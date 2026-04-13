@@ -3,6 +3,7 @@
 //! Uses an in-memory App (noop embedder) + real temp directories to verify
 //! the manifest lifecycle, file discovery, chunking, and DB state.
 
+use ironrace_embed::Embedder;
 use ironrace_memory::ingest::mine_directory;
 use ironrace_memory::mcp::app::App;
 use tempfile::TempDir;
@@ -99,5 +100,31 @@ fn mine_removes_deleted_files() {
     assert!(
         count_after < count_before,
         "deleted file's drawers should be removed on next mine"
+    );
+}
+
+#[test]
+fn mine_failure_does_not_delete_existing_drawers_for_changed_file() {
+    let (app, dir) = setup();
+    let file = dir.path().join("volatile.md");
+
+    std::fs::write(&file, "# Version 1\n\nStable content.").unwrap();
+    mine_directory(&app, dir.path().to_str().unwrap()).unwrap();
+    let count_before = app.db.count_drawers(None).unwrap();
+    assert!(count_before > 0);
+
+    std::fs::write(&file, "# Version 2\n\nThis update should fail to embed.").unwrap();
+    *app.embedder.write().unwrap() = Embedder::new_failing_for_test("forced embed failure");
+
+    let err = mine_directory(&app, dir.path().to_str().unwrap()).unwrap_err();
+    assert!(
+        err.to_string().contains("forced embed failure"),
+        "expected injected embed failure, got: {err}"
+    );
+
+    let count_after = app.db.count_drawers(None).unwrap();
+    assert_eq!(
+        count_after, count_before,
+        "existing drawers must remain if re-mining a changed file fails"
     );
 }

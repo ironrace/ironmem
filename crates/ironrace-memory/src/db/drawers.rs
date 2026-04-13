@@ -132,6 +132,13 @@ impl Database {
         Ok(count > 0)
     }
 
+    pub(crate) fn delete_drawers_by_source_file_tx(
+        tx: &Transaction<'_>,
+        source_file: &str,
+    ) -> Result<usize, MemoryError> {
+        Self::delete_drawers_by_source_file_conn(tx, source_file)
+    }
+
     /// Get a drawer by ID.
     pub fn get_drawer(&self, id: &str) -> Result<Option<Drawer>, MemoryError> {
         let mut stmt = self.conn.prepare(

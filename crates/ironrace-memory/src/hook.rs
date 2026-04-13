@@ -5,6 +5,7 @@ use serde::Serialize;
 
 use crate::bootstrap::{ensure_bootstrapped, record_workspace_mine, resolve_workspace_root};
 use crate::config::Config;
+use crate::diary;
 use crate::error::MemoryError;
 use crate::ingest::mine_directory;
 use crate::mcp::app::App;
@@ -68,25 +69,7 @@ pub fn run_hook(
 }
 
 fn persist_diary_summary(app: &App, content: &str) -> Result<(), MemoryError> {
-    let wing = "diary";
-    let room = "sessions";
-    let content = crate::sanitize::sanitize_content(content, 8_000)?;
-    let id = crate::db::drawers::generate_id(content, wing, room);
-    let embedding = {
-        let mut embedder = app
-            .embedder
-            .write()
-            .map_err(|e| MemoryError::Lock(format!("Embedder lock poisoned: {e}")))?;
-        embedder.embed_one(content).map_err(MemoryError::Embed)?
-    };
-
-    app.db.with_transaction(|tx| {
-        crate::db::schema::Database::insert_drawer_tx(
-            tx, &id, content, &embedding, wing, room, "", "hook",
-        )?;
-        Ok(())
-    })?;
-    app.mark_dirty();
+    let _ = diary::write_entry(app, content, "diary", "hook", 8_000)?;
     Ok(())
 }
 
@@ -166,6 +149,8 @@ fn sanitize_path_for_log(raw: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::mcp::protocol::JsonRpcRequest;
+    use crate::mcp::server::dispatch;
 
     #[test]
     fn parses_workspace_root_from_payload() {
@@ -187,5 +172,33 @@ mod tests {
         let summary = session_summary(&payload, "stop", "codex", Some("abc")).unwrap();
         assert!(summary.contains("Hook stop ran"));
         assert!(summary.contains("/tmp/workspace"));
+    }
+
+    #[test]
+    fn persisted_session_summary_is_readable_via_diary_api() {
+        let app = App::open_for_test().unwrap();
+        persist_diary_summary(&app, "Hook stop ran for test session").unwrap();
+
+        let req: JsonRpcRequest = serde_json::from_value(serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {
+                "name": "ironmem_diary_read",
+                "arguments": { "wing": "diary", "limit": 10 }
+            }
+        }))
+        .unwrap();
+        let resp = dispatch(&app, &req).unwrap();
+        let result = resp.result.unwrap();
+        let text = result["content"][0]["text"].as_str().unwrap();
+        let read: serde_json::Value = serde_json::from_str(text).unwrap();
+        let entries = read["entries"].as_array().unwrap();
+        assert!(
+            entries
+                .iter()
+                .any(|entry| entry["content"] == "Hook stop ran for test session"),
+            "hook summaries must be readable through the diary API"
+        );
     }
 }

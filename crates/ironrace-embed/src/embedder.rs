@@ -179,6 +179,7 @@ struct RealEmbedder {
 enum EmbedderInner {
     Real(Box<RealEmbedder>),
     Noop,
+    Failing(String),
 }
 
 /// The embedder: wraps either a loaded ONNX session or a noop for testing.
@@ -227,6 +228,13 @@ impl Embedder {
         }
     }
 
+    /// Create a test embedder that fails every embed request with the given message.
+    pub fn new_failing_for_test(message: impl Into<String>) -> Self {
+        Self {
+            inner: EmbedderInner::Failing(message.into()),
+        }
+    }
+
     /// Embed a single text, returning a 384-dim vector.
     pub fn embed_one(&mut self, text: &str) -> Result<Vec<f32>> {
         let results = self.embed_batch(&[text])?;
@@ -248,6 +256,10 @@ impl Embedder {
         if matches!(self.inner, EmbedderInner::Noop) {
             // Return deterministic zero vectors — valid for DB storage and index ops.
             return Ok(vec![0.0f32; texts.len() * EMBED_DIM]);
+        }
+
+        if let EmbedderInner::Failing(message) = &self.inner {
+            anyhow::bail!(message.clone());
         }
 
         let mut all_embeddings = Vec::with_capacity(texts.len() * EMBED_DIM);

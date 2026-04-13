@@ -1,4 +1,5 @@
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -51,7 +52,7 @@ pub fn resolve_workspace_root(explicit: Option<&Path>) -> Option<PathBuf> {
             return Some(PathBuf::from(trimmed));
         }
     }
-    std::env::current_dir().ok()
+    None
 }
 
 pub fn ensure_bootstrapped(
@@ -61,6 +62,8 @@ pub fn ensure_bootstrapped(
     if !auto_bootstrap_enabled() {
         return Ok(BootstrapReport::default());
     }
+
+    let _lock = BootstrapLock::acquire(&app.config.state_dir)?;
 
     let mut report = BootstrapReport::default();
     let global_state_path = global_state_path(&app.config);
@@ -98,6 +101,43 @@ pub fn ensure_bootstrapped(
     Ok(report)
 }
 
+struct BootstrapLock {
+    path: PathBuf,
+}
+
+impl BootstrapLock {
+    fn acquire(state_dir: &Path) -> Result<Self, MemoryError> {
+        std::fs::create_dir_all(state_dir)?;
+        let path = state_dir.join("bootstrap.lock");
+        let start = Instant::now();
+        loop {
+            match std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&path)
+            {
+                Ok(_) => return Ok(Self { path }),
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                    if start.elapsed() > Duration::from_secs(10) {
+                        return Err(MemoryError::Io(std::io::Error::new(
+                            std::io::ErrorKind::TimedOut,
+                            format!("Timed out waiting for bootstrap lock at {}", path.display()),
+                        )));
+                    }
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+                Err(error) => return Err(MemoryError::Io(error)),
+            }
+        }
+    }
+}
+
+impl Drop for BootstrapLock {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
 pub fn record_workspace_mine(config: &Config, workspace_root: &Path) -> Result<(), MemoryError> {
     let workspace_state_path = workspace_state_path(config, workspace_root);
     let mut workspace_state = load_workspace_state(&workspace_state_path, workspace_root)?;
@@ -107,6 +147,18 @@ pub fn record_workspace_mine(config: &Config, workspace_root: &Path) -> Result<(
 }
 
 pub fn detect_mempalace_store() -> Option<PathBuf> {
+    if std::env::var("IRONMEM_DISABLE_MIGRATION")
+        .map(|value| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes"
+            )
+        })
+        .unwrap_or(false)
+    {
+        return None;
+    }
+
     if let Ok(path) = std::env::var("IRONMEM_MIGRATE_FROM") {
         let candidate = PathBuf::from(path);
         if candidate.join("chroma.sqlite3").is_file() {
@@ -187,7 +239,17 @@ where
         return Ok(T::default());
     }
     let raw = std::fs::read_to_string(path)?;
-    Ok(serde_json::from_str(&raw)?)
+    match serde_json::from_str(&raw) {
+        Ok(value) => Ok(value),
+        Err(error) => {
+            tracing::warn!(
+                "Ignoring malformed bootstrap state at {}: {}",
+                path.display(),
+                error
+            );
+            Ok(T::default())
+        }
+    }
 }
 
 fn save_json<T: Serialize>(path: &Path, value: &T) -> Result<(), MemoryError> {
@@ -195,13 +257,30 @@ fn save_json<T: Serialize>(path: &Path, value: &T) -> Result<(), MemoryError> {
         std::fs::create_dir_all(parent)?;
     }
     let raw = serde_json::to_string_pretty(value)?;
-    std::fs::write(path, raw)?;
+    let tmp_path = temp_path_for(path);
+    std::fs::write(&tmp_path, raw)?;
+    std::fs::rename(&tmp_path, path)?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
         let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
     }
     Ok(())
+}
+
+fn temp_path_for(path: &Path) -> PathBuf {
+    let unique = format!(
+        ".{}.tmp-{}-{}",
+        path.file_name()
+            .and_then(|value| value.to_str())
+            .unwrap_or("state"),
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+    );
+    path.with_file_name(unique)
 }
 
 #[cfg(test)]
@@ -234,5 +313,22 @@ mod tests {
         if let Some(value) = original_home {
             std::env::set_var("HOME", value);
         }
+    }
+
+    #[test]
+    fn resolve_workspace_root_without_input_does_not_fallback_to_cwd() {
+        let original = std::env::var("IRONMEM_WORKSPACE_ROOT").ok();
+        std::env::remove_var("IRONMEM_WORKSPACE_ROOT");
+
+        let resolved = resolve_workspace_root(None);
+
+        if let Some(value) = original {
+            std::env::set_var("IRONMEM_WORKSPACE_ROOT", value);
+        }
+
+        assert!(
+            resolved.is_none(),
+            "workspace auto-bootstrap should require an explicit workspace root"
+        );
     }
 }

@@ -72,7 +72,7 @@ async fn run(cli: Cli) -> Result<(), MemoryError> {
             // App is not Sync (single-threaded stdio server, block_in_place dispatch).
             #[allow(clippy::arc_with_non_send_sync)]
             let app = std::sync::Arc::new(mcp::app::App::new(cfg)?);
-            let _ = bootstrap::ensure_bootstrapped(app.as_ref(), None);
+            bootstrap::ensure_bootstrapped(app.as_ref(), None)?;
             mcp::server::run_server(app).await
         }
         Commands::Init => {
@@ -83,6 +83,10 @@ async fn run(cli: Cli) -> Result<(), MemoryError> {
         }
         Commands::Setup => {
             let cfg = config::Config::load(None)?;
+            if matches!(cfg.embed_mode, config::EmbedMode::Noop) {
+                eprintln!("Noop embedder mode enabled; skipping model setup.");
+                return Ok(());
+            }
             let allow_download = !cfg.model_dir_explicit;
             if allow_download {
                 eprintln!(

@@ -1,4 +1,5 @@
 use std::path::Path;
+use std::time::Duration;
 
 use rusqlite::{Connection, Transaction};
 
@@ -25,7 +26,8 @@ impl Database {
         }
 
         let conn = Connection::open(path)?;
-        conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;")?;
+        conn.busy_timeout(Duration::from_secs(5))?;
+        retry_on_busy(|| conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;"))?;
 
         // Restrict database file permissions to owner-only
         #[cfg(unix)]
@@ -40,6 +42,7 @@ impl Database {
     /// Open an in-memory database (for testing and integration tests).
     pub fn open_in_memory() -> Result<Self, MemoryError> {
         let conn = Connection::open_in_memory()?;
+        conn.busy_timeout(Duration::from_secs(5))?;
         conn.execute_batch("PRAGMA foreign_keys=ON;")?;
         let db = Self { conn };
         db.migrate()?;
@@ -48,7 +51,7 @@ impl Database {
 
     /// Run schema migrations.
     pub fn migrate(&self) -> Result<(), MemoryError> {
-        self.conn.execute_batch(SCHEMA_SQL)?;
+        retry_on_busy(|| self.conn.execute_batch(SCHEMA_SQL))?;
         Ok(())
     }
 
@@ -111,6 +114,34 @@ impl Database {
         }
         Ok(result)
     }
+}
+
+fn retry_on_busy<T>(
+    mut operation: impl FnMut() -> Result<T, rusqlite::Error>,
+) -> Result<T, rusqlite::Error> {
+    let start = std::time::Instant::now();
+    loop {
+        match operation() {
+            Ok(value) => return Ok(value),
+            Err(error) if is_busy_error(&error) && start.elapsed() < Duration::from_secs(10) => {
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+fn is_busy_error(error: &rusqlite::Error) -> bool {
+    matches!(
+        error,
+        rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error {
+                code: rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked,
+                ..
+            },
+            _
+        )
+    )
 }
 
 #[cfg(test)]

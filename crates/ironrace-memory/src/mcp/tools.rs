@@ -7,6 +7,7 @@ use crate::bootstrap::MEMORY_PROTOCOL;
 use crate::config::McpAccessMode;
 use crate::db::knowledge_graph::KnowledgeGraph;
 use crate::db::SearchFilters;
+use crate::diary;
 use crate::error::MemoryError;
 use crate::sanitize;
 use crate::search;
@@ -583,36 +584,14 @@ fn handle_diary_write(app: &App, args: &Value) -> Result<Value, MemoryError> {
         .and_then(|v| v.as_str())
         .ok_or_else(|| MemoryError::Validation("content is required".into()))?;
     let wing = args.get("wing").and_then(|v| v.as_str()).unwrap_or("diary");
+    let entry = diary::write_entry(app, content, wing, "diary", 100_000)?;
+    app.db.wal_log(
+        "diary_write",
+        &json!({"id": &entry.id, "wing": &entry.wing}),
+        None,
+    )?;
 
-    let content = sanitize::sanitize_content(content, 100_000)?;
-    let wing = sanitize::sanitize_name(wing, "wing")?;
-    let room = "diary";
-
-    let id = crate::db::drawers::generate_id(content, &wing, room);
-
-    let embedding = {
-        let mut emb = app
-            .embedder
-            .write()
-            .map_err(|e| MemoryError::Lock(format!("Embedder lock poisoned: {e}")))?;
-        emb.embed_one(content).map_err(MemoryError::Embed)?
-    };
-
-    app.db.with_transaction(|tx| {
-        crate::db::schema::Database::insert_drawer_tx(
-            tx, &id, content, &embedding, &wing, room, "", "diary",
-        )?;
-        crate::db::schema::Database::wal_log_tx(
-            tx,
-            "diary_write",
-            &json!({"id": &id, "wing": &wing}),
-            None,
-        )?;
-        Ok(())
-    })?;
-    app.mark_dirty();
-
-    Ok(json!({ "success": true, "id": id, "wing": wing }))
+    Ok(json!({ "success": true, "id": entry.id, "wing": entry.wing }))
 }
 
 fn handle_diary_read(app: &App, args: &Value) -> Result<Value, MemoryError> {
@@ -622,7 +601,9 @@ fn handle_diary_read(app: &App, args: &Value) -> Result<Value, MemoryError> {
         (args.get("limit").and_then(|v| v.as_u64()).unwrap_or(20) as usize).min(MAX_READ_LIMIT);
     let redact_content = app.config.mcp_access_mode.redacts_sensitive_content();
 
-    let drawers = app.db.get_drawers(Some(&wing), Some("diary"), limit)?;
+    let drawers = app
+        .db
+        .get_drawers(Some(&wing), Some(diary::DIARY_ROOM), limit)?;
 
     let entries: Vec<Value> = drawers
         .iter()

@@ -11,7 +11,6 @@ use std::path::{Path, PathBuf};
 
 use rusqlite::{params, Connection};
 
-use crate::db::knowledge_graph::KnowledgeGraph;
 use crate::error::MemoryError;
 use crate::mcp::app::App;
 
@@ -62,6 +61,9 @@ pub fn migrate_from_chromadb(chromadb_path: &str, app: &App) -> Result<(), Memor
 
     let source = Connection::open(&chroma_db)?;
     let drawers = load_drawers_from_chromadb(&source)?;
+    let (entities, triples) = load_knowledge_graph_payload(path)?;
+    let extracted_at = chrono::Utc::now().to_rfc3339();
+
     if !drawers.is_empty() {
         let texts: Vec<&str> = drawers
             .iter()
@@ -74,7 +76,6 @@ pub fn migrate_from_chromadb(chromadb_path: &str, app: &App) -> Result<(), Memor
                 .map_err(|e| MemoryError::Lock(format!("Embedder lock poisoned: {e}")))?;
             embedder.embed_batch(&texts).map_err(MemoryError::Embed)?
         };
-
         app.db.with_transaction(|tx| {
             for (index, drawer) in drawers.iter().enumerate() {
                 let start = index * ironrace_embed::embedder::EMBED_DIM;
@@ -95,11 +96,15 @@ pub fn migrate_from_chromadb(chromadb_path: &str, app: &App) -> Result<(), Memor
                     &drawer.added_by,
                 )?;
             }
+            insert_kg_payload_tx(tx, &entities, &triples, &extracted_at)?;
+            Ok(())
+        })?;
+    } else if !entities.is_empty() || !triples.is_empty() {
+        app.db.with_transaction(|tx| {
+            insert_kg_payload_tx(tx, &entities, &triples, &extracted_at)?;
             Ok(())
         })?;
     }
-
-    migrate_knowledge_graph(path, app)?;
     app.mark_dirty();
     Ok(())
 }
@@ -153,66 +158,60 @@ type TripleRow = (
     Option<String>,
 );
 
-fn migrate_knowledge_graph(root: &Path, app: &App) -> Result<(), MemoryError> {
+fn load_knowledge_graph_payload(
+    root: &Path,
+) -> Result<(Vec<EntityRow>, Vec<TripleRow>), MemoryError> {
     let kg_path = detect_knowledge_graph_path(root);
     let Some(kg_path) = kg_path else {
-        return Ok(());
+        return Ok((Vec::new(), Vec::new()));
     };
     let source = Connection::open(kg_path)?;
-
-    // Collect all rows eagerly from the source before opening our transaction.
     let entities = collect_kg_entities(&source)?;
     let triples = collect_kg_triples(&source)?;
+    Ok((entities, triples))
+}
 
-    if entities.is_empty() && triples.is_empty() {
-        return Ok(());
+fn insert_kg_payload_tx(
+    tx: &rusqlite::Transaction<'_>,
+    entities: &[EntityRow],
+    triples: &[TripleRow],
+    extracted_at: &str,
+) -> Result<(), MemoryError> {
+    for (id, name, entity_type, properties) in entities {
+        tx.execute(
+            "INSERT INTO entities (id, name, entity_type, properties)
+             VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(id) DO UPDATE SET
+                name = excluded.name,
+                entity_type = excluded.entity_type,
+                properties = excluded.properties",
+            params![id, name, entity_type, properties],
+        )?;
     }
-
-    let extracted_at = chrono::Utc::now().to_rfc3339();
-
-    // Write everything in a single transaction so a crash mid-migration does
-    // not leave partially imported entities without their corresponding triples.
-    app.db.with_transaction(|tx| {
-        for (id, name, entity_type, properties) in &entities {
-            tx.execute(
-                "INSERT INTO entities (id, name, entity_type, properties)
-                 VALUES (?1, ?2, ?3, ?4)
-                 ON CONFLICT(id) DO UPDATE SET
-                    name = excluded.name,
-                    entity_type = excluded.entity_type,
-                    properties = excluded.properties",
-                params![id, name, entity_type, properties],
-            )?;
-        }
-        for (id, subject, predicate, object, valid_from, valid_to, confidence, source_closet) in
-            &triples
-        {
-            tx.execute(
-                "INSERT INTO triples
-                 (id, subject, predicate, object, valid_from, valid_to, confidence, source_closet, extracted_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
-                 ON CONFLICT(id) DO UPDATE SET
-                    valid_from = excluded.valid_from,
-                    valid_to = excluded.valid_to,
-                    confidence = excluded.confidence,
-                    source_closet = excluded.source_closet",
-                params![
-                    id,
-                    subject,
-                    predicate,
-                    object,
-                    valid_from,
-                    valid_to,
-                    confidence,
-                    source_closet,
-                    &extracted_at,
-                ],
-            )?;
-        }
-        Ok(())
-    })?;
-
-    let _ = KnowledgeGraph::new(&app.db).stats()?;
+    for (id, subject, predicate, object, valid_from, valid_to, confidence, source_closet) in triples
+    {
+        tx.execute(
+            "INSERT INTO triples
+             (id, subject, predicate, object, valid_from, valid_to, confidence, source_closet, extracted_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+             ON CONFLICT(id) DO UPDATE SET
+                valid_from = excluded.valid_from,
+                valid_to = excluded.valid_to,
+                confidence = excluded.confidence,
+                source_closet = excluded.source_closet",
+            params![
+                id,
+                subject,
+                predicate,
+                object,
+                valid_from,
+                valid_to,
+                confidence,
+                source_closet,
+                extracted_at,
+            ],
+        )?;
+    }
     Ok(())
 }
 
@@ -256,14 +255,56 @@ fn detect_knowledge_graph_path(root: &Path) -> Option<PathBuf> {
     if local.is_file() {
         return Some(local);
     }
-    dirs::home_dir()
-        .map(|home| home.join(".mempalace").join("knowledge_graph.sqlite3"))
-        .filter(|path| path.is_file())
+    None
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::mcp::app::App;
+
+    fn write_basic_chroma_store(root: &Path) {
+        let conn = Connection::open(root.join("chroma.sqlite3")).unwrap();
+        conn.execute_batch(
+            "
+            CREATE TABLE embeddings (
+                id INTEGER PRIMARY KEY,
+                segment_id TEXT NOT NULL,
+                embedding_id TEXT NOT NULL,
+                seq_id BLOB NOT NULL,
+                created_at TEXT NOT NULL
+            );
+            CREATE TABLE embedding_metadata (
+                id INTEGER,
+                key TEXT NOT NULL,
+                string_value TEXT,
+                int_value INTEGER,
+                float_value REAL,
+                bool_value INTEGER
+            );
+            ",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO embeddings (id, segment_id, embedding_id, seq_id, created_at)
+             VALUES (1, 'seg', 'drawer_1', X'01', '2026-01-01T00:00:00Z')",
+            [],
+        )
+        .unwrap();
+        for (key, value) in [
+            ("chroma:document", "hello world"),
+            ("wing", "workspace"),
+            ("room", "docs"),
+            ("source_file", "/tmp/README.md"),
+            ("added_by", "mempalace"),
+        ] {
+            conn.execute(
+                "INSERT INTO embedding_metadata (id, key, string_value) VALUES (1, ?1, ?2)",
+                params![key, value],
+            )
+            .unwrap();
+        }
+    }
 
     #[test]
     fn loads_drawers_from_chroma_style_tables() {
@@ -313,5 +354,82 @@ mod tests {
         assert_eq!(drawers[0].embedding_id, "drawer_1");
         assert_eq!(drawers[0].content, "hello world");
         assert_eq!(drawers[0].wing, "workspace");
+    }
+
+    #[test]
+    fn migration_is_idempotent_on_retry() {
+        let temp = tempfile::tempdir().unwrap();
+        write_basic_chroma_store(temp.path());
+        let app = App::open_for_test().unwrap();
+
+        migrate_from_chromadb(temp.path().to_str().unwrap(), &app).unwrap();
+        let count_after_first = app.db.count_drawers(None).unwrap();
+        migrate_from_chromadb(temp.path().to_str().unwrap(), &app).unwrap();
+        let count_after_second = app.db.count_drawers(None).unwrap();
+
+        assert_eq!(count_after_first, 1);
+        assert_eq!(
+            count_after_second, count_after_first,
+            "retrying migration should not duplicate imported drawers"
+        );
+    }
+
+    #[test]
+    fn corrupted_chroma_store_returns_error_without_importing_partial_data() {
+        let temp = tempfile::tempdir().unwrap();
+        Connection::open(temp.path().join("chroma.sqlite3")).unwrap();
+        let app = App::open_for_test().unwrap();
+
+        let err = migrate_from_chromadb(temp.path().to_str().unwrap(), &app).unwrap_err();
+        assert!(
+            err.to_string().contains("no such table") || err.to_string().contains("Database error"),
+            "unexpected migration error: {err}"
+        );
+        assert_eq!(app.db.count_drawers(None).unwrap(), 0);
+    }
+
+    #[test]
+    fn corrupted_knowledge_graph_prevents_partial_drawer_import() {
+        let temp = tempfile::tempdir().unwrap();
+        write_basic_chroma_store(temp.path());
+        let kg = Connection::open(temp.path().join("knowledge_graph.sqlite3")).unwrap();
+        kg.execute_batch("CREATE TABLE broken (id INTEGER PRIMARY KEY);")
+            .unwrap();
+        let app = App::open_for_test().unwrap();
+
+        let err = migrate_from_chromadb(temp.path().to_str().unwrap(), &app).unwrap_err();
+        assert!(
+            err.to_string().contains("no such table"),
+            "unexpected migration error: {err}"
+        );
+        assert_eq!(
+            app.db.count_drawers(None).unwrap(),
+            0,
+            "a KG migration failure must not leave drawers partially imported"
+        );
+    }
+
+    #[test]
+    fn nondefault_migration_root_does_not_fallback_to_home_kg() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("home");
+        let other_root = temp.path().join("external-store");
+        std::fs::create_dir_all(home.join(".mempalace")).unwrap();
+        std::fs::create_dir_all(&other_root).unwrap();
+        std::fs::write(home.join(".mempalace").join("knowledge_graph.sqlite3"), "").unwrap();
+
+        let original_home = std::env::var("HOME").ok();
+        std::env::set_var("HOME", &home);
+
+        let detected = detect_knowledge_graph_path(&other_root);
+
+        if let Some(value) = original_home {
+            std::env::set_var("HOME", value);
+        }
+
+        assert!(
+            detected.is_none(),
+            "explicit migration roots must not import a home-directory knowledge graph"
+        );
     }
 }

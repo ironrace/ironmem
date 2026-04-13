@@ -2,7 +2,7 @@
 
 use std::sync::Arc;
 
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 
 use super::app::App;
 use super::protocol::{self, JsonRpcRequest, JsonRpcResponse};
@@ -12,9 +12,17 @@ use crate::error::MemoryError;
 /// Run the MCP server loop, reading JSON-RPC from stdin, writing to stdout.
 pub async fn run_server(app: Arc<App>) -> Result<(), MemoryError> {
     let stdin = BufReader::new(tokio::io::stdin());
-    let mut stdout = tokio::io::stdout();
-    let mut lines = stdin.lines();
+    let stdout = tokio::io::stdout();
+    run_server_io(app, stdin, stdout).await
+}
 
+pub async fn run_server_io<R, W>(app: Arc<App>, reader: R, writer: W) -> Result<(), MemoryError>
+where
+    R: AsyncBufRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
+    let mut stdout = writer;
+    let mut lines = reader.lines();
     while let Ok(Some(line)) = lines.next_line().await {
         let line = line.trim().to_string();
         if line.is_empty() {
@@ -54,7 +62,7 @@ pub async fn run_server(app: Arc<App>) -> Result<(), MemoryError> {
 }
 
 async fn write_response(
-    stdout: &mut tokio::io::Stdout,
+    stdout: &mut (impl AsyncWrite + Unpin),
     resp: &JsonRpcResponse,
 ) -> Result<(), MemoryError> {
     let json = serde_json::to_string(resp)?;
@@ -134,5 +142,79 @@ pub fn dispatch(app: &App, request: &JsonRpcRequest) -> Option<JsonRpcResponse> 
             -32601,
             &format!("Unknown method: {}", request.method),
         )),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    async fn run_with_input(input: &str) -> String {
+        #[allow(clippy::arc_with_non_send_sync)]
+        let app = Arc::new(App::open_for_test().unwrap());
+        let (mut client_in, server_in) = tokio::io::duplex(4096);
+        let (server_out, mut client_out) = tokio::io::duplex(4096);
+
+        client_in.write_all(input.as_bytes()).await.unwrap();
+        client_in.shutdown().await.unwrap();
+
+        run_server_io(app, BufReader::new(server_in), server_out)
+            .await
+            .unwrap();
+
+        let mut output = String::new();
+        client_out.read_to_string(&mut output).await.unwrap();
+        output
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn malformed_json_returns_parse_error() {
+        let output = run_with_input("{not json}\n").await;
+        assert!(output.contains("\"code\":-32700"));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn fragmented_valid_request_is_handled() {
+        #[allow(clippy::arc_with_non_send_sync)]
+        let app = Arc::new(App::open_for_test().unwrap());
+        let (mut client_in, server_in) = tokio::io::duplex(4096);
+        let (server_out, mut client_out) = tokio::io::duplex(4096);
+
+        client_in
+            .write_all(b"{\"jsonrpc\":\"2.0\",\"id\":1,")
+            .await
+            .unwrap();
+        client_in
+            .write_all(b"\"method\":\"initialize\",\"params\":{}}\n")
+            .await
+            .unwrap();
+        client_in.shutdown().await.unwrap();
+
+        run_server_io(app, BufReader::new(server_in), server_out)
+            .await
+            .unwrap();
+
+        let mut output = String::new();
+        client_out.read_to_string(&mut output).await.unwrap();
+        assert!(output.contains("\"protocolVersion\":\"2024-11-05\""));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn pretty_printed_multiline_json_yields_parse_errors_without_crashing() {
+        let output = run_with_input(
+            "{\n  \"jsonrpc\":\"2.0\",\n  \"id\":1,\n  \"method\":\"initialize\"\n}\n",
+        )
+        .await;
+        assert!(output.contains("\"code\":-32700"));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn notifications_do_not_emit_responses() {
+        let output = run_with_input(
+            "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\",\"params\":{}}\n",
+        )
+        .await;
+        assert!(output.is_empty());
     }
 }

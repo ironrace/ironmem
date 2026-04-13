@@ -4,6 +4,7 @@
 //! without downloading the ONNX model. They cover the tool combinations that a
 //! real AI harness would exercise in practice.
 
+use ironrace_embed::embedder::EMBED_DIM;
 use ironrace_memory::config::McpAccessMode;
 use ironrace_memory::mcp::app::App;
 use ironrace_memory::mcp::protocol::JsonRpcRequest;
@@ -260,6 +261,40 @@ fn diary_write_read_round_trip() {
     assert_eq!(entry["content"], content);
 }
 
+#[test]
+fn diary_write_same_content_creates_distinct_entries() {
+    let app = App::open_for_test().unwrap();
+    let content = "Repeated summary text should create a new entry each time.";
+
+    let first = call(
+        &app,
+        "ironmem_diary_write",
+        json!({ "content": content, "wing": "diary" }),
+    );
+    let second = call(
+        &app,
+        "ironmem_diary_write",
+        json!({ "content": content, "wing": "diary" }),
+    );
+
+    let first_id = first["id"].as_str().unwrap();
+    let second_id = second["id"].as_str().unwrap();
+    assert_ne!(
+        first_id, second_id,
+        "timestamped diary writes must not overwrite identical content"
+    );
+
+    let read = call(
+        &app,
+        "ironmem_diary_read",
+        json!({ "wing": "diary", "limit": 10 }),
+    );
+    let entries = read["entries"].as_array().unwrap();
+    let ids: Vec<&str> = entries.iter().filter_map(|e| e["id"].as_str()).collect();
+    assert!(ids.contains(&first_id));
+    assert!(ids.contains(&second_id));
+}
+
 // ── Scenario 5: Access mode — read-only blocks all writes ────────────────────
 
 #[test]
@@ -293,62 +328,53 @@ fn read_only_mode_blocks_write_tools() {
 
 #[test]
 fn restricted_mode_redacts_search_content() {
-    // Use trusted mode to seed data
-    let trusted = App::open_for_test().unwrap();
-    call(
-        &trusted,
-        "ironmem_add_drawer",
-        json!({ "content": "Sensitive internal roadmap data", "wing": "projects", "room": "secret" }),
-    );
-
-    // Open a separate restricted instance with the same in-memory DB isn't
-    // possible, so we use a restricted app and seed via the write API —
-    // but writes are blocked in restricted mode. Instead, test that the
-    // restricted handler is wired correctly by checking diary_read redacts.
     let restricted = App::open_for_test_with_mode(McpAccessMode::Restricted).unwrap();
-    // Add via the underlying db directly — restricted mode still has a writable db
-    // (the mode only blocks MCP writes). Use trusted app's search then assert
-    // redaction works at the read path by checking the Restricted mode's diary_read
-    // returns redacted=true when content exists.
+    let embedding = vec![0.0f32; EMBED_DIM];
+    restricted
+        .db
+        .insert_drawer(
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "Sensitive internal roadmap data",
+            &embedding,
+            "projects",
+            "secret",
+            "",
+            "test",
+        )
+        .unwrap();
+    restricted
+        .db
+        .insert_drawer(
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "Diary secret",
+            &embedding,
+            "diary",
+            "diary",
+            "",
+            "test",
+        )
+        .unwrap();
+    restricted.mark_dirty();
 
-    // For this scenario: add via trusted, then confirm search results through
-    // a restricted App have content_redacted=true.
-    // The apps share no state (each has its own in-memory DB), so we test the
-    // redaction logic directly via a trusted add + restricted read of a fresh entry.
-    // We confirm restricted mode's diary_read returns redacted entries when present.
-    let _ = restricted; // redaction behavior verified by render_sensitive_text unit tests
-                        // and the read path in handle_diary_read/handle_search.
+    let search = call(
+        &restricted,
+        "ironmem_search",
+        json!({ "query": "roadmap", "limit": 5 }),
+    );
+    let results = search["results"].as_array().unwrap();
+    assert!(!results.is_empty());
+    assert_eq!(results[0]["content"], Value::Null);
+    assert_eq!(results[0]["content_redacted"], true);
 
-    // What we can test: a search on a restricted app returns content_redacted=true.
-    let restricted2 = App::open_for_test_with_mode(McpAccessMode::Restricted).unwrap();
-    // We can't add from restricted mode, so seed via the DB directly.
-    // Instead verify that if we could search, results would be redacted.
-    // Verify the mcp_access_mode is correctly set.
-    assert_eq!(
-        restricted2.config.mcp_access_mode,
-        McpAccessMode::Restricted
+    let diary = call(
+        &restricted,
+        "ironmem_diary_read",
+        json!({ "wing": "diary", "limit": 5 }),
     );
-
-    // Verify that search on a restricted app with data returns redacted=true.
-    // Since we can't write from restricted mode, we do this by checking that
-    // the search tool is still listed (not blocked) in restricted mode.
-    let tools_req = request("tools/list", json!({}));
-    let tools_resp = dispatch(&restricted2, &tools_req).unwrap();
-    let tools_result = tools_resp.result.unwrap();
-    let names: Vec<&str> = tools_result["tools"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .filter_map(|t| t["name"].as_str())
-        .collect();
-    assert!(
-        names.contains(&"ironmem_search"),
-        "search must be available in restricted mode"
-    );
-    assert!(
-        !names.contains(&"ironmem_add_drawer"),
-        "add_drawer must be blocked in restricted mode"
-    );
+    let entries = diary["entries"].as_array().unwrap();
+    assert!(!entries.is_empty());
+    assert_eq!(entries[0]["content"], Value::Null);
+    assert_eq!(entries[0]["content_redacted"], true);
 }
 
 // ── Scenario 7: Graph traverse and tunnels ───────────────────────────────────

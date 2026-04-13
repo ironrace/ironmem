@@ -1,6 +1,7 @@
 pub mod bootstrap;
 pub mod config;
 pub mod db;
+pub mod diary;
 pub mod error;
 pub mod hook;
 pub mod ingest;

@@ -97,14 +97,9 @@ pub fn mine_directory(app: &App, path: &str) -> Result<(), MemoryError> {
         let (wing, room) = derive_location(&root, &file.absolute_path, root_has_git)?;
         let chunks = chunk_text(&file.content);
 
-        app.db.delete_drawers_by_source_file(&source_file)?;
-
-        if chunks.is_empty() {
-            manifest.files.remove(&source_file);
-            continue;
-        }
-
-        let embeddings = {
+        let embeddings = if chunks.is_empty() {
+            Vec::new()
+        } else {
             let chunk_refs: Vec<&str> = chunks.iter().map(String::as_str).collect();
             let mut embedder = app
                 .embedder
@@ -116,6 +111,7 @@ pub fn mine_directory(app: &App, path: &str) -> Result<(), MemoryError> {
         };
 
         app.db.with_transaction(|tx| {
+            crate::db::schema::Database::delete_drawers_by_source_file_tx(tx, &source_file)?;
             for (chunk_index, chunk) in chunks.iter().enumerate() {
                 let start = chunk_index * ironrace_embed::embedder::EMBED_DIM;
                 let end = start + ironrace_embed::embedder::EMBED_DIM;
@@ -137,14 +133,18 @@ pub fn mine_directory(app: &App, path: &str) -> Result<(), MemoryError> {
             Ok(())
         })?;
 
-        manifest.files.insert(
-            source_file,
-            MineManifestEntry {
-                content_hash: file.content_hash,
-                chunk_count: chunks.len(),
-                updated_at: chrono::Utc::now().to_rfc3339(),
-            },
-        );
+        if chunks.is_empty() {
+            manifest.files.remove(&source_file);
+        } else {
+            manifest.files.insert(
+                source_file,
+                MineManifestEntry {
+                    content_hash: file.content_hash,
+                    chunk_count: chunks.len(),
+                    updated_at: chrono::Utc::now().to_rfc3339(),
+                },
+            );
+        }
         app.mark_dirty();
     }
 

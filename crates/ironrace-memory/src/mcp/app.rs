@@ -6,7 +6,7 @@ use std::sync::RwLock;
 use ironrace_core::VectorIndex;
 use ironrace_embed::Embedder;
 
-use crate::config::Config;
+use crate::config::{Config, EmbedMode};
 use crate::db::schema::Database;
 use crate::error::MemoryError;
 use crate::search::graph::MemoryGraph;
@@ -44,12 +44,17 @@ impl App {
         }
 
         // Load embedder
-        let model_dir = ironrace_embed::embedder::ensure_model_in_dir(
-            &config.model_dir,
-            !config.model_dir_explicit,
-        )
-        .map_err(MemoryError::Embed)?;
-        let embedder = Embedder::new(&model_dir).map_err(MemoryError::Embed)?;
+        let embedder = match config.embed_mode {
+            EmbedMode::Noop => Embedder::new_noop(),
+            EmbedMode::Real => {
+                let model_dir = ironrace_embed::embedder::ensure_model_in_dir(
+                    &config.model_dir,
+                    !config.model_dir_explicit,
+                )
+                .map_err(MemoryError::Embed)?;
+                Embedder::new(&model_dir).map_err(MemoryError::Embed)?
+            }
+        };
 
         // Load vectors and build HNSW index
         let vectors_with_ids = db.load_all_vectors()?;
@@ -108,6 +113,7 @@ impl App {
             model_dir_explicit: true,
             state_dir,
             mcp_access_mode: mode,
+            embed_mode: crate::config::EmbedMode::Noop,
         };
         let embedder = ironrace_embed::Embedder::new_noop();
         Ok(Self {

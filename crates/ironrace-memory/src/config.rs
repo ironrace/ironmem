@@ -30,15 +30,35 @@ impl McpAccessMode {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EmbedMode {
+    Real,
+    Noop,
+}
+
+impl EmbedMode {
+    fn parse(raw: &str) -> Result<Self, MemoryError> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "real" => Ok(Self::Real),
+            "noop" | "no-op" => Ok(Self::Noop),
+            other => Err(MemoryError::Config(format!(
+                "IRONMEM_EMBED_MODE must be one of real, noop; got {other}"
+            ))),
+        }
+    }
+}
+
 /// Application configuration.
 ///
 /// Priority: CLI arg > env var > config file > defaults.
+#[derive(Debug, Clone)]
 pub struct Config {
     pub db_path: PathBuf,
     pub model_dir: PathBuf,
     pub model_dir_explicit: bool,
     pub state_dir: PathBuf,
     pub mcp_access_mode: McpAccessMode,
+    pub embed_mode: EmbedMode,
 }
 
 impl Config {
@@ -74,6 +94,10 @@ impl Config {
             Ok(mode) => McpAccessMode::parse(&mode)?,
             Err(_) => McpAccessMode::Trusted,
         };
+        let embed_mode = match std::env::var("IRONMEM_EMBED_MODE") {
+            Ok(mode) => EmbedMode::parse(&mode)?,
+            Err(_) => EmbedMode::Real,
+        };
 
         Ok(Self {
             db_path,
@@ -81,6 +105,7 @@ impl Config {
             model_dir_explicit,
             state_dir,
             mcp_access_mode,
+            embed_mode,
         })
     }
 
