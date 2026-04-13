@@ -139,9 +139,28 @@ fn session_summary(
     Some(format!(
         "Hook {hook_name} ran for harness {harness}. session_id={} cwd={} transcript_path={}",
         session_id.unwrap_or("unknown"),
-        cwd,
-        transcript_path
+        sanitize_path_for_log(cwd),
+        sanitize_path_for_log(transcript_path),
     ))
+}
+
+/// Sanitize a file-system path for inclusion in diary/log entries.
+///
+/// Allows printable ASCII path characters only. Strips anything that could be
+/// used for injection (backticks, quotes, semicolons, pipe, ampersand) and
+/// caps length at 512 characters so a crafted hook payload cannot inflate
+/// diary entries.
+fn sanitize_path_for_log(raw: &str) -> String {
+    raw.chars()
+        .filter(|c| {
+            c.is_ascii_graphic()
+                && !matches!(
+                    c,
+                    '"' | '\'' | '`' | ';' | '|' | '&' | '<' | '>' | '$' | '!'
+                )
+        })
+        .take(512)
+        .collect()
 }
 
 #[cfg(test)]

@@ -36,11 +36,29 @@ struct CandidateFile {
     content_hash: String,
 }
 
+/// Directories that must never be mined regardless of user input.
+const BLOCKED_SYSTEM_PREFIXES: &[&str] = &[
+    "/etc", "/usr", "/var", "/sys", "/proc", "/dev", "/boot", "/run", "/bin", "/sbin", "/lib",
+    "/lib64",
+];
+
 pub fn mine_directory(app: &App, path: &str) -> Result<(), MemoryError> {
     let root = PathBuf::from(path);
     if !root.is_dir() {
         return Err(MemoryError::NotFound(format!(
             "Directory not found for mining: {path}"
+        )));
+    }
+
+    // Canonicalize to resolve symlinks before checking system-path boundaries.
+    let root = root.canonicalize().unwrap_or(root);
+    let root_str = root.to_string_lossy();
+    if BLOCKED_SYSTEM_PREFIXES
+        .iter()
+        .any(|prefix| root_str == *prefix || root_str.starts_with(&format!("{}/", prefix)))
+    {
+        return Err(MemoryError::Validation(format!(
+            "Mining of system directory '{root_str}' is not allowed"
         )));
     }
 
@@ -207,7 +225,7 @@ fn is_candidate_file(path: &Path) -> bool {
 
     let allowed = [
         "md", "txt", "rst", "py", "toml", "json", "yaml", "yml", "swift", "kt", "java", "js", "ts",
-        "tsx", "jsx", "go", "rs", "sql", "html", "css", "sh", "env",
+        "tsx", "jsx", "go", "rs", "sql", "html", "css", "sh",
     ];
     path.extension()
         .and_then(|value| value.to_str())

@@ -24,6 +24,11 @@ struct MempalaceDrawer {
     added_by: String,
 }
 
+/// Directories that must never be opened as a migration source.
+const BLOCKED_MIGRATE_PREFIXES: &[&str] = &[
+    "/etc", "/usr", "/var", "/sys", "/proc", "/dev", "/boot", "/run", "/bin", "/sbin",
+];
+
 /// Migrate from ChromaDB store to ironrace-memory.
 pub fn migrate_from_chromadb(chromadb_path: &str, app: &App) -> Result<(), MemoryError> {
     let path = Path::new(chromadb_path);
@@ -32,6 +37,17 @@ pub fn migrate_from_chromadb(chromadb_path: &str, app: &App) -> Result<(), Memor
         return Err(MemoryError::Migration(format!(
             "ChromaDB store not found at: {}",
             chromadb_path
+        )));
+    }
+
+    // Canonicalize to resolve symlinks before checking system boundaries.
+    let canonical = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+    let canonical_str = canonical.to_string_lossy();
+    if BLOCKED_MIGRATE_PREFIXES.iter().any(|prefix| {
+        canonical_str == *prefix || canonical_str.starts_with(&format!("{}/", prefix))
+    }) {
+        return Err(MemoryError::Validation(format!(
+            "Migration source '{canonical_str}' is a system directory and cannot be used"
         )));
     }
 
