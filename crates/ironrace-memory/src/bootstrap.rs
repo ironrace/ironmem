@@ -109,6 +109,7 @@ impl BootstrapLock {
     fn acquire(state_dir: &Path) -> Result<Self, MemoryError> {
         std::fs::create_dir_all(state_dir)?;
         let path = state_dir.join("bootstrap.lock");
+        let pid = std::process::id().to_string();
         let start = Instant::now();
         loop {
             match std::fs::OpenOptions::new()
@@ -116,8 +117,25 @@ impl BootstrapLock {
                 .create_new(true)
                 .open(&path)
             {
-                Ok(_) => return Ok(Self { path }),
+                Ok(mut file) => {
+                    use std::io::Write;
+                    let _ = file.write_all(pid.as_bytes());
+                    return Ok(Self { path });
+                }
                 Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                    // Check if the owning process is still alive.
+                    if let Ok(raw) = std::fs::read_to_string(&path) {
+                        if let Ok(owner_pid) = raw.trim().parse::<u32>() {
+                            if !process_is_alive(owner_pid) {
+                                // Stale lock — owner crashed. Remove and retry immediately.
+                                tracing::warn!(
+                                    "Removing stale bootstrap lock (pid {owner_pid} is gone)"
+                                );
+                                let _ = std::fs::remove_file(&path);
+                                continue;
+                            }
+                        }
+                    }
                     if start.elapsed() > Duration::from_secs(10) {
                         return Err(MemoryError::Io(std::io::Error::new(
                             std::io::ErrorKind::TimedOut,
@@ -129,6 +147,21 @@ impl BootstrapLock {
                 Err(error) => return Err(MemoryError::Io(error)),
             }
         }
+    }
+}
+
+/// Returns true if the given PID has a live process on this system.
+fn process_is_alive(pid: u32) -> bool {
+    #[cfg(unix)]
+    {
+        // kill(pid, 0) returns 0 if the process exists, ESRCH if not.
+        let result = unsafe { libc::kill(pid as libc::pid_t, 0) };
+        result == 0 || (result == -1 && unsafe { *libc::__error() } != libc::ESRCH)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = pid;
+        true // Conservative: assume alive on non-Unix
     }
 }
 
