@@ -10,7 +10,6 @@ pub struct Entity {
     pub id: String,
     pub name: String,
     pub entity_type: String,
-    pub properties: serde_json::Value,
     pub created_at: String,
 }
 
@@ -65,9 +64,8 @@ impl<'a> KnowledgeGraph<'a> {
         &self,
         name: &str,
         entity_type: &str,
-        properties: &serde_json::Value,
     ) -> Result<String, MemoryError> {
-        Self::upsert_entity_conn(&self.db.conn, name, entity_type, properties)
+        Self::upsert_entity_conn(&self.db.conn, name, entity_type)
     }
 
     /// Add a triple (relationship between entities).
@@ -159,27 +157,18 @@ impl<'a> KnowledgeGraph<'a> {
         );
 
         let mut stmt = self.db.conn.prepare(
-            "SELECT id, name, entity_type, properties, created_at
+            "SELECT id, name, entity_type, created_at
              FROM entities
              WHERE INSTR(?1, ' ' || LOWER(name) || ' ') > 0
              LIMIT 100",
         )?;
 
         let rows = stmt.query_map(params![text_padded], |row| {
-            let props_str: String = row.get(3)?;
-            let properties = match serde_json::from_str(&props_str) {
-                Ok(v) => v,
-                Err(_) => {
-                    tracing::warn!("Malformed JSON in entity properties, using default");
-                    serde_json::Value::default()
-                }
-            };
             Ok(Entity {
                 id: row.get(0)?,
                 name: row.get(1)?,
                 entity_type: row.get(2)?,
-                properties,
-                created_at: row.get(4)?,
+                created_at: row.get(3)?,
             })
         })?;
 
@@ -196,14 +185,11 @@ impl<'a> KnowledgeGraph<'a> {
         entity_type: Option<&str>,
     ) -> Result<Vec<Entity>, MemoryError> {
         let map_row = |row: &rusqlite::Row<'_>| -> rusqlite::Result<Entity> {
-            let props_str: String = row.get(3)?;
-            let properties = serde_json::from_str(&props_str).unwrap_or_default();
             Ok(Entity {
                 id: row.get(0)?,
                 name: row.get(1)?,
                 entity_type: row.get(2)?,
-                properties,
-                created_at: row.get(4)?,
+                created_at: row.get(3)?,
             })
         };
 
@@ -212,7 +198,7 @@ impl<'a> KnowledgeGraph<'a> {
         match entity_type {
             Some(kind) => {
                 let mut stmt = self.db.conn.prepare(
-                    "SELECT id, name, entity_type, properties, created_at
+                    "SELECT id, name, entity_type, created_at
                      FROM entities
                      WHERE LOWER(name) = LOWER(?1) AND entity_type = ?2
                      ORDER BY created_at ASC",
@@ -224,7 +210,7 @@ impl<'a> KnowledgeGraph<'a> {
             }
             None => {
                 let mut stmt = self.db.conn.prepare(
-                    "SELECT id, name, entity_type, properties, created_at
+                    "SELECT id, name, entity_type, created_at
                      FROM entities
                      WHERE LOWER(name) = LOWER(?1)
                      ORDER BY entity_type ASC, created_at ASC",
@@ -271,18 +257,15 @@ impl<'a> KnowledgeGraph<'a> {
     /// Get an entity by ID.
     pub fn get_entity(&self, entity_id: &str) -> Result<Option<Entity>, MemoryError> {
         let mut stmt = self.db.conn.prepare(
-            "SELECT id, name, entity_type, properties, created_at FROM entities WHERE id = ?1",
+            "SELECT id, name, entity_type, created_at FROM entities WHERE id = ?1",
         )?;
 
         let mut rows = stmt.query_map(params![entity_id], |row| {
-            let props_str: String = row.get(3)?;
-            let properties = serde_json::from_str(&props_str).unwrap_or_default();
             Ok(Entity {
                 id: row.get(0)?,
                 name: row.get(1)?,
                 entity_type: row.get(2)?,
-                properties,
-                created_at: row.get(4)?,
+                created_at: row.get(3)?,
             })
         })?;
 
@@ -366,15 +349,13 @@ impl<'a> KnowledgeGraph<'a> {
         conn: &Connection,
         name: &str,
         entity_type: &str,
-        properties: &serde_json::Value,
     ) -> Result<String, MemoryError> {
         let id = entity_id(name, entity_type);
         conn.execute(
-            "INSERT INTO entities (id, name, entity_type, properties)
-             VALUES (?1, ?2, ?3, ?4)
-             ON CONFLICT(id) DO UPDATE SET
-                properties = ?4",
-            params![id, name, entity_type, properties.to_string()],
+            "INSERT INTO entities (id, name, entity_type)
+             VALUES (?1, ?2, ?3)
+             ON CONFLICT(id) DO NOTHING",
+            params![id, name, entity_type],
         )?;
         Ok(id)
     }
@@ -391,10 +372,8 @@ impl<'a> KnowledgeGraph<'a> {
         confidence: f64,
         source_closet: Option<&str>,
     ) -> Result<String, MemoryError> {
-        let subject_id =
-            Self::upsert_entity_conn(conn, subject_name, subject_type, &serde_json::json!({}))?;
-        let object_id =
-            Self::upsert_entity_conn(conn, object_name, object_type, &serde_json::json!({}))?;
+        let subject_id = Self::upsert_entity_conn(conn, subject_name, subject_type)?;
+        let object_id = Self::upsert_entity_conn(conn, object_name, object_type)?;
 
         if let Some(existing_id) = conn
             .query_row(
@@ -468,20 +447,15 @@ mod tests {
         let db = Database::open_in_memory().unwrap();
         let kg = KnowledgeGraph::new(&db);
 
-        let id1 = kg
-            .upsert_entity("Alice", "person", &serde_json::json!({"age": 30}))
-            .unwrap();
-        let id2 = kg
-            .upsert_entity("Alice", "person", &serde_json::json!({"age": 31}))
-            .unwrap();
+        let id1 = kg.upsert_entity("Alice", "person").unwrap();
+        let id2 = kg.upsert_entity("Alice", "person").unwrap();
 
         assert_eq!(id1, id2); // Same name+type → same ID
         assert_eq!(id1.len(), 32);
 
-        // Properties should be updated
         let entity = kg.get_entity(&id1).unwrap().unwrap();
         assert_eq!(entity.name, "Alice");
-        assert_eq!(entity.properties["age"], 31);
+        assert_eq!(entity.entity_type, "person");
     }
 
     #[test]
@@ -627,10 +601,8 @@ mod tests {
         let db = Database::open_in_memory().unwrap();
         let kg = KnowledgeGraph::new(&db);
 
-        kg.upsert_entity("Apple", "company", &serde_json::json!({}))
-            .unwrap();
-        kg.upsert_entity("Apple", "person", &serde_json::json!({}))
-            .unwrap();
+        kg.upsert_entity("Apple", "company").unwrap();
+        kg.upsert_entity("Apple", "person").unwrap();
 
         let err = kg.resolve_entity("Apple", None).unwrap_err().to_string();
         assert!(err.contains("ambiguous"));
@@ -684,10 +656,8 @@ mod tests {
         let db = Database::open_in_memory().unwrap();
         let kg = KnowledgeGraph::new(&db);
 
-        kg.upsert_entity("cat", "animal", &serde_json::json!({}))
-            .unwrap();
-        kg.upsert_entity("scatter", "action", &serde_json::json!({}))
-            .unwrap();
+        kg.upsert_entity("cat", "animal").unwrap();
+        kg.upsert_entity("scatter", "action").unwrap();
 
         // "cat" should match "I have a cat" but NOT "scatter"
         let matches = kg.find_entities_in_text("I have a cat").unwrap();
@@ -701,8 +671,7 @@ mod tests {
         let db = Database::open_in_memory().unwrap();
         let kg = KnowledgeGraph::new(&db);
 
-        kg.upsert_entity("cat", "animal", &serde_json::json!({}))
-            .unwrap();
+        kg.upsert_entity("cat", "animal").unwrap();
 
         // Punctuation adjacent to entity name should still match
         let cases = vec![
@@ -728,8 +697,7 @@ mod tests {
         let db = Database::open_in_memory().unwrap();
         let kg = KnowledgeGraph::new(&db);
 
-        kg.upsert_entity("Alice", "person", &serde_json::json!({}))
-            .unwrap();
+        kg.upsert_entity("Alice", "person").unwrap();
 
         let matches = kg.find_entities_in_text("Bob went to the store").unwrap();
         assert!(matches.is_empty());

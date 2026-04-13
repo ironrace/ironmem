@@ -21,7 +21,6 @@ CREATE TABLE IF NOT EXISTS entities (
     id          TEXT PRIMARY KEY,
     name        TEXT NOT NULL,
     entity_type TEXT NOT NULL DEFAULT 'unknown',
-    properties  TEXT NOT NULL DEFAULT '{}',
     created_at  TEXT NOT NULL DEFAULT (datetime('now'))
 );
 

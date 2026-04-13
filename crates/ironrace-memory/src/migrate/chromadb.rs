@@ -146,7 +146,7 @@ fn load_drawers_from_chromadb(source: &Connection) -> Result<Vec<MempalaceDrawer
     Ok(result)
 }
 
-type EntityRow = (String, String, String, String);
+type EntityRow = (String, String, String);
 type TripleRow = (
     String,
     String,
@@ -177,15 +177,12 @@ fn insert_kg_payload_tx(
     triples: &[TripleRow],
     extracted_at: &str,
 ) -> Result<(), MemoryError> {
-    for (id, name, entity_type, properties) in entities {
+    for (id, name, entity_type) in entities {
         tx.execute(
-            "INSERT INTO entities (id, name, entity_type, properties)
-             VALUES (?1, ?2, ?3, ?4)
-             ON CONFLICT(id) DO UPDATE SET
-                name = excluded.name,
-                entity_type = excluded.entity_type,
-                properties = excluded.properties",
-            params![id, name, entity_type, properties],
+            "INSERT INTO entities (id, name, entity_type)
+             VALUES (?1, ?2, ?3)
+             ON CONFLICT(id) DO NOTHING",
+            params![id, name, entity_type],
         )?;
     }
     for (id, subject, predicate, object, valid_from, valid_to, confidence, source_closet) in triples
@@ -216,14 +213,12 @@ fn insert_kg_payload_tx(
 }
 
 fn collect_kg_entities(source: &Connection) -> Result<Vec<EntityRow>, MemoryError> {
-    let mut stmt =
-        source.prepare("SELECT id, name, type, COALESCE(properties, '{}') FROM entities")?;
+    let mut stmt = source.prepare("SELECT id, name, type FROM entities")?;
     let rows = stmt.query_map([], |row| {
         Ok((
             row.get::<_, String>(0)?,
             row.get::<_, String>(1)?,
             row.get::<_, String>(2)?,
-            row.get::<_, String>(3)?,
         ))
     })?;
     rows.collect::<Result<Vec<_>, _>>().map_err(MemoryError::Db)
