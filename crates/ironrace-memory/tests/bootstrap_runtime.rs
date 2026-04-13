@@ -1,5 +1,5 @@
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Barrier};
+use std::sync::{Arc, Barrier, Mutex};
 
 use ironrace_memory::bootstrap::ensure_bootstrapped;
 use ironrace_memory::config::{Config, EmbedMode, McpAccessMode};
@@ -46,6 +46,12 @@ impl Drop for EnvGuard {
     }
 }
 
+/// Tests that manipulate process-global env vars (HOME, IRONMEM_*) must not run
+/// concurrently — concurrent drops of EnvGuard can unset IRONMEM_DISABLE_MIGRATION
+/// while the other test's threads are inside ensure_bootstrapped, causing
+/// detect_mempalace_store to find the real ~/.mempalace store and migrate it.
+static ENV_MUTEX: Mutex<()> = Mutex::new(());
+
 fn workspace_state_path(state_dir: &Path, workspace_root: &Path) -> PathBuf {
     let mut hasher = Sha256::new();
     hasher.update(workspace_root.to_string_lossy().as_bytes());
@@ -57,6 +63,7 @@ fn workspace_state_path(state_dir: &Path, workspace_root: &Path) -> PathBuf {
 
 #[test]
 fn concurrent_bootstrap_on_same_workspace_completes_without_duplication() {
+    let _env = ENV_MUTEX.lock().unwrap();
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path();
     let home = root.join("home");
@@ -99,6 +106,7 @@ fn concurrent_bootstrap_on_same_workspace_completes_without_duplication() {
 
 #[test]
 fn malformed_workspace_state_is_ignored_and_recovery_remains_idempotent() {
+    let _env = ENV_MUTEX.lock().unwrap();
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path();
     let home = root.join("home");
