@@ -324,6 +324,26 @@ impl Database {
         Ok(result)
     }
 
+    /// Return all (wing, room) pairs present in the drawers table.
+    ///
+    /// Used by the graph module to build the room adjacency graph without
+    /// requiring direct access to `conn`.
+    pub fn wing_room_pairs(&self) -> Result<Vec<(String, String)>, MemoryError> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT DISTINCT wing, room FROM drawers")?;
+        let rows = stmt.query_map([], |row| {
+            let wing: String = row.get(0)?;
+            let room: String = row.get(1)?;
+            Ok((wing, room))
+        })?;
+        let mut result = Vec::new();
+        for row in rows {
+            result.push(row?);
+        }
+        Ok(result)
+    }
+
     /// Get full taxonomy: wing -> room -> count.
     pub fn taxonomy(
         &self,

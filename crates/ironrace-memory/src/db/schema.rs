@@ -8,8 +8,13 @@ use ironrace_embed::embedder::EMBED_DIM;
 const SCHEMA_SQL: &str = include_str!("../../../../migrations/001_init.sql");
 
 /// Database wrapper around a SQLite connection.
+///
+/// `conn` is intentionally restricted to `pub(super)` (visible only within
+/// `crate::db`). External callers must go through the `Database` API so that
+/// all access is auditable and the single-threaded invariant is enforced at the
+/// boundary rather than scattered across the codebase.
 pub struct Database {
-    pub(crate) conn: Connection,
+    pub(super) conn: Connection,
 }
 
 impl Database {
@@ -115,8 +120,8 @@ mod tests {
     #[test]
     fn test_load_all_vectors_rejects_corrupt_blob_length() {
         let db = Database::open_in_memory().unwrap();
-        db.conn
-            .execute(
+        db.with_transaction(|tx| {
+            tx.execute(
                 "INSERT INTO drawers (id, content, embedding, wing, room, source_file, added_by)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
                 rusqlite::params![
@@ -128,8 +133,10 @@ mod tests {
                     "",
                     "test"
                 ],
-            )
-            .unwrap();
+            )?;
+            Ok(())
+        })
+        .unwrap();
 
         let err = db.load_all_vectors().unwrap_err().to_string();
         assert!(err.contains("invalid embedding blob length"));
@@ -142,8 +149,8 @@ mod tests {
             .into_iter()
             .flat_map(|value| value.to_le_bytes())
             .collect();
-        db.conn
-            .execute(
+        db.with_transaction(|tx| {
+            tx.execute(
                 "INSERT INTO drawers (id, content, embedding, wing, room, source_file, added_by)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
                 rusqlite::params![
@@ -155,8 +162,10 @@ mod tests {
                     "",
                     "test"
                 ],
-            )
-            .unwrap();
+            )?;
+            Ok(())
+        })
+        .unwrap();
 
         let err = db.load_all_vectors().unwrap_err().to_string();
         assert!(err.contains("embedding dimension"));

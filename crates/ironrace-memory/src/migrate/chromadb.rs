@@ -141,6 +141,18 @@ fn load_drawers_from_chromadb(source: &Connection) -> Result<Vec<MempalaceDrawer
     Ok(result)
 }
 
+type EntityRow = (String, String, String, String);
+type TripleRow = (
+    String,
+    String,
+    String,
+    String,
+    Option<String>,
+    Option<String>,
+    f64,
+    Option<String>,
+);
+
 fn migrate_knowledge_graph(root: &Path, app: &App) -> Result<(), MemoryError> {
     let kg_path = detect_knowledge_graph_path(root);
     let Some(kg_path) = kg_path else {
@@ -148,9 +160,66 @@ fn migrate_knowledge_graph(root: &Path, app: &App) -> Result<(), MemoryError> {
     };
     let source = Connection::open(kg_path)?;
 
-    let mut entity_stmt =
+    // Collect all rows eagerly from the source before opening our transaction.
+    let entities = collect_kg_entities(&source)?;
+    let triples = collect_kg_triples(&source)?;
+
+    if entities.is_empty() && triples.is_empty() {
+        return Ok(());
+    }
+
+    let extracted_at = chrono::Utc::now().to_rfc3339();
+
+    // Write everything in a single transaction so a crash mid-migration does
+    // not leave partially imported entities without their corresponding triples.
+    app.db.with_transaction(|tx| {
+        for (id, name, entity_type, properties) in &entities {
+            tx.execute(
+                "INSERT INTO entities (id, name, entity_type, properties)
+                 VALUES (?1, ?2, ?3, ?4)
+                 ON CONFLICT(id) DO UPDATE SET
+                    name = excluded.name,
+                    entity_type = excluded.entity_type,
+                    properties = excluded.properties",
+                params![id, name, entity_type, properties],
+            )?;
+        }
+        for (id, subject, predicate, object, valid_from, valid_to, confidence, source_closet) in
+            &triples
+        {
+            tx.execute(
+                "INSERT INTO triples
+                 (id, subject, predicate, object, valid_from, valid_to, confidence, source_closet, extracted_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+                 ON CONFLICT(id) DO UPDATE SET
+                    valid_from = excluded.valid_from,
+                    valid_to = excluded.valid_to,
+                    confidence = excluded.confidence,
+                    source_closet = excluded.source_closet",
+                params![
+                    id,
+                    subject,
+                    predicate,
+                    object,
+                    valid_from,
+                    valid_to,
+                    confidence,
+                    source_closet,
+                    &extracted_at,
+                ],
+            )?;
+        }
+        Ok(())
+    })?;
+
+    let _ = KnowledgeGraph::new(&app.db).stats()?;
+    Ok(())
+}
+
+fn collect_kg_entities(source: &Connection) -> Result<Vec<EntityRow>, MemoryError> {
+    let mut stmt =
         source.prepare("SELECT id, name, type, COALESCE(properties, '{}') FROM entities")?;
-    let entities = entity_stmt.query_map([], |row| {
+    let rows = stmt.query_map([], |row| {
         Ok((
             row.get::<_, String>(0)?,
             row.get::<_, String>(1)?,
@@ -158,24 +227,16 @@ fn migrate_knowledge_graph(root: &Path, app: &App) -> Result<(), MemoryError> {
             row.get::<_, String>(3)?,
         ))
     })?;
-    for entity in entities {
-        let (id, name, entity_type, properties) = entity?;
-        app.db.conn.execute(
-            "INSERT INTO entities (id, name, entity_type, properties)
-             VALUES (?1, ?2, ?3, ?4)
-             ON CONFLICT(id) DO UPDATE SET
-                name = excluded.name,
-                entity_type = excluded.entity_type,
-                properties = excluded.properties",
-            params![id, name, entity_type, properties],
-        )?;
-    }
+    rows.collect::<Result<Vec<_>, _>>().map_err(MemoryError::Db)
+}
 
-    let mut triple_stmt = source.prepare(
-        "SELECT id, subject, predicate, object, valid_from, valid_to, COALESCE(confidence, 1.0), source_closet
+fn collect_kg_triples(source: &Connection) -> Result<Vec<TripleRow>, MemoryError> {
+    let mut stmt = source.prepare(
+        "SELECT id, subject, predicate, object, valid_from, valid_to,
+                COALESCE(confidence, 1.0), source_closet
          FROM triples",
     )?;
-    let triples = triple_stmt.query_map([], |row| {
+    let rows = stmt.query_map([], |row| {
         Ok((
             row.get::<_, String>(0)?,
             row.get::<_, String>(1)?,
@@ -187,35 +248,7 @@ fn migrate_knowledge_graph(root: &Path, app: &App) -> Result<(), MemoryError> {
             row.get::<_, Option<String>>(7)?,
         ))
     })?;
-    for triple in triples {
-        let (id, subject, predicate, object, valid_from, valid_to, confidence, source_closet) =
-            triple?;
-        let extracted_at = chrono::Utc::now().to_rfc3339();
-        app.db.conn.execute(
-            "INSERT INTO triples
-             (id, subject, predicate, object, valid_from, valid_to, confidence, source_closet, extracted_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
-             ON CONFLICT(id) DO UPDATE SET
-                valid_from = excluded.valid_from,
-                valid_to = excluded.valid_to,
-                confidence = excluded.confidence,
-                source_closet = excluded.source_closet",
-            params![
-                id,
-                subject,
-                predicate,
-                object,
-                valid_from,
-                valid_to,
-                confidence,
-                source_closet,
-                extracted_at,
-            ],
-        )?;
-    }
-
-    let _ = KnowledgeGraph::new(&app.db).stats()?;
-    Ok(())
+    rows.collect::<Result<Vec<_>, _>>().map_err(MemoryError::Db)
 }
 
 fn detect_knowledge_graph_path(root: &Path) -> Option<PathBuf> {

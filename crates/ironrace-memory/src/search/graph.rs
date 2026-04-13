@@ -8,7 +8,6 @@ use std::collections::{HashMap, HashSet, VecDeque};
 
 use serde::Serialize;
 
-use crate::db::schema::Database;
 use crate::error::MemoryError;
 use crate::mcp::app::App;
 
@@ -42,19 +41,11 @@ pub struct MemoryGraph {
 }
 
 /// Build the room adjacency graph from drawer metadata.
-fn build_graph_from_db(db: &Database) -> Result<MemoryGraph, MemoryError> {
+fn build_graph_from_db(app: &App) -> Result<MemoryGraph, MemoryError> {
     let mut wing_rooms: HashMap<String, HashSet<String>> = HashMap::new();
     let mut room_wings: HashMap<String, HashSet<String>> = HashMap::new();
 
-    let mut stmt = db.conn.prepare("SELECT DISTINCT wing, room FROM drawers")?;
-    let rows = stmt.query_map([], |row| {
-        let wing: String = row.get(0)?;
-        let room: String = row.get(1)?;
-        Ok((wing, room))
-    })?;
-
-    for row in rows {
-        let (wing, room) = row?;
+    for (wing, room) in app.db.wing_room_pairs()? {
         wing_rooms
             .entry(wing.clone())
             .or_default()
@@ -82,7 +73,7 @@ fn get_graph(app: &App) -> Result<MemoryGraph, MemoryError> {
     }
 
     // Cache miss: build from DB and store
-    let graph = build_graph_from_db(&app.db)?;
+    let graph = build_graph_from_db(app)?;
     if let Ok(mut cache) = app.graph_cache.write() {
         *cache = Some(graph.clone());
     }
