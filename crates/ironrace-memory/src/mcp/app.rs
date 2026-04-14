@@ -1,7 +1,7 @@
 //! Application state — initialized once, shared across MCP tool handlers.
 
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::RwLock;
+use std::sync::{Arc, RwLock};
 
 use ironrace_core::VectorIndex;
 use ironrace_embed::Embedder;
@@ -28,6 +28,11 @@ pub struct App {
     dirty: AtomicBool,
     /// Cached memory graph (wing/room adjacency). Invalidated on writes.
     pub graph_cache: RwLock<Option<MemoryGraph>>,
+    /// Set to true once background memory init (model load + bootstrap) completes.
+    /// False during warmup; tools that need the embedder return a warming_up response.
+    pub memory_ready: Arc<AtomicBool>,
+    /// Guards the one-time HNSW rebuild triggered when memory_ready transitions to true.
+    memory_ready_rebuilt: AtomicBool,
 }
 
 impl App {
@@ -84,7 +89,44 @@ impl App {
             }),
             dirty: AtomicBool::new(false),
             graph_cache: RwLock::new(None),
+            memory_ready: Arc::new(AtomicBool::new(true)),
+            memory_ready_rebuilt: AtomicBool::new(true),
         })
+    }
+
+    /// Phase-1 fast init for `serve`: open DB and migrate schema only (~50ms).
+    /// The embedder is a noop placeholder; background init replaces it via
+    /// `run_background_memory_init` and signals `memory_ready` when done.
+    pub fn new_server_ready(config: Config) -> Result<Self, MemoryError> {
+        config.ensure_dirs()?;
+        let db = Database::open(&config.db_path)?;
+        db.migrate()?;
+        if let Err(e) = db.wal_prune(None) {
+            tracing::warn!("WAL pruning failed (non-fatal): {e}");
+        }
+        tracing::info!(
+            "Server ready (memory warming up in background), MCP mode: {:?}",
+            config.mcp_access_mode,
+        );
+        Ok(Self {
+            config,
+            db,
+            embedder: RwLock::new(Embedder::new_noop()),
+            index_state: RwLock::new(IndexState {
+                index: VectorIndex::build(&[], 100),
+                id_map: Vec::new(),
+            }),
+            dirty: AtomicBool::new(false),
+            graph_cache: RwLock::new(None),
+            memory_ready: Arc::new(AtomicBool::new(false)),
+            memory_ready_rebuilt: AtomicBool::new(false),
+        })
+    }
+
+    /// Returns true while background memory init is still in progress.
+    /// Embedding-dependent tools should return a warming_up response during this window.
+    pub fn is_warming_up(&self) -> bool {
+        !self.memory_ready.load(Ordering::Relaxed)
     }
 
     /// Create an App with an in-memory DB and noop embedder for testing.
@@ -126,6 +168,8 @@ impl App {
             }),
             dirty: AtomicBool::new(false),
             graph_cache: RwLock::new(None),
+            memory_ready: Arc::new(AtomicBool::new(true)),
+            memory_ready_rebuilt: AtomicBool::new(true),
         })
     }
 
@@ -140,10 +184,41 @@ impl App {
     }
 
     /// Rebuild the HNSW index if dirty. Called before search.
+    /// Also triggers a one-time embedder reload + index rebuild when background
+    /// memory init completes — the serving App starts with a Noop embedder and
+    /// must swap in the real model before it can embed queries correctly.
     pub fn ensure_index_fresh(&self) -> Result<(), MemoryError> {
+        if self.memory_ready.load(Ordering::Acquire)
+            && !self.memory_ready_rebuilt.swap(true, Ordering::AcqRel)
+        {
+            self.reload_embedder()?;
+            self.dirty.store(true, Ordering::Release);
+        }
         if self.dirty.load(Ordering::Acquire) {
             self.rebuild_index()?;
         }
+        Ok(())
+    }
+
+    /// Swap the real embedder into this App. Called once after background init completes.
+    fn reload_embedder(&self) -> Result<(), MemoryError> {
+        let new_embedder = match self.config.embed_mode {
+            EmbedMode::Noop => Embedder::new_noop(),
+            EmbedMode::Real => {
+                let model_dir = ironrace_embed::embedder::ensure_model_in_dir(
+                    &self.config.model_dir,
+                    !self.config.model_dir_explicit,
+                )
+                .map_err(MemoryError::Embed)?;
+                Embedder::new(&model_dir).map_err(MemoryError::Embed)?
+            }
+        };
+        let mut emb = self
+            .embedder
+            .write()
+            .map_err(|e| MemoryError::Lock(format!("Embedder lock poisoned: {e}")))?;
+        *emb = new_embedder;
+        tracing::info!("Embedder reloaded after background init");
         Ok(())
     }
 

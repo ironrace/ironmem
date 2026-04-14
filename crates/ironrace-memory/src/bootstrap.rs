@@ -1,4 +1,6 @@
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
@@ -169,6 +171,35 @@ impl Drop for BootstrapLock {
     fn drop(&mut self) {
         let _ = std::fs::remove_file(&self.path);
     }
+}
+
+/// Spawn a background thread that runs the full memory init (model load + bootstrap).
+/// Signals `memory_ready` when done — even on failure — so the serve loop is never
+/// permanently blocked in warming-up mode.
+///
+/// The thread opens its own `App` (its own DB connection). SQLite WAL handles
+/// concurrent access from the serve loop's connection and this background connection.
+pub fn run_background_memory_init(config: Config, memory_ready: Arc<AtomicBool>) {
+    std::thread::spawn(move || {
+        let workspace = resolve_workspace_root(None);
+        let app = match App::new(config) {
+            Ok(a) => a,
+            Err(e) => {
+                tracing::error!("Background memory init failed (App::new): {e}");
+                memory_ready.store(true, Ordering::Release);
+                return;
+            }
+        };
+        match ensure_bootstrapped(&app, workspace.as_deref()) {
+            Ok(r) => tracing::info!(
+                "Bootstrap complete (initialized={}, mine_ran={})",
+                r.initialized_store,
+                r.initial_mine_ran
+            ),
+            Err(e) => tracing::error!("Bootstrap failed: {e}"),
+        }
+        memory_ready.store(true, Ordering::Release);
+    });
 }
 
 pub fn record_workspace_mine(config: &Config, workspace_root: &Path) -> Result<(), MemoryError> {

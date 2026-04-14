@@ -248,10 +248,18 @@ fn handle_status(app: &App) -> Result<Value, MemoryError> {
         "wings": wings.into_iter().collect::<std::collections::HashMap<_, _>>(),
         "knowledge_graph": kg_stats,
         "memory_protocol": MEMORY_PROTOCOL,
+        "warming_up": app.is_warming_up(),
     }))
 }
 
 fn handle_search(app: &App, args: &Value) -> Result<Value, MemoryError> {
+    if app.is_warming_up() {
+        return Ok(json!({
+            "warming_up": true,
+            "message": "Memory server is initializing. Search will be available shortly.",
+            "results": [],
+        }));
+    }
     let query = args
         .get("query")
         .and_then(|v| v.as_str())
@@ -301,6 +309,12 @@ fn handle_search(app: &App, args: &Value) -> Result<Value, MemoryError> {
 }
 
 fn handle_add_drawer(app: &App, args: &Value) -> Result<Value, MemoryError> {
+    if app.is_warming_up() {
+        return Ok(json!({
+            "warming_up": true,
+            "message": "Memory server is initializing. Please retry in a moment.",
+        }));
+    }
     let content = args
         .get("content")
         .and_then(|v| v.as_str())
@@ -579,6 +593,12 @@ fn handle_graph_stats(app: &App) -> Result<Value, MemoryError> {
 }
 
 fn handle_diary_write(app: &App, args: &Value) -> Result<Value, MemoryError> {
+    if app.is_warming_up() {
+        return Ok(json!({
+            "warming_up": true,
+            "message": "Memory server is initializing. Please retry in a moment.",
+        }));
+    }
     let content = args
         .get("content")
         .and_then(|v| v.as_str())

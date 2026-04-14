@@ -69,10 +69,15 @@ async fn run(cli: Cli) -> Result<(), MemoryError> {
     match cli.command {
         Commands::Serve { db } => {
             let cfg = config::Config::load(db)?;
+            // Phase 1: fast server-ready init (DB open + schema migrate, ~50ms).
             // App is not Sync (single-threaded stdio server, block_in_place dispatch).
             #[allow(clippy::arc_with_non_send_sync)]
-            let app = std::sync::Arc::new(mcp::app::App::new(cfg)?);
-            bootstrap::ensure_bootstrapped(app.as_ref(), None)?;
+            let app = std::sync::Arc::new(mcp::app::App::new_server_ready(cfg.clone())?);
+            // Phase 2: model load + bootstrap run in a background thread with its own
+            // DB connection (SQLite WAL handles concurrent access safely).
+            let memory_ready = std::sync::Arc::clone(&app.memory_ready);
+            bootstrap::run_background_memory_init(cfg, memory_ready);
+            // MCP stdio loop starts immediately — initialize responds in <100ms.
             mcp::server::run_server(app).await
         }
         Commands::Init => {
