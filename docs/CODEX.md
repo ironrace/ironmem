@@ -62,6 +62,35 @@ After registering the MCP server, validate the basics:
 3. Add a small drawer with `ironmem_add_drawer`.
 4. Search for it with `ironmem_search`.
 
+## Shared Memory Across Harnesses
+
+Codex and Claude Code share the **same database by default** (`~/.ironrace-memory/memory.sqlite3`). Memory written during a Claude session is immediately visible in Codex, and vice versa.
+
+The database is kept up to date automatically through hooks:
+
+| Hook | What happens |
+|------|-------------|
+| `session-start` | Bootstrap if first run; initial mine if workspace not yet indexed |
+| `stop` | Persist session summary to diary; re-mine files changed since last hook run |
+| `precompact` | Snapshot pending session context; re-mine changed files |
+
+Incremental re-mining uses a SHA-256 manifest so only files whose content changed are re-embedded. Repeat hook runs on unchanged workspaces are fast.
+
+SQLite WAL mode allows both harnesses to access the store concurrently without locking conflicts.
+
+**Isolation:** To give a harness its own store, set `IRONMEM_DB_PATH` in its plugin config:
+
+```toml
+# Codex-only store
+[mcp_servers.ironrace_memory.env]
+IRONMEM_DB_PATH = "~/.ironrace-memory/codex.sqlite3"
+```
+
+```json
+// Claude Code-only store — in .claude-plugin/.mcp.json env block
+"IRONMEM_DB_PATH": "/Users/you/.ironrace-memory/claude.sqlite3"
+```
+
 ## Startup Behavior
 
 `ironmem serve` uses a two-phase init so the harness is never left waiting at startup:

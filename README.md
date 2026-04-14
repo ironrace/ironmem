@@ -24,6 +24,26 @@ Key docs:
 - Codex and Claude Code plugin packaging is included
 - `~/.ironrace/bin/ironmem` is the preferred installed binary location; plugin launch scripts check there first
 
+## Shared Memory Across Harnesses
+
+Codex and Claude Code read from and write to the **same database by default** (`~/.ironrace-memory/memory.sqlite3`). Memory written in a Claude session is immediately visible in Codex, and vice versa — there is one unified store.
+
+The DB is updated automatically as you work:
+
+- **Session start** — bootstrap runs if this is the first time; the workspace is mined if it hasn't been indexed yet
+- **Stop / PreCompact** — changed files are detected via SHA-256 manifest and re-mined incrementally; a session summary is appended to the diary
+- **Later sessions** — only files whose content hash changed since the last hook run are re-embedded, so updates are fast
+
+SQLite WAL mode handles concurrent access safely when both harnesses are running at the same time.
+
+To give a harness its own isolated store, set `IRONMEM_DB_PATH` in its plugin config:
+
+```toml
+# ~/.codex/config.toml — Codex-only store
+[mcp_servers.ironrace_memory.env]
+IRONMEM_DB_PATH = "~/.ironrace-memory/codex.sqlite3"
+```
+
 ## Startup Behavior
 
 `ironmem serve` uses a two-phase init so the harness is never left waiting at startup:
