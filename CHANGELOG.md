@@ -9,6 +9,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Non-blocking MCP startup: `App::new_server_ready()` opens only the DB in Phase 1 (<50 ms), while `run_background_memory_init()` loads the ONNX model, runs bootstrap, and signals `memory_ready` in a background thread
+- `warming_up` flag on `ironmem_status` response and early-return guard in `ironmem_search`, `ironmem_add_drawer`, and diary writes — callers can poll status until `warming_up: false` before issuing write-heavy workloads
+- Embedder hot-swap: the serving `App` swaps in the real embedder (and triggers HNSW rebuild) the first time a tool call is made after the background thread signals ready
+- `--ironmem-only` flag on the benchmark harness to run without a mempalace checkout
+- `--debug-stderr` flag on the benchmark harness to redirect server stderr to `/tmp` log files
+- Warmup timing tracked separately from connect latency in benchmark output
+- p95 latencies reported alongside p50 in benchmark summary
+- Human-readable storage sizes (KB / MB / GB) in benchmark output
 - Shared diary persistence helper so hook-written session summaries and diary tool entries use the same append-only write path
 - Runtime QA coverage for bootstrap races, malformed bootstrap state recovery, CLI `init -> mine -> serve -> hook` smoke flows, malformed stdio protocol handling, failed re-mine recovery, and migration corruption/idempotency scenarios
 - `IRONMEM_EMBED_MODE=noop` for process-level tests and controlled local smoke runs without the ONNX model
@@ -17,6 +25,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Search overfetch increased from 3x to 5x (minimum 30 candidates) so needle documents are not dropped when their embeddings are diluted by unrelated document context
+- Benchmark harness sets `IRONMEM_AUTO_BOOTSTRAP=0` and `IRONMEM_DISABLE_MIGRATION=1` automatically so one-time bootstrap cost does not pollute latency measurements
+- Benchmark storage measurement now forces a SQLite WAL `TRUNCATE` checkpoint before measuring disk size for a fair comparison with Chroma-backed backends
+- Plugin launch scripts (`.claude-plugin/bin/ironmem-mcp.sh`, `.codex-plugin/bin/ironmem-mcp.sh`) check `~/.ironrace/bin/ironmem` first, then the repo release binary, then the debug binary
 - Bootstrap no longer infers a workspace from `cwd`; explicit workspace roots are required for auto-mining
 - `serve` now fails closed on bootstrap errors instead of starting with partial or skipped initialization
 - Re-mining replaces a file's drawers transactionally after embeddings are computed, so transient failures do not delete previously indexed content
@@ -28,6 +40,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Stale `bootstrap.lock` files left by SIGTERM'd processes are now detected and auto-cleared on the next startup instead of blocking bootstrap indefinitely
 - Sanitized `cwd` and `transcript_path` values before hook diary persistence to prevent path-shaped content injection into durable summaries
 - Rejected system directory prefixes for mining and migration inputs, and canonicalized mining roots before traversal
 - Removed `.env` from the mining allowlist to reduce accidental credential ingestion

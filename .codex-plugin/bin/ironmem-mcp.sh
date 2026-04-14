@@ -15,12 +15,16 @@ resolve_workspace_root() {
 
 export IRONMEM_WORKSPACE_ROOT="${IRONMEM_WORKSPACE_ROOT:-$(resolve_workspace_root)}"
 
-if [[ -x "$REPO_ROOT/target/debug/ironmem" ]]; then
-  exec "$REPO_ROOT/target/debug/ironmem" "$@"
+if [[ -x "$HOME/.ironrace/bin/ironmem" ]]; then
+  exec "$HOME/.ironrace/bin/ironmem" "$@"
 fi
 
 if [[ -x "$REPO_ROOT/target/release/ironmem" ]]; then
   exec "$REPO_ROOT/target/release/ironmem" "$@"
+fi
+
+if [[ -x "$REPO_ROOT/target/debug/ironmem" ]]; then
+  exec "$REPO_ROOT/target/debug/ironmem" "$@"
 fi
 
 cargo build -q --manifest-path "$REPO_ROOT/Cargo.toml" -p ironrace-memory --bin ironmem >&2
