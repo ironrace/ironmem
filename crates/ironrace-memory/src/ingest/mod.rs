@@ -375,7 +375,10 @@ fn save_manifest(path: &Path, manifest: &MineManifest) -> Result<(), MemoryError
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    std::fs::write(path, serde_json::to_string_pretty(manifest)?)?;
+    let raw = serde_json::to_string_pretty(manifest)?;
+    let tmp = path.with_extension("tmp");
+    std::fs::write(&tmp, &raw)?;
+    std::fs::rename(&tmp, path)?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;

@@ -158,7 +158,10 @@ fn process_is_alive(pid: u32) -> bool {
     {
         // kill(pid, 0) returns 0 if the process exists, ESRCH if not.
         let result = unsafe { libc::kill(pid as libc::pid_t, 0) };
-        result == 0 || (result == -1 && unsafe { *libc::__error() } != libc::ESRCH)
+        if result == 0 {
+            return true;
+        }
+        std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
     }
     #[cfg(not(unix))]
     {
