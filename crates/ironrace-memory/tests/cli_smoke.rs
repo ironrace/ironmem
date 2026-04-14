@@ -98,10 +98,30 @@ fn cli_init_mine_serve_and_hook_smoke_test() {
     let hook_start_output = hook_start.wait_with_output().unwrap();
     assert!(hook_start_output.status.success());
 
+    let transcript_path = workspace.join("transcript.jsonl");
+    std::fs::write(
+        &transcript_path,
+        format!(
+            "{}\n",
+            json!({
+                "message": {
+                    "role": "assistant",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": "Findings\n- High: transcript-derived review storage is missing in crates/ironrace-memory/src/hook.rs:48\n- Medium: add an end-to-end smoke assertion\nPR #7"
+                        }
+                    ]
+                }
+            })
+        ),
+    )
+    .unwrap();
+
     let stop_payload = json!({
         "cwd": workspace,
         "session_id": "smoke-session",
-        "transcript_path": workspace.join("transcript.jsonl")
+        "transcript_path": &transcript_path
     })
     .to_string();
     let mut hook_stop = base_command(&home, &db_path)
@@ -153,4 +173,12 @@ fn cli_init_mine_serve_and_hook_smoke_test() {
                 .contains("Hook stop ran")),
         "hook stop should persist a diary summary retrievable from the store"
     );
+
+    let reviews = app
+        .db
+        .get_drawers(Some("reviews"), Some("pr-7"), 10)
+        .unwrap();
+    assert_eq!(reviews.len(), 1);
+    assert!(reviews[0].content.contains("Findings"));
+    assert!(reviews[0].source_file.ends_with("transcript.jsonl"));
 }
