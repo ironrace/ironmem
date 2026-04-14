@@ -28,9 +28,24 @@ pub fn run_hook(
     config: Config,
 ) -> Result<HookResponse, MemoryError> {
     let input = read_hook_input()?;
+    run_hook_with_input(hook_name, harness, config, input)
+}
+
+fn run_hook_with_input(
+    hook_name: &str,
+    harness: &str,
+    config: Config,
+    input: serde_json::Value,
+) -> Result<HookResponse, MemoryError> {
     let workspace_root = parse_workspace_root(&input);
     let session_id = parse_session_id(&input);
     let app = App::new(config)?;
+    let allows_writes = app.config.mcp_access_mode.allows_writes();
+    let bootstrap_workspace = if allows_writes {
+        workspace_root.as_deref()
+    } else {
+        None
+    };
     let response = HookResponse {
         decision: None,
         reason: None,
@@ -43,19 +58,21 @@ pub fn run_hook(
 
     match hook_name {
         "session-start" => {
-            ensure_bootstrapped(&app, workspace_root.as_deref())?;
+            ensure_bootstrapped(&app, bootstrap_workspace)?;
         }
         "precompact" | "stop" => {
-            ensure_bootstrapped(&app, workspace_root.as_deref())?;
-            if let Some(root) = workspace_root.as_deref() {
-                mine_directory(&app, root.to_string_lossy().as_ref())?;
-                record_workspace_mine(&app.config, root)?;
-            }
+            ensure_bootstrapped(&app, bootstrap_workspace)?;
+            if allows_writes {
+                if let Some(root) = workspace_root.as_deref() {
+                    mine_directory(&app, root.to_string_lossy().as_ref())?;
+                    record_workspace_mine(&app.config, root)?;
+                }
 
-            if let Some(summary) =
-                session_summary(&input, hook_name, harness, session_id.as_deref())
-            {
-                persist_diary_summary(&app, &summary)?;
+                if let Some(summary) =
+                    session_summary(&input, hook_name, harness, session_id.as_deref())
+                {
+                    persist_diary_summary(&app, &summary)?;
+                }
             }
         }
         other => {
@@ -149,8 +166,12 @@ fn sanitize_path_for_log(raw: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::{Config, EmbedMode, McpAccessMode};
     use crate::mcp::protocol::JsonRpcRequest;
     use crate::mcp::server::dispatch;
+    use std::sync::{LazyLock, Mutex};
+
+    static ENV_MUTEX: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
     #[test]
     fn parses_workspace_root_from_payload() {
@@ -200,5 +221,43 @@ mod tests {
                 .any(|entry| entry["content"] == "Hook stop ran for test session"),
             "hook summaries must be readable through the diary API"
         );
+    }
+
+    #[test]
+    fn read_only_stop_hook_skips_mining_and_diary_writes() {
+        let _env = ENV_MUTEX.lock().unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = temp.path().join("workspace");
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::write(workspace.join("README.md"), "# Workspace\n\nMine me.").unwrap();
+
+        std::env::set_var("IRONMEM_DISABLE_MIGRATION", "1");
+
+        let config = Config {
+            db_path: temp.path().join("memory.sqlite3"),
+            model_dir: temp.path().join("model"),
+            model_dir_explicit: true,
+            state_dir: temp.path().join("hook_state"),
+            mcp_access_mode: McpAccessMode::ReadOnly,
+            embed_mode: EmbedMode::Noop,
+        };
+
+        let response = run_hook_with_input(
+            "stop",
+            "codex",
+            config.clone(),
+            serde_json::json!({
+                "cwd": workspace,
+                "session_id": "session-1",
+                "transcript_path": "/tmp/transcript.jsonl"
+            }),
+        )
+        .unwrap();
+
+        let app = App::new(config).unwrap();
+        assert_eq!(response.hook, "stop");
+        assert_eq!(app.db.count_drawers(None).unwrap(), 0);
+
+        std::env::remove_var("IRONMEM_DISABLE_MIGRATION");
     }
 }
