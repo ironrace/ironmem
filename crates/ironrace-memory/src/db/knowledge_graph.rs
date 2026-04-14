@@ -60,11 +60,7 @@ impl<'a> KnowledgeGraph<'a> {
     }
 
     /// Add or update an entity.
-    pub fn upsert_entity(
-        &self,
-        name: &str,
-        entity_type: &str,
-    ) -> Result<String, MemoryError> {
+    pub fn upsert_entity(&self, name: &str, entity_type: &str) -> Result<String, MemoryError> {
         Self::upsert_entity_conn(&self.db.conn, name, entity_type)
     }
 
@@ -256,9 +252,10 @@ impl<'a> KnowledgeGraph<'a> {
 
     /// Get an entity by ID.
     pub fn get_entity(&self, entity_id: &str) -> Result<Option<Entity>, MemoryError> {
-        let mut stmt = self.db.conn.prepare(
-            "SELECT id, name, entity_type, created_at FROM entities WHERE id = ?1",
-        )?;
+        let mut stmt = self
+            .db
+            .conn
+            .prepare("SELECT id, name, entity_type, created_at FROM entities WHERE id = ?1")?;
 
         let mut rows = stmt.query_map(params![entity_id], |row| {
             Ok(Entity {
