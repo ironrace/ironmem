@@ -101,6 +101,19 @@ pub fn mine_directory(app: &App, path: &str) -> Result<(), MemoryError> {
                 path = %file.absolute_path.display(),
                 "skipping file: possible secrets detected"
             );
+            // Evict any previously-indexed drawers so stale sensitive content
+            // does not remain searchable after a file gains credentials.
+            app.db.delete_drawers_by_source_file(&source_file)?;
+            // Record in the manifest with chunk_count=0 so subsequent mine
+            // runs see the current hash and skip without retrying.
+            manifest.files.insert(
+                source_file,
+                MineManifestEntry {
+                    content_hash: file.content_hash,
+                    chunk_count: 0,
+                    updated_at: chrono::Utc::now().to_rfc3339(),
+                },
+            );
             continue;
         }
 
@@ -328,6 +341,13 @@ fn file_contains_secrets(content: &str) -> bool {
             || lower.contains("_password=")
             || lower.contains("_passwd=")
             || lower.contains("api_key=")
+            // Spaced variants: `OPENAI_API_KEY = "..."` style (TOML, .env, INI)
+            || lower.contains("_key =")
+            || lower.contains("_secret =")
+            || lower.contains("_token =")
+            || lower.contains("_password =")
+            || lower.contains("_passwd =")
+            || lower.contains("api_key =")
             // Bare config-style assignments
             || lower.contains("password =")
             || lower.contains("passwd =")
@@ -548,13 +568,23 @@ mod tests {
     }
 
     #[test]
+    fn secret_filter_catches_spaced_assignment_variants() {
+        // TOML / .env / INI style: OPENAI_API_KEY = "sk-..."
+        assert!(file_contains_secrets("OPENAI_API_KEY = sk-abc123\n"));
+        assert!(file_contains_secrets("GITHUB_TOKEN = ghp_abc123\n"));
+        assert!(file_contains_secrets("MY_SECRET = supersecret\n"));
+        assert!(file_contains_secrets("DB_PASSWORD = hunter2\n"));
+    }
+
+    #[test]
     fn secret_filter_ignores_variable_names_without_assignment() {
         // "secret_key_field_name" in docs or code — no `=` follows the pattern
         assert!(!file_contains_secrets(
             "// See secret_key_field_name for details\n"
         ));
+        // Function call: `_key` appears but is followed by `)`, not ` =` or `=`
         assert!(!file_contains_secrets(
-            "let secret_key_field_name = get_key();\n"
+            "let value = get_key();\n"
         ));
     }
 

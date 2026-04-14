@@ -184,6 +184,8 @@ impl Drop for BootstrapLock {
 /// concurrent access from the serve loop's connection and this background connection.
 pub fn run_background_memory_init(config: Config, memory_ready: Arc<AtomicBool>) {
     std::thread::spawn(move || {
+        // Capture write permission before config is moved into App::new.
+        let writes_allowed = config.mcp_access_mode.allows_writes();
         let workspace = resolve_workspace_root(None);
         let app = match App::new(config) {
             Ok(a) => a,
@@ -193,13 +195,17 @@ pub fn run_background_memory_init(config: Config, memory_ready: Arc<AtomicBool>)
                 return;
             }
         };
-        match ensure_bootstrapped(&app, workspace.as_deref()) {
-            Ok(r) => tracing::info!(
-                "Bootstrap complete (initialized={}, mine_ran={})",
-                r.initialized_store,
-                r.initial_mine_ran
-            ),
-            Err(e) => tracing::error!("Bootstrap failed: {e}"),
+        if writes_allowed {
+            match ensure_bootstrapped(&app, workspace.as_deref()) {
+                Ok(r) => tracing::info!(
+                    "Bootstrap complete (initialized={}, mine_ran={})",
+                    r.initialized_store,
+                    r.initial_mine_ran
+                ),
+                Err(e) => tracing::error!("Bootstrap failed: {e}"),
+            }
+        } else {
+            tracing::debug!("Skipping auto-bootstrap: MCP access mode does not allow writes");
         }
         memory_ready.store(true, Ordering::Release);
     });
