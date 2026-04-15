@@ -82,14 +82,8 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
-      - name: cargo package ironrace-core
-        run: cargo package -p ironrace-core
-
-      - name: cargo package ironrace-embed
-        run: cargo package -p ironrace-embed
-
-      - name: cargo package ironrace-memory
-        run: cargo package -p ironrace-memory
+      - name: cargo package workspace
+        run: cargo package --workspace --no-verify
 
   plugin-metadata:
     name: Plugin Metadata
