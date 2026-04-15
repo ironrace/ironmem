@@ -61,6 +61,40 @@ jobs:
           name: ironmem-linux
           path: target/debug/ironmem
 
+  audit:
+    name: Security Audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Install cargo-audit
+        run: cargo install cargo-audit --locked
+
+      - name: cargo audit
+        run: cargo audit --deny warnings
+
+  package:
+    name: Package Dry-Run
+    runs-on: ubuntu-latest
+    needs: [check, test]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: cargo package ironrace-core
+        run: cargo package -p ironrace-core --no-verify
+
+      - name: cargo package ironrace-embed
+        run: cargo package -p ironrace-embed --no-verify
+
+      - name: cargo package ironrace-memory
+        run: cargo package -p ironrace-memory --no-verify
+
   plugin-metadata:
     name: Plugin Metadata
     runs-on: ubuntu-latest

@@ -8,6 +8,8 @@ authors = ["Jeffrey Crum <jeffrey.crum81@gmail.com>"]
 repository = "https://github.com/ironrace/ironrace-memory"
 homepage = "https://github.com/ironrace/ironrace-memory"
 keywords = ["embeddings", "onnx", "sentence-transformers", "nlp", "mcp"]
+categories = ["science", "algorithms"]
+readme = "../../README.md"
 
 [dependencies]
 ort = { version = "2.0.0-rc.12", default-features = false, features = ["std", "ndarray", "download-binaries", "tls-rustls", "copy-dylibs"] }

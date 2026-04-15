@@ -8,6 +8,14 @@ authors = ["Jeffrey Crum <jeffrey.crum81@gmail.com>"]
 repository = "https://github.com/ironrace/ironrace-memory"
 homepage = "https://github.com/ironrace/ironrace-memory"
 keywords = ["memory", "mcp", "semantic-search", "knowledge-graph", "ai"]
+categories = ["development-tools", "command-line-utilities"]
+readme = "../../README.md"
+exclude = [
+    "benches/",
+    "scripts/",
+    ".github/",
+    "docs/",
+]
 
 [lib]
 name = "ironrace_memory"

@@ -236,7 +236,9 @@ impl<'a> KnowledgeGraph<'a> {
                     "No entity found for {name}{type_suffix}"
                 )))
             }
-            1 => Ok(matches.into_iter().next().expect("single entity exists")),
+            1 => Ok(matches.into_iter().next().ok_or_else(|| {
+                    MemoryError::NotFound(format!("Entity '{name}' disappeared during lookup"))
+                })?),
             _ => {
                 let choices = matches
                     .iter()
