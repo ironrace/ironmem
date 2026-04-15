@@ -14,8 +14,8 @@ use crate::search::graph::MemoryGraph;
 /// HNSW index + id_map bundled together to eliminate TOCTOU between separate locks.
 pub struct IndexState {
     pub index: VectorIndex,
-    /// Maps HNSW index position → (drawer_id, embedding_vec).
-    pub id_map: Vec<(String, Vec<f32>)>,
+    /// Maps HNSW index position → drawer_id.
+    pub id_map: Vec<String>,
 }
 
 /// Top-level application state.
@@ -63,9 +63,10 @@ impl App {
 
         // Load vectors and build HNSW index
         let vectors_with_ids = db.load_all_vectors()?;
-
+        let drawer_count = vectors_with_ids.len();
         let vectors_for_index: Vec<Vec<f32>> =
             vectors_with_ids.iter().map(|(_, v)| v.clone()).collect();
+        let id_map: Vec<String> = vectors_with_ids.into_iter().map(|(id, _)| id).collect();
 
         let index = if vectors_for_index.is_empty() {
             VectorIndex::build(&[], 100)
@@ -75,7 +76,7 @@ impl App {
 
         tracing::info!(
             "Memory loaded: {} drawers, HNSW index built, MCP mode: {:?}",
-            vectors_with_ids.len(),
+            drawer_count,
             config.mcp_access_mode,
         );
 
@@ -83,10 +84,7 @@ impl App {
             config,
             db,
             embedder: RwLock::new(embedder),
-            index_state: RwLock::new(IndexState {
-                index,
-                id_map: vectors_with_ids,
-            }),
+            index_state: RwLock::new(IndexState { index, id_map }),
             dirty: AtomicBool::new(false),
             graph_cache: RwLock::new(None),
             memory_ready: Arc::new(AtomicBool::new(true)),
@@ -183,6 +181,32 @@ impl App {
         }
     }
 
+    /// Insert a single embedding into the live HNSW index without a full rebuild.
+    /// Falls back to a full rebuild from DB if the index is at capacity.
+    pub fn insert_into_index(&self, drawer_id: &str, embedding: &[f32]) -> Result<(), MemoryError> {
+        let mut state = self
+            .index_state
+            .write()
+            .map_err(|e| MemoryError::Lock(format!("IndexState lock poisoned: {e}")))?;
+
+        let pos = state.index.insert_one(embedding);
+        if pos == usize::MAX {
+            drop(state);
+            tracing::info!("HNSW index at capacity; falling back to full rebuild");
+            self.dirty.store(true, Ordering::Release);
+            return self.rebuild_index_from_db();
+        }
+
+        debug_assert_eq!(pos, state.id_map.len());
+        state.id_map.push(drawer_id.to_string());
+
+        if let Ok(mut cache) = self.graph_cache.write() {
+            *cache = None;
+        }
+
+        Ok(())
+    }
+
     /// If background init just completed, swap in the real embedder.
     /// Must be called before any embed operation (add, diary write, search).
     /// Idempotent: the swap happens at most once per server lifetime.
@@ -202,7 +226,7 @@ impl App {
     pub fn ensure_index_fresh(&self) -> Result<(), MemoryError> {
         self.ensure_embedder_ready()?;
         if self.dirty.load(Ordering::Acquire) {
-            self.rebuild_index()?;
+            self.rebuild_index_from_db()?;
         }
         Ok(())
     }
@@ -232,10 +256,10 @@ impl App {
     /// Rebuild the HNSW index from DB. Swaps index + id_map atomically.
     /// Dirty flag is cleared inside the write lock so a concurrent
     /// `mark_dirty()` that fires after our DB read is not lost.
-    fn rebuild_index(&self) -> Result<(), MemoryError> {
+    fn rebuild_index_from_db(&self) -> Result<(), MemoryError> {
         let vectors_with_ids = self.db.load_all_vectors()?;
-
         let vectors: Vec<Vec<f32>> = vectors_with_ids.iter().map(|(_, v)| v.clone()).collect();
+        let id_map: Vec<String> = vectors_with_ids.into_iter().map(|(id, _)| id).collect();
 
         let new_index = if vectors.is_empty() {
             VectorIndex::build(&[], 100)
@@ -252,7 +276,7 @@ impl App {
             .write()
             .map_err(|e| MemoryError::Lock(format!("IndexState lock poisoned: {e}")))?;
         state.index = new_index;
-        state.id_map = vectors_with_ids;
+        state.id_map = id_map;
         self.dirty.store(false, Ordering::Release);
         // Safety note: the MCP server dispatches one request at a time
         // (block_in_place on a single stdin line loop), so concurrent

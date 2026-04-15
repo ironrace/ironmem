@@ -116,6 +116,38 @@ fn add_search_delete_round_trip() {
     );
 }
 
+#[test]
+fn add_drawer_is_immediately_searchable_without_rebuild() {
+    let app = App::open_for_test().unwrap();
+
+    let dim = EMBED_DIM;
+    let mut embedding = vec![0.0f32; dim];
+    embedding[42] = 1.0;
+
+    let id = "aabbccdd00112233aabbccdd00112233";
+    app.db
+        .insert_drawer(
+            id,
+            "test content about rockets",
+            &embedding,
+            "test-wing",
+            "general",
+            "",
+            "src",
+        )
+        .unwrap();
+    app.insert_into_index(id, &embedding).unwrap();
+
+    let state = app.index_state.read().unwrap();
+    assert_eq!(state.index.len(), 1);
+    assert_eq!(state.id_map.len(), 1);
+    assert_eq!(state.id_map[0], id);
+
+    let results = state.index.search(&embedding, 1);
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].0, 0);
+}
+
 // ── Scenario 2: Multiple drawers → taxonomy ──────────────────────────────────
 
 /// Returns all room names listed under a wing in the taxonomy.

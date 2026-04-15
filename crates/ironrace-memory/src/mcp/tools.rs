@@ -359,8 +359,7 @@ fn handle_add_drawer(app: &App, args: &Value) -> Result<Value, MemoryError> {
         Ok(())
     })?;
 
-    // Mark index dirty only after the transaction commits.
-    app.mark_dirty();
+    app.insert_into_index(&id, &embedding)?;
 
     Ok(json!({
         "success": true,

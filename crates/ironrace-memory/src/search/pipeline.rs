@@ -70,7 +70,7 @@ pub fn search(
 
     let candidate_ids: Vec<&str> = hnsw_results
         .iter()
-        .filter_map(|(idx, _)| state.id_map.get(*idx).map(|(id, _)| id.as_str()))
+        .filter_map(|(idx, _)| state.id_map.get(*idx).map(|id| id.as_str()))
         .collect();
 
     let drawers = app.db.get_drawers_by_ids_filtered(
@@ -82,7 +82,7 @@ pub fn search(
     // Build scored results with metadata filtering
     let mut scored = Vec::new();
     for (idx, score) in &hnsw_results {
-        if let Some((id, _)) = state.id_map.get(*idx) {
+        if let Some(id) = state.id_map.get(*idx) {
             if let Some(drawer) = drawers.get(id) {
                 scored.push(ScoredDrawer {
                     drawer: drawer.clone(),

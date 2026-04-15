@@ -38,7 +38,7 @@ pub fn write_entry(
         )?;
         Ok(())
     })?;
-    app.mark_dirty();
+    app.insert_into_index(&id, &embedding)?;
 
     Ok(DiaryEntry { id, wing })
 }
