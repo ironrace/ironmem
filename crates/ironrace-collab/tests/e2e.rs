@@ -90,7 +90,7 @@ fn planning_loop_reaches_plan_approved() {
     let msgs = db.collab_message_recv(&session_id, "codex", 10).unwrap();
     assert_eq!(msgs.len(), 1);
     assert_eq!(msgs[0].topic, "plan");
-    db.collab_message_ack(&msgs[0].id).unwrap();
+    db.collab_message_ack(&msgs[0].id, &session_id).unwrap();
 
     let msg_id2 = generate_collab_id();
     let row = db.collab_session_get(&session_id).unwrap().unwrap();
@@ -116,7 +116,7 @@ fn planning_loop_reaches_plan_approved() {
     // ── Step 3: Claude reads feedback, sends revised plan ────────────────────
     let msgs = db.collab_message_recv(&session_id, "claude", 10).unwrap();
     assert_eq!(msgs.len(), 1);
-    db.collab_message_ack(&msgs[0].id).unwrap();
+    db.collab_message_ack(&msgs[0].id, &session_id).unwrap();
 
     let revised_hash = "sha256:plan_v2";
     let msg_id3 = generate_collab_id();
@@ -144,7 +144,7 @@ fn planning_loop_reaches_plan_approved() {
     // ── Step 4: Codex approves revised plan ──────────────────────────────────
     let msgs = db.collab_message_recv(&session_id, "codex", 10).unwrap();
     assert_eq!(msgs.len(), 1);
-    db.collab_message_ack(&msgs[0].id).unwrap();
+    db.collab_message_ack(&msgs[0].id, &session_id).unwrap();
 
     let row = db.collab_session_get(&session_id).unwrap().unwrap();
     let mut s = load_session(&row);
@@ -206,6 +206,7 @@ fn escalation_at_max_rounds() {
             claude_ok: false,
             codex_ok: false,
             content_hash: None,
+            rejected_hashes: &[],
         },
     )
     .unwrap();
@@ -343,6 +344,7 @@ fn persist(db: &Database, session_id: &str, s: &ironrace_collab::CollabSession) 
             claude_ok: s.claude_ok,
             codex_ok: s.codex_ok,
             content_hash: s.content_hash.as_deref(),
+            rejected_hashes: &s.rejected_hashes,
         },
     )
     .unwrap();
@@ -374,7 +376,7 @@ fn run_plan_feedback_cycle(
     {
         let msgs = db.collab_message_recv(session_id, "codex", 10).unwrap();
         for m in &msgs {
-            db.collab_message_ack(&m.id).unwrap();
+            db.collab_message_ack(&m.id, session_id).unwrap();
         }
         let row = db.collab_session_get(session_id).unwrap().unwrap();
         let mut s = load_session(&row);
@@ -393,7 +395,7 @@ fn run_plan_feedback_cycle(
     {
         let msgs = db.collab_message_recv(session_id, "claude", 10).unwrap();
         for m in &msgs {
-            db.collab_message_ack(&m.id).unwrap();
+            db.collab_message_ack(&m.id, session_id).unwrap();
         }
         let row = db.collab_session_get(session_id).unwrap().unwrap();
         let mut s = load_session(&row);

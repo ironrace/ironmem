@@ -848,6 +848,7 @@ fn handle_collab_send(app: &App, args: &Value) -> Result<Value, MemoryError> {
             claude_ok: session.claude_ok,
             codex_ok: session.codex_ok,
             content_hash: session.content_hash.as_deref(),
+            rejected_hashes: &session.rejected_hashes,
         },
     )?;
 
@@ -899,8 +900,8 @@ fn handle_collab_recv(app: &App, args: &Value) -> Result<Value, MemoryError> {
 
 fn handle_collab_ack(app: &App, args: &Value) -> Result<Value, MemoryError> {
     let message_id = require_str(args, "message_id")?;
-    require_str(args, "session_id")?; // validated for presence
-    app.db.collab_message_ack(message_id)?;
+    let session_id = require_str(args, "session_id")?;
+    app.db.collab_message_ack(message_id, session_id)?;
     Ok(json!({ "success": true }))
 }
 
@@ -941,6 +942,7 @@ fn handle_collab_approve(app: &App, args: &Value) -> Result<Value, MemoryError> 
             claude_ok: session.claude_ok,
             codex_ok: session.codex_ok,
             content_hash: session.content_hash.as_deref(),
+            rejected_hashes: &session.rejected_hashes,
         },
     )?;
 
@@ -1039,6 +1041,7 @@ fn session_row_to_state(row: &crate::db::collab::SessionRow) -> CollabSession {
     s.claude_ok = row.claude_ok;
     s.codex_ok = row.codex_ok;
     s.content_hash = row.content_hash.clone();
+    s.rejected_hashes = row.rejected_hashes.clone();
     s
 }
 

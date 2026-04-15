@@ -19,6 +19,7 @@ pub struct SessionRow {
     pub claude_ok: bool,
     pub codex_ok: bool,
     pub content_hash: Option<String>,
+    pub rejected_hashes: Vec<String>,
     pub created_at: String,
     pub updated_at: String,
 }
@@ -54,6 +55,7 @@ pub struct SessionUpdate<'a> {
     pub claude_ok: bool,
     pub codex_ok: bool,
     pub content_hash: Option<&'a str>,
+    pub rejected_hashes: &'a [String],
 }
 
 // ── Database impl ────────────────────────────────────────────────────────────
@@ -79,11 +81,14 @@ impl Database {
         let mut stmt = conn.prepare(
             "SELECT id, phase, current_owner, round, max_rounds,
                     repo_path, branch, claude_ok, codex_ok, content_hash,
-                    created_at, updated_at
+                    rejected_hashes, created_at, updated_at
              FROM collab_sessions WHERE id = ?1",
         )?;
         let mut rows = stmt.query(params![id])?;
         if let Some(row) = rows.next()? {
+            let rejected_json: String = row.get(10)?;
+            let rejected_hashes: Vec<String> =
+                serde_json::from_str(&rejected_json).unwrap_or_default();
             Ok(Some(SessionRow {
                 id: row.get(0)?,
                 phase: row.get(1)?,
@@ -95,8 +100,9 @@ impl Database {
                 claude_ok: row.get::<_, i64>(7)? != 0,
                 codex_ok: row.get::<_, i64>(8)? != 0,
                 content_hash: row.get(9)?,
-                created_at: row.get(10)?,
-                updated_at: row.get(11)?,
+                rejected_hashes,
+                created_at: row.get(11)?,
+                updated_at: row.get(12)?,
             }))
         } else {
             Ok(None)
@@ -108,12 +114,15 @@ impl Database {
         id: &str,
         u: &SessionUpdate<'_>,
     ) -> Result<(), MemoryError> {
+        let rejected_json =
+            serde_json::to_string(u.rejected_hashes).unwrap_or_else(|_| "[]".to_string());
         let updated = self.raw_conn().execute(
             "UPDATE collab_sessions
              SET phase = ?1, current_owner = ?2, round = ?3,
                  claude_ok = ?4, codex_ok = ?5, content_hash = ?6,
+                 rejected_hashes = ?7,
                  updated_at = datetime('now')
-             WHERE id = ?7",
+             WHERE id = ?8",
             params![
                 u.phase,
                 u.current_owner,
@@ -121,6 +130,7 @@ impl Database {
                 u.claude_ok as i64,
                 u.codex_ok as i64,
                 u.content_hash,
+                rejected_json,
                 id,
             ],
         )?;
@@ -205,11 +215,16 @@ impl Database {
         Ok(count)
     }
 
-    /// Mark a message as acked. Idempotent — no error if already acked.
-    pub fn collab_message_ack(&self, message_id: &str) -> Result<(), MemoryError> {
+    /// Mark a message as acked. Scoped to `session_id` to prevent cross-session acks.
+    /// Idempotent — no error if already acked.
+    pub fn collab_message_ack(
+        &self,
+        message_id: &str,
+        session_id: &str,
+    ) -> Result<(), MemoryError> {
         self.raw_conn().execute(
-            "UPDATE messages SET status = 'acked' WHERE id = ?1",
-            params![message_id],
+            "UPDATE messages SET status = 'acked' WHERE id = ?1 AND session_id = ?2",
+            params![message_id, session_id],
         )?;
         Ok(())
     }
@@ -331,6 +346,7 @@ mod tests {
                 claude_ok: false,
                 codex_ok: false,
                 content_hash: Some("abc"),
+                rejected_hashes: &[],
             },
         )
         .unwrap();
@@ -338,6 +354,7 @@ mod tests {
         assert_eq!(row.phase, "PlanReview");
         assert_eq!(row.current_owner, "codex");
         assert_eq!(row.content_hash.as_deref(), Some("abc"));
+        assert!(row.rejected_hashes.is_empty());
     }
 
     #[test]
@@ -353,6 +370,7 @@ mod tests {
                     claude_ok: false,
                     codex_ok: false,
                     content_hash: None,
+                    rejected_hashes: &[],
                 },
             )
             .unwrap_err();
@@ -381,7 +399,7 @@ mod tests {
         assert_eq!(msgs[0].topic, "plan");
         assert_eq!(msgs[0].content, "here is plan");
 
-        db.collab_message_ack("m1").unwrap();
+        db.collab_message_ack("m1", "sess3").unwrap();
         let msgs = db.collab_message_recv("sess3", "codex", 10).unwrap();
         assert_eq!(msgs.len(), 1);
         assert_eq!(msgs[0].id, "m2");
@@ -393,8 +411,43 @@ mod tests {
         db.collab_session_create("sess4", "/repo", "main").unwrap();
         db.collab_message_send("m1", "sess4", "claude", "codex", "plan", "x")
             .unwrap();
-        db.collab_message_ack("m1").unwrap();
-        db.collab_message_ack("m1").unwrap(); // should not error
+        db.collab_message_ack("m1", "sess4").unwrap();
+        db.collab_message_ack("m1", "sess4").unwrap(); // should not error
+    }
+
+    #[test]
+    fn message_ack_wrong_session_is_no_op() {
+        let db = open();
+        db.collab_session_create("sess4b", "/repo", "main").unwrap();
+        db.collab_message_send("m1", "sess4b", "claude", "codex", "plan", "x")
+            .unwrap();
+        // Ack with wrong session_id — message should remain pending
+        db.collab_message_ack("m1", "other-session").unwrap();
+        let msgs = db.collab_message_recv("sess4b", "codex", 10).unwrap();
+        assert_eq!(msgs.len(), 1, "message should still be pending");
+    }
+
+    #[test]
+    fn rejected_hashes_roundtrip() {
+        let db = open();
+        db.collab_session_create("sess_rh", "/repo", "main")
+            .unwrap();
+        let hashes = vec!["sha256:aaa".to_string(), "sha256:bbb".to_string()];
+        db.collab_session_update(
+            "sess_rh",
+            &SessionUpdate {
+                phase: "PlanFeedback",
+                current_owner: "claude",
+                round: 1,
+                claude_ok: false,
+                codex_ok: false,
+                content_hash: None,
+                rejected_hashes: &hashes,
+            },
+        )
+        .unwrap();
+        let row = db.collab_session_get("sess_rh").unwrap().unwrap();
+        assert_eq!(row.rejected_hashes, hashes);
     }
 
     #[test]

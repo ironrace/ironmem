@@ -9,11 +9,12 @@ CREATE TABLE IF NOT EXISTS collab_sessions (
     max_rounds    INTEGER NOT NULL DEFAULT 5,
     repo_path     TEXT NOT NULL,
     branch        TEXT NOT NULL,
-    claude_ok     INTEGER NOT NULL DEFAULT 0,
-    codex_ok      INTEGER NOT NULL DEFAULT 0,
-    content_hash  TEXT,
-    created_at    TEXT NOT NULL DEFAULT (datetime('now')),
-    updated_at    TEXT NOT NULL DEFAULT (datetime('now'))
+    claude_ok        INTEGER NOT NULL DEFAULT 0,
+    codex_ok         INTEGER NOT NULL DEFAULT 0,
+    content_hash     TEXT,
+    rejected_hashes  TEXT NOT NULL DEFAULT '[]',
+    created_at       TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at       TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
 -- Async message queue between Claude and Codex within a session.
