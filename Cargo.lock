@@ -1116,6 +1116,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "ironrace-collab"
+version = "0.1.0"
+dependencies = [
+ "ironrace-memory",
+ "rusqlite",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "ironrace-core"
 version = "0.1.0"
 dependencies = [
@@ -1145,6 +1154,7 @@ dependencies = [
  "clap",
  "dirs",
  "ignore",
+ "ironrace-collab",
  "ironrace-core",
  "ironrace-embed",
  "libc",

@@ -1,5 +1,6 @@
 [workspace]
 members = [
+    "crates/ironrace-collab",
     "crates/ironrace-core",
     "crates/ironrace-embed",
     "crates/ironrace-memory",

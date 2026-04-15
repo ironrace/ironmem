@@ -1,10 +1,13 @@
 //! MCP tool definitions and dispatch.
 
+use ironrace_collab::state_machine::{CollabError, CollabSession};
+use ironrace_collab::types::{Agent, Topic};
 use serde_json::{json, Value};
 
 use super::app::App;
 use crate::bootstrap::MEMORY_PROTOCOL;
 use crate::config::McpAccessMode;
+use crate::db::collab::{generate_collab_id, SessionUpdate};
 use crate::db::knowledge_graph::KnowledgeGraph;
 use crate::db::SearchFilters;
 use crate::diary;
@@ -192,6 +195,119 @@ pub fn tool_definitions(app: &App) -> Vec<Value> {
                 }
             }
         }),
+        // ── Collab protocol ───────────────────────────────────────────────────
+        json!({
+            "name": "ironmem_collab_start",
+            "description": "Start a new Claude↔Codex collaboration session. Returns session_id.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "repo_path": { "type": "string" },
+                    "branch": { "type": "string" },
+                    "initiator": { "type": "string", "enum": ["claude", "codex"] }
+                },
+                "required": ["repo_path", "branch", "initiator"]
+            }
+        }),
+        json!({
+            "name": "ironmem_collab_send",
+            "description": "Send a message to the other agent in a collab session.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "session_id": { "type": "string" },
+                    "sender": { "type": "string", "enum": ["claude", "codex"] },
+                    "topic": { "type": "string", "enum": ["plan", "review", "feedback", "approve", "reject"] },
+                    "content": { "type": "string" },
+                    "content_hash": { "type": "string" }
+                },
+                "required": ["session_id", "sender", "topic", "content"]
+            }
+        }),
+        json!({
+            "name": "ironmem_collab_recv",
+            "description": "Poll pending messages for an agent in a collab session.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "session_id": { "type": "string" },
+                    "receiver": { "type": "string", "enum": ["claude", "codex"] },
+                    "limit": { "type": "integer", "default": 10 }
+                },
+                "required": ["session_id", "receiver"]
+            }
+        }),
+        json!({
+            "name": "ironmem_collab_ack",
+            "description": "Acknowledge (mark consumed) a collab message.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "message_id": { "type": "string" },
+                    "session_id": { "type": "string" }
+                },
+                "required": ["message_id", "session_id"]
+            }
+        }),
+        json!({
+            "name": "ironmem_collab_approve",
+            "description": "Approve the current proposal in a collab session.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "session_id": { "type": "string" },
+                    "agent": { "type": "string", "enum": ["claude", "codex"] },
+                    "content_hash": { "type": "string" }
+                },
+                "required": ["session_id", "agent", "content_hash"]
+            }
+        }),
+        json!({
+            "name": "ironmem_collab_status",
+            "description": "Get the current state of a collab session.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "session_id": { "type": "string" }
+                },
+                "required": ["session_id"]
+            }
+        }),
+        json!({
+            "name": "ironmem_collab_register_caps",
+            "description": "Register this agent's available sub-agents/capabilities.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "session_id": { "type": "string" },
+                    "agent": { "type": "string", "enum": ["claude", "codex"] },
+                    "capabilities": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "name": { "type": "string" },
+                                "description": { "type": "string" }
+                            },
+                            "required": ["name"]
+                        }
+                    }
+                },
+                "required": ["session_id", "agent", "capabilities"]
+            }
+        }),
+        json!({
+            "name": "ironmem_collab_get_caps",
+            "description": "Get the registered capabilities of an agent in a collab session.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "session_id": { "type": "string" },
+                    "agent": { "type": "string", "enum": ["claude", "codex"] }
+                },
+                "required": ["session_id", "agent"]
+            }
+        }),
     ];
 
     tools
@@ -229,6 +345,14 @@ pub fn call_tool(app: &App, name: &str, args: &Value) -> Result<Value, MemoryErr
         "ironmem_graph_stats" => handle_graph_stats(app),
         "ironmem_diary_write" => handle_diary_write(app, args),
         "ironmem_diary_read" => handle_diary_read(app, args),
+        "ironmem_collab_start" => handle_collab_start(app, args),
+        "ironmem_collab_send" => handle_collab_send(app, args),
+        "ironmem_collab_recv" => handle_collab_recv(app, args),
+        "ironmem_collab_ack" => handle_collab_ack(app, args),
+        "ironmem_collab_approve" => handle_collab_approve(app, args),
+        "ironmem_collab_status" => handle_collab_status(app, args),
+        "ironmem_collab_register_caps" => handle_collab_register_caps(app, args),
+        "ironmem_collab_get_caps" => handle_collab_get_caps(app, args),
         _ => Err(MemoryError::Permission(format!(
             "Tool '{name}' is not available in the current MCP mode"
         ))),
@@ -652,6 +776,272 @@ fn handle_diary_read(app: &App, args: &Value) -> Result<Value, MemoryError> {
     Ok(json!({ "entries": entries, "count": entries.len() }))
 }
 
+// ── Collab protocol handlers ─────────────────────────────────────────────────
+
+fn handle_collab_start(app: &App, args: &Value) -> Result<Value, MemoryError> {
+    let repo_path = args
+        .get("repo_path")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| MemoryError::Validation("repo_path is required".into()))?;
+    let branch = args
+        .get("branch")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| MemoryError::Validation("branch is required".into()))?;
+    let initiator_str = args
+        .get("initiator")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| MemoryError::Validation("initiator is required".into()))?;
+    Agent::from_name(initiator_str)
+        .ok_or_else(|| MemoryError::Validation("initiator must be 'claude' or 'codex'".into()))?;
+
+    let id = generate_collab_id();
+    app.db.collab_session_create(&id, repo_path, branch)?;
+
+    Ok(json!({
+        "session_id": id,
+        "phase": "PlanDraft",
+        "current_owner": "claude",
+    }))
+}
+
+fn handle_collab_send(app: &App, args: &Value) -> Result<Value, MemoryError> {
+    let session_id = require_str(args, "session_id")?;
+    let sender_str = require_str(args, "sender")?;
+    let topic_str = require_str(args, "topic")?;
+    let content = require_str(args, "content")?;
+    let content_hash = args.get("content_hash").and_then(|v| v.as_str());
+
+    let sender = Agent::from_name(sender_str)
+        .ok_or_else(|| MemoryError::Validation("sender must be 'claude' or 'codex'".into()))?;
+    let topic = Topic::from_name(topic_str)
+        .ok_or_else(|| MemoryError::Validation(format!("unknown topic: {topic_str}")))?;
+
+    // Load session and run state machine
+    let row = app
+        .db
+        .collab_session_get(session_id)?
+        .ok_or_else(|| MemoryError::NotFound(format!("session {session_id} not found")))?;
+
+    let mut session = session_row_to_state(&row);
+    let new_phase = match session.on_send(&sender, &topic, content_hash) {
+        Ok(phase) => phase.as_str().to_string(),
+        Err(CollabError::NotYourTurn { expected, got }) => {
+            return Ok(json!({
+                "error": format!("not your turn: expected {expected}, got {got}")
+            }));
+        }
+        Err(CollabError::InvalidTransition(msg)) => {
+            return Ok(json!({ "error": format!("invalid transition: {msg}") }));
+        }
+        Err(e) => return Err(MemoryError::Validation(e.to_string())),
+    };
+
+    // Persist updated state
+    app.db.collab_session_update(
+        session_id,
+        &SessionUpdate {
+            phase: &new_phase,
+            current_owner: session.current_owner.as_str(),
+            round: session.round as i64,
+            claude_ok: session.claude_ok,
+            codex_ok: session.codex_ok,
+            content_hash: session.content_hash.as_deref(),
+        },
+    )?;
+
+    // Enqueue message for the receiver
+    let receiver = sender.other();
+    let msg_id = generate_collab_id();
+    app.db.collab_message_send(
+        &msg_id,
+        session_id,
+        sender.as_str(),
+        receiver.as_str(),
+        topic.as_str(),
+        content,
+    )?;
+
+    Ok(json!({
+        "message_id": msg_id,
+        "phase": new_phase,
+        "round": session.round,
+    }))
+}
+
+fn handle_collab_recv(app: &App, args: &Value) -> Result<Value, MemoryError> {
+    let session_id = require_str(args, "session_id")?;
+    let receiver_str = require_str(args, "receiver")?;
+    Agent::from_name(receiver_str)
+        .ok_or_else(|| MemoryError::Validation("receiver must be 'claude' or 'codex'".into()))?;
+
+    let limit = (args.get("limit").and_then(|v| v.as_u64()).unwrap_or(10) as usize).min(50);
+    let msgs = app
+        .db
+        .collab_message_recv(session_id, receiver_str, limit)?;
+
+    let messages: Vec<Value> = msgs
+        .iter()
+        .map(|m| {
+            json!({
+                "id": m.id,
+                "sender": m.sender,
+                "topic": m.topic,
+                "content": m.content,
+                "created_at": m.created_at,
+            })
+        })
+        .collect();
+
+    Ok(json!({ "messages": messages }))
+}
+
+fn handle_collab_ack(app: &App, args: &Value) -> Result<Value, MemoryError> {
+    let message_id = require_str(args, "message_id")?;
+    require_str(args, "session_id")?; // validated for presence
+    app.db.collab_message_ack(message_id)?;
+    Ok(json!({ "success": true }))
+}
+
+fn handle_collab_approve(app: &App, args: &Value) -> Result<Value, MemoryError> {
+    let session_id = require_str(args, "session_id")?;
+    let agent_str = require_str(args, "agent")?;
+    let content_hash = require_str(args, "content_hash")?;
+
+    let agent = Agent::from_name(agent_str)
+        .ok_or_else(|| MemoryError::Validation("agent must be 'claude' or 'codex'".into()))?;
+
+    let row = app
+        .db
+        .collab_session_get(session_id)?
+        .ok_or_else(|| MemoryError::NotFound(format!("session {session_id} not found")))?;
+
+    let mut session = session_row_to_state(&row);
+    let consensus = match session.on_approve(&agent, content_hash) {
+        Ok(c) => c,
+        Err(CollabError::HashMismatch) => {
+            return Ok(json!({ "error": "hash mismatch: approve the current proposal" }));
+        }
+        Err(CollabError::AlreadyRejected) => {
+            return Ok(json!({ "error": "content hash was already rejected" }));
+        }
+        Err(CollabError::InvalidTransition(msg)) => {
+            return Ok(json!({ "error": format!("invalid transition: {msg}") }));
+        }
+        Err(e) => return Err(MemoryError::Validation(e.to_string())),
+    };
+
+    app.db.collab_session_update(
+        session_id,
+        &SessionUpdate {
+            phase: session.phase.as_str(),
+            current_owner: session.current_owner.as_str(),
+            round: session.round as i64,
+            claude_ok: session.claude_ok,
+            codex_ok: session.codex_ok,
+            content_hash: session.content_hash.as_deref(),
+        },
+    )?;
+
+    Ok(json!({
+        "consensus": consensus,
+        "phase": session.phase.as_str(),
+    }))
+}
+
+fn handle_collab_status(app: &App, args: &Value) -> Result<Value, MemoryError> {
+    let session_id = require_str(args, "session_id")?;
+    let row = app
+        .db
+        .collab_session_get(session_id)?
+        .ok_or_else(|| MemoryError::NotFound(format!("session {session_id} not found")))?;
+
+    Ok(json!({
+        "id": row.id,
+        "phase": row.phase,
+        "current_owner": row.current_owner,
+        "round": row.round,
+        "max_rounds": row.max_rounds,
+        "repo_path": row.repo_path,
+        "branch": row.branch,
+        "claude_ok": row.claude_ok,
+        "codex_ok": row.codex_ok,
+        "content_hash": row.content_hash,
+        "created_at": row.created_at,
+        "updated_at": row.updated_at,
+    }))
+}
+
+fn handle_collab_register_caps(app: &App, args: &Value) -> Result<Value, MemoryError> {
+    let session_id = require_str(args, "session_id")?;
+    let agent_str = require_str(args, "agent")?;
+    Agent::from_name(agent_str)
+        .ok_or_else(|| MemoryError::Validation("agent must be 'claude' or 'codex'".into()))?;
+
+    let caps_json = args
+        .get("capabilities")
+        .and_then(|v| v.as_array())
+        .ok_or_else(|| MemoryError::Validation("capabilities must be an array".into()))?;
+
+    let caps: Vec<(String, Option<String>)> = caps_json
+        .iter()
+        .map(|c| {
+            let name = c
+                .get("name")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let description = c
+                .get("description")
+                .and_then(|v| v.as_str())
+                .map(str::to_string);
+            (name, description)
+        })
+        .filter(|(name, _)| !name.is_empty())
+        .collect();
+
+    let count = app.db.collab_caps_register(session_id, agent_str, &caps)?;
+    Ok(json!({ "success": true, "count": count }))
+}
+
+fn handle_collab_get_caps(app: &App, args: &Value) -> Result<Value, MemoryError> {
+    let session_id = require_str(args, "session_id")?;
+    let agent_str = require_str(args, "agent")?;
+    Agent::from_name(agent_str)
+        .ok_or_else(|| MemoryError::Validation("agent must be 'claude' or 'codex'".into()))?;
+
+    let caps = app.db.collab_caps_get(session_id, agent_str)?;
+    let capabilities: Vec<Value> = caps
+        .iter()
+        .map(|c| json!({ "name": c.name, "description": c.description }))
+        .collect();
+
+    Ok(json!({ "capabilities": capabilities }))
+}
+
+// ── Collab helpers ────────────────────────────────────────────────────────────
+
+fn require_str<'a>(args: &'a Value, key: &str) -> Result<&'a str, MemoryError> {
+    args.get(key)
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| MemoryError::Validation(format!("{key} is required")))
+}
+
+fn session_row_to_state(row: &crate::db::collab::SessionRow) -> CollabSession {
+    use ironrace_collab::types::Phase;
+    let mut s = CollabSession::new(row.id.clone());
+    s.phase = Phase::from_name(&row.phase).unwrap_or(Phase::PlanDraft);
+    s.current_owner = Agent::from_name(&row.current_owner).unwrap_or(Agent::Claude);
+    s.round = row.round as u32;
+    s.max_rounds = row.max_rounds as u32;
+    s.claude_ok = row.claude_ok;
+    s.codex_ok = row.codex_ok;
+    s.content_hash = row.content_hash.clone();
+    s
+}
+
 fn tool_known(name: &str) -> bool {
     matches!(
         name,
@@ -672,6 +1062,14 @@ fn tool_known(name: &str) -> bool {
             | "ironmem_graph_stats"
             | "ironmem_diary_write"
             | "ironmem_diary_read"
+            | "ironmem_collab_start"
+            | "ironmem_collab_send"
+            | "ironmem_collab_recv"
+            | "ironmem_collab_ack"
+            | "ironmem_collab_approve"
+            | "ironmem_collab_status"
+            | "ironmem_collab_register_caps"
+            | "ironmem_collab_get_caps"
     )
 }
 
@@ -687,6 +1085,11 @@ fn tool_allowed_in_mode(mode: McpAccessMode, name: &str) -> bool {
                 | "ironmem_kg_add"
                 | "ironmem_kg_invalidate"
                 | "ironmem_diary_write"
+                | "ironmem_collab_start"
+                | "ironmem_collab_send"
+                | "ironmem_collab_ack"
+                | "ironmem_collab_approve"
+                | "ironmem_collab_register_caps"
         )
 }
 

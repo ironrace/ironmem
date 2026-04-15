@@ -1,3 +1,4 @@
+pub mod collab;
 pub mod drawers;
 pub mod knowledge_graph;
 pub mod schema;

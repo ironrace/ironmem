@@ -7,6 +7,7 @@ use crate::error::MemoryError;
 use ironrace_embed::embedder::EMBED_DIM;
 
 const SCHEMA_SQL: &str = include_str!("../../../../migrations/001_init.sql");
+const COLLAB_SQL: &str = include_str!("../../../../migrations/002_collab.sql");
 
 /// Database wrapper around a SQLite connection.
 ///
@@ -52,7 +53,13 @@ impl Database {
     /// Run schema migrations.
     pub fn migrate(&self) -> Result<(), MemoryError> {
         retry_on_busy(|| self.conn.execute_batch(SCHEMA_SQL))?;
+        retry_on_busy(|| self.conn.execute_batch(COLLAB_SQL))?;
         Ok(())
+    }
+
+    /// Expose a shared reference to the raw connection for crate-internal collab helpers.
+    pub(crate) fn raw_conn(&self) -> &rusqlite::Connection {
+        &self.conn
     }
 
     /// Execute a closure inside a SQLite transaction and commit on success.

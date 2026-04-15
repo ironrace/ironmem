@@ -1,0 +1,13 @@
+[package]
+name = "ironrace-collab"
+version = "0.1.0"
+edition = "2021"
+description = "Pure state machine for the IronRace Claude↔Codex collaboration protocol"
+license = "Apache-2.0"
+
+[dependencies]
+thiserror = "2"
+
+[dev-dependencies]
+ironrace-memory = { path = "../ironrace-memory" }
+rusqlite = { version = "0.32", features = ["bundled"] }
