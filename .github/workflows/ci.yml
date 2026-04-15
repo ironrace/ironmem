@@ -67,6 +67,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
       - name: Validate JSON syntax
         run: |
           for f in .codex-plugin/plugin.json .codex-plugin/hooks.json \
@@ -76,15 +80,4 @@ jobs:
           done
 
       - name: Check version consistency
-        run: |
-          CARGO_VERSION=$(grep '^version' crates/ironrace-memory/Cargo.toml | head -1 | sed 's/.*"\(.*\)".*/\1/')
-          echo "Cargo.toml version: $CARGO_VERSION"
-          for f in .codex-plugin/plugin.json .claude-plugin/plugin.json; do
-            PLUGIN_VERSION=$(python3 -c "import json; print(json.load(open('$f'))['version'])")
-            echo "$f version: $PLUGIN_VERSION"
-            if [ "$CARGO_VERSION" != "$PLUGIN_VERSION" ]; then
-              echo "ERROR: $f version ($PLUGIN_VERSION) does not match Cargo.toml ($CARGO_VERSION)"
-              exit 1
-            fi
-          done
-          echo "All plugin versions match Cargo.toml."
+        run: scripts/check-versions.sh

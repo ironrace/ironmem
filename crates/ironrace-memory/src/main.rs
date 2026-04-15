@@ -53,8 +53,11 @@ async fn main() {
     tracing_subscriber::fmt()
         .with_writer(std::io::stderr)
         .with_env_filter(
-            tracing_subscriber::EnvFilter::from_default_env()
-                .add_directive("ironrace_memory=info".parse().unwrap()),
+            tracing_subscriber::EnvFilter::from_default_env().add_directive(
+                "ironrace_memory=info"
+                    .parse()
+                    .expect("static directive literal is always valid"),
+            ),
         )
         .init();
 

@@ -19,10 +19,25 @@ What works now:
 - Automatic migrate-or-init bootstrap on first use
 - Stale `bootstrap.lock` files from crashed processes are auto-cleared on next startup
 
+What hooks currently do on `stop` / `precompact`:
+
+- **Transcript review capture** — assistant messages in the transcript are scanned in reverse
+  chronological order for code-review-like content (severity labels, file references, decision
+  keywords). The most recent review-like assistant message is stored as a drawer in the
+  `reviews/` wing so it can be recalled in future sessions.
+- **Metadata diary entry** — a structured summary line is written to the diary recording the hook
+  name, harness, session ID, working directory, and transcript path, plus the review room if a
+  review was captured.
+- **Incremental re-mine** — workspace files changed since the last hook run are re-embedded.
+
 What does not work yet:
 
-- Release/distribution polish is still thin; install is plugin-wrapper based, not a separate installer command
-- Hook behavior does not yet build a rich LLM-written session summary from transcript content
+- Release/distribution polish is still thin; install is plugin-wrapper based, not a separate
+  installer command.
+- **LLM-synthesized session summaries** — `stop`/`precompact` do not yet call an LLM to produce
+  a rich narrative summary of what happened during the session (decisions made, code changed,
+  open questions). The diary entry is metadata only. Implementing this requires an LLM call with
+  the full `transcript_path` content; tracked in *Recommended Next Work* below.
 
 ## Build
 
@@ -231,5 +246,8 @@ All flags:
 
 1. Add MCP smoke tests in CI
 2. Extend benchmark coverage with larger datasets and repeated warm-cache runs
-3. Implement rich LLM-written session summaries from `transcript_path` in hook stop/precompact
+3. Implement rich LLM-written session summaries: on `stop`/`precompact`, call an LLM with the
+   full `transcript_path` content to produce a narrative summary (decisions, code changed, open
+   questions) stored in the diary. Currently only metadata and transcript review excerpts are
+   persisted.
 4. Publish a release binary and installer so users do not need to build from source
