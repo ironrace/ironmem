@@ -25,6 +25,10 @@ const MAX_DEPTH: usize = 10;
 const MAX_SENSITIVE_FIELD_CHARS: usize = 4_000;
 /// Maximum aggregate characters returned across search results.
 const MAX_SEARCH_RESPONSE_CHARS: usize = 32_000;
+/// Maximum bytes for a collab message or capability description.
+const MAX_COLLAB_CONTENT_BYTES: usize = 100_000;
+/// Maximum bytes for a capability name or description field.
+const MAX_COLLAB_CAP_FIELD_BYTES: usize = 1_000;
 
 /// Return tool definitions for tools/list.
 pub fn tool_definitions(app: &App) -> Vec<Value> {
@@ -810,7 +814,8 @@ fn handle_collab_send(app: &App, args: &Value) -> Result<Value, MemoryError> {
     let session_id = require_str(args, "session_id")?;
     let sender_str = require_str(args, "sender")?;
     let topic_str = require_str(args, "topic")?;
-    let content = require_str(args, "content")?;
+    let content =
+        sanitize::sanitize_content(require_str(args, "content")?, MAX_COLLAB_CONTENT_BYTES)?;
     let content_hash = args.get("content_hash").and_then(|v| v.as_str());
 
     let sender = Agent::from_name(sender_str)
@@ -824,7 +829,7 @@ fn handle_collab_send(app: &App, args: &Value) -> Result<Value, MemoryError> {
         .collab_session_get(session_id)?
         .ok_or_else(|| MemoryError::NotFound(format!("session {session_id} not found")))?;
 
-    let mut session = session_row_to_state(&row);
+    let mut session = session_row_to_state(&row)?;
     let new_phase = match session.on_send(&sender, &topic, content_hash) {
         Ok(phase) => phase.as_str().to_string(),
         Err(CollabError::NotYourTurn { expected, got }) => {
@@ -918,7 +923,7 @@ fn handle_collab_approve(app: &App, args: &Value) -> Result<Value, MemoryError> 
         .collab_session_get(session_id)?
         .ok_or_else(|| MemoryError::NotFound(format!("session {session_id} not found")))?;
 
-    let mut session = session_row_to_state(&row);
+    let mut session = session_row_to_state(&row)?;
     let consensus = match session.on_approve(&agent, content_hash) {
         Ok(c) => c,
         Err(CollabError::HashMismatch) => {
@@ -986,22 +991,32 @@ fn handle_collab_register_caps(app: &App, args: &Value) -> Result<Value, MemoryE
         .and_then(|v| v.as_array())
         .ok_or_else(|| MemoryError::Validation("capabilities must be an array".into()))?;
 
-    let caps: Vec<(String, Option<String>)> = caps_json
-        .iter()
-        .map(|c| {
-            let name = c
-                .get("name")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string();
-            let description = c
-                .get("description")
-                .and_then(|v| v.as_str())
-                .map(str::to_string);
-            (name, description)
-        })
-        .filter(|(name, _)| !name.is_empty())
-        .collect();
+    let mut caps: Vec<(String, Option<String>)> = Vec::with_capacity(caps_json.len());
+    for c in caps_json {
+        let name = c.get("name").and_then(|v| v.as_str()).unwrap_or("").trim();
+        if name.is_empty() {
+            continue;
+        }
+        if name.len() > MAX_COLLAB_CAP_FIELD_BYTES {
+            return Err(MemoryError::Validation(format!(
+                "capability name exceeds {MAX_COLLAB_CAP_FIELD_BYTES} bytes"
+            )));
+        }
+        let description = c
+            .get("description")
+            .and_then(|v| v.as_str())
+            .map(|d| {
+                if d.len() > MAX_COLLAB_CAP_FIELD_BYTES {
+                    Err(MemoryError::Validation(format!(
+                        "capability description exceeds {MAX_COLLAB_CAP_FIELD_BYTES} bytes"
+                    )))
+                } else {
+                    Ok(d.to_string())
+                }
+            })
+            .transpose()?;
+        caps.push((name.to_string(), description));
+    }
 
     let count = app.db.collab_caps_register(session_id, agent_str, &caps)?;
     Ok(json!({ "success": true, "count": count }))
@@ -1031,18 +1046,26 @@ fn require_str<'a>(args: &'a Value, key: &str) -> Result<&'a str, MemoryError> {
         .ok_or_else(|| MemoryError::Validation(format!("{key} is required")))
 }
 
-fn session_row_to_state(row: &crate::db::collab::SessionRow) -> CollabSession {
+fn session_row_to_state(row: &crate::db::collab::SessionRow) -> Result<CollabSession, MemoryError> {
     use ironrace_collab::types::Phase;
+    let phase = Phase::from_name(&row.phase)
+        .ok_or_else(|| MemoryError::Validation(format!("unknown phase in DB: '{}'", row.phase)))?;
+    let current_owner = Agent::from_name(&row.current_owner).ok_or_else(|| {
+        MemoryError::Validation(format!(
+            "unknown current_owner in DB: '{}'",
+            row.current_owner
+        ))
+    })?;
     let mut s = CollabSession::new(row.id.clone());
-    s.phase = Phase::from_name(&row.phase).unwrap_or(Phase::PlanDraft);
-    s.current_owner = Agent::from_name(&row.current_owner).unwrap_or(Agent::Claude);
+    s.phase = phase;
+    s.current_owner = current_owner;
     s.round = row.round as u32;
     s.max_rounds = row.max_rounds as u32;
     s.claude_ok = row.claude_ok;
     s.codex_ok = row.codex_ok;
     s.content_hash = row.content_hash.clone();
     s.rejected_hashes = row.rejected_hashes.clone();
-    s
+    Ok(s)
 }
 
 fn tool_known(name: &str) -> bool {

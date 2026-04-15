@@ -192,7 +192,12 @@ impl Database {
         Ok(result)
     }
 
-    /// Override max_rounds for a session (test helper).
+    /// Override max_rounds for a session.
+    ///
+    /// # Warning
+    /// This is a test helper exposed only because the E2E tests live in a
+    /// separate crate. Production callers **must not** use this method.
+    #[doc(hidden)]
     pub fn collab_set_max_rounds(
         &self,
         session_id: &str,
@@ -241,7 +246,7 @@ impl Database {
         let conn = self.raw_conn();
         let mut count = 0usize;
         for (name, description) in capabilities {
-            let id = new_id();
+            let id = generate_collab_id();
             conn.execute(
                 "INSERT INTO agent_capabilities (id, session_id, agent, capability, description)
                  VALUES (?1, ?2, ?3, ?4, ?5)
@@ -281,26 +286,9 @@ impl Database {
     }
 }
 
-fn new_id() -> String {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    use std::time::{SystemTime, UNIX_EPOCH};
-
-    static COUNTER: AtomicU64 = AtomicU64::new(0);
-    let seq = COUNTER.fetch_add(1, Ordering::Relaxed);
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .subsec_nanos() as u64;
-    format!(
-        "{:016x}{:016x}",
-        nanos ^ seq.wrapping_mul(0x9e3779b97f4a7c15),
-        seq
-    )
-}
-
-/// Generate a fresh collision-resistant ID for messages and sessions.
+/// Generate a cryptographically random UUID v4 for messages and sessions.
 pub fn generate_collab_id() -> String {
-    new_id()
+    uuid::Uuid::new_v4().to_string()
 }
 
 #[cfg(test)]

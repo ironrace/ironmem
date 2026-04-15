@@ -25,6 +25,7 @@ rusqlite = { version = "0.32", features = ["bundled"] }
 anyhow = "1"
 thiserror = "2"
 sha2 = "0.10"
+uuid = { version = "1", features = ["v4"] }
 regex = "1"
 chrono = { version = "0.4", features = ["serde"] }
 clap = { version = "4", features = ["derive"] }
