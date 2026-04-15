@@ -5,3 +5,7 @@
 *.sqlite3
 *.sqlite3-journal
 *.sqlite3-wal
+
+# Development artifacts (Codex/Claude task files)
+CODEX_TASK_*.md
+docs/collab_*.md
