@@ -237,8 +237,8 @@ impl<'a> KnowledgeGraph<'a> {
                 )))
             }
             1 => Ok(matches.into_iter().next().ok_or_else(|| {
-                    MemoryError::NotFound(format!("Entity '{name}' disappeared during lookup"))
-                })?),
+                MemoryError::NotFound(format!("Entity '{name}' disappeared during lookup"))
+            })?),
             _ => {
                 let choices = matches
                     .iter()
