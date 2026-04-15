@@ -67,13 +67,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - uses: dtolnay/rust-toolchain@stable
-
-      - name: Install cargo-audit
-        run: cargo install cargo-audit --locked
-
-      - name: cargo audit
-        run: cargo audit --deny warnings
+      - uses: rustsec/audit-check@v2
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
 
   package:
     name: Package Dry-Run
@@ -87,13 +83,13 @@ jobs:
       - uses: Swatinem/rust-cache@v2
 
       - name: cargo package ironrace-core
-        run: cargo package -p ironrace-core --no-verify
+        run: cargo package -p ironrace-core
 
       - name: cargo package ironrace-embed
-        run: cargo package -p ironrace-embed --no-verify
+        run: cargo package -p ironrace-embed
 
       - name: cargo package ironrace-memory
-        run: cargo package -p ironrace-memory --no-verify
+        run: cargo package -p ironrace-memory
 
   plugin-metadata:
     name: Plugin Metadata

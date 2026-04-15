@@ -12,9 +12,6 @@ categories = ["development-tools", "command-line-utilities"]
 readme = "../../README.md"
 exclude = [
     "benches/",
-    "scripts/",
-    ".github/",
-    "docs/",
 ]
 
 [lib]
