@@ -1,3 +1,5 @@
+//! Background bootstrap, workspace initialization, and stale-lock recovery.
+
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;

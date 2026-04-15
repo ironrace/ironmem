@@ -1,3 +1,5 @@
+//! Input sanitization helpers for user-facing tool arguments and hook metadata.
+
 use regex::Regex;
 use std::sync::LazyLock;
 

@@ -1,3 +1,5 @@
+//! Durable diary writes and reads backed by the shared memory database.
+
 use sha2::{Digest, Sha256};
 
 use crate::error::MemoryError;

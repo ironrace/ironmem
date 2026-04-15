@@ -32,12 +32,8 @@ What hooks currently do on `stop` / `precompact`:
 
 What does not work yet:
 
-- Release/distribution polish is still thin; install is plugin-wrapper based, not a separate
-  installer command.
-- **LLM-synthesized session summaries** — `stop`/`precompact` do not yet call an LLM to produce
-  a rich narrative summary of what happened during the session (decisions made, code changed,
-  open questions). The diary entry is metadata only. Implementing this requires an LLM call with
-  the full `transcript_path` content; tracked in *Recommended Next Work* below.
+- There is still no standalone installer command; installs are source-build or release-binary based
+- Hook behavior does not yet build a rich LLM-written session summary from transcript content
 
 ## Build
 
@@ -244,10 +240,6 @@ All flags:
 
 ## Recommended Next Work
 
-1. Add MCP smoke tests in CI
-2. Extend benchmark coverage with larger datasets and repeated warm-cache runs
-3. Implement rich LLM-written session summaries: on `stop`/`precompact`, call an LLM with the
-   full `transcript_path` content to produce a narrative summary (decisions, code changed, open
-   questions) stored in the diary. Currently only metadata and transcript review excerpts are
-   persisted.
-4. Publish a release binary and installer so users do not need to build from source
+1. Extend benchmark coverage with larger datasets and repeated warm-cache runs
+2. Implement rich LLM-written session summaries from `transcript_path` in hook stop/precompact
+3. Add a standalone installer command so users do not need to edit MCP config manually

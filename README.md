@@ -10,8 +10,46 @@ Codex and Claude Code plugin packaging is included. See [docs/CODEX.md](docs/COD
 
 Key docs:
 
+- [Contributing Guide](CONTRIBUTING.md)
 - [Cross-Harness Implementation Plan](IMPLEMENTATION_PLAN.md)
 - [Codex Guide](docs/CODEX.md)
+
+## Quickstart: Install and Run in 60 Seconds
+
+Fastest path from source today:
+
+```bash
+git clone https://github.com/ironrace/ironrace-memory.git
+cd ironrace-memory
+cargo build --release -p ironrace-memory --bin ironmem
+./target/release/ironmem setup
+```
+
+Start the MCP server:
+
+```bash
+./target/release/ironmem serve
+```
+
+Smoke-test the live stdio server without downloading the model:
+
+```bash
+python3 scripts/mcp_smoke_test.py --binary ./target/release/ironmem
+```
+
+Add it to Codex:
+
+```toml
+[mcp_servers.ironrace_memory]
+command = "/absolute/path/to/ironmem"
+args = ["serve"]
+
+[mcp_servers.ironrace_memory.env]
+IRONMEM_MCP_MODE = "trusted"
+IRONMEM_DB_PATH = "~/.ironrace-memory/memory.sqlite3"
+```
+
+Tagged releases upload prebuilt macOS and Linux binaries automatically. Until the first tagged release is published, building from source is the supported install path.
 
 ## Current Status
 

@@ -1,3 +1,5 @@
+//! Session lifecycle hooks for Codex and Claude Code integrations.
+
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::LazyLock;

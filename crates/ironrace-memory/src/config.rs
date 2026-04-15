@@ -1,3 +1,5 @@
+//! Configuration loading and environment-variable parsing for `ironmem`.
+
 use std::path::PathBuf;
 
 use crate::error::MemoryError;
