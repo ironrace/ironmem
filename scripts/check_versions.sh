@@ -4,7 +4,17 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT_DIR"
 
-CARGO_VERSION="$(grep '^version' crates/ironrace-memory/Cargo.toml | head -1 | sed 's/.*"\(.*\)".*/\1/')"
+CARGO_VERSION="$(python3 - crates/ironrace-memory/Cargo.toml <<'PY'
+import sys
+try:
+    import tomllib
+except ModuleNotFoundError:
+    import tomli as tomllib  # type: ignore[no-redef]
+import pathlib
+data = tomllib.loads(pathlib.Path(sys.argv[1]).read_text())
+print(data["package"]["version"])
+PY
+)"
 
 echo "Cargo.toml version: $CARGO_VERSION"
 

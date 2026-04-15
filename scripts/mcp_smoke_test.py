@@ -56,15 +56,19 @@ def main() -> int:
             }
         )
 
-        completed = subprocess.run(
-            command,
-            input=json.dumps(request) + "\n",
-            text=True,
-            capture_output=True,
-            env=env,
-            timeout=args.timeout,
-            check=False,
-        )
+        try:
+            completed = subprocess.run(
+                command,
+                input=json.dumps(request) + "\n",
+                text=True,
+                capture_output=True,
+                env=env,
+                timeout=args.timeout,
+                check=False,
+            )
+        except subprocess.TimeoutExpired:
+            sys.stderr.write(f"ironmem process timed out after {args.timeout}s\n")
+            return 1
 
     if completed.returncode != 0:
         sys.stderr.write("ironmem process failed\n")
@@ -84,13 +88,17 @@ def main() -> int:
     result = response.get("result", {})
 
     if response.get("error") is not None:
-        raise AssertionError(f"initialize returned an error: {response['error']}")
+        sys.stderr.write(f"FAIL: initialize returned an error: {response['error']}\n")
+        return 1
     if result.get("protocolVersion") != "2024-11-05":
-        raise AssertionError(f"unexpected protocolVersion: {result.get('protocolVersion')!r}")
+        sys.stderr.write(f"FAIL: unexpected protocolVersion: {result.get('protocolVersion')!r}\n")
+        return 1
     if result.get("serverInfo", {}).get("name") != "ironrace-memory":
-        raise AssertionError(f"unexpected server name: {result.get('serverInfo')!r}")
+        sys.stderr.write(f"FAIL: unexpected server name: {result.get('serverInfo')!r}\n")
+        return 1
     if "tools" not in result.get("capabilities", {}):
-        raise AssertionError(f"missing tools capabilities: {result.get('capabilities')!r}")
+        sys.stderr.write(f"FAIL: missing tools capabilities: {result.get('capabilities')!r}\n")
+        return 1
 
     print("MCP initialize smoke test passed.")
     return 0
