@@ -156,7 +156,10 @@ impl BootstrapLock {
 fn process_is_alive(pid: u32) -> bool {
     #[cfg(unix)]
     {
-        // kill(pid, 0) returns 0 if the process exists, ESRCH if not.
+        // kill(pid, 0) probes process existence without sending a signal.
+        // Returns 0 if alive, ESRCH if the process does not exist.
+        // EPERM means the process exists but we lack permission to signal it —
+        // treat as alive (conservative; the lock is not stale).
         let result = unsafe { libc::kill(pid as libc::pid_t, 0) };
         if result == 0 {
             return true;
@@ -403,5 +406,24 @@ mod tests {
             resolved.is_none(),
             "workspace auto-bootstrap should require an explicit workspace root"
         );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn stale_bootstrap_lock_is_recovered_when_owner_pid_is_gone() {
+        let temp = tempfile::tempdir().unwrap();
+        let lock_path = temp.path().join("bootstrap.lock");
+
+        // Obtain a real dead PID: spawn a no-op child, wait for it to exit, then use its PID.
+        let mut child = std::process::Command::new("true").spawn().unwrap();
+        let dead_pid = child.id();
+        child.wait().unwrap();
+        std::fs::write(&lock_path, dead_pid.to_string()).unwrap();
+
+        // Acquiring the lock should succeed by removing the stale lock file.
+        let lock = BootstrapLock::acquire(temp.path()).unwrap();
+        drop(lock);
+
+        assert!(!lock_path.exists(), "lock file should have been cleaned up");
     }
 }

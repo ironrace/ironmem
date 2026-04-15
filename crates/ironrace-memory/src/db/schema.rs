@@ -146,7 +146,100 @@ fn is_busy_error(error: &rusqlite::Error) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use std::path::PathBuf;
+
     use super::Database;
+
+    /// Returns a `(TempDir, PathBuf)` pair for a database nested under a temp directory.
+    /// The caller **must** retain the `TempDir` for the lifetime of the test; dropping it
+    /// deletes the directory and invalidates the path.
+    fn nested_db_path() -> (tempfile::TempDir, PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("sub").join("test.db");
+        (dir, db_path)
+    }
+
+    #[test]
+    fn test_open_creates_parent_dirs_and_migrate_creates_schema() {
+        let (_dir, db_path) = nested_db_path();
+        let db = Database::open(&db_path).unwrap();
+        db.migrate().unwrap();
+
+        // Verify the drawers table was created.
+        let count: i64 = db
+            .conn
+            .query_row("SELECT count(*) FROM drawers", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, 0);
+
+        // Calling migrate() a second time must be idempotent (all DDL uses IF NOT EXISTS).
+        db.migrate().unwrap();
+    }
+
+    #[test]
+    fn test_with_transaction_commits_on_success() {
+        let db = Database::open_in_memory().unwrap();
+
+        db.with_transaction(|tx| {
+            tx.execute(
+                "INSERT INTO drawers (id, content, embedding, wing, room, source_file, added_by)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                rusqlite::params![
+                    "txncommit00000000000000000000001",
+                    "committed",
+                    vec![0u8; ironrace_embed::embedder::EMBED_DIM * std::mem::size_of::<f32>()],
+                    "w",
+                    "r",
+                    "",
+                    "test"
+                ],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+
+        let count: i64 = db
+            .conn
+            .query_row("SELECT COUNT(*) FROM drawers", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn test_with_transaction_rolls_back_on_error() {
+        use crate::error::MemoryError;
+
+        let db = Database::open_in_memory().unwrap();
+
+        let result: Result<(), _> = db.with_transaction(|tx| {
+            let rows_inserted = tx.execute(
+                "INSERT INTO drawers (id, content, embedding, wing, room, source_file, added_by)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                rusqlite::params![
+                    "rollback_test_id_000000000000001",
+                    "test content",
+                    vec![0u8; 4 * ironrace_embed::embedder::EMBED_DIM],
+                    "wing",
+                    "room",
+                    "",
+                    "test"
+                ],
+            )?;
+            assert_eq!(
+                rows_inserted, 1,
+                "INSERT must succeed before testing rollback"
+            );
+            Err(MemoryError::Validation("force rollback".into()))
+        });
+
+        assert!(result.is_err());
+
+        let count: i64 = db
+            .conn
+            .query_row("SELECT count(*) FROM drawers", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, 0, "transaction must have been rolled back");
+    }
 
     #[test]
     fn test_load_all_vectors_rejects_corrupt_blob_length() {

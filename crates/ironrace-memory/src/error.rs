@@ -32,16 +32,3 @@ pub enum MemoryError {
     #[error("Lock error: {0}")]
     Lock(String),
 }
-
-impl MemoryError {
-    /// Convert to JSON-RPC error code.
-    #[allow(dead_code)]
-    pub fn rpc_code(&self) -> i64 {
-        match self {
-            Self::Validation(_) => -32602, // Invalid params
-            Self::NotFound(_) => -32601,
-            Self::Permission(_) => -32001,
-            _ => -32000, // Server error
-        }
-    }
-}
