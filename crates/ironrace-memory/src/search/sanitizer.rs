@@ -11,6 +11,7 @@
 
 use regex::Regex;
 use serde::Serialize;
+use std::collections::HashSet;
 use std::sync::LazyLock;
 
 const MAX_QUERY_LENGTH: usize = 500;
@@ -29,6 +30,55 @@ fn safe_tail(s: &str, max_bytes: usize) -> &str {
 
 static QUESTION_MARK: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r#"[?？]\s*["']?\s*$"#).unwrap());
+
+/// English stop words to strip when extracting content words for multi-query search.
+static STOP_WORDS: LazyLock<HashSet<&'static str>> = LazyLock::new(|| {
+    [
+        "a", "an", "the", "and", "or", "but", "in", "on", "at", "to", "for", "of", "with", "by",
+        "from", "is", "are", "was", "were", "be", "been", "being", "have", "has", "had", "do",
+        "does", "did", "will", "would", "could", "should", "may", "might", "shall", "can", "not",
+        "no", "what", "when", "where", "who", "which", "how", "why", "that", "this", "these",
+        "those", "there", "here", "i", "me", "my", "you", "your", "he", "she", "it", "we", "they",
+        "their", "our", "its", "him", "her", "us", "them", "about", "any", "some", "all", "just",
+        "more", "also", "than", "then", "into", "up", "out", "if", "so", "as", "during",
+    ]
+    .into_iter()
+    .collect()
+});
+
+/// Extract content words from a query by removing stop words and short tokens.
+///
+/// Returns `None` if the result is identical to the input (after normalisation)
+/// or is too short to be useful as an additional search signal.
+pub fn extract_content_words(query: &str) -> Option<String> {
+    let words: Vec<&str> = query
+        .split_whitespace()
+        .filter(|w| {
+            // Strip punctuation from both ends for comparison.
+            let clean: String = w
+                .chars()
+                .filter(|c| c.is_alphanumeric())
+                .collect::<String>()
+                .to_lowercase();
+            clean.len() >= 3 && !STOP_WORDS.contains(clean.as_str())
+        })
+        .collect();
+
+    if words.len() < 2 {
+        return None;
+    }
+
+    let result = words.join(" ");
+
+    // Only return if it's meaningfully shorter than the original query —
+    // i.e., at least one stop word was removed.
+    let original_word_count = query.split_whitespace().count();
+    if words.len() == original_word_count {
+        return None;
+    }
+
+    Some(result)
+}
 
 #[derive(Debug, Clone, Serialize)]
 pub struct SanitizeResult {

@@ -238,7 +238,7 @@ class McpClient:
         self._call("initialize", {})
         if wait_for_embedder:
             # Poll ironmem_status until warming_up is False (model loaded)
-            deadline = time.monotonic() + 60.0
+            deadline = time.monotonic() + 120.0
             while time.monotonic() < deadline:
                 try:
                     result = self.call_tool("ironmem_status", {})

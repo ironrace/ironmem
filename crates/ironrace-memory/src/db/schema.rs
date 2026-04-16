@@ -7,6 +7,7 @@ use crate::error::MemoryError;
 use ironrace_embed::embedder::EMBED_DIM;
 
 const SCHEMA_SQL: &str = include_str!("../../migrations/001_init.sql");
+const FTS_SQL: &str = include_str!("../../../../migrations/002_fts.sql");
 
 /// Database wrapper around a SQLite connection.
 ///
@@ -49,9 +50,23 @@ impl Database {
         Ok(db)
     }
 
-    /// Run schema migrations.
+    /// Run schema migrations in version order. Idempotent: uses schema_version
+    /// to skip already-applied migrations.
     pub fn migrate(&self) -> Result<(), MemoryError> {
+        // v1: base schema (drawers, entities, triples, wal_log, schema_version)
         retry_on_busy(|| self.conn.execute_batch(SCHEMA_SQL))?;
+
+        // v2: FTS5 full-text search index for hybrid BM25+vector retrieval
+        let current_version: i64 = self
+            .conn
+            .query_row("SELECT MAX(version) FROM schema_version", [], |row| {
+                row.get(0)
+            })
+            .unwrap_or(1);
+        if current_version < 2 {
+            retry_on_busy(|| self.conn.execute_batch(FTS_SQL))?;
+        }
+
         Ok(())
     }
 

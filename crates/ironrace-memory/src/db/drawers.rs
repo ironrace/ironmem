@@ -2,6 +2,31 @@ use rusqlite::{params, Transaction};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+/// Escape a user query for FTS5 MATCH syntax.
+///
+/// FTS5 treats several characters as operators (`"`, `*`, `(`, `)`, `AND`, `OR`, `NOT`).
+/// This wraps individual tokens in double-quotes so the entire query is treated as
+/// a set of phrase searches rather than operator expressions, preventing SQL injection
+/// via query syntax and avoiding false query-parse errors on punctuation-heavy content.
+fn fts5_quote(query: &str) -> String {
+    query
+        .split_whitespace()
+        .map(|token| {
+            let clean: String = token
+                .chars()
+                .filter(|c| c.is_alphanumeric() || matches!(c, '\'' | '-'))
+                .collect();
+            if clean.is_empty() {
+                String::new()
+            } else {
+                format!("\"{}\"", clean)
+            }
+        })
+        .filter(|t| !t.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 use super::schema::Database;
 use crate::error::MemoryError;
 
@@ -112,6 +137,22 @@ impl Database {
                 added_by = excluded.added_by",
             params![id, content, blob, wing, room, source_file, added_by],
         )?;
+
+        // Keep FTS5 index in sync (delete-then-insert for upsert semantics).
+        // Silently skip if the FTS table doesn't exist yet (pre-migration DBs).
+        let fts_ok = conn
+            .execute("DELETE FROM drawers_fts WHERE drawer_id = ?1", params![id])
+            .and_then(|_| {
+                conn.execute(
+                    "INSERT INTO drawers_fts(content, drawer_id) VALUES (?1, ?2)",
+                    params![content, id],
+                )
+            });
+        if let Err(e) = fts_ok {
+            // FTS table may not exist on first startup before migration runs.
+            // Log at debug level and continue — HNSW-only search remains functional.
+            tracing::debug!("FTS5 sync skipped (table may not exist yet): {e}");
+        }
 
         Ok(())
     }
@@ -281,6 +322,99 @@ impl Database {
         Ok(count as usize)
     }
 
+    /// BM25 full-text search via SQLite FTS5. Returns (drawer_id, score) pairs
+    /// ordered by relevance descending. Score is positive (negated bm25() output).
+    ///
+    /// Returns an empty vec if the FTS table doesn't exist yet or the query is
+    /// syntactically invalid — callers fall back to vector-only search gracefully.
+    pub fn bm25_search(
+        &self,
+        query: &str,
+        limit: usize,
+        wing: Option<&str>,
+        room: Option<&str>,
+    ) -> Result<Vec<(String, f32)>, MemoryError> {
+        if query.trim().is_empty() {
+            return Ok(vec![]);
+        }
+        let fts_query = fts5_quote(query);
+        let limit_i64 = limit as i64;
+
+        let sql = match (wing, room) {
+            (Some(_), Some(_)) => {
+                "SELECT f.drawer_id, -bm25(f) AS score
+                 FROM drawers_fts f
+                 JOIN drawers d ON d.id = f.drawer_id
+                 WHERE f MATCH ?1 AND d.wing = ?3 AND d.room = ?4
+                 ORDER BY score DESC LIMIT ?2"
+            }
+            (Some(_), None) => {
+                "SELECT f.drawer_id, -bm25(f) AS score
+                 FROM drawers_fts f
+                 JOIN drawers d ON d.id = f.drawer_id
+                 WHERE f MATCH ?1 AND d.wing = ?3
+                 ORDER BY score DESC LIMIT ?2"
+            }
+            (None, Some(_)) => {
+                "SELECT f.drawer_id, -bm25(f) AS score
+                 FROM drawers_fts f
+                 JOIN drawers d ON d.id = f.drawer_id
+                 WHERE f MATCH ?1 AND d.room = ?4
+                 ORDER BY score DESC LIMIT ?2"
+            }
+            (None, None) => {
+                "SELECT drawer_id, -bm25(drawers_fts) AS score
+                 FROM drawers_fts
+                 WHERE drawers_fts MATCH ?1
+                 ORDER BY score DESC LIMIT ?2"
+            }
+        };
+
+        let mut stmt = match self.conn.prepare(sql) {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::debug!("BM25 search skipped (FTS table may not exist): {e}");
+                return Ok(vec![]);
+            }
+        };
+
+        let query_fn = |row: &rusqlite::Row<'_>| -> rusqlite::Result<(String, f32)> {
+            let id: String = row.get(0)?;
+            let score: f64 = row.get(1)?;
+            Ok((id, score as f32))
+        };
+
+        let rows = match (wing, room) {
+            (Some(w), Some(r)) => {
+                stmt.query_map(rusqlite::params![fts_query, limit_i64, w, r], query_fn)
+            }
+            (Some(w), None) => stmt.query_map(rusqlite::params![fts_query, limit_i64, w], query_fn),
+            (None, Some(r)) => stmt.query_map(rusqlite::params![fts_query, limit_i64, r], query_fn),
+            (None, None) => stmt.query_map(rusqlite::params![fts_query, limit_i64], query_fn),
+        };
+
+        match rows {
+            Err(e) => {
+                // FTS5 query syntax error or missing table — degrade gracefully.
+                tracing::debug!("BM25 query failed (will use vector-only): {e}");
+                Ok(vec![])
+            }
+            Ok(rows) => {
+                let mut result = Vec::new();
+                for row in rows {
+                    match row {
+                        Ok(pair) => result.push(pair),
+                        Err(e) => {
+                            tracing::debug!("BM25 row error: {e}");
+                            break;
+                        }
+                    }
+                }
+                Ok(result)
+            }
+        }
+    }
+
     /// Get wing -> count mapping.
     pub fn wing_counts(&self) -> Result<Vec<(String, usize)>, MemoryError> {
         let mut stmt = self
@@ -389,6 +523,8 @@ impl Database {
     }
 
     fn delete_drawer_conn(conn: &rusqlite::Connection, id: &str) -> Result<usize, MemoryError> {
+        // Remove from FTS index first (best-effort; ignore if table doesn't exist).
+        let _ = conn.execute("DELETE FROM drawers_fts WHERE drawer_id = ?1", params![id]);
         Ok(conn.execute("DELETE FROM drawers WHERE id = ?1", params![id])?)
     }
 
@@ -396,6 +532,13 @@ impl Database {
         conn: &rusqlite::Connection,
         source_file: &str,
     ) -> Result<usize, MemoryError> {
+        // Remove matching drawers from FTS index first (best-effort).
+        let _ = conn.execute(
+            "DELETE FROM drawers_fts WHERE drawer_id IN (
+                 SELECT id FROM drawers WHERE source_file = ?1
+             )",
+            params![source_file],
+        );
         Ok(conn.execute(
             "DELETE FROM drawers WHERE source_file = ?1",
             params![source_file],
@@ -409,7 +552,7 @@ mod tests {
     use crate::db::schema::Database;
 
     fn dummy_embedding() -> Vec<f32> {
-        vec![0.1; 384]
+        vec![0.1; ironrace_embed::embedder::EMBED_DIM]
     }
 
     #[test]
