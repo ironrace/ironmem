@@ -48,19 +48,20 @@ cargo build -p ironrace-memory --bin ironmem
 
 ## Git Pre-Commit Hook
 
-This repo includes a tracked Git pre-commit hook so Codex, Claude Code, and manual terminal commits all hit the same lint gate.
+This repo includes tracked Git hooks so Codex, Claude Code, and manual terminal workflows all hit the same local gates.
 
 Enable it once per clone:
 
 ```bash
 git config core.hooksPath .githooks
-chmod +x .githooks/pre-commit
+chmod +x .githooks/pre-commit .githooks/pre-push
 ```
 
-The hook runs:
+The hooks run:
 
-- `cargo fmt --all -- --check`
-- `cargo clippy --workspace --all-targets --all-features -- -D warnings`
+- `pre-commit`: `cargo fmt --all -- --check`
+- `pre-commit`: `cargo clippy --workspace --all-targets --all-features -- -D warnings`
+- `pre-push`: `cargo test --workspace`
 
 ## Manual Codex MCP Setup
 
@@ -222,7 +223,7 @@ What is measured per backend:
 | Metric | Description |
 |--------|-------------|
 | startup p50/p95 | Time from process spawn to `initialize` response (connect only) |
-| warmup p50/p95 | Time until `ironmem_status` returns `warming_up: false` (model load + bootstrap) |
+| warmup p50/p95 | Time until `ironmem_status` returns `warming_up": false` (model load + bootstrap) |
 | add p50/p95 | `add_drawer` latency once embedder is ready |
 | search p50/p95 | `search` latency with 5-needle recall check |
 | status / taxonomy / delete p50 | Auxiliary tool latency |

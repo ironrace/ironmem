@@ -10,19 +10,22 @@
 
 ## Git Hooks
 
-This repo ships a tracked Git pre-commit hook in `.githooks/pre-commit`.
+This repo ships tracked Git hooks in `.githooks/`.
 
 Enable it once per clone:
 
 ```bash
 git config core.hooksPath .githooks
-chmod +x .githooks/pre-commit
+chmod +x .githooks/pre-commit .githooks/pre-push
 ```
 
-After that, every `git commit` runs:
+After that:
 
+- every `git commit` runs:
 - `cargo fmt --all -- --check`
 - `cargo clippy --workspace --all-targets --all-features -- -D warnings`
+- every `git push` runs:
+- `cargo test --workspace`
 
 ## Local Development Loop
 

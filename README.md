@@ -20,16 +20,19 @@ Key docs:
 
 ## Contributor Hook
 
-This repo includes a tracked Git pre-commit hook for local commits.
+This repo includes tracked Git hooks for local commits and pushes.
 
 Enable it once per clone:
 
 ```bash
 git config core.hooksPath .githooks
-chmod +x .githooks/pre-commit
+chmod +x .githooks/pre-commit .githooks/pre-push
 ```
 
-The hook runs `cargo fmt --all -- --check` and `cargo clippy --workspace --all-targets --all-features -- -D warnings` before commit creation.
+The hooks run:
+
+- `pre-commit`: `cargo fmt --all -- --check` and `cargo clippy --workspace --all-targets --all-features -- -D warnings`
+- `pre-push`: `cargo test --workspace`
 
 ## Quickstart: Install and Run in 60 Seconds
 
