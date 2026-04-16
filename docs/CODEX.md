@@ -223,7 +223,7 @@ What is measured per backend:
 | Metric | Description |
 |--------|-------------|
 | startup p50/p95 | Time from process spawn to `initialize` response (connect only) |
-| warmup p50/p95 | Time until `ironmem_status` returns `warming_up": false` (model load + bootstrap) |
+| warmup p50/p95 | Time until `ironmem_status` returns `warming_up: false` (model load + bootstrap) |
 | add p50/p95 | `add_drawer` latency once embedder is ready |
 | search p50/p95 | `search` latency with 5-needle recall check |
 | status / taxonomy / delete p50 | Auxiliary tool latency |
@@ -258,5 +258,3 @@ All flags:
 ## Recommended Next Work
 
 1. Extend benchmark coverage with larger datasets and repeated warm-cache runs
-2. Implement rich LLM-written session summaries from `transcript_path` in hook stop/precompact
-3. Add a standalone installer command so users do not need to edit MCP config manually
