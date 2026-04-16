@@ -12,11 +12,15 @@ The key difference in this benchmark vs mempalace's raw mode:
 Both use all-MiniLM-L6-v2 embeddings, so this isolates retrieval infrastructure
 quality, not model quality.
 
+The dataset (longmemeval_s_cleaned.json) is downloaded automatically on first
+run from HuggingFace (xiaowu0162/longmemeval) and cached at
+~/.cache/ironrace/longmemeval_s_cleaned.json.
+
 Usage:
-    python3 scripts/benchmark_longmemeval.py /tmp/longmemeval_s_cleaned.json
-    python3 scripts/benchmark_longmemeval.py /tmp/longmemeval_s_cleaned.json --limit 50
-    python3 scripts/benchmark_longmemeval.py /tmp/longmemeval_s_cleaned.json --backend both
-    python3 scripts/benchmark_longmemeval.py /tmp/longmemeval_s_cleaned.json --backend mempalace
+    python3 scripts/benchmark_longmemeval.py               # auto-download dataset
+    python3 scripts/benchmark_longmemeval.py --limit 50    # quick 50-question run
+    python3 scripts/benchmark_longmemeval.py --backend both
+    python3 scripts/benchmark_longmemeval.py /path/to/longmemeval_s_cleaned.json
 """
 
 from __future__ import annotations
@@ -32,6 +36,43 @@ import tempfile
 import time
 from collections import defaultdict
 from pathlib import Path
+
+_HF_REPO = "xiaowu0162/longmemeval"
+_HF_FILENAME = "longmemeval_s"
+_CACHE_PATH = Path.home() / ".cache" / "ironrace" / _HF_FILENAME
+
+
+def _ensure_dataset(explicit_path: str | None) -> Path:
+    """Return path to the dataset, downloading from HuggingFace if needed."""
+    if explicit_path:
+        p = Path(explicit_path)
+        if not p.exists():
+            print(f"error: data file not found: {p}", file=sys.stderr)
+            sys.exit(1)
+        return p
+
+    if _CACHE_PATH.exists():
+        return _CACHE_PATH
+
+    print(f"Dataset not found locally. Downloading from HuggingFace ({_HF_REPO})...", flush=True)
+    try:
+        from huggingface_hub import hf_hub_download
+    except ImportError:
+        print("error: huggingface_hub not installed. Run: pip install huggingface_hub", file=sys.stderr)
+        sys.exit(1)
+
+    _CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
+    downloaded = hf_hub_download(
+        repo_id=_HF_REPO,
+        filename=_HF_FILENAME,
+        repo_type="dataset",
+        local_dir=str(_CACHE_PATH.parent),
+    )
+    dest = Path(downloaded)
+    if dest != _CACHE_PATH:
+        dest.rename(_CACHE_PATH)
+    print(f"  Cached to {_CACHE_PATH}", flush=True)
+    return _CACHE_PATH
 
 
 # ── Metrics (same as mempalace's implementation) ─────────────────────────────
@@ -62,7 +103,7 @@ class McpClient:
         )
         self._call("initialize", {})
         if wait_for_embedder:
-            deadline = time.monotonic() + 60.0
+            deadline = time.monotonic() + 120.0
             while time.monotonic() < deadline:
                 try:
                     r = self.call_tool("ironmem_status", {})
@@ -138,12 +179,16 @@ def run_ironrace_benchmark(
     granularity: str,
     ef_search: int | None,
 ) -> dict:
-    """Run LongMemEval against ironrace-memory.
+    """Run LongMemEval against ironrace-memory, one fresh server per question.
 
-    Uses a single persistent server for the full benchmark run. Each question's
-    haystack sessions are ingested into wing=f"q{i}" so searches are isolated
-    per-question via wing filter. This avoids restarting the server (and
-    reloading the embedding model) for every question.
+    Each question gets its own DB and MCP server, matching mempalace's
+    per-collection methodology. This ensures the HNSW index only contains
+    the ~50 sessions for the current question, so overfetch is not diluted
+    by cross-question documents.
+
+    Trade-off: ~N server startups (each loads the ONNX model from disk).
+    With the model already cached in the OS page cache after the first
+    question, subsequent loads are fast (~0.2s on M-series hardware).
     """
     ks = [1, 3, 5, 10]
     recalls: dict[int, list[float]] = {k: [] for k in ks}
@@ -153,72 +198,56 @@ def run_ironrace_benchmark(
     data = data[:limit]
     total = len(data)
 
-    # One server, one DB for the entire benchmark
-    tmp = Path(tempfile.mkdtemp(prefix="ironmem-lme-"))
-    db_path = tmp / "memory.sqlite3"
-
-    env: dict[str, str] = {
-        "IRONMEM_DB_PATH": str(db_path),
+    base_env: dict[str, str] = {
         "IRONMEM_EMBED_MODE": "real",
         "IRONMEM_MCP_MODE": "trusted",
         "IRONMEM_AUTO_BOOTSTRAP": "0",
     }
     if ef_search is not None:
-        env["IRONMEM_EF_SEARCH"] = str(ef_search)
+        base_env["IRONMEM_EF_SEARCH"] = str(ef_search)
 
-    client = McpClient(
-        name="ironrace-memory",
-        cmd=[ironmem_binary, "serve"],
-        env=env,
-    )
+    for i, entry in enumerate(data):
+        qtype = entry["question_type"]
+        question = entry["question"]
+        answer_sids = set(entry["answer_session_ids"])
+        docs, corpus_ids = build_corpus(entry, granularity)
 
-    # Store per-question corpus info for scoring after all ingestion
-    question_corpora: list[tuple[str, set[str], list[str], list[str]]] = []
-    # (qtype, answer_sids, docs, corpus_ids)
+        if not docs:
+            continue
 
-    try:
-        client.start(wait_for_embedder=True)
-        print(f"  Model loaded. Ingesting {total} questions × ~50 sessions...", flush=True)
+        tmp = Path(tempfile.mkdtemp(prefix="ironmem-lme-q-"))
+        db_path = tmp / "memory.sqlite3"
 
-        # Phase 1: ingest all questions
-        for i, entry in enumerate(data):
-            qtype = entry["question_type"]
-            answer_sids = set(entry["answer_session_ids"])
-            docs, corpus_ids = build_corpus(entry, granularity)
-            question_corpora.append((qtype, answer_sids, docs, corpus_ids))
+        env = {**base_env, "IRONMEM_DB_PATH": str(db_path)}
 
-            wing = f"q{i}"
-            for doc in docs:
-                client.call_tool("ironmem_add_drawer", {
-                    "content": doc,
-                    "wing": wing,
-                    "room": "session",
-                })
+        client = McpClient(
+            name="ironrace-memory",
+            cmd=[ironmem_binary, "serve"],
+            env=env,
+        )
 
-            if (i + 1) % 50 == 0:
-                print(f"  Ingested {i+1}/{total} questions...", flush=True)
+        try:
+            client.start(wait_for_embedder=True)
 
-        print(f"  Ingestion complete. Running {total} queries...", flush=True)
-
-        # Phase 2: query each question
-        for i, entry in enumerate(data):
-            qtype, answer_sids, docs, corpus_ids = question_corpora[i]
-            if not docs:
-                continue
-
-            question = entry["question"]
-            wing = f"q{i}"
-
-            # Build content fingerprint → index map
-            content_to_idx: dict[str, int] = {}
+            # Capture drawer IDs during ingest for exact ID-based matching.
+            # Fingerprinting doc[:120] was fragile: sanitize_content() trims
+            # stored content, so stored[:120] ≠ original[:120] on any doc with
+            # leading whitespace, silently demoting that result to rank 50+.
+            drawer_id_to_idx: dict[str, int] = {}
             for j, doc in enumerate(docs):
-                content_to_idx[doc[:120]] = j
+                resp = client.call_tool("ironmem_add_drawer", {
+                    "content": doc,
+                    "wing": "session",
+                    "room": "haystack",
+                })
+                drawer_id = resp.get("id")
+                if drawer_id:
+                    drawer_id_to_idx[drawer_id] = j
 
             t0 = time.perf_counter()
             payload = client.call_tool("ironmem_search", {
                 "query": question,
                 "limit": n_results,
-                "wing": wing,
             })
             elapsed_ms = (time.perf_counter() - t0) * 1000
             search_latencies.append(elapsed_ms)
@@ -227,8 +256,8 @@ def run_ironrace_benchmark(
             ranked: list[int] = []
             seen: set[int] = set()
             for r in results:
-                key = r.get("content", "")[:120]
-                idx = content_to_idx.get(key)
+                drawer_id = r.get("id", "")
+                idx = drawer_id_to_idx.get(drawer_id)
                 if idx is not None and idx not in seen:
                     ranked.append(idx)
                     seen.add(idx)
@@ -241,14 +270,14 @@ def run_ironrace_benchmark(
                 recalls[k].append(score)
                 per_type[qtype][k].append(score)
 
-            if (i + 1) % 50 == 0 or i == total - 1:
-                r5 = sum(recalls[5]) / max(len(recalls[5]), 1)
-                med = sorted(search_latencies)[len(search_latencies) // 2]
-                print(f"  [{i+1:>3}/{total}]  R@5={r5:.1%}  med_search={med:.1f}ms", flush=True)
+        finally:
+            client.stop()
+            shutil.rmtree(tmp, ignore_errors=True)
 
-    finally:
-        client.stop()
-        shutil.rmtree(tmp, ignore_errors=True)
+        if (i + 1) % 50 == 0 or i == total - 1:
+            r5 = sum(recalls[5]) / max(len(recalls[5]), 1)
+            med = sorted(search_latencies)[len(search_latencies) // 2]
+            print(f"  [{i+1:>3}/{total}]  R@5={r5:.1%}  med_search={med:.1f}ms", flush=True)
 
     sl = sorted(search_latencies)
     return {
@@ -411,7 +440,12 @@ def parse_args() -> argparse.Namespace:
         description="LongMemEval benchmark: ironrace-memory vs mempalace.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    p.add_argument("data", help="Path to longmemeval_s_cleaned.json")
+    p.add_argument(
+        "data",
+        nargs="?",
+        default=None,
+        help="Path to longmemeval_s_cleaned.json (auto-downloaded to ~/.cache/ironrace/ if omitted)",
+    )
     p.add_argument(
         "--backend",
         choices=["ironrace", "mempalace", "both"],
@@ -463,13 +497,7 @@ def parse_args() -> argparse.Namespace:
 def main() -> int:
     args = parse_args()
 
-    data_path = Path(args.data)
-    if not data_path.exists():
-        print(f"Data file not found: {data_path}", file=sys.stderr)
-        print("Download with:", file=sys.stderr)
-        print("  curl -fsSL -o /tmp/longmemeval_s_cleaned.json \\", file=sys.stderr)
-        print("    https://huggingface.co/datasets/xiaowu0162/longmemeval-cleaned/resolve/main/longmemeval_s_cleaned.json", file=sys.stderr)
-        return 1
+    data_path = _ensure_dataset(args.data)
 
     print(f"Loading {data_path.name}...", flush=True)
     with open(data_path) as f:
@@ -502,7 +530,7 @@ def main() -> int:
             print(f"\nmempalace (via {args.mempalace_python}):", flush=True)
             mp_result = subprocess.run(
                 [args.mempalace_python, __file__,
-                 str(data_path),
+                 str(data_path),  # always pass resolved path to sub-process
                  "--backend", "mempalace",
                  "--limit", str(args.limit),
                  "--n-results", str(args.n_results),

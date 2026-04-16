@@ -33,14 +33,12 @@ pub struct TraversalResult {
     pub depth: usize,
 }
 
-/// Cached memory graph data.
 #[derive(Debug, Clone)]
 pub struct MemoryGraph {
     pub wing_rooms: HashMap<String, HashSet<String>>,
     pub room_wings: HashMap<String, HashSet<String>>,
 }
 
-/// Build the room adjacency graph from drawer metadata.
 fn build_graph_from_db(app: &App) -> Result<MemoryGraph, MemoryError> {
     let mut wing_rooms: HashMap<String, HashSet<String>> = HashMap::new();
     let mut room_wings: HashMap<String, HashSet<String>> = HashMap::new();
@@ -59,9 +57,7 @@ fn build_graph_from_db(app: &App) -> Result<MemoryGraph, MemoryError> {
     })
 }
 
-/// Get the memory graph, using the App-level cache if available.
 fn get_graph(app: &App) -> Result<MemoryGraph, MemoryError> {
-    // Check cache first
     {
         let cache = app
             .graph_cache
@@ -72,7 +68,6 @@ fn get_graph(app: &App) -> Result<MemoryGraph, MemoryError> {
         }
     }
 
-    // Cache miss: build from DB and store
     let graph = build_graph_from_db(app)?;
     if let Ok(mut cache) = app.graph_cache.write() {
         *cache = Some(graph.clone());
@@ -80,7 +75,6 @@ fn get_graph(app: &App) -> Result<MemoryGraph, MemoryError> {
     Ok(graph)
 }
 
-/// BFS traversal from a starting room.
 pub fn traverse(
     app: &App,
     start_room: &str,
@@ -93,7 +87,6 @@ pub fn traverse(
     let mut queue: VecDeque<(String, usize)> = VecDeque::new();
     let mut max_reached = 0;
 
-    // Find the start room with a best-effort substring match.
     let start = graph
         .room_wings
         .keys()
@@ -111,7 +104,6 @@ pub fn traverse(
         max_reached = max_reached.max(depth);
         visited.push(room.clone());
 
-        // Find adjacent rooms: rooms in the same wing(s)
         if let Some(wings) = graph.room_wings.get(&room) {
             for wing in wings {
                 if let Some(rooms) = graph.wing_rooms.get(wing) {
@@ -133,7 +125,6 @@ pub fn traverse(
     })
 }
 
-/// Find rooms that span multiple wings (tunnels).
 pub fn find_tunnels(app: &App) -> Result<Vec<Tunnel>, MemoryError> {
     let graph = get_graph(app)?;
 
@@ -155,7 +146,6 @@ pub fn find_tunnels(app: &App) -> Result<Vec<Tunnel>, MemoryError> {
     Ok(tunnels)
 }
 
-/// Graph statistics.
 pub fn graph_stats(app: &App) -> Result<GraphStats, MemoryError> {
     let graph = get_graph(app)?;
 

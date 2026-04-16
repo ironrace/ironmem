@@ -278,9 +278,6 @@ fn collect_assistant_texts(value: &serde_json::Value, out: &mut Vec<String>) {
     match value {
         serde_json::Value::Object(map) => {
             if is_assistant_message(map) {
-                // Extract text from this message and stop descending into its
-                // children — the content fields we just extracted would be
-                // visited again by the recursive walk, producing duplicates.
                 let text = extract_message_text(map);
                 if !text.is_empty() {
                     out.push(text);
@@ -366,14 +363,10 @@ fn is_review_like(text: &str) -> bool {
 
     let lower = text.to_ascii_lowercase();
 
-    // Unambiguous review section headers
     if lower.starts_with("findings") || lower.starts_with("no findings") {
         return true;
     }
 
-    // Severity labels that appear as markdown headers or list items.
-    // Require the label to start a line or follow "### " to avoid matching
-    // "high: temperature" or "this is a blocking I/O call".
     let review_line_markers = [
         "### high",
         "### medium",
@@ -389,7 +382,6 @@ fn is_review_like(text: &str) -> bool {
         return true;
     }
 
-    // Decision keywords that are unambiguous in review context
     if ["request changes", "would not merge", "approve", "lgtm"]
         .iter()
         .any(|marker| lower.contains(marker))
@@ -397,8 +389,6 @@ fn is_review_like(text: &str) -> bool {
         return true;
     }
 
-    // File reference pattern (e.g. src/foo.rs:42) combined with minimum
-    // length — long enough to rule out incidental matches in short messages.
     REVIEW_FILE_REF_RE.is_match(text) && text.len() >= 80
 }
 
@@ -430,12 +420,6 @@ fn truncate_text_to_byte_limit(text: &str, max_bytes: usize) -> String {
     text[..end].to_string()
 }
 
-/// Sanitize a file-system path for inclusion in diary/log entries.
-///
-/// Allows printable ASCII path characters only. Strips anything that could be
-/// used for injection (backticks, quotes, semicolons, pipe, ampersand) and
-/// caps length at 512 characters so a crafted hook payload cannot inflate
-/// diary entries.
 fn sanitize_path_for_log(raw: &str) -> String {
     raw.chars()
         .filter(|c| {
@@ -668,21 +652,16 @@ mod tests {
 
     #[test]
     fn is_review_like_rejects_non_review_messages() {
-        // "blocking" alone must not match
         assert!(!is_review_like("This uses a blocking I/O call"));
         assert!(!is_review_like("high: performance is the goal here"));
-        // "high:" in the middle of a sentence is fine
         assert!(!is_review_like("The latency is high: 200ms average"));
         assert!(!is_review_like("Let me explain the architecture"));
         assert!(!is_review_like("Here is the updated implementation"));
-        // short file ref should not trigger
         assert!(!is_review_like("see foo.rs:12"));
     }
 
     #[test]
     fn collect_assistant_texts_does_not_double_count_nested_content() {
-        // A top-level assistant message whose content contains another object
-        // with role=assistant should produce exactly one candidate, not two.
         let value = serde_json::json!({
             "role": "assistant",
             "content": [
@@ -699,11 +678,9 @@ mod tests {
 
     #[test]
     fn truncate_text_to_byte_limit_respects_char_boundaries() {
-        // 23_999 ASCII bytes + one 2-byte UTF-8 char = 24_001 bytes total
         let s = "a".repeat(23_999) + "é";
         assert_eq!(s.len(), 24_001);
         let truncated = truncate_text_to_byte_limit(&s, 24_000);
-        // Must drop the 2-byte char entirely, not split it
         assert_eq!(truncated.len(), 23_999);
         assert!(truncated.is_char_boundary(truncated.len()));
     }

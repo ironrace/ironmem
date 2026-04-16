@@ -82,13 +82,14 @@ impl Config {
         let (model_dir, model_dir_explicit) = if let Ok(p) = std::env::var("IRONMEM_MODEL_DIR") {
             (PathBuf::from(p), true)
         } else {
-            // Reuse ironrace's model cache — no need to download twice
-            (
+            // Use the same cache dir as the embed crate so they stay in sync
+            // when the model is upgraded.
+            let dir = ironrace_embed::embedder::model_cache_dir().unwrap_or_else(|_| {
                 home.join(".ironrace")
                     .join("models")
-                    .join("all-MiniLM-L6-v2"),
-                false,
-            )
+                    .join("all-MiniLM-L6-v2")
+            });
+            (dir, false)
         };
 
         let state_dir = base_dir.join("hook_state");

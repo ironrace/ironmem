@@ -59,7 +59,8 @@ pub fn compute_ef_search(top_k: usize, count: usize) -> usize {
     } else if top_k >= count / 2 {
         count
     } else {
-        top_k.max(100)
+        // 2× overshoot gives ~99% recall at all tested scales; min 100 for small indexes.
+        top_k.saturating_mul(2).max(100)
     }
 }
 

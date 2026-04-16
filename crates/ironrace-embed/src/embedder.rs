@@ -1,4 +1,4 @@
-//! ONNX-based sentence embedder using MiniLM-L6-v2.
+//! ONNX-based sentence embedder using bge-base-en-v1.5.
 //!
 //! Ported from ironrace-bin/src/embedder.rs with security hardening:
 //! - SHA-256 checksum verification of downloaded model files
@@ -14,27 +14,27 @@ use ort::value::TensorRef;
 use sha2::{Digest, Sha256};
 use tokenizers::Tokenizer;
 
-/// MiniLM-L6-v2 produces 384-dimensional embeddings.
-pub const EMBED_DIM: usize = 384;
+/// bge-base-en-v1.5 produces 768-dimensional embeddings.
+pub const EMBED_DIM: usize = 768;
 
-/// Maximum sequence length for the model.
-const MAX_SEQ_LEN: usize = 256;
+/// Maximum sequence length for the model (bge-base supports up to 512).
+const MAX_SEQ_LEN: usize = 512;
 
 /// Batch size for embedding inference.
 const BATCH_SIZE: usize = 64;
 
 /// HuggingFace model repo for the ONNX model.
-const HF_MODEL_REPO: &str = "sentence-transformers/all-MiniLM-L6-v2";
+const HF_MODEL_REPO: &str = "BAAI/bge-base-en-v1.5";
 
 /// Local cache directory name.
-const MODEL_DIR_NAME: &str = "all-MiniLM-L6-v2";
+const MODEL_DIR_NAME: &str = "bge-base-en-v1.5";
 
 /// SHA-256 checksums for model integrity verification.
-/// Pinned to sentence-transformers/all-MiniLM-L6-v2 from HuggingFace Hub.
+/// Pinned to BAAI/bge-base-en-v1.5 from HuggingFace Hub.
 /// Update these when upgrading the model version.
-const MODEL_ONNX_SHA256: &str = "6fd5d72fe4589f189f8ebc006442dbb529bb7ce38f8082112682524616046452";
+const MODEL_ONNX_SHA256: &str = "9bc579acdba21c253c62a9bf866891355a63ffa3442b52c8a37d75b2ccb91848";
 const TOKENIZER_JSON_SHA256: &str =
-    "be50c3628f2bf5bb5e3a7f17b1f74611b2561a3a27eeab05e5aa30f411572037";
+    "d241a60d5e8f04cc1b2b3e9ef7a4921b27bf526d9f6050ab90f9267a1f9e5c66";
 
 // Compile-time assertion: SHA-256 hex digests must be exactly 64 characters.
 const _: () = {
@@ -98,7 +98,7 @@ fn verify_checksums(dir: &Path) -> Result<bool> {
 fn download_model(dir: &Path) -> Result<()> {
     std::fs::create_dir_all(dir)?;
 
-    eprintln!("Downloading MiniLM-L6-v2 model from HuggingFace...");
+    eprintln!("Downloading bge-base-en-v1.5 model from HuggingFace...");
 
     let api = hf_hub::api::sync::Api::new().context("Failed to create HuggingFace API client")?;
     let repo = api.model(HF_MODEL_REPO.to_string());
@@ -435,7 +435,7 @@ mod tests {
         let dir = model_cache_dir().unwrap();
         assert!(dir
             .to_string_lossy()
-            .contains(".ironrace/models/all-MiniLM-L6-v2"));
+            .contains(".ironrace/models/bge-base-en-v1.5"));
     }
 
     #[test]

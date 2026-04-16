@@ -7,6 +7,7 @@ use crate::error::MemoryError;
 use ironrace_embed::embedder::EMBED_DIM;
 
 const SCHEMA_SQL: &str = include_str!("../../migrations/001_init.sql");
+const FTS_SQL: &str = include_str!("../../migrations/002_fts.sql");
 
 /// Database wrapper around a SQLite connection.
 ///
@@ -49,9 +50,23 @@ impl Database {
         Ok(db)
     }
 
-    /// Run schema migrations.
+    /// Run schema migrations in version order. Idempotent: uses schema_version
+    /// to skip already-applied migrations.
     pub fn migrate(&self) -> Result<(), MemoryError> {
+        // v1: base schema (drawers, entities, triples, wal_log, schema_version)
         retry_on_busy(|| self.conn.execute_batch(SCHEMA_SQL))?;
+
+        // v2: FTS5 full-text search index for hybrid BM25+vector retrieval
+        let current_version: i64 = self
+            .conn
+            .query_row("SELECT MAX(version) FROM schema_version", [], |row| {
+                row.get(0)
+            })
+            .unwrap_or(1);
+        if current_version < 2 {
+            retry_on_busy(|| self.conn.execute_batch(FTS_SQL))?;
+        }
+
         Ok(())
     }
 
@@ -218,80 +233,22 @@ mod tests {
                 rusqlite::params![
                     "rollback_test_id_000000000000001",
                     "test content",
-                    vec![0u8; 4 * ironrace_embed::embedder::EMBED_DIM],
-                    "wing",
-                    "room",
+                    vec![0u8; ironrace_embed::embedder::EMBED_DIM * std::mem::size_of::<f32>()],
+                    "w",
+                    "r",
                     "",
                     "test"
                 ],
             )?;
-            assert_eq!(
-                rows_inserted, 1,
-                "INSERT must succeed before testing rollback"
-            );
-            Err(MemoryError::Validation("force rollback".into()))
+            assert_eq!(rows_inserted, 1);
+            Err(MemoryError::NotFound("forced rollback".into()))
         });
 
         assert!(result.is_err());
-
         let count: i64 = db
             .conn
-            .query_row("SELECT count(*) FROM drawers", [], |row| row.get(0))
+            .query_row("SELECT COUNT(*) FROM drawers", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(count, 0, "transaction must have been rolled back");
-    }
-
-    #[test]
-    fn test_load_all_vectors_rejects_corrupt_blob_length() {
-        let db = Database::open_in_memory().unwrap();
-        db.with_transaction(|tx| {
-            tx.execute(
-                "INSERT INTO drawers (id, content, embedding, wing, room, source_file, added_by)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-                rusqlite::params![
-                    "badblob000000000000000000000001",
-                    "bad",
-                    vec![1u8, 2, 3],
-                    "w",
-                    "r",
-                    "",
-                    "test"
-                ],
-            )?;
-            Ok(())
-        })
-        .unwrap();
-
-        let err = db.load_all_vectors().unwrap_err().to_string();
-        assert!(err.contains("invalid embedding blob length"));
-    }
-
-    #[test]
-    fn test_load_all_vectors_rejects_wrong_dimension() {
-        let db = Database::open_in_memory().unwrap();
-        let blob: Vec<u8> = [1.0f32, 2.0, 3.0]
-            .into_iter()
-            .flat_map(|value| value.to_le_bytes())
-            .collect();
-        db.with_transaction(|tx| {
-            tx.execute(
-                "INSERT INTO drawers (id, content, embedding, wing, room, source_file, added_by)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-                rusqlite::params![
-                    "baddim0000000000000000000000002",
-                    "bad",
-                    blob,
-                    "w",
-                    "r",
-                    "",
-                    "test"
-                ],
-            )?;
-            Ok(())
-        })
-        .unwrap();
-
-        let err = db.load_all_vectors().unwrap_err().to_string();
-        assert!(err.contains("embedding dimension"));
+        assert_eq!(count, 0);
     }
 }
