@@ -41,6 +41,9 @@ from pathlib import Path
 
 _DEFAULT_CACHE = Path.home() / ".cache" / "ironrace" / "Membench"
 
+# Raw Membench repo structure: MemData/{FirstAgent,ThirdAgent}/*.json
+_AGENT_PERSPECTIVE = {"FirstAgent": "participation", "ThirdAgent": "observation"}
+
 # Pre-sampled files at 0-10k token context (one per scenario × memory level)
 _DATA_FILES = [
     ("participation", "factual",    "data2test/participation_factual_0_10k.json"),
@@ -60,11 +63,21 @@ _ALT_DATA_FILES = [
 
 def _find_data_files(data_dir: Path) -> list[tuple[str, str, Path]]:
     """Return [(perspective, memory_level, path)] for each found data file."""
+    # Prefer raw Membench repo structure: MemData/{FirstAgent,ThirdAgent}/*.json
+    raw_found: list[tuple[str, str, Path]] = []
+    for agent_dir, perspective in _AGENT_PERSPECTIVE.items():
+        agent_path = data_dir / "MemData" / agent_dir
+        if agent_path.is_dir():
+            for json_file in sorted(agent_path.glob("*.json")):
+                raw_found.append((perspective, json_file.stem, json_file))
+    if raw_found:
+        return raw_found
+
+    # Fall back to pre-processed data2test/ or data/ files
     found: list[tuple[str, str, Path]] = []
     for perspective, level, rel in _DATA_FILES + _ALT_DATA_FILES:
         p = data_dir / rel
         if p.exists():
-            # Deduplicate by (perspective, level) — prefer data2test over data/
             if not any(x[0] == perspective and x[1] == level for x in found):
                 found.append((perspective, level, p))
     return found
@@ -89,6 +102,78 @@ def _ensure_data_dir(data_dir: Path) -> list[tuple[str, str, Path]]:
 
 # ── Dataset helpers ───────────────────────────────────────────────────────────
 
+def _build_dialogue(message_list: list) -> str:
+    """Flatten a Membench message_list (list-of-sessions or list-of-turns) into a string."""
+    turns: list[str] = []
+    for item in message_list:
+        if isinstance(item, list):
+            # List of turns within a session
+            for turn in item:
+                if not isinstance(turn, dict):
+                    continue
+                u = turn.get("user_message", turn.get("user", ""))
+                a = turn.get("assistant_message", turn.get("assistant", ""))
+                t = turn.get("time", "")
+                pl = turn.get("place", "")
+                meta = f" (time: {t}, place: {pl})" if t or pl else ""
+                if u:
+                    turns.append(f"User: {u}{meta}")
+                if a:
+                    turns.append(f"Assistant: {a}")
+        elif isinstance(item, dict):
+            u = item.get("user_message", item.get("user", ""))
+            a = item.get("assistant_message", item.get("assistant", ""))
+            t = item.get("time", "")
+            pl = item.get("place", "")
+            meta = f" (time: {t}, place: {pl})" if t or pl else ""
+            if u:
+                turns.append(f"User: {u}{meta}")
+            if a:
+                turns.append(f"Assistant: {a}")
+        elif isinstance(item, str):
+            turns.append(item)
+    return "\n".join(turns)
+
+
+def _turn_text(turn: dict) -> str:
+    """Render one MemBench turn the same way MemPal's benchmark does."""
+    user = turn.get("user") or turn.get("user_message", "")
+    asst = turn.get("assistant") or turn.get("assistant_message", "")
+    t = turn.get("time", "")
+    text = f"[User] {user} [Assistant] {asst}"
+    if t:
+        text = f"[{t}] {text}"
+    return text
+
+
+def _iter_turns(message_list: list) -> list[dict]:
+    """Flatten MemBench message_list into indexed turns with sid/global metadata."""
+    if not message_list:
+        return []
+
+    sessions = [message_list] if isinstance(message_list[0], dict) else message_list
+    turns: list[dict] = []
+    global_idx = 0
+
+    for s_idx, session in enumerate(sessions):
+        if not isinstance(session, list):
+            continue
+        for t_idx, turn in enumerate(session):
+            if not isinstance(turn, dict):
+                continue
+            sid = turn.get("sid", turn.get("mid"))
+            turns.append({
+                "sid": int(sid) if isinstance(sid, (int, float)) else global_idx,
+                "global_idx": global_idx,
+                "s_idx": s_idx,
+                "t_idx": t_idx,
+                "content": _turn_text(turn),
+            })
+            global_idx += 1
+
+    return turns
+
+
 def _load_items(path: Path, perspective: str, level: str) -> list[dict]:
     """Load and tag items from one MemBench data file."""
     with open(path) as f:
@@ -96,25 +181,49 @@ def _load_items(path: Path, perspective: str, level: str) -> list[dict]:
 
     items: list[dict] = []
 
-    if isinstance(raw, list):
-        entries = raw
-    elif isinstance(raw, dict) and "data" in raw:
-        entries = raw["data"]
-    else:
-        print(f"  warning: unexpected format in {path}, skipping.", file=sys.stderr)
-        return items
-
-    for entry in entries:
+    def _add_entry(entry: dict) -> None:
         if not isinstance(entry, dict):
-            continue
+            return
+        qa = entry.get("QA", {})
+        msg_list = entry.get("message_list", [])
+        dialogue = (
+            _build_dialogue(msg_list)
+            if msg_list
+            else entry.get("dialogue", entry.get("context", entry.get("conversation", "")))
+        )
+        def _str(v: object) -> str:
+            if isinstance(v, list):
+                return ", ".join(str(x) for x in v)
+            return str(v) if v is not None else ""
+
         items.append({
             "perspective": perspective,
             "memory_level": level,
-            "question": entry.get("question", entry.get("query", "")),
-            "answer": entry.get("answer", entry.get("ground_truth", "")),
-            "evidence": entry.get("evidence", entry.get("evidence_text", "")),
-            "dialogue": entry.get("dialogue", entry.get("context", entry.get("conversation", ""))),
+            "question": _str(qa.get("question", entry.get("question", entry.get("query", "")))),
+            "answer": _str(qa.get("answer", entry.get("answer", ""))),
+            "evidence": _str(qa.get("evidence", entry.get("evidence", entry.get("evidence_text", "")))),
+            "ground_truth": _str(qa.get("ground_truth", entry.get("ground_truth", ""))),
+            "choices": qa.get("choices", entry.get("choices", {})),
+            "target_step_ids": qa.get("target_step_id", entry.get("target_step_id", [])),
+            "message_list": msg_list,
+            "dialogue": dialogue,
         })
+
+    if isinstance(raw, list):
+        for entry in raw:
+            _add_entry(entry)
+    elif isinstance(raw, dict):
+        if "data" in raw:
+            for entry in raw["data"]:
+                _add_entry(entry)
+        else:
+            # Raw Membench format: {"roles": [...], "events": [...]}
+            for sublist in raw.values():
+                if isinstance(sublist, list):
+                    for entry in sublist:
+                        _add_entry(entry)
+    else:
+        print(f"  warning: unexpected format in {path}, skipping.", file=sys.stderr)
 
     return items
 
@@ -141,6 +250,24 @@ def _split_dialogue_into_chunks(dialogue: str, max_chunk_chars: int = 500) -> li
         chunks.append(current.strip())
 
     return chunks if chunks else [dialogue[:max_chunk_chars]]
+
+
+def _target_turn_ids(target_step_ids: object) -> set[int]:
+    """Extract the primary sid/global index from MemBench target_step_id records."""
+    target_ids: set[int] = set()
+    if not isinstance(target_step_ids, list):
+        return target_ids
+
+    for step in target_step_ids:
+        if isinstance(step, list) and step:
+            value = step[0]
+        else:
+            value = step
+
+        if isinstance(value, (int, float)):
+            target_ids.add(int(value))
+
+    return target_ids
 
 
 # ── MCP JSON-RPC client ───────────────────────────────────────────────────────
@@ -198,6 +325,10 @@ class McpClient:
         resp = self._call("tools/call", {"name": name, "arguments": arguments})
         if "error" in resp:
             raise RuntimeError(f"{self.name} tool error: {resp['error']}")
+        if resp.get("result", {}).get("isError"):
+            content = resp.get("result", {}).get("content", [])
+            message = content[0].get("text", "unknown tool error") if content else "unknown tool error"
+            raise RuntimeError(f"{self.name} tool error: {message}")
         content = resp.get("result", {}).get("content", [])
         if content and content[0].get("type") == "text":
             try:
@@ -219,9 +350,9 @@ def run_membench_benchmark(
 ) -> dict:
     """Run MemBench retrieval benchmark against ironrace-memory.
 
-    Each item's dialogue is split into chunks and ingested into its own wing.
-    A hit is scored when the evidence text (or answer) appears in the top-k
-    retrieved chunks.
+    Each item's turns are ingested one drawer per turn into its own wing.
+    A hit is scored when any retrieved turn matches the MemBench
+    `target_step_id` sid/global index, mirroring MemPal's benchmark logic.
     """
     tmp = Path(tempfile.mkdtemp(prefix="ironmem-membench-"))
     db_path = tmp / "memory.sqlite3"
@@ -254,27 +385,30 @@ def run_membench_benchmark(
 
         for i, item in enumerate(items):
             question = item.get("question", "")
-            evidence = item.get("evidence", "")
-            answer = item.get("answer", "")
-            dialogue = item.get("dialogue", "")
+            message_list = item.get("message_list", [])
             perspective = item.get("perspective", "unknown")
             level = item.get("memory_level", "unknown")
             scenario = f"{perspective}/{level}"
+            target_ids = _target_turn_ids(item.get("target_step_ids", []))
 
-            if not question or not dialogue:
+            if not question:
                 continue
 
-            chunks = _split_dialogue_into_chunks(dialogue)
-            if not chunks:
+            turns = _iter_turns(message_list) if isinstance(message_list, list) else []
+            if not turns:
                 continue
 
             wing = f"item{i}"
-            for chunk in chunks:
-                client.call_tool("ironmem_add_drawer", {
-                    "content": chunk,
+            drawer_targets: dict[str, tuple[int, int]] = {}
+            for turn in turns:
+                payload = client.call_tool("ironmem_add_drawer", {
+                    "content": turn["content"],
                     "wing": wing,
-                    "room": "dialogue",
+                    "room": "turn",
                 })
+                drawer_id = payload.get("id")
+                if isinstance(drawer_id, str):
+                    drawer_targets[drawer_id] = (turn["sid"], turn["global_idx"])
 
             t0 = time.perf_counter()
             payload = client.call_tool("ironmem_search", {
@@ -286,11 +420,20 @@ def run_membench_benchmark(
             search_latencies.append(elapsed_ms)
 
             results = payload.get("results", [])
-            top_contents = " ".join(r.get("content", "") for r in results[:top_k]).lower()
+            retrieved_sids: set[int] = set()
+            retrieved_global: set[int] = set()
+            for result in results[:top_k]:
+                drawer_id = result.get("id")
+                if not isinstance(drawer_id, str):
+                    continue
+                target = drawer_targets.get(drawer_id)
+                if target is None:
+                    continue
+                sid, global_idx = target
+                retrieved_sids.add(sid)
+                retrieved_global.add(global_idx)
 
-            # Score: evidence text appears in retrieved content (fall back to answer)
-            needle = evidence if evidence else answer
-            hit = needle.lower() in top_contents if needle else False
+            hit = bool(target_ids & retrieved_sids) or bool(target_ids & retrieved_global)
             hits.append(1.0 if hit else 0.0)
             per_scenario[scenario].append(1.0 if hit else 0.0)
 

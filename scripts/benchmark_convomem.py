@@ -2,25 +2,31 @@
 """ConvoMem benchmark for ironrace-memory.
 
 Tests retrieval recall across 6 conversational memory categories.
-Matches mempalace's ConvoMem benchmark: 250 items (50 per category).
+Matches MemPal's published ConvoMem harness: 250 items (50 per category),
+one drawer per message, scored at top-10.
 
 Mempalace published baseline:
-  92.9% avg recall  (all categories, 250 items)
+  92.9% avg recall  (all categories, 250 items, top-10)
 
 Dataset: Salesforce/ConvoMem on HuggingFace (75K QA pairs).
-Streams the dataset and samples 50 items per category — avoids downloading
-the full 27.5 GB.
+The Hugging Face dataset viewer and `datasets.load_dataset(..., streaming=True)`
+currently fail on this repo because the published split mixes incompatible JSON
+schemas. This script reads the raw benchmark JSON files directly from the HF
+repo and samples from the `1_evidence` subset MemPal uses, preferring
+`evidence_questions/<category>/1_evidence` and falling back to the equivalent
+`pre_mixed_testcases/<category>/1_evidence` files when only those are cached.
 
 Six categories evaluated:
   user_evidence               — user states facts about themselves
   assistant_facts_evidence    — assistant provided information
   changing_evidence           — track state changes across messages
-  abstention_evidence         — information was never stated (skip for retrieval)
+  abstention_evidence         — information was never stated
   preference_evidence         — apply user preferences
   implicit_connection_evidence — multi-hop reasoning across messages
 
-For abstention items, there is no evidence to retrieve, so they are scored
-separately as "did ironrace correctly return no relevant results?"
+For abstention items, the upstream MemPal benchmark treats the item as a
+trivial pass when no evidence messages are present. This script mirrors that
+behavior for apples-to-apples comparisons.
 
 Usage:
     python3 scripts/benchmark_convomem.py
@@ -62,20 +68,27 @@ _CAT_LABELS = {
     "implicit_connection_evidence": "implicit_conn",
 }
 
+_HF_REPO_ID = "Salesforce/ConvoMem"
+_HF_EVIDENCE_PREFIX = "core_benchmark/evidence_questions/"
+_HF_PREMIXED_PREFIX = "core_benchmark/pre_mixed_testcases/"
+_HF_CACHE_ROOT = Path.home() / ".cache" / "huggingface" / "hub" / "datasets--Salesforce--ConvoMem" / "snapshots"
+
 
 # ── Dataset loading ───────────────────────────────────────────────────────────
 
 def _stream_sample(n_per_category: int, seed: int) -> list[dict]:
-    """Stream ConvoMem from HuggingFace and collect n_per_category items per category.
+    """Sample ConvoMem items from raw HF repo files.
 
-    Uses streaming to avoid downloading the full 27.5 GB dataset.
-    Stops streaming as soon as all categories are filled.
+    The dataset's advertised `train` split currently mixes flat rows with
+    nested `evidence_items` JSON documents, which breaks `datasets` streaming.
+    We bypass that split entirely and read the raw `1_evidence` files, using
+    the same subset MemPal benchmarks against.
     """
     try:
-        from datasets import load_dataset  # type: ignore
+        from huggingface_hub import HfApi, hf_hub_download  # type: ignore
     except ImportError:
         print(
-            "error: datasets not installed. Run: pip install datasets",
+            "error: huggingface_hub not installed. Run: pip install huggingface_hub",
             file=sys.stderr,
         )
         sys.exit(1)
@@ -86,34 +99,49 @@ def _stream_sample(n_per_category: int, seed: int) -> list[dict]:
         flush=True,
     )
 
-    ds = load_dataset("Salesforce/ConvoMem", streaming=True, split="train")
-
     rng = random.Random(seed)
-    per_cat: dict[str, list[dict]] = {c: [] for c in _CATEGORIES}
     reservoir: dict[str, list[dict]] = {c: [] for c in _CATEGORIES}
     counts: dict[str, int] = {c: 0 for c in _CATEGORIES}
     filled: set[str] = set()
 
-    for item in ds:
-        cat = item.get("category")
-        if cat not in per_cat:
+    data_files = _list_convomem_files(HfApi())
+    if not data_files:
+        print("error: no ConvoMem 1_evidence benchmark files found", file=sys.stderr)
+        sys.exit(1)
+
+    rng.shuffle(data_files)
+
+    for path in data_files:
+        category = _category_from_path(path)
+        if category not in reservoir or category in filled:
             continue
 
-        counts[cat] += 1
-        n = counts[cat]
+        local_path = _resolve_local_convomem_file(path, hf_hub_download)
+        with open(local_path) as f:
+            payload = json.load(f)
 
-        # Reservoir sampling so the final sample is uniformly random
-        if len(reservoir[cat]) < n_per_category:
-            reservoir[cat].append(item)
-        else:
-            j = rng.randint(0, n - 1)
-            if j < n_per_category:
-                reservoir[cat][j] = item
+        for item in _iter_evidence_items(payload, default_category=category):
+            cat = item.get("category")
+            if cat not in reservoir:
+                continue
 
-        if len(reservoir[cat]) >= n_per_category and cat not in filled:
-            filled.add(cat)
-            print(f"  category '{cat}': {n_per_category} sampled", flush=True)
+            counts[cat] += 1
+            n = counts[cat]
 
+            # Reservoir sampling so later items can replace earlier ones.
+            if len(reservoir[cat]) < n_per_category:
+                reservoir[cat].append(item)
+            else:
+                j = rng.randint(0, n - 1)
+                if j < n_per_category:
+                    reservoir[cat][j] = item
+
+            if len(reservoir[cat]) >= n_per_category and cat not in filled:
+                filled.add(cat)
+                print(f"  category '{cat}': {n_per_category} sampled", flush=True)
+
+            if len(filled) == len(_CATEGORIES):
+                break
         if len(filled) == len(_CATEGORIES):
             break
 
@@ -128,12 +156,125 @@ def _stream_sample(n_per_category: int, seed: int) -> list[dict]:
 
 
 def _load_local(path: Path) -> list[dict]:
-    """Load a pre-sampled ConvoMem JSON file (list of items)."""
+    """Load a pre-sampled ConvoMem JSON file (list of normalized items)."""
     with open(path) as f:
         data = json.load(f)
     if not isinstance(data, list):
         raise ValueError(f"Expected a list at top level, got {type(data).__name__}")
     return data
+
+
+def _category_from_path(path: str) -> str | None:
+    parts = Path(path).parts
+    for category in _CATEGORIES:
+        if category in parts:
+            return category
+    return None
+
+
+def _prioritize_convomem_files(paths: list[str]) -> list[str]:
+    """Prefer `1_evidence` files per category, but backfill gaps from pre-mixed files."""
+    preferred_by_cat: dict[str, list[str]] = {cat: [] for cat in _CATEGORIES}
+    fallback_by_cat: dict[str, list[str]] = {cat: [] for cat in _CATEGORIES}
+
+    for path in paths:
+        category = _category_from_path(path)
+        if category is None:
+            continue
+
+        if (
+            (path.startswith(_HF_EVIDENCE_PREFIX) or path.startswith(_HF_PREMIXED_PREFIX))
+            and "/1_evidence/" in path
+        ):
+            preferred_by_cat[category].append(path)
+        elif path.startswith(_HF_PREMIXED_PREFIX):
+            fallback_by_cat[category].append(path)
+
+    ordered: list[str] = []
+    for category in _CATEGORIES:
+        preferred = preferred_by_cat[category]
+        if preferred:
+            ordered.extend(preferred)
+        else:
+            ordered.extend(fallback_by_cat[category])
+    return ordered
+
+
+def _list_convomem_files(api: object) -> list[str]:
+    try:
+        repo_files = api.list_repo_files(repo_id=_HF_REPO_ID, repo_type="dataset")
+        candidates = [
+            path for path in repo_files
+            if (
+                path.endswith(".json")
+                and (
+                    path.startswith(_HF_EVIDENCE_PREFIX)
+                    or path.startswith(_HF_PREMIXED_PREFIX)
+                )
+            )
+        ]
+        prioritized = _prioritize_convomem_files(candidates)
+        if prioritized:
+            return prioritized
+    except Exception:
+        pass
+
+    cached: list[str] = []
+    if _HF_CACHE_ROOT.exists():
+        for path in _HF_CACHE_ROOT.glob("**/core_benchmark/**/*.json"):
+            try:
+                rel = path.relative_to(next(parent for parent in path.parents if parent.parent == _HF_CACHE_ROOT))
+            except StopIteration:
+                continue
+            rel_posix = rel.as_posix()
+            if rel_posix.startswith(_HF_EVIDENCE_PREFIX) or rel_posix.startswith(_HF_PREMIXED_PREFIX):
+                cached.append(rel_posix)
+    return _prioritize_convomem_files(cached)
+
+
+def _resolve_local_convomem_file(path: str, hf_hub_download) -> Path:
+    for snapshot in _HF_CACHE_ROOT.glob("*"):
+        candidate = snapshot / path
+        if candidate.exists():
+            return candidate
+    return Path(hf_hub_download(repo_id=_HF_REPO_ID, repo_type="dataset", filename=path))
+
+
+def _iter_evidence_items(payload: object, default_category: str | None) -> list[dict]:
+    """Normalize HF payloads into the flat item shape used by the benchmark."""
+    items: list[dict] = []
+
+    if isinstance(payload, dict):
+        bundles = [payload]
+    elif isinstance(payload, list):
+        bundles = payload
+    else:
+        return items
+
+    for bundle in bundles:
+        if not isinstance(bundle, dict):
+            continue
+
+        raw_items = bundle.get("evidenceItems") or bundle.get("evidence_items") or []
+        if not isinstance(raw_items, list):
+            continue
+
+        for raw in raw_items:
+            if not isinstance(raw, dict):
+                continue
+            category = default_category or raw.get("evidence_type") or raw.get("category")
+            if category not in _CATEGORIES:
+                continue
+            items.append({
+                "category": category,
+                "question": raw.get("question", ""),
+                "answer": raw.get("answer", ""),
+                "conversations": raw.get("conversations", bundle.get("conversations", [])),
+                "messages": raw.get("messages", []),
+                "message_evidences": raw.get("message_evidences", []),
+                "persona": raw.get("persona") or raw.get("personId"),
+            })
+    return items
 
 
 # ── Evidence extraction ───────────────────────────────────────────────────────
@@ -142,13 +283,23 @@ def _extract_messages(item: dict) -> list[str]:
     """Return all conversation messages to ingest as drawers."""
     messages: list[str] = []
 
-    # ConvoMem schema has a 'conversations' field with messages
+    # Raw HF files store full conversations under `conversations`, while older
+    # pre-sampled files may already have a flat top-level `messages` list.
     for conv in item.get("conversations", []):
         for msg in conv.get("messages", []):
             text = msg.get("text", "")
             speaker = msg.get("speaker", "")
             if text:
                 messages.append(f"{speaker}: {text}" if speaker else text)
+
+    if messages:
+        return messages
+
+    for msg in item.get("messages", []):
+        text = msg.get("text", "")
+        speaker = msg.get("speaker", "")
+        if text:
+            messages.append(f"{speaker}: {text}" if speaker else text)
 
     return messages
 
@@ -230,6 +381,10 @@ class McpClient:
         resp = self._call("tools/call", {"name": name, "arguments": arguments})
         if "error" in resp:
             raise RuntimeError(f"{self.name} tool error: {resp['error']}")
+        if resp.get("result", {}).get("isError"):
+            content = resp.get("result", {}).get("content", [])
+            message = content[0].get("text", "unknown tool error") if content else "unknown tool error"
+            raise RuntimeError(f"{self.name} tool error: {message}")
         content = resp.get("result", {}).get("content", [])
         if content and content[0].get("type") == "text":
             try:
@@ -297,11 +452,10 @@ def run_convomem_benchmark(
             if not messages:
                 continue
 
-            # Abstention items have no evidence; score separately
+            # Match MemPal's benchmark: no evidence messages is a trivial pass.
             if cat == "abstention_evidence":
                 per_cat_total[cat] += 1
-                # For abstention, "recall" means the system retrieves nothing
-                # relevant — we skip scoring and count separately.
+                per_cat_hits[cat] += 1
                 continue
 
             if not evidence_texts:
@@ -348,12 +502,13 @@ def run_convomem_benchmark(
         shutil.rmtree(tmp, ignore_errors=True)
 
     sl = sorted(search_latencies)
-    cats_scored = {c: per_cat_hits[c] / per_cat_total[c] for c in per_cat_total if per_cat_total[c] > 0 and c != "abstention_evidence"}
-    avg_recall = sum(cats_scored.values()) / max(len(cats_scored), 1)
+    total_scored = sum(per_cat_total.values())
+    total_hits = sum(per_cat_hits.values())
+    avg_recall = total_hits / max(total_scored, 1)
 
     return {
         "backend": "ironrace-memory",
-        "items_scored": sum(v for c, v in per_cat_total.items() if c != "abstention_evidence"),
+        "items_scored": total_scored,
         "avg_recall": avg_recall,
         "per_category": {c: per_cat_hits[c] / per_cat_total[c] for c in per_cat_total if per_cat_total[c] > 0},
         "per_category_total": dict(per_cat_total),
@@ -407,7 +562,7 @@ def print_results(results: list[dict]) -> None:
             print()
         print()
 
-    print("mempalace baseline (all categories, 250 items): 92.9% avg recall")
+    print("mempalace baseline (all categories, 250 items, top-10): 92.9% avg recall")
     print()
 
 
@@ -439,8 +594,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--top-k",
         type=int,
-        default=5,
-        help="Top-k threshold for hit scoring (default: 5)",
+        default=10,
+        help="Top-k threshold for hit scoring (default: 10, matches MemPal benchmark)",
     )
     p.add_argument(
         "--skip-abstention",

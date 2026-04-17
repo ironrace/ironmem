@@ -35,6 +35,21 @@ pub struct BootstrapReport {
 
 pub const MEMORY_PROTOCOL: &str = "Before answering questions about prior work, decisions, project history, or people, check ironmem_search or the KG tools first. After important progress or decisions, write durable summaries back into memory.";
 
+/// Write the current binary version to `state_dir/server.version`.
+/// If the version changed since last run, log an upgrade notice to stderr.
+/// Non-fatal: errors are silently ignored.
+pub fn check_and_record_version(state_dir: &Path) {
+    let version_file = state_dir.join("server.version");
+    let current = env!("CARGO_PKG_VERSION");
+    if let Ok(prev) = std::fs::read_to_string(&version_file) {
+        let prev = prev.trim();
+        if prev != current {
+            tracing::info!("ironrace-memory upgraded {prev} → {current}");
+        }
+    }
+    let _ = std::fs::write(&version_file, current);
+}
+
 pub fn auto_bootstrap_enabled() -> bool {
     std::env::var("IRONMEM_AUTO_BOOTSTRAP")
         .map(|value| {

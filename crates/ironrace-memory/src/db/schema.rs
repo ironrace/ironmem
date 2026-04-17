@@ -124,8 +124,18 @@ impl Database {
         })?;
 
         let mut result = Vec::new();
+        let mut skipped = 0usize;
         for row in rows {
-            result.push(row?);
+            match row {
+                Ok(item) => result.push(item),
+                Err(_) => skipped += 1,
+            }
+        }
+        if skipped > 0 {
+            tracing::warn!(
+                "{skipped} drawer(s) skipped: embedding dimension mismatch — \
+                 re-embed or run `ironmem migrate` to restore full search coverage"
+            );
         }
         Ok(result)
     }

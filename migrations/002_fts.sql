@@ -10,7 +10,11 @@ CREATE VIRTUAL TABLE IF NOT EXISTS drawers_fts USING fts5(
 );
 
 -- Backfill all existing drawers into the FTS index.
+-- WHERE NOT EXISTS guard makes this idempotent: if the migration is retried
+-- (e.g. after a SQLITE_BUSY interruption), we skip re-inserting rows that
+-- were already written, preventing duplicate FTS entries.
 INSERT INTO drawers_fts(content, drawer_id)
-SELECT content, id FROM drawers;
+SELECT content, id FROM drawers
+WHERE NOT EXISTS (SELECT 1 FROM drawers_fts LIMIT 1);
 
 INSERT OR IGNORE INTO schema_version (version) VALUES (2);
