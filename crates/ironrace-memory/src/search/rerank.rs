@@ -37,7 +37,7 @@ use super::tunables;
 static NAME_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\b[A-Z][a-z]{2,15}\b").unwrap());
 
 /// Lowercase content words 3+ chars.
-static KW_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\b[a-z]{3,}\b").unwrap());
+pub(crate) static KW_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\b[a-z]{3,}\b").unwrap());
 
 /// Text inside single or double quotes, 3-60 chars.
 static QUOTED_RE: LazyLock<Regex> =
@@ -140,7 +140,7 @@ static NOT_NAMES: LazyLock<HashSet<&'static str>> = LazyLock::new(|| {
 });
 
 /// English stop words for predicate keyword extraction.
-static KW_STOP: LazyLock<HashSet<&'static str>> = LazyLock::new(|| {
+pub(crate) static KW_STOP: LazyLock<HashSet<&'static str>> = LazyLock::new(|| {
     [
         "a", "an", "the", "and", "or", "but", "in", "on", "at", "to", "for", "of", "with", "by",
         "from", "is", "are", "was", "were", "be", "been", "being", "have", "has", "had", "do",

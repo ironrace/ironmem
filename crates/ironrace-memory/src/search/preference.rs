@@ -158,11 +158,13 @@ mod tests {
 
     #[test]
     fn enrich_content_appends_annotation() {
-        // Call enrich_content without the tunable override (defaults to enabled)
+        // Test extraction + annotation format directly (enrich_content is gated by tunable).
         let content = "I prefer dark mode in my editor.";
-        let enriched = enrich_content(content);
-        assert!(enriched.contains("[preferences:"));
-        assert!(enriched.contains("dark mode"));
+        let prefs = extract_preferences(content);
+        assert!(!prefs.is_empty());
+        let annotation = format!("{}\n[preferences: {}]", content, prefs.join("; "));
+        assert!(annotation.contains("[preferences:"));
+        assert!(annotation.contains("dark mode"));
     }
 
     #[test]

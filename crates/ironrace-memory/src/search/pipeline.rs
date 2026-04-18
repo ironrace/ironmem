@@ -134,11 +134,135 @@ pub fn search(
     };
 
     let rrf_k = tunables::rrf_k();
-    let merged_ids = if bm25_weight == 0.0 {
+    let mut merged_ids = if bm25_weight == 0.0 {
         hnsw_ids.clone()
     } else {
         rrf_merge_weighted(&hnsw_ids, &bm25_ids, rrf_k, bm25_weight)
     };
+
+    // Step 5b: Pseudo-relevance feedback (E3) — expand the query with discriminative
+    // terms from the top-K initial candidates, then re-search and 4-way RRF merge.
+    // Gated on IRONMEM_PRF_ENABLED (default off). prf_top_k defaults to 15 so that
+    // preference-question gold sessions (E1: ranks 6-22) appear in the foreground.
+    let mut prf_expanded_hnsw_ids: Option<Vec<String>> = None;
+    let mut prf_expanded_bm25_ids: Option<Vec<String>> = None;
+
+    if tunables::prf_enabled() && merged_ids.len() >= tunables::prf_top_k() {
+        let fg_k = tunables::prf_top_k();
+        let n_terms = tunables::prf_terms();
+
+        // Fetch foreground (top-K) content for term extraction.
+        let fg_refs: Vec<&str> = merged_ids[..fg_k].iter().map(|s| s.as_str()).collect();
+        let bg_refs: Vec<&str> = merged_ids[fg_k..].iter().map(|s| s.as_str()).collect();
+        let fg_drawers = app.db.get_drawers_by_ids(&fg_refs)?;
+        let bg_drawers = if bg_refs.is_empty() {
+            std::collections::HashMap::new()
+        } else {
+            app.db.get_drawers_by_ids(&bg_refs)?
+        };
+
+        // Build query term set to exclude from expansion.
+        let query_lower = sanitized.clean_query.to_lowercase();
+        let query_terms: std::collections::HashSet<String> = super::rerank::KW_RE
+            .find_iter(&query_lower)
+            .map(|m| m.as_str().to_string())
+            .filter(|w| !super::rerank::KW_STOP.contains(w.as_str()))
+            .collect();
+
+        // fg_tf: term → number of foreground docs containing it.
+        let fg_size = fg_drawers.len();
+        let bg_size = bg_drawers.len();
+        let mut fg_tf: HashMap<String, usize> = HashMap::new();
+        for drawer in fg_drawers.values() {
+            let doc_lower = drawer.content.to_lowercase();
+            let doc_terms: std::collections::HashSet<String> = super::rerank::KW_RE
+                .find_iter(&doc_lower)
+                .map(|m| m.as_str().to_string())
+                .filter(|w| !super::rerank::KW_STOP.contains(w.as_str()))
+                .collect();
+            for term in doc_terms {
+                if !query_terms.contains(&term) {
+                    *fg_tf.entry(term).or_default() += 1;
+                }
+            }
+        }
+
+        // bg_df: term → number of background docs containing it.
+        let mut bg_df: HashMap<String, usize> = HashMap::new();
+        for drawer in bg_drawers.values() {
+            let doc_lower = drawer.content.to_lowercase();
+            let doc_terms: std::collections::HashSet<String> = super::rerank::KW_RE
+                .find_iter(&doc_lower)
+                .map(|m| m.as_str().to_string())
+                .filter(|w| !super::rerank::KW_STOP.contains(w.as_str()))
+                .collect();
+            for term in doc_terms {
+                *bg_df.entry(term).or_default() += 1;
+            }
+        }
+
+        // Score: TF-ICF — frequent in foreground, rare in background.
+        // Require term in ≥2 foreground docs to suppress single-doc noise.
+        let mut term_scores: Vec<(String, f32)> = fg_tf
+            .into_iter()
+            .filter(|(_, count)| *count >= 2)
+            .map(|(term, fg_count)| {
+                let bg_count = bg_df.get(&term).copied().unwrap_or(0);
+                let icf = ((bg_size as f32 + 1.0) / (bg_count as f32 + 1.0))
+                    .ln()
+                    .max(0.0);
+                let score = (fg_count as f32 / fg_size as f32) * icf;
+                (term, score)
+            })
+            .collect();
+        term_scores.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+
+        let expansion: Vec<String> = term_scores
+            .into_iter()
+            .take(n_terms)
+            .map(|(t, _)| t)
+            .collect();
+
+        if !expansion.is_empty() {
+            let expanded_query = format!("{} {}", sanitized.clean_query, expansion.join(" "));
+            tracing::debug!(expansion = ?expansion, "prf_query_expansion");
+
+            // Re-embed and re-search with expanded query.
+            let expanded_vec = {
+                let mut emb = app
+                    .embedder
+                    .write()
+                    .map_err(|e| MemoryError::Lock(format!("Embedder lock poisoned: {e}")))?;
+                emb.embed_one(&expanded_query).map_err(MemoryError::Embed)?
+            };
+
+            let state = app
+                .index_state
+                .read()
+                .map_err(|e| MemoryError::Lock(format!("IndexState lock poisoned: {e}")))?;
+            let exp_hnsw_raw = state.index.search(&expanded_vec, overfetch);
+            let exp_hnsw_ids: Vec<String> = exp_hnsw_raw
+                .iter()
+                .filter_map(|(idx, _)| state.id_map.get(*idx).cloned())
+                .collect();
+            drop(state);
+
+            let exp_bm25_pairs = app.db.bm25_search(
+                &expanded_query,
+                overfetch,
+                filters.wing.as_deref(),
+                filters.room.as_deref(),
+            )?;
+            let exp_bm25_ids: Vec<String> = exp_bm25_pairs.into_iter().map(|(id, _)| id).collect();
+
+            // 4-way RRF: original lists weight 1.0, expanded lists weight 0.5.
+            let lists: [&Vec<String>; 4] = [&hnsw_ids, &bm25_ids, &exp_hnsw_ids, &exp_bm25_ids];
+            let weights: [f32; 4] = [1.0, bm25_weight, 0.5, 0.5 * bm25_weight];
+            merged_ids = rrf_merge_nway(&lists, &weights, rrf_k);
+            prf_expanded_hnsw_ids = Some(exp_hnsw_ids);
+            prf_expanded_bm25_ids = Some(exp_bm25_ids);
+        }
+    }
 
     // Step 6: Fetch drawer metadata with filters.
     let candidate_id_refs: Vec<&str> = merged_ids.iter().map(|s| s.as_str()).collect();
@@ -148,7 +272,15 @@ pub fn search(
         filters.room.as_deref(),
     )?;
 
-    let rrf_scores = rrf_scores_map_weighted(&hnsw_ids, &bm25_ids, rrf_k, bm25_weight);
+    // Compute RRF scores — 4-way if PRF fired, 2-way otherwise.
+    let rrf_scores = match (&prf_expanded_hnsw_ids, &prf_expanded_bm25_ids) {
+        (Some(exp_hnsw), Some(exp_bm25)) => {
+            let lists: [&Vec<String>; 4] = [&hnsw_ids, &bm25_ids, exp_hnsw, exp_bm25];
+            let weights: [f32; 4] = [1.0, bm25_weight, 0.5, 0.5 * bm25_weight];
+            rrf_scores_map_nway(&lists, &weights, rrf_k)
+        }
+        _ => rrf_scores_map_weighted(&hnsw_ids, &bm25_ids, rrf_k, bm25_weight),
+    };
     let mut scored: Vec<ScoredDrawer> = merged_ids
         .iter()
         .filter_map(|id| {
@@ -220,6 +352,33 @@ fn union_hnsw(
     });
     merged.truncate(cap);
     merged
+}
+
+/// N-way weighted RRF merge. Each list has a corresponding weight.
+fn rrf_merge_nway(lists: &[&Vec<String>], weights: &[f32], k: f32) -> Vec<String> {
+    let scores = rrf_scores_map_nway(lists, weights, k);
+    let mut ranked: Vec<(&str, f32)> = scores.iter().map(|(id, &s)| (*id, s)).collect();
+    ranked.sort_by(|a, b| {
+        b.1.partial_cmp(&a.1)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.0.cmp(b.0))
+    });
+    ranked.into_iter().map(|(id, _)| id.to_string()).collect()
+}
+
+/// Compute N-way weighted RRF scores from parallel lists and weights.
+fn rrf_scores_map_nway<'a>(
+    lists: &[&'a Vec<String>],
+    weights: &[f32],
+    k: f32,
+) -> HashMap<&'a str, f32> {
+    let mut scores: HashMap<&str, f32> = HashMap::new();
+    for (list, &weight) in lists.iter().zip(weights.iter()) {
+        for (rank, id) in list.iter().enumerate() {
+            *scores.entry(id.as_str()).or_default() += weight / (k + rank as f32 + 1.0);
+        }
+    }
+    scores
 }
 
 /// Weighted RRF merge. `bm25_weight ∈ [0, 1]` scales list_b's contribution.

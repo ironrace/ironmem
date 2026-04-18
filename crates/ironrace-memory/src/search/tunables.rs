@@ -93,9 +93,11 @@ pub fn prf_enabled() -> bool {
     *V.get_or_init(|| env_bool("IRONMEM_PRF_ENABLED", false))
 }
 
+/// Number of top candidates used as PRF foreground.
+/// Set to 15 to cover preference misses at ranks 6-22 (E1 diagnostic).
 pub fn prf_top_k() -> usize {
     static V: OnceLock<usize> = OnceLock::new();
-    *V.get_or_init(|| env_usize("IRONMEM_PRF_TOP_K", 5))
+    *V.get_or_init(|| env_usize("IRONMEM_PRF_TOP_K", 15))
 }
 
 pub fn prf_terms() -> usize {
