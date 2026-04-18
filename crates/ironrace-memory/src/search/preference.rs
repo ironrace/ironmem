@@ -10,7 +10,7 @@
 //! a session that contains "I enjoy Adobe Premiere Pro" because the annotation
 //! contains the extracted phrase "enjoy adobe premiere pro".
 //!
-//! Activation: on by default; disable with `IRONMEM_PREF_ENRICH=0`.
+//! Activation: off by default; enable with `IRONMEM_PREF_ENRICH=1`.
 
 use std::sync::LazyLock;
 

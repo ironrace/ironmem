@@ -109,7 +109,7 @@ pub fn prf_terms() -> usize {
 /// Disable with `IRONMEM_PREF_ENRICH=0`.
 pub fn pref_enrich_enabled() -> bool {
     static V: OnceLock<bool> = OnceLock::new();
-    *V.get_or_init(|| env_bool("IRONMEM_PREF_ENRICH", true))
+    *V.get_or_init(|| env_bool("IRONMEM_PREF_ENRICH", false))
 }
 
 // ── E4: recency boost (off by default) ───────────────────────────────────────
