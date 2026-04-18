@@ -2,7 +2,7 @@ use clap::{Parser, Subcommand};
 use std::process;
 
 use ironrace_memory::MemoryError;
-use ironrace_memory::{bootstrap, config, ingest, mcp, migrate};
+use ironrace_memory::{bootstrap, config, ingest, mcp, migrate, reembed};
 
 #[derive(Parser)]
 #[command(
@@ -37,6 +37,12 @@ enum Commands {
         /// Path to existing ChromaDB directory
         #[arg(long)]
         from: String,
+    },
+    /// Re-embed all drawers using the current model (run after a model upgrade)
+    Reembed {
+        /// Only re-embed drawers in this wing
+        #[arg(long)]
+        wing: Option<String>,
     },
     /// Run a hook (called by Claude Code / Codex)
     Hook {
@@ -79,6 +85,7 @@ async fn run(cli: Cli) -> Result<(), MemoryError> {
             let app = std::sync::Arc::new(mcp::app::App::new_server_ready(cfg.clone())?);
             // Phase 2: model load + bootstrap run in a background thread with its own
             // DB connection (SQLite WAL handles concurrent access safely).
+            bootstrap::check_and_record_version(&cfg.state_dir);
             let memory_ready = std::sync::Arc::clone(&app.memory_ready);
             bootstrap::run_background_memory_init(cfg, memory_ready);
             // MCP stdio loop starts immediately — initialize responds in <100ms.
@@ -122,6 +129,12 @@ async fn run(cli: Cli) -> Result<(), MemoryError> {
             let cfg = config::Config::load(None)?;
             let app = mcp::app::App::new(cfg)?;
             migrate::chromadb::migrate_from_chromadb(&from, &app)?;
+            Ok(())
+        }
+        Commands::Reembed { wing } => {
+            let cfg = config::Config::load(None)?;
+            let app = mcp::app::App::new(cfg)?;
+            reembed::reembed_all(&app, wing.as_deref())?;
             Ok(())
         }
         Commands::Hook { name, harness } => {

@@ -2,27 +2,32 @@ use rusqlite::{params, Transaction};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-/// Escape a user query for FTS5 MATCH syntax.
+/// Sanitize a query string for FTS5 MATCH syntax.
 ///
-/// FTS5 treats several characters as operators (`"`, `*`, `(`, `)`, `AND`, `OR`, `NOT`).
-/// This wraps individual tokens in double-quotes so the entire query is treated as
-/// a set of phrase searches rather than operator expressions, preventing SQL injection
-/// via query syntax and avoiding false query-parse errors on punctuation-heavy content.
-fn fts5_quote(query: &str) -> String {
+/// Previous behaviour wrapped every token in double-quotes, making the query a
+/// strict AND-of-phrases. This caused empty BM25 hits on verbose questions
+/// (any absent token → zero results) and collapsed the hybrid pipeline to
+/// vector-only retrieval.
+///
+/// New behaviour: strip FTS5 operator characters and emit bare stemmed tokens
+/// separated by spaces. FTS5 with `tokenize='porter ascii'` will apply the
+/// Porter stemmer so morphological variants still match, and the implicit AND
+/// applies at the token level (not phrase level) so partial overlap now returns
+/// results with appropriate BM25 scores rather than nothing.
+fn fts5_sanitize(query: &str) -> String {
     query
         .split_whitespace()
-        .map(|token| {
+        .filter_map(|token| {
             let clean: String = token
                 .chars()
                 .filter(|c| c.is_alphanumeric() || matches!(c, '\'' | '-'))
                 .collect();
             if clean.is_empty() {
-                String::new()
+                None
             } else {
-                format!("\"{}\"", clean)
+                Some(clean)
             }
         })
-        .filter(|t| !t.is_empty())
         .collect::<Vec<_>>()
         .join(" ")
 }
@@ -337,7 +342,7 @@ impl Database {
         if query.trim().is_empty() {
             return Ok(vec![]);
         }
-        let fts_query = fts5_quote(query);
+        let fts_query = fts5_sanitize(query);
         let limit_i64 = limit as i64;
 
         let sql = match (wing, room) {

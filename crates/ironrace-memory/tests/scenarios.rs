@@ -490,8 +490,8 @@ fn graph_traverse_with_data() {
 fn search_limit_is_capped_at_max() {
     let app = App::open_for_test().unwrap();
 
-    // Add more than MAX_SEARCH_LIMIT (25) drawers
-    for i in 0..30 {
+    // Add more than MAX_SEARCH_LIMIT (100) drawers
+    for i in 0..110 {
         call(
             &app,
             "ironmem_add_drawer",
@@ -503,16 +503,16 @@ fn search_limit_is_capped_at_max() {
         );
     }
 
-    // Request 100 results — should be capped at 25
+    // Request 200 results — should be capped at 100
     let search = call(
         &app,
         "ironmem_search",
-        json!({ "query": "memory systems", "limit": 100 }),
+        json!({ "query": "memory systems", "limit": 200 }),
     );
     let results = search["results"].as_array().unwrap();
     assert!(
-        results.len() <= 25,
-        "search results must be capped at MAX_SEARCH_LIMIT (25), got {}",
+        results.len() <= 100,
+        "search results must be capped at MAX_SEARCH_LIMIT (100), got {}",
         results.len()
     );
 }

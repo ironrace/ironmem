@@ -26,6 +26,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import math
 import os
@@ -171,6 +172,23 @@ def build_corpus(entry: dict, granularity: str = "session") -> tuple[list[str], 
 
 # ── ironrace-memory retriever ─────────────────────────────────────────────────
 
+def _corpus_cache_key(docs: list[str], granularity: str, ingest_env: dict[str, str]) -> str:
+    """SHA-256 fingerprint of the corpus + ingest-affecting env vars.
+
+    Only IRONMEM_PREF_ENRICH (and similar write-path vars) change what gets
+    stored in the DB.  Search-only tunables (RRF_K, BM25_THRESHOLD, etc.)
+    don't affect embeddings so they don't invalidate the cache.
+    """
+    h = hashlib.sha256()
+    for doc in docs:
+        h.update(doc.encode())
+    h.update(granularity.encode())
+    write_vars = {k: v for k, v in sorted(ingest_env.items())
+                  if k in ("IRONMEM_PREF_ENRICH",)}
+    h.update(json.dumps(write_vars, sort_keys=True).encode())
+    return h.hexdigest()[:24]
+
+
 def run_ironrace_benchmark(
     data: list[dict],
     ironmem_binary: str,
@@ -178,6 +196,8 @@ def run_ironrace_benchmark(
     n_results: int,
     granularity: str,
     ef_search: int | None,
+    per_question_json: str | None = None,
+    db_cache_dir: str | None = None,
 ) -> dict:
     """Run LongMemEval against ironrace-memory, one fresh server per question.
 
@@ -194,6 +214,7 @@ def run_ironrace_benchmark(
     recalls: dict[int, list[float]] = {k: [] for k in ks}
     per_type: dict[str, dict[int, list[float]]] = defaultdict(lambda: {k: [] for k in ks})
     search_latencies: list[float] = []
+    per_question_records: list[dict] = []
 
     data = data[:limit]
     total = len(data)
@@ -205,6 +226,11 @@ def run_ironrace_benchmark(
     }
     if ef_search is not None:
         base_env["IRONMEM_EF_SEARCH"] = str(ef_search)
+    # Forward any IRONMEM_* tuning knobs set in the caller's environment so
+    # the E2 sweep harness can override constants via env without patching code.
+    for k, v in os.environ.items():
+        if k.startswith("IRONMEM_") and k not in base_env:
+            base_env[k] = v
 
     for i, entry in enumerate(data):
         qtype = entry["question_type"]
@@ -220,6 +246,22 @@ def run_ironrace_benchmark(
 
         env = {**base_env, "IRONMEM_DB_PATH": str(db_path)}
 
+        # DB cache: copy a pre-embedded DB + ID map so we skip add_drawer calls.
+        # Cache key covers corpus content + ingest-affecting env vars.
+        # A JSON sidecar stores the drawer_id→corpus_index map so we don't need
+        # to reconstruct IDs (which requires replicating Rust's sanitize + hash).
+        cache_hit = False
+        cached_db_path: Path | None = None
+        cached_ids_path: Path | None = None
+        if db_cache_dir:
+            Path(db_cache_dir).mkdir(parents=True, exist_ok=True)
+            key = _corpus_cache_key(docs, granularity, base_env)
+            cached_db_path = Path(db_cache_dir) / f"{key}.sqlite3"
+            cached_ids_path = Path(db_cache_dir) / f"{key}.ids.json"
+            if cached_db_path.exists() and cached_ids_path.exists():
+                shutil.copy2(cached_db_path, db_path)
+                cache_hit = True
+
         client = McpClient(
             name="ironrace-memory",
             cmd=[ironmem_binary, "serve"],
@@ -229,20 +271,44 @@ def run_ironrace_benchmark(
         try:
             client.start(wait_for_embedder=True)
 
-            # Capture drawer IDs during ingest for exact ID-based matching.
-            # Fingerprinting doc[:120] was fragile: sanitize_content() trims
-            # stored content, so stored[:120] ≠ original[:120] on any doc with
-            # leading whitespace, silently demoting that result to rank 50+.
             drawer_id_to_idx: dict[str, int] = {}
-            for j, doc in enumerate(docs):
-                resp = client.call_tool("ironmem_add_drawer", {
-                    "content": doc,
-                    "wing": "session",
-                    "room": "haystack",
-                })
-                drawer_id = resp.get("id")
-                if drawer_id:
-                    drawer_id_to_idx[drawer_id] = j
+            if cache_hit and cached_ids_path is not None:
+                # Load pre-built ID map from sidecar — skip all embed calls.
+                with open(cached_ids_path) as _f:
+                    drawer_id_to_idx = {k: int(v) for k, v in json.load(_f).items()}
+            else:
+                # Capture drawer IDs during ingest for exact ID-based matching.
+                # Fingerprinting doc[:120] was fragile: sanitize_content() trims
+                # stored content, so stored[:120] ≠ original[:120] on any doc with
+                # leading whitespace, silently demoting that result to rank 50+.
+                for j, doc in enumerate(docs):
+                    resp = client.call_tool("ironmem_add_drawer", {
+                        "content": doc,
+                        "wing": "session",
+                        "room": "haystack",
+                    })
+                    drawer_id = resp.get("id")
+                    if drawer_id:
+                        drawer_id_to_idx[drawer_id] = j
+                # Save DB + ID map for future runs.
+                if db_cache_dir and cached_db_path is not None and cached_ids_path is not None:
+                    # Checkpoint the WAL so all committed frames land in the main
+                    # file before we copy it. Without this, shutil.copy2 captures
+                    # only the main file and silently omits the last few drawers.
+                    import sqlite3 as _sqlite3
+                    _conn = _sqlite3.connect(str(db_path))
+                    _conn.execute("PRAGMA wal_checkpoint(FULL)")
+                    _conn.close()
+                    shutil.copy2(db_path, cached_db_path)
+                    with open(cached_ids_path, "w") as _f:
+                        json.dump(drawer_id_to_idx, _f)
+
+            if cache_hit:
+                # Pre-trigger reload_embedder() before the timed window.
+                # new_server_ready() starts with a noop embedder; without
+                # add_drawer, ensure_embedder_ready() fires on the first search
+                # call and pays ~1700ms. This warmup absorbs that cost.
+                client.call_tool("ironmem_search", {"query": "warmup", "limit": 1})
 
             t0 = time.perf_counter()
             payload = client.call_tool("ironmem_search", {
@@ -270,6 +336,35 @@ def run_ironrace_benchmark(
                 recalls[k].append(score)
                 per_type[qtype][k].append(score)
 
+            if per_question_json is not None:
+                # Find where the gold session first appears in the ranked list.
+                # ranked[i] is an index into corpus_ids; answer_sids contains
+                # the actual session IDs. Rank is 1-based; None means not in
+                # the retrieved results.
+                answer_indices = {
+                    j for j, cid in enumerate(corpus_ids) if cid in answer_sids
+                }
+                gold_rank: int | None = None
+                for rank_idx, doc_idx in enumerate(ranked[:n_results]):
+                    if doc_idx in answer_indices:
+                        gold_rank = rank_idx + 1
+                        break
+
+                top10 = [
+                    {"corpus_id": corpus_ids[ranked[j]], "score": results[j].get("score") if j < len(results) else None}
+                    for j in range(min(10, len(ranked)))
+                ]
+                per_question_records.append({
+                    "question_id": entry.get("question_id", f"q{i}"),
+                    "question_type": qtype,
+                    "question": question,
+                    "answer_sids": list(answer_sids),
+                    "gold_rank": gold_rank,
+                    "top10": top10,
+                    "total_candidates": len(docs),
+                    "search_ms": elapsed_ms,
+                })
+
         finally:
             client.stop()
             shutil.rmtree(tmp, ignore_errors=True)
@@ -278,6 +373,14 @@ def run_ironrace_benchmark(
             r5 = sum(recalls[5]) / max(len(recalls[5]), 1)
             med = sorted(search_latencies)[len(search_latencies) // 2]
             print(f"  [{i+1:>3}/{total}]  R@5={r5:.1%}  med_search={med:.1f}ms", flush=True)
+
+    if per_question_json is not None:
+        pq_path = Path(per_question_json)
+        pq_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(pq_path, "w") as fh:
+            for rec in per_question_records:
+                fh.write(json.dumps(rec) + "\n")
+        print(f"  Per-question records written to {pq_path} ({len(per_question_records)} lines)", flush=True)
 
     sl = sorted(search_latencies)
     return {
@@ -489,7 +592,23 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--output-json",
         default=None,
-        help="Write results to JSON file",
+        help="Write aggregate results to JSON file",
+    )
+    p.add_argument(
+        "--per-question-json",
+        default=None,
+        metavar="PATH",
+        help="Write one JSON record per question (JSONL) including gold rank, top-10 results, and latency",
+    )
+    p.add_argument(
+        "--db-cache-dir",
+        default=None,
+        metavar="DIR",
+        help=(
+            "Cache pre-embedded SQLite DBs keyed by corpus hash. "
+            "First run embeds and saves; subsequent runs skip add_drawer calls entirely. "
+            "Clear the directory when changing IRONMEM_PREF_ENRICH or the binary's ingest logic."
+        ),
     )
     return p.parse_args()
 
@@ -520,6 +639,8 @@ def main() -> int:
             n_results=args.n_results,
             granularity=args.granularity,
             ef_search=args.ef_search,
+            per_question_json=args.per_question_json,
+            db_cache_dir=args.db_cache_dir,
         )
         results.append(r)
 

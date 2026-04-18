@@ -13,7 +13,7 @@ use crate::sanitize;
 use crate::search;
 
 /// Maximum allowed value for search `limit`.
-const MAX_SEARCH_LIMIT: usize = 25;
+const MAX_SEARCH_LIMIT: usize = 100;
 /// Maximum allowed value for list/read `limit` parameters.
 const MAX_READ_LIMIT: usize = 100;
 /// Maximum allowed BFS traversal depth.
@@ -337,7 +337,6 @@ fn handle_add_drawer(app: &App, args: &Value) -> Result<Value, MemoryError> {
     // Ensure real embedder is loaded before embedding (no-op after first call).
     app.ensure_embedder_ready()?;
 
-    // Embed the content
     let embedding = {
         let mut emb = app
             .embedder
