@@ -13,7 +13,7 @@ use crate::sanitize;
 use crate::search;
 
 /// Maximum allowed value for search `limit`.
-const MAX_SEARCH_LIMIT: usize = 25;
+const MAX_SEARCH_LIMIT: usize = 100;
 /// Maximum allowed value for list/read `limit` parameters.
 const MAX_READ_LIMIT: usize = 100;
 /// Maximum allowed BFS traversal depth.
@@ -334,21 +334,35 @@ fn handle_add_drawer(app: &App, args: &Value) -> Result<Value, MemoryError> {
 
     let id = crate::db::drawers::generate_id(content, &wing, &room);
 
+    // E5: index-time preference enrichment — append [preferences: ...] annotation
+    // before embedding and FTS indexing so preference-type queries find vocabulary
+    // overlap with first-person disclosures ("I prefer X").  The original content
+    // (without annotation) is stored as the display representation.
+    let enriched = search::preference::enrich_content(content);
+    let index_content: &str = &enriched;
+
     // Ensure real embedder is loaded before embedding (no-op after first call).
     app.ensure_embedder_ready()?;
 
-    // Embed the content
+    // Embed the enriched content
     let embedding = {
         let mut emb = app
             .embedder
             .write()
             .map_err(|e| MemoryError::Lock(format!("Embedder lock poisoned: {e}")))?;
-        emb.embed_one(content).map_err(MemoryError::Embed)?
+        emb.embed_one(index_content).map_err(MemoryError::Embed)?
     };
 
     app.db.with_transaction(|tx| {
         crate::db::schema::Database::insert_drawer_tx(
-            tx, &id, content, &embedding, &wing, &room, "", "mcp",
+            tx,
+            &id,
+            index_content,
+            &embedding,
+            &wing,
+            &room,
+            "",
+            "mcp",
         )?;
         crate::db::schema::Database::wal_log_tx(
             tx,
