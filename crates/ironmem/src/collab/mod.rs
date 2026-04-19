@@ -29,6 +29,13 @@ pub const MAX_TASK_REVIEW_ROUNDS: u8 = 2;
 /// looping back for another Codex pass.
 pub const MAX_GLOBAL_REVIEW_ROUNDS: u8 = 2;
 
+/// Prefix on `coding_failure` that marks a failure as "branch drift" — a
+/// mismatch the non-owner may detect via its own git ops. Drift failures are
+/// the only case where an off-turn agent may emit `FailureReport`; ordinary
+/// failures must come from `current_owner` so an off-turn agent cannot
+/// unilaterally abort the other agent's work.
+pub const BRANCH_DRIFT_PREFIX: &str = "branch_drift:";
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Phase {
     // Planning (v1)
@@ -150,9 +157,10 @@ pub struct CollabSession {
     pub final_plan_hash: Option<String>,
     pub codex_review_verdict: Option<String>,
     pub review_round: u8,
-    // v2 coding fields
+    // v2 coding fields. `tasks_count` is not stored — it is derived from
+    // `task_list` via `tasks_count_from_list` so there is a single source of
+    // truth for task cardinality.
     pub task_list: Option<String>,
-    pub tasks_count: Option<u32>,
     pub current_task_index: Option<u32>,
     pub task_review_round: u8,
     pub global_review_round: u8,
@@ -175,7 +183,6 @@ impl CollabSession {
             codex_review_verdict: None,
             review_round: 0,
             task_list: None,
-            tasks_count: None,
             current_task_index: None,
             task_review_round: 0,
             global_review_round: 0,
@@ -185,6 +192,24 @@ impl CollabSession {
             coding_failure: None,
         }
     }
+
+    /// Task cardinality derived from the stored `task_list` JSON. Canonical
+    /// shape is `{"tasks":[…]}`; any other shape yields `None`. Returns `None`
+    /// when `task_list` is unset (pre-`SubmitTaskList`).
+    pub fn tasks_count(&self) -> Option<u32> {
+        tasks_count_from_list(self.task_list.as_deref())
+    }
+}
+
+/// Count tasks in a stored `task_list` JSON payload. Canonical shape is
+/// `{"tasks":[…]}`; anything else is rejected. Kept narrow on purpose so a
+/// corrupt payload yields `None` instead of silently advancing the state
+/// machine with a wrong count.
+pub fn tasks_count_from_list(raw: Option<&str>) -> Option<u32> {
+    let raw = raw?;
+    let value: serde_json::Value = serde_json::from_str(raw).ok()?;
+    let tasks = value.get("tasks")?.as_array()?;
+    u32::try_from(tasks.len()).ok()
 }
 
 /// The set of verdicts accepted on v2 coding topics (`verdict`,
@@ -278,7 +303,11 @@ pub enum CollabError {
     #[error("session is locked")]
     SessionLocked,
 
-    #[error("plan_hash mismatch: expected {expected}, got {got}")]
+    /// `expected` is intentionally elided from the Display string: the
+    /// stored `final_plan_hash` must not leak to callers that probe with
+    /// arbitrary hashes. The field is retained for structured logging on
+    /// the server side.
+    #[error("plan_hash mismatch: got {got}")]
     PlanHashMismatch { expected: String, got: String },
 
     #[error("task_list must contain at least one task")]
@@ -362,10 +391,18 @@ fn validate_coding_verdict(verdict: &str) -> Result<(), CollabError> {
 
 /// Apply the per-task advance rule. Resets `task_review_round` and either
 /// increments `current_task_index` or transitions into local review.
+///
+/// `task_list` and `current_task_index` are invariants of every coding-active
+/// phase; if either is missing the state machine has already drifted and we
+/// panic rather than silently treat it as zero tasks.
 fn advance_task(session: &mut CollabSession) {
     session.task_review_round = 0;
-    let total = session.tasks_count.unwrap_or(0);
-    let current = session.current_task_index.unwrap_or(0);
+    let total = session
+        .tasks_count()
+        .expect("task_list must be set and well-formed in coding-active phase");
+    let current = session
+        .current_task_index
+        .expect("current_task_index must be set in coding-active phase");
     let next = current.saturating_add(1);
     if next >= total {
         session.phase = Phase::CodeReviewLocalPending;
@@ -490,7 +527,6 @@ pub fn apply_event(
                 return Err(CollabError::MissingBaseSha);
             }
             next.task_list = Some(task_list_json.clone());
-            next.tasks_count = Some(*tasks_count);
             next.current_task_index = Some(0);
             next.task_review_round = 0;
             next.global_review_round = 0;
@@ -541,11 +577,17 @@ pub fn apply_event(
         (Phase::CodeFinalPending, CollabEvent::CodeFinal { head_sha }) => {
             require_actor(actor, "claude")?;
             next.last_head_sha = Some(head_sha.clone());
-            if session.task_review_round >= MAX_TASK_REVIEW_ROUNDS {
+            // Read from `next` so the check is robust if a future refactor
+            // mutates `next.task_review_round` in this arm. `next` is a fresh
+            // clone of `session`, so values are equal today.
+            if next.task_review_round >= MAX_TASK_REVIEW_ROUNDS {
                 // Round cap reached — force advance instead of looping back.
                 advance_task(&mut next);
             } else {
                 // Under the cap: loop back so Codex re-reviews Claude's fixes.
+                // `task_review_round` is preserved across the loopback so the
+                // next CodeVerdictPending→CodeFinalPending cycle sees the
+                // incremented counter.
                 next.phase = Phase::CodeReviewPending;
                 next.current_owner = "codex".to_string();
             }
@@ -605,21 +647,25 @@ pub fn apply_event(
         }
         // ── v2: failure is valid from any coding-active phase ─────────────
         (phase, CollabEvent::FailureReport { coding_failure }) if phase.is_coding_active() => {
-            // Either agent can emit a failure (both run the wait_my_turn loop
-            // and may detect drift). The protocol never routes FailureReport
-            // back through turn-ownership — drift detection is asymmetric.
+            // Drift failures (prefix `branch_drift:`) may be emitted by either
+            // agent because the non-owner often detects drift via its own git
+            // ops. Any other failure must come from `current_owner` so an
+            // off-turn agent cannot unilaterally abort the other's work.
+            let is_drift = coding_failure.starts_with(BRANCH_DRIFT_PREFIX);
+            if !is_drift && actor != session.current_owner {
+                return Err(CollabError::NotYourTurn {
+                    expected: session.current_owner.clone(),
+                    got: actor.to_string(),
+                });
+            }
             next.coding_failure = Some(coding_failure.clone());
             next.phase = Phase::CodingFailed;
             next.current_owner = actor.to_string();
         }
-        (Phase::CodingComplete, _) | (Phase::CodingFailed, _) => {
-            return Err(CollabError::SessionLocked);
-        }
         (phase, _) => {
-            // Terminal phases must be handled by the preceding arm; if a
-            // future refactor reorders the arms this guard catches it in
-            // debug builds rather than leaking a sentinel "SessionLocked"
-            // string as the expected event.
+            // Terminal phases are short-circuited by the guard at the top of
+            // this function, so they never reach here. The debug_assert
+            // catches any future refactor that reorders or removes the guard.
             debug_assert!(
                 !matches!(phase, Phase::CodingComplete | Phase::CodingFailed),
                 "terminal phase {phase:?} reached WrongPhase catch-all",
@@ -693,6 +739,21 @@ mod tests {
         .unwrap()
     }
 
+    /// Build a canonical `{"tasks":[…]}` JSON of `count` placeholder tasks so
+    /// the derived `tasks_count_from_list` matches what we pass in the event.
+    fn canonical_task_list(count: u32) -> String {
+        let tasks: Vec<serde_json::Value> = (0..count)
+            .map(|i| {
+                serde_json::json!({
+                    "id": i as i64 + 1,
+                    "title": format!("task-{}", i + 1),
+                    "acceptance": ["ok"],
+                })
+            })
+            .collect();
+        serde_json::json!({ "tasks": tasks }).to_string()
+    }
+
     fn submit_task_list(s: &CollabSession, plan_hash: &str, tasks_count: u32) -> CollabSession {
         apply_event(
             s,
@@ -700,7 +761,7 @@ mod tests {
             &CollabEvent::SubmitTaskList {
                 plan_hash: plan_hash.to_string(),
                 base_sha: "base0".to_string(),
-                task_list_json: "[]".to_string(),
+                task_list_json: canonical_task_list(tasks_count),
                 tasks_count,
                 head_sha: "head0".to_string(),
             },
@@ -798,7 +859,7 @@ mod tests {
         assert_eq!(s.phase, Phase::CodeImplementPending);
         assert_eq!(s.current_owner, "claude");
         assert_eq!(s.current_task_index, Some(0));
-        assert_eq!(s.tasks_count, Some(2));
+        assert_eq!(s.tasks_count(), Some(2));
         assert_eq!(s.task_review_round, 0);
         assert_eq!(s.global_review_round, 0);
         assert_eq!(s.base_sha.as_deref(), Some("base0"));
@@ -1317,5 +1378,151 @@ mod tests {
         )
         .unwrap_err();
         assert!(matches!(err, CollabError::WrongPhase { .. }));
+    }
+
+    #[test]
+    fn test_failure_report_from_non_owner_requires_branch_drift_prefix() {
+        // H2: off-turn FailureReport is only allowed if the reason begins with
+        // the branch_drift: prefix. A non-owner submitting an arbitrary
+        // coding_failure must be rejected as WrongTurn.
+        let s = locked_session("hf");
+        let s = submit_task_list(&s, "hf", 1);
+        let s = apply_event(
+            &s,
+            "claude",
+            &CollabEvent::CodeImplement {
+                head_sha: "h".to_string(),
+            },
+        )
+        .unwrap();
+        assert_eq!(s.current_owner, "codex");
+
+        // Claude (non-owner here) with a non-drift reason → rejected.
+        let err = apply_event(
+            &s,
+            "claude",
+            &CollabEvent::FailureReport {
+                coding_failure: "general failure".to_string(),
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(err, CollabError::NotYourTurn { .. }));
+
+        // Same non-owner with a branch_drift: reason → accepted.
+        let s = apply_event(
+            &s,
+            "claude",
+            &CollabEvent::FailureReport {
+                coding_failure: "branch_drift: expected=abc".to_string(),
+            },
+        )
+        .unwrap();
+        assert_eq!(s.phase, Phase::CodingFailed);
+    }
+
+    #[test]
+    fn test_failure_report_from_pr_ready_pending_transitions_to_failed() {
+        // FailureReport must be accepted in every coding-active phase,
+        // including late ones like PrReadyPending and CodeReviewFinalPending.
+        let s = locked_session("hf");
+        let s = submit_task_list(&s, "hf", 1);
+        let s = happy_task_cycle(&s, "h");
+        let s = apply_event(
+            &s,
+            "claude",
+            &CollabEvent::ReviewLocal {
+                head_sha: "h".to_string(),
+            },
+        )
+        .unwrap();
+        let s = apply_event(
+            &s,
+            "codex",
+            &CollabEvent::ReviewGlobal {
+                verdict: "agree".to_string(),
+                head_sha: "h".to_string(),
+            },
+        )
+        .unwrap();
+        assert_eq!(s.phase, Phase::PrReadyPending);
+
+        let s = apply_event(
+            &s,
+            "claude",
+            &CollabEvent::FailureReport {
+                coding_failure: "gh pr create failed".to_string(),
+            },
+        )
+        .unwrap();
+        assert_eq!(s.phase, Phase::CodingFailed);
+    }
+
+    #[test]
+    fn test_failure_report_from_code_review_final_pending_transitions_to_failed() {
+        let s = locked_session("hf");
+        let s = submit_task_list(&s, "hf", 1);
+        let s = happy_task_cycle(&s, "h");
+        let s = apply_event(
+            &s,
+            "claude",
+            &CollabEvent::ReviewLocal {
+                head_sha: "h".to_string(),
+            },
+        )
+        .unwrap();
+        let s = apply_event(
+            &s,
+            "codex",
+            &CollabEvent::ReviewGlobal {
+                verdict: "disagree_with_reasons".to_string(),
+                head_sha: "h".to_string(),
+            },
+        )
+        .unwrap();
+        let s = apply_event(
+            &s,
+            "claude",
+            &CollabEvent::VerdictGlobal {
+                verdict: "agree".to_string(),
+                head_sha: "h".to_string(),
+            },
+        )
+        .unwrap();
+        let s = apply_event(
+            &s,
+            "codex",
+            &CollabEvent::CommentGlobal {
+                head_sha: "h".to_string(),
+            },
+        )
+        .unwrap();
+        assert_eq!(s.phase, Phase::CodeReviewFinalPending);
+
+        let s = apply_event(
+            &s,
+            "claude",
+            &CollabEvent::FailureReport {
+                coding_failure: "local gate regressed".to_string(),
+            },
+        )
+        .unwrap();
+        assert_eq!(s.phase, Phase::CodingFailed);
+    }
+
+    #[test]
+    fn test_tasks_count_from_list_only_accepts_canonical_shape() {
+        // Derived tasks_count requires `{"tasks":[...]}`; bare arrays and
+        // objects without `tasks` return None.
+        let raw = canonical_task_list(3);
+        assert_eq!(tasks_count_from_list(Some(&raw)), Some(3));
+        assert_eq!(tasks_count_from_list(None), None);
+        assert_eq!(tasks_count_from_list(Some("{}")), None);
+        // Bare array — rejected by the single derivation path.
+        assert_eq!(
+            tasks_count_from_list(Some("[{\"id\":1,\"title\":\"t\"}]")),
+            None
+        );
+        // Malformed JSON — swallowed by `ok()` and returns None.
+        assert_eq!(tasks_count_from_list(Some("not json")), None);
     }
 }

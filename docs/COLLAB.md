@@ -208,10 +208,11 @@ v1 planning topics: `draft`, `canonical`, `review`, `final`.
 
 v2 coding topics: `task_list`, `implement`, `verdict`, `comment`,
 `review_local`, `review_global`, `verdict_global`, `comment_global`,
-`final_review`, `pr_opened`, `failure_report`. The topic strings `review`
-and `final` are reused across v1 and v2 — the server dispatches on the
-current phase (`CodeReviewPending` / `CodeFinalPending` pick the v2
-semantics; any other phase uses v1).
+`final_review`, `pr_opened`, `failure_report`.
+
+The phase→topic acceptance matrix is tabulated in
+[§ Phase → Topic Acceptance](#phase--topic-acceptance); consult that table
+before every `collab_send`.
 
 ### `collab_recv`
 
@@ -328,6 +329,36 @@ either agent can detect drift.
 | `final_review` | `claude` | `{"head_sha"}` | |
 | `pr_opened` | `claude` | `{"head_sha","pr_url"}` | |
 | `failure_report` | either | `{"coding_failure":"<reason>"}` | Valid in any coding-active phase. |
+
+### Phase → Topic Acceptance
+
+The server dispatches strictly on the current phase. The topic strings
+`review` and `final` are overloaded — their semantics depend on the phase
+at the time of `collab_send`. All other topics map 1:1.
+
+| Phase | Accepted topic(s) | Notes |
+|---|---|---|
+| `PlanParallelDrafts` | `draft` | v1 planning |
+| `PlanSynthesisPending` | `canonical` | v1 planning |
+| `PlanReviewPending` | `review` | v1 — Codex review of canonical |
+| `PlanClaudeFinalizePending` | `final` | v1 — Claude finalizes |
+| `PlanLocked` | `task_list` | v1 → v2 hand-off |
+| `CodeImplementPending` | `implement`, `failure_report` | |
+| `CodeReviewPending` | `review`, `failure_report` | **v2** review, not v1 |
+| `CodeVerdictPending` | `verdict`, `failure_report` | |
+| `CodeDebatePending` | `comment`, `failure_report` | |
+| `CodeFinalPending` | `final`, `failure_report` | **v2** final, not v1 |
+| `CodeReviewLocalPending` | `review_local`, `failure_report` | |
+| `CodeReviewCodexPending` | `review_global`, `failure_report` | |
+| `CodeReviewVerdictPending` | `verdict_global`, `failure_report` | |
+| `CodeReviewDebatePending` | `comment_global`, `failure_report` | |
+| `CodeReviewFinalPending` | `final_review`, `failure_report` | |
+| `PrReadyPending` | `pr_opened`, `failure_report` | |
+| `CodingComplete` / `CodingFailed` | *(none — terminal; only `collab_end` accepted)* | |
+
+`failure_report` is accepted from either agent in any coding-active phase
+and transitions the session to `CodingFailed`. All other topics are gated
+by the owner recorded in the phase table above.
 
 ## Harness-Side Responsibilities
 

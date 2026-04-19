@@ -128,10 +128,22 @@ pub fn load_session_record(
             let review_round = review_round_i.clamp(0, u8::MAX as i64) as u8;
             let task_list: Option<String> = row.get(13)?;
             let current_task_index: Option<i64> = row.get(14)?;
-            let current_task_index = current_task_index.map(|i| i.max(0) as u32);
+            let current_task_index = current_task_index
+                .map(|i| {
+                    u32::try_from(i).map_err(|_| {
+                        rusqlite::Error::FromSqlConversionFailure(
+                            14,
+                            rusqlite::types::Type::Integer,
+                            Box::new(std::io::Error::new(
+                                std::io::ErrorKind::InvalidData,
+                                format!("current_task_index out of range: {i}"),
+                            )),
+                        )
+                    })
+                })
+                .transpose()?;
             let task_review_round_i: i64 = row.get(15)?;
             let global_review_round_i: i64 = row.get(16)?;
-            let tasks_count = task_list.as_deref().and_then(parse_tasks_count);
             Ok(SessionRecord {
                 session: CollabSession {
                     id: row.get(0)?,
@@ -144,7 +156,6 @@ pub fn load_session_record(
                     codex_review_verdict: row.get(9)?,
                     review_round,
                     task_list,
-                    tasks_count,
                     current_task_index,
                     task_review_round: task_review_round_i.clamp(0, u8::MAX as i64) as u8,
                     global_review_round: global_review_round_i.clamp(0, u8::MAX as i64) as u8,
@@ -164,18 +175,6 @@ pub fn load_session_record(
     )
     .optional()?
     .ok_or_else(|| MemoryError::NotFound(format!("session {session_id} not found")))
-}
-
-/// Count tasks in the stored `task_list` JSON. The array lives under a
-/// `tasks` key per the v2 schema; if the column holds a bare array we fall
-/// back to that for forward-compat with in-tree unit tests.
-fn parse_tasks_count(raw: &str) -> Option<u32> {
-    let value: serde_json::Value = serde_json::from_str(raw).ok()?;
-    let array = value
-        .get("tasks")
-        .and_then(|v| v.as_array())
-        .or_else(|| value.as_array())?;
-    u32::try_from(array.len()).ok()
 }
 
 pub fn save_session(conn: &Connection, session: &CollabSession) -> Result<(), MemoryError> {
@@ -542,8 +541,8 @@ mod tests {
         assert_eq!(rt.last_head_sha.as_deref(), Some("def456"));
         assert_eq!(rt.pr_url.as_deref(), Some("https://example/pr/42"));
         assert_eq!(rt.coding_failure.as_deref(), Some("gh_auth: token expired"));
-        // tasks_count is derived from task_list JSON on load.
-        assert_eq!(rt.tasks_count, Some(2));
+        // tasks_count is derived from task_list JSON on demand.
+        assert_eq!(rt.tasks_count(), Some(2));
     }
 
     #[test]
@@ -559,6 +558,6 @@ mod tests {
         assert!(session.last_head_sha.is_none());
         assert!(session.pr_url.is_none());
         assert!(session.coding_failure.is_none());
-        assert_eq!(session.tasks_count, None);
+        assert_eq!(session.tasks_count(), None);
     }
 }

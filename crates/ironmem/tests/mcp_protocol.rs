@@ -29,6 +29,22 @@ fn call_tool(app: &App, name: &str, args: serde_json::Value) -> serde_json::Valu
     serde_json::from_str(text).expect("tool response text must be valid JSON")
 }
 
+/// Tool errors surface as an `isError: true` success response carrying a
+/// JSON error string, not as the JSON-RPC `error` field. Return the error
+/// message so callers can assert on its contents.
+fn call_tool_expect_error(app: &App, name: &str, args: serde_json::Value) -> String {
+    let req = request("tools/call", json!({ "name": name, "arguments": args }));
+    let resp = dispatch(app, &req).expect("tools/call must return a response");
+    let result = resp.result.expect("tool result must be present");
+    assert_eq!(
+        result["isError"], true,
+        "expected tool error for {name}, got success: {result}"
+    );
+    let text = result["content"][0]["text"].as_str().unwrap_or("");
+    let parsed: serde_json::Value = serde_json::from_str(text).unwrap_or(json!({}));
+    parsed["error"].as_str().unwrap_or(text).to_string()
+}
+
 #[test]
 fn initialize_returns_capabilities() {
     let app = App::open_for_test().unwrap();
@@ -225,6 +241,96 @@ fn collab_happy_path_locks_via_mcp_handlers() {
     );
     let status = call_tool(&app, "collab_status", json!({ "session_id": session_id }));
     assert_eq!(status["phase"], "PlanLocked");
+}
+
+#[test]
+fn collab_send_rejects_non_owner_before_dispatch() {
+    let app = App::open_for_test().unwrap();
+    let started = call_tool(
+        &app,
+        "collab_start",
+        json!({
+            "repo_path": "/repo",
+            "branch": "main",
+            "initiator": "claude"
+        }),
+    );
+    let session_id = started["session_id"].as_str().unwrap();
+
+    call_tool(
+        &app,
+        "collab_send",
+        json!({
+            "session_id": session_id,
+            "sender": "claude",
+            "topic": "draft",
+            "content": "c"
+        }),
+    );
+    call_tool(
+        &app,
+        "collab_send",
+        json!({
+            "session_id": session_id,
+            "sender": "codex",
+            "topic": "draft",
+            "content": "x"
+        }),
+    );
+
+    let status = call_tool(&app, "collab_status", json!({ "session_id": session_id }));
+    assert_eq!(status["phase"], "PlanSynthesisPending");
+    assert_eq!(status["current_owner"], "claude");
+
+    // Codex tries to send while claude is the owner → rejected upstream.
+    let msg = call_tool_expect_error(
+        &app,
+        "collab_send",
+        json!({
+            "session_id": session_id,
+            "sender": "codex",
+            "topic": "canonical",
+            "content": "hostile canonical"
+        }),
+    );
+    assert!(msg.contains("not your turn"), "msg={msg}");
+    assert!(
+        msg.contains("claude"),
+        "expected owner in error, got: {msg}"
+    );
+}
+
+#[test]
+fn collab_send_allows_either_agent_during_parallel_drafts() {
+    // PlanParallelDrafts is exempt — current_owner there is a "next-expected"
+    // hint, not a hard lock, and the blind-draft protocol lets whichever
+    // agent is ready submit first.
+    let app = App::open_for_test().unwrap();
+    let started = call_tool(
+        &app,
+        "collab_start",
+        json!({
+            "repo_path": "/repo",
+            "branch": "main",
+            "initiator": "claude"
+        }),
+    );
+    let session_id = started["session_id"].as_str().unwrap();
+
+    // Fresh session defaults to current_owner=claude, yet codex is still
+    // allowed to submit its draft first.
+    call_tool(
+        &app,
+        "collab_send",
+        json!({
+            "session_id": session_id,
+            "sender": "codex",
+            "topic": "draft",
+            "content": "codex goes first"
+        }),
+    );
+    let status = call_tool(&app, "collab_status", json!({ "session_id": session_id }));
+    assert_eq!(status["phase"], "PlanParallelDrafts");
 }
 
 #[test]

@@ -856,6 +856,29 @@ fn handle_collab_send(app: &App, args: &Value) -> Result<Value, MemoryError> {
         crate::collab::queue::ensure_active(tx, session_id)?;
         let mut session = crate::collab::queue::load_session_record(tx, session_id)?.session;
         let phase_before = session.phase.to_string();
+
+        // Upstream turn gate: reject sends from the non-owner before any
+        // payload parsing or event dispatch. Two carve-outs:
+        //   1. `PlanParallelDrafts` — both agents submit drafts
+        //      independently; current_owner there is a "next-expected" hint
+        //      and the state-machine arm uses its own "already-submitted"
+        //      guard.
+        //   2. `failure_report` with a `branch_drift:` prefix — either agent
+        //      must be able to abort the session when they detect branch
+        //      drift, even if it is not their turn. The deeper check in
+        //      `apply_event` validates the prefix and rejects generic
+        //      off-turn failure reports as NotYourTurn.
+        let turn_exempt = matches!(session.phase, crate::collab::Phase::PlanParallelDrafts)
+            || (topic == "failure_report"
+                && sender != session.current_owner
+                && failure_report_is_branch_drift(content));
+        if !turn_exempt && sender != session.current_owner {
+            return Err(MemoryError::Validation(format!(
+                "not your turn: phase {} expects sender '{}', got '{}'",
+                session.phase, session.current_owner, sender
+            )));
+        }
+
         let event = build_collab_event(topic, content, &session)?;
 
         session = apply_event(&session, sender, &event).map_err(collab_error_to_memory_error)?;
@@ -1088,6 +1111,43 @@ const WAIT_MY_TURN_DEFAULT_TIMEOUT_SECS: u64 = 30;
 /// Hard cap on `timeout_secs` — clients that want longer should re-poll.
 const WAIT_MY_TURN_MAX_TIMEOUT_SECS: u64 = 60;
 
+/// Snapshot of session state read by `wait_my_turn` on each poll tick. Taken
+/// in one `load_session_record` call so `task_list_submitted` and `phase` are
+/// always from the same row — a concurrent `collab_send(task_list)` commit
+/// cannot interleave into this view and produce an inconsistent terminal-set
+/// decision. The returned status is stale-but-consistent: the next tick picks
+/// up the new phase.
+struct WaitTurnSnapshot {
+    is_my_turn: bool,
+    phase: String,
+    current_owner: String,
+    ended: bool,
+    phase_is_terminal: bool,
+}
+
+fn wait_turn_snapshot(record: &SessionRecord, agent: &str) -> WaitTurnSnapshot {
+    let ended = record.ended_at.is_some();
+    // Dynamic terminal set, evaluated on a single snapshot: pre-task_list,
+    // PlanLocked is terminal so v1 agents can exit cleanly after the plan
+    // locks. Post-task_list the v2 coding phase is underway and the terminal
+    // set switches to `{CodingComplete, CodingFailed}`.
+    let task_list_submitted = record.session.task_list.is_some();
+    let phase_is_terminal = if task_list_submitted {
+        record.session.phase.is_terminal_v2()
+    } else {
+        matches!(record.session.phase, crate::collab::Phase::PlanLocked)
+            || record.session.phase.is_terminal_v2()
+    };
+    let is_my_turn = !ended && !phase_is_terminal && record.session.current_owner == agent;
+    WaitTurnSnapshot {
+        is_my_turn,
+        phase: record.session.phase.to_string(),
+        current_owner: record.session.current_owner.clone(),
+        ended,
+        phase_is_terminal,
+    }
+}
+
 fn handle_collab_wait_my_turn(app: &App, args: &Value) -> Result<Value, MemoryError> {
     let session_id = require_str(args, "session_id")?;
     let agent = require_agent(require_str(args, "agent")?)?;
@@ -1102,27 +1162,18 @@ fn handle_collab_wait_my_turn(app: &App, args: &Value) -> Result<Value, MemoryEr
 
     loop {
         let record = app.db.collab_load_session_record(session_id)?;
-        let ended = record.ended_at.is_some();
-        // Dynamic terminal set: pre-task_list, PlanLocked is terminal so v1
-        // agents can exit cleanly after the plan locks. Post-task_list (the
-        // v2 coding phase is underway) PlanLocked is impossible by the state
-        // machine's construction, and the terminal set switches to
-        // {CodingComplete, CodingFailed}.
-        let task_list_submitted = record.session.task_list.is_some();
-        let phase_is_terminal = if task_list_submitted {
-            record.session.phase.is_terminal_v2()
-        } else {
-            matches!(record.session.phase, crate::collab::Phase::PlanLocked)
-                || record.session.phase.is_terminal_v2()
-        };
-        let is_my_turn = !ended && !phase_is_terminal && record.session.current_owner == agent;
+        let snap = wait_turn_snapshot(&record, agent);
 
-        if is_my_turn || ended || phase_is_terminal || std::time::Instant::now() >= deadline {
+        if snap.is_my_turn
+            || snap.ended
+            || snap.phase_is_terminal
+            || std::time::Instant::now() >= deadline
+        {
             return Ok(json!({
-                "is_my_turn": is_my_turn,
-                "phase": record.session.phase.to_string(),
-                "current_owner": record.session.current_owner,
-                "session_ended": ended,
+                "is_my_turn": snap.is_my_turn,
+                "phase": snap.phase,
+                "current_owner": snap.current_owner,
+                "session_ended": snap.ended,
             }));
         }
 
@@ -1331,13 +1382,42 @@ fn is_known_collab_topic(topic: &str) -> bool {
     )
 }
 
+/// Maximum length (chars) for `coding_failure` on a failure_report. Matches
+/// the CHECK constraint in migration 005 so the DB and MCP layer agree. The
+/// outer `content` cap (MAX_COLLAB_CONTENT_CHARS) is larger — this per-field
+/// cap prevents a caller from filling the whole content budget with one
+/// unbounded string.
+const MAX_CODING_FAILURE_CHARS: usize = 2048;
+
+/// Maximum length (chars) for `pr_url` on a pr_opened event. Matches the
+/// CHECK constraint in migration 005.
+const MAX_PR_URL_CHARS: usize = 2048;
+
 /// Translate a `(topic, content)` send into a `CollabEvent` using the session's
 /// current phase to disambiguate v1/v2-overloaded topics (`review`, `final`).
+/// Dispatch is split into v1 planning, phase-overloaded, and v2 coding groups
+/// so each sub-function stays under the file's 50-line function guideline.
 fn build_collab_event(
     topic: &str,
     content: &str,
     session: &crate::collab::CollabSession,
 ) -> Result<CollabEvent, MemoryError> {
+    match topic {
+        "draft" | "canonical" => build_v1_plan_event(topic, content),
+        "review" | "final" => build_overloaded_event(topic, content, &session.phase),
+        "task_list" | "implement" | "verdict" | "comment" | "review_local" | "review_global"
+        | "verdict_global" | "comment_global" | "final_review" | "pr_opened" | "failure_report" => {
+            build_v2_coding_event(topic, content)
+        }
+        other => Err(MemoryError::Validation(format!(
+            "unknown collab topic: {other}"
+        ))),
+    }
+}
+
+/// v1 planning topics with no phase overloading. `draft` and `canonical` hash
+/// the raw content and carry no structured payload.
+fn build_v1_plan_event(topic: &str, content: &str) -> Result<CollabEvent, MemoryError> {
     match topic {
         "draft" => Ok(CollabEvent::SubmitDraft {
             content_hash: sha256_hex(content),
@@ -1345,95 +1425,148 @@ fn build_collab_event(
         "canonical" => Ok(CollabEvent::PublishCanonical {
             content_hash: sha256_hex(content),
         }),
-        "review" => {
-            // v1 planning review vs. v2 per-task review share the same topic
-            // string. Disambiguate on phase — `CodeReviewPending` is the only
-            // v2 phase that accepts `review`.
-            if matches!(session.phase, Phase::CodeReviewPending) {
-                let head_sha = parse_required_head_sha(content, "review")?;
-                Ok(CollabEvent::CodeReview { head_sha })
-            } else {
-                Ok(CollabEvent::SubmitReview {
-                    verdict: parse_review_verdict(content)?,
-                })
-            }
+        _ => unreachable!("build_v1_plan_event called with non-v1 topic: {topic}"),
+    }
+}
+
+/// Phase-overloaded topics (`review`, `final`) are shared across v1 planning
+/// and v2 per-task coding. An explicit phase whitelist picks the right event
+/// variant — anything outside the whitelist is rejected here so the caller
+/// gets a clean `WrongPhase` instead of a cryptic JSON parse error downstream.
+fn build_overloaded_event(
+    topic: &str,
+    content: &str,
+    phase: &Phase,
+) -> Result<CollabEvent, MemoryError> {
+    match (topic, phase) {
+        ("review", Phase::PlanCodexReviewPending) => Ok(CollabEvent::SubmitReview {
+            verdict: parse_review_verdict(content)?,
+        }),
+        ("review", Phase::CodeReviewPending) => {
+            let head_sha = parse_required_head_sha(content, "review")?;
+            Ok(CollabEvent::CodeReview { head_sha })
         }
-        "final" => {
-            if matches!(session.phase, Phase::CodeFinalPending) {
-                let head_sha = parse_required_head_sha(content, "final")?;
-                Ok(CollabEvent::CodeFinal { head_sha })
-            } else {
-                let plan = parse_final_payload(content)?;
-                Ok(CollabEvent::PublishFinal {
-                    content_hash: sha256_hex(&plan),
-                })
-            }
+        ("final", Phase::PlanClaudeFinalizePending) => {
+            let plan = parse_final_payload(content)?;
+            Ok(CollabEvent::PublishFinal {
+                content_hash: sha256_hex(&plan),
+            })
         }
+        ("final", Phase::CodeFinalPending) => {
+            let head_sha = parse_required_head_sha(content, "final")?;
+            Ok(CollabEvent::CodeFinal { head_sha })
+        }
+        (topic, phase) => Err(MemoryError::Validation(format!(
+            "topic '{topic}' is not accepted in phase {phase}; v1 expects it in PlanCodexReviewPending/PlanClaudeFinalizePending and v2 expects it in CodeReviewPending/CodeFinalPending",
+        ))),
+    }
+}
+
+/// v2 coding topics. Each payload is parsed once and required fields are
+/// extracted in a single pass so `verdict_global` / `review_global` don't
+/// double-parse their JSON for head_sha and verdict.
+fn build_v2_coding_event(topic: &str, content: &str) -> Result<CollabEvent, MemoryError> {
+    match topic {
         "task_list" => parse_task_list_event(content),
-        "implement" => {
-            let head_sha = parse_required_head_sha(content, "implement")?;
-            Ok(CollabEvent::CodeImplement { head_sha })
-        }
+        "implement" => Ok(CollabEvent::CodeImplement {
+            head_sha: parse_required_head_sha(content, "implement")?,
+        }),
         "verdict" => {
-            let head_sha = parse_required_head_sha(content, "verdict")?;
-            let verdict = parse_required_verdict(content, "verdict")?;
+            let (head_sha, verdict) = parse_head_sha_and_verdict(content, "verdict")?;
             Ok(CollabEvent::CodeVerdict { verdict, head_sha })
         }
-        "comment" => {
-            let head_sha = parse_required_head_sha(content, "comment")?;
-            Ok(CollabEvent::CodeComment { head_sha })
-        }
-        "review_local" => {
-            let head_sha = parse_required_head_sha(content, "review_local")?;
-            Ok(CollabEvent::ReviewLocal { head_sha })
-        }
+        "comment" => Ok(CollabEvent::CodeComment {
+            head_sha: parse_required_head_sha(content, "comment")?,
+        }),
+        "review_local" => Ok(CollabEvent::ReviewLocal {
+            head_sha: parse_required_head_sha(content, "review_local")?,
+        }),
         "review_global" => {
-            let head_sha = parse_required_head_sha(content, "review_global")?;
-            let verdict = parse_required_verdict(content, "review_global")?;
+            let (head_sha, verdict) = parse_head_sha_and_verdict(content, "review_global")?;
             Ok(CollabEvent::ReviewGlobal { verdict, head_sha })
         }
         "verdict_global" => {
-            let head_sha = parse_required_head_sha(content, "verdict_global")?;
-            let verdict = parse_required_verdict(content, "verdict_global")?;
+            let (head_sha, verdict) = parse_head_sha_and_verdict(content, "verdict_global")?;
             Ok(CollabEvent::VerdictGlobal { verdict, head_sha })
         }
-        "comment_global" => {
-            let head_sha = parse_required_head_sha(content, "comment_global")?;
-            Ok(CollabEvent::CommentGlobal { head_sha })
-        }
-        "final_review" => {
-            let head_sha = parse_required_head_sha(content, "final_review")?;
-            Ok(CollabEvent::FinalReview { head_sha })
-        }
-        "pr_opened" => {
-            let payload: Value = serde_json::from_str(content).map_err(|e| {
-                MemoryError::Validation(format!("pr_opened content must be JSON: {e}"))
-            })?;
-            let head_sha = extract_required_str(&payload, "head_sha", "pr_opened")?;
-            let pr_url = extract_required_str(&payload, "pr_url", "pr_opened")?;
-            Ok(CollabEvent::PrOpened { pr_url, head_sha })
-        }
-        "failure_report" => {
-            let payload: Value = serde_json::from_str(content).map_err(|e| {
-                MemoryError::Validation(format!("failure_report content must be JSON: {e}"))
-            })?;
-            let coding_failure = payload
-                .get("coding_failure")
-                .and_then(Value::as_str)
-                .filter(|v| !v.is_empty())
-                .ok_or_else(|| {
-                    MemoryError::Validation(
-                        "failure_report content must include a non-empty \"coding_failure\" field"
-                            .to_string(),
-                    )
-                })?
-                .to_string();
-            Ok(CollabEvent::FailureReport { coding_failure })
-        }
-        other => Err(MemoryError::Validation(format!(
-            "unknown collab topic: {other}"
-        ))),
+        "comment_global" => Ok(CollabEvent::CommentGlobal {
+            head_sha: parse_required_head_sha(content, "comment_global")?,
+        }),
+        "final_review" => Ok(CollabEvent::FinalReview {
+            head_sha: parse_required_head_sha(content, "final_review")?,
+        }),
+        "pr_opened" => parse_pr_opened_event(content),
+        "failure_report" => parse_failure_report_event(content),
+        _ => unreachable!("build_v2_coding_event called with non-v2 topic: {topic}"),
     }
+}
+
+fn parse_pr_opened_event(content: &str) -> Result<CollabEvent, MemoryError> {
+    let payload: Value = serde_json::from_str(content)
+        .map_err(|e| MemoryError::Validation(format!("pr_opened content must be JSON: {e}")))?;
+    let head_sha = extract_required_str(&payload, "head_sha", "pr_opened")?;
+    let pr_url = extract_required_str(&payload, "pr_url", "pr_opened")?;
+    if pr_url.chars().count() > MAX_PR_URL_CHARS {
+        return Err(MemoryError::Validation(format!(
+            "pr_opened pr_url exceeds {MAX_PR_URL_CHARS} chars",
+        )));
+    }
+    // Only https URLs are accepted — a javascript:/file:// URL here could
+    // become an open-redirect or SSRF if any downstream consumer renders it.
+    if !pr_url.starts_with("https://") {
+        return Err(MemoryError::Validation(
+            "pr_opened pr_url must start with https://".to_string(),
+        ));
+    }
+    Ok(CollabEvent::PrOpened { pr_url, head_sha })
+}
+
+fn parse_failure_report_event(content: &str) -> Result<CollabEvent, MemoryError> {
+    let payload: Value = serde_json::from_str(content).map_err(|e| {
+        MemoryError::Validation(format!("failure_report content must be JSON: {e}"))
+    })?;
+    let coding_failure = payload
+        .get("coding_failure")
+        .and_then(Value::as_str)
+        .filter(|v| !v.is_empty())
+        .ok_or_else(|| {
+            MemoryError::Validation(
+                "failure_report content must include a non-empty \"coding_failure\" field"
+                    .to_string(),
+            )
+        })?
+        .to_string();
+    if coding_failure.chars().count() > MAX_CODING_FAILURE_CHARS {
+        return Err(MemoryError::Validation(format!(
+            "failure_report coding_failure exceeds {MAX_CODING_FAILURE_CHARS} chars",
+        )));
+    }
+    Ok(CollabEvent::FailureReport { coding_failure })
+}
+
+/// Best-effort check for the `branch_drift:` prefix used by the upstream
+/// turn gate. Returns false on any JSON parse failure so malformed payloads
+/// still fall through to the main `parse_failure_report_event` validation.
+fn failure_report_is_branch_drift(content: &str) -> bool {
+    serde_json::from_str::<Value>(content)
+        .ok()
+        .and_then(|v| {
+            v.get("coding_failure")
+                .and_then(Value::as_str)
+                .map(|s| s.starts_with(crate::collab::BRANCH_DRIFT_PREFIX))
+        })
+        .unwrap_or(false)
+}
+
+/// Parse the JSON payload once and extract both `head_sha` and `verdict` in a
+/// single pass. Used by `verdict` / `review_global` / `verdict_global` which
+/// all need both fields.
+fn parse_head_sha_and_verdict(content: &str, topic: &str) -> Result<(String, String), MemoryError> {
+    let payload: Value = serde_json::from_str(content)
+        .map_err(|e| MemoryError::Validation(format!("{topic} content must be JSON: {e}")))?;
+    let head_sha = extract_required_str(&payload, "head_sha", topic)?;
+    let verdict = extract_required_str(&payload, "verdict", topic)?;
+    Ok((head_sha, verdict))
 }
 
 /// Parse and validate the task_list payload shape. Fails fast on missing
@@ -1522,12 +1655,6 @@ fn parse_required_head_sha(content: &str, topic: &str) -> Result<String, MemoryE
     extract_required_str(&payload, "head_sha", topic)
 }
 
-fn parse_required_verdict(content: &str, topic: &str) -> Result<String, MemoryError> {
-    let payload: Value = serde_json::from_str(content)
-        .map_err(|e| MemoryError::Validation(format!("{topic} content must be JSON: {e}")))?;
-    extract_required_str(&payload, "verdict", topic)
-}
-
 /// Pull a non-empty string field out of a parsed JSON payload with a uniform
 /// validation error.
 fn extract_required_str(payload: &Value, field: &str, topic: &str) -> Result<String, MemoryError> {
@@ -1591,7 +1718,7 @@ fn session_record_json(record: &SessionRecord) -> Value {
         "codex_review_verdict": record.session.codex_review_verdict.as_deref(),
         "review_round": record.session.review_round,
         "task_list": record.session.task_list.as_deref(),
-        "tasks_count": record.session.tasks_count,
+        "tasks_count": record.session.tasks_count(),
         "current_task_index": record.session.current_task_index,
         "task_review_round": record.session.task_review_round,
         "global_review_round": record.session.global_review_round,
