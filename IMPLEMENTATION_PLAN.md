@@ -40,7 +40,7 @@ Acceptance criteria:
 
 - [x] A user can build `ironmem`
 - [x] A user can register it as a Codex MCP server
-- [x] A user can successfully call `initialize`, `tools/list`, `ironmem_status`, and `ironmem_search`
+- [x] A user can successfully call `initialize`, `tools/list`, `status`, and `search`
 - [x] A user can compare `ironmem` and `mempalace` with one script
 
 ## Phase 1.5: Install-Time Bootstrap and Migration ✅ COMPLETE
@@ -202,7 +202,7 @@ Objective: prevent drift between documented behavior and real harness behavior.
 Tests added:
 
 - [x] MCP handshake smoke test — `initialize` returns capabilities, error codes correct
-- [x] Tool contract tests — `tools/list` contents, access mode filtering, `ironmem_status` shape
+- [x] Tool contract tests — `tools/list` contents, access mode filtering, `status` shape
 - [x] Hook command unit tests (parses payload, builds response)
 - [x] Mining end-to-end test on a fixture repo (ingest, idempotency, change detection, deletion)
 - [x] Codex plugin metadata validation (`plugin.json`, `hooks.json` required fields)
@@ -270,7 +270,7 @@ Required behavior:
 Recommended implementation:
 
 - [x] Include protocol text in plugin docs and default prompt metadata (`defaultPrompt` in `.codex-plugin/plugin.json`)
-- [x] Return a concise protocol reminder from `ironmem_status` (`MEMORY_PROTOCOL` constant in `bootstrap.rs`, surfaced via `tools.rs`)
+- [x] Return a concise protocol reminder from `status` (`MEMORY_PROTOCOL` constant in `bootstrap.rs`, surfaced via `tools.rs`)
 - [x] Keep the prompt short and operational
 
 Acceptance criteria:

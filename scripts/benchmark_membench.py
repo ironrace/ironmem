@@ -294,7 +294,7 @@ class McpClient:
             deadline = time.monotonic() + 120.0
             while time.monotonic() < deadline:
                 try:
-                    r = self.call_tool("ironmem_status", {})
+                    r = self.call_tool("status", {})
                     if not r.get("warming_up", False):
                         break
                 except Exception:
@@ -342,7 +342,7 @@ class McpClient:
 
 def run_membench_benchmark(
     items: list[dict],
-    ironmem_binary: str,
+    binary: str,
     limit: int,
     n_results: int,
     top_k: int,
@@ -368,7 +368,7 @@ def run_membench_benchmark(
 
     client = McpClient(
         name="ironmem",
-        cmd=[ironmem_binary, "serve"],
+        cmd=[binary, "serve"],
         env=env,
     )
 
@@ -401,7 +401,7 @@ def run_membench_benchmark(
             wing = f"item{i}"
             drawer_targets: dict[str, tuple[int, int]] = {}
             for turn in turns:
-                payload = client.call_tool("ironmem_add_drawer", {
+                payload = client.call_tool("add_drawer", {
                     "content": turn["content"],
                     "wing": wing,
                     "room": "turn",
@@ -411,7 +411,7 @@ def run_membench_benchmark(
                     drawer_targets[drawer_id] = (turn["sid"], turn["global_idx"])
 
             t0 = time.perf_counter()
-            payload = client.call_tool("ironmem_search", {
+            payload = client.call_tool("search", {
                 "query": question,
                 "limit": n_results,
                 "wing": wing,
@@ -548,9 +548,9 @@ def main() -> int:
 
     print(f"Total: {len(items)} items across {len(data_files)} files.", flush=True)
 
-    ironmem_binary = Path(args.ironmem_binary).expanduser().resolve()
-    if not ironmem_binary.exists():
-        print(f"ironmem binary not found: {ironmem_binary}", file=sys.stderr)
+    binary = Path(args.binary).expanduser().resolve()
+    if not binary.exists():
+        print(f"ironmem binary not found: {binary}", file=sys.stderr)
         print("Build it with: cargo build --release -p ironmem --bin ironmem", file=sys.stderr)
         return 1
 
@@ -558,7 +558,7 @@ def main() -> int:
     print(f"\nironmem{ef_label}:", flush=True)
     result = run_membench_benchmark(
         items=items,
-        ironmem_binary=str(ironmem_binary),
+        binary=str(binary),
         limit=args.limit,
         n_results=args.n_results,
         top_k=args.top_k,

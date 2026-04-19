@@ -350,7 +350,7 @@ class McpClient:
             deadline = time.monotonic() + 120.0
             while time.monotonic() < deadline:
                 try:
-                    r = self.call_tool("ironmem_status", {})
+                    r = self.call_tool("status", {})
                     if not r.get("warming_up", False):
                         break
                 except Exception:
@@ -398,7 +398,7 @@ class McpClient:
 
 def run_convomem_benchmark(
     items: list[dict],
-    ironmem_binary: str,
+    binary: str,
     n_results: int,
     top_k: int,
     skip_abstention: bool,
@@ -424,7 +424,7 @@ def run_convomem_benchmark(
 
     client = McpClient(
         name="ironmem",
-        cmd=[ironmem_binary, "serve"],
+        cmd=[binary, "serve"],
         env=env,
     )
 
@@ -464,14 +464,14 @@ def run_convomem_benchmark(
             wing = f"item{i}"
 
             for j, msg in enumerate(messages):
-                client.call_tool("ironmem_add_drawer", {
+                client.call_tool("add_drawer", {
                     "content": msg,
                     "wing": wing,
                     "room": "message",
                 })
 
             t0 = time.perf_counter()
-            payload = client.call_tool("ironmem_search", {
+            payload = client.call_tool("search", {
                 "query": question,
                 "limit": n_results,
                 "wing": wing,
@@ -637,9 +637,9 @@ def main() -> int:
         Path(args.save_sample).write_text(json.dumps(items, indent=2))
         print(f"Sample saved to {args.save_sample} (reuse with: python3 {__file__} {args.save_sample})")
 
-    ironmem_binary = Path(args.ironmem_binary).expanduser().resolve()
-    if not ironmem_binary.exists():
-        print(f"ironmem binary not found: {ironmem_binary}", file=sys.stderr)
+    binary = Path(args.binary).expanduser().resolve()
+    if not binary.exists():
+        print(f"ironmem binary not found: {binary}", file=sys.stderr)
         print("Build it with: cargo build --release -p ironmem --bin ironmem", file=sys.stderr)
         return 1
 
@@ -647,7 +647,7 @@ def main() -> int:
     print(f"\nironmem{ef_label}:", flush=True)
     result = run_convomem_benchmark(
         items=items,
-        ironmem_binary=str(ironmem_binary),
+        binary=str(binary),
         n_results=args.n_results,
         top_k=args.top_k,
         skip_abstention=args.skip_abstention,

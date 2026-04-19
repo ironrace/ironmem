@@ -88,9 +88,9 @@ If you want a project-local store instead of the default home-directory location
 After registering the MCP server, validate the basics:
 
 1. Start Codex and confirm the server appears in MCP listings.
-2. Call `ironmem_status`.
-3. Add a small drawer with `ironmem_add_drawer`.
-4. Search for it with `ironmem_search`.
+2. Call `status`.
+3. Add a small drawer with `add_drawer`.
+4. Search for it with `search`.
 
 ## Shared Memory Across Harnesses
 
@@ -130,13 +130,13 @@ IRONMEM_DB_PATH = "~/.ironmem/codex.sqlite3"
 | Phase 1 | DB open + schema migration | ~50 ms |
 | Phase 2 | ONNX model load + auto-bootstrap + mine (background thread) | 5–120 s |
 
-Embedding-dependent tools (`ironmem_search`, `ironmem_add_drawer`, diary writes) return `{"warming_up": true}` until Phase 2 completes. The benchmark harness polls `ironmem_status` until `warming_up: false` before starting measurements.
+Embedding-dependent tools (`search`, `add_drawer`, diary writes) return `{"warming_up": true}` until Phase 2 completes. The benchmark harness polls `status` until `warming_up: false` before starting measurements.
 
 ```json
-// ironmem_status response during warmup
+// status response during warmup
 {"warming_up": true, "total_drawers": 0, ...}
 
-// ironmem_status response once ready
+// status response once ready
 {"warming_up": false, "total_drawers": 42, ...}
 ```
 
@@ -193,12 +193,12 @@ Codex should get a short protocol reminding it to use memory proactively.
 
 Recommended text:
 
-> Before answering questions about prior work, decisions, project history, or people, check `ironmem_search` or the KG tools first. After important progress or decisions, write durable summaries back into memory.
+> Before answering questions about prior work, decisions, project history, or people, check `search` or the KG tools first. After important progress or decisions, write durable summaries back into memory.
 
 Best places to inject this:
 
 - `.codex-plugin/plugin.json` default prompt metadata
-- `ironmem_status` response
+- `status` response
 - Codex-facing README/setup docs
 
 ## Benchmarking Against MemPalace
@@ -225,7 +225,7 @@ What is measured per backend:
 | Metric | Description |
 |--------|-------------|
 | startup p50/p95 | Time from process spawn to `initialize` response (connect only) |
-| warmup p50/p95 | Time until `ironmem_status` returns `warming_up: false` (model load + bootstrap) |
+| warmup p50/p95 | Time until `status` returns `warming_up: false` (model load + bootstrap) |
 | add p50/p95 | `add_drawer` latency once embedder is ready |
 | search p50/p95 | `search` latency with 5-needle recall check |
 | status / taxonomy / delete p50 | Auxiliary tool latency |

@@ -33,7 +33,7 @@ pub struct BootstrapReport {
     pub workspace_root: Option<String>,
 }
 
-pub const MEMORY_PROTOCOL: &str = "Before answering questions about prior work, decisions, project history, or people, check ironmem_search or the KG tools first. After important progress or decisions, write durable summaries back into memory.";
+pub const MEMORY_PROTOCOL: &str = "Before answering questions about prior work, decisions, project history, or people, check search or the KG tools first. After important progress or decisions, write durable summaries back into memory.";
 
 /// Write the current binary version to `state_dir/server.version`.
 /// If the version changed since last run, log an upgrade notice to stderr.

@@ -495,7 +495,7 @@ mod tests {
             "id": 1,
             "method": "tools/call",
             "params": {
-                "name": "ironmem_diary_read",
+                "name": "diary_read",
                 "arguments": { "wing": "diary", "limit": 10 }
             }
         }))

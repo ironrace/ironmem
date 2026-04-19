@@ -19,23 +19,23 @@ Default behavior:
 
 Use the memory tools this way:
 
-1. At session start, call `ironmem_status` to load the memory overview and check whether memory is still warming up.
-2. Before answering questions about prior work, decisions, project history, people, or earlier sessions, call `ironmem_search` or the knowledge-graph tools first.
+1. At session start, call `status` to load the memory overview and check whether memory is still warming up.
+2. Before answering questions about prior work, decisions, project history, people, or earlier sessions, call `search` or the knowledge-graph tools first.
 3. After important progress or decisions, write a durable summary back into memory.
 
 Preferred tools:
 
-- Overview: `ironmem_status`
-- Recall: `ironmem_search`
-- Structured facts: `ironmem_kg_query`, `ironmem_kg_stats`, related KG tools
-- Durable notes: `ironmem_add_drawer`, diary tools, or other write tools that fit the context
+- Overview: `status`
+- Recall: `search`
+- Structured facts: `kg_query`, `kg_stats`, related KG tools
+- Durable notes: `add_drawer`, diary tools, or other write tools that fit the context
 
 ## Warmup Rule
 
 `ironmem serve` uses background warmup.
 
-- If `ironmem_status` shows `warming_up: true`, avoid write-heavy memory actions until warmup completes.
-- Poll `ironmem_status` and wait for `warming_up: false` before relying on embedding-dependent tools such as semantic search or drawer writes.
+- If `status` shows `warming_up: true`, avoid write-heavy memory actions until warmup completes.
+- Poll `status` and wait for `warming_up: false` before relying on embedding-dependent tools such as semantic search or drawer writes.
 
 ## Documentation Rules
 

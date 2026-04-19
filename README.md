@@ -75,14 +75,14 @@ Tagged releases upload prebuilt macOS and Linux binaries automatically. Until th
 ## Current Status
 
 - MCP server works over stdio with non-blocking startup (responds to `initialize` in <25 ms)
-- Embedding and bootstrap run in a background thread; `ironmem_status` returns `warming_up: true` until ready
+- Embedding and bootstrap run in a background thread; `status` returns `warming_up: true` until ready
 - Search, taxonomy, graph, diary, and knowledge-graph tools exist
 - Automatic bootstrap runs on first server or hook start
 - Direct migration from `mempalace` Chroma stores is implemented
 - Workspace mining and incremental re-mining are implemented
 - Codex and Claude Code plugin packaging is included
 - `~/.ironrace/bin/ironmem` is the preferred installed binary location; plugin launch scripts check there first
-- Bounded Claude↔Codex planning protocol (v1) is available via the `ironmem_collab_*` MCP tools, including long-poll `wait_my_turn` for autonomous operation — see [docs/COLLAB.md](docs/COLLAB.md)
+- Bounded Claude↔Codex planning protocol (v1) is available via the `collab_*` MCP tools, including long-poll `wait_my_turn` for autonomous operation — see [docs/COLLAB.md](docs/COLLAB.md)
 
 ## Shared Memory Across Harnesses
 
@@ -113,7 +113,7 @@ IRONMEM_DB_PATH = "~/.ironmem/codex.sqlite3"
 | Phase 1 | DB open + schema migration | ~50 ms |
 | Phase 2 | ONNX model load + auto-bootstrap + mine (background thread) | 5–120 s |
 
-Embedding-dependent tools (`ironmem_search`, `ironmem_add_drawer`, diary writes) return `{"warming_up": true}` until Phase 2 completes. Poll `ironmem_status` and check `warming_up: false` before issuing write-heavy workloads.
+Embedding-dependent tools (`search`, `add_drawer`, diary writes) return `{"warming_up": true}` until Phase 2 completes. Poll `status` and check `warming_up: false` before issuing write-heavy workloads.
 
 ## Benchmarking
 

@@ -20,7 +20,7 @@ branch names.
    - `branch` ← output of `git branch --show-current`.
    - `initiator` ← `"claude"` (this is Claude's terminal).
    - `task` ← the remainder of `$ARGUMENTS` after the word `start`.
-2. Call `mcp__ironmem__ironmem_collab_start` with those four fields.
+2. Call `mcp___collab_start` with those four fields.
 3. Tell the user, in a single line they can copy-paste into Codex's terminal:
 
    ```
@@ -29,17 +29,17 @@ branch names.
 
 4. Enter Plan Mode and draft your first plan for `<task>` — the draft is
    yours alone, Codex cannot see it. When you have the user's approval in
-   Plan Mode, call `mcp__ironmem__ironmem_collab_send` with
+   Plan Mode, call `mcp___collab_send` with
    `sender="claude"`, `topic="draft"`, `content=<the plan text>`.
 5. After the draft is sent, begin the autonomous planning loop (see below).
 
 ## `join <session_id>`
 
 1. Store `<session_id>` as the current collab session — reuse it on every
-   subsequent `ironmem_collab_*` call without re-prompting the user.
+   subsequent `collab_*` call without re-prompting the user.
 2. `agent` / `sender` / `receiver` ← `"claude"` (still Claude's terminal;
    in Codex's terminal this would be `"codex"`, handled by the Codex side).
-3. Call `mcp__ironmem__ironmem_collab_status` to read `task`,
+3. Call `mcp___collab_status` to read `task`,
    `phase`, and `current_owner`. Report the task to the user.
 4. Enter the autonomous planning loop.
 
@@ -59,7 +59,7 @@ messages, no summaries. Just keep polling.
 
 Repeat:
 
-1. `mcp__ironmem__ironmem_collab_wait_my_turn` with
+1. `mcp___collab_wait_my_turn` with
    `agent="claude"`, `timeout_secs=60`. Server-side long-poll.
 2. If `session_ended` or `phase == "PlanLocked"`, exit and report.
 3. If `is_my_turn == false`, **call `wait_my_turn` again immediately**
@@ -69,10 +69,10 @@ Repeat:
    another poll. If you catch yourself about to call `wait_my_turn` a
    second time in the same iteration, you have a bug — fall through
    to step 5.
-5. `mcp__ironmem__ironmem_collab_status` → read `phase`,
+5. `mcp___collab_status` → read `phase`,
    `current_owner`, `review_round`.
-6. `mcp__ironmem__ironmem_collab_recv` with `receiver="claude"`.
-   Ack each message via `mcp__ironmem__ironmem_collab_ack`. An
+6. `mcp___collab_recv` with `receiver="claude"`.
+   Ack each message via `mcp___collab_ack`. An
    empty `messages` array is fine — it means you already acked
    everything on a prior iteration. Do **not** re-poll because the
    queue is empty; proceed to step 7.
@@ -100,7 +100,7 @@ Repeat:
 
 ## Invariants — do not violate
 
-- **Never** call `mcp__ironmem__ironmem_collab_end`. It is
+- **Never** call `mcp___collab_end`. It is
   reserved for the v2 coding phase.
 - **Never** peek at Codex's draft before sending your own. The server
   enforces this in `recv`, but don't try to work around it.

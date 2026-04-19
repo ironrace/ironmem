@@ -388,8 +388,8 @@ def benchmark_backend(
     }
 
 
-def make_ironmem_client(args, storage_root: Path) -> JsonRpcClient:
-    binary = Path(args.ironmem_binary).expanduser().resolve()
+def make_client(args, storage_root: Path) -> JsonRpcClient:
+    binary = Path(args.binary).expanduser().resolve()
     if not binary.exists():
         raise SystemExit(
             f"ironmem binary not found at {binary}. Run `cargo build -p ironmem --bin ironmem` first."
@@ -402,8 +402,8 @@ def make_ironmem_client(args, storage_root: Path) -> JsonRpcClient:
     # not one-time bootstrap cost. Background thread still loads the embedder (real warmup).
     env["IRONMEM_AUTO_BOOTSTRAP"] = "0"
     env["IRONMEM_DISABLE_MIGRATION"] = "1"
-    if args.ironmem_model_dir:
-        env["IRONMEM_MODEL_DIR"] = str(Path(args.ironmem_model_dir).expanduser().resolve())
+    if args.model_dir:
+        env["IRONMEM_MODEL_DIR"] = str(Path(args.model_dir).expanduser().resolve())
 
     setup = subprocess.run(
         [str(binary), "setup"],
@@ -422,7 +422,7 @@ def make_ironmem_client(args, storage_root: Path) -> JsonRpcClient:
     return JsonRpcClient(
         name="ironmem",
         cmd=[str(binary), "serve", "--db", str(storage_root / "ironmem.sqlite3")],
-        cwd=Path(args.ironmem_repo).expanduser().resolve(),
+        cwd=Path(args.repo).expanduser().resolve(),
         env=env,
         log_stderr=getattr(args, "debug_stderr", False),
     )
@@ -547,8 +547,8 @@ def main() -> int:
     iron_storage = temp_dir / "ironmem-store"
     mempal_storage = temp_dir / "mempalace-store"
 
-    iron_client = make_ironmem_client(args, iron_storage)
-    mempal_client = None if args.ironmem_only else make_mempalace_client(args, mempal_storage)
+    iron_client = make_client(args, iron_storage)
+    mempal_client = None if args.only else make_mempalace_client(args, mempal_storage)
 
     results = {
         "generated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
@@ -566,12 +566,12 @@ def main() -> int:
             name="ironmem",
             client=iron_client,
             tool_names={
-                "status": "ironmem_status",
-                "list_wings": "ironmem_list_wings",
-                "taxonomy": "ironmem_get_taxonomy",
-                "search": "ironmem_search",
-                "add_drawer": "ironmem_add_drawer",
-                "delete_drawer": "ironmem_delete_drawer",
+                "status": "status",
+                "list_wings": "list_wings",
+                "taxonomy": "get_taxonomy",
+                "search": "search",
+                "add_drawer": "add_drawer",
+                "delete_drawer": "delete_drawer",
             },
             documents=documents,
             query_count=args.queries,

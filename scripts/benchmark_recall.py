@@ -237,11 +237,11 @@ class McpClient:
         )
         self._call("initialize", {})
         if wait_for_embedder:
-            # Poll ironmem_status until warming_up is False (model loaded)
+            # Poll status until warming_up is False (model loaded)
             deadline = time.monotonic() + 120.0
             while time.monotonic() < deadline:
                 try:
-                    result = self.call_tool("ironmem_status", {})
+                    result = self.call_tool("status", {})
                     if not result.get("warming_up", False):
                         break
                 except Exception:
@@ -291,13 +291,13 @@ def _ingest_via_mcp(
     """Add all documents through MCP add_drawer. Returns total ingestion ms."""
     t0 = time.perf_counter()
     for nd in needle_docs:
-        client.call_tool("ironmem_add_drawer", {
+        client.call_tool("add_drawer", {
             "content": nd.content,
             "wing": nd.wing,
             "room": nd.room,
         })
     for wing, room, content in background_docs:
-        client.call_tool("ironmem_add_drawer", {
+        client.call_tool("add_drawer", {
             "content": content,
             "wing": wing,
             "room": room,
@@ -306,7 +306,7 @@ def _ingest_via_mcp(
 
 
 def _ingest_via_mine(
-    ironmem_binary: str,
+    binary: str,
     db_path: Path,
     needle_docs: list[NeedleDoc],
     background_docs: list[tuple[str, str, str]],
@@ -340,7 +340,7 @@ def _ingest_via_mine(
 
     t0 = time.perf_counter()
     result = subprocess.run(
-        [ironmem_binary, "mine", str(docs_dir)],
+        [binary, "mine", str(docs_dir)],
         env={**os.environ, **env},
         capture_output=True,
         text=True,
@@ -382,7 +382,7 @@ def _run_recall_queries(
 
     for nd in needle_docs:
         t0 = time.perf_counter()
-        payload = client.call_tool("ironmem_search", {"query": nd.query, "limit": limit})
+        payload = client.call_tool("search", {"query": nd.query, "limit": limit})
         elapsed_ms = (time.perf_counter() - t0) * 1000
         latencies.append(elapsed_ms)
 
@@ -419,7 +419,7 @@ def _percentile(values: list[float], p: float) -> float:
 def run_ironrace(
     scale: int,
     n_needles: int,
-    ironmem_binary: str,
+    binary: str,
     model_dir: str | None,
     seed: int,
     ef_search: int | None = None,
@@ -448,14 +448,14 @@ def run_ironrace(
     try:
         if use_mine:
             ingestion_ms = _ingest_via_mine(
-                ironmem_binary, db_path, needle_docs, background_docs, model_dir
+                binary, db_path, needle_docs, background_docs, model_dir
             )
             ingestion_method = "mine"
         else:
             # Start MCP server, ingest, then query
             client = McpClient(
                 name="ironmem",
-                cmd=[ironmem_binary, "serve"],
+                cmd=[binary, "serve"],
                 env=env,
             )
             client.start(wait_for_embedder=True)
@@ -481,7 +481,7 @@ def run_ironrace(
         # After mine, start server for queries
         client = McpClient(
             name="ironmem",
-            cmd=[ironmem_binary, "serve"],
+            cmd=[binary, "serve"],
             env=env,
         )
         client.start(wait_for_embedder=True)
@@ -725,9 +725,9 @@ def main() -> int:
     args = parse_args()
     scales = resolve_scales(args.scale)
 
-    ironmem_binary = Path(args.ironmem_binary).expanduser().resolve()
-    if not ironmem_binary.exists():
-        print(f"ironmem binary not found: {ironmem_binary}", file=sys.stderr)
+    binary = Path(args.binary).expanduser().resolve()
+    if not binary.exists():
+        print(f"ironmem binary not found: {binary}", file=sys.stderr)
         print("Build it with: cargo build --release -p ironmem --bin ironmem", file=sys.stderr)
         return 1
 
@@ -745,8 +745,8 @@ def main() -> int:
             r = run_ironrace(
                 scale=scale,
                 n_needles=n_needles,
-                ironmem_binary=str(ironmem_binary),
-                model_dir=args.ironmem_model_dir,
+                binary=str(binary),
+                model_dir=args.model_dir,
                 seed=args.seed,
                 ef_search=ef,
             )

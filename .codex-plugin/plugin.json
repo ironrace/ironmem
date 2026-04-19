@@ -37,9 +37,9 @@
       "Write"
     ],
     "defaultPrompt": [
-      "Before answering questions about prior work, decisions, project history, or people, call ironmem_search or KG tools first.",
+      "Before answering questions about prior work, decisions, project history, or people, call search or KG tools first.",
       "After important progress or decisions, write durable summaries back into ironmem.",
-      "Use ironmem_status at session start to load memory overview and protocol guidance."
+      "Use status at session start to load memory overview and protocol guidance."
     ],
     "brandColor": "#1C5D6B"
   }

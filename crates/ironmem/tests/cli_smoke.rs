@@ -65,7 +65,7 @@ fn cli_init_mine_serve_and_hook_smoke_test() {
         writeln!(
             stdin,
             "{}",
-            json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"ironmem_status","arguments":{}}})
+            json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"status","arguments":{}}})
         )
         .unwrap();
     }
@@ -155,7 +155,7 @@ fn cli_init_mine_serve_and_hook_smoke_test() {
         "jsonrpc":"2.0",
         "id": 3,
         "method":"tools/call",
-        "params":{"name":"ironmem_diary_read","arguments":{"wing":"diary","limit":10}}
+        "params":{"name":"diary_read","arguments":{"wing":"diary","limit":10}}
     }))
     .unwrap();
     let resp = dispatch(&app, &req).unwrap();
