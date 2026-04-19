@@ -1,4 +1,4 @@
-//! Migrate from a ChromaDB store to ironrace-memory's SQLite format.
+//! Migrate from a ChromaDB store to ironmem's SQLite format.
 //!
 //! Strategy:
 //! 1. Open ChromaDB's SQLite backing store
@@ -28,7 +28,7 @@ const BLOCKED_MIGRATE_PREFIXES: &[&str] = &[
     "/etc", "/usr", "/var", "/sys", "/proc", "/dev", "/boot", "/run", "/bin", "/sbin",
 ];
 
-/// Migrate from ChromaDB store to ironrace-memory.
+/// Migrate from ChromaDB store to ironmem.
 pub fn migrate_from_chromadb(chromadb_path: &str, app: &App) -> Result<(), MemoryError> {
     let path = Path::new(chromadb_path);
 

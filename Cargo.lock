@@ -1151,28 +1151,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "ironrace-core"
-version = "0.1.0"
-dependencies = [
- "hnsw_rs",
- "rayon",
-]
-
-[[package]]
-name = "ironrace-embed"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "dirs",
- "hf-hub",
- "ndarray",
- "ort",
- "sha2",
- "tokenizers",
-]
-
-[[package]]
-name = "ironrace-memory"
+name = "ironmem"
 version = "0.1.0"
 dependencies = [
  "anyhow",
@@ -1194,6 +1173,27 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "uuid",
+]
+
+[[package]]
+name = "ironrace-core"
+version = "0.1.0"
+dependencies = [
+ "hnsw_rs",
+ "rayon",
+]
+
+[[package]]
+name = "ironrace-embed"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "dirs",
+ "hf-hub",
+ "ndarray",
+ "ort",
+ "sha2",
+ "tokenizers",
 ]
 
 [[package]]

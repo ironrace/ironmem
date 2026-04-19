@@ -1,13 +1,13 @@
 [package]
-name = "ironrace-memory"
+name = "ironmem"
 version = "0.1.0"
 edition = "2021"
 rust-version.workspace = true
 description = "AI memory MCP server — semantic search + knowledge graph in a single binary"
 license = "Apache-2.0"
 authors = ["Jeffrey Crum <jeffrey.crum81@gmail.com>"]
-repository = "https://github.com/ironrace/ironrace-memory"
-homepage = "https://github.com/ironrace/ironrace-memory"
+repository = "https://github.com/ironrace/ironmem"
+homepage = "https://github.com/ironrace/ironmem"
 keywords = ["memory", "mcp", "semantic-search", "knowledge-graph", "ai"]
 categories = ["development-tools", "command-line-utilities"]
 readme = "../../README.md"
@@ -16,7 +16,7 @@ exclude = [
 ]
 
 [lib]
-name = "ironrace_memory"
+name = "ironmem"
 path = "src/lib.rs"
 
 [[bin]]

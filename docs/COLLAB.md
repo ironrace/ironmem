@@ -1,6 +1,6 @@
 # IronRace Collab (v1 — Bounded Planning)
 
-`ironrace-memory` includes a bounded planning protocol that lets Claude Code
+`ironmem` includes a bounded planning protocol that lets Claude Code
 and Codex coordinate a single plan through the shared MCP server.
 
 v1 covers the **planning stage only**. The implementation stage will be added
@@ -9,7 +9,7 @@ in v2.
 This document covers:
 
 - the state machine and invariants
-- the 10 `ironmem_collab_*` MCP tools
+- the 10 `collab_*` MCP tools
 - the autonomous long-poll loop each agent runs
 - Claude's Plan Mode integration for canonical synthesis and revisions
 - copy-pasteable prompts for the Claude and Codex terminals
@@ -33,7 +33,7 @@ is forced to finalize regardless of Codex's objections.
 
 ```text
 Claude / Codex (each in its own terminal / worktree)
-  └─ ironmem_collab_* MCP tools
+  └─ collab_* MCP tools
       └─ ironmem serve (stdio)
           └─ SQLite (sessions, messages, capabilities, wal_log)
 ```
@@ -47,7 +47,7 @@ Stored in `collab_sessions`:
 
 | Field | Meaning |
 |---|---|
-| `id` | Session identifier (returned from `ironmem_collab_start`) |
+| `id` | Session identifier (returned from `collab_start`) |
 | `repo_path`, `branch` | Where this plan applies |
 | `task` | Human description of the planning goal. Set at `start`, readable via `status`. |
 | `phase` | Current protocol phase (see below) |
@@ -57,7 +57,7 @@ Stored in `collab_sessions`:
 | `final_plan_hash` | SHA-256 of the locked plan |
 | `codex_review_verdict` | Last Codex verdict |
 | `review_round` | Number of completed Codex reviews (0, 1, or 2) |
-| `ended_at` | Non-null once `ironmem_collab_end` has been called |
+| `ended_at` | Non-null once `collab_end` has been called |
 
 All state changes are recorded in `wal_log`.
 
@@ -67,7 +67,7 @@ All state changes are recorded in `wal_log`.
 
 Both agents submit exactly one `draft`. Order is not enforced.
 
-**Blind-draft invariant:** `ironmem_collab_recv` suppresses a counterpart's
+**Blind-draft invariant:** `collab_recv` suppresses a counterpart's
 `draft` until the calling agent has submitted its own. This is enforced
 server-side, not by convention.
 
@@ -108,7 +108,7 @@ Exit → `PlanLocked` (always). Planning is done.
 
 Terminal. The plan is frozen. `final_plan_hash` is set.
 
-Do **not** call `ironmem_collab_end` at this point during v1 — the session
+Do **not** call `collab_end` at this point during v1 — the session
 stays alive and will be consumed by the v2 coding phase once that ships.
 
 ## Blind-Draft Invariant
@@ -117,12 +117,12 @@ During `PlanParallelDrafts`, neither agent can see the other's draft until
 it has submitted its own. This prevents drift toward the first draft that
 lands.
 
-Enforcement: `ironmem_collab_recv` filters out `draft` topic messages from
+Enforcement: `collab_recv` filters out `draft` topic messages from
 the counterpart whenever the caller has not yet submitted its own draft.
 
 ## MCP Tools
 
-### `ironmem_collab_start`
+### `collab_start`
 
 Creates a new session.
 
@@ -136,10 +136,10 @@ Creates a new session.
 ```
 
 Returns `{ session_id, task }`. The `task` is stored on the session so the
-counterpart agent can read it via `ironmem_collab_status` without a manual
+counterpart agent can read it via `collab_status` without a manual
 paste.
 
-### `ironmem_collab_send`
+### `collab_send`
 
 Sends a protocol message and advances the state machine.
 
@@ -150,27 +150,27 @@ Sends a protocol message and advances the state machine.
 Protocol topics: `draft`, `canonical`, `review`, `final`. Any other topic is
 rejected.
 
-### `ironmem_collab_recv`
+### `collab_recv`
 
 Returns pending messages. Enforces the blind-draft invariant.
 
-### `ironmem_collab_ack`
+### `collab_ack`
 
 Marks a message consumed. Session-scoped: a mismatched
 `(session_id, message_id)` pair is rejected.
 
-### `ironmem_collab_status`
+### `collab_status`
 
 Returns the full session record including `phase`, `current_owner`, `task`,
 `review_round`, `ended_at`, and all hashes. Call this before every protocol
 action.
 
-### `ironmem_collab_approve`
+### `collab_approve`
 
 Codex-only shortcut for an `approve` review. Requires `content_hash` to
 match the stored `canonical_plan_hash`.
 
-### `ironmem_collab_wait_my_turn` (long-poll)
+### `collab_wait_my_turn` (long-poll)
 
 Blocks server-side until the caller is the owner, the session ends, the
 phase becomes terminal (`PlanLocked`), or `timeout_secs` elapses.
@@ -183,12 +183,12 @@ Returns `{ is_my_turn, phase, current_owner, session_ended }`. Default
 timeout 30s, max 60s. Agents loop on this instead of polling `status` on a
 fixed interval.
 
-### `ironmem_collab_register_caps` / `ironmem_collab_get_caps`
+### `collab_register_caps` / `collab_get_caps`
 
 Advisory: each agent registers available sub-agents/tools so the other can
 plan around them.
 
-### `ironmem_collab_end`
+### `collab_end`
 
 Idempotently ends a session. Sets `ended_at`; subsequent `send`, `ack`,
 `approve`, `register_caps`, and `wait_my_turn` calls are rejected.
@@ -240,13 +240,13 @@ Each agent runs the same shape of loop:
 
 ```text
 loop:
-  wait = ironmem_collab_wait_my_turn(session_id, me, 30)
+  wait = collab_wait_my_turn(session_id, me, 30)
   if wait.session_ended or wait.phase == "PlanLocked": break
   if not wait.is_my_turn: continue
 
-  status = ironmem_collab_status(session_id)
-  msgs   = ironmem_collab_recv(session_id, me)
-  for m in msgs: ironmem_collab_ack(session_id, m.id)
+  status = collab_status(session_id)
+  msgs   = collab_recv(session_id, me)
+  for m in msgs: collab_ack(session_id, m.id)
 
   act on (status.phase, status.current_owner) → send exactly one protocol message
 ```
@@ -295,13 +295,13 @@ Claude's behavior on receiving this:
 2. `branch` ← `git branch --show-current`.
 3. `initiator` ← `"claude"` (this is the Claude terminal).
 4. `task` ← the text after `start`/`start:`.
-5. Call `ironmem_collab_start` with those four fields.
+5. Call `collab_start` with those four fields.
 6. Report the returned `session_id` back to the user in a format they can
    paste into Codex's terminal verbatim, e.g.
    `collab-join <session_id>`.
 7. Enter the autonomous planning loop as `claude`:
    `wait_my_turn → status → recv/ack → act`. Enter Plan Mode before
-   sending `canonical` or `final`. Do not call `ironmem_collab_end`.
+   sending `canonical` or `final`. Do not call `collab_end`.
 
 ### Joining a session (Codex's terminal)
 
@@ -320,13 +320,13 @@ collab-join <session_id>
 Codex's behavior:
 
 1. Store `<session_id>` as the current session — every subsequent
-   `ironmem_collab_*` call uses it without re-prompting.
+   `collab_*` call uses it without re-prompting.
 2. `agent` / `sender` / `receiver` ← `"codex"` (this is the Codex terminal).
-3. Call `ironmem_collab_status(session_id)` to read the task (the user
+3. Call `collab_status(session_id)` to read the task (the user
    does not re-type it on this side).
 4. Enter the autonomous planning loop as `codex`:
    `wait_my_turn → status → recv/ack → act`. One draft, then up to two
-   reviews. Claude has the last word. Do not call `ironmem_collab_end`.
+   reviews. Claude has the last word. Do not call `collab_end`.
 
 ### Agent-side defaults — never ask the user
 
@@ -387,21 +387,21 @@ IRONMEM_MCP_MODE=trusted IRONMEM_EMBED_MODE=noop ./target/release/ironmem serve
 ## Validation
 
 ```bash
-cargo test -p ironrace-memory collab::
-cargo test -p ironrace-memory --test mcp_protocol
-cargo test -p ironrace-memory
-cargo clippy -p ironrace-memory -- -D warnings
+cargo test -p ironmem collab::
+cargo test -p ironmem --test mcp_protocol
+cargo test -p ironmem
+cargo clippy -p ironmem -- -D warnings
 ```
 
 Tool-surface smoke test:
 
 ```bash
-cargo build -p ironrace-memory --release
+cargo build -p ironmem --release
 echo '{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}' \
   | env HOME=/tmp/ironmem-home IRONMEM_EMBED_MODE=noop IRONMEM_MCP_MODE=trusted \
       ./target/release/ironmem serve --db /tmp/ironmem-collab-tools.sqlite3 \
   | python3 -c "import sys,json; t=[x['name'] for x in json.load(sys.stdin)['result']['tools']]; \
-      assert all(f'ironmem_collab_{n}' in t for n in ['start','send','recv','ack','status','approve','register_caps','get_caps','wait_my_turn','end']), t; print('OK')"
+      assert all(f'collab_{n}' in t for n in ['start','send','recv','ack','status','approve','register_caps','get_caps','wait_my_turn','end']), t; print('OK')"
 ```
 
 ## Scope and Limits

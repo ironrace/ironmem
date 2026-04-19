@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""ConvoMem benchmark for ironrace-memory.
+"""ConvoMem benchmark for ironmem.
 
 Tests retrieval recall across 6 conversational memory categories.
 Matches MemPal's published ConvoMem harness: 250 items (50 per category),
@@ -350,7 +350,7 @@ class McpClient:
             deadline = time.monotonic() + 120.0
             while time.monotonic() < deadline:
                 try:
-                    r = self.call_tool("ironmem_status", {})
+                    r = self.call_tool("status", {})
                     if not r.get("warming_up", False):
                         break
                 except Exception:
@@ -398,13 +398,13 @@ class McpClient:
 
 def run_convomem_benchmark(
     items: list[dict],
-    ironmem_binary: str,
+    binary: str,
     n_results: int,
     top_k: int,
     skip_abstention: bool,
     ef_search: int | None,
 ) -> dict:
-    """Run ConvoMem retrieval recall benchmark against ironrace-memory.
+    """Run ConvoMem retrieval recall benchmark against ironmem.
 
     Each item gets its own wing for isolation. All conversation messages are
     ingested; retrieval is scored by whether any evidence message appears in
@@ -423,8 +423,8 @@ def run_convomem_benchmark(
         env["IRONMEM_EF_SEARCH"] = str(ef_search)
 
     client = McpClient(
-        name="ironrace-memory",
-        cmd=[ironmem_binary, "serve"],
+        name="ironmem",
+        cmd=[binary, "serve"],
         env=env,
     )
 
@@ -464,14 +464,14 @@ def run_convomem_benchmark(
             wing = f"item{i}"
 
             for j, msg in enumerate(messages):
-                client.call_tool("ironmem_add_drawer", {
+                client.call_tool("add_drawer", {
                     "content": msg,
                     "wing": wing,
                     "room": "message",
                 })
 
             t0 = time.perf_counter()
-            payload = client.call_tool("ironmem_search", {
+            payload = client.call_tool("search", {
                 "query": question,
                 "limit": n_results,
                 "wing": wing,
@@ -507,7 +507,7 @@ def run_convomem_benchmark(
     avg_recall = total_hits / max(total_scored, 1)
 
     return {
-        "backend": "ironrace-memory",
+        "backend": "ironmem",
         "items_scored": total_scored,
         "avg_recall": avg_recall,
         "per_category": {c: per_cat_hits[c] / per_cat_total[c] for c in per_cat_total if per_cat_total[c] > 0},
@@ -570,7 +570,7 @@ def print_results(results: list[dict]) -> None:
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
-        description="ConvoMem retrieval recall benchmark for ironrace-memory.",
+        description="ConvoMem retrieval recall benchmark for ironmem.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     p.add_argument(
@@ -637,17 +637,17 @@ def main() -> int:
         Path(args.save_sample).write_text(json.dumps(items, indent=2))
         print(f"Sample saved to {args.save_sample} (reuse with: python3 {__file__} {args.save_sample})")
 
-    ironmem_binary = Path(args.ironmem_binary).expanduser().resolve()
-    if not ironmem_binary.exists():
-        print(f"ironmem binary not found: {ironmem_binary}", file=sys.stderr)
-        print("Build it with: cargo build --release -p ironrace-memory --bin ironmem", file=sys.stderr)
+    binary = Path(args.binary).expanduser().resolve()
+    if not binary.exists():
+        print(f"ironmem binary not found: {binary}", file=sys.stderr)
+        print("Build it with: cargo build --release -p ironmem --bin ironmem", file=sys.stderr)
         return 1
 
     ef_label = f"  ef_search={args.ef_search}" if args.ef_search else ""
-    print(f"\nironrace-memory{ef_label}:", flush=True)
+    print(f"\nironmem{ef_label}:", flush=True)
     result = run_convomem_benchmark(
         items=items,
-        ironmem_binary=str(ironmem_binary),
+        binary=str(binary),
         n_results=args.n_results,
         top_k=args.top_k,
         skip_abstention=args.skip_abstention,

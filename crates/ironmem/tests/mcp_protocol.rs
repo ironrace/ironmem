@@ -3,9 +3,9 @@
 //! These tests call `dispatch` directly with an in-memory App (noop embedder,
 //! no ONNX model required) and assert on the JSON-RPC response shape.
 
-use ironrace_memory::mcp::app::App;
-use ironrace_memory::mcp::protocol::JsonRpcRequest;
-use ironrace_memory::mcp::server::dispatch;
+use ironmem::mcp::app::App;
+use ironmem::mcp::protocol::JsonRpcRequest;
+use ironmem::mcp::server::dispatch;
 use serde_json::json;
 
 fn request(method: &str, params: serde_json::Value) -> JsonRpcRequest {
@@ -39,7 +39,7 @@ fn initialize_returns_capabilities() {
     let result = resp.result.unwrap();
     assert_eq!(result["protocolVersion"], "2024-11-05");
     assert!(result["capabilities"]["tools"].is_object());
-    assert_eq!(result["serverInfo"]["name"], "ironrace-memory");
+    assert_eq!(result["serverInfo"]["name"], "ironmem");
 }
 
 #[test]
@@ -56,12 +56,12 @@ fn tools_list_contains_required_tools() {
     let names: Vec<&str> = tools.iter().filter_map(|t| t["name"].as_str()).collect();
 
     for required in &[
-        "ironmem_status",
-        "ironmem_search",
-        "ironmem_list_wings",
-        "ironmem_kg_stats",
-        "ironmem_add_drawer",
-        "ironmem_diary_write",
+        "status",
+        "search",
+        "list_wings",
+        "kg_stats",
+        "add_drawer",
+        "diary_write",
     ] {
         assert!(
             names.contains(required),
@@ -72,7 +72,7 @@ fn tools_list_contains_required_tools() {
 
 #[test]
 fn tools_list_read_only_mode_excludes_write_tools() {
-    use ironrace_memory::config::McpAccessMode;
+    use ironmem::config::McpAccessMode;
 
     let app = App::open_for_test_with_mode(McpAccessMode::ReadOnly).unwrap();
     let req = request("tools/list", json!({}));
@@ -81,25 +81,21 @@ fn tools_list_read_only_mode_excludes_write_tools() {
     let tools = resp.result.unwrap()["tools"].as_array().cloned().unwrap();
     let names: Vec<&str> = tools.iter().filter_map(|t| t["name"].as_str()).collect();
 
-    for blocked in &[
-        "ironmem_add_drawer",
-        "ironmem_delete_drawer",
-        "ironmem_diary_write",
-    ] {
+    for blocked in &["add_drawer", "delete_drawer", "diary_write"] {
         assert!(
             !names.contains(blocked),
             "write tool should be absent in read-only mode: {blocked}"
         );
     }
     // Read tools still present
-    assert!(names.contains(&"ironmem_status"));
-    assert!(names.contains(&"ironmem_search"));
+    assert!(names.contains(&"status"));
+    assert!(names.contains(&"search"));
 }
 
 #[test]
-fn ironmem_status_returns_expected_shape() {
+fn status_returns_expected_shape() {
     let app = App::open_for_test().unwrap();
-    let status = call_tool(&app, "ironmem_status", json!({}));
+    let status = call_tool(&app, "status", json!({}));
 
     assert!(
         status["total_drawers"].is_number(),
@@ -134,13 +130,13 @@ fn kg_add_and_query_round_trip() {
     // Add a triple
     let add = call_tool(
         &app,
-        "ironmem_kg_add",
+        "kg_add",
         json!({ "subject": "rust", "predicate": "is-a", "object": "language" }),
     );
     assert_eq!(add["success"], true);
 
     // Query it back
-    let query = call_tool(&app, "ironmem_kg_query", json!({ "entity": "rust" }));
+    let query = call_tool(&app, "kg_query", json!({ "entity": "rust" }));
     let triples = query["triples"]
         .as_array()
         .expect("triples must be an array");
@@ -156,7 +152,7 @@ fn collab_happy_path_locks_via_mcp_handlers() {
 
     let started = call_tool(
         &app,
-        "ironmem_collab_start",
+        "collab_start",
         json!({
             "repo_path": "/repo",
             "branch": "main",
@@ -167,7 +163,7 @@ fn collab_happy_path_locks_via_mcp_handlers() {
 
     call_tool(
         &app,
-        "ironmem_collab_send",
+        "collab_send",
         json!({
             "session_id": session_id,
             "sender": "claude",
@@ -177,7 +173,7 @@ fn collab_happy_path_locks_via_mcp_handlers() {
     );
     call_tool(
         &app,
-        "ironmem_collab_send",
+        "collab_send",
         json!({
             "session_id": session_id,
             "sender": "codex",
@@ -185,16 +181,12 @@ fn collab_happy_path_locks_via_mcp_handlers() {
             "content": "Codex first draft"
         }),
     );
-    let status = call_tool(
-        &app,
-        "ironmem_collab_status",
-        json!({ "session_id": session_id }),
-    );
+    let status = call_tool(&app, "collab_status", json!({ "session_id": session_id }));
     assert_eq!(status["phase"], "PlanSynthesisPending");
 
     call_tool(
         &app,
-        "ironmem_collab_send",
+        "collab_send",
         json!({
             "session_id": session_id,
             "sender": "claude",
@@ -202,33 +194,25 @@ fn collab_happy_path_locks_via_mcp_handlers() {
             "content": "Merged canonical plan"
         }),
     );
-    let status = call_tool(
-        &app,
-        "ironmem_collab_status",
-        json!({ "session_id": session_id }),
-    );
+    let status = call_tool(&app, "collab_status", json!({ "session_id": session_id }));
     assert_eq!(status["phase"], "PlanCodexReviewPending");
     let canonical_hash = status["canonical_plan_hash"].as_str().unwrap().to_string();
 
     call_tool(
         &app,
-        "ironmem_collab_approve",
+        "collab_approve",
         json!({
             "session_id": session_id,
             "agent": "codex",
             "content_hash": canonical_hash
         }),
     );
-    let status = call_tool(
-        &app,
-        "ironmem_collab_status",
-        json!({ "session_id": session_id }),
-    );
+    let status = call_tool(&app, "collab_status", json!({ "session_id": session_id }));
     assert_eq!(status["phase"], "PlanClaudeFinalizePending");
 
     call_tool(
         &app,
-        "ironmem_collab_send",
+        "collab_send",
         json!({
             "session_id": session_id,
             "sender": "claude",
@@ -239,11 +223,7 @@ fn collab_happy_path_locks_via_mcp_handlers() {
             }).to_string()
         }),
     );
-    let status = call_tool(
-        &app,
-        "ironmem_collab_status",
-        json!({ "session_id": session_id }),
-    );
+    let status = call_tool(&app, "collab_status", json!({ "session_id": session_id }));
     assert_eq!(status["phase"], "PlanLocked");
 }
 
@@ -253,7 +233,7 @@ fn collab_request_changes_loops_back_to_synthesis_and_locks_after_revision() {
 
     let started = call_tool(
         &app,
-        "ironmem_collab_start",
+        "collab_start",
         json!({
             "repo_path": "/repo",
             "branch": "main",
@@ -264,7 +244,7 @@ fn collab_request_changes_loops_back_to_synthesis_and_locks_after_revision() {
 
     call_tool(
         &app,
-        "ironmem_collab_send",
+        "collab_send",
         json!({
             "session_id": session_id,
             "sender": "claude",
@@ -274,7 +254,7 @@ fn collab_request_changes_loops_back_to_synthesis_and_locks_after_revision() {
     );
     call_tool(
         &app,
-        "ironmem_collab_send",
+        "collab_send",
         json!({
             "session_id": session_id,
             "sender": "codex",
@@ -284,7 +264,7 @@ fn collab_request_changes_loops_back_to_synthesis_and_locks_after_revision() {
     );
     call_tool(
         &app,
-        "ironmem_collab_send",
+        "collab_send",
         json!({
             "session_id": session_id,
             "sender": "claude",
@@ -296,7 +276,7 @@ fn collab_request_changes_loops_back_to_synthesis_and_locks_after_revision() {
     // Wrong hash on approve is rejected (canonical_plan_hash mismatch).
     let bad_approve = call_tool(
         &app,
-        "ironmem_collab_approve",
+        "collab_approve",
         json!({
             "session_id": session_id,
             "agent": "codex",
@@ -312,7 +292,7 @@ fn collab_request_changes_loops_back_to_synthesis_and_locks_after_revision() {
     // Claude can revise the canonical plan.
     call_tool(
         &app,
-        "ironmem_collab_send",
+        "collab_send",
         json!({
             "session_id": session_id,
             "sender": "codex",
@@ -320,11 +300,7 @@ fn collab_request_changes_loops_back_to_synthesis_and_locks_after_revision() {
             "content": json!({ "verdict": "request_changes" }).to_string()
         }),
     );
-    let status_after_rc = call_tool(
-        &app,
-        "ironmem_collab_status",
-        json!({ "session_id": session_id }),
-    );
+    let status_after_rc = call_tool(&app, "collab_status", json!({ "session_id": session_id }));
     assert_eq!(status_after_rc["phase"], "PlanSynthesisPending");
     assert_eq!(status_after_rc["current_owner"], "claude");
     assert_eq!(status_after_rc["review_round"], 1);
@@ -333,7 +309,7 @@ fn collab_request_changes_loops_back_to_synthesis_and_locks_after_revision() {
     // Claude publishes the final plan and the session locks.
     call_tool(
         &app,
-        "ironmem_collab_send",
+        "collab_send",
         json!({
             "session_id": session_id,
             "sender": "claude",
@@ -343,7 +319,7 @@ fn collab_request_changes_loops_back_to_synthesis_and_locks_after_revision() {
     );
     call_tool(
         &app,
-        "ironmem_collab_send",
+        "collab_send",
         json!({
             "session_id": session_id,
             "sender": "codex",
@@ -353,7 +329,7 @@ fn collab_request_changes_loops_back_to_synthesis_and_locks_after_revision() {
     );
     call_tool(
         &app,
-        "ironmem_collab_send",
+        "collab_send",
         json!({
             "session_id": session_id,
             "sender": "claude",
@@ -361,11 +337,7 @@ fn collab_request_changes_loops_back_to_synthesis_and_locks_after_revision() {
             "content": json!({ "plan": "Merged canonical v2" }).to_string()
         }),
     );
-    let status = call_tool(
-        &app,
-        "ironmem_collab_status",
-        json!({ "session_id": session_id }),
-    );
+    let status = call_tool(&app, "collab_status", json!({ "session_id": session_id }));
     assert_eq!(status["phase"], "PlanLocked");
     assert_eq!(status["final_plan_hash"], status["canonical_plan_hash"]);
 }
@@ -376,7 +348,7 @@ fn collab_two_rounds_of_request_changes_force_finalize() {
 
     let started = call_tool(
         &app,
-        "ironmem_collab_start",
+        "collab_start",
         json!({
             "repo_path": "/repo",
             "branch": "main",
@@ -389,7 +361,7 @@ fn collab_two_rounds_of_request_changes_force_finalize() {
     for (sender, content) in [("claude", "cdraft"), ("codex", "xdraft")] {
         call_tool(
             &app,
-            "ironmem_collab_send",
+            "collab_send",
             json!({
                 "session_id": session_id,
                 "sender": sender,
@@ -402,7 +374,7 @@ fn collab_two_rounds_of_request_changes_force_finalize() {
     // Round 1: canonical → request_changes (back to synthesis).
     call_tool(
         &app,
-        "ironmem_collab_send",
+        "collab_send",
         json!({
             "session_id": session_id,
             "sender": "claude",
@@ -412,7 +384,7 @@ fn collab_two_rounds_of_request_changes_force_finalize() {
     );
     call_tool(
         &app,
-        "ironmem_collab_send",
+        "collab_send",
         json!({
             "session_id": session_id,
             "sender": "codex",
@@ -425,7 +397,7 @@ fn collab_two_rounds_of_request_changes_force_finalize() {
     // must advance to PlanClaudeFinalizePending (Claude gets the last word).
     call_tool(
         &app,
-        "ironmem_collab_send",
+        "collab_send",
         json!({
             "session_id": session_id,
             "sender": "claude",
@@ -435,7 +407,7 @@ fn collab_two_rounds_of_request_changes_force_finalize() {
     );
     call_tool(
         &app,
-        "ironmem_collab_send",
+        "collab_send",
         json!({
             "session_id": session_id,
             "sender": "codex",
@@ -444,18 +416,14 @@ fn collab_two_rounds_of_request_changes_force_finalize() {
         }),
     );
 
-    let status = call_tool(
-        &app,
-        "ironmem_collab_status",
-        json!({ "session_id": session_id }),
-    );
+    let status = call_tool(&app, "collab_status", json!({ "session_id": session_id }));
     assert_eq!(status["phase"], "PlanClaudeFinalizePending");
     assert_eq!(status["review_round"], 2);
 
     // Claude publishes final despite Codex's objection; session locks.
     call_tool(
         &app,
-        "ironmem_collab_send",
+        "collab_send",
         json!({
             "session_id": session_id,
             "sender": "claude",
@@ -463,11 +431,7 @@ fn collab_two_rounds_of_request_changes_force_finalize() {
             "content": json!({ "plan": "Claude's last word" }).to_string()
         }),
     );
-    let status = call_tool(
-        &app,
-        "ironmem_collab_status",
-        json!({ "session_id": session_id }),
-    );
+    let status = call_tool(&app, "collab_status", json!({ "session_id": session_id }));
     assert_eq!(status["phase"], "PlanLocked");
 }
 
@@ -476,7 +440,7 @@ fn collab_start_with_task_roundtrips_via_status() {
     let app = App::open_for_test().unwrap();
     let started = call_tool(
         &app,
-        "ironmem_collab_start",
+        "collab_start",
         json!({
             "repo_path": "/repo",
             "branch": "main",
@@ -487,11 +451,7 @@ fn collab_start_with_task_roundtrips_via_status() {
     assert_eq!(started["task"], "design a landing page");
     let session_id = started["session_id"].as_str().unwrap();
 
-    let status = call_tool(
-        &app,
-        "ironmem_collab_status",
-        json!({ "session_id": session_id }),
-    );
+    let status = call_tool(&app, "collab_status", json!({ "session_id": session_id }));
     assert_eq!(status["task"], "design a landing page");
     assert_eq!(status["review_round"], 0);
     assert!(status["ended_at"].is_null());
@@ -502,7 +462,7 @@ fn collab_recv_blocks_draft_peek_before_own_draft_submitted() {
     let app = App::open_for_test().unwrap();
     let started = call_tool(
         &app,
-        "ironmem_collab_start",
+        "collab_start",
         json!({
             "repo_path": "/repo",
             "branch": "main",
@@ -514,7 +474,7 @@ fn collab_recv_blocks_draft_peek_before_own_draft_submitted() {
     // Claude submits first.
     call_tool(
         &app,
-        "ironmem_collab_send",
+        "collab_send",
         json!({
             "session_id": session_id,
             "sender": "claude",
@@ -526,7 +486,7 @@ fn collab_recv_blocks_draft_peek_before_own_draft_submitted() {
     // Codex must NOT be able to read Claude's draft before submitting its own.
     let peek = call_tool(
         &app,
-        "ironmem_collab_recv",
+        "collab_recv",
         json!({ "session_id": session_id, "receiver": "codex" }),
     );
     let messages = peek["messages"].as_array().unwrap();
@@ -539,7 +499,7 @@ fn collab_recv_blocks_draft_peek_before_own_draft_submitted() {
     // read Claude's draft.
     call_tool(
         &app,
-        "ironmem_collab_send",
+        "collab_send",
         json!({
             "session_id": session_id,
             "sender": "codex",
@@ -549,7 +509,7 @@ fn collab_recv_blocks_draft_peek_before_own_draft_submitted() {
     );
     let peek = call_tool(
         &app,
-        "ironmem_collab_recv",
+        "collab_recv",
         json!({ "session_id": session_id, "receiver": "codex" }),
     );
     let messages = peek["messages"].as_array().unwrap();
@@ -562,7 +522,7 @@ fn collab_wait_my_turn_returns_immediately_when_owner() {
     let app = App::open_for_test().unwrap();
     let started = call_tool(
         &app,
-        "ironmem_collab_start",
+        "collab_start",
         json!({
             "repo_path": "/repo",
             "branch": "main",
@@ -575,7 +535,7 @@ fn collab_wait_my_turn_returns_immediately_when_owner() {
     let start = std::time::Instant::now();
     let resp = call_tool(
         &app,
-        "ironmem_collab_wait_my_turn",
+        "collab_wait_my_turn",
         json!({ "session_id": session_id, "agent": "claude", "timeout_secs": 5 }),
     );
     assert!(start.elapsed() < std::time::Duration::from_secs(2));
@@ -590,7 +550,7 @@ fn collab_end_blocks_subsequent_writes() {
     let app = App::open_for_test().unwrap();
     let started = call_tool(
         &app,
-        "ironmem_collab_start",
+        "collab_start",
         json!({
             "repo_path": "/repo",
             "branch": "main",
@@ -601,7 +561,7 @@ fn collab_end_blocks_subsequent_writes() {
 
     let ended = call_tool(
         &app,
-        "ironmem_collab_end",
+        "collab_end",
         json!({ "session_id": session_id, "agent": "claude" }),
     );
     assert_eq!(ended["ok"], true);
@@ -609,7 +569,7 @@ fn collab_end_blocks_subsequent_writes() {
     // Subsequent send must fail because the session has ended.
     let blocked = call_tool(
         &app,
-        "ironmem_collab_send",
+        "collab_send",
         json!({
             "session_id": session_id,
             "sender": "claude",
@@ -625,7 +585,7 @@ fn collab_end_blocks_subsequent_writes() {
     // wait_my_turn must surface session_ended=true so the agent loop exits.
     let wait = call_tool(
         &app,
-        "ironmem_collab_wait_my_turn",
+        "collab_wait_my_turn",
         json!({ "session_id": session_id, "agent": "claude", "timeout_secs": 1 }),
     );
     assert_eq!(wait["session_ended"], true);

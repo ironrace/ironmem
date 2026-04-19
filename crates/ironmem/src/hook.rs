@@ -495,7 +495,7 @@ mod tests {
             "id": 1,
             "method": "tools/call",
             "params": {
-                "name": "ironmem_diary_read",
+                "name": "diary_read",
                 "arguments": { "wing": "diary", "limit": 10 }
             }
         }))
@@ -531,7 +531,7 @@ mod tests {
                         "content": [
                             {
                                 "type": "text",
-                                "text": "Findings\n- High: duplicate writes still happen in crates/ironrace-memory/src/hook.rs:52\n- Medium: add a regression test\nPR #2"
+                                "text": "Findings\n- High: duplicate writes still happen in crates/ironmem/src/hook.rs:52\n- Medium: add a regression test\nPR #2"
                             }
                         ]
                     }
@@ -551,7 +551,7 @@ mod tests {
     fn transcript_review_storage_is_deduplicated() {
         let app = App::open_for_test().unwrap();
         let temp = tempfile::tempdir().unwrap();
-        let workspace = temp.path().join("ironrace-memory");
+        let workspace = temp.path().join("ironmem");
         std::fs::create_dir_all(&workspace).unwrap();
         let transcript = temp.path().join("transcript.jsonl");
         std::fs::write(
@@ -560,7 +560,7 @@ mod tests {
                 "{}\n",
                 serde_json::json!({
                     "role": "assistant",
-                    "content": "Findings\n- High: race condition in crates/ironrace-memory/src/ingest/mod.rs:374\n- Medium: keep a regression test\nPR #1"
+                    "content": "Findings\n- High: race condition in crates/ironmem/src/ingest/mod.rs:374\n- Medium: keep a regression test\nPR #1"
                 })
             ),
         )

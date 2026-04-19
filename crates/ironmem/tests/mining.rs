@@ -3,9 +3,9 @@
 //! Uses an in-memory App (noop embedder) + real temp directories to verify
 //! the manifest lifecycle, file discovery, chunking, and DB state.
 
+use ironmem::ingest::mine_directory;
+use ironmem::mcp::app::App;
 use ironrace_embed::Embedder;
-use ironrace_memory::ingest::mine_directory;
-use ironrace_memory::mcp::app::App;
 use tempfile::TempDir;
 
 fn setup() -> (App, TempDir) {

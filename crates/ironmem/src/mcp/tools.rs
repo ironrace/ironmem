@@ -34,12 +34,12 @@ const MAX_COLLAB_CAP_FIELD_CHARS: usize = 512;
 pub fn tool_definitions(app: &App) -> Vec<Value> {
     let tools = vec![
         json!({
-            "name": "ironmem_status",
+            "name": "status",
             "description": "Memory overview — total drawers, wing and room counts",
             "inputSchema": { "type": "object", "properties": {} }
         }),
         json!({
-            "name": "ironmem_search",
+            "name": "search",
             "description": "Semantic search with KG-boosted ranking. Returns bounded content excerpts.",
             "inputSchema": {
                 "type": "object",
@@ -53,7 +53,7 @@ pub fn tool_definitions(app: &App) -> Vec<Value> {
             }
         }),
         json!({
-            "name": "ironmem_add_drawer",
+            "name": "add_drawer",
             "description": "File verbatim content into a wing/room",
             "inputSchema": {
                 "type": "object",
@@ -66,7 +66,7 @@ pub fn tool_definitions(app: &App) -> Vec<Value> {
             }
         }),
         json!({
-            "name": "ironmem_delete_drawer",
+            "name": "delete_drawer",
             "description": "Remove a drawer by ID",
             "inputSchema": {
                 "type": "object",
@@ -77,12 +77,12 @@ pub fn tool_definitions(app: &App) -> Vec<Value> {
             }
         }),
         json!({
-            "name": "ironmem_list_wings",
+            "name": "list_wings",
             "description": "All wings with drawer counts",
             "inputSchema": { "type": "object", "properties": {} }
         }),
         json!({
-            "name": "ironmem_list_rooms",
+            "name": "list_rooms",
             "description": "Rooms within a wing (or all rooms)",
             "inputSchema": {
                 "type": "object",
@@ -92,12 +92,12 @@ pub fn tool_definitions(app: &App) -> Vec<Value> {
             }
         }),
         json!({
-            "name": "ironmem_get_taxonomy",
+            "name": "get_taxonomy",
             "description": "Full wing → room → count tree",
             "inputSchema": { "type": "object", "properties": {} }
         }),
         json!({
-            "name": "ironmem_kg_add",
+            "name": "kg_add",
             "description": "Add an entity relationship triple to the knowledge graph",
             "inputSchema": {
                 "type": "object",
@@ -114,7 +114,7 @@ pub fn tool_definitions(app: &App) -> Vec<Value> {
             }
         }),
         json!({
-            "name": "ironmem_kg_query",
+            "name": "kg_query",
             "description": "Query knowledge graph for an entity's relationships",
             "inputSchema": {
                 "type": "object",
@@ -126,7 +126,7 @@ pub fn tool_definitions(app: &App) -> Vec<Value> {
             }
         }),
         json!({
-            "name": "ironmem_kg_invalidate",
+            "name": "kg_invalidate",
             "description": "Mark a triple as no longer valid",
             "inputSchema": {
                 "type": "object",
@@ -138,7 +138,7 @@ pub fn tool_definitions(app: &App) -> Vec<Value> {
             }
         }),
         json!({
-            "name": "ironmem_kg_timeline",
+            "name": "kg_timeline",
             "description": "Chronological fact history for an entity",
             "inputSchema": {
                 "type": "object",
@@ -150,12 +150,12 @@ pub fn tool_definitions(app: &App) -> Vec<Value> {
             }
         }),
         json!({
-            "name": "ironmem_kg_stats",
+            "name": "kg_stats",
             "description": "Knowledge graph summary statistics",
             "inputSchema": { "type": "object", "properties": {} }
         }),
         json!({
-            "name": "ironmem_traverse",
+            "name": "traverse",
             "description": "BFS traversal from a room to find related rooms",
             "inputSchema": {
                 "type": "object",
@@ -167,17 +167,17 @@ pub fn tool_definitions(app: &App) -> Vec<Value> {
             }
         }),
         json!({
-            "name": "ironmem_find_tunnels",
+            "name": "find_tunnels",
             "description": "Find rooms that span multiple wings",
             "inputSchema": { "type": "object", "properties": {} }
         }),
         json!({
-            "name": "ironmem_graph_stats",
+            "name": "graph_stats",
             "description": "Memory graph summary — rooms, wings, tunnels, edges",
             "inputSchema": { "type": "object", "properties": {} }
         }),
         json!({
-            "name": "ironmem_diary_write",
+            "name": "diary_write",
             "description": "Write a timestamped diary entry",
             "inputSchema": {
                 "type": "object",
@@ -189,7 +189,7 @@ pub fn tool_definitions(app: &App) -> Vec<Value> {
             }
         }),
         json!({
-            "name": "ironmem_diary_read",
+            "name": "diary_read",
             "description": "Read recent diary entries",
             "inputSchema": {
                 "type": "object",
@@ -200,8 +200,8 @@ pub fn tool_definitions(app: &App) -> Vec<Value> {
             }
         }),
         json!({
-            "name": "ironmem_collab_start",
-            "description": "Create a bounded Claude↔Codex planning session. Optional `task` describes the planning goal and is returned in ironmem_collab_status so the counterpart agent can fetch it without a manual paste.",
+            "name": "collab_start",
+            "description": "Create a bounded Claude↔Codex planning session. Optional `task` describes the planning goal and is returned in collab_status so the counterpart agent can fetch it without a manual paste.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -214,7 +214,7 @@ pub fn tool_definitions(app: &App) -> Vec<Value> {
             }
         }),
         json!({
-            "name": "ironmem_collab_send",
+            "name": "collab_send",
             "description": "Send a collab message and advance the bounded planning state machine when applicable",
             "inputSchema": {
                 "type": "object",
@@ -228,7 +228,7 @@ pub fn tool_definitions(app: &App) -> Vec<Value> {
             }
         }),
         json!({
-            "name": "ironmem_collab_recv",
+            "name": "collab_recv",
             "description": "Read pending collab messages for one agent",
             "inputSchema": {
                 "type": "object",
@@ -241,7 +241,7 @@ pub fn tool_definitions(app: &App) -> Vec<Value> {
             }
         }),
         json!({
-            "name": "ironmem_collab_ack",
+            "name": "collab_ack",
             "description": "Mark a collab message as consumed",
             "inputSchema": {
                 "type": "object",
@@ -253,7 +253,7 @@ pub fn tool_definitions(app: &App) -> Vec<Value> {
             }
         }),
         json!({
-            "name": "ironmem_collab_status",
+            "name": "collab_status",
             "description": "Return the full collab session state",
             "inputSchema": {
                 "type": "object",
@@ -264,7 +264,7 @@ pub fn tool_definitions(app: &App) -> Vec<Value> {
             }
         }),
         json!({
-            "name": "ironmem_collab_approve",
+            "name": "collab_approve",
             "description": "Codex-only shortcut for submitting an approve review",
             "inputSchema": {
                 "type": "object",
@@ -277,7 +277,7 @@ pub fn tool_definitions(app: &App) -> Vec<Value> {
             }
         }),
         json!({
-            "name": "ironmem_collab_register_caps",
+            "name": "collab_register_caps",
             "description": "Register available sub-agents/tools for a collab participant",
             "inputSchema": {
                 "type": "object",
@@ -300,7 +300,7 @@ pub fn tool_definitions(app: &App) -> Vec<Value> {
             }
         }),
         json!({
-            "name": "ironmem_collab_get_caps",
+            "name": "collab_get_caps",
             "description": "Read registered capabilities for one or all collab participants",
             "inputSchema": {
                 "type": "object",
@@ -312,7 +312,7 @@ pub fn tool_definitions(app: &App) -> Vec<Value> {
             }
         }),
         json!({
-            "name": "ironmem_collab_wait_my_turn",
+            "name": "collab_wait_my_turn",
             "description": "Long-poll: block until current_owner == agent or the timeout elapses. Returns {is_my_turn, phase, current_owner, session_ended}. Default timeout 30s, max 60s.",
             "inputSchema": {
                 "type": "object",
@@ -325,7 +325,7 @@ pub fn tool_definitions(app: &App) -> Vec<Value> {
             }
         }),
         json!({
-            "name": "ironmem_collab_end",
+            "name": "collab_end",
             "description": "End a collab session. Reserved for the v2 coding phase — DO NOT call during planning. Idempotent; blocks subsequent send/approve/wait_my_turn writes.",
             "inputSchema": {
                 "type": "object",
@@ -356,33 +356,33 @@ pub fn call_tool(app: &App, name: &str, args: &Value) -> Result<Value, MemoryErr
     }
     ensure_tool_allowed(app, name)?;
     match name {
-        "ironmem_status" => handle_status(app),
-        "ironmem_search" => handle_search(app, args),
-        "ironmem_add_drawer" => handle_add_drawer(app, args),
-        "ironmem_delete_drawer" => handle_delete_drawer(app, args),
-        "ironmem_list_wings" => handle_list_wings(app),
-        "ironmem_list_rooms" => handle_list_rooms(app, args),
-        "ironmem_get_taxonomy" => handle_get_taxonomy(app),
-        "ironmem_kg_add" => handle_kg_add(app, args),
-        "ironmem_kg_query" => handle_kg_query(app, args),
-        "ironmem_kg_invalidate" => handle_kg_invalidate(app, args),
-        "ironmem_kg_timeline" => handle_kg_timeline(app, args),
-        "ironmem_kg_stats" => handle_kg_stats(app),
-        "ironmem_traverse" => handle_traverse(app, args),
-        "ironmem_find_tunnels" => handle_find_tunnels(app),
-        "ironmem_graph_stats" => handle_graph_stats(app),
-        "ironmem_diary_write" => handle_diary_write(app, args),
-        "ironmem_diary_read" => handle_diary_read(app, args),
-        "ironmem_collab_start" => handle_collab_start(app, args),
-        "ironmem_collab_send" => handle_collab_send(app, args),
-        "ironmem_collab_recv" => handle_collab_recv(app, args),
-        "ironmem_collab_ack" => handle_collab_ack(app, args),
-        "ironmem_collab_status" => handle_collab_status(app, args),
-        "ironmem_collab_approve" => handle_collab_approve(app, args),
-        "ironmem_collab_register_caps" => handle_collab_register_caps(app, args),
-        "ironmem_collab_get_caps" => handle_collab_get_caps(app, args),
-        "ironmem_collab_wait_my_turn" => handle_collab_wait_my_turn(app, args),
-        "ironmem_collab_end" => handle_collab_end(app, args),
+        "status" => handle_status(app),
+        "search" => handle_search(app, args),
+        "add_drawer" => handle_add_drawer(app, args),
+        "delete_drawer" => handle_delete_drawer(app, args),
+        "list_wings" => handle_list_wings(app),
+        "list_rooms" => handle_list_rooms(app, args),
+        "get_taxonomy" => handle_get_taxonomy(app),
+        "kg_add" => handle_kg_add(app, args),
+        "kg_query" => handle_kg_query(app, args),
+        "kg_invalidate" => handle_kg_invalidate(app, args),
+        "kg_timeline" => handle_kg_timeline(app, args),
+        "kg_stats" => handle_kg_stats(app),
+        "traverse" => handle_traverse(app, args),
+        "find_tunnels" => handle_find_tunnels(app),
+        "graph_stats" => handle_graph_stats(app),
+        "diary_write" => handle_diary_write(app, args),
+        "diary_read" => handle_diary_read(app, args),
+        "collab_start" => handle_collab_start(app, args),
+        "collab_send" => handle_collab_send(app, args),
+        "collab_recv" => handle_collab_recv(app, args),
+        "collab_ack" => handle_collab_ack(app, args),
+        "collab_status" => handle_collab_status(app, args),
+        "collab_approve" => handle_collab_approve(app, args),
+        "collab_register_caps" => handle_collab_register_caps(app, args),
+        "collab_get_caps" => handle_collab_get_caps(app, args),
+        "collab_wait_my_turn" => handle_collab_wait_my_turn(app, args),
+        "collab_end" => handle_collab_end(app, args),
         _ => Err(MemoryError::Permission(format!(
             "Tool '{name}' is not available in the current MCP mode"
         ))),
@@ -973,7 +973,7 @@ fn handle_collab_approve(app: &App, args: &Value) -> Result<Value, MemoryError> 
     let agent = require_agent(require_str(args, "agent")?)?;
     if agent != "codex" {
         return Err(MemoryError::Validation(
-            "agent must be 'codex' for ironmem_collab_approve".to_string(),
+            "agent must be 'codex' for collab_approve".to_string(),
         ));
     }
     let content_hash = require_str(args, "content_hash")?;
@@ -1096,7 +1096,7 @@ fn handle_collab_get_caps(app: &App, args: &Value) -> Result<Value, MemoryError>
     Ok(json!({ "capabilities": capabilities }))
 }
 
-/// Polling cadence for `ironmem_collab_wait_my_turn`. Short enough that
+/// Polling cadence for `collab_wait_my_turn`. Short enough that
 /// turn transitions feel immediate, long enough that idle waits don't
 /// hammer SQLite.
 const WAIT_MY_TURN_POLL_MS: u64 = 500;
@@ -1160,33 +1160,33 @@ fn handle_collab_end(app: &App, args: &Value) -> Result<Value, MemoryError> {
 fn tool_known(name: &str) -> bool {
     matches!(
         name,
-        "ironmem_status"
-            | "ironmem_search"
-            | "ironmem_add_drawer"
-            | "ironmem_delete_drawer"
-            | "ironmem_list_wings"
-            | "ironmem_list_rooms"
-            | "ironmem_get_taxonomy"
-            | "ironmem_kg_add"
-            | "ironmem_kg_query"
-            | "ironmem_kg_invalidate"
-            | "ironmem_kg_timeline"
-            | "ironmem_kg_stats"
-            | "ironmem_traverse"
-            | "ironmem_find_tunnels"
-            | "ironmem_graph_stats"
-            | "ironmem_diary_write"
-            | "ironmem_diary_read"
-            | "ironmem_collab_start"
-            | "ironmem_collab_send"
-            | "ironmem_collab_recv"
-            | "ironmem_collab_ack"
-            | "ironmem_collab_status"
-            | "ironmem_collab_approve"
-            | "ironmem_collab_register_caps"
-            | "ironmem_collab_get_caps"
-            | "ironmem_collab_wait_my_turn"
-            | "ironmem_collab_end"
+        "status"
+            | "search"
+            | "add_drawer"
+            | "delete_drawer"
+            | "list_wings"
+            | "list_rooms"
+            | "get_taxonomy"
+            | "kg_add"
+            | "kg_query"
+            | "kg_invalidate"
+            | "kg_timeline"
+            | "kg_stats"
+            | "traverse"
+            | "find_tunnels"
+            | "graph_stats"
+            | "diary_write"
+            | "diary_read"
+            | "collab_start"
+            | "collab_send"
+            | "collab_recv"
+            | "collab_ack"
+            | "collab_status"
+            | "collab_approve"
+            | "collab_register_caps"
+            | "collab_get_caps"
+            | "collab_wait_my_turn"
+            | "collab_end"
     )
 }
 
@@ -1197,17 +1197,17 @@ fn tool_allowed_in_mode(mode: McpAccessMode, name: &str) -> bool {
     mode.allows_writes()
         || !matches!(
             name,
-            "ironmem_add_drawer"
-                | "ironmem_delete_drawer"
-                | "ironmem_kg_add"
-                | "ironmem_kg_invalidate"
-                | "ironmem_diary_write"
-                | "ironmem_collab_start"
-                | "ironmem_collab_send"
-                | "ironmem_collab_ack"
-                | "ironmem_collab_approve"
-                | "ironmem_collab_register_caps"
-                | "ironmem_collab_end"
+            "add_drawer"
+                | "delete_drawer"
+                | "kg_add"
+                | "kg_invalidate"
+                | "diary_write"
+                | "collab_start"
+                | "collab_send"
+                | "collab_ack"
+                | "collab_approve"
+                | "collab_register_caps"
+                | "collab_end"
         )
 }
 
@@ -1355,22 +1355,10 @@ mod tests {
 
     #[test]
     fn test_tool_access_modes_disable_writes_outside_trusted_mode() {
-        assert!(tool_allowed_in_mode(
-            McpAccessMode::Trusted,
-            "ironmem_add_drawer"
-        ));
-        assert!(!tool_allowed_in_mode(
-            McpAccessMode::ReadOnly,
-            "ironmem_add_drawer"
-        ));
-        assert!(!tool_allowed_in_mode(
-            McpAccessMode::Restricted,
-            "ironmem_kg_add"
-        ));
-        assert!(tool_allowed_in_mode(
-            McpAccessMode::Restricted,
-            "ironmem_search"
-        ));
+        assert!(tool_allowed_in_mode(McpAccessMode::Trusted, "add_drawer"));
+        assert!(!tool_allowed_in_mode(McpAccessMode::ReadOnly, "add_drawer"));
+        assert!(!tool_allowed_in_mode(McpAccessMode::Restricted, "kg_add"));
+        assert!(tool_allowed_in_mode(McpAccessMode::Restricted, "search"));
     }
 
     #[test]

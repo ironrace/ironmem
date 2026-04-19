@@ -1,8 +1,8 @@
 use clap::{Parser, Subcommand};
 use std::process;
 
-use ironrace_memory::MemoryError;
-use ironrace_memory::{bootstrap, config, ingest, mcp, migrate, reembed};
+use ironmem::MemoryError;
+use ironmem::{bootstrap, config, ingest, mcp, migrate, reembed};
 
 #[derive(Parser)]
 #[command(
@@ -60,7 +60,7 @@ async fn main() {
         .with_writer(std::io::stderr)
         .with_env_filter(
             tracing_subscriber::EnvFilter::from_default_env().add_directive(
-                "ironrace_memory=info"
+                "ironmem=info"
                     .parse()
                     .expect("static directive literal is always valid"),
             ),
@@ -139,7 +139,7 @@ async fn run(cli: Cli) -> Result<(), MemoryError> {
         }
         Commands::Hook { name, harness } => {
             let cfg = config::Config::load(None)?;
-            let response = ironrace_memory::hook::run_hook(&name, &harness, cfg)?;
+            let response = ironmem::hook::run_hook(&name, &harness, cfg)?;
             println!("{}", serde_json::to_string_pretty(&response)?);
             Ok(())
         }

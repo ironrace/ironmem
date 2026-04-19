@@ -1,4 +1,4 @@
-# ironrace-memory for Codex
+# ironmem for Codex
 
 Persistent workspace memory for Codex using the local Rust `ironmem` binary.
 
@@ -12,7 +12,7 @@ Persistent workspace memory for Codex using the local Rust `ironmem` binary.
 
 ## Memory protocol
 
-Before answering questions about prior work, decisions, project history, or people, call `ironmem_search` or the knowledge-graph tools first. After important progress or decisions, write durable summaries back into memory.
+Before answering questions about prior work, decisions, project history, or people, call `search` or the knowledge-graph tools first. After important progress or decisions, write durable summaries back into memory.
 
 ## Notes
 

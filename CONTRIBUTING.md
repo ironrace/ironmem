@@ -1,6 +1,6 @@
 # Contributing
 
-`ironrace-memory` is a Rust workspace with one CLI/MCP server crate (`ironrace-memory`) and two support crates (`ironrace-core`, `ironrace-embed`).
+`ironmem` is a Rust workspace with one CLI/MCP server crate (`ironmem`) and two support crates (`ironrace-core`, `ironrace-embed`).
 
 ## Prerequisites
 
@@ -41,7 +41,7 @@ python3 scripts/mcp_smoke_test.py
 
 Notes:
 
-- `scripts/check_versions.sh` verifies that plugin metadata versions stay in sync with `crates/ironrace-memory/Cargo.toml`.
+- `scripts/check_versions.sh` verifies that plugin metadata versions stay in sync with `crates/ironmem/Cargo.toml`.
 - `scripts/mcp_smoke_test.py` starts a real `ironmem serve` process in noop-embedder mode and sends a live `initialize` call over stdio.
 - The smoke test uses an isolated temp DB and disables auto-bootstrap/migration so it stays fast and deterministic.
 
@@ -50,7 +50,7 @@ Notes:
 For a local release-style binary:
 
 ```bash
-cargo build --release -p ironrace-memory --bin ironmem
+cargo build --release -p ironmem --bin ironmem
 ./target/release/ironmem setup
 IRONMEM_MCP_MODE=trusted ./target/release/ironmem serve
 ```
@@ -66,7 +66,7 @@ IRONMEM_DISABLE_MIGRATION=1 \
 
 ## Versioning
 
-The canonical release version lives in `crates/ironrace-memory/Cargo.toml`.
+The canonical release version lives in `crates/ironmem/Cargo.toml`.
 
 Before tagging a release:
 

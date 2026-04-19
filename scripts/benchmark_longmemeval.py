@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""LongMemEval benchmark — ironrace-memory vs mempalace, apples-to-apples.
+"""LongMemEval benchmark — ironmem vs mempalace, apples-to-apples.
 
 Both systems ingest the same haystack sessions from LongMemEval and answer
 the same 500 questions. Scoring is identical to mempalace's own benchmark
@@ -7,7 +7,7 @@ script: Recall@k (any answer session in top-k results).
 
 The key difference in this benchmark vs mempalace's raw mode:
   - mempalace: one ChromaDB doc per session, searched via ephemeral in-process client
-  - ironrace:  one ironmem_add_drawer per session, searched via MCP server
+  - ironrace:  one add_drawer per session, searched via MCP server
 
 Both use all-MiniLM-L6-v2 embeddings, so this isolates retrieval infrastructure
 quality, not model quality.
@@ -107,7 +107,7 @@ class McpClient:
             deadline = time.monotonic() + 120.0
             while time.monotonic() < deadline:
                 try:
-                    r = self.call_tool("ironmem_status", {})
+                    r = self.call_tool("status", {})
                     if not r.get("warming_up", False):
                         break
                 except Exception:
@@ -170,7 +170,7 @@ def build_corpus(entry: dict, granularity: str = "session") -> tuple[list[str], 
     return docs, ids
 
 
-# ── ironrace-memory retriever ─────────────────────────────────────────────────
+# ── ironmem retriever ─────────────────────────────────────────────────
 
 def _corpus_cache_key(docs: list[str], granularity: str, ingest_env: dict[str, str]) -> str:
     """SHA-256 fingerprint of the corpus + ingest-affecting env vars.
@@ -191,7 +191,7 @@ def _corpus_cache_key(docs: list[str], granularity: str, ingest_env: dict[str, s
 
 def run_ironrace_benchmark(
     data: list[dict],
-    ironmem_binary: str,
+    binary: str,
     limit: int,
     n_results: int,
     granularity: str,
@@ -199,7 +199,7 @@ def run_ironrace_benchmark(
     per_question_json: str | None = None,
     db_cache_dir: str | None = None,
 ) -> dict:
-    """Run LongMemEval against ironrace-memory, one fresh server per question.
+    """Run LongMemEval against ironmem, one fresh server per question.
 
     Each question gets its own DB and MCP server, matching mempalace's
     per-collection methodology. This ensures the HNSW index only contains
@@ -263,8 +263,8 @@ def run_ironrace_benchmark(
                 cache_hit = True
 
         client = McpClient(
-            name="ironrace-memory",
-            cmd=[ironmem_binary, "serve"],
+            name="ironmem",
+            cmd=[binary, "serve"],
             env=env,
         )
 
@@ -282,7 +282,7 @@ def run_ironrace_benchmark(
                 # stored content, so stored[:120] ≠ original[:120] on any doc with
                 # leading whitespace, silently demoting that result to rank 50+.
                 for j, doc in enumerate(docs):
-                    resp = client.call_tool("ironmem_add_drawer", {
+                    resp = client.call_tool("add_drawer", {
                         "content": doc,
                         "wing": "session",
                         "room": "haystack",
@@ -308,10 +308,10 @@ def run_ironrace_benchmark(
                 # new_server_ready() starts with a noop embedder; without
                 # add_drawer, ensure_embedder_ready() fires on the first search
                 # call and pays ~1700ms. This warmup absorbs that cost.
-                client.call_tool("ironmem_search", {"query": "warmup", "limit": 1})
+                client.call_tool("search", {"query": "warmup", "limit": 1})
 
             t0 = time.perf_counter()
-            payload = client.call_tool("ironmem_search", {
+            payload = client.call_tool("search", {
                 "query": question,
                 "limit": n_results,
             })
@@ -384,7 +384,7 @@ def run_ironrace_benchmark(
 
     sl = sorted(search_latencies)
     return {
-        "backend": "ironrace-memory",
+        "backend": "ironmem",
         "questions": len(recalls[5]),
         "recall": {k: sum(v) / max(len(v), 1) for k, v in recalls.items()},
         "per_type": {
@@ -540,7 +540,7 @@ def print_results(results: list[dict]) -> None:
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
-        description="LongMemEval benchmark: ironrace-memory vs mempalace.",
+        description="LongMemEval benchmark: ironmem vs mempalace.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     p.add_argument(
@@ -626,15 +626,15 @@ def main() -> int:
     results: list[dict] = []
 
     if args.backend in ("ironrace", "both"):
-        ironmem_binary = Path(args.ironmem_binary).expanduser().resolve()
-        if not ironmem_binary.exists():
-            print(f"ironmem binary not found: {ironmem_binary}", file=sys.stderr)
+        binary = Path(args.binary).expanduser().resolve()
+        if not binary.exists():
+            print(f"ironmem binary not found: {binary}", file=sys.stderr)
             return 1
         ef_label = f"  ef_search={args.ef_search}" if args.ef_search else ""
-        print(f"\nironrace-memory{ef_label}:", flush=True)
+        print(f"\nironmem{ef_label}:", flush=True)
         r = run_ironrace_benchmark(
             data=data,
-            ironmem_binary=str(ironmem_binary),
+            binary=str(binary),
             limit=args.limit,
             n_results=args.n_results,
             granularity=args.granularity,

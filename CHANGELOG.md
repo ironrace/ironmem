@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **Breaking (wire):** MCP tool ids dropped the `ironmem_` prefix now that the server id itself is `ironmem`. For example, `ironmem_search` → `search`, `ironmem_collab_start` → `collab_start`. Clients invoking tools as `mcp__ironmem__ironmem_*` must update to `mcp__ironmem__*`.
+- Renamed workspace crate `ironrace-memory` → `ironmem` and MCP server id → `ironmem`. The on-disk data directory `~/.ironrace-memory/` is preserved for user-data backcompat.
+
 ## [0.1.0] - 2026-04-15
 
 ### Added

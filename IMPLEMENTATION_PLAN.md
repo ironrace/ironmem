@@ -1,8 +1,8 @@
-# ironrace-memory Integration Plan
+# ironmem Integration Plan
 
 ## Goal
 
-Make `ironrace-memory` usable as a practical memory backend for both Claude Code and Codex, with parity on the minimum ergonomics that `mempalace` already ships today.
+Make `ironmem` usable as a practical memory backend for both Claude Code and Codex, with parity on the minimum ergonomics that `mempalace` already ships today.
 
 ## Current State
 
@@ -40,8 +40,8 @@ Acceptance criteria:
 
 - [x] A user can build `ironmem`
 - [x] A user can register it as a Codex MCP server
-- [x] A user can successfully call `initialize`, `tools/list`, `ironmem_status`, and `ironmem_search`
-- [x] A user can compare `ironrace-memory` and `mempalace` with one script
+- [x] A user can successfully call `initialize`, `tools/list`, `status`, and `search`
+- [x] A user can compare `ironmem` and `mempalace` with one script
 
 ## Phase 1.5: Install-Time Bootstrap and Migration ✅ COMPLETE
 
@@ -50,7 +50,7 @@ Objective: make installation self-initializing rather than manual.
 Required install behavior:
 
 - [x] On install, detect whether an existing `mempalace` installation or data directory exists
-- [x] If `mempalace` data exists, migrate automatically into `ironrace-memory`
+- [x] If `mempalace` data exists, migrate automatically into `ironmem`
 - [x] If no prior `mempalace` data exists, initialize a fresh store automatically
 - [x] Run an initial mine automatically after successful install/bootstrap
 - [x] Record bootstrap state so the install path is idempotent
@@ -100,7 +100,7 @@ Recommended plugin shape:
 Acceptance criteria:
 
 - [x] Codex detects the plugin automatically when run inside the repo
-- [ ] `codex --plugins` shows `ironrace-memory` _(not yet verified against a live Codex runtime)_
+- [ ] `codex --plugins` shows `ironmem` _(not yet verified against a live Codex runtime)_
 - [x] Hooks invoke a stable wrapper script rather than raw inline shell
 
 ## Phase 3: Claude Code Plugin Parity ✅ COMPLETE
@@ -202,7 +202,7 @@ Objective: prevent drift between documented behavior and real harness behavior.
 Tests added:
 
 - [x] MCP handshake smoke test — `initialize` returns capabilities, error codes correct
-- [x] Tool contract tests — `tools/list` contents, access mode filtering, `ironmem_status` shape
+- [x] Tool contract tests — `tools/list` contents, access mode filtering, `status` shape
 - [x] Hook command unit tests (parses payload, builds response)
 - [x] Mining end-to-end test on a fixture repo (ingest, idempotency, change detection, deletion)
 - [x] Codex plugin metadata validation (`plugin.json`, `hooks.json` required fields)
@@ -227,14 +227,14 @@ Objective: reduce friction for non-authors.
 Recommended additions:
 
 - [x] Top-level README with quickstart
-- [x] Release build instructions (`cargo build -p ironrace-memory --bin ironmem`)
+- [x] Release build instructions (`cargo build -p ironmem --bin ironmem`)
 - [x] Versioning policy (semver, canonical in `Cargo.toml`, enforced by CI)
 - [x] Changelog (`CHANGELOG.md`, Keep-a-Changelog format)
 - [x] Installer/bootstrap wrapper shared by both Codex and Claude plugins
 - [x] GitHub Actions (`.github/workflows/ci.yml`):
   - [x] Rust tests (`cargo test --workspace`)
   - [x] Format check + clippy (`-D warnings`)
-  - [x] Binary build (`cargo build -p ironrace-memory --bin ironmem`)
+  - [x] Binary build (`cargo build -p ironmem --bin ironmem`)
   - [x] Plugin metadata JSON validation + version consistency check
   - [ ] Smoke benchmarks _(deferred — requires real harness runtime)_
 
@@ -270,7 +270,7 @@ Required behavior:
 Recommended implementation:
 
 - [x] Include protocol text in plugin docs and default prompt metadata (`defaultPrompt` in `.codex-plugin/plugin.json`)
-- [x] Return a concise protocol reminder from `ironmem_status` (`MEMORY_PROTOCOL` constant in `bootstrap.rs`, surfaced via `tools.rs`)
+- [x] Return a concise protocol reminder from `status` (`MEMORY_PROTOCOL` constant in `bootstrap.rs`, surfaced via `tools.rs`)
 - [x] Keep the prompt short and operational
 
 Acceptance criteria:

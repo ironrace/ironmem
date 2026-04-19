@@ -2,10 +2,10 @@ use std::io::Write;
 use std::path::Path;
 use std::process::{Command, Stdio};
 
-use ironrace_memory::config::{Config, EmbedMode, McpAccessMode};
-use ironrace_memory::mcp::app::App;
-use ironrace_memory::mcp::protocol::JsonRpcRequest;
-use ironrace_memory::mcp::server::dispatch;
+use ironmem::config::{Config, EmbedMode, McpAccessMode};
+use ironmem::mcp::app::App;
+use ironmem::mcp::protocol::JsonRpcRequest;
+use ironmem::mcp::server::dispatch;
 use serde_json::json;
 
 fn bin() -> &'static str {
@@ -65,7 +65,7 @@ fn cli_init_mine_serve_and_hook_smoke_test() {
         writeln!(
             stdin,
             "{}",
-            json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"ironmem_status","arguments":{}}})
+            json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"status","arguments":{}}})
         )
         .unwrap();
     }
@@ -109,7 +109,7 @@ fn cli_init_mine_serve_and_hook_smoke_test() {
                     "content": [
                         {
                             "type": "text",
-                            "text": "Findings\n- High: transcript-derived review storage is missing in crates/ironrace-memory/src/hook.rs:48\n- Medium: add an end-to-end smoke assertion\nPR #7"
+                            "text": "Findings\n- High: transcript-derived review storage is missing in crates/ironmem/src/hook.rs:48\n- Medium: add an end-to-end smoke assertion\nPR #7"
                         }
                     ]
                 }
@@ -155,7 +155,7 @@ fn cli_init_mine_serve_and_hook_smoke_test() {
         "jsonrpc":"2.0",
         "id": 3,
         "method":"tools/call",
-        "params":{"name":"ironmem_diary_read","arguments":{"wing":"diary","limit":10}}
+        "params":{"name":"diary_read","arguments":{"wing":"diary","limit":10}}
     }))
     .unwrap();
     let resp = dispatch(&app, &req).unwrap();

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""LoCoMo long-term conversation memory benchmark for ironrace-memory.
+"""LoCoMo long-term conversation memory benchmark for ironmem.
 
 Tests session-level retrieval recall, matching mempalace's LoCoMo benchmark.
 
@@ -200,7 +200,7 @@ class McpClient:
             deadline = time.monotonic() + 120.0
             while time.monotonic() < deadline:
                 try:
-                    r = self.call_tool("ironmem_status", {})
+                    r = self.call_tool("status", {})
                     if not r.get("warming_up", False):
                         break
                 except Exception:
@@ -244,12 +244,12 @@ class McpClient:
 
 def run_locomo_benchmark(
     conversations: list[dict],
-    ironmem_binary: str,
+    binary: str,
     limit: int,
     n_results: int,
     ef_search: int | None,
 ) -> dict:
-    """Run LoCoMo retrieval benchmark against ironrace-memory.
+    """Run LoCoMo retrieval benchmark against ironmem.
 
     One wing per conversation; all sessions ingested before queries run.
     Each QA pair's evidence_dialog_ids are resolved to session keys and used
@@ -273,8 +273,8 @@ def run_locomo_benchmark(
         env["IRONMEM_EF_SEARCH"] = str(ef_search)
 
     client = McpClient(
-        name="ironrace-memory",
-        cmd=[ironmem_binary, "serve"],
+        name="ironmem",
+        cmd=[binary, "serve"],
         env=env,
     )
 
@@ -303,7 +303,7 @@ def run_locomo_benchmark(
             content_to_session: dict[str, str] = {}
             for sess_key, sess_text in sessions:
                 content_to_session[sess_text[:120]] = sess_key
-                client.call_tool("ironmem_add_drawer", {
+                client.call_tool("add_drawer", {
                     "content": sess_text,
                     "wing": wing,
                     "room": "session",
@@ -330,7 +330,7 @@ def run_locomo_benchmark(
                     continue
 
                 t0 = time.perf_counter()
-                payload = client.call_tool("ironmem_search", {
+                payload = client.call_tool("search", {
                     "query": question,
                     "limit": n_results,
                     "wing": wing,
@@ -371,7 +371,7 @@ def run_locomo_benchmark(
 
     sl = sorted(search_latencies)
     return {
-        "backend": "ironrace-memory",
+        "backend": "ironmem",
         "questions": len(recalls[10]),
         "recall": {k: sum(v) / max(len(v), 1) for k, v in recalls.items()},
         "per_category": {
@@ -429,7 +429,7 @@ def print_results(results: list[dict]) -> None:
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
-        description="LoCoMo benchmark: ironrace-memory session-level retrieval.",
+        description="LoCoMo benchmark: ironmem session-level retrieval.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     p.add_argument(
@@ -461,17 +461,17 @@ def main() -> int:
     total_qa = sum(len(c.get("qa", [])) for c in data)
     print(f"  {len(data)} conversations, {total_qa} QA pairs total.", flush=True)
 
-    ironmem_binary = Path(args.ironmem_binary).expanduser().resolve()
-    if not ironmem_binary.exists():
-        print(f"ironmem binary not found: {ironmem_binary}", file=sys.stderr)
-        print("Build it with: cargo build --release -p ironrace-memory --bin ironmem", file=sys.stderr)
+    binary = Path(args.binary).expanduser().resolve()
+    if not binary.exists():
+        print(f"ironmem binary not found: {binary}", file=sys.stderr)
+        print("Build it with: cargo build --release -p ironmem --bin ironmem", file=sys.stderr)
         return 1
 
     ef_label = f"  ef_search={args.ef_search}" if args.ef_search else ""
-    print(f"\nironrace-memory{ef_label}:", flush=True)
+    print(f"\nironmem{ef_label}:", flush=True)
     result = run_locomo_benchmark(
         conversations=data,
-        ironmem_binary=str(ironmem_binary),
+        binary=str(binary),
         limit=args.limit,
         n_results=args.n_results,
         ef_search=args.ef_search,

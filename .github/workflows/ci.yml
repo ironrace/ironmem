@@ -72,7 +72,7 @@ jobs:
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32  # v2
 
       - name: cargo build
-        run: cargo build -p ironrace-memory --bin ironmem
+        run: cargo build -p ironmem --bin ironmem
 
       - name: Upload binary
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
@@ -94,7 +94,7 @@ jobs:
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32  # v2
 
       - name: cargo build
-        run: cargo build -p ironrace-memory --bin ironmem
+        run: cargo build -p ironmem --bin ironmem
 
       - name: Live initialize smoke test
         run: python3 scripts/mcp_smoke_test.py --binary ./target/debug/ironmem

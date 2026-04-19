@@ -1,4 +1,4 @@
-# ironrace-memory for Claude Code
+# ironmem for Claude Code
 
 Persistent workspace memory for Claude Code using the local Rust `ironmem` binary.
 
@@ -11,4 +11,4 @@ Persistent workspace memory for Claude Code using the local Rust `ironmem` binar
 
 ## Memory protocol
 
-Before answering questions about prior work, decisions, project history, or people, check `ironmem_search` or the KG tools first. After important progress or decisions, write durable summaries back into memory.
+Before answering questions about prior work, decisions, project history, or people, check `search` or the KG tools first. After important progress or decisions, write durable summaries back into memory.

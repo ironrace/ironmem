@@ -28,7 +28,7 @@ elif [[ -x "$REPO_ROOT/target/debug/ironmem" ]]; then
 fi
 
 if [[ -z "$IRONMEM_BIN" ]]; then
-  cargo build -q --manifest-path "$REPO_ROOT/Cargo.toml" -p ironrace-memory --bin ironmem >&2
+  cargo build -q --manifest-path "$REPO_ROOT/Cargo.toml" -p ironmem --bin ironmem >&2
   IRONMEM_BIN="$REPO_ROOT/target/debug/ironmem"
 fi
 
@@ -38,7 +38,7 @@ if [[ -n "$PLUGIN_VERSION" ]]; then
   BIN_VERSION="$("$IRONMEM_BIN" --version 2>/dev/null | awk '{print $2}' || echo "")"
   if [[ -n "$BIN_VERSION" && "$BIN_VERSION" != "$PLUGIN_VERSION" ]]; then
     echo "ironmem version mismatch: binary is $BIN_VERSION, plugin expects $PLUGIN_VERSION" >&2
-    echo "Run: cargo build --release -p ironrace-memory --bin ironmem && cp target/release/ironmem ~/.ironrace/bin/ironmem" >&2
+    echo "Run: cargo build --release -p ironmem --bin ironmem && cp target/release/ironmem ~/.ironrace/bin/ironmem" >&2
     exit 1
   fi
 fi

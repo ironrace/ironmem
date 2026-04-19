@@ -4,11 +4,11 @@
 //! without downloading the ONNX model. They cover the tool combinations that a
 //! real AI harness would exercise in practice.
 
+use ironmem::config::McpAccessMode;
+use ironmem::mcp::app::App;
+use ironmem::mcp::protocol::JsonRpcRequest;
+use ironmem::mcp::server::dispatch;
 use ironrace_embed::embedder::EMBED_DIM;
-use ironrace_memory::config::McpAccessMode;
-use ironrace_memory::mcp::app::App;
-use ironrace_memory::mcp::protocol::JsonRpcRequest;
-use ironrace_memory::mcp::server::dispatch;
 use serde_json::{json, Value};
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
@@ -41,7 +41,7 @@ fn call(app: &App, tool: &str, args: Value) -> Value {
 }
 
 /// Call a tool and return the raw RPC response (may contain error).
-fn call_raw(app: &App, tool: &str, args: Value) -> ironrace_memory::mcp::protocol::JsonRpcResponse {
+fn call_raw(app: &App, tool: &str, args: Value) -> ironmem::mcp::protocol::JsonRpcResponse {
     let req = request("tools/call", json!({ "name": tool, "arguments": args }));
     dispatch(app, &req).expect("dispatch must return a response")
 }
@@ -50,7 +50,7 @@ fn call_raw(app: &App, tool: &str, args: Value) -> ironrace_memory::mcp::protoco
 ///
 /// The MCP server wraps all tool errors as `JsonRpcResponse::success` with
 /// `isError: true` in the result body (not as a JSON-RPC error object).
-fn is_tool_error(resp: &ironrace_memory::mcp::protocol::JsonRpcResponse) -> bool {
+fn is_tool_error(resp: &ironmem::mcp::protocol::JsonRpcResponse) -> bool {
     resp.error.is_some()
         || resp
             .result
@@ -68,7 +68,7 @@ fn add_search_delete_round_trip() {
     // 1. Add a drawer
     let added = call(
         &app,
-        "ironmem_add_drawer",
+        "add_drawer",
         json!({
             "content": "The Rust borrow checker ensures memory safety at compile time",
             "wing": "projects",
@@ -80,22 +80,22 @@ fn add_search_delete_round_trip() {
     assert!(!drawer_id.is_empty());
 
     // 2. Status shows the drawer exists
-    let status = call(&app, "ironmem_status", json!({}));
+    let status = call(&app, "status", json!({}));
     assert!(status["total_drawers"].as_u64().unwrap_or(0) >= 1);
 
     // 3. List wings shows the new wing
-    let wings = call(&app, "ironmem_list_wings", json!({}));
+    let wings = call(&app, "list_wings", json!({}));
     assert!(wings["wings"]["projects"].is_number());
 
     // 4. List rooms for the wing
-    let rooms = call(&app, "ironmem_list_rooms", json!({ "wing": "projects" }));
+    let rooms = call(&app, "list_rooms", json!({ "wing": "projects" }));
     assert!(rooms["rooms"]["notes"].is_number());
 
     // 5. Search returns results (noop embedder returns zero vectors, so all
     //    candidates may have the same score — what matters is the count > 0)
     let search = call(
         &app,
-        "ironmem_search",
+        "search",
         json!({ "query": "Rust memory safety", "limit": 5 }),
     );
     let results = search["results"].as_array().unwrap();
@@ -105,11 +105,11 @@ fn add_search_delete_round_trip() {
     );
 
     // 6. Delete the drawer
-    let deleted = call(&app, "ironmem_delete_drawer", json!({ "id": &drawer_id }));
+    let deleted = call(&app, "delete_drawer", json!({ "id": &drawer_id }));
     assert_eq!(deleted["success"], true);
 
     // 7. Status reflects deletion
-    let status_after = call(&app, "ironmem_status", json!({}));
+    let status_after = call(&app, "status", json!({}));
     assert!(
         status_after["total_drawers"].as_u64().unwrap_or(0)
             < status["total_drawers"].as_u64().unwrap_or(1) + 1
@@ -170,21 +170,21 @@ fn taxonomy_reflects_wing_room_hierarchy() {
     // Add drawers in different wings/rooms
     call(
         &app,
-        "ironmem_add_drawer",
+        "add_drawer",
         json!({ "content": "Alpha content in wing A room X extended text", "wing": "alpha", "room": "room-x" }),
     );
     call(
         &app,
-        "ironmem_add_drawer",
+        "add_drawer",
         json!({ "content": "Beta content in wing A room Y extended text", "wing": "alpha", "room": "room-y" }),
     );
     call(
         &app,
-        "ironmem_add_drawer",
+        "add_drawer",
         json!({ "content": "Gamma content in wing B general extended text", "wing": "beta", "room": "general" }),
     );
 
-    let taxonomy = call(&app, "ironmem_get_taxonomy", json!({}));
+    let taxonomy = call(&app, "get_taxonomy", json!({}));
     let alpha_rooms = taxonomy_rooms(&taxonomy, "alpha");
     let beta_rooms = taxonomy_rooms(&taxonomy, "beta");
 
@@ -211,7 +211,7 @@ fn kg_triple_add_query_invalidate_timeline() {
     // Add a triple
     let added = call(
         &app,
-        "ironmem_kg_add",
+        "kg_add",
         json!({
             "subject": "Alice",
             "subject_type": "person",
@@ -227,7 +227,7 @@ fn kg_triple_add_query_invalidate_timeline() {
     // Query shows the triple
     let query = call(
         &app,
-        "ironmem_kg_query",
+        "kg_query",
         json!({ "entity": "Alice", "entity_type": "person" }),
     );
     let triples = query["triples"].as_array().unwrap();
@@ -237,7 +237,7 @@ fn kg_triple_add_query_invalidate_timeline() {
     // Timeline also shows the triple
     let timeline = call(
         &app,
-        "ironmem_kg_timeline",
+        "kg_timeline",
         json!({ "entity": "Alice", "entity_type": "person" }),
     );
     assert!(!timeline["timeline"].as_array().unwrap().is_empty());
@@ -245,13 +245,13 @@ fn kg_triple_add_query_invalidate_timeline() {
     // Invalidate the triple
     let invalidated = call(
         &app,
-        "ironmem_kg_invalidate",
+        "kg_invalidate",
         json!({ "triple_id": &triple_id, "valid_to": "2026-01-01" }),
     );
     assert_eq!(invalidated["success"], true);
 
     // KG stats still show entities/triples
-    let stats = call(&app, "ironmem_kg_stats", json!({}));
+    let stats = call(&app, "kg_stats", json!({}));
     assert!(stats["entity_count"].as_u64().unwrap_or(0) > 0);
 }
 
@@ -265,17 +265,13 @@ fn diary_write_read_round_trip() {
 
     let written = call(
         &app,
-        "ironmem_diary_write",
+        "diary_write",
         json!({ "content": content, "wing": "diary" }),
     );
     assert_eq!(written["success"], true);
     let entry_id = written["id"].as_str().unwrap().to_string();
 
-    let read = call(
-        &app,
-        "ironmem_diary_read",
-        json!({ "wing": "diary", "limit": 10 }),
-    );
+    let read = call(&app, "diary_read", json!({ "wing": "diary", "limit": 10 }));
     let entries = read["entries"].as_array().unwrap();
     assert!(
         !entries.is_empty(),
@@ -300,12 +296,12 @@ fn diary_write_same_content_creates_distinct_entries() {
 
     let first = call(
         &app,
-        "ironmem_diary_write",
+        "diary_write",
         json!({ "content": content, "wing": "diary" }),
     );
     let second = call(
         &app,
-        "ironmem_diary_write",
+        "diary_write",
         json!({ "content": content, "wing": "diary" }),
     );
 
@@ -316,11 +312,7 @@ fn diary_write_same_content_creates_distinct_entries() {
         "timestamped diary writes must not overwrite identical content"
     );
 
-    let read = call(
-        &app,
-        "ironmem_diary_read",
-        json!({ "wing": "diary", "limit": 10 }),
-    );
+    let read = call(&app, "diary_read", json!({ "wing": "diary", "limit": 10 }));
     let entries = read["entries"].as_array().unwrap();
     let ids: Vec<&str> = entries.iter().filter_map(|e| e["id"].as_str()).collect();
     assert!(ids.contains(&first_id));
@@ -335,16 +327,13 @@ fn read_only_mode_blocks_write_tools() {
 
     for (tool, args) in [
         (
-            "ironmem_add_drawer",
+            "add_drawer",
             json!({ "content": "test content here", "wing": "wo" }),
         ),
-        ("ironmem_delete_drawer", json!({ "id": "a".repeat(32) })),
+        ("delete_drawer", json!({ "id": "a".repeat(32) })),
+        ("diary_write", json!({ "content": "my note content" })),
         (
-            "ironmem_diary_write",
-            json!({ "content": "my note content" }),
-        ),
-        (
-            "ironmem_kg_add",
+            "kg_add",
             json!({ "subject": "a1", "predicate": "b1", "object": "c1" }),
         ),
     ] {
@@ -390,7 +379,7 @@ fn restricted_mode_redacts_search_content() {
 
     let search = call(
         &restricted,
-        "ironmem_search",
+        "search",
         json!({ "query": "roadmap", "limit": 5 }),
     );
     let results = search["results"].as_array().unwrap();
@@ -400,7 +389,7 @@ fn restricted_mode_redacts_search_content() {
 
     let diary = call(
         &restricted,
-        "ironmem_diary_read",
+        "diary_read",
         json!({ "wing": "diary", "limit": 5 }),
     );
     let entries = diary["entries"].as_array().unwrap();
@@ -418,7 +407,7 @@ fn graph_traverse_and_tunnels_on_empty_store() {
     // Empty store — traverse a nonexistent room should return empty or error gracefully
     let resp = call_raw(
         &app,
-        "ironmem_traverse",
+        "traverse",
         json!({ "room": "nonexistent", "max_depth": 2 }),
     );
     // Should not panic; either an empty result or a tool error is acceptable
@@ -426,11 +415,11 @@ fn graph_traverse_and_tunnels_on_empty_store() {
     let _ = resp;
 
     // find_tunnels on empty store returns empty tunnels list
-    let tunnels = call(&app, "ironmem_find_tunnels", json!({}));
+    let tunnels = call(&app, "find_tunnels", json!({}));
     assert!(tunnels["tunnels"].as_array().unwrap().is_empty());
 
     // graph_stats on empty store returns zero counts
-    let stats = call(&app, "ironmem_graph_stats", json!({}));
+    let stats = call(&app, "graph_stats", json!({}));
     assert_eq!(stats["total_rooms"].as_u64().unwrap_or(0), 0);
     assert_eq!(stats["total_wings"].as_u64().unwrap_or(0), 0);
 }
@@ -442,36 +431,36 @@ fn graph_traverse_with_data() {
     // Add drawers in a shared room across wings (creates a tunnel)
     call(
         &app,
-        "ironmem_add_drawer",
+        "add_drawer",
         json!({ "content": "Wing A general content one", "wing": "wing-a", "room": "shared" }),
     );
     call(
         &app,
-        "ironmem_add_drawer",
+        "add_drawer",
         json!({ "content": "Wing B general content two", "wing": "wing-b", "room": "shared" }),
     );
     call(
         &app,
-        "ironmem_add_drawer",
+        "add_drawer",
         json!({ "content": "Wing A local content", "wing": "wing-a", "room": "local" }),
     );
 
     // Traverse from the shared room
     let traversal = call(
         &app,
-        "ironmem_traverse",
+        "traverse",
         json!({ "room": "shared", "max_depth": 3 }),
     );
     // The result should be a valid JSON object with a rooms/edges structure
     assert!(traversal.is_object(), "traverse must return an object");
 
     // Graph stats should show rooms and wings
-    let stats = call(&app, "ironmem_graph_stats", json!({}));
+    let stats = call(&app, "graph_stats", json!({}));
     assert!(stats["total_rooms"].as_u64().unwrap_or(0) >= 2);
     assert!(stats["total_wings"].as_u64().unwrap_or(0) >= 2);
 
     // find_tunnels: "shared" is in two wings so should appear
-    let tunnels = call(&app, "ironmem_find_tunnels", json!({}));
+    let tunnels = call(&app, "find_tunnels", json!({}));
     let tunnel_rooms: Vec<&str> = tunnels["tunnels"]
         .as_array()
         .unwrap()
@@ -494,7 +483,7 @@ fn search_limit_is_capped_at_max() {
     for i in 0..110 {
         call(
             &app,
-            "ironmem_add_drawer",
+            "add_drawer",
             json!({
                 "content": format!("Drawer content number {i} about memory systems and Rust"),
                 "wing": "bulk",
@@ -506,7 +495,7 @@ fn search_limit_is_capped_at_max() {
     // Request 200 results — should be capped at 100
     let search = call(
         &app,
-        "ironmem_search",
+        "search",
         json!({ "query": "memory systems", "limit": 200 }),
     );
     let results = search["results"].as_array().unwrap();
@@ -525,7 +514,7 @@ fn wing_name_with_path_traversal_is_rejected() {
 
     let resp = call_raw(
         &app,
-        "ironmem_add_drawer",
+        "add_drawer",
         json!({ "content": "some content here", "wing": "../etc/passwd" }),
     );
     assert!(
@@ -540,7 +529,7 @@ fn empty_content_is_rejected() {
 
     let resp = call_raw(
         &app,
-        "ironmem_add_drawer",
+        "add_drawer",
         json!({ "content": "   ", "wing": "projects" }),
     );
     assert!(
@@ -554,7 +543,7 @@ fn delete_with_invalid_id_format_is_rejected() {
     let app = App::open_for_test().unwrap();
 
     for bad_id in &["not-a-hex", "tooshort", &"z".repeat(32)] {
-        let resp = call_raw(&app, "ironmem_delete_drawer", json!({ "id": bad_id }));
+        let resp = call_raw(&app, "delete_drawer", json!({ "id": bad_id }));
         assert!(
             is_tool_error(&resp),
             "invalid id '{bad_id}' must return a tool error"
@@ -568,7 +557,7 @@ fn delete_with_invalid_id_format_is_rejected() {
 fn unknown_tool_returns_structured_error() {
     let app = App::open_for_test().unwrap();
 
-    let resp = call_raw(&app, "ironmem_does_not_exist", json!({}));
+    let resp = call_raw(&app, "does_not_exist", json!({}));
     assert!(
         is_tool_error(&resp),
         "unknown tool must return a tool error"
@@ -581,7 +570,7 @@ fn unknown_tool_returns_structured_error() {
 fn kg_stats_on_empty_store_returns_zeros() {
     let app = App::open_for_test().unwrap();
 
-    let stats = call(&app, "ironmem_kg_stats", json!({}));
+    let stats = call(&app, "kg_stats", json!({}));
     assert_eq!(stats["entity_count"].as_u64().unwrap_or(99), 0);
     assert_eq!(stats["triple_count"].as_u64().unwrap_or(99), 0);
 }
@@ -592,11 +581,7 @@ fn kg_stats_on_empty_store_returns_zeros() {
 fn kg_query_unknown_entity_returns_error() {
     let app = App::open_for_test().unwrap();
 
-    let resp = call_raw(
-        &app,
-        "ironmem_kg_query",
-        json!({ "entity": "no-such-entity" }),
-    );
+    let resp = call_raw(&app, "kg_query", json!({ "entity": "no-such-entity" }));
     assert!(
         is_tool_error(&resp),
         "querying an unknown entity must return a tool error"
@@ -613,13 +598,13 @@ fn diary_read_limit_is_capped() {
     for i in 0..5 {
         call(
             &app,
-            "ironmem_diary_write",
+            "diary_write",
             json!({ "content": format!("Session summary entry number {i} with details") }),
         );
     }
 
     // Request more than available — should return what exists, capped at MAX_READ_LIMIT
-    let read = call(&app, "ironmem_diary_read", json!({ "limit": 200 }));
+    let read = call(&app, "diary_read", json!({ "limit": 200 }));
     let count = read["entries"].as_array().unwrap().len();
     // 200 was requested; MAX_READ_LIMIT is 100, but we only wrote 5 entries.
     // Note: same content hash → same ID → inserts may deduplicate.
@@ -635,7 +620,7 @@ fn kg_add_rejects_invalid_date_format() {
 
     let resp = call_raw(
         &app,
-        "ironmem_kg_add",
+        "kg_add",
         json!({
             "subject": "Alice",
             "predicate": "works-at",
