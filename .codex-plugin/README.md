@@ -1,4 +1,4 @@
-# ironrace-memory for Codex
+# ironmem for Codex
 
 Persistent workspace memory for Codex using the local Rust `ironmem` binary.
 

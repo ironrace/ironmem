@@ -1,4 +1,4 @@
-# ironrace-memory for Claude Code
+# ironmem for Claude Code
 
 Persistent workspace memory for Claude Code using the local Rust `ironmem` binary.
 

@@ -4,7 +4,7 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT_DIR"
 
-CARGO_VERSION="$(python3 - crates/ironrace-memory/Cargo.toml <<'PY'
+CARGO_VERSION="$(python3 - crates/ironmem/Cargo.toml <<'PY'
 import sys
 try:
     import tomllib

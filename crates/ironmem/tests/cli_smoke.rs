@@ -2,10 +2,10 @@ use std::io::Write;
 use std::path::Path;
 use std::process::{Command, Stdio};
 
-use ironrace_memory::config::{Config, EmbedMode, McpAccessMode};
-use ironrace_memory::mcp::app::App;
-use ironrace_memory::mcp::protocol::JsonRpcRequest;
-use ironrace_memory::mcp::server::dispatch;
+use ironmem::config::{Config, EmbedMode, McpAccessMode};
+use ironmem::mcp::app::App;
+use ironmem::mcp::protocol::JsonRpcRequest;
+use ironmem::mcp::server::dispatch;
 use serde_json::json;
 
 fn bin() -> &'static str {
@@ -109,7 +109,7 @@ fn cli_init_mine_serve_and_hook_smoke_test() {
                     "content": [
                         {
                             "type": "text",
-                            "text": "Findings\n- High: transcript-derived review storage is missing in crates/ironrace-memory/src/hook.rs:48\n- Medium: add an end-to-end smoke assertion\nPR #7"
+                            "text": "Findings\n- High: transcript-derived review storage is missing in crates/ironmem/src/hook.rs:48\n- Medium: add an end-to-end smoke assertion\nPR #7"
                         }
                     ]
                 }

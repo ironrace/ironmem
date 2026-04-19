@@ -1,14 +1,14 @@
-# ironrace-memory
+# ironmem
 
-[![CI](https://github.com/ironrace/ironrace-memory/actions/workflows/ci.yml/badge.svg)](https://github.com/ironrace/ironrace-memory/actions/workflows/ci.yml)
-[![crates.io](https://img.shields.io/crates/v/ironrace-memory.svg)](https://crates.io/crates/ironrace-memory)
+[![CI](https://github.com/ironrace/ironmem/actions/workflows/ci.yml/badge.svg)](https://github.com/ironrace/ironmem/actions/workflows/ci.yml)
+[![crates.io](https://img.shields.io/crates/v/ironmem.svg)](https://crates.io/crates/ironmem)
 [![License: Apache-2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
 
-`ironrace-memory` is a Rust workspace for a local AI memory backend:
+`ironmem` is a Rust workspace for a local AI memory backend:
 
 - `ironrace-core`: shared HNSW vector index
 - `ironrace-embed`: ONNX sentence embeddings in pure Rust
-- `ironrace-memory`: MCP server exposing semantic search plus a knowledge graph
+- `ironmem`: MCP server exposing semantic search plus a knowledge graph
 
 Codex and Claude Code plugin packaging is included. See [docs/CODEX.md](docs/CODEX.md) for setup instructions.
 
@@ -40,9 +40,9 @@ The hooks run:
 Fastest path from source today:
 
 ```bash
-git clone https://github.com/ironrace/ironrace-memory.git
-cd ironrace-memory
-cargo build --release -p ironrace-memory --bin ironmem
+git clone https://github.com/ironrace/ironmem.git
+cd ironmem
+cargo build --release -p ironmem --bin ironmem
 ./target/release/ironmem setup
 ```
 
@@ -61,13 +61,13 @@ python3 scripts/mcp_smoke_test.py --binary ./target/release/ironmem
 Add it to Codex:
 
 ```toml
-[mcp_servers.ironrace_memory]
+[mcp_servers.ironmem]
 command = "/absolute/path/to/ironmem"
 args = ["serve"]
 
-[mcp_servers.ironrace_memory.env]
+[mcp_servers.ironmem.env]
 IRONMEM_MCP_MODE = "trusted"
-IRONMEM_DB_PATH = "~/.ironrace-memory/memory.sqlite3"
+IRONMEM_DB_PATH = "~/.ironmem/memory.sqlite3"
 ```
 
 Tagged releases upload prebuilt macOS and Linux binaries automatically. Until the first tagged release is published, building from source is the supported install path.
@@ -86,7 +86,7 @@ Tagged releases upload prebuilt macOS and Linux binaries automatically. Until th
 
 ## Shared Memory Across Harnesses
 
-Codex and Claude Code read from and write to the **same database by default** (`~/.ironrace-memory/memory.sqlite3`). Memory written in a Claude session is immediately visible in Codex, and vice versa — there is one unified store.
+Codex and Claude Code read from and write to the **same database by default** (`~/.ironmem/memory.sqlite3`). Memory written in a Claude session is immediately visible in Codex, and vice versa — there is one unified store.
 
 The DB is updated automatically as you work:
 
@@ -100,8 +100,8 @@ To give a harness its own isolated store, set `IRONMEM_DB_PATH` in its plugin co
 
 ```toml
 # ~/.codex/config.toml — Codex-only store
-[mcp_servers.ironrace_memory.env]
-IRONMEM_DB_PATH = "~/.ironrace-memory/codex.sqlite3"
+[mcp_servers.ironmem.env]
+IRONMEM_DB_PATH = "~/.ironmem/codex.sqlite3"
 ```
 
 ## Startup Behavior
@@ -127,7 +127,7 @@ python3 scripts/benchmark_vs_mempalace.py \
   --runs 2 \
   --output-json /tmp/ironmem-vs-mempalace.json
 
-# ironrace-memory only (no mempalace required)
+# ironmem only (no mempalace required)
 python3 scripts/benchmark_vs_mempalace.py \
   --ironmem-only \
   --documents 100 \
@@ -162,4 +162,4 @@ Key benchmark flags:
 
 ## Versioning
 
-This project uses [Semantic Versioning](https://semver.org/). The canonical version is in `crates/ironrace-memory/Cargo.toml`. Plugin JSON files (`.codex-plugin/plugin.json`, `.claude-plugin/plugin.json`) must match this version — enforced by CI. See [CHANGELOG.md](CHANGELOG.md) for release history.
+This project uses [Semantic Versioning](https://semver.org/). The canonical version is in `crates/ironmem/Cargo.toml`. Plugin JSON files (`.codex-plugin/plugin.json`, `.claude-plugin/plugin.json`) must match this version — enforced by CI. See [CHANGELOG.md](CHANGELOG.md) for release history.

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""ConvoMem benchmark for ironrace-memory.
+"""ConvoMem benchmark for ironmem.
 
 Tests retrieval recall across 6 conversational memory categories.
 Matches MemPal's published ConvoMem harness: 250 items (50 per category),
@@ -404,7 +404,7 @@ def run_convomem_benchmark(
     skip_abstention: bool,
     ef_search: int | None,
 ) -> dict:
-    """Run ConvoMem retrieval recall benchmark against ironrace-memory.
+    """Run ConvoMem retrieval recall benchmark against ironmem.
 
     Each item gets its own wing for isolation. All conversation messages are
     ingested; retrieval is scored by whether any evidence message appears in
@@ -423,7 +423,7 @@ def run_convomem_benchmark(
         env["IRONMEM_EF_SEARCH"] = str(ef_search)
 
     client = McpClient(
-        name="ironrace-memory",
+        name="ironmem",
         cmd=[ironmem_binary, "serve"],
         env=env,
     )
@@ -507,7 +507,7 @@ def run_convomem_benchmark(
     avg_recall = total_hits / max(total_scored, 1)
 
     return {
-        "backend": "ironrace-memory",
+        "backend": "ironmem",
         "items_scored": total_scored,
         "avg_recall": avg_recall,
         "per_category": {c: per_cat_hits[c] / per_cat_total[c] for c in per_cat_total if per_cat_total[c] > 0},
@@ -570,7 +570,7 @@ def print_results(results: list[dict]) -> None:
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
-        description="ConvoMem retrieval recall benchmark for ironrace-memory.",
+        description="ConvoMem retrieval recall benchmark for ironmem.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     p.add_argument(
@@ -640,11 +640,11 @@ def main() -> int:
     ironmem_binary = Path(args.ironmem_binary).expanduser().resolve()
     if not ironmem_binary.exists():
         print(f"ironmem binary not found: {ironmem_binary}", file=sys.stderr)
-        print("Build it with: cargo build --release -p ironrace-memory --bin ironmem", file=sys.stderr)
+        print("Build it with: cargo build --release -p ironmem --bin ironmem", file=sys.stderr)
         return 1
 
     ef_label = f"  ef_search={args.ef_search}" if args.ef_search else ""
-    print(f"\nironrace-memory{ef_label}:", flush=True)
+    print(f"\nironmem{ef_label}:", flush=True)
     result = run_convomem_benchmark(
         items=items,
         ironmem_binary=str(ironmem_binary),

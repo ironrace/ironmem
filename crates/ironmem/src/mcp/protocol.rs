@@ -59,7 +59,7 @@ pub fn capabilities_response() -> serde_json::Value {
             "tools": {}
         },
         "serverInfo": {
-            "name": "ironrace-memory",
+            "name": "ironmem",
             "version": env!("CARGO_PKG_VERSION")
         }
     })

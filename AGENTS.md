@@ -2,19 +2,19 @@
 
 ## Purpose
 
-`ironrace-memory` is a Rust workspace for a local AI memory backend:
+`ironmem` is a Rust workspace for a local AI memory backend:
 
 - `ironrace-core` — shared HNSW vector index
 - `ironrace-embed` — ONNX sentence embeddings in pure Rust
-- `ironrace-memory` — MCP server exposing semantic search plus a knowledge graph
+- `ironmem` — MCP server exposing semantic search plus a knowledge graph
 
 ## Shared Memory Protocol
 
-When the `ironrace-memory` MCP server is available in the current harness, use it proactively so Codex and Claude Code share the same memory.
+When the `ironmem` MCP server is available in the current harness, use it proactively so Codex and Claude Code share the same memory.
 
 Default behavior:
 
-- Codex and Claude Code read from and write to the same SQLite store by default: `~/.ironrace-memory/memory.sqlite3`
+- Codex and Claude Code read from and write to the same SQLite store by default: `~/.ironmem/memory.sqlite3`
 - Memory written in one harness should be treated as available to the other
 
 Use the memory tools this way:

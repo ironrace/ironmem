@@ -4,11 +4,11 @@
 //! without downloading the ONNX model. They cover the tool combinations that a
 //! real AI harness would exercise in practice.
 
+use ironmem::config::McpAccessMode;
+use ironmem::mcp::app::App;
+use ironmem::mcp::protocol::JsonRpcRequest;
+use ironmem::mcp::server::dispatch;
 use ironrace_embed::embedder::EMBED_DIM;
-use ironrace_memory::config::McpAccessMode;
-use ironrace_memory::mcp::app::App;
-use ironrace_memory::mcp::protocol::JsonRpcRequest;
-use ironrace_memory::mcp::server::dispatch;
 use serde_json::{json, Value};
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
@@ -41,7 +41,7 @@ fn call(app: &App, tool: &str, args: Value) -> Value {
 }
 
 /// Call a tool and return the raw RPC response (may contain error).
-fn call_raw(app: &App, tool: &str, args: Value) -> ironrace_memory::mcp::protocol::JsonRpcResponse {
+fn call_raw(app: &App, tool: &str, args: Value) -> ironmem::mcp::protocol::JsonRpcResponse {
     let req = request("tools/call", json!({ "name": tool, "arguments": args }));
     dispatch(app, &req).expect("dispatch must return a response")
 }
@@ -50,7 +50,7 @@ fn call_raw(app: &App, tool: &str, args: Value) -> ironrace_memory::mcp::protoco
 ///
 /// The MCP server wraps all tool errors as `JsonRpcResponse::success` with
 /// `isError: true` in the result body (not as a JSON-RPC error object).
-fn is_tool_error(resp: &ironrace_memory::mcp::protocol::JsonRpcResponse) -> bool {
+fn is_tool_error(resp: &ironmem::mcp::protocol::JsonRpcResponse) -> bool {
     resp.error.is_some()
         || resp
             .result

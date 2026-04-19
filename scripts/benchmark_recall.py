@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Recall quality benchmark for ironrace-memory (with optional mempalace comparison).
+"""Recall quality benchmark for ironmem (with optional mempalace comparison).
 
 Measures whether the right document is retrieved — not just how fast search is.
 Uses planted needles: unique, semantically identifiable phrases injected into a
@@ -454,7 +454,7 @@ def run_ironrace(
         else:
             # Start MCP server, ingest, then query
             client = McpClient(
-                name="ironrace-memory",
+                name="ironmem",
                 cmd=[ironmem_binary, "serve"],
                 env=env,
             )
@@ -465,7 +465,7 @@ def run_ironrace(
             shutil.rmtree(tmp, ignore_errors=True)
             return ScaleResult(
                 scale=scale,
-                backend="ironrace-memory",
+                backend="ironmem",
                 ingestion_method="mcp",
                 recall_at_1=r1,
                 recall_at_5=r5,
@@ -480,7 +480,7 @@ def run_ironrace(
 
         # After mine, start server for queries
         client = McpClient(
-            name="ironrace-memory",
+            name="ironmem",
             cmd=[ironmem_binary, "serve"],
             env=env,
         )
@@ -493,7 +493,7 @@ def run_ironrace(
 
     return ScaleResult(
         scale=scale,
-        backend="ironrace-memory",
+        backend="ironmem",
         ingestion_method=ingestion_method,
         recall_at_1=r1,
         recall_at_5=r5,
@@ -652,7 +652,7 @@ _NEEDLES_PER_SCALE = {
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
-        description="Recall quality benchmark for ironrace-memory.",
+        description="Recall quality benchmark for ironmem.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""\
 Examples:
@@ -728,7 +728,7 @@ def main() -> int:
     ironmem_binary = Path(args.ironmem_binary).expanduser().resolve()
     if not ironmem_binary.exists():
         print(f"ironmem binary not found: {ironmem_binary}", file=sys.stderr)
-        print("Build it with: cargo build --release -p ironrace-memory --bin ironmem", file=sys.stderr)
+        print("Build it with: cargo build --release -p ironmem --bin ironmem", file=sys.stderr)
         return 1
 
     ef_values: list[int | None] = [int(x) for x in args.ef_search] if args.ef_search else [None]
@@ -752,7 +752,7 @@ def main() -> int:
             )
             elapsed = time.perf_counter() - t0
             results.append(r)
-            print(f"  ironrace-memory done in {elapsed:.1f}s  R@5={_fmt_pct(r.recall_at_5)}  p50={_fmt_ms(r.search_p50_ms)}", flush=True)
+            print(f"  ironmem done in {elapsed:.1f}s  R@5={_fmt_pct(r.recall_at_5)}  p50={_fmt_ms(r.search_p50_ms)}", flush=True)
 
         if args.compare_mempalace and scale <= 10_000:
             t0 = time.perf_counter()

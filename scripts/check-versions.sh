@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # check-versions.sh — verify that all plugin.json version fields match
-# the canonical version in crates/ironrace-memory/Cargo.toml.
+# the canonical version in crates/ironmem/Cargo.toml.
 #
 # Usage:
 #   scripts/check-versions.sh          # exits 0 if all match, 1 on mismatch
@@ -13,7 +13,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 
-CARGO_TOML="${REPO_ROOT}/crates/ironrace-memory/Cargo.toml"
+CARGO_TOML="${REPO_ROOT}/crates/ironmem/Cargo.toml"
 CODEX_PLUGIN="${REPO_ROOT}/.codex-plugin/plugin.json"
 CLAUDE_PLUGIN="${REPO_ROOT}/.claude-plugin/plugin.json"
 

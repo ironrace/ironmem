@@ -2,7 +2,7 @@
 members = [
     "crates/ironrace-core",
     "crates/ironrace-embed",
-    "crates/ironrace-memory",
+    "crates/ironmem",
 ]
 resolver = "2"
 

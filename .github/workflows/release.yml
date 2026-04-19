@@ -33,7 +33,7 @@ jobs:
         run: bash scripts/check_versions.sh
 
       - name: Build release binary
-        run: cargo build --release -p ironrace-memory --bin ironmem
+        run: cargo build --release -p ironmem --bin ironmem
 
       - name: Package archive
         shell: bash
@@ -100,7 +100,7 @@ jobs:
       - name: Wait for crates.io to index ironrace-embed
         run: sleep 90
 
-      - name: Publish ironrace-memory
-        run: cargo publish -p ironrace-memory
+      - name: Publish ironmem
+        run: cargo publish -p ironmem
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}

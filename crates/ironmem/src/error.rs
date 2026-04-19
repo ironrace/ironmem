@@ -1,6 +1,6 @@
 //! Shared error types used across CLI, MCP, and storage boundaries.
 
-/// All error types for the `ironrace-memory` crate.
+/// All error types for the `ironmem` crate.
 #[derive(Debug, thiserror::Error)]
 pub enum MemoryError {
     #[error("Database error: {0}")]

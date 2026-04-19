@@ -1,4 +1,4 @@
-//! `ironrace-memory` is the workspace's main public crate: a local-first AI
+//! `ironmem` is the workspace's main public crate: a local-first AI
 //! memory backend with an MCP server, SQLite storage, semantic search, and
 //! knowledge-graph utilities.
 

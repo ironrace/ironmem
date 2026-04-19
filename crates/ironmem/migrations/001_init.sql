@@ -1,4 +1,4 @@
--- ironrace-memory schema v1
+-- ironmem schema v1
 
 CREATE TABLE IF NOT EXISTS drawers (
     id          TEXT PRIMARY KEY,

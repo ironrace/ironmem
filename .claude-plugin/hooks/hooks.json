@@ -1,5 +1,5 @@
 {
-  "description": "ironrace-memory bootstrap and incremental mining hooks",
+  "description": "ironmem bootstrap and incremental mining hooks",
   "hooks": {
     "SessionStart": [
       {

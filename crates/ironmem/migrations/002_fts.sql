@@ -1,4 +1,4 @@
--- ironrace-memory schema v2: FTS5 full-text search index for hybrid BM25+vector retrieval.
+-- ironmem schema v2: FTS5 full-text search index for hybrid BM25+vector retrieval.
 --
 -- This migration is guarded by schema_version in schema.rs and runs exactly once.
 -- The porter tokenizer applies stemming so "running" matches "run", "searched" matches "search".

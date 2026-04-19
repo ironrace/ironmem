@@ -3,9 +3,9 @@
 //! These tests call `dispatch` directly with an in-memory App (noop embedder,
 //! no ONNX model required) and assert on the JSON-RPC response shape.
 
-use ironrace_memory::mcp::app::App;
-use ironrace_memory::mcp::protocol::JsonRpcRequest;
-use ironrace_memory::mcp::server::dispatch;
+use ironmem::mcp::app::App;
+use ironmem::mcp::protocol::JsonRpcRequest;
+use ironmem::mcp::server::dispatch;
 use serde_json::json;
 
 fn request(method: &str, params: serde_json::Value) -> JsonRpcRequest {
@@ -39,7 +39,7 @@ fn initialize_returns_capabilities() {
     let result = resp.result.unwrap();
     assert_eq!(result["protocolVersion"], "2024-11-05");
     assert!(result["capabilities"]["tools"].is_object());
-    assert_eq!(result["serverInfo"]["name"], "ironrace-memory");
+    assert_eq!(result["serverInfo"]["name"], "ironmem");
 }
 
 #[test]
@@ -72,7 +72,7 @@ fn tools_list_contains_required_tools() {
 
 #[test]
 fn tools_list_read_only_mode_excludes_write_tools() {
-    use ironrace_memory::config::McpAccessMode;
+    use ironmem::config::McpAccessMode;
 
     let app = App::open_for_test_with_mode(McpAccessMode::ReadOnly).unwrap();
     let req = request("tools/list", json!({}));

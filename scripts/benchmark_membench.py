@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""MemBench (ACL 2025) benchmark for ironrace-memory.
+"""MemBench (ACL 2025) benchmark for ironmem.
 
 Tests memory retrieval across factual and reflective scenarios, from both
 participation (first-person) and observation (third-person) perspectives.
@@ -348,7 +348,7 @@ def run_membench_benchmark(
     top_k: int,
     ef_search: int | None,
 ) -> dict:
-    """Run MemBench retrieval benchmark against ironrace-memory.
+    """Run MemBench retrieval benchmark against ironmem.
 
     Each item's turns are ingested one drawer per turn into its own wing.
     A hit is scored when any retrieved turn matches the MemBench
@@ -367,7 +367,7 @@ def run_membench_benchmark(
         env["IRONMEM_EF_SEARCH"] = str(ef_search)
 
     client = McpClient(
-        name="ironrace-memory",
+        name="ironmem",
         cmd=[ironmem_binary, "serve"],
         env=env,
     )
@@ -451,7 +451,7 @@ def run_membench_benchmark(
 
     sl = sorted(search_latencies)
     return {
-        "backend": "ironrace-memory",
+        "backend": "ironmem",
         "items_scored": len(hits),
         f"recall_at_{top_k}": sum(hits) / max(len(hits), 1),
         "per_scenario": {
@@ -507,7 +507,7 @@ def print_results(results: list[dict], top_k: int) -> None:
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
-        description="MemBench (ACL 2025) retrieval benchmark for ironrace-memory.",
+        description="MemBench (ACL 2025) retrieval benchmark for ironmem.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""\
 Download the dataset once:
@@ -551,11 +551,11 @@ def main() -> int:
     ironmem_binary = Path(args.ironmem_binary).expanduser().resolve()
     if not ironmem_binary.exists():
         print(f"ironmem binary not found: {ironmem_binary}", file=sys.stderr)
-        print("Build it with: cargo build --release -p ironrace-memory --bin ironmem", file=sys.stderr)
+        print("Build it with: cargo build --release -p ironmem --bin ironmem", file=sys.stderr)
         return 1
 
     ef_label = f"  ef_search={args.ef_search}" if args.ef_search else ""
-    print(f"\nironrace-memory{ef_label}:", flush=True)
+    print(f"\nironmem{ef_label}:", flush=True)
     result = run_membench_benchmark(
         items=items,
         ironmem_binary=str(ironmem_binary),

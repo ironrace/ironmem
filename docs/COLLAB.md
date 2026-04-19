@@ -1,6 +1,6 @@
 # IronRace Collab (v1 — Bounded Planning)
 
-`ironrace-memory` includes a bounded planning protocol that lets Claude Code
+`ironmem` includes a bounded planning protocol that lets Claude Code
 and Codex coordinate a single plan through the shared MCP server.
 
 v1 covers the **planning stage only**. The implementation stage will be added
@@ -387,16 +387,16 @@ IRONMEM_MCP_MODE=trusted IRONMEM_EMBED_MODE=noop ./target/release/ironmem serve
 ## Validation
 
 ```bash
-cargo test -p ironrace-memory collab::
-cargo test -p ironrace-memory --test mcp_protocol
-cargo test -p ironrace-memory
-cargo clippy -p ironrace-memory -- -D warnings
+cargo test -p ironmem collab::
+cargo test -p ironmem --test mcp_protocol
+cargo test -p ironmem
+cargo clippy -p ironmem -- -D warnings
 ```
 
 Tool-surface smoke test:
 
 ```bash
-cargo build -p ironrace-memory --release
+cargo build -p ironmem --release
 echo '{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}' \
   | env HOME=/tmp/ironmem-home IRONMEM_EMBED_MODE=noop IRONMEM_MCP_MODE=trusted \
       ./target/release/ironmem serve --db /tmp/ironmem-collab-tools.sqlite3 \

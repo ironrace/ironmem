@@ -1,9 +1,9 @@
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Barrier, Mutex};
 
-use ironrace_memory::bootstrap::ensure_bootstrapped;
-use ironrace_memory::config::{Config, EmbedMode, McpAccessMode};
-use ironrace_memory::mcp::app::App;
+use ironmem::bootstrap::ensure_bootstrapped;
+use ironmem::config::{Config, EmbedMode, McpAccessMode};
+use ironmem::mcp::app::App;
 use sha2::{Digest, Sha256};
 
 fn test_config(root: &Path) -> Config {

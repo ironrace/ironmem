@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""LoCoMo long-term conversation memory benchmark for ironrace-memory.
+"""LoCoMo long-term conversation memory benchmark for ironmem.
 
 Tests session-level retrieval recall, matching mempalace's LoCoMo benchmark.
 
@@ -249,7 +249,7 @@ def run_locomo_benchmark(
     n_results: int,
     ef_search: int | None,
 ) -> dict:
-    """Run LoCoMo retrieval benchmark against ironrace-memory.
+    """Run LoCoMo retrieval benchmark against ironmem.
 
     One wing per conversation; all sessions ingested before queries run.
     Each QA pair's evidence_dialog_ids are resolved to session keys and used
@@ -273,7 +273,7 @@ def run_locomo_benchmark(
         env["IRONMEM_EF_SEARCH"] = str(ef_search)
 
     client = McpClient(
-        name="ironrace-memory",
+        name="ironmem",
         cmd=[ironmem_binary, "serve"],
         env=env,
     )
@@ -371,7 +371,7 @@ def run_locomo_benchmark(
 
     sl = sorted(search_latencies)
     return {
-        "backend": "ironrace-memory",
+        "backend": "ironmem",
         "questions": len(recalls[10]),
         "recall": {k: sum(v) / max(len(v), 1) for k, v in recalls.items()},
         "per_category": {
@@ -429,7 +429,7 @@ def print_results(results: list[dict]) -> None:
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
-        description="LoCoMo benchmark: ironrace-memory session-level retrieval.",
+        description="LoCoMo benchmark: ironmem session-level retrieval.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     p.add_argument(
@@ -464,11 +464,11 @@ def main() -> int:
     ironmem_binary = Path(args.ironmem_binary).expanduser().resolve()
     if not ironmem_binary.exists():
         print(f"ironmem binary not found: {ironmem_binary}", file=sys.stderr)
-        print("Build it with: cargo build --release -p ironrace-memory --bin ironmem", file=sys.stderr)
+        print("Build it with: cargo build --release -p ironmem --bin ironmem", file=sys.stderr)
         return 1
 
     ef_label = f"  ef_search={args.ef_search}" if args.ef_search else ""
-    print(f"\nironrace-memory{ef_label}:", flush=True)
+    print(f"\nironmem{ef_label}:", flush=True)
     result = run_locomo_benchmark(
         conversations=data,
         ironmem_binary=str(ironmem_binary),

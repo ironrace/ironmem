@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""LongMemEval benchmark — ironrace-memory vs mempalace, apples-to-apples.
+"""LongMemEval benchmark — ironmem vs mempalace, apples-to-apples.
 
 Both systems ingest the same haystack sessions from LongMemEval and answer
 the same 500 questions. Scoring is identical to mempalace's own benchmark
@@ -170,7 +170,7 @@ def build_corpus(entry: dict, granularity: str = "session") -> tuple[list[str], 
     return docs, ids
 
 
-# ── ironrace-memory retriever ─────────────────────────────────────────────────
+# ── ironmem retriever ─────────────────────────────────────────────────
 
 def _corpus_cache_key(docs: list[str], granularity: str, ingest_env: dict[str, str]) -> str:
     """SHA-256 fingerprint of the corpus + ingest-affecting env vars.
@@ -199,7 +199,7 @@ def run_ironrace_benchmark(
     per_question_json: str | None = None,
     db_cache_dir: str | None = None,
 ) -> dict:
-    """Run LongMemEval against ironrace-memory, one fresh server per question.
+    """Run LongMemEval against ironmem, one fresh server per question.
 
     Each question gets its own DB and MCP server, matching mempalace's
     per-collection methodology. This ensures the HNSW index only contains
@@ -263,7 +263,7 @@ def run_ironrace_benchmark(
                 cache_hit = True
 
         client = McpClient(
-            name="ironrace-memory",
+            name="ironmem",
             cmd=[ironmem_binary, "serve"],
             env=env,
         )
@@ -384,7 +384,7 @@ def run_ironrace_benchmark(
 
     sl = sorted(search_latencies)
     return {
-        "backend": "ironrace-memory",
+        "backend": "ironmem",
         "questions": len(recalls[5]),
         "recall": {k: sum(v) / max(len(v), 1) for k, v in recalls.items()},
         "per_type": {
@@ -540,7 +540,7 @@ def print_results(results: list[dict]) -> None:
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
-        description="LongMemEval benchmark: ironrace-memory vs mempalace.",
+        description="LongMemEval benchmark: ironmem vs mempalace.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     p.add_argument(
@@ -631,7 +631,7 @@ def main() -> int:
             print(f"ironmem binary not found: {ironmem_binary}", file=sys.stderr)
             return 1
         ef_label = f"  ef_search={args.ef_search}" if args.ef_search else ""
-        print(f"\nironrace-memory{ef_label}:", flush=True)
+        print(f"\nironmem{ef_label}:", flush=True)
         r = run_ironrace_benchmark(
             data=data,
             ironmem_binary=str(ironmem_binary),

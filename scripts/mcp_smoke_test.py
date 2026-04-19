@@ -30,7 +30,7 @@ def parse_args() -> argparse.Namespace:
 def build_command(binary: str | None) -> list[str]:
     if binary:
         return [binary, "serve"]
-    return ["cargo", "run", "-q", "-p", "ironrace-memory", "--bin", "ironmem", "--", "serve"]
+    return ["cargo", "run", "-q", "-p", "ironmem", "--bin", "ironmem", "--", "serve"]
 
 
 def main() -> int:
@@ -93,7 +93,7 @@ def main() -> int:
     if result.get("protocolVersion") != "2024-11-05":
         sys.stderr.write(f"FAIL: unexpected protocolVersion: {result.get('protocolVersion')!r}\n")
         return 1
-    if result.get("serverInfo", {}).get("name") != "ironrace-memory":
+    if result.get("serverInfo", {}).get("name") != "ironmem":
         sys.stderr.write(f"FAIL: unexpected server name: {result.get('serverInfo')!r}\n")
         return 1
     if "tools" not in result.get("capabilities", {}):

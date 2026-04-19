@@ -44,7 +44,7 @@ pub fn check_and_record_version(state_dir: &Path) {
     if let Ok(prev) = std::fs::read_to_string(&version_file) {
         let prev = prev.trim();
         if prev != current {
-            tracing::info!("ironrace-memory upgraded {prev} → {current}");
+            tracing::info!("ironmem upgraded {prev} → {current}");
         }
     }
     let _ = std::fs::write(&version_file, current);

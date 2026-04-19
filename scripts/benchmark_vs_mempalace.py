@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Benchmark ironrace-memory against mempalace through their MCP servers.
+"""Benchmark ironmem against mempalace through their MCP servers.
 
 This harness focuses on surfaces both systems already expose in common:
 
@@ -10,7 +10,7 @@ This harness focuses on surfaces both systems already expose in common:
 - taxonomy
 - delete drawer
 
-It deliberately avoids file-mining comparisons even though ironrace-memory
+It deliberately avoids file-mining comparisons even though ironmem
 implements `mine`, because the two projects have meaningfully different
 mining pipelines and this harness is intended to compare common MCP tool
 surfaces.
@@ -315,7 +315,7 @@ def benchmark_backend(
             shutil.rmtree(storage_path)
         storage_path.mkdir(parents=True, exist_ok=True)
 
-        warmup_tool = tool_names.get("status") if name == "ironrace-memory" else None
+        warmup_tool = tool_names.get("status") if name == "ironmem" else None
         startup_ms = client.start(warmup_tool=warmup_tool)
         startup_samples.append(startup_ms)
         if hasattr(client, "warmup_ms"):
@@ -359,7 +359,7 @@ def benchmark_backend(
         for drawer_id in created_ids[-10:]:
             _, elapsed_ms = measure_call(
                 lambda i=drawer_id: client.call_tool(tool_names["delete_drawer"], {"id": i})
-                if name == "ironrace-memory"
+                if name == "ironmem"
                 else client.call_tool(tool_names["delete_drawer"], {"drawer_id": i})
             )
             delete_samples.append(elapsed_ms)
@@ -368,7 +368,7 @@ def benchmark_backend(
         client.stop()
         # SQLite WAL files aren't truncated on last connection close; force a
         # TRUNCATE checkpoint so the storage measurement reflects actual data size.
-        if name == "ironrace-memory":
+        if name == "ironmem":
             _truncate_sqlite_wal(storage_path)
         final_storage_bytes = dir_size_bytes(storage_path)
 
@@ -392,7 +392,7 @@ def make_ironmem_client(args, storage_root: Path) -> JsonRpcClient:
     binary = Path(args.ironmem_binary).expanduser().resolve()
     if not binary.exists():
         raise SystemExit(
-            f"ironmem binary not found at {binary}. Run `cargo build -p ironrace-memory --bin ironmem` first."
+            f"ironmem binary not found at {binary}. Run `cargo build -p ironmem --bin ironmem` first."
         )
 
     env = os.environ.copy()
@@ -420,7 +420,7 @@ def make_ironmem_client(args, storage_root: Path) -> JsonRpcClient:
         )
 
     return JsonRpcClient(
-        name="ironrace-memory",
+        name="ironmem",
         cmd=[str(binary), "serve", "--db", str(storage_root / "ironmem.sqlite3")],
         cwd=Path(args.ironmem_repo).expanduser().resolve(),
         env=env,
@@ -478,7 +478,7 @@ def print_summary(results: dict[str, Any]) -> None:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Benchmark ironrace-memory vs mempalace over common MCP tool calls.",
+        description="Benchmark ironmem vs mempalace over common MCP tool calls.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=textwrap.dedent(
             """\
@@ -491,7 +491,7 @@ def parse_args() -> argparse.Namespace:
             """
         ),
     )
-    parser.add_argument("--ironmem-repo", default=".", help="Path to the ironrace-memory repo")
+    parser.add_argument("--ironmem-repo", default=".", help="Path to the ironmem repo")
     parser.add_argument(
         "--ironmem-binary",
         default="./target/debug/ironmem",
@@ -534,7 +534,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--ironmem-only",
         action="store_true",
-        help="Skip mempalace benchmark (ironrace-memory only)",
+        help="Skip mempalace benchmark (ironmem only)",
     )
     return parser.parse_args()
 
@@ -562,8 +562,8 @@ def main() -> int:
     }
 
     try:
-        results["backends"]["ironrace-memory"] = benchmark_backend(
-            name="ironrace-memory",
+        results["backends"]["ironmem"] = benchmark_backend(
+            name="ironmem",
             client=iron_client,
             tool_names={
                 "status": "ironmem_status",

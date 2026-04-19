@@ -89,10 +89,10 @@ fn claude_plugin_json_has_required_fields() {
 #[test]
 fn claude_mcp_json_has_required_fields() {
     let json = read_json(".claude-plugin/.mcp.json");
-    let server = &json["ironrace-memory"];
+    let server = &json["ironmem"];
     assert!(
         server.is_object(),
-        "claude .mcp.json: missing 'ironrace-memory' server entry"
+        "claude .mcp.json: missing 'ironmem' server entry"
     );
     assert!(
         server["command"].is_string(),

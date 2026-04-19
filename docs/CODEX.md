@@ -2,7 +2,7 @@
 
 ## Purpose
 
-This guide explains how to use `ironrace-memory` with Codex today, what is still missing, and how to compare it against `mempalace`.
+This guide explains how to use `ironmem` with Codex today, what is still missing, and how to compare it against `mempalace`.
 
 For the bounded Claude↔Codex planning protocol, see [COLLAB.md](COLLAB.md).
 
@@ -42,7 +42,7 @@ What does not work yet:
 From the repo root:
 
 ```bash
-cargo build -p ironrace-memory --bin ironmem
+cargo build -p ironmem --bin ironmem
 ./target/debug/ironmem setup
 ```
 
@@ -72,13 +72,13 @@ Add a server entry to your Codex MCP config.
 Example `~/.codex/config.toml` fragment:
 
 ```toml
-[mcp_servers.ironrace_memory]
-command = "/Users/jeffreycrum/git-repos/ironrace-memory/target/debug/ironmem"
+[mcp_servers.ironmem]
+command = "/Users/jeffreycrum/git-repos/ironmem/target/debug/ironmem"
 args = ["serve"]
 
-[mcp_servers.ironrace_memory.env]
+[mcp_servers.ironmem.env]
 IRONMEM_MCP_MODE = "trusted"
-IRONMEM_DB_PATH = "/Users/jeffreycrum/.ironrace-memory/memory.sqlite3"
+IRONMEM_DB_PATH = "/Users/jeffreycrum/.ironmem/memory.sqlite3"
 ```
 
 If you want a project-local store instead of the default home-directory location, point `IRONMEM_DB_PATH` at a repo-local path.
@@ -94,7 +94,7 @@ After registering the MCP server, validate the basics:
 
 ## Shared Memory Across Harnesses
 
-Codex and Claude Code share the **same database by default** (`~/.ironrace-memory/memory.sqlite3`). Memory written during a Claude session is immediately visible in Codex, and vice versa.
+Codex and Claude Code share the **same database by default** (`~/.ironmem/memory.sqlite3`). Memory written during a Claude session is immediately visible in Codex, and vice versa.
 
 The database is kept up to date automatically through hooks:
 
@@ -112,13 +112,13 @@ SQLite WAL mode allows both harnesses to access the store concurrently without l
 
 ```toml
 # Codex-only store
-[mcp_servers.ironrace_memory.env]
-IRONMEM_DB_PATH = "~/.ironrace-memory/codex.sqlite3"
+[mcp_servers.ironmem.env]
+IRONMEM_DB_PATH = "~/.ironmem/codex.sqlite3"
 ```
 
 ```json
 // Claude Code-only store — in .claude-plugin/.mcp.json env block
-"IRONMEM_DB_PATH": "/Users/you/.ironrace-memory/claude.sqlite3"
+"IRONMEM_DB_PATH": "/Users/you/.ironmem/claude.sqlite3"
 ```
 
 ## Startup Behavior
@@ -153,7 +153,7 @@ Embedding-dependent tools (`ironmem_search`, `ironmem_add_drawer`, diary writes)
 
 ## Codex Packaging Gap
 
-`ironrace-memory` now ships a `.codex-plugin/` directory with:
+`ironmem` now ships a `.codex-plugin/` directory with:
 
 - `plugin.json`
 - `hooks.json`
@@ -213,7 +213,7 @@ python3 scripts/benchmark_vs_mempalace.py \
   --runs 2 \
   --output-json /tmp/ironmem-vs-mempalace.json
 
-# ironrace-memory only (no mempalace required)
+# ironmem only (no mempalace required)
 python3 scripts/benchmark_vs_mempalace.py --ironmem-only --documents 100 --queries 20 --runs 3
 
 # Capture server logs for debugging startup issues
@@ -251,7 +251,7 @@ All flags:
 
 ## Benchmark Caveats
 
-- `ironrace-memory` uses a Rust ONNX embedding path; `mempalace` uses Python and Chroma
+- `ironmem` uses a Rust ONNX embedding path; `mempalace` uses Python and Chroma
 - The harness sets `IRONMEM_AUTO_BOOTSTRAP=0` and `IRONMEM_DISABLE_MIGRATION=1` automatically so one-time bootstrap cost is excluded from latency measurements; warmup time (model load) is tracked separately
 - Storage is measured after a SQLite WAL `TRUNCATE` checkpoint for a fair comparison with Chroma-backed backends
 - File mining is excluded — the benchmark targets common MCP tool surfaces only, because the two mining pipelines differ too much for a controlled comparison
