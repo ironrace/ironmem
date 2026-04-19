@@ -9,3 +9,10 @@
 # Development artifacts (Codex/Claude task files)
 CODEX_TASK_*.md
 docs/collab_*.md
+
+# Local tool and editor state (personal, non-portable)
+.cargo/
+.claude/
+.playwright-mcp/
+__pycache__/
+*.pyc

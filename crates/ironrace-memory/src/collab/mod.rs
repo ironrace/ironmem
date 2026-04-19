@@ -4,6 +4,11 @@ pub mod queue;
 
 use std::fmt;
 
+/// Maximum number of review cycles Codex may run on the canonical plan.
+/// After this many reviews, Claude is forced into finalize regardless of the
+/// verdict (she always gets the last word).
+pub const MAX_REVIEW_ROUNDS: u8 = 2;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Phase {
     PlanParallelDrafts,
@@ -11,7 +16,6 @@ pub enum Phase {
     PlanCodexReviewPending,
     PlanClaudeFinalizePending,
     PlanLocked,
-    PlanEscalated,
 }
 
 impl fmt::Display for Phase {
@@ -22,7 +26,6 @@ impl fmt::Display for Phase {
             Self::PlanCodexReviewPending => "PlanCodexReviewPending",
             Self::PlanClaudeFinalizePending => "PlanClaudeFinalizePending",
             Self::PlanLocked => "PlanLocked",
-            Self::PlanEscalated => "PlanEscalated",
         };
         f.write_str(value)
     }
@@ -38,7 +41,6 @@ impl TryFrom<&str> for Phase {
             "PlanCodexReviewPending" => Ok(Self::PlanCodexReviewPending),
             "PlanClaudeFinalizePending" => Ok(Self::PlanClaudeFinalizePending),
             "PlanLocked" => Ok(Self::PlanLocked),
-            "PlanEscalated" => Ok(Self::PlanEscalated),
             other => Err(format!("unknown collab phase: {other}")),
         }
     }
@@ -54,6 +56,7 @@ pub struct CollabSession {
     pub canonical_plan_hash: Option<String>,
     pub final_plan_hash: Option<String>,
     pub codex_review_verdict: Option<String>,
+    pub review_round: u8,
 }
 
 impl CollabSession {
@@ -67,25 +70,17 @@ impl CollabSession {
             canonical_plan_hash: None,
             final_plan_hash: None,
             codex_review_verdict: None,
+            review_round: 0,
         }
     }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CollabEvent {
-    SubmitDraft {
-        content_hash: String,
-    },
-    PublishCanonical {
-        content_hash: String,
-    },
-    SubmitReview {
-        verdict: String,
-    },
-    PublishFinal {
-        content_hash: String,
-        codex_still_objects: bool,
-    },
+    SubmitDraft { content_hash: String },
+    PublishCanonical { content_hash: String },
+    SubmitReview { verdict: String },
+    PublishFinal { content_hash: String },
 }
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
@@ -120,7 +115,7 @@ pub fn apply_event(
     actor: &str,
     event: &CollabEvent,
 ) -> Result<CollabSession, CollabError> {
-    if matches!(session.phase, Phase::PlanLocked | Phase::PlanEscalated) {
+    if matches!(session.phase, Phase::PlanLocked) {
         return Err(CollabError::SessionLocked);
     }
 
@@ -188,16 +183,20 @@ pub fn apply_event(
                 return Err(CollabError::InvalidVerdictValue(verdict.clone()));
             }
             next.codex_review_verdict = Some(verdict.clone());
-            next.phase = Phase::PlanClaudeFinalizePending;
-            next.current_owner = "claude".to_string();
+            next.review_round = session.review_round.saturating_add(1);
+
+            // request_changes returns to synthesis (Claude revises) unless we've
+            // hit the cap — then Claude is forced into finalize with the last word.
+            let force_finalize = next.review_round >= MAX_REVIEW_ROUNDS;
+            if verdict == "request_changes" && !force_finalize {
+                next.phase = Phase::PlanSynthesisPending;
+                next.current_owner = "claude".to_string();
+            } else {
+                next.phase = Phase::PlanClaudeFinalizePending;
+                next.current_owner = "claude".to_string();
+            }
         }
-        (
-            Phase::PlanClaudeFinalizePending,
-            CollabEvent::PublishFinal {
-                content_hash,
-                codex_still_objects: _,
-            },
-        ) => {
+        (Phase::PlanClaudeFinalizePending, CollabEvent::PublishFinal { content_hash }) => {
             if actor != "claude" {
                 return Err(CollabError::NotYourTurn {
                     expected: "claude".to_string(),
@@ -205,15 +204,7 @@ pub fn apply_event(
                 });
             }
             next.final_plan_hash = Some(content_hash.clone());
-            let codex_still_objects = matches!(
-                session.codex_review_verdict.as_deref(),
-                Some("request_changes")
-            );
-            next.phase = if codex_still_objects {
-                Phase::PlanEscalated
-            } else {
-                Phase::PlanLocked
-            };
+            next.phase = Phase::PlanLocked;
         }
         (Phase::PlanParallelDrafts, _) => {
             return Err(CollabError::WrongPhase {
@@ -239,7 +230,7 @@ pub fn apply_event(
                 got: event_name(event).to_string(),
             });
         }
-        (Phase::PlanLocked | Phase::PlanEscalated, _) => return Err(CollabError::SessionLocked),
+        (Phase::PlanLocked, _) => return Err(CollabError::SessionLocked),
     }
 
     Ok(next)
@@ -253,26 +244,45 @@ mod tests {
         CollabSession::new("test-session")
     }
 
+    fn draft(actor: &str, hash: &str, s: &CollabSession) -> CollabSession {
+        apply_event(
+            s,
+            actor,
+            &CollabEvent::SubmitDraft {
+                content_hash: hash.to_string(),
+            },
+        )
+        .unwrap()
+    }
+
+    fn canonical(hash: &str, s: &CollabSession) -> CollabSession {
+        apply_event(
+            s,
+            "claude",
+            &CollabEvent::PublishCanonical {
+                content_hash: hash.to_string(),
+            },
+        )
+        .unwrap()
+    }
+
+    fn review(verdict: &str, s: &CollabSession) -> CollabSession {
+        apply_event(
+            s,
+            "codex",
+            &CollabEvent::SubmitReview {
+                verdict: verdict.to_string(),
+            },
+        )
+        .unwrap()
+    }
+
     #[test]
     fn test_parallel_drafts_both_submit_advances_phase() {
         let s = session();
-        let s = apply_event(
-            &s,
-            "claude",
-            &CollabEvent::SubmitDraft {
-                content_hash: "c1".to_string(),
-            },
-        )
-        .unwrap();
+        let s = draft("claude", "c1", &s);
         assert_eq!(s.phase, Phase::PlanParallelDrafts);
-        let s = apply_event(
-            &s,
-            "codex",
-            &CollabEvent::SubmitDraft {
-                content_hash: "c2".to_string(),
-            },
-        )
-        .unwrap();
+        let s = draft("codex", "c2", &s);
         assert_eq!(s.phase, Phase::PlanSynthesisPending);
         assert_eq!(s.current_owner, "claude");
     }
@@ -280,14 +290,7 @@ mod tests {
     #[test]
     fn test_duplicate_draft_rejected() {
         let s = session();
-        let s = apply_event(
-            &s,
-            "claude",
-            &CollabEvent::SubmitDraft {
-                content_hash: "c1".to_string(),
-            },
-        )
-        .unwrap();
+        let s = draft("claude", "c1", &s);
         let err = apply_event(
             &s,
             "claude",
@@ -307,22 +310,8 @@ mod tests {
     #[test]
     fn test_non_claude_cannot_publish_canonical() {
         let s = session();
-        let s = apply_event(
-            &s,
-            "claude",
-            &CollabEvent::SubmitDraft {
-                content_hash: "c1".to_string(),
-            },
-        )
-        .unwrap();
-        let s = apply_event(
-            &s,
-            "codex",
-            &CollabEvent::SubmitDraft {
-                content_hash: "c2".to_string(),
-            },
-        )
-        .unwrap();
+        let s = draft("claude", "c1", &s);
+        let s = draft("codex", "c2", &s);
         let err = apply_event(
             &s,
             "codex",
@@ -341,87 +330,65 @@ mod tests {
     }
 
     #[test]
-    fn test_codex_review_all_three_verdicts() {
-        for verdict in ["approve", "approve_with_minor_edits", "request_changes"] {
+    fn test_codex_review_approve_advances_to_finalize() {
+        for verdict in ["approve", "approve_with_minor_edits"] {
             let s = session();
-            let s = apply_event(
-                &s,
-                "claude",
-                &CollabEvent::SubmitDraft {
-                    content_hash: "c1".to_string(),
-                },
-            )
-            .unwrap();
-            let s = apply_event(
-                &s,
-                "codex",
-                &CollabEvent::SubmitDraft {
-                    content_hash: "c2".to_string(),
-                },
-            )
-            .unwrap();
-            let s = apply_event(
-                &s,
-                "claude",
-                &CollabEvent::PublishCanonical {
-                    content_hash: "canonical".to_string(),
-                },
-            )
-            .unwrap();
-            let s = apply_event(
-                &s,
-                "codex",
-                &CollabEvent::SubmitReview {
-                    verdict: verdict.to_string(),
-                },
-            )
-            .unwrap();
+            let s = draft("claude", "c1", &s);
+            let s = draft("codex", "c2", &s);
+            let s = canonical("canonical", &s);
+            let s = review(verdict, &s);
             assert_eq!(s.phase, Phase::PlanClaudeFinalizePending);
             assert_eq!(s.codex_review_verdict.as_deref(), Some(verdict));
+            assert_eq!(s.review_round, 1);
         }
     }
 
     #[test]
-    fn test_finalize_locks_after_approve() {
+    fn test_request_changes_round_one_returns_to_synthesis() {
         let s = session();
-        let s = apply_event(
-            &s,
-            "claude",
-            &CollabEvent::SubmitDraft {
-                content_hash: "c1".to_string(),
-            },
-        )
-        .unwrap();
-        let s = apply_event(
-            &s,
-            "codex",
-            &CollabEvent::SubmitDraft {
-                content_hash: "c2".to_string(),
-            },
-        )
-        .unwrap();
-        let s = apply_event(
-            &s,
-            "claude",
-            &CollabEvent::PublishCanonical {
-                content_hash: "canonical".to_string(),
-            },
-        )
-        .unwrap();
-        let s = apply_event(
-            &s,
-            "codex",
-            &CollabEvent::SubmitReview {
-                verdict: "approve".to_string(),
-            },
-        )
-        .unwrap();
+        let s = draft("claude", "c1", &s);
+        let s = draft("codex", "c2", &s);
+        let s = canonical("canonical-v1", &s);
+        let s = review("request_changes", &s);
+
+        assert_eq!(s.phase, Phase::PlanSynthesisPending);
+        assert_eq!(s.current_owner, "claude");
+        assert_eq!(s.review_round, 1);
+
+        // Claude revises — publishes new canonical, back to review.
+        let s = canonical("canonical-v2", &s);
+        assert_eq!(s.phase, Phase::PlanCodexReviewPending);
+        assert_eq!(s.canonical_plan_hash.as_deref(), Some("canonical-v2"));
+    }
+
+    #[test]
+    fn test_request_changes_at_cap_forces_finalize() {
+        let s = session();
+        let s = draft("claude", "c1", &s);
+        let s = draft("codex", "c2", &s);
+        let s = canonical("v1", &s);
+        let s = review("request_changes", &s); // round 1, back to synthesis
+        let s = canonical("v2", &s);
+        let s = review("request_changes", &s); // round 2, hits MAX_REVIEW_ROUNDS
+
+        assert_eq!(s.review_round, MAX_REVIEW_ROUNDS);
+        assert_eq!(s.phase, Phase::PlanClaudeFinalizePending);
+        assert_eq!(s.current_owner, "claude");
+        assert_eq!(s.codex_review_verdict.as_deref(), Some("request_changes"));
+    }
+
+    #[test]
+    fn test_finalize_always_locks() {
+        let s = session();
+        let s = draft("claude", "c1", &s);
+        let s = draft("codex", "c2", &s);
+        let s = canonical("canonical", &s);
+        let s = review("approve", &s);
         let s = apply_event(
             &s,
             "claude",
             &CollabEvent::PublishFinal {
                 content_hash: "final".to_string(),
-                codex_still_objects: false,
             },
         )
         .unwrap();
@@ -430,50 +397,25 @@ mod tests {
     }
 
     #[test]
-    fn test_finalize_escalates_when_codex_still_objects() {
+    fn test_finalize_locks_even_after_forced_finalize() {
+        // Reach finalize via 2x request_changes, then publish final — still locks.
         let s = session();
-        let s = apply_event(
-            &s,
-            "claude",
-            &CollabEvent::SubmitDraft {
-                content_hash: "c1".to_string(),
-            },
-        )
-        .unwrap();
-        let s = apply_event(
-            &s,
-            "codex",
-            &CollabEvent::SubmitDraft {
-                content_hash: "c2".to_string(),
-            },
-        )
-        .unwrap();
-        let s = apply_event(
-            &s,
-            "claude",
-            &CollabEvent::PublishCanonical {
-                content_hash: "canonical".to_string(),
-            },
-        )
-        .unwrap();
-        let s = apply_event(
-            &s,
-            "codex",
-            &CollabEvent::SubmitReview {
-                verdict: "request_changes".to_string(),
-            },
-        )
-        .unwrap();
+        let s = draft("claude", "c1", &s);
+        let s = draft("codex", "c2", &s);
+        let s = canonical("v1", &s);
+        let s = review("request_changes", &s);
+        let s = canonical("v2", &s);
+        let s = review("request_changes", &s);
+
         let s = apply_event(
             &s,
             "claude",
             &CollabEvent::PublishFinal {
                 content_hash: "final".to_string(),
-                codex_still_objects: true,
             },
         )
         .unwrap();
-        assert_eq!(s.phase, Phase::PlanEscalated);
+        assert_eq!(s.phase, Phase::PlanLocked);
     }
 
     #[test]
@@ -494,5 +436,51 @@ mod tests {
                 got: "PublishCanonical".to_string()
             }
         );
+    }
+
+    #[test]
+    fn test_invalid_verdict_rejected() {
+        let s = session();
+        let s = draft("claude", "c1", &s);
+        let s = draft("codex", "c2", &s);
+        let s = canonical("canonical", &s);
+        let err = apply_event(
+            &s,
+            "codex",
+            &CollabEvent::SubmitReview {
+                verdict: "looks good to me".to_string(),
+            },
+        )
+        .unwrap_err();
+        assert_eq!(
+            err,
+            CollabError::InvalidVerdictValue("looks good to me".to_string())
+        );
+    }
+
+    #[test]
+    fn test_locked_session_rejects_all_events() {
+        let s = session();
+        let s = draft("claude", "c1", &s);
+        let s = draft("codex", "c2", &s);
+        let s = canonical("canonical", &s);
+        let s = review("approve", &s);
+        let s = apply_event(
+            &s,
+            "claude",
+            &CollabEvent::PublishFinal {
+                content_hash: "final".to_string(),
+            },
+        )
+        .unwrap();
+        let err = apply_event(
+            &s,
+            "claude",
+            &CollabEvent::SubmitDraft {
+                content_hash: "x".to_string(),
+            },
+        )
+        .unwrap_err();
+        assert_eq!(err, CollabError::SessionLocked);
     }
 }

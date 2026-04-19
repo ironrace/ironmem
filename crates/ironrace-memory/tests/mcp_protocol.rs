@@ -248,7 +248,7 @@ fn collab_happy_path_locks_via_mcp_handlers() {
 }
 
 #[test]
-fn collab_request_changes_escalates_and_approve_hash_mismatch_is_rejected() {
+fn collab_request_changes_loops_back_to_synthesis_and_locks_after_revision() {
     let app = App::open_for_test().unwrap();
 
     let started = call_tool(
@@ -289,10 +289,11 @@ fn collab_request_changes_escalates_and_approve_hash_mismatch_is_rejected() {
             "session_id": session_id,
             "sender": "claude",
             "topic": "canonical",
-            "content": "Merged canonical plan"
+            "content": "Merged canonical v1"
         }),
     );
 
+    // Wrong hash on approve is rejected (canonical_plan_hash mismatch).
     let bad_approve = call_tool(
         &app,
         "ironmem_collab_approve",
@@ -307,6 +308,8 @@ fn collab_request_changes_escalates_and_approve_hash_mismatch_is_rejected() {
         .unwrap_or("")
         .contains("content_hash does not match canonical_plan_hash"));
 
+    // Codex requests changes → revision round 1; phase returns to synthesis so
+    // Claude can revise the canonical plan.
     call_tool(
         &app,
         "ironmem_collab_send",
@@ -314,9 +317,38 @@ fn collab_request_changes_escalates_and_approve_hash_mismatch_is_rejected() {
             "session_id": session_id,
             "sender": "codex",
             "topic": "review",
-            "content": json!({
-                "verdict": "request_changes"
-            }).to_string()
+            "content": json!({ "verdict": "request_changes" }).to_string()
+        }),
+    );
+    let status_after_rc = call_tool(
+        &app,
+        "ironmem_collab_status",
+        json!({ "session_id": session_id }),
+    );
+    assert_eq!(status_after_rc["phase"], "PlanSynthesisPending");
+    assert_eq!(status_after_rc["current_owner"], "claude");
+    assert_eq!(status_after_rc["review_round"], 1);
+
+    // Claude publishes a revised canonical; Codex now approves. After approval
+    // Claude publishes the final plan and the session locks.
+    call_tool(
+        &app,
+        "ironmem_collab_send",
+        json!({
+            "session_id": session_id,
+            "sender": "claude",
+            "topic": "canonical",
+            "content": "Merged canonical v2"
+        }),
+    );
+    call_tool(
+        &app,
+        "ironmem_collab_send",
+        json!({
+            "session_id": session_id,
+            "sender": "codex",
+            "topic": "review",
+            "content": json!({ "verdict": "approve" }).to_string()
         }),
     );
     call_tool(
@@ -326,10 +358,7 @@ fn collab_request_changes_escalates_and_approve_hash_mismatch_is_rejected() {
             "session_id": session_id,
             "sender": "claude",
             "topic": "final",
-            "content": json!({
-                "plan": "Claude final plan",
-                "codex_still_objects": false
-            }).to_string()
+            "content": json!({ "plan": "Merged canonical v2" }).to_string()
         }),
     );
     let status = call_tool(
@@ -337,5 +366,268 @@ fn collab_request_changes_escalates_and_approve_hash_mismatch_is_rejected() {
         "ironmem_collab_status",
         json!({ "session_id": session_id }),
     );
-    assert_eq!(status["phase"], "PlanEscalated");
+    assert_eq!(status["phase"], "PlanLocked");
+    assert_eq!(status["final_plan_hash"], status["canonical_plan_hash"]);
+}
+
+#[test]
+fn collab_two_rounds_of_request_changes_force_finalize() {
+    let app = App::open_for_test().unwrap();
+
+    let started = call_tool(
+        &app,
+        "ironmem_collab_start",
+        json!({
+            "repo_path": "/repo",
+            "branch": "main",
+            "initiator": "claude"
+        }),
+    );
+    let session_id = started["session_id"].as_str().unwrap();
+
+    // Submit both drafts.
+    for (sender, content) in [("claude", "cdraft"), ("codex", "xdraft")] {
+        call_tool(
+            &app,
+            "ironmem_collab_send",
+            json!({
+                "session_id": session_id,
+                "sender": sender,
+                "topic": "draft",
+                "content": content
+            }),
+        );
+    }
+
+    // Round 1: canonical → request_changes (back to synthesis).
+    call_tool(
+        &app,
+        "ironmem_collab_send",
+        json!({
+            "session_id": session_id,
+            "sender": "claude",
+            "topic": "canonical",
+            "content": "v1"
+        }),
+    );
+    call_tool(
+        &app,
+        "ironmem_collab_send",
+        json!({
+            "session_id": session_id,
+            "sender": "codex",
+            "topic": "review",
+            "content": json!({ "verdict": "request_changes" }).to_string()
+        }),
+    );
+
+    // Round 2: canonical → request_changes again. Revision cap hit, so we
+    // must advance to PlanClaudeFinalizePending (Claude gets the last word).
+    call_tool(
+        &app,
+        "ironmem_collab_send",
+        json!({
+            "session_id": session_id,
+            "sender": "claude",
+            "topic": "canonical",
+            "content": "v2"
+        }),
+    );
+    call_tool(
+        &app,
+        "ironmem_collab_send",
+        json!({
+            "session_id": session_id,
+            "sender": "codex",
+            "topic": "review",
+            "content": json!({ "verdict": "request_changes" }).to_string()
+        }),
+    );
+
+    let status = call_tool(
+        &app,
+        "ironmem_collab_status",
+        json!({ "session_id": session_id }),
+    );
+    assert_eq!(status["phase"], "PlanClaudeFinalizePending");
+    assert_eq!(status["review_round"], 2);
+
+    // Claude publishes final despite Codex's objection; session locks.
+    call_tool(
+        &app,
+        "ironmem_collab_send",
+        json!({
+            "session_id": session_id,
+            "sender": "claude",
+            "topic": "final",
+            "content": json!({ "plan": "Claude's last word" }).to_string()
+        }),
+    );
+    let status = call_tool(
+        &app,
+        "ironmem_collab_status",
+        json!({ "session_id": session_id }),
+    );
+    assert_eq!(status["phase"], "PlanLocked");
+}
+
+#[test]
+fn collab_start_with_task_roundtrips_via_status() {
+    let app = App::open_for_test().unwrap();
+    let started = call_tool(
+        &app,
+        "ironmem_collab_start",
+        json!({
+            "repo_path": "/repo",
+            "branch": "main",
+            "initiator": "claude",
+            "task": "design a landing page"
+        }),
+    );
+    assert_eq!(started["task"], "design a landing page");
+    let session_id = started["session_id"].as_str().unwrap();
+
+    let status = call_tool(
+        &app,
+        "ironmem_collab_status",
+        json!({ "session_id": session_id }),
+    );
+    assert_eq!(status["task"], "design a landing page");
+    assert_eq!(status["review_round"], 0);
+    assert!(status["ended_at"].is_null());
+}
+
+#[test]
+fn collab_recv_blocks_draft_peek_before_own_draft_submitted() {
+    let app = App::open_for_test().unwrap();
+    let started = call_tool(
+        &app,
+        "ironmem_collab_start",
+        json!({
+            "repo_path": "/repo",
+            "branch": "main",
+            "initiator": "claude"
+        }),
+    );
+    let session_id = started["session_id"].as_str().unwrap();
+
+    // Claude submits first.
+    call_tool(
+        &app,
+        "ironmem_collab_send",
+        json!({
+            "session_id": session_id,
+            "sender": "claude",
+            "topic": "draft",
+            "content": "claude draft"
+        }),
+    );
+
+    // Codex must NOT be able to read Claude's draft before submitting its own.
+    let peek = call_tool(
+        &app,
+        "ironmem_collab_recv",
+        json!({ "session_id": session_id, "receiver": "codex" }),
+    );
+    let messages = peek["messages"].as_array().unwrap();
+    assert!(
+        messages.is_empty(),
+        "drafts must be hidden during PlanParallelDrafts until receiver submits its own"
+    );
+
+    // After Codex submits its own draft, the phase advances and Codex can
+    // read Claude's draft.
+    call_tool(
+        &app,
+        "ironmem_collab_send",
+        json!({
+            "session_id": session_id,
+            "sender": "codex",
+            "topic": "draft",
+            "content": "codex draft"
+        }),
+    );
+    let peek = call_tool(
+        &app,
+        "ironmem_collab_recv",
+        json!({ "session_id": session_id, "receiver": "codex" }),
+    );
+    let messages = peek["messages"].as_array().unwrap();
+    assert_eq!(messages.len(), 1);
+    assert_eq!(messages[0]["content"], "claude draft");
+}
+
+#[test]
+fn collab_wait_my_turn_returns_immediately_when_owner() {
+    let app = App::open_for_test().unwrap();
+    let started = call_tool(
+        &app,
+        "ironmem_collab_start",
+        json!({
+            "repo_path": "/repo",
+            "branch": "main",
+            "initiator": "claude"
+        }),
+    );
+    let session_id = started["session_id"].as_str().unwrap();
+
+    // Fresh session: current_owner=claude, PlanParallelDrafts.
+    let start = std::time::Instant::now();
+    let resp = call_tool(
+        &app,
+        "ironmem_collab_wait_my_turn",
+        json!({ "session_id": session_id, "agent": "claude", "timeout_secs": 5 }),
+    );
+    assert!(start.elapsed() < std::time::Duration::from_secs(2));
+    assert_eq!(resp["is_my_turn"], true);
+    assert_eq!(resp["phase"], "PlanParallelDrafts");
+    assert_eq!(resp["current_owner"], "claude");
+    assert_eq!(resp["session_ended"], false);
+}
+
+#[test]
+fn collab_end_blocks_subsequent_writes() {
+    let app = App::open_for_test().unwrap();
+    let started = call_tool(
+        &app,
+        "ironmem_collab_start",
+        json!({
+            "repo_path": "/repo",
+            "branch": "main",
+            "initiator": "claude"
+        }),
+    );
+    let session_id = started["session_id"].as_str().unwrap();
+
+    let ended = call_tool(
+        &app,
+        "ironmem_collab_end",
+        json!({ "session_id": session_id, "agent": "claude" }),
+    );
+    assert_eq!(ended["ok"], true);
+
+    // Subsequent send must fail because the session has ended.
+    let blocked = call_tool(
+        &app,
+        "ironmem_collab_send",
+        json!({
+            "session_id": session_id,
+            "sender": "claude",
+            "topic": "draft",
+            "content": "too late"
+        }),
+    );
+    assert!(blocked["error"]
+        .as_str()
+        .unwrap_or("")
+        .contains("has ended"));
+
+    // wait_my_turn must surface session_ended=true so the agent loop exits.
+    let wait = call_tool(
+        &app,
+        "ironmem_collab_wait_my_turn",
+        json!({ "session_id": session_id, "agent": "claude", "timeout_secs": 1 }),
+    );
+    assert_eq!(wait["session_ended"], true);
+    assert_eq!(wait["is_my_turn"], false);
 }

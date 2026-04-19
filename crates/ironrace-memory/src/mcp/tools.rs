@@ -201,13 +201,14 @@ pub fn tool_definitions(app: &App) -> Vec<Value> {
         }),
         json!({
             "name": "ironmem_collab_start",
-            "description": "Create a bounded Claude↔Codex planning session",
+            "description": "Create a bounded Claude↔Codex planning session. Optional `task` describes the planning goal and is returned in ironmem_collab_status so the counterpart agent can fetch it without a manual paste.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "repo_path": { "type": "string" },
                     "branch": { "type": "string" },
-                    "initiator": { "type": "string", "enum": ["claude", "codex"] }
+                    "initiator": { "type": "string", "enum": ["claude", "codex"] },
+                    "task": { "type": "string" }
                 },
                 "required": ["repo_path", "branch", "initiator"]
             }
@@ -310,6 +311,31 @@ pub fn tool_definitions(app: &App) -> Vec<Value> {
                 "required": ["session_id"]
             }
         }),
+        json!({
+            "name": "ironmem_collab_wait_my_turn",
+            "description": "Long-poll: block until current_owner == agent or the timeout elapses. Returns {is_my_turn, phase, current_owner, session_ended}. Default timeout 30s, max 60s.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "session_id": { "type": "string" },
+                    "agent": { "type": "string", "enum": ["claude", "codex"] },
+                    "timeout_secs": { "type": "integer", "default": 30 }
+                },
+                "required": ["session_id", "agent"]
+            }
+        }),
+        json!({
+            "name": "ironmem_collab_end",
+            "description": "End a collab session. Reserved for the v2 coding phase — DO NOT call during planning. Idempotent; blocks subsequent send/approve/wait_my_turn writes.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "session_id": { "type": "string" },
+                    "agent": { "type": "string", "enum": ["claude", "codex"] }
+                },
+                "required": ["session_id", "agent"]
+            }
+        }),
     ];
 
     tools
@@ -355,6 +381,8 @@ pub fn call_tool(app: &App, name: &str, args: &Value) -> Result<Value, MemoryErr
         "ironmem_collab_approve" => handle_collab_approve(app, args),
         "ironmem_collab_register_caps" => handle_collab_register_caps(app, args),
         "ironmem_collab_get_caps" => handle_collab_get_caps(app, args),
+        "ironmem_collab_wait_my_turn" => handle_collab_wait_my_turn(app, args),
+        "ironmem_collab_end" => handle_collab_end(app, args),
         _ => Err(MemoryError::Permission(format!(
             "Tool '{name}' is not available in the current MCP mode"
         ))),
@@ -783,10 +811,17 @@ fn handle_collab_start(app: &App, args: &Value) -> Result<Value, MemoryError> {
     let repo_path = require_str(args, "repo_path")?;
     let branch = require_str(args, "branch")?;
     let initiator = require_agent(require_str(args, "initiator")?)?;
+    let task_owned = args
+        .get("task")
+        .and_then(Value::as_str)
+        .map(|value| sanitize::sanitize_content(value, MAX_COLLAB_CONTENT_CHARS))
+        .transpose()?
+        .map(ToString::to_string);
+    let task = task_owned.as_deref();
     let session_id = uuid::Uuid::new_v4().to_string();
 
     app.db.with_transaction(|tx| {
-        crate::collab::queue::create_session(tx, &session_id, repo_path, branch)?;
+        crate::collab::queue::create_session(tx, &session_id, repo_path, branch, task)?;
         crate::db::schema::Database::wal_log_tx(
             tx,
             "collab_start",
@@ -795,13 +830,14 @@ fn handle_collab_start(app: &App, args: &Value) -> Result<Value, MemoryError> {
                 "repo_path": repo_path,
                 "branch": branch,
                 "initiator": initiator,
+                "has_task": task.is_some(),
             }),
             Some(&json!({ "session_id": session_id })),
         )?;
         Ok(())
     })?;
 
-    Ok(json!({ "session_id": session_id }))
+    Ok(json!({ "session_id": session_id, "task": task }))
 }
 
 fn handle_collab_send(app: &App, args: &Value) -> Result<Value, MemoryError> {
@@ -817,6 +853,7 @@ fn handle_collab_send(app: &App, args: &Value) -> Result<Value, MemoryError> {
     }
 
     app.db.with_transaction(|tx| {
+        crate::collab::queue::ensure_active(tx, session_id)?;
         let mut session = crate::collab::queue::load_session(tx, session_id)?;
         let phase_before = session.phase.to_string();
         let event = match topic {
@@ -833,7 +870,6 @@ fn handle_collab_send(app: &App, args: &Value) -> Result<Value, MemoryError> {
                 let plan = parse_final_payload(content)?;
                 CollabEvent::PublishFinal {
                     content_hash: sha256_hex(&plan),
-                    codex_still_objects: false,
                 }
             }
             _ => unreachable!(),
@@ -876,22 +912,41 @@ fn handle_collab_recv(app: &App, args: &Value) -> Result<Value, MemoryError> {
     let session_id = require_str(args, "session_id")?;
     let receiver = require_agent(require_str(args, "receiver")?)?;
     let limit = (args.get("limit").and_then(|v| v.as_u64()).unwrap_or(10) as usize).min(50);
+
+    // Blind-drafts invariant: during PlanParallelDrafts, an agent must not see
+    // the counterpart's draft until it has submitted its own. This enforces
+    // the "parallel" in parallel drafts at the server boundary so the protocol
+    // doesn't rely on agent-side discipline alone.
+    let session = app.db.collab_load_session(session_id)?;
+    let suppress_drafts = matches!(session.phase, crate::collab::Phase::PlanParallelDrafts)
+        && match receiver {
+            "claude" => session.claude_draft_hash.is_none(),
+            "codex" => session.codex_draft_hash.is_none(),
+            _ => false,
+        };
+
     let messages = app.db.collab_recv_messages(session_id, receiver, limit)?;
-    Ok(json!({
-        "messages": messages.into_iter().map(|message| json!({
-            "id": message.id,
-            "sender": message.sender,
-            "topic": message.topic,
-            "content": message.content,
-            "created_at": message.created_at,
-        })).collect::<Vec<_>>()
-    }))
+    let filtered: Vec<Value> = messages
+        .into_iter()
+        .filter(|message| !(suppress_drafts && message.topic == "draft"))
+        .map(|message| {
+            json!({
+                "id": message.id,
+                "sender": message.sender,
+                "topic": message.topic,
+                "content": message.content,
+                "created_at": message.created_at,
+            })
+        })
+        .collect();
+    Ok(json!({ "messages": filtered }))
 }
 
 fn handle_collab_ack(app: &App, args: &Value) -> Result<Value, MemoryError> {
     let message_id = require_str(args, "message_id")?;
     let session_id = require_str(args, "session_id")?;
     app.db.with_transaction(|tx| {
+        crate::collab::queue::ensure_active(tx, session_id)?;
         crate::collab::queue::ack_message(tx, session_id, message_id)?;
         crate::db::schema::Database::wal_log_tx(
             tx,
@@ -929,6 +984,7 @@ fn handle_collab_approve(app: &App, args: &Value) -> Result<Value, MemoryError> 
     .to_string();
 
     app.db.with_transaction(|tx| {
+        crate::collab::queue::ensure_active(tx, session_id)?;
         let session = crate::collab::queue::load_session(tx, session_id)?;
         let expected_hash = session
             .canonical_plan_hash
@@ -1000,6 +1056,7 @@ fn handle_collab_register_caps(app: &App, args: &Value) -> Result<Value, MemoryE
 
     let count = parsed.len();
     app.db.with_transaction(|tx| {
+        crate::collab::queue::ensure_active(tx, session_id)?;
         crate::collab::queue::register_caps(tx, session_id, agent, &parsed)?;
         crate::db::schema::Database::wal_log_tx(
             tx,
@@ -1039,6 +1096,67 @@ fn handle_collab_get_caps(app: &App, args: &Value) -> Result<Value, MemoryError>
     Ok(json!({ "capabilities": capabilities }))
 }
 
+/// Polling cadence for `ironmem_collab_wait_my_turn`. Short enough that
+/// turn transitions feel immediate, long enough that idle waits don't
+/// hammer SQLite.
+const WAIT_MY_TURN_POLL_MS: u64 = 500;
+/// Default timeout (seconds) applied when the caller omits `timeout_secs`.
+const WAIT_MY_TURN_DEFAULT_TIMEOUT_SECS: u64 = 30;
+/// Hard cap on `timeout_secs` — clients that want longer should re-poll.
+const WAIT_MY_TURN_MAX_TIMEOUT_SECS: u64 = 60;
+
+fn handle_collab_wait_my_turn(app: &App, args: &Value) -> Result<Value, MemoryError> {
+    let session_id = require_str(args, "session_id")?;
+    let agent = require_agent(require_str(args, "agent")?)?;
+    let timeout_secs = args
+        .get("timeout_secs")
+        .and_then(Value::as_u64)
+        .unwrap_or(WAIT_MY_TURN_DEFAULT_TIMEOUT_SECS)
+        .clamp(1, WAIT_MY_TURN_MAX_TIMEOUT_SECS);
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
+    let poll_interval = std::time::Duration::from_millis(WAIT_MY_TURN_POLL_MS);
+
+    loop {
+        let record = app.db.collab_load_session_record(session_id)?;
+        let ended = record.ended_at.is_some();
+        let phase_is_terminal = matches!(record.session.phase, crate::collab::Phase::PlanLocked);
+        let is_my_turn = !ended && !phase_is_terminal && record.session.current_owner == agent;
+
+        if is_my_turn || ended || phase_is_terminal || std::time::Instant::now() >= deadline {
+            return Ok(json!({
+                "is_my_turn": is_my_turn,
+                "phase": record.session.phase.to_string(),
+                "current_owner": record.session.current_owner,
+                "session_ended": ended,
+            }));
+        }
+
+        std::thread::sleep(poll_interval);
+    }
+}
+
+fn handle_collab_end(app: &App, args: &Value) -> Result<Value, MemoryError> {
+    let session_id = require_str(args, "session_id")?;
+    let agent = require_agent(require_str(args, "agent")?)?;
+
+    app.db.with_transaction(|tx| {
+        crate::collab::queue::end_session(tx, session_id)?;
+        crate::db::schema::Database::wal_log_tx(
+            tx,
+            "collab_end",
+            &json!({
+                "session_id": session_id,
+                "agent": agent,
+            }),
+            Some(&json!({ "ok": true })),
+        )?;
+        Ok(())
+    })?;
+
+    Ok(json!({ "ok": true, "session_id": session_id }))
+}
+
 fn tool_known(name: &str) -> bool {
     matches!(
         name,
@@ -1067,6 +1185,8 @@ fn tool_known(name: &str) -> bool {
             | "ironmem_collab_approve"
             | "ironmem_collab_register_caps"
             | "ironmem_collab_get_caps"
+            | "ironmem_collab_wait_my_turn"
+            | "ironmem_collab_end"
     )
 }
 
@@ -1087,6 +1207,7 @@ fn tool_allowed_in_mode(mode: McpAccessMode, name: &str) -> bool {
                 | "ironmem_collab_ack"
                 | "ironmem_collab_approve"
                 | "ironmem_collab_register_caps"
+                | "ironmem_collab_end"
         )
 }
 
@@ -1176,22 +1297,31 @@ fn sha256_hex(content: &str) -> String {
 }
 
 fn parse_review_verdict(content: &str) -> Result<String, MemoryError> {
-    let payload: Value = serde_json::from_str(content)?;
+    let payload: Value = serde_json::from_str(content).map_err(|e| {
+        MemoryError::Validation(format!(
+            "review content must be JSON shaped like {{\"verdict\":\"approve|approve_with_minor_edits|request_changes\",\"notes\":[\"...\"]}} (parse error: {e})"
+        ))
+    })?;
     let verdict = payload
         .get("verdict")
         .and_then(Value::as_str)
         .ok_or_else(|| {
-            MemoryError::Validation("review content must include verdict".to_string())
+            MemoryError::Validation(
+                "review content must include a \"verdict\" string field".to_string(),
+            )
         })?;
     Ok(verdict.to_string())
 }
 
 fn parse_final_payload(content: &str) -> Result<String, MemoryError> {
-    let payload: Value = serde_json::from_str(content)?;
-    let plan = payload
-        .get("plan")
-        .and_then(Value::as_str)
-        .ok_or_else(|| MemoryError::Validation("final content must include plan".to_string()))?;
+    let payload: Value = serde_json::from_str(content).map_err(|e| {
+        MemoryError::Validation(format!(
+            "final content must be JSON shaped like {{\"plan\":\"<full plan text>\"}} (parse error: {e})"
+        ))
+    })?;
+    let plan = payload.get("plan").and_then(Value::as_str).ok_or_else(|| {
+        MemoryError::Validation("final content must include a \"plan\" string field".to_string())
+    })?;
     Ok(plan.to_string())
 }
 
@@ -1206,11 +1336,14 @@ fn session_record_json(record: &SessionRecord) -> Value {
         "current_owner": record.session.current_owner.as_str(),
         "repo_path": record.repo_path.as_str(),
         "branch": record.branch.as_str(),
+        "task": record.task.as_deref(),
         "claude_draft_hash": record.session.claude_draft_hash.as_deref(),
         "codex_draft_hash": record.session.codex_draft_hash.as_deref(),
         "canonical_plan_hash": record.session.canonical_plan_hash.as_deref(),
         "final_plan_hash": record.session.final_plan_hash.as_deref(),
         "codex_review_verdict": record.session.codex_review_verdict.as_deref(),
+        "review_round": record.session.review_round,
+        "ended_at": record.ended_at.as_deref(),
         "created_at": record.created_at.as_str(),
         "updated_at": record.updated_at.as_str(),
     })

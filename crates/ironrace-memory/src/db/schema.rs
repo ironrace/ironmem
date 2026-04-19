@@ -9,6 +9,7 @@ use ironrace_embed::embedder::EMBED_DIM;
 const SCHEMA_SQL: &str = include_str!("../../migrations/001_init.sql");
 const FTS_SQL: &str = include_str!("../../migrations/002_fts.sql");
 const COLLAB_SQL: &str = include_str!("../../migrations/003_collab.sql");
+const COLLAB_V1_SQL: &str = include_str!("../../migrations/004_collab_planning_v1.sql");
 
 /// Database wrapper around a SQLite connection.
 ///
@@ -71,6 +72,12 @@ impl Database {
         // v3: collab protocol tables for bounded planning between Claude and Codex
         if current_version < 3 {
             self.create_collab_tables()?;
+        }
+
+        // v4: planning protocol v1 final — task, review_round, ended_at columns
+        // and PlanEscalated → PlanLocked data migration.
+        if current_version < 4 {
+            retry_on_busy(|| self.conn.execute_batch(COLLAB_V1_SQL))?;
         }
 
         Ok(())
