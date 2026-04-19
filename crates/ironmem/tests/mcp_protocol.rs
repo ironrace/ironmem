@@ -548,16 +548,10 @@ fn collab_wait_my_turn_returns_immediately_when_owner() {
 #[test]
 fn collab_end_blocks_subsequent_writes() {
     let app = App::open_for_test().unwrap();
-    let started = call_tool(
-        &app,
-        "collab_start",
-        json!({
-            "repo_path": "/repo",
-            "branch": "main",
-            "initiator": "claude"
-        }),
-    );
-    let session_id = started["session_id"].as_str().unwrap();
+    // Drive to PlanLocked so collab_end is actually allowed — calling it
+    // during active planning is rejected by the contract tested in
+    // `collab_end_rejected_in_active_planning_phase`.
+    let session_id = drive_to_plan_locked(&app, "fp");
 
     let ended = call_tool(
         &app,
@@ -571,10 +565,10 @@ fn collab_end_blocks_subsequent_writes() {
         &app,
         "collab_send",
         json!({
-            "session_id": session_id,
+            "session_id": &session_id,
             "sender": "claude",
-            "topic": "draft",
-            "content": "too late"
+            "topic": "task_list",
+            "content": task_list_payload("00", "b0", "h0", 1)
         }),
     );
     assert!(blocked["error"]
@@ -586,10 +580,130 @@ fn collab_end_blocks_subsequent_writes() {
     let wait = call_tool(
         &app,
         "collab_wait_my_turn",
-        json!({ "session_id": session_id, "agent": "claude", "timeout_secs": 1 }),
+        json!({ "session_id": &session_id, "agent": "claude", "timeout_secs": 1 }),
     );
     assert_eq!(wait["session_ended"], true);
     assert_eq!(wait["is_my_turn"], false);
+}
+
+#[test]
+fn collab_end_rejected_in_active_planning_phase() {
+    let app = App::open_for_test().unwrap();
+    let started = call_tool(
+        &app,
+        "collab_start",
+        json!({
+            "repo_path": "/repo",
+            "branch": "main",
+            "initiator": "claude"
+        }),
+    );
+    let session_id = started["session_id"].as_str().unwrap().to_string();
+
+    // Fresh session → PlanParallelDrafts. end must be rejected.
+    let blocked = call_tool(
+        &app,
+        "collab_end",
+        json!({ "session_id": &session_id, "agent": "claude" }),
+    );
+    assert!(
+        blocked["error"]
+            .as_str()
+            .unwrap_or("")
+            .contains("active phase PlanParallelDrafts"),
+        "expected PlanParallelDrafts rejection, got: {blocked}"
+    );
+
+    // Advance to PlanSynthesisPending — still an active planning phase.
+    for (sender, content) in [("claude", "cdraft"), ("codex", "xdraft")] {
+        call_tool(
+            &app,
+            "collab_send",
+            json!({
+                "session_id": &session_id,
+                "sender": sender,
+                "topic": "draft",
+                "content": content
+            }),
+        );
+    }
+    let blocked = call_tool(
+        &app,
+        "collab_end",
+        json!({ "session_id": &session_id, "agent": "claude" }),
+    );
+    assert!(
+        blocked["error"]
+            .as_str()
+            .unwrap_or("")
+            .contains("active phase PlanSynthesisPending"),
+        "expected PlanSynthesisPending rejection, got: {blocked}"
+    );
+
+    // Advance to PlanCodexReviewPending → PlanClaudeFinalizePending.
+    call_tool(
+        &app,
+        "collab_send",
+        json!({
+            "session_id": &session_id,
+            "sender": "claude",
+            "topic": "canonical",
+            "content": "canonical v1"
+        }),
+    );
+    let blocked = call_tool(
+        &app,
+        "collab_end",
+        json!({ "session_id": &session_id, "agent": "codex" }),
+    );
+    assert!(
+        blocked["error"]
+            .as_str()
+            .unwrap_or("")
+            .contains("PlanCodexReviewPending"),
+        "expected PlanCodexReviewPending rejection, got: {blocked}"
+    );
+
+    call_tool(
+        &app,
+        "collab_send",
+        json!({
+            "session_id": &session_id,
+            "sender": "codex",
+            "topic": "review",
+            "content": json!({ "verdict": "approve" }).to_string()
+        }),
+    );
+    let blocked = call_tool(
+        &app,
+        "collab_end",
+        json!({ "session_id": &session_id, "agent": "claude" }),
+    );
+    assert!(
+        blocked["error"]
+            .as_str()
+            .unwrap_or("")
+            .contains("PlanClaudeFinalizePending"),
+        "expected PlanClaudeFinalizePending rejection, got: {blocked}"
+    );
+
+    // Reach PlanLocked — now end is allowed.
+    call_tool(
+        &app,
+        "collab_send",
+        json!({
+            "session_id": &session_id,
+            "sender": "claude",
+            "topic": "final",
+            "content": json!({ "plan": "fp" }).to_string()
+        }),
+    );
+    let ended = call_tool(
+        &app,
+        "collab_end",
+        json!({ "session_id": &session_id, "agent": "claude" }),
+    );
+    assert_eq!(ended["ok"], true);
 }
 
 // ── v2 coding-loop E2E tests ────────────────────────────────────────────────
@@ -848,7 +962,7 @@ fn collab_v2_end_rejected_in_coding_active_phase() {
     assert!(blocked["error"]
         .as_str()
         .unwrap_or("")
-        .contains("coding-active phase"));
+        .contains("active phase CodeImplementPending"));
 
     // Session still active — send should work.
     let ok = call_tool(

@@ -253,17 +253,20 @@ plan around them.
 
 ### `collab_end`
 
-Ends a session. Valid from:
+Ends a session. Valid **only** from one of three phases:
 
 - `PlanLocked` pre-`task_list` (the user abandons the plan before coding),
 - `CodingComplete` (post-PR),
 - `CodingFailed` (after `failure_report`).
 
-**Rejected** during any coding-active phase (`CodeImplementPending` through
-`PrReadyPending`). This prevents an agent from killing a session mid-debate.
+**Rejected** during any active planning phase (`PlanParallelDrafts` through
+`PlanClaudeFinalizePending`) or coding-active phase (`CodeImplementPending`
+through `PrReadyPending`). This prevents either agent from killing a session
+the counterpart is still working in.
 
-Idempotent: subsequent `send`, `ack`, `approve`, `register_caps`, and
-`wait_my_turn` calls all treat the session as ended.
+Idempotent once allowed: calling from a terminal phase or an
+already-ended session is a no-op, and subsequent `send`, `ack`, `approve`,
+`register_caps`, and `wait_my_turn` calls all treat the session as ended.
 
 ## Payload Formats
 

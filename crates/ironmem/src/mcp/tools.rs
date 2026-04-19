@@ -326,7 +326,7 @@ pub fn tool_definitions(app: &App) -> Vec<Value> {
         }),
         json!({
             "name": "collab_end",
-            "description": "End a collab session. Valid from PlanLocked (pre-task_list), CodingComplete, or CodingFailed; rejected in any coding-active phase (CodeImplementPending through PrReadyPending). Idempotent.",
+            "description": "End a collab session. Valid only from PlanLocked (pre-task_list), CodingComplete, or CodingFailed; rejected in any active planning phase (PlanParallelDrafts through PlanClaudeFinalizePending) or coding-active phase (CodeImplementPending through PrReadyPending). Idempotent once allowed.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -1135,14 +1135,19 @@ fn handle_collab_end(app: &App, args: &Value) -> Result<Value, MemoryError> {
     let agent = require_agent(require_str(args, "agent")?)?;
 
     app.db.with_transaction(|tx| {
-        // v2 rule: collab_end is valid only when the session is pre-coding
-        // (PlanLocked and before task_list) or has reached a v2 terminal
-        // phase. Rejecting during any coding-active phase prevents agents
-        // from killing a session mid-debate.
+        // collab_end is valid only from PlanLocked (pre-task_list), or from
+        // the two v2 terminal phases. Rejecting during any active planning
+        // or coding phase prevents either agent from killing a session the
+        // counterpart is still working in.
         let session = crate::collab::queue::load_session(tx, session_id)?;
-        if session.phase.is_coding_active() {
+        use crate::collab::Phase;
+        let allowed = matches!(
+            session.phase,
+            Phase::PlanLocked | Phase::CodingComplete | Phase::CodingFailed
+        );
+        if !allowed {
             return Err(MemoryError::Validation(format!(
-                "collab_end rejected in coding-active phase {}; end is only valid in CodingComplete or CodingFailed",
+                "collab_end rejected in active phase {}; end is only valid from PlanLocked (pre-task_list), CodingComplete, or CodingFailed",
                 session.phase
             )));
         }
