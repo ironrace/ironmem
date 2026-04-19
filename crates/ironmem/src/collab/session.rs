@@ -1,3 +1,5 @@
+//! `CollabSession` — single source of truth for collab session state.
+
 use super::phase::Phase;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -52,6 +54,31 @@ impl CollabSession {
     /// when `task_list` is unset (pre-`SubmitTaskList`).
     pub fn tasks_count(&self) -> Option<u32> {
         tasks_count_from_list(self.task_list.as_deref())
+    }
+
+    /// Apply the per-task advance rule. Resets `task_review_round` and either
+    /// increments `current_task_index` or transitions into local review.
+    ///
+    /// `task_list` and `current_task_index` are invariants of every
+    /// coding-active phase; if either is missing the state machine has already
+    /// drifted and we panic rather than silently treat it as zero tasks.
+    pub(super) fn advance_task(&mut self) {
+        self.task_review_round = 0;
+        let total = self
+            .tasks_count()
+            .expect("task_list must be set and well-formed in coding-active phase");
+        let current = self
+            .current_task_index
+            .expect("current_task_index must be set in coding-active phase");
+        let next = current.saturating_add(1);
+        if next >= total {
+            self.phase = Phase::CodeReviewLocalPending;
+            self.current_owner = "claude".to_string();
+        } else {
+            self.current_task_index = Some(next);
+            self.phase = Phase::CodeImplementPending;
+            self.current_owner = "claude".to_string();
+        }
     }
 }
 

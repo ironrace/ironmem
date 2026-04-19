@@ -444,7 +444,7 @@ fn tool_allowed_in_mode(mode: McpAccessMode, name: &str) -> bool {
         )
 }
 
-pub(super) fn ensure_tool_allowed(app: &App, name: &str) -> Result<(), MemoryError> {
+fn ensure_tool_allowed(app: &App, name: &str) -> Result<(), MemoryError> {
     if tool_allowed_in_mode(app.config.mcp_access_mode, name) {
         Ok(())
     } else {

@@ -65,3 +65,28 @@ pub enum CollabEvent {
         coding_failure: String,
     },
 }
+
+impl CollabEvent {
+    /// Short name for the variant, used in error messages.
+    pub(super) fn name(&self) -> &'static str {
+        match self {
+            Self::SubmitDraft { .. } => "SubmitDraft",
+            Self::PublishCanonical { .. } => "PublishCanonical",
+            Self::SubmitReview { .. } => "SubmitReview",
+            Self::PublishFinal { .. } => "PublishFinal",
+            Self::SubmitTaskList { .. } => "SubmitTaskList",
+            Self::CodeImplement { .. } => "CodeImplement",
+            Self::CodeReview { .. } => "CodeReview",
+            Self::CodeVerdict { .. } => "CodeVerdict",
+            Self::CodeComment { .. } => "CodeComment",
+            Self::CodeFinal { .. } => "CodeFinal",
+            Self::ReviewLocal { .. } => "ReviewLocal",
+            Self::ReviewGlobal { .. } => "ReviewGlobal",
+            Self::VerdictGlobal { .. } => "VerdictGlobal",
+            Self::CommentGlobal { .. } => "CommentGlobal",
+            Self::FinalReview { .. } => "FinalReview",
+            Self::PrOpened { .. } => "PrOpened",
+            Self::FailureReport { .. } => "FailureReport",
+        }
+    }
+}

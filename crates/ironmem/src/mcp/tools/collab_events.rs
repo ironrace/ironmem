@@ -341,7 +341,8 @@ mod tests {
     fn extract_required_str_pins_error_format() {
         let payload = json!({ "head_sha": "abc123", "empty": "", "n": 3 });
         assert_eq!(
-            extract_required_str(&payload, "head_sha", "implement").unwrap(),
+            extract_required_str(&payload, "head_sha", "implement")
+                .expect("head_sha should extract successfully"),
             "abc123"
         );
         let missing = extract_required_str(&payload, "pr_url", "pr_opened").unwrap_err();

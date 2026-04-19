@@ -1,6 +1,7 @@
 use std::fmt;
+use std::str::FromStr;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Phase {
     // Planning (v1)
     PlanParallelDrafts,
@@ -25,6 +26,33 @@ pub enum Phase {
     CodingComplete,
     CodingFailed,
 }
+
+/// Authoritative mapping between `Phase` variants and the DB string forms.
+/// String values are byte-identical to what the old match-based `Display`
+/// and `TryFrom` produced — changing them would corrupt stored sessions.
+const PHASE_NAMES: &[(Phase, &str)] = &[
+    (Phase::PlanParallelDrafts, "PlanParallelDrafts"),
+    (Phase::PlanSynthesisPending, "PlanSynthesisPending"),
+    (Phase::PlanCodexReviewPending, "PlanCodexReviewPending"),
+    (
+        Phase::PlanClaudeFinalizePending,
+        "PlanClaudeFinalizePending",
+    ),
+    (Phase::PlanLocked, "PlanLocked"),
+    (Phase::CodeImplementPending, "CodeImplementPending"),
+    (Phase::CodeReviewPending, "CodeReviewPending"),
+    (Phase::CodeVerdictPending, "CodeVerdictPending"),
+    (Phase::CodeDebatePending, "CodeDebatePending"),
+    (Phase::CodeFinalPending, "CodeFinalPending"),
+    (Phase::CodeReviewLocalPending, "CodeReviewLocalPending"),
+    (Phase::CodeReviewCodexPending, "CodeReviewCodexPending"),
+    (Phase::CodeReviewVerdictPending, "CodeReviewVerdictPending"),
+    (Phase::CodeReviewDebatePending, "CodeReviewDebatePending"),
+    (Phase::CodeReviewFinalPending, "CodeReviewFinalPending"),
+    (Phase::PrReadyPending, "PrReadyPending"),
+    (Phase::CodingComplete, "CodingComplete"),
+    (Phase::CodingFailed, "CodingFailed"),
+];
 
 impl Phase {
     /// True for phases that permanently end the session. `wait_my_turn` uses
@@ -54,31 +82,54 @@ impl Phase {
                 | Self::PrReadyPending
         )
     }
+
+    /// The single `CollabEvent` variant each active phase expects. Used by the
+    /// catch-all `WrongPhase` arm to build a uniform error message. Terminal
+    /// phases return a placeholder that the catch-all never reaches because
+    /// `CodingComplete`/`CodingFailed` short-circuit to `SessionLocked` first.
+    pub(super) fn expected_event(&self) -> &'static str {
+        match self {
+            Self::PlanParallelDrafts => "SubmitDraft",
+            Self::PlanSynthesisPending => "PublishCanonical",
+            Self::PlanCodexReviewPending => "SubmitReview",
+            Self::PlanClaudeFinalizePending => "PublishFinal",
+            Self::PlanLocked => "SubmitTaskList",
+            Self::CodeImplementPending => "CodeImplement",
+            Self::CodeReviewPending => "CodeReview",
+            Self::CodeVerdictPending => "CodeVerdict",
+            Self::CodeDebatePending => "CodeComment",
+            Self::CodeFinalPending => "CodeFinal",
+            Self::CodeReviewLocalPending => "ReviewLocal",
+            Self::CodeReviewCodexPending => "ReviewGlobal",
+            Self::CodeReviewVerdictPending => "VerdictGlobal",
+            Self::CodeReviewDebatePending => "CommentGlobal",
+            Self::CodeReviewFinalPending => "FinalReview",
+            Self::PrReadyPending => "PrOpened",
+            Self::CodingComplete | Self::CodingFailed => "SessionLocked",
+        }
+    }
 }
 
 impl fmt::Display for Phase {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let value = match self {
-            Self::PlanParallelDrafts => "PlanParallelDrafts",
-            Self::PlanSynthesisPending => "PlanSynthesisPending",
-            Self::PlanCodexReviewPending => "PlanCodexReviewPending",
-            Self::PlanClaudeFinalizePending => "PlanClaudeFinalizePending",
-            Self::PlanLocked => "PlanLocked",
-            Self::CodeImplementPending => "CodeImplementPending",
-            Self::CodeReviewPending => "CodeReviewPending",
-            Self::CodeVerdictPending => "CodeVerdictPending",
-            Self::CodeDebatePending => "CodeDebatePending",
-            Self::CodeFinalPending => "CodeFinalPending",
-            Self::CodeReviewLocalPending => "CodeReviewLocalPending",
-            Self::CodeReviewCodexPending => "CodeReviewCodexPending",
-            Self::CodeReviewVerdictPending => "CodeReviewVerdictPending",
-            Self::CodeReviewDebatePending => "CodeReviewDebatePending",
-            Self::CodeReviewFinalPending => "CodeReviewFinalPending",
-            Self::PrReadyPending => "PrReadyPending",
-            Self::CodingComplete => "CodingComplete",
-            Self::CodingFailed => "CodingFailed",
-        };
-        f.write_str(value)
+        let name = PHASE_NAMES
+            .iter()
+            .find(|(p, _)| p == self)
+            .map(|(_, n)| *n)
+            .unwrap_or("UNKNOWN");
+        f.write_str(name)
+    }
+}
+
+impl FromStr for Phase {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        PHASE_NAMES
+            .iter()
+            .find(|(_, n)| *n == s)
+            .map(|(p, _)| *p)
+            .ok_or_else(|| format!("unknown collab phase: {s}"))
     }
 }
 
@@ -86,26 +137,6 @@ impl TryFrom<&str> for Phase {
     type Error = String;
 
     fn try_from(value: &str) -> Result<Self, Self::Error> {
-        match value {
-            "PlanParallelDrafts" => Ok(Self::PlanParallelDrafts),
-            "PlanSynthesisPending" => Ok(Self::PlanSynthesisPending),
-            "PlanCodexReviewPending" => Ok(Self::PlanCodexReviewPending),
-            "PlanClaudeFinalizePending" => Ok(Self::PlanClaudeFinalizePending),
-            "PlanLocked" => Ok(Self::PlanLocked),
-            "CodeImplementPending" => Ok(Self::CodeImplementPending),
-            "CodeReviewPending" => Ok(Self::CodeReviewPending),
-            "CodeVerdictPending" => Ok(Self::CodeVerdictPending),
-            "CodeDebatePending" => Ok(Self::CodeDebatePending),
-            "CodeFinalPending" => Ok(Self::CodeFinalPending),
-            "CodeReviewLocalPending" => Ok(Self::CodeReviewLocalPending),
-            "CodeReviewCodexPending" => Ok(Self::CodeReviewCodexPending),
-            "CodeReviewVerdictPending" => Ok(Self::CodeReviewVerdictPending),
-            "CodeReviewDebatePending" => Ok(Self::CodeReviewDebatePending),
-            "CodeReviewFinalPending" => Ok(Self::CodeReviewFinalPending),
-            "PrReadyPending" => Ok(Self::PrReadyPending),
-            "CodingComplete" => Ok(Self::CodingComplete),
-            "CodingFailed" => Ok(Self::CodingFailed),
-            other => Err(format!("unknown collab phase: {other}")),
-        }
+        value.parse()
     }
 }
