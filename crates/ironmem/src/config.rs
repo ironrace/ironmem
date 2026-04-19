@@ -69,6 +69,8 @@ impl Config {
         let home = dirs::home_dir()
             .ok_or_else(|| MemoryError::Config("Cannot determine home directory".into()))?;
 
+        // Legacy path retained after the ironrace-memory → ironmem rename so existing
+        // users' databases and hook state are found without manual migration.
         let base_dir = home.join(".ironrace-memory");
 
         let db_path = if let Some(p) = db_override {

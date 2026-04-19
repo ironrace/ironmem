@@ -14,7 +14,7 @@ When the `ironmem` MCP server is available in the current harness, use it proact
 
 Default behavior:
 
-- Codex and Claude Code read from and write to the same SQLite store by default: `~/.ironmem/memory.sqlite3`
+- Codex and Claude Code read from and write to the same SQLite store by default: `~/.ironrace-memory/memory.sqlite3`
 - Memory written in one harness should be treated as available to the other
 
 Use the memory tools this way:

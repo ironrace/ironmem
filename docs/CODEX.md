@@ -94,7 +94,7 @@ After registering the MCP server, validate the basics:
 
 ## Shared Memory Across Harnesses
 
-Codex and Claude Code share the **same database by default** (`~/.ironmem/memory.sqlite3`). Memory written during a Claude session is immediately visible in Codex, and vice versa.
+Codex and Claude Code share the **same database by default** (`~/.ironrace-memory/memory.sqlite3`). Memory written during a Claude session is immediately visible in Codex, and vice versa.
 
 The database is kept up to date automatically through hooks:
 

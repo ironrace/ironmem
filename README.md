@@ -86,7 +86,7 @@ Tagged releases upload prebuilt macOS and Linux binaries automatically. Until th
 
 ## Shared Memory Across Harnesses
 
-Codex and Claude Code read from and write to the **same database by default** (`~/.ironmem/memory.sqlite3`). Memory written in a Claude session is immediately visible in Codex, and vice versa — there is one unified store.
+Codex and Claude Code read from and write to the **same database by default** (`~/.ironrace-memory/memory.sqlite3`). Memory written in a Claude session is immediately visible in Codex, and vice versa — there is one unified store.
 
 The DB is updated automatically as you work:
 
