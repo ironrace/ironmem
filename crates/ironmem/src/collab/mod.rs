@@ -313,6 +313,32 @@ fn event_name(event: &CollabEvent) -> &'static str {
     }
 }
 
+/// The single `CollabEvent` variant each active phase expects. Used by the
+/// catch-all `WrongPhase` arm to build a uniform error message. Terminal
+/// phases return a placeholder that the catch-all never reaches because
+/// `CodingComplete`/`CodingFailed` short-circuit to `SessionLocked` first.
+fn expected_event_for_phase(phase: &Phase) -> &'static str {
+    match phase {
+        Phase::PlanParallelDrafts => "SubmitDraft",
+        Phase::PlanSynthesisPending => "PublishCanonical",
+        Phase::PlanCodexReviewPending => "SubmitReview",
+        Phase::PlanClaudeFinalizePending => "PublishFinal",
+        Phase::PlanLocked => "SubmitTaskList",
+        Phase::CodeImplementPending => "CodeImplement",
+        Phase::CodeReviewPending => "CodeReview",
+        Phase::CodeVerdictPending => "CodeVerdict",
+        Phase::CodeDebatePending => "CodeComment",
+        Phase::CodeFinalPending => "CodeFinal",
+        Phase::CodeReviewLocalPending => "ReviewLocal",
+        Phase::CodeReviewCodexPending => "ReviewGlobal",
+        Phase::CodeReviewVerdictPending => "VerdictGlobal",
+        Phase::CodeReviewDebatePending => "CommentGlobal",
+        Phase::CodeReviewFinalPending => "FinalReview",
+        Phase::PrReadyPending => "PrOpened",
+        Phase::CodingComplete | Phase::CodingFailed => "SessionLocked",
+    }
+}
+
 /// Require an actor to match the expected value, else return `NotYourTurn`.
 fn require_actor(actor: &str, expected: &str) -> Result<(), CollabError> {
     if actor == expected {
@@ -586,104 +612,14 @@ pub fn apply_event(
             next.phase = Phase::CodingFailed;
             next.current_owner = actor.to_string();
         }
-        (Phase::PlanParallelDrafts, _) => {
-            return Err(CollabError::WrongPhase {
-                expected: "SubmitDraft".to_string(),
-                got: event_name(event).to_string(),
-            });
-        }
-        (Phase::PlanSynthesisPending, _) => {
-            return Err(CollabError::WrongPhase {
-                expected: "PublishCanonical".to_string(),
-                got: event_name(event).to_string(),
-            });
-        }
-        (Phase::PlanCodexReviewPending, _) => {
-            return Err(CollabError::WrongPhase {
-                expected: "SubmitReview".to_string(),
-                got: event_name(event).to_string(),
-            });
-        }
-        (Phase::PlanClaudeFinalizePending, _) => {
-            return Err(CollabError::WrongPhase {
-                expected: "PublishFinal".to_string(),
-                got: event_name(event).to_string(),
-            });
-        }
-        (Phase::PlanLocked, _) => {
-            return Err(CollabError::WrongPhase {
-                expected: "SubmitTaskList".to_string(),
-                got: event_name(event).to_string(),
-            });
-        }
-        (Phase::CodeImplementPending, _) => {
-            return Err(CollabError::WrongPhase {
-                expected: "CodeImplement".to_string(),
-                got: event_name(event).to_string(),
-            });
-        }
-        (Phase::CodeReviewPending, _) => {
-            return Err(CollabError::WrongPhase {
-                expected: "CodeReview".to_string(),
-                got: event_name(event).to_string(),
-            });
-        }
-        (Phase::CodeVerdictPending, _) => {
-            return Err(CollabError::WrongPhase {
-                expected: "CodeVerdict".to_string(),
-                got: event_name(event).to_string(),
-            });
-        }
-        (Phase::CodeDebatePending, _) => {
-            return Err(CollabError::WrongPhase {
-                expected: "CodeComment".to_string(),
-                got: event_name(event).to_string(),
-            });
-        }
-        (Phase::CodeFinalPending, _) => {
-            return Err(CollabError::WrongPhase {
-                expected: "CodeFinal".to_string(),
-                got: event_name(event).to_string(),
-            });
-        }
-        (Phase::CodeReviewLocalPending, _) => {
-            return Err(CollabError::WrongPhase {
-                expected: "ReviewLocal".to_string(),
-                got: event_name(event).to_string(),
-            });
-        }
-        (Phase::CodeReviewCodexPending, _) => {
-            return Err(CollabError::WrongPhase {
-                expected: "ReviewGlobal".to_string(),
-                got: event_name(event).to_string(),
-            });
-        }
-        (Phase::CodeReviewVerdictPending, _) => {
-            return Err(CollabError::WrongPhase {
-                expected: "VerdictGlobal".to_string(),
-                got: event_name(event).to_string(),
-            });
-        }
-        (Phase::CodeReviewDebatePending, _) => {
-            return Err(CollabError::WrongPhase {
-                expected: "CommentGlobal".to_string(),
-                got: event_name(event).to_string(),
-            });
-        }
-        (Phase::CodeReviewFinalPending, _) => {
-            return Err(CollabError::WrongPhase {
-                expected: "FinalReview".to_string(),
-                got: event_name(event).to_string(),
-            });
-        }
-        (Phase::PrReadyPending, _) => {
-            return Err(CollabError::WrongPhase {
-                expected: "PrOpened".to_string(),
-                got: event_name(event).to_string(),
-            });
-        }
         (Phase::CodingComplete, _) | (Phase::CodingFailed, _) => {
             return Err(CollabError::SessionLocked);
+        }
+        (phase, _) => {
+            return Err(CollabError::WrongPhase {
+                expected: expected_event_for_phase(phase).to_string(),
+                got: event_name(event).to_string(),
+            });
         }
     }
 

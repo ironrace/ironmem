@@ -568,7 +568,9 @@ fn collab_end_blocks_subsequent_writes() {
             "session_id": &session_id,
             "sender": "claude",
             "topic": "task_list",
-            "content": task_list_payload("00", "b0", "h0", 1)
+            // Payload values are irrelevant — the session-ended gate must
+            // reject before parsing.
+            "content": task_list_payload("unused_plan_hash", "unused_base", "unused_head", 1)
         }),
     );
     assert!(blocked["error"]
@@ -660,7 +662,7 @@ fn collab_end_rejected_in_active_planning_phase() {
         blocked["error"]
             .as_str()
             .unwrap_or("")
-            .contains("PlanCodexReviewPending"),
+            .contains("active phase PlanCodexReviewPending"),
         "expected PlanCodexReviewPending rejection, got: {blocked}"
     );
 
@@ -683,7 +685,7 @@ fn collab_end_rejected_in_active_planning_phase() {
         blocked["error"]
             .as_str()
             .unwrap_or("")
-            .contains("PlanClaudeFinalizePending"),
+            .contains("active phase PlanClaudeFinalizePending"),
         "expected PlanClaudeFinalizePending rejection, got: {blocked}"
     );
 
@@ -891,6 +893,14 @@ fn collab_v2_happy_path_reaches_coding_complete() {
     assert_eq!(status["phase"], "CodingComplete");
     assert_eq!(status["pr_url"], "https://example/pr/1");
     assert_eq!(status["last_head_sha"], "h2");
+
+    // CodingComplete is a terminal phase — collab_end must be accepted.
+    let ended = call_tool(
+        &app,
+        "collab_end",
+        json!({ "session_id": session_id, "agent": "claude" }),
+    );
+    assert_eq!(ended["ok"], true);
 }
 
 #[test]

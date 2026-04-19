@@ -6,7 +6,7 @@ use sha2::{Digest, Sha256};
 use super::app::App;
 use crate::bootstrap::MEMORY_PROTOCOL;
 use crate::collab::queue::{Capability, SessionRecord};
-use crate::collab::{apply_event, CollabError, CollabEvent};
+use crate::collab::{apply_event, CollabError, CollabEvent, Phase};
 use crate::config::McpAccessMode;
 use crate::db::knowledge_graph::KnowledgeGraph;
 use crate::db::SearchFilters;
@@ -1140,7 +1140,6 @@ fn handle_collab_end(app: &App, args: &Value) -> Result<Value, MemoryError> {
         // or coding phase prevents either agent from killing a session the
         // counterpart is still working in.
         let session = crate::collab::queue::load_session(tx, session_id)?;
-        use crate::collab::Phase;
         let allowed = matches!(
             session.phase,
             Phase::PlanLocked | Phase::CodingComplete | Phase::CodingFailed
@@ -1339,7 +1338,6 @@ fn build_collab_event(
     content: &str,
     session: &crate::collab::CollabSession,
 ) -> Result<CollabEvent, MemoryError> {
-    use crate::collab::Phase;
     match topic {
         "draft" => Ok(CollabEvent::SubmitDraft {
             content_hash: sha256_hex(content),
@@ -1408,20 +1406,11 @@ fn build_collab_event(
             Ok(CollabEvent::FinalReview { head_sha })
         }
         "pr_opened" => {
-            let head_sha = parse_required_head_sha(content, "pr_opened")?;
             let payload: Value = serde_json::from_str(content).map_err(|e| {
                 MemoryError::Validation(format!("pr_opened content must be JSON: {e}"))
             })?;
-            let pr_url = payload
-                .get("pr_url")
-                .and_then(Value::as_str)
-                .filter(|v| !v.is_empty())
-                .ok_or_else(|| {
-                    MemoryError::Validation(
-                        "pr_opened content must include a non-empty \"pr_url\" field".to_string(),
-                    )
-                })?
-                .to_string();
+            let head_sha = extract_required_str(&payload, "head_sha", "pr_opened")?;
+            let pr_url = extract_required_str(&payload, "pr_url", "pr_opened")?;
             Ok(CollabEvent::PrOpened { pr_url, head_sha })
         }
         "failure_report" => {
@@ -1530,33 +1519,28 @@ fn parse_task_list_event(content: &str) -> Result<CollabEvent, MemoryError> {
 fn parse_required_head_sha(content: &str, topic: &str) -> Result<String, MemoryError> {
     let payload: Value = serde_json::from_str(content)
         .map_err(|e| MemoryError::Validation(format!("{topic} content must be JSON: {e}")))?;
-    let head_sha = payload
-        .get("head_sha")
-        .and_then(Value::as_str)
-        .filter(|v| !v.is_empty())
-        .ok_or_else(|| {
-            MemoryError::Validation(format!(
-                "{topic} content must include a non-empty \"head_sha\" field"
-            ))
-        })?
-        .to_string();
-    Ok(head_sha)
+    extract_required_str(&payload, "head_sha", topic)
 }
 
 fn parse_required_verdict(content: &str, topic: &str) -> Result<String, MemoryError> {
     let payload: Value = serde_json::from_str(content)
         .map_err(|e| MemoryError::Validation(format!("{topic} content must be JSON: {e}")))?;
-    let verdict = payload
-        .get("verdict")
+    extract_required_str(&payload, "verdict", topic)
+}
+
+/// Pull a non-empty string field out of a parsed JSON payload with a uniform
+/// validation error.
+fn extract_required_str(payload: &Value, field: &str, topic: &str) -> Result<String, MemoryError> {
+    payload
+        .get(field)
         .and_then(Value::as_str)
         .filter(|v| !v.is_empty())
+        .map(str::to_string)
         .ok_or_else(|| {
             MemoryError::Validation(format!(
-                "{topic} content must include a non-empty \"verdict\" field"
+                "{topic} content must include a non-empty \"{field}\" field"
             ))
-        })?
-        .to_string();
-    Ok(verdict)
+        })
 }
 
 fn parse_review_verdict(content: &str) -> Result<String, MemoryError> {

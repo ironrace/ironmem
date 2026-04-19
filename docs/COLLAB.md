@@ -393,7 +393,7 @@ Phase → action (v2):
 | `CodeImplementPending` | run gates, commit, push, send `implement` | wait |
 | `CodeReviewPending` | wait | run reviewer tooling, send `review` |
 | `CodeVerdictPending` | send `verdict` (`agree` or `disagree_with_reasons`) | wait |
-| `CodeDebatePending` | wait | send `comment` with rebuttal | 
+| `CodeDebatePending` | wait | send `comment` with rebuttal |
 | `CodeFinalPending` | apply fixes, re-run gates, send `final` | wait |
 | `CodeReviewLocalPending` | run gates once more, send `review_local` | wait |
 | `CodeReviewCodexPending` | wait | run coderabbit, send `review_global` |
