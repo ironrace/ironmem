@@ -3,7 +3,11 @@ description: Start or join an IronRace bounded planning session with Codex, auto
 argument-hint: start <task> | join <session_id>
 ---
 
-<!-- DERIVED FROM docs/COLLAB.md — any protocol change must update BOTH files. -->
+<!-- DERIVED FROM docs/COLLAB.md — protocol changes must update:
+     - docs/COLLAB.md (spec)
+     - .claude-plugin/commands/collab.md (this file)
+     - .codex-plugin/prompts/collab.md (Codex mirror) -->
+
 
 You are participating in the IronRace bounded collaboration protocol (v1 planning
 + v2 coding). Full spec: `docs/COLLAB.md`. The user has invoked `/collab` with

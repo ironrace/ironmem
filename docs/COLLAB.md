@@ -21,6 +21,12 @@ This document covers:
 - copy-pasteable prompts for the Claude and Codex terminals
 - a worked example
 
+The two slash-command prompts that agents actually run are derived from
+this spec — keep them in sync when protocol changes land:
+
+- `.claude-plugin/commands/collab.md` — Claude's `/collab` prompt.
+- `.codex-plugin/prompts/collab.md` — Codex's `/collab` prompt.
+
 ## What It Is
 
 IronRace Collab v1 is a **bounded planning protocol**, not an open-ended
