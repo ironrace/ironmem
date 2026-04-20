@@ -937,9 +937,13 @@ fn task_list_payload(plan_hash: &str, base_sha: &str, head_sha: &str, n: usize) 
     .to_string()
 }
 
-/// Run implement → review → verdict=agree, advancing one task.
+/// Run implement → review_fix → final, advancing one task (v3 linear).
 fn happy_task_cycle(app: &App, session_id: &str, head: &str) {
-    for (sender, topic) in [("claude", "implement"), ("codex", "review")] {
+    for (sender, topic) in [
+        ("claude", "implement"),
+        ("codex", "review_fix"),
+        ("claude", "final"),
+    ] {
         call_tool(
             app,
             "collab_send",
@@ -951,16 +955,6 @@ fn happy_task_cycle(app: &App, session_id: &str, head: &str) {
             }),
         );
     }
-    call_tool(
-        app,
-        "collab_send",
-        json!({
-            "session_id": session_id,
-            "sender": "claude",
-            "topic": "verdict",
-            "content": json!({ "head_sha": head, "verdict": "agree" }).to_string()
-        }),
-    );
 }
 
 #[test]
@@ -995,7 +989,7 @@ fn collab_v2_happy_path_reaches_coding_complete() {
     let status = call_tool(&app, "collab_status", json!({ "session_id": &session_id }));
     assert_eq!(status["phase"], "CodeReviewLocalPending");
 
-    // Local review → global review agree → PR ready.
+    // Local → global review_fix → final_review (v3 linear, terminal in 3 turns).
     call_tool(
         &app,
         "collab_send",
@@ -1006,27 +1000,29 @@ fn collab_v2_happy_path_reaches_coding_complete() {
             "content": json!({ "head_sha": "h2" }).to_string()
         }),
     );
+    let status = call_tool(&app, "collab_status", json!({ "session_id": &session_id }));
+    assert_eq!(status["phase"], "CodeReviewFixGlobalPending");
+
     call_tool(
         &app,
         "collab_send",
         json!({
             "session_id": session_id,
             "sender": "codex",
-            "topic": "review_global",
-            "content": json!({ "head_sha": "h2", "verdict": "agree" }).to_string()
+            "topic": "review_fix_global",
+            "content": json!({ "head_sha": "h2" }).to_string()
         }),
     );
     let status = call_tool(&app, "collab_status", json!({ "session_id": &session_id }));
-    assert_eq!(status["phase"], "PrReadyPending");
+    assert_eq!(status["phase"], "CodeReviewFinalPending");
 
-    // PR opened → CodingComplete.
     call_tool(
         &app,
         "collab_send",
         json!({
             "session_id": session_id,
             "sender": "claude",
-            "topic": "pr_opened",
+            "topic": "final_review",
             "content": json!({ "head_sha": "h2", "pr_url": "https://example/pr/1" }).to_string()
         }),
     );
@@ -1045,7 +1041,9 @@ fn collab_v2_happy_path_reaches_coding_complete() {
 }
 
 #[test]
-fn collab_v2_task_disagree_round_loops_back_to_review() {
+fn collab_v3_per_task_linear_flow_advances_phases() {
+    // v3: single task → implement (claude) → review_fix (codex) → final (claude)
+    // advances directly to CodeReviewLocalPending. No disagree/debate round.
     let app = App::open_for_test().unwrap();
     let session_id = drive_to_plan_locked(&app, "fp");
     let hash = plan_hash(&app, &session_id);
@@ -1060,18 +1058,10 @@ fn collab_v2_task_disagree_round_loops_back_to_review() {
         }),
     );
 
-    // implement → review → verdict=disagree → debate comment → final
-    // (under cap, so Final loops back to CodeReviewPending).
-    for (sender, topic, extra) in [
-        ("claude", "implement", json!({ "head_sha": "h1" })),
-        ("codex", "review", json!({ "head_sha": "h1" })),
-        (
-            "claude",
-            "verdict",
-            json!({ "head_sha": "h1", "verdict": "disagree_with_reasons" }),
-        ),
-        ("codex", "comment", json!({ "head_sha": "h1" })),
-        ("claude", "final", json!({ "head_sha": "h1" })),
+    for (sender, topic, expected_phase) in [
+        ("claude", "implement", "CodeReviewFixPending"),
+        ("codex", "review_fix", "CodeFinalPending"),
+        ("claude", "final", "CodeReviewLocalPending"),
     ] {
         call_tool(
             &app,
@@ -1080,13 +1070,12 @@ fn collab_v2_task_disagree_round_loops_back_to_review() {
                 "session_id": session_id,
                 "sender": sender,
                 "topic": topic,
-                "content": extra.to_string()
+                "content": json!({ "head_sha": "h1" }).to_string()
             }),
         );
+        let status = call_tool(&app, "collab_status", json!({ "session_id": &session_id }));
+        assert_eq!(status["phase"], expected_phase);
     }
-    let status = call_tool(&app, "collab_status", json!({ "session_id": &session_id }));
-    assert_eq!(status["phase"], "CodeReviewPending");
-    assert_eq!(status["task_review_round"], 1);
 }
 
 #[test]
@@ -1126,7 +1115,7 @@ fn collab_v2_end_rejected_in_coding_active_phase() {
             "content": json!({ "head_sha": "h1" }).to_string()
         }),
     );
-    assert_eq!(ok["phase"], "CodeReviewPending");
+    assert_eq!(ok["phase"], "CodeReviewFixPending");
 }
 
 #[test]

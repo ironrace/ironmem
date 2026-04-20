@@ -13,9 +13,11 @@ pub struct CollabSession {
     pub final_plan_hash: Option<String>,
     pub codex_review_verdict: Option<String>,
     pub review_round: u8,
-    // v2 coding fields. `tasks_count` is not stored — it is derived from
+    // v3 coding fields. `tasks_count` is not stored — it is derived from
     // `task_list` via `tasks_count_from_list` so there is a single source of
-    // truth for task cardinality.
+    // truth for task cardinality. `task_review_round` and `global_review_round`
+    // are vestigial (v2 held per-task and global verdict cycles; v3 is linear
+    // and never increments them) but remain as columns to avoid a migration.
     pub task_list: Option<String>,
     pub current_task_index: Option<u32>,
     pub task_review_round: u8,

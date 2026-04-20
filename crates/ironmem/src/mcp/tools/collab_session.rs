@@ -43,9 +43,9 @@ pub(super) fn session_record_json(record: &SessionRecord) -> Value {
 }
 
 /// True for every topic the collab_send handler accepts — v1 planning
-/// vocabulary plus the v2 coding vocabulary. The topic strings `review` and
-/// `final` are intentionally reused across versions; dispatch happens on the
-/// current phase inside `build_collab_event`.
+/// vocabulary plus the v3 coding vocabulary. The topic string `final` is
+/// intentionally reused across versions; dispatch happens on the current
+/// phase inside `build_collab_event`.
 pub(super) fn is_known_collab_topic(topic: &str) -> bool {
     matches!(
         topic,
@@ -55,14 +55,10 @@ pub(super) fn is_known_collab_topic(topic: &str) -> bool {
             | "final"
             | "task_list"
             | "implement"
-            | "verdict"
-            | "comment"
+            | "review_fix"
             | "review_local"
-            | "review_global"
-            | "verdict_global"
-            | "comment_global"
+            | "review_fix_global"
             | "final_review"
-            | "pr_opened"
             | "failure_report"
     )
 }

@@ -13,7 +13,7 @@ pub enum CollabEvent {
     PublishFinal {
         content_hash: String,
     },
-    // v2 coding
+    // v3 coding
     SubmitTaskList {
         plan_hash: String,
         base_sha: String,
@@ -24,14 +24,10 @@ pub enum CollabEvent {
     CodeImplement {
         head_sha: String,
     },
-    CodeReview {
-        head_sha: String,
-    },
-    CodeVerdict {
-        verdict: String,
-        head_sha: String,
-    },
-    CodeComment {
+    /// Codex per-task: reviewed Claude's implementation and applied fixes
+    /// directly (may be a no-op commit if clean). `head_sha` is the post-fix
+    /// HEAD that Claude pulls for the final phase.
+    CodeReviewFix {
         head_sha: String,
     },
     CodeFinal {
@@ -40,23 +36,17 @@ pub enum CollabEvent {
     ReviewLocal {
         head_sha: String,
     },
-    ReviewGlobal {
-        verdict: String,
+    /// Codex global: reviewed the full task stack and applied fixes directly.
+    /// Mirrors `CodeReviewFix` at the global scope.
+    CodeReviewFixGlobal {
         head_sha: String,
     },
-    VerdictGlobal {
-        verdict: String,
-        head_sha: String,
-    },
-    CommentGlobal {
-        head_sha: String,
-    },
+    /// Claude's final global turn — includes the opened PR URL so the session
+    /// advances straight to `CodingComplete` in one send (no separate
+    /// `pr_opened`).
     FinalReview {
         head_sha: String,
-    },
-    PrOpened {
         pr_url: String,
-        head_sha: String,
     },
     /// Emitted by either agent when branch drift, gate exhaustion, `gh_auth`,
     /// or any other unrecoverable error occurs during coding. Transitions to
@@ -76,16 +66,11 @@ impl CollabEvent {
             Self::PublishFinal { .. } => "PublishFinal",
             Self::SubmitTaskList { .. } => "SubmitTaskList",
             Self::CodeImplement { .. } => "CodeImplement",
-            Self::CodeReview { .. } => "CodeReview",
-            Self::CodeVerdict { .. } => "CodeVerdict",
-            Self::CodeComment { .. } => "CodeComment",
+            Self::CodeReviewFix { .. } => "CodeReviewFix",
             Self::CodeFinal { .. } => "CodeFinal",
             Self::ReviewLocal { .. } => "ReviewLocal",
-            Self::ReviewGlobal { .. } => "ReviewGlobal",
-            Self::VerdictGlobal { .. } => "VerdictGlobal",
-            Self::CommentGlobal { .. } => "CommentGlobal",
+            Self::CodeReviewFixGlobal { .. } => "CodeReviewFixGlobal",
             Self::FinalReview { .. } => "FinalReview",
-            Self::PrOpened { .. } => "PrOpened",
             Self::FailureReport { .. } => "FailureReport",
         }
     }

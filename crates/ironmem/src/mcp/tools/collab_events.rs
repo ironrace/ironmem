@@ -12,14 +12,14 @@ use super::shared::sha256_hex;
 /// unbounded string.
 const MAX_CODING_FAILURE_CHARS: usize = 2048;
 
-/// Maximum length (chars) for `pr_url` on a pr_opened event. Matches the
+/// Maximum length (chars) for `pr_url` on a final_review event. Matches the
 /// CHECK constraint in migration 005.
 const MAX_PR_URL_CHARS: usize = 2048;
 
 /// Translate a `(topic, content)` send into a `CollabEvent` using the session's
-/// current phase to disambiguate v1/v2-overloaded topics (`review`, `final`).
-/// Dispatch is split into v1 planning, phase-overloaded, and v2 coding groups
-/// so each sub-function stays under the file's 50-line function guideline.
+/// current phase to disambiguate v1/v3-overloaded topics (`final`). Dispatch
+/// is split into v1 planning, phase-overloaded, and v3 coding groups so each
+/// sub-function stays under the file's 50-line function guideline.
 pub(super) fn build_collab_event(
     topic: &str,
     content: &str,
@@ -27,11 +27,10 @@ pub(super) fn build_collab_event(
 ) -> Result<CollabEvent, MemoryError> {
     match topic {
         "draft" | "canonical" => build_v1_plan_event(topic, content),
-        "review" | "final" => build_overloaded_event(topic, content, &session.phase),
-        "task_list" | "implement" | "verdict" | "comment" | "review_local" | "review_global"
-        | "verdict_global" | "comment_global" | "final_review" | "pr_opened" | "failure_report" => {
-            build_v2_coding_event(topic, content)
-        }
+        "review" => build_v1_review_event(content),
+        "final" => build_overloaded_final_event(content, &session.phase),
+        "task_list" | "implement" | "review_fix" | "review_local" | "review_fix_global"
+        | "final_review" | "failure_report" => build_v3_coding_event(topic, content),
         other => Err(MemoryError::Validation(format!(
             "unknown collab topic: {other}"
         ))),
@@ -52,43 +51,42 @@ pub(super) fn build_v1_plan_event(topic: &str, content: &str) -> Result<CollabEv
     }
 }
 
-/// Phase-overloaded topics (`review`, `final`) are shared across v1 planning
-/// and v2 per-task coding. An explicit phase whitelist picks the right event
-/// variant — anything outside the whitelist is rejected here so the caller
-/// gets a clean `WrongPhase` instead of a cryptic JSON parse error downstream.
-pub(super) fn build_overloaded_event(
-    topic: &str,
+/// v1 `review` topic — plan-only now. v3 removed the per-task `review` topic
+/// entirely (Codex reviews+fixes in a single `review_fix` send).
+pub(super) fn build_v1_review_event(content: &str) -> Result<CollabEvent, MemoryError> {
+    Ok(CollabEvent::SubmitReview {
+        verdict: parse_review_verdict(content)?,
+    })
+}
+
+/// `final` is shared across v1 plan finalization and v3 per-task finalization.
+/// An explicit phase whitelist picks the right event variant — anything
+/// outside the whitelist is rejected here so the caller gets a clean
+/// `WrongPhase` instead of a cryptic JSON parse error downstream.
+pub(super) fn build_overloaded_final_event(
     content: &str,
     phase: &Phase,
 ) -> Result<CollabEvent, MemoryError> {
-    match (topic, phase) {
-        ("review", Phase::PlanCodexReviewPending) => Ok(CollabEvent::SubmitReview {
-            verdict: parse_review_verdict(content)?,
-        }),
-        ("review", Phase::CodeReviewPending) => {
-            let head_sha = parse_required_head_sha(content, "review")?;
-            Ok(CollabEvent::CodeReview { head_sha })
-        }
-        ("final", Phase::PlanClaudeFinalizePending) => {
+    match phase {
+        Phase::PlanClaudeFinalizePending => {
             let plan = parse_final_payload(content)?;
             Ok(CollabEvent::PublishFinal {
                 content_hash: sha256_hex(&plan),
             })
         }
-        ("final", Phase::CodeFinalPending) => {
+        Phase::CodeFinalPending => {
             let head_sha = parse_required_head_sha(content, "final")?;
             Ok(CollabEvent::CodeFinal { head_sha })
         }
-        (topic, phase) => Err(MemoryError::Validation(format!(
-            "topic '{topic}' is not accepted in phase {phase}; v1 expects it in PlanCodexReviewPending/PlanClaudeFinalizePending and v2 expects it in CodeReviewPending/CodeFinalPending",
+        other => Err(MemoryError::Validation(format!(
+            "topic 'final' is not accepted in phase {other}; expected PlanClaudeFinalizePending or CodeFinalPending",
         ))),
     }
 }
 
-/// v2 coding topics. Each payload is parsed once and required fields are
-/// extracted in a single pass so `verdict_global` / `review_global` don't
-/// double-parse their JSON for head_sha and verdict.
-pub(super) fn build_v2_coding_event(
+/// v3 coding topics. Codex's review+fix events carry only `head_sha` — the
+/// post-fix commit Claude pulls for the final phase.
+pub(super) fn build_v3_coding_event(
     topic: &str,
     content: &str,
 ) -> Result<CollabEvent, MemoryError> {
@@ -97,54 +95,39 @@ pub(super) fn build_v2_coding_event(
         "implement" => Ok(CollabEvent::CodeImplement {
             head_sha: parse_required_head_sha(content, "implement")?,
         }),
-        "verdict" => {
-            let (head_sha, verdict) = parse_head_sha_and_verdict(content, "verdict")?;
-            Ok(CollabEvent::CodeVerdict { verdict, head_sha })
-        }
-        "comment" => Ok(CollabEvent::CodeComment {
-            head_sha: parse_required_head_sha(content, "comment")?,
+        "review_fix" => Ok(CollabEvent::CodeReviewFix {
+            head_sha: parse_required_head_sha(content, "review_fix")?,
         }),
         "review_local" => Ok(CollabEvent::ReviewLocal {
             head_sha: parse_required_head_sha(content, "review_local")?,
         }),
-        "review_global" => {
-            let (head_sha, verdict) = parse_head_sha_and_verdict(content, "review_global")?;
-            Ok(CollabEvent::ReviewGlobal { verdict, head_sha })
-        }
-        "verdict_global" => {
-            let (head_sha, verdict) = parse_head_sha_and_verdict(content, "verdict_global")?;
-            Ok(CollabEvent::VerdictGlobal { verdict, head_sha })
-        }
-        "comment_global" => Ok(CollabEvent::CommentGlobal {
-            head_sha: parse_required_head_sha(content, "comment_global")?,
+        "review_fix_global" => Ok(CollabEvent::CodeReviewFixGlobal {
+            head_sha: parse_required_head_sha(content, "review_fix_global")?,
         }),
-        "final_review" => Ok(CollabEvent::FinalReview {
-            head_sha: parse_required_head_sha(content, "final_review")?,
-        }),
-        "pr_opened" => parse_pr_opened_event(content),
+        "final_review" => parse_final_review_event(content),
         "failure_report" => parse_failure_report_event(content),
-        _ => unreachable!("build_v2_coding_event called with non-v2 topic: {topic}"),
+        _ => unreachable!("build_v3_coding_event called with non-v3 topic: {topic}"),
     }
 }
 
-pub(super) fn parse_pr_opened_event(content: &str) -> Result<CollabEvent, MemoryError> {
+pub(super) fn parse_final_review_event(content: &str) -> Result<CollabEvent, MemoryError> {
     let payload: Value = serde_json::from_str(content)
-        .map_err(|e| MemoryError::Validation(format!("pr_opened content must be JSON: {e}")))?;
-    let head_sha = extract_required_str(&payload, "head_sha", "pr_opened")?;
-    let pr_url = extract_required_str(&payload, "pr_url", "pr_opened")?;
+        .map_err(|e| MemoryError::Validation(format!("final_review content must be JSON: {e}")))?;
+    let head_sha = extract_required_str(&payload, "head_sha", "final_review")?;
+    let pr_url = extract_required_str(&payload, "pr_url", "final_review")?;
     if pr_url.chars().count() > MAX_PR_URL_CHARS {
         return Err(MemoryError::Validation(format!(
-            "pr_opened pr_url exceeds {MAX_PR_URL_CHARS} chars",
+            "final_review pr_url exceeds {MAX_PR_URL_CHARS} chars",
         )));
     }
     // Only https URLs are accepted — a javascript:/file:// URL here could
     // become an open-redirect or SSRF if any downstream consumer renders it.
     if !pr_url.starts_with("https://") {
         return Err(MemoryError::Validation(
-            "pr_opened pr_url must start with https://".to_string(),
+            "final_review pr_url must start with https://".to_string(),
         ));
     }
-    Ok(CollabEvent::PrOpened { pr_url, head_sha })
+    Ok(CollabEvent::FinalReview { head_sha, pr_url })
 }
 
 pub(super) fn parse_failure_report_event(content: &str) -> Result<CollabEvent, MemoryError> {
@@ -182,20 +165,6 @@ pub(super) fn failure_report_is_branch_drift(content: &str) -> bool {
                 .map(|s| s.starts_with(crate::collab::BRANCH_DRIFT_PREFIX))
         })
         .unwrap_or(false)
-}
-
-/// Parse the JSON payload once and extract both `head_sha` and `verdict` in a
-/// single pass. Used by `verdict` / `review_global` / `verdict_global` which
-/// all need both fields.
-pub(super) fn parse_head_sha_and_verdict(
-    content: &str,
-    topic: &str,
-) -> Result<(String, String), MemoryError> {
-    let payload: Value = serde_json::from_str(content)
-        .map_err(|e| MemoryError::Validation(format!("{topic} content must be JSON: {e}")))?;
-    let head_sha = extract_required_str(&payload, "head_sha", topic)?;
-    let verdict = extract_required_str(&payload, "verdict", topic)?;
-    Ok((head_sha, verdict))
 }
 
 /// Parse and validate the task_list payload shape. Fails fast on missing
@@ -345,14 +314,14 @@ mod tests {
                 .expect("head_sha should extract successfully"),
             "abc123"
         );
-        let missing = extract_required_str(&payload, "pr_url", "pr_opened").unwrap_err();
+        let missing = extract_required_str(&payload, "pr_url", "final_review").unwrap_err();
         assert_eq!(
             missing.to_string(),
-            "Validation error: pr_opened content must include a non-empty \"pr_url\" field"
+            "Validation error: final_review content must include a non-empty \"pr_url\" field"
         );
-        let empty = extract_required_str(&payload, "empty", "verdict").unwrap_err();
+        let empty = extract_required_str(&payload, "empty", "review_fix").unwrap_err();
         assert!(empty.to_string().contains("non-empty \"empty\" field"));
-        let wrong_type = extract_required_str(&payload, "n", "verdict").unwrap_err();
+        let wrong_type = extract_required_str(&payload, "n", "review_fix").unwrap_err();
         assert!(wrong_type.to_string().contains("non-empty \"n\" field"));
     }
 }

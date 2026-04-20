@@ -9,22 +9,6 @@ use super::BRANCH_DRIFT_PREFIX;
 /// verdict (she always gets the last word).
 pub(super) const MAX_REVIEW_ROUNDS: u8 = 2;
 
-/// Maximum number of Codex-review debate rounds per coding task. At the cap,
-/// Claude's `verdict=disagree_with_reasons` skips Debate and lands directly
-/// in `CodeFinalPending`, which advances the task instead of looping back.
-pub(super) const MAX_TASK_REVIEW_ROUNDS: u8 = 2;
-
-/// Maximum number of Codex disagree rounds during global review. At the cap,
-/// `CodeReviewFinalPending` advances straight to `PrReadyPending` instead of
-/// looping back for another Codex pass.
-pub(super) const MAX_GLOBAL_REVIEW_ROUNDS: u8 = 2;
-
-/// The set of verdicts accepted on v2 coding topics (`verdict`,
-/// `verdict_global`, `review_global`). `review_global` uses the same strings
-/// even though only Codex sends it — keeping the vocabulary uniform means
-/// harness code can share a verdict-parsing helper.
-pub(super) const CODING_VERDICTS: [&str; 2] = ["agree", "disagree_with_reasons"];
-
 /// Require an actor to match the expected value, else return `NotYourTurn`.
 fn require_actor(actor: &str, expected: &str) -> Result<(), CollabError> {
     if actor == expected {
@@ -37,23 +21,14 @@ fn require_actor(actor: &str, expected: &str) -> Result<(), CollabError> {
     }
 }
 
-/// Validate one of the coding-loop verdict strings.
-fn validate_coding_verdict(verdict: &str) -> Result<(), CollabError> {
-    if CODING_VERDICTS.contains(&verdict) {
-        Ok(())
-    } else {
-        Err(CollabError::InvalidVerdictValue(verdict.to_string()))
-    }
-}
-
 pub fn apply_event(
     session: &CollabSession,
     actor: &str,
     event: &CollabEvent,
 ) -> Result<CollabSession, CollabError> {
-    // v2: PlanLocked is transient pre-`task_list`. The ONLY transition out of
-    // it is a `SubmitTaskList` from Claude — anything else is rejected as
-    // SessionLocked. The terminal coding phases reject all further events.
+    // v3: terminal coding phases reject all further events. PlanLocked is
+    // transient pre-`task_list`; the only transition out of it is a
+    // `SubmitTaskList` from Claude.
     if matches!(session.phase, Phase::CodingComplete | Phase::CodingFailed) {
         return Err(CollabError::SessionLocked);
     }
@@ -130,7 +105,7 @@ pub fn apply_event(
             next.final_plan_hash = Some(content_hash.clone());
             next.phase = Phase::PlanLocked;
         }
-        // ── v2: the one transition out of PlanLocked ──────────────────────
+        // ── v3: the one transition out of PlanLocked ──────────────────────
         (
             Phase::PlanLocked,
             CollabEvent::SubmitTaskList {
@@ -167,40 +142,19 @@ pub fn apply_event(
             next.phase = Phase::CodeImplementPending;
             next.current_owner = "claude".to_string();
         }
-        // ── v2: per-task 5-phase debate ───────────────────────────────────
+        // ── v3: per-task 3-phase linear ───────────────────────────────────
+        // Claude implements → Codex reviews+fixes → Claude final → next task.
+        // No verdict, no debate: Codex writes code directly rather than
+        // handing review notes back for Claude to apply. This both shortens
+        // the loop and removes the `verdict`/`comment` turns where Claude
+        // could steer Codex's conclusion.
         (Phase::CodeImplementPending, CollabEvent::CodeImplement { head_sha }) => {
             require_actor(actor, "claude")?;
             next.last_head_sha = Some(head_sha.clone());
-            next.phase = Phase::CodeReviewPending;
+            next.phase = Phase::CodeReviewFixPending;
             next.current_owner = "codex".to_string();
         }
-        (Phase::CodeReviewPending, CollabEvent::CodeReview { head_sha }) => {
-            require_actor(actor, "codex")?;
-            next.last_head_sha = Some(head_sha.clone());
-            next.phase = Phase::CodeVerdictPending;
-            next.current_owner = "claude".to_string();
-        }
-        (Phase::CodeVerdictPending, CollabEvent::CodeVerdict { verdict, head_sha }) => {
-            require_actor(actor, "claude")?;
-            validate_coding_verdict(verdict)?;
-            next.last_head_sha = Some(head_sha.clone());
-            if verdict == "agree" {
-                next.advance_task();
-            } else {
-                // disagree_with_reasons: bump the debate counter. At cap, skip
-                // the Debate phase and go straight to Final — Claude still has
-                // the last word but Codex gets no further rebuttal.
-                next.task_review_round = session.task_review_round.saturating_add(1);
-                if next.task_review_round >= MAX_TASK_REVIEW_ROUNDS {
-                    next.phase = Phase::CodeFinalPending;
-                    next.current_owner = "claude".to_string();
-                } else {
-                    next.phase = Phase::CodeDebatePending;
-                    next.current_owner = "codex".to_string();
-                }
-            }
-        }
-        (Phase::CodeDebatePending, CollabEvent::CodeComment { head_sha }) => {
+        (Phase::CodeReviewFixPending, CollabEvent::CodeReviewFix { head_sha }) => {
             require_actor(actor, "codex")?;
             next.last_head_sha = Some(head_sha.clone());
             next.phase = Phase::CodeFinalPending;
@@ -209,75 +163,29 @@ pub fn apply_event(
         (Phase::CodeFinalPending, CollabEvent::CodeFinal { head_sha }) => {
             require_actor(actor, "claude")?;
             next.last_head_sha = Some(head_sha.clone());
-            // Read from `next` so the check is robust if a future refactor
-            // mutates `next.task_review_round` in this arm. `next` is a fresh
-            // clone of `session`, so values are equal today.
-            if next.task_review_round >= MAX_TASK_REVIEW_ROUNDS {
-                // Round cap reached — force advance instead of looping back.
-                next.advance_task();
-            } else {
-                // Under the cap: loop back so Codex re-reviews Claude's fixes.
-                // `task_review_round` is preserved across the loopback so the
-                // next CodeVerdictPending→CodeFinalPending cycle sees the
-                // incremented counter.
-                next.phase = Phase::CodeReviewPending;
-                next.current_owner = "codex".to_string();
-            }
+            next.advance_task();
         }
-        // ── v2: local review (Claude solo) ────────────────────────────────
+        // ── v3: global review, 3-phase linear ─────────────────────────────
         (Phase::CodeReviewLocalPending, CollabEvent::ReviewLocal { head_sha }) => {
             require_actor(actor, "claude")?;
             next.last_head_sha = Some(head_sha.clone());
-            next.phase = Phase::CodeReviewCodexPending;
+            next.phase = Phase::CodeReviewFixGlobalPending;
             next.current_owner = "codex".to_string();
         }
-        // ── v2: global Codex review (4-phase, 2-pass) ─────────────────────
-        (Phase::CodeReviewCodexPending, CollabEvent::ReviewGlobal { verdict, head_sha }) => {
-            require_actor(actor, "codex")?;
-            validate_coding_verdict(verdict)?;
-            next.last_head_sha = Some(head_sha.clone());
-            if verdict == "agree" {
-                next.phase = Phase::PrReadyPending;
-                next.current_owner = "claude".to_string();
-            } else {
-                next.global_review_round = session.global_review_round.saturating_add(1);
-                next.phase = Phase::CodeReviewVerdictPending;
-                next.current_owner = "claude".to_string();
-            }
-        }
-        (Phase::CodeReviewVerdictPending, CollabEvent::VerdictGlobal { verdict, head_sha }) => {
-            require_actor(actor, "claude")?;
-            validate_coding_verdict(verdict)?;
-            next.last_head_sha = Some(head_sha.clone());
-            next.phase = Phase::CodeReviewDebatePending;
-            next.current_owner = "codex".to_string();
-        }
-        (Phase::CodeReviewDebatePending, CollabEvent::CommentGlobal { head_sha }) => {
+        (Phase::CodeReviewFixGlobalPending, CollabEvent::CodeReviewFixGlobal { head_sha }) => {
             require_actor(actor, "codex")?;
             next.last_head_sha = Some(head_sha.clone());
             next.phase = Phase::CodeReviewFinalPending;
             next.current_owner = "claude".to_string();
         }
-        (Phase::CodeReviewFinalPending, CollabEvent::FinalReview { head_sha }) => {
-            require_actor(actor, "claude")?;
-            next.last_head_sha = Some(head_sha.clone());
-            if session.global_review_round >= MAX_GLOBAL_REVIEW_ROUNDS {
-                next.phase = Phase::PrReadyPending;
-                next.current_owner = "claude".to_string();
-            } else {
-                next.phase = Phase::CodeReviewCodexPending;
-                next.current_owner = "codex".to_string();
-            }
-        }
-        // ── v2: PR handoff ────────────────────────────────────────────────
-        (Phase::PrReadyPending, CollabEvent::PrOpened { pr_url, head_sha }) => {
+        (Phase::CodeReviewFinalPending, CollabEvent::FinalReview { head_sha, pr_url }) => {
             require_actor(actor, "claude")?;
             next.last_head_sha = Some(head_sha.clone());
             next.pr_url = Some(pr_url.clone());
             next.phase = Phase::CodingComplete;
             next.current_owner = "claude".to_string();
         }
-        // ── v2: failure is valid from any coding-active phase ─────────────
+        // ── v3: failure is valid from any coding-active phase ─────────────
         (phase, CollabEvent::FailureReport { coding_failure }) if phase.is_coding_active() => {
             // Drift failures (prefix `branch_drift:`) may be emitted by either
             // agent because the non-owner often detects drift via its own git

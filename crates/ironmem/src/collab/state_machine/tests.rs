@@ -166,7 +166,7 @@ fn test_invalid_verdict_rejected() {
     );
 }
 
-// ── v2: PlanLocked → task_list transition ────────────────────────────
+// ── v3: PlanLocked → task_list transition ────────────────────────────
 
 #[test]
 fn test_task_list_transitions_to_code_implement() {
@@ -273,8 +273,9 @@ fn test_task_list_rejected_before_plan_locked() {
     assert!(matches!(err, CollabError::WrongPhase { .. }));
 }
 
-// ── v2: per-task happy path ──────────────────────────────────────────
+// ── v3: per-task linear 3-phase flow ─────────────────────────────────
 
+/// Run one complete per-task cycle: Claude implement → Codex review/fix → Claude final.
 fn happy_task_cycle(s: &CollabSession, head: &str) -> CollabSession {
     let s = apply_event(
         s,
@@ -287,7 +288,7 @@ fn happy_task_cycle(s: &CollabSession, head: &str) -> CollabSession {
     let s = apply_event(
         &s,
         "codex",
-        &CollabEvent::CodeReview {
+        &CollabEvent::CodeReviewFix {
             head_sha: head.to_string(),
         },
     )
@@ -295,12 +296,54 @@ fn happy_task_cycle(s: &CollabSession, head: &str) -> CollabSession {
     apply_event(
         &s,
         "claude",
-        &CollabEvent::CodeVerdict {
-            verdict: "agree".to_string(),
+        &CollabEvent::CodeFinal {
             head_sha: head.to_string(),
         },
     )
     .unwrap()
+}
+
+#[test]
+fn test_per_task_linear_flow_advances_phases() {
+    let s = locked_session("hf");
+    let s = submit_task_list(&s, "hf", 1);
+
+    // Implement: claude → codex
+    let s = apply_event(
+        &s,
+        "claude",
+        &CollabEvent::CodeImplement {
+            head_sha: "h1".to_string(),
+        },
+    )
+    .unwrap();
+    assert_eq!(s.phase, Phase::CodeReviewFixPending);
+    assert_eq!(s.current_owner, "codex");
+
+    // Review+fix: codex → claude
+    let s = apply_event(
+        &s,
+        "codex",
+        &CollabEvent::CodeReviewFix {
+            head_sha: "h2".to_string(),
+        },
+    )
+    .unwrap();
+    assert_eq!(s.phase, Phase::CodeFinalPending);
+    assert_eq!(s.current_owner, "claude");
+    assert_eq!(s.last_head_sha.as_deref(), Some("h2"));
+
+    // Final: claude → advance (single-task plan → local review)
+    let s = apply_event(
+        &s,
+        "claude",
+        &CollabEvent::CodeFinal {
+            head_sha: "h3".to_string(),
+        },
+    )
+    .unwrap();
+    assert_eq!(s.phase, Phase::CodeReviewLocalPending);
+    assert_eq!(s.current_owner, "claude");
 }
 
 #[test]
@@ -310,12 +353,10 @@ fn test_two_task_happy_path_reaches_local_review() {
     let s = happy_task_cycle(&s, "h1");
     assert_eq!(s.phase, Phase::CodeImplementPending);
     assert_eq!(s.current_task_index, Some(1));
-    assert_eq!(s.task_review_round, 0);
 
     let s = happy_task_cycle(&s, "h2");
     assert_eq!(s.phase, Phase::CodeReviewLocalPending);
     assert_eq!(s.current_owner, "claude");
-    assert_eq!(s.task_review_round, 0);
 }
 
 #[test]
@@ -333,13 +374,33 @@ fn test_code_implement_wrong_sender_rejected() {
     assert!(matches!(err, CollabError::NotYourTurn { .. }));
 }
 
-// ── v2: per-task disagree round + cap ────────────────────────────────
-
 #[test]
-fn test_task_disagree_round_loops_back_to_review() {
+fn test_code_review_fix_wrong_sender_rejected() {
     let s = locked_session("hf");
     let s = submit_task_list(&s, "hf", 1);
-    // implement → review → verdict=disagree
+    let s = apply_event(
+        &s,
+        "claude",
+        &CollabEvent::CodeImplement {
+            head_sha: "h1".to_string(),
+        },
+    )
+    .unwrap();
+    let err = apply_event(
+        &s,
+        "claude",
+        &CollabEvent::CodeReviewFix {
+            head_sha: "h2".to_string(),
+        },
+    )
+    .unwrap_err();
+    assert!(matches!(err, CollabError::NotYourTurn { .. }));
+}
+
+#[test]
+fn test_code_final_wrong_sender_rejected() {
+    let s = locked_session("hf");
+    let s = submit_task_list(&s, "hf", 1);
     let s = apply_event(
         &s,
         "claude",
@@ -351,291 +412,68 @@ fn test_task_disagree_round_loops_back_to_review() {
     let s = apply_event(
         &s,
         "codex",
-        &CollabEvent::CodeReview {
-            head_sha: "h1".to_string(),
-        },
-    )
-    .unwrap();
-    let s = apply_event(
-        &s,
-        "claude",
-        &CollabEvent::CodeVerdict {
-            verdict: "disagree_with_reasons".to_string(),
-            head_sha: "h1".to_string(),
-        },
-    )
-    .unwrap();
-    assert_eq!(s.phase, Phase::CodeDebatePending);
-    assert_eq!(s.task_review_round, 1);
-    assert_eq!(s.current_owner, "codex");
-
-    let s = apply_event(
-        &s,
-        "codex",
-        &CollabEvent::CodeComment {
+        &CollabEvent::CodeReviewFix {
             head_sha: "h2".to_string(),
         },
     )
     .unwrap();
-    assert_eq!(s.phase, Phase::CodeFinalPending);
-    assert_eq!(s.current_owner, "claude");
-
-    let s = apply_event(
+    let err = apply_event(
         &s,
-        "claude",
+        "codex",
         &CollabEvent::CodeFinal {
             head_sha: "h3".to_string(),
         },
     )
-    .unwrap();
-    // Under cap: loops back to Review so Codex re-reviews Claude's fixes.
-    assert_eq!(s.phase, Phase::CodeReviewPending);
-    assert_eq!(s.task_review_round, 1);
+    .unwrap_err();
+    assert!(matches!(err, CollabError::NotYourTurn { .. }));
 }
 
-#[test]
-fn test_two_disagrees_force_final_and_advance() {
-    let s = locked_session("hf");
-    let s = submit_task_list(&s, "hf", 1);
-    let s = apply_event(
-        &s,
-        "claude",
-        &CollabEvent::CodeImplement {
-            head_sha: "h".to_string(),
-        },
-    )
-    .unwrap();
-    // Round 1
-    let s = apply_event(
-        &s,
-        "codex",
-        &CollabEvent::CodeReview {
-            head_sha: "h".to_string(),
-        },
-    )
-    .unwrap();
-    let s = apply_event(
-        &s,
-        "claude",
-        &CollabEvent::CodeVerdict {
-            verdict: "disagree_with_reasons".to_string(),
-            head_sha: "h".to_string(),
-        },
-    )
-    .unwrap();
-    let s = apply_event(
-        &s,
-        "codex",
-        &CollabEvent::CodeComment {
-            head_sha: "h".to_string(),
-        },
-    )
-    .unwrap();
-    let s = apply_event(
-        &s,
-        "claude",
-        &CollabEvent::CodeFinal {
-            head_sha: "h".to_string(),
-        },
-    )
-    .unwrap();
-    assert_eq!(s.phase, Phase::CodeReviewPending);
-    // Round 2: disagree at cap skips Debate and goes straight to Final.
-    let s = apply_event(
-        &s,
-        "codex",
-        &CollabEvent::CodeReview {
-            head_sha: "h".to_string(),
-        },
-    )
-    .unwrap();
-    let s = apply_event(
-        &s,
-        "claude",
-        &CollabEvent::CodeVerdict {
-            verdict: "disagree_with_reasons".to_string(),
-            head_sha: "h".to_string(),
-        },
-    )
-    .unwrap();
-    assert_eq!(s.phase, Phase::CodeFinalPending);
-    assert_eq!(s.task_review_round, MAX_TASK_REVIEW_ROUNDS);
-
-    // Final at cap advances (single-task plan → local review).
-    let s = apply_event(
-        &s,
-        "claude",
-        &CollabEvent::CodeFinal {
-            head_sha: "h".to_string(),
-        },
-    )
-    .unwrap();
-    assert_eq!(s.phase, Phase::CodeReviewLocalPending);
-    assert_eq!(s.task_review_round, 0);
-}
-
-// ── v2: global review ────────────────────────────────────────────────
+// ── v3: global review, linear 3-phase flow ───────────────────────────
 
 #[test]
-fn test_review_global_agree_goes_directly_to_pr_ready() {
+fn test_global_review_linear_flow_ends_in_coding_complete() {
     let s = locked_session("hf");
     let s = submit_task_list(&s, "hf", 1);
     let s = happy_task_cycle(&s, "h");
     assert_eq!(s.phase, Phase::CodeReviewLocalPending);
+
+    // Local: claude → codex
     let s = apply_event(
         &s,
         "claude",
         &CollabEvent::ReviewLocal {
-            head_sha: "h".to_string(),
+            head_sha: "g1".to_string(),
         },
     )
     .unwrap();
-    assert_eq!(s.phase, Phase::CodeReviewCodexPending);
+    assert_eq!(s.phase, Phase::CodeReviewFixGlobalPending);
     assert_eq!(s.current_owner, "codex");
 
+    // Global review+fix: codex → claude
     let s = apply_event(
         &s,
         "codex",
-        &CollabEvent::ReviewGlobal {
-            verdict: "agree".to_string(),
-            head_sha: "h".to_string(),
+        &CollabEvent::CodeReviewFixGlobal {
+            head_sha: "g2".to_string(),
         },
     )
     .unwrap();
-    assert_eq!(s.phase, Phase::PrReadyPending);
+    assert_eq!(s.phase, Phase::CodeReviewFinalPending);
     assert_eq!(s.current_owner, "claude");
-    assert_eq!(s.global_review_round, 0);
-}
 
-#[test]
-fn test_global_review_disagree_round_loops_and_bumps_counter() {
-    let s = locked_session("hf");
-    let s = submit_task_list(&s, "hf", 1);
-    let s = happy_task_cycle(&s, "h");
-    let s = apply_event(
-        &s,
-        "claude",
-        &CollabEvent::ReviewLocal {
-            head_sha: "h".to_string(),
-        },
-    )
-    .unwrap();
-    let s = apply_event(
-        &s,
-        "codex",
-        &CollabEvent::ReviewGlobal {
-            verdict: "disagree_with_reasons".to_string(),
-            head_sha: "h".to_string(),
-        },
-    )
-    .unwrap();
-    assert_eq!(s.phase, Phase::CodeReviewVerdictPending);
-    assert_eq!(s.global_review_round, 1);
-
-    let s = apply_event(
-        &s,
-        "claude",
-        &CollabEvent::VerdictGlobal {
-            verdict: "disagree_with_reasons".to_string(),
-            head_sha: "h".to_string(),
-        },
-    )
-    .unwrap();
-    let s = apply_event(
-        &s,
-        "codex",
-        &CollabEvent::CommentGlobal {
-            head_sha: "h".to_string(),
-        },
-    )
-    .unwrap();
+    // Final review (includes PR URL): claude → terminal
     let s = apply_event(
         &s,
         "claude",
         &CollabEvent::FinalReview {
-            head_sha: "h".to_string(),
-        },
-    )
-    .unwrap();
-    // Round 1 complete: Final loops back to Codex review.
-    assert_eq!(s.phase, Phase::CodeReviewCodexPending);
-
-    // Round 2 disagree → round counter at cap.
-    let s = apply_event(
-        &s,
-        "codex",
-        &CollabEvent::ReviewGlobal {
-            verdict: "disagree_with_reasons".to_string(),
-            head_sha: "h".to_string(),
-        },
-    )
-    .unwrap();
-    assert_eq!(s.global_review_round, MAX_GLOBAL_REVIEW_ROUNDS);
-
-    let s = apply_event(
-        &s,
-        "claude",
-        &CollabEvent::VerdictGlobal {
-            verdict: "agree".to_string(),
-            head_sha: "h".to_string(),
-        },
-    )
-    .unwrap();
-    let s = apply_event(
-        &s,
-        "codex",
-        &CollabEvent::CommentGlobal {
-            head_sha: "h".to_string(),
-        },
-    )
-    .unwrap();
-    let s = apply_event(
-        &s,
-        "claude",
-        &CollabEvent::FinalReview {
-            head_sha: "h".to_string(),
-        },
-    )
-    .unwrap();
-    // Cap reached: Final advances to PR-ready instead of looping.
-    assert_eq!(s.phase, Phase::PrReadyPending);
-}
-
-// ── v2: PR handoff + terminal ────────────────────────────────────────
-
-#[test]
-fn test_pr_opened_transitions_to_coding_complete() {
-    let s = locked_session("hf");
-    let s = submit_task_list(&s, "hf", 1);
-    let s = happy_task_cycle(&s, "h");
-    let s = apply_event(
-        &s,
-        "claude",
-        &CollabEvent::ReviewLocal {
-            head_sha: "h".to_string(),
-        },
-    )
-    .unwrap();
-    let s = apply_event(
-        &s,
-        "codex",
-        &CollabEvent::ReviewGlobal {
-            verdict: "agree".to_string(),
-            head_sha: "h".to_string(),
-        },
-    )
-    .unwrap();
-    let s = apply_event(
-        &s,
-        "claude",
-        &CollabEvent::PrOpened {
+            head_sha: "g3".to_string(),
             pr_url: "https://example/pr/1".to_string(),
-            head_sha: "h".to_string(),
         },
     )
     .unwrap();
     assert_eq!(s.phase, Phase::CodingComplete);
     assert_eq!(s.pr_url.as_deref(), Some("https://example/pr/1"));
+    assert_eq!(s.last_head_sha.as_deref(), Some("g3"));
 
     // Terminal: further events rejected.
     let err = apply_event(
@@ -650,10 +488,51 @@ fn test_pr_opened_transitions_to_coding_complete() {
 }
 
 #[test]
+fn test_review_local_wrong_sender_rejected() {
+    let s = locked_session("hf");
+    let s = submit_task_list(&s, "hf", 1);
+    let s = happy_task_cycle(&s, "h");
+    let err = apply_event(
+        &s,
+        "codex",
+        &CollabEvent::ReviewLocal {
+            head_sha: "g".to_string(),
+        },
+    )
+    .unwrap_err();
+    assert!(matches!(err, CollabError::NotYourTurn { .. }));
+}
+
+#[test]
+fn test_code_review_fix_global_wrong_sender_rejected() {
+    let s = locked_session("hf");
+    let s = submit_task_list(&s, "hf", 1);
+    let s = happy_task_cycle(&s, "h");
+    let s = apply_event(
+        &s,
+        "claude",
+        &CollabEvent::ReviewLocal {
+            head_sha: "g1".to_string(),
+        },
+    )
+    .unwrap();
+    let err = apply_event(
+        &s,
+        "claude",
+        &CollabEvent::CodeReviewFixGlobal {
+            head_sha: "g2".to_string(),
+        },
+    )
+    .unwrap_err();
+    assert!(matches!(err, CollabError::NotYourTurn { .. }));
+}
+
+// ── v3: failure report ───────────────────────────────────────────────
+
+#[test]
 fn test_failure_report_from_coding_phase_transitions_to_coding_failed() {
     let s = locked_session("hf");
     let s = submit_task_list(&s, "hf", 1);
-    // Drift detected before implement — agent emits FailureReport.
     let s = apply_event(
         &s,
         "codex",
@@ -699,9 +578,8 @@ fn test_failure_report_rejected_outside_coding_active_phase() {
 
 #[test]
 fn test_failure_report_from_non_owner_requires_branch_drift_prefix() {
-    // H2: off-turn FailureReport is only allowed if the reason begins with
-    // the branch_drift: prefix. A non-owner submitting an arbitrary
-    // coding_failure must be rejected as WrongTurn.
+    // Off-turn FailureReport is only allowed if the reason begins with
+    // the branch_drift: prefix.
     let s = locked_session("hf");
     let s = submit_task_list(&s, "hf", 1);
     let s = apply_event(
@@ -738,44 +616,9 @@ fn test_failure_report_from_non_owner_requires_branch_drift_prefix() {
 }
 
 #[test]
-fn test_failure_report_from_pr_ready_pending_transitions_to_failed() {
-    // FailureReport must be accepted in every coding-active phase,
-    // including late ones like PrReadyPending and CodeReviewFinalPending.
-    let s = locked_session("hf");
-    let s = submit_task_list(&s, "hf", 1);
-    let s = happy_task_cycle(&s, "h");
-    let s = apply_event(
-        &s,
-        "claude",
-        &CollabEvent::ReviewLocal {
-            head_sha: "h".to_string(),
-        },
-    )
-    .unwrap();
-    let s = apply_event(
-        &s,
-        "codex",
-        &CollabEvent::ReviewGlobal {
-            verdict: "agree".to_string(),
-            head_sha: "h".to_string(),
-        },
-    )
-    .unwrap();
-    assert_eq!(s.phase, Phase::PrReadyPending);
-
-    let s = apply_event(
-        &s,
-        "claude",
-        &CollabEvent::FailureReport {
-            coding_failure: "gh pr create failed".to_string(),
-        },
-    )
-    .unwrap();
-    assert_eq!(s.phase, Phase::CodingFailed);
-}
-
-#[test]
 fn test_failure_report_from_code_review_final_pending_transitions_to_failed() {
+    // FailureReport must be accepted in every coding-active phase,
+    // including `CodeReviewFinalPending`.
     let s = locked_session("hf");
     let s = submit_task_list(&s, "hf", 1);
     let s = happy_task_cycle(&s, "h");
@@ -783,33 +626,15 @@ fn test_failure_report_from_code_review_final_pending_transitions_to_failed() {
         &s,
         "claude",
         &CollabEvent::ReviewLocal {
-            head_sha: "h".to_string(),
+            head_sha: "g1".to_string(),
         },
     )
     .unwrap();
     let s = apply_event(
         &s,
         "codex",
-        &CollabEvent::ReviewGlobal {
-            verdict: "disagree_with_reasons".to_string(),
-            head_sha: "h".to_string(),
-        },
-    )
-    .unwrap();
-    let s = apply_event(
-        &s,
-        "claude",
-        &CollabEvent::VerdictGlobal {
-            verdict: "agree".to_string(),
-            head_sha: "h".to_string(),
-        },
-    )
-    .unwrap();
-    let s = apply_event(
-        &s,
-        "codex",
-        &CollabEvent::CommentGlobal {
-            head_sha: "h".to_string(),
+        &CollabEvent::CodeReviewFixGlobal {
+            head_sha: "g2".to_string(),
         },
     )
     .unwrap();

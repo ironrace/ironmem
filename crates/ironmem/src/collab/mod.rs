@@ -3,12 +3,14 @@
 //! v1 covers planning: `PlanParallelDrafts` → `PlanSynthesisPending`
 //! → `PlanCodexReviewPending` → `PlanClaudeFinalizePending` → `PlanLocked`.
 //!
-//! v2 extends `PlanLocked` with a human-approved coding loop. A single
+//! v3 extends `PlanLocked` with a human-approved coding loop. A single
 //! Claude `task_list` send transitions out of `PlanLocked` into the per-task
-//! 5-phase debate; after all tasks, the session enters a local review and a
-//! 2-pass global Codex review before landing in `PrReadyPending`, then
-//! `CodingComplete` (terminal) on success or `CodingFailed` (terminal) on
-//! unrecoverable drift / tooling failure.
+//! 3-phase linear flow (`CodeImplementPending` → `CodeReviewFixPending` →
+//! `CodeFinalPending`); after all tasks, the session enters the global
+//! 3-phase flow (`CodeReviewLocalPending` → `CodeReviewFixGlobalPending` →
+//! `CodeReviewFinalPending`) and lands directly in `CodingComplete`
+//! (terminal) on success — the final Claude turn opens the PR and carries
+//! its URL. `CodingFailed` is the unrecoverable-error terminal.
 
 pub mod queue;
 

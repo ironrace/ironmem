@@ -9,20 +9,15 @@ pub enum Phase {
     PlanCodexReviewPending,
     PlanClaudeFinalizePending,
     PlanLocked,
-    // Coding (v2) — per-task 5-phase debate
+    // Coding (v3) — per-task 3-phase linear
     CodeImplementPending,
-    CodeReviewPending,
-    CodeVerdictPending,
-    CodeDebatePending,
+    CodeReviewFixPending,
     CodeFinalPending,
-    // Coding (v2) — local + global review
+    // Coding (v3) — global review, 3-phase linear
     CodeReviewLocalPending,
-    CodeReviewCodexPending,
-    CodeReviewVerdictPending,
-    CodeReviewDebatePending,
+    CodeReviewFixGlobalPending,
     CodeReviewFinalPending,
-    // Coding (v2) — PR handoff + terminal
-    PrReadyPending,
+    // Coding (v3) — terminal
     CodingComplete,
     CodingFailed,
 }
@@ -40,16 +35,14 @@ const PHASE_NAMES: &[(Phase, &str)] = &[
     ),
     (Phase::PlanLocked, "PlanLocked"),
     (Phase::CodeImplementPending, "CodeImplementPending"),
-    (Phase::CodeReviewPending, "CodeReviewPending"),
-    (Phase::CodeVerdictPending, "CodeVerdictPending"),
-    (Phase::CodeDebatePending, "CodeDebatePending"),
+    (Phase::CodeReviewFixPending, "CodeReviewFixPending"),
     (Phase::CodeFinalPending, "CodeFinalPending"),
     (Phase::CodeReviewLocalPending, "CodeReviewLocalPending"),
-    (Phase::CodeReviewCodexPending, "CodeReviewCodexPending"),
-    (Phase::CodeReviewVerdictPending, "CodeReviewVerdictPending"),
-    (Phase::CodeReviewDebatePending, "CodeReviewDebatePending"),
+    (
+        Phase::CodeReviewFixGlobalPending,
+        "CodeReviewFixGlobalPending",
+    ),
     (Phase::CodeReviewFinalPending, "CodeReviewFinalPending"),
-    (Phase::PrReadyPending, "PrReadyPending"),
     (Phase::CodingComplete, "CodingComplete"),
     (Phase::CodingFailed, "CodingFailed"),
 ];
@@ -64,22 +57,17 @@ impl Phase {
         matches!(self, Self::CodingComplete | Self::CodingFailed)
     }
 
-    /// True if the session is currently inside the v2 coding loop. Used by
+    /// True if the session is currently inside the v3 coding loop. Used by
     /// `collab_end` to reject early-end calls.
     pub fn is_coding_active(&self) -> bool {
         matches!(
             self,
             Self::CodeImplementPending
-                | Self::CodeReviewPending
-                | Self::CodeVerdictPending
-                | Self::CodeDebatePending
+                | Self::CodeReviewFixPending
                 | Self::CodeFinalPending
                 | Self::CodeReviewLocalPending
-                | Self::CodeReviewCodexPending
-                | Self::CodeReviewVerdictPending
-                | Self::CodeReviewDebatePending
+                | Self::CodeReviewFixGlobalPending
                 | Self::CodeReviewFinalPending
-                | Self::PrReadyPending
         )
     }
 
@@ -95,16 +83,11 @@ impl Phase {
             Self::PlanClaudeFinalizePending => "PublishFinal",
             Self::PlanLocked => "SubmitTaskList",
             Self::CodeImplementPending => "CodeImplement",
-            Self::CodeReviewPending => "CodeReview",
-            Self::CodeVerdictPending => "CodeVerdict",
-            Self::CodeDebatePending => "CodeComment",
+            Self::CodeReviewFixPending => "CodeReviewFix",
             Self::CodeFinalPending => "CodeFinal",
             Self::CodeReviewLocalPending => "ReviewLocal",
-            Self::CodeReviewCodexPending => "ReviewGlobal",
-            Self::CodeReviewVerdictPending => "VerdictGlobal",
-            Self::CodeReviewDebatePending => "CommentGlobal",
+            Self::CodeReviewFixGlobalPending => "CodeReviewFixGlobal",
             Self::CodeReviewFinalPending => "FinalReview",
-            Self::PrReadyPending => "PrOpened",
             Self::CodingComplete | Self::CodingFailed => "SessionLocked",
         }
     }

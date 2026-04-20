@@ -1,5 +1,5 @@
 ---
-description: Start or join an IronRace bounded planning session with Codex, auto-flowing into v2 coding if enabled. Covers v1 planning and v2 per-task debate → global review → PR handoff. Usage — /collab start <task>  |  /collab join <session_id>
+description: Start or join an IronRace bounded planning session with Codex, auto-flowing into v3 coding if enabled. Covers v1 planning and v3 per-task linear → global review → PR handoff. Usage — /collab start <task>  |  /collab join <session_id>
 argument-hint: start <task> | join <session_id>
 ---
 
@@ -10,7 +10,7 @@ argument-hint: start <task> | join <session_id>
 
 
 You are participating in the IronRace bounded collaboration protocol (v1 planning
-+ v2 coding). Full spec: `docs/COLLAB.md`. The user has invoked `/collab` with
++ v3 coding). Full spec: `docs/COLLAB.md`. The user has invoked `/collab` with
 arguments:
 
 $ARGUMENTS
@@ -39,7 +39,7 @@ branch names.
    Plan Mode, call `mcp__ironmem__collab_send` with
    `sender="claude"`, `topic="draft"`, `content=<the plan text>`.
 5. After the draft is sent, begin the v1 planning loop (below). After the
-   plan locks (`PlanLocked`), the session automatically flows into the v2
+   plan locks (`PlanLocked`), the session automatically flows into the v3
    coding bridge (no separate invocation needed).
 
 ## `join <session_id>`
@@ -54,15 +54,15 @@ branch names.
    - **v1 active** (`PlanParallelDrafts` .. `PlanClaudeFinalizePending`) →
      enter the v1 planning loop (see below).
    - **`PlanLocked` pre-task_list** (final_plan_hash set, no task_list yet) →
-     enter the v2 bridge (see "v2 bridge" section).
-   - **v2 active** (`CodeImplementPending` .. `PrReadyPending`) →
-     enter the v2 dispatch loop at the current phase (see "v2 dispatch loop").
-   - **v2 terminal** (`CodingComplete` / `CodingFailed`) →
+     enter the v3 bridge (see "v3 bridge" section).
+   - **v3 active** (`CodeImplementPending` .. `CodeReviewFinalPending`) →
+     enter the v3 dispatch loop at the current phase (see "v3 dispatch loop").
+   - **v3 terminal** (`CodingComplete` / `CodingFailed`) →
      report the status and exit.
 
 ## Dispatch Loop Structure
 
-Both v1 and v2 share a common dispatch loop:
+Both v1 and v3 share a common dispatch loop:
 
 ```text
 loop:
@@ -88,11 +88,11 @@ wait-for-Codex mechanism — Codex isn't polling, Claude drives it.
 
 Terminal sets:
 - **v1**: `{PlanLocked}` (until `task_list` is sent)
-- **v2**: `{CodingComplete, CodingFailed}`
+- **v3**: `{CodingComplete, CodingFailed}`
 
 Once `task_list` has been sent, `PlanLocked` is no longer terminal: the session
-stays active and the terminal set flips to the v2 set above. The v2 bridge
-(below) sends `task_list` and falls directly into the v2 dispatch loop, so the
+stays active and the terminal set flips to the v3 set above. The v3 bridge
+(below) sends `task_list` and falls directly into the v3 dispatch loop, so the
 planning loop never re-polls at `PlanLocked` post-`task_list`.
 
 ## v1 Planning Loop (Phase → Action Table)
@@ -109,7 +109,7 @@ Repeat the dispatch loop with these actions:
 Rationale: the user approves only at finalization—the commit point. Everything
 before (drafts, synthesis, revisions) runs autonomously.
 
-## v2 Bridge: PlanLocked → CodeImplementPending
+## v3 Bridge: PlanLocked → CodeImplementPending
 
 Once `PlanLocked` is reached with `final_plan_hash` set and no `task_list` yet:
 
@@ -141,45 +141,66 @@ Once `PlanLocked` is reached with `final_plan_hash` set and no `task_list` yet:
    ```
 5. Call `collab_send(sender="claude", topic="task_list",
    content=<JSON string>)`. Session advances to `CodeImplementPending`.
-6. Fall through into the v2 dispatch loop.
+6. Fall through into the v3 dispatch loop.
 
-## v2 Dispatch Loop (Phase → Action Table)
+## v3 Dispatch Loop (Phase → Action Table)
+
+v3 collapses the coding loop to three linear turns per task and three linear
+turns at the global stage. There are no verdict/debate turns: Codex reviews
+and fixes in a single step, Claude does a final pass, and the next task
+starts. This structurally prevents Claude from steering Codex's conclusions.
 
 For every coding-active phase, execute this pre-send harness sequence before
 building the payload:
 
-**Pre-send Harness Sequence (v2 turns only):**
+**Pre-send Harness Sequence (v3 turns only):**
 1. `collab_status(session_id)` → read `last_head_sha`.
-2. `git cat-file -e <last_head_sha>^{commit}` — if the commit is missing,
-   send `failure_report` with `coding_failure` field containing
+2. `git fetch` + `git cat-file -e <last_head_sha>^{commit}` — if the commit
+   is missing locally after fetch, send `failure_report` with
+   `coding_failure` field containing
    `"branch_drift: last_head_sha=<sha> not found in local repo"` and exit
    the loop (do not retry silently).
-3. Run local gates **for phases that implement, finalize, or produce a local
-   review** — specifically `CodeImplementPending`, `CodeFinalPending`,
-   `CodeReviewLocalPending`, and `CodeReviewFinalPending`:
+3. `git reset --hard <last_head_sha>` (or equivalent) so Claude starts from
+   the exact commit Codex/Claude last pushed. Never build on top of
+   unsynced local state.
+4. Run local gates **for every Claude-owned coding turn** —
+   `CodeImplementPending`, `CodeFinalPending`, `CodeReviewLocalPending`,
+   `CodeReviewFinalPending`:
    - `cargo fmt --all -- --check`
    - `cargo clippy --workspace --all-targets --all-features -- -D warnings`
    - `cargo test --workspace`
-4. On any gate failure, send `failure_report` with concrete error message
+5. On any gate failure, send `failure_report` with concrete error message
    (no silent retry). Include the exact error output.
-5. Otherwise, proceed to the phase-specific action below.
+6. Otherwise, proceed to the phase-specific action below.
 
 | Phase | What to do (is_my_turn == true) |
 |---|---|
-| `CodeImplementPending` | **Run pre-send harness.** Write code for the current task. Commit and push. Call `collab_send` with `sender="claude"`, `topic="implement"`, `content=<JSON {"head_sha":"<current HEAD>"}>`. |
-| `CodeReviewPending` | Codex's turn. is_my_turn should be false. If `collab_status` confirms Claude is the owner, exit the loop and report the anomaly to the user; do not attempt a send. |
-| `CodeVerdictPending` | **Run pre-send harness.** Read Codex's review. If local gates pass AND Codex's review raises no concrete actionable issue, send `verdict` with `"agree"`. Send `verdict` with `"disagree_with_reasons"` only when you have a genuine position Codex should weigh — a specific pushback, an open question, or a framing disagreement. **Do not use `disagree_with_reasons` as a state-machine detour to reach `CodeFinalPending`.** If you plan to apply all of Codex's notes as-is with no independent position, that is `"agree"`: fixes land in the next `CodeImplementPending` round (per-task loop) or in `CodeReviewFinalPending` (global loop), not via a manufactured debate. Payload: `{"head_sha":"<current HEAD>","verdict":"agree"\|"disagree_with_reasons","reasons":"<text, only when disagreeing>"}`. Escalate to the user in Plan Mode only if Codex flags something the gates cannot mechanically verify (architectural drift, plan-scope creep, security smell) or the choice is between two reasonable fixes. |
-| `CodeDebatePending` | Codex's turn. is_my_turn should be false. If `collab_status` confirms Claude is the owner, exit the loop and report the anomaly. |
-| `CodeFinalPending` | **Run pre-send harness (gates before finalize).** Apply fixes from Codex's comment. Re-run gates. Call `collab_send` with `sender="claude"`, `topic="final"`, `content=<JSON {"head_sha":"<current HEAD>"}>`. |
-| `CodeReviewLocalPending` | **Run pre-send harness.** Call `collab_send` with `sender="claude"`, `topic="review_local"`, `content=<JSON {"head_sha":"<current HEAD>"}>`. Proactive review (`/ultrareview-local`) happens once, at `PrReadyPending` — not here. |
-| `CodeReviewCodexPending` | Codex's turn. is_my_turn should be false. If `collab_status` confirms Claude is the owner, exit the loop and report the anomaly. |
-| `CodeReviewVerdictPending` | **Run pre-send harness.** Read Codex's `review_global` message. If local gates still pass AND Codex's review_global raises no concrete actionable issue, send `verdict_global` with `"agree"`; otherwise send with `"disagree_with_reasons"` and a terse justification. Payload: `{"head_sha":"<current HEAD>","verdict":"agree"|"disagree_with_reasons"}`. Escalate to the user in Plan Mode if Codex flags something the gates cannot mechanically verify (architectural drift, plan-scope creep, security smell). |
-| `CodeReviewDebatePending` | Codex's turn. is_my_turn should be false. If `collab_status` confirms Claude is the owner, exit the loop and report the anomaly. |
-| `CodeReviewFinalPending` | **Run pre-send harness (gates before final).** Apply Codex's global comment fixes. Re-run gates. Call `collab_send` with `sender="claude"`, `topic="final_review"`, `content=<JSON {"head_sha":"<current HEAD>"}>`. |
-| `PrReadyPending` | **Run pre-send harness, then `/ultrareview-local` pre-PR validation.** If CRITICAL/HIGH surfaces: fix in place (commit + push), re-run gates, re-run `/ultrareview-local` until clean — the state machine stays at `PrReadyPending` throughout; only the `head_sha` you eventually send advances. If findings are out of scope for the locked plan, send `failure_report` with `coding_failure` describing the blocker. Once clean, **enter Plan Mode**: draft PR title (under 70 chars) and body (summary + test plan derived from task list + gate results + per-task acceptance checklist). Get user approval. Then `gh pr create --base <base_branch> --head <current branch> --title <approved title> --body <approved body>`. If `gh pr create` fails for any reason (auth, rate limit, conflict), send `failure_report` with `coding_failure: "pr_create_failed: <error>"` — no silent retry. On success, capture `pr_url` and call `collab_send` with `sender="claude"`, `topic="pr_opened"`, `content=<JSON {"head_sha":"<current HEAD>","pr_url":"<url>"}>`. Session advances to `CodingComplete`. Exit loop. |
+| `CodeImplementPending` | **Run pre-send harness.** Write code for the current task. Commit and push. Call `collab_send` with `sender="claude"`, `topic="implement"`, `content=<JSON {"head_sha":"<current HEAD>"}>`. Payload carries ONLY `head_sha` — no review notes, no self-critique, no guidance for Codex. Codex reads the diff and forms its own judgment. |
+| `CodeReviewFixPending` | Codex's turn. is_my_turn should be false. If `collab_status` confirms Claude is the owner, exit the loop and report the anomaly; do not attempt a send. |
+| `CodeFinalPending` | **Run pre-send harness.** Codex has pushed fixes (or a no-op commit if clean); your local working copy was reset to `last_head_sha` by the harness. Optionally make final adjustments — Claude always gets the last word on each task. Commit + push if you change anything. Re-run gates. Call `collab_send` with `sender="claude"`, `topic="final"`, `content=<JSON {"head_sha":"<current HEAD>"}>`. Advances to the next task's `CodeImplementPending`, or to `CodeReviewLocalPending` after the last task. |
+| `CodeReviewLocalPending` | **Run pre-send harness, then `/ultrareview-local` on the full task stack.** Fix any CRITICAL/HIGH inline (commit + push). Call `collab_send` with `sender="claude"`, `topic="review_local"`, `content=<JSON {"head_sha":"<current HEAD>"}>`. |
+| `CodeReviewFixGlobalPending` | Codex's turn. is_my_turn should be false. If `collab_status` confirms Claude is the owner, exit the loop and report the anomaly. |
+| `CodeReviewFinalPending` | **Run pre-send harness (gates before final).** Codex has pushed any global fixes (or a no-op commit); your local working copy was reset to `last_head_sha` by the harness. Optionally tweak. Re-run gates. Then **enter Plan Mode**: draft PR title (under 70 chars) and body (summary + test plan derived from task list + gate results). Get user approval. Then `gh pr create --base <base_branch> --head <current branch> --title <approved title> --body <approved body>`. If `gh pr create` fails, send `failure_report` with `coding_failure: "pr_create_failed: <error>"` — no silent retry. On success, capture `pr_url` and call `collab_send` with `sender="claude"`, `topic="final_review"`, `content=<JSON {"head_sha":"<current HEAD>","pr_url":"<https url>"}>`. Session advances directly to `CodingComplete`. Exit loop. |
 
-After each send in v2, loop back to polling. The loop continues until
+After each send in v3, loop back to polling. The loop continues until
 `phase in {CodingComplete, CodingFailed}` or `session_ended`.
+
+### Anti-puppeteering rules (v3)
+
+v3 structurally removes the `verdict` and `comment` turns that v2 used,
+but a few behavioral rules remain:
+
+- The `implement` and `final` payloads carry ONLY `head_sha`. Do not
+  embed review notes, self-critique, or instructions for Codex in any
+  other field — there are no other fields.
+- When driving Codex via `mcp__codex__codex`, the `prompt` argument is
+  the verbatim expanded `.codex-plugin/prompts/collab.md` with
+  `$ARGUMENTS` substituted. Nothing more. Do not append session
+  context, state summary, or recommendations about what Codex should
+  conclude. See the handoff section below.
+- Codex's `review_fix` commit stands as its own judgment. If Claude
+  disagrees with a fix during `CodeFinalPending`, the right response is
+  to amend the code and commit — not to re-litigate in prose.
 
 ### Codex handoff — synchronous MCP invocation
 
@@ -234,24 +255,15 @@ Procedure:
    rubber-stamp and defeat the point of an independent second pass.
 
    Block on the result. Codex executes its phase-specific action
-   (review, debate, global review, etc.) and returns when the session
-   flips back to a Claude-owned phase or terminates. Codex may chain
-   multiple handoffs internally — the tool call stays open for as long
-   as the Codex session runs.
+   (review+fix, global review+fix, etc.) and returns when the session
+   flips back to a Claude-owned phase or terminates.
 3. When `mcp__codex__codex` returns, resume the dispatch loop at
-   `wait_my_turn`. The next iteration will see either a Claude-owned
+   `collab_status`. The next iteration will see either a Claude-owned
    phase or a terminal condition.
 
-Also update the **dispatch loop itself**: replace the
-`if not is_my_turn: loop (continue polling)` step with
-`if not is_my_turn: drive Codex via the procedure above, then loop`. The
-`wait_my_turn` call is now only used to block on Claude-owned work that
-the server is still finalizing (brief race-window waits), not as a
-general wait-for-Codex mechanism.
-
 Applies to every Codex-owned phase: v1 `PlanParallelDrafts` (Codex
-drafting), `PlanCodexReviewPending`, v2 `CodeReviewPending`,
-`CodeDebatePending`, `CodeReviewCodexPending`, `CodeReviewDebatePending`.
+drafting), v1 `PlanCodexReviewPending`, v3 `CodeReviewFixPending`,
+v3 `CodeReviewFixGlobalPending`.
 
 If `mcp__codex__codex` is not registered, fall back to the legacy flow:
 tell the user to run `/collab join <session_id>` in a Codex terminal,
@@ -262,26 +274,21 @@ then `ScheduleWakeup` and resume polling.
 - **Never** call `mcp__ironmem__collab_end` during any active phase. Rejected in:
   - v1 active: `PlanParallelDrafts`, `PlanSynthesisPending`,
     `PlanCodexReviewPending`, `PlanClaudeFinalizePending`.
-  - v2 active: `CodeImplementPending`, `CodeReviewPending`, `CodeVerdictPending`,
-    `CodeDebatePending`, `CodeFinalPending`, `CodeReviewLocalPending`,
-    `CodeReviewCodexPending`, `CodeReviewVerdictPending`, `CodeReviewDebatePending`,
-    `CodeReviewFinalPending`, `PrReadyPending`.
+  - v3 active: `CodeImplementPending`, `CodeReviewFixPending`,
+    `CodeFinalPending`, `CodeReviewLocalPending`,
+    `CodeReviewFixGlobalPending`, `CodeReviewFinalPending`.
 
   Only valid from `PlanLocked` pre-`task_list` (abandon plan), `CodingComplete`,
   or `CodingFailed`.
 - **Never** peek at Codex's draft before sending your own during
   `PlanParallelDrafts`. The server enforces blind-draft in `recv`.
 - **Plan Mode gates only at: v1 initial `draft` (from `/collab start`),
-  v1 `final` (`PlanClaudeFinalizePending`), v2 `task_list` (bridge), and
-  v2 `pr_opened` (`PrReadyPending`).** Every other turn — `canonical`,
-  synthesis revisions, per-task `verdict`/`final`, global `verdict_global`/
-  `final_review` — runs autonomously. Escalation exception: if a verdict turn
-  flags a concern the gates cannot mechanically verify (architectural drift,
-  plan-scope creep, security smell) or presents a genuine choice between two
-  reasonable fixes, surface to the user in Plan Mode before sending.
-- **Every v2 `collab_send` payload is JSON** per the matrix in `docs/COLLAB.md`.
-  Never send prose payloads for v2 topics.
-- **`head_sha` in every v2 payload must be the current `HEAD` AFTER any
+  v1 `final` (`PlanClaudeFinalizePending`), v3 `task_list` (bridge), and
+  v3 `final_review` (`CodeReviewFinalPending`, PR creation).** Every other
+  turn runs autonomously.
+- **Every v3 `collab_send` payload is JSON** per the matrix in `docs/COLLAB.md`.
+  Never send prose payloads for v3 topics.
+- **`head_sha` in every v3 payload must be the current `HEAD` AFTER any
   commit/push that preceded this turn.** The server records branch progress
   via `head_sha`.
 - **Branch-drift carve-out:** `failure_report` may be sent by either agent at
@@ -289,8 +296,8 @@ then `ScheduleWakeup` and resume polling.
   the only topic that bypasses the owner check. A `coding_failure` prefixed
   `"branch_drift:"` is the canonical drift signal; do not suppress it.
 - If the user interrupts with a question or correction during v1, answer it
-  inside Plan Mode and incorporate it into the next send. During v2, gate at
-  Plan Mode points only (`task_list`, `pr_opened`); all other turns are
+  inside Plan Mode and incorporate it into the next send. During v3, gate at
+  Plan Mode points only (`task_list`, `final_review`); all other turns are
   autonomous.
 
 ## Unknown subcommand
