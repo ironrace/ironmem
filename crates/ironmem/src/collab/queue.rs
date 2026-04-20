@@ -277,6 +277,29 @@ pub fn recv_messages(
     Ok(messages)
 }
 
+/// Return the latest message `content` for a given `(session_id, topic)` pair,
+/// regardless of status. Used by `collab_status` so a fresh Claude session
+/// joining at `PlanLocked` can pull back the locked `final` plan it previously
+/// sent — `recv_messages` only returns unacked *incoming* mail, which cannot
+/// surface outbound plans the peer already consumed.
+pub fn load_latest_message_content(
+    conn: &Connection,
+    session_id: &str,
+    topic: &str,
+) -> Result<Option<String>, MemoryError> {
+    let content: Option<String> = conn
+        .query_row(
+            "SELECT content FROM messages
+             WHERE session_id = ?1 AND topic = ?2
+             ORDER BY rowid DESC
+             LIMIT 1",
+            params![session_id, topic],
+            |row| row.get(0),
+        )
+        .optional()?;
+    Ok(content)
+}
+
 pub fn ack_message(
     conn: &Connection,
     session_id: &str,

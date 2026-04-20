@@ -105,9 +105,11 @@ before (drafts, synthesis, revisions) runs autonomously.
 
 Once `PlanLocked` is reached with `final_plan_hash` set and no `task_list` yet:
 
-1. Read `final_plan_hash` from `collab_status(session_id)`. Read the current
-   `HEAD` SHA via `git rev-parse HEAD` (the session record does not carry a
-   HEAD field — that's the harness's responsibility).
+1. Read `final_plan_hash` and `final_plan` from `collab_status(session_id)`.
+   `final_plan` is the JSON string `{"plan":"<full text>"}` Claude previously
+   sent; parse it to recover the approved plan body. Read the current `HEAD`
+   SHA via `git rev-parse HEAD` (the session record does not carry a HEAD
+   field — that's the harness's responsibility).
 2. **Enter Plan Mode.** Build a task list from the locked plan:
    - Each task has `id` (strictly ordered starting at 1), `title`, and
      `acceptance` (list of acceptance criteria, ≥1 per task).

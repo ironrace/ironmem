@@ -446,6 +446,41 @@ fn collab_request_changes_loops_back_to_synthesis_and_locks_after_revision() {
     let status = call_tool(&app, "collab_status", json!({ "session_id": session_id }));
     assert_eq!(status["phase"], "PlanLocked");
     assert_eq!(status["final_plan_hash"], status["canonical_plan_hash"]);
+    // A fresh agent joining at PlanLocked must be able to pull the plan text
+    // back without having to recv its own previously-sent (and peer-acked)
+    // outbound message. collab_status surfaces the latest canonical/final
+    // content alongside the hashes.
+    assert_eq!(status["canonical_plan"], "Merged canonical v2");
+    assert_eq!(
+        status["final_plan"],
+        json!({ "plan": "Merged canonical v2" }).to_string()
+    );
+}
+
+#[test]
+fn collab_status_omits_plan_text_before_plan_is_sent() {
+    let app = App::open_for_test().unwrap();
+
+    let started = call_tool(
+        &app,
+        "collab_start",
+        json!({
+            "repo_path": "/repo",
+            "branch": "main",
+            "initiator": "claude"
+        }),
+    );
+    let session_id = started["session_id"].as_str().unwrap().to_string();
+
+    let status = call_tool(&app, "collab_status", json!({ "session_id": &session_id }));
+    assert!(
+        status.get("canonical_plan").is_none(),
+        "canonical_plan must be absent before any canonical is published"
+    );
+    assert!(
+        status.get("final_plan").is_none(),
+        "final_plan must be absent before PlanLocked"
+    );
 }
 
 #[test]

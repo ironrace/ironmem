@@ -53,6 +53,14 @@ impl Database {
         queue::recv_messages(&self.conn, session_id, receiver, limit)
     }
 
+    pub fn collab_latest_message_content(
+        &self,
+        session_id: &str,
+        topic: &str,
+    ) -> Result<Option<String>, MemoryError> {
+        queue::load_latest_message_content(&self.conn, session_id, topic)
+    }
+
     pub fn collab_ack_message(
         &self,
         session_id: &str,
