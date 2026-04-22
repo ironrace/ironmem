@@ -51,6 +51,38 @@ impl CollabSession {
         }
     }
 
+    /// Construct a session pre-positioned at the v3 global-review stage.
+    /// Used by the coding-review shortcut (`collab_start_code_review`) for
+    /// orchestrators that already completed per-task coding via
+    /// `subagent-driven-development`. The no-op `CodeReviewLocalPending`
+    /// handshake is collapsed — `head_sha` is supplied here instead.
+    pub fn new_global_review(
+        id: impl Into<String>,
+        base_sha: impl Into<String>,
+        head_sha: impl Into<String>,
+    ) -> Self {
+        let head = head_sha.into();
+        Self {
+            id: id.into(),
+            phase: Phase::CodeReviewFixGlobalPending,
+            current_owner: "codex".to_string(),
+            claude_draft_hash: None,
+            codex_draft_hash: None,
+            canonical_plan_hash: None,
+            final_plan_hash: None,
+            codex_review_verdict: None,
+            review_round: 0,
+            task_list: None,
+            current_task_index: None,
+            task_review_round: 0,
+            global_review_round: 0,
+            base_sha: Some(base_sha.into()),
+            last_head_sha: Some(head),
+            pr_url: None,
+            coding_failure: None,
+        }
+    }
+
     /// Task cardinality derived from the stored `task_list` JSON. Canonical
     /// shape is `{"tasks":[…]}`; any other shape yields `None`. Returns `None`
     /// when `task_list` is unset (pre-`SubmitTaskList`).
