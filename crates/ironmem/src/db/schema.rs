@@ -11,6 +11,7 @@ const FTS_SQL: &str = include_str!("../../migrations/002_fts.sql");
 const COLLAB_SQL: &str = include_str!("../../migrations/003_collab.sql");
 const COLLAB_V1_SQL: &str = include_str!("../../migrations/004_collab_planning_v1.sql");
 const COLLAB_V2_SQL: &str = include_str!("../../migrations/005_collab_v2.sql");
+const COLLAB_IMPLEMENTER_SQL: &str = include_str!("../../migrations/006_collab_implementer.sql");
 
 /// Database wrapper around a SQLite connection.
 ///
@@ -86,6 +87,13 @@ impl Database {
         // coding_failure.
         if current_version < 5 {
             retry_on_busy(|| self.conn.execute_batch(COLLAB_V2_SQL))?;
+        }
+
+        // v6: per-session `implementer` column (claude|codex) so
+        // `/collab start --implementer=codex` can route the
+        // `CodeImplementPending` phase to Codex.
+        if current_version < 6 {
+            retry_on_busy(|| self.conn.execute_batch(COLLAB_IMPLEMENTER_SQL))?;
         }
 
         Ok(())

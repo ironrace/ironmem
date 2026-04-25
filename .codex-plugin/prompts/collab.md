@@ -1,5 +1,5 @@
 ---
-description: Join (or start) an IronRace bounded collab session with Claude. Covers v1 planning (draft + review) and the v3 global review pass — Codex's only coding turn. Usage — /collab join <session_id>  |  /collab start <task>
+description: Join (or start) an IronRace bounded collab session with Claude. Covers v1 planning (draft + review), the v3 global review pass (Codex's mandatory coding turn), and the optional Codex-implementer batch phase when the session was started with --implementer=codex. Usage — /collab join <session_id>  |  /collab start <task>
 ---
 
 <!-- DERIVED FROM docs/COLLAB.md — any protocol change must update BOTH this
@@ -17,10 +17,14 @@ Your agent identity for every call: `"codex"`. Your valid send topics (the
 server rejects anything else):
 
 - v1: `draft`, `review`
-- v3: `review_fix_global` (global review+fix), `failure_report`
+- v3: `review_fix_global` (global review+fix), `failure_report`, and
+  `implementation_done` **only when** the session was started with
+  `--implementer=codex` (check `collab_status.implementer == "codex"`)
 
-You never send `canonical`, `final`, `task_list`, `implementation_done`,
-`review_local`, or `final_review`. Those are Claude-only.
+You never send `canonical`, `final`, `task_list`, `review_local`, or
+`final_review`. Those are Claude-only. `implementation_done` is also
+Claude-only in default sessions; it becomes Codex-valid only when the
+session record's `implementer` field is `"codex"`.
 
 **Never** call `ironmem_collab_end` during an active phase. See Invariants.
 
@@ -96,11 +100,16 @@ branch names.
      submitted your draft, write and send it first, then enter the loop.
    - **`PlanLocked` pre-task_list** → Codex has no work here. Exit with a
      one-line status; Claude is building the task list.
-   - **`CodeImplementPending`** → Codex has no work; Claude is running
-     subagents. Exit with a one-line status.
+   - **`CodeImplementPending`** → Branch on `implementer`. If
+     `implementer == "claude"`, Claude is running subagents on its
+     side; exit with a one-line status. If `implementer == "codex"`
+     **and** `current_owner == "codex"`, this is your batch
+     implementation turn — run the action under "Batch implementation
+     (codex-implementer)" below.
    - **`CodeReviewLocalPending`** → Claude's local-review turn. Exit.
-   - **`CodeReviewFixGlobalPending`** → Codex's only v3 coding turn.
-     Run the v3 dispatch action below.
+   - **`CodeReviewFixGlobalPending`** → Codex's only mandatory v3 coding
+     turn (always Codex regardless of `implementer`). Run the global
+     review action below.
    - **`CodeReviewFinalPending`** → Claude's PR turn. Exit.
    - **v3 terminal** (`CodingComplete` / `CodingFailed`) → report and exit.
 
@@ -169,10 +178,42 @@ before building the payload:
 
 | Phase | What to do (is_my_turn == true) |
 |---|---|
-| `CodeImplementPending` | Claude's batch implementation turn. Exit. |
+| `CodeImplementPending` | Owner depends on `implementer`. If `implementer == "claude"`, this is Claude's batch turn — exit. If `implementer == "codex"`, run the batch implementation action below. |
 | `CodeReviewLocalPending` | Claude's turn. Exit. |
-| `CodeReviewFixGlobalPending` | **Run pre-send harness.** This is the only v3 coding turn for Codex — review the full branch diff (`git diff <base_sha>..<last_head_sha>`) alongside the writing-plans markdown at `plan_file_path` (read it from the canonicalized `task_list` JSON in `collab_status`). Check cross-task consistency, architectural drift, missed acceptance criteria, security. **Fix any issues directly**: commit + push. Send `collab_send` with `sender="codex"`, `topic="review_fix_global"`, `content=<JSON {"head_sha":"<current HEAD>"}>`. |
+| `CodeReviewFixGlobalPending` | **Run pre-send harness.** This is your only mandatory v3 coding turn — review the full branch diff (`git diff <base_sha>..<last_head_sha>`) alongside the writing-plans markdown at `plan_file_path` (read it from the canonicalized `task_list` JSON in `collab_status`). Check cross-task consistency, architectural drift, missed acceptance criteria, security. **Fix any issues directly**: commit + push. Send `collab_send` with `sender="codex"`, `topic="review_fix_global"`, `content=<JSON {"head_sha":"<current HEAD>"}>`. |
 | `CodeReviewFinalPending` | Claude's turn. Exit. |
+
+### Batch implementation (codex-implementer)
+
+When `phase == "CodeImplementPending"` and `implementer == "codex"`, you
+own the batch phase. Claude has already published `task_list` with
+`plan_file_path` pointing at the writing-plans markdown.
+
+1. Run the pre-send harness (steps 1–7 above), but skip the test command
+   in step 6 — there's no prior commit to validate yet beyond what
+   Claude pushed at `last_head_sha`.
+2. Read the markdown plan from `plan_file_path` (resolved relative to
+   `repo_path`).
+3. Invoke the `subagent-driven-development` skill (Codex variant — uses
+   `spawn_agent` and `update_plan`) with that plan file. Let its
+   controller-owned loop run to completion: every task implemented,
+   reviewed, committed, and marked complete in `update_plan`.
+4. **Stop the skill at the boundary before
+   `finishing-a-development-branch`.** That sub-skill prompts the user
+   for merge/PR/cleanup, which would conflict with the collab v3
+   global review stage that handles PR creation. Treat the last task's
+   approval + commit as the exit point.
+5. Run final gates (project-appropriate: `cargo test`, `pytest`, etc).
+   On gate failure or any unrecoverable subagent failure, send
+   `failure_report` with `coding_failure: "subagent_failure: <reason>"`
+   or `coding_failure: "gate_failure: <reason>"` and exit. Do not
+   return control to Claude with a half-batch.
+6. On full success, send `collab_send` with `sender="codex"`,
+   `topic="implementation_done"`,
+   `content=<JSON {"head_sha":"<current HEAD>"}>`. Payload carries
+   ONLY `head_sha` — no subagent notes, no summary.
+7. Exit. The session is now `CodeReviewLocalPending` with Claude as
+   owner; Claude provides the local-review second opinion.
 
 After one successful send, exit. Claude will re-invoke `/collab join`
 via its Codex MCP tool when the session needs you again.

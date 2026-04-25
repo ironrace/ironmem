@@ -1,6 +1,6 @@
 ---
-description: Start or join an IronRace bounded planning session with Codex, auto-flowing into v3 batch coding if enabled. Covers v1 planning, v3 batch implementation (writing-plans + subagent-driven-development) → global review → PR handoff, and the post-subagent review shortcut. Usage — /collab start <task>  |  /collab join <session_id>  |  /collab review <short-topic>
-argument-hint: start <task> | join <session_id> | review <short-topic>
+description: Start or join an IronRace bounded planning session with Codex, auto-flowing into v3 batch coding. Covers v1 planning, v3 batch implementation (Claude or Codex via writing-plans + subagent-driven-development) → global review → PR handoff, and the post-subagent review shortcut. Usage — /collab start [--implementer=claude|codex] <task>  |  /collab join <session_id>  |  /collab review <short-topic>
+argument-hint: start [--implementer=claude|codex] <task> | join <session_id> | review <short-topic>
 ---
 
 <!-- DERIVED FROM docs/COLLAB.md — protocol changes must update:
@@ -17,35 +17,43 @@ $ARGUMENTS
 
 Parse the first word of `$ARGUMENTS` as the subcommand and behave as follows.
 
-## `start <task>`
+## `start [--implementer=claude|codex] <task>`
 
 Everything except the task is inferred — never ask the user for paths or
 branch names.
 
-1. Resolve defaults:
+1. Parse `$ARGUMENTS`:
+   - Strip the leading `start` token.
+   - Detect optional `--implementer=claude` or `--implementer=codex` flag
+     anywhere in the remaining tokens. Default `"claude"` if absent. Reject
+     any other value with a usage error (do not silently fall back).
+   - `task` ← the remaining text after stripping `start` and the flag.
+2. Resolve defaults:
    - `repo_path` ← output of `git rev-parse --show-toplevel` (run via Bash).
    - `branch` ← output of `git branch --show-current`.
    - `initiator` ← `"claude"` (this is Claude's terminal).
-   - `task` ← the remainder of `$ARGUMENTS` after the word `start`.
-2. Call `mcp__ironmem__collab_start` with those four fields.
-3. **Do not ask the user to run anything in a Codex terminal.** Claude
+3. Call `mcp__ironmem__collab_start` with `repo_path`, `branch`,
+   `initiator`, `task`, and `implementer`. The MCP tool returns
+   `session_id`, `task`, and the resolved `implementer` — verify it
+   matches what you sent.
+4. **Do not ask the user to run anything in a Codex terminal.** Claude
    drives every Codex-owned turn via `mcp__codex__codex` in this same
    terminal — there is no second terminal for the user to manage. Just
-   report the new `session_id` to the user as a single line so they can
-   track it:
+   report the new `session_id` and selected `implementer` to the user as
+   a single line so they can track it:
 
    ```
-   Collab session started: <session_id>
+   Collab session started: <session_id> (implementer: <claude|codex>)
    ```
 
    Only fall back to `"Run in Codex: /collab join <session_id>"` if
    `mcp__codex__codex` is not registered (see the Codex handoff section
    below for the fallback path).
-4. Enter Plan Mode and draft your first plan for `<task>` — the draft is
+5. Enter Plan Mode and draft your first plan for `<task>` — the draft is
    yours alone, Codex cannot see it. When you have the user's approval in
    Plan Mode, call `mcp__ironmem__collab_send` with
    `sender="claude"`, `topic="draft"`, `content=<the plan text>`.
-5. After the draft is sent, begin the v1 planning loop (below). When the
+6. After the draft is sent, begin the v1 planning loop (below). When the
    loop observes `current_owner == "codex"`, it drives Codex inline via
    the MCP tool (see "Codex handoff — synchronous MCP invocation"). After
    the plan locks (`PlanLocked`), the session automatically flows into
@@ -192,22 +200,60 @@ serves as the gate.
    ```
 5. Call `collab_send(sender="claude", topic="task_list",
    content=<JSON string>)`. Session advances to `CodeImplementPending`.
-6. **Invoke `Skill('superpowers:subagent-driven-development')`** with
-   the same plan file. Auto-proceed through between-task checkpoints —
-   do not pause for user approval per task. Each subagent runs TDD,
-   commits, and pushes for its own task.
-7. **Subagent failure handling.** If a subagent fails mid-batch
-   (irrecoverable bug, persistent test failure, environment issue),
+   The `current_owner` after this transition matches the session's
+   `implementer` — which agent runs the batch phase is committed at
+   this point.
+6. **Branch on `implementer`** (read it from `collab_status`):
+
+   - **`implementer == "claude"`** — Run the batch locally. Invoke
+     `Skill('superpowers:subagent-driven-development')` with the same
+     plan file. Auto-proceed through between-task checkpoints — do not
+     pause for user approval per task. Each subagent runs TDD, commits,
+     and pushes for its own task.
+
+     **Stop the skill at the boundary before
+     `finishing-a-development-branch`.** That sub-skill prompts the user
+     to choose merge/PR/cleanup, which would conflict with the collab
+     global review stage that handles PR creation here. Treat the last
+     task's approval + commit as the exit point: do *not* let the skill
+     auto-invoke `superpowers:finishing-a-development-branch`. The
+     collab v3 global review flow
+     (`review_local` → `review_fix_global` → `final_review` with
+     `gh pr create`) is the protocol's canonical PR path.
+
+   - **`implementer == "codex"`** — Hand off to Codex synchronously via
+     `mcp__codex__codex`, just like the Codex-owned global review turn.
+     Read `.codex-plugin/prompts/collab.md`, substitute `$ARGUMENTS`
+     with `join <session_id>`, and call the MCP tool with that resolved
+     prompt and `cwd = repo_path`. Block until Codex returns. Codex
+     will read `plan_file_path` from the canonicalized `task_list`,
+     run its own `subagent-driven-development` end-to-end (with the
+     same `finishing-a-development-branch` carve-out applied on its
+     side), and emit `implementation_done` itself before returning.
+     Do *not* invoke `superpowers:subagent-driven-development` locally
+     in this mode — Codex owns the batch phase.
+
+     If `mcp__codex__codex` is not registered, abort with a clear
+     error: `--implementer=codex` requires the Codex MCP server.
+
+7. **Subagent failure handling** (Claude-implementer mode only — Codex's
+   failures surface inside its own MCP session and Codex emits
+   `failure_report` directly per the Codex prompt). If a subagent fails
+   mid-batch (irrecoverable bug, persistent test failure, environment
+   issue),
    pause, surface the failure to the user, and triage:
    - If retryable, re-dispatch that subagent and continue.
    - If unrecoverable, send `failure_report` with
      `coding_failure: "subagent_failure: <task id>: <concrete reason>"`
      and exit the loop.
-8. **On full success:** run the pre-send harness once
-   (fetch, fmt --check, clippy -D warnings, test --workspace). On gate
-   failure, send `failure_report`. On green, send `implementation_done`
-   with `{"head_sha":"<current HEAD>"}`. Session advances to
-   `CodeReviewLocalPending`.
+8. **On full success in Claude-implementer mode:** run the pre-send
+   harness once (fetch, fmt --check, clippy -D warnings, test --workspace).
+   On gate failure, send `failure_report`. On green, send
+   `implementation_done` with `{"head_sha":"<current HEAD>"}`. Session
+   advances to `CodeReviewLocalPending`. (In Codex-implementer mode
+   Codex already emitted `implementation_done` from inside its MCP
+   session; just re-poll `collab_status` and confirm the phase is now
+   `CodeReviewLocalPending` with Claude as owner.)
 9. Fall through into the v3 dispatch loop.
 
 ## v3 Dispatch Loop (Phase → Action Table)
@@ -242,7 +288,7 @@ sequence before building the payload:
 
 | Phase | What to do (is_my_turn == true) |
 |---|---|
-| `CodeImplementPending` | The bridge has already invoked `superpowers:subagent-driven-development`. When all subagents finish successfully, **run pre-send harness gates** (no reset — no Codex push to sync). Call `collab_send` with `sender="claude"`, `topic="implementation_done"`, `content=<JSON {"head_sha":"<current HEAD>"}>`. Payload carries ONLY `head_sha` — no subagent notes, no summary, no guidance for Codex. Codex reads the diff and the writing-plans markdown at `plan_file_path` and forms its own judgment. |
+| `CodeImplementPending` | Owner depends on `implementer`. **Claude is owner** (default): the bridge has already invoked `superpowers:subagent-driven-development`. When all subagents finish, **run pre-send harness gates** (no reset — no Codex push to sync) and `collab_send` with `sender="claude"`, `topic="implementation_done"`, `content=<JSON {"head_sha":"<current HEAD>"}>`. Payload carries ONLY `head_sha`. **Codex is owner** (`--implementer=codex`): is_my_turn is false here; the bridge dispatched to Codex via `mcp__codex__codex` and Codex emits `implementation_done` itself before its MCP session returns. If the dispatch loop ever sees `CodeImplementPending` with Codex owner, re-dispatch via the Codex MCP tool (resumed-mid-batch case). |
 | `CodeReviewLocalPending` | **Run pre-send harness (with reset to `last_head_sha`), then `/ultrareview-local` on the full task stack.** Fix any CRITICAL/HIGH inline (commit + push). Call `collab_send` with `sender="claude"`, `topic="review_local"`, `content=<JSON {"head_sha":"<current HEAD>"}>`. |
 | `CodeReviewFixGlobalPending` | Codex's turn. is_my_turn should be false. If `collab_status` confirms Claude is the owner, exit the loop and report the anomaly. |
 | `CodeReviewFinalPending` | **Run pre-send harness (with reset to `last_head_sha`).** Codex has pushed any global fixes (or a no-op commit); your local working copy was reset to `last_head_sha` by the harness. Optionally tweak. Re-run gates. Then **enter Plan Mode**: draft PR title (under 70 chars) and body (summary + test plan derived from task list + gate results). Get user approval. Then `gh pr create --base <base_branch> --head <current branch> --title <approved title> --body <approved body>`. If `gh pr create` fails, send `failure_report` with `coding_failure: "pr_create_failed: <error>"` — no silent retry. On success, capture `pr_url` and call `collab_send` with `sender="claude"`, `topic="final_review"`, `content=<JSON {"head_sha":"<current HEAD>","pr_url":"<https url>"}>`. Session advances directly to `CodingComplete`. Exit loop. |
@@ -337,7 +383,8 @@ Procedure:
    phase or a terminal condition.
 
 Applies to every Codex-owned phase: v1 `PlanParallelDrafts` (Codex
-drafting), v1 `PlanCodexReviewPending`, and v3 `CodeReviewFixGlobalPending`.
+drafting), v1 `PlanCodexReviewPending`, v3 `CodeReviewFixGlobalPending`,
+and v3 `CodeImplementPending` *when* `implementer == "codex"`.
 
 If `mcp__codex__codex` is not registered, fall back to the legacy flow:
 tell the user to run `/collab join <session_id>` in a Codex terminal,
@@ -379,5 +426,5 @@ then `ScheduleWakeup` and resume polling.
 If `$ARGUMENTS` does not start with `start`, `join`, or `review`, tell the user:
 
 ```
-Usage: /collab start <task>  |  /collab join <session_id>  |  /collab review <short-topic>
+Usage: /collab start [--implementer=claude|codex] <task>  |  /collab join <session_id>  |  /collab review <short-topic>
 ```

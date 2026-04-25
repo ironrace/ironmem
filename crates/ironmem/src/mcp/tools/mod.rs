@@ -201,14 +201,15 @@ pub fn tool_definitions(app: &App) -> Vec<Value> {
         }),
         json!({
             "name": "collab_start",
-            "description": "Create a bounded Claude↔Codex planning session. Optional `task` describes the planning goal and is returned in collab_status so the counterpart agent can fetch it without a manual paste.",
+            "description": "Create a bounded Claude↔Codex planning session. Optional `task` describes the planning goal and is returned in collab_status so the counterpart agent can fetch it without a manual paste. Optional `implementer` (default 'claude') selects which agent runs the v3 batch implementation phase; 'codex' routes CodeImplementPending to Codex so it drives its own subagent-driven-development end-to-end.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "repo_path": { "type": "string" },
                     "branch": { "type": "string" },
                     "initiator": { "type": "string", "enum": ["claude", "codex"] },
-                    "task": { "type": "string" }
+                    "task": { "type": "string" },
+                    "implementer": { "type": "string", "enum": ["claude", "codex"] }
                 },
                 "required": ["repo_path", "branch", "initiator"]
             }

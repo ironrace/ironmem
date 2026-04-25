@@ -156,16 +156,24 @@ pub fn apply_event(
             next.base_sha = Some(base_sha.clone());
             next.last_head_sha = Some(head_sha.clone());
             next.phase = Phase::CodeImplementPending;
-            next.current_owner = "claude".to_string();
+            // Owner of the batch implementation phase is whichever agent
+            // the user selected at `collab_start` time. Default sessions
+            // have `implementer == "claude"` (historical flow); sessions
+            // started with `--implementer=codex` route Codex into the
+            // batch phase to drive its own subagent-driven-development.
+            next.current_owner = session.implementer.clone();
         }
         // ── v3: batch implementation → global review ──────────────────────
-        // Claude orchestrates the per-task subagent run on its side
-        // (superpowers:writing-plans → superpowers:subagent-driven-development).
-        // Codex does not participate per-task; the single transition out of
-        // `CodeImplementPending` jumps straight to global review. Payload
-        // carries only `head_sha` (anti-puppeteering).
+        // The implementer agent (Claude by default; Codex when selected at
+        // `collab_start`) drives per-task subagent work on its side via
+        // `superpowers:writing-plans` → `superpowers:subagent-driven-development`.
+        // The other agent does not participate per-task; the single
+        // transition out of `CodeImplementPending` jumps straight to
+        // global review with Claude as owner — Claude always provides
+        // the local-review second opinion. Payload carries only
+        // `head_sha` (anti-puppeteering).
         (Phase::CodeImplementPending, CollabEvent::ImplementationDone { head_sha }) => {
-            require_actor(actor, "claude")?;
+            require_actor(actor, session.implementer.as_str())?;
             next.last_head_sha = Some(head_sha.clone());
             next.phase = Phase::CodeReviewLocalPending;
             next.current_owner = "claude".to_string();

@@ -42,10 +42,20 @@ pub fn create_session(
     repo_path: &str,
     branch: &str,
     task: Option<&str>,
+    implementer: &str,
 ) -> Result<(), MemoryError> {
+    // The DB CHECK constraint enforces `implementer IN ('claude', 'codex')`,
+    // but validate at the application layer too so callers get a clear
+    // `Validation` error rather than a SQL constraint violation.
+    if implementer != "claude" && implementer != "codex" {
+        return Err(MemoryError::Validation(format!(
+            "implementer must be 'claude' or 'codex', got '{implementer}'"
+        )));
+    }
     conn.execute(
-        "INSERT INTO collab_sessions (id, repo_path, branch, task) VALUES (?1, ?2, ?3, ?4)",
-        params![id, repo_path, branch, task],
+        "INSERT INTO collab_sessions (id, repo_path, branch, task, implementer)
+         VALUES (?1, ?2, ?3, ?4, ?5)",
+        params![id, repo_path, branch, task, implementer],
     )?;
     Ok(())
 }
@@ -115,7 +125,7 @@ pub fn load_session_record(
                 task_list,
                 task_review_round, global_review_round,
                 base_sha, last_head_sha, pr_url, coding_failure,
-                created_at, updated_at
+                created_at, updated_at, implementer
          FROM collab_sessions
          WHERE id = ?1",
         params![session_id],
@@ -151,6 +161,7 @@ pub fn load_session_record(
                     last_head_sha: row.get(17)?,
                     pr_url: row.get(18)?,
                     coding_failure: row.get(19)?,
+                    implementer: row.get(22)?,
                 },
                 repo_path: row.get(3)?,
                 branch: row.get(4)?,
@@ -390,6 +401,8 @@ mod tests {
     const COLLAB_SQL: &str = include_str!("../../migrations/003_collab.sql");
     const COLLAB_V1_SQL: &str = include_str!("../../migrations/004_collab_planning_v1.sql");
     const COLLAB_V2_SQL: &str = include_str!("../../migrations/005_collab_v2.sql");
+    const COLLAB_IMPLEMENTER_SQL: &str =
+        include_str!("../../migrations/006_collab_implementer.sql");
 
     fn open() -> Connection {
         let conn = Connection::open_in_memory().unwrap();
@@ -398,13 +411,14 @@ mod tests {
         conn.execute_batch(COLLAB_SQL).unwrap();
         conn.execute_batch(COLLAB_V1_SQL).unwrap();
         conn.execute_batch(COLLAB_V2_SQL).unwrap();
+        conn.execute_batch(COLLAB_IMPLEMENTER_SQL).unwrap();
         conn
     }
 
     #[test]
     fn test_send_recv_ack_fifo() {
         let db = open();
-        create_session(&db, "sess1", "/repo", "main", None).unwrap();
+        create_session(&db, "sess1", "/repo", "main", None, "claude").unwrap();
         let m1 = send_message(&db, "sess1", "claude", "codex", "draft", "first").unwrap();
         let _m2 = send_message(&db, "sess1", "claude", "codex", "draft", "second").unwrap();
 
@@ -422,7 +436,7 @@ mod tests {
     #[test]
     fn test_ack_idempotent() {
         let db = open();
-        create_session(&db, "sess2", "/repo", "main", None).unwrap();
+        create_session(&db, "sess2", "/repo", "main", None, "claude").unwrap();
         let message_id = send_message(&db, "sess2", "claude", "codex", "draft", "x").unwrap();
         ack_message(&db, "sess2", &message_id).unwrap();
         let err = ack_message(&db, "wrong-session", &message_id).unwrap_err();
@@ -432,7 +446,7 @@ mod tests {
     #[test]
     fn test_register_caps_upsert() {
         let db = open();
-        create_session(&db, "sess3", "/repo", "main", None).unwrap();
+        create_session(&db, "sess3", "/repo", "main", None, "claude").unwrap();
         register_caps(
             &db,
             "sess3",
@@ -464,7 +478,7 @@ mod tests {
     #[test]
     fn test_get_caps_empty_before_register() {
         let db = open();
-        create_session(&db, "sess4", "/repo", "main", None).unwrap();
+        create_session(&db, "sess4", "/repo", "main", None, "claude").unwrap();
         let caps = get_caps(&db, "sess4", Some("claude")).unwrap();
         assert!(caps.is_empty());
     }
@@ -486,6 +500,7 @@ mod tests {
             "/repo",
             "main",
             Some("build a landing page"),
+            "claude",
         )
         .unwrap();
         let record = load_session_record(&db, "sess-task").unwrap();
@@ -497,7 +512,7 @@ mod tests {
     #[test]
     fn test_review_round_persists() {
         let db = open();
-        create_session(&db, "sess-rr", "/repo", "main", None).unwrap();
+        create_session(&db, "sess-rr", "/repo", "main", None, "claude").unwrap();
         let mut session = load_session(&db, "sess-rr").unwrap();
         session.review_round = 2;
         save_session(&db, &session).unwrap();
@@ -508,7 +523,7 @@ mod tests {
     #[test]
     fn test_ensure_active_rejects_ended_session() {
         let db = open();
-        create_session(&db, "sess-end", "/repo", "main", None).unwrap();
+        create_session(&db, "sess-end", "/repo", "main", None, "claude").unwrap();
         ensure_active(&db, "sess-end").unwrap();
         end_session(&db, "sess-end").unwrap();
         let err = ensure_active(&db, "sess-end").unwrap_err();
@@ -518,7 +533,7 @@ mod tests {
     #[test]
     fn test_end_session_idempotent() {
         let db = open();
-        create_session(&db, "sess-end2", "/repo", "main", None).unwrap();
+        create_session(&db, "sess-end2", "/repo", "main", None, "claude").unwrap();
         end_session(&db, "sess-end2").unwrap();
         // Calling end_session a second time must succeed (idempotent).
         end_session(&db, "sess-end2").unwrap();
@@ -534,7 +549,7 @@ mod tests {
     #[test]
     fn test_v2_fields_round_trip() {
         let db = open();
-        create_session(&db, "sess-v2", "/repo", "main", None).unwrap();
+        create_session(&db, "sess-v2", "/repo", "main", None, "claude").unwrap();
         let mut session = load_session(&db, "sess-v2").unwrap();
         session.task_list = Some(r#"{"plan_hash":"pf","tasks":[{"id":1},{"id":2}]}"#.to_string());
         session.task_review_round = 1;
@@ -560,7 +575,7 @@ mod tests {
     #[test]
     fn test_v1_defaults_for_fresh_session() {
         let db = open();
-        create_session(&db, "sess-fresh", "/repo", "main", None).unwrap();
+        create_session(&db, "sess-fresh", "/repo", "main", None, "claude").unwrap();
         let session = load_session(&db, "sess-fresh").unwrap();
         assert!(session.task_list.is_none());
         assert_eq!(session.task_review_round, 0);

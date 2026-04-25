@@ -966,15 +966,25 @@ fn collab_end_rejected_in_active_planning_phase() {
 /// return `(session_id, final_plan_text)` so callers can assemble valid
 /// `task_list` payloads (the state machine rejects a mismatched `plan_hash`).
 fn drive_to_plan_locked(app: &App, final_plan: &str) -> String {
-    let started = call_tool(
-        app,
-        "collab_start",
-        json!({
-            "repo_path": "/repo",
-            "branch": "main",
-            "initiator": "claude"
-        }),
-    );
+    drive_to_plan_locked_with_implementer(app, final_plan, None)
+}
+
+/// Same as `drive_to_plan_locked` but threads through the optional
+/// `implementer` field. `None` keeps the historical default (`"claude"`).
+fn drive_to_plan_locked_with_implementer(
+    app: &App,
+    final_plan: &str,
+    implementer: Option<&str>,
+) -> String {
+    let mut start_args = json!({
+        "repo_path": "/repo",
+        "branch": "main",
+        "initiator": "claude"
+    });
+    if let Some(value) = implementer {
+        start_args["implementer"] = json!(value);
+    }
+    let started = call_tool(app, "collab_start", start_args);
     let session_id = started["session_id"].as_str().unwrap().to_string();
 
     for (sender, content) in [("claude", "cdraft"), ("codex", "xdraft")] {
@@ -1207,6 +1217,84 @@ fn collab_v3_unknown_per_task_topics_rejected() {
             "expected unknown-topic error for {topic}, got: {err}"
         );
     }
+}
+
+#[test]
+fn collab_start_accepts_implementer_codex_and_routes_owner() {
+    // `--implementer=codex` flips the owner of `CodeImplementPending` to
+    // Codex. Claude still publishes `task_list`; Codex is the only valid
+    // sender of `implementation_done`.
+    let app = App::open_for_test().unwrap();
+    let session_id = drive_to_plan_locked_with_implementer(&app, "fp", Some("codex"));
+
+    let status = call_tool(&app, "collab_status", json!({ "session_id": &session_id }));
+    assert_eq!(status["implementer"], "codex");
+
+    let hash = plan_hash(&app, &session_id);
+    call_tool(
+        &app,
+        "collab_send",
+        json!({
+            "session_id": session_id,
+            "sender": "claude",
+            "topic": "task_list",
+            "content": task_list_payload(&hash, "b0", "h0", 2)
+        }),
+    );
+    let status = call_tool(&app, "collab_status", json!({ "session_id": &session_id }));
+    assert_eq!(status["phase"], "CodeImplementPending");
+    assert_eq!(status["current_owner"], "codex");
+
+    // Claude trying to fire `implementation_done` is rejected.
+    let err = call_tool_expect_error(
+        &app,
+        "collab_send",
+        json!({
+            "session_id": session_id,
+            "sender": "claude",
+            "topic": "implementation_done",
+            "content": json!({ "head_sha": "batch_head" }).to_string()
+        }),
+    );
+    assert!(
+        err.to_lowercase().contains("not your turn") || err.contains("expects sender"),
+        "expected turn-ownership error, got: {err}"
+    );
+
+    // Codex fires it and the phase advances to local review (Claude-owned).
+    call_tool(
+        &app,
+        "collab_send",
+        json!({
+            "session_id": session_id,
+            "sender": "codex",
+            "topic": "implementation_done",
+            "content": json!({ "head_sha": "batch_head" }).to_string()
+        }),
+    );
+    let status = call_tool(&app, "collab_status", json!({ "session_id": &session_id }));
+    assert_eq!(status["phase"], "CodeReviewLocalPending");
+    assert_eq!(status["current_owner"], "claude");
+}
+
+#[test]
+fn collab_start_rejects_invalid_implementer() {
+    let app = App::open_for_test().unwrap();
+    let err = call_tool_expect_error(
+        &app,
+        "collab_start",
+        json!({
+            "repo_path": "/repo",
+            "branch": "main",
+            "initiator": "claude",
+            "implementer": "gemini"
+        }),
+    );
+    assert!(
+        err.to_lowercase().contains("agent")
+            || err.to_lowercase().contains("must be 'claude' or 'codex'"),
+        "expected agent-validation error, got: {err}"
+    );
 }
 
 #[test]

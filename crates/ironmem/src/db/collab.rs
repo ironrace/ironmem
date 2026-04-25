@@ -10,8 +10,9 @@ impl Database {
         repo_path: &str,
         branch: &str,
         task: Option<&str>,
+        implementer: &str,
     ) -> Result<(), MemoryError> {
-        queue::create_session(&self.conn, id, repo_path, branch, task)
+        queue::create_session(&self.conn, id, repo_path, branch, task, implementer)
     }
 
     pub fn collab_end_session(&self, session_id: &str) -> Result<(), MemoryError> {

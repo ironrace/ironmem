@@ -67,6 +67,7 @@ Stored in `collab_sessions`:
 | `id` | Session identifier (returned from `collab_start`) |
 | `repo_path`, `branch` | Where this plan applies |
 | `task` | Human description of the planning goal. Set at `start`, readable via `status`. |
+| `implementer` | Which agent runs the v3 batch implementation phase (`claude` or `codex`). Set at `start`, immutable. Default `claude`. |
 | `phase` | Current protocol phase (see below) |
 | `current_owner` | Agent whose turn it is (`claude` or `codex`) |
 | `claude_draft_hash`, `codex_draft_hash` | SHA-256 of each first draft |
@@ -149,23 +150,46 @@ global review stage and is expressed as commits, not prose.
 
 ### Batch implementation
 
-After `task_list` lands, the session sits in a single Claude-owned phase
-for the entire implementation run. Claude orchestrates per-task work
-through `superpowers:writing-plans` (which produces a markdown plan at
-`docs/superpowers/plans/...`) and then `superpowers:subagent-driven-development`
-(which dispatches a fresh subagent per task, runs TDD, and commits per
-task). The server stores the `task_list` manifest as an audit artifact
-but does not iterate it; per-task progress is observable through the
-git log on the branch.
+After `task_list` lands, the session sits in a single phase for the
+entire implementation run. Which agent owns that phase depends on the
+session's `implementer` field, set at `collab_start` time and
+immutable thereafter:
+
+- **`implementer == "claude"`** (default): Claude orchestrates per-task
+  work through `superpowers:writing-plans` (markdown plan) and then
+  `superpowers:subagent-driven-development` (fresh subagent per task,
+  TDD, per-task commits). Claude emits `implementation_done`.
+- **`implementer == "codex"`** (opt-in via
+  `/collab start --implementer=codex`): Claude still produces the
+  writing-plans markdown and publishes `task_list` (writing-plans
+  approval is still the user gate). Then Claude hands off to Codex via
+  `mcp__codex__codex`; Codex runs its own
+  `subagent-driven-development` (controller-owned loop, runs to
+  completion) and emits `implementation_done` itself before returning.
+
+In both modes the server stores the `task_list` manifest as an audit
+artifact but does not iterate it; per-task progress is observable
+through the git log on the branch. After `implementation_done`, the
+phase advances to `CodeReviewLocalPending` with **Claude** as owner
+regardless of who implemented — Claude always provides the local-review
+second opinion. In Codex-implementer mode this is what makes the second
+opinion *independent*: Claude reviews Codex's batch output.
 
 | Phase | Owner | Event | Next |
 |---|---|---|---|
-| `CodeImplementPending` | `claude` | `ImplementationDone{head_sha}` — fired once after the full subagent batch completes (gates green, all commits pushed) | `CodeReviewLocalPending` |
+| `CodeImplementPending` | `claude` or `codex` (per session `implementer`) | `ImplementationDone{head_sha}` from the implementer agent — fired once after the full subagent batch completes (gates green, all commits pushed) | `CodeReviewLocalPending` (Claude-owned) |
 
 The `implementation_done` payload carries **only** `head_sha`. There is
-no `notes`, `summary`, `subagent_report`, or any other field — Codex
-reads the diff and the writing-plans markdown in the repo at the global
-review stage and forms its own judgment.
+no `notes`, `summary`, `subagent_report`, or any other field — the
+non-implementer agent reads the diff and the writing-plans markdown in
+the repo (via `plan_file_path`) at the global review stage and forms
+its own judgment.
+
+**Both modes apply the same `finishing-a-development-branch` carve-out**:
+the implementer agent stops `subagent-driven-development` at the last
+task's approval+commit and does *not* let the skill auto-invoke
+`superpowers:finishing-a-development-branch`. PR creation belongs to
+the collab `final_review` turn, not to the subagent skill.
 
 ### Global review, 3-phase linear
 
@@ -238,13 +262,18 @@ Creates a new session.
   "repo_path": "/path/to/repo",
   "branch": "feat/landing-page",
   "initiator": "claude",
-  "task": "design the marketing landing page"
+  "task": "design the marketing landing page",
+  "implementer": "claude"
 }
 ```
 
-Returns `{ session_id, task }`. The `task` is stored on the session so the
-counterpart agent can read it via `collab_status` without a manual
-paste.
+Returns `{ session_id, task, implementer }`. The `task` is stored on the
+session so the counterpart agent can read it via `collab_status` without
+a manual paste. `implementer` is optional, defaults to `"claude"`, and
+must be one of `{"claude","codex"}` — it routes the v3
+`CodeImplementPending` phase to the named agent. The DB CHECK constraint
+on the `implementer` column enforces the same set, so direct writes
+cannot bypass validation.
 
 ### `collab_start_code_review`
 

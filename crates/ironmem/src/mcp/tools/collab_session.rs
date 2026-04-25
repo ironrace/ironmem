@@ -30,6 +30,7 @@ pub(super) fn session_record_json(record: &SessionRecord) -> Value {
         "review_round": record.session.review_round,
         "task_list": record.session.task_list.as_deref(),
         "tasks_count": record.session.tasks_count(),
+        "implementer": record.session.implementer.as_str(),
         "task_review_round": record.session.task_review_round,
         "global_review_round": record.session.global_review_round,
         "base_sha": record.session.base_sha.as_deref(),
@@ -119,10 +120,26 @@ pub(super) fn handle_collab_start(app: &App, args: &Value) -> Result<Value, Memo
         .transpose()?
         .map(ToString::to_string);
     let task = task_owned.as_deref();
+    // Optional `implementer` field: routes the v3 batch implementation
+    // phase. Default is `"claude"` (historical flow). `"codex"` makes
+    // Codex the owner of `CodeImplementPending` and the only valid
+    // sender of `implementation_done`. `require_agent` rejects anything
+    // outside `{"claude","codex"}` with a uniform validation error.
+    let implementer = match args.get("implementer").and_then(Value::as_str) {
+        Some(value) => require_agent(value)?,
+        None => "claude",
+    };
     let session_id = uuid::Uuid::new_v4().to_string();
 
     app.db.with_transaction(|tx| {
-        crate::collab::queue::create_session(tx, &session_id, repo_path, branch, task)?;
+        crate::collab::queue::create_session(
+            tx,
+            &session_id,
+            repo_path,
+            branch,
+            task,
+            implementer,
+        )?;
         crate::db::schema::Database::wal_log_tx(
             tx,
             "collab_start",
@@ -131,6 +148,7 @@ pub(super) fn handle_collab_start(app: &App, args: &Value) -> Result<Value, Memo
                 "repo_path": repo_path,
                 "branch": branch,
                 "initiator": initiator,
+                "implementer": implementer,
                 "has_task": task.is_some(),
             }),
             Some(&json!({ "session_id": session_id })),
@@ -138,7 +156,11 @@ pub(super) fn handle_collab_start(app: &App, args: &Value) -> Result<Value, Memo
         Ok(())
     })?;
 
-    Ok(json!({ "session_id": session_id, "task": task }))
+    Ok(json!({
+        "session_id": session_id,
+        "task": task,
+        "implementer": implementer,
+    }))
 }
 
 pub(super) fn handle_collab_start_code_review(
@@ -161,7 +183,16 @@ pub(super) fn handle_collab_start_code_review(
         .map_err(collab_error_to_memory_error)?;
 
     app.db.with_transaction(|tx| {
-        crate::collab::queue::create_session(tx, &session_id, repo_path, branch, Some(task))?;
+        // Shortcut sessions never enter `CodeImplementPending`, so the
+        // `implementer` field is fixed at `"claude"` for uniformity.
+        crate::collab::queue::create_session(
+            tx,
+            &session_id,
+            repo_path,
+            branch,
+            Some(task),
+            "claude",
+        )?;
         crate::collab::queue::save_session(tx, &session)?;
         crate::db::schema::Database::wal_log_tx(
             tx,

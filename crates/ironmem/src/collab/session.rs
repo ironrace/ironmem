@@ -27,6 +27,14 @@ pub struct CollabSession {
     pub last_head_sha: Option<String>,
     pub pr_url: Option<String>,
     pub coding_failure: Option<String>,
+    /// Which agent runs the v3 batch implementation phase. `"claude"` (the
+    /// default) keeps the historical flow where Claude orchestrates per-task
+    /// subagents inline. `"codex"` routes `CodeImplementPending` to Codex
+    /// instead — Claude still publishes `task_list`, but Codex drives its
+    /// own `subagent-driven-development` end-to-end and emits
+    /// `implementation_done`. Validated against `{"claude","codex"}` at
+    /// `collab_start`; the DB CHECK constraint enforces the same set.
+    pub implementer: String,
 }
 
 impl CollabSession {
@@ -48,6 +56,7 @@ impl CollabSession {
             last_head_sha: None,
             pr_url: None,
             coding_failure: None,
+            implementer: "claude".to_string(),
         }
     }
 
@@ -56,6 +65,9 @@ impl CollabSession {
     /// orchestrators that already completed per-task coding via
     /// `subagent-driven-development`. The no-op `CodeReviewLocalPending`
     /// handshake is collapsed — `head_sha` is supplied here instead.
+    /// `implementer` is fixed at `"claude"` because the shortcut never
+    /// enters `CodeImplementPending`; the field is preserved only so the
+    /// session record shape stays uniform with full-flow sessions.
     pub fn new_global_review(
         id: impl Into<String>,
         base_sha: impl Into<String>,
@@ -79,6 +91,7 @@ impl CollabSession {
             last_head_sha: Some(head),
             pr_url: None,
             coding_failure: None,
+            implementer: "claude".to_string(),
         }
     }
 

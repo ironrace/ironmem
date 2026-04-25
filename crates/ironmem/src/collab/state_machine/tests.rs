@@ -86,6 +86,16 @@ fn submit_task_list(s: &CollabSession, plan_hash: &str, tasks_count: u32) -> Col
     .unwrap()
 }
 
+/// Build a `PlanLocked` session with `implementer == "codex"` so transitions
+/// out of the batch phase route to Codex. Mirrors `locked_session` but
+/// stamps the implementer field after planning completes (planning itself
+/// does not depend on `implementer`).
+fn locked_session_with_codex_implementer(final_hash: &str) -> CollabSession {
+    let mut s = locked_session(final_hash);
+    s.implementer = "codex".to_string();
+    s
+}
+
 /// Drive a session from `CodeImplementPending` through the full global
 /// review flow to `CodingComplete`. Used by tests that need a representative
 /// happy path through the post-batch stage.
@@ -345,6 +355,52 @@ fn test_implementation_done_rejected_from_codex() {
     )
     .unwrap_err();
     assert!(matches!(err, CollabError::NotYourTurn { .. }));
+}
+
+#[test]
+fn test_task_list_under_codex_implementer_makes_codex_owner() {
+    // With `implementer == "codex"`, transitioning out of PlanLocked sets
+    // `current_owner = "codex"` so Codex is the agent expected to drive
+    // the batch phase.
+    let s = locked_session_with_codex_implementer("hash-final");
+    let s = submit_task_list(&s, "hash-final", 2);
+    assert_eq!(s.phase, Phase::CodeImplementPending);
+    assert_eq!(s.current_owner, "codex");
+    assert_eq!(s.implementer, "codex");
+}
+
+#[test]
+fn test_implementation_done_under_codex_implementer_requires_codex_actor() {
+    let s = locked_session_with_codex_implementer("hf");
+    let s = submit_task_list(&s, "hf", 1);
+
+    // Claude trying to fire `implementation_done` is rejected — the
+    // owner check now reads from `session.implementer`, not a hardcoded
+    // "claude".
+    let err = apply_event(
+        &s,
+        "claude",
+        &CollabEvent::ImplementationDone {
+            head_sha: "h".to_string(),
+        },
+    )
+    .unwrap_err();
+    assert!(matches!(err, CollabError::NotYourTurn { .. }));
+
+    // Codex fires it successfully and the phase advances to local review
+    // (Claude-owned, since Claude always provides the second-opinion
+    // local pass regardless of who implemented).
+    let s = apply_event(
+        &s,
+        "codex",
+        &CollabEvent::ImplementationDone {
+            head_sha: "batch_head".to_string(),
+        },
+    )
+    .unwrap();
+    assert_eq!(s.phase, Phase::CodeReviewLocalPending);
+    assert_eq!(s.current_owner, "claude");
+    assert_eq!(s.last_head_sha.as_deref(), Some("batch_head"));
 }
 
 #[test]
