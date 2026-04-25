@@ -1,5 +1,5 @@
 ---
-description: Start or join an IronRace bounded planning session with Codex, auto-flowing into v3 coding if enabled. Covers v1 planning, v3 per-task linear → global review → PR handoff, and the post-subagent review shortcut. Usage — /collab start <task>  |  /collab join <session_id>  |  /collab review <short-topic>
+description: Start or join an IronRace bounded planning session with Codex, auto-flowing into v3 batch coding if enabled. Covers v1 planning, v3 batch implementation (writing-plans + subagent-driven-development) → global review → PR handoff, and the post-subagent review shortcut. Usage — /collab start <task>  |  /collab join <session_id>  |  /collab review <short-topic>
 argument-hint: start <task> | join <session_id> | review <short-topic>
 ---
 
@@ -54,8 +54,9 @@ branch names.
 ## `review <short-topic>`
 
 Shortcut entry for post-subagent-driven-development flows: skip v1
-planning and v3 per-task coding, and drop straight into the v3 global-review
-stage with Codex as the reviewer on the already-committed branch.
+planning and v3 batch implementation, and drop straight into the v3
+global-review stage with Codex as the reviewer on the already-committed
+branch.
 Everything except the short topic is inferred — never ask the user for
 paths, branches, or SHAs.
 
@@ -155,61 +156,83 @@ before (drafts, synthesis, revisions) runs autonomously.
 
 ## v3 Bridge: PlanLocked → CodeImplementPending
 
-Once `PlanLocked` is reached with `final_plan_hash` set and no `task_list` yet:
+Once `PlanLocked` is reached with `final_plan_hash` set and no `task_list`
+yet, run the writing-plans + subagent-driven-development pipeline. **Do not
+enter harness Plan Mode here** — `superpowers:writing-plans` produces the
+markdown plan and presents its own approval handoff to the user, which
+serves as the gate.
 
 1. Read `final_plan_hash` and `final_plan` from `collab_status(session_id)`.
-   `final_plan` is the JSON string `{"plan":"<full text>"}` Claude previously
-   sent; parse it to recover the approved plan body. Read the current `HEAD`
-   SHA via `git rev-parse HEAD` (the session record does not carry a HEAD
-   field — that's the harness's responsibility).
-2. **Enter Plan Mode.** Build a task list from the locked plan:
-   - Each task has `id` (strictly ordered starting at 1), `title`, and
-     `acceptance` (list of acceptance criteria, ≥1 per task).
-   - Document what success looks like for each task.
-3. Get user approval in Plan Mode.
+   `final_plan` is the JSON string `{"plan":"<full text>"}` Claude
+   previously sent; parse it to recover the approved plan body. Read the
+   current `HEAD` SHA via `git rev-parse HEAD`.
+2. **Invoke `Skill('superpowers:writing-plans')`** with the locked plan
+   text as input. The skill will save a markdown plan to
+   `docs/superpowers/plans/YYYY-MM-DD-<feature>.md` and present its own
+   "execute now?" handoff to the user. This is the user gate. If the user
+   declines, abort the bridge cleanly (do not send `task_list`).
+3. **Derive the `task_list` manifest from the markdown.** Parse each
+   `### Task N:` heading into `{id: N, title: "...", acceptance: [...]}`,
+   pulling acceptance criteria from the task body (e.g. lines describing
+   what success looks like, or the explicit acceptance bullets if the
+   skill includes them). If you parse zero tasks, abort with a clear
+   error — do not invent a single-task fallback.
 4. Build `task_list` JSON:
    ```json
    {
      "plan_hash": "<final_plan_hash>",
      "base_sha": "<current HEAD>",
      "head_sha": "<current HEAD>",
+     "plan_file_path": "docs/superpowers/plans/YYYY-MM-DD-<feature>.md",
      "tasks": [
-       {
-         "id": 1,
-         "title": "...",
-         "acceptance": ["criterion 1", "criterion 2"]
-       },
+       { "id": 1, "title": "...", "acceptance": ["criterion 1"] },
        ...
      ]
    }
    ```
 5. Call `collab_send(sender="claude", topic="task_list",
    content=<JSON string>)`. Session advances to `CodeImplementPending`.
-6. Fall through into the v3 dispatch loop.
+6. **Invoke `Skill('superpowers:subagent-driven-development')`** with
+   the same plan file. Auto-proceed through between-task checkpoints —
+   do not pause for user approval per task. Each subagent runs TDD,
+   commits, and pushes for its own task.
+7. **Subagent failure handling.** If a subagent fails mid-batch
+   (irrecoverable bug, persistent test failure, environment issue),
+   pause, surface the failure to the user, and triage:
+   - If retryable, re-dispatch that subagent and continue.
+   - If unrecoverable, send `failure_report` with
+     `coding_failure: "subagent_failure: <task id>: <concrete reason>"`
+     and exit the loop.
+8. **On full success:** run the pre-send harness once
+   (fetch, fmt --check, clippy -D warnings, test --workspace). On gate
+   failure, send `failure_report`. On green, send `implementation_done`
+   with `{"head_sha":"<current HEAD>"}`. Session advances to
+   `CodeReviewLocalPending`.
+9. Fall through into the v3 dispatch loop.
 
 ## v3 Dispatch Loop (Phase → Action Table)
 
-v3 collapses the coding loop to three linear turns per task and three linear
-turns at the global stage. There are no verdict/debate turns: Codex reviews
-and fixes in a single step, Claude does a final pass, and the next task
-starts. This structurally prevents Claude from steering Codex's conclusions.
+v3 batch mode has exactly four Claude-owned coding turns: `task_list`
+(bridge), `implementation_done` (post-batch), `review_local` (post-
+ultrareview), and `final_review` (PR open). Codex has one coding turn
+(`review_fix_global`) at the global review stage. There are no per-task
+Codex turns — Claude orchestrates per-task work via subagents on its
+side, and Codex's only second-opinion pass is at branch scope.
 
-For every coding-active phase, execute this pre-send harness sequence before
-building the payload:
+For every Claude-owned coding turn, execute this pre-send harness
+sequence before building the payload:
 
-**Pre-send Harness Sequence (v3 turns only):**
+**Pre-send Harness Sequence (Claude-owned v3 turns):**
 1. `collab_status(session_id)` → read `last_head_sha`.
 2. `git fetch` + `git cat-file -e <last_head_sha>^{commit}` — if the commit
    is missing locally after fetch, send `failure_report` with
-   `coding_failure` field containing
-   `"branch_drift: last_head_sha=<sha> not found in local repo"` and exit
-   the loop (do not retry silently).
-3. `git reset --hard <last_head_sha>` (or equivalent) so Claude starts from
-   the exact commit Codex/Claude last pushed. Never build on top of
-   unsynced local state.
-4. Run local gates **for every Claude-owned coding turn** —
-   `CodeImplementPending`, `CodeFinalPending`, `CodeReviewLocalPending`,
-   `CodeReviewFinalPending`:
+   `coding_failure: "branch_drift: last_head_sha=<sha> not found in local repo"`
+   and exit the loop (do not retry silently).
+3. **Reset only when Codex just pushed.** Run `git reset --hard <last_head_sha>`
+   before `review_local` and `final_review` — Codex pushed `review_fix_global`
+   right before those phases. Skip reset before `task_list` and
+   `implementation_done` — Claude is the only writer in those phases.
+4. Run local gates:
    - `cargo fmt --all -- --check`
    - `cargo clippy --workspace --all-targets --all-features -- -D warnings`
    - `cargo test --workspace`
@@ -219,38 +242,40 @@ building the payload:
 
 | Phase | What to do (is_my_turn == true) |
 |---|---|
-| `CodeImplementPending` | **Run pre-send harness.** Write code for the current task. Commit and push. Call `collab_send` with `sender="claude"`, `topic="implement"`, `content=<JSON {"head_sha":"<current HEAD>"}>`. Payload carries ONLY `head_sha` — no review notes, no self-critique, no guidance for Codex. Codex reads the diff and forms its own judgment. |
-| `CodeReviewFixPending` | Codex's turn. is_my_turn should be false. If `collab_status` confirms Claude is the owner, exit the loop and report the anomaly; do not attempt a send. |
-| `CodeFinalPending` | **Run pre-send harness.** Codex has pushed fixes (or a no-op commit if clean); your local working copy was reset to `last_head_sha` by the harness. Optionally make final adjustments — Claude always gets the last word on each task. Commit + push if you change anything. Re-run gates. Call `collab_send` with `sender="claude"`, `topic="final"`, `content=<JSON {"head_sha":"<current HEAD>"}>`. Advances to the next task's `CodeImplementPending`, or to `CodeReviewLocalPending` after the last task. |
-| `CodeReviewLocalPending` | **Run pre-send harness, then `/ultrareview-local` on the full task stack.** Fix any CRITICAL/HIGH inline (commit + push). Call `collab_send` with `sender="claude"`, `topic="review_local"`, `content=<JSON {"head_sha":"<current HEAD>"}>`. |
+| `CodeImplementPending` | The bridge has already invoked `superpowers:subagent-driven-development`. When all subagents finish successfully, **run pre-send harness gates** (no reset — no Codex push to sync). Call `collab_send` with `sender="claude"`, `topic="implementation_done"`, `content=<JSON {"head_sha":"<current HEAD>"}>`. Payload carries ONLY `head_sha` — no subagent notes, no summary, no guidance for Codex. Codex reads the diff and the writing-plans markdown at `plan_file_path` and forms its own judgment. |
+| `CodeReviewLocalPending` | **Run pre-send harness (with reset to `last_head_sha`), then `/ultrareview-local` on the full task stack.** Fix any CRITICAL/HIGH inline (commit + push). Call `collab_send` with `sender="claude"`, `topic="review_local"`, `content=<JSON {"head_sha":"<current HEAD>"}>`. |
 | `CodeReviewFixGlobalPending` | Codex's turn. is_my_turn should be false. If `collab_status` confirms Claude is the owner, exit the loop and report the anomaly. |
-| `CodeReviewFinalPending` | **Run pre-send harness (gates before final).** Codex has pushed any global fixes (or a no-op commit); your local working copy was reset to `last_head_sha` by the harness. Optionally tweak. Re-run gates. Then **enter Plan Mode**: draft PR title (under 70 chars) and body (summary + test plan derived from task list + gate results). Get user approval. Then `gh pr create --base <base_branch> --head <current branch> --title <approved title> --body <approved body>`. If `gh pr create` fails, send `failure_report` with `coding_failure: "pr_create_failed: <error>"` — no silent retry. On success, capture `pr_url` and call `collab_send` with `sender="claude"`, `topic="final_review"`, `content=<JSON {"head_sha":"<current HEAD>","pr_url":"<https url>"}>`. Session advances directly to `CodingComplete`. Exit loop. |
+| `CodeReviewFinalPending` | **Run pre-send harness (with reset to `last_head_sha`).** Codex has pushed any global fixes (or a no-op commit); your local working copy was reset to `last_head_sha` by the harness. Optionally tweak. Re-run gates. Then **enter Plan Mode**: draft PR title (under 70 chars) and body (summary + test plan derived from task list + gate results). Get user approval. Then `gh pr create --base <base_branch> --head <current branch> --title <approved title> --body <approved body>`. If `gh pr create` fails, send `failure_report` with `coding_failure: "pr_create_failed: <error>"` — no silent retry. On success, capture `pr_url` and call `collab_send` with `sender="claude"`, `topic="final_review"`, `content=<JSON {"head_sha":"<current HEAD>","pr_url":"<https url>"}>`. Session advances directly to `CodingComplete`. Exit loop. |
 
 After each send in v3, loop back to polling. The loop continues until
 `phase in {CodingComplete, CodingFailed}` or `session_ended`.
 
 **Shortcut entry:** `/collab review` starts the loop at phase
-`CodeReviewFixGlobalPending` with `current_owner == "codex"`. No per-task
-phases are traversed. The only two remaining turns are Codex's
-`review_fix_global` and Claude's `final_review`. All anti-puppeteering
-rules below apply unchanged.
+`CodeReviewFixGlobalPending` with `current_owner == "codex"`. No batch
+implementation phase is traversed. The only two remaining turns are
+Codex's `review_fix_global` and Claude's `final_review`. All
+anti-puppeteering rules below apply unchanged.
 
 ### Anti-puppeteering rules (v3)
 
-v3 structurally removes the `verdict` and `comment` turns that v2 used,
-but a few behavioral rules remain:
+v3 batch mode structurally removes per-task Codex turns and the
+`verdict`/`comment` channels that v2 used, but a few behavioral rules
+remain:
 
-- The `implement` and `final` payloads carry ONLY `head_sha`. Do not
-  embed review notes, self-critique, or instructions for Codex in any
-  other field — there are no other fields.
+- The `implementation_done` payload carries ONLY `head_sha`. Do not
+  embed subagent notes, self-critique, success summaries, or
+  instructions for Codex in any other field — there are no other
+  fields. Codex reads the diff and the writing-plans markdown at
+  `plan_file_path` to form its own judgment.
 - When driving Codex via `mcp__codex__codex`, the `prompt` argument is
   the verbatim expanded `.codex-plugin/prompts/collab.md` with
   `$ARGUMENTS` substituted. Nothing more. Do not append session
   context, state summary, or recommendations about what Codex should
   conclude. See the handoff section below.
-- Codex's `review_fix` commit stands as its own judgment. If Claude
-  disagrees with a fix during `CodeFinalPending`, the right response is
-  to amend the code and commit — not to re-litigate in prose.
+- Codex's `review_fix_global` commit stands as its own judgment. If
+  Claude disagrees with a fix during `CodeReviewFinalPending`, the right
+  response is to amend the code and commit — not to re-litigate in
+  prose.
 
 ### Codex handoff — synchronous MCP invocation
 
@@ -312,8 +337,7 @@ Procedure:
    phase or a terminal condition.
 
 Applies to every Codex-owned phase: v1 `PlanParallelDrafts` (Codex
-drafting), v1 `PlanCodexReviewPending`, v3 `CodeReviewFixPending`,
-v3 `CodeReviewFixGlobalPending`.
+drafting), v1 `PlanCodexReviewPending`, and v3 `CodeReviewFixGlobalPending`.
 
 If `mcp__codex__codex` is not registered, fall back to the legacy flow:
 tell the user to run `/collab join <session_id>` in a Codex terminal,
@@ -324,18 +348,18 @@ then `ScheduleWakeup` and resume polling.
 - **Never** call `mcp__ironmem__collab_end` during any active phase. Rejected in:
   - v1 active: `PlanParallelDrafts`, `PlanSynthesisPending`,
     `PlanCodexReviewPending`, `PlanClaudeFinalizePending`.
-  - v3 active: `CodeImplementPending`, `CodeReviewFixPending`,
-    `CodeFinalPending`, `CodeReviewLocalPending`,
+  - v3 active: `CodeImplementPending`, `CodeReviewLocalPending`,
     `CodeReviewFixGlobalPending`, `CodeReviewFinalPending`.
 
   Only valid from `PlanLocked` pre-`task_list` (abandon plan), `CodingComplete`,
   or `CodingFailed`.
 - **Never** peek at Codex's draft before sending your own during
   `PlanParallelDrafts`. The server enforces blind-draft in `recv`.
-- **Plan Mode gates only at: v1 initial `draft` (from `/collab start`),
-  v1 `final` (`PlanClaudeFinalizePending`), v3 `task_list` (bridge), and
-  v3 `final_review` (`CodeReviewFinalPending`, PR creation).** Every other
-  turn runs autonomously.
+- **Harness Plan Mode gates only at: v1 initial `draft` (from `/collab start`),
+  v1 `final` (`PlanClaudeFinalizePending`), and v3 `final_review`
+  (`CodeReviewFinalPending`, PR creation).** The v3 `task_list` send is
+  gated by writing-plans's own approval handoff, not harness Plan Mode.
+  Every other turn runs autonomously.
 - **Every v3 `collab_send` payload is JSON** per the matrix in `docs/COLLAB.md`.
   Never send prose payloads for v3 topics.
 - **`head_sha` in every v3 payload must be the current `HEAD` AFTER any
@@ -346,9 +370,9 @@ then `ScheduleWakeup` and resume polling.
   the only topic that bypasses the owner check. A `coding_failure` prefixed
   `"branch_drift:"` is the canonical drift signal; do not suppress it.
 - If the user interrupts with a question or correction during v1, answer it
-  inside Plan Mode and incorporate it into the next send. During v3, gate at
-  Plan Mode points only (`task_list`, `final_review`); all other turns are
-  autonomous.
+  inside Plan Mode and incorporate it into the next send. During v3,
+  gate at writing-plans's approval (bridge) and harness Plan Mode for
+  `final_review`; all other turns are autonomous.
 
 ## Unknown subcommand
 
