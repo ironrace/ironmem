@@ -211,13 +211,26 @@ serves as the gate.
      pause for user approval per task. Each subagent runs TDD, commits,
      and pushes for its own task.
 
-     **Stop the skill at the boundary before
+     **Hard stop at the boundary before
      `finishing-a-development-branch`.** That sub-skill prompts the user
-     to choose merge/PR/cleanup, which would conflict with the collab
-     global review stage that handles PR creation here. Treat the last
-     task's approval + commit as the exit point: do *not* let the skill
-     auto-invoke `superpowers:finishing-a-development-branch`. The
-     collab v3 global review flow
+     to choose merge/PR/cleanup, which would create a PR outside the
+     collab protocol and collide with the `final_review` turn here. Two
+     guards apply:
+
+     1. Before invoking `subagent-driven-development`, tell its
+        controller-loop the explicit stopping point: "stop after the
+        last task is implemented, reviewed, and committed; do *not*
+        invoke `superpowers:finishing-a-development-branch`." The skill's
+        controller honors that direction.
+     2. After the skill returns and before `implementation_done` is
+        sent, verify no PR was opened on this branch behind your back:
+        `gh pr list --head <branch> --json number --jq 'length'` must
+        return `0`. If it returns ≥1, abort with `failure_report` —
+        `coding_failure: "skill_overran_pr_boundary: <pr_number>"` —
+        because the protocol's invariant has been violated and the
+        global-review stage can no longer open the PR cleanly.
+
+     The collab v3 global review flow
      (`review_local` → `review_fix_global` → `final_review` with
      `gh pr create`) is the protocol's canonical PR path.
 
@@ -233,8 +246,33 @@ serves as the gate.
      Do *not* invoke `superpowers:subagent-driven-development` locally
      in this mode — Codex owns the batch phase.
 
-     If `mcp__codex__codex` is not registered, abort with a clear
-     error: `--implementer=codex` requires the Codex MCP server.
+     **Recovery if `mcp__codex__codex` errors or times out mid-batch.**
+     The session is now sitting at `CodeImplementPending` with
+     `current_owner == "codex"` and no agent polling — without
+     intervention, it never advances. Catch the MCP failure and:
+
+     1. Re-poll `collab_status`. If the phase has already advanced to
+        `CodeReviewLocalPending`, Codex managed to emit
+        `implementation_done` before the failure surfaced — fall
+        through into the global review loop.
+     2. Otherwise, decide based on the failure mode:
+        - **Transient (timeout, network, server overload, 5xx)**:
+          re-dispatch by reading `.codex-plugin/prompts/collab.md`
+          again and calling `mcp__codex__codex` once more. Codex
+          will re-enter at `CodeImplementPending`, observe the same
+          `task_list` and `plan_file_path`, and resume the batch.
+        - **Hard (Codex unregistered, repeated failure, gate
+          regression on Codex's side)**: send `failure_report` with
+          `sender="claude"`, `topic="failure_report"`,
+          `content=<JSON {"coding_failure":"codex_dispatch_failed: <error>"}>`.
+          The state machine's branch-drift carve-out admits this from
+          a non-owner, transitioning the session to `CodingFailed`.
+          Surface the original Codex error to the user.
+
+     If `mcp__codex__codex` is not registered at all, abort with a
+     clear error before sending `task_list`: `--implementer=codex`
+     requires the Codex MCP server. (The session is still in
+     `PlanLocked` at that point, so `collab_end` is valid.)
 
 7. **Subagent failure handling** (Claude-implementer mode only — Codex's
    failures surface inside its own MCP session and Codex emits

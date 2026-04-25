@@ -58,7 +58,7 @@ impl Phase {
     /// `{CodingComplete, CodingFailed}` is the terminal set post-`task_list`.
     /// This helper returns only the permanently-terminal cases; callers
     /// responsible for the dynamic set check `task_list` on the session.
-    pub fn is_terminal_v2(&self) -> bool {
+    pub fn is_coding_terminal(&self) -> bool {
         matches!(self, Self::CodingComplete | Self::CodingFailed)
     }
 

@@ -3,7 +3,7 @@
 use rusqlite::{params, Connection, OptionalExtension};
 use uuid::Uuid;
 
-use super::{CollabSession, Phase};
+use super::{Agent, CollabSession, Phase};
 use crate::error::MemoryError;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -42,20 +42,16 @@ pub fn create_session(
     repo_path: &str,
     branch: &str,
     task: Option<&str>,
-    implementer: &str,
+    implementer: Agent,
 ) -> Result<(), MemoryError> {
-    // The DB CHECK constraint enforces `implementer IN ('claude', 'codex')`,
-    // but validate at the application layer too so callers get a clear
-    // `Validation` error rather than a SQL constraint violation.
-    if implementer != "claude" && implementer != "codex" {
-        return Err(MemoryError::Validation(format!(
-            "implementer must be 'claude' or 'codex', got '{implementer}'"
-        )));
-    }
+    // `Agent` is a closed enum so the canonical wire form is guaranteed —
+    // no application-layer string validation is needed here. The DB CHECK
+    // constraint on the column remains as defense-in-depth against direct
+    // SQL writes.
     conn.execute(
         "INSERT INTO collab_sessions (id, repo_path, branch, task, implementer)
          VALUES (?1, ?2, ?3, ?4, ?5)",
-        params![id, repo_path, branch, task, implementer],
+        params![id, repo_path, branch, task, implementer.as_str()],
     )?;
     Ok(())
 }
@@ -113,10 +109,10 @@ pub fn load_session_record(
     conn: &Connection,
     session_id: &str,
 ) -> Result<SessionRecord, MemoryError> {
-    // The `current_task_index` column is intentionally not selected here:
-    // v3 batch mode no longer tracks a per-task index (Claude-side subagents
-    // run all tasks in a single phase). The column remains in the schema
-    // (migration 005) but is unread; new writes set it to NULL.
+    // Named-column reads insulate this loader from positional drift: a
+    // future migration that inserts a column anywhere in the SELECT list
+    // would silently misalign hardcoded indices. The SELECT order is still
+    // listed explicitly so the query plan stays predictable.
     conn.query_row(
         "SELECT id, phase, current_owner, repo_path, branch,
                 claude_draft_hash, codex_draft_hash, canonical_plan_hash,
@@ -130,45 +126,40 @@ pub fn load_session_record(
          WHERE id = ?1",
         params![session_id],
         |row| {
-            let phase: String = row.get(1)?;
-            let phase = Phase::try_from(phase.as_str()).map_err(|err| {
-                rusqlite::Error::FromSqlConversionFailure(
-                    1,
-                    rusqlite::types::Type::Text,
-                    Box::new(std::io::Error::new(std::io::ErrorKind::InvalidData, err)),
-                )
-            })?;
-            let review_round_i: i64 = row.get(10)?;
+            let phase = parse_text_column::<Phase>(row, "phase")?;
+            let current_owner = parse_text_column::<Agent>(row, "current_owner")?;
+            let implementer = parse_text_column::<Agent>(row, "implementer")?;
+            let review_round_i: i64 = row.get("review_round")?;
             let review_round = review_round_i.clamp(0, u8::MAX as i64) as u8;
-            let task_list: Option<String> = row.get(13)?;
-            let task_review_round_i: i64 = row.get(14)?;
-            let global_review_round_i: i64 = row.get(15)?;
+            let task_list: Option<String> = row.get("task_list")?;
+            let task_review_round_i: i64 = row.get("task_review_round")?;
+            let global_review_round_i: i64 = row.get("global_review_round")?;
             Ok(SessionRecord {
                 session: CollabSession {
-                    id: row.get(0)?,
+                    id: row.get("id")?,
                     phase,
-                    current_owner: row.get(2)?,
-                    claude_draft_hash: row.get(5)?,
-                    codex_draft_hash: row.get(6)?,
-                    canonical_plan_hash: row.get(7)?,
-                    final_plan_hash: row.get(8)?,
-                    codex_review_verdict: row.get(9)?,
+                    current_owner,
+                    claude_draft_hash: row.get("claude_draft_hash")?,
+                    codex_draft_hash: row.get("codex_draft_hash")?,
+                    canonical_plan_hash: row.get("canonical_plan_hash")?,
+                    final_plan_hash: row.get("final_plan_hash")?,
+                    codex_review_verdict: row.get("codex_review_verdict")?,
                     review_round,
                     task_list,
                     task_review_round: task_review_round_i.clamp(0, u8::MAX as i64) as u8,
                     global_review_round: global_review_round_i.clamp(0, u8::MAX as i64) as u8,
-                    base_sha: row.get(16)?,
-                    last_head_sha: row.get(17)?,
-                    pr_url: row.get(18)?,
-                    coding_failure: row.get(19)?,
-                    implementer: row.get(22)?,
+                    base_sha: row.get("base_sha")?,
+                    last_head_sha: row.get("last_head_sha")?,
+                    pr_url: row.get("pr_url")?,
+                    coding_failure: row.get("coding_failure")?,
+                    implementer,
                 },
-                repo_path: row.get(3)?,
-                branch: row.get(4)?,
-                task: row.get(11)?,
-                ended_at: row.get(12)?,
-                created_at: row.get(20)?,
-                updated_at: row.get(21)?,
+                repo_path: row.get("repo_path")?,
+                branch: row.get("branch")?,
+                task: row.get("task")?,
+                ended_at: row.get("ended_at")?,
+                created_at: row.get("created_at")?,
+                updated_at: row.get("updated_at")?,
             })
         },
     )
@@ -176,11 +167,32 @@ pub fn load_session_record(
     .ok_or_else(|| MemoryError::NotFound(format!("session {session_id} not found")))
 }
 
+/// Read a TEXT column and parse it via `FromStr`, surfacing any parse
+/// failure as a `FromSqlConversionFailure` so the row scan returns a
+/// proper rusqlite error rather than panicking.
+fn parse_text_column<T>(row: &rusqlite::Row<'_>, column: &str) -> rusqlite::Result<T>
+where
+    T: std::str::FromStr,
+    T::Err: std::fmt::Display,
+{
+    let raw: String = row.get(column)?;
+    raw.parse::<T>().map_err(|err| {
+        rusqlite::Error::FromSqlConversionFailure(
+            0,
+            rusqlite::types::Type::Text,
+            Box::new(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("column {column}: {err}"),
+            )),
+        )
+    })
+}
+
 pub fn save_session(conn: &Connection, session: &CollabSession) -> Result<(), MemoryError> {
-    // `current_task_index` is set to NULL on every save: v3 batch mode does
-    // not track a per-task index. Keeping the explicit `= NULL` assignment
-    // (rather than dropping the column from UPDATE) ensures any rows
-    // surviving from v2 get nulled out the next time they are touched.
+    // `implementer` is set at INSERT time and immutable thereafter; we
+    // include it in the UPDATE list defensively so any future rebind of
+    // the field stays consistent with the rest of the session, and so a
+    // future maintainer doesn't read the absence as a bug to fix.
     let updated = conn.execute(
         "UPDATE collab_sessions
          SET phase = ?1,
@@ -192,15 +204,15 @@ pub fn save_session(conn: &Connection, session: &CollabSession) -> Result<(), Me
              codex_review_verdict = ?7,
              review_round = ?8,
              task_list = ?9,
-             current_task_index = NULL,
              task_review_round = ?10,
              global_review_round = ?11,
              base_sha = ?12,
              last_head_sha = ?13,
              pr_url = ?14,
              coding_failure = ?15,
+             implementer = ?16,
              updated_at = datetime('now')
-        WHERE id = ?16",
+        WHERE id = ?17",
         params![
             session.phase.to_string(),
             session.current_owner.as_str(),
@@ -217,6 +229,7 @@ pub fn save_session(conn: &Connection, session: &CollabSession) -> Result<(), Me
             session.last_head_sha.as_deref(),
             session.pr_url.as_deref(),
             session.coding_failure.as_deref(),
+            session.implementer.as_str(),
             session.id.as_str(),
         ],
     )?;
@@ -403,6 +416,8 @@ mod tests {
     const COLLAB_V2_SQL: &str = include_str!("../../migrations/005_collab_v2.sql");
     const COLLAB_IMPLEMENTER_SQL: &str =
         include_str!("../../migrations/006_collab_implementer.sql");
+    const DROP_CURRENT_TASK_INDEX_SQL: &str =
+        include_str!("../../migrations/007_drop_current_task_index.sql");
 
     fn open() -> Connection {
         let conn = Connection::open_in_memory().unwrap();
@@ -412,13 +427,14 @@ mod tests {
         conn.execute_batch(COLLAB_V1_SQL).unwrap();
         conn.execute_batch(COLLAB_V2_SQL).unwrap();
         conn.execute_batch(COLLAB_IMPLEMENTER_SQL).unwrap();
+        conn.execute_batch(DROP_CURRENT_TASK_INDEX_SQL).unwrap();
         conn
     }
 
     #[test]
     fn test_send_recv_ack_fifo() {
         let db = open();
-        create_session(&db, "sess1", "/repo", "main", None, "claude").unwrap();
+        create_session(&db, "sess1", "/repo", "main", None, Agent::Claude).unwrap();
         let m1 = send_message(&db, "sess1", "claude", "codex", "draft", "first").unwrap();
         let _m2 = send_message(&db, "sess1", "claude", "codex", "draft", "second").unwrap();
 
@@ -436,7 +452,7 @@ mod tests {
     #[test]
     fn test_ack_idempotent() {
         let db = open();
-        create_session(&db, "sess2", "/repo", "main", None, "claude").unwrap();
+        create_session(&db, "sess2", "/repo", "main", None, Agent::Claude).unwrap();
         let message_id = send_message(&db, "sess2", "claude", "codex", "draft", "x").unwrap();
         ack_message(&db, "sess2", &message_id).unwrap();
         let err = ack_message(&db, "wrong-session", &message_id).unwrap_err();
@@ -446,7 +462,7 @@ mod tests {
     #[test]
     fn test_register_caps_upsert() {
         let db = open();
-        create_session(&db, "sess3", "/repo", "main", None, "claude").unwrap();
+        create_session(&db, "sess3", "/repo", "main", None, Agent::Claude).unwrap();
         register_caps(
             &db,
             "sess3",
@@ -478,7 +494,7 @@ mod tests {
     #[test]
     fn test_get_caps_empty_before_register() {
         let db = open();
-        create_session(&db, "sess4", "/repo", "main", None, "claude").unwrap();
+        create_session(&db, "sess4", "/repo", "main", None, Agent::Claude).unwrap();
         let caps = get_caps(&db, "sess4", Some("claude")).unwrap();
         assert!(caps.is_empty());
     }
@@ -500,7 +516,7 @@ mod tests {
             "/repo",
             "main",
             Some("build a landing page"),
-            "claude",
+            Agent::Claude,
         )
         .unwrap();
         let record = load_session_record(&db, "sess-task").unwrap();
@@ -512,7 +528,7 @@ mod tests {
     #[test]
     fn test_review_round_persists() {
         let db = open();
-        create_session(&db, "sess-rr", "/repo", "main", None, "claude").unwrap();
+        create_session(&db, "sess-rr", "/repo", "main", None, Agent::Claude).unwrap();
         let mut session = load_session(&db, "sess-rr").unwrap();
         session.review_round = 2;
         save_session(&db, &session).unwrap();
@@ -523,7 +539,7 @@ mod tests {
     #[test]
     fn test_ensure_active_rejects_ended_session() {
         let db = open();
-        create_session(&db, "sess-end", "/repo", "main", None, "claude").unwrap();
+        create_session(&db, "sess-end", "/repo", "main", None, Agent::Claude).unwrap();
         ensure_active(&db, "sess-end").unwrap();
         end_session(&db, "sess-end").unwrap();
         let err = ensure_active(&db, "sess-end").unwrap_err();
@@ -533,7 +549,7 @@ mod tests {
     #[test]
     fn test_end_session_idempotent() {
         let db = open();
-        create_session(&db, "sess-end2", "/repo", "main", None, "claude").unwrap();
+        create_session(&db, "sess-end2", "/repo", "main", None, Agent::Claude).unwrap();
         end_session(&db, "sess-end2").unwrap();
         // Calling end_session a second time must succeed (idempotent).
         end_session(&db, "sess-end2").unwrap();
@@ -549,7 +565,7 @@ mod tests {
     #[test]
     fn test_v2_fields_round_trip() {
         let db = open();
-        create_session(&db, "sess-v2", "/repo", "main", None, "claude").unwrap();
+        create_session(&db, "sess-v2", "/repo", "main", None, Agent::Claude).unwrap();
         let mut session = load_session(&db, "sess-v2").unwrap();
         session.task_list = Some(r#"{"plan_hash":"pf","tasks":[{"id":1},{"id":2}]}"#.to_string());
         session.task_review_round = 1;
@@ -575,7 +591,7 @@ mod tests {
     #[test]
     fn test_v1_defaults_for_fresh_session() {
         let db = open();
-        create_session(&db, "sess-fresh", "/repo", "main", None, "claude").unwrap();
+        create_session(&db, "sess-fresh", "/repo", "main", None, Agent::Claude).unwrap();
         let session = load_session(&db, "sess-fresh").unwrap();
         assert!(session.task_list.is_none());
         assert_eq!(session.task_review_round, 0);

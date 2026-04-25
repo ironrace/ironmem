@@ -38,13 +38,13 @@ pub(super) fn handle_collab_register_caps(app: &App, args: &Value) -> Result<Val
     let count = parsed.len();
     app.db.with_transaction(|tx| {
         crate::collab::queue::ensure_active(tx, session_id)?;
-        crate::collab::queue::register_caps(tx, session_id, agent, &parsed)?;
+        crate::collab::queue::register_caps(tx, session_id, agent.as_str(), &parsed)?;
         crate::db::schema::Database::wal_log_tx(
             tx,
             "collab_register_caps",
             &json!({
                 "session_id": session_id,
-                "agent": agent,
+                "agent": agent.as_str(),
                 "count": count,
             }),
             Some(&json!({ "success": true, "count": count })),
@@ -64,7 +64,7 @@ pub(super) fn handle_collab_get_caps(app: &App, args: &Value) -> Result<Value, M
         .transpose()?;
     let capabilities = app
         .db
-        .collab_get_caps(session_id, agent)?
+        .collab_get_caps(session_id, agent.as_ref().map(|a| a.as_str()))?
         .into_iter()
         .map(|capability| {
             json!({

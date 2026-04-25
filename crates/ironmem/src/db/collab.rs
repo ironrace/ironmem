@@ -1,5 +1,5 @@
 use crate::collab::queue::{self, Capability, Message, SessionRecord};
-use crate::collab::CollabSession;
+use crate::collab::{Agent, CollabSession};
 use crate::db::schema::Database;
 use crate::error::MemoryError;
 
@@ -10,7 +10,7 @@ impl Database {
         repo_path: &str,
         branch: &str,
         task: Option<&str>,
-        implementer: &str,
+        implementer: Agent,
     ) -> Result<(), MemoryError> {
         queue::create_session(&self.conn, id, repo_path, branch, task, implementer)
     }

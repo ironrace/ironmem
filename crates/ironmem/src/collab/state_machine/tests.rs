@@ -1,3 +1,4 @@
+use super::super::agent::Agent;
 use super::super::session::tasks_count_from_list;
 use super::*;
 
@@ -5,7 +6,11 @@ fn session() -> CollabSession {
     CollabSession::new("test-session")
 }
 
-fn draft(actor: &str, hash: &str, s: &CollabSession) -> CollabSession {
+fn session_with_implementer(implementer: Agent) -> CollabSession {
+    CollabSession::new_with_implementer("test-session", implementer)
+}
+
+fn draft(actor: Agent, hash: &str, s: &CollabSession) -> CollabSession {
     apply_event(
         s,
         actor,
@@ -19,7 +24,7 @@ fn draft(actor: &str, hash: &str, s: &CollabSession) -> CollabSession {
 fn canonical(hash: &str, s: &CollabSession) -> CollabSession {
     apply_event(
         s,
-        "claude",
+        Agent::Claude,
         &CollabEvent::PublishCanonical {
             content_hash: hash.to_string(),
         },
@@ -30,7 +35,7 @@ fn canonical(hash: &str, s: &CollabSession) -> CollabSession {
 fn review(verdict: &str, s: &CollabSession) -> CollabSession {
     apply_event(
         s,
-        "codex",
+        Agent::Codex,
         &CollabEvent::SubmitReview {
             verdict: verdict.to_string(),
         },
@@ -38,22 +43,27 @@ fn review(verdict: &str, s: &CollabSession) -> CollabSession {
     .unwrap()
 }
 
-/// Run the v1 flow to the point where `final_plan_hash` is set and the
-/// session is `PlanLocked`, ready for `SubmitTaskList`.
-fn locked_session(final_hash: &str) -> CollabSession {
-    let s = session();
-    let s = draft("claude", "c1", &s);
-    let s = draft("codex", "c2", &s);
+/// Run the v1 flow on the supplied starting session through to the point
+/// where `final_plan_hash` is set and the session is `PlanLocked`, ready
+/// for `SubmitTaskList`. Used by both the default-implementer helper and
+/// the codex-implementer helper.
+fn drive_to_plan_locked(start: CollabSession, final_hash: &str) -> CollabSession {
+    let s = draft(Agent::Claude, "c1", &start);
+    let s = draft(Agent::Codex, "c2", &s);
     let s = canonical("canonical", &s);
     let s = review("approve", &s);
     apply_event(
         &s,
-        "claude",
+        Agent::Claude,
         &CollabEvent::PublishFinal {
             content_hash: final_hash.to_string(),
         },
     )
     .unwrap()
+}
+
+fn locked_session(final_hash: &str) -> CollabSession {
+    drive_to_plan_locked(session(), final_hash)
 }
 
 /// Build a canonical `{"tasks":[…]}` JSON of `count` placeholder tasks so
@@ -74,7 +84,7 @@ fn canonical_task_list(count: u32) -> String {
 fn submit_task_list(s: &CollabSession, plan_hash: &str, tasks_count: u32) -> CollabSession {
     apply_event(
         s,
-        "claude",
+        Agent::Claude,
         &CollabEvent::SubmitTaskList {
             plan_hash: plan_hash.to_string(),
             base_sha: "base0".to_string(),
@@ -86,14 +96,13 @@ fn submit_task_list(s: &CollabSession, plan_hash: &str, tasks_count: u32) -> Col
     .unwrap()
 }
 
-/// Build a `PlanLocked` session with `implementer == "codex"` so transitions
-/// out of the batch phase route to Codex. Mirrors `locked_session` but
-/// stamps the implementer field after planning completes (planning itself
-/// does not depend on `implementer`).
+/// Build a `PlanLocked` session whose `implementer` is `Agent::Codex`, so
+/// the v3 batch phase routes ownership to Codex. Constructs the session
+/// with the implementer set up front rather than mutating after the fact —
+/// the project's immutability rule forbids field-level mutation, and the
+/// planning flow doesn't depend on the implementer field anyway.
 fn locked_session_with_codex_implementer(final_hash: &str) -> CollabSession {
-    let mut s = locked_session(final_hash);
-    s.implementer = "codex".to_string();
-    s
+    drive_to_plan_locked(session_with_implementer(Agent::Codex), final_hash)
 }
 
 /// Drive a session from `CodeImplementPending` through the full global
@@ -102,7 +111,7 @@ fn locked_session_with_codex_implementer(final_hash: &str) -> CollabSession {
 fn finish_through_global_review(s: &CollabSession) -> CollabSession {
     let s = apply_event(
         s,
-        "claude",
+        Agent::Claude,
         &CollabEvent::ImplementationDone {
             head_sha: "batch_head".to_string(),
         },
@@ -110,7 +119,7 @@ fn finish_through_global_review(s: &CollabSession) -> CollabSession {
     .unwrap();
     let s = apply_event(
         &s,
-        "claude",
+        Agent::Claude,
         &CollabEvent::ReviewLocal {
             head_sha: "g1".to_string(),
         },
@@ -118,7 +127,7 @@ fn finish_through_global_review(s: &CollabSession) -> CollabSession {
     .unwrap();
     let s = apply_event(
         &s,
-        "codex",
+        Agent::Codex,
         &CollabEvent::CodeReviewFixGlobal {
             head_sha: "g2".to_string(),
         },
@@ -126,7 +135,7 @@ fn finish_through_global_review(s: &CollabSession) -> CollabSession {
     .unwrap();
     apply_event(
         &s,
-        "claude",
+        Agent::Claude,
         &CollabEvent::FinalReview {
             head_sha: "g3".to_string(),
             pr_url: "https://example/pr/1".to_string(),
@@ -140,20 +149,20 @@ fn finish_through_global_review(s: &CollabSession) -> CollabSession {
 #[test]
 fn test_parallel_drafts_both_submit_advances_phase() {
     let s = session();
-    let s = draft("claude", "c1", &s);
+    let s = draft(Agent::Claude, "c1", &s);
     assert_eq!(s.phase, Phase::PlanParallelDrafts);
-    let s = draft("codex", "c2", &s);
+    let s = draft(Agent::Codex, "c2", &s);
     assert_eq!(s.phase, Phase::PlanSynthesisPending);
-    assert_eq!(s.current_owner, "claude");
+    assert_eq!(s.current_owner, Agent::Claude);
 }
 
 #[test]
 fn test_duplicate_draft_rejected() {
     let s = session();
-    let s = draft("claude", "c1", &s);
+    let s = draft(Agent::Claude, "c1", &s);
     let err = apply_event(
         &s,
-        "claude",
+        Agent::Claude,
         &CollabEvent::SubmitDraft {
             content_hash: "c2".to_string(),
         },
@@ -171,8 +180,8 @@ fn test_duplicate_draft_rejected() {
 fn test_codex_review_approve_advances_to_finalize() {
     for verdict in ["approve", "approve_with_minor_edits"] {
         let s = session();
-        let s = draft("claude", "c1", &s);
-        let s = draft("codex", "c2", &s);
+        let s = draft(Agent::Claude, "c1", &s);
+        let s = draft(Agent::Codex, "c2", &s);
         let s = canonical("canonical", &s);
         let s = review(verdict, &s);
         assert_eq!(s.phase, Phase::PlanClaudeFinalizePending);
@@ -184,8 +193,8 @@ fn test_codex_review_approve_advances_to_finalize() {
 #[test]
 fn test_request_changes_at_cap_forces_finalize() {
     let s = session();
-    let s = draft("claude", "c1", &s);
-    let s = draft("codex", "c2", &s);
+    let s = draft(Agent::Claude, "c1", &s);
+    let s = draft(Agent::Codex, "c2", &s);
     let s = canonical("v1", &s);
     let s = review("request_changes", &s);
     let s = canonical("v2", &s);
@@ -198,12 +207,12 @@ fn test_request_changes_at_cap_forces_finalize() {
 #[test]
 fn test_invalid_verdict_rejected() {
     let s = session();
-    let s = draft("claude", "c1", &s);
-    let s = draft("codex", "c2", &s);
+    let s = draft(Agent::Claude, "c1", &s);
+    let s = draft(Agent::Codex, "c2", &s);
     let s = canonical("canonical", &s);
     let err = apply_event(
         &s,
-        "codex",
+        Agent::Codex,
         &CollabEvent::SubmitReview {
             verdict: "looks good to me".to_string(),
         },
@@ -223,7 +232,7 @@ fn test_task_list_transitions_to_code_implement() {
     assert_eq!(s.phase, Phase::PlanLocked);
     let s = submit_task_list(&s, "hash-final", 2);
     assert_eq!(s.phase, Phase::CodeImplementPending);
-    assert_eq!(s.current_owner, "claude");
+    assert_eq!(s.current_owner, Agent::Claude);
     assert_eq!(s.tasks_count(), Some(2));
     assert_eq!(s.task_review_round, 0);
     assert_eq!(s.global_review_round, 0);
@@ -236,7 +245,7 @@ fn test_task_list_rejects_plan_hash_mismatch() {
     let s = locked_session("hash-final");
     let err = apply_event(
         &s,
-        "claude",
+        Agent::Claude,
         &CollabEvent::SubmitTaskList {
             plan_hash: "wrong".to_string(),
             base_sha: "base".to_string(),
@@ -254,7 +263,7 @@ fn test_task_list_rejects_empty_tasks() {
     let s = locked_session("hash-final");
     let err = apply_event(
         &s,
-        "claude",
+        Agent::Claude,
         &CollabEvent::SubmitTaskList {
             plan_hash: "hash-final".to_string(),
             base_sha: "base".to_string(),
@@ -272,7 +281,7 @@ fn test_task_list_rejects_missing_base_sha() {
     let s = locked_session("hash-final");
     let err = apply_event(
         &s,
-        "claude",
+        Agent::Claude,
         &CollabEvent::SubmitTaskList {
             plan_hash: "hash-final".to_string(),
             base_sha: "".to_string(),
@@ -290,7 +299,7 @@ fn test_task_list_rejected_from_non_claude() {
     let s = locked_session("hash-final");
     let err = apply_event(
         &s,
-        "codex",
+        Agent::Codex,
         &CollabEvent::SubmitTaskList {
             plan_hash: "hash-final".to_string(),
             base_sha: "b".to_string(),
@@ -308,7 +317,7 @@ fn test_task_list_rejected_before_plan_locked() {
     let s = session();
     let err = apply_event(
         &s,
-        "claude",
+        Agent::Claude,
         &CollabEvent::SubmitTaskList {
             plan_hash: "x".to_string(),
             base_sha: "b".to_string(),
@@ -331,14 +340,14 @@ fn test_implementation_done_jumps_to_local_review() {
 
     let s = apply_event(
         &s,
-        "claude",
+        Agent::Claude,
         &CollabEvent::ImplementationDone {
             head_sha: "batch_head".to_string(),
         },
     )
     .unwrap();
     assert_eq!(s.phase, Phase::CodeReviewLocalPending);
-    assert_eq!(s.current_owner, "claude");
+    assert_eq!(s.current_owner, Agent::Claude);
     assert_eq!(s.last_head_sha.as_deref(), Some("batch_head"));
 }
 
@@ -348,7 +357,7 @@ fn test_implementation_done_rejected_from_codex() {
     let s = submit_task_list(&s, "hf", 1);
     let err = apply_event(
         &s,
-        "codex",
+        Agent::Codex,
         &CollabEvent::ImplementationDone {
             head_sha: "h".to_string(),
         },
@@ -365,8 +374,8 @@ fn test_task_list_under_codex_implementer_makes_codex_owner() {
     let s = locked_session_with_codex_implementer("hash-final");
     let s = submit_task_list(&s, "hash-final", 2);
     assert_eq!(s.phase, Phase::CodeImplementPending);
-    assert_eq!(s.current_owner, "codex");
-    assert_eq!(s.implementer, "codex");
+    assert_eq!(s.current_owner, Agent::Codex);
+    assert_eq!(s.implementer, Agent::Codex);
 }
 
 #[test]
@@ -379,7 +388,7 @@ fn test_implementation_done_under_codex_implementer_requires_codex_actor() {
     // "claude".
     let err = apply_event(
         &s,
-        "claude",
+        Agent::Claude,
         &CollabEvent::ImplementationDone {
             head_sha: "h".to_string(),
         },
@@ -392,14 +401,14 @@ fn test_implementation_done_under_codex_implementer_requires_codex_actor() {
     // local pass regardless of who implemented).
     let s = apply_event(
         &s,
-        "codex",
+        Agent::Codex,
         &CollabEvent::ImplementationDone {
             head_sha: "batch_head".to_string(),
         },
     )
     .unwrap();
     assert_eq!(s.phase, Phase::CodeReviewLocalPending);
-    assert_eq!(s.current_owner, "claude");
+    assert_eq!(s.current_owner, Agent::Claude);
     assert_eq!(s.last_head_sha.as_deref(), Some("batch_head"));
 }
 
@@ -409,7 +418,7 @@ fn test_implementation_done_rejected_outside_code_implement_pending() {
     let s = locked_session("hf");
     let err = apply_event(
         &s,
-        "claude",
+        Agent::Claude,
         &CollabEvent::ImplementationDone {
             head_sha: "h".to_string(),
         },
@@ -422,7 +431,7 @@ fn test_implementation_done_rejected_outside_code_implement_pending() {
     let s = submit_task_list(&s, "hf", 1);
     let s = apply_event(
         &s,
-        "claude",
+        Agent::Claude,
         &CollabEvent::ImplementationDone {
             head_sha: "b".to_string(),
         },
@@ -430,7 +439,7 @@ fn test_implementation_done_rejected_outside_code_implement_pending() {
     .unwrap();
     let err = apply_event(
         &s,
-        "claude",
+        Agent::Claude,
         &CollabEvent::ImplementationDone {
             head_sha: "again".to_string(),
         },
@@ -449,7 +458,7 @@ fn test_global_review_linear_flow_ends_in_coding_complete() {
     // Batch implementation → local review owner.
     let s = apply_event(
         &s,
-        "claude",
+        Agent::Claude,
         &CollabEvent::ImplementationDone {
             head_sha: "b".to_string(),
         },
@@ -460,31 +469,31 @@ fn test_global_review_linear_flow_ends_in_coding_complete() {
     // Local: claude → codex
     let s = apply_event(
         &s,
-        "claude",
+        Agent::Claude,
         &CollabEvent::ReviewLocal {
             head_sha: "g1".to_string(),
         },
     )
     .unwrap();
     assert_eq!(s.phase, Phase::CodeReviewFixGlobalPending);
-    assert_eq!(s.current_owner, "codex");
+    assert_eq!(s.current_owner, Agent::Codex);
 
     // Global review+fix: codex → claude
     let s = apply_event(
         &s,
-        "codex",
+        Agent::Codex,
         &CollabEvent::CodeReviewFixGlobal {
             head_sha: "g2".to_string(),
         },
     )
     .unwrap();
     assert_eq!(s.phase, Phase::CodeReviewFinalPending);
-    assert_eq!(s.current_owner, "claude");
+    assert_eq!(s.current_owner, Agent::Claude);
 
     // Final review (includes PR URL): claude → terminal
     let s = apply_event(
         &s,
-        "claude",
+        Agent::Claude,
         &CollabEvent::FinalReview {
             head_sha: "g3".to_string(),
             pr_url: "https://example/pr/1".to_string(),
@@ -498,7 +507,7 @@ fn test_global_review_linear_flow_ends_in_coding_complete() {
     // Terminal: further events rejected.
     let err = apply_event(
         &s,
-        "claude",
+        Agent::Claude,
         &CollabEvent::ImplementationDone {
             head_sha: "x".to_string(),
         },
@@ -513,7 +522,7 @@ fn test_review_local_wrong_sender_rejected() {
     let s = submit_task_list(&s, "hf", 1);
     let s = apply_event(
         &s,
-        "claude",
+        Agent::Claude,
         &CollabEvent::ImplementationDone {
             head_sha: "b".to_string(),
         },
@@ -521,7 +530,7 @@ fn test_review_local_wrong_sender_rejected() {
     .unwrap();
     let err = apply_event(
         &s,
-        "codex",
+        Agent::Codex,
         &CollabEvent::ReviewLocal {
             head_sha: "g".to_string(),
         },
@@ -536,7 +545,7 @@ fn test_code_review_fix_global_wrong_sender_rejected() {
     let s = submit_task_list(&s, "hf", 1);
     let s = apply_event(
         &s,
-        "claude",
+        Agent::Claude,
         &CollabEvent::ImplementationDone {
             head_sha: "b".to_string(),
         },
@@ -544,7 +553,7 @@ fn test_code_review_fix_global_wrong_sender_rejected() {
     .unwrap();
     let s = apply_event(
         &s,
-        "claude",
+        Agent::Claude,
         &CollabEvent::ReviewLocal {
             head_sha: "g1".to_string(),
         },
@@ -552,7 +561,7 @@ fn test_code_review_fix_global_wrong_sender_rejected() {
     .unwrap();
     let err = apply_event(
         &s,
-        "claude",
+        Agent::Claude,
         &CollabEvent::CodeReviewFixGlobal {
             head_sha: "g2".to_string(),
         },
@@ -566,7 +575,7 @@ fn start_global_review_session_seeds_codex_owned_review_phase() {
     let session = start_global_review_session("s1", "basesha", "headsha").unwrap();
     assert_eq!(session.id, "s1");
     assert_eq!(session.phase, Phase::CodeReviewFixGlobalPending);
-    assert_eq!(session.current_owner, "codex");
+    assert_eq!(session.current_owner, Agent::Codex);
     assert_eq!(session.base_sha.as_deref(), Some("basesha"));
     assert_eq!(session.last_head_sha.as_deref(), Some("headsha"));
     assert!(session.task_list.is_none());
@@ -592,18 +601,18 @@ fn start_global_review_session_flows_into_final_review() {
 
     let after_codex = apply_event(
         &session,
-        "codex",
+        Agent::Codex,
         &CollabEvent::CodeReviewFixGlobal {
             head_sha: "h1".to_string(),
         },
     )
     .unwrap();
     assert_eq!(after_codex.phase, Phase::CodeReviewFinalPending);
-    assert_eq!(after_codex.current_owner, "claude");
+    assert_eq!(after_codex.current_owner, Agent::Claude);
 
     let after_claude = apply_event(
         &after_codex,
-        "claude",
+        Agent::Claude,
         &CollabEvent::FinalReview {
             head_sha: "h1".to_string(),
             pr_url: "https://github.com/acme/repo/pull/1".to_string(),
@@ -623,14 +632,14 @@ fn start_global_review_session_accepts_branch_drift_failure_from_non_owner() {
 
     let failed = apply_event(
         &session,
-        "claude",
+        Agent::Claude,
         &CollabEvent::FailureReport {
             coding_failure: "branch_drift: last_head_sha=h0 not found".to_string(),
         },
     )
     .unwrap();
     assert_eq!(failed.phase, Phase::CodingFailed);
-    assert_eq!(failed.current_owner, "claude");
+    assert_eq!(failed.current_owner, Agent::Claude);
 }
 
 // ── v3: failure report ───────────────────────────────────────────────
@@ -645,7 +654,7 @@ fn test_failure_report_from_code_implement_pending_transitions_to_failed() {
 
     let s = apply_event(
         &s,
-        "claude",
+        Agent::Claude,
         &CollabEvent::FailureReport {
             coding_failure: "subagent_failure: task 2 timed out".to_string(),
         },
@@ -659,22 +668,69 @@ fn test_failure_report_from_code_implement_pending_transitions_to_failed() {
 }
 
 #[test]
+fn test_failure_report_from_codex_implementer_during_batch_phase() {
+    // With `implementer == "codex"`, Codex owns CodeImplementPending and
+    // can fire a non-drift failure report to abort the batch. Mirror of
+    // the Claude-implementer case but exercising the codex-owned path.
+    let s = locked_session_with_codex_implementer("hf");
+    let s = submit_task_list(&s, "hf", 1);
+    assert_eq!(s.phase, Phase::CodeImplementPending);
+    assert_eq!(s.current_owner, Agent::Codex);
+
+    let s = apply_event(
+        &s,
+        Agent::Codex,
+        &CollabEvent::FailureReport {
+            coding_failure: "subagent_failure: task 2 timed out".to_string(),
+        },
+    )
+    .unwrap();
+    assert_eq!(s.phase, Phase::CodingFailed);
+    assert_eq!(s.current_owner, Agent::Codex);
+    assert_eq!(
+        s.coding_failure.as_deref(),
+        Some("subagent_failure: task 2 timed out")
+    );
+}
+
+#[test]
+fn test_failure_report_rejects_bare_branch_drift_prefix() {
+    // The drift carve-out lets the non-owner abort a session, but only
+    // with a payload that includes diagnostic content after the prefix.
+    // A bare `"branch_drift:"` from an off-turn agent must be rejected
+    // so the carve-out can't be abused to abort with no cause.
+    let s = locked_session("hf");
+    let s = submit_task_list(&s, "hf", 1);
+    assert_eq!(s.current_owner, Agent::Claude);
+
+    let err = apply_event(
+        &s,
+        Agent::Codex,
+        &CollabEvent::FailureReport {
+            coding_failure: "branch_drift:".to_string(),
+        },
+    )
+    .unwrap_err();
+    assert!(matches!(err, CollabError::NotYourTurn { .. }));
+}
+
+#[test]
 fn test_failure_report_branch_drift_from_codex_during_batch_phase() {
     // Branch drift is the carve-out: the non-owner may emit it.
     let s = locked_session("hf");
     let s = submit_task_list(&s, "hf", 1);
-    assert_eq!(s.current_owner, "claude");
+    assert_eq!(s.current_owner, Agent::Claude);
 
     let s = apply_event(
         &s,
-        "codex",
+        Agent::Codex,
         &CollabEvent::FailureReport {
             coding_failure: "branch_drift: head_sha=abc not found".to_string(),
         },
     )
     .unwrap();
     assert_eq!(s.phase, Phase::CodingFailed);
-    assert_eq!(s.current_owner, "codex");
+    assert_eq!(s.current_owner, Agent::Codex);
 }
 
 #[test]
@@ -684,7 +740,7 @@ fn test_failure_report_rejected_outside_coding_active_phase() {
     // catch-all WrongPhase arm.
     let err = apply_event(
         &s,
-        "claude",
+        Agent::Claude,
         &CollabEvent::FailureReport {
             coding_failure: "nope".to_string(),
         },
@@ -701,7 +757,7 @@ fn test_failure_report_from_code_review_final_pending_transitions_to_failed() {
     let s = submit_task_list(&s, "hf", 1);
     let s = apply_event(
         &s,
-        "claude",
+        Agent::Claude,
         &CollabEvent::ImplementationDone {
             head_sha: "b".to_string(),
         },
@@ -709,7 +765,7 @@ fn test_failure_report_from_code_review_final_pending_transitions_to_failed() {
     .unwrap();
     let s = apply_event(
         &s,
-        "claude",
+        Agent::Claude,
         &CollabEvent::ReviewLocal {
             head_sha: "g1".to_string(),
         },
@@ -717,7 +773,7 @@ fn test_failure_report_from_code_review_final_pending_transitions_to_failed() {
     .unwrap();
     let s = apply_event(
         &s,
-        "codex",
+        Agent::Codex,
         &CollabEvent::CodeReviewFixGlobal {
             head_sha: "g2".to_string(),
         },
@@ -727,7 +783,7 @@ fn test_failure_report_from_code_review_final_pending_transitions_to_failed() {
 
     let s = apply_event(
         &s,
-        "claude",
+        Agent::Claude,
         &CollabEvent::FailureReport {
             coding_failure: "local gate regressed".to_string(),
         },

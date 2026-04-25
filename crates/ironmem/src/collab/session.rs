@@ -1,12 +1,13 @@
 //! `CollabSession` — single source of truth for collab session state.
 
+use super::agent::Agent;
 use super::phase::Phase;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CollabSession {
     pub id: String,
     pub phase: Phase,
-    pub current_owner: String,
+    pub current_owner: Agent,
     pub claude_draft_hash: Option<String>,
     pub codex_draft_hash: Option<String>,
     pub canonical_plan_hash: Option<String>,
@@ -15,11 +16,10 @@ pub struct CollabSession {
     pub review_round: u8,
     // v3 coding fields. `tasks_count` is not stored — it is derived from
     // `task_list` via `tasks_count_from_list` so there is a single source of
-    // truth for task cardinality. `task_review_round`, `global_review_round`,
-    // and the DB-only `current_task_index` column are vestigial (v2 held
-    // per-task verdict cycles and a per-task index; v3 batch mode runs all
+    // truth for task cardinality. `task_review_round` and `global_review_round`
+    // are vestigial (v2 held per-task verdict cycles; v3 batch mode runs all
     // tasks in a single Claude-driven phase) but remain as columns to avoid
-    // a migration. `current_task_index` is no longer read or written.
+    // disturbing the wire format.
     pub task_list: Option<String>,
     pub task_review_round: u8,
     pub global_review_round: u8,
@@ -27,22 +27,32 @@ pub struct CollabSession {
     pub last_head_sha: Option<String>,
     pub pr_url: Option<String>,
     pub coding_failure: Option<String>,
-    /// Which agent runs the v3 batch implementation phase. `"claude"` (the
-    /// default) keeps the historical flow where Claude orchestrates per-task
-    /// subagents inline. `"codex"` routes `CodeImplementPending` to Codex
-    /// instead — Claude still publishes `task_list`, but Codex drives its
-    /// own `subagent-driven-development` end-to-end and emits
-    /// `implementation_done`. Validated against `{"claude","codex"}` at
-    /// `collab_start`; the DB CHECK constraint enforces the same set.
-    pub implementer: String,
+    /// Which agent runs the v3 batch implementation phase. `Agent::Claude`
+    /// (the default) keeps the historical flow where Claude orchestrates
+    /// per-task subagents inline. `Agent::Codex` routes
+    /// `CodeImplementPending` to Codex instead — Claude still publishes
+    /// `task_list`, but Codex drives its own `subagent-driven-development`
+    /// end-to-end and emits `implementation_done`. Set at `collab_start`
+    /// and immutable thereafter; the DB CHECK constraint enforces the
+    /// allowed set as defense-in-depth.
+    pub implementer: Agent,
 }
 
 impl CollabSession {
     pub fn new(id: impl Into<String>) -> Self {
+        Self::new_with_implementer(id, Agent::Claude)
+    }
+
+    /// Construct a fresh planning-stage session with an explicit
+    /// `implementer`. Used by tests and any caller that wants the
+    /// non-default `Agent::Codex` batch ownership; production code should
+    /// go through `collab_start` (which validates and persists the
+    /// implementer at INSERT time).
+    pub fn new_with_implementer(id: impl Into<String>, implementer: Agent) -> Self {
         Self {
             id: id.into(),
             phase: Phase::PlanParallelDrafts,
-            current_owner: "claude".to_string(),
+            current_owner: Agent::Claude,
             claude_draft_hash: None,
             codex_draft_hash: None,
             canonical_plan_hash: None,
@@ -56,7 +66,7 @@ impl CollabSession {
             last_head_sha: None,
             pr_url: None,
             coding_failure: None,
-            implementer: "claude".to_string(),
+            implementer,
         }
     }
 
@@ -65,9 +75,9 @@ impl CollabSession {
     /// orchestrators that already completed per-task coding via
     /// `subagent-driven-development`. The no-op `CodeReviewLocalPending`
     /// handshake is collapsed — `head_sha` is supplied here instead.
-    /// `implementer` is fixed at `"claude"` because the shortcut never
-    /// enters `CodeImplementPending`; the field is preserved only so the
-    /// session record shape stays uniform with full-flow sessions.
+    /// `implementer` is fixed at `Agent::Claude` because the shortcut
+    /// never enters `CodeImplementPending`; the field is preserved only so
+    /// the session record shape stays uniform with full-flow sessions.
     pub fn new_global_review(
         id: impl Into<String>,
         base_sha: impl Into<String>,
@@ -77,7 +87,7 @@ impl CollabSession {
         Self {
             id: id.into(),
             phase: Phase::CodeReviewFixGlobalPending,
-            current_owner: "codex".to_string(),
+            current_owner: Agent::Codex,
             claude_draft_hash: None,
             codex_draft_hash: None,
             canonical_plan_hash: None,
@@ -91,7 +101,7 @@ impl CollabSession {
             last_head_sha: Some(head),
             pr_url: None,
             coding_failure: None,
-            implementer: "claude".to_string(),
+            implementer: Agent::Claude,
         }
     }
 

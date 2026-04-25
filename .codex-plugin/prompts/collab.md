@@ -198,11 +198,19 @@ own the batch phase. Claude has already published `task_list` with
    `spawn_agent` and `update_plan`) with that plan file. Let its
    controller-owned loop run to completion: every task implemented,
    reviewed, committed, and marked complete in `update_plan`.
-4. **Stop the skill at the boundary before
+4. **Hard stop at the boundary before
    `finishing-a-development-branch`.** That sub-skill prompts the user
-   for merge/PR/cleanup, which would conflict with the collab v3
-   global review stage that handles PR creation. Treat the last task's
-   approval + commit as the exit point.
+   for merge/PR/cleanup, which would create a PR outside the collab
+   protocol and collide with the `final_review` turn. Two guards:
+   (a) tell `subagent-driven-development`'s controller loop explicitly
+   "stop after the last task is implemented, reviewed, and committed;
+   do not invoke `finishing-a-development-branch`" — the controller
+   honors that direction; (b) before sending `implementation_done`,
+   verify no PR was opened on this branch:
+   `gh pr list --head <branch> --json number --jq 'length'` must
+   return `0`. If it returns ≥1, send `failure_report` with
+   `coding_failure: "skill_overran_pr_boundary: <pr_number>"` and
+   exit — the protocol invariant has been violated.
 5. Run final gates (project-appropriate: `cargo test`, `pytest`, etc).
    On gate failure or any unrecoverable subagent failure, send
    `failure_report` with `coding_failure: "subagent_failure: <reason>"`

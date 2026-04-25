@@ -1,8 +1,9 @@
+use super::agent::Agent;
 use super::error::CollabError;
 use super::event::CollabEvent;
 use super::phase::Phase;
 use super::session::CollabSession;
-use super::BRANCH_DRIFT_PREFIX;
+use super::OFF_TURN_FAILURE_PREFIXES;
 
 /// Construct a fresh `CollabSession` positioned at the v3 global-review
 /// stage, for the coding-review shortcut. Rejects empty SHAs so the
@@ -26,8 +27,8 @@ pub fn start_global_review_session(
 /// verdict (she always gets the last word).
 pub(super) const MAX_REVIEW_ROUNDS: u8 = 2;
 
-/// Require an actor to match the expected value, else return `NotYourTurn`.
-fn require_actor(actor: &str, expected: &str) -> Result<(), CollabError> {
+/// Require an actor to match the expected agent, else return `NotYourTurn`.
+fn require_actor(actor: Agent, expected: Agent) -> Result<(), CollabError> {
     if actor == expected {
         Ok(())
     } else {
@@ -40,7 +41,7 @@ fn require_actor(actor: &str, expected: &str) -> Result<(), CollabError> {
 
 pub fn apply_event(
     session: &CollabSession,
-    actor: &str,
+    actor: Agent,
     event: &CollabEvent,
 ) -> Result<CollabSession, CollabError> {
     // v3: terminal coding phases reject all further events. PlanLocked is
@@ -54,7 +55,7 @@ pub fn apply_event(
 
     match (&session.phase, event) {
         (Phase::PlanParallelDrafts, CollabEvent::SubmitDraft { content_hash }) => match actor {
-            "claude" => {
+            Agent::Claude => {
                 if session.claude_draft_hash.is_some() {
                     return Err(CollabError::AlreadySubmittedDraft {
                         agent: actor.to_string(),
@@ -63,40 +64,35 @@ pub fn apply_event(
                 next.claude_draft_hash = Some(content_hash.clone());
                 if session.codex_draft_hash.is_some() {
                     next.phase = Phase::PlanSynthesisPending;
-                    next.current_owner = "claude".to_string();
+                    next.current_owner = Agent::Claude;
                 } else {
-                    next.current_owner = "codex".to_string();
+                    next.current_owner = Agent::Codex;
                 }
             }
-            "codex" => {
+            Agent::Codex => {
                 if session.codex_draft_hash.is_some() {
                     return Err(CollabError::AlreadySubmittedDraft {
                         agent: actor.to_string(),
                     });
                 }
                 next.codex_draft_hash = Some(content_hash.clone());
+                // Whether Claude has drafted or not, the next owner is
+                // always Claude — either to synthesize or to wait for
+                // Codex's draft to land first.
+                next.current_owner = Agent::Claude;
                 if session.claude_draft_hash.is_some() {
                     next.phase = Phase::PlanSynthesisPending;
-                    next.current_owner = "claude".to_string();
-                } else {
-                    next.current_owner = "claude".to_string();
                 }
-            }
-            _ => {
-                return Err(CollabError::NotYourTurn {
-                    expected: "claude|codex".to_string(),
-                    got: actor.to_string(),
-                });
             }
         },
         (Phase::PlanSynthesisPending, CollabEvent::PublishCanonical { content_hash }) => {
-            require_actor(actor, "claude")?;
+            require_actor(actor, Agent::Claude)?;
             next.canonical_plan_hash = Some(content_hash.clone());
             next.phase = Phase::PlanCodexReviewPending;
-            next.current_owner = "codex".to_string();
+            next.current_owner = Agent::Codex;
         }
         (Phase::PlanCodexReviewPending, CollabEvent::SubmitReview { verdict }) => {
-            require_actor(actor, "codex")?;
+            require_actor(actor, Agent::Codex)?;
             if !matches!(
                 verdict.as_str(),
                 "approve" | "approve_with_minor_edits" | "request_changes"
@@ -111,14 +107,14 @@ pub fn apply_event(
             let force_finalize = next.review_round >= MAX_REVIEW_ROUNDS;
             if verdict == "request_changes" && !force_finalize {
                 next.phase = Phase::PlanSynthesisPending;
-                next.current_owner = "claude".to_string();
+                next.current_owner = Agent::Claude;
             } else {
                 next.phase = Phase::PlanClaudeFinalizePending;
-                next.current_owner = "claude".to_string();
+                next.current_owner = Agent::Claude;
             }
         }
         (Phase::PlanClaudeFinalizePending, CollabEvent::PublishFinal { content_hash }) => {
-            require_actor(actor, "claude")?;
+            require_actor(actor, Agent::Claude)?;
             next.final_plan_hash = Some(content_hash.clone());
             next.phase = Phase::PlanLocked;
         }
@@ -133,7 +129,7 @@ pub fn apply_event(
                 head_sha,
             },
         ) => {
-            require_actor(actor, "claude")?;
+            require_actor(actor, Agent::Claude)?;
             let expected = session
                 .final_plan_hash
                 .as_deref()
@@ -158,10 +154,11 @@ pub fn apply_event(
             next.phase = Phase::CodeImplementPending;
             // Owner of the batch implementation phase is whichever agent
             // the user selected at `collab_start` time. Default sessions
-            // have `implementer == "claude"` (historical flow); sessions
-            // started with `--implementer=codex` route Codex into the
-            // batch phase to drive its own subagent-driven-development.
-            next.current_owner = session.implementer.clone();
+            // have `implementer == Agent::Claude` (historical flow);
+            // sessions started with `--implementer=codex` route Codex
+            // into the batch phase to drive its own
+            // subagent-driven-development.
+            next.current_owner = session.implementer;
         }
         // ── v3: batch implementation → global review ──────────────────────
         // The implementer agent (Claude by default; Codex when selected at
@@ -173,47 +170,58 @@ pub fn apply_event(
         // the local-review second opinion. Payload carries only
         // `head_sha` (anti-puppeteering).
         (Phase::CodeImplementPending, CollabEvent::ImplementationDone { head_sha }) => {
-            require_actor(actor, session.implementer.as_str())?;
+            require_actor(actor, session.implementer)?;
             next.last_head_sha = Some(head_sha.clone());
             next.phase = Phase::CodeReviewLocalPending;
-            next.current_owner = "claude".to_string();
+            next.current_owner = Agent::Claude;
         }
         // ── v3: global review, 3-phase linear ─────────────────────────────
         (Phase::CodeReviewLocalPending, CollabEvent::ReviewLocal { head_sha }) => {
-            require_actor(actor, "claude")?;
+            require_actor(actor, Agent::Claude)?;
             next.last_head_sha = Some(head_sha.clone());
             next.phase = Phase::CodeReviewFixGlobalPending;
-            next.current_owner = "codex".to_string();
+            next.current_owner = Agent::Codex;
         }
         (Phase::CodeReviewFixGlobalPending, CollabEvent::CodeReviewFixGlobal { head_sha }) => {
-            require_actor(actor, "codex")?;
+            require_actor(actor, Agent::Codex)?;
             next.last_head_sha = Some(head_sha.clone());
             next.phase = Phase::CodeReviewFinalPending;
-            next.current_owner = "claude".to_string();
+            next.current_owner = Agent::Claude;
         }
         (Phase::CodeReviewFinalPending, CollabEvent::FinalReview { head_sha, pr_url }) => {
-            require_actor(actor, "claude")?;
+            require_actor(actor, Agent::Claude)?;
             next.last_head_sha = Some(head_sha.clone());
             next.pr_url = Some(pr_url.clone());
             next.phase = Phase::CodingComplete;
-            next.current_owner = "claude".to_string();
+            next.current_owner = Agent::Claude;
         }
         // ── v3: failure is valid from any coding-active phase ─────────────
         (phase, CollabEvent::FailureReport { coding_failure }) if phase.is_coding_active() => {
-            // Drift failures (prefix `branch_drift:`) may be emitted by either
-            // agent because the non-owner often detects drift via its own git
-            // ops. Any other failure must come from `current_owner` so an
-            // off-turn agent cannot unilaterally abort the other's work.
-            let is_drift = coding_failure.starts_with(BRANCH_DRIFT_PREFIX);
-            if !is_drift && actor != session.current_owner {
+            // Some failure classes are structurally detectable only from
+            // outside the owner's process (branch drift via git ops; a
+            // Codex dispatch failure observed from Claude's MCP call when
+            // `--implementer=codex` and Codex itself never returned). For
+            // those, allow the non-owner to emit a `FailureReport` with a
+            // recognized prefix; everything else still requires the
+            // current owner.
+            //
+            // The carve-out additionally requires *content* after the
+            // prefix: a bare prefix string would let any authenticated
+            // session participant abort the session with no diagnostic
+            // value, so we reject the empty form and demand at least one
+            // byte of context.
+            let is_off_turn_admissible = OFF_TURN_FAILURE_PREFIXES.iter().any(|prefix| {
+                coding_failure.starts_with(prefix) && coding_failure.len() > prefix.len()
+            });
+            if !is_off_turn_admissible && actor != session.current_owner {
                 return Err(CollabError::NotYourTurn {
-                    expected: session.current_owner.clone(),
+                    expected: session.current_owner.to_string(),
                     got: actor.to_string(),
                 });
             }
             next.coding_failure = Some(coding_failure.clone());
             next.phase = Phase::CodingFailed;
-            next.current_owner = actor.to_string();
+            next.current_owner = actor;
         }
         (phase, _) => {
             // Terminal phases are short-circuited by the guard at the top of
