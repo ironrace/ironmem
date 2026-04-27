@@ -362,6 +362,27 @@ remain:
   response is to amend the code and commit — not to re-litigate in
   prose.
 
+### Codex MCP tuning matrix
+
+Codex's default reasoning effort is the dominant latency cost on long
+silent grinds. The MCP tool accepts a `config` argument that overrides
+`CODEX_HOME/config.toml`. Use this matrix to pick the per-phase config
+for every Codex handoff. Don't blanket-apply low reasoning — review
+and planning turns are where the second-opinion value lives, and a
+shallow reviewer defeats the protocol's design.
+
+| Phase from `collab_status` | `implementer` | Config override | Rationale |
+|---|---|---|---|
+| `CodeImplementPending` | `"codex"` | `{ "model_reasoning_effort": "low" }` | Batch impl follows an approved plan — mechanical |
+| `CodeReviewFixGlobalPending` | (any) | **none** (defaults preserved) | Reviewer judgment must not be shallow |
+| `PlanParallelDrafts` | (any) | **none** | Planning needs reasoning |
+| `PlanCodexReviewPending` | (any) | **none** | Plan review needs reasoning |
+| `CodeImplementPending` | `"claude"` | n/a — Codex isn't owner | Claude runs subagents on its side; no Codex MCP call |
+
+Read `phase` and `implementer` from the `collab_status` you fetched at
+the top of the dispatch step (you already do this); branch on them
+when constructing the MCP call below.
+
 ### Codex handoff — synchronous MCP invocation
 
 **Whenever `current_owner == "codex"` in a coding-active or planning-active
@@ -392,7 +413,29 @@ Procedure:
       — this repo holds the canonical prompt regardless of the target
       `repo_path`).
    b. Substitute `$ARGUMENTS` in that file with `join <session_id>`.
-   c. Call:
+   c. Build the `arguments` object:
+      - Always include `prompt` (the resolved Codex slash-command text)
+        and `cwd` (the session's `repo_path`).
+      - Look up the row in the "Codex MCP tuning matrix" above using
+        the `phase` and `implementer` you already have from
+        `collab_status`. If that row specifies a config override, add
+        a `config` field with that exact value. If the row says
+        "none", omit `config` entirely.
+
+      Example for the batch-impl row (`CodeImplementPending` +
+      `implementer == "codex"`):
+      ```json
+      {
+        "name": "mcp__codex__codex",
+        "arguments": {
+          "prompt": "<resolved prompt text>",
+          "cwd": "<repo_path from collab_status>",
+          "config": { "model_reasoning_effort": "low" }
+        }
+      }
+      ```
+
+      Example for any other Codex-owned phase (review, planning):
       ```json
       {
         "name": "mcp__codex__codex",
@@ -402,6 +445,9 @@ Procedure:
         }
       }
       ```
+
+      Do not pass `model` or any other override — only `config` per the
+      matrix. Model swap is intentionally out of scope.
 
    **The `prompt` argument is the verbatim expanded
    `.codex-plugin/prompts/collab.md` with `$ARGUMENTS` substituted —
