@@ -316,6 +316,19 @@ before every `collab_send`.
 
 Returns pending messages. Enforces the blind-draft invariant.
 
+**Parameters:**
+
+| Parameter | Type | Default | Description |
+|---|---|---|---|
+| `session_id` | string | required | Session to receive from |
+| `receiver` | string | required | `"claude"` or `"codex"` |
+| `limit` | integer | 10 (max 50) | Maximum messages to return |
+| `auto_ack` | boolean | `false` | When `true`, atomically marks all returned messages as acked in the same DB transaction as the read. Eliminates a separate `collab_ack` round-trip per turn. Backwards-compatible — existing callers that omit the field continue to use the two-step recv + ack flow. |
+
+Using `auto_ack=true` is recommended in the dispatch loop for any caller that
+always acks all received messages immediately. The explicit `collab_ack` call
+is still available when callers need selective acknowledgement.
+
 ### `collab_ack`
 
 Marks a message consumed. Session-scoped: a mismatched
@@ -420,12 +433,49 @@ orchestrator from steering the reviewer's conclusion.
 
 | Topic | Sender | Payload | Notes |
 |---|---|---|---|
-| `task_list` | `claude` | `{"plan_hash","base_sha","head_sha","plan_file_path"?,"tasks":[{"id","title","acceptance":[...]}]}` | `plan_hash` must equal `final_plan_hash`; `tasks` must be non-empty and strictly ordered by `id`; each task requires ≥1 `acceptance` entry. Optional `plan_file_path` (repo-relative; no leading `/`; no `..` segments) points at the writing-plans markdown driving subagent execution. |
+| `task_list` | `claude` | `{"plan_hash","base_sha","head_sha","plan_file_path"?,"execution_mode"?,"tasks":[{"id","title","acceptance":[...]}]}` | `plan_hash` must equal `final_plan_hash`; `tasks` must be non-empty and strictly ordered by `id`; each task requires ≥1 `acceptance` entry. Optional `plan_file_path` (repo-relative; no leading `/`; no `..` segments) points at the writing-plans markdown driving subagent execution. Optional `execution_mode` — see below. |
 | `implementation_done` | `claude` | `{"head_sha"}` | In `CodeImplementPending` only. Fired once after the subagent batch completes and gates pass. Carries only `head_sha` — no prose, no subagent notes. |
 | `review_local` | `claude` | `{"head_sha"}` | Post-ultrareview, before handing to Codex for the global pass. |
 | `review_fix_global` | `codex` | `{"head_sha"}` | In `CodeReviewFixGlobalPending` only. Codex has pushed any branch-level fixes. |
 | `final_review` | `claude` | `{"head_sha","pr_url"}` | In `CodeReviewFinalPending` only. Claude has opened the PR; the event carries the URL and advances directly to `CodingComplete`. `pr_url` must start with `https://` and be ≤2048 chars. |
 | `failure_report` | either | `{"coding_failure":"<reason>"}` | Valid in any coding-active phase. |
+
+### `task_list` — `execution_mode` field
+
+The optional `execution_mode` string field on the `task_list` payload selects
+the implementation strategy for the batch phase. It is validated at send time
+and exposed as a top-level `execution_mode` field in `collab_status` so both
+agents can read it without re-parsing the canonicalized `task_list` JSON.
+
+| Value | Behaviour |
+|---|---|
+| *(omitted)* | Default: subagent-driven. The implementer agent invokes `subagent-driven-development` (one subagent per task). |
+| `"mechanical_direct"` | Single-task verbatim plan. The implementer applies the plan's bash/code blocks directly without spawning `subagent-driven-development`. |
+
+**Validation rules (server-enforced):**
+
+- Unknown values are rejected immediately with a clear error message listing
+  the allowed set. A typo therefore fails at submit time rather than silently
+  falling through to the default.
+- `"subagent_driven"` is intentionally NOT an allowed value — callers omit
+  the field entirely to select the default path. Sending it explicitly is a
+  validation error.
+- The field is preserved verbatim in the canonicalized `task_list` JSON
+  stored on the session, so it survives the round-trip back through
+  `collab_status.execution_mode`.
+
+**Eligibility criteria for `"mechanical_direct"` (Claude-side detection).** Set
+this mode when ALL four conditions hold:
+
+1. The writing-plans markdown produced exactly one task (`### Task 1` only).
+2. The task's `Files:` block lists one or zero files to create or modify.
+3. The task's steps include at least one verbatim ` ```bash ` or language code
+   block meant to be applied as-is (not pseudocode or illustrative snippets).
+4. No step contains language like "decide", "choose between", or other
+   design-judgment cues.
+
+When conditions are not met, omit the field — the server treats absence as the
+default subagent-driven path.
 
 ### Phase → Topic Acceptance
 
@@ -462,6 +512,16 @@ between `wait_my_turn` and `collab_send`:
   the harness reads `last_head_sha` from `collab_status` and runs
   `git cat-file -e <sha>^{commit}` to verify the commit is present; if not,
   it sends `failure_report` with `coding_failure: "branch_drift: ..."`.
+- **Pre-send harness fast-path.** Before running `git fetch`, `git checkout`,
+  and `git reset --hard` to sync the working tree to `last_head_sha`, the
+  harness first checks: is `git rev-parse HEAD` already equal to
+  `last_head_sha` AND is the current branch already the session branch? When
+  both hold, steps 3 (`git fetch`) and 5 (`git checkout` + `git reset
+  --hard`) are skipped entirely. The `git cat-file -e` sanity check (step 4)
+  still runs because the commit is already local. This avoids a network
+  round-trip and a working-tree reset on the common case where the agent is
+  already at the right SHA — for example, entering the batch-impl turn
+  immediately after `task_list` is sent.
 - **Subagent orchestration** during `CodeImplementPending`. Claude invokes
   `superpowers:writing-plans` to expand the locked plan into a markdown
   task document, then `superpowers:subagent-driven-development` to
@@ -484,6 +544,13 @@ between `wait_my_turn` and `collab_send`:
 - **PR creation** during `final_review`: Claude runs `gh pr create
   --base <base_sha> ...` and sends the URL inline with the `final_review`
   event. There is no separate `pr_opened` turn.
+- **Codex must not create or check for PRs.** Codex never calls `gh pr
+  create`, `gh pr list`, `git ls-remote refs/pull/*`, or any other
+  PR-related GitHub API operation during any of its phases. PR creation
+  belongs exclusively to Claude's `final_review` turn. This boundary is
+  explicit: removing the PR check from Codex's batch turn also removes
+  Codex's dependency on `api.github.com` reachability, which was observed
+  as a fragility in practice.
 - **Plan Mode** on Claude's side is entered before `canonical`, `final`
   (v1), and `final_review` (v3 PR creation). The `task_list` send is
   gated by writing-plans's own approval handoff (the user reviews the
@@ -696,6 +763,46 @@ via Codex's MCP server (`codex mcp-server`):
 This keeps the control loop inside Claude Code — no external daemon, no
 FIFO, no turn-change webhook. If the `codex` MCP server isn't registered,
 the prompt falls back to asking the user to run `/collab join` manually.
+
+## Implementation Notes
+
+### Background `codex exec` dispatch (CodeImplementPending + implementer=codex)
+
+For the single phase `CodeImplementPending` when `implementer == "codex"`,
+the Claude dispatcher invokes Codex via `codex exec --reasoning-effort low`
+as a background Bash process (`run_in_background: true`) rather than via the
+synchronous `mcp__codex__codex` MCP tool. The full procedure (prompt file
+construction, polling loop, termination conditions, and failure handling) is
+documented in the Claude-side dispatcher prompt
+(`.claude-plugin/commands/collab.md`, section "Codex batch handoff —
+background `codex exec`").
+
+**Why this phase only.** `CodeImplementPending` is the longest Codex-owned
+phase. Backgrounding it lets Claude surface real-time progress output and
+detect hangs early, whereas a synchronous MCP call blocks with no visibility.
+All other Codex-owned phases — `PlanParallelDrafts`, `PlanCodexReviewPending`,
+and `CodeReviewFixGlobalPending` — continue using `mcp__codex__codex`
+synchronously, unchanged.
+
+**Fallback.** When `codex` is not on PATH, the dispatcher falls back to
+`mcp__codex__codex` synchronously for this phase (with
+`model_reasoning_effort: "low"` in the config overrides).
+
+### Timing instrumentation (eval mode)
+
+When running with timing instrumentation enabled, Claude writes one event per
+line to `/tmp/collab-eval-${session_id}.log` at key transition points in the
+dispatcher. Events are formatted as:
+
+```
+<unix_seconds>.<nanos> <event_name> [extra]
+```
+
+Named events span `t0_session_started` (after `collab_start` returns) through
+`t10_session_complete` (when `CodingComplete` or `CodingFailed` is first
+observed). This instrumentation is opt-in and never blocks the protocol —
+write failures are swallowed silently. Full event list and post-run analysis
+commands are documented in the Claude-side dispatcher prompt.
 
 ## Validation
 
