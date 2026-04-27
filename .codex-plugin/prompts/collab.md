@@ -28,10 +28,15 @@ session record's `implementer` field is `"codex"`.
 
 **Never** call `ironmem_collab_end` during an active phase. See Invariants.
 
-> **Note:** For the `CodeImplementPending` (codex implementer) turn, Claude's
-> dispatcher sends a slim phase-specific prompt at `.codex-plugin/prompts/collab-batch-impl.md`
-> instead of this full file. This file remains canonical for v1 planning,
-> global review, and shortcut sessions.
+> **Note:** Claude's dispatcher invokes ALL Codex-owned non-terminal phases via
+> background `codex exec` (Track C), not the synchronous `mcp__codex__codex`
+> MCP tool. This full file is the prompt for v1 planning turns
+> (`PlanParallelDrafts`, `PlanCodexReviewPending`), the global review turn
+> (`CodeReviewFixGlobalPending`), and shortcut sessions. For the
+> `CodeImplementPending+codex` batch turn only, Claude's dispatcher sends the
+> slim variant at `.codex-plugin/prompts/collab-batch-impl.md` instead — that
+> file covers only the batch-impl turn so Codex doesn't process unreachable
+> v1/review content.
 
 ## v3 core rule — you write code, not review notes
 

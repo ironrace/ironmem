@@ -766,27 +766,31 @@ the prompt falls back to asking the user to run `/collab join` manually.
 
 ## Implementation Notes
 
-### Background `codex exec` dispatch (CodeImplementPending + implementer=codex)
+### Background `codex exec` dispatch (all Codex-owned phases)
 
-For the single phase `CodeImplementPending` when `implementer == "codex"`,
-the Claude dispatcher invokes Codex via `codex exec --reasoning-effort low`
-as a background Bash process (`run_in_background: true`) rather than via the
-synchronous `mcp__codex__codex` MCP tool. The full procedure (prompt file
-construction, polling loop, termination conditions, and failure handling) is
-documented in the Claude-side dispatcher prompt
-(`.claude-plugin/commands/collab.md`, section "Codex batch handoff —
-background `codex exec`").
+The Claude dispatcher invokes ALL Codex-owned non-terminal phases via
+`codex exec` as a background Bash process (`run_in_background: true`)
+rather than via the synchronous `mcp__codex__codex` MCP tool. This
+covers `PlanParallelDrafts`, `PlanCodexReviewPending`,
+`CodeReviewFixGlobalPending`, and `CodeImplementPending+codex`. The full
+procedure (prompt file selection, reasoning flag, polling loop, termination
+conditions, and failure handling) is documented in the Claude-side
+dispatcher prompt (`.claude-plugin/commands/collab.md`, section "Codex
+handoff — background `codex exec`").
 
-**Why this phase only.** `CodeImplementPending` is the longest Codex-owned
-phase. Backgrounding it lets Claude surface real-time progress output and
-detect hangs early, whereas a synchronous MCP call blocks with no visibility.
-All other Codex-owned phases — `PlanParallelDrafts`, `PlanCodexReviewPending`,
-and `CodeReviewFixGlobalPending` — continue using `mcp__codex__codex`
-synchronously, unchanged.
+**Why all phases.** Background exec avoids the MCP cold-start overhead
+that dominated latency in smoke testing (`PlanCodexReviewPending` hung
+24+ min; `CodeReviewFixGlobalPending` took 171s via synchronous MCP).
+The dispatch shape is now uniform across all Codex turns; only the prompt
+file and the reasoning flag vary by phase. `CodeImplementPending+codex`
+uses the slim `collab-batch-impl.md` prompt and `--reasoning-effort low`;
+all other Codex turns use the full `collab.md` prompt with default reasoning
+preserved (reviewer and planner judgment must not be shallow).
 
 **Fallback.** When `codex` is not on PATH, the dispatcher falls back to
-`mcp__codex__codex` synchronously for this phase (with
-`model_reasoning_effort: "low"` in the config overrides).
+synchronous `mcp__codex__codex` for any phase (with
+`model_reasoning_effort: "low"` in the config overrides for
+`CodeImplementPending+codex`; no config override for all other phases).
 
 ### Timing instrumentation (eval mode)
 
