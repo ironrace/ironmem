@@ -35,7 +35,7 @@ branch names.
 3. Call `mcp__ironmem__collab_start` with `repo_path`, `branch`,
    `initiator`, `task`, and `implementer`. The MCP tool returns
    `session_id`, `task`, and the resolved `implementer` — verify it
-   matches what you sent.
+   matches what you sent. **Log:** `t0_session_started`
 4. **Do not ask the user to run anything in a Codex terminal.** Claude
    drives every Codex-owned turn via `mcp__codex__codex` in this same
    terminal — there is no second terminal for the user to manage. Just
@@ -121,7 +121,11 @@ Both v1 and v3 share a common dispatch loop:
 loop:
   status = collab_status(session_id)
 
+  if phase changed since last iteration:
+    Log: t4_phase_advanced_to_<new_phase>   # write timing event
+
   if session_ended or phase in terminal_set:
+    Log: t10_session_complete <phase>       # CodingComplete or CodingFailed
     exit and report to user
 
   if current_owner == "codex":
@@ -202,7 +206,7 @@ serves as the gate.
    content=<JSON string>)`. Session advances to `CodeImplementPending`.
    The `current_owner` after this transition matches the session's
    `implementer` — which agent runs the batch phase is committed at
-   this point.
+   this point. **Log:** `t1_task_list_sent`
 6. **Branch on `implementer`** (read it from `collab_status`):
 
    - **`implementer == "claude"`** — Run the batch locally. Invoke
@@ -234,8 +238,12 @@ serves as the gate.
      (`review_local` → `review_fix_global` → `final_review` with
      `gh pr create`) is the protocol's canonical PR path.
 
-   - **`implementer == "codex"`** — Hand off to Codex synchronously via
-     `mcp__codex__codex`, just like the Codex-owned global review turn.
+   - **`implementer == "codex"`** — For `CodeImplementPending`, use the
+     background `codex exec` path (see `### Codex batch handoff — background \`codex exec\``).
+     **Log:** `t2_codex_dispatched` immediately before launching.
+     **Log:** `t3_codex_returned` immediately after the polling loop exits.
+     For all other Codex-owned phases, hand off synchronously via
+     `mcp__codex__codex`.
      Read `.codex-plugin/prompts/collab.md`, substitute `$ARGUMENTS`
      with `join <session_id>`, and call the MCP tool with that resolved
      prompt and `cwd = repo_path`. Block until Codex returns. Codex
@@ -332,9 +340,9 @@ sequence before building the payload:
 | Phase | What to do (is_my_turn == true) |
 |---|---|
 | `CodeImplementPending` | Owner depends on `implementer`. **Claude is owner** (default): the bridge has already invoked `superpowers:subagent-driven-development`. When all subagents finish, **run pre-send harness gates** (no reset — no Codex push to sync) and `collab_send` with `sender="claude"`, `topic="implementation_done"`, `content=<JSON {"head_sha":"<current HEAD>"}>`. Payload carries ONLY `head_sha`. **Codex is owner** (`--implementer=codex`): is_my_turn is false here; the bridge dispatched to Codex via `mcp__codex__codex` and Codex emits `implementation_done` itself before its MCP session returns. If the dispatch loop ever sees `CodeImplementPending` with Codex owner, re-dispatch via the Codex MCP tool (resumed-mid-batch case). |
-| `CodeReviewLocalPending` | **Run pre-send harness (with reset to `last_head_sha`), then `/ultrareview-local` on the full task stack.** Fix any CRITICAL/HIGH inline (commit + push). Call `collab_send` with `sender="claude"`, `topic="review_local"`, `content=<JSON {"head_sha":"<current HEAD>"}>`. |
-| `CodeReviewFixGlobalPending` | Codex's turn. is_my_turn should be false. If `collab_status` confirms Claude is the owner, exit the loop and report the anomaly. |
-| `CodeReviewFinalPending` | **Run pre-send harness (with reset to `last_head_sha`).** Codex has pushed any global fixes (or a no-op commit); your local working copy was reset to `last_head_sha` by the harness. Optionally tweak. Re-run gates. Then **enter Plan Mode**: draft PR title (under 70 chars) and body (summary + test plan derived from task list + gate results). Get user approval. Then `gh pr create --base <base_branch> --head <current branch> --title <approved title> --body <approved body>`. If `gh pr create` fails, send `failure_report` with `coding_failure: "pr_create_failed: <error>"` — no silent retry. On success, capture `pr_url` and call `collab_send` with `sender="claude"`, `topic="final_review"`, `content=<JSON {"head_sha":"<current HEAD>","pr_url":"<https url>"}>`. Session advances directly to `CodingComplete`. Exit loop. |
+| `CodeReviewLocalPending` | **Run pre-send harness (with reset to `last_head_sha`), then `/ultrareview-local` on the full task stack.** Fix any CRITICAL/HIGH inline (commit + push). Call `collab_send` with `sender="claude"`, `topic="review_local"`, `content=<JSON {"head_sha":"<current HEAD>"}>`. **Log:** `t5_review_local_sent` |
+| `CodeReviewFixGlobalPending` | Codex's turn. is_my_turn should be false. If `collab_status` confirms Claude is the owner, exit the loop and report the anomaly. **Log:** `t6_codex_review_dispatched` immediately before the `mcp__codex__codex` call; **Log:** `t7_codex_review_returned` immediately after it returns. |
+| `CodeReviewFinalPending` | **Run pre-send harness (with reset to `last_head_sha`).** Codex has pushed any global fixes (or a no-op commit); your local working copy was reset to `last_head_sha` by the harness. Optionally tweak. Re-run gates. Then **enter Plan Mode**: draft PR title (under 70 chars) and body (summary + test plan derived from task list + gate results). Get user approval. Then `gh pr create --base <base_branch> --head <current branch> --title <approved title> --body <approved body>`. If `gh pr create` fails, send `failure_report` with `coding_failure: "pr_create_failed: <error>"` — no silent retry. On success, **Log:** `t8_pr_created <pr_url>`, capture `pr_url` and call `collab_send` with `sender="claude"`, `topic="final_review"`, `content=<JSON {"head_sha":"<current HEAD>","pr_url":"<https url>"}>`. **Log:** `t9_final_review_sent`. Session advances directly to `CodingComplete`. **Log:** `t10_session_complete CodingComplete`. Exit loop. |
 
 After each send in v3, loop back to polling. The loop continues until
 `phase in {CodingComplete, CodingFailed}` or `session_ended`.
@@ -377,7 +385,7 @@ shallow reviewer defeats the protocol's design.
 
 | Phase from `collab_status` | `implementer` | Config override | Rationale |
 |---|---|---|---|
-| `CodeImplementPending` | `"codex"` | `{ "model_reasoning_effort": "low" }` | Batch impl follows an approved plan — mechanical |
+| `CodeImplementPending` | `"codex"` | `{ "model_reasoning_effort": "low" }` | Routed via background `codex exec --reasoning-effort low`, NOT `mcp__codex__codex` — see `### Codex batch handoff — background \`codex exec\`` section. Config shown here for reference only. |
 | `CodeReviewFixGlobalPending` | (any) | **none** (defaults preserved) | Reviewer judgment must not be shallow |
 | `PlanParallelDrafts` | (any) | **none** | Planning needs reasoning |
 | `PlanCodexReviewPending` | (any) | **none** | Plan review needs reasoning |
@@ -393,6 +401,12 @@ the top of the dispatch step (you already do this); branch on them
 when constructing the MCP call below.
 
 ### Codex handoff — synchronous MCP invocation
+
+> **NOTE:** For `CodeImplementPending` with `implementer == "codex"`, do **NOT**
+> use this synchronous MCP path. Use the background-exec path documented in
+> [`### Codex batch handoff — background \`codex exec\``](#codex-batch-handoff--background-codex-exec-codeimplementpendingcodex-only)
+> instead. This synchronous MCP path is used for all **other** Codex-owned phases:
+> `PlanParallelDrafts`, `PlanCodexReviewPending`, and `CodeReviewFixGlobalPending`.
 
 **Whenever `current_owner == "codex"` in a coding-active or planning-active
 phase, drive Codex's turn inline via the Codex MCP tool.** Codex CLI
@@ -477,12 +491,166 @@ Procedure:
    phase or a terminal condition.
 
 Applies to every Codex-owned phase: v1 `PlanParallelDrafts` (Codex
-drafting), v1 `PlanCodexReviewPending`, v3 `CodeReviewFixGlobalPending`,
-and v3 `CodeImplementPending` *when* `implementer == "codex"`.
+drafting), v1 `PlanCodexReviewPending`, v3 `CodeReviewFixGlobalPending`.
+(v3 `CodeImplementPending` with `implementer == "codex"` uses the
+background-exec path documented below, not this synchronous path.)
 
 If `mcp__codex__codex` is not registered, fall back to the legacy flow:
 tell the user to run `/collab join <session_id>` in a Codex terminal,
 then `ScheduleWakeup` and resume polling.
+
+### Codex batch handoff — background `codex exec` (CodeImplementPending+codex only)
+
+**When to use this path:** ONLY when ALL three conditions hold:
+- `phase == "CodeImplementPending"` AND
+- `current_owner == "codex"` AND
+- `implementer == "codex"`
+
+In every other case (other Codex-owned phases, or `implementer != "codex"`),
+use the synchronous MCP path in "Codex handoff — synchronous MCP invocation".
+
+**Rationale:** `CodeImplementPending` is the longest Codex-owned phase
+(full batch implementation). The synchronous `mcp__codex__codex` call gives
+no visibility during execution (appears as a hang) and may carry higher
+cold-start cost than a direct CLI invocation. Backgrounding it lets Claude
+surface real-time progress and detect hangs/failures early.
+
+**Procedure:**
+
+a. Read `.codex-plugin/prompts/collab.md` (from
+   `/Users/jeffreycrum/git-repos/ironrace-memory/.codex-plugin/prompts/collab.md`)
+   and substitute `$ARGUMENTS` with `join <session_id>`. Write the resolved
+   prompt to a temp file:
+   ```bash
+   mkdir -p /tmp/collab-eval && cat > /tmp/codex-prompt-${session_id}.md <<'PROMPT_EOF'
+   <resolved prompt text>
+   PROMPT_EOF
+   ```
+
+b. **Log:** `t2_codex_dispatched`
+
+c. Launch via Bash with `run_in_background: true`:
+   ```bash
+   cd <repo_path> && codex exec --reasoning-effort low --prompt-file /tmp/codex-prompt-${session_id}.md > /tmp/codex-out-${session_id}.log 2>&1
+   ```
+   > **CLI note (best-effort, verify with `codex --help`):** The exact flag for
+   > a prompt file may be `--prompt-file <path>`, `--file <path>`, or stdin
+   > redirect (`< /tmp/codex-prompt-…`). Run `codex exec --help` once at the
+   > start of this path to confirm. If stdin is supported, prefer:
+   > ```bash
+   > cd <repo_path> && codex exec --reasoning-effort low - < /tmp/codex-prompt-${session_id}.md > /tmp/codex-out-${session_id}.log 2>&1
+   > ```
+   > Document in the log which invocation form was used.
+
+d. **Polling loop** — the dispatcher's interactive surface during this phase.
+   Poll every ~10 seconds (via Bash `sleep 10` or `ScheduleWakeup`).
+
+   On each iteration:
+   - Call `mcp__ironmem__collab_status(session_id)` to detect phase advance.
+     **Log:** `t4_phase_advanced_to_<new_phase>` if phase changed.
+   - Read `BashOutput(<bash-id>)` to surface new stdout to the user
+     as a one-line update: `[codex bg] <last stdout line>`.
+
+   **Termination conditions** (first match wins):
+
+   1. `collab_status.phase` advances to `CodeReviewLocalPending` →
+      Codex emitted `implementation_done` cleanly. **SUCCESS.**
+      **Log:** `t3_codex_returned` then continue to step f.
+
+   2. `collab_status.phase` reaches `CodingFailed` →
+      Codex emitted `failure_report`. **ABORT** — surface failure to user,
+      exit the dispatcher loop.
+
+   3. Bash background process exits (BashOutput shows "exit code N" or
+      process is no longer running) AND no phase advance observed →
+      Codex CLI failed silently. **ERROR.**
+      - Capture the last 50 lines from `/tmp/codex-out-${session_id}.log`.
+      - Send `collab_send(sender="claude", topic="failure_report",
+          content=<JSON {"coding_failure":"codex_exec_failed_silent: <last lines>"}>)`.
+      - **ABORT.**
+
+   4. Wall time exceeds 600 seconds (configurable) →
+      **HANG.**
+      - Kill the Bash background process via `KillShell`.
+      - Send `collab_send(sender="claude", topic="failure_report",
+          content=<JSON {"coding_failure":"codex_exec_timeout"}>)`.
+      - **ABORT.**
+
+   While polling, emit a one-line progress update each iteration
+   (`[codex bg] <last stdout line>`) so the user can confirm Codex is alive.
+
+e. **Log:** `t3_codex_returned` (if not already logged at condition 1).
+
+f. Resume the normal dispatch loop. The next iteration will see
+   `current_owner == "claude"` at `CodeReviewLocalPending`.
+
+**Failure modes:**
+
+- **`codex` not on PATH** → fall back to `mcp__codex__codex` synchronously
+  (same resolved prompt, `config: {model_reasoning_effort: "low"}`).
+  **Log:** `t2_fallback_to_mcp` in place of `t2_codex_dispatched`.
+
+- **Repository or PATH issues** → capture the error output, send
+  `failure_report` with `coding_failure: "codex_exec_env_error: <error>"`.
+
+- **User interrupts (Ctrl+C during polling)** → kill the background Bash
+  process via `KillShell`. Do NOT automatically send `failure_report` —
+  let the user inspect the session state manually before deciding.
+
+**Compatibility:** Only this one phase is rerouted. All other Codex-owned
+phases (`PlanParallelDrafts`, `PlanCodexReviewPending`,
+`CodeReviewFixGlobalPending`) continue using `mcp__codex__codex` unchanged.
+
+## Timing instrumentation (eval mode)
+
+Claude writes one timing event per line to `/tmp/collab-eval-${session_id}.log`
+at key transition points throughout the dispatcher. This is opt-in and
+harmless: worst case a `/tmp` log file is written. Timing events never block
+the protocol — if a write fails, swallow the error silently and continue.
+
+**Rationale:** IronRace collab sessions span multiple agents and a long
+batch-implementation phase. Post-run shell analysis of the log lets us
+reconstruct the latency breakdown (planning vs. Codex dispatch vs. review vs.
+PR), measure the background-exec speedup (A.2), and identify hangs.
+
+**Format:** one event per line:
+```
+<unix_seconds>.<nanos> <event_name> [extra]
+```
+
+**Write an event:**
+```bash
+echo "$(date +%s.%N) <event_name> [extra]" >> /tmp/collab-eval-${session_id}.log
+```
+
+**Event list:**
+
+| Event | When to write |
+|---|---|
+| `t0_session_started` | Right after `collab_start` returns (session_id now known) |
+| `t1_task_list_sent` | Right after `collab_send(topic="task_list")` returns |
+| `t2_codex_dispatched` | Immediately before launching background `codex exec` (or `mcp__codex__codex` for non-batch phases) |
+| `t2_fallback_to_mcp` | When `codex` is not on PATH and falling back to synchronous MCP for the batch phase |
+| `t3_codex_returned` | Immediately after the polling loop exits successfully (batch phase) or `mcp__codex__codex` returns (other phases) |
+| `t4_phase_advanced_to_<phase>` | Every time a poll observes a new phase (write the new phase name as `[extra]`) |
+| `t5_review_local_sent` | After `collab_send(topic="review_local")` returns |
+| `t6_codex_review_dispatched` | Immediately before the `mcp__codex__codex` call for `CodeReviewFixGlobalPending` |
+| `t7_codex_review_returned` | Immediately after that MCP call returns |
+| `t8_pr_created` | After `gh pr create` returns success; include the PR URL as `[extra]` |
+| `t9_final_review_sent` | After `collab_send(topic="final_review")` returns |
+| `t10_session_complete` | When `collab_status.phase` first reads `CodingComplete` or `CodingFailed`; include the phase as `[extra]` |
+
+**Analyze post-run:**
+```bash
+# Show all events for a session with human-readable timestamps
+session_id="<sid>"
+awk '{printf "%s %s %s\n", strftime("%H:%M:%S", $1), $2, $3}' \
+  /tmp/collab-eval-${session_id}.log
+
+# Compute elapsed time between t0 and t10
+grep -E "t0_session_started|t10_session_complete" \
+  /tmp/collab-eval-${session_id}.log | awk 'NR==1{s=$1} NR==2{printf "Total: %.1fs\n", $1-s}'
+```
 
 ## Invariants — do not violate
 
