@@ -176,9 +176,12 @@ before building the payload:
    which is the sender's post-work-gated commit (every send is post-gated
    by the sender's harness). Re-running tests on a known-green tree is
    duplicate work. Branch-drift was already caught in step 4
-   (`git cat-file -e`). The phase-specific action below is responsible
-   for running the project's test command **after** any fixes are
-   applied, immediately before the outgoing `collab_send`.
+   (`git cat-file -e`). Post-work tests live in the phase-specific action
+   below — for `CodeReviewFixGlobalPending`, run the project's test
+   command after any fixes are applied, immediately before the outgoing
+   `collab_send`; for `CodeImplementPending` (codex implementer), the
+   post-work gate is step 5 of the "Batch implementation
+   (codex-implementer)" sub-section ("Run final gates ...").
 7. Proceed to the phase-specific action below.
 
 | Phase | What to do (is_my_turn == true) |
