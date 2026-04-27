@@ -172,8 +172,13 @@ before building the payload:
    (no silent retry).
 5. `git checkout <branch>` and `git reset --hard <last_head_sha>` so your
    working copy matches what Claude last pushed.
-6. Run the project's test command (language-appropriate: `cargo test`,
-   `pytest`, `npm test`, `go test ./...`, etc). Record failures.
+6. **No pre-work test command.** The receiver just reset to `last_head_sha`,
+   which is the sender's post-work-gated commit (every send is post-gated
+   by the sender's harness). Re-running tests on a known-green tree is
+   duplicate work. Branch-drift was already caught in step 4
+   (`git cat-file -e`). The phase-specific action below is responsible
+   for running the project's test command **after** any fixes are
+   applied, immediately before the outgoing `collab_send`.
 7. Proceed to the phase-specific action below.
 
 | Phase | What to do (is_my_turn == true) |
