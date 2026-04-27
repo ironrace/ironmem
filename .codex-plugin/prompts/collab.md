@@ -26,7 +26,7 @@ You never send `canonical`, `final`, `task_list`, `review_local`, or
 Claude-only in default sessions; it becomes Codex-valid only when the
 session record's `implementer` field is `"codex"`.
 
-**Never** call `ironmem_collab_end` during an active phase. See Invariants.
+**Never** call `collab_end` during an active phase. See Invariants.
 
 > **Note:** Claude's dispatcher invokes ALL Codex-owned non-terminal phases via
 > background `codex exec` (Track C), not the synchronous `mcp__codex__codex`
@@ -69,7 +69,7 @@ trust the code not the prose.
 
 ## Blind-draft invariant — do not try to peek
 
-During `phase == "PlanParallelDrafts"`, `ironmem_collab_recv` will **not**
+During `phase == "PlanParallelDrafts"`, `collab_recv` will **not**
 return Claude's draft until you've submitted your own. Server-enforced.
 Do not grep `~/.claude/plans/` or speculate what Claude drafted; write
 strictly from the `task` text returned by `collab_status`.
@@ -84,7 +84,7 @@ branch names.
    - `branch` ← `git branch --show-current`
    - `initiator` ← `"codex"`
    - `task` ← the remainder of `$ARGUMENTS` after the word `start`
-2. Call `mcp__ironrace-memory__ironmem_collab_start`.
+2. Call `mcp__ironmem__collab_start`.
 3. Tell the user, in one copy-pasteable line:
 
    ```
@@ -93,16 +93,16 @@ branch names.
 
 4. Draft your plan (Claude hasn't drafted yet; blind-draft applies to you
    too on the return trip — you will not be able to read Claude's draft
-   until yours is submitted). Call `mcp__ironrace-memory__ironmem_collab_send`
+   until yours is submitted). Call `mcp__ironmem__collab_send`
    with `sender="codex"`, `topic="draft"`, `content=<plan text>`.
 5. Enter the v1 planning loop.
 
 ## `join <session_id>`
 
-1. Store `<session_id>` — reuse on every subsequent `ironmem_collab_*` call
+1. Store `<session_id>` — reuse on every subsequent `collab_*` call
    without re-prompting the user.
 2. `agent` / `sender` / `receiver` ← `"codex"`.
-3. Call `mcp__ironrace-memory__ironmem_collab_status`. Report `task` and
+3. Call `mcp__ironmem__collab_status`. Report `task` and
    `phase` to the user.
 4. Branch on `phase`:
    - **v1 active** (`PlanParallelDrafts` .. `PlanClaudeFinalizePending`) →
@@ -164,7 +164,7 @@ Claude's MCP tool call will still complete cleanly.
 |---|---|
 | `PlanParallelDrafts` | If you haven't submitted yet, write your draft and send `topic="draft"`, `sender="codex"`. If already submitted, `is_my_turn` should be false — exit. |
 | `PlanSynthesisPending` | Claude's turn. Exit. |
-| `PlanCodexReviewPending` | Read Claude's canonical plan from the recv'd message. Call `collab_send` with `sender="codex"`, `topic="review"`, `content=<JSON {"verdict":"...","notes":["..."]}>`. Allowed verdicts: `approve`, `approve_with_minor_edits`, `request_changes`. Shortcut: if verdict is exactly `approve`, you may call `ironmem_collab_approve` with `agent="codex"`, `content_hash=<canonical_plan_hash from collab_status>` instead. |
+| `PlanCodexReviewPending` | Read Claude's canonical plan from the recv'd message. Call `collab_send` with `sender="codex"`, `topic="review"`, `content=<JSON {"verdict":"...","notes":["..."]}>`. Allowed verdicts: `approve`, `approve_with_minor_edits`, `request_changes`. Shortcut: if verdict is exactly `approve`, you may call `collab_approve` with `agent="codex"`, `content_hash=<canonical_plan_hash from collab_status>` instead. |
 | `PlanClaudeFinalizePending` | Claude's turn. Exit. |
 
 ## v3 Dispatch Loop (Phase → Action Table)
@@ -332,7 +332,7 @@ All existing v3 anti-puppeteering rules apply unchanged.
 
 ## Invariants — do not violate
 
-- **Never** call `ironmem_collab_end` during an active phase:
+- **Never** call `collab_end` during an active phase:
   - v1 active: `PlanParallelDrafts`, `PlanSynthesisPending`,
     `PlanCodexReviewPending`, `PlanClaudeFinalizePending`.
   - v3 active: `CodeImplementPending`, `CodeReviewLocalPending`,

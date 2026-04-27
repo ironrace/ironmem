@@ -81,7 +81,7 @@ Tagged releases upload prebuilt macOS and Linux binaries automatically. Until th
 - Workspace mining and incremental re-mining are implemented
 - Codex and Claude Code plugin packaging is included
 - `~/.ironrace/bin/ironmem` is the preferred installed binary location; plugin launch scripts check there first
-- Bounded Claude↔Codex planning protocol (v1) is available via the `collab_*` MCP tools, including long-poll `wait_my_turn` for autonomous operation — see [docs/COLLAB.md](docs/COLLAB.md)
+- Bounded Claude↔Codex collaboration protocol (v1 planning + v3 coding) is available via the `collab_*` MCP tools, including long-poll `wait_my_turn` for autonomous operation — see [docs/COLLAB.md](docs/COLLAB.md)
 
 ## Shared Memory Across Harnesses
 

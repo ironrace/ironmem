@@ -27,13 +27,13 @@ You never send `draft`, `review`, `canonical`, `final`, `task_list`,
 at `.codex-plugin/prompts/collab.md` covers all other phases — read it if
 your phase isn't `CodeImplementPending`.
 
-**Never** call `ironmem_collab_end` during an active phase. See Invariants.
+**Never** call `collab_end` during an active phase. See Invariants.
 
 ## `join <session_id>`
 
-1. Store `<session_id>` — reuse on every subsequent `ironmem_collab_*` call.
+1. Store `<session_id>` — reuse on every subsequent `collab_*` call.
 2. `agent` / `sender` / `receiver` ← `"codex"`.
-3. Call `mcp__ironrace-memory__ironmem_collab_status`. Report `task` and
+3. Call `mcp__ironmem__collab_status`. Report `task` and
    `phase` to the user.
 4. **Guard:** If `collab_status.phase != "CodeImplementPending"` OR
    `collab_status.implementer != "codex"` OR
@@ -178,7 +178,7 @@ via its Codex MCP tool when the session needs you again.
 
 ## Invariants — do not violate
 
-- **Never** call `ironmem_collab_end` during an active phase:
+- **Never** call `collab_end` during an active phase:
   - v3 active: `CodeImplementPending`, `CodeReviewLocalPending`,
     `CodeReviewFixGlobalPending`, `CodeReviewFinalPending`.
 
