@@ -379,6 +379,11 @@ shallow reviewer defeats the protocol's design.
 | `PlanCodexReviewPending` | (any) | **none** | Plan review needs reasoning |
 | `CodeImplementPending` | `"claude"` | n/a — Codex isn't owner | Claude runs subagents on its side; no Codex MCP call |
 
+Match **both** columns when looking up a row: `(any)` is a wildcard,
+quoted strings (e.g. `"codex"`, `"claude"`) are exact matches. The two
+`CodeImplementPending` rows are distinguished only by `implementer` —
+do not stop at the first phase match.
+
 Read `phase` and `implementer` from the `collab_status` you fetched at
 the top of the dispatch step (you already do this); branch on them
 when constructing the MCP call below.
@@ -435,7 +440,7 @@ Procedure:
       }
       ```
 
-      Example for any other Codex-owned phase (review, planning):
+      Example for any Codex-owned review or planning phase (no batch impl):
       ```json
       {
         "name": "mcp__codex__codex",
