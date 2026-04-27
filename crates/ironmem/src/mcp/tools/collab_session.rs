@@ -2,13 +2,17 @@ use serde_json::{json, Value};
 use std::process::Command;
 
 use crate::collab::queue::SessionRecord;
-use crate::collab::{apply_event, start_global_review_session, CollabError, CollabEvent, Phase};
+use crate::collab::{
+    apply_event, start_global_review_session, Agent, CollabError, CollabEvent, Phase,
+};
 use crate::error::MemoryError;
 use crate::mcp::app::App;
 use crate::sanitize;
 
-use super::collab_events::{build_collab_event, failure_report_is_branch_drift};
-use super::shared::{other_agent, require_agent, require_str, MAX_COLLAB_CONTENT_CHARS};
+use super::collab_events::{build_collab_event, failure_report_is_off_turn_admissible};
+use super::shared::{
+    other_agent, require_agent, require_implementer, require_str, MAX_COLLAB_CONTENT_CHARS,
+};
 
 pub(super) fn collab_error_to_memory_error(error: CollabError) -> MemoryError {
     MemoryError::Validation(error.to_string())
@@ -30,7 +34,19 @@ pub(super) fn session_record_json(record: &SessionRecord) -> Value {
         "review_round": record.session.review_round,
         "task_list": record.session.task_list.as_deref(),
         "tasks_count": record.session.tasks_count(),
-        "current_task_index": record.session.current_task_index,
+        // `plan_file_path` is parsed back out of the canonicalized
+        // `task_list` JSON so consumers (notably the Codex prompt) can
+        // read it as a top-level field instead of re-parsing the JSON
+        // blob themselves. Returns `None` until `task_list` is sent or
+        // when the optional field was omitted.
+        "plan_file_path": plan_file_path_from_task_list(record.session.task_list.as_deref()),
+        // `execution_mode` is parsed back out of the canonicalized
+        // `task_list` JSON for the same reason as `plan_file_path`.
+        // Returns `None` when `task_list` is absent, when the field was
+        // omitted (default subagent-driven), or when the payload is
+        // malformed. Consumers treat `None` as the default (subagent-driven).
+        "execution_mode": execution_mode_from_task_list(record.session.task_list.as_deref()),
+        "implementer": record.session.implementer.as_str(),
         "task_review_round": record.session.task_review_round,
         "global_review_round": record.session.global_review_round,
         "base_sha": record.session.base_sha.as_deref(),
@@ -41,6 +57,32 @@ pub(super) fn session_record_json(record: &SessionRecord) -> Value {
         "created_at": record.created_at.as_str(),
         "updated_at": record.updated_at.as_str(),
     })
+}
+
+/// Pull `plan_file_path` out of a stored `task_list` JSON payload. Mirrors
+/// `tasks_count_from_list` in shape: returns `None` for unset/malformed
+/// task_list so a corrupt payload yields `null` in the JSON response
+/// rather than panicking the read path.
+fn plan_file_path_from_task_list(raw: Option<&str>) -> Option<String> {
+    let raw = raw?;
+    let value: Value = serde_json::from_str(raw).ok()?;
+    value
+        .get("plan_file_path")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+}
+
+/// Pull `execution_mode` out of a stored `task_list` JSON payload. Returns
+/// `None` when `task_list` is unset, when the field was omitted (default
+/// subagent-driven path), or when the payload is malformed. Consumers treat
+/// `None` the same as the omitted-field default.
+fn execution_mode_from_task_list(raw: Option<&str>) -> Option<String> {
+    let raw = raw?;
+    let value: Value = serde_json::from_str(raw).ok()?;
+    value
+        .get("execution_mode")
+        .and_then(Value::as_str)
+        .map(str::to_string)
 }
 
 /// True for every topic the collab_send handler accepts — v1 planning
@@ -55,8 +97,7 @@ pub(super) fn is_known_collab_topic(topic: &str) -> bool {
             | "review"
             | "final"
             | "task_list"
-            | "implement"
-            | "review_fix"
+            | "implementation_done"
             | "review_local"
             | "review_fix_global"
             | "final_review"
@@ -87,7 +128,7 @@ struct WaitTurnSnapshot {
     phase_is_terminal: bool,
 }
 
-fn wait_turn_snapshot(record: &SessionRecord, agent: &str) -> WaitTurnSnapshot {
+fn wait_turn_snapshot(record: &SessionRecord, agent: Agent) -> WaitTurnSnapshot {
     let ended = record.ended_at.is_some();
     // Dynamic terminal set, evaluated on a single snapshot: pre-task_list,
     // PlanLocked is terminal so v1 agents can exit cleanly after the plan
@@ -95,16 +136,16 @@ fn wait_turn_snapshot(record: &SessionRecord, agent: &str) -> WaitTurnSnapshot {
     // set switches to `{CodingComplete, CodingFailed}`.
     let task_list_submitted = record.session.task_list.is_some();
     let phase_is_terminal = if task_list_submitted {
-        record.session.phase.is_terminal_v2()
+        record.session.phase.is_coding_terminal()
     } else {
         matches!(record.session.phase, crate::collab::Phase::PlanLocked)
-            || record.session.phase.is_terminal_v2()
+            || record.session.phase.is_coding_terminal()
     };
     let is_my_turn = !ended && !phase_is_terminal && record.session.current_owner == agent;
     WaitTurnSnapshot {
         is_my_turn,
         phase: record.session.phase.to_string(),
-        current_owner: record.session.current_owner.clone(),
+        current_owner: record.session.current_owner.to_string(),
         ended,
         phase_is_terminal,
     }
@@ -121,10 +162,26 @@ pub(super) fn handle_collab_start(app: &App, args: &Value) -> Result<Value, Memo
         .transpose()?
         .map(ToString::to_string);
     let task = task_owned.as_deref();
+    // Optional `implementer` field: routes the v3 batch implementation
+    // phase. Default is `Agent::Claude` (historical flow). `Agent::Codex`
+    // makes Codex the owner of `CodeImplementPending` and the only valid
+    // sender of `implementation_done`. `require_implementer` rejects
+    // anything outside `{"claude","codex"}` with a clear validation error.
+    let implementer = match args.get("implementer").and_then(Value::as_str) {
+        Some(value) => require_implementer(value)?,
+        None => Agent::Claude,
+    };
     let session_id = uuid::Uuid::new_v4().to_string();
 
     app.db.with_transaction(|tx| {
-        crate::collab::queue::create_session(tx, &session_id, repo_path, branch, task)?;
+        crate::collab::queue::create_session(
+            tx,
+            &session_id,
+            repo_path,
+            branch,
+            task,
+            implementer,
+        )?;
         crate::db::schema::Database::wal_log_tx(
             tx,
             "collab_start",
@@ -132,7 +189,8 @@ pub(super) fn handle_collab_start(app: &App, args: &Value) -> Result<Value, Memo
                 "session_id": session_id,
                 "repo_path": repo_path,
                 "branch": branch,
-                "initiator": initiator,
+                "initiator": initiator.as_str(),
+                "implementer": implementer.as_str(),
                 "has_task": task.is_some(),
             }),
             Some(&json!({ "session_id": session_id })),
@@ -140,7 +198,11 @@ pub(super) fn handle_collab_start(app: &App, args: &Value) -> Result<Value, Memo
         Ok(())
     })?;
 
-    Ok(json!({ "session_id": session_id, "task": task }))
+    Ok(json!({
+        "session_id": session_id,
+        "task": task,
+        "implementer": implementer.as_str(),
+    }))
 }
 
 pub(super) fn handle_collab_start_code_review(
@@ -152,7 +214,7 @@ pub(super) fn handle_collab_start_code_review(
     let base_sha = require_str(args, "base_sha")?;
     let head_sha = require_str(args, "head_sha")?;
     let initiator = require_agent(require_str(args, "initiator")?)?;
-    if initiator != "claude" {
+    if initiator != Agent::Claude {
         return Err(MemoryError::Validation(
             "initiator must be 'claude' for collab_start_code_review".to_string(),
         ));
@@ -163,7 +225,16 @@ pub(super) fn handle_collab_start_code_review(
         .map_err(collab_error_to_memory_error)?;
 
     app.db.with_transaction(|tx| {
-        crate::collab::queue::create_session(tx, &session_id, repo_path, branch, Some(task))?;
+        // Shortcut sessions never enter `CodeImplementPending`, so the
+        // `implementer` field is fixed at `Agent::Claude` for uniformity.
+        crate::collab::queue::create_session(
+            tx,
+            &session_id,
+            repo_path,
+            branch,
+            Some(task),
+            Agent::Claude,
+        )?;
         crate::collab::queue::save_session(tx, &session)?;
         crate::db::schema::Database::wal_log_tx(
             tx,
@@ -174,7 +245,7 @@ pub(super) fn handle_collab_start_code_review(
                 "branch": branch,
                 "base_sha": base_sha,
                 "head_sha": head_sha,
-                "initiator": initiator,
+                "initiator": initiator.as_str(),
                 "task": task,
             }),
             Some(&json!({ "session_id": session_id })),
@@ -217,7 +288,7 @@ pub(super) fn handle_collab_send(app: &App, args: &Value) -> Result<Value, Memor
         let turn_exempt = matches!(session.phase, crate::collab::Phase::PlanParallelDrafts)
             || (topic == "failure_report"
                 && sender != session.current_owner
-                && failure_report_is_branch_drift(content));
+                && failure_report_is_off_turn_admissible(content));
         if !turn_exempt && sender != session.current_owner {
             return Err(MemoryError::Validation(format!(
                 "not your turn: phase {} expects sender '{}', got '{}'",
@@ -225,7 +296,7 @@ pub(super) fn handle_collab_send(app: &App, args: &Value) -> Result<Value, Memor
             )));
         }
 
-        let event = build_collab_event(topic, content, &session)?;
+        let event = build_collab_event(topic, content, session.phase)?;
         if matches!(
             (&session.phase, &event),
             (
@@ -254,8 +325,8 @@ pub(super) fn handle_collab_send(app: &App, args: &Value) -> Result<Value, Memor
         let message_id = crate::collab::queue::send_message(
             tx,
             session_id,
-            sender,
-            other_agent(sender),
+            sender.as_str(),
+            other_agent(sender).as_str(),
             topic,
             content,
         )?;
@@ -264,7 +335,7 @@ pub(super) fn handle_collab_send(app: &App, args: &Value) -> Result<Value, Memor
             "collab_send",
             &json!({
                 "session_id": session_id,
-                "sender": sender,
+                "sender": sender.as_str(),
                 "topic": topic,
                 "phase_before": phase_before,
             }),
@@ -328,34 +399,49 @@ pub(super) fn handle_collab_recv(app: &App, args: &Value) -> Result<Value, Memor
     let session_id = require_str(args, "session_id")?;
     let receiver = require_agent(require_str(args, "receiver")?)?;
     let limit = (args.get("limit").and_then(|v| v.as_u64()).unwrap_or(10) as usize).min(50);
+    let auto_ack = args
+        .get("auto_ack")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
 
-    // Blind-drafts invariant: during PlanParallelDrafts, an agent must not see
-    // the counterpart's draft until it has submitted its own. This enforces
-    // the "parallel" in parallel drafts at the server boundary so the protocol
-    // doesn't rely on agent-side discipline alone.
-    let session = app.db.collab_load_session(session_id)?;
-    let suppress_drafts = matches!(session.phase, crate::collab::Phase::PlanParallelDrafts)
-        && match receiver {
-            "claude" => session.claude_draft_hash.is_none(),
-            "codex" => session.codex_draft_hash.is_none(),
-            _ => false,
-        };
+    app.db.with_transaction(|tx| {
+        // Blind-drafts invariant: during PlanParallelDrafts, an agent must not
+        // see the counterpart's draft until it has submitted its own. This
+        // enforces the "parallel" in parallel drafts at the server boundary so
+        // the protocol doesn't rely on agent-side discipline alone.
+        let session = crate::collab::queue::load_session(tx, session_id)?;
+        let suppress_drafts = matches!(session.phase, crate::collab::Phase::PlanParallelDrafts)
+            && match receiver {
+                Agent::Claude => session.claude_draft_hash.is_none(),
+                Agent::Codex => session.codex_draft_hash.is_none(),
+            };
 
-    let messages = app.db.collab_recv_messages(session_id, receiver, limit)?;
-    let filtered: Vec<Value> = messages
-        .into_iter()
-        .filter(|message| !(suppress_drafts && message.topic == "draft"))
-        .map(|message| {
-            json!({
-                "id": message.id,
-                "sender": message.sender,
-                "topic": message.topic,
-                "content": message.content,
-                "created_at": message.created_at,
+        let messages =
+            crate::collab::queue::recv_messages(tx, session_id, receiver.as_str(), limit)?;
+        let filtered: Vec<_> = messages
+            .into_iter()
+            .filter(|message| !(suppress_drafts && message.topic == "draft"))
+            .collect();
+
+        if auto_ack && !filtered.is_empty() {
+            let ids: Vec<String> = filtered.iter().map(|m| m.id.clone()).collect();
+            crate::collab::queue::ack_messages_many(tx, session_id, &ids)?;
+        }
+
+        let json_messages: Vec<Value> = filtered
+            .iter()
+            .map(|message| {
+                json!({
+                    "id": message.id,
+                    "sender": message.sender,
+                    "topic": message.topic,
+                    "content": message.content,
+                    "created_at": message.created_at,
+                })
             })
-        })
-        .collect();
-    Ok(json!({ "messages": filtered }))
+            .collect();
+        Ok(json!({ "messages": json_messages }))
+    })
 }
 
 pub(super) fn handle_collab_ack(app: &App, args: &Value) -> Result<Value, MemoryError> {
@@ -405,7 +491,7 @@ pub(super) fn handle_collab_status(app: &App, args: &Value) -> Result<Value, Mem
 pub(super) fn handle_collab_approve(app: &App, args: &Value) -> Result<Value, MemoryError> {
     let session_id = require_str(args, "session_id")?;
     let agent = require_agent(require_str(args, "agent")?)?;
-    if agent != "codex" {
+    if agent != Agent::Codex {
         return Err(MemoryError::Validation(
             "agent must be 'codex' for collab_approve".to_string(),
         ));
@@ -431,7 +517,7 @@ pub(super) fn handle_collab_approve(app: &App, args: &Value) -> Result<Value, Me
         }
         let session = apply_event(
             &session,
-            "codex",
+            Agent::Codex,
             &CollabEvent::SubmitReview {
                 verdict: "approve".to_string(),
             },
@@ -441,8 +527,8 @@ pub(super) fn handle_collab_approve(app: &App, args: &Value) -> Result<Value, Me
         let _ = crate::collab::queue::send_message(
             tx,
             session_id,
-            "codex",
-            "claude",
+            Agent::Codex.as_str(),
+            Agent::Claude.as_str(),
             "review",
             &review_content,
         )?;
@@ -451,7 +537,7 @@ pub(super) fn handle_collab_approve(app: &App, args: &Value) -> Result<Value, Me
             "collab_approve",
             &json!({
                 "session_id": session_id,
-                "agent": agent,
+                "agent": agent.as_str(),
                 "content_hash": content_hash,
             }),
             Some(&json!({ "phase": session.phase.to_string() })),
@@ -519,7 +605,7 @@ pub(super) fn handle_collab_end(app: &App, args: &Value) -> Result<Value, Memory
             "collab_end",
             &json!({
                 "session_id": session_id,
-                "agent": agent,
+                "agent": agent.as_str(),
                 "phase": session.phase.to_string(),
             }),
             Some(&json!({ "ok": true })),
@@ -528,4 +614,82 @@ pub(super) fn handle_collab_end(app: &App, args: &Value) -> Result<Value, Memory
     })?;
 
     Ok(json!({ "ok": true, "session_id": session_id }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::collab::queue::SessionRecord;
+    use crate::collab::CollabSession;
+
+    // ── execution_mode_from_task_list ─────────────────────────────────────────
+
+    #[test]
+    fn execution_mode_from_task_list_returns_none_when_absent() {
+        let raw = r#"{"plan_hash":"h","base_sha":"b","head_sha":"x","tasks":[]}"#;
+        assert_eq!(execution_mode_from_task_list(Some(raw)), None);
+    }
+
+    #[test]
+    fn execution_mode_from_task_list_returns_value_when_present() {
+        let raw = r#"{"plan_hash":"h","base_sha":"b","head_sha":"x","execution_mode":"mechanical_direct","tasks":[]}"#;
+        assert_eq!(
+            execution_mode_from_task_list(Some(raw)),
+            Some("mechanical_direct".to_string())
+        );
+    }
+
+    #[test]
+    fn execution_mode_from_task_list_returns_none_for_null_task_list() {
+        assert_eq!(execution_mode_from_task_list(None), None);
+    }
+
+    // ── session_record_json exposes execution_mode ────────────────────────────
+
+    fn make_record(task_list: Option<&str>) -> SessionRecord {
+        let mut session = CollabSession::new("test-session");
+        session.task_list = task_list.map(str::to_string);
+        SessionRecord {
+            session,
+            repo_path: "/tmp/repo".to_string(),
+            branch: "main".to_string(),
+            task: None,
+            ended_at: None,
+            created_at: "2026-01-01T00:00:00Z".to_string(),
+            updated_at: "2026-01-01T00:00:00Z".to_string(),
+        }
+    }
+
+    #[test]
+    fn collab_status_returns_execution_mode_when_set() {
+        let task_list_json = r#"{"plan_hash":"h","base_sha":"b","head_sha":"x","execution_mode":"mechanical_direct","tasks":[{"id":1,"title":"t","acceptance":["ok"]}]}"#;
+        let record = make_record(Some(task_list_json));
+        let status = session_record_json(&record);
+        assert_eq!(
+            status["execution_mode"].as_str(),
+            Some("mechanical_direct"),
+            "collab_status must surface execution_mode from canonicalized task_list"
+        );
+    }
+
+    #[test]
+    fn collab_status_returns_null_execution_mode_when_omitted() {
+        let task_list_json = r#"{"plan_hash":"h","base_sha":"b","head_sha":"x","tasks":[{"id":1,"title":"t","acceptance":["ok"]}]}"#;
+        let record = make_record(Some(task_list_json));
+        let status = session_record_json(&record);
+        assert!(
+            status["execution_mode"].is_null(),
+            "collab_status must return null execution_mode when field is absent from task_list"
+        );
+    }
+
+    #[test]
+    fn collab_status_returns_null_execution_mode_when_no_task_list() {
+        let record = make_record(None);
+        let status = session_record_json(&record);
+        assert!(
+            status["execution_mode"].is_null(),
+            "collab_status must return null execution_mode when task_list is not yet set"
+        );
+    }
 }

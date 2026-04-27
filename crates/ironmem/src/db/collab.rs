@@ -1,5 +1,5 @@
 use crate::collab::queue::{self, Capability, Message, SessionRecord};
-use crate::collab::CollabSession;
+use crate::collab::{Agent, CollabSession};
 use crate::db::schema::Database;
 use crate::error::MemoryError;
 
@@ -10,8 +10,9 @@ impl Database {
         repo_path: &str,
         branch: &str,
         task: Option<&str>,
+        implementer: Agent,
     ) -> Result<(), MemoryError> {
-        queue::create_session(&self.conn, id, repo_path, branch, task)
+        queue::create_session(&self.conn, id, repo_path, branch, task, implementer)
     }
 
     pub fn collab_end_session(&self, session_id: &str) -> Result<(), MemoryError> {
@@ -67,6 +68,14 @@ impl Database {
         message_id: &str,
     ) -> Result<(), MemoryError> {
         queue::ack_message(&self.conn, session_id, message_id)
+    }
+
+    pub fn collab_ack_messages_many(
+        &self,
+        session_id: &str,
+        message_ids: &[String],
+    ) -> Result<usize, MemoryError> {
+        queue::ack_messages_many(&self.conn, session_id, message_ids)
     }
 
     pub fn collab_register_caps(

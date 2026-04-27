@@ -201,14 +201,15 @@ pub fn tool_definitions(app: &App) -> Vec<Value> {
         }),
         json!({
             "name": "collab_start",
-            "description": "Create a bounded Claude↔Codex planning session. Optional `task` describes the planning goal and is returned in collab_status so the counterpart agent can fetch it without a manual paste.",
+            "description": "Create a bounded Claude↔Codex planning session. Optional `task` describes the planning goal and is returned in collab_status so the counterpart agent can fetch it without a manual paste. Optional `implementer` (default 'claude') selects which agent runs the v3 batch implementation phase; 'codex' routes CodeImplementPending to Codex so it drives its own subagent-driven-development end-to-end.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "repo_path": { "type": "string" },
                     "branch": { "type": "string" },
                     "initiator": { "type": "string", "enum": ["claude", "codex"] },
-                    "task": { "type": "string" }
+                    "task": { "type": "string" },
+                    "implementer": { "type": "string", "enum": ["claude", "codex"] }
                 },
                 "required": ["repo_path", "branch", "initiator"]
             }
@@ -231,7 +232,7 @@ pub fn tool_definitions(app: &App) -> Vec<Value> {
         }),
         json!({
             "name": "collab_send",
-            "description": "Send a collab message and advance the bounded state machine. v1 planning topics: draft, canonical, review, final. v3 coding topics: task_list, implement, review_fix, final, review_local, review_fix_global, final_review, failure_report. Topic final is phase-dispatched (v1 plan finalize vs v3 per-task final chosen by current phase).",
+            "description": "Send a collab message and advance the bounded state machine. v1 planning topics: draft, canonical, review, final. v3 coding topics: task_list, implementation_done, review_local, review_fix_global, final_review, failure_report.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -245,13 +246,14 @@ pub fn tool_definitions(app: &App) -> Vec<Value> {
         }),
         json!({
             "name": "collab_recv",
-            "description": "Read pending collab messages for one agent",
+            "description": "Read pending collab messages for one agent. When auto_ack is true, atomically marks all returned messages as acked in the same transaction, eliminating one round-trip compared to calling collab_ack separately for each message. Default false preserves the existing two-step recv+ack flow.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "session_id": { "type": "string" },
                     "receiver": { "type": "string", "enum": ["claude", "codex"] },
-                    "limit": { "type": "integer", "default": 10 }
+                    "limit": { "type": "integer", "default": 10 },
+                    "auto_ack": { "type": "boolean", "default": false }
                 },
                 "required": ["session_id", "receiver"]
             }

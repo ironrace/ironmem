@@ -11,6 +11,9 @@ const FTS_SQL: &str = include_str!("../../migrations/002_fts.sql");
 const COLLAB_SQL: &str = include_str!("../../migrations/003_collab.sql");
 const COLLAB_V1_SQL: &str = include_str!("../../migrations/004_collab_planning_v1.sql");
 const COLLAB_V2_SQL: &str = include_str!("../../migrations/005_collab_v2.sql");
+const COLLAB_IMPLEMENTER_SQL: &str = include_str!("../../migrations/006_collab_implementer.sql");
+const DROP_CURRENT_TASK_INDEX_SQL: &str =
+    include_str!("../../migrations/007_drop_current_task_index.sql");
 
 /// Database wrapper around a SQLite connection.
 ///
@@ -86,6 +89,20 @@ impl Database {
         // coding_failure.
         if current_version < 5 {
             retry_on_busy(|| self.conn.execute_batch(COLLAB_V2_SQL))?;
+        }
+
+        // v6: per-session `implementer` column (claude|codex) so
+        // `/collab start --implementer=codex` can route the
+        // `CodeImplementPending` phase to Codex.
+        if current_version < 6 {
+            retry_on_busy(|| self.conn.execute_batch(COLLAB_IMPLEMENTER_SQL))?;
+        }
+
+        // v7: drop the now-zombified `current_task_index` column added by
+        // migration 005. v3 batch mode replaced the per-task loop and the
+        // column has been written as NULL and never read since.
+        if current_version < 7 {
+            retry_on_busy(|| self.conn.execute_batch(DROP_CURRENT_TASK_INDEX_SQL))?;
         }
 
         Ok(())

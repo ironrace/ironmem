@@ -1,12 +1,13 @@
 //! `CollabSession` — single source of truth for collab session state.
 
+use super::agent::Agent;
 use super::phase::Phase;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CollabSession {
     pub id: String,
     pub phase: Phase,
-    pub current_owner: String,
+    pub current_owner: Agent,
     pub claude_draft_hash: Option<String>,
     pub codex_draft_hash: Option<String>,
     pub canonical_plan_hash: Option<String>,
@@ -16,24 +17,42 @@ pub struct CollabSession {
     // v3 coding fields. `tasks_count` is not stored — it is derived from
     // `task_list` via `tasks_count_from_list` so there is a single source of
     // truth for task cardinality. `task_review_round` and `global_review_round`
-    // are vestigial (v2 held per-task and global verdict cycles; v3 is linear
-    // and never increments them) but remain as columns to avoid a migration.
+    // are vestigial (v2 held per-task verdict cycles; v3 batch mode runs all
+    // tasks in a single Claude-driven phase) but remain as columns to avoid
+    // disturbing the wire format.
     pub task_list: Option<String>,
-    pub current_task_index: Option<u32>,
     pub task_review_round: u8,
     pub global_review_round: u8,
     pub base_sha: Option<String>,
     pub last_head_sha: Option<String>,
     pub pr_url: Option<String>,
     pub coding_failure: Option<String>,
+    /// Which agent runs the v3 batch implementation phase. `Agent::Claude`
+    /// (the default) keeps the historical flow where Claude orchestrates
+    /// per-task subagents inline. `Agent::Codex` routes
+    /// `CodeImplementPending` to Codex instead — Claude still publishes
+    /// `task_list`, but Codex drives its own `subagent-driven-development`
+    /// end-to-end and emits `implementation_done`. Set at `collab_start`
+    /// and immutable thereafter; the DB CHECK constraint enforces the
+    /// allowed set as defense-in-depth.
+    pub implementer: Agent,
 }
 
 impl CollabSession {
     pub fn new(id: impl Into<String>) -> Self {
+        Self::new_with_implementer(id, Agent::Claude)
+    }
+
+    /// Construct a fresh planning-stage session with an explicit
+    /// `implementer`. Used by tests and any caller that wants the
+    /// non-default `Agent::Codex` batch ownership; production code should
+    /// go through `collab_start` (which validates and persists the
+    /// implementer at INSERT time).
+    pub fn new_with_implementer(id: impl Into<String>, implementer: Agent) -> Self {
         Self {
             id: id.into(),
             phase: Phase::PlanParallelDrafts,
-            current_owner: "claude".to_string(),
+            current_owner: Agent::Claude,
             claude_draft_hash: None,
             codex_draft_hash: None,
             canonical_plan_hash: None,
@@ -41,13 +60,13 @@ impl CollabSession {
             codex_review_verdict: None,
             review_round: 0,
             task_list: None,
-            current_task_index: None,
             task_review_round: 0,
             global_review_round: 0,
             base_sha: None,
             last_head_sha: None,
             pr_url: None,
             coding_failure: None,
+            implementer,
         }
     }
 
@@ -56,6 +75,9 @@ impl CollabSession {
     /// orchestrators that already completed per-task coding via
     /// `subagent-driven-development`. The no-op `CodeReviewLocalPending`
     /// handshake is collapsed — `head_sha` is supplied here instead.
+    /// `implementer` is fixed at `Agent::Claude` because the shortcut
+    /// never enters `CodeImplementPending`; the field is preserved only so
+    /// the session record shape stays uniform with full-flow sessions.
     pub fn new_global_review(
         id: impl Into<String>,
         base_sha: impl Into<String>,
@@ -65,7 +87,7 @@ impl CollabSession {
         Self {
             id: id.into(),
             phase: Phase::CodeReviewFixGlobalPending,
-            current_owner: "codex".to_string(),
+            current_owner: Agent::Codex,
             claude_draft_hash: None,
             codex_draft_hash: None,
             canonical_plan_hash: None,
@@ -73,46 +95,23 @@ impl CollabSession {
             codex_review_verdict: None,
             review_round: 0,
             task_list: None,
-            current_task_index: None,
             task_review_round: 0,
             global_review_round: 0,
             base_sha: Some(base_sha.into()),
             last_head_sha: Some(head),
             pr_url: None,
             coding_failure: None,
+            implementer: Agent::Claude,
         }
     }
 
     /// Task cardinality derived from the stored `task_list` JSON. Canonical
     /// shape is `{"tasks":[…]}`; any other shape yields `None`. Returns `None`
-    /// when `task_list` is unset (pre-`SubmitTaskList`).
+    /// when `task_list` is unset (pre-`SubmitTaskList`). Used by the MCP
+    /// `collab_status` response for audit visibility — the v3 batch flow does
+    /// not iterate tasks server-side.
     pub fn tasks_count(&self) -> Option<u32> {
         tasks_count_from_list(self.task_list.as_deref())
-    }
-
-    /// Apply the per-task advance rule. Resets `task_review_round` and either
-    /// increments `current_task_index` or transitions into local review.
-    ///
-    /// `task_list` and `current_task_index` are invariants of every
-    /// coding-active phase; if either is missing the state machine has already
-    /// drifted and we panic rather than silently treat it as zero tasks.
-    pub(super) fn advance_task(&mut self) {
-        self.task_review_round = 0;
-        let total = self
-            .tasks_count()
-            .expect("task_list must be set and well-formed in coding-active phase");
-        let current = self
-            .current_task_index
-            .expect("current_task_index must be set in coding-active phase");
-        let next = current.saturating_add(1);
-        if next >= total {
-            self.phase = Phase::CodeReviewLocalPending;
-            self.current_owner = "claude".to_string();
-        } else {
-            self.current_task_index = Some(next);
-            self.phase = Phase::CodeImplementPending;
-            self.current_owner = "claude".to_string();
-        }
     }
 }
 

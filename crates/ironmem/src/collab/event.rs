@@ -21,23 +21,19 @@ pub enum CollabEvent {
         tasks_count: u32,
         head_sha: String,
     },
-    CodeImplement {
-        head_sha: String,
-    },
-    /// Codex per-task: reviewed Claude's implementation and applied fixes
-    /// directly (may be a no-op commit if clean). `head_sha` is the post-fix
-    /// HEAD that Claude pulls for the final phase.
-    CodeReviewFix {
-        head_sha: String,
-    },
-    CodeFinal {
+    /// Claude signals the batch of subagent-driven per-task implementations
+    /// is complete. `head_sha` is the post-batch HEAD Codex pulls for global
+    /// review. Single transition out of `CodeImplementPending`. Carries only
+    /// `head_sha` (anti-puppeteering — Codex reads the diff and the plan
+    /// markdown in the repo and forms its own judgment).
+    ImplementationDone {
         head_sha: String,
     },
     ReviewLocal {
         head_sha: String,
     },
     /// Codex global: reviewed the full task stack and applied fixes directly.
-    /// Mirrors `CodeReviewFix` at the global scope.
+    /// The single Codex coding turn in the v3 batch flow.
     CodeReviewFixGlobal {
         head_sha: String,
     },
@@ -65,9 +61,7 @@ impl CollabEvent {
             Self::SubmitReview { .. } => "SubmitReview",
             Self::PublishFinal { .. } => "PublishFinal",
             Self::SubmitTaskList { .. } => "SubmitTaskList",
-            Self::CodeImplement { .. } => "CodeImplement",
-            Self::CodeReviewFix { .. } => "CodeReviewFix",
-            Self::CodeFinal { .. } => "CodeFinal",
+            Self::ImplementationDone { .. } => "ImplementationDone",
             Self::ReviewLocal { .. } => "ReviewLocal",
             Self::CodeReviewFixGlobal { .. } => "CodeReviewFixGlobal",
             Self::FinalReview { .. } => "FinalReview",

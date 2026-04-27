@@ -966,15 +966,25 @@ fn collab_end_rejected_in_active_planning_phase() {
 /// return `(session_id, final_plan_text)` so callers can assemble valid
 /// `task_list` payloads (the state machine rejects a mismatched `plan_hash`).
 fn drive_to_plan_locked(app: &App, final_plan: &str) -> String {
-    let started = call_tool(
-        app,
-        "collab_start",
-        json!({
-            "repo_path": "/repo",
-            "branch": "main",
-            "initiator": "claude"
-        }),
-    );
+    drive_to_plan_locked_with_implementer(app, final_plan, None)
+}
+
+/// Same as `drive_to_plan_locked` but threads through the optional
+/// `implementer` field. `None` keeps the historical default (`"claude"`).
+fn drive_to_plan_locked_with_implementer(
+    app: &App,
+    final_plan: &str,
+    implementer: Option<&str>,
+) -> String {
+    let mut start_args = json!({
+        "repo_path": "/repo",
+        "branch": "main",
+        "initiator": "claude"
+    });
+    if let Some(value) = implementer {
+        start_args["implementer"] = json!(value);
+    }
+    let started = call_tool(app, "collab_start", start_args);
     let session_id = started["session_id"].as_str().unwrap().to_string();
 
     for (sender, content) in [("claude", "cdraft"), ("codex", "xdraft")] {
@@ -1048,24 +1058,19 @@ fn task_list_payload(plan_hash: &str, base_sha: &str, head_sha: &str, n: usize) 
     .to_string()
 }
 
-/// Run implement → review_fix → final, advancing one task (v3 linear).
-fn happy_task_cycle(app: &App, session_id: &str, head: &str) {
-    for (sender, topic) in [
-        ("claude", "implement"),
-        ("codex", "review_fix"),
-        ("claude", "final"),
-    ] {
-        call_tool(
-            app,
-            "collab_send",
-            json!({
-                "session_id": session_id,
-                "sender": sender,
-                "topic": topic,
-                "content": json!({ "head_sha": head }).to_string()
-            }),
-        );
-    }
+/// Send `implementation_done` from Claude, advancing the batch phase to
+/// local review (`CodeReviewLocalPending`).
+fn do_implementation_done(app: &App, session_id: &str, head: &str) {
+    call_tool(
+        app,
+        "collab_send",
+        json!({
+            "session_id": session_id,
+            "sender": "claude",
+            "topic": "implementation_done",
+            "content": json!({ "head_sha": head }).to_string()
+        }),
+    );
 }
 
 #[test]
@@ -1074,7 +1079,8 @@ fn collab_v2_happy_path_reaches_coding_complete() {
     let session_id = drive_to_plan_locked(&app, "final plan text");
     let hash = plan_hash(&app, &session_id);
 
-    // Submit a 2-task list.
+    // Submit a 2-task list — server stores the manifest for audit but
+    // does not iterate it; Claude orchestrates subagents on its side.
     call_tool(
         &app,
         "collab_send",
@@ -1088,17 +1094,13 @@ fn collab_v2_happy_path_reaches_coding_complete() {
     let status = call_tool(&app, "collab_status", json!({ "session_id": &session_id }));
     assert_eq!(status["phase"], "CodeImplementPending");
     assert_eq!(status["tasks_count"], 2);
-    assert_eq!(status["current_task_index"], 0);
     assert_eq!(status["base_sha"], "base0");
 
-    // Task 1 + Task 2 happy path.
-    happy_task_cycle(&app, &session_id, "h1");
-    let status = call_tool(&app, "collab_status", json!({ "session_id": &session_id }));
-    assert_eq!(status["phase"], "CodeImplementPending");
-    assert_eq!(status["current_task_index"], 1);
-    happy_task_cycle(&app, &session_id, "h2");
+    // Single batch send replaces the per-task loop.
+    do_implementation_done(&app, &session_id, "batch_head");
     let status = call_tool(&app, "collab_status", json!({ "session_id": &session_id }));
     assert_eq!(status["phase"], "CodeReviewLocalPending");
+    assert_eq!(status["last_head_sha"], "batch_head");
 
     // Local → global review_fix → final_review (v3 linear, terminal in 3 turns).
     call_tool(
@@ -1152,9 +1154,39 @@ fn collab_v2_happy_path_reaches_coding_complete() {
 }
 
 #[test]
-fn collab_v3_per_task_linear_flow_advances_phases() {
-    // v3: single task → implement (claude) → review_fix (codex) → final (claude)
-    // advances directly to CodeReviewLocalPending. No disagree/debate round.
+fn collab_v3_implementation_done_jumps_to_local_review() {
+    // v3 batch mode: a single `implementation_done` send transitions
+    // `CodeImplementPending` → `CodeReviewLocalPending` with Claude as owner.
+    // No per-task review/fix turns server-side.
+    let app = App::open_for_test().unwrap();
+    let session_id = drive_to_plan_locked(&app, "fp");
+    let hash = plan_hash(&app, &session_id);
+    call_tool(
+        &app,
+        "collab_send",
+        json!({
+            "session_id": session_id,
+            "sender": "claude",
+            "topic": "task_list",
+            "content": task_list_payload(&hash, "b0", "h0", 3)
+        }),
+    );
+    let status = call_tool(&app, "collab_status", json!({ "session_id": &session_id }));
+    assert_eq!(status["phase"], "CodeImplementPending");
+    assert_eq!(status["current_owner"], "claude");
+
+    do_implementation_done(&app, &session_id, "batch_head");
+    let status = call_tool(&app, "collab_status", json!({ "session_id": &session_id }));
+    assert_eq!(status["phase"], "CodeReviewLocalPending");
+    assert_eq!(status["current_owner"], "claude");
+    assert_eq!(status["last_head_sha"], "batch_head");
+}
+
+#[test]
+fn collab_v3_unknown_per_task_topics_rejected() {
+    // The old per-task topics (`implement`, `review_fix`) are no longer
+    // accepted. They must surface a clear "unknown collab topic" error
+    // rather than be silently dispatched.
     let app = App::open_for_test().unwrap();
     let session_id = drive_to_plan_locked(&app, "fp");
     let hash = plan_hash(&app, &session_id);
@@ -1169,12 +1201,8 @@ fn collab_v3_per_task_linear_flow_advances_phases() {
         }),
     );
 
-    for (sender, topic, expected_phase) in [
-        ("claude", "implement", "CodeReviewFixPending"),
-        ("codex", "review_fix", "CodeFinalPending"),
-        ("claude", "final", "CodeReviewLocalPending"),
-    ] {
-        call_tool(
+    for (sender, topic) in [("claude", "implement"), ("codex", "review_fix")] {
+        let err = call_tool_expect_error(
             &app,
             "collab_send",
             json!({
@@ -1184,9 +1212,89 @@ fn collab_v3_per_task_linear_flow_advances_phases() {
                 "content": json!({ "head_sha": "h1" }).to_string()
             }),
         );
-        let status = call_tool(&app, "collab_status", json!({ "session_id": &session_id }));
-        assert_eq!(status["phase"], expected_phase);
+        assert!(
+            err.contains("unknown collab topic"),
+            "expected unknown-topic error for {topic}, got: {err}"
+        );
     }
+}
+
+#[test]
+fn collab_start_accepts_implementer_codex_and_routes_owner() {
+    // `--implementer=codex` flips the owner of `CodeImplementPending` to
+    // Codex. Claude still publishes `task_list`; Codex is the only valid
+    // sender of `implementation_done`.
+    let app = App::open_for_test().unwrap();
+    let session_id = drive_to_plan_locked_with_implementer(&app, "fp", Some("codex"));
+
+    let status = call_tool(&app, "collab_status", json!({ "session_id": &session_id }));
+    assert_eq!(status["implementer"], "codex");
+
+    let hash = plan_hash(&app, &session_id);
+    call_tool(
+        &app,
+        "collab_send",
+        json!({
+            "session_id": session_id,
+            "sender": "claude",
+            "topic": "task_list",
+            "content": task_list_payload(&hash, "b0", "h0", 2)
+        }),
+    );
+    let status = call_tool(&app, "collab_status", json!({ "session_id": &session_id }));
+    assert_eq!(status["phase"], "CodeImplementPending");
+    assert_eq!(status["current_owner"], "codex");
+
+    // Claude trying to fire `implementation_done` is rejected.
+    let err = call_tool_expect_error(
+        &app,
+        "collab_send",
+        json!({
+            "session_id": session_id,
+            "sender": "claude",
+            "topic": "implementation_done",
+            "content": json!({ "head_sha": "batch_head" }).to_string()
+        }),
+    );
+    assert!(
+        err.to_lowercase().contains("not your turn") || err.contains("expects sender"),
+        "expected turn-ownership error, got: {err}"
+    );
+
+    // Codex fires it and the phase advances to local review (Claude-owned).
+    call_tool(
+        &app,
+        "collab_send",
+        json!({
+            "session_id": session_id,
+            "sender": "codex",
+            "topic": "implementation_done",
+            "content": json!({ "head_sha": "batch_head" }).to_string()
+        }),
+    );
+    let status = call_tool(&app, "collab_status", json!({ "session_id": &session_id }));
+    assert_eq!(status["phase"], "CodeReviewLocalPending");
+    assert_eq!(status["current_owner"], "claude");
+}
+
+#[test]
+fn collab_start_rejects_invalid_implementer() {
+    let app = App::open_for_test().unwrap();
+    let err = call_tool_expect_error(
+        &app,
+        "collab_start",
+        json!({
+            "repo_path": "/repo",
+            "branch": "main",
+            "initiator": "claude",
+            "implementer": "gemini"
+        }),
+    );
+    assert!(
+        err.to_lowercase().contains("agent")
+            || err.to_lowercase().contains("must be 'claude' or 'codex'"),
+        "expected agent-validation error, got: {err}"
+    );
 }
 
 #[test]
@@ -1215,18 +1323,18 @@ fn collab_v2_end_rejected_in_coding_active_phase() {
         .unwrap_or("")
         .contains("active phase CodeImplementPending"));
 
-    // Session still active — send should work.
+    // Session still active — `implementation_done` should advance it.
     let ok = call_tool(
         &app,
         "collab_send",
         json!({
             "session_id": session_id,
             "sender": "claude",
-            "topic": "implement",
+            "topic": "implementation_done",
             "content": json!({ "head_sha": "h1" }).to_string()
         }),
     );
-    assert_eq!(ok["phase"], "CodeReviewFixPending");
+    assert_eq!(ok["phase"], "CodeReviewLocalPending");
 }
 
 #[test]
@@ -1577,4 +1685,203 @@ fn collab_v2_task_list_rejects_empty_acceptance() {
         .as_str()
         .unwrap_or("")
         .contains("acceptance criterion"));
+}
+
+// ── collab_recv auto_ack tests ────────────────────────────────────────────────
+
+/// Helper: start a fresh session and send `count` messages from claude to
+/// codex, returning (session_id, vec_of_message_ids).
+fn setup_session_with_messages(app: &App, count: usize) -> (String, Vec<String>) {
+    let started = call_tool(
+        app,
+        "collab_start",
+        json!({ "repo_path": "/repo", "branch": "main", "initiator": "claude" }),
+    );
+    let session_id = started["session_id"].as_str().unwrap().to_string();
+
+    // Submit claude's draft so the session has pending messages for codex.
+    let mut ids = Vec::new();
+    // We send the first message via collab_send (which also advances state);
+    // then send bare messages directly via the low-level `collab_send` topic
+    // "draft" for the first one.  For a simpler setup we drive through
+    // PlanParallelDrafts and then do extra sends.
+    //
+    // Simpler approach: just send drafts from both sides so the parallel-draft
+    // phase finishes and messages are visible, then query pending messages via
+    // collab_recv. But we want deterministic IDs. Instead we'll use the fact
+    // that after both drafts are submitted the session moves to
+    // PlanSynthesisPending where codex has a pending draft message. We can
+    // also query the recv output to capture the IDs.
+    //
+    // For simplicity: submit both drafts, then read back the IDs from the
+    // first recv (without auto_ack) so we have them for assertions.
+    assert!(count >= 1, "need at least one message for setup");
+
+    call_tool(
+        app,
+        "collab_send",
+        json!({ "session_id": session_id, "sender": "claude", "topic": "draft", "content": "cdraft" }),
+    );
+    // After claude's draft the phase is still PlanParallelDrafts; codex has
+    // no pending messages yet (parallel drafts are blind until codex submits).
+    // Submit codex's draft to unblock visibility.
+    call_tool(
+        app,
+        "collab_send",
+        json!({ "session_id": session_id, "sender": "codex", "topic": "draft", "content": "xdraft" }),
+    );
+    // Now codex can see claude's draft. Collect it.
+    let recv = call_tool(
+        app,
+        "collab_recv",
+        json!({ "session_id": session_id, "receiver": "codex", "limit": 50 }),
+    );
+    for msg in recv["messages"].as_array().unwrap() {
+        ids.push(msg["id"].as_str().unwrap().to_string());
+    }
+    (session_id, ids)
+}
+
+#[test]
+fn recv_auto_ack_true_marks_messages_acked() {
+    let app = App::open_for_test().unwrap();
+    let (session_id, first_ids) = setup_session_with_messages(&app, 1);
+    assert!(
+        !first_ids.is_empty(),
+        "setup must produce at least one message"
+    );
+
+    // First recv without auto_ack to confirm message is visible.
+    let recv1 = call_tool(
+        &app,
+        "collab_recv",
+        json!({ "session_id": session_id, "receiver": "codex", "limit": 50 }),
+    );
+    assert!(
+        !recv1["messages"].as_array().unwrap().is_empty(),
+        "message must be visible before auto_ack"
+    );
+
+    // Recv with auto_ack=true — this atomically marks the messages as acked.
+    let recv2 = call_tool(
+        &app,
+        "collab_recv",
+        json!({ "session_id": session_id, "receiver": "codex", "limit": 50, "auto_ack": true }),
+    );
+    assert!(
+        !recv2["messages"].as_array().unwrap().is_empty(),
+        "auto_ack recv must still return the messages"
+    );
+
+    // Subsequent recv must return nothing — all messages are now acked.
+    let recv3 = call_tool(
+        &app,
+        "collab_recv",
+        json!({ "session_id": session_id, "receiver": "codex", "limit": 50 }),
+    );
+    assert!(
+        recv3["messages"].as_array().unwrap().is_empty(),
+        "no pending messages should remain after auto_ack recv"
+    );
+}
+
+#[test]
+fn recv_auto_ack_false_default_does_not_ack() {
+    let app = App::open_for_test().unwrap();
+    let (session_id, _) = setup_session_with_messages(&app, 1);
+
+    // Recv without auto_ack (default false).
+    let recv1 = call_tool(
+        &app,
+        "collab_recv",
+        json!({ "session_id": session_id, "receiver": "codex", "limit": 50 }),
+    );
+    let count1 = recv1["messages"].as_array().unwrap().len();
+    assert!(count1 > 0, "must have pending messages");
+
+    // Second recv without auto_ack must return the same messages (still pending).
+    let recv2 = call_tool(
+        &app,
+        "collab_recv",
+        json!({ "session_id": session_id, "receiver": "codex", "limit": 50 }),
+    );
+    assert_eq!(
+        recv2["messages"].as_array().unwrap().len(),
+        count1,
+        "messages must still be pending after non-auto_ack recv"
+    );
+}
+
+#[test]
+fn recv_auto_ack_with_limit_only_acks_returned_messages() {
+    // Send 5 draft messages for codex by driving through multiple canonical
+    // sends. For this test we just need multiple unacked messages visible to
+    // codex after both parallel drafts are submitted. We'll accumulate
+    // messages by acking selectively.
+    //
+    // Simpler: after both drafts are submitted, codex has 1 message (claude's
+    // draft). We drive forward to get more: claude sends canonical → codex
+    // reviews → claude sends final → codex has more messages queued.
+    let app = App::open_for_test().unwrap();
+    let started = call_tool(
+        &app,
+        "collab_start",
+        json!({ "repo_path": "/repo", "branch": "main", "initiator": "claude" }),
+    );
+    let session_id = started["session_id"].as_str().unwrap().to_string();
+
+    // Both drafts → PlanSynthesisPending; now codex has 1 pending message.
+    call_tool(
+        &app,
+        "collab_send",
+        json!({ "session_id": session_id, "sender": "claude", "topic": "draft", "content": "cdraft" }),
+    );
+    call_tool(
+        &app,
+        "collab_send",
+        json!({ "session_id": session_id, "sender": "codex", "topic": "draft", "content": "xdraft" }),
+    );
+
+    // Claude sends canonical → codex now has 2 pending messages (draft + canonical).
+    call_tool(
+        &app,
+        "collab_send",
+        json!({ "session_id": session_id, "sender": "claude", "topic": "canonical", "content": "canonical plan" }),
+    );
+
+    // Verify 2 pending messages for codex.
+    let all_recv = call_tool(
+        &app,
+        "collab_recv",
+        json!({ "session_id": session_id, "receiver": "codex", "limit": 50 }),
+    );
+    let total = all_recv["messages"].as_array().unwrap().len();
+    assert!(
+        total >= 2,
+        "need at least 2 messages for this test, got {total}"
+    );
+
+    // Recv with limit=1 and auto_ack=true: only 1 message returned and acked.
+    let limited_recv = call_tool(
+        &app,
+        "collab_recv",
+        json!({ "session_id": session_id, "receiver": "codex", "limit": 1, "auto_ack": true }),
+    );
+    assert_eq!(
+        limited_recv["messages"].as_array().unwrap().len(),
+        1,
+        "limited recv must return exactly 1 message"
+    );
+
+    // The remaining messages (total - 1) must still be pending.
+    let remaining_recv = call_tool(
+        &app,
+        "collab_recv",
+        json!({ "session_id": session_id, "receiver": "codex", "limit": 50 }),
+    );
+    assert_eq!(
+        remaining_recv["messages"].as_array().unwrap().len(),
+        total - 1,
+        "only the returned message should have been acked; others must remain pending"
+    );
 }

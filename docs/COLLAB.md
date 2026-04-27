@@ -6,11 +6,14 @@ MCP server.
 
 - **v1 (planning)**: bounded parallel drafts → canonical synthesis → Codex
   review → Claude finalize → `PlanLocked`. Two review rounds.
-- **v3 (coding)**: post-`PlanLocked` task list → per-task 3-phase linear
-  flow (Claude implement → Codex review+fix → Claude final) → local
-  review → global 3-phase linear flow (Claude local → Codex review+fix →
-  Claude final with PR URL) → `CodingComplete` / `CodingFailed`. No
-  debate rounds at the coding stage — Codex writes code directly.
+- **v3 (coding)**: post-`PlanLocked` task list → **batch implementation
+  phase** (Claude orchestrates per-task subagents on its side via
+  `superpowers:writing-plans` → `superpowers:subagent-driven-development`,
+  then signals completion with `implementation_done`) → global 3-phase
+  linear flow (Claude local → Codex review+fix → Claude final with PR URL)
+  → `CodingComplete` / `CodingFailed`. Codex only participates at the
+  global review stage; per-task implementation is single-agent on
+  Claude's side.
 
 This document covers:
 
@@ -64,6 +67,7 @@ Stored in `collab_sessions`:
 | `id` | Session identifier (returned from `collab_start`) |
 | `repo_path`, `branch` | Where this plan applies |
 | `task` | Human description of the planning goal. Set at `start`, readable via `status`. |
+| `implementer` | Which agent runs the v3 batch implementation phase (`claude` or `codex`). Set at `start`, immutable. Default `claude`. |
 | `phase` | Current protocol phase (see below) |
 | `current_owner` | Agent whose turn it is (`claude` or `codex`) |
 | `claude_draft_hash`, `codex_draft_hash` | SHA-256 of each first draft |
@@ -141,28 +145,56 @@ phase names the exact event that advances it.
 v3 is deliberately linear: every turn deterministically advances to the
 next phase. There are no debate rounds, no verdicts, no round counters
 at the coding stage. This structurally prevents the orchestrator from
-steering the reviewer's conclusion — Codex writes code directly rather
-than handing a review-with-verdict back to Claude for re-interpretation.
+steering the reviewer's conclusion — Codex's only coding turn is at the
+global review stage and is expressed as commits, not prose.
 
-### Per-task 3-phase linear flow
+### Batch implementation
 
-Applied once per task in `task_list`. Each turn advances deterministically;
-the task advances after Claude's final turn.
+After `task_list` lands, the session sits in a single phase for the
+entire implementation run. Which agent owns that phase depends on the
+session's `implementer` field, set at `collab_start` time and
+immutable thereafter:
+
+- **`implementer == "claude"`** (default): Claude orchestrates per-task
+  work through `superpowers:writing-plans` (markdown plan) and then
+  `superpowers:subagent-driven-development` (fresh subagent per task,
+  TDD, per-task commits). Claude emits `implementation_done`.
+- **`implementer == "codex"`** (opt-in via
+  `/collab start --implementer=codex`): Claude still produces the
+  writing-plans markdown and publishes `task_list` (writing-plans
+  approval is still the user gate). Then Claude hands off to Codex via
+  `mcp__codex__codex`; Codex runs its own
+  `subagent-driven-development` (controller-owned loop, runs to
+  completion) and emits `implementation_done` itself before returning.
+
+In both modes the server stores the `task_list` manifest as an audit
+artifact but does not iterate it; per-task progress is observable
+through the git log on the branch. After `implementation_done`, the
+phase advances to `CodeReviewLocalPending` with **Claude** as owner
+regardless of who implemented — Claude always provides the local-review
+second opinion. In Codex-implementer mode this is what makes the second
+opinion *independent*: Claude reviews Codex's batch output.
 
 | Phase | Owner | Event | Next |
 |---|---|---|---|
-| `CodeImplementPending` | `claude` | `CodeImplement{head_sha}` | `CodeReviewFixPending` |
-| `CodeReviewFixPending` | `codex` | `CodeReviewFix{head_sha}` — Codex reviewed and (if needed) pushed fixes directly; payload is just the post-fix HEAD | `CodeFinalPending` |
-| `CodeFinalPending` | `claude` | `CodeFinal{head_sha}` — Claude's last word on this task; advances the task | varies |
+| `CodeImplementPending` | `claude` or `codex` (per session `implementer`) | `ImplementationDone{head_sha}` from the implementer agent — fired once after the full subagent batch completes (gates green, all commits pushed) | `CodeReviewLocalPending` (Claude-owned) |
 
-**Advance**: if another task remains, `current_task_index += 1` and phase
-returns to `CodeImplementPending`; else phase transitions to
-`CodeReviewLocalPending`.
+The `implementation_done` payload carries **only** `head_sha`. There is
+no `notes`, `summary`, `subagent_report`, or any other field — the
+non-implementer agent reads the diff and the writing-plans markdown in
+the repo (via `plan_file_path`) at the global review stage and forms
+its own judgment.
+
+**Both modes apply the same `finishing-a-development-branch` carve-out**:
+the implementer agent stops `subagent-driven-development` at the last
+task's approval+commit and does *not* let the skill auto-invoke
+`superpowers:finishing-a-development-branch`. PR creation belongs to
+the collab `final_review` turn, not to the subagent skill.
 
 ### Global review, 3-phase linear
 
-Mirrors the per-task flow at branch scope. Claude opens the PR on the
-final turn.
+After `implementation_done`, the session enters a 3-turn linear review at
+branch scope. Claude opens the PR on the final turn.
 
 | Phase | Owner | Event | Next |
 |---|---|---|---|
@@ -172,8 +204,9 @@ final turn.
 
 ### Shortcut: post-subagent coding review
 
-When an orchestrator already completed the branch's per-task work outside
-Collab, it can skip v1 planning and the v3 per-task phases by calling
+When an orchestrator already completed the branch's implementation outside
+Collab (including the local `/ultrareview-local` pass), it can skip v1
+planning and the v3 batch implementation phase by calling
 `collab_start_code_review`. The session starts directly at
 `CodeReviewFixGlobalPending` with `current_owner = codex`.
 
@@ -205,7 +238,8 @@ Invariants that still apply:
 | *any coding-active phase* | either | `FailureReport{coding_failure}` | `CodingFailed` (terminal) |
 
 `collab_end` is **rejected** in every coding-active phase
-(`CodeImplementPending` through `CodeReviewFinalPending`). Only
+(`CodeImplementPending`, `CodeReviewLocalPending`,
+`CodeReviewFixGlobalPending`, `CodeReviewFinalPending`). Only
 `CodingComplete` or `CodingFailed` end the session post-`task_list`.
 
 ## Blind-Draft Invariant
@@ -228,13 +262,18 @@ Creates a new session.
   "repo_path": "/path/to/repo",
   "branch": "feat/landing-page",
   "initiator": "claude",
-  "task": "design the marketing landing page"
+  "task": "design the marketing landing page",
+  "implementer": "claude"
 }
 ```
 
-Returns `{ session_id, task }`. The `task` is stored on the session so the
-counterpart agent can read it via `collab_status` without a manual
-paste.
+Returns `{ session_id, task, implementer }`. The `task` is stored on the
+session so the counterpart agent can read it via `collab_status` without
+a manual paste. `implementer` is optional, defaults to `"claude"`, and
+must be one of `{"claude","codex"}` — it routes the v3
+`CodeImplementPending` phase to the named agent. The DB CHECK constraint
+on the `implementer` column enforces the same set, so direct writes
+cannot bypass validation.
 
 ### `collab_start_code_review`
 
@@ -266,8 +305,8 @@ Sends a protocol message and advances the state machine.
 
 v1 planning topics: `draft`, `canonical`, `review`, `final`.
 
-v3 coding topics: `task_list`, `implement`, `review_fix`, `final`,
-`review_local`, `review_fix_global`, `final_review`, `failure_report`.
+v3 coding topics: `task_list`, `implementation_done`, `review_local`,
+`review_fix_global`, `final_review`, `failure_report`.
 
 The phase→topic acceptance matrix is tabulated in
 [§ Phase → Topic Acceptance](#phase--topic-acceptance); consult that table
@@ -276,6 +315,19 @@ before every `collab_send`.
 ### `collab_recv`
 
 Returns pending messages. Enforces the blind-draft invariant.
+
+**Parameters:**
+
+| Parameter | Type | Default | Description |
+|---|---|---|---|
+| `session_id` | string | required | Session to receive from |
+| `receiver` | string | required | `"claude"` or `"codex"` |
+| `limit` | integer | 10 (max 50) | Maximum messages to return |
+| `auto_ack` | boolean | `false` | When `true`, atomically marks all returned messages as acked in the same DB transaction as the read. Eliminates a separate `collab_ack` round-trip per turn. Backwards-compatible — existing callers that omit the field continue to use the two-step recv + ack flow. |
+
+Using `auto_ack=true` is recommended in the dispatch loop for any caller that
+always acks all received messages immediately. The explicit `collab_ack` call
+is still available when callers need selective acknowledgement.
 
 ### `collab_ack`
 
@@ -373,28 +425,62 @@ or empty required fields reject with a validation error. `head_sha` appears
 on every coding message so the server can record branch progress and either
 agent can detect drift.
 
-The per-task `implement`, `review_fix`, and `final` payloads carry **only**
-`head_sha`. There is no `verdict`, `notes`, or `comment` field — Codex's
-review judgment is expressed as commits, not prose. This is the v3 rule
-that removes the channel Claude used to puppeteer the review.
+The `implementation_done` payload carries **only** `head_sha`. There is no
+`verdict`, `notes`, `comment`, or `subagent_report` field — Codex reads
+the diff and the writing-plans markdown in the repo at the global review
+stage and forms its own judgment. This is the rule that prevents the
+orchestrator from steering the reviewer's conclusion.
 
 | Topic | Sender | Payload | Notes |
 |---|---|---|---|
-| `task_list` | `claude` | `{"plan_hash","base_sha","head_sha","tasks":[{"id","title","acceptance":[...]}]}` | `plan_hash` must equal `final_plan_hash`; `tasks` must be non-empty and strictly ordered by `id`; each task requires ≥1 `acceptance` entry. |
-| `implement` | `claude` | `{"head_sha"}` | Harness has pushed the commit before sending. Payload carries only `head_sha` — no notes, no guidance for Codex. |
-| `review_fix` | `codex` | `{"head_sha"}` | In `CodeReviewFixPending` only. Codex has already pushed fixes (or a no-op commit if clean). |
-| `final` (v3) | `claude` | `{"head_sha"}` | In `CodeFinalPending` only. Advances the task. |
+| `task_list` | `claude` | `{"plan_hash","base_sha","head_sha","plan_file_path"?,"execution_mode"?,"tasks":[{"id","title","acceptance":[...]}]}` | `plan_hash` must equal `final_plan_hash`; `tasks` must be non-empty and strictly ordered by `id`; each task requires ≥1 `acceptance` entry. Optional `plan_file_path` (repo-relative; no leading `/`; no `..` segments) points at the writing-plans markdown driving subagent execution. Optional `execution_mode` — see below. |
+| `implementation_done` | `claude` | `{"head_sha"}` | In `CodeImplementPending` only. Fired once after the subagent batch completes and gates pass. Carries only `head_sha` — no prose, no subagent notes. |
 | `review_local` | `claude` | `{"head_sha"}` | Post-ultrareview, before handing to Codex for the global pass. |
 | `review_fix_global` | `codex` | `{"head_sha"}` | In `CodeReviewFixGlobalPending` only. Codex has pushed any branch-level fixes. |
 | `final_review` | `claude` | `{"head_sha","pr_url"}` | In `CodeReviewFinalPending` only. Claude has opened the PR; the event carries the URL and advances directly to `CodingComplete`. `pr_url` must start with `https://` and be ≤2048 chars. |
 | `failure_report` | either | `{"coding_failure":"<reason>"}` | Valid in any coding-active phase. |
 
+### `task_list` — `execution_mode` field
+
+The optional `execution_mode` string field on the `task_list` payload selects
+the implementation strategy for the batch phase. It is validated at send time
+and exposed as a top-level `execution_mode` field in `collab_status` so both
+agents can read it without re-parsing the canonicalized `task_list` JSON.
+
+| Value | Behaviour |
+|---|---|
+| *(omitted)* | Default: subagent-driven. The implementer agent invokes `subagent-driven-development` (one subagent per task). |
+| `"mechanical_direct"` | Single-task verbatim plan. The implementer applies the plan's bash/code blocks directly without spawning `subagent-driven-development`. |
+
+**Validation rules (server-enforced):**
+
+- Unknown values are rejected immediately with a clear error message listing
+  the allowed set. A typo therefore fails at submit time rather than silently
+  falling through to the default.
+- `"subagent_driven"` is intentionally NOT an allowed value — callers omit
+  the field entirely to select the default path. Sending it explicitly is a
+  validation error.
+- The field is preserved verbatim in the canonicalized `task_list` JSON
+  stored on the session, so it survives the round-trip back through
+  `collab_status.execution_mode`.
+
+**Eligibility criteria for `"mechanical_direct"` (Claude-side detection).** Set
+this mode when ALL four conditions hold:
+
+1. The writing-plans markdown produced exactly one task (`### Task 1` only).
+2. The task's `Files:` block lists one or zero files to create or modify.
+3. The task's steps include at least one verbatim ` ```bash ` or language code
+   block meant to be applied as-is (not pseudocode or illustrative snippets).
+4. No step contains language like "decide", "choose between", or other
+   design-judgment cues.
+
+When conditions are not met, omit the field — the server treats absence as the
+default subagent-driven path.
+
 ### Phase → Topic Acceptance
 
-The server dispatches strictly on the current phase. The topic string
-`final` is overloaded — in `PlanClaudeFinalizePending` it means Claude's
-v1 plan finalization; in `CodeFinalPending` it means Claude's per-task
-final turn. All other topics map 1:1.
+The server dispatches strictly on the current phase. Each topic maps to
+exactly one event variant — there is no phase overloading.
 
 | Phase | Accepted topic(s) | Notes |
 |---|---|---|
@@ -403,9 +489,7 @@ final turn. All other topics map 1:1.
 | `PlanCodexReviewPending` | `review` | v1 — Codex review of canonical |
 | `PlanClaudeFinalizePending` | `final` | v1 — Claude finalizes |
 | `PlanLocked` | `task_list` | v1 → v3 hand-off |
-| `CodeImplementPending` | `implement`, `failure_report` | |
-| `CodeReviewFixPending` | `review_fix`, `failure_report` | |
-| `CodeFinalPending` | `final`, `failure_report` | **v3** per-task final, not v1 |
+| `CodeImplementPending` | `implementation_done`, `failure_report` | v3 — single Claude turn after subagent batch |
 | `CodeReviewLocalPending` | `review_local`, `failure_report` | |
 | `CodeReviewFixGlobalPending` | `review_fix_global`, `failure_report` | |
 | `CodeReviewFinalPending` | `final_review`, `failure_report` | |
@@ -428,14 +512,30 @@ between `wait_my_turn` and `collab_send`:
   the harness reads `last_head_sha` from `collab_status` and runs
   `git cat-file -e <sha>^{commit}` to verify the commit is present; if not,
   it sends `failure_report` with `coding_failure: "branch_drift: ..."`.
-- **Local gates** before every Claude-owned coding turn (`implement`,
-  `final`, `review_local`, `final_review`): `cargo fmt --check`,
-  `cargo clippy -D warnings`, `cargo test --workspace`. Any failure
-  surfaces as `failure_report`; don't hide it.
-- **Review + fix tooling** during Codex's `review_fix` and
-  `review_fix_global`: `coderabbit` / `/ultrareview-local` / manual
-  review, followed by direct code edits + commit + push. Codex's
-  judgment is expressed as commits, not prose.
+- **Pre-send harness fast-path.** Before running `git fetch`, `git checkout`,
+  and `git reset --hard` to sync the working tree to `last_head_sha`, the
+  harness first checks: is `git rev-parse HEAD` already equal to
+  `last_head_sha` AND is the current branch already the session branch? When
+  both hold, steps 3 (`git fetch`) and 5 (`git checkout` + `git reset
+  --hard`) are skipped entirely. The `git cat-file -e` sanity check (step 4)
+  still runs because the commit is already local. This avoids a network
+  round-trip and a working-tree reset on the common case where the agent is
+  already at the right SHA — for example, entering the batch-impl turn
+  immediately after `task_list` is sent.
+- **Subagent orchestration** during `CodeImplementPending`. Claude invokes
+  `superpowers:writing-plans` to expand the locked plan into a markdown
+  task document, then `superpowers:subagent-driven-development` to
+  dispatch fresh subagents per task. Each subagent runs TDD and commits
+  on the branch. Per-subagent failures pause for triage; an unrecoverable
+  failure surfaces as `failure_report` with `coding_failure: "subagent_failure: ..."`.
+- **Local gates** before every Claude-owned coding turn
+  (`implementation_done`, `review_local`, `final_review`):
+  `cargo fmt --check`, `cargo clippy -D warnings`, `cargo test --workspace`.
+  Any failure surfaces as `failure_report`; don't hide it.
+- **Review + fix tooling** during Codex's `review_fix_global`:
+  `coderabbit` / `/ultrareview-local` / manual review, followed by direct
+  code edits + commit + push. Codex's judgment is expressed as commits,
+  not prose.
 - **Shortcut ancestry validation** during shortcut-started
   `review_fix_global`: the server shells out narrowly to `git
   merge-base --is-ancestor` to distinguish a true descendant check from
@@ -444,8 +544,17 @@ between `wait_my_turn` and `collab_send`:
 - **PR creation** during `final_review`: Claude runs `gh pr create
   --base <base_sha> ...` and sends the URL inline with the `final_review`
   event. There is no separate `pr_opened` turn.
+- **Codex must not create or check for PRs.** Codex never calls `gh pr
+  create`, `gh pr list`, `git ls-remote refs/pull/*`, or any other
+  PR-related GitHub API operation during any of its phases. PR creation
+  belongs exclusively to Claude's `final_review` turn. This boundary is
+  explicit: removing the PR check from Codex's batch turn also removes
+  Codex's dependency on `api.github.com` reachability, which was observed
+  as a fragility in practice.
 - **Plan Mode** on Claude's side is entered before `canonical`, `final`
-  (v1), `task_list` (v3 bridge), and `final_review` (v3 PR creation).
+  (v1), and `final_review` (v3 PR creation). The `task_list` send is
+  gated by writing-plans's own approval handoff (the user reviews the
+  generated markdown and approves) rather than the harness's Plan Mode.
   Codex never enters Plan Mode.
 
 The server does not read the git tree for the full v2 flow, and it still
@@ -486,10 +595,8 @@ Phase → action (v3):
 
 | Phase | Claude does | Codex does |
 |---|---|---|
-| `PlanLocked` (post-final) | verify `base_sha`, build `task_list` JSON, send | wait |
-| `CodeImplementPending` | run gates, commit, push, send `implement` | wait |
-| `CodeReviewFixPending` | wait | review the diff, fix any issues in place (commit+push), send `review_fix` |
-| `CodeFinalPending` | reset to Codex's HEAD, optionally tweak, re-run gates, send `final` | wait |
+| `PlanLocked` (post-final) | run `superpowers:writing-plans` on the locked plan; user approves the generated markdown; build `task_list` JSON (with `plan_file_path`), send | wait |
+| `CodeImplementPending` | run `superpowers:subagent-driven-development` to dispatch per-task subagents; on full success run gates and send `implementation_done{head_sha}` | wait |
 | `CodeReviewLocalPending` | run `/ultrareview-local`, fix HIGH/CRITICAL in place, send `review_local` | wait |
 | `CodeReviewFixGlobalPending` | wait | review full diff, fix branch-level issues in place, send `review_fix_global` |
 | `CodeReviewFinalPending` | gates, enter Plan Mode for PR title/body, `gh pr create`, send `final_review{pr_url}` | wait |
@@ -497,13 +604,16 @@ Phase → action (v3):
 
 ### Claude's Plan Mode Integration
 
-Claude enters Plan Mode **only** before sending `final`. Everything
-before that — the initial draft, the canonical synthesis, and any
-revision rounds — runs autonomously without interrupting the user.
+Claude enters harness Plan Mode **only** before sending v1 `final` and v3
+`final_review`. Everything before that — the initial draft, the canonical
+synthesis, any revision rounds, and the v3 `task_list` send — runs
+autonomously, with the user gating only at writing-plans's own approval
+handoff during the v3 bridge.
 
-The user is gated once, at the finalize step, because that's the commit
-point: after `final` lands the session is `PlanLocked`. Codex does not
-use Plan Mode — it posts drafts and reviews directly.
+The user is gated at v1 `final` because that's the planning commit point
+(post-send the session is `PlanLocked`), and at v3 `final_review` because
+that's where the PR is opened. Codex does not use Plan Mode — it posts
+drafts, reviews, and global fixes directly.
 
 ## Prompt Templates
 
@@ -654,6 +764,46 @@ This keeps the control loop inside Claude Code — no external daemon, no
 FIFO, no turn-change webhook. If the `codex` MCP server isn't registered,
 the prompt falls back to asking the user to run `/collab join` manually.
 
+## Implementation Notes
+
+### Background `codex exec` dispatch (CodeImplementPending + implementer=codex)
+
+For the single phase `CodeImplementPending` when `implementer == "codex"`,
+the Claude dispatcher invokes Codex via `codex exec --reasoning-effort low`
+as a background Bash process (`run_in_background: true`) rather than via the
+synchronous `mcp__codex__codex` MCP tool. The full procedure (prompt file
+construction, polling loop, termination conditions, and failure handling) is
+documented in the Claude-side dispatcher prompt
+(`.claude-plugin/commands/collab.md`, section "Codex batch handoff —
+background `codex exec`").
+
+**Why this phase only.** `CodeImplementPending` is the longest Codex-owned
+phase. Backgrounding it lets Claude surface real-time progress output and
+detect hangs early, whereas a synchronous MCP call blocks with no visibility.
+All other Codex-owned phases — `PlanParallelDrafts`, `PlanCodexReviewPending`,
+and `CodeReviewFixGlobalPending` — continue using `mcp__codex__codex`
+synchronously, unchanged.
+
+**Fallback.** When `codex` is not on PATH, the dispatcher falls back to
+`mcp__codex__codex` synchronously for this phase (with
+`model_reasoning_effort: "low"` in the config overrides).
+
+### Timing instrumentation (eval mode)
+
+When running with timing instrumentation enabled, Claude writes one event per
+line to `/tmp/collab-eval-${session_id}.log` at key transition points in the
+dispatcher. Events are formatted as:
+
+```
+<unix_seconds>.<nanos> <event_name> [extra]
+```
+
+Named events span `t0_session_started` (after `collab_start` returns) through
+`t10_session_complete` (when `CodingComplete` or `CodingFailed` is first
+observed). This instrumentation is opt-in and never blocks the protocol —
+write failures are swallowed silently. Full event list and post-run analysis
+commands are documented in the Claude-side dispatcher prompt.
+
 ## Validation
 
 ```bash
@@ -681,8 +831,8 @@ Scope (v1 + v3):
 - bounded planning (v1) and bounded coding loop (v3) through a single session
 - one plan → one task list → one PR per session
 - v1 planning is 2 review rounds; v3 coding is strictly linear (no rounds)
-- Claude always gets the last word in planning (v1) and at each per-task
-  + global final (v3)
+- Claude always gets the last word in planning (v1) and at the global
+  review stage (v3)
 - long-poll via `wait_my_turn`; agents run autonomously
 
 Out of scope:

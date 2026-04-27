@@ -1,6 +1,7 @@
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
+use crate::collab::Agent;
 use crate::error::MemoryError;
 
 /// Maximum allowed value for search `limit`.
@@ -25,21 +26,27 @@ pub(super) fn require_str<'a>(args: &'a Value, key: &str) -> Result<&'a str, Mem
         .ok_or_else(|| MemoryError::Validation(format!("{key} is required")))
 }
 
-pub(super) fn require_agent(value: &str) -> Result<&str, MemoryError> {
-    if matches!(value, "claude" | "codex") {
-        Ok(value)
-    } else {
-        Err(MemoryError::Validation(
-            "agent must be 'claude' or 'codex'".to_string(),
-        ))
-    }
+pub(super) fn require_agent(value: &str) -> Result<Agent, MemoryError> {
+    value
+        .parse::<Agent>()
+        .map_err(|_| MemoryError::Validation("agent must be 'claude' or 'codex'".to_string()))
 }
 
-pub(super) fn other_agent(agent: &str) -> &'static str {
-    if agent == "claude" {
-        "codex"
-    } else {
-        "claude"
+/// Thin wrapper around `require_agent` for the `implementer` field on
+/// `collab_start`. Same accept-set today, but isolates the input-validation
+/// site so a future divergence (e.g., adding a `codex-cli` variant only valid
+/// as an agent identity, not as a v3 batch implementer) doesn't regress
+/// silently.
+pub(super) fn require_implementer(value: &str) -> Result<Agent, MemoryError> {
+    value
+        .parse::<Agent>()
+        .map_err(|_| MemoryError::Validation("implementer must be 'claude' or 'codex'".to_string()))
+}
+
+pub(super) fn other_agent(agent: Agent) -> Agent {
+    match agent {
+        Agent::Claude => Agent::Codex,
+        Agent::Codex => Agent::Claude,
     }
 }
 

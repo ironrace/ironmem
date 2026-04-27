@@ -416,4 +416,12 @@ mod tests {
         assert!(!results.is_empty());
         assert_eq!(results[0].0, 120);
     }
+
+    #[test]
+    fn merge_top_k_empty_input_returns_empty() {
+        // Characterization: with no shard results to merge, merge_top_k must
+        // return an empty Vec regardless of top_k. Asserts existing behavior.
+        let result = merge_top_k(Vec::new(), 5);
+        assert!(result.is_empty());
+    }
 }

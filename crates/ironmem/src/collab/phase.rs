@@ -9,10 +9,11 @@ pub enum Phase {
     PlanCodexReviewPending,
     PlanClaudeFinalizePending,
     PlanLocked,
-    // Coding (v3) — per-task 3-phase linear
+    // Coding (v3) — batch implementation. Claude orchestrates per-task
+    // subagents (via superpowers:subagent-driven-development) entirely on its
+    // side; Codex does not participate per-task. The single transition out is
+    // `implementation_done`, which jumps straight to global review.
     CodeImplementPending,
-    CodeReviewFixPending,
-    CodeFinalPending,
     // Coding (v3) — global review, 3-phase linear
     CodeReviewLocalPending,
     CodeReviewFixGlobalPending,
@@ -25,6 +26,12 @@ pub enum Phase {
 /// Authoritative mapping between `Phase` variants and the DB string forms.
 /// String values are byte-identical to what the old match-based `Display`
 /// and `TryFrom` produced — changing them would corrupt stored sessions.
+///
+/// Pre-1.0 protocol: in-flight sessions parked at the removed
+/// `CodeReviewFixPending` or `CodeFinalPending` phases will fail to load
+/// after the batch-implementation refactor. There is no migration; the
+/// expectation is that all dev sessions are short-lived and the operator
+/// can restart any abandoned ones.
 const PHASE_NAMES: &[(Phase, &str)] = &[
     (Phase::PlanParallelDrafts, "PlanParallelDrafts"),
     (Phase::PlanSynthesisPending, "PlanSynthesisPending"),
@@ -35,8 +42,6 @@ const PHASE_NAMES: &[(Phase, &str)] = &[
     ),
     (Phase::PlanLocked, "PlanLocked"),
     (Phase::CodeImplementPending, "CodeImplementPending"),
-    (Phase::CodeReviewFixPending, "CodeReviewFixPending"),
-    (Phase::CodeFinalPending, "CodeFinalPending"),
     (Phase::CodeReviewLocalPending, "CodeReviewLocalPending"),
     (
         Phase::CodeReviewFixGlobalPending,
@@ -53,7 +58,7 @@ impl Phase {
     /// `{CodingComplete, CodingFailed}` is the terminal set post-`task_list`.
     /// This helper returns only the permanently-terminal cases; callers
     /// responsible for the dynamic set check `task_list` on the session.
-    pub fn is_terminal_v2(&self) -> bool {
+    pub fn is_coding_terminal(&self) -> bool {
         matches!(self, Self::CodingComplete | Self::CodingFailed)
     }
 
@@ -63,8 +68,6 @@ impl Phase {
         matches!(
             self,
             Self::CodeImplementPending
-                | Self::CodeReviewFixPending
-                | Self::CodeFinalPending
                 | Self::CodeReviewLocalPending
                 | Self::CodeReviewFixGlobalPending
                 | Self::CodeReviewFinalPending
@@ -82,9 +85,7 @@ impl Phase {
             Self::PlanCodexReviewPending => "SubmitReview",
             Self::PlanClaudeFinalizePending => "PublishFinal",
             Self::PlanLocked => "SubmitTaskList",
-            Self::CodeImplementPending => "CodeImplement",
-            Self::CodeReviewFixPending => "CodeReviewFix",
-            Self::CodeFinalPending => "CodeFinal",
+            Self::CodeImplementPending => "ImplementationDone",
             Self::CodeReviewLocalPending => "ReviewLocal",
             Self::CodeReviewFixGlobalPending => "CodeReviewFixGlobal",
             Self::CodeReviewFinalPending => "FinalReview",
