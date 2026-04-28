@@ -320,13 +320,23 @@ pub fn search(
         }
     }
 
-    // Step 10: Deterministic sort — score desc, then drawer_id asc as tiebreak
-    scored.sort_by(|a, b| {
-        b.score
-            .partial_cmp(&a.score)
-            .unwrap_or(std::cmp::Ordering::Equal)
-            .then_with(|| a.drawer.id.cmp(&b.drawer.id))
-    });
+    // Step 10: Deterministic sort — score desc, then drawer_id asc as tiebreak.
+    //
+    // When cross-encoder rerank ran, skip the score-based resort. Cross-encoder
+    // logits (~[-15, +15]) are not commensurable with upstream shrinkage/RRF
+    // scores (~[0, 1]); a mixed sort would let the un-reranked tail's positive
+    // shrinkage scores float above rerank-promoted items with negative logits.
+    // cross_encoder_rerank already sorts [..rerank_top_k] correctly, and the
+    // tail [rerank_top_k..] retains its pre-rerank shrinkage order, so the
+    // current ordering is already what we want.
+    if !tunables::rerank_enabled() {
+        scored.sort_by(|a, b| {
+            b.score
+                .partial_cmp(&a.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.drawer.id.cmp(&b.drawer.id))
+        });
+    }
     scored.truncate(limit);
 
     tracing::debug!(
