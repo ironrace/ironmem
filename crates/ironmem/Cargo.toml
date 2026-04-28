@@ -26,6 +26,7 @@ path = "src/main.rs"
 [dependencies]
 ironrace-core = { version = "0.1.0", path = "../ironrace-core" }
 ironrace-embed = { version = "0.1.0", path = "../ironrace-embed" }
+ironrace-rerank = { path = "../ironrace-rerank" }
 
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "io-std", "io-util"] }
 serde = { version = "1", features = ["derive"] }

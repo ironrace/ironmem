@@ -1161,6 +1161,7 @@ dependencies = [
  "ignore",
  "ironrace-core",
  "ironrace-embed",
+ "ironrace-rerank",
  "libc",
  "regex",
  "rusqlite",

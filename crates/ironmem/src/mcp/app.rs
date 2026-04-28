@@ -23,6 +23,7 @@ pub struct App {
     pub config: Config,
     pub db: Database,
     pub embedder: RwLock<Embedder>,
+    pub(crate) reranker: RwLock<Option<Arc<dyn ironrace_rerank::RerankerScorer>>>,
     pub index_state: RwLock<IndexState>,
     /// Dirty flag: set after writes, cleared after rebuild.
     dirty: AtomicBool,
@@ -84,6 +85,7 @@ impl App {
             config,
             db,
             embedder: RwLock::new(embedder),
+            reranker: RwLock::new(None),
             index_state: RwLock::new(IndexState { index, id_map }),
             dirty: AtomicBool::new(false),
             graph_cache: RwLock::new(None),
@@ -110,6 +112,7 @@ impl App {
             config,
             db,
             embedder: RwLock::new(Embedder::new_noop()),
+            reranker: RwLock::new(None),
             index_state: RwLock::new(IndexState {
                 index: VectorIndex::build(&[], 100),
                 id_map: Vec::new(),
@@ -160,6 +163,7 @@ impl App {
             config,
             db,
             embedder: RwLock::new(embedder),
+            reranker: RwLock::new(None),
             index_state: RwLock::new(IndexState {
                 index: VectorIndex::build(&[], 100),
                 id_map: Vec::new(),
@@ -236,6 +240,50 @@ impl App {
             self.rebuild_index_from_db()?;
         }
         Ok(())
+    }
+
+    /// Lazy-load the production cross-encoder reranker. Called from the
+    /// pipeline on the first search where `tunables::rerank_enabled()` is true
+    /// AND the field is `None`. Failures log + leave the field `None` so we
+    /// degrade to the un-reranked top-K instead of erroring.
+    ///
+    /// Wired in from the search pipeline in Task 9 — the `allow(dead_code)`
+    /// suppresses the unused-method warning until then.
+    #[allow(dead_code)]
+    pub(crate) fn ensure_reranker_loaded(&self) {
+        {
+            let r = self.reranker.read().unwrap();
+            if r.is_some() {
+                return;
+            }
+        }
+        let mut w = self.reranker.write().unwrap();
+        if w.is_some() {
+            return; // raced — another thread loaded it
+        }
+        match ironrace_rerank::Reranker::new() {
+            Ok(rr) => {
+                *w = Some(Arc::new(rr));
+                tracing::info!("cross-encoder reranker loaded");
+            }
+            Err(e) => {
+                tracing::warn!("cross-encoder reranker load failed: {e}");
+                // leave None — graceful degradation
+            }
+        }
+    }
+
+    /// Test-only — production code should use `ensure_reranker_loaded`.
+    ///
+    /// Constructs a test `App` (in-memory DB, noop embedder) and installs a
+    /// pre-built `RerankerScorer` so integration tests can exercise the
+    /// rerank path without booting ONNX. Mirrors `open_for_test`.
+    pub fn with_reranker(
+        scorer: Arc<dyn ironrace_rerank::RerankerScorer>,
+    ) -> Result<Self, MemoryError> {
+        let app = Self::open_for_test()?;
+        *app.reranker.write().unwrap() = Some(scorer);
+        Ok(app)
     }
 
     /// Swap the real embedder into this App. Called once after background init completes.
