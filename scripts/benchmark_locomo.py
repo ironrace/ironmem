@@ -461,7 +461,7 @@ def main() -> int:
     total_qa = sum(len(c.get("qa", [])) for c in data)
     print(f"  {len(data)} conversations, {total_qa} QA pairs total.", flush=True)
 
-    binary = Path(args.binary).expanduser().resolve()
+    binary = Path(args.ironmem_binary).expanduser().resolve()
     if not binary.exists():
         print(f"ironmem binary not found: {binary}", file=sys.stderr)
         print("Build it with: cargo build --release -p ironmem --bin ironmem", file=sys.stderr)

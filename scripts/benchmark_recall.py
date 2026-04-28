@@ -725,7 +725,7 @@ def main() -> int:
     args = parse_args()
     scales = resolve_scales(args.scale)
 
-    binary = Path(args.binary).expanduser().resolve()
+    binary = Path(args.ironmem_binary).expanduser().resolve()
     if not binary.exists():
         print(f"ironmem binary not found: {binary}", file=sys.stderr)
         print("Build it with: cargo build --release -p ironmem --bin ironmem", file=sys.stderr)
@@ -746,7 +746,7 @@ def main() -> int:
                 scale=scale,
                 n_needles=n_needles,
                 binary=str(binary),
-                model_dir=args.model_dir,
+                model_dir=args.ironmem_model_dir,
                 seed=args.seed,
                 ef_search=ef,
             )
