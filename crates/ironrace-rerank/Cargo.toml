@@ -1,0 +1,22 @@
+[package]
+name = "ironrace-rerank"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+description = "ONNX cross-encoder reranker for ironrace-memory."
+
+[features]
+default = []
+# Dev/CI only. Allows the loader to start without pinned SHA-256 checksums.
+# Release builds MUST be built without this feature; CI smoke-checks.
+unpinned-checksums = []
+
+[dependencies]
+anyhow = "1"
+dirs = "6"
+hf-hub = { version = "0.4", default-features = false, features = ["ureq", "rustls-tls"] }
+ndarray = "0.17"
+ort = { version = "2.0.0-rc.12", default-features = false, features = ["std", "ndarray", "download-binaries", "tls-rustls", "copy-dylibs"] }
+sha2 = "0.10"
+tokenizers = { version = "0.22.2", default-features = false, features = ["onig"] }
+tracing = "0.1"
