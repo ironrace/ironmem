@@ -626,7 +626,7 @@ def main() -> int:
     results: list[dict] = []
 
     if args.backend in ("ironrace", "both"):
-        binary = Path(args.binary).expanduser().resolve()
+        binary = Path(args.ironmem_binary).expanduser().resolve()
         if not binary.exists():
             print(f"ironmem binary not found: {binary}", file=sys.stderr)
             return 1
