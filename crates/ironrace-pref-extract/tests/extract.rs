@@ -107,6 +107,6 @@ fn synthesize_doc_joins_phrases() {
     let phrases = vec!["black coffee".to_string(), "standing desks".to_string()];
     assert_eq!(
         synthesize_doc(&phrases),
-        Some("User has mentioned: black coffee; standing desks".to_string()),
+        Some("black coffee. standing desks".to_string()),
     );
 }

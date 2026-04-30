@@ -39,9 +39,14 @@ pub fn looks_conversational(text: &str) -> bool {
 
 /// Build the synthetic doc string from extracted phrases. Returns `None`
 /// when there are no phrases (caller should skip the sibling insert).
+///
+/// Format: phrases joined by `". "` with no meta prefix. The bare-phrase
+/// format keeps the synthetic embedding closer to query embeddings on
+/// `bge-base-en-v1.5`; the earlier `"User has mentioned: "` prefix
+/// dominated the embedding signal and prevented preference R@5 lift.
 pub fn synthesize_doc(phrases: &[String]) -> Option<String> {
     if phrases.is_empty() {
         return None;
     }
-    Some(format!("User has mentioned: {}", phrases.join("; ")))
+    Some(phrases.join(". "))
 }

@@ -149,13 +149,14 @@ fn call(app: &App, tool: &str, args: Value) -> Value {
 }
 
 #[test]
-fn search_response_never_contains_synthetic_marker() {
+fn search_response_never_contains_synthetic_id() {
     // End-to-end: with enrichment ON, search for the conversational topic and
-    // verify no result row's content starts with the synthetic marker.
+    // verify no result's id matches a synthetic sibling row in the DB. The
+    // collapse step must translate any synth hit into its parent before the
+    // results leave the pipeline.
     std::env::set_var("IRONMEM_PREF_ENRICH", "1");
     let app = App::open_for_test().expect("build app");
 
-    // Add a conversational drawer (creates parent + synth via Task 6).
     let _ = call(
         &app,
         "add_drawer",
@@ -167,14 +168,27 @@ fn search_response_never_contains_synthetic_marker() {
         }),
     );
 
-    // Search — both rows in HNSW; collapse must hide the synth.
+    // Snapshot synth IDs from the DB (rows with the `pref:<id>` sentinel).
+    let synth_ids: std::collections::HashSet<String> = app
+        .db
+        .get_drawers(None, None, 100)
+        .unwrap()
+        .into_iter()
+        .filter(|d| d.source_file.starts_with("pref:"))
+        .map(|d| d.id)
+        .collect();
+    assert!(
+        !synth_ids.is_empty(),
+        "test setup expects at least one synth sibling"
+    );
+
     let resp = call(&app, "search", json!({ "query": "battery", "limit": 10 }));
     let results = resp["results"].as_array().unwrap();
     for r in results {
-        let body = r["content"].as_str().unwrap_or("");
+        let id = r["id"].as_str().unwrap_or("");
         assert!(
-            !body.starts_with("User has mentioned: "),
-            "synthetic doc leaked into search response: {body}",
+            !synth_ids.contains(id),
+            "synthetic doc leaked into search response: id={id}",
         );
     }
     std::env::remove_var("IRONMEM_PREF_ENRICH");

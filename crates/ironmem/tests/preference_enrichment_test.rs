@@ -122,7 +122,14 @@ fn enrich_on_inserts_parent_plus_synthetic() {
         .filter(|d| d.source_file == sentinel)
         .collect::<Vec<_>>();
     assert_eq!(siblings.len(), 1, "exactly one synthetic sibling");
-    assert!(siblings[0].content.starts_with("User has mentioned: "));
+    // Synth content is bare phrases joined by ". " (no meta prefix). The
+    // CONVERSATIONAL_BODY mentions trouble with battery life, so the
+    // extractor should produce at least one phrase referencing it.
+    assert!(
+        siblings[0].content.contains("battery"),
+        "synth body should carry vocabulary from the source: {:?}",
+        siblings[0].content
+    );
 
     std::env::remove_var("IRONMEM_PREF_ENRICH");
 }
