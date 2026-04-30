@@ -1198,6 +1198,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "ironrace-pref-extract"
+version = "0.1.0"
+dependencies = [
+ "regex",
+]
+
+[[package]]
 name = "ironrace-rerank"
 version = "0.1.0"
 dependencies = [

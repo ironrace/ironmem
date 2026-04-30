@@ -3,6 +3,7 @@ members = [
     "crates/ironrace-core",
     "crates/ironrace-embed",
     "crates/ironrace-rerank",
+    "crates/ironrace-pref-extract",
     "crates/ironmem",
 ]
 resolver = "2"
