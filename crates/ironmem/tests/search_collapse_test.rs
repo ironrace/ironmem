@@ -1,7 +1,6 @@
 //! Pipeline-level tests for the synthetic-doc collapse step (step 7.5).
 
 use ironmem::db::ScoredDrawer;
-use ironmem::db::SearchFilters;
 use ironmem::mcp::app::App;
 use ironmem::mcp::protocol::JsonRpcRequest;
 use ironmem::mcp::server::dispatch;
@@ -139,7 +138,7 @@ fn request(method: &str, params: Value) -> JsonRpcRequest {
     .expect("request fixture must deserialize")
 }
 
-fn _call(app: &App, tool: &str, args: Value) -> Value {
+fn call(app: &App, tool: &str, args: Value) -> Value {
     let req = request("tools/call", json!({ "name": tool, "arguments": args }));
     let resp = dispatch(app, &req).expect("tools/call must return a response");
     let result = resp.result.unwrap();
@@ -155,10 +154,9 @@ fn search_response_never_contains_synthetic_marker() {
     // verify no result row's content starts with the synthetic marker.
     std::env::set_var("IRONMEM_PREF_ENRICH", "1");
     let app = App::open_for_test().expect("build app");
-    let _filters = SearchFilters::default();
 
     // Add a conversational drawer (creates parent + synth via Task 6).
-    let _ = _call(
+    let _ = call(
         &app,
         "add_drawer",
         json!({
@@ -170,7 +168,7 @@ fn search_response_never_contains_synthetic_marker() {
     );
 
     // Search — both rows in HNSW; collapse must hide the synth.
-    let resp = _call(&app, "search", json!({ "query": "battery", "limit": 10 }));
+    let resp = call(&app, "search", json!({ "query": "battery", "limit": 10 }));
     let results = resp["results"].as_array().unwrap();
     for r in results {
         let body = r["content"].as_str().unwrap_or("");
