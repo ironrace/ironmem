@@ -187,3 +187,33 @@ pub fn pref_enrich_enabled() -> bool {
         Ok("1") | Ok("true")
     )
 }
+
+/// Selects which `PreferenceExtractor` implementation `build_synthetic` uses.
+/// `regex` (default): the V4 regex set ported from mempalace. Free, fast, but
+/// only catches first-person fragments. `llm`: a `claude -p` subprocess that
+/// summarizes the conversation in question-vocabulary form. Per-ingest LLM
+/// cost; rich enough to bridge the vocabulary gap that regex misses.
+pub fn pref_extractor() -> &'static str {
+    static V: OnceLock<String> = OnceLock::new();
+    V.get_or_init(|| {
+        std::env::var("IRONMEM_PREF_EXTRACTOR").unwrap_or_else(|_| "regex".to_string())
+    })
+    .as_str()
+}
+
+/// Model alias for the LLM preference extractor. Default `"claude-haiku-4-5"`.
+pub fn pref_llm_model() -> String {
+    static V: OnceLock<String> = OnceLock::new();
+    V.get_or_init(|| {
+        std::env::var("IRONMEM_PREF_LLM_MODEL").unwrap_or_else(|_| "claude-haiku-4-5".to_string())
+    })
+    .clone()
+}
+
+/// Wall-clock timeout for one preference-extractor LLM call, in milliseconds.
+/// Default 15_000 ms (extraction is a longer prompt than rerank, so we allow
+/// a bigger budget). Capped at 60_000 ms.
+pub fn pref_llm_timeout_ms() -> u64 {
+    static V: OnceLock<u64> = OnceLock::new();
+    *V.get_or_init(|| env_usize("IRONMEM_PREF_LLM_TIMEOUT_MS", 15_000).min(60_000) as u64)
+}

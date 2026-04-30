@@ -113,6 +113,7 @@ fn build_synthetic(
     use ironrace_pref_extract::{
         looks_conversational, synthesize_doc, PreferenceExtractor, RegexPreferenceExtractor,
     };
+    use std::time::Duration;
 
     if !crate::search::tunables::pref_enrich_enabled() {
         return Ok(None);
@@ -120,7 +121,17 @@ fn build_synthetic(
     if !looks_conversational(content) {
         return Ok(None);
     }
-    let phrases = RegexPreferenceExtractor.extract(content);
+    let phrases: Vec<String> = match crate::search::tunables::pref_extractor() {
+        "llm" => {
+            let timeout = Duration::from_millis(crate::search::tunables::pref_llm_timeout_ms());
+            let extractor = crate::search::pref_extract_llm::cli_extractor(
+                crate::search::tunables::pref_llm_model(),
+                timeout,
+            );
+            extractor.extract(content)
+        }
+        _ => RegexPreferenceExtractor.extract(content),
+    };
     let synth_body = match synthesize_doc(&phrases) {
         Some(s) => s,
         None => return Ok(None),
