@@ -43,6 +43,39 @@ pub(crate) static KW_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\b[a-z]
 static QUOTED_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r#"['""]([^'""\n]{3,60})['""]"#).unwrap());
 
+// --- Word-boundary token matcher ---------------------------------------------
+
+/// Compile a word-boundary matcher for a single token, with light suffix
+/// tolerance for common English inflections. Reuse the returned regex
+/// across all candidate documents for one query — compile cost is ~µs.
+///
+/// Pattern: `(?i)(?:^|[^a-zA-Z0-9_]){escape(token)}(?:s|es|ed|ing|ion|ions)?(?:[^a-zA-Z0-9_]|$)`
+///
+/// - `(?i)` — case-insensitive (belt-and-suspenders; callers lowercase).
+/// - `(?:^|[^a-zA-Z0-9_])` / `(?:[^a-zA-Z0-9_]|$)` — token must be preceded/followed
+///   by line start, non-word char (space, punctuation), or end. Handles both word
+///   chars and non-word chars (e.g. `c++`), and punctuation (e.g. `"suggestions?"`).
+/// - `regex::escape` neutralizes regex metacharacters in the token.
+/// - The optional suffix group covers verb→noun and tense inflections
+///   common in English. `-ly` (adverbial) is intentionally excluded so
+///   "current" does NOT match "currently".
+#[allow(dead_code)]
+fn compile_token_matcher(token: &str) -> Regex {
+    let escaped = regex::escape(token);
+    Regex::new(&format!(
+        r"(?i)(?:^|[^a-zA-Z0-9_]){escaped}(?:s|es|ed|ing|ion|ions)?(?:[^a-zA-Z0-9_]|$)"
+    ))
+    .expect("token regex must compile after escape")
+}
+
+/// Boundary-aware version of `doc.contains(token)`. Thin wrapper over
+/// `Regex::is_match` so callers (the scorer and the IDF filter) share a
+/// single hit-test seam.
+#[allow(dead_code)]
+fn token_hit(doc_lower: &str, matcher: &Regex) -> bool {
+    matcher.is_match(doc_lower)
+}
+
 // --- Stop sets ---------------------------------------------------------------
 
 /// Wh-words, auxiliaries, months, days and generic discourse words that are
@@ -369,5 +402,63 @@ mod tests {
         let mut candidates = vec![];
         let signals = extract_signals("hello world");
         shrinkage_rerank(&mut candidates, &signals); // must not panic
+    }
+
+    #[test]
+    fn token_matcher_exact_form_matches() {
+        let m = compile_token_matcher("suggest");
+        assert!(m.is_match("can you suggest a name?"));
+    }
+
+    #[test]
+    fn token_matcher_inflected_forms_match() {
+        let m = compile_token_matcher("suggest");
+        for body in [
+            "i suggested it",
+            "she is suggesting",
+            "any suggestions?",
+            "one suggestion stands",
+        ] {
+            assert!(m.is_match(body), "expected to match in {body:?}");
+        }
+    }
+
+    #[test]
+    fn token_matcher_does_not_match_unrelated_substring() {
+        // "current" must NOT match "currently" — adverb -ly is not in the
+        // suffix list. This is the photography-failure failure pattern.
+        let m = compile_token_matcher("current");
+        assert!(
+            !m.is_match("we are currently shipping"),
+            "currently must not match current"
+        );
+    }
+
+    #[test]
+    fn token_matcher_does_not_match_prefix_extension() {
+        // Front-edge boundary: the prefix `pre` makes this not a word-boundary match.
+        let m = compile_token_matcher("suggest");
+        assert!(!m.is_match("we presuggest carefully"));
+    }
+
+    #[test]
+    fn token_matcher_escapes_metacharacters() {
+        // Tokens with regex metacharacters must compile and match literally.
+        let m = compile_token_matcher("c++");
+        assert!(m.is_match("i write c++ daily"));
+    }
+
+    #[test]
+    fn token_matcher_is_case_insensitive() {
+        // Even though callers lowercase upstream, the (?i) flag belt-and-suspenders.
+        let m = compile_token_matcher("photography");
+        assert!(m.is_match("Photography setup notes"));
+    }
+
+    #[test]
+    fn token_hit_wraps_is_match() {
+        let m = compile_token_matcher("setup");
+        assert!(token_hit("a clean setup of tools", &m));
+        assert!(!token_hit("a clean setup_thing", &m));
     }
 }
