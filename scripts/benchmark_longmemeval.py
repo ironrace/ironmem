@@ -136,6 +136,7 @@ class McpClient:
                 try:
                     stderr = self._proc.stderr.read().decode("utf-8", "replace")
                 except Exception:
+                    # Stderr capture is best-effort; preserve the primary stdout-closed error.
                     pass
             raise RuntimeError(f"{self.name}: server closed stdout. stderr:\n{stderr}")
         return json.loads(line)

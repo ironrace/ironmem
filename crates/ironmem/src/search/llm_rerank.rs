@@ -60,7 +60,7 @@ pub fn cross_encoder_rerank(
     }
 
     // Replace top-K scores in place.
-    for (slot, new) in scored[..k].iter_mut().zip(new_scores.into_iter()) {
+    for (slot, new) in scored[..k].iter_mut().zip(new_scores) {
         slot.score = new;
     }
 
