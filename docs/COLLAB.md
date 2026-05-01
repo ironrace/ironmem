@@ -8,7 +8,7 @@ MCP server.
   review → Claude finalize → `PlanLocked`. Two review rounds.
 - **v3 (coding)**: post-`PlanLocked` task list → **batch implementation
   phase** (Claude orchestrates per-task subagents on its side via
-  `superpowers:writing-plans` → `superpowers:subagent-driven-development`,
+  `writing-plans` → `subagent-driven-development`,
   then signals completion with `implementation_done`) → global 3-phase
   linear flow (Claude local → Codex review+fix → Claude final with PR URL)
   → `CodingComplete` / `CodingFailed`. Codex only participates at the
@@ -156,8 +156,8 @@ session's `implementer` field, set at `collab_start` time and
 immutable thereafter:
 
 - **`implementer == "claude"`** (default): Claude orchestrates per-task
-  work through `superpowers:writing-plans` (markdown plan) and then
-  `superpowers:subagent-driven-development` (fresh subagent per task,
+  work through `writing-plans` (markdown plan) and then
+  `subagent-driven-development` (fresh subagent per task,
   TDD, per-task commits). Claude emits `implementation_done`.
 - **`implementer == "codex"`** (opt-in via
   `/collab start --implementer=codex`): Claude still produces the
@@ -188,7 +188,7 @@ its own judgment.
 **Both modes apply the same `finishing-a-development-branch` carve-out**:
 the implementer agent stops `subagent-driven-development` at the last
 task's approval+commit and does *not* let the skill auto-invoke
-`superpowers:finishing-a-development-branch`. PR creation belongs to
+`finishing-a-development-branch`. PR creation belongs to
 the collab `final_review` turn, not to the subagent skill.
 
 ### Global review, 3-phase linear
@@ -523,8 +523,8 @@ between `wait_my_turn` and `collab_send`:
   already at the right SHA — for example, entering the batch-impl turn
   immediately after `task_list` is sent.
 - **Subagent orchestration** during `CodeImplementPending`. Claude invokes
-  `superpowers:writing-plans` to expand the locked plan into a markdown
-  task document, then `superpowers:subagent-driven-development` to
+  `writing-plans` to expand the locked plan into a markdown
+  task document, then `subagent-driven-development` to
   dispatch fresh subagents per task. Each subagent runs TDD and commits
   on the branch. Per-subagent failures pause for triage; an unrecoverable
   failure surfaces as `failure_report` with `coding_failure: "subagent_failure: ..."`.
@@ -595,8 +595,8 @@ Phase → action (v3):
 
 | Phase | Claude does | Codex does |
 |---|---|---|
-| `PlanLocked` (post-final) | run `superpowers:writing-plans` on the locked plan; user approves the generated markdown; build `task_list` JSON (with `plan_file_path`), send | wait |
-| `CodeImplementPending` | run `superpowers:subagent-driven-development` to dispatch per-task subagents; on full success run gates and send `implementation_done{head_sha}` | wait |
+| `PlanLocked` (post-final) | run `writing-plans` on the locked plan; user approves the generated markdown; build `task_list` JSON (with `plan_file_path`), send | wait |
+| `CodeImplementPending` | run `subagent-driven-development` to dispatch per-task subagents; on full success run gates and send `implementation_done{head_sha}` | wait |
 | `CodeReviewLocalPending` | run `/ultrareview-local`, fix HIGH/CRITICAL in place, send `review_local` | wait |
 | `CodeReviewFixGlobalPending` | wait | review full diff, fix branch-level issues in place, send `review_fix_global` |
 | `CodeReviewFinalPending` | gates, enter Plan Mode for PR title/body, `gh pr create`, send `final_review{pr_url}` | wait |

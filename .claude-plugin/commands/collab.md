@@ -171,7 +171,7 @@ before (drafts, synthesis, revisions) runs autonomously.
 
 Once `PlanLocked` is reached with `final_plan_hash` set and no `task_list`
 yet, run the writing-plans + subagent-driven-development pipeline. **Do not
-enter harness Plan Mode here** — `superpowers:writing-plans` produces the
+enter harness Plan Mode here** — `writing-plans` produces the
 markdown plan and presents its own approval handoff to the user, which
 serves as the gate.
 
@@ -179,7 +179,7 @@ serves as the gate.
    `final_plan` is the JSON string `{"plan":"<full text>"}` Claude
    previously sent; parse it to recover the approved plan body. Read the
    current `HEAD` SHA via `git rev-parse HEAD`.
-2. **Invoke `Skill('superpowers:writing-plans')`** with the locked plan
+2. **Invoke `Skill('writing-plans')`** with the locked plan
    text as input. The skill will save a markdown plan to
    `docs/superpowers/plans/YYYY-MM-DD-<feature>.md` and present its own
    "execute now?" handoff to the user. This is the user gate. If the user
@@ -231,7 +231,7 @@ serves as the gate.
 6. **Branch on `implementer`** (read it from `collab_status`):
 
    - **`implementer == "claude"`** — Run the batch locally. Invoke
-     `Skill('superpowers:subagent-driven-development')` with the same
+     `Skill('subagent-driven-development')` with the same
      plan file. Auto-proceed through between-task checkpoints — do not
      pause for user approval per task. Each subagent runs TDD, commits,
      and pushes for its own task.
@@ -245,7 +245,7 @@ serves as the gate.
      1. Before invoking `subagent-driven-development`, tell its
         controller-loop the explicit stopping point: "stop after the
         last task is implemented, reviewed, and committed; do *not*
-        invoke `superpowers:finishing-a-development-branch`." The skill's
+        invoke `finishing-a-development-branch`." The skill's
         controller honors that direction.
      2. After the skill returns and before `implementation_done` is
         sent, verify no PR was opened on this branch behind your back:
@@ -268,7 +268,7 @@ serves as the gate.
      end-to-end (with the same `finishing-a-development-branch` carve-out
      applied on its side), and emit `implementation_done` itself before
      the polling loop detects phase advance.
-     Do *not* invoke `superpowers:subagent-driven-development` locally
+     Do *not* invoke `subagent-driven-development` locally
      in this mode — Codex owns the batch phase.
 
      **Recovery if `codex exec` errors or times out mid-batch.**
@@ -358,7 +358,7 @@ sequence before building the payload:
 
 | Phase | What to do (is_my_turn == true) |
 |---|---|
-| `CodeImplementPending` | Owner depends on `implementer`. **Claude is owner** (default): the bridge has already invoked `superpowers:subagent-driven-development`. When all subagents finish, **run pre-send harness gates** (no reset — no Codex push to sync) and `collab_send` with `sender="claude"`, `topic="implementation_done"`, `content=<JSON {"head_sha":"<current HEAD>"}>`. Payload carries ONLY `head_sha`. **Codex is owner** (`--implementer=codex`): is_my_turn is false here; the bridge dispatched to Codex via `mcp__codex__codex` and Codex emits `implementation_done` itself before its MCP session returns. If the dispatch loop ever sees `CodeImplementPending` with Codex owner, re-dispatch via the Codex MCP tool (resumed-mid-batch case). |
+| `CodeImplementPending` | Owner depends on `implementer`. **Claude is owner** (default): the bridge has already invoked `subagent-driven-development`. When all subagents finish, **run pre-send harness gates** (no reset — no Codex push to sync) and `collab_send` with `sender="claude"`, `topic="implementation_done"`, `content=<JSON {"head_sha":"<current HEAD>"}>`. Payload carries ONLY `head_sha`. **Codex is owner** (`--implementer=codex`): is_my_turn is false here; the bridge dispatched to Codex via `mcp__codex__codex` and Codex emits `implementation_done` itself before its MCP session returns. If the dispatch loop ever sees `CodeImplementPending` with Codex owner, re-dispatch via the Codex MCP tool (resumed-mid-batch case). |
 | `CodeReviewLocalPending` | **Run pre-send harness (with reset to `last_head_sha`), then `/ultrareview-local` on the full task stack.** Fix any CRITICAL/HIGH inline (commit + push). Call `collab_send` with `sender="claude"`, `topic="review_local"`, `content=<JSON {"head_sha":"<current HEAD>"}>`. **Log:** `t5_review_local_sent` |
 | `CodeReviewFixGlobalPending` | Codex's turn. is_my_turn should be false. If `collab_status` confirms Claude is the owner, exit the loop and report the anomaly. **Log:** `t6_codex_review_dispatched` immediately before launching `codex exec`; **Log:** `t7_codex_review_returned` immediately after the polling loop exits. |
 | `CodeReviewFinalPending` | **Run pre-send harness (with reset to `last_head_sha`).** Codex has pushed any global fixes (or a no-op commit); your local working copy was reset to `last_head_sha` by the harness. Optionally tweak. Re-run gates. Then **enter Plan Mode**: draft PR title (under 70 chars) and body (summary + test plan derived from task list + gate results). Get user approval. Then `gh pr create --base <base_branch> --head <current branch> --title <approved title> --body <approved body>`. If `gh pr create` fails, send `failure_report` with `coding_failure: "pr_create_failed: <error>"` — no silent retry. On success, **Log:** `t8_pr_created <pr_url>`, capture `pr_url` and call `collab_send` with `sender="claude"`, `topic="final_review"`, `content=<JSON {"head_sha":"<current HEAD>","pr_url":"<https url>"}>`. **Log:** `t9_final_review_sent`. Session advances directly to `CodingComplete`. **Log:** `t10_session_complete CodingComplete`. Exit loop. |

@@ -42,20 +42,20 @@ Fastest path from source today:
 ```bash
 git clone https://github.com/ironrace/ironmem.git
 cd ironmem
-cargo build --release -p ironmem --bin ironmem
-./target/release/ironmem setup
+scripts/install-ironmem.sh
+~/.ironrace/bin/ironmem setup
 ```
 
 Start the MCP server in trusted mode (required for write tools):
 
 ```bash
-IRONMEM_MCP_MODE=trusted ./target/release/ironmem serve
+IRONMEM_MCP_MODE=trusted ~/.ironrace/bin/ironmem serve
 ```
 
 Smoke-test the live stdio server without downloading the model:
 
 ```bash
-python3 scripts/mcp_smoke_test.py --binary ./target/release/ironmem
+python3 scripts/mcp_smoke_test.py --binary ~/.ironrace/bin/ironmem
 ```
 
 Add it to Codex:
@@ -71,6 +71,20 @@ IRONMEM_MCP_MODE = "trusted"
 
 Tagged releases upload prebuilt macOS and Linux binaries automatically. Until the first tagged release is published, building from source is the supported install path.
 
+`scripts/install-ironmem.sh` also installs the bundled collab skill dependencies for both Codex and Claude Code:
+
+- `writing-plans`
+- `subagent-driven-development`
+- `finishing-a-development-branch`
+- `executing-plans`
+- `using-git-worktrees`
+- `using-superpowers`
+- `requesting-code-review`
+- `test-driven-development`
+
+Existing identical skills are skipped. Existing divergent skills are left in place unless you pass `--force-skills`; use `--skip-skills` when you only want to replace the binary.
+For Claude Code, the installer also installs the `code-reviewer` agent used by the vendored review flow.
+
 ## Current Status
 
 - MCP server works over stdio with non-blocking startup (responds to `initialize` in <25 ms)
@@ -79,7 +93,7 @@ Tagged releases upload prebuilt macOS and Linux binaries automatically. Until th
 - Automatic bootstrap runs on first server or hook start
 - Direct migration from `mempalace` Chroma stores is implemented
 - Workspace mining and incremental re-mining are implemented
-- Codex and Claude Code plugin packaging is included
+- Codex and Claude Code plugin packaging is included, including bundled collab skill dependencies
 - `~/.ironrace/bin/ironmem` is the preferred installed binary location; plugin launch scripts check there first
 - Bounded Claude↔Codex collaboration protocol (v1 planning + v3 coding) is available via the `collab_*` MCP tools, including long-poll `wait_my_turn` for autonomous operation — see [docs/COLLAB.md](docs/COLLAB.md)
 

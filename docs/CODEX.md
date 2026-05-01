@@ -34,7 +34,6 @@ What hooks currently do on `stop` / `precompact`:
 
 What does not work yet:
 
-- There is still no standalone installer command; installs are source-build or release-binary based
 - Hook behavior does not yet build a rich LLM-written session summary from transcript content
 
 ## Build
@@ -42,8 +41,8 @@ What does not work yet:
 From the repo root:
 
 ```bash
-cargo build -p ironmem --bin ironmem
-./target/debug/ironmem setup
+scripts/install-ironmem.sh
+~/.ironrace/bin/ironmem setup
 ```
 
 `setup` prepares the embedding model under the default model cache. On a fresh machine it may download the model.
@@ -159,6 +158,26 @@ Embedding-dependent tools (`search`, `add_drawer`, diary writes) return `{"warmi
 - `hooks.json`
 - wrapper scripts for the MCP server and hooks
 - Codex-specific README content
+- bundled collab skill dependencies under `skills/`
+
+The same collab skill dependencies are bundled for Claude Code under `.claude-plugin/skills/`.
+`scripts/install-ironmem.sh` installs the Codex copies into `$CODEX_HOME/skills` (default
+`~/.codex/skills`) and the Claude copies into `$CLAUDE_HOME/skills` (default `~/.claude/skills`).
+The required set is:
+
+- `writing-plans`
+- `subagent-driven-development`
+- `finishing-a-development-branch`
+- `executing-plans`
+- `using-git-worktrees`
+- `using-superpowers`
+- `requesting-code-review`
+- `test-driven-development`
+
+Existing identical skills are skipped. Existing divergent skills are left untouched unless the
+installer is run with `--force-skills`; `--skip-skills` skips this step entirely.
+For Claude Code, the installer also provisions the `code-reviewer` agent used by the vendored
+`subagent-driven-development` review flow into `$CLAUDE_HOME/agents`.
 
 The hook wrapper delegates to:
 
