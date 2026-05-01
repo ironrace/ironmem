@@ -242,3 +242,56 @@ fn idf_filter_uses_same_matcher_as_scorer() {
 
     std::env::remove_var("IRONMEM_SHRINKAGE_WORD_BOUNDARY");
 }
+
+#[test]
+fn quoted_phrase_unchanged_in_both_modes() {
+    let signals = extract_signals(r#"What did she call "the project"?"#);
+    let p_drawer = make("she discussed the project last week", 0.50);
+    let unrelated = make("totally unrelated meeting notes", 0.50);
+
+    // Run under boundary mode
+    {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("IRONMEM_SHRINKAGE_WORD_BOUNDARY", "1");
+        let mut cs = vec![p_drawer.clone(), unrelated.clone()];
+        shrinkage_rerank(&mut cs, &signals);
+        let project_score = cs
+            .iter()
+            .find(|c| c.drawer.content.starts_with("she discussed"))
+            .map(|c| c.score)
+            .unwrap();
+        let unrelated_score = cs
+            .iter()
+            .find(|c| c.drawer.content.starts_with("totally unrelated"))
+            .map(|c| c.score)
+            .unwrap();
+        assert!(
+            project_score > unrelated_score,
+            "boundary mode: quoted phrase 'the project' must lift the relevant drawer"
+        );
+        std::env::remove_var("IRONMEM_SHRINKAGE_WORD_BOUNDARY");
+    }
+
+    // Same under legacy substring mode
+    {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("IRONMEM_SHRINKAGE_WORD_BOUNDARY", "0");
+        let mut cs = vec![p_drawer.clone(), unrelated.clone()];
+        shrinkage_rerank(&mut cs, &signals);
+        let project_score = cs
+            .iter()
+            .find(|c| c.drawer.content.starts_with("she discussed"))
+            .map(|c| c.score)
+            .unwrap();
+        let unrelated_score = cs
+            .iter()
+            .find(|c| c.drawer.content.starts_with("totally unrelated"))
+            .map(|c| c.score)
+            .unwrap();
+        assert!(
+            project_score > unrelated_score,
+            "legacy mode: quoted phrase 'the project' must lift the relevant drawer"
+        );
+        std::env::remove_var("IRONMEM_SHRINKAGE_WORD_BOUNDARY");
+    }
+}
