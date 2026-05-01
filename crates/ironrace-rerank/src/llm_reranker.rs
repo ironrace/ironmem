@@ -23,7 +23,7 @@ use crate::scorer::RerankerScorer;
 
 /// Pinned rerank prompt template ("pick one" / mempalace recipe).
 /// Changes require a full eval re-run.
-const REREANK_PROMPT_TEMPLATE: &str = "Question: {QUERY}\n\nWhich of the following passages most directly answers this question? Reply with just the number (1-{N}).\n\n{CANDIDATES}";
+const RERANK_PROMPT_TEMPLATE: &str = "Question: {QUERY}\n\nWhich of the following passages most directly answers this question? Reply with just the number (1-{N}).\n\n{CANDIDATES}";
 
 /// Truncate each passage to this many chars before sending. Mempalace uses
 /// 300, but their candidates are message-level chunks; ours are full sessions
@@ -84,7 +84,7 @@ fn build_rerank_prompt(query: &str, passages: &[&str]) -> String {
             truncate_chars(p, PASSAGE_MAX_CHARS)
         ));
     }
-    REREANK_PROMPT_TEMPLATE
+    RERANK_PROMPT_TEMPLATE
         .replace("{QUERY}", query)
         .replace("{N}", &n.to_string())
         .replace("{CANDIDATES}", &candidates)
@@ -141,6 +141,7 @@ fn last_integer(s: &str) -> Option<usize> {
     while i > 0 && bytes[i - 1].is_ascii_digit() {
         i -= 1;
     }
+    // Safe: ASCII digit bytes are always single-byte UTF-8, so [i..end] is a valid str boundary.
     s[i..end].parse::<usize>().ok()
 }
 

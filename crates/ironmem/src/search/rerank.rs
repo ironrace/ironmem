@@ -228,11 +228,12 @@ pub fn extract_signals(query: &str) -> RerankSignals {
 
     let name_words: HashSet<String> = names.iter().map(|n| n.to_lowercase()).collect();
 
-    // All content keywords (lowercased, stop-filtered)
+    // All content keywords (lowercased, stop-filtered, length-capped)
     let all_kws: Vec<String> = KW_RE
         .find_iter(&query.to_lowercase())
         .map(|m| m.as_str().to_string())
         .filter(|w| !KW_STOP.contains(w.as_str()))
+        .filter(|w| w.len() <= 64)
         .collect();
 
     // Predicate keywords = all_kws minus lowercased names (the v5 split)
@@ -361,6 +362,13 @@ pub fn shrinkage_rerank(candidates: &mut [ScoredDrawer], signals: &RerankSignals
 }
 
 /// Filter a token list to those appearing in fewer than `threshold` candidates.
+// TODO(perf): the boundary path recompiles compile_token_matcher per
+// token here AND re-builds matchers in shrinkage_rerank. Plus per-
+// candidate to_lowercase. Combined: ~+20ms median search latency at
+// the LongMemEval scale. Follow-up: cache lower_docs once per query
+// and pass pre-built matchers in. See:
+// docs/superpowers/specs/2026-04-30-shrinkage-word-boundary-design.md
+// (Risks section).
 fn idf_filter(tokens: &[String], candidates: &[ScoredDrawer], threshold: usize) -> Vec<String> {
     let use_boundary = tunables::shrinkage_word_boundary_enabled();
     tokens

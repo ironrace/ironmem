@@ -176,6 +176,10 @@ pub fn llm_rerank_timeout_ms() -> u64 {
 /// user's subscription auth — free per call but ~1-3s of subprocess startup.
 /// `"api"` POSTs directly to `api.anthropic.com/v1/messages` — faster but
 /// bills the API key. Any other value falls back to `"cli"`.
+///
+/// Process-lifetime constant after first read. OnceLock-cached because no
+/// current test flips this per-call. Switch to per-call read pattern if future
+/// tests need to exercise both backends in the same test binary.
 pub fn llm_rerank_backend() -> &'static str {
     static V: OnceLock<String> = OnceLock::new();
     V.get_or_init(|| {
@@ -235,6 +239,11 @@ pub fn pref_enrich_enabled() -> bool {
 /// only catches first-person fragments. `llm`: a `claude -p` subprocess that
 /// summarizes the conversation in question-vocabulary form. Per-ingest LLM
 /// cost; rich enough to bridge the vocabulary gap that regex misses.
+///
+/// Process-lifetime constant after first read. Unlike `pref_enrich_enabled`,
+/// this is OnceLock-cached because no current test flips it per-call. If
+/// future integration tests need to flip extractor types per-test, switch
+/// to the per-call read pattern.
 pub fn pref_extractor() -> &'static str {
     static V: OnceLock<String> = OnceLock::new();
     V.get_or_init(|| {
@@ -244,6 +253,10 @@ pub fn pref_extractor() -> &'static str {
 }
 
 /// Model alias for the LLM preference extractor. Default `"claude-haiku-4-5"`.
+///
+/// Process-lifetime constant after first read. OnceLock-cached because no
+/// current test flips this per-call. Switch to per-call read pattern if future
+/// tests need different model aliases per-test.
 pub fn pref_llm_model() -> String {
     static V: OnceLock<String> = OnceLock::new();
     V.get_or_init(|| {
@@ -264,6 +277,10 @@ pub fn pref_llm_timeout_ms() -> u64 {
 /// `claude -p`; `api` POSTs directly to `api.anthropic.com/v1/messages`. The
 /// API path avoids the heavy claude-code subprocess fan-out (~13s overhead
 /// per call) at the cost of a billable API key.
+///
+/// Process-lifetime constant after first read. OnceLock-cached because no
+/// current test flips this per-call. Switch to per-call read pattern if future
+/// tests need to exercise both backends in the same test binary.
 pub fn pref_llm_backend() -> &'static str {
     static V: OnceLock<String> = OnceLock::new();
     V.get_or_init(|| {

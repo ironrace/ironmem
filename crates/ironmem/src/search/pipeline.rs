@@ -12,7 +12,9 @@
 
 use std::collections::HashMap;
 
-use crate::db::{knowledge_graph::KnowledgeGraph, ScoredDrawer, SearchFilters};
+use crate::db::{
+    drawers::PREF_SENTINEL, knowledge_graph::KnowledgeGraph, ScoredDrawer, SearchFilters,
+};
 use crate::error::MemoryError;
 use crate::mcp::app::App;
 
@@ -466,14 +468,12 @@ pub fn collapse_synthetic_into_parents(
     app: &App,
     candidates: &mut Vec<ScoredDrawer>,
 ) -> Result<(), MemoryError> {
-    const SENTINEL: &str = "pref:";
-
     // Partition: (synth, real). Both keep insertion order to keep the ordering
     // step downstream deterministic.
     let mut synths: Vec<ScoredDrawer> = Vec::new();
     let mut reals: Vec<ScoredDrawer> = Vec::with_capacity(candidates.len());
     for sd in candidates.drain(..) {
-        if sd.drawer.source_file.starts_with(SENTINEL) {
+        if sd.drawer.source_file.starts_with(PREF_SENTINEL) {
             synths.push(sd);
         } else {
             reals.push(sd);
@@ -493,29 +493,29 @@ pub fn collapse_synthetic_into_parents(
 
     // First pass: promote scores for parents already in `reals`. Defer
     // orphan-parent fetches to a single batched DB call.
-    let mut orphan_parent_ids: Vec<String> = Vec::new();
     let mut orphan_scores: std::collections::HashMap<String, f32> =
         std::collections::HashMap::new();
 
     for s in synths {
-        let parent_id = &s.drawer.source_file[SENTINEL.len()..];
+        let parent_id = &s.drawer.source_file[PREF_SENTINEL.len()..];
         if let Some(&idx) = by_id.get(parent_id) {
             if s.score > reals[idx].score {
                 reals[idx].score = s.score;
             }
         } else {
             // Track the highest synth score per orphan parent.
+            // HashMap.entry guarantees uniqueness — no per-element dedup needed.
             let cur = orphan_scores
                 .entry(parent_id.to_string())
                 .or_insert(s.score);
             if s.score > *cur {
                 *cur = s.score;
             }
-            if !orphan_parent_ids.iter().any(|pid| pid == parent_id) {
-                orphan_parent_ids.push(parent_id.to_string());
-            }
         }
     }
+
+    // Derive the orphan id list from the HashMap keys (already unique).
+    let orphan_parent_ids: Vec<String> = orphan_scores.keys().cloned().collect();
 
     if !orphan_parent_ids.is_empty() {
         let id_refs: Vec<&str> = orphan_parent_ids.iter().map(|s| s.as_str()).collect();

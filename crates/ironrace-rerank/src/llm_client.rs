@@ -168,9 +168,9 @@ impl LlmClient for AnthropicApiClient {
         // for transient transport errors (DNS, connect, read timeouts). HTTP
         // 4xx/5xx responses are NOT retried — they indicate a config issue
         // (bad key, bad model name) that won't resolve by retrying.
+        let agent = ureq::AgentBuilder::new().timeout(self.timeout).build();
         let mut last_err: Option<anyhow::Error> = None;
         for attempt in 0..3 {
-            let agent = ureq::AgentBuilder::new().timeout(self.timeout).build();
             let result = agent
                 .post(&url)
                 .set("x-api-key", &self.api_key)

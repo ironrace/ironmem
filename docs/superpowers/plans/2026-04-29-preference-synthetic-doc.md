@@ -110,6 +110,8 @@ pub fn synthesize_doc(phrases: &[String]) -> Option<String> {
 }
 ```
 
+> **Note:** the V2 format change (commit `3dd59d0`) dropped the `"User has mentioned: "` prefix in favor of bare `phrases.join(". ")`. The shipped code uses the V2 format; this plan section reflects the V1 design as written.
+
 - [ ] **Step 3: Create a stub `src/patterns.rs`** so the crate compiles before we add patterns
 
 `crates/ironrace-pref-extract/src/patterns.rs`:
