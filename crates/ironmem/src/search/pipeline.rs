@@ -1,4 +1,5 @@
-//! Search pipeline: sanitize → embed → HNSW (multi-query) → BM25 → RRF → KG boost → shrinkage rerank → rank.
+//! Search pipeline: sanitize → embed → HNSW (multi-query) → BM25 → RRF → KG boost
+//!     → collapse synthetic preference siblings → shrinkage rerank → LLM rerank → rank.
 //!
 //! Hybrid retrieval strategy:
 //!   1. Embed the cleaned query (content-word variant only for long queries)
@@ -11,7 +12,9 @@
 
 use std::collections::HashMap;
 
-use crate::db::{knowledge_graph::KnowledgeGraph, ScoredDrawer, SearchFilters};
+use crate::db::{
+    drawers::PREF_SENTINEL, knowledge_graph::KnowledgeGraph, ScoredDrawer, SearchFilters,
+};
 use crate::error::MemoryError;
 use crate::mcp::app::App;
 
@@ -301,17 +304,48 @@ pub fn search(
     let kg = KnowledgeGraph::new(&app.db);
     kg_boost(&mut scored, &sanitized.clean_query, &kg)?;
 
-    // Step 8: Lexical shrinkage rerank (mempalace hybrid-v5 port)
-    let rerank_signals = extract_signals(&sanitized.clean_query);
-    shrinkage_rerank(&mut scored, &rerank_signals);
+    // Step 7.5: collapse synthetic preference siblings into their parent rows.
+    // Cheap when no synthetic hit is in `scored` (single partition pass + early
+    // return). Always-on by structural check; the only way a synth hit reaches
+    // here is if pref-enrichment was enabled at ingest time.
+    collapse_synthetic_into_parents(app, &mut scored)?;
 
-    // Step 9: Deterministic sort — score desc, then drawer_id asc as tiebreak
-    scored.sort_by(|a, b| {
-        b.score
-            .partial_cmp(&a.score)
-            .unwrap_or(std::cmp::Ordering::Equal)
-            .then_with(|| a.drawer.id.cmp(&b.drawer.id))
-    });
+    // Step 8: Lexical shrinkage rerank (mempalace hybrid-v5 port)
+    // Default ON; disable with IRONMEM_SHRINKAGE_RERANK=0 for eval comparisons.
+    let rerank_signals = extract_signals(&sanitized.clean_query);
+    if tunables::shrinkage_rerank_enabled() {
+        shrinkage_rerank(&mut scored, &rerank_signals);
+    }
+
+    // Step 9: Optional LLM rerank.
+    if tunables::rerank_enabled() {
+        app.ensure_reranker_loaded();
+        if let Some(scorer) = app.reranker.read().unwrap().clone() {
+            crate::search::llm_rerank::cross_encoder_rerank(
+                &scorer,
+                &sanitized.clean_query,
+                &mut scored,
+            );
+        }
+    }
+
+    // Step 10: Deterministic sort — score desc, then drawer_id asc as tiebreak.
+    //
+    // When the rerank stage ran, skip the score-based resort. Reranker scores
+    // (e.g. LLM logits or cross-encoder logits) are not commensurable with
+    // upstream shrinkage/RRF scores (~[0, 1]); a mixed sort would let the
+    // un-reranked tail's positive shrinkage scores float above rerank-promoted
+    // items. `llm_rerank::cross_encoder_rerank` already sorts [..rerank_top_k]
+    // correctly, and the tail [rerank_top_k..] retains its pre-rerank order,
+    // so the current ordering is already what we want.
+    if !tunables::rerank_enabled() {
+        scored.sort_by(|a, b| {
+            b.score
+                .partial_cmp(&a.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.drawer.id.cmp(&b.drawer.id))
+        });
+    }
     scored.truncate(limit);
 
     tracing::debug!(
@@ -417,6 +451,89 @@ fn rrf_scores_map_weighted<'a>(
         *scores.entry(id.as_str()).or_default() += bm25_weight * (1.0 / (k + rank as f32 + 1.0));
     }
     scores
+}
+
+/// Step 7.5: collapse synthetic preference siblings into their parent rows.
+///
+/// A synthetic drawer carries `source_file = "pref:<parent_drawer_id>"`. After
+/// scoring, we want the parent to absorb the synth's score (if higher) and the
+/// synth to disappear from the candidate list. If the parent is missing from
+/// `candidates` (because it didn't make HNSW top-N) but the synth did, fetch
+/// the parent by id and surface it with the synth's score; drop the synth.
+/// If the parent has been deleted from the DB, drop the synth quietly.
+///
+/// This runs *before* the rerank stages so all downstream scoring sees only
+/// real drawers and so RRF/KG scores remain commensurable.
+pub fn collapse_synthetic_into_parents(
+    app: &App,
+    candidates: &mut Vec<ScoredDrawer>,
+) -> Result<(), MemoryError> {
+    // Partition: (synth, real). Both keep insertion order to keep the ordering
+    // step downstream deterministic.
+    let mut synths: Vec<ScoredDrawer> = Vec::new();
+    let mut reals: Vec<ScoredDrawer> = Vec::with_capacity(candidates.len());
+    for sd in candidates.drain(..) {
+        if sd.drawer.source_file.starts_with(PREF_SENTINEL) {
+            synths.push(sd);
+        } else {
+            reals.push(sd);
+        }
+    }
+
+    if synths.is_empty() {
+        *candidates = reals;
+        return Ok(());
+    }
+
+    // Build a parent_id → real-index map for O(1) lookup.
+    let mut by_id: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    for (i, r) in reals.iter().enumerate() {
+        by_id.insert(r.drawer.id.clone(), i);
+    }
+
+    // First pass: promote scores for parents already in `reals`. Defer
+    // orphan-parent fetches to a single batched DB call.
+    let mut orphan_scores: std::collections::HashMap<String, f32> =
+        std::collections::HashMap::new();
+
+    for s in synths {
+        let parent_id = &s.drawer.source_file[PREF_SENTINEL.len()..];
+        if let Some(&idx) = by_id.get(parent_id) {
+            if s.score > reals[idx].score {
+                reals[idx].score = s.score;
+            }
+        } else {
+            // Track the highest synth score per orphan parent.
+            // HashMap.entry guarantees uniqueness — no per-element dedup needed.
+            let cur = orphan_scores
+                .entry(parent_id.to_string())
+                .or_insert(s.score);
+            if s.score > *cur {
+                *cur = s.score;
+            }
+        }
+    }
+
+    // Derive the orphan id list from the HashMap keys (already unique).
+    let orphan_parent_ids: Vec<String> = orphan_scores.keys().cloned().collect();
+
+    if !orphan_parent_ids.is_empty() {
+        let id_refs: Vec<&str> = orphan_parent_ids.iter().map(|s| s.as_str()).collect();
+        let fetched = app.db.get_drawers_by_ids(&id_refs)?;
+        for pid in &orphan_parent_ids {
+            if let Some(parent) = fetched.get(pid) {
+                let score = orphan_scores.get(pid).copied().unwrap_or(0.0);
+                reals.push(ScoredDrawer {
+                    drawer: parent.clone(),
+                    score,
+                });
+            }
+            // else: parent deleted between index and query — drop quietly.
+        }
+    }
+
+    *candidates = reals;
+    Ok(())
 }
 
 /// Boost search scores using knowledge graph entity relationships.

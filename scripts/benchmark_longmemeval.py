@@ -98,7 +98,7 @@ class McpClient:
             self.cmd,
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
             env={**os.environ, **self.env},
             text=True,
         )
@@ -131,7 +131,14 @@ class McpClient:
         self._proc.stdin.flush()
         line = self._proc.stdout.readline()
         if not line:
-            raise RuntimeError(f"{self.name}: server closed stdout")
+            stderr = ""
+            if self._proc.stderr:
+                try:
+                    stderr = self._proc.stderr.read().decode("utf-8", "replace")
+                except Exception:
+                    # Stderr capture is best-effort; preserve the primary stdout-closed error.
+                    pass
+            raise RuntimeError(f"{self.name}: server closed stdout. stderr:\n{stderr}")
         return json.loads(line)
 
     def call_tool(self, name: str, arguments: dict) -> dict:
@@ -184,7 +191,8 @@ def _corpus_cache_key(docs: list[str], granularity: str, ingest_env: dict[str, s
         h.update(doc.encode())
     h.update(granularity.encode())
     write_vars = {k: v for k, v in sorted(ingest_env.items())
-                  if k in ("IRONMEM_PREF_ENRICH",)}
+                  if k in ("IRONMEM_PREF_ENRICH", "IRONMEM_PREF_EXTRACTOR",
+                           "IRONMEM_PREF_LLM_MODEL")}
     h.update(json.dumps(write_vars, sort_keys=True).encode())
     return h.hexdigest()[:24]
 
@@ -626,7 +634,7 @@ def main() -> int:
     results: list[dict] = []
 
     if args.backend in ("ironrace", "both"):
-        binary = Path(args.binary).expanduser().resolve()
+        binary = Path(args.ironmem_binary).expanduser().resolve()
         if not binary.exists():
             print(f"ironmem binary not found: {binary}", file=sys.stderr)
             return 1

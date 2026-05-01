@@ -35,6 +35,10 @@ fn fts5_sanitize(query: &str) -> String {
 use super::schema::Database;
 use crate::error::MemoryError;
 
+/// Sentinel prefix that marks a drawer as a synthetic preference sibling.
+/// A synthetic drawer has `source_file = "pref:<parent_drawer_id>"`.
+pub(crate) const PREF_SENTINEL: &str = "pref:";
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Drawer {
     pub id: String,
@@ -174,8 +178,31 @@ impl Database {
     }
 
     pub(crate) fn delete_drawer_tx(tx: &Transaction<'_>, id: &str) -> Result<bool, MemoryError> {
+        // Cascade: any synthetic sibling drawer points back via source_file = "pref:<id>".
+        Self::delete_drawers_by_parent_tx(tx, id)?;
         let count = Self::delete_drawer_conn(tx, id)?;
         Ok(count > 0)
+    }
+
+    pub(crate) fn delete_drawers_by_parent_tx(
+        tx: &Transaction<'_>,
+        parent_id: &str,
+    ) -> Result<usize, MemoryError> {
+        let sentinel = format!("{PREF_SENTINEL}{parent_id}");
+        // Remove matching drawers from FTS index first (best-effort).
+        // Silently skip if the FTS table doesn't exist yet (pre-migration DBs).
+        if let Err(e) = tx.execute(
+            "DELETE FROM drawers_fts WHERE drawer_id IN \
+             (SELECT id FROM drawers WHERE source_file = ?1)",
+            params![sentinel],
+        ) {
+            tracing::debug!("FTS5 sync skipped (table may not exist yet): {e}");
+        }
+        let n = tx.execute(
+            "DELETE FROM drawers WHERE source_file = ?1",
+            params![sentinel],
+        )?;
+        Ok(n)
     }
 
     pub(crate) fn delete_drawers_by_source_file_tx(

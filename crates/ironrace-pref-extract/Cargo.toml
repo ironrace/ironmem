@@ -1,0 +1,9 @@
+[package]
+name = "ironrace-pref-extract"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+description = "Conversational-text preference extractor for ironrace-memory."
+
+[dependencies]
+regex = "1"

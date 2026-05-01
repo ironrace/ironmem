@@ -7,4 +7,4 @@ pub mod schema;
 pub mod wal;
 
 /// Search result types returned from drawer queries.
-pub use drawers::{ScoredDrawer, SearchFilters};
+pub use drawers::{Drawer, ScoredDrawer, SearchFilters};

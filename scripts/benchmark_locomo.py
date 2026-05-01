@@ -248,6 +248,8 @@ def run_locomo_benchmark(
     limit: int,
     n_results: int,
     ef_search: int | None,
+    rerank: str = "none",
+    shrinkage: str = "on",
 ) -> dict:
     """Run LoCoMo retrieval benchmark against ironmem.
 
@@ -271,6 +273,9 @@ def run_locomo_benchmark(
     }
     if ef_search is not None:
         env["IRONMEM_EF_SEARCH"] = str(ef_search)
+    if rerank != "none":
+        env["IRONMEM_RERANK"] = rerank
+    env["IRONMEM_SHRINKAGE_RERANK"] = "1" if shrinkage == "on" else "0"
 
     client = McpClient(
         name="ironmem",
@@ -445,6 +450,18 @@ def parse_args() -> argparse.Namespace:
         default="./target/release/ironmem",
         help="Path to ironmem binary (default: ./target/release/ironmem)",
     )
+    p.add_argument(
+        "--rerank",
+        choices=["none", "cross_encoder", "llm_haiku"],
+        default="none",
+        help="Reranker mode (env: IRONMEM_RERANK)",
+    )
+    p.add_argument(
+        "--shrinkage",
+        choices=["on", "off"],
+        default="on",
+        help="Lexical shrinkage rerank (env: IRONMEM_SHRINKAGE_RERANK)",
+    )
     p.add_argument("--ef-search", type=int, default=None, help="Override HNSW ef_search")
     p.add_argument("--output-json", default=None, help="Write results to JSON file")
     return p.parse_args()
@@ -475,11 +492,23 @@ def main() -> int:
         limit=args.limit,
         n_results=args.n_results,
         ef_search=args.ef_search,
+        rerank=args.rerank,
+        shrinkage=args.shrinkage,
     )
     print_results([result])
 
     if args.output_json:
-        Path(args.output_json).write_text(json.dumps([result], indent=2))
+        out = {
+            "config": {
+                "limit": args.limit,
+                "n_results": args.n_results,
+                "ef_search": args.ef_search,
+                "rerank": args.rerank,
+                "shrinkage": args.shrinkage,
+            },
+            "results": [result],
+        }
+        Path(args.output_json).write_text(json.dumps(out, indent=2))
         print(f"Results written to {args.output_json}")
 
     return 0

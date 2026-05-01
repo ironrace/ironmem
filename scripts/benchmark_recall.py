@@ -423,6 +423,8 @@ def run_ironrace(
     model_dir: str | None,
     seed: int,
     ef_search: int | None = None,
+    rerank: str = "none",
+    shrinkage: str = "on",
 ) -> ScaleResult:
     needle_docs = _make_needle_docs(n_needles, seed)
     n_background = scale - n_needles
@@ -444,6 +446,9 @@ def run_ironrace(
         env["IRONMEM_MODEL_DIR"] = model_dir
     if ef_search is not None:
         env["IRONMEM_EF_SEARCH"] = str(ef_search)
+    if rerank != "none":
+        env["IRONMEM_RERANK"] = rerank
+    env["IRONMEM_SHRINKAGE_RERANK"] = "1" if shrinkage == "on" else "0"
 
     try:
         if use_mine:
@@ -679,6 +684,18 @@ Examples:
         help="Optional path to ONNX model directory for ironmem",
     )
     p.add_argument(
+        "--rerank",
+        choices=["none", "cross_encoder", "llm_haiku"],
+        default="none",
+        help="Reranker mode (env: IRONMEM_RERANK)",
+    )
+    p.add_argument(
+        "--shrinkage",
+        choices=["on", "off"],
+        default="on",
+        help="Lexical shrinkage rerank (env: IRONMEM_SHRINKAGE_RERANK)",
+    )
+    p.add_argument(
         "--compare-mempalace",
         action="store_true",
         help="Also benchmark mempalace at scales <=10k (requires Python 3.11)",
@@ -749,6 +766,8 @@ def main() -> int:
                 model_dir=args.ironmem_model_dir,
                 seed=args.seed,
                 ef_search=ef,
+                rerank=args.rerank,
+                shrinkage=args.shrinkage,
             )
             elapsed = time.perf_counter() - t0
             results.append(r)
@@ -769,22 +788,31 @@ def main() -> int:
     print_results(results)
 
     if args.output_json:
-        out = [
-            {
-                "scale": r.scale,
-                "backend": r.backend,
-                "ingestion_method": r.ingestion_method,
-                "recall_at_1": round(r.recall_at_1, 4),
-                "recall_at_5": round(r.recall_at_5, 4),
-                "recall_at_10": round(r.recall_at_10, 4),
-                "mrr": round(r.mrr, 4),
-                "search_p50_ms": round(r.search_p50_ms, 2),
-                "search_p95_ms": round(r.search_p95_ms, 2),
-                "needles_tested": r.needles_tested,
-                "ingestion_total_ms": round(r.ingestion_total_ms, 1),
-            }
-            for r in results
-        ]
+        out = {
+            "config": {
+                "scales": scales,
+                "seed": args.seed,
+                "ef_search": args.ef_search,
+                "rerank": args.rerank,
+                "shrinkage": args.shrinkage,
+            },
+            "results": [
+                {
+                    "scale": r.scale,
+                    "backend": r.backend,
+                    "ingestion_method": r.ingestion_method,
+                    "recall_at_1": round(r.recall_at_1, 4),
+                    "recall_at_5": round(r.recall_at_5, 4),
+                    "recall_at_10": round(r.recall_at_10, 4),
+                    "mrr": round(r.mrr, 4),
+                    "search_p50_ms": round(r.search_p50_ms, 2),
+                    "search_p95_ms": round(r.search_p95_ms, 2),
+                    "needles_tested": r.needles_tested,
+                    "ingestion_total_ms": round(r.ingestion_total_ms, 1),
+                }
+                for r in results
+            ],
+        }
         Path(args.output_json).write_text(json.dumps(out, indent=2))
         print(f"Results written to {args.output_json}")
 

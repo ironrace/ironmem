@@ -1161,6 +1161,8 @@ dependencies = [
  "ignore",
  "ironrace-core",
  "ironrace-embed",
+ "ironrace-pref-extract",
+ "ironrace-rerank",
  "libc",
  "regex",
  "rusqlite",
@@ -1194,6 +1196,24 @@ dependencies = [
  "ort",
  "sha2",
  "tokenizers",
+]
+
+[[package]]
+name = "ironrace-pref-extract"
+version = "0.1.0"
+dependencies = [
+ "regex",
+]
+
+[[package]]
+name = "ironrace-rerank"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "serde",
+ "serde_json",
+ "tracing",
+ "ureq 2.12.1",
 ]
 
 [[package]]

@@ -37,7 +37,6 @@ pub(super) fn handle_add_drawer(app: &App, args: &Value) -> Result<Value, Memory
 
     let id = crate::db::drawers::generate_id(content, &wing, &room);
 
-    // Ensure real embedder is loaded before embedding (no-op after first call).
     app.ensure_embedder_ready()?;
 
     let embedding = {
@@ -48,27 +47,121 @@ pub(super) fn handle_add_drawer(app: &App, args: &Value) -> Result<Value, Memory
         emb.embed_one(content).map_err(MemoryError::Embed)?
     };
 
+    // Compute synthetic sibling, if enrichment is enabled and content qualifies.
+    let synth: Option<(String, String, Vec<f32>)> =
+        build_synthetic(app, content, &wing, &room, &id)?;
+
     app.db.with_transaction(|tx| {
         crate::db::schema::Database::insert_drawer_tx(
             tx, &id, content, &embedding, &wing, &room, "", "mcp",
         )?;
+        if let Some((sid, scontent, semb)) = synth.as_ref() {
+            let parent_ref = format!("{}{id}", crate::db::drawers::PREF_SENTINEL);
+            crate::db::schema::Database::insert_drawer_tx(
+                tx,
+                sid,
+                scontent,
+                semb,
+                &wing,
+                &room,
+                &parent_ref,
+                "mcp",
+            )?;
+        }
         crate::db::schema::Database::wal_log_tx(
             tx,
             "add_drawer",
-            &json!({"id": &id, "wing": &wing, "room": &room}),
+            &json!({"id": &id, "wing": &wing, "room": &room, "synth": synth.is_some()}),
             None,
         )?;
         Ok(())
     })?;
 
     app.insert_into_index(&id, &embedding)?;
+    if let Some((sid, _, semb)) = synth.as_ref() {
+        if let Err(e) = app.insert_into_index(sid, semb) {
+            tracing::warn!(
+                error = %e,
+                parent = %id,
+                synth = %sid,
+                "pref_enrich index insert failed; marking dirty for rebuild"
+            );
+            app.mark_dirty();
+        }
+    }
 
     Ok(json!({
         "success": true,
         "id": id,
         "wing": wing,
         "room": room,
+        "synth": synth.is_some(),
     }))
+}
+
+/// Build a synthetic preference-enrichment drawer, or return Ok(None) if the
+/// tunable is off, the content doesn't look conversational, or the extractor
+/// produced no phrases. A failure to embed the synthetic body logs at warn
+/// and returns Ok(None) — the parent insert continues unaffected.
+fn build_synthetic(
+    app: &App,
+    content: &str,
+    wing: &str,
+    room: &str,
+    parent_id: &str,
+) -> Result<Option<(String, String, Vec<f32>)>, MemoryError> {
+    use ironrace_pref_extract::{
+        looks_conversational, synthesize_doc, PreferenceExtractor, RegexPreferenceExtractor,
+    };
+    use std::time::Duration;
+
+    if !crate::search::tunables::pref_enrich_enabled() {
+        return Ok(None);
+    }
+    if !looks_conversational(content) {
+        return Ok(None);
+    }
+    let phrases: Vec<String> = match crate::search::tunables::pref_extractor() {
+        "llm" => {
+            let timeout = Duration::from_millis(crate::search::tunables::pref_llm_timeout_ms());
+            let model = crate::search::tunables::pref_llm_model();
+            let extractor = match crate::search::tunables::pref_llm_backend() {
+                "api" => crate::search::pref_extract_llm::api_extractor(
+                    model,
+                    crate::search::tunables::pref_llm_max_tokens(),
+                    timeout,
+                ),
+                _ => crate::search::pref_extract_llm::cli_extractor(model, timeout),
+            };
+            extractor.extract(content)
+        }
+        _ => RegexPreferenceExtractor.extract(content),
+    };
+    let synth_body = match synthesize_doc(&phrases) {
+        Some(s) => s,
+        None => return Ok(None),
+    };
+    let synth_id = crate::db::drawers::generate_id(&synth_body, wing, room);
+    let synth_emb = {
+        let mut emb = app
+            .embedder
+            .write()
+            .map_err(|e| MemoryError::Lock(format!("Embedder lock poisoned: {e}")))?;
+        match emb.embed_one(&synth_body) {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!(error = %e, parent = parent_id, "pref_enrich embed failed; skipping synth");
+                return Ok(None);
+            }
+        }
+    };
+    tracing::debug!(
+        parent = parent_id,
+        synth = %synth_id,
+        phrases = phrases.len(),
+        "pref_enrich"
+    );
+    Ok(Some((synth_id, synth_body, synth_emb)))
 }
 
 pub(super) fn handle_delete_drawer(app: &App, args: &Value) -> Result<Value, MemoryError> {

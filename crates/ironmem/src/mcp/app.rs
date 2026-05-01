@@ -23,6 +23,7 @@ pub struct App {
     pub config: Config,
     pub db: Database,
     pub embedder: RwLock<Embedder>,
+    pub(crate) reranker: RwLock<Option<Arc<dyn ironrace_rerank::RerankerScorer>>>,
     pub index_state: RwLock<IndexState>,
     /// Dirty flag: set after writes, cleared after rebuild.
     dirty: AtomicBool,
@@ -84,6 +85,7 @@ impl App {
             config,
             db,
             embedder: RwLock::new(embedder),
+            reranker: RwLock::new(None),
             index_state: RwLock::new(IndexState { index, id_map }),
             dirty: AtomicBool::new(false),
             graph_cache: RwLock::new(None),
@@ -110,6 +112,7 @@ impl App {
             config,
             db,
             embedder: RwLock::new(Embedder::new_noop()),
+            reranker: RwLock::new(None),
             index_state: RwLock::new(IndexState {
                 index: VectorIndex::build(&[], 100),
                 id_map: Vec::new(),
@@ -160,6 +163,7 @@ impl App {
             config,
             db,
             embedder: RwLock::new(embedder),
+            reranker: RwLock::new(None),
             index_state: RwLock::new(IndexState {
                 index: VectorIndex::build(&[], 100),
                 id_map: Vec::new(),
@@ -236,6 +240,69 @@ impl App {
             self.rebuild_index_from_db()?;
         }
         Ok(())
+    }
+
+    /// Lazy-construct the production LLM reranker. Called from the pipeline on
+    /// the first search where `tunables::rerank_enabled()` is true AND the field
+    /// is `None`. Construction itself cannot fail — subprocess errors only
+    /// surface on first `score_pairs` call, where the rerank module degrades
+    /// gracefully (logs a `WARN`, returns the un-reranked candidates).
+    ///
+    /// Wired in from the search pipeline (step 9).
+    pub(crate) fn ensure_reranker_loaded(&self) {
+        {
+            let r = self.reranker.read().unwrap();
+            if r.is_some() {
+                return;
+            }
+        }
+        let mut w = self.reranker.write().unwrap();
+        if w.is_some() {
+            return; // raced — another thread loaded it
+        }
+        let model = crate::search::tunables::llm_rerank_model();
+        let timeout =
+            std::time::Duration::from_millis(crate::search::tunables::llm_rerank_timeout_ms());
+        let backend = crate::search::tunables::llm_rerank_backend();
+
+        // Backend selection: "api" → direct Anthropic Messages API (billed,
+        // requires a key); anything else → local `claude` CLI via subscription
+        // auth (free per call, ~1-3s subprocess startup).
+        match backend {
+            "api" => {
+                let key = crate::search::tunables::anthropic_api_key().unwrap_or_else(|| {
+                    panic!(
+                        "IRONMEM_LLM_RERANK_BACKEND=api requires ANTHROPIC_API_KEY or \
+                         IRONMEM_ANTHROPIC_API_KEY to be set"
+                    );
+                });
+                let max_tokens = crate::search::tunables::llm_rerank_max_tokens();
+                let client = ironrace_rerank::AnthropicApiClient::new(key, model.clone(), timeout)
+                    .with_max_tokens(max_tokens);
+                let reranker = ironrace_rerank::LlmReranker::new(client);
+                *w = Some(Arc::new(reranker));
+                tracing::info!(model = %model, backend = "api", max_tokens, "LLM reranker loaded");
+            }
+            _ => {
+                let client = ironrace_rerank::ClaudeCliClient::new(model.clone(), timeout);
+                let reranker = ironrace_rerank::LlmReranker::new(client);
+                *w = Some(Arc::new(reranker));
+                tracing::info!(model = %model, backend = "cli", "LLM reranker loaded");
+            }
+        }
+    }
+
+    /// Test-only — production code should use `ensure_reranker_loaded`.
+    ///
+    /// Constructs a test `App` (in-memory DB, noop embedder) and installs a
+    /// pre-built `RerankerScorer` so integration tests can exercise the
+    /// rerank path without booting ONNX. Mirrors `open_for_test`.
+    pub fn with_reranker(
+        scorer: Arc<dyn ironrace_rerank::RerankerScorer>,
+    ) -> Result<Self, MemoryError> {
+        let app = Self::open_for_test()?;
+        *app.reranker.write().unwrap() = Some(scorer);
+        Ok(app)
     }
 
     /// Swap the real embedder into this App. Called once after background init completes.
