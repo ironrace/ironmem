@@ -278,3 +278,22 @@ pub fn pref_llm_max_tokens() -> u32 {
     static V: OnceLock<u32> = OnceLock::new();
     *V.get_or_init(|| env_usize("IRONMEM_PREF_LLM_MAX_TOKENS", 200) as u32)
 }
+
+// ── shrinkage matcher mode ──────────────────────────────────────────────────
+
+/// `IRONMEM_SHRINKAGE_WORD_BOUNDARY=0` reverts the shrinkage rerank's
+/// keyword/name matcher to legacy substring behavior. Default ON.
+///
+/// The legacy path (`String::contains`) causes false-positive boosts: a
+/// predicate keyword like "suggest" substring-matches drawer text
+/// "suggestions"; "current" matches "currently". Word-boundary matching
+/// with a small set of English suffix tolerances (s|es|ed|ing|ion|ions)
+/// fixes the substring confusion without losing inflected-form recall.
+///
+/// Not OnceLock-cached: the integration tests need to flip this per-test.
+pub fn shrinkage_word_boundary_enabled() -> bool {
+    !matches!(
+        std::env::var("IRONMEM_SHRINKAGE_WORD_BOUNDARY").as_deref(),
+        Ok("0") | Ok("false")
+    )
+}
