@@ -69,14 +69,18 @@ git log origin/main --oneline -20 | grep -i "python labeler\|provbench-v1.2b-pyt
 
 Expected: a merge commit matching Plan A's PR title. If empty, STOP — Plan A must merge first. Plan B's labeler-pin must reference a commit on `origin/main` so reviewers can reproduce.
 
-- [ ] **Step 2: Record Plan A's merged SHA as the labeler pin**
+- [ ] **Step 2: Set labeler pin to the literal Plan A merge SHA**
 
 ```bash
-PLAN_A_SHA=$(git rev-parse origin/main)
+# CORRECTION (Codex v1 review): pin to literal SHA, NOT `$(git rev-parse origin/main)`.
+# If origin/main has advanced since the Plan A merge, the labeler pin would drift silently.
+# The literal SHA below is PR #50's merge commit.
+PLAN_A_SHA=c623298f88e1704363c60a5873528f457209734e
 echo "$PLAN_A_SHA"
+git cat-file -e "$PLAN_A_SHA^{commit}"   # verify reachable; abort if not
 ```
 
-Edit this plan file: replace every `c623298f88e1704363c60a5873528f457209734e` placeholder (3 occurrences in the frontmatter "Frozen pins", File Structure, and Task 2 worktree paths) with the recorded SHA. Commit:
+The 9 frontmatter occurrences of this SHA were already populated by an earlier commit. No further plan-file replacement is needed in this step.
 
 ```bash
 git add docs/superpowers/plans/2026-05-15-provbench-v1.2b-flask-heldout.md
@@ -137,14 +141,20 @@ git status --short benchmarks/provbench/work/flask # empty (ignored)
 
 If the checkout appears in `git status`, fix `.gitignore` BEFORE proceeding (committing the flask tree would explode repo size).
 
-- [ ] **Step 9: Verify flask HEAD is different from T₀**
+- [ ] **Step 9: Advance flask HEAD to the chosen replay SHA**
+
+The local `work/flask` checkout is currently at T₀ (`2f0c62f5...`) which would yield zero replay commits. **Explicitly checkout** (not just record) the replay HEAD per Codex's v1 review note 2:
 
 ```bash
-git -C benchmarks/provbench/work/flask log --first-parent --oneline 2f0c62f5..origin/main | wc -l
-# expect: a positive number — held-out replay requires HEAD ≠ T₀ (see memory project_provbench_labeler_pin_quirks.md)
+git -C benchmarks/provbench/work/flask fetch origin main
+git -C benchmarks/provbench/work/flask checkout 9fcd34c9f3065640bd1cd86234216ca068633fb9
+git -C benchmarks/provbench/work/flask rev-parse HEAD
+# expect: 9fcd34c9f3065640bd1cd86234216ca068633fb9
+git -C benchmarks/provbench/work/flask log --first-parent --oneline 2f0c62f5..HEAD | wc -l
+# expect: ~401 first-parent commits ahead of T₀
 ```
 
-If zero, choose a current HEAD downstream of T₀ (record in findings) — for first-pass execution, use `origin/main` of flask. Record the chosen HEAD SHA for §11.
+Record the chosen HEAD SHA `9fcd34c9f3065640bd1cd86234216ca068633fb9` and the first-parent commit count in the findings + §11 row. T₀ stays at `2f0c62f5...` in every labeler `--t0` argument; only the working-tree HEAD moves.
 
 ---
 
@@ -201,7 +211,7 @@ git branch --show-current          # expect: feat/provbench-v1.2b-flask-heldout
 ```bash
 LBL=/tmp/ironmem-worktrees/labeler-$PLAN_A_SHA/target/release/provbench-labeler
 SHA7=$(echo "$PLAN_A_SHA" | cut -c1-7)
-$LBL emit-corpus \
+$LBL run \
   --repo benchmarks/provbench/work/flask \
   --t0   2f0c62f5e6e290843f03c1fa70817c7a3c7fd661 \
   --out  benchmarks/provbench/corpus/flask-2f0c62f5-$SHA7.jsonl
