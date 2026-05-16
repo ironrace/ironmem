@@ -10,7 +10,7 @@
 
 **Frozen pins (do not bump):**
 - Spec freeze hash: `683d023934c181a8714b9d24c53d011caed31f511becf82ed9e5def92e0ff37c`
-- **Labeler git SHA (Python-capable):** `<plan-A-merge-sha>` — pin AT PLAN B KICKOFF from `git rev-parse origin/main` after Plan A's PR merges. Record in this file before any execution begins; once recorded, freeze.
+- **Labeler git SHA (Python-capable):** `c623298f88e1704363c60a5873528f457209734e` — pin AT PLAN B KICKOFF from `git rev-parse origin/main` after Plan A's PR merges. Record in this file before any execution begins; once recorded, freeze.
 - Phase 1 git SHA: `97cef97` (v1.2; from v1.2a R4 Field-kind guard relaxation, SPEC §11 row dated 2026-05-15)
 - Rule set version: `v1.2`
 - Sample seed: `13897750829054410479` (= `0xC0DEBABEDEADBEEF`; pass as decimal — clap's default `u64` parser does NOT accept hex)
@@ -58,7 +58,7 @@
 - Create: `/tmp/ironmem-worktrees/phase1-97cef97/` (git worktree)
 - Create: `benchmarks/provbench/work/flask/` (git clone)
 - Inspect: `.gitignore`
-- Modify: this plan's frontmatter (replace `<plan-A-merge-sha>` placeholder)
+- Modify: this plan's frontmatter (replace `c623298f88e1704363c60a5873528f457209734e` placeholder)
 
 - [ ] **Step 1: Confirm Plan A has merged to `main`**
 
@@ -76,7 +76,7 @@ PLAN_A_SHA=$(git rev-parse origin/main)
 echo "$PLAN_A_SHA"
 ```
 
-Edit this plan file: replace every `<plan-A-merge-sha>` placeholder (3 occurrences in the frontmatter "Frozen pins", File Structure, and Task 2 worktree paths) with the recorded SHA. Commit:
+Edit this plan file: replace every `c623298f88e1704363c60a5873528f457209734e` placeholder (3 occurrences in the frontmatter "Frozen pins", File Structure, and Task 2 worktree paths) with the recorded SHA. Commit:
 
 ```bash
 git add docs/superpowers/plans/2026-05-15-provbench-v1.2b-flask-heldout.md
@@ -601,7 +601,7 @@ Skeleton — fill in actual numbers from Task 7:
 **Run dir:** `benchmarks/provbench/results/flask-heldout-2026-05-15-canary/`
 **Held-out repo:** `pallets/flask @ 2f0c62f5e6e290843f03c1fa70817c7a3c7fd661` (T₀ = `2.0.0`)
 **HEAD at run:** `<recorded SHA from Task 1 Step 9>`
-**Labeler git SHA:** `<plan-A-merge-sha>` (Python-capable build from Plan A)
+**Labeler git SHA:** `c623298f88e1704363c60a5873528f457209734e` (Python-capable build from Plan A)
 **Phase 1 git SHA:** `97cef97` (`rule_set_version v1.2`, R4 Field-kind guard relaxation from v1.2a)
 **Sample seed:** `0xC0DEBABEDEADBEEF` (decimal `13897750829054410479`)
 **SPEC freeze hash:** `683d023934c181a8714b9d24c53d011caed31f511becf82ed9e5def92e0ff37c`
@@ -642,7 +642,7 @@ Interpret the per-rule confusion + Field-kind breakdown.]
 
 ## §10 anti-leakage attestation
 - Phase 1 source byte-identical to `97cef97` across the run (Task 6 Step 2 verified).
-- Labeler git SHA frozen at `<plan-A-merge-sha>` from kickoff; no labeler bump mid-run.
+- Labeler git SHA frozen at `c623298f88e1704363c60a5873528f457209734e` from kickoff; no labeler bump mid-run.
 - No rule retuning in-round.
 - v1.0 / v1.1 / v1.2 pilot canary artifacts not rewritten by this round.
 
@@ -694,7 +694,7 @@ Confirm the column structure (date | section | observation | rationale | spec im
 Sketch — fill in actual numbers and PASS/FAIL verdicts:
 
 ```markdown
-| 2026-05-15 | §9.4 (record only) | Second §9.4 held-out result recorded: pallets/flask @ `2f0c62f5e6e290843f03c1fa70817c7a3c7fd661` (T₀ = `2.0.0`, HEAD = `<recorded>`) + labeler @ `<plan-A-merge-sha>` (Python-capable build; tree-sitter-python 0.25 per §13.1) + phase1 @ `97cef97`, `rule_set_version v1.2`, no in-round retuning. Result: **<PASS|FAIL> §8 #3** (valid retention WLB `<observed>` <op> `0.95`; v1.1 serde was `0.9062`, v1.2a ripgrep pilot was `0.9729`). §8 #4 (`latency_p50_ms` = `<observed>`) <PASS|FAIL> and §8 #5 (`stale_detection.wilson_lower_95` = `<observed>`) <PASS|FAIL>. Per-rule confusion attributes [§8 #3 verdict] to [dominant rule]. Held-out subset n=`<S>` (stratified, default targets, seed `0xC0DEBABEDEADBEEF`); corpus n=`<N>`; `<K>` first-parent commits T₀→HEAD. Findings: `benchmarks/provbench/results/flask-heldout-2026-05-15-findings.md`. | Second held-out evaluation per SPEC §9.4 / §10. The v1.2a R4 Field-kind guard relaxation was tuned on ripgrep pilot only; this is its first held-out test on a new language family. [Narrative: did it generalize?] | None for SPEC §§1–10 / §12–§15 (frozen body untouched). The §10 anti-leakage contract holds verbatim: phase1 source byte-identical to `97cef97` (`git diff` empty); v1.0 / v1.1 / v1.2 pilot canary artifacts not rewritten; labeler git SHA frozen at `<plan-A-merge-sha>` from kickoff. Acceptance test `phase1/tests/end_to_end_heldout_flask.rs` is `#[ignore]` and asserts §8 verbatim — it [passes/fails honestly on §8 #3, which IS the recorded held-out result]. |
+| 2026-05-15 | §9.4 (record only) | Second §9.4 held-out result recorded: pallets/flask @ `2f0c62f5e6e290843f03c1fa70817c7a3c7fd661` (T₀ = `2.0.0`, HEAD = `<recorded>`) + labeler @ `c623298f88e1704363c60a5873528f457209734e` (Python-capable build; tree-sitter-python 0.25 per §13.1) + phase1 @ `97cef97`, `rule_set_version v1.2`, no in-round retuning. Result: **<PASS|FAIL> §8 #3** (valid retention WLB `<observed>` <op> `0.95`; v1.1 serde was `0.9062`, v1.2a ripgrep pilot was `0.9729`). §8 #4 (`latency_p50_ms` = `<observed>`) <PASS|FAIL> and §8 #5 (`stale_detection.wilson_lower_95` = `<observed>`) <PASS|FAIL>. Per-rule confusion attributes [§8 #3 verdict] to [dominant rule]. Held-out subset n=`<S>` (stratified, default targets, seed `0xC0DEBABEDEADBEEF`); corpus n=`<N>`; `<K>` first-parent commits T₀→HEAD. Findings: `benchmarks/provbench/results/flask-heldout-2026-05-15-findings.md`. | Second held-out evaluation per SPEC §9.4 / §10. The v1.2a R4 Field-kind guard relaxation was tuned on ripgrep pilot only; this is its first held-out test on a new language family. [Narrative: did it generalize?] | None for SPEC §§1–10 / §12–§15 (frozen body untouched). The §10 anti-leakage contract holds verbatim: phase1 source byte-identical to `97cef97` (`git diff` empty); v1.0 / v1.1 / v1.2 pilot canary artifacts not rewritten; labeler git SHA frozen at `c623298f88e1704363c60a5873528f457209734e` from kickoff. Acceptance test `phase1/tests/end_to_end_heldout_flask.rs` is `#[ignore]` and asserts §8 verbatim — it [passes/fails honestly on §8 #3, which IS the recorded held-out result]. |
 ```
 
 - [ ] **Step 4: Commit**
@@ -720,7 +720,7 @@ gh pr create --base main \
   --body "$(cat <<'EOF'
 ## Summary
 - §9.4 held-out evaluation of phase1 v1.2 (R4 Field-kind guard relaxation from v1.2a) on `pallets/flask @ 2f0c62f5e6e290843f03c1fa70817c7a3c7fd661`.
-- Labeler: Python-capable build from PR #<plan-A-PR-num> (SHA `<plan-A-merge-sha>`).
+- Labeler: Python-capable build from PR #<plan-A-PR-num> (SHA `c623298f88e1704363c60a5873528f457209734e`).
 - No in-round retuning. SPEC §11 row appended.
 
 ## Verdict
@@ -732,7 +732,7 @@ Detailed findings: `benchmarks/provbench/results/flask-heldout-2026-05-15-findin
 
 ## §10 anti-leakage attestation
 - Phase 1 source byte-identical to `97cef97` across the run.
-- Labeler frozen at `<plan-A-merge-sha>` from kickoff.
+- Labeler frozen at `c623298f88e1704363c60a5873528f457209734e` from kickoff.
 - No rule retuning, no labeler bump, no pilot canary artifact rewrites.
 
 ## Test plan
@@ -759,7 +759,7 @@ After PR merges, save a project memory entry summarizing the v1.2b verdict, the 
    - SPEC §13.1 tree-sitter-python pin → Task 2 Step 3 (verify-tooling)
    - SPEC §13.2 held-out #2 pin → Task 1 Step 7
 
-2. **Placeholder scan:** Three intentional `<plan-A-merge-sha>` and one `<recorded>` HEAD placeholder live in this plan — Task 1 Step 2 replaces all `<plan-A-merge-sha>` occurrences, and Task 1 Step 9 records HEAD. Findings + §11 templates contain `<observed>` / `<wlb>` / `<ms>` placeholders that are filled in by Task 10 / Task 11 from actual metrics.json values. These are not unbounded placeholders — each has a concrete source.
+2. **Placeholder scan:** Three intentional `c623298f88e1704363c60a5873528f457209734e` and one `<recorded>` HEAD placeholder live in this plan — Task 1 Step 2 replaces all `c623298f88e1704363c60a5873528f457209734e` occurrences, and Task 1 Step 9 records HEAD. Findings + §11 templates contain `<observed>` / `<wlb>` / `<ms>` placeholders that are filled in by Task 10 / Task 11 from actual metrics.json values. These are not unbounded placeholders — each has a concrete source.
 
 3. **Type consistency:** `$PLAN_A_SHA`, `$SHA7`, `$RUNDIR`, `$LBL`, `$PH1` bash variables used consistently across tasks 1-7.
 
