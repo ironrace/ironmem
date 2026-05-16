@@ -181,7 +181,16 @@ What this round established:
 
 For v1.2c (next round if pursued):
 
-- Decide between (a) **extending the labeler to emit `Stale_*` on Python** — refining the Plan A.1 short-circuit so it does NOT catch ALL changed-Python files (e.g., admit obvious deletes and rename-with-content-change patterns as `Stale_*` while keeping symbol-resolution-dependent cases as `NeedsRevalidation`); OR (b) **cherry-picking a held-out repo + corpus where the `Stale_*` ground-truth signal exists pre-built** (e.g., post-deletion / large-rename commits) so the §8 #5 threshold becomes meaningful.
+Six candidate forward paths (per ultrareview-local architect review). Options (a)/(b) target the labeler; (c)/(d)/(e)/(f) target phase1 or the §8 metric definition itself. They are NOT mutually exclusive — a combination may be the right answer:
+
+- **(a) Labeler refinement — emit `Stale_*` on Python.** Refine the Plan A.1 short-circuit so it does NOT catch ALL changed-Python files (e.g., admit obvious deletes and rename-with-content-change patterns as `Stale_*` while keeping symbol-resolution-dependent cases as `NeedsRevalidation`). Most invasive; full Python AST post-cache + matching_post_fact dispatch.
+- **(b) Cherry-pick a held-out corpus with pre-built `Stale_*` ground truth.** Repo + commit range where the §8 #5 signal exists by construction (post-deletion / large-rename commits). Cheaper than (a); changes the held-out budget rather than the labeler.
+- **(c) Extend phase1 to emit `NeedsRevalidation` as a third Decision** (architect HIGH finding). Today phase1 collapses ambiguous classifications to `Valid` / `Stale` via R3/R4; emitting `NeedsRevalidation` when the rule chain is inconclusive aligns the labeler/phase1 output taxonomies and unblocks meaningful §7.1 three-way agreement metrics WITHOUT touching the labeler.
+- **(d) Add a `needs_revalidation_routing_accuracy` metric to §8** as a first-class threshold alongside #5, so Python rounds can be evaluated on the NR-routing axis the labeler actually emits.
+- **(e) Score `phase1_rules + virtual NR mapping` post-hoc.** Define a mapping (e.g., R4 line-presence-uncertain → NR) and add a `phase1_rules_nr_aware` column in `metrics.json` from `provbench-score compare`. Reveals whether the rule chain *has* the NR signal even when the Decision API discards it.
+- **(f) Refine the §8 #5 threshold to be SKIP-aware** when ground-truth Stale_* is empty. Mechanically distinguishes "structural skip" from "0.0 recall fail" in metrics.json itself, so future rounds with this property are recorded honestly without a FAIL flag.
+
+Additional cleanup (independent of (a)-(f)):
 - Repopulate per-row `wall_ms` in `predictions.jsonl` so §8 #4 returns to a meaningful measurement.
 - Record a new SPEC §11 row at the v1.2 → v1.2c transition (if pursued) and re-run the leakage clock against a fresh held-out repo (current SPEC §13.2 budget exhausted for flask after this round).
 
