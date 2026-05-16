@@ -10,7 +10,7 @@
 
 **Frozen pins (do not bump):**
 - Spec freeze hash: `683d023934c181a8714b9d24c53d011caed31f511becf82ed9e5def92e0ff37c`
-- **Labeler git SHA (Python-capable):** `800d108b542dcf2b9122eb57b15c3c8d0a472275` — pin AT PLAN B KICKOFF from `git rev-parse origin/main` after Plan A's PR merges. Record in this file before any execution begins; once recorded, freeze.
+- **Labeler git SHA (Python-capable, Plan A.1 fix):** `800d108b542dcf2b9122eb57b15c3c8d0a472275` — PR #52 merge commit (Plan A.1 retrospective; fixes Python replay panic via `Label::NeedsRevalidation` short-circuit for changed Python files). LITERAL pin — NOT derived from `git rev-parse origin/main`. Already populated at this file's 9 occurrences via commit `6643789`.
 - Phase 1 git SHA: `97cef97` (v1.2; from v1.2a R4 Field-kind guard relaxation, SPEC §11 row dated 2026-05-15)
 - Rule set version: `v1.2`
 - Sample seed: `13897750829054410479` (= `0xC0DEBABEDEADBEEF`; pass as decimal — clap's default `u64` parser does NOT accept hex)
@@ -54,38 +54,31 @@
 ## Task 1: Pre-flight + pin Plan A merge SHA + worktree pin + flask clone
 
 **Files:**
-- Create: `/tmp/ironmem-worktrees/labeler-<plan-A-sha>/` (git worktree)
+- Create: `/tmp/ironmem-worktrees/labeler-800d108b542dcf2b9122eb57b15c3c8d0a472275/` (git worktree)
 - Create: `/tmp/ironmem-worktrees/phase1-97cef97/` (git worktree)
-- Create: `benchmarks/provbench/work/flask/` (git clone)
-- Inspect: `.gitignore`
-- Modify: this plan's frontmatter (replace `800d108b542dcf2b9122eb57b15c3c8d0a472275` placeholder)
+- Use: `benchmarks/provbench/work/flask/` (already cloned in previous attempt; HEAD already at `9fcd34c9...`)
 
-- [ ] **Step 1: Confirm Plan A has merged to `main`**
+- [ ] **Step 1: Verify Plan A.1 retro commit is reachable**
 
 ```bash
-git fetch origin main
-git log origin/main --oneline -20 | grep -i "python labeler\|provbench-v1.2b-python"
+git cat-file -e 800d108b542dcf2b9122eb57b15c3c8d0a472275^{commit}   # PR #52 merge commit (Plan A.1)
+git cat-file -e 97cef97^{commit}                                    # phase1 v1.2 (Plan A v1.2a)
 ```
 
-Expected: a merge commit matching Plan A's PR title. If empty, STOP — Plan A must merge first. Plan B's labeler-pin must reference a commit on `origin/main` so reviewers can reproduce.
+Both must exit 0. If either fails, STOP — the pins are unreachable; abort the round.
 
-- [ ] **Step 2: Set labeler pin to the literal Plan A merge SHA**
+- [ ] **Step 2: Set labeler pin to the literal Plan A.1 merge SHA**
 
 ```bash
-# CORRECTION (Codex v1 review): pin to literal SHA, NOT `$(git rev-parse origin/main)`.
-# If origin/main has advanced since the Plan A merge, the labeler pin would drift silently.
-# The literal SHA below is PR #50's merge commit.
+# Pin to literal SHA, NOT `$(git rev-parse origin/main)`.
+# If origin/main has advanced since the Plan A.1 (PR #52) merge, the labeler pin would drift silently.
+# The literal SHA below is PR #52's merge commit (Plan A.1 retrospective —
+# fixes Python replay panic via Label::NeedsRevalidation short-circuit).
 PLAN_A_SHA=800d108b542dcf2b9122eb57b15c3c8d0a472275
 echo "$PLAN_A_SHA"
-git cat-file -e "$PLAN_A_SHA^{commit}"   # verify reachable; abort if not
 ```
 
-The 9 frontmatter occurrences of this SHA were already populated by an earlier commit. No further plan-file replacement is needed in this step.
-
-```bash
-git add docs/superpowers/plans/2026-05-15-provbench-v1.2b-flask-heldout.md
-git commit -m "chore(provbench): pin Plan A merged SHA in v1.2b flask plan"
-```
+The 9 frontmatter occurrences of this SHA were already populated by commit `6643789`. No further plan-file replacement is needed in this step.
 
 (Once committed, the pin is frozen — do NOT update mid-run.)
 
@@ -189,7 +182,16 @@ Expected output includes `$PLAN_A_SHA` (first 7-12 chars) — this is the `label
 
 Expected: all three of `tree-sitter` CLI (Homebrew binary), `tree-sitter-rust` grammar, `tree-sitter-python` grammar resolve to the SPEC §13.1 binary hashes. If `tree-sitter-python` grammar hash diverges from the SPEC pin (`63b76b3fa8181fd79eaad4abcdb21e2babcb504dbfc7710a89934fa456d26096`), STOP — a tooling drift requires its own SPEC §11 entry and re-runs the §10 leakage clock, which means Plan A must have failed to capture the pin properly.
 
-- [ ] **Step 4: Return to the feature branch root**
+- [ ] **Step 4: Run Plan A.1 regression sanity (PR #52 contract)**
+
+```bash
+# Still in the labeler worktree.
+cargo test --release --test python_replay_changed_file 2>&1 | tail -5
+```
+
+Expected: `1 passed; 0 failed`. This test asserts that Python `Fact::FunctionSignature` at a changed file routes to `Label::NeedsRevalidation` instead of panicking (the bug fixed in PR #52). If this test fails, the labeler binary does not honor the Plan A.1 contract and the round MUST NOT proceed — abort and investigate.
+
+- [ ] **Step 5: Return to the feature branch root**
 
 ```bash
 cd <feature-branch-root>           # original repo dir, not the worktree
@@ -645,10 +647,19 @@ Interpret the per-rule confusion + Field-kind breakdown.]
 
 [Insert `jq` output from Task 7 Step 3 here.]
 
-## Hygiene flags
-1. [Any baseline manifest normalization issues from Task 4 Step 3]
-2. [Determinism gate result from Task 3 Step 4]
-3. [Anything else surfaced mid-run]
+## Hygiene flags (7 concrete flags REQUIRED — do not collapse to placeholders)
+
+The findings doc MUST list these 7 flags explicitly. The first 6 come from Plan A's documented resolver coverage gaps; #7 is the Plan A.1 / PR #52 contract.
+
+1. **`__init__.py` collapse not implemented** → flask's `from .app import Flask` re-exports under-resolve through `PythonResolver`; R7 (`stale_symbol_renamed`) under-fires on Python.
+2. **Multi-hop import chains capped at one hop** → re-export through `__init__.py` then to consumer is two hops.
+3. **Relative imports** (`from . import X`) silently dropped.
+4. **Star imports** (`from X import *`) skipped unless `__all__` defined; resolver does not parse `__all__`.
+5. **`TYPE_CHECKING`-conditional imports** + dynamic dispatch + metaclass attribute generation not modeled.
+6. **Python `DocClaim` extractor is a stub** → R5 (`stale_doc_drift`) does not fire on Python rows.
+7. **Plan A.1 / PR #52 contract:** Python facts at *changed* files (post-commit blob ≠ T₀ blob) emit `Label::NeedsRevalidation` instead of being classified by R3/R4/R5/R7. The Rust-oriented `matching_post_fact` + `CommitSymbolIndex` + rename detector are intentionally not extended to Python in v1.2b. Python facts at *unchanged* files still get `Label::Valid` via the file-byte-identical bypass. NeedsRevalidation rows fall out of both §8 numerators cleanly.
+
+Additionally, document anything else surfaced mid-run (baseline manifest normalization quirks, determinism gate result, tooling-pin observations) under an "Additional mid-run notes" subsection.
 
 ## §10 anti-leakage attestation
 - Phase 1 source byte-identical to `97cef97` across the run (Task 6 Step 2 verified).
@@ -716,7 +727,11 @@ git commit -m "docs(provbench): SPEC §11 — record v1.2b flask held-out result
 
 ---
 
-## Task 12: Open PR
+## Task 12: Open PR — OUT OF BATCH SCOPE
+
+> **Implementation batch ends at Task 11.** Plan B Task 12 is DEFERRED to the collab protocol's `CodeReviewFinalPending` phase (Claude's `final_review` turn), which owns `gh pr create` AFTER Codex's `review_fix_global`. Implementers driving this plan via `task_list` must NOT execute Task 12 in the batch — the collab session's `implementation_done` send transitions to the global-review stage where PR creation lives. The Task 12 content below is preserved only as a record of what the `final_review` turn will produce.
+
+## Task 12 (deferred): Open PR
 
 **Files:**
 - External: GitHub PR against `main`
@@ -769,7 +784,7 @@ After PR merges, save a project memory entry summarizing the v1.2b verdict, the 
    - SPEC §13.1 tree-sitter-python pin → Task 2 Step 3 (verify-tooling)
    - SPEC §13.2 held-out #2 pin → Task 1 Step 7
 
-2. **Placeholder scan:** Three intentional `800d108b542dcf2b9122eb57b15c3c8d0a472275` and one `<recorded>` HEAD placeholder live in this plan — Task 1 Step 2 replaces all `800d108b542dcf2b9122eb57b15c3c8d0a472275` occurrences, and Task 1 Step 9 records HEAD. Findings + §11 templates contain `<observed>` / `<wlb>` / `<ms>` placeholders that are filled in by Task 10 / Task 11 from actual metrics.json values. These are not unbounded placeholders — each has a concrete source.
+2. **Placeholder scan:** The 9 labeler-SHA occurrences are already populated with the literal Plan A.1 merge commit `800d108b542dcf2b9122eb57b15c3c8d0a472275` (commit `6643789`). Task 1 Step 2 verifies reachability only — no further replacement. Findings + §11 templates contain `<observed>` / `<wlb>` / `<ms>` placeholders that Task 10 / Task 11 fill in from actual metrics.json values. These are not unbounded placeholders — each has a concrete source.
 
 3. **Type consistency:** `$PLAN_A_SHA`, `$SHA7`, `$RUNDIR`, `$LBL`, `$PH1` bash variables used consistently across tasks 1-7.
 
