@@ -22,7 +22,7 @@ The §8 #5 miss is **structural, not a rule-chain quality failure**: the labeler
 |---|---|
 | Runner | `provbench-phase1` |
 | `rule_set_version` | `v1.2` |
-| Spec freeze hash (§15) | `6ab6c23bdcd0e5bf06bcc036bab883f94457a53e0c67188165d6db7c20b44fb2` |
+| Spec freeze hash (§15) | `683d023934c181a8714b9d24c53d011caed31f511becf82ed9e5def92e0ff37c` |
 | Labeler git SHA (corpus + facts + diffs, Plan A.1) | `800d108b542dcf2b9122eb57b15c3c8d0a472275` (PR #52 merge) |
 | Phase 1 git SHA | `97cef97ba347aa7adca0a8367712ab11490f26fe` |
 | Held-out repo | pallets/flask @ `2f0c62f5e6e290843f03c1fa70817c7a3c7fd661` (T₀ = tag `2.0.0`) |
@@ -130,7 +130,7 @@ What this comparison establishes:
 
 ### Additional observed mid-run
 
-A.1. **`frozen_hash` key absent from baseline `manifest.json`.** Matches serde Round 1 hygiene flag 8 (carve-out). Manifest carries `spec_freeze_hash` (`6ab6c23b…`) and `content_hash` (`93e0ed3a…`); a separate top-level `frozen_hash` is not emitted by the current baseline crate. Documented; no source change in scope.
+A.1. **`frozen_hash` key absent from baseline `manifest.json`.** Matches serde Round 1 hygiene flag 8 (carve-out). Manifest carries normalized `spec_freeze_hash` (`683d023…`) and recomputed `content_hash` (`dec36e6…`); a separate top-level `frozen_hash` is not emitted by the current baseline crate. Documented; no source change in scope.
 
 A.2. **`per_stratum_targets.stale_renamed == u64::MAX` sentinel.** Manifest reports `stale_renamed: 18446744073709551615` (= `u64::MAX`) — under-filled stratum sentinel used by the sampler. No effective impact on this subset because the corpus has no Python `Stale_*` rows to fill any stale_* stratum at all (see narrative).
 

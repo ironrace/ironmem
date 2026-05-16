@@ -4,7 +4,7 @@
   "facts_path": "benchmarks/provbench/facts/flask-2f0c62f5-800d108.facts.jsonl",
   "diffs_dir": "benchmarks/provbench/facts/flask-2f0c62f5-800d108.diffs/",
   "labeler_git_sha": "800d108b542dcf2b9122eb57b15c3c8d0a472275",
-  "spec_freeze_hash": "6ab6c23bdcd0e5bf06bcc036bab883f94457a53e0c67188165d6db7c20b44fb2",
+  "spec_freeze_hash": "683d023934c181a8714b9d24c53d011caed31f511becf82ed9e5def92e0ff37c",
   "baseline_crate_head_sha": "3225904525a11426467d9d572066aeda14e10a87",
   "per_stratum_targets": {
     "valid": 2000,
@@ -24021,5 +24021,5 @@
     }
   ],
   "created_at": "unix-seconds-1778973234Z",
-  "content_hash": "93e0ed3a7180be250ce068bfb8c1663a422aae920f4c78865644f4e42c0d62ba"
+  "content_hash": "dec36e6a8a4725a29b4caa7c135df93b6dfa8f9074522ce1176763c7cc19a4aa"
 }
