@@ -1,0 +1,16 @@
+{
+  "round": "v1.2b-flask-heldout",
+  "rule_set_version": "v1.2",
+  "phase1_git_sha": "97cef97",
+  "labeler_git_sha": "800d108b542dcf2b9122eb57b15c3c8d0a472275",
+  "held_out_repo": "pallets/flask",
+  "held_out_repo_t0": "2f0c62f5e6e290843f03c1fa70817c7a3c7fd661",
+  "held_out_repo_head": "9fcd34c9f3065640bd1cd86234216ca068633fb9",
+  "first_parent_commits_t0_to_head": 401,
+  "spec_freeze_hash": "6ab6c23bdcd0e5bf06bcc036bab883f94457a53e0c67188165d6db7c20b44fb2",
+  "sample_seed": "13897750829054410479",
+  "subset_size": 4000,
+  "run_date": "2026-05-16",
+  "retuning_in_round": false,
+  "session_id": "8e6e8ab6-d59b-4612-a781-9cdc0c86fcc4"
+}
