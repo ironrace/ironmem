@@ -122,7 +122,7 @@ loop:
   status = collab_status(session_id)
 
   if phase changed since last iteration:
-    Log: t4_phase_advanced_to_<new_phase>   # write timing event
+    Log: t4_phase_advanced phase=<new_phase>   # write timing event
 
   if session_ended or phase in terminal_set:
     Log: t10_session_complete <phase>       # CodingComplete or CodingFailed
@@ -161,7 +161,7 @@ Repeat the dispatch loop with these actions:
 |---|---|
 | `PlanParallelDrafts` | Your draft was already sent from the `start` branch. is_my_turn should be false here — if true, verify with `collab_status`. If `collab_status` confirms Claude is the owner in a Codex-owned phase, this is a protocol-level anomaly — exit the loop and report to the user; do not attempt a send. |
 | `PlanSynthesisPending` | **Do not ask the user.** Merge both drafts (or revise prior canonical on revision rounds) into a canonical plan. Call `collab_send` with `sender="claude"`, `topic="canonical"`, `content=<plan text>` (plain text — `draft` and `canonical` are the only v1 topics that are NOT JSON-wrapped). |
-| `PlanCodexReviewPending` | Codex's turn. is_my_turn should be false — if true, verify with `collab_status`. If the inconsistency persists, exit the loop and report to the user. |
+| `PlanCodexReviewPending` | Codex's turn. is_my_turn should be false — if true, verify with `collab_status`. If the inconsistency persists, exit the loop and report to the user. **Review cap:** the server enforces `MAX_REVIEW_ROUNDS = 2` at `crates/ironmem/src/collab/state_machine/mod.rs:28`. Codex gets at most two review rounds; after the 2nd review the server transitions to `PlanClaudeFinalizePending` regardless of verdict (`approve`, `approve_with_minor_edits`, or `request_changes` all map to the same next phase). Do not model v1 as open-ended iteration. |
 | `PlanClaudeFinalizePending` | **Enter Plan Mode.** Produce the final plan, incorporating Codex's review notes unless they conflict with user intent. Get user approval. Call `collab_send` with `sender="claude"`, `topic="final"`, `content=<JSON string of {"plan":"<full text>"}>` (v1 `final` is the only v1 topic wrapped in JSON). After send, `PlanLocked` is reached. |
 
 Rationale: the user approves only at finalization—the commit point. Everything
@@ -359,7 +359,7 @@ sequence before building the payload:
 | Phase | What to do (is_my_turn == true) |
 |---|---|
 | `CodeImplementPending` | Owner depends on `implementer`. **Claude is owner** (default): the bridge has already invoked `subagent-driven-development`. When all subagents finish, **run pre-send harness gates** (no reset — no Codex push to sync) and `collab_send` with `sender="claude"`, `topic="implementation_done"`, `content=<JSON {"head_sha":"<current HEAD>"}>`. Payload carries ONLY `head_sha`. **Codex is owner** (`--implementer=codex`): is_my_turn is false here; the bridge dispatched to Codex via `mcp__codex__codex` and Codex emits `implementation_done` itself before its MCP session returns. If the dispatch loop ever sees `CodeImplementPending` with Codex owner, re-dispatch via the Codex MCP tool (resumed-mid-batch case). |
-| `CodeReviewLocalPending` | **Run pre-send harness (with reset to `last_head_sha`), then `/ultrareview-local` on the full task stack.** Fix any CRITICAL/HIGH inline (commit + push). Call `collab_send` with `sender="claude"`, `topic="review_local"`, `content=<JSON {"head_sha":"<current HEAD>"}>`. **Log:** `t5_review_local_sent` |
+| `CodeReviewLocalPending` | **Run pre-send harness (with reset to `last_head_sha`), then `/ultrareview-local` on the full task stack.** Fix any CRITICAL/HIGH inline (commit + push). Call `collab_send` with `sender="claude"`, `topic="review_local"`, `content=<JSON {"head_sha":"<current HEAD>"}>`. **Log:** `t5_review_local_sent`. **Anti-removal:** `/ultrareview-local`'s code-quality lens partially overlaps with Codex `review_fix_global`'s correctness/security/scope/architecture lens but does not fully duplicate it. Removing this stage requires a written overlap audit demonstrating that prior Codex global reviews caught the code-quality issues `/ultrareview-local` would have flagged. |
 | `CodeReviewFixGlobalPending` | Codex's turn. is_my_turn should be false. If `collab_status` confirms Claude is the owner, exit the loop and report the anomaly. **Log:** `t6_codex_review_dispatched` immediately before launching `codex exec`; **Log:** `t7_codex_review_returned` immediately after the polling loop exits. |
 | `CodeReviewFinalPending` | **Run pre-send harness (with reset to `last_head_sha`).** Codex has pushed any global fixes (or a no-op commit); your local working copy was reset to `last_head_sha` by the harness. Optionally tweak. Re-run gates. Then **enter Plan Mode**: draft PR title (under 70 chars) and body (summary + test plan derived from task list + gate results). Get user approval. Then `gh pr create --base <base_branch> --head <current branch> --title <approved title> --body <approved body>`. If `gh pr create` fails, send `failure_report` with `coding_failure: "pr_create_failed: <error>"` — no silent retry. On success, **Log:** `t8_pr_created <pr_url>`, capture `pr_url` and call `collab_send` with `sender="claude"`, `topic="final_review"`, `content=<JSON {"head_sha":"<current HEAD>","pr_url":"<https url>"}>`. **Log:** `t9_final_review_sent`. Session advances directly to `CodingComplete`. **Log:** `t10_session_complete CodingComplete`. Exit loop. |
 
@@ -489,10 +489,15 @@ c. Substitute `$ARGUMENTS` in the selected file with `join <session_id>`.
    fix everything") collapses the review into a rubber-stamp and defeats
    the point of an independent second pass.
 
-d. **Log the appropriate timing event** immediately before launch:
-   - For `CodeImplementPending`: **Log:** `t2_codex_dispatched`
-   - For `CodeReviewFixGlobalPending`: **Log:** `t6_codex_review_dispatched`
-   - For `PlanParallelDrafts` / `PlanCodexReviewPending`: **Log:** `t2_codex_dispatched`
+d. **Log the appropriate timing event** immediately before launch. Use the
+   structured-metadata form (`<event_name> phase=<phase> round=<N>`); fill
+   `phase=` from `collab_status.phase` and `round=` from
+   `collab_status.review_round + 1` for plan/code reviews (or `round=1` for
+   batch impl and initial drafts):
+   - For `CodeImplementPending`: **Log:** `t2_codex_dispatched phase=CodeImplementPending round=1`
+   - For `CodeReviewFixGlobalPending`: **Log:** `t6_codex_review_dispatched phase=CodeReviewFixGlobalPending round=1`
+   - For `PlanParallelDrafts`: **Log:** `t2_codex_dispatched phase=PlanParallelDrafts round=1`
+   - For `PlanCodexReviewPending`: **Log:** `t2_codex_dispatched phase=PlanCodexReviewPending round=<1 or 2>`
 
 e. Launch via Bash with `run_in_background: true`. Include `--reasoning-effort low`
    only for `CodeImplementPending+codex`; omit for all other phases:
@@ -513,11 +518,32 @@ e. Launch via Bash with `run_in_background: true`. Include `--reasoning-effort l
    > Document in the log which invocation form was used.
 
 f. **Polling loop** — the dispatcher's interactive surface during this phase.
-   Poll every ~10 seconds (via Bash `sleep 10` or `ScheduleWakeup`).
+   Poll on a bounded backoff curve (NOT a fixed cadence — long silent
+   grinds churn the dispatcher without producing new information):
+
+   - Start at **10s** poll interval.
+   - After **60s** of no progress (no `phase` advance AND no new stdout
+     line in `BashOutput`) → escalate to **20s**.
+   - After **300s** (5 min) of no progress → escalate to **30s** (cap).
+   - **Reset to 10s** on ANY of: phase advance, new stdout line, bg
+     process exit, bg process error/signal.
+   - 600s hang detection (termination condition 4 below) is unchanged.
+
+   Track "no progress" with two timestamps: `last_phase_change_at` (set
+   when `collab_status.phase` differs from the prior poll) and
+   `last_stdout_at` (set when `BashOutput` returns at least one new line
+   since the prior poll). Time since `max(last_phase_change_at, last_stdout_at)`
+   is the "no progress" duration; pick the poll interval from that.
+
+   The backoff applies **only** to Codex-owned background phases
+   (`PlanParallelDrafts`, `PlanCodexReviewPending`,
+   `CodeReviewFixGlobalPending`, `CodeImplementPending+codex`). It does
+   NOT change the user-visible idle gap during Claude's Plan Mode
+   prompts — those are gated on user input, not on poll cadence.
 
    On each iteration:
    - Call `mcp__ironmem__collab_status(session_id)` to detect phase advance.
-     **Log:** `t4_phase_advanced_to_<new_phase>` if phase changed.
+     **Log:** `t4_phase_advanced phase=<new_phase>` if phase changed.
    - Read `BashOutput(<bash-id>)` to surface new stdout to the user
      as a one-line update: `[codex bg] <last stdout line>`.
 
@@ -525,10 +551,12 @@ f. **Polling loop** — the dispatcher's interactive surface during this phase.
 
    1. `collab_status.phase` advances to a Claude-owned phase →
       Codex emitted its message cleanly. **SUCCESS.**
-      **Log the appropriate return event:**
-      - For `CodeImplementPending`: **Log:** `t3_codex_returned`
-      - For `CodeReviewFixGlobalPending`: **Log:** `t7_codex_review_returned`
-      - For `PlanParallelDrafts` / `PlanCodexReviewPending`: **Log:** `t3_codex_returned`
+      **Log the appropriate return event** with structured metadata
+      (same `phase=` / `round=` values used at dispatch in step d):
+      - For `CodeImplementPending`: **Log:** `t3_codex_returned phase=CodeImplementPending round=1`
+      - For `CodeReviewFixGlobalPending`: **Log:** `t7_codex_review_returned phase=CodeReviewFixGlobalPending round=1`
+      - For `PlanParallelDrafts`: **Log:** `t3_codex_returned phase=PlanParallelDrafts round=1`
+      - For `PlanCodexReviewPending`: **Log:** `t3_codex_returned phase=PlanCodexReviewPending round=<1 or 2>`
       Continue to step g.
 
    2. `collab_status.phase` reaches `CodingFailed` →
@@ -587,32 +615,53 @@ batch-implementation phase. Post-run shell analysis of the log lets us
 reconstruct the latency breakdown (planning vs. Codex dispatch vs. review vs.
 PR), measure the background-exec speedup (A.2), and identify hangs.
 
-**Format:** one event per line:
+**Format:** one event per line, with stable base names and structured
+key=value metadata. The event name itself never embeds round or phase
+detail; those go in `phase=` and `round=` fields:
+
 ```
-<unix_seconds>.<nanos> <event_name> [extra]
+<unix_seconds>.<nanos> <event_name> phase=<phase> round=<N> [<extra>]
 ```
+
+Examples:
+
+```
+1778971814.91 t2_codex_dispatched phase=PlanCodexReviewPending round=2
+1778971990.43 t3_codex_returned phase=PlanCodexReviewPending round=2
+1778971814.93 t4_phase_advanced phase=PlanClaudeFinalizePending round=2
+1778971990.99 t8_pr_created phase=CodeReviewFinalPending https://github.com/.../pull/123
+```
+
+`phase=` and `round=` are required for `t2_codex_dispatched`,
+`t3_codex_returned`, `t6_codex_review_dispatched`,
+`t7_codex_review_returned`, and `t4_phase_advanced`. Single-fire events
+(`t0_session_started`, `t1_task_list_sent`, `t8_pr_created`,
+`t9_final_review_sent`, `t10_session_complete`) may omit `round=` and
+retain `phase=` where meaningful. Suffixed event-name shapes that bake
+the round number or destination phase into the identifier are legacy
+artifacts — do not emit them.
 
 **Write an event:**
 ```bash
-echo "$(date +%s.%N) <event_name> [extra]" >> /tmp/collab-eval-${session_id}.log
+echo "$(date +%s.%N) <event_name> phase=<phase> round=<N> [<extra>]" >> /tmp/collab-eval-${session_id}.log
 ```
 
 **Event list:**
 
-| Event | When to write |
-|---|---|
-| `t0_session_started` | Right after `collab_start` returns (session_id now known) |
-| `t1_task_list_sent` | Right after `collab_send(topic="task_list")` returns |
-| `t2_codex_dispatched` | Immediately before launching background `codex exec` for any Codex-owned phase (PlanParallelDrafts, PlanCodexReviewPending, CodeImplementPending+codex) |
-| `t2_fallback_to_mcp` | When `codex` is not on PATH and falling back to synchronous MCP (any phase) |
-| `t3_codex_returned` | Immediately after the bg-exec polling loop exits successfully for PlanParallelDrafts, PlanCodexReviewPending, or CodeImplementPending+codex |
-| `t4_phase_advanced_to_<phase>` | Every time a poll observes a new phase (write the new phase name as `[extra]`) |
-| `t5_review_local_sent` | After `collab_send(topic="review_local")` returns |
-| `t6_codex_review_dispatched` | Immediately before launching background `codex exec` for `CodeReviewFixGlobalPending` |
-| `t7_codex_review_returned` | Immediately after the bg-exec polling loop exits successfully for `CodeReviewFixGlobalPending` |
-| `t8_pr_created` | After `gh pr create` returns success; include the PR URL as `[extra]` |
-| `t9_final_review_sent` | After `collab_send(topic="final_review")` returns |
-| `t10_session_complete` | When `collab_status.phase` first reads `CodingComplete` or `CodingFailed`; include the phase as `[extra]` |
+| Event | Required fields | When to write |
+|---|---|---|
+| `t0_session_started` | (none required) | Right after `collab_start` returns (session_id now known) |
+| `t1_task_list_sent` | (none required) | Right after `collab_send(topic="task_list")` returns |
+| `t2_codex_dispatched` | `phase=` `round=` | Immediately before launching background `codex exec` for any Codex-owned phase (PlanParallelDrafts, PlanCodexReviewPending, CodeImplementPending+codex) |
+| `t2_fallback_to_mcp` | `phase=` | When `codex` is not on PATH and falling back to synchronous MCP (any phase) |
+| `t3_codex_returned` | `phase=` `round=` | Immediately after the bg-exec polling loop exits successfully for PlanParallelDrafts, PlanCodexReviewPending, or CodeImplementPending+codex |
+| `t4_phase_advanced` | `phase=` | Every time a poll observes a new phase (destination phase goes in `phase=`, NOT in the event name) |
+| `t5_review_local_sent` | `phase=CodeReviewLocalPending` | After `collab_send(topic="review_local")` returns |
+| `t6_codex_review_dispatched` | `phase=` `round=` | Immediately before launching background `codex exec` for `CodeReviewFixGlobalPending` |
+| `t7_codex_review_returned` | `phase=` `round=` | Immediately after the bg-exec polling loop exits successfully for `CodeReviewFixGlobalPending` |
+| `t8_pr_created` | `phase=CodeReviewFinalPending` | After `gh pr create` returns success; include the PR URL as `[extra]` |
+| `t9_final_review_sent` | `phase=CodeReviewFinalPending` | After `collab_send(topic="final_review")` returns |
+| `t10_session_complete` | `phase=` (CodingComplete or CodingFailed) | When `collab_status.phase` first reads `CodingComplete` or `CodingFailed` |
 
 **Analyze post-run:**
 ```bash
