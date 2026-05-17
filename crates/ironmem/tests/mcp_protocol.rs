@@ -1059,7 +1059,8 @@ fn task_list_payload(plan_hash: &str, base_sha: &str, head_sha: &str, n: usize) 
 }
 
 /// Send `implementation_done` from Claude, advancing the batch phase to
-/// local review (`CodeReviewLocalPending`).
+/// global review (`CodeReviewFixGlobalPending`, Codex-owned) under the v3
+/// reorder.
 fn do_implementation_done(app: &App, session_id: &str, head: &str) {
     call_tool(
         app,
@@ -1099,23 +1100,11 @@ fn collab_v2_happy_path_reaches_coding_complete() {
     // Single batch send replaces the per-task loop.
     do_implementation_done(&app, &session_id, "batch_head");
     let status = call_tool(&app, "collab_status", json!({ "session_id": &session_id }));
-    assert_eq!(status["phase"], "CodeReviewLocalPending");
+    assert_eq!(status["phase"], "CodeReviewFixGlobalPending");
     assert_eq!(status["last_head_sha"], "batch_head");
 
-    // Local → global review_fix → final_review (v3 linear, terminal in 3 turns).
-    call_tool(
-        &app,
-        "collab_send",
-        json!({
-            "session_id": session_id,
-            "sender": "claude",
-            "topic": "review_local",
-            "content": json!({ "head_sha": "h2" }).to_string()
-        }),
-    );
-    let status = call_tool(&app, "collab_status", json!({ "session_id": &session_id }));
-    assert_eq!(status["phase"], "CodeReviewFixGlobalPending");
-
+    // Global review_fix (Codex) → local audit (Claude) → final_review
+    // (v3 reorder linear, terminal in 3 turns).
     call_tool(
         &app,
         "collab_send",
@@ -1123,6 +1112,19 @@ fn collab_v2_happy_path_reaches_coding_complete() {
             "session_id": session_id,
             "sender": "codex",
             "topic": "review_fix_global",
+            "content": json!({ "head_sha": "h2" }).to_string()
+        }),
+    );
+    let status = call_tool(&app, "collab_status", json!({ "session_id": &session_id }));
+    assert_eq!(status["phase"], "CodeReviewLocalPending");
+
+    call_tool(
+        &app,
+        "collab_send",
+        json!({
+            "session_id": session_id,
+            "sender": "claude",
+            "topic": "review_local",
             "content": json!({ "head_sha": "h2" }).to_string()
         }),
     );
@@ -1154,9 +1156,9 @@ fn collab_v2_happy_path_reaches_coding_complete() {
 }
 
 #[test]
-fn collab_v3_implementation_done_jumps_to_local_review() {
-    // v3 batch mode: a single `implementation_done` send transitions
-    // `CodeImplementPending` → `CodeReviewLocalPending` with Claude as owner.
+fn collab_v3_implementation_done_jumps_to_global_review() {
+    // v3 batch mode (reorder): a single `implementation_done` send transitions
+    // `CodeImplementPending` → `CodeReviewFixGlobalPending` with Codex as owner.
     // No per-task review/fix turns server-side.
     let app = App::open_for_test().unwrap();
     let session_id = drive_to_plan_locked(&app, "fp");
@@ -1177,8 +1179,8 @@ fn collab_v3_implementation_done_jumps_to_local_review() {
 
     do_implementation_done(&app, &session_id, "batch_head");
     let status = call_tool(&app, "collab_status", json!({ "session_id": &session_id }));
-    assert_eq!(status["phase"], "CodeReviewLocalPending");
-    assert_eq!(status["current_owner"], "claude");
+    assert_eq!(status["phase"], "CodeReviewFixGlobalPending");
+    assert_eq!(status["current_owner"], "codex");
     assert_eq!(status["last_head_sha"], "batch_head");
 }
 
@@ -1261,7 +1263,8 @@ fn collab_start_accepts_implementer_codex_and_routes_owner() {
         "expected turn-ownership error, got: {err}"
     );
 
-    // Codex fires it and the phase advances to local review (Claude-owned).
+    // Codex fires it and the phase advances to global review (Codex-owned
+    // under v3 reorder: Codex reads the raw post-implementation diff first).
     call_tool(
         &app,
         "collab_send",
@@ -1273,8 +1276,8 @@ fn collab_start_accepts_implementer_codex_and_routes_owner() {
         }),
     );
     let status = call_tool(&app, "collab_status", json!({ "session_id": &session_id }));
-    assert_eq!(status["phase"], "CodeReviewLocalPending");
-    assert_eq!(status["current_owner"], "claude");
+    assert_eq!(status["phase"], "CodeReviewFixGlobalPending");
+    assert_eq!(status["current_owner"], "codex");
 }
 
 #[test]
@@ -1334,7 +1337,7 @@ fn collab_v2_end_rejected_in_coding_active_phase() {
             "content": json!({ "head_sha": "h1" }).to_string()
         }),
     );
-    assert_eq!(ok["phase"], "CodeReviewLocalPending");
+    assert_eq!(ok["phase"], "CodeReviewFixGlobalPending");
 }
 
 #[test]
@@ -1454,8 +1457,21 @@ fn collab_start_code_review_happy_path_reaches_coding_complete() {
         }),
     );
     let status = call_tool(&app, "collab_status", json!({ "session_id": session_id }));
-    assert_eq!(status["phase"], "CodeReviewFinalPending");
+    assert_eq!(status["phase"], "CodeReviewLocalPending");
     assert_eq!(status["last_head_sha"], descendant_sha);
+
+    call_tool(
+        &app,
+        "collab_send",
+        json!({
+            "session_id": session_id,
+            "sender": "claude",
+            "topic": "review_local",
+            "content": json!({ "head_sha": descendant_sha }).to_string()
+        }),
+    );
+    let status = call_tool(&app, "collab_status", json!({ "session_id": session_id }));
+    assert_eq!(status["phase"], "CodeReviewFinalPending");
 
     call_tool(
         &app,
@@ -1638,9 +1654,26 @@ fn collab_start_code_review_accepts_descendant_head_and_rejects_end_in_final_rev
         }),
     );
     let status = call_tool(&app, "collab_status", json!({ "session_id": session_id }));
-    assert_eq!(status["phase"], "CodeReviewFinalPending");
+    // Under v3 reorder: review_fix_global advances to CodeReviewLocalPending
+    // (Claude's audit turn) before reaching CodeReviewFinalPending.
+    assert_eq!(status["phase"], "CodeReviewLocalPending");
     assert_eq!(status["current_owner"], "claude");
     assert_eq!(status["last_head_sha"], descendant_sha);
+
+    // Claude's review_local advances to CodeReviewFinalPending.
+    call_tool(
+        &app,
+        "collab_send",
+        json!({
+            "session_id": session_id,
+            "sender": "claude",
+            "topic": "review_local",
+            "content": json!({ "head_sha": descendant_sha }).to_string()
+        }),
+    );
+    let status = call_tool(&app, "collab_status", json!({ "session_id": session_id }));
+    assert_eq!(status["phase"], "CodeReviewFinalPending");
+    assert_eq!(status["current_owner"], "claude");
 
     let blocked = call_tool_expect_error(
         &app,
