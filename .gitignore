@@ -10,11 +10,11 @@
 CODEX_TASK_*.md
 docs/collab_*.md
 
-# Superpowers plan + scratch artifacts (writing-plans output, /collab bridges).
-# These are per-session working artifacts, not durable spec; the canonical
-# protocol/architecture lives in docs/COLLAB.md and similar. Specs under
-# docs/superpowers/specs/ are tracked deliberately.
-docs/superpowers/plans/
+# Superpowers working artifacts (writing-plans output, /collab bridges,
+# design specs). Per-session and developer-facing, not durable repo content.
+# The canonical protocol/architecture lives in docs/COLLAB.md and the
+# in-tree Rust source. Any historical file is retrievable from git history.
+docs/superpowers/
 
 # Local tool and editor state (personal, non-portable)
 .cargo/
