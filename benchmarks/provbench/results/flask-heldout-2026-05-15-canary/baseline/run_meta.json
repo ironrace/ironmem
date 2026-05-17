@@ -1,0 +1,17 @@
+{
+  "batches_total": 406,
+  "batches_completed": 406,
+  "batches_skipped_resume": 0,
+  "batches_parse_failed": 0,
+  "rows_total": 4000,
+  "rows_scored": 4000,
+  "total_cost_usd": 0.0,
+  "total_tokens": 0,
+  "tokens_in_uncached": 0,
+  "tokens_in_cache_write": 0,
+  "tokens_in_cache_read": 0,
+  "tokens_out": 0,
+  "aborted": false,
+  "abort_reason": null,
+  "manifest_content_hash": "dec36e6a8a4725a29b4caa7c135df93b6dfa8f9074522ce1176763c7cc19a4aa"
+}

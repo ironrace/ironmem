@@ -46,6 +46,67 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   leakage clock against pallets/flask (Round 2; pre-registered).
   Findings:
   `benchmarks/provbench/results/serde-heldout-2026-05-15-findings.md`.
+- **ProvBench v1.2a — R4 Field-kind guard relaxation (ripgrep pilot,
+  2026-05-15).** Phase1 `rule_set_version v1.2` (phase1 git SHA
+  `97cef97`): R4 `span_hash_changed` `MIN_PROBE_NONWS_LEN` length
+  floor dropped for `kind = "Field"` (single match arm relaxed in
+  `phase1/src/rules/r4_span_hash_changed.rs`; all other kinds
+  unchanged). Re-run on the ripgrep Phase 0c canary subset clears
+  v1.1's pilot SPEC §8 thresholds verbatim (WLB valid 0.9729, p50
+  2 ms, WLB stale 0.9537) with three v1.2a acceptance gates also
+  cleared: §8 verbatim, no regression vs v1.1, Field false-Valid
+  count `0` ≤ v1.1 + 20 slack. §10 admission consumed on ripgrep;
+  no held-out evidence produced this round. Findings:
+  `benchmarks/provbench/results/ripgrep-pilot-2026-05-15-v1.2a-findings.md`.
+- **ProvBench v1.2b — Python labeler bring-up (Plan A, PR #50;
+  merged at `c623298`).** Workspace-excluded `provbench-labeler`
+  extended to label Python repos via `tree-sitter-python 0.25`
+  (SPEC §13.1 pin). Pure-Rust extension; `tree-sitter` scope walker
+  + lexical import graph (`resolve::python::PythonResolver`) — no
+  Python runtime in ironmem. Same fact schema as Rust path
+  (FunctionSignature, Field, PublicSymbol, TestAssertion;
+  `DocClaim` for Python is a documented stub). Rust ripgrep canary
+  byte-identical pre/post (SHA `d8de2d2a…` stripped of
+  `labeler_git_sha`). Determinism enforced by new
+  `tests/determinism_python.rs` (fixture, default-run) and
+  `tests/determinism_flask.rs` (`#[ignore]`, full pallets/flask at
+  T₀). Spot-check material (n=200, seed `0xC0DEBABEDEADBEEF`) at
+  `benchmarks/provbench/results/python-labeler-2026-05-15-spotcheck.csv`.
+- **ProvBench v1.2b — Python replay short-circuit fix (Plan A.1,
+  PR #52; merged at `800d108`).** Plan A's Task 12 routed Python
+  `Fact::FunctionSignature` through `push_observed_facts`
+  (defaulting `function_signature_disambiguator: None`), then
+  `replay/mod.rs` built `RustAst` for every fact-source path
+  including `.py` files — `tree-sitter-rust` silently produced a
+  garbled tree on Python, and `match_post.rs:60`'s `expect()` on
+  the Rust-only disambiguator panicked during replay. Plan A's
+  `#[ignore]` flask determinism test missed it (T₀-only, empty
+  replay). Fix filters `post_asts` by `Language::for_path` (Rust
+  paths only get `RustAst::parse`) and short-circuits non-byte-
+  identical Python paths to `Label::NeedsRevalidation`. New
+  `tests/python_replay_changed_file.rs` enforces the contract.
+  Rust ripgrep canary remains byte-identical
+  (`d8de2d2a…`).
+- **ProvBench §9.4 held-out evaluation — Round 2 (pallets/flask @
+  T₀ `2f0c62f5`, 2.0.0).** First Python held-out round. Labeler
+  `800d108…` (Plan A.1) + phase1 `97cef97` (v1.2) on flask T₀
+  with replay HEAD `9fcd34c9…` (T₀+401 first-parent commits).
+  Stratified subset n=4,000 (vs serde's 12,820 — flask is fact-
+  poor). Verdict **PASS-PASS-FAIL**: §8 #3 valid retention WLB
+  `0.9981` (PASS; v1.2 R4 relaxation generalizes from pilot to
+  Python — a stronger result than serde Round 1's FAIL); §8 #4
+  latency p50 `0` ms (PASS vacuously — `wall_ms` not populated in
+  predictions for this round; hygiene flag for v1.2c); §8 #5
+  stale recall WLB `0.0` (FAIL — **structural**: Plan A.1 labeler
+  emits 2,000 Valid + 2,000 NeedsRevalidation + 0 Stale_* ground
+  truth on Python, so `stale_detection` recall collapses to 0/0
+  by Wilson convention). The §8 #5 FAIL is uninformative about
+  phase1's actual stale-detection ability on Python; v1.2c needs
+  either labeler refinement (Stale_* emission on changed Python)
+  or a corpus with pre-built Stale_* ground truth, or extending
+  phase1 to emit a NeedsRevalidation decision. §10 attestation
+  cleared 8/8. SPEC §11 row at SPEC.md:185. Findings:
+  `benchmarks/provbench/results/flask-heldout-2026-05-15-findings.md`.
 
 ### Fixed
 
