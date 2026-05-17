@@ -1683,6 +1683,104 @@ fn collab_start_code_review_accepts_descendant_head_and_rejects_end_in_final_rev
     assert!(blocked.contains("active phase CodeReviewFinalPending"));
 }
 
+/// RED: Under the v3 reorder, `/collab review` shortcut sessions advance
+/// `CodeReviewFixGlobalPending → CodeReviewLocalPending → CodeReviewFinalPending`.
+/// Claude's `review_local` at `CodeReviewLocalPending` produces a NEW head
+/// (her audit commit on top of Codex's). The ancestry gate that currently
+/// guards `(CodeReviewFixGlobalPending, CodeReviewFixGlobal)` must also fire
+/// for `(CodeReviewLocalPending, CodeReviewLocal)` so a non-descendant
+/// `claude_head` is rejected with `branch_drift`. This test fails today
+/// because no such gate exists at `CodeReviewLocalPending`; Task 6 extends it.
+#[test]
+fn test_shortcut_review_local_ancestry_enforced() {
+    let app = App::open_for_test().unwrap();
+    let (_temp, repo_path, base_sha, head_sha, codex_head, claude_off_branch) = git_repo_fixture();
+
+    // Build `claude_head` as a descendant of `codex_head` (Codex's fix commit),
+    // simulating Claude's `review_local` audit commit on top of Codex's work.
+    // `git_repo_fixture` leaves HEAD on the `drift` branch, so check out
+    // `codex_head` first.
+    git(&["checkout", &codex_head], &repo_path);
+    let claude_head = commit_file(
+        &repo_path,
+        "branch.txt",
+        "claude audit\n",
+        "claude audit commit",
+    );
+
+    let started = call_tool(
+        &app,
+        "collab_start_code_review",
+        json!({
+            "repo_path": repo_path,
+            "branch": "feat/review-shortcut",
+            "base_sha": base_sha,
+            "head_sha": head_sha,
+            "initiator": "claude",
+            "task": "review completed branch"
+        }),
+    );
+    let session_id = started["session_id"].as_str().unwrap();
+
+    // Codex advances CodeReviewFixGlobalPending → CodeReviewLocalPending
+    // by sending review_fix_global with a valid descendant head.
+    call_tool(
+        &app,
+        "collab_send",
+        json!({
+            "session_id": session_id,
+            "sender": "codex",
+            "topic": "review_fix_global",
+            "content": json!({ "head_sha": codex_head }).to_string()
+        }),
+    );
+    let status = call_tool(&app, "collab_status", json!({ "session_id": session_id }));
+    assert_eq!(status["phase"], "CodeReviewLocalPending");
+    assert_eq!(status["current_owner"], "claude");
+    assert_eq!(status["last_head_sha"], codex_head);
+
+    // FAILING ASSERTION (RED): Claude attempts review_local with a head that
+    // is NOT a descendant of codex_head. This must be rejected with
+    // `branch_drift`, but today the gate only fires at CodeReviewFixGlobalPending.
+    let blocked = call_tool_expect_error(
+        &app,
+        "collab_send",
+        json!({
+            "session_id": session_id,
+            "sender": "claude",
+            "topic": "review_local",
+            "content": json!({ "head_sha": claude_off_branch }).to_string()
+        }),
+    );
+    assert!(
+        blocked.contains("branch_drift"),
+        "expected branch_drift error from non-descendant review_local, got: {}",
+        blocked
+    );
+
+    // Phase must NOT have advanced past CodeReviewLocalPending.
+    let status = call_tool(&app, "collab_status", json!({ "session_id": session_id }));
+    assert_eq!(status["phase"], "CodeReviewLocalPending");
+    assert_eq!(status["current_owner"], "claude");
+    assert_eq!(status["last_head_sha"], codex_head);
+
+    // A valid descendant review_local then advances to CodeReviewFinalPending.
+    call_tool(
+        &app,
+        "collab_send",
+        json!({
+            "session_id": session_id,
+            "sender": "claude",
+            "topic": "review_local",
+            "content": json!({ "head_sha": claude_head }).to_string()
+        }),
+    );
+    let status = call_tool(&app, "collab_status", json!({ "session_id": session_id }));
+    assert_eq!(status["phase"], "CodeReviewFinalPending");
+    assert_eq!(status["current_owner"], "claude");
+    assert_eq!(status["last_head_sha"], claude_head);
+}
+
 #[test]
 fn collab_start_code_review_rejects_non_descendant_head() {
     let app = App::open_for_test().unwrap();
