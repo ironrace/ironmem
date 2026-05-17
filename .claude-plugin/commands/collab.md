@@ -543,7 +543,7 @@ f. **Polling loop** — the dispatcher's interactive surface during this phase.
 
    On each iteration:
    - Call `mcp__ironmem__collab_status(session_id)` to detect phase advance.
-     **Log:** `t4_phase_advanced phase=<new_phase>` if phase changed.
+     **Log:** `t4_phase_advanced phase=<new_phase> round=<same round as dispatch>` if phase changed.
    - Read `BashOutput(<bash-id>)` to surface new stdout to the user
      as a one-line update: `[codex bg] <last stdout line>`.
 
@@ -655,7 +655,7 @@ echo "$(date +%s.%N) <event_name> phase=<phase> round=<N> [<extra>]" >> /tmp/col
 | `t2_codex_dispatched` | `phase=` `round=` | Immediately before launching background `codex exec` for any Codex-owned phase (PlanParallelDrafts, PlanCodexReviewPending, CodeImplementPending+codex) |
 | `t2_fallback_to_mcp` | `phase=` | When `codex` is not on PATH and falling back to synchronous MCP (any phase) |
 | `t3_codex_returned` | `phase=` `round=` | Immediately after the bg-exec polling loop exits successfully for PlanParallelDrafts, PlanCodexReviewPending, or CodeImplementPending+codex |
-| `t4_phase_advanced` | `phase=` (`round=` optional, include when destination has a round counter) | Every time a poll observes a new phase (destination phase goes in `phase=`, NOT in the event name) |
+| `t4_phase_advanced` | `phase=` `round=` | Every time a poll observes a new phase (destination phase goes in `phase=`, NOT in the event name; round is the same dispatch round being watched by the polling loop) |
 | `t5_review_local_sent` | `phase=CodeReviewLocalPending` | After `collab_send(topic="review_local")` returns |
 | `t6_codex_review_dispatched` | `phase=` `round=` | Immediately before launching background `codex exec` for `CodeReviewFixGlobalPending` |
 | `t7_codex_review_returned` | `phase=` `round=` | Immediately after the bg-exec polling loop exits successfully for `CodeReviewFixGlobalPending` |
