@@ -9,12 +9,21 @@ pub enum Phase {
     PlanCodexReviewPending,
     PlanClaudeFinalizePending,
     PlanLocked,
-    // Coding (v3) — batch implementation. Claude orchestrates per-task
-    // subagents (via superpowers:subagent-driven-development) entirely on its
-    // side; Codex does not participate per-task. The single transition out is
-    // `implementation_done`, which jumps straight to global review.
+    // Coding (v3) — batch implementation. The selected implementer
+    // orchestrates per-task subagents (via superpowers:subagent-driven-development)
+    // entirely on its side. The single transition out is `implementation_done`,
+    // which jumps straight to global review.
     CodeImplementPending,
-    // Coding (v3) — global review, 3-phase linear
+    // Coding (v3) — global review, 3-phase linear:
+    //   CodeReviewFixGlobalPending (Codex reads the raw post-implementation
+    //   diff and applies fixes directly; no Claude pre-clean)
+    //   → CodeReviewLocalPending (Claude audits Codex's commits via
+    //     `/ultrareview-local` and catches code-quality issues both agents
+    //     missed)
+    //   → CodeReviewFinalPending (Claude opens the PR)
+    // Note: enum variants are listed in alphabetical/legacy order for
+    // wire compatibility (`PHASE_NAMES` mapping); the transition order is
+    // enforced by `state_machine::mod::apply_event`, not by variant order.
     CodeReviewLocalPending,
     CodeReviewFixGlobalPending,
     CodeReviewFinalPending,

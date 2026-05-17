@@ -42,10 +42,18 @@ session record's `implementer` field is `"codex"`.
 
 v3 batch mode gives Codex a single coding turn: **read the full branch
 diff and the writing-plans markdown, form your own judgment, apply any
-fixes directly (commit + push), then send `review_fix_global`.** There
-is no separate `review` → `verdict` → `comment` cycle at the coding
-stage, and there are no per-task Codex turns — Claude orchestrates per-
-task subagents on its side, and you only see the consolidated result.
+fixes directly (commit + push), then send `review_fix_global`. You see
+the diff AS-IS — no Claude pre-clean.** Under the v3 phase order,
+`CodeReviewFixGlobalPending` (your turn) runs *before*
+`CodeReviewLocalPending` (Claude's `/ultrareview-local` audit of your
+commits) and `CodeReviewFinalPending` (Claude's PR turn). The
+next-receiving-side gate after you send `review_fix_global` is
+`CodeReviewLocalPending`, NOT `CodeReviewFinalPending`. There is no
+separate `review` → `verdict` → `comment` cycle at the coding stage,
+and there are no per-task cross-agent turns — the selected implementer
+orchestrates per-task subagents on its own side, and you only see the
+consolidated result at `review_fix_global`. PR creation is Claude-only at
+`final_review`; do not call `gh pr create`.
 
 - The session record's `task_list` field includes `plan_file_path`
   pointing at the markdown plan that drove subagent execution. Read it
@@ -116,10 +124,13 @@ branch names.
      **and** `current_owner == "codex"`, this is your batch
      implementation turn — run the action under "Batch implementation
      (codex-implementer)" below.
-   - **`CodeReviewLocalPending`** → Claude's local-review turn. Exit.
    - **`CodeReviewFixGlobalPending`** → Codex's only mandatory v3 coding
-     turn (always Codex regardless of `implementer`). Run the global
-     review action below.
+     turn (always Codex regardless of `implementer`). Under the new v3
+     order this phase runs FIRST (before Claude's `/ultrareview-local`
+     audit). Run the global review action below.
+   - **`CodeReviewLocalPending`** → Claude's audit turn — Claude is
+     running `/ultrareview-local` against your `review_fix_global`
+     commits. Exit.
    - **`CodeReviewFinalPending`** → Claude's PR turn. Exit.
    - **v3 terminal** (`CodingComplete` / `CodingFailed`) → report and exit.
 
@@ -197,8 +208,8 @@ before building the payload:
    implementation (codex-implementer)" sub-section ("Run final gates ...").
    For `CodeReviewFixGlobalPending`, the table row defines the action
    directly; Codex's commit+push completes the turn and the next test
-   run lives on the receiving Claude side (in the `CodeReviewFinalPending`
-   pre-PR re-run-gates step).
+   run lives on the receiving Claude side (in the `CodeReviewLocalPending`
+   `/ultrareview-local` audit step).
 7. Proceed to the phase-specific action below.
 
 **Fast path:** Before running steps 3–5, check if the working tree is already correct:
@@ -264,7 +275,7 @@ requiring no design judgment. Skip `subagent-driven-development` entirely.
 7. Send `collab_send` with `sender="codex"`, `topic="implementation_done"`,
    `content=<JSON {"head_sha":"<current HEAD after commit>"}>`. Payload
    carries ONLY `head_sha`.
-8. Exit. The session advances to `CodeReviewLocalPending` with Claude as
+8. Exit. The session advances to `CodeReviewFixGlobalPending` with Codex as
    owner. Skip the `gh pr list` PR-boundary check (Codex never touches PRs).
 
 ---
@@ -308,8 +319,9 @@ is `null`/absent (or any value other than `"mechanical_direct"`).
    `topic="implementation_done"`,
    `content=<JSON {"head_sha":"<current HEAD>"}>`. Payload carries
    ONLY `head_sha` — no subagent notes, no summary.
-7. Exit. The session is now `CodeReviewLocalPending` with Claude as
-   owner; Claude provides the local-review second opinion.
+7. Exit. The session is now `CodeReviewFixGlobalPending` with Codex as
+   owner; Codex will be re-invoked for `review_fix_global`, and Claude's
+   `/ultrareview-local` audit runs after that at `CodeReviewLocalPending`.
 
 After one successful send, exit. Claude will re-invoke `/collab join`
 via its Codex MCP tool when the session needs you again.
@@ -325,8 +337,8 @@ Codex joins such a session:
 - `base_sha` and `last_head_sha` will be set — use them for branch-drift
   detection exactly as in a full-flow global review.
 - Codex's next turn is `review_fix_global`; after that, Claude's
-  `final_review` closes out the session. No earlier phases are reachable
-  from a shortcut session.
+  `review_local` audit runs before Claude's `final_review` closes out
+  the session. No earlier phases are reachable from a shortcut session.
 
 All existing v3 anti-puppeteering rules apply unchanged.
 
@@ -335,8 +347,8 @@ All existing v3 anti-puppeteering rules apply unchanged.
 - **Never** call `collab_end` during an active phase:
   - v1 active: `PlanParallelDrafts`, `PlanSynthesisPending`,
     `PlanCodexReviewPending`, `PlanClaudeFinalizePending`.
-  - v3 active: `CodeImplementPending`, `CodeReviewLocalPending`,
-    `CodeReviewFixGlobalPending`, `CodeReviewFinalPending`.
+  - v3 active: `CodeImplementPending`, `CodeReviewFixGlobalPending`,
+    `CodeReviewLocalPending`, `CodeReviewFinalPending`.
 
   Only valid from `PlanLocked` pre-`task_list` (abandon plan with user's
   explicit instruction), `CodingComplete`, or `CodingFailed`.

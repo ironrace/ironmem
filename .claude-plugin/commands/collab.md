@@ -92,8 +92,9 @@ paths, branches, or SHAs.
    is Codex's review turn, driven inline via `codex exec` under the
    existing "Codex handoff — background `codex exec`" rules.
 5. Enter the v3 dispatch loop at phase `CodeReviewFixGlobalPending`. The
-   loop handles the two remaining turns (`review_fix_global` from Codex,
-   then `final_review` from Claude) and terminates at `CodingComplete`.
+   loop handles the three remaining turns (`review_fix_global` from Codex,
+   `review_local` from Claude, then `final_review` from Claude) and
+   terminates at `CodingComplete`.
 
 ## `join <session_id>`
 
@@ -256,7 +257,7 @@ serves as the gate.
         global-review stage can no longer open the PR cleanly.
 
      The collab v3 global review flow
-     (`review_local` → `review_fix_global` → `final_review` with
+     (`review_fix_global` → `review_local` → `final_review` with
      `gh pr create`) is the protocol's canonical PR path.
 
    - **`implementer == "codex"`** — Use the background `codex exec` path
@@ -277,7 +278,7 @@ serves as the gate.
      intervention, it never advances. Catch the bg-exec failure and:
 
      1. Re-poll `collab_status`. If the phase has already advanced to
-        `CodeReviewLocalPending`, Codex managed to emit
+        `CodeReviewFixGlobalPending`, Codex managed to emit
         `implementation_done` before the failure surfaced — fall
         through into the global review loop.
      2. Otherwise, decide based on the failure mode:
@@ -316,20 +317,22 @@ serves as the gate.
    `cargo test --workspace` as the post-work gate.
    On gate failure, send `failure_report`. On green, send
    `implementation_done` with `{"head_sha":"<current HEAD>"}`. Session
-   advances to `CodeReviewLocalPending`. (In Codex-implementer mode
+   advances to `CodeReviewFixGlobalPending`. (In Codex-implementer mode
    Codex already emitted `implementation_done` from inside its MCP
    session; just re-poll `collab_status` and confirm the phase is now
-   `CodeReviewLocalPending` with Claude as owner.)
+   `CodeReviewFixGlobalPending` with Codex as owner.)
 9. Fall through into the v3 dispatch loop.
 
 ## v3 Dispatch Loop (Phase → Action Table)
 
-v3 batch mode has exactly four Claude-owned coding turns: `task_list`
-(bridge), `implementation_done` (post-batch), `review_local` (post-
-ultrareview), and `final_review` (PR open). Codex has one coding turn
-(`review_fix_global`) at the global review stage. There are no per-task
-Codex turns — Claude orchestrates per-task work via subagents on its
-side, and Codex's only second-opinion pass is at branch scope.
+v3 batch mode has four Claude-side/default coding topics: `task_list`
+(bridge), `implementation_done` (post-batch in Claude-implementer mode),
+`review_local` (post-ultrareview), and `final_review` (PR open). Codex
+has one coding review turn (`review_fix_global`) at branch scope, plus
+the optional `implementation_done` turn when the session started with
+`--implementer=codex`. There are no per-task cross-agent turns — the
+selected implementer orchestrates per-task work via subagents on its own
+side.
 
 For every Claude-owned coding turn, execute this pre-send harness
 sequence before building the payload:
@@ -344,10 +347,22 @@ sequence before building the payload:
    sends — Claude is the only writer in those phases (same condition as
    the reset-skip in step 3), so there's nothing for Codex to have pushed
    that needs syncing. The cat-file check still catches local-tree drift.
-3. **Reset only when Codex just pushed.** Run `git reset --hard <last_head_sha>`
-   before `review_local` and `final_review` — Codex pushed `review_fix_global`
-   right before those phases. Skip reset before `task_list` and
-   `implementation_done` — Claude is the only writer in those phases.
+3. **Reset only when Codex just pushed (Claude-side rule under new v3 order).**
+   Under the new v3 phase order
+   (`CodeImplementPending` → `CodeReviewFixGlobalPending` (Codex) →
+   `CodeReviewLocalPending` (Claude audit) → `CodeReviewFinalPending` (Claude PR)),
+   Codex's only push happens at `review_fix_global`. So:
+   - **Reset to `last_head_sha`** before `review_local` (Codex pushed at
+     `review_fix_global` — the only Codex push in v3).
+   - **Skip reset** before `final_review` (Claude pushed at `review_local`).
+   - **Skip reset** before `task_list` and `implementation_done` (Claude is
+     the sole writer in those phases).
+   Codex's own pre-send harness (sending `review_fix_global`) keeps its
+   receive-side fetch/cat-file/checkout/reset-to-`last_head_sha` before
+   reviewing — Codex syncs to whatever Claude pushed at `implementation_done`
+   so review uses the canonical post-impl head. That rule lives in the
+   Codex prompt (`.codex-plugin/prompts/collab.md`); the rules in this list
+   apply to Claude's send-side harness only.
 4. Run local gates (pre-work — fmt + clippy only):
    - `cargo fmt --all -- --check`
    - `cargo clippy --workspace --all-targets --all-features -- -D warnings`
@@ -358,19 +373,24 @@ sequence before building the payload:
 
 | Phase | What to do (is_my_turn == true) |
 |---|---|
-| `CodeImplementPending` | Owner depends on `implementer`. **Claude is owner** (default): the bridge has already invoked `subagent-driven-development`. When all subagents finish, **run pre-send harness gates** (no reset — no Codex push to sync) and `collab_send` with `sender="claude"`, `topic="implementation_done"`, `content=<JSON {"head_sha":"<current HEAD>"}>`. Payload carries ONLY `head_sha`. **Codex is owner** (`--implementer=codex`): is_my_turn is false here; the bridge dispatched to Codex via `mcp__codex__codex` and Codex emits `implementation_done` itself before its MCP session returns. If the dispatch loop ever sees `CodeImplementPending` with Codex owner, re-dispatch via the Codex MCP tool (resumed-mid-batch case). |
-| `CodeReviewLocalPending` | **Run pre-send harness (with reset to `last_head_sha`), then `/ultrareview-local` on the full task stack.** Fix any CRITICAL/HIGH inline (commit + push). Call `collab_send` with `sender="claude"`, `topic="review_local"`, `content=<JSON {"head_sha":"<current HEAD>"}>`. **Log:** `t5_review_local_sent`. **Anti-removal:** `/ultrareview-local`'s code-quality lens partially overlaps with Codex `review_fix_global`'s correctness/security/scope/architecture lens but does not fully duplicate it. Removing this stage requires a written overlap audit demonstrating that prior Codex global reviews caught the code-quality issues `/ultrareview-local` would have flagged. |
-| `CodeReviewFixGlobalPending` | Codex's turn. is_my_turn should be false. If `collab_status` confirms Claude is the owner, exit the loop and report the anomaly. **Log:** `t6_codex_review_dispatched` immediately before launching `codex exec`; **Log:** `t7_codex_review_returned` immediately after the polling loop exits. Both events take structured `phase=CodeReviewFixGlobalPending round=1` metadata — see step d ("Codex handoff") for the exact form. |
-| `CodeReviewFinalPending` | **Run pre-send harness (with reset to `last_head_sha`).** Codex has pushed any global fixes (or a no-op commit); your local working copy was reset to `last_head_sha` by the harness. Optionally tweak. Re-run gates. Then **enter Plan Mode**: draft PR title (under 70 chars) and body (summary + test plan derived from task list + gate results). Get user approval. Then `gh pr create --base <base_branch> --head <current branch> --title <approved title> --body <approved body>`. If `gh pr create` fails, send `failure_report` with `coding_failure: "pr_create_failed: <error>"` — no silent retry. On success, **Log:** `t8_pr_created <pr_url>`, capture `pr_url` and call `collab_send` with `sender="claude"`, `topic="final_review"`, `content=<JSON {"head_sha":"<current HEAD>","pr_url":"<https url>"}>`. **Log:** `t9_final_review_sent`. Session advances directly to `CodingComplete`. **Log:** `t10_session_complete CodingComplete`. Exit loop. |
+| `CodeImplementPending` | Owner depends on `implementer`. **Claude is owner** (default): the bridge has already invoked `subagent-driven-development`. When all subagents finish, **run pre-send harness gates** (no reset — no Codex push to sync) and `collab_send` with `sender="claude"`, `topic="implementation_done"`, `content=<JSON {"head_sha":"<current HEAD>"}>`. Payload carries ONLY `head_sha`. After send, the phase advances to `CodeReviewFixGlobalPending` (Codex's turn — the new v3 order has Codex review the raw post-implementation diff first). **Codex is owner** (`--implementer=codex`): is_my_turn is false here; the bridge dispatched to Codex via `mcp__codex__codex` and Codex emits `implementation_done` itself before its MCP session returns. |
+| `CodeReviewFixGlobalPending` | Codex's turn. is_my_turn should be false. If `collab_status` confirms Claude is the owner, exit the loop and report the anomaly. **Log:** `t6_codex_review_dispatched` immediately before launching `codex exec`; **Log:** `t7_codex_review_returned` immediately after the polling loop exits. Both events take structured `phase=CodeReviewFixGlobalPending round=1` metadata — see step d ("Codex handoff") for the exact form. After Codex sends `review_fix_global` the phase advances to `CodeReviewLocalPending` (Claude's audit turn). |
+| `CodeReviewLocalPending` | **Run pre-send harness (with reset to `last_head_sha` — Codex just pushed at `review_fix_global`), then `/ultrareview-local` on the full task stack as audit of Codex's commits.** Fix any CRITICAL/HIGH/MEDIUM inline (commit + push). Call `collab_send` with `sender="claude"`, `topic="review_local"`, `content=<JSON {"head_sha":"<current HEAD>"}>`. **Log:** `t5_review_local_sent`. **Anti-removal:** under v3 ordering `/ultrareview-local` audits Codex's `review_fix_global` work plus catches code-quality issues both agents missed. Its code-quality lens partially overlaps with Codex's correctness/security/scope/architecture lens but does not fully duplicate it. Removing this stage requires a written overlap audit demonstrating that Codex's global reviews catch the code-quality issues `/ultrareview-local` would have flagged AND that the audit-of-Codex role is unnecessary. |
+| `CodeReviewFinalPending` | **Run pre-send harness (no reset — Claude just pushed at `review_local`).** Re-run gates. Then **enter Plan Mode**: draft PR title (under 70 chars) and body (summary + test plan derived from task list + gate results). Get user approval. Then `gh pr create --base <base_branch> --head <current branch> --title <approved title> --body <approved body>`. If `gh pr create` fails, send `failure_report` with `coding_failure: "pr_create_failed: <error>"` — no silent retry. On success, **Log:** `t8_pr_created <pr_url>`, capture `pr_url` and call `collab_send` with `sender="claude"`, `topic="final_review"`, `content=<JSON {"head_sha":"<current HEAD>","pr_url":"<https url>"}>`. **Log:** `t9_final_review_sent`. Session advances directly to `CodingComplete`. **Log:** `t10_session_complete CodingComplete`. Exit loop. |
 
 After each send in v3, loop back to polling. The loop continues until
 `phase in {CodingComplete, CodingFailed}` or `session_ended`.
 
 **Shortcut entry:** `/collab review` starts the loop at phase
 `CodeReviewFixGlobalPending` with `current_owner == "codex"`. No batch
-implementation phase is traversed. The only two remaining turns are
-Codex's `review_fix_global` and Claude's `final_review`. All
-anti-puppeteering rules below apply unchanged.
+implementation phase is traversed. Under the new v3 order the surviving
+flow is three turns: Codex's `review_fix_global` (audit and fix the raw
+diff) → Claude's `review_local` (audit Codex's commits via
+`/ultrareview-local`) → Claude's `final_review` (PR creation). The
+shortcut-ancestry gate now fires at BOTH `review_fix_global` AND
+`review_local` sends when `task_list.is_none()` — each push must
+descend from the prior `last_head_sha`. All anti-puppeteering rules
+below apply unchanged.
 
 ### Anti-puppeteering rules (v3)
 
@@ -405,7 +425,7 @@ silent grinds. ALL Codex-owned non-terminal phases now dispatch via
 background `codex exec` (not synchronous `mcp__codex__codex`). The
 matrix below governs HOW `codex exec` is invoked — specifically the
 prompt file and the reasoning flag. Don't blanket-apply low reasoning
-— review and planning turns are where the second-opinion value lives,
+— review and planning turns are where the independent-judgment value lives,
 and a shallow reviewer defeats the protocol's design.
 
 | Phase from `collab_status` | `implementer` | Prompt file | Reasoning flag | Rationale |
@@ -680,8 +700,8 @@ grep -E "t0_session_started|t10_session_complete" \
 - **Never** call `mcp__ironmem__collab_end` during any active phase. Rejected in:
   - v1 active: `PlanParallelDrafts`, `PlanSynthesisPending`,
     `PlanCodexReviewPending`, `PlanClaudeFinalizePending`.
-  - v3 active: `CodeImplementPending`, `CodeReviewLocalPending`,
-    `CodeReviewFixGlobalPending`, `CodeReviewFinalPending`.
+  - v3 active: `CodeImplementPending`, `CodeReviewFixGlobalPending`,
+    `CodeReviewLocalPending`, `CodeReviewFinalPending`.
 
   Only valid from `PlanLocked` pre-`task_list` (abandon plan), `CodingComplete`,
   or `CodingFailed`.

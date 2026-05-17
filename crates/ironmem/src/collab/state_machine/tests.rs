@@ -107,7 +107,9 @@ fn locked_session_with_codex_implementer(final_hash: &str) -> CollabSession {
 
 /// Drive a session from `CodeImplementPending` through the full global
 /// review flow to `CodingComplete`. Used by tests that need a representative
-/// happy path through the post-batch stage.
+/// happy path through the post-batch stage. Under the v3 reorder the
+/// sequence is: ImplementationDone → CodeReviewFixGlobal (Codex) →
+/// ReviewLocal (Claude audit) → FinalReview (Claude PR).
 fn finish_through_global_review(s: &CollabSession) -> CollabSession {
     let s = apply_event(
         s,
@@ -119,16 +121,16 @@ fn finish_through_global_review(s: &CollabSession) -> CollabSession {
     .unwrap();
     let s = apply_event(
         &s,
-        Agent::Claude,
-        &CollabEvent::ReviewLocal {
+        Agent::Codex,
+        &CollabEvent::CodeReviewFixGlobal {
             head_sha: "g1".to_string(),
         },
     )
     .unwrap();
     let s = apply_event(
         &s,
-        Agent::Codex,
-        &CollabEvent::CodeReviewFixGlobal {
+        Agent::Claude,
+        &CollabEvent::ReviewLocal {
             head_sha: "g2".to_string(),
         },
     )
@@ -333,7 +335,7 @@ fn test_task_list_rejected_before_plan_locked() {
 // ── v3: batch implementation → global review ─────────────────────────
 
 #[test]
-fn test_implementation_done_jumps_to_local_review() {
+fn test_implementation_done_jumps_to_global_review() {
     let s = locked_session("hf");
     let s = submit_task_list(&s, "hf", 3);
     assert_eq!(s.phase, Phase::CodeImplementPending);
@@ -346,8 +348,8 @@ fn test_implementation_done_jumps_to_local_review() {
         },
     )
     .unwrap();
-    assert_eq!(s.phase, Phase::CodeReviewLocalPending);
-    assert_eq!(s.current_owner, Agent::Claude);
+    assert_eq!(s.phase, Phase::CodeReviewFixGlobalPending);
+    assert_eq!(s.current_owner, Agent::Codex);
     assert_eq!(s.last_head_sha.as_deref(), Some("batch_head"));
 }
 
@@ -396,9 +398,9 @@ fn test_implementation_done_under_codex_implementer_requires_codex_actor() {
     .unwrap_err();
     assert!(matches!(err, CollabError::NotYourTurn { .. }));
 
-    // Codex fires it successfully and the phase advances to local review
-    // (Claude-owned, since Claude always provides the second-opinion
-    // local pass regardless of who implemented).
+    // Codex fires it successfully and the phase advances to global review
+    // (Codex-owned under v3 reorder: Codex reads the raw post-implementation
+    // diff first, before Claude's `/ultrareview-local` audit).
     let s = apply_event(
         &s,
         Agent::Codex,
@@ -407,8 +409,8 @@ fn test_implementation_done_under_codex_implementer_requires_codex_actor() {
         },
     )
     .unwrap();
-    assert_eq!(s.phase, Phase::CodeReviewLocalPending);
-    assert_eq!(s.current_owner, Agent::Claude);
+    assert_eq!(s.phase, Phase::CodeReviewFixGlobalPending);
+    assert_eq!(s.current_owner, Agent::Codex);
     assert_eq!(s.last_head_sha.as_deref(), Some("batch_head"));
 }
 
@@ -426,7 +428,7 @@ fn test_implementation_done_rejected_outside_code_implement_pending() {
     .unwrap_err();
     assert!(matches!(err, CollabError::WrongPhase { .. }));
 
-    // From CodeReviewLocalPending: WrongPhase too.
+    // From CodeReviewFixGlobalPending: WrongPhase too.
     let s = locked_session("hf");
     let s = submit_task_list(&s, "hf", 1);
     let s = apply_event(
@@ -455,7 +457,7 @@ fn test_global_review_linear_flow_ends_in_coding_complete() {
     let s = locked_session("hf");
     let s = submit_task_list(&s, "hf", 1);
 
-    // Batch implementation → local review owner.
+    // Batch implementation → global review owner (Codex reads raw diff first).
     let s = apply_event(
         &s,
         Agent::Claude,
@@ -464,25 +466,26 @@ fn test_global_review_linear_flow_ends_in_coding_complete() {
         },
     )
     .unwrap();
-    assert_eq!(s.phase, Phase::CodeReviewLocalPending);
-
-    // Local: claude → codex
-    let s = apply_event(
-        &s,
-        Agent::Claude,
-        &CollabEvent::ReviewLocal {
-            head_sha: "g1".to_string(),
-        },
-    )
-    .unwrap();
     assert_eq!(s.phase, Phase::CodeReviewFixGlobalPending);
     assert_eq!(s.current_owner, Agent::Codex);
 
-    // Global review+fix: codex → claude
+    // Global review+fix: codex → claude (audit turn).
     let s = apply_event(
         &s,
         Agent::Codex,
         &CollabEvent::CodeReviewFixGlobal {
+            head_sha: "g1".to_string(),
+        },
+    )
+    .unwrap();
+    assert_eq!(s.phase, Phase::CodeReviewLocalPending);
+    assert_eq!(s.current_owner, Agent::Claude);
+
+    // Local audit (/ultrareview-local): claude → claude (final review).
+    let s = apply_event(
+        &s,
+        Agent::Claude,
+        &CollabEvent::ReviewLocal {
             head_sha: "g2".to_string(),
         },
     )
@@ -516,8 +519,96 @@ fn test_global_review_linear_flow_ends_in_coding_complete() {
     assert_eq!(err, CollabError::SessionLocked);
 }
 
+// ── v3 reorder (Codex first): canonical phase sequence ───────────────
+
+#[test]
+fn test_v3_phase_sequence_is_global_then_local() {
+    // Under the v3 reorder, ImplementationDone routes to
+    // CodeReviewFixGlobalPending (Codex's turn) BEFORE
+    // CodeReviewLocalPending (Claude's audit).
+    let s = locked_session("hf");
+    let s = submit_task_list(&s, "hf", 1);
+    assert_eq!(s.phase, Phase::CodeImplementPending);
+
+    // CodeImplementPending -> CodeReviewFixGlobalPending (Codex)
+    let s = apply_event(
+        &s,
+        Agent::Claude,
+        &CollabEvent::ImplementationDone {
+            head_sha: "h1".to_string(),
+        },
+    )
+    .expect("implementation_done");
+    assert_eq!(s.phase, Phase::CodeReviewFixGlobalPending);
+    assert_eq!(s.current_owner, Agent::Codex);
+
+    // CodeReviewFixGlobalPending -> CodeReviewLocalPending (Claude)
+    let s = apply_event(
+        &s,
+        Agent::Codex,
+        &CollabEvent::CodeReviewFixGlobal {
+            head_sha: "h2".to_string(),
+        },
+    )
+    .expect("review_fix_global");
+    assert_eq!(s.phase, Phase::CodeReviewLocalPending);
+    assert_eq!(s.current_owner, Agent::Claude);
+
+    // CodeReviewLocalPending -> CodeReviewFinalPending (Claude)
+    let s = apply_event(
+        &s,
+        Agent::Claude,
+        &CollabEvent::ReviewLocal {
+            head_sha: "h3".to_string(),
+        },
+    )
+    .expect("review_local");
+    assert_eq!(s.phase, Phase::CodeReviewFinalPending);
+    assert_eq!(s.current_owner, Agent::Claude);
+
+    // CodeReviewFinalPending -> CodingComplete
+    let s = apply_event(
+        &s,
+        Agent::Claude,
+        &CollabEvent::FinalReview {
+            head_sha: "h4".to_string(),
+            pr_url: "https://example/pr".to_string(),
+        },
+    )
+    .expect("final_review");
+    assert_eq!(s.phase, Phase::CodingComplete);
+}
+
+#[test]
+fn test_v1_force_finalize_still_works_at_max_rounds() {
+    // Regression: the v1 force-finalize cap at MAX_REVIEW_ROUNDS must
+    // remain intact after the v3 reorder. The substantive assertion is
+    // already covered by `test_request_changes_at_cap_forces_finalize`
+    // above (state_machine/tests.rs:194-205): two `request_changes`
+    // rounds force the phase to PlanClaudeFinalizePending and pin
+    // `review_round == MAX_REVIEW_ROUNDS`. This pointer test makes the
+    // regression contract explicit so a future v3 rewire cannot silently
+    // bypass the cap.
+    let s = session();
+    let s = draft(Agent::Claude, "c1", &s);
+    let s = draft(Agent::Codex, "c2", &s);
+    let s = canonical("v1", &s);
+    let s = review("request_changes", &s);
+    assert_eq!(s.phase, Phase::PlanSynthesisPending);
+    let s = canonical("v2", &s);
+    let s = review("request_changes", &s);
+
+    // Force-finalize trips here (review_round == MAX_REVIEW_ROUNDS).
+    assert_eq!(s.phase, Phase::PlanClaudeFinalizePending);
+    assert_eq!(s.review_round, MAX_REVIEW_ROUNDS);
+}
+
 #[test]
 fn test_review_local_wrong_sender_rejected() {
+    // Under v3 reorder: drive through ImplementationDone (→ CodeReviewFixGlobalPending,
+    // Codex) and CodeReviewFixGlobal (→ CodeReviewLocalPending, Claude) so we
+    // land at the gate where ReviewLocal is the expected next event, then
+    // assert a Codex-sent ReviewLocal is rejected as NotYourTurn.
     let s = locked_session("hf");
     let s = submit_task_list(&s, "hf", 1);
     let s = apply_event(
@@ -528,11 +619,19 @@ fn test_review_local_wrong_sender_rejected() {
         },
     )
     .unwrap();
+    let s = apply_event(
+        &s,
+        Agent::Codex,
+        &CollabEvent::CodeReviewFixGlobal {
+            head_sha: "g1".to_string(),
+        },
+    )
+    .unwrap();
     let err = apply_event(
         &s,
         Agent::Codex,
         &CollabEvent::ReviewLocal {
-            head_sha: "g".to_string(),
+            head_sha: "g2".to_string(),
         },
     )
     .unwrap_err();
@@ -541,6 +640,9 @@ fn test_review_local_wrong_sender_rejected() {
 
 #[test]
 fn test_code_review_fix_global_wrong_sender_rejected() {
+    // Under v3 reorder: after ImplementationDone the phase is
+    // CodeReviewFixGlobalPending (Codex owner). A Claude-sent
+    // CodeReviewFixGlobal is rejected as NotYourTurn.
     let s = locked_session("hf");
     let s = submit_task_list(&s, "hf", 1);
     let s = apply_event(
@@ -551,19 +653,11 @@ fn test_code_review_fix_global_wrong_sender_rejected() {
         },
     )
     .unwrap();
-    let s = apply_event(
-        &s,
-        Agent::Claude,
-        &CollabEvent::ReviewLocal {
-            head_sha: "g1".to_string(),
-        },
-    )
-    .unwrap();
     let err = apply_event(
         &s,
         Agent::Claude,
         &CollabEvent::CodeReviewFixGlobal {
-            head_sha: "g2".to_string(),
+            head_sha: "g1".to_string(),
         },
     )
     .unwrap_err();
@@ -599,6 +693,8 @@ fn start_global_review_session_rejects_empty_head_sha() {
 fn start_global_review_session_flows_into_final_review() {
     let session = start_global_review_session("s1", "basesha", "h0").unwrap();
 
+    // Under v3 reorder: Codex review_fix_global advances to CodeReviewLocalPending
+    // (Claude's audit turn) before reaching CodeReviewFinalPending.
     let after_codex = apply_event(
         &session,
         Agent::Codex,
@@ -607,11 +703,22 @@ fn start_global_review_session_flows_into_final_review() {
         },
     )
     .unwrap();
-    assert_eq!(after_codex.phase, Phase::CodeReviewFinalPending);
+    assert_eq!(after_codex.phase, Phase::CodeReviewLocalPending);
     assert_eq!(after_codex.current_owner, Agent::Claude);
 
-    let after_claude = apply_event(
+    let after_audit = apply_event(
         &after_codex,
+        Agent::Claude,
+        &CollabEvent::ReviewLocal {
+            head_sha: "h1".to_string(),
+        },
+    )
+    .unwrap();
+    assert_eq!(after_audit.phase, Phase::CodeReviewFinalPending);
+    assert_eq!(after_audit.current_owner, Agent::Claude);
+
+    let after_claude = apply_event(
+        &after_audit,
         Agent::Claude,
         &CollabEvent::FinalReview {
             head_sha: "h1".to_string(),
@@ -765,16 +872,16 @@ fn test_failure_report_from_code_review_final_pending_transitions_to_failed() {
     .unwrap();
     let s = apply_event(
         &s,
-        Agent::Claude,
-        &CollabEvent::ReviewLocal {
+        Agent::Codex,
+        &CollabEvent::CodeReviewFixGlobal {
             head_sha: "g1".to_string(),
         },
     )
     .unwrap();
     let s = apply_event(
         &s,
-        Agent::Codex,
-        &CollabEvent::CodeReviewFixGlobal {
+        Agent::Claude,
+        &CollabEvent::ReviewLocal {
             head_sha: "g2".to_string(),
         },
     )

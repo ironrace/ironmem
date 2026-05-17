@@ -57,8 +57,8 @@ pub(super) fn build_v1_plan_event(topic: &str, content: &str) -> Result<CollabEv
     }
 }
 
-/// v1 `review` topic — plan-only. v3 batch mode has no per-task review topic
-/// (Codex only participates at the global review stage).
+/// v1 `review` topic — plan-only. v3 batch mode has no per-task review topic;
+/// Codex's branch-scope review uses `review_fix_global`.
 pub(super) fn build_v1_review_event(content: &str) -> Result<CollabEvent, MemoryError> {
     Ok(CollabEvent::SubmitReview {
         verdict: parse_review_verdict(content)?,
@@ -86,9 +86,9 @@ pub(super) fn build_v1_final_event(
     })
 }
 
-/// v3 coding topics. Batch mode: Claude orchestrates per-task subagents
-/// inline and signals completion via `implementation_done`; Codex only
-/// participates at the global review stage.
+/// v3 coding topics. Batch mode: the selected implementer orchestrates
+/// per-task subagents and signals completion via `implementation_done`;
+/// Codex owns the first branch-scope review pass afterward.
 pub(super) fn build_v3_coding_event(
     topic: &str,
     content: &str,

@@ -185,6 +185,44 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Collab v3 phase reorder — Codex global review precedes Claude local
+  audit (2026-05-17).** Forward-only protocol change.
+  New phase sequence: `CodeImplementPending` →
+  `CodeReviewFixGlobalPending` (Codex; reviews the raw post-implementation
+  diff with no Claude pre-clean) → `CodeReviewLocalPending` (Claude;
+  audits Codex's commits via `/ultrareview-local`, fixes
+  CRITICAL/HIGH/MEDIUM inline) → `CodeReviewFinalPending` (Claude; PR
+  creation) → `CodingComplete`. Wire-observable through
+  `collab_status.phase` transitions.
+  (A) State-machine match arms rewired in
+  `crates/ironmem/src/collab/state_machine/mod.rs`; topic-to-event
+  names unchanged. Owners per phase unchanged; positions in sequence
+  change.
+  (B) Pre-send harness reset rules scoped by harness owner: Claude
+  resets to `last_head_sha` before `review_local` (Codex's only push
+  in v3); skips reset before `task_list`, `implementation_done`, and
+  `final_review`. Codex keeps its receive-side reset before
+  `review_fix_global` (syncs to whatever Claude pushed at
+  `implementation_done`).
+  (C) `/ultrareview-local` role shifts to audit-of-Codex; anti-removal
+  guardrail updated. Severity threshold for inline fixes extended to
+  CRITICAL/HIGH/MEDIUM (was CRITICAL/HIGH).
+  (D) Codex prompt framing updated: Codex sees the raw post-implementation
+  diff, no Claude pre-clean. The next-receiving-side gate after Codex's
+  `review_fix_global` is `CodeReviewLocalPending`, not
+  `CodeReviewFinalPending`.
+  (E) Shortcut ancestry validation extended in
+  `crates/ironmem/src/mcp/tools/collab_session.rs` to fire at both
+  `(CodeReviewFixGlobalPending, CodeReviewFixGlobal)` AND
+  `(CodeReviewLocalPending, ReviewLocal)` when `task_list.is_none()`.
+  New test `test_shortcut_review_local_ancestry_enforced` enforces
+  branch-drift rejection.
+  (F) **Deployment requirement** — operationally explicit: pause / avoid
+  starting new coding-phase collab sessions while existing
+  coding-active sessions are drained or aborted before rollout. No
+  protocol-version migration; sessions surviving deploy follow new
+  semantics from their stored phase forward.
+
 - **Collab protocol — docs/prompts alignment with server enforcement
   (2026-05-16).** Three doc/prompt-only changes; no Rust source touched
   (server behavior unchanged):
