@@ -581,7 +581,7 @@ between `wait_my_turn` and `collab_send`:
   (code-reviewer + security-reviewer + architect + doc-reviewer in
   parallel) runs against the post-`review_fix_global` head, auditing
   Codex's commits + catching code-quality issues both agents missed.
-  Claude fixes any HIGH/CRITICAL findings in place + commits + pushes.
+  Claude fixes any CRITICAL/HIGH/MEDIUM findings in place + commits + pushes.
 - **Shortcut ancestry validation** during shortcut-started
   `review_fix_global` and `review_local`: the server shells out narrowly
   to `git merge-base --is-ancestor` to distinguish a true descendant
@@ -646,7 +646,7 @@ Phase → action (v3):
 | `PlanLocked` (post-final) | run `writing-plans` on the locked plan; user approves the generated markdown; build `task_list` JSON (with `plan_file_path`), send | wait |
 | `CodeImplementPending` | run `subagent-driven-development` to dispatch per-task subagents; on full success run gates and send `implementation_done{head_sha}` | wait |
 | `CodeReviewFixGlobalPending` | wait | review the raw post-implementation diff (no Claude pre-clean), fix branch-level issues in place, send `review_fix_global` |
-| `CodeReviewLocalPending` | run `/ultrareview-local` as audit of Codex's commits, fix HIGH/CRITICAL in place, send `review_local` | wait |
+| `CodeReviewLocalPending` | run `/ultrareview-local` as audit of Codex's commits, fix CRITICAL/HIGH/MEDIUM in place, send `review_local` | wait |
 | `CodeReviewFinalPending` | gates, enter Plan Mode for PR title/body, `gh pr create`, send `final_review{pr_url}` | wait |
 | `CodingComplete` / `CodingFailed` | exit loop | exit loop |
 
