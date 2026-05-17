@@ -9,8 +9,10 @@
 //! per-task subagents (via `superpowers:writing-plans` →
 //! `superpowers:subagent-driven-development`) entirely on its side. A
 //! single `implementation_done` send jumps to the global 3-phase review
-//! flow (`CodeReviewLocalPending` → `CodeReviewFixGlobalPending` →
-//! `CodeReviewFinalPending`) and lands directly in `CodingComplete`
+//! flow (`CodeReviewFixGlobalPending` → `CodeReviewLocalPending` →
+//! `CodeReviewFinalPending`) — Codex reviews the raw post-implementation
+//! diff first, then Claude audits Codex's commits via `/ultrareview-local`,
+//! then Claude opens the PR — and lands directly in `CodingComplete`
 //! (terminal) on success — the final Claude turn opens the PR and carries
 //! its URL. `CodingFailed` is the unrecoverable-error terminal.
 
