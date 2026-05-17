@@ -164,7 +164,7 @@ Claude's MCP tool call will still complete cleanly.
 |---|---|
 | `PlanParallelDrafts` | If you haven't submitted yet, write your draft and send `topic="draft"`, `sender="codex"`. If already submitted, `is_my_turn` should be false — exit. |
 | `PlanSynthesisPending` | Claude's turn. Exit. |
-| `PlanCodexReviewPending` | Read Claude's canonical plan from the recv'd message. Call `collab_send` with `sender="codex"`, `topic="review"`, `content=<JSON {"verdict":"...","notes":["..."]}>`. Allowed verdicts: `approve`, `approve_with_minor_edits`, `request_changes`. Shortcut: if verdict is exactly `approve`, you may call `collab_approve` with `agent="codex"`, `content_hash=<canonical_plan_hash from collab_status>` instead. |
+| `PlanCodexReviewPending` | Read Claude's canonical plan from the recv'd message. Call `collab_send` with `sender="codex"`, `topic="review"`, `content=<JSON {"verdict":"...","notes":["..."]}>`. Allowed verdicts: `approve`, `approve_with_minor_edits`, `request_changes`. Shortcut: if verdict is exactly `approve`, you may call `collab_approve` with `agent="codex"`, `content_hash=<canonical_plan_hash from collab_status>` instead. **Review cap (server-enforced):** you have at most **2 plan review rounds** (`MAX_REVIEW_ROUNDS = 2` at `crates/ironmem/src/collab/state_machine/mod.rs:28`). On your 2nd review the server force-finalizes to `PlanClaudeFinalizePending` regardless of verdict — `request_changes` does not extend the loop. Frame your notes accordingly: surface every concern in round 1 if you can, because Claude has the last word on round 2. Do NOT treat planning as open-ended iteration. |
 | `PlanClaudeFinalizePending` | Claude's turn. Exit. |
 
 ## v3 Dispatch Loop (Phase → Action Table)
