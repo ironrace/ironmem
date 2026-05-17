@@ -318,7 +318,7 @@ pub(super) fn handle_collab_send(app: &App, args: &Value) -> Result<Value, Memor
                 &record.repo_path,
                 session.last_head_sha.as_deref().ok_or_else(|| {
                     MemoryError::Validation(format!(
-                        "last_head_sha is missing for {:?}",
+                        "last_head_sha is missing for {}",
                         session.phase
                     ))
                 })?,

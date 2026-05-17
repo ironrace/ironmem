@@ -525,9 +525,7 @@ fn test_global_review_linear_flow_ends_in_coding_complete() {
 fn test_v3_phase_sequence_is_global_then_local() {
     // Under the v3 reorder, ImplementationDone routes to
     // CodeReviewFixGlobalPending (Codex's turn) BEFORE
-    // CodeReviewLocalPending (Claude's audit). Current code still routes
-    // to CodeReviewLocalPending first; this test fails until the four
-    // state-machine arms are rewired.
+    // CodeReviewLocalPending (Claude's audit).
     let s = locked_session("hf");
     let s = submit_task_list(&s, "hf", 1);
     assert_eq!(s.phase, Phase::CodeImplementPending);
