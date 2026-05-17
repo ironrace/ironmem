@@ -10,6 +10,12 @@
 CODEX_TASK_*.md
 docs/collab_*.md
 
+# Superpowers plan + scratch artifacts (writing-plans output, /collab bridges).
+# These are per-session working artifacts, not durable spec; the canonical
+# protocol/architecture lives in docs/COLLAB.md and similar. Specs under
+# docs/superpowers/specs/ are tracked deliberately.
+docs/superpowers/plans/
+
 # Local tool and editor state (personal, non-portable)
 .cargo/
 .claude/
