@@ -182,8 +182,8 @@ via its Codex MCP tool when the session needs you again.
 ## Invariants — do not violate
 
 - **Never** call `collab_end` during an active phase:
-  - v3 active: `CodeImplementPending`, `CodeReviewLocalPending`,
-    `CodeReviewFixGlobalPending`, `CodeReviewFinalPending`.
+  - v3 active: `CodeImplementPending`, `CodeReviewFixGlobalPending`,
+    `CodeReviewLocalPending`, `CodeReviewFinalPending`.
 
   Only valid from `PlanLocked` pre-`task_list` (abandon plan with user's
   explicit instruction), `CodingComplete`, or `CodingFailed`.

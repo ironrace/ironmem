@@ -92,8 +92,9 @@ paths, branches, or SHAs.
    is Codex's review turn, driven inline via `codex exec` under the
    existing "Codex handoff — background `codex exec`" rules.
 5. Enter the v3 dispatch loop at phase `CodeReviewFixGlobalPending`. The
-   loop handles the two remaining turns (`review_fix_global` from Codex,
-   then `final_review` from Claude) and terminates at `CodingComplete`.
+   loop handles the three remaining turns (`review_fix_global` from Codex,
+   `review_local` from Claude, then `final_review` from Claude) and
+   terminates at `CodingComplete`.
 
 ## `join <session_id>`
 
@@ -256,7 +257,7 @@ serves as the gate.
         global-review stage can no longer open the PR cleanly.
 
      The collab v3 global review flow
-     (`review_local` → `review_fix_global` → `final_review` with
+     (`review_fix_global` → `review_local` → `final_review` with
      `gh pr create`) is the protocol's canonical PR path.
 
    - **`implementer == "codex"`** — Use the background `codex exec` path
@@ -277,7 +278,7 @@ serves as the gate.
      intervention, it never advances. Catch the bg-exec failure and:
 
      1. Re-poll `collab_status`. If the phase has already advanced to
-        `CodeReviewLocalPending`, Codex managed to emit
+        `CodeReviewFixGlobalPending`, Codex managed to emit
         `implementation_done` before the failure surfaced — fall
         through into the global review loop.
      2. Otherwise, decide based on the failure mode:
@@ -316,20 +317,22 @@ serves as the gate.
    `cargo test --workspace` as the post-work gate.
    On gate failure, send `failure_report`. On green, send
    `implementation_done` with `{"head_sha":"<current HEAD>"}`. Session
-   advances to `CodeReviewLocalPending`. (In Codex-implementer mode
+   advances to `CodeReviewFixGlobalPending`. (In Codex-implementer mode
    Codex already emitted `implementation_done` from inside its MCP
    session; just re-poll `collab_status` and confirm the phase is now
-   `CodeReviewLocalPending` with Claude as owner.)
+   `CodeReviewFixGlobalPending` with Codex as owner.)
 9. Fall through into the v3 dispatch loop.
 
 ## v3 Dispatch Loop (Phase → Action Table)
 
-v3 batch mode has exactly four Claude-owned coding turns: `task_list`
-(bridge), `implementation_done` (post-batch), `review_local` (post-
-ultrareview), and `final_review` (PR open). Codex has one coding turn
-(`review_fix_global`) at the global review stage. There are no per-task
-Codex turns — Claude orchestrates per-task work via subagents on its
-side, and Codex's only second-opinion pass is at branch scope.
+v3 batch mode has four Claude-side/default coding topics: `task_list`
+(bridge), `implementation_done` (post-batch in Claude-implementer mode),
+`review_local` (post-ultrareview), and `final_review` (PR open). Codex
+has one coding review turn (`review_fix_global`) at branch scope, plus
+the optional `implementation_done` turn when the session started with
+`--implementer=codex`. There are no per-task cross-agent turns — the
+selected implementer orchestrates per-task work via subagents on its own
+side.
 
 For every Claude-owned coding turn, execute this pre-send harness
 sequence before building the payload:
@@ -422,7 +425,7 @@ silent grinds. ALL Codex-owned non-terminal phases now dispatch via
 background `codex exec` (not synchronous `mcp__codex__codex`). The
 matrix below governs HOW `codex exec` is invoked — specifically the
 prompt file and the reasoning flag. Don't blanket-apply low reasoning
-— review and planning turns are where the second-opinion value lives,
+— review and planning turns are where the independent-judgment value lives,
 and a shallow reviewer defeats the protocol's design.
 
 | Phase from `collab_status` | `implementer` | Prompt file | Reasoning flag | Rationale |
@@ -697,8 +700,8 @@ grep -E "t0_session_started|t10_session_complete" \
 - **Never** call `mcp__ironmem__collab_end` during any active phase. Rejected in:
   - v1 active: `PlanParallelDrafts`, `PlanSynthesisPending`,
     `PlanCodexReviewPending`, `PlanClaudeFinalizePending`.
-  - v3 active: `CodeImplementPending`, `CodeReviewLocalPending`,
-    `CodeReviewFixGlobalPending`, `CodeReviewFinalPending`.
+  - v3 active: `CodeImplementPending`, `CodeReviewFixGlobalPending`,
+    `CodeReviewLocalPending`, `CodeReviewFinalPending`.
 
   Only valid from `PlanLocked` pre-`task_list` (abandon plan), `CodingComplete`,
   or `CodingFailed`.

@@ -1490,12 +1490,10 @@ fn collab_start_code_review_happy_path_reaches_coding_complete() {
 
 #[test]
 fn test_shortcut_review_flows_through_audit() {
-    // RED test for the v3 reorder: under the new ordering the shortcut
-    // (collab_start_code_review) must seed at CodeReviewFixGlobalPending
-    // / Codex, then `review_fix_global` advances to CodeReviewLocalPending
-    // (Claude's audit turn) — NOT directly to CodeReviewFinalPending.
-    // Today the second transition jumps straight to CodeReviewFinalPending,
-    // so this test fails until the four state-machine arms are rewired.
+    // Regression for the v3 reorder: the shortcut (collab_start_code_review)
+    // seeds at CodeReviewFixGlobalPending / Codex, then `review_fix_global`
+    // advances to CodeReviewLocalPending (Claude's audit turn) before
+    // CodeReviewFinalPending.
     let app = App::open_for_test().unwrap();
     let (_temp, repo_path, base_sha, head_sha, descendant_sha, _drift_sha) = git_repo_fixture();
 
@@ -1683,14 +1681,13 @@ fn collab_start_code_review_accepts_descendant_head_and_rejects_end_in_final_rev
     assert!(blocked.contains("active phase CodeReviewFinalPending"));
 }
 
-/// RED: Under the v3 reorder, `/collab review` shortcut sessions advance
+/// Under the v3 reorder, `/collab review` shortcut sessions advance
 /// `CodeReviewFixGlobalPending → CodeReviewLocalPending → CodeReviewFinalPending`.
 /// Claude's `review_local` at `CodeReviewLocalPending` produces a NEW head
-/// (her audit commit on top of Codex's). The ancestry gate that currently
-/// guards `(CodeReviewFixGlobalPending, CodeReviewFixGlobal)` must also fire
+/// (her audit commit on top of Codex's). The ancestry gate guards
+/// `(CodeReviewFixGlobalPending, CodeReviewFixGlobal)` and also fires
 /// for `(CodeReviewLocalPending, CodeReviewLocal)` so a non-descendant
-/// `claude_head` is rejected with `branch_drift`. This test fails today
-/// because no such gate exists at `CodeReviewLocalPending`; Task 6 extends it.
+/// `claude_head` is rejected with `branch_drift`.
 #[test]
 fn test_shortcut_review_local_ancestry_enforced() {
     let app = App::open_for_test().unwrap();
@@ -1739,9 +1736,8 @@ fn test_shortcut_review_local_ancestry_enforced() {
     assert_eq!(status["current_owner"], "claude");
     assert_eq!(status["last_head_sha"], codex_head);
 
-    // FAILING ASSERTION (RED): Claude attempts review_local with a head that
-    // is NOT a descendant of codex_head. This must be rejected with
-    // `branch_drift`, but today the gate only fires at CodeReviewFixGlobalPending.
+    // Claude attempts review_local with a head that is NOT a descendant of
+    // codex_head. This must be rejected with `branch_drift`.
     let blocked = call_tool_expect_error(
         &app,
         "collab_send",

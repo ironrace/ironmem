@@ -7,13 +7,13 @@ MCP server.
 - **v1 (planning)**: bounded parallel drafts → canonical synthesis → Codex
   review → Claude finalize → `PlanLocked`. Two review rounds.
 - **v3 (coding)**: post-`PlanLocked` task list → **batch implementation
-  phase** (Claude orchestrates per-task subagents on its side via
-  `writing-plans` → `subagent-driven-development`,
-  then signals completion with `implementation_done`) → global 3-phase
-  linear flow (Claude local → Codex review+fix → Claude final with PR URL)
-  → `CodingComplete` / `CodingFailed`. Codex only participates at the
-  global review stage; per-task implementation is single-agent on
-  Claude's side.
+  phase** (Claude publishes the `writing-plans` task document, then the
+  session's `implementer` runs per-task subagents via
+  `subagent-driven-development` and signals completion with
+  `implementation_done`) → global 3-phase linear flow (Codex review+fix →
+  Claude local audit → Claude final with PR URL) → `CodingComplete` /
+  `CodingFailed`. Per-task implementation is single-agent on the selected
+  implementer's side; Codex always owns the first branch-scope review pass.
 
 This document covers:
 
@@ -94,7 +94,7 @@ Stored in `collab_sessions`:
 | `canonical_plan_hash` | SHA-256 of Claude's synthesis |
 | `canonical_plan` | Latest `canonical` message content (present when `canonical_plan_hash` is set). Lets a fresh agent rejoining mid-planning pull back its own earlier synthesis without a counterpart `recv`. |
 | `final_plan_hash` | SHA-256 of the locked plan |
-| `final_plan` | Latest `final` message content as sent — the JSON string `{"plan":"<full text>"}` (present when `final_plan_hash` is set). Primary input to the v2 `task_list` bridge after `PlanLocked`. |
+| `final_plan` | Latest `final` message content as sent — the JSON string `{"plan":"<full text>"}` (present when `final_plan_hash` is set). Primary input to the v3 `task_list` bridge after `PlanLocked`. |
 | `codex_review_verdict` | Last Codex verdict |
 | `review_round` | Number of completed Codex reviews (0, 1, or 2) |
 | `ended_at` | Non-null once `collab_end` has been called |
@@ -150,7 +150,7 @@ Plan is frozen; `final_plan_hash` is set. This is terminal for `wait_my_turn`
 **only while `task_list` has not yet been submitted**. Two transitions out:
 
 - `collab_end` — abandon before coding starts (last point this is valid).
-- `collab_send` with `topic=task_list` from `claude` — enter the v2 coding
+- `collab_send` with `topic=task_list` from `claude` — enter the v3 coding
   loop. The state machine verifies `plan_hash == final_plan_hash` and the
   task list is non-empty; the session stays active and the terminal set for
   `wait_my_turn` flips to `{CodingComplete, CodingFailed}`.
@@ -255,7 +255,7 @@ Invariants that still apply:
   `ReviewLocal{head_sha}` with a git ancestry check when `task_list` is
   still unset. Both Codex's `review_fix_global` push and Claude's
   `review_local` audit-push must descend from the prior `last_head_sha`.
-  Full-flow v2 sessions keep their existing non-shell-out behavior.
+  Full-flow v3 sessions keep their existing non-shell-out behavior.
 
 ### Deployment
 
@@ -278,8 +278,8 @@ migration logic.
 | *any coding-active phase* | either | `FailureReport{coding_failure}` | `CodingFailed` (terminal) |
 
 `collab_end` is **rejected** in every coding-active phase
-(`CodeImplementPending`, `CodeReviewLocalPending`,
-`CodeReviewFixGlobalPending`, `CodeReviewFinalPending`). Only
+(`CodeImplementPending`, `CodeReviewFixGlobalPending`,
+`CodeReviewLocalPending`, `CodeReviewFinalPending`). Only
 `CodingComplete` or `CodingFailed` end the session post-`task_list`.
 
 ## Blind-Draft Invariant
@@ -563,15 +563,18 @@ between `wait_my_turn` and `collab_send`:
   already at the right SHA — for example, entering the batch-impl turn
   immediately after `task_list` is sent.
 - **Subagent orchestration** during `CodeImplementPending`. Claude invokes
-  `writing-plans` to expand the locked plan into a markdown
-  task document, then `subagent-driven-development` to
-  dispatch fresh subagents per task. Each subagent runs TDD and commits
-  on the branch. Per-subagent failures pause for triage; an unrecoverable
-  failure surfaces as `failure_report` with `coding_failure: "subagent_failure: ..."`.
+  `writing-plans` to expand the locked plan into a markdown task document
+  and publishes it via `task_list`. The selected `implementer` then runs
+  `subagent-driven-development` to dispatch fresh subagents per task. Each
+  subagent runs TDD and commits on the branch. Per-subagent failures pause
+  for triage; an unrecoverable failure surfaces as `failure_report` with
+  `coding_failure: "subagent_failure: ..."`.
 - **Local gates** before every Claude-owned coding turn
-  (`implementation_done`, `review_local`, `final_review`):
-  `cargo fmt --check`, `cargo clippy -D warnings`, `cargo test --workspace`.
-  Any failure surfaces as `failure_report`; don't hide it.
+  (`implementation_done` in Claude-implementer mode, `review_local`,
+  `final_review`): `cargo fmt --check`, `cargo clippy -D warnings`,
+  `cargo test --workspace`. In Codex-implementer mode, Codex runs its own
+  gates before sending `implementation_done`. Any failure surfaces as
+  `failure_report`; don't hide it.
 - **Review + fix tooling** during Codex's `review_fix_global`:
   `coderabbit` / manual review of the raw post-implementation diff,
   followed by direct code edits + commit + push. `/ultrareview-local`
@@ -605,7 +608,7 @@ between `wait_my_turn` and `collab_send`:
   generated markdown and approves) rather than the harness's Plan Mode.
   Codex never enters Plan Mode.
 
-The server does not read the git tree for the full v2 flow, and it still
+The server does not read the git tree for the full v3 flow, and it still
 trusts the harness's `head_sha` string there. The narrow shortcut-only
 ancestry check is the exception; drift detection in that path is now a
 hybrid responsibility, with the server performing the git ancestor check
@@ -973,8 +976,8 @@ Scope (v1 + v3):
 - bounded planning (v1) and bounded coding loop (v3) through a single session
 - one plan → one task list → one PR per session
 - v1 planning is 2 review rounds; v3 coding is strictly linear (no rounds)
-- Claude always gets the last word in planning (v1) and at the global
-  review stage (v3)
+- Claude always gets the last word in planning (v1) and owns the
+  audit/PR turns after Codex's first branch-scope review in v3
 - long-poll via `wait_my_turn`; agents run autonomously
 
 Out of scope:

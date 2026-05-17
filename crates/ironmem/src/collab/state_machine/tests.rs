@@ -519,7 +519,7 @@ fn test_global_review_linear_flow_ends_in_coding_complete() {
     assert_eq!(err, CollabError::SessionLocked);
 }
 
-// ── v3 reorder (Codex first): RED tests for new phase sequence ───────
+// ── v3 reorder (Codex first): canonical phase sequence ───────────────
 
 #[test]
 fn test_v3_phase_sequence_is_global_then_local() {

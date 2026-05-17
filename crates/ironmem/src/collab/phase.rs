@@ -9,10 +9,10 @@ pub enum Phase {
     PlanCodexReviewPending,
     PlanClaudeFinalizePending,
     PlanLocked,
-    // Coding (v3) — batch implementation. Claude orchestrates per-task
-    // subagents (via superpowers:subagent-driven-development) entirely on its
-    // side; Codex does not participate per-task. The single transition out is
-    // `implementation_done`, which jumps straight to global review.
+    // Coding (v3) — batch implementation. The selected implementer
+    // orchestrates per-task subagents (via superpowers:subagent-driven-development)
+    // entirely on its side. The single transition out is `implementation_done`,
+    // which jumps straight to global review.
     CodeImplementPending,
     // Coding (v3) — global review, 3-phase linear:
     //   CodeReviewFixGlobalPending (Codex reads the raw post-implementation
