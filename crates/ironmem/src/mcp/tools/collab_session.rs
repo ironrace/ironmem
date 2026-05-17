@@ -297,25 +297,32 @@ pub(super) fn handle_collab_send(app: &App, args: &Value) -> Result<Value, Memor
         }
 
         let event = build_collab_event(topic, content, session.phase)?;
-        if matches!(
-            (&session.phase, &event),
-            (
-                crate::collab::Phase::CodeReviewFixGlobalPending,
-                crate::collab::CollabEvent::CodeReviewFixGlobal { .. }
-            )
-        ) && session.task_list.is_none()
-        {
+        let shortcut_ancestry = session.task_list.is_none()
+            && matches!(
+                (&session.phase, &event),
+                (
+                    crate::collab::Phase::CodeReviewFixGlobalPending,
+                    crate::collab::CollabEvent::CodeReviewFixGlobal { .. },
+                ) | (
+                    crate::collab::Phase::CodeReviewLocalPending,
+                    crate::collab::CollabEvent::ReviewLocal { .. },
+                )
+            );
+        if shortcut_ancestry {
+            let head_sha = match &event {
+                crate::collab::CollabEvent::CodeReviewFixGlobal { head_sha } => head_sha,
+                crate::collab::CollabEvent::ReviewLocal { head_sha } => head_sha,
+                _ => unreachable!(),
+            };
             validate_global_review_head_advance(
                 &record.repo_path,
                 session.last_head_sha.as_deref().ok_or_else(|| {
-                    MemoryError::Validation(
-                        "last_head_sha is missing for CodeReviewFixGlobalPending".to_string(),
-                    )
+                    MemoryError::Validation(format!(
+                        "last_head_sha is missing for {:?}",
+                        session.phase
+                    ))
                 })?,
-                match &event {
-                    crate::collab::CollabEvent::CodeReviewFixGlobal { head_sha } => head_sha,
-                    _ => unreachable!(),
-                },
+                head_sha,
             )?;
         }
 
