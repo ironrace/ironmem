@@ -1,6 +1,6 @@
 [package]
 name = "ironmem"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2021"
 rust-version.workspace = true
 description = "AI memory MCP server — semantic search + knowledge graph in a single binary"
@@ -24,10 +24,10 @@ name = "ironmem"
 path = "src/main.rs"
 
 [dependencies]
-ironrace-core = { version = "0.2.0", path = "../ironrace-core" }
-ironrace-embed = { version = "0.2.0", path = "../ironrace-embed" }
-ironrace-pref-extract = { version = "0.2.0", path = "../ironrace-pref-extract" }
-ironrace-rerank = { version = "0.2.0", path = "../ironrace-rerank" }
+ironrace-core = { version = "0.2.1", path = "../ironrace-core" }
+ironrace-embed = { version = "0.2.1", path = "../ironrace-embed" }
+ironrace-pref-extract = { version = "0.2.1", path = "../ironrace-pref-extract" }
+ironrace-rerank = { version = "0.2.1", path = "../ironrace-rerank" }
 
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "io-std", "io-util"] }
 serde = { version = "1", features = ["derive"] }

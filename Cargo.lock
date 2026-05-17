@@ -1152,7 +1152,7 @@ dependencies = [
 
 [[package]]
 name = "ironmem"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "anyhow",
  "chrono",
@@ -1179,7 +1179,7 @@ dependencies = [
 
 [[package]]
 name = "ironrace-core"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "hnsw_rs",
  "rayon",
@@ -1187,7 +1187,7 @@ dependencies = [
 
 [[package]]
 name = "ironrace-embed"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "anyhow",
  "dirs",
@@ -1200,14 +1200,14 @@ dependencies = [
 
 [[package]]
 name = "ironrace-pref-extract"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "regex",
 ]
 
 [[package]]
 name = "ironrace-rerank"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "anyhow",
  "serde",
