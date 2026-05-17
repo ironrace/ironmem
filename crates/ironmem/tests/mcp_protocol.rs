@@ -1473,6 +1473,82 @@ fn collab_start_code_review_happy_path_reaches_coding_complete() {
 }
 
 #[test]
+fn test_shortcut_review_flows_through_audit() {
+    // RED test for the v3 reorder: under the new ordering the shortcut
+    // (collab_start_code_review) must seed at CodeReviewFixGlobalPending
+    // / Codex, then `review_fix_global` advances to CodeReviewLocalPending
+    // (Claude's audit turn) — NOT directly to CodeReviewFinalPending.
+    // Today the second transition jumps straight to CodeReviewFinalPending,
+    // so this test fails until the four state-machine arms are rewired.
+    let app = App::open_for_test().unwrap();
+    let (_temp, repo_path, base_sha, head_sha, descendant_sha, _drift_sha) = git_repo_fixture();
+
+    let started = call_tool(
+        &app,
+        "collab_start_code_review",
+        json!({
+            "repo_path": repo_path,
+            "branch": "feat/review-shortcut-audit",
+            "base_sha": base_sha,
+            "head_sha": head_sha,
+            "initiator": "claude",
+            "task": "shortcut audit"
+        }),
+    );
+    let session_id = started["session_id"].as_str().unwrap();
+
+    // Shortcut seeds at CodeReviewFixGlobalPending / Codex.
+    let status = call_tool(&app, "collab_status", json!({ "session_id": session_id }));
+    assert_eq!(status["phase"], "CodeReviewFixGlobalPending");
+    assert_eq!(status["current_owner"], "codex");
+
+    // Codex sends review_fix_global -> CodeReviewLocalPending / Claude
+    // (the new audit gate before the PR turn).
+    call_tool(
+        &app,
+        "collab_send",
+        json!({
+            "session_id": session_id,
+            "sender": "codex",
+            "topic": "review_fix_global",
+            "content": json!({ "head_sha": descendant_sha }).to_string()
+        }),
+    );
+    let status = call_tool(&app, "collab_status", json!({ "session_id": session_id }));
+    assert_eq!(status["phase"], "CodeReviewLocalPending");
+    assert_eq!(status["current_owner"], "claude");
+
+    // Claude audits -> CodeReviewFinalPending / Claude.
+    call_tool(
+        &app,
+        "collab_send",
+        json!({
+            "session_id": session_id,
+            "sender": "claude",
+            "topic": "review_local",
+            "content": json!({ "head_sha": descendant_sha }).to_string()
+        }),
+    );
+    let status = call_tool(&app, "collab_status", json!({ "session_id": session_id }));
+    assert_eq!(status["phase"], "CodeReviewFinalPending");
+    assert_eq!(status["current_owner"], "claude");
+
+    // Claude PRs -> CodingComplete.
+    call_tool(
+        &app,
+        "collab_send",
+        json!({
+            "session_id": session_id,
+            "sender": "claude",
+            "topic": "final_review",
+            "content": json!({ "head_sha": descendant_sha, "pr_url": "https://example/pr" }).to_string()
+        }),
+    );
+    let status = call_tool(&app, "collab_status", json!({ "session_id": session_id }));
+    assert_eq!(status["phase"], "CodingComplete");
+}
+
+#[test]
 fn collab_start_code_review_end_rejected_during_active_review() {
     let app = App::open_for_test().unwrap();
     let started = call_tool(

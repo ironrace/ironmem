@@ -516,6 +516,92 @@ fn test_global_review_linear_flow_ends_in_coding_complete() {
     assert_eq!(err, CollabError::SessionLocked);
 }
 
+// ── v3 reorder (Codex first): RED tests for new phase sequence ───────
+
+#[test]
+fn test_v3_phase_sequence_is_global_then_local() {
+    // Under the v3 reorder, ImplementationDone routes to
+    // CodeReviewFixGlobalPending (Codex's turn) BEFORE
+    // CodeReviewLocalPending (Claude's audit). Current code still routes
+    // to CodeReviewLocalPending first; this test fails until the four
+    // state-machine arms are rewired.
+    let s = locked_session("hf");
+    let s = submit_task_list(&s, "hf", 1);
+    assert_eq!(s.phase, Phase::CodeImplementPending);
+
+    // CodeImplementPending -> CodeReviewFixGlobalPending (Codex)
+    let s = apply_event(
+        &s,
+        Agent::Claude,
+        &CollabEvent::ImplementationDone {
+            head_sha: "h1".to_string(),
+        },
+    )
+    .expect("implementation_done");
+    assert_eq!(s.phase, Phase::CodeReviewFixGlobalPending);
+    assert_eq!(s.current_owner, Agent::Codex);
+
+    // CodeReviewFixGlobalPending -> CodeReviewLocalPending (Claude)
+    let s = apply_event(
+        &s,
+        Agent::Codex,
+        &CollabEvent::CodeReviewFixGlobal {
+            head_sha: "h2".to_string(),
+        },
+    )
+    .expect("review_fix_global");
+    assert_eq!(s.phase, Phase::CodeReviewLocalPending);
+    assert_eq!(s.current_owner, Agent::Claude);
+
+    // CodeReviewLocalPending -> CodeReviewFinalPending (Claude)
+    let s = apply_event(
+        &s,
+        Agent::Claude,
+        &CollabEvent::ReviewLocal {
+            head_sha: "h3".to_string(),
+        },
+    )
+    .expect("review_local");
+    assert_eq!(s.phase, Phase::CodeReviewFinalPending);
+    assert_eq!(s.current_owner, Agent::Claude);
+
+    // CodeReviewFinalPending -> CodingComplete
+    let s = apply_event(
+        &s,
+        Agent::Claude,
+        &CollabEvent::FinalReview {
+            head_sha: "h4".to_string(),
+            pr_url: "https://example/pr".to_string(),
+        },
+    )
+    .expect("final_review");
+    assert_eq!(s.phase, Phase::CodingComplete);
+}
+
+#[test]
+fn test_v1_force_finalize_still_works_at_max_rounds() {
+    // Regression: the v1 force-finalize cap at MAX_REVIEW_ROUNDS must
+    // remain intact after the v3 reorder. The substantive assertion is
+    // already covered by `test_request_changes_at_cap_forces_finalize`
+    // above (state_machine/tests.rs:194-205): two `request_changes`
+    // rounds force the phase to PlanClaudeFinalizePending and pin
+    // `review_round == MAX_REVIEW_ROUNDS`. This pointer test makes the
+    // regression contract explicit so a future v3 rewire cannot silently
+    // bypass the cap.
+    let s = session();
+    let s = draft(Agent::Claude, "c1", &s);
+    let s = draft(Agent::Codex, "c2", &s);
+    let s = canonical("v1", &s);
+    let s = review("request_changes", &s);
+    assert_eq!(s.phase, Phase::PlanSynthesisPending);
+    let s = canonical("v2", &s);
+    let s = review("request_changes", &s);
+
+    // Force-finalize trips here (review_round == MAX_REVIEW_ROUNDS).
+    assert_eq!(s.phase, Phase::PlanClaudeFinalizePending);
+    assert_eq!(s.review_round, MAX_REVIEW_ROUNDS);
+}
+
 #[test]
 fn test_review_local_wrong_sender_rejected() {
     let s = locked_session("hf");
