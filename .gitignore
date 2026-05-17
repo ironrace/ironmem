@@ -10,6 +10,13 @@
 CODEX_TASK_*.md
 docs/collab_*.md
 
+# Superpowers working artifacts (writing-plans output, /collab bridges,
+# design specs). Per-session and developer-facing, not durable repo content.
+# The canonical protocol/architecture lives in docs/COLLAB.md and the
+# in-tree Rust source. Recovery from git history if any individual file
+# is needed later.
+docs/superpowers/
+
 # Local tool and editor state (personal, non-portable)
 .cargo/
 .claude/
