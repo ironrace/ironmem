@@ -834,10 +834,15 @@ Examples:
 **Required fields.** `phase=<phase>` and `round=<N>` are required on every
 Codex-owned dispatch/return event (`t2_codex_dispatched`,
 `t3_codex_returned`, `t6_codex_review_dispatched`,
-`t7_codex_review_returned`) and on `t4_phase_advanced`. Events that fire
-exactly once per session (`t0_session_started`, `t1_task_list_sent`,
-`t8_pr_created`, `t9_final_review_sent`, `t10_session_complete`) MAY omit
-`round=`; they retain `phase=` where meaningful.
+`t7_codex_review_returned`). `t4_phase_advanced` requires `phase=` but
+`round=` is optional — a phase advance is not always round-anchored
+(e.g., the transition to `CodeReviewLocalPending` follows
+`implementation_done`, not a Codex review round). Include `round=` when
+the destination phase has a meaningful round counter (the v1 planning
+phases); omit otherwise. Events that fire exactly once per session
+(`t0_session_started`, `t1_task_list_sent`, `t8_pr_created`,
+`t9_final_review_sent`, `t10_session_complete`) MAY omit `round=`; they
+retain `phase=` where meaningful.
 
 **Renamed event.** The old phase-advance event (one event per destination
 phase, with the destination baked into the name) is now a single event,

@@ -185,6 +185,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Collab protocol — docs/prompts alignment with server enforcement
+  (2026-05-16).** Three doc/prompt-only changes; no Rust source touched
+  (server behavior unchanged):
+  (A) `docs/COLLAB.md`, `.claude-plugin/commands/collab.md`, and
+  `.codex-plugin/prompts/collab.md` now name the
+  `MAX_REVIEW_ROUNDS = 2` cap explicitly and cite
+  `crates/ironmem/src/collab/state_machine/mod.rs:28` — Codex gets at
+  most two v1 plan-review rounds, then the server force-finalizes to
+  `PlanClaudeFinalizePending` regardless of verdict.
+  (B) Timing-event names are now stable base identifiers with phase +
+  round detail in structured `phase=<phase> round=<N>` key=value
+  fields. `t4_phase_advanced_to_<phase>` is renamed to
+  `t4_phase_advanced` (phase moves into `phase=`). Old suffix-shaped
+  names (`<event>_round<N>`, `<event>_to_<phase>`) are documented as
+  legacy artifacts and must not be emitted by current dispatchers;
+  historical logs are not rewritten. Consumers of
+  `/tmp/collab-eval-${session_id}.log` parsing on event-name suffix
+  must switch to parsing the structured key=value fields.
+  (C) Claude's dispatcher polling loop documents a bounded backoff
+  curve for Codex-owned background phases — 10s default → 20s after
+  60s of no progress → 30s after 300s (cap), reset on phase advance /
+  new stdout / bg process exit / bg process error or signal. 600s
+  hang detection unchanged. Scope: Codex bg phases only; does NOT
+  affect Plan Mode idle gaps.
+  Also documents two anti-removal guardrails:
+  `/ultrareview-local`'s code-quality lens requires a written overlap
+  audit before removal; SDD reviewer model-pinning recommendations
+  belong in the SDD skill itself once pinning support exists, not in
+  the collab protocol spec.
 - **ProvBench labeler — Phase 0b hardening pass 3 (2026-05-12).**
   Four labeling-correctness clusters fixed; SPEC v1 is unchanged:
   (A) visibility narrowing (`pub(crate)` / `pub(super)` / `pub(in path)` /

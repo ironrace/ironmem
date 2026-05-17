@@ -4,6 +4,8 @@
 
 **Goal:** Bring `docs/COLLAB.md`, `.claude-plugin/commands/collab.md`, `.codex-plugin/prompts/collab.md` into agreement with the server's existing `MAX_REVIEW_ROUNDS = 2` enforcement, normalize timing event names + structured metadata, add a bounded polling backoff for silent Codex bg phases, and document two anti-removal guardrails (`/ultrareview-local`, SDD reviewer model-pinning).
 
+**Status:** Completed 2026-05-16. Filename date (2026-05-17) is a tooling artifact from plan creation; commits and implementation landed on 2026-05-16. The `plan_file_path` was already locked into the collab session's `task_list`, so the file is kept at its original name.
+
 **Architecture:** Pure docs + prompts edit. No Rust source touched. Server stays the source of truth; this round fixes drift in the human/agent-facing surface.
 
 **Tech stack:** Markdown only. Pre-commit hook runs `cargo fmt --check` + `cargo clippy` (both trivial passes since no Rust changes).
