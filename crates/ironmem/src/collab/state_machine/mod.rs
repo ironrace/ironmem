@@ -165,25 +165,24 @@ pub fn apply_event(
         // `collab_start`) drives per-task subagent work on its side via
         // `superpowers:writing-plans` → `superpowers:subagent-driven-development`.
         // The other agent does not participate per-task; the single
-        // transition out of `CodeImplementPending` jumps straight to
-        // global review with Claude as owner — Claude always provides
-        // the local-review second opinion. Payload carries only
-        // `head_sha` (anti-puppeteering).
+        // transition out of `CodeImplementPending` jumps to global review
+        // with Codex as owner — Codex first; Claude audits after. Payload
+        // carries only `head_sha` (anti-puppeteering).
         (Phase::CodeImplementPending, CollabEvent::ImplementationDone { head_sha }) => {
             require_actor(actor, session.implementer)?;
-            next.last_head_sha = Some(head_sha.clone());
-            next.phase = Phase::CodeReviewLocalPending;
-            next.current_owner = Agent::Claude;
-        }
-        // ── v3: global review, 3-phase linear ─────────────────────────────
-        (Phase::CodeReviewLocalPending, CollabEvent::ReviewLocal { head_sha }) => {
-            require_actor(actor, Agent::Claude)?;
             next.last_head_sha = Some(head_sha.clone());
             next.phase = Phase::CodeReviewFixGlobalPending;
             next.current_owner = Agent::Codex;
         }
+        // ── v3: global review, 3-phase linear (Codex first; Claude audits after) ──
         (Phase::CodeReviewFixGlobalPending, CollabEvent::CodeReviewFixGlobal { head_sha }) => {
             require_actor(actor, Agent::Codex)?;
+            next.last_head_sha = Some(head_sha.clone());
+            next.phase = Phase::CodeReviewLocalPending;
+            next.current_owner = Agent::Claude;
+        }
+        (Phase::CodeReviewLocalPending, CollabEvent::ReviewLocal { head_sha }) => {
+            require_actor(actor, Agent::Claude)?;
             next.last_head_sha = Some(head_sha.clone());
             next.phase = Phase::CodeReviewFinalPending;
             next.current_owner = Agent::Claude;
