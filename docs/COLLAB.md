@@ -46,6 +46,26 @@ multi-agent framework. Exactly one plan is produced per session, with:
 There is no `PlanEscalated` state. After two `request_changes` rounds Claude
 is forced to finalize regardless of Codex's objections.
 
+### Review cap (server-enforced)
+
+`MAX_REVIEW_ROUNDS = 2` is the hard cap on Codex plan reviews, enforced
+server-side at `crates/ironmem/src/collab/state_machine/mod.rs:28`
+(force-finalize branch at `mod.rs:107`). Two review rounds is a maximum,
+not an iteration target.
+
+- After Codex's **2nd** `review` message, the server transitions to
+  `PlanClaudeFinalizePending` **regardless of verdict** — `approve`,
+  `approve_with_minor_edits`, and `request_changes` all map to the same
+  next phase.
+- Claude has the last word: any unresolved review notes are absorbed (or
+  explicitly declined with a rationale) in the `final` plan.
+- `review_round` is the audit trail. It is set to 1 after the first
+  review and to 2 after the second; post-finalize the test suite asserts
+  `review_round == MAX_REVIEW_ROUNDS` at `state_machine/tests.rs:203`.
+- The protocol is bounded by construction: at most two Codex reviews,
+  then forced Claude finalize. Docs/prompts that frame v1 planning as
+  open-ended iteration to convergence are wrong.
+
 ## Runtime Model
 
 ```text
@@ -796,17 +816,104 @@ synchronous `mcp__codex__codex` for any phase (with
 
 When running with timing instrumentation enabled, Claude writes one event per
 line to `/tmp/collab-eval-${session_id}.log` at key transition points in the
-dispatcher. Events are formatted as:
+dispatcher. Events use **stable base names** with phase + round detail
+carried in structured key=value fields, NOT in the event name:
 
 ```
-<unix_seconds>.<nanos> <event_name> [extra]
+<unix_seconds>.<nanos> <event_name> phase=<phase> round=<N> [<extra>]
 ```
+
+Examples:
+
+```
+1778971814.91 t2_codex_dispatched phase=PlanCodexReviewPending round=2
+1778971990.43 t3_codex_returned phase=PlanCodexReviewPending round=2
+1778971814.93 t4_phase_advanced phase=PlanClaudeFinalizePending round=2
+```
+
+**Required fields.** `phase=<phase>` and `round=<N>` are required on every
+Codex-owned dispatch/return event (`t2_codex_dispatched`,
+`t3_codex_returned`, `t6_codex_review_dispatched`,
+`t7_codex_review_returned`) and on `t4_phase_advanced`. For
+`t4_phase_advanced`, `phase=` is the new destination phase and `round=`
+is the same dispatch round being watched by the polling loop (for
+example, `round=2` for the second v1 review, `round=1` for the global
+review phase). Events that fire exactly once per session
+(`t0_session_started`, `t1_task_list_sent`, `t8_pr_created`,
+`t9_final_review_sent`, `t10_session_complete`) MAY omit `round=`; they
+retain `phase=` where meaningful.
+
+**Renamed event.** The old phase-advance event (one event per destination
+phase, with the destination baked into the name) is now a single event,
+`t4_phase_advanced`, with the destination phase carried in the `phase=`
+field. There is one event name; the phase is data, not part of the
+identifier. This makes log filtering and aggregation grep-stable across
+phases.
+
+**Legacy/incorrect forms.** Any event name that bakes the round number or
+destination phase into the identifier (an `_round<N>` suffix on a Codex
+dispatch/return event, or an `_to_<phase>` suffix on the phase-advance
+event) is a legacy artifact of earlier runs. Those shapes are NOT
+canonical and must not be emitted by current dispatchers. Historical
+logs containing them are not rewritten; new logs use the structured form
+above.
 
 Named events span `t0_session_started` (after `collab_start` returns) through
 `t10_session_complete` (when `CodingComplete` or `CodingFailed` is first
 observed). This instrumentation is opt-in and never blocks the protocol —
 write failures are swallowed silently. Full event list and post-run analysis
 commands are documented in the Claude-side dispatcher prompt.
+
+### Polling backoff (Codex bg phases only)
+
+The Claude dispatcher polls `collab_status` + `BashOutput` on a fixed ~10s
+interval while a Codex-owned phase is running as a background
+`codex exec` process. For long silent grinds, that fixed cadence churns
+the dispatcher without producing new information. A bounded backoff curve
+reduces that churn:
+
+- Default poll interval: **10s**.
+- After **60s** of no progress (no `phase` advance AND no new stdout
+  line) → escalate to **20s**.
+- After **300s** (5 min) of no progress → escalate to **30s** (cap).
+- **Reset to 10s** on ANY of: phase advance, new stdout line, bg process
+  exit, bg process error/signal.
+- 600s hang detection is unchanged.
+
+Scope: this backoff applies **only** to Codex-owned background phases
+(`PlanParallelDrafts`, `PlanCodexReviewPending`,
+`CodeReviewFixGlobalPending`, `CodeImplementPending+codex`). It does NOT
+change the user-visible idle gap during Claude's Plan Mode prompts —
+those are gated on user input, not on poll cadence. Full curve + reset
+conditions are documented in the Claude-side dispatcher prompt.
+
+### Anti-removal: `/ultrareview-local` overlap audit
+
+`CodeReviewLocalPending` runs `/ultrareview-local` (code-reviewer +
+security-reviewer + architect + doc-reviewer in parallel, synthesized
+inline). Its code-quality lens **partially overlaps** with Codex's
+`review_fix_global` correctness/security/scope/architecture lens but does
+NOT fully duplicate it — the local stage exercises a different set of
+agent prompts and a different synthesis path.
+
+Removing the `CodeReviewLocalPending` stage from the v3 flow therefore
+requires a written **overlap audit**: a demonstration, against a
+representative sample of prior collab sessions, that Codex's
+`review_fix_global` reviews caught the code-quality issues
+`/ultrareview-local` would have flagged. Without that audit, the stage
+stays.
+
+### SDD reviewer model pinning (out of protocol)
+
+The `subagent-driven-development` skill's reviewer prompts in this repo
+do not currently pin a model — reviewer subagents run on the parent
+session's default. Recommendations to "use Haiku for reviewers" or
+similar model-selection rules require skill-side pinning support that
+does not exist in the current prompt surface. If preferred-model
+guidance becomes load-bearing later, it should live in the SDD skill
+itself **after** model pinning exists — NOT in the collab protocol
+spec. The collab protocol is intentionally model-agnostic for
+subagent-driven implementation.
 
 ## Validation
 
