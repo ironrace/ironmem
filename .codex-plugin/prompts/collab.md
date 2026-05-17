@@ -42,10 +42,17 @@ session record's `implementer` field is `"codex"`.
 
 v3 batch mode gives Codex a single coding turn: **read the full branch
 diff and the writing-plans markdown, form your own judgment, apply any
-fixes directly (commit + push), then send `review_fix_global`.** There
-is no separate `review` → `verdict` → `comment` cycle at the coding
-stage, and there are no per-task Codex turns — Claude orchestrates per-
-task subagents on its side, and you only see the consolidated result.
+fixes directly (commit + push), then send `review_fix_global`. You see
+the diff AS-IS — no Claude pre-clean.** Under the v3 phase order,
+`CodeReviewFixGlobalPending` (your turn) runs *before*
+`CodeReviewLocalPending` (Claude's `/ultrareview-local` audit of your
+commits) and `CodeReviewFinalPending` (Claude's PR turn). The
+next-receiving-side gate after you send `review_fix_global` is
+`CodeReviewLocalPending`, NOT `CodeReviewFinalPending`. There is no
+separate `review` → `verdict` → `comment` cycle at the coding stage,
+and there are no per-task Codex turns — Claude orchestrates per-task
+subagents on its side, and you only see the consolidated result. PR
+creation is Claude-only at `final_review`; do not call `gh pr create`.
 
 - The session record's `task_list` field includes `plan_file_path`
   pointing at the markdown plan that drove subagent execution. Read it
@@ -116,10 +123,13 @@ branch names.
      **and** `current_owner == "codex"`, this is your batch
      implementation turn — run the action under "Batch implementation
      (codex-implementer)" below.
-   - **`CodeReviewLocalPending`** → Claude's local-review turn. Exit.
    - **`CodeReviewFixGlobalPending`** → Codex's only mandatory v3 coding
-     turn (always Codex regardless of `implementer`). Run the global
-     review action below.
+     turn (always Codex regardless of `implementer`). Under the new v3
+     order this phase runs FIRST (before Claude's `/ultrareview-local`
+     audit). Run the global review action below.
+   - **`CodeReviewLocalPending`** → Claude's audit turn — Claude is
+     running `/ultrareview-local` against your `review_fix_global`
+     commits. Exit.
    - **`CodeReviewFinalPending`** → Claude's PR turn. Exit.
    - **v3 terminal** (`CodingComplete` / `CodingFailed`) → report and exit.
 
@@ -264,7 +274,7 @@ requiring no design judgment. Skip `subagent-driven-development` entirely.
 7. Send `collab_send` with `sender="codex"`, `topic="implementation_done"`,
    `content=<JSON {"head_sha":"<current HEAD after commit>"}>`. Payload
    carries ONLY `head_sha`.
-8. Exit. The session advances to `CodeReviewLocalPending` with Claude as
+8. Exit. The session advances to `CodeReviewFixGlobalPending` with Codex as
    owner. Skip the `gh pr list` PR-boundary check (Codex never touches PRs).
 
 ---
@@ -308,7 +318,7 @@ is `null`/absent (or any value other than `"mechanical_direct"`).
    `topic="implementation_done"`,
    `content=<JSON {"head_sha":"<current HEAD>"}>`. Payload carries
    ONLY `head_sha` — no subagent notes, no summary.
-7. Exit. The session is now `CodeReviewLocalPending` with Claude as
+7. Exit. The session is now `CodeReviewFixGlobalPending` with Codex as
    owner; Claude provides the local-review second opinion.
 
 After one successful send, exit. Claude will re-invoke `/collab join`

@@ -127,7 +127,7 @@ requiring no design judgment. Skip `subagent-driven-development` entirely.
 7. Send `collab_send` with `sender="codex"`, `topic="implementation_done"`,
    `content=<JSON {"head_sha":"<current HEAD after commit>"}>`. Payload
    carries ONLY `head_sha`.
-8. Exit. The session advances to `CodeReviewLocalPending` with Claude as
+8. Exit. The session advances to `CodeReviewFixGlobalPending` with Codex as
    owner. Skip the `gh pr list` PR-boundary check (Codex never touches PRs).
 
 ---
@@ -170,8 +170,11 @@ is `null`/absent (or any value other than `"mechanical_direct"`).
    `topic="implementation_done"`,
    `content=<JSON {"head_sha":"<current HEAD>"}>`. Payload carries
    ONLY `head_sha` — no subagent notes, no summary.
-7. Exit. The session is now `CodeReviewLocalPending` with Claude as
-   owner; Claude provides the local-review second opinion.
+7. Exit. The session is now `CodeReviewFixGlobalPending` with Codex as
+   owner — note that under the new v3 order Codex (not Claude) is the
+   next-receiving-side gate after `implementation_done`. Claude's
+   `/ultrareview-local` audit at `CodeReviewLocalPending` runs after
+   your `review_fix_global` push.
 
 After one successful send, exit. Claude will re-invoke `/collab join`
 via its Codex MCP tool when the session needs you again.
