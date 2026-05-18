@@ -50,7 +50,7 @@ enum Cmd {
 
         /// Rule-set version label embedded in request_id and recorded in
         /// run_meta.json. Bump when rule semantics change.
-        #[arg(long, default_value = "v1.0")]
+        #[arg(long, default_value = "v1.3")]
         rule_set_version: String,
     },
 }
