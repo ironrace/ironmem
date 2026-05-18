@@ -18,7 +18,7 @@ use crate::{metrics, PredictionRow};
 ///
 /// Pairs the LLM baseline's already-scored `metrics.json` against a
 /// candidate (e.g. the Phase 1 rules runner) scored on the same
-/// SPEC §7.1 axes, with deltas, SPEC §8 pass/fail booleans, and a
+/// SPEC §7.1 axes, with deltas, SPEC §8 threshold-status objects, and a
 /// per-rule confusion matrix joined from `rule_traces.jsonl`.
 ///
 /// The struct is the typed counterpart to the JSON document the CLI
@@ -35,9 +35,12 @@ pub struct Compare {
     pub candidate: Value,
     pub candidate_name: String,
     pub deltas: BTreeMap<String, f64>,
-    /// SPEC §8 pass/fail booleans (`section_8_3_valid_retention_ge_0_95`,
-    /// `section_8_4_latency_p50_le_727_ms`, `section_8_5_stale_recall_wlb_ge_0_30`).
-    pub thresholds: BTreeMap<String, bool>,
+    /// SPEC §8 structured threshold-status objects keyed by gate name
+    /// (`section_8_3_valid_retention_ge_0_95`, `section_8_4_latency_p50_le_727_ms`,
+    /// `section_8_5_stale_recall_wlb_ge_0_30`). Each value has the shape
+    /// `{status: "PASS"|"FAIL"|"SKIP", passed: bool|null, metric, observed,
+    /// target, reason?}`. SPEC §11 row 2026-05-18.
+    pub thresholds: serde_json::Map<String, Value>,
     /// Per-rule confusion matrix: `rule_id → "<gt>__<pred>" → count`,
     /// joined from `<candidate_run>/rule_traces.jsonl`.
     pub per_rule_confusion: BTreeMap<String, BTreeMap<String, u64>>,
@@ -162,15 +165,28 @@ pub fn run(baseline_run: &Path, candidate_run: &Path, candidate_name: &str) -> R
             ],
         ),
     );
-    let mut thresholds: BTreeMap<String, bool> = BTreeMap::new();
+    // SPEC §11 row 2026-05-18 (v1.2c): thresholds are structured objects
+    // with explicit PASS / FAIL / SKIP status, not bare booleans. SKIP
+    // applies to §8 #5 when ground-truth stale_* count == 0 (taxonomy
+    // mismatch — see SPEC §8 #5 and flask v1.2b findings).
+    let gt_stale_count = count_ground_truth_stale(candidate_run)?;
+    let mut thresholds = serde_json::Map::new();
     thresholds.insert(
         "section_8_3_valid_retention_ge_0_95".into(),
-        valid_acc_wlb >= 0.95,
+        threshold_status(
+            valid_acc_wlb >= 0.95,
+            "valid_retention_wlb",
+            valid_acc_wlb,
+            0.95,
+        ),
     );
-    thresholds.insert("section_8_4_latency_p50_le_727_ms".into(), p50 <= 727);
+    thresholds.insert(
+        "section_8_4_latency_p50_le_727_ms".into(),
+        threshold_status(p50 <= 727, "latency_p50_ms", p50 as f64, 727.0),
+    );
     thresholds.insert(
         "section_8_5_stale_recall_wlb_ge_0_30".into(),
-        stale_recall_wlb >= 0.30,
+        section_8_5_status(stale_recall_wlb, gt_stale_count),
     );
 
     // 4) Per-rule confusion (joined from candidate_run/rule_traces.jsonl).
@@ -180,7 +196,7 @@ pub fn run(baseline_run: &Path, candidate_run: &Path, candidate_name: &str) -> R
         "llm_baseline": baseline_metrics,
         candidate_name: candidate_metrics,
         "deltas": deltas,
-        "thresholds": thresholds,
+        "thresholds": Value::Object(thresholds),
         "per_rule_confusion": per_rule_confusion,
     }))
 }
@@ -279,6 +295,64 @@ fn percentile_u64(sorted: &[u64], q: f64) -> u64 {
     let rank = (q * sorted.len() as f64).ceil() as usize;
     let idx = rank.saturating_sub(1).min(sorted.len() - 1);
     sorted[idx]
+}
+
+/// Build a structured threshold-status object for SPEC §8 thresholds
+/// whose verdict is a simple pass/fail (no SKIP semantics).
+fn threshold_status(passed: bool, metric_name: &str, observed: f64, target: f64) -> Value {
+    json!({
+        "status": if passed { "PASS" } else { "FAIL" },
+        "passed": passed,
+        "metric": metric_name,
+        "observed": observed,
+        "target": target,
+    })
+}
+
+/// SPEC §8 #5 SKIP-aware status. See SPEC §11 row 2026-05-18.
+fn section_8_5_status(stale_recall_wlb: f64, gt_stale_count: u64) -> Value {
+    if gt_stale_count == 0 {
+        return json!({
+            "status": "SKIP",
+            "passed": Value::Null,
+            "metric": "stale_recall_wlb",
+            "observed": Value::Null,
+            "target": 0.30,
+            "reason": "ground_truth_stale_count_is_zero",
+        });
+    }
+    let passed = stale_recall_wlb >= 0.30;
+    json!({
+        "status": if passed { "PASS" } else { "FAIL" },
+        "passed": passed,
+        "metric": "stale_recall_wlb",
+        "observed": stale_recall_wlb,
+        "target": 0.30,
+    })
+}
+
+/// Count rows in `predictions.jsonl` whose coalesced `ground_truth` equals
+/// [`metrics::CLASS_STALE`]. Handles both lowercase labeler tags (`stale`,
+/// `stale_source_changed`, …) and PascalCase labeler tags (`StaleSourceChanged`,
+/// `StaleSourceDeleted`, `StaleSymbolRenamed`) via [`metrics::coalesce`].
+/// Returns 0 if the file is empty.
+fn count_ground_truth_stale(candidate_run: &Path) -> Result<u64> {
+    let preds_path = candidate_run.join("predictions.jsonl");
+    let text = fs::read_to_string(&preds_path)
+        .with_context(|| format!("reading {}", preds_path.display()))?;
+    let mut count = 0u64;
+    for line in text.lines() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let row: Value = serde_json::from_str(line)?;
+        if let Some(gt) = row.get("ground_truth").and_then(|g| g.as_str()) {
+            if metrics::coalesce(gt) == metrics::CLASS_STALE {
+                count += 1;
+            }
+        }
+    }
+    Ok(count)
 }
 
 fn load_per_rule_confusion(

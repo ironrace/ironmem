@@ -152,3 +152,51 @@ fn section_8_5_records_pass_or_fail_when_stale_ground_truth_present() {
         "passed must be true when stale GT present and perfectly recalled, got: {s8_5}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Test 3: Fix 1 regression — PascalCase labeler tags must coalesce to stale
+// ---------------------------------------------------------------------------
+
+fn write_minimal_baseline_metrics(dir: &std::path::Path) {
+    fs::write(
+        dir.join("metrics.json"),
+        serde_json::to_string(&minimal_baseline_metrics()).unwrap(),
+    )
+    .unwrap();
+}
+
+#[test]
+fn section_8_5_handles_pascalcase_labeler_stale_tags() {
+    let tmp = TempDir::new().unwrap();
+    let candidate = tmp.path().join("candidate");
+    let baseline = tmp.path().join("baseline");
+    fs::create_dir_all(&candidate).unwrap();
+    fs::create_dir_all(&baseline).unwrap();
+
+    // Synth: 50 valid + 50 PascalCase StaleSourceChanged GT rows.
+    // The candidate predicts coalesced lowercase "stale" / "valid".
+    // count_ground_truth_stale MUST detect the PascalCase rows as stale.
+    let mut preds = String::new();
+    for i in 0..50 {
+        preds.push_str(&pred_line(i, "valid", "valid"));
+        preds.push('\n');
+    }
+    for i in 50..100 {
+        preds.push_str(&pred_line(i, "stale", "StaleSourceChanged"));
+        preds.push('\n');
+    }
+
+    fs::write(candidate.join("predictions.jsonl"), &preds).unwrap();
+    fs::write(baseline.join("predictions.jsonl"), &preds).unwrap();
+    write_minimal_baseline_metrics(&baseline);
+
+    let report = provbench_scoring::compare::run(&baseline, &candidate, "phase1_rules").unwrap();
+    let s8_5 = &report["thresholds"]["section_8_5_stale_recall_wlb_ge_0_30"];
+
+    // PascalCase MUST be recognized as stale, so status is PASS/FAIL, not SKIP.
+    assert_ne!(
+        s8_5["status"].as_str(),
+        Some("SKIP"),
+        "PascalCase StaleSourceChanged tags must coalesce to CLASS_STALE; got: {s8_5}"
+    );
+}
