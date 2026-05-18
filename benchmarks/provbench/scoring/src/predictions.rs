@@ -20,6 +20,13 @@ pub struct PredictionRow {
     /// `predictions.jsonl` for audit / debugging.
     pub request_id: String,
     pub wall_ms: u64,
+    /// Optional evidence blob emitted by rule-based runners.
+    /// Phase 1 R4 sets `{"rule": "R4", "guard_below_floor": <bool>, ...}`.
+    /// Absent on baseline rows and on legacy artifacts — `#[serde(default)]`
+    /// keeps those rows deserializable, and `skip_serializing_if` keeps legacy
+    /// fixtures byte-identical when they round-trip through `PredictionRow`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub evidence: Option<serde_json::Value>,
 }
 
 /// Read-side mirror of `run_meta.json` — only the fields the scorer

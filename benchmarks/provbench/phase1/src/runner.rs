@@ -174,6 +174,17 @@ pub fn run(opts: RunnerOpts<'_>) -> Result<RunStats> {
         ])?;
         ins_trace.execute(params![row_index, rule_id, spec_ref, "n/a", &evidence])?;
 
+        let evidence_value: Option<serde_json::Value> = match serde_json::from_str(&evidence) {
+            Ok(v) => Some(v),
+            Err(e) => {
+                eprintln!(
+                    "runner: failed to parse evidence JSON for row_index={row_index}: {e}; \
+                     storing None in predictions.jsonl"
+                );
+                None
+            }
+        };
+
         let pr_row = PredictionRow {
             fact_id: fact_id.clone(),
             commit_sha: commit_sha.clone(),
@@ -182,6 +193,7 @@ pub fn run(opts: RunnerOpts<'_>) -> Result<RunStats> {
             prediction: pred.clone(),
             request_id: request_id.clone(),
             wall_ms,
+            evidence: evidence_value,
         };
         writeln!(predictions_f, "{}", serde_json::to_string(&pr_row)?)?;
         let trace_obj = serde_json::json!({

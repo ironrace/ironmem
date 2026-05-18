@@ -130,6 +130,13 @@ pub fn wilson_lower_95(k: u64, n: u64) -> f64 {
     lower.max(0.0)
 }
 
+/// §7.1 convenience wrapper — runs [`three_way`] with empty population
+/// weights (unweighted per-stratum accuracy as the SPEC §7.1 contract
+/// calls for). Use this when you don't need HT-weighted agreement.
+pub fn three_way_from_rows(rows: &[PredictionRow]) -> ThreeWayReport {
+    three_way(rows, &HashMap::new())
+}
+
 /// §7.1 — stale-detection P/R/F1, valid-retention accuracy,
 /// needs-revalidation routing accuracy.
 ///

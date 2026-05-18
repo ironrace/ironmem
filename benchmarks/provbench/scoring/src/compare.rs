@@ -192,9 +192,13 @@ pub fn run(baseline_run: &Path, candidate_run: &Path, candidate_name: &str) -> R
     // 4) Per-rule confusion (joined from candidate_run/rule_traces.jsonl).
     let per_rule_confusion = load_per_rule_confusion(candidate_run)?;
 
+    // 5) NR-aware post-hoc column: R4 guard_below_floor rows remapped to NR.
+    let nr_aware_metrics: Value = score_candidate_nr_aware(candidate_run)?;
+
     Ok(json!({
         "llm_baseline": baseline_metrics,
         candidate_name: candidate_metrics,
+        "phase1_rules_nr_aware": nr_aware_metrics,
         "deltas": deltas,
         "thresholds": Value::Object(thresholds),
         "per_rule_confusion": per_rule_confusion,
@@ -272,6 +276,65 @@ fn score_candidate(candidate_run: &Path) -> Result<Value> {
             "cost_per_correct_invalidation": {
                 "tokens": cost.tokens,
                 "usd": cost.usd,
+            },
+        },
+    }))
+}
+
+/// Post-hoc NR-aware column (SPEC §11 row 2026-05-18, v1.2c forward path e).
+///
+/// Reads `candidate_run/predictions.jsonl` and virtually remaps any row where:
+///   - `evidence["rule"] == "R4"` (rule that uses the leaf+length guard)
+///   - `prediction == "stale"`
+///   - `evidence["guard_below_floor"] == true`
+///
+/// to `prediction = "needs_revalidation"`, then re-runs the §7.1 three-way
+/// math on the remapped slice. Returns a JSON value with the same shape as
+/// `score_candidate`'s `section_7_1` sub-tree.
+fn score_candidate_nr_aware(candidate_run: &Path) -> Result<Value> {
+    let preds_path = candidate_run.join("predictions.jsonl");
+    let text = fs::read_to_string(&preds_path)
+        .with_context(|| format!("reading {}", preds_path.display()))?;
+    let mut rows: Vec<PredictionRow> = Vec::new();
+    for line in text.lines() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let mut row: PredictionRow = serde_json::from_str(line)?;
+        let guard_below_floor = row
+            .evidence
+            .as_ref()
+            .and_then(|e| e.get("guard_below_floor"))
+            .and_then(|b| b.as_bool())
+            .unwrap_or(false);
+        let rule_is_r4 = row
+            .evidence
+            .as_ref()
+            .and_then(|e| e.get("rule"))
+            .and_then(|r| r.as_str())
+            .map(|r| r == "R4")
+            .unwrap_or(false);
+        if rule_is_r4 && row.prediction == "stale" && guard_below_floor {
+            row.prediction = "needs_revalidation".into();
+        }
+        rows.push(row);
+    }
+    let three = metrics::three_way_from_rows(&rows);
+    Ok(json!({
+        "section_7_1": {
+            "stale_detection": {
+                "precision": three.stale_detection.precision,
+                "recall": three.stale_detection.recall,
+                "f1": three.stale_detection.f1,
+                "wilson_lower_95": three.stale_detection.wilson_lower_95,
+            },
+            "valid_retention_accuracy": {
+                "point": three.valid_retention_accuracy.point,
+                "wilson_lower_95": three.valid_retention_accuracy.wilson_lower_95,
+            },
+            "needs_revalidation_routing_accuracy": {
+                "point": three.needs_revalidation_routing_accuracy.point,
+                "wilson_lower_95": three.needs_revalidation_routing_accuracy.wilson_lower_95,
             },
         },
     }))
