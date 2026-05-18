@@ -7,31 +7,80 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.1] - 2026-05-17
+
+### Changed
+
+- **Collab v3 phase reorder — Codex global review precedes Claude local
+  audit (2026-05-17, PR #56).** Forward-only protocol change.
+  New phase sequence: `CodeImplementPending` →
+  `CodeReviewFixGlobalPending` (Codex; reviews the raw post-implementation
+  diff with no Claude pre-clean) → `CodeReviewLocalPending` (Claude;
+  audits Codex's commits via `/ultrareview-local`, fixes
+  CRITICAL/HIGH/MEDIUM inline) → `CodeReviewFinalPending` (Claude; PR
+  creation) → `CodingComplete`. Wire-observable through
+  `collab_status.phase` transitions.
+  (A) State-machine match arms rewired in
+  `crates/ironmem/src/collab/state_machine/mod.rs`; topic-to-event
+  names unchanged. Owners per phase unchanged; positions in sequence
+  change.
+  (B) Pre-send harness reset rules scoped by harness owner: Claude
+  resets to `last_head_sha` before `review_local` (Codex's only push
+  in v3); skips reset before `task_list`, `implementation_done`, and
+  `final_review`. Codex keeps its receive-side reset before
+  `review_fix_global` (syncs to whatever Claude pushed at
+  `implementation_done`).
+  (C) `/ultrareview-local` role shifts to audit-of-Codex; anti-removal
+  guardrail updated. Severity threshold for inline fixes extended to
+  CRITICAL/HIGH/MEDIUM (was CRITICAL/HIGH).
+  (D) Codex prompt framing updated: Codex sees the raw post-implementation
+  diff, no Claude pre-clean. The next-receiving-side gate after Codex's
+  `review_fix_global` is `CodeReviewLocalPending`, not
+  `CodeReviewFinalPending`.
+  (E) Shortcut ancestry validation extended in
+  `crates/ironmem/src/mcp/tools/collab_session.rs` to fire at both
+  `(CodeReviewFixGlobalPending, CodeReviewFixGlobal)` AND
+  `(CodeReviewLocalPending, ReviewLocal)` when `task_list.is_none()`.
+  New test `test_shortcut_review_local_ancestry_enforced` enforces
+  branch-drift rejection.
+  (F) **Deployment requirement** — operationally explicit: pause / avoid
+  starting new coding-phase collab sessions while existing
+  coding-active sessions are drained or aborted before rollout. No
+  protocol-version migration; sessions surviving deploy follow new
+  semantics from their stored phase forward.
+
+- **Collab protocol — docs/prompts alignment with server enforcement
+  (2026-05-16, PR #55).** Three doc/prompt-only changes; no Rust source touched
+  (server behavior unchanged):
+  (A) `docs/COLLAB.md`, `.claude-plugin/commands/collab.md`, and
+  `.codex-plugin/prompts/collab.md` now name the
+  `MAX_REVIEW_ROUNDS = 2` cap explicitly and cite
+  `crates/ironmem/src/collab/state_machine/mod.rs:28` — Codex gets at
+  most two v1 plan-review rounds, then the server force-finalizes to
+  `PlanClaudeFinalizePending` regardless of verdict.
+  (B) Timing-event names are now stable base identifiers with phase +
+  round detail in structured `phase=<phase> round=<N>` key=value
+  fields. `t4_phase_advanced_to_<phase>` is renamed to
+  `t4_phase_advanced` (phase moves into `phase=`). Old suffix-shaped
+  names (`<event>_round<N>`, `<event>_to_<phase>`) are documented as
+  legacy artifacts and must not be emitted by current dispatchers;
+  historical logs are not rewritten. Consumers of
+  `/tmp/collab-eval-${session_id}.log` parsing on event-name suffix
+  must switch to parsing the structured key=value fields.
+  (C) Claude's dispatcher polling loop documents a bounded backoff
+  curve for Codex-owned background phases — 10s default → 20s after
+  60s of no progress → 30s after 300s (cap), reset on phase advance /
+  new stdout / bg process exit / bg process error or signal. 600s
+  hang detection unchanged. Scope: Codex bg phases only; does NOT
+  affect Plan Mode idle gaps.
+  Also documents two anti-removal guardrails:
+  `/ultrareview-local`'s code-quality lens requires a written overlap
+  audit before removal; SDD reviewer model-pinning recommendations
+  belong in the SDD skill itself once pinning support exists, not in
+  the collab protocol spec.
+
 ### Added
 
-- **provbench-baseline** (Phase 0c): new workspace-excluded crate implementing
-  the LLM-as-invalidator baseline against `claude-sonnet-4-6` snapshot
-  2026-05-09 per SPEC §6.1. Three subcommands (`sample`, `run`, `score`).
-  Operational $25 budget cap (preflight + live abort) under the spec's
-  immutable $250 ceiling. Stratified sampler, atomic checkpointing,
-  `--resume`, schema-derived preflight estimator, prompt caching at the
-  static prefix, parse-error addendum retry, §7.1 three-way metrics +
-  §9.2 LLM-validator agreement with Wilson intervals + Cohen κ bootstrap.
-- **provbench-labeler**: two new subcommands `emit-facts` and `emit-diffs`
-  to produce the JSON artifacts consumed by the baseline runner.
-- **provbench-phase1** (Phase 1): new workspace-excluded crate implementing
-  the rules-based structural invalidator (`rule_set_version v1.0` →
-  `v1.1`, frozen at phase1 git SHA `ccfc901be171`). 7-rule chain
-  (`source_file_missing`, `blob_identical`, `symbol_missing`,
-  `span_hash_changed`, `whitespace_or_comment_only`, `doc_claim`,
-  `rename_candidate`), deterministic single-repo HEAD-only replay,
-  per-rule confusion + audit trail in `rule_traces.jsonl`. Pilot v1.1
-  clears SPEC §8 #3 / #4 / #5 on the ripgrep Phase 0c canary
-  (n=4,387; WLB valid 0.9716, p50 2 ms, WLB stale 0.9537).
-- **provbench-scoring**: shared SPEC §7 math crate (Wilson intervals,
-  three-way confusion, F1, Cohen κ bootstrap) split out of baseline
-  so phase1 and baseline both consume the same scorer. `compare`
-  subcommand produces side-by-side `metrics.json` with deltas.
 - **ProvBench §9.4 held-out evaluation — Round 1 (serde-rs/serde @
   T₀ `65e1a507`, v1.0.130).** First held-out evaluation of phase1
   v1.1 against a repo the rules were never tuned on (SPEC §13.2
@@ -107,6 +156,100 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   phase1 to emit a NeedsRevalidation decision. §10 attestation
   cleared 8/8. SPEC §11 row at SPEC.md:185. Findings:
   `benchmarks/provbench/results/flask-heldout-2026-05-15-findings.md`.
+- **ProvBench v1.2b — SPEC §9.1 Python labeler spot-check PASS
+  (PR #54; 2026-05-16).** First Python labeler-quality gate cleared
+  at WLB 98.12% (200/200 agreements, same threshold as the Rust
+  labeler's 2026-05-13 gate). New
+  `benchmarks/provbench/autofilter_python.py` provides reusable
+  labeler-independent triage for future Python rounds.
+
+## [0.2.0] - 2026-05-14
+
+### Added
+
+- **provbench-phase1** (Phase 1): new workspace-excluded crate
+  implementing the rules-based structural invalidator
+  (`rule_set_version v1.0` → `v1.1`, frozen at phase1 git SHA
+  `ccfc901be171`). 7-rule chain (`source_file_missing`,
+  `blob_identical`, `symbol_missing`, `span_hash_changed`,
+  `whitespace_or_comment_only`, `doc_claim`, `rename_candidate`),
+  deterministic single-repo HEAD-only replay, per-rule confusion +
+  audit trail in `rule_traces.jsonl`. Pilot v1.1 clears SPEC §8 #3 /
+  #4 / #5 on the ripgrep Phase 0c canary (n=4,387; WLB valid 0.9716,
+  p50 2 ms, WLB stale 0.9537).
+- **provbench-scoring**: shared SPEC §7 math crate (Wilson intervals,
+  three-way confusion, F1, Cohen κ bootstrap) split out of baseline
+  so phase1 and baseline both consume the same scorer. `compare`
+  subcommand produces side-by-side `metrics.json` with deltas.
+- **provbench-baseline** (Phase 0c): new workspace-excluded crate
+  implementing the LLM-as-invalidator baseline against
+  `claude-sonnet-4-6` snapshot 2026-05-09 per SPEC §6.1. Three
+  subcommands (`sample`, `run`, `score`). Operational $25 budget cap
+  (preflight + live abort) under the spec's immutable $250 ceiling.
+  Stratified sampler, atomic checkpointing, `--resume`, schema-derived
+  preflight estimator, prompt caching at the static prefix,
+  parse-error addendum retry, §7.1 three-way metrics + §9.2
+  LLM-validator agreement with Wilson intervals + Cohen κ bootstrap.
+- **provbench-labeler**: two new subcommands `emit-facts` and
+  `emit-diffs` to produce the JSON artifacts consumed by the baseline
+  runner.
+- **provbench-labeler — `spotcheck --seed <u64>` (2026-05-12).** The
+  stratified sampler now accepts an optional seed (decimal or `0x`-
+  prefixed hex) so post-merge / anti-tuning validation runs can draw a
+  fresh sample against a regenerated corpus. Omitting `--seed` uses
+  the new `DEFAULT_SEED` public constant
+  (`0xC0DEBABEDEADBEEF`, the historical value), preserving
+  byte-identical replay for resuming an in-progress reviewer CSV. The
+  CLI echoes the resolved seed and writes a `<out>.meta.json` sidecar
+  recording `{corpus, seed, n, labeler_git_sha}` so the on-disk
+  spot-check artifact is self-describing. The SPEC §9.1 acceptance
+  gate must continue to use `DEFAULT_SEED`.
+- `ironmem --version` and MCP `serverInfo.version` carry the
+  git-describe suffix for in-development builds and drop it cleanly
+  on a tagged commit.
+
+### Changed
+
+- **Breaking (wire):** MCP tool ids dropped the `ironmem_` prefix
+  now that the server id itself is `ironmem`. For example,
+  `ironmem_search` → `search`, `ironmem_collab_start` →
+  `collab_start`. Clients invoking tools as `mcp__ironmem__ironmem_*`
+  must update to `mcp__ironmem__*`.
+- Renamed workspace crate `ironrace-memory` → `ironmem` and MCP
+  server id → `ironmem`. The on-disk data directory
+  `~/.ironrace-memory/` is preserved for user-data backcompat.
+- `AgreementReport`'s `per_class` + `per_stale_subtype` moved
+  `HashMap` → `BTreeMap` so byte-stable JSON serialization is
+  structural, not platform-luck.
+- `Database::migrate()` wraps the version-gated section in
+  `BEGIN IMMEDIATE` so concurrent openers can't race
+  `ALTER TABLE ADD COLUMN`.
+- CI: macOS rustup-init shim workaround pinned via absolute-path
+  cargo invocation; deterministic across all runner images.
+- **ProvBench labeler — Phase 0b hardening pass 3 (2026-05-12).**
+  Four labeling-correctness clusters fixed; SPEC v1 is unchanged:
+  (A) visibility narrowing (`pub(crate)` / `pub(super)` / `pub(in path)` /
+  private) is now classified as `StaleSourceChanged` per SPEC §5 rule
+  ordering rather than `NeedsRevalidation`;
+  (B) replay symbol resolution is commit-tree-local — `CommitSymbolIndex`
+  built via tree-sitter per commit, eliminating the runtime RA dependency
+  (RA tooling pin and `tests/replay_ra.rs` retained for future cross-crate
+  / macro-expanded work);
+  (C) rename detection requires a typed `RenameCandidate` with matching
+  `kind` + `container` and a T₀-presence check to prevent false positives
+  from pre-existing same-named symbols;
+  (D) doc-claim matching is relocation-tolerant — post-state lookup uses
+  `qualified_name` rather than byte-offset hash so claims that move lines
+  are still matched correctly.
+- **ProvBench labeler — Phase 0b hardening pass 2 (2026-05-09).**
+  Deterministic `fact_id`s via pure-string path normalization (no
+  `pwd`-sensitive canonicalization), fail-closed behavior on
+  rust-analyzer indexing timeout, explicit invalid-UTF-8 error in the
+  doc-claim extractor (no more silent zero-fact corpus on a corrupted
+  README), structured CSV via the `csv` crate for the spot-check sample,
+  and pinned `linux-x86_64` tooling hashes for the `ubuntu-latest` GitHub
+  runner so CI matches the canonical `aarch64-darwin` freeze
+  environment.
 
 ### Fixed
 
@@ -168,116 +311,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `sample-e96c9fe.csv` was drawn against the buggy corpus and is
   diagnostic-only; the SPEC §9.1 acceptance gate must be re-run on a
   freshly regenerated corpus drawn with a NEW seed.
-
-### Added
-
-- **ProvBench labeler — `spotcheck --seed <u64>` (2026-05-12).** The
-  stratified sampler now accepts an optional seed (decimal or `0x`-
-  prefixed hex) so post-merge / anti-tuning validation runs can draw a
-  fresh sample against a regenerated corpus. Omitting `--seed` uses
-  the new `DEFAULT_SEED` public constant
-  (`0xC0DEBABEDEADBEEF`, the historical value), preserving
-  byte-identical replay for resuming an in-progress reviewer CSV. The
-  CLI echoes the resolved seed and writes a `<out>.meta.json` sidecar
-  recording `{corpus, seed, n, labeler_git_sha}` so the on-disk
-  spot-check artifact is self-describing. The SPEC §9.1 acceptance
-  gate must continue to use `DEFAULT_SEED`.
-
-### Changed
-
-- **Collab v3 phase reorder — Codex global review precedes Claude local
-  audit (2026-05-17).** Forward-only protocol change.
-  New phase sequence: `CodeImplementPending` →
-  `CodeReviewFixGlobalPending` (Codex; reviews the raw post-implementation
-  diff with no Claude pre-clean) → `CodeReviewLocalPending` (Claude;
-  audits Codex's commits via `/ultrareview-local`, fixes
-  CRITICAL/HIGH/MEDIUM inline) → `CodeReviewFinalPending` (Claude; PR
-  creation) → `CodingComplete`. Wire-observable through
-  `collab_status.phase` transitions.
-  (A) State-machine match arms rewired in
-  `crates/ironmem/src/collab/state_machine/mod.rs`; topic-to-event
-  names unchanged. Owners per phase unchanged; positions in sequence
-  change.
-  (B) Pre-send harness reset rules scoped by harness owner: Claude
-  resets to `last_head_sha` before `review_local` (Codex's only push
-  in v3); skips reset before `task_list`, `implementation_done`, and
-  `final_review`. Codex keeps its receive-side reset before
-  `review_fix_global` (syncs to whatever Claude pushed at
-  `implementation_done`).
-  (C) `/ultrareview-local` role shifts to audit-of-Codex; anti-removal
-  guardrail updated. Severity threshold for inline fixes extended to
-  CRITICAL/HIGH/MEDIUM (was CRITICAL/HIGH).
-  (D) Codex prompt framing updated: Codex sees the raw post-implementation
-  diff, no Claude pre-clean. The next-receiving-side gate after Codex's
-  `review_fix_global` is `CodeReviewLocalPending`, not
-  `CodeReviewFinalPending`.
-  (E) Shortcut ancestry validation extended in
-  `crates/ironmem/src/mcp/tools/collab_session.rs` to fire at both
-  `(CodeReviewFixGlobalPending, CodeReviewFixGlobal)` AND
-  `(CodeReviewLocalPending, ReviewLocal)` when `task_list.is_none()`.
-  New test `test_shortcut_review_local_ancestry_enforced` enforces
-  branch-drift rejection.
-  (F) **Deployment requirement** — operationally explicit: pause / avoid
-  starting new coding-phase collab sessions while existing
-  coding-active sessions are drained or aborted before rollout. No
-  protocol-version migration; sessions surviving deploy follow new
-  semantics from their stored phase forward.
-
-- **Collab protocol — docs/prompts alignment with server enforcement
-  (2026-05-16).** Three doc/prompt-only changes; no Rust source touched
-  (server behavior unchanged):
-  (A) `docs/COLLAB.md`, `.claude-plugin/commands/collab.md`, and
-  `.codex-plugin/prompts/collab.md` now name the
-  `MAX_REVIEW_ROUNDS = 2` cap explicitly and cite
-  `crates/ironmem/src/collab/state_machine/mod.rs:28` — Codex gets at
-  most two v1 plan-review rounds, then the server force-finalizes to
-  `PlanClaudeFinalizePending` regardless of verdict.
-  (B) Timing-event names are now stable base identifiers with phase +
-  round detail in structured `phase=<phase> round=<N>` key=value
-  fields. `t4_phase_advanced_to_<phase>` is renamed to
-  `t4_phase_advanced` (phase moves into `phase=`). Old suffix-shaped
-  names (`<event>_round<N>`, `<event>_to_<phase>`) are documented as
-  legacy artifacts and must not be emitted by current dispatchers;
-  historical logs are not rewritten. Consumers of
-  `/tmp/collab-eval-${session_id}.log` parsing on event-name suffix
-  must switch to parsing the structured key=value fields.
-  (C) Claude's dispatcher polling loop documents a bounded backoff
-  curve for Codex-owned background phases — 10s default → 20s after
-  60s of no progress → 30s after 300s (cap), reset on phase advance /
-  new stdout / bg process exit / bg process error or signal. 600s
-  hang detection unchanged. Scope: Codex bg phases only; does NOT
-  affect Plan Mode idle gaps.
-  Also documents two anti-removal guardrails:
-  `/ultrareview-local`'s code-quality lens requires a written overlap
-  audit before removal; SDD reviewer model-pinning recommendations
-  belong in the SDD skill itself once pinning support exists, not in
-  the collab protocol spec.
-- **ProvBench labeler — Phase 0b hardening pass 3 (2026-05-12).**
-  Four labeling-correctness clusters fixed; SPEC v1 is unchanged:
-  (A) visibility narrowing (`pub(crate)` / `pub(super)` / `pub(in path)` /
-  private) is now classified as `StaleSourceChanged` per SPEC §5 rule
-  ordering rather than `NeedsRevalidation`;
-  (B) replay symbol resolution is commit-tree-local — `CommitSymbolIndex`
-  built via tree-sitter per commit, eliminating the runtime RA dependency
-  (RA tooling pin and `tests/replay_ra.rs` retained for future cross-crate
-  / macro-expanded work);
-  (C) rename detection requires a typed `RenameCandidate` with matching
-  `kind` + `container` and a T₀-presence check to prevent false positives
-  from pre-existing same-named symbols;
-  (D) doc-claim matching is relocation-tolerant — post-state lookup uses
-  `qualified_name` rather than byte-offset hash so claims that move lines
-  are still matched correctly.
-- **ProvBench labeler — Phase 0b hardening pass 2 (2026-05-09).**
-  Deterministic `fact_id`s via pure-string path normalization (no
-  `pwd`-sensitive canonicalization), fail-closed behavior on
-  rust-analyzer indexing timeout, explicit invalid-UTF-8 error in the
-  doc-claim extractor (no more silent zero-fact corpus on a corrupted
-  README), structured CSV via the `csv` crate for the spot-check sample,
-  and pinned `linux-x86_64` tooling hashes for the `ubuntu-latest` GitHub
-  runner so CI matches the canonical `aarch64-darwin` freeze
-  environment.
-- **Breaking (wire):** MCP tool ids dropped the `ironmem_` prefix now that the server id itself is `ironmem`. For example, `ironmem_search` → `search`, `ironmem_collab_start` → `collab_start`. Clients invoking tools as `mcp__ironmem__ironmem_*` must update to `mcp__ironmem__*`.
-- Renamed workspace crate `ironrace-memory` → `ironmem` and MCP server id → `ironmem`. The on-disk data directory `~/.ironrace-memory/` is preserved for user-data backcompat.
 
 ## [0.1.0] - 2026-04-15
 
