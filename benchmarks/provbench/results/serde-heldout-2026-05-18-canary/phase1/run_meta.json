@@ -1,0 +1,20 @@
+{
+  "round": "v1.2c-serde-heldout",
+  "round_description": "v1.2c round identifier (the v1.2c PR sequence: PRs #60 chain, #61 flask, #N serde); the rule_set_version is v1.3 — round id and rule_set_version increment independently per v1.2a/v1.2b/v1.2c naming convention",
+  "rule_set_version": "v1.3",
+  "phase1_git_sha": "1c117cdc54919c6531de8d96ecd85d3b77d56488",
+  "scoring_git_sha": "541219a1f1fb98153cbd220582a23f165afe9474",
+  "workspace_git_sha": "d1397f2248018f6dd3f4ae4f39ff3ac85ef66d5b",
+  "labeler_git_sha": "c2d3b7b03a51a9047ff2d50077200bb52f149448",
+  "emit_facts_diffs_labeler_sha": "ababb376f7cf3f92c36dde6035d90932e083517a",
+  "held_out_repo": "serde-rs/serde",
+  "held_out_repo_t0": "65e1a50749938612cfbdb69b57fc4cf249f87149",
+  "held_out_repo_head": "fa7da4a93567ed347ad0735c28e439fca688ef26",
+  "first_parent_commits_t0_to_head": 657,
+  "spec_freeze_hash": "683d023934c181a8714b9d24c53d011caed31f511becf82ed9e5def92e0ff37c",
+  "sample_seed": "13897750829054410479",
+  "subset_size": 12820,
+  "run_date": "2026-05-18",
+  "retuning_in_round": false,
+  "baseline_dir": "../serde-heldout-2026-05-15-canary/baseline (symlinked; frozen v1.1 dry-run carrier reused per §10)"
+}
