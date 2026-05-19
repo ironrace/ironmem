@@ -4,6 +4,19 @@
 //! candidate run's `predictions.jsonl` against the same SPEC §7.1 axes,
 //! and emits a single JSON document with both columns, per-rule confusion
 //! (joined from `rule_traces.jsonl`), and SPEC §8 threshold flags.
+//!
+//! ## Output keys
+//!
+//! The top-level JSON object contains:
+//! - `llm_baseline` — verbatim contents of `<baseline_run>/metrics.json`
+//! - `<candidate_name>` — SPEC §7.1 metrics scored from `predictions.jsonl`
+//! - `phase1_rules_nr_aware` — post-hoc NR-aware column (SPEC §11 row
+//!   2026-05-18). Contains an `applicable` sentinel (`true` when at least one
+//!   row was remapped) and a `rows_remapped` counter, plus a `section_7_1`
+//!   sub-tree with the same shape as the candidate column.
+//! - `deltas` — per-metric point deltas vs. baseline
+//! - `thresholds` — SPEC §8 structured threshold-status objects
+//! - `per_rule_confusion` — per-rule confusion matrix
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -285,31 +298,45 @@ fn score_candidate(candidate_run: &Path) -> Result<Value> {
 ///
 /// Reads `candidate_run/predictions.jsonl` and virtually remaps any row where:
 ///   - `evidence["rule"] == "R4"` (rule that uses the leaf+length guard)
-///   - `prediction == "stale"`
+///   - `prediction == metrics::CLASS_STALE`
 ///   - `evidence["guard_below_floor"] == true`
 ///
 /// Evidence is read from the prediction row when present, with a
 /// `rule_traces.jsonl` fallback for older artifacts whose predictions did
-/// not yet carry evidence.
+/// not yet carry evidence. The join key is `PredictionRow.row_index` when
+/// present (new artifacts); falls back to the enumerate counter only when
+/// `row_index` is absent AND the trace map is non-empty (legacy artifacts).
 ///
-/// to `prediction = "needs_revalidation"`, then re-runs the §7.1 three-way
-/// math on the remapped slice. Returns a JSON value with the same shape as
-/// `score_candidate`'s `section_7_1` sub-tree.
+/// to `prediction = metrics::CLASS_NEEDS_REVAL`, then re-runs the §7.1
+/// three-way math on the remapped slice. Returns a JSON value with an
+/// `applicable` sentinel (`true` when at least one row was remapped), a
+/// `rows_remapped` counter, and a `section_7_1` sub-tree.
 fn score_candidate_nr_aware(candidate_run: &Path) -> Result<Value> {
     let preds_path = candidate_run.join("predictions.jsonl");
     let text = fs::read_to_string(&preds_path)
         .with_context(|| format!("reading {}", preds_path.display()))?;
     let trace_evidence = load_rule_trace_evidence(candidate_run)?;
+    let has_traces = !trace_evidence.is_empty();
     let mut rows: Vec<PredictionRow> = Vec::new();
+    let mut rows_remapped: u64 = 0;
     for (i, line) in text.lines().enumerate() {
         if line.trim().is_empty() {
             continue;
         }
         let mut row: PredictionRow = serde_json::from_str(line)?;
+        // Join on the typed row_index when present. Fall back to the enumerate
+        // counter only for legacy artifacts (row_index absent) where the trace
+        // map is non-empty — this avoids a false match on modern artifacts
+        // that have no traces.
+        let trace_key: i64 = match row.row_index {
+            Some(ri) => ri as i64,
+            None if has_traces => i as i64,
+            None => -1, // no row_index and no traces — skip trace lookup
+        };
         let evidence = row
             .evidence
             .as_ref()
-            .or_else(|| trace_evidence.get(&(i as i64)));
+            .or_else(|| trace_evidence.get(&trace_key));
         let guard_below_floor = evidence
             .and_then(|e| e.get("guard_below_floor"))
             .and_then(|b| b.as_bool())
@@ -319,13 +346,16 @@ fn score_candidate_nr_aware(candidate_run: &Path) -> Result<Value> {
             .and_then(|r| r.as_str())
             .map(|r| r == "R4")
             .unwrap_or(false);
-        if rule_is_r4 && row.prediction == "stale" && guard_below_floor {
-            row.prediction = "needs_revalidation".into();
+        if rule_is_r4 && row.prediction == crate::metrics::CLASS_STALE && guard_below_floor {
+            row.prediction = crate::metrics::CLASS_NEEDS_REVAL.into();
+            rows_remapped += 1;
         }
         rows.push(row);
     }
     let three = metrics::three_way_from_rows(&rows);
     Ok(json!({
+        "applicable": rows_remapped > 0,
+        "rows_remapped": rows_remapped,
         "section_7_1": {
             "stale_detection": {
                 "precision": three.stale_detection.precision,
@@ -348,17 +378,20 @@ fn score_candidate_nr_aware(candidate_run: &Path) -> Result<Value> {
 fn load_rule_trace_evidence(candidate_run: &Path) -> Result<BTreeMap<i64, Value>> {
     let traces = candidate_run.join("rule_traces.jsonl");
     let mut out = BTreeMap::new();
-    if let Ok(text) = fs::read_to_string(&traces) {
-        for line in text.lines() {
-            if line.trim().is_empty() {
-                continue;
-            }
-            let v: Value = serde_json::from_str(line)?;
-            if let (Some(row_index), Some(evidence)) =
-                (v["row_index"].as_i64(), v.get("evidence").cloned())
-            {
-                out.insert(row_index, evidence);
-            }
+    let text = match fs::read_to_string(&traces) {
+        Ok(t) => t,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(out),
+        Err(e) => return Err(e).with_context(|| format!("reading {}", traces.display())),
+    };
+    for line in text.lines() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let v: Value = serde_json::from_str(line)?;
+        if let (Some(row_index), Some(evidence)) =
+            (v["row_index"].as_i64(), v.get("evidence").cloned())
+        {
+            out.insert(row_index, evidence);
         }
     }
     Ok(out)
@@ -448,7 +481,12 @@ fn load_per_rule_confusion(
     let traces = candidate_run.join("rule_traces.jsonl");
     let preds = candidate_run.join("predictions.jsonl");
     let mut row_to_rule: BTreeMap<i64, String> = BTreeMap::new();
-    if let Ok(text) = fs::read_to_string(&traces) {
+    {
+        let text = match fs::read_to_string(&traces) {
+            Ok(t) => t,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+            Err(e) => return Err(e).with_context(|| format!("reading {}", traces.display())),
+        };
         for line in text.lines() {
             if line.trim().is_empty() {
                 continue;

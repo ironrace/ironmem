@@ -27,6 +27,13 @@ pub struct PredictionRow {
     /// fixtures byte-identical when they round-trip through `PredictionRow`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub evidence: Option<serde_json::Value>,
+    /// SQLite `row_index` counter from the runner (0-based, matches
+    /// `rule_traces.jsonl` `row_index` field). Absent on baseline rows and
+    /// legacy artifacts; `score_candidate_nr_aware` joins on this when
+    /// present and falls back to the enumerate counter only on legacy
+    /// artifacts where the field is absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub row_index: Option<u64>,
 }
 
 /// Read-side mirror of `run_meta.json` — only the fields the scorer

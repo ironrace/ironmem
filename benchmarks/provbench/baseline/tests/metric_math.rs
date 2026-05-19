@@ -34,6 +34,7 @@ fn row(
         request_id: "fixture".to_string(),
         wall_ms,
         evidence: None,
+        row_index: None,
     }
 }
 

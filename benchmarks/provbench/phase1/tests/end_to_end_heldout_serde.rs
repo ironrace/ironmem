@@ -141,9 +141,6 @@ fn spec_section_8_thresholds_on_serde_heldout_subset() {
         serde_json::from_slice(&std::fs::read(out_p.join("metrics.json")).unwrap()).unwrap();
 
     // SPEC §8 verbatim against phase1_rules column.
-    let stale_wlb = metrics["phase1_rules"]["section_7_1"]["stale_detection"]["wilson_lower_95"]
-        .as_f64()
-        .expect("phase1_rules stale_detection wilson_lower_95");
     let valid_wlb = metrics["phase1_rules"]["section_7_1"]["valid_retention_accuracy"]
         ["wilson_lower_95"]
         .as_f64()
@@ -152,11 +149,29 @@ fn spec_section_8_thresholds_on_serde_heldout_subset() {
         .as_u64()
         .expect("phase1_rules latency_p50_ms");
 
-    assert!(
-        stale_wlb >= 0.30,
-        "§8 #5 stale recall WLB {:.4} < 0.30",
-        stale_wlb
-    );
+    // §8 #5: SKIP-aware assertion. Per SPEC §11 row 2026-05-18, when
+    // ground-truth stale_* count == 0 the threshold is recorded as
+    // status="SKIP" and the numeric value is null — we must not assert
+    // numerically in that case.
+    let s8_5 = &metrics["thresholds"]["section_8_5_stale_recall_wlb_ge_0_30"];
+    match s8_5["status"].as_str().unwrap_or("") {
+        "SKIP" => {
+            eprintln!(
+                "§8 #5 SKIP (status=SKIP, reason={}): not asserted numerically",
+                s8_5["reason"].as_str().unwrap_or("none")
+            );
+        }
+        "PASS" | "FAIL" => {
+            let stale_wlb = s8_5["observed"]
+                .as_f64()
+                .expect("observed must be numeric on PASS/FAIL");
+            assert!(
+                stale_wlb >= 0.30,
+                "§8 #5 stale recall WLB {stale_wlb:.4} < 0.30 on PASS/FAIL"
+            );
+        }
+        other => panic!("unknown §8 #5 status: {other}"),
+    }
     assert!(
         valid_wlb >= 0.95,
         "§8 #3 valid retention WLB {:.4} < 0.95",

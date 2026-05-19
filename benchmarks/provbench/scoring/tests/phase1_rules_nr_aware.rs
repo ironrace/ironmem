@@ -148,6 +148,20 @@ fn nr_aware_column_reroutes_r4_guard_below_floor_rows() {
         nr_aware.is_object(),
         "phase1_rules_nr_aware column must appear; got: {nr_aware}"
     );
+
+    // Sentinel: applicable=true because at least one row was remapped.
+    assert_eq!(
+        nr_aware["applicable"].as_bool(),
+        Some(true),
+        "applicable must be true when rows were remapped; got: {nr_aware}"
+    );
+    assert_eq!(
+        nr_aware["rows_remapped"].as_u64(),
+        Some(1),
+        "exactly r1 should be remapped; got rows_remapped={:?}",
+        nr_aware["rows_remapped"]
+    );
+
     let nr_aware_nr_acc = nr_aware["section_7_1"]["needs_revalidation_routing_accuracy"]["point"]
         .as_f64()
         .unwrap();
@@ -219,10 +233,22 @@ fn nr_aware_column_uses_rule_trace_evidence_when_prediction_evidence_absent() {
         ["point"]
         .as_f64()
         .unwrap();
-    let nr_aware_nr_acc = report["phase1_rules_nr_aware"]["section_7_1"]
-        ["needs_revalidation_routing_accuracy"]["point"]
+    let nr_aware = &report["phase1_rules_nr_aware"];
+    let nr_aware_nr_acc = nr_aware["section_7_1"]["needs_revalidation_routing_accuracy"]["point"]
         .as_f64()
         .unwrap();
+
+    // Sentinel: applicable=true because row 0 (guard_below_floor=true) is remapped.
+    assert_eq!(
+        nr_aware["applicable"].as_bool(),
+        Some(true),
+        "applicable must be true when trace evidence triggers a remap"
+    );
+    assert!(
+        nr_aware["rows_remapped"].as_u64().unwrap_or(0) >= 1,
+        "rows_remapped must be ≥1; got {:?}",
+        nr_aware["rows_remapped"]
+    );
 
     assert!(
         nr_aware_nr_acc > base_nr_acc,

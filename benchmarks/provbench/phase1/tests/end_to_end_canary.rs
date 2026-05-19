@@ -87,10 +87,6 @@ fn spec_section_8_thresholds_clear_on_canary() {
     let metrics: serde_json::Value =
         serde_json::from_slice(&std::fs::read(out_p.join("metrics.json")).unwrap()).unwrap();
 
-    let stale_recall_wlb = metrics["phase1_rules"]["section_7_1"]["stale_detection"]
-        ["wilson_lower_95"]
-        .as_f64()
-        .unwrap();
     let valid_acc_wlb = metrics["phase1_rules"]["section_7_1"]["valid_retention_accuracy"]
         ["wilson_lower_95"]
         .as_f64()
@@ -112,11 +108,30 @@ fn spec_section_8_thresholds_clear_on_canary() {
         .as_f64()
         .unwrap();
 
-    assert!(
-        stale_recall_wlb >= 0.30,
-        "§8 #5 stale recall WLB {:.4} < 0.30",
-        stale_recall_wlb
-    );
+    // §8 #5: SKIP-aware assertion. Per SPEC §11 row 2026-05-18, when
+    // ground-truth stale_* count == 0 the threshold is SKIP and the numeric
+    // value is null — we must not assert numerically in that case.
+    let s8_5 = &metrics["thresholds"]["section_8_5_stale_recall_wlb_ge_0_30"];
+    let stale_recall_wlb_opt: Option<f64> = match s8_5["status"].as_str().unwrap_or("") {
+        "SKIP" => {
+            eprintln!(
+                "§8 #5 SKIP (status=SKIP, reason={}): not asserted numerically",
+                s8_5["reason"].as_str().unwrap_or("none")
+            );
+            None
+        }
+        "PASS" | "FAIL" => {
+            let stale_wlb = s8_5["observed"]
+                .as_f64()
+                .expect("observed must be numeric on PASS/FAIL");
+            assert!(
+                stale_wlb >= 0.30,
+                "§8 #5 stale recall WLB {stale_wlb:.4} < 0.30 on PASS/FAIL"
+            );
+            Some(stale_wlb)
+        }
+        other => panic!("unknown §8 #5 status: {other}"),
+    };
     assert!(
         valid_acc_wlb >= 0.95,
         "§8 #3 valid retention WLB {:.4} < 0.95",
@@ -134,12 +149,17 @@ fn spec_section_8_thresholds_clear_on_canary() {
     let v1_1_metrics = provbench.join("results/phase1/2026-05-15-canary/metrics.json");
     let v1_1_baseline =
         load_v1_1_gate2_baseline(&v1_1_metrics).expect("load v1.1 pilot Gate 2 baseline");
-    assert!(
-        stale_recall_wlb >= v1_1_baseline.stale_recall_wlb,
-        "Gate 2 regression: stale recall WLB {:.4} < v1.1 pilot {:.4}",
-        stale_recall_wlb,
-        v1_1_baseline.stale_recall_wlb
-    );
+    // Gate 2 stale regression is only asserted when §8 #5 is not SKIP —
+    // if the round has no ground-truth stale rows, the recall WLB is null
+    // and the regression comparison is unevaluable.
+    if let Some(stale_recall_wlb) = stale_recall_wlb_opt {
+        assert!(
+            stale_recall_wlb >= v1_1_baseline.stale_recall_wlb,
+            "Gate 2 regression: stale recall WLB {:.4} < v1.1 pilot {:.4}",
+            stale_recall_wlb,
+            v1_1_baseline.stale_recall_wlb
+        );
+    }
     assert!(
         valid_acc_wlb >= v1_1_baseline.valid_retention_wlb,
         "Gate 2 regression: valid retention WLB {:.4} < v1.1 pilot {:.4}",

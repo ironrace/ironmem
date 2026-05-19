@@ -109,7 +109,7 @@ impl Rule for R4SpanHashChanged {
                 serde_json::json!({
                     "rule": "R4",
                     "reason": "t0_span_found_in_post",
-                    "guard_below_floor": false,
+                    "guard_below_floor": !guard_passed,
                 })
                 .to_string(),
             ));
@@ -141,7 +141,7 @@ impl Rule for R4SpanHashChanged {
             serde_json::json!({
                 "rule": "R4",
                 "reason": "stale_source_changed",
-                "guard_below_floor": false,
+                "guard_below_floor": !guard_passed,
             })
             .to_string(),
         ))

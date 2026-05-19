@@ -156,6 +156,7 @@ fn prediction_row_carries_evidence_from_rule_chain() {
         request_id: "phase1:v1.2c:0000000000000000000000000000000000000000:0".into(),
         wall_ms: 1,
         evidence: evidence_value,
+        row_index: Some(0),
     };
 
     // Primary assertion: evidence must not be None.
