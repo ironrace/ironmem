@@ -13,6 +13,11 @@
 use provbench_phase1::facts::FactBody;
 use provbench_phase1::rules::{Decision, RowCtx, RuleChain};
 use provbench_scoring::PredictionRow;
+use rusqlite::params;
+use std::fs;
+use std::path::Path;
+use std::process::Command;
+use tempfile::TempDir;
 
 /// Construct a minimal `FactBody` that will cause R9 (fallback) to fire.
 ///
@@ -173,4 +178,99 @@ fn prediction_row_carries_evidence_from_rule_chain() {
         ev["rule"].is_string(),
         "evidence[\"rule\"] must be a string; got: {ev}"
     );
+}
+
+#[test]
+fn runner_run_writes_rule_evidence_into_predictions_jsonl() {
+    let tmp = TempDir::new().unwrap();
+    let repo_dir = tmp.path().join("repo");
+    fs::create_dir_all(repo_dir.join("src")).unwrap();
+
+    git(&repo_dir, &["init"]);
+    git(
+        &repo_dir,
+        &["config", "user.email", "provbench@example.test"],
+    );
+    git(&repo_dir, &["config", "user.name", "ProvBench Test"]);
+
+    fs::write(repo_dir.join("src/lib.rs"), "pub fn frobnicate() {\n}\n").unwrap();
+    git(&repo_dir, &["add", "src/lib.rs"]);
+    git(&repo_dir, &["commit", "-m", "t0"]);
+    let t0 = git(&repo_dir, &["rev-parse", "HEAD"]);
+
+    fs::write(
+        repo_dir.join("src/lib.rs"),
+        "pub fn frobnicate() {\n    let _x = 1;\n}\n",
+    )
+    .unwrap();
+    git(&repo_dir, &["add", "src/lib.rs"]);
+    git(&repo_dir, &["commit", "-m", "post"]);
+    let post = git(&repo_dir, &["rev-parse", "HEAD"]);
+
+    let out_dir = tmp.path().join("run");
+    fs::create_dir_all(&out_dir).unwrap();
+    let db = provbench_phase1::storage::open(&out_dir.join("phase1.sqlite")).unwrap();
+    db.execute(
+        "INSERT INTO facts \
+         (fact_id, kind, body, source_path, line_start, line_end, symbol_path, \
+          content_hash_at_observation, labeler_git_sha, raw_json_sha256) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+        params![
+            "fact-r4-guard",
+            "FunctionSignature",
+            "pub fn frobnicate()",
+            "src/lib.rs",
+            2_i64,
+            2_i64,
+            "frobnicate",
+            "deadbeef",
+            "labeler",
+            "rawhash",
+        ],
+    )
+    .unwrap();
+    db.execute(
+        "INSERT INTO eval_rows (row_index, fact_id, commit_sha, batch_id, ground_truth) \
+         VALUES (?1, ?2, ?3, ?4, ?5)",
+        params![0_i64, "fact-r4-guard", post, "batch-0", "NeedsRevalidation"],
+    )
+    .unwrap();
+
+    let repo = provbench_phase1::repo::Repo::open(&repo_dir).unwrap();
+    let stats = provbench_phase1::runner::run(provbench_phase1::runner::RunnerOpts {
+        db: &db,
+        repo: &repo,
+        t0: &t0,
+        rule_set_version: "v1.3-test",
+        out_predictions: &out_dir.join("predictions.jsonl"),
+        out_traces: &out_dir.join("rule_traces.jsonl"),
+    })
+    .unwrap();
+
+    assert_eq!(stats.processed, 1);
+    assert_eq!(stats.needs_reval, 1);
+
+    let predictions = fs::read_to_string(out_dir.join("predictions.jsonl")).unwrap();
+    let row: serde_json::Value = serde_json::from_str(predictions.trim()).unwrap();
+    assert_eq!(row["prediction"].as_str(), Some("needs_revalidation"));
+    assert_eq!(row["evidence"]["rule"].as_str(), Some("R4"));
+    assert_eq!(row["evidence"]["guard_below_floor"].as_bool(), Some(true));
+}
+
+fn git(repo_dir: &Path, args: &[&str]) -> String {
+    let output = Command::new("git")
+        .current_dir(repo_dir)
+        .args(args)
+        .output()
+        .unwrap_or_else(|e| panic!("failed to run git {args:?}: {e}"));
+    assert!(
+        output.status.success(),
+        "git {args:?} failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8(output.stdout)
+        .expect("git stdout must be utf8")
+        .trim()
+        .to_string()
 }

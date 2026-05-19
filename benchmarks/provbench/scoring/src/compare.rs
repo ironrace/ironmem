@@ -288,6 +288,10 @@ fn score_candidate(candidate_run: &Path) -> Result<Value> {
 ///   - `prediction == "stale"`
 ///   - `evidence["guard_below_floor"] == true`
 ///
+/// Evidence is read from the prediction row when present, with a
+/// `rule_traces.jsonl` fallback for older artifacts whose predictions did
+/// not yet carry evidence.
+///
 /// to `prediction = "needs_revalidation"`, then re-runs the §7.1 three-way
 /// math on the remapped slice. Returns a JSON value with the same shape as
 /// `score_candidate`'s `section_7_1` sub-tree.
@@ -295,21 +299,22 @@ fn score_candidate_nr_aware(candidate_run: &Path) -> Result<Value> {
     let preds_path = candidate_run.join("predictions.jsonl");
     let text = fs::read_to_string(&preds_path)
         .with_context(|| format!("reading {}", preds_path.display()))?;
+    let trace_evidence = load_rule_trace_evidence(candidate_run)?;
     let mut rows: Vec<PredictionRow> = Vec::new();
-    for line in text.lines() {
+    for (i, line) in text.lines().enumerate() {
         if line.trim().is_empty() {
             continue;
         }
         let mut row: PredictionRow = serde_json::from_str(line)?;
-        let guard_below_floor = row
+        let evidence = row
             .evidence
             .as_ref()
+            .or_else(|| trace_evidence.get(&(i as i64)));
+        let guard_below_floor = evidence
             .and_then(|e| e.get("guard_below_floor"))
             .and_then(|b| b.as_bool())
             .unwrap_or(false);
-        let rule_is_r4 = row
-            .evidence
-            .as_ref()
+        let rule_is_r4 = evidence
             .and_then(|e| e.get("rule"))
             .and_then(|r| r.as_str())
             .map(|r| r == "R4")
@@ -338,6 +343,25 @@ fn score_candidate_nr_aware(candidate_run: &Path) -> Result<Value> {
             },
         },
     }))
+}
+
+fn load_rule_trace_evidence(candidate_run: &Path) -> Result<BTreeMap<i64, Value>> {
+    let traces = candidate_run.join("rule_traces.jsonl");
+    let mut out = BTreeMap::new();
+    if let Ok(text) = fs::read_to_string(&traces) {
+        for line in text.lines() {
+            if line.trim().is_empty() {
+                continue;
+            }
+            let v: Value = serde_json::from_str(line)?;
+            if let (Some(row_index), Some(evidence)) =
+                (v["row_index"].as_i64(), v.get("evidence").cloned())
+            {
+                out.insert(row_index, evidence);
+            }
+        }
+    }
+    Ok(out)
 }
 
 fn metric_f64(root: &Value, path: &[&str]) -> f64 {

@@ -39,7 +39,13 @@ pub const CLASS_NEEDS_REVAL: &str = "needs_revalidation";
 pub fn coalesce(label_tag: &str) -> &'static str {
     match label_tag {
         "Valid" | "valid" => CLASS_VALID,
-        "StaleSourceChanged" | "StaleSourceDeleted" | "StaleSymbolRenamed" | "stale" => CLASS_STALE,
+        "StaleSourceChanged"
+        | "StaleSourceDeleted"
+        | "StaleSymbolRenamed"
+        | "stale_source_changed"
+        | "stale_source_deleted"
+        | "stale_symbol_renamed"
+        | "stale" => CLASS_STALE,
         "NeedsRevalidation" | "needs_revalidation" => CLASS_NEEDS_REVAL,
         // Defensive: the runner can emit "missing" if a batch dropped an
         // id. Unknown tags fall into the same bucket so they can't

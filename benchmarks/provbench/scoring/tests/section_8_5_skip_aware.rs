@@ -200,3 +200,56 @@ fn section_8_5_handles_pascalcase_labeler_stale_tags() {
         "PascalCase StaleSourceChanged tags must coalesce to CLASS_STALE; got: {s8_5}"
     );
 }
+
+#[test]
+fn stale_ground_truth_count_uses_canonical_coalesce_for_all_stale_aliases() {
+    for label in [
+        "StaleSourceChanged",
+        "StaleSourceDeleted",
+        "StaleSymbolRenamed",
+        "stale_source_changed",
+        "stale_source_deleted",
+        "stale_symbol_renamed",
+        "stale",
+    ] {
+        assert_eq!(
+            provbench_scoring::metrics::coalesce(label),
+            provbench_scoring::metrics::CLASS_STALE,
+            "stale alias {label} must coalesce to CLASS_STALE"
+        );
+    }
+
+    let tmp = TempDir::new().unwrap();
+    let candidate = tmp.path().join("candidate");
+    let baseline = tmp.path().join("baseline");
+    fs::create_dir_all(&candidate).unwrap();
+    fs::create_dir_all(&baseline).unwrap();
+
+    let labels = [
+        "StaleSourceChanged",
+        "StaleSourceDeleted",
+        "StaleSymbolRenamed",
+        "stale_source_changed",
+        "stale_source_deleted",
+        "stale_symbol_renamed",
+        "stale",
+    ];
+    let preds: Vec<String> = labels
+        .iter()
+        .enumerate()
+        .map(|(i, label)| pred_line(i, "stale", label))
+        .collect();
+
+    write_predictions(&candidate, &preds);
+    write_predictions(&baseline, &preds);
+    write_minimal_baseline_metrics(&baseline);
+
+    let report = provbench_scoring::compare::run(&baseline, &candidate, "phase1_rules").unwrap();
+    let s8_5 = &report["thresholds"]["section_8_5_stale_recall_wlb_ge_0_30"];
+
+    assert_eq!(
+        s8_5["status"].as_str(),
+        Some("PASS"),
+        "all stale aliases must make §8 #5 evaluable, not SKIP; got: {s8_5}"
+    );
+}

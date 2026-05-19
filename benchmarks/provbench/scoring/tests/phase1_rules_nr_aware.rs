@@ -34,9 +34,6 @@ fn minimal_baseline_metrics() -> Value {
 ///
 /// Includes an `evidence` object so that Task 6's NR-aware remap can read
 /// `guard_below_floor` without schema changes to the JSONL format.
-/// Today `PredictionRow` has no `evidence` field, so serde silently ignores
-/// the key — this is the structural RED: the output will lack the
-/// `phase1_rules_nr_aware` column entirely.
 fn pred_line_with_evidence(
     i: usize,
     prediction: &str,
@@ -52,6 +49,29 @@ fn pred_line_with_evidence(
         "request_id":   format!("phase1:v1.2c:0000000000:{i}"),
         "wall_ms":      1_u64,
         "evidence":     evidence,
+    })
+    .to_string()
+}
+
+fn pred_line_without_evidence(i: usize, prediction: &str, ground_truth: &str) -> String {
+    serde_json::json!({
+        "fact_id":      format!("r{i}"),
+        "commit_sha":   "0000000000",
+        "batch_id":     "test-batch",
+        "ground_truth": ground_truth,
+        "prediction":   prediction,
+        "request_id":   format!("phase1:v1.2c:0000000000:{i}"),
+        "wall_ms":      1_u64,
+    })
+    .to_string()
+}
+
+fn trace_line(row_index: usize, rule_id: &str, evidence: Value) -> String {
+    serde_json::json!({
+        "row_index": row_index,
+        "rule_id": rule_id,
+        "spec_ref": "SPEC §5.3",
+        "evidence": evidence,
     })
     .to_string()
 }
@@ -144,5 +164,68 @@ fn nr_aware_column_reroutes_r4_guard_below_floor_rows() {
     assert!(
         (nr_aware_stale_recall - 1.0).abs() < 1e-9,
         "r2 must remain Stale (guard_below_floor=false); recall expected 1.0, got {nr_aware_stale_recall}"
+    );
+}
+
+#[test]
+fn nr_aware_column_uses_rule_trace_evidence_when_prediction_evidence_absent() {
+    let tmp = TempDir::new().unwrap();
+    let candidate = tmp.path().join("candidate");
+    let baseline = tmp.path().join("baseline");
+    fs::create_dir_all(&candidate).unwrap();
+    fs::create_dir_all(&baseline).unwrap();
+
+    fs::write(
+        baseline.join("metrics.json"),
+        serde_json::to_string(&minimal_baseline_metrics()).unwrap(),
+    )
+    .unwrap();
+
+    let preds = [
+        pred_line_without_evidence(1, "stale", "needs_revalidation"),
+        pred_line_without_evidence(2, "stale", "stale"),
+        pred_line_without_evidence(3, "valid", "valid"),
+    ]
+    .join("\n");
+    let traces = [
+        trace_line(
+            0,
+            "R4",
+            serde_json::json!({
+                "rule": "R4",
+                "reason": "stale_source_changed",
+                "guard_below_floor": true,
+            }),
+        ),
+        trace_line(
+            1,
+            "R4",
+            serde_json::json!({
+                "rule": "R4",
+                "reason": "stale_source_changed",
+                "guard_below_floor": false,
+            }),
+        ),
+        trace_line(2, "R2", serde_json::json!({"rule": "R2"})),
+    ]
+    .join("\n");
+
+    fs::write(candidate.join("predictions.jsonl"), &preds).unwrap();
+    fs::write(candidate.join("rule_traces.jsonl"), traces).unwrap();
+    fs::write(baseline.join("predictions.jsonl"), &preds).unwrap();
+
+    let report = provbench_scoring::compare::run(&baseline, &candidate, "phase1_rules").unwrap();
+    let base_nr_acc = report["phase1_rules"]["section_7_1"]["needs_revalidation_routing_accuracy"]
+        ["point"]
+        .as_f64()
+        .unwrap();
+    let nr_aware_nr_acc = report["phase1_rules_nr_aware"]["section_7_1"]
+        ["needs_revalidation_routing_accuracy"]["point"]
+        .as_f64()
+        .unwrap();
+
+    assert!(
+        nr_aware_nr_acc > base_nr_acc,
+        "NR-aware remap must use rule_traces.jsonl evidence when predictions evidence is absent"
     );
 }

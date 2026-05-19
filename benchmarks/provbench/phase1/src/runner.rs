@@ -219,12 +219,9 @@ pub fn run(opts: RunnerOpts<'_>) -> Result<RunStats> {
 /// `processed` is the total number of `eval_rows` scored; the remaining
 /// counters partition that total by final `Decision`.
 ///
-/// `needs_reval` is expected to be 0 on the current rule chain: R7 is
-/// unreachable in practice (R3 always fires first when `post_blob` is
-/// `Some`), and the R9 fallback only triggers when no earlier rule
-/// matches — a state R3/R4 cover for every fact kind present in the
-/// canary corpus. A non-zero count is a §9.4 follow-up signal, not a
-/// bug.
+/// `needs_reval` is expected to be non-zero on v1.3+ runs: R4 routes
+/// guard-below-floor rows to `NeedsRevalidation`, and earlier rules such as
+/// R0/R6/R9 can still emit NR when their structural evidence is insufficient.
 #[derive(Default, Debug)]
 pub struct RunStats {
     pub processed: u64,
