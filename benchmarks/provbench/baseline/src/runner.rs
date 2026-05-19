@@ -281,6 +281,8 @@ pub async fn run(opts: RunnerOpts) -> Result<RunResult> {
                 prediction,
                 request_id: response.request_id.clone(),
                 wall_ms: response.wall_ms,
+                evidence: None,
+                row_index: None,
             });
         }
 

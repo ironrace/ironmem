@@ -12,6 +12,8 @@ fn predictionrow_roundtrip_is_byte_stable() {
         prediction: "valid".into(),
         request_id: "phase1:v1.0:0000157917:0".into(),
         wall_ms: 12,
+        evidence: None,
+        row_index: None,
     };
     let s = serde_json::to_string(&row).unwrap();
     assert_eq!(

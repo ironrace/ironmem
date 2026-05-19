@@ -33,6 +33,8 @@ fn row(
         prediction: pred.to_string(),
         request_id: "fixture".to_string(),
         wall_ms,
+        evidence: None,
+        row_index: None,
     }
 }
 
@@ -279,6 +281,10 @@ fn coalesce_maps_all_raw_tags() {
     assert_eq!(coalesce("valid"), "valid");
     assert_eq!(coalesce("stale"), "stale");
     assert_eq!(coalesce("needs_revalidation"), "needs_revalidation");
+    // Spotcheck/export paths may use snake_case subtype labels.
+    assert_eq!(coalesce("stale_source_changed"), "stale");
+    assert_eq!(coalesce("stale_source_deleted"), "stale");
+    assert_eq!(coalesce("stale_symbol_renamed"), "stale");
 }
 
 #[test]

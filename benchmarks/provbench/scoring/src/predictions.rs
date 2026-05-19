@@ -20,6 +20,20 @@ pub struct PredictionRow {
     /// `predictions.jsonl` for audit / debugging.
     pub request_id: String,
     pub wall_ms: u64,
+    /// Optional evidence blob emitted by rule-based runners.
+    /// Phase 1 R4 sets `{"rule": "R4", "guard_below_floor": <bool>, ...}`.
+    /// Absent on baseline rows and on legacy artifacts — `#[serde(default)]`
+    /// keeps those rows deserializable, and `skip_serializing_if` keeps legacy
+    /// fixtures byte-identical when they round-trip through `PredictionRow`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub evidence: Option<serde_json::Value>,
+    /// SQLite `row_index` counter from the runner (0-based, matches
+    /// `rule_traces.jsonl` `row_index` field). Absent on baseline rows and
+    /// legacy artifacts; `score_candidate_nr_aware` joins on this when
+    /// present and falls back to the enumerate counter only on legacy
+    /// artifacts where the field is absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub row_index: Option<u64>,
 }
 
 /// Read-side mirror of `run_meta.json` — only the fields the scorer

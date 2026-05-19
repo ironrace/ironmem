@@ -78,7 +78,10 @@ fn ensure_scoring_binary_built() -> PathBuf {
 fn spec_section_8_thresholds_on_serde_heldout_subset() {
     let provbench = provbench_root();
     let workrepo = provbench.join("work/serde");
-    assert!(workrepo.exists(), "needs work/serde checkout for held-out e2e");
+    assert!(
+        workrepo.exists(),
+        "needs work/serde checkout for held-out e2e"
+    );
 
     let baseline_run = provbench.join(HELDOUT_RUN_DIR).join("baseline");
     assert!(
@@ -109,7 +112,9 @@ fn spec_section_8_thresholds_on_serde_heldout_subset() {
             "--out",
             out_p.to_str().unwrap(),
             "--rule-set-version",
-            "v1.1",
+            // v1.3: R4 guard-below-floor rows route to NeedsRevalidation
+            // instead of Stale. Pre-registered in SPEC §11 row 2026-05-18.
+            "v1.3",
         ])
         .status()
         .unwrap();
@@ -136,9 +141,6 @@ fn spec_section_8_thresholds_on_serde_heldout_subset() {
         serde_json::from_slice(&std::fs::read(out_p.join("metrics.json")).unwrap()).unwrap();
 
     // SPEC §8 verbatim against phase1_rules column.
-    let stale_wlb = metrics["phase1_rules"]["section_7_1"]["stale_detection"]["wilson_lower_95"]
-        .as_f64()
-        .expect("phase1_rules stale_detection wilson_lower_95");
     let valid_wlb = metrics["phase1_rules"]["section_7_1"]["valid_retention_accuracy"]
         ["wilson_lower_95"]
         .as_f64()
@@ -147,11 +149,29 @@ fn spec_section_8_thresholds_on_serde_heldout_subset() {
         .as_u64()
         .expect("phase1_rules latency_p50_ms");
 
-    assert!(
-        stale_wlb >= 0.30,
-        "§8 #5 stale recall WLB {:.4} < 0.30",
-        stale_wlb
-    );
+    // §8 #5: SKIP-aware assertion. Per SPEC §11 row 2026-05-18, when
+    // ground-truth stale_* count == 0 the threshold is recorded as
+    // status="SKIP" and the numeric value is null — we must not assert
+    // numerically in that case.
+    let s8_5 = &metrics["thresholds"]["section_8_5_stale_recall_wlb_ge_0_30"];
+    match s8_5["status"].as_str().unwrap_or("") {
+        "SKIP" => {
+            eprintln!(
+                "§8 #5 SKIP (status=SKIP, reason={}): not asserted numerically",
+                s8_5["reason"].as_str().unwrap_or("none")
+            );
+        }
+        "PASS" | "FAIL" => {
+            let stale_wlb = s8_5["observed"]
+                .as_f64()
+                .expect("observed must be numeric on PASS/FAIL");
+            assert!(
+                stale_wlb >= 0.30,
+                "§8 #5 stale recall WLB {stale_wlb:.4} < 0.30 on PASS/FAIL"
+            );
+        }
+        other => panic!("unknown §8 #5 status: {other}"),
+    }
     assert!(
         valid_wlb >= 0.95,
         "§8 #3 valid retention WLB {:.4} < 0.95",
@@ -161,7 +181,8 @@ fn spec_section_8_thresholds_on_serde_heldout_subset() {
 
     // Row-count consistency: predictions.jsonl line count == manifest selected_count.
     let manifest: serde_json::Value =
-        serde_json::from_slice(&std::fs::read(baseline_run.join("manifest.json")).unwrap()).unwrap();
+        serde_json::from_slice(&std::fs::read(baseline_run.join("manifest.json")).unwrap())
+            .unwrap();
     let selected_count = manifest["selected_count"]
         .as_u64()
         .expect("manifest selected_count");
@@ -174,14 +195,16 @@ fn spec_section_8_thresholds_on_serde_heldout_subset() {
         "phase1 predictions line count {pred_lines} != manifest selected_count {selected_count}"
     );
 
-    // rule_set_version=v1.1 evidence in every prediction's request_id.
+    // rule_set_version=v1.3 evidence in every prediction's request_id.
+    // v1.3: R4 NR carve-out for guard-below-floor rows.
+    // Pre-registered in SPEC §11 row 2026-05-18.
     let preds = std::fs::read_to_string(out_p.join("predictions.jsonl")).unwrap();
     for (i, line) in preds.lines().enumerate() {
         let row: serde_json::Value = serde_json::from_str(line).unwrap();
         let req_id = row["request_id"].as_str().expect("request_id");
         assert!(
-            req_id.contains("v1.1"),
-            "row {i} request_id {req_id} does not embed rule_set_version v1.1"
+            req_id.contains("v1.3"),
+            "row {i} request_id {req_id} does not embed rule_set_version v1.3"
         );
     }
 }

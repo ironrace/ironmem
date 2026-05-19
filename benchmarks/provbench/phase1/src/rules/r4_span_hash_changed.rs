@@ -10,13 +10,15 @@
 //!
 //! 1. Extract `t0_span` = T0 `lines[start..=end]` (the fact's bound
 //!    lines exactly).
-//! 2. If `t0_span` contains the leaf symbol name (defensive: trivial
-//!    lines like `}` or `#[test]` would otherwise collapse every fact
-//!    onto the same probe) AND `t0_span` is a substring of post_blob
+//! 2. If the leaf-or-length guard passes AND `t0_span ⊂ post_blob`
 //!    → **Valid** (the fact's bound source is byte-stable; line
 //!    numbers may have shifted but the code didn't).
-//! 3. Otherwise → **Stale** (the lines that bound the fact have
-//!    meaningfully changed).
+//! 3. Else if the leaf-or-length guard passes AND `t0_span ⊄ post_blob`
+//!    → **Stale** (the lines that bound the fact have meaningfully changed).
+//! 4. Else (guard fails — probe is below floor or missing the leaf
+//!    symbol) → **NeedsRevalidation** (phase1 has no defensible probe;
+//!    aligns phase1's output taxonomy with the labeler's three classes).
+//!    SPEC §11 row 2026-05-18 (v1.2c, rule_set_version v1.3).
 //!
 //! Rationale: this trades the labeler-internal `byte_range`+hash check
 //! for a byte-window presence check that phase1 can compute from
@@ -107,21 +109,39 @@ impl Rule for R4SpanHashChanged {
                 serde_json::json!({
                     "rule": "R4",
                     "reason": "t0_span_found_in_post",
+                    "guard_below_floor": !guard_passed,
                 })
                 .to_string(),
             ));
         }
 
-        // Probe absent (or below guard) → the source lines that bound
-        // this fact at T0 have meaningfully changed, OR phase1 cannot
-        // distinguish stale from valid here. Route to Stale to preserve
-        // §7.1 stale recall — false positives against GT=Valid are
-        // contained by the leaf+length guards above.
+        // SPEC §11 row 2026-05-18 (v1.2c, rule_set_version v1.3):
+        // Split the ambiguous path. When the leaf-or-length guard FAILS
+        // (we have no defensible probe to test), route to NR — phase1
+        // cannot make a confident structural claim. When the guard
+        // PASSES but the probe is absent from post_blob, the source
+        // lines that bound this fact have meaningfully changed → Stale.
+        if !guard_passed {
+            return Some((
+                Decision::NeedsRevalidation,
+                serde_json::json!({
+                    "rule": "R4",
+                    "reason": "guard_below_floor",
+                    "guard_below_floor": true,
+                    "kind": ctx.fact.kind,
+                    "nonws_len": nonws_len,
+                    "probe_has_leaf": probe_has_leaf,
+                })
+                .to_string(),
+            ));
+        }
+
         Some((
             Decision::Stale,
             serde_json::json!({
                 "rule": "R4",
                 "reason": "stale_source_changed",
+                "guard_below_floor": !guard_passed,
             })
             .to_string(),
         ))

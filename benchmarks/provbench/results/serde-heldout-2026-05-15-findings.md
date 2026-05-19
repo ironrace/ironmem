@@ -6,6 +6,14 @@ A deterministic, structural, single-repo HEAD-only rules pass clears SPEC §8 #3
 
 ## SPEC §8 threshold verdict — **FAIL §8 #3**
 
+> **Note (post-2026-05-18):** `metrics.json.thresholds.section_8_*` in this
+> artifact uses the pre-v1.2c bare-boolean shape. From v1.2c onward (SPEC §11
+> row 2026-05-18) the field is a structured object
+> `{status: "PASS"|"FAIL"|"SKIP", passed: bool|null, metric, observed, target,
+> reason?}`. This artifact has not been re-run; readers should not parse it as
+> the new shape. See `benchmarks/provbench/scoring/SCHEMA.md` §3 for the
+> current shape.
+
 | Threshold | Required | Observed (serde held-out) | Pass? |
 |---|---|---|:---:|
 | §8 #3 valid retention WLB | ≥ 0.95 | **0.9062** | **❌** |

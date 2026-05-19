@@ -174,6 +174,18 @@ pub fn run(opts: RunnerOpts<'_>) -> Result<RunStats> {
         ])?;
         ins_trace.execute(params![row_index, rule_id, spec_ref, "n/a", &evidence])?;
 
+        let evidence_value: Option<serde_json::Value> = match serde_json::from_str(&evidence) {
+            Ok(v) => Some(v),
+            Err(e) => {
+                eprintln!(
+                    "runner: failed to parse evidence JSON for row_index={row_index}: {e}; \
+                     storing None in predictions.jsonl"
+                );
+                stats.evidence_parse_failures += 1;
+                None
+            }
+        };
+
         let pr_row = PredictionRow {
             fact_id: fact_id.clone(),
             commit_sha: commit_sha.clone(),
@@ -182,6 +194,8 @@ pub fn run(opts: RunnerOpts<'_>) -> Result<RunStats> {
             prediction: pred.clone(),
             request_id: request_id.clone(),
             wall_ms,
+            evidence: evidence_value,
+            row_index: Some(row_index as u64),
         };
         writeln!(predictions_f, "{}", serde_json::to_string(&pr_row)?)?;
         let trace_obj = serde_json::json!({
@@ -207,18 +221,20 @@ pub fn run(opts: RunnerOpts<'_>) -> Result<RunStats> {
 /// `processed` is the total number of `eval_rows` scored; the remaining
 /// counters partition that total by final `Decision`.
 ///
-/// `needs_reval` is expected to be 0 on the current rule chain: R7 is
-/// unreachable in practice (R3 always fires first when `post_blob` is
-/// `Some`), and the R9 fallback only triggers when no earlier rule
-/// matches — a state R3/R4 cover for every fact kind present in the
-/// canary corpus. A non-zero count is a §9.4 follow-up signal, not a
-/// bug.
+/// `needs_reval` is expected to be non-zero on v1.3+ runs: R4 routes
+/// guard-below-floor rows to `NeedsRevalidation`, and earlier rules such as
+/// R0/R6/R9 can still emit NR when their structural evidence is insufficient.
+///
+/// `evidence_parse_failures` counts rows where the rule returned evidence JSON
+/// that failed to parse back to `serde_json::Value`. Test harnesses should
+/// assert this is zero; a non-zero value means a rule emitted malformed JSON.
 #[derive(Default, Debug)]
 pub struct RunStats {
     pub processed: u64,
     pub valid: u64,
     pub stale: u64,
     pub needs_reval: u64,
+    pub evidence_parse_failures: u64,
 }
 
 /// Load the diff_artifact row for a single commit, if present.

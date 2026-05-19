@@ -39,7 +39,13 @@ pub const CLASS_NEEDS_REVAL: &str = "needs_revalidation";
 pub fn coalesce(label_tag: &str) -> &'static str {
     match label_tag {
         "Valid" | "valid" => CLASS_VALID,
-        "StaleSourceChanged" | "StaleSourceDeleted" | "StaleSymbolRenamed" | "stale" => CLASS_STALE,
+        "StaleSourceChanged"
+        | "StaleSourceDeleted"
+        | "StaleSymbolRenamed"
+        | "stale_source_changed"
+        | "stale_source_deleted"
+        | "stale_symbol_renamed"
+        | "stale" => CLASS_STALE,
         "NeedsRevalidation" | "needs_revalidation" => CLASS_NEEDS_REVAL,
         // Defensive: the runner can emit "missing" if a batch dropped an
         // id. Unknown tags fall into the same bucket so they can't
@@ -128,6 +134,13 @@ pub fn wilson_lower_95(k: u64, n: u64) -> f64 {
     let denom = 1.0 + z2 / n_f;
     let lower = (center - margin) / denom;
     lower.max(0.0)
+}
+
+/// §7.1 convenience wrapper — runs [`three_way`] with empty population
+/// weights (unweighted per-stratum accuracy as the SPEC §7.1 contract
+/// calls for). Use this when you don't need HT-weighted agreement.
+pub fn three_way_from_rows(rows: &[PredictionRow]) -> ThreeWayReport {
+    three_way(rows, &HashMap::new())
 }
 
 /// §7.1 — stale-detection P/R/F1, valid-retention accuracy,

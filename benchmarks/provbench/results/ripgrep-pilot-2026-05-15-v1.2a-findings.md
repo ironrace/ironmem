@@ -16,6 +16,14 @@ Prerequisite read: `docs/superpowers/specs/2026-05-15-provbench-v1.2a-r4-guard-d
 
 All three `metrics.json.thresholds.*` flags are `true`.
 
+> **Note (post-2026-05-18):** `metrics.json.thresholds.section_8_*` in this
+> artifact uses the pre-v1.2c bare-boolean shape. From v1.2c onward (SPEC §11
+> row 2026-05-18) the field is a structured object
+> `{status: "PASS"|"FAIL"|"SKIP", passed: bool|null, metric, observed, target,
+> reason?}`. This artifact has not been re-run; readers should not parse it as
+> the new shape. See `benchmarks/provbench/scoring/SCHEMA.md` §3 for the
+> current shape.
+
 ## Run Details
 
 | Field | Value |
