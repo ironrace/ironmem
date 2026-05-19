@@ -1,7 +1,7 @@
 # ProvBench Scoring — Artifact Schema Reference
 
 **Last updated:** 2026-05-18
-**Covers:** `provbench-scoring` v1.2c (SPEC §11 row 2026-05-18)
+**Covers:** `provbench-scoring` v1.2c+ (SPEC §11 row 2026-05-18; `wall_us` field added)
 **Source files:** `scoring/src/predictions.rs`, `scoring/src/compare.rs`,
   `scoring/src/report.rs`, `scoring/src/metrics.rs`, `phase1/src/runner.rs`
 
@@ -36,6 +36,7 @@ incremental runs.
 | `prediction` | string | required | Coalesced model/rule output: `valid`, `stale`, or `needs_revalidation` |
 | `request_id` | string | required | Opaque audit token. Baseline: Anthropic request id (`req_…`). Phase 1: `phase1:<rule_set_version>:<commit_sha>:<row_index>` |
 | `wall_ms` | u64 | required | Wall time in ms. Baseline: per-batch API round-trip. Phase 1: per-row rule classification cost |
+| `wall_us` | u64\|null | optional — v1.2c+ added (`#[serde(default, skip_serializing_if = "Option::is_none")]`) | Microsecond-resolution rule-chain latency for a single row. Added to give meaningful latency reporting on sub-millisecond Python rule-chain work: flask predictions had `wall_ms: 0` across the entire subset because the structural rule chain runs in 100–900 μs per row, which rounds to 0 at millisecond granularity. `wall_ms` retains its SPEC §8 #4 contract; `wall_us` is purely additive precision. `None` on legacy artifacts and baseline LLM-runner output |
 | `evidence` | object\|null | optional — v1.2c added (`#[serde(default, skip_serializing_if = "Option::is_none")]`) | Rule-specific evidence blob. R4 emits `{"rule":"R4","guard_below_floor":<bool>,...}`. Absent on baseline rows and pre-v1.2c Phase 1 artifacts |
 | `row_index` | u64\|null | optional — v1.2c added (`#[serde(default, skip_serializing_if = "Option::is_none")]`) | 0-based SQLite row counter from the runner. Matches `rule_traces.jsonl` `row_index`. Absent on baseline rows and legacy Phase 1 artifacts. The scorer uses it for the `score_candidate_nr_aware` join when present, and falls back to the enumeration counter on legacy artifacts |
 
@@ -341,3 +342,4 @@ prediction row's own `evidence` field is absent (legacy artifacts).
 | v1.2a | 2026-05-15 | No schema changes. `thresholds.*` still bare booleans |
 | v1.2b | 2026-05-15 | No schema changes. `thresholds.*` still bare booleans |
 | v1.2c | 2026-05-18 | `thresholds.*` → structured object `{status, passed, metric, observed, target, reason?}`. `predictions.jsonl` gains optional `evidence` and `row_index` fields. `compare` output gains `phase1_rules_nr_aware` column. §8 #5 gains SKIP semantics when `gt_stale_count == 0` |
+| v1.2c+ | 2026-05-18 | `predictions.jsonl` gains optional `wall_us` field (microsecond-resolution per-row rule-chain latency). Closes H1 carry-forward from flask findings: flask `wall_ms: 0` was millisecond rounding of 100–900 μs rule-chain work, not a missing write. `wall_ms` contract unchanged. Legacy artifacts (no `wall_us` key) round-trip cleanly as `None` |
