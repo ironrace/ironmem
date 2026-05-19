@@ -15,6 +15,24 @@ impl Repo {
         Ok(Self { inner })
     }
 
+    /// Verify that `commit_sha` resolves to an actual commit in this repo.
+    /// Errors loudly if the sha is malformed OR points at a non-existent
+    /// or non-commit object. Use this at the top of any pipeline that
+    /// reads blobs at `commit_sha` — otherwise `blob_at` would silently
+    /// return `Ok(None)` for every read and produce wrong results without
+    /// any error signal.
+    pub fn verify_commit(&self, commit_sha: &str) -> Result<()> {
+        let oid = ObjectId::from_hex(commit_sha.as_bytes())
+            .with_context(|| format!("commit sha {commit_sha:?} is not a valid hex sha"))?;
+        let obj = self
+            .inner
+            .find_object(oid)
+            .with_context(|| format!("commit {commit_sha} does not exist in this repository"))?;
+        obj.try_into_commit()
+            .with_context(|| format!("object {commit_sha} exists but is not a commit"))?;
+        Ok(())
+    }
+
     pub fn file_exists_at(&self, commit_sha: &str, source_path: &str) -> Result<bool> {
         Ok(self.blob_at(commit_sha, source_path)?.is_some())
     }

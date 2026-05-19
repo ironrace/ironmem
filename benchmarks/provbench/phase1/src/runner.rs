@@ -38,6 +38,12 @@ pub struct RunnerOpts<'a> {
 }
 
 pub fn run(opts: RunnerOpts<'_>) -> Result<RunStats> {
+    // §10 / robustness: fail loudly if T0 doesn't resolve. Without this,
+    // every `t0_blob` read silently returns `Ok(None)` and the rule chain
+    // produces wildly wrong predictions (observed 2026-05-18: a typo'd T0
+    // returned `valid:0 stale:6126 needs_reval:6694` with exit 0).
+    opts.repo.verify_commit(opts.t0)?;
+
     let chain = RuleChain::default();
 
     // Load all facts once.
