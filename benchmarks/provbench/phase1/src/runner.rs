@@ -154,7 +154,9 @@ pub fn run(opts: RunnerOpts<'_>) -> Result<RunStats> {
             commit_files: &commit_files,
         };
         let (decision, rule_id, spec_ref, evidence) = chain.classify_first_match(&ctx);
-        let wall_ms = started.elapsed().as_millis() as u64;
+        let elapsed = started.elapsed();
+        let wall_ms = elapsed.as_millis() as u64;
+        let wall_us = elapsed.as_micros() as u64;
 
         let pred = decision.as_str().to_string();
         let request_id = format!(
@@ -194,6 +196,7 @@ pub fn run(opts: RunnerOpts<'_>) -> Result<RunStats> {
             prediction: pred.clone(),
             request_id: request_id.clone(),
             wall_ms,
+            wall_us: Some(wall_us),
             evidence: evidence_value,
             row_index: Some(row_index as u64),
         };

@@ -20,6 +20,26 @@ pub struct PredictionRow {
     /// `predictions.jsonl` for audit / debugging.
     pub request_id: String,
     pub wall_ms: u64,
+    /// Microsecond-resolution rule-chain latency for a single row.
+    ///
+    /// Added in v1.2c+ to give meaningful latency reporting on sub-millisecond
+    /// Python rule-chain work (flask predictions had `wall_ms: 0` across the
+    /// entire subset because the structural rule chain runs in 100–900 μs per
+    /// row, which rounds to 0 at millisecond granularity).
+    ///
+    /// `wall_ms` retains its SPEC §8 #4 contract (integer milliseconds, used
+    /// for the ≤ 727 ms latency threshold). `wall_us` is purely additive
+    /// precision.
+    ///
+    /// `None` on legacy artifacts (which pre-date this field) and on baseline
+    /// LLM-runner output (where μs precision has no useful interpretation for
+    /// per-batch API round-trips).
+    ///
+    /// `#[serde(default)]` + `skip_serializing_if` keeps legacy v1.2c
+    /// artifacts byte-stable through round-trip: absent key → `None` on
+    /// deserialize; `None` → no key on serialize.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wall_us: Option<u64>,
     /// Optional evidence blob emitted by rule-based runners.
     /// Phase 1 R4 sets `{"rule": "R4", "guard_below_floor": <bool>, ...}`.
     /// Absent on baseline rows and on legacy artifacts — `#[serde(default)]`

@@ -33,6 +33,7 @@ fn row(
         prediction: pred.to_string(),
         request_id: "fixture".to_string(),
         wall_ms,
+        wall_us: None,
         evidence: None,
         row_index: None,
     }

@@ -155,6 +155,7 @@ fn prediction_row_carries_evidence_from_rule_chain() {
         prediction: decision.as_str().into(),
         request_id: "phase1:v1.2c:0000000000000000000000000000000000000000:0".into(),
         wall_ms: 1,
+        wall_us: None,
         evidence: evidence_value,
         row_index: Some(0),
     };
@@ -256,6 +257,19 @@ fn runner_run_writes_rule_evidence_into_predictions_jsonl() {
     assert_eq!(row["prediction"].as_str(), Some("needs_revalidation"));
     assert_eq!(row["evidence"]["rule"].as_str(), Some("R4"));
     assert_eq!(row["evidence"]["guard_below_floor"].as_bool(), Some(true));
+
+    // wall_us must be Some(_) and must be >= wall_ms * 1000 (microseconds can
+    // only be >= the truncated millisecond value scaled up). Allows for the
+    // edge case where wall_ms rounds down: e.g. 1500μs → wall_ms=1, wall_us=1500.
+    let wall_us = row["wall_us"]
+        .as_u64()
+        .expect("runner must emit wall_us as a u64");
+    let wall_ms = row["wall_ms"].as_u64().unwrap_or(0);
+    assert!(
+        wall_us >= wall_ms * 1000,
+        "wall_us ({wall_us}) must be >= wall_ms ({wall_ms}) * 1000 — microseconds \
+         can only be larger than the truncated millisecond value"
+    );
 }
 
 fn git(repo_dir: &Path, args: &[&str]) -> String {
