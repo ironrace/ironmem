@@ -13,5 +13,15 @@ spotcheck/*.PARKED
 work/
 results/**/phase1/phase1.sqlite
 
+# Full-corpus sidecar artifacts (Plan A.2 flask v1.3, 2026-05-19) — too large
+# to track; regeneratable from labeler at bf56f40 + phase1 over the corpus.
+# Baseline is synthetic (placeholder for phase1's --baseline-run loader);
+# its manifest.json/metrics.json are stub files, not real LLM artifacts.
+results/flask-heldout-2026-05-19-fullcorpus/phase1/predictions.jsonl
+results/flask-heldout-2026-05-19-fullcorpus/phase1/rule_traces.jsonl
+results/flask-heldout-2026-05-19-fullcorpus/baseline/predictions.jsonl
+results/flask-heldout-2026-05-19-fullcorpus/baseline/manifest.json
+results/flask-heldout-2026-05-19-fullcorpus/baseline/metrics.json
+
 # Keep the directory itself tracked via .gitkeep
 !.gitkeep

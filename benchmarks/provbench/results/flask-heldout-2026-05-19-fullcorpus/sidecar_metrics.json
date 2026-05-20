@@ -1,0 +1,106 @@
+{
+  "corpus_path": "benchmarks/provbench/corpus/flask-2f0c62f5-bf56f40.jsonl",
+  "labeler_git_sha": "bf56f40999a5b3f026db517b196fa9d3a5724ded",
+  "phase1_git_sha": "bf56f40999a5b3f026db517b196fa9d3a5724ded",
+  "scoring_git_sha": "bf56f40999a5b3f026db517b196fa9d3a5724ded",
+  "rule_set_version": "v1.3",
+  "run_date": "2026-05-19",
+  "n_total": 910530,
+  "phase1_runner_stats": {
+    "processed": 910530,
+    "valid": 398821,
+    "stale": 494313,
+    "needs_reval": 17396,
+    "wall_seconds": 840
+  },
+  "confusion_matrix_3x3": {
+    "Valid": {
+      "valid": 389642,
+      "stale": 345923,
+      "needs_revalidation": 14753
+    },
+    "Stale_*": {
+      "valid": 8579,
+      "stale": 142338,
+      "needs_revalidation": 2643
+    },
+    "NeedsRevalidation": {
+      "valid": 600,
+      "stale": 6052,
+      "needs_revalidation": 0
+    }
+  },
+  "per_class_accuracy": {
+    "valid_retention": {
+      "point": 0.519302482414123,
+      "wilson_lower_95": 0.5181718839269918,
+      "n": 750318
+    },
+    "stale_detection_recall": {
+      "point": 0.9269210731961448,
+      "wilson_lower_95": 0.9256086193379737,
+      "n": 153560
+    },
+    "stale_detection_precision": {
+      "point": 0.2879511564535021,
+      "wilson_lower_95": null,
+      "n_predicted_stale": 494313
+    },
+    "stale_detection_f1": 0.4394009319727786,
+    "needs_revalidation_routing_accuracy": {
+      "point": 0.0,
+      "wilson_lower_95": 0.0,
+      "n": 6652
+    }
+  },
+  "per_stale_subtype_recall": {
+    "StaleSourceChanged": {
+      "point": 0.9532114581111432,
+      "wilson_lower_95": 0.9517233114133928,
+      "n": 79699
+    },
+    "StaleSourceDeleted": {
+      "point": 0.930523829502898,
+      "wilson_lower_95": 0.928533552196634,
+      "n": 64353
+    },
+    "StaleSymbolRenamed": {
+      "point": 0.6821623895666807,
+      "wilson_lower_95": 0.6727309786529191,
+      "n": 9508
+    }
+  },
+  "per_rule_confusion": {
+    "R3": {
+      "Valid__stale": 343284,
+      "Stale_*__stale": 113020,
+      "NeedsRevalidation__stale": 4055,
+      "_total": 460359
+    },
+    "R4": {
+      "Valid__valid": 246882,
+      "Stale_*__stale": 22738,
+      "Stale_*__valid": 8579,
+      "Valid__needs_revalidation": 14753,
+      "Valid__stale": 2639,
+      "NeedsRevalidation__valid": 600,
+      "Stale_*__needs_revalidation": 2643,
+      "NeedsRevalidation__stale": 1997,
+      "_total": 300831
+    },
+    "R2": {
+      "Valid__valid": 142760,
+      "_total": 142760
+    },
+    "R1": {
+      "Stale_*__stale": 6580,
+      "_total": 6580
+    }
+  },
+  "notes": [
+    "Sidecar evaluation against the full Plan A.2 flask corpus (910,530 rows) \u2014 NOT a SPEC \u00a78 verdict.",
+    "Baseline at ../baseline/ is synthetic (request_id='synthetic-fullcorpus'); LLM-baseline columns must be ignored.",
+    "Frozen baseline subset (4k rows; v1.2b reuse) used for \u00a78 verdict in flask-heldout-2026-05-19-canary/ has zero Stale_* GT, so \u00a78 #5 is SKIP there. This sidecar provides the missing evidence on phase1's behavior against real Stale_* rows.",
+    "GT canonicalization: raw labels (Valid, StaleSourceChanged, StaleSourceDeleted, StaleSymbolRenamed, NeedsRevalidation) used verbatim \u2014 phase1's scoring/coalesce already maps each Stale_* subtype into the 'stale' axis."
+  ]
+}
