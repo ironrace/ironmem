@@ -32,7 +32,6 @@ pub enum PythonFactKind {
 #[derive(Debug, Clone)]
 pub struct PythonEntry {
     pub fact_kind: PythonFactKind,
-    #[allow(dead_code)] // read by Task 4's builder; not yet consumed
     pub qualified_name: String,
     pub container: String,
     pub leaf: String,
@@ -56,11 +55,13 @@ pub enum PythonLookup {
     Absent,
 }
 
-/// Per-commit, kind-partitioned set of qualified names present in the tree.
+/// Per-commit, kind-partitioned symbol index present in the tree.
 ///
-/// Only `.rs` blobs are indexed; markdown blobs are not parsed here because
-/// `DocClaim` resolution is byte-range–based and does not benefit from a
-/// tree-wide symbol index.
+/// Rust entries retain the historical path-agnostic qualified-name sets.
+/// Python entries carry `(qualified_name, container, leaf, path)` so
+/// cross-file moves can be routed to `NeedsRevalidation` without guessing.
+/// Markdown blobs are not parsed here because `DocClaim` resolution is
+/// byte-range–based and does not benefit from a tree-wide symbol index.
 pub struct CommitSymbolIndex {
     function_names: HashSet<String>,
     field_names: HashSet<String>,
@@ -73,7 +74,7 @@ pub struct CommitSymbolIndex {
 }
 
 impl CommitSymbolIndex {
-    /// Build the index for `commit_sha` over all `.rs` paths in `rs_paths`.
+    /// Build the index for `commit_sha` over all Rust and Python source paths.
     ///
     /// `cached_blobs` is a map of blobs already read in the same commit
     /// iteration (keyed by repo-relative path).  Paths present in the map
@@ -83,8 +84,8 @@ impl CommitSymbolIndex {
     pub fn build(
         pilot: &Pilot,
         commit_sha: &str,
-        rs_paths: &[PathBuf],
-        py_paths: &[PathBuf],
+        rust_paths: &[PathBuf],
+        python_paths: &[PathBuf],
         cached_blobs: &HashMap<PathBuf, Option<Vec<u8>>>,
     ) -> Result<Self> {
         let mut function_names = HashSet::new();
@@ -92,7 +93,7 @@ impl CommitSymbolIndex {
         let mut symbol_names = HashSet::new();
         let mut test_names = HashSet::new();
 
-        for path in rs_paths {
+        for path in rust_paths {
             // Reuse a cached blob if available; only call read_blob_at when
             // the path was not already fetched for this commit.
             // Borrow cached bytes in-place to avoid cloning when possible.
@@ -137,7 +138,7 @@ impl CommitSymbolIndex {
 
         let mut python_entries: Vec<PythonEntry> = Vec::new();
 
-        for path in py_paths {
+        for path in python_paths {
             let fetched: Option<Vec<u8>>;
             let bytes: &[u8] = match cached_blobs.get(path) {
                 Some(Some(cached)) => cached,
@@ -246,10 +247,9 @@ impl CommitSymbolIndex {
     }
 
     /// SPEC §11 row 2026-05-19 (Plan A.2): path-aware lookup for Python
-    /// rename / move resolution. Returns `PythonLookup::ExactAtOriginalPath`
-    /// if a matching entry exists at `original_path`; otherwise applies
-    /// the path-stripped fallback (matching `(fact_kind, container, leaf)`
-    /// at different paths) and returns Unique / Ambiguous / Absent.
+    /// rename / move resolution. First tries an exact qualified-name match;
+    /// only when that misses does it apply the path-stripped fallback
+    /// matching `(fact_kind, container, leaf)` at any path.
     ///
     /// Callers MUST route both `UniqueFallbackAtPath` and `AmbiguousFallback`
     /// to `Label::NeedsRevalidation` — without body-hash confirmation we
@@ -257,20 +257,29 @@ impl CommitSymbolIndex {
     pub fn lookup_python(
         &self,
         fact_kind: PythonFactKind,
+        qualified_name: &str,
         container: &str,
         leaf: &str,
         original_path: &Path,
     ) -> PythonLookup {
-        // Primary: exact at original path.
-        for entry in &self.python_entries {
-            if entry.fact_kind == fact_kind
-                && entry.path == original_path
-                && entry.container == container
-                && entry.leaf == leaf
-            {
-                return PythonLookup::ExactAtOriginalPath;
-            }
+        // Primary: exact qualified-name match across all Python source paths.
+        let mut exact_paths: Vec<&PathBuf> = self
+            .python_entries
+            .iter()
+            .filter(|e| e.fact_kind == fact_kind && e.qualified_name == qualified_name)
+            .map(|e| &e.path)
+            .collect();
+        exact_paths.sort();
+        exact_paths.dedup();
+        if exact_paths.iter().any(|p| p.as_path() == original_path) {
+            return PythonLookup::ExactAtOriginalPath;
         }
+        match exact_paths.len() {
+            0 => {}
+            1 => return PythonLookup::UniqueFallbackAtPath(exact_paths[0].clone()),
+            _ => return PythonLookup::AmbiguousFallback,
+        }
+
         // Fallback: same (fact_kind, container, leaf) at any path.
         let mut matches: Vec<&PathBuf> = self
             .python_entries
@@ -330,6 +339,7 @@ mod python_lookup_tests {
         };
         let result = idx.lookup_python(
             PythonFactKind::FunctionSignature,
+            "src.a.foo",
             "",
             "foo",
             Path::new("src/a.py"),
@@ -354,6 +364,7 @@ mod python_lookup_tests {
         };
         let result = idx.lookup_python(
             PythonFactKind::FunctionSignature,
+            "src.a.foo",
             "",
             "foo",
             Path::new("src/a.py"),
@@ -387,6 +398,7 @@ mod python_lookup_tests {
         };
         let result = idx.lookup_python(
             PythonFactKind::FunctionSignature,
+            "src.c.foo",
             "",
             "foo",
             Path::new("src/c.py"),
@@ -405,11 +417,50 @@ mod python_lookup_tests {
         };
         let result = idx.lookup_python(
             PythonFactKind::FunctionSignature,
+            "src.a.foo",
             "",
             "foo",
             Path::new("src/a.py"),
         );
         assert!(matches!(result, PythonLookup::Absent));
+    }
+
+    #[test]
+    fn python_lookup_primary_qualified_name_precedes_fallback_collision() {
+        let idx = CommitSymbolIndex {
+            function_names: HashSet::new(),
+            field_names: HashSet::new(),
+            symbol_names: HashSet::new(),
+            test_names: HashSet::new(),
+            python_entries: vec![
+                PythonEntry {
+                    fact_kind: PythonFactKind::FunctionSignature,
+                    qualified_name: "src.a.foo".into(),
+                    container: "".into(),
+                    leaf: "foo".into(),
+                    path: Path::new("src/b.py").to_path_buf(),
+                },
+                PythonEntry {
+                    fact_kind: PythonFactKind::FunctionSignature,
+                    qualified_name: "src.c.foo".into(),
+                    container: "".into(),
+                    leaf: "foo".into(),
+                    path: Path::new("src/c.py").to_path_buf(),
+                },
+            ],
+        };
+        let result = idx.lookup_python(
+            PythonFactKind::FunctionSignature,
+            "src.a.foo",
+            "",
+            "foo",
+            Path::new("src/a.py"),
+        );
+        assert!(
+            matches!(result, PythonLookup::UniqueFallbackAtPath(ref p) if p == Path::new("src/b.py")),
+            "primary exact qualified-name match should win before path-stripped fallback; got {:?}",
+            result
+        );
     }
 
     // ── build() integration tests (Option B: tempdir + git init) ─────────────
@@ -481,7 +532,7 @@ mod python_lookup_tests {
     }
 
     #[test]
-    fn build_populates_python_entries_from_py_paths() {
+    fn build_populates_python_entries_from_python_paths() {
         let py_source = b"def foo():\n    return 1\n";
         let py_path = "src/a.py";
         let (_tmp, pilot, sha) = make_pilot_with_py(py_path, py_source);
@@ -492,8 +543,8 @@ mod python_lookup_tests {
         let idx = CommitSymbolIndex::build(
             &pilot,
             &sha,
-            &[],                         // rs_paths empty
-            std::slice::from_ref(&path), // py_paths
+            &[],                         // rust_paths empty
+            std::slice::from_ref(&path), // python_paths
             &cached,
         )
         .expect("build");

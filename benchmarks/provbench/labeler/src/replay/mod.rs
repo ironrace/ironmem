@@ -107,15 +107,10 @@ struct FnDisambiguator {
 /// Language-aware post-commit AST, cached per (commit, path).
 ///
 /// SPEC §11 row 2026-05-19 (Plan A.2): replaces the Rust-only
-/// `HashMap<PathBuf, Option<RustAst>>` cache. The `Python` variant lands
-/// in Task 2; Task 1 introduces the type so the Rust path can be refactored
-/// without behavioral change.
+/// `HashMap<PathBuf, Option<RustAst>>` cache.
 // TODO: derive Debug when RustAst/PythonAst are Debug
 pub(super) enum PostAst {
     Rust(crate::ast::RustAst),
-    // The inner PythonAst is read by Task 5 (matching_post_fact_python).
-    // Suppress dead_code until that task lands.
-    #[allow(dead_code)]
     Python(crate::ast::python::PythonAst),
 }
 
@@ -368,11 +363,9 @@ impl Replay {
         }
         // Python branch — parallel to the Rust loop above. See `emit_facts`
         // for rationale on the empty disambiguators / skipped `doc_claim`.
-        // Limitation: Python rows are not added to the per-commit
-        // `CommitSymbolIndex` (it is Rust-only via tree-sitter). Python
-        // facts are classified by row-level rules R1-R5 at replay time
-        // without cross-symbol resolution; R7 (rename detection) over
-        // Python is out of scope for v1.2b.
+        // Plan A.2 routes these facts through the language-aware post-AST
+        // cache and `CommitSymbolIndex` so Python gets real changed-file
+        // classification instead of the old NeedsRevalidation short-circuit.
         let python_paths = python_paths_at(&pilot, &cfg.t0_sha)?;
         for path in &python_paths {
             if let Some(blob) = pilot.read_blob_at(&cfg.t0_sha, path)? {
@@ -469,13 +462,13 @@ impl Replay {
             let commit_index: Option<CommitSymbolIndex> = if cfg.skip_symbol_resolution {
                 None
             } else {
-                let commit_rs_paths = rust_paths_at(&pilot, &commit.sha)?;
-                let commit_py_paths = python_paths_at(&pilot, &commit.sha)?;
+                let commit_rust_paths = rust_paths_at(&pilot, &commit.sha)?;
+                let commit_python_paths = python_paths_at(&pilot, &commit.sha)?;
                 Some(CommitSymbolIndex::build(
                     &pilot,
                     &commit.sha,
-                    &commit_rs_paths,
-                    &commit_py_paths,
+                    &commit_rust_paths,
+                    &commit_python_paths,
                     &cached_blobs,
                 )?)
             };
@@ -939,11 +932,9 @@ fn classify_against_commit(
     t0_qualified_names: &HashSet<String>,
     commit_sha: &str,
 ) -> Result<Label> {
-    // Task 10 (Plan A.2): dispatch by language. The Rust arm carries the
-    // original `classify_against_commit` body verbatim (lifted into
-    // `classify_rust_against_commit`). The Python arm uses the Tasks 5-9
-    // pieces and currently has no live caller (the Python short-circuit at
-    // the call site fires first; Task 11 removes it).
+    // Plan A.2: dispatch by language. If parsing failed and `post_ast` is
+    // `None`, fall back to the file extension so Python paths still use the
+    // Python classifier with a missing AST instead of the Rust classifier.
     match post_ast {
         Some(PostAst::Rust(ast)) => classify_rust_against_commit(
             fact,
@@ -969,19 +960,32 @@ fn classify_against_commit(
             commit_index,
             t0_qualified_names,
         ),
-        None => classify_rust_against_commit(
-            fact,
-            path,
-            post_blob,
-            None,
-            t0_span_bytes,
-            test_assertion_ordinal,
-            function_signature_disambiguator,
-            cfg,
-            commit_index,
-            t0_qualified_names,
-            commit_sha,
-        ),
+        None => match crate::lang::Language::for_path(path) {
+            Some(crate::lang::Language::Python) => classify_python_against_commit(
+                fact,
+                path,
+                post_blob,
+                None,
+                t0_span_bytes,
+                test_assertion_ordinal,
+                cfg,
+                commit_index,
+                t0_qualified_names,
+            ),
+            Some(crate::lang::Language::Rust) | None => classify_rust_against_commit(
+                fact,
+                path,
+                post_blob,
+                None,
+                t0_span_bytes,
+                test_assertion_ordinal,
+                function_signature_disambiguator,
+                cfg,
+                commit_index,
+                t0_qualified_names,
+                commit_sha,
+            ),
+        },
     }
 }
 
@@ -1158,10 +1162,6 @@ fn classify_rust_against_commit(
 /// but uses `matching_post_fact_python`, `rename_candidates_for_python_typed`,
 /// and `CommitSymbolIndex::lookup_python`.
 ///
-/// SPEC §11 row 2026-05-19 (Plan A.2). Currently never reached: the Python
-/// short-circuit at the call site routes every Python fact to
-/// `Label::NeedsRevalidation` first. Task 11 removes the short-circuit.
-///
 /// Differences from the Rust arm:
 /// - `function_signature_disambiguator` and `commit_sha` are not threaded —
 ///   Python `matching_post_fact_python` has neither parameter.
@@ -1174,7 +1174,6 @@ fn classify_rust_against_commit(
 ///   and `AmbiguousFallback` both route to `NeedsRevalidation` per the
 ///   lookup's documented contract.
 #[allow(clippy::too_many_arguments)]
-#[allow(dead_code)] // Task 11 removes the short-circuit and wires the caller.
 fn classify_python_against_commit(
     fact: &Fact,
     path: &Path,
@@ -1254,7 +1253,13 @@ fn classify_python_against_commit(
                                 },
                             ));
                         };
-                        match index.lookup_python(kind, &container, &leaf, path) {
+                        match index.lookup_python(
+                            kind,
+                            qualified_key_for(fact),
+                            &container,
+                            &leaf,
+                            path,
+                        ) {
                             // Defensive: matching_post_fact_python returned None,
                             // so the symbol shouldn't be exact-at-original. Route
                             // to NeedsRevalidation rather than panic if the two

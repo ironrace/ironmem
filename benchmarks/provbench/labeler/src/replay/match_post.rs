@@ -326,8 +326,6 @@ pub(super) fn rename_candidates_for_typed(
 ///
 /// SPEC §11 row 2026-05-19 (Plan A.2). `PublicSymbol` respects the
 /// single-underscore filter (private names excluded from rename detection).
-// No caller exists until Task 10; suppress dead_code in the interim.
-#[allow(dead_code)]
 pub(super) fn rename_candidates_for_python(
     fact: &Fact,
     path: &Path,
@@ -394,8 +392,6 @@ pub(super) fn rename_candidates_for_python(
 /// [`crate::diff::RenameCandidate::new_python`], whose `container` and
 /// `leaf_name` are derived from Python dotted-name semantics (splitting on
 /// `.` after stripping the module-path prefix from `path`).
-// No caller exists until Task 10; suppress dead_code in the interim.
-#[allow(dead_code)]
 pub(super) fn rename_candidates_for_python_typed(
     fact: &Fact,
     path: &Path,
@@ -412,11 +408,8 @@ pub(super) fn rename_candidates_for_python_typed(
 ///
 /// SPEC §11 row 2026-05-19 (Plan A.2). Mirrors the Rust contract where
 /// applicable but uses `PythonAst` and `facts::python::*` extractors.
-/// PublicSymbol (Task 6), TestAssertion (Task 7), DocClaim (Task 8 stub)
-/// arms land in subsequent tasks.
-// Tasks 6-8 will wire callers from the Python replay path; suppress dead_code
-// until the call site lands.
-#[allow(dead_code)]
+/// `DocClaim` intentionally stays a stub until Python doc-claim semantics
+/// are designed.
 pub(super) fn matching_post_fact_python(
     fact: &Fact,
     path: &Path,
