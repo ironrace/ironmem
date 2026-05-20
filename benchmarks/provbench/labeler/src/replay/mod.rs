@@ -959,6 +959,7 @@ fn classify_against_commit(
             cfg,
             commit_index,
             t0_qualified_names,
+            commit_sha,
         ),
         None => match crate::lang::Language::for_path(path) {
             Some(crate::lang::Language::Python) => classify_python_against_commit(
@@ -971,6 +972,7 @@ fn classify_against_commit(
                 cfg,
                 commit_index,
                 t0_qualified_names,
+                commit_sha,
             ),
             Some(crate::lang::Language::Rust) | None => classify_rust_against_commit(
                 fact,
@@ -1184,6 +1186,7 @@ fn classify_python_against_commit(
     cfg: &ReplayConfig,
     commit_index: Option<&CommitSymbolIndex>,
     t0_qualified_names: &HashSet<String>,
+    _commit_sha: &str, // reserved for v1.4 Python DocClaim implementation
 ) -> Result<Label> {
     let state = match post_blob {
         // File was deleted at this commit.
@@ -1260,13 +1263,45 @@ fn classify_python_against_commit(
                             &leaf,
                             path,
                         ) {
-                            // Defensive: matching_post_fact_python returned None,
-                            // so the symbol shouldn't be exact-at-original. Route
-                            // to NeedsRevalidation rather than panic if the two
-                            // disagree (extractor / index drift hatch).
-                            PythonLookup::ExactAtOriginalPath
-                            | PythonLookup::UniqueFallbackAtPath(_)
-                            | PythonLookup::AmbiguousFallback => CommitState {
+                            // Extractor/index drift hatch: matching_post_fact_python
+                            // returned None (symbol not found at original path), but
+                            // lookup_python says ExactAtOriginalPath. In a correct
+                            // build these two cannot disagree; assert so the gap
+                            // surfaces loudly in debug builds. Release: fall through
+                            // to NeedsRevalidation defensively.
+                            PythonLookup::ExactAtOriginalPath => {
+                                debug_assert!(
+                                    false,
+                                    "extractor/index drift: matching_post_fact_python returned \
+                                     None but lookup_python returned ExactAtOriginalPath for \
+                                     path={:?}",
+                                    path
+                                );
+                                CommitState {
+                                    file_exists: true,
+                                    post_span_hash: None,
+                                    structurally_classifiable: false,
+                                    whitespace_or_comment_only: false,
+                                    symbol_resolves: true,
+                                    rename: None,
+                                }
+                            }
+                            PythonLookup::UniqueFallbackAtPath(ref new_path) => {
+                                tracing::debug!(
+                                    original_path = ?path,
+                                    cross_file_move_candidate = ?new_path,
+                                    "cross-file move candidate detected: routing to NeedsRevalidation"
+                                );
+                                CommitState {
+                                    file_exists: true,
+                                    post_span_hash: None,
+                                    structurally_classifiable: false,
+                                    whitespace_or_comment_only: false,
+                                    symbol_resolves: true,
+                                    rename: None,
+                                }
+                            }
+                            PythonLookup::AmbiguousFallback => CommitState {
                                 file_exists: true,
                                 post_span_hash: None,
                                 structurally_classifiable: false,
@@ -1334,41 +1369,27 @@ fn classify_python_against_commit(
 /// Split a Python fact into `(PythonFactKind, container, leaf)` for
 /// `CommitSymbolIndex::lookup_python` and `RenameOrigin` construction.
 ///
-/// Mirrors the private `split_python_qualified_name` in `commit_index.rs`
-/// (which feeds the index's container/leaf fields), so the lookup keys line
-/// up byte-stable. `DocClaim` returns `None` for kind — the caller routes
-/// it before lookup. Module-level symbols (no container) use `""` for
-/// container, matching how `python_entries` is populated.
+/// Delegates to the canonical `commit_index::split_python_qualified_name`
+/// so the lookup keys are byte-stable with how `python_entries` is populated.
+/// `DocClaim` returns `None` for kind — the caller routes it before lookup.
+/// Module-level symbols (no container) use `""` for container, matching how
+/// `python_entries` is populated.
 fn python_fact_kind_container_leaf(
     fact: &Fact,
     path: &Path,
 ) -> (Option<PythonFactKind>, String, String) {
-    fn split(qualified_name: &str, path: &Path) -> (String, String) {
-        let path_str = path.to_string_lossy();
-        let module_path = path_str
-            .strip_suffix(".py")
-            .unwrap_or(&path_str)
-            .replace('/', ".");
-        let stripped = qualified_name
-            .strip_prefix(&format!("{}.", module_path))
-            .unwrap_or(qualified_name);
-        if let Some(idx) = stripped.rfind('.') {
-            (stripped[..idx].to_string(), stripped[idx + 1..].to_string())
-        } else {
-            (String::new(), stripped.to_string())
-        }
-    }
+    use commit_index::split_python_qualified_name;
     match fact {
         Fact::FunctionSignature { qualified_name, .. } => {
-            let (c, l) = split(qualified_name, path);
+            let (c, l) = split_python_qualified_name(qualified_name, path);
             (Some(PythonFactKind::FunctionSignature), c, l)
         }
         Fact::Field { qualified_path, .. } => {
-            let (c, l) = split(qualified_path, path);
+            let (c, l) = split_python_qualified_name(qualified_path, path);
             (Some(PythonFactKind::Field), c, l)
         }
         Fact::PublicSymbol { qualified_name, .. } => {
-            let (c, l) = split(qualified_name, path);
+            let (c, l) = split_python_qualified_name(qualified_name, path);
             (Some(PythonFactKind::PublicSymbol), c, l)
         }
         Fact::TestAssertion { test_fn, .. } => (

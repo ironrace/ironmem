@@ -70,7 +70,7 @@ pub struct CommitSymbolIndex {
     /// Python-specific entries, keyed by (fact_kind, container, leaf, path).
     /// Populated by Task 4's builder; defaults to empty so existing Rust
     /// behavior is byte-stable.
-    pub python_entries: Vec<PythonEntry>,
+    python_entries: Vec<PythonEntry>,
 }
 
 impl CommitSymbolIndex {
@@ -216,6 +216,28 @@ impl CommitSymbolIndex {
         })
     }
 
+    /// Test-only constructor: build a `CommitSymbolIndex` with empty Rust
+    /// symbol sets and the provided `python_entries`. Avoids exposing the
+    /// private `python_entries` field in test code.
+    #[cfg(test)]
+    pub fn with_python_entries_for_test(entries: Vec<PythonEntry>) -> Self {
+        Self {
+            function_names: HashSet::new(),
+            field_names: HashSet::new(),
+            symbol_names: HashSet::new(),
+            test_names: HashSet::new(),
+            python_entries: entries,
+        }
+    }
+
+    /// Test-only iterator over `python_entries`. Avoids exposing the field
+    /// as `pub` while still letting integration tests in this module inspect
+    /// what `build` populated.
+    #[cfg(test)]
+    pub fn iter_python_entries(&self) -> impl Iterator<Item = &PythonEntry> {
+        self.python_entries.iter()
+    }
+
     /// Returns `true` if a same-kind, same-qualified Rust symbol exists
     /// anywhere in this commit's `.rs` tree (including at the fact's
     /// original source path).
@@ -280,11 +302,20 @@ impl CommitSymbolIndex {
             _ => return PythonLookup::AmbiguousFallback,
         }
 
-        // Fallback: same (fact_kind, container, leaf) at any path.
+        // Fallback: same (fact_kind, container, leaf) at a DIFFERENT path.
+        // Exclude `original_path` so that an in-file container rename
+        // (e.g. `src.a.Foo.method` → `src.a.Bar.method`) does not produce
+        // `UniqueFallbackAtPath(original_path)` — that would mislead the
+        // caller into treating an in-file rename as a cross-file move.
         let mut matches: Vec<&PathBuf> = self
             .python_entries
             .iter()
-            .filter(|e| e.fact_kind == fact_kind && e.container == container && e.leaf == leaf)
+            .filter(|e| {
+                e.fact_kind == fact_kind
+                    && e.container == container
+                    && e.leaf == leaf
+                    && e.path.as_path() != original_path
+            })
             .map(|e| &e.path)
             .collect();
         matches.sort();
@@ -301,7 +332,12 @@ impl CommitSymbolIndex {
 /// module-path prefix derived from `path`. For `src.a.Greeter.greet` at
 /// `src/a.py`, returns (`"Greeter"`, `"greet"`). For module-level
 /// `src.a.foo` at `src/a.py`, returns (`""`, `"foo"`).
-fn split_python_qualified_name(qualified_name: &str, path: &Path) -> (String, String) {
+///
+/// This is the canonical implementation shared by `commit_index` (index
+/// population), `replay/mod.rs` (`python_fact_kind_container_leaf`), and
+/// `diff/mod.rs` (`RenameCandidate::new_python`). All three must use
+/// identical logic so lookup keys are byte-stable.
+pub(crate) fn split_python_qualified_name(qualified_name: &str, path: &Path) -> (String, String) {
     let path_str = path.to_string_lossy();
     let module_path = path_str
         .strip_suffix(".py")
@@ -324,19 +360,13 @@ mod python_lookup_tests {
 
     #[test]
     fn python_lookup_exact_at_original_path() {
-        let idx = CommitSymbolIndex {
-            function_names: HashSet::new(),
-            field_names: HashSet::new(),
-            symbol_names: HashSet::new(),
-            test_names: HashSet::new(),
-            python_entries: vec![PythonEntry {
-                fact_kind: PythonFactKind::FunctionSignature,
-                qualified_name: "src.a.foo".into(),
-                container: "".into(),
-                leaf: "foo".into(),
-                path: Path::new("src/a.py").to_path_buf(),
-            }],
-        };
+        let idx = CommitSymbolIndex::with_python_entries_for_test(vec![PythonEntry {
+            fact_kind: PythonFactKind::FunctionSignature,
+            qualified_name: "src.a.foo".into(),
+            container: "".into(),
+            leaf: "foo".into(),
+            path: Path::new("src/a.py").to_path_buf(),
+        }]);
         let result = idx.lookup_python(
             PythonFactKind::FunctionSignature,
             "src.a.foo",
@@ -349,19 +379,13 @@ mod python_lookup_tests {
 
     #[test]
     fn python_lookup_unique_fallback_at_path() {
-        let idx = CommitSymbolIndex {
-            function_names: HashSet::new(),
-            field_names: HashSet::new(),
-            symbol_names: HashSet::new(),
-            test_names: HashSet::new(),
-            python_entries: vec![PythonEntry {
-                fact_kind: PythonFactKind::FunctionSignature,
-                qualified_name: "src.b.foo".into(),
-                container: "".into(),
-                leaf: "foo".into(),
-                path: Path::new("src/b.py").to_path_buf(),
-            }],
-        };
+        let idx = CommitSymbolIndex::with_python_entries_for_test(vec![PythonEntry {
+            fact_kind: PythonFactKind::FunctionSignature,
+            qualified_name: "src.b.foo".into(),
+            container: "".into(),
+            leaf: "foo".into(),
+            path: Path::new("src/b.py").to_path_buf(),
+        }]);
         let result = idx.lookup_python(
             PythonFactKind::FunctionSignature,
             "src.a.foo",
@@ -374,28 +398,22 @@ mod python_lookup_tests {
 
     #[test]
     fn python_lookup_ambiguous_fallback() {
-        let idx = CommitSymbolIndex {
-            function_names: HashSet::new(),
-            field_names: HashSet::new(),
-            symbol_names: HashSet::new(),
-            test_names: HashSet::new(),
-            python_entries: vec![
-                PythonEntry {
-                    fact_kind: PythonFactKind::FunctionSignature,
-                    qualified_name: "src.a.foo".into(),
-                    container: "".into(),
-                    leaf: "foo".into(),
-                    path: Path::new("src/a.py").to_path_buf(),
-                },
-                PythonEntry {
-                    fact_kind: PythonFactKind::FunctionSignature,
-                    qualified_name: "src.b.foo".into(),
-                    container: "".into(),
-                    leaf: "foo".into(),
-                    path: Path::new("src/b.py").to_path_buf(),
-                },
-            ],
-        };
+        let idx = CommitSymbolIndex::with_python_entries_for_test(vec![
+            PythonEntry {
+                fact_kind: PythonFactKind::FunctionSignature,
+                qualified_name: "src.a.foo".into(),
+                container: "".into(),
+                leaf: "foo".into(),
+                path: Path::new("src/a.py").to_path_buf(),
+            },
+            PythonEntry {
+                fact_kind: PythonFactKind::FunctionSignature,
+                qualified_name: "src.b.foo".into(),
+                container: "".into(),
+                leaf: "foo".into(),
+                path: Path::new("src/b.py").to_path_buf(),
+            },
+        ]);
         let result = idx.lookup_python(
             PythonFactKind::FunctionSignature,
             "src.c.foo",
@@ -408,13 +426,7 @@ mod python_lookup_tests {
 
     #[test]
     fn python_lookup_absent() {
-        let idx = CommitSymbolIndex {
-            function_names: HashSet::new(),
-            field_names: HashSet::new(),
-            symbol_names: HashSet::new(),
-            test_names: HashSet::new(),
-            python_entries: Vec::new(),
-        };
+        let idx = CommitSymbolIndex::with_python_entries_for_test(vec![]);
         let result = idx.lookup_python(
             PythonFactKind::FunctionSignature,
             "src.a.foo",
@@ -427,28 +439,22 @@ mod python_lookup_tests {
 
     #[test]
     fn python_lookup_primary_qualified_name_precedes_fallback_collision() {
-        let idx = CommitSymbolIndex {
-            function_names: HashSet::new(),
-            field_names: HashSet::new(),
-            symbol_names: HashSet::new(),
-            test_names: HashSet::new(),
-            python_entries: vec![
-                PythonEntry {
-                    fact_kind: PythonFactKind::FunctionSignature,
-                    qualified_name: "src.a.foo".into(),
-                    container: "".into(),
-                    leaf: "foo".into(),
-                    path: Path::new("src/b.py").to_path_buf(),
-                },
-                PythonEntry {
-                    fact_kind: PythonFactKind::FunctionSignature,
-                    qualified_name: "src.c.foo".into(),
-                    container: "".into(),
-                    leaf: "foo".into(),
-                    path: Path::new("src/c.py").to_path_buf(),
-                },
-            ],
-        };
+        let idx = CommitSymbolIndex::with_python_entries_for_test(vec![
+            PythonEntry {
+                fact_kind: PythonFactKind::FunctionSignature,
+                qualified_name: "src.a.foo".into(),
+                container: "".into(),
+                leaf: "foo".into(),
+                path: Path::new("src/b.py").to_path_buf(),
+            },
+            PythonEntry {
+                fact_kind: PythonFactKind::FunctionSignature,
+                qualified_name: "src.c.foo".into(),
+                container: "".into(),
+                leaf: "foo".into(),
+                path: Path::new("src/c.py").to_path_buf(),
+            },
+        ]);
         let result = idx.lookup_python(
             PythonFactKind::FunctionSignature,
             "src.a.foo",
@@ -459,6 +465,78 @@ mod python_lookup_tests {
         assert!(
             matches!(result, PythonLookup::UniqueFallbackAtPath(ref p) if p == Path::new("src/b.py")),
             "primary exact qualified-name match should win before path-stripped fallback; got {:?}",
+            result
+        );
+    }
+
+    /// Fix 4: in-file container rename must resolve to Absent, not
+    /// UniqueFallbackAtPath(original_path).
+    ///
+    /// Before the fix, the fallback matched `(kind, "Foo", "method")` at
+    /// `src/a.py` — the original path — and returned
+    /// `UniqueFallbackAtPath(PathBuf::from("src/a.py"))`. The caller would
+    /// route that to NeedsRevalidation with misleading "cross-file move"
+    /// semantics. After the fix, original_path is excluded from the fallback
+    /// match set so the result is `Absent`, correctly falling through to
+    /// within-file rename detection.
+    #[test]
+    fn python_lookup_in_file_container_rename_routes_absent() {
+        // Index has `src.a.Bar.method` at src/a.py (post-rename state).
+        // Fact asks for `src.a.Foo.method` at src/a.py (pre-rename).
+        // Primary: no entry with qualified_name "src.a.Foo.method" → miss.
+        // Fallback: (FunctionSignature, "Foo", "method") — no match because
+        //   the only entry has container "Bar". Result: Absent.
+        let idx = CommitSymbolIndex::with_python_entries_for_test(vec![PythonEntry {
+            fact_kind: PythonFactKind::FunctionSignature,
+            qualified_name: "src.a.Bar.method".into(),
+            container: "Bar".into(),
+            leaf: "method".into(),
+            path: Path::new("src/a.py").to_path_buf(),
+        }]);
+        let result = idx.lookup_python(
+            PythonFactKind::FunctionSignature,
+            "src.a.Foo.method",
+            "Foo",
+            "method",
+            Path::new("src/a.py"),
+        );
+        assert!(
+            matches!(result, PythonLookup::Absent),
+            "in-file container rename should resolve to Absent; got {:?}",
+            result
+        );
+    }
+
+    /// Fix 4 variant: same leaf at same file must not produce
+    /// UniqueFallbackAtPath(original_path) when qualified_name differs.
+    #[test]
+    fn python_lookup_same_file_fallback_excluded() {
+        // Index has `src.a.helper` at src/a.py (module-level).
+        // Fact was `src.a.util` at src/a.py — same leaf "helper" is not
+        // there; leaf is different too. But if leaf matched (e.g. same leaf,
+        // different container at the SAME path), it must return Absent not
+        // UniqueFallbackAtPath(original_path).
+        let idx = CommitSymbolIndex::with_python_entries_for_test(vec![PythonEntry {
+            fact_kind: PythonFactKind::FunctionSignature,
+            qualified_name: "src.a.foo".into(),
+            container: "".into(),
+            leaf: "foo".into(),
+            path: Path::new("src/a.py").to_path_buf(),
+        }]);
+        // Ask for ("", "foo") at src/a.py — primary misses (qualified_name
+        // is "src.b.foo" which is not in the index). Fallback matches
+        // (kind, "", "foo") but only at src/a.py which is original_path →
+        // excluded → Absent.
+        let result = idx.lookup_python(
+            PythonFactKind::FunctionSignature,
+            "src.b.foo",
+            "",
+            "foo",
+            Path::new("src/a.py"),
+        );
+        assert!(
+            matches!(result, PythonLookup::Absent),
+            "fallback at original_path must be excluded; got {:?}",
             result
         );
     }
@@ -550,8 +628,7 @@ mod python_lookup_tests {
         .expect("build");
 
         let py_foos: Vec<_> = idx
-            .python_entries
-            .iter()
+            .iter_python_entries()
             .filter(|e| e.fact_kind == PythonFactKind::FunctionSignature && e.leaf == "foo")
             .collect();
         assert_eq!(
@@ -575,8 +652,7 @@ mod python_lookup_tests {
         let idx = CommitSymbolIndex::build(&pilot, &sha, &[], &[path], &cached).expect("build");
 
         let underscored: Vec<_> = idx
-            .python_entries
-            .iter()
+            .iter_python_entries()
             .filter(|e| e.fact_kind == PythonFactKind::PublicSymbol && e.leaf.starts_with('_'))
             .collect();
         assert!(

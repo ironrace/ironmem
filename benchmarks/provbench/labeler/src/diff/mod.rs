@@ -3,6 +3,7 @@
 //! sides with tree-sitter, drops trivia, and compares the residual.
 
 use crate::lang::Language;
+use crate::replay::commit_index::split_python_qualified_name;
 use std::collections::HashSet;
 use tree_sitter::{Node, Parser, Tree};
 
@@ -251,23 +252,16 @@ impl RenameCandidate {
     ///
     /// Do NOT use `RenameCandidate::new` for Python — that splits on
     /// `::` and dotted Python names produce wrong containers.
+    ///
+    /// Delegates to the canonical `split_python_qualified_name` from
+    /// `commit_index` so the logic is byte-stable with the index population
+    /// and `python_fact_kind_container_leaf` in `replay/mod.rs`.
     pub fn new_python(qualified_name: String, span: Vec<u8>, path: &std::path::Path) -> Self {
-        let path_str = path.to_string_lossy();
-        let module_path = path_str
-            .strip_suffix(".py")
-            .unwrap_or(&path_str)
-            .replace('/', ".");
-        let stripped = qualified_name
-            .strip_prefix(&format!("{}.", module_path))
-            .unwrap_or(&qualified_name)
-            .to_string();
-        let (container, leaf_name) = if let Some(idx) = stripped.rfind('.') {
-            (
-                Some(stripped[..idx].to_string()),
-                stripped[idx + 1..].to_string(),
-            )
+        let (container_str, leaf_name) = split_python_qualified_name(&qualified_name, path);
+        let container = if container_str.is_empty() {
+            None
         } else {
-            (None, stripped.clone())
+            Some(container_str)
         };
         Self {
             qualified_name,
