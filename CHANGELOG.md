@@ -7,6 +7,47 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **ProvBench Plan A.2 — Python post-commit classification pipeline
+  (2026-05-19, SPEC §11 row 2026-05-19).** Full per-commit Python
+  classification replaces the Plan A.1 short-circuit that routed every
+  changed Python file directly to `NeedsRevalidation`. Key changes:
+
+  - **`is_python_path` short-circuit removed.** The Plan A.1 guard that
+    bypassed per-fact matching for all Python-path facts is gone. Python
+    facts now flow through the full replay loop.
+
+  - **`classify_python_against_commit` dispatch.** `replay::classify_commit`
+    detects `PostAst::Python(_)` and routes to a dedicated Python
+    classification function rather than the Rust path.
+
+  - **`matching_post_fact_python` — 5-arm matcher:**
+    - `FunctionSignature` — body-hash compare + cross-file move via
+      `lookup_python` 4-variant fallback.
+    - `Field` — exact `qualified_path` lookup; absent → `NeedsRevalidation`.
+    - `PublicSymbol` — `CommitSymbolIndex::lookup_python` with
+      single-underscore-leaf filter (`_foo` does NOT match a public `foo`).
+    - `TestAssertion` — ordinal end-to-end via `push_test_assertion_facts`;
+      same ordinal pairing semantics as the Rust path.
+    - `DocClaim` — stub, returns `None` (Python DocClaim is v1.4+ work).
+
+  - **`PublicSymbol` single-underscore-leaf filter.** Applied symmetrically
+    in `CommitSymbolIndex` index building (Python entries) and in
+    `matching_post_fact_python` matching.
+
+  - **`lookup_python` 4-variant fallback routing.**
+    `ExactAtOriginalPath` → `UniqueFallbackAtPath` → `AmbiguousFallback`
+    → `Absent`. Unique-but-no-body-hash cases route to `NeedsRevalidation`
+    (not `Stale_Symbol_Renamed`).
+
+  - **`RenameCandidate::new_python`** uses `.` splitting for
+    qualified-name decomposition (not Rust's `::` splitter).
+
+  - **Flask H3 (R3 dominance) closeable at the labeler layer.** The v1.2b
+    held-out findings' H3 finding is now closeable; held-out re-run to
+    confirm is the follow-up PR.
+
 ## [0.2.1] - 2026-05-17
 
 ### Changed
