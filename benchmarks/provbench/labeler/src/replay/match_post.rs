@@ -397,8 +397,13 @@ pub(super) fn matching_post_fact_python(
                 })
                 .nth(ordinal)
         }
-        // Stub for Task 8.
-        Fact::DocClaim { .. } => None,
+        Fact::DocClaim { .. } => {
+            // SPEC §11 row 2026-05-19 (Plan A.2): Python DocClaim semantics
+            // are out of scope. The Python facts::python::doc_claim extractor
+            // is a stub today. DocClaim facts on Python paths route through
+            // upstream as NeedsRevalidation. Revisit in v1.4+.
+            None
+        }
     }
 }
 
@@ -544,6 +549,34 @@ mod python_match_tests {
         assert!(
             result_oob.is_none(),
             "expected None for out-of-range ordinal=5"
+        );
+    }
+
+    #[test]
+    fn python_doc_claim_returns_none_per_design() {
+        let src = b"# README\nSome text\n";
+        let ast = PythonAst::parse(src).unwrap();
+        let path = Path::new("README.md");
+        let fact = Fact::DocClaim {
+            qualified_name: "src.a.foo".into(),
+            doc_path: path.to_path_buf(),
+            mention_span: crate::ast::spans::Span {
+                byte_range: 0..10,
+                line_start: 1,
+                line_end: 1,
+            },
+            mention_hash: "h".into(),
+            defining_span: crate::ast::spans::Span {
+                byte_range: 0..10,
+                line_start: 1,
+                line_end: 1,
+            },
+            defining_hash: "h2".into(),
+        };
+        let result = matching_post_fact_python(&fact, path, src, Some(&ast), None);
+        assert!(
+            result.is_none(),
+            "DocClaim Python arm returns None per design"
         );
     }
 }
