@@ -43,6 +43,7 @@ async fn resume_skips_already_scored_rows_and_verifies_hash() {
         fixture_mode: None,
         max_batches: None,
         max_concurrency: 1,
+        max_input_tokens_per_minute: 0,
         client_override: None,
     })
     .await
@@ -76,6 +77,7 @@ async fn resume_skips_already_scored_rows_and_verifies_hash() {
         fixture_mode: None,
         max_batches: None,
         max_concurrency: 1,
+        max_input_tokens_per_minute: 0,
         client_override: None,
     })
     .await
@@ -108,6 +110,7 @@ async fn resume_skips_already_scored_rows_and_verifies_hash() {
         fixture_mode: None,
         max_batches: None,
         max_concurrency: 1,
+        max_input_tokens_per_minute: 0,
         client_override: None,
     })
     .await;

@@ -19,3 +19,4 @@ pub mod prompt;
 pub mod report;
 pub mod runner;
 pub mod sample;
+pub mod throttle;

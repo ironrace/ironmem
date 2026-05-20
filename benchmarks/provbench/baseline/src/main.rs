@@ -102,6 +102,13 @@ struct RunArgs {
     /// Must remain ≤ the immutable SPEC §6.2 / §15 ceiling.
     #[arg(long, name = "budget-usd", default_value_t = provbench_baseline::constants::DEFAULT_OPERATIONAL_BUDGET_USD)]
     budget_usd: f64,
+    /// Sliding-window input-tokens-per-minute throttle. `0` disables
+    /// the throttle entirely. Default is well under Anthropic's 450k
+    /// ITPM org-cap on `claude-sonnet-4-6` to leave headroom for the
+    /// parse-retry doublings. Robustness knob only — does not touch
+    /// the §10 frozen surface.
+    #[arg(long, default_value_t = provbench_baseline::constants::DEFAULT_MAX_INPUT_TOKENS_PER_MINUTE)]
+    max_input_tokens_per_minute: usize,
 }
 
 #[derive(Debug, clap::Args)]
@@ -165,6 +172,7 @@ fn main() -> Result<()> {
                     fixture_mode: args.fixture_mode,
                     max_batches: args.max_batches,
                     max_concurrency: args.max_concurrency,
+                    max_input_tokens_per_minute: args.max_input_tokens_per_minute,
                     client_override: None,
                 }),
             )?;
