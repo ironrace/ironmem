@@ -242,6 +242,40 @@ impl RenameCandidate {
             qualified_name,
         }
     }
+
+    /// SPEC §11 row 2026-05-19 (Plan A.2): Python-aware constructor.
+    /// Strips the module-path prefix derived from `path` (e.g.
+    /// `src.a.Greeter.greet` at `src/a.py` → container `Some("Greeter")`,
+    /// leaf `"greet"`). Splits remaining dotted segments at the last `.`.
+    /// Module-level symbols with no class prefix produce `container: None`.
+    ///
+    /// Do NOT use `RenameCandidate::new` for Python — that splits on
+    /// `::` and dotted Python names produce wrong containers.
+    pub fn new_python(qualified_name: String, span: Vec<u8>, path: &std::path::Path) -> Self {
+        let path_str = path.to_string_lossy();
+        let module_path = path_str
+            .strip_suffix(".py")
+            .unwrap_or(&path_str)
+            .replace('/', ".");
+        let stripped = qualified_name
+            .strip_prefix(&format!("{}.", module_path))
+            .unwrap_or(&qualified_name)
+            .to_string();
+        let (container, leaf_name) = if let Some(idx) = stripped.rfind('.') {
+            (
+                Some(stripped[..idx].to_string()),
+                stripped[idx + 1..].to_string(),
+            )
+        } else {
+            (None, stripped.clone())
+        };
+        Self {
+            qualified_name,
+            span,
+            container,
+            leaf_name,
+        }
+    }
 }
 
 /// The T₀ fact that is being matched against rename candidates.

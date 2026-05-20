@@ -4,6 +4,7 @@ use provbench_labeler::diff::{
 };
 use provbench_labeler::lang::Language;
 use std::collections::HashSet;
+use std::path::Path;
 
 #[test]
 fn pure_whitespace_diff_is_ignored() {
@@ -447,4 +448,28 @@ fn typed_genuine_same_container_rename_is_detected() {
          but rename_candidate_typed returned {:?}",
         result
     );
+}
+
+// ── RenameCandidate::new_python tests ────────────────────────────────────────
+
+#[test]
+fn rename_candidate_new_python_strips_module_path() {
+    let candidate = RenameCandidate::new_python(
+        "src.a.Greeter.greet".into(),
+        b"def greet(self): pass".to_vec(),
+        Path::new("src/a.py"),
+    );
+    assert_eq!(candidate.container, Some("Greeter".to_string()));
+    assert_eq!(candidate.leaf_name, "greet");
+}
+
+#[test]
+fn rename_candidate_new_python_module_level() {
+    let candidate = RenameCandidate::new_python(
+        "src.a.foo".into(),
+        b"def foo(): pass".to_vec(),
+        Path::new("src/a.py"),
+    );
+    assert_eq!(candidate.container, None);
+    assert_eq!(candidate.leaf_name, "foo");
 }

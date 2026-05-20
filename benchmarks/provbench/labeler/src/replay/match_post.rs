@@ -321,6 +321,93 @@ pub(super) fn rename_candidates_for_typed(
         .collect()
 }
 
+/// Python equivalent of [`rename_candidates_for`]. Returns `(qualified_name,
+/// span_bytes)` pairs for same-kind facts in the post-commit Python AST.
+///
+/// SPEC §11 row 2026-05-19 (Plan A.2). `PublicSymbol` respects the
+/// single-underscore filter (private names excluded from rename detection).
+// No caller exists until Task 10; suppress dead_code in the interim.
+#[allow(dead_code)]
+pub(super) fn rename_candidates_for_python(
+    fact: &Fact,
+    path: &Path,
+    post_bytes: &[u8],
+    post_ast: Option<&crate::ast::python::PythonAst>,
+) -> Vec<(String, Vec<u8>)> {
+    let Some(ast) = post_ast else {
+        return Vec::new();
+    };
+    match fact {
+        Fact::FunctionSignature { .. } => {
+            crate::facts::python::function_signature::extract(ast, path)
+                .filter_map(|f| match f {
+                    Fact::FunctionSignature {
+                        qualified_name,
+                        span,
+                        ..
+                    } => Some((qualified_name, post_bytes[span.byte_range].to_vec())),
+                    _ => None,
+                })
+                .collect()
+        }
+        Fact::Field { .. } => crate::facts::python::field::extract(ast, path)
+            .filter_map(|f| match f {
+                Fact::Field {
+                    qualified_path,
+                    span,
+                    ..
+                } => Some((qualified_path, post_bytes[span.byte_range].to_vec())),
+                _ => None,
+            })
+            .collect(),
+        Fact::PublicSymbol { .. } => crate::facts::python::symbol_existence::extract(ast, path)
+            .filter_map(|f| match f {
+                Fact::PublicSymbol {
+                    qualified_name,
+                    span,
+                    ..
+                } => {
+                    let leaf = qualified_name.rsplit('.').next().unwrap_or(&qualified_name);
+                    if leaf.starts_with('_') {
+                        return None;
+                    }
+                    Some((qualified_name, post_bytes[span.byte_range].to_vec()))
+                }
+                _ => None,
+            })
+            .collect(),
+        Fact::DocClaim { .. } => Vec::new(),
+        Fact::TestAssertion { .. } => crate::facts::python::test_assertion::extract(ast, path)
+            .filter_map(|f| match f {
+                Fact::TestAssertion { test_fn, span, .. } => {
+                    Some((test_fn, post_bytes[span.byte_range].to_vec()))
+                }
+                _ => None,
+            })
+            .collect(),
+    }
+}
+
+/// Typed variant of [`rename_candidates_for_python`].
+///
+/// Returns [`RenameCandidate`] values built with
+/// [`crate::diff::RenameCandidate::new_python`], whose `container` and
+/// `leaf_name` are derived from Python dotted-name semantics (splitting on
+/// `.` after stripping the module-path prefix from `path`).
+// No caller exists until Task 10; suppress dead_code in the interim.
+#[allow(dead_code)]
+pub(super) fn rename_candidates_for_python_typed(
+    fact: &Fact,
+    path: &Path,
+    post_bytes: &[u8],
+    post_ast: Option<&crate::ast::python::PythonAst>,
+) -> Vec<RenameCandidate> {
+    rename_candidates_for_python(fact, path, post_bytes, post_ast)
+        .into_iter()
+        .map(|(qname, span)| RenameCandidate::new_python(qname, span, path))
+        .collect()
+}
+
 /// Python equivalent of [`matching_post_fact`]. Five fact-kind arms.
 ///
 /// SPEC §11 row 2026-05-19 (Plan A.2). Mirrors the Rust contract where
