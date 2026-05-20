@@ -3,6 +3,7 @@
 //! sides with tree-sitter, drops trivia, and compares the residual.
 
 use crate::lang::Language;
+use crate::replay::commit_index::split_python_qualified_name;
 use std::collections::HashSet;
 use tree_sitter::{Node, Parser, Tree};
 
@@ -240,6 +241,33 @@ impl RenameCandidate {
             container: container.map(str::to_string),
             span,
             qualified_name,
+        }
+    }
+
+    /// SPEC §11 row 2026-05-19 (Plan A.2): Python-aware constructor.
+    /// Strips the module-path prefix derived from `path` (e.g.
+    /// `src.a.Greeter.greet` at `src/a.py` → container `Some("Greeter")`,
+    /// leaf `"greet"`). Splits remaining dotted segments at the last `.`.
+    /// Module-level symbols with no class prefix produce `container: None`.
+    ///
+    /// Do NOT use `RenameCandidate::new` for Python — that splits on
+    /// `::` and dotted Python names produce wrong containers.
+    ///
+    /// Delegates to the canonical `split_python_qualified_name` from
+    /// `commit_index` so the logic is byte-stable with the index population
+    /// and `python_fact_kind_container_leaf` in `replay/mod.rs`.
+    pub fn new_python(qualified_name: String, span: Vec<u8>, path: &std::path::Path) -> Self {
+        let (container_str, leaf_name) = split_python_qualified_name(&qualified_name, path);
+        let container = if container_str.is_empty() {
+            None
+        } else {
+            Some(container_str)
+        };
+        Self {
+            qualified_name,
+            span,
+            container,
+            leaf_name,
         }
     }
 }

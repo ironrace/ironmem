@@ -1,20 +1,22 @@
-//! Plan A.1 retrospective: short-circuit Python replay for changed files.
+//! Python replay tests for changed-file classification.
 //!
-//! When a Python source file changes between T₀ and a post-commit, the
-//! labeler cannot mechanically classify its facts via the existing
-//! Rust-oriented AST match path (`matching_post_fact` was Rust-only,
-//! and `RustAst::parse` applied to Python source returns a garbled tree
-//! that the disambiguator contract was never written for).
+//! **Plan A.1 retrospective (pre-Task 11):** when a Python source file changed
+//! between T₀ and a post-commit, the labeler short-circuited directly to
+//! `Label::NeedsRevalidation` for every fact at that path. Full Python AST
+//! matching was deferred.
 //!
-//! Pre-fix: `Replay::run` panicked at `replay/match_post.rs:60` because
-//! Plan A Task 12's Python facts have `function_signature_disambiguator
-//! = None` while `post_ast` was nevertheless `Some(garbled_RustAst)`.
+//! **Plan A.2 activation (Task 11):** the short-circuit is removed. Python
+//! facts at changed files now flow through `classify_python_against_commit`
+//! (dispatched by `classify_against_commit` via `PostAst::Python`).
 //!
-//! Post-fix contract: Python facts at a changed file route to
-//! `Label::NeedsRevalidation` — the existing rule-chain escape hatch
-//! meaning "structurally unclassifiable, ask the baseline". Full Python
-//! replay (PythonAst post-cache + Python-flavored matching) is out of
-//! scope for v1.2b and is documented as a labeler limitation.
+//! `python_changed_file_no_longer_all_needs_revalidation` is the regression
+//! test that verifies the short-circuit is gone: at least one Python fact in a
+//! changed file must receive a label other than `NeedsRevalidation`.
+//!
+//! `python_fact_at_changed_file_emits_needs_revalidation` is **intentionally
+//! deleted** as part of Task 11 — it pinned the short-circuit behaviour that
+//! Task 11 removes. Task 12 replaces it with per-label assertions against real
+//! classification output.
 
 use provbench_labeler::label::Label;
 use provbench_labeler::replay::{Replay, ReplayConfig};
@@ -28,7 +30,11 @@ fn git(repo: &Path, args: &[&str]) {
         .args(args)
         .status()
         .unwrap();
-    assert!(status.success(), "git {args:?} failed in {}", repo.display());
+    assert!(
+        status.success(),
+        "git {args:?} failed in {}",
+        repo.display()
+    );
 }
 
 fn capture(repo: &Path, args: &[&str]) -> String {
@@ -41,8 +47,15 @@ fn capture(repo: &Path, args: &[&str]) -> String {
     String::from_utf8(out.stdout).unwrap().trim().to_string()
 }
 
+/// Regression test for SPEC §11 row 2026-05-19 (Plan A.2).
+///
+/// Builds a synthetic Python repo: T₀ has `def foo(): return 1`; HEAD
+/// adds a docstring (function body content hash changes). Pre-Plan-A.2
+/// (short-circuit active) the `foo` fact was always `NeedsRevalidation`.
+/// Post-Plan-A.2 it should receive a real classification label — anything
+/// but `NeedsRevalidation` proves the short-circuit is gone.
 #[test]
-fn python_fact_at_changed_file_emits_needs_revalidation() {
+fn python_changed_file_no_longer_all_needs_revalidation() {
     let tmp = TempDir::new().unwrap();
     let repo = tmp.path();
 
@@ -50,20 +63,24 @@ fn python_fact_at_changed_file_emits_needs_revalidation() {
     git(repo, &["config", "user.email", "test@example.com"]);
     git(repo, &["config", "user.name", "Test"]);
 
-    // Commit 1 (T₀): src/foo.py with `def f(): return 1`.
-    let foo_path = repo.join("src/foo.py");
-    std::fs::create_dir_all(foo_path.parent().unwrap()).unwrap();
-    std::fs::write(&foo_path, "def f():\n    return 1\n").unwrap();
+    // Commit 1 (T₀): src/a.py with `def foo(): return 1`.
+    let a_py = repo.join("src/a.py");
+    std::fs::create_dir_all(a_py.parent().unwrap()).unwrap();
+    std::fs::write(&a_py, "def foo():\n    return 1\n").unwrap();
     git(repo, &["add", "-A"]);
     git(repo, &["commit", "-q", "-m", "initial"]);
     let t0 = capture(repo, &["rev-parse", "HEAD"]);
 
-    // Commit 2: change the function body (signature byte-identical,
-    // body bytes differ → file_byte_identical bypass MUST NOT fire,
-    // forcing the per-fact classification path).
-    std::fs::write(&foo_path, "def f():\n    return 2\n").unwrap();
+    // Commit 2 (HEAD): add a docstring — body bytes change, signature
+    // (`def foo():`) is byte-identical. The file_byte_identical bypass
+    // must NOT fire, so facts go through per-fact classification.
+    std::fs::write(
+        &a_py,
+        "def foo():\n    \"\"\"docstring.\"\"\"\n    return 1\n",
+    )
+    .unwrap();
     git(repo, &["add", "-A"]);
-    git(repo, &["commit", "-q", "-m", "change body"]);
+    git(repo, &["commit", "-q", "-m", "add docstring"]);
     let head = capture(repo, &["rev-parse", "HEAD"]);
     assert_ne!(head, t0, "two distinct commits required");
 
@@ -73,29 +90,28 @@ fn python_fact_at_changed_file_emits_needs_revalidation() {
         skip_symbol_resolution: true,
     };
 
-    // Pre-fix this panics; post-fix this returns a deterministic row set.
     let rows = Replay::run(&cfg).expect("Replay::run on Python repo must not panic");
 
-    // Locate the FunctionSignature fact for src.foo.f at commit 2.
-    let foo_func_row = rows
+    // There must be at least one fact row for src/a.py at the HEAD commit.
+    let foo_facts: Vec<_> = rows
         .iter()
-        .find(|r| {
-            r.commit_sha == head
-                && r.fact_id.starts_with("FunctionSignature::")
-                && r.fact_id.contains("foo.py")
-        })
-        .unwrap_or_else(|| {
-            panic!(
-                "no FunctionSignature row for src.foo.f at commit {head}; got {} rows: {:?}",
-                rows.len(),
-                rows.iter().map(|r| &r.fact_id).collect::<Vec<_>>()
-            )
-        });
-    assert_eq!(
-        foo_func_row.label,
-        Label::NeedsRevalidation,
-        "Python fact at a changed file must route to NeedsRevalidation (Option C \
-         short-circuit); got {:?}",
-        foo_func_row.label
+        .filter(|r| r.commit_sha == head && r.fact_id.contains("a.py"))
+        .collect();
+    assert!(
+        !foo_facts.is_empty(),
+        "expected at least one fact row for src/a.py at commit {head}; got {} total rows: {:?}",
+        rows.len(),
+        rows.iter().map(|r| &r.fact_id).collect::<Vec<_>>()
+    );
+
+    // At least one fact must NOT be NeedsRevalidation.
+    // If every fact is still NeedsRevalidation, the short-circuit was not removed.
+    assert!(
+        foo_facts
+            .iter()
+            .any(|f| !matches!(f.label, Label::NeedsRevalidation)),
+        "expected at least one fact for src/a.py to NOT be NeedsRevalidation \
+         (short-circuit not removed?). Labels: {:?}",
+        foo_facts.iter().map(|f| &f.label).collect::<Vec<_>>()
     );
 }

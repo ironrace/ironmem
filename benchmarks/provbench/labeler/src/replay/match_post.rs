@@ -320,3 +320,343 @@ pub(super) fn rename_candidates_for_typed(
         .map(|(qname, span)| RenameCandidate::new(qname, span))
         .collect()
 }
+
+/// Python equivalent of [`rename_candidates_for`]. Returns `(qualified_name,
+/// span_bytes)` pairs for same-kind facts in the post-commit Python AST.
+///
+/// SPEC §11 row 2026-05-19 (Plan A.2). `PublicSymbol` respects the
+/// single-underscore filter (private names excluded from rename detection).
+pub(super) fn rename_candidates_for_python(
+    fact: &Fact,
+    path: &Path,
+    post_bytes: &[u8],
+    post_ast: Option<&crate::ast::python::PythonAst>,
+) -> Vec<(String, Vec<u8>)> {
+    let Some(ast) = post_ast else {
+        return Vec::new();
+    };
+    match fact {
+        Fact::FunctionSignature { .. } => {
+            crate::facts::python::function_signature::extract(ast, path)
+                .filter_map(|f| match f {
+                    Fact::FunctionSignature {
+                        qualified_name,
+                        span,
+                        ..
+                    } => Some((qualified_name, post_bytes[span.byte_range].to_vec())),
+                    _ => None,
+                })
+                .collect()
+        }
+        Fact::Field { .. } => crate::facts::python::field::extract(ast, path)
+            .filter_map(|f| match f {
+                Fact::Field {
+                    qualified_path,
+                    span,
+                    ..
+                } => Some((qualified_path, post_bytes[span.byte_range].to_vec())),
+                _ => None,
+            })
+            .collect(),
+        Fact::PublicSymbol { .. } => crate::facts::python::symbol_existence::extract(ast, path)
+            .filter_map(|f| match f {
+                Fact::PublicSymbol {
+                    qualified_name,
+                    span,
+                    ..
+                } => {
+                    let leaf = qualified_name.rsplit('.').next().unwrap_or(&qualified_name);
+                    if leaf.starts_with('_') {
+                        return None;
+                    }
+                    Some((qualified_name, post_bytes[span.byte_range].to_vec()))
+                }
+                _ => None,
+            })
+            .collect(),
+        Fact::DocClaim { .. } => Vec::new(),
+        Fact::TestAssertion { .. } => crate::facts::python::test_assertion::extract(ast, path)
+            .filter_map(|f| match f {
+                Fact::TestAssertion { test_fn, span, .. } => {
+                    Some((test_fn, post_bytes[span.byte_range].to_vec()))
+                }
+                _ => None,
+            })
+            .collect(),
+    }
+}
+
+/// Typed variant of [`rename_candidates_for_python`].
+///
+/// Returns [`RenameCandidate`] values built with
+/// [`crate::diff::RenameCandidate::new_python`], whose `container` and
+/// `leaf_name` are derived from Python dotted-name semantics (splitting on
+/// `.` after stripping the module-path prefix from `path`).
+pub(super) fn rename_candidates_for_python_typed(
+    fact: &Fact,
+    path: &Path,
+    post_bytes: &[u8],
+    post_ast: Option<&crate::ast::python::PythonAst>,
+) -> Vec<RenameCandidate> {
+    rename_candidates_for_python(fact, path, post_bytes, post_ast)
+        .into_iter()
+        .map(|(qname, span)| RenameCandidate::new_python(qname, span, path))
+        .collect()
+}
+
+/// Python equivalent of [`matching_post_fact`]. Five fact-kind arms.
+///
+/// SPEC §11 row 2026-05-19 (Plan A.2). Mirrors the Rust contract where
+/// applicable but uses `PythonAst` and `facts::python::*` extractors.
+/// `DocClaim` intentionally stays a stub until Python doc-claim semantics
+/// are designed.
+pub(super) fn matching_post_fact_python(
+    fact: &Fact,
+    path: &Path,
+    _post_bytes: &[u8],
+    post_ast: Option<&crate::ast::python::PythonAst>,
+    test_assertion_ordinal: Option<usize>,
+) -> Option<(Span, String)> {
+    let ast = post_ast?;
+    match fact {
+        Fact::FunctionSignature { qualified_name, .. } => {
+            crate::facts::python::function_signature::extract(ast, path).find_map(|f| match f {
+                Fact::FunctionSignature {
+                    qualified_name: q,
+                    span,
+                    content_hash,
+                    ..
+                } if q == *qualified_name => Some((span, content_hash)),
+                _ => None,
+            })
+        }
+        Fact::Field { qualified_path, .. } => crate::facts::python::field::extract(ast, path)
+            .find_map(|f| match f {
+                Fact::Field {
+                    qualified_path: q,
+                    span,
+                    content_hash,
+                    ..
+                } if q == *qualified_path => Some((span, content_hash)),
+                _ => None,
+            }),
+        Fact::PublicSymbol { qualified_name, .. } => {
+            crate::facts::python::symbol_existence::extract(ast, path).find_map(|f| match f {
+                Fact::PublicSymbol {
+                    qualified_name: q,
+                    span,
+                    content_hash,
+                    ..
+                } if q == *qualified_name => {
+                    // SPEC §11 row 2026-05-19: single-underscore-prefixed
+                    // leaf is NOT a continuation of a public name.
+                    let leaf = q.rsplit('.').next().unwrap_or(&q);
+                    if leaf.starts_with('_') {
+                        return None;
+                    }
+                    Some((span, content_hash))
+                }
+                _ => None,
+            })
+        }
+        Fact::TestAssertion { test_fn, .. } => {
+            let ordinal = test_assertion_ordinal.expect(
+                "Fact::TestAssertion must carry an ordinal; \
+                 see replay::push_test_assertion_facts. Routing through \
+                 None would silently misclassify post-commit assertions.",
+            );
+            crate::facts::python::test_assertion::extract(ast, path)
+                .filter_map(|f| match f {
+                    Fact::TestAssertion {
+                        test_fn: q,
+                        span,
+                        content_hash,
+                        ..
+                    } if q == *test_fn => Some((span, content_hash)),
+                    _ => None,
+                })
+                .nth(ordinal)
+        }
+        Fact::DocClaim { .. } => {
+            // SPEC §11 row 2026-05-19 (Plan A.2): Python DocClaim semantics
+            // are out of scope. The Python facts::python::doc_claim extractor
+            // is a stub today. DocClaim facts on Python paths route through
+            // upstream as NeedsRevalidation. Revisit in v1.4+.
+            None
+        }
+    }
+}
+
+#[cfg(test)]
+mod python_match_tests {
+    use super::*;
+    use crate::ast::python::PythonAst;
+    use std::path::Path;
+
+    #[test]
+    fn python_function_signature_matches_by_qualified_name() {
+        let src = b"def foo():\n    return 1\n";
+        let ast = PythonAst::parse(src).unwrap();
+        let path = Path::new("src/a.py");
+        let fact = Fact::FunctionSignature {
+            qualified_name: "src.a.foo".into(),
+            source_path: path.to_path_buf(),
+            span: crate::ast::spans::Span {
+                byte_range: 0..src.len(),
+                line_start: 1,
+                line_end: 1,
+            },
+            content_hash: "old-hash".into(),
+        };
+        let result = matching_post_fact_python(&fact, path, src, Some(&ast), None);
+        assert!(
+            result.is_some(),
+            "expected match for src.a.foo at src/a.py; got None"
+        );
+    }
+
+    #[test]
+    fn python_function_signature_misses_on_different_name() {
+        let src = b"def bar():\n    return 1\n";
+        let ast = PythonAst::parse(src).unwrap();
+        let path = Path::new("src/a.py");
+        let fact = Fact::FunctionSignature {
+            qualified_name: "src.a.foo".into(),
+            source_path: path.to_path_buf(),
+            span: crate::ast::spans::Span {
+                byte_range: 0..src.len(),
+                line_start: 1,
+                line_end: 1,
+            },
+            content_hash: "old-hash".into(),
+        };
+        let result = matching_post_fact_python(&fact, path, src, Some(&ast), None);
+        assert!(
+            result.is_none(),
+            "expected None for foo when only bar exists"
+        );
+    }
+
+    #[test]
+    fn python_public_symbol_matches_module_level_def() {
+        let src = b"def foo():\n    return 1\n";
+        let ast = PythonAst::parse(src).unwrap();
+        let path = Path::new("src/a.py");
+        let fact = Fact::PublicSymbol {
+            qualified_name: "src.a.foo".into(),
+            source_path: path.to_path_buf(),
+            span: crate::ast::spans::Span {
+                byte_range: 0..src.len(),
+                line_start: 1,
+                line_end: 1,
+            },
+            content_hash: "old-hash".into(),
+        };
+        let result = matching_post_fact_python(&fact, path, src, Some(&ast), None);
+        assert!(result.is_some(), "expected PublicSymbol match for foo");
+    }
+
+    #[test]
+    fn python_public_symbol_underscore_renames_to_none() {
+        // Post-commit source only has `_foo`; T0 fact has `qualified_name: "src.a.foo"`.
+        // The extractor emits "src.a._foo" — no name match — so result is None.
+        // The underscore leaf filter is defense-in-depth for any residual match.
+        let src = b"def _foo():\n    return 1\n";
+        let ast = PythonAst::parse(src).unwrap();
+        let path = Path::new("src/a.py");
+        let fact = Fact::PublicSymbol {
+            qualified_name: "src.a.foo".into(),
+            source_path: path.to_path_buf(),
+            span: crate::ast::spans::Span {
+                byte_range: 0..src.len(),
+                line_start: 1,
+                line_end: 1,
+            },
+            content_hash: "old-hash".into(),
+        };
+        let result = matching_post_fact_python(&fact, path, src, Some(&ast), None);
+        assert!(
+            result.is_none(),
+            "expected None when public foo became private _foo"
+        );
+    }
+
+    #[test]
+    fn python_field_matches_by_qualified_path() {
+        let src = b"class Greeter:\n    name = 'world'\n";
+        let ast = PythonAst::parse(src).unwrap();
+        let path = Path::new("src/a.py");
+        let fact = Fact::Field {
+            qualified_path: "src.a.Greeter.name".into(),
+            source_path: path.to_path_buf(),
+            type_text: String::new(),
+            span: crate::ast::spans::Span {
+                byte_range: 17..32,
+                line_start: 2,
+                line_end: 2,
+            },
+            content_hash: "old-hash".into(),
+        };
+        let result = matching_post_fact_python(&fact, path, src, Some(&ast), None);
+        assert!(result.is_some(), "expected match for src.a.Greeter.name");
+    }
+
+    #[test]
+    fn python_test_assertion_pairs_by_test_fn_and_ordinal() {
+        let src = b"def test_thing():\n    assert 1 == 1\n    assert 2 == 2\n";
+        let ast = PythonAst::parse(src).unwrap();
+        let path = Path::new("tests/test_thing.py");
+        let fact = Fact::TestAssertion {
+            test_fn: "test_thing".into(),
+            source_path: path.to_path_buf(),
+            span: crate::ast::spans::Span {
+                byte_range: 0..src.len(),
+                line_start: 1,
+                line_end: 3,
+            },
+            content_hash: "old-hash".into(),
+            asserted_symbol: None,
+        };
+        // ordinal=1 (second assertion).
+        let result = matching_post_fact_python(&fact, path, src, Some(&ast), Some(1));
+        assert!(
+            result.is_some(),
+            "expected match for second assertion in test_thing; got None"
+        );
+
+        // Out-of-range ordinal=5.
+        let result_oob = matching_post_fact_python(&fact, path, src, Some(&ast), Some(5));
+        assert!(
+            result_oob.is_none(),
+            "expected None for out-of-range ordinal=5"
+        );
+    }
+
+    #[test]
+    fn python_doc_claim_returns_none_per_design() {
+        let src = b"# README\nSome text\n";
+        let ast = PythonAst::parse(src).unwrap();
+        let path = Path::new("README.md");
+        let fact = Fact::DocClaim {
+            qualified_name: "src.a.foo".into(),
+            doc_path: path.to_path_buf(),
+            mention_span: crate::ast::spans::Span {
+                byte_range: 0..10,
+                line_start: 1,
+                line_end: 1,
+            },
+            mention_hash: "h".into(),
+            defining_span: crate::ast::spans::Span {
+                byte_range: 0..10,
+                line_start: 1,
+                line_end: 1,
+            },
+            defining_hash: "h2".into(),
+        };
+        let result = matching_post_fact_python(&fact, path, src, Some(&ast), None);
+        assert!(
+            result.is_none(),
+            "DocClaim Python arm returns None per design"
+        );
+    }
+}

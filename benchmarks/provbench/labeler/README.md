@@ -95,8 +95,15 @@ Phase 0b is accepted iff:
 - **Replay symbol resolution is commit-tree-local.** For each commit a
   `CommitSymbolIndex` is built from that commit's `.rs` tree (via
   tree-sitter) before any fact is classified; `rust-analyzer` is no longer
-  consulted at replay time. This eliminates the runtime RA dependency for the
-  hot classification path. Live RA tooling and the `PINNED_BINARIES`
+  consulted at replay time. The index also covers `.py` paths via
+  `python_entries`; Python facts use `lookup_python` which returns a
+  4-variant enum (`ExactAtOriginalPath` / `UniqueFallbackAtPath` /
+  `AmbiguousFallback` / `Absent`). Rust facts continue to use
+  `symbol_exists_in_tree` (bool). Per-fact-kind: `PublicSymbol` respects a
+  single-underscore-leaf filter applied symmetrically in index building and
+  matching — a leaf name beginning with `_` (e.g. `_foo`) does NOT continue
+  a public `foo` across commits. This eliminates the runtime RA dependency
+  for the hot classification path. Live RA tooling and the `PINNED_BINARIES`
   tooling-pin table (in `src/tooling.rs`) remain in the crate for
   `tests/replay_ra.rs` (pinned-binary test) and for future cross-crate /
   macro-expanded work. Files added after T₀ are included in the per-commit
@@ -348,9 +355,28 @@ Both outputs feed the Phase 0c baseline runner under
 
 ## Limitations
 
-- v1 supports Rust only. The held-out Python repo (`flask`) is **not**
-  exercised by this labeler. A `tree-sitter`-based Python path is
-  future work and **not** required for Phase 0b acceptance.
+- **Python post-commit classification is implemented** (Plan A.2 / SPEC §11
+  row 2026-05-19). The held-out Python repo (`flask`) is exercised by this
+  labeler via `classify_python_against_commit` + `matching_post_fact_python`
+  + `CommitSymbolIndex::python_entries`. The prior claim that "v1 supports
+  Rust only" is retracted. Remaining gaps:
+  - **Python `DocClaim` is a stub** — the `DocClaim` arm in
+    `matching_post_fact_python` returns `None` unconditionally. Full Python
+    doc-claim classification is v1.4+ work.
+  - **Python `FunctionSignature` disambiguator not implemented** — the
+    cfg-attribute + impl-receiver tiebreaker used for Rust (pass-5) has no
+    Python equivalent. YAGNI; add only when fixtures surface genuine
+    duplicates.
+  - **Python same-file `Field` leaf-elsewhere pre-check intentionally
+    omitted** — the Rust path uses a `::` qualified-name assumption to scope
+    the same-leaf search to the enclosing file; this assumption does not
+    translate cleanly to Python's `.` separator, so the pre-check is absent
+    for Python `Field` facts.
+  - **Cross-file Python moves** resolve via `lookup_python`'s 4-variant
+    fallback (`ExactAtOriginalPath` → `UniqueFallbackAtPath` →
+    `AmbiguousFallback` → `Absent`). A symbol that is unique across the
+    post-commit tree but has no body-hash match routes to
+    `NeedsRevalidation` rather than `Stale_Symbol_Renamed`.
 - Per-commit classification uses a tree-sitter-built `CommitSymbolIndex`
   rather than a live `rust-analyzer` query. This loses semantic resolution
   for cross-crate references and macro-expanded symbols. The pinned RA
@@ -436,3 +462,52 @@ Determinism is enforced by:
 Spot-check material for the v1.2b held-out round lives at
 `../results/python-labeler-2026-05-15-spotcheck.csv` and the
 companion findings template `python-labeler-2026-05-15-spotcheck-findings.md`.
+
+### Plan A.2 — Post-commit classification machinery (2026-05-19)
+
+Plan A.2 extends Python support from T₀ extraction only (v1.2b) to full
+per-commit classification. The Plan A.1 short-circuit that routed every
+changed Python file directly to `NeedsRevalidation` (`is_python_path`
+guard in the replay loop) **has been removed**.
+
+**Dispatch.** `replay::classify_commit` detects `PostAst::Python(_)` and
+routes to `classify_python_against_commit` instead of the Rust path.
+The byte-identical short-circuit (valid for all paths) runs first and
+bypasses per-fact matching as before.
+
+**`matching_post_fact_python` — 5 arms:**
+
+| Fact kind | Post-commit behaviour |
+|---|---|
+| `FunctionSignature` | Body-hash compare + cross-file move via `lookup_python` 4-variant fallback |
+| `Field` | Exact `qualified_path` lookup; absent → `NeedsRevalidation` (same-file leaf-elsewhere pre-check not implemented for Python) |
+| `PublicSymbol` | `CommitSymbolIndex::lookup_python`; single-underscore-leaf filter applied (`_foo` does NOT continue `foo`) |
+| `TestAssertion` | Ordinal end-to-end via `push_test_assertion_facts`; same ordinal pairing as Rust path |
+| `DocClaim` | **Stub — returns `None`** (Python DocClaim is v1.4+ work) |
+
+**`PublicSymbol` single-underscore-leaf filter.** A public `foo` at T₀ is
+NOT matched by a post-commit `_foo`. The filter is applied symmetrically
+in `CommitSymbolIndex` index building (Python entries) and in
+`matching_post_fact_python` matching, so the invariant holds for both
+directions.
+
+**Cross-file move resolution (`lookup_python`).** Resolution proceeds
+through 4 variants in order:
+1. `ExactAtOriginalPath` — qualified name found at the original file path.
+2. `UniqueFallbackAtPath` — qualified name not at original path but unique
+   across the full post-commit tree; promotes to the new path.
+3. `AmbiguousFallback` — name found at multiple paths; routes to
+   `NeedsRevalidation`.
+4. `Absent` — name not found anywhere; routes to `StaleSourceDeleted` (or
+   `NeedsRevalidation` if the test fn still exists, for `TestAssertion`).
+
+Unique-but-no-body-hash cases (symbol present but body changed) route to
+`NeedsRevalidation` rather than `Stale_Symbol_Renamed`.
+
+**`RenameCandidate::new_python`.** Uses `.` splitting for qualified-name
+decomposition. Rust's `::` splitter is not used for Python candidates.
+
+**Flask H3 (R3 dominance) closeable.** The v1.2b held-out findings noted
+R3 dominance as a labeler-layer concern. Plan A.2's full per-commit
+classification closes the H3 finding at the labeler layer; the held-out
+re-run confirming this is the follow-up PR.
