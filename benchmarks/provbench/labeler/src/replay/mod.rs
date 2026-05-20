@@ -104,6 +104,17 @@ struct FnDisambiguator {
     ordinal: usize,
 }
 
+/// Language-aware post-commit AST, cached per (commit, path).
+///
+/// SPEC §11 row 2026-05-19 (Plan A.2): replaces the Rust-only
+/// `HashMap<PathBuf, Option<RustAst>>` cache. The `Python` variant lands
+/// in Task 2; Task 1 introduces the type so the Rust path can be refactored
+/// without behavioral change.
+pub(super) enum PostAst {
+    Rust(crate::ast::RustAst),
+    // Python(crate::ast::python::PythonAst), // Task 2
+}
+
 impl Replay {
     /// Run the full T₀-anchored replay and return one [`FactAtCommit`] row
     /// per (fact, commit) pair.
@@ -422,7 +433,7 @@ impl Replay {
             // Collect into a HashMap so we can pass them as the blob cache to
             // CommitSymbolIndex::build without double-reading.
             let mut cached_blobs: HashMap<PathBuf, Option<Vec<u8>>> = HashMap::new();
-            let mut post_asts: HashMap<PathBuf, Option<RustAst>> = HashMap::new();
+            let mut post_asts: HashMap<PathBuf, Option<PostAst>> = HashMap::new();
             for path in facts_by_path.keys() {
                 let blob = pilot.read_blob_at(&commit.sha, path)?;
                 // Only parse Rust files as `RustAst`. tree-sitter-rust will
@@ -434,9 +445,10 @@ impl Replay {
                 // `Label::NeedsRevalidation` at the per-fact classify step
                 // below.
                 let ast = match crate::lang::Language::for_path(path) {
-                    Some(crate::lang::Language::Rust) | None => {
-                        blob.as_ref().and_then(|bytes| RustAst::parse(bytes).ok())
-                    }
+                    Some(crate::lang::Language::Rust) | None => blob
+                        .as_ref()
+                        .and_then(|bytes| RustAst::parse(bytes).ok())
+                        .map(PostAst::Rust),
                     Some(crate::lang::Language::Python) => None,
                 };
                 cached_blobs.insert(path.clone(), blob);
@@ -485,7 +497,7 @@ impl Replay {
                     continue;
                 }
 
-                let post_ast = post_asts.get(path).and_then(|a| a.as_ref());
+                let post_ast: Option<&PostAst> = post_asts.get(path).and_then(|a| a.as_ref());
                 let t0_names: &HashSet<String> =
                     t0_names_by_path.get(path).unwrap_or(&EMPTY_STRING_SET);
 
@@ -516,12 +528,21 @@ impl Replay {
                     continue;
                 }
 
+                // Temporary Task 1 adapter: extract the inner RustAst from
+                // PostAst before passing into classify_against_commit, whose
+                // signature still takes Option<&RustAst>. The adapter and
+                // the PostAst wrapping both disappear in Task 10 when the
+                // classifier signature is promoted to accept Option<&PostAst>.
+                let rust_ast_for_now: Option<&RustAst> = post_ast.map(|p| match p {
+                    PostAst::Rust(a) => a,
+                });
+
                 for observed in facts_at_path {
                     let label = classify_against_commit(
                         &observed.fact,
                         path,
                         post_bytes,
-                        post_ast,
+                        rust_ast_for_now,
                         &observed.t0_span_bytes,
                         observed.test_assertion_ordinal,
                         observed.function_signature_disambiguator.as_ref(),
