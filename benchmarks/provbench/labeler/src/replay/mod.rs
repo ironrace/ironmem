@@ -470,6 +470,7 @@ impl Replay {
                     &pilot,
                     &commit.sha,
                     &commit_rs_paths,
+                    &[], // py_paths: wired to python_paths_at(commit) in Task 11
                     &cached_blobs,
                 )?)
             };

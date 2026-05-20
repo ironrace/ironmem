@@ -84,6 +84,7 @@ impl CommitSymbolIndex {
         pilot: &Pilot,
         commit_sha: &str,
         rs_paths: &[PathBuf],
+        py_paths: &[PathBuf],
         cached_blobs: &HashMap<PathBuf, Option<Vec<u8>>>,
     ) -> Result<Self> {
         let mut function_names = HashSet::new();
@@ -134,12 +135,83 @@ impl CommitSymbolIndex {
             }
         }
 
+        let mut python_entries: Vec<PythonEntry> = Vec::new();
+
+        for path in py_paths {
+            let fetched: Option<Vec<u8>>;
+            let bytes: &[u8] = match cached_blobs.get(path) {
+                Some(Some(cached)) => cached,
+                Some(None) => continue,
+                None => {
+                    fetched = pilot.read_blob_at(commit_sha, path)?;
+                    match &fetched {
+                        Some(b) => b,
+                        None => continue,
+                    }
+                }
+            };
+            let Ok(py_ast) = crate::ast::python::PythonAst::parse(bytes) else {
+                continue;
+            };
+            for fact in crate::facts::python::function_signature::extract(&py_ast, path) {
+                if let Fact::FunctionSignature { qualified_name, .. } = fact {
+                    let (container, leaf) = split_python_qualified_name(&qualified_name, path);
+                    python_entries.push(PythonEntry {
+                        fact_kind: PythonFactKind::FunctionSignature,
+                        qualified_name,
+                        container,
+                        leaf,
+                        path: path.clone(),
+                    });
+                }
+            }
+            for fact in crate::facts::python::field::extract(&py_ast, path) {
+                if let Fact::Field { qualified_path, .. } = fact {
+                    let (container, leaf) = split_python_qualified_name(&qualified_path, path);
+                    python_entries.push(PythonEntry {
+                        fact_kind: PythonFactKind::Field,
+                        qualified_name: qualified_path,
+                        container,
+                        leaf,
+                        path: path.clone(),
+                    });
+                }
+            }
+            for fact in crate::facts::python::symbol_existence::extract(&py_ast, path) {
+                if let Fact::PublicSymbol { qualified_name, .. } = fact {
+                    let (container, leaf) = split_python_qualified_name(&qualified_name, path);
+                    // SPEC §11 row 2026-05-19: single-underscore filter for PublicSymbol.
+                    if leaf.starts_with('_') {
+                        continue;
+                    }
+                    python_entries.push(PythonEntry {
+                        fact_kind: PythonFactKind::PublicSymbol,
+                        qualified_name,
+                        container,
+                        leaf,
+                        path: path.clone(),
+                    });
+                }
+            }
+            for fact in crate::facts::python::test_assertion::extract(&py_ast, path) {
+                if let Fact::TestAssertion { test_fn, .. } = fact {
+                    python_entries.push(PythonEntry {
+                        fact_kind: PythonFactKind::TestAssertion,
+                        qualified_name: test_fn.clone(),
+                        container: String::new(),
+                        leaf: test_fn,
+                        path: path.clone(),
+                    });
+                }
+            }
+        }
+
         Ok(Self {
             function_names,
             field_names,
             symbol_names,
             test_names,
-            python_entries: Vec::new(),
+            python_entries,
         })
     }
 
@@ -213,6 +285,26 @@ impl CommitSymbolIndex {
             1 => PythonLookup::UniqueFallbackAtPath(matches[0].clone()),
             _ => PythonLookup::AmbiguousFallback,
         }
+    }
+}
+
+/// Split a Python qualified name into (container, leaf), stripping the
+/// module-path prefix derived from `path`. For `src.a.Greeter.greet` at
+/// `src/a.py`, returns (`"Greeter"`, `"greet"`). For module-level
+/// `src.a.foo` at `src/a.py`, returns (`""`, `"foo"`).
+fn split_python_qualified_name(qualified_name: &str, path: &Path) -> (String, String) {
+    let path_str = path.to_string_lossy();
+    let module_path = path_str
+        .strip_suffix(".py")
+        .unwrap_or(&path_str)
+        .replace('/', ".");
+    let stripped = qualified_name
+        .strip_prefix(&format!("{}.", module_path))
+        .unwrap_or(qualified_name);
+    if let Some(idx) = stripped.rfind('.') {
+        (stripped[..idx].to_string(), stripped[idx + 1..].to_string())
+    } else {
+        (String::new(), stripped.to_string())
     }
 }
 
@@ -318,5 +410,128 @@ mod python_lookup_tests {
             Path::new("src/a.py"),
         );
         assert!(matches!(result, PythonLookup::Absent));
+    }
+
+    // ── build() integration tests (Option B: tempdir + git init) ─────────────
+
+    fn git_cmd(repo: &std::path::Path, args: &[&str]) {
+        let status = std::process::Command::new("git")
+            .args(args)
+            .current_dir(repo)
+            .status()
+            .unwrap_or_else(|e| panic!("git {:?} failed to spawn: {e}", args));
+        assert!(status.success(), "git {:?} exited non-zero", args);
+    }
+
+    fn make_pilot_with_py(py_path: &str, py_source: &[u8]) -> (tempfile::TempDir, Pilot, String) {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path();
+        git_cmd(root, &["init", "--initial-branch=main"]);
+        // Minimal Cargo.toml so `git ls-tree` sees something in the tree.
+        std::fs::write(root.join("placeholder.txt"), b"placeholder\n").unwrap();
+        // Write the python file, creating parent dirs as needed.
+        let full_path = root.join(py_path);
+        if let Some(parent) = full_path.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        std::fs::write(&full_path, py_source).unwrap();
+        git_cmd(root, &["add", "."]);
+        git_cmd(
+            root,
+            &[
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@t",
+                "commit",
+                "-m",
+                "init",
+            ],
+        );
+        let sha = String::from_utf8(
+            std::process::Command::new("git")
+                .args(["rev-parse", "HEAD"])
+                .current_dir(root)
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .unwrap()
+        .trim()
+        .to_string();
+
+        struct AdHoc {
+            path: PathBuf,
+            sha: String,
+        }
+        impl crate::repo::PilotRepoSpec for AdHoc {
+            fn local_clone_path(&self) -> &Path {
+                &self.path
+            }
+            fn t0_sha(&self) -> &str {
+                &self.sha
+            }
+        }
+        let pilot = Pilot::open(&AdHoc {
+            path: root.to_path_buf(),
+            sha: sha.clone(),
+        })
+        .expect("Pilot::open");
+        (tmp, pilot, sha)
+    }
+
+    #[test]
+    fn build_populates_python_entries_from_py_paths() {
+        let py_source = b"def foo():\n    return 1\n";
+        let py_path = "src/a.py";
+        let (_tmp, pilot, sha) = make_pilot_with_py(py_path, py_source);
+
+        let path = PathBuf::from(py_path);
+        let cached: HashMap<PathBuf, Option<Vec<u8>>> = HashMap::new();
+
+        let idx = CommitSymbolIndex::build(
+            &pilot,
+            &sha,
+            &[],                              // rs_paths empty
+            std::slice::from_ref(&path),      // py_paths
+            &cached,
+        )
+        .expect("build");
+
+        let py_foos: Vec<_> = idx
+            .python_entries
+            .iter()
+            .filter(|e| e.fact_kind == PythonFactKind::FunctionSignature && e.leaf == "foo")
+            .collect();
+        assert_eq!(
+            py_foos.len(),
+            1,
+            "expected exactly one foo entry; got {:?}",
+            py_foos
+        );
+        assert_eq!(py_foos[0].path, path);
+    }
+
+    #[test]
+    fn build_filters_underscore_prefixed_public_symbols() {
+        let py_source = b"def foo():\n    return 1\n\ndef _internal_foo():\n    return 2\n";
+        let py_path = "src/a.py";
+        let (_tmp, pilot, sha) = make_pilot_with_py(py_path, py_source);
+
+        let path = PathBuf::from(py_path);
+        let cached: HashMap<PathBuf, Option<Vec<u8>>> = HashMap::new();
+
+        let idx = CommitSymbolIndex::build(&pilot, &sha, &[], &[path], &cached).expect("build");
+
+        let underscored: Vec<_> = idx
+            .python_entries
+            .iter()
+            .filter(|e| e.fact_kind == PythonFactKind::PublicSymbol && e.leaf.starts_with('_'))
+            .collect();
+        assert!(
+            underscored.is_empty(),
+            "underscore-prefixed public symbols must be filtered; found {:?}",
+            underscored
+        );
     }
 }

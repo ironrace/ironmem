@@ -28,7 +28,11 @@ fn git(repo: &Path, args: &[&str]) {
         .args(args)
         .status()
         .unwrap();
-    assert!(status.success(), "git {args:?} failed in {}", repo.display());
+    assert!(
+        status.success(),
+        "git {args:?} failed in {}",
+        repo.display()
+    );
 }
 
 fn capture(repo: &Path, args: &[&str]) -> String {
