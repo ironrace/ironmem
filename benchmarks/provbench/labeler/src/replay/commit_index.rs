@@ -492,8 +492,8 @@ mod python_lookup_tests {
         let idx = CommitSymbolIndex::build(
             &pilot,
             &sha,
-            &[],                              // rs_paths empty
-            std::slice::from_ref(&path),      // py_paths
+            &[],                         // rs_paths empty
+            std::slice::from_ref(&path), // py_paths
             &cached,
         )
         .expect("build");

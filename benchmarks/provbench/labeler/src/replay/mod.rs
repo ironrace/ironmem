@@ -26,7 +26,7 @@ use crate::label::{classify, Label, PostCommitState};
 use crate::repo::{normalize_path_for_fact_id, CommitRef, Pilot, PilotRepoSpec};
 use crate::resolve::SymbolResolver;
 use anyhow::{Context, Result};
-use commit_index::CommitSymbolIndex;
+use commit_index::{CommitSymbolIndex, PythonFactKind, PythonLookup};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -541,25 +541,18 @@ impl Replay {
                     continue;
                 }
 
-                // Temporary Task 1 adapter: extract the inner RustAst from
-                // PostAst before passing into classify_against_commit, whose
-                // signature still takes Option<&RustAst>. The adapter and
-                // the PostAst wrapping both disappear in Task 10 when the
-                // classifier signature is promoted to accept Option<&PostAst>.
-                // Python paths never reach this point — the short-circuit above
-                // fires `continue` first — so the Python arm is unreachable in
-                // practice; we return None defensively rather than unreachable!().
-                let rust_ast_for_now: Option<&RustAst> = post_ast.and_then(|p| match p {
-                    PostAst::Rust(a) => Some(a),
-                    PostAst::Python(_) => None,
-                });
-
+                // Task 10 (Plan A.2): the classifier now accepts
+                // `Option<&PostAst>` directly and dispatches by language.
+                // The Task 1 temporary RustAst adapter is gone.
+                // The Python short-circuit above still fires `continue`
+                // before reaching here (Task 11 removes it), so Python
+                // facts don't yet hit `classify_python_against_commit`.
                 for observed in facts_at_path {
                     let label = classify_against_commit(
                         &observed.fact,
                         path,
                         post_bytes,
-                        rust_ast_for_now,
+                        post_ast,
                         &observed.t0_span_bytes,
                         observed.test_assertion_ordinal,
                         observed.function_signature_disambiguator.as_ref(),
@@ -966,6 +959,69 @@ fn classify_against_commit(
     fact: &Fact,
     path: &Path,
     post_blob: Option<&[u8]>,
+    post_ast: Option<&PostAst>,
+    t0_span_bytes: &[u8],
+    test_assertion_ordinal: Option<usize>,
+    function_signature_disambiguator: Option<&FnDisambiguator>,
+    cfg: &ReplayConfig,
+    commit_index: Option<&CommitSymbolIndex>,
+    t0_qualified_names: &HashSet<String>,
+    commit_sha: &str,
+) -> Result<Label> {
+    // Task 10 (Plan A.2): dispatch by language. The Rust arm carries the
+    // original `classify_against_commit` body verbatim (lifted into
+    // `classify_rust_against_commit`). The Python arm uses the Tasks 5-9
+    // pieces and currently has no live caller (the Python short-circuit at
+    // the call site fires first; Task 11 removes it).
+    match post_ast {
+        Some(PostAst::Rust(ast)) => classify_rust_against_commit(
+            fact,
+            path,
+            post_blob,
+            Some(ast),
+            t0_span_bytes,
+            test_assertion_ordinal,
+            function_signature_disambiguator,
+            cfg,
+            commit_index,
+            t0_qualified_names,
+            commit_sha,
+        ),
+        Some(PostAst::Python(ast)) => classify_python_against_commit(
+            fact,
+            path,
+            post_blob,
+            Some(ast),
+            t0_span_bytes,
+            test_assertion_ordinal,
+            cfg,
+            commit_index,
+            t0_qualified_names,
+        ),
+        None => classify_rust_against_commit(
+            fact,
+            path,
+            post_blob,
+            None,
+            t0_span_bytes,
+            test_assertion_ordinal,
+            function_signature_disambiguator,
+            cfg,
+            commit_index,
+            t0_qualified_names,
+            commit_sha,
+        ),
+    }
+}
+
+/// Rust classifier — verbatim lift of the pre-Task-10
+/// `classify_against_commit` body. No semantic change; the Plan A.2 refactor
+/// only moved the language dispatch up one frame.
+#[allow(clippy::too_many_arguments)]
+fn classify_rust_against_commit(
+    fact: &Fact,
+    path: &Path,
+    post_blob: Option<&[u8]>,
     post_ast: Option<&RustAst>,
     t0_span_bytes: &[u8],
     test_assertion_ordinal: Option<usize>,
@@ -1125,6 +1181,227 @@ fn classify_against_commit(
     };
 
     Ok(classify(fact, &state))
+}
+
+/// Python classifier — mirrors `classify_rust_against_commit`'s control flow
+/// but uses `matching_post_fact_python`, `rename_candidates_for_python_typed`,
+/// and `CommitSymbolIndex::lookup_python`.
+///
+/// SPEC §11 row 2026-05-19 (Plan A.2). Currently never reached: the Python
+/// short-circuit at the call site routes every Python fact to
+/// `Label::NeedsRevalidation` first. Task 11 removes the short-circuit.
+///
+/// Differences from the Rust arm:
+/// - `function_signature_disambiguator` and `commit_sha` are not threaded —
+///   Python `matching_post_fact_python` has neither parameter.
+/// - Same-file leaf-elsewhere `Fact::Field` pre-check is omitted: the Python
+///   field extractor's qualified-name scheme makes the
+///   `same_file_leaf_elsewhere` Rust helper inapplicable (it expects `::`
+///   segments). v1.2c+ may add a Python analog.
+/// - Cross-file resolution uses path-aware `lookup_python` (Task 4) instead
+///   of the path-agnostic `symbol_exists_in_tree`. `UniqueFallbackAtPath`
+///   and `AmbiguousFallback` both route to `NeedsRevalidation` per the
+///   lookup's documented contract.
+#[allow(clippy::too_many_arguments)]
+#[allow(dead_code)] // Task 11 removes the short-circuit and wires the caller.
+fn classify_python_against_commit(
+    fact: &Fact,
+    path: &Path,
+    post_blob: Option<&[u8]>,
+    post_ast: Option<&crate::ast::python::PythonAst>,
+    t0_span_bytes: &[u8],
+    test_assertion_ordinal: Option<usize>,
+    cfg: &ReplayConfig,
+    commit_index: Option<&CommitSymbolIndex>,
+    t0_qualified_names: &HashSet<String>,
+) -> Result<Label> {
+    let state = match post_blob {
+        // File was deleted at this commit.
+        None => CommitState::deleted(),
+
+        Some(post_bytes) => {
+            let observed_hash = fact.content_hash();
+
+            let post_fact = match_post::matching_post_fact_python(
+                fact,
+                path,
+                post_bytes,
+                post_ast,
+                test_assertion_ordinal,
+            );
+
+            match post_fact {
+                Some((post_span, post_hash)) => {
+                    // Symbol found at its original path — compute deltas
+                    // against the Python grammar.
+                    let after_bytes = &post_bytes[post_span.byte_range.clone()];
+                    let ws_only = is_whitespace_or_comment_only(
+                        t0_span_bytes,
+                        after_bytes,
+                        crate::lang::Language::Python,
+                    );
+                    let structural = post_hash != observed_hash;
+                    CommitState {
+                        file_exists: true,
+                        post_span_hash: Some(post_hash),
+                        structurally_classifiable: structural,
+                        whitespace_or_comment_only: ws_only,
+                        symbol_resolves: true,
+                        rename: None,
+                    }
+                }
+                None => {
+                    // Symbol absent at its original path.
+                    if cfg.skip_symbol_resolution {
+                        // Unit-test mode: no cross-file or rename detection.
+                        CommitState {
+                            file_exists: true,
+                            post_span_hash: None,
+                            structurally_classifiable: false,
+                            whitespace_or_comment_only: false,
+                            symbol_resolves: false,
+                            rename: None,
+                        }
+                    } else if let Some(index) = commit_index {
+                        let (kind_opt, container, leaf) =
+                            python_fact_kind_container_leaf(fact, path);
+                        // DocClaim has no PythonFactKind — Python doc-claim
+                        // semantics are out of scope (matching_post_fact_python
+                        // already returned None for the DocClaim arm). Route
+                        // to StaleSourceDeleted, mirroring how the rule chain
+                        // treats a missing symbol with no rename candidate.
+                        let Some(kind) = kind_opt else {
+                            return Ok(classify(
+                                fact,
+                                &CommitState {
+                                    file_exists: true,
+                                    post_span_hash: None,
+                                    structurally_classifiable: false,
+                                    whitespace_or_comment_only: false,
+                                    symbol_resolves: false,
+                                    rename: None,
+                                },
+                            ));
+                        };
+                        match index.lookup_python(kind, &container, &leaf, path) {
+                            // Defensive: matching_post_fact_python returned None,
+                            // so the symbol shouldn't be exact-at-original. Route
+                            // to NeedsRevalidation rather than panic if the two
+                            // disagree (extractor / index drift hatch).
+                            PythonLookup::ExactAtOriginalPath
+                            | PythonLookup::UniqueFallbackAtPath(_)
+                            | PythonLookup::AmbiguousFallback => CommitState {
+                                file_exists: true,
+                                post_span_hash: None,
+                                structurally_classifiable: false,
+                                whitespace_or_comment_only: false,
+                                symbol_resolves: true,
+                                rename: None,
+                            },
+                            PythonLookup::Absent => {
+                                // Within-file rename detection via the typed
+                                // pipeline. Build a Python-flavored origin
+                                // (RenameOrigin::new splits on `::` which is
+                                // wrong for dotted Python names) so the
+                                // container-compatibility gate matches.
+                                let candidates = match_post::rename_candidates_for_python_typed(
+                                    fact, path, post_bytes, post_ast,
+                                );
+                                let container_opt = if container.is_empty() {
+                                    None
+                                } else {
+                                    Some(container.as_str())
+                                };
+                                let origin = RenameOrigin {
+                                    qualified_name: qualified_key_for(fact),
+                                    leaf_name: leaf.as_str(),
+                                    container: container_opt,
+                                    span: t0_span_bytes,
+                                };
+                                let rename = rename_candidate_typed(
+                                    &origin,
+                                    &candidates,
+                                    t0_qualified_names,
+                                    0.6,
+                                );
+                                CommitState {
+                                    file_exists: true,
+                                    post_span_hash: None,
+                                    structurally_classifiable: false,
+                                    whitespace_or_comment_only: false,
+                                    symbol_resolves: false,
+                                    rename,
+                                }
+                            }
+                        }
+                    } else {
+                        // `skip_symbol_resolution = false` but `commit_index`
+                        // is `None`. Mirror the Rust arm: defined behaviour
+                        // over panic.
+                        CommitState {
+                            file_exists: true,
+                            post_span_hash: None,
+                            structurally_classifiable: false,
+                            whitespace_or_comment_only: false,
+                            symbol_resolves: false,
+                            rename: None,
+                        }
+                    }
+                }
+            }
+        }
+    };
+
+    Ok(classify(fact, &state))
+}
+
+/// Split a Python fact into `(PythonFactKind, container, leaf)` for
+/// `CommitSymbolIndex::lookup_python` and `RenameOrigin` construction.
+///
+/// Mirrors the private `split_python_qualified_name` in `commit_index.rs`
+/// (which feeds the index's container/leaf fields), so the lookup keys line
+/// up byte-stable. `DocClaim` returns `None` for kind — the caller routes
+/// it before lookup. Module-level symbols (no container) use `""` for
+/// container, matching how `python_entries` is populated.
+fn python_fact_kind_container_leaf(
+    fact: &Fact,
+    path: &Path,
+) -> (Option<PythonFactKind>, String, String) {
+    fn split(qualified_name: &str, path: &Path) -> (String, String) {
+        let path_str = path.to_string_lossy();
+        let module_path = path_str
+            .strip_suffix(".py")
+            .unwrap_or(&path_str)
+            .replace('/', ".");
+        let stripped = qualified_name
+            .strip_prefix(&format!("{}.", module_path))
+            .unwrap_or(qualified_name);
+        if let Some(idx) = stripped.rfind('.') {
+            (stripped[..idx].to_string(), stripped[idx + 1..].to_string())
+        } else {
+            (String::new(), stripped.to_string())
+        }
+    }
+    match fact {
+        Fact::FunctionSignature { qualified_name, .. } => {
+            let (c, l) = split(qualified_name, path);
+            (Some(PythonFactKind::FunctionSignature), c, l)
+        }
+        Fact::Field { qualified_path, .. } => {
+            let (c, l) = split(qualified_path, path);
+            (Some(PythonFactKind::Field), c, l)
+        }
+        Fact::PublicSymbol { qualified_name, .. } => {
+            let (c, l) = split(qualified_name, path);
+            (Some(PythonFactKind::PublicSymbol), c, l)
+        }
+        Fact::TestAssertion { test_fn, .. } => (
+            Some(PythonFactKind::TestAssertion),
+            String::new(),
+            test_fn.clone(),
+        ),
+        Fact::DocClaim { .. } => (None, String::new(), String::new()),
+    }
 }
 
 /// Render the SPEC §3 single-line claim body for `fact`. For
