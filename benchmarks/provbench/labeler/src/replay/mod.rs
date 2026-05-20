@@ -110,9 +110,13 @@ struct FnDisambiguator {
 /// `HashMap<PathBuf, Option<RustAst>>` cache. The `Python` variant lands
 /// in Task 2; Task 1 introduces the type so the Rust path can be refactored
 /// without behavioral change.
+// TODO: derive Debug when RustAst/PythonAst are Debug
 pub(super) enum PostAst {
     Rust(crate::ast::RustAst),
-    // Python(crate::ast::python::PythonAst), // Task 2
+    // The inner PythonAst is read by Task 5 (matching_post_fact_python).
+    // Suppress dead_code until that task lands.
+    #[allow(dead_code)]
+    Python(crate::ast::python::PythonAst),
 }
 
 impl Replay {
@@ -436,20 +440,22 @@ impl Replay {
             let mut post_asts: HashMap<PathBuf, Option<PostAst>> = HashMap::new();
             for path in facts_by_path.keys() {
                 let blob = pilot.read_blob_at(&commit.sha, path)?;
-                // Only parse Rust files as `RustAst`. tree-sitter-rust will
-                // silently produce a garbled tree if handed Python source,
-                // which then violates `matching_post_fact`'s Rust-disambiguator
-                // contract (Plan A.1 fix; see
-                // `tests/python_replay_changed_file.rs`). Python paths get
-                // `post_ast = None` here and short-circuit to
-                // `Label::NeedsRevalidation` at the per-fact classify step
-                // below.
+                // Parse Rust files as `RustAst` and Python files as `PythonAst`.
+                // tree-sitter-rust will silently produce a garbled tree if
+                // handed Python source, so language dispatch is mandatory here.
+                // Python paths that fail to parse get `post_ast = None`; the
+                // Plan A.1 short-circuit at line ~516 routes all changed-Python
+                // facts to `Label::NeedsRevalidation` regardless of whether the
+                // cache entry is `Some` or `None`, so a parse failure is safe.
                 let ast = match crate::lang::Language::for_path(path) {
                     Some(crate::lang::Language::Rust) | None => blob
                         .as_ref()
                         .and_then(|bytes| RustAst::parse(bytes).ok())
                         .map(PostAst::Rust),
-                    Some(crate::lang::Language::Python) => None,
+                    Some(crate::lang::Language::Python) => blob
+                        .as_ref()
+                        .and_then(|bytes| crate::ast::python::PythonAst::parse(bytes).ok())
+                        .map(PostAst::Python),
                 };
                 cached_blobs.insert(path.clone(), blob);
                 post_asts.insert(path.clone(), ast);
@@ -533,8 +539,12 @@ impl Replay {
                 // signature still takes Option<&RustAst>. The adapter and
                 // the PostAst wrapping both disappear in Task 10 when the
                 // classifier signature is promoted to accept Option<&PostAst>.
-                let rust_ast_for_now: Option<&RustAst> = post_ast.map(|p| match p {
-                    PostAst::Rust(a) => a,
+                // Python paths never reach this point — the short-circuit above
+                // fires `continue` first — so the Python arm is unreachable in
+                // practice; we return None defensively rather than unreachable!().
+                let rust_ast_for_now: Option<&RustAst> = post_ast.and_then(|p| match p {
+                    PostAst::Rust(a) => Some(a),
+                    PostAst::Python(_) => None,
                 });
 
                 for observed in facts_at_path {
