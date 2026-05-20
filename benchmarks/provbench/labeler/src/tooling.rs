@@ -59,7 +59,7 @@ pub(crate) const PINNED_BINARIES: &[PinnedBinary] = &[
         tool: ExpectedTool {
             name: "rust-analyzer",
             version_hint: "1.85.0 (4d91de4e 2025-02-17)",
-            sha256_hex: "f85740bfa5b9136e9053768c015c31a6c7556f7cfe44f7f9323965034e1f9aee",
+            sha256_hex: "aeb4105778ca1bd3c6b0e75768f581c656633cd51368fa61289b6a71696ac7e1",
         },
         fallback_path: "/opt/homebrew/bin/rust-analyzer",
     },
