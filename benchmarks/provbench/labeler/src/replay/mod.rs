@@ -449,10 +449,8 @@ impl Replay {
                 // Parse Rust files as `RustAst` and Python files as `PythonAst`.
                 // tree-sitter-rust will silently produce a garbled tree if
                 // handed Python source, so language dispatch is mandatory here.
-                // Python paths that fail to parse get `post_ast = None`; the
-                // Plan A.1 short-circuit at line ~516 routes all changed-Python
-                // facts to `Label::NeedsRevalidation` regardless of whether the
-                // cache entry is `Some` or `None`, so a parse failure is safe.
+                // Python paths that fail to parse get `post_ast = None`;
+                // `classify_python_against_commit` handles that gracefully.
                 let ast = match crate::lang::Language::for_path(path) {
                     Some(crate::lang::Language::Rust) | None => blob
                         .as_ref()
@@ -472,11 +470,12 @@ impl Replay {
                 None
             } else {
                 let commit_rs_paths = rust_paths_at(&pilot, &commit.sha)?;
+                let commit_py_paths = python_paths_at(&pilot, &commit.sha)?;
                 Some(CommitSymbolIndex::build(
                     &pilot,
                     &commit.sha,
                     &commit_rs_paths,
-                    &[], // py_paths: wired to python_paths_at(commit) in Task 11
+                    &commit_py_paths,
                     &cached_blobs,
                 )?)
             };
@@ -514,39 +513,11 @@ impl Replay {
                 let t0_names: &HashSet<String> =
                     t0_names_by_path.get(path).unwrap_or(&EMPTY_STRING_SET);
 
-                // Plan A.1 short-circuit (Option C): for Python paths
-                // whose post-commit blob is NOT byte-identical to T₀,
-                // we cannot mechanically classify via the Rust-oriented
-                // AST match path (`matching_post_fact`,
-                // `CommitSymbolIndex`, and the rename detector are all
-                // Rust-only). Building a parallel PythonAst post-cache
-                // + Python-flavored matching is a v1.2c-and-beyond
-                // project; for v1.2b's flask held-out round we surface
-                // the limitation honestly via `Label::NeedsRevalidation`
-                // — the rule chain's existing "ask the baseline" hatch.
-                // Documented in `docs/superpowers/plans/...flask-heldout.md`
-                // hygiene flags and `tests/python_replay_changed_file.rs`.
-                let is_python_path = matches!(
-                    crate::lang::Language::for_path(path),
-                    Some(crate::lang::Language::Python)
-                );
-                if is_python_path {
-                    for observed in facts_at_path {
-                        rows.push(FactAtCommit {
-                            fact_id: fact_id(&observed.fact),
-                            commit_sha: commit.sha.clone(),
-                            label: Label::NeedsRevalidation,
-                        });
-                    }
-                    continue;
-                }
-
-                // Task 10 (Plan A.2): the classifier now accepts
-                // `Option<&PostAst>` directly and dispatches by language.
-                // The Task 1 temporary RustAst adapter is gone.
-                // The Python short-circuit above still fires `continue`
-                // before reaching here (Task 11 removes it), so Python
-                // facts don't yet hit `classify_python_against_commit`.
+                // Task 11 (Plan A.2): the Plan A.1 short-circuit that routed all
+                // changed-Python-file facts to `Label::NeedsRevalidation` is
+                // removed here. Python facts now flow through
+                // `classify_against_commit`, which dispatches to
+                // `classify_python_against_commit` via `PostAst::Python`.
                 for observed in facts_at_path {
                     let label = classify_against_commit(
                         &observed.fact,
