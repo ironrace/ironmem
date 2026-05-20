@@ -359,8 +359,27 @@ pub(super) fn matching_post_fact_python(
                 } if q == *qualified_path => Some((span, content_hash)),
                 _ => None,
             }),
-        // Stubs for Tasks 6-8.
-        Fact::PublicSymbol { .. } | Fact::DocClaim { .. } | Fact::TestAssertion { .. } => None,
+        Fact::PublicSymbol { qualified_name, .. } => {
+            crate::facts::python::symbol_existence::extract(ast, path).find_map(|f| match f {
+                Fact::PublicSymbol {
+                    qualified_name: q,
+                    span,
+                    content_hash,
+                    ..
+                } if q == *qualified_name => {
+                    // SPEC §11 row 2026-05-19: single-underscore-prefixed
+                    // leaf is NOT a continuation of a public name.
+                    let leaf = q.rsplit('.').next().unwrap_or(&q);
+                    if leaf.starts_with('_') {
+                        return None;
+                    }
+                    Some((span, content_hash))
+                }
+                _ => None,
+            })
+        }
+        // Stubs for Tasks 7-8.
+        Fact::DocClaim { .. } | Fact::TestAssertion { .. } => None,
     }
 }
 
@@ -411,6 +430,50 @@ mod python_match_tests {
         assert!(
             result.is_none(),
             "expected None for foo when only bar exists"
+        );
+    }
+
+    #[test]
+    fn python_public_symbol_matches_module_level_def() {
+        let src = b"def foo():\n    return 1\n";
+        let ast = PythonAst::parse(src).unwrap();
+        let path = Path::new("src/a.py");
+        let fact = Fact::PublicSymbol {
+            qualified_name: "src.a.foo".into(),
+            source_path: path.to_path_buf(),
+            span: crate::ast::spans::Span {
+                byte_range: 0..src.len(),
+                line_start: 1,
+                line_end: 1,
+            },
+            content_hash: "old-hash".into(),
+        };
+        let result = matching_post_fact_python(&fact, path, src, Some(&ast));
+        assert!(result.is_some(), "expected PublicSymbol match for foo");
+    }
+
+    #[test]
+    fn python_public_symbol_underscore_renames_to_none() {
+        // Post-commit source only has `_foo`; T0 fact has `qualified_name: "src.a.foo"`.
+        // The extractor emits "src.a._foo" — no name match — so result is None.
+        // The underscore leaf filter is defense-in-depth for any residual match.
+        let src = b"def _foo():\n    return 1\n";
+        let ast = PythonAst::parse(src).unwrap();
+        let path = Path::new("src/a.py");
+        let fact = Fact::PublicSymbol {
+            qualified_name: "src.a.foo".into(),
+            source_path: path.to_path_buf(),
+            span: crate::ast::spans::Span {
+                byte_range: 0..src.len(),
+                line_start: 1,
+                line_end: 1,
+            },
+            content_hash: "old-hash".into(),
+        };
+        let result = matching_post_fact_python(&fact, path, src, Some(&ast));
+        assert!(
+            result.is_none(),
+            "expected None when public foo became private _foo"
         );
     }
 
