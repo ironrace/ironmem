@@ -1,0 +1,15 @@
+{
+  "round": "v1.2c-flask-heldout-plan-a2-fullcorpus-sidecar",
+  "kind": "synthetic-baseline",
+  "note": "Synthetic full-corpus baseline. NOT a real LLM run. prediction='valid' is a placeholder; do NOT cite any LLM-baseline metric derived from this file. Exists solely to pin phase1's --baseline-run loader to the full 910,530-row corpus for a sidecar evaluation against phase1's own structural rule chain.",
+  "corpus_path": "benchmarks/provbench/corpus/flask-2f0c62f5-bf56f40.jsonl",
+  "rows_total": 910530,
+  "label_distribution": {
+    "Valid": 750318,
+    "StaleSourceDeleted": 64353,
+    "StaleSourceChanged": 79699,
+    "NeedsRevalidation": 6652,
+    "StaleSymbolRenamed": 9508
+  },
+  "request_id_marker": "synthetic-fullcorpus"
+}
