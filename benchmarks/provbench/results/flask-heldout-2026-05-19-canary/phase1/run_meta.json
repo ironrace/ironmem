@@ -1,0 +1,18 @@
+{
+  "round": "v1.2c-flask-heldout-plan-a2",
+  "rule_set_version": "v1.3",
+  "phase1_git_sha": "bf56f40999a5b3f026db517b196fa9d3a5724ded",
+  "scoring_git_sha": "bf56f40999a5b3f026db517b196fa9d3a5724ded",
+  "workspace_git_sha": "bf56f40999a5b3f026db517b196fa9d3a5724ded",
+  "labeler_git_sha": "bf56f40999a5b3f026db517b196fa9d3a5724ded",
+  "held_out_repo": "pallets/flask",
+  "held_out_repo_t0": "2f0c62f5e6e290843f03c1fa70817c7a3c7fd661",
+  "held_out_repo_head": "9fcd34c9f3065640bd1cd86234216ca068633fb9",
+  "first_parent_commits_t0_to_head": 401,
+  "spec_freeze_hash": "cd881a32c410a635074d6cec92b31d14382b8a0f1425789d2584f00fe9bacb30",
+  "sample_seed": "13897750829054410479",
+  "subset_size": 4000,
+  "run_date": "2026-05-19",
+  "retuning_in_round": false,
+  "baseline_dir": "../flask-heldout-2026-05-15-canary/baseline (symlinked; frozen v1.2b dry-run carrier reused per §10)"
+}
