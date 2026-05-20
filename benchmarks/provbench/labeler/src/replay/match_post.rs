@@ -320,3 +320,117 @@ pub(super) fn rename_candidates_for_typed(
         .map(|(qname, span)| RenameCandidate::new(qname, span))
         .collect()
 }
+
+/// Python equivalent of [`matching_post_fact`]. Five fact-kind arms.
+///
+/// SPEC §11 row 2026-05-19 (Plan A.2). Mirrors the Rust contract where
+/// applicable but uses `PythonAst` and `facts::python::*` extractors.
+/// PublicSymbol (Task 6), TestAssertion (Task 7), DocClaim (Task 8 stub)
+/// arms land in subsequent tasks.
+// Tasks 6-8 will wire callers from the Python replay path; suppress dead_code
+// until the call site lands.
+#[allow(dead_code)]
+pub(super) fn matching_post_fact_python(
+    fact: &Fact,
+    path: &Path,
+    _post_bytes: &[u8],
+    post_ast: Option<&crate::ast::python::PythonAst>,
+) -> Option<(Span, String)> {
+    let ast = post_ast?;
+    match fact {
+        Fact::FunctionSignature { qualified_name, .. } => {
+            crate::facts::python::function_signature::extract(ast, path).find_map(|f| match f {
+                Fact::FunctionSignature {
+                    qualified_name: q,
+                    span,
+                    content_hash,
+                    ..
+                } if q == *qualified_name => Some((span, content_hash)),
+                _ => None,
+            })
+        }
+        Fact::Field { qualified_path, .. } => crate::facts::python::field::extract(ast, path)
+            .find_map(|f| match f {
+                Fact::Field {
+                    qualified_path: q,
+                    span,
+                    content_hash,
+                    ..
+                } if q == *qualified_path => Some((span, content_hash)),
+                _ => None,
+            }),
+        // Stubs for Tasks 6-8.
+        Fact::PublicSymbol { .. } | Fact::DocClaim { .. } | Fact::TestAssertion { .. } => None,
+    }
+}
+
+#[cfg(test)]
+mod python_match_tests {
+    use super::*;
+    use crate::ast::python::PythonAst;
+    use std::path::Path;
+
+    #[test]
+    fn python_function_signature_matches_by_qualified_name() {
+        let src = b"def foo():\n    return 1\n";
+        let ast = PythonAst::parse(src).unwrap();
+        let path = Path::new("src/a.py");
+        let fact = Fact::FunctionSignature {
+            qualified_name: "src.a.foo".into(),
+            source_path: path.to_path_buf(),
+            span: crate::ast::spans::Span {
+                byte_range: 0..src.len(),
+                line_start: 1,
+                line_end: 1,
+            },
+            content_hash: "old-hash".into(),
+        };
+        let result = matching_post_fact_python(&fact, path, src, Some(&ast));
+        assert!(
+            result.is_some(),
+            "expected match for src.a.foo at src/a.py; got None"
+        );
+    }
+
+    #[test]
+    fn python_function_signature_misses_on_different_name() {
+        let src = b"def bar():\n    return 1\n";
+        let ast = PythonAst::parse(src).unwrap();
+        let path = Path::new("src/a.py");
+        let fact = Fact::FunctionSignature {
+            qualified_name: "src.a.foo".into(),
+            source_path: path.to_path_buf(),
+            span: crate::ast::spans::Span {
+                byte_range: 0..src.len(),
+                line_start: 1,
+                line_end: 1,
+            },
+            content_hash: "old-hash".into(),
+        };
+        let result = matching_post_fact_python(&fact, path, src, Some(&ast));
+        assert!(
+            result.is_none(),
+            "expected None for foo when only bar exists"
+        );
+    }
+
+    #[test]
+    fn python_field_matches_by_qualified_path() {
+        let src = b"class Greeter:\n    name = 'world'\n";
+        let ast = PythonAst::parse(src).unwrap();
+        let path = Path::new("src/a.py");
+        let fact = Fact::Field {
+            qualified_path: "src.a.Greeter.name".into(),
+            source_path: path.to_path_buf(),
+            type_text: String::new(),
+            span: crate::ast::spans::Span {
+                byte_range: 17..32,
+                line_start: 2,
+                line_end: 2,
+            },
+            content_hash: "old-hash".into(),
+        };
+        let result = matching_post_fact_python(&fact, path, src, Some(&ast));
+        assert!(result.is_some(), "expected match for src.a.Greeter.name");
+    }
+}
