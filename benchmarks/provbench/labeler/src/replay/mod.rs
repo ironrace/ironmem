@@ -247,11 +247,14 @@ impl Replay {
                     &blob,
                     crate::facts::python::symbol_existence::extract(&ast, path),
                 );
-                push_observed_facts(
+                let py_test_facts: Vec<Fact> =
+                    crate::facts::python::test_assertion::extract(&ast, path).collect();
+                push_test_assertion_facts(
                     &mut facts,
                     &mut facts_so_far,
                     &blob,
-                    crate::facts::python::test_assertion::extract(&ast, path),
+                    path,
+                    py_test_facts,
                 );
                 t0_blobs.insert(path.clone(), blob);
             }
@@ -393,11 +396,14 @@ impl Replay {
                     &blob,
                     crate::facts::python::symbol_existence::extract(&ast, path),
                 );
-                push_observed_facts(
+                let py_test_facts: Vec<Fact> =
+                    crate::facts::python::test_assertion::extract(&ast, path).collect();
+                push_test_assertion_facts(
                     &mut facts,
                     &mut facts_so_far,
                     &blob,
-                    crate::facts::python::test_assertion::extract(&ast, path),
+                    path,
+                    py_test_facts,
                 );
                 t0_blobs.insert(path.clone(), blob);
             }

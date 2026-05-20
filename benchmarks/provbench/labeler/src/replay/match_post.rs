@@ -335,6 +335,7 @@ pub(super) fn matching_post_fact_python(
     path: &Path,
     _post_bytes: &[u8],
     post_ast: Option<&crate::ast::python::PythonAst>,
+    test_assertion_ordinal: Option<usize>,
 ) -> Option<(Span, String)> {
     let ast = post_ast?;
     match fact {
@@ -378,8 +379,26 @@ pub(super) fn matching_post_fact_python(
                 _ => None,
             })
         }
-        // Stubs for Tasks 7-8.
-        Fact::DocClaim { .. } | Fact::TestAssertion { .. } => None,
+        Fact::TestAssertion { test_fn, .. } => {
+            let ordinal = test_assertion_ordinal.expect(
+                "Fact::TestAssertion must carry an ordinal; \
+                 see replay::push_test_assertion_facts. Routing through \
+                 None would silently misclassify post-commit assertions.",
+            );
+            crate::facts::python::test_assertion::extract(ast, path)
+                .filter_map(|f| match f {
+                    Fact::TestAssertion {
+                        test_fn: q,
+                        span,
+                        content_hash,
+                        ..
+                    } if q == *test_fn => Some((span, content_hash)),
+                    _ => None,
+                })
+                .nth(ordinal)
+        }
+        // Stub for Task 8.
+        Fact::DocClaim { .. } => None,
     }
 }
 
@@ -404,7 +423,7 @@ mod python_match_tests {
             },
             content_hash: "old-hash".into(),
         };
-        let result = matching_post_fact_python(&fact, path, src, Some(&ast));
+        let result = matching_post_fact_python(&fact, path, src, Some(&ast), None);
         assert!(
             result.is_some(),
             "expected match for src.a.foo at src/a.py; got None"
@@ -426,7 +445,7 @@ mod python_match_tests {
             },
             content_hash: "old-hash".into(),
         };
-        let result = matching_post_fact_python(&fact, path, src, Some(&ast));
+        let result = matching_post_fact_python(&fact, path, src, Some(&ast), None);
         assert!(
             result.is_none(),
             "expected None for foo when only bar exists"
@@ -448,7 +467,7 @@ mod python_match_tests {
             },
             content_hash: "old-hash".into(),
         };
-        let result = matching_post_fact_python(&fact, path, src, Some(&ast));
+        let result = matching_post_fact_python(&fact, path, src, Some(&ast), None);
         assert!(result.is_some(), "expected PublicSymbol match for foo");
     }
 
@@ -470,7 +489,7 @@ mod python_match_tests {
             },
             content_hash: "old-hash".into(),
         };
-        let result = matching_post_fact_python(&fact, path, src, Some(&ast));
+        let result = matching_post_fact_python(&fact, path, src, Some(&ast), None);
         assert!(
             result.is_none(),
             "expected None when public foo became private _foo"
@@ -493,7 +512,38 @@ mod python_match_tests {
             },
             content_hash: "old-hash".into(),
         };
-        let result = matching_post_fact_python(&fact, path, src, Some(&ast));
+        let result = matching_post_fact_python(&fact, path, src, Some(&ast), None);
         assert!(result.is_some(), "expected match for src.a.Greeter.name");
+    }
+
+    #[test]
+    fn python_test_assertion_pairs_by_test_fn_and_ordinal() {
+        let src = b"def test_thing():\n    assert 1 == 1\n    assert 2 == 2\n";
+        let ast = PythonAst::parse(src).unwrap();
+        let path = Path::new("tests/test_thing.py");
+        let fact = Fact::TestAssertion {
+            test_fn: "test_thing".into(),
+            source_path: path.to_path_buf(),
+            span: crate::ast::spans::Span {
+                byte_range: 0..src.len(),
+                line_start: 1,
+                line_end: 3,
+            },
+            content_hash: "old-hash".into(),
+            asserted_symbol: None,
+        };
+        // ordinal=1 (second assertion).
+        let result = matching_post_fact_python(&fact, path, src, Some(&ast), Some(1));
+        assert!(
+            result.is_some(),
+            "expected match for second assertion in test_thing; got None"
+        );
+
+        // Out-of-range ordinal=5.
+        let result_oob = matching_post_fact_python(&fact, path, src, Some(&ast), Some(5));
+        assert!(
+            result_oob.is_none(),
+            "expected None for out-of-range ordinal=5"
+        );
     }
 }
