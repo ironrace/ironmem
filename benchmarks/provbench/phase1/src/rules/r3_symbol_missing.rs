@@ -32,6 +32,24 @@ impl Rule for R3SymbolMissing {
         if leaf.is_empty() {
             return None; // defensive: empty/unparseable symbol_path
         }
+        // v1.4: language-aware dispatch. Python facts route through
+        // the AST resolver; Rust path is byte-identical to v1.3.
+        if is_python_fact(&ctx.fact.fact_id) {
+            if super::r3_python_resolver::resolves_in_python(post, leaf) {
+                return None;
+            }
+            return Some((
+                Decision::Stale,
+                serde_json::json!({
+                    "rule": "R3",
+                    "reason": "stale_source_deleted",
+                    "lang": "python",
+                    "symbol": qualified,
+                    "leaf": leaf,
+                })
+                .to_string(),
+            ));
+        }
         let needle = leaf.as_bytes();
         let haystack = post;
         // Naive substring search — symbol no longer literally appears.
@@ -57,4 +75,46 @@ impl Rule for R3SymbolMissing {
 /// Returns the input unchanged when no `::` is present.
 fn leaf_symbol(qualified: &str) -> &str {
     qualified.rsplit("::").next().unwrap_or(qualified)
+}
+
+/// Detect whether a fact identifier refers to a Python source line.
+/// Fact IDs are shaped `<kind>::<dotted_symbol>::<path>::<line>`.
+fn is_python_fact(fact_id: &str) -> bool {
+    // Path component ends in `.py` immediately before the trailing
+    // `::<line>`. Tolerate paths containing `::` themselves by looking
+    // at the substring before the last `::`.
+    let Some(last_sep) = fact_id.rfind("::") else {
+        return false;
+    };
+    let before_line = &fact_id[..last_sep];
+    before_line.ends_with(".py")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_python_fact;
+
+    #[test]
+    fn python_fact_detected() {
+        assert!(is_python_fact(
+            "FunctionSignature::flask.app.Flask.add_url_rule::src/flask/app.py::1234"
+        ));
+    }
+
+    #[test]
+    fn rust_fact_not_detected() {
+        assert!(!is_python_fact(
+            "FunctionSignature::ripgrep::cli::run::src/cli.rs::42"
+        ));
+    }
+
+    #[test]
+    fn empty_fact_id_returns_false() {
+        assert!(!is_python_fact(""));
+    }
+
+    #[test]
+    fn fact_without_separator_returns_false() {
+        assert!(!is_python_fact("nopath"));
+    }
 }
