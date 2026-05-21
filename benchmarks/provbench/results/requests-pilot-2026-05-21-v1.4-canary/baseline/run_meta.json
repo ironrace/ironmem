@@ -1,0 +1,14 @@
+{
+  "round": "v1.4-requests-pilot-canary-sidecar",
+  "kind": "synthetic-baseline",
+  "note": "Synthetic placeholder baseline for v1.4 requests pilot (Task 9). NOT a real LLM run. prediction=\"valid\" is a placeholder; do NOT cite any LLM-baseline metric derived from this file. Exists solely to pin phase1's --baseline-run loader to this 4,000-row eval subset for a sidecar evaluation against phase1's own structural rule chain.",
+  "corpus_path": "benchmarks/provbench/corpus/requests-0797c61f-bf56f40.jsonl",
+  "manifest_content_hash": "9d5b60966661185f4f17f9466e515d3cf776998a049f9f37a5247c644907ded8",
+  "rows_total": 4000,
+  "label_distribution": {
+    "Valid": 2400,
+    "StaleSourceChanged": 800,
+    "StaleSourceDeleted": 800
+  },
+  "request_id_marker": "synthetic-placeholder-v1.4-requests"
+}
