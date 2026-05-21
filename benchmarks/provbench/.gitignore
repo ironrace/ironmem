@@ -24,6 +24,8 @@ results/**/phase1-v1.4/phase1.sqlite-wal
 # its manifest.json/metrics.json are stub files, not real LLM artifacts.
 results/flask-heldout-2026-05-19-fullcorpus/phase1/predictions.jsonl
 results/flask-heldout-2026-05-19-fullcorpus/phase1/rule_traces.jsonl
+results/flask-heldout-2026-05-19-fullcorpus/phase1-v1.4/predictions.jsonl
+results/flask-heldout-2026-05-19-fullcorpus/phase1-v1.4/rule_traces.jsonl
 results/flask-heldout-2026-05-19-fullcorpus/baseline/predictions.jsonl
 results/flask-heldout-2026-05-19-fullcorpus/baseline/manifest.json
 results/flask-heldout-2026-05-19-fullcorpus/baseline/metrics.json

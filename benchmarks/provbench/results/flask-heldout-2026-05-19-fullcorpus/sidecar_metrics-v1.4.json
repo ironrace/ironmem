@@ -1,0 +1,94 @@
+{
+  "corpus_path": "benchmarks/provbench/corpus/flask-2f0c62f5-bf56f40.jsonl",
+  "labeler_git_sha": "bf56f40999a5b3f026db517b196fa9d3a5724ded",
+  "phase1_git_sha": "ffb794a9b90c09a5f1aa2e3d5554e87555ada88b",
+  "scoring_git_sha": "ffb794a9b90c09a5f1aa2e3d5554e87555ada88b",
+  "rule_set_version": "v1.4",
+  "run_date": "2026-05-21",
+  "n_total": 910530,
+  "phase1_runner_stats": {
+    "processed": 910530,
+    "valid": 398821,
+    "stale": 77744,
+    "needs_reval": 433965,
+    "wall_seconds": 3666
+  },
+  "confusion_matrix_3x3": {
+    "Valid": {
+      "needs_revalidation": 358037,
+      "valid": 389642,
+      "stale": 2639
+    },
+    "Stale_*": {
+      "stale": 69156,
+      "needs_revalidation": 75825,
+      "valid": 8579
+    },
+    "NeedsRevalidation": {
+      "stale": 5949,
+      "needs_revalidation": 103,
+      "valid": 600
+    }
+  },
+  "per_class_accuracy": {
+    "valid_retention": {
+      "point": 0.519302482414123,
+      "wilson_lower_95": 0.5181718839269918,
+      "n": 750318
+    },
+    "stale_detection_recall": {
+      "point": 0.45035165407658245,
+      "wilson_lower_95": 0.44786448566447973,
+      "n": 153560
+    },
+    "needs_revalidation_routing_accuracy": {
+      "point": 0.015484064942874324,
+      "wilson_lower_95": 0.012784353366046755,
+      "n": 6652
+    }
+  },
+  "per_class_by_subtype": {
+    "Valid": {
+      "needs_revalidation": 358037,
+      "valid": 389642,
+      "stale": 2639
+    },
+    "StaleSourceDeleted": {
+      "stale": 51481,
+      "needs_revalidation": 10729,
+      "valid": 2143
+    },
+    "StaleSourceChanged": {
+      "needs_revalidation": 65096,
+      "stale": 11189,
+      "valid": 3414
+    },
+    "NeedsRevalidation": {
+      "stale": 5949,
+      "needs_revalidation": 103,
+      "valid": 600
+    },
+    "StaleSymbolRenamed": {
+      "stale": 6486,
+      "valid": 3022
+    }
+  },
+  "per_rule_fires": {
+    "R1": 6580,
+    "R2": 142760,
+    "R3": 43790,
+    "R4": 717400
+  },
+  "delta_vs_v1_3": {
+    "valid_retention_wlb": 0.0,
+    "stale_recall_wlb": -0.47773551433552025,
+    "nr_routing_point": 0.015484064942874324
+  },
+  "diagnostic_gate": {
+    "v_retention_wlb_threshold": 0.8,
+    "observed": 0.5181718839269918,
+    "status": "FAIL",
+    "note": "R3 leaf fix shifts 416,569 prior-Stale rows to NR (R4 takes over). V-retention bottleneck is upstream of R3, not in R3."
+  },
+  "synthetic_baseline_note": "Baseline is synthetic (all 'valid'). Phase1 \u00a78 metrics computed against ground_truth in synthetic predictions, which equals the canonicalized corpus label."
+}
