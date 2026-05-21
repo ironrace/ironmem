@@ -116,6 +116,7 @@ fn dunder_name_found() {
 fn same_leaf_in_multiple_classes_resolves() {
     // If two classes define `m`, the leaf resolves — phase1 can't
     // tell which one is "ours". Conservative-Valid by design.
-    let src = b"class A:\n    def m(self):\n        pass\nclass B:\n    def m(self):\n        pass\n";
+    let src =
+        b"class A:\n    def m(self):\n        pass\nclass B:\n    def m(self):\n        pass\n";
     assert!(resolves_in_python(src, "m"));
 }
