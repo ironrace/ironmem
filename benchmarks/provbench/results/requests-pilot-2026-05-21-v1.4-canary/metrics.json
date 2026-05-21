@@ -4,8 +4,8 @@
     "cost_per_correct_invalidation_usd_delta": 0.0,
     "latency_p50_ratio_baseline_per_commit_to_candidate_per_row": 0.0,
     "needs_revalidation_routing_wilson_lower_95_delta": 0.0,
-    "stale_precision_point_delta": 0.5502958579881657,
-    "stale_recall_point_delta": 0.988125,
+    "stale_precision_point_delta": 1.0,
+    "stale_recall_point_delta": 0.86875,
     "valid_retention_wilson_lower_95_delta": -0.5918036284413717
   },
   "llm_baseline": {
@@ -96,23 +96,22 @@
       "valid__valid": 369
     },
     "R3": {
-      "stalesourcechanged__stale": 147,
-      "stalesourcedeleted__stale": 54,
-      "valid__stale": 1292
+      "stalesourcedeleted__stale": 10
     },
     "R4": {
-      "stalesourcechanged__needs_revalidation": 18,
+      "stalesourcechanged__needs_revalidation": 165,
       "stalesourcechanged__stale": 635,
+      "stalesourcedeleted__needs_revalidation": 44,
       "stalesourcedeleted__stale": 9,
       "stalesourcedeleted__valid": 1,
-      "valid__needs_revalidation": 85,
+      "valid__needs_revalidation": 1377,
       "valid__valid": 652
     },
     "R6": {
       "valid__valid": 2
     }
   },
-  "phase1-v1.4": {
+  "phase1": {
     "row_count": 4000,
     "section_7_1": {
       "needs_revalidation_routing_accuracy": {
@@ -120,10 +119,10 @@
         "wilson_lower_95": 0.0
       },
       "stale_detection": {
-        "f1": 0.7069081153588196,
-        "precision": 0.5502958579881657,
-        "recall": 0.988125,
-        "wilson_lower_95": 0.9815270804511245
+        "f1": 0.9297658862876255,
+        "precision": 1.0,
+        "recall": 0.86875,
+        "wilson_lower_95": 0.8513173254900666
       },
       "valid_retention_accuracy": {
         "point": 0.42625,
@@ -136,7 +135,7 @@
         "usd": 0.0
       },
       "latency_p50_ms": 0,
-      "latency_p95_ms": 17
+      "latency_p95_ms": 21
     }
   },
   "phase1_rules_nr_aware": {
@@ -148,10 +147,10 @@
         "wilson_lower_95": 0.0
       },
       "stale_detection": {
-        "f1": 0.7069081153588196,
-        "precision": 0.5502958579881657,
-        "recall": 0.988125,
-        "wilson_lower_95": 0.9815270804511245
+        "f1": 0.9297658862876255,
+        "precision": 1.0,
+        "recall": 0.86875,
+        "wilson_lower_95": 0.8513173254900666
       },
       "valid_retention_accuracy": {
         "point": 0.42625,
@@ -176,7 +175,7 @@
     },
     "section_8_5_stale_recall_wlb_ge_0_30": {
       "metric": "stale_recall_wlb",
-      "observed": 0.9815270804511245,
+      "observed": 0.8513173254900666,
       "passed": true,
       "status": "PASS",
       "target": 0.3
