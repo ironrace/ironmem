@@ -35,7 +35,11 @@ impl Rule for R3SymbolMissing {
         // v1.4: language-aware dispatch. Python facts route through
         // the AST resolver; Rust path is byte-identical to v1.3.
         if is_python_fact(&ctx.fact.fact_id) {
-            if super::r3_python_resolver::resolves_in_python(post, leaf) {
+            let py_leaf = leaf_python_symbol(qualified);
+            if py_leaf.is_empty() {
+                return None; // defensive
+            }
+            if super::r3_python_resolver::resolves_in_python(post, py_leaf) {
                 return None;
             }
             return Some((
@@ -45,7 +49,7 @@ impl Rule for R3SymbolMissing {
                     "reason": "stale_source_deleted",
                     "lang": "python",
                     "symbol": qualified,
-                    "leaf": leaf,
+                    "leaf": py_leaf,
                 })
                 .to_string(),
             ));
@@ -77,6 +81,13 @@ fn leaf_symbol(qualified: &str) -> &str {
     qualified.rsplit("::").next().unwrap_or(qualified)
 }
 
+/// Extract the leaf segment of a Python `.`-qualified symbol path
+/// (e.g. `module.Class.method` → `method`, `module.func` → `func`).
+/// Returns the input unchanged when no `.` is present.
+fn leaf_python_symbol(qualified: &str) -> &str {
+    qualified.rsplit('.').next().unwrap_or(qualified)
+}
+
 /// Detect whether a fact identifier refers to a Python source line.
 /// Fact IDs are shaped `<kind>::<dotted_symbol>::<path>::<line>`.
 fn is_python_fact(fact_id: &str) -> bool {
@@ -93,6 +104,28 @@ fn is_python_fact(fact_id: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::is_python_fact;
+    use super::leaf_python_symbol;
+
+    #[test]
+    fn python_leaf_extracts_last_dot_component() {
+        assert_eq!(
+            leaf_python_symbol("tests.test_structures.TestLookupDict.test_get"),
+            "test_get"
+        );
+    }
+
+    #[test]
+    fn python_leaf_handles_module_level_function() {
+        assert_eq!(
+            leaf_python_symbol("requests.utils.iter_slices"),
+            "iter_slices"
+        );
+    }
+
+    #[test]
+    fn python_leaf_passthrough_when_no_dot() {
+        assert_eq!(leaf_python_symbol("foo"), "foo");
+    }
 
     #[test]
     fn python_fact_detected() {
