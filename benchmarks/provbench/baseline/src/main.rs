@@ -52,6 +52,25 @@ struct SampleArgs {
     /// Path to write the resulting `manifest.json`.
     #[arg(long)]
     out: PathBuf,
+    /// Per-stratum target for the `Valid` class. Defaults to the
+    /// pre-registered §9.2 constant. Exposes a knob (sample shape),
+    /// not a rule/threshold — does NOT consume the §10 anti-leakage
+    /// clock.
+    #[arg(long, default_value_t = provbench_baseline::constants::TARGET_VALID)]
+    target_valid: usize,
+    /// Per-stratum target for the `StaleSourceChanged` class.
+    #[arg(long, default_value_t = provbench_baseline::constants::TARGET_STALE_CHANGED)]
+    target_stale_source_changed: usize,
+    /// Per-stratum target for the `StaleSourceDeleted` class.
+    #[arg(long, default_value_t = provbench_baseline::constants::TARGET_STALE_DELETED)]
+    target_stale_source_deleted: usize,
+    /// Per-stratum target for the `StaleSymbolRenamed` class.
+    /// Sentinel `usize::MAX` means "take the entire stratum".
+    #[arg(long, default_value_t = provbench_baseline::constants::TARGET_STALE_RENAMED)]
+    target_stale_symbol_renamed: usize,
+    /// Per-stratum target for the `NeedsRevalidation` class.
+    #[arg(long, default_value_t = provbench_baseline::constants::TARGET_NEEDS_REVALIDATION)]
+    target_needs_revalidation: usize,
 }
 
 #[derive(Debug, clap::Args)]
@@ -83,6 +102,13 @@ struct RunArgs {
     /// Must remain ≤ the immutable SPEC §6.2 / §15 ceiling.
     #[arg(long, name = "budget-usd", default_value_t = provbench_baseline::constants::DEFAULT_OPERATIONAL_BUDGET_USD)]
     budget_usd: f64,
+    /// Sliding-window input-tokens-per-minute throttle. `0` disables
+    /// the throttle entirely. Default is well under Anthropic's 450k
+    /// ITPM org-cap on `claude-sonnet-4-6` to leave headroom for the
+    /// parse-retry doublings. Robustness knob only — does not touch
+    /// the §10 frozen surface.
+    #[arg(long, default_value_t = provbench_baseline::constants::DEFAULT_MAX_INPUT_TOKENS_PER_MINUTE)]
+    max_input_tokens_per_minute: usize,
 }
 
 #[derive(Debug, clap::Args)]
@@ -104,12 +130,19 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
         Command::Sample(args) => {
+            let targets = provbench_baseline::sample::PerStratumTargets {
+                valid: args.target_valid,
+                stale_changed: args.target_stale_source_changed,
+                stale_deleted: args.target_stale_source_deleted,
+                stale_renamed: args.target_stale_symbol_renamed,
+                needs_revalidation: args.target_needs_revalidation,
+            };
             let manifest = provbench_baseline::manifest::SampleManifest::from_corpus(
                 &args.corpus,
                 &args.facts,
                 &args.diffs_dir,
                 args.seed,
-                provbench_baseline::sample::PerStratumTargets::default(),
+                targets,
                 args.budget_usd,
             )?;
             manifest.save_atomic(&args.out)?;
@@ -139,6 +172,7 @@ fn main() -> Result<()> {
                     fixture_mode: args.fixture_mode,
                     max_batches: args.max_batches,
                     max_concurrency: args.max_concurrency,
+                    max_input_tokens_per_minute: args.max_input_tokens_per_minute,
                     client_override: None,
                 }),
             )?;

@@ -32,10 +32,12 @@ use crate::facts::{load_facts, FactBody};
 use crate::manifest::SampleManifest;
 use crate::prompt::PromptBuilder;
 use crate::sample::SampledRow;
+use crate::throttle::{estimate_input_tokens_from_chars, InputTokenMeter, ThrottleDecision};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::time::Instant;
 
 pub use provbench_scoring::PredictionRow;
 
@@ -50,6 +52,9 @@ pub struct RunnerOpts {
     pub max_batches: Option<usize>,
     /// Forward-compat knob; ignored in v1 (sequential dispatch).
     pub max_concurrency: usize,
+    /// Per-minute input-token throttle cap. `0` disables the throttle.
+    /// See [`crate::throttle::InputTokenMeter`].
+    pub max_input_tokens_per_minute: usize,
     /// Optional pre-built client (test-only seam: lets the integration
     /// suite point the runner at a wiremock server without touching
     /// global env vars). `None` in the CLI path — `from_env()` is used.
@@ -129,6 +134,7 @@ pub async fn run(opts: RunnerOpts) -> Result<RunResult> {
         fixture_mode,
         max_batches,
         max_concurrency: _max_concurrency, // v1: sequential
+        max_input_tokens_per_minute,
         client_override,
     } = opts;
 
@@ -154,6 +160,7 @@ pub async fn run(opts: RunnerOpts) -> Result<RunResult> {
     };
 
     let mut meter = CostMeter::new(budget_usd);
+    let mut token_meter = InputTokenMeter::new(max_input_tokens_per_minute);
     let mut batches_completed = 0usize;
     let mut batches_skipped_resume = 0usize;
     let mut batches_parse_failed = 0usize;
@@ -222,6 +229,26 @@ pub async fn run(opts: RunnerOpts) -> Result<RunResult> {
                 .with_context(|| format!("fixture for batch {}", batch.batch_id))?
         } else {
             // Live path. `client` is Some by construction in this branch.
+            // ITPM throttle: pace dispatch to stay under the per-minute
+            // input-token cap. Estimate from prompt char-count; replace
+            // with the response's `usage.input_tokens` after the call.
+            let est_tokens =
+                estimate_input_tokens_from_chars(blocks.iter().map(|b| b.text.len()).sum());
+            if let ThrottleDecision::SleepFor(dur) =
+                token_meter.would_sleep(Instant::now(), est_tokens)
+            {
+                tracing::info!(
+                    "input-token throttle: sleeping {:?} before batch {} (est_tokens={}, current_sum={}, cap={})",
+                    dur,
+                    batch.batch_id,
+                    est_tokens,
+                    token_meter.current_sum(),
+                    max_input_tokens_per_minute,
+                );
+                tokio::time::sleep(dur).await;
+            }
+            token_meter.record_estimate(Instant::now(), est_tokens);
+
             let c = client.as_ref().expect("live client present");
             match c.score_batch(blocks).await {
                 Ok(r) => r,
@@ -254,6 +281,13 @@ pub async fn run(opts: RunnerOpts) -> Result<RunResult> {
         };
 
         meter.record(&response.usage)?;
+        // Replace the conservative char-based estimate with the actual
+        // total input tokens reported by Anthropic, so the throttle's
+        // sliding-window sum converges to ground truth.
+        let actual_input = (response.usage.input_tokens as usize)
+            .saturating_add(response.usage.cache_creation_input_tokens as usize)
+            .saturating_add(response.usage.cache_read_input_tokens as usize);
+        token_meter.correct(actual_input);
 
         // Index predictions by id for the parallel-row lookup.
         let pred_by_id: HashMap<&str, &str> = response

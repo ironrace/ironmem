@@ -68,6 +68,7 @@ async fn runner_skips_batch_and_logs_sidecar_on_parse_failure() {
         fixture_mode: None,
         max_batches: None,
         max_concurrency: 1,
+        max_input_tokens_per_minute: 0,
         client_override: Some(client),
     };
 

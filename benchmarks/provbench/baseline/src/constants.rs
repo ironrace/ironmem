@@ -16,6 +16,13 @@ pub const MAX_FACTS_PER_BATCH: usize = 32;
 /// Maximum retries on transient errors (SPEC §6.2).
 pub const MAX_TRANSIENT_RETRIES: u32 = 2;
 
+/// Default per-minute input-token throttle cap. Set well below
+/// Anthropic's 450k ITPM org-cap on `claude-sonnet-4-6` to leave
+/// headroom for the parse-retry doublings. Off entirely when the
+/// CLI flag is set to `0`. Robustness knob only — does not touch
+/// the §10 frozen surface (prompt/scoring/labeler).
+pub const DEFAULT_MAX_INPUT_TOKENS_PER_MINUTE: usize = 300_000;
+
 // --- Token prices (SPEC §6.2 / §15 snapshot 2026-05-09) ---
 
 /// $3.00 per 1M input tokens (uncached).

@@ -160,7 +160,8 @@ impl AnthropicClient {
                 .as_str()
                 .unwrap_or("")
                 .to_string();
-            match serde_json::from_str::<Vec<Decision>>(&text) {
+            let parse_input = strip_markdown_fence(&text);
+            match serde_json::from_str::<Vec<Decision>>(parse_input) {
                 Ok(decisions) => {
                     return Ok(BatchResponse {
                         decisions,
@@ -228,6 +229,42 @@ struct CacheControl<'a> {
     kind: &'a str,
 }
 
+/// Strip a single leading ```` ```json ```` or bare ```` ``` ```` fence and
+/// the matching trailing ```` ``` ```` from a model response, if present.
+///
+/// Defensive pre-parse fixup for the documented Anthropic behavior of
+/// occasionally wrapping JSON responses in a markdown code-fence despite
+/// the prompt asking for bare JSON. Only the OUTERMOST fence pair is
+/// stripped — mid-content backticks are left alone — and stripping leaves
+/// trailing/leading whitespace handled too. If no recognizable fence is
+/// present, the input is returned unchanged so the deeper addendum-retry
+/// path remains in charge of true malformation.
+pub(crate) fn strip_markdown_fence(s: &str) -> &str {
+    let trimmed = s.trim();
+    // Find the opening fence (```json or bare ```).
+    let after_open = if let Some(rest) = trimmed.strip_prefix("```json") {
+        rest
+    } else if let Some(rest) = trimmed.strip_prefix("```") {
+        rest
+    } else {
+        return s;
+    };
+    // Require a newline directly after the opener — guards against
+    // accidentally peeling the leading characters of a non-fenced string
+    // that happens to start with three backticks followed by content.
+    let after_newline = match after_open.strip_prefix('\n') {
+        Some(rest) => rest,
+        None => return s,
+    };
+    // Require a trailing ``` (allow trailing whitespace/newline after it).
+    let trimmed_end = after_newline.trim_end();
+    let body = match trimmed_end.strip_suffix("```") {
+        Some(rest) => rest,
+        None => return s,
+    };
+    body.trim()
+}
+
 fn build_request_body<'a>(blocks: &'a [ContentBlock]) -> ApiRequestBody<'a> {
     let content: Vec<_> = blocks
         .iter()
@@ -245,5 +282,98 @@ fn build_request_body<'a>(blocks: &'a [ContentBlock]) -> ApiRequestBody<'a> {
             role: "user",
             content,
         }],
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn strip_fence_bare_json_is_unchanged() {
+        let s = r#"[{"id":"x","decision":"valid"}]"#;
+        assert_eq!(strip_markdown_fence(s), s);
+    }
+
+    #[test]
+    fn strip_fence_with_language_tag() {
+        let s = "```json\n[{\"id\":\"x\",\"decision\":\"valid\"}]\n```";
+        assert_eq!(
+            strip_markdown_fence(s),
+            r#"[{"id":"x","decision":"valid"}]"#
+        );
+    }
+
+    #[test]
+    fn strip_fence_without_language_tag() {
+        let s = "```\n[{\"id\":\"x\",\"decision\":\"valid\"}]\n```";
+        assert_eq!(
+            strip_markdown_fence(s),
+            r#"[{"id":"x","decision":"valid"}]"#
+        );
+    }
+
+    #[test]
+    fn strip_fence_with_trailing_whitespace() {
+        let s = "```json\n[{\"id\":\"x\",\"decision\":\"valid\"}]\n```\n";
+        assert_eq!(
+            strip_markdown_fence(s),
+            r#"[{"id":"x","decision":"valid"}]"#
+        );
+    }
+
+    #[test]
+    fn strip_fence_with_leading_whitespace() {
+        let s = "  ```json\n[{\"id\":\"x\",\"decision\":\"valid\"}]\n```";
+        assert_eq!(
+            strip_markdown_fence(s),
+            r#"[{"id":"x","decision":"valid"}]"#
+        );
+    }
+
+    #[test]
+    fn strip_fence_real_sample_from_parse_failures() {
+        // Reconstructed from parse_failures.jsonl line 2
+        // (flask-heldout-2026-05-20-canary canary run).
+        let raw = "```json\n[\n  {\"id\": \"Field::src.flask.scaffold.Scaffold.name::src/flask/scaffold.py::77\", \"decision\": \"valid\"}\n]\n```";
+        let stripped = strip_markdown_fence(raw);
+        let parsed: Vec<Decision> =
+            serde_json::from_str(stripped).expect("real sample should parse after fence-stripping");
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].decision, "valid");
+    }
+
+    #[test]
+    fn strip_fence_passthrough_when_inner_is_malformed() {
+        // Stripping must not mask a deeper malformation: the addendum-
+        // retry path is what handles non-JSON.
+        let s = "```json\nnot really JSON\n```";
+        let stripped = strip_markdown_fence(s);
+        // Stripping happens (we got the body), but parsing still fails.
+        assert_eq!(stripped, "not really JSON");
+        assert!(serde_json::from_str::<Vec<Decision>>(stripped).is_err());
+    }
+
+    #[test]
+    fn strip_fence_no_strip_on_mid_content_backticks() {
+        // A string with ``` in the middle (no leading fence) is unchanged.
+        let s = r#"[{"id":"x```y","decision":"valid"}]"#;
+        assert_eq!(strip_markdown_fence(s), s);
+    }
+
+    #[test]
+    fn strip_fence_no_strip_without_newline_after_opener() {
+        // Three backticks followed directly by content (no newline) is
+        // not a recognized fence — return unchanged.
+        let s = "```not a fence```";
+        assert_eq!(strip_markdown_fence(s), s);
+    }
+
+    #[test]
+    fn strip_fence_no_strip_with_open_but_no_close() {
+        // Opening fence but no closing fence — leave alone so the
+        // addendum-retry path gets a chance to see the raw response.
+        let s = "```json\n[{\"id\":\"x\",\"decision\":\"valid\"}]";
+        assert_eq!(strip_markdown_fence(s), s);
     }
 }
