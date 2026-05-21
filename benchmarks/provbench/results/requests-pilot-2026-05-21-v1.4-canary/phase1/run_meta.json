@@ -1,0 +1,63 @@
+{
+  "round": "v1.4-requests-pilot-r3-python-ast",
+  "rule_set_version": "v1.4",
+  "phase1_git_sha": "cc0442d0508ab44b6b928675ce7edc10cc8af990",
+  "scoring_git_sha": "cc0442d0508ab44b6b928675ce7edc10cc8af990",
+  "workspace_git_sha": "cc0442d0508ab44b6b928675ce7edc10cc8af990",
+  "labeler_git_sha": "bf56f40999a5b3f026db517b196fa9d3a5724ded",
+  "pilot_repo": "psf/requests",
+  "pilot_repo_t0": "0797c61fd541f92f66e409dbf9515ca287af28d2",
+  "pilot_repo_head": "cd90742ed94d901759e26766197d0ce7c7bd9c8e",
+  "first_parent_commits_t0_to_head": 344,
+  "spec_freeze_hash": "f00b4db931c8f541b754ad24dc3825d0cce11bf2f52e35aa32be2dd03584898c",
+  "sample_seed": "13897750829054410479",
+  "subset_size": 4000,
+  "subset_per_stratum": {
+    "Valid": 2400,
+    "StaleSourceChanged": 800,
+    "StaleSourceDeleted": 800,
+    "StaleSymbolRenamed": 0,
+    "NeedsRevalidation": 0
+  },
+  "subset_per_stratum_note": "requests corpus has 0 StaleSymbolRenamed and 0 NeedsRevalidation rows (too stable). Rebalanced from the v1.2d-shape 1500V+500/500/500+1000NR to 2400V+800SSC+800SSD=4000 per round design §4.1/4.2.",
+  "baseline_synthetic": true,
+  "baseline_synthetic_note": "Placeholder predictions (all 'valid') for the synthetic baseline. No LLM calls. Phase1 §8 metrics are computed against the manifest ground truth, not against the synthetic baseline's predictions.",
+  "run_date": "2026-05-21",
+  "retuning_in_round": true,
+  "r3_python_leaf_fix_iteration": 1,
+  "phase1_row_count": 4000,
+  "phase1_wall_seconds": 19,
+  "compare_wall_seconds": 0,
+  "primary_gate_verdict": {
+    "section_8_3_valid_retention_wlb_ge_0_95": {
+      "observed": 0.4065983215428492,
+      "target": 0.95,
+      "status": "FAIL"
+    },
+    "section_8_4_latency_p50_le_727_ms": {
+      "observed": 0.0,
+      "target": 727.0,
+      "status": "PASS"
+    },
+    "section_8_5_stale_recall_wlb_ge_0_30": {
+      "observed": 0.8513173254900666,
+      "target": 0.3,
+      "status": "PASS"
+    }
+  },
+  "primary_gate_summary": "Iteration 1 (R3 Python leaf fix cc0442d0): R3 over-fire on Valid Python rows is RESOLVED (R3 fires dropped 1493 -> 10; reason='stale_source_deleted' no longer collides with valid dotted-path Python symbols). §8 #5 stale_recall_wlb dropped 0.9815 -> 0.8513 but still PASSes the 0.30 target by 55pp. §8 #3 valid_retention_wlb stuck at 0.4066 because R4 now dominates: of 2400 Valid rows, R4 emits 1377 needs_revalidation + 644 stale (only 652 Valid). R3 fix was necessary but not sufficient; next iteration must retune R4 (guard_below_floor heuristic over-fires on Valid Python rows).",
+  "per_rule_fire_counts": {
+    "R1": 736,
+    "R2": 369,
+    "R3": 10,
+    "R4": 2883,
+    "R6": 2,
+    "R7": 0
+  },
+  "phase1_prediction_class_distribution": {
+    "valid": 1024,
+    "stale": 1390,
+    "needs_revalidation": 1586
+  },
+  "false_stale_root_cause": "Iteration 1: R3 contribution to false-Stale dropped to 10 rows (all StaleSourceDeleted-correct). Remaining FP load is now in R4: 644 false-Stale + 1377 false-NeedsRevalidation on Valid rows (guard_below_floor heuristic over-fires on small Python symbols). The R3 Python leaf fix is byte-correct; next iteration target is R4."
+}

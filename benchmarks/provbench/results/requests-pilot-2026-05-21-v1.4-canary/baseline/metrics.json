@@ -1,0 +1,80 @@
+{
+  "coverage": "subset",
+  "labeler_git_sha": "c6b308fe0962a9e05dd70d2cf207c5fa405da25e-dirty",
+  "llm_validator_agreement": {
+    "cohen_kappa": {
+      "ci_95_lower": 0.0,
+      "ci_95_upper": 0.0,
+      "n_bootstrap": 1000,
+      "point_estimate": 0.0
+    },
+    "confusion_matrix_3x3": [
+      [
+        2400,
+        0,
+        0
+      ],
+      [
+        1600,
+        0,
+        0
+      ],
+      [
+        0,
+        0,
+        0
+      ]
+    ],
+    "overall": {
+      "ht_se": 0.0,
+      "point": 0.8366146732068515
+    },
+    "per_class": {
+      "needs_revalidation": 0.0,
+      "stale": 0.0,
+      "valid": 1.0
+    },
+    "per_stale_subtype": {
+      "changed": 0.0,
+      "deleted": 0.0
+    }
+  },
+  "model_id": "claude-sonnet-4-6",
+  "model_snapshot_date": "2026-05-09",
+  "per_stratum_sizes": {
+    "StaleSourceChanged": 800,
+    "StaleSourceDeleted": 800,
+    "Valid": 2400
+  },
+  "population_weights": {
+    "needs_revalidation": 0.011288756574762537,
+    "stale": 0.16154090961109271,
+    "valid": 0.8271703338141447
+  },
+  "sample_seed": "0xc0debabedeadbeef",
+  "section_7_1": {
+    "needs_revalidation_routing_accuracy": {
+      "point": 0.0,
+      "wilson_lower_95": 0.0
+    },
+    "stale_detection": {
+      "f1": 0.0,
+      "precision": 0.0,
+      "recall": 0.0,
+      "wilson_lower_95": 0.0
+    },
+    "valid_retention_accuracy": {
+      "point": 1.0,
+      "wilson_lower_95": 0.9984019499842208
+    }
+  },
+  "section_7_2_applicable": {
+    "cost_per_correct_invalidation": {
+      "tokens": 0,
+      "usd": 0.0
+    },
+    "latency_p50_ms": 0,
+    "latency_p95_ms": 0
+  },
+  "spec_freeze_hash": "f00b4db931c8f541b754ad24dc3825d0cce11bf2f52e35aa32be2dd03584898c"
+}

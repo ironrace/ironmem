@@ -28,9 +28,12 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 gix = { version = "0.66", default-features = false, features = ["max-performance-safe"] }
 # Used in Task 3+: R5 whitespace/comment-only and R6 doc-claim parsers
-tree-sitter = "0.22"
+# v1.4: tree-sitter + tree-sitter-python pinned to labeler crate's versions
+# (bf56f40) to avoid parser-state mismatch (design §9 risk #6).
+tree-sitter = "0.25"
 tree-sitter-rust = "0.21"
 tree-sitter-md = "0.2"
+tree-sitter-python = "0.25"
 provbench-scoring = { path = "../scoring" }
 
 [dev-dependencies]

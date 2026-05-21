@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 pub mod r0_diff_excluded;
 pub mod r1_source_file_missing;
 pub mod r2_blob_identical;
+pub mod r3_python_resolver;
 pub mod r3_symbol_missing;
 pub mod r4_span_hash_changed;
 pub mod r5_whitespace_or_comment_only;
