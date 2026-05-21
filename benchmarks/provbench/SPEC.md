@@ -235,6 +235,7 @@ benchmarks/provbench/
 | Role | Repo | T₀ commit SHA | Language |
 |---|---|---|---|
 | Pilot | `https://github.com/BurntSushi/ripgrep` (`13.0.0`; 602 commits to `master` at selection time) | `af6b6c543b224d348a8876f0c06245d9ea7929c5` | Rust |
+| Pilot (v1.4 Python) | `https://github.com/psf/requests` (`v2.24.0`, 2020-06-17; 344 first-parent commits T₀→HEAD `cd90742ed94d901759e26766197d0ce7c7bd9c8e` pinned 2026-05-18; merge ratio 31.7% = 109/344 — hygiene flag for labeler-emit phase) | `0797c61fd541f92f66e409dbf9515ca287af28d2` | Python |
 | Held-out #1 | `https://github.com/serde-rs/serde` (`v1.0.130`; 1114 commits to `master` at selection time) | `65e1a50749938612cfbdb69b57fc4cf249f87149` | Rust |
 | Held-out #2 | `https://github.com/pallets/flask` (`2.0.0`; 1300 commits to `main` at selection time) | `2f0c62f5e6e290843f03c1fa70817c7a3c7fd661` | Python |
 
