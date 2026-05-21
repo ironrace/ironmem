@@ -12,6 +12,11 @@ spotcheck/*.bak
 spotcheck/*.PARKED
 work/
 results/**/phase1/phase1.sqlite
+results/**/phase1/phase1.sqlite-shm
+results/**/phase1/phase1.sqlite-wal
+results/**/phase1-v1.4/phase1.sqlite
+results/**/phase1-v1.4/phase1.sqlite-shm
+results/**/phase1-v1.4/phase1.sqlite-wal
 
 # Full-corpus sidecar artifacts (Plan A.2 flask v1.3, 2026-05-19) — too large
 # to track; regeneratable from labeler at bf56f40 + phase1 over the corpus.
