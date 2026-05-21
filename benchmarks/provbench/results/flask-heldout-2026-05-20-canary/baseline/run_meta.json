@@ -1,0 +1,17 @@
+{
+  "batches_total": 401,
+  "batches_completed": 3,
+  "batches_skipped_resume": 271,
+  "batches_parse_failed": 127,
+  "rows_total": 4000,
+  "rows_scored": 61,
+  "total_cost_usd": 1.249917,
+  "total_tokens": 406847,
+  "tokens_in_uncached": 404399,
+  "tokens_in_cache_write": 0,
+  "tokens_in_cache_read": 0,
+  "tokens_out": 2448,
+  "aborted": false,
+  "abort_reason": null,
+  "manifest_content_hash": "2fd04ab27be1ebe1cb5a9b3e0ddb975ddd077a4d469b6e7e01a9a1dc91a4de5c"
+}

@@ -1,0 +1,83 @@
+{
+  "coverage": "subset",
+  "labeler_git_sha": "bf56f40999a5b3f026db517b196fa9d3a5724ded",
+  "llm_validator_agreement": {
+    "cohen_kappa": {
+      "ci_95_lower": -0.0010783594301058024,
+      "ci_95_upper": 0.011716132392730002,
+      "n_bootstrap": 1000,
+      "point_estimate": 0.005000562510711391
+    },
+    "confusion_matrix_3x3": [
+      [
+        1026,
+        0,
+        14
+      ],
+      [
+        998,
+        12,
+        16
+      ],
+      [
+        681,
+        6,
+        6
+      ]
+    ],
+    "overall": {
+      "ht_se": 0.003005434087750801,
+      "point": 0.8180224540672969
+    },
+    "per_class": {
+      "needs_revalidation": 0.008658008658008658,
+      "stale": 0.011695906432748537,
+      "valid": 0.9865384615384616
+    },
+    "per_stale_subtype": {
+      "changed": 0.009036144578313253,
+      "deleted": 0.02064896755162242,
+      "renamed": 0.005633802816901409
+    }
+  },
+  "model_id": "claude-sonnet-4-6",
+  "model_snapshot_date": "2026-05-09",
+  "per_stratum_sizes": {
+    "NeedsRevalidation": 693,
+    "StaleSourceChanged": 332,
+    "StaleSourceDeleted": 339,
+    "StaleSymbolRenamed": 355,
+    "Valid": 1040
+  },
+  "population_weights": {
+    "needs_revalidation": 0.011288756574762537,
+    "stale": 0.16154090961109271,
+    "valid": 0.8271703338141447
+  },
+  "sample_seed": "0xc0debabedeadbeef",
+  "section_7_1": {
+    "needs_revalidation_routing_accuracy": {
+      "point": 0.008658008658008658,
+      "wilson_lower_95": 0.003973911262686802
+    },
+    "stale_detection": {
+      "f1": 0.022988505747126436,
+      "precision": 0.6666666666666666,
+      "recall": 0.011695906432748537,
+      "wilson_lower_95": 0.006703040632798719
+    },
+    "valid_retention_accuracy": {
+      "point": 0.9865384615384616,
+      "wilson_lower_95": 0.9775313572016513
+    }
+  },
+  "section_7_2_applicable": {
+    "cost_per_correct_invalidation": {
+      "tokens": 33903,
+      "usd": 0.10415975
+    },
+    "latency_p50_ms": 5118,
+    "latency_p95_ms": 16946
+  },
+  "spec_freeze_hash": "41be7eb01c474a0a1faf69a139e4f52aa6e053e2668d230b2c22881102dc3b1f"
+}
