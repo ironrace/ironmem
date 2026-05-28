@@ -36,18 +36,41 @@ REQUIRED_CLAUDE_AGENTS=(
   code-reviewer
 )
 
+# /collab-only command + prompt files the install must place so that a fresh
+# user can run `/collab` end-to-end. The lists are intentionally minimal —
+# anything broader belongs to the plugin-marketplace install path, not this
+# script.
+REQUIRED_CLAUDE_COMMANDS=(
+  collab
+)
+
+REQUIRED_CODEX_PROMPTS=(
+  collab
+  collab-batch-impl
+)
+
 SKIP_BUILD=0
 SKIP_SKILLS=0
+SKIP_WIRING=0
 FORCE_SKILLS=0
+FORCE_WIRING=0
 
 usage() {
   cat <<'EOF'
-Usage: scripts/install-ironmem.sh [--skip-build] [--skip-skills] [--force-skills]
+Usage: scripts/install-ironmem.sh [--skip-build] [--skip-skills] [--skip-wiring]
+                                  [--force-skills] [--force-wiring]
 
 Options:
   --skip-build     Install the existing target/release/ironmem binary.
-  --skip-skills    Do not install bundled Codex/Claude skill and agent dependencies.
-  --force-skills   Replace existing skill/agent files with bundled copies.
+  --skip-skills    Do not install bundled Codex/Claude skill, agent, command,
+                   and prompt dependencies.
+  --skip-wiring    Do not register the ironmem MCP server in Claude/Codex
+                   config or warn about missing /ultrareview-local.
+  --force-skills   Replace existing skill/agent/command/prompt files with
+                   bundled copies.
+  --force-wiring   Replace an existing 'ironmem' MCP entry in
+                   ~/.claude.json or ~/.codex/config.toml with the bundled one
+                   (use only when the config has drifted from a fresh install).
 EOF
 }
 
@@ -59,8 +82,14 @@ for arg in "$@"; do
     --skip-skills)
       SKIP_SKILLS=1
       ;;
+    --skip-wiring)
+      SKIP_WIRING=1
+      ;;
     --force-skills)
       FORCE_SKILLS=1
+      ;;
+    --force-wiring)
+      FORCE_WIRING=1
       ;;
     -h|--help)
       usage
@@ -186,6 +215,56 @@ install_agent_set() {
   done
 }
 
+# Generic .md installer used by commands and prompts. We don't reuse
+# install_agent_set because its name list and target naming are entangled with
+# the agent loop; splitting keeps each loop readable.
+install_md_set() {
+  local label="$1"      # human-readable kind (e.g. "Claude command")
+  local source_root="$2"
+  local target_root="$3"
+  shift 3
+  local names=("$@")
+
+  local missing=0
+  for name in "${names[@]}"; do
+    if [[ ! -f "$source_root/$name.md" ]]; then
+      echo "ERROR: bundled $label missing: $source_root/$name.md" >&2
+      missing=1
+    fi
+  done
+  if [[ "$missing" -eq 1 ]]; then
+    exit 1
+  fi
+
+  mkdir -p "$target_root"
+  echo "==> Installing ${label}s → $target_root"
+
+  for name in "${names[@]}"; do
+    local source="$source_root/$name.md"
+    local target="$target_root/$name.md"
+
+    if [[ ! -e "$target" ]]; then
+      cp "$source" "$target"
+      echo "    installed $name"
+      continue
+    fi
+
+    if diff -q "$source" "$target" >/dev/null 2>&1; then
+      echo "    $name already installed"
+      continue
+    fi
+
+    if [[ "$FORCE_SKILLS" -eq 1 ]]; then
+      cp "$source" "$target"
+      echo "    replaced $name"
+      continue
+    fi
+
+    echo "    WARN: $name already exists and differs from bundled copy; leaving it unchanged" >&2
+    echo "          Re-run with --force-skills to replace it." >&2
+  done
+}
+
 if [[ "$SKIP_BUILD" -eq 0 ]]; then
   echo "==> Building ironmem release"
   (cd "$REPO_ROOT" && cargo build --release -p ironmem --bin ironmem)
@@ -212,18 +291,106 @@ if ! VERSION_OUTPUT=$("$TARGET" --version 2>&1); then
 fi
 echo "    $VERSION_OUTPUT"
 
+CODEX_HOME="${CODEX_HOME:-$HOME/.codex}"
+CLAUDE_HOME="${CLAUDE_HOME:-$HOME/.claude}"
+
 if [[ "$SKIP_SKILLS" -eq 0 ]]; then
-  CODEX_HOME="${CODEX_HOME:-$HOME/.codex}"
-  CLAUDE_HOME="${CLAUDE_HOME:-$HOME/.claude}"
   CODEX_SKILLS_DIR="${CODEX_SKILLS_DIR:-$CODEX_HOME/skills}"
   CLAUDE_SKILLS_DIR="${CLAUDE_SKILLS_DIR:-$CLAUDE_HOME/skills}"
   CLAUDE_AGENTS_DIR="${CLAUDE_AGENTS_DIR:-$CLAUDE_HOME/agents}"
+  CLAUDE_COMMANDS_DIR="${CLAUDE_COMMANDS_DIR:-$CLAUDE_HOME/commands}"
+  CODEX_PROMPTS_DIR="${CODEX_PROMPTS_DIR:-$CODEX_HOME/prompts}"
 
   install_skill_set "Codex" "$REPO_ROOT/.codex-plugin/skills" "$CODEX_SKILLS_DIR"
   install_skill_set "Claude" "$REPO_ROOT/.claude-plugin/skills" "$CLAUDE_SKILLS_DIR"
   install_agent_set "Claude" "$REPO_ROOT/.claude-plugin/agents" "$CLAUDE_AGENTS_DIR"
+  install_md_set "Claude command" "$REPO_ROOT/.claude-plugin/commands" \
+    "$CLAUDE_COMMANDS_DIR" "${REQUIRED_CLAUDE_COMMANDS[@]}"
+  install_md_set "Codex prompt" "$REPO_ROOT/.codex-plugin/prompts" \
+    "$CODEX_PROMPTS_DIR" "${REQUIRED_CODEX_PROMPTS[@]}"
 else
-  echo "==> Skipping skill dependency install"
+  echo "==> Skipping skill / command / prompt install"
+fi
+
+# MCP server registration + /ultrareview-local preflight. Split from skills
+# because a sysadmin may want to install the files but wire MCP themselves.
+if [[ "$SKIP_WIRING" -eq 0 ]]; then
+  CLAUDE_CONFIG_JSON="${CLAUDE_CONFIG_JSON:-$HOME/.claude.json}"
+  CODEX_CONFIG_TOML="${CODEX_CONFIG_TOML:-$CODEX_HOME/config.toml}"
+
+  # ---- Claude Code: ~/.claude.json mcpServers.ironmem -----------------------
+  if ! command -v jq >/dev/null 2>&1; then
+    echo "==> WARN: jq not installed; skipping Claude MCP registration check." >&2
+    echo "          Install jq, or add this manually to $CLAUDE_CONFIG_JSON:" >&2
+    echo "          { \"mcpServers\": { \"ironmem\": { \"command\": \"$TARGET\", \"args\": [\"serve\"] } } }" >&2
+  else
+    if [[ ! -f "$CLAUDE_CONFIG_JSON" ]]; then
+      echo "{}" > "$CLAUDE_CONFIG_JSON"
+    fi
+
+    EXISTING_CMD="$(jq -r '.mcpServers.ironmem.command // empty' "$CLAUDE_CONFIG_JSON" 2>/dev/null || echo "")"
+    if [[ -z "$EXISTING_CMD" ]]; then
+      echo "==> Registering 'ironmem' MCP server in $CLAUDE_CONFIG_JSON"
+      TMP="$(mktemp)"
+      jq --arg cmd "$TARGET" \
+        '.mcpServers = ((.mcpServers // {}) + {ironmem: {command: $cmd, args: ["serve"]}})' \
+        "$CLAUDE_CONFIG_JSON" > "$TMP" && mv -f "$TMP" "$CLAUDE_CONFIG_JSON"
+    elif [[ "$EXISTING_CMD" == "$TARGET" ]]; then
+      echo "    'ironmem' MCP server already registered for Claude"
+    elif [[ "$FORCE_WIRING" -eq 1 ]]; then
+      echo "==> Replacing divergent 'ironmem' MCP entry (was: $EXISTING_CMD)"
+      TMP="$(mktemp)"
+      jq --arg cmd "$TARGET" \
+        '.mcpServers.ironmem = {command: $cmd, args: ["serve"]}' \
+        "$CLAUDE_CONFIG_JSON" > "$TMP" && mv -f "$TMP" "$CLAUDE_CONFIG_JSON"
+    else
+      echo "    WARN: 'ironmem' MCP entry already exists with command=$EXISTING_CMD" >&2
+      echo "          Expected: $TARGET. Re-run with --force-wiring to replace." >&2
+    fi
+  fi
+
+  # ---- Codex: ~/.codex/config.toml [mcp_servers.ironmem] --------------------
+  # TOML editing without a TOML parser is fragile, so we only ever append a
+  # missing block — we never rewrite an existing one. --force-wiring is a
+  # no-op here and prints a manual-edit hint instead.
+  if [[ ! -f "$CODEX_CONFIG_TOML" ]]; then
+    mkdir -p "$(dirname "$CODEX_CONFIG_TOML")"
+    : > "$CODEX_CONFIG_TOML"
+  fi
+
+  if grep -q '^\[mcp_servers\.ironmem\]' "$CODEX_CONFIG_TOML"; then
+    if [[ "$FORCE_WIRING" -eq 1 ]]; then
+      echo "    WARN: --force-wiring cannot safely rewrite TOML in place." >&2
+      echo "          Edit $CODEX_CONFIG_TOML by hand to point command = \"$TARGET\"." >&2
+    else
+      echo "    'ironmem' MCP server already registered for Codex"
+    fi
+  else
+    echo "==> Appending [mcp_servers.ironmem] to $CODEX_CONFIG_TOML"
+    {
+      echo ""
+      echo "[mcp_servers.ironmem]"
+      echo "command = \"$TARGET\""
+      echo "args = [\"serve\"]"
+      echo ""
+      echo "[mcp_servers.ironmem.env]"
+      echo "IRONMEM_MCP_MODE = \"trusted\""
+    } >> "$CODEX_CONFIG_TOML"
+  fi
+
+  # ---- /ultrareview-local preflight -----------------------------------------
+  # /collab's CodeReviewLocalPending phase shells out to /ultrareview-local.
+  # It ships in a separate plugin, so we only warn (don't fail) if absent.
+  ULTRAREVIEW_CMD="$CLAUDE_HOME/commands/ultrareview-local.md"
+  if [[ ! -f "$ULTRAREVIEW_CMD" ]]; then
+    echo ""
+    echo "WARN: /ultrareview-local is not installed at $ULTRAREVIEW_CMD." >&2
+    echo "      /collab's CodeReviewLocalPending phase invokes it; without it the" >&2
+    echo "      flow will halt there. Install it from your /ultrareview-local source" >&2
+    echo "      (it is not bundled with ironmem)." >&2
+  fi
+else
+  echo "==> Skipping MCP wiring and /ultrareview-local preflight"
 fi
 
 # Surface running `ironmem serve` instances as an FYI — the atomic install

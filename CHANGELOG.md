@@ -7,6 +7,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.1] - 2026-05-28
+
+### Added
+
+- `scripts/install-ironmem.sh` now installs the four `/collab` dependencies
+  fresh users were previously missing: the `/collab` command file
+  (`~/.claude/commands/collab.md`), the Codex `/collab` and
+  `collab-batch-impl` prompts (`~/.codex/prompts/`), the `ironmem` MCP
+  server registration in `~/.claude.json` (via `jq`) and
+  `~/.codex/config.toml` (appended block), and a preflight warning when
+  `~/.claude/commands/ultrareview-local.md` is absent (it is not bundled
+  with ironmem but is invoked by `/collab`'s `CodeReviewLocalPending`
+  phase).
+- New install flags: `--skip-wiring` and `--force-wiring`. `--skip-skills`
+  / `--force-skills` now also cover the new command and prompt installs.
+
+### Notes
+
+- Hooks remain unmanaged by `install-ironmem.sh`: the bundled
+  `.claude-plugin/hooks/ironmem-hook.sh` requires a plugin-tree layout
+  this script does not produce, and the binary-direct hook entries in
+  `~/.claude/settings.json` (calling `ironmem hook …` directly) are the
+  supported wiring. `/collab` itself does not depend on the diary /
+  auto-mining hooks.
+
 ## [0.3.0] - 2026-05-27
 
 ### Changed
