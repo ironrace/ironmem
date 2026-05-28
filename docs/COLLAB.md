@@ -21,9 +21,9 @@ This document covers:
 - the `collab_*` MCP tools
 - topic payload formats for every protocol message
 - harness-side responsibilities (git, cargo, gh, coderabbit)
-- the autonomous long-poll loop each agent runs
-- Claude's Plan Mode integration for canonical synthesis and revisions
-- copy-pasteable prompts for the Claude and Codex terminals
+- Claude's dispatcher loop and one-shot Codex dispatches
+- Claude's Plan Mode integration for the first canonical synthesis, the v1 final plan, and the v3 final_review (PR creation)
+- copy-pasteable prompts (single-terminal default; Codex-terminal fallback)
 - a worked example
 
 The two slash-command prompts that agents actually run are derived from
@@ -61,7 +61,7 @@ not an iteration target.
   explicitly declined with a rationale) in the `final` plan.
 - `review_round` is the audit trail. It is set to 1 after the first
   review and to 2 after the second; post-finalize the test suite asserts
-  `review_round == MAX_REVIEW_ROUNDS` at `state_machine/tests.rs:203`.
+  `review_round == MAX_REVIEW_ROUNDS` at `state_machine/tests.rs:205`.
 - The protocol is bounded by construction: at most two Codex reviews,
   then forced Claude finalize. Docs/prompts that frame v1 planning as
   open-ended iteration to convergence are wrong.
@@ -69,14 +69,15 @@ not an iteration target.
 ## Runtime Model
 
 ```text
-Claude / Codex (each in its own terminal / worktree)
+Claude (single dispatcher loop in one terminal; Codex turns dispatched inline via background codex exec)
   └─ collab_* MCP tools
       └─ ironmem serve (stdio)
           └─ SQLite (sessions, messages, capabilities, wal_log)
 ```
 
-Protocol enforcement lives in the server. The agents are thin clients that
-long-poll `wait_my_turn` and react to the state machine.
+Protocol enforcement lives in the server. Claude is the long-running
+dispatcher that polls the state machine; Codex turns are one-shot
+clients that read state, send exactly one protocol message, and exit.
 
 ## Session State
 
@@ -107,6 +108,11 @@ All state changes are recorded in `wal_log`.
 
 Both agents submit exactly one `draft`. Order is not enforced.
 
+Claude's draft is sent **autonomously — no Plan Mode, no user approval —**
+so Codex's draft can begin grinding without waiting on a user gate. The
+blind-draft invariant is enforced server-side independent of this gating
+change.
+
 **Blind-draft invariant:** `collab_recv` suppresses a counterpart's
 `draft` until the calling agent has submitted its own. This is enforced
 server-side, not by convention.
@@ -120,7 +126,22 @@ Owner: `claude`. Claude sends one `canonical` message containing the merged
 plan.
 
 This phase is also re-entered on `request_changes`, so Claude uses it both
-for the first synthesis and for revisions.
+for the first synthesis and for revisions. **Gating split by `review_round`
+(prompt-enforced, not server-enforced):**
+
+- `review_round == 0` (first synthesis) — Claude enters harness Plan Mode
+  and gets user approval before sending `canonical`. This is the user's
+  primary v1 steering gate (the first artifact that combines both drafts).
+- `review_round >= 1` (revision rounds, re-entered on `request_changes`) —
+  Claude sends autonomously. The user's next gate is `final` at
+  `PlanClaudeFinalizePending`.
+
+The server accepts a `canonical` send in either branch; the user-approval
+requirement on the first synthesis is honored by the prompt layer
+(`.claude-plugin/commands/collab.md`'s v1 phase table). Compare with
+`MAX_REVIEW_ROUNDS = 2`, which IS server-enforced via the force-finalize
+branch above. Treat the prompt-enforced split as advisory at the protocol
+layer but load-bearing in the dispatcher.
 
 Exit → `PlanCodexReviewPending`, owner `codex`.
 
@@ -182,10 +203,13 @@ immutable thereafter:
 - **`implementer == "codex"`** (opt-in via
   `/collab start --implementer=codex`): Claude still produces the
   writing-plans markdown and publishes `task_list` (writing-plans
-  approval is still the user gate). Then Claude hands off to Codex via
-  `mcp__codex__codex`; Codex runs its own
+  approval is still the user gate). Then Claude dispatches Codex via
+  background `codex exec` (per Implementation Notes § Background
+  `codex exec` dispatch; `mcp__codex__codex` is the fallback when
+  `codex` is not on PATH). Codex runs its own
   `subagent-driven-development` (controller-owned loop, runs to
-  completion) and emits `implementation_done` itself before returning.
+  completion) and emits `implementation_done` itself before the
+  bg-exec polling loop detects phase advance.
 
 In both modes the server stores the `task_list` manifest as an audit
 artifact but does not iterate it; per-task progress is observable
@@ -474,7 +498,7 @@ orchestrator from steering the reviewer's conclusion.
 | Topic | Sender | Payload | Notes |
 |---|---|---|---|
 | `task_list` | `claude` | `{"plan_hash","base_sha","head_sha","plan_file_path"?,"execution_mode"?,"tasks":[{"id","title","acceptance":[...]}]}` | `plan_hash` must equal `final_plan_hash`; `tasks` must be non-empty and strictly ordered by `id`; each task requires ≥1 `acceptance` entry. Optional `plan_file_path` (repo-relative; no leading `/`; no `..` segments) points at the writing-plans markdown driving subagent execution. Optional `execution_mode` — see below. |
-| `implementation_done` | `claude` | `{"head_sha"}` | In `CodeImplementPending` only. Fired once after the subagent batch completes and gates pass. Carries only `head_sha` — no prose, no subagent notes. |
+| `implementation_done` | `claude` or `codex` (per session `implementer`) | `{"head_sha"}` | In `CodeImplementPending` only. Fired once after the subagent batch completes and gates pass. Carries only `head_sha` — no prose, no subagent notes. |
 | `review_fix_global` | `codex` | `{"head_sha"}` | In `CodeReviewFixGlobalPending` only. Codex reviewed the raw post-implementation diff (no Claude pre-clean) and has pushed any branch-level fixes. |
 | `review_local` | `claude` | `{"head_sha"}` | In `CodeReviewLocalPending` only. Claude ran `/ultrareview-local` as an audit of Codex's `review_fix_global` commits + caught code-quality issues both agents missed; has pushed any fixes. |
 | `final_review` | `claude` | `{"head_sha","pr_url"}` | In `CodeReviewFinalPending` only. Claude has opened the PR; the event carries the URL and advances directly to `CodingComplete`. `pr_url` must start with `https://` and be ≤2048 chars. |
@@ -544,7 +568,7 @@ by the owner recorded in the phase table above.
 The server validates transitions, persists hashes, and routes messages.
 Most shell-level action — cargo, gh, coderabbit — is the **agent harness's**
 responsibility. The protocol relies on the harness doing these things
-between `wait_my_turn` and `collab_send`:
+before each coding-active `collab_send`:
 
 - **`base_sha` / `head_sha` tracking.** The harness records `base_sha` at
   `task_list` send time (the commit the branch forked from) and the current
@@ -602,11 +626,12 @@ between `wait_my_turn` and `collab_send`:
   explicit: removing the PR check from Codex's batch turn also removes
   Codex's dependency on `api.github.com` reachability, which was observed
   as a fragility in practice.
-- **Plan Mode** on Claude's side is entered before `canonical`, `final`
-  (v1), and `final_review` (v3 PR creation). The `task_list` send is
-  gated by writing-plans's own approval handoff (the user reviews the
-  generated markdown and approves) rather than the harness's Plan Mode.
-  Codex never enters Plan Mode.
+- **Plan Mode** on Claude's side is entered before the first `canonical`
+  (`review_round == 0`), `final` (v1), and `final_review` (v3 PR
+  creation). Revision-round canonicals run autonomously. The `task_list`
+  send is gated by writing-plans's own approval handoff (the user
+  reviews the generated markdown and approves) rather than the
+  harness's Plan Mode. Codex never enters Plan Mode.
 
 The server does not read the git tree for the full v3 flow, and it still
 trusts the harness's `head_sha` string there. The narrow shortcut-only
@@ -617,60 +642,79 @@ and the harness still responsible for local verification and any
 
 ## Autonomous Planning Loop
 
-Each agent runs the same shape of loop:
+**Claude runs the single control loop.** Codex CLI sessions are one-shot:
+each Codex-owned turn is dispatched inline via background `codex exec`
+(see Implementation Notes § Background `codex exec` dispatch), reads
+state, sends exactly one protocol message, and exits. There is no
+symmetric long-running polling loop on the Codex side — Claude polls,
+Claude dispatches. A single bounded `wait_my_turn` call at invocation
+start (as in `.codex-plugin/prompts/collab.md`) is permitted to bridge
+the brief server-write race after Claude's dispatch — that's a one-shot
+boot-time wait, not a polling loop.
+
+Claude's loop:
 
 ```text
 loop:
-  wait = collab_wait_my_turn(session_id, me, 30)
-  if wait.session_ended or wait.phase == "PlanLocked": break
-  if not wait.is_my_turn: continue
-
   status = collab_status(session_id)
-  msgs   = collab_recv(session_id, me)
-  for m in msgs: collab_ack(session_id, m.id)
-
-  act on (status.phase, status.current_owner) → send exactly one protocol message
+  if status.session_ended or status.phase in terminal_set: break
+  if status.current_owner == "codex":
+    dispatch Codex via background `codex exec`; poll until phase advances
+    continue
+  # current_owner == "claude"
+  msgs = collab_recv(session_id, "claude", auto_ack=true)
+  act on (status.phase, status.review_round) → send exactly one protocol message
 ```
 
 Phase → action (v1):
 
 | Phase | Claude does | Codex does |
 |---|---|---|
-| `PlanParallelDrafts` | send `draft` (once) | send `draft` (once) |
-| `PlanSynthesisPending` | enter Plan Mode, synthesize `canonical`, send | wait |
-| `PlanCodexReviewPending` | wait | send `review` (or `approve` shortcut) |
-| `PlanClaudeFinalizePending` | enter Plan Mode, send `final` | wait |
-| `PlanLocked` | exit loop (or send `task_list` to start v3) | exit loop |
+| `PlanParallelDrafts` | send `draft` autonomously (no Plan Mode); owner flips to `codex` | one-shot bg-exec: send `draft`, exit |
+| `PlanSynthesisPending` | `review_round == 0` → enter Plan Mode, get user approval, synthesize `canonical`, send. `review_round >= 1` → revise autonomously (no Plan Mode), send | wait (not polling) |
+| `PlanCodexReviewPending` | wait | one-shot bg-exec: send `review` (or `approve` shortcut), exit |
+| `PlanClaudeFinalizePending` | enter Plan Mode, get user approval, send `final` | wait |
+| `PlanLocked` | exit loop (or send `task_list` to start v3) | n/a |
 
 Phase → action (v3):
 
 | Phase | Claude does | Codex does |
 |---|---|---|
-| `PlanLocked` (post-final) | run `writing-plans` on the locked plan; user approves the generated markdown; build `task_list` JSON (with `plan_file_path`), send | wait |
-| `CodeImplementPending` | run `subagent-driven-development` to dispatch per-task subagents; on full success run gates and send `implementation_done{head_sha}` | wait |
-| `CodeReviewFixGlobalPending` | wait | review the raw post-implementation diff (no Claude pre-clean), fix branch-level issues in place, send `review_fix_global` |
+| `PlanLocked` (post-final) | run `writing-plans` on the locked plan; user approves the generated markdown; build `task_list` JSON (with `plan_file_path`), send | n/a |
+| `CodeImplementPending` (implementer=claude) | run `subagent-driven-development` locally; on full success run gates and send `implementation_done{head_sha}` | wait |
+| `CodeImplementPending` (implementer=codex) | dispatch Codex via bg-exec; poll | one-shot bg-exec: run `subagent-driven-development`, emit `implementation_done{head_sha}`, exit |
+| `CodeReviewFixGlobalPending` | dispatch Codex via bg-exec; poll | one-shot bg-exec: review raw post-implementation diff, fix branch-level issues in place, send `review_fix_global`, exit |
 | `CodeReviewLocalPending` | run `/ultrareview-local` as audit of Codex's commits, fix CRITICAL/HIGH/MEDIUM in place, send `review_local` | wait |
 | `CodeReviewFinalPending` | gates, enter Plan Mode for PR title/body, `gh pr create`, send `final_review{pr_url}` | wait |
-| `CodingComplete` / `CodingFailed` | exit loop | exit loop |
+| `CodingComplete` / `CodingFailed` | exit loop | n/a |
 
 ### Claude's Plan Mode Integration
 
-Claude enters harness Plan Mode **only** before sending v1 `final` and v3
-`final_review`. Everything before that — the initial draft, the canonical
-synthesis, any revision rounds, and the v3 `task_list` send — runs
-autonomously, with the user gating only at writing-plans's own approval
-handoff during the v3 bridge.
+Claude enters harness Plan Mode at **exactly three gates**, matching the
+command-file invariant bullet:
 
-The user is gated at v1 `final` because that's the planning commit point
-(post-send the session is `PlanLocked`), and at v3 `final_review` because
-that's where the PR is opened. Codex does not use Plan Mode — it posts
-drafts, reviews, and global fixes directly.
+1. **v1 first `canonical`** — `PlanSynthesisPending` with `review_round == 0`.
+   The first artifact combining both drafts; the user's primary v1
+   steering gate.
+2. **v1 `final`** — `PlanClaudeFinalizePending`. The planning commit
+   point; post-send the session is `PlanLocked`.
+3. **v3 `final_review`** — `CodeReviewFinalPending`. PR creation.
+
+Everything else runs autonomously: the blind `draft` send (from
+`/collab start`), revision-round canonicals (`PlanSynthesisPending`
+with `review_round >= 1`), all Codex turns, and the v3 `task_list`
+send (gated by writing-plans's own approval handoff during the v3
+bridge, not harness Plan Mode). Codex never enters Plan Mode — it
+posts drafts, reviews, and global fixes directly.
 
 ## Prompt Templates
 
-The user types the task; the agent fills in everything else.
+The user types the task; the agent fills in everything else. Normal path
+is **single-terminal**: the user runs `/collab start` in Claude's terminal
+and Claude dispatches every Codex turn inline via background `codex exec`.
+The Codex-terminal "join" path is the fallback below.
 
-### Starting a session (Claude's terminal)
+### Starting a session (Claude's terminal — normal path)
 
 User types:
 
@@ -691,16 +735,25 @@ Claude's behavior on receiving this:
 3. `initiator` ← `"claude"` (this is the Claude terminal).
 4. `task` ← the text after `start`/`start:`.
 5. Call `collab_start` with those four fields.
-6. Report the returned `session_id` back to the user in a format they can
-   paste into Codex's terminal verbatim, e.g.
-   `collab-join <session_id>`.
-7. Enter the autonomous planning loop as `claude`:
-   `wait_my_turn → status → recv/ack → act`. Enter Plan Mode before
-   sending `canonical` or `final`. Do not call `collab_end`.
+6. Report the returned `session_id` back to the user as a single-line
+   tracking message (e.g. `Collab session started: <session_id>
+   (implementer: <claude|codex>)`). Do not instruct the user to paste
+   anything into a Codex terminal — Claude drives Codex inline via
+   background `codex exec`.
+7. Enter the autonomous planning loop as `claude` (see § Autonomous
+   Planning Loop). Send the blind `draft` autonomously (no Plan Mode);
+   enter Plan Mode only at the three gates listed in
+   § Claude's Plan Mode Integration. Do not call `collab_end`.
 
-### Joining a session (Codex's terminal)
+### Joining a session in a Codex terminal — fallback only
 
-User types:
+This path is **only** used when both `codex` CLI on PATH and the
+`mcp__codex__codex` MCP server are unavailable in Claude's terminal —
+i.e., Claude has no way to dispatch Codex inline. The user manually
+runs the join command in a separate Codex terminal so Codex can poll
+for its own turn.
+
+User types in a Codex terminal:
 
 ```text
 /collab join <session_id>
@@ -712,16 +765,19 @@ or:
 collab-join <session_id>
 ```
 
-Codex's behavior:
+Codex's behavior in this fallback:
 
 1. Store `<session_id>` as the current session — every subsequent
    `collab_*` call uses it without re-prompting.
-2. `agent` / `sender` / `receiver` ← `"codex"` (this is the Codex terminal).
+2. `agent` / `sender` / `receiver` ← `"codex"`.
 3. Call `collab_status(session_id)` to read the task (the user
    does not re-type it on this side).
-4. Enter the autonomous planning loop as `codex`:
-   `wait_my_turn → status → recv/ack → act`. One draft, then up to two
-   reviews. Claude has the last word. Do not call `collab_end`.
+4. Run a one-shot turn for the current Codex-owned phase
+   (`PlanParallelDrafts` draft, `PlanCodexReviewPending` review,
+   `CodeReviewFixGlobalPending` global fix, or
+   `CodeImplementPending` batch impl when `implementer == "codex"`).
+   Codex CLI sessions are one-shot; the prompt exits after one send
+   regardless. Do not call `collab_end`.
 
 ### Agent-side defaults — never ask the user
 
@@ -739,31 +795,44 @@ If the agent is running somewhere without a git repo, it falls back to
 
 ## Worked Example
 
+Single-terminal narrative (normal path). The user only types the
+`/collab start` line; Claude drives every Codex turn inline.
+
 ```text
 user (Claude terminal):
   /collab start design marketing landing page
 
 Claude: resolves repo_path, branch, initiator=claude. start → s_abc.
-        draft sent. wait_my_turn → codex owns.
-        Tells the user: "Run in Codex: collab-join s_abc"
-
-user (Codex terminal):
-  collab-join s_abc
-
-Codex:  status → task is "design marketing landing page". draft sent.
-Claude: wait_my_turn fires → owner=claude, phase=PlanSynthesisPending.
-        recv → sees Codex's draft. Enter Plan Mode. canonical sent.
-Codex:  wait_my_turn fires → codex owns. review verdict=request_changes.
-Claude: wait_my_turn fires → phase=PlanSynthesisPending (round 1 done).
-        revise canonical in Plan Mode. send canonical.
-Codex:  approve_with_minor_edits.
-Claude: wait_my_turn fires → PlanClaudeFinalizePending. send final.
-        Status now PlanLocked. Loop exits.
+        Draft sent autonomously — no Plan Mode (review_round == 0
+        gates the first canonical, not the blind draft). Owner flips
+        to codex.
+Claude: dispatches Codex via background `codex exec` with the resolved
+        Codex prompt. Begins polling collab_status + BashOutput.
+Codex (bg-exec):
+        reads status → task is "design marketing landing page".
+        Submits one draft. Exits.
+Claude: poll observes owner=claude, phase=PlanSynthesisPending,
+        review_round=0. recv → sees Codex's draft. **Enters Plan Mode
+        for the user-gated first canonical.** User approves. Sends
+        canonical.
+Claude: dispatches Codex again via bg-exec for the review.
+Codex (bg-exec):
+        reads canonical, returns verdict=request_changes. Exits.
+Claude: poll observes phase=PlanSynthesisPending, review_round=1.
+        **Revision-round canonical is autonomous — no Plan Mode.**
+        Revises canonical incorporating Codex's notes, sends.
+Claude: dispatches Codex again via bg-exec.
+Codex (bg-exec):
+        approve_with_minor_edits. Exits.
+Claude: poll observes phase=PlanClaudeFinalizePending. **Enters Plan
+        Mode for final.** User approves. Sends final. Phase now
+        PlanLocked. Loop exits.
 ```
 
-Two rounds of `request_changes` would force Claude into
-`PlanClaudeFinalizePending` without another synthesis — last word is still
-Claude's.
+Two `request_changes` rounds would force Claude into
+`PlanClaudeFinalizePending` without a third synthesis — last word is
+still Claude's. Revision-round canonicals are always autonomous; only
+the first canonical and the final are user-gated.
 
 ## Running the MCP Server
 
@@ -778,42 +847,6 @@ Smoke test without the embed model:
 ```bash
 IRONMEM_MCP_MODE=trusted IRONMEM_EMBED_MODE=noop ./target/release/ironmem serve
 ```
-
-## Codex handoff via MCP
-
-Codex CLI sessions are one-shot: after sending a review and seeing the
-session hand off back to Claude, Codex emits a summary and stops. It has
-no `ScheduleWakeup` primitive to self-wake on the next handoff. Rather
-than relying on an external daemon, Claude drives Codex's turn inline
-via Codex's MCP server (`codex mcp-server`):
-
-1. Register `codex mcp-server` with Claude Code (once):
-   ```bash
-   claude mcp add codex codex mcp-server
-   ```
-2. Claude's `/collab` prompt drives Codex whenever
-   `current_owner == "codex"` (after a Claude send, on `/collab join`
-   mid-session, or in the dispatch loop). **`codex mcp-server` does not
-   resolve slash commands from `.codex-plugin/prompts/`.** Passing a
-   raw `/collab join <sid>` string makes Codex treat it as ordinary
-   user text and go off-script. Claude must expand the prompt locally:
-   read `.codex-plugin/prompts/collab.md`, substitute `$ARGUMENTS` with
-   `join <session_id>`, and call:
-   ```json
-   {
-     "name": "mcp__codex__codex",
-     "arguments": {
-       "prompt": "<resolved prompt text from collab.md>",
-       "cwd": "<repo_path>"
-     }
-   }
-   ```
-   The call blocks until Codex finishes its phase-specific action and
-   hands control back. Claude then resumes the dispatch loop.
-
-This keeps the control loop inside Claude Code — no external daemon, no
-FIFO, no turn-change webhook. If the `codex` MCP server isn't registered,
-the prompt falls back to asking the user to run `/collab join` manually.
 
 ## Implementation Notes
 
@@ -838,17 +871,62 @@ uses the slim `collab-batch-impl.md` prompt and `--reasoning-effort low`;
 all other Codex turns use the full `collab.md` prompt with default reasoning
 preserved (reviewer and planner judgment must not be shallow).
 
-**Fallback.** When `codex` is not on PATH, the dispatcher falls back to
-synchronous `mcp__codex__codex` for any phase (with
-`model_reasoning_effort: "low"` in the config overrides for
-`CodeImplementPending+codex`; no config override for all other phases).
+#### Fallback: synchronous `mcp__codex__codex` MCP
+
+When `codex` is not on PATH, the dispatcher falls back to synchronous
+`mcp__codex__codex` for any phase. The prompt-file selection matrix is
+unchanged; only the transport differs.
+
+1. Register `codex mcp-server` with Claude Code (once):
+   ```bash
+   claude mcp add codex codex mcp-server
+   ```
+2. Claude expands the Codex prompt locally — `codex mcp-server` does
+   **not** resolve slash commands from `.codex-plugin/prompts/`, so
+   passing a raw `/collab join <sid>` string would make Codex treat it
+   as ordinary user text and go off-script. Read the appropriate
+   prompt file (`.codex-plugin/prompts/collab.md` for plan/review
+   phases; `.codex-plugin/prompts/collab-batch-impl.md` for
+   `CodeImplementPending+codex`), substitute `$ARGUMENTS` with
+   `join <session_id>`, and call:
+   ```json
+   {
+     "name": "mcp__codex__codex",
+     "arguments": {
+       "prompt": "<resolved prompt text>",
+       "cwd": "<repo_path>",
+       "config": { "model_reasoning_effort": "low" }
+     }
+   }
+   ```
+   The `config` block with `model_reasoning_effort: "low"` is added
+   **only** for `CodeImplementPending+codex`; all other phases omit
+   `config` so reviewer and planner judgment stays at default depth.
+   The call blocks until Codex finishes its phase-specific action and
+   hands control back. Claude then resumes the dispatch loop.
+
+This keeps the control loop inside Claude Code — no external daemon, no
+FIFO, no turn-change webhook. If `mcp__codex__codex` is also not
+registered, the prompt falls back to asking the user to run
+`/collab join <session_id>` manually in a separate Codex terminal
+(see § Prompt Templates — "Joining a session in a Codex terminal —
+fallback only").
 
 ### Timing instrumentation (eval mode)
 
-When running with timing instrumentation enabled, Claude writes one event per
-line to `/tmp/collab-eval-${session_id}.log` at key transition points in the
-dispatcher. Events use **stable base names** with phase + round detail
-carried in structured key=value fields, NOT in the event name:
+Claude writes one timing event per line to `/tmp/collab-eval-${session_id}.log`
+at key transition points throughout the dispatcher. This is opt-in and
+harmless: worst case a `/tmp` log file is written. Timing events never block
+the protocol — if a write fails, swallow the error silently and continue.
+
+**Rationale:** IronRace collab sessions span multiple agents and a long
+batch-implementation phase. Post-run shell analysis of the log lets us
+reconstruct the latency breakdown (planning vs. Codex dispatch vs. review vs.
+PR), measure the background-exec speedup (A.2), and identify hangs.
+
+**Format:** one event per line, with stable base names and structured
+key=value metadata. The event name itself never embeds round or phase
+detail; those go in `phase=` and `round=` fields:
 
 ```
 <unix_seconds>.<nanos> <event_name> phase=<phase> round=<N> [<extra>]
@@ -860,6 +938,7 @@ Examples:
 1778971814.91 t2_codex_dispatched phase=PlanCodexReviewPending round=2
 1778971990.43 t3_codex_returned phase=PlanCodexReviewPending round=2
 1778971814.93 t4_phase_advanced phase=PlanClaudeFinalizePending round=2
+1778971990.99 t8_pr_created phase=CodeReviewFinalPending https://github.com/.../pull/123
 ```
 
 **Required fields.** `phase=<phase>` and `round=<N>` are required on every
@@ -872,7 +951,31 @@ example, `round=2` for the second v1 review, `round=1` for the global
 review phase). Events that fire exactly once per session
 (`t0_session_started`, `t1_task_list_sent`, `t8_pr_created`,
 `t9_final_review_sent`, `t10_session_complete`) MAY omit `round=`; they
-retain `phase=` where meaningful.
+retain `phase=` where meaningful. Suffixed event-name shapes that bake
+the round number or destination phase into the identifier are legacy
+artifacts — do not emit them.
+
+**Write an event:**
+```bash
+echo "$(date +%s.%N) <event_name> phase=<phase> round=<N> [<extra>]" >> /tmp/collab-eval-${session_id}.log
+```
+
+**Event list:**
+
+| Event | Required fields | When to write |
+|---|---|---|
+| `t0_session_started` | (none required) | Right after `collab_start` returns (session_id now known) |
+| `t1_task_list_sent` | (none required) | Right after `collab_send(topic="task_list")` returns |
+| `t2_codex_dispatched` | `phase=` `round=` | Immediately before launching background `codex exec` for any Codex-owned phase (PlanParallelDrafts, PlanCodexReviewPending, CodeImplementPending+codex) |
+| `t2_fallback_to_mcp` | `phase=` | When `codex` is not on PATH and falling back to synchronous MCP (any phase) |
+| `t3_codex_returned` | `phase=` `round=` | Immediately after the bg-exec polling loop exits successfully for PlanParallelDrafts, PlanCodexReviewPending, or CodeImplementPending+codex |
+| `t4_phase_advanced` | `phase=` `round=` | Every time a poll observes a new phase (destination phase goes in `phase=`, NOT in the event name; round is the same dispatch round being watched by the polling loop) |
+| `t5_review_local_sent` | `phase=CodeReviewLocalPending` | After `collab_send(topic="review_local")` returns |
+| `t6_codex_review_dispatched` | `phase=` `round=` | Immediately before launching background `codex exec` for `CodeReviewFixGlobalPending` |
+| `t7_codex_review_returned` | `phase=` `round=` | Immediately after the bg-exec polling loop exits successfully for `CodeReviewFixGlobalPending` |
+| `t8_pr_created` | `phase=CodeReviewFinalPending` | After `gh pr create` returns success; include the PR URL as `[extra]` |
+| `t9_final_review_sent` | `phase=CodeReviewFinalPending` | After `collab_send(topic="final_review")` returns |
+| `t10_session_complete` | `phase=` (CodingComplete or CodingFailed) | When `collab_status.phase` first reads `CodingComplete` or `CodingFailed` |
 
 **Renamed event.** The old phase-advance event (one event per destination
 phase, with the destination baked into the name) is now a single event,
@@ -889,11 +992,21 @@ canonical and must not be emitted by current dispatchers. Historical
 logs containing them are not rewritten; new logs use the structured form
 above.
 
-Named events span `t0_session_started` (after `collab_start` returns) through
-`t10_session_complete` (when `CodingComplete` or `CodingFailed` is first
-observed). This instrumentation is opt-in and never blocks the protocol —
-write failures are swallowed silently. Full event list and post-run analysis
-commands are documented in the Claude-side dispatcher prompt.
+**Analyze post-run:**
+```bash
+# Show all events for a session with human-readable timestamps
+session_id="<sid>"
+awk '{printf "%s %s %s\n", strftime("%H:%M:%S", $1), $2, $3}' \
+  /tmp/collab-eval-${session_id}.log
+
+# Compute elapsed time between t0 and t10
+grep -E "t0_session_started|t10_session_complete" \
+  /tmp/collab-eval-${session_id}.log | awk 'NR==1{s=$1} NR==2{printf "Total: %.1fs\n", $1-s}'
+```
+
+Named events span `t0_session_started` (after `collab_start` returns)
+through `t10_session_complete` (when `CodingComplete` or `CodingFailed`
+is first observed).
 
 ### Polling backoff (Codex bg phases only)
 
@@ -937,6 +1050,10 @@ representative sample of prior collab sessions, that Codex's
 is unnecessary (e.g., Codex's commits never reintroduce issues).
 Without that audit, the stage stays.
 
+**Status as of 2026-05-27: kept.** Code-quality / consistency overlap
+with Codex's correctness/security lens accepted as deliberate. Removal
+still requires the written overlap audit specified above.
+
 ### SDD reviewer model pinning (out of protocol)
 
 The `subagent-driven-development` skill's reviewer prompts in this repo
@@ -978,7 +1095,8 @@ Scope (v1 + v3):
 - v1 planning is 2 review rounds; v3 coding is strictly linear (no rounds)
 - Claude always gets the last word in planning (v1) and owns the
   audit/PR turns after Codex's first branch-scope review in v3
-- long-poll via `wait_my_turn`; agents run autonomously
+- Claude runs the dispatcher loop; Codex-owned phases are one-shot
+  dispatches that act autonomously and exit
 
 Out of scope:
 
