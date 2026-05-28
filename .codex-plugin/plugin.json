@@ -1,6 +1,6 @@
 {
   "name": "ironmem",
-  "version": "0.2.1",
+  "version": "0.3.0",
   "description": "Rust MCP memory backend for Codex with semantic search, knowledge graph, automatic migrate-or-init bootstrap, and incremental workspace mining.",
   "author": {
     "name": "Jeffrey Crum"
