@@ -137,9 +137,10 @@ branch names.
 ## Dispatch Shape
 
 Each `/collab join` invocation handles **one Codex-owned turn** and
-exits. Claude drives handoffs synchronously via the Codex MCP tool, so
-you are not expected to loop or self-wake — when Claude needs you again,
-it will spawn a fresh `/collab join` call.
+exits. Claude drives handoffs by launching a fresh background `codex exec`
+process for each Codex-owned phase, with `mcp__codex__codex` only as the
+fallback transport, so you are not expected to loop or self-wake — when
+Claude needs you again, it will spawn a fresh `/collab join` call.
 
 Per-invocation flow:
 
@@ -167,7 +168,7 @@ no wake-up daemon.
 
 If you reach a phase where it is not your turn (`is_my_turn == false`)
 on entry — that is a stale invocation; exit with a one-line status.
-Claude's MCP tool call will still complete cleanly.
+Claude's dispatch will still complete cleanly.
 
 ## v1 Planning Loop (Phase → Action Table)
 

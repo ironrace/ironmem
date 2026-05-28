@@ -312,7 +312,8 @@ serves as the gate.
      point, so `collab_end` is valid.)
 
 7. **Subagent failure handling** (Claude-implementer mode only — Codex's
-   failures surface inside its own MCP session and Codex emits
+   batch failures surface inside its own Codex turn, whether launched via
+   background `codex exec` or the MCP fallback, and Codex emits
    `failure_report` directly per the Codex prompt). If a subagent fails
    mid-batch (irrecoverable bug, persistent test failure, environment
    issue),
@@ -327,8 +328,8 @@ serves as the gate.
    On gate failure, send `failure_report`. On green, send
    `implementation_done` with `{"head_sha":"<current HEAD>"}`. Session
    advances to `CodeReviewFixGlobalPending`. (In Codex-implementer mode
-   Codex already emitted `implementation_done` from inside its MCP
-   session; just re-poll `collab_status` and confirm the phase is now
+   Codex already emitted `implementation_done` from its own dispatched
+   turn; just re-poll `collab_status` and confirm the phase is now
    `CodeReviewFixGlobalPending` with Codex as owner.)
 9. Fall through into the v3 dispatch loop.
 

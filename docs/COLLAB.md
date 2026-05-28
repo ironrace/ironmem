@@ -21,7 +21,7 @@ This document covers:
 - the `collab_*` MCP tools
 - topic payload formats for every protocol message
 - harness-side responsibilities (git, cargo, gh, coderabbit)
-- the autonomous long-poll loop each agent runs
+- Claude's dispatcher loop and one-shot Codex dispatches
 - Claude's Plan Mode integration for the first canonical synthesis and the final plan
 - copy-pasteable prompts (single-terminal default; Codex-terminal fallback)
 - a worked example
@@ -75,8 +75,9 @@ Claude (single dispatcher loop in one terminal; Codex turns dispatched inline vi
           └─ SQLite (sessions, messages, capabilities, wal_log)
 ```
 
-Protocol enforcement lives in the server. The agents are thin clients that
-long-poll `wait_my_turn` and react to the state machine.
+Protocol enforcement lives in the server. Claude is the long-running
+dispatcher that polls the state machine; Codex turns are one-shot
+clients that read state, send exactly one protocol message, and exit.
 
 ## Session State
 
@@ -559,7 +560,7 @@ by the owner recorded in the phase table above.
 The server validates transitions, persists hashes, and routes messages.
 Most shell-level action — cargo, gh, coderabbit — is the **agent harness's**
 responsibility. The protocol relies on the harness doing these things
-between `wait_my_turn` and `collab_send`:
+before each coding-active `collab_send`:
 
 - **`base_sha` / `head_sha` tracking.** The harness records `base_sha` at
   `task_list` send time (the commit the branch forked from) and the current
@@ -617,11 +618,12 @@ between `wait_my_turn` and `collab_send`:
   explicit: removing the PR check from Codex's batch turn also removes
   Codex's dependency on `api.github.com` reachability, which was observed
   as a fragility in practice.
-- **Plan Mode** on Claude's side is entered before `canonical`, `final`
-  (v1), and `final_review` (v3 PR creation). The `task_list` send is
-  gated by writing-plans's own approval handoff (the user reviews the
-  generated markdown and approves) rather than the harness's Plan Mode.
-  Codex never enters Plan Mode.
+- **Plan Mode** on Claude's side is entered before the first `canonical`
+  (`review_round == 0`), `final` (v1), and `final_review` (v3 PR
+  creation). Revision-round canonicals run autonomously. The `task_list`
+  send is gated by writing-plans's own approval handoff (the user
+  reviews the generated markdown and approves) rather than the
+  harness's Plan Mode. Codex never enters Plan Mode.
 
 The server does not read the git tree for the full v3 flow, and it still
 trusts the harness's `head_sha` string there. The narrow shortcut-only
@@ -1082,7 +1084,8 @@ Scope (v1 + v3):
 - v1 planning is 2 review rounds; v3 coding is strictly linear (no rounds)
 - Claude always gets the last word in planning (v1) and owns the
   audit/PR turns after Codex's first branch-scope review in v3
-- long-poll via `wait_my_turn`; agents run autonomously
+- Claude runs the dispatcher loop; Codex-owned phases are one-shot
+  dispatches that act autonomously and exit
 
 Out of scope:
 
