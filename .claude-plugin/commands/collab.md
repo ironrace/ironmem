@@ -37,27 +37,33 @@ branch names.
    `session_id`, `task`, and the resolved `implementer` — verify it
    matches what you sent. **Log:** `t0_session_started`
 4. **Do not ask the user to run anything in a Codex terminal.** Claude
-   drives every Codex-owned turn via `mcp__codex__codex` in this same
-   terminal — there is no second terminal for the user to manage. Just
-   report the new `session_id` and selected `implementer` to the user as
-   a single line so they can track it:
+   drives every Codex-owned turn via background `codex exec` in this
+   same terminal — there is no second terminal for the user to manage.
+   See the "Codex handoff — background `codex exec`" section below for
+   the procedure, fallback, and failure modes. Just report the new
+   `session_id` and selected `implementer` to the user as a single line
+   so they can track it:
 
    ```
    Collab session started: <session_id> (implementer: <claude|codex>)
    ```
 
    Only fall back to `"Run in Codex: /collab join <session_id>"` if
-   `mcp__codex__codex` is not registered (see the Codex handoff section
-   below for the fallback path).
-5. Enter Plan Mode and draft your first plan for `<task>` — the draft is
-   yours alone, Codex cannot see it. When you have the user's approval in
-   Plan Mode, call `mcp__ironmem__collab_send` with
-   `sender="claude"`, `topic="draft"`, `content=<the plan text>`.
-6. After the draft is sent, begin the v1 planning loop (below). When the
-   loop observes `current_owner == "codex"`, it drives Codex inline via
-   the bg-exec path (see "Codex handoff — background `codex exec`"). After
-   the plan locks (`PlanLocked`), the session automatically flows into
-   the v3 coding bridge (no separate invocation needed).
+   neither `codex` CLI on PATH nor `mcp__codex__codex` is available
+   (see the Codex handoff section below for the fallback path).
+5. Draft your first plan for `<task>` autonomously — **no Plan Mode, no
+   user approval here.** The draft is yours alone, Codex cannot see it.
+   Once drafted, call `mcp__ironmem__collab_send` with
+   `sender="claude"`, `topic="draft"`, `content=<the plan text>`. Your
+   user gate is the combined plan at `PlanSynthesisPending`, not here —
+   sending the draft autonomously lets Codex start grinding immediately
+   instead of waiting on a user think-time gate.
+6. After the draft is sent, begin the v1 planning loop (below). The send
+   flips `current_owner` to `"codex"`, so the loop's next iteration
+   dispatches Codex via bg-exec immediately (see "Codex handoff —
+   background `codex exec`") and Codex grinds in parallel while Claude
+   polls. After the plan locks (`PlanLocked`), the session automatically
+   flows into the v3 coding bridge (no separate invocation needed).
 
 ## `review <short-topic>`
 
@@ -161,12 +167,15 @@ Repeat the dispatch loop with these actions:
 | Phase | What to do (is_my_turn == true) |
 |---|---|
 | `PlanParallelDrafts` | Your draft was already sent from the `start` branch. is_my_turn should be false here — if true, verify with `collab_status`. If `collab_status` confirms Claude is the owner in a Codex-owned phase, this is a protocol-level anomaly — exit the loop and report to the user; do not attempt a send. |
-| `PlanSynthesisPending` | **Do not ask the user.** Merge both drafts (or revise prior canonical on revision rounds) into a canonical plan. Call `collab_send` with `sender="claude"`, `topic="canonical"`, `content=<plan text>` (plain text — `draft` and `canonical` are the only v1 topics that are NOT JSON-wrapped). |
+| `PlanSynthesisPending` | Read `review_round` from `collab_status`. **`review_round == 0` (first synthesis): enter Plan Mode and get user approval before sending the `canonical`.** This is the user's primary v1 steering gate — the first artifact that combines both drafts. **`review_round >= 1` (revision rounds, re-entered on `request_changes`): send autonomously, no Plan Mode** — the user's next gate is `final`. In both cases merge both drafts (or revise prior canonical on revision rounds) and call `collab_send` with `sender="claude"`, `topic="canonical"`, `content=<plan text>` (plain text — `draft` and `canonical` are the only v1 topics that are NOT JSON-wrapped). |
 | `PlanCodexReviewPending` | Codex's turn. is_my_turn should be false — if true, verify with `collab_status`. If the inconsistency persists, exit the loop and report to the user. **Review cap:** the server enforces `MAX_REVIEW_ROUNDS = 2` at `crates/ironmem/src/collab/state_machine/mod.rs:28`. Codex gets at most two review rounds; after the 2nd review the server transitions to `PlanClaudeFinalizePending` regardless of verdict (`approve`, `approve_with_minor_edits`, or `request_changes` all map to the same next phase). Do not model v1 as open-ended iteration. |
 | `PlanClaudeFinalizePending` | **Enter Plan Mode.** Produce the final plan, incorporating Codex's review notes unless they conflict with user intent. Get user approval. Call `collab_send` with `sender="claude"`, `topic="final"`, `content=<JSON string of {"plan":"<full text>"}>` (v1 `final` is the only v1 topic wrapped in JSON). After send, `PlanLocked` is reached. |
 
-Rationale: the user approves only at finalization—the commit point. Everything
-before (drafts, synthesis, revisions) runs autonomously.
+Rationale: the user approves the first combined plan and the final plan;
+blind draft and revision rounds run autonomously. The first canonical is
+the first artifact worth steering (it combines both drafts and gives the
+user Codex-side context they lack at draft time); the final is the
+commit point.
 
 ## v3 Bridge: PlanLocked → CodeImplementPending
 
@@ -373,7 +382,7 @@ sequence before building the payload:
 
 | Phase | What to do (is_my_turn == true) |
 |---|---|
-| `CodeImplementPending` | Owner depends on `implementer`. **Claude is owner** (default): the bridge has already invoked `subagent-driven-development`. When all subagents finish, **run pre-send harness gates** (no reset — no Codex push to sync) and `collab_send` with `sender="claude"`, `topic="implementation_done"`, `content=<JSON {"head_sha":"<current HEAD>"}>`. Payload carries ONLY `head_sha`. After send, the phase advances to `CodeReviewFixGlobalPending` (Codex's turn — the new v3 order has Codex review the raw post-implementation diff first). **Codex is owner** (`--implementer=codex`): is_my_turn is false here; the bridge dispatched to Codex via `mcp__codex__codex` and Codex emits `implementation_done` itself before its MCP session returns. |
+| `CodeImplementPending` | Owner depends on `implementer`. **Claude is owner** (default): the bridge has already invoked `subagent-driven-development`. When all subagents finish, **run pre-send harness gates** (no reset — no Codex push to sync) and `collab_send` with `sender="claude"`, `topic="implementation_done"`, `content=<JSON {"head_sha":"<current HEAD>"}>`. Payload carries ONLY `head_sha`. After send, the phase advances to `CodeReviewFixGlobalPending` (Codex's turn — the new v3 order has Codex review the raw post-implementation diff first). **Codex is owner** (`--implementer=codex`): is_my_turn is false here; the bridge dispatched to Codex via background `codex exec` (per the Codex handoff section) and Codex emits `implementation_done` itself before the bg-exec polling loop detects phase advance. |
 | `CodeReviewFixGlobalPending` | Codex's turn. is_my_turn should be false. If `collab_status` confirms Claude is the owner, exit the loop and report the anomaly. **Log:** `t6_codex_review_dispatched` immediately before launching `codex exec`; **Log:** `t7_codex_review_returned` immediately after the polling loop exits. Both events take structured `phase=CodeReviewFixGlobalPending round=1` metadata — see step d ("Codex handoff") for the exact form. After Codex sends `review_fix_global` the phase advances to `CodeReviewLocalPending` (Claude's audit turn). |
 | `CodeReviewLocalPending` | **Run pre-send harness (with reset to `last_head_sha` — Codex just pushed at `review_fix_global`), then `/ultrareview-local` on the full task stack as audit of Codex's commits.** Fix any CRITICAL/HIGH/MEDIUM inline (commit + push). Call `collab_send` with `sender="claude"`, `topic="review_local"`, `content=<JSON {"head_sha":"<current HEAD>"}>`. **Log:** `t5_review_local_sent`. **Anti-removal:** under v3 ordering `/ultrareview-local` audits Codex's `review_fix_global` work plus catches code-quality issues both agents missed. Its code-quality lens partially overlaps with Codex's correctness/security/scope/architecture lens but does not fully duplicate it. Removing this stage requires a written overlap audit demonstrating that Codex's global reviews catch the code-quality issues `/ultrareview-local` would have flagged AND that the audit-of-Codex role is unnecessary. |
 | `CodeReviewFinalPending` | **Run pre-send harness (no reset — Claude just pushed at `review_local`).** Re-run gates. Then **enter Plan Mode**: draft PR title (under 70 chars) and body (summary + test plan derived from task list + gate results). Get user approval. Then `gh pr create --base <base_branch> --head <current branch> --title <approved title> --body <approved body>`. If `gh pr create` fails, send `failure_report` with `coding_failure: "pr_create_failed: <error>"` — no silent retry. On success, **Log:** `t8_pr_created <pr_url>`, capture `pr_url` and call `collab_send` with `sender="claude"`, `topic="final_review"`, `content=<JSON {"head_sha":"<current HEAD>","pr_url":"<https url>"}>`. **Log:** `t9_final_review_sent`. Session advances directly to `CodingComplete`. **Log:** `t10_session_complete CodingComplete`. Exit loop. |
@@ -625,75 +634,9 @@ g. Resume the normal dispatch loop. The next `collab_status` poll will
 
 ## Timing instrumentation (eval mode)
 
-Claude writes one timing event per line to `/tmp/collab-eval-${session_id}.log`
-at key transition points throughout the dispatcher. This is opt-in and
-harmless: worst case a `/tmp` log file is written. Timing events never block
-the protocol — if a write fails, swallow the error silently and continue.
-
-**Rationale:** IronRace collab sessions span multiple agents and a long
-batch-implementation phase. Post-run shell analysis of the log lets us
-reconstruct the latency breakdown (planning vs. Codex dispatch vs. review vs.
-PR), measure the background-exec speedup (A.2), and identify hangs.
-
-**Format:** one event per line, with stable base names and structured
-key=value metadata. The event name itself never embeds round or phase
-detail; those go in `phase=` and `round=` fields:
-
-```
-<unix_seconds>.<nanos> <event_name> phase=<phase> round=<N> [<extra>]
-```
-
-Examples:
-
-```
-1778971814.91 t2_codex_dispatched phase=PlanCodexReviewPending round=2
-1778971990.43 t3_codex_returned phase=PlanCodexReviewPending round=2
-1778971814.93 t4_phase_advanced phase=PlanClaudeFinalizePending round=2
-1778971990.99 t8_pr_created phase=CodeReviewFinalPending https://github.com/.../pull/123
-```
-
-`phase=` and `round=` are required for `t2_codex_dispatched`,
-`t3_codex_returned`, `t6_codex_review_dispatched`,
-`t7_codex_review_returned`, and `t4_phase_advanced`. Single-fire events
-(`t0_session_started`, `t1_task_list_sent`, `t8_pr_created`,
-`t9_final_review_sent`, `t10_session_complete`) may omit `round=` and
-retain `phase=` where meaningful. Suffixed event-name shapes that bake
-the round number or destination phase into the identifier are legacy
-artifacts — do not emit them.
-
-**Write an event:**
-```bash
-echo "$(date +%s.%N) <event_name> phase=<phase> round=<N> [<extra>]" >> /tmp/collab-eval-${session_id}.log
-```
-
-**Event list:**
-
-| Event | Required fields | When to write |
-|---|---|---|
-| `t0_session_started` | (none required) | Right after `collab_start` returns (session_id now known) |
-| `t1_task_list_sent` | (none required) | Right after `collab_send(topic="task_list")` returns |
-| `t2_codex_dispatched` | `phase=` `round=` | Immediately before launching background `codex exec` for any Codex-owned phase (PlanParallelDrafts, PlanCodexReviewPending, CodeImplementPending+codex) |
-| `t2_fallback_to_mcp` | `phase=` | When `codex` is not on PATH and falling back to synchronous MCP (any phase) |
-| `t3_codex_returned` | `phase=` `round=` | Immediately after the bg-exec polling loop exits successfully for PlanParallelDrafts, PlanCodexReviewPending, or CodeImplementPending+codex |
-| `t4_phase_advanced` | `phase=` `round=` | Every time a poll observes a new phase (destination phase goes in `phase=`, NOT in the event name; round is the same dispatch round being watched by the polling loop) |
-| `t5_review_local_sent` | `phase=CodeReviewLocalPending` | After `collab_send(topic="review_local")` returns |
-| `t6_codex_review_dispatched` | `phase=` `round=` | Immediately before launching background `codex exec` for `CodeReviewFixGlobalPending` |
-| `t7_codex_review_returned` | `phase=` `round=` | Immediately after the bg-exec polling loop exits successfully for `CodeReviewFixGlobalPending` |
-| `t8_pr_created` | `phase=CodeReviewFinalPending` | After `gh pr create` returns success; include the PR URL as `[extra]` |
-| `t9_final_review_sent` | `phase=CodeReviewFinalPending` | After `collab_send(topic="final_review")` returns |
-| `t10_session_complete` | `phase=` (CodingComplete or CodingFailed) | When `collab_status.phase` first reads `CodingComplete` or `CodingFailed` |
-
-**Analyze post-run:**
-```bash
-# Show all events for a session with human-readable timestamps
-session_id="<sid>"
-awk '{printf "%s %s %s\n", strftime("%H:%M:%S", $1), $2, $3}' \
-  /tmp/collab-eval-${session_id}.log
-
-# Compute elapsed time between t0 and t10
-grep -E "t0_session_started|t10_session_complete" \
-  /tmp/collab-eval-${session_id}.log | awk 'NR==1{s=$1} NR==2{printf "Total: %.1fs\n", $1-s}'
-```
+Opt-in latency logging — full event list, format, and post-run analysis
+commands live in `docs/COLLAB.md` § "Timing instrumentation (eval mode)".
+Writes are best-effort and never block the protocol.
 
 ## Invariants — do not violate
 
@@ -707,9 +650,12 @@ grep -E "t0_session_started|t10_session_complete" \
   or `CodingFailed`.
 - **Never** peek at Codex's draft before sending your own during
   `PlanParallelDrafts`. The server enforces blind-draft in `recv`.
-- **Harness Plan Mode gates only at: v1 initial `draft` (from `/collab start`),
-  v1 `final` (`PlanClaudeFinalizePending`), and v3 `final_review`
-  (`CodeReviewFinalPending`, PR creation).** The v3 `task_list` send is
+- **Harness Plan Mode gates only at: v1 FIRST `canonical`
+  (`PlanSynthesisPending` with `review_round == 0`), v1 `final`
+  (`PlanClaudeFinalizePending`), and v3 `final_review`
+  (`CodeReviewFinalPending`, PR creation).** The blind `draft` send (from
+  `/collab start`) and revision-round canonicals (`PlanSynthesisPending`
+  with `review_round >= 1`) run autonomously. The v3 `task_list` send is
   gated by writing-plans's own approval handoff, not harness Plan Mode.
   Every other turn runs autonomously.
 - **Every v3 `collab_send` payload is JSON** per the matrix in `docs/COLLAB.md`.
