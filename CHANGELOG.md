@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.2] - 2026-05-28
+
+### Changed
+
+- Collab v3 implementation prompts now require durable ironmem
+  `collab-checkpoints` entries during `CodeImplementPending`, letting a
+  fresh Claude or Codex session resume from the last task boundary after
+  token exhaustion or another mid-batch stop.
+- Claude and Codex `/collab` prompt surfaces now search the checkpoint
+  room before implementation work and resume from `next_task_id`, a
+  started task, or `batch_complete` instead of depending on transcript
+  context.
+
 ## [0.3.1] - 2026-05-28
 
 ### Added

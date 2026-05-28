@@ -244,13 +244,57 @@ serves as the gate.
    The `current_owner` after this transition matches the session's
    `implementer` — which agent runs the batch phase is committed at
    this point. **Log:** `t1_task_list_sent`
+5a. **Implementation checkpoint rule.** During `CodeImplementPending`,
+   the implementer must write durable task-boundary checkpoints via
+   `mcp__ironmem__add_drawer`:
+
+   - `wing`: `ironrace-memory`
+   - `room`: `collab-checkpoints`
+   - write `status: started` before each task
+   - write `status: completed` after each task is implemented,
+     reviewed, committed, and pushed
+   - write `status: blocked` before any unrecoverable
+     `failure_report`
+   - write `status: batch_complete` after final gates pass and before
+     `implementation_done`
+
+   Use this compact content shape:
+
+   ```text
+   collab_checkpoint
+   session_id: <session_id>
+   phase: CodeImplementPending
+   implementer: <claude|codex>
+   repo_path: <repo_path>
+   branch: <branch>
+   plan_file_path: <plan_file_path>
+   task_id: <N|none>
+   task_title: <title|none>
+   status: <started|completed|blocked|batch_complete>
+   head_sha: <current HEAD>
+   commit_sha: <task commit sha|none>
+   completed_task_ids: <comma-separated ids>
+   next_task_id: <N|none>
+   gates: <not_run|passed|failed: short reason>
+   summary: <one concise sentence>
+   resume_hint: /collab join <session_id>
+   ```
+
+   On any fresh `/collab join` where `phase == "CodeImplementPending"`
+   and `current_owner == "claude"`, search
+   `wing=ironrace-memory room=collab-checkpoints` for the `session_id`
+   before doing work. Use the newest checkpoint and the git log to resume
+   at `next_task_id` (or the `started` task if the last checkpoint
+   stopped mid-task). If the newest checkpoint is `batch_complete`, rerun
+   gates and send `implementation_done`; do not rerun completed tasks.
 6. **Branch on `implementer`** (read it from `collab_status`):
 
    - **`implementer == "claude"`** — Run the batch locally. Invoke
      `Skill('subagent-driven-development')` with the same
      plan file. Auto-proceed through between-task checkpoints — do not
-     pause for user approval per task. Each subagent runs TDD, commits,
-     and pushes for its own task.
+     pause for user approval per task — but write the ironmem checkpoints
+     from step 5a before and after every task. Each subagent runs TDD,
+     commits, and pushes for its own task.
 
      **Hard stop at the boundary before
      `finishing-a-development-branch`.** That sub-skill prompts the user
@@ -327,11 +371,14 @@ serves as the gate.
    - If retryable, re-dispatch that subagent and continue.
    - If unrecoverable, send `failure_report` with
      `coding_failure: "subagent_failure: <task id>: <concrete reason>"`
-     and exit the loop.
+     and exit the loop. Before sending the failure report, write a
+     `status: blocked` checkpoint for that task.
 8. **On full success in Claude-implementer mode:** run the pre-send
    harness once (fetch, fmt --check, clippy -D warnings), then run
    `cargo test --workspace` as the post-work gate.
-   On gate failure, send `failure_report`. On green, send
+   On gate failure, write a `status: blocked` checkpoint and send
+   `failure_report`. On green, write a `status: batch_complete`
+   checkpoint and send
    `implementation_done` with `{"head_sha":"<current HEAD>"}`. Session
    advances to `CodeReviewFixGlobalPending`. (In Codex-implementer mode
    Codex already emitted `implementation_done` from its own dispatched
@@ -389,7 +436,7 @@ sequence before building the payload:
 
 | Phase | What to do (is_my_turn == true) |
 |---|---|
-| `CodeImplementPending` | Owner depends on `implementer`. **Claude is owner** (default): the bridge has already invoked `subagent-driven-development`. When all subagents finish, **run pre-send harness gates** (no reset — no Codex push to sync) and `collab_send` with `sender="claude"`, `topic="implementation_done"`, `content=<JSON {"head_sha":"<current HEAD>"}>`. Payload carries ONLY `head_sha`. After send, the phase advances to `CodeReviewFixGlobalPending` (Codex's turn — the new v3 order has Codex review the raw post-implementation diff first). **Codex is owner** (`--implementer=codex`): is_my_turn is false here; the bridge dispatched to Codex via background `codex exec` (per the Codex handoff section) and Codex emits `implementation_done` itself before the bg-exec polling loop detects phase advance. |
+| `CodeImplementPending` | Owner depends on `implementer`. **Claude is owner** (default): search `ironrace-memory/collab-checkpoints` for this `session_id`, resume at the first unfinished task, and continue the local `subagent-driven-development` batch with the checkpoint rule from the v3 bridge. When all subagents finish, **run pre-send harness gates** (no reset — no Codex push to sync), write `status: batch_complete`, and `collab_send` with `sender="claude"`, `topic="implementation_done"`, `content=<JSON {"head_sha":"<current HEAD>"}>`. Payload carries ONLY `head_sha`. After send, the phase advances to `CodeReviewFixGlobalPending` (Codex's turn — the new v3 order has Codex review the raw post-implementation diff first). **Codex is owner** (`--implementer=codex`): is_my_turn is false here; the bridge dispatched to Codex via background `codex exec` (per the Codex handoff section) and Codex emits `implementation_done` itself before the bg-exec polling loop detects phase advance. |
 | `CodeReviewFixGlobalPending` | Codex's turn. is_my_turn should be false. If `collab_status` confirms Claude is the owner, exit the loop and report the anomaly. **Log:** `t6_codex_review_dispatched` immediately before launching `codex exec`; **Log:** `t7_codex_review_returned` immediately after the polling loop exits. Both events take structured `phase=CodeReviewFixGlobalPending round=1` metadata — see step d ("Codex handoff") for the exact form. After Codex sends `review_fix_global` the phase advances to `CodeReviewLocalPending` (Claude's audit turn). |
 | `CodeReviewLocalPending` | **Run pre-send harness (with reset to `last_head_sha` — Codex just pushed at `review_fix_global`), then `/ultrareview-local` on the full task stack as audit of Codex's commits.** Fix any CRITICAL/HIGH/MEDIUM inline (commit + push). Call `collab_send` with `sender="claude"`, `topic="review_local"`, `content=<JSON {"head_sha":"<current HEAD>"}>`. **Log:** `t5_review_local_sent`. **Anti-removal:** under v3 ordering `/ultrareview-local` audits Codex's `review_fix_global` work plus catches code-quality issues both agents missed. Its code-quality lens partially overlaps with Codex's correctness/security/scope/architecture lens but does not fully duplicate it. Removing this stage requires a written overlap audit demonstrating that Codex's global reviews catch the code-quality issues `/ultrareview-local` would have flagged AND that the audit-of-Codex role is unnecessary. |
 | `CodeReviewFinalPending` | **Run pre-send harness (no reset — Claude just pushed at `review_local`).** Re-run gates. Then **enter Plan Mode**: draft PR title (under 70 chars) and body (summary + test plan derived from task list + gate results). Get user approval. Then `gh pr create --base <base_branch> --head <current branch> --title <approved title> --body <approved body>`. If `gh pr create` fails, send `failure_report` with `coding_failure: "pr_create_failed: <error>"` — no silent retry. On success, **Log:** `t8_pr_created <pr_url>`, capture `pr_url` and call `collab_send` with `sender="claude"`, `topic="final_review"`, `content=<JSON {"head_sha":"<current HEAD>","pr_url":"<https url>"}>`. **Log:** `t9_final_review_sent`. Session advances directly to `CodingComplete`. **Log:** `t10_session_complete CodingComplete`. Exit loop. |
