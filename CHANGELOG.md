@@ -7,6 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.3] - 2026-05-28
+
+### Added
+
+- New `collab_set_implementer` MCP tool lets an existing collab session
+  reassign the v3 batch implementer during planning or active
+  `CodeImplementPending`. When reassigned during `CodeImplementPending`,
+  the server also moves `current_owner` to the selected implementer so
+  `/collab join --implementer=<claude|codex> <session_id>` can hand off
+  an in-progress batch cleanly.
+
+### Changed
+
+- Claude and Codex `/collab join` prompts now accept
+  `--implementer=claude|codex`, resume from the newest ironmem
+  `collab-checkpoints` entry, inspect git/code state, and scan the plan
+  before continuing already-started implementation work.
+- `/collab review` shortcut prompts now recover branch context from
+  ironmem checkpoints and referenced writing-plans docs when available,
+  then scan the code/diff before Codex performs the global review.
+
 ## [0.3.2] - 2026-05-28
 
 ### Changed
