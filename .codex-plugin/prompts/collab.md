@@ -1,5 +1,5 @@
 ---
-description: Join (or start) an IronRace bounded collab session with Claude. Covers v1 planning (draft + review), the v3 global review pass (Codex's mandatory coding turn), and the optional Codex-implementer batch phase when the session was started with --implementer=codex. Usage — /collab join <session_id>  |  /collab start <task>
+description: Join (or start) an IronRace bounded collab session with Claude. Covers v1 planning (draft + review), the v3 global review pass (Codex's mandatory coding turn), and the optional Codex-implementer batch phase when the session is assigned with --implementer=codex. Usage — /collab join [--implementer=claude|codex] <session_id>  |  /collab start <task>
 ---
 
 <!-- DERIVED FROM docs/COLLAB.md — any protocol change must update BOTH this
@@ -105,14 +105,25 @@ branch names.
    with `sender="codex"`, `topic="draft"`, `content=<plan text>`.
 5. Enter the v1 planning loop.
 
-## `join <session_id>`
+## `join [--implementer=claude|codex] <session_id>`
 
-1. Store `<session_id>` — reuse on every subsequent `collab_*` call
+1. Parse `$ARGUMENTS`:
+   - Strip the leading `join` token.
+   - Detect optional `--implementer=claude` or `--implementer=codex` flag
+     anywhere in the remaining tokens. Reject any other value with a usage
+     error.
+   - `session_id` ← the remaining token. Reject missing or extra tokens.
+2. Store `<session_id>` — reuse on every subsequent `collab_*` call
    without re-prompting the user.
-2. `agent` / `sender` / `receiver` ← `"codex"`.
-3. Call `mcp__ironmem__collab_status`. Report `task` and
-   `phase` to the user.
-4. Branch on `phase`:
+3. `agent` / `sender` / `receiver` ← `"codex"`.
+4. If the optional implementer flag was present, call
+   `mcp__ironmem__collab_set_implementer` with `session_id`,
+   `agent="codex"`, and `implementer=<flag value>`, then use the returned
+   session record as the current status. This may transfer an active
+   `CodeImplementPending` batch to the selected implementer.
+5. Otherwise call `mcp__ironmem__collab_status`.
+6. Report `task`, `phase`, and `implementer` to the user.
+7. Branch on `phase`:
    - **v1 active** (`PlanParallelDrafts` .. `PlanClaudeFinalizePending`) →
      v1 planning loop (below). If `PlanParallelDrafts` and you have not yet
      submitted your draft, write and send it first, then enter the loop.
@@ -225,9 +236,9 @@ working-tree reset on the common case where Codex is already at the right SHA
 
 | Phase | What to do (is_my_turn == true) |
 |---|---|
-| `CodeImplementPending` | Owner depends on `implementer`. If `implementer == "claude"`, this is Claude's batch turn — exit. If `implementer == "codex"`, run the batch implementation action below. |
+| `CodeImplementPending` | Owner depends on `implementer`. If `implementer == "claude"`, this is Claude's batch turn — exit. If `implementer == "codex"`, run the batch implementation action below, resuming from ironmem checkpoints and scanning the plan/code state before editing. |
 | `CodeReviewLocalPending` | Claude's turn. Exit. |
-| `CodeReviewFixGlobalPending` | **Run pre-send harness.** This is your only mandatory v3 coding turn — review the full branch diff (`git diff <base_sha>..<last_head_sha>`) alongside the writing-plans markdown at `plan_file_path` (read it from the canonicalized `task_list` JSON in `collab_status`). Check cross-task consistency, architectural drift, missed acceptance criteria, security. **Fix any issues directly**: commit + push. Send `collab_send` with `sender="codex"`, `topic="review_fix_global"`, `content=<JSON {"head_sha":"<current HEAD>"}>`. |
+| `CodeReviewFixGlobalPending` | **Run pre-send harness.** This is your only mandatory v3 coding turn — review the full branch diff (`git diff <base_sha>..<last_head_sha>`) alongside the writing-plans markdown at `plan_file_path` when present. In full-flow sessions, read `plan_file_path` from the canonicalized `task_list` JSON in `collab_status`. In shortcut sessions where `task_list` is null, first search ironmem checkpoints for the same `repo_path`/`branch`, read any referenced plan, and scan the current code/diff to determine what is already complete; if no checkpoint exists, fall back to nearby writing-plans docs plus the branch diff. Check cross-task consistency, architectural drift, missed acceptance criteria, security. **Fix any issues directly**: commit + push. Send `collab_send` with `sender="codex"`, `topic="review_fix_global"`, `content=<JSON {"head_sha":"<current HEAD>"}>`. |
 | `CodeReviewFinalPending` | Claude's turn. Exit. |
 
 ### Batch implementation (codex-implementer)
@@ -240,8 +251,10 @@ own the batch phase. Claude has already published `task_list` with
 `wing=ironrace-memory room=collab-checkpoints` for the `session_id`. Use the
 newest checkpoint plus the git log to choose the first unfinished task:
 resume at `next_task_id`, or at the `started` task if the last checkpoint
-stopped mid-task. If the newest checkpoint is `batch_complete`, rerun final
-gates and send `implementation_done`; do not rerun completed tasks.
+stopped mid-task. Then read the plan and scan the current code/diff to
+verify what is already complete against the acceptance criteria before
+editing. If the newest checkpoint is `batch_complete`, rerun final gates
+and send `implementation_done`; do not rerun completed tasks.
 
 While you own `CodeImplementPending`, write durable checkpoints via
 `mcp__ironmem__add_drawer` with `wing="ironrace-memory"` and
@@ -273,7 +286,7 @@ completed_task_ids: <comma-separated ids>
 next_task_id: <N|none>
 gates: <not_run|passed|failed: short reason>
 summary: <one concise sentence>
-resume_hint: /collab join <session_id>
+resume_hint: /collab join [--implementer=<claude|codex>] <session_id>
 ```
 
 **Execution mode branch.** Read `execution_mode` from
@@ -385,6 +398,12 @@ Codex joins such a session:
   null in `collab_status`.
 - `base_sha` and `last_head_sha` will be set — use them for branch-drift
   detection exactly as in a full-flow global review.
+- Recover the missing implementation context before reviewing: search
+  ironmem checkpoints for the same `repo_path`/`branch`, read any
+  referenced writing-plans markdown, then scan the current code/diff to
+  determine which acceptance criteria are already complete. If no
+  checkpoint exists, fall back to nearby writing-plans docs plus the
+  branch diff.
 - Codex's next turn is `review_fix_global`; after that, Claude's
   `review_local` audit runs before Claude's `final_review` closes out
   the session. No earlier phases are reachable from a shortcut session.
@@ -437,5 +456,5 @@ error to the user and stop.
 If `$ARGUMENTS` does not start with `start` or `join`, tell the user:
 
 ```
-Usage: /collab join <session_id>  |  /collab start <task>
+Usage: /collab join [--implementer=claude|codex] <session_id>  |  /collab start <task>
 ```

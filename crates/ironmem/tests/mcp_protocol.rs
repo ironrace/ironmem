@@ -144,6 +144,7 @@ fn tools_list_contains_required_tools() {
         "add_drawer",
         "diary_write",
         "collab_start_code_review",
+        "collab_set_implementer",
     ] {
         assert!(
             names.contains(required),
@@ -163,7 +164,12 @@ fn tools_list_read_only_mode_excludes_write_tools() {
     let tools = resp.result.unwrap()["tools"].as_array().cloned().unwrap();
     let names: Vec<&str> = tools.iter().filter_map(|t| t["name"].as_str()).collect();
 
-    for blocked in &["add_drawer", "delete_drawer", "diary_write"] {
+    for blocked in &[
+        "add_drawer",
+        "delete_drawer",
+        "diary_write",
+        "collab_set_implementer",
+    ] {
         assert!(
             !names.contains(blocked),
             "write tool should be absent in read-only mode: {blocked}"
@@ -1297,6 +1303,128 @@ fn collab_start_rejects_invalid_implementer() {
         err.to_lowercase().contains("agent")
             || err.to_lowercase().contains("must be 'claude' or 'codex'"),
         "expected agent-validation error, got: {err}"
+    );
+}
+
+#[test]
+fn collab_set_implementer_before_task_list_routes_batch_owner() {
+    let app = App::open_for_test().unwrap();
+    let session_id = drive_to_plan_locked(&app, "fp");
+
+    let updated = call_tool(
+        &app,
+        "collab_set_implementer",
+        json!({
+            "session_id": &session_id,
+            "agent": "claude",
+            "implementer": "codex"
+        }),
+    );
+    assert_eq!(updated["implementer"], "codex");
+    assert_eq!(updated["phase"], "PlanLocked");
+
+    let hash = plan_hash(&app, &session_id);
+    call_tool(
+        &app,
+        "collab_send",
+        json!({
+            "session_id": session_id,
+            "sender": "claude",
+            "topic": "task_list",
+            "content": task_list_payload(&hash, "b0", "h0", 1)
+        }),
+    );
+    let status = call_tool(&app, "collab_status", json!({ "session_id": &session_id }));
+    assert_eq!(status["phase"], "CodeImplementPending");
+    assert_eq!(status["implementer"], "codex");
+    assert_eq!(status["current_owner"], "codex");
+}
+
+#[test]
+fn collab_set_implementer_during_batch_moves_current_owner() {
+    let app = App::open_for_test().unwrap();
+    let session_id = drive_to_plan_locked(&app, "fp");
+    let hash = plan_hash(&app, &session_id);
+    call_tool(
+        &app,
+        "collab_send",
+        json!({
+            "session_id": session_id,
+            "sender": "claude",
+            "topic": "task_list",
+            "content": task_list_payload(&hash, "b0", "h0", 1)
+        }),
+    );
+    let status = call_tool(&app, "collab_status", json!({ "session_id": &session_id }));
+    assert_eq!(status["current_owner"], "claude");
+
+    let updated = call_tool(
+        &app,
+        "collab_set_implementer",
+        json!({
+            "session_id": &session_id,
+            "agent": "claude",
+            "implementer": "codex"
+        }),
+    );
+    assert_eq!(updated["phase"], "CodeImplementPending");
+    assert_eq!(updated["implementer"], "codex");
+    assert_eq!(updated["current_owner"], "codex");
+
+    let err = call_tool_expect_error(
+        &app,
+        "collab_send",
+        json!({
+            "session_id": session_id,
+            "sender": "claude",
+            "topic": "implementation_done",
+            "content": json!({ "head_sha": "batch_head" }).to_string()
+        }),
+    );
+    assert!(
+        err.to_lowercase().contains("not your turn") || err.contains("expects sender"),
+        "expected turn-ownership error, got: {err}"
+    );
+}
+
+#[test]
+fn collab_set_implementer_rejects_after_batch_implementation() {
+    let app = App::open_for_test().unwrap();
+    let session_id = drive_to_plan_locked(&app, "fp");
+    let hash = plan_hash(&app, &session_id);
+    call_tool(
+        &app,
+        "collab_send",
+        json!({
+            "session_id": session_id,
+            "sender": "claude",
+            "topic": "task_list",
+            "content": task_list_payload(&hash, "b0", "h0", 1)
+        }),
+    );
+    call_tool(
+        &app,
+        "collab_send",
+        json!({
+            "session_id": session_id,
+            "sender": "claude",
+            "topic": "implementation_done",
+            "content": json!({ "head_sha": "batch_head" }).to_string()
+        }),
+    );
+
+    let err = call_tool_expect_error(
+        &app,
+        "collab_set_implementer",
+        json!({
+            "session_id": &session_id,
+            "agent": "claude",
+            "implementer": "codex"
+        }),
+    );
+    assert!(
+        err.contains("before implementation is complete"),
+        "expected post-implementation rejection, got: {err}"
     );
 }
 

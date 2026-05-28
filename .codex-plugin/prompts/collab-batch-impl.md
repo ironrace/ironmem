@@ -93,8 +93,10 @@ Before doing implementation work, search `wing=ironrace-memory`
 `room=collab-checkpoints` for the `session_id`. Use the newest checkpoint
 plus the git log to choose the first unfinished task: resume at
 `next_task_id`, or at the `started` task if the last checkpoint stopped
-mid-task. If the newest checkpoint is `batch_complete`, rerun final gates
-and send `implementation_done`; do not rerun completed tasks.
+mid-task. Then read the plan and scan the current code/diff to verify what
+is already complete against the acceptance criteria before editing. If the
+newest checkpoint is `batch_complete`, rerun final gates and send
+`implementation_done`; do not rerun completed tasks.
 
 While you own `CodeImplementPending`, write durable checkpoints via
 `mcp__ironmem__add_drawer` with `wing="ironrace-memory"` and
@@ -126,7 +128,7 @@ completed_task_ids: <comma-separated ids>
 next_task_id: <N|none>
 gates: <not_run|passed|failed: short reason>
 summary: <one concise sentence>
-resume_hint: /collab join <session_id>
+resume_hint: /collab join [--implementer=<claude|codex>] <session_id>
 ```
 
 **Execution mode branch.** Read `execution_mode` from

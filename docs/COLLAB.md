@@ -88,7 +88,7 @@ Stored in `collab_sessions`:
 | `id` | Session identifier (returned from `collab_start`) |
 | `repo_path`, `branch` | Where this plan applies |
 | `task` | Human description of the planning goal. Set at `start`, readable via `status`. |
-| `implementer` | Which agent runs the v3 batch implementation phase (`claude` or `codex`). Set at `start`, immutable. Default `claude`. |
+| `implementer` | Which agent runs the v3 batch implementation phase (`claude` or `codex`). Set at `start` and rebindable with `collab_set_implementer` while planning or `CodeImplementPending` is active. Default `claude`. |
 | `phase` | Current protocol phase (see below) |
 | `current_owner` | Agent whose turn it is (`claude` or `codex`) |
 | `claude_draft_hash`, `codex_draft_hash` | SHA-256 of each first draft |
@@ -193,15 +193,15 @@ global review stage and is expressed as commits, not prose.
 
 After `task_list` lands, the session sits in a single phase for the
 entire implementation run. Which agent owns that phase depends on the
-session's `implementer` field, set at `collab_start` time and
-immutable thereafter:
+session's current `implementer` field:
 
 - **`implementer == "claude"`** (default): Claude orchestrates per-task
   work through `writing-plans` (markdown plan) and then
   `subagent-driven-development` (fresh subagent per task,
   TDD, per-task commits). Claude emits `implementation_done`.
 - **`implementer == "codex"`** (opt-in via
-  `/collab start --implementer=codex`): Claude still produces the
+  `/collab start --implementer=codex` or
+  `/collab join --implementer=codex <session_id>`): Claude still produces the
   writing-plans markdown and publishes `task_list` (writing-plans
   approval is still the user gate). Then Claude dispatches Codex via
   background `codex exec` (per Implementation Notes § Background
@@ -270,15 +270,17 @@ completed_task_ids: <comma-separated ids>
 next_task_id: <N|none>
 gates: <not_run|passed|failed: short reason>
 summary: <one concise sentence>
-resume_hint: /collab join <session_id>
+resume_hint: /collab join [--implementer=<claude|codex>] <session_id>
 ```
 
 On any fresh `/collab join` that lands in `CodeImplementPending`, the
 owning implementer must first search `wing=ironrace-memory`,
 `room=collab-checkpoints` for the session id and use the newest
-checkpoint plus the git log to choose the first unfinished task. If the
-newest checkpoint is `batch_complete`, rerun the required gates and send
-`implementation_done`; otherwise resume at `next_task_id` (or the
+checkpoint plus the git log to choose the first unfinished task. The new
+implementer must then read the plan and scan the current code/diff to
+verify which acceptance criteria are already complete before editing. If
+the newest checkpoint is `batch_complete`, rerun the required gates and
+send `implementation_done`; otherwise resume at `next_task_id` (or the
 `started` task if the last checkpoint stopped mid-task).
 
 **Both modes apply the same `finishing-a-development-branch` carve-out**:
@@ -306,6 +308,13 @@ When an orchestrator already completed the branch's implementation outside
 Collab, it can skip v1 planning and the v3 batch implementation phase by
 calling `collab_start_code_review`. The session starts directly at
 `CodeReviewFixGlobalPending` with `current_owner = codex`.
+
+Because shortcut sessions have no collab `task_list`, Codex must recover
+the implementation context before reviewing: search ironmem checkpoints
+for the same `repo_path`/`branch`, read any referenced writing-plans
+markdown, and scan the current code/diff to determine which acceptance
+criteria are already complete. If no checkpoint exists, fall back to the
+branch diff plus nearby writing-plans docs in the repo.
 
 The no-op handshake turn is collapsed: `head_sha` is supplied at session
 creation time. From there, the surviving flow follows the new ordering:
@@ -389,6 +398,25 @@ must be one of `{"claude","codex"}` — it routes the v3
 `CodeImplementPending` phase to the named agent. The DB CHECK constraint
 on the `implementer` column enforces the same set, so direct writes
 cannot bypass validation.
+
+### `collab_set_implementer`
+
+Rebinds the batch implementation owner for an existing session.
+
+```json
+{
+  "session_id": "...",
+  "agent": "claude",
+  "implementer": "codex"
+}
+```
+
+Valid during planning and during `CodeImplementPending`. During
+`CodeImplementPending`, this also moves `current_owner` to the selected
+implementer so `/collab join --implementer=<agent> <session_id>` can hand
+the active batch to another agent. The new implementer resumes from the
+latest ironmem checkpoint, then scans the plan and current code before
+continuing. Calls after `implementation_done` are rejected.
 
 ### `collab_start_code_review`
 

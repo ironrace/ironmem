@@ -56,6 +56,38 @@ pub fn create_session(
     Ok(())
 }
 
+pub fn set_implementer(
+    conn: &Connection,
+    session_id: &str,
+    implementer: Agent,
+    current_owner: Option<Agent>,
+) -> Result<(), MemoryError> {
+    let updated = if let Some(owner) = current_owner {
+        conn.execute(
+            "UPDATE collab_sessions
+             SET implementer = ?2,
+                 current_owner = ?3,
+                 updated_at = datetime('now')
+             WHERE id = ?1",
+            params![session_id, implementer.as_str(), owner.as_str()],
+        )?
+    } else {
+        conn.execute(
+            "UPDATE collab_sessions
+             SET implementer = ?2,
+                 updated_at = datetime('now')
+             WHERE id = ?1",
+            params![session_id, implementer.as_str()],
+        )?
+    };
+    if updated == 0 {
+        return Err(MemoryError::NotFound(format!(
+            "session {session_id} not found"
+        )));
+    }
+    Ok(())
+}
+
 /// Mark a session as ended. Subsequent mutating operations should check
 /// `ended_at` via `ensure_active` and refuse to proceed.
 pub fn end_session(conn: &Connection, session_id: &str) -> Result<(), MemoryError> {
@@ -189,10 +221,9 @@ where
 }
 
 pub fn save_session(conn: &Connection, session: &CollabSession) -> Result<(), MemoryError> {
-    // `implementer` is set at INSERT time and immutable thereafter; we
-    // include it in the UPDATE list defensively so any future rebind of
-    // the field stays consistent with the rest of the session, and so a
-    // future maintainer doesn't read the absence as a bug to fix.
+    // `implementer` may be rebound by `collab_set_implementer` while a
+    // planning or implementation handoff is still active, so keep it in the
+    // full-session update list alongside the rest of the state.
     let updated = conn.execute(
         "UPDATE collab_sessions
          SET phase = ?1,
