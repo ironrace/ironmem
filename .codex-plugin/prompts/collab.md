@@ -236,6 +236,46 @@ When `phase == "CodeImplementPending"` and `implementer == "codex"`, you
 own the batch phase. Claude has already published `task_list` with
 `plan_file_path` pointing at the writing-plans markdown.
 
+**Implementation checkpoint rule.** Before doing implementation work, search
+`wing=ironrace-memory room=collab-checkpoints` for the `session_id`. Use the
+newest checkpoint plus the git log to choose the first unfinished task:
+resume at `next_task_id`, or at the `started` task if the last checkpoint
+stopped mid-task. If the newest checkpoint is `batch_complete`, rerun final
+gates and send `implementation_done`; do not rerun completed tasks.
+
+While you own `CodeImplementPending`, write durable checkpoints via
+`mcp__ironmem__add_drawer` with `wing="ironrace-memory"` and
+`room="collab-checkpoints"`:
+
+- `status: started` before each task
+- `status: completed` after each task is implemented, reviewed, committed,
+  and pushed
+- `status: blocked` before any unrecoverable `failure_report`
+- `status: batch_complete` after final gates pass and before
+  `implementation_done`
+
+Use this compact content shape:
+
+```text
+collab_checkpoint
+session_id: <session_id>
+phase: CodeImplementPending
+implementer: codex
+repo_path: <repo_path>
+branch: <branch>
+plan_file_path: <plan_file_path>
+task_id: <N|none>
+task_title: <title|none>
+status: <started|completed|blocked|batch_complete>
+head_sha: <current HEAD>
+commit_sha: <task commit sha|none>
+completed_task_ids: <comma-separated ids>
+next_task_id: <N|none>
+gates: <not_run|passed|failed: short reason>
+summary: <one concise sentence>
+resume_hint: /collab join <session_id>
+```
+
 **Execution mode branch.** Read `execution_mode` from
 `collab_status.task_list` — it is also surfaced as the top-level
 `execution_mode` field in `collab_status` so you do not need to
@@ -254,7 +294,8 @@ requiring no design judgment. Skip `subagent-driven-development` entirely.
    beyond what Claude pushed at `last_head_sha`.
 2. Read the markdown plan from `plan_file_path` (resolved relative to
    `repo_path`). There is exactly one task (`### Task 1`).
-3. Apply each numbered step in `### Task 1` directly — **do NOT invoke
+3. Write a `status: started` checkpoint for task 1.
+4. Apply each numbered step in `### Task 1` directly — **do NOT invoke
    `subagent-driven-development`, do NOT call `spawn_agent`**:
    - For ` ```bash ` blocks: run them via Bash exactly as written.
    - For language code blocks (e.g. ` ```rust `, ` ```python `): apply
@@ -262,21 +303,24 @@ requiring no design judgment. Skip `subagent-driven-development` entirely.
      `Files:` block.
    - For prose steps describing exact text to insert or replace: apply
      verbatim.
-4. Run the configured gates:
+5. Run the configured gates:
    - `cargo fmt --all -- --check`
    - `cargo clippy --workspace --all-targets --all-features -- -D warnings`
    - The project test command (e.g. `cargo test --workspace`)
 
-   On any gate failure, send `failure_report` with
+   On any gate failure, write a `status: blocked` checkpoint, then send
+   `failure_report` with
    `coding_failure: "mechanical_direct_gate_failed: <error output>"` and
    exit. Do not retry silently.
-5. Verify the task's acceptance criteria are met (read them from the
+6. Verify the task's acceptance criteria are met (read them from the
    `tasks[0].acceptance` array in `collab_status.task_list`).
-6. Commit and push per the task's commit/push instructions in the plan.
-7. Send `collab_send` with `sender="codex"`, `topic="implementation_done"`,
+7. Commit and push per the task's commit/push instructions in the plan.
+8. Write a `status: completed` checkpoint for task 1, then write a
+   `status: batch_complete` checkpoint for the full batch.
+9. Send `collab_send` with `sender="codex"`, `topic="implementation_done"`,
    `content=<JSON {"head_sha":"<current HEAD after commit>"}>`. Payload
    carries ONLY `head_sha`.
-8. Exit. The session advances to `CodeReviewFixGlobalPending` with Codex as
+10. Exit. The session advances to `CodeReviewFixGlobalPending` with Codex as
    owner. Skip the `gh pr list` PR-boundary check (Codex never touches PRs).
 
 ---
@@ -294,7 +338,9 @@ is `null`/absent (or any value other than `"mechanical_direct"`).
 3. Invoke the `subagent-driven-development` skill (Codex variant — uses
    `spawn_agent` and `update_plan`) with that plan file. Let its
    controller-owned loop run to completion: every task implemented,
-   reviewed, committed, and marked complete in `update_plan`.
+   reviewed, committed, and marked complete in `update_plan`. Tell the
+   controller to write the ironmem checkpoints above before dispatching
+   each task and immediately after each task's commit/push completes.
 4. **Hard stop at the boundary before
    `finishing-a-development-branch`.** That sub-skill prompts the user
    for merge/PR/cleanup, which would create a PR outside the collab
@@ -312,11 +358,13 @@ is `null`/absent (or any value other than `"mechanical_direct"`).
    dependency on `api.github.com` reachability for the batch turn,
    which the smoke run on session 991d3b49 surfaced as a fragility.
 5. Run final gates (project-appropriate: `cargo test`, `pytest`, etc).
-   On gate failure or any unrecoverable subagent failure, send
+   On gate failure or any unrecoverable subagent failure, write a
+   `status: blocked` checkpoint, then send
    `failure_report` with `coding_failure: "subagent_failure: <reason>"`
    or `coding_failure: "gate_failure: <reason>"` and exit. Do not
    return control to Claude with a half-batch.
-6. On full success, send `collab_send` with `sender="codex"`,
+6. On full success, write a `status: batch_complete` checkpoint, then
+   send `collab_send` with `sender="codex"`,
    `topic="implementation_done"`,
    `content=<JSON {"head_sha":"<current HEAD>"}>`. Payload carries
    ONLY `head_sha` — no subagent notes, no summary.

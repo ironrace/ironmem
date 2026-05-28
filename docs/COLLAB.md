@@ -212,13 +212,14 @@ immutable thereafter:
   bg-exec polling loop detects phase advance.
 
 In both modes the server stores the `task_list` manifest as an audit
-artifact but does not iterate it; per-task progress is observable
-through the git log on the branch. After `implementation_done`, the
-phase advances to `CodeReviewFixGlobalPending` with **Codex** as owner
-regardless of who implemented — Codex sees the raw post-implementation
-diff first (no Claude pre-clean) and applies any fixes directly.
-Claude's `/ultrareview-local` then audits Codex's commits at
-`CodeReviewLocalPending`.
+artifact but does not iterate it. Per-task progress is observable through
+the git log on the branch and through durable ironmem checkpoints written
+by the implementer after each task boundary. After `implementation_done`,
+the phase advances to `CodeReviewFixGlobalPending` with **Codex** as
+owner regardless of who implemented — Codex sees the raw
+post-implementation diff first (no Claude pre-clean) and applies any
+fixes directly. Claude's `/ultrareview-local` then audits Codex's commits
+at `CodeReviewLocalPending`.
 
 | Phase | Owner | Event | Next |
 |---|---|---|---|
@@ -229,6 +230,56 @@ no `notes`, `summary`, `subagent_report`, or any other field — the
 non-implementer agent reads the diff and the writing-plans markdown in
 the repo (via `plan_file_path`) at the global review stage and forms
 its own judgment.
+
+### Implementation checkpoints
+
+During `CodeImplementPending`, the implementer must write durable
+checkpoints to ironmem so a fresh Claude or Codex process can resume if
+the current session stops mid-batch. These checkpoints do **not** advance
+the collab state machine and must not be sent through `collab_send`.
+
+Checkpoint storage:
+
+- Tool: `mcp__ironmem__add_drawer`
+- `wing`: `ironrace-memory`
+- `room`: `collab-checkpoints`
+- One checkpoint before starting each task (`status: started`)
+- One checkpoint after each task is implemented, reviewed, committed, and
+  pushed (`status: completed`)
+- One checkpoint on unrecoverable task failure (`status: blocked`)
+- One final checkpoint before `implementation_done`
+  (`status: batch_complete`)
+
+Checkpoint content should be compact, line-oriented, and include enough
+state for another agent to resume without transcript context:
+
+```text
+collab_checkpoint
+session_id: <uuid>
+phase: CodeImplementPending
+implementer: <claude|codex>
+repo_path: <absolute repo path>
+branch: <branch>
+plan_file_path: <repo-relative plan path>
+task_id: <N|none>
+task_title: <title|none>
+status: <started|completed|blocked|batch_complete>
+head_sha: <current HEAD>
+commit_sha: <task commit sha|none>
+completed_task_ids: <comma-separated ids>
+next_task_id: <N|none>
+gates: <not_run|passed|failed: short reason>
+summary: <one concise sentence>
+resume_hint: /collab join <session_id>
+```
+
+On any fresh `/collab join` that lands in `CodeImplementPending`, the
+owning implementer must first search `wing=ironrace-memory`,
+`room=collab-checkpoints` for the session id and use the newest
+checkpoint plus the git log to choose the first unfinished task. If the
+newest checkpoint is `batch_complete`, rerun the required gates and send
+`implementation_done`; otherwise resume at `next_task_id` (or the
+`started` task if the last checkpoint stopped mid-task).
 
 **Both modes apply the same `finishing-a-development-branch` carve-out**:
 the implementer agent stops `subagent-driven-development` at the last
@@ -593,6 +644,13 @@ before each coding-active `collab_send`:
   subagent runs TDD and commits on the branch. Per-subagent failures pause
   for triage; an unrecoverable failure surfaces as `failure_report` with
   `coding_failure: "subagent_failure: ..."`.
+- **Implementation checkpoints** during `CodeImplementPending`. The
+  implementer writes `ironrace-memory/collab-checkpoints` drawers before
+  each task starts, after each task completes, on blocked failures, and
+  after final gates pass. On a fresh join at `CodeImplementPending`, the
+  implementer searches those checkpoints by `session_id` before doing
+  work and resumes from the first unfinished task instead of relying on
+  transcript context.
 - **Local gates** before every Claude-owned coding turn
   (`implementation_done` in Claude-implementer mode, `review_local`,
   `final_review`): `cargo fmt --check`, `cargo clippy -D warnings`,
@@ -681,8 +739,8 @@ Phase → action (v3):
 | Phase | Claude does | Codex does |
 |---|---|---|
 | `PlanLocked` (post-final) | run `writing-plans` on the locked plan; user approves the generated markdown; build `task_list` JSON (with `plan_file_path`), send | n/a |
-| `CodeImplementPending` (implementer=claude) | run `subagent-driven-development` locally; on full success run gates and send `implementation_done{head_sha}` | wait |
-| `CodeImplementPending` (implementer=codex) | dispatch Codex via bg-exec; poll | one-shot bg-exec: run `subagent-driven-development`, emit `implementation_done{head_sha}`, exit |
+| `CodeImplementPending` (implementer=claude) | search implementation checkpoints, resume/run `subagent-driven-development` locally, checkpoint every task boundary; on full success run gates, write `batch_complete`, and send `implementation_done{head_sha}` | wait |
+| `CodeImplementPending` (implementer=codex) | dispatch Codex via bg-exec; poll | one-shot bg-exec: search implementation checkpoints, resume/run `subagent-driven-development`, checkpoint every task boundary, emit `implementation_done{head_sha}`, exit |
 | `CodeReviewFixGlobalPending` | dispatch Codex via bg-exec; poll | one-shot bg-exec: review raw post-implementation diff, fix branch-level issues in place, send `review_fix_global`, exit |
 | `CodeReviewLocalPending` | run `/ultrareview-local` as audit of Codex's commits, fix CRITICAL/HIGH/MEDIUM in place, send `review_local` | wait |
 | `CodeReviewFinalPending` | gates, enter Plan Mode for PR title/body, `gh pr create`, send `final_review{pr_url}` | wait |
