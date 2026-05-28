@@ -33,8 +33,9 @@ pub struct CollabSession {
     /// `CodeImplementPending` to Codex instead — Claude still publishes
     /// `task_list`, but Codex drives its own `subagent-driven-development`
     /// end-to-end and emits `implementation_done`. Set at `collab_start`
-    /// and immutable thereafter; the DB CHECK constraint enforces the
-    /// allowed set as defense-in-depth.
+    /// and rebindable via `collab_set_implementer` until implementation
+    /// completes. The DB CHECK constraint enforces the allowed set as
+    /// defense-in-depth.
     pub implementer: Agent,
 }
 

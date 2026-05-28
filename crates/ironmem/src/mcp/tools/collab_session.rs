@@ -165,8 +165,8 @@ pub(super) fn handle_collab_start(app: &App, args: &Value) -> Result<Value, Memo
     // Optional `implementer` field: routes the v3 batch implementation
     // phase. Default is `Agent::Claude` (historical flow). `Agent::Codex`
     // makes Codex the owner of `CodeImplementPending` and the only valid
-    // sender of `implementation_done`. `require_implementer` rejects
-    // anything outside `{"claude","codex"}` with a clear validation error.
+    // sender of `implementation_done`. It can be rebound later through
+    // `collab_set_implementer` while planning or implementation is active.
     let implementer = match args.get("implementer").and_then(Value::as_str) {
         Some(value) => require_implementer(value)?,
         None => Agent::Claude,
@@ -203,6 +203,64 @@ pub(super) fn handle_collab_start(app: &App, args: &Value) -> Result<Value, Memo
         "task": task,
         "implementer": implementer.as_str(),
     }))
+}
+
+pub(super) fn handle_collab_set_implementer(app: &App, args: &Value) -> Result<Value, MemoryError> {
+    let session_id = require_str(args, "session_id")?;
+    let agent = require_agent(require_str(args, "agent")?)?;
+    let implementer = require_implementer(require_str(args, "implementer")?)?;
+
+    app.db.with_transaction(|tx| {
+        crate::collab::queue::ensure_active(tx, session_id)?;
+        let record = crate::collab::queue::load_session_record(tx, session_id)?;
+        let can_change = match record.session.phase {
+            Phase::PlanParallelDrafts
+            | Phase::PlanSynthesisPending
+            | Phase::PlanCodexReviewPending
+            | Phase::PlanClaudeFinalizePending
+            | Phase::PlanLocked => record.session.task_list.is_none(),
+            Phase::CodeImplementPending => true,
+            Phase::CodeReviewFixGlobalPending
+            | Phase::CodeReviewLocalPending
+            | Phase::CodeReviewFinalPending
+            | Phase::CodingComplete
+            | Phase::CodingFailed => false,
+        };
+        if !can_change {
+            return Err(MemoryError::Validation(
+                "implementer can only be changed before implementation is complete".to_string(),
+            ));
+        }
+
+        let previous = record.session.implementer;
+        let previous_owner = record.session.current_owner;
+        let new_owner = if record.session.phase == Phase::CodeImplementPending {
+            Some(implementer)
+        } else {
+            None
+        };
+        let owner_changed = new_owner.is_some_and(|owner| owner != previous_owner);
+        if previous != implementer || owner_changed {
+            crate::collab::queue::set_implementer(tx, session_id, implementer, new_owner)?;
+        }
+        crate::db::schema::Database::wal_log_tx(
+            tx,
+            "collab_set_implementer",
+            &json!({
+                "session_id": session_id,
+                "agent": agent.as_str(),
+                "previous_implementer": previous.as_str(),
+                "implementer": implementer.as_str(),
+                "phase": record.session.phase.to_string(),
+                "previous_owner": previous_owner.as_str(),
+                "current_owner": new_owner.unwrap_or(previous_owner).as_str(),
+                "changed": previous != implementer || owner_changed,
+            }),
+            Some(&json!({ "session_id": session_id })),
+        )?;
+        let updated = crate::collab::queue::load_session_record(tx, session_id)?;
+        Ok(session_record_json(&updated))
+    })
 }
 
 pub(super) fn handle_collab_start_code_review(
