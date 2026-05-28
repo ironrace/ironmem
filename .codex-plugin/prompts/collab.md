@@ -29,7 +29,7 @@ session record's `implementer` field is `"codex"`.
 **Never** call `collab_end` during an active phase. See Invariants.
 
 > **Note:** Claude's dispatcher invokes ALL Codex-owned non-terminal phases via
-> background `codex exec` (Track C), not the synchronous `mcp__codex__codex`
+> background `codex exec` (see `docs/COLLAB.md` § Background `codex exec` dispatch), not the synchronous `mcp__codex__codex`
 > MCP tool. This full file is the prompt for v1 planning turns
 > (`PlanParallelDrafts`, `PlanCodexReviewPending`), the global review turn
 > (`CodeReviewFixGlobalPending`), and shortcut sessions. For the

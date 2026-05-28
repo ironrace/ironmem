@@ -22,7 +22,7 @@ This document covers:
 - topic payload formats for every protocol message
 - harness-side responsibilities (git, cargo, gh, coderabbit)
 - Claude's dispatcher loop and one-shot Codex dispatches
-- Claude's Plan Mode integration for the first canonical synthesis and the final plan
+- Claude's Plan Mode integration for the first canonical synthesis, the v1 final plan, and the v3 final_review (PR creation)
 - copy-pasteable prompts (single-terminal default; Codex-terminal fallback)
 - a worked example
 
@@ -61,7 +61,7 @@ not an iteration target.
   explicitly declined with a rationale) in the `final` plan.
 - `review_round` is the audit trail. It is set to 1 after the first
   review and to 2 after the second; post-finalize the test suite asserts
-  `review_round == MAX_REVIEW_ROUNDS` at `state_machine/tests.rs:203`.
+  `review_round == MAX_REVIEW_ROUNDS` at `state_machine/tests.rs:205`.
 - The protocol is bounded by construction: at most two Codex reviews,
   then forced Claude finalize. Docs/prompts that frame v1 planning as
   open-ended iteration to convergence are wrong.
@@ -126,7 +126,8 @@ Owner: `claude`. Claude sends one `canonical` message containing the merged
 plan.
 
 This phase is also re-entered on `request_changes`, so Claude uses it both
-for the first synthesis and for revisions. **Gating split by `review_round`:**
+for the first synthesis and for revisions. **Gating split by `review_round`
+(prompt-enforced, not server-enforced):**
 
 - `review_round == 0` (first synthesis) — Claude enters harness Plan Mode
   and gets user approval before sending `canonical`. This is the user's
@@ -134,6 +135,13 @@ for the first synthesis and for revisions. **Gating split by `review_round`:**
 - `review_round >= 1` (revision rounds, re-entered on `request_changes`) —
   Claude sends autonomously. The user's next gate is `final` at
   `PlanClaudeFinalizePending`.
+
+The server accepts a `canonical` send in either branch; the user-approval
+requirement on the first synthesis is honored by the prompt layer
+(`.claude-plugin/commands/collab.md`'s v1 phase table). Compare with
+`MAX_REVIEW_ROUNDS = 2`, which IS server-enforced via the force-finalize
+branch above. Treat the prompt-enforced split as advisory at the protocol
+layer but load-bearing in the dispatcher.
 
 Exit → `PlanCodexReviewPending`, owner `codex`.
 
@@ -638,8 +646,11 @@ and the harness still responsible for local verification and any
 each Codex-owned turn is dispatched inline via background `codex exec`
 (see Implementation Notes § Background `codex exec` dispatch), reads
 state, sends exactly one protocol message, and exits. There is no
-symmetric `wait_my_turn` polling on the Codex side — Claude polls,
-Claude dispatches.
+symmetric long-running polling loop on the Codex side — Claude polls,
+Claude dispatches. A single bounded `wait_my_turn` call at invocation
+start (as in `.codex-plugin/prompts/collab.md`) is permitted to bridge
+the brief server-write race after Claude's dispatch — that's a one-shot
+boot-time wait, not a polling loop.
 
 Claude's loop:
 

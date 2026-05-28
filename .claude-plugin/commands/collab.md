@@ -59,11 +59,17 @@ branch names.
    sending the draft autonomously lets Codex start grinding immediately
    instead of waiting on a user think-time gate.
 6. After the draft is sent, begin the v1 planning loop (below). The send
-   flips `current_owner` to `"codex"`, so the loop's next iteration
-   dispatches Codex via bg-exec immediately (see "Codex handoff —
-   background `codex exec`") and Codex grinds in parallel while Claude
-   polls. After the plan locks (`PlanLocked`), the session automatically
-   flows into the v3 coding bridge (no separate invocation needed).
+   normally flips `current_owner` to `"codex"`, so the loop's next
+   iteration dispatches Codex via bg-exec immediately (see "Codex handoff
+   — background `codex exec`") and Codex grinds in parallel while Claude
+   polls. **Race exception (fallback only):** if Codex submitted its
+   draft first (only possible when the user manually ran `/collab join`
+   in a Codex terminal under the fallback path), the phase advances
+   directly to `PlanSynthesisPending` with `current_owner == "claude"`
+   on the second draft's arrival — the loop will see Claude is owner
+   and proceed to synthesis. After the plan locks (`PlanLocked`), the
+   session automatically flows into the v3 coding bridge (no separate
+   invocation needed).
 
 ## `review <short-topic>`
 

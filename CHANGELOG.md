@@ -7,6 +7,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **Collab v1 planning gates reworked (prompt-layer only; no Rust /
+  state-machine change).** Blind `draft` now sends autonomously — Codex
+  starts grinding immediately on the owner-flip instead of waiting on a
+  user think-time gate. The first `canonical` synthesis at
+  `PlanSynthesisPending` with `review_round == 0` is now the user gate
+  (Plan Mode + approval), since it is the first artifact that combines
+  both drafts. Revision-round canonicals (`review_round >= 1`,
+  re-entered on `request_changes`) run autonomously; the user's next
+  gate is `final`. The v1 `final` gate and the v3 `final_review` PR
+  gate are unchanged. Gating is prompt-enforced via the existing
+  `review_round` field on `CollabSession` — server semantics are
+  untouched.
+
+- **Adjacent doc cleanups folded into the same change:** moved the
+  72-line timing-instrumentation block from the runtime command file
+  to the spec (inverts cross-reference; trims invocation tokens);
+  rewrote four sections in `docs/COLLAB.md` still describing the old
+  two-terminal model (§ Autonomous Planning Loop, § Prompt Templates,
+  § Worked Example, top-of-doc bullets + Runtime Model ASCII);
+  demoted § "Codex handoff via MCP" into a Fallback subsection merged
+  under § Background `codex exec` dispatch; fixed stale
+  `mcp__codex__codex` primary-dispatch references; recorded the
+  `/ultrareview-local` anti-removal decision as `kept` under the
+  existing overlap-audit clause.
+
 ### Added
 
 - **ProvBench Plan A.2 — Python post-commit classification pipeline
