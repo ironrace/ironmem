@@ -82,6 +82,9 @@ Tagged releases upload prebuilt macOS and Linux binaries automatically. Until th
 - `requesting-code-review`
 - `test-driven-development`
 
+Codex also receives the `pr-review-toolkit` skill used by the `/collab`
+`review_fix_global` turn before Claude runs `/ultrareview-local`.
+
 Existing identical skills are skipped. Existing divergent skills are left in place unless you pass `--force-skills`; use `--skip-skills` when you only want to replace the binary.
 For Claude Code, the installer also installs the `code-reviewer` agent used by the vendored review flow.
 

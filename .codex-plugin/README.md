@@ -27,6 +27,7 @@ Before answering questions about prior work, decisions, project history, or peop
 - `using-superpowers`
 - `requesting-code-review`
 - `test-driven-development`
+- `pr-review-toolkit`
 
 ## Notes
 
