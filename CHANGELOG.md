@@ -15,6 +15,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   installer now bundles `pr-review-toolkit` as a Codex-only skill
   dependency for fresh `/collab` installs.
 
+### Fixed
+
+- Fixed invalid YAML in `.github/workflows/ci.yml` caused by partially
+  quoted absolute-path cargo commands, which made CI runs fail before
+  scheduling any jobs.
+
 ## [0.3.3] - 2026-05-28
 
 ### Added
