@@ -21,7 +21,7 @@ INSTALL_DIR="${IRONMEM_INSTALL_DIR:-$HOME/.ironrace/bin}"
 TARGET="$INSTALL_DIR/ironmem"
 SOURCE="$REPO_ROOT/target/release/ironmem"
 
-REQUIRED_SKILLS=(
+REQUIRED_SHARED_SKILLS=(
   writing-plans
   subagent-driven-development
   finishing-a-development-branch
@@ -31,6 +31,12 @@ REQUIRED_SKILLS=(
   requesting-code-review
   test-driven-development
 )
+
+REQUIRED_CODEX_SKILLS=(
+  pr-review-toolkit
+)
+
+REQUIRED_CLAUDE_SKILLS=()
 
 REQUIRED_CLAUDE_AGENTS=(
   code-reviewer
@@ -106,9 +112,11 @@ done
 validate_packaged_skills() {
   local harness="$1"
   local source_root="$2"
+  shift 2
+  local skills=("$@")
   local missing=0
 
-  for skill in "${REQUIRED_SKILLS[@]}"; do
+  for skill in "${skills[@]}"; do
     if [[ ! -f "$source_root/$skill/SKILL.md" ]]; then
       echo "ERROR: bundled $harness skill missing: $source_root/$skill/SKILL.md" >&2
       missing=1
@@ -141,13 +149,15 @@ install_skill_set() {
   local harness="$1"
   local source_root="$2"
   local target_root="$3"
+  shift 3
+  local skills=("$@")
 
-  validate_packaged_skills "$harness" "$source_root"
+  validate_packaged_skills "$harness" "$source_root" "${skills[@]}"
   mkdir -p "$target_root"
 
   echo "==> Installing $harness skill dependencies → $target_root"
 
-  for skill in "${REQUIRED_SKILLS[@]}"; do
+  for skill in "${skills[@]}"; do
     local source="$source_root/$skill"
     local target="$target_root/$skill"
 
@@ -301,8 +311,10 @@ if [[ "$SKIP_SKILLS" -eq 0 ]]; then
   CLAUDE_COMMANDS_DIR="${CLAUDE_COMMANDS_DIR:-$CLAUDE_HOME/commands}"
   CODEX_PROMPTS_DIR="${CODEX_PROMPTS_DIR:-$CODEX_HOME/prompts}"
 
-  install_skill_set "Codex" "$REPO_ROOT/.codex-plugin/skills" "$CODEX_SKILLS_DIR"
-  install_skill_set "Claude" "$REPO_ROOT/.claude-plugin/skills" "$CLAUDE_SKILLS_DIR"
+  install_skill_set "Codex" "$REPO_ROOT/.codex-plugin/skills" "$CODEX_SKILLS_DIR" \
+    "${REQUIRED_SHARED_SKILLS[@]}" "${REQUIRED_CODEX_SKILLS[@]}"
+  install_skill_set "Claude" "$REPO_ROOT/.claude-plugin/skills" "$CLAUDE_SKILLS_DIR" \
+    "${REQUIRED_SHARED_SKILLS[@]}" "${REQUIRED_CLAUDE_SKILLS[@]}"
   install_agent_set "Claude" "$REPO_ROOT/.claude-plugin/agents" "$CLAUDE_AGENTS_DIR"
   install_md_set "Claude command" "$REPO_ROOT/.claude-plugin/commands" \
     "$CLAUDE_COMMANDS_DIR" "${REQUIRED_CLAUDE_COMMANDS[@]}"

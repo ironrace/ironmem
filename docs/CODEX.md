@@ -160,10 +160,10 @@ Embedding-dependent tools (`search`, `add_drawer`, diary writes) return `{"warmi
 - Codex-specific README content
 - bundled collab skill dependencies under `skills/`
 
-The same collab skill dependencies are bundled for Claude Code under `.claude-plugin/skills/`.
+The shared collab skill dependencies are bundled for Claude Code under `.claude-plugin/skills/`.
 `scripts/install-ironmem.sh` installs the Codex copies into `$CODEX_HOME/skills` (default
 `~/.codex/skills`) and the Claude copies into `$CLAUDE_HOME/skills` (default `~/.claude/skills`).
-The required set is:
+The shared required set is:
 
 - `writing-plans`
 - `subagent-driven-development`
@@ -173,6 +173,10 @@ The required set is:
 - `using-superpowers`
 - `requesting-code-review`
 - `test-driven-development`
+
+Codex also receives `pr-review-toolkit`, which `/collab` uses during the
+`CodeReviewFixGlobalPending` / `review_fix_global` turn before Claude's
+`/ultrareview-local` audit.
 
 Existing identical skills are skipped. Existing divergent skills are left untouched unless the
 installer is run with `--force-skills`; `--skip-skills` skips this step entirely.

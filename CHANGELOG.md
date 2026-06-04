@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- Codex `/collab` now runs `/pr-review-toolkit:review-pr` during the
+  `CodeReviewFixGlobalPending` / `review_fix_global` turn as the final
+  Codex review pass before Claude's `/ultrareview-local` audit. The
+  installer now bundles `pr-review-toolkit` as a Codex-only skill
+  dependency for fresh `/collab` installs.
+
 ## [0.3.3] - 2026-05-28
 
 ### Added

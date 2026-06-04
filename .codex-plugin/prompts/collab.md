@@ -38,10 +38,11 @@ session record's `implementer` field is `"codex"`.
 > file covers only the batch-impl turn so Codex doesn't process unreachable
 > v1/review content.
 
-## v3 core rule — you write code, not review notes
+## v3 core rule — run PR review, then write code
 
-v3 batch mode gives Codex a single coding turn: **read the full branch
-diff and the writing-plans markdown, form your own judgment, apply any
+v3 batch mode gives Codex a single coding review turn:
+**run `/pr-review-toolkit:review-pr` against the full branch diff and
+the writing-plans markdown, form your own judgment, apply any confirmed
 fixes directly (commit + push), then send `review_fix_global`. You see
 the diff AS-IS — no Claude pre-clean.** Under the v3 phase order,
 `CodeReviewFixGlobalPending` (your turn) runs *before*
@@ -59,6 +60,12 @@ consolidated result at `review_fix_global`. PR creation is Claude-only at
   pointing at the markdown plan that drove subagent execution. Read it
   alongside the diff — that file is your source of truth for what the
   branch was supposed to deliver.
+- Treat `/pr-review-toolkit:review-pr` as the read-only finding pass for
+  this turn. Scope it to the collab target (`base_sha` → `last_head_sha`)
+  from `collab_status`; if the toolkit's default base detection differs,
+  override it with the collab base/head. After it returns, independently
+  verify the findings and then leave review-only mode to make any required
+  fixes in the branch.
 - If the code is clean, commit nothing (or a no-op empty commit) and send
   `review_fix_global` with the existing `last_head_sha`.
 - If you find issues — correctness bugs, missed acceptance criteria,
@@ -238,7 +245,7 @@ working-tree reset on the common case where Codex is already at the right SHA
 |---|---|
 | `CodeImplementPending` | Owner depends on `implementer`. If `implementer == "claude"`, this is Claude's batch turn — exit. If `implementer == "codex"`, run the batch implementation action below, resuming from ironmem checkpoints and scanning the plan/code state before editing. |
 | `CodeReviewLocalPending` | Claude's turn. Exit. |
-| `CodeReviewFixGlobalPending` | **Run pre-send harness.** This is your only mandatory v3 coding turn — review the full branch diff (`git diff <base_sha>..<last_head_sha>`) alongside the writing-plans markdown at `plan_file_path` when present. In full-flow sessions, read `plan_file_path` from the canonicalized `task_list` JSON in `collab_status`. In shortcut sessions where `task_list` is null, first search ironmem checkpoints for the same `repo_path`/`branch`, read any referenced plan, and scan the current code/diff to determine what is already complete; if no checkpoint exists, fall back to nearby writing-plans docs plus the branch diff. Check cross-task consistency, architectural drift, missed acceptance criteria, security. **Fix any issues directly**: commit + push. Send `collab_send` with `sender="codex"`, `topic="review_fix_global"`, `content=<JSON {"head_sha":"<current HEAD>"}>`. |
+| `CodeReviewFixGlobalPending` | **Run pre-send harness.** This is your only mandatory v3 coding review turn and the final Codex review before Claude runs `/ultrareview-local` — invoke `/pr-review-toolkit:review-pr` against the full branch diff (`git diff <base_sha>..<last_head_sha>`) alongside the writing-plans markdown at `plan_file_path` when present. Pass the collab `base_sha` and `last_head_sha` as the review target; do not let the toolkit silently substitute a different base branch. In full-flow sessions, read `plan_file_path` from the canonicalized `task_list` JSON in `collab_status`. In shortcut sessions where `task_list` is null, first search ironmem checkpoints for the same `repo_path`/`branch`, read any referenced plan, and scan the current code/diff to determine what is already complete; if no checkpoint exists, fall back to nearby writing-plans docs plus the branch diff. Use the toolkit as a read-only finding pass for cross-task consistency, architectural drift, missed acceptance criteria, correctness, tests, docs, security, performance, and dependency risk. Then verify findings yourself and **fix any confirmed issues directly**: commit + push. Send `collab_send` with `sender="codex"`, `topic="review_fix_global"`, `content=<JSON {"head_sha":"<current HEAD>"}>`. |
 | `CodeReviewFinalPending` | Claude's turn. Exit. |
 
 ### Batch implementation (codex-implementer)

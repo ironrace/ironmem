@@ -20,7 +20,7 @@ This document covers:
 - the full state machine and invariants (v1 + v3)
 - the `collab_*` MCP tools
 - topic payload formats for every protocol message
-- harness-side responsibilities (git, cargo, gh, coderabbit)
+- harness-side responsibilities (git, cargo, gh, pr-review-toolkit)
 - Claude's dispatcher loop and one-shot Codex dispatches
 - Claude's Plan Mode integration for the first canonical synthesis, the v1 final plan, and the v3 final_review (PR creation)
 - copy-pasteable prompts (single-terminal default; Codex-terminal fallback)
@@ -216,10 +216,10 @@ artifact but does not iterate it. Per-task progress is observable through
 the git log on the branch and through durable ironmem checkpoints written
 by the implementer after each task boundary. After `implementation_done`,
 the phase advances to `CodeReviewFixGlobalPending` with **Codex** as
-owner regardless of who implemented — Codex sees the raw
-post-implementation diff first (no Claude pre-clean) and applies any
-fixes directly. Claude's `/ultrareview-local` then audits Codex's commits
-at `CodeReviewLocalPending`.
+owner regardless of who implemented — Codex runs `/pr-review-toolkit:review-pr`
+on the raw post-implementation diff first (no Claude pre-clean) and
+applies any confirmed fixes directly. Claude's `/ultrareview-local` then
+audits Codex's commits at `CodeReviewLocalPending`.
 
 | Phase | Owner | Event | Next |
 |---|---|---|---|
@@ -292,13 +292,13 @@ the collab `final_review` turn, not to the subagent skill.
 ### Global review, 3-phase linear (Codex first; Claude audits after)
 
 After `implementation_done`, the session enters a 3-turn linear review at
-branch scope. Codex reviews the raw post-implementation diff first;
-Claude then audits Codex's commits via `/ultrareview-local`; Claude
-opens the PR on the final turn.
+branch scope. Codex runs `/pr-review-toolkit:review-pr` on the raw
+post-implementation diff first; Claude then audits Codex's commits via
+`/ultrareview-local`; Claude opens the PR on the final turn.
 
 | Phase | Owner | Event | Next |
 |---|---|---|---|
-| `CodeReviewFixGlobalPending` | `codex` | `CodeReviewFixGlobal{head_sha}` — Codex reviewed the full diff AS-IS (no Claude pre-clean) and (if needed) pushed fixes directly | `CodeReviewLocalPending` |
+| `CodeReviewFixGlobalPending` | `codex` | `CodeReviewFixGlobal{head_sha}` — Codex ran `/pr-review-toolkit:review-pr` on the full diff AS-IS (no Claude pre-clean) and (if needed) pushed fixes directly | `CodeReviewLocalPending` |
 | `CodeReviewLocalPending` | `claude` | `ReviewLocal{head_sha}` — Claude ran `/ultrareview-local` as an audit of Codex's commits + code-quality issues both agents missed; pushed any fixes | `CodeReviewFinalPending` |
 | `CodeReviewFinalPending` | `claude` | `FinalReview{head_sha, pr_url}` — Claude opens the PR and sends the URL in the same event | `CodingComplete` (terminal) |
 
@@ -318,9 +318,9 @@ branch diff plus nearby writing-plans docs in the repo.
 
 The no-op handshake turn is collapsed: `head_sha` is supplied at session
 creation time. From there, the surviving flow follows the new ordering:
-Codex `review_fix_global` (audit-and-fix the raw diff) → Claude
-`review_local` (audit Codex's commits) → Claude `final_review` (PR
-creation).
+Codex `review_fix_global` (`/pr-review-toolkit:review-pr` plus confirmed
+fixes on the raw diff) → Claude `review_local` (audit Codex's commits)
+→ Claude `final_review` (PR creation).
 
 | Phase | Owner | Event | Next |
 |---|---|---|---|
@@ -578,7 +578,7 @@ orchestrator from steering the reviewer's conclusion.
 |---|---|---|---|
 | `task_list` | `claude` | `{"plan_hash","base_sha","head_sha","plan_file_path"?,"execution_mode"?,"tasks":[{"id","title","acceptance":[...]}]}` | `plan_hash` must equal `final_plan_hash`; `tasks` must be non-empty and strictly ordered by `id`; each task requires ≥1 `acceptance` entry. Optional `plan_file_path` (repo-relative; no leading `/`; no `..` segments) points at the writing-plans markdown driving subagent execution. Optional `execution_mode` — see below. |
 | `implementation_done` | `claude` or `codex` (per session `implementer`) | `{"head_sha"}` | In `CodeImplementPending` only. Fired once after the subagent batch completes and gates pass. Carries only `head_sha` — no prose, no subagent notes. |
-| `review_fix_global` | `codex` | `{"head_sha"}` | In `CodeReviewFixGlobalPending` only. Codex reviewed the raw post-implementation diff (no Claude pre-clean) and has pushed any branch-level fixes. |
+| `review_fix_global` | `codex` | `{"head_sha"}` | In `CodeReviewFixGlobalPending` only. Codex ran `/pr-review-toolkit:review-pr` on the raw post-implementation diff (no Claude pre-clean) and has pushed any branch-level fixes. |
 | `review_local` | `claude` | `{"head_sha"}` | In `CodeReviewLocalPending` only. Claude ran `/ultrareview-local` as an audit of Codex's `review_fix_global` commits + caught code-quality issues both agents missed; has pushed any fixes. |
 | `final_review` | `claude` | `{"head_sha","pr_url"}` | In `CodeReviewFinalPending` only. Claude has opened the PR; the event carries the URL and advances directly to `CodingComplete`. `pr_url` must start with `https://` and be ≤2048 chars. |
 | `failure_report` | either | `{"coding_failure":"<reason>"}` | Valid in any coding-active phase. |
@@ -633,7 +633,7 @@ exactly one event variant — there is no phase overloading.
 | `PlanClaudeFinalizePending` | `final` | v1 — Claude finalizes |
 | `PlanLocked` | `task_list` | v1 → v3 hand-off |
 | `CodeImplementPending` | `implementation_done`, `failure_report` | v3 — single implementer turn after subagent batch |
-| `CodeReviewFixGlobalPending` | `review_fix_global`, `failure_report` | v3 — Codex reviews raw post-implementation diff (first review pass) |
+| `CodeReviewFixGlobalPending` | `review_fix_global`, `failure_report` | v3 — Codex runs `/pr-review-toolkit:review-pr` on the raw post-implementation diff (first review pass) |
 | `CodeReviewLocalPending` | `review_local`, `failure_report` | v3 — Claude audits Codex's commits via `/ultrareview-local` |
 | `CodeReviewFinalPending` | `final_review`, `failure_report` | v3 — Claude opens PR |
 | `CodingComplete` / `CodingFailed` | *(none — terminal; only `collab_end` accepted)* | |
@@ -645,7 +645,7 @@ by the owner recorded in the phase table above.
 ## Harness-Side Responsibilities
 
 The server validates transitions, persists hashes, and routes messages.
-Most shell-level action — cargo, gh, coderabbit — is the **agent harness's**
+Most shell-level action — cargo, gh, pr-review-toolkit — is the **agent harness's**
 responsibility. The protocol relies on the harness doing these things
 before each coding-active `collab_send`:
 
@@ -686,10 +686,16 @@ before each coding-active `collab_send`:
   gates before sending `implementation_done`. Any failure surfaces as
   `failure_report`; don't hide it.
 - **Review + fix tooling** during Codex's `review_fix_global`:
-  `coderabbit` / manual review of the raw post-implementation diff,
-  followed by direct code edits + commit + push. `/ultrareview-local`
-  is NOT used here — it runs later at Claude's `review_local` audit
-  step. Codex's judgment is expressed as commits, not prose.
+  `/pr-review-toolkit:review-pr` runs as the final Codex review pass
+  over the raw post-implementation diff, alongside the writing-plans
+  markdown when available. The collab `base_sha` and `last_head_sha`
+  define the review target; Codex must not let the toolkit silently
+  substitute a different base branch. Codex treats the toolkit output as
+  a read-only finding pass, independently verifies findings, then makes
+  direct code edits + commit + push for confirmed branch-level issues.
+  `/ultrareview-local` is NOT used here — it runs later at Claude's
+  `review_local` audit step. Codex's judgment is expressed as commits,
+  not prose.
 - **Audit tooling** during Claude's `review_local`: `/ultrareview-local`
   (code-reviewer + security-reviewer + architect + doc-reviewer in
   parallel) runs against the post-`review_fix_global` head, auditing
@@ -769,7 +775,7 @@ Phase → action (v3):
 | `PlanLocked` (post-final) | run `writing-plans` on the locked plan; user approves the generated markdown; build `task_list` JSON (with `plan_file_path`), send | n/a |
 | `CodeImplementPending` (implementer=claude) | search implementation checkpoints, resume/run `subagent-driven-development` locally, checkpoint every task boundary; on full success run gates, write `batch_complete`, and send `implementation_done{head_sha}` | wait |
 | `CodeImplementPending` (implementer=codex) | dispatch Codex via bg-exec; poll | one-shot bg-exec: search implementation checkpoints, resume/run `subagent-driven-development`, checkpoint every task boundary, emit `implementation_done{head_sha}`, exit |
-| `CodeReviewFixGlobalPending` | dispatch Codex via bg-exec; poll | one-shot bg-exec: review raw post-implementation diff, fix branch-level issues in place, send `review_fix_global`, exit |
+| `CodeReviewFixGlobalPending` | dispatch Codex via bg-exec; poll | one-shot bg-exec: run `/pr-review-toolkit:review-pr` on the raw post-implementation diff, fix confirmed branch-level issues in place, send `review_fix_global`, exit |
 | `CodeReviewLocalPending` | run `/ultrareview-local` as audit of Codex's commits, fix CRITICAL/HIGH/MEDIUM in place, send `review_local` | wait |
 | `CodeReviewFinalPending` | gates, enter Plan Mode for PR title/body, `gh pr create`, send `final_review{pr_url}` | wait |
 | `CodingComplete` / `CodingFailed` | exit loop | n/a |
@@ -1122,23 +1128,24 @@ conditions are documented in the Claude-side dispatcher prompt.
 Under the new v3 ordering, `CodeReviewLocalPending` runs after Codex's
 `review_fix_global`. Its role is **audit of Codex's commits** plus
 catching code-quality, maintainability, consistency, and local-read
-issues that Codex's correctness/security/scope/architecture lens may
-miss. `/ultrareview-local` (code-reviewer + security-reviewer +
+issues that Codex's pr-review-toolkit-backed branch review may miss.
+`/ultrareview-local` (code-reviewer + security-reviewer +
 architect + doc-reviewer in parallel, synthesized inline) exercises a
 different set of agent prompts and a different synthesis path than
-Codex's lens.
+Codex's review toolkit pass.
 
 Removing the `CodeReviewLocalPending` stage from the v3 flow therefore
 requires a written **overlap audit**: a demonstration, against a
 representative sample of prior collab sessions, that Codex's
-`review_fix_global` reviews catch the code-quality issues
-`/ultrareview-local` would have flagged AND that the audit-of-Codex role
-is unnecessary (e.g., Codex's commits never reintroduce issues).
+`pr-review-toolkit`-backed `review_fix_global` reviews catch the
+code-quality issues `/ultrareview-local` would have flagged AND that the
+audit-of-Codex role is unnecessary (e.g., Codex's commits never
+reintroduce issues).
 Without that audit, the stage stays.
 
 **Status as of 2026-05-27: kept.** Code-quality / consistency overlap
-with Codex's correctness/security lens accepted as deliberate. Removal
-still requires the written overlap audit specified above.
+with Codex's branch review is accepted as deliberate. Removal still
+requires the written overlap audit specified above.
 
 ### SDD reviewer model pinning (out of protocol)
 

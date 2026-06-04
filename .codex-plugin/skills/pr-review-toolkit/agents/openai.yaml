@@ -1,0 +1,7 @@
+interface:
+  display_name: "PR Review Toolkit"
+  short_description: "Parallel PR review synthesis"
+  default_prompt: "Use $pr-review-toolkit:review-pr to review the current branch diff with focused parallel reviewers."
+
+policy:
+  allow_implicit_invocation: true
