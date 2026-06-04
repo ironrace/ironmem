@@ -1,9 +1,15 @@
 [package]
 name = "ironrace-rerank"
-version = "0.3.3"
+version = "0.3.4"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 description = "LLM-based reranker for ironrace-memory."
+authors = ["Jeffrey Crum <jeffrey.crum81@gmail.com>"]
+repository = "https://github.com/ironrace/ironmem"
+homepage = "https://github.com/ironrace/ironmem"
+keywords = ["rerank", "llm", "memory", "mcp", "search"]
+categories = ["algorithms"]
+readme = "../../README.md"
 
 [dependencies]
 anyhow = "1"
