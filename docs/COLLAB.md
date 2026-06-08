@@ -959,7 +959,8 @@ that dominated latency in smoke testing (`PlanCodexReviewPending` hung
 24+ min; `CodeReviewFixGlobalPending` took 171s via synchronous MCP).
 The dispatch shape is now uniform across all Codex turns; only the prompt
 file and the reasoning flag vary by phase. `CodeImplementPending+codex`
-uses the slim `collab-batch-impl.md` prompt and `--reasoning-effort low`;
+uses the slim `collab-batch-impl.md` prompt and
+`-c model_reasoning_effort=xhigh`;
 all other Codex turns use the full `collab.md` prompt with default reasoning
 preserved (reviewer and planner judgment must not be shallow).
 
@@ -987,11 +988,11 @@ unchanged; only the transport differs.
      "arguments": {
        "prompt": "<resolved prompt text>",
        "cwd": "<repo_path>",
-       "config": { "model_reasoning_effort": "low" }
+       "config": { "model_reasoning_effort": "xhigh" }
      }
    }
    ```
-   The `config` block with `model_reasoning_effort: "low"` is added
+   The `config` block with `model_reasoning_effort: "xhigh"` is added
    **only** for `CodeImplementPending+codex`; all other phases omit
    `config` so reviewer and planner judgment stays at default depth.
    The call blocks until Codex finishes its phase-specific action and
