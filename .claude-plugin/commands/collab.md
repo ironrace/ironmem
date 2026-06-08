@@ -519,7 +519,7 @@ and a shallow reviewer defeats the protocol's design.
 
 | Phase from `collab_status` | `implementer` | Prompt file | Reasoning flag | Rationale |
 |---|---|---|---|---|
-| `CodeImplementPending` | `"codex"` | `collab-batch-impl.md` | `--reasoning-effort low` | Batch impl is throughput-bound; review quality is not needed here |
+| `CodeImplementPending` | `"codex"` | `collab-batch-impl.md` | `-c model_reasoning_effort=xhigh` | RecoverLead-class batch plans carry real design judgment; the T1 livelock showed shallow batch effort can over-gate instead of moving on |
 | `CodeReviewFixGlobalPending` | (any) | `collab.md` | *(none — default preserved)* | Reviewer judgment must not be shallow |
 | `PlanParallelDrafts` | (any) | `collab.md` | *(none — default preserved)* | Planning needs reasoning |
 | `PlanCodexReviewPending` | (any) | `collab.md` | *(none — default preserved)* | Plan review needs reasoning |
@@ -537,7 +537,7 @@ file and reasoning flag below.
 **When falling back to `mcp__codex__codex`** (see fallback path in the
 handoff section), apply the same prompt file selection from this
 matrix. The `model_reasoning_effort` override for `CodeImplementPending`
-becomes a `config` field (`{ "model_reasoning_effort": "low" }`); all
+becomes a `config` field (`{ "model_reasoning_effort": "xhigh" }`); all
 other phases omit `config` (no override). The matrix's intent is
 preserved whether the transport is `codex exec` or MCP.
 
@@ -571,7 +571,7 @@ b. Select prompt file and reasoning flag from the "Codex dispatch tuning
    matrix" above using `phase` and `implementer` from `collab_status`:
    - `CodeImplementPending` + `implementer == "codex"` → prompt file:
      `.codex-plugin/prompts/collab-batch-impl.md`; reasoning flag:
-     `--reasoning-effort low`
+     `-c model_reasoning_effort=xhigh`
    - All other Codex-owned phases (`PlanParallelDrafts`,
      `PlanCodexReviewPending`, `CodeReviewFixGlobalPending`) → prompt file:
      `.codex-plugin/prompts/collab.md`; reasoning flag: *(none — omit)*
@@ -608,11 +608,11 @@ d. **Log the appropriate timing event** immediately before launch. Use the
    - For `PlanParallelDrafts`: **Log:** `t2_codex_dispatched phase=PlanParallelDrafts round=1`
    - For `PlanCodexReviewPending`: **Log:** `t2_codex_dispatched phase=PlanCodexReviewPending round=<1 or 2>`
 
-e. Launch via Bash with `run_in_background: true`. Include `--reasoning-effort low`
+e. Launch via Bash with `run_in_background: true`. Include `-c model_reasoning_effort=xhigh`
    only for `CodeImplementPending+codex`; omit for all other phases:
    ```bash
    # CodeImplementPending+codex:
-   cd <repo_path> && codex exec --reasoning-effort low --prompt-file /tmp/codex-prompt-${session_id}.md > /tmp/codex-out-${session_id}.log 2>&1
+   cd <repo_path> && codex exec -c model_reasoning_effort=xhigh --prompt-file /tmp/codex-prompt-${session_id}.md > /tmp/codex-out-${session_id}.log 2>&1
 
    # All other Codex-owned phases:
    cd <repo_path> && codex exec --prompt-file /tmp/codex-prompt-${session_id}.md > /tmp/codex-out-${session_id}.log 2>&1
@@ -622,7 +622,7 @@ e. Launch via Bash with `run_in_background: true`. Include `--reasoning-effort l
    > redirect (`< /tmp/codex-prompt-…`). Run `codex exec --help` once at the
    > start of this path to confirm. If stdin is supported, prefer:
    > ```bash
-   > cd <repo_path> && codex exec [--reasoning-effort low] - < /tmp/codex-prompt-${session_id}.md > /tmp/codex-out-${session_id}.log 2>&1
+   > cd <repo_path> && codex exec [-c model_reasoning_effort=xhigh] - < /tmp/codex-prompt-${session_id}.md > /tmp/codex-out-${session_id}.log 2>&1
    > ```
    > Document in the log which invocation form was used.
 
@@ -697,7 +697,7 @@ g. Resume the normal dispatch loop. The next `collab_status` poll will
 
 - **`codex` not on PATH** → fall back to `mcp__codex__codex` synchronously
   (same resolved prompt; for `CodeImplementPending+codex` add
-  `config: {model_reasoning_effort: "low"}`; all other phases omit
+  `config: {model_reasoning_effort: "xhigh"}`; all other phases omit
   `config`). **Log:** `t2_fallback_to_mcp` in place of the normal pre-launch
   event. The fallback applies to ALL phases, not just batch impl. Do not pass
   `model` or any other override — only `config` per the matrix. Model swap

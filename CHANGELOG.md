@@ -17,6 +17,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- docs(collab): document `CodeImplementPending+codex` batch dispatch with
+  `model_reasoning_effort=xhigh` and the working `codex exec -c` override
+  form.
 - Fixed invalid YAML in `.github/workflows/ci.yml` caused by partially
   quoted absolute-path cargo commands, which made CI runs fail before
   scheduling any jobs.
