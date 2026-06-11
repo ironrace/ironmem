@@ -3,8 +3,13 @@
 pub mod collab;
 pub mod drawers;
 pub mod knowledge_graph;
+pub mod metrics;
 pub mod schema;
 pub mod wal;
 
 /// Search result types returned from drawer queries.
 pub use drawers::{Drawer, ScoredDrawer, SearchFilters};
+pub use metrics::{
+    NewOccupancySample, NewTokenUsage, OccupancySample, SessionSummary, TaskOutcome, TokenUsage,
+    TokenUsageQuery,
+};
