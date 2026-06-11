@@ -417,6 +417,8 @@ mod tests {
         }
         assert!(index_exists(&db, "idx_token_usage_task_ts"));
         assert!(index_exists(&db, "idx_token_usage_collab_phase"));
+        assert!(index_exists(&db, "idx_occupancy_session_ts"));
+        assert!(index_exists(&db, "idx_task_outcomes_collab"));
     }
 
     #[test]
