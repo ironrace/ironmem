@@ -14,6 +14,7 @@ const COLLAB_V2_SQL: &str = include_str!("../../migrations/005_collab_v2.sql");
 const COLLAB_IMPLEMENTER_SQL: &str = include_str!("../../migrations/006_collab_implementer.sql");
 const DROP_CURRENT_TASK_INDEX_SQL: &str =
     include_str!("../../migrations/007_drop_current_task_index.sql");
+const METRICS_SQL: &str = include_str!("../../migrations/008_metrics.sql");
 
 /// Database wrapper around a SQLite connection.
 ///
@@ -144,6 +145,13 @@ impl Database {
             self.conn.execute_batch(DROP_CURRENT_TASK_INDEX_SQL)?;
         }
 
+        // v8: metrics counter tables (token_usage, occupancy_samples,
+        // session_summary, task_outcomes) per METRICS_SPEC §5/§8. All DDL is
+        // IF NOT EXISTS so it stays safe under the BEGIN IMMEDIATE race path.
+        if current_version < 8 {
+            self.conn.execute_batch(METRICS_SQL)?;
+        }
+
         Ok(())
     }
 
@@ -255,7 +263,9 @@ fn is_busy_error(error: &rusqlite::Error) -> bool {
 mod tests {
     use std::path::PathBuf;
 
-    use super::Database;
+    use rusqlite::OptionalExtension;
+
+    use super::*;
 
     /// Returns a `(TempDir, PathBuf)` pair for a database nested under a temp directory.
     /// The caller **must** retain the `TempDir` for the lifetime of the test; dropping it
@@ -342,5 +352,92 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM drawers", [], |row| row.get(0))
             .unwrap();
         assert_eq!(count, 0);
+    }
+
+    // ---- Migration 008 (metrics tables) coverage ----
+
+    fn schema_version_of(db: &Database) -> i64 {
+        db.conn
+            .query_row("SELECT MAX(version) FROM schema_version", [], |r| r.get(0))
+            .unwrap()
+    }
+
+    fn table_exists(db: &Database, name: &str) -> bool {
+        db.conn
+            .query_row(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1",
+                [name],
+                |_| Ok(()),
+            )
+            .optional()
+            .unwrap()
+            .is_some()
+    }
+
+    fn index_exists(db: &Database, name: &str) -> bool {
+        db.conn
+            .query_row(
+                "SELECT 1 FROM sqlite_master WHERE type='index' AND name=?1",
+                [name],
+                |_| Ok(()),
+            )
+            .optional()
+            .unwrap()
+            .is_some()
+    }
+
+    const METRICS_TABLES: [&str; 4] = [
+        "token_usage",
+        "occupancy_samples",
+        "session_summary",
+        "task_outcomes",
+    ];
+
+    /// Build a connection migrated to exactly v7 (no metrics tables yet) by
+    /// replaying migrations 001-007 directly from the module consts.
+    fn open_at_v7() -> Database {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch("PRAGMA foreign_keys=ON;").unwrap();
+        conn.execute_batch(SCHEMA_SQL).unwrap();
+        conn.execute_batch(FTS_SQL).unwrap();
+        conn.execute_batch(COLLAB_SQL).unwrap();
+        conn.execute_batch(COLLAB_V1_SQL).unwrap();
+        conn.execute_batch(COLLAB_V2_SQL).unwrap();
+        conn.execute_batch(COLLAB_IMPLEMENTER_SQL).unwrap();
+        conn.execute_batch(DROP_CURRENT_TASK_INDEX_SQL).unwrap();
+        Database { conn }
+    }
+
+    #[test]
+    fn test_fresh_migrate_reaches_v8_with_metrics_tables() {
+        let db = Database::open_in_memory().unwrap();
+        assert_eq!(schema_version_of(&db), 8);
+        for t in METRICS_TABLES {
+            assert!(table_exists(&db, t), "missing table {t}");
+        }
+        assert!(index_exists(&db, "idx_token_usage_task_ts"));
+        assert!(index_exists(&db, "idx_token_usage_collab_phase"));
+    }
+
+    #[test]
+    fn test_v7_to_v8_upgrade_adds_metrics_tables() {
+        let db = open_at_v7();
+        assert_eq!(schema_version_of(&db), 7);
+        for t in METRICS_TABLES {
+            assert!(!table_exists(&db, t), "table {t} should not exist at v7");
+        }
+        db.migrate().unwrap();
+        assert_eq!(schema_version_of(&db), 8);
+        for t in METRICS_TABLES {
+            assert!(table_exists(&db, t), "missing table {t} after upgrade");
+        }
+    }
+
+    #[test]
+    fn test_migrate_twice_idempotent_at_v8() {
+        let db = Database::open_in_memory().unwrap();
+        db.migrate().unwrap();
+        db.migrate().unwrap();
+        assert_eq!(schema_version_of(&db), 8);
     }
 }
