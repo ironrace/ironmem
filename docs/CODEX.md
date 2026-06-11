@@ -72,15 +72,17 @@ Example `~/.codex/config.toml` fragment:
 
 ```toml
 [mcp_servers.ironmem]
-command = "/Users/jeffreycrum/git-repos/ironmem/target/debug/ironmem"
+command = "/absolute/path/to/.ironrace/bin/ironmem"
 args = ["serve"]
 
 [mcp_servers.ironmem.env]
 IRONMEM_MCP_MODE = "trusted"
-IRONMEM_DB_PATH = "/Users/jeffreycrum/.ironmem/memory.sqlite3"
 ```
 
-If you want a project-local store instead of the default home-directory location, point `IRONMEM_DB_PATH` at a repo-local path.
+Leave `IRONMEM_DB_PATH` unset to use the shared default store
+(`~/.ironrace-memory/memory.sqlite3`). Set it only when you want an isolated
+store — for example a project-local path, or a Codex-only database as shown in
+the isolation section below.
 
 ## Manual Validation
 
