@@ -98,7 +98,11 @@ pub struct OccupancySample {
 }
 
 /// A `session_summary` row. `session_id` is the primary key and is
-/// caller-supplied (not auto-assigned).
+/// caller-supplied (not auto-assigned). This one struct is both the
+/// `upsert_session_summary` input and the `get_session_summary` result — the
+/// `New*`/stored split used for `token_usage`/`occupancy_samples` is
+/// intentionally collapsed here because the PK is caller-supplied (there is no
+/// auto-assigned `id` to omit on insert).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SessionSummary {
     pub session_id: String,
@@ -113,8 +117,15 @@ pub struct SessionSummary {
     pub compactions: i64,
 }
 
-/// A `task_outcomes` row. `task_tag` is the unique caller-supplied key.
-/// `id` is not exposed — callers query by `task_tag`.
+/// A `task_outcomes` row. `task_tag` is the unique caller-supplied key
+/// (METRICS_SPEC §5.4); `id` is not exposed — callers query by `task_tag`.
+/// This one struct is both the `upsert_task_outcome` input and the
+/// `get_task_outcome` / `task_outcomes_for_collab` result (same rationale as
+/// [`SessionSummary`]: the key is caller-supplied, so no `New*` split is
+/// needed). Note: `task_tag` is `NOT NULL` in the schema, so a writer keying a
+/// task by collab session (METRICS_SPEC §2.3, `task_key =
+/// COALESCE(collab_session_id, task_tag)`) must derive a non-null `task_tag`
+/// before upserting.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TaskOutcome {
     pub task_tag: String,

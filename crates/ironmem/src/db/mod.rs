@@ -1,4 +1,5 @@
-//! SQLite-backed storage layers for drawers, schema management, and WAL auditing.
+//! SQLite-backed storage layers for drawers, metrics, schema management, and
+//! WAL auditing.
 
 pub mod collab;
 pub mod drawers;
