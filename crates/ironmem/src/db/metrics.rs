@@ -2,7 +2,8 @@
 //! introduced in migration 008 (`token_usage`, `occupancy_samples`,
 //! `session_summary`, `task_outcomes`).
 //!
-//! This module is storage-only: no write call-sites exist in this PR.
+//! This module is storage-only by design: it holds no business logic or
+//! call-site wiring — callers construct and pass the typed input structs.
 //! Enum column values are stringly-typed here; the DB CHECK constraints
 //! (see `migrations/008_metrics.sql`) enforce domain correctness so a
 //! malformed direct write cannot land an out-of-domain value.
@@ -59,7 +60,7 @@ pub struct TokenUsage {
 }
 
 /// Query filters for `token_usage`. All fields are optional; unset fields
-/// match every row. Results are ordered by `(ts, id)` then optionally limited.
+/// match every row (see `query_token_usage` for ordering and limit behavior).
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct TokenUsageQuery {
     pub task_tag: Option<String>,
@@ -122,10 +123,11 @@ pub struct SessionSummary {
 /// This one struct is both the `upsert_task_outcome` input and the
 /// `get_task_outcome` / `task_outcomes_for_collab` result (same rationale as
 /// [`SessionSummary`]: the key is caller-supplied, so no `New*` split is
-/// needed). Note: `task_tag` is `NOT NULL` in the schema, so a writer keying a
-/// task by collab session (METRICS_SPEC §2.3, `task_key =
-/// COALESCE(collab_session_id, task_tag)`) must derive a non-null `task_tag`
-/// before upserting.
+/// needed). Note: `task_tag` is the `NOT NULL UNIQUE` key sourced from
+/// collab_start / status (METRICS_SPEC §5.4), so a writer keying a task by
+/// collab session must derive a non-null `task_tag` before upserting (the
+/// COALESCE-style task identity in §2.3 governs `token_usage` rollups, not the
+/// `task_outcomes` persistence contract).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TaskOutcome {
     pub task_tag: String,
@@ -548,6 +550,109 @@ mod tests {
         assert!(rows[0].collab_session_id.is_none());
         assert!(rows[0].collab_phase.is_none());
         assert!(rows[0].cost_usd.is_none());
+    }
+
+    #[test]
+    fn token_usage_query_matches_all_and_is_unlimited_by_default() {
+        let db = db();
+        // Three distinct rows; vary task_tag so no single filter would match all.
+        for (i, ts) in [
+            "2026-06-11T00:00:01Z",
+            "2026-06-11T00:00:02Z",
+            "2026-06-11T00:00:03Z",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let mut r = sample_token_usage();
+            r.ts = ts.into();
+            r.task_tag = Some(format!("issue-{i}"));
+            db.insert_token_usage(&r).unwrap();
+        }
+
+        // Default query: all filters None (match-all) and limit None (unlimited,
+        // mapped to LIMIT -1). A regression mapping None -> 0 would return zero rows.
+        let rows = db.query_token_usage(&TokenUsageQuery::default()).unwrap();
+        assert_eq!(
+            rows.len(),
+            3,
+            "empty filter + None limit must return every row"
+        );
+        // Match-all path still applies the ORDER BY (ts, id).
+        assert_eq!(rows[0].ts, "2026-06-11T00:00:01Z");
+        assert_eq!(rows[2].ts, "2026-06-11T00:00:03Z");
+    }
+
+    #[test]
+    fn token_usage_query_filter_actually_discriminates() {
+        let db = db();
+        let mut keep = sample_token_usage();
+        keep.task_tag = Some("keep".into());
+        db.insert_token_usage(&keep).unwrap();
+        let mut skip = sample_token_usage();
+        skip.task_tag = Some("skip".into());
+        db.insert_token_usage(&skip).unwrap();
+
+        let rows = db
+            .query_token_usage(&TokenUsageQuery {
+                task_tag: Some("keep".into()),
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].task_tag.as_deref(), Some("keep"));
+    }
+
+    #[test]
+    fn metrics_accept_every_valid_enum_value() {
+        // Positive counterpart to the *_rejects_* tests: a typo dropping a legal
+        // value from a CHECK list would otherwise pass unnoticed.
+        let db = db();
+        for source in ["llm_rerank", "pref_extract", "transcript", "mcp_response"] {
+            let mut r = sample_token_usage();
+            r.source = source.into();
+            assert!(
+                db.insert_token_usage(&r).is_ok(),
+                "source {source} should be accepted"
+            );
+        }
+        for harness in ["claude", "codex"] {
+            let mut r = sample_token_usage();
+            r.harness = harness.into();
+            assert!(
+                db.insert_token_usage(&r).is_ok(),
+                "harness {harness} should be accepted"
+            );
+        }
+        for phase in ["planning", "impl", "review", "rework", "other"] {
+            let mut r = sample_token_usage();
+            r.collab_phase = Some(phase.into());
+            assert!(
+                db.insert_token_usage(&r).is_ok(),
+                "collab_phase {phase} should be accepted"
+            );
+        }
+        for hook in [
+            "session-start",
+            "session-stop",
+            "precompact",
+            "user-prompt-submit",
+        ] {
+            let mut r = sample_occupancy_sample("2026-06-11T00:00:00Z");
+            r.hook_event = Some(hook.into());
+            assert!(
+                db.insert_occupancy_sample(&r).is_ok(),
+                "hook_event {hook} should be accepted"
+            );
+        }
+        for outcome in ["merged", "failed", "abandoned"] {
+            let mut t = sample_task_outcome(&format!("task-{outcome}"), "2026-06-11T00:00:00Z");
+            t.outcome = Some(outcome.into());
+            assert!(
+                db.upsert_task_outcome(&t).is_ok(),
+                "outcome {outcome} should be accepted"
+            );
+        }
     }
 
     #[test]
