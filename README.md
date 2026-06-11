@@ -1,7 +1,7 @@
 # ironmem
 
 [![CI](https://github.com/ironrace/ironmem/actions/workflows/ci.yml/badge.svg)](https://github.com/ironrace/ironmem/actions/workflows/ci.yml)
-[![crates.io](https://img.shields.io/crates/v/ironmem.svg)](https://crates.io/crates/ironmem)
+[![Release](https://img.shields.io/github/v/release/ironrace/ironmem)](https://github.com/ironrace/ironmem/releases)
 [![License: Apache-2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
 
 `ironmem` is a Rust workspace for a local AI memory backend:
@@ -18,6 +18,10 @@ Key docs:
 - [Cross-Harness Implementation Plan](IMPLEMENTATION_PLAN.md)
 - [Codex Guide](docs/CODEX.md)
 - [Collab Guide](docs/COLLAB.md)
+- [Cloudflare Pages Site](docs/CLOUDFLARE_PAGES.md)
+
+Public site source lives in [`site/`](site/) and is configured for Cloudflare
+Pages with [`wrangler.jsonc`](wrangler.jsonc).
 
 ## Contributor Hook
 
@@ -69,7 +73,7 @@ args = ["serve"]
 IRONMEM_MCP_MODE = "trusted"
 ```
 
-Tagged releases upload prebuilt macOS and Linux binaries automatically. Until the first tagged release is published, building from source is the supported install path.
+Prebuilt macOS (arm64) and Linux (x86_64) binaries, with SHA-256 checksums, are attached to every [tagged release](https://github.com/ironrace/ironmem/releases).
 
 `scripts/install-ironmem.sh` also installs the bundled collab skill dependencies for both Codex and Claude Code:
 

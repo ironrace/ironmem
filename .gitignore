@@ -20,6 +20,8 @@ docs/superpowers/
 .cargo/
 .claude/
 .playwright-mcp/
+.wrangler/
+node_modules/
 __pycache__/
 *.pyc
 

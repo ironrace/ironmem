@@ -1,0 +1,263 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Ironrace | ironmem — local memory for AI agents</title>
+    <meta
+      name="description"
+      content="ironmem is an open-source Rust MCP server that gives Codex, Claude Code, and any MCP client a private local memory: semantic search, a knowledge graph, and a diary in a single binary."
+    />
+    <meta name="theme-color" content="#ffffff" />
+    <meta property="og:site_name" content="Ironrace" />
+    <meta property="og:title" content="Ironrace | ironmem — local memory for AI agents" />
+    <meta property="og:description" content="Open-source Rust MCP memory server: semantic search, knowledge graph, and diary shared by Codex, Claude Code, and any MCP client." />
+    <meta property="og:type" content="website" />
+    <meta property="og:url" content="https://ironrace.dev/" />
+    <meta property="og:image" content="https://ironrace.dev/assets/ironrace-memory-graph.png" />
+    <meta property="og:image:alt" content="A technical illustration of a local memory graph connected to vector search results" />
+    <meta name="twitter:card" content="summary_large_image" />
+    <meta name="twitter:title" content="Ironrace | ironmem — local memory for AI agents" />
+    <meta name="twitter:description" content="Open-source Rust MCP memory server: semantic search, knowledge graph, and diary shared by Codex, Claude Code, and any MCP client." />
+    <meta name="twitter:image" content="https://ironrace.dev/assets/ironrace-memory-graph.png" />
+    <link rel="canonical" href="https://ironrace.dev/" />
+    <script type="application/ld+json">
+      {
+        "@context": "https://schema.org",
+        "@type": "SoftwareApplication",
+        "name": "ironmem",
+        "applicationCategory": "DeveloperApplication",
+        "operatingSystem": "macOS, Linux",
+        "url": "https://ironrace.dev/",
+        "downloadUrl": "https://github.com/ironrace/ironmem/releases",
+        "license": "https://www.apache.org/licenses/LICENSE-2.0",
+        "offers": { "@type": "Offer", "price": "0", "priceCurrency": "USD" },
+        "description": "Open-source Rust MCP server that gives AI coding agents a private local memory: semantic search, a knowledge graph, and a diary in a single binary."
+      }
+    </script>
+    <link rel="icon" href="/favicon.svg" type="image/svg+xml" />
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body>
+    <header class="site-header">
+      <a class="brand" href="/" aria-label="Ironrace home">
+        <span class="brand-mark" aria-hidden="true">IR</span>
+        <span class="brand-word">ironrace<span>.dev</span></span>
+      </a>
+      <nav class="nav" aria-label="Primary navigation">
+        <a href="#ironmem">ironmem</a>
+        <a href="#install">Install</a>
+        <a href="https://github.com/ironrace/ironmem/tree/main/docs" rel="noopener">Docs</a>
+        <a href="#github">GitHub</a>
+      </nav>
+    </header>
+
+    <main>
+      <section class="hero" aria-labelledby="hero-title">
+        <div class="hero-copy">
+          <h1 id="hero-title">Ironrace</h1>
+          <p class="hero-lede">Memory for AI agents that outlives the session.</p>
+          <p class="hero-body">
+            ironmem is an open-source Rust MCP server that gives Codex, Claude Code, and any MCP client a
+            private semantic memory: search, diary, taxonomy, and knowledge-graph tools over one local
+            SQLite store. No cloud, no Python — a single binary that starts serving in under 25&nbsp;ms.
+          </p>
+          <div class="actions" aria-label="Primary actions">
+            <a class="button button-primary" href="#install">
+              <svg aria-hidden="true" viewBox="0 0 24 24">
+                <path d="M5 12h12m0 0-5-5m5 5-5 5" />
+              </svg>
+              Install ironmem
+            </a>
+            <a class="button button-secondary" href="https://github.com/ironrace/ironmem/tree/main/docs" rel="noopener">
+              <svg aria-hidden="true" viewBox="0 0 24 24">
+                <path d="M4 5.5A2.5 2.5 0 0 1 6.5 3H20v16H6.5A2.5 2.5 0 0 0 4 21.5v-16Z" />
+                <path d="M8 7h8M8 11h8" />
+              </svg>
+              Read the docs
+            </a>
+          </div>
+          <ul class="trust-list" aria-label="Project properties">
+            <li>Local-first</li>
+            <li>Private by default</li>
+            <li>Single binary</li>
+            <li>Apache-2.0</li>
+          </ul>
+        </div>
+
+        <div class="hero-visual" aria-label="Illustration of a local memory graph and vector index">
+          <img
+            src="/assets/ironrace-memory-graph.png"
+            alt="A technical illustration of a local memory graph connected to vector search results"
+            width="1586"
+            height="992"
+          />
+          <div class="query-panel" aria-hidden="true">
+            <div class="query-line">
+              <span>search</span>
+              <code>shared harness memory</code>
+            </div>
+            <div class="result-row"><span></span><code>docs/COLLAB.md</code><strong>0.92</strong></div>
+            <div class="result-row"><span></span><code>crates/ironmem/src/mcp</code><strong>0.87</strong></div>
+            <div class="result-row"><span></span><code>knowledge_graph.rs</code><strong>0.81</strong></div>
+          </div>
+        </div>
+      </section>
+
+      <section id="ironmem" class="section section-tight" aria-labelledby="ships-title">
+        <div class="section-heading">
+          <h2 id="ships-title">What ships today</h2>
+          <p>One local server, one database, and a tool surface agents can share.</p>
+        </div>
+        <div class="feature-grid">
+          <article class="feature">
+            <span class="feature-icon" aria-hidden="true">
+              <svg viewBox="0 0 24 24"><path d="M4 7c0 2 16 2 16 0M4 7c0-2 16-2 16 0M4 7v10c0 2 16 2 16 0V7M4 12c0 2 16 2 16 0" /></svg>
+            </span>
+            <h3>Semantic memory</h3>
+            <p>HNSW vector search over local embeddings for fast recall from agent context.</p>
+          </article>
+          <article class="feature">
+            <span class="feature-icon" aria-hidden="true">
+              <svg viewBox="0 0 24 24"><path d="M8 8h8v8H8z" /><path d="M4 12h4m8 0h4M12 4v4m0 8v4" /></svg>
+            </span>
+            <h3>Pure Rust embeddings</h3>
+            <p>ONNX sentence embeddings live inside the workspace through ironrace-embed.</p>
+          </article>
+          <article class="feature">
+            <span class="feature-icon" aria-hidden="true">
+              <svg viewBox="0 0 24 24"><path d="M5 8h14M5 16h14" /><path d="m8 5-3 3 3 3M16 13l3 3-3 3" /></svg>
+            </span>
+            <h3>MCP server</h3>
+            <p>Expose status, search, diary, graph, taxonomy, and collaboration tools over stdio.</p>
+          </article>
+          <article class="feature">
+            <span class="feature-icon" aria-hidden="true">
+              <svg viewBox="0 0 24 24"><path d="M7 8a3 3 0 1 0 0-6 3 3 0 0 0 0 6Zm10 14a3 3 0 1 0 0-6 3 3 0 0 0 0 6ZM7 8l10 8M17 6a3 3 0 1 0 0-6 3 3 0 0 0 0 6M17 6 7 16" /></svg>
+            </span>
+            <h3>Knowledge graph</h3>
+            <p>Structured facts and semantic drawers can be queried together as memory grows.</p>
+          </article>
+          <article class="feature">
+            <span class="feature-icon" aria-hidden="true">
+              <svg viewBox="0 0 24 24"><path d="M4 6h16v12H4z" /><path d="M8 10h8M8 14h5" /></svg>
+            </span>
+            <h3>Shared across harnesses</h3>
+            <p>Codex and Claude Code read and write the same SQLite store by default.</p>
+          </article>
+          <article class="feature">
+            <span class="feature-icon" aria-hidden="true">
+              <svg viewBox="0 0 24 24"><path d="M12 3v6m0 6v6M5 6l4 3m6 6 4 3M19 6l-4 3M9 15l-4 3" /><circle cx="12" cy="12" r="3" /></svg>
+            </span>
+            <h3>Agent collaboration</h3>
+            <p>Bounded Claude&harr;Codex planning and coding sessions run over the shared store.</p>
+          </article>
+        </div>
+      </section>
+
+      <section id="install" class="section install-section" aria-labelledby="install-title">
+        <div class="section-heading">
+          <h2 id="install-title">Install ironmem</h2>
+          <p>The source quickstart builds the binary, runs setup, then starts the trusted MCP server.</p>
+        </div>
+        <div class="terminal" data-copy-root>
+          <div class="terminal-bar">
+            <span>source quickstart</span>
+            <button class="copy-button" type="button" data-copy-target="install-command">Copy</button>
+          </div>
+          <pre><code id="install-command">git clone https://github.com/ironrace/ironmem.git
+cd ironmem
+scripts/install-ironmem.sh
+~/.ironrace/bin/ironmem setup
+IRONMEM_MCP_MODE=trusted ~/.ironrace/bin/ironmem serve</code></pre>
+        </div>
+        <div class="install-notes">
+          <div>
+            <h3>Prebuilt binaries</h3>
+            <p>macOS (arm64) and Linux (x86_64) tarballs ship with every tagged release, with SHA-256 checksums.</p>
+            <a href="https://github.com/ironrace/ironmem/releases" rel="noopener">Download a release &rarr;</a>
+          </div>
+          <div>
+            <h3>Smoke test</h3>
+            <p>Validate stdio startup without downloading the model:</p>
+            <code>python3 scripts/mcp_smoke_test.py --binary ~/.ironrace/bin/ironmem</code>
+          </div>
+          <div>
+            <h3>Codex config</h3>
+            <p>Point Codex at the installed binary and set trusted mode when write tools are needed.</p>
+            <a href="https://github.com/ironrace/ironmem/blob/main/docs/CODEX.md" rel="noopener">Open Codex setup &rarr;</a>
+          </div>
+        </div>
+      </section>
+
+      <section class="section harness-section" aria-labelledby="harness-title">
+        <div class="section-heading">
+          <h2 id="harness-title">Works across harnesses</h2>
+          <p>ironmem is built for local agent workflows where memory should outlive one chat window.</p>
+        </div>
+        <div class="harness-list">
+          <article>
+            <h3>OpenAI Codex</h3>
+            <p>Use ironmem as a local MCP server for shared search, status, graph, and write tools.</p>
+            <a href="https://github.com/ironrace/ironmem/blob/main/docs/CODEX.md" rel="noopener">Setup guide &rarr;</a>
+          </article>
+          <article>
+            <h3>Claude Code</h3>
+            <p>Plugin packaging is included so both harnesses can use the same memory database.</p>
+            <a href="https://github.com/ironrace/ironmem/blob/main/docs/COLLAB.md" rel="noopener">Collab guide &rarr;</a>
+          </article>
+          <article>
+            <h3>Rust projects</h3>
+            <p>ironrace-core and ironrace-embed provide the shared index and embedding layers.</p>
+            <a href="https://github.com/ironrace/ironmem/tree/main/crates" rel="noopener">Browse crates &rarr;</a>
+          </article>
+        </div>
+      </section>
+
+      <section id="github" class="section github-section" aria-labelledby="github-title">
+        <div class="section-heading">
+          <h2 id="github-title">GitHub</h2>
+          <p>ironmem is developed in the open under the Apache-2.0 license.</p>
+        </div>
+        <div class="github-list">
+          <a class="github-link" href="https://github.com/ironrace/ironmem" rel="noopener">
+            <span>
+              <strong>ironrace/ironmem</strong>
+              <small>Source repository — a Rust workspace with the ironmem server plus the ironrace-core and ironrace-embed crates.</small>
+            </span>
+            <svg aria-hidden="true" viewBox="0 0 24 24">
+              <path d="M7 17 17 7M9 7h8v8" />
+            </svg>
+          </a>
+          <a class="github-link" href="https://github.com/ironrace/ironmem/releases" rel="noopener">
+            <span>
+              <strong>Releases</strong>
+              <small>Tagged releases with prebuilt macOS and Linux binaries, checksums, and changelogs.</small>
+            </span>
+            <svg aria-hidden="true" viewBox="0 0 24 24">
+              <path d="M7 17 17 7M9 7h8v8" />
+            </svg>
+          </a>
+        </div>
+      </section>
+    </main>
+
+    <footer class="site-footer">
+      <div>
+        <a class="brand brand-footer" href="/" aria-label="Ironrace home">
+          <span class="brand-mark" aria-hidden="true">IR</span>
+          <span class="brand-word">ironrace<span>.dev</span></span>
+        </a>
+        <p>Open-source Rust memory infrastructure for local AI agents.</p>
+      </div>
+      <nav aria-label="Footer navigation">
+        <a href="https://github.com/ironrace/ironmem" rel="noopener">ironmem</a>
+        <a href="https://github.com/ironrace/ironmem/tree/main/docs" rel="noopener">Docs</a>
+        <a href="https://github.com/ironrace/ironmem/blob/main/CONTRIBUTING.md" rel="noopener">Contributing</a>
+        <a href="https://github.com/ironrace/ironmem/blob/main/LICENSE" rel="noopener">Apache-2.0</a>
+      </nav>
+    </footer>
+
+    <script src="/script.js" defer></script>
+  </body>
+</html>

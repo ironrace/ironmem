@@ -1,0 +1,10 @@
+{
+  "private": true,
+  "scripts": {
+    "site:dev": "wrangler pages dev site",
+    "site:deploy": "wrangler pages deploy site --project-name ironrace-dev"
+  },
+  "devDependencies": {
+    "wrangler": "^4.99.0"
+  }
+}

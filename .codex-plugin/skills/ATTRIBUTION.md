@@ -1,0 +1,48 @@
+# Skill Attribution
+
+Most skills in this directory are vendored, modified copies of skills from
+[obra/superpowers](https://github.com/obra/superpowers) by Jesse Vincent,
+distributed under the MIT License:
+
+- `executing-plans`
+- `finishing-a-development-branch`
+- `requesting-code-review`
+- `subagent-driven-development`
+- `test-driven-development`
+- `using-git-worktrees`
+- `using-superpowers`
+- `writing-plans`
+
+They have been adapted for the ironmem `/collab` workflow. The upstream
+copyright and license notice is reproduced below as required by the MIT
+License.
+
+`pr-review-toolkit` is vendored from the
+[anthropics/claude-code](https://github.com/anthropics/claude-code) repository
+(`plugins/pr-review-toolkit`) by Anthropic, which does not declare an explicit
+license for its bundled plugins; it is redistributed here, adapted for the
+`/collab` workflow, with attribution to its source.
+
+---
+
+MIT License
+
+Copyright (c) 2025 Jesse Vincent
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
