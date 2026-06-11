@@ -454,6 +454,34 @@ mod tests {
         }
     }
 
+    fn sample_occupancy_sample(ts: &str) -> NewOccupancySample {
+        NewOccupancySample {
+            ts: ts.into(),
+            harness: "claude".into(),
+            session_id: Some("sess-1".into()),
+            workspace_root: Some("/repo".into()),
+            hook_event: Some("precompact".into()),
+            input_tokens: 150_000,
+            cache_read_input_tokens: 90_000,
+            context_window: 200_000,
+            occupancy_pct: Some(1.2),
+        }
+    }
+
+    fn sample_task_outcome(task_tag: &str, started_at: &str) -> TaskOutcome {
+        TaskOutcome {
+            task_tag: task_tag.into(),
+            collab_session_id: Some("collab-1".into()),
+            started_at: Some(started_at.into()),
+            done_at: None,
+            outcome: None,
+            review_rounds: 0,
+            fix_commits: 0,
+            handoffs: 0,
+            pr_url: None,
+        }
+    }
+
     #[test]
     fn token_usage_round_trip() {
         let db = db();
@@ -482,6 +510,33 @@ mod tests {
             })
             .unwrap();
         assert_eq!(by_collab.len(), 1);
+    }
+
+    #[test]
+    fn token_usage_round_trip_preserves_nullable_fields() {
+        let db = db();
+        let mut row = sample_token_usage();
+        row.model = None;
+        row.session_id = None;
+        row.collab_session_id = None;
+        row.collab_phase = None;
+        row.task_tag = Some("issue-null".into());
+        row.cost_usd = None;
+
+        db.insert_token_usage(&row).unwrap();
+
+        let rows = db
+            .query_token_usage(&TokenUsageQuery {
+                task_tag: Some("issue-null".into()),
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert!(rows[0].model.is_none());
+        assert!(rows[0].session_id.is_none());
+        assert!(rows[0].collab_session_id.is_none());
+        assert!(rows[0].collab_phase.is_none());
+        assert!(rows[0].cost_usd.is_none());
     }
 
     #[test]
@@ -519,11 +574,16 @@ mod tests {
     #[test]
     fn token_usage_rejects_bad_enums_and_negatives() {
         let db = db();
-        let mutations: [fn(&mut NewTokenUsage); 4] = [
+        let mutations: [fn(&mut NewTokenUsage); 9] = [
             |r| r.source = "bogus".into(),
             |r| r.harness = "bogus".into(),
             |r| r.collab_phase = Some("bogus".into()),
             |r| r.input_tokens = -1,
+            |r| r.output_tokens = -1,
+            |r| r.cache_creation_input_tokens = -1,
+            |r| r.cache_read_input_tokens = -1,
+            |r| r.chars = -1,
+            |r| r.cost_usd = Some(-0.01),
         ];
         for mutate in mutations {
             let mut r = sample_token_usage();
@@ -536,17 +596,7 @@ mod tests {
     fn occupancy_round_trip_allows_over_one() {
         let db = db();
         let id = db
-            .insert_occupancy_sample(&NewOccupancySample {
-                ts: "2026-06-11T00:00:00Z".into(),
-                harness: "claude".into(),
-                session_id: Some("sess-1".into()),
-                workspace_root: Some("/repo".into()),
-                hook_event: Some("precompact".into()),
-                input_tokens: 150_000,
-                cache_read_input_tokens: 90_000,
-                context_window: 200_000,
-                occupancy_pct: Some(1.2),
-            })
+            .insert_occupancy_sample(&sample_occupancy_sample("2026-06-11T00:00:00Z"))
             .unwrap();
         assert!(id > 0);
         let rows = db.occupancy_samples_for_session("sess-1", 10).unwrap();
@@ -555,20 +605,63 @@ mod tests {
     }
 
     #[test]
+    fn occupancy_round_trip_preserves_nullable_fields() {
+        let db = db();
+        let mut row = sample_occupancy_sample("2026-06-11T00:00:00Z");
+        row.workspace_root = None;
+        row.hook_event = None;
+        row.occupancy_pct = None;
+
+        db.insert_occupancy_sample(&row).unwrap();
+
+        let rows = db.occupancy_samples_for_session("sess-1", 10).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert!(rows[0].workspace_root.is_none());
+        assert!(rows[0].hook_event.is_none());
+        assert!(rows[0].occupancy_pct.is_none());
+    }
+
+    #[test]
+    fn occupancy_samples_are_ordered_and_limited() {
+        let db = db();
+        for ts in [
+            "2026-06-11T00:00:03Z",
+            "2026-06-11T00:00:01Z",
+            "2026-06-11T00:00:02Z",
+        ] {
+            db.insert_occupancy_sample(&sample_occupancy_sample(ts))
+                .unwrap();
+        }
+
+        let rows = db.occupancy_samples_for_session("sess-1", 2).unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].ts, "2026-06-11T00:00:01Z");
+        assert_eq!(rows[1].ts, "2026-06-11T00:00:02Z");
+    }
+
+    #[test]
     fn occupancy_rejects_bad_hook_event() {
         let db = db();
-        let r = NewOccupancySample {
-            ts: "2026-06-11T00:00:00Z".into(),
-            harness: "claude".into(),
-            session_id: Some("sess-1".into()),
-            workspace_root: None,
-            hook_event: Some("bogus".into()),
-            input_tokens: 0,
-            cache_read_input_tokens: 0,
-            context_window: 200_000,
-            occupancy_pct: None,
-        };
+        let mut r = sample_occupancy_sample("2026-06-11T00:00:00Z");
+        r.hook_event = Some("bogus".into());
         assert!(db.insert_occupancy_sample(&r).is_err());
+    }
+
+    #[test]
+    fn occupancy_rejects_bad_harness_and_negatives() {
+        let db = db();
+        let mutations: [fn(&mut NewOccupancySample); 5] = [
+            |r| r.harness = "bogus".into(),
+            |r| r.input_tokens = -1,
+            |r| r.cache_read_input_tokens = -1,
+            |r| r.context_window = 0,
+            |r| r.occupancy_pct = Some(-0.01),
+        ];
+        for mutate in mutations {
+            let mut r = sample_occupancy_sample("2026-06-11T00:00:00Z");
+            mutate(&mut r);
+            assert!(db.insert_occupancy_sample(&r).is_err());
+        }
     }
 
     #[test]
@@ -620,19 +713,37 @@ mod tests {
     }
 
     #[test]
+    fn session_summary_rejects_negative_counters() {
+        let db = db();
+        let mutations: [fn(&mut SessionSummary); 5] = [
+            |s| s.peak_occupancy_pct = Some(-0.01),
+            |s| s.total_input_tokens = -1,
+            |s| s.total_output_tokens = -1,
+            |s| s.mcp_chars_served = -1,
+            |s| s.compactions = -1,
+        ];
+        for mutate in mutations {
+            let mut s = SessionSummary {
+                session_id: "sess-1".into(),
+                harness: "claude".into(),
+                workspace_root: None,
+                started_at: None,
+                ended_at: None,
+                peak_occupancy_pct: None,
+                total_input_tokens: 0,
+                total_output_tokens: 0,
+                mcp_chars_served: 0,
+                compactions: 0,
+            };
+            mutate(&mut s);
+            assert!(db.upsert_session_summary(&s).is_err());
+        }
+    }
+
+    #[test]
     fn task_outcome_upsert_and_query() {
         let db = db();
-        let mut t = TaskOutcome {
-            task_tag: "issue-80".into(),
-            collab_session_id: Some("collab-1".into()),
-            started_at: Some("2026-06-11T00:00:00Z".into()),
-            done_at: None,
-            outcome: None,
-            review_rounds: 0,
-            fix_commits: 0,
-            handoffs: 0,
-            pr_url: None,
-        };
+        let mut t = sample_task_outcome("issue-80", "2026-06-11T00:00:00Z");
         db.upsert_task_outcome(&t).unwrap();
         t.done_at = Some("2026-06-11T02:00:00Z".into());
         t.outcome = Some("merged".into());
@@ -650,20 +761,41 @@ mod tests {
     }
 
     #[test]
+    fn task_outcomes_for_collab_is_ordered_by_started_at_then_id() {
+        let db = db();
+        db.upsert_task_outcome(&sample_task_outcome("task-b", "2026-06-11T00:00:02Z"))
+            .unwrap();
+        db.upsert_task_outcome(&sample_task_outcome("task-a", "2026-06-11T00:00:01Z"))
+            .unwrap();
+        db.upsert_task_outcome(&sample_task_outcome("task-c", "2026-06-11T00:00:01Z"))
+            .unwrap();
+
+        let rows = db.task_outcomes_for_collab("collab-1").unwrap();
+        let task_tags: Vec<_> = rows.iter().map(|row| row.task_tag.as_str()).collect();
+        assert_eq!(task_tags, ["task-a", "task-c", "task-b"]);
+    }
+
+    #[test]
     fn task_outcome_rejects_bad_outcome() {
         let db = db();
-        let t = TaskOutcome {
-            task_tag: "issue-80".into(),
-            collab_session_id: None,
-            started_at: None,
-            done_at: None,
-            outcome: Some("bogus".into()),
-            review_rounds: 0,
-            fix_commits: 0,
-            handoffs: 0,
-            pr_url: None,
-        };
+        let mut t = sample_task_outcome("issue-80", "2026-06-11T00:00:00Z");
+        t.outcome = Some("bogus".into());
         assert!(db.upsert_task_outcome(&t).is_err());
+    }
+
+    #[test]
+    fn task_outcome_rejects_negative_counters() {
+        let db = db();
+        let mutations: [fn(&mut TaskOutcome); 3] = [
+            |t| t.review_rounds = -1,
+            |t| t.fix_commits = -1,
+            |t| t.handoffs = -1,
+        ];
+        for mutate in mutations {
+            let mut t = sample_task_outcome("issue-80", "2026-06-11T00:00:00Z");
+            mutate(&mut t);
+            assert!(db.upsert_task_outcome(&t).is_err());
+        }
     }
 
     #[test]
