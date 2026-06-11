@@ -1,9 +1,15 @@
 [package]
 name = "ironrace-pref-extract"
-version = "0.3.3"
+version = "0.3.4"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 description = "Conversational-text preference extractor for ironrace-memory."
+authors = ["Jeffrey Crum <jeffrey.crum81@gmail.com>"]
+repository = "https://github.com/ironrace/ironmem"
+homepage = "https://github.com/ironrace/ironmem"
+keywords = ["preferences", "memory", "nlp", "mcp", "extraction"]
+categories = ["text-processing"]
+readme = "../../README.md"
 
 [dependencies]
 regex = "1"
