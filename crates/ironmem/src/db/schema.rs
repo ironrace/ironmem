@@ -101,12 +101,7 @@ impl Database {
     /// TABLE`. Do not call outside `migrate()` — assumes the caller holds
     /// `BEGIN IMMEDIATE`.
     fn run_version_gated_migrations(&self) -> Result<(), MemoryError> {
-        let current_version: i64 = self
-            .conn
-            .query_row("SELECT MAX(version) FROM schema_version", [], |row| {
-                row.get(0)
-            })
-            .unwrap_or(1);
+        let current_version = read_schema_version(&self.conn)?;
 
         // v2: FTS5 full-text search index for hybrid BM25+vector retrieval
         if current_version < 2 {
@@ -229,6 +224,22 @@ impl Database {
         }
         Ok(result)
     }
+}
+
+/// Read the highest applied schema version from `schema_version`.
+///
+/// Returns `1` only for the legitimate fresh-DB case where the table exists
+/// but is empty (`MAX(version)` is `NULL`). Real query failures — a missing
+/// `schema_version` table, a corrupt row, or a lock/`SQLITE_BUSY` — are
+/// **propagated** rather than silently collapsed to `1`. The previous
+/// `query_row(...).unwrap_or(1)` masked those failures, which would cause the
+/// migrator to treat a broken DB as brand-new and re-run every migration.
+fn read_schema_version(conn: &Connection) -> Result<i64, MemoryError> {
+    let max_version: Option<i64> =
+        conn.query_row("SELECT MAX(version) FROM schema_version", [], |row| {
+            row.get(0)
+        })?;
+    Ok(max_version.unwrap_or(1))
 }
 
 fn retry_on_busy<T>(
@@ -441,5 +452,36 @@ mod tests {
         db.migrate().unwrap();
         db.migrate().unwrap();
         assert_eq!(schema_version_of(&db), 8);
+    }
+
+    // ---- read_schema_version: distinguish fresh-DB from real DB errors ----
+
+    #[test]
+    fn read_schema_version_returns_max_applied() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE schema_version (version INTEGER PRIMARY KEY);
+             INSERT INTO schema_version (version) VALUES (3), (7), (5);",
+        )
+        .unwrap();
+        assert_eq!(super::read_schema_version(&conn).unwrap(), 7);
+    }
+
+    #[test]
+    fn read_schema_version_empty_table_defaults_to_1() {
+        // An existing-but-empty schema_version table (MAX -> NULL) is the
+        // legitimate fresh-DB case and must default to 1, not error.
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch("CREATE TABLE schema_version (version INTEGER PRIMARY KEY);")
+            .unwrap();
+        assert_eq!(super::read_schema_version(&conn).unwrap(), 1);
+    }
+
+    #[test]
+    fn read_schema_version_missing_table_is_error_not_silent_v1() {
+        // The old `.unwrap_or(1)` masked this as v1 (silently re-running
+        // migrations). A genuinely broken/locked DB must surface an error.
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        assert!(super::read_schema_version(&conn).is_err());
     }
 }
