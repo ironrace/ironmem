@@ -165,7 +165,11 @@ impl LlmClient for ClaudeCliClient {
         }
         let stdout = String::from_utf8(output.stdout)
             .map_err(|e| anyhow!("claude stdout not UTF-8: {e}"))?;
-        Ok(parse_cli_stdout(&stdout, &self.model, prompt.chars().count()))
+        Ok(parse_cli_stdout(
+            &stdout,
+            &self.model,
+            prompt.chars().count(),
+        ))
     }
 }
 
@@ -224,21 +228,46 @@ fn build_anthropic_body(model: &str, max_tokens: u32, prompt: &str) -> serde_jso
     })
 }
 
-/// Extract the assistant text from an Anthropic Messages API response and
-/// re-emit it in the `{"result": "<text>"}` envelope used by `claude -p`,
-/// so a single parser handles both backends.
-fn wrap_anthropic_response(api_response: &serde_json::Value) -> Result<String> {
+/// Parse an Anthropic Messages API response into an `LlmResponse`. The API
+/// always reports a `usage` block, so `estimated=false`; the API carries no
+/// dollar cost, so `cost_usd=None`. `prompt_chars` is the serialized prompt
+/// length passed from `call`.
+fn parse_anthropic_response(
+    api_response: &serde_json::Value,
+    model_fallback: &str,
+    prompt_chars: usize,
+) -> Result<LlmResponse> {
     let text = api_response
         .get("content")
         .and_then(|c| c.get(0))
         .and_then(|c0| c0.get("text"))
         .and_then(|t| t.as_str())
-        .ok_or_else(|| anyhow!("anthropic response missing content[0].text"))?;
-    Ok(serde_json::json!({"result": text}).to_string())
+        .ok_or_else(|| anyhow!("anthropic response missing content[0].text"))?
+        .to_string();
+
+    let usage = api_response
+        .get("usage")
+        .and_then(|u| serde_json::from_value::<Usage>(u.clone()).ok())
+        .unwrap_or_default();
+
+    let model = api_response
+        .get("model")
+        .and_then(|m| m.as_str())
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| model_fallback.to_string());
+
+    Ok(LlmResponse {
+        text,
+        usage,
+        cost_usd: None,
+        model,
+        estimated: false,
+        prompt_chars,
+    })
 }
 
 impl LlmClient for AnthropicApiClient {
-    fn call(&self, prompt: &str) -> Result<String> {
+    fn call(&self, prompt: &str) -> Result<LlmResponse> {
         let body = build_anthropic_body(&self.model, self.max_tokens, prompt);
         let url = format!("{}/v1/messages", self.base_url.trim_end_matches('/'));
 
@@ -261,7 +290,7 @@ impl LlmClient for AnthropicApiClient {
                     let parsed: serde_json::Value = resp
                         .into_json()
                         .context("decoding Anthropic response JSON")?;
-                    return wrap_anthropic_response(&parsed);
+                    return parse_anthropic_response(&parsed, &self.model, prompt.chars().count());
                 }
                 Err(ureq::Error::Status(code, resp)) => {
                     // Don't retry config errors. We deliberately do NOT log
@@ -384,32 +413,35 @@ mod tests {
     }
 
     #[test]
-    fn wrap_anthropic_response_extracts_text() {
+    fn anthropic_parse_extracts_text_usage_model() {
         let api = serde_json::json!({
-            "id": "msg_abc",
-            "type": "message",
-            "role": "assistant",
+            "id": "msg_abc", "type": "message", "role": "assistant",
             "content": [{"type": "text", "text": "5"}],
-            "model": "claude-haiku-4-5",
-            "stop_reason": "end_turn",
+            "model": "claude-haiku-4-5", "stop_reason": "end_turn",
+            "usage": {"input_tokens": 200, "output_tokens": 2,
+                      "cache_creation_input_tokens": 0, "cache_read_input_tokens": 10}
         });
-        let wrapped = wrap_anthropic_response(&api).unwrap();
-        let v: serde_json::Value = serde_json::from_str(&wrapped).unwrap();
-        // Re-emitted in the {"result": "<text>"} envelope produced by claude -p,
-        // so the existing rerank parser handles it without branching.
-        assert_eq!(v["result"], "5");
+        let r = parse_anthropic_response(&api, "fallback", 80).unwrap();
+        assert_eq!(r.text, "5");
+        assert_eq!(r.model, "claude-haiku-4-5");
+        assert_eq!(r.usage.input_tokens, 200);
+        assert_eq!(r.usage.output_tokens, 2);
+        assert_eq!(r.usage.cache_read_input_tokens, 10);
+        assert!(!r.estimated);
+        assert_eq!(r.cost_usd, None);
+        assert_eq!(r.prompt_chars, 80);
     }
 
     #[test]
-    fn wrap_anthropic_response_missing_content_errors() {
+    fn anthropic_parse_missing_content_errors() {
         let api = serde_json::json!({"id": "msg_abc"});
-        assert!(wrap_anthropic_response(&api).is_err());
+        assert!(parse_anthropic_response(&api, "fallback", 0).is_err());
     }
 
     #[test]
-    fn wrap_anthropic_response_empty_content_array_errors() {
+    fn anthropic_parse_empty_content_array_errors() {
         let api = serde_json::json!({"content": []});
-        assert!(wrap_anthropic_response(&api).is_err());
+        assert!(parse_anthropic_response(&api, "fallback", 0).is_err());
     }
 
     #[test]

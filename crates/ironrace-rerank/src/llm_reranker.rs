@@ -48,11 +48,11 @@ impl<C: LlmClient> RerankerScorer for LlmReranker<C> {
             return Ok(Vec::new());
         }
         let prompt = build_rerank_prompt(query, passages);
-        let raw = self
+        let response = self
             .client
             .call(&prompt)
             .context("LLM client call failed")?;
-        let chosen = parse_chosen_index(&raw, passages.len())?;
+        let chosen = parse_chosen_index(&response.text, passages.len())?;
 
         // Chosen → 0.0, others → -(i+1) so the post-rerank sort preserves
         // original order for non-chosen items.
