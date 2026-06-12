@@ -20,6 +20,8 @@ pub mod hook;
 pub mod ingest;
 /// MCP application state, protocol types, server loop, and tool dispatch.
 pub mod mcp;
+/// Pure metrics helpers shared by the MCP server and lifecycle hooks.
+pub mod metrics;
 /// Migration helpers for importing legacy Chroma-backed stores.
 pub mod migrate;
 /// Re-embedding all drawers after a model upgrade.
