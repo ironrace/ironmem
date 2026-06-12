@@ -43,8 +43,82 @@ impl ClaudeCliClient {
     }
 }
 
+/// Parse `claude -p --output-format json` stdout into an `LlmResponse`.
+/// `model_fallback` is the client's configured model (used when the envelope
+/// omits `model`); `prompt_chars` is the serialized prompt length for chars/4
+/// estimation and the recorded `chars` basis.
+fn parse_cli_stdout(stdout: &str, model_fallback: &str, prompt_chars: usize) -> LlmResponse {
+    let parsed: Option<serde_json::Value> = serde_json::from_str(stdout).ok();
+
+    // text ← `result` field, else the raw stdout (handles non-JSON output).
+    let text = parsed
+        .as_ref()
+        .and_then(|v| v.get("result"))
+        .and_then(|r| r.as_str())
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| stdout.to_string());
+
+    let model = parsed
+        .as_ref()
+        .and_then(|v| v.get("model"))
+        .and_then(|m| m.as_str())
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| model_fallback.to_string());
+
+    // A `usage` object with at least one nonzero token field counts as real.
+    let real_usage: Option<Usage> = parsed
+        .as_ref()
+        .and_then(|v| v.get("usage"))
+        .and_then(|u| serde_json::from_value::<Usage>(u.clone()).ok())
+        .filter(|u| {
+            u.input_tokens != 0
+                || u.output_tokens != 0
+                || u.cache_creation_input_tokens != 0
+                || u.cache_read_input_tokens != 0
+        });
+
+    match real_usage {
+        Some(usage) => {
+            let cost_usd = parsed
+                .as_ref()
+                .and_then(|v| v.get("total_cost_usd"))
+                .and_then(|c| c.as_f64());
+            LlmResponse {
+                text,
+                usage,
+                cost_usd,
+                model,
+                estimated: false,
+                prompt_chars,
+            }
+        }
+        None => {
+            // chars/4 fallback (ceil). input from prompt, output from text.
+            let output_chars = text.chars().count();
+            let usage = Usage {
+                input_tokens: ceil_div4(prompt_chars),
+                output_tokens: ceil_div4(output_chars),
+                ..Usage::default()
+            };
+            LlmResponse {
+                text,
+                usage,
+                cost_usd: None,
+                model,
+                estimated: true,
+                prompt_chars,
+            }
+        }
+    }
+}
+
+/// ceil(n / 4) as u32, saturating.
+fn ceil_div4(n: usize) -> u32 {
+    ((n + 3) / 4) as u32
+}
+
 impl LlmClient for ClaudeCliClient {
-    fn call(&self, prompt: &str) -> Result<String> {
+    fn call(&self, prompt: &str) -> Result<LlmResponse> {
         let started = Instant::now();
         let mut child = Command::new(&self.binary)
             .arg("--model")
@@ -89,7 +163,9 @@ impl LlmClient for ClaudeCliClient {
             tracing::trace!(stderr = %raw_stderr, "claude CLI nonzero exit");
             bail!("claude CLI exited with status {}", output.status);
         }
-        String::from_utf8(output.stdout).map_err(|e| anyhow!("claude stdout not UTF-8: {e}"))
+        let stdout = String::from_utf8(output.stdout)
+            .map_err(|e| anyhow!("claude stdout not UTF-8: {e}"))?;
+        Ok(parse_cli_stdout(&stdout, &self.model, prompt.chars().count()))
     }
 }
 
@@ -256,6 +332,45 @@ impl LlmClient for MockLlmClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cli_parse_with_usage_is_measured() {
+        let stdout = r#"{"type":"result","result":"5","model":"claude-haiku-4-5",
+            "total_cost_usd":0.0012,
+            "usage":{"input_tokens":120,"output_tokens":3,
+                     "cache_creation_input_tokens":0,"cache_read_input_tokens":40}}"#;
+        let r = parse_cli_stdout(stdout, "fallback-model", 200);
+        assert_eq!(r.text, "5");
+        assert_eq!(r.model, "claude-haiku-4-5");
+        assert_eq!(r.usage.input_tokens, 120);
+        assert_eq!(r.usage.output_tokens, 3);
+        assert_eq!(r.usage.cache_read_input_tokens, 40);
+        assert_eq!(r.cost_usd, Some(0.0012));
+        assert!(!r.estimated);
+        assert_eq!(r.prompt_chars, 200);
+    }
+
+    #[test]
+    fn cli_parse_without_usage_is_estimated() {
+        // No `usage` key → chars/4 fallback. prompt_chars=40 → input=ceil(40/4)=10.
+        let stdout = r#"{"type":"result","result":"hello world"}"#; // 11 chars → output=ceil(11/4)=3
+        let r = parse_cli_stdout(stdout, "fallback-model", 40);
+        assert_eq!(r.text, "hello world");
+        assert_eq!(r.model, "fallback-model");
+        assert!(r.estimated);
+        assert_eq!(r.usage.input_tokens, 10);
+        assert_eq!(r.usage.output_tokens, 3);
+        assert_eq!(r.cost_usd, None);
+        assert_eq!(r.prompt_chars, 40);
+    }
+
+    #[test]
+    fn cli_parse_non_json_falls_back_to_raw_text() {
+        let r = parse_cli_stdout("3", "fallback-model", 12);
+        assert_eq!(r.text, "3");
+        assert!(r.estimated);
+        assert_eq!(r.model, "fallback-model");
+    }
 
     #[test]
     fn anthropic_body_shape() {
