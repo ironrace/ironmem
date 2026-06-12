@@ -15,7 +15,10 @@ fn integration_pick_one_score_encoding_via_mock() {
     // 5 passages; LLM picks passage 4 (1-indexed) → idx 3 promoted to top.
     let client = MockLlmClient::ok("4");
     let r = LlmReranker::new(client);
-    let scores = r.score_pairs("q", &["a", "b", "c", "d", "e"]).unwrap();
+    let scores = r
+        .score_pairs("q", &["a", "b", "c", "d", "e"])
+        .unwrap()
+        .scores;
     // Chosen idx 3 → 0.0; others → -(i+1) keeping original-index order.
     assert_eq!(scores, vec![-1.0, -2.0, -3.0, 0.0, -5.0]);
 }
@@ -28,7 +31,7 @@ fn integration_claude_envelope_round_trips() {
     let envelope = r#"{"type":"result","result":"2"}"#;
     let client = MockLlmClient::ok(envelope);
     let r = LlmReranker::new(client);
-    let scores = r.score_pairs("q", &["a", "b"]).unwrap();
+    let scores = r.score_pairs("q", &["a", "b"]).unwrap().scores;
     // Chosen idx 1 → 0.0; idx 0 → -1.0.
     assert_eq!(scores, vec![-1.0, 0.0]);
 }

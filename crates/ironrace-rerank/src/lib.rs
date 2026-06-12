@@ -12,4 +12,4 @@ pub mod scorer;
 pub use llm_client::{AnthropicApiClient, ClaudeCliClient, LlmClient, MockLlmClient};
 pub use llm_reranker::LlmReranker;
 pub use response::{LlmResponse, Usage};
-pub use scorer::{NoopScorer, RerankerScorer};
+pub use scorer::{NoopScorer, RerankScoreResult, RerankerScorer};

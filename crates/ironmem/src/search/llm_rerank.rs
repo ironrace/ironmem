@@ -15,17 +15,19 @@
 
 use std::sync::Arc;
 
-use ironrace_rerank::RerankerScorer;
+use ironrace_rerank::{LlmResponse, RerankerScorer};
 
 use crate::db::ScoredDrawer;
 use crate::search::tunables;
 
-/// Reorder the top-K of `scored` using `scorer`. See module doc for invariants.
+/// Reorder the top-K of `scored` using `scorer`. Returns the LLM response (and
+/// its usage) when an LLM-backed scorer produced one, else None. See module doc
+/// for ordering invariants — unchanged here.
 pub fn cross_encoder_rerank(
     scorer: &Arc<dyn RerankerScorer>,
     query: &str,
     scored: &mut [ScoredDrawer],
-) {
+) -> Option<LlmResponse> {
     // Invariant 1: pre-sort the full vec.
     scored.sort_by(|a, b| {
         b.score
@@ -36,31 +38,31 @@ pub fn cross_encoder_rerank(
 
     let k = tunables::rerank_top_k().min(scored.len());
     if k == 0 {
-        return;
+        return None;
     }
 
     let passages: Vec<&str> = scored[..k]
         .iter()
         .map(|s| s.drawer.content.as_str())
         .collect();
-    let new_scores = match scorer.score_pairs(query, &passages) {
+    let result = match scorer.score_pairs(query, &passages) {
         Ok(v) => v,
         Err(e) => {
             tracing::warn!("cross_encoder_rerank: scorer error, skipping: {e}");
-            return;
+            return None;
         }
     };
-    if new_scores.len() != k {
+    if result.scores.len() != k {
         tracing::warn!(
             "cross_encoder_rerank: scorer returned {} scores for {} passages — skipping",
-            new_scores.len(),
+            result.scores.len(),
             k
         );
-        return;
+        return None;
     }
 
     // Replace top-K scores in place.
-    for (slot, new) in scored[..k].iter_mut().zip(new_scores) {
+    for (slot, new) in scored[..k].iter_mut().zip(result.scores) {
         slot.score = new;
     }
 
@@ -71,6 +73,8 @@ pub fn cross_encoder_rerank(
             .unwrap_or(std::cmp::Ordering::Equal)
             .then_with(|| a.drawer.id.cmp(&b.drawer.id))
     });
+
+    result.llm_response
 }
 
 #[cfg(test)]
@@ -100,15 +104,22 @@ mod tests {
     /// Scorer that returns `-i as f32` for the i-th passage — reverses order.
     struct ReverseScorer;
     impl RerankerScorer for ReverseScorer {
-        fn score_pairs(&self, _q: &str, passages: &[&str]) -> Result<Vec<f32>> {
-            Ok((0..passages.len()).map(|i| -(i as f32)).collect())
+        fn score_pairs(
+            &self,
+            _q: &str,
+            passages: &[&str],
+        ) -> Result<ironrace_rerank::RerankScoreResult> {
+            Ok(ironrace_rerank::RerankScoreResult {
+                scores: (0..passages.len()).map(|i| -(i as f32)).collect(),
+                llm_response: None,
+            })
         }
     }
 
     /// Always returns Err — for the failure-path test.
     struct ErrScorer;
     impl RerankerScorer for ErrScorer {
-        fn score_pairs(&self, _q: &str, _p: &[&str]) -> Result<Vec<f32>> {
+        fn score_pairs(&self, _q: &str, _p: &[&str]) -> Result<ironrace_rerank::RerankScoreResult> {
             anyhow::bail!("simulated scorer failure")
         }
     }
@@ -132,7 +143,7 @@ mod tests {
         // tail-id snapshot we compare against is the post-pre-sort tail.
         let pre_tail: Vec<String> = scored[3..].iter().map(|s| s.drawer.id.clone()).collect();
 
-        cross_encoder_rerank(&scorer, "q", &mut scored);
+        let _ = cross_encoder_rerank(&scorer, "q", &mut scored);
 
         // Tail untouched.
         let post_tail: Vec<String> = scored[3..].iter().map(|s| s.drawer.id.clone()).collect();
@@ -168,7 +179,7 @@ mod tests {
             copy.iter().map(|s| s.drawer.id.clone()).collect()
         };
 
-        cross_encoder_rerank(&scorer, "q", &mut scored);
+        let _ = cross_encoder_rerank(&scorer, "q", &mut scored);
 
         let post: Vec<String> = scored.iter().map(|s| s.drawer.id.clone()).collect();
         // Pre-sort still happens before the err — order matches the sorted version.

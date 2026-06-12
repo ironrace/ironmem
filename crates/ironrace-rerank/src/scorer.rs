@@ -2,13 +2,23 @@
 
 use anyhow::Result;
 
+use crate::response::LlmResponse;
+
+/// Result of one rerank scoring call: the per-passage scores plus the optional
+/// `LlmResponse` produced by an LLM-backed scorer (None for non-LLM scorers).
+#[derive(Debug, Clone)]
+pub struct RerankScoreResult {
+    pub scores: Vec<f32>,
+    pub llm_response: Option<LlmResponse>,
+}
+
 /// Cross-encoder rerank interface.
 ///
 /// Implementations score `(query, passage)` pairs and return one logit per
 /// passage. Higher = more relevant. Raw logits are fine — callers only use
 /// relative order.
 pub trait RerankerScorer: Send + Sync {
-    fn score_pairs(&self, query: &str, passages: &[&str]) -> Result<Vec<f32>>;
+    fn score_pairs(&self, query: &str, passages: &[&str]) -> Result<RerankScoreResult>;
 }
 
 /// Test fixture: returns one zero per passage.
@@ -26,7 +36,10 @@ impl NoopScorer {
 }
 
 impl RerankerScorer for NoopScorer {
-    fn score_pairs(&self, _query: &str, passages: &[&str]) -> Result<Vec<f32>> {
-        Ok(vec![0.0; passages.len()])
+    fn score_pairs(&self, _query: &str, passages: &[&str]) -> Result<RerankScoreResult> {
+        Ok(RerankScoreResult {
+            scores: vec![0.0; passages.len()],
+            llm_response: None,
+        })
     }
 }
