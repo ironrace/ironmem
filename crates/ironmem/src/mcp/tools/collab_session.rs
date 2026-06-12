@@ -151,6 +151,43 @@ fn wait_turn_snapshot(record: &SessionRecord, agent: Agent) -> WaitTurnSnapshot 
     }
 }
 
+/// Best-effort task_outcomes lifecycle writes (METRICS_SPEC §4/§5.4). Runs
+/// AFTER the protocol transaction commits so a metrics failure can never roll
+/// back or fail a collab turn; errors log at warn.
+fn record_task_outcome_transition(
+    app: &App,
+    session_id: &str,
+    before: Phase,
+    after: Phase,
+    pr_url: Option<&str>,
+) {
+    if before == after {
+        return;
+    }
+    let entered_review = crate::metrics::phase_bucket(after) == "review"
+        && matches!(crate::metrics::phase_bucket(before), "impl" | "rework");
+    if entered_review {
+        if let Err(e) = app.db.increment_task_review_rounds(session_id) {
+            tracing::warn!("metrics: review_rounds increment failed: {e}");
+        }
+    }
+    let now = crate::metrics::now_rfc3339();
+    let result = match after {
+        Phase::CodingComplete => {
+            app.db
+                .mark_task_outcome_done(session_id, Some(&now), None, pr_url)
+        }
+        Phase::CodingFailed => {
+            app.db
+                .mark_task_outcome_done(session_id, Some(&now), Some("failed"), None)
+        }
+        _ => Ok(()),
+    };
+    if let Err(e) = result {
+        tracing::warn!("metrics: task_outcome terminal update failed: {e}");
+    }
+}
+
 pub(super) fn handle_collab_start(app: &App, args: &Value) -> Result<Value, MemoryError> {
     let repo_path = require_str(args, "repo_path")?;
     let branch = require_str(args, "branch")?;
@@ -210,6 +247,22 @@ pub(super) fn handle_collab_start(app: &App, args: &Value) -> Result<Value, Memo
         )?;
         Ok(())
     })?;
+
+    app.set_active_collab_session(&session_id);
+    let outcome = crate::db::metrics::TaskOutcome {
+        task_tag: session_id.clone(),
+        collab_session_id: Some(session_id.clone()),
+        started_at: Some(crate::metrics::now_rfc3339()),
+        done_at: None,
+        outcome: None,
+        review_rounds: 0,
+        fix_commits: 0,
+        handoffs: 0,
+        pr_url: None,
+    };
+    if let Err(e) = app.db.upsert_task_outcome(&outcome) {
+        tracing::warn!("metrics: task_outcomes create failed: {e}");
+    }
 
     Ok(json!({
         "session_id": session_id,
@@ -336,6 +389,22 @@ pub(super) fn handle_collab_start_code_review(
         Ok(())
     })?;
 
+    app.set_active_collab_session(&session_id);
+    let outcome = crate::db::metrics::TaskOutcome {
+        task_tag: session_id.clone(),
+        collab_session_id: Some(session_id.clone()),
+        started_at: Some(crate::metrics::now_rfc3339()),
+        done_at: None,
+        outcome: None,
+        review_rounds: 0,
+        fix_commits: 0,
+        handoffs: 0,
+        pr_url: None,
+    };
+    if let Err(e) = app.db.upsert_task_outcome(&outcome) {
+        tracing::warn!("metrics: task_outcomes create failed: {e}");
+    }
+
     Ok(json!({ "session_id": session_id, "task": task }))
 }
 
@@ -351,11 +420,13 @@ pub(super) fn handle_collab_send(app: &App, args: &Value) -> Result<Value, Memor
         )));
     }
 
-    app.db.with_transaction(|tx| {
+    let (response, before, after, pr_url) = app.db.with_transaction(|tx| {
         crate::collab::queue::ensure_active(tx, session_id)?;
         let record = crate::collab::queue::load_session_record(tx, session_id)?;
         let mut session = record.session;
         let phase_before = session.phase.to_string();
+        // Capture the phase enum BEFORE apply_event for lifecycle tracking.
+        let phase_before_enum = session.phase;
 
         // Upstream turn gate: reject sends from the non-owner before any
         // payload parsing or event dispatch. Two carve-outs:
@@ -410,6 +481,10 @@ pub(super) fn handle_collab_send(app: &App, args: &Value) -> Result<Value, Memor
         }
 
         session = apply_event(&session, sender, &event).map_err(collab_error_to_memory_error)?;
+        // Snapshot the post-event pr_url so the lifecycle writer can stamp it
+        // on CodingComplete without an extra DB round-trip.
+        let post_pr_url = session.pr_url.clone();
+        let phase_after_enum = session.phase;
         crate::collab::queue::save_session(tx, &session)?;
 
         let message_id = crate::collab::queue::send_message(
@@ -435,11 +510,20 @@ pub(super) fn handle_collab_send(app: &App, args: &Value) -> Result<Value, Memor
             })),
         )?;
 
-        Ok(json!({
-            "message_id": message_id,
-            "phase": session.phase.to_string(),
-        }))
-    })
+        Ok((
+            json!({
+                "message_id": message_id,
+                "phase": session.phase.to_string(),
+            }),
+            phase_before_enum,
+            phase_after_enum,
+            post_pr_url,
+        ))
+    })?;
+
+    app.set_active_collab_session(session_id);
+    record_task_outcome_transition(app, session_id, before, after, pr_url.as_deref());
+    Ok(response)
 }
 
 fn validate_global_review_head_advance(
@@ -494,7 +578,7 @@ pub(super) fn handle_collab_recv(app: &App, args: &Value) -> Result<Value, Memor
         .and_then(Value::as_bool)
         .unwrap_or(false);
 
-    app.db.with_transaction(|tx| {
+    let result = app.db.with_transaction(|tx| {
         // Blind-drafts invariant: during PlanParallelDrafts, an agent must not
         // see the counterpart's draft until it has submitted its own. This
         // enforces the "parallel" in parallel drafts at the server boundary so
@@ -531,7 +615,9 @@ pub(super) fn handle_collab_recv(app: &App, args: &Value) -> Result<Value, Memor
             })
             .collect();
         Ok(json!({ "messages": json_messages }))
-    })
+    })?;
+    app.set_active_collab_session(session_id);
+    Ok(result)
 }
 
 pub(super) fn handle_collab_ack(app: &App, args: &Value) -> Result<Value, MemoryError> {
@@ -647,9 +733,14 @@ pub(super) fn handle_collab_wait_my_turn(app: &App, args: &Value) -> Result<Valu
 
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
     let poll_interval = std::time::Duration::from_millis(WAIT_MY_TURN_POLL_MS);
+    let mut cell_set = false;
 
     loop {
         let record = app.db.collab_load_session_record(session_id)?;
+        if !cell_set {
+            app.set_active_collab_session(session_id);
+            cell_set = true;
+        }
         let snap = wait_turn_snapshot(&record, agent);
 
         if snap.is_my_turn
@@ -673,7 +764,7 @@ pub(super) fn handle_collab_end(app: &App, args: &Value) -> Result<Value, Memory
     let session_id = require_str(args, "session_id")?;
     let agent = require_agent(require_str(args, "agent")?)?;
 
-    app.db.with_transaction(|tx| {
+    let phase = app.db.with_transaction(|tx| {
         // collab_end is valid only from PlanLocked (pre-task_list), or from
         // the two v2 terminal phases. Rejecting during any active planning
         // or coding phase prevents either agent from killing a session the
@@ -689,6 +780,7 @@ pub(super) fn handle_collab_end(app: &App, args: &Value) -> Result<Value, Memory
                 session.phase
             )));
         }
+        let ended_phase = session.phase;
         crate::collab::queue::end_session(tx, session_id)?;
         crate::db::schema::Database::wal_log_tx(
             tx,
@@ -696,12 +788,34 @@ pub(super) fn handle_collab_end(app: &App, args: &Value) -> Result<Value, Memory
             &json!({
                 "session_id": session_id,
                 "agent": agent.as_str(),
-                "phase": session.phase.to_string(),
+                "phase": ended_phase.to_string(),
             }),
             Some(&json!({ "ok": true })),
         )?;
-        Ok(())
+        Ok(ended_phase)
     })?;
+
+    // Operator attestation (METRICS_SPEC §12 amendment): the operator ends a
+    // CodingComplete session after the PR lands, or abandons a PlanLocked one.
+    let now = crate::metrics::now_rfc3339();
+    let attested = match phase {
+        Phase::CodingComplete => {
+            app.db
+                .mark_task_outcome_done(session_id, None, Some("merged"), None)
+        }
+        Phase::PlanLocked => {
+            app.db
+                .mark_task_outcome_done(session_id, Some(&now), Some("abandoned"), None)
+        }
+        // CodingFailed: failure_report already wrote 'failed' — no write here.
+        _ => Ok(()),
+    };
+    if let Err(e) = attested {
+        tracing::warn!("metrics: task_outcome end attestation failed: {e}");
+    }
+    if app.active_collab_session_snapshot().as_deref() == Some(session_id) {
+        app.clear_active_collab_session();
+    }
 
     Ok(json!({ "ok": true, "session_id": session_id }))
 }
@@ -711,6 +825,224 @@ mod tests {
     use super::*;
     use crate::collab::queue::SessionRecord;
     use crate::collab::CollabSession;
+    use std::sync::Arc;
+
+    // ── test helpers ──────────────────────────────────────────────────────────
+
+    fn test_app() -> Arc<crate::mcp::app::App> {
+        use crate::config::{Config, EmbedMode, McpAccessMode};
+        let dir = tempfile::tempdir().unwrap();
+        let config = Config {
+            db_path: dir.path().join("mem.sqlite3"),
+            model_dir: dir.path().join("model"),
+            model_dir_explicit: true,
+            state_dir: dir.path().join("state"),
+            mcp_access_mode: McpAccessMode::Trusted,
+            embed_mode: EmbedMode::Noop,
+        };
+        // Leak the tempdir so the DB file outlives this helper.
+        std::mem::forget(dir);
+        #[allow(clippy::arc_with_non_send_sync)]
+        Arc::new(crate::mcp::app::App::new(config).unwrap())
+    }
+
+    fn start_session(app: &crate::mcp::app::App) -> String {
+        let args = json!({
+            "repo_path": "/tmp/repo", "branch": "main",
+            "initiator": "claude", "task": "lifecycle test", "implementer": "claude",
+        });
+        let out = handle_collab_start(app, &args).unwrap();
+        out["session_id"].as_str().unwrap().to_string()
+    }
+
+    fn send(
+        app: &crate::mcp::app::App,
+        sid: &str,
+        sender: &str,
+        topic: &str,
+        content: &str,
+    ) -> Value {
+        handle_collab_send(
+            app,
+            &json!({ "session_id": sid, "sender": sender, "topic": topic, "content": content }),
+        )
+        .unwrap()
+    }
+
+    /// Drive v1 planning to PlanLocked and return the final_plan_hash that
+    /// must be used in the subsequent task_list payload.
+    fn drive_to_plan_locked(app: &crate::mcp::app::App, sid: &str) -> String {
+        let plan_text = "final plan";
+        let final_plan_hash = super::super::shared::sha256_hex(plan_text);
+        send(app, sid, "claude", "draft", "claude draft");
+        send(app, sid, "codex", "draft", "codex draft");
+        send(app, sid, "claude", "canonical", "canonical plan");
+        send(app, sid, "codex", "review", r#"{"verdict":"approve"}"#);
+        send(
+            app,
+            sid,
+            "claude",
+            "final",
+            &format!(r#"{{"plan":"{plan_text}"}}"#),
+        );
+        final_plan_hash
+    }
+
+    /// Drive to CodeImplementPending and return the final_plan_hash.
+    fn drive_to_implement(app: &crate::mcp::app::App, sid: &str) -> String {
+        let hash = drive_to_plan_locked(app, sid);
+        let task_list_content = format!(
+            r#"{{"plan_hash":"{hash}","base_sha":"b","head_sha":"b","tasks":[{{"id":1,"title":"t","acceptance":["a"]}}]}}"#
+        );
+        send(app, sid, "claude", "task_list", &task_list_content);
+        hash
+    }
+
+    // ── lifecycle tests ───────────────────────────────────────────────────────
+
+    #[test]
+    fn collab_start_creates_task_outcome_row_and_sets_active_cell() {
+        let app = test_app();
+        let sid = start_session(&app);
+        let row = app.db.get_task_outcome(&sid).unwrap().expect("row created");
+        assert_eq!(row.collab_session_id.as_deref(), Some(sid.as_str()));
+        assert!(row.started_at.is_some());
+        assert!(
+            row.done_at.is_none() && row.outcome.is_none() && row.pr_url.is_none(),
+            "fresh row must have no terminal fields set"
+        );
+        assert_eq!(
+            (row.review_rounds, row.fix_commits, row.handoffs),
+            (0, 0, 0)
+        );
+        assert_eq!(
+            app.active_collab_session_snapshot().as_deref(),
+            Some(sid.as_str())
+        );
+    }
+
+    #[test]
+    fn full_v3_happy_path_yields_review_round_done_at_pr_url_then_merged_on_end() {
+        let app = test_app();
+        let sid = start_session(&app);
+
+        // v1 planning → PlanLocked, then v3 → CodeImplementPending.
+        drive_to_implement(&app, &sid);
+
+        // CodeImplementPending(impl) → CodeReviewFixGlobalPending(rework): no increment yet.
+        send(
+            &app,
+            &sid,
+            "claude",
+            "implementation_done",
+            r#"{"head_sha":"c1"}"#,
+        );
+        let row = app.db.get_task_outcome(&sid).unwrap().unwrap();
+        assert_eq!(row.review_rounds, 0, "impl→rework must NOT increment");
+
+        // CodeReviewFixGlobalPending(rework) → CodeReviewLocalPending(review): +1.
+        send(
+            &app,
+            &sid,
+            "codex",
+            "review_fix_global",
+            r#"{"head_sha":"c2"}"#,
+        );
+        let row = app.db.get_task_outcome(&sid).unwrap().unwrap();
+        assert_eq!(row.review_rounds, 1, "rework→review entry increments once");
+
+        // CodeReviewLocalPending(review) → CodeReviewFinalPending(review): must NOT increment.
+        send(&app, &sid, "claude", "review_local", r#"{"head_sha":"c3"}"#);
+        let row = app.db.get_task_outcome(&sid).unwrap().unwrap();
+        assert_eq!(
+            row.review_rounds, 1,
+            "review→review (Local→Final) must NOT increment"
+        );
+        assert!(row.done_at.is_none(), "session not yet complete");
+
+        // CodeReviewFinalPending(review) → CodingComplete: sets done_at + pr_url.
+        send(
+            &app,
+            &sid,
+            "claude",
+            "final_review",
+            r#"{"head_sha":"c4","pr_url":"https://github.com/x/y/pull/9"}"#,
+        );
+        let row = app.db.get_task_outcome(&sid).unwrap().unwrap();
+        assert!(row.done_at.is_some(), "CodingComplete sets done_at");
+        assert_eq!(row.pr_url.as_deref(), Some("https://github.com/x/y/pull/9"));
+        assert!(
+            row.outcome.is_none(),
+            "outcome must stay NULL until operator attestation"
+        );
+
+        // collab_end from CodingComplete → operator attests "merged".
+        handle_collab_end(&app, &json!({"session_id": sid, "agent": "claude"})).unwrap();
+        let row = app.db.get_task_outcome(&sid).unwrap().unwrap();
+        assert_eq!(
+            row.outcome.as_deref(),
+            Some("merged"),
+            "collab_end from CodingComplete attests merged"
+        );
+    }
+
+    #[test]
+    fn failure_report_marks_outcome_failed() {
+        let app = test_app();
+        let sid = start_session(&app);
+        drive_to_implement(&app, &sid);
+
+        // Send failure_report from CodeImplementPending.
+        send(
+            &app,
+            &sid,
+            "claude",
+            "failure_report",
+            r#"{"coding_failure":"subagent_failure: 1: env"}"#,
+        );
+        let row = app.db.get_task_outcome(&sid).unwrap().unwrap();
+        assert_eq!(
+            row.outcome.as_deref(),
+            Some("failed"),
+            "failure_report must set outcome=failed"
+        );
+        assert!(row.done_at.is_some(), "failure_report must set done_at");
+    }
+
+    #[test]
+    fn collab_end_from_planlocked_marks_abandoned() {
+        let app = test_app();
+        let sid = start_session(&app);
+        drive_to_plan_locked(&app, &sid);
+
+        handle_collab_end(&app, &json!({"session_id": sid, "agent": "claude"})).unwrap();
+        let row = app.db.get_task_outcome(&sid).unwrap().unwrap();
+        assert_eq!(
+            row.outcome.as_deref(),
+            Some("abandoned"),
+            "collab_end from PlanLocked must mark abandoned"
+        );
+        assert!(row.done_at.is_some(), "abandoned must set done_at");
+    }
+
+    #[test]
+    fn recv_refreshes_active_cell_but_status_does_not() {
+        let app = test_app();
+        let sid = start_session(&app);
+        app.clear_active_collab_session();
+        // status must NOT steal attribution
+        handle_collab_status(&app, &json!({"session_id": sid})).unwrap();
+        assert!(
+            app.active_collab_session_snapshot().is_none(),
+            "status must not steal attribution"
+        );
+        // recv must set it
+        handle_collab_recv(&app, &json!({"session_id": sid, "receiver": "claude"})).unwrap();
+        assert_eq!(
+            app.active_collab_session_snapshot().as_deref(),
+            Some(sid.as_str())
+        );
+    }
 
     // ── execution_mode_from_task_list ─────────────────────────────────────────
 
