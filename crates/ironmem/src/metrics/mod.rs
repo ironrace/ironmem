@@ -5,7 +5,7 @@
 
 /// Token usage extracted from a transcript's last assistant message.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct Usage {
+pub(crate) struct Usage {
     pub input_tokens: i64,
     pub output_tokens: i64,
     pub cache_creation_input_tokens: i64,
@@ -13,7 +13,7 @@ pub struct Usage {
 }
 
 /// METRICS_SPEC §6.2 estimate: `ceil(chars / 4)`.
-pub fn estimate_tokens(chars: i64) -> i64 {
+pub(crate) fn estimate_tokens(chars: i64) -> i64 {
     if chars <= 0 {
         0
     } else {
@@ -25,7 +25,11 @@ pub fn estimate_tokens(chars: i64) -> i64 {
 
 /// METRICS_SPEC §8.1: `(input + cache_read) / context_window`.
 /// `None` when the window is non-positive (avoids div-by-zero / inversion).
-pub fn occupancy_pct(input_tokens: i64, cache_read_input_tokens: i64, window: i64) -> Option<f64> {
+pub(crate) fn occupancy_pct(
+    input_tokens: i64,
+    cache_read_input_tokens: i64,
+    window: i64,
+) -> Option<f64> {
     if window <= 0 {
         return None;
     }
@@ -34,7 +38,7 @@ pub fn occupancy_pct(input_tokens: i64, cache_read_input_tokens: i64, window: i6
 
 /// RFC3339 UTC timestamp, matching existing metric-row call sites
 /// (`chrono::Utc::now().to_rfc3339()`).
-pub fn now_rfc3339() -> String {
+pub(crate) fn now_rfc3339() -> String {
     chrono::Utc::now().to_rfc3339()
 }
 
@@ -43,7 +47,7 @@ pub fn now_rfc3339() -> String {
 /// in `hook.rs`. Handles both a top-level `usage` and a nested
 /// `message.usage` envelope. Missing numeric fields default to 0. Returns
 /// `None` when no assistant `usage` is found or the input is empty/malformed.
-pub fn extract_last_assistant_usage(raw: &str) -> Option<Usage> {
+pub(crate) fn extract_last_assistant_usage(raw: &str) -> Option<Usage> {
     for line in raw.lines().rev() {
         let line = line.trim();
         if line.is_empty() {
@@ -89,7 +93,12 @@ use crate::db::schema::Database;
 /// Always inserts a diagnostic `token_usage` row; accumulates
 /// `session_summary.mcp_chars_served` via read-modify-write only when a
 /// session id is known. Best-effort: all DB errors are logged, never returned.
-pub fn account_mcp_response(db: &Database, chars: i64, harness: &str, session_id: Option<&str>) {
+pub(crate) fn account_mcp_response(
+    db: &Database,
+    chars: i64,
+    harness: &str,
+    session_id: Option<&str>,
+) {
     let row = NewTokenUsage {
         ts: now_rfc3339(),
         source: "mcp_response".to_string(),
@@ -141,7 +150,7 @@ pub fn account_mcp_response(db: &Database, chars: i64, harness: &str, session_id
 
 /// Map a hook CLI name to the `occupancy_samples.hook_event` enum value
 /// (METRICS_SPEC §5.2 / §8.2). `stop` → `session-stop` (CHECK-constraint safe).
-pub fn hook_event_for(hook_name: &str) -> Option<&'static str> {
+pub(crate) fn hook_event_for(hook_name: &str) -> Option<&'static str> {
     match hook_name {
         "session-start" => Some("session-start"),
         "stop" => Some("session-stop"),
@@ -154,7 +163,7 @@ pub fn hook_event_for(hook_name: &str) -> Option<&'static str> {
 /// Best-effort. Caller guarantees `session_id` is `Some` (absent-id is skipped
 /// by the caller per D4). `usage` is `None` when the transcript had no usable
 /// assistant usage → a deterministic zero-token sample is still written.
-pub fn record_occupancy_sample(
+pub(crate) fn record_occupancy_sample(
     db: &Database,
     harness: &str,
     session_id: &str,

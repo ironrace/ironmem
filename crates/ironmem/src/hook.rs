@@ -1,6 +1,6 @@
 //! Session lifecycle hooks for Codex and Claude Code integrations.
 
-use std::io::Read;
+use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
 
@@ -18,6 +18,7 @@ use crate::sanitize::{sanitize_harness, sanitize_session_id};
 
 const REVIEW_WING: &str = "reviews";
 const REVIEW_MAX_BYTES: usize = 24_000;
+const METRICS_TRANSCRIPT_TAIL_BYTES: u64 = 2 * 1024 * 1024;
 
 static REVIEW_FILE_REF_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"[A-Za-z0-9_./-]+\.[A-Za-z0-9]+:\d+").unwrap());
@@ -146,7 +147,7 @@ fn sample_occupancy(
         "claude"
     };
     let usage = transcript_path
-        .and_then(|p| std::fs::read_to_string(p).ok())
+        .and_then(read_transcript_tail)
         .and_then(|raw| crate::metrics::extract_last_assistant_usage(&raw));
     let workspace = workspace_root.map(|p| p.to_string_lossy().to_string());
     crate::metrics::record_occupancy_sample(
@@ -158,6 +159,26 @@ fn sample_occupancy(
         usage,
         crate::search::tunables::context_window(),
     );
+}
+
+fn read_transcript_tail(path: &Path) -> Option<String> {
+    let metadata = std::fs::symlink_metadata(path).ok()?;
+    if !metadata.file_type().is_file() {
+        return None;
+    }
+    let start = metadata.len().saturating_sub(METRICS_TRANSCRIPT_TAIL_BYTES);
+    let mut file = std::fs::File::open(path).ok()?;
+    if start > 0 {
+        file.seek(SeekFrom::Start(start)).ok()?;
+    }
+    let mut raw = String::new();
+    let mut reader = file.take(METRICS_TRANSCRIPT_TAIL_BYTES);
+    reader.read_to_string(&mut raw).ok()?;
+    if start > 0 {
+        let first_newline = raw.find('\n')?;
+        raw = raw[first_newline + 1..].to_string();
+    }
+    Some(raw)
 }
 
 fn persist_diary_summary(app: &App, content: &str) -> Result<(), MemoryError> {
@@ -483,8 +504,9 @@ mod tests {
     use super::*;
     use crate::config::{Config, EmbedMode, McpAccessMode};
     use crate::mcp::protocol::JsonRpcRequest;
-    use crate::mcp::server::dispatch;
-    use std::sync::{LazyLock, Mutex};
+    use crate::mcp::server::{dispatch, run_server_io};
+    use std::sync::{Arc, LazyLock, Mutex};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader};
 
     static ENV_MUTEX: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
@@ -643,11 +665,15 @@ mod tests {
     #[test]
     fn read_only_stop_hook_skips_mining_and_diary_writes() {
         let _env = ENV_MUTEX.lock().unwrap();
+        let _metrics = crate::metrics::METRICS_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let temp = tempfile::tempdir().unwrap();
         let workspace = temp.path().join("workspace");
         std::fs::create_dir_all(&workspace).unwrap();
         std::fs::write(workspace.join("README.md"), "# Workspace\n\nMine me.").unwrap();
 
+        std::env::remove_var("IRONMEM_METRICS");
         std::env::set_var("IRONMEM_DISABLE_MIGRATION", "1");
 
         let config = Config {
@@ -674,6 +700,14 @@ mod tests {
         let app = App::new(config).unwrap();
         assert_eq!(response.hook, "stop");
         assert_eq!(app.db.count_drawers(None).unwrap(), 0);
+        assert_eq!(
+            app.db
+                .occupancy_samples_for_session("session-1", 10)
+                .unwrap()
+                .len(),
+            0
+        );
+        assert!(app.db.get_session_summary("session-1").unwrap().is_none());
 
         std::env::remove_var("IRONMEM_DISABLE_MIGRATION");
     }
@@ -832,6 +866,187 @@ mod tests {
         assert_eq!(samples.len(), 1, "deterministic zero-token sample (D4)");
         assert_eq!(samples[0].input_tokens, 0);
         assert_eq!(samples[0].hook_event.as_deref(), Some("session-start"));
+        std::env::remove_var("IRONMEM_DISABLE_MIGRATION");
+    }
+
+    #[test]
+    fn absent_session_id_skips_occupancy_and_summary() {
+        let _env = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let _metrics = crate::metrics::METRICS_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        std::env::remove_var("IRONMEM_METRICS");
+        std::env::set_var("IRONMEM_DISABLE_MIGRATION", "1");
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(temp.path().join("workspace")).unwrap();
+        let transcript = temp.path().join("t.jsonl");
+        std::fs::write(
+            &transcript,
+            r#"{"type":"assistant","message":{"usage":{"input_tokens":10,"output_tokens":2}}}"#,
+        )
+        .unwrap();
+        let config = Config {
+            db_path: temp.path().join("memory.sqlite3"),
+            model_dir: temp.path().join("model"),
+            model_dir_explicit: true,
+            state_dir: temp.path().join("hook_state"),
+            mcp_access_mode: McpAccessMode::Trusted,
+            embed_mode: EmbedMode::Noop,
+        };
+        run_hook_with_input(
+            "session-start",
+            "claude",
+            config.clone(),
+            serde_json::json!({
+                "cwd": temp.path().join("workspace"),
+                "transcript_path": transcript.to_string_lossy(),
+            }),
+        )
+        .unwrap();
+        let app = App::new(config).unwrap();
+        assert_eq!(
+            app.db.occupancy_samples_for_session("", 10).unwrap().len(),
+            0
+        );
+        assert!(app.db.get_session_summary("").unwrap().is_none());
+        assert!(app.db.get_session_summary("unknown").unwrap().is_none());
+        std::env::remove_var("IRONMEM_DISABLE_MIGRATION");
+    }
+
+    #[test]
+    fn stop_writes_session_stop_sample_and_summary_totals() {
+        let _env = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let _metrics = crate::metrics::METRICS_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        std::env::remove_var("IRONMEM_METRICS");
+        std::env::set_var("IRONMEM_DISABLE_MIGRATION", "1");
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(temp.path().join("workspace")).unwrap();
+        let transcript = temp.path().join("t.jsonl");
+        std::fs::write(
+            &transcript,
+            r#"{"type":"assistant","message":{"usage":{"input_tokens":10,"output_tokens":2,"cache_read_input_tokens":5}}}"#,
+        )
+        .unwrap();
+        let config = Config {
+            db_path: temp.path().join("memory.sqlite3"),
+            model_dir: temp.path().join("model"),
+            model_dir_explicit: true,
+            state_dir: temp.path().join("hook_state"),
+            mcp_access_mode: McpAccessMode::Trusted,
+            embed_mode: EmbedMode::Noop,
+        };
+        run_hook_with_input(
+            "stop",
+            "codex",
+            config.clone(),
+            serde_json::json!({
+                "cwd": temp.path().join("workspace"),
+                "session_id": "sess-stop",
+                "transcript_path": transcript.to_string_lossy(),
+            }),
+        )
+        .unwrap();
+        let app = App::new(config).unwrap();
+        let samples = app
+            .db
+            .occupancy_samples_for_session("sess-stop", 10)
+            .unwrap();
+        assert_eq!(samples.len(), 1);
+        assert_eq!(samples[0].harness, "codex");
+        assert_eq!(samples[0].hook_event.as_deref(), Some("session-stop"));
+        assert_eq!(samples[0].input_tokens, 10);
+        assert_eq!(samples[0].cache_read_input_tokens, 5);
+        let s = app.db.get_session_summary("sess-stop").unwrap().unwrap();
+        assert_eq!(s.harness, "codex");
+        assert!(s.ended_at.is_some());
+        assert_eq!(s.total_input_tokens, 10);
+        assert_eq!(s.total_output_tokens, 2);
+        assert_eq!(s.compactions, 0);
+        std::env::remove_var("IRONMEM_DISABLE_MIGRATION");
+    }
+
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn mcp_and_hook_share_sanitized_session_summary_key() {
+        let _env = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let _metrics = crate::metrics::METRICS_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        std::env::remove_var("IRONMEM_METRICS");
+        std::env::remove_var("IRONMEM_HARNESS");
+        std::env::set_var("IRONMEM_DISABLE_MIGRATION", "1");
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = temp.path().join("workspace");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let transcript = temp.path().join("t.jsonl");
+        std::fs::write(
+            &transcript,
+            r#"{"type":"assistant","message":{"usage":{"input_tokens":10,"output_tokens":2,"cache_read_input_tokens":5}}}"#,
+        )
+        .unwrap();
+        let config = Config {
+            db_path: temp.path().join("memory.sqlite3"),
+            model_dir: temp.path().join("model"),
+            model_dir_explicit: true,
+            state_dir: temp.path().join("hook_state"),
+            mcp_access_mode: McpAccessMode::Trusted,
+            embed_mode: EmbedMode::Noop,
+        };
+
+        {
+            #[allow(clippy::arc_with_non_send_sync)]
+            let app = Arc::new(App::new(config.clone()).unwrap());
+            let (mut client_in, server_in) = tokio::io::duplex(4096);
+            let (server_out, mut client_out) = tokio::io::duplex(4096);
+            client_in
+                .write_all(
+                    b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{\"sessionId\":\"../same-session\"}}\n",
+                )
+                .await
+                .unwrap();
+            client_in.shutdown().await.unwrap();
+            run_server_io(Arc::clone(&app), BufReader::new(server_in), server_out)
+                .await
+                .unwrap();
+            let mut out = String::new();
+            client_out.read_to_string(&mut out).await.unwrap();
+        }
+
+        run_hook_with_input(
+            "session-start",
+            "claude",
+            config.clone(),
+            serde_json::json!({
+                "cwd": workspace,
+                "session_id": "../same-session",
+                "transcript_path": transcript.to_string_lossy(),
+            }),
+        )
+        .unwrap();
+
+        let app = App::new(config).unwrap();
+        assert!(app
+            .db
+            .get_session_summary("../same-session")
+            .unwrap()
+            .is_none());
+        let summary = app
+            .db
+            .get_session_summary("same-session")
+            .unwrap()
+            .expect("sanitized summary key exists");
+        assert!(summary.mcp_chars_served > 0);
+        assert_eq!(summary.total_input_tokens, 10);
+        assert_eq!(summary.total_output_tokens, 2);
+        assert_eq!(
+            app.db
+                .occupancy_samples_for_session("same-session", 10)
+                .unwrap()
+                .len(),
+            1
+        );
         std::env::remove_var("IRONMEM_DISABLE_MIGRATION");
     }
 
