@@ -305,12 +305,19 @@ def main() -> int:
                 return 1
             print(f"PASS: task_outcomes ({rows['n']} row(s) with started_at for collab session)")
 
-            # session_summary: ≥1 row
-            rows = conn.execute("SELECT COUNT(*) AS n FROM session_summary").fetchone()
-            if rows["n"] < 1:
-                sys.stderr.write("FAIL: session_summary — no rows\n")
+            # session_summary: the MCP server response accounting must create/update
+            # the shared session row and increment mcp_chars_served. The hook below
+            # also writes session_summary, so a generic COUNT(*) can false-pass.
+            rows = conn.execute(
+                "SELECT mcp_chars_served FROM session_summary WHERE session_id = ?",
+                (session_id,),
+            ).fetchone()
+            if rows is None or rows["mcp_chars_served"] <= 0:
+                sys.stderr.write(
+                    "FAIL: session_summary — no MCP response chars recorded for server session\n"
+                )
                 return 1
-            print(f"PASS: session_summary ({rows['n']} row(s))")
+            print(f"PASS: session_summary (mcp_chars_served={rows['mcp_chars_served']})")
 
             # occupancy_samples: ≥1 row from the hook invocation
             rows = conn.execute(

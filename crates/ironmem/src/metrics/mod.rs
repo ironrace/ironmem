@@ -94,15 +94,20 @@ impl MetricsContext {
                         task_tag: None,
                     };
                 }
-                Ok(_) => app.clear_active_collab_session(),
+                Ok(_) => {
+                    app.clear_active_collab_session();
+                    return MetricsContext::default();
+                }
                 // `NotFound` is what `queue::load_session_record` returns for a
                 // missing row — matched explicitly so a new error variant never
                 // silently falls through to the warn arm.
                 Err(crate::error::MemoryError::NotFound(_)) => {
                     app.clear_active_collab_session();
+                    return MetricsContext::default();
                 }
                 Err(e) => {
                     tracing::warn!("metrics: collab session lookup for attribution failed: {e}");
+                    return MetricsContext::default();
                 }
             }
         }
@@ -427,11 +432,49 @@ mod tests {
     }
 
     #[test]
+    fn resolve_does_not_fallback_to_task_tag_for_ended_active_session() {
+        let app = test_app();
+        let sid = seed_collab_session(&app);
+        app.db
+            .with_transaction(|tx| crate::collab::queue::end_session(tx, &sid))
+            .unwrap();
+        app.set_active_collab_session(&sid);
+        app.set_explicit_task_tag("issue-85");
+
+        let ctx = MetricsContext::resolve(&app);
+
+        assert!(ctx.collab_session_id.is_none());
+        assert!(ctx.collab_phase.is_none());
+        assert!(
+            ctx.task_tag.is_none(),
+            "the row that discovers a stale collab cell must stay unstamped"
+        );
+        assert!(app.active_collab_session_snapshot().is_none());
+    }
+
+    #[test]
     fn resolve_unstamps_and_clears_cell_for_missing_session() {
         let app = test_app();
         app.set_active_collab_session("does-not-exist");
         let ctx = MetricsContext::resolve(&app);
         assert!(ctx.collab_session_id.is_none());
+        assert!(app.active_collab_session_snapshot().is_none());
+    }
+
+    #[test]
+    fn resolve_does_not_fallback_to_task_tag_for_missing_active_session() {
+        let app = test_app();
+        app.set_active_collab_session("does-not-exist");
+        app.set_explicit_task_tag("issue-85");
+
+        let ctx = MetricsContext::resolve(&app);
+
+        assert!(ctx.collab_session_id.is_none());
+        assert!(ctx.collab_phase.is_none());
+        assert!(
+            ctx.task_tag.is_none(),
+            "the row that discovers a missing collab cell must stay unstamped"
+        );
         assert!(app.active_collab_session_snapshot().is_none());
     }
 

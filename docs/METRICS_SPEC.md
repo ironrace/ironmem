@@ -217,7 +217,7 @@ Indexes: `(task_tag, ts)` and `(collab_session_id, collab_phase)`.
 
 | Column              | Unit    | Source                  | Destination |
 |---------------------|---------|-------------------------|-------------|
-| `task_tag` (UNIQUE) | string  | collab_start / status   | `task_outcomes.task_tag` |
+| `task_tag` (UNIQUE) | string  | collab_start            | `task_outcomes.task_tag` |
 | `collab_session_id` | string  | collab_start            | `task_outcomes.collab_session_id` |
 | `started_at`        | iso8601 | collab_start            | `task_outcomes.started_at` |
 | `done_at`           | iso8601 | end/PR                  | `task_outcomes.done_at` |
@@ -226,6 +226,11 @@ Indexes: `(task_tag, ts)` and `(collab_session_id, collab_phase)`.
 | `fix_commits`       | count   | §4                      | `task_outcomes.fix_commits` |
 | `handoffs`          | count   | §4                      | `task_outcomes.handoffs` |
 | `pr_url`            | string  | PR creation             | `task_outcomes.pr_url` |
+
+In PR 05 / issue #83, `status(set_task_tag=...)` is token-usage-only: it
+annotates subsequent non-collab `token_usage` rows with `task_tag` and the
+default `impl` bucket, but it does not create or complete a `task_outcomes`
+row. Non-collab task lifecycle rows require a later explicit lifecycle API.
 
 ---
 

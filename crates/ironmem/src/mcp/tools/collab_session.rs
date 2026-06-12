@@ -212,6 +212,57 @@ fn record_task_outcome_transition(
     }
 }
 
+fn ensure_no_conflicting_process_session(
+    app: &App,
+    requested_session_id: &str,
+) -> Result<(), MemoryError> {
+    let Some(active_session_id) = app.active_collab_session_snapshot() else {
+        return Ok(());
+    };
+    if active_session_id == requested_session_id {
+        return Ok(());
+    }
+
+    match app.db.collab_load_session_record(&active_session_id) {
+        Ok(record) if record.ended_at.is_none() => Err(MemoryError::Validation(format!(
+            "another active collab session is already bound to this MCP process for metrics attribution: {active_session_id}. End it or use a separate server process before switching to {requested_session_id}."
+        ))),
+        Ok(_) | Err(MemoryError::NotFound(_)) => {
+            app.clear_active_collab_session();
+            Ok(())
+        }
+        Err(e) => Err(MemoryError::Validation(format!(
+            "could not verify active collab session {active_session_id} before switching metrics attribution: {e}"
+        ))),
+    }
+}
+
+fn ensure_no_conflicting_process_session_tx(
+    app: &App,
+    tx: &rusqlite::Transaction<'_>,
+    requested_session_id: &str,
+) -> Result<(), MemoryError> {
+    let Some(active_session_id) = app.active_collab_session_snapshot() else {
+        return Ok(());
+    };
+    if active_session_id == requested_session_id {
+        return Ok(());
+    }
+
+    match crate::collab::queue::load_session_record(tx, &active_session_id) {
+        Ok(record) if record.ended_at.is_none() => Err(MemoryError::Validation(format!(
+            "another active collab session is already bound to this MCP process for metrics attribution: {active_session_id}. End it or use a separate server process before switching to {requested_session_id}."
+        ))),
+        Ok(_) | Err(MemoryError::NotFound(_)) => {
+            app.clear_active_collab_session();
+            Ok(())
+        }
+        Err(e) => Err(MemoryError::Validation(format!(
+            "could not verify active collab session {active_session_id} before switching metrics attribution: {e}"
+        ))),
+    }
+}
+
 pub(super) fn handle_collab_start(app: &App, args: &Value) -> Result<Value, MemoryError> {
     let repo_path = require_str(args, "repo_path")?;
     let branch = require_str(args, "branch")?;
@@ -245,9 +296,10 @@ pub(super) fn handle_collab_start(app: &App, args: &Value) -> Result<Value, Memo
             return Err(MemoryError::Validation(format!(
                 "an active collab session already exists for repo {repo_path} branch {branch}: \
                  {existing_id} (phase {phase}). Resume it with `/collab join {existing_id}`, or \
-                 if it is finished call collab_end on it before starting a new session here."
+                if it is finished call collab_end on it before starting a new session here."
             )));
         }
+        ensure_no_conflicting_process_session_tx(app, tx, &session_id)?;
         crate::collab::queue::create_session(
             tx,
             &session_id,
@@ -369,9 +421,10 @@ pub(super) fn handle_collab_start_code_review(
             return Err(MemoryError::Validation(format!(
                 "an active collab session already exists for repo {repo_path} branch {branch}: \
                  {existing_id} (phase {phase}). Resume it with `/collab join {existing_id}`, or \
-                 if it is finished call collab_end on it before starting a new session here."
+                if it is finished call collab_end on it before starting a new session here."
             )));
         }
+        ensure_no_conflicting_process_session_tx(app, tx, &session_id)?;
         // Shortcut sessions never enter `CodeImplementPending`, so the
         // `implementer` field is fixed at `Agent::Claude` for uniformity.
         crate::collab::queue::create_session(
@@ -408,6 +461,7 @@ pub(super) fn handle_collab_start_code_review(
 
 pub(super) fn handle_collab_send(app: &App, args: &Value) -> Result<Value, MemoryError> {
     let session_id = require_str(args, "session_id")?;
+    ensure_no_conflicting_process_session(app, session_id)?;
     let sender = require_agent(require_str(args, "sender")?)?;
     let topic = require_str(args, "topic")?;
     let content =
@@ -571,6 +625,7 @@ fn validate_global_review_head_advance(
 
 pub(super) fn handle_collab_recv(app: &App, args: &Value) -> Result<Value, MemoryError> {
     let session_id = require_str(args, "session_id")?;
+    ensure_no_conflicting_process_session(app, session_id)?;
     let receiver = require_agent(require_str(args, "receiver")?)?;
     let limit = (args.get("limit").and_then(|v| v.as_u64()).unwrap_or(10) as usize).min(50);
     let auto_ack = args
@@ -724,6 +779,7 @@ pub(super) fn handle_collab_approve(app: &App, args: &Value) -> Result<Value, Me
 
 pub(super) fn handle_collab_wait_my_turn(app: &App, args: &Value) -> Result<Value, MemoryError> {
     let session_id = require_str(args, "session_id")?;
+    ensure_no_conflicting_process_session(app, session_id)?;
     let agent = require_agent(require_str(args, "agent")?)?;
     let timeout_secs = args
         .get("timeout_secs")
@@ -1041,6 +1097,53 @@ mod tests {
         assert_eq!(
             app.active_collab_session_snapshot().as_deref(),
             Some(sid.as_str())
+        );
+    }
+
+    #[test]
+    fn wait_my_turn_refreshes_active_cell() {
+        let app = test_app();
+        let sid = start_session(&app);
+        app.clear_active_collab_session();
+
+        let wait = handle_collab_wait_my_turn(
+            &app,
+            &json!({"session_id": sid, "agent": "claude", "timeout_secs": 1}),
+        )
+        .unwrap();
+
+        assert_eq!(wait["is_my_turn"], true);
+        assert_eq!(
+            app.active_collab_session_snapshot().as_deref(),
+            Some(sid.as_str())
+        );
+    }
+
+    #[test]
+    fn second_live_session_cannot_steal_process_attribution_slot() {
+        let app = test_app();
+        let first = start_session(&app);
+
+        let err = handle_collab_start(
+            &app,
+            &json!({
+                "repo_path": "/tmp/repo",
+                "branch": "other-branch",
+                "initiator": "claude",
+                "task": "second live session",
+                "implementer": "claude",
+            }),
+        )
+        .unwrap_err();
+
+        assert!(
+            err.to_string()
+                .contains("already bound to this MCP process"),
+            "unexpected error: {err}"
+        );
+        assert_eq!(
+            app.active_collab_session_snapshot().as_deref(),
+            Some(first.as_str())
         );
     }
 
