@@ -140,6 +140,12 @@ fn sample_occupancy(
     let Some(session_id) = session_id else {
         return; // D4: absent session id → skip (never create an empty key)
     };
+    // `parse_session_id` sanitizes to "unknown" for path-traversal-ish input;
+    // skip it so the hook never keys a summary the MCP side (which maps
+    // sanitized "unknown" → None) would never co-key.
+    if session_id == "unknown" {
+        return;
+    }
     // CHECK constraint: occupancy_samples.harness ∈ {claude, codex}.
     let harness_norm = if harness.starts_with("codex") {
         "codex"
@@ -167,13 +173,27 @@ fn read_transcript_tail(path: &Path) -> Option<String> {
         return None;
     }
     let start = metadata.len().saturating_sub(METRICS_TRANSCRIPT_TAIL_BYTES);
-    let mut file = std::fs::File::open(path).ok()?;
+    // `O_NOFOLLOW` rejects a symlink swapped in after the `symlink_metadata`
+    // check, closing the TOCTOU window atomically at open() time.
+    let mut file = {
+        use std::os::unix::fs::OpenOptionsExt;
+        std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(path)
+            .ok()?
+    };
     if start > 0 {
         file.seek(SeekFrom::Start(start)).ok()?;
     }
-    let mut raw = String::new();
+    // Decode lossily: an arbitrary byte-offset seek can split a multibyte
+    // codepoint, which would make a strict UTF-8 read fail and silently drop a
+    // real transcript's usage. Lossy decode never fails; the partial first line
+    // is discarded below anyway.
+    let mut buf = Vec::new();
     let mut reader = file.take(METRICS_TRANSCRIPT_TAIL_BYTES);
-    reader.read_to_string(&mut raw).ok()?;
+    reader.read_to_end(&mut buf).ok()?;
+    let mut raw = String::from_utf8_lossy(&buf).into_owned();
     if start > 0 {
         let first_newline = raw.find('\n')?;
         raw = raw[first_newline + 1..].to_string();

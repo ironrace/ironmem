@@ -495,4 +495,28 @@ claimed to preserve quality.
 > Every post-freeze change to any section above is recorded here as a dated, justified entry.
 > The body sections are not edited silently; an amendment states what changed and why.
 
-_(none yet — initial freeze 2026-06-11)_
+### 2026-06-11 — PR 04 implementation clarifications (no behavioral change to §1–§11 contracts)
+
+Recorded while wiring the first two capture points (issue #82). These document
+implementation details that §5/§8 left unspecified; no counter name, unit, source,
+destination, or reporting query changed.
+
+1. **`IRONMEM_METRICS` accepted disable values.** §8.3 says "when disabled, no rows
+   are written"; the implementation disables on `0`, `false`, `no`, or `off`. Any
+   other value (including `1`) leaves metrics enabled.
+2. **New override seams `IRONMEM_SESSION_ID` and `IRONMEM_HARNESS`.** §5.1/§5.3 source
+   `session_id`/`harness` from "hook / MCP context". Because the MCP `serve` process
+   receives no harness session id in `initialize` (only `clientInfo`), two optional
+   env seams pin those values when negotiation can't supply them: `IRONMEM_SESSION_ID`
+   (harness session id for `session_summary` co-keying) and `IRONMEM_HARNESS`
+   (`claude`|`codex` attribution; otherwise learned from `initialize.clientInfo.name`).
+   Both are primarily testing seams; absent them, behavior is unchanged.
+3. **`session_summary` accumulation is atomic engine-side, not read-modify-write.**
+   §5.3 specifies the columns, not the write mechanism. Because the MCP-server and hook
+   processes both co-key the same row (§5.3), accumulation uses a single
+   `INSERT … ON CONFLICT DO UPDATE SET col = col + excluded.col` statement (max for
+   `peak_occupancy_pct`, COALESCE set-once for `started_at`) so concurrent cross-process
+   writes cannot lose an increment. This strengthens the §5.3 contract; it does not
+   change it.
+4. **`session_id` is bounded to 128 chars** by `sanitize_session_id` before becoming a
+   row key, preventing an unbounded attacker-supplied key from MCP `initialize`.

@@ -1,7 +1,14 @@
-//! Pure metrics helpers shared by the MCP server (response sizing) and the
-//! lifecycle hooks (occupancy sampling). No DB or env access lives here — the
-//! call sites own writes and tunable reads; these functions are unit-testable
-//! in isolation (METRICS_SPEC §5/§6/§8).
+//! Metrics helpers shared by the MCP server (response sizing) and the lifecycle
+//! hooks (occupancy sampling), per METRICS_SPEC §5/§6/§8.
+//!
+//! Two layers live here:
+//! - **Pure calc** (`estimate_tokens`, `occupancy_pct`, `extract_last_assistant_usage`,
+//!   `hook_event_for`, `now_rfc3339`) — no DB/env access, unit-testable in isolation.
+//! - **Best-effort sinks** (`account_mcp_response`, `record_occupancy_sample`) — take a
+//!   `&Database` and write metric rows. They never propagate DB errors (logged via
+//!   `tracing::warn!`) so a metrics failure cannot break MCP transport or a hook.
+//!   `IRONMEM_METRICS`/`IRONMEM_CONTEXT_WINDOW` gating is read fresh by the callers
+//!   (`search::tunables`), not here.
 
 /// Token usage extracted from a transcript's last assistant message.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -90,9 +97,10 @@ use crate::db::metrics::{NewOccupancySample, NewTokenUsage, SessionSummary};
 use crate::db::schema::Database;
 
 /// Record one MCP response's size (METRICS_SPEC §5.1, Decisions D1/D2/D2b/D6).
-/// Always inserts a diagnostic `token_usage` row; accumulates
-/// `session_summary.mcp_chars_served` via read-modify-write only when a
-/// session id is known. Best-effort: all DB errors are logged, never returned.
+/// Always inserts a diagnostic `token_usage` row; atomically accumulates
+/// `session_summary.mcp_chars_served` (engine-side, race-free across the
+/// MCP-server and hook processes) when a session id is known. Best-effort: all
+/// DB errors are logged, never returned.
 pub(crate) fn account_mcp_response(
     db: &Database,
     chars: i64,
@@ -121,30 +129,23 @@ pub(crate) fn account_mcp_response(
     }
 
     let Some(sid) = session_id else { return };
-    let merged = match db.get_session_summary(sid) {
-        Ok(Some(mut s)) => {
-            s.mcp_chars_served += chars;
-            s
-        }
-        Ok(None) => SessionSummary {
-            session_id: sid.to_string(),
-            harness: harness.to_string(),
-            workspace_root: None,
-            started_at: None,
-            ended_at: None,
-            peak_occupancy_pct: None,
-            total_input_tokens: 0,
-            total_output_tokens: 0,
-            mcp_chars_served: chars,
-            compactions: 0,
-        },
-        Err(e) => {
-            tracing::warn!("metrics: get_session_summary failed: {e}");
-            return;
-        }
+    // Delta carries ONLY this writer's mcp_chars_served increment; every other
+    // column is identity (0 / None) so the atomic upsert leaves hook-owned
+    // fields untouched.
+    let delta = SessionSummary {
+        session_id: sid.to_string(),
+        harness: harness.to_string(),
+        workspace_root: None,
+        started_at: None,
+        ended_at: None,
+        peak_occupancy_pct: None,
+        total_input_tokens: 0,
+        total_output_tokens: 0,
+        mcp_chars_served: chars,
+        compactions: 0,
     };
-    if let Err(e) = db.upsert_session_summary(&merged) {
-        tracing::warn!("metrics: upsert mcp_chars_served failed: {e}");
+    if let Err(e) = db.accumulate_session_summary(&delta) {
+        tracing::warn!("metrics: accumulate mcp_chars_served failed: {e}");
     }
 }
 
@@ -174,8 +175,11 @@ pub(crate) fn record_occupancy_sample(
 ) {
     let u = usage.unwrap_or_default();
     let occ = occupancy_pct(u.input_tokens, u.cache_read_input_tokens, window);
+    // One clock read for the whole logical event so the sample row and the
+    // summary's started_at/ended_at can never drift apart.
+    let ts = now_rfc3339();
     let sample = NewOccupancySample {
-        ts: now_rfc3339(),
+        ts: ts.clone(),
         harness: harness.to_string(),
         session_id: Some(session_id.to_string()),
         workspace_root: workspace_root.map(|s| s.to_string()),
@@ -189,46 +193,26 @@ pub(crate) fn record_occupancy_sample(
         tracing::warn!("metrics: insert occupancy_sample failed: {e}");
     }
 
-    // RMW summary: preserve mcp_chars_served (hook → MCP direction).
-    let mut s = match db.get_session_summary(session_id) {
-        Ok(Some(s)) => s,
-        Ok(None) => SessionSummary {
-            session_id: session_id.to_string(),
-            harness: harness.to_string(),
-            workspace_root: workspace_root.map(|s| s.to_string()),
-            started_at: None,
-            ended_at: None,
-            peak_occupancy_pct: None,
-            total_input_tokens: 0,
-            total_output_tokens: 0,
-            mcp_chars_served: 0,
-            compactions: 0,
+    // Atomic engine-side merge (preserves mcp_chars_served written by the MCP
+    // process; additive fields carry only this event's increment).
+    let delta = SessionSummary {
+        session_id: session_id.to_string(),
+        harness: harness.to_string(),
+        workspace_root: workspace_root.map(|s| s.to_string()),
+        started_at: Some(ts.clone()),
+        ended_at: if hook_event == "session-stop" {
+            Some(ts)
+        } else {
+            None
         },
-        Err(e) => {
-            tracing::warn!("metrics: get_session_summary failed: {e}");
-            return;
-        }
+        peak_occupancy_pct: occ,
+        total_input_tokens: u.input_tokens,
+        total_output_tokens: u.output_tokens,
+        mcp_chars_served: 0,
+        compactions: if hook_event == "precompact" { 1 } else { 0 },
     };
-    let ts = now_rfc3339();
-    if s.started_at.is_none() {
-        s.started_at = Some(ts.clone());
-    }
-    if hook_event == "session-stop" {
-        s.ended_at = Some(ts);
-    }
-    if hook_event == "precompact" {
-        s.compactions += 1;
-    }
-    s.total_input_tokens += u.input_tokens;
-    s.total_output_tokens += u.output_tokens;
-    if let Some(o) = occ {
-        s.peak_occupancy_pct = Some(s.peak_occupancy_pct.map_or(o, |p| p.max(o)));
-    }
-    if workspace_root.is_some() {
-        s.workspace_root = workspace_root.map(|w| w.to_string());
-    }
-    if let Err(e) = db.upsert_session_summary(&s) {
-        tracing::warn!("metrics: upsert occupancy summary failed: {e}");
+    if let Err(e) = db.accumulate_session_summary(&delta) {
+        tracing::warn!("metrics: accumulate occupancy summary failed: {e}");
     }
 }
 

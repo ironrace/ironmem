@@ -381,6 +381,53 @@ impl Database {
         Ok(())
     }
 
+    /// Atomically merge a `session_summary` delta in a single statement, so the
+    /// MCP-server process and the hook process can co-key the same row without a
+    /// cross-process read-modify-write race (a get→mutate→clobber sequence on
+    /// separate connections silently drops one writer's increment under WAL).
+    ///
+    /// The `delta` carries each caller's OWN increment: additive columns
+    /// (`mcp_chars_served`, `total_input_tokens`, `total_output_tokens`,
+    /// `compactions`) are summed engine-side; `peak_occupancy_pct` takes the
+    /// running max; `started_at` is set-once (earliest wins via COALESCE);
+    /// `ended_at` takes the newest non-null; `harness` takes the latest;
+    /// `workspace_root` keeps the latest non-null.
+    pub fn accumulate_session_summary(&self, delta: &SessionSummary) -> Result<(), MemoryError> {
+        self.conn.execute(
+            "INSERT INTO session_summary (
+                session_id, harness, workspace_root, started_at, ended_at,
+                peak_occupancy_pct, total_input_tokens, total_output_tokens,
+                mcp_chars_served, compactions
+            ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)
+            ON CONFLICT(session_id) DO UPDATE SET
+                harness             = excluded.harness,
+                workspace_root      = COALESCE(excluded.workspace_root, session_summary.workspace_root),
+                started_at          = COALESCE(session_summary.started_at, excluded.started_at),
+                ended_at            = COALESCE(excluded.ended_at, session_summary.ended_at),
+                peak_occupancy_pct  = MAX(
+                                        COALESCE(session_summary.peak_occupancy_pct, excluded.peak_occupancy_pct),
+                                        COALESCE(excluded.peak_occupancy_pct, session_summary.peak_occupancy_pct)
+                                      ),
+                total_input_tokens  = session_summary.total_input_tokens  + excluded.total_input_tokens,
+                total_output_tokens = session_summary.total_output_tokens + excluded.total_output_tokens,
+                mcp_chars_served    = session_summary.mcp_chars_served     + excluded.mcp_chars_served,
+                compactions         = session_summary.compactions         + excluded.compactions",
+            params![
+                delta.session_id,
+                delta.harness,
+                delta.workspace_root,
+                delta.started_at,
+                delta.ended_at,
+                delta.peak_occupancy_pct,
+                delta.total_input_tokens,
+                delta.total_output_tokens,
+                delta.mcp_chars_served,
+                delta.compactions,
+            ],
+        )?;
+        Ok(())
+    }
+
     /// Fetch a `session_summary` by `session_id`. Returns `None` if not found.
     pub fn get_session_summary(
         &self,
