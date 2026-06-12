@@ -97,11 +97,14 @@ pub fn sanitize_harness(value: &str) -> String {
     }
 }
 
-/// Sanitize a session ID to prevent path traversal.
+/// Sanitize a session ID to prevent path traversal. Bounded to 128 chars so an
+/// attacker-controlled `sessionId` (e.g. from MCP `initialize`) cannot become an
+/// unbounded primary key in `session_summary` / `token_usage` / `occupancy_samples`.
 pub fn sanitize_session_id(session_id: &str) -> String {
     let sanitized: String = session_id
         .chars()
         .filter(|c| c.is_alphanumeric() || *c == '_' || *c == '-')
+        .take(128)
         .collect();
 
     if sanitized.is_empty() {
@@ -195,6 +198,15 @@ mod tests {
         assert_eq!(sanitize_session_id("abc-123_def"), "abc-123_def");
         assert_eq!(sanitize_session_id("../../../etc"), "etc");
         assert_eq!(sanitize_session_id(""), "unknown");
+    }
+
+    #[test]
+    fn test_sanitize_session_id_caps_length() {
+        let long = "a".repeat(10_000);
+        assert_eq!(sanitize_session_id(&long).len(), 128);
+        // A normal UUID-length id is untouched.
+        let uuid = "a6dc3420-1ee6-49b8-b5c4-e8f8d15f5139";
+        assert_eq!(sanitize_session_id(uuid), uuid);
     }
 
     #[test]

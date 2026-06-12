@@ -17,6 +17,7 @@ What works now:
 - Restricted vs trusted access modes
 - `mine` for workspace ingestion with incremental updates
 - `hook` for session-start, stop, and precompact
+- `metrics` — pure calc helpers + best-effort DB sinks shared by MCP response sizing and hook occupancy sampling (see `docs/METRICS_SPEC.md`)
 - Codex plugin packaging
 - Automatic migrate-or-init bootstrap on first use
 - Stale `bootstrap.lock` files from crashed processes are auto-cleared on next startup

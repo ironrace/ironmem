@@ -43,6 +43,13 @@ pub struct App {
     pub memory_ready: Arc<AtomicBool>,
     /// Guards the one-time HNSW rebuild triggered when memory_ready transitions to true.
     memory_ready_rebuilt: AtomicBool,
+    /// Harness session id learned from the MCP `initialize` request (or the
+    /// `IRONMEM_SESSION_ID` env), set once. Used to co-key `mcp_chars_served`
+    /// with the hook's `session_summary` row (METRICS_SPEC §5.3, Decision D1).
+    pub session_id: RwLock<Option<String>>,
+    /// Metrics harness attribution learned from MCP `initialize.clientInfo`
+    /// (or `IRONMEM_HARNESS`), set once. Stored as the DB enum value.
+    pub harness: RwLock<Option<String>>,
 }
 
 impl App {
@@ -102,6 +109,8 @@ impl App {
             graph_cache: RwLock::new(None),
             memory_ready: Arc::new(AtomicBool::new(true)),
             memory_ready_rebuilt: AtomicBool::new(true),
+            session_id: RwLock::new(std::env::var("IRONMEM_SESSION_ID").ok()),
+            harness: RwLock::new(env_metrics_harness()),
         })
     }
 
@@ -134,7 +143,58 @@ impl App {
             graph_cache: RwLock::new(None),
             memory_ready: Arc::new(AtomicBool::new(false)),
             memory_ready_rebuilt: AtomicBool::new(false),
+            session_id: RwLock::new(std::env::var("IRONMEM_SESSION_ID").ok()),
+            harness: RwLock::new(env_metrics_harness()),
         })
+    }
+
+    /// Learn metrics context from the MCP `initialize` params.
+    pub fn learn_metrics_context(&self, params: &serde_json::Value) {
+        self.learn_session_id(params);
+        self.learn_harness(params);
+    }
+
+    /// Learn the harness session id once, from the MCP `initialize` params.
+    /// Probes common locations clients may use; falls back to the env-seeded
+    /// value. Never overwrites a value already set (set-once).
+    fn learn_session_id(&self, params: &serde_json::Value) {
+        let mut guard = self.session_id.write().expect("session_id lock poisoned");
+        if guard.is_some() {
+            return;
+        }
+        let found = params
+            .get("sessionId")
+            .or_else(|| params.get("session_id"))
+            .or_else(|| params.get("_meta").and_then(|m| m.get("sessionId")))
+            .or_else(|| params.get("_meta").and_then(|m| m.get("session_id")))
+            .and_then(|v| v.as_str())
+            .and_then(normalize_session_id);
+        if found.is_some() {
+            *guard = found;
+        }
+    }
+
+    fn learn_harness(&self, params: &serde_json::Value) {
+        let mut guard = self.harness.write().expect("harness lock poisoned");
+        if guard.is_some() {
+            return;
+        }
+        if let Some(harness) = harness_from_client_info(params) {
+            *guard = Some(harness);
+        }
+    }
+
+    /// Snapshot of the learned harness session id.
+    pub fn session_id_snapshot(&self) -> Option<String> {
+        self.session_id
+            .read()
+            .expect("session_id lock poisoned")
+            .clone()
+    }
+
+    /// Snapshot of the learned metrics harness attribution.
+    pub fn harness_snapshot(&self) -> Option<String> {
+        self.harness.read().expect("harness lock poisoned").clone()
     }
 
     /// Returns true while background memory init is still in progress.
@@ -187,6 +247,8 @@ impl App {
             graph_cache: RwLock::new(None),
             memory_ready: Arc::new(AtomicBool::new(true)),
             memory_ready_rebuilt: AtomicBool::new(true),
+            session_id: RwLock::new(std::env::var("IRONMEM_SESSION_ID").ok()),
+            harness: RwLock::new(env_metrics_harness()),
         })
     }
 
@@ -400,5 +462,42 @@ impl App {
         // allow concurrency, this should be replaced with a generation
         // counter to avoid clearing a dirty flag set after our DB snapshot.
         Ok(())
+    }
+}
+
+fn env_metrics_harness() -> Option<String> {
+    match std::env::var("IRONMEM_HARNESS").ok().as_deref() {
+        Some("codex") => Some("codex".to_string()),
+        Some("claude") => Some("claude".to_string()),
+        _ => None,
+    }
+}
+
+fn normalize_session_id(value: &str) -> Option<String> {
+    let sanitized = crate::sanitize::sanitize_session_id(value);
+    if sanitized == "unknown" {
+        None
+    } else {
+        Some(sanitized)
+    }
+}
+
+fn harness_from_client_info(params: &serde_json::Value) -> Option<String> {
+    let client_info = params
+        .get("clientInfo")
+        .or_else(|| params.get("client_info"))
+        .or_else(|| params.get("_meta").and_then(|m| m.get("clientInfo")))
+        .or_else(|| params.get("_meta").and_then(|m| m.get("client_info")))?;
+    let name = client_info
+        .get("name")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    if name.contains("codex") {
+        Some("codex".to_string())
+    } else if name.contains("claude") {
+        Some("claude".to_string())
+    } else {
+        None
     }
 }
