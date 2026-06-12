@@ -15,7 +15,7 @@
 
 use std::sync::Arc;
 
-use ironrace_rerank::{LlmResponse, RerankerScorer};
+use ironrace_rerank::{LlmResponse, RerankScoreError, RerankerScorer};
 
 use crate::db::ScoredDrawer;
 use crate::search::tunables;
@@ -50,7 +50,9 @@ pub fn cross_encoder_rerank(
         Ok(v) => v,
         Err(e) => {
             tracing::warn!("cross_encoder_rerank: scorer error, skipping: {e}");
-            return None;
+            return e
+                .downcast_ref::<RerankScoreError>()
+                .and_then(|e| e.llm_response.clone());
         }
     };
     if result.scores.len() != k {
@@ -59,7 +61,7 @@ pub fn cross_encoder_rerank(
             result.scores.len(),
             k
         );
-        return None;
+        return result.llm_response;
     }
 
     // Replace top-K scores in place.

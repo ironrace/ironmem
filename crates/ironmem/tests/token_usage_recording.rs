@@ -11,7 +11,7 @@
 //! fresh here. We still scope env vars within each test and never depend on
 //! cross-test ordering.
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use ironmem::db::metrics::TokenUsageQuery;
 use ironmem::mcp::app::App;
@@ -58,10 +58,15 @@ const CONVERSATION: &str =
 const ENVELOPE: &str =
     r#"{"type":"result","result":"photography accessories, camera flash, tripod"}"#;
 
+static PREF_ENV_LOCK: Mutex<()> = Mutex::new(());
+
 /// EXIT CRITERION — `add_drawer` with a mock LLM pref-extractor records exactly
 /// one `source="pref_extract"` token_usage row carrying the mock's usage.
 #[test]
 fn add_drawer_with_llm_pref_extractor_records_token_usage() {
+    let _guard = PREF_ENV_LOCK.lock().unwrap();
+    std::env::set_var("IRONMEM_PREF_ENRICH", "1");
+
     let mock = MockLlmClient::ok_response(LlmResponse {
         text: ENVELOPE.to_string(),
         usage: Usage {
@@ -76,9 +81,6 @@ fn add_drawer_with_llm_pref_extractor_records_token_usage() {
     });
     let extractor = Arc::new(LlmPreferenceExtractor::new(Arc::new(mock)));
     let app = App::with_pref_extractor(extractor).expect("build app with pref extractor");
-
-    // `pref_enrich_enabled()` is NOT OnceLock-cached — safe to flip per-test.
-    std::env::set_var("IRONMEM_PREF_ENRICH", "1");
 
     let added = call(
         &app,
@@ -114,6 +116,9 @@ fn add_drawer_with_llm_pref_extractor_records_token_usage() {
 /// IRONMEM_RERANK being set.
 #[test]
 fn search_with_llm_reranker_records_llm_rerank_usage() {
+    let _guard = PREF_ENV_LOCK.lock().unwrap();
+    std::env::remove_var("IRONMEM_PREF_ENRICH");
+
     // Mock reranker returns "1" (rank the single candidate first) with a real
     // usage block so the recorded row is non-estimated.
     let mock = MockLlmClient::ok_response(LlmResponse {
@@ -160,23 +165,90 @@ fn search_with_llm_reranker_records_llm_rerank_usage() {
         .db
         .query_token_usage(&TokenUsageQuery::default())
         .expect("query_token_usage");
-    assert_eq!(
-        rows.iter().filter(|r| r.source == "llm_rerank").count(),
-        1,
-        "exactly one llm_rerank row expected"
+    let rerank_rows: Vec<_> = rows.iter().filter(|r| r.source == "llm_rerank").collect();
+    assert_eq!(rerank_rows.len(), 1, "exactly one llm_rerank row expected");
+    let row = rerank_rows[0];
+    assert_eq!(row.model.as_deref(), Some("claude-haiku-4-5"));
+    assert_eq!(row.input_tokens, 800);
+    assert_eq!(row.output_tokens, 1);
+    assert!(!row.estimated);
+    assert_eq!(row.chars, 3001);
+}
+
+/// RERANK NEGATIVE — an LLM call that succeeds but returns an unparsable answer
+/// still records usage before the rerank stage gracefully falls back.
+#[test]
+fn search_records_llm_rerank_usage_when_response_is_unparseable() {
+    let _guard = PREF_ENV_LOCK.lock().unwrap();
+    std::env::remove_var("IRONMEM_PREF_ENRICH");
+
+    let mock = MockLlmClient::ok_response(LlmResponse {
+        text: "no numeric answer".to_string(),
+        usage: Usage {
+            input_tokens: 700,
+            output_tokens: 4,
+            ..Default::default()
+        },
+        cost_usd: None,
+        model: "claude-haiku-4-5".to_string(),
+        estimated: false,
+        prompt_chars: 2048,
+    });
+    let scorer: Arc<dyn ironrace_rerank::RerankerScorer> = Arc::new(LlmReranker::new(mock));
+    let app = App::with_reranker_forced(scorer).expect("build app with forced reranker");
+
+    for i in 0..15 {
+        let added = call(
+            &app,
+            "add_drawer",
+            json!({
+                "content": format!("Rust memory safety topic number {i} discussing borrow checker and ownership"),
+                "wing": "projects",
+                "room": "notes"
+            }),
+        );
+        assert_eq!(added["success"], true);
+    }
+
+    let search = call(
+        &app,
+        "search",
+        json!({ "query": "Rust memory safety", "limit": 5 }),
     );
+    assert!(
+        !search["results"].as_array().unwrap().is_empty(),
+        "search should gracefully return fallback results"
+    );
+
+    let rows = app
+        .db
+        .query_token_usage(&TokenUsageQuery::default())
+        .expect("query_token_usage");
+    let rerank_rows: Vec<_> = rows.iter().filter(|r| r.source == "llm_rerank").collect();
+    assert_eq!(
+        rerank_rows.len(),
+        1,
+        "usage row should survive parse failure"
+    );
+    let row = rerank_rows[0];
+    assert_eq!(row.model.as_deref(), Some("claude-haiku-4-5"));
+    assert_eq!(row.input_tokens, 700);
+    assert_eq!(row.output_tokens, 4);
+    assert!(!row.estimated);
+    assert_eq!(row.chars, 2048 + "no numeric answer".chars().count() as i64);
 }
 
 /// NEGATIVE — when the LLM pref call errors, `add_drawer` still succeeds and NO
 /// `pref_extract` row is recorded (failure path returns `(phrases, None)`).
 #[test]
 fn failed_llm_pref_call_records_no_row() {
+    let _guard = PREF_ENV_LOCK.lock().unwrap();
+    std::env::set_var("IRONMEM_PREF_ENRICH", "1");
+
     let extractor = Arc::new(LlmPreferenceExtractor::new(Arc::new(MockLlmClient::err(
         "boom",
     ))));
     let app = App::with_pref_extractor(extractor).expect("build app with pref extractor");
-
-    std::env::set_var("IRONMEM_PREF_ENRICH", "1");
 
     let added = call(
         &app,

@@ -70,9 +70,8 @@ impl PreferenceExtractor for LlmPreferenceExtractor {
 
 /// Pull the assistant text out of the `claude -p --output-format json` envelope:
 ///   `{"type": "result", "result": "<assistant text>", ...}`
-/// The `AnthropicApiClient` re-emits this same envelope via `wrap_anthropic_response`,
-/// so both backends share one parser. Falls back to `None` when the input isn't
-/// that envelope; caller then uses the raw stdout directly.
+/// This is now a defensive fallback for legacy/mock fixtures; current clients
+/// return bare assistant text in `LlmResponse.text`.
 fn extract_assistant_text(raw: &str) -> Option<String> {
     let v: Value = serde_json::from_str(raw).ok()?;
     if let Some(Value::String(s)) = v.get("result") {

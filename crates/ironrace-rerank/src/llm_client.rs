@@ -180,8 +180,8 @@ impl LlmClient for ClaudeCliClient {
 /// `ANTHROPIC_API_KEY` with `IRONMEM_ANTHROPIC_API_KEY` as a scoped fallback);
 /// we just hold whatever string is passed in.
 ///
-/// Response is wrapped into the same `{"result": "<text>"}` envelope produced
-/// by `claude -p --output-format json` so callers can share one parser.
+/// Responses are parsed directly into `LlmResponse`, preserving the provider's
+/// usage block for downstream token accounting.
 pub struct AnthropicApiClient {
     pub(crate) api_key: String,
     pub(crate) model: String,
@@ -229,7 +229,8 @@ fn build_anthropic_body(model: &str, max_tokens: u32, prompt: &str) -> serde_jso
 }
 
 /// Parse an Anthropic Messages API response into an `LlmResponse`. The API
-/// always reports a `usage` block, so `estimated=false`; the API carries no
+/// reports a `usage` block, so missing or malformed usage is treated as an
+/// invalid response rather than a measured zero-token call. The API carries no
 /// dollar cost, so `cost_usd=None`. `prompt_chars` is the serialized prompt
 /// length passed from `call`.
 fn parse_anthropic_response(
@@ -247,8 +248,9 @@ fn parse_anthropic_response(
 
     let usage = api_response
         .get("usage")
-        .and_then(|u| serde_json::from_value::<Usage>(u.clone()).ok())
-        .unwrap_or_default();
+        .ok_or_else(|| anyhow!("anthropic response missing usage"))?;
+    let usage = serde_json::from_value::<Usage>(usage.clone())
+        .context("anthropic response has invalid usage")?;
 
     let model = api_response
         .get("model")
@@ -441,6 +443,15 @@ mod tests {
     #[test]
     fn anthropic_parse_empty_content_array_errors() {
         let api = serde_json::json!({"content": []});
+        assert!(parse_anthropic_response(&api, "fallback", 0).is_err());
+    }
+
+    #[test]
+    fn anthropic_parse_missing_usage_errors() {
+        let api = serde_json::json!({
+            "content": [{"type": "text", "text": "5"}],
+            "model": "claude-haiku-4-5"
+        });
         assert!(parse_anthropic_response(&api, "fallback", 0).is_err());
     }
 

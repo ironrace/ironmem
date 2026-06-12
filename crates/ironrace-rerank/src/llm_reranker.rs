@@ -19,7 +19,7 @@ use anyhow::{bail, Context, Result};
 use serde_json::Value;
 
 use crate::llm_client::LlmClient;
-use crate::scorer::{RerankScoreResult, RerankerScorer};
+use crate::scorer::{RerankScoreError, RerankScoreResult, RerankerScorer};
 
 /// Pinned rerank prompt template ("pick one" / mempalace recipe).
 /// Changes require a full eval re-run.
@@ -55,7 +55,12 @@ impl<C: LlmClient> RerankerScorer for LlmReranker<C> {
             .client
             .call(&prompt)
             .context("LLM client call failed")?;
-        let chosen = parse_chosen_index(&response.text, passages.len())?;
+        let chosen = parse_chosen_index(&response.text, passages.len()).map_err(|e| {
+            RerankScoreError::with_response(
+                format!("could not convert LLM rerank response into scores: {e}"),
+                response.clone(),
+            )
+        })?;
 
         // Chosen → 0.0, others → -(i+1) so the post-rerank sort preserves
         // original order for non-chosen items.
@@ -281,7 +286,11 @@ mod tests {
     fn score_pairs_unparseable_errors() {
         let client = MockLlmClient::ok("I cannot answer");
         let r = LlmReranker::new(client);
-        assert!(r.score_pairs("q", &["a", "b"]).is_err());
+        let err = r.score_pairs("q", &["a", "b"]).unwrap_err();
+        let rerank_err = err
+            .downcast_ref::<RerankScoreError>()
+            .expect("parse failures should carry rerank response metadata");
+        assert!(rerank_err.llm_response.is_some());
     }
 
     #[test]
