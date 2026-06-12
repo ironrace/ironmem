@@ -43,6 +43,10 @@ pub struct App {
     pub memory_ready: Arc<AtomicBool>,
     /// Guards the one-time HNSW rebuild triggered when memory_ready transitions to true.
     memory_ready_rebuilt: AtomicBool,
+    /// Harness session id learned from the MCP `initialize` request (or the
+    /// `IRONMEM_SESSION_ID` env), set once. Used to co-key `mcp_chars_served`
+    /// with the hook's `session_summary` row (METRICS_SPEC §5.3, Decision D1).
+    pub session_id: RwLock<Option<String>>,
 }
 
 impl App {
@@ -102,6 +106,7 @@ impl App {
             graph_cache: RwLock::new(None),
             memory_ready: Arc::new(AtomicBool::new(true)),
             memory_ready_rebuilt: AtomicBool::new(true),
+            session_id: RwLock::new(std::env::var("IRONMEM_SESSION_ID").ok()),
         })
     }
 
@@ -134,7 +139,36 @@ impl App {
             graph_cache: RwLock::new(None),
             memory_ready: Arc::new(AtomicBool::new(false)),
             memory_ready_rebuilt: AtomicBool::new(false),
+            session_id: RwLock::new(std::env::var("IRONMEM_SESSION_ID").ok()),
         })
+    }
+
+    /// Learn the harness session id once, from the MCP `initialize` params.
+    /// Probes common locations clients may use; falls back to the env-seeded
+    /// value. Never overwrites a value already set (set-once).
+    pub fn learn_session_id(&self, params: &serde_json::Value) {
+        let mut guard = self.session_id.write().expect("session_id lock poisoned");
+        if guard.is_some() {
+            return;
+        }
+        let found = params
+            .get("sessionId")
+            .or_else(|| params.get("session_id"))
+            .or_else(|| params.get("_meta").and_then(|m| m.get("sessionId")))
+            .or_else(|| params.get("_meta").and_then(|m| m.get("session_id")))
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+        if found.is_some() {
+            *guard = found;
+        }
+    }
+
+    /// Snapshot of the learned harness session id.
+    pub fn session_id_snapshot(&self) -> Option<String> {
+        self.session_id
+            .read()
+            .expect("session_id lock poisoned")
+            .clone()
     }
 
     /// Returns true while background memory init is still in progress.
@@ -187,6 +221,7 @@ impl App {
             graph_cache: RwLock::new(None),
             memory_ready: Arc::new(AtomicBool::new(true)),
             memory_ready_rebuilt: AtomicBool::new(true),
+            session_id: RwLock::new(std::env::var("IRONMEM_SESSION_ID").ok()),
         })
     }
 

@@ -82,6 +82,70 @@ fn find_assistant_usage(value: &serde_json::Value) -> Option<Usage> {
     })
 }
 
+use crate::db::metrics::{NewTokenUsage, SessionSummary};
+use crate::db::schema::Database;
+
+/// Record one MCP response's size (METRICS_SPEC §5.1, Decisions D1/D2/D2b/D6).
+/// Always inserts a diagnostic `token_usage` row; accumulates
+/// `session_summary.mcp_chars_served` via read-modify-write only when a
+/// session id is known. Best-effort: all DB errors are logged, never returned.
+pub fn account_mcp_response(db: &Database, chars: i64, harness: &str, session_id: Option<&str>) {
+    let row = NewTokenUsage {
+        ts: now_rfc3339(),
+        source: "mcp_response".to_string(),
+        harness: harness.to_string(),
+        model: None,
+        session_id: session_id.map(|s| s.to_string()),
+        collab_session_id: None,
+        collab_phase: None,
+        task_tag: None,
+        input_tokens: 0,
+        output_tokens: estimate_tokens(chars),
+        cache_creation_input_tokens: 0,
+        cache_read_input_tokens: 0,
+        estimated: true,
+        chars,
+        cost_usd: None,
+    };
+    if let Err(e) = db.insert_token_usage(&row) {
+        tracing::warn!("metrics: insert mcp_response token_usage failed: {e}");
+    }
+
+    let Some(sid) = session_id else { return };
+    let merged = match db.get_session_summary(sid) {
+        Ok(Some(mut s)) => {
+            s.mcp_chars_served += chars;
+            s
+        }
+        Ok(None) => SessionSummary {
+            session_id: sid.to_string(),
+            harness: harness.to_string(),
+            workspace_root: None,
+            started_at: None,
+            ended_at: None,
+            peak_occupancy_pct: None,
+            total_input_tokens: 0,
+            total_output_tokens: 0,
+            mcp_chars_served: chars,
+            compactions: 0,
+        },
+        Err(e) => {
+            tracing::warn!("metrics: get_session_summary failed: {e}");
+            return;
+        }
+    };
+    if let Err(e) = db.upsert_session_summary(&merged) {
+        tracing::warn!("metrics: upsert mcp_chars_served failed: {e}");
+    }
+}
+
+/// Process-global lock serializing tests that mutate the `IRONMEM_METRICS`
+/// env var. Env vars are process-wide, so unrelated test modules that flip the
+/// kill switch (here, `search::tunables` and `mcp::server`) must share ONE lock
+/// or they clobber each other under the parallel test runner.
+#[cfg(test)]
+pub(crate) static METRICS_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 #[cfg(test)]
 mod tests {
     use super::*;

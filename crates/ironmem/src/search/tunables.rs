@@ -347,19 +347,21 @@ pub fn metrics_enabled() -> bool {
 mod tests {
     use super::*;
 
-    // Env vars are process-global; serialize these tests.
-    static METRICS_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    // Env vars are process-global; serialize against the crate-wide metrics
+    // env lock so tests in other modules that flip `IRONMEM_METRICS` (e.g.
+    // `mcp::server`) cannot clobber these.
+    use crate::metrics::METRICS_ENV_LOCK;
 
     #[test]
     fn context_window_defaults_to_200000() {
-        let _g = METRICS_ENV_LOCK.lock().unwrap();
+        let _g = METRICS_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         std::env::remove_var("IRONMEM_CONTEXT_WINDOW");
         assert_eq!(context_window(), 200_000);
     }
 
     #[test]
     fn context_window_reads_override() {
-        let _g = METRICS_ENV_LOCK.lock().unwrap();
+        let _g = METRICS_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         std::env::set_var("IRONMEM_CONTEXT_WINDOW", "1000000");
         assert_eq!(context_window(), 1_000_000);
         std::env::remove_var("IRONMEM_CONTEXT_WINDOW");
@@ -367,7 +369,7 @@ mod tests {
 
     #[test]
     fn context_window_rejects_nonpositive_and_garbage() {
-        let _g = METRICS_ENV_LOCK.lock().unwrap();
+        let _g = METRICS_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         std::env::set_var("IRONMEM_CONTEXT_WINDOW", "0");
         assert_eq!(context_window(), 200_000);
         std::env::set_var("IRONMEM_CONTEXT_WINDOW", "-5");
@@ -379,7 +381,7 @@ mod tests {
 
     #[test]
     fn metrics_enabled_defaults_true_and_honors_kill_switch() {
-        let _g = METRICS_ENV_LOCK.lock().unwrap();
+        let _g = METRICS_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         std::env::remove_var("IRONMEM_METRICS");
         assert!(metrics_enabled());
         for off in ["0", "false", "no", "off"] {
