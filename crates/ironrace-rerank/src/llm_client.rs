@@ -45,8 +45,8 @@ impl ClaudeCliClient {
 
 /// Parse `claude -p --output-format json` stdout into an `LlmResponse`.
 /// `model_fallback` is the client's configured model (used when the envelope
-/// omits `model`); `prompt_chars` is the serialized prompt length for chars/4
-/// estimation and the recorded `chars` basis.
+/// omits `model`); `prompt_chars` is the user prompt char count passed to
+/// `call` (the basis for chars/4 estimation and the recorded `chars`).
 fn parse_cli_stdout(stdout: &str, model_fallback: &str, prompt_chars: usize) -> LlmResponse {
     let parsed: Option<serde_json::Value> = serde_json::from_str(stdout).ok();
 
@@ -94,6 +94,13 @@ fn parse_cli_stdout(stdout: &str, model_fallback: &str, prompt_chars: usize) -> 
         }
         None => {
             // chars/4 fallback (ceil). input from prompt, output from text.
+            // A systemic loss of the `usage` block (e.g. a `claude` CLI
+            // output-format change) would otherwise surface only in the stored
+            // `estimated=true` column; log it so it's visible in traces too.
+            tracing::debug!(
+                prompt_chars,
+                "claude CLI response had no usage block; estimating tokens via chars/4"
+            );
             let output_chars = text.chars().count();
             let usage = Usage {
                 input_tokens: ceil_div4(prompt_chars),
@@ -231,8 +238,8 @@ fn build_anthropic_body(model: &str, max_tokens: u32, prompt: &str) -> serde_jso
 /// Parse an Anthropic Messages API response into an `LlmResponse`. The API
 /// reports a `usage` block, so missing or malformed usage is treated as an
 /// invalid response rather than a measured zero-token call. The API carries no
-/// dollar cost, so `cost_usd=None`. `prompt_chars` is the serialized prompt
-/// length passed from `call`.
+/// dollar cost, so `cost_usd=None`. `prompt_chars` is the user prompt char
+/// count passed from `call`.
 fn parse_anthropic_response(
     api_response: &serde_json::Value,
     model_fallback: &str,

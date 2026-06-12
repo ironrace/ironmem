@@ -130,7 +130,12 @@ fn build_synthetic(
             chrono::Utc::now().to_rfc3339(),
         );
         if let Err(e) = app.db.insert_token_usage(&row) {
-            tracing::warn!(error = %e, "pref_extract token_usage insert failed");
+            tracing::warn!(
+                error = %e,
+                source = %row.source,
+                model = ?row.model,
+                "pref_extract token_usage insert failed"
+            );
         }
     };
 

@@ -55,7 +55,7 @@ pub struct LlmResponse {
 }
 
 impl LlmResponse {
-    /// Total chars involved in the call: serialized prompt + assistant text.
+    /// Total chars involved in the call: prompt chars + assistant text chars.
     /// Recorded into `token_usage.chars` as the estimation/diagnostic basis.
     pub fn chars(&self) -> usize {
         self.prompt_chars + self.text.chars().count()

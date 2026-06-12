@@ -334,7 +334,12 @@ pub fn search(
                     chrono::Utc::now().to_rfc3339(),
                 );
                 if let Err(e) = app.db.insert_token_usage(&row) {
-                    tracing::warn!(error = %e, "llm_rerank token_usage insert failed");
+                    tracing::warn!(
+                        error = %e,
+                        source = %row.source,
+                        model = ?row.model,
+                        "llm_rerank token_usage insert failed"
+                    );
                 }
             }
         }
