@@ -82,7 +82,7 @@ fn find_assistant_usage(value: &serde_json::Value) -> Option<Usage> {
     })
 }
 
-use crate::db::metrics::{NewTokenUsage, SessionSummary};
+use crate::db::metrics::{NewOccupancySample, NewTokenUsage, SessionSummary};
 use crate::db::schema::Database;
 
 /// Record one MCP response's size (METRICS_SPEC §5.1, Decisions D1/D2/D2b/D6).
@@ -136,6 +136,90 @@ pub fn account_mcp_response(db: &Database, chars: i64, harness: &str, session_id
     };
     if let Err(e) = db.upsert_session_summary(&merged) {
         tracing::warn!("metrics: upsert mcp_chars_served failed: {e}");
+    }
+}
+
+/// Map a hook CLI name to the `occupancy_samples.hook_event` enum value
+/// (METRICS_SPEC §5.2 / §8.2). `stop` → `session-stop` (CHECK-constraint safe).
+pub fn hook_event_for(hook_name: &str) -> Option<&'static str> {
+    match hook_name {
+        "session-start" => Some("session-start"),
+        "stop" => Some("session-stop"),
+        "precompact" => Some("precompact"),
+        _ => None,
+    }
+}
+
+/// Record one occupancy sample + merge the session summary (Decisions D4/D5/D6).
+/// Best-effort. Caller guarantees `session_id` is `Some` (absent-id is skipped
+/// by the caller per D4). `usage` is `None` when the transcript had no usable
+/// assistant usage → a deterministic zero-token sample is still written.
+pub fn record_occupancy_sample(
+    db: &Database,
+    harness: &str,
+    session_id: &str,
+    workspace_root: Option<&str>,
+    hook_event: &str,
+    usage: Option<Usage>,
+    window: i64,
+) {
+    let u = usage.unwrap_or_default();
+    let occ = occupancy_pct(u.input_tokens, u.cache_read_input_tokens, window);
+    let sample = NewOccupancySample {
+        ts: now_rfc3339(),
+        harness: harness.to_string(),
+        session_id: Some(session_id.to_string()),
+        workspace_root: workspace_root.map(|s| s.to_string()),
+        hook_event: Some(hook_event.to_string()),
+        input_tokens: u.input_tokens,
+        cache_read_input_tokens: u.cache_read_input_tokens,
+        context_window: window,
+        occupancy_pct: occ,
+    };
+    if let Err(e) = db.insert_occupancy_sample(&sample) {
+        tracing::warn!("metrics: insert occupancy_sample failed: {e}");
+    }
+
+    // RMW summary: preserve mcp_chars_served (hook → MCP direction).
+    let mut s = match db.get_session_summary(session_id) {
+        Ok(Some(s)) => s,
+        Ok(None) => SessionSummary {
+            session_id: session_id.to_string(),
+            harness: harness.to_string(),
+            workspace_root: workspace_root.map(|s| s.to_string()),
+            started_at: None,
+            ended_at: None,
+            peak_occupancy_pct: None,
+            total_input_tokens: 0,
+            total_output_tokens: 0,
+            mcp_chars_served: 0,
+            compactions: 0,
+        },
+        Err(e) => {
+            tracing::warn!("metrics: get_session_summary failed: {e}");
+            return;
+        }
+    };
+    let ts = now_rfc3339();
+    if s.started_at.is_none() {
+        s.started_at = Some(ts.clone());
+    }
+    if hook_event == "session-stop" {
+        s.ended_at = Some(ts);
+    }
+    if hook_event == "precompact" {
+        s.compactions += 1;
+    }
+    s.total_input_tokens += u.input_tokens;
+    s.total_output_tokens += u.output_tokens;
+    if let Some(o) = occ {
+        s.peak_occupancy_pct = Some(s.peak_occupancy_pct.map_or(o, |p| p.max(o)));
+    }
+    if workspace_root.is_some() {
+        s.workspace_root = workspace_root.map(|w| w.to_string());
+    }
+    if let Err(e) = db.upsert_session_summary(&s) {
+        tracing::warn!("metrics: upsert occupancy summary failed: {e}");
     }
 }
 

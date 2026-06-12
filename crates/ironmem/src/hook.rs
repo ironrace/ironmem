@@ -61,6 +61,16 @@ fn run_hook_with_input(
     let session_id = parse_session_id(&input);
     let app = App::new(config)?;
     let allows_writes = app.config.mcp_access_mode.allows_writes();
+    if crate::search::tunables::metrics_enabled() && allows_writes {
+        sample_occupancy(
+            &app,
+            hook_name,
+            harness,
+            session_id.as_deref(),
+            workspace_root.as_deref(),
+            transcript_path.as_deref(),
+        );
+    }
     let bootstrap_workspace = if allows_writes {
         workspace_root.as_deref()
     } else {
@@ -113,6 +123,41 @@ fn run_hook_with_input(
     }
 
     Ok(response)
+}
+
+fn sample_occupancy(
+    app: &App,
+    hook_name: &str,
+    harness: &str,
+    session_id: Option<&str>,
+    workspace_root: Option<&Path>,
+    transcript_path: Option<&Path>,
+) {
+    let Some(event) = crate::metrics::hook_event_for(hook_name) else {
+        return; // unsupported hook → no sample
+    };
+    let Some(session_id) = session_id else {
+        return; // D4: absent session id → skip (never create an empty key)
+    };
+    // CHECK constraint: occupancy_samples.harness ∈ {claude, codex}.
+    let harness_norm = if harness.starts_with("codex") {
+        "codex"
+    } else {
+        "claude"
+    };
+    let usage = transcript_path
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .and_then(|raw| crate::metrics::extract_last_assistant_usage(&raw));
+    let workspace = workspace_root.map(|p| p.to_string_lossy().to_string());
+    crate::metrics::record_occupancy_sample(
+        &app.db,
+        harness_norm,
+        session_id,
+        workspace.as_deref(),
+        event,
+        usage,
+        crate::search::tunables::context_window(),
+    );
 }
 
 fn persist_diary_summary(app: &App, content: &str) -> Result<(), MemoryError> {
@@ -674,6 +719,161 @@ mod tests {
         let mut candidates = Vec::new();
         collect_assistant_texts(&value, &mut candidates);
         assert_eq!(candidates.len(), 1);
+    }
+
+    #[test]
+    fn precompact_writes_occupancy_sample_and_increments_compactions() {
+        let _env = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let _metrics = crate::metrics::METRICS_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        std::env::remove_var("IRONMEM_METRICS");
+        std::env::set_var("IRONMEM_DISABLE_MIGRATION", "1");
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(temp.path().join("workspace")).unwrap();
+        let transcript = temp.path().join("t.jsonl");
+        std::fs::write(
+            &transcript,
+            concat!(
+                r#"{"type":"assistant","message":{"usage":{"input_tokens":120000,"output_tokens":800,"cache_read_input_tokens":40000}}}"#,
+                "\n",
+                r#"{"type":"user","message":{"content":"next"}}"#,
+                "\n",
+            ),
+        )
+        .unwrap();
+        let config = Config {
+            db_path: temp.path().join("memory.sqlite3"),
+            model_dir: temp.path().join("model"),
+            model_dir_explicit: true,
+            state_dir: temp.path().join("hook_state"),
+            mcp_access_mode: McpAccessMode::Trusted,
+            embed_mode: EmbedMode::Noop,
+        };
+        {
+            let app = App::new(config.clone()).unwrap();
+            let s = crate::db::metrics::SessionSummary {
+                session_id: "sess-occ".to_string(),
+                harness: "claude".to_string(),
+                workspace_root: None,
+                started_at: Some("2026-06-11T00:00:00Z".to_string()),
+                ended_at: None,
+                peak_occupancy_pct: None,
+                total_input_tokens: 0,
+                total_output_tokens: 0,
+                mcp_chars_served: 999,
+                compactions: 0,
+            };
+            app.db.upsert_session_summary(&s).unwrap();
+        }
+        run_hook_with_input(
+            "precompact",
+            "claude",
+            config.clone(),
+            serde_json::json!({
+                "cwd": temp.path().join("workspace"),
+                "session_id": "sess-occ",
+                "transcript_path": transcript.to_string_lossy(),
+            }),
+        )
+        .unwrap();
+        let app = App::new(config).unwrap();
+        let samples = app
+            .db
+            .occupancy_samples_for_session("sess-occ", 10)
+            .unwrap();
+        assert_eq!(samples.len(), 1);
+        assert_eq!(samples[0].hook_event.as_deref(), Some("precompact"));
+        assert_eq!(samples[0].input_tokens, 120000);
+        assert_eq!(samples[0].cache_read_input_tokens, 40000);
+        assert_eq!(samples[0].context_window, 200000);
+        assert!((samples[0].occupancy_pct.unwrap() - 0.8).abs() < 1e-9);
+        let s = app.db.get_session_summary("sess-occ").unwrap().unwrap();
+        assert_eq!(s.compactions, 1);
+        assert_eq!(s.mcp_chars_served, 999, "RMW preserved mcp_chars_served");
+        assert!((s.peak_occupancy_pct.unwrap() - 0.8).abs() < 1e-9);
+        std::env::remove_var("IRONMEM_DISABLE_MIGRATION");
+    }
+
+    #[test]
+    fn missing_usage_writes_zero_token_sample_when_session_present() {
+        let _env = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let _metrics = crate::metrics::METRICS_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        std::env::remove_var("IRONMEM_METRICS");
+        std::env::set_var("IRONMEM_DISABLE_MIGRATION", "1");
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(temp.path().join("workspace")).unwrap();
+        let config = Config {
+            db_path: temp.path().join("memory.sqlite3"),
+            model_dir: temp.path().join("model"),
+            model_dir_explicit: true,
+            state_dir: temp.path().join("hook_state"),
+            mcp_access_mode: McpAccessMode::Trusted,
+            embed_mode: EmbedMode::Noop,
+        };
+        run_hook_with_input(
+            "session-start",
+            "claude",
+            config.clone(),
+            serde_json::json!({
+                "cwd": temp.path().join("workspace"),
+                "session_id": "sess-empty",
+                "transcript_path": "/nonexistent/path.jsonl",
+            }),
+        )
+        .unwrap();
+        let app = App::new(config).unwrap();
+        let samples = app
+            .db
+            .occupancy_samples_for_session("sess-empty", 10)
+            .unwrap();
+        assert_eq!(samples.len(), 1, "deterministic zero-token sample (D4)");
+        assert_eq!(samples[0].input_tokens, 0);
+        assert_eq!(samples[0].hook_event.as_deref(), Some("session-start"));
+        std::env::remove_var("IRONMEM_DISABLE_MIGRATION");
+    }
+
+    #[test]
+    fn kill_switch_suppresses_occupancy() {
+        let _env = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let _metrics = crate::metrics::METRICS_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("IRONMEM_METRICS", "0");
+        std::env::set_var("IRONMEM_DISABLE_MIGRATION", "1");
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(temp.path().join("workspace")).unwrap();
+        let config = Config {
+            db_path: temp.path().join("memory.sqlite3"),
+            model_dir: temp.path().join("model"),
+            model_dir_explicit: true,
+            state_dir: temp.path().join("hook_state"),
+            mcp_access_mode: McpAccessMode::Trusted,
+            embed_mode: EmbedMode::Noop,
+        };
+        run_hook_with_input(
+            "precompact",
+            "claude",
+            config.clone(),
+            serde_json::json!({
+                "cwd": temp.path().join("workspace"),
+                "session_id": "sess-off",
+                "transcript_path": "/nonexistent.jsonl",
+            }),
+        )
+        .unwrap();
+        let app = App::new(config).unwrap();
+        assert_eq!(
+            app.db
+                .occupancy_samples_for_session("sess-off", 10)
+                .unwrap()
+                .len(),
+            0
+        );
+        std::env::remove_var("IRONMEM_METRICS");
+        std::env::remove_var("IRONMEM_DISABLE_MIGRATION");
     }
 
     #[test]
