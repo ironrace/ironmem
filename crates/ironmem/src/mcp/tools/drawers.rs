@@ -121,32 +121,50 @@ fn build_synthetic(
     if !looks_conversational(content) {
         return Ok(None);
     }
-    let phrases: Vec<String> = match crate::search::tunables::pref_extractor() {
-        "llm" => {
-            let timeout = Duration::from_millis(crate::search::tunables::pref_llm_timeout_ms());
-            let model = crate::search::tunables::pref_llm_model();
-            let extractor = match crate::search::tunables::pref_llm_backend() {
-                "api" => crate::search::pref_extract_llm::api_extractor(
-                    model,
-                    crate::search::tunables::pref_llm_max_tokens(),
-                    timeout,
-                ),
-                _ => crate::search::pref_extract_llm::cli_extractor(model, timeout),
-            };
-            let (phrases, response) = extractor.extract_with_response(content);
-            if let Some(resp) = response {
-                let row = crate::db::metrics::new_token_usage_from_llm(
-                    "pref_extract",
-                    &resp,
-                    chrono::Utc::now().to_rfc3339(),
-                );
-                if let Err(e) = app.db.insert_token_usage(&row) {
-                    tracing::warn!(error = %e, "pref_extract token_usage insert failed");
-                }
-            }
-            phrases
+    // Record a `pref_extract` token_usage row from an LLM response (non-fatal:
+    // a failed insert logs at warn and is dropped — pref-enrich is best-effort).
+    let record_pref_usage = |resp: &ironrace_rerank::LlmResponse| {
+        let row = crate::db::metrics::new_token_usage_from_llm(
+            "pref_extract",
+            resp,
+            chrono::Utc::now().to_rfc3339(),
+        );
+        if let Err(e) = app.db.insert_token_usage(&row) {
+            tracing::warn!(error = %e, "pref_extract token_usage insert failed");
         }
-        _ => RegexPreferenceExtractor.extract(content),
+    };
+
+    // Test-only seam: a concrete `LlmPreferenceExtractor` override bypasses the
+    // OnceLock-cached tunable selection so the usage path is deterministic.
+    let override_extractor = app.pref_extractor_override.read().unwrap().clone();
+
+    let phrases: Vec<String> = if let Some(extractor) = override_extractor {
+        let (phrases, response) = extractor.extract_with_response(content);
+        if let Some(resp) = response {
+            record_pref_usage(&resp);
+        }
+        phrases
+    } else {
+        match crate::search::tunables::pref_extractor() {
+            "llm" => {
+                let timeout = Duration::from_millis(crate::search::tunables::pref_llm_timeout_ms());
+                let model = crate::search::tunables::pref_llm_model();
+                let extractor = match crate::search::tunables::pref_llm_backend() {
+                    "api" => crate::search::pref_extract_llm::api_extractor(
+                        model,
+                        crate::search::tunables::pref_llm_max_tokens(),
+                        timeout,
+                    ),
+                    _ => crate::search::pref_extract_llm::cli_extractor(model, timeout),
+                };
+                let (phrases, response) = extractor.extract_with_response(content);
+                if let Some(resp) = response {
+                    record_pref_usage(&resp);
+                }
+                phrases
+            }
+            _ => RegexPreferenceExtractor.extract(content),
+        }
     };
     let synth_body = match synthesize_doc(&phrases) {
         Some(s) => s,

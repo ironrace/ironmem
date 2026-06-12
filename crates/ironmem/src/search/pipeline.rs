@@ -317,8 +317,9 @@ pub fn search(
         shrinkage_rerank(&mut scored, &rerank_signals);
     }
 
-    // Step 9: Optional LLM rerank.
-    if tunables::rerank_enabled() {
+    // Step 9: Optional LLM rerank. `force_rerank` is a test-only seam that runs
+    // the stage even when the OnceLock-cached `IRONMEM_RERANK` gate is unset.
+    if tunables::rerank_enabled() || app.force_rerank {
         app.ensure_reranker_loaded();
         if let Some(scorer) = app.reranker.read().unwrap().clone() {
             let llm_response = crate::search::llm_rerank::cross_encoder_rerank(
@@ -348,7 +349,7 @@ pub fn search(
     // items. `llm_rerank::cross_encoder_rerank` already sorts [..rerank_top_k]
     // correctly, and the tail [rerank_top_k..] retains its pre-rerank order,
     // so the current ordering is already what we want.
-    if !tunables::rerank_enabled() {
+    if !(tunables::rerank_enabled() || app.force_rerank) {
         scored.sort_by(|a, b| {
             b.score
                 .partial_cmp(&a.score)

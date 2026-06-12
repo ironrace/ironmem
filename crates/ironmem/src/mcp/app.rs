@@ -24,6 +24,15 @@ pub struct App {
     pub db: Database,
     pub embedder: RwLock<Embedder>,
     pub(crate) reranker: RwLock<Option<Arc<dyn ironrace_rerank::RerankerScorer>>>,
+    /// Test-only — installs a concrete `LlmPreferenceExtractor` that bypasses
+    /// the OnceLock-cached `tunables::pref_extractor()` selection so the
+    /// pref-extract usage path is exercisable deterministically. `None` in
+    /// production; `build_synthetic` consults the tunable when this is unset.
+    pub(crate) pref_extractor_override:
+        RwLock<Option<Arc<crate::search::pref_extract_llm::LlmPreferenceExtractor>>>,
+    /// Test-only: force the rerank stage even when `IRONMEM_RERANK` is unset
+    /// (the env gate is OnceLock-cached and can't be flipped per-test).
+    pub(crate) force_rerank: bool,
     pub index_state: RwLock<IndexState>,
     /// Dirty flag: set after writes, cleared after rebuild.
     dirty: AtomicBool,
@@ -86,6 +95,8 @@ impl App {
             db,
             embedder: RwLock::new(embedder),
             reranker: RwLock::new(None),
+            pref_extractor_override: RwLock::new(None),
+            force_rerank: false,
             index_state: RwLock::new(IndexState { index, id_map }),
             dirty: AtomicBool::new(false),
             graph_cache: RwLock::new(None),
@@ -113,6 +124,8 @@ impl App {
             db,
             embedder: RwLock::new(Embedder::new_noop()),
             reranker: RwLock::new(None),
+            pref_extractor_override: RwLock::new(None),
+            force_rerank: false,
             index_state: RwLock::new(IndexState {
                 index: VectorIndex::build(&[], 100),
                 id_map: Vec::new(),
@@ -164,6 +177,8 @@ impl App {
             db,
             embedder: RwLock::new(embedder),
             reranker: RwLock::new(None),
+            pref_extractor_override: RwLock::new(None),
+            force_rerank: false,
             index_state: RwLock::new(IndexState {
                 index: VectorIndex::build(&[], 100),
                 id_map: Vec::new(),
@@ -302,6 +317,33 @@ impl App {
     ) -> Result<Self, MemoryError> {
         let app = Self::open_for_test()?;
         *app.reranker.write().unwrap() = Some(scorer);
+        Ok(app)
+    }
+
+    /// Test-only — like `with_reranker` but also sets `force_rerank` so the
+    /// rerank stage runs even when the OnceLock-cached `IRONMEM_RERANK` gate is
+    /// unset. Kept separate from `with_reranker` so callers that install a
+    /// scorer purely to assert the env gate keeps it dormant (e.g. the
+    /// rerank-disabled passthrough test) are unaffected.
+    pub fn with_reranker_forced(
+        scorer: Arc<dyn ironrace_rerank::RerankerScorer>,
+    ) -> Result<Self, MemoryError> {
+        let mut app = Self::open_for_test()?;
+        app.force_rerank = true;
+        *app.reranker.write().unwrap() = Some(scorer);
+        Ok(app)
+    }
+
+    /// Test-only — install a concrete `LlmPreferenceExtractor` that bypasses
+    /// the OnceLock-cached `tunables::pref_extractor()` selection so the
+    /// pref-extract usage path is exercisable deterministically. Mirrors
+    /// `with_reranker`: builds the base test `App` (in-memory DB, noop
+    /// embedder) and installs the override.
+    pub fn with_pref_extractor(
+        extractor: Arc<crate::search::pref_extract_llm::LlmPreferenceExtractor>,
+    ) -> Result<Self, MemoryError> {
+        let app = Self::open_for_test()?;
+        *app.pref_extractor_override.write().unwrap() = Some(extractor);
         Ok(app)
     }
 
