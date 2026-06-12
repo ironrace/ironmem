@@ -71,6 +71,21 @@ pub fn new_token_usage_from_llm(
     }
 }
 
+impl NewTokenUsage {
+    /// Return a copy stamped with the resolved attribution context
+    /// (METRICS_SPEC §2.3/§3). Consuming builder: callers chain it after
+    /// construction; unset context fields leave the row's fields unchanged.
+    #[allow(dead_code)] // wired to callers in Task 2+ (account_mcp_response, record_occupancy_sample)
+    pub(crate) fn with_context(self, ctx: &crate::metrics::MetricsContext) -> NewTokenUsage {
+        NewTokenUsage {
+            collab_session_id: ctx.collab_session_id.clone().or(self.collab_session_id),
+            collab_phase: ctx.collab_phase.clone().or(self.collab_phase),
+            task_tag: ctx.task_tag.clone().or(self.task_tag),
+            ..self
+        }
+    }
+}
+
 /// A stored `token_usage` row including its auto-assigned `id`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TokenUsage {
