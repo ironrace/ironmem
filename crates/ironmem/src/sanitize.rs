@@ -10,7 +10,10 @@ const MAX_NAME_LENGTH: usize = 128;
 static SAFE_NAME_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^[a-zA-Z0-9][a-zA-Z0-9_ .'\-]{0,126}[a-zA-Z0-9]$").unwrap());
 
-/// Validate and sanitize a wing/room/entity name.
+/// Validate and sanitize a wing/room/entity name or task tag.
+///
+/// Called for: wing names, room names, entity names, and explicit task tags
+/// set via the `status` tool's `set_task_tag` argument.
 pub fn sanitize_name(value: &str, field_name: &str) -> Result<String, MemoryError> {
     let value = value.trim();
 

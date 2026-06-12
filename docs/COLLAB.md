@@ -424,7 +424,9 @@ process for metrics attribution: <id>. End it or use a separate server process
 before switching to <requested_id>."` Remedy: call `collab_end` on the named
 session if it is finished, or run the new session from a separate server
 process. Stale or ended sessions self-clear automatically — no manual cleanup
-is needed for those.
+is needed for those. On the error `"could not verify active collab session"`,
+check the server logs for the underlying DB error detail; retry after the
+underlying issue clears.
 
 ### `collab_set_implementer`
 

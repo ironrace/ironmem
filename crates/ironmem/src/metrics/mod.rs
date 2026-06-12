@@ -96,18 +96,28 @@ impl MetricsContext {
                     };
                 }
                 Ok(_) => {
+                    // Session has ended — self-heal silently.
                     app.clear_active_collab_session();
                     return MetricsContext::default();
                 }
-                // `NotFound` is what `queue::load_session_record` returns for a
-                // missing row — matched explicitly so a new error variant never
-                // silently falls through to the warn arm.
+                // `NotFound` is what the session loader returns for a missing row —
+                // matched explicitly so only a confirmed-missing session clears the
+                // cell; any new error variant lands in the warn arm below instead of
+                // being mistaken for a missing session.
                 Err(crate::error::MemoryError::NotFound(_)) => {
+                    tracing::warn!(
+                        session_id = %sid,
+                        "metrics attribution: active collab session not found — clearing cell"
+                    );
                     app.clear_active_collab_session();
                     return MetricsContext::default();
                 }
                 Err(e) => {
-                    tracing::warn!("metrics: collab session lookup for attribution failed: {e}");
+                    tracing::warn!(
+                        session_id = %sid,
+                        error = %e,
+                        "metrics: collab session lookup for attribution failed"
+                    );
                     return MetricsContext::default();
                 }
             }

@@ -44,13 +44,35 @@ def build_hook_command(binary: str | None) -> list[str]:
     ]
 
 
+def _decode_bytes(b: bytes | None) -> str:
+    if b is None:
+        return ""
+    return b.decode("utf-8", errors="replace")
+
+
+def _safe_json_loads(line: str) -> dict:
+    """Parse a JSON line; FAIL with the offending text instead of a traceback."""
+    try:
+        return json.loads(line)
+    except json.JSONDecodeError as exc:
+        sys.stderr.write(
+            f"FAIL: could not parse server output as JSON (offset {exc.pos}): {line!r}\n"
+        )
+        sys.exit(1)
+
+
 def run_mcp_requests(
     command: list[str],
     requests: list[dict],
     env: dict[str, str],
     timeout: int,
-) -> list[dict]:
-    """Send multiple JSON-RPC requests to the server over stdio; return parsed responses."""
+    phase_label: str = "",
+) -> tuple[list[dict], str]:
+    """Send multiple JSON-RPC requests to the server over stdio.
+
+    Returns (parsed_responses, captured_stderr).
+    On timeout, prints stderr and exits.
+    """
     stdin_payload = "\n".join(json.dumps(r) for r in requests) + "\n"
     try:
         completed = subprocess.run(
@@ -62,8 +84,11 @@ def run_mcp_requests(
             timeout=timeout,
             check=False,
         )
-    except subprocess.TimeoutExpired:
-        sys.stderr.write(f"ironmem process timed out after {timeout}s\n")
+    except subprocess.TimeoutExpired as e:
+        label = f" [{phase_label}]" if phase_label else ""
+        sys.stderr.write(f"ironmem process timed out after {timeout}s{label}\n")
+        sys.stderr.write(_decode_bytes(e.stdout))
+        sys.stderr.write(_decode_bytes(e.stderr))
         sys.exit(1)
 
     if completed.returncode != 0:
@@ -71,12 +96,17 @@ def run_mcp_requests(
         sys.stderr.write(completed.stderr)
         sys.exit(completed.returncode)
 
-    responses = []
+    responses: list[dict] = []
     for line in completed.stdout.splitlines():
         line = line.strip()
         if line:
-            responses.append(json.loads(line))
-    return responses
+            responses.append(_safe_json_loads(line))
+    return responses, completed.stderr
+
+
+def _responses_by_id(responses: list[dict]) -> dict[int, dict]:
+    """Index responses by their JSON-RPC id."""
+    return {r["id"]: r for r in responses if "id" in r}
 
 
 def main() -> int:
@@ -125,59 +155,67 @@ def main() -> int:
                 },
             },
         ]
-        phase1_responses = run_mcp_requests(
-            command, phase1_requests, base_env, args.timeout
+        phase1_responses, phase1_stderr = run_mcp_requests(
+            command, phase1_requests, base_env, args.timeout, phase_label="phase-1"
         )
 
         if len(phase1_responses) < 2:
             sys.stderr.write(
                 f"FAIL: expected 2 responses, got {len(phase1_responses)}\n"
             )
+            sys.stderr.write(f"[phase-1 stderr]\n{phase1_stderr}\n")
             return 1
 
-        init_resp = phase1_responses[0]
-        collab_start_resp = phase1_responses[1]
+        by_id1 = _responses_by_id(phase1_responses)
 
-        # Validate initialize response
+        # Validate initialize response (id=1)
+        init_resp = by_id1.get(1, phase1_responses[0])
         if init_resp.get("error") is not None:
             sys.stderr.write(
                 f"FAIL: initialize returned an error: {init_resp['error']}\n"
             )
+            sys.stderr.write(f"[phase-1 stderr]\n{phase1_stderr}\n")
             return 1
         result = init_resp.get("result", {})
         if result.get("protocolVersion") != "2024-11-05":
             sys.stderr.write(
                 f"FAIL: unexpected protocolVersion: {result.get('protocolVersion')!r}\n"
             )
+            sys.stderr.write(f"[phase-1 stderr]\n{phase1_stderr}\n")
             return 1
         if result.get("serverInfo", {}).get("name") != "ironmem":
             sys.stderr.write(
                 f"FAIL: unexpected server name: {result.get('serverInfo')!r}\n"
             )
+            sys.stderr.write(f"[phase-1 stderr]\n{phase1_stderr}\n")
             return 1
         if "tools" not in result.get("capabilities", {}):
             sys.stderr.write(
                 f"FAIL: missing tools capabilities: {result.get('capabilities')!r}\n"
             )
+            sys.stderr.write(f"[phase-1 stderr]\n{phase1_stderr}\n")
             return 1
 
         print("PASS: MCP initialize")
 
-        # Extract collab session_id from collab_start response
+        # Extract collab session_id from collab_start response (id=2)
+        collab_start_resp = by_id1.get(2, phase1_responses[1])
         if collab_start_resp.get("error") is not None:
             sys.stderr.write(
                 f"FAIL: collab_start returned an error: {collab_start_resp['error']}\n"
             )
+            sys.stderr.write(f"[phase-1 stderr]\n{phase1_stderr}\n")
             return 1
         cs_result = collab_start_resp.get("result", {})
         cs_content = cs_result.get("content", [{}])
         cs_text = cs_content[0].get("text", "{}") if cs_content else "{}"
-        cs_data = json.loads(cs_text)
+        cs_data = _safe_json_loads(cs_text)
         collab_sid = cs_data.get("session_id")
         if not collab_sid:
             sys.stderr.write(
                 f"FAIL: collab_start did not return a session_id: {cs_text!r}\n"
             )
+            sys.stderr.write(f"[phase-1 stderr]\n{phase1_stderr}\n")
             return 1
 
         # ------------------------------------------------------------------ #
@@ -200,21 +238,45 @@ def main() -> int:
                 },
             },
         ]
-        phase2_responses = run_mcp_requests(
-            command, phase2_requests, base_env, args.timeout
+        phase2_responses, phase2_stderr = run_mcp_requests(
+            command, phase2_requests, base_env, args.timeout, phase_label="phase-2"
         )
 
         if len(phase2_responses) < 2:
             sys.stderr.write(
                 f"FAIL: expected 2 responses in phase 2, got {len(phase2_responses)}\n"
             )
+            sys.stderr.write(f"[phase-1 stderr]\n{phase1_stderr}\n")
+            sys.stderr.write(f"[phase-2 stderr]\n{phase2_stderr}\n")
             return 1
 
-        collab_status_resp = phase2_responses[1]
+        by_id2 = _responses_by_id(phase2_responses)
+
+        # Validate phase-2 initialize response (id=3)
+        init2_resp = by_id2.get(3, phase2_responses[0])
+        if init2_resp.get("error") is not None:
+            sys.stderr.write(
+                f"FAIL: phase-2 initialize returned an error: {init2_resp['error']}\n"
+            )
+            sys.stderr.write(f"[phase-1 stderr]\n{phase1_stderr}\n")
+            sys.stderr.write(f"[phase-2 stderr]\n{phase2_stderr}\n")
+            return 1
+        result2 = init2_resp.get("result", {})
+        if result2.get("protocolVersion") != "2024-11-05":
+            sys.stderr.write(
+                f"FAIL: phase-2 unexpected protocolVersion: {result2.get('protocolVersion')!r}\n"
+            )
+            sys.stderr.write(f"[phase-1 stderr]\n{phase1_stderr}\n")
+            sys.stderr.write(f"[phase-2 stderr]\n{phase2_stderr}\n")
+            return 1
+
+        collab_status_resp = by_id2.get(4, phase2_responses[1])
         if collab_status_resp.get("error") is not None:
             sys.stderr.write(
                 f"FAIL: collab_status returned an error: {collab_status_resp['error']}\n"
             )
+            sys.stderr.write(f"[phase-1 stderr]\n{phase1_stderr}\n")
+            sys.stderr.write(f"[phase-2 stderr]\n{phase2_stderr}\n")
             return 1
         # Check it's not an isError result (tool-level error)
         st_result = collab_status_resp.get("result", {})
@@ -222,6 +284,8 @@ def main() -> int:
             st_content = st_result.get("content", [{}])
             st_text = st_content[0].get("text", "") if st_content else ""
             sys.stderr.write(f"FAIL: collab_status tool error: {st_text!r}\n")
+            sys.stderr.write(f"[phase-1 stderr]\n{phase1_stderr}\n")
+            sys.stderr.write(f"[phase-2 stderr]\n{phase2_stderr}\n")
             return 1
 
         print("PASS: collab_start + collab_status")
@@ -265,8 +329,10 @@ def main() -> int:
                 timeout=args.timeout,
                 check=False,
             )
-        except subprocess.TimeoutExpired:
+        except subprocess.TimeoutExpired as e:
             sys.stderr.write(f"FAIL: hook process timed out after {args.timeout}s\n")
+            sys.stderr.write(_decode_bytes(e.stdout))
+            sys.stderr.write(_decode_bytes(e.stderr))
             return 1
 
         if hook_completed.returncode != 0:
@@ -289,6 +355,8 @@ def main() -> int:
                 sys.stderr.write(
                     "FAIL: token_usage — no row with source='mcp_response' and collab_session_id set\n"
                 )
+                sys.stderr.write(f"[phase-1 stderr]\n{phase1_stderr}\n")
+                sys.stderr.write(f"[phase-2 stderr]\n{phase2_stderr}\n")
                 return 1
             print(f"PASS: token_usage ({rows['n']} mcp_response row(s) with collab_session_id)")
 
@@ -302,6 +370,8 @@ def main() -> int:
                 sys.stderr.write(
                     f"FAIL: task_outcomes — no row for collab session {collab_sid!r} with started_at\n"
                 )
+                sys.stderr.write(f"[phase-1 stderr]\n{phase1_stderr}\n")
+                sys.stderr.write(f"[phase-2 stderr]\n{phase2_stderr}\n")
                 return 1
             print(f"PASS: task_outcomes ({rows['n']} row(s) with started_at for collab session)")
 
@@ -316,6 +386,8 @@ def main() -> int:
                 sys.stderr.write(
                     "FAIL: session_summary — no MCP response chars recorded for server session\n"
                 )
+                sys.stderr.write(f"[phase-1 stderr]\n{phase1_stderr}\n")
+                sys.stderr.write(f"[phase-2 stderr]\n{phase2_stderr}\n")
                 return 1
             print(f"PASS: session_summary (mcp_chars_served={rows['mcp_chars_served']})")
 
@@ -328,6 +400,8 @@ def main() -> int:
                 sys.stderr.write(
                     "FAIL: occupancy_samples — no rows for hook session\n"
                 )
+                sys.stderr.write(f"[phase-1 stderr]\n{phase1_stderr}\n")
+                sys.stderr.write(f"[phase-2 stderr]\n{phase2_stderr}\n")
                 return 1
             print(f"PASS: occupancy_samples ({rows['n']} row(s) from hook)")
 

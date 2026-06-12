@@ -62,11 +62,11 @@ pub struct App {
     /// this slot. Parallel collab sessions require separate server processes so
     /// `search` / pref-extract / rerank work cannot be stamped onto the wrong
     /// session.
-    pub active_collab_session_id: RwLock<Option<String>>,
+    active_collab_session_id: RwLock<Option<String>>,
     /// Explicit task tag for non-collab work (METRICS_SPEC §2.3 item 2), set
     /// via `status` tool args. Only consulted when no active collab session
     /// resolves.
-    pub explicit_task_tag: RwLock<Option<String>>,
+    explicit_task_tag: RwLock<Option<String>>,
 }
 
 impl App {

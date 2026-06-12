@@ -463,4 +463,22 @@ mod tests {
             "set_task_tag must not create a task_outcomes row"
         );
     }
+
+    // ── G.6: status rejects invalid task_tag and leaves tag unset ────────────
+
+    #[test]
+    fn status_rejects_invalid_task_tag_and_leaves_tag_unset() {
+        let app = test_app();
+
+        // "../etc" contains ".." which is rejected by sanitize_name.
+        let err = handle_status(&app, &json!({"set_task_tag": "../etc"})).unwrap_err();
+        assert!(
+            !err.to_string().is_empty(),
+            "should have returned a validation error"
+        );
+        assert!(
+            app.explicit_task_tag_snapshot().is_none(),
+            "task tag must remain unset after a rejected set_task_tag"
+        );
+    }
 }

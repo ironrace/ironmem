@@ -74,12 +74,14 @@ pub fn new_token_usage_from_llm(
 impl NewTokenUsage {
     /// Return a copy stamped with the resolved attribution context
     /// (METRICS_SPEC §2.3/§3). Consuming builder: callers chain it after
-    /// construction; unset context fields leave the row's fields unchanged.
+    /// construction; the resolved context replaces all three attribution
+    /// columns — a resolved context is authoritative and the `.or()` fallback
+    /// was the only path that could produce a §2.3-violating both-set row.
     pub(crate) fn with_context(self, ctx: &crate::metrics::MetricsContext) -> NewTokenUsage {
         NewTokenUsage {
-            collab_session_id: ctx.collab_session_id.clone().or(self.collab_session_id),
-            collab_phase: ctx.collab_phase.clone().or(self.collab_phase),
-            task_tag: ctx.task_tag.clone().or(self.task_tag),
+            collab_session_id: ctx.collab_session_id.clone(),
+            collab_phase: ctx.collab_phase.clone(),
+            task_tag: ctx.task_tag.clone(),
             ..self
         }
     }
@@ -514,10 +516,17 @@ impl Database {
     /// metrics layer is best-effort and a missing row is a caller problem,
     /// not a transport error.
     pub fn increment_task_review_rounds(&self, task_tag: &str) -> Result<(), MemoryError> {
-        self.conn.execute(
+        let changed = self.conn.execute(
             "UPDATE task_outcomes SET review_rounds = review_rounds + 1 WHERE task_tag = ?1",
             params![task_tag],
         )?;
+        if changed == 0 {
+            tracing::warn!(
+                task_tag = %task_tag,
+                operation = "increment_task_review_rounds",
+                "metrics: UPDATE matched 0 rows — task_tag not found in task_outcomes"
+            );
+        }
         Ok(())
     }
 
@@ -531,7 +540,7 @@ impl Database {
         outcome: Option<&str>,
         pr_url: Option<&str>,
     ) -> Result<(), MemoryError> {
-        self.conn.execute(
+        let changed = self.conn.execute(
             "UPDATE task_outcomes SET
                 done_at = COALESCE(?2, done_at),
                 outcome = COALESCE(?3, outcome),
@@ -539,6 +548,13 @@ impl Database {
              WHERE task_tag = ?1",
             params![task_tag, done_at, outcome, pr_url],
         )?;
+        if changed == 0 {
+            tracing::warn!(
+                task_tag = %task_tag,
+                operation = "mark_task_outcome_done",
+                "metrics: UPDATE matched 0 rows — task_tag not found in task_outcomes"
+            );
+        }
         Ok(())
     }
 

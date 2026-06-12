@@ -155,6 +155,9 @@ fn wait_turn_snapshot(record: &SessionRecord, agent: Agent) -> WaitTurnSnapshot 
 /// immediately after the collab session transaction commits; metrics failures log
 /// at warn and are non-fatal — the protocol state is the source of truth.
 fn create_initial_task_outcome(app: &App, session_id: &str) {
+    if !crate::search::tunables::metrics_enabled() {
+        return;
+    }
     let outcome = crate::db::metrics::TaskOutcome {
         task_tag: session_id.to_string(),
         collab_session_id: Some(session_id.to_string()),
@@ -167,7 +170,7 @@ fn create_initial_task_outcome(app: &App, session_id: &str) {
         pr_url: None,
     };
     if let Err(e) = app.db.upsert_task_outcome(&outcome) {
-        tracing::warn!("metrics: task_outcomes create failed: {e}");
+        tracing::warn!(session_id = %session_id, error = %e, "metrics: task_outcomes create failed");
     }
 }
 
@@ -185,6 +188,9 @@ fn record_task_outcome_transition(
     after: Phase,
     pr_url: Option<&str>,
 ) {
+    if !crate::search::tunables::metrics_enabled() {
+        return;
+    }
     if before == after {
         return;
     }
@@ -192,7 +198,7 @@ fn record_task_outcome_transition(
         && matches!(crate::metrics::phase_bucket(before), "impl" | "rework");
     if entered_review {
         if let Err(e) = app.db.increment_task_review_rounds(session_id) {
-            tracing::warn!("metrics: review_rounds increment failed: {e}");
+            tracing::warn!(session_id = %session_id, error = %e, "metrics: review_rounds increment failed");
         }
     }
     let now = crate::metrics::now_rfc3339();
@@ -208,7 +214,13 @@ fn record_task_outcome_transition(
         _ => Ok(()),
     };
     if let Err(e) = result {
-        tracing::warn!("metrics: task_outcome terminal update failed: {e}");
+        tracing::warn!(
+            session_id = %session_id,
+            before = %before,
+            after = %after,
+            error = %e,
+            "metrics: task_outcome terminal update failed"
+        );
     }
 }
 
@@ -216,8 +228,9 @@ fn record_task_outcome_transition(
 ///
 /// Invariant: one live collab session may own the process attribution slot at a time
 /// (any repo). Stale or missing sessions self-heal by clearing the cell. Returns
-/// `true` when the cell should be cleared (stale/missing), `false` is unreachable
-/// — the live-session arm returns `Err` directly.
+/// `Ok(())` when the cell should be cleared (stale/missing); the live-session
+/// arm returns `Err` directly. The guard protects correctness whenever metrics
+/// get re-enabled — the conflict check is NOT gated on IRONMEM_METRICS.
 ///
 /// A turn is refused rather than risking ambiguous attribution; the raw DB error
 /// detail lives in the server log, not in the MCP response.
@@ -225,16 +238,31 @@ fn check_conflicting_session(
     load_result: Result<crate::collab::queue::SessionRecord, MemoryError>,
     active_session_id: &str,
     requested_session_id: &str,
-) -> Result<bool /* clear_cell */, MemoryError> {
+) -> Result<(), MemoryError> {
     match load_result {
         Ok(record) if record.ended_at.is_none() => Err(MemoryError::Validation(format!(
             "another active collab session is already bound to this MCP process for metrics attribution: {active_session_id}. End it or use a separate server process before switching to {requested_session_id}."
         ))),
-        Ok(_) | Err(MemoryError::NotFound(_)) => Ok(true),
+        // `NotFound` is what the session loader returns for a missing row — matched
+        // explicitly so only a confirmed-missing session clears the cell; any new
+        // error variant lands in the warn arm below instead of being mistaken for
+        // a missing session.
+        Err(crate::error::MemoryError::NotFound(_)) => {
+            tracing::warn!(
+                session_id = %active_session_id,
+                "metrics attribution: active collab session not found — clearing cell for new session"
+            );
+            Ok(())
+        }
+        Ok(_) => {
+            // Session ended — self-heal silently.
+            Ok(())
+        }
         Err(e) => {
             tracing::warn!(
-                "could not verify active collab session {active_session_id} before switching \
-                 metrics attribution to {requested_session_id}: {e}"
+                session_id = %active_session_id,
+                error = %e,
+                "could not verify active collab session before switching metrics attribution"
             );
             // Refuse the turn rather than risk ambiguous attribution;
             // detail is in the server log above.
@@ -258,9 +286,8 @@ fn ensure_no_conflicting_process_session(
     }
 
     let load_result = app.db.collab_load_session_record(&active_session_id);
-    if check_conflicting_session(load_result, &active_session_id, requested_session_id)? {
-        app.clear_active_collab_session();
-    }
+    check_conflicting_session(load_result, &active_session_id, requested_session_id)?;
+    app.clear_active_collab_session();
     Ok(())
 }
 
@@ -277,9 +304,8 @@ fn ensure_no_conflicting_process_session_tx(
     }
 
     let load_result = crate::collab::queue::load_session_record(tx, &active_session_id);
-    if check_conflicting_session(load_result, &active_session_id, requested_session_id)? {
-        app.clear_active_collab_session();
-    }
+    check_conflicting_session(load_result, &active_session_id, requested_session_id)?;
+    app.clear_active_collab_session();
     Ok(())
 }
 
@@ -873,21 +899,23 @@ pub(super) fn handle_collab_end(app: &App, args: &Value) -> Result<Value, Memory
 
     // Operator attestation (METRICS_SPEC §12 amendment): the operator ends a
     // CodingComplete session after the PR lands, or abandons a PlanLocked one.
-    let now = crate::metrics::now_rfc3339();
-    let attested = match phase {
-        Phase::CodingComplete => {
-            app.db
-                .mark_task_outcome_done(session_id, None, Some("merged"), None)
+    if crate::search::tunables::metrics_enabled() {
+        let now = crate::metrics::now_rfc3339();
+        let attested = match phase {
+            Phase::CodingComplete => {
+                app.db
+                    .mark_task_outcome_done(session_id, None, Some("merged"), None)
+            }
+            Phase::PlanLocked => {
+                app.db
+                    .mark_task_outcome_done(session_id, Some(&now), Some("abandoned"), None)
+            }
+            // CodingFailed: failure_report already wrote 'failed' — no write here.
+            _ => Ok(()),
+        };
+        if let Err(e) = attested {
+            tracing::warn!(session_id = %session_id, error = %e, "metrics: task_outcome end attestation failed");
         }
-        Phase::PlanLocked => {
-            app.db
-                .mark_task_outcome_done(session_id, Some(&now), Some("abandoned"), None)
-        }
-        // CodingFailed: failure_report already wrote 'failed' — no write here.
-        _ => Ok(()),
-    };
-    if let Err(e) = attested {
-        tracing::warn!("metrics: task_outcome end attestation failed: {e}");
     }
     if app.active_collab_session_snapshot().as_deref() == Some(session_id) {
         app.clear_active_collab_session();
@@ -1236,6 +1264,246 @@ mod tests {
         assert!(
             status["execution_mode"].is_null(),
             "collab_status must return null execution_mode when task_list is not yet set"
+        );
+    }
+
+    // ── A: kill-switch gating ─────────────────────────────────────────────────
+
+    #[test]
+    fn metrics_kill_switch_suppresses_task_outcomes_row_on_collab_start() {
+        // IRONMEM_METRICS=0 → collab_start must NOT create any task_outcomes row.
+        let _g = crate::metrics::METRICS_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("IRONMEM_METRICS", "0");
+
+        let app = test_app();
+        let sid = start_session(&app);
+
+        // The session must exist (protocol state) …
+        let record = app.db.collab_load_session_record(&sid);
+        assert!(
+            record.is_ok(),
+            "session must be created regardless of metrics kill switch"
+        );
+
+        // … but no task_outcomes row must have been written.
+        let row = app.db.get_task_outcome(&sid).unwrap();
+        assert!(
+            row.is_none(),
+            "IRONMEM_METRICS=0 must suppress task_outcomes row creation"
+        );
+
+        std::env::remove_var("IRONMEM_METRICS");
+    }
+
+    // ── G.1: send/recv to second live session rejected, cell unchanged ─────────
+
+    #[test]
+    fn send_to_second_live_session_is_rejected_and_cell_unchanged() {
+        let app = test_app();
+        let first = start_session(&app);
+
+        // Seed a second session directly via queue (simulating another process).
+        let second = "second-session-id";
+        app.db
+            .with_transaction(|tx| {
+                crate::collab::queue::create_session(
+                    tx,
+                    second,
+                    "/tmp/other",
+                    "other-branch",
+                    None,
+                    crate::collab::Agent::Claude,
+                )
+            })
+            .unwrap();
+
+        // collab_send to the second session must be rejected.
+        let err = handle_collab_send(
+            &app,
+            &json!({
+                "session_id": second,
+                "sender": "claude",
+                "topic": "draft",
+                "content": "a valid draft payload",
+            }),
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("already bound to this MCP process"),
+            "expected conflict error, got: {err}"
+        );
+        assert_eq!(
+            app.active_collab_session_snapshot().as_deref(),
+            Some(first.as_str()),
+            "cell must still hold the first session after rejected send"
+        );
+
+        // collab_recv to the second session must also be rejected.
+        let err = handle_collab_recv(
+            &app,
+            &json!({
+                "session_id": second,
+                "receiver": "codex",
+            }),
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("already bound to this MCP process"),
+            "expected conflict error on recv, got: {err}"
+        );
+        assert_eq!(
+            app.active_collab_session_snapshot().as_deref(),
+            Some(first.as_str()),
+            "cell must still hold first session after rejected recv"
+        );
+    }
+
+    // ── G.2: start self-heals when cell holds an ended session ────────────────
+
+    #[test]
+    fn start_self_heals_when_cell_holds_ended_session() {
+        let app = test_app();
+        let first = start_session(&app);
+
+        // End the first session directly (simulates cross-process end; cell still holds it).
+        app.db
+            .with_transaction(|tx| crate::collab::queue::end_session(tx, &first))
+            .unwrap();
+        // Cell still points to the ended session.
+        assert_eq!(
+            app.active_collab_session_snapshot().as_deref(),
+            Some(first.as_str())
+        );
+
+        // Starting a new session on a different repo/branch must succeed.
+        let result = handle_collab_start(
+            &app,
+            &json!({
+                "repo_path": "/tmp/new-repo",
+                "branch": "new-branch",
+                "initiator": "claude",
+                "task": "new task",
+                "implementer": "claude",
+            }),
+        );
+        assert!(
+            result.is_ok(),
+            "collab_start must self-heal ended session in cell: {:?}",
+            result.unwrap_err()
+        );
+        let new_sid = result.unwrap()["session_id"].as_str().unwrap().to_string();
+        assert_eq!(
+            app.active_collab_session_snapshot().as_deref(),
+            Some(new_sid.as_str()),
+            "cell must be rebound to new session after self-heal"
+        );
+    }
+
+    // ── G.3: start self-heals when cell holds a missing session ──────────────
+
+    #[test]
+    fn start_self_heals_when_cell_holds_missing_session() {
+        let app = test_app();
+        app.set_active_collab_session("ghost-session-id");
+
+        let result = handle_collab_start(
+            &app,
+            &json!({
+                "repo_path": "/tmp/repo",
+                "branch": "main",
+                "initiator": "claude",
+                "task": "task after ghost",
+                "implementer": "claude",
+            }),
+        );
+        assert!(
+            result.is_ok(),
+            "collab_start must self-heal ghost session in cell: {:?}",
+            result.unwrap_err()
+        );
+        let new_sid = result.unwrap()["session_id"].as_str().unwrap().to_string();
+        assert_eq!(
+            app.active_collab_session_snapshot().as_deref(),
+            Some(new_sid.as_str()),
+            "cell must be rebound to new session after ghost self-heal"
+        );
+    }
+
+    // ── G.4: collab_end from CodingFailed leaves outcome 'failed' ─────────────
+
+    #[test]
+    fn failure_report_marks_outcome_failed_and_end_does_not_overwrite() {
+        let app = test_app();
+        let sid = start_session(&app);
+        drive_to_implement(&app, &sid);
+
+        // Send failure_report from CodeImplementPending.
+        send(
+            &app,
+            &sid,
+            "claude",
+            "failure_report",
+            r#"{"coding_failure":"subagent_failure: 1: env"}"#,
+        );
+        let row = app.db.get_task_outcome(&sid).unwrap().unwrap();
+        assert_eq!(
+            row.outcome.as_deref(),
+            Some("failed"),
+            "failure_report must set outcome=failed"
+        );
+
+        // Now call collab_end from CodingFailed — outcome must remain 'failed'.
+        handle_collab_end(&app, &json!({"session_id": sid, "agent": "claude"})).unwrap();
+        let row = app.db.get_task_outcome(&sid).unwrap().unwrap();
+        assert_eq!(
+            row.outcome.as_deref(),
+            Some("failed"),
+            "collab_end from CodingFailed must NOT overwrite outcome to merged"
+        );
+    }
+
+    // ── G.5: collab_end for other session leaves cell intact ──────────────────
+
+    #[test]
+    fn end_of_other_session_leaves_cell_intact() {
+        let app = test_app();
+        let first = start_session(&app);
+
+        // Create a second session and drive it to PlanLocked (an endable phase).
+        let second_id = uuid::Uuid::new_v4().to_string();
+        app.db
+            .with_transaction(|tx| {
+                crate::collab::queue::create_session(
+                    tx,
+                    &second_id,
+                    "/tmp/other-repo",
+                    "other-branch",
+                    None,
+                    crate::collab::Agent::Claude,
+                )
+            })
+            .unwrap();
+        // Drive second to PlanLocked by saving the phase directly.
+        app.db
+            .with_transaction(|tx| {
+                let mut s = crate::collab::queue::load_session(tx, &second_id)?;
+                s.phase = crate::collab::Phase::PlanLocked;
+                // Set a dummy final_plan_hash so it's a valid PlanLocked state.
+                s.final_plan_hash = Some("dummy-hash".to_string());
+                crate::collab::queue::save_session(tx, &s)
+            })
+            .unwrap();
+
+        // End the second session — cell holds first, must remain first.
+        handle_collab_end(&app, &json!({"session_id": second_id, "agent": "claude"})).unwrap();
+        assert_eq!(
+            app.active_collab_session_snapshot().as_deref(),
+            Some(first.as_str()),
+            "ending a different session must not clear the cell"
         );
     }
 }
