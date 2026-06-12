@@ -151,9 +151,33 @@ fn wait_turn_snapshot(record: &SessionRecord, agent: Agent) -> WaitTurnSnapshot 
     }
 }
 
+/// Best-effort initial `task_outcomes` row creation (METRICS_SPEC §5.4). Called
+/// immediately after the collab session transaction commits; metrics failures log
+/// at warn and are non-fatal — the protocol state is the source of truth.
+fn create_initial_task_outcome(app: &App, session_id: &str) {
+    let outcome = crate::db::metrics::TaskOutcome {
+        task_tag: session_id.to_string(),
+        collab_session_id: Some(session_id.to_string()),
+        started_at: Some(crate::metrics::now_rfc3339()),
+        done_at: None,
+        outcome: None,
+        review_rounds: 0,
+        fix_commits: 0,
+        handoffs: 0,
+        pr_url: None,
+    };
+    if let Err(e) = app.db.upsert_task_outcome(&outcome) {
+        tracing::warn!("metrics: task_outcomes create failed: {e}");
+    }
+}
+
 /// Best-effort task_outcomes lifecycle writes (METRICS_SPEC §4/§5.4). Runs
 /// AFTER the protocol transaction commits so a metrics failure can never roll
 /// back or fail a collab turn; errors log at warn.
+///
+/// If the process dies between the commit and these writes, the row
+/// under-counts or stays in-flight (outcome NULL) — acceptable for a
+/// best-effort metrics projection; protocol state is the source of truth.
 fn record_task_outcome_transition(
     app: &App,
     session_id: &str,
@@ -249,20 +273,7 @@ pub(super) fn handle_collab_start(app: &App, args: &Value) -> Result<Value, Memo
     })?;
 
     app.set_active_collab_session(&session_id);
-    let outcome = crate::db::metrics::TaskOutcome {
-        task_tag: session_id.clone(),
-        collab_session_id: Some(session_id.clone()),
-        started_at: Some(crate::metrics::now_rfc3339()),
-        done_at: None,
-        outcome: None,
-        review_rounds: 0,
-        fix_commits: 0,
-        handoffs: 0,
-        pr_url: None,
-    };
-    if let Err(e) = app.db.upsert_task_outcome(&outcome) {
-        tracing::warn!("metrics: task_outcomes create failed: {e}");
-    }
+    create_initial_task_outcome(app, &session_id);
 
     Ok(json!({
         "session_id": session_id,
@@ -390,20 +401,7 @@ pub(super) fn handle_collab_start_code_review(
     })?;
 
     app.set_active_collab_session(&session_id);
-    let outcome = crate::db::metrics::TaskOutcome {
-        task_tag: session_id.clone(),
-        collab_session_id: Some(session_id.clone()),
-        started_at: Some(crate::metrics::now_rfc3339()),
-        done_at: None,
-        outcome: None,
-        review_rounds: 0,
-        fix_commits: 0,
-        handoffs: 0,
-        pr_url: None,
-    };
-    if let Err(e) = app.db.upsert_task_outcome(&outcome) {
-        tracing::warn!("metrics: task_outcomes create failed: {e}");
-    }
+    create_initial_task_outcome(app, &session_id);
 
     Ok(json!({ "session_id": session_id, "task": task }))
 }
@@ -521,6 +519,8 @@ pub(super) fn handle_collab_send(app: &App, args: &Value) -> Result<Value, Memor
         ))
     })?;
 
+    // Deliberately also set on terminal sends — terminal-but-not-ended sessions still attribute
+    // (bucket 'other'); resolve() self-clears once ended_at is set.
     app.set_active_collab_session(session_id);
     record_task_outcome_transition(app, session_id, before, after, pr_url.as_deref());
     Ok(response)
