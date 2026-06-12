@@ -8,11 +8,13 @@ use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, bail, Context, Result};
 
+use crate::response::{LlmResponse, Usage};
+
 /// Single-call interface to an LLM. Synchronous, blocking.
 pub trait LlmClient: Send + Sync {
-    /// Send `prompt` to the LLM, return the assistant's text response.
+    /// Send `prompt` to the LLM, return the assistant text plus usage metadata.
     /// Errors should NOT leak raw stderr to user-facing layers; sanitize first.
-    fn call(&self, prompt: &str) -> Result<String>;
+    fn call(&self, prompt: &str) -> Result<LlmResponse>;
 }
 
 /// Real client: shells out to the local `claude` CLI in non-interactive mode.
@@ -210,13 +212,28 @@ impl LlmClient for AnthropicApiClient {
 
 /// Test-only client. Returns a pre-canned response (or Err) on every `call`.
 pub struct MockLlmClient {
-    pub(crate) response: Result<String>,
+    pub(crate) response: Result<LlmResponse>,
 }
 
 impl MockLlmClient {
+    /// Ergonomic text-only constructor: wraps `text` in an `LlmResponse` with
+    /// zeroed usage, `estimated=true`, empty `model`, `prompt_chars=0`.
     pub fn ok(response: impl Into<String>) -> Self {
         Self {
-            response: Ok(response.into()),
+            response: Ok(LlmResponse {
+                text: response.into(),
+                usage: Usage::default(),
+                cost_usd: None,
+                model: String::new(),
+                estimated: true,
+                prompt_chars: 0,
+            }),
+        }
+    }
+    /// Full-control constructor for usage-asserting tests.
+    pub fn ok_response(response: LlmResponse) -> Self {
+        Self {
+            response: Ok(response),
         }
     }
     pub fn err(message: impl Into<String>) -> Self {
@@ -227,10 +244,10 @@ impl MockLlmClient {
 }
 
 impl LlmClient for MockLlmClient {
-    fn call(&self, _prompt: &str) -> Result<String> {
-        // Mirror the response by cloning the error chain (anyhow::Error isn't Clone).
+    fn call(&self, _prompt: &str) -> Result<LlmResponse> {
+        // anyhow::Error isn't Clone, so rebuild on the error path.
         match &self.response {
-            Ok(s) => Ok(s.clone()),
+            Ok(r) => Ok(r.clone()),
             Err(e) => bail!("{e}"),
         }
     }
