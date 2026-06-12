@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-"""Run a live MCP initialize smoke test against an ironmem server process."""
+"""Smoke-test an ironmem server: MCP initialize, tool listing, collab_start/collab_status, hook occupancy sampling, and four-table metrics assertions (token_usage, task_outcomes, session_summary, occupancy_samples)."""
 
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import os
 import sqlite3
@@ -276,54 +277,52 @@ def main() -> int:
         # ------------------------------------------------------------------ #
         # Phase 4: SQLite assertions over all four metrics tables             #
         # ------------------------------------------------------------------ #
-        conn = sqlite3.connect(db_path)
-        conn.row_factory = sqlite3.Row
+        with contextlib.closing(sqlite3.connect(db_path)) as conn:
+            conn.row_factory = sqlite3.Row
 
-        # token_usage: ≥1 row with source='mcp_response' AND collab_session_id set
-        rows = conn.execute(
-            "SELECT COUNT(*) AS n FROM token_usage "
-            "WHERE source = 'mcp_response' AND collab_session_id IS NOT NULL"
-        ).fetchone()
-        if rows["n"] < 1:
-            sys.stderr.write(
-                "FAIL: token_usage — no row with source='mcp_response' and collab_session_id set\n"
-            )
-            return 1
-        print(f"PASS: token_usage ({rows['n']} mcp_response row(s) with collab_session_id)")
+            # token_usage: ≥1 row with source='mcp_response' AND collab_session_id set
+            rows = conn.execute(
+                "SELECT COUNT(*) AS n FROM token_usage "
+                "WHERE source = 'mcp_response' AND collab_session_id IS NOT NULL"
+            ).fetchone()
+            if rows["n"] < 1:
+                sys.stderr.write(
+                    "FAIL: token_usage — no row with source='mcp_response' and collab_session_id set\n"
+                )
+                return 1
+            print(f"PASS: token_usage ({rows['n']} mcp_response row(s) with collab_session_id)")
 
-        # task_outcomes: session row with started_at set
-        rows = conn.execute(
-            "SELECT COUNT(*) AS n FROM task_outcomes "
-            "WHERE collab_session_id = ? AND started_at IS NOT NULL",
-            (collab_sid,),
-        ).fetchone()
-        if rows["n"] < 1:
-            sys.stderr.write(
-                f"FAIL: task_outcomes — no row for collab session {collab_sid!r} with started_at\n"
-            )
-            return 1
-        print(f"PASS: task_outcomes ({rows['n']} row(s) with started_at for collab session)")
+            # task_outcomes: session row with started_at set
+            rows = conn.execute(
+                "SELECT COUNT(*) AS n FROM task_outcomes "
+                "WHERE collab_session_id = ? AND started_at IS NOT NULL",
+                (collab_sid,),
+            ).fetchone()
+            if rows["n"] < 1:
+                sys.stderr.write(
+                    f"FAIL: task_outcomes — no row for collab session {collab_sid!r} with started_at\n"
+                )
+                return 1
+            print(f"PASS: task_outcomes ({rows['n']} row(s) with started_at for collab session)")
 
-        # session_summary: ≥1 row
-        rows = conn.execute("SELECT COUNT(*) AS n FROM session_summary").fetchone()
-        if rows["n"] < 1:
-            sys.stderr.write("FAIL: session_summary — no rows\n")
-            return 1
-        print(f"PASS: session_summary ({rows['n']} row(s))")
+            # session_summary: ≥1 row
+            rows = conn.execute("SELECT COUNT(*) AS n FROM session_summary").fetchone()
+            if rows["n"] < 1:
+                sys.stderr.write("FAIL: session_summary — no rows\n")
+                return 1
+            print(f"PASS: session_summary ({rows['n']} row(s))")
 
-        # occupancy_samples: ≥1 row from the hook invocation
-        rows = conn.execute(
-            "SELECT COUNT(*) AS n FROM occupancy_samples WHERE session_id = ?",
-            (session_id,),
-        ).fetchone()
-        if rows["n"] < 1:
-            sys.stderr.write(
-                "FAIL: occupancy_samples — no rows for hook session\n"
-            )
-            return 1
-        print(f"PASS: occupancy_samples ({rows['n']} row(s) from hook)")
-
-        conn.close()
+            # occupancy_samples: ≥1 row from the hook invocation
+            rows = conn.execute(
+                "SELECT COUNT(*) AS n FROM occupancy_samples WHERE session_id = ?",
+                (session_id,),
+            ).fetchone()
+            if rows["n"] < 1:
+                sys.stderr.write(
+                    "FAIL: occupancy_samples — no rows for hook session\n"
+                )
+                return 1
+            print(f"PASS: occupancy_samples ({rows['n']} row(s) from hook)")
 
     print("\nAll four metrics tables populated. Smoke test PASSED.")
     return 0
