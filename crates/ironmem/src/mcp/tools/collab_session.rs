@@ -1005,8 +1005,22 @@ mod tests {
 
     // ── lifecycle tests ───────────────────────────────────────────────────────
 
+    /// Serialize on the shared metrics env lock and force metrics ON. The
+    /// lifecycle writes are gated on `IRONMEM_METRICS`, so any test that
+    /// asserts a `task_outcomes` row exists races a parallel test flipping
+    /// the kill switch (the suppression test below and the `mcp::server`
+    /// metrics tests) unless it holds the same lock.
+    fn metrics_on_guard() -> std::sync::MutexGuard<'static, ()> {
+        let guard = crate::metrics::METRICS_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        std::env::remove_var("IRONMEM_METRICS");
+        guard
+    }
+
     #[test]
     fn collab_start_creates_task_outcome_row_and_sets_active_cell() {
+        let _g = metrics_on_guard();
         let app = test_app();
         let sid = start_session(&app);
         let row = app.db.get_task_outcome(&sid).unwrap().expect("row created");
@@ -1028,6 +1042,7 @@ mod tests {
 
     #[test]
     fn full_v3_happy_path_yields_review_round_done_at_pr_url_then_merged_on_end() {
+        let _g = metrics_on_guard();
         let app = test_app();
         let sid = start_session(&app);
 
@@ -1093,6 +1108,7 @@ mod tests {
 
     #[test]
     fn failure_report_marks_outcome_failed() {
+        let _g = metrics_on_guard();
         let app = test_app();
         let sid = start_session(&app);
         drive_to_implement(&app, &sid);
@@ -1116,6 +1132,7 @@ mod tests {
 
     #[test]
     fn collab_end_from_planlocked_marks_abandoned() {
+        let _g = metrics_on_guard();
         let app = test_app();
         let sid = start_session(&app);
         drive_to_plan_locked(&app, &sid);
@@ -1437,6 +1454,7 @@ mod tests {
 
     #[test]
     fn failure_report_marks_outcome_failed_and_end_does_not_overwrite() {
+        let _g = metrics_on_guard();
         let app = test_app();
         let sid = start_session(&app);
         drive_to_implement(&app, &sid);
