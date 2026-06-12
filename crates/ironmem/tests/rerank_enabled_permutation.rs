@@ -15,9 +15,16 @@ struct ReverseScorer {
     called: std::sync::atomic::AtomicBool,
 }
 impl RerankerScorer for ReverseScorer {
-    fn score_pairs(&self, _q: &str, p: &[&str]) -> anyhow::Result<Vec<f32>> {
+    fn score_pairs(
+        &self,
+        _q: &str,
+        p: &[&str],
+    ) -> anyhow::Result<ironrace_rerank::RerankScoreResult> {
         self.called.store(true, std::sync::atomic::Ordering::SeqCst);
-        Ok((0..p.len()).map(|i| -(i as f32)).collect())
+        Ok(ironrace_rerank::RerankScoreResult {
+            scores: (0..p.len()).map(|i| -(i as f32)).collect(),
+            llm_response: None,
+        })
     }
 }
 

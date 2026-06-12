@@ -12,7 +12,11 @@ use serde_json::{json, Value};
 
 struct PanicScorer;
 impl RerankerScorer for PanicScorer {
-    fn score_pairs(&self, _q: &str, _p: &[&str]) -> anyhow::Result<Vec<f32>> {
+    fn score_pairs(
+        &self,
+        _q: &str,
+        _p: &[&str],
+    ) -> anyhow::Result<ironrace_rerank::RerankScoreResult> {
         panic!("PanicScorer must NOT be called when IRONMEM_RERANK is unset");
     }
 }

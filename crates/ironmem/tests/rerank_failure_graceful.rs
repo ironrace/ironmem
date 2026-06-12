@@ -13,7 +13,11 @@ struct ErrScorer {
     called: std::sync::atomic::AtomicBool,
 }
 impl RerankerScorer for ErrScorer {
-    fn score_pairs(&self, _q: &str, _p: &[&str]) -> anyhow::Result<Vec<f32>> {
+    fn score_pairs(
+        &self,
+        _q: &str,
+        _p: &[&str],
+    ) -> anyhow::Result<ironrace_rerank::RerankScoreResult> {
         self.called.store(true, std::sync::atomic::Ordering::SeqCst);
         anyhow::bail!("simulated scorer failure")
     }

@@ -8,11 +8,13 @@ use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, bail, Context, Result};
 
+use crate::response::{LlmResponse, Usage};
+
 /// Single-call interface to an LLM. Synchronous, blocking.
 pub trait LlmClient: Send + Sync {
-    /// Send `prompt` to the LLM, return the assistant's text response.
+    /// Send `prompt` to the LLM, return the assistant text plus usage metadata.
     /// Errors should NOT leak raw stderr to user-facing layers; sanitize first.
-    fn call(&self, prompt: &str) -> Result<String>;
+    fn call(&self, prompt: &str) -> Result<LlmResponse>;
 }
 
 /// Real client: shells out to the local `claude` CLI in non-interactive mode.
@@ -41,8 +43,89 @@ impl ClaudeCliClient {
     }
 }
 
+/// Parse `claude -p --output-format json` stdout into an `LlmResponse`.
+/// `model_fallback` is the client's configured model (used when the envelope
+/// omits `model`); `prompt_chars` is the user prompt char count passed to
+/// `call` (the basis for chars/4 estimation and the recorded `chars`).
+fn parse_cli_stdout(stdout: &str, model_fallback: &str, prompt_chars: usize) -> LlmResponse {
+    let parsed: Option<serde_json::Value> = serde_json::from_str(stdout).ok();
+
+    // text ← `result` field, else the raw stdout (handles non-JSON output).
+    let text = parsed
+        .as_ref()
+        .and_then(|v| v.get("result"))
+        .and_then(|r| r.as_str())
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| stdout.to_string());
+
+    let model = parsed
+        .as_ref()
+        .and_then(|v| v.get("model"))
+        .and_then(|m| m.as_str())
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| model_fallback.to_string());
+
+    // A `usage` object with at least one nonzero token field counts as real.
+    let real_usage: Option<Usage> = parsed
+        .as_ref()
+        .and_then(|v| v.get("usage"))
+        .and_then(|u| serde_json::from_value::<Usage>(u.clone()).ok())
+        .filter(|u| {
+            u.input_tokens != 0
+                || u.output_tokens != 0
+                || u.cache_creation_input_tokens != 0
+                || u.cache_read_input_tokens != 0
+        });
+
+    match real_usage {
+        Some(usage) => {
+            let cost_usd = parsed
+                .as_ref()
+                .and_then(|v| v.get("total_cost_usd"))
+                .and_then(|c| c.as_f64());
+            LlmResponse {
+                text,
+                usage,
+                cost_usd,
+                model,
+                estimated: false,
+                prompt_chars,
+            }
+        }
+        None => {
+            // chars/4 fallback (ceil). input from prompt, output from text.
+            // A systemic loss of the `usage` block (e.g. a `claude` CLI
+            // output-format change) would otherwise surface only in the stored
+            // `estimated=true` column; log it so it's visible in traces too.
+            tracing::debug!(
+                prompt_chars,
+                "claude CLI response had no usage block; estimating tokens via chars/4"
+            );
+            let output_chars = text.chars().count();
+            let usage = Usage {
+                input_tokens: ceil_div4(prompt_chars),
+                output_tokens: ceil_div4(output_chars),
+                ..Usage::default()
+            };
+            LlmResponse {
+                text,
+                usage,
+                cost_usd: None,
+                model,
+                estimated: true,
+                prompt_chars,
+            }
+        }
+    }
+}
+
+/// ceil(n / 4), truncated to u32 (prompt sizes never approach u32::MAX).
+fn ceil_div4(n: usize) -> u32 {
+    n.div_ceil(4) as u32
+}
+
 impl LlmClient for ClaudeCliClient {
-    fn call(&self, prompt: &str) -> Result<String> {
+    fn call(&self, prompt: &str) -> Result<LlmResponse> {
         let started = Instant::now();
         let mut child = Command::new(&self.binary)
             .arg("--model")
@@ -87,7 +170,13 @@ impl LlmClient for ClaudeCliClient {
             tracing::trace!(stderr = %raw_stderr, "claude CLI nonzero exit");
             bail!("claude CLI exited with status {}", output.status);
         }
-        String::from_utf8(output.stdout).map_err(|e| anyhow!("claude stdout not UTF-8: {e}"))
+        let stdout = String::from_utf8(output.stdout)
+            .map_err(|e| anyhow!("claude stdout not UTF-8: {e}"))?;
+        Ok(parse_cli_stdout(
+            &stdout,
+            &self.model,
+            prompt.chars().count(),
+        ))
     }
 }
 
@@ -98,8 +187,8 @@ impl LlmClient for ClaudeCliClient {
 /// `ANTHROPIC_API_KEY` with `IRONMEM_ANTHROPIC_API_KEY` as a scoped fallback);
 /// we just hold whatever string is passed in.
 ///
-/// Response is wrapped into the same `{"result": "<text>"}` envelope produced
-/// by `claude -p --output-format json` so callers can share one parser.
+/// Responses are parsed directly into `LlmResponse`, preserving the provider's
+/// usage block for downstream token accounting.
 pub struct AnthropicApiClient {
     pub(crate) api_key: String,
     pub(crate) model: String,
@@ -146,21 +235,48 @@ fn build_anthropic_body(model: &str, max_tokens: u32, prompt: &str) -> serde_jso
     })
 }
 
-/// Extract the assistant text from an Anthropic Messages API response and
-/// re-emit it in the `{"result": "<text>"}` envelope used by `claude -p`,
-/// so a single parser handles both backends.
-fn wrap_anthropic_response(api_response: &serde_json::Value) -> Result<String> {
+/// Parse an Anthropic Messages API response into an `LlmResponse`. The API
+/// reports a `usage` block, so missing or malformed usage is treated as an
+/// invalid response rather than a measured zero-token call. The API carries no
+/// dollar cost, so `cost_usd=None`. `prompt_chars` is the user prompt char
+/// count passed from `call`.
+fn parse_anthropic_response(
+    api_response: &serde_json::Value,
+    model_fallback: &str,
+    prompt_chars: usize,
+) -> Result<LlmResponse> {
     let text = api_response
         .get("content")
         .and_then(|c| c.get(0))
         .and_then(|c0| c0.get("text"))
         .and_then(|t| t.as_str())
-        .ok_or_else(|| anyhow!("anthropic response missing content[0].text"))?;
-    Ok(serde_json::json!({"result": text}).to_string())
+        .ok_or_else(|| anyhow!("anthropic response missing content[0].text"))?
+        .to_string();
+
+    let usage = api_response
+        .get("usage")
+        .ok_or_else(|| anyhow!("anthropic response missing usage"))?;
+    let usage = serde_json::from_value::<Usage>(usage.clone())
+        .context("anthropic response has invalid usage")?;
+
+    let model = api_response
+        .get("model")
+        .and_then(|m| m.as_str())
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| model_fallback.to_string());
+
+    Ok(LlmResponse {
+        text,
+        usage,
+        cost_usd: None,
+        model,
+        estimated: false,
+        prompt_chars,
+    })
 }
 
 impl LlmClient for AnthropicApiClient {
-    fn call(&self, prompt: &str) -> Result<String> {
+    fn call(&self, prompt: &str) -> Result<LlmResponse> {
         let body = build_anthropic_body(&self.model, self.max_tokens, prompt);
         let url = format!("{}/v1/messages", self.base_url.trim_end_matches('/'));
 
@@ -183,7 +299,7 @@ impl LlmClient for AnthropicApiClient {
                     let parsed: serde_json::Value = resp
                         .into_json()
                         .context("decoding Anthropic response JSON")?;
-                    return wrap_anthropic_response(&parsed);
+                    return parse_anthropic_response(&parsed, &self.model, prompt.chars().count());
                 }
                 Err(ureq::Error::Status(code, resp)) => {
                     // Don't retry config errors. We deliberately do NOT log
@@ -210,15 +326,31 @@ impl LlmClient for AnthropicApiClient {
 
 /// Test-only client. Returns a pre-canned response (or Err) on every `call`.
 pub struct MockLlmClient {
-    pub(crate) response: Result<String>,
+    pub(crate) response: Result<LlmResponse>,
 }
 
 impl MockLlmClient {
+    /// Ergonomic text-only constructor: wraps `text` in an `LlmResponse` with
+    /// zeroed usage, `estimated=true`, empty `model`, `prompt_chars=0`.
     pub fn ok(response: impl Into<String>) -> Self {
         Self {
-            response: Ok(response.into()),
+            response: Ok(LlmResponse {
+                text: response.into(),
+                usage: Usage::default(),
+                cost_usd: None,
+                model: String::new(),
+                estimated: true,
+                prompt_chars: 0,
+            }),
         }
     }
+    /// Full-control constructor for usage-asserting tests.
+    pub fn ok_response(response: LlmResponse) -> Self {
+        Self {
+            response: Ok(response),
+        }
+    }
+    /// Error-path fixture: every `call` returns `Err(message)`.
     pub fn err(message: impl Into<String>) -> Self {
         Self {
             response: Err(anyhow!(message.into())),
@@ -227,10 +359,10 @@ impl MockLlmClient {
 }
 
 impl LlmClient for MockLlmClient {
-    fn call(&self, _prompt: &str) -> Result<String> {
-        // Mirror the response by cloning the error chain (anyhow::Error isn't Clone).
+    fn call(&self, _prompt: &str) -> Result<LlmResponse> {
+        // anyhow::Error isn't Clone, so rebuild on the error path.
         match &self.response {
-            Ok(s) => Ok(s.clone()),
+            Ok(r) => Ok(r.clone()),
             Err(e) => bail!("{e}"),
         }
     }
@@ -239,6 +371,45 @@ impl LlmClient for MockLlmClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cli_parse_with_usage_is_measured() {
+        let stdout = r#"{"type":"result","result":"5","model":"claude-haiku-4-5",
+            "total_cost_usd":0.0012,
+            "usage":{"input_tokens":120,"output_tokens":3,
+                     "cache_creation_input_tokens":0,"cache_read_input_tokens":40}}"#;
+        let r = parse_cli_stdout(stdout, "fallback-model", 200);
+        assert_eq!(r.text, "5");
+        assert_eq!(r.model, "claude-haiku-4-5");
+        assert_eq!(r.usage.input_tokens, 120);
+        assert_eq!(r.usage.output_tokens, 3);
+        assert_eq!(r.usage.cache_read_input_tokens, 40);
+        assert_eq!(r.cost_usd, Some(0.0012));
+        assert!(!r.estimated);
+        assert_eq!(r.prompt_chars, 200);
+    }
+
+    #[test]
+    fn cli_parse_without_usage_is_estimated() {
+        // No `usage` key → chars/4 fallback. prompt_chars=40 → input=ceil(40/4)=10.
+        let stdout = r#"{"type":"result","result":"hello world"}"#; // 11 chars → output=ceil(11/4)=3
+        let r = parse_cli_stdout(stdout, "fallback-model", 40);
+        assert_eq!(r.text, "hello world");
+        assert_eq!(r.model, "fallback-model");
+        assert!(r.estimated);
+        assert_eq!(r.usage.input_tokens, 10);
+        assert_eq!(r.usage.output_tokens, 3);
+        assert_eq!(r.cost_usd, None);
+        assert_eq!(r.prompt_chars, 40);
+    }
+
+    #[test]
+    fn cli_parse_non_json_falls_back_to_raw_text() {
+        let r = parse_cli_stdout("3", "fallback-model", 12);
+        assert_eq!(r.text, "3");
+        assert!(r.estimated);
+        assert_eq!(r.model, "fallback-model");
+    }
 
     #[test]
     fn anthropic_body_shape() {
@@ -252,32 +423,44 @@ mod tests {
     }
 
     #[test]
-    fn wrap_anthropic_response_extracts_text() {
+    fn anthropic_parse_extracts_text_usage_model() {
         let api = serde_json::json!({
-            "id": "msg_abc",
-            "type": "message",
-            "role": "assistant",
+            "id": "msg_abc", "type": "message", "role": "assistant",
             "content": [{"type": "text", "text": "5"}],
-            "model": "claude-haiku-4-5",
-            "stop_reason": "end_turn",
+            "model": "claude-haiku-4-5", "stop_reason": "end_turn",
+            "usage": {"input_tokens": 200, "output_tokens": 2,
+                      "cache_creation_input_tokens": 0, "cache_read_input_tokens": 10}
         });
-        let wrapped = wrap_anthropic_response(&api).unwrap();
-        let v: serde_json::Value = serde_json::from_str(&wrapped).unwrap();
-        // Re-emitted in the {"result": "<text>"} envelope produced by claude -p,
-        // so the existing rerank parser handles it without branching.
-        assert_eq!(v["result"], "5");
+        let r = parse_anthropic_response(&api, "fallback", 80).unwrap();
+        assert_eq!(r.text, "5");
+        assert_eq!(r.model, "claude-haiku-4-5");
+        assert_eq!(r.usage.input_tokens, 200);
+        assert_eq!(r.usage.output_tokens, 2);
+        assert_eq!(r.usage.cache_read_input_tokens, 10);
+        assert!(!r.estimated);
+        assert_eq!(r.cost_usd, None);
+        assert_eq!(r.prompt_chars, 80);
     }
 
     #[test]
-    fn wrap_anthropic_response_missing_content_errors() {
+    fn anthropic_parse_missing_content_errors() {
         let api = serde_json::json!({"id": "msg_abc"});
-        assert!(wrap_anthropic_response(&api).is_err());
+        assert!(parse_anthropic_response(&api, "fallback", 0).is_err());
     }
 
     #[test]
-    fn wrap_anthropic_response_empty_content_array_errors() {
+    fn anthropic_parse_empty_content_array_errors() {
         let api = serde_json::json!({"content": []});
-        assert!(wrap_anthropic_response(&api).is_err());
+        assert!(parse_anthropic_response(&api, "fallback", 0).is_err());
+    }
+
+    #[test]
+    fn anthropic_parse_missing_usage_errors() {
+        let api = serde_json::json!({
+            "content": [{"type": "text", "text": "5"}],
+            "model": "claude-haiku-4-5"
+        });
+        assert!(parse_anthropic_response(&api, "fallback", 0).is_err());
     }
 
     #[test]

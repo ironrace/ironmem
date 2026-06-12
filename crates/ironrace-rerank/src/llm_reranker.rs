@@ -19,7 +19,7 @@ use anyhow::{bail, Context, Result};
 use serde_json::Value;
 
 use crate::llm_client::LlmClient;
-use crate::scorer::RerankerScorer;
+use crate::scorer::{RerankScoreError, RerankScoreResult, RerankerScorer};
 
 /// Pinned rerank prompt template ("pick one" / mempalace recipe).
 /// Changes require a full eval re-run.
@@ -32,33 +32,47 @@ const RERANK_PROMPT_TEMPLATE: &str = "Question: {QUERY}\n\nWhich of the followin
 /// is the only setting that produced an R@1 lift in the 50-q probe (+10pp).
 const PASSAGE_MAX_CHARS: usize = 2000;
 
+/// Wraps an [`LlmClient`] to implement [`RerankerScorer`] via the "pick one"
+/// recipe (see module docs). Owns the client it scores with.
 pub struct LlmReranker<C: LlmClient> {
     client: C,
 }
 
 impl<C: LlmClient> LlmReranker<C> {
+    /// Construct a reranker that takes ownership of `client`.
     pub fn new(client: C) -> Self {
         Self { client }
     }
 }
 
 impl<C: LlmClient> RerankerScorer for LlmReranker<C> {
-    fn score_pairs(&self, query: &str, passages: &[&str]) -> Result<Vec<f32>> {
+    fn score_pairs(&self, query: &str, passages: &[&str]) -> Result<RerankScoreResult> {
         if passages.is_empty() {
-            return Ok(Vec::new());
+            return Ok(RerankScoreResult {
+                scores: Vec::new(),
+                llm_response: None,
+            });
         }
         let prompt = build_rerank_prompt(query, passages);
-        let raw = self
+        let response = self
             .client
             .call(&prompt)
             .context("LLM client call failed")?;
-        let chosen = parse_chosen_index(&raw, passages.len())?;
+        let chosen = parse_chosen_index(&response.text, passages.len()).map_err(|e| {
+            RerankScoreError::with_response(
+                format!("could not convert LLM rerank response into scores: {e}"),
+                response.clone(),
+            )
+        })?;
 
         // Chosen → 0.0, others → -(i+1) so the post-rerank sort preserves
         // original order for non-chosen items.
         let mut scores: Vec<f32> = (0..passages.len()).map(|i| -((i + 1) as f32)).collect();
         scores[chosen] = 0.0;
-        Ok(scores)
+        Ok(RerankScoreResult {
+            scores,
+            llm_response: Some(response),
+        })
     }
 }
 
@@ -102,16 +116,18 @@ fn parse_chosen_index(raw: &str, expected_n: usize) -> Result<usize> {
         Some(n) if (1..=expected_n).contains(&n) => Ok(n - 1),
         Some(n) => {
             tracing::trace!(
-                raw = %raw,
-                assistant = %assistant_text,
                 parsed = n,
                 expected_n,
+                assistant_len = assistant_text.chars().count(),
                 "rerank response: chosen index out of range"
             );
             bail!("LLM returned chosen index {n} outside 1..={expected_n}")
         }
         None => {
-            tracing::trace!(raw = %raw, assistant = %assistant_text, "rerank response: no integer found");
+            tracing::trace!(
+                assistant_len = assistant_text.chars().count(),
+                "rerank response: no integer found"
+            );
             bail!("could not parse a passage number from LLM response")
         }
     }
@@ -217,7 +233,9 @@ mod tests {
         // LLM picks passage 3 (1-indexed) → idx 2.
         let client = MockLlmClient::ok("3");
         let r = LlmReranker::new(client);
-        let scores = r.score_pairs("q", &["a", "b", "c", "d"]).unwrap();
+        let result = r.score_pairs("q", &["a", "b", "c", "d"]).unwrap();
+        assert!(result.llm_response.is_some());
+        let scores = result.scores;
         // Chosen has highest score.
         assert_eq!(scores[2], 0.0);
         // Non-chosen are strictly decreasing in original index.
@@ -239,7 +257,7 @@ mod tests {
         let client = MockLlmClient::ok("2");
         let r = LlmReranker::new(client);
         let passages = ["a", "b", "c", "d", "e"];
-        let scores = r.score_pairs("q", &passages).unwrap();
+        let scores = r.score_pairs("q", &passages).unwrap().scores;
 
         let mut order: Vec<usize> = (0..passages.len()).collect();
         order.sort_by(|&i, &j| {
@@ -256,7 +274,7 @@ mod tests {
     fn score_pairs_envelope_response() {
         let client = MockLlmClient::ok(r#"{"type":"result","result":"1"}"#);
         let r = LlmReranker::new(client);
-        let scores = r.score_pairs("q", &["a", "b", "c"]).unwrap();
+        let scores = r.score_pairs("q", &["a", "b", "c"]).unwrap().scores;
         assert_eq!(scores[0], 0.0);
     }
 
@@ -264,14 +282,20 @@ mod tests {
     fn score_pairs_empty() {
         let client = MockLlmClient::ok("");
         let r = LlmReranker::new(client);
-        assert!(r.score_pairs("q", &[]).unwrap().is_empty());
+        let result = r.score_pairs("q", &[]).unwrap();
+        assert!(result.scores.is_empty());
+        assert!(result.llm_response.is_none());
     }
 
     #[test]
     fn score_pairs_unparseable_errors() {
         let client = MockLlmClient::ok("I cannot answer");
         let r = LlmReranker::new(client);
-        assert!(r.score_pairs("q", &["a", "b"]).is_err());
+        let err = r.score_pairs("q", &["a", "b"]).unwrap_err();
+        let rerank_err = err
+            .downcast_ref::<RerankScoreError>()
+            .expect("parse failures should carry rerank response metadata");
+        assert!(rerank_err.llm_response.is_some());
     }
 
     #[test]

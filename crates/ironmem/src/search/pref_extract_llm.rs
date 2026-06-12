@@ -11,7 +11,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use ironrace_pref_extract::PreferenceExtractor;
-use ironrace_rerank::LlmClient;
+use ironrace_rerank::{LlmClient, LlmResponse};
 use serde_json::Value;
 
 const PROMPT_TEMPLATE: &str = "Below are user turns from a conversation. \
@@ -36,34 +36,42 @@ impl LlmPreferenceExtractor {
     pub fn new(client: Arc<dyn LlmClient>) -> Self {
         Self { client }
     }
+
+    /// Like `extract`, but also returns the raw `LlmResponse` (for usage
+    /// recording). Returns `(phrases, None)` when the LLM call errored.
+    pub fn extract_with_response(&self, text: &str) -> (Vec<String>, Option<LlmResponse>) {
+        let prompt = PROMPT_TEMPLATE.replace("{TEXT}", text);
+        let response = match self.client.call(&prompt) {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::warn!(error = %e, "pref_extract LLM call failed");
+                return (Vec::new(), None);
+            }
+        };
+        let assistant_text =
+            extract_assistant_text(&response.text).unwrap_or_else(|| response.text.clone());
+        let cleaned = assistant_text.trim();
+        // Return as a single phrase. `synthesize_doc` joins by `". "`; with one
+        // entry the join is a no-op so the synth body is exactly this paragraph.
+        let phrases = if cleaned.is_empty() {
+            Vec::new()
+        } else {
+            vec![cleaned.to_string()]
+        };
+        (phrases, Some(response))
+    }
 }
 
 impl PreferenceExtractor for LlmPreferenceExtractor {
     fn extract(&self, text: &str) -> Vec<String> {
-        let prompt = PROMPT_TEMPLATE.replace("{TEXT}", text);
-        let raw = match self.client.call(&prompt) {
-            Ok(r) => r,
-            Err(e) => {
-                tracing::warn!(error = %e, "pref_extract LLM call failed");
-                return Vec::new();
-            }
-        };
-        let assistant_text = extract_assistant_text(&raw).unwrap_or(raw);
-        let cleaned = assistant_text.trim();
-        if cleaned.is_empty() {
-            return Vec::new();
-        }
-        // Return as a single phrase. `synthesize_doc` joins by `". "`; with one
-        // entry the join is a no-op so the synth body is exactly this paragraph.
-        vec![cleaned.to_string()]
+        self.extract_with_response(text).0
     }
 }
 
 /// Pull the assistant text out of the `claude -p --output-format json` envelope:
 ///   `{"type": "result", "result": "<assistant text>", ...}`
-/// The `AnthropicApiClient` re-emits this same envelope via `wrap_anthropic_response`,
-/// so both backends share one parser. Falls back to `None` when the input isn't
-/// that envelope; caller then uses the raw stdout directly.
+/// This is now a defensive fallback for legacy/mock fixtures; current clients
+/// return bare assistant text in `LlmResponse.text`.
 fn extract_assistant_text(raw: &str) -> Option<String> {
     let v: Value = serde_json::from_str(raw).ok()?;
     if let Some(Value::String(s)) = v.get("result") {
