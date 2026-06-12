@@ -112,9 +112,9 @@ fn parse_cli_stdout(stdout: &str, model_fallback: &str, prompt_chars: usize) -> 
     }
 }
 
-/// ceil(n / 4) as u32, saturating.
+/// ceil(n / 4), truncated to u32 (prompt sizes never approach u32::MAX).
 fn ceil_div4(n: usize) -> u32 {
-    ((n + 3) / 4) as u32
+    n.div_ceil(4) as u32
 }
 
 impl LlmClient for ClaudeCliClient {
