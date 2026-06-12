@@ -429,6 +429,12 @@ All existing v3 anti-puppeteering rules apply unchanged.
   explicit instruction), `CodingComplete`, or `CodingFailed`.
 - **Never** peek at Claude's draft during `PlanParallelDrafts`. The server
   enforces blind-draft in `recv`.
+- **Duplicate-session guard.** `collab_start` / `collab_start_code_review`
+  reject a new session when an active one (`ended_at IS NULL`, including a
+  session left at `CodingComplete` / `CodingFailed`) already exists for the
+  same `repo_path` + `branch`; the error names the existing `session_id`.
+  Claude almost always initiates, but if you ever hit this on a `start`,
+  resume the named session with `/collab join <id>` instead of retrying.
 - **Every v3 `collab_send` payload is a JSON-encoded string** per the
   matrix in `docs/COLLAB.md`. Never send prose for v3 topics.
 - **`head_sha` in every v3 payload is the current `HEAD` AFTER any commit

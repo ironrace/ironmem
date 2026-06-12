@@ -174,6 +174,19 @@ pub(super) fn handle_collab_start(app: &App, args: &Value) -> Result<Value, Memo
     let session_id = uuid::Uuid::new_v4().to_string();
 
     app.db.with_transaction(|tx| {
+        // Guard against accidental duplicate sessions on the same repo+branch
+        // (e.g. a fired ScheduleWakeup replaying the `/collab start` entry
+        // command after a session already reached CodingComplete). The check is
+        // atomic with the insert inside this transaction.
+        if let Some((existing_id, phase)) =
+            crate::collab::queue::find_active_session_by_repo_branch(tx, repo_path, branch)?
+        {
+            return Err(MemoryError::Validation(format!(
+                "an active collab session already exists for repo {repo_path} branch {branch}: \
+                 {existing_id} (phase {phase}). Resume it with `/collab join {existing_id}`, or \
+                 if it is finished call collab_end on it before starting a new session here."
+            )));
+        }
         crate::collab::queue::create_session(
             tx,
             &session_id,
@@ -283,6 +296,18 @@ pub(super) fn handle_collab_start_code_review(
         .map_err(collab_error_to_memory_error)?;
 
     app.db.with_transaction(|tx| {
+        // Same duplicate-session guard as `handle_collab_start`: a stray replay
+        // of `/collab review` must not fork a second review session on a branch
+        // that already has an active one.
+        if let Some((existing_id, phase)) =
+            crate::collab::queue::find_active_session_by_repo_branch(tx, repo_path, branch)?
+        {
+            return Err(MemoryError::Validation(format!(
+                "an active collab session already exists for repo {repo_path} branch {branch}: \
+                 {existing_id} (phase {phase}). Resume it with `/collab join {existing_id}`, or \
+                 if it is finished call collab_end on it before starting a new session here."
+            )));
+        }
         // Shortcut sessions never enter `CodeImplementPending`, so the
         // `implementer` field is fixed at `Agent::Claude` for uniformity.
         crate::collab::queue::create_session(

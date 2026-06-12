@@ -133,6 +133,33 @@ pub fn ensure_active(conn: &Connection, session_id: &str) -> Result<(), MemoryEr
     Ok(())
 }
 
+/// Find the newest still-active (not yet `collab_end`-ed) session for a
+/// `repo_path` + `branch`, if any, returning `(id, phase)`.
+///
+/// "Active" is keyed purely on `ended_at IS NULL` — deliberately including
+/// terminal phases (`CodingComplete` / `CodingFailed`) that have not been
+/// explicitly ended. `collab_start` uses this to reject accidental duplicate
+/// sessions (e.g. a fired `ScheduleWakeup` replaying the `/collab start` entry
+/// command after a session already reached `CodingComplete`): the only way to
+/// start a new session on the same branch is to `collab_end` the prior one or
+/// resume it, both of which require deliberate action a stray replay lacks.
+pub fn find_active_session_by_repo_branch(
+    conn: &Connection,
+    repo_path: &str,
+    branch: &str,
+) -> Result<Option<(String, String)>, MemoryError> {
+    conn.query_row(
+        "SELECT id, phase FROM collab_sessions
+         WHERE repo_path = ?1 AND branch = ?2 AND ended_at IS NULL
+         ORDER BY created_at DESC, id DESC
+         LIMIT 1",
+        params![repo_path, branch],
+        |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+    )
+    .optional()
+    .map_err(MemoryError::from)
+}
+
 pub fn load_session(conn: &Connection, session_id: &str) -> Result<CollabSession, MemoryError> {
     Ok(load_session_record(conn, session_id)?.session)
 }

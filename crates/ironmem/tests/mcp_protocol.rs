@@ -847,6 +847,81 @@ fn collab_end_blocks_subsequent_writes() {
 }
 
 #[test]
+fn collab_start_rejects_duplicate_active_session_on_same_branch() {
+    let app = App::open_for_test().unwrap();
+    let first = call_tool(
+        &app,
+        "collab_start",
+        json!({ "repo_path": "/repo", "branch": "main", "initiator": "claude", "task": "first" }),
+    );
+    let first_id = first["session_id"].as_str().unwrap().to_string();
+
+    // A stray replay of `/collab start` on the same repo+branch (e.g. a fired
+    // ScheduleWakeup re-running the entry command) must be rejected, not
+    // silently fork a second session.
+    let err = call_tool_expect_error(
+        &app,
+        "collab_start",
+        json!({ "repo_path": "/repo", "branch": "main", "initiator": "claude", "task": "second" }),
+    );
+    assert!(
+        err.contains("active collab session already exists"),
+        "expected duplicate-session rejection, got: {err}"
+    );
+    assert!(
+        err.contains(&first_id),
+        "error must name the existing session id so the user can resume it, got: {err}"
+    );
+}
+
+#[test]
+fn collab_start_allows_distinct_branch_while_active() {
+    let app = App::open_for_test().unwrap();
+    let a = call_tool(
+        &app,
+        "collab_start",
+        json!({ "repo_path": "/repo", "branch": "main", "initiator": "claude" }),
+    );
+    let b = call_tool(
+        &app,
+        "collab_start",
+        json!({ "repo_path": "/repo", "branch": "feature-x", "initiator": "claude" }),
+    );
+    assert_ne!(
+        a["session_id"].as_str().unwrap(),
+        b["session_id"].as_str().unwrap(),
+        "distinct branches must each get their own active session"
+    );
+}
+
+#[test]
+fn collab_start_allows_restart_after_end() {
+    let app = App::open_for_test().unwrap();
+    // `drive_to_plan_locked` starts on /repo + main and reaches PlanLocked,
+    // the phase where `collab_end` is permitted.
+    let first_id = drive_to_plan_locked(&app, "fp");
+    let ended = call_tool(
+        &app,
+        "collab_end",
+        json!({ "session_id": &first_id, "agent": "claude" }),
+    );
+    assert_eq!(ended["ok"], true);
+
+    // With the prior session explicitly ended, a fresh session on the same
+    // repo+branch is allowed again.
+    let second = call_tool(
+        &app,
+        "collab_start",
+        json!({ "repo_path": "/repo", "branch": "main", "initiator": "claude" }),
+    );
+    assert_ne!(
+        second["session_id"].as_str().unwrap(),
+        first_id,
+        "a new session after collab_end must have a distinct id"
+    );
+}
+
+#[test]
 fn collab_end_rejected_in_active_planning_phase() {
     let app = App::open_for_test().unwrap();
     let started = call_tool(
