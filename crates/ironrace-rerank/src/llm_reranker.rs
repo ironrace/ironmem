@@ -32,11 +32,14 @@ const RERANK_PROMPT_TEMPLATE: &str = "Question: {QUERY}\n\nWhich of the followin
 /// is the only setting that produced an R@1 lift in the 50-q probe (+10pp).
 const PASSAGE_MAX_CHARS: usize = 2000;
 
+/// Wraps an [`LlmClient`] to implement [`RerankerScorer`] via the "pick one"
+/// recipe (see module docs). Owns the client it scores with.
 pub struct LlmReranker<C: LlmClient> {
     client: C,
 }
 
 impl<C: LlmClient> LlmReranker<C> {
+    /// Construct a reranker that takes ownership of `client`.
     pub fn new(client: C) -> Self {
         Self { client }
     }
@@ -113,16 +116,18 @@ fn parse_chosen_index(raw: &str, expected_n: usize) -> Result<usize> {
         Some(n) if (1..=expected_n).contains(&n) => Ok(n - 1),
         Some(n) => {
             tracing::trace!(
-                raw = %raw,
-                assistant = %assistant_text,
                 parsed = n,
                 expected_n,
+                assistant_len = assistant_text.chars().count(),
                 "rerank response: chosen index out of range"
             );
             bail!("LLM returned chosen index {n} outside 1..={expected_n}")
         }
         None => {
-            tracing::trace!(raw = %raw, assistant = %assistant_text, "rerank response: no integer found");
+            tracing::trace!(
+                assistant_len = assistant_text.chars().count(),
+                "rerank response: no integer found"
+            );
             bail!("could not parse a passage number from LLM response")
         }
     }

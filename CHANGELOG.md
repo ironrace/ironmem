@@ -7,6 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **`ironrace-rerank` 0.3.4 → 0.4.0 (breaking, workspace-internal):**
+  `LlmClient::call` now returns `Result<LlmResponse>` instead of
+  `Result<String>`. `LlmResponse` carries the assistant `text` plus token
+  `usage`, `cost_usd`, `model`, an `estimated` flag, and `prompt_chars`. New
+  public types: `Usage`, `LlmResponse`, `RerankScoreResult`, `RerankScoreError`;
+  `RerankerScorer::score_pairs` now returns `RerankScoreResult`. Both backends
+  (`ClaudeCliClient`, `AnthropicApiClient`) parse real token counts (the CLI
+  falls back to a chars/4 estimate, flagged `estimated`).
+
+### Added
+
+- `ironmem` now records a `token_usage` row per real LLM call at the
+  preference-extraction (`source = "pref_extract"`) and LLM-rerank
+  (`source = "llm_rerank"`) call sites, via
+  `db::metrics::new_token_usage_from_llm`. Usage is preserved even when a
+  rerank answer fails to parse. Inserts are non-fatal — a recording failure
+  logs a warning and never breaks `add_drawer`/`search`. Context columns
+  (session/collab/phase/task) are intentionally left `None` pending a later
+  attribution pass.
+
 ## [0.3.4] - 2026-06-04
 
 ### Changed

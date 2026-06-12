@@ -127,6 +127,27 @@ mod tests {
         }
     }
 
+    /// Returns a wrong-length score vec but carries an `llm_response`. The
+    /// length-mismatch path must still surface the usage — the LLM call really
+    /// happened and its tokens were spent, so the row should be recorded.
+    struct WrongLenScorerWithUsage;
+    impl RerankerScorer for WrongLenScorerWithUsage {
+        fn score_pairs(&self, _q: &str, _p: &[&str]) -> Result<ironrace_rerank::RerankScoreResult> {
+            Ok(ironrace_rerank::RerankScoreResult {
+                // Deliberately length 1, mismatching k (>1 here).
+                scores: vec![0.0],
+                llm_response: Some(ironrace_rerank::LlmResponse {
+                    text: "1".into(),
+                    usage: ironrace_rerank::Usage::default(),
+                    cost_usd: None,
+                    model: "m".into(),
+                    estimated: true,
+                    prompt_chars: 10,
+                }),
+            })
+        }
+    }
+
     #[test]
     fn top_k_window_reorders_tail_untouched() {
         // OnceLock means whichever IRONMEM_RERANK_TOP_K is first set wins.
@@ -189,6 +210,37 @@ mod tests {
         assert_eq!(
             pre_after_sort, post,
             "scorer Err leaves pre-sorted order intact"
+        );
+    }
+
+    #[test]
+    fn score_count_mismatch_preserves_usage_and_order() {
+        let scorer: Arc<dyn RerankerScorer> = Arc::new(WrongLenScorerWithUsage);
+        let mut scored = vec![sd(1, 0.9, "a"), sd(2, 0.8, "b"), sd(3, 0.7, "c")];
+
+        let pre_after_sort: Vec<String> = {
+            let mut copy = scored.clone();
+            copy.sort_by(|a, b| {
+                b.score
+                    .partial_cmp(&a.score)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+                    .then_with(|| a.drawer.id.cmp(&b.drawer.id))
+            });
+            copy.iter().map(|s| s.drawer.id.clone()).collect()
+        };
+
+        let resp = cross_encoder_rerank(&scorer, "q", &mut scored);
+
+        // The call happened — its usage must survive the length-mismatch skip.
+        assert!(
+            resp.is_some(),
+            "score-count mismatch must still surface the LLM response/usage"
+        );
+        // Scores were not applied, so order is the pre-sorted order, untouched.
+        let post: Vec<String> = scored.iter().map(|s| s.drawer.id.clone()).collect();
+        assert_eq!(
+            pre_after_sort, post,
+            "score-count mismatch leaves pre-sorted order intact"
         );
     }
 }

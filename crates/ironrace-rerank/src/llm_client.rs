@@ -343,6 +343,7 @@ impl MockLlmClient {
             response: Ok(response),
         }
     }
+    /// Error-path fixture: every `call` returns `Err(message)`.
     pub fn err(message: impl Into<String>) -> Self {
         Self {
             response: Err(anyhow!(message.into())),

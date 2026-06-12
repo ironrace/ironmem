@@ -24,6 +24,9 @@ pub struct RerankScoreError {
 }
 
 impl RerankScoreError {
+    /// Build a scoring error that carries the `LlmResponse` from the call that
+    /// already happened, so the caller can still persist its token usage even
+    /// though the answer could not be converted into scores.
     pub fn with_response(message: impl Into<String>, llm_response: LlmResponse) -> Self {
         Self {
             message: message.into(),

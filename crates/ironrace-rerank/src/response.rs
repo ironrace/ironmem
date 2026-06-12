@@ -38,8 +38,10 @@ impl Usage {
 
 /// One LLM call's result: assistant `text` plus accounting metadata.
 ///
-/// `prompt_chars` is the char count of the fully-serialized prompt the client
-/// actually sent (set at the client boundary, where the real prompt exists).
+/// `prompt_chars` is the char count of the prompt text passed to `call()`
+/// (set at the client boundary, where the real prompt exists). This is the
+/// user prompt string itself, not the JSON request envelope the API client
+/// wraps it in.
 /// `estimated` is true when token counts were derived from a chars/4 heuristic
 /// rather than a provider-reported `usage` block.
 #[derive(Debug, Clone)]
