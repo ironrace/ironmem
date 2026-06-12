@@ -509,6 +509,40 @@ impl Database {
             .map_err(MemoryError::from)
     }
 
+    /// Atomically bump `review_rounds` for one task (METRICS_SPEC §4). A
+    /// single UPDATE so concurrent writer processes can't lose increments to
+    /// a read-modify-write race. Missing `task_tag` is a no-op `Ok` — the
+    /// metrics layer is best-effort and a missing row is the caller's signal
+    /// problem, not a transport error.
+    pub fn increment_task_review_rounds(&self, task_tag: &str) -> Result<(), MemoryError> {
+        self.conn.execute(
+            "UPDATE task_outcomes SET review_rounds = review_rounds + 1 WHERE task_tag = ?1",
+            params![task_tag],
+        )?;
+        Ok(())
+    }
+
+    /// Partial terminal-state update for one task (METRICS_SPEC §5.4):
+    /// only non-`None` fields are written (COALESCE keeps existing values),
+    /// counters are never touched. Missing `task_tag` is a no-op `Ok`.
+    pub fn mark_task_outcome_done(
+        &self,
+        task_tag: &str,
+        done_at: Option<&str>,
+        outcome: Option<&str>,
+        pr_url: Option<&str>,
+    ) -> Result<(), MemoryError> {
+        self.conn.execute(
+            "UPDATE task_outcomes SET
+                done_at = COALESCE(?2, done_at),
+                outcome = COALESCE(?3, outcome),
+                pr_url  = COALESCE(?4, pr_url)
+             WHERE task_tag = ?1",
+            params![task_tag, done_at, outcome, pr_url],
+        )?;
+        Ok(())
+    }
+
     /// Return all `task_outcomes` rows for a given `collab_session_id`,
     /// ordered by `(started_at, id)` ascending.
     pub fn task_outcomes_for_collab(
@@ -1086,5 +1120,64 @@ mod tests {
             .join(".ironrace-memory")
             .join("memory.sqlite3");
         pb.is_file().then_some(pb)
+    }
+
+    #[test]
+    fn increment_task_review_rounds_is_monotonic_and_preserves_row() {
+        let db = db();
+        db.upsert_task_outcome(&sample_task_outcome("issue-83", "2026-06-12T00:00:00Z"))
+            .unwrap();
+        db.increment_task_review_rounds("issue-83").unwrap();
+        db.increment_task_review_rounds("issue-83").unwrap();
+        let got = db.get_task_outcome("issue-83").unwrap().unwrap();
+        assert_eq!(got.review_rounds, 2);
+        assert_eq!(got.fix_commits, 0); // untouched
+        assert_eq!(got.started_at.as_deref(), Some("2026-06-12T00:00:00Z")); // untouched
+    }
+
+    #[test]
+    fn increment_task_review_rounds_missing_tag_is_noop_ok() {
+        let db = db();
+        assert!(db.increment_task_review_rounds("missing").is_ok());
+    }
+
+    #[test]
+    fn mark_task_outcome_done_partial_update_preserves_counters_and_nones() {
+        let db = db();
+        let mut t = sample_task_outcome("issue-83", "2026-06-12T00:00:00Z");
+        t.review_rounds = 3;
+        db.upsert_task_outcome(&t).unwrap();
+
+        // First call: done_at + pr_url, no outcome (CodingComplete semantics).
+        db.mark_task_outcome_done(
+            "issue-83",
+            Some("2026-06-12T01:00:00Z"),
+            None,
+            Some("https://example/pr/5"),
+        )
+        .unwrap();
+        let got = db.get_task_outcome("issue-83").unwrap().unwrap();
+        assert_eq!(got.done_at.as_deref(), Some("2026-06-12T01:00:00Z"));
+        assert!(got.outcome.is_none());
+        assert_eq!(got.pr_url.as_deref(), Some("https://example/pr/5"));
+        assert_eq!(got.review_rounds, 3); // counters preserved
+
+        // Second call: outcome only (collab_end attestation); earlier fields kept.
+        db.mark_task_outcome_done("issue-83", None, Some("merged"), None)
+            .unwrap();
+        let got = db.get_task_outcome("issue-83").unwrap().unwrap();
+        assert_eq!(got.outcome.as_deref(), Some("merged"));
+        assert_eq!(got.done_at.as_deref(), Some("2026-06-12T01:00:00Z")); // not clobbered
+        assert_eq!(got.pr_url.as_deref(), Some("https://example/pr/5")); // not clobbered
+    }
+
+    #[test]
+    fn mark_task_outcome_done_rejects_bad_outcome_enum() {
+        let db = db();
+        db.upsert_task_outcome(&sample_task_outcome("issue-83", "2026-06-12T00:00:00Z"))
+            .unwrap();
+        assert!(db
+            .mark_task_outcome_done("issue-83", None, Some("bogus"), None)
+            .is_err());
     }
 }
