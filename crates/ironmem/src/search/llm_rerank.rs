@@ -23,6 +23,7 @@ use crate::search::tunables;
 /// Reorder the top-K of `scored` using `scorer`. Returns the LLM response (and
 /// its usage) when an LLM-backed scorer produced one, else None. See module doc
 /// for ordering invariants — unchanged here.
+#[must_use]
 pub fn cross_encoder_rerank(
     scorer: &Arc<dyn RerankerScorer>,
     query: &str,

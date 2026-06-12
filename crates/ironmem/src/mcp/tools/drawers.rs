@@ -133,7 +133,18 @@ fn build_synthetic(
                 ),
                 _ => crate::search::pref_extract_llm::cli_extractor(model, timeout),
             };
-            extractor.extract(content)
+            let (phrases, response) = extractor.extract_with_response(content);
+            if let Some(resp) = response {
+                let row = crate::db::metrics::new_token_usage_from_llm(
+                    "pref_extract",
+                    &resp,
+                    chrono::Utc::now().to_rfc3339(),
+                );
+                if let Err(e) = app.db.insert_token_usage(&row) {
+                    tracing::warn!(error = %e, "pref_extract token_usage insert failed");
+                }
+            }
+            phrases
         }
         _ => RegexPreferenceExtractor.extract(content),
     };

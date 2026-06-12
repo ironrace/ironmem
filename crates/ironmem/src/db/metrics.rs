@@ -38,6 +38,39 @@ pub struct NewTokenUsage {
     pub cost_usd: Option<f64>,
 }
 
+/// Build a `NewTokenUsage` from an LLM call result. `source` is the call site
+/// (`"llm_rerank"` | `"pref_extract"`); `ts` is an RFC3339 timestamp. `harness`
+/// is fixed to `"claude"` because these are ironmem-internal Claude-model calls
+/// (the orchestrating agent is not attributed here — a later PR plumbs the
+/// session/collab/task context columns, which stay `None` for now).
+pub fn new_token_usage_from_llm(
+    source: &str,
+    resp: &ironrace_rerank::LlmResponse,
+    ts: String,
+) -> NewTokenUsage {
+    NewTokenUsage {
+        ts,
+        source: source.to_string(),
+        harness: "claude".to_string(),
+        model: if resp.model.is_empty() {
+            None
+        } else {
+            Some(resp.model.clone())
+        },
+        session_id: None,
+        collab_session_id: None,
+        collab_phase: None,
+        task_tag: None,
+        input_tokens: resp.usage.input_tokens as i64,
+        output_tokens: resp.usage.output_tokens as i64,
+        cache_creation_input_tokens: resp.usage.cache_creation_input_tokens as i64,
+        cache_read_input_tokens: resp.usage.cache_read_input_tokens as i64,
+        estimated: resp.estimated,
+        chars: resp.chars() as i64,
+        cost_usd: resp.cost_usd,
+    }
+}
+
 /// A stored `token_usage` row including its auto-assigned `id`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TokenUsage {
@@ -493,6 +526,45 @@ mod tests {
             handoffs: 0,
             pr_url: None,
         }
+    }
+
+    #[test]
+    fn new_token_usage_from_llm_maps_fields() {
+        use ironrace_rerank::{LlmResponse, Usage};
+        let resp = LlmResponse {
+            text: "hello".to_string(),
+            usage: Usage {
+                input_tokens: 120,
+                output_tokens: 3,
+                cache_creation_input_tokens: 1,
+                cache_read_input_tokens: 40,
+            },
+            cost_usd: Some(0.0012),
+            model: "claude-haiku-4-5".to_string(),
+            estimated: false,
+            prompt_chars: 200,
+        };
+        let row = new_token_usage_from_llm(
+            "pref_extract",
+            &resp,
+            "2026-06-12T00:00:00+00:00".to_string(),
+        );
+        assert_eq!(row.source, "pref_extract");
+        assert_eq!(row.harness, "claude");
+        assert_eq!(row.model.as_deref(), Some("claude-haiku-4-5"));
+        assert_eq!(row.input_tokens, 120);
+        assert_eq!(row.output_tokens, 3);
+        assert_eq!(row.cache_read_input_tokens, 40);
+        assert_eq!(row.cache_creation_input_tokens, 1);
+        assert!(!row.estimated);
+        assert_eq!(row.chars, 205); // prompt_chars 200 + text "hello" 5
+        assert_eq!(row.cost_usd, Some(0.0012));
+        assert!(
+            row.session_id.is_none()
+                && row.collab_session_id.is_none()
+                && row.collab_phase.is_none()
+                && row.task_tag.is_none()
+        );
     }
 
     #[test]

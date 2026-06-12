@@ -321,11 +321,21 @@ pub fn search(
     if tunables::rerank_enabled() {
         app.ensure_reranker_loaded();
         if let Some(scorer) = app.reranker.read().unwrap().clone() {
-            crate::search::llm_rerank::cross_encoder_rerank(
+            let llm_response = crate::search::llm_rerank::cross_encoder_rerank(
                 &scorer,
                 &sanitized.clean_query,
                 &mut scored,
             );
+            if let Some(resp) = llm_response {
+                let row = crate::db::metrics::new_token_usage_from_llm(
+                    "llm_rerank",
+                    &resp,
+                    chrono::Utc::now().to_rfc3339(),
+                );
+                if let Err(e) = app.db.insert_token_usage(&row) {
+                    tracing::warn!(error = %e, "llm_rerank token_usage insert failed");
+                }
+            }
         }
     }
 
