@@ -40,9 +40,9 @@ pub struct NewTokenUsage {
 
 /// Build a `NewTokenUsage` from an LLM call result. `source` is the call site
 /// (`"llm_rerank"` | `"pref_extract"`); `ts` is an RFC3339 timestamp. `harness`
-/// is fixed to `"claude"` because these are ironmem-internal Claude-model calls
-/// (the orchestrating agent is not attributed here — a later PR plumbs the
-/// session/collab/task context columns, which stay `None` for now).
+/// is fixed to `"claude"` because these are ironmem-internal Claude-model calls.
+/// Context columns (`collab_session_id`, `collab_phase`, `task_tag`) are left
+/// `None` here — callers apply attribution by chaining `.with_context(&ctx)`.
 pub fn new_token_usage_from_llm(
     source: &str,
     resp: &ironrace_rerank::LlmResponse,
@@ -75,7 +75,6 @@ impl NewTokenUsage {
     /// Return a copy stamped with the resolved attribution context
     /// (METRICS_SPEC §2.3/§3). Consuming builder: callers chain it after
     /// construction; unset context fields leave the row's fields unchanged.
-    #[allow(dead_code)] // wired to callers in Task 2+ (account_mcp_response, record_occupancy_sample)
     pub(crate) fn with_context(self, ctx: &crate::metrics::MetricsContext) -> NewTokenUsage {
         NewTokenUsage {
             collab_session_id: ctx.collab_session_id.clone().or(self.collab_session_id),
@@ -512,8 +511,8 @@ impl Database {
     /// Atomically bump `review_rounds` for one task (METRICS_SPEC §4). A
     /// single UPDATE so concurrent writer processes can't lose increments to
     /// a read-modify-write race. Missing `task_tag` is a no-op `Ok` — the
-    /// metrics layer is best-effort and a missing row is the caller's signal
-    /// problem, not a transport error.
+    /// metrics layer is best-effort and a missing row is a caller problem,
+    /// not a transport error.
     pub fn increment_task_review_rounds(&self, task_tag: &str) -> Result<(), MemoryError> {
         self.conn.execute(
             "UPDATE task_outcomes SET review_rounds = review_rounds + 1 WHERE task_tag = ?1",

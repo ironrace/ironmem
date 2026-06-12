@@ -124,11 +124,13 @@ fn build_synthetic(
     // Record a `pref_extract` token_usage row from an LLM response (non-fatal:
     // a failed insert logs at warn and is dropped — pref-enrich is best-effort).
     let record_pref_usage = |resp: &ironrace_rerank::LlmResponse| {
+        let ctx = crate::metrics::MetricsContext::resolve(app);
         let row = crate::db::metrics::new_token_usage_from_llm(
             "pref_extract",
             resp,
             chrono::Utc::now().to_rfc3339(),
-        );
+        )
+        .with_context(&ctx);
         if let Err(e) = app.db.insert_token_usage(&row) {
             tracing::warn!(
                 error = %e,

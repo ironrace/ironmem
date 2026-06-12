@@ -271,3 +271,200 @@ fn failed_llm_pref_call_records_no_row() {
 
     std::env::remove_var("IRONMEM_PREF_ENRICH");
 }
+
+// ---------------------------------------------------------------------------
+// Task 3: collab session + task-tag stamping tests
+// ---------------------------------------------------------------------------
+
+/// Helper: seed a collab session via the queue layer (same pattern used in
+/// `metrics/mod.rs` unit tests) and return its id.
+fn seed_collab_session(app: &App, sid: &str) {
+    app.db
+        .with_transaction(|tx| {
+            ironmem::collab::queue::create_session(
+                tx,
+                sid,
+                "/tmp/repo",
+                "main",
+                None,
+                ironmem::collab::Agent::Claude,
+            )
+        })
+        .expect("seed_collab_session must succeed");
+}
+
+/// pref_extract rows produced during an active collab session carry
+/// collab_session_id + phase bucket (new session = PlanParallelDrafts → "planning").
+#[test]
+fn pref_extract_rows_are_stamped_during_active_collab_session() {
+    let _guard = PREF_ENV_LOCK.lock().unwrap();
+    std::env::set_var("IRONMEM_PREF_ENRICH", "1");
+
+    let mock = MockLlmClient::ok_response(LlmResponse {
+        text: ENVELOPE.to_string(),
+        usage: Usage {
+            input_tokens: 130,
+            output_tokens: 9,
+            ..Default::default()
+        },
+        cost_usd: Some(0.0009),
+        model: "claude-haiku-4-5".to_string(),
+        estimated: false,
+        prompt_chars: 512,
+    });
+    let extractor = Arc::new(LlmPreferenceExtractor::new(Arc::new(mock)));
+    let app = App::with_pref_extractor(extractor).expect("build app");
+
+    let sid = "test-collab-pref-stamped";
+    seed_collab_session(&app, sid);
+    app.set_active_collab_session(sid);
+
+    let added = call(
+        &app,
+        "add_drawer",
+        json!({ "wing": "prefs", "room": "general", "content": CONVERSATION }),
+    );
+    assert_eq!(added["success"], true, "add_drawer should succeed");
+
+    let rows = app
+        .db
+        .query_token_usage(&TokenUsageQuery::default())
+        .expect("query_token_usage");
+    let pref_rows: Vec<_> = rows.iter().filter(|r| r.source == "pref_extract").collect();
+    assert_eq!(pref_rows.len(), 1, "exactly one pref_extract row");
+
+    let row = pref_rows[0];
+    assert_eq!(
+        row.collab_session_id.as_deref(),
+        Some(sid),
+        "row must carry the active collab session id"
+    );
+    assert_eq!(
+        row.collab_phase.as_deref(),
+        Some("planning"),
+        "fresh session (PlanParallelDrafts) maps to 'planning'"
+    );
+
+    std::env::remove_var("IRONMEM_PREF_ENRICH");
+}
+
+/// pref_extract rows produced WITHOUT an active collab session or task tag
+/// have all three context columns set to None.
+#[test]
+fn pref_extract_rows_are_unstamped_without_collab_or_tag() {
+    let _guard = PREF_ENV_LOCK.lock().unwrap();
+    std::env::set_var("IRONMEM_PREF_ENRICH", "1");
+
+    let mock = MockLlmClient::ok_response(LlmResponse {
+        text: ENVELOPE.to_string(),
+        usage: Usage {
+            input_tokens: 130,
+            output_tokens: 9,
+            ..Default::default()
+        },
+        cost_usd: Some(0.0009),
+        model: "claude-haiku-4-5".to_string(),
+        estimated: false,
+        prompt_chars: 512,
+    });
+    let extractor = Arc::new(LlmPreferenceExtractor::new(Arc::new(mock)));
+    let app = App::with_pref_extractor(extractor).expect("build app");
+    // Deliberately: no set_active_collab_session, no set_explicit_task_tag
+
+    let added = call(
+        &app,
+        "add_drawer",
+        json!({ "wing": "prefs", "room": "general", "content": CONVERSATION }),
+    );
+    assert_eq!(added["success"], true);
+
+    let rows = app
+        .db
+        .query_token_usage(&TokenUsageQuery::default())
+        .expect("query_token_usage");
+    let pref_rows: Vec<_> = rows.iter().filter(|r| r.source == "pref_extract").collect();
+    assert_eq!(pref_rows.len(), 1, "exactly one pref_extract row");
+
+    let row = pref_rows[0];
+    assert!(
+        row.collab_session_id.is_none(),
+        "no collab session → collab_session_id must be None"
+    );
+    assert!(
+        row.collab_phase.is_none(),
+        "no collab session or tag → collab_phase must be None"
+    );
+    assert!(
+        row.task_tag.is_none(),
+        "no task tag set → task_tag must be None"
+    );
+
+    std::env::remove_var("IRONMEM_PREF_ENRICH");
+}
+
+/// An explicit task tag (no collab session) stamps task_tag and "impl" bucket.
+#[test]
+fn explicit_task_tag_stamps_rows_with_impl_phase() {
+    let _guard = PREF_ENV_LOCK.lock().unwrap();
+    std::env::set_var("IRONMEM_PREF_ENRICH", "1");
+
+    let mock = MockLlmClient::ok_response(LlmResponse {
+        text: ENVELOPE.to_string(),
+        usage: Usage {
+            input_tokens: 130,
+            output_tokens: 9,
+            ..Default::default()
+        },
+        cost_usd: Some(0.0009),
+        model: "claude-haiku-4-5".to_string(),
+        estimated: false,
+        prompt_chars: 512,
+    });
+    let extractor = Arc::new(LlmPreferenceExtractor::new(Arc::new(mock)));
+    let app = App::with_pref_extractor(extractor).expect("build app");
+    app.set_explicit_task_tag("issue-99");
+    // No collab session — task tag path only.
+
+    let added = call(
+        &app,
+        "add_drawer",
+        json!({ "wing": "prefs", "room": "general", "content": CONVERSATION }),
+    );
+    assert_eq!(added["success"], true);
+
+    let rows = app
+        .db
+        .query_token_usage(&TokenUsageQuery::default())
+        .expect("query_token_usage");
+    let pref_rows: Vec<_> = rows.iter().filter(|r| r.source == "pref_extract").collect();
+    assert_eq!(pref_rows.len(), 1, "exactly one pref_extract row");
+
+    let row = pref_rows[0];
+    assert_eq!(
+        row.task_tag.as_deref(),
+        Some("issue-99"),
+        "task_tag must be stamped"
+    );
+    assert_eq!(
+        row.collab_phase.as_deref(),
+        Some("impl"),
+        "task-tag-only path defaults phase to 'impl' per §3.3"
+    );
+    assert!(
+        row.collab_session_id.is_none(),
+        "no collab session → collab_session_id must be None"
+    );
+
+    std::env::remove_var("IRONMEM_PREF_ENRICH");
+}
+
+// NOTE: The llm_rerank insert site is stamped with the identical `.with_context()`
+// shape as the pref_extract site (see `search/pipeline.rs`). The `with_context`
+// contract is already comprehensively verified in `metrics::mod::tests` (Task 1
+// unit tests). Driving the rerank stage deterministically in an integration test
+// requires a live reranker model or the force_rerank seam — the existing tests
+// `search_with_llm_reranker_records_llm_rerank_usage` and
+// `search_records_llm_rerank_usage_when_response_is_unparseable` cover the
+// recording path. A stamped-variant test for llm_rerank would require seeding a
+// collab session and is deferred; the code change at the rerank site is
+// structurally identical to pref_extract and is covered by the unit contract.

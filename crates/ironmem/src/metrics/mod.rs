@@ -54,7 +54,6 @@ use crate::collab::Phase;
 /// METRICS_SPEC §3.2: map the session `Phase` to its token_usage bucket.
 /// Exhaustive on purpose — a new `Phase` variant must fail compilation here
 /// so the spec table gets a conscious update, never a silent `other`.
-#[allow(dead_code)] // wired to callers in Task 2+ (account_mcp_response, record_occupancy_sample)
 pub(crate) fn phase_bucket(phase: Phase) -> &'static str {
     match phase {
         Phase::PlanParallelDrafts
@@ -73,7 +72,6 @@ pub(crate) fn phase_bucket(phase: Phase) -> &'static str {
 /// Resolved fresh at every row write — phase is read from the session record
 /// "at the time the row is recorded" (§3.2), never cached across turns.
 #[derive(Debug, Clone, Default, PartialEq)]
-#[allow(dead_code)] // wired to callers in Task 2+ (account_mcp_response, record_occupancy_sample)
 pub(crate) struct MetricsContext {
     pub collab_session_id: Option<String>,
     pub collab_phase: Option<String>,
@@ -86,7 +84,6 @@ impl MetricsContext {
     /// the explicit task tag (phase defaults to `impl` per §3.3); else empty.
     /// `ended_at IS NOT NULL` or a missing session clears the App cell.
     /// Best-effort: a DB read error degrades to an empty context + warn.
-    #[allow(dead_code)] // wired to callers in Task 2+ (account_mcp_response, record_occupancy_sample)
     pub(crate) fn resolve(app: &crate::mcp::app::App) -> MetricsContext {
         if let Some(sid) = app.active_collab_session_snapshot() {
             match app.db.collab_load_session_record(&sid) {
@@ -177,6 +174,7 @@ pub(crate) fn account_mcp_response(
     chars: i64,
     harness: &str,
     session_id: Option<&str>,
+    ctx: &MetricsContext,
 ) {
     let row = NewTokenUsage {
         ts: now_rfc3339(),
@@ -194,7 +192,8 @@ pub(crate) fn account_mcp_response(
         estimated: true,
         chars,
         cost_usd: None,
-    };
+    }
+    .with_context(ctx);
     if let Err(e) = db.insert_token_usage(&row) {
         tracing::warn!("metrics: insert mcp_response token_usage failed: {e}");
     }
