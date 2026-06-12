@@ -314,3 +314,80 @@ pub fn shrinkage_word_boundary_enabled() -> bool {
         Ok("0") | Ok("false")
     )
 }
+
+// ── metrics tunables (§5/§8) ────────────────────────────────────────────────
+// Unlike the search knobs above, these read the env FRESH on every call (no
+// OnceLock). They gate per-response / per-hook metrics writes that tests flip
+// via process-global env vars; a cached first-read would make IRONMEM_METRICS
+// and IRONMEM_CONTEXT_WINDOW untestable in a shared test binary. Call frequency
+// is ≤ once per MCP response / hook event, so a fresh env read is cheap.
+
+/// Context-window size used as the occupancy denominator (METRICS_SPEC §8.1).
+/// Default 200000; non-positive or unparseable overrides fall back to default.
+pub fn context_window() -> i64 {
+    match std::env::var("IRONMEM_CONTEXT_WINDOW")
+        .ok()
+        .and_then(|s| s.parse::<i64>().ok())
+    {
+        Some(v) if v > 0 => v,
+        _ => 200_000,
+    }
+}
+
+/// Global metrics kill switch (METRICS_SPEC §8.3). Default enabled; `0`,
+/// `false`, `no`, `off` disable.
+pub fn metrics_enabled() -> bool {
+    !matches!(
+        std::env::var("IRONMEM_METRICS").as_deref(),
+        Ok("0" | "false" | "no" | "off")
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Env vars are process-global; serialize these tests.
+    static METRICS_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn context_window_defaults_to_200000() {
+        let _g = METRICS_ENV_LOCK.lock().unwrap();
+        std::env::remove_var("IRONMEM_CONTEXT_WINDOW");
+        assert_eq!(context_window(), 200_000);
+    }
+
+    #[test]
+    fn context_window_reads_override() {
+        let _g = METRICS_ENV_LOCK.lock().unwrap();
+        std::env::set_var("IRONMEM_CONTEXT_WINDOW", "1000000");
+        assert_eq!(context_window(), 1_000_000);
+        std::env::remove_var("IRONMEM_CONTEXT_WINDOW");
+    }
+
+    #[test]
+    fn context_window_rejects_nonpositive_and_garbage() {
+        let _g = METRICS_ENV_LOCK.lock().unwrap();
+        std::env::set_var("IRONMEM_CONTEXT_WINDOW", "0");
+        assert_eq!(context_window(), 200_000);
+        std::env::set_var("IRONMEM_CONTEXT_WINDOW", "-5");
+        assert_eq!(context_window(), 200_000);
+        std::env::set_var("IRONMEM_CONTEXT_WINDOW", "abc");
+        assert_eq!(context_window(), 200_000);
+        std::env::remove_var("IRONMEM_CONTEXT_WINDOW");
+    }
+
+    #[test]
+    fn metrics_enabled_defaults_true_and_honors_kill_switch() {
+        let _g = METRICS_ENV_LOCK.lock().unwrap();
+        std::env::remove_var("IRONMEM_METRICS");
+        assert!(metrics_enabled());
+        for off in ["0", "false", "no", "off"] {
+            std::env::set_var("IRONMEM_METRICS", off);
+            assert!(!metrics_enabled(), "{off} should disable");
+        }
+        std::env::set_var("IRONMEM_METRICS", "1");
+        assert!(metrics_enabled());
+        std::env::remove_var("IRONMEM_METRICS");
+    }
+}
