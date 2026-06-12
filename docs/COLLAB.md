@@ -399,6 +399,17 @@ must be one of `{"claude","codex"}` — it routes the v3
 on the `implementer` column enforces the same set, so direct writes
 cannot bypass validation.
 
+**Duplicate-session guard.** `collab_start` (and `collab_start_code_review`)
+reject the call when an **active** session already exists for the same
+`repo_path` + `branch`. "Active" means `ended_at IS NULL` — including a
+session sitting at a terminal phase (`CodingComplete` / `CodingFailed`) that
+was never explicitly ended. The error names the existing `session_id` and its
+phase. This prevents an accidental second session — most often a fired
+`ScheduleWakeup` replaying the `/collab start` entry command after the first
+session already finished. To proceed deliberately, either resume the existing
+session (`/collab join <id>`) or `collab_end` it first (valid only from
+`PlanLocked` pre-`task_list`, `CodingComplete`, or `CodingFailed`).
+
 ### `collab_set_implementer`
 
 Rebinds the batch implementation owner for an existing session.

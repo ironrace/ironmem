@@ -703,7 +703,15 @@ g. Resume the normal dispatch loop. The next `collab_status` poll will
   `model` or any other override — only `config` per the matrix. Model swap
   is intentionally out of scope. If `mcp__codex__codex` is also not
   registered, tell the user to run `/collab join <session_id>` in a
-  Codex terminal, then `ScheduleWakeup` and resume polling.
+  Codex terminal, then `ScheduleWakeup` and resume polling. **Never use a
+  `/collab` entry command (`/collab start …`, `/collab join …`,
+  `/collab review …`) as the `ScheduleWakeup` prompt** — a fired wakeup
+  replays the prompt verbatim, which re-invokes the entry command and tries
+  to start a duplicate session. The server now rejects that duplicate (see
+  the duplicate-session guard invariant below), but you still burn a turn.
+  Use a benign diagnostic prompt (e.g. "check collab session `<id>` status
+  and resume the dispatch loop") or rely on the background task-completion
+  notification instead.
 
 - **Repository or PATH issues** → capture the error output, send
   `failure_report` with `coding_failure: "codex_exec_env_error: <error>"`.
@@ -730,6 +738,17 @@ Writes are best-effort and never block the protocol.
   or `CodingFailed`.
 - **Never** peek at Codex's draft before sending your own during
   `PlanParallelDrafts`. The server enforces blind-draft in `recv`.
+- **Duplicate-session guard.** `collab_start` / `collab_start_code_review`
+  reject a new session when an active one (`ended_at IS NULL`, including a
+  session left at `CodingComplete` / `CodingFailed`) already exists for the
+  same `repo_path` + `branch`; the error names the existing `session_id`. On
+  that error, do **not** retry — resume the named session with
+  `/collab join <id>`, or `collab_end` it first if it is genuinely finished.
+- **Never `ScheduleWakeup` with a `/collab` entry command as the prompt.** A
+  fired wakeup replays it and would re-enter `start`/`join`/`review`. Use a
+  benign diagnostic prompt or rely on the background task-completion
+  notification; the duplicate-session guard is the server-side backstop, not
+  a license to schedule the entry command.
 - **Harness Plan Mode gates only at: v1 FIRST `canonical`
   (`PlanSynthesisPending` with `review_round == 0`), v1 `final`
   (`PlanClaudeFinalizePending`), and v3 `final_review`
