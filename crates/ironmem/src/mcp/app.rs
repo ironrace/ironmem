@@ -56,11 +56,12 @@ pub struct App {
     /// by `collab_status`, which is also used to inspect foreign/stale
     /// sessions. Process-global rather than request-local because the dominant
     /// token volume (`search` rerank, pref-extract) carries no collab argument
-    /// — only process state can attribute it. Collab handlers reject switching
-    /// this process-local attribution slot to a different still-live session;
-    /// an agent that truly needs parallel collab sessions must use separate
-    /// server processes so `search` / pref-extract / rerank work cannot be
-    /// stamped onto the wrong session.
+    /// — only process state can attribute it. Enforced invariant: one active
+    /// collab session per server process, regardless of repo — the collab
+    /// handlers' conflict guard rejects binding a second still-live session to
+    /// this slot. Parallel collab sessions require separate server processes so
+    /// `search` / pref-extract / rerank work cannot be stamped onto the wrong
+    /// session.
     pub active_collab_session_id: RwLock<Option<String>>,
     /// Explicit task tag for non-collab work (METRICS_SPEC §2.3 item 2), set
     /// via `status` tool args. Only consulted when no active collab session

@@ -536,3 +536,22 @@ destination, or reporting query changed.
   GitHub. `fix_commits` and `handoffs` remain 0 in this phase: `handoffs` awaits the
   session-handoff machinery (PR 13/15); `fix_commits` needs commit-counting the MCP server
   cannot do without git access — deferred, tracked on the roadmap.
+
+- **Process-attribution constraint (clarification of §2.3 / §3).** Only one active collab
+  session may be bound to the process attribution slot of a given MCP server process at a
+  time — the constraint applies across all repos, not just the same repo+branch. The collab
+  handlers (`collab_start`, `collab_start_code_review`, `collab_send`, `collab_recv`,
+  `collab_wait_my_turn`) reject any attempt to bind a second still-live session to the
+  process slot. Stale or ended sessions self-clear automatically. Parallel collab sessions
+  require separate server processes so that `search`, pref-extract, and rerank token-usage
+  rows cannot be stamped onto the wrong session.
+
+- **§4 `review_rounds` increment semantics (clarification of §4 "each entry into
+  review_local / final_review following impl/rework" wording).** As shipped, `review_rounds`
+  increments exactly on phase transitions whose *new* phase buckets to `review` from a phase
+  bucketing to `impl` or `rework`. In the current v3 phase order the only such edge is
+  `CodeReviewFixGlobalPending → CodeReviewLocalPending` (rework → review). The
+  `CodeReviewLocalPending → CodeReviewFinalPending` transition (review → review) does *not*
+  increment, nor does the `CodeReviewFinalPending → CodingComplete` transition (review →
+  other). This narrows §4's looser description; no counter name, unit, or destination
+  changed.

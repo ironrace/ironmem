@@ -82,7 +82,8 @@ impl MetricsContext {
     /// §2.3 priority: active collab session first (stamps id + phase bucket,
     /// INCLUDING terminal-but-not-ended sessions, which stamp `other`); else
     /// the explicit task tag (phase defaults to `impl` per §3.3); else empty.
-    /// `ended_at IS NOT NULL` or a missing session clears the App cell.
+    /// Ended (`ended_at IS NOT NULL`) or missing sessions clear the App cell;
+    /// the discovering row stays unstamped (returns `MetricsContext::default()`).
     /// Best-effort: a DB read error degrades to an empty context + warn.
     pub(crate) fn resolve(app: &crate::mcp::app::App) -> MetricsContext {
         if let Some(sid) = app.active_collab_session_snapshot() {

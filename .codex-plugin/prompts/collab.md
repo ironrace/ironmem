@@ -435,6 +435,10 @@ All existing v3 anti-puppeteering rules apply unchanged.
   same `repo_path` + `branch`; the error names the existing `session_id`.
   Claude almost always initiates, but if you ever hit this on a `start`,
   resume the named session with `/collab join <id>` instead of retrying.
+- **Process attribution guard.** On error `"another active collab session is
+  already bound to this MCP process for metrics attribution: <id>"`, do not
+  retry blindly — `collab_end` the named session if it is finished, or run the
+  new session from a separate server process; stale/ended sessions self-clear.
 - **Every v3 `collab_send` payload is a JSON-encoded string** per the
   matrix in `docs/COLLAB.md`. Never send prose for v3 topics.
 - **`head_sha` in every v3 payload is the current `HEAD` AFTER any commit

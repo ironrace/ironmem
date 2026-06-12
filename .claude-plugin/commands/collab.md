@@ -744,6 +744,10 @@ Writes are best-effort and never block the protocol.
   same `repo_path` + `branch`; the error names the existing `session_id`. On
   that error, do **not** retry — resume the named session with
   `/collab join <id>`, or `collab_end` it first if it is genuinely finished.
+- **Process attribution guard.** On error `"another active collab session is
+  already bound to this MCP process for metrics attribution: <id>"`, do not
+  retry blindly — `collab_end` the named session if it is finished, or run the
+  new session from a separate server process; stale/ended sessions self-clear.
 - **Never `ScheduleWakeup` with a `/collab` entry command as the prompt.** A
   fired wakeup replays it and would re-enter `start`/`join`/`review`. Use a
   benign diagnostic prompt or rely on the background task-completion

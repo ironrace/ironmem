@@ -212,6 +212,40 @@ fn record_task_outcome_transition(
     }
 }
 
+/// Shared decision logic for the process-attribution conflict guard.
+///
+/// Invariant: one live collab session may own the process attribution slot at a time
+/// (any repo). Stale or missing sessions self-heal by clearing the cell. Returns
+/// `true` when the cell should be cleared (stale/missing), `false` is unreachable
+/// — the live-session arm returns `Err` directly.
+///
+/// A turn is refused rather than risking ambiguous attribution; the raw DB error
+/// detail lives in the server log, not in the MCP response.
+fn check_conflicting_session(
+    load_result: Result<crate::collab::queue::SessionRecord, MemoryError>,
+    active_session_id: &str,
+    requested_session_id: &str,
+) -> Result<bool /* clear_cell */, MemoryError> {
+    match load_result {
+        Ok(record) if record.ended_at.is_none() => Err(MemoryError::Validation(format!(
+            "another active collab session is already bound to this MCP process for metrics attribution: {active_session_id}. End it or use a separate server process before switching to {requested_session_id}."
+        ))),
+        Ok(_) | Err(MemoryError::NotFound(_)) => Ok(true),
+        Err(e) => {
+            tracing::warn!(
+                "could not verify active collab session {active_session_id} before switching \
+                 metrics attribution to {requested_session_id}: {e}"
+            );
+            // Refuse the turn rather than risk ambiguous attribution;
+            // detail is in the server log above.
+            Err(MemoryError::Validation(format!(
+                "could not verify active collab session {active_session_id} before switching \
+                 metrics attribution to {requested_session_id}"
+            )))
+        }
+    }
+}
+
 fn ensure_no_conflicting_process_session(
     app: &App,
     requested_session_id: &str,
@@ -223,18 +257,11 @@ fn ensure_no_conflicting_process_session(
         return Ok(());
     }
 
-    match app.db.collab_load_session_record(&active_session_id) {
-        Ok(record) if record.ended_at.is_none() => Err(MemoryError::Validation(format!(
-            "another active collab session is already bound to this MCP process for metrics attribution: {active_session_id}. End it or use a separate server process before switching to {requested_session_id}."
-        ))),
-        Ok(_) | Err(MemoryError::NotFound(_)) => {
-            app.clear_active_collab_session();
-            Ok(())
-        }
-        Err(e) => Err(MemoryError::Validation(format!(
-            "could not verify active collab session {active_session_id} before switching metrics attribution: {e}"
-        ))),
+    let load_result = app.db.collab_load_session_record(&active_session_id);
+    if check_conflicting_session(load_result, &active_session_id, requested_session_id)? {
+        app.clear_active_collab_session();
     }
+    Ok(())
 }
 
 fn ensure_no_conflicting_process_session_tx(
@@ -249,18 +276,11 @@ fn ensure_no_conflicting_process_session_tx(
         return Ok(());
     }
 
-    match crate::collab::queue::load_session_record(tx, &active_session_id) {
-        Ok(record) if record.ended_at.is_none() => Err(MemoryError::Validation(format!(
-            "another active collab session is already bound to this MCP process for metrics attribution: {active_session_id}. End it or use a separate server process before switching to {requested_session_id}."
-        ))),
-        Ok(_) | Err(MemoryError::NotFound(_)) => {
-            app.clear_active_collab_session();
-            Ok(())
-        }
-        Err(e) => Err(MemoryError::Validation(format!(
-            "could not verify active collab session {active_session_id} before switching metrics attribution: {e}"
-        ))),
+    let load_result = crate::collab::queue::load_session_record(tx, &active_session_id);
+    if check_conflicting_session(load_result, &active_session_id, requested_session_id)? {
+        app.clear_active_collab_session();
     }
+    Ok(())
 }
 
 pub(super) fn handle_collab_start(app: &App, args: &Value) -> Result<Value, MemoryError> {
@@ -296,7 +316,7 @@ pub(super) fn handle_collab_start(app: &App, args: &Value) -> Result<Value, Memo
             return Err(MemoryError::Validation(format!(
                 "an active collab session already exists for repo {repo_path} branch {branch}: \
                  {existing_id} (phase {phase}). Resume it with `/collab join {existing_id}`, or \
-                if it is finished call collab_end on it before starting a new session here."
+                 if it is finished call collab_end on it before starting a new session here."
             )));
         }
         ensure_no_conflicting_process_session_tx(app, tx, &session_id)?;
@@ -421,7 +441,7 @@ pub(super) fn handle_collab_start_code_review(
             return Err(MemoryError::Validation(format!(
                 "an active collab session already exists for repo {repo_path} branch {branch}: \
                  {existing_id} (phase {phase}). Resume it with `/collab join {existing_id}`, or \
-                if it is finished call collab_end on it before starting a new session here."
+                 if it is finished call collab_end on it before starting a new session here."
             )));
         }
         ensure_no_conflicting_process_session_tx(app, tx, &session_id)?;
@@ -871,6 +891,7 @@ pub(super) fn handle_collab_end(app: &App, args: &Value) -> Result<Value, Memory
     }
     if app.active_collab_session_snapshot().as_deref() == Some(session_id) {
         app.clear_active_collab_session();
+        // Leaving a *different* session's cell intact is intentional: that session still owns the slot.
     }
 
     Ok(json!({ "ok": true, "session_id": session_id }))
