@@ -6,13 +6,6 @@
 //! `docs/METRICS_SPEC.md`. Token aggregations remain verbatim §10; the stored
 //! provider cost is surfaced separately as `provider_reported_cost_usd`.
 
-// Interim: the production caller (`super::cost::row_cost_usd`, invoked from
-// `run_report`) lands in Task 3 of this plan. Until then these items are
-// exercised only by the unit tests below. CI runs `clippy -- -D warnings`, so
-// suppress dead-code here for this skeleton commit; removed once Task 3 wires
-// the caller. Mirrors the existing `#[allow(dead_code)]` precedent in db/wal.rs.
-#![allow(dead_code)]
-
 /// METRICS_SPEC §7.1 pinned rates: `(model_id, input $/MTok, output $/MTok)`.
 /// `claude-fable-5` is retained as frozen reference data for pricing historical
 /// rows even though the model is no longer dispatched.
