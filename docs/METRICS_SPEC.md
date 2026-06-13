@@ -555,3 +555,24 @@ destination, or reporting query changed.
   increment, nor does the `CodeReviewFinalPending → CodingComplete` transition (review →
   other). This narrows §4's looser description; no counter name, unit, or destination
   changed.
+
+### 2026-06-13 — PR 06 / issue #84: `ironmem report` cost rendering (no contract change to §1–§11 token semantics)
+
+- **Cost rendering.** `ironmem report` (§10) renders the per-task/per-phase and
+  headline **cost** as a **§7-derived** figure — `Σ tokens_of_kind × rate(model, kind)`
+  using the §7.1 table embedded as a const (`crates/ironmem/src/report/cost.rs`,
+  unit-pinned to §7.1) — rather than `SUM(token_usage.cost_usd)`. Reason: the
+  Phase-1 capture pipeline (#81) populates `cost_usd` only for the Claude-CLI
+  backend (`total_cost_usd`); summing the stored column alone under-reports cost
+  for API-backed, MCP, and rerank rows. The literal §10.1/§10.4 `SUM(cost_usd)` is
+  still computed and surfaced **separately** as `provider_reported_cost_usd`
+  (NULL-preserving: SUM-of-all-NULL stays NULL, distinct from `0.0`). **No counter
+  name, unit, source, destination, or token-aggregation query changed** — §10 token
+  sums are verbatim; only the cost *rendering* is specified here.
+- **Codex / unpriced rows (§7.2/§7.3).** `harness == "codex"` rows are counted in
+  tokens but priced `None` (Codex cost is outside this table) even when the model id
+  matches an Anthropic-priced id; unknown/unpinned models are likewise `None` and
+  surfaced in `unpriced_models`. Cost is never silently `0`.
+- **`--since` windowing.** Token-row queries (§10.1/§10.2/§10.4) filter on `ts`; the
+  outcomes query (§10.3) filters on `started_at`; the headline JOIN applies `--since`
+  to the token side (`ts`) only.

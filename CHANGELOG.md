@@ -20,6 +20,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `ironmem report [--task <tag>] [--since <date>] [--json]` — renders METRICS_SPEC §10 (tokens-to-done by task/phase, measured-vs-estimated split, iteration counts/outcome, merged-only headline) with §7-derived cost; baseline-recording gate for Phase 6 (§11.5). The `status` MCP tool gains a one-line metrics summary.
 - `ironmem` now records a `token_usage` row per real LLM call at the
   preference-extraction (`source = "pref_extract"`) and LLM-rerank
   (`source = "llm_rerank"`) call sites, via
