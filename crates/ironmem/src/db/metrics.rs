@@ -40,9 +40,9 @@ pub struct NewTokenUsage {
 
 /// Build a `NewTokenUsage` from an LLM call result. `source` is the call site
 /// (`"llm_rerank"` | `"pref_extract"`); `ts` is an RFC3339 timestamp. `harness`
-/// is fixed to `"claude"` because these are ironmem-internal Claude-model calls
-/// (the orchestrating agent is not attributed here — a later PR plumbs the
-/// session/collab/task context columns, which stay `None` for now).
+/// is fixed to `"claude"` because these are ironmem-internal Claude-model calls.
+/// Context columns (`collab_session_id`, `collab_phase`, `task_tag`) are left
+/// `None` here — callers apply attribution by chaining `.with_context(&ctx)`.
 pub fn new_token_usage_from_llm(
     source: &str,
     resp: &ironrace_rerank::LlmResponse,
@@ -68,6 +68,22 @@ pub fn new_token_usage_from_llm(
         estimated: resp.estimated,
         chars: resp.chars() as i64,
         cost_usd: resp.cost_usd,
+    }
+}
+
+impl NewTokenUsage {
+    /// Return a copy stamped with the resolved attribution context
+    /// (METRICS_SPEC §2.3/§3). Consuming builder: callers chain it after
+    /// construction; the resolved context replaces all three attribution
+    /// columns — a resolved context is authoritative and the `.or()` fallback
+    /// was the only path that could produce a §2.3-violating both-set row.
+    pub(crate) fn with_context(self, ctx: &crate::metrics::MetricsContext) -> NewTokenUsage {
+        NewTokenUsage {
+            collab_session_id: ctx.collab_session_id.clone(),
+            collab_phase: ctx.collab_phase.clone(),
+            task_tag: ctx.task_tag.clone(),
+            ..self
+        }
     }
 }
 
@@ -492,6 +508,54 @@ impl Database {
             )
             .optional()
             .map_err(MemoryError::from)
+    }
+
+    /// Atomically bump `review_rounds` for one task (METRICS_SPEC §4). A
+    /// single UPDATE so concurrent writer processes can't lose increments to
+    /// a read-modify-write race. Missing `task_tag` is a no-op `Ok` — the
+    /// metrics layer is best-effort and a missing row is a caller problem,
+    /// not a transport error.
+    pub fn increment_task_review_rounds(&self, task_tag: &str) -> Result<(), MemoryError> {
+        let changed = self.conn.execute(
+            "UPDATE task_outcomes SET review_rounds = review_rounds + 1 WHERE task_tag = ?1",
+            params![task_tag],
+        )?;
+        if changed == 0 {
+            tracing::warn!(
+                task_tag = %task_tag,
+                operation = "increment_task_review_rounds",
+                "metrics: UPDATE matched 0 rows — task_tag not found in task_outcomes"
+            );
+        }
+        Ok(())
+    }
+
+    /// Partial terminal-state update for one task (METRICS_SPEC §5.4):
+    /// only non-`None` fields are written (COALESCE keeps existing values),
+    /// counters are never touched. Missing `task_tag` is a no-op `Ok`.
+    pub fn mark_task_outcome_done(
+        &self,
+        task_tag: &str,
+        done_at: Option<&str>,
+        outcome: Option<&str>,
+        pr_url: Option<&str>,
+    ) -> Result<(), MemoryError> {
+        let changed = self.conn.execute(
+            "UPDATE task_outcomes SET
+                done_at = COALESCE(?2, done_at),
+                outcome = COALESCE(?3, outcome),
+                pr_url  = COALESCE(?4, pr_url)
+             WHERE task_tag = ?1",
+            params![task_tag, done_at, outcome, pr_url],
+        )?;
+        if changed == 0 {
+            tracing::warn!(
+                task_tag = %task_tag,
+                operation = "mark_task_outcome_done",
+                "metrics: UPDATE matched 0 rows — task_tag not found in task_outcomes"
+            );
+        }
+        Ok(())
     }
 
     /// Return all `task_outcomes` rows for a given `collab_session_id`,
@@ -1071,5 +1135,64 @@ mod tests {
             .join(".ironrace-memory")
             .join("memory.sqlite3");
         pb.is_file().then_some(pb)
+    }
+
+    #[test]
+    fn increment_task_review_rounds_is_monotonic_and_preserves_row() {
+        let db = db();
+        db.upsert_task_outcome(&sample_task_outcome("issue-83", "2026-06-12T00:00:00Z"))
+            .unwrap();
+        db.increment_task_review_rounds("issue-83").unwrap();
+        db.increment_task_review_rounds("issue-83").unwrap();
+        let got = db.get_task_outcome("issue-83").unwrap().unwrap();
+        assert_eq!(got.review_rounds, 2);
+        assert_eq!(got.fix_commits, 0); // untouched
+        assert_eq!(got.started_at.as_deref(), Some("2026-06-12T00:00:00Z")); // untouched
+    }
+
+    #[test]
+    fn increment_task_review_rounds_missing_tag_is_noop_ok() {
+        let db = db();
+        assert!(db.increment_task_review_rounds("missing").is_ok());
+    }
+
+    #[test]
+    fn mark_task_outcome_done_partial_update_preserves_counters_and_nones() {
+        let db = db();
+        let mut t = sample_task_outcome("issue-83", "2026-06-12T00:00:00Z");
+        t.review_rounds = 3;
+        db.upsert_task_outcome(&t).unwrap();
+
+        // First call: done_at + pr_url, no outcome (CodingComplete semantics).
+        db.mark_task_outcome_done(
+            "issue-83",
+            Some("2026-06-12T01:00:00Z"),
+            None,
+            Some("https://example/pr/5"),
+        )
+        .unwrap();
+        let got = db.get_task_outcome("issue-83").unwrap().unwrap();
+        assert_eq!(got.done_at.as_deref(), Some("2026-06-12T01:00:00Z"));
+        assert!(got.outcome.is_none());
+        assert_eq!(got.pr_url.as_deref(), Some("https://example/pr/5"));
+        assert_eq!(got.review_rounds, 3); // counters preserved
+
+        // Second call: outcome only (collab_end attestation); earlier fields kept.
+        db.mark_task_outcome_done("issue-83", None, Some("merged"), None)
+            .unwrap();
+        let got = db.get_task_outcome("issue-83").unwrap().unwrap();
+        assert_eq!(got.outcome.as_deref(), Some("merged"));
+        assert_eq!(got.done_at.as_deref(), Some("2026-06-12T01:00:00Z")); // not clobbered
+        assert_eq!(got.pr_url.as_deref(), Some("https://example/pr/5")); // not clobbered
+    }
+
+    #[test]
+    fn mark_task_outcome_done_rejects_bad_outcome_enum() {
+        let db = db();
+        db.upsert_task_outcome(&sample_task_outcome("issue-83", "2026-06-12T00:00:00Z"))
+            .unwrap();
+        assert!(db
+            .mark_task_outcome_done("issue-83", None, Some("bogus"), None)
+            .is_err());
     }
 }

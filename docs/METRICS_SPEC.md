@@ -217,7 +217,7 @@ Indexes: `(task_tag, ts)` and `(collab_session_id, collab_phase)`.
 
 | Column              | Unit    | Source                  | Destination |
 |---------------------|---------|-------------------------|-------------|
-| `task_tag` (UNIQUE) | string  | collab_start / status   | `task_outcomes.task_tag` |
+| `task_tag` (UNIQUE) | string  | collab_start            | `task_outcomes.task_tag` |
 | `collab_session_id` | string  | collab_start            | `task_outcomes.collab_session_id` |
 | `started_at`        | iso8601 | collab_start            | `task_outcomes.started_at` |
 | `done_at`           | iso8601 | end/PR                  | `task_outcomes.done_at` |
@@ -226,6 +226,11 @@ Indexes: `(task_tag, ts)` and `(collab_session_id, collab_phase)`.
 | `fix_commits`       | count   | §4                      | `task_outcomes.fix_commits` |
 | `handoffs`          | count   | §4                      | `task_outcomes.handoffs` |
 | `pr_url`            | string  | PR creation             | `task_outcomes.pr_url` |
+
+In PR 05 / issue #83, `status(set_task_tag=...)` is token-usage-only: it
+annotates subsequent non-collab `token_usage` rows with `task_tag` and the
+default `impl` bucket, but it does not create or complete a `task_outcomes`
+row. Non-collab task lifecycle rows require a later explicit lifecycle API.
 
 ---
 
@@ -520,3 +525,33 @@ destination, or reporting query changed.
    change it.
 4. **`session_id` is bounded to 128 chars** by `sanitize_session_id` before becoming a
    row key, preventing an unbounded attacker-supplied key from MCP `initialize`.
+
+### 2026-06-12 — PR 05 / issue #83: outcome-attestation semantics and deferred counters
+
+- **2026-06-12 (PR 05 / issue #83):** `task_outcomes.outcome='merged'` is written by
+  `collab_end` from `CodingComplete` as an **operator attestation** — the operator ends
+  the session after the PR is merged. `final_review`/`CodingComplete` itself records only
+  `done_at` + `pr_url` and leaves `outcome` NULL ("in flight"), so an unmerged PR is never
+  silently counted as done (§2.2). PR 84's reporting may cross-check attestations against
+  GitHub. `fix_commits` and `handoffs` remain 0 in this phase: `handoffs` awaits the
+  session-handoff machinery (PR 13/15); `fix_commits` needs commit-counting the MCP server
+  cannot do without git access — deferred, tracked on the roadmap.
+
+- **Process-attribution constraint (clarification of §2.3 / §3).** Only one active collab
+  session may be bound to the process attribution slot of a given MCP server process at a
+  time — the constraint applies across all repos, not just the same repo+branch. The collab
+  handlers (`collab_start`, `collab_start_code_review`, `collab_send`, `collab_recv`,
+  `collab_wait_my_turn`) reject any attempt to bind a second still-live session to the
+  process slot. Stale or ended sessions self-clear automatically. Parallel collab sessions
+  require separate server processes so that `search`, pref-extract, and rerank token-usage
+  rows cannot be stamped onto the wrong session.
+
+- **§4 `review_rounds` increment semantics (clarification of §4 "each entry into
+  review_local / final_review following impl/rework" wording).** As shipped, `review_rounds`
+  increments exactly on phase transitions whose *new* phase buckets to `review` from a phase
+  bucketing to `impl` or `rework`. In the current v3 phase order the only such edge is
+  `CodeReviewFixGlobalPending → CodeReviewLocalPending` (rework → review). The
+  `CodeReviewLocalPending → CodeReviewFinalPending` transition (review → review) does *not*
+  increment, nor does the `CodeReviewFinalPending → CodingComplete` transition (review →
+  other). This narrows §4's looser description; no counter name, unit, or destination
+  changed.

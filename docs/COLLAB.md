@@ -340,6 +340,11 @@ Invariants that still apply:
   still unset. Both Codex's `review_fix_global` push and Claude's
   `review_local` audit-push must descend from the prior `last_head_sha`.
   Full-flow v3 sessions keep their existing non-shell-out behavior.
+- **Process attribution:** one active collab session per MCP server process
+  (any repo). On the error `"another active collab session is already bound to
+  this MCP process for metrics attribution: <id>"`, do not retry blindly —
+  `collab_end` the named session if it is finished, or run the new session from
+  a separate server process.
 
 ### Deployment
 
@@ -409,6 +414,19 @@ phase. This prevents an accidental second session — most often a fired
 session already finished. To proceed deliberately, either resume the existing
 session (`/collab join <id>`) or `collab_end` it first (valid only from
 `PlanLocked` pre-`task_list`, `CodingComplete`, or `CodingFailed`).
+
+**Process attribution guard.** `collab_start`, `collab_start_code_review`,
+`collab_send`, `collab_recv`, and `collab_wait_my_turn` also reject the call
+when this MCP server process is already bound to a *different* still-live
+session for metrics attribution (regardless of repo or branch). The error
+message is: `"another active collab session is already bound to this MCP
+process for metrics attribution: <id>. End it or use a separate server process
+before switching to <requested_id>."` Remedy: call `collab_end` on the named
+session if it is finished, or run the new session from a separate server
+process. Stale or ended sessions self-clear automatically — no manual cleanup
+is needed for those. On the error `"could not verify active collab session"`,
+check the server logs for the underlying DB error detail; retry after the
+underlying issue clears.
 
 ### `collab_set_implementer`
 

@@ -50,6 +50,23 @@ pub struct App {
     /// Metrics harness attribution learned from MCP `initialize.clientInfo`
     /// (or `IRONMEM_HARNESS`), set once. Stored as the DB enum value.
     pub harness: RwLock<Option<String>>,
+    /// Active collab session this server process is participating in. Set by
+    /// `collab_start`/`collab_start_code_review` and refreshed by
+    /// `collab_send`/`collab_recv`/`collab_wait_my_turn`; deliberately NOT set
+    /// by `collab_status`, which is also used to inspect foreign/stale
+    /// sessions. Process-global rather than request-local because the dominant
+    /// token volume (`search` rerank, pref-extract) carries no collab argument
+    /// — only process state can attribute it. Enforced invariant: one active
+    /// collab session per server process, regardless of repo — the collab
+    /// handlers' conflict guard rejects binding a second still-live session to
+    /// this slot. Parallel collab sessions require separate server processes so
+    /// `search` / pref-extract / rerank work cannot be stamped onto the wrong
+    /// session.
+    active_collab_session_id: RwLock<Option<String>>,
+    /// Explicit task tag for non-collab work (METRICS_SPEC §2.3 item 2), set
+    /// via `status` tool args. Only consulted when no active collab session
+    /// resolves.
+    explicit_task_tag: RwLock<Option<String>>,
 }
 
 impl App {
@@ -111,6 +128,8 @@ impl App {
             memory_ready_rebuilt: AtomicBool::new(true),
             session_id: RwLock::new(std::env::var("IRONMEM_SESSION_ID").ok()),
             harness: RwLock::new(env_metrics_harness()),
+            active_collab_session_id: RwLock::new(None),
+            explicit_task_tag: RwLock::new(None),
         })
     }
 
@@ -145,6 +164,8 @@ impl App {
             memory_ready_rebuilt: AtomicBool::new(false),
             session_id: RwLock::new(std::env::var("IRONMEM_SESSION_ID").ok()),
             harness: RwLock::new(env_metrics_harness()),
+            active_collab_session_id: RwLock::new(None),
+            explicit_task_tag: RwLock::new(None),
         })
     }
 
@@ -195,6 +216,50 @@ impl App {
     /// Snapshot of the learned metrics harness attribution.
     pub fn harness_snapshot(&self) -> Option<String> {
         self.harness.read().expect("harness lock poisoned").clone()
+    }
+
+    /// Mark `id` as the active collab session for metrics attribution.
+    pub fn set_active_collab_session(&self, id: &str) {
+        *self
+            .active_collab_session_id
+            .write()
+            .expect("active_collab_session_id lock poisoned") = Some(id.to_string());
+    }
+
+    /// Clear the active collab session (ended or missing).
+    pub fn clear_active_collab_session(&self) {
+        *self
+            .active_collab_session_id
+            .write()
+            .expect("active_collab_session_id lock poisoned") = None;
+    }
+
+    pub fn active_collab_session_snapshot(&self) -> Option<String> {
+        self.active_collab_session_id
+            .read()
+            .expect("active_collab_session_id lock poisoned")
+            .clone()
+    }
+
+    pub fn set_explicit_task_tag(&self, tag: &str) {
+        *self
+            .explicit_task_tag
+            .write()
+            .expect("explicit_task_tag lock poisoned") = Some(tag.to_string());
+    }
+
+    pub fn clear_explicit_task_tag(&self) {
+        *self
+            .explicit_task_tag
+            .write()
+            .expect("explicit_task_tag lock poisoned") = None;
+    }
+
+    pub fn explicit_task_tag_snapshot(&self) -> Option<String> {
+        self.explicit_task_tag
+            .read()
+            .expect("explicit_task_tag lock poisoned")
+            .clone()
     }
 
     /// Returns true while background memory init is still in progress.
@@ -249,6 +314,8 @@ impl App {
             memory_ready_rebuilt: AtomicBool::new(true),
             session_id: RwLock::new(std::env::var("IRONMEM_SESSION_ID").ok()),
             harness: RwLock::new(env_metrics_harness()),
+            active_collab_session_id: RwLock::new(None),
+            explicit_task_tag: RwLock::new(None),
         })
     }
 

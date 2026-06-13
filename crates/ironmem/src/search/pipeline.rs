@@ -328,11 +328,13 @@ pub fn search(
                 &mut scored,
             );
             if let Some(resp) = llm_response {
+                let ctx = crate::metrics::MetricsContext::resolve(app);
                 let row = crate::db::metrics::new_token_usage_from_llm(
                     "llm_rerank",
                     &resp,
                     chrono::Utc::now().to_rfc3339(),
-                );
+                )
+                .with_context(&ctx);
                 if let Err(e) = app.db.insert_token_usage(&row) {
                     tracing::warn!(
                         error = %e,

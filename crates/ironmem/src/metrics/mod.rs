@@ -49,6 +49,90 @@ pub(crate) fn now_rfc3339() -> String {
     chrono::Utc::now().to_rfc3339()
 }
 
+use crate::collab::Phase;
+
+/// METRICS_SPEC §3.2: map the session `Phase` to its token_usage bucket.
+/// Exhaustive on purpose — a new `Phase` variant must fail compilation here
+/// so the spec table gets a conscious update, never a silent `other`.
+pub(crate) fn phase_bucket(phase: Phase) -> &'static str {
+    match phase {
+        Phase::PlanParallelDrafts
+        | Phase::PlanSynthesisPending
+        | Phase::PlanCodexReviewPending
+        | Phase::PlanClaudeFinalizePending
+        | Phase::PlanLocked => "planning",
+        Phase::CodeImplementPending => "impl",
+        Phase::CodeReviewLocalPending | Phase::CodeReviewFinalPending => "review",
+        Phase::CodeReviewFixGlobalPending => "rework",
+        Phase::CodingComplete | Phase::CodingFailed => "other",
+    }
+}
+
+/// Attribution context for one token_usage row (METRICS_SPEC §2.3 / §3).
+/// Resolved fresh at every row write — phase is read from the session record
+/// "at the time the row is recorded" (§3.2), never cached across turns.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub(crate) struct MetricsContext {
+    pub collab_session_id: Option<String>,
+    pub collab_phase: Option<String>,
+    pub task_tag: Option<String>,
+}
+
+impl MetricsContext {
+    /// §2.3 priority: active collab session first (stamps id + phase bucket,
+    /// INCLUDING terminal-but-not-ended sessions, which stamp `other`); else
+    /// the explicit task tag (phase defaults to `impl` per §3.3); else empty.
+    /// Ended (`ended_at IS NOT NULL`) or missing sessions clear the App cell;
+    /// the discovering row stays unstamped (returns `MetricsContext::default()`).
+    /// Best-effort: a DB read error degrades to an empty context + warn.
+    pub(crate) fn resolve(app: &crate::mcp::app::App) -> MetricsContext {
+        if let Some(sid) = app.active_collab_session_snapshot() {
+            match app.db.collab_load_session_record(&sid) {
+                Ok(record) if record.ended_at.is_none() => {
+                    return MetricsContext {
+                        collab_session_id: Some(sid),
+                        collab_phase: Some(phase_bucket(record.session.phase).to_string()),
+                        task_tag: None,
+                    };
+                }
+                Ok(_) => {
+                    // Session has ended — self-heal silently.
+                    app.clear_active_collab_session();
+                    return MetricsContext::default();
+                }
+                // `NotFound` is what the session loader returns for a missing row —
+                // matched explicitly so only a confirmed-missing session clears the
+                // cell; any new error variant lands in the warn arm below instead of
+                // being mistaken for a missing session.
+                Err(crate::error::MemoryError::NotFound(_)) => {
+                    tracing::warn!(
+                        session_id = %sid,
+                        "metrics attribution: active collab session not found — clearing cell"
+                    );
+                    app.clear_active_collab_session();
+                    return MetricsContext::default();
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        session_id = %sid,
+                        error = %e,
+                        "metrics: collab session lookup for attribution failed"
+                    );
+                    return MetricsContext::default();
+                }
+            }
+        }
+        if let Some(tag) = app.explicit_task_tag_snapshot() {
+            return MetricsContext {
+                collab_session_id: None,
+                collab_phase: Some("impl".to_string()),
+                task_tag: Some(tag),
+            };
+        }
+        MetricsContext::default()
+    }
+}
+
 /// Reverse-scan a transcript JSONL string for the LAST assistant message's
 /// `usage` object. Mirrors the reverse-scan shape used by the review extractor
 /// in `hook.rs`. Handles both a top-level `usage` and a nested
@@ -106,6 +190,7 @@ pub(crate) fn account_mcp_response(
     chars: i64,
     harness: &str,
     session_id: Option<&str>,
+    ctx: &MetricsContext,
 ) {
     let row = NewTokenUsage {
         ts: now_rfc3339(),
@@ -123,7 +208,8 @@ pub(crate) fn account_mcp_response(
         estimated: true,
         chars,
         cost_usd: None,
-    };
+    }
+    .with_context(ctx);
     if let Err(e) = db.insert_token_usage(&row) {
         tracing::warn!("metrics: insert mcp_response token_usage failed: {e}");
     }
@@ -226,6 +312,213 @@ pub(crate) static METRICS_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn phase_bucket_maps_every_variant_per_spec_3_2() {
+        use crate::collab::Phase;
+        // METRICS_SPEC §3.2 table, pinned variant-by-variant.
+        assert_eq!(phase_bucket(Phase::PlanParallelDrafts), "planning");
+        assert_eq!(phase_bucket(Phase::PlanSynthesisPending), "planning");
+        assert_eq!(phase_bucket(Phase::PlanCodexReviewPending), "planning");
+        assert_eq!(phase_bucket(Phase::PlanClaudeFinalizePending), "planning");
+        assert_eq!(phase_bucket(Phase::PlanLocked), "planning");
+        assert_eq!(phase_bucket(Phase::CodeImplementPending), "impl");
+        assert_eq!(phase_bucket(Phase::CodeReviewLocalPending), "review");
+        assert_eq!(phase_bucket(Phase::CodeReviewFixGlobalPending), "rework");
+        assert_eq!(phase_bucket(Phase::CodeReviewFinalPending), "review");
+        assert_eq!(phase_bucket(Phase::CodingComplete), "other");
+        assert_eq!(phase_bucket(Phase::CodingFailed), "other");
+    }
+
+    #[test]
+    fn with_context_stamps_collab_fields_and_preserves_rest() {
+        let ctx = MetricsContext {
+            collab_session_id: Some("collab-1".into()),
+            collab_phase: Some("planning".into()),
+            task_tag: None,
+        };
+        let row = crate::db::metrics::NewTokenUsage {
+            ts: "2026-06-12T00:00:00Z".into(),
+            source: "mcp_response".into(),
+            harness: "claude".into(),
+            model: None,
+            session_id: Some("sess-1".into()),
+            collab_session_id: None,
+            collab_phase: None,
+            task_tag: None,
+            input_tokens: 1,
+            output_tokens: 2,
+            cache_creation_input_tokens: 0,
+            cache_read_input_tokens: 0,
+            estimated: true,
+            chars: 8,
+            cost_usd: None,
+        }
+        .with_context(&ctx);
+        assert_eq!(row.collab_session_id.as_deref(), Some("collab-1"));
+        assert_eq!(row.collab_phase.as_deref(), Some("planning"));
+        assert!(row.task_tag.is_none());
+        assert_eq!(row.session_id.as_deref(), Some("sess-1")); // untouched
+        assert_eq!(row.output_tokens, 2); // untouched
+    }
+
+    fn test_app() -> std::sync::Arc<crate::mcp::app::App> {
+        use crate::config::{Config, EmbedMode, McpAccessMode};
+        let dir = tempfile::tempdir().unwrap();
+        let config = Config {
+            db_path: dir.path().join("mem.sqlite3"),
+            model_dir: dir.path().join("model"),
+            model_dir_explicit: true,
+            state_dir: dir.path().join("state"),
+            mcp_access_mode: McpAccessMode::Trusted,
+            embed_mode: EmbedMode::Noop,
+        };
+        // Leak the tempdir so the DB file outlives the helper.
+        std::mem::forget(dir);
+        #[allow(clippy::arc_with_non_send_sync)]
+        std::sync::Arc::new(crate::mcp::app::App::new(config).unwrap())
+    }
+
+    /// Create a collab session row directly through the queue layer and return its id.
+    fn seed_collab_session(app: &crate::mcp::app::App) -> String {
+        let sid = "ctx-test-session".to_string();
+        app.db
+            .with_transaction(|tx| {
+                crate::collab::queue::create_session(
+                    tx,
+                    &sid,
+                    "/tmp/repo",
+                    "main",
+                    None,
+                    crate::collab::Agent::Claude,
+                )
+            })
+            .unwrap();
+        sid
+    }
+
+    #[test]
+    fn resolve_stamps_active_collab_session_with_bucket() {
+        let app = test_app();
+        let sid = seed_collab_session(&app);
+        app.set_active_collab_session(&sid);
+        let ctx = MetricsContext::resolve(&app);
+        assert_eq!(ctx.collab_session_id.as_deref(), Some(sid.as_str()));
+        assert_eq!(ctx.collab_phase.as_deref(), Some("planning")); // new session = PlanParallelDrafts
+        assert!(ctx.task_tag.is_none());
+    }
+
+    #[test]
+    fn resolve_stamps_terminal_but_not_ended_session_as_other() {
+        let app = test_app();
+        let sid = seed_collab_session(&app);
+        // Force the session to a terminal phase WITHOUT ending it.
+        app.db
+            .with_transaction(|tx| {
+                let mut s = crate::collab::queue::load_session(tx, &sid)?;
+                s.phase = crate::collab::Phase::CodingComplete;
+                crate::collab::queue::save_session(tx, &s)
+            })
+            .unwrap();
+        app.set_active_collab_session(&sid);
+        let ctx = MetricsContext::resolve(&app);
+        assert_eq!(ctx.collab_session_id.as_deref(), Some(sid.as_str()));
+        assert_eq!(ctx.collab_phase.as_deref(), Some("other"));
+    }
+
+    #[test]
+    fn resolve_unstamps_and_clears_cell_for_ended_session() {
+        let app = test_app();
+        let sid = seed_collab_session(&app);
+        app.db
+            .with_transaction(|tx| crate::collab::queue::end_session(tx, &sid))
+            .unwrap();
+        app.set_active_collab_session(&sid);
+        let ctx = MetricsContext::resolve(&app);
+        assert!(ctx.collab_session_id.is_none());
+        assert!(
+            app.active_collab_session_snapshot().is_none(),
+            "cell must self-clear"
+        );
+    }
+
+    #[test]
+    fn resolve_does_not_fallback_to_task_tag_for_ended_active_session() {
+        let app = test_app();
+        let sid = seed_collab_session(&app);
+        app.db
+            .with_transaction(|tx| crate::collab::queue::end_session(tx, &sid))
+            .unwrap();
+        app.set_active_collab_session(&sid);
+        app.set_explicit_task_tag("issue-85");
+
+        let ctx = MetricsContext::resolve(&app);
+
+        assert!(ctx.collab_session_id.is_none());
+        assert!(ctx.collab_phase.is_none());
+        assert!(
+            ctx.task_tag.is_none(),
+            "the row that discovers a stale collab cell must stay unstamped"
+        );
+        assert!(app.active_collab_session_snapshot().is_none());
+    }
+
+    #[test]
+    fn resolve_unstamps_and_clears_cell_for_missing_session() {
+        let app = test_app();
+        app.set_active_collab_session("does-not-exist");
+        let ctx = MetricsContext::resolve(&app);
+        assert!(ctx.collab_session_id.is_none());
+        assert!(app.active_collab_session_snapshot().is_none());
+    }
+
+    #[test]
+    fn resolve_does_not_fallback_to_task_tag_for_missing_active_session() {
+        let app = test_app();
+        app.set_active_collab_session("does-not-exist");
+        app.set_explicit_task_tag("issue-85");
+
+        let ctx = MetricsContext::resolve(&app);
+
+        assert!(ctx.collab_session_id.is_none());
+        assert!(ctx.collab_phase.is_none());
+        assert!(
+            ctx.task_tag.is_none(),
+            "the row that discovers a missing collab cell must stay unstamped"
+        );
+        assert!(app.active_collab_session_snapshot().is_none());
+    }
+
+    #[test]
+    fn resolve_falls_back_to_explicit_task_tag_with_impl_default() {
+        let app = test_app();
+        app.set_explicit_task_tag("issue-85");
+        let ctx = MetricsContext::resolve(&app);
+        assert!(ctx.collab_session_id.is_none());
+        assert_eq!(ctx.task_tag.as_deref(), Some("issue-85"));
+        assert_eq!(ctx.collab_phase.as_deref(), Some("impl")); // §3.3 default
+    }
+
+    #[test]
+    fn resolve_collab_session_takes_priority_over_task_tag() {
+        let app = test_app();
+        let sid = seed_collab_session(&app);
+        app.set_active_collab_session(&sid);
+        app.set_explicit_task_tag("issue-85");
+        let ctx = MetricsContext::resolve(&app);
+        // §2.3 priority: collab id wins; task_tag not stamped alongside it.
+        assert_eq!(ctx.collab_session_id.as_deref(), Some(sid.as_str()));
+        assert!(ctx.task_tag.is_none());
+    }
+
+    #[test]
+    fn resolve_returns_empty_context_when_nothing_set() {
+        let app = test_app();
+        let ctx = MetricsContext::resolve(&app);
+        assert!(
+            ctx.collab_session_id.is_none() && ctx.collab_phase.is_none() && ctx.task_tag.is_none()
+        );
+    }
 
     #[test]
     fn estimate_tokens_is_ceil_div_4() {

@@ -51,7 +51,14 @@ fn account_response_metrics(app: &App, chars: usize, session_id: Option<&str>) {
         return;
     }
     tokio::task::block_in_place(|| {
-        crate::metrics::account_mcp_response(&app.db, chars as i64, &mcp_harness(app), session_id);
+        let ctx = crate::metrics::MetricsContext::resolve(app);
+        crate::metrics::account_mcp_response(
+            &app.db,
+            chars as i64,
+            &mcp_harness(app),
+            session_id,
+            &ctx,
+        );
     });
 }
 
@@ -564,6 +571,62 @@ mod tests {
         assert_eq!(s.total_output_tokens, 567);
         assert_eq!(s.compactions, 3);
         assert_eq!(s.started_at.as_deref(), Some("2026-06-11T00:00:00Z"));
+    }
+
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn mcp_response_row_is_stamped_with_active_collab_session() {
+        let _g = METRICS_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::remove_var("IRONMEM_METRICS");
+        std::env::remove_var("IRONMEM_HARNESS");
+        #[allow(clippy::arc_with_non_send_sync)]
+        let app = Arc::new(App::open_for_test().unwrap());
+
+        // Seed a collab session and set it as active.
+        let sid = "server-test-collab-session";
+        app.db
+            .with_transaction(|tx| {
+                crate::collab::queue::create_session(
+                    tx,
+                    sid,
+                    "/tmp/repo",
+                    "main",
+                    None,
+                    crate::collab::Agent::Claude,
+                )
+            })
+            .unwrap();
+        app.set_active_collab_session(sid);
+
+        let (mut client_in, server_in) = tokio::io::duplex(4096);
+        let (server_out, mut client_out) = tokio::io::duplex(4096);
+        client_in
+            .write_all(b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{}}\n")
+            .await
+            .unwrap();
+        client_in.shutdown().await.unwrap();
+        run_server_io(Arc::clone(&app), BufReader::new(server_in), server_out)
+            .await
+            .unwrap();
+        let mut out = String::new();
+        client_out.read_to_string(&mut out).await.unwrap();
+
+        let rows = app
+            .db
+            .query_token_usage(&crate::db::metrics::TokenUsageQuery::default())
+            .unwrap();
+        let mcp: Vec<_> = rows.iter().filter(|r| r.source == "mcp_response").collect();
+        assert_eq!(mcp.len(), 1, "exactly one mcp_response row");
+        assert_eq!(
+            mcp[0].collab_session_id.as_deref(),
+            Some(sid),
+            "row must carry the active collab session id"
+        );
+        assert_eq!(
+            mcp[0].collab_phase.as_deref(),
+            Some("planning"),
+            "fresh session (PlanParallelDrafts) → 'planning' bucket"
+        );
     }
 
     #[allow(clippy::await_holding_lock)]

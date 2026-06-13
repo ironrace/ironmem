@@ -875,22 +875,27 @@ fn collab_start_rejects_duplicate_active_session_on_same_branch() {
 }
 
 #[test]
-fn collab_start_allows_distinct_branch_while_active() {
+fn collab_start_rejects_distinct_branch_in_same_process_while_active() {
     let app = App::open_for_test().unwrap();
-    let a = call_tool(
+    let first = call_tool(
         &app,
         "collab_start",
         json!({ "repo_path": "/repo", "branch": "main", "initiator": "claude" }),
     );
-    let b = call_tool(
+    let first_id = first["session_id"].as_str().unwrap();
+
+    let err = call_tool_expect_error(
         &app,
         "collab_start",
         json!({ "repo_path": "/repo", "branch": "feature-x", "initiator": "claude" }),
     );
-    assert_ne!(
-        a["session_id"].as_str().unwrap(),
-        b["session_id"].as_str().unwrap(),
-        "distinct branches must each get their own active session"
+    assert!(
+        err.contains("already bound to this MCP process"),
+        "expected process-local attribution guard, got: {err}"
+    );
+    assert!(
+        err.contains(first_id),
+        "error must name the active process-bound session, got: {err}"
     );
 }
 
@@ -1640,6 +1645,18 @@ fn collab_start_code_review_happy_path_reaches_coding_complete() {
         }),
     );
     let session_id = started["session_id"].as_str().unwrap();
+    let row = app
+        .db
+        .get_task_outcome(session_id)
+        .unwrap()
+        .expect("shortcut review must create task_outcomes row");
+    assert_eq!(row.collab_session_id.as_deref(), Some(session_id));
+    assert!(row.started_at.is_some());
+    assert_eq!(row.review_rounds, 0);
+    assert_eq!(
+        app.active_collab_session_snapshot().as_deref(),
+        Some(session_id)
+    );
 
     let wait = call_tool(
         &app,
@@ -1662,6 +1679,11 @@ fn collab_start_code_review_happy_path_reaches_coding_complete() {
     let status = call_tool(&app, "collab_status", json!({ "session_id": session_id }));
     assert_eq!(status["phase"], "CodeReviewLocalPending");
     assert_eq!(status["last_head_sha"], descendant_sha);
+    let row = app.db.get_task_outcome(session_id).unwrap().unwrap();
+    assert_eq!(
+        row.review_rounds, 1,
+        "shortcut rework→review entry increments review_rounds"
+    );
 
     call_tool(
         &app,
@@ -1675,6 +1697,11 @@ fn collab_start_code_review_happy_path_reaches_coding_complete() {
     );
     let status = call_tool(&app, "collab_status", json!({ "session_id": session_id }));
     assert_eq!(status["phase"], "CodeReviewFinalPending");
+    let row = app.db.get_task_outcome(session_id).unwrap().unwrap();
+    assert_eq!(
+        row.review_rounds, 1,
+        "review→review must not increment review_rounds again"
+    );
 
     call_tool(
         &app,
@@ -1689,6 +1716,21 @@ fn collab_start_code_review_happy_path_reaches_coding_complete() {
     let status = call_tool(&app, "collab_status", json!({ "session_id": session_id }));
     assert_eq!(status["phase"], "CodingComplete");
     assert_eq!(status["pr_url"], "https://example/pr/42");
+    let row = app.db.get_task_outcome(session_id).unwrap().unwrap();
+    assert!(row.done_at.is_some(), "final_review sets done_at");
+    assert_eq!(row.pr_url.as_deref(), Some("https://example/pr/42"));
+    assert!(
+        row.outcome.is_none(),
+        "final_review must leave outcome in-flight until collab_end"
+    );
+
+    call_tool(
+        &app,
+        "collab_end",
+        json!({ "session_id": session_id, "agent": "claude" }),
+    );
+    let row = app.db.get_task_outcome(session_id).unwrap().unwrap();
+    assert_eq!(row.outcome.as_deref(), Some("merged"));
 }
 
 #[test]

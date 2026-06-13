@@ -124,11 +124,13 @@ fn build_synthetic(
     // Record a `pref_extract` token_usage row from an LLM response (non-fatal:
     // a failed insert logs at warn and is dropped — pref-enrich is best-effort).
     let record_pref_usage = |resp: &ironrace_rerank::LlmResponse| {
+        let ctx = crate::metrics::MetricsContext::resolve(app);
         let row = crate::db::metrics::new_token_usage_from_llm(
             "pref_extract",
             resp,
             chrono::Utc::now().to_rfc3339(),
-        );
+        )
+        .with_context(&ctx);
         if let Err(e) = app.db.insert_token_usage(&row) {
             tracing::warn!(
                 error = %e,
@@ -298,7 +300,26 @@ pub(super) fn handle_search(app: &App, args: &Value) -> Result<Value, MemoryErro
     }))
 }
 
-pub(super) fn handle_status(app: &App) -> Result<Value, MemoryError> {
+pub(super) fn handle_status(app: &App, args: &Value) -> Result<Value, MemoryError> {
+    let set_tag = args.get("set_task_tag").and_then(Value::as_str);
+    let clear_tag = args
+        .get("clear_task_tag")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    if set_tag.is_some() && clear_tag {
+        return Err(MemoryError::Validation(
+            "set_task_tag and clear_task_tag are mutually exclusive".into(),
+        ));
+    }
+    if let Some(tag) = set_tag {
+        // sanitize_name allows hyphens in the middle (e.g. "issue-85") and
+        // enforces a safe character set; round-trips unchanged for normal slugs.
+        let tag = sanitize::sanitize_name(tag, "task_tag")?;
+        app.set_explicit_task_tag(&tag);
+    } else if clear_tag {
+        app.clear_explicit_task_tag();
+    }
+
     let total = app.db.count_drawers(None)?;
     let wings = app.db.wing_counts()?;
     let kg = crate::db::knowledge_graph::KnowledgeGraph::new(&app.db);
@@ -310,5 +331,154 @@ pub(super) fn handle_status(app: &App) -> Result<Value, MemoryError> {
         "knowledge_graph": kg_stats,
         "memory_protocol": crate::bootstrap::MEMORY_PROTOCOL,
         "warming_up": app.is_warming_up(),
+        "task_tag": app.explicit_task_tag_snapshot(),
+        "active_collab_session_id": app.active_collab_session_snapshot(),
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::{Config, EmbedMode, McpAccessMode};
+    use serde_json::json;
+    use std::sync::Arc;
+
+    fn test_app() -> Arc<App> {
+        let dir = tempfile::tempdir().unwrap();
+        let config = Config {
+            db_path: dir.path().join("mem.sqlite3"),
+            model_dir: dir.path().join("model"),
+            model_dir_explicit: true,
+            state_dir: dir.path().join("state"),
+            mcp_access_mode: McpAccessMode::Trusted,
+            embed_mode: EmbedMode::Noop,
+        };
+        // Leak the tempdir so the DB file outlives the test.
+        std::mem::forget(dir);
+        #[allow(clippy::arc_with_non_send_sync)]
+        Arc::new(App::new(config).unwrap())
+    }
+
+    fn test_app_readonly() -> Arc<App> {
+        let dir = tempfile::tempdir().unwrap();
+        let config = Config {
+            db_path: dir.path().join("mem.sqlite3"),
+            model_dir: dir.path().join("model"),
+            model_dir_explicit: true,
+            state_dir: dir.path().join("state"),
+            mcp_access_mode: McpAccessMode::ReadOnly,
+            embed_mode: EmbedMode::Noop,
+        };
+        std::mem::forget(dir);
+        #[allow(clippy::arc_with_non_send_sync)]
+        Arc::new(App::new(config).unwrap())
+    }
+
+    #[test]
+    fn status_sets_clears_and_echoes_task_tag() {
+        let app = test_app();
+
+        // set_task_tag stores the tag and echoes it in the response
+        let out = handle_status(&app, &json!({"set_task_tag": "issue-85"})).unwrap();
+        assert_eq!(out["task_tag"].as_str(), Some("issue-85"));
+        assert_eq!(
+            app.explicit_task_tag_snapshot().as_deref(),
+            Some("issue-85")
+        );
+
+        // Existing structural keys must still be present
+        assert!(out.get("total_drawers").is_some(), "total_drawers missing");
+        assert!(out.get("wings").is_some(), "wings missing");
+        assert!(
+            out.get("knowledge_graph").is_some(),
+            "knowledge_graph missing"
+        );
+        assert!(
+            out.get("memory_protocol").is_some(),
+            "memory_protocol missing"
+        );
+        assert!(out.get("warming_up").is_some(), "warming_up missing");
+
+        // active_collab_session_id is echoed (null when unset)
+        assert!(
+            out["active_collab_session_id"].is_null(),
+            "active_collab_session_id must be null when unset"
+        );
+
+        // plain status call (no args) echoes current tag
+        let out = handle_status(&app, &json!({})).unwrap();
+        assert_eq!(
+            out["task_tag"].as_str(),
+            Some("issue-85"),
+            "plain status echoes current tag"
+        );
+
+        // clear_task_tag removes the tag
+        let out = handle_status(&app, &json!({"clear_task_tag": true})).unwrap();
+        assert!(out["task_tag"].is_null());
+        assert!(app.explicit_task_tag_snapshot().is_none());
+    }
+
+    #[test]
+    fn status_rejects_set_and_clear_together() {
+        let app = test_app();
+        assert!(
+            handle_status(&app, &json!({"set_task_tag": "x", "clear_task_tag": true})).is_err()
+        );
+    }
+
+    #[test]
+    fn status_tag_set_writes_no_db_rows_in_read_only_mode() {
+        let app = test_app_readonly();
+
+        // Before: no token_usage rows
+        let rows_before = app
+            .db
+            .query_token_usage(&crate::db::metrics::TokenUsageQuery::default())
+            .unwrap();
+
+        // set_task_tag must succeed (it's process-local state, not a DB write)
+        let out = handle_status(&app, &json!({"set_task_tag": "issue-85"})).unwrap();
+        assert_eq!(out["task_tag"].as_str(), Some("issue-85"));
+        assert_eq!(
+            app.explicit_task_tag_snapshot().as_deref(),
+            Some("issue-85")
+        );
+
+        // After: still no token_usage rows (tag is process-local only)
+        let rows_after = app
+            .db
+            .query_token_usage(&crate::db::metrics::TokenUsageQuery::default())
+            .unwrap();
+        assert_eq!(
+            rows_before.len(),
+            rows_after.len(),
+            "set_task_tag must not write any DB rows"
+        );
+
+        // Also check task_outcomes is untouched
+        let task_outcome = app.db.get_task_outcome("issue-85").unwrap();
+        assert!(
+            task_outcome.is_none(),
+            "set_task_tag must not create a task_outcomes row"
+        );
+    }
+
+    // ── G.6: status rejects invalid task_tag and leaves tag unset ────────────
+
+    #[test]
+    fn status_rejects_invalid_task_tag_and_leaves_tag_unset() {
+        let app = test_app();
+
+        // "../etc" contains ".." which is rejected by sanitize_name.
+        let err = handle_status(&app, &json!({"set_task_tag": "../etc"})).unwrap_err();
+        assert!(
+            !err.to_string().is_empty(),
+            "should have returned a validation error"
+        );
+        assert!(
+            app.explicit_task_tag_snapshot().is_none(),
+            "task tag must remain unset after a rejected set_task_tag"
+        );
+    }
 }
