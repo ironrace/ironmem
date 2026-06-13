@@ -35,7 +35,11 @@ fn render_headline_row(out: &mut String, row: &HeadlineRow) {
 
 /// Render one task's per-phase decomposition block.
 fn render_task_phases(out: &mut String, task: &TaskReport) {
-    let outcome = task.outcome.as_deref().unwrap_or("(no outcome)");
+    let outcome = task
+        .outcome
+        .as_ref()
+        .and_then(|o| o.outcome.as_deref())
+        .unwrap_or("(no outcome)");
     let _ = writeln!(
         out,
         "  {key} [{outcome}]: {tokens} tokens · cost {cost} (§7) · provider {provider}",

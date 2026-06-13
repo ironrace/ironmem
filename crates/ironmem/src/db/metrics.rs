@@ -633,7 +633,9 @@ impl Database {
     /// so the report can apply §7 per-model rates. Rolling the rows up to the
     /// (task_key, collab_phase) grain reproduces §10.1 exactly (SUM is associative);
     /// see the drift-guard test. NOT the literal §10.1 GROUP BY.
-    /// `task` filters `COALESCE(collab_session_id, task_tag)`; `since` filters `ts >= ?`.
+    /// `task` filters `COALESCE(collab_session_id, task_tag)` and also accepts
+    /// a `task_outcomes.task_tag` alias for collab-token rows keyed only by
+    /// `collab_session_id`; `since` filters `julianday(ts) >= julianday(?)`.
     pub fn report_tokens_by_task_phase(
         &self,
         task: Option<&str>,
@@ -648,8 +650,13 @@ impl Database {
              FROM token_usage
              WHERE estimated = 0
                AND COALESCE(collab_session_id, task_tag) IS NOT NULL
-               AND (?1 IS NULL OR COALESCE(collab_session_id, task_tag) = ?1)
-               AND (?2 IS NULL OR ts >= ?2)
+               AND (?1 IS NULL
+                    OR COALESCE(collab_session_id, task_tag) = ?1
+                    OR COALESCE(collab_session_id, task_tag) IN (
+                        SELECT collab_session_id FROM task_outcomes
+                        WHERE task_tag = ?1 AND collab_session_id IS NOT NULL
+                    ))
+               AND (?2 IS NULL OR julianday(ts) >= julianday(?2))
              GROUP BY task_key, collab_phase, model, harness
              ORDER BY task_key, collab_phase, model, harness",
         )?;
@@ -670,8 +677,13 @@ impl Database {
                     SUM(input_tokens + output_tokens + cache_creation_input_tokens + cache_read_input_tokens) AS tokens
              FROM token_usage
              WHERE COALESCE(collab_session_id, task_tag) IS NOT NULL
-               AND (?1 IS NULL OR COALESCE(collab_session_id, task_tag) = ?1)
-               AND (?2 IS NULL OR ts >= ?2)
+               AND (?1 IS NULL
+                    OR COALESCE(collab_session_id, task_tag) = ?1
+                    OR COALESCE(collab_session_id, task_tag) IN (
+                        SELECT collab_session_id FROM task_outcomes
+                        WHERE task_tag = ?1 AND collab_session_id IS NOT NULL
+                    ))
+               AND (?2 IS NULL OR julianday(ts) >= julianday(?2))
              GROUP BY task_key, estimated
              ORDER BY task_key, estimated",
         )?;
@@ -688,7 +700,7 @@ impl Database {
 
     /// METRICS_SPEC §10.3 iteration counts & outcome per task (verbatim; ORDER BY
     /// started_at). `task` matches `task_tag` OR `collab_session_id`; `since`
-    /// filters `started_at >= ?`. Reuses `map_task_outcome`.
+    /// filters `julianday(started_at) >= julianday(?)`. Reuses `map_task_outcome`.
     pub fn report_task_outcomes(
         &self,
         task: Option<&str>,
@@ -699,7 +711,7 @@ impl Database {
                     review_rounds, fix_commits, handoffs, pr_url
              FROM task_outcomes
              WHERE (?1 IS NULL OR task_tag = ?1 OR collab_session_id = ?1)
-               AND (?2 IS NULL OR started_at >= ?2)
+               AND (?2 IS NULL OR julianday(started_at) >= julianday(?2))
              ORDER BY started_at, id",
         )?;
         let rows = stmt.query_map(params![task, since], map_task_outcome)?;
@@ -708,9 +720,10 @@ impl Database {
     }
 
     /// METRICS_SPEC §10.4 headline tokens-to-done (merged only; verbatim JOIN).
-    /// `since` filters the TOKEN side (`u.ts >= ?`); `task` matches the outcome's
-    /// `task_tag` OR `collab_session_id`. The OR-join is safe under the §10
-    /// uniqueness invariant (task_tag and collab_session_id each unique per task).
+    /// `since` filters the TOKEN side (`julianday(u.ts) >= julianday(?)`);
+    /// `task` matches the outcome's `task_tag` OR `collab_session_id`. The
+    /// OR-join is safe under the §10 uniqueness invariant (task_tag and
+    /// collab_session_id each unique per task).
     pub fn report_headline(
         &self,
         task: Option<&str>,
@@ -745,7 +758,7 @@ impl Database {
              WHERE {outcome_pred}
                AND u.estimated = 0
                AND (?1 IS NULL OR t.task_tag = ?1 OR t.collab_session_id = ?1)
-               AND (?2 IS NULL OR u.ts >= ?2)
+               AND (?2 IS NULL OR julianday(u.ts) >= julianday(?2))
              GROUP BY t.task_tag
              ORDER BY t.task_tag",
         );

@@ -573,6 +573,9 @@ destination, or reporting query changed.
   tokens but priced `None` (Codex cost is outside this table) even when the model id
   matches an Anthropic-priced id; unknown/unpinned models are likewise `None` and
   surfaced in `unpriced_models`. Cost is never silently `0`.
-- **`--since` windowing.** Token-row queries (§10.1/§10.2/§10.4) filter on `ts`; the
-  outcomes query (§10.3) filters on `started_at`; the headline JOIN applies `--since`
-  to the token side (`ts`) only.
+- **`--since` windowing.** `--since` accepts an RFC3339 instant or `YYYY-MM-DD`
+  date, normalizes the report echo to UTC, and compares timestamps as parsed
+  instants (not raw text, so `Z` and `+00:00` spellings are equivalent).
+  Token-row queries (§10.1/§10.2/§10.4) filter on `ts`; the outcomes query
+  (§10.3) filters on `started_at`; the headline JOIN applies `--since` to the
+  token side (`ts`) only.

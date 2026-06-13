@@ -13,6 +13,7 @@ mod render;
 
 pub use render::render_text;
 
+use chrono::{DateTime, NaiveDate, SecondsFormat, Utc};
 use serde::Serialize;
 
 use crate::db::metrics::{HeadlineTokens, TaskEstimatedSplit, TaskOutcome, TaskPhaseModelTokens};
@@ -59,6 +60,40 @@ fn sum_opt<I: IntoIterator<Item = Option<f64>>>(it: I) -> Option<f64> {
     }
 }
 
+fn task_outcome_key(outcome: &TaskOutcome) -> String {
+    outcome
+        .collab_session_id
+        .clone()
+        .unwrap_or_else(|| outcome.task_tag.clone())
+}
+
+fn validate_since(since: Option<&str>) -> Result<Option<String>, MemoryError> {
+    let Some(since) = since else {
+        return Ok(None);
+    };
+
+    if let Ok(dt) = DateTime::parse_from_rfc3339(since) {
+        return Ok(Some(
+            dt.with_timezone(&Utc)
+                .to_rfc3339_opts(SecondsFormat::Secs, true),
+        ));
+    }
+
+    if let Ok(date) = NaiveDate::parse_from_str(since, "%Y-%m-%d") {
+        let midnight = date
+            .and_hms_opt(0, 0, 0)
+            .expect("00:00:00 is always a valid time");
+        return Ok(Some(
+            DateTime::<Utc>::from_naive_utc_and_offset(midnight, Utc)
+                .to_rfc3339_opts(SecondsFormat::Secs, true),
+        ));
+    }
+
+    Err(MemoryError::Validation(format!(
+        "since must be RFC3339 or YYYY-MM-DD, got: {since}"
+    )))
+}
+
 /// Options for [`run_report`]. Both filters narrow input only (no aggregation
 /// semantics change); see the per-method docs in `crate::db::metrics`.
 #[derive(Debug, Clone, Default)]
@@ -66,8 +101,15 @@ pub struct ReportOptions {
     /// Restrict to one task (`COALESCE(collab_session_id, task_tag)` for token
     /// rows; `task_tag` OR `collab_session_id` for outcomes).
     pub task: Option<String>,
-    /// Restrict to rows at/after this RFC3339 instant (inclusive). Applies to
-    /// `ts` on token rows and `started_at` on outcomes (METRICS_SPEC §12).
+    /// Restrict to rows at/after this RFC3339 instant or YYYY-MM-DD date
+    /// (inclusive). The value is normalized to UTC before SQL comparison.
+    pub since: Option<String>,
+}
+
+/// Report scope echoed into `--json` output so filtered runs are self-describing.
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct GeneratedFor {
+    pub task: Option<String>,
     pub since: Option<String>,
 }
 
@@ -92,33 +134,37 @@ pub struct SplitReport {
     pub estimated_tokens: i64,
 }
 
+/// Outcome metadata for one task (METRICS_SPEC §10.3), nested under
+/// [`TaskReport::outcome`] so the terminal-state fields stay explicitly tied to
+/// the outcome row rather than looking like independent token aggregates.
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct OutcomeReport {
+    pub outcome: Option<String>,
+    pub review_rounds: i64,
+    pub fix_commits: i64,
+    pub handoffs: i64,
+    pub started_at: Option<String>,
+    pub done_at: Option<String>,
+    pub pr_url: Option<String>,
+}
+
 /// One task's full report: outcome metadata (§10.3) + measured phase
 /// decomposition (§10.1) + estimated/measured split (§10.2).
 #[derive(Debug, Clone, Serialize, PartialEq)]
 pub struct TaskReport {
     /// `COALESCE(collab_session_id, task_tag)` — the §10.1 task identity.
     pub task_key: String,
-    /// Outcome `task_tag` if an outcome matched this task, else `None`.
-    pub task_tag: Option<String>,
-    /// Outcome `collab_session_id` if matched, else `None`.
-    pub collab_session_id: Option<String>,
-    /// Terminal outcome (`merged`/`failed`/`abandoned`) or `None`.
-    pub outcome: Option<String>,
-    pub started_at: Option<String>,
-    pub done_at: Option<String>,
-    pub review_rounds: i64,
-    pub fix_commits: i64,
-    pub handoffs: i64,
-    pub pr_url: Option<String>,
+    /// Phase decomposition, ordered by [`PHASE_ORDER`] then `null`.
+    pub by_phase: Vec<PhaseReport>,
+    pub split: SplitReport,
+    /// Outcome row for this task, if one exists.
+    pub outcome: Option<OutcomeReport>,
     /// Σ measured tokens across all phases.
     pub tokens_to_done: i64,
     /// §7 cost summed over phases (`None` only if no phase priced).
     pub cost_usd: Option<f64>,
     /// Provider-reported cost summed over phases (NULL-preserving).
     pub provider_reported_cost_usd: Option<f64>,
-    /// Phase decomposition, ordered by [`PHASE_ORDER`] then `null`.
-    pub by_phase: Vec<PhaseReport>,
-    pub split: SplitReport,
 }
 
 /// One headline / non-completion row (METRICS_SPEC §10.4). `tokens_to_done`
@@ -140,19 +186,21 @@ pub struct HeadlineRow {
 /// The full `ironmem report` payload (serialized verbatim by `--json`).
 #[derive(Debug, Clone, Serialize, PartialEq)]
 pub struct Report {
-    /// Per-task decompositions, ordered by `task_key`.
-    pub tasks: Vec<TaskReport>,
-    /// Merged-only headline tokens-to-done, ordered by `task_key`.
-    pub headline: Vec<HeadlineRow>,
-    /// Non-completion (`failed`/`abandoned`) variant, ordered by `task_key`.
-    pub non_completions: Vec<HeadlineRow>,
-    /// Sorted-unique labels for measured groups with no §7 price (unknown model
-    /// id, `"<none>"` for NULL model, `"codex"` for any codex group).
-    pub unpriced_models: Vec<String>,
+    /// Filters used to generate this report.
+    pub generated_for: GeneratedFor,
     /// Distinct merged task_keys with ≥1 measured token row.
     pub baseline_task_count: usize,
     /// `baseline_task_count >= 10` (Phase-6 recording gate, METRICS_SPEC §11.5).
     pub baseline_ready: bool,
+    /// Merged-only headline tokens-to-done, ordered by `task_key`.
+    pub headline: Vec<HeadlineRow>,
+    /// Non-completion (`failed`/`abandoned`) variant, ordered by `task_key`.
+    pub non_completions: Vec<HeadlineRow>,
+    /// Per-task decompositions, ordered by `task_key`.
+    pub tasks: Vec<TaskReport>,
+    /// Sorted-unique labels for measured groups with no §7 price (unknown model
+    /// id, `"<none>"` for NULL model, `"codex"` for any codex group).
+    pub unpriced_models: Vec<String>,
 }
 
 /// Label a §7-unpriceable measured group for `unpriced_models`: `"codex"` for
@@ -197,22 +245,30 @@ fn outcome_for_key<'a>(task_key: &str, outcomes: &'a [TaskOutcome]) -> Option<&'
 /// then render the §10.4 headline / non-completion lists with §7 cost.
 pub fn run_report(db: &Database, opts: &ReportOptions) -> Result<Report, MemoryError> {
     let task = opts.task.as_deref();
-    let since = opts.since.as_deref();
+    let since = validate_since(opts.since.as_deref())?;
+    let since_filter = since.as_deref();
 
-    let groups = db.report_tokens_by_task_phase(task, since)?;
-    let splits = db.report_measured_estimated_split(task, since)?;
-    let outcomes = db.report_task_outcomes(task, since)?;
-    let headline_rows = db.report_headline(task, since)?;
-    let non_completion_rows = db.report_non_completions(task, since)?;
+    let groups = db.report_tokens_by_task_phase(task, since_filter)?;
+    let splits = db.report_measured_estimated_split(task, since_filter)?;
+    let outcomes = db.report_task_outcomes(task, since_filter)?;
+    let headline_rows = db.report_headline(task, since_filter)?;
+    let non_completion_rows = db.report_non_completions(task, since_filter)?;
 
-    // Distinct task_keys present in the §10.1 measured roll-up, in deterministic
-    // order. `report_tokens_by_task_phase` already orders by task_key, so a
-    // dedup-preserving pass keeps them sorted.
-    let mut task_keys: Vec<String> = Vec::new();
+    // Distinct task_keys present in any canonical task-shaped query (§10.1,
+    // §10.2, or §10.3). This keeps estimated-only and outcome-only tasks visible
+    // with zero measured tokens instead of silently dropping them from `tasks`.
+    let mut task_keys: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    let mut measured_task_keys: std::collections::BTreeSet<String> =
+        std::collections::BTreeSet::new();
     for g in &groups {
-        if task_keys.last().map(String::as_str) != Some(g.task_key.as_str()) {
-            task_keys.push(g.task_key.clone());
-        }
+        task_keys.insert(g.task_key.clone());
+        measured_task_keys.insert(g.task_key.clone());
+    }
+    for s in &splits {
+        task_keys.insert(s.task_key.clone());
+    }
+    for o in &outcomes {
+        task_keys.insert(task_outcome_key(o));
     }
 
     let tasks: Vec<TaskReport> = task_keys
@@ -221,7 +277,7 @@ pub fn run_report(db: &Database, opts: &ReportOptions) -> Result<Report, MemoryE
         .collect();
 
     // Merged task_keys with ≥1 measured token row → baseline count.
-    let baseline_task_count = task_keys
+    let baseline_task_count = measured_task_keys
         .iter()
         .filter(|key| {
             outcome_for_key(key, &outcomes).and_then(|o| o.outcome.as_deref()) == Some("merged")
@@ -234,12 +290,16 @@ pub fn run_report(db: &Database, opts: &ReportOptions) -> Result<Report, MemoryE
     let non_completions = build_headline_rows(&non_completion_rows, &tasks);
 
     Ok(Report {
-        tasks,
-        headline,
-        non_completions,
-        unpriced_models,
+        generated_for: GeneratedFor {
+            task: opts.task.clone(),
+            since,
+        },
         baseline_task_count,
         baseline_ready: baseline_task_count >= 10,
+        headline,
+        non_completions,
+        tasks,
+        unpriced_models,
     })
 }
 
@@ -306,25 +366,27 @@ fn build_task(
         .sum();
 
     let outcome = outcome_for_key(task_key, outcomes);
+    let outcome = outcome.map(|o| OutcomeReport {
+        outcome: o.outcome.clone(),
+        review_rounds: o.review_rounds,
+        fix_commits: o.fix_commits,
+        handoffs: o.handoffs,
+        started_at: o.started_at.clone(),
+        done_at: o.done_at.clone(),
+        pr_url: o.pr_url.clone(),
+    });
+
     TaskReport {
         task_key: task_key.to_string(),
-        task_tag: outcome.map(|o| o.task_tag.clone()),
-        collab_session_id: outcome.and_then(|o| o.collab_session_id.clone()),
-        outcome: outcome.and_then(|o| o.outcome.clone()),
-        started_at: outcome.and_then(|o| o.started_at.clone()),
-        done_at: outcome.and_then(|o| o.done_at.clone()),
-        review_rounds: outcome.map(|o| o.review_rounds).unwrap_or(0),
-        fix_commits: outcome.map(|o| o.fix_commits).unwrap_or(0),
-        handoffs: outcome.map(|o| o.handoffs).unwrap_or(0),
-        pr_url: outcome.and_then(|o| o.pr_url.clone()),
-        tokens_to_done,
-        cost_usd,
-        provider_reported_cost_usd,
         by_phase,
         split: SplitReport {
             measured_tokens,
             estimated_tokens,
         },
+        outcome,
+        tokens_to_done,
+        cost_usd,
+        provider_reported_cost_usd,
     }
 }
 
@@ -394,21 +456,18 @@ pub fn one_line_summary(db: &Database) -> String {
 /// queries) for the §7 cost + baseline count, and the §10.3 outcomes for the
 /// task count (tasks with outcomes OR measured token data).
 fn one_line_summary_inner(db: &Database) -> Result<String, MemoryError> {
+    let groups = db.report_tokens_by_task_phase(None, None)?;
     let outcomes = db.report_task_outcomes(None, None)?;
-    let report = run_report(db, &ReportOptions::default())?;
 
     // Distinct task identities across outcomes and the measured roll-up: a task
-    // counts if it has an outcome OR ≥1 measured token row.
+    // counts if it has an outcome OR ≥1 measured token row. Keep this path much
+    // cheaper than assembling the full report; `status` is a hot MCP endpoint.
     let mut keys: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
     for o in &outcomes {
-        let key = o
-            .collab_session_id
-            .clone()
-            .unwrap_or_else(|| o.task_tag.clone());
-        keys.insert(key);
+        keys.insert(task_outcome_key(o));
     }
-    for t in &report.tasks {
-        keys.insert(t.task_key.clone());
+    for g in &groups {
+        keys.insert(g.task_key.clone());
     }
 
     if keys.is_empty() {
@@ -416,9 +475,25 @@ fn one_line_summary_inner(db: &Database) -> Result<String, MemoryError> {
     }
 
     let n = keys.len();
-    let measured: i64 = report.tasks.iter().map(|t| t.split.measured_tokens).sum();
-    let cost: f64 = report.tasks.iter().filter_map(|t| t.cost_usd).sum();
-    let c = report.baseline_task_count;
+    let measured: i64 = groups
+        .iter()
+        .map(|g| {
+            g.input_tokens
+                + g.output_tokens
+                + g.cache_creation_input_tokens
+                + g.cache_read_input_tokens
+        })
+        .sum();
+    let cost: f64 = groups.iter().filter_map(group_cost).sum();
+    let c = groups
+        .iter()
+        .map(|g| g.task_key.as_str())
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .filter(|key| {
+            outcome_for_key(key, &outcomes).and_then(|o| o.outcome.as_deref()) == Some("merged")
+        })
+        .count();
 
     Ok(format!(
         "{n} tasks · {measured} measured tokens · ${cost:.2} (§7) · baseline {c}/10"

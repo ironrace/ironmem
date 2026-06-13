@@ -60,7 +60,7 @@ enum Commands {
         /// Only this task (collab_session_id or task_tag)
         #[arg(long)]
         task: Option<String>,
-        /// Only rows at/after this RFC3339 date (inclusive)
+        /// Only rows at/after this RFC3339 instant or YYYY-MM-DD date (inclusive)
         #[arg(long)]
         since: Option<String>,
         /// Emit JSON instead of text

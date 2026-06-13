@@ -240,6 +240,8 @@ fn report_golden_json_matches_hand_computed() {
     let report: Report = run_report(&db, &ReportOptions::default()).unwrap();
 
     // ---- Hand-verified guard assertions (must pass before the JSON freeze) ----
+    assert_eq!(report.generated_for.task, None);
+    assert_eq!(report.generated_for.since, None);
     assert_eq!(report.baseline_task_count, 2); // sess-rich, sess-min
     assert!(!report.baseline_ready); // 2 < 10
     assert_eq!(
@@ -341,27 +343,197 @@ fn baseline_ready_flips_at_ten_merged_tasks() {
     assert!(ten.baseline_ready);
 }
 
+#[test]
+fn tasks_include_estimated_only_and_outcome_only_identities() {
+    let db = Database::open_in_memory().unwrap();
+
+    db.upsert_task_outcome(&outcome(
+        "issue-est",
+        "sess-est",
+        "merged",
+        "2026-06-01T00:00:00Z",
+        Some("2026-06-02T00:00:00Z"),
+        0,
+        0,
+        None,
+    ))
+    .unwrap();
+    db.insert_token_usage(&tok(
+        "sess-est",
+        "impl",
+        "claude-opus-4-8",
+        "claude",
+        500_000,
+        0,
+        0,
+        0,
+        true,
+        None,
+        "2026-06-01T01:00:00Z",
+    ))
+    .unwrap();
+
+    db.upsert_task_outcome(&outcome(
+        "issue-empty",
+        "sess-empty",
+        "failed",
+        "2026-06-03T00:00:00Z",
+        None,
+        1,
+        0,
+        None,
+    ))
+    .unwrap();
+
+    let report = run_report(&db, &ReportOptions::default()).unwrap();
+    let est = report
+        .tasks
+        .iter()
+        .find(|t| t.task_key == "sess-est")
+        .expect("estimated-only task should still render");
+    assert_eq!(est.tokens_to_done, 0);
+    assert_eq!(est.split.measured_tokens, 0);
+    assert_eq!(est.split.estimated_tokens, 500_000);
+    assert_eq!(
+        est.outcome.as_ref().and_then(|o| o.outcome.as_deref()),
+        Some("merged")
+    );
+
+    let empty = report
+        .tasks
+        .iter()
+        .find(|t| t.task_key == "sess-empty")
+        .expect("outcome-only task should still render");
+    assert_eq!(empty.tokens_to_done, 0);
+    assert_eq!(empty.split.measured_tokens, 0);
+    assert_eq!(
+        empty.outcome.as_ref().and_then(|o| o.outcome.as_deref()),
+        Some("failed")
+    );
+
+    assert_eq!(
+        report.baseline_task_count, 0,
+        "baseline counts merged tasks with measured token rows only"
+    );
+}
+
+#[test]
+fn task_tag_alias_and_rfc3339_since_variants_filter_collab_rows() {
+    let db = Database::open_in_memory().unwrap();
+    db.upsert_task_outcome(&outcome(
+        "issue-84",
+        "sess-84",
+        "merged",
+        "2026-06-01T00:00:00+00:00",
+        Some("2026-06-02T00:00:00+00:00"),
+        0,
+        0,
+        None,
+    ))
+    .unwrap();
+    db.insert_token_usage(&tok(
+        "sess-84",
+        "impl",
+        "claude-opus-4-8",
+        "claude",
+        1_000_000,
+        0,
+        0,
+        0,
+        false,
+        None,
+        "2026-06-01T00:00:00+00:00",
+    ))
+    .unwrap();
+
+    for since in ["2026-06-01T00:00:00Z", "2026-06-01T01:00:00+01:00"] {
+        let report = run_report(
+            &db,
+            &ReportOptions {
+                task: Some("issue-84".to_string()),
+                since: Some(since.to_string()),
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            report.generated_for.since.as_deref(),
+            Some("2026-06-01T00:00:00Z")
+        );
+        assert_eq!(
+            report.tasks.len(),
+            1,
+            "task-tag alias must find collab tokens"
+        );
+        assert_eq!(report.tasks[0].task_key, "sess-84");
+        assert_eq!(report.tasks[0].tokens_to_done, 1_000_000);
+        assert_eq!(report.tasks[0].cost_usd, Some(5.0));
+        assert_eq!(report.baseline_task_count, 1);
+        assert_eq!(report.headline.len(), 1);
+        assert_eq!(report.headline[0].task_key, "sess-84");
+        assert_eq!(report.headline[0].tokens_to_done, 1_000_000);
+    }
+}
+
+#[test]
+fn invalid_since_is_rejected() {
+    let db = Database::open_in_memory().unwrap();
+    let err = run_report(
+        &db,
+        &ReportOptions {
+            task: None,
+            since: Some("not-a-date".to_string()),
+        },
+    )
+    .unwrap_err();
+    assert!(
+        err.to_string().contains("since must be"),
+        "unexpected error: {err}"
+    );
+}
+
 /// Frozen pretty-JSON golden. Filled after the guard assertions pass and every
 /// value is reconciled with the plan's expectation table (Task 3): sess-fail
 /// §7 $10.00 / no provider cost; sess-min §7 $1.00 == provider; sess-rich
 /// planning $5.00, impl $13.80 (provider $7.50), review/rework unpriced, total
 /// §7 $18.80 / provider $7.50 / 6.5M measured + 400k estimated; baseline 2/10.
 const EXPECTED_JSON: &str = r#"{
-  "tasks": [
+  "generated_for": {
+    "task": null,
+    "since": null
+  },
+  "baseline_task_count": 2,
+  "baseline_ready": false,
+  "headline": [
+    {
+      "task_key": "sess-min",
+      "task_tag": "issue-min",
+      "collab_session_id": "sess-min",
+      "tokens_to_done": 1000000,
+      "cost_usd": 1.0,
+      "provider_reported_cost_usd": 1.0
+    },
+    {
+      "task_key": "sess-rich",
+      "task_tag": "issue-rich",
+      "collab_session_id": "sess-rich",
+      "tokens_to_done": 6500000,
+      "cost_usd": 18.8,
+      "provider_reported_cost_usd": 7.5
+    }
+  ],
+  "non_completions": [
     {
       "task_key": "sess-fail",
       "task_tag": "issue-fail",
       "collab_session_id": "sess-fail",
-      "outcome": "failed",
-      "started_at": "2026-06-05T00:00:00Z",
-      "done_at": null,
-      "review_rounds": 3,
-      "fix_commits": 0,
-      "handoffs": 0,
-      "pr_url": null,
       "tokens_to_done": 2000000,
       "cost_usd": 10.0,
-      "provider_reported_cost_usd": null,
+      "provider_reported_cost_usd": null
+    }
+  ],
+  "tasks": [
+    {
+      "task_key": "sess-fail",
       "by_phase": [
         {
           "phase": "impl",
@@ -373,22 +545,22 @@ const EXPECTED_JSON: &str = r#"{
       "split": {
         "measured_tokens": 2000000,
         "estimated_tokens": 0
-      }
+      },
+      "outcome": {
+        "outcome": "failed",
+        "review_rounds": 3,
+        "fix_commits": 0,
+        "handoffs": 0,
+        "started_at": "2026-06-05T00:00:00Z",
+        "done_at": null,
+        "pr_url": null
+      },
+      "tokens_to_done": 2000000,
+      "cost_usd": 10.0,
+      "provider_reported_cost_usd": null
     },
     {
       "task_key": "sess-min",
-      "task_tag": "issue-min",
-      "collab_session_id": "sess-min",
-      "outcome": "merged",
-      "started_at": "2026-06-03T00:00:00Z",
-      "done_at": "2026-06-04T00:00:00Z",
-      "review_rounds": 0,
-      "fix_commits": 0,
-      "handoffs": 0,
-      "pr_url": "https://github.com/ironrace/ironmem/pull/101",
-      "tokens_to_done": 1000000,
-      "cost_usd": 1.0,
-      "provider_reported_cost_usd": 1.0,
       "by_phase": [
         {
           "phase": "impl",
@@ -400,22 +572,22 @@ const EXPECTED_JSON: &str = r#"{
       "split": {
         "measured_tokens": 1000000,
         "estimated_tokens": 0
-      }
+      },
+      "outcome": {
+        "outcome": "merged",
+        "review_rounds": 0,
+        "fix_commits": 0,
+        "handoffs": 0,
+        "started_at": "2026-06-03T00:00:00Z",
+        "done_at": "2026-06-04T00:00:00Z",
+        "pr_url": "https://github.com/ironrace/ironmem/pull/101"
+      },
+      "tokens_to_done": 1000000,
+      "cost_usd": 1.0,
+      "provider_reported_cost_usd": 1.0
     },
     {
       "task_key": "sess-rich",
-      "task_tag": "issue-rich",
-      "collab_session_id": "sess-rich",
-      "outcome": "merged",
-      "started_at": "2026-06-01T00:00:00Z",
-      "done_at": "2026-06-02T00:00:00Z",
-      "review_rounds": 2,
-      "fix_commits": 1,
-      "handoffs": 0,
-      "pr_url": "https://github.com/ironrace/ironmem/pull/100",
-      "tokens_to_done": 6500000,
-      "cost_usd": 18.8,
-      "provider_reported_cost_usd": 7.5,
       "by_phase": [
         {
           "phase": "planning",
@@ -445,41 +617,23 @@ const EXPECTED_JSON: &str = r#"{
       "split": {
         "measured_tokens": 6500000,
         "estimated_tokens": 400000
-      }
-    }
-  ],
-  "headline": [
-    {
-      "task_key": "sess-min",
-      "task_tag": "issue-min",
-      "collab_session_id": "sess-min",
-      "tokens_to_done": 1000000,
-      "cost_usd": 1.0,
-      "provider_reported_cost_usd": 1.0
-    },
-    {
-      "task_key": "sess-rich",
-      "task_tag": "issue-rich",
-      "collab_session_id": "sess-rich",
+      },
+      "outcome": {
+        "outcome": "merged",
+        "review_rounds": 2,
+        "fix_commits": 1,
+        "handoffs": 0,
+        "started_at": "2026-06-01T00:00:00Z",
+        "done_at": "2026-06-02T00:00:00Z",
+        "pr_url": "https://github.com/ironrace/ironmem/pull/100"
+      },
       "tokens_to_done": 6500000,
       "cost_usd": 18.8,
       "provider_reported_cost_usd": 7.5
     }
   ],
-  "non_completions": [
-    {
-      "task_key": "sess-fail",
-      "task_tag": "issue-fail",
-      "collab_session_id": "sess-fail",
-      "tokens_to_done": 2000000,
-      "cost_usd": 10.0,
-      "provider_reported_cost_usd": null
-    }
-  ],
   "unpriced_models": [
     "claude-future-9",
     "codex"
-  ],
-  "baseline_task_count": 2,
-  "baseline_ready": false
+  ]
 }"#;

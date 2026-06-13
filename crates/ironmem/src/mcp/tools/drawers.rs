@@ -424,10 +424,49 @@ mod tests {
     fn status_includes_one_line_metrics_summary() {
         let app = test_app();
         let out = handle_status(&app, &json!({})).unwrap();
-        assert!(out.get("metrics").is_some(), "metrics summary present");
-        assert!(
-            out["metrics"].as_str().unwrap().contains("metric") // "no metrics recorded yet"
-                || out["metrics"].as_str().unwrap().contains("task")
+        assert_eq!(
+            out["metrics"].as_str(),
+            Some("no metrics recorded yet"),
+            "empty DB status summary"
+        );
+
+        app.db
+            .upsert_task_outcome(&crate::db::TaskOutcome {
+                task_tag: "issue-status".into(),
+                collab_session_id: Some("sess-status".into()),
+                started_at: Some("2026-06-01T00:00:00Z".into()),
+                done_at: Some("2026-06-02T00:00:00Z".into()),
+                outcome: Some("merged".into()),
+                review_rounds: 0,
+                fix_commits: 0,
+                handoffs: 0,
+                pr_url: None,
+            })
+            .unwrap();
+        app.db
+            .insert_token_usage(&crate::db::NewTokenUsage {
+                ts: "2026-06-01T01:00:00Z".into(),
+                source: "llm_rerank".into(),
+                harness: "claude".into(),
+                model: Some("claude-opus-4-8".into()),
+                session_id: None,
+                collab_session_id: Some("sess-status".into()),
+                collab_phase: Some("impl".into()),
+                task_tag: None,
+                input_tokens: 1_000_000,
+                output_tokens: 0,
+                cache_creation_input_tokens: 0,
+                cache_read_input_tokens: 0,
+                estimated: false,
+                chars: 0,
+                cost_usd: None,
+            })
+            .unwrap();
+
+        let out = handle_status(&app, &json!({})).unwrap();
+        assert_eq!(
+            out["metrics"].as_str(),
+            Some("1 tasks · 1000000 measured tokens · $5.00 (§7) · baseline 1/10")
         );
         // existing keys preserved
         assert!(out.get("total_drawers").is_some());

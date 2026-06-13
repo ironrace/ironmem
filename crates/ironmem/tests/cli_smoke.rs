@@ -230,6 +230,10 @@ fn cli_report_json_smoke_test() {
 
     let report = base_command(&home, &db_path)
         .arg("report")
+        .arg("--task")
+        .arg("issue-rep")
+        .arg("--since")
+        .arg("2026-06-01T01:00:00+00:00")
         .arg("--json")
         .output()
         .unwrap();
@@ -241,6 +245,21 @@ fn cli_report_json_smoke_test() {
     assert!(
         value.get("baseline_ready").is_some(),
         "report JSON missing baseline_ready: {stdout}"
+    );
+    assert_eq!(
+        value["generated_for"]["task"].as_str(),
+        Some("issue-rep"),
+        "report JSON missing task filter echo: {stdout}"
+    );
+    assert_eq!(
+        value["generated_for"]["since"].as_str(),
+        Some("2026-06-01T01:00:00Z"),
+        "report JSON missing normalized since filter echo: {stdout}"
+    );
+    assert_eq!(
+        value["tasks"][0]["task_key"].as_str(),
+        Some("sess-rep"),
+        "task_tag filter must resolve collab token rows: {stdout}"
     );
     assert!(
         value.get("headline").is_some(),
