@@ -333,6 +333,7 @@ pub(super) fn handle_status(app: &App, args: &Value) -> Result<Value, MemoryErro
         "warming_up": app.is_warming_up(),
         "task_tag": app.explicit_task_tag_snapshot(),
         "active_collab_session_id": app.active_collab_session_snapshot(),
+        "metrics": crate::report::one_line_summary(&app.db),
     }))
 }
 
@@ -417,6 +418,20 @@ mod tests {
         let out = handle_status(&app, &json!({"clear_task_tag": true})).unwrap();
         assert!(out["task_tag"].is_null());
         assert!(app.explicit_task_tag_snapshot().is_none());
+    }
+
+    #[test]
+    fn status_includes_one_line_metrics_summary() {
+        let app = test_app();
+        let out = handle_status(&app, &json!({})).unwrap();
+        assert!(out.get("metrics").is_some(), "metrics summary present");
+        assert!(
+            out["metrics"].as_str().unwrap().contains("metric") // "no metrics recorded yet"
+                || out["metrics"].as_str().unwrap().contains("task")
+        );
+        // existing keys preserved
+        assert!(out.get("total_drawers").is_some());
+        assert!(out.get("active_collab_session_id").is_some());
     }
 
     #[test]
