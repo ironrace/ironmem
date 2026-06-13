@@ -491,6 +491,199 @@ fn invalid_since_is_rejected() {
     );
 }
 
+#[test]
+fn headline_cost_attaches_when_tokens_keyed_by_task_tag_not_collab_id() {
+    // Regression for the §10.4 either-key cost match: an outcome carrying a
+    // collab_session_id whose token rows are keyed by task_tag ONLY. The §10.4
+    // JOIN matches via task_tag, so the §7 cost must still attach to the headline
+    // (it previously fell to `n/a` because the lookup keyed only on collab id).
+    let db = Database::open_in_memory().unwrap();
+    db.upsert_task_outcome(&outcome(
+        "issue-x",
+        "sess-x",
+        "merged",
+        "2026-06-01T00:00:00Z",
+        Some("2026-06-02T00:00:00Z"),
+        0,
+        0,
+        None,
+    ))
+    .unwrap();
+    db.insert_token_usage(&NewTokenUsage {
+        ts: "2026-06-01T01:00:00Z".into(),
+        source: "llm_rerank".into(),
+        harness: "claude".into(),
+        model: Some("claude-opus-4-8".into()),
+        session_id: None,
+        collab_session_id: None, // keyed by task_tag only
+        collab_phase: Some("impl".into()),
+        task_tag: Some("issue-x".into()),
+        input_tokens: 1_000_000,
+        output_tokens: 0,
+        cache_creation_input_tokens: 0,
+        cache_read_input_tokens: 0,
+        estimated: false,
+        chars: 0,
+        cost_usd: None,
+    })
+    .unwrap();
+
+    let report = run_report(&db, &ReportOptions::default()).unwrap();
+    assert_eq!(report.headline.len(), 1);
+    assert_eq!(report.headline[0].task_tag, "issue-x");
+    assert_eq!(report.headline[0].tokens_to_done, 1_000_000);
+    assert_eq!(
+        report.headline[0].cost_usd,
+        Some(5.0),
+        "§7 cost must attach via the task_tag identity, not render n/a"
+    );
+}
+
+#[test]
+fn non_completion_since_filters_token_side() {
+    // A failed task with two measured rows straddling a `--since` cutoff: the
+    // §10.4 token total must drop the pre-cutoff row (filter is on u.ts).
+    let db = Database::open_in_memory().unwrap();
+    db.upsert_task_outcome(&outcome(
+        "issue-f",
+        "sess-f",
+        "failed",
+        "2026-06-01T00:00:00Z",
+        None,
+        0,
+        0,
+        None,
+    ))
+    .unwrap();
+    db.insert_token_usage(&tok(
+        "sess-f",
+        "impl",
+        "claude-opus-4-8",
+        "claude",
+        1_000_000,
+        0,
+        0,
+        0,
+        false,
+        None,
+        "2026-06-01T00:00:00Z",
+    ))
+    .unwrap();
+    db.insert_token_usage(&tok(
+        "sess-f",
+        "impl",
+        "claude-opus-4-8",
+        "claude",
+        3_000_000,
+        0,
+        0,
+        0,
+        false,
+        None,
+        "2026-06-10T00:00:00Z",
+    ))
+    .unwrap();
+
+    let all = run_report(&db, &ReportOptions::default()).unwrap();
+    assert_eq!(all.non_completions[0].tokens_to_done, 4_000_000);
+
+    let windowed = run_report(
+        &db,
+        &ReportOptions {
+            task: None,
+            since: Some("2026-06-05".into()),
+        },
+    )
+    .unwrap();
+    assert_eq!(windowed.non_completions.len(), 1);
+    assert_eq!(
+        windowed.non_completions[0].tokens_to_done, 3_000_000,
+        "--since drops the pre-cutoff token row from the non-completion total"
+    );
+}
+
+#[test]
+fn since_accepts_bare_date_and_normalizes_echo() {
+    let db = Database::open_in_memory().unwrap();
+    db.upsert_task_outcome(&outcome(
+        "issue-d",
+        "sess-d",
+        "merged",
+        "2026-06-01T00:00:00Z",
+        Some("2026-06-02T00:00:00Z"),
+        0,
+        0,
+        None,
+    ))
+    .unwrap();
+    db.insert_token_usage(&tok(
+        "sess-d",
+        "impl",
+        "claude-opus-4-8",
+        "claude",
+        1_000_000,
+        0,
+        0,
+        0,
+        false,
+        None,
+        "2026-06-03T00:00:00Z",
+    ))
+    .unwrap();
+
+    let report = run_report(
+        &db,
+        &ReportOptions {
+            task: None,
+            since: Some("2026-06-01".into()),
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        report.generated_for.since.as_deref(),
+        Some("2026-06-01T00:00:00Z"),
+        "YYYY-MM-DD normalizes to a UTC RFC3339 instant in the echo"
+    );
+    assert_eq!(report.tasks.len(), 1);
+    assert_eq!(report.tasks[0].tokens_to_done, 1_000_000);
+}
+
+#[test]
+fn abandoned_outcome_lands_in_non_completions() {
+    let db = Database::open_in_memory().unwrap();
+    db.upsert_task_outcome(&outcome(
+        "issue-a",
+        "sess-a",
+        "abandoned",
+        "2026-06-01T00:00:00Z",
+        None,
+        0,
+        0,
+        None,
+    ))
+    .unwrap();
+    db.insert_token_usage(&tok(
+        "sess-a",
+        "impl",
+        "claude-opus-4-8",
+        "claude",
+        2_000_000,
+        0,
+        0,
+        0,
+        false,
+        None,
+        "2026-06-01T01:00:00Z",
+    ))
+    .unwrap();
+
+    let report = run_report(&db, &ReportOptions::default()).unwrap();
+    assert!(report.headline.is_empty(), "abandoned is not merged");
+    assert_eq!(report.non_completions.len(), 1);
+    assert_eq!(report.non_completions[0].task_key, "sess-a");
+    assert_eq!(report.non_completions[0].cost_usd, Some(10.0));
+}
+
 /// Frozen pretty-JSON golden. Filled after the guard assertions pass and every
 /// value is reconciled with the plan's expectation table (Task 3): sess-fail
 /// §7 $10.00 / no provider cost; sess-min §7 $1.00 == provider; sess-rich

@@ -6,8 +6,10 @@
 //! [`mod@cost`] rather than the sparse stored `cost_usd` column. The stored
 //! provider figure is surfaced separately as `provider_reported_cost_usd`
 //! (NULL-preserving). The assembly path injects no wallclock and rounds every
-//! emitted cost to 6 dp so the `--json` output is byte-stable for the golden
-//! test.
+//! **§7-derived** cost to 6 dp so the `--json` output is byte-stable; the
+//! headline `provider_reported_cost_usd` figures are emitted as the verbatim
+//! §10.4 SQL `SUM(cost_usd)` (not re-rounded — clean in practice; the golden
+//! pins them).
 mod cost;
 mod render;
 
@@ -105,10 +107,16 @@ fn validate_since(since: Option<&str>) -> Result<Option<String>, MemoryError> {
 #[derive(Debug, Clone, Default)]
 pub struct ReportOptions {
     /// Restrict to one task (`COALESCE(collab_session_id, task_tag)` for token
-    /// rows; `task_tag` OR `collab_session_id` for outcomes).
+    /// rows; `task_tag` OR `collab_session_id` for outcomes). Unlike `since`,
+    /// this is NOT validated: an unknown/typo'd key matches no rows and yields an
+    /// empty report (the text renderer adds a "no metrics matched" note so it is
+    /// not mistaken for a genuinely empty task).
     pub task: Option<String>,
-    /// Restrict to rows at/after this RFC3339 instant or YYYY-MM-DD date
-    /// (inclusive). The value is normalized to UTC before SQL comparison.
+    /// Restrict to rows at/after this RFC3339 instant or `YYYY-MM-DD` date
+    /// (inclusive). Normalized to UTC; SQL compares instants via `julianday()`.
+    /// A stored timestamp that is not a parseable datetime yields a NULL
+    /// `julianday` and is excluded once `since` is set — current writers always
+    /// emit RFC3339, so this only bites a hand-edited DB.
     pub since: Option<String>,
 }
 
@@ -116,6 +124,9 @@ pub struct ReportOptions {
 #[derive(Debug, Clone, Serialize, PartialEq)]
 pub struct GeneratedFor {
     pub task: Option<String>,
+    /// The **normalized** `--since` (post-`validate_since`): a `YYYY-MM-DD` input
+    /// is echoed here as a full UTC RFC3339 instant, so it may differ textually
+    /// from the raw value the caller passed.
     pub since: Option<String>,
 }
 
@@ -143,6 +154,11 @@ pub struct SplitReport {
 /// Outcome metadata for one task (METRICS_SPEC §10.3), nested under
 /// [`TaskReport::outcome`] so the terminal-state fields stay explicitly tied to
 /// the outcome row rather than looking like independent token aggregates.
+///
+/// A deliberate manual projection of [`crate::db::metrics::TaskOutcome`] — the
+/// identity fields (`task_tag`/`collab_session_id`) are intentionally dropped
+/// (identity lives on [`TaskReport::task_key`]). There is no compile-time link,
+/// so a new `task_outcomes` column must be added here in lockstep.
 #[derive(Debug, Clone, Serialize, PartialEq)]
 pub struct OutcomeReport {
     pub outcome: Option<String>,
@@ -181,11 +197,14 @@ pub struct HeadlineRow {
     /// `collab_session_id` when present else `task_tag` — matches the §10.1 key.
     pub task_key: String,
     pub task_tag: String,
+    /// `None` ⟹ keyed by `task_tag` (no collab session), so `task_key == task_tag`.
     pub collab_session_id: Option<String>,
     pub tokens_to_done: i64,
     /// §7-derived cost for this task (`None` when no contributing row priced).
     pub cost_usd: Option<f64>,
-    /// Verbatim §10.4 `SUM(cost_usd)` (NULL-preserving).
+    /// Verbatim §10.4 JOIN `SUM(cost_usd)` (NULL-preserving). This is the JOIN
+    /// aggregate and may differ from a `TaskReport`'s phase-roll-up
+    /// `provider_reported_cost_usd`; consumers must not assume the two are equal.
     pub provider_reported_cost_usd: Option<f64>,
 }
 
@@ -260,7 +279,8 @@ fn count_baseline_tasks(groups: &[TaskPhaseModelTokens], outcomes: &[TaskOutcome
 }
 
 /// Assemble the METRICS_SPEC §10 report with §7-derived cost. No wallclock is
-/// read on this path; every emitted cost is rounded to 6 dp at construction.
+/// read on this path; every §7-derived cost is rounded to 6 dp at construction
+/// (the headline `provider_reported_cost_usd` is the verbatim §10.4 SQL `SUM`).
 ///
 /// Pipeline: pull the five §10 aggregates (filtered by `opts`), group the
 /// §10.1 rows by `task_key`, decompose each task by phase (applying §7 rates
@@ -429,9 +449,18 @@ fn build_headline_rows(rows: &[HeadlineTokens], tasks: &[TaskReport]) -> Vec<Hea
                 .collab_session_id
                 .clone()
                 .unwrap_or_else(|| r.task_tag.clone());
+            // Mirror the §10.4 JOIN (`u.task_tag = t.task_tag OR
+            // u.collab_session_id = t.collab_session_id`): the §7 cost lives on
+            // the `TaskReport` keyed by whichever identity the token rows used,
+            // which is not always this row's `task_key` (the collab id). Match on
+            // EITHER identity so a `task_tag`-keyed token set still attaches its
+            // cost instead of silently rendering `n/a`.
             let cost_usd = tasks
                 .iter()
-                .find(|t| t.task_key == task_key)
+                .find(|t| {
+                    t.task_key == r.task_tag
+                        || r.collab_session_id.as_deref() == Some(t.task_key.as_str())
+                })
                 .and_then(|t| t.cost_usd);
             HeadlineRow {
                 task_key,
@@ -466,9 +495,10 @@ pub fn one_line_summary(db: &Database) -> String {
 }
 
 /// Fallible core of [`one_line_summary`]; the public wrapper degrades any `Err`
-/// to a default string. Uses [`run_report`] (which wraps the §10 token/outcome
-/// queries) for the §7 cost + baseline count, and the §10.3 outcomes for the
-/// task count (tasks with outcomes OR measured token data).
+/// to a default string. Queries the §10.1 token roll-up and §10.3 outcomes
+/// directly — deliberately cheaper than assembling the full [`run_report`] tree
+/// (`status` is a hot endpoint) — for the §7 cost, baseline count, and task
+/// count (tasks with an outcome OR ≥1 measured token row).
 fn one_line_summary_inner(db: &Database) -> Result<String, MemoryError> {
     let groups = db.report_tokens_by_task_phase(None, None)?;
     let outcomes = db.report_task_outcomes(None, None)?;

@@ -71,6 +71,19 @@ fn render_task_phases(out: &mut String, task: &TaskReport) {
 pub fn render_text(report: &Report) -> String {
     let mut out = String::new();
 
+    // Diagnosability: `--task` is unvalidated, so a typo'd key produces an empty
+    // report indistinguishable from a genuinely empty task. Surface a note so the
+    // two are not confused (the JSON `generated_for.task` carries the same signal
+    // for tooling).
+    if let Some(task) = report.generated_for.task.as_deref() {
+        if report.headline.is_empty()
+            && report.non_completions.is_empty()
+            && report.tasks.is_empty()
+        {
+            let _ = writeln!(out, "(no metrics matched task '{task}')\n");
+        }
+    }
+
     let _ = writeln!(out, "Headline (merged tasks):");
     if report.headline.is_empty() {
         let _ = writeln!(out, "  (none)");
@@ -268,5 +281,26 @@ mod tests {
         assert!(text.contains("baseline") || text.contains("Baseline"));
         assert!(text.contains("claude-future-9"), "unpriced model surfaced");
         assert!(text.contains("provider"), "provider-reported cost labeled");
+        // review/rework phases are unpriced → cost renders `n/a`, never `$0.00`.
+        assert!(text.contains("n/a"), "unpriced cost renders n/a");
+        assert!(!text.contains("$0.00"), "unpriced cost is never $0.00");
+    }
+
+    #[test]
+    fn render_text_notes_unmatched_task_filter() {
+        let db = Database::open_in_memory().unwrap();
+        let report = crate::report::run_report(
+            &db,
+            &crate::report::ReportOptions {
+                task: Some("does-not-exist".into()),
+                since: None,
+            },
+        )
+        .unwrap();
+        let text = crate::report::render_text(&report);
+        assert!(
+            text.contains("no metrics matched task 'does-not-exist'"),
+            "unmatched --task must be flagged: {text}"
+        );
     }
 }
