@@ -47,6 +47,15 @@ impl Database {
         Ok(Self { conn })
     }
 
+    /// Execute raw SQL against the connection. Test-only fixture for putting the
+    /// schema into a failure state (e.g. dropping a table) so error-propagation
+    /// paths can be exercised. Compiled out of release builds.
+    #[cfg(test)]
+    pub(crate) fn exec_raw(&self, sql: &str) -> Result<(), MemoryError> {
+        self.conn.execute_batch(sql)?;
+        Ok(())
+    }
+
     /// Open an in-memory database (for testing and integration tests).
     pub fn open_in_memory() -> Result<Self, MemoryError> {
         let conn = Connection::open_in_memory()?;

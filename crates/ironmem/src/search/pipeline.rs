@@ -583,19 +583,18 @@ fn kg_boost(
     'outer: for entity in &mentioned {
         direct_names.insert(entity.name.to_lowercase());
 
-        if let Ok(triples) = kg.query_entity_current(&entity.id, query_limit) {
-            for triple in triples {
-                for related_id in [&triple.subject, &triple.object] {
-                    if let Ok(Some(e)) = kg.get_entity(related_id) {
-                        let name = e.name.to_lowercase();
-                        if !direct_names.contains(&name) {
-                            related_names.insert(name);
-                        }
+        let triples = kg.query_entity_current(&entity.id, query_limit)?;
+        for triple in triples {
+            for related_id in [&triple.subject, &triple.object] {
+                if let Some(e) = kg.get_entity(related_id)? {
+                    let name = e.name.to_lowercase();
+                    if !direct_names.contains(&name) {
+                        related_names.insert(name);
                     }
                 }
-                if related_names.len() >= fanout_cap {
-                    break 'outer;
-                }
+            }
+            if related_names.len() >= fanout_cap {
+                break 'outer;
             }
         }
     }
@@ -688,5 +687,33 @@ mod tests {
         );
 
         std::env::remove_var("IRONMEM_KG_BOOST_FANOUT");
+    }
+
+    #[test]
+    fn kg_boost_propagates_db_errors_instead_of_swallowing() {
+        let _g = KG_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::remove_var("IRONMEM_KG_QUERY_LIMIT");
+        std::env::remove_var("IRONMEM_KG_BOOST_FANOUT");
+
+        let db = Database::open_in_memory().unwrap();
+        let kg = KnowledgeGraph::new(&db);
+
+        // Register an entity so the query mentions it and the related-entity
+        // lookup runs (it would short-circuit on an empty mention set).
+        kg.upsert_entity("Hub", "thing").unwrap();
+
+        // Simulate a DB-level failure: drop the table the related-entity lookup
+        // reads from. The entities table is left intact so the mention scan
+        // still finds "Hub" and execution reaches the triple query.
+        db.exec_raw("DROP TABLE triples").unwrap();
+
+        let mut candidates = vec![candidate("c0", "note about hub")];
+
+        // The error from the dropped table must surface, not be swallowed.
+        let result = kg_boost(&mut candidates, "Hub", &kg);
+        assert!(
+            result.is_err(),
+            "kg_boost must propagate DB errors from the related-entity lookup, got {result:?}"
+        );
     }
 }
