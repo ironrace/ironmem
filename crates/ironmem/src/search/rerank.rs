@@ -46,8 +46,10 @@ static QUOTED_RE: LazyLock<Regex> =
 // --- Word-boundary token matcher ---------------------------------------------
 
 /// Compile a word-boundary matcher for a single token, with light suffix
-/// tolerance for common English inflections. Reuse the returned regex
-/// across all candidate documents for one query — compile cost is ~µs.
+/// tolerance for common English inflections. The returned regex is compiled
+/// exactly once per surviving token in `idf_filter`, stored on
+/// `EffectiveToken.matcher`, and reused for both the IDF df-count and the
+/// per-candidate scoring loop — compile cost is ~µs.
 ///
 /// Pattern: `(?i)(?:^|[^a-zA-Z0-9_]){escape(token)}(?:s|es|ed|ing|ion|ions)?(?:[^a-zA-Z0-9_]|$)`
 ///
@@ -81,8 +83,9 @@ fn compile_token_matcher(token: &str) -> Regex {
 }
 
 /// Boundary-aware version of `doc.contains(token)`. Thin wrapper over
-/// `Regex::is_match` so callers (the scorer and the IDF filter) share a
-/// single hit-test seam.
+/// `Regex::is_match`. Reached through `token_in_doc`, the single hit-test
+/// seam that both the scorer (`overlap_fraction`) and the IDF df-count
+/// (`idf_filter`) route through, keeping the two consistent.
 fn token_hit(doc_lower: &str, matcher: &Regex) -> bool {
     matcher.is_match(doc_lower)
 }
@@ -337,9 +340,23 @@ pub fn shrinkage_rerank(candidates: &mut [ScoredDrawer], signals: &RerankSignals
 
 /// A query token that survived the IDF filter, paired with its compiled
 /// boundary matcher. The matcher is `None` in legacy substring mode.
+///
+/// Construct via [`EffectiveToken::new`] only — it is the single seam that
+/// upholds the type's invariants: `lower` is lowercased, and `matcher` (when
+/// present) is compiled from that same lowercased token.
 struct EffectiveToken {
     lower: String,
     matcher: Option<Regex>,
+}
+
+impl EffectiveToken {
+    /// Lowercase `raw` once, reusing it for the `lower` field and (in boundary
+    /// mode) the compiled matcher so the two cannot drift apart.
+    fn new(raw: &str, use_boundary: bool) -> Self {
+        let lower = raw.to_lowercase();
+        let matcher = use_boundary.then(|| compile_token_matcher(&lower));
+        Self { lower, matcher }
+    }
 }
 
 /// Fraction of `tokens` that hit `doc_lower`. Shares the single hit-test seam
@@ -373,10 +390,7 @@ fn idf_filter(
     tokens
         .iter()
         .filter_map(|t| {
-            let token = EffectiveToken {
-                lower: t.to_lowercase(),
-                matcher: use_boundary.then(|| compile_token_matcher(&t.to_lowercase())),
-            };
+            let token = EffectiveToken::new(t, use_boundary);
             let df = lower_docs
                 .iter()
                 .filter(|doc| token_in_doc(&token, doc))
@@ -505,6 +519,52 @@ mod tests {
         let m = compile_token_matcher("setup");
         assert!(token_hit("a clean setup of tools", &m));
         assert!(!token_hit("a clean setup_thing", &m));
+    }
+
+    #[test]
+    fn token_in_doc_boundary_mode_uses_matcher() {
+        // Boundary token: respects word boundaries — "current" must not hit
+        // "currently".
+        let t = EffectiveToken::new("current", true);
+        assert!(t.matcher.is_some());
+        assert!(token_in_doc(&t, "the current state of things"));
+        assert!(!token_in_doc(&t, "we are currently shipping"));
+    }
+
+    #[test]
+    fn token_in_doc_legacy_mode_uses_substring() {
+        // Legacy token (matcher None): plain substring — "current" DOES hit
+        // "currently", the known substring false-positive that the boundary
+        // path exists to avoid. This pins the hermetic legacy path.
+        let t = EffectiveToken::new("current", false);
+        assert!(t.matcher.is_none());
+        assert!(token_in_doc(&t, "the current state"));
+        assert!(token_in_doc(&t, "we are currently shipping"));
+    }
+
+    #[test]
+    fn effective_token_new_lowercases() {
+        // The constructor lowercases regardless of mode so the legacy
+        // substring test against pre-lowercased docs stays correct.
+        assert_eq!(EffectiveToken::new("Rachel", false).lower, "rachel");
+        assert_eq!(EffectiveToken::new("Rachel", true).lower, "rachel");
+    }
+
+    #[test]
+    fn overlap_fraction_counts_hits_over_total() {
+        let tokens = [
+            EffectiveToken::new("school", true),
+            EffectiveToken::new("boston", true),
+            EffectiveToken::new("paris", true),
+        ];
+        // 2 of 3 tokens present.
+        let frac = overlap_fraction(&tokens, "she studied at school in boston");
+        assert!((frac - 2.0 / 3.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn overlap_fraction_empty_token_list_is_zero() {
+        assert_eq!(overlap_fraction(&[], "any document at all"), 0.0);
     }
 
     #[test]
