@@ -25,6 +25,12 @@ use crate::error::MemoryError;
 /// A `None` phase sorts last (after `other`).
 const PHASE_ORDER: &[&str] = &["planning", "impl", "review", "rework", "other"];
 
+/// METRICS_SPEC §11.5 Phase-6 recording gate: `baseline_ready` becomes true at
+/// this many distinct merged task_keys with ≥1 measured token row. Single source
+/// of truth for the threshold — referenced by [`run_report`], [`one_line_summary`],
+/// and the text renderer so the three can never drift apart.
+pub(crate) const BASELINE_READY_THRESHOLD: usize = 10;
+
 /// Sort key for a `collab_phase` bucket: its index in [`PHASE_ORDER`], or one
 /// past the end for any unrecognized bucket, with `None` sorting last of all.
 fn phase_rank(phase: Option<&str>) -> usize {
@@ -236,6 +242,23 @@ fn outcome_for_key<'a>(task_key: &str, outcomes: &'a [TaskOutcome]) -> Option<&'
     })
 }
 
+/// METRICS_SPEC §11.5 baseline count: distinct **measured** task_keys (from the
+/// §10.1 roll-up) whose matched outcome is `merged`. Estimated-only and
+/// outcome-only tasks are excluded — the gate requires real measured tokens
+/// (§6.3). Shared by [`run_report`] and [`one_line_summary`] so the gate has a
+/// single definition.
+fn count_baseline_tasks(groups: &[TaskPhaseModelTokens], outcomes: &[TaskOutcome]) -> usize {
+    groups
+        .iter()
+        .map(|g| g.task_key.as_str())
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .filter(|key| {
+            outcome_for_key(key, outcomes).and_then(|o| o.outcome.as_deref()) == Some("merged")
+        })
+        .count()
+}
+
 /// Assemble the METRICS_SPEC §10 report with §7-derived cost. No wallclock is
 /// read on this path; every emitted cost is rounded to 6 dp at construction.
 ///
@@ -258,11 +281,8 @@ pub fn run_report(db: &Database, opts: &ReportOptions) -> Result<Report, MemoryE
     // §10.2, or §10.3). This keeps estimated-only and outcome-only tasks visible
     // with zero measured tokens instead of silently dropping them from `tasks`.
     let mut task_keys: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
-    let mut measured_task_keys: std::collections::BTreeSet<String> =
-        std::collections::BTreeSet::new();
     for g in &groups {
         task_keys.insert(g.task_key.clone());
-        measured_task_keys.insert(g.task_key.clone());
     }
     for s in &splits {
         task_keys.insert(s.task_key.clone());
@@ -276,13 +296,7 @@ pub fn run_report(db: &Database, opts: &ReportOptions) -> Result<Report, MemoryE
         .map(|key| build_task(key, &groups, &splits, &outcomes))
         .collect();
 
-    // Merged task_keys with ≥1 measured token row → baseline count.
-    let baseline_task_count = measured_task_keys
-        .iter()
-        .filter(|key| {
-            outcome_for_key(key, &outcomes).and_then(|o| o.outcome.as_deref()) == Some("merged")
-        })
-        .count();
+    let baseline_task_count = count_baseline_tasks(&groups, &outcomes);
 
     let unpriced_models = collect_unpriced(&groups);
 
@@ -295,7 +309,7 @@ pub fn run_report(db: &Database, opts: &ReportOptions) -> Result<Report, MemoryE
             since,
         },
         baseline_task_count,
-        baseline_ready: baseline_task_count >= 10,
+        baseline_ready: baseline_task_count >= BASELINE_READY_THRESHOLD,
         headline,
         non_completions,
         tasks,
@@ -436,7 +450,7 @@ fn build_headline_rows(rows: &[HeadlineTokens], tasks: &[TaskReport]) -> Vec<Hea
 /// One-line, best-effort metrics summary for the `status` MCP tool.
 ///
 /// This is deliberately infallible: it queries the §10 aggregates and, on ANY
-/// error, returns a sensible default string after a `tracing::warn!` (it never
+/// error, returns `"metrics unavailable"` after a `tracing::warn!` (it never
 /// panics or propagates, so a metrics fault cannot break the `status` tool).
 /// An empty database yields exactly `"no metrics recorded yet"`; otherwise a
 /// single line (no embedded newline) of task count, measured tokens, §7 cost,
@@ -484,19 +498,11 @@ fn one_line_summary_inner(db: &Database) -> Result<String, MemoryError> {
                 + g.cache_read_input_tokens
         })
         .sum();
-    let cost: f64 = groups.iter().filter_map(group_cost).sum();
-    let c = groups
-        .iter()
-        .map(|g| g.task_key.as_str())
-        .collect::<std::collections::BTreeSet<_>>()
-        .into_iter()
-        .filter(|key| {
-            outcome_for_key(key, &outcomes).and_then(|o| o.outcome.as_deref()) == Some("merged")
-        })
-        .count();
+    let cost: f64 = round6(groups.iter().filter_map(group_cost).sum());
+    let baseline = count_baseline_tasks(&groups, &outcomes);
 
     Ok(format!(
-        "{n} tasks · {measured} measured tokens · ${cost:.2} (§7) · baseline {c}/10"
+        "{n} tasks · {measured} measured tokens · ${cost:.2} (§7) · baseline {baseline}/{BASELINE_READY_THRESHOLD}"
     ))
 }
 
@@ -554,5 +560,43 @@ mod tests {
         let line = one_line_summary(&db);
         assert!(line.contains("task"), "task count surfaced: {line}");
         assert!(!line.contains('\n'), "must be one line: {line}");
+    }
+
+    #[test]
+    fn null_phase_rows_bucket_last_with_none_phase() {
+        // A measured row with `collab_phase = NULL` must still render, and the
+        // canonical phase order (PHASE_ORDER then None) sorts it after every
+        // named bucket — exercising `phase_rank`'s `None` branch that the
+        // golden integration seed does not cover.
+        let db = Database::open_in_memory().unwrap();
+        let row = |phase: Option<&str>| NewTokenUsage {
+            ts: "2026-06-01T01:00:00Z".into(),
+            source: "llm_rerank".into(),
+            harness: "claude".into(),
+            model: Some("claude-opus-4-8".into()),
+            session_id: None,
+            collab_session_id: Some("sess-np".into()),
+            collab_phase: phase.map(Into::into),
+            task_tag: None,
+            input_tokens: 1_000_000,
+            output_tokens: 0,
+            cache_creation_input_tokens: 0,
+            cache_read_input_tokens: 0,
+            estimated: false,
+            chars: 0,
+            cost_usd: None,
+        };
+        db.insert_token_usage(&row(Some("impl"))).unwrap();
+        db.insert_token_usage(&row(None)).unwrap();
+
+        let report = run_report(&db, &ReportOptions::default()).unwrap();
+        let task = report
+            .tasks
+            .iter()
+            .find(|t| t.task_key == "sess-np")
+            .expect("task present");
+        assert_eq!(task.by_phase.len(), 2);
+        assert_eq!(task.by_phase[0].phase.as_deref(), Some("impl"));
+        assert_eq!(task.by_phase[1].phase, None);
     }
 }

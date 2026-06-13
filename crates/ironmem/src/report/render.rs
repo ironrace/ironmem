@@ -105,8 +105,9 @@ pub fn render_text(report: &Report) -> String {
     };
     let _ = writeln!(
         out,
-        "\nBaseline gate: {count}/10 merged tasks measured — {gate}",
+        "\nBaseline gate: {count}/{threshold} merged tasks measured — {gate}",
         count = report.baseline_task_count,
+        threshold = crate::report::BASELINE_READY_THRESHOLD,
     );
 
     let unpriced = if report.unpriced_models.is_empty() {

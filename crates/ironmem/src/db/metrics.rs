@@ -2,8 +2,13 @@
 //! introduced in migration 008 (`token_usage`, `occupancy_samples`,
 //! `session_summary`, `task_outcomes`).
 //!
-//! This module is storage-only by design: it holds no business logic or
-//! call-site wiring — callers construct and pass the typed input structs.
+//! The insert/upsert/`query_*` CRUD half is storage-only by design: it holds no
+//! business logic or call-site wiring — callers construct and pass the typed
+//! input structs. The `report_*` aggregate methods are a distinct
+//! reporting/query surface: they encode the METRICS_SPEC §10 canonical queries
+//! and the §2.3 task-identity policy (e.g. the `task_tag`→`collab_session_id`
+//! alias for collab token rows) in SQL. That query policy intentionally lives
+//! here, not in the report renderer — the renderer owns only shaping + §7 cost.
 //! Enum column values are stringly-typed here; the DB CHECK constraints
 //! (see `migrations/008_metrics.sql`) enforce domain correctness so a
 //! malformed direct write cannot land an out-of-domain value.
@@ -635,7 +640,10 @@ impl Database {
     /// see the drift-guard test. NOT the literal §10.1 GROUP BY.
     /// `task` filters `COALESCE(collab_session_id, task_tag)` and also accepts
     /// a `task_outcomes.task_tag` alias for collab-token rows keyed only by
-    /// `collab_session_id`; `since` filters `julianday(ts) >= julianday(?)`.
+    /// `collab_session_id`; `since` filters `julianday(ts) >= julianday(?)` — a
+    /// deliberate INSTANT comparison (not a lexical `ts >= ?` text compare) so a
+    /// stored `+00:00`-offset `ts` and a normalized-`Z` `since` are equal at the
+    /// same instant (METRICS_SPEC §12). Do not "optimize" back to text compare.
     pub fn report_tokens_by_task_phase(
         &self,
         task: Option<&str>,

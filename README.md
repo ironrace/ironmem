@@ -230,6 +230,18 @@ ironmem records lightweight per-call metrics (MCP response sizing + transcript o
 | `IRONMEM_SESSION_ID` | (unset) | Override seam that pins the harness session id for `session_summary` co-keying when the MCP `initialize` request does not carry one. Primarily for testing. |
 | `IRONMEM_HARNESS` | (unset) | Override seam pinning metrics harness attribution to `claude` or `codex` (otherwise learned from `initialize.clientInfo`). Primarily for testing. |
 
+#### Reporting
+
+`ironmem report` renders the recorded metrics (see `docs/METRICS_SPEC.md` §10 + the §7 cost table):
+
+```bash
+ironmem report                                  # human-readable text
+ironmem report --json                           # stable JSON for tooling
+ironmem report --task <tag> --since 2026-06-01  # scope to one task / start date (RFC3339 or YYYY-MM-DD)
+```
+
+It surfaces tokens-to-done by task and phase, the measured-vs-estimated split, iteration counts/outcome, and a merged-only headline. Cost is **§7-derived** (the stored provider figure is reported separately as `provider_reported_cost_usd`); `baseline_ready` / `baseline_task_count` track the Phase-6 ≥10-merged-task recording gate (§11.5).
+
 ## Versioning
 
 This project uses [Semantic Versioning](https://semver.org/). The canonical version is in `crates/ironmem/Cargo.toml`. Plugin JSON files (`.codex-plugin/plugin.json`, `.claude-plugin/plugin.json`) must match this version — enforced by CI. See [CHANGELOG.md](CHANGELOG.md) for release history.
