@@ -9,6 +9,9 @@
 //! emitted cost to 6 dp so the `--json` output is byte-stable for the golden
 //! test.
 mod cost;
+mod render;
+
+pub use render::render_text;
 
 use serde::Serialize;
 
@@ -366,4 +369,115 @@ fn build_headline_rows(rows: &[HeadlineTokens], tasks: &[TaskReport]) -> Vec<Hea
         .collect();
     out.sort_by(|a, b| a.task_key.cmp(&b.task_key));
     out
+}
+
+/// One-line, best-effort metrics summary for the `status` MCP tool.
+///
+/// This is deliberately infallible: it queries the §10 aggregates and, on ANY
+/// error, returns a sensible default string after a `tracing::warn!` (it never
+/// panics or propagates, so a metrics fault cannot break the `status` tool).
+/// An empty database yields exactly `"no metrics recorded yet"`; otherwise a
+/// single line (no embedded newline) of task count, measured tokens, §7 cost,
+/// and the baseline gate. No wallclock is read, so the output is deterministic.
+pub fn one_line_summary(db: &Database) -> String {
+    match one_line_summary_inner(db) {
+        Ok(line) => line,
+        Err(e) => {
+            tracing::warn!("one_line_summary: metrics query failed: {e}");
+            "metrics unavailable".to_string()
+        }
+    }
+}
+
+/// Fallible core of [`one_line_summary`]; the public wrapper degrades any `Err`
+/// to a default string. Uses [`run_report`] (which wraps the §10 token/outcome
+/// queries) for the §7 cost + baseline count, and the §10.3 outcomes for the
+/// task count (tasks with outcomes OR measured token data).
+fn one_line_summary_inner(db: &Database) -> Result<String, MemoryError> {
+    let outcomes = db.report_task_outcomes(None, None)?;
+    let report = run_report(db, &ReportOptions::default())?;
+
+    // Distinct task identities across outcomes and the measured roll-up: a task
+    // counts if it has an outcome OR ≥1 measured token row.
+    let mut keys: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    for o in &outcomes {
+        let key = o
+            .collab_session_id
+            .clone()
+            .unwrap_or_else(|| o.task_tag.clone());
+        keys.insert(key);
+    }
+    for t in &report.tasks {
+        keys.insert(t.task_key.clone());
+    }
+
+    if keys.is_empty() {
+        return Ok("no metrics recorded yet".to_string());
+    }
+
+    let n = keys.len();
+    let measured: i64 = report.tasks.iter().map(|t| t.split.measured_tokens).sum();
+    let cost: f64 = report.tasks.iter().filter_map(|t| t.cost_usd).sum();
+    let c = report.baseline_task_count;
+
+    Ok(format!(
+        "{n} tasks · {measured} measured tokens · ${cost:.2} (§7) · baseline {c}/10"
+    ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::db::NewTokenUsage;
+
+    /// Minimal local seed: one merged task (`sess-rich`) with two measured
+    /// rows, enough to exercise the non-empty `one_line_summary` branch.
+    fn seeded_db() -> Database {
+        let db = Database::open_in_memory().unwrap();
+        db.upsert_task_outcome(&TaskOutcome {
+            task_tag: "issue-rich".into(),
+            collab_session_id: Some("sess-rich".into()),
+            started_at: Some("2026-06-01T00:00:00Z".into()),
+            done_at: None,
+            outcome: Some("merged".into()),
+            review_rounds: 0,
+            fix_commits: 0,
+            handoffs: 0,
+            pr_url: None,
+        })
+        .unwrap();
+        let row = |phase: &str, model: &str, inp: i64, cost: Option<f64>| NewTokenUsage {
+            ts: "2026-06-01T01:00:00Z".into(),
+            source: "llm_rerank".into(),
+            harness: "claude".into(),
+            model: Some(model.into()),
+            session_id: None,
+            collab_session_id: Some("sess-rich".into()),
+            collab_phase: Some(phase.into()),
+            task_tag: None,
+            input_tokens: inp,
+            output_tokens: 0,
+            cache_creation_input_tokens: 0,
+            cache_read_input_tokens: 0,
+            estimated: false,
+            chars: 0,
+            cost_usd: cost,
+        };
+        db.insert_token_usage(&row("planning", "claude-opus-4-8", 1_000_000, None))
+            .unwrap();
+        db.insert_token_usage(&row("impl", "claude-haiku-4-5", 1_000_000, Some(1.0)))
+            .unwrap();
+        db
+    }
+
+    #[test]
+    fn one_line_summary_reports_counts_or_empty() {
+        let empty = Database::open_in_memory().unwrap();
+        assert_eq!(one_line_summary(&empty), "no metrics recorded yet");
+
+        let db = seeded_db();
+        let line = one_line_summary(&db);
+        assert!(line.contains("task"), "task count surfaced: {line}");
+        assert!(!line.contains('\n'), "must be one line: {line}");
+    }
 }
