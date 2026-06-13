@@ -2,7 +2,7 @@ use clap::{Parser, Subcommand};
 use std::process;
 
 use ironmem::MemoryError;
-use ironmem::{bootstrap, config, ingest, mcp, migrate, reembed};
+use ironmem::{bootstrap, config, ingest, mcp, migrate, reembed, report};
 
 #[derive(Parser)]
 #[command(
@@ -51,6 +51,21 @@ enum Commands {
         /// Harness: claude-code, codex
         #[arg(long, default_value = "claude-code")]
         harness: String,
+    },
+    /// Render the metrics report (METRICS_SPEC §10 + §7 cost)
+    Report {
+        /// Path to the database
+        #[arg(long)]
+        db: Option<String>,
+        /// Only this task (collab_session_id or task_tag)
+        #[arg(long)]
+        task: Option<String>,
+        /// Only rows at/after this RFC3339 instant or YYYY-MM-DD date (inclusive)
+        #[arg(long)]
+        since: Option<String>,
+        /// Emit JSON instead of text
+        #[arg(long)]
+        json: bool,
     },
 }
 
@@ -141,6 +156,24 @@ async fn run(cli: Cli) -> Result<(), MemoryError> {
             let cfg = config::Config::load(None)?;
             let response = ironmem::hook::run_hook(&name, &harness, cfg)?;
             println!("{}", serde_json::to_string_pretty(&response)?);
+            Ok(())
+        }
+        Commands::Report {
+            db,
+            task,
+            since,
+            json,
+        } => {
+            let cfg = config::Config::load(db)?;
+            let database = ironmem::db::schema::Database::open(&cfg.db_path)?;
+            database.migrate()?;
+            let opts = report::ReportOptions { task, since };
+            let report = report::run_report(&database, &opts)?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            } else {
+                println!("{}", report::render_text(&report));
+            }
             Ok(())
         }
     }

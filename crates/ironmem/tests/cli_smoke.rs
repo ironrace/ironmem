@@ -3,6 +3,8 @@ use std::path::Path;
 use std::process::{Command, Stdio};
 
 use ironmem::config::{Config, EmbedMode, McpAccessMode};
+use ironmem::db::schema::Database;
+use ironmem::db::{NewTokenUsage, TaskOutcome};
 use ironmem::mcp::app::App;
 use ironmem::mcp::protocol::JsonRpcRequest;
 use ironmem::mcp::server::dispatch;
@@ -181,4 +183,86 @@ fn cli_init_mine_serve_and_hook_smoke_test() {
     assert_eq!(reviews.len(), 1);
     assert!(reviews[0].content.contains("Findings"));
     assert!(reviews[0].source_file.ends_with("transcript.jsonl"));
+}
+
+#[test]
+fn cli_report_json_smoke_test() {
+    let temp = tempfile::tempdir().unwrap();
+    let home = temp.path().join("home");
+    let db_path = temp.path().join("report.sqlite3");
+    std::fs::create_dir_all(&home).unwrap();
+
+    // Seed directly via the storage API: one merged task + one measured row.
+    {
+        let db = Database::open(&db_path).unwrap();
+        db.migrate().unwrap();
+        db.upsert_task_outcome(&TaskOutcome {
+            task_tag: "issue-rep".into(),
+            collab_session_id: Some("sess-rep".into()),
+            started_at: Some("2026-06-01T00:00:00Z".into()),
+            done_at: Some("2026-06-02T00:00:00Z".into()),
+            outcome: Some("merged".into()),
+            review_rounds: 1,
+            fix_commits: 0,
+            handoffs: 0,
+            pr_url: Some("https://github.com/ironrace/ironmem/pull/100".into()),
+        })
+        .unwrap();
+        db.insert_token_usage(&NewTokenUsage {
+            ts: "2026-06-01T01:00:00Z".into(),
+            source: "llm_rerank".into(),
+            harness: "claude".into(),
+            model: Some("claude-opus-4-8".into()),
+            session_id: None,
+            collab_session_id: Some("sess-rep".into()),
+            collab_phase: Some("impl".into()),
+            task_tag: None,
+            input_tokens: 1_000_000,
+            output_tokens: 0,
+            cache_creation_input_tokens: 0,
+            cache_read_input_tokens: 0,
+            estimated: false,
+            chars: 0,
+            cost_usd: None,
+        })
+        .unwrap();
+    }
+
+    let report = base_command(&home, &db_path)
+        .arg("report")
+        .arg("--task")
+        .arg("issue-rep")
+        .arg("--since")
+        .arg("2026-06-01T01:00:00+00:00")
+        .arg("--json")
+        .output()
+        .unwrap();
+    assert!(report.status.success(), "report failed: {:?}", report);
+
+    let stdout = String::from_utf8(report.stdout).unwrap();
+    let value: serde_json::Value = serde_json::from_str(&stdout)
+        .unwrap_or_else(|e| panic!("report --json must emit valid JSON ({e}): {stdout}"));
+    assert!(
+        value.get("baseline_ready").is_some(),
+        "report JSON missing baseline_ready: {stdout}"
+    );
+    assert_eq!(
+        value["generated_for"]["task"].as_str(),
+        Some("issue-rep"),
+        "report JSON missing task filter echo: {stdout}"
+    );
+    assert_eq!(
+        value["generated_for"]["since"].as_str(),
+        Some("2026-06-01T01:00:00Z"),
+        "report JSON missing normalized since filter echo: {stdout}"
+    );
+    assert_eq!(
+        value["tasks"][0]["task_key"].as_str(),
+        Some("sess-rep"),
+        "task_tag filter must resolve collab token rows: {stdout}"
+    );
+    assert!(
+        value.get("headline").is_some(),
+        "report JSON missing headline: {stdout}"
+    );
 }

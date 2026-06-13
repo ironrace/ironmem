@@ -35,7 +35,7 @@ pub fn tool_definitions(app: &App) -> Vec<Value> {
     let tools = vec![
         json!({
             "name": "status",
-            "description": "Memory overview — total drawers, wing and room counts. Optional set_task_tag/clear_task_tag manage the explicit metrics task tag for non-collab work (METRICS_SPEC §2.3).",
+            "description": "Memory overview — total drawers, wing and room counts, knowledge graph summary, and one-line metrics summary. Optional set_task_tag/clear_task_tag manage the explicit metrics task tag for non-collab work (METRICS_SPEC §2.3).",
             "inputSchema": { "type": "object", "properties": {
                 "set_task_tag": { "type": "string", "description": "Set the explicit metrics task tag for subsequent token_usage rows. Process-local and ephemeral (cleared on server restart); shadowed while an active collab session is attributing (METRICS_SPEC §2.3 gives the collab session id priority)." },
                 "clear_task_tag": { "type": "boolean", "description": "Clear the explicit metrics task tag" }

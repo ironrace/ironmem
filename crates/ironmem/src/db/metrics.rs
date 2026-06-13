@@ -2,8 +2,13 @@
 //! introduced in migration 008 (`token_usage`, `occupancy_samples`,
 //! `session_summary`, `task_outcomes`).
 //!
-//! This module is storage-only by design: it holds no business logic or
-//! call-site wiring — callers construct and pass the typed input structs.
+//! The insert/upsert/`query_*` CRUD half is storage-only by design: it holds no
+//! business logic or call-site wiring — callers construct and pass the typed
+//! input structs. The `report_*` aggregate methods are a distinct
+//! reporting/query surface: they encode the METRICS_SPEC §10 canonical queries
+//! and the §2.3 task-identity policy (e.g. the `task_tag`→`collab_session_id`
+//! alias for collab token rows) in SQL. That query policy intentionally lives
+//! here, not in the report renderer — the renderer owns only shaping + §7 cost.
 //! Enum column values are stringly-typed here; the DB CHECK constraints
 //! (see `migrations/008_metrics.sql`) enforce domain correctness so a
 //! malformed direct write cannot land an out-of-domain value.
@@ -257,6 +262,58 @@ fn map_task_outcome(row: &rusqlite::Row<'_>) -> rusqlite::Result<TaskOutcome> {
         fix_commits: row.get(6)?,
         handoffs: row.get(7)?,
         pr_url: row.get(8)?,
+    })
+}
+
+// ---------------------------------------------------------------------------
+// §10 report aggregate result structs + row mapper
+// ---------------------------------------------------------------------------
+
+/// One measured `token_usage` aggregate at (task_key, collab_phase, model,
+/// harness) grain — the §10.1-compatible source the report rolls up to the
+/// (task_key, collab_phase) grain (model/harness retained so §7 rates apply).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TaskPhaseModelTokens {
+    pub task_key: String,
+    pub collab_phase: Option<String>,
+    pub model: Option<String>,
+    pub harness: String,
+    pub input_tokens: i64,
+    pub output_tokens: i64,
+    pub cache_creation_input_tokens: i64,
+    pub cache_read_input_tokens: i64,
+    /// `SUM(cost_usd)` — `None` when every contributing row's `cost_usd` is NULL.
+    pub provider_cost_usd: Option<f64>,
+}
+
+/// METRICS_SPEC §10.2 split row.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TaskEstimatedSplit {
+    pub task_key: String,
+    pub estimated: bool,
+    pub tokens: i64,
+}
+
+/// METRICS_SPEC §10.4 headline row (also used for the non-completion variant).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct HeadlineTokens {
+    pub task_tag: String,
+    pub collab_session_id: Option<String>,
+    pub tokens_to_done: i64,
+    pub provider_cost_usd: Option<f64>,
+}
+
+fn map_task_phase_model_tokens(row: &rusqlite::Row<'_>) -> rusqlite::Result<TaskPhaseModelTokens> {
+    Ok(TaskPhaseModelTokens {
+        task_key: row.get(0)?,
+        collab_phase: row.get(1)?,
+        model: row.get(2)?,
+        harness: row.get(3)?,
+        input_tokens: row.get::<_, Option<i64>>(4)?.unwrap_or(0),
+        output_tokens: row.get::<_, Option<i64>>(5)?.unwrap_or(0),
+        cache_creation_input_tokens: row.get::<_, Option<i64>>(6)?.unwrap_or(0),
+        cache_read_input_tokens: row.get::<_, Option<i64>>(7)?.unwrap_or(0),
+        provider_cost_usd: row.get(8)?,
     })
 }
 
@@ -572,6 +629,157 @@ impl Database {
              ORDER BY started_at, id",
         )?;
         let rows = stmt.query_map(params![collab_session_id], map_task_outcome)?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(MemoryError::from)
+    }
+
+    /// METRICS_SPEC §10.1 (tokens-to-done per task, by phase; measured only) as a
+    /// §10.1-COMPATIBLE roll-up: this GROUPs additionally by `model` and `harness`
+    /// so the report can apply §7 per-model rates. Rolling the rows up to the
+    /// (task_key, collab_phase) grain reproduces §10.1 exactly (SUM is associative);
+    /// see the drift-guard test. NOT the literal §10.1 GROUP BY.
+    /// `task` filters `COALESCE(collab_session_id, task_tag)` and also accepts
+    /// a `task_outcomes.task_tag` alias for collab-token rows keyed only by
+    /// `collab_session_id`; `since` filters `julianday(ts) >= julianday(?)` — a
+    /// deliberate INSTANT comparison (not a lexical `ts >= ?` text compare) so a
+    /// stored `+00:00`-offset `ts` and a normalized-`Z` `since` are equal at the
+    /// same instant (METRICS_SPEC §12). Do not "optimize" back to text compare.
+    pub fn report_tokens_by_task_phase(
+        &self,
+        task: Option<&str>,
+        since: Option<&str>,
+    ) -> Result<Vec<TaskPhaseModelTokens>, MemoryError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT COALESCE(collab_session_id, task_tag) AS task_key,
+                    collab_phase, model, harness,
+                    SUM(input_tokens), SUM(output_tokens),
+                    SUM(cache_creation_input_tokens), SUM(cache_read_input_tokens),
+                    SUM(cost_usd)
+             FROM token_usage
+             WHERE estimated = 0
+               AND COALESCE(collab_session_id, task_tag) IS NOT NULL
+               AND (?1 IS NULL
+                    OR COALESCE(collab_session_id, task_tag) = ?1
+                    OR COALESCE(collab_session_id, task_tag) IN (
+                        SELECT collab_session_id FROM task_outcomes
+                        WHERE task_tag = ?1 AND collab_session_id IS NOT NULL
+                    ))
+               AND (?2 IS NULL OR julianday(ts) >= julianday(?2))
+             GROUP BY task_key, collab_phase, model, harness
+             ORDER BY task_key, collab_phase, model, harness",
+        )?;
+        let rows = stmt.query_map(params![task, since], map_task_phase_model_tokens)?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(MemoryError::from)
+    }
+
+    /// METRICS_SPEC §10.2 measured-vs-estimated split per task (verbatim shape).
+    pub fn report_measured_estimated_split(
+        &self,
+        task: Option<&str>,
+        since: Option<&str>,
+    ) -> Result<Vec<TaskEstimatedSplit>, MemoryError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT COALESCE(collab_session_id, task_tag) AS task_key,
+                    estimated,
+                    SUM(input_tokens + output_tokens + cache_creation_input_tokens + cache_read_input_tokens) AS tokens
+             FROM token_usage
+             WHERE COALESCE(collab_session_id, task_tag) IS NOT NULL
+               AND (?1 IS NULL
+                    OR COALESCE(collab_session_id, task_tag) = ?1
+                    OR COALESCE(collab_session_id, task_tag) IN (
+                        SELECT collab_session_id FROM task_outcomes
+                        WHERE task_tag = ?1 AND collab_session_id IS NOT NULL
+                    ))
+               AND (?2 IS NULL OR julianday(ts) >= julianday(?2))
+             GROUP BY task_key, estimated
+             ORDER BY task_key, estimated",
+        )?;
+        let rows = stmt.query_map(params![task, since], |r| {
+            Ok(TaskEstimatedSplit {
+                task_key: r.get(0)?,
+                estimated: r.get::<_, i64>(1)? != 0,
+                tokens: r.get::<_, Option<i64>>(2)?.unwrap_or(0),
+            })
+        })?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(MemoryError::from)
+    }
+
+    /// METRICS_SPEC §10.3 iteration counts & outcome per task (verbatim; ORDER BY
+    /// started_at). `task` matches `task_tag` OR `collab_session_id`; `since`
+    /// filters `julianday(started_at) >= julianday(?)`. Reuses `map_task_outcome`.
+    pub fn report_task_outcomes(
+        &self,
+        task: Option<&str>,
+        since: Option<&str>,
+    ) -> Result<Vec<TaskOutcome>, MemoryError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT task_tag, collab_session_id, started_at, done_at, outcome,
+                    review_rounds, fix_commits, handoffs, pr_url
+             FROM task_outcomes
+             WHERE (?1 IS NULL OR task_tag = ?1 OR collab_session_id = ?1)
+               AND (?2 IS NULL OR julianday(started_at) >= julianday(?2))
+             ORDER BY started_at, id",
+        )?;
+        let rows = stmt.query_map(params![task, since], map_task_outcome)?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(MemoryError::from)
+    }
+
+    /// METRICS_SPEC §10.4 headline tokens-to-done (merged only; verbatim JOIN).
+    /// `since` filters the TOKEN side (`julianday(u.ts) >= julianday(?)`);
+    /// `task` matches the outcome's `task_tag` OR `collab_session_id`. The
+    /// OR-join is safe under the §10 uniqueness invariant (task_tag and
+    /// collab_session_id each unique per task).
+    pub fn report_headline(
+        &self,
+        task: Option<&str>,
+        since: Option<&str>,
+    ) -> Result<Vec<HeadlineTokens>, MemoryError> {
+        self.headline_inner("t.outcome = 'merged'", task, since)
+    }
+
+    /// METRICS_SPEC §10.4 non-completion variant (`failed`/`abandoned`), §2.2/§9.4.
+    pub fn report_non_completions(
+        &self,
+        task: Option<&str>,
+        since: Option<&str>,
+    ) -> Result<Vec<HeadlineTokens>, MemoryError> {
+        self.headline_inner("t.outcome IN ('failed','abandoned')", task, since)
+    }
+
+    fn headline_inner(
+        &self,
+        outcome_pred: &str,
+        task: Option<&str>,
+        since: Option<&str>,
+    ) -> Result<Vec<HeadlineTokens>, MemoryError> {
+        let sql = format!(
+            "SELECT t.task_tag, t.collab_session_id,
+                    SUM(u.input_tokens + u.output_tokens
+                        + u.cache_creation_input_tokens + u.cache_read_input_tokens) AS tokens_to_done,
+                    SUM(u.cost_usd) AS cost_usd
+             FROM task_outcomes t
+             JOIN token_usage u
+               ON u.task_tag = t.task_tag OR u.collab_session_id = t.collab_session_id
+             WHERE {outcome_pred}
+               AND u.estimated = 0
+               AND (?1 IS NULL OR t.task_tag = ?1 OR t.collab_session_id = ?1)
+               AND (?2 IS NULL OR julianday(u.ts) >= julianday(?2))
+             GROUP BY t.task_tag
+             ORDER BY t.task_tag",
+        );
+        // `outcome_pred` is a fixed internal literal (never user input) — no injection surface.
+        let mut stmt = self.conn.prepare(&sql)?;
+        let rows = stmt.query_map(params![task, since], |r| {
+            Ok(HeadlineTokens {
+                task_tag: r.get(0)?,
+                collab_session_id: r.get(1)?,
+                tokens_to_done: r.get::<_, Option<i64>>(2)?.unwrap_or(0),
+                provider_cost_usd: r.get(3)?,
+            })
+        })?;
         rows.collect::<rusqlite::Result<Vec<_>>>()
             .map_err(MemoryError::from)
     }
@@ -1194,5 +1402,291 @@ mod tests {
         assert!(db
             .mark_task_outcome_done("issue-83", None, Some("bogus"), None)
             .is_err());
+    }
+
+    // ---- §10 report aggregates ----
+
+    #[allow(clippy::too_many_arguments)]
+    fn tok(
+        task_key_collab: Option<&str>,
+        phase: &str,
+        model: &str,
+        harness: &str,
+        inp: i64,
+        out: i64,
+        cc: i64,
+        cr: i64,
+        estimated: bool,
+        cost: Option<f64>,
+        ts: &str,
+    ) -> NewTokenUsage {
+        NewTokenUsage {
+            ts: ts.into(),
+            source: "llm_rerank".into(),
+            harness: harness.into(),
+            model: Some(model.into()),
+            session_id: None,
+            collab_session_id: task_key_collab.map(|s| s.into()),
+            collab_phase: Some(phase.into()),
+            task_tag: None,
+            input_tokens: inp,
+            output_tokens: out,
+            cache_creation_input_tokens: cc,
+            cache_read_input_tokens: cr,
+            estimated,
+            chars: 0,
+            cost_usd: cost,
+        }
+    }
+
+    #[test]
+    fn report_tokens_by_task_phase_rolls_up_to_spec_10_1() {
+        let db = db();
+        // Two measured rows, same (task,phase) different model+harness → two groups.
+        db.insert_token_usage(&tok(
+            Some("S"),
+            "impl",
+            "claude-opus-4-8",
+            "claude",
+            100,
+            10,
+            0,
+            0,
+            false,
+            Some(0.5),
+            "2026-06-01T00:00:00Z",
+        ))
+        .unwrap();
+        db.insert_token_usage(&tok(
+            Some("S"),
+            "impl",
+            "claude-sonnet-4-6",
+            "codex",
+            200,
+            0,
+            0,
+            0,
+            false,
+            None,
+            "2026-06-01T00:00:01Z",
+        ))
+        .unwrap();
+        // One ESTIMATED row must be excluded (§10.1 WHERE estimated=0).
+        db.insert_token_usage(&tok(
+            Some("S"),
+            "impl",
+            "claude-opus-4-8",
+            "claude",
+            999,
+            0,
+            0,
+            0,
+            true,
+            None,
+            "2026-06-01T00:00:02Z",
+        ))
+        .unwrap();
+
+        let rows = db.report_tokens_by_task_phase(None, None).unwrap();
+        assert_eq!(
+            rows.len(),
+            2,
+            "two model/harness groups, estimated excluded"
+        );
+
+        // DRIFT GUARD: literal §10.1 (grouped by task_key, collab_phase) must equal the Rust roll-up.
+        let literal: Vec<(String, Option<String>, i64)> = db
+            .conn
+            .prepare(
+                "SELECT COALESCE(collab_session_id, task_tag) AS task_key, collab_phase,
+                        SUM(input_tokens + output_tokens + cache_creation_input_tokens + cache_read_input_tokens) AS tokens
+                 FROM token_usage WHERE estimated = 0 AND COALESCE(collab_session_id, task_tag) IS NOT NULL
+                 GROUP BY task_key, collab_phase ORDER BY task_key, collab_phase",
+            )
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        // Roll the method's finer grain up to (task_key, phase).
+        let mut rolled: std::collections::BTreeMap<(String, Option<String>), i64> =
+            Default::default();
+        for r in &rows {
+            *rolled
+                .entry((r.task_key.clone(), r.collab_phase.clone()))
+                .or_default() += r.input_tokens
+                + r.output_tokens
+                + r.cache_creation_input_tokens
+                + r.cache_read_input_tokens;
+        }
+        let rolled: Vec<_> = rolled.into_iter().map(|((k, p), t)| (k, p, t)).collect();
+        assert_eq!(
+            literal, rolled,
+            "§10.1-compatible roll-up must equal literal §10.1"
+        );
+    }
+
+    #[test]
+    fn report_tokens_provider_cost_preserves_null() {
+        let db = db();
+        db.insert_token_usage(&tok(
+            Some("S"),
+            "impl",
+            "claude-opus-4-8",
+            "claude",
+            1,
+            0,
+            0,
+            0,
+            false,
+            None,
+            "2026-06-01T00:00:00Z",
+        ))
+        .unwrap();
+        let rows = db.report_tokens_by_task_phase(None, None).unwrap();
+        assert_eq!(
+            rows[0].provider_cost_usd, None,
+            "SUM of all-NULL cost stays NULL, not 0.0"
+        );
+    }
+
+    #[test]
+    fn report_filters_by_task_and_since() {
+        let db = db();
+        db.insert_token_usage(&tok(
+            Some("KEEP"),
+            "impl",
+            "claude-opus-4-8",
+            "claude",
+            1,
+            0,
+            0,
+            0,
+            false,
+            None,
+            "2026-06-05T00:00:00Z",
+        ))
+        .unwrap();
+        db.insert_token_usage(&tok(
+            Some("DROP"),
+            "impl",
+            "claude-opus-4-8",
+            "claude",
+            1,
+            0,
+            0,
+            0,
+            false,
+            None,
+            "2026-06-01T00:00:00Z",
+        ))
+        .unwrap();
+        assert_eq!(
+            db.report_tokens_by_task_phase(Some("KEEP"), None)
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            db.report_tokens_by_task_phase(None, Some("2026-06-03"))
+                .unwrap()
+                .len(),
+            1,
+            "since filters ts"
+        );
+    }
+
+    #[test]
+    fn report_headline_excludes_non_merged_and_non_completions_include_them() {
+        let db = db();
+        // merged task with a measured row
+        let mut merged = sample_task_outcome("issue-m", "2026-06-01T00:00:00Z");
+        merged.collab_session_id = Some("S-m".into());
+        merged.outcome = Some("merged".into());
+        db.upsert_task_outcome(&merged).unwrap();
+        db.insert_token_usage(&tok(
+            Some("S-m"),
+            "impl",
+            "claude-opus-4-8",
+            "claude",
+            1000,
+            0,
+            0,
+            0,
+            false,
+            None,
+            "2026-06-01T00:00:00Z",
+        ))
+        .unwrap();
+        // failed task with a measured row — MUST NOT appear in the headline.
+        let mut failed = sample_task_outcome("issue-f", "2026-06-02T00:00:00Z");
+        failed.collab_session_id = Some("S-f".into());
+        failed.outcome = Some("failed".into());
+        db.upsert_task_outcome(&failed).unwrap();
+        db.insert_token_usage(&tok(
+            Some("S-f"),
+            "impl",
+            "claude-opus-4-8",
+            "claude",
+            5000,
+            0,
+            0,
+            0,
+            false,
+            None,
+            "2026-06-02T00:00:00Z",
+        ))
+        .unwrap();
+
+        let head = db.report_headline(None, None).unwrap();
+        assert_eq!(head.len(), 1, "only merged tasks in headline");
+        assert_eq!(head[0].task_tag, "issue-m");
+        assert_eq!(head[0].tokens_to_done, 1000);
+
+        let non = db.report_non_completions(None, None).unwrap();
+        assert_eq!(non.len(), 1);
+        assert_eq!(non[0].task_tag, "issue-f");
+        assert_eq!(non[0].tokens_to_done, 5000);
+    }
+
+    #[test]
+    fn report_split_separates_measured_and_estimated() {
+        let db = db();
+        db.insert_token_usage(&tok(
+            Some("S"),
+            "impl",
+            "claude-opus-4-8",
+            "claude",
+            100,
+            0,
+            0,
+            0,
+            false,
+            None,
+            "2026-06-01T00:00:00Z",
+        ))
+        .unwrap();
+        db.insert_token_usage(&tok(
+            Some("S"),
+            "impl",
+            "claude-opus-4-8",
+            "claude",
+            40,
+            0,
+            0,
+            0,
+            true,
+            None,
+            "2026-06-01T00:00:01Z",
+        ))
+        .unwrap();
+        let split = db.report_measured_estimated_split(None, None).unwrap();
+        let measured: i64 = split
+            .iter()
+            .filter(|s| !s.estimated)
+            .map(|s| s.tokens)
+            .sum();
+        let estimated: i64 = split.iter().filter(|s| s.estimated).map(|s| s.tokens).sum();
+        assert_eq!((measured, estimated), (100, 40));
     }
 }
