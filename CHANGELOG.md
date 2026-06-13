@@ -30,6 +30,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (session/collab/phase/task) are intentionally left `None` pending a later
   attribution pass.
 
+### Performance
+
+- **Shrinkage rerank compile-once + lowercase hoisting** (`search/rerank.rs`):
+  each query token's word-boundary matcher is now compiled exactly once and
+  reused for both the IDF df-count and per-candidate scoring (previously
+  recompiled per token in `idf_filter` *and* rebuilt in `shrinkage_rerank`),
+  and each candidate document is lowercased once up front instead of
+  token×candidate times. Quoted-phrase lowercasing is hoisted out of the
+  per-candidate loop. Measured on a synthetic 200-candidate set (500 iters):
+  release median **1035µs → 582µs (−44%)**, debug median
+  **14302µs → 8532µs (−40%)**. Behavior unchanged — all existing search
+  tests stay green. Closes the in-code `TODO(perf)`. (#85)
+
 ## [0.3.4] - 2026-06-04
 
 ### Changed

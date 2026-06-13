@@ -273,72 +273,46 @@ pub fn shrinkage_rerank(candidates: &mut [ScoredDrawer], signals: &RerankSignals
         return;
     }
 
+    let use_boundary = tunables::shrinkage_word_boundary_enabled();
+
+    // Lowercase each candidate document exactly once, up front. Both the IDF
+    // df-count below and the per-candidate overlap scoring reuse these views,
+    // replacing the previous token×candidate and per-candidate re-lowercasing.
+    let lower_docs: Vec<String> = candidates
+        .iter()
+        .map(|c| c.drawer.content.to_lowercase())
+        .collect();
+
     let n = candidates.len() as f32;
     let threshold = (n * tunables::high_df_threshold()).ceil() as usize;
 
-    // Build effective token lists (IDF-style: skip high-DF tokens)
-    let effective_kws = idf_filter(&signals.predicate_kws, candidates, threshold);
-    let effective_names = idf_filter(&signals.names, candidates, threshold);
+    // Build effective token lists (IDF-style: skip high-DF tokens). Each
+    // surviving token carries its compiled boundary matcher so the scoring
+    // loop reuses it instead of recompiling — compile happens once per token.
+    let effective_kws = idf_filter(&signals.predicate_kws, &lower_docs, threshold, use_boundary);
+    let effective_names = idf_filter(&signals.names, &lower_docs, threshold, use_boundary);
 
-    let use_boundary = tunables::shrinkage_word_boundary_enabled();
-    let kw_matchers: Vec<Regex> = if use_boundary {
-        effective_kws
-            .iter()
-            .map(|kw| compile_token_matcher(kw))
-            .collect()
-    } else {
-        Vec::new()
-    };
-    let name_matchers: Vec<Regex> = if use_boundary {
-        effective_names
-            .iter()
-            .map(|n| compile_token_matcher(&n.to_lowercase()))
-            .collect()
-    } else {
-        Vec::new()
-    };
+    // Quoted phrases are not IDF-filtered, but their lowercasing is hoisted
+    // out of the per-candidate loop here.
+    let quoted_lower: Vec<String> = signals
+        .quoted_phrases
+        .iter()
+        .map(|p| p.to_lowercase())
+        .collect();
 
-    for c in candidates.iter_mut() {
-        let doc = c.drawer.content.to_lowercase();
-
-        // Predicate keyword overlap fraction
-        let kw_boost = if effective_kws.is_empty() {
-            0.0
-        } else if use_boundary {
-            let hits = kw_matchers.iter().filter(|m| token_hit(&doc, m)).count();
-            hits as f32 / effective_kws.len() as f32
-        } else {
-            let hits = effective_kws
-                .iter()
-                .filter(|kw| doc.contains(kw.as_str()))
-                .count();
-            hits as f32 / effective_kws.len() as f32
-        };
+    for (c, doc) in candidates.iter_mut().zip(lower_docs.iter()) {
+        let kw_boost = overlap_fraction(&effective_kws, doc);
+        let name_boost = overlap_fraction(&effective_names, doc);
 
         // Quoted phrase overlap fraction
-        let quoted_boost = if signals.quoted_phrases.is_empty() {
+        let quoted_boost = if quoted_lower.is_empty() {
             0.0
         } else {
-            let hits = signals
-                .quoted_phrases
+            let hits = quoted_lower
                 .iter()
-                .filter(|p| doc.contains(p.to_lowercase().as_str()))
+                .filter(|p| doc.contains(p.as_str()))
                 .count();
-            hits as f32 / signals.quoted_phrases.len() as f32
-        };
-
-        // Name overlap fraction
-        let name_boost = if effective_names.is_empty() {
-            0.0
-        } else if use_boundary {
-            let hits = name_matchers.iter().filter(|m| token_hit(&doc, m)).count();
-            hits as f32 / effective_names.len() as f32
-        } else {
-            let hits = effective_names
-                .iter()
-                .filter(|n| doc.contains(n.to_lowercase().as_str()))
-                .count();
-            hits as f32 / effective_names.len() as f32
+            hits as f32 / quoted_lower.len() as f32
         };
 
         if kw_boost == 0.0 && quoted_boost == 0.0 && name_boost == 0.0 {
@@ -361,35 +335,54 @@ pub fn shrinkage_rerank(candidates: &mut [ScoredDrawer], signals: &RerankSignals
     }
 }
 
-/// Filter a token list to those appearing in fewer than `threshold` candidates.
-// TODO(perf): the boundary path recompiles compile_token_matcher per
-// token here AND re-builds matchers in shrinkage_rerank. Plus per-
-// candidate to_lowercase. Combined: ~+20ms median search latency at
-// the LongMemEval scale. Follow-up: cache lower_docs once per query
-// and pass pre-built matchers in. See:
-// docs/superpowers/specs/2026-04-30-shrinkage-word-boundary-design.md
-// (Risks section).
-fn idf_filter(tokens: &[String], candidates: &[ScoredDrawer], threshold: usize) -> Vec<String> {
-    let use_boundary = tunables::shrinkage_word_boundary_enabled();
+/// A query token that survived the IDF filter, paired with its compiled
+/// boundary matcher. The matcher is `None` in legacy substring mode.
+struct EffectiveToken {
+    lower: String,
+    matcher: Option<Regex>,
+}
+
+/// Fraction of `tokens` that hit `doc_lower`. Shares the single hit-test seam
+/// (`token_hit` for the boundary path, `contains` for legacy) with the IDF
+/// df-count so both stay consistent.
+fn overlap_fraction(tokens: &[EffectiveToken], doc_lower: &str) -> f32 {
+    if tokens.is_empty() {
+        return 0.0;
+    }
+    let hits = tokens.iter().filter(|t| token_in_doc(t, doc_lower)).count();
+    hits as f32 / tokens.len() as f32
+}
+
+/// Does an effective token occur in a (pre-lowercased) document?
+fn token_in_doc(token: &EffectiveToken, doc_lower: &str) -> bool {
+    match &token.matcher {
+        Some(m) => token_hit(doc_lower, m),
+        None => doc_lower.contains(token.lower.as_str()),
+    }
+}
+
+/// Filter a token list to those appearing in fewer than `threshold` of the
+/// (pre-lowercased) candidate documents, compiling each survivor's boundary
+/// matcher exactly once for reuse in scoring.
+fn idf_filter(
+    tokens: &[String],
+    lower_docs: &[String],
+    threshold: usize,
+    use_boundary: bool,
+) -> Vec<EffectiveToken> {
     tokens
         .iter()
-        .filter(|t| {
-            let t_lower = t.to_lowercase();
-            let df = if use_boundary {
-                let m = compile_token_matcher(&t_lower);
-                candidates
-                    .iter()
-                    .filter(|c| m.is_match(&c.drawer.content.to_lowercase()))
-                    .count()
-            } else {
-                candidates
-                    .iter()
-                    .filter(|c| c.drawer.content.to_lowercase().contains(t_lower.as_str()))
-                    .count()
+        .filter_map(|t| {
+            let token = EffectiveToken {
+                lower: t.to_lowercase(),
+                matcher: use_boundary.then(|| compile_token_matcher(&t.to_lowercase())),
             };
-            df < threshold
+            let df = lower_docs
+                .iter()
+                .filter(|doc| token_in_doc(&token, doc))
+                .count();
+            (df < threshold).then_some(token)
         })
-        .cloned()
         .collect()
 }
 
@@ -537,5 +530,72 @@ mod tests {
         let m = compile_token_matcher("current");
         assert!(m.is_match("the current state"));
         assert!(!m.is_match("we are currently shipping"));
+    }
+
+    /// Build a synthetic 200-candidate set with realistic prose so the rerank
+    /// exercises the boundary matcher + per-candidate lowercasing hot paths.
+    #[cfg(test)]
+    fn synthetic_candidates(n: usize) -> Vec<ScoredDrawer> {
+        use crate::db::drawers::Drawer;
+        // A handful of repeated sentence templates with varied tokens so that
+        // some candidates hit signals and some do not — mirrors a real merge.
+        let bodies = [
+            "Rachel went to school in Boston and studied photography every weekend",
+            "Melanie visited the museum downtown and took notes about the exhibits",
+            "unrelated content about weather patterns over the pacific northwest region",
+            "the project shipped last quarter after several rounds of careful review",
+            "he baked egg tarts and suggested a new recipe for the holiday dinner party",
+            "she is currently working on suggestions for the photography portfolio layout",
+        ];
+        (0..n)
+            .map(|i| ScoredDrawer {
+                drawer: Drawer {
+                    id: format!("d{i}"),
+                    content: format!("{} (record {i})", bodies[i % bodies.len()]),
+                    wing: "w".into(),
+                    room: "r".into(),
+                    source_file: "".into(),
+                    added_by: "".into(),
+                    filed_at: "".into(),
+                    date: "".into(),
+                },
+                // Spread scores so ordering is non-trivial.
+                score: 0.50 + (i % 50) as f32 / 100.0,
+            })
+            .collect()
+    }
+
+    /// Timed benchmark for issue #85. Ignored by default (timing is not a hard
+    /// assertion); run explicitly to capture before/after latency numbers:
+    ///
+    ///   cargo test -p ironmem rerank_latency_bench -- --ignored --nocapture
+    #[test]
+    #[ignore = "timing benchmark; run with --ignored --nocapture"]
+    fn rerank_latency_bench() {
+        use std::time::Instant;
+
+        let base = synthetic_candidates(200);
+        let signals =
+            extract_signals("Where did Rachel go to school and what did Melanie suggest?");
+
+        const ITERS: usize = 500;
+        let mut samples: Vec<u128> = Vec::with_capacity(ITERS);
+        for _ in 0..ITERS {
+            // Clone fresh each iteration so prior reranks don't perturb input;
+            // the clone is outside the timed region.
+            let mut candidates = base.clone();
+            let t0 = Instant::now();
+            shrinkage_rerank(&mut candidates, &signals);
+            samples.push(t0.elapsed().as_micros());
+        }
+
+        samples.sort_unstable();
+        let median = samples[ITERS / 2];
+        let p90 = samples[(ITERS * 9) / 10];
+        let mean = samples.iter().sum::<u128>() / ITERS as u128;
+        println!(
+            "rerank_latency_bench (200 candidates, {ITERS} iters): \
+             median={median}µs p90={p90}µs mean={mean}µs"
+        );
     }
 }
