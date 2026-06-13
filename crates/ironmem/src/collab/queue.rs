@@ -160,6 +160,28 @@ pub fn find_active_session_by_repo_branch(
     .map_err(MemoryError::from)
 }
 
+/// Newest active session for a repo path, branch-agnostic, returning
+/// `(id, phase)`. Companion to `find_active_session_by_repo_branch` for
+/// callers that lack a branch (e.g. the session-start hook, which only knows
+/// the workspace root). "Active" is `ended_at IS NULL`; ambiguity across
+/// branches is intentionally resolved as the newest active session for the
+/// repo (`created_at DESC, id DESC`).
+pub fn find_active_session_by_repo(
+    conn: &Connection,
+    repo_path: &str,
+) -> Result<Option<(String, String)>, MemoryError> {
+    conn.query_row(
+        "SELECT id, phase FROM collab_sessions
+         WHERE repo_path = ?1 AND ended_at IS NULL
+         ORDER BY created_at DESC, id DESC
+         LIMIT 1",
+        params![repo_path],
+        |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+    )
+    .optional()
+    .map_err(MemoryError::from)
+}
+
 pub fn load_session(conn: &Connection, session_id: &str) -> Result<CollabSession, MemoryError> {
     Ok(load_session_record(conn, session_id)?.session)
 }
@@ -757,5 +779,32 @@ mod tests {
         let remaining = recv_messages(&db, "amm-4a", "codex", 10).unwrap();
         assert_eq!(remaining.len(), 1);
         assert_eq!(remaining[0].id, m1);
+    }
+
+    #[test]
+    fn find_active_session_by_repo_returns_active_and_isolates_repos() {
+        let db = open();
+        // /repo-a: one ended (older) + one active session.
+        create_session(&db, "a-old", "/repo-a", "main", None, Agent::Claude).unwrap();
+        end_session(&db, "a-old").unwrap();
+        create_session(&db, "a-active", "/repo-a", "feature", None, Agent::Claude).unwrap();
+        // Different repo must not leak.
+        create_session(&db, "b-active", "/repo-b", "main", None, Agent::Claude).unwrap();
+
+        let found = find_active_session_by_repo(&db, "/repo-a").unwrap();
+        assert_eq!(found.map(|(id, _)| id), Some("a-active".to_string()));
+
+        // Repo with only an ended session → None.
+        end_session(&db, "a-active").unwrap();
+        assert!(find_active_session_by_repo(&db, "/repo-a")
+            .unwrap()
+            .is_none());
+
+        // Isolation: /repo-b still returns its own active session + a phase string.
+        let b = find_active_session_by_repo(&db, "/repo-b")
+            .unwrap()
+            .unwrap();
+        assert_eq!(b.0, "b-active");
+        assert!(!b.1.is_empty());
     }
 }
