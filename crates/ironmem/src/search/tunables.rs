@@ -1,8 +1,10 @@
 //! Runtime-overridable search tuning knobs.
 //!
-//! Every constant here reads an `IRONMEM_*` environment variable on first use
-//! (via `OnceLock`). When the variable is absent or unparseable the compile-time
-//! default is used, so production behaviour is unchanged with no env overrides.
+//! Most constants here read an `IRONMEM_*` environment variable on first use
+//! (via `OnceLock`); the knowledge-graph caps and the metrics knobs read fresh
+//! on every call (see their sections). When the variable is absent or
+//! unparseable the compile-time default is used, so production behaviour is
+//! unchanged with no env overrides.
 //!
 //! This centralises all tuning parameters in one place and lets the E2 parameter
 //! sweep drive experiments purely through environment variables without recompiling.
@@ -57,6 +59,37 @@ pub fn content_word_variant_min_tokens() -> usize {
 pub fn bm25_sparse_threshold() -> usize {
     static V: OnceLock<usize> = OnceLock::new();
     *V.get_or_init(|| env_usize("IRONMEM_BM25_SPARSE_THRESHOLD", 5))
+}
+
+// ── knowledge-graph fan-out caps ───────────────────────────────────────────────
+// Read fresh on every call (no OnceLock): the kg_query MCP tool overrides the
+// limit per-request, and integration tests flip these via process-global env
+// vars. Call frequency is ≤ once per kg_query / once per kg_boost, so a fresh
+// env read is negligible next to the SQLite probes they bound.
+
+/// Maximum currently-valid triples `query_entity_current` returns. Bounds both
+/// the triples serialized into `kg_query` MCP responses and the 1-hop fan-out
+/// the KG-boost loop walks. Default 50. A `0` override is treated as "use the
+/// default" rather than silently truncating every query to nothing.
+pub fn kg_query_limit() -> usize {
+    nonzero_or("IRONMEM_KG_QUERY_LIMIT", 50)
+}
+
+/// Maximum distinct related entities the KG boost fans out to (1-hop) across all
+/// mentioned entities. Bounds the entity lookups a high-degree hub would
+/// otherwise trigger unbounded. Default 32. A `0` override is treated as "use
+/// the default" rather than silently disabling the boost.
+pub fn kg_boost_fanout() -> usize {
+    nonzero_or("IRONMEM_KG_BOOST_FANOUT", 32)
+}
+
+/// Like `env_usize`, but a parsed `0` falls back to `default` — these caps must
+/// stay ≥ 1 or they silently disable the feature they bound.
+fn nonzero_or(name: &str, default: usize) -> usize {
+    match env_usize(name, default) {
+        0 => default,
+        n => n,
+    }
 }
 
 // ── rerank weights ────────────────────────────────────────────────────────────
@@ -343,6 +376,13 @@ pub fn metrics_enabled() -> bool {
     )
 }
 
+/// Serializes tests that mutate the `IRONMEM_KG_*` env vars. These tunables
+/// read the env fresh on every call, so any test flipping them (here or in
+/// `search::pipeline`) must hold this lock to avoid clobbering a concurrent
+/// test reading the default.
+#[cfg(test)]
+pub(crate) static KG_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -377,6 +417,38 @@ mod tests {
         std::env::set_var("IRONMEM_CONTEXT_WINDOW", "abc");
         assert_eq!(context_window(), 200_000);
         std::env::remove_var("IRONMEM_CONTEXT_WINDOW");
+    }
+
+    #[test]
+    fn kg_query_limit_defaults_to_50_and_reads_override() {
+        let _g = KG_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::remove_var("IRONMEM_KG_QUERY_LIMIT");
+        assert_eq!(kg_query_limit(), 50);
+        std::env::set_var("IRONMEM_KG_QUERY_LIMIT", "7");
+        assert_eq!(kg_query_limit(), 7);
+        std::env::remove_var("IRONMEM_KG_QUERY_LIMIT");
+    }
+
+    #[test]
+    fn kg_boost_fanout_defaults_to_32_and_reads_override() {
+        let _g = KG_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::remove_var("IRONMEM_KG_BOOST_FANOUT");
+        assert_eq!(kg_boost_fanout(), 32);
+        std::env::set_var("IRONMEM_KG_BOOST_FANOUT", "4");
+        assert_eq!(kg_boost_fanout(), 4);
+        std::env::remove_var("IRONMEM_KG_BOOST_FANOUT");
+    }
+
+    #[test]
+    fn kg_caps_treat_zero_as_default() {
+        let _g = KG_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // A `0` override must not silently disable the feature each cap bounds.
+        std::env::set_var("IRONMEM_KG_QUERY_LIMIT", "0");
+        std::env::set_var("IRONMEM_KG_BOOST_FANOUT", "0");
+        assert_eq!(kg_query_limit(), 50);
+        assert_eq!(kg_boost_fanout(), 32);
+        std::env::remove_var("IRONMEM_KG_QUERY_LIMIT");
+        std::env::remove_var("IRONMEM_KG_BOOST_FANOUT");
     }
 
     #[test]

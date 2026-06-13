@@ -219,6 +219,15 @@ Default OFF. The pref-enrich experiment did not meet its target lift on LongMemE
 | `IRONMEM_PREF_LLM_TIMEOUT_MS` | `15000` | Wall-clock cap per LLM extraction call (capped at 60_000). |
 | `IRONMEM_PREF_LLM_MAX_TOKENS` | `200` | `max_tokens` for the API backend. Ignored by `cli`. |
 
+### Knowledge-graph fan-out caps (on by default)
+
+Bound how many triples the KG layer serves and walks so a well-connected hub entity can't dump every relationship into MCP responses or the KG-boost loop. Both read fresh each call; the `kg_query` MCP tool also accepts a per-request `limit`.
+
+| Variable | Default | Effect |
+|---|---|---|
+| `IRONMEM_KG_QUERY_LIMIT` | `50` | Max currently-valid triples `query_entity_current` returns (the `kg_query` tool and the KG-boost 1-hop fetch). Truncation is deterministic — ordered by `extracted_at DESC, id ASC`. `0` falls back to the default. |
+| `IRONMEM_KG_BOOST_FANOUT` | `32` | Max distinct related entities the KG boost walks to across all mentioned entities, bounding the per-triple entity lookups a high-degree hub would otherwise trigger unbounded. `0` falls back to the default. |
+
 ### Metrics (instrumentation; on by default)
 
 ironmem records lightweight per-call metrics (MCP response sizing + transcript occupancy) into the migration-008 tables. See `docs/METRICS_SPEC.md` (§5, §8). All writes are best-effort — a metrics failure never breaks an MCP response or a hook.

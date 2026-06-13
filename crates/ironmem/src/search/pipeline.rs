@@ -572,20 +572,29 @@ fn kg_boost(
         return Ok(());
     }
 
-    // Collect related entity names (1-hop)
+    // Collect related entity names (1-hop), bounded by the fan-out cap so a
+    // high-degree hub can't trigger unbounded entity lookups. The cap counts
+    // genuine related entities (the mentioned entity itself is skipped).
+    let query_limit = tunables::kg_query_limit();
+    let fanout_cap = tunables::kg_boost_fanout();
     let mut related_names: HashSet<String> = HashSet::new();
     let mut direct_names: HashSet<String> = HashSet::new();
 
-    for entity in &mentioned {
+    'outer: for entity in &mentioned {
         direct_names.insert(entity.name.to_lowercase());
 
-        if let Ok(triples) = kg.query_entity_current(&entity.id) {
+        if let Ok(triples) = kg.query_entity_current(&entity.id, query_limit) {
             for triple in triples {
-                if let Ok(Some(e)) = kg.get_entity(&triple.subject) {
-                    related_names.insert(e.name.to_lowercase());
+                for related_id in [&triple.subject, &triple.object] {
+                    if let Ok(Some(e)) = kg.get_entity(related_id) {
+                        let name = e.name.to_lowercase();
+                        if !direct_names.contains(&name) {
+                            related_names.insert(name);
+                        }
+                    }
                 }
-                if let Ok(Some(e)) = kg.get_entity(&triple.object) {
-                    related_names.insert(e.name.to_lowercase());
+                if related_names.len() >= fanout_cap {
+                    break 'outer;
                 }
             }
         }
@@ -614,4 +623,70 @@ fn kg_boost(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::db::drawers::Drawer;
+    use crate::db::schema::Database;
+    use crate::search::tunables::KG_ENV_LOCK;
+
+    fn candidate(id: &str, content: &str) -> ScoredDrawer {
+        ScoredDrawer {
+            drawer: Drawer {
+                id: id.to_string(),
+                content: content.to_string(),
+                wing: "w".into(),
+                room: "r".into(),
+                source_file: "f".into(),
+                added_by: "t".into(),
+                filed_at: "2026-01-01T00:00:00Z".into(),
+                date: "2026-01-01".into(),
+            },
+            score: 1.0,
+        }
+    }
+
+    #[test]
+    fn kg_boost_caps_related_entity_fanout() {
+        let _g = KG_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::remove_var("IRONMEM_KG_QUERY_LIMIT");
+        std::env::set_var("IRONMEM_KG_BOOST_FANOUT", "8");
+
+        let db = Database::open_in_memory().unwrap();
+        let kg = KnowledgeGraph::new(&db);
+
+        // High-degree hub: 20 distinct related entities, each its own triple.
+        for i in 0..20 {
+            kg.add_triple(
+                "Hub",
+                "person",
+                "knows",
+                &format!("friend{i:02}"),
+                "person",
+                None,
+                1.0,
+                None,
+            )
+            .unwrap();
+        }
+
+        // One candidate per related entity, each mentioning exactly that friend.
+        let mut candidates: Vec<ScoredDrawer> = (0..20)
+            .map(|i| candidate(&format!("c{i:02}"), &format!("note about friend{i:02}")))
+            .collect();
+
+        kg_boost(&mut candidates, "Hub", &kg).unwrap();
+
+        // Without a cap all 20 related entities would boost their candidate;
+        // the fan-out cap of 8 must limit it to exactly 8.
+        let boosted = candidates.iter().filter(|c| c.score > 1.0).count();
+        assert_eq!(
+            boosted, 8,
+            "fan-out cap of 8 should boost exactly 8 related entities"
+        );
+
+        std::env::remove_var("IRONMEM_KG_BOOST_FANOUT");
+    }
 }

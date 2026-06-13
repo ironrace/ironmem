@@ -99,9 +99,21 @@ pub(super) fn handle_kg_query(app: &App, args: &Value) -> Result<Value, MemoryEr
         .map(|value| sanitize::sanitize_name(value, "entity_type"))
         .transpose()?;
 
+    // JSON-Schema `minimum: 1` is advisory only; enforce it here so a `limit: 0`
+    // can't slip through to `LIMIT 0` and silently return zero triples.
+    let limit = match args.get("limit") {
+        None => crate::search::tunables::kg_query_limit(),
+        Some(v) => {
+            let n = v.as_u64().filter(|n| *n >= 1).ok_or_else(|| {
+                MemoryError::Validation("limit must be a positive integer".into())
+            })?;
+            n as usize
+        }
+    };
+
     let kg = KnowledgeGraph::new(&app.db);
     let entity = kg.resolve_entity(&entity_name, entity_type.as_deref())?;
-    let triples = kg.query_entity_current(&entity.id)?;
+    let triples = kg.query_entity_current(&entity.id, limit)?;
 
     Ok(json!({
         "entity": {
@@ -192,4 +204,77 @@ pub(super) fn handle_find_tunnels(app: &App) -> Result<Value, MemoryError> {
 pub(super) fn handle_graph_stats(app: &App) -> Result<Value, MemoryError> {
     let stats = search::graph::graph_stats(app)?;
     Ok(serde_json::to_value(stats)?)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::{Config, EmbedMode, McpAccessMode};
+
+    fn test_app() -> App {
+        let dir = tempfile::tempdir().unwrap();
+        let config = Config {
+            db_path: dir.path().join("mem.sqlite3"),
+            model_dir: dir.path().join("model"),
+            model_dir_explicit: true,
+            state_dir: dir.path().join("state"),
+            mcp_access_mode: McpAccessMode::Trusted,
+            embed_mode: EmbedMode::Noop,
+        };
+        std::mem::forget(dir); // keep the DB file alive for the test
+        App::new(config).unwrap()
+    }
+
+    fn seed_hub(app: &App, edges: usize) {
+        let kg = KnowledgeGraph::new(&app.db);
+        for i in 0..edges {
+            kg.add_triple(
+                "Hub",
+                "person",
+                "knows",
+                &format!("Friend{i:02}"),
+                "person",
+                None,
+                1.0,
+                None,
+            )
+            .unwrap();
+        }
+    }
+
+    fn triple_count(result: &Value) -> usize {
+        result["triples"].as_array().unwrap().len()
+    }
+
+    #[test]
+    fn kg_query_explicit_limit_truncates() {
+        let app = test_app();
+        seed_hub(&app, 5);
+        let result = handle_kg_query(&app, &json!({ "entity": "Hub", "limit": 2 })).unwrap();
+        assert_eq!(triple_count(&result), 2);
+    }
+
+    #[test]
+    fn kg_query_without_limit_uses_default() {
+        let app = test_app();
+        seed_hub(&app, 5);
+        // Default (50) comfortably covers all 5 edges.
+        let result = handle_kg_query(&app, &json!({ "entity": "Hub" })).unwrap();
+        assert_eq!(triple_count(&result), 5);
+    }
+
+    #[test]
+    fn kg_query_rejects_zero_and_non_integer_limit() {
+        let app = test_app();
+        seed_hub(&app, 3);
+
+        let zero = handle_kg_query(&app, &json!({ "entity": "Hub", "limit": 0 }));
+        assert!(matches!(zero, Err(MemoryError::Validation(_))));
+
+        let negative = handle_kg_query(&app, &json!({ "entity": "Hub", "limit": -1 }));
+        assert!(matches!(negative, Err(MemoryError::Validation(_))));
+
+        let textual = handle_kg_query(&app, &json!({ "entity": "Hub", "limit": "5" }));
+        assert!(matches!(textual, Err(MemoryError::Validation(_))));
+    }
 }
