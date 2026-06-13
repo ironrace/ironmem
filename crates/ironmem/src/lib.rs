@@ -26,6 +26,8 @@ pub mod metrics;
 pub mod migrate;
 /// Re-embedding all drawers after a model upgrade.
 pub mod reembed;
+/// `ironmem report` rendering layer (METRICS_SPEC §10 queries + §7 cost).
+pub mod report;
 /// Input sanitization helpers for names, content, harness IDs, and paths.
 pub mod sanitize;
 /// Search pipeline, graph traversal, and query sanitization.
