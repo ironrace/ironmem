@@ -698,22 +698,30 @@ mod tests {
         let db = Database::open_in_memory().unwrap();
         let kg = KnowledgeGraph::new(&db);
 
-        // Register an entity so the query mentions it and the related-entity
-        // lookup runs (it would short-circuit on an empty mention set).
+        // Register an entity so the query mentions it and the 1-hop expansion
+        // runs (it would short-circuit on an empty mention set).
         kg.upsert_entity("Hub", "thing").unwrap();
 
-        // Simulate a DB-level failure: drop the table the related-entity lookup
-        // reads from. The entities table is left intact so the mention scan
-        // still finds "Hub" and execution reaches the triple query.
+        // Simulate a DB-level failure: drop the `triples` table, which the
+        // first lookup in the expansion (`query_entity_current`) reads from.
+        // The `entities` table is left intact so the mention scan still finds
+        // "Hub" and execution reaches that triple query.
         db.exec_raw("DROP TABLE triples").unwrap();
 
         let mut candidates = vec![candidate("c0", "note about hub")];
 
-        // The error from the dropped table must surface, not be swallowed.
+        // The error from the dropped table must surface at the `?` on
+        // `query_entity_current`, not be swallowed. This covers the first of
+        // the two propagation sites. The second (`get_entity`, which reads
+        // `entities`) cannot be isolated at the table level: `get_entity` and
+        // `find_entities_in_text` issue the same `SELECT ... FROM entities`, so
+        // any structural break to `entities` fails the mention scan first,
+        // before the `get_entity` call is ever reached. Both sites use
+        // identical `?` propagation and the symmetric fix is verified by review.
         let result = kg_boost(&mut candidates, "Hub", &kg);
         assert!(
             result.is_err(),
-            "kg_boost must propagate DB errors from the related-entity lookup, got {result:?}"
+            "kg_boost must propagate the DB error from query_entity_current, got {result:?}"
         );
     }
 }
