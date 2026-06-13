@@ -97,15 +97,29 @@ impl<'a> KnowledgeGraph<'a> {
 
     /// Query triples for an entity (both as subject and object).
     /// Only returns currently valid triples (valid_to IS NULL).
-    pub fn query_entity_current(&self, entity_id: &str) -> Result<Vec<Triple>, MemoryError> {
+    ///
+    /// Results are capped at `limit` (a well-connected hub would otherwise dump
+    /// every triple into MCP responses and the KG-boost loop). The secondary
+    /// `id` sort keeps the truncation deterministic when `extracted_at` ties,
+    /// so the same `limit` always returns the same prefix.
+    pub fn query_entity_current(
+        &self,
+        entity_id: &str,
+        limit: usize,
+    ) -> Result<Vec<Triple>, MemoryError> {
         let mut stmt = self.db.conn.prepare(
             "SELECT id, subject, predicate, object, valid_from, valid_to, confidence, source_closet, extracted_at
              FROM triples
              WHERE (subject = ?1 OR object = ?1) AND valid_to IS NULL
-             ORDER BY extracted_at DESC",
+             ORDER BY extracted_at DESC, id ASC
+             LIMIT ?2",
         )?;
 
-        let rows = stmt.query_map(params![entity_id], Self::row_to_triple)?;
+        // Clamp to i64 so a pathologically large usize can't wrap negative —
+        // SQLite reads a negative LIMIT as "unlimited", which would defeat the
+        // cap this method exists to enforce.
+        let bounded = i64::try_from(limit).unwrap_or(i64::MAX);
+        let rows = stmt.query_map(params![entity_id, bounded], Self::row_to_triple)?;
         let mut result = Vec::new();
         for row in rows {
             result.push(row?);
@@ -478,10 +492,104 @@ mod tests {
 
         // Query from subject side
         let alice_id = entity_id("alice", "person");
-        let triples = kg.query_entity_current(&alice_id).unwrap();
+        let triples = kg.query_entity_current(&alice_id, 50).unwrap();
         assert_eq!(triples.len(), 1);
         assert_eq!(triples[0].predicate, "works_at");
         assert!((triples[0].confidence - 0.9).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_query_entity_current_truncates_and_orders_stably() {
+        let db = Database::open_in_memory().unwrap();
+        let kg = KnowledgeGraph::new(&db);
+
+        // Seed >50 current triples on a single hub entity.
+        for i in 0..60 {
+            kg.add_triple(
+                "Hub",
+                "person",
+                "knows",
+                &format!("Friend{i:02}"),
+                "person",
+                None,
+                1.0,
+                None,
+            )
+            .unwrap();
+        }
+
+        let hub_id = entity_id("hub", "person");
+
+        // Explicit limit truncates the result set.
+        let limited = kg.query_entity_current(&hub_id, 50).unwrap();
+        assert_eq!(limited.len(), 50);
+
+        let smaller = kg.query_entity_current(&hub_id, 10).unwrap();
+        assert_eq!(smaller.len(), 10);
+
+        // Stable ordering: same limit → identical id sequence across calls,
+        // even when extracted_at ties (tiebreaker on id keeps it deterministic).
+        let again = kg.query_entity_current(&hub_id, 50).unwrap();
+        let ids_a: Vec<&str> = limited.iter().map(|t| t.id.as_str()).collect();
+        let ids_b: Vec<&str> = again.iter().map(|t| t.id.as_str()).collect();
+        assert_eq!(ids_a, ids_b);
+
+        // The truncated set is a prefix of the larger set (consistent order).
+        let smaller_ids: Vec<&str> = smaller.iter().map(|t| t.id.as_str()).collect();
+        assert_eq!(smaller_ids, ids_a[..10]);
+    }
+
+    #[test]
+    fn test_query_entity_current_tiebreaks_on_id_when_extracted_at_ties() {
+        let db = Database::open_in_memory().unwrap();
+
+        // Insert triples directly with an IDENTICAL extracted_at so the
+        // secondary `id ASC` sort is the only thing that can order them.
+        // Ids are inserted out of sorted order; without the tiebreaker the
+        // result would follow rowid (insertion) order and this test fails.
+        let hub = "hub00000000000000000000000000000";
+        db.conn
+            .execute(
+                "INSERT INTO entities (id, name, entity_type) VALUES (?1, 'Hub', 'thing')",
+                params![hub],
+            )
+            .unwrap();
+
+        // Triple ids inserted out of sorted order; each needs a distinct object
+        // (UNIQUE on subject,predicate,object) and a shared extracted_at so the
+        // `id ASC` tiebreaker is the only thing that can order the result.
+        let ids = [
+            "cccccccccccccccccccccccccccccccc",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "dddddddddddddddddddddddddddddddd",
+        ];
+        for (i, id) in ids.iter().enumerate() {
+            let obj = format!("obj{i:029}");
+            db.conn
+                .execute(
+                    "INSERT INTO entities (id, name, entity_type) VALUES (?1, ?2, 'thing')",
+                    params![obj, format!("Obj{i}")],
+                )
+                .unwrap();
+            db.conn
+                .execute(
+                    "INSERT INTO triples
+                     (id, subject, predicate, object, confidence, extracted_at)
+                     VALUES (?1, ?2, 'rel', ?3, 1.0, '2026-01-01T00:00:00Z')",
+                    params![id, hub, obj],
+                )
+                .unwrap();
+        }
+
+        let kg = KnowledgeGraph::new(&db);
+        let got = kg.query_entity_current(hub, 50).unwrap();
+        let got_ids: Vec<&str> = got.iter().map(|t| t.id.as_str()).collect();
+
+        let mut expected: Vec<&str> = ids.to_vec();
+        expected.sort_unstable();
+        assert_eq!(got_ids, expected);
     }
 
     #[test]
@@ -497,13 +605,13 @@ mod tests {
 
         // Triple is visible before invalidation
         let alice_id = entity_id("alice", "person");
-        assert_eq!(kg.query_entity_current(&alice_id).unwrap().len(), 1);
+        assert_eq!(kg.query_entity_current(&alice_id, 50).unwrap().len(), 1);
 
         // Invalidate
         assert!(kg.invalidate_triple(&triple_id, "2025-01-01").unwrap());
 
         // No longer visible in current query
-        assert_eq!(kg.query_entity_current(&alice_id).unwrap().len(), 0);
+        assert_eq!(kg.query_entity_current(&alice_id, 50).unwrap().len(), 0);
 
         // Double invalidation returns false
         assert!(!kg.invalidate_triple(&triple_id, "2025-01-02").unwrap());
@@ -544,7 +652,7 @@ mod tests {
         assert_ne!(first_id, second_id);
 
         let alice_id = entity_id("alice", "person");
-        let current = kg.query_entity_current(&alice_id).unwrap();
+        let current = kg.query_entity_current(&alice_id, 50).unwrap();
         assert_eq!(current.len(), 1);
         assert_eq!(current[0].id, second_id);
 

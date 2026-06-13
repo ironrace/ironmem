@@ -123,7 +123,12 @@ pub fn tool_definitions(app: &App) -> Vec<Value> {
                 "type": "object",
                 "properties": {
                     "entity": { "type": "string" },
-                    "entity_type": { "type": "string" }
+                    "entity_type": { "type": "string" },
+                    "limit": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "description": "Max triples to return (default 50)."
+                    }
                 },
                 "required": ["entity"]
             }
