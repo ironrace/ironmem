@@ -186,13 +186,21 @@ async fn run(cli: Cli) -> Result<(), MemoryError> {
             Ok(())
         }
         Commands::WriteRules { target, workspace } => {
-            use ironmem::write_rules::{write_rules_file, WriteOutcome};
+            use ironmem::write_rules::{validate_rules_file, write_rules_file, WriteOutcome};
             let targets: Vec<&str> = match target.as_deref() {
                 Some(t) => vec![t],
                 None => vec!["CLAUDE.md", "AGENTS.md"],
             };
-            for name in targets {
-                let path = std::path::Path::new(&workspace).join(name);
+            let paths: Vec<_> = targets
+                .iter()
+                .map(|name| std::path::Path::new(&workspace).join(name))
+                .collect();
+            if target.is_none() {
+                for path in &paths {
+                    validate_rules_file(path, bootstrap::MEMORY_PROTOCOL)?;
+                }
+            }
+            for path in paths {
                 let outcome = write_rules_file(&path, bootstrap::MEMORY_PROTOCOL)?;
                 let label = match outcome {
                     WriteOutcome::Created => "created",

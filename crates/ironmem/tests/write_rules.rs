@@ -4,6 +4,10 @@ fn bin() -> &'static str {
     env!("CARGO_BIN_EXE_ironmem")
 }
 
+fn expected_block() -> String {
+    ironmem::write_rules::render_block(ironmem::bootstrap::MEMORY_PROTOCOL)
+}
+
 #[test]
 fn write_rules_no_target_creates_both_files() {
     let temp = tempfile::tempdir().unwrap();
@@ -15,16 +19,10 @@ fn write_rules_no_target_creates_both_files() {
         .output()
         .unwrap();
     assert!(out.status.success(), "write-rules failed: {out:?}");
+    let expected = expected_block();
     for name in ["CLAUDE.md", "AGENTS.md"] {
         let content = std::fs::read_to_string(ws.join(name)).unwrap();
-        assert!(
-            content.contains("BEGIN IRONMEM MEMORY PROTOCOL"),
-            "{name} missing BEGIN marker"
-        );
-        assert!(
-            content.contains("END IRONMEM MEMORY PROTOCOL"),
-            "{name} missing END marker"
-        );
+        assert_eq!(content, expected, "{name} must contain the canonical block");
     }
 }
 
@@ -81,5 +79,34 @@ fn write_rules_rejects_invalid_target() {
     assert!(
         !out.status.success(),
         "invalid --target must be rejected by clap"
+    );
+}
+
+#[test]
+fn write_rules_default_preflights_both_targets_before_writing() {
+    let temp = tempfile::tempdir().unwrap();
+    let ws = temp.path();
+    let malformed = "<!-- BEGIN IRONMEM MEMORY PROTOCOL -->\nno end marker\n";
+    std::fs::write(ws.join("AGENTS.md"), malformed).unwrap();
+
+    let out = Command::new(bin())
+        .arg("write-rules")
+        .arg("--workspace")
+        .arg(ws)
+        .output()
+        .unwrap();
+
+    assert!(
+        !out.status.success(),
+        "malformed AGENTS.md must fail the default two-target run"
+    );
+    assert!(
+        !ws.join("CLAUDE.md").exists(),
+        "CLAUDE.md must not be created when AGENTS.md fails preflight"
+    );
+    assert_eq!(
+        std::fs::read_to_string(ws.join("AGENTS.md")).unwrap(),
+        malformed,
+        "malformed target must be left untouched"
     );
 }

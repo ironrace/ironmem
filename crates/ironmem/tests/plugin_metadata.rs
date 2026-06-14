@@ -52,6 +52,40 @@ fn codex_plugin_json_has_required_fields() {
         json["hooks"].is_string(),
         "codex plugin.json: missing 'hooks' path"
     );
+    let interface = &json["interface"];
+    assert!(
+        interface["displayName"].is_string(),
+        "codex plugin.json: missing interface.displayName"
+    );
+    assert!(
+        interface["shortDescription"].is_string(),
+        "codex plugin.json: missing interface.shortDescription"
+    );
+    assert_eq!(
+        interface["category"].as_str(),
+        Some("Coding"),
+        "codex plugin.json: interface.category must remain Coding"
+    );
+    assert_eq!(
+        interface["brandColor"].as_str(),
+        Some("#1C5D6B"),
+        "codex plugin.json: interface.brandColor changed unexpectedly"
+    );
+    let capabilities = interface["capabilities"]
+        .as_array()
+        .expect("codex plugin.json: interface.capabilities must be an array");
+    for capability in ["Interactive", "Read", "Write"] {
+        assert!(
+            capabilities
+                .iter()
+                .any(|value| value.as_str() == Some(capability)),
+            "codex plugin.json: missing interface capability {capability}"
+        );
+    }
+    assert!(
+        interface["defaultPrompt"].is_null(),
+        "codex plugin.json: interface.defaultPrompt duplicates MEMORY_PROTOCOL; use ironmem write-rules instead"
+    );
 }
 
 #[test]

@@ -4,6 +4,7 @@
 //! [`crate::bootstrap::MEMORY_PROTOCOL`]. Explicit opt-in only: no hook,
 //! bootstrap, or serve path ever calls this.
 
+use std::io::Write;
 use std::path::Path;
 
 use crate::error::MemoryError;
@@ -53,8 +54,10 @@ pub fn upsert_block(existing: &str, block: &str) -> Result<String, MemoryError> 
                 ));
             }
             let after_end = end_idx + END_MARKER.len();
-            // Consume one trailing newline after END so replacement stays idempotent.
-            let region_end = if existing[after_end..].starts_with('\n') {
+            // Consume one trailing line ending after END so replacement stays idempotent.
+            let region_end = if existing[after_end..].starts_with("\r\n") {
+                after_end + 2
+            } else if existing[after_end..].starts_with('\n') {
                 after_end + 1
             } else {
                 after_end
@@ -76,21 +79,33 @@ fn append_block(existing: &str, block: &str) -> String {
     if existing.trim().is_empty() {
         return block.to_string();
     }
-    let trimmed = existing.trim_end_matches('\n');
-    format!("{trimmed}\n\n{block}")
+    let trimmed = trim_trailing_line_endings(existing);
+    let separator = if existing.contains("\r\n") {
+        "\r\n\r\n"
+    } else {
+        "\n\n"
+    };
+    format!("{trimmed}{separator}{block}")
+}
+
+fn trim_trailing_line_endings(mut value: &str) -> &str {
+    loop {
+        if let Some(trimmed) = value.strip_suffix("\r\n") {
+            value = trimmed;
+        } else if let Some(trimmed) = value.strip_suffix('\n') {
+            value = trimmed;
+        } else {
+            return value;
+        }
+    }
 }
 
 /// Read `target_path` (missing = empty), upsert the block rendered from
 /// `protocol`, and write atomically. Skips the write when the result is
 /// byte-identical to the existing file.
 pub fn write_rules_file(target_path: &Path, protocol: &str) -> Result<WriteOutcome, MemoryError> {
-    let existing = match std::fs::read_to_string(target_path) {
-        Ok(content) => Some(content),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
-        Err(error) => return Err(MemoryError::Io(error)),
-    };
-    let existed = existing.is_some();
-    let current = existing.unwrap_or_default();
+    let (target_metadata, current) = read_rules_target(target_path)?;
+    let existed = target_metadata.is_some();
 
     let block = render_block(protocol);
     let updated = upsert_block(&current, &block)?;
@@ -98,7 +113,7 @@ pub fn write_rules_file(target_path: &Path, protocol: &str) -> Result<WriteOutco
     if existed && updated == current {
         return Ok(WriteOutcome::Unchanged);
     }
-    write_atomic(target_path, &updated)?;
+    write_atomic(target_path, &updated, target_metadata.as_ref())?;
     Ok(if existed {
         WriteOutcome::Updated
     } else {
@@ -106,20 +121,134 @@ pub fn write_rules_file(target_path: &Path, protocol: &str) -> Result<WriteOutco
     })
 }
 
-fn write_atomic(path: &Path, content: &str) -> Result<(), MemoryError> {
+/// Validate that `target_path` can be read and upserted without writing it.
+pub fn validate_rules_file(target_path: &Path, protocol: &str) -> Result<(), MemoryError> {
+    let (_target_metadata, current) = read_rules_target(target_path)?;
+    let block = render_block(protocol);
+    upsert_block(&current, &block)?;
+    Ok(())
+}
+
+fn read_rules_target(
+    target_path: &Path,
+) -> Result<(Option<std::fs::Metadata>, String), MemoryError> {
+    let target_metadata = match std::fs::symlink_metadata(target_path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            return Err(MemoryError::Validation(format!(
+                "ironmem write-rules refuses to overwrite symlink target {}",
+                target_path.display()
+            )));
+        }
+        Ok(metadata) => Some(metadata),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => return Err(MemoryError::Io(error)),
+    };
+    let current = if target_metadata.is_some() {
+        std::fs::read_to_string(target_path)?
+    } else {
+        String::new()
+    };
+    Ok((target_metadata, current))
+}
+
+fn write_atomic(
+    path: &Path,
+    content: &str,
+    existing_metadata: Option<&std::fs::Metadata>,
+) -> Result<(), MemoryError> {
     if let Some(parent) = path.parent() {
         if !parent.as_os_str().is_empty() {
             std::fs::create_dir_all(parent)?;
         }
     }
     let tmp_path = temp_path_for(path);
-    std::fs::write(&tmp_path, content)?;
-    std::fs::rename(&tmp_path, path)?;
+    let result = (|| -> Result<(), MemoryError> {
+        let mut file = create_temp_file(&tmp_path, existing_metadata)?;
+        file.write_all(content.as_bytes())?;
+        file.sync_all()?;
+        drop(file);
+        replace_file(&tmp_path, path)?;
+        set_final_permissions(path, existing_metadata)?;
+        sync_parent_dir(path)?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&tmp_path);
+    }
+    result
+}
+
+fn create_temp_file(
+    path: &Path,
+    existing_metadata: Option<&std::fs::Metadata>,
+) -> Result<std::fs::File, MemoryError> {
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o644));
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(target_mode(existing_metadata));
     }
+    Ok(options.open(path)?)
+}
+
+#[cfg(not(windows))]
+fn replace_file(tmp_path: &Path, path: &Path) -> Result<(), MemoryError> {
+    std::fs::rename(tmp_path, path)?;
+    Ok(())
+}
+
+#[cfg(windows)]
+fn replace_file(tmp_path: &Path, path: &Path) -> Result<(), MemoryError> {
+    if path.exists() {
+        std::fs::remove_file(path)?;
+    }
+    std::fs::rename(tmp_path, path)?;
+    Ok(())
+}
+
+#[cfg(unix)]
+fn set_final_permissions(
+    path: &Path,
+    existing_metadata: Option<&std::fs::Metadata>,
+) -> Result<(), MemoryError> {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(
+        path,
+        std::fs::Permissions::from_mode(target_mode(existing_metadata)),
+    )?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn set_final_permissions(
+    _path: &Path,
+    _existing_metadata: Option<&std::fs::Metadata>,
+) -> Result<(), MemoryError> {
+    Ok(())
+}
+
+#[cfg(unix)]
+fn target_mode(existing_metadata: Option<&std::fs::Metadata>) -> u32 {
+    use std::os::unix::fs::PermissionsExt;
+
+    existing_metadata
+        .map(|metadata| metadata.permissions().mode() & 0o777)
+        .unwrap_or(0o644)
+}
+
+#[cfg(unix)]
+fn sync_parent_dir(path: &Path) -> Result<(), MemoryError> {
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::File::open(parent)?.sync_all()?;
+        }
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn sync_parent_dir(_path: &Path) -> Result<(), MemoryError> {
     Ok(())
 }
 
@@ -177,6 +306,13 @@ mod tests {
     }
 
     #[test]
+    fn upsert_appends_after_crlf_user_content_with_crlf_separator() {
+        let block = render_block(PROTO);
+        let out = upsert_block("# My rules\r\n", &block).unwrap();
+        assert_eq!(out, format!("# My rules\r\n\r\n{block}"));
+    }
+
+    #[test]
     fn upsert_replaces_stale_block_byte_identical_to_fresh() {
         let block = render_block(PROTO);
         let stale = format!("{BEGIN_MARKER}\n{NOTICE}\nOLD STALE PROTOCOL\n{END_MARKER}\n");
@@ -195,6 +331,15 @@ mod tests {
         assert_eq!(out, format!("ABOVE LINE\n\n{block}\nBELOW LINE\n"));
         assert!(out.starts_with("ABOVE LINE\n\n"));
         assert!(out.ends_with("\nBELOW LINE\n"));
+    }
+
+    #[test]
+    fn upsert_preserves_crlf_content_around_block() {
+        let block = render_block(PROTO);
+        let existing =
+            format!("ABOVE LINE\r\n{BEGIN_MARKER}\r\nOLD\r\n{END_MARKER}\r\nBELOW LINE\r\n");
+        let out = upsert_block(&existing, &block).unwrap();
+        assert_eq!(out, format!("ABOVE LINE\r\n{block}BELOW LINE\r\n"));
     }
 
     #[test]
@@ -267,5 +412,47 @@ mod tests {
         let outcome = write_rules_file(&path, PROTO).unwrap();
         assert_eq!(outcome, WriteOutcome::Created);
         assert!(path.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_rules_file_preserves_existing_unix_mode() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("AGENTS.md");
+        std::fs::write(&path, "# Private rules\n").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+        let outcome = write_rules_file(&path, PROTO).unwrap();
+
+        assert_eq!(outcome, WriteOutcome::Updated);
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "existing file mode must be preserved");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_rules_file_rejects_symlink_targets_without_touching_target() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("real.md");
+        let link = dir.path().join("AGENTS.md");
+        std::fs::write(&real, "# Real target\n").unwrap();
+        symlink(&real, &link).unwrap();
+
+        let err = write_rules_file(&link, PROTO).unwrap_err();
+
+        assert!(matches!(err, MemoryError::Validation(_)));
+        assert!(std::fs::symlink_metadata(&link)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert_eq!(
+            std::fs::read_to_string(&real).unwrap(),
+            "# Real target\n",
+            "symlink target content must be untouched"
+        );
     }
 }

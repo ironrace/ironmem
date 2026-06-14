@@ -269,7 +269,7 @@ Required behavior:
 
 Recommended implementation:
 
-- [x] Include protocol text in plugin docs and default prompt metadata (`defaultPrompt` in `.codex-plugin/plugin.json`)
+- [x] Keep protocol text single-sourced in `MEMORY_PROTOCOL`; Codex rules-file adoption is via explicit `ironmem write-rules`
 - [x] Return a concise protocol reminder from `status` (`MEMORY_PROTOCOL` constant in `bootstrap.rs`, surfaced via `tools.rs`)
 - [x] Keep the prompt short and operational
 

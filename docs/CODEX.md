@@ -234,7 +234,15 @@ Current behavior for Codex:
 
 ## Memory Usage Guidance
 
-Codex adopts the memory protocol via `ironmem write-rules --target AGENTS.md` (single source: the `MEMORY_PROTOCOL` constant in `crates/ironmem/src/bootstrap.rs`).
+Codex adopts the memory protocol through a managed rules-file block sourced from
+the `MEMORY_PROTOCOL` constant in `crates/ironmem/src/bootstrap.rs`:
+
+```bash
+ironmem write-rules --target AGENTS.md
+```
+
+This is explicit opt-in only; no hook or plugin path runs `write-rules`
+automatically.
 
 ## Benchmarking Against MemPalace
 
