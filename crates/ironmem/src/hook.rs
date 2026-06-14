@@ -1909,6 +1909,29 @@ mod tests {
         }
     }
 
+    /// Bulk-seed `n` drawers in a single transaction so the 10k-drawer timing
+    /// test sets up quickly (one COMMIT instead of `n` implicit commits).
+    ///
+    /// Content is FTS5-tokenizable: every row shares the tokens `drawer token
+    /// alpha beta gamma context entry number` and carries its own unique index
+    /// `{i}`. FTS5 MATCH is implicit-AND, so a prompt built only from the shared
+    /// tokens (optionally plus an index that exists) matches; a prompt with any
+    /// token absent from every row matches nothing.
+    fn seed_db_file_bulk(path: &std::path::Path, n: usize) {
+        use ironrace_embed::embedder::EMBED_DIM;
+        let db = crate::db::schema::Database::open(path).unwrap();
+        db.migrate().unwrap();
+        let zero = vec![0.0f32; EMBED_DIM];
+        db.exec_raw("BEGIN").unwrap();
+        for i in 0..n {
+            let content = format!("drawer {i} token alpha beta gamma context entry number {i}");
+            let id = generate_id(&content, "bench", "general");
+            db.insert_drawer(&id, &content, &zero, "bench", "general", "test", "test")
+                .unwrap();
+        }
+        db.exec_raw("COMMIT").unwrap();
+    }
+
     fn prompt_hook_config(db_path: std::path::PathBuf, state_dir: std::path::PathBuf) -> Config {
         Config {
             db_path,
@@ -2200,5 +2223,76 @@ mod tests {
             cmd.contains("ironmem-hook.sh user-prompt-submit"),
             "got: {cmd}"
         );
+    }
+
+    /// PR exit-criteria gate: on a 10,000-drawer DB the UserPromptSubmit hook
+    /// must (a) inject for a relevant prompt and emit nothing for an unrelated
+    /// one, and (b) keep p95 latency under the 150ms budget. The worker-thread
+    /// budget guard caps the search at the budget by construction, so the real
+    /// signal here is that normal queries COMPLETE (inject) rather than time
+    /// out, while p95 stays under budget. Do not weaken this gate to get green.
+    #[test]
+    fn prompt_hook_p95_under_budget_on_10k_drawers() {
+        use std::time::Instant;
+        let _env = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("IRONMEM_PROMPT_HOOK_BUDGET_MS", "150");
+
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("m.sqlite3");
+        seed_db_file_bulk(&db_path, 10_000);
+
+        // Correctness: relevant prompt injects; unrelated emits nothing.
+        // Every shared token is present in every drawer, so this is a guaranteed
+        // implicit-AND match.
+        let hit = run_hook_with_input(
+            "user-prompt-submit",
+            "claude-code",
+            prompt_hook_config(db_path.clone(), dir.path().join("s_hit")),
+            serde_json::json!({ "prompt": "drawer token alpha beta", "session_id": "t1" }),
+        )
+        .unwrap();
+        assert!(
+            hit.hook_specific_output.is_some(),
+            "relevant prompt should inject"
+        );
+        // None of these tokens appears in any seeded drawer, so implicit-AND
+        // yields zero matches.
+        let miss = run_hook_with_input(
+            "user-prompt-submit",
+            "claude-code",
+            prompt_hook_config(db_path.clone(), dir.path().join("s_miss")),
+            serde_json::json!({ "prompt": "zzqqxx nonexistent qwerty", "session_id": "t2" }),
+        )
+        .unwrap();
+        assert!(
+            miss.hook_specific_output.is_none(),
+            "unrelated prompt should emit nothing"
+        );
+
+        // Latency: p95 over N runs <= 150ms.
+        let n = 40;
+        let mut samples = Vec::with_capacity(n);
+        for i in 0..n {
+            let cfg = prompt_hook_config(db_path.clone(), dir.path().join(format!("s{i}")));
+            // `number {i}` exists for i < 10_000, so each run is a real match.
+            let prompt = format!("drawer token alpha number {i}");
+            let t = Instant::now();
+            let _ = run_hook_with_input(
+                "user-prompt-submit",
+                "claude-code",
+                cfg,
+                serde_json::json!({ "prompt": prompt, "session_id": "t1" }),
+            )
+            .unwrap();
+            samples.push(t.elapsed().as_millis() as u64);
+        }
+        samples.sort_unstable();
+        let p95 = samples[((n as f64 * 0.95) as usize).saturating_sub(1)];
+        assert!(
+            p95 <= 150,
+            "p95 {p95}ms exceeds 150ms budget; samples={samples:?}"
+        );
+
+        std::env::remove_var("IRONMEM_PROMPT_HOOK_BUDGET_MS");
     }
 }
