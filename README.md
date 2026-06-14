@@ -111,6 +111,7 @@ Codex and Claude Code read from and write to the **same database by default** (`
 The DB is updated automatically as you work:
 
 - **Session start** — bootstrap runs if this is the first time; the workspace is mined if it hasn't been indexed yet
+- **UserPromptSubmit** (Claude Code only) — every prompt triggers a budget-bounded FTS/BM25 drawer lookup (embedder never loaded) that injects up to 3 sanitized untrusted-memory excerpts as `additionalContext`; see [docs/CODEX.md](docs/CODEX.md) for the `IRONMEM_PROMPT_HOOK_*` tunables
 - **Stop / PreCompact** — changed files are detected via SHA-256 manifest and re-mined incrementally; a session summary is appended to the diary
 - **Later sessions** — only files whose content hash changed since the last hook run are re-embedded, so updates are fast
 
@@ -227,6 +228,17 @@ Bound how many triples the KG layer serves and walks so a well-connected hub ent
 |---|---|---|
 | `IRONMEM_KG_QUERY_LIMIT` | `50` | Max currently-valid triples `query_entity_current` returns (the `kg_query` tool and the KG-boost 1-hop fetch). Truncation is deterministic — ordered by `extracted_at DESC, id ASC`. `0` falls back to the default. |
 | `IRONMEM_KG_BOOST_FANOUT` | `32` | Max distinct related entities the KG boost walks to across all mentioned entities, bounding the per-triple entity lookups a high-degree hub would otherwise trigger unbounded. `0` falls back to the default. |
+
+### UserPromptSubmit FTS injection (Claude Code only)
+
+On every prompt, ironmem runs an FTS/BM25-only drawer lookup (the embedder is never loaded) and injects up to 3 sanitized one-line untrusted-memory excerpts as `hookSpecificOutput.additionalContext`, under a hard wall-clock budget. On overrun, lock contention, or no qualifying hit it emits nothing and exits 0. Codex registers no UserPromptSubmit hook.
+
+| Variable | Default | Effect |
+|---|---|---|
+| `IRONMEM_PROMPT_HOOK_BUDGET_MS` | `150` | Hard wall-clock budget for the whole hook, milliseconds. Non-positive/unparseable falls back to the default; capped at `1000`. |
+| `IRONMEM_PROMPT_HOOK_MAX_HITS` | `3` | Max memory excerpts injected per prompt. Clamped to `1`–`3`. |
+| `IRONMEM_PROMPT_HOOK_MIN_SCORE` | `0.0` | Minimum BM25 score a hit must clear (higher = better). `0.0` lets any FTS match through, since `MATCH` already filters relevance. |
+| `IRONMEM_PROMPT_HOOK_SUMMARY_MAX_BYTES` | `120` | Byte cap for each injected one-line excerpt. |
 
 ### Metrics (instrumentation; on by default)
 

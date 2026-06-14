@@ -303,13 +303,18 @@ fn run_user_prompt_submit(
         && crate::search::tunables::metrics_enabled()
         && config.mcp_access_mode.allows_writes()
     {
+        // Cap the occupancy budget at the reserve so a contended best-effort
+        // sample (which blocks on `recv_timeout`/`open_with_busy_timeout` for
+        // the passed budget) can never consume the full ~120ms search-class
+        // remainder under DB-lock contention.
+        let occ_budget = remaining.min(Duration::from_millis(PROMPT_HOOK_OCCUPANCY_RESERVE_MS));
         sample_prompt_occupancy(
             config,
             harness,
             session_id,
             workspace_root,
             transcript_path,
-            remaining,
+            occ_budget,
         );
     }
 
@@ -352,6 +357,9 @@ fn bm25_prompt_block(db_path: &Path, prompt: &str, busy: Duration) -> Option<Str
     let max_hits = crate::search::tunables::prompt_hook_max_hits();
     let line_bytes = crate::search::tunables::prompt_hook_summary_max_bytes();
 
+    // Overfetch `max_hits * 3` so the `prompt_hook_min_bm25_score` floor filter
+    // below has room to drop low-scorers before `take(max_hits)`; simplifying
+    // this to `max_hits` would starve a floor-filtered config of candidates.
     let scored = db.bm25_search(prompt, max_hits * 3, None, None).ok()?;
     let qualifying: Vec<(String, f32)> = scored
         .into_iter()

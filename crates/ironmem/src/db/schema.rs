@@ -52,6 +52,12 @@ impl Database {
     /// that must never pay the default 5 s busy timeout or run schema
     /// migrations. Uses `SQLITE_OPEN_READ_WRITE` WITHOUT `_CREATE`, so a missing
     /// file errors instead of being silently created.
+    ///
+    /// The `0o600` owner-only permission hardening that [`Self::open`] applies is
+    /// intentionally delegated to `open`: this opener never creates the file (no
+    /// `_CREATE` flag), so the file already exists and was hardened by whichever
+    /// `open` call created it. Re-applying the chmod here would only add a syscall
+    /// to a latency-critical hot path.
     pub fn open_with_busy_timeout(path: &Path, busy: Duration) -> Result<Self, MemoryError> {
         let conn = Connection::open_with_flags(
             path,

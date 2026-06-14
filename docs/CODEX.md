@@ -111,9 +111,19 @@ The database is kept up to date automatically through hooks:
 
 On every prompt, ironmem runs an FTS/BM25-only drawer lookup (the embedder is
 never loaded) and injects up to 3 sanitized one-line memory matches as
-`hookSpecificOutput.additionalContext`. Hard latency budget
-`IRONMEM_PROMPT_HOOK_BUDGET_MS` (default 150 ms); on overrun or no match it emits
-nothing and exits 0. Codex registers no UserPromptSubmit hook.
+`hookSpecificOutput.additionalContext`. On overrun or no match it emits nothing
+and exits 0. Codex registers no UserPromptSubmit hook.
+
+Tunables (all fresh-read per invocation):
+
+- `IRONMEM_PROMPT_HOOK_BUDGET_MS` — hard wall-clock budget, ms (default `150`,
+  capped `1000`).
+- `IRONMEM_PROMPT_HOOK_MAX_HITS` — max excerpts injected per prompt (default `3`,
+  clamped `1`–`3`).
+- `IRONMEM_PROMPT_HOOK_MIN_SCORE` — minimum BM25 score a hit must clear, higher =
+  better (default `0.0`; any FTS match passes).
+- `IRONMEM_PROMPT_HOOK_SUMMARY_MAX_BYTES` — byte cap per injected one-line excerpt
+  (default `120`).
 
 Incremental re-mining uses a SHA-256 manifest so only files whose content changed are re-embedded. Repeat hook runs on unchanged workspaces are fast.
 

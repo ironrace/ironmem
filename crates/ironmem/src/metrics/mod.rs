@@ -293,8 +293,23 @@ pub(crate) fn record_occupancy_sample(
             None
         },
         peak_occupancy_pct: occ,
-        total_input_tokens: u.input_tokens,
-        total_output_tokens: u.output_tokens,
+        // `user-prompt-submit` fires on EVERY prompt and re-reads the same
+        // last-assistant cumulative usage from the transcript tail each time.
+        // Accumulating those into the summary token totals would double-count
+        // tokens the lifecycle hooks (session-stop/precompact) already add, so
+        // zero the per-event delta here (mirroring `mcp_chars_served: 0`). The
+        // occupancy_samples row above still carries the real usage, and
+        // `peak_occupancy_pct` still updates.
+        total_input_tokens: if hook_event == "user-prompt-submit" {
+            0
+        } else {
+            u.input_tokens
+        },
+        total_output_tokens: if hook_event == "user-prompt-submit" {
+            0
+        } else {
+            u.output_tokens
+        },
         mcp_chars_served: 0,
         compactions: if hook_event == "precompact" { 1 } else { 0 },
     };
@@ -527,6 +542,55 @@ mod tests {
         assert!(
             ctx.collab_session_id.is_none() && ctx.collab_phase.is_none() && ctx.task_tag.is_none()
         );
+    }
+
+    #[test]
+    fn user_prompt_submit_does_not_accumulate_summary_tokens() {
+        // `user-prompt-submit` fires per prompt and re-reads the same cumulative
+        // transcript usage each time; without the per-event zeroing the summary
+        // token totals would double-count. Two calls with non-zero usage must
+        // leave the summary token totals at 0 while still writing sample rows.
+        let app = test_app();
+        let usage = Some(Usage {
+            input_tokens: 1234,
+            output_tokens: 56,
+            cache_creation_input_tokens: 0,
+            cache_read_input_tokens: 78,
+        });
+        for _ in 0..2 {
+            record_occupancy_sample(
+                &app.db,
+                "claude",
+                "ups-sess",
+                Some("/tmp/repo"),
+                "user-prompt-submit",
+                usage,
+                200_000,
+            );
+        }
+
+        let summary = app
+            .db
+            .get_session_summary("ups-sess")
+            .unwrap()
+            .expect("summary row exists");
+        assert_eq!(
+            summary.total_input_tokens, 0,
+            "per-prompt usage must not accumulate into summary input tokens"
+        );
+        assert_eq!(
+            summary.total_output_tokens, 0,
+            "per-prompt usage must not accumulate into summary output tokens"
+        );
+
+        // The occupancy sample rows themselves are still written with real usage.
+        let samples = app
+            .db
+            .occupancy_samples_for_session("ups-sess", 10)
+            .unwrap();
+        assert_eq!(samples.len(), 2, "one occupancy sample row per call");
+        assert_eq!(samples[0].input_tokens, 1234);
+        assert_eq!(samples[0].cache_read_input_tokens, 78);
     }
 
     #[test]
