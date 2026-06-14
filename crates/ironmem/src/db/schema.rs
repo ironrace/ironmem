@@ -47,6 +47,27 @@ impl Database {
         Ok(Self { conn })
     }
 
+    /// Open an EXISTING database with a caller-bounded busy timeout and **no
+    /// migration**. For latency-critical hot paths (the UserPromptSubmit hook)
+    /// that must never pay the default 5 s busy timeout or run schema
+    /// migrations. Uses `SQLITE_OPEN_READ_WRITE` WITHOUT `_CREATE`, so a missing
+    /// file errors instead of being silently created.
+    ///
+    /// The `0o600` owner-only permission hardening that [`Self::open`] applies is
+    /// intentionally delegated to `open`: this opener never creates the file (no
+    /// `_CREATE` flag), so the file already exists and was hardened by whichever
+    /// `open` call created it. Re-applying the chmod here would only add a syscall
+    /// to a latency-critical hot path.
+    pub fn open_with_busy_timeout(path: &Path, busy: Duration) -> Result<Self, MemoryError> {
+        let conn = Connection::open_with_flags(
+            path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )?;
+        conn.busy_timeout(busy)?;
+        conn.execute_batch("PRAGMA foreign_keys=ON;")?;
+        Ok(Self { conn })
+    }
+
     /// Execute raw SQL against the connection. Test-only fixture for putting the
     /// schema into a failure state (e.g. dropping a table) so error-propagation
     /// paths can be exercised. Compiled out of release builds.
@@ -305,6 +326,33 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("sub").join("test.db");
         (dir, db_path)
+    }
+
+    #[test]
+    fn open_with_busy_timeout_reads_without_migrating() {
+        use std::time::Duration;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("m.sqlite3");
+        {
+            let db = Database::open(&path).unwrap();
+            db.migrate().unwrap();
+        }
+        let db = Database::open_with_busy_timeout(&path, Duration::from_millis(50)).unwrap();
+        let n = db.count_drawers(None).unwrap();
+        assert_eq!(n, 0);
+    }
+
+    #[test]
+    fn open_with_busy_timeout_errors_on_missing_file() {
+        use std::time::Duration;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("nope.sqlite3");
+        let result = Database::open_with_busy_timeout(&path, Duration::from_millis(50));
+        assert!(
+            result.is_err(),
+            "missing DB file must error, not be created"
+        );
+        assert!(!path.exists(), "must not create the file");
     }
 
     #[test]

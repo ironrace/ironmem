@@ -20,6 +20,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **UserPromptSubmit FTS-injection hook (Claude Code):** a new `user-prompt-submit`
+  hook runs an FTS/BM25-only drawer search on **every** prompt and injects up to 3
+  sanitized one-line untrusted-memory excerpts via
+  `HookResponse.hookSpecificOutput.additionalContext`, under a hard wall-clock
+  `IRONMEM_PROMPT_HOOK_BUDGET_MS` budget (default 150 ms, capped 1000). The embedder
+  is **never** loaded (no `App` construction); on overrun, lock contention,
+  missing/empty prompt, or no qualifying hit it emits nothing and exits 0
+  (fail-closed). Claude-Code-only — Codex registers no UserPromptSubmit hook and
+  restricted mode injects nothing. Four new tunables: `IRONMEM_PROMPT_HOOK_BUDGET_MS`,
+  `IRONMEM_PROMPT_HOOK_MAX_HITS` (default 3, clamped 1–3),
+  `IRONMEM_PROMPT_HOOK_MIN_SCORE` (default 0.0), and
+  `IRONMEM_PROMPT_HOOK_SUMMARY_MAX_BYTES` (default 120). New public DB API
+  `Database::open_with_busy_timeout` opens an existing DB with a caller-bounded
+  busy timeout and no migration for this latency-critical path.
 - **SessionStart `additionalContext` injection (Claude Code):** the `session-start`
   hook now emits a compact memory-status block via
   `HookResponse.hookSpecificOutput.additionalContext` — drawer/wing/room counts
