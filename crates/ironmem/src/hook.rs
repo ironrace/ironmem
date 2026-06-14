@@ -315,12 +315,15 @@ fn run_user_prompt_submit(
         }
     }
 
-    // Best-effort, budget-gated occupancy: only if we still have headroom and the
-    // same metrics/write gates the other hooks use.
+    // Best-effort, budget-gated occupancy: only if we still have headroom and
+    // metrics are enabled. Like precompact/stop (issue #113), this is decoupled
+    // from `allows_writes` — occupancy is metrics-only telemetry (token counts /
+    // occupancy %, no memory content), and the UPS hook command in settings.json
+    // defaults to ReadOnly, so coupling it to the content-write gate meant it
+    // never banked a row in production.
     let remaining = budget.checked_sub(start.elapsed()).unwrap_or_default();
     if remaining >= Duration::from_millis(PROMPT_HOOK_OCCUPANCY_RESERVE_MS)
         && crate::search::tunables::metrics_enabled()
-        && config.mcp_access_mode.allows_writes()
     {
         // Cap the occupancy budget at the reserve so a contended best-effort
         // sample (which blocks on `recv_timeout`/`open_with_busy_timeout` for
@@ -2357,6 +2360,49 @@ mod tests {
                 [], |r| r.get(0))?)
         }).unwrap();
         assert_eq!(n, 1);
+        std::env::remove_var("IRONMEM_METRICS");
+    }
+
+    #[test]
+    fn read_only_prompt_hook_records_occupancy_sample() {
+        // Issue #113: the UserPromptSubmit occupancy site must decouple from the
+        // content-write gate exactly like precompact/stop. The hook commands in
+        // settings.json default to ReadOnly, so coupling UPS occupancy to
+        // `allows_writes` (Trusted only) meant it never banked a row in
+        // production. ReadOnly does not redact, so the UPS path reaches the
+        // occupancy block; this asserts it now samples there too.
+        use crate::metrics::METRICS_ENV_LOCK;
+        let _env = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let _g = METRICS_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("IRONMEM_METRICS", "1");
+
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("m.sqlite3");
+        seed_db_file(&db_path, &[("postgres pgbouncer pooling", "i", "d")]);
+
+        let transcript = dir.path().join("t.jsonl");
+        std::fs::write(&transcript,
+            "{\"type\":\"assistant\",\"message\":{\"usage\":{\"input_tokens\":1000,\"output_tokens\":5,\"cache_read_input_tokens\":0}}}\n",
+        ).unwrap();
+
+        let mut cfg = prompt_hook_config(db_path.clone(), dir.path().join("state"));
+        cfg.mcp_access_mode = crate::config::McpAccessMode::ReadOnly;
+        let _ = run_hook_with_input(
+            "user-prompt-submit",
+            "claude-code",
+            cfg,
+            serde_json::json!({ "prompt": "postgres", "session_id": "ro-occ-1",
+                                "transcript_path": transcript.to_string_lossy() }),
+        )
+        .unwrap();
+
+        let db = crate::db::schema::Database::open(&db_path).unwrap();
+        let n: i64 = db.with_connection(|c| {
+            Ok(c.query_row(
+                "SELECT COUNT(*) FROM occupancy_samples WHERE hook_event = 'user-prompt-submit' AND session_id = 'ro-occ-1'",
+                [], |r| r.get(0))?)
+        }).unwrap();
+        assert_eq!(n, 1, "ReadOnly UPS hook must still bank occupancy");
         std::env::remove_var("IRONMEM_METRICS");
     }
 

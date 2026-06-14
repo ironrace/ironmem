@@ -587,9 +587,11 @@ destination, or reporting query changed.
   additionally (and undocumentedly) required `mcp_access_mode == Trusted`
   (`allows_writes`). The lifecycle hook commands in `~/.claude/settings.json` invoke
   `ironmem hook …` without `IRONMEM_MCP_MODE`, so they ran ReadOnly and banked **zero**
-  `occupancy_samples` rows. The hook now samples occupancy whenever
-  `metrics_enabled()` is true, regardless of access mode, bringing the code in line
-  with §8.3. This is safe: `occupancy_samples`/`session_summary` carry only token
+  `occupancy_samples` rows. Occupancy now fires whenever `metrics_enabled()` is true,
+  regardless of access mode, at **all three** sampling sites — `precompact`, `stop`,
+  and `user-prompt-submit` (the UPS site is additionally budget-gated on remaining
+  hook headroom, but no longer on `allows_writes`) — bringing the code in line with
+  §8.3. This is safe: `occupancy_samples`/`session_summary` carry only token
   counts and occupancy %, no memory content; the SQLite connection always opens
   `READ_WRITE` (access mode is a pure application-level gate); and the **content**-write
   paths (bootstrap/mining/diary) remain gated on `allows_writes`. No counter name,
