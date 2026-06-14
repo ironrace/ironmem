@@ -473,11 +473,17 @@ mod tests {
         std::env::set_var("IRONMEM_PROMPT_HOOK_MIN_SCORE", "2.5");
         assert_eq!(prompt_hook_min_bm25_score(), 2.5);
 
+        std::env::set_var("IRONMEM_PROMPT_HOOK_MIN_SCORE", "not_a_float");
+        assert_eq!(prompt_hook_min_bm25_score(), 0.0);
         std::env::remove_var("IRONMEM_PROMPT_HOOK_MIN_SCORE");
 
         std::env::remove_var("IRONMEM_PROMPT_HOOK_SUMMARY_MAX_BYTES");
         assert_eq!(prompt_hook_summary_max_bytes(), 120);
 
+        std::env::set_var("IRONMEM_PROMPT_HOOK_SUMMARY_MAX_BYTES", "80");
+        assert_eq!(prompt_hook_summary_max_bytes(), 80);
+        std::env::set_var("IRONMEM_PROMPT_HOOK_SUMMARY_MAX_BYTES", "bad");
+        assert_eq!(prompt_hook_summary_max_bytes(), 120);
         std::env::remove_var("IRONMEM_PROMPT_HOOK_SUMMARY_MAX_BYTES");
     }
 
