@@ -377,14 +377,47 @@ fn bm25_prompt_block(db_path: &Path, prompt: &str, busy: Duration) -> Option<Str
     ))
 }
 
-/// Placeholder; real body added in Task 4. Kept as a no-op so this task compiles.
+/// Best-effort occupancy sample for the prompt hook. Opens its own budget-bounded
+/// writable connection (no `App`); reuses the shared transcript-tail scan and
+/// `record_occupancy_sample`. Silently no-ops on any failure.
 fn sample_prompt_occupancy(
-    _config: &Config,
-    _harness: &str,
-    _session_id: Option<&str>,
-    _workspace_root: Option<&Path>,
-    _transcript_path: Option<&Path>,
+    config: &Config,
+    harness: &str,
+    session_id: Option<&str>,
+    workspace_root: Option<&Path>,
+    transcript_path: Option<&Path>,
 ) {
+    let Some(event) = crate::metrics::hook_event_for("user-prompt-submit") else {
+        return;
+    };
+    let Some(session_id) = session_id else { return };
+    if session_id == "unknown" {
+        return;
+    }
+    let Ok(db) = crate::db::schema::Database::open_with_busy_timeout(
+        &config.db_path,
+        Duration::from_millis(crate::search::tunables::prompt_hook_budget_ms()),
+    ) else {
+        return;
+    };
+    let harness_norm = if harness.starts_with("codex") {
+        "codex"
+    } else {
+        "claude"
+    };
+    let usage = transcript_path
+        .and_then(read_transcript_tail)
+        .and_then(|raw| crate::metrics::extract_last_assistant_usage(&raw));
+    let workspace = workspace_root.map(|p| p.to_string_lossy().to_string());
+    crate::metrics::record_occupancy_sample(
+        &db,
+        harness_norm,
+        session_id,
+        workspace.as_deref(),
+        event,
+        usage,
+        crate::search::tunables::context_window(),
+    );
 }
 
 fn read_transcript_tail(path: &Path) -> Option<String> {
@@ -2026,6 +2059,41 @@ mod tests {
             v.get("hookSpecificOutput").is_none(),
             "codex has no additionalContext channel"
         );
+    }
+
+    #[test]
+    fn prompt_hook_writes_occupancy_sample() {
+        use crate::metrics::METRICS_ENV_LOCK;
+        let _g = METRICS_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("IRONMEM_METRICS", "1");
+
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("m.sqlite3");
+        seed_db_file(&db_path, &[("postgres pgbouncer pooling", "i", "d")]);
+
+        let transcript = dir.path().join("t.jsonl");
+        std::fs::write(&transcript,
+            "{\"type\":\"assistant\",\"message\":{\"usage\":{\"input_tokens\":1000,\"output_tokens\":5,\"cache_read_input_tokens\":0}}}\n",
+        ).unwrap();
+
+        let cfg = prompt_hook_config(db_path.clone(), dir.path().join("state"));
+        let _ = run_hook_with_input(
+            "user-prompt-submit",
+            "claude-code",
+            cfg,
+            serde_json::json!({ "prompt": "postgres", "session_id": "occ-1",
+                                "transcript_path": transcript.to_string_lossy() }),
+        )
+        .unwrap();
+
+        let db = crate::db::schema::Database::open(&db_path).unwrap();
+        let n: i64 = db.with_connection(|c| {
+            Ok(c.query_row(
+                "SELECT COUNT(*) FROM occupancy_samples WHERE hook_event = 'user-prompt-submit' AND session_id = 'occ-1'",
+                [], |r| r.get(0))?)
+        }).unwrap();
+        assert_eq!(n, 1);
+        std::env::remove_var("IRONMEM_METRICS");
     }
 
     #[test]
