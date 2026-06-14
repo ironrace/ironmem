@@ -93,9 +93,9 @@ Stored in `collab_sessions`:
 | `current_owner` | Agent whose turn it is (`claude` or `codex`) |
 | `claude_draft_hash`, `codex_draft_hash` | SHA-256 of each first draft |
 | `canonical_plan_hash` | SHA-256 of Claude's synthesis |
-| `canonical_plan` | Latest `canonical` message content (present when `canonical_plan_hash` is set). Lets a fresh agent rejoining mid-planning pull back its own earlier synthesis without a counterpart `recv`. |
+| `canonical_plan` / `canonical_plan_ref` | The latest `canonical` plan (present when `canonical_plan_hash` is set). By default returned as a compact `canonical_plan_ref` `{drawer_id, hash, first_200_chars}`; with `verbose:true` the full `canonical_plan` string (already-parsed text) is inlined. Lets a fresh agent rejoining mid-planning pull back its own earlier synthesis without a counterpart `recv`. See "Plan-by-reference contract". |
 | `final_plan_hash` | SHA-256 of the locked plan |
-| `final_plan` | Latest `final` message content as sent — the JSON string `{"plan":"<full text>"}` (present when `final_plan_hash` is set). Primary input to the v3 `task_list` bridge after `PlanLocked`. |
+| `final_plan` / `final_plan_ref` | The locked `final` plan (present when `final_plan_hash` is set). By default returned as a compact `final_plan_ref` `{drawer_id, hash, first_200_chars}`; with `verbose:true` the full `final_plan` string (already-parsed plan text, no `{"plan":...}` unwrap) is inlined. Primary input to the v3 `task_list` bridge after `PlanLocked`. See "Plan-by-reference contract". |
 | `codex_review_verdict` | Last Codex verdict |
 | `review_round` | Number of completed Codex reviews (0, 1, or 2) |
 | `ended_at` | Non-null once `collab_end` has been called |
@@ -511,6 +511,26 @@ Marks a message consumed. Session-scoped: a mismatched
 Returns the full session record including `phase`, `current_owner`, `task`,
 `review_round`, `ended_at`, and all hashes. Call this before every protocol
 action.
+
+#### Plan-by-reference contract
+
+Accepted plan bodies are returned by reference by default to keep the status
+payload compact:
+
+- **Default (`verbose` false or omitted):** the accepted `canonical` and
+  `final` plans are returned as compact references —
+  `canonical_plan_ref` / `final_plan_ref` = `{drawer_id, hash,
+  first_200_chars}`. The full plan strings are omitted.
+- **`verbose:true`:** additionally inlines the full `canonical_plan` /
+  `final_plan` string. Callers that need the approved plan body (e.g. the v3
+  `task_list` bridge, or recovering a prior canonical on a revision round)
+  must pass `verbose:true`.
+- The `final` (and `canonical`) drawer body is the **already-parsed plan
+  text** — consumers no longer need to unwrap the legacy
+  `{"plan":"<full text>"}` JSON, and the `hash` verifies that parsed body.
+- **Backward compatibility:** pre-009 sessions (NULL drawer id) keep the
+  legacy behavior — the full plan text is inlined under `canonical_plan` /
+  `final_plan` regardless of `verbose`.
 
 ### `collab_approve`
 
