@@ -558,25 +558,42 @@ fn compact_excerpt(text: &str, max_bytes: usize) -> String {
     truncate_text_to_byte_limit(out.trim_end(), max_bytes)
 }
 
+/// Sort `(name, count)` pairs by count descending (ascending name tie-break for
+/// determinism), take the top `n`, and format each as `name:count`. The DB
+/// count helpers (`wing_counts`/`room_counts`) return rows alphabetically, so
+/// this re-sort is what surfaces the largest buckets.
+fn top_counts(mut pairs: Vec<(String, usize)>, n: usize) -> Vec<String> {
+    pairs.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    pairs
+        .into_iter()
+        .take(n)
+        .map(|(name, count)| format!("{name}:{count}"))
+        .collect()
+}
+
 /// Build the compact session-start memory block (Claude Code only). Every read
 /// is best-effort: on a DB error we `warn!` and drop that line rather than fail
-/// the hook. Returns `None` only if nothing could be assembled. The active
-/// collab session and diary pointer come from the DB because this hook runs in
-/// a separate process where `App::active_collab_session_snapshot()` is empty.
+/// the hook. `MEMORY_PROTOCOL` is always included with a reserved byte budget so
+/// a pile of long wing/room names can never truncate the one behavior-changing
+/// line; the status lines share whatever budget is left and may be dropped or
+/// truncated. The active collab session and diary pointer come from the DB
+/// because this hook runs in a separate process where
+/// `App::active_collab_session_snapshot()` is empty.
 fn build_session_start_context(app: &App, workspace_root: Option<&Path>) -> Option<String> {
     let mut lines: Vec<String> = Vec::new();
 
-    // 1. Drawer total + top wings (re-sorted by count desc; DB returns alphabetical).
+    // 1. Drawer total + top wings (largest first; the DB returns them alphabetically).
     match app.db.count_drawers(None) {
         Ok(total) => {
-            let mut wings = app.db.wing_counts().unwrap_or_default();
-            wings.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+            let wings = match app.db.wing_counts() {
+                Ok(wings) => wings,
+                Err(e) => {
+                    tracing::warn!("session-start context: wing counts unavailable: {e}");
+                    Vec::new()
+                }
+            };
             let n_wings = wings.len();
-            let top: Vec<String> = wings
-                .iter()
-                .take(SESSION_CONTEXT_TOP_N)
-                .map(|(w, c)| format!("{w}:{c}"))
-                .collect();
+            let top = top_counts(wings, SESSION_CONTEXT_TOP_N);
             if top.is_empty() {
                 lines.push(format!("[ironmem] {total} drawers"));
             } else {
@@ -589,15 +606,10 @@ fn build_session_start_context(app: &App, workspace_root: Option<&Path>) -> Opti
         Err(e) => tracing::warn!("session-start context: drawer counts unavailable: {e}"),
     }
 
-    // 1b. Top rooms across all wings (count desc).
+    // 1b. Top rooms across all wings (largest first).
     match app.db.room_counts(None) {
-        Ok(mut rooms) => {
-            rooms.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
-            let top: Vec<String> = rooms
-                .iter()
-                .take(SESSION_CONTEXT_TOP_N)
-                .map(|(r, c)| format!("{r}:{c}"))
-                .collect();
+        Ok(rooms) => {
+            let top = top_counts(rooms, SESSION_CONTEXT_TOP_N);
             if !top.is_empty() {
                 lines.push(format!("rooms (top: {})", top.join(", ")));
             }
@@ -632,19 +644,19 @@ fn build_session_start_context(app: &App, workspace_root: Option<&Path>) -> Opti
         Err(e) => tracing::warn!("session-start context: diary lookup failed: {e}"),
     }
 
-    // 4. Memory protocol (verbatim).
-    lines.push(format!(
-        "MEMORY_PROTOCOL: {}",
-        crate::bootstrap::MEMORY_PROTOCOL
-    ));
-
+    // 4. Memory protocol (verbatim) — reserve its budget so the status lines,
+    // not the protocol, absorb any truncation.
+    let protocol_line = format!("MEMORY_PROTOCOL: {}", crate::bootstrap::MEMORY_PROTOCOL);
     if lines.is_empty() {
-        return None;
+        return Some(protocol_line);
     }
-    Some(truncate_text_to_byte_limit(
-        &lines.join("\n"),
-        SESSION_CONTEXT_MAX_BYTES,
-    ))
+    let reserved = SESSION_CONTEXT_MAX_BYTES.saturating_sub(protocol_line.len() + 1);
+    let status = truncate_text_to_byte_limit(&lines.join("\n"), reserved);
+    if status.is_empty() {
+        Some(protocol_line)
+    } else {
+        Some(format!("{status}\n{protocol_line}"))
+    }
 }
 
 fn sanitize_path_for_log(raw: &str) -> String {
@@ -1368,6 +1380,30 @@ mod tests {
         assert!(
             block.len() <= SESSION_CONTEXT_MAX_BYTES,
             "within byte budget"
+        );
+    }
+
+    #[test]
+    fn session_start_context_preserves_memory_protocol_under_long_names() {
+        let app = App::open_for_test().unwrap();
+        // Many wings/rooms with long names so the status lines alone would blow
+        // the byte budget. MEMORY_PROTOCOL (the behavior-changing instruction)
+        // must still survive — it gets a reserved budget, never truncated off.
+        for w in 0..8 {
+            let wing = format!("w{w}{}", "x".repeat(200));
+            let room = format!("r{w}{}", "y".repeat(200));
+            for i in 0..2 {
+                seed_drawer(&app, &format!("body {w} {i}"), &wing, &room);
+            }
+        }
+        let block = build_session_start_context(&app, None).unwrap();
+        assert!(
+            block.contains("MEMORY_PROTOCOL"),
+            "memory protocol must survive truncation under long wing/room names"
+        );
+        assert!(
+            block.len() <= SESSION_CONTEXT_MAX_BYTES,
+            "still within byte budget"
         );
     }
 
