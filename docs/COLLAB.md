@@ -93,7 +93,8 @@ Stored in `collab_sessions`:
 | `current_owner` | Agent whose turn it is (`claude` or `codex`) |
 | `claude_draft_hash`, `codex_draft_hash` | SHA-256 of each first draft |
 | `canonical_plan_hash` | SHA-256 of Claude's synthesis |
-| `canonical_plan` / `canonical_plan_ref` | The latest `canonical` plan (present when `canonical_plan_hash` is set). By default returned as a compact `canonical_plan_ref` `{drawer_id, hash, first_200_chars}`; with `verbose:true` the full `canonical_plan` string (already-parsed text) is inlined. Lets a fresh agent rejoining mid-planning pull back its own earlier synthesis without a counterpart `recv`. See "Plan-by-reference contract". |
+| `canonical_plan` / `canonical_plan_ref` | The latest `canonical` plan (present when `canonical_plan_hash` is set). By default returned as a compact `canonical_plan_ref` `{drawer_id, hash, first_200_chars}`; with `verbose:true` the full `canonical_plan` string (raw synthesis text — `canonical` has no JSON envelope) is inlined. Lets a fresh agent rejoining mid-planning pull back its own earlier synthesis without a counterpart `recv`. See "Plan-by-reference contract". |
+| `canonical_plan_drawer_id` / `final_plan_drawer_id` | Deterministic 32-char id of the `collab-plans` drawer storing the canonical/final plan body once accepted (migration 009). NULL on pre-009 sessions → legacy inline path. |
 | `final_plan_hash` | SHA-256 of the locked plan |
 | `final_plan` / `final_plan_ref` | The locked `final` plan (present when `final_plan_hash` is set). By default returned as a compact `final_plan_ref` `{drawer_id, hash, first_200_chars}`; with `verbose:true` the full `final_plan` string is inlined as normalized, already-parsed plan text. No caller unwraps `{"plan":...}`, including legacy NULL-drawer sessions. Primary input to the v3 `task_list` bridge after `PlanLocked`. See "Plan-by-reference contract". |
 | `codex_review_verdict` | Last Codex verdict |
@@ -534,7 +535,15 @@ payload compact:
 - **Backward compatibility:** pre-009 sessions (NULL drawer id) keep the
   legacy inline path — the full plan text is inlined under
   `canonical_plan` / `final_plan` regardless of `verbose`, with `final_plan`
-  normalized to parsed plan text.
+  normalized to parsed plan text. These sessions emit **no**
+  `canonical_plan_ref` / `final_plan_ref`, so callers must not assume the
+  compact reference object is always present.
+- **Recall note:** accepted plan bodies are filed as drawers in the
+  dedicated `collab-plans` room with a zero embedding (kept out of vector
+  recall), but the generic drawer FTS index still sees their content, so an
+  unscoped keyword `search` can surface them. This is an accepted tradeoff
+  for issue #90; excluding `collab-plans` from default recall is tracked as a
+  follow-up.
 
 ### `collab_approve`
 

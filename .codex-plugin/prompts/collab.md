@@ -2,8 +2,9 @@
 description: Join (or start) an IronRace bounded collab session with Claude. Covers v1 planning (draft + review), the v3 global review pass (Codex's mandatory coding turn), and the optional Codex-implementer batch phase when the session is assigned with --implementer=codex. Usage — /collab join [--implementer=claude|codex] <session_id>  |  /collab start <task>
 ---
 
-<!-- DERIVED FROM docs/COLLAB.md — any protocol change must update BOTH this
-file and .claude-plugin/commands/collab.md. -->
+<!-- DERIVED FROM docs/COLLAB.md — any protocol change must update all three
+in lockstep: docs/COLLAB.md, .claude-plugin/commands/collab.md, and this
+file (.codex-plugin/prompts/collab.md). -->
 
 You are participating in the IronRace bounded collaboration protocol (v1
 planning + v3 coding) as **Codex**. Full spec: `docs/COLLAB.md`. The user

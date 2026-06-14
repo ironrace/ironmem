@@ -28,11 +28,14 @@ pub(super) fn collab_error_to_memory_error(error: CollabError) -> MemoryError {
 }
 
 /// Store an accepted plan body as a `collab-plans` drawer and return its
-/// deterministic 32-char id. `topic` is `"canonical"` (body = raw content)
-/// or `"final"` (body = parsed plan text, so `final_plan_hash` — sha256 of
-/// the parsed text — verifies the stored body). Dereferenced by id, never
-/// semantically searched, so it is stored with a zero embedding (an empty
-/// slice is rejected by the EMBED_DIM length guard).
+/// deterministic 32-char id. `topic` must be `"canonical"` (body = raw
+/// content) or `"final"` (body = parsed plan text, so `final_plan_hash` —
+/// sha256 of the parsed text — verifies the stored body); any other topic is
+/// rejected loudly rather than silently filed. These drawers are dereferenced
+/// by id and are not intended for recall, so they carry a zero embedding (an
+/// empty slice is rejected by the EMBED_DIM length guard) — but note the
+/// generic drawer FTS index still sees their content (see the room comment
+/// above).
 fn store_collab_plan_drawer(
     tx: &rusqlite::Transaction<'_>,
     session_id: &str,
@@ -41,8 +44,13 @@ fn store_collab_plan_drawer(
 ) -> Result<String, MemoryError> {
     use ironrace_embed::embedder::EMBED_DIM;
     let body = match topic {
+        "canonical" => content.to_string(),
         "final" => parse_final_payload(content)?,
-        _ => content.to_string(),
+        other => {
+            return Err(MemoryError::Validation(format!(
+                "store_collab_plan_drawer: unexpected topic {other:?} (want canonical|final)"
+            )))
+        }
     };
     let id = crate::db::drawers::generate_id(&body, COLLAB_PLAN_WING, COLLAB_PLAN_ROOM);
     let zero = vec![0.0f32; EMBED_DIM];
@@ -841,6 +849,9 @@ fn render_plan(
             // when the plan hash is present. Canonical was always raw text;
             // final was stored as {"plan": "..."} but is normalized here so
             // collab_status consistently exposes final_plan as plan text.
+            // The `parse_final_payload` below cannot fail on a persisted final
+            // message: `build_v1_final_event` already parsed it at send time,
+            // so any stored `final` is a well-formed {"plan":...} envelope.
             if hash.is_some() {
                 if let Some(content) = db.collab_latest_message_content(session_id, kind)? {
                     let body = if kind == "final" {
