@@ -34,6 +34,19 @@ pub struct HookResponse {
     pub hook: String,
     pub harness: String,
     pub workspace_root: Option<String>,
+    #[serde(rename = "hookSpecificOutput", skip_serializing_if = "Option::is_none")]
+    pub hook_specific_output: Option<HookSpecificOutput>,
+}
+
+/// Claude Code's `SessionStart` additional-context channel. Serialized only
+/// when populated (non-Codex harness); camelCase keys match the Claude Code
+/// hook output contract.
+#[derive(Debug, Serialize)]
+pub struct HookSpecificOutput {
+    #[serde(rename = "hookEventName")]
+    pub hook_event_name: String,
+    #[serde(rename = "additionalContext")]
+    pub additional_context: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -85,6 +98,7 @@ fn run_hook_with_input(
         workspace_root: workspace_root
             .as_ref()
             .map(|path| path.display().to_string()),
+        hook_specific_output: None,
     };
 
     match hook_name {
@@ -1118,5 +1132,37 @@ mod tests {
         let truncated = truncate_text_to_byte_limit(&s, 24_000);
         assert_eq!(truncated.len(), 23_999);
         assert!(truncated.is_char_boundary(truncated.len()));
+    }
+
+    #[test]
+    fn hook_response_serializes_hook_specific_output_camelcase_and_omits_when_none() {
+        let none = HookResponse {
+            decision: None,
+            reason: None,
+            hook: "session-start".into(),
+            harness: "claude-code".into(),
+            workspace_root: None,
+            hook_specific_output: None,
+        };
+        let v = serde_json::to_value(&none).unwrap();
+        assert!(
+            v.get("hookSpecificOutput").is_none(),
+            "None must omit the key"
+        );
+
+        let some = HookResponse {
+            decision: None,
+            reason: None,
+            hook: "session-start".into(),
+            harness: "claude-code".into(),
+            workspace_root: None,
+            hook_specific_output: Some(HookSpecificOutput {
+                hook_event_name: "SessionStart".into(),
+                additional_context: "hi".into(),
+            }),
+        };
+        let v = serde_json::to_value(&some).unwrap();
+        assert_eq!(v["hookSpecificOutput"]["hookEventName"], "SessionStart");
+        assert_eq!(v["hookSpecificOutput"]["additionalContext"], "hi");
     }
 }
