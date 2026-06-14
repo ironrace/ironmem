@@ -361,14 +361,27 @@ fn search_prompt_context(
     }
 }
 
-/// Pure DB work (runs on the worker thread): open budget-bounded, BM25, filter by
-/// floor, take top-N, sanitize each to one line, format a compact block.
+/// Pure DB work (runs on the worker thread): open budget-bounded, read the
+/// tunables, then delegate to [`bm25_block_from_db`]. Splitting the env read from
+/// the formatting keeps the latter unit-testable without mutating process-global
+/// `IRONMEM_PROMPT_HOOK_*` env vars (which would race the other prompt tests).
 fn bm25_prompt_block(db_path: &Path, prompt: &str, busy: Duration) -> Option<String> {
     let db = crate::db::schema::Database::open_with_busy_timeout(db_path, busy).ok()?;
     let floor = crate::search::tunables::prompt_hook_min_bm25_score();
     let max_hits = crate::search::tunables::prompt_hook_max_hits();
     let line_bytes = crate::search::tunables::prompt_hook_summary_max_bytes();
+    bm25_block_from_db(&db, prompt, floor, max_hits, line_bytes)
+}
 
+/// Format the recall block from an open DB and explicit tunables: BM25, filter by
+/// `floor`, take top-`max_hits`, sanitize each hit to one ≤`line_bytes` line.
+fn bm25_block_from_db(
+    db: &crate::db::schema::Database,
+    prompt: &str,
+    floor: f32,
+    max_hits: usize,
+    line_bytes: usize,
+) -> Option<String> {
     // Overfetch `max_hits * 3` so the `prompt_hook_min_bm25_score` floor filter
     // below has room to drop low-scorers before `take(max_hits)`; simplifying
     // this to `max_hits` would starve a floor-filtered config of candidates.
@@ -1066,16 +1079,6 @@ mod tests {
         }
     }
 
-    /// Drop guard removing an arbitrary named env var on scope exit (incl.
-    /// panic/unwind), so prompt-hook tunable overrides never leak to other
-    /// ENV_MUTEX-serialized tests.
-    struct EnvVarGuard(&'static str);
-    impl Drop for EnvVarGuard {
-        fn drop(&mut self) {
-            std::env::remove_var(self.0);
-        }
-    }
-
     #[test]
     fn parses_workspace_root_from_payload() {
         let payload = serde_json::json!({
@@ -1230,7 +1233,9 @@ mod tests {
 
     #[test]
     fn read_only_stop_hook_skips_mining_and_diary_writes() {
-        let _env = ENV_MUTEX.lock().unwrap();
+        // Poison-tolerant like the sibling env-mutating tests: a panic in another
+        // ENV_MUTEX holder must not cascade a PoisonError into this one.
+        let _env = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
         let _metrics = crate::metrics::METRICS_ENV_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
@@ -2322,7 +2327,13 @@ mod tests {
             "occupancy sampling must respect the remaining prompt budget"
         );
 
-        lock_db.exec_raw("ROLLBACK").unwrap();
+        // Assert the sample was dropped WHILE the write lock is still held.
+        // `sample_prompt_occupancy` abandons its worker on `recv_timeout`, so the
+        // worker may still be in flight; the held `BEGIN IMMEDIATE` keeps any such
+        // write blocked (busy_timeout = 1ms → it fails) so nothing can commit. A
+        // fresh reader connection takes only a SHARED lock and sees no
+        // worker-committed row → 0. Reading after ROLLBACK instead would race an
+        // abandoned worker that writes once the lock frees (flaky under load).
         let db = crate::db::schema::Database::open(&db_path).unwrap();
         let n: i64 = db
             .with_connection(|c| {
@@ -2334,6 +2345,8 @@ mod tests {
             })
             .unwrap();
         assert_eq!(n, 0, "contended best-effort occupancy sample is dropped");
+
+        lock_db.exec_raw("ROLLBACK").unwrap();
         std::env::remove_var("IRONMEM_METRICS");
     }
 
@@ -2547,9 +2560,9 @@ mod tests {
 
     #[test]
     fn prompt_hook_min_bm25_score_floor_drops_weak_matches() {
-        let _env = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
-        let _guard = EnvVarGuard("IRONMEM_PROMPT_HOOK_MIN_SCORE");
-
+        // Exercises `bm25_block_from_db` directly with an explicit floor: passing
+        // tunables as params (not process-global `IRONMEM_PROMPT_HOOK_*` env vars)
+        // keeps this from racing the other prompt tests under `cargo test`.
         let temp = tempfile::tempdir().unwrap();
         let db_path = temp.path().join("memory.sqlite3");
         // Both contain every query term (implicit-AND qualifies both), but the
@@ -2574,33 +2587,23 @@ mod tests {
             "strong must outscore weak: {strong_score} vs {weak_score}"
         );
         let floor = (strong_score + weak_score) / 2.0;
-        std::env::set_var("IRONMEM_PROMPT_HOOK_MIN_SCORE", floor.to_string());
 
-        let resp = run_hook_with_input(
-            "user-prompt-submit",
-            "claude-code",
-            prompt_hook_config(db_path, temp.path().join("state")),
-            serde_json::json!({ "prompt": q }),
-        )
-        .unwrap();
-        let v = serde_json::to_value(&resp).unwrap();
-        let ctx = v["hookSpecificOutput"]["additionalContext"]
-            .as_str()
+        let block = bm25_block_from_db(&db, q, floor, 3, 120)
             .expect("strong match still injects above the floor");
         assert_eq!(
-            injected_source_rooms(ctx),
+            injected_source_rooms(&block),
             vec!["strong".to_string()],
-            "only the above-floor drawer injects: {ctx}"
+            "only the above-floor drawer injects: {block}"
+        );
+        // A floor above every score drops all hits → no recall block at all.
+        assert!(
+            bm25_block_from_db(&db, q, strong_score + 1.0, 3, 120).is_none(),
+            "floor above all scores yields no recall block"
         );
     }
 
     #[test]
     fn prompt_hook_caps_at_max_hits_in_bm25_order() {
-        let _env = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
-        // Default max_hits is 3; ensure no stray override is in effect.
-        let _guard = EnvVarGuard("IRONMEM_PROMPT_HOOK_MAX_HITS");
-        std::env::remove_var("IRONMEM_PROMPT_HOOK_MAX_HITS");
-
         let temp = tempfile::tempdir().unwrap();
         let db_path = temp.path().join("memory.sqlite3");
         // Five drawers all matching the query (implicit-AND), with increasing
@@ -2636,28 +2639,15 @@ mod tests {
         scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
         let expected: Vec<String> = scored.into_iter().take(3).map(|(r, _)| r).collect();
 
-        let resp = run_hook_with_input(
-            "user-prompt-submit",
-            "claude-code",
-            prompt_hook_config(db_path, temp.path().join("state")),
-            serde_json::json!({ "prompt": q }),
-        )
-        .unwrap();
-        let v = serde_json::to_value(&resp).unwrap();
-        let ctx = v["hookSpecificOutput"]["additionalContext"]
-            .as_str()
-            .expect("five matches → recall injects");
-        let injected = injected_source_rooms(ctx);
-        assert_eq!(injected.len(), 3, "max_hits caps the block at 3: {ctx}");
-        assert_eq!(injected, expected, "injected in BM25 score order: {ctx}");
+        // max_hits = 3 even though five drawers qualify.
+        let block = bm25_block_from_db(&db, q, 0.0, 3, 120).expect("five matches → recall injects");
+        let injected = injected_source_rooms(&block);
+        assert_eq!(injected.len(), 3, "max_hits caps the block at 3: {block}");
+        assert_eq!(injected, expected, "injected in BM25 score order: {block}");
     }
 
     #[test]
     fn prompt_hook_excerpt_respects_summary_byte_cap() {
-        let _env = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
-        let _guard = EnvVarGuard("IRONMEM_PROMPT_HOOK_SUMMARY_MAX_BYTES");
-        std::env::set_var("IRONMEM_PROMPT_HOOK_SUMMARY_MAX_BYTES", "16");
-
         let temp = tempfile::tempdir().unwrap();
         let db_path = temp.path().join("memory.sqlite3");
         seed_db_file(
@@ -2668,18 +2658,10 @@ mod tests {
                 "db",
             )],
         );
-        let resp = run_hook_with_input(
-            "user-prompt-submit",
-            "claude-code",
-            prompt_hook_config(db_path, temp.path().join("state")),
-            serde_json::json!({ "prompt": "alpha beta" }),
-        )
-        .unwrap();
-        let v = serde_json::to_value(&resp).unwrap();
-        let ctx = v["hookSpecificOutput"]["additionalContext"]
-            .as_str()
-            .expect("match injects");
-        let summary = ctx
+        let db = crate::db::schema::Database::open(&db_path).unwrap();
+        // line_bytes = 16 caps each excerpt.
+        let block = bm25_block_from_db(&db, "alpha beta", 0.0, 3, 16).expect("match injects");
+        let summary = block
             .lines()
             .find(|l| l.starts_with("- "))
             .expect("summary line present");
@@ -2691,8 +2673,8 @@ mod tests {
             "excerpt must honor the per-summary byte cap: {excerpt:?}"
         );
         assert!(
-            !ctx.contains("epsilon") && !ctx.contains("theta"),
-            "content past the byte cap must not leak: {ctx}"
+            !block.contains("epsilon") && !block.contains("theta"),
+            "content past the byte cap must not leak: {block}"
         );
     }
 
