@@ -32,10 +32,13 @@ pub(super) fn collab_error_to_memory_error(error: CollabError) -> MemoryError {
 /// content) or `"final"` (body = parsed plan text, so `final_plan_hash` —
 /// sha256 of the parsed text — verifies the stored body); any other topic is
 /// rejected loudly rather than silently filed. These drawers are dereferenced
-/// by id and are not intended for recall, so they carry a zero embedding (an
-/// empty slice is rejected by the EMBED_DIM length guard) — but note the
-/// generic drawer FTS index still sees their content (see the room comment
-/// above).
+/// by id and are not intended for recall, so they carry a full zero vector
+/// rather than an empty slice: `insert_drawer_tx` does not validate embedding
+/// length, but the HNSW index-load path (`load_all_vectors` in `db/schema.rs`)
+/// skips — with a per-row warning — any drawer whose embedding length is not
+/// `EMBED_DIM`. A zero vector stays loadable (contributing no vector signal)
+/// and avoids that warn/skip. Note the generic drawer FTS index still sees
+/// their content (see the `COLLAB_PLAN_ROOM` comment).
 fn store_collab_plan_drawer(
     tx: &rusqlite::Transaction<'_>,
     session_id: &str,
@@ -850,16 +853,31 @@ fn render_plan(
             // final was stored as {"plan": "..."} but is normalized here so
             // collab_status consistently exposes final_plan as plan text.
             // The `parse_final_payload` below cannot fail on a persisted final
-            // message: `build_v1_final_event` already parsed it at send time,
-            // so any stored `final` is a well-formed {"plan":...} envelope.
+            // message: `build_collab_event` (at the top of `handle_collab_send`,
+            // before `send_message` persists the raw content) already ran
+            // `build_v1_final_event` → `parse_final_payload`, so any stored
+            // `final` is a well-formed {"plan":...} envelope.
             if hash.is_some() {
-                if let Some(content) = db.collab_latest_message_content(session_id, kind)? {
-                    let body = if kind == "final" {
-                        parse_final_payload(&content)?
-                    } else {
-                        content
-                    };
-                    status[body_key] = Value::String(body);
+                match db.collab_latest_message_content(session_id, kind)? {
+                    Some(content) => {
+                        let body = if kind == "final" {
+                            parse_final_payload(&content)?
+                        } else {
+                            content
+                        };
+                        status[body_key] = Value::String(body);
+                    }
+                    None => {
+                        // A locked plan hash with no backing message is an
+                        // out-of-band inconsistency (the message is written in
+                        // the same tx as the hash). Surface it rather than
+                        // silently omitting the body so it is observable.
+                        tracing::warn!(
+                            session_id = %session_id,
+                            kind = %kind,
+                            "collab_status: {kind}_plan_hash set but no {kind} message found"
+                        );
+                    }
                 }
             }
         }
@@ -1737,6 +1755,95 @@ mod tests {
         // sha256(final_plan_hash) verifies against the stored body.
         assert_eq!(drawer.content, "FINAL BODY TEXT");
         assert_eq!(drawer.room, "collab-plans");
+    }
+
+    #[test]
+    fn final_drawer_body_hashes_to_final_plan_hash() {
+        // The central correctness claim: the stored final drawer body is the
+        // parsed plan text, so its sha256 equals final_plan_hash. This pins the
+        // contract that `build_v1_final_event` (hash) and
+        // `store_collab_plan_drawer` (body) parse identically.
+        let app = test_app();
+        let sid = start_session(&app);
+        drive_to_final(&app, &sid, "canonical plan", "FINAL BODY TEXT");
+
+        let record = app.db.collab_load_session_record(&sid).unwrap();
+        let drawer_id = record.session.final_plan_drawer_id.clone().unwrap();
+        let final_plan_hash = record.session.final_plan_hash.clone().unwrap();
+        let drawer = app.db.get_drawer(&drawer_id).unwrap().unwrap();
+        assert_eq!(
+            super::super::shared::sha256_hex(&drawer.content),
+            final_plan_hash,
+            "sha256(final drawer body) must equal final_plan_hash"
+        );
+    }
+
+    #[test]
+    fn revision_round_canonical_re_send_overwrites_drawer_id() {
+        // request_changes returns to synthesis; a second, different canonical
+        // body must re-stamp canonical_plan_drawer_id to the v2-derived id.
+        let app = test_app();
+        let sid = start_session(&app);
+        send(&app, &sid, "claude", "draft", "claude draft");
+        send(&app, &sid, "codex", "draft", "codex draft");
+        send(&app, &sid, "claude", "canonical", "CANONICAL V1");
+        send(
+            &app,
+            &sid,
+            "codex",
+            "review",
+            r#"{"verdict":"request_changes"}"#,
+        );
+        send(&app, &sid, "claude", "canonical", "CANONICAL V2");
+
+        let record = app.db.collab_load_session_record(&sid).unwrap();
+        let id = record.session.canonical_plan_drawer_id.unwrap();
+        let id_v1 =
+            crate::db::drawers::generate_id("CANONICAL V1", "ironrace-memory", "collab-plans");
+        let id_v2 =
+            crate::db::drawers::generate_id("CANONICAL V2", "ironrace-memory", "collab-plans");
+        assert_eq!(id, id_v2, "drawer id must point at the v2 body");
+        assert_ne!(id, id_v1);
+        assert_eq!(
+            app.db.get_drawer(&id).unwrap().unwrap().content,
+            "CANONICAL V2"
+        );
+    }
+
+    #[test]
+    fn store_collab_plan_drawer_rejects_unexpected_topic() {
+        // The defensive `other =>` arm must fail loudly, not silently file.
+        let app = test_app();
+        app.db
+            .with_transaction(|tx| {
+                let result = store_collab_plan_drawer(tx, "sess", "draft", "x");
+                assert!(result.is_err(), "unexpected topic must error");
+                let msg = format!("{:?}", result.err().unwrap());
+                assert!(
+                    msg.contains("unexpected topic"),
+                    "error must name the unexpected-topic cause, got: {msg}"
+                );
+                Ok(())
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn status_verbose_false_returns_compact_ref_not_body() {
+        // Explicit verbose:false must behave like the default (compact ref).
+        let app = test_app();
+        let sid = start_session(&app);
+        send(&app, &sid, "claude", "draft", "d");
+        send(&app, &sid, "codex", "draft", "d");
+        send(&app, &sid, "claude", "canonical", "CANONICAL BODY");
+
+        let status =
+            handle_collab_status(&app, &json!({ "session_id": sid, "verbose": false })).unwrap();
+        assert!(status["canonical_plan_ref"].is_object());
+        assert!(
+            status.get("canonical_plan").is_none(),
+            "explicit verbose:false must omit the full body"
+        );
     }
 
     #[test]
