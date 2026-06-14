@@ -149,7 +149,14 @@ fn run_hook_with_input(
 
     let app = App::new(config)?;
     let allows_writes = app.config.mcp_access_mode.allows_writes();
-    if crate::search::tunables::metrics_enabled() && allows_writes {
+    // Occupancy sampling is metrics-only telemetry (token counts / occupancy %,
+    // no memory content), so it is decoupled from `allows_writes` and fires in
+    // every access mode (issue #113). The hook commands in settings.json default
+    // to ReadOnly; coupling occupancy to the content-write gate meant it never
+    // banked a single row. The SQLite connection always opens READ_WRITE —
+    // `mcp_access_mode` is purely an application-level gate — so this physically
+    // succeeds. The content-write paths below (bootstrap/mining/diary) stay gated.
+    if crate::search::tunables::metrics_enabled() {
         sample_occupancy(
             &app,
             hook_name,
@@ -1256,6 +1263,8 @@ mod tests {
             embed_mode: EmbedMode::Noop,
         };
 
+        // Absent transcript → no usage; a zero-token occupancy sample is still
+        // banked because the session id is present (issue #113 decoupling).
         let response = run_hook_with_input(
             "stop",
             "codex",
@@ -1263,23 +1272,81 @@ mod tests {
             serde_json::json!({
                 "cwd": workspace,
                 "session_id": "session-1",
-                "transcript_path": "/tmp/transcript.jsonl"
+                "transcript_path": temp.path().join("absent.jsonl").to_string_lossy(),
             }),
         )
         .unwrap();
 
         let app = App::new(config).unwrap();
         assert_eq!(response.hook, "stop");
+        // Content-write gate still holds in ReadOnly: no mining, no diary drawers.
         assert_eq!(app.db.count_drawers(None).unwrap(), 0);
+        // Contract change (issue #113): occupancy/metrics are metrics-only and now
+        // record regardless of access mode. Previously these asserted 0 / is_none()
+        // under the old `allows_writes` coupling that this fix removes.
         assert_eq!(
             app.db
                 .occupancy_samples_for_session("session-1", 10)
                 .unwrap()
                 .len(),
-            0
+            1
         );
-        assert!(app.db.get_session_summary("session-1").unwrap().is_none());
+        assert!(app.db.get_session_summary("session-1").unwrap().is_some());
 
+        std::env::remove_var("IRONMEM_DISABLE_MIGRATION");
+    }
+
+    #[test]
+    fn read_only_mode_still_records_occupancy_sample() {
+        // Issue #113: occupancy sampling is metrics-only telemetry (token counts /
+        // occupancy %, no memory content) and must fire regardless of MCP access
+        // mode. Previously it was coupled to `allows_writes` (Trusted only), so the
+        // hook commands in settings.json — which default to ReadOnly — never banked
+        // any occupancy rows. This asserts the decoupled contract: ReadOnly records
+        // the sample, while the CONTENT-write gate (mining/diary/bootstrap) stays
+        // closed (see `read_only_stop_hook_skips_mining_and_diary_writes`).
+        let _env = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let _metrics = crate::metrics::METRICS_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        std::env::remove_var("IRONMEM_METRICS");
+        std::env::set_var("IRONMEM_DISABLE_MIGRATION", "1");
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(temp.path().join("workspace")).unwrap();
+        let transcript = temp.path().join("t.jsonl");
+        std::fs::write(
+            &transcript,
+            concat!(
+                r#"{"type":"assistant","message":{"usage":{"input_tokens":120000,"output_tokens":800,"cache_read_input_tokens":40000}}}"#,
+                "\n",
+            ),
+        )
+        .unwrap();
+        let config = Config {
+            db_path: temp.path().join("memory.sqlite3"),
+            model_dir: temp.path().join("model"),
+            model_dir_explicit: true,
+            state_dir: temp.path().join("hook_state"),
+            mcp_access_mode: McpAccessMode::ReadOnly,
+            embed_mode: EmbedMode::Noop,
+        };
+        run_hook_with_input(
+            "precompact",
+            "claude",
+            config.clone(),
+            serde_json::json!({
+                "cwd": temp.path().join("workspace"),
+                "session_id": "sess-ro",
+                "transcript_path": transcript.to_string_lossy(),
+            }),
+        )
+        .unwrap();
+        let app = App::new(config).unwrap();
+        let samples = app.db.occupancy_samples_for_session("sess-ro", 10).unwrap();
+        assert_eq!(samples.len(), 1, "ReadOnly mode must still bank occupancy");
+        assert_eq!(samples[0].input_tokens, 120000);
+        // occupancy = (input + cache_read) / window = (120000 + 40000) / 200000.
+        assert!((samples[0].occupancy_pct.unwrap() - 0.8).abs() < 1e-9);
         std::env::remove_var("IRONMEM_DISABLE_MIGRATION");
     }
 

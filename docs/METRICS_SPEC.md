@@ -579,3 +579,25 @@ destination, or reporting query changed.
   Token-row queries (§10.1/§10.2/§10.4) filter on `ts`; the outcomes query
   (§10.3) filters on `started_at`; the headline JOIN applies `--since` to the
   token side (`ts`) only.
+
+### 2026-06-14 — issue #113: capture-firing fix (no contract change to §1–§11 semantics)
+
+- **Occupancy sampling is decoupled from MCP access mode (§8.2/§8.3).** §8.3 lists
+  `IRONMEM_METRICS` as the *only* gate on occupancy sampling; the implementation
+  additionally (and undocumentedly) required `mcp_access_mode == Trusted`
+  (`allows_writes`). The lifecycle hook commands in `~/.claude/settings.json` invoke
+  `ironmem hook …` without `IRONMEM_MCP_MODE`, so they ran ReadOnly and banked **zero**
+  `occupancy_samples` rows. The hook now samples occupancy whenever
+  `metrics_enabled()` is true, regardless of access mode, bringing the code in line
+  with §8.3. This is safe: `occupancy_samples`/`session_summary` carry only token
+  counts and occupancy %, no memory content; the SQLite connection always opens
+  `READ_WRITE` (access mode is a pure application-level gate); and the **content**-write
+  paths (bootstrap/mining/diary) remain gated on `allows_writes`. No counter name,
+  unit, source, or aggregation changed.
+- **`llm_rerank` / `pref_extract` measured rows stay OFF (decision, not contract).**
+  Banking measured (`estimated=0`) `token_usage` rows requires enabling
+  `IRONMEM_RERANK=llm_haiku` and/or `IRONMEM_PREF_ENRICH=1`/`IRONMEM_PREF_EXTRACTOR=llm`,
+  each of which adds a Haiku LLM call to **every** search / `add_drawer`. These remain
+  default-off in the dogfooding MCP env; measured baseline rows are sourced from the
+  controlled, cost-gated A/B runs in issue #97 rather than accrued passively. The §11.5
+  baseline gate (`≥10 measured tasks`) is therefore fed by #97, not by routine usage.
