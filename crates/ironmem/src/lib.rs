@@ -33,5 +33,7 @@ pub mod sanitize;
 /// Search pipeline, graph traversal, and query sanitization.
 pub mod search;
 
+pub mod write_rules;
+
 /// Canonical crate error type used by CLI, MCP, and storage layers.
 pub use error::MemoryError;

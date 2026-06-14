@@ -13,7 +13,11 @@ Persistent workspace memory for Codex using the local Rust `ironmem` binary.
 
 ## Memory protocol
 
-Before answering questions about prior work, decisions, project history, or people, call `search` or the knowledge-graph tools first. After important progress or decisions, write durable summaries back into memory.
+The memory protocol is single-sourced from the `MEMORY_PROTOCOL` constant in `crates/ironmem/src/bootstrap.rs`. Stamp it into your rules file with the explicit, opt-in command (no hook runs it for you):
+
+```bash
+ironmem write-rules --target AGENTS.md
+```
 
 ## Bundled skills
 

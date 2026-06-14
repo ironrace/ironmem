@@ -234,17 +234,15 @@ Current behavior for Codex:
 
 ## Memory Usage Guidance
 
-Codex should get a short protocol reminding it to use memory proactively.
+Codex adopts the memory protocol through a managed rules-file block sourced from
+the `MEMORY_PROTOCOL` constant in `crates/ironmem/src/bootstrap.rs`:
 
-Recommended text:
+```bash
+ironmem write-rules --target AGENTS.md
+```
 
-> Before answering questions about prior work, decisions, project history, or people, check `search` or the KG tools first. After important progress or decisions, write durable summaries back into memory.
-
-Best places to inject this:
-
-- `.codex-plugin/plugin.json` default prompt metadata
-- `status` response
-- Codex-facing README/setup docs
+This is explicit opt-in only; no hook or plugin path runs `write-rules`
+automatically.
 
 ## Benchmarking Against MemPalace
 
