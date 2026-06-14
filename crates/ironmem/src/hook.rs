@@ -1880,7 +1880,11 @@ mod tests {
             model_dir_explicit: true,
             state_dir,
             mcp_access_mode: crate::config::McpAccessMode::Trusted,
-            embed_mode: crate::config::EmbedMode::Noop,
+            // EmbedMode::Real + a nonexistent model_dir is the trip-wire: if this hook
+            // path ever constructed App / loaded the embedder, App::new would fail on
+            // the bad path and fail the test. The path returns before App::new, so it
+            // never fires — proving the embedder is never loaded.
+            embed_mode: crate::config::EmbedMode::Real,
         }
     }
 
