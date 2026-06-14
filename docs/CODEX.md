@@ -102,7 +102,7 @@ The database is kept up to date automatically through hooks:
 
 | Hook | What happens |
 |------|-------------|
-| `session-start` | Bootstrap if first run; initial mine if workspace not yet indexed |
+| `session-start` | Bootstrap if first run; initial mine if workspace not yet indexed. On the Claude Code harness, also emits a compact memory-status block via `hookSpecificOutput.additionalContext` (drawer/wing/room counts, active collab session + phase, last-diary pointer, `MEMORY_PROTOCOL`); Codex receives no such output (silent degrade) |
 | `stop` | Persist session summary to diary; re-mine files changed since last hook run |
 | `precompact` | Snapshot pending session context; re-mine changed files |
 

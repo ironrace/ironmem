@@ -20,6 +20,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **SessionStart `additionalContext` injection (Claude Code):** the `session-start`
+  hook now emits a compact memory-status block via
+  `HookResponse.hookSpecificOutput.additionalContext` — drawer/wing/room counts
+  (top-N by count), the active collab session + phase (read from the DB), a
+  last-diary pointer (date + short id only, never the body), and
+  `MEMORY_PROTOCOL` — so the model starts each session aware of memory instead of
+  relying on a `status` call. Claude-Code-only; under `--harness codex` the field
+  is omitted (silent degrade). New public type `HookSpecificOutput` and a new
+  optional `HookResponse.hook_specific_output` field (omitted from JSON when
+  absent, so existing hook output is unchanged). The block is capped (~400 tokens)
+  with `MEMORY_PROTOCOL` given a reserved budget so it is always present.
 - `ironmem report [--task <tag>] [--since <date>] [--json]` — renders METRICS_SPEC §10 (tokens-to-done by task/phase, measured-vs-estimated split, iteration counts/outcome, merged-only headline) with §7-derived cost; baseline-recording gate for Phase 6 (§11.5). The `status` MCP tool gains a one-line metrics summary.
 - `ironmem` now records a `token_usage` row per real LLM call at the
   preference-extraction (`source = "pref_extract"`) and LLM-rerank
