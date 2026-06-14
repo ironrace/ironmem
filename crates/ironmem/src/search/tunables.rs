@@ -376,6 +376,36 @@ pub fn metrics_enabled() -> bool {
     )
 }
 
+// ── UserPromptSubmit hook knobs (fresh-read; tests flip per-test) ────────────
+
+/// Hard wall-clock budget for the UserPromptSubmit hook, milliseconds.
+/// Default 150; non-positive/unparseable → default; capped at 1000.
+pub fn prompt_hook_budget_ms() -> u64 {
+    match std::env::var("IRONMEM_PROMPT_HOOK_BUDGET_MS")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+    {
+        Some(v) if v > 0 => v.min(1000),
+        _ => 150,
+    }
+}
+
+/// Max memory lines injected per prompt. Default 3, clamped to 1..=3.
+pub fn prompt_hook_max_hits() -> usize {
+    env_usize("IRONMEM_PROMPT_HOOK_MAX_HITS", 3).clamp(1, 3)
+}
+
+/// Minimum BM25 score (positive; higher = better) a hit must clear.
+/// Default 0.0 (any FTS match passes; FTS MATCH already filters relevance).
+pub fn prompt_hook_min_bm25_score() -> f32 {
+    env_f32("IRONMEM_PROMPT_HOOK_MIN_SCORE", 0.0)
+}
+
+/// Byte cap for each injected one-line summary. Default 120.
+pub fn prompt_hook_summary_max_bytes() -> usize {
+    env_usize("IRONMEM_PROMPT_HOOK_SUMMARY_MAX_BYTES", 120)
+}
+
 /// Serializes tests that mutate the `IRONMEM_KG_*` env vars. These tunables
 /// read the env fresh on every call, so any test flipping them (here or in
 /// `search::pipeline`) must hold this lock to avoid clobbering a concurrent
@@ -391,6 +421,65 @@ mod tests {
     // env lock so tests in other modules that flip `IRONMEM_METRICS` (e.g.
     // `mcp::server`) cannot clobber these.
     use crate::metrics::METRICS_ENV_LOCK;
+
+    // Serializes tests that mutate the `IRONMEM_PROMPT_HOOK_*` env vars.
+    static PROMPT_HOOK_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn prompt_hook_budget_defaults_and_overrides() {
+        let _g = PROMPT_HOOK_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::remove_var("IRONMEM_PROMPT_HOOK_BUDGET_MS");
+        assert_eq!(prompt_hook_budget_ms(), 150);
+
+        std::env::set_var("IRONMEM_PROMPT_HOOK_BUDGET_MS", "75");
+        assert_eq!(prompt_hook_budget_ms(), 75);
+
+        std::env::set_var("IRONMEM_PROMPT_HOOK_BUDGET_MS", "0");
+        assert_eq!(prompt_hook_budget_ms(), 150);
+
+        std::env::set_var("IRONMEM_PROMPT_HOOK_BUDGET_MS", "nope");
+        assert_eq!(prompt_hook_budget_ms(), 150);
+
+        std::env::set_var("IRONMEM_PROMPT_HOOK_BUDGET_MS", "999999");
+        assert_eq!(prompt_hook_budget_ms(), 1000);
+
+        std::env::remove_var("IRONMEM_PROMPT_HOOK_BUDGET_MS");
+    }
+
+    #[test]
+    fn prompt_hook_max_hits_clamped_1_to_3() {
+        let _g = PROMPT_HOOK_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::remove_var("IRONMEM_PROMPT_HOOK_MAX_HITS");
+        assert_eq!(prompt_hook_max_hits(), 3);
+
+        std::env::set_var("IRONMEM_PROMPT_HOOK_MAX_HITS", "1");
+        assert_eq!(prompt_hook_max_hits(), 1);
+
+        std::env::set_var("IRONMEM_PROMPT_HOOK_MAX_HITS", "0");
+        assert_eq!(prompt_hook_max_hits(), 1);
+
+        std::env::set_var("IRONMEM_PROMPT_HOOK_MAX_HITS", "9");
+        assert_eq!(prompt_hook_max_hits(), 3);
+
+        std::env::remove_var("IRONMEM_PROMPT_HOOK_MAX_HITS");
+    }
+
+    #[test]
+    fn prompt_hook_floor_and_summary_bytes_defaults() {
+        let _g = PROMPT_HOOK_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::remove_var("IRONMEM_PROMPT_HOOK_MIN_SCORE");
+        assert_eq!(prompt_hook_min_bm25_score(), 0.0);
+
+        std::env::set_var("IRONMEM_PROMPT_HOOK_MIN_SCORE", "2.5");
+        assert_eq!(prompt_hook_min_bm25_score(), 2.5);
+
+        std::env::remove_var("IRONMEM_PROMPT_HOOK_MIN_SCORE");
+
+        std::env::remove_var("IRONMEM_PROMPT_HOOK_SUMMARY_MAX_BYTES");
+        assert_eq!(prompt_hook_summary_max_bytes(), 120);
+
+        std::env::remove_var("IRONMEM_PROMPT_HOOK_SUMMARY_MAX_BYTES");
+    }
 
     #[test]
     fn context_window_defaults_to_200000() {
