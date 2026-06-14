@@ -24,6 +24,8 @@ const METRICS_TRANSCRIPT_TAIL_BYTES: u64 = 2 * 1024 * 1024;
 /// ~400-token budget for the injected block (~4 chars/token).
 const SESSION_CONTEXT_MAX_BYTES: usize = 1600;
 const SESSION_CONTEXT_LABEL_BYTES: usize = 80;
+/// Byte cap for each `wing`/`room` label in a prompt-recall `source=` tag.
+const PROMPT_RECALL_LABEL_BYTES: usize = 40;
 const SESSION_CONTEXT_TOP_N: usize = 5;
 const SESSION_CONTEXT_SHORT_ID: usize = 8;
 /// Prefix for the always-included memory-protocol line. A `const` so the
@@ -53,13 +55,17 @@ pub struct HookResponse {
     pub hook: String,
     pub harness: String,
     pub workspace_root: Option<String>,
-    /// Claude Code `SessionStart` additional-context payload. Populated only for
-    /// non-Codex harnesses on `session-start`; omitted from JSON when `None`.
+    /// Claude Code additional-context payload. Populated only for non-Codex
+    /// harnesses, by two hooks: `session-start` (compact memory-status block)
+    /// and `user-prompt-submit` (FTS/BM25 memory recall). Omitted from JSON when
+    /// `None` (Codex, or nothing to inject). The `hookEventName` inside
+    /// distinguishes which hook produced it.
     #[serde(rename = "hookSpecificOutput", skip_serializing_if = "Option::is_none")]
     pub hook_specific_output: Option<HookSpecificOutput>,
 }
 
-/// Claude Code's `SessionStart` additional-context channel. Serialized only
+/// Claude Code's additional-context channel, shared by the `session-start` and
+/// `user-prompt-submit` hooks (see the two constructors below). Serialized only
 /// when populated (non-Codex harness); camelCase keys match the Claude Code
 /// hook output contract.
 #[derive(Debug, Serialize)]
@@ -101,10 +107,13 @@ struct StoredReview {
 
 /// Run a session lifecycle hook, reading the harness JSON payload from stdin.
 ///
-/// `harness` gates harness-specific output: on `session-start` a non-Codex
-/// harness (Claude Code) receives a compact memory-status block in the returned
-/// [`HookResponse::hook_specific_output`]; Codex omits it (silent degrade). The
-/// returned [`HookResponse`] is what the CLI serializes to stdout for the harness.
+/// `harness` gates harness-specific output. Two hooks populate the returned
+/// [`HookResponse::hook_specific_output`] for non-Codex harnesses (Claude Code):
+/// `session-start` injects a compact memory-status block, and
+/// `user-prompt-submit` injects FTS/BM25 memory recall (handled entirely by
+/// [`run_user_prompt_submit`] without constructing `App`). Codex omits both
+/// (silent degrade). The returned [`HookResponse`] is what the CLI serializes to
+/// stdout for the harness.
 pub fn run_hook(
     hook_name: &str,
     harness: &str,
@@ -254,8 +263,11 @@ fn sample_occupancy(
     );
 }
 
-/// Best-effort reserve kept for occupancy sampling so the transcript-tail scan
-/// never eats into context emission.
+/// Minimum leftover headroom required to attempt a best-effort occupancy sample
+/// after context emission has already completed, and the cap on that sample's
+/// own budget. Doubles as a gate (skip sampling when less than this remains) and
+/// a ceiling (a contended sample can never consume more than this), so the
+/// transcript-tail scan and DB write stay well inside the prompt budget.
 const PROMPT_HOOK_OCCUPANCY_RESERVE_MS: u64 = 30;
 
 /// UserPromptSubmit hook: FTS/BM25-only memory injection under a hard wall-clock
@@ -360,7 +372,19 @@ fn bm25_prompt_block(db_path: &Path, prompt: &str, busy: Duration) -> Option<Str
     // Overfetch `max_hits * 3` so the `prompt_hook_min_bm25_score` floor filter
     // below has room to drop low-scorers before `take(max_hits)`; simplifying
     // this to `max_hits` would starve a floor-filtered config of candidates.
-    let scored = db.bm25_search(prompt, max_hits * 3, None, None).ok()?;
+    //
+    // Distinguish a genuine query failure (broken/missing FTS index) from "no
+    // hits": the former is a diagnosable degradation the sibling SessionStart
+    // builders `warn!` about, so do the same here rather than swallowing it as a
+    // silent `None`. A `busy_timeout` open failure above stays silent (expected
+    // under lock contention / missing DB — the fail-closed path).
+    let scored = match db.bm25_search(prompt, max_hits * 3, None, None) {
+        Ok(scored) => scored,
+        Err(e) => {
+            tracing::warn!("prompt-hook recall: BM25 query failed: {e}");
+            return None;
+        }
+    };
     let qualifying: Vec<(String, f32)> = scored
         .into_iter()
         .filter(|(_, score)| *score >= floor)
@@ -371,15 +395,21 @@ fn bm25_prompt_block(db_path: &Path, prompt: &str, busy: Duration) -> Option<Str
     }
 
     let ids: Vec<&str> = qualifying.iter().map(|(id, _)| id.as_str()).collect();
-    let drawers = db.get_drawers_by_ids(&ids).ok()?;
+    let drawers = match db.get_drawers_by_ids(&ids) {
+        Ok(drawers) => drawers,
+        Err(e) => {
+            tracing::warn!("prompt-hook recall: drawer fetch failed: {e}");
+            return None;
+        }
+    };
 
     let mut lines = Vec::new();
     for (id, _score) in &qualifying {
         if let Some(d) = drawers.get(id) {
             let excerpt = compact_excerpt(&d.content, line_bytes);
             if !excerpt.is_empty() {
-                let wing = compact_excerpt(&d.wing, 40);
-                let room = compact_excerpt(&d.room, 40);
+                let wing = compact_excerpt(&d.wing, PROMPT_RECALL_LABEL_BYTES);
+                let room = compact_excerpt(&d.room, PROMPT_RECALL_LABEL_BYTES);
                 let source = serde_json::to_string(&format!("{wing}/{room}")).ok()?;
                 let excerpt = serde_json::to_string(&excerpt).ok()?;
                 lines.push(format!("- source={source} excerpt={excerpt}"));
@@ -417,6 +447,10 @@ fn sample_prompt_occupancy(
         return;
     }
     let db_path = config.db_path.clone();
+    // Defensive: a codex harness has already returned from `run_user_prompt_submit`
+    // before this is reached, so this normalizes to "claude" in practice. Kept to
+    // honor the occupancy_samples.harness CHECK constraint at this callsite too,
+    // so a future caller can't write an out-of-domain value.
     let harness_norm = if harness.starts_with("codex") {
         "codex".to_string()
     } else {
@@ -788,10 +822,12 @@ fn truncate_text_to_byte_limit(text: &str, max_bytes: usize) -> String {
     text[..end].to_string()
 }
 
-/// Normalize free-text (diary/drawer content) for safe inclusion in the
-/// session-start context block: trim, collapse any whitespace/control run to a
-/// single space, then byte-cap on a char boundary. serde handles JSON escaping
-/// when the enclosing `HookResponse` is serialized.
+/// Normalize free-text (diary/drawer content) for safe inclusion in an injected
+/// context block (session-start status lines and prompt-recall excerpts): trim,
+/// collapse any whitespace/control run to a single space, neutralize markdown
+/// code fences (` ``` ` → `` ` ``) so recalled text can't open a fenced block in
+/// the host prompt, then byte-cap on a char boundary. serde handles JSON
+/// escaping when the enclosing `HookResponse` is serialized.
 fn compact_excerpt(text: &str, max_bytes: usize) -> String {
     let mut out = String::with_capacity(text.len().min(max_bytes + 4));
     let mut prev_space = false;
@@ -1027,6 +1063,16 @@ mod tests {
     impl Drop for PromptHookBudgetEnvGuard {
         fn drop(&mut self) {
             std::env::remove_var("IRONMEM_PROMPT_HOOK_BUDGET_MS");
+        }
+    }
+
+    /// Drop guard removing an arbitrary named env var on scope exit (incl.
+    /// panic/unwind), so prompt-hook tunable overrides never leak to other
+    /// ENV_MUTEX-serialized tests.
+    struct EnvVarGuard(&'static str);
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            std::env::remove_var(self.0);
         }
     }
 
@@ -2465,6 +2511,219 @@ mod tests {
         assert!(
             p95 <= 150,
             "p95 {p95}ms exceeds 150ms budget; samples={samples:?}"
+        );
+    }
+
+    /// Find the BM25 score the prompt hook would see for a seeded drawer, keyed
+    /// by the deterministic id `seed_db_file` derives from `(content, wing, room)`.
+    fn bm25_score_of(
+        db: &crate::db::schema::Database,
+        query: &str,
+        content: &str,
+        wing: &str,
+        room: &str,
+    ) -> f32 {
+        let id = generate_id(content, wing, room);
+        db.bm25_search(query, 50, None, None)
+            .unwrap()
+            .into_iter()
+            .find(|(i, _)| *i == id)
+            .unwrap_or_else(|| panic!("drawer {wing}/{room} did not match query {query:?}"))
+            .1
+    }
+
+    /// Parse the `source="…"` rooms from the recall block's body lines, in order.
+    fn injected_source_rooms(ctx: &str) -> Vec<String> {
+        ctx.lines()
+            .filter(|l| l.starts_with("- "))
+            .filter_map(|l| {
+                let start = l.find("source=\"")? + "source=\"".len();
+                let rest = &l[start..];
+                let end = rest.find('"')?;
+                rest[..end].split('/').nth(1).map(str::to_string)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn prompt_hook_min_bm25_score_floor_drops_weak_matches() {
+        let _env = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = EnvVarGuard("IRONMEM_PROMPT_HOOK_MIN_SCORE");
+
+        let temp = tempfile::tempdir().unwrap();
+        let db_path = temp.path().join("memory.sqlite3");
+        // Both contain every query term (implicit-AND qualifies both), but the
+        // "weak" doc buries them in filler so BM25 length-normalization scores it
+        // strictly below the short "strong" doc.
+        let strong = "alpha beta gamma";
+        let weak = "alpha beta gamma then a long tail of unrelated filler words \
+                    one two three four five six seven eight nine ten eleven twelve";
+        seed_db_file(
+            &db_path,
+            &[(strong, "infra", "strong"), (weak, "infra", "weak")],
+        );
+
+        // Place the floor strictly between the two real scores so exactly the
+        // strong drawer survives — no guessing BM25 magnitudes.
+        let db = crate::db::schema::Database::open(&db_path).unwrap();
+        let q = "alpha beta gamma";
+        let strong_score = bm25_score_of(&db, q, strong, "infra", "strong");
+        let weak_score = bm25_score_of(&db, q, weak, "infra", "weak");
+        assert!(
+            strong_score > weak_score,
+            "strong must outscore weak: {strong_score} vs {weak_score}"
+        );
+        let floor = (strong_score + weak_score) / 2.0;
+        std::env::set_var("IRONMEM_PROMPT_HOOK_MIN_SCORE", floor.to_string());
+
+        let resp = run_hook_with_input(
+            "user-prompt-submit",
+            "claude-code",
+            prompt_hook_config(db_path, temp.path().join("state")),
+            serde_json::json!({ "prompt": q }),
+        )
+        .unwrap();
+        let v = serde_json::to_value(&resp).unwrap();
+        let ctx = v["hookSpecificOutput"]["additionalContext"]
+            .as_str()
+            .expect("strong match still injects above the floor");
+        assert_eq!(
+            injected_source_rooms(ctx),
+            vec!["strong".to_string()],
+            "only the above-floor drawer injects: {ctx}"
+        );
+    }
+
+    #[test]
+    fn prompt_hook_caps_at_max_hits_in_bm25_order() {
+        let _env = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        // Default max_hits is 3; ensure no stray override is in effect.
+        let _guard = EnvVarGuard("IRONMEM_PROMPT_HOOK_MAX_HITS");
+        std::env::remove_var("IRONMEM_PROMPT_HOOK_MAX_HITS");
+
+        let temp = tempfile::tempdir().unwrap();
+        let db_path = temp.path().join("memory.sqlite3");
+        // Five drawers all matching the query (implicit-AND), with increasing
+        // filler → strictly decreasing BM25 score, so the expected top-3 order is
+        // deterministic. Rooms r0..r4 tag each so the injected order is checkable.
+        let rows: Vec<(String, &str, String)> = (0..5)
+            .map(|i| {
+                let filler = (0..i)
+                    .map(|j| format!("pad{j}"))
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                (
+                    format!("alpha beta gamma {filler}").trim().to_string(),
+                    "x",
+                    format!("r{i}"),
+                )
+            })
+            .collect();
+        let seed: Vec<(&str, &str, &str)> = rows
+            .iter()
+            .map(|(c, w, r)| (c.as_str(), *w, r.as_str()))
+            .collect();
+        seed_db_file(&db_path, &seed);
+
+        let q = "alpha beta gamma";
+        let db = crate::db::schema::Database::open(&db_path).unwrap();
+        // Sort rooms by their real BM25 score descending and take the top 3 —
+        // the order the capped recall block must reproduce.
+        let mut scored: Vec<(String, f32)> = rows
+            .iter()
+            .map(|(c, w, r)| (r.clone(), bm25_score_of(&db, q, c, w, r)))
+            .collect();
+        scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+        let expected: Vec<String> = scored.into_iter().take(3).map(|(r, _)| r).collect();
+
+        let resp = run_hook_with_input(
+            "user-prompt-submit",
+            "claude-code",
+            prompt_hook_config(db_path, temp.path().join("state")),
+            serde_json::json!({ "prompt": q }),
+        )
+        .unwrap();
+        let v = serde_json::to_value(&resp).unwrap();
+        let ctx = v["hookSpecificOutput"]["additionalContext"]
+            .as_str()
+            .expect("five matches → recall injects");
+        let injected = injected_source_rooms(ctx);
+        assert_eq!(injected.len(), 3, "max_hits caps the block at 3: {ctx}");
+        assert_eq!(injected, expected, "injected in BM25 score order: {ctx}");
+    }
+
+    #[test]
+    fn prompt_hook_excerpt_respects_summary_byte_cap() {
+        let _env = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = EnvVarGuard("IRONMEM_PROMPT_HOOK_SUMMARY_MAX_BYTES");
+        std::env::set_var("IRONMEM_PROMPT_HOOK_SUMMARY_MAX_BYTES", "16");
+
+        let temp = tempfile::tempdir().unwrap();
+        let db_path = temp.path().join("memory.sqlite3");
+        seed_db_file(
+            &db_path,
+            &[(
+                "alpha beta gamma delta epsilon zeta eta theta iota kappa",
+                "infra",
+                "db",
+            )],
+        );
+        let resp = run_hook_with_input(
+            "user-prompt-submit",
+            "claude-code",
+            prompt_hook_config(db_path, temp.path().join("state")),
+            serde_json::json!({ "prompt": "alpha beta" }),
+        )
+        .unwrap();
+        let v = serde_json::to_value(&resp).unwrap();
+        let ctx = v["hookSpecificOutput"]["additionalContext"]
+            .as_str()
+            .expect("match injects");
+        let summary = ctx
+            .lines()
+            .find(|l| l.starts_with("- "))
+            .expect("summary line present");
+        let start = summary.find("excerpt=\"").unwrap() + "excerpt=\"".len();
+        let rest = &summary[start..];
+        let excerpt = &rest[..rest.find('"').unwrap()];
+        assert!(
+            excerpt.len() <= 16,
+            "excerpt must honor the per-summary byte cap: {excerpt:?}"
+        );
+        assert!(
+            !ctx.contains("epsilon") && !ctx.contains("theta"),
+            "content past the byte cap must not leak: {ctx}"
+        );
+    }
+
+    #[test]
+    fn prompt_hook_codex_prefix_variant_emits_nothing() {
+        // The sibling test uses the exact harness "codex"; this pins the
+        // `starts_with("codex")` prefix contract so a regression to `== "codex"`
+        // would leak injection to codex-cli.
+        let temp = tempfile::tempdir().unwrap();
+        let db_path = temp.path().join("memory.sqlite3");
+        seed_db_file(
+            &db_path,
+            &[(
+                "Postgres connection pooling uses pgbouncer in transaction mode",
+                "infra",
+                "db",
+            )],
+        );
+        let resp = run_hook_with_input(
+            "user-prompt-submit",
+            "codex-cli",
+            prompt_hook_config(db_path, temp.path().join("state")),
+            serde_json::json!({ "prompt": "postgres connection pooling" }),
+        )
+        .unwrap();
+        assert!(
+            serde_json::to_value(&resp)
+                .unwrap()
+                .get("hookSpecificOutput")
+                .is_none(),
+            "codex-* prefix must omit prompt-recall injection"
         );
     }
 }
