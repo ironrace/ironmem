@@ -166,6 +166,11 @@ pub fn find_active_session_by_repo_branch(
 /// the workspace root). "Active" is `ended_at IS NULL`; ambiguity across
 /// branches is intentionally resolved as the newest active session for the
 /// repo (`created_at DESC, id DESC`).
+///
+/// `phase` is returned as the raw column string (not parsed into [`Phase`]) on
+/// purpose, so the infallible session-start hook can treat it as an opaque
+/// display value; parsing here would add a failure path that caller must not
+/// have. Use [`load_session`] when a typed [`Phase`] is required.
 pub fn find_active_session_by_repo(
     conn: &Connection,
     repo_path: &str,
@@ -789,6 +794,16 @@ mod tests {
         end_session(&db, "a-old").unwrap();
         create_session(&db, "a-active-1", "/repo-a", "feature", None, Agent::Claude).unwrap();
         create_session(&db, "a-active-2", "/repo-a", "other", None, Agent::Claude).unwrap();
+        // `created_at` is second-resolution, so insertion order alone may not
+        // disambiguate two same-second rows. Pin both active rows to the SAME
+        // instant so the `id DESC` tie-break (not creation timing) is what
+        // deterministically selects a-active-2.
+        db.execute(
+            "UPDATE collab_sessions SET created_at = '2026-01-01T00:00:00Z' \
+             WHERE id IN ('a-active-1', 'a-active-2')",
+            [],
+        )
+        .unwrap();
         // Different repo must not leak.
         create_session(&db, "b-active", "/repo-b", "main", None, Agent::Claude).unwrap();
 

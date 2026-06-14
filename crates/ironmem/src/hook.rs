@@ -25,6 +25,18 @@ const SESSION_CONTEXT_MAX_BYTES: usize = 1600;
 const SESSION_CONTEXT_LABEL_BYTES: usize = 80;
 const SESSION_CONTEXT_TOP_N: usize = 5;
 const SESSION_CONTEXT_SHORT_ID: usize = 8;
+/// Prefix for the always-included memory-protocol line. A `const` so the
+/// compile-time budget check below and the runtime `format!` agree byte-for-byte.
+const MEMORY_PROTOCOL_PREFIX: &str = "MEMORY_PROTOCOL: ";
+
+// The protocol-only fallback returns the `MEMORY_PROTOCOL` line verbatim with no
+// byte cap, so it must fit the budget on its own. Guard at compile time: if the
+// protocol text ever grows past the budget, fail the build, not a live session.
+const _: () = assert!(
+    MEMORY_PROTOCOL_PREFIX.len() + crate::bootstrap::MEMORY_PROTOCOL.len()
+        <= SESSION_CONTEXT_MAX_BYTES,
+    "MEMORY_PROTOCOL line exceeds SESSION_CONTEXT_MAX_BYTES"
+);
 
 static REVIEW_FILE_REF_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"[A-Za-z0-9_./-]+\.[A-Za-z0-9]+:\d+").unwrap());
@@ -55,6 +67,19 @@ pub struct HookSpecificOutput {
     pub hook_event_name: String,
     #[serde(rename = "additionalContext")]
     pub additional_context: String,
+}
+
+impl HookSpecificOutput {
+    /// Construct the `SessionStart` additional-context payload. Centralizes the
+    /// (stringly-typed) `hookEventName` so a typo can't drift from what Claude
+    /// Code expects at the single callsite — the value is rejected silently at
+    /// runtime, not at compile time, so it must be set in exactly one place.
+    fn session_start(additional_context: String) -> Self {
+        Self {
+            hook_event_name: "SessionStart".to_string(),
+            additional_context,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -123,10 +148,7 @@ fn run_hook_with_input(
             // so it silently degrades (field stays None → omitted from JSON).
             if !harness.starts_with("codex") {
                 if let Some(ctx) = build_session_start_context(&app, workspace_root.as_deref()) {
-                    response.hook_specific_output = Some(HookSpecificOutput {
-                        hook_event_name: "SessionStart".to_string(),
-                        additional_context: ctx,
-                    });
+                    response.hook_specific_output = Some(HookSpecificOutput::session_start(ctx));
                 }
             }
         }
@@ -552,6 +574,8 @@ fn truncate_text_to_byte_limit(text: &str, max_bytes: usize) -> String {
 fn compact_excerpt(text: &str, max_bytes: usize) -> String {
     let mut out = String::with_capacity(text.len().min(max_bytes + 4));
     let mut prev_space = false;
+    // Manual scan (not `split_whitespace`): this must also collapse `is_control()`
+    // runs to a single space, which a whitespace split would silently let through.
     for ch in text.trim().chars() {
         if ch.is_whitespace() || ch.is_control() {
             if !prev_space {
@@ -584,94 +608,161 @@ fn top_counts(mut pairs: Vec<(String, usize)>, n: usize) -> Vec<String> {
         .collect()
 }
 
-/// Build the compact session-start memory block (Claude Code only). Every read
-/// is best-effort: on a DB error we `warn!` and drop that line rather than fail
-/// the hook. `MEMORY_PROTOCOL` is always included with a reserved byte budget so
-/// a pile of long wing/room names can never truncate the one behavior-changing
-/// line; the status lines share whatever budget is left and may be dropped or
-/// truncated. Because `MEMORY_PROTOCOL` is that floor, this currently always
-/// returns `Some` — the `Option` lets callers treat an empty block as "nothing
-/// to inject". The active collab session and diary pointer come from the DB
-/// because this hook runs in a separate process where
-/// `App::active_collab_session_snapshot()` is empty.
-fn build_session_start_context(app: &App, workspace_root: Option<&Path>) -> Option<String> {
-    let mut lines: Vec<String> = Vec::new();
+/// First [`SESSION_CONTEXT_SHORT_ID`] chars of an id for compact display.
+/// `get(..)`/`unwrap_or` (never `&id[..n]`) keeps this panic-safe when the cut
+/// would land inside a multibyte char boundary.
+fn short_id(id: &str) -> &str {
+    id.get(..SESSION_CONTEXT_SHORT_ID).unwrap_or(id)
+}
 
-    // 1. Drawer total + top wings (largest first; the DB returns them alphabetically).
-    match app.db.count_drawers(None) {
-        Ok(total) => {
-            let wings = match app.db.wing_counts() {
-                Ok(wings) => wings,
-                Err(e) => {
-                    tracing::warn!("session-start context: wing counts unavailable: {e}");
-                    Vec::new()
-                }
-            };
-            let n_wings = wings.len();
-            let top = top_counts(wings, SESSION_CONTEXT_TOP_N);
-            if top.is_empty() {
-                lines.push(format!("[ironmem] {total} drawers"));
-            } else {
-                lines.push(format!(
-                    "[ironmem] {total} drawers · {n_wings} wings (top: {})",
-                    top.join(", ")
-                ));
-            }
+/// `[ironmem] N drawers · M wings (top: …)` — or just the drawer count when no
+/// wings are present. `None` only when the drawer count itself is unavailable;
+/// a missing wing list still yields the drawer line.
+fn drawers_and_wings_line(app: &App) -> Option<String> {
+    let total = match app.db.count_drawers(None) {
+        Ok(total) => total,
+        Err(e) => {
+            tracing::warn!("session-start context: drawer counts unavailable: {e}");
+            return None;
         }
-        Err(e) => tracing::warn!("session-start context: drawer counts unavailable: {e}"),
-    }
+    };
+    // DB returns wings alphabetically; `top_counts` re-sorts by count desc.
+    let wings = match app.db.wing_counts() {
+        Ok(wings) => wings,
+        Err(e) => {
+            tracing::warn!("session-start context: wing counts unavailable: {e}");
+            Vec::new()
+        }
+    };
+    let n_wings = wings.len();
+    let top = top_counts(wings, SESSION_CONTEXT_TOP_N);
+    Some(if top.is_empty() {
+        format!("[ironmem] {total} drawers")
+    } else {
+        format!(
+            "[ironmem] {total} drawers · {n_wings} wings (top: {})",
+            top.join(", ")
+        )
+    })
+}
 
-    // 1b. Top rooms across all wings (largest first).
+/// Busiest room *names* across all wings. Labeled "room names" (not "rooms") on
+/// purpose: `room_counts(None)` groups by name, so a name reused across wings is
+/// summed into one bucket — this is a busiest-names view, not a per-room total.
+/// `None` when there are no rooms or the lookup fails.
+fn room_names_line(app: &App) -> Option<String> {
     match app.db.room_counts(None) {
         Ok(rooms) => {
             let top = top_counts(rooms, SESSION_CONTEXT_TOP_N);
-            if !top.is_empty() {
-                lines.push(format!("rooms (top: {})", top.join(", ")));
-            }
+            (!top.is_empty()).then(|| format!("room names (top: {})", top.join(", ")))
         }
-        Err(e) => tracing::warn!("session-start context: room counts unavailable: {e}"),
-    }
-
-    // 2. Active collab session + phase (DB-backed; snapshot is empty in the hook process).
-    if let Some(root) = workspace_root {
-        let repo_path = root.to_string_lossy();
-        match app.db.with_connection(|conn| {
-            crate::collab::queue::find_active_session_by_repo(conn, repo_path.as_ref())
-        }) {
-            Ok(Some((id, phase))) => {
-                let short = id.get(..SESSION_CONTEXT_SHORT_ID).unwrap_or(&id);
-                // Normalize the phase like wing/room names: every DB-derived
-                // field is sanitized at the injection boundary (defense-in-depth,
-                // though `phase` is written only from the closed `Phase` enum).
-                let phase = compact_excerpt(&phase, SESSION_CONTEXT_LABEL_BYTES);
-                lines.push(format!("collab {short} @ {phase}"));
-            }
-            Ok(None) => {}
-            Err(e) => tracing::warn!("session-start context: active collab lookup failed: {e}"),
+        Err(e) => {
+            tracing::warn!("session-start context: room counts unavailable: {e}");
+            None
         }
     }
+}
 
-    // 3. Last diary pointer (most recent entry in the diary wing, any room).
-    // Do not inject diary body text at session start; it is prior free-form
-    // memory content and should be fetched deliberately via memory tools.
+/// `collab <short id> @ <phase>` for the newest active session in this repo.
+/// `None` when there is no active session or the lookup fails. DB-backed because
+/// the in-process snapshot is empty in the hook's separate process.
+fn collab_line(app: &App, workspace_root: &Path) -> Option<String> {
+    let repo_path = workspace_root.to_string_lossy();
+    match app.db.with_connection(|conn| {
+        crate::collab::queue::find_active_session_by_repo(conn, repo_path.as_ref())
+    }) {
+        Ok(Some((id, phase))) => {
+            // Sanitize the phase like every other DB-derived field at the
+            // injection boundary. `find_active_session_by_repo` returns the raw
+            // phase column (not a parsed `Phase`) so this hook stays infallible;
+            // treat it as an opaque display string. See its doc comment.
+            let phase = compact_excerpt(&phase, SESSION_CONTEXT_LABEL_BYTES);
+            Some(format!("collab {} @ {phase}", short_id(&id)))
+        }
+        Ok(None) => None,
+        Err(e) => {
+            tracing::warn!("session-start context: active collab lookup failed: {e}");
+            None
+        }
+    }
+}
+
+/// `last diary <date> (<short id>)` — a pointer only. The diary body is prior
+/// free-form memory and must be fetched deliberately via the memory tools, so it
+/// is never injected here. `None` when the diary is empty or the lookup fails.
+fn diary_line(app: &App) -> Option<String> {
     match app.db.get_drawers(Some("diary"), None, 1) {
-        Ok(entries) => {
-            if let Some(d) = entries.first() {
-                let short = d.id.get(..SESSION_CONTEXT_SHORT_ID).unwrap_or(&d.id);
-                lines.push(format!("last diary {} ({short})", d.date));
-            }
+        Ok(entries) => entries
+            .first()
+            .map(|d| format!("last diary {} ({})", d.date, short_id(&d.id))),
+        Err(e) => {
+            tracing::warn!("session-start context: diary lookup failed: {e}");
+            None
         }
-        Err(e) => tracing::warn!("session-start context: diary lookup failed: {e}"),
     }
+}
 
-    // 4. Memory protocol (verbatim) — reserve its budget so the status lines,
-    // not the protocol, absorb any truncation.
-    let protocol_line = format!("MEMORY_PROTOCOL: {}", crate::bootstrap::MEMORY_PROTOCOL);
+/// Join leading `lines` with `\n` while the running length stays within
+/// `budget`, dropping whole trailing lines that don't fit. Line-wise (never a
+/// byte-prefix cut) so the result can't end in a sliced count or half a line.
+fn join_within_budget(lines: &[String], budget: usize) -> String {
+    let mut out = String::new();
+    for line in lines {
+        let needed = if out.is_empty() {
+            line.len()
+        } else {
+            line.len() + 1 // leading '\n'
+        };
+        if out.len() + needed > budget {
+            break;
+        }
+        if !out.is_empty() {
+            out.push('\n');
+        }
+        out.push_str(line);
+    }
+    out
+}
+
+/// Build the compact session-start memory block (Claude Code only).
+///
+/// Every read is best-effort: a DB error on any line is logged with `warn!` and
+/// that line dropped rather than failing the hook. `MEMORY_PROTOCOL` is always
+/// included with a reserved byte budget, so a pile of long wing/room names can
+/// never crowd out the one behavior-changing line; the status lines share what
+/// budget is left and whole lines are dropped (never byte-sliced) when they
+/// don't fit. Because `MEMORY_PROTOCOL` is that floor this always returns `Some`
+/// — the `Option` lets callers treat an empty block as "nothing to inject".
+///
+/// The active collab session and diary pointer are read from the DB (not
+/// `App::active_collab_session_snapshot()`) because this hook runs in a separate
+/// process where that snapshot is empty.
+///
+/// Diagnostics caveat: the `warn!`s above go to stderr, which Claude Code
+/// discards when the hook exits 0, so a persistent degradation shrinks the block
+/// with no user-visible signal. The swallow is intentional (a status line must
+/// never break session start); surfacing a degradation signal via metrics is a
+/// follow-up, not done here. Do not promote these to `error!` — same sink.
+fn build_session_start_context(app: &App, workspace_root: Option<&Path>) -> Option<String> {
+    let mut lines: Vec<String> = Vec::new();
+    lines.extend(drawers_and_wings_line(app));
+    lines.extend(room_names_line(app));
+    if let Some(root) = workspace_root {
+        lines.extend(collab_line(app, root));
+    }
+    lines.extend(diary_line(app));
+
+    let protocol_line = format!(
+        "{MEMORY_PROTOCOL_PREFIX}{}",
+        crate::bootstrap::MEMORY_PROTOCOL
+    );
     if lines.is_empty() {
         return Some(protocol_line);
     }
+    // Reserve the protocol line's bytes (+1 for the joining newline) so the
+    // status lines, never the protocol, absorb any truncation.
     let reserved = SESSION_CONTEXT_MAX_BYTES.saturating_sub(protocol_line.len() + 1);
-    let status = truncate_text_to_byte_limit(&lines.join("\n"), reserved);
+    let status = join_within_budget(&lines, reserved);
     if status.is_empty() {
         Some(protocol_line)
     } else {
@@ -1390,7 +1481,7 @@ mod tests {
         );
         let rooms_line = block
             .lines()
-            .find(|line| line.starts_with("rooms (top: "))
+            .find(|line| line.starts_with("room names (top: "))
             .expect("room counts listed");
         let rooms = rooms_line.find("r:4").expect("r room count listed");
         let diary = rooms_line.find("diary:1").expect("diary room count listed");
@@ -1494,5 +1585,112 @@ mod tests {
             "codex must silently degrade"
         );
         assert_eq!(v["hook"], "session-start");
+    }
+
+    #[test]
+    fn session_start_context_degrades_to_protocol_only_when_all_reads_fail() {
+        let app = App::open_for_test().unwrap();
+        // Remove the table out from under every drawer-backed read
+        // (count_drawers, wing_counts, room_counts, diary). The central promise
+        // is that a DB hiccup never breaks session start: each unavailable line
+        // is dropped and the behavior-changing MEMORY_PROTOCOL still ships.
+        app.db
+            .with_connection(|conn| {
+                conn.execute("DROP TABLE drawers", [])?;
+                Ok(())
+            })
+            .unwrap();
+        let block = build_session_start_context(&app, None)
+            .expect("MEMORY_PROTOCOL floor always yields Some");
+        assert_eq!(
+            block,
+            format!("MEMORY_PROTOCOL: {}", crate::bootstrap::MEMORY_PROTOCOL),
+            "all status reads failed → degrade to protocol-only, never error"
+        );
+        assert!(block.len() <= SESSION_CONTEXT_MAX_BYTES);
+    }
+
+    #[test]
+    fn session_start_context_on_empty_db_is_drawer_line_plus_protocol() {
+        let app = App::open_for_test().unwrap();
+        let block = build_session_start_context(&app, None).unwrap();
+        assert_eq!(
+            block,
+            format!(
+                "[ironmem] 0 drawers\nMEMORY_PROTOCOL: {}",
+                crate::bootstrap::MEMORY_PROTOCOL
+            )
+        );
+        assert!(block.len() <= SESSION_CONTEXT_MAX_BYTES);
+    }
+
+    #[test]
+    fn session_start_codex_prefix_variants_omit_others_emit() {
+        // "codex" is matched exactly in the sibling tests; here "codex-cli" must
+        // also omit via the `starts_with("codex")` prefix, while an arbitrary
+        // non-codex harness must still emit. A refactor to `harness == "codex"`
+        // would pass the exact-match tests but silently break this contract.
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = temp.path().join("workspace");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let make_config = || Config {
+            db_path: temp.path().join("memory.sqlite3"),
+            model_dir: temp.path().join("model"),
+            model_dir_explicit: true,
+            state_dir: temp.path().join("hook_state"),
+            mcp_access_mode: McpAccessMode::Trusted,
+            embed_mode: EmbedMode::Noop,
+        };
+        let emits = |harness: &str| {
+            let resp = run_hook_with_input(
+                "session-start",
+                harness,
+                make_config(),
+                serde_json::json!({ "cwd": workspace, "session_id": "s" }),
+            )
+            .unwrap();
+            serde_json::to_value(&resp)
+                .unwrap()
+                .get("hookSpecificOutput")
+                .is_some()
+        };
+        assert!(
+            !emits("codex-cli"),
+            "codex-* prefix must omit additionalContext"
+        );
+        assert!(
+            emits("gemini"),
+            "non-codex harness must emit additionalContext"
+        );
+    }
+
+    #[test]
+    fn top_counts_caps_at_n_and_breaks_ties_alphabetically() {
+        let pairs = vec![
+            ("b".to_string(), 5),
+            ("a".to_string(), 5),
+            ("c".to_string(), 9),
+            ("d".to_string(), 1),
+            ("e".to_string(), 1),
+        ];
+        // count DESC, then name ASC for equal counts; capped at n.
+        assert_eq!(top_counts(pairs, 3), vec!["c:9", "a:5", "b:5"]);
+    }
+
+    #[test]
+    fn compact_excerpt_handles_empty_whitespace_and_zero_budget() {
+        assert_eq!(compact_excerpt("", 100), "");
+        assert_eq!(compact_excerpt("   \t\n  ", 100), "");
+        assert_eq!(compact_excerpt("hello", 0), "");
+    }
+
+    #[test]
+    fn join_within_budget_drops_whole_trailing_lines() {
+        let lines = vec!["aaa".to_string(), "bbbb".to_string(), "cc".to_string()];
+        assert_eq!(join_within_budget(&lines, 100), "aaa\nbbbb\ncc");
+        // 8 fits "aaa\nbbbb" (3 + 1 + 4) but not the next line → whole-line drop.
+        assert_eq!(join_within_budget(&lines, 8), "aaa\nbbbb");
+        // Too small for even the first line → empty (caller falls back to protocol).
+        assert_eq!(join_within_budget(&lines, 2), "");
     }
 }
