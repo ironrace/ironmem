@@ -50,10 +50,15 @@ impl Database {
     /// Open an EXISTING database with a caller-bounded busy timeout and **no
     /// migration**. For latency-critical hot paths (the UserPromptSubmit hook)
     /// that must never pay the default 5 s busy timeout or run schema
-    /// migrations. Errors if the file does not exist or cannot be opened.
+    /// migrations. Uses `SQLITE_OPEN_READ_WRITE` WITHOUT `_CREATE`, so a missing
+    /// file errors instead of being silently created.
     pub fn open_with_busy_timeout(path: &Path, busy: Duration) -> Result<Self, MemoryError> {
-        let conn = Connection::open(path)?;
+        let conn = Connection::open_with_flags(
+            path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )?;
         conn.busy_timeout(busy)?;
+        conn.execute_batch("PRAGMA foreign_keys=ON;")?;
         Ok(Self { conn })
     }
 
@@ -329,6 +334,19 @@ mod tests {
         let db = Database::open_with_busy_timeout(&path, Duration::from_millis(50)).unwrap();
         let n = db.count_drawers(None).unwrap();
         assert_eq!(n, 0);
+    }
+
+    #[test]
+    fn open_with_busy_timeout_errors_on_missing_file() {
+        use std::time::Duration;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("nope.sqlite3");
+        let result = Database::open_with_busy_timeout(&path, Duration::from_millis(50));
+        assert!(
+            result.is_err(),
+            "missing DB file must error, not be created"
+        );
+        assert!(!path.exists(), "must not create the file");
     }
 
     #[test]
