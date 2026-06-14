@@ -20,6 +20,12 @@ const REVIEW_WING: &str = "reviews";
 const REVIEW_MAX_BYTES: usize = 24_000;
 const METRICS_TRANSCRIPT_TAIL_BYTES: u64 = 2 * 1024 * 1024;
 
+/// ~400-token budget for the injected block (~4 chars/token).
+const SESSION_CONTEXT_MAX_BYTES: usize = 1600;
+const SESSION_CONTEXT_DIARY_EXCERPT_BYTES: usize = 200;
+const SESSION_CONTEXT_TOP_N: usize = 5;
+const SESSION_CONTEXT_SHORT_ID: usize = 8;
+
 static REVIEW_FILE_REF_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"[A-Za-z0-9_./-]+\.[A-Za-z0-9]+:\d+").unwrap());
 static REVIEW_PR_RE: LazyLock<Regex> =
@@ -90,7 +96,7 @@ fn run_hook_with_input(
     } else {
         None
     };
-    let response = HookResponse {
+    let mut response = HookResponse {
         decision: None,
         reason: None,
         hook: hook_name.to_string(),
@@ -104,6 +110,17 @@ fn run_hook_with_input(
     match hook_name {
         "session-start" => {
             ensure_bootstrapped(&app, bootstrap_workspace)?;
+            // Claude Code-specific: push a compact memory status block via
+            // hookSpecificOutput.additionalContext. Codex has no such channel,
+            // so it silently degrades (field stays None → omitted from JSON).
+            if !harness.starts_with("codex") {
+                if let Some(ctx) = build_session_start_context(&app, workspace_root.as_deref()) {
+                    response.hook_specific_output = Some(HookSpecificOutput {
+                        hook_event_name: "SessionStart".to_string(),
+                        additional_context: ctx,
+                    });
+                }
+            }
         }
         "precompact" | "stop" => {
             ensure_bootstrapped(&app, bootstrap_workspace)?;
@@ -518,6 +535,116 @@ fn truncate_text_to_byte_limit(text: &str, max_bytes: usize) -> String {
         end = next;
     }
     text[..end].to_string()
+}
+
+/// Normalize free-text (diary/drawer content) for safe inclusion in the
+/// session-start context block: trim, collapse any whitespace/control run to a
+/// single space, then byte-cap on a char boundary. serde handles JSON escaping
+/// when the enclosing `HookResponse` is serialized.
+fn compact_excerpt(text: &str, max_bytes: usize) -> String {
+    let mut out = String::with_capacity(text.len().min(max_bytes + 4));
+    let mut prev_space = false;
+    for ch in text.trim().chars() {
+        if ch.is_whitespace() || ch.is_control() {
+            if !prev_space {
+                out.push(' ');
+                prev_space = true;
+            }
+        } else {
+            out.push(ch);
+            prev_space = false;
+        }
+    }
+    truncate_text_to_byte_limit(out.trim_end(), max_bytes)
+}
+
+/// Build the compact session-start memory block (Claude Code only). Every read
+/// is best-effort: on a DB error we `warn!` and drop that line rather than fail
+/// the hook. Returns `None` only if nothing could be assembled. The active
+/// collab session and diary pointer come from the DB because this hook runs in
+/// a separate process where `App::active_collab_session_snapshot()` is empty.
+fn build_session_start_context(app: &App, workspace_root: Option<&Path>) -> Option<String> {
+    let mut lines: Vec<String> = Vec::new();
+
+    // 1. Drawer total + top wings (re-sorted by count desc; DB returns alphabetical).
+    match app.db.count_drawers(None) {
+        Ok(total) => {
+            let mut wings = app.db.wing_counts().unwrap_or_default();
+            wings.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+            let n_wings = wings.len();
+            let top: Vec<String> = wings
+                .iter()
+                .take(SESSION_CONTEXT_TOP_N)
+                .map(|(w, c)| format!("{w}:{c}"))
+                .collect();
+            if top.is_empty() {
+                lines.push(format!("[ironmem] {total} drawers"));
+            } else {
+                lines.push(format!(
+                    "[ironmem] {total} drawers · {n_wings} wings (top: {})",
+                    top.join(", ")
+                ));
+            }
+        }
+        Err(e) => tracing::warn!("session-start context: drawer counts unavailable: {e}"),
+    }
+
+    // 1b. Top rooms across all wings (count desc).
+    match app.db.room_counts(None) {
+        Ok(mut rooms) => {
+            rooms.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+            let top: Vec<String> = rooms
+                .iter()
+                .take(SESSION_CONTEXT_TOP_N)
+                .map(|(r, c)| format!("{r}:{c}"))
+                .collect();
+            if !top.is_empty() {
+                lines.push(format!("rooms (top: {})", top.join(", ")));
+            }
+        }
+        Err(e) => tracing::warn!("session-start context: room counts unavailable: {e}"),
+    }
+
+    // 2. Active collab session + phase (DB-backed; snapshot is empty in the hook process).
+    if let Some(root) = workspace_root {
+        let repo_path = root.to_string_lossy();
+        match app.db.with_transaction(|tx| {
+            crate::collab::queue::find_active_session_by_repo(tx, repo_path.as_ref())
+        }) {
+            Ok(Some((id, phase))) => {
+                let short = id.get(..SESSION_CONTEXT_SHORT_ID).unwrap_or(&id);
+                lines.push(format!("collab {short} @ {phase}"));
+            }
+            Ok(None) => {}
+            Err(e) => tracing::warn!("session-start context: active collab lookup failed: {e}"),
+        }
+    }
+
+    // 3. Last diary pointer (most recent entry in the diary wing, any room).
+    match app.db.get_drawers(Some("diary"), None, 1) {
+        Ok(entries) => {
+            if let Some(d) = entries.first() {
+                let short = d.id.get(..SESSION_CONTEXT_SHORT_ID).unwrap_or(&d.id);
+                let excerpt = compact_excerpt(&d.content, SESSION_CONTEXT_DIARY_EXCERPT_BYTES);
+                lines.push(format!("last diary {} ({short}): {excerpt}", d.date));
+            }
+        }
+        Err(e) => tracing::warn!("session-start context: diary lookup failed: {e}"),
+    }
+
+    // 4. Memory protocol (verbatim).
+    lines.push(format!(
+        "MEMORY_PROTOCOL: {}",
+        crate::bootstrap::MEMORY_PROTOCOL
+    ));
+
+    if lines.is_empty() {
+        return None;
+    }
+    Some(truncate_text_to_byte_limit(
+        &lines.join("\n"),
+        SESSION_CONTEXT_MAX_BYTES,
+    ))
 }
 
 fn sanitize_path_for_log(raw: &str) -> String {
@@ -1164,5 +1291,141 @@ mod tests {
         let v = serde_json::to_value(&some).unwrap();
         assert_eq!(v["hookSpecificOutput"]["hookEventName"], "SessionStart");
         assert_eq!(v["hookSpecificOutput"]["additionalContext"], "hi");
+    }
+
+    #[test]
+    fn compact_excerpt_collapses_control_chars_and_caps_bytes() {
+        let out = compact_excerpt("  line one\nline\ttwo\r\nthree  ", 1000);
+        assert_eq!(out, "line one line two three");
+        assert!(!out.contains('\n') && !out.contains('\t') && !out.contains('\r'));
+
+        let multi = "é".repeat(50); // 100 bytes
+        let capped = compact_excerpt(&multi, 10);
+        assert!(capped.len() <= 10);
+        assert!(capped.is_char_boundary(capped.len()));
+    }
+
+    fn seed_drawer(app: &App, content: &str, wing: &str, room: &str) {
+        let embedding = {
+            let mut e = app.embedder.write().unwrap();
+            e.embed_one(content).unwrap()
+        };
+        let id = generate_id(content, wing, room);
+        app.db
+            .insert_drawer(&id, content, &embedding, wing, room, "test", "test")
+            .unwrap();
+    }
+
+    #[test]
+    fn build_session_start_context_includes_counts_collab_diary_and_protocol() {
+        let app = App::open_for_test().unwrap();
+        let repo = "/tmp/repo-ctx-87";
+
+        // "zeta" (alphabetically last) gets the MOST drawers; "alpha" the fewest —
+        // proves the count-DESC re-sort actually reorders the alphabetical DB output.
+        for i in 0..3 {
+            seed_drawer(&app, &format!("zeta body {i}"), "zeta", "r");
+        }
+        seed_drawer(&app, "alpha body", "alpha", "r");
+
+        // Long diary entry → must appear as a capped excerpt, never in full.
+        let long_body = "x".repeat(1000);
+        diary::write_entry(&app, &long_body, "diary", "test", 8000).unwrap();
+
+        // Active collab session for this repo.
+        app.db
+            .with_transaction(|tx| {
+                crate::collab::queue::create_session(
+                    tx,
+                    "ctxsess-1234abcd",
+                    repo,
+                    "main",
+                    None,
+                    crate::collab::Agent::Claude,
+                )
+            })
+            .unwrap();
+
+        let block = build_session_start_context(&app, Some(std::path::Path::new(repo))).unwrap();
+
+        assert!(block.contains("drawers"), "drawer count line present");
+        let zpos = block.find("zeta").expect("zeta listed");
+        let apos = block.find("alpha").expect("alpha listed");
+        assert!(
+            zpos < apos,
+            "top wings must be sorted by count desc, not alphabetical"
+        );
+        assert!(
+            block.contains("collab ctxsess"),
+            "active collab line present"
+        );
+        assert!(block.contains("last diary"), "diary pointer present");
+        assert!(
+            !block.contains(&long_body),
+            "diary body must be excerpted, not dumped"
+        );
+        assert!(block.contains("MEMORY_PROTOCOL"), "memory protocol present");
+        assert!(
+            block.len() <= SESSION_CONTEXT_MAX_BYTES,
+            "within byte budget"
+        );
+    }
+
+    #[test]
+    fn session_start_claude_emits_hook_specific_output() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = temp.path().join("workspace");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let config = Config {
+            db_path: temp.path().join("memory.sqlite3"),
+            model_dir: temp.path().join("model"),
+            model_dir_explicit: true,
+            state_dir: temp.path().join("hook_state"),
+            mcp_access_mode: McpAccessMode::Trusted,
+            embed_mode: EmbedMode::Noop,
+        };
+        let resp = run_hook_with_input(
+            "session-start",
+            "claude-code",
+            config,
+            serde_json::json!({ "cwd": workspace, "session_id": "s-cc" }),
+        )
+        .unwrap();
+        let v = serde_json::to_value(&resp).unwrap();
+        assert_eq!(v["hookSpecificOutput"]["hookEventName"], "SessionStart");
+        let ctx = v["hookSpecificOutput"]["additionalContext"]
+            .as_str()
+            .unwrap();
+        assert!(!ctx.is_empty());
+        assert!(ctx.contains("MEMORY_PROTOCOL"));
+        assert!(ctx.len() <= SESSION_CONTEXT_MAX_BYTES);
+    }
+
+    #[test]
+    fn session_start_codex_omits_hook_specific_output() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = temp.path().join("workspace");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let config = Config {
+            db_path: temp.path().join("memory.sqlite3"),
+            model_dir: temp.path().join("model"),
+            model_dir_explicit: true,
+            state_dir: temp.path().join("hook_state"),
+            mcp_access_mode: McpAccessMode::Trusted,
+            embed_mode: EmbedMode::Noop,
+        };
+        let resp = run_hook_with_input(
+            "session-start",
+            "codex",
+            config,
+            serde_json::json!({ "cwd": workspace, "session_id": "s-cx" }),
+        )
+        .unwrap();
+        let v = serde_json::to_value(&resp).unwrap();
+        assert!(
+            v.get("hookSpecificOutput").is_none(),
+            "codex must silently degrade"
+        );
+        assert_eq!(v["hook"], "session-start");
     }
 }
