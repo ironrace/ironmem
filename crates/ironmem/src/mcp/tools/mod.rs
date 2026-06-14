@@ -293,11 +293,15 @@ pub fn tool_definitions(app: &App) -> Vec<Value> {
         }),
         json!({
             "name": "collab_status",
-            "description": "Return the full collab session state",
+            "description": "Return collab session state. Accepted plans are returned as compact references by default; pass verbose:true to inline full canonical/final plan bodies.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "session_id": { "type": "string" }
+                    "session_id": { "type": "string" },
+                    "verbose": {
+                        "type": "boolean",
+                        "description": "When true, include the full canonical/final plan body alongside the compact reference. Default false (compact reference only)."
+                    }
                 },
                 "required": ["session_id"]
             }
