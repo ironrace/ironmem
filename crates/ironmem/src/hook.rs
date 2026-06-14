@@ -22,7 +22,7 @@ const METRICS_TRANSCRIPT_TAIL_BYTES: u64 = 2 * 1024 * 1024;
 
 /// ~400-token budget for the injected block (~4 chars/token).
 const SESSION_CONTEXT_MAX_BYTES: usize = 1600;
-const SESSION_CONTEXT_DIARY_EXCERPT_BYTES: usize = 200;
+const SESSION_CONTEXT_LABEL_BYTES: usize = 80;
 const SESSION_CONTEXT_TOP_N: usize = 5;
 const SESSION_CONTEXT_SHORT_ID: usize = 8;
 
@@ -567,7 +567,12 @@ fn top_counts(mut pairs: Vec<(String, usize)>, n: usize) -> Vec<String> {
     pairs
         .into_iter()
         .take(n)
-        .map(|(name, count)| format!("{name}:{count}"))
+        .map(|(name, count)| {
+            format!(
+                "{}:{count}",
+                compact_excerpt(&name, SESSION_CONTEXT_LABEL_BYTES)
+            )
+        })
         .collect()
 }
 
@@ -633,12 +638,13 @@ fn build_session_start_context(app: &App, workspace_root: Option<&Path>) -> Opti
     }
 
     // 3. Last diary pointer (most recent entry in the diary wing, any room).
+    // Do not inject diary body text at session start; it is prior free-form
+    // memory content and should be fetched deliberately via memory tools.
     match app.db.get_drawers(Some("diary"), None, 1) {
         Ok(entries) => {
             if let Some(d) = entries.first() {
                 let short = d.id.get(..SESSION_CONTEXT_SHORT_ID).unwrap_or(&d.id);
-                let excerpt = compact_excerpt(&d.content, SESSION_CONTEXT_DIARY_EXCERPT_BYTES);
-                lines.push(format!("last diary {} ({short}): {excerpt}", d.date));
+                lines.push(format!("last diary {} ({short})", d.date));
             }
         }
         Err(e) => tracing::warn!("session-start context: diary lookup failed: {e}"),
@@ -1340,8 +1346,9 @@ mod tests {
         }
         seed_drawer(&app, "alpha body", "alpha", "r");
 
-        // Long diary entry → must appear as a capped excerpt, never in full.
-        let long_body = "x".repeat(1000);
+        // Diary entry content must never be injected automatically; session
+        // start includes only a date/id pointer.
+        let long_body = format!("DIARY_PROMPT_INJECTION_DO_NOT_LEAK {}", "x".repeat(1000));
         diary::write_entry(&app, &long_body, "diary", "test", 8000).unwrap();
 
         // Active collab session for this repo.
@@ -1367,14 +1374,24 @@ mod tests {
             zpos < apos,
             "top wings must be sorted by count desc, not alphabetical"
         );
+        let rooms_line = block
+            .lines()
+            .find(|line| line.starts_with("rooms (top: "))
+            .expect("room counts listed");
+        let rooms = rooms_line.find("r:4").expect("r room count listed");
+        let diary = rooms_line.find("diary:1").expect("diary room count listed");
+        assert!(
+            rooms < diary,
+            "top rooms must be sorted by count desc, not alphabetical"
+        );
         assert!(
             block.contains("collab ctxsess"),
             "active collab line present"
         );
         assert!(block.contains("last diary"), "diary pointer present");
         assert!(
-            !block.contains(&long_body),
-            "diary body must be excerpted, not dumped"
+            !block.contains("DIARY_PROMPT_INJECTION_DO_NOT_LEAK"),
+            "diary body must not be injected into session-start context"
         );
         assert!(block.contains("MEMORY_PROTOCOL"), "memory protocol present");
         assert!(

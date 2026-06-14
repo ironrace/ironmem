@@ -787,15 +787,17 @@ mod tests {
         // /repo-a: one ended (older) + one active session.
         create_session(&db, "a-old", "/repo-a", "main", None, Agent::Claude).unwrap();
         end_session(&db, "a-old").unwrap();
-        create_session(&db, "a-active", "/repo-a", "feature", None, Agent::Claude).unwrap();
+        create_session(&db, "a-active-1", "/repo-a", "feature", None, Agent::Claude).unwrap();
+        create_session(&db, "a-active-2", "/repo-a", "other", None, Agent::Claude).unwrap();
         // Different repo must not leak.
         create_session(&db, "b-active", "/repo-b", "main", None, Agent::Claude).unwrap();
 
         let found = find_active_session_by_repo(&db, "/repo-a").unwrap();
-        assert_eq!(found.map(|(id, _)| id), Some("a-active".to_string()));
+        assert_eq!(found.map(|(id, _)| id), Some("a-active-2".to_string()));
 
         // Repo with only an ended session → None.
-        end_session(&db, "a-active").unwrap();
+        end_session(&db, "a-active-1").unwrap();
+        end_session(&db, "a-active-2").unwrap();
         assert!(find_active_session_by_repo(&db, "/repo-a")
             .unwrap()
             .is_none());
