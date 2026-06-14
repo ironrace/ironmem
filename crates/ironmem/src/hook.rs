@@ -989,6 +989,15 @@ mod tests {
 
     static ENV_MUTEX: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
+    /// Drop guard that removes `IRONMEM_PROMPT_HOOK_BUDGET_MS` on scope exit,
+    /// including on panic/unwind, so the var never leaks to other ENV_MUTEX tests.
+    struct PromptHookBudgetEnvGuard;
+    impl Drop for PromptHookBudgetEnvGuard {
+        fn drop(&mut self) {
+            std::env::remove_var("IRONMEM_PROMPT_HOOK_BUDGET_MS");
+        }
+    }
+
     #[test]
     fn parses_workspace_root_from_payload() {
         let payload = serde_json::json!({
@@ -2236,6 +2245,7 @@ mod tests {
         use std::time::Instant;
         let _env = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
         std::env::set_var("IRONMEM_PROMPT_HOOK_BUDGET_MS", "150");
+        let _budget_guard = PromptHookBudgetEnvGuard;
 
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("m.sqlite3");
@@ -2270,6 +2280,7 @@ mod tests {
         );
 
         // Latency: p95 over N runs <= 150ms.
+        // 40 samples → p95 = samples[37]; enough to smooth warm-up without slowing the test.
         let n = 40;
         let mut samples = Vec::with_capacity(n);
         for i in 0..n {
@@ -2292,7 +2303,5 @@ mod tests {
             p95 <= 150,
             "p95 {p95}ms exceeds 150ms budget; samples={samples:?}"
         );
-
-        std::env::remove_var("IRONMEM_PROMPT_HOOK_BUDGET_MS");
     }
 }
