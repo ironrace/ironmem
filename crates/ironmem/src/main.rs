@@ -67,6 +67,15 @@ enum Commands {
         #[arg(long)]
         json: bool,
     },
+    /// Write the ironmem memory-protocol managed block into rules file(s) (explicit opt-in)
+    WriteRules {
+        /// Target file. Omit to write BOTH CLAUDE.md and AGENTS.md.
+        #[arg(long, value_parser = ["CLAUDE.md", "AGENTS.md"])]
+        target: Option<String>,
+        /// Directory containing the target file(s)
+        #[arg(long, default_value = ".")]
+        workspace: String,
+    },
 }
 
 #[tokio::main]
@@ -173,6 +182,24 @@ async fn run(cli: Cli) -> Result<(), MemoryError> {
                 println!("{}", serde_json::to_string_pretty(&report)?);
             } else {
                 println!("{}", report::render_text(&report));
+            }
+            Ok(())
+        }
+        Commands::WriteRules { target, workspace } => {
+            use ironmem::write_rules::{write_rules_file, WriteOutcome};
+            let targets: Vec<&str> = match target.as_deref() {
+                Some(t) => vec![t],
+                None => vec!["CLAUDE.md", "AGENTS.md"],
+            };
+            for name in targets {
+                let path = std::path::Path::new(&workspace).join(name);
+                let outcome = write_rules_file(&path, bootstrap::MEMORY_PROTOCOL)?;
+                let label = match outcome {
+                    WriteOutcome::Created => "created",
+                    WriteOutcome::Updated => "updated",
+                    WriteOutcome::Unchanged => "unchanged",
+                };
+                eprintln!("ironmem write-rules: {label} {}", path.display());
             }
             Ok(())
         }
