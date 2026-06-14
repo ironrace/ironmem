@@ -92,6 +92,25 @@ Codex also receives the `pr-review-toolkit` skill used by the `/collab`
 Existing identical skills are skipped. Existing divergent skills are left in place unless you pass `--force-skills`; use `--skip-skills` when you only want to replace the binary.
 For Claude Code, the installer also installs the `code-reviewer` agent used by the vendored review flow.
 
+## CLI
+
+### `ironmem write-rules`
+
+Stamp the canonical memory-protocol guidance into your rules files as an
+idempotent, marker-delimited managed block:
+
+```bash
+# Write both CLAUDE.md and AGENTS.md in the current directory
+ironmem write-rules
+
+# Target a single file, or a different workspace
+ironmem write-rules --target AGENTS.md --workspace /path/to/repo
+```
+
+The block is sourced from a single in-source constant and is safe to re-run —
+it replaces only the managed block and never touches surrounding content.
+**Explicit opt-in only: no hook ever runs this for you.**
+
 ## Current Status
 
 - MCP server works over stdio with non-blocking startup (responds to `initialize` in <25 ms)
