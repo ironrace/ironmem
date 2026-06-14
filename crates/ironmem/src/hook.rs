@@ -40,6 +40,8 @@ pub struct HookResponse {
     pub hook: String,
     pub harness: String,
     pub workspace_root: Option<String>,
+    /// Claude Code `SessionStart` additional-context payload. Populated only for
+    /// non-Codex harnesses on `session-start`; omitted from JSON when `None`.
     #[serde(rename = "hookSpecificOutput", skip_serializing_if = "Option::is_none")]
     pub hook_specific_output: Option<HookSpecificOutput>,
 }
@@ -61,6 +63,12 @@ struct StoredReview {
     room: String,
 }
 
+/// Run a session lifecycle hook, reading the harness JSON payload from stdin.
+///
+/// `harness` gates harness-specific output: on `session-start` a non-Codex
+/// harness (Claude Code) receives a compact memory-status block in the returned
+/// [`HookResponse::hook_specific_output`]; Codex omits it (silent degrade). The
+/// returned [`HookResponse`] is what the CLI serializes to stdout for the harness.
 pub fn run_hook(
     hook_name: &str,
     harness: &str,
@@ -581,7 +589,9 @@ fn top_counts(mut pairs: Vec<(String, usize)>, n: usize) -> Vec<String> {
 /// the hook. `MEMORY_PROTOCOL` is always included with a reserved byte budget so
 /// a pile of long wing/room names can never truncate the one behavior-changing
 /// line; the status lines share whatever budget is left and may be dropped or
-/// truncated. The active collab session and diary pointer come from the DB
+/// truncated. Because `MEMORY_PROTOCOL` is that floor, this currently always
+/// returns `Some` — the `Option` lets callers treat an empty block as "nothing
+/// to inject". The active collab session and diary pointer come from the DB
 /// because this hook runs in a separate process where
 /// `App::active_collab_session_snapshot()` is empty.
 fn build_session_start_context(app: &App, workspace_root: Option<&Path>) -> Option<String> {
@@ -625,11 +635,15 @@ fn build_session_start_context(app: &App, workspace_root: Option<&Path>) -> Opti
     // 2. Active collab session + phase (DB-backed; snapshot is empty in the hook process).
     if let Some(root) = workspace_root {
         let repo_path = root.to_string_lossy();
-        match app.db.with_transaction(|tx| {
-            crate::collab::queue::find_active_session_by_repo(tx, repo_path.as_ref())
+        match app.db.with_connection(|conn| {
+            crate::collab::queue::find_active_session_by_repo(conn, repo_path.as_ref())
         }) {
             Ok(Some((id, phase))) => {
                 let short = id.get(..SESSION_CONTEXT_SHORT_ID).unwrap_or(&id);
+                // Normalize the phase like wing/room names: every DB-derived
+                // field is sanitized at the injection boundary (defense-in-depth,
+                // though `phase` is written only from the closed `Phase` enum).
+                let phase = compact_excerpt(&phase, SESSION_CONTEXT_LABEL_BYTES);
                 lines.push(format!("collab {short} @ {phase}"));
             }
             Ok(None) => {}

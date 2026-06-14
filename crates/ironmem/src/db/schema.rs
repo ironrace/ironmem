@@ -175,6 +175,17 @@ impl Database {
         Ok(result)
     }
 
+    /// Borrow the underlying connection for a read-only closure. Unlike
+    /// [`Self::with_transaction`], this opens no transaction — use it for plain
+    /// `SELECT`s (e.g. the session-start hook reading collab/diary state) so a
+    /// read is not wrapped in a write-capable `BEGIN`/`COMMIT`.
+    pub fn with_connection<T>(
+        &self,
+        f: impl FnOnce(&Connection) -> Result<T, MemoryError>,
+    ) -> Result<T, MemoryError> {
+        f(&self.conn)
+    }
+
     /// Load all vectors from the drawers table for HNSW index building.
     /// Returns (id, embedding) pairs.
     pub fn load_all_vectors(&self) -> Result<Vec<(String, Vec<f32>)>, MemoryError> {
