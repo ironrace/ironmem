@@ -394,6 +394,9 @@ fn sample_prompt_occupancy(
     if session_id == "unknown" {
         return;
     }
+    // Full budget as the busy-timeout cap (not the remaining slice): the caller
+    // only reaches here with >=PROMPT_HOOK_OCCUPANCY_RESERVE_MS headroom, and this
+    // is a short-lived process that exits right after the hook returns.
     let Ok(db) = crate::db::schema::Database::open_with_busy_timeout(
         &config.db_path,
         Duration::from_millis(crate::search::tunables::prompt_hook_budget_ms()),
@@ -2064,6 +2067,7 @@ mod tests {
     #[test]
     fn prompt_hook_writes_occupancy_sample() {
         use crate::metrics::METRICS_ENV_LOCK;
+        let _env = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
         let _g = METRICS_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         std::env::set_var("IRONMEM_METRICS", "1");
 
