@@ -100,16 +100,18 @@ Stamp the canonical memory-protocol guidance into your rules files as an
 idempotent, marker-delimited managed block:
 
 ```bash
-# Write both CLAUDE.md and AGENTS.md in the current directory
+# Write both CLAUDE.md and AGENTS.md in the current directory.
+# With no --target, all targets are validated before any file is written.
 ironmem write-rules
 
-# Target a single file, or a different workspace
+# Write a single file (--target accepts only CLAUDE.md or AGENTS.md),
+# optionally in a different directory via --workspace.
 ironmem write-rules --target AGENTS.md --workspace /path/to/repo
 ```
 
-The block is sourced from a single in-source constant and is safe to re-run —
-it replaces only the managed block and never touches surrounding content.
-**Explicit opt-in only: no hook ever runs this for you.**
+The block is sourced from a single in-source constant (`MEMORY_PROTOCOL`) and is
+safe to re-run — it replaces only the managed block and never touches surrounding
+content. **Explicit opt-in only: no hook ever runs this for you.**
 
 ## Current Status
 

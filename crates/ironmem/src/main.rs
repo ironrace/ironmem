@@ -195,6 +195,12 @@ async fn run(cli: Cli) -> Result<(), MemoryError> {
                 .iter()
                 .map(|name| std::path::Path::new(&workspace).join(name))
                 .collect();
+            // For the default two-file run, pre-validate every target so a
+            // malformed managed block in one file aborts before any file is
+            // written. This makes *validation* all-or-nothing; the writes
+            // themselves are still applied sequentially (a write-time I/O error
+            // on the second file leaves the first written). Single-target runs
+            // need no preflight — there is nothing to roll back.
             if target.is_none() {
                 for path in &paths {
                     validate_rules_file(path, bootstrap::MEMORY_PROTOCOL)?;
