@@ -47,6 +47,16 @@ impl Database {
         Ok(Self { conn })
     }
 
+    /// Open an EXISTING database with a caller-bounded busy timeout and **no
+    /// migration**. For latency-critical hot paths (the UserPromptSubmit hook)
+    /// that must never pay the default 5 s busy timeout or run schema
+    /// migrations. Errors if the file does not exist or cannot be opened.
+    pub fn open_with_busy_timeout(path: &Path, busy: Duration) -> Result<Self, MemoryError> {
+        let conn = Connection::open(path)?;
+        conn.busy_timeout(busy)?;
+        Ok(Self { conn })
+    }
+
     /// Execute raw SQL against the connection. Test-only fixture for putting the
     /// schema into a failure state (e.g. dropping a table) so error-propagation
     /// paths can be exercised. Compiled out of release builds.
@@ -305,6 +315,20 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("sub").join("test.db");
         (dir, db_path)
+    }
+
+    #[test]
+    fn open_with_busy_timeout_reads_without_migrating() {
+        use std::time::Duration;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("m.sqlite3");
+        {
+            let db = Database::open(&path).unwrap();
+            db.migrate().unwrap();
+        }
+        let db = Database::open_with_busy_timeout(&path, Duration::from_millis(50)).unwrap();
+        let n = db.count_drawers(None).unwrap();
+        assert_eq!(n, 0);
     }
 
     #[test]

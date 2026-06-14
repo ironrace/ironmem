@@ -242,6 +242,7 @@ pub(crate) fn hook_event_for(hook_name: &str) -> Option<&'static str> {
         "session-start" => Some("session-start"),
         "stop" => Some("session-stop"),
         "precompact" => Some("precompact"),
+        "user-prompt-submit" => Some("user-prompt-submit"),
         _ => None,
     }
 }
@@ -312,6 +313,14 @@ pub(crate) static METRICS_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn hook_event_for_maps_user_prompt_submit() {
+        assert_eq!(
+            hook_event_for("user-prompt-submit"),
+            Some("user-prompt-submit")
+        );
+    }
 
     #[test]
     fn phase_bucket_maps_every_variant_per_spec_3_2() {

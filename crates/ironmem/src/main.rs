@@ -46,7 +46,7 @@ enum Commands {
     },
     /// Run a hook (called by Claude Code / Codex)
     Hook {
-        /// Hook name: stop, precompact, session-start
+        /// Hook name: stop, precompact, session-start, user-prompt-submit
         name: String,
         /// Harness: claude-code, codex
         #[arg(long, default_value = "claude-code")]

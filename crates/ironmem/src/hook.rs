@@ -80,6 +80,18 @@ impl HookSpecificOutput {
             additional_context,
         }
     }
+
+    /// Construct the `UserPromptSubmit` additional-context payload. Single
+    /// callsite for the (runtime-validated) `hookEventName`, same rationale as
+    /// `session_start`.
+    // wired up in the user-prompt-submit arm (next task)
+    #[allow(dead_code)]
+    fn user_prompt_submit(additional_context: String) -> Self {
+        Self {
+            hook_event_name: "UserPromptSubmit".to_string(),
+            additional_context,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1662,6 +1674,14 @@ mod tests {
             emits("gemini"),
             "non-codex harness must emit additionalContext"
         );
+    }
+
+    #[test]
+    fn user_prompt_submit_output_has_correct_event_name() {
+        let out = HookSpecificOutput::user_prompt_submit("hello".into());
+        let v = serde_json::to_value(&out).unwrap();
+        assert_eq!(v["hookEventName"], "UserPromptSubmit");
+        assert_eq!(v["additionalContext"], "hello");
     }
 
     #[test]
