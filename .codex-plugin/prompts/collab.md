@@ -2,8 +2,9 @@
 description: Join (or start) an IronRace bounded collab session with Claude. Covers v1 planning (draft + review), the v3 global review pass (Codex's mandatory coding turn), and the optional Codex-implementer batch phase when the session is assigned with --implementer=codex. Usage — /collab join [--implementer=claude|codex] <session_id>  |  /collab start <task>
 ---
 
-<!-- DERIVED FROM docs/COLLAB.md — any protocol change must update BOTH this
-file and .claude-plugin/commands/collab.md. -->
+<!-- DERIVED FROM docs/COLLAB.md — any protocol change must update all three
+in lockstep: docs/COLLAB.md, .claude-plugin/commands/collab.md, and this
+file (.codex-plugin/prompts/collab.md). -->
 
 You are participating in the IronRace bounded collaboration protocol (v1
 planning + v3 coding) as **Codex**. Full spec: `docs/COLLAB.md`. The user
@@ -194,7 +195,7 @@ Claude's dispatch will still complete cleanly.
 |---|---|
 | `PlanParallelDrafts` | If you haven't submitted yet, write your draft and send `topic="draft"`, `sender="codex"`. If already submitted, `is_my_turn` should be false — exit. |
 | `PlanSynthesisPending` | Claude's turn. Exit. |
-| `PlanCodexReviewPending` | Read Claude's canonical plan from the recv'd message. Call `collab_send` with `sender="codex"`, `topic="review"`, `content=<JSON {"verdict":"...","notes":["..."]}>`. Allowed verdicts: `approve`, `approve_with_minor_edits`, `request_changes`. Shortcut: if verdict is exactly `approve`, you may call `collab_approve` with `agent="codex"`, `content_hash=<canonical_plan_hash from collab_status>` instead. **Review cap (server-enforced):** you have at most **2 plan review rounds** (`MAX_REVIEW_ROUNDS = 2` at `crates/ironmem/src/collab/state_machine/mod.rs:28`). On your 2nd review the server force-finalizes to `PlanClaudeFinalizePending` regardless of verdict — `request_changes` does not extend the loop. Frame your notes accordingly: surface every concern in round 1 if you can, because Claude has the last word on round 2. Do NOT treat planning as open-ended iteration. |
+| `PlanCodexReviewPending` | Read Claude's canonical plan from the recv'd message. Call `collab_send` with `sender="codex"`, `topic="review"`, `content=<JSON {"verdict":"...","notes":["..."]}>`. Allowed verdicts: `approve`, `approve_with_minor_edits`, `request_changes`. Shortcut: if verdict is exactly `approve`, you may call `collab_approve` with `agent="codex"`, `content_hash=<canonical_plan_hash from collab_status>` instead. **Review cap (server-enforced):** you have at most **2 plan review rounds** (`MAX_REVIEW_ROUNDS = 2` at `crates/ironmem/src/collab/state_machine/mod.rs:28`). On your 2nd review the server force-finalizes to `PlanClaudeFinalizePending` regardless of verdict — `request_changes` does not extend the loop. Frame your notes accordingly: surface every concern in round 1 if you can, because Claude has the last word on round 2. Do NOT treat planning as open-ended iteration. **Note:** read the canonical plan body from the recv'd message (as above). By default `collab_status` returns accepted plans as compact references only (`canonical_plan_ref`/`final_plan_ref` = `{drawer_id, hash, first_200_chars}`); if you ever need the full plan body from status instead of the message, call `collab_status` with `verbose:true`, which inlines `canonical_plan` and the normalized already-parsed `final_plan` string. |
 | `PlanClaudeFinalizePending` | Claude's turn. Exit. |
 
 ## v3 Dispatch Loop (Phase → Action Table)

@@ -9,13 +9,65 @@ use crate::error::MemoryError;
 use crate::mcp::app::App;
 use crate::sanitize;
 
-use super::collab_events::{build_collab_event, failure_report_is_off_turn_admissible};
+use super::collab_events::{
+    build_collab_event, failure_report_is_off_turn_admissible, parse_final_payload,
+};
 use super::shared::{
     other_agent, require_agent, require_implementer, require_str, MAX_COLLAB_CONTENT_CHARS,
 };
 
+/// Wing/room under which accepted plan bodies are filed as drawers. Runtime
+/// collab paths dereference these drawers by id; the dedicated room keeps them
+/// auditable/filterable even though the generic drawer FTS index still sees
+/// their content.
+const COLLAB_PLAN_WING: &str = "ironrace-memory";
+const COLLAB_PLAN_ROOM: &str = "collab-plans";
+
 pub(super) fn collab_error_to_memory_error(error: CollabError) -> MemoryError {
     MemoryError::Validation(error.to_string())
+}
+
+/// Store an accepted plan body as a `collab-plans` drawer and return its
+/// deterministic 32-char id. `topic` must be `"canonical"` (body = raw
+/// content) or `"final"` (body = parsed plan text, so `final_plan_hash` —
+/// sha256 of the parsed text — verifies the stored body); any other topic is
+/// rejected loudly rather than silently filed. These drawers are dereferenced
+/// by id and are not intended for recall, so they carry a full zero vector
+/// rather than an empty slice: `insert_drawer_tx` does not validate embedding
+/// length, but the HNSW index-load path (`load_all_vectors` in `db/schema.rs`)
+/// skips — with a per-row warning — any drawer whose embedding length is not
+/// `EMBED_DIM`. A zero vector stays loadable (contributing no vector signal)
+/// and avoids that warn/skip. Note the generic drawer FTS index still sees
+/// their content (see the `COLLAB_PLAN_ROOM` comment).
+fn store_collab_plan_drawer(
+    tx: &rusqlite::Transaction<'_>,
+    session_id: &str,
+    topic: &str,
+    content: &str,
+) -> Result<String, MemoryError> {
+    use ironrace_embed::embedder::EMBED_DIM;
+    let body = match topic {
+        "canonical" => content.to_string(),
+        "final" => parse_final_payload(content)?,
+        other => {
+            return Err(MemoryError::Validation(format!(
+                "store_collab_plan_drawer: unexpected topic {other:?} (want canonical|final)"
+            )))
+        }
+    };
+    let id = crate::db::drawers::generate_id(&body, COLLAB_PLAN_WING, COLLAB_PLAN_ROOM);
+    let zero = vec![0.0f32; EMBED_DIM];
+    crate::db::schema::Database::insert_drawer_tx(
+        tx,
+        &id,
+        &body,
+        &zero,
+        COLLAB_PLAN_WING,
+        COLLAB_PLAN_ROOM,
+        &format!("collab:{session_id}:{topic}"),
+        "collab",
+    )?;
+    Ok(id)
 }
 
 pub(super) fn session_record_json(record: &SessionRecord) -> Value {
@@ -30,6 +82,8 @@ pub(super) fn session_record_json(record: &SessionRecord) -> Value {
         "codex_draft_hash": record.session.codex_draft_hash.as_deref(),
         "canonical_plan_hash": record.session.canonical_plan_hash.as_deref(),
         "final_plan_hash": record.session.final_plan_hash.as_deref(),
+        "canonical_plan_drawer_id": record.session.canonical_plan_drawer_id.as_deref(),
+        "final_plan_drawer_id": record.session.final_plan_drawer_id.as_deref(),
         "codex_review_verdict": record.session.codex_review_verdict.as_deref(),
         "review_round": record.session.review_round,
         "task_list": record.session.task_list.as_deref(),
@@ -579,6 +633,17 @@ pub(super) fn handle_collab_send(app: &App, args: &Value) -> Result<Value, Memor
         }
 
         session = apply_event(&session, sender, &event).map_err(collab_error_to_memory_error)?;
+        // Persist the accepted plan body by reference. `apply_event` only
+        // records the content hash; here we file the body itself as a
+        // `collab-plans` drawer and stamp its id on the session so later
+        // phases can dereference the full plan text without re-sending it.
+        if topic == "canonical" {
+            session.canonical_plan_drawer_id =
+                Some(store_collab_plan_drawer(tx, session_id, topic, content)?);
+        } else if topic == "final" {
+            session.final_plan_drawer_id =
+                Some(store_collab_plan_drawer(tx, session_id, topic, content)?);
+        }
         // Snapshot the post-event pr_url so the lifecycle writer can stamp it
         // on CodingComplete without an extra DB round-trip.
         let post_pr_url = session.pr_url.clone();
@@ -741,27 +806,116 @@ pub(super) fn handle_collab_ack(app: &App, args: &Value) -> Result<Value, Memory
     Ok(json!({ "ok": true }))
 }
 
+/// Build the compact plan reference object surfaced by `collab_status` when an
+/// accepted plan body is filed as a drawer (post-009 sessions). The full body
+/// is dereferenced by `drawer_id` only on `verbose:true`; here we expose a
+/// fixed-size peek so a joining agent can recognize the plan without paying for
+/// the whole body.
+fn plan_ref_json(drawer_id: &str, hash: Option<&str>, body: &str) -> Value {
+    json!({
+        "drawer_id": drawer_id,
+        "hash": hash,
+        // char-boundary safe: take 200 CHARS, not bytes.
+        "first_200_chars": body.chars().take(200).collect::<String>(),
+    })
+}
+
+/// Render one accepted plan (`canonical` or `final`) into `status`. Post-009
+/// sessions carry a `drawer_id`: we emit a compact `<kind>_plan_ref` and, only
+/// under `verbose`, inline the full `<kind>_plan` body. Pre-009 sessions have a
+/// NULL drawer id; we preserve the historical inline-from-messages behavior.
+fn render_plan(
+    db: &crate::db::schema::Database,
+    status: &mut Value,
+    session_id: &str,
+    kind: &str, // "canonical" | "final"
+    drawer_id: Option<&str>,
+    hash: Option<&str>,
+    verbose: bool,
+) -> Result<(), MemoryError> {
+    let ref_key = format!("{kind}_plan_ref");
+    let body_key = format!("{kind}_plan");
+    match drawer_id {
+        Some(id) => {
+            let drawer = db.get_drawer(id)?.ok_or_else(|| {
+                MemoryError::Validation(format!(
+                    "{kind}_plan_drawer_id {id} points to a missing drawer"
+                ))
+            })?;
+            status[ref_key] = plan_ref_json(id, hash, &drawer.content);
+            if verbose {
+                status[body_key] = Value::String(drawer.content);
+            }
+        }
+        None => {
+            // Legacy (pre-009): drawer id NULL. Inline full body from messages
+            // when the plan hash is present. Canonical was always raw text;
+            // final was stored as {"plan": "..."} but is normalized here so
+            // collab_status consistently exposes final_plan as plan text.
+            // The `parse_final_payload` below cannot fail on a persisted final
+            // message: `build_collab_event` (at the top of `handle_collab_send`,
+            // before `send_message` persists the raw content) already ran
+            // `build_v1_final_event` → `parse_final_payload`, so any stored
+            // `final` is a well-formed {"plan":...} envelope.
+            if hash.is_some() {
+                match db.collab_latest_message_content(session_id, kind)? {
+                    Some(content) => {
+                        let body = if kind == "final" {
+                            parse_final_payload(&content)?
+                        } else {
+                            content
+                        };
+                        status[body_key] = Value::String(body);
+                    }
+                    None => {
+                        // A locked plan hash with no backing message is an
+                        // out-of-band inconsistency (the message is written in
+                        // the same tx as the hash). Surface it rather than
+                        // silently omitting the body so it is observable.
+                        tracing::warn!(
+                            session_id = %session_id,
+                            kind = %kind,
+                            "collab_status: {kind}_plan_hash set but no {kind} message found"
+                        );
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 pub(super) fn handle_collab_status(app: &App, args: &Value) -> Result<Value, MemoryError> {
     let session_id = require_str(args, "session_id")?;
     let record = app.db.collab_load_session_record(session_id)?;
     let mut status = session_record_json(&record);
-    // Surface the locked plan text alongside the hashes so a fresh agent
-    // joining mid-session can build a task_list (or continue a review round)
-    // without having to re-derive content it previously sent but already had
-    // acked off its inbox.
-    if record.session.canonical_plan_hash.is_some() {
-        if let Some(content) = app
-            .db
-            .collab_latest_message_content(session_id, "canonical")?
-        {
-            status["canonical_plan"] = Value::String(content);
-        }
-    }
-    if record.session.final_plan_hash.is_some() {
-        if let Some(content) = app.db.collab_latest_message_content(session_id, "final")? {
-            status["final_plan"] = Value::String(content);
-        }
-    }
+    // Surface the locked plan alongside the hashes so a fresh agent joining
+    // mid-session can build a task_list (or continue a review round) without
+    // re-deriving content it previously sent but already acked off its inbox.
+    // By default this is a compact reference (drawer id + hash + 200-char peek);
+    // the full body is inlined only on `verbose:true`.
+    let verbose = args
+        .get("verbose")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    render_plan(
+        &app.db,
+        &mut status,
+        session_id,
+        "canonical",
+        record.session.canonical_plan_drawer_id.as_deref(),
+        record.session.canonical_plan_hash.as_deref(),
+        verbose,
+    )?;
+    render_plan(
+        &app.db,
+        &mut status,
+        session_id,
+        "final",
+        record.session.final_plan_drawer_id.as_deref(),
+        record.session.final_plan_hash.as_deref(),
+        verbose,
+    )?;
     Ok(status)
 }
 
@@ -930,6 +1084,7 @@ mod tests {
     use super::*;
     use crate::collab::queue::SessionRecord;
     use crate::collab::CollabSession;
+    use std::path::{Path, PathBuf};
     use std::sync::Arc;
 
     // ── test helpers ──────────────────────────────────────────────────────────
@@ -947,6 +1102,20 @@ mod tests {
         };
         // Leak the tempdir so the DB file outlives this helper.
         std::mem::forget(dir);
+        #[allow(clippy::arc_with_non_send_sync)]
+        Arc::new(crate::mcp::app::App::new(config).unwrap())
+    }
+
+    fn test_app_with_db_path(db_path: PathBuf, root: &Path) -> Arc<crate::mcp::app::App> {
+        use crate::config::{Config, EmbedMode, McpAccessMode};
+        let config = Config {
+            db_path,
+            model_dir: root.join("model"),
+            model_dir_explicit: true,
+            state_dir: root.join("state"),
+            mcp_access_mode: McpAccessMode::Trusted,
+            embed_mode: EmbedMode::Noop,
+        };
         #[allow(clippy::arc_with_non_send_sync)]
         Arc::new(crate::mcp::app::App::new(config).unwrap())
     }
@@ -988,7 +1157,7 @@ mod tests {
             sid,
             "claude",
             "final",
-            &format!(r#"{{"plan":"{plan_text}"}}"#),
+            &json!({ "plan": plan_text }).to_string(),
         );
         final_plan_hash
     }
@@ -1522,6 +1691,445 @@ mod tests {
             app.active_collab_session_snapshot().as_deref(),
             Some(first.as_str()),
             "ending a different session must not clear the cell"
+        );
+    }
+
+    // ── plan-by-reference (#90) drawer-persistence tests ──────────────────────
+
+    #[test]
+    fn canonical_send_stores_collab_plan_drawer() {
+        let app = test_app();
+        let sid = start_session(&app);
+        send(&app, &sid, "claude", "draft", "claude draft");
+        send(&app, &sid, "codex", "draft", "codex draft");
+        send(&app, &sid, "claude", "canonical", "CANONICAL BODY");
+
+        let record = app.db.collab_load_session_record(&sid).unwrap();
+        let drawer_id = record
+            .session
+            .canonical_plan_drawer_id
+            .expect("canonical_plan_drawer_id must be set after canonical send");
+        assert_eq!(
+            drawer_id.len(),
+            32,
+            "drawer id must be the 32-char deterministic id"
+        );
+
+        let drawer = app
+            .db
+            .get_drawer(&drawer_id)
+            .unwrap()
+            .expect("stored plan drawer must be fetchable by id");
+        assert_eq!(drawer.content, "CANONICAL BODY");
+        assert_eq!(drawer.room, "collab-plans");
+    }
+
+    #[test]
+    fn final_send_stores_parsed_plan_body_drawer() {
+        let app = test_app();
+        let sid = start_session(&app);
+        send(&app, &sid, "claude", "draft", "claude draft");
+        send(&app, &sid, "codex", "draft", "codex draft");
+        send(&app, &sid, "claude", "canonical", "canonical plan");
+        send(&app, &sid, "codex", "review", r#"{"verdict":"approve"}"#);
+        send(
+            &app,
+            &sid,
+            "claude",
+            "final",
+            r#"{"plan":"FINAL BODY TEXT"}"#,
+        );
+
+        let record = app.db.collab_load_session_record(&sid).unwrap();
+        let drawer_id = record
+            .session
+            .final_plan_drawer_id
+            .expect("final_plan_drawer_id must be set after final send");
+
+        let drawer = app
+            .db
+            .get_drawer(&drawer_id)
+            .unwrap()
+            .expect("stored final plan drawer must be fetchable by id");
+        // Body must be the PARSED plan text, not the JSON wrapper, so the
+        // sha256(final_plan_hash) verifies against the stored body.
+        assert_eq!(drawer.content, "FINAL BODY TEXT");
+        assert_eq!(drawer.room, "collab-plans");
+    }
+
+    #[test]
+    fn final_drawer_body_hashes_to_final_plan_hash() {
+        // The central correctness claim: the stored final drawer body is the
+        // parsed plan text, so its sha256 equals final_plan_hash. This pins the
+        // contract that `build_v1_final_event` (hash) and
+        // `store_collab_plan_drawer` (body) parse identically.
+        let app = test_app();
+        let sid = start_session(&app);
+        drive_to_final(&app, &sid, "canonical plan", "FINAL BODY TEXT");
+
+        let record = app.db.collab_load_session_record(&sid).unwrap();
+        let drawer_id = record.session.final_plan_drawer_id.clone().unwrap();
+        let final_plan_hash = record.session.final_plan_hash.clone().unwrap();
+        let drawer = app.db.get_drawer(&drawer_id).unwrap().unwrap();
+        assert_eq!(
+            super::super::shared::sha256_hex(&drawer.content),
+            final_plan_hash,
+            "sha256(final drawer body) must equal final_plan_hash"
+        );
+    }
+
+    #[test]
+    fn revision_round_canonical_re_send_overwrites_drawer_id() {
+        // request_changes returns to synthesis; a second, different canonical
+        // body must re-stamp canonical_plan_drawer_id to the v2-derived id.
+        let app = test_app();
+        let sid = start_session(&app);
+        send(&app, &sid, "claude", "draft", "claude draft");
+        send(&app, &sid, "codex", "draft", "codex draft");
+        send(&app, &sid, "claude", "canonical", "CANONICAL V1");
+        send(
+            &app,
+            &sid,
+            "codex",
+            "review",
+            r#"{"verdict":"request_changes"}"#,
+        );
+        send(&app, &sid, "claude", "canonical", "CANONICAL V2");
+
+        let record = app.db.collab_load_session_record(&sid).unwrap();
+        let id = record.session.canonical_plan_drawer_id.unwrap();
+        let id_v1 =
+            crate::db::drawers::generate_id("CANONICAL V1", "ironrace-memory", "collab-plans");
+        let id_v2 =
+            crate::db::drawers::generate_id("CANONICAL V2", "ironrace-memory", "collab-plans");
+        assert_eq!(id, id_v2, "drawer id must point at the v2 body");
+        assert_ne!(id, id_v1);
+        assert_eq!(
+            app.db.get_drawer(&id).unwrap().unwrap().content,
+            "CANONICAL V2"
+        );
+    }
+
+    #[test]
+    fn store_collab_plan_drawer_rejects_unexpected_topic() {
+        // The defensive `other =>` arm must fail loudly, not silently file.
+        let app = test_app();
+        app.db
+            .with_transaction(|tx| {
+                let result = store_collab_plan_drawer(tx, "sess", "draft", "x");
+                assert!(result.is_err(), "unexpected topic must error");
+                let msg = format!("{:?}", result.err().unwrap());
+                assert!(
+                    msg.contains("unexpected topic"),
+                    "error must name the unexpected-topic cause, got: {msg}"
+                );
+                Ok(())
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn status_verbose_false_returns_compact_ref_not_body() {
+        // Explicit verbose:false must behave like the default (compact ref).
+        let app = test_app();
+        let sid = start_session(&app);
+        send(&app, &sid, "claude", "draft", "d");
+        send(&app, &sid, "codex", "draft", "d");
+        send(&app, &sid, "claude", "canonical", "CANONICAL BODY");
+
+        let status =
+            handle_collab_status(&app, &json!({ "session_id": sid, "verbose": false })).unwrap();
+        assert!(status["canonical_plan_ref"].is_object());
+        assert!(
+            status.get("canonical_plan").is_none(),
+            "explicit verbose:false must omit the full body"
+        );
+    }
+
+    #[test]
+    fn canonical_drawer_id_is_deterministic_for_same_body() {
+        let app = test_app();
+        let sid = start_session(&app);
+        send(&app, &sid, "claude", "draft", "claude draft");
+        send(&app, &sid, "codex", "draft", "codex draft");
+        send(&app, &sid, "claude", "canonical", "CANONICAL BODY");
+
+        let record = app.db.collab_load_session_record(&sid).unwrap();
+        let drawer_id = record
+            .session
+            .canonical_plan_drawer_id
+            .expect("canonical_plan_drawer_id must be set");
+        assert_eq!(
+            drawer_id,
+            crate::db::drawers::generate_id("CANONICAL BODY", "ironrace-memory", "collab-plans"),
+        );
+    }
+
+    #[test]
+    fn search_is_safe_after_plan_drawer_stored() {
+        let app = test_app();
+        let sid = start_session(&app);
+        send(&app, &sid, "claude", "draft", "claude draft");
+        send(&app, &sid, "codex", "draft", "codex draft");
+        send(&app, &sid, "claude", "canonical", "CANONICAL BODY");
+
+        // The zero-embedding plan drawer must not break the search pipeline.
+        let filters = crate::db::drawers::SearchFilters {
+            wing: None,
+            room: None,
+            limit: 10,
+        };
+        let result = crate::search::pipeline::search(&app, "canonical body", &filters);
+        assert!(
+            result.is_ok(),
+            "search must not panic or error: {:?}",
+            result.err()
+        );
+    }
+
+    // ── plan-by-reference (#90) collab_status compact-reference tests ──────────
+
+    /// Drive draft → draft → canonical(<body>) → review(approve) → final(<body>)
+    /// so both canonical and final plan drawers are stored.
+    fn drive_to_final(
+        app: &crate::mcp::app::App,
+        sid: &str,
+        canonical_body: &str,
+        final_body: &str,
+    ) {
+        send(app, sid, "claude", "draft", "claude draft");
+        send(app, sid, "codex", "draft", "codex draft");
+        send(app, sid, "claude", "canonical", canonical_body);
+        send(app, sid, "codex", "review", r#"{"verdict":"approve"}"#);
+        send(
+            app,
+            sid,
+            "claude",
+            "final",
+            &json!({ "plan": final_body }).to_string(),
+        );
+    }
+
+    #[test]
+    fn status_default_returns_compact_canonical_ref_not_body() {
+        let app = test_app();
+        let sid = start_session(&app);
+        let big = "X".repeat(20_000);
+        send(&app, &sid, "claude", "draft", "claude draft");
+        send(&app, &sid, "codex", "draft", "codex draft");
+        send(&app, &sid, "claude", "canonical", &big);
+
+        let status = handle_collab_status(&app, &json!({ "session_id": sid })).unwrap();
+
+        let plan_ref = &status["canonical_plan_ref"];
+        assert!(plan_ref.is_object(), "canonical_plan_ref must be an object");
+        assert_eq!(
+            plan_ref["drawer_id"].as_str().unwrap().len(),
+            32,
+            "drawer_id must be the 32-char deterministic id"
+        );
+        assert!(
+            plan_ref["hash"].is_string(),
+            "hash must be a string in the compact ref"
+        );
+        let first_200 = plan_ref["first_200_chars"].as_str().unwrap();
+        assert!(
+            first_200.chars().count() <= 200,
+            "first_200_chars must be at most 200 chars"
+        );
+        assert!(
+            status.get("canonical_plan").is_none(),
+            "full canonical_plan body must be absent by default"
+        );
+        assert!(
+            !serde_json::to_string(&status).unwrap().contains(&big),
+            "full canonical body must not appear anywhere in default status"
+        );
+    }
+
+    #[test]
+    fn status_default_returns_compact_final_ref_not_body() {
+        let app = test_app();
+        let sid = start_session(&app);
+        let big = "Y".repeat(20_000);
+        drive_to_final(&app, &sid, "canonical plan", &big);
+
+        let status = handle_collab_status(&app, &json!({ "session_id": sid })).unwrap();
+
+        let plan_ref = &status["final_plan_ref"];
+        assert!(plan_ref.is_object(), "final_plan_ref must be an object");
+        assert_eq!(
+            plan_ref["drawer_id"].as_str().unwrap().len(),
+            32,
+            "drawer_id must be the 32-char deterministic id"
+        );
+        assert!(
+            plan_ref["hash"].is_string(),
+            "hash must be a string in the compact ref"
+        );
+        let first_200 = plan_ref["first_200_chars"].as_str().unwrap();
+        assert!(
+            first_200.chars().count() <= 200,
+            "first_200_chars must be at most 200 chars"
+        );
+        assert!(
+            status.get("final_plan").is_none(),
+            "full final_plan body must be absent by default"
+        );
+        assert!(
+            !serde_json::to_string(&status).unwrap().contains(&big),
+            "full final body must not appear anywhere in default status"
+        );
+    }
+
+    #[test]
+    fn status_verbose_returns_full_canonical_body() {
+        let app = test_app();
+        let sid = start_session(&app);
+        send(&app, &sid, "claude", "draft", "claude draft");
+        send(&app, &sid, "codex", "draft", "codex draft");
+        send(&app, &sid, "claude", "canonical", "FULL CANONICAL");
+
+        let status =
+            handle_collab_status(&app, &json!({ "session_id": sid, "verbose": true })).unwrap();
+
+        assert_eq!(
+            status["canonical_plan"], "FULL CANONICAL",
+            "verbose must inline the full canonical body"
+        );
+        assert!(
+            status["canonical_plan_ref"].is_object(),
+            "verbose must still include the compact reference"
+        );
+    }
+
+    #[test]
+    fn status_verbose_returns_full_final_body() {
+        let app = test_app();
+        let sid = start_session(&app);
+        drive_to_final(&app, &sid, "canonical plan", "FULL FINAL");
+
+        let status =
+            handle_collab_status(&app, &json!({ "session_id": sid, "verbose": true })).unwrap();
+
+        assert_eq!(
+            status["final_plan"], "FULL FINAL",
+            "verbose must inline the full final body"
+        );
+        assert!(
+            status["final_plan_ref"].is_object(),
+            "verbose must still include the compact final reference"
+        );
+    }
+
+    #[test]
+    fn status_verbose_plan_drawers_survive_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("mem.sqlite3");
+        let sid;
+
+        {
+            let app = test_app_with_db_path(db_path.clone(), dir.path());
+            sid = start_session(&app);
+            drive_to_final(&app, &sid, "REOPEN CANONICAL", "REOPEN FINAL");
+            let status = handle_collab_status(&app, &json!({ "session_id": &sid })).unwrap();
+            assert!(status["canonical_plan_ref"].is_object());
+            assert!(status["final_plan_ref"].is_object());
+        }
+
+        {
+            let app = test_app_with_db_path(db_path, dir.path());
+            let status =
+                handle_collab_status(&app, &json!({ "session_id": &sid, "verbose": true }))
+                    .unwrap();
+            assert_eq!(status["canonical_plan"], "REOPEN CANONICAL");
+            assert_eq!(status["final_plan"], "REOPEN FINAL");
+        }
+    }
+
+    #[test]
+    fn status_legacy_null_drawer_inlines_full_body() {
+        let app = test_app();
+        let sid = start_session(&app);
+        send(&app, &sid, "claude", "draft", "claude draft");
+        send(&app, &sid, "codex", "draft", "codex draft");
+        send(&app, &sid, "claude", "canonical", "LEGACY BODY");
+
+        // Simulate a pre-009 session whose drawer id was never recorded.
+        let mut s = app.db.collab_load_session(&sid).unwrap();
+        s.canonical_plan_drawer_id = None;
+        app.db.collab_save_session(&s).unwrap();
+
+        let status = handle_collab_status(&app, &json!({ "session_id": sid })).unwrap();
+
+        assert_eq!(
+            status["canonical_plan"], "LEGACY BODY",
+            "legacy NULL-drawer path must inline the full body from messages"
+        );
+        assert!(
+            status.get("canonical_plan_ref").is_none(),
+            "legacy path must not emit a compact reference"
+        );
+    }
+
+    #[test]
+    fn status_legacy_null_final_drawer_inlines_parsed_final_plan() {
+        let app = test_app();
+        let sid = start_session(&app);
+        drive_to_final(&app, &sid, "canonical plan", "LEGACY FINAL");
+
+        // Simulate a pre-009 session whose final drawer id was never recorded.
+        let mut s = app.db.collab_load_session(&sid).unwrap();
+        s.final_plan_drawer_id = None;
+        app.db.collab_save_session(&s).unwrap();
+
+        let status = handle_collab_status(&app, &json!({ "session_id": sid })).unwrap();
+
+        assert_eq!(
+            status["final_plan"], "LEGACY FINAL",
+            "legacy NULL-drawer final path must normalize the raw final message to plan text"
+        );
+        assert!(
+            status.get("final_plan_ref").is_none(),
+            "legacy final path must not emit a compact reference"
+        );
+    }
+
+    #[test]
+    fn status_dangling_drawer_id_errors() {
+        let app = test_app();
+        let sid = start_session(&app);
+        send(&app, &sid, "claude", "draft", "claude draft");
+        send(&app, &sid, "codex", "draft", "codex draft");
+        send(&app, &sid, "claude", "canonical", "BODY");
+
+        // Point the session at a drawer id that does not exist.
+        let mut s = app.db.collab_load_session(&sid).unwrap();
+        s.canonical_plan_drawer_id = Some("0".repeat(32));
+        app.db.collab_save_session(&s).unwrap();
+
+        let result = handle_collab_status(&app, &json!({ "session_id": sid }));
+        assert!(
+            result.is_err(),
+            "a dangling drawer id must surface as an error, not a silent empty ref"
+        );
+    }
+
+    #[test]
+    fn status_dangling_final_drawer_id_errors() {
+        let app = test_app();
+        let sid = start_session(&app);
+        drive_to_final(&app, &sid, "canonical plan", "FINAL");
+
+        // Point the session at a drawer id that does not exist.
+        let mut s = app.db.collab_load_session(&sid).unwrap();
+        s.final_plan_drawer_id = Some("1".repeat(32));
+        app.db.collab_save_session(&s).unwrap();
+
+        let result = handle_collab_status(&app, &json!({ "session_id": sid }));
+        assert!(
+            result.is_err(),
+            "a dangling final drawer id must surface as an error, not a silent fallback"
         );
     }
 }

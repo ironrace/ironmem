@@ -293,11 +293,15 @@ pub fn tool_definitions(app: &App) -> Vec<Value> {
         }),
         json!({
             "name": "collab_status",
-            "description": "Return the full collab session state",
+            "description": "Return collab session state. Accepted plans are returned by reference by default — `canonical_plan_ref`/`final_plan_ref` = {drawer_id, hash, first_200_chars}; pass verbose:true to additionally inline the full canonical_plan/final_plan strings. (Legacy pre-009 sessions inline the full body and emit no *_plan_ref.)",
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "session_id": { "type": "string" }
+                    "session_id": { "type": "string" },
+                    "verbose": {
+                        "type": "boolean",
+                        "description": "When true, include the full canonical/final plan body alongside the compact reference. Default false (compact reference only)."
+                    }
                 },
                 "required": ["session_id"]
             }
@@ -365,7 +369,7 @@ pub fn tool_definitions(app: &App) -> Vec<Value> {
         }),
         json!({
             "name": "collab_end",
-            "description": "End a collab session. Valid only from PlanLocked (pre-task_list), CodingComplete, or CodingFailed; rejected in any active planning phase (PlanParallelDrafts through PlanClaudeFinalizePending) or coding-active phase (CodeImplementPending through PrReadyPending). Idempotent once allowed.",
+            "description": "End a collab session. Valid only from PlanLocked (pre-task_list), CodingComplete, or CodingFailed; rejected in any active planning phase (PlanParallelDrafts through PlanClaudeFinalizePending) or coding-active phase (CodeImplementPending through CodeReviewFinalPending). Idempotent once allowed.",
             "inputSchema": {
                 "type": "object",
                 "properties": {

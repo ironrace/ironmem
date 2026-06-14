@@ -191,7 +191,7 @@ Repeat the dispatch loop with these actions:
 | Phase | What to do (is_my_turn == true) |
 |---|---|
 | `PlanParallelDrafts` | Your draft was already sent from the `start` branch. is_my_turn should be false here — if true, verify with `collab_status`. If `collab_status` confirms Claude is the owner in a Codex-owned phase, this is a protocol-level anomaly — exit the loop and report to the user; do not attempt a send. |
-| `PlanSynthesisPending` | Read `review_round` from `collab_status`. **`review_round == 0` (first synthesis): enter Plan Mode and get user approval before sending the `canonical`.** This is the user's primary v1 steering gate — the first artifact that combines both drafts. **`review_round >= 1` (revision rounds, re-entered on `request_changes`): send autonomously, no Plan Mode** — the user's next gate is `final`. In both cases merge both drafts (or revise prior canonical on revision rounds) and call `collab_send` with `sender="claude"`, `topic="canonical"`, `content=<plan text>` (plain text — `draft` and `canonical` are the only v1 topics that are NOT JSON-wrapped). |
+| `PlanSynthesisPending` | Read `review_round` from `collab_status`. **`review_round == 0` (first synthesis): enter Plan Mode and get user approval before sending the `canonical`.** This is the user's primary v1 steering gate — the first artifact that combines both drafts. **`review_round >= 1` (revision rounds, re-entered on `request_changes`): send autonomously, no Plan Mode** — the user's next gate is `final`. In both cases merge both drafts (or revise prior canonical on revision rounds) and call `collab_send` with `sender="claude"`, `topic="canonical"`, `content=<plan text>` (plain text — `draft` and `canonical` are the only v1 topics that are NOT JSON-wrapped). To recover the prior canonical body on a revision round (or after a fresh rejoin), call `collab_status` with `verbose:true` and read `canonical_plan` as the already-parsed plan text — by default `collab_status` returns only the compact `canonical_plan_ref` `{drawer_id, hash, first_200_chars}`, so `verbose:true` is required to inline the full `canonical_plan` string. |
 | `PlanCodexReviewPending` | Codex's turn. is_my_turn should be false — if true, verify with `collab_status`. If the inconsistency persists, exit the loop and report to the user. **Review cap:** the server enforces `MAX_REVIEW_ROUNDS = 2` at `crates/ironmem/src/collab/state_machine/mod.rs:28`. Codex gets at most two review rounds; after the 2nd review the server transitions to `PlanClaudeFinalizePending` regardless of verdict (`approve`, `approve_with_minor_edits`, or `request_changes` all map to the same next phase). Do not model v1 as open-ended iteration. |
 | `PlanClaudeFinalizePending` | **Enter Plan Mode.** Produce the final plan, incorporating Codex's review notes unless they conflict with user intent. Get user approval. Call `collab_send` with `sender="claude"`, `topic="final"`, `content=<JSON string of {"plan":"<full text>"}>` (v1 `final` is the only v1 topic wrapped in JSON). After send, `PlanLocked` is reached. |
 
@@ -209,10 +209,14 @@ enter harness Plan Mode here** — `writing-plans` produces the
 markdown plan and presents its own approval handoff to the user, which
 serves as the gate.
 
-1. Read `final_plan_hash` and `final_plan` from `collab_status(session_id)`.
-   `final_plan` is the JSON string `{"plan":"<full text>"}` Claude
-   previously sent; parse it to recover the approved plan body. Read the
-   current `HEAD` SHA via `git rev-parse HEAD`.
+1. Call `collab_status(session_id)` with `verbose:true` (by default
+   `collab_status` returns only a compact `final_plan_ref`
+   `{drawer_id, hash, first_200_chars}`; `verbose:true` is required to
+   inline the full `final_plan` string). Read `final_plan_hash` and
+   `final_plan` from the response. `final_plan` is normalized to the
+   already-parsed approved plan body, including legacy NULL-drawer sessions
+   whose stored message is still `{"plan":...}` — use it directly, with no
+   unwrap. Read the current `HEAD` SHA via `git rev-parse HEAD`.
 2. **Invoke `Skill('writing-plans')`** with the locked plan
    text as input. The skill will save a markdown plan to
    `docs/superpowers/plans/YYYY-MM-DD-<feature>.md` and present its own

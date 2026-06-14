@@ -518,15 +518,36 @@ fn collab_request_changes_loops_back_to_synthesis_and_locks_after_revision() {
     let status = call_tool(&app, "collab_status", json!({ "session_id": session_id }));
     assert_eq!(status["phase"], "PlanLocked");
     assert_eq!(status["final_plan_hash"], status["canonical_plan_hash"]);
-    // A fresh agent joining at PlanLocked must be able to pull the plan text
-    // back without having to recv its own previously-sent (and peer-acked)
-    // outbound message. collab_status surfaces the latest canonical/final
-    // content alongside the hashes.
-    assert_eq!(status["canonical_plan"], "Merged canonical v2");
+    // Plan-by-reference (#90): by default collab_status now returns only the
+    // compact references, so the full bodies are absent.
+    assert!(status.get("canonical_plan").is_none());
+    assert!(status.get("final_plan").is_none());
     assert_eq!(
-        status["final_plan"],
-        json!({ "plan": "Merged canonical v2" }).to_string()
+        status["canonical_plan_ref"]["drawer_id"]
+            .as_str()
+            .unwrap()
+            .len(),
+        32
     );
+    assert_eq!(
+        status["final_plan_ref"]["drawer_id"]
+            .as_str()
+            .unwrap()
+            .len(),
+        32
+    );
+    // A fresh agent joining at PlanLocked must still be able to pull the full
+    // plan text back without recv'ing its own previously-sent (and peer-acked)
+    // outbound message — now via verbose:true. The final body is the PARSED
+    // plan text (the drawer stores the parsed body, whose sha256 is
+    // final_plan_hash), no longer the {"plan":...} JSON wrapper.
+    let verbose = call_tool(
+        &app,
+        "collab_status",
+        json!({ "session_id": session_id, "verbose": true }),
+    );
+    assert_eq!(verbose["canonical_plan"], "Merged canonical v2");
+    assert_eq!(verbose["final_plan"], "Merged canonical v2");
 }
 
 #[test]
@@ -550,8 +571,16 @@ fn collab_status_omits_plan_text_before_plan_is_sent() {
         "canonical_plan must be absent before any canonical is published"
     );
     assert!(
+        status.get("canonical_plan_ref").is_none(),
+        "canonical_plan_ref must be absent before any canonical is published"
+    );
+    assert!(
         status.get("final_plan").is_none(),
         "final_plan must be absent before PlanLocked"
+    );
+    assert!(
+        status.get("final_plan_ref").is_none(),
+        "final_plan_ref must be absent before PlanLocked"
     );
 }
 

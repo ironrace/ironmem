@@ -12,6 +12,12 @@ pub struct CollabSession {
     pub codex_draft_hash: Option<String>,
     pub canonical_plan_hash: Option<String>,
     pub final_plan_hash: Option<String>,
+    /// Deterministic 32-char drawer id of the canonical plan body once
+    /// accepted (room `collab-plans`). NULL on pre-009 sessions → legacy
+    /// inline path in `collab_status`. See issue #90.
+    pub canonical_plan_drawer_id: Option<String>,
+    /// Deterministic 32-char drawer id of the final (parsed) plan body.
+    pub final_plan_drawer_id: Option<String>,
     pub codex_review_verdict: Option<String>,
     pub review_round: u8,
     // v3 coding fields. `tasks_count` is not stored — it is derived from
@@ -58,6 +64,8 @@ impl CollabSession {
             codex_draft_hash: None,
             canonical_plan_hash: None,
             final_plan_hash: None,
+            canonical_plan_drawer_id: None,
+            final_plan_drawer_id: None,
             codex_review_verdict: None,
             review_round: 0,
             task_list: None,
@@ -97,6 +105,8 @@ impl CollabSession {
             codex_draft_hash: None,
             canonical_plan_hash: None,
             final_plan_hash: None,
+            canonical_plan_drawer_id: None,
+            final_plan_drawer_id: None,
             codex_review_verdict: None,
             review_round: 0,
             task_list: None,
