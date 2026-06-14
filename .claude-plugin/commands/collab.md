@@ -213,9 +213,10 @@ serves as the gate.
    `collab_status` returns only a compact `final_plan_ref`
    `{drawer_id, hash, first_200_chars}`; `verbose:true` is required to
    inline the full `final_plan` string). Read `final_plan_hash` and
-   `final_plan` from the response. `final_plan` is the already-parsed
-   approved plan body — use it directly (no `{"plan":...}` unwrap). Read
-   the current `HEAD` SHA via `git rev-parse HEAD`.
+   `final_plan` from the response. `final_plan` is normalized to the
+   already-parsed approved plan body, including legacy NULL-drawer sessions
+   whose stored message is still `{"plan":...}` — use it directly, with no
+   unwrap. Read the current `HEAD` SHA via `git rev-parse HEAD`.
 2. **Invoke `Skill('writing-plans')`** with the locked plan
    text as input. The skill will save a markdown plan to
    `docs/superpowers/plans/YYYY-MM-DD-<feature>.md` and present its own

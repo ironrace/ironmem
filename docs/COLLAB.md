@@ -95,7 +95,7 @@ Stored in `collab_sessions`:
 | `canonical_plan_hash` | SHA-256 of Claude's synthesis |
 | `canonical_plan` / `canonical_plan_ref` | The latest `canonical` plan (present when `canonical_plan_hash` is set). By default returned as a compact `canonical_plan_ref` `{drawer_id, hash, first_200_chars}`; with `verbose:true` the full `canonical_plan` string (already-parsed text) is inlined. Lets a fresh agent rejoining mid-planning pull back its own earlier synthesis without a counterpart `recv`. See "Plan-by-reference contract". |
 | `final_plan_hash` | SHA-256 of the locked plan |
-| `final_plan` / `final_plan_ref` | The locked `final` plan (present when `final_plan_hash` is set). By default returned as a compact `final_plan_ref` `{drawer_id, hash, first_200_chars}`; with `verbose:true` the full `final_plan` string (already-parsed plan text, no `{"plan":...}` unwrap) is inlined. Primary input to the v3 `task_list` bridge after `PlanLocked`. See "Plan-by-reference contract". |
+| `final_plan` / `final_plan_ref` | The locked `final` plan (present when `final_plan_hash` is set). By default returned as a compact `final_plan_ref` `{drawer_id, hash, first_200_chars}`; with `verbose:true` the full `final_plan` string is inlined as normalized, already-parsed plan text. No caller unwraps `{"plan":...}`, including legacy NULL-drawer sessions. Primary input to the v3 `task_list` bridge after `PlanLocked`. See "Plan-by-reference contract". |
 | `codex_review_verdict` | Last Codex verdict |
 | `review_round` | Number of completed Codex reviews (0, 1, or 2) |
 | `ended_at` | Non-null once `collab_end` has been called |
@@ -525,12 +525,16 @@ payload compact:
   `final_plan` string. Callers that need the approved plan body (e.g. the v3
   `task_list` bridge, or recovering a prior canonical on a revision round)
   must pass `verbose:true`.
-- The `final` (and `canonical`) drawer body is the **already-parsed plan
+- The `final` body exposed by `collab_status` is the **already-parsed plan
   text** — consumers no longer need to unwrap the legacy
-  `{"plan":"<full text>"}` JSON, and the `hash` verifies that parsed body.
+  `{"plan":"<full text>"}` JSON. For post-009 sessions, the drawer stores
+  that parsed body; for legacy NULL-drawer sessions, `collab_status`
+  normalizes the raw stored message on read. The `hash` verifies the parsed
+  body.
 - **Backward compatibility:** pre-009 sessions (NULL drawer id) keep the
-  legacy behavior — the full plan text is inlined under `canonical_plan` /
-  `final_plan` regardless of `verbose`.
+  legacy inline path — the full plan text is inlined under
+  `canonical_plan` / `final_plan` regardless of `verbose`, with `final_plan`
+  normalized to parsed plan text.
 
 ### `collab_approve`
 

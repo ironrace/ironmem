@@ -588,6 +588,26 @@ mod tests {
         }
     }
 
+    #[test]
+    fn test_v8_to_v9_upgrade_preserves_existing_collab_sessions_with_null_plan_drawer_ids() {
+        let db = open_at_v8();
+        crate::collab::queue::create_session(
+            &db.conn,
+            "legacy-session",
+            "/repo",
+            "main",
+            Some("legacy task"),
+            crate::collab::Agent::Claude,
+        )
+        .unwrap();
+
+        db.migrate().unwrap();
+
+        let session = crate::collab::queue::load_session(&db.conn, "legacy-session").unwrap();
+        assert!(session.canonical_plan_drawer_id.is_none());
+        assert!(session.final_plan_drawer_id.is_none());
+    }
+
     // ---- read_schema_version: distinguish fresh-DB from real DB errors ----
 
     #[test]

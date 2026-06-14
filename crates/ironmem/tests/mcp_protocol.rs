@@ -571,8 +571,16 @@ fn collab_status_omits_plan_text_before_plan_is_sent() {
         "canonical_plan must be absent before any canonical is published"
     );
     assert!(
+        status.get("canonical_plan_ref").is_none(),
+        "canonical_plan_ref must be absent before any canonical is published"
+    );
+    assert!(
         status.get("final_plan").is_none(),
         "final_plan must be absent before PlanLocked"
+    );
+    assert!(
+        status.get("final_plan_ref").is_none(),
+        "final_plan_ref must be absent before PlanLocked"
     );
 }
 
