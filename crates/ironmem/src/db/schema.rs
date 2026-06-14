@@ -15,6 +15,7 @@ const COLLAB_IMPLEMENTER_SQL: &str = include_str!("../../migrations/006_collab_i
 const DROP_CURRENT_TASK_INDEX_SQL: &str =
     include_str!("../../migrations/007_drop_current_task_index.sql");
 const METRICS_SQL: &str = include_str!("../../migrations/008_metrics.sql");
+const COLLAB_PLAN_DRAWERS_SQL: &str = include_str!("../../migrations/009_collab_plan_drawers.sql");
 
 /// Database wrapper around a SQLite connection.
 ///
@@ -175,6 +176,12 @@ impl Database {
         // IF NOT EXISTS so it stays safe under the BEGIN IMMEDIATE race path.
         if current_version < 8 {
             self.conn.execute_batch(METRICS_SQL)?;
+        }
+
+        // v9: plan-by-reference drawer-id columns on collab_sessions
+        // (issue #90). Nullable adds; NULL = legacy inline-plan path.
+        if current_version < 9 {
+            self.conn.execute_batch(COLLAB_PLAN_DRAWERS_SQL)?;
         }
 
         Ok(())
@@ -465,6 +472,21 @@ mod tests {
             .is_some()
     }
 
+    fn column_exists(db: &Database, table: &str, col: &str) -> bool {
+        let mut stmt = db
+            .conn
+            .prepare(&format!("PRAGMA table_info({table})"))
+            .unwrap();
+        let mut rows = stmt.query([]).unwrap();
+        while let Some(row) = rows.next().unwrap() {
+            let name: String = row.get(1).unwrap();
+            if name == col {
+                return true;
+            }
+        }
+        false
+    }
+
     const METRICS_TABLES: [&str; 4] = [
         "token_usage",
         "occupancy_samples",
@@ -487,10 +509,18 @@ mod tests {
         Database { conn }
     }
 
+    /// Build a connection migrated to exactly v8 (no plan-drawer columns yet) by
+    /// replaying migrations 001-008 directly from the module consts.
+    fn open_at_v8() -> Database {
+        let db = open_at_v7();
+        db.conn.execute_batch(METRICS_SQL).unwrap();
+        db
+    }
+
     #[test]
-    fn test_fresh_migrate_reaches_v8_with_metrics_tables() {
+    fn test_fresh_migrate_reaches_head_with_all_tables() {
         let db = Database::open_in_memory().unwrap();
-        assert_eq!(schema_version_of(&db), 8);
+        assert_eq!(schema_version_of(&db), 9);
         for t in METRICS_TABLES {
             assert!(table_exists(&db, t), "missing table {t}");
         }
@@ -508,18 +538,54 @@ mod tests {
             assert!(!table_exists(&db, t), "table {t} should not exist at v7");
         }
         db.migrate().unwrap();
-        assert_eq!(schema_version_of(&db), 8);
+        assert_eq!(schema_version_of(&db), 9);
         for t in METRICS_TABLES {
             assert!(table_exists(&db, t), "missing table {t} after upgrade");
         }
     }
 
     #[test]
-    fn test_migrate_twice_idempotent_at_v8() {
+    fn test_migrate_twice_idempotent() {
         let db = Database::open_in_memory().unwrap();
         db.migrate().unwrap();
         db.migrate().unwrap();
+        assert_eq!(schema_version_of(&db), 9);
+    }
+
+    // ---- Migration 009 (plan-by-reference drawer-id columns) coverage ----
+
+    const PLAN_DRAWER_COLUMNS: [&str; 2] = ["canonical_plan_drawer_id", "final_plan_drawer_id"];
+
+    #[test]
+    fn test_fresh_migrate_reaches_v9_with_plan_drawer_columns() {
+        let db = Database::open_in_memory().unwrap();
+        assert_eq!(schema_version_of(&db), 9);
+        for c in PLAN_DRAWER_COLUMNS {
+            assert!(
+                column_exists(&db, "collab_sessions", c),
+                "missing column {c} on collab_sessions"
+            );
+        }
+    }
+
+    #[test]
+    fn test_v8_to_v9_upgrade_adds_plan_drawer_columns() {
+        let db = open_at_v8();
         assert_eq!(schema_version_of(&db), 8);
+        for c in PLAN_DRAWER_COLUMNS {
+            assert!(
+                !column_exists(&db, "collab_sessions", c),
+                "column {c} should not exist at v8"
+            );
+        }
+        db.migrate().unwrap();
+        assert_eq!(schema_version_of(&db), 9);
+        for c in PLAN_DRAWER_COLUMNS {
+            assert!(
+                column_exists(&db, "collab_sessions", c),
+                "missing column {c} after upgrade"
+            );
+        }
     }
 
     // ---- read_schema_version: distinguish fresh-DB from real DB errors ----
