@@ -207,6 +207,7 @@ pub fn load_session_record(
                 task_list,
                 task_review_round, global_review_round,
                 base_sha, last_head_sha, pr_url, coding_failure,
+                canonical_plan_drawer_id, final_plan_drawer_id,
                 created_at, updated_at, implementer
          FROM collab_sessions
          WHERE id = ?1",
@@ -229,6 +230,8 @@ pub fn load_session_record(
                     codex_draft_hash: row.get("codex_draft_hash")?,
                     canonical_plan_hash: row.get("canonical_plan_hash")?,
                     final_plan_hash: row.get("final_plan_hash")?,
+                    canonical_plan_drawer_id: row.get("canonical_plan_drawer_id")?,
+                    final_plan_drawer_id: row.get("final_plan_drawer_id")?,
                     codex_review_verdict: row.get("codex_review_verdict")?,
                     review_round,
                     task_list,
@@ -295,9 +298,11 @@ pub fn save_session(conn: &Connection, session: &CollabSession) -> Result<(), Me
              last_head_sha = ?13,
              pr_url = ?14,
              coding_failure = ?15,
-             implementer = ?16,
+             canonical_plan_drawer_id = ?16,
+             final_plan_drawer_id = ?17,
+             implementer = ?18,
              updated_at = datetime('now')
-        WHERE id = ?17",
+        WHERE id = ?19",
         params![
             session.phase.to_string(),
             session.current_owner.as_str(),
@@ -314,6 +319,8 @@ pub fn save_session(conn: &Connection, session: &CollabSession) -> Result<(), Me
             session.last_head_sha.as_deref(),
             session.pr_url.as_deref(),
             session.coding_failure.as_deref(),
+            session.canonical_plan_drawer_id.as_deref(),
+            session.final_plan_drawer_id.as_deref(),
             session.implementer.as_str(),
             session.id.as_str(),
         ],
@@ -532,6 +539,8 @@ mod tests {
         include_str!("../../migrations/006_collab_implementer.sql");
     const DROP_CURRENT_TASK_INDEX_SQL: &str =
         include_str!("../../migrations/007_drop_current_task_index.sql");
+    const COLLAB_PLAN_DRAWERS_SQL: &str =
+        include_str!("../../migrations/009_collab_plan_drawers.sql");
 
     fn open() -> Connection {
         let conn = Connection::open_in_memory().unwrap();
@@ -542,6 +551,7 @@ mod tests {
         conn.execute_batch(COLLAB_V2_SQL).unwrap();
         conn.execute_batch(COLLAB_IMPLEMENTER_SQL).unwrap();
         conn.execute_batch(DROP_CURRENT_TASK_INDEX_SQL).unwrap();
+        conn.execute_batch(COLLAB_PLAN_DRAWERS_SQL).unwrap();
         conn
     }
 
@@ -714,7 +724,36 @@ mod tests {
         assert!(session.last_head_sha.is_none());
         assert!(session.pr_url.is_none());
         assert!(session.coding_failure.is_none());
+        assert!(session.canonical_plan_drawer_id.is_none());
+        assert!(session.final_plan_drawer_id.is_none());
         assert_eq!(session.tasks_count(), None);
+    }
+
+    #[test]
+    fn test_plan_drawer_ids_round_trip() {
+        let db = open();
+        create_session(&db, "sess-drawers", "/repo", "main", None, Agent::Claude).unwrap();
+
+        // Fresh session: both drawer ids must be NULL (legacy inline path).
+        let session = load_session(&db, "sess-drawers").unwrap();
+        assert!(session.canonical_plan_drawer_id.is_none());
+        assert!(session.final_plan_drawer_id.is_none());
+
+        // Set both to deterministic 32-char ids and persist.
+        let mut session = session;
+        session.canonical_plan_drawer_id = Some("c".repeat(32));
+        session.final_plan_drawer_id = Some("f".repeat(32));
+        save_session(&db, &session).unwrap();
+
+        let round_trip = load_session(&db, "sess-drawers").unwrap();
+        assert_eq!(
+            round_trip.canonical_plan_drawer_id.as_deref(),
+            Some("c".repeat(32).as_str())
+        );
+        assert_eq!(
+            round_trip.final_plan_drawer_id.as_deref(),
+            Some("f".repeat(32).as_str())
+        );
     }
 
     // ── ack_messages_many tests ───────────────────────────────────────────────

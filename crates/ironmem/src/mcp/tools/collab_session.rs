@@ -30,6 +30,8 @@ pub(super) fn session_record_json(record: &SessionRecord) -> Value {
         "codex_draft_hash": record.session.codex_draft_hash.as_deref(),
         "canonical_plan_hash": record.session.canonical_plan_hash.as_deref(),
         "final_plan_hash": record.session.final_plan_hash.as_deref(),
+        "canonical_plan_drawer_id": record.session.canonical_plan_drawer_id.as_deref(),
+        "final_plan_drawer_id": record.session.final_plan_drawer_id.as_deref(),
         "codex_review_verdict": record.session.codex_review_verdict.as_deref(),
         "review_round": record.session.review_round,
         "task_list": record.session.task_list.as_deref(),
