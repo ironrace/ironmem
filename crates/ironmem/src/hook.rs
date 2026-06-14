@@ -2178,4 +2178,27 @@ mod tests {
             assert!(resp.is_ok(), "tiny budget must still return Ok");
         }
     }
+
+    #[test]
+    fn hooks_json_registers_user_prompt_submit() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .ancestors()
+            .nth(2)
+            .unwrap() // crates/ironmem -> repo root
+            .join(".claude-plugin/hooks/hooks.json");
+        let raw = std::fs::read_to_string(&root)
+            .unwrap_or_else(|e| panic!("read {}: {e}", root.display()));
+        let v: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert!(
+            v["hooks"]["UserPromptSubmit"].is_array(),
+            "hooks.json must register UserPromptSubmit"
+        );
+        let cmd = v["hooks"]["UserPromptSubmit"][0]["hooks"][0]["command"]
+            .as_str()
+            .unwrap();
+        assert!(
+            cmd.contains("ironmem-hook.sh user-prompt-submit"),
+            "got: {cmd}"
+        );
+    }
 }

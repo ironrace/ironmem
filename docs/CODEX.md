@@ -103,8 +103,17 @@ The database is kept up to date automatically through hooks:
 | Hook | What happens |
 |------|-------------|
 | `session-start` | Bootstrap if first run; initial mine if workspace not yet indexed. On the Claude Code harness, also emits a compact memory-status block via `hookSpecificOutput.additionalContext` (drawer/wing/room counts, active collab session + phase, last-diary pointer, `MEMORY_PROTOCOL`); Codex receives no such output (silent degrade) |
+| `user-prompt-submit` | Claude Code only — FTS/BM25 drawer lookup and optional context injection (see below). Codex registers no UserPromptSubmit hook |
 | `stop` | Persist session summary to diary; re-mine files changed since last hook run |
 | `precompact` | Snapshot pending session context; re-mine changed files |
+
+### UserPromptSubmit (Claude Code only)
+
+On every prompt, ironmem runs an FTS/BM25-only drawer lookup (the embedder is
+never loaded) and injects up to 3 sanitized one-line memory matches as
+`hookSpecificOutput.additionalContext`. Hard latency budget
+`IRONMEM_PROMPT_HOOK_BUDGET_MS` (default 150 ms); on overrun or no match it emits
+nothing and exits 0. Codex registers no UserPromptSubmit hook.
 
 Incremental re-mining uses a SHA-256 manifest so only files whose content changed are re-embedded. Repeat hook runs on unchanged workspaces are fast.
 
