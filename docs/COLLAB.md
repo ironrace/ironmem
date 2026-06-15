@@ -69,15 +69,25 @@ not an iteration target.
 ## Runtime Model
 
 ```text
-Claude (single dispatcher loop in one terminal; Codex turns dispatched inline via background codex exec)
-  └─ collab_* MCP tools
-      └─ ironmem serve (stdio)
-          └─ SQLite (sessions, messages, capabilities, wal_log)
+Claude orchestrator (thin dispatcher loop in one terminal)
+  ├─ Agent-tool worker layer — one fresh-context worker per Claude-owned turn
+  │    (.claude-plugin/prompts/collab-turn-*.md; orchestrator ingests only the
+  │     worker's ≤3-line verdict — full artifacts never transit the orchestrator)
+  │     └─ collab_* MCP tools (workers call these directly)
+  │         └─ ironmem serve (stdio)
+  │             └─ SQLite (sessions, messages, capabilities, wal_log)
+  └─ Codex turns dispatched inline via background `codex exec` (one-shot)
+       └─ collab_* MCP tools
+           └─ ironmem serve (stdio) → SQLite
 ```
 
-Protocol enforcement lives in the server. Claude is the long-running
-dispatcher that polls the state machine; Codex turns are one-shot
-clients that read state, send exactly one protocol message, and exit.
+Protocol enforcement lives in the server. The Claude orchestrator is a thin
+long-running dispatcher that polls the state machine but does no protocol work
+inline: for every Claude-owned turn it spawns ONE fresh-context worker via the
+`Agent` tool (the per-turn `collab-turn-*.md` template), and that worker calls
+the MCP tools and reads/writes artifacts itself. Codex turns are one-shot
+clients dispatched inline that read state, send exactly one protocol message,
+and exit. See § "Worker-per-turn dispatch (Claude side)" for the full model.
 
 ## Session State
 
@@ -830,9 +840,11 @@ before each coding-active `collab_send`:
   when `task_list` is still unset. Both Codex's `review_fix_global` push
   and Claude's `review_local` audit-push must descend from the prior
   `last_head_sha`.
-- **PR creation** during `final_review`: Claude runs `gh pr create
-  --base <base_sha> ...` and sends the URL inline with the `final_review`
-  event. There is no separate `pr_opened` turn.
+- **PR creation** during `final_review`: Claude resolves a base branch from
+  the recorded `base_sha` (preferring `origin/main`, then `origin/master`, then
+  `origin/trunk` when they contain that commit), runs `gh pr create --base
+  <base_branch> ...`, and sends the URL inline with the `final_review` event.
+  There is no separate `pr_opened` turn.
 - **Codex must not create or check for PRs.** Codex never calls `gh pr
   create`, `gh pr list`, `git ls-remote refs/pull/*`, or any other
   PR-related GitHub API operation during any of its phases. PR creation
@@ -843,9 +855,9 @@ before each coding-active `collab_send`:
 - **Plan Mode** on Claude's side is entered before the first `canonical`
   (`review_round == 0`), `final` (v1), and `final_review` (v3 PR
   creation). Revision-round canonicals run autonomously. The `task_list`
-  send is gated by writing-plans's own approval handoff (the user
-  reviews the generated markdown and approves) rather than the
-  harness's Plan Mode. Codex never enters Plan Mode.
+  send is gated by the orchestrator's ref+hash approval of the
+  worker-produced plan; `writing-plans` must run produce-only and must not
+  surface its interactive handoff in this bridge. Codex never enters Plan Mode.
 
 The server does not read the git tree for the full v3 flow, and it still
 trusts the harness's `head_sha` string there. The narrow shortcut-only
@@ -853,6 +865,117 @@ ancestry check is the exception; drift detection in that path is now a
 hybrid responsibility, with the server performing the git ancestor check
 and the harness still responsible for local verification and any
 `failure_report` it emits.
+
+## Worker-per-turn dispatch (Claude side)
+
+On the Claude side, `/collab` is a thin orchestrator. For every Claude-owned
+protocol turn it does not do the work inline; it: reads a slim `collab_status`
+→ spawns ONE fresh-context worker via the `Agent` tool → ingests ONLY the
+worker's ≤3-line verdict → loops. The worker prompt is the verbatim
+`.claude-plugin/prompts/collab-turn-<turn>.md` template with the `$VAR`
+placeholders substituted (`$SESSION_ID`, plus `$REPO_PATH`, `$BRANCH`,
+`$TOPIC`, `$ARTIFACT_REF`, `$ARTIFACT_HASH`, `$MODE` where that template uses
+them). The worker
+calls the ironmem MCP tools directly and reads/writes artifacts via drawers and
+files. **Full artifacts — plans, diffs, review reports, PR bodies — never
+transit the orchestrator.**
+
+**Anti-puppeteering.** The orchestrator passes ONLY the resolved template. It
+never appends an inline recap, a state summary, or "what to conclude." Each
+worker discovers state for itself via its own `collab_status` / `collab_recv` /
+drawer fetches. This structurally removes the channel the orchestrator could
+otherwise use to steer a worker's judgment (mirrors the v3 design that keeps
+Claude from steering Codex's review).
+
+**Verdict contract.** The worker's final message is at most three lines
+(`result:` / `ref:` / `blocker:`). The orchestrator stores only this verdict;
+it does not ingest the body of whatever the worker produced.
+
+### Model tiers + fail-closed
+
+Workers are dispatched at one of three tiers. Fable is OFF, so planning and
+review both run on Opus; mechanical turns run on Sonnet/default. The Codex side
+is unchanged (xhigh).
+
+| Tier | Turns | Dispatch |
+|---|---|---|
+| `planning` | `draft`, `canonical` (synthesis), `final` (finalize), `task_list` | `Agent(model=opus)` at max effort |
+| `review` | `review_local`, `final_review` | `Agent(model=opus)` |
+| `mechanical` | `code-implement` controller, `submit` | `Agent(model=sonnet)` / default |
+
+"Max effort" is the harness thinking-budget mechanism. **Fail-closed rule: if
+the harness cannot select the requested tier for a planning or review dispatch,
+ABORT the turn and surface to the user — never silently fall back to a lower
+tier.**
+
+### Approval gates are reference-only
+
+The three user gates (the first `canonical`, `final`, and `final_review`) use a
+two-phase reference-only split so the orchestrator never has to ingest a full
+artifact to gate it:
+
+1. **Compose worker** writes the artifact to a drawer and returns
+   `{ref, ≤3-line summary}`.
+2. **Orchestrator gate** surfaces ONLY `ref + summary` for the user's
+   approval — never the full body. For `final_review`, the drawer artifact
+   contains JSON `{"title":"...","body":"..."}` so the submit worker can open
+   the PR without relying on verdict text.
+3. **Submit worker** (`collab-turn-submit.md`) reads the approved artifact by
+   `$ARTIFACT_REF` and sends it. **Drawer immutability is the integrity
+   anchor:** drawers are append-only, so the approved `drawer_id`'s content
+   cannot change — the ref itself guarantees the user approved exactly what is
+   sent, and no hash recompute is needed (a cross-worker recompute would be both
+   redundant and non-reproducible across readback/encoding). It never
+   re-authors. If the artifact cannot be fetched, the submit worker does not
+   send the protocol topic: for `final_review` (coding-active) it sends a
+   `failure_report`; for the v1 planning topics `canonical`/`final` the state
+   machine rejects `failure_report`, so it aborts with a `blocker:` verdict
+   instead.
+
+### v3 bridge (PlanLocked → CodeImplementPending) — worker-owned
+
+The PlanLocked bridge is worker-owned and follows the same reference-only
+pattern. The orchestrator does NOT call `Skill('writing-plans')` inline, does
+NOT read verbose `final_plan`, and does NOT build the `task_list` manifest. It
+dispatches `collab-turn-task-list.md` twice:
+
+- `$MODE=compose` — the worker invokes `writing-plans` to author the plan
+  markdown at `docs/superpowers/plans/…` and returns `plan_file_path` + a
+  content hash. The orchestrator surfaces path + hash + summary for approval.
+- `$MODE=submit` (after approval) — the orchestrator passes
+  `$ARTIFACT_REF=<approved plan_file_path>` and
+  `$ARTIFACT_HASH=<approved hash>`; the same template rereads that plan file,
+  recomputes its SHA-256 content hash, aborts with `failure_report` on
+  mismatch, then parses it into the manifest, validates it, and sends
+  `task_list`. If zero tasks parse it sends a `failure_report` instead.
+
+Only refs/paths cross the orchestrator boundary; the plan markdown and the
+manifest JSON never do.
+
+### Measurement gate
+
+The dispatch design targets **orchestrator context growth ≤ ~300 tokens per
+protocol turn**, since the orchestrator ingests only a ≤3-line verdict per
+worker and never the produced artifacts. This is measured via occupancy
+sampling — the same metrics instrumentation tracked under #82–#83.
+
+### Worker templates
+
+The eight per-turn worker templates live under `.claude-plugin/prompts/`:
+
+- `collab-turn-plan-draft.md` — `PlanParallelDrafts` blind draft
+- `collab-turn-plan-synthesis.md` — `PlanSynthesisPending` canonical
+- `collab-turn-plan-finalize.md` — `PlanClaudeFinalizePending` final
+- `collab-turn-task-list.md` — `PlanLocked` bridge (`$MODE=compose|submit`)
+- `collab-turn-code-implement.md` — `CodeImplementPending` batch (Claude implementer)
+- `collab-turn-review-local.md` — `CodeReviewLocalPending` `/ultrareview-local` audit
+- `collab-turn-final-review.md` — `CodeReviewFinalPending` PR-body compose
+- `collab-turn-submit.md` — generic submit-by-ref + PR create
+
+The Claude-side dispatch tables and the authoritative tier matrix live in
+`.claude-plugin/commands/collab.md`; this section and that command file must
+stay in lockstep (see the three-file header rule at the top of
+`.codex-plugin/prompts/collab.md`).
 
 ## Autonomous Planning Loop
 
@@ -894,12 +1017,12 @@ Phase → action (v3):
 
 | Phase | Claude does | Codex does |
 |---|---|---|
-| `PlanLocked` (post-final) | run `writing-plans` on the locked plan; user approves the generated markdown; build `task_list` JSON (with `plan_file_path`), send | n/a |
-| `CodeImplementPending` (implementer=claude) | search implementation checkpoints, resume/run `subagent-driven-development` locally, checkpoint every task boundary; on full success run gates, write `batch_complete`, and send `implementation_done{head_sha}` | wait |
+| `PlanLocked` (post-final) | dispatch `collab-turn-task-list.md` compose/submit workers; user approves the generated markdown by ref; worker sends `task_list` | n/a |
+| `CodeImplementPending` (implementer=claude) | dispatch `collab-turn-code-implement.md`; worker searches checkpoints, runs `subagent-driven-development`, gates, checkpoints, and sends `implementation_done{head_sha}` | wait |
 | `CodeImplementPending` (implementer=codex) | dispatch Codex via bg-exec; poll | one-shot bg-exec: search implementation checkpoints, resume/run `subagent-driven-development`, checkpoint every task boundary, emit `implementation_done{head_sha}`, exit |
 | `CodeReviewFixGlobalPending` | dispatch Codex via bg-exec; poll | one-shot bg-exec: run `/pr-review-toolkit:review-pr` on the raw post-implementation diff, fix confirmed branch-level issues in place, send `review_fix_global`, exit |
-| `CodeReviewLocalPending` | run `/ultrareview-local` as audit of Codex's commits, fix CRITICAL/HIGH/MEDIUM in place, send `review_local` | wait |
-| `CodeReviewFinalPending` | gates, enter Plan Mode for PR title/body, `gh pr create`, send `final_review{pr_url}` | wait |
+| `CodeReviewLocalPending` | dispatch `collab-turn-review-local.md`; worker runs `/ultrareview-local`, fixes CRITICAL/HIGH/MEDIUM in place, and sends `review_local` | wait |
+| `CodeReviewFinalPending` | dispatch `collab-turn-final-review.md` compose worker, enter Plan Mode on ref+hash+summary, then dispatch `collab-turn-submit.md` to `gh pr create` and send `final_review{pr_url}` | wait |
 | `CodingComplete` / `CodingFailed` | exit loop | n/a |
 
 ### Claude's Plan Mode Integration
@@ -917,8 +1040,8 @@ command-file invariant bullet:
 Everything else runs autonomously: the blind `draft` send (from
 `/collab start`), revision-round canonicals (`PlanSynthesisPending`
 with `review_round >= 1`), all Codex turns, and the v3 `task_list`
-send (gated by writing-plans's own approval handoff during the v3
-bridge, not harness Plan Mode). Codex never enters Plan Mode — it
+send (gated by orchestrator ref+hash approval of the worker-produced plan,
+not writing-plans's interactive handoff and not harness Plan Mode). Codex never enters Plan Mode — it
 posts drafts, reviews, and global fixes directly.
 
 ## Prompt Templates

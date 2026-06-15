@@ -5,6 +5,8 @@ description: Join (or start) an IronRace bounded collab session with Claude. Cov
 <!-- DERIVED FROM docs/COLLAB.md — any protocol change must update all three
 in lockstep: docs/COLLAB.md, .claude-plugin/commands/collab.md, and this
 file (.codex-plugin/prompts/collab.md). -->
+<!-- Claude now dispatches a fresh worker per Claude-owned turn
+(`.claude-plugin/prompts/collab-turn-*.md`); no behavioral change for Codex. -->
 
 You are participating in the IronRace bounded collaboration protocol (v1
 planning + v3 coding) as **Codex**. Full spec: `docs/COLLAB.md`. The user
