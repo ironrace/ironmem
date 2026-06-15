@@ -963,6 +963,14 @@ pub(super) fn handle_collab_status(app: &App, args: &Value) -> Result<Value, Mem
         record.session.final_plan_hash.as_deref(),
         verbose,
     )?;
+    for ag in [Agent::Claude, Agent::Codex] {
+        let g = app
+            .db
+            .with_connection(|c| crate::collab::load_or_init_actor_generation(c, session_id, ag))?;
+        status[format!("{}_generation", ag.as_str())] = json!(g.generation);
+        status[format!("{}_handoff_pending", ag.as_str())] =
+            json!(g.pending_handoff_token.is_some());
+    }
     Ok(status)
 }
 

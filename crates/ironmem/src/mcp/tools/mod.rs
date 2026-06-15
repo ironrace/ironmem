@@ -26,6 +26,7 @@ use drawers::{
     handle_add_drawer, handle_delete_drawer, handle_get_taxonomy, handle_list_rooms,
     handle_list_wings, handle_search, handle_status,
 };
+use handoff::handle_session_handoff;
 use kg::{
     handle_find_tunnels, handle_graph_stats, handle_kg_add, handle_kg_invalidate, handle_kg_query,
     handle_kg_stats, handle_kg_timeline, handle_traverse,
@@ -388,6 +389,19 @@ pub fn tool_definitions(app: &App) -> Vec<Value> {
                 "required": ["session_id", "agent"]
             }
         }),
+        json!({
+            "name": "session_handoff",
+            "description": "Issue (or byte-identically reuse) a one-time handoff token plus a deterministic, model-free session handoff block for an unplanned successor. Sets the pending generation; the successor presents handoff_token on its first mutating collab call to claim it, making this predecessor inert. The token is returned top-level (NOT inside the block) — the successor needs both.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "session_id": { "type": "string" },
+                    "agent": { "type": "string", "enum": ["claude", "codex"] },
+                    "handoff_token": { "type": "string" }
+                },
+                "required": ["session_id", "agent"]
+            }
+        }),
     ];
 
     tools
@@ -437,6 +451,7 @@ pub fn call_tool(app: &App, name: &str, args: &Value) -> Result<Value, MemoryErr
         "collab_get_caps" => handle_collab_get_caps(app, args),
         "collab_wait_my_turn" => handle_collab_wait_my_turn(app, args),
         "collab_end" => handle_collab_end(app, args),
+        "session_handoff" => handle_session_handoff(app, args),
         _ => Err(MemoryError::Permission(format!(
             "Tool '{name}' is not available in the current MCP mode"
         ))),
@@ -477,6 +492,7 @@ fn tool_known(name: &str) -> bool {
             | "collab_get_caps"
             | "collab_wait_my_turn"
             | "collab_end"
+            | "session_handoff"
     )
 }
 
@@ -500,6 +516,7 @@ fn tool_allowed_in_mode(mode: McpAccessMode, name: &str) -> bool {
                 | "collab_approve"
                 | "collab_register_caps"
                 | "collab_end"
+                | "session_handoff"
         )
 }
 

@@ -87,7 +87,7 @@ impl Phase {
     /// catch-all `WrongPhase` arm to build a uniform error message. Terminal
     /// phases return a placeholder that the catch-all never reaches because
     /// `CodingComplete`/`CodingFailed` short-circuit to `SessionLocked` first.
-    pub(super) fn expected_event(&self) -> &'static str {
+    pub fn expected_event(&self) -> &'static str {
         match self {
             Self::PlanParallelDrafts => "SubmitDraft",
             Self::PlanSynthesisPending => "PublishCanonical",
