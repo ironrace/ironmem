@@ -306,26 +306,28 @@ fn occupancy_tier(pct: f64, warn: f64, handoff: f64) -> OccupancyTier {
 
 /// Pure notice builder. Returns `None` for `OccupancyTier::Ok`.
 /// `pct` is the raw fraction (e.g. 0.654); displayed as a rounded integer
-/// percent (e.g. "~65%"). All output strings are ASCII-only.
-/// `sid` is included in the Handoff notice so the user/agent can copy the
-/// rejoin target.
+/// percent (e.g. "~65%"). `occupancy_pct` is unclamped, so a session over the
+/// configured window can exceed 1.0; the *display* is clamped to 100% to avoid
+/// confusing operator guidance like "~118%" (tier classification is unaffected).
+/// All output strings are ASCII-only. `sid` is included in the Handoff notice
+/// so the user/agent can copy the rejoin target.
 fn occupancy_notice(pct: f64, tier: OccupancyTier, sid: Option<&str>) -> Option<String> {
-    let pct_int = (pct * 100.0).round() as i64;
+    let pct_int = ((pct * 100.0).round() as i64).min(100);
     match tier {
         OccupancyTier::Ok => None,
         OccupancyTier::Warn => Some(format!(
             "[ironmem] context ~{pct_int}% - plan a handoff/clear soon."
         )),
         OccupancyTier::Handoff => {
+            // Build the shared prefix once; only the rejoin clause varies by sid.
+            let mut notice = format!(
+                "[ironmem] context ~{pct_int}% - hand off now: run session_handoff then /clear and rejoin"
+            );
             if let Some(sid) = sid {
-                Some(format!(
-                    "[ironmem] context ~{pct_int}% - hand off now: run session_handoff then /clear and rejoin: join collab {sid} - see collab.md."
-                ))
-            } else {
-                Some(format!(
-                    "[ironmem] context ~{pct_int}% - hand off now: run session_handoff then /clear and rejoin - see collab.md."
-                ))
+                notice.push_str(&format!(": join collab {sid}"));
             }
+            notice.push_str(" - see collab.md.");
+            Some(notice)
         }
     }
 }
@@ -383,8 +385,9 @@ fn run_user_prompt_submit(
         if let Some(pct) =
             crate::metrics::occupancy_pct(u.input_tokens, u.cache_read_input_tokens, window)
         {
-            let warn = crate::search::tunables::context_warn_pct();
-            let handoff = crate::search::tunables::context_handoff_pct();
+            // One env-pair parse (validates the warn < handoff invariant once),
+            // not two — both thresholds are needed here.
+            let (warn, handoff) = crate::search::tunables::context_threshold_pair();
             let tier = occupancy_tier(pct, warn, handoff);
             if let Some(notice) = occupancy_notice(pct, tier, session_id) {
                 match &mut response.hook_specific_output {

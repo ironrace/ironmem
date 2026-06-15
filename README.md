@@ -260,6 +260,8 @@ On every prompt, ironmem runs an FTS/BM25-only drawer lookup (the embedder is ne
 | `IRONMEM_PROMPT_HOOK_MAX_HITS` | `3` | Max memory excerpts injected per prompt. Clamped to `1`–`3`. |
 | `IRONMEM_PROMPT_HOOK_MIN_SCORE` | `0.0` | Minimum BM25 score a hit must clear (higher = better). `0.0` lets any FTS match through, since `MATCH` already filters relevance. |
 | `IRONMEM_PROMPT_HOOK_SUMMARY_MAX_BYTES` | `120` | Byte cap for each injected one-line excerpt. |
+| `IRONMEM_CONTEXT_WARN_PCT` | `0.60` | Context-occupancy fraction at which the hook injects a soft warning line (`>= warn`, `< handoff`). Unparseable or outside `0.0..=1.0` falls back to the default. If the resolved warn value `>=` handoff value, both revert to defaults to preserve the `warn < handoff` invariant. Occupancy uses `IRONMEM_CONTEXT_WINDOW` as the denominator. |
+| `IRONMEM_CONTEXT_HANDOFF_PCT` | `0.80` | Context-occupancy fraction at which the hook injects the handoff instruction (`>= handoff`). Same parsing/clamping and `warn < handoff` invariant as above. |
 
 ### Metrics (instrumentation; on by default)
 

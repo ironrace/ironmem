@@ -872,6 +872,9 @@ entry as a best-effort fallback (local-only, never committed, self-deletes):
 ```sh
 (crontab -l 2>/dev/null; echo "* * * * * claude -p \"join ironmem collab <sid> with token <token>\" && crontab -l | grep -v 'join ironmem collab <sid>' | crontab -") | crontab -
 ```
+Safety: `<sid>`/`<token>` must be `[A-Za-z0-9_-]` only — ironmem session IDs
+are already sanitized to that set, so they are shell-safe here. Never paste a
+raw value from an untrusted source into this pipeline.
 
 **Interactive phases (manual flow):**
 
@@ -892,7 +895,8 @@ An unattended `claude -p` successor needs at minimum:
   `mcp__ironmem__collab_register_caps`,
   `mcp__ironmem__collab_wait_my_turn`, `mcp__ironmem__collab_end`,
   `mcp__ironmem__session_handoff`, `mcp__ironmem__collab_status`
-- `Bash(claude -p:*)` — re-spawn a further successor if needed
+- `Bash(claude -p "join ironmem collab *":*)` — re-spawn a further successor if
+  needed (scope to the join-command form; avoid the broader `Bash(claude -p:*)`)
 - Git bash operations as needed for implementation tasks
 
 Configure these in `.claude/settings.json` under `permissions.allow`.

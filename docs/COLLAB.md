@@ -680,7 +680,7 @@ crosses a threshold (default 60% warn / 80% handoff, overridable via
    presents the token and claims the lease.
 4. The predecessor ends its turn. Once the successor claims the lease (gen+1),
    the predecessor's next mutating call is rejected with "stale collab
-   generation" (stale-gen rejection, `collab/handoff.rs` L35-69). **No
+   generation" (stale-gen rejection, `mcp/tools/handoff.rs` L35-81). **No
    process coordination is required — the generation lease is the single
    writer.**
 
@@ -697,6 +697,13 @@ use a one-time local cron entry as a fallback:
 
 This is a **best-effort fallback only**: local-only, never committed to the
 repo, self-deleting after the first run.
+
+> **Safety:** `<sid>` and `<token>` must contain only `[A-Za-z0-9_-]`.
+> ironmem-issued session IDs are already sanitized to that set, so they are
+> shell-safe inside this `crontab` pipeline. Never substitute a raw value from
+> an untrusted source — shell metacharacters (`` ` ``, `$(...)`) would execute
+> on the host. If in doubt, assign on a separate line and single-quote:
+> `SID='...'; TOKEN='...'`.
 
 **Interactive phases (manual flow):**
 
@@ -723,7 +730,10 @@ An unattended `claude -p` successor needs at minimum:
 - `mcp__ironmem__collab_end` — end session
 - `mcp__ironmem__session_handoff` — re-handoff if needed
 - `mcp__ironmem__collab_status` — read session state
-- `Bash(claude -p:*)` — re-spawn a further successor if needed
+- `Bash(claude -p "join ironmem collab *":*)` — re-spawn a further successor if
+  needed. Scope the wildcard to the known join-command form; avoid the broader
+  `Bash(claude -p:*)`, which would let the successor spawn arbitrarily-prompted
+  sub-agents.
 - Git bash operations (`Bash(git commit:*)`, `Bash(git push:*)`, etc.) as
   needed for the implementation tasks the successor will perform.
 

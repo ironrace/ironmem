@@ -430,8 +430,10 @@ pub fn context_handoff_pct() -> f64 {
 
 /// Parse and validate both occupancy thresholds together so the
 /// `warn < handoff` invariant can be enforced atomically.
-/// Returns `(warn_pct, handoff_pct)`.
-fn context_threshold_pair() -> (f64, f64) {
+/// Returns `(warn_pct, handoff_pct)`. Prefer this over the two single getters
+/// when both values are needed (e.g. the prompt hook) to avoid re-parsing the
+/// env pair twice; the singles are thin wrappers that discard the other half.
+pub fn context_threshold_pair() -> (f64, f64) {
     const DEFAULT_WARN: f64 = 0.60;
     const DEFAULT_HANDOFF: f64 = 0.80;
 
