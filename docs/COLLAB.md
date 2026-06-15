@@ -854,6 +854,102 @@ hybrid responsibility, with the server performing the git ancestor check
 and the harness still responsible for local verification and any
 `failure_report` it emits.
 
+## Worker-per-turn dispatch (Claude side)
+
+On the Claude side, `/collab` is a thin orchestrator. For every Claude-owned
+protocol turn it does not do the work inline; it: reads a slim `collab_status`
+→ spawns ONE fresh-context worker via the `Agent` tool → ingests ONLY the
+worker's ≤3-line verdict → loops. The worker prompt is the verbatim
+`.claude-plugin/prompts/collab-turn-<turn>.md` template with the `$VAR`
+placeholders substituted (`$SESSION_ID`, plus `$REPO_PATH`, `$BRANCH`,
+`$TOPIC`, `$ARTIFACT_REF`, `$MODE` where that template uses them). The worker
+calls the ironmem MCP tools directly and reads/writes artifacts via drawers and
+files. **Full artifacts — plans, diffs, review reports, PR bodies — never
+transit the orchestrator.**
+
+**Anti-puppeteering.** The orchestrator passes ONLY the resolved template. It
+never appends an inline recap, a state summary, or "what to conclude." Each
+worker discovers state for itself via its own `collab_status` / `collab_recv` /
+drawer fetches. This structurally removes the channel the orchestrator could
+otherwise use to steer a worker's judgment (mirrors the v3 design that keeps
+Claude from steering Codex's review).
+
+**Verdict contract.** The worker's final message is at most three lines
+(`result:` / `ref:` / `blocker:`). The orchestrator stores only this verdict;
+it does not ingest the body of whatever the worker produced.
+
+### Model tiers + fail-closed
+
+Workers are dispatched at one of three tiers. Fable is OFF, so planning and
+review both run on Opus; mechanical turns run on Sonnet/default. The Codex side
+is unchanged (xhigh).
+
+| Tier | Turns | Dispatch |
+|---|---|---|
+| `planning` | `draft`, `canonical` (synthesis), `final` (finalize), `task_list` | `Agent(model=opus)` at max effort |
+| `review` | `review_local`, `final_review` | `Agent(model=opus)` |
+| `mechanical` | `code-implement` controller, `submit` | `Agent(model=sonnet)` / default |
+
+"Max effort" is the harness thinking-budget mechanism. **Fail-closed rule: if
+the harness cannot select the requested tier for a planning or review dispatch,
+ABORT the turn and surface to the user — never silently fall back to a lower
+tier.**
+
+### Approval gates are reference-only
+
+The three user gates (the first `canonical`, `final`, and `final_review`) use a
+two-phase reference-only split so the orchestrator never has to ingest a full
+artifact to gate it:
+
+1. **Compose worker** writes the artifact to a drawer or file and returns
+   `{ref, hash, ≤3-line summary}`.
+2. **Orchestrator gate** surfaces ONLY `ref + hash + summary` for the user's
+   approval — never the full body.
+3. **Submit worker** (`collab-turn-submit.md`, `$MODE=send`) reads the approved
+   artifact by `$ARTIFACT_REF` and sends it, without re-authoring.
+
+### v3 bridge (PlanLocked → CodeImplementPending) — worker-owned
+
+The PlanLocked bridge is worker-owned and follows the same reference-only
+pattern. The orchestrator does NOT call `Skill('writing-plans')` inline, does
+NOT read verbose `final_plan`, and does NOT build the `task_list` manifest. It
+dispatches `collab-turn-task-list.md` twice:
+
+- `$MODE=compose` — the worker invokes `writing-plans` to author the plan
+  markdown at `docs/superpowers/plans/…` and returns `plan_file_path` + a
+  content hash. The orchestrator surfaces path + hash + summary for approval.
+- `$MODE=submit` (after approval) — the same template parses the plan into the
+  manifest, validates it, and sends `task_list`. If zero tasks parse it sends a
+  `failure_report` instead.
+
+Only refs/paths cross the orchestrator boundary; the plan markdown and the
+manifest JSON never do.
+
+### Measurement gate
+
+The dispatch design targets **orchestrator context growth ≤ ~300 tokens per
+protocol turn**, since the orchestrator ingests only a ≤3-line verdict per
+worker and never the produced artifacts. This is measured via occupancy
+sampling — the same metrics instrumentation tracked under #82–#83.
+
+### Worker templates
+
+The eight per-turn worker templates live under `.claude-plugin/prompts/`:
+
+- `collab-turn-plan-draft.md` — `PlanParallelDrafts` blind draft
+- `collab-turn-plan-synthesis.md` — `PlanSynthesisPending` canonical
+- `collab-turn-plan-finalize.md` — `PlanClaudeFinalizePending` final
+- `collab-turn-task-list.md` — `PlanLocked` bridge (`$MODE=compose|submit`)
+- `collab-turn-code-implement.md` — `CodeImplementPending` batch (Claude implementer)
+- `collab-turn-review-local.md` — `CodeReviewLocalPending` `/ultrareview-local` audit
+- `collab-turn-final-review.md` — `CodeReviewFinalPending` PR-body compose
+- `collab-turn-submit.md` — generic submit-by-ref + PR create
+
+The Claude-side dispatch tables and the authoritative tier matrix live in
+`.claude-plugin/commands/collab.md`; this section and that command file must
+stay in lockstep (see the three-file header rule at the top of
+`.codex-plugin/prompts/collab.md`).
+
 ## Autonomous Planning Loop
 
 **Claude runs the single control loop.** Codex CLI sessions are one-shot:
