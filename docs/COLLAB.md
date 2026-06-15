@@ -594,7 +594,9 @@ token to claim the generation lease and becomes the active process.
 
 **Arguments:** `{ session_id, agent }` plus optional `handoff_token` (for
 re-issuance to a third successor). **Returns:** `{ session_id, agent,
-generation, handoff_token, handoff_block }`.
+generation, handoff_token, handoff_block }` where `generation` is the
+**pending (to-be-claimed) generation** = active_generation + 1, not the
+caller's current active generation.
 
 **What it does.** The server reads persisted session state and the newest
 `collab-checkpoints` drawer for the session and composes a deterministic,

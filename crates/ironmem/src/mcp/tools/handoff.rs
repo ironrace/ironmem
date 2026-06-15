@@ -16,7 +16,7 @@ use rusqlite::OptionalExtension;
 use serde_json::{json, Value};
 
 use crate::collab::queue::SessionRecord;
-use crate::collab::{claim_handoff_token, load_or_init_actor_generation, Agent};
+use crate::collab::{claim_handoff_token, read_actor_generation, Agent};
 use crate::error::MemoryError;
 use crate::mcp::app::App;
 
@@ -45,7 +45,9 @@ pub(super) fn ensure_actor_generation_current(
         app.set_cached_generation(session_id, agent, claimed);
         return Ok(());
     }
-    let db_active = load_or_init_actor_generation(conn, session_id, agent)?.generation;
+    let db_active = read_actor_generation(conn, session_id, agent)?
+        .map(|a| a.generation)
+        .unwrap_or(0);
     if let Some(cached) = app.cached_generation(session_id, agent) {
         if cached == db_active {
             return Ok(());
@@ -637,5 +639,33 @@ gates: passed\n";
             res.is_err(),
             "stale predecessor must not mint a new handoff"
         );
+    }
+
+    /// The no-token path of `ensure_actor_generation_current` must not create a
+    /// lease row in `collab_actor_generations`. This proves that read-only/restricted
+    /// tools that call this guard (e.g. `collab_recv`, `collab_wait_my_turn`) do not
+    /// write a DB row on the no-token path.
+    #[test]
+    fn guard_no_token_does_not_create_lease_row() {
+        let (app, _dir) = test_handoff_app();
+        let sid = seed_active_session(&app);
+        app.db
+            .with_connection(|conn| {
+                ensure_actor_generation_current(&app, conn, &sid, Agent::Claude, None)
+            })
+            .unwrap();
+        let n: i64 = app
+            .db
+            .with_connection(|conn| {
+                conn.query_row(
+                    "SELECT COUNT(*) FROM collab_actor_generations \
+                     WHERE session_id = ?1 AND agent = 'claude'",
+                    rusqlite::params![sid],
+                    |r| r.get(0),
+                )
+                .map_err(crate::error::MemoryError::from)
+            })
+            .unwrap();
+        assert_eq!(n, 0, "no-token guard path must not create a lease row");
     }
 }
