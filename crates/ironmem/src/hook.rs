@@ -2614,6 +2614,9 @@ mod tests {
         // returns Ok. Serialize against other env-mutating tests and clean up.
         {
             let _env = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+            let _prompt = crate::search::tunables::PROMPT_HOOK_LOCK
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
             std::env::set_var("IRONMEM_PROMPT_HOOK_BUDGET_MS", "1");
             let resp = run_hook_with_input(
                 "user-prompt-submit",
@@ -2659,6 +2662,9 @@ mod tests {
     fn prompt_hook_p95_under_budget_on_10k_drawers() {
         use std::time::Instant;
         let _env = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let _prompt = crate::search::tunables::PROMPT_HOOK_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         std::env::set_var("IRONMEM_PROMPT_HOOK_BUDGET_MS", "150");
         let _budget_guard = PromptHookBudgetEnvGuard;
 
@@ -3000,6 +3006,9 @@ mod tests {
         let _metrics = crate::metrics::METRICS_ENV_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
+        let _prompt = crate::search::tunables::PROMPT_HOOK_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         std::env::set_var("IRONMEM_CONTEXT_WARN_PCT", "0.60");
         std::env::set_var("IRONMEM_CONTEXT_HANDOFF_PCT", "0.80");
         std::env::set_var("IRONMEM_CONTEXT_WINDOW", "200000");
@@ -3041,6 +3050,9 @@ mod tests {
         // 170k input_tokens / 200k window = 85% -> Handoff tier.
         let _env = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
         let _metrics = crate::metrics::METRICS_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _prompt = crate::search::tunables::PROMPT_HOOK_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         std::env::set_var("IRONMEM_CONTEXT_WARN_PCT", "0.60");
@@ -3086,6 +3098,9 @@ mod tests {
         let _metrics = crate::metrics::METRICS_ENV_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
+        let _prompt = crate::search::tunables::PROMPT_HOOK_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         std::env::set_var("IRONMEM_CONTEXT_WARN_PCT", "0.60");
         std::env::set_var("IRONMEM_CONTEXT_HANDOFF_PCT", "0.80");
         std::env::set_var("IRONMEM_CONTEXT_WINDOW", "200000");
@@ -3122,6 +3137,9 @@ mod tests {
         let _metrics = crate::metrics::METRICS_ENV_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
+        let _prompt = crate::search::tunables::PROMPT_HOOK_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         std::env::set_var("IRONMEM_CONTEXT_WARN_PCT", "0.60");
         std::env::set_var("IRONMEM_CONTEXT_HANDOFF_PCT", "0.80");
         std::env::set_var("IRONMEM_CONTEXT_WINDOW", "200000");
@@ -3156,6 +3174,9 @@ mod tests {
         // the DB sample but must NOT suppress the operator notice.
         let _env = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
         let _metrics = crate::metrics::METRICS_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _prompt = crate::search::tunables::PROMPT_HOOK_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         std::env::set_var("IRONMEM_METRICS", "0");

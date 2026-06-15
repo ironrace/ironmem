@@ -544,9 +544,12 @@ When the occupancy notice appears in an interactive session:
 **Permission allowlist for unattended successor operation:**
 
 An unattended `claude -p` successor needs at minimum:
-- `mcp__ironmem__collab_send`, `collab_recv`, `collab_ack`, `collab_approve`,
-  `collab_set_implementer`, `collab_register_caps`, `collab_wait_my_turn`,
-  `collab_end`, `session_handoff`, `collab_status`
+- `mcp__ironmem__collab_send`, `mcp__ironmem__collab_recv`,
+  `mcp__ironmem__collab_ack`, `mcp__ironmem__collab_approve`,
+  `mcp__ironmem__collab_set_implementer`,
+  `mcp__ironmem__collab_register_caps`,
+  `mcp__ironmem__collab_wait_my_turn`, `mcp__ironmem__collab_end`,
+  `mcp__ironmem__session_handoff`, `mcp__ironmem__collab_status`
 - `Bash(claude -p:*)` — re-spawn a further successor if needed
 - Git bash operations as needed for implementation tasks
 

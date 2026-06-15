@@ -460,6 +460,12 @@ fn context_threshold_pair() -> (f64, f64) {
 #[cfg(test)]
 pub(crate) static KG_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+/// Serializes tests that mutate the `IRONMEM_PROMPT_HOOK_*` and
+/// `IRONMEM_CONTEXT_*_PCT` env vars. These env vars are process-global and are
+/// read fresh by hook/tunable tests across modules.
+#[cfg(test)]
+pub(crate) static PROMPT_HOOK_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -468,9 +474,6 @@ mod tests {
     // env lock so tests in other modules that flip `IRONMEM_METRICS` (e.g.
     // `mcp::server`) cannot clobber these.
     use crate::metrics::METRICS_ENV_LOCK;
-
-    // Serializes tests that mutate the `IRONMEM_PROMPT_HOOK_*` env vars.
-    static PROMPT_HOOK_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     #[test]
     fn prompt_hook_budget_defaults_and_overrides() {
