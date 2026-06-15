@@ -527,4 +527,115 @@ gates: passed\n";
             "handoff.generation must be rendered"
         );
     }
+
+    // ── Task 4 tests ─────────────────────────────────────────────────────────
+
+    /// For every relevant phase, verify the handoff block:
+    ///   (a) contains `phase: <Name>`,
+    ///   (b) two renders are byte-identical (determinism),
+    ///   (c) contains no timestamp field substrings.
+    #[test]
+    fn golden_block_per_phase() {
+        use crate::collab::Phase::*;
+        for phase in [
+            PlanParallelDrafts,
+            PlanCodexReviewPending,
+            PlanLocked,
+            CodeImplementPending,
+            CodeReviewFixGlobalPending,
+            CodeReviewLocalPending,
+            CodeReviewFinalPending,
+            CodingComplete,
+            CodingFailed,
+        ] {
+            let r = sample_record(phase);
+            let b1 = compose_handoff_block(&r, Agent::Claude, 1, None);
+            let b2 = compose_handoff_block(&r, Agent::Claude, 1, None);
+            assert_eq!(b1, b2, "phase {phase} must render identically");
+            assert!(
+                b1.contains(&format!("phase: {phase}")),
+                "missing phase line for {phase}"
+            );
+            for ts in ["created_at", "updated_at", "ended_at"] {
+                assert!(
+                    !b1.contains(ts),
+                    "block must not contain {ts} (phase {phase})"
+                );
+            }
+        }
+    }
+
+    /// Verify that plan drawer IDs/hashes and checkpoint gates all render
+    /// correctly when populated.
+    #[test]
+    fn golden_block_with_plan_drawers_and_checkpoint_gates() {
+        let mut r = sample_record(crate::collab::Phase::CodeImplementPending);
+        r.session.canonical_plan_drawer_id = Some("abc123".into());
+        r.session.canonical_plan_hash = Some("def456".into());
+        r.session.final_plan_drawer_id = Some("fff999".into());
+        r.session.final_plan_hash = Some("aaa111".into());
+        let cp = Checkpoint {
+            status: Some("completed".into()),
+            task_id: Some("2".into()),
+            completed_task_ids: Some("1,2".into()),
+            next_task_id: Some("3".into()),
+            gates: Some("passed".into()),
+        };
+        let block = compose_handoff_block(&r, Agent::Codex, 2, Some(cp));
+        assert!(block.contains("plan.canonical.drawer_id: abc123"));
+        assert!(block.contains("plan.canonical.hash: def456"));
+        assert!(block.contains("plan.final.drawer_id: fff999"));
+        assert!(block.contains("gates: passed"));
+        assert!(block.contains("checkpoint: present"));
+        assert!(block.contains("checkpoint.status: completed"));
+        assert!(block.contains("handoff.agent: codex"));
+        assert!(block.contains("handoff.generation: 2"));
+    }
+
+    /// Calling session_handoff twice before the token is claimed must return
+    /// byte-identical handoff_block, handoff_token, and generation values.
+    #[test]
+    fn session_handoff_twice_before_claim_is_byte_identical() {
+        let (app, _dir) = test_handoff_app();
+        let sid = seed_active_session(&app);
+        let a =
+            handle_session_handoff(&app, &json!({"session_id": sid, "agent": "claude"})).unwrap();
+        let b =
+            handle_session_handoff(&app, &json!({"session_id": sid, "agent": "claude"})).unwrap();
+        assert_eq!(a["handoff_block"], b["handoff_block"]);
+        assert_eq!(a["handoff_token"], b["handoff_token"]);
+        assert_eq!(a["generation"], b["generation"]);
+    }
+
+    /// Predecessor cannot mint a new handoff after the successor has claimed the
+    /// previous one (two App instances over the same DB file).
+    #[test]
+    fn stale_predecessor_cannot_mint_after_claim() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("mem.sqlite3");
+
+        let pred = test_app_with_db_path(db_path.clone(), dir.path());
+        let succ = test_app_with_db_path(db_path, dir.path());
+
+        let sid = seed_active_session(&pred);
+
+        // Predecessor issues the handoff (binds at gen 0, pending gen becomes 1).
+        let issued =
+            handle_session_handoff(&pred, &json!({"session_id": sid, "agent": "claude"})).unwrap();
+        let token = issued["handoff_token"].as_str().unwrap().to_string();
+
+        // Successor claims the token — advances DB generation to 1.
+        handle_session_handoff(
+            &succ,
+            &json!({"session_id": sid, "agent": "claude", "handoff_token": token}),
+        )
+        .unwrap();
+
+        // Predecessor tries to mint a new handoff — must be rejected (stale gen).
+        let res = handle_session_handoff(&pred, &json!({"session_id": sid, "agent": "claude"}));
+        assert!(
+            res.is_err(),
+            "stale predecessor must not mint a new handoff"
+        );
+    }
 }

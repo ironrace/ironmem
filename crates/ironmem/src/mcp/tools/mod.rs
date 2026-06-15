@@ -549,6 +549,23 @@ mod tests {
     }
 
     #[test]
+    fn session_handoff_is_write_gated_and_known() {
+        assert!(tool_known("session_handoff"));
+        assert!(tool_allowed_in_mode(
+            McpAccessMode::Trusted,
+            "session_handoff"
+        ));
+        assert!(!tool_allowed_in_mode(
+            McpAccessMode::ReadOnly,
+            "session_handoff"
+        ));
+        assert!(!tool_allowed_in_mode(
+            McpAccessMode::Restricted,
+            "session_handoff"
+        ));
+    }
+
+    #[test]
     fn confidence_validation_rejects_out_of_range() {
         use crate::config::{Config, EmbedMode, McpAccessMode};
         use std::sync::Arc;
