@@ -65,6 +65,11 @@ fn changed_files(repo_root: &Path, build_sha: &str) -> Result<Vec<String>, Strin
 /// 2. Intersect with `map.source_files`.
 /// 3. Empty intersection → `Fresh`; non-empty → `Stale { changed_files }`.
 /// 4. Any git error → `RescoutRequired` (fail-safe: never load as Fresh).
+///
+/// **Path convention:** `git diff --name-only` always emits forward-slash-
+/// separated paths. `CodeMap::source_files` MUST also use forward slashes
+/// for the intersection to work correctly. Writers (e.g. `code_map_write`)
+/// must normalise paths to forward slashes before storing them.
 pub fn classify(map: &CodeMap, repo_root: &Path) -> Freshness {
     match changed_files(repo_root, &map.head_sha) {
         Err(reason) => Freshness::RescoutRequired { reason },
