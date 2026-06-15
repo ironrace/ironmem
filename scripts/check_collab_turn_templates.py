@@ -249,10 +249,17 @@ def main() -> int:
         if not info:
             err(f"matrix references missing template {r['template']}")
             continue
-        if r["tier"] and r["tier"] != info["tier"]:
+        # A matrix row naming a collab-turn template MUST carry a recognized
+        # tier and model token. A typo (e.g. `mechnical`) parses to None; do
+        # not silently skip the cross-check — that hides the typo.
+        if r["tier"] is None or r["model"] is None:
+            err(f"matrix row for {r['template']}: unrecognized tier/model "
+                f"token")
+            continue
+        if r["tier"] != info["tier"]:
             err(f"{r['template']}: matrix tier {r['tier']} != frontmatter "
                 f"{info['tier']}")
-        if r["model"] and r["model"] != info["model"]:
+        if r["model"] != info["model"]:
             err(f"{r['template']}: matrix model {r['model']} != frontmatter "
                 f"{info['model']}")
     for name in parsed:

@@ -22,8 +22,10 @@ preconditions: phase == PlanClaudeFinalizePending, current_owner == claude
    user intent.
 2. `add_drawer(wing="ironrace-memory", room="collab-drafts",
    content=<JSON string {"plan":"<full text>"}>)`; return its `drawer_id`.
-   Do NOT send — the orchestrator gates, then dispatches `collab-turn-submit.md`
-   in `$MODE=send` `$TOPIC=final`.
+   Compute the SHA-256 of the artifact body you stored and return it as the
+   `hash` in the verdict `ref:` line. Do NOT send — the orchestrator gates,
+   then dispatches `collab-turn-submit.md` with `$TOPIC=final`,
+   `$ARTIFACT_REF=<drawer_id>`, and `$ARTIFACT_HASH=<that hash>`.
 
 ## Verdict
 Return EXACTLY these ≤3 lines, nothing else:

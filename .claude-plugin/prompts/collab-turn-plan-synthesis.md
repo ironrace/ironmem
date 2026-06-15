@@ -21,7 +21,10 @@ preconditions: phase == PlanSynthesisPending, current_owner == claude
 ## Actions
 - If `review_round == 0` AND `$MODE == compose`: merge both drafts into the
   canonical; `add_drawer(wing="ironrace-memory", room="collab-drafts",
-  content=<canonical text>)`; return its `drawer_id` as the ref. Do NOT send.
+  content=<canonical text>)`; return its `drawer_id` as the ref. Compute the
+  SHA-256 of the canonical body you stored and return it as the `hash` in the
+  verdict `ref:` line — the orchestrator passes it as `$ARTIFACT_HASH` to the
+  submit worker, which verifies it before sending. Do NOT send.
 - If `review_round >= 1` (revision) OR `$MODE == send`: produce/refresh the
   canonical and `collab_send(sender="claude", topic="canonical",
   content=<canonical text>)`.

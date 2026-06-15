@@ -9,14 +9,22 @@ preconditions: a prior compose worker wrote $ARTIFACT_REF and the user approved
 # Collab worker — submit-by-ref (post-gate sender)
 
 > ANTI-PUPPETEERING: You received only this template, `$SESSION_ID`, `$TOPIC`,
-> and `$ARTIFACT_REF`. Read the approved artifact by ref and send it. Do NOT
-> re-author or editorialize. Your final message MUST be the ≤3-line verdict only.
+> `$ARTIFACT_REF`, and `$ARTIFACT_HASH`. Read the approved artifact by ref,
+> verify its hash, and send it. Do NOT re-author or editorialize. Your final
+> message MUST be the ≤3-line verdict only.
 
 ## State discovery
 1. `collab_status(session_id=$SESSION_ID)` to confirm phase/owner and read
    `repo_path`, `branch`, and `base_sha`.
 2. Fetch the artifact named by `$ARTIFACT_REF` (drawer id → drawer fetch, or a
    file path → read the file).
+3. **Hash integrity gate.** Recompute the SHA-256 of the fetched artifact body
+   (for `final_review`, hash the PR `body`) and compare it to `$ARTIFACT_HASH`.
+   On MISMATCH, do NOT send the artifact — instead
+   `collab_send(sender="claude", topic="failure_report",
+   content=<JSON {"coding_failure":"approved_artifact_hash_mismatch:
+   expected=$ARTIFACT_HASH"}>)` and stop. This prevents shipping content the
+   user never approved.
 
 ## Actions
 - If `$TOPIC == final_review`: parse the artifact JSON as

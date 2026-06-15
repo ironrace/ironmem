@@ -50,3 +50,27 @@ def test_lint_catches_bad_verdict_schema(tmp_path):
 
     assert r.returncode == 1
     assert "verdict block must be result/ref/blocker lines" in r.stdout
+
+
+def test_lint_catches_typoed_matrix_tier(tmp_path):
+    # A typo in a matrix tier token parses to None. The cross-check must NOT
+    # silently skip it; it must record a specific "unrecognized tier/model"
+    # error against the named template.
+    fixture = copy_fixture(tmp_path)
+    cmd = fixture / ".claude-plugin" / "commands" / "collab.md"
+    text = cmd.read_text()
+    # The submit row: `| post-gate send | claude | `collab-turn-submit.md` |
+    # mechanical | sonnet |` — corrupt the tier token only.
+    mutated = text.replace(
+        "| `collab-turn-submit.md` | mechanical | sonnet |",
+        "| `collab-turn-submit.md` | mechnical | sonnet |",
+        1,
+    )
+    assert mutated != text, "matrix submit row not found to mutate"
+    cmd.write_text(mutated)
+
+    r = run({"COLLAB_LINT_ROOT": str(fixture)})
+
+    assert r.returncode == 1
+    assert "matrix row for collab-turn-submit.md: unrecognized tier/model" \
+        in r.stdout

@@ -35,6 +35,7 @@ From the repo root:
 ```bash
 cargo fmt --all -- --check
 python3 scripts/check_collab_turn_templates.py
+python3 -m pytest tests/collab_turn_templates/
 cargo clippy --workspace --all-targets --all-features -- -D warnings
 cargo test --workspace
 bash scripts/check_versions.sh
@@ -43,6 +44,7 @@ python3 scripts/mcp_smoke_test.py
 
 Notes:
 
+- `scripts/check_collab_turn_templates.py` lints the collab worker-per-turn templates and the `collab.md` dispatch surface; `tests/collab_turn_templates/` exercises that linter (including negative cases that assert it rejects malformed templates and matrix rows).
 - `scripts/check_versions.sh` verifies that plugin metadata versions stay in sync with `crates/ironmem/Cargo.toml`.
 - `scripts/mcp_smoke_test.py` starts a real `ironmem serve` process in noop-embedder mode and sends a live `initialize` call over stdio.
 - The smoke test uses an isolated temp DB and disables auto-bootstrap/migration so it stays fast and deterministic.
@@ -85,6 +87,7 @@ Release checklist:
 1. Start from a clean `main`.
 2. Verify local checks pass:
    - `cargo fmt --all -- --check`
+   - `python3 scripts/check_collab_turn_templates.py`
    - `cargo clippy --workspace --all-targets --all-features -- -D warnings`
    - `cargo test --workspace`
    - `bash scripts/check_versions.sh`

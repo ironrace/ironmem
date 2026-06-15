@@ -69,15 +69,25 @@ not an iteration target.
 ## Runtime Model
 
 ```text
-Claude (single dispatcher loop in one terminal; Codex turns dispatched inline via background codex exec)
-  └─ collab_* MCP tools
-      └─ ironmem serve (stdio)
-          └─ SQLite (sessions, messages, capabilities, wal_log)
+Claude orchestrator (thin dispatcher loop in one terminal)
+  ├─ Agent-tool worker layer — one fresh-context worker per Claude-owned turn
+  │    (.claude-plugin/prompts/collab-turn-*.md; orchestrator ingests only the
+  │     worker's ≤3-line verdict — full artifacts never transit the orchestrator)
+  │     └─ collab_* MCP tools (workers call these directly)
+  │         └─ ironmem serve (stdio)
+  │             └─ SQLite (sessions, messages, capabilities, wal_log)
+  └─ Codex turns dispatched inline via background `codex exec` (one-shot)
+       └─ collab_* MCP tools
+           └─ ironmem serve (stdio) → SQLite
 ```
 
-Protocol enforcement lives in the server. Claude is the long-running
-dispatcher that polls the state machine; Codex turns are one-shot
-clients that read state, send exactly one protocol message, and exit.
+Protocol enforcement lives in the server. The Claude orchestrator is a thin
+long-running dispatcher that polls the state machine but does no protocol work
+inline: for every Claude-owned turn it spawns ONE fresh-context worker via the
+`Agent` tool (the per-turn `collab-turn-*.md` template), and that worker calls
+the MCP tools and reads/writes artifacts itself. Codex turns are one-shot
+clients dispatched inline that read state, send exactly one protocol message,
+and exit. See § "Worker-per-turn dispatch (Claude side)" for the full model.
 
 ## Session State
 
@@ -910,8 +920,11 @@ artifact to gate it:
    approval — never the full body. For `final_review`, the drawer artifact
    contains JSON `{"title":"...","body":"..."}` so the submit worker can open
    the PR without relying on verdict text.
-3. **Submit worker** (`collab-turn-submit.md`, `$MODE=send`) reads the approved
-   artifact by `$ARTIFACT_REF` and sends it, without re-authoring.
+3. **Submit worker** (`collab-turn-submit.md`) reads the approved artifact by
+   `$ARTIFACT_REF`, is passed the approved `$ARTIFACT_HASH`, recomputes the
+   artifact's SHA-256 and verifies it matches before sending — on mismatch it
+   sends a `failure_report` instead of shipping unapproved content. It never
+   re-authors.
 
 ### v3 bridge (PlanLocked → CodeImplementPending) — worker-owned
 
