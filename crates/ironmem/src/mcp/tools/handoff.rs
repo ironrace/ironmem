@@ -100,11 +100,19 @@ pub(super) fn latest_checkpoint(
     session_id: &str,
 ) -> Result<Option<Checkpoint>, MemoryError> {
     db.with_connection(|conn| {
-        let needle = format!("session_id: {session_id}");
+        // Wrap the needle in sentinel newlines so `session_id: <id>` matches only
+        // as a complete line, avoiding substring collisions (e.g. "test-sid" inside
+        // "test-sid-extra") or cross-session matches. Concatenating char(10) on both
+        // sides of `content` ensures first-line and last-line entries also match.
+        let needle = format!("\nsession_id: {session_id}\n");
         let content: Option<String> = conn
             .query_row(
                 "SELECT content FROM drawers
-                 WHERE wing = ?1 AND room = ?2 AND content LIKE '%' || ?3 || '%'
+                 WHERE wing = ?1 AND room = ?2
+                   AND (char(10) || content || char(10)) LIKE '%' || ?3 || '%'
+                 -- drawer ids are content-hash based; inserts upsert-in-place (rowid stable
+                 -- on conflict), so rowid DESC = newest first-seen checkpoint content.
+                 -- A future switch to INSERT OR REPLACE would break this ordering.
                  ORDER BY rowid DESC LIMIT 1",
                 rusqlite::params![CHECKPOINT_WING, CHECKPOINT_ROOM, needle],
                 |r| r.get(0),
@@ -316,14 +324,12 @@ mod tests {
         assert!(a.contains("handoff.generation: 1"));
     }
 
-    fn test_handoff_app() -> Arc<crate::mcp::app::App> {
+    fn test_handoff_app() -> (Arc<crate::mcp::app::App>, tempfile::TempDir) {
         let dir = tempfile::tempdir().unwrap();
-        // Keep dir alive by leaking it — test is short-lived.
         let path = dir.path().join("mem.sqlite3");
         let root = dir.path().to_path_buf();
-        // Leak tempdir so the path stays valid for the app lifetime.
-        std::mem::forget(dir);
-        test_app_with_db_path(path, &root)
+        let app = test_app_with_db_path(path, &root);
+        (app, dir)
     }
 
     fn seed_active_session(app: &crate::mcp::app::App) -> String {
@@ -443,7 +449,7 @@ mod tests {
 
     #[test]
     fn session_handoff_returns_token_and_block_without_embedding_token_in_block() {
-        let app = test_handoff_app();
+        let (app, _dir) = test_handoff_app();
         let sid = seed_active_session(&app);
         let out =
             handle_session_handoff(&app, &json!({"session_id": sid, "agent": "claude"})).unwrap();
@@ -455,5 +461,70 @@ mod tests {
             "token must NOT appear inside the fenced block"
         );
         assert_eq!(out["generation"], json!(1));
+    }
+
+    /// Verify that `parse_checkpoint` extracts all expected fields from a realistic
+    /// multi-line checkpoint string, and that `compose_handoff_block` with that
+    /// checkpoint renders the populated fields (checkpoint: present, gates: passed,
+    /// checkpoint.status: completed, etc.).
+    #[test]
+    fn parse_checkpoint_and_compose_block_with_populated_checkpoint() {
+        let checkpoint_body = "\
+collab_checkpoint\n\
+session_id: test-sid\n\
+phase: CodeImplementPending\n\
+status: completed\n\
+task_id: 2\n\
+completed_task_ids: 1,2\n\
+next_task_id: 3\n\
+gates: passed\n";
+
+        let cp = parse_checkpoint(checkpoint_body);
+        assert_eq!(cp.status.as_deref(), Some("completed"), "status");
+        assert_eq!(cp.task_id.as_deref(), Some("2"), "task_id");
+        assert_eq!(
+            cp.completed_task_ids.as_deref(),
+            Some("1,2"),
+            "completed_task_ids"
+        );
+        assert_eq!(cp.next_task_id.as_deref(), Some("3"), "next_task_id");
+        assert_eq!(cp.gates.as_deref(), Some("passed"), "gates");
+
+        // compose_handoff_block must render the populated checkpoint correctly.
+        let r = sample_record(Phase::CodeImplementPending);
+        let block = compose_handoff_block(&r, Agent::Codex, 2, Some(cp));
+
+        assert!(
+            block.contains("checkpoint: present"),
+            "checkpoint must be present"
+        );
+        assert!(
+            block.contains("checkpoint.status: completed"),
+            "checkpoint.status must be rendered"
+        );
+        assert!(
+            block.contains("checkpoint.task_id: 2"),
+            "checkpoint.task_id must be rendered"
+        );
+        assert!(
+            block.contains("checkpoint.completed_task_ids: 1,2"),
+            "checkpoint.completed_task_ids must be rendered"
+        );
+        assert!(
+            block.contains("checkpoint.next_task_id: 3"),
+            "checkpoint.next_task_id must be rendered"
+        );
+        assert!(
+            block.contains("gates: passed"),
+            "gates must be rendered from checkpoint"
+        );
+        assert!(
+            block.contains("handoff.agent: codex"),
+            "handoff.agent must be rendered"
+        );
+        assert!(
+            block.contains("handoff.generation: 2"),
+            "handoff.generation must be rendered"
+        );
     }
 }

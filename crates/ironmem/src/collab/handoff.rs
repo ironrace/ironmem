@@ -76,6 +76,49 @@ pub fn load_or_init_actor_generation(
     })
 }
 
+/// Read the (session, agent) lease row WITHOUT creating it. Returns `None` when
+/// no row exists yet (treated as generation 0, no pending handoff). Use this on
+/// read-only paths (e.g. `collab_status`) so a read never materializes a row.
+pub fn read_actor_generation(
+    conn: &Connection,
+    session_id: &str,
+    agent: Agent,
+) -> Result<Option<ActorGeneration>, MemoryError> {
+    conn.query_row(
+        "SELECT generation, pending_handoff_token, pending_handoff_generation
+         FROM collab_actor_generations WHERE session_id = ?1 AND agent = ?2",
+        params![session_id, agent.as_str()],
+        |r| {
+            let generation: i64 = r.get(0)?;
+            let token: Option<String> = r.get(1)?;
+            let pending_gen: Option<i64> = r.get(2)?;
+            Ok((generation, token, pending_gen))
+        },
+    )
+    .optional()?
+    .map(|(generation, token, pending_gen)| {
+        let generation = u64::try_from(generation).map_err(|_| {
+            MemoryError::Validation(format!(
+                "corrupt lease row: negative generation {generation}"
+            ))
+        })?;
+        let pending_handoff_generation = match pending_gen {
+            Some(g) => Some(u64::try_from(g).map_err(|_| {
+                MemoryError::Validation(format!(
+                    "corrupt lease row: negative pending generation {g}"
+                ))
+            })?),
+            None => None,
+        };
+        Ok(ActorGeneration {
+            generation,
+            pending_handoff_token: token,
+            pending_handoff_generation,
+        })
+    })
+    .transpose()
+}
+
 /// Issue a new handoff token (or reuse a pending one). Does NOT bump the active
 /// generation — it sets `pending_handoff_generation = generation + 1`. Reuse path
 /// returns the same token + pending generation (byte-identical retries before claim).
