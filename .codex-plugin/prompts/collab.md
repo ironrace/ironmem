@@ -469,6 +469,34 @@ not the topic**. Common errors:
 If two retries with corrected content both fail, report the exact server
 error to the user and stop.
 
+## Session handoff (fallback succession)
+
+When your context is exhausted mid-session, call `session_handoff` with
+`{ session_id, agent: "codex" }` before stopping. The server composes a
+deterministic, model-free ` ```ironrace-session-handoff ` block from
+persisted state + the newest `collab-checkpoints` drawer — it never asks a
+model to summarize. The response carries both a `handoff_block` (context for
+the successor) and a top-level `handoff_token` (the claim credential — not
+embedded inside the block).
+
+The successor presents `handoff_token` on its first actor-bearing mutating
+call (`collab_send`, `collab_recv`, `collab_ack`, etc.) to **claim** the
+generation lease. The claim advances the active generation, making the prior
+process **inert** — any subsequent mutating/binding call from the old process
+is rejected. Pure reads (`collab_status`, `collab_get_caps`) remain
+available to a stale predecessor.
+
+Tokenless first-touch is only allowed at generation 0 (a session that was
+never handed off). Once any handoff is claimed (generation > 0) a fresh
+process without a token is rejected and must obtain a `session_handoff`
+token.
+
+`session_handoff` is a WRITE tool (denied in read-only / restricted MCP
+mode) and is itself generation-guarded — a stale caller cannot mint a new
+token after a successor has claimed.
+
+Full semantics: `docs/COLLAB.md` § "session_handoff (fallback succession)".
+
 ## Unknown subcommand
 
 If `$ARGUMENTS` does not start with `start` or `join`, tell the user:

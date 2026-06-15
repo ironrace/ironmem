@@ -37,6 +37,13 @@ pub(super) fn handle_collab_register_caps(app: &App, args: &Value) -> Result<Val
 
     let count = parsed.len();
     app.db.with_transaction(|tx| {
+        super::handoff::ensure_actor_generation_current(
+            app,
+            tx,
+            session_id,
+            agent,
+            super::handoff::opt_handoff_token(args).as_deref(),
+        )?;
         crate::collab::queue::ensure_active(tx, session_id)?;
         crate::collab::queue::register_caps(tx, session_id, agent.as_str(), &parsed)?;
         crate::db::schema::Database::wal_log_tx(

@@ -1,3 +1,4 @@
+use rusqlite::OptionalExtension;
 use serde_json::{json, Value};
 use std::process::Command;
 
@@ -440,6 +441,13 @@ pub(super) fn handle_collab_set_implementer(app: &App, args: &Value) -> Result<V
     let implementer = require_implementer(require_str(args, "implementer")?)?;
 
     app.db.with_transaction(|tx| {
+        super::handoff::ensure_actor_generation_current(
+            app,
+            tx,
+            session_id,
+            agent,
+            super::handoff::opt_handoff_token(args).as_deref(),
+        )?;
         crate::collab::queue::ensure_active(tx, session_id)?;
         let record = crate::collab::queue::load_session_record(tx, session_id)?;
         let can_change = match record.session.phase {
@@ -573,6 +581,13 @@ pub(super) fn handle_collab_send(app: &App, args: &Value) -> Result<Value, Memor
     }
 
     let (response, before, after, pr_url) = app.db.with_transaction(|tx| {
+        super::handoff::ensure_actor_generation_current(
+            app,
+            tx,
+            session_id,
+            sender,
+            super::handoff::opt_handoff_token(args).as_deref(),
+        )?;
         crate::collab::queue::ensure_active(tx, session_id)?;
         let record = crate::collab::queue::load_session_record(tx, session_id)?;
         let mut session = record.session;
@@ -745,6 +760,13 @@ pub(super) fn handle_collab_recv(app: &App, args: &Value) -> Result<Value, Memor
         .unwrap_or(false);
 
     let result = app.db.with_transaction(|tx| {
+        super::handoff::ensure_actor_generation_current(
+            app,
+            tx,
+            session_id,
+            receiver,
+            super::handoff::opt_handoff_token(args).as_deref(),
+        )?;
         // Blind-drafts invariant: during PlanParallelDrafts, an agent must not
         // see the counterpart's draft until it has submitted its own. This
         // enforces the "parallel" in parallel drafts at the server boundary so
@@ -791,6 +813,31 @@ pub(super) fn handle_collab_ack(app: &App, args: &Value) -> Result<Value, Memory
     let session_id = require_str(args, "session_id")?;
     app.db.with_transaction(|tx| {
         crate::collab::queue::ensure_active(tx, session_id)?;
+        // Resolve the receiver from the target message so we can run the
+        // generation guard. A missing message surfaces as NotFound — same
+        // behavior as the ack_message call that follows.
+        let receiver_str: Option<String> = tx
+            .query_row(
+                "SELECT receiver FROM messages WHERE id = ?1 AND session_id = ?2",
+                rusqlite::params![message_id, session_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let receiver_str = receiver_str.ok_or_else(|| {
+            MemoryError::NotFound(format!(
+                "message {message_id} not found in session {session_id}"
+            ))
+        })?;
+        let agent = receiver_str
+            .parse::<crate::collab::Agent>()
+            .map_err(|e| MemoryError::Validation(format!("invalid receiver in message: {e}")))?;
+        super::handoff::ensure_actor_generation_current(
+            app,
+            tx,
+            session_id,
+            agent,
+            super::handoff::opt_handoff_token(args).as_deref(),
+        )?;
         crate::collab::queue::ack_message(tx, session_id, message_id)?;
         crate::db::schema::Database::wal_log_tx(
             tx,
@@ -916,6 +963,17 @@ pub(super) fn handle_collab_status(app: &App, args: &Value) -> Result<Value, Mem
         record.session.final_plan_hash.as_deref(),
         verbose,
     )?;
+    for ag in [Agent::Claude, Agent::Codex] {
+        let g = app
+            .db
+            .with_connection(|c| crate::collab::read_actor_generation(c, session_id, ag))?;
+        let (generation, pending) = match g {
+            Some(a) => (a.generation, a.pending.is_some()),
+            None => (0, false),
+        };
+        status[format!("{}_generation", ag.as_str())] = json!(generation);
+        status[format!("{}_handoff_pending", ag.as_str())] = json!(pending);
+    }
     Ok(status)
 }
 
@@ -935,6 +993,13 @@ pub(super) fn handle_collab_approve(app: &App, args: &Value) -> Result<Value, Me
     .to_string();
 
     app.db.with_transaction(|tx| {
+        super::handoff::ensure_actor_generation_current(
+            app,
+            tx,
+            session_id,
+            agent,
+            super::handoff::opt_handoff_token(args).as_deref(),
+        )?;
         crate::collab::queue::ensure_active(tx, session_id)?;
         let session = crate::collab::queue::load_session(tx, session_id)?;
         let expected_hash = session
@@ -987,6 +1052,21 @@ pub(super) fn handle_collab_wait_my_turn(app: &App, args: &Value) -> Result<Valu
         .unwrap_or(WAIT_MY_TURN_DEFAULT_TIMEOUT_SECS)
         .clamp(1, WAIT_MY_TURN_MAX_TIMEOUT_SECS);
 
+    // Run the generation guard in its own transaction before the polling loop:
+    // the polling loop makes no collab-state write that must be atomic with the
+    // claim, and a token claim commits unconditionally before polling begins, so
+    // the process cache update is correct even if the session snapshot is read
+    // later in a separate connection.
+    app.db.with_transaction(|tx| {
+        super::handoff::ensure_actor_generation_current(
+            app,
+            tx,
+            session_id,
+            agent,
+            super::handoff::opt_handoff_token(args).as_deref(),
+        )
+    })?;
+
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
     let poll_interval = std::time::Duration::from_millis(WAIT_MY_TURN_POLL_MS);
     let mut cell_set = false;
@@ -1021,6 +1101,13 @@ pub(super) fn handle_collab_end(app: &App, args: &Value) -> Result<Value, Memory
     let agent = require_agent(require_str(args, "agent")?)?;
 
     let phase = app.db.with_transaction(|tx| {
+        super::handoff::ensure_actor_generation_current(
+            app,
+            tx,
+            session_id,
+            agent,
+            super::handoff::opt_handoff_token(args).as_deref(),
+        )?;
         // collab_end is valid only from PlanLocked (pre-task_list), or from
         // the two v2 terminal phases. Rejecting during any active planning
         // or coding phase prevents either agent from killing a session the
@@ -2130,6 +2217,151 @@ mod tests {
         assert!(
             result.is_err(),
             "a dangling final drawer id must surface as an error, not a silent fallback"
+        );
+    }
+
+    // ── generation-lease guard (#91) ──────────────────────────────────────────
+
+    /// Gen-0 flow: a single-app session can send/recv without any token.
+    /// Proves the guard does not break the legacy zero-handoff path.
+    #[test]
+    fn gen0_legacy_flow_unchanged() {
+        let app = test_app();
+        let sid = start_session(&app);
+
+        // send a draft — the guarded path must allow it at gen 0.
+        let result = handle_collab_send(
+            &app,
+            &json!({
+                "session_id": sid,
+                "sender": "claude",
+                "topic": "draft",
+                "content": "gen0 draft payload",
+            }),
+        );
+        assert!(
+            result.is_ok(),
+            "gen-0 send must succeed without a handoff token: {:?}",
+            result.unwrap_err()
+        );
+    }
+
+    /// Stale predecessor: after the successor claims the handoff token the
+    /// predecessor's next guarded call must fail with "stale collab generation".
+    #[test]
+    fn stale_predecessor_send_rejected_after_claim() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("mem.sqlite3");
+
+        let pred = test_app_with_db_path(db_path.clone(), dir.path());
+        let succ = test_app_with_db_path(db_path, dir.path());
+
+        // Start a session on predecessor (binds gen 0 on first guarded call).
+        let sid = {
+            let out = handle_collab_start(
+                &pred,
+                &json!({
+                    "repo_path": "/tmp/repo",
+                    "branch": "handoff-branch",
+                    "initiator": "claude",
+                    "task": "handoff test",
+                    "implementer": "claude",
+                }),
+            )
+            .unwrap();
+            out["session_id"].as_str().unwrap().to_string()
+        };
+
+        // Predecessor makes its first guarded call — binds at gen 0.
+        handle_collab_send(
+            &pred,
+            &json!({
+                "session_id": sid,
+                "sender": "claude",
+                "topic": "draft",
+                "content": "pred draft",
+            }),
+        )
+        .unwrap();
+
+        // Issue a handoff token for "claude" via the predecessor's DB.
+        let token = pred
+            .db
+            .with_transaction(|tx| {
+                crate::collab::issue_or_reuse_handoff(tx, &sid, crate::collab::Agent::Claude)
+            })
+            .unwrap()
+            .token;
+
+        // Successor claims the token via a guarded recv (advances DB gen to 1).
+        handle_collab_recv(
+            &succ,
+            &json!({
+                "session_id": sid,
+                "receiver": "claude",
+                "handoff_token": token,
+            }),
+        )
+        .unwrap();
+
+        // Predecessor tries to send again — cached gen 0, DB gen 1 → stale error.
+        let err = handle_collab_send(
+            &pred,
+            &json!({
+                "session_id": sid,
+                "sender": "claude",
+                "topic": "draft",
+                "content": "pred second attempt",
+            }),
+        )
+        .unwrap_err();
+
+        assert!(
+            err.to_string().contains("stale collab generation"),
+            "expected stale collab generation error, got: {err}"
+        );
+    }
+
+    /// collab_status must expose claude_generation and claude_handoff_pending
+    /// correctly after a handoff is issued, without leaking the token itself.
+    #[test]
+    fn collab_status_exposes_generation_and_pending_without_token() {
+        let app = test_app();
+        let sid = start_session(&app);
+
+        // Issue a handoff for claude directly.
+        let issued = app
+            .db
+            .with_transaction(|tx| {
+                crate::collab::issue_or_reuse_handoff(tx, &sid, crate::collab::Agent::Claude)
+            })
+            .unwrap();
+
+        let status = handle_collab_status(&app, &json!({"session_id": sid})).unwrap();
+
+        assert_eq!(
+            status["claude_generation"],
+            json!(0),
+            "claude_generation must be 0 (pending does not advance active generation)"
+        );
+        assert_eq!(
+            status["claude_handoff_pending"],
+            json!(true),
+            "claude_handoff_pending must be true after issue"
+        );
+        assert_eq!(
+            status["codex_handoff_pending"],
+            json!(false),
+            "codex_handoff_pending must be false (no handoff issued for codex)"
+        );
+
+        // The serialized status must not contain the raw token string.
+        let serialized = serde_json::to_string(&status).unwrap();
+        assert!(
+            !serialized.contains(&issued.token),
+            "serialized status must not expose the handoff token: token={}, status={}",
+            issued.token,
+            serialized
         );
     }
 }

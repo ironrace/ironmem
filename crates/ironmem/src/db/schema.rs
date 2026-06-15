@@ -16,6 +16,8 @@ const DROP_CURRENT_TASK_INDEX_SQL: &str =
     include_str!("../../migrations/007_drop_current_task_index.sql");
 const METRICS_SQL: &str = include_str!("../../migrations/008_metrics.sql");
 const COLLAB_PLAN_DRAWERS_SQL: &str = include_str!("../../migrations/009_collab_plan_drawers.sql");
+const COLLAB_GENERATION_LEASE_SQL: &str =
+    include_str!("../../migrations/010_collab_generation_lease.sql");
 
 /// Database wrapper around a SQLite connection.
 ///
@@ -182,6 +184,11 @@ impl Database {
         // (issue #90). Nullable adds; NULL = legacy inline-plan path.
         if current_version < 9 {
             self.conn.execute_batch(COLLAB_PLAN_DRAWERS_SQL)?;
+        }
+
+        // v10: per-actor generation lease table for session_handoff (issue #91).
+        if current_version < 10 {
+            self.conn.execute_batch(COLLAB_GENERATION_LEASE_SQL)?;
         }
 
         Ok(())
@@ -520,7 +527,7 @@ mod tests {
     #[test]
     fn test_fresh_migrate_reaches_head_with_all_tables() {
         let db = Database::open_in_memory().unwrap();
-        assert_eq!(schema_version_of(&db), 9);
+        assert_eq!(schema_version_of(&db), 10);
         for t in METRICS_TABLES {
             assert!(table_exists(&db, t), "missing table {t}");
         }
@@ -538,7 +545,7 @@ mod tests {
             assert!(!table_exists(&db, t), "table {t} should not exist at v7");
         }
         db.migrate().unwrap();
-        assert_eq!(schema_version_of(&db), 9);
+        assert_eq!(schema_version_of(&db), 10);
         for t in METRICS_TABLES {
             assert!(table_exists(&db, t), "missing table {t} after upgrade");
         }
@@ -549,7 +556,7 @@ mod tests {
         let db = Database::open_in_memory().unwrap();
         db.migrate().unwrap();
         db.migrate().unwrap();
-        assert_eq!(schema_version_of(&db), 9);
+        assert_eq!(schema_version_of(&db), 10);
     }
 
     // ---- Migration 009 (plan-by-reference drawer-id columns) coverage ----
@@ -559,7 +566,7 @@ mod tests {
     #[test]
     fn test_fresh_migrate_reaches_v9_with_plan_drawer_columns() {
         let db = Database::open_in_memory().unwrap();
-        assert_eq!(schema_version_of(&db), 9);
+        assert_eq!(schema_version_of(&db), 10);
         for c in PLAN_DRAWER_COLUMNS {
             assert!(
                 column_exists(&db, "collab_sessions", c),
@@ -579,13 +586,41 @@ mod tests {
             );
         }
         db.migrate().unwrap();
-        assert_eq!(schema_version_of(&db), 9);
+        assert_eq!(schema_version_of(&db), 10);
         for c in PLAN_DRAWER_COLUMNS {
             assert!(
                 column_exists(&db, "collab_sessions", c),
                 "missing column {c} after upgrade"
             );
         }
+    }
+
+    /// Build a connection migrated to exactly v9 (no generation-lease table yet) by
+    /// replaying migrations 001-009 directly from the module consts.
+    fn open_at_v9() -> Database {
+        let db = open_at_v8();
+        db.conn.execute_batch(COLLAB_PLAN_DRAWERS_SQL).unwrap();
+        db
+    }
+
+    #[test]
+    fn test_v9_to_v10_upgrade_adds_lease_table() {
+        let db = open_at_v9();
+        assert_eq!(schema_version_of(&db), 9);
+        assert!(
+            !table_exists(&db, "collab_actor_generations"),
+            "lease table should not exist at v9"
+        );
+        db.migrate().unwrap();
+        assert_eq!(schema_version_of(&db), 10);
+        assert!(
+            table_exists(&db, "collab_actor_generations"),
+            "missing collab_actor_generations after upgrade"
+        );
+        assert!(
+            index_exists(&db, "idx_collab_actor_generations_session"),
+            "missing idx_collab_actor_generations_session after upgrade"
+        );
     }
 
     #[test]

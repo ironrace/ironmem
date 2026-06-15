@@ -505,7 +505,10 @@ is still available when callers need selective acknowledgement.
 ### `collab_ack`
 
 Marks a message consumed. Session-scoped: a mismatched
-`(session_id, message_id)` pair is rejected.
+`(session_id, message_id)` pair is rejected. The generation guard resolves
+the acting agent from the target message's `receiver` field (`collab_ack`
+takes no `agent` parameter), so the lease guard applies to the message's
+receiver.
 
 ### `collab_status`
 
@@ -584,6 +587,63 @@ a session the counterpart is still working in.
 Idempotent once allowed: calling from a terminal phase or an
 already-ended session is a no-op, and subsequent `send`, `ack`, `approve`,
 `register_caps`, and `wait_my_turn` calls all treat the session as ended.
+
+### `session_handoff` (fallback succession)
+
+Issues a cryptographic succession token that lets a fresh process take over
+an active session without restarting it. This is the fallback path for an
+agent whose context is exhausted mid-session — the successor presents the
+token to claim the generation lease and becomes the active process.
+
+**Arguments:** `{ session_id, agent }` plus optional `handoff_token` (for
+re-issuance to a third successor). **Returns:** `{ session_id, agent,
+generation, handoff_token, handoff_block }` where `generation` is the
+**pending (to-be-claimed) generation** = active_generation + 1, not the
+caller's current active generation.
+
+**What it does.** The server reads persisted session state and the newest
+`collab-checkpoints` drawer for the session and composes a deterministic,
+model-free fenced markdown block (` ```ironrace-session-handoff `) — it
+NEVER asks a model to summarize. This tool is a WRITE tool and is denied in
+read-only / restricted MCP mode.
+
+**Generation lease.** Each `(session_id, agent)` pair tracks an `active
+generation` and a `pending_handoff_generation`. `session_handoff` issues (or
+byte-identically reuses) a one-time `handoff_token` and sets
+`pending_handoff_generation = active_generation + 1` **without** advancing
+the active generation. A successor presents the `handoff_token` on its first
+actor-bearing mutating/binding collab call (`collab_send`, `collab_recv`,
+`collab_ack`, `collab_approve`, `collab_set_implementer`,
+`collab_register_caps`, `collab_wait_my_turn`, `collab_end`, or
+`session_handoff` itself) to **claim** — the claim advances the active
+generation, making the predecessor process **inert**.
+
+**Inertness.** A process whose cached active generation is behind the DB is
+rejected from all mutating/binding calls listed above. Pure reads
+(`collab_status`, `collab_get_caps`) remain available to a stale
+predecessor.
+
+**Token placement.** The `handoff_token` travels at the top level of the
+response, NOT inside the fenced block. The successor needs both: the block
+(context) and the top-level token (claim credential). Never embed the token
+inside the `handoff_block`.
+
+**gen > 0 tokenless rejection.** Once any handoff has been claimed (active
+generation > 0), a fresh process with no cached generation and no token is
+rejected — it must present a `session_handoff` token. Tokenless first-touch
+is permitted only at generation 0 (a session that has never been handed off).
+
+**collab_ack actor resolution.** `collab_ack` has no `agent` parameter; it
+resolves the actor from the target message's `receiver` field before
+applying the generation guard.
+
+**Self-guard.** `session_handoff` is itself generation-guarded. A stale or
+tokenless gen > 0 caller cannot mint a new token after a successor has
+claimed — resurrection is closed.
+
+**collab_status additions.** `collab_status` now returns `claude_generation`,
+`codex_generation`, `claude_handoff_pending`, and `codex_handoff_pending`
+(boolean). The token value itself is never exposed through `collab_status`.
 
 ## Payload Formats
 
@@ -1239,7 +1299,8 @@ echo '{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}' \
   | env HOME=/tmp/ironmem-home IRONMEM_EMBED_MODE=noop IRONMEM_MCP_MODE=trusted \
       ./target/release/ironmem serve --db /tmp/ironmem-collab-tools.sqlite3 \
   | python3 -c "import sys,json; t=[x['name'] for x in json.load(sys.stdin)['result']['tools']]; \
-      assert all(f'collab_{n}' in t for n in ['start','send','recv','ack','status','approve','register_caps','get_caps','wait_my_turn','end']), t; print('OK')"
+      assert all(f'collab_{n}' in t for n in ['start','send','recv','ack','status','approve','register_caps','get_caps','wait_my_turn','end']), t; \
+      assert 'session_handoff' in t, t; print('OK')"
 ```
 
 ## Scope and Limits

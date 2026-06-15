@@ -11,6 +11,7 @@ mod collab_events;
 mod collab_session;
 mod diary;
 mod drawers;
+mod handoff;
 mod kg;
 mod shared;
 
@@ -25,6 +26,7 @@ use drawers::{
     handle_add_drawer, handle_delete_drawer, handle_get_taxonomy, handle_list_rooms,
     handle_list_wings, handle_search, handle_status,
 };
+use handoff::handle_session_handoff;
 use kg::{
     handle_find_tunnels, handle_graph_stats, handle_kg_add, handle_kg_invalidate, handle_kg_query,
     handle_kg_stats, handle_kg_timeline, handle_traverse,
@@ -246,7 +248,8 @@ pub fn tool_definitions(app: &App) -> Vec<Value> {
                 "properties": {
                     "session_id": { "type": "string" },
                     "agent": { "type": "string", "enum": ["claude", "codex"] },
-                    "implementer": { "type": "string", "enum": ["claude", "codex"] }
+                    "implementer": { "type": "string", "enum": ["claude", "codex"] },
+                    "handoff_token": { "type": "string" }
                 },
                 "required": ["session_id", "agent", "implementer"]
             }
@@ -260,7 +263,8 @@ pub fn tool_definitions(app: &App) -> Vec<Value> {
                     "session_id": { "type": "string" },
                     "sender": { "type": "string", "enum": ["claude", "codex"] },
                     "topic": { "type": "string" },
-                    "content": { "type": "string" }
+                    "content": { "type": "string" },
+                    "handoff_token": { "type": "string" }
                 },
                 "required": ["session_id", "sender", "topic", "content"]
             }
@@ -274,7 +278,8 @@ pub fn tool_definitions(app: &App) -> Vec<Value> {
                     "session_id": { "type": "string" },
                     "receiver": { "type": "string", "enum": ["claude", "codex"] },
                     "limit": { "type": "integer", "default": 10 },
-                    "auto_ack": { "type": "boolean", "default": false }
+                    "auto_ack": { "type": "boolean", "default": false },
+                    "handoff_token": { "type": "string" }
                 },
                 "required": ["session_id", "receiver"]
             }
@@ -286,7 +291,8 @@ pub fn tool_definitions(app: &App) -> Vec<Value> {
                 "type": "object",
                 "properties": {
                     "message_id": { "type": "string" },
-                    "session_id": { "type": "string" }
+                    "session_id": { "type": "string" },
+                    "handoff_token": { "type": "string" }
                 },
                 "required": ["message_id", "session_id"]
             }
@@ -314,7 +320,8 @@ pub fn tool_definitions(app: &App) -> Vec<Value> {
                 "properties": {
                     "session_id": { "type": "string" },
                     "agent": { "type": "string", "enum": ["codex"] },
-                    "content_hash": { "type": "string" }
+                    "content_hash": { "type": "string" },
+                    "handoff_token": { "type": "string" }
                 },
                 "required": ["session_id", "agent", "content_hash"]
             }
@@ -337,7 +344,8 @@ pub fn tool_definitions(app: &App) -> Vec<Value> {
                             },
                             "required": ["name"]
                         }
-                    }
+                    },
+                    "handoff_token": { "type": "string" }
                 },
                 "required": ["session_id", "agent", "capabilities"]
             }
@@ -362,7 +370,8 @@ pub fn tool_definitions(app: &App) -> Vec<Value> {
                 "properties": {
                     "session_id": { "type": "string" },
                     "agent": { "type": "string", "enum": ["claude", "codex"] },
-                    "timeout_secs": { "type": "integer", "default": 30 }
+                    "timeout_secs": { "type": "integer", "default": 30 },
+                    "handoff_token": { "type": "string" }
                 },
                 "required": ["session_id", "agent"]
             }
@@ -374,7 +383,24 @@ pub fn tool_definitions(app: &App) -> Vec<Value> {
                 "type": "object",
                 "properties": {
                     "session_id": { "type": "string" },
-                    "agent": { "type": "string", "enum": ["claude", "codex"] }
+                    "agent": { "type": "string", "enum": ["claude", "codex"] },
+                    "handoff_token": { "type": "string" }
+                },
+                "required": ["session_id", "agent"]
+            }
+        }),
+        json!({
+            "name": "session_handoff",
+            "description": "Issue (or byte-identically reuse) a one-time handoff token plus a deterministic, model-free session handoff block for an unplanned successor. Sets the pending generation; the successor presents handoff_token on its first mutating collab call to claim it, making this predecessor inert. The token is returned top-level (NOT inside the block) — the successor needs both.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "session_id": { "type": "string" },
+                    "agent": { "type": "string", "enum": ["claude", "codex"] },
+                    "handoff_token": {
+                        "type": "string",
+                        "description": "Required when the session's active generation > 0 (a prior handoff has been claimed); omit only on a generation-0 session. On the first mutating collab call a successor presents this to claim the new generation."
+                    }
                 },
                 "required": ["session_id", "agent"]
             }
@@ -428,6 +454,7 @@ pub fn call_tool(app: &App, name: &str, args: &Value) -> Result<Value, MemoryErr
         "collab_get_caps" => handle_collab_get_caps(app, args),
         "collab_wait_my_turn" => handle_collab_wait_my_turn(app, args),
         "collab_end" => handle_collab_end(app, args),
+        "session_handoff" => handle_session_handoff(app, args),
         _ => Err(MemoryError::Permission(format!(
             "Tool '{name}' is not available in the current MCP mode"
         ))),
@@ -468,6 +495,7 @@ fn tool_known(name: &str) -> bool {
             | "collab_get_caps"
             | "collab_wait_my_turn"
             | "collab_end"
+            | "session_handoff"
     )
 }
 
@@ -491,6 +519,7 @@ fn tool_allowed_in_mode(mode: McpAccessMode, name: &str) -> bool {
                 | "collab_approve"
                 | "collab_register_caps"
                 | "collab_end"
+                | "session_handoff"
         )
 }
 
@@ -520,6 +549,23 @@ mod tests {
         assert!(!tool_allowed_in_mode(McpAccessMode::ReadOnly, "add_drawer"));
         assert!(!tool_allowed_in_mode(McpAccessMode::Restricted, "kg_add"));
         assert!(tool_allowed_in_mode(McpAccessMode::Restricted, "search"));
+    }
+
+    #[test]
+    fn session_handoff_is_write_gated_and_known() {
+        assert!(tool_known("session_handoff"));
+        assert!(tool_allowed_in_mode(
+            McpAccessMode::Trusted,
+            "session_handoff"
+        ));
+        assert!(!tool_allowed_in_mode(
+            McpAccessMode::ReadOnly,
+            "session_handoff"
+        ));
+        assert!(!tool_allowed_in_mode(
+            McpAccessMode::Restricted,
+            "session_handoff"
+        ));
     }
 
     #[test]

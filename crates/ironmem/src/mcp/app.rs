@@ -67,6 +67,14 @@ pub struct App {
     /// via `status` tool args. Only consulted when no active collab session
     /// resolves.
     explicit_task_tag: RwLock<Option<String>>,
+    /// Process-local cache of the ACTIVE generation this MCP process is bound
+    /// to per (session_id, agent). Inertness mechanism for the generation lease
+    /// (issue #91): a process whose cached generation is behind the DB active
+    /// generation is a stale predecessor, rejected from mutating/binding collab
+    /// calls. Populated by the first guarded call for a (session, agent) and on
+    /// a successful token claim.
+    pub(crate) active_collab_generations:
+        RwLock<std::collections::HashMap<(String, crate::collab::Agent), u64>>,
 }
 
 impl App {
@@ -130,6 +138,7 @@ impl App {
             harness: RwLock::new(env_metrics_harness()),
             active_collab_session_id: RwLock::new(None),
             explicit_task_tag: RwLock::new(None),
+            active_collab_generations: RwLock::new(std::collections::HashMap::new()),
         })
     }
 
@@ -166,6 +175,7 @@ impl App {
             harness: RwLock::new(env_metrics_harness()),
             active_collab_session_id: RwLock::new(None),
             explicit_task_tag: RwLock::new(None),
+            active_collab_generations: RwLock::new(std::collections::HashMap::new()),
         })
     }
 
@@ -316,7 +326,34 @@ impl App {
             harness: RwLock::new(env_metrics_harness()),
             active_collab_session_id: RwLock::new(None),
             explicit_task_tag: RwLock::new(None),
+            active_collab_generations: RwLock::new(std::collections::HashMap::new()),
         })
+    }
+
+    /// Cached active generation for (session, agent), if this process bound one.
+    pub(crate) fn cached_generation(
+        &self,
+        session_id: &str,
+        agent: crate::collab::Agent,
+    ) -> Option<u64> {
+        self.active_collab_generations
+            .read()
+            .expect("active_collab_generations lock poisoned")
+            .get(&(session_id.to_string(), agent))
+            .copied()
+    }
+
+    /// Bind/refresh this process's cached active generation for (session, agent).
+    pub(crate) fn set_cached_generation(
+        &self,
+        session_id: &str,
+        agent: crate::collab::Agent,
+        generation: u64,
+    ) {
+        self.active_collab_generations
+            .write()
+            .expect("active_collab_generations lock poisoned")
+            .insert((session_id.to_string(), agent), generation);
     }
 
     /// Mark index as dirty after a write operation. The index will be
