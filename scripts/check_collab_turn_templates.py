@@ -5,20 +5,90 @@ Exit 0 iff all checks pass; non-zero with a printed reason otherwise.
 Stdlib only.
 """
 from __future__ import annotations
-import re, sys, pathlib
+import os, pathlib, re, sys
 
-ROOT = pathlib.Path(__file__).resolve().parents[1]
+ROOT = pathlib.Path(os.environ.get(
+    "COLLAB_LINT_ROOT",
+    pathlib.Path(__file__).resolve().parents[1],
+)).resolve()
 PROMPTS = ROOT / ".claude-plugin" / "prompts"
 COMMAND = ROOT / ".claude-plugin" / "commands" / "collab.md"
+DOC = ROOT / "docs" / "COLLAB.md"
+CODEX_PROMPT = ROOT / ".codex-plugin" / "prompts" / "collab.md"
 
 ALLOWED_PLACEHOLDERS = {"SESSION_ID", "REPO_PATH", "BRANCH", "TOPIC",
-                        "ARTIFACT_REF", "MODE"}
+                        "ARTIFACT_REF", "ARTIFACT_HASH", "MODE"}
 REQUIRED_FM = {"turn", "tier", "model", "topics", "preconditions"}
 VALID_TIERS = {"planning", "review", "mechanical"}
 VALID_MODELS = {"opus", "sonnet", "haiku", "default"}
 VALID_TOPICS = {"draft", "canonical", "review", "final", "task_list",
                 "implementation_done", "review_local", "review_fix_global",
                 "final_review", "failure_report"}
+EXPECTED_TEMPLATES = {
+    "collab-turn-plan-draft.md": {
+        "turn": "draft",
+        "tier": "planning",
+        "model": "opus",
+        "topics": ["draft"],
+    },
+    "collab-turn-plan-synthesis.md": {
+        "turn": "canonical",
+        "tier": "planning",
+        "model": "opus",
+        "topics": ["canonical"],
+    },
+    "collab-turn-plan-finalize.md": {
+        "turn": "final",
+        "tier": "planning",
+        "model": "opus",
+        "topics": ["final"],
+    },
+    "collab-turn-task-list.md": {
+        "turn": "task_list",
+        "tier": "planning",
+        "model": "opus",
+        "topics": ["task_list", "failure_report"],
+    },
+    "collab-turn-code-implement.md": {
+        "turn": "implementation_done",
+        "tier": "mechanical",
+        "model": "sonnet",
+        "topics": ["implementation_done", "failure_report"],
+    },
+    "collab-turn-review-local.md": {
+        "turn": "review_local",
+        "tier": "review",
+        "model": "opus",
+        "topics": ["review_local", "failure_report"],
+    },
+    "collab-turn-final-review.md": {
+        "turn": "final_review",
+        "tier": "review",
+        "model": "opus",
+        "topics": ["final_review"],
+    },
+    "collab-turn-submit.md": {
+        "turn": "submit",
+        "tier": "mechanical",
+        "model": "sonnet",
+        "topics": ["canonical", "final", "final_review", "failure_report"],
+    },
+}
+REQUIRED_TEMPLATE_SNIPPETS = {
+    "collab-turn-task-list.md": [
+        "$ARTIFACT_REF",
+        "$ARTIFACT_HASH",
+        "approved_plan_hash_mismatch",
+        "plan_file_path:<$ARTIFACT_REF>",
+    ],
+    "collab-turn-final-review.md": [
+        '{"title":"<title>","body":"<body>"}',
+    ],
+    "collab-turn-submit.md": [
+        'parse the artifact JSON as',
+        'gh pr create --base <base_branch>',
+    ],
+}
 REQUIRED_SENTINELS = ["<!-- LINT:worker-dispatch -->",
                       "<!-- LINT:gates-ref-only -->",
                       "<!-- LINT:bridge-worker-owned -->",
@@ -30,6 +100,8 @@ FORBIDDEN_IN_COMMAND = [
 ]
 PLACEHOLDER_RE = re.compile(r"\$([A-Za-z_]+)")
 FM_RE = re.compile(r"^---\n(.*?)\n---\n", re.DOTALL)
+VERDICT_RE = re.compile(r"## Verdict.*?```(?:[a-zA-Z0-9_-]+)?\n(.*?)\n```",
+                        re.DOTALL)
 
 errors: list[str] = []
 
@@ -84,10 +156,25 @@ def lint_template(path: pathlib.Path) -> dict | None:
         err(f"{name}: missing ANTI-PUPPETEERING banner")
     if "## Verdict" not in body:
         err(f"{name}: missing '## Verdict' (<=3 line contract) section")
+    else:
+        verdict = VERDICT_RE.search(body)
+        if not verdict:
+            err(f"{name}: missing fenced verdict block")
+        else:
+            lines = [line.strip() for line in verdict.group(1).splitlines()
+                     if line.strip()]
+            expected_prefixes = ["result:", "ref:", "blocker:"]
+            if len(lines) != 3:
+                err(f"{name}: verdict block must contain exactly 3 lines")
+            elif [line.split(":", 1)[0] + ":" for line in lines] != expected_prefixes:
+                err(f"{name}: verdict block must be result/ref/blocker lines")
     if re.search(r"fable", text, re.IGNORECASE):
         err(f"{name}: contains a 'Fable' reference (Fable is OFF)")
-    return {"name": name, "tier": fm.get("tier"), "model": fm.get("model"),
-            "topics": topics}
+    for snippet in REQUIRED_TEMPLATE_SNIPPETS.get(name, []):
+        if snippet not in text:
+            err(f"{name}: missing required contract snippet {snippet!r}")
+    return {"name": name, "turn": fm.get("turn"), "tier": fm.get("tier"),
+            "model": fm.get("model"), "topics": topics}
 
 
 def parse_dispatch_matrix(text: str) -> list[dict]:
@@ -114,11 +201,26 @@ def main() -> int:
     templates = sorted(PROMPTS.glob("collab-turn-*.md"))
     if not templates:
         err("no collab-turn-*.md templates found")
+    template_names = {t.name for t in templates}
+    expected_names = set(EXPECTED_TEMPLATES)
+    for missing in sorted(expected_names - template_names):
+        err(f"missing required template {missing}")
+    for extra in sorted(template_names - expected_names):
+        err(f"unexpected collab-turn template {extra}")
     parsed = {}
     for t in templates:
         info = lint_template(t)
         if info:
             parsed[info["name"]] = info
+            expected = EXPECTED_TEMPLATES.get(info["name"])
+            if expected:
+                for key in ("turn", "tier", "model"):
+                    if info[key] != expected[key]:
+                        err(f"{info['name']}: {key} {info[key]!r} != "
+                            f"expected {expected[key]!r}")
+                if info["topics"] != expected["topics"]:
+                    err(f"{info['name']}: topics {info['topics']} != "
+                        f"expected {expected['topics']}")
 
     cmd_text = COMMAND.read_text()
     for s in REQUIRED_SENTINELS:
@@ -139,6 +241,9 @@ def main() -> int:
     # Matrix <-> frontmatter cross-check.
     matrix = parse_dispatch_matrix(cmd_text)
     matrix_tmpls = {r["template"] for r in matrix}
+    if matrix_tmpls != expected_names:
+        err("collab.md: dispatch matrix must reference exactly the 8 "
+            "required collab-turn templates")
     for r in matrix:
         info = parsed.get(r["template"])
         if not info:
@@ -153,6 +258,19 @@ def main() -> int:
     for name in parsed:
         if name not in matrix_tmpls:
             err(f"{name}: no dispatch-matrix row in collab.md")
+
+    doc_text = DOC.read_text()
+    if "## Worker-per-turn dispatch (Claude side)" not in doc_text:
+        err("docs/COLLAB.md: missing Worker-per-turn dispatch section")
+    if "### Measurement gate" not in doc_text:
+        err("docs/COLLAB.md: missing worker context measurement gate")
+    for name in EXPECTED_TEMPLATES:
+        if name not in doc_text:
+            err(f"docs/COLLAB.md: missing template reference {name}")
+
+    codex_text = CODEX_PROMPT.read_text()
+    if "collab-turn-*.md" not in codex_text:
+        err(".codex-plugin/prompts/collab.md: missing worker-template xref")
 
     if errors:
         print("collab-turn template lint FAILED:")

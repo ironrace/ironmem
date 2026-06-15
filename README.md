@@ -36,7 +36,7 @@ chmod +x .githooks/pre-commit .githooks/pre-push
 
 The hooks run:
 
-- `pre-commit`: `cargo fmt --all -- --check` and `cargo clippy --workspace --all-targets --all-features -- -D warnings`
+- `pre-commit`: `cargo fmt --all -- --check`, `python3 scripts/check_collab_turn_templates.py`, and `cargo clippy --workspace --all-targets --all-features -- -D warnings`
 - `pre-push`: `cargo test --workspace`
 
 ## Quickstart: Install and Run in 60 Seconds

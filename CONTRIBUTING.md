@@ -23,6 +23,7 @@ After that:
 
 - every `git commit` runs:
 - `cargo fmt --all -- --check`
+- `python3 scripts/check_collab_turn_templates.py`
 - `cargo clippy --workspace --all-targets --all-features -- -D warnings`
 - every `git push` runs:
 - `cargo test --workspace`
@@ -33,6 +34,7 @@ From the repo root:
 
 ```bash
 cargo fmt --all -- --check
+python3 scripts/check_collab_turn_templates.py
 cargo clippy --workspace --all-targets --all-features -- -D warnings
 cargo test --workspace
 bash scripts/check_versions.sh

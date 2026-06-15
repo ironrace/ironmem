@@ -10,7 +10,7 @@ preconditions: phase == CodeReviewFinalPending, current_owner == claude
 
 > ANTI-PUPPETEERING: You received only this template and `$SESSION_ID`. Discover
 > all state yourself. Your final message MUST be the ≤3-line verdict only; never
-> paste the PR body.
+> paste the PR artifact.
 
 ## State discovery
 1. `collab_status(session_id=$SESSION_ID, verbose:true)`; read `task_list`,
@@ -21,9 +21,10 @@ preconditions: phase == CodeReviewFinalPending, current_owner == claude
    check; re-run gates.
 2. Draft the PR title (<70 chars) + body (summary + test plan from task_list +
    gate results). `add_drawer(wing="ironrace-memory", room="collab-drafts",
-   content=<PR body>)`; return its `drawer_id`. Do NOT open the PR — the
-   orchestrator gates, then dispatches `collab-turn-submit.md` `$MODE=send`
-   `$TOPIC=final_review` to run `gh pr create` and send.
+   content=<JSON string {"title":"<title>","body":"<body>"}>)`; return its
+   `drawer_id`. Do NOT open the PR — the orchestrator gates, then dispatches
+   `collab-turn-submit.md` `$MODE=send` `$TOPIC=final_review` to run
+   `gh pr create` and send.
 
 ## Verdict
 Return EXACTLY these ≤3 lines, nothing else:
