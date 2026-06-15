@@ -16,6 +16,7 @@
 //! (terminal) on success — the final Claude turn opens the PR and carries
 //! its URL. `CodingFailed` is the unrecoverable-error terminal.
 
+pub mod handoff;
 pub mod queue;
 
 mod agent;
@@ -28,6 +29,10 @@ mod state_machine;
 pub use agent::Agent;
 pub use error::CollabError;
 pub use event::CollabEvent;
+pub use handoff::{
+    claim_handoff_token, issue_or_reuse_handoff, load_or_init_actor_generation, ActorGeneration,
+    HandoffIssue,
+};
 pub use phase::Phase;
 pub use session::{tasks_count_from_list, CollabSession};
 pub use state_machine::{apply_event, start_global_review_session};

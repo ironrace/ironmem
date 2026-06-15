@@ -541,6 +541,8 @@ mod tests {
         include_str!("../../migrations/007_drop_current_task_index.sql");
     const COLLAB_PLAN_DRAWERS_SQL: &str =
         include_str!("../../migrations/009_collab_plan_drawers.sql");
+    const COLLAB_GENERATION_LEASE_SQL: &str =
+        include_str!("../../migrations/010_collab_generation_lease.sql");
 
     fn open() -> Connection {
         let conn = Connection::open_in_memory().unwrap();
@@ -552,6 +554,7 @@ mod tests {
         conn.execute_batch(COLLAB_IMPLEMENTER_SQL).unwrap();
         conn.execute_batch(DROP_CURRENT_TASK_INDEX_SQL).unwrap();
         conn.execute_batch(COLLAB_PLAN_DRAWERS_SQL).unwrap();
+        conn.execute_batch(COLLAB_GENERATION_LEASE_SQL).unwrap();
         conn
     }
 
