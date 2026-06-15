@@ -11,6 +11,7 @@ mod collab_events;
 mod collab_session;
 mod diary;
 mod drawers;
+mod handoff;
 mod kg;
 mod shared;
 
@@ -246,7 +247,8 @@ pub fn tool_definitions(app: &App) -> Vec<Value> {
                 "properties": {
                     "session_id": { "type": "string" },
                     "agent": { "type": "string", "enum": ["claude", "codex"] },
-                    "implementer": { "type": "string", "enum": ["claude", "codex"] }
+                    "implementer": { "type": "string", "enum": ["claude", "codex"] },
+                    "handoff_token": { "type": "string" }
                 },
                 "required": ["session_id", "agent", "implementer"]
             }
@@ -260,7 +262,8 @@ pub fn tool_definitions(app: &App) -> Vec<Value> {
                     "session_id": { "type": "string" },
                     "sender": { "type": "string", "enum": ["claude", "codex"] },
                     "topic": { "type": "string" },
-                    "content": { "type": "string" }
+                    "content": { "type": "string" },
+                    "handoff_token": { "type": "string" }
                 },
                 "required": ["session_id", "sender", "topic", "content"]
             }
@@ -274,7 +277,8 @@ pub fn tool_definitions(app: &App) -> Vec<Value> {
                     "session_id": { "type": "string" },
                     "receiver": { "type": "string", "enum": ["claude", "codex"] },
                     "limit": { "type": "integer", "default": 10 },
-                    "auto_ack": { "type": "boolean", "default": false }
+                    "auto_ack": { "type": "boolean", "default": false },
+                    "handoff_token": { "type": "string" }
                 },
                 "required": ["session_id", "receiver"]
             }
@@ -286,7 +290,8 @@ pub fn tool_definitions(app: &App) -> Vec<Value> {
                 "type": "object",
                 "properties": {
                     "message_id": { "type": "string" },
-                    "session_id": { "type": "string" }
+                    "session_id": { "type": "string" },
+                    "handoff_token": { "type": "string" }
                 },
                 "required": ["message_id", "session_id"]
             }
@@ -314,7 +319,8 @@ pub fn tool_definitions(app: &App) -> Vec<Value> {
                 "properties": {
                     "session_id": { "type": "string" },
                     "agent": { "type": "string", "enum": ["codex"] },
-                    "content_hash": { "type": "string" }
+                    "content_hash": { "type": "string" },
+                    "handoff_token": { "type": "string" }
                 },
                 "required": ["session_id", "agent", "content_hash"]
             }
@@ -337,7 +343,8 @@ pub fn tool_definitions(app: &App) -> Vec<Value> {
                             },
                             "required": ["name"]
                         }
-                    }
+                    },
+                    "handoff_token": { "type": "string" }
                 },
                 "required": ["session_id", "agent", "capabilities"]
             }
@@ -362,7 +369,8 @@ pub fn tool_definitions(app: &App) -> Vec<Value> {
                 "properties": {
                     "session_id": { "type": "string" },
                     "agent": { "type": "string", "enum": ["claude", "codex"] },
-                    "timeout_secs": { "type": "integer", "default": 30 }
+                    "timeout_secs": { "type": "integer", "default": 30 },
+                    "handoff_token": { "type": "string" }
                 },
                 "required": ["session_id", "agent"]
             }
@@ -374,7 +382,8 @@ pub fn tool_definitions(app: &App) -> Vec<Value> {
                 "type": "object",
                 "properties": {
                     "session_id": { "type": "string" },
-                    "agent": { "type": "string", "enum": ["claude", "codex"] }
+                    "agent": { "type": "string", "enum": ["claude", "codex"] },
+                    "handoff_token": { "type": "string" }
                 },
                 "required": ["session_id", "agent"]
             }
