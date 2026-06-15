@@ -406,6 +406,53 @@ pub fn prompt_hook_summary_max_bytes() -> usize {
     env_usize("IRONMEM_PROMPT_HOOK_SUMMARY_MAX_BYTES", 120)
 }
 
+/// Occupancy fraction at which the hook injects a soft warning (>= warn, < handoff).
+/// Env `IRONMEM_CONTEXT_WARN_PCT`; default 0.60; clamped to `0.0..=1.0`.
+/// Fresh-read per call (no OnceLock) so integration tests can flip it.
+/// If the resolved warn value >= handoff value, both revert to defaults (0.60 / 0.80)
+/// to preserve the `warn < handoff` ordering invariant.
+pub fn context_warn_pct() -> f64 {
+    let (w, h) = context_threshold_pair();
+    let _ = h;
+    w
+}
+
+/// Occupancy fraction at which the hook injects a handoff instruction (>= handoff).
+/// Env `IRONMEM_CONTEXT_HANDOFF_PCT`; default 0.80; clamped to `0.0..=1.0`.
+/// Fresh-read per call (no OnceLock) so integration tests can flip it.
+/// If the resolved warn value >= handoff value, both revert to defaults (0.60 / 0.80)
+/// to preserve the `warn < handoff` ordering invariant.
+pub fn context_handoff_pct() -> f64 {
+    let (w, h) = context_threshold_pair();
+    let _ = w;
+    h
+}
+
+/// Parse and validate both occupancy thresholds together so the
+/// `warn < handoff` invariant can be enforced atomically.
+/// Returns `(warn_pct, handoff_pct)`.
+fn context_threshold_pair() -> (f64, f64) {
+    const DEFAULT_WARN: f64 = 0.60;
+    const DEFAULT_HANDOFF: f64 = 0.80;
+
+    let parse_clamped = |name: &str, default: f64| -> f64 {
+        match std::env::var(name).ok().and_then(|s| s.parse::<f64>().ok()) {
+            Some(v) if v.is_finite() && (0.0..=1.0).contains(&v) => v,
+            _ => default,
+        }
+    };
+
+    let warn = parse_clamped("IRONMEM_CONTEXT_WARN_PCT", DEFAULT_WARN);
+    let handoff = parse_clamped("IRONMEM_CONTEXT_HANDOFF_PCT", DEFAULT_HANDOFF);
+
+    // Invariant guard: warn must be strictly less than handoff.
+    if warn >= handoff {
+        (DEFAULT_WARN, DEFAULT_HANDOFF)
+    } else {
+        (warn, handoff)
+    }
+}
+
 /// Serializes tests that mutate the `IRONMEM_KG_*` env vars. These tunables
 /// read the env fresh on every call, so any test flipping them (here or in
 /// `search::pipeline`) must hold this lock to avoid clobbering a concurrent
@@ -558,5 +605,66 @@ mod tests {
         std::env::set_var("IRONMEM_METRICS", "1");
         assert!(metrics_enabled());
         std::env::remove_var("IRONMEM_METRICS");
+    }
+
+    #[test]
+    fn context_thresholds_defaults() {
+        let _g = PROMPT_HOOK_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::remove_var("IRONMEM_CONTEXT_WARN_PCT");
+        std::env::remove_var("IRONMEM_CONTEXT_HANDOFF_PCT");
+        assert_eq!(context_warn_pct(), 0.60);
+        assert_eq!(context_handoff_pct(), 0.80);
+    }
+
+    #[test]
+    fn context_thresholds_valid_override() {
+        let _g = PROMPT_HOOK_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("IRONMEM_CONTEXT_WARN_PCT", "0.50");
+        std::env::set_var("IRONMEM_CONTEXT_HANDOFF_PCT", "0.90");
+        assert_eq!(context_warn_pct(), 0.50);
+        assert_eq!(context_handoff_pct(), 0.90);
+        std::env::remove_var("IRONMEM_CONTEXT_WARN_PCT");
+        std::env::remove_var("IRONMEM_CONTEXT_HANDOFF_PCT");
+    }
+
+    #[test]
+    fn context_thresholds_garbage_falls_back_to_defaults() {
+        let _g = PROMPT_HOOK_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("IRONMEM_CONTEXT_WARN_PCT", "notanumber");
+        std::env::set_var("IRONMEM_CONTEXT_HANDOFF_PCT", "also_bad");
+        assert_eq!(context_warn_pct(), 0.60);
+        assert_eq!(context_handoff_pct(), 0.80);
+        std::env::remove_var("IRONMEM_CONTEXT_WARN_PCT");
+        std::env::remove_var("IRONMEM_CONTEXT_HANDOFF_PCT");
+    }
+
+    #[test]
+    fn context_thresholds_out_of_range_falls_back_to_defaults() {
+        let _g = PROMPT_HOOK_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // > 1.0
+        std::env::set_var("IRONMEM_CONTEXT_WARN_PCT", "1.5");
+        std::env::remove_var("IRONMEM_CONTEXT_HANDOFF_PCT");
+        assert_eq!(context_warn_pct(), 0.60);
+        // < 0.0
+        std::env::set_var("IRONMEM_CONTEXT_WARN_PCT", "-0.1");
+        assert_eq!(context_warn_pct(), 0.60);
+        std::env::remove_var("IRONMEM_CONTEXT_WARN_PCT");
+    }
+
+    #[test]
+    fn context_thresholds_inversion_guard_both_default() {
+        let _g = PROMPT_HOOK_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // warn == handoff => inversion
+        std::env::set_var("IRONMEM_CONTEXT_WARN_PCT", "0.70");
+        std::env::set_var("IRONMEM_CONTEXT_HANDOFF_PCT", "0.70");
+        assert_eq!(context_warn_pct(), 0.60);
+        assert_eq!(context_handoff_pct(), 0.80);
+        // warn > handoff
+        std::env::set_var("IRONMEM_CONTEXT_WARN_PCT", "0.90");
+        std::env::set_var("IRONMEM_CONTEXT_HANDOFF_PCT", "0.70");
+        assert_eq!(context_warn_pct(), 0.60);
+        assert_eq!(context_handoff_pct(), 0.80);
+        std::env::remove_var("IRONMEM_CONTEXT_WARN_PCT");
+        std::env::remove_var("IRONMEM_CONTEXT_HANDOFF_PCT");
     }
 }

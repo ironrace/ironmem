@@ -655,6 +655,81 @@ claimed — resurrection is closed.
 `codex_generation`, `claude_handoff_pending`, and `codex_handoff_pending`
 (boolean). The token value itself is never exposed through `collab_status`.
 
+### Context-occupancy handoff
+
+The UserPromptSubmit hook injects a one-line notice when context occupancy
+crosses a threshold (default 60% warn / 80% handoff, overridable via
+`IRONMEM_CONTEXT_WARN_PCT` / `IRONMEM_CONTEXT_HANDOFF_PCT`).
+
+**Automated successor path (autonomous/collab phases):**
+
+1. On a `>= 80%` (Handoff) notice, the active agent calls
+   `session_handoff(session_id, agent)` and captures the **top-level**
+   `handoff_token` and `handoff_block` from the response (the token is NOT
+   inside the fenced block).
+2. The `task_outcomes.handoffs` counter is incremented automatically inside
+   `handle_session_handoff` (via `increment_task_handoffs(session_id)` called
+   immediately after the token is issued or reused). The count reflects handoff
+   **intent** at issue/reuse time, not successor claim.
+3. Spawn the successor via background Bash, mirroring the `codex exec`
+   dispatch contract (see "Background `codex exec` dispatch"):
+   ```
+   claude -p "join ironmem collab <sid> with token <handoff_token>"
+   ```
+   with `run_in_background: true`. The successor's first mutating call
+   presents the token and claims the lease.
+4. The predecessor ends its turn. Once the successor claims the lease (gen+1),
+   the predecessor's next mutating call is rejected with "stale collab
+   generation" (stale-gen rejection, `collab/handoff.rs` L35-69). **No
+   process coordination is required — the generation lease is the single
+   writer.**
+
+**Cron fallback (where a spawned child cannot outlive its parent):**
+
+When the runtime cannot keep a spawned child alive after the parent exits,
+use a one-time local cron entry as a fallback:
+
+```sh
+# Add a one-shot entry (runs once at the next minute, then self-deletes).
+# Replace <sid> and <token> with the values from session_handoff.
+(crontab -l 2>/dev/null; echo "* * * * * claude -p \"join ironmem collab <sid> with token <token>\" && crontab -l | grep -v 'join ironmem collab <sid>' | crontab -") | crontab -
+```
+
+This is a **best-effort fallback only**: local-only, never committed to the
+repo, self-deleting after the first run.
+
+**Interactive phases (manual flow):**
+
+When the context occupancy notice appears in an interactive session, the user
+manually handles the handoff:
+1. Note the `session_id` in the notice (the Handoff notice includes
+   `join collab <sid>` for easy copy).
+2. Call `session_handoff(session_id, agent)` to mint the token (or ask the
+   agent to call it).
+3. Run `/clear` to reset context.
+4. Rejoin with `join collab <sid>` (or `join collab <sid> with token <token>`
+   if the token was captured).
+
+**Permission allowlist for unattended successor operation:**
+
+An unattended `claude -p` successor needs at minimum:
+- `mcp__ironmem__collab_send` — send phase messages
+- `mcp__ironmem__collab_recv` — receive phase messages
+- `mcp__ironmem__collab_ack` — acknowledge messages
+- `mcp__ironmem__collab_approve` — approve plans/reviews
+- `mcp__ironmem__collab_set_implementer` — set implementer
+- `mcp__ironmem__collab_register_caps` — register capabilities
+- `mcp__ironmem__collab_wait_my_turn` — wait for turn
+- `mcp__ironmem__collab_end` — end session
+- `mcp__ironmem__session_handoff` — re-handoff if needed
+- `mcp__ironmem__collab_status` — read session state
+- `Bash(claude -p:*)` — re-spawn a further successor if needed
+- Git bash operations (`Bash(git commit:*)`, `Bash(git push:*)`, etc.) as
+  needed for the implementation tasks the successor will perform.
+
+Operators should configure these in `.claude/settings.json` under
+`permissions.allow` before running unattended.
+
 ## Payload Formats
 
 ### Draft / Canonical / Final

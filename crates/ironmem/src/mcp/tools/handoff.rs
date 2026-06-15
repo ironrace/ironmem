@@ -291,6 +291,19 @@ pub(super) fn handle_session_handoff(app: &App, args: &Value) -> Result<Value, M
         Ok((record, issued))
     })?;
 
+    // Best-effort handoff counter: keyed on session_id (the repo's task_tag
+    // convention for collab rows, matching increment_task_review_rounds call sites).
+    // Counted at token issue/reuse time so it reflects handoff intent even if
+    // the spawned successor never claims the lease. Warn-and-continue: a metrics
+    // error must never fail the session_handoff response.
+    if let Err(e) = app.db.increment_task_handoffs(session_id) {
+        tracing::warn!(
+            session_id = %session_id,
+            error = %e,
+            "metrics: increment_task_handoffs failed — handoff count may be under-counted"
+        );
+    }
+
     let checkpoint = latest_checkpoint(&app.db, session_id)?;
     let block = compose_handoff_block(&record, agent, issued.pending_generation, checkpoint);
 
@@ -868,6 +881,72 @@ gates: passed\n";
         assert!(
             err.to_string().contains("handed off"),
             "expected 'handed off' in error, got: {err}"
+        );
+    }
+
+    /// `handle_session_handoff` bumps `task_outcomes.handoffs` by 1 for a
+    /// session whose row exists (keyed on session_id). A metrics failure or
+    /// absent row must still return the normal handoff JSON.
+    #[test]
+    fn handle_session_handoff_bumps_handoffs_counter() {
+        let (app, _dir) = test_handoff_app();
+        let sid = seed_active_session(&app);
+
+        // Seed a task_outcomes row with task_tag = session_id (the repo convention).
+        app.db
+            .upsert_task_outcome(&crate::db::metrics::TaskOutcome {
+                task_tag: sid.clone(),
+                collab_session_id: Some(sid.clone()),
+                started_at: Some("2026-06-15T00:00:00Z".to_string()),
+                done_at: None,
+                outcome: None,
+                review_rounds: 0,
+                fix_commits: 0,
+                handoffs: 0,
+                pr_url: None,
+            })
+            .unwrap();
+
+        let resp =
+            handle_session_handoff(&app, &json!({ "session_id": sid, "agent": "claude" })).unwrap();
+
+        // Response must carry the normal handoff fields.
+        assert!(
+            resp.get("handoff_token").is_some(),
+            "handoff_token must be top-level"
+        );
+        assert!(
+            resp.get("handoff_block").is_some(),
+            "handoff_block must be present"
+        );
+
+        // Counter incremented exactly once.
+        let got = app.db.get_task_outcome(&sid).unwrap().unwrap();
+        assert_eq!(got.handoffs, 1, "handoffs must be 1 after one handoff call");
+    }
+
+    /// Absent task_outcomes row: increment is a no-op; response is still normal.
+    #[test]
+    fn handle_session_handoff_absent_row_still_returns_normal_response() {
+        let (app, _dir) = test_handoff_app();
+        let sid = seed_active_session(&app);
+        // Deliberately do NOT seed a task_outcomes row.
+
+        let resp =
+            handle_session_handoff(&app, &json!({ "session_id": sid, "agent": "claude" })).unwrap();
+
+        assert!(
+            resp.get("handoff_token").is_some(),
+            "handoff_token must be top-level"
+        );
+        assert!(
+            resp.get("handoff_block").is_some(),
+            "handoff_block must be present"
+        );
+        // No row created by the increment.
+        assert!(
+            app.db.get_task_outcome(&sid).unwrap().is_none(),
+            "absent row must remain absent after best-effort increment"
         );
     }
 

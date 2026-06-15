@@ -277,6 +277,59 @@ fn sample_occupancy(
 /// transcript-tail scan and DB write stay well inside the prompt budget.
 const PROMPT_HOOK_OCCUPANCY_RESERVE_MS: u64 = 30;
 
+// ── Occupancy tier + notice ─────────────────────────────────────────────────
+
+/// Occupancy tier derived from context-window percentage.
+/// Split from the env read so the tier classification is pure and unit-testable
+/// without mutating process-global env vars (mirrors the hook.rs L375 convention).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OccupancyTier {
+    /// Below the warn threshold — no notice needed.
+    Ok,
+    /// >= warn threshold, < handoff threshold — soft warning.
+    Warn,
+    /// >= handoff threshold — handoff instruction.
+    Handoff,
+}
+
+/// Pure tier classifier. Assumes `warn < handoff` (invariant enforced by
+/// `context_threshold_pair`); callers should read both tunables together.
+fn occupancy_tier(pct: f64, warn: f64, handoff: f64) -> OccupancyTier {
+    if pct >= handoff {
+        OccupancyTier::Handoff
+    } else if pct >= warn {
+        OccupancyTier::Warn
+    } else {
+        OccupancyTier::Ok
+    }
+}
+
+/// Pure notice builder. Returns `None` for `OccupancyTier::Ok`.
+/// `pct` is the raw fraction (e.g. 0.654); displayed as a rounded integer
+/// percent (e.g. "~65%"). All output strings are ASCII-only.
+/// `sid` is included in the Handoff notice so the user/agent can copy the
+/// rejoin target.
+fn occupancy_notice(pct: f64, tier: OccupancyTier, sid: Option<&str>) -> Option<String> {
+    let pct_int = (pct * 100.0).round() as i64;
+    match tier {
+        OccupancyTier::Ok => None,
+        OccupancyTier::Warn => Some(format!(
+            "[ironmem] context ~{pct_int}% - plan a handoff/clear soon."
+        )),
+        OccupancyTier::Handoff => {
+            if let Some(sid) = sid {
+                Some(format!(
+                    "[ironmem] context ~{pct_int}% - hand off now: run session_handoff then /clear and rejoin: join collab {sid} - see collab.md."
+                ))
+            } else {
+                Some(format!(
+                    "[ironmem] context ~{pct_int}% - hand off now: run session_handoff then /clear and rejoin - see collab.md."
+                ))
+            }
+        }
+    }
+}
+
 /// UserPromptSubmit hook: FTS/BM25-only memory injection under a hard wall-clock
 /// budget. Always returns a fully-formed `HookResponse`; on ANY problem (missing/
 /// empty prompt, missing DB/FTS, lock, timeout, no qualifying hits) it emits no
@@ -315,8 +368,41 @@ fn run_user_prompt_submit(
         }
     }
 
-    // Best-effort, budget-gated occupancy: only if we still have headroom and
-    // metrics are enabled. Like precompact/stop (issue #113), this is decoupled
+    // Read the transcript tail once and parse usage here in the caller, so both
+    // the occupancy notice (Task 3 / R11) and the metrics DB sample share the
+    // same parsed result with no second file read.
+    let usage = transcript_path
+        .and_then(read_transcript_tail)
+        .and_then(|raw| crate::metrics::extract_last_assistant_usage(&raw));
+
+    // Occupancy notice: NOT gated by IRONMEM_METRICS (R12). This is operator
+    // guidance, not telemetry — it must fire even when metrics writes are disabled.
+    // Fail-closed: any missing/unparseable transcript -> no notice, no error.
+    if let Some(u) = usage {
+        let window = crate::search::tunables::context_window();
+        if let Some(pct) =
+            crate::metrics::occupancy_pct(u.input_tokens, u.cache_read_input_tokens, window)
+        {
+            let warn = crate::search::tunables::context_warn_pct();
+            let handoff = crate::search::tunables::context_handoff_pct();
+            let tier = occupancy_tier(pct, warn, handoff);
+            if let Some(notice) = occupancy_notice(pct, tier, session_id) {
+                match &mut response.hook_specific_output {
+                    Some(out) => {
+                        // Prepend notice to existing additionalContext.
+                        out.additional_context = format!("{}\n{}", notice, out.additional_context);
+                    }
+                    None => {
+                        response.hook_specific_output =
+                            Some(HookSpecificOutput::user_prompt_submit(notice));
+                    }
+                }
+            }
+        }
+    }
+
+    // Best-effort, budget-gated occupancy DB sample: only if we still have headroom
+    // and metrics are enabled. Like precompact/stop (issue #113), this is decoupled
     // from `allows_writes` — occupancy is metrics-only telemetry (token counts /
     // occupancy %, no memory content), and the UPS hook command in settings.json
     // defaults to ReadOnly, so coupling it to the content-write gate meant it
@@ -335,7 +421,7 @@ fn run_user_prompt_submit(
             harness,
             session_id,
             workspace_root,
-            transcript_path,
+            usage,
             occ_budget,
         );
     }
@@ -448,15 +534,16 @@ fn bm25_block_from_db(
     ))
 }
 
-/// Best-effort occupancy sample for the prompt hook. Opens its own budget-bounded
-/// writable connection (no `App`); reuses the shared transcript-tail scan and
-/// `record_occupancy_sample`. Silently no-ops on any failure.
+/// Best-effort occupancy sample for the prompt hook. Accepts pre-parsed usage
+/// (read once in the caller, shared with the notice path per R11) to avoid a
+/// second transcript-tail file read. Opens its own budget-bounded writable
+/// connection (no `App`). Silently no-ops on any failure.
 fn sample_prompt_occupancy(
     config: &Config,
     harness: &str,
     session_id: Option<&str>,
     workspace_root: Option<&Path>,
-    transcript_path: Option<&Path>,
+    usage: Option<crate::metrics::Usage>,
     budget: Duration,
 ) {
     let Some(event) = crate::metrics::hook_event_for("user-prompt-submit") else {
@@ -481,17 +568,12 @@ fn sample_prompt_occupancy(
     };
     let workspace = workspace_root.map(|p| p.to_string_lossy().to_string());
     let session_id = session_id.to_string();
-    let transcript_path = transcript_path.map(Path::to_path_buf);
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
         let Ok(db) = crate::db::schema::Database::open_with_busy_timeout(&db_path, budget) else {
             let _ = tx.send(());
             return;
         };
-        let usage = transcript_path
-            .as_deref()
-            .and_then(read_transcript_tail)
-            .and_then(|raw| crate::metrics::extract_last_assistant_usage(&raw));
         crate::metrics::record_occupancy_sample(
             &db,
             &harness_norm,
@@ -2427,12 +2509,14 @@ mod tests {
 
         let cfg = prompt_hook_config(db_path.clone(), dir.path().join("state"));
         let start = Instant::now();
+        // Usage is now pre-parsed by the caller (R11); pass None here since
+        // this test is only verifying the budget-timeout behavior, not the sample content.
         sample_prompt_occupancy(
             &cfg,
             "claude-code",
             Some("busy-1"),
             None,
-            Some(&transcript),
+            None, // pre-parsed usage (None -> no DB sample row; DB lock still holds the test)
             Duration::from_millis(1),
         );
         assert!(
@@ -2820,5 +2904,291 @@ mod tests {
                 .is_none(),
             "codex-* prefix must omit prompt-recall injection"
         );
+    }
+
+    // ── Task 2: OccupancyTier + occupancy_notice unit tests ──────────────────
+
+    #[test]
+    fn occupancy_tier_boundaries() {
+        // Below warn
+        assert_eq!(occupancy_tier(0.59, 0.60, 0.80), OccupancyTier::Ok);
+        // At warn
+        assert_eq!(occupancy_tier(0.60, 0.60, 0.80), OccupancyTier::Warn);
+        // Between warn and handoff
+        assert_eq!(occupancy_tier(0.79, 0.60, 0.80), OccupancyTier::Warn);
+        // At handoff
+        assert_eq!(occupancy_tier(0.80, 0.60, 0.80), OccupancyTier::Handoff);
+        // Above handoff
+        assert_eq!(occupancy_tier(1.0, 0.60, 0.80), OccupancyTier::Handoff);
+    }
+
+    #[test]
+    fn occupancy_notice_ok_returns_none() {
+        assert!(occupancy_notice(0.50, OccupancyTier::Ok, None).is_none());
+        assert!(occupancy_notice(0.50, OccupancyTier::Ok, Some("sid123")).is_none());
+    }
+
+    #[test]
+    fn occupancy_notice_warn_is_non_empty_and_ascii() {
+        let notice = occupancy_notice(0.654, OccupancyTier::Warn, None).unwrap();
+        assert!(!notice.is_empty());
+        assert!(notice.is_ascii(), "notice must be ASCII-only: {notice:?}");
+        // Rounded pct: 0.654 -> 65%
+        assert!(notice.contains("~65%"), "pct rendering: {notice:?}");
+    }
+
+    #[test]
+    fn occupancy_notice_handoff_with_sid_contains_join_clause() {
+        let notice = occupancy_notice(0.85, OccupancyTier::Handoff, Some("abc-123")).unwrap();
+        assert!(!notice.is_empty());
+        assert!(notice.is_ascii(), "notice must be ASCII-only: {notice:?}");
+        assert!(notice.contains("abc-123"), "sid must appear: {notice:?}");
+        assert!(
+            notice.contains("join collab abc-123"),
+            "join clause: {notice:?}"
+        );
+        assert!(notice.contains("~85%"), "pct rendering: {notice:?}");
+    }
+
+    #[test]
+    fn occupancy_notice_handoff_without_sid_omits_join_clause() {
+        let notice = occupancy_notice(0.85, OccupancyTier::Handoff, None).unwrap();
+        assert!(!notice.is_empty());
+        assert!(notice.is_ascii(), "notice must be ASCII-only: {notice:?}");
+        assert!(
+            !notice.contains("join collab"),
+            "no sid -> no join clause: {notice:?}"
+        );
+    }
+
+    #[test]
+    fn occupancy_notice_all_strings_are_ascii() {
+        for tier in [
+            OccupancyTier::Ok,
+            OccupancyTier::Warn,
+            OccupancyTier::Handoff,
+        ] {
+            for sid in [None, Some("s1")] {
+                if let Some(notice) = occupancy_notice(0.75, tier, sid) {
+                    assert!(
+                        notice.is_ascii(),
+                        "non-ASCII in notice (tier={tier:?} sid={sid:?}): {notice:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    // ── Task 3: Hook integration tests for occupancy notice injection ─────────
+
+    fn make_transcript_at_pct(dir: &std::path::Path, input_tokens: i64) -> std::path::PathBuf {
+        let path = dir.join("t.jsonl");
+        std::fs::write(
+            &path,
+            format!(
+                "{{\"type\":\"assistant\",\"message\":{{\"usage\":{{\"input_tokens\":{input_tokens},\"output_tokens\":5,\"cache_read_input_tokens\":0}}}}}}\n"
+            ),
+        )
+        .unwrap();
+        path
+    }
+
+    #[test]
+    fn prompt_hook_injects_warn_notice_at_65_pct() {
+        // With a 200k window, 130k input_tokens = 65% occupancy -> Warn tier.
+        let _env = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let _metrics = crate::metrics::METRICS_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("IRONMEM_CONTEXT_WARN_PCT", "0.60");
+        std::env::set_var("IRONMEM_CONTEXT_HANDOFF_PCT", "0.80");
+        std::env::set_var("IRONMEM_CONTEXT_WINDOW", "200000");
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("m.sqlite3");
+        seed_db_file(&db_path, &[("postgres pgbouncer pooling", "i", "d")]);
+        let transcript = make_transcript_at_pct(dir.path(), 130_000);
+        let cfg = prompt_hook_config(db_path, dir.path().join("state"));
+        let resp = run_hook_with_input(
+            "user-prompt-submit",
+            "claude-code",
+            cfg,
+            serde_json::json!({
+                "prompt": "anything",
+                "session_id": "warn-test",
+                "transcript_path": transcript.to_string_lossy(),
+            }),
+        )
+        .unwrap();
+        let v = serde_json::to_value(&resp).unwrap();
+        let ctx = v["hookSpecificOutput"]["additionalContext"]
+            .as_str()
+            .unwrap_or("");
+        assert!(
+            ctx.contains("[ironmem] context ~65%"),
+            "warn notice must appear: {ctx:?}"
+        );
+        assert!(
+            !ctx.contains("hand off now"),
+            "should be warn, not handoff: {ctx:?}"
+        );
+        std::env::remove_var("IRONMEM_CONTEXT_WARN_PCT");
+        std::env::remove_var("IRONMEM_CONTEXT_HANDOFF_PCT");
+        std::env::remove_var("IRONMEM_CONTEXT_WINDOW");
+    }
+
+    #[test]
+    fn prompt_hook_injects_handoff_notice_at_85_pct() {
+        // 170k input_tokens / 200k window = 85% -> Handoff tier.
+        let _env = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let _metrics = crate::metrics::METRICS_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("IRONMEM_CONTEXT_WARN_PCT", "0.60");
+        std::env::set_var("IRONMEM_CONTEXT_HANDOFF_PCT", "0.80");
+        std::env::set_var("IRONMEM_CONTEXT_WINDOW", "200000");
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("m.sqlite3");
+        seed_db_file(&db_path, &[("postgres pgbouncer pooling", "i", "d")]);
+        let transcript = make_transcript_at_pct(dir.path(), 170_000);
+        let cfg = prompt_hook_config(db_path, dir.path().join("state"));
+        let resp = run_hook_with_input(
+            "user-prompt-submit",
+            "claude-code",
+            cfg,
+            serde_json::json!({
+                "prompt": "anything",
+                "session_id": "handoff-test",
+                "transcript_path": transcript.to_string_lossy(),
+            }),
+        )
+        .unwrap();
+        let v = serde_json::to_value(&resp).unwrap();
+        let ctx = v["hookSpecificOutput"]["additionalContext"]
+            .as_str()
+            .unwrap_or("");
+        assert!(
+            ctx.contains("[ironmem] context ~85%"),
+            "handoff notice must appear: {ctx:?}"
+        );
+        assert!(
+            ctx.contains("hand off now"),
+            "should be handoff notice: {ctx:?}"
+        );
+        std::env::remove_var("IRONMEM_CONTEXT_WARN_PCT");
+        std::env::remove_var("IRONMEM_CONTEXT_HANDOFF_PCT");
+        std::env::remove_var("IRONMEM_CONTEXT_WINDOW");
+    }
+
+    #[test]
+    fn prompt_hook_no_notice_at_50_pct() {
+        // 100k / 200k = 50% -> Ok tier, no notice.
+        let _env = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let _metrics = crate::metrics::METRICS_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("IRONMEM_CONTEXT_WARN_PCT", "0.60");
+        std::env::set_var("IRONMEM_CONTEXT_HANDOFF_PCT", "0.80");
+        std::env::set_var("IRONMEM_CONTEXT_WINDOW", "200000");
+        // Use an empty DB (no FTS hits) so hookSpecificOutput is only present if notice fires.
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("m.sqlite3");
+        seed_db_file(&db_path, &[]);
+        let transcript = make_transcript_at_pct(dir.path(), 100_000);
+        let cfg = prompt_hook_config(db_path, dir.path().join("state"));
+        let resp = run_hook_with_input(
+            "user-prompt-submit",
+            "claude-code",
+            cfg,
+            serde_json::json!({
+                "prompt": "anything",
+                "session_id": "ok-test",
+                "transcript_path": transcript.to_string_lossy(),
+            }),
+        )
+        .unwrap();
+        let v = serde_json::to_value(&resp).unwrap();
+        assert!(
+            v.get("hookSpecificOutput").is_none(),
+            "no notice at 50% with no FTS hits: {v:?}"
+        );
+        std::env::remove_var("IRONMEM_CONTEXT_WARN_PCT");
+        std::env::remove_var("IRONMEM_CONTEXT_HANDOFF_PCT");
+        std::env::remove_var("IRONMEM_CONTEXT_WINDOW");
+    }
+
+    #[test]
+    fn prompt_hook_no_notice_on_missing_transcript() {
+        let _env = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let _metrics = crate::metrics::METRICS_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("IRONMEM_CONTEXT_WARN_PCT", "0.60");
+        std::env::set_var("IRONMEM_CONTEXT_HANDOFF_PCT", "0.80");
+        std::env::set_var("IRONMEM_CONTEXT_WINDOW", "200000");
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("m.sqlite3");
+        seed_db_file(&db_path, &[]);
+        let cfg = prompt_hook_config(db_path, dir.path().join("state"));
+        let resp = run_hook_with_input(
+            "user-prompt-submit",
+            "claude-code",
+            cfg,
+            serde_json::json!({
+                "prompt": "anything",
+                "session_id": "no-tx-test",
+                // no transcript_path
+            }),
+        )
+        .unwrap();
+        let v = serde_json::to_value(&resp).unwrap();
+        assert!(
+            v.get("hookSpecificOutput").is_none(),
+            "no notice when transcript missing: {v:?}"
+        );
+        std::env::remove_var("IRONMEM_CONTEXT_WARN_PCT");
+        std::env::remove_var("IRONMEM_CONTEXT_HANDOFF_PCT");
+        std::env::remove_var("IRONMEM_CONTEXT_WINDOW");
+    }
+
+    #[test]
+    fn prompt_hook_notice_fires_even_when_metrics_disabled() {
+        // R12: the notice is NOT gated by IRONMEM_METRICS. Disabling metrics suppresses
+        // the DB sample but must NOT suppress the operator notice.
+        let _env = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let _metrics = crate::metrics::METRICS_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("IRONMEM_METRICS", "0");
+        std::env::set_var("IRONMEM_CONTEXT_WARN_PCT", "0.60");
+        std::env::set_var("IRONMEM_CONTEXT_HANDOFF_PCT", "0.80");
+        std::env::set_var("IRONMEM_CONTEXT_WINDOW", "200000");
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("m.sqlite3");
+        seed_db_file(&db_path, &[]);
+        let transcript = make_transcript_at_pct(dir.path(), 170_000); // 85% -> Handoff
+        let cfg = prompt_hook_config(db_path, dir.path().join("state"));
+        let resp = run_hook_with_input(
+            "user-prompt-submit",
+            "claude-code",
+            cfg,
+            serde_json::json!({
+                "prompt": "anything",
+                "session_id": "metrics-off-test",
+                "transcript_path": transcript.to_string_lossy(),
+            }),
+        )
+        .unwrap();
+        let v = serde_json::to_value(&resp).unwrap();
+        let ctx = v["hookSpecificOutput"]["additionalContext"]
+            .as_str()
+            .unwrap_or("");
+        assert!(
+            ctx.contains("[ironmem] context"),
+            "notice must fire even with IRONMEM_METRICS=0: {ctx:?}"
+        );
+        std::env::remove_var("IRONMEM_METRICS");
+        std::env::remove_var("IRONMEM_CONTEXT_WARN_PCT");
+        std::env::remove_var("IRONMEM_CONTEXT_HANDOFF_PCT");
+        std::env::remove_var("IRONMEM_CONTEXT_WINDOW");
     }
 }
