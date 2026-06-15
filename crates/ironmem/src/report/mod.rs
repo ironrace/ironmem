@@ -573,6 +573,9 @@ mod tests {
             estimated: false,
             chars: 0,
             cost_usd: cost,
+            map_status: None,
+            turn_id: None,
+            area: None,
         };
         db.insert_token_usage(&row("planning", "claude-opus-4-8", 1_000_000, None))
             .unwrap();
@@ -615,6 +618,9 @@ mod tests {
             estimated: false,
             chars: 0,
             cost_usd: None,
+            map_status: None,
+            turn_id: None,
+            area: None,
         };
         db.insert_token_usage(&row(Some("impl"))).unwrap();
         db.insert_token_usage(&row(None)).unwrap();

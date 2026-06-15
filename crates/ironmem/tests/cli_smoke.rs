@@ -224,6 +224,9 @@ fn cli_report_json_smoke_test() {
             estimated: false,
             chars: 0,
             cost_usd: None,
+            map_status: None,
+            turn_id: None,
+            area: None,
         })
         .unwrap();
     }

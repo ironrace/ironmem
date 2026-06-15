@@ -208,6 +208,9 @@ pub(crate) fn account_mcp_response(
         estimated: true,
         chars,
         cost_usd: None,
+        map_status: None,
+        turn_id: None,
+        area: None,
     }
     .with_context(ctx);
     if let Err(e) = db.insert_token_usage(&row) {
@@ -377,6 +380,9 @@ mod tests {
             estimated: true,
             chars: 8,
             cost_usd: None,
+            map_status: None,
+            turn_id: None,
+            area: None,
         }
         .with_context(&ctx);
         assert_eq!(row.collab_session_id.as_deref(), Some("collab-1"));

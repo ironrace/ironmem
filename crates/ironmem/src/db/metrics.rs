@@ -41,6 +41,11 @@ pub struct NewTokenUsage {
     pub estimated: bool,
     pub chars: i64,
     pub cost_usd: Option<f64>,
+    /// Exploration-token attribution (Phase 5 / issue #94). `None` for rows
+    /// not participating in lazy code-map attribution.
+    pub map_status: Option<String>,
+    pub turn_id: Option<String>,
+    pub area: Option<String>,
 }
 
 /// Build a `NewTokenUsage` from an LLM call result. `source` is the call site
@@ -73,6 +78,9 @@ pub fn new_token_usage_from_llm(
         estimated: resp.estimated,
         chars: resp.chars() as i64,
         cost_usd: resp.cost_usd,
+        map_status: None,
+        turn_id: None,
+        area: None,
     }
 }
 
@@ -111,6 +119,11 @@ pub struct TokenUsage {
     pub estimated: bool,
     pub chars: i64,
     pub cost_usd: Option<f64>,
+    /// Exploration-token attribution (Phase 5 / issue #94). `None` for rows
+    /// not participating in lazy code-map attribution.
+    pub map_status: Option<String>,
+    pub turn_id: Option<String>,
+    pub area: Option<String>,
 }
 
 /// Query filters for `token_usage`. All fields are optional; unset fields
@@ -218,6 +231,9 @@ fn map_token_usage(row: &rusqlite::Row<'_>) -> rusqlite::Result<TokenUsage> {
         estimated: estimated_int != 0,
         chars: row.get(14)?,
         cost_usd: row.get(15)?,
+        map_status: row.get(16)?,
+        turn_id: row.get(17)?,
+        area: row.get(18)?,
     })
 }
 
@@ -328,8 +344,9 @@ impl Database {
             "INSERT INTO token_usage (
                 ts, source, harness, model, session_id, collab_session_id, collab_phase,
                 task_tag, input_tokens, output_tokens, cache_creation_input_tokens,
-                cache_read_input_tokens, estimated, chars, cost_usd
-            ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15)",
+                cache_read_input_tokens, estimated, chars, cost_usd,
+                map_status, turn_id, area
+            ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18)",
             params![
                 row.ts,
                 row.source,
@@ -346,6 +363,9 @@ impl Database {
                 row.estimated as i64,
                 row.chars,
                 row.cost_usd,
+                row.map_status,
+                row.turn_id,
+                row.area,
             ],
         )?;
         Ok(self.conn.last_insert_rowid())
@@ -361,7 +381,8 @@ impl Database {
         let mut stmt = self.conn.prepare(
             "SELECT id, ts, source, harness, model, session_id, collab_session_id, collab_phase,
                     task_tag, input_tokens, output_tokens, cache_creation_input_tokens,
-                    cache_read_input_tokens, estimated, chars, cost_usd
+                    cache_read_input_tokens, estimated, chars, cost_usd,
+                    map_status, turn_id, area
              FROM token_usage
              WHERE (?1 IS NULL OR task_tag = ?1)
                AND (?2 IS NULL OR collab_session_id = ?2)
@@ -838,6 +859,9 @@ mod tests {
             estimated: true,
             chars: 480,
             cost_usd: Some(0.0123),
+            map_status: None,
+            turn_id: None,
+            area: None,
         }
     }
 
@@ -1483,6 +1507,9 @@ mod tests {
             estimated,
             chars: 0,
             cost_usd: cost,
+            map_status: None,
+            turn_id: None,
+            area: None,
         }
     }
 
@@ -1694,6 +1721,69 @@ mod tests {
         assert_eq!(non.len(), 1);
         assert_eq!(non[0].task_tag, "issue-f");
         assert_eq!(non[0].tokens_to_done, 5000);
+    }
+
+    // ---- Migration 011: map_status / turn_id / area columns on token_usage ----
+
+    #[test]
+    fn test_token_usage_map_status_round_trip() {
+        let db = db();
+        let mut r = sample_token_usage();
+        r.map_status = Some("map_hit".into());
+        r.turn_id = Some("turn-42".into());
+        r.area = Some("src/auth".into());
+        let id = db.insert_token_usage(&r).unwrap();
+
+        let rows = db
+            .query_token_usage(&TokenUsageQuery {
+                task_tag: Some("issue-80".into()),
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].id, id);
+        assert_eq!(rows[0].map_status.as_deref(), Some("map_hit"));
+        assert_eq!(rows[0].turn_id.as_deref(), Some("turn-42"));
+        assert_eq!(rows[0].area.as_deref(), Some("src/auth"));
+    }
+
+    #[test]
+    fn test_token_usage_map_status_null_default() {
+        let db = db();
+        // sample_token_usage() uses default NewTokenUsage which has map_status=None
+        db.insert_token_usage(&sample_token_usage()).unwrap();
+
+        let rows = db
+            .query_token_usage(&TokenUsageQuery {
+                task_tag: Some("issue-80".into()),
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert!(
+            rows[0].map_status.is_none(),
+            "map_status must default to None"
+        );
+        assert!(rows[0].turn_id.is_none(), "turn_id must default to None");
+        assert!(rows[0].area.is_none(), "area must default to None");
+    }
+
+    #[test]
+    fn test_token_usage_map_status_invalid_rejected() {
+        let db = db();
+        // Insert a valid row first to confirm the table is writable.
+        db.insert_token_usage(&sample_token_usage()).unwrap();
+        // Now try a raw SQL insert with an invalid map_status value.
+        let result = db.conn.execute(
+            "INSERT INTO token_usage (ts, source, harness, input_tokens, output_tokens,
+             cache_creation_input_tokens, cache_read_input_tokens, estimated, chars, map_status)
+             VALUES ('2026-06-15T00:00:00Z','mcp_response','claude',1,1,0,0,0,10,'invalid')",
+            [],
+        );
+        assert!(
+            result.is_err(),
+            "CHECK constraint on map_status must reject 'invalid'"
+        );
     }
 
     #[test]

@@ -41,6 +41,9 @@ fn tok(
         estimated,
         chars: 0,
         cost_usd: cost,
+        map_status: None,
+        turn_id: None,
+        area: None,
     }
 }
 
@@ -525,6 +528,9 @@ fn headline_cost_attaches_when_tokens_keyed_by_task_tag_not_collab_id() {
         estimated: false,
         chars: 0,
         cost_usd: None,
+        map_status: None,
+        turn_id: None,
+        area: None,
     })
     .unwrap();
 

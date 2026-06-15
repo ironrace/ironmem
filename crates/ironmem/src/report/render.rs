@@ -167,6 +167,9 @@ mod tests {
             estimated,
             chars: 0,
             cost_usd: cost,
+            map_status: None,
+            turn_id: None,
+            area: None,
         }
     }
 
