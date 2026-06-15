@@ -123,9 +123,9 @@ pub fn read_actor_generation(
 /// generation — it sets `pending_handoff_generation = generation + 1`. Reuse path
 /// returns the same token + pending generation (byte-identical retries before claim).
 ///
-/// Safe under callers' DEFERRED transactions: the issue decision is enforced by the
-/// guarded `WHERE pending_handoff_token IS NULL` clause (single atomic UPDATE), not
-/// a prior read.
+/// Safe under any transaction isolation level: the issue decision is enforced by the
+/// atomic guarded `WHERE` clause (`WHERE pending_handoff_token IS NULL`, a single
+/// UPDATE), not by snapshot isolation.
 pub fn issue_or_reuse_handoff(
     conn: &Connection,
     session_id: &str,
@@ -177,9 +177,9 @@ pub fn issue_or_reuse_handoff(
 /// `pending_handoff_generation`, clear pending fields, stamp claimed_at.
 /// Returns the new active generation. Errors on mismatch / already-claimed.
 ///
-/// Safe under callers' DEFERRED transactions: the claim decision is enforced by the
-/// guarded `WHERE pending_handoff_token = ?token` clause (single atomic UPDATE), not
-/// a prior read.
+/// Safe under any transaction isolation level: the claim decision is enforced by the
+/// atomic guarded `WHERE` clause (`WHERE pending_handoff_token = ?token`, a single
+/// UPDATE), not by snapshot isolation.
 pub fn claim_handoff_token(
     conn: &Connection,
     session_id: &str,

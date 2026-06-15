@@ -397,7 +397,10 @@ pub fn tool_definitions(app: &App) -> Vec<Value> {
                 "properties": {
                     "session_id": { "type": "string" },
                     "agent": { "type": "string", "enum": ["claude", "codex"] },
-                    "handoff_token": { "type": "string" }
+                    "handoff_token": {
+                        "type": "string",
+                        "description": "Required when the session's active generation > 0 (a prior handoff has been claimed); omit only on a generation-0 session. On the first mutating collab call a successor presents this to claim the new generation."
+                    }
                 },
                 "required": ["session_id", "agent"]
             }

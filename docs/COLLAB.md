@@ -505,7 +505,10 @@ is still available when callers need selective acknowledgement.
 ### `collab_ack`
 
 Marks a message consumed. Session-scoped: a mismatched
-`(session_id, message_id)` pair is rejected.
+`(session_id, message_id)` pair is rejected. The generation guard resolves
+the acting agent from the target message's `receiver` field (`collab_ack`
+takes no `agent` parameter), so the lease guard applies to the message's
+receiver.
 
 ### `collab_status`
 
@@ -1296,7 +1299,8 @@ echo '{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}' \
   | env HOME=/tmp/ironmem-home IRONMEM_EMBED_MODE=noop IRONMEM_MCP_MODE=trusted \
       ./target/release/ironmem serve --db /tmp/ironmem-collab-tools.sqlite3 \
   | python3 -c "import sys,json; t=[x['name'] for x in json.load(sys.stdin)['result']['tools']]; \
-      assert all(f'collab_{n}' in t for n in ['start','send','recv','ack','status','approve','register_caps','get_caps','wait_my_turn','end']), t; print('OK')"
+      assert all(f'collab_{n}' in t for n in ['start','send','recv','ack','status','approve','register_caps','get_caps','wait_my_turn','end']), t; \
+      assert 'session_handoff' in t, t; print('OK')"
 ```
 
 ## Scope and Limits

@@ -41,7 +41,17 @@ pub(super) fn ensure_actor_generation_current(
     maybe_token: Option<&str>,
 ) -> Result<(), MemoryError> {
     if let Some(token) = maybe_token {
+        if !app.config.mcp_access_mode.allows_writes() {
+            return Err(MemoryError::Permission(
+                "claiming a session_handoff token requires write access (IRONMEM_MCP_MODE=trusted)"
+                    .to_string(),
+            ));
+        }
         let claimed = claim_handoff_token(conn, session_id, agent, token)?;
+        // The cache is advisory; the DB is authoritative. If the enclosing
+        // transaction rolls back after this claim, the process cache may be one
+        // generation ahead of the DB. The guard treats that as a (fail-safe)
+        // stale condition on subsequent calls rather than silently accepting it.
         app.set_cached_generation(session_id, agent, claimed);
         return Ok(());
     }
@@ -154,8 +164,10 @@ fn parse_checkpoint(content: &str) -> Checkpoint {
 
 // ── Handoff block renderer ───────────────────────────────────────────────────
 
-/// Pure deterministic render of session state + checkpoint. No timestamps,
-/// no clock, no randomness. `pending_generation` is the to-be-claimed value;
+/// Pure deterministic render of session state + checkpoint (no clock,
+/// no randomness, no timestamps). Key order in the fenced block is stable
+/// across calls. `pending_generation` is the **to-be-claimed** value
+/// (= `active_generation + 1`), not the caller's current active generation.
 /// `agent` is the actor being handed off to.
 pub(super) fn compose_handoff_block(
     record: &SessionRecord,
@@ -668,6 +680,65 @@ gates: passed\n";
             res.is_err(),
             "stale predecessor must not mint a new handoff"
         );
+    }
+
+    /// A token-claim attempted through a ReadOnly-mode App must be rejected with a
+    /// Permission error before any DB write occurs. The token itself remains valid
+    /// (trusted-mode claim still succeeds after the rejection).
+    #[test]
+    fn token_claim_rejected_in_read_only_mode() {
+        use crate::config::{Config, EmbedMode, McpAccessMode};
+
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("mem.sqlite3");
+
+        // Trusted app — issues the session and the handoff token.
+        let trusted_app = test_app_with_db_path(db_path.clone(), dir.path());
+        let sid = seed_active_session(&trusted_app);
+
+        // Issue the token via the trusted app.
+        let token = trusted_app
+            .db
+            .with_transaction(|tx| issue_or_reuse_handoff(tx, &sid, Agent::Claude))
+            .unwrap()
+            .token;
+
+        // Build a ReadOnly-mode App over the same DB.
+        let ro_config = Config {
+            db_path: db_path.clone(),
+            model_dir: dir.path().join("model"),
+            model_dir_explicit: true,
+            state_dir: dir.path().join("state"),
+            mcp_access_mode: McpAccessMode::ReadOnly,
+            embed_mode: EmbedMode::Noop,
+        };
+        #[allow(clippy::arc_with_non_send_sync)]
+        let ro_app = std::sync::Arc::new(crate::mcp::app::App::new(ro_config).unwrap());
+
+        // Claim attempt through the read-only app must fail with a Permission error.
+        let err = ro_app
+            .db
+            .with_connection(|conn| {
+                ensure_actor_generation_current(&ro_app, conn, &sid, Agent::Claude, Some(&token))
+            })
+            .unwrap_err();
+
+        assert!(
+            matches!(err, MemoryError::Permission(_)),
+            "expected Permission error, got: {err:?}"
+        );
+        assert!(
+            err.to_string().contains("write access"),
+            "error must mention write access, got: {err}"
+        );
+
+        // The token must still be claimable by a trusted-mode caller (no DB mutation occurred).
+        trusted_app
+            .db
+            .with_transaction(|tx| {
+                ensure_actor_generation_current(&trusted_app, tx, &sid, Agent::Claude, Some(&token))
+            })
+            .unwrap();
     }
 
     /// The no-token path of `ensure_actor_generation_current` must not create a
