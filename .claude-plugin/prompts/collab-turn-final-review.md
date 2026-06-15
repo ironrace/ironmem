@@ -22,16 +22,14 @@ preconditions: phase == CodeReviewFinalPending, current_owner == claude
 2. Draft the PR title (<70 chars) + body (summary + test plan from task_list +
    gate results). `add_drawer(wing="ironrace-memory", room="collab-drafts",
    content=<JSON string {"title":"<title>","body":"<body>"}>)`; return its
-   `drawer_id`. Compute the SHA-256 of the PR body and return it as the `hash`
-   in the verdict `ref:` line. Do NOT open the PR — the orchestrator gates,
-   then dispatches `collab-turn-submit.md` with `$TOPIC=final_review`,
-   `$ARTIFACT_REF=<drawer_id>`, and `$ARTIFACT_HASH=<that hash>` to run
-   `gh pr create` and send.
+   `drawer_id`. Do NOT open the PR — the orchestrator gates, then dispatches
+   `collab-turn-submit.md` with `$TOPIC=final_review` and
+   `$ARTIFACT_REF=<drawer_id>` to run `gh pr create` and send.
 
 ## Verdict
 Return EXACTLY these ≤3 lines, nothing else:
 ```
 result: pr body composed (title: <title>)
-ref: <drawer_id hash:<h>>
+ref: <drawer_id | none>
 blocker: <one line | none>
 ```

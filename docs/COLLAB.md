@@ -914,17 +914,23 @@ The three user gates (the first `canonical`, `final`, and `final_review`) use a
 two-phase reference-only split so the orchestrator never has to ingest a full
 artifact to gate it:
 
-1. **Compose worker** writes the artifact to a drawer or file and returns
-   `{ref, hash, ≤3-line summary}`.
-2. **Orchestrator gate** surfaces ONLY `ref + hash + summary` for the user's
+1. **Compose worker** writes the artifact to a drawer and returns
+   `{ref, ≤3-line summary}`.
+2. **Orchestrator gate** surfaces ONLY `ref + summary` for the user's
    approval — never the full body. For `final_review`, the drawer artifact
    contains JSON `{"title":"...","body":"..."}` so the submit worker can open
    the PR without relying on verdict text.
 3. **Submit worker** (`collab-turn-submit.md`) reads the approved artifact by
-   `$ARTIFACT_REF`, is passed the approved `$ARTIFACT_HASH`, recomputes the
-   artifact's SHA-256 and verifies it matches before sending — on mismatch it
-   sends a `failure_report` instead of shipping unapproved content. It never
-   re-authors.
+   `$ARTIFACT_REF` and sends it. **Drawer immutability is the integrity
+   anchor:** drawers are append-only, so the approved `drawer_id`'s content
+   cannot change — the ref itself guarantees the user approved exactly what is
+   sent, and no hash recompute is needed (a cross-worker recompute would be both
+   redundant and non-reproducible across readback/encoding). It never
+   re-authors. If the artifact cannot be fetched, the submit worker does not
+   send the protocol topic: for `final_review` (coding-active) it sends a
+   `failure_report`; for the v1 planning topics `canonical`/`final` the state
+   machine rejects `failure_report`, so it aborts with a `blocker:` verdict
+   instead.
 
 ### v3 bridge (PlanLocked → CodeImplementPending) — worker-owned
 
