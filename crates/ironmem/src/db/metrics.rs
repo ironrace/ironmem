@@ -567,6 +567,28 @@ impl Database {
             .map_err(MemoryError::from)
     }
 
+    /// Atomically bump `handoffs` for one task. A single UPDATE so concurrent
+    /// writer processes can't lose increments to a read-modify-write race.
+    /// Missing `task_tag` is a no-op `Ok` — the metrics layer is best-effort
+    /// and a missing row is a caller problem, not a transport error.
+    /// Never creates a stub row (a collab row needs its full identity incl.
+    /// `collab_session_id`; a stub keyed only by `task_tag` would be
+    /// invisible/incomplete in metrics).
+    pub fn increment_task_handoffs(&self, task_tag: &str) -> Result<(), MemoryError> {
+        let changed = self.conn.execute(
+            "UPDATE task_outcomes SET handoffs = handoffs + 1 WHERE task_tag = ?1",
+            params![task_tag],
+        )?;
+        if changed == 0 {
+            tracing::warn!(
+                task_tag = %task_tag,
+                operation = "increment_task_handoffs",
+                "metrics: UPDATE matched 0 rows — task_tag not found in task_outcomes"
+            );
+        }
+        Ok(())
+    }
+
     /// Atomically bump `review_rounds` for one task (METRICS_SPEC §4). A
     /// single UPDATE so concurrent writer processes can't lose increments to
     /// a read-modify-write race. Missing `task_tag` is a no-op `Ok` — the
@@ -1362,6 +1384,31 @@ mod tests {
     fn increment_task_review_rounds_missing_tag_is_noop_ok() {
         let db = db();
         assert!(db.increment_task_review_rounds("missing").is_ok());
+    }
+
+    #[test]
+    fn increment_task_handoffs_is_monotonic_and_preserves_row() {
+        let db = db();
+        db.upsert_task_outcome(&sample_task_outcome("issue-93", "2026-06-15T00:00:00Z"))
+            .unwrap();
+        db.increment_task_handoffs("issue-93").unwrap();
+        db.increment_task_handoffs("issue-93").unwrap();
+        let got = db.get_task_outcome("issue-93").unwrap().unwrap();
+        assert_eq!(got.handoffs, 2);
+        assert_eq!(got.review_rounds, 0); // untouched
+        assert_eq!(got.fix_commits, 0); // untouched
+        assert_eq!(got.started_at.as_deref(), Some("2026-06-15T00:00:00Z")); // untouched
+    }
+
+    #[test]
+    fn increment_task_handoffs_missing_tag_is_noop_ok_and_creates_no_row() {
+        let db = db();
+        // Confirm no row exists first
+        assert!(db.get_task_outcome("missing-handoff").unwrap().is_none());
+        // Increment on absent tag -> Ok, no row created
+        assert!(db.increment_task_handoffs("missing-handoff").is_ok());
+        // Still no row
+        assert!(db.get_task_outcome("missing-handoff").unwrap().is_none());
     }
 
     #[test]

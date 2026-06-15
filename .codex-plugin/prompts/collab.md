@@ -499,6 +499,69 @@ token after a successor has claimed.
 
 Full semantics: `docs/COLLAB.md` § "session_handoff (fallback succession)".
 
+## Context-occupancy handoff
+
+The UserPromptSubmit hook injects a one-line notice when context occupancy
+crosses a threshold (default 60% warn / 80% handoff, overridable via
+`IRONMEM_CONTEXT_WARN_PCT` / `IRONMEM_CONTEXT_HANDOFF_PCT`).
+
+**Automated successor path (autonomous/collab phases):**
+
+1. On a `>= 80%` (Handoff) notice, call `session_handoff(session_id, agent)`
+   and capture the **top-level** `handoff_token` and `handoff_block` (the
+   token is NOT inside the fenced block).
+2. The `task_outcomes.handoffs` counter is incremented automatically inside
+   `handle_session_handoff` only when a **fresh** token is issued (gated on
+   `!issued.reused`); reusing an existing token does NOT increment it. The
+   count reflects handoff **intent** at fresh-issue time, not successor claim.
+3. Spawn the successor via background Bash:
+   ```
+   claude -p "join ironmem collab <sid> with token <handoff_token>"
+   ```
+   with `run_in_background: true`. The successor's first mutating call
+   presents the token and claims the lease (gen+1), making the predecessor
+   **inert** (stale-gen rejection). No process coordination required — the
+   generation lease is the single writer.
+4. End the current turn.
+
+**Cron fallback (where a spawned child cannot outlive its parent):**
+
+When a spawned child cannot outlive its parent, use a one-time local cron
+entry as a best-effort fallback (local-only, never committed, self-deletes):
+```sh
+(crontab -l 2>/dev/null; echo "* * * * * claude -p \"join ironmem collab <sid> with token <token>\" && crontab -l | grep -v 'join ironmem collab <sid>' | crontab -") | crontab -
+```
+Safety: `<sid>`/`<token>` must be `[A-Za-z0-9_-]` only — ironmem session IDs
+are already sanitized to that set, so they are shell-safe here. Never paste a
+raw value from an untrusted source into this pipeline.
+
+**Interactive phases (manual flow):**
+
+When the occupancy notice appears in an interactive session:
+1. Note the `session_id` in the notice (the Handoff notice includes
+   `join collab <sid>` for easy copy).
+2. Call `session_handoff(session_id, agent)` to mint the token.
+3. Run `/clear` to reset context.
+4. Rejoin with `join collab <sid>` (or `join collab <sid> with token <token>`
+   if the token was captured).
+
+**Permission allowlist for unattended successor operation:**
+
+An unattended `claude -p` successor needs at minimum:
+- `mcp__ironmem__collab_send`, `mcp__ironmem__collab_recv`,
+  `mcp__ironmem__collab_ack`, `mcp__ironmem__collab_approve`,
+  `mcp__ironmem__collab_set_implementer`,
+  `mcp__ironmem__collab_register_caps`,
+  `mcp__ironmem__collab_wait_my_turn`, `mcp__ironmem__collab_end`,
+  `mcp__ironmem__session_handoff`, `mcp__ironmem__collab_status`
+- `Bash(claude -p "join ironmem collab *":*)` — re-spawn a further successor if
+  needed (scope to the join-command form; avoid the broader `Bash(claude -p:*)`)
+- Git bash operations as needed for implementation tasks
+
+Configure these in `.claude/settings.json` under `permissions.allow`.
+
+Full semantics: `docs/COLLAB.md` § "Context-occupancy handoff".
+
 ## Unknown subcommand
 
 If `$ARGUMENTS` does not start with `start` or `join`, tell the user:
