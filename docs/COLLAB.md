@@ -669,10 +669,13 @@ crosses a threshold (default 60% warn / 80% handoff, overridable via
    inside the fenced block).
 2. The `task_outcomes.handoffs` counter is incremented automatically inside
    `handle_session_handoff` (via `increment_task_handoffs(session_id)` called
-   immediately after the token is issued or reused). The count reflects handoff
-   **intent** at issue/reuse time, not successor claim.
-3. Spawn the successor via background Bash, mirroring the `codex exec`
-   dispatch contract (see "Background `codex exec` dispatch"):
+   only when a **fresh** token is issued, gated on `!issued.reused`; reusing an
+   existing token does NOT increment it). The count reflects handoff
+   **intent** at fresh-issue time, not successor claim.
+3. Spawn the successor via background Bash, using the same background-Bash
+   dispatch pattern documented for Codex (see "Background `codex exec`
+   dispatch"); for a `claude -p` successor the command is `claude -p`, not
+   `codex exec`:
    ```
    claude -p "join ironmem collab <sid> with token <handoff_token>"
    ```
@@ -680,9 +683,9 @@ crosses a threshold (default 60% warn / 80% handoff, overridable via
    presents the token and claims the lease.
 4. The predecessor ends its turn. Once the successor claims the lease (gen+1),
    the predecessor's next mutating call is rejected with "stale collab
-   generation" (stale-gen rejection, `mcp/tools/handoff.rs` L35-81). **No
-   process coordination is required — the generation lease is the single
-   writer.**
+   generation" (stale-gen rejection, enforced by
+   `ensure_actor_generation_current`). **No process coordination is required —
+   the generation lease is the single writer.**
 
 **Cron fallback (where a spawned child cannot outlive its parent):**
 
@@ -690,13 +693,15 @@ When the runtime cannot keep a spawned child alive after the parent exits,
 use a one-time local cron entry as a fallback:
 
 ```sh
-# Add a one-shot entry (runs once at the next minute, then self-deletes).
+# Add a one-shot entry (runs at the next minute; self-deletes only on success).
 # Replace <sid> and <token> with the values from session_handoff.
 (crontab -l 2>/dev/null; echo "* * * * * claude -p \"join ironmem collab <sid> with token <token>\" && crontab -l | grep -v 'join ironmem collab <sid>' | crontab -") | crontab -
 ```
 
 This is a **best-effort fallback only**: local-only, never committed to the
-repo, self-deleting after the first run.
+repo. The `&&` means it self-deletes only after the first *successful* join; a
+failing join leaves the entry in place, so it re-fires every minute until the
+join succeeds or the entry is removed manually.
 
 > **Safety:** `<sid>` and `<token>` must contain only `[A-Za-z0-9_-]`.
 > ironmem-issued session IDs are already sanitized to that set, so they are

@@ -853,8 +853,9 @@ crosses a threshold (default 60% warn / 80% handoff, overridable via
    and capture the **top-level** `handoff_token` and `handoff_block` (the
    token is NOT inside the fenced block).
 2. The `task_outcomes.handoffs` counter is incremented automatically inside
-   `handle_session_handoff`. The count reflects handoff **intent** at
-   issue/reuse time, not successor claim.
+   `handle_session_handoff` only when a **fresh** token is issued (gated on
+   `!issued.reused`); reusing an existing token does NOT increment it. The
+   count reflects handoff **intent** at fresh-issue time, not successor claim.
 3. Spawn the successor via background Bash:
    ```
    claude -p "join ironmem collab <sid> with token <handoff_token>"

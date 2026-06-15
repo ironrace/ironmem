@@ -406,34 +406,28 @@ pub fn prompt_hook_summary_max_bytes() -> usize {
     env_usize("IRONMEM_PROMPT_HOOK_SUMMARY_MAX_BYTES", 120)
 }
 
-/// Occupancy fraction at which the hook injects a soft warning (>= warn, < handoff).
-/// Env `IRONMEM_CONTEXT_WARN_PCT`; default 0.60; clamped to `0.0..=1.0`.
-/// Fresh-read per call (no OnceLock) so integration tests can flip it.
-/// If the resolved warn value >= handoff value, both revert to defaults (0.60 / 0.80)
-/// to preserve the `warn < handoff` ordering invariant.
-pub fn context_warn_pct() -> f64 {
-    let (w, h) = context_threshold_pair();
-    let _ = h;
-    w
-}
-
-/// Occupancy fraction at which the hook injects a handoff instruction (>= handoff).
-/// Env `IRONMEM_CONTEXT_HANDOFF_PCT`; default 0.80; clamped to `0.0..=1.0`.
-/// Fresh-read per call (no OnceLock) so integration tests can flip it.
-/// If the resolved warn value >= handoff value, both revert to defaults (0.60 / 0.80)
-/// to preserve the `warn < handoff` ordering invariant.
-pub fn context_handoff_pct() -> f64 {
-    let (w, h) = context_threshold_pair();
-    let _ = w;
-    h
+/// The pair of occupancy thresholds that gate the prompt-hook context notice.
+/// Both are fractions in `0.0..=1.0` with the invariant `warn < handoff`.
+///
+/// - `warn`: occupancy fraction at which the hook injects a soft warning
+///   (>= warn, < handoff). Env `IRONMEM_CONTEXT_WARN_PCT`; default 0.60.
+/// - `handoff`: occupancy fraction at which the hook injects a handoff
+///   instruction (>= handoff). Env `IRONMEM_CONTEXT_HANDOFF_PCT`; default 0.80.
+///
+/// Produced only by [`context_threshold_pair`], which parses, clamps, finite-
+/// checks, and enforces the `warn < handoff` invariant atomically.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ContextThresholds {
+    pub warn: f64,
+    pub handoff: f64,
 }
 
 /// Parse and validate both occupancy thresholds together so the
 /// `warn < handoff` invariant can be enforced atomically.
-/// Returns `(warn_pct, handoff_pct)`. Prefer this over the two single getters
-/// when both values are needed (e.g. the prompt hook) to avoid re-parsing the
-/// env pair twice; the singles are thin wrappers that discard the other half.
-pub fn context_threshold_pair() -> (f64, f64) {
+/// Each value is read fresh per call (no OnceLock) so integration tests can
+/// flip it. If the resolved warn value >= handoff value, BOTH revert to
+/// defaults (0.60 / 0.80) to preserve the `warn < handoff` ordering invariant.
+pub fn context_threshold_pair() -> ContextThresholds {
     const DEFAULT_WARN: f64 = 0.60;
     const DEFAULT_HANDOFF: f64 = 0.80;
 
@@ -447,11 +441,23 @@ pub fn context_threshold_pair() -> (f64, f64) {
     let warn = parse_clamped("IRONMEM_CONTEXT_WARN_PCT", DEFAULT_WARN);
     let handoff = parse_clamped("IRONMEM_CONTEXT_HANDOFF_PCT", DEFAULT_HANDOFF);
 
-    // Invariant guard: warn must be strictly less than handoff.
+    // Invariant guard: warn must be strictly less than handoff. Reverting
+    // silently would hide an operator misconfiguration, so name the offending
+    // values and the revert (no-silent-swallow rule).
     if warn >= handoff {
-        (DEFAULT_WARN, DEFAULT_HANDOFF)
+        tracing::warn!(
+            warn,
+            handoff,
+            "IRONMEM_CONTEXT_WARN_PCT ({warn}) >= IRONMEM_CONTEXT_HANDOFF_PCT ({handoff}); \
+             both reverted to defaults ({DEFAULT_WARN} / {DEFAULT_HANDOFF}) to preserve \
+             the warn < handoff invariant"
+        );
+        ContextThresholds {
+            warn: DEFAULT_WARN,
+            handoff: DEFAULT_HANDOFF,
+        }
     } else {
-        (warn, handoff)
+        ContextThresholds { warn, handoff }
     }
 }
 
@@ -617,8 +623,9 @@ mod tests {
         let _g = PROMPT_HOOK_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         std::env::remove_var("IRONMEM_CONTEXT_WARN_PCT");
         std::env::remove_var("IRONMEM_CONTEXT_HANDOFF_PCT");
-        assert_eq!(context_warn_pct(), 0.60);
-        assert_eq!(context_handoff_pct(), 0.80);
+        let t = context_threshold_pair();
+        assert_eq!(t.warn, 0.60);
+        assert_eq!(t.handoff, 0.80);
     }
 
     #[test]
@@ -626,8 +633,9 @@ mod tests {
         let _g = PROMPT_HOOK_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         std::env::set_var("IRONMEM_CONTEXT_WARN_PCT", "0.50");
         std::env::set_var("IRONMEM_CONTEXT_HANDOFF_PCT", "0.90");
-        assert_eq!(context_warn_pct(), 0.50);
-        assert_eq!(context_handoff_pct(), 0.90);
+        let t = context_threshold_pair();
+        assert_eq!(t.warn, 0.50);
+        assert_eq!(t.handoff, 0.90);
         std::env::remove_var("IRONMEM_CONTEXT_WARN_PCT");
         std::env::remove_var("IRONMEM_CONTEXT_HANDOFF_PCT");
     }
@@ -637,8 +645,9 @@ mod tests {
         let _g = PROMPT_HOOK_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         std::env::set_var("IRONMEM_CONTEXT_WARN_PCT", "notanumber");
         std::env::set_var("IRONMEM_CONTEXT_HANDOFF_PCT", "also_bad");
-        assert_eq!(context_warn_pct(), 0.60);
-        assert_eq!(context_handoff_pct(), 0.80);
+        let t = context_threshold_pair();
+        assert_eq!(t.warn, 0.60);
+        assert_eq!(t.handoff, 0.80);
         std::env::remove_var("IRONMEM_CONTEXT_WARN_PCT");
         std::env::remove_var("IRONMEM_CONTEXT_HANDOFF_PCT");
     }
@@ -649,10 +658,10 @@ mod tests {
         // > 1.0
         std::env::set_var("IRONMEM_CONTEXT_WARN_PCT", "1.5");
         std::env::remove_var("IRONMEM_CONTEXT_HANDOFF_PCT");
-        assert_eq!(context_warn_pct(), 0.60);
+        assert_eq!(context_threshold_pair().warn, 0.60);
         // < 0.0
         std::env::set_var("IRONMEM_CONTEXT_WARN_PCT", "-0.1");
-        assert_eq!(context_warn_pct(), 0.60);
+        assert_eq!(context_threshold_pair().warn, 0.60);
         std::env::remove_var("IRONMEM_CONTEXT_WARN_PCT");
     }
 
@@ -662,13 +671,15 @@ mod tests {
         // warn == handoff => inversion
         std::env::set_var("IRONMEM_CONTEXT_WARN_PCT", "0.70");
         std::env::set_var("IRONMEM_CONTEXT_HANDOFF_PCT", "0.70");
-        assert_eq!(context_warn_pct(), 0.60);
-        assert_eq!(context_handoff_pct(), 0.80);
+        let t = context_threshold_pair();
+        assert_eq!(t.warn, 0.60);
+        assert_eq!(t.handoff, 0.80);
         // warn > handoff
         std::env::set_var("IRONMEM_CONTEXT_WARN_PCT", "0.90");
         std::env::set_var("IRONMEM_CONTEXT_HANDOFF_PCT", "0.70");
-        assert_eq!(context_warn_pct(), 0.60);
-        assert_eq!(context_handoff_pct(), 0.80);
+        let t = context_threshold_pair();
+        assert_eq!(t.warn, 0.60);
+        assert_eq!(t.handoff, 0.80);
         std::env::remove_var("IRONMEM_CONTEXT_WARN_PCT");
         std::env::remove_var("IRONMEM_CONTEXT_HANDOFF_PCT");
     }
