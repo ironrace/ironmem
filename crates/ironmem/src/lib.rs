@@ -33,6 +33,9 @@ pub mod sanitize;
 /// Search pipeline, graph traversal, and query sanitization.
 pub mod search;
 
+/// Lazy per-area code maps — freshness classification (issue #94).
+pub mod code_maps;
+
 pub mod write_rules;
 
 /// Canonical crate error type used by CLI, MCP, and storage layers.
