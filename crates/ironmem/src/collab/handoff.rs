@@ -46,11 +46,7 @@ pub fn load_or_init_actor_generation(
                 let generation: i64 = r.get(0)?;
                 let token: Option<String> = r.get(1)?;
                 let pending_gen: Option<i64> = r.get(2)?;
-                Ok(ActorGeneration {
-                    generation: generation.max(0) as u64,
-                    pending_handoff_token: token,
-                    pending_handoff_generation: pending_gen.map(|g| g.max(0) as u64),
-                })
+                Ok((generation, token, pending_gen))
             },
         )
         .optional()?
@@ -60,74 +56,149 @@ pub fn load_or_init_actor_generation(
                 agent.as_str()
             ))
         })?;
-    Ok(row)
+    let (generation, token, pending_gen) = row;
+    let generation = u64::try_from(generation).map_err(|_| {
+        MemoryError::Validation(format!(
+            "corrupt lease row: negative generation {generation}"
+        ))
+    })?;
+    let pending_handoff_generation = pending_gen
+        .map(|g| {
+            u64::try_from(g).map_err(|_| {
+                MemoryError::Validation(format!("corrupt lease row: negative generation {g}"))
+            })
+        })
+        .transpose()?;
+    Ok(ActorGeneration {
+        generation,
+        pending_handoff_token: token,
+        pending_handoff_generation,
+    })
 }
 
 /// Issue a new handoff token (or reuse a pending one). Does NOT bump the active
 /// generation — it sets `pending_handoff_generation = generation + 1`. Reuse path
 /// returns the same token + pending generation (byte-identical retries before claim).
+///
+/// Safe under callers' DEFERRED transactions: the issue decision is enforced by the
+/// guarded `WHERE pending_handoff_token IS NULL` clause (single atomic UPDATE), not
+/// a prior read.
 pub fn issue_or_reuse_handoff(
     conn: &Connection,
     session_id: &str,
     agent: Agent,
 ) -> Result<HandoffIssue, MemoryError> {
-    let current = load_or_init_actor_generation(conn, session_id, agent)?;
-    if let (Some(token), Some(pending_generation)) = (
-        current.pending_handoff_token.clone(),
-        current.pending_handoff_generation,
-    ) {
-        return Ok(HandoffIssue {
-            pending_generation,
-            token,
-            reused: true,
-        });
-    }
-    let token = Uuid::new_v4().to_string();
-    let pending_generation = current.generation + 1;
+    // Ensure the row exists at generation 0.
     conn.execute(
+        "INSERT OR IGNORE INTO collab_actor_generations (session_id, agent, generation)
+         VALUES (?1, ?2, 0)",
+        params![session_id, agent.as_str()],
+    )?;
+
+    // Generate a candidate token; it is only stored if no pending token exists.
+    let candidate_token = Uuid::new_v4().to_string();
+
+    // Atomic guarded UPDATE: only writes when no token is already pending.
+    let rows = conn.execute(
         "UPDATE collab_actor_generations
          SET pending_handoff_token = ?3,
-             pending_handoff_generation = ?4,
+             pending_handoff_generation = generation + 1,
              pending_handoff_issued_at = datetime('now'),
              pending_handoff_claimed_at = NULL
-         WHERE session_id = ?1 AND agent = ?2",
-        params![session_id, agent.as_str(), token, pending_generation as i64],
+         WHERE session_id = ?1 AND agent = ?2 AND pending_handoff_token IS NULL",
+        params![session_id, agent.as_str(), candidate_token],
     )?;
+    let reused = rows == 0;
+
+    // SELECT the now-current stored token (either just written or already pending).
+    let (stored_token, stored_gen): (String, i64) = conn.query_row(
+        "SELECT pending_handoff_token, pending_handoff_generation
+         FROM collab_actor_generations WHERE session_id = ?1 AND agent = ?2",
+        params![session_id, agent.as_str()],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    )?;
+    let pending_generation = u64::try_from(stored_gen).map_err(|_| {
+        MemoryError::Validation(format!(
+            "corrupt lease row: negative generation {stored_gen}"
+        ))
+    })?;
+
     Ok(HandoffIssue {
         pending_generation,
-        token,
-        reused: false,
+        token: stored_token,
+        reused,
     })
 }
 
 /// Claim a pending handoff token: advance `generation` to
 /// `pending_handoff_generation`, clear pending fields, stamp claimed_at.
 /// Returns the new active generation. Errors on mismatch / already-claimed.
+///
+/// Safe under callers' DEFERRED transactions: the claim decision is enforced by the
+/// guarded `WHERE pending_handoff_token = ?token` clause (single atomic UPDATE), not
+/// a prior read.
 pub fn claim_handoff_token(
     conn: &Connection,
     session_id: &str,
     agent: Agent,
     token: &str,
 ) -> Result<u64, MemoryError> {
-    let current = load_or_init_actor_generation(conn, session_id, agent)?;
-    let pending_token = current
-        .pending_handoff_token
-        .ok_or_else(|| MemoryError::Validation("handoff_token already claimed".to_string()))?;
+    // Plain SELECT — do NOT create a row here; lazy-init is issue's responsibility.
+    let row: Option<(Option<String>, Option<i64>)> = conn
+        .query_row(
+            "SELECT pending_handoff_token, pending_handoff_generation
+             FROM collab_actor_generations WHERE session_id = ?1 AND agent = ?2",
+            params![session_id, agent.as_str()],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()?;
+
+    let (pending_token_opt, pending_gen_opt) = match row {
+        None => {
+            return Err(MemoryError::Validation(
+                "handoff_token already claimed".to_string(),
+            ))
+        }
+        Some(r) => r,
+    };
+
+    let pending_token = match pending_token_opt {
+        None => {
+            return Err(MemoryError::Validation(
+                "handoff_token already claimed".to_string(),
+            ))
+        }
+        Some(t) => t,
+    };
+
     if pending_token != token {
         return Err(MemoryError::Validation("invalid handoff_token".to_string()));
     }
-    let new_generation = current
-        .pending_handoff_generation
-        .ok_or_else(|| MemoryError::Validation("invalid handoff_token".to_string()))?;
-    conn.execute(
+
+    let pending_gen_raw = pending_gen_opt.ok_or_else(|| {
+        MemoryError::Validation("corrupt lease row: pending token without generation".to_string())
+    })?;
+    let new_generation = u64::try_from(pending_gen_raw).map_err(|_| {
+        MemoryError::Validation(format!(
+            "corrupt lease row: negative generation {pending_gen_raw}"
+        ))
+    })?;
+
+    // Atomic guarded UPDATE: only commits if the token is still the expected one.
+    let rows = conn.execute(
         "UPDATE collab_actor_generations
-         SET generation = ?3,
+         SET generation = pending_handoff_generation,
              pending_handoff_token = NULL,
              pending_handoff_generation = NULL,
              pending_handoff_claimed_at = datetime('now')
-         WHERE session_id = ?1 AND agent = ?2",
-        params![session_id, agent.as_str(), new_generation as i64],
+         WHERE session_id = ?1 AND agent = ?2 AND pending_handoff_token = ?3",
+        params![session_id, agent.as_str(), token],
     )?;
+    if rows == 0 {
+        // A concurrent claim won the race.
+        return Err(MemoryError::Validation("invalid handoff_token".to_string()));
+    }
+
     Ok(new_generation)
 }
 
@@ -218,6 +289,7 @@ mod tests {
         let issued = issue_or_reuse_handoff(&conn, "s1", Agent::Claude).unwrap();
         assert!(claim_handoff_token(&conn, "s1", Agent::Claude, "nope").is_err());
         claim_handoff_token(&conn, "s1", Agent::Claude, &issued.token).unwrap();
+        // Double-claim: no pending token → "already claimed"
         assert!(claim_handoff_token(&conn, "s1", Agent::Claude, &issued.token).is_err());
     }
 
@@ -231,5 +303,29 @@ mod tests {
             [],
         );
         assert!(res.is_err());
+    }
+
+    #[test]
+    fn claim_on_never_issued_actor_errors_without_creating_row() {
+        let conn = open();
+        seed_session(&conn, "s1");
+        // Never called issue_or_reuse_handoff — no row exists for Codex.
+        let err = claim_handoff_token(&conn, "s1", Agent::Codex, "any-token").unwrap_err();
+        assert!(
+            matches!(err, MemoryError::Validation(_)),
+            "expected Validation error, got {err:?}"
+        );
+        // Assert no row was created by claim.
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM collab_actor_generations WHERE session_id = 's1' AND agent = 'codex'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            count, 0,
+            "claim must not create a row for an actor that never had a handoff issued"
+        );
     }
 }
