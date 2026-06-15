@@ -76,6 +76,15 @@ pub(super) fn opt_handoff_token(args: &Value) -> Option<String> {
         .map(str::to_string)
 }
 
+fn task_list_str_field(raw: Option<&str>, key: &str) -> Option<String> {
+    let raw = raw?;
+    serde_json::from_str::<Value>(raw)
+        .ok()?
+        .get(key)?
+        .as_str()
+        .map(str::to_string)
+}
+
 // ── Checkpoint reader ────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -157,6 +166,8 @@ pub(super) fn compose_handoff_block(
     let s = &record.session;
     let cp = checkpoint.unwrap_or_default();
     let cp_present = cp != Checkpoint::default();
+    let plan_file_path = task_list_str_field(s.task_list.as_deref(), "plan_file_path");
+    let execution_mode = task_list_str_field(s.task_list.as_deref(), "execution_mode");
     let mut out = String::new();
     let _ = writeln!(out, "```{HANDOFF_FENCE}");
     let _ = writeln!(out, "session_id: {}", s.id);
@@ -194,6 +205,16 @@ pub(super) fn compose_handoff_block(
         s.tasks_count()
             .map(|c| c.to_string())
             .unwrap_or_else(|| "\u{2014}".into())
+    );
+    let _ = writeln!(
+        out,
+        "task_list.plan_file_path: {}",
+        opt(plan_file_path.as_deref())
+    );
+    let _ = writeln!(
+        out,
+        "task_list.execution_mode: {}",
+        opt(execution_mode.as_deref())
     );
     let _ = writeln!(out, "review_round: {}", s.review_round);
     let _ = writeln!(out, "task_review_round: {}", s.task_review_round);
@@ -238,15 +259,8 @@ pub(super) fn handle_session_handoff(app: &App, args: &Value) -> Result<Value, M
     let session_id = require_str(args, "session_id")?;
     let agent = require_agent(require_str(args, "agent")?)?;
 
-    let record = app.db.collab_load_session_record(session_id)?;
-    if record.ended_at.is_some() {
-        return Err(MemoryError::Validation(format!(
-            "session {session_id} has ended; cannot issue a handoff"
-        )));
-    }
-
-    // Resurrection guard + issue, atomic in one transaction.
-    let issued = app.db.with_transaction(|tx| {
+    // Resurrection guard + active-session snapshot + issue, atomic in one transaction.
+    let (record, issued) = app.db.with_transaction(|tx| {
         ensure_actor_generation_current(
             app,
             tx,
@@ -254,7 +268,10 @@ pub(super) fn handle_session_handoff(app: &App, args: &Value) -> Result<Value, M
             agent,
             opt_handoff_token(args).as_deref(),
         )?;
-        crate::collab::issue_or_reuse_handoff(tx, session_id, agent)
+        crate::collab::queue::ensure_active(tx, session_id)?;
+        let record = crate::collab::queue::load_session_record(tx, session_id)?;
+        let issued = crate::collab::issue_or_reuse_handoff(tx, session_id, agent)?;
+        Ok((record, issued))
     })?;
 
     let checkpoint = latest_checkpoint(&app.db, session_id)?;
@@ -322,6 +339,8 @@ mod tests {
         assert!(a.contains("phase: CodeImplementPending"));
         assert!(a.contains("checkpoint: none"));
         assert!(a.contains("gates: not_recorded"));
+        assert!(a.contains("task_list.plan_file_path: \u{2014}"));
+        assert!(a.contains("task_list.execution_mode: \u{2014}"));
         assert!(a.contains("handoff.agent: claude"));
         assert!(a.contains("handoff.generation: 1"));
     }
@@ -576,6 +595,14 @@ gates: passed\n";
         r.session.canonical_plan_hash = Some("def456".into());
         r.session.final_plan_drawer_id = Some("fff999".into());
         r.session.final_plan_hash = Some("aaa111".into());
+        r.session.task_list = Some(
+            json!({
+                "plan_file_path": "docs/superpowers/plans/handoff.md",
+                "execution_mode": "mechanical_direct",
+                "tasks": [{"id": 1}]
+            })
+            .to_string(),
+        );
         let cp = Checkpoint {
             status: Some("completed".into()),
             task_id: Some("2".into()),
@@ -587,6 +614,8 @@ gates: passed\n";
         assert!(block.contains("plan.canonical.drawer_id: abc123"));
         assert!(block.contains("plan.canonical.hash: def456"));
         assert!(block.contains("plan.final.drawer_id: fff999"));
+        assert!(block.contains("task_list.plan_file_path: docs/superpowers/plans/handoff.md"));
+        assert!(block.contains("task_list.execution_mode: mechanical_direct"));
         assert!(block.contains("gates: passed"));
         assert!(block.contains("checkpoint: present"));
         assert!(block.contains("checkpoint.status: completed"));
