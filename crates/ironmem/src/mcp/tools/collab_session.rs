@@ -968,7 +968,7 @@ pub(super) fn handle_collab_status(app: &App, args: &Value) -> Result<Value, Mem
             .db
             .with_connection(|c| crate::collab::read_actor_generation(c, session_id, ag))?;
         let (generation, pending) = match g {
-            Some(a) => (a.generation, a.pending_handoff_token.is_some()),
+            Some(a) => (a.generation, a.pending.is_some()),
             None => (0, false),
         };
         status[format!("{}_generation", ag.as_str())] = json!(generation);
@@ -1052,7 +1052,11 @@ pub(super) fn handle_collab_wait_my_turn(app: &App, args: &Value) -> Result<Valu
         .unwrap_or(WAIT_MY_TURN_DEFAULT_TIMEOUT_SECS)
         .clamp(1, WAIT_MY_TURN_MAX_TIMEOUT_SECS);
 
-    // Run the generation guard in its own transaction before the polling loop.
+    // Run the generation guard in its own transaction before the polling loop:
+    // the polling loop makes no collab-state write that must be atomic with the
+    // claim, and a token claim commits unconditionally before polling begins, so
+    // the process cache update is correct even if the session snapshot is read
+    // later in a separate connection.
     app.db.with_transaction(|tx| {
         super::handoff::ensure_actor_generation_current(
             app,
@@ -2315,6 +2319,49 @@ mod tests {
         assert!(
             err.to_string().contains("stale collab generation"),
             "expected stale collab generation error, got: {err}"
+        );
+    }
+
+    /// collab_status must expose claude_generation and claude_handoff_pending
+    /// correctly after a handoff is issued, without leaking the token itself.
+    #[test]
+    fn collab_status_exposes_generation_and_pending_without_token() {
+        let app = test_app();
+        let sid = start_session(&app);
+
+        // Issue a handoff for claude directly.
+        let issued = app
+            .db
+            .with_transaction(|tx| {
+                crate::collab::issue_or_reuse_handoff(tx, &sid, crate::collab::Agent::Claude)
+            })
+            .unwrap();
+
+        let status = handle_collab_status(&app, &json!({"session_id": sid})).unwrap();
+
+        assert_eq!(
+            status["claude_generation"],
+            json!(0),
+            "claude_generation must be 0 (pending does not advance active generation)"
+        );
+        assert_eq!(
+            status["claude_handoff_pending"],
+            json!(true),
+            "claude_handoff_pending must be true after issue"
+        );
+        assert_eq!(
+            status["codex_handoff_pending"],
+            json!(false),
+            "codex_handoff_pending must be false (no handoff issued for codex)"
+        );
+
+        // The serialized status must not contain the raw token string.
+        let serialized = serde_json::to_string(&status).unwrap();
+        assert!(
+            !serialized.contains(&issued.token),
+            "serialized status must not expose the handoff token: token={}, status={}",
+            issued.token,
+            serialized
         );
     }
 }

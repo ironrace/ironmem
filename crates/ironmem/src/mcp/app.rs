@@ -338,8 +338,9 @@ impl App {
     ) -> Option<u64> {
         self.active_collab_generations
             .read()
-            .ok()
-            .and_then(|m| m.get(&(session_id.to_string(), agent)).copied())
+            .expect("active_collab_generations lock poisoned")
+            .get(&(session_id.to_string(), agent))
+            .copied()
     }
 
     /// Bind/refresh this process's cached active generation for (session, agent).
@@ -349,9 +350,10 @@ impl App {
         agent: crate::collab::Agent,
         generation: u64,
     ) {
-        if let Ok(mut m) = self.active_collab_generations.write() {
-            m.insert((session_id.to_string(), agent), generation);
-        }
+        self.active_collab_generations
+            .write()
+            .expect("active_collab_generations lock poisoned")
+            .insert((session_id.to_string(), agent), generation);
     }
 
     /// Mark index as dirty after a write operation. The index will be

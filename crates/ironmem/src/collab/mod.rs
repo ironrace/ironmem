@@ -29,9 +29,11 @@ mod state_machine;
 pub use agent::Agent;
 pub use error::CollabError;
 pub use event::CollabEvent;
+#[cfg(test)]
+pub use handoff::load_or_init_actor_generation;
 pub use handoff::{
-    claim_handoff_token, issue_or_reuse_handoff, load_or_init_actor_generation,
-    read_actor_generation, ActorGeneration, HandoffIssue,
+    claim_handoff_token, issue_or_reuse_handoff, read_actor_generation, ActorGeneration,
+    HandoffIssue, PendingHandoff,
 };
 pub use phase::Phase;
 pub use session::{tasks_count_from_list, CollabSession};

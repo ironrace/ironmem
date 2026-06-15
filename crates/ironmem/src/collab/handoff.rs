@@ -13,10 +13,15 @@ use super::Agent;
 use crate::error::MemoryError;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingHandoff {
+    pub token: String,
+    pub generation: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ActorGeneration {
     pub generation: u64,
-    pub pending_handoff_token: Option<String>,
-    pub pending_handoff_generation: Option<u64>,
+    pub pending: Option<PendingHandoff>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -26,7 +31,47 @@ pub struct HandoffIssue {
     pub reused: bool,
 }
 
+/// Shared parsing helper: build an `ActorGeneration` from raw DB columns.
+/// Returns a `Validation` error for negative values or a mismatched token/generation pair.
+fn build_actor_generation(
+    generation: i64,
+    token: Option<String>,
+    pending_gen: Option<i64>,
+) -> Result<ActorGeneration, MemoryError> {
+    let generation = u64::try_from(generation).map_err(|_| {
+        MemoryError::Validation(format!(
+            "corrupt lease row: negative generation {generation}"
+        ))
+    })?;
+    let pending = match (token, pending_gen) {
+        (Some(token), Some(g)) => {
+            let g = u64::try_from(g).map_err(|_| {
+                MemoryError::Validation(format!(
+                    "corrupt lease row: negative pending generation {g}"
+                ))
+            })?;
+            Some(PendingHandoff {
+                token,
+                generation: g,
+            })
+        }
+        (None, None) => None,
+        // A token without its generation (or vice-versa) is a corrupt row — the
+        // two columns are always written together by issue_or_reuse_handoff.
+        (Some(_), None) | (None, Some(_)) => {
+            return Err(MemoryError::Validation(
+                "corrupt lease row: pending token/generation mismatch".to_string(),
+            ));
+        }
+    };
+    Ok(ActorGeneration {
+        generation,
+        pending,
+    })
+}
+
 /// Read the (session, agent) lease row, creating it lazily at generation 0.
+#[cfg(test)]
 pub fn load_or_init_actor_generation(
     conn: &Connection,
     session_id: &str,
@@ -57,23 +102,7 @@ pub fn load_or_init_actor_generation(
             ))
         })?;
     let (generation, token, pending_gen) = row;
-    let generation = u64::try_from(generation).map_err(|_| {
-        MemoryError::Validation(format!(
-            "corrupt lease row: negative generation {generation}"
-        ))
-    })?;
-    let pending_handoff_generation = pending_gen
-        .map(|g| {
-            u64::try_from(g).map_err(|_| {
-                MemoryError::Validation(format!("corrupt lease row: negative generation {g}"))
-            })
-        })
-        .transpose()?;
-    Ok(ActorGeneration {
-        generation,
-        pending_handoff_token: token,
-        pending_handoff_generation,
-    })
+    build_actor_generation(generation, token, pending_gen)
 }
 
 /// Read the (session, agent) lease row WITHOUT creating it. Returns `None` when
@@ -96,26 +125,7 @@ pub fn read_actor_generation(
         },
     )
     .optional()?
-    .map(|(generation, token, pending_gen)| {
-        let generation = u64::try_from(generation).map_err(|_| {
-            MemoryError::Validation(format!(
-                "corrupt lease row: negative generation {generation}"
-            ))
-        })?;
-        let pending_handoff_generation = match pending_gen {
-            Some(g) => Some(u64::try_from(g).map_err(|_| {
-                MemoryError::Validation(format!(
-                    "corrupt lease row: negative pending generation {g}"
-                ))
-            })?),
-            None => None,
-        };
-        Ok(ActorGeneration {
-            generation,
-            pending_handoff_token: token,
-            pending_handoff_generation,
-        })
-    })
+    .map(|(generation, token, pending_gen)| build_actor_generation(generation, token, pending_gen))
     .transpose()
 }
 
@@ -294,9 +304,9 @@ mod tests {
         assert!(!issued.reused);
         let g = load_or_init_actor_generation(&conn, "s1", Agent::Claude).unwrap();
         assert_eq!(g.generation, 0, "active generation must not bump on issue");
-        assert_eq!(g.pending_handoff_generation, Some(1));
+        assert_eq!(g.pending.as_ref().map(|p| p.generation), Some(1));
         assert_eq!(
-            g.pending_handoff_token.as_deref(),
+            g.pending.as_ref().map(|p| p.token.as_str()),
             Some(issued.token.as_str())
         );
     }
@@ -321,8 +331,7 @@ mod tests {
         assert_eq!(new_gen, 1);
         let g = load_or_init_actor_generation(&conn, "s1", Agent::Claude).unwrap();
         assert_eq!(g.generation, 1);
-        assert_eq!(g.pending_handoff_token, None);
-        assert_eq!(g.pending_handoff_generation, None);
+        assert_eq!(g.pending, None);
     }
 
     #[test]
@@ -369,6 +378,76 @@ mod tests {
         assert_eq!(
             count, 0,
             "claim must not create a row for an actor that never had a handoff issued"
+        );
+    }
+
+    /// Direct INSERT of generation = -1 must be rejected by the CHECK constraint.
+    #[test]
+    fn check_constraint_rejects_negative_generation() {
+        let conn = open();
+        seed_session(&conn, "s1");
+
+        let err = conn.execute(
+            "INSERT INTO collab_actor_generations (session_id, agent, generation)
+             VALUES ('s1', 'claude', -1)",
+            [],
+        );
+        assert!(
+            err.is_err(),
+            "INSERT with generation = -1 must fail the CHECK constraint"
+        );
+    }
+
+    /// Direct INSERT of pending_handoff_generation = -1 must be rejected by the CHECK constraint.
+    #[test]
+    fn check_constraint_rejects_negative_pending_generation() {
+        let conn = open();
+        seed_session(&conn, "s1");
+
+        // First create a valid row at generation 0.
+        conn.execute(
+            "INSERT INTO collab_actor_generations (session_id, agent, generation)
+             VALUES ('s1', 'claude', 0)",
+            [],
+        )
+        .unwrap();
+
+        let err = conn.execute(
+            "UPDATE collab_actor_generations
+             SET pending_handoff_token = 'tok', pending_handoff_generation = -1
+             WHERE session_id = 's1' AND agent = 'claude'",
+            [],
+        );
+        assert!(
+            err.is_err(),
+            "UPDATE with pending_handoff_generation = -1 must fail the CHECK constraint"
+        );
+    }
+
+    /// `read_actor_generation` for a never-issued (session, agent) must return
+    /// `Ok(None)` and must NOT create a row.
+    #[test]
+    fn read_actor_generation_returns_none_without_creating_row() {
+        let conn = open();
+        seed_session(&conn, "s1");
+
+        let result = read_actor_generation(&conn, "s1", Agent::Codex).unwrap();
+        assert!(
+            result.is_none(),
+            "read_actor_generation must return None for never-issued actor"
+        );
+
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM collab_actor_generations \
+                 WHERE session_id = 's1' AND agent = 'codex'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            count, 0,
+            "read_actor_generation must not create a row for a never-issued actor"
         );
     }
 }

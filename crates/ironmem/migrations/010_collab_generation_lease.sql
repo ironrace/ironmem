@@ -2,8 +2,8 @@
 -- Separate table keeps collab_sessions untouched. One row per (session_id, agent),
 -- created lazily at generation 0 — no backfill. issue sets pending fields WITHOUT
 -- bumping generation; claim advances generation = pending_handoff_generation.
--- Version-gated behind current_version < 10 (CREATE TABLE IF NOT EXISTS is idempotent
--- under the BEGIN IMMEDIATE migration lock).
+-- The migration runner (schema.rs) skips this file when current_version >= 10;
+-- CREATE TABLE IF NOT EXISTS keeps the DDL safe if executed directly.
 
 CREATE TABLE IF NOT EXISTS collab_actor_generations (
     session_id TEXT NOT NULL REFERENCES collab_sessions(id) ON DELETE CASCADE,
@@ -11,6 +11,7 @@ CREATE TABLE IF NOT EXISTS collab_actor_generations (
     generation INTEGER NOT NULL DEFAULT 0 CHECK (generation >= 0),
     pending_handoff_token TEXT,
     pending_handoff_generation INTEGER CHECK (pending_handoff_generation IS NULL OR pending_handoff_generation >= 0),
+    -- audit trail: written by issue/claim ops, not read by the runtime.
     pending_handoff_issued_at TEXT,
     pending_handoff_claimed_at TEXT,
     PRIMARY KEY (session_id, agent)

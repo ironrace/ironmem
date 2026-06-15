@@ -2,8 +2,10 @@
 //!
 //! `ensure_actor_generation_current` validates (and on first-touch/claim,
 //! binds) this process's generation for (session, agent). Call before any
-//! actor-bearing mutating/binding collab op; must run inside the caller's
-//! transaction so a claim is atomic with the op.
+//! actor-bearing mutating/binding collab op. When `maybe_token` is `Some`, the
+//! guard must run inside the caller's write transaction so the claim is atomic
+//! with the op; the no-token validation path may run in its own transaction (as
+//! `collab_wait_my_turn` does).
 //!
 //! `handle_session_handoff` issues (or byte-identically reuses) a one-time
 //! handoff token and renders a deterministic, model-free session handoff block
@@ -120,6 +122,8 @@ pub(super) fn latest_checkpoint(
     db: &crate::db::schema::Database,
     session_id: &str,
 ) -> Result<Option<Checkpoint>, MemoryError> {
+    // Intentionally runs as a separate read after the session-snapshot transaction
+    // (render-only; can't interleave under the single-request MCP dispatch model).
     db.with_connection(|conn| {
         // Wrap the needle in sentinel newlines so `session_id: <id>` matches only
         // as a complete line, avoiding substring collisions (e.g. "test-sid" inside
@@ -168,7 +172,8 @@ fn parse_checkpoint(content: &str) -> Checkpoint {
 /// no randomness, no timestamps). Key order in the fenced block is stable
 /// across calls. `pending_generation` is the **to-be-claimed** value
 /// (= `active_generation + 1`), not the caller's current active generation.
-/// `agent` is the actor being handed off to.
+/// `agent` is the agent role whose session context is being transferred (the
+/// vacating actor).
 pub(super) fn compose_handoff_block(
     record: &SessionRecord,
     agent: Agent,
@@ -767,5 +772,123 @@ gates: passed\n";
             })
             .unwrap();
         assert_eq!(n, 0, "no-token guard path must not create a lease row");
+    }
+
+    /// `session_handoff` on an ended session must return `Err`.
+    #[test]
+    fn session_handoff_on_ended_session_is_rejected() {
+        let (app, _dir) = test_handoff_app();
+        let sid = seed_active_session(&app);
+
+        // End the session directly via the queue layer.
+        app.db
+            .with_transaction(|tx| crate::collab::queue::end_session(tx, &sid))
+            .unwrap();
+
+        // Handoff on an ended session must fail (ensure_active rejects it).
+        let result = handle_session_handoff(&app, &json!({"session_id": sid, "agent": "claude"}));
+        assert!(
+            result.is_err(),
+            "session_handoff on an ended session must return Err"
+        );
+    }
+
+    /// Calling the no-token guard twice for the same (app, session, agent) in
+    /// steady-state (db gen == cached gen == 0) must succeed both times.
+    #[test]
+    fn guard_cached_equal_db_is_ok_reentrant() {
+        let (app, _dir) = test_handoff_app();
+        let sid = seed_active_session(&app);
+
+        // First call: binds the cache at gen 0.
+        app.db
+            .with_connection(|conn| {
+                ensure_actor_generation_current(&app, conn, &sid, Agent::Claude, None)
+            })
+            .unwrap();
+
+        // Second call: cached == db (both 0) → must still be Ok.
+        app.db
+            .with_connection(|conn| {
+                ensure_actor_generation_current(&app, conn, &sid, Agent::Claude, None)
+            })
+            .unwrap();
+    }
+
+    /// A fresh process (empty cache) calling the no-token guard when the DB
+    /// generation is already > 0 must be rejected with an error mentioning
+    /// "handed off".
+    #[test]
+    fn guard_rejects_tokenless_fresh_process_when_gen_gt_zero() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("mem.sqlite3");
+
+        // Predecessor: issues the handoff.
+        let pred = test_app_with_db_path(db_path.clone(), dir.path());
+        let sid = {
+            let sid = uuid::Uuid::new_v4().to_string();
+            pred.db
+                .with_transaction(|tx| {
+                    crate::collab::queue::create_session(
+                        tx,
+                        &sid,
+                        "/repo",
+                        "main",
+                        Some("t"),
+                        Agent::Claude,
+                    )
+                })
+                .unwrap();
+            sid
+        };
+
+        // Issue and claim (pred → succ) to advance DB to gen 1.
+        let token = pred
+            .db
+            .with_transaction(|tx| issue_or_reuse_handoff(tx, &sid, Agent::Claude))
+            .unwrap()
+            .token;
+
+        let succ = test_app_with_db_path(db_path.clone(), dir.path());
+        succ.db
+            .with_transaction(|tx| {
+                ensure_actor_generation_current(&succ, tx, &sid, Agent::Claude, Some(&token))
+            })
+            .unwrap();
+
+        // Third fresh App: empty cache, DB gen = 1, no token → must be rejected.
+        let fresh = test_app_with_db_path(db_path, dir.path());
+        let err = fresh
+            .db
+            .with_connection(|conn| {
+                ensure_actor_generation_current(&fresh, conn, &sid, Agent::Claude, None)
+            })
+            .unwrap_err();
+
+        assert!(
+            err.to_string().contains("handed off"),
+            "expected 'handed off' in error, got: {err}"
+        );
+    }
+
+    /// `opt_handoff_token` must treat an empty string as `None` and a non-empty
+    /// value as `Some`.
+    #[test]
+    fn opt_handoff_token_treats_empty_string_as_none() {
+        assert_eq!(
+            opt_handoff_token(&json!({"handoff_token": ""})),
+            None,
+            "empty string must yield None"
+        );
+        assert_eq!(
+            opt_handoff_token(&json!({"handoff_token": "abc-token"})),
+            Some("abc-token".to_string()),
+            "non-empty string must yield Some"
+        );
+        assert_eq!(
+            opt_handoff_token(&json!({})),
+            None,
+            "missing key must yield None"
+        );
     }
 }
