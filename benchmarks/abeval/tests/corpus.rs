@@ -129,7 +129,8 @@ fn committed_corpus_validates() {
     assert_eq!(
         content_hash(&t),
         "e6f464ce6c75f76254bbb483f71a8ff7e3794cfeafe030c8cbb5c8f1719c8cab",
-        "frozen corpus content hash changed — update intentionally if the corpus changed"
+        "frozen corpus content hash changed — re-pinned 2026-06-16: added \
+         Task.base_commit per session 9f49a93d steering decision (intentional)"
     );
 }
 
