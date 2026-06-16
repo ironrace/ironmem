@@ -13,11 +13,60 @@
 //! (see `migrations/008_metrics.sql`) enforce domain correctness so a
 //! malformed direct write cannot land an out-of-domain value.
 
+use rusqlite::types::{FromSql, FromSqlError, FromSqlResult, ToSql, ToSqlOutput, ValueRef};
 use rusqlite::{params, OptionalExtension};
 use serde::{Deserialize, Serialize};
 
 use super::schema::Database;
 use crate::error::MemoryError;
+
+// ---------------------------------------------------------------------------
+// Typed enums
+// ---------------------------------------------------------------------------
+
+/// Exploration-token verdict for one code-map MCP call (Phase 5 / issue #94).
+/// The ONLY two legal `token_usage.map_status` values. Confining the wire
+/// strings to the `ToSql`/`FromSql` impls below keeps `"map_hit"`/`"map_miss"`
+/// from spreading as bare literals across the codebase; the DB CHECK constraint
+/// (migration 011) remains as defense-in-depth.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MapStatus {
+    /// A `code_map_load` returned a found map with verdict `fresh`.
+    #[serde(rename = "map_hit")]
+    Hit,
+    /// Every other case — stale/rescout/absent load, or any `code_map_write`.
+    #[serde(rename = "map_miss")]
+    Miss,
+}
+
+impl MapStatus {
+    /// The canonical DB/wire string — the single producer of these literals.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            MapStatus::Hit => "map_hit",
+            MapStatus::Miss => "map_miss",
+        }
+    }
+}
+
+impl ToSql for MapStatus {
+    fn to_sql(&self) -> rusqlite::Result<ToSqlOutput<'_>> {
+        Ok(ToSqlOutput::from(self.as_str()))
+    }
+}
+
+impl FromSql for MapStatus {
+    fn column_result(value: ValueRef<'_>) -> FromSqlResult<Self> {
+        match value.as_str()? {
+            "map_hit" => Ok(MapStatus::Hit),
+            "map_miss" => Ok(MapStatus::Miss),
+            other => Err(FromSqlError::Other(
+                format!("invalid map_status value: {other:?}").into(),
+            )),
+        }
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Structs
@@ -41,6 +90,12 @@ pub struct NewTokenUsage {
     pub estimated: bool,
     pub chars: i64,
     pub cost_usd: Option<f64>,
+    /// Exploration-token attribution INPUT (Phase 5 / issue #94): the verdict to
+    /// stamp on this new row. `None` for rows not participating in lazy
+    /// code-map attribution.
+    pub map_status: Option<MapStatus>,
+    pub turn_id: Option<String>,
+    pub area: Option<String>,
 }
 
 /// Build a `NewTokenUsage` from an LLM call result. `source` is the call site
@@ -73,6 +128,9 @@ pub fn new_token_usage_from_llm(
         estimated: resp.estimated,
         chars: resp.chars() as i64,
         cost_usd: resp.cost_usd,
+        map_status: None,
+        turn_id: None,
+        area: None,
     }
 }
 
@@ -111,6 +169,12 @@ pub struct TokenUsage {
     pub estimated: bool,
     pub chars: i64,
     pub cost_usd: Option<f64>,
+    /// Exploration-token attribution as PERSISTED (Phase 5 / issue #94): the
+    /// verdict read back from the stored row. `None` for rows not participating
+    /// in lazy code-map attribution.
+    pub map_status: Option<MapStatus>,
+    pub turn_id: Option<String>,
+    pub area: Option<String>,
 }
 
 /// Query filters for `token_usage`. All fields are optional; unset fields
@@ -218,6 +282,9 @@ fn map_token_usage(row: &rusqlite::Row<'_>) -> rusqlite::Result<TokenUsage> {
         estimated: estimated_int != 0,
         chars: row.get(14)?,
         cost_usd: row.get(15)?,
+        map_status: row.get(16)?,
+        turn_id: row.get(17)?,
+        area: row.get(18)?,
     })
 }
 
@@ -286,6 +353,35 @@ pub struct TaskPhaseModelTokens {
     pub provider_cost_usd: Option<f64>,
 }
 
+/// Phase-5 / issue #94 exploration-token attribution aggregate.
+/// Produced by `report_exploration_delta`; one unit per DISTINCT non-NULL
+/// `turn_id` over `token_usage` rows where `source = 'mcp_response'` and
+/// `map_status IN ('map_hit', 'map_miss')`. Each turn gets a single verdict:
+/// `map_hit` only when the turn has a hit and NO miss, else `map_miss`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ExplorationReport {
+    /// Total distinct `turn_id` values with a tagged `map_status`.
+    pub total_turns: i64,
+    /// Distinct `turn_id` values whose per-turn verdict is `map_hit`
+    /// (a hit and no miss across the turn's exploration rows).
+    pub map_hit_turns: i64,
+    /// Distinct `turn_id` values whose per-turn verdict is `map_miss`
+    /// (at least one miss across the turn's exploration rows).
+    pub map_miss_turns: i64,
+    /// `map_hit_turns / total_turns`; `0.0` when `total_turns == 0`.
+    pub hit_rate: f64,
+    /// Mean `(input_tokens + output_tokens)` per turn for `map_hit` turns.
+    ///
+    /// **v0 note:** the MCP layer has no LLM-issued token counts for code-map
+    /// calls; `account_mcp_response` uses the response-size estimate
+    /// (`ceil(chars / 4)`) as `output_tokens` on the tagged MCP response row.
+    pub mean_tokens_map_hit: f64,
+    /// Mean `(input_tokens + output_tokens)` per turn for `map_miss` turns.
+    ///
+    /// See `mean_tokens_map_hit` — same v0 proxy applies.
+    pub mean_tokens_map_miss: f64,
+}
+
 /// METRICS_SPEC §10.2 split row.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TaskEstimatedSplit {
@@ -328,8 +424,9 @@ impl Database {
             "INSERT INTO token_usage (
                 ts, source, harness, model, session_id, collab_session_id, collab_phase,
                 task_tag, input_tokens, output_tokens, cache_creation_input_tokens,
-                cache_read_input_tokens, estimated, chars, cost_usd
-            ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15)",
+                cache_read_input_tokens, estimated, chars, cost_usd,
+                map_status, turn_id, area
+            ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18)",
             params![
                 row.ts,
                 row.source,
@@ -346,6 +443,9 @@ impl Database {
                 row.estimated as i64,
                 row.chars,
                 row.cost_usd,
+                row.map_status,
+                row.turn_id,
+                row.area,
             ],
         )?;
         Ok(self.conn.last_insert_rowid())
@@ -361,7 +461,8 @@ impl Database {
         let mut stmt = self.conn.prepare(
             "SELECT id, ts, source, harness, model, session_id, collab_session_id, collab_phase,
                     task_tag, input_tokens, output_tokens, cache_creation_input_tokens,
-                    cache_read_input_tokens, estimated, chars, cost_usd
+                    cache_read_input_tokens, estimated, chars, cost_usd,
+                    map_status, turn_id, area
              FROM token_usage
              WHERE (?1 IS NULL OR task_tag = ?1)
                AND (?2 IS NULL OR collab_session_id = ?2)
@@ -771,6 +872,131 @@ impl Database {
         self.headline_inner("t.outcome IN ('failed','abandoned')", task, since)
     }
 
+    /// Phase-5 / issue #94: DIRECT-RECORD / TEST-SEEDING helper that writes one
+    /// exploration-attribution row (`source = 'mcp_response'`, `estimated =
+    /// false`) with explicit token counts. This is **NOT** the live MCP path:
+    /// the live path tags the *estimated* `mcp_response` row produced by
+    /// [`crate::metrics::account_mcp_response`] (driven from
+    /// `mcp/server.rs::request_exploration_context`), using the response-size
+    /// token proxy. This helper exists only to seed deterministic, known-token
+    /// rows in tests; it is `#[cfg(test)]`-gated so it can never be mistaken for
+    /// production wiring. All `NewTokenUsage` columns not covered by the
+    /// parameters default to `None` or zero.
+    #[cfg(test)]
+    #[allow(clippy::too_many_arguments)]
+    pub fn record_exploration_tokens(
+        &self,
+        ts: &str,
+        harness: &str,
+        input_tokens: i64,
+        output_tokens: i64,
+        map_status: Option<MapStatus>,
+        turn_id: Option<&str>,
+        area: Option<&str>,
+    ) -> Result<i64, MemoryError> {
+        self.insert_token_usage(&NewTokenUsage {
+            ts: ts.to_string(),
+            source: "mcp_response".to_string(),
+            harness: harness.to_string(),
+            model: None,
+            session_id: None,
+            collab_session_id: None,
+            collab_phase: None,
+            task_tag: None,
+            input_tokens,
+            output_tokens,
+            cache_creation_input_tokens: 0,
+            cache_read_input_tokens: 0,
+            estimated: false,
+            chars: 0,
+            cost_usd: None,
+            map_status,
+            turn_id: turn_id.map(|s| s.to_string()),
+            area: area.map(|s| s.to_string()),
+        })
+    }
+
+    /// Phase-5 / issue #94: aggregate exploration-token attribution across all
+    /// `mcp_response` rows that carry a tagged `map_status`. Produces the
+    /// `ExplorationReport` used by the §10 Phase-5 report section.
+    ///
+    /// Groups by `(turn_id, map_status)` so multiple rows for the same turn
+    /// (e.g. retries) collapse to a single per-turn token total.
+    pub fn report_exploration_delta(&self) -> Result<ExplorationReport, MemoryError> {
+        // One row per DISTINCT turn_id. A turn's tokens are summed across all its
+        // exploration rows; its verdict is a single value derived per turn:
+        // `map_hit` only if the turn has a hit and NO miss, else `map_miss`.
+        // This avoids two skews: (a) a turn emitting both a hit and a miss being
+        // double-counted as two turns, and (b) NULL turn_id rows collapsing into
+        // one group — we exclude NULL turn_id entirely since an untagged row
+        // cannot be attributed to a turn.
+        let mut stmt = self.conn.prepare(
+            "SELECT
+                 CASE WHEN SUM(map_status = 'map_miss') > 0 THEN 'map_miss'
+                      ELSE 'map_hit' END AS turn_status,
+                 SUM(input_tokens + output_tokens) AS total_tokens
+             FROM token_usage
+             WHERE source = 'mcp_response'
+               AND turn_id IS NOT NULL
+               AND map_status IN ('map_hit', 'map_miss')
+             GROUP BY turn_id",
+        )?;
+        struct TurnRow {
+            map_status: String,
+            total_tokens: i64,
+        }
+        let rows: Vec<TurnRow> = stmt
+            .query_map([], |r| {
+                Ok(TurnRow {
+                    map_status: r.get(0)?,
+                    total_tokens: r.get::<_, Option<i64>>(1)?.unwrap_or(0),
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(MemoryError::from)?;
+
+        let mut map_hit_turns: i64 = 0;
+        let mut map_miss_turns: i64 = 0;
+        let mut sum_hit: f64 = 0.0;
+        let mut sum_miss: f64 = 0.0;
+
+        for row in &rows {
+            if row.map_status == "map_hit" {
+                map_hit_turns += 1;
+                sum_hit += row.total_tokens as f64;
+            } else {
+                map_miss_turns += 1;
+                sum_miss += row.total_tokens as f64;
+            }
+        }
+
+        let total_turns = map_hit_turns + map_miss_turns;
+        let hit_rate = if total_turns == 0 {
+            0.0
+        } else {
+            map_hit_turns as f64 / total_turns as f64
+        };
+        let mean_tokens_map_hit = if map_hit_turns == 0 {
+            0.0
+        } else {
+            sum_hit / map_hit_turns as f64
+        };
+        let mean_tokens_map_miss = if map_miss_turns == 0 {
+            0.0
+        } else {
+            sum_miss / map_miss_turns as f64
+        };
+
+        Ok(ExplorationReport {
+            total_turns,
+            map_hit_turns,
+            map_miss_turns,
+            hit_rate,
+            mean_tokens_map_hit,
+            mean_tokens_map_miss,
+        })
+    }
+
     fn headline_inner(
         &self,
         outcome_pred: &str,
@@ -838,6 +1064,9 @@ mod tests {
             estimated: true,
             chars: 480,
             cost_usd: Some(0.0123),
+            map_status: None,
+            turn_id: None,
+            area: None,
         }
     }
 
@@ -1483,6 +1712,9 @@ mod tests {
             estimated,
             chars: 0,
             cost_usd: cost,
+            map_status: None,
+            turn_id: None,
+            area: None,
         }
     }
 
@@ -1694,6 +1926,234 @@ mod tests {
         assert_eq!(non.len(), 1);
         assert_eq!(non[0].task_tag, "issue-f");
         assert_eq!(non[0].tokens_to_done, 5000);
+    }
+
+    // ---- Phase 5 / issue #94: exploration-token attribution ----
+
+    #[test]
+    fn test_record_exploration_tokens_map_hit() {
+        let db = db();
+        db.record_exploration_tokens(
+            "2026-06-15T00:00:00Z",
+            "claude",
+            100,
+            50,
+            Some(MapStatus::Hit),
+            Some("t1"),
+            Some("core"),
+        )
+        .unwrap();
+
+        let rows = db.query_token_usage(&TokenUsageQuery::default()).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].source, "mcp_response");
+        assert!(!rows[0].estimated);
+        assert_eq!(rows[0].map_status, Some(MapStatus::Hit));
+        assert_eq!(rows[0].turn_id.as_deref(), Some("t1"));
+        assert_eq!(rows[0].area.as_deref(), Some("core"));
+    }
+
+    #[test]
+    fn test_record_exploration_tokens_map_miss() {
+        let db = db();
+        db.record_exploration_tokens(
+            "2026-06-15T00:00:01Z",
+            "codex",
+            200,
+            80,
+            Some(MapStatus::Miss),
+            Some("t2"),
+            Some("auth"),
+        )
+        .unwrap();
+
+        let rows = db.query_token_usage(&TokenUsageQuery::default()).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].source, "mcp_response");
+        assert!(!rows[0].estimated);
+        assert_eq!(rows[0].map_status, Some(MapStatus::Miss));
+        assert_eq!(rows[0].turn_id.as_deref(), Some("t2"));
+        assert_eq!(rows[0].area.as_deref(), Some("auth"));
+    }
+
+    #[test]
+    fn test_report_exploration_delta_hit_rate() {
+        let db = db();
+
+        // t1 = map_hit, 300 total tokens
+        db.record_exploration_tokens(
+            "2026-06-15T00:00:01Z",
+            "claude",
+            200,
+            100,
+            Some(MapStatus::Hit),
+            Some("t1"),
+            Some("core"),
+        )
+        .unwrap();
+
+        // t2 = map_hit, 150 total tokens
+        db.record_exploration_tokens(
+            "2026-06-15T00:00:02Z",
+            "claude",
+            100,
+            50,
+            Some(MapStatus::Hit),
+            Some("t2"),
+            Some("auth"),
+        )
+        .unwrap();
+
+        // t3 = map_miss, 400 total tokens
+        db.record_exploration_tokens(
+            "2026-06-15T00:00:03Z",
+            "claude",
+            300,
+            100,
+            Some(MapStatus::Miss),
+            Some("t3"),
+            Some("db"),
+        )
+        .unwrap();
+
+        let report = db.report_exploration_delta().unwrap();
+        assert_eq!(report.total_turns, 3);
+        assert_eq!(report.map_hit_turns, 2);
+        assert_eq!(report.map_miss_turns, 1);
+        // hit_rate = 2/3
+        assert!((report.hit_rate - 2.0 / 3.0).abs() < 1e-9);
+        // mean_tokens_map_hit = (300 + 150) / 2 = 225
+        assert!((report.mean_tokens_map_hit - 225.0).abs() < 1e-9);
+        // mean_tokens_map_miss = 400 / 1 = 400
+        assert!((report.mean_tokens_map_miss - 400.0).abs() < 1e-9);
+    }
+
+    /// A turn that emits BOTH a hit and a miss counts as exactly ONE turn with
+    /// the conservative `map_miss` verdict (a hit + no miss is the only hit).
+    /// Rows with NULL turn_id are excluded entirely (unattributable).
+    #[test]
+    fn test_report_exploration_delta_dedups_turn_and_excludes_null() {
+        let db = db();
+
+        // Turn "t1" emits a hit (100) then a miss (200) → ONE miss turn, 300 tok.
+        db.record_exploration_tokens(
+            "2026-06-15T00:00:01Z",
+            "claude",
+            60,
+            40,
+            Some(MapStatus::Hit),
+            Some("t1"),
+            Some("core"),
+        )
+        .unwrap();
+        db.record_exploration_tokens(
+            "2026-06-15T00:00:02Z",
+            "claude",
+            120,
+            80,
+            Some(MapStatus::Miss),
+            Some("t1"),
+            Some("core"),
+        )
+        .unwrap();
+
+        // Turn "t2" emits only a hit → ONE hit turn, 150 tok.
+        db.record_exploration_tokens(
+            "2026-06-15T00:00:03Z",
+            "claude",
+            100,
+            50,
+            Some(MapStatus::Hit),
+            Some("t2"),
+            Some("auth"),
+        )
+        .unwrap();
+
+        // NULL turn_id row must be ignored (cannot attribute to a turn).
+        db.record_exploration_tokens(
+            "2026-06-15T00:00:04Z",
+            "claude",
+            500,
+            500,
+            Some(MapStatus::Hit),
+            None,
+            Some("db"),
+        )
+        .unwrap();
+
+        let report = db.report_exploration_delta().unwrap();
+        // 2 turns total: t1 (miss), t2 (hit). NULL row excluded.
+        assert_eq!(report.total_turns, 2);
+        assert_eq!(report.map_hit_turns, 1);
+        assert_eq!(report.map_miss_turns, 1);
+        assert!((report.hit_rate - 0.5).abs() < 1e-9);
+        // t2 is the only hit turn → 150 tokens.
+        assert!((report.mean_tokens_map_hit - 150.0).abs() < 1e-9);
+        // t1 is the only miss turn → 100 + 200 = 300 tokens.
+        assert!((report.mean_tokens_map_miss - 300.0).abs() < 1e-9);
+    }
+
+    // ---- Migration 011: map_status / turn_id / area columns on token_usage ----
+
+    #[test]
+    fn test_token_usage_map_status_round_trip() {
+        let db = db();
+        let mut r = sample_token_usage();
+        r.map_status = Some(MapStatus::Hit);
+        r.turn_id = Some("turn-42".into());
+        r.area = Some("src/auth".into());
+        let id = db.insert_token_usage(&r).unwrap();
+
+        let rows = db
+            .query_token_usage(&TokenUsageQuery {
+                task_tag: Some("issue-80".into()),
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].id, id);
+        assert_eq!(rows[0].map_status, Some(MapStatus::Hit));
+        assert_eq!(rows[0].turn_id.as_deref(), Some("turn-42"));
+        assert_eq!(rows[0].area.as_deref(), Some("src/auth"));
+    }
+
+    #[test]
+    fn test_token_usage_map_status_null_default() {
+        let db = db();
+        // sample_token_usage() uses default NewTokenUsage which has map_status=None
+        db.insert_token_usage(&sample_token_usage()).unwrap();
+
+        let rows = db
+            .query_token_usage(&TokenUsageQuery {
+                task_tag: Some("issue-80".into()),
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert!(
+            rows[0].map_status.is_none(),
+            "map_status must default to None"
+        );
+        assert!(rows[0].turn_id.is_none(), "turn_id must default to None");
+        assert!(rows[0].area.is_none(), "area must default to None");
+    }
+
+    #[test]
+    fn test_token_usage_map_status_invalid_rejected() {
+        let db = db();
+        // Insert a valid row first to confirm the table is writable.
+        db.insert_token_usage(&sample_token_usage()).unwrap();
+        // Now try a raw SQL insert with an invalid map_status value.
+        let result = db.conn.execute(
+            "INSERT INTO token_usage (ts, source, harness, input_tokens, output_tokens,
+             cache_creation_input_tokens, cache_read_input_tokens, estimated, chars, map_status)
+             VALUES ('2026-06-15T00:00:00Z','mcp_response','claude',1,1,0,0,0,10,'invalid')",
+            [],
+        );
+        assert!(
+            result.is_err(),
+            "CHECK constraint on map_status must reject 'invalid'"
+        );
     }
 
     #[test]

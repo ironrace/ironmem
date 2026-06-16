@@ -5,7 +5,8 @@
 //! §7-derived `cost` figure is labelled distinctly from the stored
 //! `provider`(-reported) figure. Sections, in order: a per-task **Headline**
 //! list, **Non-completions**, a per-task **by-phase** decomposition, the
-//! **Baseline gate** line, and an **Unpriced models** line.
+//! **Code-map exploration** line, **Baseline gate** line, and an **Unpriced
+//! models** line.
 
 use std::fmt::Write as _;
 
@@ -111,6 +112,17 @@ pub fn render_text(report: &Report) -> String {
         }
     }
 
+    let delta = report.exploration.mean_tokens_map_miss - report.exploration.mean_tokens_map_hit;
+    let _ = writeln!(
+        out,
+        "\nCode-map exploration: {hits}/{total} hit turns ({rate:.1}%) · mean hit {hit:.1} tokens · mean miss {miss:.1} tokens · delta {delta:.1}",
+        hits = report.exploration.map_hit_turns,
+        total = report.exploration.total_turns,
+        rate = report.exploration.hit_rate * 100.0,
+        hit = report.exploration.mean_tokens_map_hit,
+        miss = report.exploration.mean_tokens_map_miss,
+    );
+
     let gate = if report.baseline_ready {
         "READY"
     } else {
@@ -167,6 +179,9 @@ mod tests {
             estimated,
             chars: 0,
             cost_usd: cost,
+            map_status: None,
+            turn_id: None,
+            area: None,
         }
     }
 

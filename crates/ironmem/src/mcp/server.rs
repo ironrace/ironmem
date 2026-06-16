@@ -46,7 +46,12 @@ fn normalize_session_id(value: &str) -> Option<String> {
     }
 }
 
-fn account_response_metrics(app: &App, chars: usize, session_id: Option<&str>) {
+fn account_response_metrics(
+    app: &App,
+    chars: usize,
+    session_id: Option<&str>,
+    exploration: Option<&crate::metrics::ExplorationContext>,
+) {
     if !crate::search::tunables::metrics_enabled() {
         return;
     }
@@ -58,8 +63,65 @@ fn account_response_metrics(app: &App, chars: usize, session_id: Option<&str>) {
             &mcp_harness(app),
             session_id,
             &ctx,
+            exploration,
         );
     });
+}
+
+/// Extract the `turn_id` and `area` arguments from a `code_map_write` or
+/// `code_map_load` tool call request and determine `map_status` from the tool
+/// result. Returns `None` for all other methods and tool names.
+/// `code_map_status` is read-only and lightweight — it does not emit
+/// exploration attribution rows.
+fn request_exploration_context(
+    request: &JsonRpcRequest,
+    tool_result: Option<&serde_json::Value>,
+) -> Option<crate::metrics::ExplorationContext> {
+    if request.method != "tools/call" {
+        return None;
+    }
+    let tool_name = request.params.get("name").and_then(|v| v.as_str())?;
+    if !matches!(tool_name, "code_map_write" | "code_map_load") {
+        return None;
+    }
+    let args = request.params.get("arguments")?;
+    let turn_id = args
+        .get("turn_id")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string());
+    let area = args
+        .get("area")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string());
+
+    // map_status: for code_map_write it is always a miss (writing a new/updated
+    // map). For code_map_load: only a found+fresh map is a hit; stale,
+    // rescout-required, absent, or malformed results are misses.
+    let map_status = if tool_name == "code_map_write" {
+        Some(crate::db::metrics::MapStatus::Miss)
+    } else {
+        tool_result.map(|v| {
+            let found = v.get("found").and_then(|v| v.as_bool()).unwrap_or(false);
+            let fresh = v
+                .get("freshness")
+                .and_then(|f| f.get("verdict"))
+                .and_then(|v| v.as_str())
+                == Some("fresh");
+            if found && fresh {
+                crate::db::metrics::MapStatus::Hit
+            } else {
+                crate::db::metrics::MapStatus::Miss
+            }
+        })
+    };
+
+    Some(crate::metrics::ExplorationContext {
+        turn_id,
+        area,
+        map_status,
+    })
 }
 
 /// Run the MCP server loop, reading JSON-RPC from stdin, writing to stdout.
@@ -87,7 +149,7 @@ where
             Err(e) => {
                 let resp = JsonRpcResponse::error(None, -32700, &format!("Parse error: {e}"));
                 let chars = write_response(&mut stdout, &resp).await?;
-                account_response_metrics(&app, chars, app.session_id_snapshot().as_deref());
+                account_response_metrics(&app, chars, app.session_id_snapshot().as_deref(), None);
                 continue;
             }
         };
@@ -99,7 +161,7 @@ where
                 "Invalid Request: jsonrpc must be '2.0'",
             );
             let chars = write_response(&mut stdout, &resp).await?;
-            account_response_metrics(&app, chars, app.session_id_snapshot().as_deref());
+            account_response_metrics(&app, chars, app.session_id_snapshot().as_deref(), None);
             continue;
         }
 
@@ -109,11 +171,23 @@ where
         let response = tokio::task::block_in_place(|| dispatch(&app, &request));
 
         if let Some(resp) = response {
+            // Extract the tool result JSON (if this is a successful tools/call)
+            // so code-map tools can determine map_hit vs map_miss from `found`.
+            let tool_result_json: Option<serde_json::Value> = resp
+                .result
+                .as_ref()
+                .and_then(|r| r.get("content"))
+                .and_then(|c| c.as_array())
+                .and_then(|arr| arr.first())
+                .and_then(|item| item.get("text"))
+                .and_then(|t| t.as_str())
+                .and_then(|s| serde_json::from_str(s).ok());
+            let exploration = request_exploration_context(&request, tool_result_json.as_ref());
             let chars = write_response(&mut stdout, &resp).await?;
             let sid = app
                 .session_id_snapshot()
                 .or_else(|| request_collab_session_id(&request));
-            account_response_metrics(&app, chars, sid.as_deref());
+            account_response_metrics(&app, chars, sid.as_deref(), exploration.as_ref());
         }
     }
 

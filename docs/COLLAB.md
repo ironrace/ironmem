@@ -1495,6 +1495,102 @@ itself **after** model pinning exists — NOT in the collab protocol
 spec. The collab protocol is intentionally model-agnostic for
 subagent-driven implementation.
 
+## Code-Map MCP Tools (issue #94)
+
+Worker turns use three MCP tools to lazily cache and retrieve per-area code
+maps, reducing redundant file-reading across turns.
+
+### `code_map_write`
+
+Persists a code map for a named area of the repository.
+
+```json
+{
+  "repo": "/absolute/path/to/repo",
+  "area": "src/collab",
+  "head_sha": "a1b2c3d4e5f6...",
+  "source_files": ["src/collab/mod.rs", "src/collab/state.rs"],
+  "summary": "...",
+  "built_by": "scout-worker",
+  "turn_id": "task-3"
+}
+```
+
+**Required fields:** `repo`, `area`, `head_sha`, `source_files` (non-empty),
+`summary`, `built_by`. `turn_id` is optional (used for metrics attribution —
+see below).
+
+**Input validation:**
+- `repo` must be an existing git worktree — an absolute path (no `..`
+  traversal), canonicalized and resolved to its `git rev-parse --show-toplevel`
+  before storage.
+- `head_sha` must be a hex git object name (7–64 hex chars; the HEAD the map was
+  built at). A non-hex value is rejected at write time.
+- Each entry in `source_files` must be repo-relative and forward-slash
+  normalized: no leading `/`, no `..` components, no backslash or NUL; the set
+  must be non-empty.
+
+Returns `{ "success": true, "drawer_id": ..., "wing": <repo>, "room": "code-maps" }`.
+
+### `code_map_load`
+
+Retrieves the stored code map for an area and returns its freshness status.
+
+```json
+{
+  "repo": "/absolute/path/to/repo",
+  "area": "src/collab",
+  "turn_id": "task-3"
+}
+```
+
+The response carries `found` (bool) and a `freshness` object whose `verdict`
+field is one of:
+- `fresh` — the map was built at the current `HEAD`. Use it as a
+  WHERE-to-look pointer; verify load-bearing details against actual source.
+- `stale` — `HEAD` has advanced since the map was built. The `freshness`
+  object includes a `changed_files` list. Re-read only those files, then call
+  `code_map_write` to refresh before proceeding.
+- `rescout_required` — no map exists (or it cannot be verified). Scout the
+  area and call `code_map_write` to create one.
+
+### `code_map_status`
+
+Returns the freshness status and metadata for a stored map without loading
+its full content. Useful for a quick pre-flight check before deciding whether
+to load or re-scout.
+
+```json
+{ "repo": "/absolute/path/to/repo", "area": "src/collab" }
+```
+
+### Lazy first-touch worker flow
+
+```
+code_map_load(repo, area, turn_id)
+  ├─ fresh             → use map as exploration pointer; verify details in code
+  ├─ stale             → re-read changed_files; code_map_write to refresh; proceed
+  └─ rescout_required  → scout area (read files, trace paths); code_map_write; proceed
+     / not found
+```
+
+**Re-verify caveat:** Maps are WHERE-to-look pointers, not authoritative
+documentation. Before relying on any load-bearing detail — function
+signatures, type invariants, call-site counts — re-verify against the actual
+source. Never treat a map entry alone as a contract-level claim.
+
+### Exploration-token attribution
+
+Each `code_map_load` and `code_map_write` call emits a `source='mcp_response'`
+`token_usage` row with `map_status`, `turn_id`, and `area` set. `map_status` is
+`map_hit` **only** when `code_map_load` returns a found map with verdict
+`fresh`; every other case — a `stale` load, a `rescout_required`/absent load,
+and every `code_map_write` — is tagged `map_miss`. `code_map_status` does NOT
+emit an attribution row (it is a metadata-only pre-flight check, not an
+exploration call). `turn_id` is read from the top-level MCP request arguments
+by the server layer, so callers must pass it as a top-level argument. See
+`docs/METRICS_SPEC.md` — Amendment v11 for the full schema and reporting spec.
+
 ## Validation
 
 ```bash

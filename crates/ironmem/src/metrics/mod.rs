@@ -177,21 +177,41 @@ fn find_assistant_usage(value: &serde_json::Value) -> Option<Usage> {
     })
 }
 
-use crate::db::metrics::{NewOccupancySample, NewTokenUsage, SessionSummary};
+use crate::db::metrics::{MapStatus, NewOccupancySample, NewTokenUsage, SessionSummary};
 use crate::db::schema::Database;
+
+/// Exploration-token attribution context for one code-map tool call (Phase 5
+/// / issue #94). Populated by `mcp/server.rs` for `code_map_write` /
+/// `code_map_load` and passed into `account_mcp_response`. `None` for all
+/// other tool calls.
+#[derive(Debug, Clone)]
+pub(crate) struct ExplorationContext {
+    pub turn_id: Option<String>,
+    pub area: Option<String>,
+    /// `MapStatus::Hit` when the caller found a usable cached map;
+    /// `MapStatus::Miss` when no map existed or the tool was `code_map_write`
+    /// (write-back).
+    pub map_status: Option<MapStatus>,
+}
 
 /// Record one MCP response's size (METRICS_SPEC §5.1, Decisions D1/D2/D2b/D6).
 /// Always inserts a diagnostic `token_usage` row; atomically accumulates
 /// `session_summary.mcp_chars_served` (engine-side, race-free across the
 /// MCP-server and hook processes) when a session id is known. Best-effort: all
 /// DB errors are logged, never returned.
+///
+/// When `exploration` is `Some`, the live estimated MCP response row is tagged
+/// with Phase-5 code-map attribution. The token proxy remains the response-size
+/// estimate (`ceil(chars / 4)`), matching METRICS_SPEC's v0 cost model.
 pub(crate) fn account_mcp_response(
     db: &Database,
     chars: i64,
     harness: &str,
     session_id: Option<&str>,
     ctx: &MetricsContext,
+    exploration: Option<&ExplorationContext>,
 ) {
+    let exploration = exploration.filter(|exp| exp.map_status.is_some());
     let row = NewTokenUsage {
         ts: now_rfc3339(),
         source: "mcp_response".to_string(),
@@ -208,6 +228,9 @@ pub(crate) fn account_mcp_response(
         estimated: true,
         chars,
         cost_usd: None,
+        map_status: exploration.and_then(|exp| exp.map_status),
+        turn_id: exploration.and_then(|exp| exp.turn_id.clone()),
+        area: exploration.and_then(|exp| exp.area.clone()),
     }
     .with_context(ctx);
     if let Err(e) = db.insert_token_usage(&row) {
@@ -377,6 +400,9 @@ mod tests {
             estimated: true,
             chars: 8,
             cost_usd: None,
+            map_status: None,
+            turn_id: None,
+            area: None,
         }
         .with_context(&ctx);
         assert_eq!(row.collab_session_id.as_deref(), Some("collab-1"));
@@ -384,6 +410,34 @@ mod tests {
         assert!(row.task_tag.is_none());
         assert_eq!(row.session_id.as_deref(), Some("sess-1")); // untouched
         assert_eq!(row.output_tokens, 2); // untouched
+    }
+
+    #[test]
+    fn account_mcp_response_tags_live_row_for_code_map_exploration() {
+        let db = crate::db::schema::Database::open_in_memory().unwrap();
+        let ctx = MetricsContext::default();
+        let exploration = ExplorationContext {
+            turn_id: Some("turn-1".into()),
+            area: Some("core".into()),
+            map_status: Some(crate::db::metrics::MapStatus::Hit),
+        };
+
+        account_mcp_response(&db, 9, "claude", None, &ctx, Some(&exploration));
+
+        let rows = db
+            .query_token_usage(&crate::db::metrics::TokenUsageQuery::default())
+            .unwrap();
+        assert_eq!(rows.len(), 1, "exploration tags the live row, no duplicate");
+        assert!(rows[0].estimated);
+        assert_eq!(rows[0].chars, 9);
+        assert_eq!(rows[0].output_tokens, 3);
+        assert_eq!(rows[0].map_status, Some(crate::db::metrics::MapStatus::Hit));
+        assert_eq!(rows[0].turn_id.as_deref(), Some("turn-1"));
+        assert_eq!(rows[0].area.as_deref(), Some("core"));
+
+        let report = db.report_exploration_delta().unwrap();
+        assert_eq!(report.total_turns, 1);
+        assert!((report.mean_tokens_map_hit - 3.0).abs() < 1e-9);
     }
 
     fn test_app() -> std::sync::Arc<crate::mcp::app::App> {

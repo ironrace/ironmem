@@ -41,6 +41,9 @@ fn tok(
         estimated,
         chars: 0,
         cost_usd: cost,
+        map_status: None,
+        turn_id: None,
+        area: None,
     }
 }
 
@@ -248,6 +251,8 @@ fn report_golden_json_matches_hand_computed() {
         report.unpriced_models,
         vec!["claude-future-9".to_string(), "codex".to_string()]
     );
+    assert_eq!(report.exploration.total_turns, 0);
+    assert_eq!(report.exploration.hit_rate, 0.0);
 
     // headline ordered by task_key: sess-min, sess-rich
     assert_eq!(report.headline.len(), 2);
@@ -525,6 +530,9 @@ fn headline_cost_attaches_when_tokens_keyed_by_task_tag_not_collab_id() {
         estimated: false,
         chars: 0,
         cost_usd: None,
+        map_status: None,
+        turn_id: None,
+        area: None,
     })
     .unwrap();
 
@@ -825,6 +833,14 @@ const EXPECTED_JSON: &str = r#"{
       "provider_reported_cost_usd": 7.5
     }
   ],
+  "exploration": {
+    "total_turns": 0,
+    "map_hit_turns": 0,
+    "map_miss_turns": 0,
+    "hit_rate": 0.0,
+    "mean_tokens_map_hit": 0.0,
+    "mean_tokens_map_miss": 0.0
+  },
   "unpriced_models": [
     "claude-future-9",
     "codex"

@@ -6,6 +6,7 @@ use super::app::App;
 use crate::config::McpAccessMode;
 use crate::error::MemoryError;
 
+mod code_maps;
 mod collab_caps;
 mod collab_events;
 mod collab_session;
@@ -15,6 +16,7 @@ mod handoff;
 mod kg;
 mod shared;
 
+use code_maps::{handle_code_map_load, handle_code_map_status, handle_code_map_write};
 use collab_caps::{handle_collab_get_caps, handle_collab_register_caps};
 use collab_session::{
     handle_collab_ack, handle_collab_approve, handle_collab_end, handle_collab_recv,
@@ -390,6 +392,52 @@ pub fn tool_definitions(app: &App) -> Vec<Value> {
             }
         }),
         json!({
+            "name": "code_map_write",
+            "description": "Write or refresh a per-area code map. Embeds summary, stores the drawer in room 'code-maps', and records the sidecar row keyed (repo, area). Write-mode only.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "repo": { "type": "string", "description": "Canonical repo path (trailing slash stripped)" },
+                    "area": { "type": "string", "description": "Named sub-area of the repo (e.g. 'core', 'auth')" },
+                    "summary": { "type": "string", "description": "Code-map body to embed and store" },
+                    "head_sha": { "type": "string", "description": "Git SHA at which the map was built" },
+                    "source_files": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "Repo-relative paths of source files this map covers"
+                    },
+                    "built_by": { "type": "string", "description": "Agent or user that built this map" },
+                    "turn_id": { "type": "string", "description": "Optional collab turn ID for metrics attribution" }
+                },
+                "required": ["repo", "area", "summary", "head_sha", "source_files", "built_by"]
+            }
+        }),
+        json!({
+            "name": "code_map_load",
+            "description": "Load a per-area code map and classify its freshness against the current HEAD.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "repo": { "type": "string" },
+                    "area": { "type": "string" },
+                    "turn_id": { "type": "string", "description": "Optional collab turn ID" }
+                },
+                "required": ["repo", "area"]
+            }
+        }),
+        json!({
+            "name": "code_map_status",
+            "description": "Lightweight freshness check for a per-area code map. Returns verdict only, no drawer body.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "repo": { "type": "string" },
+                    "area": { "type": "string" }
+                },
+                "required": ["repo", "area"]
+            }
+        }),
+        json!({
             "name": "session_handoff",
             "description": "Issue (or byte-identically reuse) a one-time handoff token plus a deterministic, model-free session handoff block for an unplanned successor. Sets the pending generation; the successor presents handoff_token on its first mutating collab call to claim it, making this predecessor inert. The token is returned top-level (NOT inside the block) — the successor needs both.",
             "inputSchema": {
@@ -455,6 +503,9 @@ pub fn call_tool(app: &App, name: &str, args: &Value) -> Result<Value, MemoryErr
         "collab_wait_my_turn" => handle_collab_wait_my_turn(app, args),
         "collab_end" => handle_collab_end(app, args),
         "session_handoff" => handle_session_handoff(app, args),
+        "code_map_write" => handle_code_map_write(app, args),
+        "code_map_load" => handle_code_map_load(app, args),
+        "code_map_status" => handle_code_map_status(app, args),
         _ => Err(MemoryError::Permission(format!(
             "Tool '{name}' is not available in the current MCP mode"
         ))),
@@ -496,6 +547,9 @@ fn tool_known(name: &str) -> bool {
             | "collab_wait_my_turn"
             | "collab_end"
             | "session_handoff"
+            | "code_map_write"
+            | "code_map_load"
+            | "code_map_status"
     )
 }
 
@@ -520,6 +574,7 @@ fn tool_allowed_in_mode(mode: McpAccessMode, name: &str) -> bool {
                 | "collab_register_caps"
                 | "collab_end"
                 | "session_handoff"
+                | "code_map_write"
         )
 }
 

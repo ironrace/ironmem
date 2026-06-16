@@ -603,3 +603,19 @@ destination, or reporting query changed.
   default-off in the dogfooding MCP env; measured baseline rows are sourced from the
   controlled, cost-gated A/B runs in issue #97 rather than accrued passively. The §11.5
   baseline gate (`≥10 measured tasks`) is therefore fed by #97, not by routine usage.
+
+### 2026-06-15 — issue #94: v11 exploration-token attribution (additive; no change to §1–§11 token semantics)
+
+**Schema changes (migration 011):**
+- `token_usage` gains three new nullable columns: `map_status TEXT CHECK (map_status IS NULL OR map_status IN ('map_hit','map_miss'))`, `turn_id TEXT`, `area TEXT`.
+- New `code_maps` table: `(repo, area) PRIMARY KEY`, `drawer_id FK→drawers`, `head_sha`, `source_files` (JSON), `built_by`, `built_at`.
+
+**Exploration attribution (Phase 5):**
+- Code-map MCP calls (`code_map_write`, `code_map_load`) emit a `source='mcp_response'` token_usage row with `map_status`, `turn_id`, `area` set. The `source` CHECK is NOT widened: `'mcp_response'` was already an allowed value established by migration 008 (`token_usage.source` enum), so no new source value is introduced. `code_map_status` is a metadata-only pre-flight and emits no attribution row.
+- `map_status='map_hit'`: a `code_map_load` returned a found map with verdict `fresh`. `map_status='map_miss'`: every other case — a `stale` load, a `rescout_required`/absent load, and every `code_map_write` (cold scout / refresh).
+- v0 exploration cost proxy: the code-map MCP call's response-size estimate (chars/4), recorded on the tagged live `mcp_response` row as `output_tokens`. A future phase may replace this proxy with real LLM token costs.
+
+**Phase-5 report (§10 extension):**
+- `report_exploration_delta()` aggregates all `mcp_response` rows with non-NULL `turn_id` and `map_status IN ('map_hit','map_miss')`, one unit per distinct `turn_id`. Rows with NULL `turn_id` are excluded (cannot be attributed to a turn). Each turn gets a single verdict: `map_hit` only when the turn has a hit and no miss, else `map_miss`.
+- Returns `ExplorationReport { total_turns, map_hit_turns, map_miss_turns, hit_rate, mean_tokens_map_hit, mean_tokens_map_miss }`.
+- Gate: the run must contain at least one `map_hit` turn and one `map_miss` turn for the delta to be meaningful (a per-run heuristic, not a per-task requirement).

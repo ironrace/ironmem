@@ -18,6 +18,7 @@ const METRICS_SQL: &str = include_str!("../../migrations/008_metrics.sql");
 const COLLAB_PLAN_DRAWERS_SQL: &str = include_str!("../../migrations/009_collab_plan_drawers.sql");
 const COLLAB_GENERATION_LEASE_SQL: &str =
     include_str!("../../migrations/010_collab_generation_lease.sql");
+const CODE_MAPS_SQL: &str = include_str!("../../migrations/011_code_maps.sql");
 
 /// Database wrapper around a SQLite connection.
 ///
@@ -189,6 +190,12 @@ impl Database {
         // v10: per-actor generation lease table for session_handoff (issue #91).
         if current_version < 10 {
             self.conn.execute_batch(COLLAB_GENERATION_LEASE_SQL)?;
+        }
+
+        // v11: lazy per-area code maps (issue #94) — code_maps sidecar table +
+        // token_usage exploration-attribution columns (map_status, turn_id, area).
+        if current_version < 11 {
+            self.conn.execute_batch(CODE_MAPS_SQL)?;
         }
 
         Ok(())
@@ -527,7 +534,7 @@ mod tests {
     #[test]
     fn test_fresh_migrate_reaches_head_with_all_tables() {
         let db = Database::open_in_memory().unwrap();
-        assert_eq!(schema_version_of(&db), 10);
+        assert_eq!(schema_version_of(&db), 11);
         for t in METRICS_TABLES {
             assert!(table_exists(&db, t), "missing table {t}");
         }
@@ -545,7 +552,7 @@ mod tests {
             assert!(!table_exists(&db, t), "table {t} should not exist at v7");
         }
         db.migrate().unwrap();
-        assert_eq!(schema_version_of(&db), 10);
+        assert_eq!(schema_version_of(&db), 11);
         for t in METRICS_TABLES {
             assert!(table_exists(&db, t), "missing table {t} after upgrade");
         }
@@ -556,7 +563,7 @@ mod tests {
         let db = Database::open_in_memory().unwrap();
         db.migrate().unwrap();
         db.migrate().unwrap();
-        assert_eq!(schema_version_of(&db), 10);
+        assert_eq!(schema_version_of(&db), 11);
     }
 
     // ---- Migration 009 (plan-by-reference drawer-id columns) coverage ----
@@ -566,7 +573,7 @@ mod tests {
     #[test]
     fn test_fresh_migrate_reaches_v9_with_plan_drawer_columns() {
         let db = Database::open_in_memory().unwrap();
-        assert_eq!(schema_version_of(&db), 10);
+        assert_eq!(schema_version_of(&db), 11);
         for c in PLAN_DRAWER_COLUMNS {
             assert!(
                 column_exists(&db, "collab_sessions", c),
@@ -586,7 +593,7 @@ mod tests {
             );
         }
         db.migrate().unwrap();
-        assert_eq!(schema_version_of(&db), 10);
+        assert_eq!(schema_version_of(&db), 11);
         for c in PLAN_DRAWER_COLUMNS {
             assert!(
                 column_exists(&db, "collab_sessions", c),
@@ -603,6 +610,14 @@ mod tests {
         db
     }
 
+    /// Build a connection migrated to exactly v10 (no code_maps table yet) by
+    /// replaying migrations 001-010 directly from the module consts.
+    fn open_at_v10() -> Database {
+        let db = open_at_v9();
+        db.conn.execute_batch(COLLAB_GENERATION_LEASE_SQL).unwrap();
+        db
+    }
+
     #[test]
     fn test_v9_to_v10_upgrade_adds_lease_table() {
         let db = open_at_v9();
@@ -612,7 +627,7 @@ mod tests {
             "lease table should not exist at v9"
         );
         db.migrate().unwrap();
-        assert_eq!(schema_version_of(&db), 10);
+        assert_eq!(schema_version_of(&db), 11);
         assert!(
             table_exists(&db, "collab_actor_generations"),
             "missing collab_actor_generations after upgrade"
@@ -672,5 +687,86 @@ mod tests {
         // migrations). A genuinely broken/locked DB must surface an error.
         let conn = rusqlite::Connection::open_in_memory().unwrap();
         assert!(super::read_schema_version(&conn).is_err());
+    }
+
+    // ---- Migration 011 (code_maps table + token_usage exploration columns) ----
+
+    #[test]
+    fn test_fresh_migrate_reaches_v11() {
+        let db = Database::open_in_memory().unwrap();
+        assert_eq!(schema_version_of(&db), 11);
+        assert!(table_exists(&db, "code_maps"), "code_maps table must exist");
+    }
+
+    const TOKEN_USAGE_V11_COLUMNS: [&str; 3] = ["map_status", "turn_id", "area"];
+
+    #[test]
+    fn test_v10_to_v11_upgrade_adds_code_maps() {
+        let db = open_at_v10();
+        assert_eq!(schema_version_of(&db), 10);
+        assert!(
+            !table_exists(&db, "code_maps"),
+            "code_maps should not exist at v10"
+        );
+        for c in TOKEN_USAGE_V11_COLUMNS {
+            assert!(
+                !column_exists(&db, "token_usage", c),
+                "token_usage.{c} should not exist at v10"
+            );
+        }
+        db.migrate().unwrap();
+        assert_eq!(schema_version_of(&db), 11);
+        assert!(
+            table_exists(&db, "code_maps"),
+            "code_maps must exist after upgrade to v11"
+        );
+        for c in TOKEN_USAGE_V11_COLUMNS {
+            assert!(
+                column_exists(&db, "token_usage", c),
+                "token_usage.{c} must exist after upgrade to v11"
+            );
+        }
+    }
+
+    #[test]
+    fn test_v10_to_v11_preserves_existing_token_usage_rows_as_null() {
+        let db = open_at_v10();
+        // Insert a token_usage row at v10 (before the exploration columns exist).
+        db.conn
+            .execute(
+                "INSERT INTO token_usage
+                    (ts, source, harness, input_tokens, output_tokens,
+                     cache_creation_input_tokens, cache_read_input_tokens,
+                     estimated, chars)
+                 VALUES ('2026-06-15T00:00:00Z', 'mcp_response', 'claude',
+                         0, 0, 0, 0, 1, 0)",
+                [],
+            )
+            .unwrap();
+
+        db.migrate().unwrap();
+        assert_eq!(schema_version_of(&db), 11);
+
+        // The pre-existing row must read back with the three new columns NULL.
+        let (map_status, turn_id, area): (Option<String>, Option<String>, Option<String>) = db
+            .conn
+            .query_row(
+                "SELECT map_status, turn_id, area FROM token_usage
+                 WHERE ts = '2026-06-15T00:00:00Z'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert!(map_status.is_none(), "map_status must back-fill as NULL");
+        assert!(turn_id.is_none(), "turn_id must back-fill as NULL");
+        assert!(area.is_none(), "area must back-fill as NULL");
+    }
+
+    #[test]
+    fn test_migrate_twice_idempotent_v11() {
+        let db = Database::open_in_memory().unwrap();
+        db.migrate().unwrap();
+        db.migrate().unwrap();
+        assert_eq!(schema_version_of(&db), 11);
     }
 }
