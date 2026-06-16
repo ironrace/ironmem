@@ -20,3 +20,12 @@ pub const APPROVAL_FILE_SENTINEL: &str = "I approve paid A/B runs";
 /// the §11.1 "genuine backlog, not synthetic" corpus requirement (README
 /// invariant 4).
 pub const SOURCE_PREFIXES: [&str; 3] = ["issue:", "pr:", "backlog:"];
+
+/// Outcome string values, centralized so the mint site (executor) and the decode
+/// sites (runner orchestration, report aggregation) cannot drift independently.
+/// A typo would otherwise compile and silently make rows non-headline-eligible.
+/// `COMPLETED`/`FAILED` are agent-level (process exit + envelope); `MERGED` is
+/// the §12 done-proxy (agent-completed AND gates-green).
+pub const OUTCOME_COMPLETED: &str = "completed";
+pub const OUTCOME_FAILED: &str = "failed";
+pub const OUTCOME_MERGED: &str = "merged";

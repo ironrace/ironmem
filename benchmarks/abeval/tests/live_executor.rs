@@ -457,3 +457,37 @@ fn shell_gate_runner_fails_when_a_gate_fails() {
     t.gates = vec!["true".to_string(), "false".to_string()];
     assert!(!g.gates_pass(&t, ws.path()).unwrap());
 }
+
+// --- Review fixes (issue #122 review round) ---
+
+const ZERO_USAGE_JSON: &str = r#"{"is_error":false,"result":"done",
+    "usage":{"input_tokens":0,"output_tokens":0,
+             "cache_creation_input_tokens":0,"cache_read_input_tokens":0}}"#;
+
+/// A success envelope reporting ZERO total tokens is not physically plausible —
+/// it means the usage block was absent/renamed. Recording it as a merged
+/// zero-token row would silently deflate the headline cost metric, so it must be
+/// a loud error, not a silent measurement.
+#[test]
+fn live_executor_zero_usage_on_success_is_loud_error() {
+    let (runner, _c) = fake(ZERO_USAGE_JSON, true);
+    let ws = tempfile::tempdir().unwrap();
+    let exec = LiveExecutor::new(runner, ws.path().to_path_buf());
+    let err = exec.execute(&task(), Arm::Ironmem).unwrap_err();
+    assert!(
+        err.to_string().to_lowercase().contains("usage")
+            || err.to_string().to_lowercase().contains("zero-token"),
+        "zero-usage success must be loud, got: {err}"
+    );
+}
+
+/// Zero usage on a FAILED run is fine (a crashed agent may have spent nothing
+/// parseable) — it records a "failed" row, never an error.
+#[test]
+fn live_executor_zero_usage_on_failure_is_recorded_failed() {
+    let (runner, _c) = fake(ZERO_USAGE_JSON, false);
+    let ws = tempfile::tempdir().unwrap();
+    let exec = LiveExecutor::new(runner, ws.path().to_path_buf());
+    let o = exec.execute(&task(), Arm::Ironmem).unwrap();
+    assert_eq!(o.outcome, "failed");
+}

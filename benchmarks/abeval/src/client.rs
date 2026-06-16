@@ -228,10 +228,25 @@ impl<R: CommandRunner> ArmExecutor for LiveExecutor<R> {
 
         // A non-zero exit OR an is_error envelope is a non-completion; tokens
         // spent are still recorded so a failed arm is never a silent zero row.
-        let outcome = if output.success && !parsed.is_error {
-            "completed"
+        let completed = output.success && !parsed.is_error;
+
+        // A *successful* run reporting zero total tokens is not physically
+        // plausible — it means the CLI `usage` block was absent/renamed (schema
+        // drift). Recording it as a merged zero-token row would silently deflate
+        // the headline cost metric, so fail loudly rather than measure nothing.
+        if completed && parsed.usage.total() == 0 {
+            anyhow::bail!(
+                "claude reported success for task {} arm {} but the usage block was \
+                 absent or zero — refusing to record a zero-token measurement row",
+                task.id,
+                arm.label()
+            );
+        }
+
+        let outcome = if completed {
+            crate::constants::OUTCOME_COMPLETED
         } else {
-            "failed"
+            crate::constants::OUTCOME_FAILED
         };
 
         Ok(ArmOutcome {

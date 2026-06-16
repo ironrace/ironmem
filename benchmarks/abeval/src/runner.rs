@@ -47,23 +47,25 @@ struct RunMeta<'a> {
 /// Run one task across the requested arms.
 ///
 /// Dry-run (default) uses `DryRunExecutor` — no network, no model, no spawn.
-/// The live path is fail-closed in `run_task_live_guarded`, which refuses
-/// before any executor is constructed.
+/// The live path is approval-gated in `run_task_live_guarded`: it refuses before
+/// constructing any executor unless BOTH `--execute-live` and cost approval are
+/// present; only an approved run spawns.
 pub fn run_task(args: RunArgs) -> Result<RunSummary> {
-    // Live path is fully handled by the fail-closed guard.
-    if args.execute_live && !args.dry_run {
-        return run_task_live_guarded(args);
-    }
-
     // Defense-in-depth: the CLI path always validates the corpus first, but a
     // hand-built `RunArgs` could carry an unsafe id. Reject anything that is not
     // basename-safe BEFORE it is joined into an on-disk path (no `..`/separator
-    // traversal out of `out_dir`).
+    // traversal out of `out_dir`). Checked ahead of BOTH branches so the dry-run
+    // and live paths share the guard symmetrically.
     if !crate::corpus::is_safe_task_id(&args.task.id) {
         anyhow::bail!(
             "unsafe task id {:?}: use ASCII letters, digits, '-' or '_' only",
             args.task.id
         );
+    }
+
+    // Live path is fully handled by the approval-gated guard.
+    if args.execute_live && !args.dry_run {
+        return run_task_live_guarded(args);
     }
 
     let executor = DryRunExecutor;
@@ -159,6 +161,8 @@ pub struct ShellGateRunner;
 
 impl GateRunner for ShellGateRunner {
     fn gates_pass(&self, task: &Task, workspace: &Path) -> Result<bool> {
+        // `task.gates` are trusted, frozen-corpus command strings (not untrusted
+        // input); they are run via `sh -c` in the agent-produced workspace.
         for gate in &task.gates {
             let status = std::process::Command::new("sh")
                 .arg("-c")
@@ -167,6 +171,17 @@ impl GateRunner for ShellGateRunner {
                 .status()
                 .with_context(|| format!("running gate {gate:?} in {}", workspace.display()))?;
             if !status.success() {
+                // Log the exit code so an environment failure (e.g. exit 127 —
+                // the gate tool is missing) is visible rather than silently
+                // indistinguishable from a genuine red gate.
+                let code = status
+                    .code()
+                    .map(|c| c.to_string())
+                    .unwrap_or_else(|| "signal".to_string());
+                eprintln!(
+                    "gate failed: {gate:?} exited {code} in {}",
+                    workspace.display()
+                );
                 return Ok(false);
             }
         }
@@ -187,7 +202,7 @@ pub fn run_task_live<R: CommandRunner, G: GateRunner>(
     let mut metrics = Vec::with_capacity(arms.len());
     for &arm in arms {
         let outcome = executor.execute(task, arm)?;
-        let ci_green = if outcome.outcome == "completed" {
+        let ci_green = if outcome.outcome == crate::constants::OUTCOME_COMPLETED {
             let workspace = executor.workspace_for(task, arm);
             gates.gates_pass(task, &workspace)?
         } else {
@@ -229,7 +244,7 @@ pub fn guard_live_then_run<E: ArmExecutor>(
     approved: bool,
     executor: &E,
     _out_dir: &Path,
-) -> Result<RunSummary> {
+) -> Result<Vec<ArmOutcome>> {
     if !approved {
         anyhow::bail!(
             "live execution requires both --execute-live AND approval via {} \
@@ -238,16 +253,13 @@ pub fn guard_live_then_run<E: ArmExecutor>(
             crate::constants::APPROVAL_FILE_SENTINEL
         );
     }
-    // Approved: release to the generic executor, one execution per arm. The
-    // metrics-writing live entry is `run_task_live_guarded`; this lower-level
-    // guard is the release point unit-tested for the not-approved invariant.
-    for &arm in arms {
-        executor.execute(task, arm)?;
-    }
-    Ok(RunSummary {
-        task_id: task.id.clone(),
-        arms_run: arms.len(),
-    })
+    // Approved: release to the generic executor, one execution per arm, and
+    // SURFACE every arm outcome (a failed arm must not be hidden behind a success
+    // count). The metrics-writing live entry is `run_task_live_guarded`; this
+    // lower-level guard is the release point unit-tested for the guard invariant.
+    arms.iter()
+        .map(|&arm| executor.execute(task, arm))
+        .collect()
 }
 
 /// Live entry from `run_task`: build no executor until the guard passes.
@@ -261,6 +273,18 @@ pub fn run_task_live_guarded(args: RunArgs) -> Result<RunSummary> {
             crate::constants::APPROVAL_FILE_SENTINEL
         );
     }
+    // A paid run must carry an explicit cost ceiling: refuse rather than let the
+    // documented `--budget-usd` crash-guard be silently absent. (Enforcing the
+    // ceiling against per-arm token-derived spend needs the ironmem §7.1 rate
+    // table and is tracked as a follow-up; this guarantees the ceiling is at
+    // least always present and recorded.)
+    if args.budget_usd.is_none() {
+        anyhow::bail!(
+            "an approved live run requires --budget-usd <amount> as a cost ceiling; \
+             refusing to spawn without one"
+        );
+    }
+
     // Approved: build the REAL `claude`-spawning runner + shell gate runner and
     // run the task. Arm workspaces live under `<out_dir>/workspaces/...`; the
     // normalized live metrics file is written to `<out_dir>/<task_id>/`.

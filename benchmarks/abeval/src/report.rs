@@ -51,7 +51,7 @@ impl TaskMetric {
     /// §2.2 a task counts toward the headline only when merged AND CI-green.
     /// §2.1 headline token totals use measured rows only, never estimates.
     pub fn is_done(&self) -> bool {
-        !self.estimated && self.outcome == "merged" && self.ci_green
+        !self.estimated && self.outcome == crate::constants::OUTCOME_MERGED && self.ci_green
     }
 }
 
@@ -77,10 +77,10 @@ pub fn build_arm_metric(
     arm_outcome: &crate::client::ArmOutcome,
     ci_green: bool,
 ) -> TaskMetric {
-    let completed = arm_outcome.outcome == "completed";
+    let completed = arm_outcome.outcome == crate::constants::OUTCOME_COMPLETED;
     let green = completed && ci_green;
     let outcome = if green {
-        "merged".to_string()
+        crate::constants::OUTCOME_MERGED.to_string()
     } else {
         // Preserve the measured agent-level outcome ("completed"/"failed");
         // either way it is not headline-eligible without a green gate.
