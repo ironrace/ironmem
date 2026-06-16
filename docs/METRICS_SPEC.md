@@ -619,3 +619,43 @@ destination, or reporting query changed.
 - `report_exploration_delta()` aggregates all `mcp_response` rows with non-NULL `turn_id` and `map_status IN ('map_hit','map_miss')`, one unit per distinct `turn_id`. Rows with NULL `turn_id` are excluded (cannot be attributed to a turn). Each turn gets a single verdict: `map_hit` only when the turn has a hit and no miss, else `map_miss`.
 - Returns `ExplorationReport { total_turns, map_hit_turns, map_miss_turns, hit_rate, mean_tokens_map_hit, mean_tokens_map_miss }`.
 - Gate: the run must contain at least one `map_hit` turn and one `map_miss` turn for the delta to be meaningful (a per-run heuristic, not a per-task requirement).
+
+### 2026-06-16 — issue #122 (PR 21): abeval live executor + "done" proxy (clarifies §11.2/§2.2; no token-semantics change)
+
+Implements the live execution path the abeval harness (#97/#121) intentionally
+shipped inert. No counter name, unit, source, or aggregation in §1–§11 changed;
+this records how the §11 A/B protocol is operationalized by the runner.
+
+1. **"done" proxy for abeval evidence (clarifies §2.2 merged + CI-green).** The
+   corpus re-solves already-merged backlog items, so literal merge-to-`main` for
+   every arm is impractical and would pollute history. For abeval live evidence,
+   a row is `outcome:"merged", ci_green:true` **iff** (a) the arm's agent process
+   completed without error (CLI envelope `is_error:false` and zero exit) **AND**
+   (b) the task's frozen `gates` (`cargo test --workspace` + `cargo clippy …
+   -D warnings`) pass in the produced workspace. Both are **measured** facts
+   (process + gate exit codes), never a self-assertion by the agent under test;
+   live rows are always `estimated:false`. This proxy is reported openly in the
+   §1.1 written results — "done" for abeval means *agent-completed + gates-green
+   in an isolated workspace*, distinct from production `collab_end` operator
+   attestation (§12 2026-06-12). A failed agent or a red gate is not
+   headline-eligible.
+
+2. **Token capture (clarifies §2.1 source for the A/B run).** `tokens_to_done`
+   (the four §2.1 components) is read from the driving `claude` CLI's
+   `--output-format json` `usage` block, per arm. ironmem-arm internal Haiku
+   `llm_rerank`/`pref_extract` rows remain separately captured in `token_usage`
+   and are what the §11.5 baseline gate / issues #95/#96 consume.
+
+3. **Arm isolation.** Each task×arm runs in its own workspace
+   (`<out>/workspaces/<task_id>/<arm>`); `main` is never mutated by a run.
+
+4. **Approval unchanged.** A real `claude` spawn is still reached only with BOTH
+   `--execute-live` AND the cost-approval opt-in; the not-approved path errors
+   before constructing or spawning anything. No paid/real run is performed by the
+   #122 PR itself — the executor is verified entirely with injected fakes and
+   harmless coreutils (`printf`/`true`/`false`).
+
+5. **Deferred (carried forward).** `review_rounds`/`fix_commits` (§11.4
+   rework_loops) are written as `0` by the live writer in this PR; precise
+   derivation (ironmem `task_outcomes` for the ironmem arm, git history for the
+   superpowers arm) is a follow-up before the headline rework delta is claimed.
