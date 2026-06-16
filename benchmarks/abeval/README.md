@@ -15,7 +15,7 @@ Each task object has:
 
 | Field | Type | Description |
 |-------|------|-------------|
-| `id` | string | Unique stable identifier, e.g. `abeval-01-slug` |
+| `id` | string | Unique stable basename-safe slug, e.g. `abeval-01-slug` |
 | `title` | string | Human-readable title |
 | `source` | string | Real reference: `issue:#NN`, `pr:#NN`, or `backlog:<ref>` |
 | `repo_scope` | string[] | Path globs for the relevant area |
@@ -26,7 +26,7 @@ Each task object has:
 
 **Invariants** enforced by `abeval validate`:
 1. 8 ≤ count ≤ 12 (§11.1)
-2. IDs are unique and non-empty
+2. IDs are unique, non-empty, and use only ASCII letters, digits, `-`, or `_`
 3. Every task has ≥1 acceptance criterion AND ≥1 gate
 4. `source` starts with `issue:`, `pr:`, or `backlog:` (real-reference shape only)
 
@@ -88,7 +88,8 @@ Key fields in `run_meta.json`:
 Live execution requires BOTH:
 1. The explicit `--execute-live` flag
 2. A cost-approval opt-in: set env var `ABEVAL_PAID_RUN_APPROVED=yes`
-   (or an approval file stating the user approved paid A/B runs)
+   or pass `--approval-file <path>` where the file contains:
+   `I approve paid A/B runs`
 
 If `--execute-live` is set without the approval opt-in, the runner returns a clear
 error **before constructing or spawning any process**. The guard is checked before any
@@ -101,7 +102,7 @@ user cost approval first.
 
 ## superpowers arm isolation (C1)
 
-The `superpowers` arm working context is strictly isolated from ironmem server-side state:
+The `superpowers` arm working context must be isolated from ironmem server-side state:
 
 - **NO** `/collab` command or planning session
 - **NO** semantic search (ironmem `search` tool)
@@ -109,10 +110,11 @@ The `superpowers` arm working context is strictly isolated from ironmem server-s
 - **NO** drawer reads/writes
 - **NO** other ironmem server-side memory state in the working context
 
-Any task_tag or reporting instrumentation (needed to attribute token rows in the ironmem
-DB) is **measurement-only** and kept strictly separate from the arm's working context.
-The `superpowers` arm executes with superpowers skills alone — no ironmem memory state
-influences its decisions.
+The inert `LiveExecutor` command template includes these prohibitions in the task prompt.
+Any future live runner must also launch the arm in a harness configuration that omits
+ironmem MCP/memory access. Task_tag or reporting instrumentation (needed to attribute
+token rows in the ironmem DB) is **measurement-only** and kept strictly separate from
+the arm's working context.
 
 This separation is required by METRICS_SPEC §11.2 and the C1 clarification from the
 Codex review of the canonical plan.

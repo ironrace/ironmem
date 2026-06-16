@@ -13,5 +13,8 @@ pub const DEFAULT_CORPUS_PATH: &str = "corpus/tasks.jsonl";
 /// Env var that, when set to a truthy approval string, opts in to paid runs.
 pub const APPROVAL_ENV: &str = "ABEVAL_PAID_RUN_APPROVED";
 
+/// Exact text required in an approval file before a paid live run can proceed.
+pub const APPROVAL_FILE_SENTINEL: &str = "I approve paid A/B runs";
+
 /// Allowed `source` reference prefixes (§2.2 invariant 4).
 pub const SOURCE_PREFIXES: [&str; 3] = ["issue:", "pr:", "backlog:"];

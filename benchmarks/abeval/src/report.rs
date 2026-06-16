@@ -1,7 +1,7 @@
 //! Parse run artifacts / normalized metrics; compute the §11.3 trio
 //! (tokens-to-done, rework_loops, merged-rate) and enforce the headline gate.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
 use anyhow::{Context, Result};
@@ -17,6 +17,9 @@ pub struct TaskMetric {
     pub outcome: String,
     #[serde(default)]
     pub ci_green: bool,
+    /// Estimated rows are visible but never eligible for headline deltas.
+    #[serde(default)]
+    pub estimated: bool,
     #[serde(default)]
     pub input_tokens: u32,
     #[serde(default)]
@@ -46,8 +49,9 @@ impl TaskMetric {
     }
 
     /// §2.2 a task counts toward the headline only when merged AND CI-green.
+    /// §2.1 headline token totals use measured rows only, never estimates.
     pub fn is_done(&self) -> bool {
-        self.outcome == "merged" && self.ci_green
+        !self.estimated && self.outcome == "merged" && self.ci_green
     }
 }
 
@@ -104,6 +108,7 @@ pub fn metrics_from_run_dir(run: impl AsRef<Path>) -> Result<MetricsInput> {
                 task_key: format!("{task_id}:{arm}"),
                 outcome: "completed".to_string(),
                 ci_green: false, // smoke never counts toward the gate
+                estimated: false,
                 input_tokens: usage.input_tokens,
                 output_tokens: usage.output_tokens,
                 cache_creation_input_tokens: usage.cache_creation_input_tokens,
@@ -123,7 +128,10 @@ struct ArmAgg {
     completed: Vec<u64>, // tokens-to-done for merged+green tasks
     rework: Vec<u64>,
     attempted: usize,
+    attempted_tokens: u64,
     merged: usize,
+    seen_task_keys: BTreeSet<String>,
+    duplicates_ignored: usize,
 }
 
 fn aggregate(input: &MetricsInput) -> BTreeMap<String, ArmAgg> {
@@ -133,9 +141,17 @@ fn aggregate(input: &MetricsInput) -> BTreeMap<String, ArmAgg> {
             completed: Vec::new(),
             rework: Vec::new(),
             attempted: 0,
+            attempted_tokens: 0,
             merged: 0,
+            seen_task_keys: BTreeSet::new(),
+            duplicates_ignored: 0,
         });
+        if !agg.seen_task_keys.insert(t.task_key.clone()) {
+            agg.duplicates_ignored += 1;
+            continue;
+        }
         agg.attempted += 1;
+        agg.attempted_tokens = agg.attempted_tokens.saturating_add(t.tokens_to_done());
         if t.is_done() {
             agg.merged += 1;
             agg.completed.push(t.tokens_to_done());
@@ -167,10 +183,16 @@ pub fn render_report(input: &MetricsInput) -> String {
 
     // Per-arm visible numbers (always shown, even for smoke/failed).
     for (arm, agg) in &by_arm {
+        let duplicate_note = if agg.duplicates_ignored > 0 {
+            format!(" duplicates_ignored={}", agg.duplicates_ignored)
+        } else {
+            String::new()
+        };
         out.push_str(&format!(
-            "arm {arm}: attempted={} merged={} completed={} \
-             mean_tokens={:.1} mean_rework={:.1}\n",
+            "arm {arm}: attempted={} attempted_tokens={} merged={} completed={} \
+             mean_tokens={:.1} mean_rework={:.1}{duplicate_note}\n",
             agg.attempted,
+            agg.attempted_tokens,
             agg.merged,
             agg.completed.len(),
             mean(&agg.completed),
@@ -179,10 +201,11 @@ pub fn render_report(input: &MetricsInput) -> String {
     }
 
     let is_live = input.evidence_class == "live";
-    let enough = !by_arm.is_empty()
-        && by_arm
-            .values()
-            .all(|a| a.completed.len() >= MIN_TASKS_PER_ARM);
+    let enough = ["ironmem", "superpowers"].iter().all(|arm| {
+        by_arm
+            .get(*arm)
+            .is_some_and(|a| a.completed.len() >= MIN_TASKS_PER_ARM)
+    });
 
     if !is_live {
         out.push_str("SMOKE — non-headline: no cross-arm delta is claimed.\n");
@@ -191,7 +214,7 @@ pub fn render_report(input: &MetricsInput) -> String {
     if !enough {
         out.push_str(&format!(
             "non-headline: each arm needs >= {MIN_TASKS_PER_ARM} merged+CI-green \
-             tasks before any delta is reported.\n"
+             measured tasks for both ironmem and superpowers before any delta is reported.\n"
         ));
         return out;
     }

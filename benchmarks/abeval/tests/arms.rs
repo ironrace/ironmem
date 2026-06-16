@@ -8,9 +8,15 @@ fn labels_are_exact() {
 
 #[test]
 fn both_selector_yields_both_arms() {
-    assert_eq!(parse_arms_selector("both").unwrap(), vec![Arm::Ironmem, Arm::Superpowers]);
+    assert_eq!(
+        parse_arms_selector("both").unwrap(),
+        vec![Arm::Ironmem, Arm::Superpowers]
+    );
     assert_eq!(parse_arms_selector("ironmem").unwrap(), vec![Arm::Ironmem]);
-    assert_eq!(parse_arms_selector("superpowers").unwrap(), vec![Arm::Superpowers]);
+    assert_eq!(
+        parse_arms_selector("superpowers").unwrap(),
+        vec![Arm::Superpowers]
+    );
     assert!(parse_arms_selector("bogus").is_err());
 }
 

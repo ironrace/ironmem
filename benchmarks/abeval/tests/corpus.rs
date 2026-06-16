@@ -1,4 +1,5 @@
 use abeval::corpus::{content_hash, load_corpus, validate_corpus, Task};
+use std::process::Command;
 
 fn sample_task(id: &str) -> Task {
     Task {
@@ -14,7 +15,9 @@ fn sample_task(id: &str) -> Task {
 }
 
 fn tasks(n: usize) -> Vec<Task> {
-    (0..n).map(|i| sample_task(&format!("abeval-{i:02}-x"))).collect()
+    (0..n)
+        .map(|i| sample_task(&format!("abeval-{i:02}-x")))
+        .collect()
 }
 
 #[test]
@@ -41,6 +44,24 @@ fn rejects_empty_id() {
     let mut t = tasks(8);
     t[0].id = String::new();
     assert!(validate_corpus(&t).is_err());
+}
+
+#[test]
+fn rejects_path_unsafe_ids() {
+    for id in [
+        "../escape",
+        "/tmp/escape",
+        "nested/path",
+        "C:\\escape",
+        "has space",
+    ] {
+        let mut t = tasks(8);
+        t[0].id = id.to_string();
+        assert!(
+            validate_corpus(&t).is_err(),
+            "expected unsafe id {id:?} to be rejected"
+        );
+    }
 }
 
 #[test]
@@ -72,4 +93,26 @@ fn committed_corpus_validates() {
     let t = load_corpus("corpus/tasks.jsonl").expect("load committed corpus");
     validate_corpus(&t).expect("committed corpus must validate");
     assert!(!content_hash(&t).is_empty());
+}
+
+#[test]
+fn validate_default_corpus_works_from_repo_root() {
+    let repo_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(|p| p.parent())
+        .expect("crate lives under benchmarks/abeval");
+    let output = Command::new(env!("CARGO_BIN_EXE_abeval"))
+        .arg("validate")
+        .current_dir(repo_root)
+        .output()
+        .expect("run abeval validate");
+
+    assert!(
+        output.status.success(),
+        "validate failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("content_hash:"));
 }

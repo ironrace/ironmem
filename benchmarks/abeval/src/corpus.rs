@@ -1,6 +1,6 @@
 //! Corpus schema, deterministic load + validation, canonical content hash.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, bail, Context, Result};
 use serde::{Deserialize, Serialize};
@@ -10,6 +10,7 @@ use crate::constants::{CORPUS_MAX, CORPUS_MIN, SOURCE_PREFIXES};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Task {
+    /// Basename-safe stable identifier: ASCII alphanumeric, `-`, or `_`.
     pub id: String,
     pub title: String,
     /// Real-reference form: `issue:#NN`, `pr:#NN`, or `backlog:<ref>`.
@@ -24,8 +25,8 @@ pub struct Task {
 
 /// Load tasks from a JSONL file (one Task object per non-blank line).
 pub fn load_corpus(path: impl AsRef<Path>) -> Result<Vec<Task>> {
-    let path = path.as_ref();
-    let body = std::fs::read_to_string(path)
+    let path = resolve_corpus_path(path.as_ref());
+    let body = std::fs::read_to_string(&path)
         .with_context(|| format!("reading corpus {}", path.display()))?;
     let mut tasks = Vec::new();
     for (i, line) in body.lines().enumerate() {
@@ -33,11 +34,22 @@ pub fn load_corpus(path: impl AsRef<Path>) -> Result<Vec<Task>> {
         if line.is_empty() {
             continue;
         }
-        let task: Task = serde_json::from_str(line)
-            .with_context(|| format!("parsing corpus line {}", i + 1))?;
+        let task: Task =
+            serde_json::from_str(line).with_context(|| format!("parsing corpus line {}", i + 1))?;
         tasks.push(task);
     }
     Ok(tasks)
+}
+
+fn resolve_corpus_path(path: &Path) -> PathBuf {
+    if path.is_absolute() || path.exists() {
+        return path.to_path_buf();
+    }
+    let crate_relative = Path::new(env!("CARGO_MANIFEST_DIR")).join(path);
+    if crate_relative.exists() {
+        return crate_relative;
+    }
+    path.to_path_buf()
 }
 
 /// Enforce the §11.1 / §2.2 invariants. Returns Err on the first breach.
@@ -52,6 +64,12 @@ pub fn validate_corpus(tasks: &[Task]) -> Result<()> {
     for t in tasks {
         if t.id.trim().is_empty() {
             bail!("task has empty id");
+        }
+        if !is_safe_task_id(&t.id) {
+            bail!(
+                "task {} has unsafe id (use ASCII letters, digits, '-' or '_')",
+                t.id
+            );
         }
         if !seen.insert(t.id.as_str()) {
             bail!("duplicate task id: {}", t.id);
@@ -72,6 +90,11 @@ pub fn validate_corpus(tasks: &[Task]) -> Result<()> {
         }
     }
     Ok(())
+}
+
+fn is_safe_task_id(id: &str) -> bool {
+    id.bytes()
+        .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
 }
 
 /// Deterministic content hash over the canonicalized corpus.

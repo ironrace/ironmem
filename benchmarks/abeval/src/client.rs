@@ -8,6 +8,11 @@ use serde::{Deserialize, Serialize};
 use crate::arms::Arm;
 use crate::corpus::Task;
 
+const SUPERPOWERS_PROMPT_PREFIX: &str = "Run this task with superpowers skills only. \
+Do not use /collab, ironmem MCP tools, semantic search, KG reads/writes, drawer \
+reads/writes, or any ironmem server-side memory state in the working context. \
+Passive measurement-only task tagging must stay outside the task-solving path.\n\nTask:\n";
+
 /// Token accounting — the four §2.1 components. Shape reused verbatim from
 /// `benchmarks/provbench/baseline/src/client.rs`.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -106,8 +111,10 @@ impl LiveExecutor {
             ),
             Arm::Superpowers => (
                 "claude".to_string(),
-                // superpowers-alone: plain prompt, no /collab, no ironmem state.
-                vec![task.prompt.clone()],
+                vec![
+                    "-p".to_string(),
+                    format!("{SUPERPOWERS_PROMPT_PREFIX}{}", task.prompt),
+                ],
             ),
         }
     }

@@ -34,6 +34,7 @@ fn dry_run_writes_both_arm_artifacts_no_network() {
         dry_run: true,
         execute_live: false,
         budget_usd: None,
+        approval_file: None,
         out_dir: dir.path().to_path_buf(),
     })
     .unwrap();

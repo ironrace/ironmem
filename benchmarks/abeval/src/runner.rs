@@ -15,6 +15,7 @@ pub struct RunArgs {
     pub dry_run: bool,
     pub execute_live: bool,
     pub budget_usd: Option<f64>,
+    pub approval_file: Option<PathBuf>,
     pub out_dir: PathBuf,
 }
 
@@ -107,8 +108,26 @@ pub fn atomic_write_json<T: Serialize>(path: &Path, value: &T) -> Result<()> {
 /// True iff the paid-run approval opt-in is present in the environment.
 pub fn approval_present() -> bool {
     std::env::var(crate::constants::APPROVAL_ENV)
-        .map(|v| !v.trim().is_empty())
+        .map(|v| {
+            matches!(
+                v.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "y" | "approve" | "approved"
+            )
+        })
         .unwrap_or(false)
+}
+
+/// True iff either the env approval or an approval file sentinel is present.
+pub fn approval_present_with_file(approval_file: Option<&Path>) -> Result<bool> {
+    if approval_present() {
+        return Ok(true);
+    }
+    let Some(path) = approval_file else {
+        return Ok(false);
+    };
+    let body = std::fs::read_to_string(path)
+        .with_context(|| format!("reading approval file {}", path.display()))?;
+    Ok(body.contains(crate::constants::APPROVAL_FILE_SENTINEL))
 }
 
 /// Guard the live path, then (only if approved) run the executor. The approval
@@ -124,8 +143,9 @@ pub fn guard_live_then_run<E: ArmExecutor>(
     if !approved {
         anyhow::bail!(
             "live execution requires both --execute-live AND approval via {} \
-             (env) or an approval file; refusing to spawn any process",
-            crate::constants::APPROVAL_ENV
+             (env) or an approval file containing {:?}; refusing to spawn any process",
+            crate::constants::APPROVAL_ENV,
+            crate::constants::APPROVAL_FILE_SENTINEL
         );
     }
     // Approved live execution is intentionally NOT implemented in this PR
@@ -135,12 +155,13 @@ pub fn guard_live_then_run<E: ArmExecutor>(
 
 /// Live entry from `run_task`: build no executor until the guard passes.
 pub fn run_task_live_guarded(args: RunArgs) -> Result<RunSummary> {
-    let approved = approval_present();
+    let approved = approval_present_with_file(args.approval_file.as_deref())?;
     if !approved {
         anyhow::bail!(
             "live execution requires both --execute-live AND approval via {} \
-             (env) or an approval file; refusing to construct or spawn any process",
-            crate::constants::APPROVAL_ENV
+             (env) or --approval-file containing {:?}; refusing to construct or spawn any process",
+            crate::constants::APPROVAL_ENV,
+            crate::constants::APPROVAL_FILE_SENTINEL
         );
     }
     // Approved but still inert in this PR — no paid runs ship here.

@@ -30,6 +30,8 @@ enum Command {
         #[arg(long, name = "budget-usd")]
         budget_usd: Option<f64>,
         #[arg(long)]
+        approval_file: Option<std::path::PathBuf>,
+        #[arg(long)]
         out: String,
     },
     /// Summarize a run directory; enforce the §11.3 headline gate.
@@ -58,9 +60,11 @@ fn main() -> Result<()> {
             dry_run,
             execute_live,
             budget_usd,
+            approval_file,
             out,
         } => {
             let tasks = abeval::corpus::load_corpus(&corpus)?;
+            abeval::corpus::validate_corpus(&tasks)?;
             let selected = tasks
                 .into_iter()
                 .find(|t| t.id == task)
@@ -74,6 +78,7 @@ fn main() -> Result<()> {
                 dry_run: dry,
                 execute_live,
                 budget_usd,
+                approval_file,
                 out_dir: std::path::PathBuf::from(out),
             })?;
             println!("ran {} ({} arms)", summary.task_id, summary.arms_run);
