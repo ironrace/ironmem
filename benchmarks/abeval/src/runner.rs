@@ -302,17 +302,24 @@ pub fn run_task_live_guarded(args: RunArgs) -> Result<RunSummary> {
         );
     }
 
-    // Approved: build the REAL `claude`-spawning runner + shell gate runner and
-    // run the task. Arm workspaces live under `<out_dir>/workspaces/...`; the
+    // Approved: build the REAL `claude`-spawning runner + no-shell gate runner
+    // and run the task. Arm workspaces live under `<out_dir>/workspaces/...`; the
     // normalized live metrics file is written to `<out_dir>/<task_id>/`.
     //
     // CARGO_MANIFEST_DIR is `<repo>/benchmarks/abeval`; two parent() hops reach
-    // the repo root, which is the ironmem repo for worktree provisioning.
-    let ironmem_repo = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+    // the repo root, which is the ironmem repo for worktree provisioning. Fail
+    // loud rather than silently provisioning against the process CWD.
+    let manifest_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let ironmem_repo = manifest_dir
         .parent()
         .and_then(|p| p.parent())
         .map(|p| p.to_path_buf())
-        .unwrap_or_else(|| std::path::PathBuf::from("."));
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "cannot derive ironmem repo root: CARGO_MANIFEST_DIR ({}) has fewer than two parents",
+                manifest_dir.display()
+            )
+        })?;
     let executor = LiveExecutor::new(
         crate::client::ProcessCommandRunner,
         ProcessWorkspaceProvisioner { ironmem_repo },

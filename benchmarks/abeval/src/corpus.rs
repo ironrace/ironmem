@@ -55,7 +55,7 @@ fn resolve_corpus_path(path: &Path) -> PathBuf {
     path.to_path_buf()
 }
 
-/// Enforce the §11.1 corpus invariants (README invariants 1-4). Returns Err on
+/// Enforce the §11.1 corpus invariants (README invariants 1-5). Returns Err on
 /// the first breach.
 pub fn validate_corpus(tasks: &[Task]) -> Result<()> {
     if tasks.len() < CORPUS_MIN || tasks.len() > CORPUS_MAX {

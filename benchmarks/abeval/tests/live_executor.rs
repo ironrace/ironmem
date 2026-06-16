@@ -418,9 +418,8 @@ use abeval::client::ProcessCommandRunner;
 use abeval::runner::ProcessGateRunner;
 
 /// The real runner spawns a process, captures its stdout, and reports success.
-/// Uses `printf` — NEVER an agent.
+/// Uses `printf` — NEVER an agent; safe to run in CI.
 #[test]
-#[ignore = "spawns real process; run manually behind the live gate"]
 fn process_command_runner_captures_stdout_and_success() {
     let runner = ProcessCommandRunner;
     let ws = tempfile::tempdir().unwrap();
@@ -436,8 +435,8 @@ fn process_command_runner_captures_stdout_and_success() {
 }
 
 /// A non-zero exit is reported as `success = false` (not an Err).
+/// Uses `false` — NEVER an agent; safe to run in CI.
 #[test]
-#[ignore = "spawns real process; run manually behind the live gate"]
 fn process_command_runner_reports_failure_exit() {
     let runner = ProcessCommandRunner;
     let ws = tempfile::tempdir().unwrap();
@@ -446,8 +445,8 @@ fn process_command_runner_reports_failure_exit() {
 }
 
 /// A missing program is a loud error, not a silent empty success.
+/// Spawns no real workload — only a non-existent binary; safe to run in CI.
 #[test]
-#[ignore = "spawns real process; run manually behind the live gate"]
 fn process_command_runner_errors_on_missing_program() {
     let runner = ProcessCommandRunner;
     let ws = tempfile::tempdir().unwrap();
@@ -457,9 +456,8 @@ fn process_command_runner_errors_on_missing_program() {
 }
 
 /// ProcessGateRunner runs each gate (program + argv, no shell) in the workspace;
-/// all-zero-exit passes.
+/// all-zero-exit passes. Uses `true` — NEVER an agent; safe to run in CI.
 #[test]
-#[ignore = "spawns real process; run manually behind the live gate"]
 fn process_gate_runner_passes_when_all_gates_succeed() {
     let g = ProcessGateRunner;
     let ws = tempfile::tempdir().unwrap();
@@ -469,8 +467,8 @@ fn process_gate_runner_passes_when_all_gates_succeed() {
 }
 
 /// Any non-zero gate fails the set (no silent green).
+/// Uses `true`/`false` — NEVER an agent; safe to run in CI.
 #[test]
-#[ignore = "spawns real process; run manually behind the live gate"]
 fn process_gate_runner_fails_when_a_gate_fails() {
     let g = ProcessGateRunner;
     let ws = tempfile::tempdir().unwrap();
@@ -482,8 +480,8 @@ fn process_gate_runner_fails_when_a_gate_fails() {
 /// SECURITY: gates run WITHOUT a shell — metacharacters in a gate string are
 /// passed as inert argv tokens, never interpreted. With `sh -c`, `true ; touch X`
 /// would create X; here the `; touch X` tokens are just args to `true`.
+/// Uses `true` — NEVER an agent; safe to run in CI (regression guard for #122).
 #[test]
-#[ignore = "spawns real process; run manually behind the live gate"]
 fn process_gate_runner_does_not_interpret_shell_metacharacters() {
     let g = ProcessGateRunner;
     let ws = tempfile::tempdir().unwrap();
