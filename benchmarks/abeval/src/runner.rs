@@ -154,25 +154,36 @@ pub trait GateRunner {
     fn gates_pass(&self, task: &Task, workspace: &Path) -> Result<bool>;
 }
 
-/// Production [`GateRunner`] that runs each of a task's frozen gate strings as a
-/// shell command in the produced workspace. The gate set passes iff every gate
-/// exits zero; the first non-zero gate fails the set (no silent green).
-pub struct ShellGateRunner;
+/// Production [`GateRunner`] that runs each of a task's frozen gate strings in
+/// the produced workspace as `program + argv`, **without a shell**. The gate set
+/// passes iff every gate exits zero; the first non-zero gate fails the set (no
+/// silent green).
+///
+/// No `sh -c`: each gate is split on whitespace into a program and its argument
+/// vector and executed directly. This removes the shell-injection class entirely
+/// — metacharacters (`;`, `|`, `&&`, redirects) are passed as inert argv tokens,
+/// never interpreted. Frozen-corpus gates (`cargo test …`, `cargo clippy …`) do
+/// not need shell features; a gate that requires them is intentionally
+/// unsupported.
+pub struct ProcessGateRunner;
 
-impl GateRunner for ShellGateRunner {
+impl GateRunner for ProcessGateRunner {
     fn gates_pass(&self, task: &Task, workspace: &Path) -> Result<bool> {
-        // `task.gates` are trusted, frozen-corpus command strings (not untrusted
-        // input); they are run via `sh -c` in the agent-produced workspace.
         for gate in &task.gates {
-            let status = std::process::Command::new("sh")
-                .arg("-c")
-                .arg(gate)
+            let mut tokens = gate.split_whitespace();
+            let program = tokens
+                .next()
+                .ok_or_else(|| anyhow::anyhow!("empty gate string in task {}", task.id))?;
+            let argv: Vec<&str> = tokens.collect();
+
+            let status = std::process::Command::new(program)
+                .args(&argv)
                 .current_dir(workspace)
                 .status()
                 .with_context(|| format!("running gate {gate:?} in {}", workspace.display()))?;
             if !status.success() {
                 // Log the exit code so an environment failure (e.g. exit 127 —
-                // the gate tool is missing) is visible rather than silently
+                // the gate program is missing) is visible rather than silently
                 // indistinguishable from a genuine red gate.
                 let code = status
                     .code()
@@ -296,7 +307,7 @@ pub fn run_task_live_guarded(args: RunArgs) -> Result<RunSummary> {
         &args.task,
         &args.arms,
         &executor,
-        &ShellGateRunner,
+        &ProcessGateRunner,
         &args.out_dir,
     )?;
     eprintln!("live metrics written to {}", metrics_path.display());

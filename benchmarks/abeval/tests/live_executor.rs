@@ -400,7 +400,7 @@ fn execute_approved_live_writes_live_metrics_file() {
 // --- Cycle 5: real subprocess plumbing, proven with harmless coreutils only ---
 
 use abeval::client::ProcessCommandRunner;
-use abeval::runner::ShellGateRunner;
+use abeval::runner::ProcessGateRunner;
 
 /// The real runner spawns a process, captures its stdout, and reports success.
 /// Uses `printf` — NEVER an agent.
@@ -438,10 +438,11 @@ fn process_command_runner_errors_on_missing_program() {
         .is_err());
 }
 
-/// ShellGateRunner runs each gate string in the workspace; all-zero-exit passes.
+/// ProcessGateRunner runs each gate (program + argv, no shell) in the workspace;
+/// all-zero-exit passes.
 #[test]
-fn shell_gate_runner_passes_when_all_gates_succeed() {
-    let g = ShellGateRunner;
+fn process_gate_runner_passes_when_all_gates_succeed() {
+    let g = ProcessGateRunner;
     let ws = tempfile::tempdir().unwrap();
     let mut t = task();
     t.gates = vec!["true".to_string(), "true".to_string()];
@@ -450,12 +451,42 @@ fn shell_gate_runner_passes_when_all_gates_succeed() {
 
 /// Any non-zero gate fails the set (no silent green).
 #[test]
-fn shell_gate_runner_fails_when_a_gate_fails() {
-    let g = ShellGateRunner;
+fn process_gate_runner_fails_when_a_gate_fails() {
+    let g = ProcessGateRunner;
     let ws = tempfile::tempdir().unwrap();
     let mut t = task();
     t.gates = vec!["true".to_string(), "false".to_string()];
     assert!(!g.gates_pass(&t, ws.path()).unwrap());
+}
+
+/// SECURITY: gates run WITHOUT a shell — metacharacters in a gate string are
+/// passed as inert argv tokens, never interpreted. With `sh -c`, `true ; touch X`
+/// would create X; here the `; touch X` tokens are just args to `true`.
+#[test]
+fn process_gate_runner_does_not_interpret_shell_metacharacters() {
+    let g = ProcessGateRunner;
+    let ws = tempfile::tempdir().unwrap();
+    let marker = ws.path().join("PWNED");
+    let mut t = task();
+    t.gates = vec![format!("true ; touch {}", marker.display())];
+
+    // `true` ignores its args and exits 0; the injection never executes.
+    assert!(g.gates_pass(&t, ws.path()).unwrap());
+    assert!(
+        !marker.exists(),
+        "shell metacharacters must not be interpreted (no shell)"
+    );
+}
+
+/// An empty / whitespace-only gate string is malformed → loud error, not a
+/// silent pass.
+#[test]
+fn process_gate_runner_rejects_empty_gate() {
+    let g = ProcessGateRunner;
+    let ws = tempfile::tempdir().unwrap();
+    let mut t = task();
+    t.gates = vec!["   ".to_string()];
+    assert!(g.gates_pass(&t, ws.path()).is_err());
 }
 
 // --- Review fixes (issue #122 review round) ---
