@@ -22,7 +22,12 @@ fn one_corpus_task_both_arms_dry_run_then_report() {
 
     // Both arm artifacts exist.
     for arm in ["ironmem", "superpowers"] {
-        assert!(dir.path().join(&task.id).join(arm).join("usage.json").exists());
+        assert!(dir
+            .path()
+            .join(&task.id)
+            .join(arm)
+            .join("usage.json")
+            .exists());
     }
 
     // Report renders a non-headline (smoke) summary.
