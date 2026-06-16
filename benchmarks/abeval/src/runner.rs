@@ -104,16 +104,16 @@ pub fn atomic_write_json<T: Serialize>(path: &Path, value: &T) -> Result<()> {
     atomic_write_str(path, &body)
 }
 
-// TEMP stub — replaced by the real guard in Task 5.
-pub fn run_task_live_guarded(_args: RunArgs) -> Result<RunSummary> {
-    anyhow::bail!("live path not yet implemented — requires approval (Task 5)")
-}
-
-// These will be added in Task 5:
+/// True iff the paid-run approval opt-in is present in the environment.
 pub fn approval_present() -> bool {
-    false
+    std::env::var(crate::constants::APPROVAL_ENV)
+        .map(|v| !v.trim().is_empty())
+        .unwrap_or(false)
 }
 
+/// Guard the live path, then (only if approved) run the executor. The approval
+/// check happens BEFORE the executor is touched — when `approved` is false this
+/// returns an error and the executor is never invoked.
 pub fn guard_live_then_run<E: ArmExecutor>(
     _task: &Task,
     _arms: &[Arm],
@@ -122,7 +122,28 @@ pub fn guard_live_then_run<E: ArmExecutor>(
     _out_dir: &Path,
 ) -> Result<RunSummary> {
     if !approved {
-        anyhow::bail!("live execution requires approval");
+        anyhow::bail!(
+            "live execution requires both --execute-live AND approval via {} \
+             (env) or an approval file; refusing to spawn any process",
+            crate::constants::APPROVAL_ENV
+        );
     }
-    anyhow::bail!("live execution not enabled in this PR")
+    // Approved live execution is intentionally NOT implemented in this PR
+    // (no paid runs). Stop at the pre-spawn boundary.
+    anyhow::bail!("live execution is not enabled in this PR (no paid runs)")
+}
+
+/// Live entry from `run_task`: build no executor until the guard passes.
+pub fn run_task_live_guarded(args: RunArgs) -> Result<RunSummary> {
+    let approved = approval_present();
+    if !approved {
+        anyhow::bail!(
+            "live execution requires both --execute-live AND approval via {} \
+             (env) or an approval file; refusing to construct or spawn any process",
+            crate::constants::APPROVAL_ENV
+        );
+    }
+    // Approved but still inert in this PR — no paid runs ship here.
+    let _ = args;
+    anyhow::bail!("live execution is not enabled in this PR (no paid runs)")
 }

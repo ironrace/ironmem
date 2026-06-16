@@ -51,7 +51,34 @@ fn main() -> Result<()> {
             println!("content_hash: {}", abeval::corpus::content_hash(&tasks));
             Ok(())
         }
-        Command::Run { .. } => unimplemented!("wired in Task 4/5"),
+        Command::Run {
+            corpus,
+            task,
+            arms,
+            dry_run,
+            execute_live,
+            budget_usd,
+            out,
+        } => {
+            let tasks = abeval::corpus::load_corpus(&corpus)?;
+            let selected = tasks
+                .into_iter()
+                .find(|t| t.id == task)
+                .ok_or_else(|| anyhow::anyhow!("task {task} not found in corpus"))?;
+            let arm_list = abeval::arms::assign_arms(&selected.id, &arms)?;
+            // Default to dry-run unless --execute-live was explicitly passed.
+            let dry = dry_run || !execute_live;
+            let summary = abeval::runner::run_task(abeval::runner::RunArgs {
+                task: selected,
+                arms: arm_list,
+                dry_run: dry,
+                execute_live,
+                budget_usd,
+                out_dir: std::path::PathBuf::from(out),
+            })?;
+            println!("ran {} ({} arms)", summary.task_id, summary.arms_run);
+            Ok(())
+        }
         Command::Report { .. } => unimplemented!("wired in Task 6"),
     }
 }
