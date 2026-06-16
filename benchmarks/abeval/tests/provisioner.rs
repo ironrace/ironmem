@@ -1,8 +1,8 @@
 //! Unit tests for the ProcessWorkspaceProvisioner argv builder (Task 5).
 //! No real git is spawned in default `cargo test`.
 
-use std::path::PathBuf;
 use abeval::client::worktree_add_argv;
+use std::path::PathBuf;
 
 #[test]
 fn worktree_add_argv_is_no_shell_and_detached() {

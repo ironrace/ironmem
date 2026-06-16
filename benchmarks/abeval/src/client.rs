@@ -304,8 +304,7 @@ impl WorkspaceProvisioner for ProcessWorkspaceProvisioner {
             );
         }
         // (4) Add the worktree (no shell, program+argv, same hardening as ProcessGateRunner).
-        let (program, argv) =
-            worktree_add_argv(&self.ironmem_repo, req.workspace, req.base_commit);
+        let (program, argv) = worktree_add_argv(&self.ironmem_repo, req.workspace, req.base_commit);
         let status = std::process::Command::new(&program)
             .args(&argv)
             .status()
