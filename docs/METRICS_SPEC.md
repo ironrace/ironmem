@@ -611,11 +611,11 @@ destination, or reporting query changed.
 - New `code_maps` table: `(repo, area) PRIMARY KEY`, `drawer_id FK→drawers`, `head_sha`, `source_files` (JSON), `built_by`, `built_at`.
 
 **Exploration attribution (Phase 5):**
-- Code-map MCP calls (`code_map_write`, `code_map_load`) emit a `source='mcp_response'` token_usage row with `map_status`, `turn_id`, `area` set. The `source` CHECK is NOT widened.
-- `map_status='map_hit'`: the turn loaded a fresh or freshened code map. `map_status='map_miss'`: the turn wrote a new map (cold scout).
+- Code-map MCP calls (`code_map_write`, `code_map_load`) emit a `source='mcp_response'` token_usage row with `map_status`, `turn_id`, `area` set. The `source` CHECK is NOT widened: `'mcp_response'` was already an allowed value established by migration 008 (`token_usage.source` enum), so no new source value is introduced. `code_map_status` is a metadata-only pre-flight and emits no attribution row.
+- `map_status='map_hit'`: a `code_map_load` returned a found map with verdict `fresh`. `map_status='map_miss'`: every other case — a `stale` load, a `rescout_required`/absent load, and every `code_map_write` (cold scout / refresh).
 - v0 exploration cost proxy: the code-map MCP call's response-size estimate (chars/4), recorded on the tagged live `mcp_response` row as `output_tokens`. A future phase may replace this proxy with real LLM token costs.
 
 **Phase-5 report (§10 extension):**
-- `report_exploration_delta()` aggregates all `mcp_response` rows with `map_status IN ('map_hit','map_miss')`, grouped by `turn_id`.
+- `report_exploration_delta()` aggregates all `mcp_response` rows with non-NULL `turn_id` and `map_status IN ('map_hit','map_miss')`, one unit per distinct `turn_id`. Rows with NULL `turn_id` are excluded (cannot be attributed to a turn). Each turn gets a single verdict: `map_hit` only when the turn has a hit and no miss, else `map_miss`.
 - Returns `ExplorationReport { total_turns, map_hit_turns, map_miss_turns, hit_rate, mean_tokens_map_hit, mean_tokens_map_miss }`.
 - Gate: at least one task must have both `map_hit` and `map_miss` rows for the delta to be meaningful.

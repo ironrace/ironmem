@@ -23,7 +23,14 @@ pub struct CodeMap {
 
 fn map_code_map(row: &rusqlite::Row<'_>) -> rusqlite::Result<CodeMap> {
     let source_files_json: String = row.get(4)?;
-    let source_files: Vec<String> = serde_json::from_str(&source_files_json).unwrap_or_default();
+    // Fail-safe: a corrupt `source_files` blob must NOT silently become an empty
+    // Vec — an empty source set would intersect to nothing and classify any map
+    // as Fresh (false-fresh), violating the freshness engine's fail-safe
+    // contract. Surface the parse error so the caller treats the row as
+    // unreadable (→ RescoutRequired) instead of trusting a stale map.
+    let source_files: Vec<String> = serde_json::from_str(&source_files_json).map_err(|e| {
+        rusqlite::Error::FromSqlConversionFailure(4, rusqlite::types::Type::Text, Box::new(e))
+    })?;
     Ok(CodeMap {
         repo: row.get(0)?,
         area: row.get(1)?,

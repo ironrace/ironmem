@@ -303,15 +303,19 @@ pub struct TaskPhaseModelTokens {
 }
 
 /// Phase-5 / issue #94 exploration-token attribution aggregate.
-/// Produced by `report_exploration_delta`; covers all `token_usage` rows
-/// where `source = 'mcp_response'` and `map_status IN ('map_hit', 'map_miss')`.
+/// Produced by `report_exploration_delta`; one unit per DISTINCT non-NULL
+/// `turn_id` over `token_usage` rows where `source = 'mcp_response'` and
+/// `map_status IN ('map_hit', 'map_miss')`. Each turn gets a single verdict:
+/// `map_hit` only when the turn has a hit and NO miss, else `map_miss`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ExplorationReport {
     /// Total distinct `turn_id` values with a tagged `map_status`.
     pub total_turns: i64,
-    /// Distinct `turn_id` values whose `map_status = 'map_hit'`.
+    /// Distinct `turn_id` values whose per-turn verdict is `map_hit`
+    /// (a hit and no miss across the turn's exploration rows).
     pub map_hit_turns: i64,
-    /// Distinct `turn_id` values whose `map_status = 'map_miss'`.
+    /// Distinct `turn_id` values whose per-turn verdict is `map_miss`
+    /// (at least one miss across the turn's exploration rows).
     pub map_miss_turns: i64,
     /// `map_hit_turns / total_turns`; `0.0` when `total_turns == 0`.
     pub hit_rate: f64,
@@ -862,14 +866,23 @@ impl Database {
     /// Groups by `(turn_id, map_status)` so multiple rows for the same turn
     /// (e.g. retries) collapse to a single per-turn token total.
     pub fn report_exploration_delta(&self) -> Result<ExplorationReport, MemoryError> {
-        // Aggregate per (turn_id, map_status): SUM tokens.
+        // One row per DISTINCT turn_id. A turn's tokens are summed across all its
+        // exploration rows; its verdict is a single value derived per turn:
+        // `map_hit` only if the turn has a hit and NO miss, else `map_miss`.
+        // This avoids two skews: (a) a turn emitting both a hit and a miss being
+        // double-counted as two turns, and (b) NULL turn_id rows collapsing into
+        // one group — we exclude NULL turn_id entirely since an untagged row
+        // cannot be attributed to a turn.
         let mut stmt = self.conn.prepare(
-            "SELECT turn_id, map_status, SUM(input_tokens + output_tokens) AS total_tokens
+            "SELECT
+                 CASE WHEN SUM(map_status = 'map_miss') > 0 THEN 'map_miss'
+                      ELSE 'map_hit' END AS turn_status,
+                 SUM(input_tokens + output_tokens) AS total_tokens
              FROM token_usage
              WHERE source = 'mcp_response'
-               AND map_status IS NOT NULL
+               AND turn_id IS NOT NULL
                AND map_status IN ('map_hit', 'map_miss')
-             GROUP BY turn_id, map_status",
+             GROUP BY turn_id",
         )?;
         struct TurnRow {
             map_status: String,
@@ -878,8 +891,8 @@ impl Database {
         let rows: Vec<TurnRow> = stmt
             .query_map([], |r| {
                 Ok(TurnRow {
-                    map_status: r.get(1)?,
-                    total_tokens: r.get::<_, Option<i64>>(2)?.unwrap_or(0),
+                    map_status: r.get(0)?,
+                    total_tokens: r.get::<_, Option<i64>>(1)?.unwrap_or(0),
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()
@@ -1956,6 +1969,71 @@ mod tests {
         assert!((report.mean_tokens_map_hit - 225.0).abs() < 1e-9);
         // mean_tokens_map_miss = 400 / 1 = 400
         assert!((report.mean_tokens_map_miss - 400.0).abs() < 1e-9);
+    }
+
+    /// A turn that emits BOTH a hit and a miss counts as exactly ONE turn with
+    /// the conservative `map_miss` verdict (a hit + no miss is the only hit).
+    /// Rows with NULL turn_id are excluded entirely (unattributable).
+    #[test]
+    fn test_report_exploration_delta_dedups_turn_and_excludes_null() {
+        let db = db();
+
+        // Turn "t1" emits a hit (100) then a miss (200) → ONE miss turn, 300 tok.
+        db.record_exploration_tokens(
+            "2026-06-15T00:00:01Z",
+            "claude",
+            60,
+            40,
+            Some("map_hit"),
+            Some("t1"),
+            Some("core"),
+        )
+        .unwrap();
+        db.record_exploration_tokens(
+            "2026-06-15T00:00:02Z",
+            "claude",
+            120,
+            80,
+            Some("map_miss"),
+            Some("t1"),
+            Some("core"),
+        )
+        .unwrap();
+
+        // Turn "t2" emits only a hit → ONE hit turn, 150 tok.
+        db.record_exploration_tokens(
+            "2026-06-15T00:00:03Z",
+            "claude",
+            100,
+            50,
+            Some("map_hit"),
+            Some("t2"),
+            Some("auth"),
+        )
+        .unwrap();
+
+        // NULL turn_id row must be ignored (cannot attribute to a turn).
+        db.record_exploration_tokens(
+            "2026-06-15T00:00:04Z",
+            "claude",
+            500,
+            500,
+            Some("map_hit"),
+            None,
+            Some("db"),
+        )
+        .unwrap();
+
+        let report = db.report_exploration_delta().unwrap();
+        // 2 turns total: t1 (miss), t2 (hit). NULL row excluded.
+        assert_eq!(report.total_turns, 2);
+        assert_eq!(report.map_hit_turns, 1);
+        assert_eq!(report.map_miss_turns, 1);
+        assert!((report.hit_rate - 0.5).abs() < 1e-9);
+        // t2 is the only hit turn → 150 tokens.
+        assert!((report.mean_tokens_map_hit - 150.0).abs() < 1e-9);
+        // t1 is the only miss turn → 100 + 200 = 300 tokens.
+        assert!((report.mean_tokens_map_miss - 300.0).abs() < 1e-9);
     }
 
     // ---- Migration 011: map_status / turn_id / area columns on token_usage ----

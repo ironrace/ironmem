@@ -28,25 +28,42 @@ pub enum Freshness {
 /// Returns `Err(reason)` on git failure or non-zero exit; callers map this to
 /// `RescoutRequired`.
 fn changed_files(repo_root: &Path, build_sha: &str) -> Result<Vec<String>, String> {
-    // Basic sanity: refuse empty / obviously unsafe SHA values before git call.
-    if build_sha.is_empty() || build_sha.contains(|c: char| c.is_whitespace()) {
-        return Err(format!("invalid build_sha: {:?}", build_sha));
+    // Strict input validation BEFORE any git call: a build_sha is always a hex
+    // object name. Rejecting non-hex (and bounding length) here fails fast,
+    // avoids spawning git on garbage, and removes any ambiguity about refs or
+    // shell-meaningful bytes reaching the subprocess.
+    let is_hex_sha = !build_sha.is_empty()
+        && build_sha.len() >= 7
+        && build_sha.len() <= 64
+        && build_sha.chars().all(|c| c.is_ascii_hexdigit());
+    if !is_hex_sha {
+        return Err("map cannot be verified; re-scout required".to_string());
     }
 
     let range = format!("{}..HEAD", build_sha);
+    // `-c core.quotepath=false` keeps non-ASCII paths un-C-quoted so they match
+    // the stored (forward-slash, unquoted) source_files; otherwise a quoted path
+    // would fail to intersect and falsely report Fresh (fail-open).
     let output = std::process::Command::new("git")
-        .args(["diff", "--name-only", &range])
+        .args(["-c", "core.quotepath=false", "diff", "--name-only", &range])
         .current_dir(repo_root)
         .output()
-        .map_err(|e| format!("git exec failed: {e}"))?;
+        .map_err(|e| {
+            // Log detail server-side; return a generic, leak-free reason.
+            eprintln!("code_maps: git exec failed in {repo_root:?}: {e}");
+            "map cannot be verified; re-scout required".to_string()
+        })?;
 
     if !output.status.success() {
+        // Raw git stderr can carry repo internals / object names — never forward
+        // it to the worker. Log server-side, return a generic fail-safe reason.
         let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(format!(
-            "git diff failed ({}): {}",
+        eprintln!(
+            "code_maps: git diff failed ({}) in {repo_root:?}: {}",
             output.status,
             stderr.trim()
-        ));
+        );
+        return Err("map cannot be verified; re-scout required".to_string());
     }
 
     let stdout = String::from_utf8_lossy(&output.stdout);
