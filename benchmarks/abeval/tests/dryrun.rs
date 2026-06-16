@@ -37,6 +37,7 @@ fn dry_run_writes_both_arm_artifacts_no_network() {
         budget_usd: None,
         approval_file: None,
         out_dir: dir.path().to_path_buf(),
+        base_sha: None,
     })
     .unwrap();
 
@@ -68,6 +69,7 @@ fn run_task_rejects_unsafe_task_id_before_writing() {
         budget_usd: None,
         approval_file: None,
         out_dir: dir.path().to_path_buf(),
+        base_sha: None,
     })
     .unwrap_err();
     assert!(

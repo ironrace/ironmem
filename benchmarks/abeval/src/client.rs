@@ -229,13 +229,103 @@ pub fn resolve_base_commit(task: &Task, run_override: Option<&str>) -> Result<St
     )
 }
 
-/// Placeholder provisioner for compilation; replaced by ProcessWorkspaceProvisioner in Task 5.
-pub struct NoOpWorkspaceProvisioner;
+/// Pure builder for the `git worktree add` command (no spawn). Exposed so the
+/// argv can be unit-tested without touching real git.
+pub fn worktree_add_argv(
+    repo: &std::path::Path,
+    workspace: &std::path::Path,
+    base: &str,
+) -> (String, Vec<String>) {
+    (
+        "git".to_string(),
+        vec![
+            "-C".to_string(),
+            repo.display().to_string(),
+            "worktree".to_string(),
+            "add".to_string(),
+            "--detach".to_string(),
+            workspace.display().to_string(),
+            base.to_string(),
+        ],
+    )
+}
 
-impl WorkspaceProvisioner for NoOpWorkspaceProvisioner {
+/// Production provisioner: real `git worktree add` of the ironmem repo at the
+/// resolved base commit, no shell. Tests use a fake provisioner; this impl is
+/// exercised only behind the approval gate.
+pub struct ProcessWorkspaceProvisioner {
+    pub ironmem_repo: PathBuf,
+}
+
+impl WorkspaceProvisioner for ProcessWorkspaceProvisioner {
     fn provision(&self, req: &ProvisionRequest) -> Result<()> {
-        std::fs::create_dir_all(req.workspace)
-            .with_context(|| format!("creating workspace {}", req.workspace.display()))
+        // (1) Create the parent (<root>/<task_id>); git worktree add does not
+        // create missing intermediate parents, and only <out_dir>/workspaces is
+        // guaranteed to exist by run_task_live_guarded.
+        if let Some(parent) = req.workspace.parent() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("creating workspace parent {}", parent.display()))?;
+        }
+        // (2) Stale-worktree guard: never silently reuse a populated leaf.
+        if req.workspace.exists()
+            && std::fs::read_dir(req.workspace)
+                .map(|mut d| d.next().is_some())
+                .unwrap_or(false)
+        {
+            anyhow::bail!(
+                "workspace {} already exists and is non-empty (stale worktree); \
+                 refusing to reuse it",
+                req.workspace.display()
+            );
+        }
+        // (3) Validate the base ref exists before adding the worktree (no shell).
+        let verify = std::process::Command::new("git")
+            .args([
+                "-C",
+                &self.ironmem_repo.display().to_string(),
+                "rev-parse",
+                "--verify",
+                &format!("{}^{{commit}}", req.base_commit),
+            ])
+            .output()
+            .with_context(|| {
+                format!(
+                    "verifying base {} in {}",
+                    req.base_commit,
+                    self.ironmem_repo.display()
+                )
+            })?;
+        if !verify.status.success() {
+            anyhow::bail!(
+                "task {} base ref {:?} is unknown/ambiguous in repo {}",
+                req.task.id,
+                req.base_commit,
+                self.ironmem_repo.display()
+            );
+        }
+        // (4) Add the worktree (no shell, program+argv, same hardening as ProcessGateRunner).
+        let (program, argv) =
+            worktree_add_argv(&self.ironmem_repo, req.workspace, req.base_commit);
+        let status = std::process::Command::new(&program)
+            .args(&argv)
+            .status()
+            .with_context(|| {
+                format!(
+                    "git worktree add failed: repo={} base={} workspace={}",
+                    self.ironmem_repo.display(),
+                    req.base_commit,
+                    req.workspace.display()
+                )
+            })?;
+        if !status.success() {
+            anyhow::bail!(
+                "git worktree add exited non-zero: repo={} base={} workspace={}",
+                self.ironmem_repo.display(),
+                req.base_commit,
+                req.workspace.display()
+            );
+        }
+        Ok(())
     }
 }
 

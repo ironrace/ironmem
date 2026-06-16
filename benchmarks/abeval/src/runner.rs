@@ -7,8 +7,8 @@ use serde::Serialize;
 
 use crate::arms::Arm;
 use crate::client::{
-    ArmExecutor, ArmOutcome, CommandRunner, DryRunExecutor, LiveExecutor, NoOpWorkspaceProvisioner,
-    Usage, WorkspaceProvisioner,
+    ArmExecutor, ArmOutcome, CommandRunner, DryRunExecutor, LiveExecutor,
+    ProcessWorkspaceProvisioner, Usage, WorkspaceProvisioner,
 };
 use crate::corpus::Task;
 use crate::report::{build_arm_metric, TaskMetric};
@@ -21,6 +21,9 @@ pub struct RunArgs {
     pub budget_usd: Option<f64>,
     pub approval_file: Option<PathBuf>,
     pub out_dir: PathBuf,
+    /// Run-level base override; used only when a task has no `base_commit`.
+    /// Symbolic refs are permitted here and documented as non-reproducible.
+    pub base_sha: Option<String>,
 }
 
 #[derive(Debug)]
@@ -302,11 +305,19 @@ pub fn run_task_live_guarded(args: RunArgs) -> Result<RunSummary> {
     // Approved: build the REAL `claude`-spawning runner + shell gate runner and
     // run the task. Arm workspaces live under `<out_dir>/workspaces/...`; the
     // normalized live metrics file is written to `<out_dir>/<task_id>/`.
+    //
+    // CARGO_MANIFEST_DIR is `<repo>/benchmarks/abeval`; two parent() hops reach
+    // the repo root, which is the ironmem repo for worktree provisioning.
+    let ironmem_repo = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(|p| p.parent())
+        .map(|p| p.to_path_buf())
+        .unwrap_or_else(|| std::path::PathBuf::from("."));
     let executor = LiveExecutor::new(
         crate::client::ProcessCommandRunner,
-        NoOpWorkspaceProvisioner,
+        ProcessWorkspaceProvisioner { ironmem_repo },
         args.out_dir.join("workspaces"),
-        None,
+        args.base_sha.clone(),
     );
     let metrics_path = execute_approved_live(
         &args.task,

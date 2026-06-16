@@ -17,6 +17,7 @@ fn one_corpus_task_both_arms_dry_run_then_report() {
         budget_usd: None,
         approval_file: None,
         out_dir: dir.path().to_path_buf(),
+        base_sha: None,
     })
     .unwrap();
     assert_eq!(summary.arms_run, 2);

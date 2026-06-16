@@ -33,6 +33,8 @@ enum Command {
         approval_file: Option<std::path::PathBuf>,
         #[arg(long)]
         out: String,
+        #[arg(long)]
+        base_sha: Option<String>,
     },
     /// Summarize a run directory OR a normalized metrics file; enforce the
     /// §11.3 headline gate. Exactly one of --run / --metrics is required.
@@ -65,6 +67,7 @@ fn main() -> Result<()> {
             budget_usd,
             approval_file,
             out,
+            base_sha,
         } => {
             let tasks = abeval::corpus::load_corpus(&corpus)?;
             abeval::corpus::validate_corpus(&tasks)?;
@@ -83,6 +86,7 @@ fn main() -> Result<()> {
                 budget_usd,
                 approval_file,
                 out_dir: std::path::PathBuf::from(out),
+                base_sha,
             })?;
             println!("ran {} ({} arms)", summary.task_id, summary.arms_run);
             Ok(())
