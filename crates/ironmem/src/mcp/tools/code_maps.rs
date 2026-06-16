@@ -54,7 +54,23 @@ fn validate_repo(raw: &str) -> Result<String, MemoryError> {
     if raw.is_empty() {
         return Err(MemoryError::Validation("repo is required".into()));
     }
-    Ok(raw.trim_end_matches('/').to_string())
+    let canonical = raw.trim_end_matches('/');
+    // Require an absolute path to prevent git being invoked in an
+    // unintended relative or traversal directory.
+    if !canonical.starts_with('/') {
+        return Err(MemoryError::Validation(format!(
+            "repo must be an absolute path: {canonical}"
+        )));
+    }
+    // Reject parent-component traversal (e.g. "/foo/../../etc").
+    for component in std::path::Path::new(canonical).components() {
+        if component == std::path::Component::ParentDir {
+            return Err(MemoryError::Validation(format!(
+                "repo must not contain parent-directory traversal: {canonical}"
+            )));
+        }
+    }
+    Ok(canonical.to_string())
 }
 
 // ── Handlers ─────────────────────────────────────────────────────────────────
