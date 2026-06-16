@@ -125,38 +125,42 @@ impl ArmExecutor for DryRunExecutor {
     }
 }
 
+/// Single source of truth for the headless permission tokens both arms carry,
+/// so a future CLI change is a one-line edit and the arms stay in lockstep.
+/// Fallback form if the deployed CLI lacks `--permission-mode`:
+/// `["--dangerously-skip-permissions"]`.
+fn headless_permission_args() -> Vec<String> {
+    vec!["--permission-mode".to_string(), "bypassPermissions".to_string()]
+}
+
 /// Build the command for an arm. Returns the program and args that are spawned
 /// by a [`CommandRunner`].
 ///
-/// - `ironmem` arm: starts a `/collab` flow for the task.
+/// - `ironmem` arm: starts a `/collab` flow for the task (carried INSIDE the
+///   print-mode `-p` prompt string so the command is genuinely non-interactive
+///   and JSON-emitting).
 /// - `superpowers` arm: runs the task prompt with superpowers skills ONLY
 ///   (C1: NO `/collab`, NO semantic search/KG/drawer writes, NO ironmem
 ///   server-side state in the working context). Any task_tag/reporting
 ///   instrumentation is measurement-only and kept out of the working path.
 ///
-/// Both arms request `--output-format json` so usage is machine-parseable.
+/// Both arms request `--output-format json` AND `-p` (print mode, required for
+/// `--output-format` to take effect) AND headless permission tokens.
 pub fn arm_command(task: &Task, arm: Arm) -> (String, Vec<String>) {
+    let mut argv = vec!["--output-format".to_string(), "json".to_string()];
+    argv.extend(headless_permission_args());
+    argv.push("-p".to_string());
     match arm {
-        Arm::Ironmem => (
-            "claude".to_string(),
-            vec![
-                "--output-format".to_string(),
-                "json".to_string(),
-                "/collab".to_string(),
-                "start".to_string(),
-                task.prompt.clone(),
-            ],
-        ),
-        Arm::Superpowers => (
-            "claude".to_string(),
-            vec![
-                "--output-format".to_string(),
-                "json".to_string(),
-                "-p".to_string(),
-                format!("{SUPERPOWERS_PROMPT_PREFIX}{}", task.prompt),
-            ],
-        ),
+        Arm::Ironmem => {
+            // `/collab start` preserved INSIDE the print-mode prompt string so
+            // the command is genuinely non-interactive and JSON-emitting.
+            argv.push(format!("/collab start {}", task.prompt));
+        }
+        Arm::Superpowers => {
+            argv.push(format!("{SUPERPOWERS_PROMPT_PREFIX}{}", task.prompt));
+        }
     }
+    ("claude".to_string(), argv)
 }
 
 /// Output of running one arm command.
