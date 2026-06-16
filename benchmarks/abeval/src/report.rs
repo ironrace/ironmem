@@ -1,1 +1,223 @@
-//! Parse run artifacts; compute §11.3 trio; enforce headline gate.
+//! Parse run artifacts / normalized metrics; compute the §11.3 trio
+//! (tokens-to-done, rework_loops, merged-rate) and enforce the headline gate.
+
+use std::collections::BTreeMap;
+use std::path::Path;
+
+use anyhow::{Context, Result};
+use serde::{Deserialize, Serialize};
+
+use crate::constants::MIN_TASKS_PER_ARM;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TaskMetric {
+    pub arm: String,
+    pub task_key: String,
+    /// §2.2 done = "merged" AND ci_green.
+    pub outcome: String,
+    #[serde(default)]
+    pub ci_green: bool,
+    #[serde(default)]
+    pub input_tokens: u32,
+    #[serde(default)]
+    pub output_tokens: u32,
+    #[serde(default)]
+    pub cache_creation_input_tokens: u32,
+    #[serde(default)]
+    pub cache_read_input_tokens: u32,
+    #[serde(default)]
+    pub review_rounds: u32,
+    #[serde(default)]
+    pub fix_commits: u32,
+}
+
+impl TaskMetric {
+    /// §2.1 four-component sum.
+    pub fn tokens_to_done(&self) -> u64 {
+        self.input_tokens as u64
+            + self.output_tokens as u64
+            + self.cache_creation_input_tokens as u64
+            + self.cache_read_input_tokens as u64
+    }
+
+    /// §11.4 rework_loops = review_rounds + fix_commits.
+    pub fn rework_loops(&self) -> u64 {
+        self.review_rounds as u64 + self.fix_commits as u64
+    }
+
+    /// §2.2 a task counts toward the headline only when merged AND CI-green.
+    pub fn is_done(&self) -> bool {
+        self.outcome == "merged" && self.ci_green
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MetricsInput {
+    /// "smoke" | "live".
+    pub evidence_class: String,
+    pub tasks: Vec<TaskMetric>,
+}
+
+/// Load a normalized metrics file.
+pub fn load_metrics(path: impl AsRef<Path>) -> Result<MetricsInput> {
+    let path = path.as_ref();
+    let body = std::fs::read_to_string(path)
+        .with_context(|| format!("reading metrics {}", path.display()))?;
+    serde_json::from_str(&body).with_context(|| "parsing metrics input".to_string())
+}
+
+/// Build a MetricsInput from a run directory (reads run_meta.json + per-arm usage.json).
+/// Smoke runs have outcome:"completed" and ci_green:false so they never count toward the gate.
+pub fn metrics_from_run_dir(run: impl AsRef<Path>) -> Result<MetricsInput> {
+    let run = run.as_ref();
+    let mut tasks = Vec::new();
+    let mut evidence = "smoke".to_string();
+    for task_entry in
+        std::fs::read_dir(run).with_context(|| format!("reading run dir {}", run.display()))?
+    {
+        let task_dir = task_entry?.path();
+        if !task_dir.is_dir() {
+            continue;
+        }
+        let meta_path = task_dir.join("run_meta.json");
+        if !meta_path.exists() {
+            continue;
+        }
+        let meta: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&meta_path)?)?;
+        if meta["evidence_class"] == "live" {
+            evidence = "live".to_string();
+        }
+        let task_id = task_dir
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("")
+            .to_string();
+        for arm in ["ironmem", "superpowers"] {
+            let usage_path = task_dir.join(arm).join("usage.json");
+            if !usage_path.exists() {
+                continue;
+            }
+            let usage: crate::client::Usage =
+                serde_json::from_str(&std::fs::read_to_string(&usage_path)?)?;
+            tasks.push(TaskMetric {
+                arm: arm.to_string(),
+                task_key: format!("{task_id}:{arm}"),
+                outcome: "completed".to_string(),
+                ci_green: false, // smoke never counts toward the gate
+                input_tokens: usage.input_tokens,
+                output_tokens: usage.output_tokens,
+                cache_creation_input_tokens: usage.cache_creation_input_tokens,
+                cache_read_input_tokens: usage.cache_read_input_tokens,
+                review_rounds: 0,
+                fix_commits: 0,
+            });
+        }
+    }
+    Ok(MetricsInput {
+        evidence_class: evidence,
+        tasks,
+    })
+}
+
+struct ArmAgg {
+    completed: Vec<u64>, // tokens-to-done for merged+green tasks
+    rework: Vec<u64>,
+    attempted: usize,
+    merged: usize,
+}
+
+fn aggregate(input: &MetricsInput) -> BTreeMap<String, ArmAgg> {
+    let mut by_arm: BTreeMap<String, ArmAgg> = BTreeMap::new();
+    for t in &input.tasks {
+        let agg = by_arm.entry(t.arm.clone()).or_insert(ArmAgg {
+            completed: Vec::new(),
+            rework: Vec::new(),
+            attempted: 0,
+            merged: 0,
+        });
+        agg.attempted += 1;
+        if t.is_done() {
+            agg.merged += 1;
+            agg.completed.push(t.tokens_to_done());
+            agg.rework.push(t.rework_loops());
+        }
+    }
+    by_arm
+}
+
+fn mean(xs: &[u64]) -> f64 {
+    if xs.is_empty() {
+        return 0.0;
+    }
+    xs.iter().sum::<u64>() as f64 / xs.len() as f64
+}
+
+fn spread(xs: &[u64]) -> u64 {
+    match (xs.iter().min(), xs.iter().max()) {
+        (Some(lo), Some(hi)) => hi - lo,
+        _ => 0,
+    }
+}
+
+/// Render the report. Headline deltas are emitted ONLY when evidence is live
+/// AND every arm has >= MIN_TASKS_PER_ARM completed (merged + CI-green) tasks.
+pub fn render_report(input: &MetricsInput) -> String {
+    let mut out = String::new();
+    let by_arm = aggregate(input);
+
+    // Per-arm visible numbers (always shown, even for smoke/failed).
+    for (arm, agg) in &by_arm {
+        out.push_str(&format!(
+            "arm {arm}: attempted={} merged={} completed={} \
+             mean_tokens={:.1} mean_rework={:.1}\n",
+            agg.attempted,
+            agg.merged,
+            agg.completed.len(),
+            mean(&agg.completed),
+            mean(&agg.rework),
+        ));
+    }
+
+    let is_live = input.evidence_class == "live";
+    let enough = !by_arm.is_empty()
+        && by_arm
+            .values()
+            .all(|a| a.completed.len() >= MIN_TASKS_PER_ARM);
+
+    if !is_live {
+        out.push_str("SMOKE — non-headline: no cross-arm delta is claimed.\n");
+        return out;
+    }
+    if !enough {
+        out.push_str(&format!(
+            "non-headline: each arm needs >= {MIN_TASKS_PER_ARM} merged+CI-green \
+             tasks before any delta is reported.\n"
+        ));
+        return out;
+    }
+
+    // Gate passed: emit confidence-qualified deltas (never bare point estimates).
+    let iron = by_arm.get("ironmem");
+    let sp = by_arm.get("superpowers");
+    if let (Some(i), Some(s)) = (iron, sp) {
+        let n = i.completed.len().min(s.completed.len());
+        out.push_str(&format!(
+            "DELTA (n={n}, confidence-qualified):\n\
+             tokens-to-done: ironmem mean={:.1} (spread {}), \
+             superpowers mean={:.1} (spread {})\n\
+             rework_loops: ironmem mean={:.1}, superpowers mean={:.1}\n\
+             merged-rate: ironmem {}/{}, superpowers {}/{}\n",
+            mean(&i.completed),
+            spread(&i.completed),
+            mean(&s.completed),
+            spread(&s.completed),
+            mean(&i.rework),
+            mean(&s.rework),
+            i.merged,
+            i.attempted,
+            s.merged,
+            s.attempted,
+        ));
+    }
+    out
+}

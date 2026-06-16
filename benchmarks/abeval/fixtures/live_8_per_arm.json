@@ -1,0 +1,21 @@
+{
+  "evidence_class": "live",
+  "tasks": [
+    {"arm": "ironmem", "task_key": "t1", "outcome": "merged", "ci_green": true, "input_tokens": 100, "output_tokens": 50, "cache_creation_input_tokens": 0, "cache_read_input_tokens": 0, "review_rounds": 1, "fix_commits": 1},
+    {"arm": "ironmem", "task_key": "t2", "outcome": "merged", "ci_green": true, "input_tokens": 110, "output_tokens": 55, "cache_creation_input_tokens": 0, "cache_read_input_tokens": 0, "review_rounds": 1, "fix_commits": 0},
+    {"arm": "ironmem", "task_key": "t3", "outcome": "merged", "ci_green": true, "input_tokens": 120, "output_tokens": 60, "cache_creation_input_tokens": 0, "cache_read_input_tokens": 0, "review_rounds": 0, "fix_commits": 1},
+    {"arm": "ironmem", "task_key": "t4", "outcome": "merged", "ci_green": true, "input_tokens": 130, "output_tokens": 65, "cache_creation_input_tokens": 0, "cache_read_input_tokens": 0, "review_rounds": 2, "fix_commits": 1},
+    {"arm": "ironmem", "task_key": "t5", "outcome": "merged", "ci_green": true, "input_tokens": 140, "output_tokens": 70, "cache_creation_input_tokens": 0, "cache_read_input_tokens": 0, "review_rounds": 1, "fix_commits": 1},
+    {"arm": "ironmem", "task_key": "t6", "outcome": "merged", "ci_green": true, "input_tokens": 150, "output_tokens": 75, "cache_creation_input_tokens": 0, "cache_read_input_tokens": 0, "review_rounds": 0, "fix_commits": 0},
+    {"arm": "ironmem", "task_key": "t7", "outcome": "merged", "ci_green": true, "input_tokens": 160, "output_tokens": 80, "cache_creation_input_tokens": 0, "cache_read_input_tokens": 0, "review_rounds": 1, "fix_commits": 2},
+    {"arm": "ironmem", "task_key": "t8", "outcome": "merged", "ci_green": true, "input_tokens": 170, "output_tokens": 85, "cache_creation_input_tokens": 0, "cache_read_input_tokens": 0, "review_rounds": 1, "fix_commits": 1},
+    {"arm": "superpowers", "task_key": "t1", "outcome": "merged", "ci_green": true, "input_tokens": 200, "output_tokens": 100, "cache_creation_input_tokens": 0, "cache_read_input_tokens": 0, "review_rounds": 2, "fix_commits": 2},
+    {"arm": "superpowers", "task_key": "t2", "outcome": "merged", "ci_green": true, "input_tokens": 210, "output_tokens": 105, "cache_creation_input_tokens": 0, "cache_read_input_tokens": 0, "review_rounds": 1, "fix_commits": 1},
+    {"arm": "superpowers", "task_key": "t3", "outcome": "merged", "ci_green": true, "input_tokens": 220, "output_tokens": 110, "cache_creation_input_tokens": 0, "cache_read_input_tokens": 0, "review_rounds": 0, "fix_commits": 1},
+    {"arm": "superpowers", "task_key": "t4", "outcome": "merged", "ci_green": true, "input_tokens": 230, "output_tokens": 115, "cache_creation_input_tokens": 0, "cache_read_input_tokens": 0, "review_rounds": 2, "fix_commits": 0},
+    {"arm": "superpowers", "task_key": "t5", "outcome": "merged", "ci_green": true, "input_tokens": 240, "output_tokens": 120, "cache_creation_input_tokens": 0, "cache_read_input_tokens": 0, "review_rounds": 1, "fix_commits": 1},
+    {"arm": "superpowers", "task_key": "t6", "outcome": "merged", "ci_green": true, "input_tokens": 250, "output_tokens": 125, "cache_creation_input_tokens": 0, "cache_read_input_tokens": 0, "review_rounds": 0, "fix_commits": 2},
+    {"arm": "superpowers", "task_key": "t7", "outcome": "merged", "ci_green": true, "input_tokens": 260, "output_tokens": 130, "cache_creation_input_tokens": 0, "cache_read_input_tokens": 0, "review_rounds": 3, "fix_commits": 1},
+    {"arm": "superpowers", "task_key": "t8", "outcome": "merged", "ci_green": true, "input_tokens": 270, "output_tokens": 135, "cache_creation_input_tokens": 0, "cache_read_input_tokens": 0, "review_rounds": 1, "fix_commits": 1}
+  ]
+}

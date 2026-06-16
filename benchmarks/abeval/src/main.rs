@@ -79,6 +79,14 @@ fn main() -> Result<()> {
             println!("ran {} ({} arms)", summary.task_id, summary.arms_run);
             Ok(())
         }
-        Command::Report { .. } => unimplemented!("wired in Task 6"),
+        Command::Report { run, metrics } => {
+            let input = if let Some(metrics_path) = metrics {
+                abeval::report::load_metrics(&metrics_path)?
+            } else {
+                abeval::report::metrics_from_run_dir(&run)?
+            };
+            print!("{}", abeval::report::render_report(&input));
+            Ok(())
+        }
     }
 }
