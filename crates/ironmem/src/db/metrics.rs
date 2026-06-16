@@ -302,6 +302,25 @@ pub struct TaskPhaseModelTokens {
     pub provider_cost_usd: Option<f64>,
 }
 
+/// Phase-5 / issue #94 exploration-token attribution aggregate.
+/// Produced by `report_exploration_delta`; covers all `token_usage` rows
+/// where `source = 'mcp_response'` and `map_status IN ('map_hit', 'map_miss')`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ExplorationReport {
+    /// Total distinct `turn_id` values with a tagged `map_status`.
+    pub total_turns: i64,
+    /// Distinct `turn_id` values whose `map_status = 'map_hit'`.
+    pub map_hit_turns: i64,
+    /// Distinct `turn_id` values whose `map_status = 'map_miss'`.
+    pub map_miss_turns: i64,
+    /// `map_hit_turns / total_turns`; `0.0` when `total_turns == 0`.
+    pub hit_rate: f64,
+    /// Mean `(input_tokens + output_tokens)` per turn for `map_hit` turns.
+    pub mean_tokens_map_hit: f64,
+    /// Mean `(input_tokens + output_tokens)` per turn for `map_miss` turns.
+    pub mean_tokens_map_miss: f64,
+}
+
 /// METRICS_SPEC §10.2 split row.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TaskEstimatedSplit {
@@ -790,6 +809,116 @@ impl Database {
         since: Option<&str>,
     ) -> Result<Vec<HeadlineTokens>, MemoryError> {
         self.headline_inner("t.outcome IN ('failed','abandoned')", task, since)
+    }
+
+    /// Phase-5 / issue #94: write one exploration-attribution row with
+    /// `source = 'mcp_response'` and `estimated = false`. Called on the live
+    /// MCP-response path for `code_map_write` / `code_map_load` tool calls.
+    /// All `NewTokenUsage` columns not covered by the parameters default to
+    /// `None` or zero (no collab attribution, no cost, no cache columns).
+    #[allow(clippy::too_many_arguments)]
+    pub fn record_exploration_tokens(
+        &self,
+        ts: &str,
+        harness: &str,
+        input_tokens: i64,
+        output_tokens: i64,
+        map_status: Option<&str>,
+        turn_id: Option<&str>,
+        area: Option<&str>,
+    ) -> Result<i64, MemoryError> {
+        self.insert_token_usage(&NewTokenUsage {
+            ts: ts.to_string(),
+            source: "mcp_response".to_string(),
+            harness: harness.to_string(),
+            model: None,
+            session_id: None,
+            collab_session_id: None,
+            collab_phase: None,
+            task_tag: None,
+            input_tokens,
+            output_tokens,
+            cache_creation_input_tokens: 0,
+            cache_read_input_tokens: 0,
+            estimated: false,
+            chars: 0,
+            cost_usd: None,
+            map_status: map_status.map(|s| s.to_string()),
+            turn_id: turn_id.map(|s| s.to_string()),
+            area: area.map(|s| s.to_string()),
+        })
+    }
+
+    /// Phase-5 / issue #94: aggregate exploration-token attribution across all
+    /// `mcp_response` rows that carry a tagged `map_status`. Produces the
+    /// `ExplorationReport` used by the §10 Phase-5 report section.
+    ///
+    /// Groups by `(turn_id, map_status)` so multiple rows for the same turn
+    /// (e.g. retries) collapse to a single per-turn token total.
+    pub fn report_exploration_delta(&self) -> Result<ExplorationReport, MemoryError> {
+        // Aggregate per (turn_id, map_status): SUM tokens.
+        let mut stmt = self.conn.prepare(
+            "SELECT turn_id, map_status, SUM(input_tokens + output_tokens) AS total_tokens
+             FROM token_usage
+             WHERE source = 'mcp_response'
+               AND map_status IS NOT NULL
+               AND map_status IN ('map_hit', 'map_miss')
+             GROUP BY turn_id, map_status",
+        )?;
+        struct TurnRow {
+            map_status: String,
+            total_tokens: i64,
+        }
+        let rows: Vec<TurnRow> = stmt
+            .query_map([], |r| {
+                Ok(TurnRow {
+                    map_status: r.get(1)?,
+                    total_tokens: r.get::<_, Option<i64>>(2)?.unwrap_or(0),
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(MemoryError::from)?;
+
+        let mut map_hit_turns: i64 = 0;
+        let mut map_miss_turns: i64 = 0;
+        let mut sum_hit: f64 = 0.0;
+        let mut sum_miss: f64 = 0.0;
+
+        for row in &rows {
+            if row.map_status == "map_hit" {
+                map_hit_turns += 1;
+                sum_hit += row.total_tokens as f64;
+            } else {
+                map_miss_turns += 1;
+                sum_miss += row.total_tokens as f64;
+            }
+        }
+
+        let total_turns = map_hit_turns + map_miss_turns;
+        let hit_rate = if total_turns == 0 {
+            0.0
+        } else {
+            map_hit_turns as f64 / total_turns as f64
+        };
+        let mean_tokens_map_hit = if map_hit_turns == 0 {
+            0.0
+        } else {
+            sum_hit / map_hit_turns as f64
+        };
+        let mean_tokens_map_miss = if map_miss_turns == 0 {
+            0.0
+        } else {
+            sum_miss / map_miss_turns as f64
+        };
+
+        Ok(ExplorationReport {
+            total_turns,
+            map_hit_turns,
+            map_miss_turns,
+            hit_rate,
+            mean_tokens_map_hit,
+            mean_tokens_map_miss,
+        })
     }
 
     fn headline_inner(
@@ -1721,6 +1850,106 @@ mod tests {
         assert_eq!(non.len(), 1);
         assert_eq!(non[0].task_tag, "issue-f");
         assert_eq!(non[0].tokens_to_done, 5000);
+    }
+
+    // ---- Phase 5 / issue #94: exploration-token attribution ----
+
+    #[test]
+    fn test_record_exploration_tokens_map_hit() {
+        let db = db();
+        db.record_exploration_tokens(
+            "2026-06-15T00:00:00Z",
+            "claude",
+            100,
+            50,
+            Some("map_hit"),
+            Some("t1"),
+            Some("core"),
+        )
+        .unwrap();
+
+        let rows = db.query_token_usage(&TokenUsageQuery::default()).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].source, "mcp_response");
+        assert!(!rows[0].estimated);
+        assert_eq!(rows[0].map_status.as_deref(), Some("map_hit"));
+        assert_eq!(rows[0].turn_id.as_deref(), Some("t1"));
+        assert_eq!(rows[0].area.as_deref(), Some("core"));
+    }
+
+    #[test]
+    fn test_record_exploration_tokens_map_miss() {
+        let db = db();
+        db.record_exploration_tokens(
+            "2026-06-15T00:00:01Z",
+            "codex",
+            200,
+            80,
+            Some("map_miss"),
+            Some("t2"),
+            Some("auth"),
+        )
+        .unwrap();
+
+        let rows = db.query_token_usage(&TokenUsageQuery::default()).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].source, "mcp_response");
+        assert!(!rows[0].estimated);
+        assert_eq!(rows[0].map_status.as_deref(), Some("map_miss"));
+        assert_eq!(rows[0].turn_id.as_deref(), Some("t2"));
+        assert_eq!(rows[0].area.as_deref(), Some("auth"));
+    }
+
+    #[test]
+    fn test_report_exploration_delta_hit_rate() {
+        let db = db();
+
+        // t1 = map_hit, 300 total tokens
+        db.record_exploration_tokens(
+            "2026-06-15T00:00:01Z",
+            "claude",
+            200,
+            100,
+            Some("map_hit"),
+            Some("t1"),
+            Some("core"),
+        )
+        .unwrap();
+
+        // t2 = map_hit, 150 total tokens
+        db.record_exploration_tokens(
+            "2026-06-15T00:00:02Z",
+            "claude",
+            100,
+            50,
+            Some("map_hit"),
+            Some("t2"),
+            Some("auth"),
+        )
+        .unwrap();
+
+        // t3 = map_miss, 400 total tokens
+        db.record_exploration_tokens(
+            "2026-06-15T00:00:03Z",
+            "claude",
+            300,
+            100,
+            Some("map_miss"),
+            Some("t3"),
+            Some("db"),
+        )
+        .unwrap();
+
+        let report = db.report_exploration_delta().unwrap();
+        assert_eq!(report.total_turns, 3);
+        assert_eq!(report.map_hit_turns, 2);
+        assert_eq!(report.map_miss_turns, 1);
+        // hit_rate = 2/3
+        assert!((report.hit_rate - 2.0 / 3.0).abs() < 1e-9);
+        // mean_tokens_map_hit = (300 + 150) / 2 = 225
+        assert!((report.mean_tokens_map_hit - 225.0).abs() < 1e-9);
+        // mean_tokens_map_miss = 400 / 1 = 400
+        assert!((report.mean_tokens_map_miss - 400.0).abs() < 1e-9);
     }
 
     // ---- Migration 011: map_status / turn_id / area columns on token_usage ----

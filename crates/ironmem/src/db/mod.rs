@@ -13,6 +13,6 @@ pub mod wal;
 pub use code_maps::CodeMap;
 pub use drawers::{Drawer, ScoredDrawer, SearchFilters};
 pub use metrics::{
-    NewOccupancySample, NewTokenUsage, OccupancySample, SessionSummary, TaskOutcome, TokenUsage,
-    TokenUsageQuery,
+    ExplorationReport, NewOccupancySample, NewTokenUsage, OccupancySample, SessionSummary,
+    TaskOutcome, TokenUsage, TokenUsageQuery,
 };

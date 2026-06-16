@@ -180,17 +180,34 @@ fn find_assistant_usage(value: &serde_json::Value) -> Option<Usage> {
 use crate::db::metrics::{NewOccupancySample, NewTokenUsage, SessionSummary};
 use crate::db::schema::Database;
 
+/// Exploration-token attribution context for one code-map tool call (Phase 5
+/// / issue #94). Populated by `mcp/server.rs` for `code_map_write` /
+/// `code_map_load` and passed into `account_mcp_response`. `None` for all
+/// other tool calls.
+#[derive(Debug, Clone)]
+pub(crate) struct ExplorationContext {
+    pub turn_id: Option<String>,
+    pub area: Option<String>,
+    /// `"map_hit"` when the caller found a usable cached map; `"map_miss"`
+    /// when no map existed or the tool was `code_map_write` (write-back).
+    pub map_status: Option<String>,
+}
+
 /// Record one MCP response's size (METRICS_SPEC §5.1, Decisions D1/D2/D2b/D6).
 /// Always inserts a diagnostic `token_usage` row; atomically accumulates
 /// `session_summary.mcp_chars_served` (engine-side, race-free across the
 /// MCP-server and hook processes) when a session id is known. Best-effort: all
 /// DB errors are logged, never returned.
+///
+/// When `exploration` is `Some`, an additional measured (`estimated = false`)
+/// attribution row is written for Phase-5 code-map attribution.
 pub(crate) fn account_mcp_response(
     db: &Database,
     chars: i64,
     harness: &str,
     session_id: Option<&str>,
     ctx: &MetricsContext,
+    exploration: Option<&ExplorationContext>,
 ) {
     let row = NewTokenUsage {
         ts: now_rfc3339(),
@@ -215,6 +232,25 @@ pub(crate) fn account_mcp_response(
     .with_context(ctx);
     if let Err(e) = db.insert_token_usage(&row) {
         tracing::warn!("metrics: insert mcp_response token_usage failed: {e}");
+    }
+
+    // Phase-5 exploration attribution: write a second measured row when the
+    // tool call was a code-map read or write (carries real token proxy = 0
+    // because the MCP layer has no LLM-issued usage here, but the row
+    // establishes the turn attribution and map_status flag for the report).
+    if let Some(exp) = exploration {
+        let ts = now_rfc3339();
+        if let Err(e) = db.record_exploration_tokens(
+            &ts,
+            harness,
+            0,
+            0,
+            exp.map_status.as_deref(),
+            exp.turn_id.as_deref(),
+            exp.area.as_deref(),
+        ) {
+            tracing::warn!("metrics: insert exploration token_usage failed: {e}");
+        }
     }
 
     let Some(sid) = session_id else { return };
