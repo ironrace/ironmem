@@ -21,6 +21,18 @@ fn both_selector_yields_both_arms() {
 }
 
 #[test]
+fn serde_form_matches_label_for_every_variant() {
+    // `Arm` has two sources of truth for its strings: the serde rename and
+    // `label()`. Pin that they agree so neither can drift silently.
+    for arm in [Arm::Ironmem, Arm::Superpowers] {
+        let json = serde_json::to_string(&arm).unwrap();
+        assert_eq!(json, format!("\"{}\"", arm.label()), "serde form must equal label()");
+        let back: Arm = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, arm, "round-trip must preserve the arm");
+    }
+}
+
+#[test]
 fn assignment_is_deterministic() {
     let a = assign_arms("abeval-01-x", "both").unwrap();
     let b = assign_arms("abeval-01-x", "both").unwrap();

@@ -83,16 +83,44 @@ fn rejects_synthetic_source() {
 }
 
 #[test]
-fn content_hash_is_stable_across_loads() {
+fn content_hash_is_order_independent() {
+    // The hash sorts tasks by id, so input order must not change it. A
+    // regression dropping the sort (or the key-canonicalization) would diverge.
     let t = tasks(8);
-    assert_eq!(content_hash(&t), content_hash(&t));
+    let mut reversed = t.clone();
+    reversed.reverse();
+    assert_ne!(t[0].id, reversed[0].id, "fixture should actually be reordered");
+    assert_eq!(
+        content_hash(&t),
+        content_hash(&reversed),
+        "content hash must be independent of task ordering"
+    );
+}
+
+#[test]
+fn rejects_missing_acceptance_or_gate_per_task_in_mixed_corpus() {
+    // The invariant is "≥1 acceptance AND ≥1 gate EACH" — verify it fails when a
+    // *later* task in an otherwise-valid corpus is empty, not just task[0].
+    let mut t = tasks(8);
+    t[5].acceptance.clear();
+    assert!(validate_corpus(&t).is_err(), "empty acceptance on task[5] must reject");
+
+    let mut t2 = tasks(8);
+    t2[5].gates.clear();
+    assert!(validate_corpus(&t2).is_err(), "empty gates on task[5] must reject");
 }
 
 #[test]
 fn committed_corpus_validates() {
     let t = load_corpus("corpus/tasks.jsonl").expect("load committed corpus");
     validate_corpus(&t).expect("committed corpus must validate");
-    assert!(!content_hash(&t).is_empty());
+    // Golden pin: any accidental serialization/content change to the frozen
+    // corpus changes this hash and must be a deliberate, reviewed update.
+    assert_eq!(
+        content_hash(&t),
+        "9fe0e8c4d04b1b6b2a45f3bd90f760a0f21a3aeaa6bd4e9913e180c976e8ac91",
+        "frozen corpus content hash changed — update intentionally if the corpus changed"
+    );
 }
 
 #[test]

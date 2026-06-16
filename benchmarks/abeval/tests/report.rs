@@ -1,4 +1,10 @@
-use abeval::report::{render_report, MetricsInput, TaskMetric};
+use abeval::report::{load_metrics, metrics_from_run_dir, render_report, MetricsInput, TaskMetric};
+
+fn fixture(name: &str) -> std::path::PathBuf {
+    std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("fixtures")
+        .join(name)
+}
 
 fn merged(arm: &str, tokens: u64) -> TaskMetric {
     TaskMetric {
@@ -147,6 +153,110 @@ fn failed_and_smoke_attempts_do_not_count_toward_gate() {
         out.contains("n=8"),
         "delta must be confidence-qualified with n"
     );
+}
+
+#[test]
+fn live_8_per_arm_fixture_yields_exact_delta_math() {
+    // Numeric coverage of the DELTA payload (means/spreads/rework/merged-rate),
+    // loaded from the committed fixture via the --metrics path (load_metrics).
+    let input = load_metrics(fixture("live_8_per_arm.json")).expect("fixture loads");
+    let out = render_report(&input);
+    // Per-arm visible numbers.
+    assert!(
+        out.contains("arm ironmem: attempted=8 attempted_tokens=1620 merged=8 completed=8 \
+                      mean_tokens=202.5 mean_rework=1.8"),
+        "ironmem per-arm line wrong:\n{out}"
+    );
+    assert!(
+        out.contains("arm superpowers: attempted=8 attempted_tokens=2820 merged=8 completed=8 \
+                      mean_tokens=352.5 mean_rework=2.4"),
+        "superpowers per-arm line wrong:\n{out}"
+    );
+    // Headline delta with exact means/spreads/rework/merged-rate.
+    assert!(out.contains("DELTA (n=8, confidence-qualified):"), "missing delta:\n{out}");
+    assert!(
+        out.contains("tokens-to-done: ironmem mean=202.5 (spread 105), \
+                      superpowers mean=352.5 (spread 105)"),
+        "tokens-to-done delta wrong:\n{out}"
+    );
+    assert!(
+        out.contains("rework_loops: ironmem mean=1.8, superpowers mean=2.4"),
+        "rework delta wrong:\n{out}"
+    );
+    assert!(
+        out.contains("merged-rate: ironmem 8/8, superpowers 8/8"),
+        "merged-rate wrong:\n{out}"
+    );
+}
+
+#[test]
+fn live_under_8_fixture_withholds_delta() {
+    let input = load_metrics(fixture("live_under_8.json")).expect("fixture loads");
+    let out = render_report(&input);
+    assert!(!out.contains("DELTA"), "under-8 fixture must withhold deltas:\n{out}");
+    assert!(out.contains("both ironmem and superpowers"));
+}
+
+#[test]
+fn asymmetric_completed_counts_use_min_for_n() {
+    // 10 merged+green ironmem vs 8 superpowers → gate passes, n = min = 8.
+    let mut tasks = Vec::new();
+    for i in 0..10 {
+        tasks.push(merged("ironmem", 100 + i));
+    }
+    for i in 0..8 {
+        tasks.push(merged("superpowers", 200 + i));
+    }
+    let input = MetricsInput {
+        evidence_class: "live".to_string(),
+        tasks,
+    };
+    let out = render_report(&input);
+    assert!(out.contains("DELTA (n=8"), "n must be min(10,8)=8, not 10:\n{out}");
+    assert!(out.contains("merged-rate: ironmem 10/10, superpowers 8/8"));
+}
+
+#[test]
+fn metrics_from_run_dir_rejects_live_run_directory() {
+    // This PR ships no paid runs; a "live" run dir cannot legitimately exist and
+    // must be a hard error, not a silent smoke downgrade with fabricated rows.
+    let dir = tempfile::tempdir().unwrap();
+    let task = dir.path().join("t1");
+    std::fs::create_dir_all(&task).unwrap();
+    std::fs::write(
+        task.join("run_meta.json"),
+        r#"{"evidence_class":"live","per_arm":[]}"#,
+    )
+    .unwrap();
+    let err = metrics_from_run_dir(dir.path()).unwrap_err();
+    assert!(
+        err.to_string().contains("live run directories are not supported")
+            || format!("{err:#}").contains("live run directories are not supported"),
+        "expected live-dir rejection, got: {err:#}"
+    );
+}
+
+#[test]
+fn metrics_from_run_dir_reads_real_outcome_not_hardcoded() {
+    // Prove the per-arm outcome is read from run_meta.json, not hardcoded.
+    let dir = tempfile::tempdir().unwrap();
+    let task = dir.path().join("t1");
+    let arm = task.join("ironmem");
+    std::fs::create_dir_all(&arm).unwrap();
+    std::fs::write(
+        task.join("run_meta.json"),
+        r#"{"evidence_class":"smoke","per_arm":[{"arm":"ironmem","outcome":"failed","usage":{}}]}"#,
+    )
+    .unwrap();
+    std::fs::write(
+        arm.join("usage.json"),
+        r#"{"input_tokens":1,"output_tokens":2,"cache_creation_input_tokens":0,"cache_read_input_tokens":0}"#,
+    )
+    .unwrap();
+    let input = metrics_from_run_dir(dir.path()).unwrap();
+    assert_eq!(input.evidence_class, "smoke");
+    assert_eq!(input.tasks.len(), 1);
+    assert_eq!(input.tasks[0].outcome, "failed", "outcome must reflect run_meta, not a hardcoded 'completed'");
 }
 
 #[test]

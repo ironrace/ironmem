@@ -34,10 +34,13 @@ enum Command {
         #[arg(long)]
         out: String,
     },
-    /// Summarize a run directory; enforce the §11.3 headline gate.
+    /// Summarize a run directory OR a normalized metrics file; enforce the
+    /// §11.3 headline gate. Exactly one of --run / --metrics is required.
     Report {
-        #[arg(long)]
-        run: String,
+        /// Smoke run directory produced by `run` (mutually exclusive with --metrics).
+        #[arg(long, required_unless_present = "metrics", conflicts_with = "metrics")]
+        run: Option<String>,
+        /// Normalized metrics file, e.g. live evidence (mutually exclusive with --run).
         #[arg(long)]
         metrics: Option<String>,
     },
@@ -85,10 +88,14 @@ fn main() -> Result<()> {
             Ok(())
         }
         Command::Report { run, metrics } => {
-            let input = if let Some(metrics_path) = metrics {
-                abeval::report::load_metrics(&metrics_path)?
-            } else {
-                abeval::report::metrics_from_run_dir(&run)?
+            // clap enforces exactly-one-of via required_unless_present +
+            // conflicts_with; the final arm is an unreachable safety bail.
+            let input = match (run, metrics) {
+                (_, Some(metrics_path)) => abeval::report::load_metrics(&metrics_path)?,
+                (Some(run_dir), None) => abeval::report::metrics_from_run_dir(&run_dir)?,
+                (None, None) => {
+                    anyhow::bail!("provide exactly one of --run <dir> or --metrics <file>")
+                }
             };
             print!("{}", abeval::report::render_report(&input));
             Ok(())

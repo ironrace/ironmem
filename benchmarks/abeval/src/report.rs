@@ -70,12 +70,35 @@ pub fn load_metrics(path: impl AsRef<Path>) -> Result<MetricsInput> {
     serde_json::from_str(&body).with_context(|| "parsing metrics input".to_string())
 }
 
+/// The subset of `run_meta.json` the report path reads back. Typed (not
+/// `serde_json::Value`) so a missing/mistyped `evidence_class` is a parse error
+/// with file context, never a silent downgrade to smoke.
+#[derive(Deserialize)]
+struct RunMetaArmRead {
+    arm: String,
+    outcome: String,
+}
+
+#[derive(Deserialize)]
+struct RunMetaRead {
+    evidence_class: Option<String>,
+    #[serde(default)]
+    per_arm: Vec<RunMetaArmRead>,
+}
+
 /// Build a MetricsInput from a run directory (reads run_meta.json + per-arm usage.json).
-/// Smoke runs have outcome:"completed" and ci_green:false so they never count toward the gate.
+///
+/// This PR ships no paid runs, so the runner only ever writes
+/// `evidence_class:"smoke"` directories. A run dir is therefore always smoke
+/// here: per-arm `outcome` is read back verbatim from `run_meta.json` and
+/// `ci_green` is `false` by the smoke contract, so no row is ever headline-
+/// eligible. A `"live"` (or unknown) run dir cannot legitimately be produced by
+/// this PR — it is a hard error rather than a silent smoke downgrade or a
+/// fabricated outcome. Live evidence is consumed via a normalized metrics file
+/// (`report --metrics <file>` → [`load_metrics`]).
 pub fn metrics_from_run_dir(run: impl AsRef<Path>) -> Result<MetricsInput> {
     let run = run.as_ref();
     let mut tasks = Vec::new();
-    let mut evidence = "smoke".to_string();
     // `read_dir` order is filesystem-dependent; sort task dirs so the rendered
     // report and per-task ordering are deterministic across runs and platforms
     // (aggregation is by key, so this affects presentation, not gate math).
@@ -92,27 +115,52 @@ pub fn metrics_from_run_dir(run: impl AsRef<Path>) -> Result<MetricsInput> {
         if !meta_path.exists() {
             continue;
         }
-        let meta: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&meta_path)?)?;
-        if meta["evidence_class"] == "live" {
-            evidence = "live".to_string();
+        let meta: RunMetaRead = serde_json::from_str(
+            &std::fs::read_to_string(&meta_path)
+                .with_context(|| format!("reading {}", meta_path.display()))?,
+        )
+        .with_context(|| format!("parsing {}", meta_path.display()))?;
+        match meta.evidence_class.as_deref() {
+            Some("smoke") => {}
+            Some("live") => anyhow::bail!(
+                "{}: live run directories are not supported in this PR (no paid runs); \
+                 supply live evidence via `report --metrics <file>`",
+                meta_path.display()
+            ),
+            other => anyhow::bail!(
+                "{}: invalid or missing evidence_class {:?} (expected \"smoke\")",
+                meta_path.display(),
+                other
+            ),
         }
+        // A non-UTF8 dir name is anomalous (ids are ASCII-constrained at write
+        // time); surface it rather than collapsing to an empty task key.
         let task_id = task_dir
             .file_name()
             .and_then(|s| s.to_str())
-            .unwrap_or("")
+            .ok_or_else(|| {
+                anyhow::anyhow!("non-UTF8 task directory name under {}", run.display())
+            })?
             .to_string();
-        for arm in ["ironmem", "superpowers"] {
-            let usage_path = task_dir.join(arm).join("usage.json");
+        for arm_rec in &meta.per_arm {
+            let usage_path = task_dir.join(&arm_rec.arm).join("usage.json");
             if !usage_path.exists() {
                 continue;
             }
-            let usage: crate::client::Usage =
-                serde_json::from_str(&std::fs::read_to_string(&usage_path)?)?;
+            let usage: crate::client::Usage = serde_json::from_str(
+                &std::fs::read_to_string(&usage_path)
+                    .with_context(|| format!("reading {}", usage_path.display()))?,
+            )
+            .with_context(|| format!("parsing {}", usage_path.display()))?;
             tasks.push(TaskMetric {
-                arm: arm.to_string(),
-                task_key: format!("{task_id}:{arm}"),
-                outcome: "completed".to_string(),
-                ci_green: false, // smoke never counts toward the gate
+                arm: arm_rec.arm.clone(),
+                task_key: format!("{task_id}:{}", arm_rec.arm),
+                // Real per-arm outcome from run_meta.json (not hardcoded).
+                outcome: arm_rec.outcome.clone(),
+                // Smoke run dirs are never CI-green; guaranteed by the
+                // evidence_class check above, so this is the contract, not a
+                // fabricated value.
+                ci_green: false,
                 estimated: false,
                 input_tokens: usage.input_tokens,
                 output_tokens: usage.output_tokens,
@@ -124,7 +172,7 @@ pub fn metrics_from_run_dir(run: impl AsRef<Path>) -> Result<MetricsInput> {
         }
     }
     Ok(MetricsInput {
-        evidence_class: evidence,
+        evidence_class: "smoke".to_string(),
         tasks,
     })
 }
