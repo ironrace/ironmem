@@ -238,18 +238,24 @@ pub(crate) fn account_mcp_response(
     // tool call was a code-map read or write (carries real token proxy = 0
     // because the MCP layer has no LLM-issued usage here, but the row
     // establishes the turn attribution and map_status flag for the report).
+    // Guard: only write when map_status is set — a None map_status means the
+    // tool errored before producing a freshness verdict (e.g. code_map_load
+    // found no map or failed validation); a NULL-map_status row would be
+    // invisible to report_exploration_delta but would pollute the DB.
     if let Some(exp) = exploration {
-        let ts = now_rfc3339();
-        if let Err(e) = db.record_exploration_tokens(
-            &ts,
-            harness,
-            0,
-            0,
-            exp.map_status.as_deref(),
-            exp.turn_id.as_deref(),
-            exp.area.as_deref(),
-        ) {
-            tracing::warn!("metrics: insert exploration token_usage failed: {e}");
+        if exp.map_status.is_some() {
+            let ts = now_rfc3339();
+            if let Err(e) = db.record_exploration_tokens(
+                &ts,
+                harness,
+                0,
+                0,
+                exp.map_status.as_deref(),
+                exp.turn_id.as_deref(),
+                exp.area.as_deref(),
+            ) {
+                tracing::warn!("metrics: insert exploration token_usage failed: {e}");
+            }
         }
     }
 

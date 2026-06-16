@@ -69,8 +69,10 @@ fn account_response_metrics(
 }
 
 /// Extract the `turn_id` and `area` arguments from a `code_map_write` or
-/// `code_map_load` / `code_map_status` tool call request. Returns `None` for
-/// all other methods and tool names.
+/// `code_map_load` tool call request and determine `map_status` from the tool
+/// result. Returns `None` for all other methods and tool names.
+/// `code_map_status` is read-only and lightweight — it does not emit
+/// exploration attribution rows.
 fn request_exploration_context(
     request: &JsonRpcRequest,
     tool_result: Option<&serde_json::Value>,
