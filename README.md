@@ -286,6 +286,13 @@ ironmem report --task <tag> --since 2026-06-01  # scope to one task / start date
 
 It surfaces tokens-to-done by task and phase, the measured-vs-estimated split, iteration counts/outcome, and a merged-only headline. Cost is **§7-derived** (the stored provider figure is reported separately as `provider_reported_cost_usd`); `baseline_ready` / `baseline_task_count` track the Phase-6 ≥10-merged-task recording gate (§11.5).
 
+### Excluded benchmark crates
+
+These crates live under `benchmarks/` and are excluded from the Cargo workspace. They are standalone benchmark runners that never import ironmem crates at runtime.
+
+- `benchmarks/provbench/baseline/` — §0c–§1 ProvBench LLM-as-invalidator baseline. See [benchmarks/provbench/SPEC.md](benchmarks/provbench/SPEC.md).
+- `benchmarks/abeval/` — §11 A/B harness (corpus + dry-run smoke; no paid runs). See [benchmarks/abeval/README.md](benchmarks/abeval/README.md).
+
 ## Versioning
 
 This project uses [Semantic Versioning](https://semver.org/). The canonical version is in `crates/ironmem/Cargo.toml`. Plugin JSON files (`.codex-plugin/plugin.json`, `.claude-plugin/plugin.json`) must match this version — enforced by CI. See [CHANGELOG.md](CHANGELOG.md) for release history.
