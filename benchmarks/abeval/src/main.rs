@@ -44,7 +44,13 @@ enum Command {
 fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
-        Command::Validate { .. } => unimplemented!("wired in Task 2"),
+        Command::Validate { corpus } => {
+            let tasks = abeval::corpus::load_corpus(&corpus)?;
+            abeval::corpus::validate_corpus(&tasks)?;
+            println!("corpus OK: {} tasks", tasks.len());
+            println!("content_hash: {}", abeval::corpus::content_hash(&tasks));
+            Ok(())
+        }
         Command::Run { .. } => unimplemented!("wired in Task 4/5"),
         Command::Report { .. } => unimplemented!("wired in Task 6"),
     }
