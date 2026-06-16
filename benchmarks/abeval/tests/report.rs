@@ -237,6 +237,59 @@ fn metrics_from_run_dir_rejects_live_run_directory() {
 }
 
 #[test]
+fn load_metrics_rejects_unknown_evidence_class() {
+    // load_metrics is the live-evidence ingestion path; an unrecognized
+    // evidence_class (typo/wrong-case) must error, not silently render as SMOKE
+    // and withhold real deltas. Keeps it symmetric with metrics_from_run_dir.
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("m.json");
+    std::fs::write(&path, r#"{"evidence_class":"Live","tasks":[]}"#).unwrap();
+    let err = load_metrics(&path).unwrap_err();
+    assert!(
+        format!("{err:#}").contains("invalid evidence_class"),
+        "expected evidence_class rejection, got: {err:#}"
+    );
+}
+
+#[test]
+fn metrics_from_run_dir_rejects_missing_evidence_class() {
+    // A run_meta.json with no evidence_class key (→ None) must hard-bail, not
+    // default to smoke — the typed parse + `other =>` arm guards this.
+    let dir = tempfile::tempdir().unwrap();
+    let task = dir.path().join("t1");
+    std::fs::create_dir_all(&task).unwrap();
+    std::fs::write(task.join("run_meta.json"), r#"{"per_arm":[]}"#).unwrap();
+    let err = metrics_from_run_dir(dir.path()).unwrap_err();
+    assert!(
+        format!("{err:#}").contains("invalid or missing evidence_class"),
+        "expected missing-evidence_class rejection, got: {err:#}"
+    );
+}
+
+#[test]
+fn metrics_from_run_dir_skips_arm_without_usage_json() {
+    // per_arm lists two arms but only one has usage.json on disk; the arm with
+    // no usage.json is skipped (only the present arm appears).
+    let dir = tempfile::tempdir().unwrap();
+    let task = dir.path().join("t1");
+    let iron = task.join("ironmem");
+    std::fs::create_dir_all(&iron).unwrap();
+    std::fs::write(
+        task.join("run_meta.json"),
+        r#"{"evidence_class":"smoke","per_arm":[{"arm":"ironmem","outcome":"completed","usage":{}},{"arm":"superpowers","outcome":"completed","usage":{}}]}"#,
+    )
+    .unwrap();
+    std::fs::write(
+        iron.join("usage.json"),
+        r#"{"input_tokens":1,"output_tokens":2,"cache_creation_input_tokens":0,"cache_read_input_tokens":0}"#,
+    )
+    .unwrap();
+    let input = metrics_from_run_dir(dir.path()).unwrap();
+    assert_eq!(input.tasks.len(), 1, "only the arm with usage.json should appear");
+    assert_eq!(input.tasks[0].arm, "ironmem");
+}
+
+#[test]
 fn metrics_from_run_dir_reads_real_outcome_not_hardcoded() {
     // Prove the per-arm outcome is read from run_meta.json, not hardcoded.
     let dir = tempfile::tempdir().unwrap();

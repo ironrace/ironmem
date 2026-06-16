@@ -62,17 +62,37 @@ pub struct MetricsInput {
     pub tasks: Vec<TaskMetric>,
 }
 
-/// Load a normalized metrics file.
+/// Load a normalized metrics file (the live-evidence ingestion path).
+///
+/// `evidence_class` is validated against the closed set {"smoke","live"} and
+/// rejected otherwise, so a typo'd/wrong-cased value (e.g. "Live") is a loud
+/// error rather than being silently treated as smoke and withholding a real
+/// headline delta. This keeps `load_metrics` symmetric with the run-dir path's
+/// strictness in [`metrics_from_run_dir`].
 pub fn load_metrics(path: impl AsRef<Path>) -> Result<MetricsInput> {
     let path = path.as_ref();
     let body = std::fs::read_to_string(path)
         .with_context(|| format!("reading metrics {}", path.display()))?;
-    serde_json::from_str(&body).with_context(|| "parsing metrics input".to_string())
+    let input: MetricsInput =
+        serde_json::from_str(&body).with_context(|| format!("parsing metrics {}", path.display()))?;
+    match input.evidence_class.as_str() {
+        "smoke" | "live" => {}
+        other => anyhow::bail!(
+            "{}: invalid evidence_class {:?} (expected \"smoke\" or \"live\")",
+            path.display(),
+            other
+        ),
+    }
+    Ok(input)
 }
 
 /// The subset of `run_meta.json` the report path reads back. Typed (not
-/// `serde_json::Value`) so a missing/mistyped `evidence_class` is a parse error
-/// with file context, never a silent downgrade to smoke.
+/// `serde_json::Value`) so an unexpected `evidence_class` is rejected rather
+/// than silently downgraded to smoke: a mistyped field (e.g. a number) is a
+/// serde parse error with file context, and a missing/unknown value deserializes
+/// to `None`/other and is caught by the `other =>` bail in `metrics_from_run_dir`.
+/// Kept in sync by convention with the writer `runner::RunMeta`/`ArmUsageRecord`
+/// (the `tests/report.rs` run-dir tests pin the serialized shape).
 #[derive(Deserialize)]
 struct RunMetaArmRead {
     arm: String,

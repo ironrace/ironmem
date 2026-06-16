@@ -61,7 +61,7 @@ cargo run --manifest-path benchmarks/abeval/Cargo.toml -- run \
 #   --metrics <file> a normalized metrics file — the only way to feed live
 #                    evidence, since a run dir is always smoke in this PR.
 cargo run --manifest-path benchmarks/abeval/Cargo.toml -- report --run /tmp/abeval-run
-cargo run --manifest-path benchmarks/abeval/Cargo.toml -- report --metrics fixtures/live_8_per_arm.json
+cargo run --manifest-path benchmarks/abeval/Cargo.toml -- report --metrics benchmarks/abeval/fixtures/live_8_per_arm.json
 ```
 
 ---
