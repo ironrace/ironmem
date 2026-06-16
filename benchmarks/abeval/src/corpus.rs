@@ -21,6 +21,9 @@ pub struct Task {
     pub gates: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub setup_notes: Option<String>,
+    /// Pinned git base commit the live workspace is provisioned at (REQUIRED).
+    /// Hex object ref, length 7..=40. Reproducibility: prefer a full 40-char SHA.
+    pub base_commit: String,
 }
 
 /// Load tasks from a JSONL file (one Task object per non-blank line).
@@ -81,6 +84,13 @@ pub fn validate_corpus(tasks: &[Task]) -> Result<()> {
         if t.gates.is_empty() {
             bail!("task {} has no gates", t.id);
         }
+        if !is_valid_base_commit(&t.base_commit) {
+            bail!(
+                "task {} has invalid base_commit {:?} (expected hex git ref of length 7..=40)",
+                t.id,
+                t.base_commit
+            );
+        }
         if !SOURCE_PREFIXES.iter().any(|p| t.source.starts_with(p)) {
             bail!(
                 "task {} has non-real source {:?} (must start with one of {:?})",
@@ -102,6 +112,12 @@ pub(crate) fn is_safe_task_id(id: &str) -> bool {
         && id
             .bytes()
             .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+}
+
+/// A `base_commit` must be non-empty hex of git-object-ref length (7..=40).
+/// Network/repo existence is validated at provision time, not here.
+pub(crate) fn is_valid_base_commit(s: &str) -> bool {
+    (7..=40).contains(&s.len()) && s.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
 /// Deterministic content hash over the canonicalized corpus.
@@ -140,5 +156,61 @@ fn to_canonical(value: &serde_json::Value) -> serde_json::Value {
             serde_json::Value::Array(items.iter().map(to_canonical).collect())
         }
         other => other.clone(),
+    }
+}
+
+#[cfg(test)]
+mod base_commit_tests {
+    use super::*;
+
+    fn valid_task(n: usize) -> Task {
+        Task {
+            id: format!("t{n}"),
+            title: "T".to_string(),
+            source: "issue:#1".to_string(),
+            repo_scope: vec!["crates/ironmem/src/lib.rs".to_string()],
+            prompt: "do".to_string(),
+            acceptance: vec!["a".to_string()],
+            gates: vec!["cargo test".to_string()],
+            setup_notes: None,
+            base_commit: "abcdef1234567890abcdef1234567890abcdef12".to_string(),
+        }
+    }
+
+    /// Build a minimum-sized corpus (8 tasks) with the first slot replaced by `t`.
+    fn corpus_with(t: Task) -> Vec<Task> {
+        let mut tasks: Vec<Task> = (1..=8).map(valid_task).collect();
+        tasks[0] = t;
+        tasks
+    }
+
+    #[test]
+    fn rejects_empty_base_commit() {
+        let mut t = valid_task(0);
+        t.base_commit = String::new();
+        let err = validate_corpus(&corpus_with(t)).unwrap_err().to_string();
+        assert!(err.contains("base_commit"), "got: {err}");
+    }
+
+    #[test]
+    fn rejects_non_hex_base_commit() {
+        let mut t = valid_task(0);
+        t.base_commit = "not-a-sha-zzzz".to_string();
+        let err = validate_corpus(&corpus_with(t)).unwrap_err().to_string();
+        assert!(err.contains("base_commit"), "got: {err}");
+    }
+
+    #[test]
+    fn rejects_too_short_base_commit() {
+        let mut t = valid_task(0);
+        t.base_commit = "abc".to_string();
+        let err = validate_corpus(&corpus_with(t)).unwrap_err().to_string();
+        assert!(err.contains("base_commit"), "got: {err}");
+    }
+
+    #[test]
+    fn accepts_valid_full_sha() {
+        let tasks: Vec<Task> = (1..=8).map(valid_task).collect();
+        validate_corpus(&tasks).expect("valid base_commit accepted");
     }
 }
