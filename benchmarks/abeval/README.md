@@ -116,6 +116,16 @@ executor is built — no process is ever started without explicit approval.
 This is a HARD COST RULE from issue #97: any actual A/B run is paid and needs explicit
 user cost approval first.
 
+**Live executor (issue #122).** When approved, the runner spawns the per-arm `claude`
+command in an isolated workspace (`<out>/workspaces/<task_id>/<arm>`), parses the CLI
+`--output-format json` usage envelope, runs the task's frozen `gates` in that workspace,
+and writes a normalized `evidence_class:"live"` metrics file to
+`<out>/<task_id>/live_metrics.json` — consumable by `report --metrics`. A row is counted
+`merged`+`ci_green` only when the agent completed **and** the gates pass (the §12
+"done" proxy). The executor is built behind an injectable `CommandRunner`, so its
+spawn/parse/outcome/write logic is fully tested with fakes and harmless coreutils — the
+PR that added it performs **no real agent run**.
+
 ---
 
 ## superpowers arm isolation (C1)

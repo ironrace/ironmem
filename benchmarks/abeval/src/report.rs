@@ -62,6 +62,58 @@ pub struct MetricsInput {
     pub tasks: Vec<TaskMetric>,
 }
 
+/// Map one arm's executed [`ArmOutcome`](crate::client::ArmOutcome) plus the
+/// gate result into a [`TaskMetric`] (issue #122 done-proxy).
+///
+/// `outcome:"merged" + ci_green` is the abeval done-proxy for literal
+/// merge-to-main: it holds iff the arm's agent process completed without error
+/// (`arm_outcome.outcome == "completed"`) AND the task's frozen gates passed in
+/// the produced workspace (`ci_green`). Both are *measured* facts (process and
+/// gate exit codes), never a self-assertion by the agent under test, and live
+/// rows are always measured (`estimated:false`). See METRICS_SPEC §12.
+pub fn build_arm_metric(
+    task_id: &str,
+    arm: &str,
+    arm_outcome: &crate::client::ArmOutcome,
+    ci_green: bool,
+) -> TaskMetric {
+    let completed = arm_outcome.outcome == "completed";
+    let green = completed && ci_green;
+    let outcome = if green {
+        "merged".to_string()
+    } else {
+        // Preserve the measured agent-level outcome ("completed"/"failed");
+        // either way it is not headline-eligible without a green gate.
+        arm_outcome.outcome.clone()
+    };
+    let u = &arm_outcome.usage;
+    TaskMetric {
+        arm: arm.to_string(),
+        task_key: format!("{task_id}:{arm}"),
+        outcome,
+        ci_green: green,
+        estimated: false,
+        input_tokens: u.input_tokens,
+        output_tokens: u.output_tokens,
+        cache_creation_input_tokens: u.cache_creation_input_tokens,
+        cache_read_input_tokens: u.cache_read_input_tokens,
+        review_rounds: 0,
+        fix_commits: 0,
+    }
+}
+
+/// Write a normalized `evidence_class:"live"` metrics file consumable by
+/// [`load_metrics`] / `abeval report --metrics`. This is the live-evidence
+/// ingestion shape — run directories remain smoke-only by contract.
+pub fn write_live_metrics(path: impl AsRef<Path>, tasks: &[TaskMetric]) -> Result<()> {
+    let input = MetricsInput {
+        evidence_class: "live".to_string(),
+        tasks: tasks.to_vec(),
+    };
+    let body = serde_json::to_string_pretty(&input)?;
+    crate::runner::atomic_write_str(path.as_ref(), &body)
+}
+
 /// Load a normalized metrics file (the live-evidence ingestion path).
 ///
 /// `evidence_class` is validated against the closed set {"smoke","live"} and
@@ -73,8 +125,8 @@ pub fn load_metrics(path: impl AsRef<Path>) -> Result<MetricsInput> {
     let path = path.as_ref();
     let body = std::fs::read_to_string(path)
         .with_context(|| format!("reading metrics {}", path.display()))?;
-    let input: MetricsInput =
-        serde_json::from_str(&body).with_context(|| format!("parsing metrics {}", path.display()))?;
+    let input: MetricsInput = serde_json::from_str(&body)
+        .with_context(|| format!("parsing metrics {}", path.display()))?;
     match input.evidence_class.as_str() {
         "smoke" | "live" => {}
         other => anyhow::bail!(
@@ -108,9 +160,11 @@ struct RunMetaRead {
 
 /// Build a MetricsInput from a run directory (reads run_meta.json + per-arm usage.json).
 ///
-/// This PR ships no paid runs, so the runner only ever writes
-/// `evidence_class:"smoke"` directories. A run dir is therefore always smoke
-/// here: per-arm `outcome` is read back verbatim from `run_meta.json` and
+/// Run directories are smoke-only by contract: the dry-run path is the only
+/// writer of a `run_meta.json` tree, and live evidence is a separate normalized
+/// metrics file (`live_metrics.json` → [`load_metrics`]), never a run dir. A run
+/// dir is therefore always smoke here: per-arm `outcome` is read back verbatim
+/// from `run_meta.json` and
 /// `ci_green` is `false` by the smoke contract, so no row is ever headline-
 /// eligible. A `"live"` (or unknown) run dir cannot legitimately be produced by
 /// this PR — it is a hard error rather than a silent smoke downgrade or a
@@ -158,9 +212,7 @@ pub fn metrics_from_run_dir(run: impl AsRef<Path>) -> Result<MetricsInput> {
         let task_id = task_dir
             .file_name()
             .and_then(|s| s.to_str())
-            .ok_or_else(|| {
-                anyhow::anyhow!("non-UTF8 task directory name under {}", run.display())
-            })?
+            .ok_or_else(|| anyhow::anyhow!("non-UTF8 task directory name under {}", run.display()))?
             .to_string();
         for arm_rec in &meta.per_arm {
             let usage_path = task_dir.join(&arm_rec.arm).join("usage.json");

@@ -6,8 +6,9 @@ use anyhow::{Context, Result};
 use serde::Serialize;
 
 use crate::arms::Arm;
-use crate::client::{ArmExecutor, ArmOutcome, DryRunExecutor, Usage};
+use crate::client::{ArmExecutor, ArmOutcome, CommandRunner, DryRunExecutor, LiveExecutor, Usage};
 use crate::corpus::Task;
+use crate::report::{build_arm_metric, TaskMetric};
 
 pub struct RunArgs {
     pub task: Task,
@@ -144,14 +145,89 @@ pub fn approval_present_with_file(approval_file: Option<&Path>) -> Result<bool> 
     Ok(body.trim() == crate::constants::APPROVAL_FILE_SENTINEL)
 }
 
+/// Run a task's frozen gates in the produced workspace. Injected so the
+/// orchestration can be tested without invoking real `cargo`/`clippy`.
+pub trait GateRunner {
+    /// True iff every gate for `task` passes in `workspace`.
+    fn gates_pass(&self, task: &Task, workspace: &Path) -> Result<bool>;
+}
+
+/// Production [`GateRunner`] that runs each of a task's frozen gate strings as a
+/// shell command in the produced workspace. The gate set passes iff every gate
+/// exits zero; the first non-zero gate fails the set (no silent green).
+pub struct ShellGateRunner;
+
+impl GateRunner for ShellGateRunner {
+    fn gates_pass(&self, task: &Task, workspace: &Path) -> Result<bool> {
+        for gate in &task.gates {
+            let status = std::process::Command::new("sh")
+                .arg("-c")
+                .arg(gate)
+                .current_dir(workspace)
+                .status()
+                .with_context(|| format!("running gate {gate:?} in {}", workspace.display()))?;
+            if !status.success() {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+}
+
+/// Orchestrate one task across `arms`: run each arm through the live executor,
+/// run its gates in the produced workspace, and map (agent outcome, gate result)
+/// into a per-arm [`TaskMetric`] via the §12 done-proxy. Gates are only run when
+/// the agent completed — a failed agent is already not headline-eligible.
+pub fn run_task_live<R: CommandRunner, G: GateRunner>(
+    task: &Task,
+    arms: &[Arm],
+    executor: &LiveExecutor<R>,
+    gates: &G,
+) -> Result<Vec<TaskMetric>> {
+    let mut metrics = Vec::with_capacity(arms.len());
+    for &arm in arms {
+        let outcome = executor.execute(task, arm)?;
+        let ci_green = if outcome.outcome == "completed" {
+            let workspace = executor.workspace_for(task, arm);
+            gates.gates_pass(task, &workspace)?
+        } else {
+            false
+        };
+        metrics.push(build_arm_metric(&task.id, arm.label(), &outcome, ci_green));
+    }
+    Ok(metrics)
+}
+
+/// Run one task across `arms` through the live executor + gates, then write a
+/// normalized `evidence_class:"live"` metrics file to
+/// `<out_dir>/<task_id>/live_metrics.json` and return its path.
+///
+/// Generic over the runner/gate seams so it is exercised with fakes; the guarded
+/// CLI entry wires the REAL `claude`-spawning runner behind the approval gate.
+pub fn execute_approved_live<R: CommandRunner, G: GateRunner>(
+    task: &Task,
+    arms: &[Arm],
+    executor: &LiveExecutor<R>,
+    gates: &G,
+    out_dir: &Path,
+) -> Result<PathBuf> {
+    let metrics = run_task_live(task, arms, executor, gates)?;
+    let task_dir = out_dir.join(&task.id);
+    std::fs::create_dir_all(&task_dir)
+        .with_context(|| format!("creating {}", task_dir.display()))?;
+    let path = task_dir.join("live_metrics.json");
+    crate::report::write_live_metrics(&path, &metrics)?;
+    Ok(path)
+}
+
 /// Guard the live path, then (only if approved) run the executor. The approval
 /// check happens BEFORE the executor is touched — when `approved` is false this
 /// returns an error and the executor is never invoked.
 pub fn guard_live_then_run<E: ArmExecutor>(
-    _task: &Task,
-    _arms: &[Arm],
+    task: &Task,
+    arms: &[Arm],
     approved: bool,
-    _executor: &E,
+    executor: &E,
     _out_dir: &Path,
 ) -> Result<RunSummary> {
     if !approved {
@@ -162,9 +238,16 @@ pub fn guard_live_then_run<E: ArmExecutor>(
             crate::constants::APPROVAL_FILE_SENTINEL
         );
     }
-    // Approved live execution is intentionally NOT implemented in this PR
-    // (no paid runs). Stop at the pre-spawn boundary.
-    anyhow::bail!("live execution is not enabled in this PR (no paid runs)")
+    // Approved: release to the generic executor, one execution per arm. The
+    // metrics-writing live entry is `run_task_live_guarded`; this lower-level
+    // guard is the release point unit-tested for the not-approved invariant.
+    for &arm in arms {
+        executor.execute(task, arm)?;
+    }
+    Ok(RunSummary {
+        task_id: task.id.clone(),
+        arms_run: arms.len(),
+    })
 }
 
 /// Live entry from `run_task`: build no executor until the guard passes.
@@ -178,7 +261,23 @@ pub fn run_task_live_guarded(args: RunArgs) -> Result<RunSummary> {
             crate::constants::APPROVAL_FILE_SENTINEL
         );
     }
-    // Approved but still inert in this PR — no paid runs ship here.
-    let _ = args;
-    anyhow::bail!("live execution is not enabled in this PR (no paid runs)")
+    // Approved: build the REAL `claude`-spawning runner + shell gate runner and
+    // run the task. Arm workspaces live under `<out_dir>/workspaces/...`; the
+    // normalized live metrics file is written to `<out_dir>/<task_id>/`.
+    let executor = LiveExecutor::new(
+        crate::client::ProcessCommandRunner,
+        args.out_dir.join("workspaces"),
+    );
+    let metrics_path = execute_approved_live(
+        &args.task,
+        &args.arms,
+        &executor,
+        &ShellGateRunner,
+        &args.out_dir,
+    )?;
+    eprintln!("live metrics written to {}", metrics_path.display());
+    Ok(RunSummary {
+        task_id: args.task.id.clone(),
+        arms_run: args.arms.len(),
+    })
 }

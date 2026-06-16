@@ -113,13 +113,23 @@ fn approval_helper_reads_file_sentinel() {
     assert!(approval_present_with_file(Some(&approval_file)).unwrap());
 }
 
+// NOTE (issue #122): the former `…remains_inert` test asserted that even an
+// APPROVED live run stopped at an inert "not enabled in this PR" boundary. That
+// contract is intentionally removed here — #122 implements the live executor, so
+// an approved run now actually spawns. We do NOT drive the approved+real path in
+// tests (it would spawn `claude`); the approved orchestration is covered with
+// fakes in `tests/live_executor.rs` (`execute_approved_live_writes_live_metrics_file`),
+// the real subprocess plumbing with `printf`/`true`/`false`, and the
+// approval-REQUIRED invariant below + `…_spawns_nothing` above.
+
+/// The approval guard is the load-bearing safety invariant: without approval, a
+/// live `run` must error before constructing or spawning anything, even when
+/// `--execute-live` is set.
 #[test]
-fn execute_live_with_approval_file_passes_approval_guard_but_remains_inert() {
+fn live_run_without_approval_never_spawns() {
     let _guard = ENV_LOCK.lock().unwrap();
     std::env::remove_var(abeval::constants::APPROVAL_ENV);
     let dir = tempfile::tempdir().unwrap();
-    let approval_file = dir.path().join("approval.txt");
-    std::fs::write(&approval_file, abeval::constants::APPROVAL_FILE_SENTINEL).unwrap();
 
     let err = run_task(RunArgs {
         task: task(),
@@ -127,14 +137,17 @@ fn execute_live_with_approval_file_passes_approval_guard_but_remains_inert() {
         dry_run: false,
         execute_live: true,
         budget_usd: Some(1.0),
-        approval_file: Some(approval_file),
+        approval_file: None,
         out_dir: dir.path().to_path_buf(),
     })
     .unwrap_err();
 
     assert!(
-        err.to_string().contains("not enabled"),
-        "approved live path should stop at the inert boundary, got: {err}"
+        err.to_string().contains("approval"),
+        "missing approval must be cited, got: {err}"
     );
-    assert!(!dir.path().join("abeval-01-x").join("ironmem").exists());
+    assert!(
+        !dir.path().join("abeval-01-x").exists(),
+        "no workspace or metrics written when approval is absent"
+    );
 }

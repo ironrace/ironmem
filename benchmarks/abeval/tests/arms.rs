@@ -26,7 +26,11 @@ fn serde_form_matches_label_for_every_variant() {
     // `label()`. Pin that they agree so neither can drift silently.
     for arm in [Arm::Ironmem, Arm::Superpowers] {
         let json = serde_json::to_string(&arm).unwrap();
-        assert_eq!(json, format!("\"{}\"", arm.label()), "serde form must equal label()");
+        assert_eq!(
+            json,
+            format!("\"{}\"", arm.label()),
+            "serde form must equal label()"
+        );
         let back: Arm = serde_json::from_str(&json).unwrap();
         assert_eq!(back, arm, "round-trip must preserve the arm");
     }

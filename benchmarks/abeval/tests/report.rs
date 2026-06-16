@@ -163,20 +163,29 @@ fn live_8_per_arm_fixture_yields_exact_delta_math() {
     let out = render_report(&input);
     // Per-arm visible numbers.
     assert!(
-        out.contains("arm ironmem: attempted=8 attempted_tokens=1620 merged=8 completed=8 \
-                      mean_tokens=202.5 mean_rework=1.8"),
+        out.contains(
+            "arm ironmem: attempted=8 attempted_tokens=1620 merged=8 completed=8 \
+                      mean_tokens=202.5 mean_rework=1.8"
+        ),
         "ironmem per-arm line wrong:\n{out}"
     );
     assert!(
-        out.contains("arm superpowers: attempted=8 attempted_tokens=2820 merged=8 completed=8 \
-                      mean_tokens=352.5 mean_rework=2.4"),
+        out.contains(
+            "arm superpowers: attempted=8 attempted_tokens=2820 merged=8 completed=8 \
+                      mean_tokens=352.5 mean_rework=2.4"
+        ),
         "superpowers per-arm line wrong:\n{out}"
     );
     // Headline delta with exact means/spreads/rework/merged-rate.
-    assert!(out.contains("DELTA (n=8, confidence-qualified):"), "missing delta:\n{out}");
     assert!(
-        out.contains("tokens-to-done: ironmem mean=202.5 (spread 105), \
-                      superpowers mean=352.5 (spread 105)"),
+        out.contains("DELTA (n=8, confidence-qualified):"),
+        "missing delta:\n{out}"
+    );
+    assert!(
+        out.contains(
+            "tokens-to-done: ironmem mean=202.5 (spread 105), \
+                      superpowers mean=352.5 (spread 105)"
+        ),
         "tokens-to-done delta wrong:\n{out}"
     );
     assert!(
@@ -193,7 +202,10 @@ fn live_8_per_arm_fixture_yields_exact_delta_math() {
 fn live_under_8_fixture_withholds_delta() {
     let input = load_metrics(fixture("live_under_8.json")).expect("fixture loads");
     let out = render_report(&input);
-    assert!(!out.contains("DELTA"), "under-8 fixture must withhold deltas:\n{out}");
+    assert!(
+        !out.contains("DELTA"),
+        "under-8 fixture must withhold deltas:\n{out}"
+    );
     assert!(out.contains("both ironmem and superpowers"));
 }
 
@@ -212,7 +224,10 @@ fn asymmetric_completed_counts_use_min_for_n() {
         tasks,
     };
     let out = render_report(&input);
-    assert!(out.contains("DELTA (n=8"), "n must be min(10,8)=8, not 10:\n{out}");
+    assert!(
+        out.contains("DELTA (n=8"),
+        "n must be min(10,8)=8, not 10:\n{out}"
+    );
     assert!(out.contains("merged-rate: ironmem 10/10, superpowers 8/8"));
 }
 
@@ -230,7 +245,8 @@ fn metrics_from_run_dir_rejects_live_run_directory() {
     .unwrap();
     let err = metrics_from_run_dir(dir.path()).unwrap_err();
     assert!(
-        err.to_string().contains("live run directories are not supported")
+        err.to_string()
+            .contains("live run directories are not supported")
             || format!("{err:#}").contains("live run directories are not supported"),
         "expected live-dir rejection, got: {err:#}"
     );
@@ -285,7 +301,11 @@ fn metrics_from_run_dir_skips_arm_without_usage_json() {
     )
     .unwrap();
     let input = metrics_from_run_dir(dir.path()).unwrap();
-    assert_eq!(input.tasks.len(), 1, "only the arm with usage.json should appear");
+    assert_eq!(
+        input.tasks.len(),
+        1,
+        "only the arm with usage.json should appear"
+    );
     assert_eq!(input.tasks[0].arm, "ironmem");
 }
 
@@ -309,7 +329,10 @@ fn metrics_from_run_dir_reads_real_outcome_not_hardcoded() {
     let input = metrics_from_run_dir(dir.path()).unwrap();
     assert_eq!(input.evidence_class, "smoke");
     assert_eq!(input.tasks.len(), 1);
-    assert_eq!(input.tasks[0].outcome, "failed", "outcome must reflect run_meta, not a hardcoded 'completed'");
+    assert_eq!(
+        input.tasks[0].outcome, "failed",
+        "outcome must reflect run_meta, not a hardcoded 'completed'"
+    );
 }
 
 #[test]

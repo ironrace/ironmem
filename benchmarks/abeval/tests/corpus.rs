@@ -89,7 +89,10 @@ fn content_hash_is_order_independent() {
     let t = tasks(8);
     let mut reversed = t.clone();
     reversed.reverse();
-    assert_ne!(t[0].id, reversed[0].id, "fixture should actually be reordered");
+    assert_ne!(
+        t[0].id, reversed[0].id,
+        "fixture should actually be reordered"
+    );
     assert_eq!(
         content_hash(&t),
         content_hash(&reversed),
@@ -103,11 +106,17 @@ fn rejects_missing_acceptance_or_gate_per_task_in_mixed_corpus() {
     // *later* task in an otherwise-valid corpus is empty, not just task[0].
     let mut t = tasks(8);
     t[5].acceptance.clear();
-    assert!(validate_corpus(&t).is_err(), "empty acceptance on task[5] must reject");
+    assert!(
+        validate_corpus(&t).is_err(),
+        "empty acceptance on task[5] must reject"
+    );
 
     let mut t2 = tasks(8);
     t2[5].gates.clear();
-    assert!(validate_corpus(&t2).is_err(), "empty gates on task[5] must reject");
+    assert!(
+        validate_corpus(&t2).is_err(),
+        "empty gates on task[5] must reject"
+    );
 }
 
 #[test]
