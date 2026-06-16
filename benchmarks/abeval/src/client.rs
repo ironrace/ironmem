@@ -130,7 +130,10 @@ impl ArmExecutor for DryRunExecutor {
 /// Fallback form if the deployed CLI lacks `--permission-mode`:
 /// `["--dangerously-skip-permissions"]`.
 fn headless_permission_args() -> Vec<String> {
-    vec!["--permission-mode".to_string(), "bypassPermissions".to_string()]
+    vec![
+        "--permission-mode".to_string(),
+        "bypassPermissions".to_string(),
+    ]
 }
 
 /// Build the command for an arm. Returns the program and args that are spawned
@@ -196,20 +199,69 @@ impl CommandRunner for ProcessCommandRunner {
     }
 }
 
-/// Live executor — builds the arm command, runs it via the injected
-/// [`CommandRunner`] in a per-task/arm workspace, and parses the CLI envelope
-/// into an [`ArmOutcome`]. Spawning a real process is still gated behind the
-/// approval guard in `runner::run_task_live_guarded`.
-pub struct LiveExecutor<R: CommandRunner> {
-    runner: R,
-    workspace_root: PathBuf,
+/// Inputs to provisioning one arm's workspace.
+pub struct ProvisionRequest<'a> {
+    pub task: &'a Task,
+    pub arm: Arm,
+    pub base_commit: &'a str,
+    pub workspace: &'a Path,
 }
 
-impl<R: CommandRunner> LiveExecutor<R> {
-    pub fn new(runner: R, workspace_root: PathBuf) -> Self {
+/// Abstraction over creating a populated per-task/arm workspace. Production does
+/// a real `git worktree add`; tests use a fake. Mirrors [`CommandRunner`].
+pub trait WorkspaceProvisioner {
+    fn provision(&self, req: &ProvisionRequest) -> Result<()>;
+}
+
+/// Resolve the base commit for a task: task pin wins, else run-level override,
+/// else fail loudly with no silent HEAD fallback.
+pub fn resolve_base_commit(task: &Task, run_override: Option<&str>) -> Result<String> {
+    if !task.base_commit.trim().is_empty() {
+        return Ok(task.base_commit.clone());
+    }
+    if let Some(sha) = run_override.filter(|s| !s.trim().is_empty()) {
+        return Ok(sha.to_string());
+    }
+    anyhow::bail!(
+        "task {} has no base_commit and no --base-sha was provided; \
+         refusing to provision a workspace at an undefined base",
+        task.id
+    )
+}
+
+/// Placeholder provisioner for compilation; replaced by ProcessWorkspaceProvisioner in Task 5.
+pub struct NoOpWorkspaceProvisioner;
+
+impl WorkspaceProvisioner for NoOpWorkspaceProvisioner {
+    fn provision(&self, req: &ProvisionRequest) -> Result<()> {
+        std::fs::create_dir_all(req.workspace)
+            .with_context(|| format!("creating workspace {}", req.workspace.display()))
+    }
+}
+
+/// Live executor — builds the arm command, provisions the workspace via the
+/// injected [`WorkspaceProvisioner`], runs the command via the injected
+/// [`CommandRunner`], and parses the CLI envelope. Spawning a real process is
+/// still gated behind the approval guard in `runner::run_task_live_guarded`.
+pub struct LiveExecutor<R: CommandRunner, P: WorkspaceProvisioner> {
+    runner: R,
+    provisioner: P,
+    workspace_root: PathBuf,
+    base_override: Option<String>,
+}
+
+impl<R: CommandRunner, P: WorkspaceProvisioner> LiveExecutor<R, P> {
+    pub fn new(
+        runner: R,
+        provisioner: P,
+        workspace_root: PathBuf,
+        base_override: Option<String>,
+    ) -> Self {
         Self {
             runner,
+            provisioner,
             workspace_root,
+            base_override,
         }
     }
 
@@ -220,12 +272,18 @@ impl<R: CommandRunner> LiveExecutor<R> {
     }
 }
 
-impl<R: CommandRunner> ArmExecutor for LiveExecutor<R> {
+impl<R: CommandRunner, P: WorkspaceProvisioner> ArmExecutor for LiveExecutor<R, P> {
     fn execute(&self, task: &Task, arm: Arm) -> Result<ArmOutcome> {
         let (program, args) = arm_command(task, arm);
         let workspace = self.workspace_for(task, arm);
-        std::fs::create_dir_all(&workspace)
-            .with_context(|| format!("creating workspace {}", workspace.display()))?;
+        // Total, fail-loud base resolution: task pin wins, then run override, then error.
+        let base = resolve_base_commit(task, self.base_override.as_deref())?;
+        self.provisioner.provision(&ProvisionRequest {
+            task,
+            arm,
+            base_commit: &base,
+            workspace: &workspace,
+        })?;
 
         let output = self.runner.run(&program, &args, &workspace)?;
         let parsed = parse_cli_result(&output.stdout)?;

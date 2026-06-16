@@ -6,7 +6,10 @@ use anyhow::{Context, Result};
 use serde::Serialize;
 
 use crate::arms::Arm;
-use crate::client::{ArmExecutor, ArmOutcome, CommandRunner, DryRunExecutor, LiveExecutor, Usage};
+use crate::client::{
+    ArmExecutor, ArmOutcome, CommandRunner, DryRunExecutor, LiveExecutor, NoOpWorkspaceProvisioner,
+    Usage, WorkspaceProvisioner,
+};
 use crate::corpus::Task;
 use crate::report::{build_arm_metric, TaskMetric};
 
@@ -204,10 +207,10 @@ impl GateRunner for ProcessGateRunner {
 /// run its gates in the produced workspace, and map (agent outcome, gate result)
 /// into a per-arm [`TaskMetric`] via the §12 done-proxy. Gates are only run when
 /// the agent completed — a failed agent is already not headline-eligible.
-pub fn run_task_live<R: CommandRunner, G: GateRunner>(
+pub fn run_task_live<R: CommandRunner, P: WorkspaceProvisioner, G: GateRunner>(
     task: &Task,
     arms: &[Arm],
-    executor: &LiveExecutor<R>,
+    executor: &LiveExecutor<R, P>,
     gates: &G,
 ) -> Result<Vec<TaskMetric>> {
     let mut metrics = Vec::with_capacity(arms.len());
@@ -230,10 +233,10 @@ pub fn run_task_live<R: CommandRunner, G: GateRunner>(
 ///
 /// Generic over the runner/gate seams so it is exercised with fakes; the guarded
 /// CLI entry wires the REAL `claude`-spawning runner behind the approval gate.
-pub fn execute_approved_live<R: CommandRunner, G: GateRunner>(
+pub fn execute_approved_live<R: CommandRunner, P: WorkspaceProvisioner, G: GateRunner>(
     task: &Task,
     arms: &[Arm],
-    executor: &LiveExecutor<R>,
+    executor: &LiveExecutor<R, P>,
     gates: &G,
     out_dir: &Path,
 ) -> Result<PathBuf> {
@@ -301,7 +304,9 @@ pub fn run_task_live_guarded(args: RunArgs) -> Result<RunSummary> {
     // normalized live metrics file is written to `<out_dir>/<task_id>/`.
     let executor = LiveExecutor::new(
         crate::client::ProcessCommandRunner,
+        NoOpWorkspaceProvisioner,
         args.out_dir.join("workspaces"),
+        None,
     );
     let metrics_path = execute_approved_live(
         &args.task,

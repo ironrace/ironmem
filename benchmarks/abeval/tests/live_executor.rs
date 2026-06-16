@@ -6,9 +6,21 @@ use std::sync::{Arc, Mutex};
 
 use abeval::arms::Arm;
 use abeval::client::{
-    parse_cli_result, ArmExecutor, ArmOutcome, CommandOutput, CommandRunner, LiveExecutor, Usage,
+    parse_cli_result, ArmExecutor, ArmOutcome, CommandOutput, CommandRunner, LiveExecutor,
+    ProvisionRequest, Usage, WorkspaceProvisioner,
 };
 use abeval::corpus::Task;
+
+/// No-op provisioner for tests that don't test provisioning behavior — just
+/// creates the workspace directory so the runner can write artifacts into it.
+struct NoOpProvisioner;
+
+impl WorkspaceProvisioner for NoOpProvisioner {
+    fn provision(&self, req: &ProvisionRequest) -> anyhow::Result<()> {
+        std::fs::create_dir_all(req.workspace)?;
+        Ok(())
+    }
+}
 use abeval::report::{build_arm_metric, load_metrics, render_report, write_live_metrics};
 
 fn task() -> Task {
@@ -78,7 +90,7 @@ fn fake(stdout: &str, success: bool) -> (FakeRunner, Captured) {
 fn live_executor_ironmem_arm_runs_collab_and_parses_usage() {
     let (runner, captured) = fake(SUCCESS_JSON, true);
     let ws = tempfile::tempdir().unwrap();
-    let exec = LiveExecutor::new(runner, ws.path().to_path_buf());
+    let exec = LiveExecutor::new(runner, NoOpProvisioner, ws.path().to_path_buf(), None);
 
     let outcome = exec.execute(&task(), Arm::Ironmem).unwrap();
 
@@ -106,7 +118,7 @@ fn live_executor_ironmem_arm_runs_collab_and_parses_usage() {
 fn live_executor_superpowers_arm_excludes_collab() {
     let (runner, captured) = fake(SUCCESS_JSON, true);
     let ws = tempfile::tempdir().unwrap();
-    let exec = LiveExecutor::new(runner, ws.path().to_path_buf());
+    let exec = LiveExecutor::new(runner, NoOpProvisioner, ws.path().to_path_buf(), None);
 
     exec.execute(&task(), Arm::Superpowers).unwrap();
 
@@ -137,7 +149,7 @@ fn live_executor_superpowers_arm_excludes_collab() {
 fn live_executor_failed_process_records_failed_outcome() {
     let (runner, _c) = fake(SUCCESS_JSON, false); // process exited non-zero
     let ws = tempfile::tempdir().unwrap();
-    let exec = LiveExecutor::new(runner, ws.path().to_path_buf());
+    let exec = LiveExecutor::new(runner, NoOpProvisioner, ws.path().to_path_buf(), None);
 
     let outcome = exec.execute(&task(), Arm::Ironmem).unwrap();
     assert_eq!(outcome.outcome, "failed");
@@ -321,7 +333,7 @@ fn task_n(n: usize) -> Task {
 fn run_task_live_completed_and_green_yields_done_metrics() {
     let (runner, _c) = fake(SUCCESS_JSON, true);
     let ws = tempfile::tempdir().unwrap();
-    let exec = LiveExecutor::new(runner, ws.path().to_path_buf());
+    let exec = LiveExecutor::new(runner, NoOpProvisioner, ws.path().to_path_buf(), None);
     let gates = FakeGates { green: true };
 
     let metrics = run_task_live(&task(), &[Arm::Ironmem, Arm::Superpowers], &exec, &gates).unwrap();
@@ -340,7 +352,7 @@ fn run_task_live_completed_and_green_yields_done_metrics() {
 fn run_task_live_red_gates_are_not_done() {
     let (runner, _c) = fake(SUCCESS_JSON, true);
     let ws = tempfile::tempdir().unwrap();
-    let exec = LiveExecutor::new(runner, ws.path().to_path_buf());
+    let exec = LiveExecutor::new(runner, NoOpProvisioner, ws.path().to_path_buf(), None);
     let gates = FakeGates { green: false };
 
     let metrics = run_task_live(&task(), &[Arm::Ironmem], &exec, &gates).unwrap();
@@ -357,7 +369,7 @@ fn full_pipeline_eight_tasks_produces_headline_delta() {
     for n in 0..8 {
         // Distinct usage per arm so spreads are meaningful; success envelope.
         let (runner, _c) = fake(SUCCESS_JSON, true);
-        let exec = LiveExecutor::new(runner, ws.path().to_path_buf());
+        let exec = LiveExecutor::new(runner, NoOpProvisioner, ws.path().to_path_buf(), None);
         let metrics =
             run_task_live(&task_n(n), &[Arm::Ironmem, Arm::Superpowers], &exec, &gates).unwrap();
         all.extend(metrics);
@@ -381,7 +393,7 @@ fn full_pipeline_eight_tasks_produces_headline_delta() {
 fn execute_approved_live_writes_live_metrics_file() {
     let (runner, _c) = fake(SUCCESS_JSON, true);
     let out = tempfile::tempdir().unwrap();
-    let exec = LiveExecutor::new(runner, out.path().join("ws"));
+    let exec = LiveExecutor::new(runner, NoOpProvisioner, out.path().join("ws"), None);
     let gates = FakeGates { green: true };
 
     let path = abeval::runner::execute_approved_live(
@@ -506,7 +518,7 @@ const ZERO_USAGE_JSON: &str = r#"{"is_error":false,"result":"done",
 fn live_executor_zero_usage_on_success_is_loud_error() {
     let (runner, _c) = fake(ZERO_USAGE_JSON, true);
     let ws = tempfile::tempdir().unwrap();
-    let exec = LiveExecutor::new(runner, ws.path().to_path_buf());
+    let exec = LiveExecutor::new(runner, NoOpProvisioner, ws.path().to_path_buf(), None);
     let err = exec.execute(&task(), Arm::Ironmem).unwrap_err();
     assert!(
         err.to_string().to_lowercase().contains("usage")
@@ -521,7 +533,7 @@ fn live_executor_zero_usage_on_success_is_loud_error() {
 fn live_executor_zero_usage_on_failure_is_recorded_failed() {
     let (runner, _c) = fake(ZERO_USAGE_JSON, false);
     let ws = tempfile::tempdir().unwrap();
-    let exec = LiveExecutor::new(runner, ws.path().to_path_buf());
+    let exec = LiveExecutor::new(runner, NoOpProvisioner, ws.path().to_path_buf(), None);
     let o = exec.execute(&task(), Arm::Ironmem).unwrap();
     assert_eq!(o.outcome, "failed");
 }

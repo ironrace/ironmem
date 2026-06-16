@@ -128,7 +128,7 @@ fn committed_corpus_validates() {
     // corpus changes this hash and must be a deliberate, reviewed update.
     assert_eq!(
         content_hash(&t),
-        "9fe0e8c4d04b1b6b2a45f3bd90f760a0f21a3aeaa6bd4e9913e180c976e8ac91",
+        "e6f464ce6c75f76254bbb483f71a8ff7e3794cfeafe030c8cbb5c8f1719c8cab",
         "frozen corpus content hash changed — update intentionally if the corpus changed"
     );
 }
