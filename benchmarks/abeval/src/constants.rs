@@ -16,5 +16,7 @@ pub const APPROVAL_ENV: &str = "ABEVAL_PAID_RUN_APPROVED";
 /// Exact text required in an approval file before a paid live run can proceed.
 pub const APPROVAL_FILE_SENTINEL: &str = "I approve paid A/B runs";
 
-/// Allowed `source` reference prefixes (§2.2 invariant 4).
+/// Allowed `source` reference prefixes — the real-reference shape that encodes
+/// the §11.1 "genuine backlog, not synthetic" corpus requirement (README
+/// invariant 4).
 pub const SOURCE_PREFIXES: [&str; 3] = ["issue:", "pr:", "backlog:"];

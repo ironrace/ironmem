@@ -52,7 +52,8 @@ fn resolve_corpus_path(path: &Path) -> PathBuf {
     path.to_path_buf()
 }
 
-/// Enforce the §11.1 / §2.2 invariants. Returns Err on the first breach.
+/// Enforce the §11.1 corpus invariants (README invariants 1-4). Returns Err on
+/// the first breach.
 pub fn validate_corpus(tasks: &[Task]) -> Result<()> {
     if tasks.len() < CORPUS_MIN || tasks.len() > CORPUS_MAX {
         bail!(
@@ -92,9 +93,15 @@ pub fn validate_corpus(tasks: &[Task]) -> Result<()> {
     Ok(())
 }
 
-fn is_safe_task_id(id: &str) -> bool {
-    id.bytes()
-        .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+/// Basename-safe id check: ASCII letters, digits, `-`, or `_` only.
+/// Used both at corpus validation and as a defense-in-depth guard before any
+/// id is interpolated into an on-disk output path (prevents `..`/separator
+/// traversal from a hand-built `RunArgs` that bypassed `validate_corpus`).
+pub(crate) fn is_safe_task_id(id: &str) -> bool {
+    !id.is_empty()
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
 }
 
 /// Deterministic content hash over the canonicalized corpus.

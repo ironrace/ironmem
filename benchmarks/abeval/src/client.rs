@@ -1,6 +1,7 @@
-//! Execution abstraction: `Usage` (verbatim from provbench baseline), the
-//! `ArmExecutor` trait, a deterministic `DryRunExecutor`, and the inert
-//! `LiveExecutor` (plumbing only — fully wired/guarded in runner.rs Task 5).
+//! Execution abstraction: `Usage` (same field shape as the provbench baseline
+//! client), the `ArmExecutor` trait, a deterministic `DryRunExecutor`, and the
+//! inert `LiveExecutor` (command-template plumbing only — its execution is
+//! fail-closed in `runner::run_task_live_guarded`).
 
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
@@ -86,8 +87,8 @@ impl ArmExecutor for DryRunExecutor {
     }
 }
 
-/// Inert live executor — its command template is built and guarded in
-/// runner.rs (Task 5). It never spawns in this PR's tests.
+/// Inert live executor — its command template is built here, but execution is
+/// fail-closed in `runner::run_task_live_guarded`. It never spawns in this PR.
 pub struct LiveExecutor;
 
 impl LiveExecutor {

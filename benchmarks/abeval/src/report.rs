@@ -2,7 +2,7 @@
 //! (tokens-to-done, rework_loops, merged-rate) and enforce the headline gate.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -76,10 +76,15 @@ pub fn metrics_from_run_dir(run: impl AsRef<Path>) -> Result<MetricsInput> {
     let run = run.as_ref();
     let mut tasks = Vec::new();
     let mut evidence = "smoke".to_string();
-    for task_entry in
-        std::fs::read_dir(run).with_context(|| format!("reading run dir {}", run.display()))?
-    {
-        let task_dir = task_entry?.path();
+    // `read_dir` order is filesystem-dependent; sort task dirs so the rendered
+    // report and per-task ordering are deterministic across runs and platforms
+    // (aggregation is by key, so this affects presentation, not gate math).
+    let mut task_dirs: Vec<PathBuf> = std::fs::read_dir(run)
+        .with_context(|| format!("reading run dir {}", run.display()))?
+        .map(|e| e.map(|e| e.path()))
+        .collect::<std::io::Result<Vec<_>>>()?;
+    task_dirs.sort();
+    for task_dir in task_dirs {
         if !task_dir.is_dir() {
             continue;
         }

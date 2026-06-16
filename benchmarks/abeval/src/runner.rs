@@ -46,12 +46,23 @@ struct RunMeta<'a> {
 /// Run one task across the requested arms.
 ///
 /// Dry-run (default) uses `DryRunExecutor` — no network, no model, no spawn.
-/// The live path is guarded in Task 5 (`run_task_live_guarded`) before any
-/// executor is constructed.
+/// The live path is fail-closed in `run_task_live_guarded`, which refuses
+/// before any executor is constructed.
 pub fn run_task(args: RunArgs) -> Result<RunSummary> {
-    // Live path is fully handled by the Task 5 guard.
+    // Live path is fully handled by the fail-closed guard.
     if args.execute_live && !args.dry_run {
         return run_task_live_guarded(args);
+    }
+
+    // Defense-in-depth: the CLI path always validates the corpus first, but a
+    // hand-built `RunArgs` could carry an unsafe id. Reject anything that is not
+    // basename-safe BEFORE it is joined into an on-disk path (no `..`/separator
+    // traversal out of `out_dir`).
+    if !crate::corpus::is_safe_task_id(&args.task.id) {
+        anyhow::bail!(
+            "unsafe task id {:?}: use ASCII letters, digits, '-' or '_' only",
+            args.task.id
+        );
     }
 
     let executor = DryRunExecutor;
@@ -127,7 +138,10 @@ pub fn approval_present_with_file(approval_file: Option<&Path>) -> Result<bool> 
     };
     let body = std::fs::read_to_string(path)
         .with_context(|| format!("reading approval file {}", path.display()))?;
-    Ok(body.contains(crate::constants::APPROVAL_FILE_SENTINEL))
+    // Require the sentinel as the exact (trimmed) file content, not merely a
+    // substring — the approver must write precisely the opt-in phrase, so the
+    // sentinel can't be smuggled in inside unrelated prose.
+    Ok(body.trim() == crate::constants::APPROVAL_FILE_SENTINEL)
 }
 
 /// Guard the live path, then (only if approved) run the executor. The approval
