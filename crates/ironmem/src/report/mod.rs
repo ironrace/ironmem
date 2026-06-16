@@ -18,7 +18,9 @@ pub use render::render_text;
 use chrono::{DateTime, NaiveDate, SecondsFormat, Utc};
 use serde::Serialize;
 
-use crate::db::metrics::{HeadlineTokens, TaskEstimatedSplit, TaskOutcome, TaskPhaseModelTokens};
+use crate::db::metrics::{
+    ExplorationReport, HeadlineTokens, TaskEstimatedSplit, TaskOutcome, TaskPhaseModelTokens,
+};
 use crate::db::schema::Database;
 use crate::error::MemoryError;
 
@@ -223,6 +225,9 @@ pub struct Report {
     pub non_completions: Vec<HeadlineRow>,
     /// Per-task decompositions, ordered by `task_key`.
     pub tasks: Vec<TaskReport>,
+    /// Phase-5 code-map exploration attribution: hit rate and per-turn token
+    /// means for `map_hit` vs `map_miss` turns.
+    pub exploration: ExplorationReport,
     /// Sorted-unique labels for measured groups with no §7 price (unknown model
     /// id, `"<none>"` for NULL model, `"codex"` for any codex group).
     pub unpriced_models: Vec<String>,
@@ -296,6 +301,7 @@ pub fn run_report(db: &Database, opts: &ReportOptions) -> Result<Report, MemoryE
     let outcomes = db.report_task_outcomes(task, since_filter)?;
     let headline_rows = db.report_headline(task, since_filter)?;
     let non_completion_rows = db.report_non_completions(task, since_filter)?;
+    let exploration = db.report_exploration_delta()?;
 
     // Distinct task_keys present in any canonical task-shaped query (§10.1,
     // §10.2, or §10.3). This keeps estimated-only and outcome-only tasks visible
@@ -333,6 +339,7 @@ pub fn run_report(db: &Database, opts: &ReportOptions) -> Result<Report, MemoryE
         headline,
         non_completions,
         tasks,
+        exploration,
         unpriced_models,
     })
 }
@@ -593,6 +600,40 @@ mod tests {
         let line = one_line_summary(&db);
         assert!(line.contains("task"), "task count surfaced: {line}");
         assert!(!line.contains('\n'), "must be one line: {line}");
+    }
+
+    #[test]
+    fn run_report_includes_code_map_exploration_delta() {
+        let db = Database::open_in_memory().unwrap();
+        db.record_exploration_tokens(
+            "2026-06-15T00:00:00Z",
+            "claude",
+            0,
+            25,
+            Some("map_hit"),
+            Some("turn-hit"),
+            Some("core"),
+        )
+        .unwrap();
+        db.record_exploration_tokens(
+            "2026-06-15T00:00:01Z",
+            "claude",
+            0,
+            75,
+            Some("map_miss"),
+            Some("turn-miss"),
+            Some("core"),
+        )
+        .unwrap();
+
+        let report = run_report(&db, &ReportOptions::default()).unwrap();
+
+        assert_eq!(report.exploration.total_turns, 2);
+        assert_eq!(report.exploration.map_hit_turns, 1);
+        assert_eq!(report.exploration.map_miss_turns, 1);
+        assert!((report.exploration.hit_rate - 0.5).abs() < 1e-9);
+        assert!((report.exploration.mean_tokens_map_hit - 25.0).abs() < 1e-9);
+        assert!((report.exploration.mean_tokens_map_miss - 75.0).abs() < 1e-9);
     }
 
     #[test]

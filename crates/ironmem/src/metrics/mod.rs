@@ -199,8 +199,9 @@ pub(crate) struct ExplorationContext {
 /// MCP-server and hook processes) when a session id is known. Best-effort: all
 /// DB errors are logged, never returned.
 ///
-/// When `exploration` is `Some`, an additional measured (`estimated = false`)
-/// attribution row is written for Phase-5 code-map attribution.
+/// When `exploration` is `Some`, the live estimated MCP response row is tagged
+/// with Phase-5 code-map attribution. The token proxy remains the response-size
+/// estimate (`ceil(chars / 4)`), matching METRICS_SPEC's v0 cost model.
 pub(crate) fn account_mcp_response(
     db: &Database,
     chars: i64,
@@ -209,6 +210,7 @@ pub(crate) fn account_mcp_response(
     ctx: &MetricsContext,
     exploration: Option<&ExplorationContext>,
 ) {
+    let exploration = exploration.filter(|exp| exp.map_status.is_some());
     let row = NewTokenUsage {
         ts: now_rfc3339(),
         source: "mcp_response".to_string(),
@@ -225,38 +227,13 @@ pub(crate) fn account_mcp_response(
         estimated: true,
         chars,
         cost_usd: None,
-        map_status: None,
-        turn_id: None,
-        area: None,
+        map_status: exploration.and_then(|exp| exp.map_status.clone()),
+        turn_id: exploration.and_then(|exp| exp.turn_id.clone()),
+        area: exploration.and_then(|exp| exp.area.clone()),
     }
     .with_context(ctx);
     if let Err(e) = db.insert_token_usage(&row) {
         tracing::warn!("metrics: insert mcp_response token_usage failed: {e}");
-    }
-
-    // Phase-5 exploration attribution: write a second measured row when the
-    // tool call was a code-map read or write (carries real token proxy = 0
-    // because the MCP layer has no LLM-issued usage here, but the row
-    // establishes the turn attribution and map_status flag for the report).
-    // Guard: only write when map_status is set — a None map_status means the
-    // tool errored before producing a freshness verdict (e.g. code_map_load
-    // found no map or failed validation); a NULL-map_status row would be
-    // invisible to report_exploration_delta but would pollute the DB.
-    if let Some(exp) = exploration {
-        if exp.map_status.is_some() {
-            let ts = now_rfc3339();
-            if let Err(e) = db.record_exploration_tokens(
-                &ts,
-                harness,
-                0,
-                0,
-                exp.map_status.as_deref(),
-                exp.turn_id.as_deref(),
-                exp.area.as_deref(),
-            ) {
-                tracing::warn!("metrics: insert exploration token_usage failed: {e}");
-            }
-        }
     }
 
     let Some(sid) = session_id else { return };
@@ -432,6 +409,34 @@ mod tests {
         assert!(row.task_tag.is_none());
         assert_eq!(row.session_id.as_deref(), Some("sess-1")); // untouched
         assert_eq!(row.output_tokens, 2); // untouched
+    }
+
+    #[test]
+    fn account_mcp_response_tags_live_row_for_code_map_exploration() {
+        let db = crate::db::schema::Database::open_in_memory().unwrap();
+        let ctx = MetricsContext::default();
+        let exploration = ExplorationContext {
+            turn_id: Some("turn-1".into()),
+            area: Some("core".into()),
+            map_status: Some("map_hit".into()),
+        };
+
+        account_mcp_response(&db, 9, "claude", None, &ctx, Some(&exploration));
+
+        let rows = db
+            .query_token_usage(&crate::db::metrics::TokenUsageQuery::default())
+            .unwrap();
+        assert_eq!(rows.len(), 1, "exploration tags the live row, no duplicate");
+        assert!(rows[0].estimated);
+        assert_eq!(rows[0].chars, 9);
+        assert_eq!(rows[0].output_tokens, 3);
+        assert_eq!(rows[0].map_status.as_deref(), Some("map_hit"));
+        assert_eq!(rows[0].turn_id.as_deref(), Some("turn-1"));
+        assert_eq!(rows[0].area.as_deref(), Some("core"));
+
+        let report = db.report_exploration_delta().unwrap();
+        assert_eq!(report.total_turns, 1);
+        assert!((report.mean_tokens_map_hit - 3.0).abs() < 1e-9);
     }
 
     fn test_app() -> std::sync::Arc<crate::mcp::app::App> {

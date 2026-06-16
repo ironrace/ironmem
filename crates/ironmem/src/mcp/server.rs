@@ -97,21 +97,24 @@ fn request_exploration_context(
         .map(|s| s.to_string());
 
     // map_status: for code_map_write it is always a miss (writing a new/updated
-    // map). For code_map_load: hit when the result contains `"found": true`.
+    // map). For code_map_load: only a found+fresh map is a hit; stale,
+    // rescout-required, absent, or malformed results are misses.
     let map_status = if tool_name == "code_map_write" {
         Some("map_miss".to_string())
     } else {
-        // code_map_load: inspect the tool result's `found` field.
-        tool_result
-            .and_then(|v| v.get("found"))
-            .and_then(|v| v.as_bool())
-            .map(|found| {
-                if found {
-                    "map_hit".to_string()
-                } else {
-                    "map_miss".to_string()
-                }
-            })
+        tool_result.map(|v| {
+            let found = v.get("found").and_then(|v| v.as_bool()).unwrap_or(false);
+            let fresh = v
+                .get("freshness")
+                .and_then(|f| f.get("verdict"))
+                .and_then(|v| v.as_str())
+                == Some("fresh");
+            if found && fresh {
+                "map_hit".to_string()
+            } else {
+                "map_miss".to_string()
+            }
+        })
     };
 
     Some(crate::metrics::ExplorationContext {

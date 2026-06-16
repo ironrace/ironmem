@@ -613,7 +613,7 @@ destination, or reporting query changed.
 **Exploration attribution (Phase 5):**
 - Code-map MCP calls (`code_map_write`, `code_map_load`) emit a `source='mcp_response'` token_usage row with `map_status`, `turn_id`, `area` set. The `source` CHECK is NOT widened.
 - `map_status='map_hit'`: the turn loaded a fresh or freshened code map. `map_status='map_miss'`: the turn wrote a new map (cold scout).
-- v0 exploration cost proxy: the code-map MCP call's response-size estimate (chars/4). The `input_tokens`/`output_tokens` on exploration rows are 0 in this phase; a future phase will instrument real LLM token costs.
+- v0 exploration cost proxy: the code-map MCP call's response-size estimate (chars/4), recorded on the tagged live `mcp_response` row as `output_tokens`. A future phase may replace this proxy with real LLM token costs.
 
 **Phase-5 report (§10 extension):**
 - `report_exploration_delta()` aggregates all `mcp_response` rows with `map_status IN ('map_hit','map_miss')`, grouped by `turn_id`.

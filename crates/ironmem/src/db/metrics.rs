@@ -318,14 +318,12 @@ pub struct ExplorationReport {
     /// Mean `(input_tokens + output_tokens)` per turn for `map_hit` turns.
     ///
     /// **v0 note:** the MCP layer has no LLM-issued token counts for code-map
-    /// calls; `account_mcp_response` always writes `input_tokens = 0` /
-    /// `output_tokens = 0` on the exploration row. These fields are reserved for
-    /// a future phase that instruments actual LLM token costs; they will read
-    /// `0.0` for all rows written by the current production path.
+    /// calls; `account_mcp_response` uses the response-size estimate
+    /// (`ceil(chars / 4)`) as `output_tokens` on the tagged MCP response row.
     pub mean_tokens_map_hit: f64,
     /// Mean `(input_tokens + output_tokens)` per turn for `map_miss` turns.
     ///
-    /// See `mean_tokens_map_hit` — same v0 limitation applies.
+    /// See `mean_tokens_map_hit` — same v0 proxy applies.
     pub mean_tokens_map_miss: f64,
 }
 

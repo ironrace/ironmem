@@ -2,6 +2,7 @@
 //! Tools: `code_map_write`, `code_map_load`, `code_map_status`.
 
 use serde_json::{json, Value};
+use std::path::{Component, Path};
 
 use crate::code_maps::{classify, Freshness};
 use crate::db::drawers::generate_id;
@@ -32,45 +33,92 @@ fn validate_source_files(source_files: &[&str]) -> Result<Vec<String>, MemoryErr
                 "source_file must not be empty".into(),
             ));
         }
-        if f.starts_with('/') {
+        if f.contains('\0') || f.contains('\\') {
             return Err(MemoryError::Validation(format!(
-                "source_file must be repo-relative, not absolute: {f}"
+                "source_file must be a normalized repo-relative path: {f}"
             )));
         }
-        let path = std::path::Path::new(f);
+
+        let path = Path::new(f);
+        let mut parts = Vec::new();
         for component in path.components() {
-            if component == std::path::Component::ParentDir {
-                return Err(MemoryError::Validation(format!(
-                    "source_file must not traverse parent directories: {f}"
-                )));
+            match component {
+                Component::Normal(part) => {
+                    parts.push(part.to_string_lossy().to_string());
+                }
+                Component::CurDir => {}
+                Component::ParentDir => {
+                    return Err(MemoryError::Validation(format!(
+                        "source_file must not traverse parent directories: {f}"
+                    )));
+                }
+                Component::RootDir | Component::Prefix(_) => {
+                    return Err(MemoryError::Validation(format!(
+                        "source_file must be repo-relative, not absolute: {f}"
+                    )));
+                }
             }
         }
-        out.push(f.to_string());
+        if parts.is_empty() {
+            return Err(MemoryError::Validation(format!(
+                "source_file must name a repo-relative file: {f}"
+            )));
+        }
+        out.push(parts.join("/"));
     }
     Ok(out)
 }
 
 fn validate_repo(raw: &str) -> Result<String, MemoryError> {
-    if raw.is_empty() {
+    let trimmed = raw.trim_end_matches('/');
+    if trimmed.is_empty() {
         return Err(MemoryError::Validation("repo is required".into()));
     }
-    let canonical = raw.trim_end_matches('/');
-    // Require an absolute path to prevent git being invoked in an
-    // unintended relative or traversal directory.
-    if !canonical.starts_with('/') {
+
+    let raw_path = Path::new(trimmed);
+    if !raw_path.is_absolute() {
         return Err(MemoryError::Validation(format!(
-            "repo must be an absolute path: {canonical}"
+            "repo must be an absolute path: {trimmed}"
         )));
     }
-    // Reject parent-component traversal (e.g. "/foo/../../etc").
-    for component in std::path::Path::new(canonical).components() {
-        if component == std::path::Component::ParentDir {
+    for component in raw_path.components() {
+        if component == Component::ParentDir {
             return Err(MemoryError::Validation(format!(
-                "repo must not contain parent-directory traversal: {canonical}"
+                "repo must not contain parent-directory traversal: {trimmed}"
             )));
         }
     }
-    Ok(canonical.to_string())
+
+    let canonical = std::fs::canonicalize(raw_path).map_err(|e| {
+        MemoryError::Validation(format!(
+            "repo must be an existing git worktree: {trimmed}: {e}"
+        ))
+    })?;
+    if !canonical.is_dir() {
+        return Err(MemoryError::Validation(format!(
+            "repo must be a directory: {}",
+            canonical.display()
+        )));
+    }
+
+    let output = std::process::Command::new("git")
+        .args(["rev-parse", "--show-toplevel"])
+        .current_dir(&canonical)
+        .output()
+        .map_err(|e| MemoryError::Validation(format!("git worktree check failed: {e}")))?;
+    if !output.status.success() {
+        return Err(MemoryError::Validation(format!(
+            "repo must be a git worktree: {}",
+            canonical.display()
+        )));
+    }
+    let top = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let top = std::fs::canonicalize(&top).map_err(|e| {
+        MemoryError::Validation(format!(
+            "git worktree root could not be resolved: {top}: {e}"
+        ))
+    })?;
+    Ok(top.to_string_lossy().to_string())
 }
 
 // ── Handlers ─────────────────────────────────────────────────────────────────
@@ -88,7 +136,6 @@ pub(super) fn handle_code_map_write(app: &App, args: &Value) -> Result<Value, Me
         .get("repo")
         .and_then(|v| v.as_str())
         .ok_or_else(|| MemoryError::Validation("repo is required".into()))?;
-    let repo = validate_repo(repo_raw)?;
 
     let area_raw = args
         .get("area")
@@ -108,12 +155,26 @@ pub(super) fn handle_code_map_write(app: &App, args: &Value) -> Result<Value, Me
         .filter(|s| !s.is_empty())
         .ok_or_else(|| MemoryError::Validation("head_sha is required".into()))?;
 
-    let source_files_raw: Vec<&str> = args
+    let source_files_raw = args
         .get("source_files")
         .and_then(|v| v.as_array())
-        .map(|arr| arr.iter().filter_map(|v| v.as_str()).collect())
-        .unwrap_or_default();
+        .ok_or_else(|| MemoryError::Validation("source_files must be an array".into()))?;
+    if source_files_raw.is_empty() {
+        return Err(MemoryError::Validation(
+            "source_files must include at least one file".into(),
+        ));
+    }
+    let source_files_raw: Vec<&str> = source_files_raw
+        .iter()
+        .map(|v| {
+            v.as_str().ok_or_else(|| {
+                MemoryError::Validation("source_files must contain only strings".into())
+            })
+        })
+        .collect::<Result<_, _>>()?;
     let source_files = validate_source_files(&source_files_raw)?;
+
+    let repo = validate_repo(repo_raw)?;
 
     let built_by = args
         .get("built_by")
@@ -134,7 +195,7 @@ pub(super) fn handle_code_map_write(app: &App, args: &Value) -> Result<Value, Me
         emb.embed_one(summary).map_err(MemoryError::Embed)?
     };
 
-    let drawer_id = generate_id(summary, &repo, "code-maps");
+    let drawer_id = generate_id(summary, &repo, &format!("code-maps:{area}"));
     let built_at = chrono::Utc::now().to_rfc3339();
 
     // --- Atomic transaction: insert drawer + upsert sidecar ---
@@ -428,12 +489,14 @@ mod tests {
     #[test]
     fn test_load_absent_map_returns_rescout() {
         let app = test_app();
+        let (dir, root, _sha) = make_git_repo_with_file("src/lib.rs", "// lib");
+        let repo_path = root.to_string_lossy().to_string();
 
         let load_result = call_tool(
             &app,
             "code_map_load",
             &json!({
-                "repo": "/some/repo",
+                "repo": repo_path,
                 "area": "nonexistent-area",
             }),
         )
@@ -441,6 +504,8 @@ mod tests {
 
         assert_eq!(load_result["found"], false);
         assert_eq!(load_result["freshness"]["verdict"], "rescout_required");
+
+        drop(dir);
     }
 
     // 4. In read-only mode, code_map_write returns an error.
@@ -522,6 +587,133 @@ mod tests {
             err.contains("parent") || err.contains("source_file") || err.contains(".."),
             "error message should mention parent traversal, got: {err}"
         );
+    }
+
+    #[test]
+    fn test_invalid_repo_path_rejected_before_write() {
+        let app = test_app();
+        let dir = tempfile::tempdir().unwrap();
+        let missing_repo = dir.path().join("missing-repo");
+
+        let result = call_tool(
+            &app,
+            "code_map_write",
+            &json!({
+                "repo": missing_repo,
+                "area": "core",
+                "summary": "Summary",
+                "head_sha": "abc123",
+                "source_files": ["src/lib.rs"],
+                "built_by": "test-agent",
+            }),
+        );
+
+        assert!(result.is_err(), "missing repo path must be rejected");
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("git worktree") || err.contains("existing"),
+            "error message should mention the repo/worktree problem, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_source_files_rejects_non_string_entries() {
+        let app = test_app();
+        let (dir, root, sha) = make_git_repo_with_file("src/lib.rs", "// lib");
+        let repo_path = root.to_string_lossy().to_string();
+
+        let result = call_tool(
+            &app,
+            "code_map_write",
+            &json!({
+                "repo": repo_path,
+                "area": "core",
+                "summary": "Summary",
+                "head_sha": sha,
+                "source_files": ["src/lib.rs", 42],
+                "built_by": "test-agent",
+            }),
+        );
+
+        assert!(
+            result.is_err(),
+            "non-string source_files entries must be rejected"
+        );
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("source_files") && err.contains("strings"),
+            "error message should mention source_files strings, got: {err}"
+        );
+
+        drop(dir);
+    }
+
+    #[test]
+    fn test_same_summary_different_areas_do_not_share_drawer() {
+        let app = test_app();
+        let (dir, root, sha) = make_git_repo_with_file("src/lib.rs", "// lib");
+        let repo_path = root.to_string_lossy().to_string();
+
+        let core = call_tool(
+            &app,
+            "code_map_write",
+            &json!({
+                "repo": repo_path,
+                "area": "core",
+                "summary": "Shared summary",
+                "head_sha": sha,
+                "source_files": ["src/lib.rs"],
+                "built_by": "test-agent",
+            }),
+        )
+        .unwrap();
+        let auth = call_tool(
+            &app,
+            "code_map_write",
+            &json!({
+                "repo": repo_path,
+                "area": "auth",
+                "summary": "Shared summary",
+                "head_sha": sha,
+                "source_files": ["src/lib.rs"],
+                "built_by": "test-agent",
+            }),
+        )
+        .unwrap();
+
+        assert_ne!(
+            core["drawer_id"], auth["drawer_id"],
+            "area must participate in the drawer id"
+        );
+
+        call_tool(
+            &app,
+            "code_map_write",
+            &json!({
+                "repo": repo_path,
+                "area": "core",
+                "summary": "Refreshed core summary",
+                "head_sha": sha,
+                "source_files": ["src/lib.rs"],
+                "built_by": "test-agent",
+            }),
+        )
+        .unwrap();
+
+        let auth_after_core_refresh = call_tool(
+            &app,
+            "code_map_load",
+            &json!({
+                "repo": repo_path,
+                "area": "auth",
+            }),
+        )
+        .unwrap();
+
+        assert_eq!(auth_after_core_refresh["found"], true);
+        assert_eq!(auth_after_core_refresh["summary"], "Shared summary");
+
+        drop(dir);
     }
 
     // 7. After write, code_map_status returns freshness verdict without summary body.
