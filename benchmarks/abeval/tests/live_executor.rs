@@ -89,12 +89,13 @@ fn live_executor_ironmem_arm_runs_collab_and_parses_usage() {
     let cap = captured.lock().unwrap();
     assert_eq!(cap.len(), 1);
     assert_eq!(cap[0].0, "claude");
+    // `/collab start` is carried inside the single `-p` prompt arg (print mode).
     assert!(
-        cap[0].1.iter().any(|a| a == "/collab"),
-        "ironmem arm uses /collab"
+        cap[0].1.iter().any(|a| a.contains("/collab start")),
+        "ironmem arm uses /collab start (inside -p prompt)"
     );
     assert!(
-        cap[0].1.iter().any(|a| a == "PROMPT-BODY"),
+        cap[0].1.iter().any(|a| a.contains("PROMPT-BODY")),
         "task prompt is passed"
     );
 }
