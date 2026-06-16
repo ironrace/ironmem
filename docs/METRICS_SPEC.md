@@ -603,3 +603,19 @@ destination, or reporting query changed.
   default-off in the dogfooding MCP env; measured baseline rows are sourced from the
   controlled, cost-gated A/B runs in issue #97 rather than accrued passively. The §11.5
   baseline gate (`≥10 measured tasks`) is therefore fed by #97, not by routine usage.
+
+## Amendment: v11 Exploration-Token Attribution (issue #94)
+
+**Schema changes (migration 011):**
+- `token_usage` gains three new nullable columns: `map_status TEXT CHECK(NULL OR IN ('map_hit','map_miss'))`, `turn_id TEXT`, `area TEXT`.
+- New `code_maps` table: `(repo, area) PRIMARY KEY`, `drawer_id FK→drawers`, `head_sha`, `source_files` (JSON), `built_by`, `built_at`.
+
+**Exploration attribution (Phase 5):**
+- Code-map MCP calls (`code_map_write`, `code_map_load`) emit a `source='mcp_response'` token_usage row with `map_status`, `turn_id`, `area` set. The `source` CHECK is NOT widened.
+- `map_status='map_hit'`: the turn loaded a fresh or freshened code map. `map_status='map_miss'`: the turn wrote a new map (cold scout).
+- v0 exploration cost proxy: the code-map MCP call's response-size estimate (chars/4). The `input_tokens`/`output_tokens` on exploration rows are 0 in this phase; a future phase will instrument real LLM token costs.
+
+**Phase-5 report (§10 extension):**
+- `report_exploration_delta()` aggregates all `mcp_response` rows with `map_status IN ('map_hit','map_miss')`, grouped by `turn_id`.
+- Returns `ExplorationReport { total_turns, map_hit_turns, map_miss_turns, hit_rate, mean_tokens_map_hit, mean_tokens_map_miss }`.
+- Gate: at least one task must have both `map_hit` and `map_miss` rows for the delta to be meaningful.

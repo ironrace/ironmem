@@ -1495,6 +1495,85 @@ itself **after** model pinning exists — NOT in the collab protocol
 spec. The collab protocol is intentionally model-agnostic for
 subagent-driven implementation.
 
+## Code-Map MCP Tools (issue #94)
+
+Worker turns use three MCP tools to lazily cache and retrieve per-area code
+maps, reducing redundant file-reading across turns.
+
+### `code_map_write`
+
+Persists a code map for a named area of the repository.
+
+```json
+{
+  "repo": "/absolute/path/to/repo",
+  "area": "src/collab",
+  "source_files": ["src/collab/mod.rs", "src/collab/state.rs"],
+  "summary": "...",
+  "turn_id": "task-3"
+}
+```
+
+**Input validation:**
+- `repo` must be an absolute path (starts with `/`).
+- Each entry in `source_files` must be repo-relative: no leading `/`, no `..`
+  components.
+
+Returns the `drawer_id` and `head_sha` at write time.
+
+### `code_map_load`
+
+Retrieves the stored code map for an area and returns its freshness status.
+
+```json
+{
+  "repo": "/absolute/path/to/repo",
+  "area": "src/collab",
+  "turn_id": "task-3"
+}
+```
+
+**Response `status` values:**
+- `Fresh` — the map was built at the current `HEAD`. Use it as a
+  WHERE-to-look pointer; verify load-bearing details against actual source.
+- `Stale` — `HEAD` has advanced since the map was built. The response
+  includes a `changed_files` list. Re-read only those files, then call
+  `code_map_write` to refresh before proceeding.
+- `RescoutRequired` — no map exists for this area. Scout the area and call
+  `code_map_write` to create one.
+
+### `code_map_status`
+
+Returns the freshness status and metadata for a stored map without loading
+its full content. Useful for a quick pre-flight check before deciding whether
+to load or re-scout.
+
+```json
+{ "repo": "/absolute/path/to/repo", "area": "src/collab" }
+```
+
+### Lazy first-touch worker flow
+
+```
+code_map_load(repo, area, turn_id)
+  ├─ Fresh         → use map as exploration pointer; verify details in code
+  ├─ Stale         → re-read changed_files; code_map_write to refresh; proceed
+  └─ RescoutRequired / absent
+                   → scout area (read files, trace paths); code_map_write; proceed
+```
+
+**Re-verify caveat:** Maps are WHERE-to-look pointers, not authoritative
+documentation. Before relying on any load-bearing detail — function
+signatures, type invariants, call-site counts — re-verify against the actual
+source. Never treat a map entry alone as a contract-level claim.
+
+### Exploration-token attribution
+
+Each `code_map_load` and `code_map_write` call emits a `source='mcp_response'`
+`token_usage` row with `map_status` (`map_hit` for Fresh/Stale-refreshed,
+`map_miss` for cold scout), `turn_id`, and `area` set. See
+`docs/METRICS_SPEC.md` — Amendment v11 for the full schema and reporting spec.
+
 ## Validation
 
 ```bash
