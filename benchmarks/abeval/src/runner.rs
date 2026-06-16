@@ -22,7 +22,7 @@ pub struct RunArgs {
     pub approval_file: Option<PathBuf>,
     pub out_dir: PathBuf,
     /// Run-level base override; used only when a task has no `base_commit`.
-    /// Symbolic refs are permitted here and documented as non-reproducible.
+    /// Hex refs only. Committed corpus task pins cannot be overridden by the CLI.
     pub base_sha: Option<String>,
 }
 

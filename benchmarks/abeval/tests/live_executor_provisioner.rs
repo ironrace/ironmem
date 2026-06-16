@@ -108,6 +108,30 @@ fn execute_provisions_before_running_with_resolved_base() {
 }
 
 #[test]
+fn execute_forwards_run_override_when_task_pin_empty() {
+    let calls: ProvisionCalls = Arc::new(Mutex::new(Vec::new()));
+    let ran: RunnerRan = Arc::new(Mutex::new(false));
+    let prov = FakeProvisioner {
+        calls: calls.clone(),
+    };
+    let runner = FakeRunner {
+        stdout: r#"{"is_error":false,"result":"ok","usage":{"input_tokens":10,"output_tokens":5,"cache_creation_input_tokens":0,"cache_read_input_tokens":0}}"#.to_string(),
+        ran,
+    };
+    let exec = LiveExecutor::new(
+        runner,
+        prov,
+        PathBuf::from("/tmp/ws-root"),
+        Some("0123456".to_string()),
+    );
+    let out = exec.execute(&task(""), Arm::Ironmem).unwrap();
+    assert_eq!(out.usage.total(), 15);
+    let captured = calls.lock().unwrap();
+    assert_eq!(captured.len(), 1);
+    assert_eq!(captured[0].0, "0123456");
+}
+
+#[test]
 fn execute_short_circuits_when_base_unresolved() {
     let calls: ProvisionCalls = Arc::new(Mutex::new(Vec::new()));
     let ran: RunnerRan = Arc::new(Mutex::new(false));

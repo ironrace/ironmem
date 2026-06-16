@@ -84,8 +84,8 @@ fn fake(stdout: &str, success: bool) -> (FakeRunner, Captured) {
     )
 }
 
-/// The ironmem arm drives `claude /collab start <prompt>` and the parsed usage +
-/// success flow to a "completed" outcome.
+/// The ironmem arm drives `claude -p "/collab start <prompt>"` and the parsed
+/// usage + success flow to a "completed" outcome.
 #[test]
 fn live_executor_ironmem_arm_runs_collab_and_parses_usage() {
     let (runner, captured) = fake(SUCCESS_JSON, true);
@@ -420,6 +420,7 @@ use abeval::runner::ProcessGateRunner;
 /// The real runner spawns a process, captures its stdout, and reports success.
 /// Uses `printf` — NEVER an agent.
 #[test]
+#[ignore = "spawns real process; run manually behind the live gate"]
 fn process_command_runner_captures_stdout_and_success() {
     let runner = ProcessCommandRunner;
     let ws = tempfile::tempdir().unwrap();
@@ -436,6 +437,7 @@ fn process_command_runner_captures_stdout_and_success() {
 
 /// A non-zero exit is reported as `success = false` (not an Err).
 #[test]
+#[ignore = "spawns real process; run manually behind the live gate"]
 fn process_command_runner_reports_failure_exit() {
     let runner = ProcessCommandRunner;
     let ws = tempfile::tempdir().unwrap();
@@ -445,6 +447,7 @@ fn process_command_runner_reports_failure_exit() {
 
 /// A missing program is a loud error, not a silent empty success.
 #[test]
+#[ignore = "spawns real process; run manually behind the live gate"]
 fn process_command_runner_errors_on_missing_program() {
     let runner = ProcessCommandRunner;
     let ws = tempfile::tempdir().unwrap();
@@ -456,6 +459,7 @@ fn process_command_runner_errors_on_missing_program() {
 /// ProcessGateRunner runs each gate (program + argv, no shell) in the workspace;
 /// all-zero-exit passes.
 #[test]
+#[ignore = "spawns real process; run manually behind the live gate"]
 fn process_gate_runner_passes_when_all_gates_succeed() {
     let g = ProcessGateRunner;
     let ws = tempfile::tempdir().unwrap();
@@ -466,6 +470,7 @@ fn process_gate_runner_passes_when_all_gates_succeed() {
 
 /// Any non-zero gate fails the set (no silent green).
 #[test]
+#[ignore = "spawns real process; run manually behind the live gate"]
 fn process_gate_runner_fails_when_a_gate_fails() {
     let g = ProcessGateRunner;
     let ws = tempfile::tempdir().unwrap();
@@ -478,6 +483,7 @@ fn process_gate_runner_fails_when_a_gate_fails() {
 /// passed as inert argv tokens, never interpreted. With `sh -c`, `true ; touch X`
 /// would create X; here the `; touch X` tokens are just args to `true`.
 #[test]
+#[ignore = "spawns real process; run manually behind the live gate"]
 fn process_gate_runner_does_not_interpret_shell_metacharacters() {
     let g = ProcessGateRunner;
     let ws = tempfile::tempdir().unwrap();

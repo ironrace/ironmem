@@ -23,12 +23,14 @@ Each task object has:
 | `acceptance` | string[] | ≥1 acceptance criteria |
 | `gates` | string[] | ≥1 gate commands (e.g. `cargo test --workspace`) |
 | `setup_notes` | string? | Optional setup context |
+| `base_commit` | string | Required hex git object ref (7-40 chars) used to provision the live workspace |
 
 **Invariants** enforced by `abeval validate`:
 1. 8 ≤ count ≤ 12 (§11.1)
 2. IDs are unique, non-empty, and use only ASCII letters, digits, `-`, or `_`
 3. Every task has ≥1 acceptance criterion AND ≥1 gate
 4. `source` starts with `issue:`, `pr:`, or `backlog:` (real-reference shape only)
+5. `base_commit` is non-empty hex of git-object-ref length (7-40 chars)
 
 > **Note (C4):** `validate` checks the reference SHAPE only. Corpus authenticity —
 > confirming each committed task is genuine repo backlog, not a toy example — is
@@ -36,6 +38,9 @@ Each task object has:
 
 **Content hash:** The frozen corpus hash is recorded in the PR body / merge tag.
 It is NEVER embedded in the corpus file itself (avoids self-referential hash).
+The current committed corpus was intentionally re-pinned on 2026-06-16 after
+adding `Task.base_commit`; all eight tasks pin
+`ce2b27f2bcf3d318e0142ff5a1ece578559d9261`.
 
 ---
 
@@ -54,6 +59,10 @@ cargo run --manifest-path benchmarks/abeval/Cargo.toml -- validate
 cargo run --manifest-path benchmarks/abeval/Cargo.toml -- run \
   --task abeval-01-issue-95 --arms both --dry-run --out /tmp/abeval-run \
   [--budget-usd 5.0]
+
+# Approved live runs use each task's pinned base_commit. --base-sha is a
+# run-level fallback for unpinned hand-built tasks only; it cannot override a
+# committed corpus pin.
 
 # Summarize the run and enforce the §11.3 headline gate.
 # Exactly one of --run / --metrics is required (they are mutually exclusive):
@@ -116,15 +125,18 @@ executor is built — no process is ever started without explicit approval.
 This is a HARD COST RULE from issue #97: any actual A/B run is paid and needs explicit
 user cost approval first.
 
-**Live executor (issue #122).** When approved, the runner spawns the per-arm `claude`
-command in an isolated workspace (`<out>/workspaces/<task_id>/<arm>`), parses the CLI
-`--output-format json` usage envelope, runs the task's frozen `gates` in that workspace,
-and writes a normalized `evidence_class:"live"` metrics file to
+**Live executor (issues #122/#123).** When approved, the runner resolves the task's
+pinned `base_commit`, provisions a detached git worktree at
+`<out>/workspaces/<task_id>/<arm>` with `git worktree add` (no shell), rejects stale
+non-empty workspaces, and then spawns the per-arm `claude` command in that populated
+workspace. Both arms use `--output-format json --permission-mode bypassPermissions -p`;
+the ironmem arm carries `/collab start <prompt>` inside the single print-mode prompt
+argument. The runner parses the CLI usage envelope, runs the task's frozen `gates` in
+that workspace, and writes a normalized `evidence_class:"live"` metrics file to
 `<out>/<task_id>/live_metrics.json` — consumable by `report --metrics`. A row is counted
 `merged`+`ci_green` only when the agent completed **and** the gates pass (the §12
-"done" proxy). The executor is built behind an injectable `CommandRunner`, so its
-spawn/parse/outcome/write logic is fully tested with fakes and harmless coreutils — the
-PR that added it performs **no real agent run**.
+"done" proxy). The executor is built behind injectable process/provisioner seams, so
+default tests use fakes or pure helper coverage; the PR performs **no real agent run**.
 
 ---
 
@@ -138,7 +150,7 @@ The `superpowers` arm working context must be isolated from ironmem server-side 
 - **NO** drawer reads/writes
 - **NO** other ironmem server-side memory state in the working context
 
-The inert `LiveExecutor` command template includes these prohibitions in the task prompt.
+The `LiveExecutor` command template includes these prohibitions in the task prompt.
 **The prompt prefix is NOT the enforcement boundary** — a model can ignore an instruction.
 Any future live runner MUST enforce C1 by *environment isolation*: launch the `superpowers`
 arm in a harness configuration that physically omits the ironmem MCP server and starts from

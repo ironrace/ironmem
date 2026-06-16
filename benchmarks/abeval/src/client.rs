@@ -204,6 +204,7 @@ pub struct ProvisionRequest<'a> {
     pub task: &'a Task,
     pub arm: Arm,
     pub base_commit: &'a str,
+    pub workspace_root: &'a Path,
     pub workspace: &'a Path,
 }
 
@@ -216,10 +217,25 @@ pub trait WorkspaceProvisioner {
 /// Resolve the base commit for a task: task pin wins, else run-level override,
 /// else fail loudly with no silent HEAD fallback.
 pub fn resolve_base_commit(task: &Task, run_override: Option<&str>) -> Result<String> {
-    if !task.base_commit.trim().is_empty() {
-        return Ok(task.base_commit.clone());
+    let task_pin = task.base_commit.trim();
+    if !task_pin.is_empty() {
+        if !crate::corpus::is_valid_base_commit(task_pin) {
+            anyhow::bail!(
+                "task {} has invalid base_commit {:?} (expected hex git ref of length 7..=40)",
+                task.id,
+                task.base_commit
+            );
+        }
+        return Ok(task_pin.to_string());
     }
     if let Some(sha) = run_override.filter(|s| !s.trim().is_empty()) {
+        let sha = sha.trim();
+        if !crate::corpus::is_valid_base_commit(sha) {
+            anyhow::bail!(
+                "--base-sha {:?} is invalid (expected hex git ref of length 7..=40)",
+                sha
+            );
+        }
         return Ok(sha.to_string());
     }
     anyhow::bail!(
@@ -244,10 +260,68 @@ pub fn worktree_add_argv(
             "worktree".to_string(),
             "add".to_string(),
             "--detach".to_string(),
+            "--".to_string(),
             workspace.display().to_string(),
             base.to_string(),
         ],
     )
+}
+
+/// Parent directory that must exist before `git worktree add` can create the
+/// arm workspace leaf.
+pub fn worktree_parent_dir(workspace: &std::path::Path) -> Option<PathBuf> {
+    workspace.parent().map(Path::to_path_buf)
+}
+
+/// Reject existing symlinks from the workspace root through the arm workspace.
+///
+/// Live runs write into user-supplied `--out`; this prevents a reused/shared
+/// output tree from redirecting worktree creation outside the intended root.
+pub fn ensure_workspace_path_safe(workspace_root: &Path, workspace: &Path) -> Result<()> {
+    let rel = workspace.strip_prefix(workspace_root).with_context(|| {
+        format!(
+            "workspace {} is not under workspace root {}",
+            workspace.display(),
+            workspace_root.display()
+        )
+    })?;
+    if rel.components().any(|c| {
+        matches!(
+            c,
+            std::path::Component::ParentDir | std::path::Component::RootDir
+        )
+    }) {
+        anyhow::bail!(
+            "workspace {} escapes workspace root {}",
+            workspace.display(),
+            workspace_root.display()
+        );
+    }
+
+    if let Ok(meta) = std::fs::symlink_metadata(workspace_root) {
+        if meta.file_type().is_symlink() {
+            anyhow::bail!(
+                "workspace root {} is a symlink; refusing live provisioning",
+                workspace_root.display()
+            );
+        }
+    }
+
+    let mut path = workspace_root.to_path_buf();
+    for component in rel.components() {
+        path.push(component.as_os_str());
+        if let Ok(meta) = std::fs::symlink_metadata(&path) {
+            if meta.file_type().is_symlink() {
+                anyhow::bail!(
+                    "workspace path {} contains symlink {}; refusing live provisioning",
+                    workspace.display(),
+                    path.display()
+                );
+            }
+        }
+    }
+
+    Ok(())
 }
 
 /// Production provisioner: real `git worktree add` of the ironmem repo at the
@@ -259,13 +333,38 @@ pub struct ProcessWorkspaceProvisioner {
 
 impl WorkspaceProvisioner for ProcessWorkspaceProvisioner {
     fn provision(&self, req: &ProvisionRequest) -> Result<()> {
+        std::fs::create_dir_all(req.workspace_root)
+            .with_context(|| format!("creating workspace root {}", req.workspace_root.display()))?;
+        ensure_workspace_path_safe(req.workspace_root, req.workspace)?;
+
         // (1) Create the parent (<root>/<task_id>); git worktree add does not
         // create missing intermediate parents, and only <out_dir>/workspaces is
         // guaranteed to exist by run_task_live_guarded.
-        if let Some(parent) = req.workspace.parent() {
-            std::fs::create_dir_all(parent)
+        if let Some(parent) = worktree_parent_dir(req.workspace) {
+            std::fs::create_dir_all(&parent)
                 .with_context(|| format!("creating workspace parent {}", parent.display()))?;
         }
+        ensure_workspace_path_safe(req.workspace_root, req.workspace)?;
+
+        if let Some(parent) = worktree_parent_dir(req.workspace) {
+            let root = req.workspace_root.canonicalize().with_context(|| {
+                format!(
+                    "canonicalizing workspace root {}",
+                    req.workspace_root.display()
+                )
+            })?;
+            let parent = parent
+                .canonicalize()
+                .with_context(|| format!("canonicalizing workspace parent {}", parent.display()))?;
+            if !parent.starts_with(&root) {
+                anyhow::bail!(
+                    "workspace parent {} resolves outside workspace root {}",
+                    parent.display(),
+                    root.display()
+                );
+            }
+        }
+
         // (2) Stale-worktree guard: never silently reuse a populated leaf.
         if req.workspace.exists()
             && std::fs::read_dir(req.workspace)
@@ -285,6 +384,7 @@ impl WorkspaceProvisioner for ProcessWorkspaceProvisioner {
                 &self.ironmem_repo.display().to_string(),
                 "rev-parse",
                 "--verify",
+                "--end-of-options",
                 &format!("{}^{{commit}}", req.base_commit),
             ])
             .output()
@@ -371,6 +471,7 @@ impl<R: CommandRunner, P: WorkspaceProvisioner> ArmExecutor for LiveExecutor<R, 
             task,
             arm,
             base_commit: &base,
+            workspace_root: &self.workspace_root,
             workspace: &workspace,
         })?;
 

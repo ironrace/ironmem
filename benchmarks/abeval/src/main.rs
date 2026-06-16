@@ -75,6 +75,13 @@ fn main() -> Result<()> {
                 .into_iter()
                 .find(|t| t.id == task)
                 .ok_or_else(|| anyhow::anyhow!("task {task} not found in corpus"))?;
+            if base_sha.is_some() && !selected.base_commit.trim().is_empty() {
+                anyhow::bail!(
+                    "--base-sha cannot override pinned base_commit for task {}; \
+                     edit the corpus pin intentionally instead",
+                    selected.id
+                );
+            }
             let arm_list = abeval::arms::assign_arms(&selected.id, &arms)?;
             // Default to dry-run unless --execute-live was explicitly passed.
             let dry = dry_run || !execute_live;
