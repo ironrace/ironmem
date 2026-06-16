@@ -55,8 +55,13 @@ cargo run --manifest-path benchmarks/abeval/Cargo.toml -- run \
   --task abeval-01-issue-95 --arms both --dry-run --out /tmp/abeval-run \
   [--budget-usd 5.0]
 
-# Summarize the run and enforce the §11.3 headline gate
+# Summarize the run and enforce the §11.3 headline gate.
+# Exactly one of --run / --metrics is required (they are mutually exclusive):
+#   --run <dir>      a smoke run directory produced by `run` above.
+#   --metrics <file> a normalized metrics file — the only way to feed live
+#                    evidence, since a run dir is always smoke in this PR.
 cargo run --manifest-path benchmarks/abeval/Cargo.toml -- report --run /tmp/abeval-run
+cargo run --manifest-path benchmarks/abeval/Cargo.toml -- report --metrics fixtures/live_8_per_arm.json
 ```
 
 ---
