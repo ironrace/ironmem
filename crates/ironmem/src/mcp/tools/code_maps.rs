@@ -66,6 +66,9 @@ fn validate_source_files(source_files: &[&str]) -> Result<Vec<String>, MemoryErr
         }
         out.push(parts.join("/"));
     }
+    // Share the storage-layer byte invariant (non-empty set, no backslash/NUL,
+    // no empty entry) so MCP and DB layers enforce one identical check.
+    crate::db::code_maps::validate_source_files_storage(&out)?;
     Ok(out)
 }
 
@@ -154,6 +157,15 @@ pub(super) fn handle_code_map_write(app: &App, args: &Value) -> Result<Value, Me
         .and_then(|v| v.as_str())
         .filter(|s| !s.is_empty())
         .ok_or_else(|| MemoryError::Validation("head_sha is required".into()))?;
+    // `head_sha` is the git object name the map was built at. Reject a
+    // malformed (non-hex / wrong-length) value at write time using the same
+    // shape check the freshness engine applies — otherwise a bad SHA persists a
+    // map that is permanently `rescout_required`, wasting a scout each load.
+    if !crate::code_maps::is_hex_sha(head_sha) {
+        return Err(MemoryError::Validation(format!(
+            "head_sha must be a hex git object name (7-64 hex chars): {head_sha}"
+        )));
+    }
 
     let source_files_raw = args
         .get("source_files")
@@ -199,7 +211,7 @@ pub(super) fn handle_code_map_write(app: &App, args: &Value) -> Result<Value, Me
     let built_at = chrono::Utc::now().to_rfc3339();
 
     // --- Atomic transaction: insert drawer + upsert sidecar ---
-    app.db.with_transaction(|tx| {
+    let superseded = app.db.with_transaction(|tx| {
         Database::insert_drawer_tx(
             tx,
             &drawer_id,
@@ -210,7 +222,7 @@ pub(super) fn handle_code_map_write(app: &App, args: &Value) -> Result<Value, Me
             "",
             "mcp",
         )?;
-        Database::upsert_code_map_tx(
+        let superseded = Database::upsert_code_map_tx(
             tx,
             &repo,
             &area,
@@ -220,11 +232,19 @@ pub(super) fn handle_code_map_write(app: &App, args: &Value) -> Result<Value, Me
             built_by,
             &built_at,
         )?;
-        Ok(())
+        Ok(superseded)
     })?;
 
-    // Update live HNSW index
+    // Update live HNSW index with the new drawer's vector.
     app.insert_into_index(&drawer_id, &embedding)?;
+
+    // A refresh that superseded a prior drawer deleted that drawer in-tx; its
+    // stale vector is still live in the in-memory HNSW index. Mark the index
+    // dirty so the deleted vector is dropped on the next rebuild — mirroring
+    // `handle_delete_drawer`.
+    if superseded {
+        app.mark_dirty();
+    }
 
     Ok(json!({
         "success": true,
@@ -250,21 +270,34 @@ pub(super) fn handle_code_map_load(app: &App, args: &Value) -> Result<Value, Mem
     match app.db.get_code_map(&repo, &area)? {
         None => Ok(json!({
             "found": false,
-            "freshness": {
-                "verdict": "rescout_required",
-                "reason": "no map found"
-            }
+            "freshness": freshness_to_json(Freshness::RescoutRequired {
+                reason: "no map found".to_string(),
+            }),
         })),
         Some(map) => {
+            // Load drawer content. A missing drawer (Ok(None)) is an integrity
+            // violation, NOT an empty summary: the sidecar row references a
+            // drawer that no longer exists. Returning found:true + "" would let
+            // a worker treat a hollow map as usable. Treat it as a hard miss →
+            // found:false + rescout_required.
+            let Some(drawer) = app.db.get_drawer(&map.drawer_id)? else {
+                tracing::warn!(
+                    repo = %map.repo,
+                    area = %map.area,
+                    drawer_id = %map.drawer_id,
+                    "code_map_load: sidecar references a missing drawer; treating as rescout_required"
+                );
+                return Ok(json!({
+                    "found": false,
+                    "freshness": freshness_to_json(Freshness::RescoutRequired {
+                        reason: "map content missing; re-scout required".to_string(),
+                    }),
+                }));
+            };
+            let summary = drawer.content;
+
             let freshness = classify(&map, std::path::Path::new(&map.repo));
             let freshness_json = freshness_to_json(freshness);
-
-            // Load drawer content
-            let summary = app
-                .db
-                .get_drawer(&map.drawer_id)?
-                .map(|d| d.content)
-                .unwrap_or_default();
 
             Ok(json!({
                 "found": true,
@@ -300,10 +333,9 @@ pub(super) fn handle_code_map_status(app: &App, args: &Value) -> Result<Value, M
     match app.db.get_code_map(&repo, &area)? {
         None => Ok(json!({
             "found": false,
-            "freshness": {
-                "verdict": "rescout_required",
-                "reason": "no map found"
-            }
+            "freshness": freshness_to_json(Freshness::RescoutRequired {
+                reason: "no map found".to_string(),
+            }),
         })),
         Some(map) => {
             let freshness = classify(&map, std::path::Path::new(&map.repo));
@@ -544,7 +576,7 @@ mod tests {
                 "repo": "/some/repo",
                 "area": "core",
                 "summary": "Summary",
-                "head_sha": "abc123",
+                "head_sha": "deadbeef",
                 "source_files": ["/etc/passwd"],
                 "built_by": "test-agent",
             }),
@@ -572,7 +604,7 @@ mod tests {
                 "repo": "/some/repo",
                 "area": "core",
                 "summary": "Summary",
-                "head_sha": "abc123",
+                "head_sha": "deadbeef",
                 "source_files": ["../outside.rs"],
                 "built_by": "test-agent",
             }),
@@ -602,7 +634,7 @@ mod tests {
                 "repo": missing_repo,
                 "area": "core",
                 "summary": "Summary",
-                "head_sha": "abc123",
+                "head_sha": "deadbeef",
                 "source_files": ["src/lib.rs"],
                 "built_by": "test-agent",
             }),
@@ -712,6 +744,82 @@ mod tests {
 
         assert_eq!(auth_after_core_refresh["found"], true);
         assert_eq!(auth_after_core_refresh["summary"], "Shared summary");
+
+        drop(dir);
+    }
+
+    // head_sha must be a hex git object name — a non-hex value is rejected at
+    // write time (before persisting a permanently-rescout map).
+    #[test]
+    fn test_write_rejects_non_hex_head_sha() {
+        let app = test_app();
+        let (dir, root, _sha) = make_git_repo_with_file("src/lib.rs", "// lib");
+        let repo_path = root.to_string_lossy().to_string();
+
+        let result = call_tool(
+            &app,
+            "code_map_write",
+            &json!({
+                "repo": repo_path,
+                "area": "core",
+                "summary": "Summary",
+                "head_sha": "HEAD", // non-hex ref name → rejected
+                "source_files": ["src/lib.rs"],
+                "built_by": "test-agent",
+            }),
+        );
+
+        assert!(result.is_err(), "non-hex head_sha must be rejected");
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("head_sha") && err.contains("hex"),
+            "error should mention head_sha hex requirement, got: {err}"
+        );
+        // Nothing must have been persisted.
+        assert!(app.db.get_code_map(&repo_path, "core").unwrap().is_none());
+
+        drop(dir);
+    }
+
+    // Read-path parity with the write-path repo validation: a load against a
+    // non-existent / traversing repo path errors before any git runs.
+    #[test]
+    fn test_load_rejects_invalid_repo_path() {
+        let app = test_app();
+        let dir = tempfile::tempdir().unwrap();
+        let missing_repo = dir.path().join("missing-repo");
+
+        let result = call_tool(
+            &app,
+            "code_map_load",
+            &json!({
+                "repo": missing_repo,
+                "area": "core",
+            }),
+        );
+
+        assert!(
+            result.is_err(),
+            "missing repo path must be rejected on load"
+        );
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("git worktree") || err.contains("existing"),
+            "error should mention the repo/worktree problem, got: {err}"
+        );
+
+        let trav = call_tool(
+            &app,
+            "code_map_status",
+            &json!({
+                "repo": "/tmp/../etc",
+                "area": "core",
+            }),
+        );
+        assert!(
+            trav.is_err(),
+            "parent-traversal repo path must be rejected on status"
+        );
 
         drop(dir);
     }

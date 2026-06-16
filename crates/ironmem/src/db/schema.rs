@@ -698,6 +698,8 @@ mod tests {
         assert!(table_exists(&db, "code_maps"), "code_maps table must exist");
     }
 
+    const TOKEN_USAGE_V11_COLUMNS: [&str; 3] = ["map_status", "turn_id", "area"];
+
     #[test]
     fn test_v10_to_v11_upgrade_adds_code_maps() {
         let db = open_at_v10();
@@ -706,12 +708,58 @@ mod tests {
             !table_exists(&db, "code_maps"),
             "code_maps should not exist at v10"
         );
+        for c in TOKEN_USAGE_V11_COLUMNS {
+            assert!(
+                !column_exists(&db, "token_usage", c),
+                "token_usage.{c} should not exist at v10"
+            );
+        }
         db.migrate().unwrap();
         assert_eq!(schema_version_of(&db), 11);
         assert!(
             table_exists(&db, "code_maps"),
             "code_maps must exist after upgrade to v11"
         );
+        for c in TOKEN_USAGE_V11_COLUMNS {
+            assert!(
+                column_exists(&db, "token_usage", c),
+                "token_usage.{c} must exist after upgrade to v11"
+            );
+        }
+    }
+
+    #[test]
+    fn test_v10_to_v11_preserves_existing_token_usage_rows_as_null() {
+        let db = open_at_v10();
+        // Insert a token_usage row at v10 (before the exploration columns exist).
+        db.conn
+            .execute(
+                "INSERT INTO token_usage
+                    (ts, source, harness, input_tokens, output_tokens,
+                     cache_creation_input_tokens, cache_read_input_tokens,
+                     estimated, chars)
+                 VALUES ('2026-06-15T00:00:00Z', 'mcp_response', 'claude',
+                         0, 0, 0, 0, 1, 0)",
+                [],
+            )
+            .unwrap();
+
+        db.migrate().unwrap();
+        assert_eq!(schema_version_of(&db), 11);
+
+        // The pre-existing row must read back with the three new columns NULL.
+        let (map_status, turn_id, area): (Option<String>, Option<String>, Option<String>) = db
+            .conn
+            .query_row(
+                "SELECT map_status, turn_id, area FROM token_usage
+                 WHERE ts = '2026-06-15T00:00:00Z'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert!(map_status.is_none(), "map_status must back-fill as NULL");
+        assert!(turn_id.is_none(), "turn_id must back-fill as NULL");
+        assert!(area.is_none(), "area must back-fill as NULL");
     }
 
     #[test]

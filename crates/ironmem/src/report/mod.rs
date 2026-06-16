@@ -546,6 +546,7 @@ fn one_line_summary_inner(db: &Database) -> Result<String, MemoryError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::db::metrics::MapStatus;
     use crate::db::NewTokenUsage;
 
     /// Minimal local seed: one merged task (`sess-rich`) with two measured
@@ -610,7 +611,7 @@ mod tests {
             "claude",
             0,
             25,
-            Some("map_hit"),
+            Some(MapStatus::Hit),
             Some("turn-hit"),
             Some("core"),
         )
@@ -620,7 +621,7 @@ mod tests {
             "claude",
             0,
             75,
-            Some("map_miss"),
+            Some(MapStatus::Miss),
             Some("turn-miss"),
             Some("core"),
         )
@@ -634,6 +635,62 @@ mod tests {
         assert!((report.exploration.hit_rate - 0.5).abs() < 1e-9);
         assert!((report.exploration.mean_tokens_map_hit - 25.0).abs() < 1e-9);
         assert!((report.exploration.mean_tokens_map_miss - 75.0).abs() < 1e-9);
+    }
+
+    /// Phase-5 gate proven against REAL live rows: seed exploration rows through
+    /// the actual live writer `account_mcp_response` (estimated=true,
+    /// chars→ceil(chars/4) token proxy) — the same path `mcp/server.rs` drives —
+    /// and assert `run_report` computes map-hit rate + per-turn delta correctly.
+    /// This guards against `report_exploration_delta` wrongly discriminating on
+    /// `estimated` (live rows are estimated=true and MUST still count).
+    #[test]
+    fn run_report_exploration_delta_counts_live_estimated_rows() {
+        use crate::metrics::{account_mcp_response, ExplorationContext, MetricsContext};
+
+        let db = Database::open_in_memory().unwrap();
+        let ctx = MetricsContext::default();
+
+        // map_hit turn: chars=40 → output_tokens = ceil(40/4) = 10.
+        account_mcp_response(
+            &db,
+            40,
+            "claude",
+            None,
+            &ctx,
+            Some(&ExplorationContext {
+                turn_id: Some("turn-hit".into()),
+                area: Some("core".into()),
+                map_status: Some(MapStatus::Hit),
+            }),
+        );
+        // map_miss turn: chars=120 → output_tokens = ceil(120/4) = 30.
+        account_mcp_response(
+            &db,
+            120,
+            "claude",
+            None,
+            &ctx,
+            Some(&ExplorationContext {
+                turn_id: Some("turn-miss".into()),
+                area: Some("core".into()),
+                map_status: Some(MapStatus::Miss),
+            }),
+        );
+
+        // Sanity: the live rows are estimated=true.
+        let rows = db
+            .query_token_usage(&crate::db::metrics::TokenUsageQuery::default())
+            .unwrap();
+        assert_eq!(rows.len(), 2);
+        assert!(rows.iter().all(|r| r.estimated));
+
+        let report = run_report(&db, &ReportOptions::default()).unwrap();
+        assert_eq!(report.exploration.total_turns, 2);
+        assert_eq!(report.exploration.map_hit_turns, 1);
+        assert_eq!(report.exploration.map_miss_turns, 1);
+        assert!((report.exploration.hit_rate - 0.5).abs() < 1e-9);
+        assert!((report.exploration.mean_tokens_map_hit - 10.0).abs() < 1e-9);
+        assert!((report.exploration.mean_tokens_map_miss - 30.0).abs() < 1e-9);
     }
 
     #[test]

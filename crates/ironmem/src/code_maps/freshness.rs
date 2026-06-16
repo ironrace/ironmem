@@ -21,6 +21,21 @@ pub enum Freshness {
     RescoutRequired { reason: String },
 }
 
+/// Whether `sha` looks like a git object name: a non-empty, 7–64 char run of
+/// ASCII hex digits. The single source of truth for SHA shape — shared by the
+/// freshness git-shell guard and the `code_map_write` input validator so a
+/// malformed SHA is rejected identically at write time and at classify time.
+///
+/// This is intentionally a *shape* check (not an existence check): an existence
+/// check requires a git call, and the freshness engine already maps a
+/// non-resolvable-but-well-shaped SHA to `RescoutRequired` (fail-safe).
+pub fn is_hex_sha(sha: &str) -> bool {
+    !sha.is_empty()
+        && sha.len() >= 7
+        && sha.len() <= 64
+        && sha.chars().all(|c| c.is_ascii_hexdigit())
+}
+
 /// Run `git diff --name-only <build_sha>..HEAD` in `repo_root` and return
 /// the list of repo-relative changed file paths.
 ///
@@ -32,11 +47,7 @@ fn changed_files(repo_root: &Path, build_sha: &str) -> Result<Vec<String>, Strin
     // object name. Rejecting non-hex (and bounding length) here fails fast,
     // avoids spawning git on garbage, and removes any ambiguity about refs or
     // shell-meaningful bytes reaching the subprocess.
-    let is_hex_sha = !build_sha.is_empty()
-        && build_sha.len() >= 7
-        && build_sha.len() <= 64
-        && build_sha.chars().all(|c| c.is_ascii_hexdigit());
-    if !is_hex_sha {
+    if !is_hex_sha(build_sha) {
         return Err("map cannot be verified; re-scout required".to_string());
     }
 
@@ -221,6 +232,53 @@ mod tests {
             matches!(result, Freshness::RescoutRequired { .. }),
             "expected RescoutRequired, got {:?}",
             result
+        );
+    }
+
+    /// A non-hex `build_sha` (e.g. a ref name like `HEAD`, or a wrong-length
+    /// string) is rejected by the pre-git shape guard → `RescoutRequired`,
+    /// WITHOUT spawning git. Distinct from `test_rescout_on_invalid_build_sha`,
+    /// which uses a *valid-hex but nonexistent* SHA and exercises the
+    /// git-failure path.
+    #[test]
+    fn test_rescout_on_non_hex_sha_skips_git() {
+        let (_dir, root) = make_git_repo();
+        commit_file(&root, "seed.rs", "// seed");
+
+        for bad in [
+            "HEAD",
+            "main",
+            "abcde",
+            &"a".repeat(65),
+            "g".repeat(40).as_str(),
+        ] {
+            let map = dummy_code_map(bad, vec!["seed.rs".to_string()]);
+            let result = classify(&map, &root);
+            assert!(
+                matches!(result, Freshness::RescoutRequired { .. }),
+                "non-hex build_sha {bad:?} must map to RescoutRequired, got {result:?}"
+            );
+        }
+    }
+
+    /// A non-ASCII tracked path must round-trip through `git diff` and match the
+    /// stored `source_files`. Guards the `-c core.quotepath=false` arg against
+    /// regression: without it git C-quotes the path and the intersection misses,
+    /// falsely reporting `Fresh` (fail-open).
+    #[test]
+    fn test_stale_with_non_ascii_path() {
+        let (_dir, root) = make_git_repo();
+        let build_sha = commit_file(&root, "src/café.rs", "// v1");
+        // Change the non-ASCII tracked file and commit.
+        commit_file(&root, "src/café.rs", "// v2 changed");
+
+        let map = dummy_code_map(&build_sha, vec!["src/café.rs".to_string()]);
+        let result = classify(&map, &root);
+        assert_eq!(
+            result,
+            Freshness::Stale {
+                changed_files: vec!["src/café.rs".to_string()]
+            }
         );
     }
 

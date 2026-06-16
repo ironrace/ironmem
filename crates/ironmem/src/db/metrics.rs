@@ -13,11 +13,60 @@
 //! (see `migrations/008_metrics.sql`) enforce domain correctness so a
 //! malformed direct write cannot land an out-of-domain value.
 
+use rusqlite::types::{FromSql, FromSqlError, FromSqlResult, ToSql, ToSqlOutput, ValueRef};
 use rusqlite::{params, OptionalExtension};
 use serde::{Deserialize, Serialize};
 
 use super::schema::Database;
 use crate::error::MemoryError;
+
+// ---------------------------------------------------------------------------
+// Typed enums
+// ---------------------------------------------------------------------------
+
+/// Exploration-token verdict for one code-map MCP call (Phase 5 / issue #94).
+/// The ONLY two legal `token_usage.map_status` values. Confining the wire
+/// strings to the `ToSql`/`FromSql` impls below keeps `"map_hit"`/`"map_miss"`
+/// from spreading as bare literals across the codebase; the DB CHECK constraint
+/// (migration 011) remains as defense-in-depth.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MapStatus {
+    /// A `code_map_load` returned a found map with verdict `fresh`.
+    #[serde(rename = "map_hit")]
+    Hit,
+    /// Every other case — stale/rescout/absent load, or any `code_map_write`.
+    #[serde(rename = "map_miss")]
+    Miss,
+}
+
+impl MapStatus {
+    /// The canonical DB/wire string — the single producer of these literals.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            MapStatus::Hit => "map_hit",
+            MapStatus::Miss => "map_miss",
+        }
+    }
+}
+
+impl ToSql for MapStatus {
+    fn to_sql(&self) -> rusqlite::Result<ToSqlOutput<'_>> {
+        Ok(ToSqlOutput::from(self.as_str()))
+    }
+}
+
+impl FromSql for MapStatus {
+    fn column_result(value: ValueRef<'_>) -> FromSqlResult<Self> {
+        match value.as_str()? {
+            "map_hit" => Ok(MapStatus::Hit),
+            "map_miss" => Ok(MapStatus::Miss),
+            other => Err(FromSqlError::Other(
+                format!("invalid map_status value: {other:?}").into(),
+            )),
+        }
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Structs
@@ -41,9 +90,10 @@ pub struct NewTokenUsage {
     pub estimated: bool,
     pub chars: i64,
     pub cost_usd: Option<f64>,
-    /// Exploration-token attribution (Phase 5 / issue #94). `None` for rows
-    /// not participating in lazy code-map attribution.
-    pub map_status: Option<String>,
+    /// Exploration-token attribution INPUT (Phase 5 / issue #94): the verdict to
+    /// stamp on this new row. `None` for rows not participating in lazy
+    /// code-map attribution.
+    pub map_status: Option<MapStatus>,
     pub turn_id: Option<String>,
     pub area: Option<String>,
 }
@@ -119,9 +169,10 @@ pub struct TokenUsage {
     pub estimated: bool,
     pub chars: i64,
     pub cost_usd: Option<f64>,
-    /// Exploration-token attribution (Phase 5 / issue #94). `None` for rows
-    /// not participating in lazy code-map attribution.
-    pub map_status: Option<String>,
+    /// Exploration-token attribution as PERSISTED (Phase 5 / issue #94): the
+    /// verdict read back from the stored row. `None` for rows not participating
+    /// in lazy code-map attribution.
+    pub map_status: Option<MapStatus>,
     pub turn_id: Option<String>,
     pub area: Option<String>,
 }
@@ -821,11 +872,17 @@ impl Database {
         self.headline_inner("t.outcome IN ('failed','abandoned')", task, since)
     }
 
-    /// Phase-5 / issue #94: write one exploration-attribution row with
-    /// `source = 'mcp_response'` and `estimated = false`. Called on the live
-    /// MCP-response path for `code_map_write` / `code_map_load` tool calls.
-    /// All `NewTokenUsage` columns not covered by the parameters default to
-    /// `None` or zero (no collab attribution, no cost, no cache columns).
+    /// Phase-5 / issue #94: DIRECT-RECORD / TEST-SEEDING helper that writes one
+    /// exploration-attribution row (`source = 'mcp_response'`, `estimated =
+    /// false`) with explicit token counts. This is **NOT** the live MCP path:
+    /// the live path tags the *estimated* `mcp_response` row produced by
+    /// [`crate::metrics::account_mcp_response`] (driven from
+    /// `mcp/server.rs::request_exploration_context`), using the response-size
+    /// token proxy. This helper exists only to seed deterministic, known-token
+    /// rows in tests; it is `#[cfg(test)]`-gated so it can never be mistaken for
+    /// production wiring. All `NewTokenUsage` columns not covered by the
+    /// parameters default to `None` or zero.
+    #[cfg(test)]
     #[allow(clippy::too_many_arguments)]
     pub fn record_exploration_tokens(
         &self,
@@ -833,7 +890,7 @@ impl Database {
         harness: &str,
         input_tokens: i64,
         output_tokens: i64,
-        map_status: Option<&str>,
+        map_status: Option<MapStatus>,
         turn_id: Option<&str>,
         area: Option<&str>,
     ) -> Result<i64, MemoryError> {
@@ -853,7 +910,7 @@ impl Database {
             estimated: false,
             chars: 0,
             cost_usd: None,
-            map_status: map_status.map(|s| s.to_string()),
+            map_status,
             turn_id: turn_id.map(|s| s.to_string()),
             area: area.map(|s| s.to_string()),
         })
@@ -1881,7 +1938,7 @@ mod tests {
             "claude",
             100,
             50,
-            Some("map_hit"),
+            Some(MapStatus::Hit),
             Some("t1"),
             Some("core"),
         )
@@ -1891,7 +1948,7 @@ mod tests {
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].source, "mcp_response");
         assert!(!rows[0].estimated);
-        assert_eq!(rows[0].map_status.as_deref(), Some("map_hit"));
+        assert_eq!(rows[0].map_status, Some(MapStatus::Hit));
         assert_eq!(rows[0].turn_id.as_deref(), Some("t1"));
         assert_eq!(rows[0].area.as_deref(), Some("core"));
     }
@@ -1904,7 +1961,7 @@ mod tests {
             "codex",
             200,
             80,
-            Some("map_miss"),
+            Some(MapStatus::Miss),
             Some("t2"),
             Some("auth"),
         )
@@ -1914,7 +1971,7 @@ mod tests {
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].source, "mcp_response");
         assert!(!rows[0].estimated);
-        assert_eq!(rows[0].map_status.as_deref(), Some("map_miss"));
+        assert_eq!(rows[0].map_status, Some(MapStatus::Miss));
         assert_eq!(rows[0].turn_id.as_deref(), Some("t2"));
         assert_eq!(rows[0].area.as_deref(), Some("auth"));
     }
@@ -1929,7 +1986,7 @@ mod tests {
             "claude",
             200,
             100,
-            Some("map_hit"),
+            Some(MapStatus::Hit),
             Some("t1"),
             Some("core"),
         )
@@ -1941,7 +1998,7 @@ mod tests {
             "claude",
             100,
             50,
-            Some("map_hit"),
+            Some(MapStatus::Hit),
             Some("t2"),
             Some("auth"),
         )
@@ -1953,7 +2010,7 @@ mod tests {
             "claude",
             300,
             100,
-            Some("map_miss"),
+            Some(MapStatus::Miss),
             Some("t3"),
             Some("db"),
         )
@@ -1984,7 +2041,7 @@ mod tests {
             "claude",
             60,
             40,
-            Some("map_hit"),
+            Some(MapStatus::Hit),
             Some("t1"),
             Some("core"),
         )
@@ -1994,7 +2051,7 @@ mod tests {
             "claude",
             120,
             80,
-            Some("map_miss"),
+            Some(MapStatus::Miss),
             Some("t1"),
             Some("core"),
         )
@@ -2006,7 +2063,7 @@ mod tests {
             "claude",
             100,
             50,
-            Some("map_hit"),
+            Some(MapStatus::Hit),
             Some("t2"),
             Some("auth"),
         )
@@ -2018,7 +2075,7 @@ mod tests {
             "claude",
             500,
             500,
-            Some("map_hit"),
+            Some(MapStatus::Hit),
             None,
             Some("db"),
         )
@@ -2042,7 +2099,7 @@ mod tests {
     fn test_token_usage_map_status_round_trip() {
         let db = db();
         let mut r = sample_token_usage();
-        r.map_status = Some("map_hit".into());
+        r.map_status = Some(MapStatus::Hit);
         r.turn_id = Some("turn-42".into());
         r.area = Some("src/auth".into());
         let id = db.insert_token_usage(&r).unwrap();
@@ -2055,7 +2112,7 @@ mod tests {
             .unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].id, id);
-        assert_eq!(rows[0].map_status.as_deref(), Some("map_hit"));
+        assert_eq!(rows[0].map_status, Some(MapStatus::Hit));
         assert_eq!(rows[0].turn_id.as_deref(), Some("turn-42"));
         assert_eq!(rows[0].area.as_deref(), Some("src/auth"));
     }

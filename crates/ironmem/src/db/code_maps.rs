@@ -21,6 +21,37 @@ pub struct CodeMap {
     pub built_at: String,
 }
 
+/// Storage-layer invariant for `source_files`: the slice MUST be non-empty and
+/// every entry MUST be a non-empty, forward-slash-normalized repo-relative path
+/// (no backslash, no NUL). This is the LAST line of defense before a row is
+/// persisted: a map with an empty `source_files` set intersects to nothing and
+/// classifies any HEAD as `Fresh` (false-fresh), and a backslash/NUL byte means
+/// the path was never normalized and will fail to intersect `git diff` output
+/// (fail-open). The MCP `code_map_write` boundary performs the richer
+/// path-component validation (parent-dir / absolute rejection); this shared
+/// check guarantees the byte-level invariant holds for ANY caller of
+/// `upsert_code_map_tx`, not just the MCP one.
+pub(crate) fn validate_source_files_storage(source_files: &[String]) -> Result<(), MemoryError> {
+    if source_files.is_empty() {
+        return Err(MemoryError::Validation(
+            "source_files must include at least one file".into(),
+        ));
+    }
+    for f in source_files {
+        if f.is_empty() {
+            return Err(MemoryError::Validation(
+                "source_file must not be empty".into(),
+            ));
+        }
+        if f.contains('\0') || f.contains('\\') {
+            return Err(MemoryError::Validation(format!(
+                "source_file must be a normalized forward-slash repo-relative path: {f}"
+            )));
+        }
+    }
+    Ok(())
+}
+
 fn map_code_map(row: &rusqlite::Row<'_>) -> rusqlite::Result<CodeMap> {
     let source_files_json: String = row.get(4)?;
     // Fail-safe: a corrupt `source_files` blob must NOT silently become an empty
@@ -48,6 +79,10 @@ impl Database {
     /// superseded prior drawer via `delete_drawer_tx` (FTS-clean) inside the
     /// same transaction so no orphan stale map drawer accumulates.
     ///
+    /// Returns `true` when a prior, different drawer was superseded (deleted) —
+    /// the caller MUST drop that drawer's vector from the live HNSW index
+    /// (`app.mark_dirty()`), mirroring `delete_drawer`.
+    ///
     /// Callers MUST ensure the new `drawer_id` already exists in `drawers`
     /// before calling this (FK constraint). The MCP `code_map_write` tool
     /// writes the drawer and calls this in one transaction.
@@ -61,7 +96,7 @@ impl Database {
         source_files: &[String],
         built_by: &str,
         built_at: &str,
-    ) -> Result<(), MemoryError> {
+    ) -> Result<bool, MemoryError> {
         self.with_transaction(|tx| {
             Self::upsert_code_map_tx(
                 tx,
@@ -78,6 +113,8 @@ impl Database {
 
     /// Transaction-scoped variant for use inside the MCP `code_map_write`
     /// handler (drawer insert + sidecar upsert in one atomic transaction).
+    /// Returns `true` when a prior, different drawer was superseded (see
+    /// [`Database::upsert_code_map`]).
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn upsert_code_map_tx(
         tx: &Transaction<'_>,
@@ -88,7 +125,11 @@ impl Database {
         source_files: &[String],
         built_by: &str,
         built_at: &str,
-    ) -> Result<(), MemoryError> {
+    ) -> Result<bool, MemoryError> {
+        // Storage-layer fail-safe: reject an empty set or any un-normalized
+        // entry before persisting, so no caller can land a false-Fresh map.
+        validate_source_files_storage(source_files)?;
+
         let source_files_json = serde_json::to_string(source_files)
             .map_err(|e| MemoryError::Validation(format!("source_files serialization: {e}")))?;
 
@@ -115,13 +156,15 @@ impl Database {
         )?;
 
         // If the drawer changed, delete the superseded one (FTS-clean via delete_drawer_tx).
+        let mut superseded = false;
         if let Some(prior) = prior_drawer_id {
             if prior != drawer_id {
                 Self::delete_drawer_tx(tx, &prior)?;
+                superseded = true;
             }
         }
 
-        Ok(())
+        Ok(superseded)
     }
 
     /// Fetch the current `code_maps` row for `(repo, area)`. Returns `None`
@@ -347,6 +390,49 @@ mod tests {
         assert_eq!(result.source_files[0], "a/b.rs");
         assert_eq!(result.source_files[1], "c/d.rs");
         assert_eq!(result.source_files[2], "e.rs");
+    }
+
+    #[test]
+    fn test_upsert_rejects_empty_source_files() {
+        let db = Database::open_in_memory().unwrap();
+        let drawer_id = insert_test_drawer(&db, "empty sf content unique", "ev-repo", "code-maps");
+
+        let result = db.upsert_code_map(
+            "ev-repo",
+            "core",
+            &drawer_id,
+            "deadbeef",
+            &[], // empty → must be rejected (false-Fresh fail-safe)
+            "agent",
+            "2026-01-01T00:00:00Z",
+        );
+        assert!(
+            result.is_err(),
+            "empty source_files must be rejected at the storage layer"
+        );
+        // The map row must NOT have been persisted.
+        assert!(db.get_code_map("ev-repo", "core").unwrap().is_none());
+    }
+
+    #[test]
+    fn test_upsert_rejects_backslash_source_file() {
+        let db = Database::open_in_memory().unwrap();
+        let drawer_id = insert_test_drawer(&db, "bs sf content unique", "bs-repo", "code-maps");
+
+        let result = db.upsert_code_map(
+            "bs-repo",
+            "core",
+            &drawer_id,
+            "deadbeef",
+            &["src\\lib.rs".to_string()], // backslash → un-normalized → rejected
+            "agent",
+            "2026-01-01T00:00:00Z",
+        );
+        assert!(
+            result.is_err(),
+            "un-normalized (backslash) source_file must be rejected at the storage layer"
+        );
+        assert!(db.get_code_map("bs-repo", "core").unwrap().is_none());
     }
 
     #[test]

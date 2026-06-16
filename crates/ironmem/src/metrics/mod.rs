@@ -177,7 +177,7 @@ fn find_assistant_usage(value: &serde_json::Value) -> Option<Usage> {
     })
 }
 
-use crate::db::metrics::{NewOccupancySample, NewTokenUsage, SessionSummary};
+use crate::db::metrics::{MapStatus, NewOccupancySample, NewTokenUsage, SessionSummary};
 use crate::db::schema::Database;
 
 /// Exploration-token attribution context for one code-map tool call (Phase 5
@@ -188,9 +188,10 @@ use crate::db::schema::Database;
 pub(crate) struct ExplorationContext {
     pub turn_id: Option<String>,
     pub area: Option<String>,
-    /// `"map_hit"` when the caller found a usable cached map; `"map_miss"`
-    /// when no map existed or the tool was `code_map_write` (write-back).
-    pub map_status: Option<String>,
+    /// `MapStatus::Hit` when the caller found a usable cached map;
+    /// `MapStatus::Miss` when no map existed or the tool was `code_map_write`
+    /// (write-back).
+    pub map_status: Option<MapStatus>,
 }
 
 /// Record one MCP response's size (METRICS_SPEC §5.1, Decisions D1/D2/D2b/D6).
@@ -227,7 +228,7 @@ pub(crate) fn account_mcp_response(
         estimated: true,
         chars,
         cost_usd: None,
-        map_status: exploration.and_then(|exp| exp.map_status.clone()),
+        map_status: exploration.and_then(|exp| exp.map_status),
         turn_id: exploration.and_then(|exp| exp.turn_id.clone()),
         area: exploration.and_then(|exp| exp.area.clone()),
     }
@@ -418,7 +419,7 @@ mod tests {
         let exploration = ExplorationContext {
             turn_id: Some("turn-1".into()),
             area: Some("core".into()),
-            map_status: Some("map_hit".into()),
+            map_status: Some(crate::db::metrics::MapStatus::Hit),
         };
 
         account_mcp_response(&db, 9, "claude", None, &ctx, Some(&exploration));
@@ -430,7 +431,7 @@ mod tests {
         assert!(rows[0].estimated);
         assert_eq!(rows[0].chars, 9);
         assert_eq!(rows[0].output_tokens, 3);
-        assert_eq!(rows[0].map_status.as_deref(), Some("map_hit"));
+        assert_eq!(rows[0].map_status, Some(crate::db::metrics::MapStatus::Hit));
         assert_eq!(rows[0].turn_id.as_deref(), Some("turn-1"));
         assert_eq!(rows[0].area.as_deref(), Some("core"));
 

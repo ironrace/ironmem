@@ -604,10 +604,10 @@ destination, or reporting query changed.
   controlled, cost-gated A/B runs in issue #97 rather than accrued passively. The §11.5
   baseline gate (`≥10 measured tasks`) is therefore fed by #97, not by routine usage.
 
-## Amendment: v11 Exploration-Token Attribution (issue #94)
+### 2026-06-15 — issue #94: v11 exploration-token attribution (additive; no change to §1–§11 token semantics)
 
 **Schema changes (migration 011):**
-- `token_usage` gains three new nullable columns: `map_status TEXT CHECK(NULL OR IN ('map_hit','map_miss'))`, `turn_id TEXT`, `area TEXT`.
+- `token_usage` gains three new nullable columns: `map_status TEXT CHECK (map_status IS NULL OR map_status IN ('map_hit','map_miss'))`, `turn_id TEXT`, `area TEXT`.
 - New `code_maps` table: `(repo, area) PRIMARY KEY`, `drawer_id FK→drawers`, `head_sha`, `source_files` (JSON), `built_by`, `built_at`.
 
 **Exploration attribution (Phase 5):**
@@ -618,4 +618,4 @@ destination, or reporting query changed.
 **Phase-5 report (§10 extension):**
 - `report_exploration_delta()` aggregates all `mcp_response` rows with non-NULL `turn_id` and `map_status IN ('map_hit','map_miss')`, one unit per distinct `turn_id`. Rows with NULL `turn_id` are excluded (cannot be attributed to a turn). Each turn gets a single verdict: `map_hit` only when the turn has a hit and no miss, else `map_miss`.
 - Returns `ExplorationReport { total_turns, map_hit_turns, map_miss_turns, hit_rate, mean_tokens_map_hit, mean_tokens_map_miss }`.
-- Gate: at least one task must have both `map_hit` and `map_miss` rows for the delta to be meaningful.
+- Gate: the run must contain at least one `map_hit` turn and one `map_miss` turn for the delta to be meaningful (a per-run heuristic, not a per-task requirement).

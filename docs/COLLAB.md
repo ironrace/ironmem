@@ -1521,10 +1521,14 @@ Persists a code map for a named area of the repository.
 see below).
 
 **Input validation:**
-- `repo` must be an absolute path (starts with `/`).
-- `head_sha` must be a hex git object name (the HEAD the map was built at).
-- Each entry in `source_files` must be repo-relative: no leading `/`, no `..`
-  components.
+- `repo` must be an existing git worktree — an absolute path (no `..`
+  traversal), canonicalized and resolved to its `git rev-parse --show-toplevel`
+  before storage.
+- `head_sha` must be a hex git object name (7–64 hex chars; the HEAD the map was
+  built at). A non-hex value is rejected at write time.
+- Each entry in `source_files` must be repo-relative and forward-slash
+  normalized: no leading `/`, no `..` components, no backslash or NUL; the set
+  must be non-empty.
 
 Returns `{ "success": true, "drawer_id": ..., "wing": <repo>, "room": "code-maps" }`.
 
