@@ -23,6 +23,9 @@ pub struct RunArgs {
     pub out_dir: PathBuf,
     /// Run-level base override; used only when a task has no `base_commit`.
     /// Hex refs only. Committed corpus task pins cannot be overridden by the CLI.
+    /// Precedence (including rejecting an override-of-a-pin and validating the
+    /// hex form) is enforced by `client::resolve_base_commit`, the single
+    /// authority — there is no longer a duplicate check in `main`.
     pub base_sha: Option<String>,
 }
 

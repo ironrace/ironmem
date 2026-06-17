@@ -11,7 +11,7 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
 use crate::arms::Arm;
-use crate::corpus::Task;
+use crate::corpus::{BaseCommit, Task};
 
 const SUPERPOWERS_PROMPT_PREFIX: &str = "Run this task with superpowers skills only. \
 Do not use /collab, ironmem MCP tools, semantic search, KG reads/writes, drawer \
@@ -203,7 +203,7 @@ impl CommandRunner for ProcessCommandRunner {
 pub struct ProvisionRequest<'a> {
     pub task: &'a Task,
     pub arm: Arm,
-    pub base_commit: &'a str,
+    pub base_commit: &'a BaseCommit,
     pub workspace_root: &'a Path,
     pub workspace: &'a Path,
 }
@@ -214,35 +214,43 @@ pub trait WorkspaceProvisioner {
     fn provision(&self, req: &ProvisionRequest) -> Result<()>;
 }
 
-/// Resolve the base commit for a task: task pin wins, else run-level override,
-/// else fail loudly with no silent HEAD fallback.
-pub fn resolve_base_commit(task: &Task, run_override: Option<&str>) -> Result<String> {
-    let task_pin = task.base_commit.trim();
-    if !task_pin.is_empty() {
-        if !crate::corpus::is_valid_base_commit(task_pin) {
-            anyhow::bail!(
-                "task {} has invalid base_commit {:?} (expected hex git ref of length 7..=40)",
-                task.id,
-                task.base_commit
-            );
+/// Resolve the base commit for a task. THE single authority on base-commit
+/// precedence:
+///
+/// - BOTH a (validated) task pin AND a non-empty run override present → error.
+///   Overriding a deliberate corpus pin from the CLI is illegal; the corpus pin
+///   must be edited intentionally instead.
+/// - Task pin present (and valid) → use it.
+/// - No task pin but a run override present → validate and use the override.
+/// - Neither present → error (no silent HEAD fallback).
+/// - Either value present but invalid → error with a value-specific message.
+///
+/// `task.base_commit` is already a validated [`BaseCommit`]; an empty inner ref
+/// (only reachable via [`BaseCommit::unset`] for hand-built run-override tasks)
+/// means "no task pin". The run override is the one value still arriving as a
+/// raw string, so it is validated here via [`BaseCommit::parse`].
+pub fn resolve_base_commit(task: &Task, run_override: Option<&str>) -> Result<BaseCommit> {
+    let has_pin = !task.base_commit.as_str().trim().is_empty();
+    let override_raw = run_override.map(str::trim).filter(|s| !s.is_empty());
+
+    match (has_pin, override_raw) {
+        (true, Some(sha)) => anyhow::bail!(
+            "--base-sha {:?} cannot override pinned base_commit for task {}; \
+             edit the corpus pin intentionally instead",
+            sha,
+            task.id
+        ),
+        // The pin is an already-validated `BaseCommit`; clone it through.
+        (true, None) => Ok(task.base_commit.clone()),
+        (false, Some(sha)) => {
+            BaseCommit::parse(sha).map_err(|e| anyhow::anyhow!("--base-sha is {e}"))
         }
-        return Ok(task_pin.to_string());
+        (false, None) => anyhow::bail!(
+            "task {} has no base_commit and no --base-sha was provided; \
+             refusing to provision a workspace at an undefined base",
+            task.id
+        ),
     }
-    if let Some(sha) = run_override.filter(|s| !s.trim().is_empty()) {
-        let sha = sha.trim();
-        if !crate::corpus::is_valid_base_commit(sha) {
-            anyhow::bail!(
-                "--base-sha {:?} is invalid (expected hex git ref of length 7..=40)",
-                sha
-            );
-        }
-        return Ok(sha.to_string());
-    }
-    anyhow::bail!(
-        "task {} has no base_commit and no --base-sha was provided; \
-         refusing to provision a workspace at an undefined base",
-        task.id
-    )
 }
 
 /// Pure builder for the `git worktree add` command (no spawn). Exposed so the
@@ -267,13 +275,23 @@ pub fn worktree_add_argv(
     )
 }
 
-/// Parent directory that must exist before `git worktree add` can create the
-/// arm workspace leaf.
+/// The parent directory of the arm workspace leaf (`<root>/<task_id>` for a
+/// `<root>/<task_id>/<arm>` workspace). The caller creates it via
+/// `create_dir_all` before `git worktree add`, because `git worktree add` does
+/// not create missing intermediate parents.
 pub fn worktree_parent_dir(workspace: &std::path::Path) -> Option<PathBuf> {
     workspace.parent().map(Path::to_path_buf)
 }
 
-/// Reject existing symlinks from the workspace root through the arm workspace.
+/// Enforce that the arm workspace is a safe leaf under the workspace root.
+/// Three guards, each failing loud with a distinct message:
+///
+/// 1. Containment / under-root: `workspace` must be a descendant of
+///    `workspace_root` (`strip_prefix` must succeed).
+/// 2. `..`/root escape: the relative path must contain no `ParentDir`
+///    (`..`) or `RootDir` component that would climb out of the root.
+/// 3. Symlink: neither the workspace root nor any intermediate path component
+///    down to the arm workspace may be a symlink.
 ///
 /// Live runs write into user-supplied `--out`; this prevents a reused/shared
 /// output tree from redirecting worktree creation outside the intended root.
@@ -365,17 +383,26 @@ impl WorkspaceProvisioner for ProcessWorkspaceProvisioner {
             }
         }
 
-        // (2) Stale-worktree guard: never silently reuse a populated leaf.
-        if req.workspace.exists()
-            && std::fs::read_dir(req.workspace)
-                .map(|mut d| d.next().is_some())
-                .unwrap_or(false)
-        {
-            anyhow::bail!(
-                "workspace {} already exists and is non-empty (stale worktree); \
-                 refusing to reuse it",
-                req.workspace.display()
-            );
+        // (2) Stale-worktree guard: never silently reuse a populated leaf. A
+        // read_dir error on an EXISTING path (permissions, race) must fail loud
+        // with context — not be swallowed as "empty/safe".
+        if req.workspace.exists() {
+            let non_empty = std::fs::read_dir(req.workspace)
+                .with_context(|| {
+                    format!(
+                        "reading existing workspace {} for stale-worktree check",
+                        req.workspace.display()
+                    )
+                })?
+                .next()
+                .is_some();
+            if non_empty {
+                anyhow::bail!(
+                    "workspace {} already exists and is non-empty (stale worktree); \
+                     refusing to reuse it",
+                    req.workspace.display()
+                );
+            }
         }
         // (3) Validate the base ref exists before adding the worktree (no shell).
         let verify = std::process::Command::new("git")
@@ -385,7 +412,7 @@ impl WorkspaceProvisioner for ProcessWorkspaceProvisioner {
                 "rev-parse",
                 "--verify",
                 "--end-of-options",
-                &format!("{}^{{commit}}", req.base_commit),
+                &format!("{}^{{commit}}", req.base_commit.as_str()),
             ])
             .output()
             .with_context(|| {
@@ -399,12 +426,13 @@ impl WorkspaceProvisioner for ProcessWorkspaceProvisioner {
             anyhow::bail!(
                 "task {} base ref {:?} is unknown/ambiguous in repo {}",
                 req.task.id,
-                req.base_commit,
+                req.base_commit.as_str(),
                 self.ironmem_repo.display()
             );
         }
         // (4) Add the worktree (no shell, program+argv, same hardening as ProcessGateRunner).
-        let (program, argv) = worktree_add_argv(&self.ironmem_repo, req.workspace, req.base_commit);
+        let (program, argv) =
+            worktree_add_argv(&self.ironmem_repo, req.workspace, req.base_commit.as_str());
         let status = std::process::Command::new(&program)
             .args(&argv)
             .status()
@@ -465,7 +493,8 @@ impl<R: CommandRunner, P: WorkspaceProvisioner> ArmExecutor for LiveExecutor<R, 
     fn execute(&self, task: &Task, arm: Arm) -> Result<ArmOutcome> {
         let (program, args) = arm_command(task, arm);
         let workspace = self.workspace_for(task, arm);
-        // Total, fail-loud base resolution: task pin wins, then run override, then error.
+        // Single-authority, fail-loud base resolution (see `resolve_base_commit`):
+        // exactly one of task pin / run override must be present, else error.
         let base = resolve_base_commit(task, self.base_override.as_deref())?;
         self.provisioner.provision(&ProvisionRequest {
             task,
