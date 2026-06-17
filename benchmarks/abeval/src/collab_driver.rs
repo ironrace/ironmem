@@ -31,6 +31,13 @@ pub enum WorkerAction {
         template: &'static str,
         topic: &'static str,
     },
+    /// The PlanLocked v3 bridge: a compose turn authors the plan markdown via
+    /// `writing-plans` (returning `plan_file_path` + content hash + fidelity),
+    /// then the SAME template in `$MODE=submit` sends `task_list` by file path +
+    /// hash. Distinct from [`ClaudeCompose`] because the artifact is a file (not
+    /// a drawer), the submit reuses the bridge template (not
+    /// `collab-turn-submit.md`), and a hash must be threaded.
+    TaskListBridge,
     /// A Codex turn (`codex exec ... join <session>`); usage attributed later.
     Codex,
     /// The final-review compose + a driver-owned synthetic-`pr_url` submit (no
@@ -76,10 +83,7 @@ pub fn worker_action(phase: &str, owner: &str, global_review_round: u32) -> Work
                 template: "collab-turn-plan-finalize.md",
                 topic: "final",
             },
-            "PlanLocked" => WorkerAction::ClaudeCompose {
-                template: "collab-turn-task-list.md",
-                topic: "task_list",
-            },
+            "PlanLocked" => WorkerAction::TaskListBridge,
             "CodeImplementPending" => WorkerAction::ClaudeSend {
                 template: "collab-turn-code-implement.md",
                 mode: "send",
@@ -108,6 +112,30 @@ pub fn parse_ref_line(stdout: &str) -> Option<String> {
         }
     }
     None
+}
+
+/// Split a `collab-turn-task-list.md` compose verdict's `ref:` line —
+/// `ref: <plan_file_path> hash:<h>` — into `(plan_file_path, content_hash)`.
+/// The submit turn needs both to recompute and verify the approved plan.
+pub fn parse_task_list_ref(stdout: &str) -> Result<(String, String)> {
+    let ref_val =
+        parse_ref_line(stdout).ok_or_else(|| anyhow!("task_list compose returned no ref: line"))?;
+    let (path, hash) = ref_val
+        .split_once(" hash:")
+        .ok_or_else(|| anyhow!("task_list ref missing ` hash:` segment: {ref_val:?}"))?;
+    let (path, hash) = (path.trim(), hash.trim());
+    if path.is_empty() || hash.is_empty() {
+        return Err(anyhow!("task_list ref has empty path or hash: {ref_val:?}"));
+    }
+    Ok((path.to_string(), hash.to_string()))
+}
+
+/// Whether a `collab-turn-task-list.md` compose verdict reports `fidelity:fail`
+/// (heading-count/ID-continuity/acceptance mismatch). A failed fidelity check
+/// means the authored markdown diverged from the manifest — the driver must not
+/// submit it.
+pub fn task_list_fidelity_failed(stdout: &str) -> bool {
+    stdout.contains("fidelity:fail")
 }
 
 /// Read the `ABEVAL_SESSION_ID=<id>` line the bootstrap worker prints.
@@ -330,6 +358,43 @@ pub fn run_collab_task<R: CollabStateReader, S: WorkerSpawner, A: CodexAttributo
                 let sr = spawner.spawn_claude(&submit, wt)?;
                 claude_usage.add_assign(&sr.usage);
             }
+            WorkerAction::TaskListBridge => {
+                let compose = render_worker_prompt(
+                    &ctx.prompts_dir,
+                    "collab-turn-task-list.md",
+                    &[
+                        ("$SESSION_ID", &session_id),
+                        ("$BRANCH", &ctx.branch),
+                        ("$MODE", "compose"),
+                    ],
+                )?;
+                let cr = spawner.spawn_claude(&compose, wt)?;
+                claude_usage.add_assign(&cr.usage);
+                // Auto-approve on fidelity:pass (post-plan-lock gates are dropped
+                // in headless); fidelity:fail means the markdown diverged from the
+                // manifest — fail clean rather than submit a bad plan.
+                if task_list_fidelity_failed(&cr.stdout) {
+                    return Err(anyhow!(
+                        "task_list compose for task {} returned fidelity:fail — \
+                         INVALID run (plan markdown diverged from manifest)",
+                        ctx.task_id
+                    ));
+                }
+                let (plan_path, plan_hash) = parse_task_list_ref(&cr.stdout)?;
+                let submit = render_worker_prompt(
+                    &ctx.prompts_dir,
+                    "collab-turn-task-list.md",
+                    &[
+                        ("$SESSION_ID", &session_id),
+                        ("$BRANCH", &ctx.branch),
+                        ("$MODE", "submit"),
+                        ("$ARTIFACT_REF", &plan_path),
+                        ("$ARTIFACT_HASH", &plan_hash),
+                    ],
+                )?;
+                let sr = spawner.spawn_claude(&submit, wt)?;
+                claude_usage.add_assign(&sr.usage);
+            }
             WorkerAction::Codex => {
                 let cr = spawner.spawn_codex(&session_id, wt)?;
                 if state.phase == "CodeReviewFixGlobalPending" {
@@ -443,5 +508,35 @@ mod tests {
             err.to_string().to_lowercase().contains("ref"),
             "error must name 'ref': {err}"
         );
+    }
+
+    #[test]
+    fn task_list_ref_splits_path_and_hash() {
+        let stdout = "result: plan composed (tasks:3 headings:3 fidelity:pass)\n\
+                      ref: docs/superpowers/plans/2026-06-17-x.md hash:deadbeef\n\
+                      blocker: none\n";
+        let (path, hash) = parse_task_list_ref(stdout).unwrap();
+        assert_eq!(path, "docs/superpowers/plans/2026-06-17-x.md");
+        assert_eq!(hash, "deadbeef");
+    }
+
+    #[test]
+    fn task_list_ref_without_hash_segment_errors() {
+        // A bare drawer-style ref (no ` hash:`) is not a valid task_list ref.
+        let err = parse_task_list_ref("result: ok\nref: drawer-1\nblocker: none\n").unwrap_err();
+        assert!(
+            err.to_string().contains("hash:"),
+            "must name the missing hash segment: {err}"
+        );
+    }
+
+    #[test]
+    fn fidelity_pass_is_not_a_failure() {
+        assert!(!task_list_fidelity_failed(
+            "result: plan composed (fidelity:pass)\nref: p hash:h\n"
+        ));
+        assert!(task_list_fidelity_failed(
+            "result: plan composed (fidelity:fail)\nref: p hash:h\n"
+        ));
     }
 }

@@ -49,6 +49,11 @@ impl WorkerSpawner for FakeSpawner {
         self.claude_prompts.borrow_mut().push(prompt.to_string());
         let stdout = if prompt.contains("ABEVAL_BOOTSTRAP") {
             "ABEVAL_SESSION_ID=sess-xyz\n".to_string()
+        } else if prompt.contains("fidelity") {
+            // task_list bridge verdict shape (compose): `<path> hash:<h>` + fidelity.
+            "result: plan composed (tasks:2 headings:2 fidelity:pass)\n\
+             ref: docs/superpowers/plans/x.md hash:abc123\nblocker: none\n"
+                .to_string()
         } else {
             "result: ok\nref: drawer-1\nblocker: none\n".to_string()
         };
@@ -133,8 +138,8 @@ fn full_happy_path_sums_usage_and_counts_rework() {
     assert_eq!(res.fix_commits, 2); // one codex fix turn × 2 commits
     assert_eq!(*spawner.codex_calls.borrow(), 3); // draft + plan-review + fix
     assert_eq!(res.codex_usage.total(), 1200);
-    // Claude usage = 1 bootstrap + 11 loop spawns (ClaudeSend×3, ClaudeCompose×3×2,
-    // FinalReviewSynthetic×2) = 12 spawns × 15 tokens each = 180.
+    // Claude usage = 1 bootstrap + 11 loop spawns (ClaudeSend×3, ClaudeCompose×2×2,
+    // TaskListBridge×2, FinalReviewSynthetic×2) = 12 spawns × 15 tokens each = 180.
     assert_eq!(res.claude_usage.total(), 180);
     assert_eq!(res.pr_url_synthetic, "local://abeval/task1");
     // The final-review path produced a synthetic submit, never a gh pr create.
@@ -396,4 +401,52 @@ fn compose_worker_missing_ref_recovers_persisted_drawer() {
     // Reaching the terminal phase is the proof: without recovery, the compose at
     // PlanSynthesisPending would have errored with "no ref: line".
     assert_eq!(res.reached_phase, "CodingComplete");
+}
+
+/// TEST 8 (layer 9) — the PlanLocked TaskListBridge must fail clean when the
+/// compose worker reports `fidelity:fail` (authored markdown diverged from the
+/// manifest), rather than submitting a bad plan.
+struct FidelityFailSpawner;
+impl WorkerSpawner for FidelityFailSpawner {
+    fn spawn_claude(&self, prompt: &str, _wt: &std::path::Path) -> anyhow::Result<WorkerResult> {
+        let stdout = if prompt.contains("ABEVAL_BOOTSTRAP") {
+            "ABEVAL_SESSION_ID=sess-xyz\n".to_string()
+        } else {
+            // task_list compose reporting a fidelity failure.
+            "result: plan composed (tasks:2 headings:1 fidelity:fail)\n\
+             ref: docs/superpowers/plans/x.md hash:abc123\nblocker: heading-count parity\n"
+                .to_string()
+        };
+        Ok(WorkerResult {
+            usage: Usage {
+                input_tokens: 10,
+                output_tokens: 5,
+                ..Default::default()
+            },
+            stdout,
+        })
+    }
+    fn spawn_codex(&self, _session_id: &str, _wt: &std::path::Path) -> anyhow::Result<CodexResult> {
+        Ok(CodexResult { commits_added: 0 })
+    }
+}
+
+#[test]
+fn task_list_fidelity_fail_aborts_clean() {
+    let prompts = repo_prompts_dir();
+    let reader = ScriptedReader {
+        states: vec![st("PlanLocked", "claude", 0)],
+        idx: RefCell::new(0),
+        draft: None,
+    };
+    let spawner = FidelityFailSpawner;
+    let attributor = FixedAttributor(Usage {
+        input_tokens: 1,
+        ..Default::default()
+    });
+    let err = run_collab_task(&ctx(&prompts), &reader, &spawner, &attributor).unwrap_err();
+    assert!(
+        err.to_string().to_lowercase().contains("fidelity"),
+        "fidelity:fail must abort the run naming 'fidelity': {err}"
+    );
 }
