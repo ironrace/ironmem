@@ -1,6 +1,6 @@
 use std::path::Path;
 use abeval::collab_live::{
-    claude_worker_argv, codex_exec_argv, minimal_codex_config, worker_text_and_usage,
+    claude_worker_argv, codex_config, codex_exec_argv, worker_text_and_usage,
 };
 use abeval::collab_driver::parse_session_id;
 
@@ -60,10 +60,16 @@ fn worker_text_falls_back_to_raw_on_unparseable_envelope() {
 }
 
 #[test]
-fn minimal_codex_config_has_no_unparseable_app_keys() {
-    let toml = minimal_codex_config();
+fn codex_config_pins_ironmem_mcp_and_avoids_unparseable_app_keys() {
+    let toml = codex_config(Path::new("/out/t1/collab.db"));
     // Per memory feedback_codex_app_config_rewrite: keep config minimal so the
     // older CLI can parse it — no service_tier / relative-agent-paths.
     assert!(!toml.contains("service_tier"));
     assert!(!toml.contains("relative-agent-paths"));
+    // The ironmem MCP must be configured so Codex actually has the collab tools,
+    // pinned to THIS task's DB in trusted (write-enabled) mode.
+    assert!(toml.contains("[mcp_servers.ironmem]"));
+    assert!(toml.contains(r#"command = "ironmem""#));
+    assert!(toml.contains(r#"IRONMEM_DB_PATH = "/out/t1/collab.db""#));
+    assert!(toml.contains(r#"IRONMEM_MCP_MODE = "trusted""#));
 }
