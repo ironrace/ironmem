@@ -5,6 +5,7 @@
 use anyhow::{anyhow, Result};
 use chrono::{DateTime, Utc};
 use serde::Deserialize;
+use std::path::{Path, PathBuf};
 
 use crate::client::Usage;
 
@@ -122,4 +123,68 @@ pub fn parse_rollout(jsonl: &str) -> Result<Option<CodexSessionTokens>> {
         started_at,
         usage,
     }))
+}
+
+/// Walk `sessions_root` for `rollout-*.jsonl` files and sum the usage of every
+/// session whose `cwd` resolves to `worktree` AND whose `started_at` is in
+/// `window`. A zero/empty sum is returned as a zero `Usage`; the caller decides
+/// whether zero-for-a-completed-run is invalid (it is).
+pub fn attribute_codex_tokens(
+    sessions_root: &Path,
+    worktree: &Path,
+    window: TimeWindow,
+) -> Result<Usage> {
+    let mut files = Vec::new();
+    collect_rollouts(sessions_root, &mut files)?;
+    files.sort();
+
+    let mut total = Usage::default();
+    for file in files {
+        let body = std::fs::read_to_string(&file)
+            .map_err(|e| anyhow!("reading rollout {}: {e}", file.display()))?;
+        let Some(session) = parse_rollout(&body)? else {
+            continue; // no token_count yet
+        };
+        if window.contains(session.started_at) && paths_equal(&session.cwd, worktree) {
+            total.add_assign(&session.usage);
+        }
+    }
+    Ok(total)
+}
+
+/// Recursively gather `rollout-*.jsonl` files under `root` (the YYYY/MM/DD tree).
+/// A missing root is not an error (no Codex sessions yet) — it yields nothing.
+fn collect_rollouts(root: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
+    let entries = match std::fs::read_dir(root) {
+        Ok(e) => e,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(anyhow!("reading {}: {e}", root.display())),
+    };
+    for entry in entries {
+        let entry = entry.map_err(|e| anyhow!("reading entry under {}: {e}", root.display()))?;
+        let path = entry.path();
+        let ft = entry
+            .file_type()
+            .map_err(|e| anyhow!("stat {}: {e}", path.display()))?;
+        if ft.is_dir() {
+            collect_rollouts(&path, out)?;
+        } else if ft.is_file() {
+            let name = path.file_name().and_then(|s| s.to_str()).unwrap_or("");
+            if name.starts_with("rollout-") && name.ends_with(".jsonl") {
+                out.push(path);
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Compare a rollout `cwd` string with a worktree path. Canonicalize both when
+/// possible (handles `/var`↔`/private/var` on macOS); fall back to lexical
+/// equality when a path no longer exists.
+fn paths_equal(cwd: &str, worktree: &Path) -> bool {
+    let a = Path::new(cwd);
+    match (a.canonicalize(), worktree.canonicalize()) {
+        (Ok(x), Ok(y)) => x == y,
+        _ => a == worktree,
+    }
 }
