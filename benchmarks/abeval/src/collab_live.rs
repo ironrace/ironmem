@@ -22,6 +22,11 @@ use crate::corpus::Task;
 /// driver-supplied `--mcp-config` (so the worker's ironmem MCP server shares the
 /// per-task DB via inherited `IRONMEM_DB_PATH`). The prompt is appended as the
 /// `-p` positional by the caller.
+///
+/// The trailing `--` is REQUIRED: the collab-turn worker templates begin with
+/// `---` YAML frontmatter, so a prompt passed without an end-of-options marker is
+/// parsed by the CLI as an option (`error: unknown option '---'`). `--` forces
+/// the prompt to be a positional even when it starts with dashes.
 pub fn claude_worker_argv(mcp_config: &str) -> (String, Vec<String>) {
     (
         "claude".to_string(),
@@ -33,11 +38,32 @@ pub fn claude_worker_argv(mcp_config: &str) -> (String, Vec<String>) {
             "--mcp-config".into(),
             mcp_config.to_string(),
             "-p".into(),
+            "--".into(),
         ],
     )
 }
 
+/// Extract the worker's *printed text* and token usage from a raw `claude -p
+/// --output-format json` envelope. The envelope is a single JSON line, so the
+/// model's actual output (where sentinel lines like `ABEVAL_SESSION_ID=` / `ref:`
+/// live) is the `result` field — NOT the raw bytes. The driver's line parsers
+/// must see that text, not the `{...}` wrapper. On an unparseable envelope
+/// (schema drift) fall back to the raw bytes + default usage: a 0-exit worker
+/// then contributes zero tokens for the turn (the rare tolerance the run-level
+/// zero-token guards still catch in aggregate).
+pub fn worker_text_and_usage(raw: &str) -> (String, Usage) {
+    match parse_cli_result(raw) {
+        Ok(r) => (r.result, r.usage),
+        Err(_) => (raw.to_string(), Usage::default()),
+    }
+}
+
 /// `codex exec` argv: sandbox full-access, run in the worktree, prompt positional.
+///
+/// The `--` before the prompt is REQUIRED: the collab prompt (`collab.md`) begins
+/// with `---` YAML frontmatter, so without an end-of-options marker `codex exec`
+/// parses it as a flag (`error: unexpected argument '---'`). Same hazard the
+/// Claude worker argv guards against.
 pub fn codex_exec_argv(worktree: &Path, prompt: &str) -> (String, Vec<String>) {
     (
         "codex".to_string(),
@@ -47,15 +73,44 @@ pub fn codex_exec_argv(worktree: &Path, prompt: &str) -> (String, Vec<String>) {
             "danger-full-access".into(),
             "-C".into(),
             worktree.display().to_string(),
+            "--".into(),
             prompt.to_string(),
         ],
     )
 }
 
-/// Minimal `config.toml` for the isolated CODEX_HOME (memory
-/// `feedback_codex_app_config_rewrite`): only keys the pinned CLI parses.
-pub fn minimal_codex_config() -> String {
-    "model = \"gpt-5-codex\"\nmodel_reasoning_effort = \"xhigh\"\n".to_string()
+/// `config.toml` for the isolated CODEX_HOME (memory
+/// `feedback_codex_app_config_rewrite`): only keys the pinned CLI parses, plus the
+/// ironmem MCP server so Codex actually has the `collab_*` tools it needs to take
+/// its turn. The server is pinned to THIS task's collab DB (`IRONMEM_DB_PATH`) in
+/// trusted mode — the same write-enabled server the Claude workers use — so both
+/// agents act on one shared session. Without this block Codex has no collab tools
+/// and its turn is a ~2s no-op (`last_agent_message: null`), which the zero-Codex
+/// INVALID guard would (correctly) reject.
+pub fn codex_config(db_path: &Path) -> String {
+    // db_path is harness-controlled (under the out tree), but escape defensively
+    // so a `"`/`\` in the path can't produce malformed TOML.
+    let db = db_path
+        .display()
+        .to_string()
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"");
+    // `gpt-5.5` is the model the user's ChatGPT/subscription Codex account
+    // supports (and what their real ~/.codex/config.toml uses). `gpt-5-codex` /
+    // `gpt-5` return HTTP 400 "not supported when using Codex with a ChatGPT
+    // account", which makes every Codex turn a ~2s null no-op.
+    format!(
+        "model = \"gpt-5.5\"\n\
+         model_reasoning_effort = \"xhigh\"\n\
+         \n\
+         [mcp_servers.ironmem]\n\
+         command = \"ironmem\"\n\
+         args = [\"serve\"]\n\
+         \n\
+         [mcp_servers.ironmem.env]\n\
+         IRONMEM_DB_PATH = \"{db}\"\n\
+         IRONMEM_MCP_MODE = \"trusted\"\n"
+    )
 }
 
 pub struct SqliteStateReader {
@@ -91,18 +146,15 @@ impl WorkerSpawner for ProcessWorkerSpawner {
                 stderr.trim()
             ));
         }
-        let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
-        // Reuse the envelope parser. A non-zero exit already errored above; only a
-        // 0-exit worker whose usage block is unparseable/renamed (schema drift)
-        // reaches here and contributes zero tokens for this turn — the rare
-        // tolerance the run-level zero-token guards still catch in aggregate.
-        let usage = parse_cli_result(&stdout).map(|r| r.usage).unwrap_or_default();
+        let raw = String::from_utf8_lossy(&out.stdout).into_owned();
+        let (stdout, usage) = worker_text_and_usage(&raw);
         Ok(WorkerResult { usage, stdout })
     }
 
     fn spawn_codex(&self, session_id: &str, worktree: &Path) -> Result<CodexResult> {
         let head_before = git_head(worktree)?;
-        let (prog, args) = codex_exec_argv(worktree, &format!("join {session_id}"));
+        let prompt = codex_collab_prompt(session_id)?;
+        let (prog, args) = codex_exec_argv(worktree, &prompt);
         let status = std::process::Command::new(&prog)
             .args(&args)
             .env("CODEX_HOME", &self.codex_home)
@@ -175,11 +227,12 @@ pub fn provision_collab_env(
     auth_src: &Path,
     branch: &str,
     remote_bare: &Path,
+    db_path: &Path,
 ) -> Result<()> {
-    // Isolated CODEX_HOME.
+    // Isolated CODEX_HOME — config carries the ironmem MCP pinned to this task's DB.
     std::fs::create_dir_all(codex_home)
         .with_context(|| format!("creating CODEX_HOME {}", codex_home.display()))?;
-    std::fs::write(codex_home.join("config.toml"), minimal_codex_config())?;
+    std::fs::write(codex_home.join("config.toml"), codex_config(db_path))?;
     let auth_dst = codex_home.join("auth.json");
     if auth_dst.exists() {
         std::fs::remove_file(&auth_dst)
@@ -199,8 +252,24 @@ pub fn provision_collab_env(
     // Per-task local bare remote so intermediate pushes go nowhere real.
     run_git(&["init", "--bare", &remote_bare.display().to_string()])?;
     run_git_in(worktree, &["checkout", "-b", branch])?;
-    run_git_in(worktree, &["remote", "add", "origin", &remote_bare.display().to_string()])?;
+    // The isolated clone already carries an `origin` (→ the source repo); repoint
+    // it at this task's throwaway bare so collab workers' `git push origin` stays
+    // local. Because the workspace is a clone (not a linked worktree) this mutates
+    // only the per-task config — never the real repo's. Fall back to `add` if the
+    // clone somehow lacks an origin.
+    wire_origin(worktree, remote_bare)?;
     run_git_in(worktree, &["push", "-u", "origin", branch])?;
+    Ok(())
+}
+
+/// Point the workspace's `origin` at `bare`, whether or not an `origin` already
+/// exists. A clone has one (→ source repo) so `set-url` is the normal path; the
+/// `add` fallback covers a repo that lacks it.
+fn wire_origin(worktree: &Path, bare: &Path) -> Result<()> {
+    let bare_s = bare.display().to_string();
+    if run_git_in(worktree, &["remote", "set-url", "origin", &bare_s]).is_err() {
+        run_git_in(worktree, &["remote", "add", "origin", &bare_s])?;
+    }
     Ok(())
 }
 
@@ -231,17 +300,27 @@ pub fn run_ironmem_arm(task: &Task, worktree: &Path, out_task_dir: &Path) -> Res
     let auth_src = PathBuf::from(&home).join(".codex").join("auth.json");
     let sessions_root = codex_home.join("sessions");
 
-    provision_collab_env(worktree, &codex_home, &auth_src, &branch, &remote_bare)?;
+    provision_collab_env(worktree, &codex_home, &auth_src, &branch, &remote_bare, &db_path)?;
 
     // MCP config: a single ironmem server that inherits IRONMEM_DB_PATH so the
     // worker's collab tools and the driver's reader share the per-task DB. Built
     // with serde_json so a db_path containing `"`/`\` cannot produce malformed JSON.
+    //
+    // IRONMEM_MCP_MODE=trusted is REQUIRED: the server defaults to read-only, which
+    // exposes only the read-class collab tools (status/recv/get_caps/wait_my_turn)
+    // and disables the write-class ones the driver depends on — collab_start,
+    // collab_send, collab_ack, collab_approve, collab_end. Without it the bootstrap
+    // worker cannot create a session and the run fails with "No such tool available:
+    // mcp__ironmem__collab_start".
     let mcp_config = serde_json::json!({
         "mcpServers": {
             "ironmem": {
                 "command": "ironmem",
                 "args": ["serve"],
-                "env": { "IRONMEM_DB_PATH": db_path.display().to_string() }
+                "env": {
+                    "IRONMEM_DB_PATH": db_path.display().to_string(),
+                    "IRONMEM_MCP_MODE": "trusted"
+                }
             }
         }
     })
@@ -323,4 +402,27 @@ fn prompts_dir() -> Result<PathBuf> {
         .and_then(|p| p.parent())
         .map(|p| p.join(".claude-plugin").join("prompts"))
         .ok_or_else(|| anyhow!("cannot derive repo .claude-plugin/prompts dir"))
+}
+
+/// Repo `.codex-plugin/prompts` dir — the Codex-side collab prompt lives here
+/// (the counterpart to `.claude-plugin/prompts`).
+fn codex_prompts_dir() -> Result<PathBuf> {
+    let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    manifest
+        .parent()
+        .and_then(|p| p.parent())
+        .map(|p| p.join(".codex-plugin").join("prompts"))
+        .ok_or_else(|| anyhow!("cannot derive repo .codex-plugin/prompts dir"))
+}
+
+/// The Codex turn prompt: the full IronRace collab protocol prompt
+/// (`.codex-plugin/prompts/collab.md`) with its `$ARGUMENTS` placeholder bound to
+/// `join <session_id>`. The prompt itself branches by reading `collab_status`, so
+/// one prompt serves every Codex-owned phase (plan draft/review, global review).
+/// This replaces the bare `join <sid>` stub that left Codex with no instructions.
+pub fn codex_collab_prompt(session_id: &str) -> Result<String> {
+    let path = codex_prompts_dir()?.join("collab.md");
+    let body = std::fs::read_to_string(&path)
+        .map_err(|e| anyhow!("reading codex collab prompt {}: {e}", path.display()))?;
+    Ok(body.replace("$ARGUMENTS", &format!("join {session_id}")))
 }

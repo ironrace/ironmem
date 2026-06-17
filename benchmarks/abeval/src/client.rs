@@ -276,7 +276,7 @@ pub struct ProvisionRequest<'a> {
 }
 
 /// Abstraction over creating a populated per-task/arm workspace. Production does
-/// a real `git worktree add`; tests use a fake. Mirrors [`CommandRunner`].
+/// a real isolated `git clone`; tests use a fake. Mirrors [`CommandRunner`].
 pub trait WorkspaceProvisioner {
     fn provision(&self, req: &ProvisionRequest) -> Result<()>;
 }
@@ -320,10 +320,37 @@ pub fn resolve_base_commit(task: &Task, run_override: Option<&str>) -> Result<Ba
     }
 }
 
-/// Pure builder for the `git worktree add` command (no spawn). Exposed so the
+/// Pure builder for the `git clone --local` command (no spawn). Exposed so the
 /// argv can be unit-tested without touching real git.
-pub fn worktree_add_argv(
+///
+/// We clone instead of `git worktree add` deliberately: a linked worktree shares
+/// the source repo's `.git/config` (and therefore its `origin` remote), so the
+/// ironmem arm cannot wire a per-task local `origin` without mutating — and
+/// racing on — the real repo's config. An isolated clone has its own config, so
+/// each task owns its `origin`. `--local` hardlinks the object store (fast, cheap)
+/// and brings every commit, so the pinned base ref is always present for checkout.
+pub fn clone_argv(
     repo: &std::path::Path,
+    workspace: &std::path::Path,
+) -> (String, Vec<String>) {
+    (
+        "git".to_string(),
+        vec![
+            "clone".to_string(),
+            "--local".to_string(),
+            "--quiet".to_string(),
+            "--".to_string(),
+            repo.display().to_string(),
+            workspace.display().to_string(),
+        ],
+    )
+}
+
+/// Pure builder for the post-clone `git checkout --detach <base>` (no spawn). The
+/// clone lands on the source default branch; this pins the workspace to the
+/// resolved base commit. `advice.detachedHead=false` silences the detached-HEAD
+/// advice so it never pollutes captured output.
+pub fn checkout_detach_argv(
     workspace: &std::path::Path,
     base: &str,
 ) -> (String, Vec<String>) {
@@ -331,12 +358,12 @@ pub fn worktree_add_argv(
         "git".to_string(),
         vec![
             "-C".to_string(),
-            repo.display().to_string(),
-            "worktree".to_string(),
-            "add".to_string(),
-            "--detach".to_string(),
-            "--".to_string(),
             workspace.display().to_string(),
+            "-c".to_string(),
+            "advice.detachedHead=false".to_string(),
+            "checkout".to_string(),
+            "--detach".to_string(),
+            "--end-of-options".to_string(),
             base.to_string(),
         ],
     )
@@ -409,9 +436,9 @@ pub fn ensure_workspace_path_safe(workspace_root: &Path, workspace: &Path) -> Re
     Ok(())
 }
 
-/// Production provisioner: real `git worktree add` of the ironmem repo at the
-/// resolved base commit, no shell. Tests use a fake provisioner; this impl is
-/// exercised only behind the approval gate.
+/// Production provisioner: a real isolated `git clone --local` of the ironmem
+/// repo pinned (detached) to the resolved base commit, no shell. Tests use a fake
+/// provisioner; this impl is exercised only behind the approval gate.
 pub struct ProcessWorkspaceProvisioner {
     pub ironmem_repo: PathBuf,
 }
@@ -497,24 +524,45 @@ impl WorkspaceProvisioner for ProcessWorkspaceProvisioner {
                 self.ironmem_repo.display()
             );
         }
-        // (4) Add the worktree (no shell, program+argv, same hardening as ProcessGateRunner).
-        let (program, argv) =
-            worktree_add_argv(&self.ironmem_repo, req.workspace, req.base_commit.as_str());
+        // (4) Clone the repo into an isolated workspace (no shell, program+argv,
+        // same hardening as ProcessGateRunner). An isolated clone — not a linked
+        // worktree — so the ironmem arm owns its `origin` without touching the
+        // real repo's shared config.
+        let (program, argv) = clone_argv(&self.ironmem_repo, req.workspace);
         let status = std::process::Command::new(&program)
             .args(&argv)
             .status()
             .with_context(|| {
                 format!(
-                    "git worktree add failed: repo={} base={} workspace={}",
+                    "git clone failed: repo={} workspace={}",
                     self.ironmem_repo.display(),
+                    req.workspace.display()
+                )
+            })?;
+        if !status.success() {
+            anyhow::bail!(
+                "git clone exited non-zero: repo={} workspace={}",
+                self.ironmem_repo.display(),
+                req.workspace.display()
+            );
+        }
+
+        // (5) Pin the clone to the resolved base commit (detached). The clone
+        // carries every object, so the base ref validated above is present.
+        let (program, argv) = checkout_detach_argv(req.workspace, req.base_commit.as_str());
+        let status = std::process::Command::new(&program)
+            .args(&argv)
+            .status()
+            .with_context(|| {
+                format!(
+                    "git checkout --detach failed: base={} workspace={}",
                     req.base_commit,
                     req.workspace.display()
                 )
             })?;
         if !status.success() {
             anyhow::bail!(
-                "git worktree add exited non-zero: repo={} base={} workspace={}",
-                self.ironmem_repo.display(),
+                "git checkout --detach exited non-zero: base={} workspace={}",
                 req.base_commit,
                 req.workspace.display()
             );
