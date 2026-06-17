@@ -143,6 +143,10 @@ impl CommandRunner for FakeRunner {
     }
 }
 
+// Contract changed (METRICS_SPEC §12 2026-06-17): provision-before-run with a
+// resolved base is verified through the single-command arm = superpowers; the
+// ironmem arm now delegates to the IronmemArmRunner and never reaches the
+// CommandRunner, so this provision/run ordering test drives superpowers.
 #[test]
 fn execute_provisions_before_running_with_resolved_base() {
     let calls: ProvisionCalls = Arc::new(Mutex::new(Vec::new()));
@@ -156,14 +160,14 @@ fn execute_provisions_before_running_with_resolved_base() {
     };
     let exec = LiveExecutor::new(runner, prov, PathBuf::from("/tmp/ws-root"), None);
     let t = task("abcdef1234567890abcdef1234567890abcdef12");
-    let out = exec.execute(&t, Arm::Ironmem).unwrap();
+    let out = exec.execute(&t, Arm::Superpowers).unwrap();
     assert_eq!(out.usage.total(), 15);
     let captured = calls.lock().unwrap();
     assert_eq!(captured.len(), 1);
     assert_eq!(captured[0].0, "abcdef1234567890abcdef1234567890abcdef12");
     assert_eq!(
         captured[0].1,
-        PathBuf::from("/tmp/ws-root").join("t1").join("ironmem")
+        PathBuf::from("/tmp/ws-root").join("t1").join("superpowers")
     );
     assert!(*ran.lock().unwrap(), "runner.run must be called");
 }
@@ -185,7 +189,10 @@ fn execute_forwards_run_override_when_task_pin_empty() {
         PathBuf::from("/tmp/ws-root"),
         Some("0123456".to_string()),
     );
-    let out = exec.execute(&task(""), Arm::Ironmem).unwrap();
+    // Contract changed (METRICS_SPEC §12 2026-06-17): the run-override forwarding
+    // is verified through the single-command arm = superpowers; the ironmem arm
+    // now delegates to the IronmemArmRunner and never reaches the CommandRunner.
+    let out = exec.execute(&task(""), Arm::Superpowers).unwrap();
     assert_eq!(out.usage.total(), 15);
     let captured = calls.lock().unwrap();
     assert_eq!(captured.len(), 1);

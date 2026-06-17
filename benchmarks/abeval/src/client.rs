@@ -240,6 +240,26 @@ impl CommandRunner for ProcessCommandRunner {
     }
 }
 
+/// Runs the ironmem arm (a full headless `/collab` flow) for one task. Injected
+/// into [`LiveExecutor`] so the heavy real-process path
+/// (`collab_live::run_ironmem_arm`) can be replaced by a fake in tests —
+/// mirroring [`CommandRunner`]/[`WorkspaceProvisioner`]. The ironmem arm no
+/// longer runs a single `claude -p "/collab start"`; it drives the dispatcher
+/// loop (METRICS_SPEC §12 2026-06-17).
+pub trait IronmemArmRunner {
+    fn run(&self, task: &Task, workspace: &Path, out_task_dir: &Path) -> Result<ArmOutcome>;
+}
+
+/// Production [`IronmemArmRunner`]: drives the real collab loop. Reached only
+/// behind the approval gate (it spawns real processes).
+pub struct ProcessIronmemArmRunner;
+
+impl IronmemArmRunner for ProcessIronmemArmRunner {
+    fn run(&self, task: &Task, workspace: &Path, out_task_dir: &Path) -> Result<ArmOutcome> {
+        crate::collab_live::run_ironmem_arm(task, workspace, out_task_dir)
+    }
+}
+
 /// Inputs to provisioning one arm's workspace.
 pub struct ProvisionRequest<'a> {
     pub task: &'a Task,
@@ -506,6 +526,7 @@ pub struct LiveExecutor<R: CommandRunner, P: WorkspaceProvisioner> {
     provisioner: P,
     workspace_root: PathBuf,
     base_override: Option<String>,
+    ironmem_runner: Box<dyn IronmemArmRunner>,
 }
 
 impl<R: CommandRunner, P: WorkspaceProvisioner> LiveExecutor<R, P> {
@@ -520,7 +541,15 @@ impl<R: CommandRunner, P: WorkspaceProvisioner> LiveExecutor<R, P> {
             provisioner,
             workspace_root,
             base_override,
+            ironmem_runner: Box::new(ProcessIronmemArmRunner),
         }
+    }
+
+    /// Override the ironmem-arm runner (tests inject a fake so the heavy
+    /// real-process collab path is not spawned).
+    pub fn with_ironmem_runner(mut self, runner: Box<dyn IronmemArmRunner>) -> Self {
+        self.ironmem_runner = runner;
+        self
     }
 
     /// The isolated workspace an arm runs in: `<root>/<task_id>/<arm>`. The
@@ -532,7 +561,6 @@ impl<R: CommandRunner, P: WorkspaceProvisioner> LiveExecutor<R, P> {
 
 impl<R: CommandRunner, P: WorkspaceProvisioner> ArmExecutor for LiveExecutor<R, P> {
     fn execute(&self, task: &Task, arm: Arm) -> Result<ArmOutcome> {
-        let (program, args) = arm_command(task, arm);
         let workspace = self.workspace_for(task, arm);
         // Single-authority, fail-loud base resolution (see `resolve_base_commit`):
         // exactly one of task pin / run override must be present, else error.
@@ -545,6 +573,21 @@ impl<R: CommandRunner, P: WorkspaceProvisioner> ArmExecutor for LiveExecutor<R, 
             workspace: &workspace,
         })?;
 
+        // The superpowers arm runs a single `claude -p`; the ironmem arm drives a
+        // real /collab flow (Claude + Codex) via the injected IronmemArmRunner.
+        if matches!(arm, Arm::Ironmem) {
+            let out_task_dir = self
+                .workspace_root
+                .parent()
+                .unwrap_or(&self.workspace_root)
+                .join(&task.id);
+            std::fs::create_dir_all(&out_task_dir).with_context(|| {
+                format!("creating ironmem out dir {}", out_task_dir.display())
+            })?;
+            return self.ironmem_runner.run(task, &workspace, &out_task_dir);
+        }
+
+        let (program, args) = arm_command(task, arm);
         let output = self.runner.run(&program, &args, &workspace)?;
         let parsed = parse_cli_result(&output.stdout)?;
 
