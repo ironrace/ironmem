@@ -22,6 +22,11 @@ use crate::corpus::Task;
 /// driver-supplied `--mcp-config` (so the worker's ironmem MCP server shares the
 /// per-task DB via inherited `IRONMEM_DB_PATH`). The prompt is appended as the
 /// `-p` positional by the caller.
+///
+/// The trailing `--` is REQUIRED: the collab-turn worker templates begin with
+/// `---` YAML frontmatter, so a prompt passed without an end-of-options marker is
+/// parsed by the CLI as an option (`error: unknown option '---'`). `--` forces
+/// the prompt to be a positional even when it starts with dashes.
 pub fn claude_worker_argv(mcp_config: &str) -> (String, Vec<String>) {
     (
         "claude".to_string(),
@@ -33,6 +38,7 @@ pub fn claude_worker_argv(mcp_config: &str) -> (String, Vec<String>) {
             "--mcp-config".into(),
             mcp_config.to_string(),
             "-p".into(),
+            "--".into(),
         ],
     )
 }

@@ -23,6 +23,11 @@ fn claude_worker_argv_carries_json_and_mcp_config() {
     assert!(args.windows(2).any(|w| w == ["--output-format", "json"]));
     assert!(args.iter().any(|a| a == "--mcp-config"));
     assert!(args.iter().any(|a| a == "-p"));
+    // The prompt is pushed last by the caller, so argv must end with `-p --`:
+    // worker templates start with `---` frontmatter and would otherwise be parsed
+    // as an option ("unknown option '---'").
+    assert_eq!(args.last().map(String::as_str), Some("--"));
+    assert!(args.windows(2).any(|w| w == ["-p", "--"]));
 }
 
 #[test]
