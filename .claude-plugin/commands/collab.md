@@ -204,14 +204,17 @@ own `collab_status` / `collab_recv` / drawer fetches.
 
 <!-- LINT:gates-ref-only -->
 ### Approval gates are reference-only
-The three user gates (first `canonical`, `final`, `final_review`) and the
-PlanLocked bridge use a two-phase split: a compose worker writes the artifact to
-a drawer/file and returns `{ref, ≤3-line summary}`; the orchestrator
+The two user gates (first `canonical`, `final`) and the PlanLocked bridge's
+**fidelity-fail fallback** use a two-phase split: a compose worker writes the
+artifact to a drawer/file and returns `{ref, ≤3-line summary}`; the orchestrator
 surfaces ONLY ref+summary for approval (never the full body); a
 `collab-turn-submit.md` worker sends the approved artifact by ref. For drawer
 refs, **drawer immutability is the integrity anchor** — drawers are append-only,
 so an approved `drawer_id`'s content cannot change and no hash recompute is
-needed.
+needed. Two post-plan-lock steps run autonomously (no user gate): the PlanLocked
+bridge auto-approves when its fidelity check passes (see "v3 Bridge"), and the
+v3 `final_review` PR creation always auto-proceeds (the diff has already passed
+`review_fix_global` + `review_local`).
 
 <!-- LINT:fail-closed-tiering -->
 ### Model tiers + fail-closed
@@ -276,24 +279,50 @@ summary`.
    `$MODE=compose`. The worker reads `final_plan`/`final_plan_hash` itself
    (via `collab_status(verbose:true)`), invokes `Skill('writing-plans')` in
    produce-only mode, saves
-   `docs/superpowers/plans/YYYY-MM-DD-<feature>.md`, and returns the
-   `plan_file_path` + content hash in its ≤3-line verdict. Full artifacts
-   never transit the orchestrator.
-2. **Approve.** Surface ONLY the `plan_file_path` + hash + ≤3-line summary
-   for user approval (reference-only gate — never the full plan body). If the
-   user declines, abort the bridge cleanly (do not dispatch `$MODE=submit`,
-   do not send `task_list`).
-3. **Submit.** On approval, dispatch `collab-turn-task-list.md` again with
-   `$MODE=submit`, `$ARTIFACT_REF=<approved plan_file_path>`, and
-   `$ARTIFACT_HASH=<approved hash>`. The worker recomputes the file's SHA-256
-   and aborts with `failure_report` on mismatch, then parses each
-   `### Task N:` heading into `{id, title, acceptance:[...]}`, builds the
-   `task_list` manifest `{plan_hash, base_sha:<HEAD>, head_sha:<HEAD>,
-   plan_file_path:<$ARTIFACT_REF>, tasks:[...]}` (adding
-   `execution_mode:"mechanical_direct"` only when the single-task eligibility
-   rule in `docs/COLLAB.md` holds), and `collab_send`s `topic="task_list"`.
-   If zero tasks parse, the worker sends a
-   `failure_report` instead. Ingest only the ≤3-line verdict. Session
+   `docs/superpowers/plans/YYYY-MM-DD-<feature>.md`, derives the manifest, and
+   runs the **fidelity check** (below) against the markdown it just authored. It
+   returns the `plan_file_path` + content hash + `fidelity:<pass|fail>` (with
+   task and heading counts) in its ≤3-line verdict. Full artifacts never transit
+   the orchestrator.
+2. **Auto-approve gate (fidelity-conditional).** Read `fidelity` from the
+   compose verdict.
+   - `fidelity:pass` → **auto-proceed, no prompt.** Emit a ≤1-line audit note
+     (`bridge auto-approved: <N> tasks, heading-parity OK`) and go to Submit.
+   - `fidelity:fail` → **fall back to the existing manual gate.** Surface ONLY
+     the `plan_file_path` + hash + ≤3-line summary for user approval
+     (reference-only gate — never the full plan body). If the user declines,
+     abort the bridge cleanly (do not dispatch `$MODE=submit`, do not send
+     `task_list`).
+
+   The fidelity check is what the COMPOSE→SUBMIT step transcribes the locked
+   plan into a manifest by an **LLM worker**, not a deterministic parser, so
+   silent under-counting (e.g. one dropped task, or the `## Task` vs `### Task`
+   heading mismatch that has parsed **0 tasks** in practice) is a real risk. It
+   asserts, against the just-authored markdown:
+   1. **Heading-count parity** — count `^### Task ` headings; assert
+      `manifest.tasks.length == heading_count` **and** both counts are ≥ 1. A
+      zero count on either side is a fidelity *failure*, not a pass — this is
+      exactly the `## Task` (h2) heading-level mismatch, which yields 0
+      `^### Task ` headings.
+   2. **ID continuity** — task IDs are `1..N` contiguous.
+   3. **Non-empty `acceptance`** — every task has ≥1 acceptance entry.
+
+   Any failed check → `fidelity:fail` (manual gate). The
+   `approved_plan_hash_mismatch` hard-fail in Submit is unchanged and applies on
+   both the auto-approve and manual-gate paths.
+3. **Submit.** On auto-proceed or manual approval, dispatch
+   `collab-turn-task-list.md` again with `$MODE=submit`,
+   `$ARTIFACT_REF=<approved plan_file_path>`, and `$ARTIFACT_HASH=<approved
+   hash>`. The worker recomputes the file's SHA-256 and aborts with
+   `failure_report` on mismatch, then parses each `### Task N:` heading into
+   `{id, title, acceptance:[...]}`, builds the `task_list` manifest `{plan_hash,
+   base_sha:<HEAD>, head_sha:<HEAD>, plan_file_path:<$ARTIFACT_REF>, tasks:[...]}`
+   (adding `execution_mode:"mechanical_direct"` only when the single-task
+   eligibility rule in `docs/COLLAB.md` holds). It re-asserts **heading-count
+   parity** (`tasks.length == ^### Task heading count`) as a defense-in-depth
+   integrity anchor and, on mismatch or zero tasks parsed, sends a
+   `failure_report` instead of `task_list`. Otherwise it `collab_send`s
+   `topic="task_list"`. Ingest only the ≤3-line verdict. Session
    advances to `CodeImplementPending`; the `current_owner` after this
    transition matches the session's current `implementer`. A later
    `/collab join --implementer=...` may reassign `CodeImplementPending`; the
@@ -498,7 +527,7 @@ sequence before building the payload:
 | `CodeImplementPending` | Owner depends on `implementer`. **Claude is owner** (default or `/collab join --implementer=claude <session_id>`): dispatch the matrix worker `collab-turn-code-implement.md` (mechanical/sonnet) and ingest its ≤3-line verdict; loop. The worker resumes from `ironrace-memory/collab-checkpoints`, scans plan/code state, continues the local `subagent-driven-development` batch with the v3-bridge checkpoint rule, runs pre-send harness gates (no reset — no Codex push to sync), writes `status: batch_complete`, and `collab_send`s `sender="claude"`, `topic="implementation_done"`, `content=<JSON {"head_sha":"<current HEAD>"}>` (payload carries ONLY `head_sha`) on green, or `failure_report` on failure. After send, the phase advances to `CodeReviewFixGlobalPending` (Codex's turn — the new v3 order has Codex run `/pr-review-toolkit:review-pr` on the raw post-implementation diff first). **Codex is owner** (`--implementer=codex`): is_my_turn is false here; dispatch Codex via background `codex exec` (per the Codex handoff section). Codex must resume from ironmem checkpoints, scan the plan/code state, and emit `implementation_done` itself before the bg-exec polling loop detects phase advance. |
 | `CodeReviewFixGlobalPending` | Codex's turn. is_my_turn should be false. If `collab_status` confirms Claude is the owner, exit the loop and report the anomaly. **Log:** `t6_codex_review_dispatched` immediately before launching `codex exec`; Codex's prompt requires `/pr-review-toolkit:review-pr` as the final Codex review pass before this handoff returns to Claude for `/ultrareview-local`. **Log:** `t7_codex_review_returned` immediately after the polling loop exits. Both events take structured `phase=CodeReviewFixGlobalPending round=1` metadata — see step d ("Codex handoff") for the exact form. After Codex sends `review_fix_global` the phase advances to `CodeReviewLocalPending` (Claude's audit turn). |
 | `CodeReviewLocalPending` | Dispatch the matrix worker `collab-turn-review-local.md` (review/opus) and ingest its ≤3-line verdict; loop. The worker runs the pre-send harness (with reset to `last_head_sha` — Codex just pushed at `review_fix_global`), then `/ultrareview-local` on the full task stack as audit of Codex's commits, fixes any CRITICAL/HIGH/MEDIUM inline (commit + push), and `collab_send`s `sender="claude"`, `topic="review_local"`, `content=<JSON {"head_sha":"<current HEAD>"}>`. **Log:** `t5_review_local_sent`. **Anti-removal:** under v3 ordering `/ultrareview-local` audits Codex's `review_fix_global` work plus catches code-quality issues both agents missed. Its code-quality lens partially overlaps with Codex's `pr-review-toolkit`-backed branch review but does not fully duplicate it. Removing this stage requires a written overlap audit demonstrating that Codex's `review_fix_global` reviews catch the code-quality issues `/ultrareview-local` would have flagged AND that the audit-of-Codex role is unnecessary. |
-| `CodeReviewFinalPending` | **Enter Plan Mode and get user approval — this is the v3 PR-creation gate.** Under reference-only gates, dispatch the matrix worker `collab-turn-final-review.md` (review/opus) with `$MODE=compose`: it runs the pre-send harness (no reset — Claude just pushed at `review_local`), re-runs gates, drafts the PR title (under 70 chars) + body (summary + test plan derived from task list + gate results), writes `{"title":"...","body":"..."}` to a drawer, and returns `{drawer_id, ≤3-line summary}`. Surface ONLY ref+summary for approval. On approval, dispatch `collab-turn-submit.md` (mechanical/sonnet) with `$TOPIC=final_review` `$ARTIFACT_REF=<drawer_id>`: it reads the approved title/body artifact (drawer immutability is the integrity anchor — the approved drawer's content cannot change, so no hash recompute is needed), then runs `gh pr create --base <base_branch> --head <current branch> --title <approved title> --body <approved body>`, and on failure sends `failure_report` `coding_failure: "pr_create_failed: <error>"` (no silent retry). On success, **Log:** `t8_pr_created <pr_url>`, the worker captures `pr_url` and `collab_send`s `sender="claude"`, `topic="final_review"`, `content=<JSON {"head_sha":"<current HEAD>","pr_url":"<https url>"}>`. **Log:** `t9_final_review_sent`. Session advances directly to `CodingComplete`. **Log:** `t10_session_complete CodingComplete`. Exit loop. |
+| `CodeReviewFinalPending` | **Auto-create the PR — no user-approval gate** (the diff already passed `review_fix_global` + `review_local`, and a PR is editable and unmerged after creation; do NOT enter Plan Mode here). Dispatch the matrix worker `collab-turn-final-review.md` (review/opus) with `$MODE=compose`: it runs the pre-send harness (no reset — Claude just pushed at `review_local`), re-runs gates, drafts the PR title (under 70 chars) + body (summary + test plan derived from task list + gate results), writes `{"title":"...","body":"..."}` to a drawer, and returns `{drawer_id, ≤3-line summary}`. Then dispatch `collab-turn-submit.md` (mechanical/sonnet) **directly** with `$TOPIC=final_review` `$ARTIFACT_REF=<drawer_id>` (drawer immutability is the integrity anchor — the approved drawer's content cannot change, so no hash recompute is needed): it reads the title/body artifact, then runs a plain `gh pr create --base <base_branch> --head <current branch> --title <title> --body <body>` (a **ready** PR — no `--draft`), and on failure sends `failure_report` `coding_failure: "pr_create_failed: <error>"` (no silent retry). On success, **Log:** `t8_pr_created <pr_url>`, the worker captures `pr_url` and `collab_send`s `sender="claude"`, `topic="final_review"`, `content=<JSON {"head_sha":"<current HEAD>","pr_url":"<https url>"}>`. **Log:** `t9_final_review_sent`. Session advances directly to `CodingComplete`. **Log:** `t10_session_complete CodingComplete`. Exit loop. |
 
 After each send in v3, loop back to polling. The loop continues until
 `phase in {CodingComplete, CodingFailed}` or `session_ended`.
@@ -791,14 +820,15 @@ Writes are best-effort and never block the protocol.
   notification; the duplicate-session guard is the server-side backstop, not
   a license to schedule the entry command.
 - **Harness Plan Mode gates only at: v1 FIRST `canonical`
-  (`PlanSynthesisPending` with `review_round == 0`), v1 `final`
-  (`PlanClaudeFinalizePending`), and v3 `final_review`
-  (`CodeReviewFinalPending`, PR creation).** The blind `draft` send (from
+  (`PlanSynthesisPending` with `review_round == 0`) and v1 `final`
+  (`PlanClaudeFinalizePending`).** The blind `draft` send (from
   `/collab start`) and revision-round canonicals (`PlanSynthesisPending`
   with `review_round >= 1`) run autonomously. The v3 `task_list` send is
-  gated by the orchestrator's ref+hash approval of the worker-produced plan,
-  not by writing-plans's interactive handoff and not by harness Plan Mode.
-  Every other turn runs autonomously.
+  gated by the orchestrator's fidelity check — auto-approve on pass, manual
+  reference-only fallback on fail — not by writing-plans's interactive handoff
+  and not by harness Plan Mode. The v3 `final_review` PR creation runs
+  autonomously (no gate; the diff already passed `review_fix_global` +
+  `review_local`). Every other turn runs autonomously.
 - **Every v3 `collab_send` payload is JSON** per the matrix in `docs/COLLAB.md`.
   Never send prose payloads for v3 topics.
 - **`head_sha` in every v3 payload must be the current `HEAD` AFTER any

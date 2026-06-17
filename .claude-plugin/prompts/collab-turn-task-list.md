@@ -21,25 +21,41 @@ preconditions: phase == PlanLocked, current_owner == claude
 ## Actions
 - `$MODE == compose`: invoke `Skill('writing-plans')` on `final_plan` in
   produce-only mode (do NOT trigger its interactive "execute now?" handoff).
-  It saves `docs/superpowers/plans/YYYY-MM-DD-<feature>.md`. Return that
-  `plan_file_path` + SHA-256 content hash. Do NOT send.
-- `$MODE == submit` (after approval): read the approved plan markdown at
-  `$ARTIFACT_REF` (the repo-relative `plan_file_path` returned by compose);
-  recompute its SHA-256 content hash and compare it to `$ARTIFACT_HASH`. On
-  mismatch, send `failure_report`
+  It saves `docs/superpowers/plans/YYYY-MM-DD-<feature>.md`. Then derive the
+  manifest you would send at submit and run the **fidelity check** against the
+  markdown you just authored — this gates whether the orchestrator
+  auto-approves or falls back to the manual gate:
+  1. **Heading-count parity** — `heading_count = grep -c '^### Task '
+     <plan_file_path>`; assert `manifest.tasks.length == heading_count` AND both
+     are ≥ 1. A zero count on either side is a fidelity *failure* (this is the
+     `## Task` h2 mismatch, which yields 0 `^### Task ` headings).
+  2. **ID continuity** — task IDs are `1..N` contiguous.
+  3. **Non-empty `acceptance`** — every task has ≥1 acceptance entry.
+
+  All three pass → `fidelity:pass`. Any fail → `fidelity:fail` and name the
+  failed check on the `blocker:` line. Return `plan_file_path` + SHA-256 content
+  hash + `fidelity:<pass|fail>` with the counts. Do NOT send.
+- `$MODE == submit` (after auto-approve or manual approval): read the approved
+  plan markdown at `$ARTIFACT_REF` (the repo-relative `plan_file_path` returned
+  by compose); recompute its SHA-256 content hash and compare it to
+  `$ARTIFACT_HASH`. On mismatch, send `failure_report`
   `coding_failure:"approved_plan_hash_mismatch: <path>"` and stop. Otherwise
   parse each `### Task N:` heading into `{id, title, acceptance:[...]}`; build
   the manifest `{plan_hash, base_sha:<HEAD>, head_sha:<HEAD>,
   plan_file_path:<$ARTIFACT_REF>, tasks:[...]}` (add
   `execution_mode:"mechanical_direct"` only if the single-task eligibility rule
-  in `docs/COLLAB.md` holds); `collab_send(sender="claude", topic="task_list",
-  content=<JSON string>)`. If zero tasks parse, send a `failure_report`
-  instead.
+  in `docs/COLLAB.md` holds). Re-assert **heading-count parity**
+  (`tasks.length == grep -c '^### Task ' <$ARTIFACT_REF>`) as a
+  defense-in-depth integrity anchor: on mismatch — or if zero tasks parse —
+  send a `failure_report` (`coding_failure:"task_heading_parity_mismatch:
+  tasks=<n> headings=<h>"` or `coding_failure:"zero_tasks_parsed: <path>"`)
+  instead of `task_list`. Otherwise `collab_send(sender="claude",
+  topic="task_list", content=<JSON string>)`.
 
 ## Verdict
 Return EXACTLY these ≤3 lines, nothing else:
 ```
-result: <plan composed | task_list sent (<n> tasks)>
+result: <plan composed (tasks:<n> headings:<h> fidelity:<pass|fail>) | task_list sent (<n> tasks)>
 ref: <plan_file_path hash:<h>>
 blocker: <one line | none>
 ```

@@ -22,9 +22,10 @@ preconditions: phase == CodeReviewFinalPending, current_owner == claude
 2. Draft the PR title (<70 chars) + body (summary + test plan from task_list +
    gate results). `add_drawer(wing="ironrace-memory", room="collab-drafts",
    content=<JSON string {"title":"<title>","body":"<body>"}>)`; return its
-   `drawer_id`. Do NOT open the PR — the orchestrator gates, then dispatches
-   `collab-turn-submit.md` with `$TOPIC=final_review` and
-   `$ARTIFACT_REF=<drawer_id>` to run `gh pr create` and send.
+   `drawer_id`. Do NOT open the PR — the orchestrator dispatches
+   `collab-turn-submit.md` **directly** (no user-approval gate at this phase)
+   with `$TOPIC=final_review` and `$ARTIFACT_REF=<drawer_id>` to run a plain
+   `gh pr create` (ready PR, no `--draft`) and send.
 
 ## Verdict
 Return EXACTLY these ≤3 lines, nothing else:
