@@ -59,6 +59,11 @@ pub fn worker_text_and_usage(raw: &str) -> (String, Usage) {
 }
 
 /// `codex exec` argv: sandbox full-access, run in the worktree, prompt positional.
+///
+/// The `--` before the prompt is REQUIRED: the collab prompt (`collab.md`) begins
+/// with `---` YAML frontmatter, so without an end-of-options marker `codex exec`
+/// parses it as a flag (`error: unexpected argument '---'`). Same hazard the
+/// Claude worker argv guards against.
 pub fn codex_exec_argv(worktree: &Path, prompt: &str) -> (String, Vec<String>) {
     (
         "codex".to_string(),
@@ -68,6 +73,7 @@ pub fn codex_exec_argv(worktree: &Path, prompt: &str) -> (String, Vec<String>) {
             "danger-full-access".into(),
             "-C".into(),
             worktree.display().to_string(),
+            "--".into(),
             prompt.to_string(),
         ],
     )

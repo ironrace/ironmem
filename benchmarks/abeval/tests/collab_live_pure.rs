@@ -12,6 +12,9 @@ fn codex_exec_argv_is_no_shell_and_isolated() {
     assert!(args.windows(2).any(|w| w == ["-s", "danger-full-access"]));
     assert!(args.windows(2).any(|w| w == ["-C", "/tmp/wt"]));
     assert!(args.iter().any(|a| a == "join sess-1"));
+    // `--` must immediately precede the prompt: collab.md starts with `---`
+    // frontmatter and would otherwise be parsed as a flag.
+    assert!(args.windows(2).any(|w| w == ["--", "join sess-1"]));
     // never a shell.
     assert!(!args.iter().any(|a| a == "-c" || a.contains("sh ")));
 }
