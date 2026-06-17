@@ -262,18 +262,20 @@ commit point.
 ### v3 bridge (PlanLocked → CodeImplementPending) — worker-owned
 The orchestrator does NOT call `Skill('writing-plans')` inline, read verbose
 `final_plan`, or build the manifest. It dispatches `collab-turn-task-list.md`
-`$MODE=compose` (authors the plan markdown, returns `plan_file_path` + hash),
-surfaces path+hash+summary for approval, then dispatches the same template
-`$MODE=submit` with `$ARTIFACT_REF=<approved plan_file_path>` and
-`$ARTIFACT_HASH=<approved hash>` to recheck the approved file, derive +
-validate the manifest, and send `task_list`. Only refs/paths/hashes cross the
-orchestrator boundary.
+`$MODE=compose` (authors the plan markdown, derives the manifest, runs the
+fidelity check, returns `plan_file_path` + hash + `fidelity:<pass|fail>`).
+On `fidelity:pass` it **auto-proceeds** (no prompt); on `fidelity:fail` it
+falls back to the manual reference-only gate (surface path+hash+summary). It
+then dispatches the same template `$MODE=submit` with
+`$ARTIFACT_REF=<approved plan_file_path>` and `$ARTIFACT_HASH=<approved hash>`
+to recheck the approved file, derive + validate the manifest, and send
+`task_list`. Only refs/paths/hashes cross the orchestrator boundary.
 
 Once `PlanLocked` is reached with `final_plan_hash` set and no `task_list`
 yet, run the worker-owned bridge. **Do not enter harness Plan Mode here** —
 the `$MODE=compose` worker authors the markdown plan via `writing-plans` in
-produce-only mode, then the orchestrator gates on `plan_file_path + hash +
-summary`.
+produce-only mode, then the orchestrator auto-approves on the fidelity check
+(manual `plan_file_path + hash + summary` gate only on `fidelity:fail`).
 
 1. **Compose.** Dispatch `collab-turn-task-list.md` (planning/opus) with
    `$MODE=compose`. The worker reads `final_plan`/`final_plan_hash` itself
@@ -292,13 +294,15 @@ summary`.
      the `plan_file_path` + hash + ≤3-line summary for user approval
      (reference-only gate — never the full plan body). If the user declines,
      abort the bridge cleanly (do not dispatch `$MODE=submit`, do not send
-     `task_list`).
+     `task_list`) **and exit the dispatch loop with a one-line note** — the
+     session stays at `PlanLocked`; do NOT silently re-dispatch `$MODE=compose`
+     in a loop.
 
-   The fidelity check is what the COMPOSE→SUBMIT step transcribes the locked
-   plan into a manifest by an **LLM worker**, not a deterministic parser, so
-   silent under-counting (e.g. one dropped task, or the `## Task` vs `### Task`
-   heading mismatch that has parsed **0 tasks** in practice) is a real risk. It
-   asserts, against the just-authored markdown:
+   The fidelity check is needed because the COMPOSE→SUBMIT step transcribes the
+   locked plan into a manifest via an **LLM worker**, not a deterministic
+   parser, so silent under-counting (e.g. one dropped task, or the `## Task` vs
+   `### Task` heading mismatch that has parsed **0 tasks** in practice) is a
+   real risk. It asserts, against the just-authored markdown:
    1. **Heading-count parity** — count `^### Task ` headings; assert
       `manifest.tasks.length == heading_count` **and** both counts are ≥ 1. A
       zero count on either side is a fidelity *failure*, not a pass — this is
@@ -309,7 +313,12 @@ summary`.
 
    Any failed check → `fidelity:fail` (manual gate). The
    `approved_plan_hash_mismatch` hard-fail in Submit is unchanged and applies on
-   both the auto-approve and manual-gate paths.
+   both the auto-approve and manual-gate paths. **Scope:** the check is
+   count/structure-only (heading parity, ID continuity, acceptance presence) —
+   it does NOT verify per-task content mapping (e.g. a task whose title/
+   acceptance was transcribed from the wrong heading while the count still
+   matches). The plan-file hash pins the source markdown; manifest transcription
+   fidelity beyond count is an accepted residual risk on the auto-approve path.
 3. **Submit.** On auto-proceed or manual approval, dispatch
    `collab-turn-task-list.md` again with `$MODE=submit`,
    `$ARTIFACT_REF=<approved plan_file_path>`, and `$ARTIFACT_HASH=<approved
@@ -839,9 +848,11 @@ Writes are best-effort and never block the protocol.
   the only topic that bypasses the owner check. A `coding_failure` prefixed
   `"branch_drift:"` is the canonical drift signal; do not suppress it.
 - If the user interrupts with a question or correction during v1, answer it
-  inside Plan Mode and incorporate it into the next send. During v3,
-  gate at writing-plans's approval (bridge) and harness Plan Mode for
-  `final_review`; all other turns are autonomous.
+  inside Plan Mode and incorporate it into the next send. During v3, all turns
+  are autonomous — the only remaining content gates are the v1 first
+  `canonical` and `final` (Plan Mode). The bridge auto-approves on its fidelity
+  check (manual fallback only on `fidelity:fail`) and `final_review` PR creation
+  is gateless.
 
 ## Session handoff (fallback succession)
 

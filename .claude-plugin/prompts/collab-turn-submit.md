@@ -3,7 +3,7 @@ turn: submit
 tier: mechanical
 model: sonnet
 topics: [canonical, final, final_review, failure_report]
-preconditions: a prior compose worker wrote $ARTIFACT_REF and the user approved
+preconditions: a prior compose worker wrote $ARTIFACT_REF; for canonical/final the user approved, for final_review the orchestrator dispatches directly (no gate)
 ---
 
 # Collab worker — submit-by-ref (post-gate sender)
@@ -18,9 +18,10 @@ preconditions: a prior compose worker wrote $ARTIFACT_REF and the user approved
    `repo_path`, `branch`, and `base_sha`.
 2. Fetch the artifact named by `$ARTIFACT_REF` (drawer id → drawer fetch, or a
    file path → read the file).
-   - Drawers are immutable (append-only); the approved `$ARTIFACT_REF` content
-     cannot change, so no hash recompute is needed — the ref is the integrity
-     anchor.
+   - Drawers are immutable (append-only); the `$ARTIFACT_REF` content cannot
+     change, so no hash recompute is needed — the ref is the integrity anchor.
+     (For `canonical`/`final` the ref is the user-approved drawer; for
+     `final_review` the orchestrator dispatched it directly with no gate.)
 
 ## Actions
 - If `$TOPIC == final_review`: parse the artifact JSON as
@@ -31,7 +32,8 @@ preconditions: a prior compose worker wrote $ARTIFACT_REF and the user approved
   `collab_send(sender="claude", topic="final_review",
   content=<JSON {"head_sha":"<HEAD>","pr_url":"<url>"}>)`. On `gh` failure or
   base-branch resolution failure, send `failure_report`
-  `pr_create_failed:...`.
+  `content=<JSON {"coding_failure":"pr_create_failed: <error>"}>` (no silent
+  retry).
 - Otherwise (`canonical`/`final`): `collab_send(sender="claude", topic="$TOPIC",
   content=<artifact body, JSON-wrapped {"plan":...} only for `final`>)`.
 
