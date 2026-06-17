@@ -37,6 +37,21 @@ pub fn claude_worker_argv(mcp_config: &str) -> (String, Vec<String>) {
     )
 }
 
+/// Extract the worker's *printed text* and token usage from a raw `claude -p
+/// --output-format json` envelope. The envelope is a single JSON line, so the
+/// model's actual output (where sentinel lines like `ABEVAL_SESSION_ID=` / `ref:`
+/// live) is the `result` field — NOT the raw bytes. The driver's line parsers
+/// must see that text, not the `{...}` wrapper. On an unparseable envelope
+/// (schema drift) fall back to the raw bytes + default usage: a 0-exit worker
+/// then contributes zero tokens for the turn (the rare tolerance the run-level
+/// zero-token guards still catch in aggregate).
+pub fn worker_text_and_usage(raw: &str) -> (String, Usage) {
+    match parse_cli_result(raw) {
+        Ok(r) => (r.result, r.usage),
+        Err(_) => (raw.to_string(), Usage::default()),
+    }
+}
+
 /// `codex exec` argv: sandbox full-access, run in the worktree, prompt positional.
 pub fn codex_exec_argv(worktree: &Path, prompt: &str) -> (String, Vec<String>) {
     (
@@ -91,12 +106,8 @@ impl WorkerSpawner for ProcessWorkerSpawner {
                 stderr.trim()
             ));
         }
-        let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
-        // Reuse the envelope parser. A non-zero exit already errored above; only a
-        // 0-exit worker whose usage block is unparseable/renamed (schema drift)
-        // reaches here and contributes zero tokens for this turn — the rare
-        // tolerance the run-level zero-token guards still catch in aggregate.
-        let usage = parse_cli_result(&stdout).map(|r| r.usage).unwrap_or_default();
+        let raw = String::from_utf8_lossy(&out.stdout).into_owned();
+        let (stdout, usage) = worker_text_and_usage(&raw);
         Ok(WorkerResult { usage, stdout })
     }
 

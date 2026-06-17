@@ -1,5 +1,8 @@
 use std::path::Path;
-use abeval::collab_live::{codex_exec_argv, claude_worker_argv, minimal_codex_config};
+use abeval::collab_live::{
+    claude_worker_argv, codex_exec_argv, minimal_codex_config, worker_text_and_usage,
+};
+use abeval::collab_driver::parse_session_id;
 
 #[test]
 fn codex_exec_argv_is_no_shell_and_isolated() {
@@ -20,6 +23,35 @@ fn claude_worker_argv_carries_json_and_mcp_config() {
     assert!(args.windows(2).any(|w| w == ["--output-format", "json"]));
     assert!(args.iter().any(|a| a == "--mcp-config"));
     assert!(args.iter().any(|a| a == "-p"));
+}
+
+#[test]
+fn worker_text_extracts_result_so_sentinels_parse_from_json_envelope() {
+    // Regression: the worker runs with --output-format json, so the raw stdout is
+    // a one-line `{...}` envelope. The ABEVAL_SESSION_ID= sentinel lives in the
+    // `result` field; parsing the RAW envelope can never line-match it. After
+    // extraction, parse_session_id must find the id.
+    let envelope = r#"{"type":"result","is_error":false,"result":"ABEVAL_SESSION_ID=d234877e-f538-4925-a66b-75c1a2380c74","usage":{"input_tokens":12,"output_tokens":3,"cache_creation_input_tokens":0,"cache_read_input_tokens":0}}"#;
+
+    // Raw envelope: sentinel is NOT line-matchable (the regression).
+    assert!(parse_session_id(envelope).is_err());
+
+    // Extracted text: sentinel parses, usage carried through.
+    let (text, usage) = worker_text_and_usage(envelope);
+    assert_eq!(
+        parse_session_id(&text).unwrap(),
+        "d234877e-f538-4925-a66b-75c1a2380c74"
+    );
+    assert_eq!(usage.input_tokens, 12);
+    assert_eq!(usage.output_tokens, 3);
+}
+
+#[test]
+fn worker_text_falls_back_to_raw_on_unparseable_envelope() {
+    let (text, usage) = worker_text_and_usage("not json at all");
+    assert_eq!(text, "not json at all");
+    assert_eq!(usage.input_tokens, 0);
+    assert_eq!(usage.output_tokens, 0);
 }
 
 #[test]
