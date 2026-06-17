@@ -11,8 +11,12 @@ use anyhow::{anyhow, Result};
 use crate::client::Usage;
 use crate::collab_db::SessionState;
 
+/// Terminal collab phases (mirrors `crates/ironmem/src/collab/phase.rs`).
+pub const PHASE_CODING_COMPLETE: &str = "CodingComplete";
+pub const PHASE_CODING_FAILED: &str = "CodingFailed";
+
 /// One dispatch decision for a `(phase, owner)` poll. Frozen mirror of the
-/// design-spec §4.3 table / `collab.md` owner-first dispatch.
+/// dispatch matrix in `.claude-plugin/commands/collab.md` (owner-first dispatch).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WorkerAction {
     /// A single Claude turn that sends its phase event directly (no compose/submit
@@ -34,7 +38,7 @@ pub enum WorkerAction {
 
 /// Map a `(phase, owner, global_review_round)` poll to a [`WorkerAction`].
 pub fn worker_action(phase: &str, owner: &str, global_review_round: u32) -> WorkerAction {
-    if matches!(phase, "CodingComplete" | "CodingFailed") {
+    if matches!(phase, PHASE_CODING_COMPLETE | PHASE_CODING_FAILED) {
         return WorkerAction::Terminal;
     }
     match owner {
@@ -163,10 +167,6 @@ pub struct WorkerResult {
 /// Result of one spawned Codex turn. `commits_added` is the count of commits the
 /// turn added to the worktree (used for `fix_commits` on rework turns).
 pub struct CodexResult {
-    /// Reserved; real Codex token attribution comes from rollout-log scanning via
-    /// [`CodexAttributor`], not from this field — present so fakes can signal a
-    /// spawn happened without wiring up a full attributor.
-    pub usage_hint: Usage,
     pub commits_added: u32,
 }
 
@@ -309,7 +309,7 @@ pub fn run_collab_task<R: CollabStateReader, S: WorkerSpawner, A: CodexAttributo
     let reached_phase = last_state.phase.clone();
     let review_rounds = last_state.global_review_round;
 
-    if !matches!(reached_phase.as_str(), "CodingComplete" | "CodingFailed") {
+    if !matches!(reached_phase.as_str(), PHASE_CODING_COMPLETE | PHASE_CODING_FAILED) {
         return Err(anyhow!(
             "collab run for task {} exhausted MAX_TURNS ({}) without reaching a \
              terminal phase; last phase was {} — INVALID run",
@@ -321,10 +321,17 @@ pub fn run_collab_task<R: CollabStateReader, S: WorkerSpawner, A: CodexAttributo
 
     // (3) Attribute Codex tokens; a completed run with zero Codex is INVALID.
     let codex_usage = attributor.attribute()?;
-    if reached_phase == "CodingComplete" && codex_usage.total() == 0 {
+    if reached_phase == PHASE_CODING_COMPLETE && codex_usage.total() == 0 {
         return Err(anyhow!(
             "collab run for task {} reached CodingComplete but attributed ZERO Codex \
              tokens — INVALID run (no Codex engagement); excluded",
+            ctx.task_id
+        ));
+    }
+    if reached_phase == PHASE_CODING_COMPLETE && claude_usage.total() == 0 {
+        return Err(anyhow!(
+            "collab run for task {} reached CodingComplete but accumulated ZERO Claude \
+             tokens across all turns — INVALID run (workers emitted no usage); excluded",
             ctx.task_id
         ));
     }

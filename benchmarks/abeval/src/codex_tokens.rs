@@ -89,8 +89,13 @@ pub fn parse_rollout(jsonl: &str) -> Result<Option<CodexSessionTokens>> {
                         .get("info")
                         .and_then(|v| v.get("total_token_usage"))
                     {
-                        if let Ok(parsed) = serde_json::from_value::<TotalTokenUsage>(tu.clone()) {
-                            last_usage = Some(parsed);
+                        match serde_json::from_value::<TotalTokenUsage>(tu.clone()) {
+                            Ok(parsed) => last_usage = Some(parsed),
+                            Err(e) => {
+                                return Err(anyhow!(
+                                    "token_count event has unparseable total_token_usage: {e}"
+                                ));
+                            }
                         }
                     }
                 }
@@ -118,7 +123,9 @@ pub fn parse_rollout(jsonl: &str) -> Result<Option<CodexSessionTokens>> {
     // Corrected mapping (see plan Global Constraints): Codex `input_tokens`
     // INCLUDES `cached_input_tokens`, unlike Anthropic's convention. Subtract so
     // `Usage::total()` equals Codex's own `total_tokens` and the cached portion is
-    // counted once (as cache_read). `output_tokens` already includes reasoning.
+    // counted once (as cache_read). `output_tokens` already includes
+    // `reasoning_output_tokens` (per Codex rollout convention; not verified by
+    // this code — assumed from observed sessions).
     let usage = Usage {
         input_tokens: tu.input_tokens.saturating_sub(tu.cached_input_tokens),
         cache_read_input_tokens: tu.cached_input_tokens,

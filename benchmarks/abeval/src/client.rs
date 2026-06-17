@@ -187,7 +187,8 @@ fn superpowers_mcp_isolation_args() -> Vec<String> {
 /// NOTE: as of METRICS_SPEC §12 2026-06-17, `LiveExecutor::execute` no longer
 /// calls `arm_command` for `Arm::Ironmem` — that arm delegates to an
 /// `IronmemArmRunner` (the headless collab driver). The `Arm::Ironmem` branch
-/// here is retained only for the `arm_command` unit tests / `arms.rs`.
+/// here is retained only for `arm_command` unit tests (`tests/arms.rs`,
+/// `tests/live_executor.rs`).
 pub fn arm_command(task: &Task, arm: Arm) -> (String, Vec<String>) {
     let mut argv = vec!["--output-format".to_string(), "json".to_string()];
     argv.extend(headless_permission_args());
@@ -583,12 +584,16 @@ impl<R: CommandRunner, P: WorkspaceProvisioner> ArmExecutor for LiveExecutor<R, 
         if matches!(arm, Arm::Ironmem) {
             // Collab artifacts (collab.db, codex-home, remote.git) live as a
             // SIBLING of the workspaces tree: workspace_root is <out>/workspaces,
-            // so its parent <out> is the task-dir root. The unwrap_or fallback only
-            // triggers for a root-less workspace_root (not a real run layout).
+            // so its parent <out> is the task-dir root. A root-less workspace_root
+            // is not a real run layout, so derive the dir fail-loud rather than
+            // silently mis-placing artifacts inside the workspaces tree.
             let out_task_dir = self
                 .workspace_root
                 .parent()
-                .unwrap_or(&self.workspace_root)
+                .ok_or_else(|| anyhow::anyhow!(
+                    "workspace_root {} has no parent; cannot derive ironmem output dir",
+                    self.workspace_root.display()
+                ))?
                 .join(&task.id);
             std::fs::create_dir_all(&out_task_dir).with_context(|| {
                 format!("creating ironmem out dir {}", out_task_dir.display())

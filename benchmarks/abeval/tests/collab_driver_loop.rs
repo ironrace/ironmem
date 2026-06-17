@@ -53,7 +53,7 @@ impl WorkerSpawner for FakeSpawner {
     }
     fn spawn_codex(&self, _session_id: &str, _wt: &Path) -> anyhow::Result<CodexResult> {
         *self.codex_calls.borrow_mut() += 1;
-        Ok(CodexResult { usage_hint: Usage::default(), commits_added: 2 })
+        Ok(CodexResult { commits_added: 2 })
     }
 }
 

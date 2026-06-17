@@ -1,6 +1,8 @@
 //! Production seams for the headless collab driver (real process spawns) + the
 //! per-task live environment (isolated CODEX_HOME, local bare remote, branch).
-//! Reached ONLY behind the approval gate in `runner::run_task_live_guarded`.
+//! The real-process entry point `run_ironmem_arm` is reached ONLY behind the
+//! approval gate in `runner::run_task_live_guarded`; the pure argv/config helpers
+//! are also used directly by unit tests.
 
 use std::path::{Path, PathBuf};
 
@@ -80,11 +82,20 @@ impl WorkerSpawner for ProcessWorkerSpawner {
             .env("IRONMEM_DB_PATH", &self.db_path)
             .output()
             .with_context(|| format!("spawning claude worker in {}", worktree.display()))?;
+        if !out.status.success() {
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            return Err(anyhow!(
+                "claude worker exited {:?} in {} — stderr: {}",
+                out.status.code(),
+                worktree.display(),
+                stderr.trim()
+            ));
+        }
         let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
-        // Reuse the envelope parser. A worker that errored but still emitted a
-        // usage block has its tokens summed; a worker that emitted no parseable
-        // JSON contributes zero tokens for this turn (the run-level zero-Codex
-        // guard catches the catastrophic case).
+        // Reuse the envelope parser. A non-zero exit already errored above; only a
+        // 0-exit worker whose usage block is unparseable/renamed (schema drift)
+        // reaches here and contributes zero tokens for this turn — the rare
+        // tolerance the run-level zero-token guards still catch in aggregate.
         let usage = parse_cli_result(&stdout).map(|r| r.usage).unwrap_or_default();
         Ok(WorkerResult { usage, stdout })
     }
@@ -102,7 +113,7 @@ impl WorkerSpawner for ProcessWorkerSpawner {
         }
         let head_after = git_head(worktree)?;
         let commits_added = count_commits_between(worktree, &head_before, &head_after)?;
-        Ok(CodexResult { usage_hint: Usage::default(), commits_added })
+        Ok(CodexResult { commits_added })
     }
 }
 
@@ -171,7 +182,8 @@ pub fn provision_collab_env(
     std::fs::write(codex_home.join("config.toml"), minimal_codex_config())?;
     let auth_dst = codex_home.join("auth.json");
     if auth_dst.exists() {
-        std::fs::remove_file(&auth_dst).ok();
+        std::fs::remove_file(&auth_dst)
+            .with_context(|| format!("removing stale auth symlink {}", auth_dst.display()))?;
     }
     if !auth_src.exists() {
         return Err(anyhow!(
@@ -181,7 +193,8 @@ pub fn provision_collab_env(
     }
     std::os::unix::fs::symlink(auth_src, &auth_dst)
         .with_context(|| format!("symlinking auth.json into {}", codex_home.display()))?;
-    let _ = std::fs::create_dir_all(codex_home.join("sessions"));
+    std::fs::create_dir_all(codex_home.join("sessions"))
+        .with_context(|| format!("creating sessions dir under {}", codex_home.display()))?;
 
     // Per-task local bare remote so intermediate pushes go nowhere real.
     run_git(&["init", "--bare", &remote_bare.display().to_string()])?;
@@ -221,11 +234,18 @@ pub fn run_ironmem_arm(task: &Task, worktree: &Path, out_task_dir: &Path) -> Res
     provision_collab_env(worktree, &codex_home, &auth_src, &branch, &remote_bare)?;
 
     // MCP config: a single ironmem server that inherits IRONMEM_DB_PATH so the
-    // worker's collab tools and the driver's reader share the per-task DB.
-    let mcp_config = format!(
-        r#"{{"mcpServers":{{"ironmem":{{"command":"ironmem","args":["serve"],"env":{{"IRONMEM_DB_PATH":"{}"}}}}}}}}"#,
-        db_path.display()
-    );
+    // worker's collab tools and the driver's reader share the per-task DB. Built
+    // with serde_json so a db_path containing `"`/`\` cannot produce malformed JSON.
+    let mcp_config = serde_json::json!({
+        "mcpServers": {
+            "ironmem": {
+                "command": "ironmem",
+                "args": ["serve"],
+                "env": { "IRONMEM_DB_PATH": db_path.display().to_string() }
+            }
+        }
+    })
+    .to_string();
     let bootstrap_prompt = format!(
         "ABEVAL_BOOTSTRAP: call mcp__ironmem__collab_start with repo_path=\"{}\", \
          branch=\"{}\", task=\"{}\", initiator=\"claude\". Then print EXACTLY one line: \
@@ -257,7 +277,7 @@ pub fn run_ironmem_arm(task: &Task, worktree: &Path, out_task_dir: &Path) -> Res
         codex_usage: result.codex_usage,
         review_rounds: result.review_rounds,
         fix_commits: result.fix_commits,
-        outcome: if result.reached_phase == "CodingComplete" {
+        outcome: if result.reached_phase == crate::collab_driver::PHASE_CODING_COMPLETE {
             crate::constants::OUTCOME_COMPLETED.to_string()
         } else {
             crate::constants::OUTCOME_FAILED.to_string()

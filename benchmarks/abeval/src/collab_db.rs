@@ -23,6 +23,7 @@ impl SessionState {
     /// `{CodingComplete, CodingFailed}` is the terminal set (mirrors
     /// `crates/ironmem/src/collab/phase.rs::is_terminal`).
     pub fn is_terminal(&self) -> bool {
+        // keep in sync with collab_driver::PHASE_CODING_{COMPLETE,FAILED}
         matches!(self.phase.as_str(), "CodingComplete" | "CodingFailed")
     }
 }
