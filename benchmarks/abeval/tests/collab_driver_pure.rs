@@ -49,6 +49,10 @@ fn dispatch_matrix_maps_each_phase() {
     // Owner/phase mismatch is an anomaly (e.g. claude owning a codex-only phase).
     assert_eq!(worker_action("CodeReviewFixGlobalPending", "claude", 0), WorkerAction::Anomaly);
     assert_eq!(worker_action("CodeImplementPending", "codex", 0), WorkerAction::Anomaly);
+    // TEST 7: unknown owner string is always an anomaly, regardless of phase.
+    assert_eq!(worker_action("PlanLocked", "human", 0), WorkerAction::Anomaly);
+    // Terminal wins regardless of owner — even an unknown owner string.
+    assert_eq!(worker_action("CodingComplete", "nobody", 0), WorkerAction::Terminal);
 }
 
 #[test]

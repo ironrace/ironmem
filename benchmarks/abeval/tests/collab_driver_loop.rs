@@ -163,6 +163,114 @@ fn max_turns_exhaustion_without_terminal_is_invalid() {
     let spawner = FakeSpawner { claude_prompts: RefCell::new(vec![]), codex_calls: RefCell::new(0) };
     let attributor = FixedAttributor(Usage { input_tokens: 1, ..Default::default() });
     let err = run_collab_task(&ctx(&prompts), &reader, &spawner, &attributor).unwrap_err();
-    let msg = err.to_string().to_lowercase();
-    assert!(msg.contains("max_turns") || msg.contains("terminal"), "expected exhaustion error: {err}");
+    // TEST 8a: tighten to the real message (production says "exhausted MAX_TURNS").
+    let msg = err.to_string();
+    assert!(msg.contains("MAX_TURNS"), "expected MAX_TURNS exhaustion error: {err}");
+}
+
+/// TEST 4 — CodingFailed + zero Codex is Ok, not Err.
+/// The zero-Codex INVALID guard fires only on CodingComplete. A failed run that
+/// produced no Codex sessions is still a valid (non-INVALID) data point.
+#[test]
+fn coding_failed_with_zero_codex_is_ok_not_err() {
+    let prompts = repo_prompts_dir();
+    let reader = ScriptedReader {
+        states: vec![
+            st("CodeImplementPending", "claude", 0),
+            st("CodingFailed", "claude", 0),
+        ],
+        idx: RefCell::new(0),
+    };
+    let spawner = FakeSpawner { claude_prompts: RefCell::new(vec![]), codex_calls: RefCell::new(0) };
+    let attributor = FixedAttributor(Usage::default()); // zero Codex tokens
+
+    let res = run_collab_task(&ctx(&prompts), &reader, &spawner, &attributor)
+        .expect("CodingFailed + zero Codex must be Ok, not Err");
+    assert_eq!(res.reached_phase, "CodingFailed");
+    assert_eq!(res.codex_usage.total(), 0);
+}
+
+/// TEST 5 — zero-Claude on CodingComplete is INVALID.
+/// A run that reaches CodingComplete but accumulated ZERO Claude tokens across
+/// all worker turns must return Err with a message naming "claude".
+struct ZeroUsageSpawner;
+
+impl WorkerSpawner for ZeroUsageSpawner {
+    fn spawn_claude(&self, prompt: &str, _wt: &std::path::Path) -> anyhow::Result<WorkerResult> {
+        let stdout = if prompt.contains("ABEVAL_BOOTSTRAP") {
+            "ABEVAL_SESSION_ID=sess-xyz\n".to_string()
+        } else {
+            "result: ok\nref: drawer-1\nblocker: none\n".to_string()
+        };
+        Ok(WorkerResult {
+            usage: Usage::default(), // zero every turn
+            stdout,
+        })
+    }
+    fn spawn_codex(&self, _session_id: &str, _wt: &std::path::Path) -> anyhow::Result<CodexResult> {
+        Ok(CodexResult { commits_added: 0 })
+    }
+}
+
+#[test]
+fn zero_claude_completed_run_is_invalid() {
+    let prompts = repo_prompts_dir();
+    let reader = ScriptedReader {
+        states: vec![
+            st("CodeImplementPending", "claude", 0),
+            st("CodingComplete", "claude", 0),
+        ],
+        idx: RefCell::new(0),
+    };
+    let spawner = ZeroUsageSpawner;
+    // Non-zero Codex so only the Claude guard can fire.
+    let attributor = FixedAttributor(Usage { input_tokens: 500, output_tokens: 100, ..Default::default() });
+
+    let err = run_collab_task(&ctx(&prompts), &reader, &spawner, &attributor).unwrap_err();
+    assert!(
+        err.to_string().to_lowercase().contains("claude"),
+        "zero-claude completed run must fail loud naming claude: {err}"
+    );
+}
+
+/// TEST 6 — ClaudeCompose returning no ref: line errors through run_collab_task.
+/// A compose-phase spawner that returns a verdict without a `ref:` line must
+/// produce an Err with a message containing "ref".
+struct NoRefSpawner;
+
+impl WorkerSpawner for NoRefSpawner {
+    fn spawn_claude(&self, prompt: &str, _wt: &std::path::Path) -> anyhow::Result<WorkerResult> {
+        let stdout = if prompt.contains("ABEVAL_BOOTSTRAP") {
+            "ABEVAL_SESSION_ID=sess-xyz\n".to_string()
+        } else {
+            // Deliberate: no `ref:` line.
+            "result: ok\nblocker: none\n".to_string()
+        };
+        Ok(WorkerResult {
+            usage: Usage { input_tokens: 10, output_tokens: 5, ..Default::default() },
+            stdout,
+        })
+    }
+    fn spawn_codex(&self, _session_id: &str, _wt: &std::path::Path) -> anyhow::Result<CodexResult> {
+        Ok(CodexResult { commits_added: 0 })
+    }
+}
+
+#[test]
+fn compose_worker_returning_no_ref_errors() {
+    let prompts = repo_prompts_dir();
+    // PlanSynthesisPending + claude + round 0 → ClaudeCompose, which requires a ref: line.
+    let reader = ScriptedReader {
+        states: vec![st("PlanSynthesisPending", "claude", 0)],
+        idx: RefCell::new(0),
+    };
+    let spawner = NoRefSpawner;
+    // Non-zero Codex (won't be reached, but set for completeness).
+    let attributor = FixedAttributor(Usage { input_tokens: 1, ..Default::default() });
+
+    let err = run_collab_task(&ctx(&prompts), &reader, &spawner, &attributor).unwrap_err();
+    assert!(
+        err.to_string().to_lowercase().contains("ref"),
+        "missing ref: line must produce an error naming 'ref': {err}"
+    );
 }

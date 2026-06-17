@@ -34,7 +34,24 @@ fn rollout_without_token_count_is_none_not_error() {
 fn rollout_without_session_meta_is_an_error() {
     let no_meta = r#"{"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":10,"cached_input_tokens":0,"output_tokens":2,"reasoning_output_tokens":0,"total_tokens":12}}}}
 "#;
-    assert!(parse_rollout(no_meta).is_err());
+    let err = parse_rollout(no_meta).unwrap_err();
+    assert!(err.to_string().contains("session_meta"), "{err}");
+}
+
+/// TEST 1 — zero-cached parse passthrough.
+/// A structurally valid rollout where cached_input_tokens == 0 must pass through
+/// saturating_sub(0) cleanly: input stays at face value, cache_read is zero,
+/// total() equals Codex's own total_tokens field.
+#[test]
+fn zero_cached_tokens_pass_through_saturating_sub() {
+    let jsonl = r#"{"type":"session_meta","payload":{"cwd":"/tmp/wt/zero-cache","timestamp":"2026-06-17T06:00:00.000Z"}}
+{"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":500,"cached_input_tokens":0,"output_tokens":50,"reasoning_output_tokens":0,"total_tokens":550}}}}
+"#;
+    let parsed = parse_rollout(jsonl).unwrap().expect("a usable session");
+    assert_eq!(parsed.usage.input_tokens, 500); // saturating_sub(0) passes through
+    assert_eq!(parsed.usage.cache_read_input_tokens, 0);
+    assert_eq!(parsed.usage.output_tokens, 50);
+    assert_eq!(parsed.usage.total(), 550);
 }
 
 #[test]
