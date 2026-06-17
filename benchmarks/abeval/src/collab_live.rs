@@ -252,12 +252,22 @@ pub fn run_ironmem_arm(task: &Task, worktree: &Path, out_task_dir: &Path) -> Res
     // MCP config: a single ironmem server that inherits IRONMEM_DB_PATH so the
     // worker's collab tools and the driver's reader share the per-task DB. Built
     // with serde_json so a db_path containing `"`/`\` cannot produce malformed JSON.
+    //
+    // IRONMEM_MCP_MODE=trusted is REQUIRED: the server defaults to read-only, which
+    // exposes only the read-class collab tools (status/recv/get_caps/wait_my_turn)
+    // and disables the write-class ones the driver depends on — collab_start,
+    // collab_send, collab_ack, collab_approve, collab_end. Without it the bootstrap
+    // worker cannot create a session and the run fails with "No such tool available:
+    // mcp__ironmem__collab_start".
     let mcp_config = serde_json::json!({
         "mcpServers": {
             "ironmem": {
                 "command": "ironmem",
                 "args": ["serve"],
-                "env": { "IRONMEM_DB_PATH": db_path.display().to_string() }
+                "env": {
+                    "IRONMEM_DB_PATH": db_path.display().to_string(),
+                    "IRONMEM_MCP_MODE": "trusted"
+                }
             }
         }
     })
