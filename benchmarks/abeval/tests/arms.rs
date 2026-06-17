@@ -12,7 +12,8 @@ fn task(prompt: &str) -> Task {
         acceptance: vec!["a".to_string()],
         gates: vec!["cargo test".to_string()],
         setup_notes: None,
-        base_commit: "abcdef1234567890abcdef1234567890abcdef12".to_string(),
+        base_commit: abeval::corpus::BaseCommit::parse("abcdef1234567890abcdef1234567890abcdef12")
+            .unwrap(),
     }
 }
 
