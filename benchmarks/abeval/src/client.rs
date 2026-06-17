@@ -183,6 +183,11 @@ fn superpowers_mcp_isolation_args() -> Vec<String> {
 /// Both arms request `--output-format json` AND `-p` (print mode, required for
 /// `--output-format` to take effect) AND headless permission tokens. The
 /// isolation flags precede `-p` so the prompt remains the print-mode positional.
+///
+/// NOTE: as of METRICS_SPEC §12 2026-06-17, `LiveExecutor::execute` no longer
+/// calls `arm_command` for `Arm::Ironmem` — that arm delegates to an
+/// `IronmemArmRunner` (the headless collab driver). The `Arm::Ironmem` branch
+/// here is retained only for the `arm_command` unit tests / `arms.rs`.
 pub fn arm_command(task: &Task, arm: Arm) -> (String, Vec<String>) {
     let mut argv = vec!["--output-format".to_string(), "json".to_string()];
     argv.extend(headless_permission_args());
@@ -576,6 +581,10 @@ impl<R: CommandRunner, P: WorkspaceProvisioner> ArmExecutor for LiveExecutor<R, 
         // The superpowers arm runs a single `claude -p`; the ironmem arm drives a
         // real /collab flow (Claude + Codex) via the injected IronmemArmRunner.
         if matches!(arm, Arm::Ironmem) {
+            // Collab artifacts (collab.db, codex-home, remote.git) live as a
+            // SIBLING of the workspaces tree: workspace_root is <out>/workspaces,
+            // so its parent <out> is the task-dir root. The unwrap_or fallback only
+            // triggers for a root-less workspace_root (not a real run layout).
             let out_task_dir = self
                 .workspace_root
                 .parent()

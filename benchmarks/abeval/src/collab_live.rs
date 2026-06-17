@@ -146,7 +146,10 @@ fn count_commits_between(worktree: &Path, from: &str, to: &str) -> Result<u32> {
     if !out.status.success() {
         return Err(anyhow!("git rev-list failed in {}", worktree.display()));
     }
-    Ok(String::from_utf8_lossy(&out.stdout).trim().parse().unwrap_or(0))
+    let raw = String::from_utf8_lossy(&out.stdout);
+    raw.trim()
+        .parse::<u32>()
+        .with_context(|| format!("parsing `git rev-list --count` output {:?} in {}", raw.trim(), worktree.display()))
 }
 
 /// Provision the isolated CODEX_HOME (minimal config + symlinked auth.json), a
@@ -167,6 +170,12 @@ pub fn provision_collab_env(
     let auth_dst = codex_home.join("auth.json");
     if auth_dst.exists() {
         std::fs::remove_file(&auth_dst).ok();
+    }
+    if !auth_src.exists() {
+        return Err(anyhow!(
+            "Codex auth not found at {}; cannot provision isolated CODEX_HOME",
+            auth_src.display()
+        ));
     }
     std::os::unix::fs::symlink(auth_src, &auth_dst)
         .with_context(|| format!("symlinking auth.json into {}", codex_home.display()))?;
