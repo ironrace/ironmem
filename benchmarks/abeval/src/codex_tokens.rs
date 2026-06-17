@@ -107,6 +107,14 @@ pub fn parse_rollout(jsonl: &str) -> Result<Option<CodexSessionTokens>> {
         return Ok(None);
     };
 
+    if tu.cached_input_tokens > tu.input_tokens {
+        return Err(anyhow!(
+            "corrupt rollout: cached_input_tokens ({}) exceeds input_tokens ({}) — refusing to miscount",
+            tu.cached_input_tokens,
+            tu.input_tokens
+        ));
+    }
+
     // Corrected mapping (see plan Global Constraints): Codex `input_tokens`
     // INCLUDES `cached_input_tokens`, unlike Anthropic's convention. Subtract so
     // `Usage::total()` equals Codex's own `total_tokens` and the cached portion is

@@ -36,3 +36,12 @@ fn rollout_without_session_meta_is_an_error() {
 "#;
     assert!(parse_rollout(no_meta).is_err());
 }
+
+#[test]
+fn rollout_with_cached_exceeding_input_is_an_error() {
+    let bad = r#"{"type":"session_meta","payload":{"cwd":"/tmp/x","timestamp":"2026-06-17T05:43:08.955Z"}}
+{"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":10,"cached_input_tokens":40,"output_tokens":2,"reasoning_output_tokens":0,"total_tokens":12}}}}
+"#;
+    let err = parse_rollout(bad).unwrap_err();
+    assert!(err.to_string().to_lowercase().contains("cached"), "must name the corrupt field: {err}");
+}

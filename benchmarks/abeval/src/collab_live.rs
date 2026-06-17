@@ -81,8 +81,10 @@ impl WorkerSpawner for ProcessWorkerSpawner {
             .output()
             .with_context(|| format!("spawning claude worker in {}", worktree.display()))?;
         let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
-        // Reuse the existing envelope parser; a worker that errored still has its
-        // usage summed (a failed turn is not a silent zero).
+        // Reuse the envelope parser. A worker that errored but still emitted a
+        // usage block has its tokens summed; a worker that emitted no parseable
+        // JSON contributes zero tokens for this turn (the run-level zero-Codex
+        // guard catches the catastrophic case).
         let usage = parse_cli_result(&stdout).map(|r| r.usage).unwrap_or_default();
         Ok(WorkerResult { usage, stdout })
     }
