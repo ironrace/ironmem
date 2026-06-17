@@ -73,7 +73,9 @@ cargo run --manifest-path benchmarks/abeval/Cargo.toml -- run \
   --batch 0 --batch-size 2 --arms both --dry-run --out /tmp/abeval-campaign
 cargo run --manifest-path benchmarks/abeval/Cargo.toml -- run \
   --batch 1 --batch-size 2 --arms both --dry-run --out /tmp/abeval-campaign
-# ... up to the last batch (8 tasks / 2 = batches 0..4)
+# ... up to the last batch: 8 tasks / 2 = 4 batches, valid indices 0–3.
+# A failing task does not strand the batch — every task is attempted, a
+# per-task ledger is printed, and the process exits non-zero if any failed.
 
 # Summarize the run and enforce the §11.3 headline gate.
 # Exactly one of --run / --metrics is required (they are mutually exclusive):

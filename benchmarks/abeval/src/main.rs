@@ -1,14 +1,18 @@
+use std::path::PathBuf;
+
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 
-#[derive(Parser)]
+use abeval::corpus::Task;
+
+#[derive(Parser, Debug)]
 #[command(name = "abeval", about = "A/B eval harness (METRICS_SPEC §11)")]
 struct Cli {
     #[command(subcommand)]
     command: Command,
 }
 
-#[derive(Subcommand)]
+#[derive(Subcommand, Debug)]
 enum Command {
     /// Validate the frozen corpus and print its content hash.
     Validate {
@@ -45,8 +49,9 @@ enum Command {
         #[arg(long)]
         base_sha: Option<String>,
     },
-    /// Summarize a run directory OR a normalized metrics file; enforce the
-    /// §11.3 headline gate. Exactly one of --run / --metrics is required.
+    /// Summarize a smoke run directory, a single metrics file, OR an aggregated
+    /// `--out` tree; enforce the §11.3 headline gate. Exactly one of --run /
+    /// --metrics / --metrics-dir is required.
     Report {
         /// Smoke run directory produced by `run`.
         #[arg(long, conflicts_with_all = ["metrics", "metrics_dir"])]
@@ -86,58 +91,29 @@ fn main() -> Result<()> {
         } => {
             let tasks = abeval::corpus::load_corpus(&corpus)?;
             abeval::corpus::validate_corpus(&tasks)?;
-            // clap guarantees exactly one of --task / --batch; the remaining
-            // arms are defensive bails for a hand-built invocation.
-            let selected = match (task, batch) {
-                (Some(id), None) => {
-                    let t = tasks
-                        .into_iter()
-                        .find(|t| t.id == id)
-                        .ok_or_else(|| anyhow::anyhow!("task {id} not found in corpus"))?;
-                    vec![t]
-                }
-                (None, Some(index)) => abeval::corpus::select_batch(&tasks, batch_size, index)?,
-                (Some(_), Some(_)) => anyhow::bail!("pass either --task or --batch, not both"),
-                (None, None) => anyhow::bail!("provide --task <id> or --batch <index>"),
-            };
+            let selected = select_run_tasks(tasks, task, batch, batch_size)?;
             // Default to dry-run unless --execute-live was explicitly passed.
             let dry = dry_run || !execute_live;
-            // Each task in a batch runs independently into its own
-            // `<out>/<task_id>/` subtree; the live cost-approval gate is
-            // re-checked per task inside `run_task`.
-            for selected_task in selected {
-                // Base-commit precedence (including the illegal "override a pin"
-                // state) is enforced by the single authority `resolve_base_commit`,
-                // reached via the live executor; no duplicate guard here.
-                let arm_list = abeval::arms::assign_arms(&selected_task.id, &arms)?;
-                let summary = abeval::runner::run_task(abeval::runner::RunArgs {
-                    task: selected_task,
-                    arms: arm_list,
-                    dry_run: dry,
-                    execute_live,
-                    budget_usd,
-                    approval_file: approval_file.clone(),
-                    out_dir: std::path::PathBuf::from(&out),
-                    base_sha: base_sha.clone(),
-                })?;
-                println!("ran {} ({} arms)", summary.task_id, summary.arms_run);
-            }
-            Ok(())
+            run_selected(RunBatch {
+                selected,
+                arms: &arms,
+                dry,
+                execute_live,
+                budget_usd,
+                approval_file,
+                out: &out,
+                base_sha,
+            })
         }
         Command::Report {
             run,
             metrics,
             metrics_dir,
         } => {
-            // clap enforces mutual exclusion; the final arm is the
-            // none-provided error (clap can't require exactly-one of three).
-            let input = match (run, metrics, metrics_dir) {
-                (Some(run_dir), None, None) => abeval::report::metrics_from_run_dir(&run_dir)?,
-                (None, Some(metrics_path), None) => abeval::report::load_metrics(&metrics_path)?,
-                (None, None, Some(dir)) => abeval::report::load_metrics_dir(&dir)?,
-                _ => anyhow::bail!(
-                    "provide exactly one of --run <dir>, --metrics <file>, or --metrics-dir <dir>"
-                ),
+            let input = match report_source(run, metrics, metrics_dir)? {
+                ReportSource::RunDir(d) => abeval::report::metrics_from_run_dir(&d)?,
+                ReportSource::MetricsFile(f) => abeval::report::load_metrics(&f)?,
+                ReportSource::MetricsDir(d) => abeval::report::load_metrics_dir(&d)?,
             };
             print!("{}", abeval::report::render_report(&input));
             Ok(())
@@ -145,10 +121,134 @@ fn main() -> Result<()> {
     }
 }
 
+/// Resolve which corpus tasks a `run` invocation targets: a single `--task` id,
+/// or the `--batch`-th chunk of size `batch_size`. clap enforces the mutual
+/// exclusion; the both/neither arms are defensive bails for a hand-built
+/// invocation that bypassed clap.
+fn select_run_tasks(
+    tasks: Vec<Task>,
+    task: Option<String>,
+    batch: Option<usize>,
+    batch_size: usize,
+) -> Result<Vec<Task>> {
+    match (task, batch) {
+        (Some(id), None) => {
+            let t = tasks
+                .into_iter()
+                .find(|t| t.id == id)
+                .ok_or_else(|| anyhow::anyhow!("task {id} not found in corpus"))?;
+            Ok(vec![t])
+        }
+        (None, Some(index)) => abeval::corpus::select_batch(&tasks, batch_size, index),
+        (Some(_), Some(_)) => anyhow::bail!("pass either --task or --batch, not both"),
+        (None, None) => anyhow::bail!("provide --task <id> or --batch <index>"),
+    }
+}
+
+/// The evidence source a `report` invocation reads.
+enum ReportSource {
+    RunDir(String),
+    MetricsFile(String),
+    MetricsDir(String),
+}
+
+/// Validate that exactly one report source is present. clap enforces mutual
+/// exclusion but cannot express "required exactly-one-of-three", so the
+/// none-present case is validated here rather than silently dispatching.
+fn report_source(
+    run: Option<String>,
+    metrics: Option<String>,
+    metrics_dir: Option<String>,
+) -> Result<ReportSource> {
+    match (run, metrics, metrics_dir) {
+        (Some(d), None, None) => Ok(ReportSource::RunDir(d)),
+        (None, Some(f), None) => Ok(ReportSource::MetricsFile(f)),
+        (None, None, Some(d)) => Ok(ReportSource::MetricsDir(d)),
+        _ => anyhow::bail!(
+            "provide exactly one of --run <dir>, --metrics <file>, or --metrics-dir <dir>"
+        ),
+    }
+}
+
+/// Parameters for running one selection (single task or a batch).
+struct RunBatch<'a> {
+    selected: Vec<Task>,
+    arms: &'a str,
+    dry: bool,
+    execute_live: bool,
+    budget_usd: Option<f64>,
+    approval_file: Option<PathBuf>,
+    out: &'a str,
+    base_sha: Option<String>,
+}
+
+/// Run each selected task independently into its own `<out>/<task_id>/` subtree.
+///
+/// Batch policy: tasks are independent and a batch is resumable, so a failing
+/// task does NOT strand the rest — every task is attempted, each outcome is
+/// printed, and a final ledger reports which ran and which failed. The process
+/// still exits non-zero if any task failed, so a partial paid batch is never
+/// silently reported as success (the spent-vs-skipped boundary stays visible).
+fn run_selected(b: RunBatch) -> Result<()> {
+    let total = b.selected.len();
+    let mut ran: Vec<String> = Vec::new();
+    let mut failed: Vec<String> = Vec::new();
+    for selected_task in b.selected {
+        let task_id = selected_task.id.clone();
+        // Base-commit precedence (including the illegal "override a pin" state)
+        // is enforced by the single authority `resolve_base_commit`, reached via
+        // the live executor; no duplicate guard here. The live cost-approval
+        // gate is re-checked per task inside `run_task`.
+        let result = abeval::arms::assign_arms(&task_id, b.arms).and_then(|arm_list| {
+            abeval::runner::run_task(abeval::runner::RunArgs {
+                task: selected_task,
+                arms: arm_list,
+                dry_run: b.dry,
+                execute_live: b.execute_live,
+                budget_usd: b.budget_usd,
+                approval_file: b.approval_file.clone(),
+                out_dir: PathBuf::from(b.out),
+                base_sha: b.base_sha.clone(),
+            })
+        });
+        match result {
+            Ok(summary) => {
+                println!("ran {} ({} arms)", summary.task_id, summary.arms_run);
+                ran.push(task_id);
+            }
+            Err(e) => {
+                // Full error chain to stderr so a per-task failure is never lost.
+                eprintln!("FAILED {task_id}: {e:#}");
+                failed.push(task_id);
+            }
+        }
+    }
+    if total > 1 || !failed.is_empty() {
+        let failed_note = if failed.is_empty() {
+            String::new()
+        } else {
+            format!("; failed [{}]", failed.join(", "))
+        };
+        println!(
+            "batch summary: {}/{total} ran [{}]{failed_note}",
+            ran.len(),
+            ran.join(", "),
+        );
+    }
+    if !failed.is_empty() {
+        anyhow::bail!(
+            "{} of {total} task(s) failed: {}",
+            failed.len(),
+            failed.join(", ")
+        );
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
-    use super::Cli;
-    use clap::CommandFactory;
+    use super::{report_source, select_run_tasks, Cli, ReportSource};
+    use clap::{CommandFactory, Parser};
 
     /// Guards every `conflicts_with*` / `required_unless_present` id against the
     /// arg ids that actually exist — the check that would have caught the
@@ -156,5 +256,63 @@ mod tests {
     #[test]
     fn cli_definition_is_internally_consistent() {
         Cli::command().debug_assert();
+    }
+
+    // --- run: --task / --batch mutual exclusion enforced by clap at parse time ---
+
+    #[test]
+    fn run_rejects_task_and_batch_together() {
+        let r = Cli::try_parse_from(["abeval", "run", "--task", "x", "--batch", "0", "--out", "o"]);
+        assert!(r.is_err(), "clap must reject --task with --batch");
+    }
+
+    #[test]
+    fn run_requires_task_or_batch() {
+        let r = Cli::try_parse_from(["abeval", "run", "--out", "o"]);
+        assert!(r.is_err(), "clap must require one of --task / --batch");
+    }
+
+    #[test]
+    fn run_accepts_batch_alone() {
+        let r = Cli::try_parse_from(["abeval", "run", "--batch", "0", "--out", "o"]);
+        assert!(r.is_ok(), "--batch alone is valid: {r:?}");
+    }
+
+    // --- report: exactly-one-of-three source selection ---
+
+    #[test]
+    fn report_rejects_multiple_sources_at_parse_time() {
+        let r = Cli::try_parse_from(["abeval", "report", "--metrics", "a", "--metrics-dir", "b"]);
+        assert!(r.is_err(), "clap must reject --metrics with --metrics-dir");
+    }
+
+    #[test]
+    fn report_source_requires_exactly_one() {
+        // The none-provided case clap cannot express; validated in code.
+        assert!(report_source(None, None, None).is_err());
+        // Defensive: a hand-built both-present pair is rejected.
+        assert!(report_source(Some("a".into()), Some("b".into()), None).is_err());
+        assert!(matches!(
+            report_source(None, None, Some("d".into())).unwrap(),
+            ReportSource::MetricsDir(_)
+        ));
+    }
+
+    // --- run task selection (pure dispatch helper) ---
+
+    #[test]
+    fn select_run_tasks_defensive_bails() {
+        // Neither and both are defensive errors (clap normally prevents them).
+        assert!(select_run_tasks(vec![], None, None, 2).is_err());
+        assert!(select_run_tasks(vec![], Some("x".into()), Some(0), 2).is_err());
+    }
+
+    #[test]
+    fn select_run_tasks_rejects_unknown_task_id() {
+        // Empty corpus exercises the not-found path without constructing a Task.
+        let err = select_run_tasks(vec![], Some("nope".into()), None, 2)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("not found"), "got: {err}");
     }
 }

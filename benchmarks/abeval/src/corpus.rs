@@ -183,11 +183,18 @@ pub fn select_batch(tasks: &[Task], batch_size: usize, batch_index: usize) -> Re
     if batch_size == 0 {
         bail!("batch-size must be >= 1");
     }
+    if tasks.is_empty() {
+        bail!("corpus is empty; nothing to batch");
+    }
     let num_batches = tasks.len().div_ceil(batch_size);
     if batch_index >= num_batches {
+        // `num_batches >= 1` here (corpus is non-empty), so the inclusive upper
+        // index is well-defined. Inclusive `0..=last` wording avoids the
+        // exclusive-range ambiguity of `0..N` for an operator-facing message.
+        let last = num_batches - 1;
         bail!(
-            "batch index {batch_index} out of range: corpus of {} tasks has \
-             {num_batches} batch(es) of size {batch_size} (valid indices 0..{num_batches})",
+            "batch index {batch_index} out of range: corpus of {} tasks splits into \
+             {num_batches} batch(es) of size {batch_size} (valid indices 0..={last})",
             tasks.len()
         );
     }

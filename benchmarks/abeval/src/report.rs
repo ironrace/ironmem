@@ -144,27 +144,54 @@ pub fn load_metrics(path: impl AsRef<Path>) -> Result<MetricsInput> {
 ///
 /// Scans immediate subdirectories `<dir>/<task_id>/live_metrics.json` (the shape
 /// the live runner writes), in sorted order for determinism, and unions their
-/// task rows. Errors if:
-/// - the tree holds no such file (nothing to report — never an empty pass), or
-/// - any loaded file is not `evidence_class:"live"` (a smoke file must never
-///   silently dilute live evidence into a fabricated headline).
+/// task rows.
+///
+/// Failure posture — errors are surfaced, never swallowed:
+/// - `read_dir`/entry/stat errors (e.g. a permissions error) PROPAGATE rather
+///   than being coerced to "not a directory" and silently skipped.
+/// - a malformed `live_metrics.json` propagates its parse error (via
+///   [`load_metrics`]) with the offending path.
+/// - any loaded file that is not `evidence_class:"live"` is a hard error (a
+///   smoke file must never silently dilute live evidence into a fabricated
+///   headline).
+/// - an empty result errors and reports how many subdirectories were scanned,
+///   so "no task dirs at all" is distinguishable from "dirs present, none with a
+///   readable metrics file".
+///
+/// A subdirectory WITHOUT `live_metrics.json` is skipped, not an error: the live
+/// runner writes a sibling `<dir>/workspaces/...` worktree tree that legitimately
+/// holds no metrics file. Each per-task file is assumed to carry BOTH arms (the
+/// writer, `execute_approved_live`, writes them together atomically); the §11.3
+/// gate, not this loader, is the authority on per-arm completeness.
 ///
 /// Duplicate `task_key` rows (e.g. a task re-run) are NOT collapsed here; the
 /// §11.3 gate already ignores duplicate keys, so aggregation cannot inflate `n`.
 pub fn load_metrics_dir(dir: impl AsRef<Path>) -> Result<MetricsInput> {
     let dir = dir.as_ref();
-    let mut files: Vec<PathBuf> = Vec::new();
     let entries =
         std::fs::read_dir(dir).with_context(|| format!("reading metrics dir {}", dir.display()))?;
+    let mut files: Vec<PathBuf> = Vec::new();
+    let mut subdirs_scanned = 0usize;
     for entry in entries {
-        let path = entry
-            .with_context(|| format!("reading entry in {}", dir.display()))?
-            .path();
-        if path.is_dir() {
-            let candidate = path.join("live_metrics.json");
-            if candidate.is_file() {
-                files.push(candidate);
-            }
+        let entry = entry.with_context(|| format!("reading entry in {}", dir.display()))?;
+        // `file_type` from the dir entry does not follow symlinks, so a
+        // symlinked dir is treated as a non-dir (skipped) rather than followed.
+        let file_type = entry
+            .file_type()
+            .with_context(|| format!("stat {}", entry.path().display()))?;
+        if !file_type.is_dir() {
+            continue; // stray top-level file (e.g. a run log) — not a task dir
+        }
+        subdirs_scanned += 1;
+        let candidate = entry.path().join("live_metrics.json");
+        // A task subtree has live_metrics.json; a sibling like `workspaces/`
+        // legitimately does not. A missing file is a skip; a stat error other
+        // than "not found" propagates instead of vanishing.
+        match std::fs::metadata(&candidate) {
+            Ok(meta) if meta.is_file() => files.push(candidate),
+            Ok(_) => anyhow::bail!("{} exists but is not a regular file", candidate.display()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e).with_context(|| format!("stat {}", candidate.display())),
         }
     }
     files.sort();
@@ -183,7 +210,7 @@ pub fn load_metrics_dir(dir: impl AsRef<Path>) -> Result<MetricsInput> {
     }
     if tasks.is_empty() {
         anyhow::bail!(
-            "no */live_metrics.json found under {} (nothing to aggregate)",
+            "no */live_metrics.json found under {} ({subdirs_scanned} subdirectory(ies) scanned)",
             dir.display()
         );
     }

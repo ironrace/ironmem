@@ -70,3 +70,36 @@ fn zero_batch_size_is_rejected() {
     let c = corpus(8);
     assert!(select_batch(&c, 0, 0).is_err());
 }
+
+#[test]
+fn batch_size_larger_than_corpus_returns_all_as_batch_zero() {
+    let c = corpus(3);
+    assert_eq!(
+        ids(&select_batch(&c, 10, 0).unwrap()),
+        ["abeval-00", "abeval-01", "abeval-02"]
+    );
+    // Only one batch exists (div_ceil(3, 10) == 1), so index 1 is out of range.
+    assert!(select_batch(&c, 10, 1).is_err());
+}
+
+#[test]
+fn single_element_corpus_has_exactly_one_batch() {
+    let c = corpus(1);
+    assert_eq!(ids(&select_batch(&c, 2, 0).unwrap()), ["abeval-00"]);
+    assert!(select_batch(&c, 2, 1).is_err());
+}
+
+#[test]
+fn batch_size_one_maps_each_index_to_a_single_task() {
+    let c = corpus(3);
+    assert_eq!(ids(&select_batch(&c, 1, 0).unwrap()), ["abeval-00"]);
+    assert_eq!(ids(&select_batch(&c, 1, 1).unwrap()), ["abeval-01"]);
+    assert_eq!(ids(&select_batch(&c, 1, 2).unwrap()), ["abeval-02"]);
+    assert!(select_batch(&c, 1, 3).is_err()); // num_batches == len == 3
+}
+
+#[test]
+fn empty_corpus_is_rejected() {
+    let c: Vec<Task> = Vec::new();
+    assert!(select_batch(&c, 2, 0).is_err());
+}
