@@ -58,9 +58,20 @@ impl Usage {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ArmOutcome {
     pub arm: Arm,
+    /// Claude-side token usage (the driving CLI envelope, or summed across collab
+    /// worker turns for the ironmem arm).
     pub usage: Usage,
-    /// `"completed"` for dry-run synthesis; live outcomes are recorded by the
-    /// future live path / normalized metric input.
+    /// Codex-side token usage (ironmem arm only; zero for superpowers). Attributed
+    /// from `~/.codex/sessions` rollouts by worktree cwd + window.
+    #[serde(default)]
+    pub codex_usage: Usage,
+    /// §11.4 rework counters (ironmem arm only; zero for superpowers).
+    #[serde(default)]
+    pub review_rounds: u32,
+    #[serde(default)]
+    pub fix_commits: u32,
+    /// `"completed"`/`"failed"` (agent-level). The §12 done-proxy lifts this to
+    /// `"merged"` only when gates are green (in `build_arm_metric`).
     pub outcome: String,
     pub transcript: String,
 }
@@ -119,6 +130,9 @@ impl ArmExecutor for DryRunExecutor {
         Ok(ArmOutcome {
             arm,
             usage,
+            codex_usage: Usage::default(),
+            review_rounds: 0,
+            fix_commits: 0,
             outcome: "completed".to_string(),
             transcript: format!("[dry-run] {} :: {}", arm.label(), task.id),
         })
@@ -560,6 +574,9 @@ impl<R: CommandRunner, P: WorkspaceProvisioner> ArmExecutor for LiveExecutor<R, 
         Ok(ArmOutcome {
             arm,
             usage: parsed.usage,
+            codex_usage: Usage::default(),
+            review_rounds: 0,
+            fix_commits: 0,
             outcome: outcome.to_string(),
             transcript: output.stdout,
         })

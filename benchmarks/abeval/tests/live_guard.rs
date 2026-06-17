@@ -167,6 +167,9 @@ impl ArmExecutor for FakeArmExec {
         Ok(ArmOutcome {
             arm,
             usage: abeval::client::Usage::default(),
+            codex_usage: abeval::client::Usage::default(),
+            review_rounds: 0,
+            fix_commits: 0,
             outcome: self.outcome.clone(),
             transcript: String::new(),
         })

@@ -272,6 +272,9 @@ fn arm_outcome(outcome: &str, input: u32) -> ArmOutcome {
             cache_creation_input_tokens: 0,
             cache_read_input_tokens: 0,
         },
+        codex_usage: Usage::default(),
+        review_rounds: 0,
+        fix_commits: 0,
         outcome: outcome.to_string(),
         transcript: String::new(),
     }
