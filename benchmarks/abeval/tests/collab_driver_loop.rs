@@ -1,16 +1,19 @@
-use std::cell::RefCell;
-use std::path::{Path, PathBuf};
 use abeval::client::Usage;
 use abeval::collab_db::SessionState;
 use abeval::collab_driver::{
-    run_collab_task, CodexAttributor, CodexResult, CollabStateReader, CollabTaskCtx,
-    WorkerResult, WorkerSpawner,
+    run_collab_task, CodexAttributor, CodexResult, CollabStateReader, CollabTaskCtx, WorkerResult,
+    WorkerSpawner,
 };
+use std::cell::RefCell;
+use std::path::{Path, PathBuf};
 
 /// State reader that returns a scripted sequence of phases, one per poll.
 struct ScriptedReader {
     states: Vec<SessionState>,
     idx: RefCell<usize>,
+    /// `(drawer_id, rowid)` the next `newest_draft_drawer` call should surface,
+    /// or `None` for "no DB drawer" (forces the `parse_ref_line` fallback).
+    draft: Option<(String, i64)>,
 }
 impl CollabStateReader for ScriptedReader {
     fn read(&self, _session_id: &str) -> anyhow::Result<SessionState> {
@@ -18,6 +21,9 @@ impl CollabStateReader for ScriptedReader {
         let s = self.states[(*i).min(self.states.len() - 1)].clone();
         *i += 1;
         Ok(s)
+    }
+    fn newest_draft_drawer(&self, after_rowid: i64) -> anyhow::Result<Option<(String, i64)>> {
+        Ok(self.draft.clone().filter(|(_, rowid)| *rowid > after_rowid))
     }
 }
 
@@ -43,11 +49,20 @@ impl WorkerSpawner for FakeSpawner {
         self.claude_prompts.borrow_mut().push(prompt.to_string());
         let stdout = if prompt.contains("ABEVAL_BOOTSTRAP") {
             "ABEVAL_SESSION_ID=sess-xyz\n".to_string()
+        } else if prompt.contains("fidelity") {
+            // task_list bridge verdict shape (compose): `<path> hash:<h>` + fidelity.
+            "result: plan composed (tasks:2 headings:2 fidelity:pass)\n\
+             ref: docs/superpowers/plans/x.md hash:abc123\nblocker: none\n"
+                .to_string()
         } else {
             "result: ok\nref: drawer-1\nblocker: none\n".to_string()
         };
         Ok(WorkerResult {
-            usage: Usage { input_tokens: 10, output_tokens: 5, ..Default::default() },
+            usage: Usage {
+                input_tokens: 10,
+                output_tokens: 5,
+                ..Default::default()
+            },
             stdout,
         })
     }
@@ -59,7 +74,9 @@ impl WorkerSpawner for FakeSpawner {
 
 struct FixedAttributor(Usage);
 impl CodexAttributor for FixedAttributor {
-    fn attribute(&self) -> anyhow::Result<Usage> { Ok(self.0.clone()) }
+    fn attribute(&self) -> anyhow::Result<Usage> {
+        Ok(self.0.clone())
+    }
 }
 
 fn ctx(prompts_dir: &Path) -> CollabTaskCtx {
@@ -76,7 +93,10 @@ fn ctx(prompts_dir: &Path) -> CollabTaskCtx {
 fn repo_prompts_dir() -> PathBuf {
     // tests run with CWD = crate dir (benchmarks/abeval); repo root is two up.
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .parent().unwrap().parent().unwrap()
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap()
         .join(".claude-plugin/prompts")
 }
 
@@ -99,24 +119,34 @@ fn full_happy_path_sums_usage_and_counts_rework() {
             st("CodingComplete", "claude", 1),
         ],
         idx: RefCell::new(0),
+        draft: None,
     };
-    let spawner = FakeSpawner { claude_prompts: RefCell::new(vec![]), codex_calls: RefCell::new(0) };
-    let attributor = FixedAttributor(Usage { input_tokens: 1000, output_tokens: 200, ..Default::default() });
+    let spawner = FakeSpawner {
+        claude_prompts: RefCell::new(vec![]),
+        codex_calls: RefCell::new(0),
+    };
+    let attributor = FixedAttributor(Usage {
+        input_tokens: 1000,
+        output_tokens: 200,
+        ..Default::default()
+    });
 
     let res = run_collab_task(&ctx(&prompts), &reader, &spawner, &attributor).unwrap();
 
     assert_eq!(res.reached_phase, "CodingComplete");
-    assert_eq!(res.review_rounds, 1);          // from global_review_round
-    assert_eq!(res.fix_commits, 2);            // one codex fix turn × 2 commits
+    assert_eq!(res.review_rounds, 1); // from global_review_round
+    assert_eq!(res.fix_commits, 2); // one codex fix turn × 2 commits
     assert_eq!(*spawner.codex_calls.borrow(), 3); // draft + plan-review + fix
     assert_eq!(res.codex_usage.total(), 1200);
-    // Claude usage = 1 bootstrap + 11 loop spawns (ClaudeSend×3, ClaudeCompose×3×2,
-    // FinalReviewSynthetic×2) = 12 spawns × 15 tokens each = 180.
+    // Claude usage = 1 bootstrap + 11 loop spawns (ClaudeSend×3, ClaudeCompose×2×2,
+    // TaskListBridge×2, FinalReviewSynthetic×2) = 12 spawns × 15 tokens each = 180.
     assert_eq!(res.claude_usage.total(), 180);
     assert_eq!(res.pr_url_synthetic, "local://abeval/task1");
     // The final-review path produced a synthetic submit, never a gh pr create.
     let prompts_seen = spawner.claude_prompts.borrow();
-    assert!(prompts_seen.iter().any(|p| p.contains("local://abeval/task1")));
+    assert!(prompts_seen
+        .iter()
+        .any(|p| p.contains("local://abeval/task1")));
 }
 
 #[test]
@@ -128,8 +158,12 @@ fn zero_codex_completed_run_is_invalid() {
             st("CodingComplete", "claude", 0),
         ],
         idx: RefCell::new(0),
+        draft: None,
     };
-    let spawner = FakeSpawner { claude_prompts: RefCell::new(vec![]), codex_calls: RefCell::new(0) };
+    let spawner = FakeSpawner {
+        claude_prompts: RefCell::new(vec![]),
+        codex_calls: RefCell::new(0),
+    };
     let attributor = FixedAttributor(Usage::default()); // zero Codex tokens
 
     let err = run_collab_task(&ctx(&prompts), &reader, &spawner, &attributor).unwrap_err();
@@ -145,11 +179,21 @@ fn anomaly_phase_owner_combo_errors() {
     let reader = ScriptedReader {
         states: vec![st("CodeReviewFixGlobalPending", "claude", 0)], // claude can't own this
         idx: RefCell::new(0),
+        draft: None,
     };
-    let spawner = FakeSpawner { claude_prompts: RefCell::new(vec![]), codex_calls: RefCell::new(0) };
-    let attributor = FixedAttributor(Usage { input_tokens: 1, ..Default::default() });
+    let spawner = FakeSpawner {
+        claude_prompts: RefCell::new(vec![]),
+        codex_calls: RefCell::new(0),
+    };
+    let attributor = FixedAttributor(Usage {
+        input_tokens: 1,
+        ..Default::default()
+    });
     let err = run_collab_task(&ctx(&prompts), &reader, &spawner, &attributor).unwrap_err();
-    assert!(err.to_string().to_lowercase().contains("anomaly"), "expected anomaly error: {err}");
+    assert!(
+        err.to_string().to_lowercase().contains("anomaly"),
+        "expected anomaly error: {err}"
+    );
 }
 
 #[test]
@@ -159,13 +203,23 @@ fn max_turns_exhaustion_without_terminal_is_invalid() {
     let reader = ScriptedReader {
         states: vec![st("CodeImplementPending", "claude", 0)],
         idx: RefCell::new(0),
+        draft: None,
     };
-    let spawner = FakeSpawner { claude_prompts: RefCell::new(vec![]), codex_calls: RefCell::new(0) };
-    let attributor = FixedAttributor(Usage { input_tokens: 1, ..Default::default() });
+    let spawner = FakeSpawner {
+        claude_prompts: RefCell::new(vec![]),
+        codex_calls: RefCell::new(0),
+    };
+    let attributor = FixedAttributor(Usage {
+        input_tokens: 1,
+        ..Default::default()
+    });
     let err = run_collab_task(&ctx(&prompts), &reader, &spawner, &attributor).unwrap_err();
     // TEST 8a: tighten to the real message (production says "exhausted MAX_TURNS").
     let msg = err.to_string();
-    assert!(msg.contains("MAX_TURNS"), "expected MAX_TURNS exhaustion error: {err}");
+    assert!(
+        msg.contains("MAX_TURNS"),
+        "expected MAX_TURNS exhaustion error: {err}"
+    );
 }
 
 /// TEST 4 — CodingFailed + zero Codex is Ok, not Err.
@@ -180,8 +234,12 @@ fn coding_failed_with_zero_codex_is_ok_not_err() {
             st("CodingFailed", "claude", 0),
         ],
         idx: RefCell::new(0),
+        draft: None,
     };
-    let spawner = FakeSpawner { claude_prompts: RefCell::new(vec![]), codex_calls: RefCell::new(0) };
+    let spawner = FakeSpawner {
+        claude_prompts: RefCell::new(vec![]),
+        codex_calls: RefCell::new(0),
+    };
     let attributor = FixedAttributor(Usage::default()); // zero Codex tokens
 
     let res = run_collab_task(&ctx(&prompts), &reader, &spawner, &attributor)
@@ -221,10 +279,15 @@ fn zero_claude_completed_run_is_invalid() {
             st("CodingComplete", "claude", 0),
         ],
         idx: RefCell::new(0),
+        draft: None,
     };
     let spawner = ZeroUsageSpawner;
     // Non-zero Codex so only the Claude guard can fire.
-    let attributor = FixedAttributor(Usage { input_tokens: 500, output_tokens: 100, ..Default::default() });
+    let attributor = FixedAttributor(Usage {
+        input_tokens: 500,
+        output_tokens: 100,
+        ..Default::default()
+    });
 
     let err = run_collab_task(&ctx(&prompts), &reader, &spawner, &attributor).unwrap_err();
     assert!(
@@ -247,7 +310,11 @@ impl WorkerSpawner for NoRefSpawner {
             "result: ok\nblocker: none\n".to_string()
         };
         Ok(WorkerResult {
-            usage: Usage { input_tokens: 10, output_tokens: 5, ..Default::default() },
+            usage: Usage {
+                input_tokens: 10,
+                output_tokens: 5,
+                ..Default::default()
+            },
             stdout,
         })
     }
@@ -263,14 +330,123 @@ fn compose_worker_returning_no_ref_errors() {
     let reader = ScriptedReader {
         states: vec![st("PlanSynthesisPending", "claude", 0)],
         idx: RefCell::new(0),
+        draft: None,
     };
     let spawner = NoRefSpawner;
     // Non-zero Codex (won't be reached, but set for completeness).
-    let attributor = FixedAttributor(Usage { input_tokens: 1, ..Default::default() });
+    let attributor = FixedAttributor(Usage {
+        input_tokens: 1,
+        ..Default::default()
+    });
 
     let err = run_collab_task(&ctx(&prompts), &reader, &spawner, &attributor).unwrap_err();
     assert!(
         err.to_string().to_lowercase().contains("ref"),
         "missing ref: line must produce an error naming 'ref': {err}"
+    );
+}
+
+/// TEST 7 (layer 8) — a compose worker that OMITS its `ref:` line must NOT fail
+/// the run when the drawer it staged actually persisted: the driver recovers the
+/// artifact ref from the newest `collab-drafts` drawer (rowid advanced past the
+/// pre-compose snapshot). This is the drawer-staging-flakiness fix.
+struct RecoverReader {
+    states: Vec<SessionState>,
+    idx: RefCell<usize>,
+    /// Per-compose, `newest_draft_drawer` is called twice: first the pre-compose
+    /// snapshot (no new drawer yet → None), then the post-compose resolve (the
+    /// drawer the worker persisted → Some). Toggles on each call.
+    calls: RefCell<u32>,
+}
+impl CollabStateReader for RecoverReader {
+    fn read(&self, _session_id: &str) -> anyhow::Result<SessionState> {
+        let mut i = self.idx.borrow_mut();
+        let s = self.states[(*i).min(self.states.len() - 1)].clone();
+        *i += 1;
+        Ok(s)
+    }
+    fn newest_draft_drawer(&self, after_rowid: i64) -> anyhow::Result<Option<(String, i64)>> {
+        let mut c = self.calls.borrow_mut();
+        *c += 1;
+        // Odd call = pre-compose snapshot (empty); even = post-compose (persisted).
+        if *c % 2 == 1 {
+            Ok(None)
+        } else {
+            Ok(Some(("recovered-drawer".to_string(), 1)).filter(|(_, r)| *r > after_rowid))
+        }
+    }
+}
+
+#[test]
+fn compose_worker_missing_ref_recovers_persisted_drawer() {
+    let prompts = repo_prompts_dir();
+    // One compose phase (canonical), then terminal. The worker omits `ref:`.
+    let reader = RecoverReader {
+        states: vec![
+            st("PlanSynthesisPending", "claude", 0),
+            st("CodingComplete", "claude", 1),
+        ],
+        idx: RefCell::new(0),
+        calls: RefCell::new(0),
+    };
+    let spawner = NoRefSpawner; // never prints a ref: line
+    let attributor = FixedAttributor(Usage {
+        input_tokens: 100,
+        output_tokens: 20,
+        ..Default::default()
+    });
+
+    let res = run_collab_task(&ctx(&prompts), &reader, &spawner, &attributor)
+        .expect("missing ref: line must be recovered from the persisted drawer, not fail");
+    // Reaching the terminal phase is the proof: without recovery, the compose at
+    // PlanSynthesisPending would have errored with "no ref: line".
+    assert_eq!(res.reached_phase, "CodingComplete");
+}
+
+/// TEST 8 (layer 9) — the PlanLocked TaskListBridge must fail clean when the
+/// compose worker reports `fidelity:fail` (authored markdown diverged from the
+/// manifest), rather than submitting a bad plan.
+struct FidelityFailSpawner;
+impl WorkerSpawner for FidelityFailSpawner {
+    fn spawn_claude(&self, prompt: &str, _wt: &std::path::Path) -> anyhow::Result<WorkerResult> {
+        let stdout = if prompt.contains("ABEVAL_BOOTSTRAP") {
+            "ABEVAL_SESSION_ID=sess-xyz\n".to_string()
+        } else {
+            // task_list compose reporting a fidelity failure.
+            "result: plan composed (tasks:2 headings:1 fidelity:fail)\n\
+             ref: docs/superpowers/plans/x.md hash:abc123\nblocker: heading-count parity\n"
+                .to_string()
+        };
+        Ok(WorkerResult {
+            usage: Usage {
+                input_tokens: 10,
+                output_tokens: 5,
+                ..Default::default()
+            },
+            stdout,
+        })
+    }
+    fn spawn_codex(&self, _session_id: &str, _wt: &std::path::Path) -> anyhow::Result<CodexResult> {
+        Ok(CodexResult { commits_added: 0 })
+    }
+}
+
+#[test]
+fn task_list_fidelity_fail_aborts_clean() {
+    let prompts = repo_prompts_dir();
+    let reader = ScriptedReader {
+        states: vec![st("PlanLocked", "claude", 0)],
+        idx: RefCell::new(0),
+        draft: None,
+    };
+    let spawner = FidelityFailSpawner;
+    let attributor = FixedAttributor(Usage {
+        input_tokens: 1,
+        ..Default::default()
+    });
+    let err = run_collab_task(&ctx(&prompts), &reader, &spawner, &attributor).unwrap_err();
+    assert!(
+        err.to_string().to_lowercase().contains("fidelity"),
+        "fidelity:fail must abort the run naming 'fidelity': {err}"
     );
 }

@@ -1,58 +1,105 @@
-use std::fs;
 use abeval::collab_driver::{
     parse_ref_line, parse_session_id, render_worker_prompt, worker_action, WorkerAction,
 };
+use std::fs;
 
 #[test]
 fn dispatch_matrix_maps_each_phase() {
     // Claude-owned planning/coding phases.
     assert_eq!(
         worker_action("PlanParallelDrafts", "claude", 0),
-        WorkerAction::ClaudeSend { template: "collab-turn-plan-draft.md", mode: "send" }
+        WorkerAction::ClaudeSend {
+            template: "collab-turn-plan-draft.md",
+            mode: "send"
+        }
     );
     assert_eq!(
         worker_action("PlanSynthesisPending", "claude", 0),
-        WorkerAction::ClaudeCompose { template: "collab-turn-plan-synthesis.md", topic: "canonical" }
+        WorkerAction::ClaudeCompose {
+            template: "collab-turn-plan-synthesis.md",
+            topic: "canonical"
+        }
     );
     // Revision round: send, not compose.
     assert_eq!(
         worker_action("PlanSynthesisPending", "claude", 1),
-        WorkerAction::ClaudeSend { template: "collab-turn-plan-synthesis.md", mode: "send" }
+        WorkerAction::ClaudeSend {
+            template: "collab-turn-plan-synthesis.md",
+            mode: "send"
+        }
     );
     assert_eq!(
         worker_action("PlanClaudeFinalizePending", "claude", 0),
-        WorkerAction::ClaudeCompose { template: "collab-turn-plan-finalize.md", topic: "final" }
+        WorkerAction::ClaudeCompose {
+            template: "collab-turn-plan-finalize.md",
+            topic: "final"
+        }
     );
     assert_eq!(
+        // PlanLocked is the v3 bridge: task-list compose+submit (own template,
+        // file+hash artifact), not a generic drawer compose.
         worker_action("PlanLocked", "claude", 0),
-        WorkerAction::ClaudeCompose { template: "collab-turn-task-list.md", topic: "task_list" }
+        WorkerAction::TaskListBridge
     );
     assert_eq!(
         worker_action("CodeImplementPending", "claude", 0),
-        WorkerAction::ClaudeSend { template: "collab-turn-code-implement.md", mode: "send" }
+        WorkerAction::ClaudeSend {
+            template: "collab-turn-code-implement.md",
+            mode: "send"
+        }
     );
     assert_eq!(
         worker_action("CodeReviewLocalPending", "claude", 0),
-        WorkerAction::ClaudeSend { template: "collab-turn-review-local.md", mode: "send" }
+        WorkerAction::ClaudeSend {
+            template: "collab-turn-review-local.md",
+            mode: "send"
+        }
     );
     assert_eq!(
         worker_action("CodeReviewFinalPending", "claude", 0),
         WorkerAction::FinalReviewSynthetic
     );
     // Codex-owned phases.
-    assert_eq!(worker_action("PlanParallelDrafts", "codex", 0), WorkerAction::Codex);
-    assert_eq!(worker_action("PlanCodexReviewPending", "codex", 0), WorkerAction::Codex);
-    assert_eq!(worker_action("CodeReviewFixGlobalPending", "codex", 0), WorkerAction::Codex);
+    assert_eq!(
+        worker_action("PlanParallelDrafts", "codex", 0),
+        WorkerAction::Codex
+    );
+    assert_eq!(
+        worker_action("PlanCodexReviewPending", "codex", 0),
+        WorkerAction::Codex
+    );
+    assert_eq!(
+        worker_action("CodeReviewFixGlobalPending", "codex", 0),
+        WorkerAction::Codex
+    );
     // Terminal.
-    assert_eq!(worker_action("CodingComplete", "claude", 0), WorkerAction::Terminal);
-    assert_eq!(worker_action("CodingFailed", "codex", 0), WorkerAction::Terminal);
+    assert_eq!(
+        worker_action("CodingComplete", "claude", 0),
+        WorkerAction::Terminal
+    );
+    assert_eq!(
+        worker_action("CodingFailed", "codex", 0),
+        WorkerAction::Terminal
+    );
     // Owner/phase mismatch is an anomaly (e.g. claude owning a codex-only phase).
-    assert_eq!(worker_action("CodeReviewFixGlobalPending", "claude", 0), WorkerAction::Anomaly);
-    assert_eq!(worker_action("CodeImplementPending", "codex", 0), WorkerAction::Anomaly);
+    assert_eq!(
+        worker_action("CodeReviewFixGlobalPending", "claude", 0),
+        WorkerAction::Anomaly
+    );
+    assert_eq!(
+        worker_action("CodeImplementPending", "codex", 0),
+        WorkerAction::Anomaly
+    );
     // TEST 7: unknown owner string is always an anomaly, regardless of phase.
-    assert_eq!(worker_action("PlanLocked", "human", 0), WorkerAction::Anomaly);
+    assert_eq!(
+        worker_action("PlanLocked", "human", 0),
+        WorkerAction::Anomaly
+    );
     // Terminal wins regardless of owner — even an unknown owner string.
-    assert_eq!(worker_action("CodingComplete", "nobody", 0), WorkerAction::Terminal);
+    assert_eq!(
+        worker_action("CodingComplete", "nobody", 0),
+        WorkerAction::Terminal
+    );
 }
 
 #[test]

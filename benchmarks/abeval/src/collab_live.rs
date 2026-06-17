@@ -10,12 +10,12 @@ use anyhow::{anyhow, Context, Result};
 use chrono::Utc;
 
 use crate::client::{parse_cli_result, ArmOutcome, Usage};
+use crate::codex_tokens::{attribute_codex_tokens, TimeWindow};
 use crate::collab_db::read_session_state;
 use crate::collab_driver::{
     run_collab_task, CodexAttributor, CodexResult, CollabRunResult, CollabStateReader,
     CollabTaskCtx, WorkerResult, WorkerSpawner,
 };
-use crate::codex_tokens::{attribute_codex_tokens, TimeWindow};
 use crate::corpus::Task;
 
 /// `claude -p` worker argv: JSON output, headless permissions, and the
@@ -120,6 +120,10 @@ impl CollabStateReader for SqliteStateReader {
     fn read(&self, session_id: &str) -> Result<crate::collab_db::SessionState> {
         read_session_state(&self.db_path, session_id)
     }
+
+    fn newest_draft_drawer(&self, after_rowid: i64) -> Result<Option<(String, i64)>> {
+        crate::collab_db::newest_draft_drawer(&self.db_path, after_rowid)
+    }
 }
 
 pub struct ProcessWorkerSpawner {
@@ -161,7 +165,10 @@ impl WorkerSpawner for ProcessWorkerSpawner {
             .status()
             .with_context(|| format!("spawning codex exec in {}", worktree.display()))?;
         if !status.success() {
-            return Err(anyhow!("codex exec exited non-zero in {}", worktree.display()));
+            return Err(anyhow!(
+                "codex exec exited non-zero in {}",
+                worktree.display()
+            ));
         }
         let head_after = git_head(worktree)?;
         let commits_added = count_commits_between(worktree, &head_before, &head_after)?;
@@ -189,7 +196,10 @@ fn git_head(worktree: &Path) -> Result<String> {
         .output()
         .with_context(|| format!("git rev-parse HEAD in {}", worktree.display()))?;
     if !out.status.success() {
-        return Err(anyhow!("git rev-parse HEAD failed in {}", worktree.display()));
+        return Err(anyhow!(
+            "git rev-parse HEAD failed in {}",
+            worktree.display()
+        ));
     }
     Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
 }
@@ -212,9 +222,13 @@ fn count_commits_between(worktree: &Path, from: &str, to: &str) -> Result<u32> {
         return Err(anyhow!("git rev-list failed in {}", worktree.display()));
     }
     let raw = String::from_utf8_lossy(&out.stdout);
-    raw.trim()
-        .parse::<u32>()
-        .with_context(|| format!("parsing `git rev-list --count` output {:?} in {}", raw.trim(), worktree.display()))
+    raw.trim().parse::<u32>().with_context(|| {
+        format!(
+            "parsing `git rev-list --count` output {:?} in {}",
+            raw.trim(),
+            worktree.display()
+        )
+    })
 }
 
 /// Provision the isolated CODEX_HOME (minimal config + symlinked auth.json), a
@@ -274,16 +288,25 @@ fn wire_origin(worktree: &Path, bare: &Path) -> Result<()> {
 }
 
 fn run_git(args: &[&str]) -> Result<()> {
-    let status = std::process::Command::new("git").args(args).status()
+    let status = std::process::Command::new("git")
+        .args(args)
+        .status()
         .with_context(|| format!("git {args:?}"))?;
-    if !status.success() { return Err(anyhow!("git {args:?} failed")); }
+    if !status.success() {
+        return Err(anyhow!("git {args:?} failed"));
+    }
     Ok(())
 }
 fn run_git_in(dir: &Path, args: &[&str]) -> Result<()> {
     let status = std::process::Command::new("git")
-        .arg("-C").arg(dir).args(args).status()
+        .arg("-C")
+        .arg(dir)
+        .args(args)
+        .status()
         .with_context(|| format!("git -C {} {args:?}", dir.display()))?;
-    if !status.success() { return Err(anyhow!("git -C {} {args:?} failed", dir.display())); }
+    if !status.success() {
+        return Err(anyhow!("git -C {} {args:?} failed", dir.display()));
+    }
     Ok(())
 }
 
@@ -300,7 +323,14 @@ pub fn run_ironmem_arm(task: &Task, worktree: &Path, out_task_dir: &Path) -> Res
     let auth_src = PathBuf::from(&home).join(".codex").join("auth.json");
     let sessions_root = codex_home.join("sessions");
 
-    provision_collab_env(worktree, &codex_home, &auth_src, &branch, &remote_bare, &db_path)?;
+    provision_collab_env(
+        worktree,
+        &codex_home,
+        &auth_src,
+        &branch,
+        &remote_bare,
+        &db_path,
+    )?;
 
     // MCP config: a single ironmem server that inherits IRONMEM_DB_PATH so the
     // worker's collab tools and the driver's reader share the per-task DB. Built
@@ -342,7 +372,9 @@ pub fn run_ironmem_arm(task: &Task, worktree: &Path, out_task_dir: &Path) -> Res
         prompts_dir: prompts_dir()?,
         bootstrap_prompt,
     };
-    let reader = SqliteStateReader { db_path: db_path.clone() };
+    let reader = SqliteStateReader {
+        db_path: db_path.clone(),
+    };
     let spawner = ProcessWorkerSpawner {
         db_path: db_path.clone(),
         codex_home: codex_home.clone(),
@@ -382,7 +414,10 @@ fn drive_then_attribute(
     }
     impl CodexAttributor for LiveAttributor<'_> {
         fn attribute(&self) -> Result<Usage> {
-            let window = TimeWindow { start: self.start, end: Utc::now() };
+            let window = TimeWindow {
+                start: self.start,
+                end: Utc::now(),
+            };
             attribute_codex_tokens(self.sessions_root, self.worktree, window)
         }
     }
