@@ -20,6 +20,9 @@ fn merged(arm: &str, tokens: u64) -> TaskMetric {
         output_tokens: 0,
         cache_creation_input_tokens: 0,
         cache_read_input_tokens: 0,
+        codex_input_tokens: 0,
+        codex_output_tokens: 0,
+        codex_cache_read_input_tokens: 0,
         review_rounds: 1,
         fix_commits: 1,
     }

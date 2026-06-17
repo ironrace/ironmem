@@ -58,9 +58,20 @@ impl Usage {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ArmOutcome {
     pub arm: Arm,
+    /// Claude-side token usage (the driving CLI envelope, or summed across collab
+    /// worker turns for the ironmem arm).
     pub usage: Usage,
-    /// `"completed"` for dry-run synthesis; live outcomes are recorded by the
-    /// future live path / normalized metric input.
+    /// Codex-side token usage (ironmem arm only; zero for superpowers). Attributed
+    /// from `~/.codex/sessions` rollouts by worktree cwd + window.
+    #[serde(default)]
+    pub codex_usage: Usage,
+    /// §11.4 rework counters (ironmem arm only; zero for superpowers).
+    #[serde(default)]
+    pub review_rounds: u32,
+    #[serde(default)]
+    pub fix_commits: u32,
+    /// `"completed"`/`"failed"` (agent-level). The §12 done-proxy lifts this to
+    /// `"merged"` only when gates are green (in `build_arm_metric`).
     pub outcome: String,
     pub transcript: String,
 }
@@ -119,6 +130,9 @@ impl ArmExecutor for DryRunExecutor {
         Ok(ArmOutcome {
             arm,
             usage,
+            codex_usage: Usage::default(),
+            review_rounds: 0,
+            fix_commits: 0,
             outcome: "completed".to_string(),
             transcript: format!("[dry-run] {} :: {}", arm.label(), task.id),
         })
@@ -169,6 +183,12 @@ fn superpowers_mcp_isolation_args() -> Vec<String> {
 /// Both arms request `--output-format json` AND `-p` (print mode, required for
 /// `--output-format` to take effect) AND headless permission tokens. The
 /// isolation flags precede `-p` so the prompt remains the print-mode positional.
+///
+/// NOTE: as of METRICS_SPEC §12 2026-06-17, `LiveExecutor::execute` no longer
+/// calls `arm_command` for `Arm::Ironmem` — that arm delegates to an
+/// `IronmemArmRunner` (the headless collab driver). The `Arm::Ironmem` branch
+/// here is retained only for `arm_command` unit tests (`tests/arms.rs`,
+/// `tests/live_executor.rs`).
 pub fn arm_command(task: &Task, arm: Arm) -> (String, Vec<String>) {
     let mut argv = vec!["--output-format".to_string(), "json".to_string()];
     argv.extend(headless_permission_args());
@@ -223,6 +243,26 @@ impl CommandRunner for ProcessCommandRunner {
             stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
             success: output.status.success(),
         })
+    }
+}
+
+/// Runs the ironmem arm (a full headless `/collab` flow) for one task. Injected
+/// into [`LiveExecutor`] so the heavy real-process path
+/// (`collab_live::run_ironmem_arm`) can be replaced by a fake in tests —
+/// mirroring [`CommandRunner`]/[`WorkspaceProvisioner`]. The ironmem arm no
+/// longer runs a single `claude -p "/collab start"`; it drives the dispatcher
+/// loop (METRICS_SPEC §12 2026-06-17).
+pub trait IronmemArmRunner {
+    fn run(&self, task: &Task, workspace: &Path, out_task_dir: &Path) -> Result<ArmOutcome>;
+}
+
+/// Production [`IronmemArmRunner`]: drives the real collab loop. Reached only
+/// behind the approval gate (it spawns real processes).
+pub struct ProcessIronmemArmRunner;
+
+impl IronmemArmRunner for ProcessIronmemArmRunner {
+    fn run(&self, task: &Task, workspace: &Path, out_task_dir: &Path) -> Result<ArmOutcome> {
+        crate::collab_live::run_ironmem_arm(task, workspace, out_task_dir)
     }
 }
 
@@ -492,6 +532,7 @@ pub struct LiveExecutor<R: CommandRunner, P: WorkspaceProvisioner> {
     provisioner: P,
     workspace_root: PathBuf,
     base_override: Option<String>,
+    ironmem_runner: Box<dyn IronmemArmRunner>,
 }
 
 impl<R: CommandRunner, P: WorkspaceProvisioner> LiveExecutor<R, P> {
@@ -506,7 +547,15 @@ impl<R: CommandRunner, P: WorkspaceProvisioner> LiveExecutor<R, P> {
             provisioner,
             workspace_root,
             base_override,
+            ironmem_runner: Box::new(ProcessIronmemArmRunner),
         }
+    }
+
+    /// Override the ironmem-arm runner (tests inject a fake so the heavy
+    /// real-process collab path is not spawned).
+    pub fn with_ironmem_runner(mut self, runner: Box<dyn IronmemArmRunner>) -> Self {
+        self.ironmem_runner = runner;
+        self
     }
 
     /// The isolated workspace an arm runs in: `<root>/<task_id>/<arm>`. The
@@ -518,7 +567,6 @@ impl<R: CommandRunner, P: WorkspaceProvisioner> LiveExecutor<R, P> {
 
 impl<R: CommandRunner, P: WorkspaceProvisioner> ArmExecutor for LiveExecutor<R, P> {
     fn execute(&self, task: &Task, arm: Arm) -> Result<ArmOutcome> {
-        let (program, args) = arm_command(task, arm);
         let workspace = self.workspace_for(task, arm);
         // Single-authority, fail-loud base resolution (see `resolve_base_commit`):
         // exactly one of task pin / run override must be present, else error.
@@ -531,6 +579,29 @@ impl<R: CommandRunner, P: WorkspaceProvisioner> ArmExecutor for LiveExecutor<R, 
             workspace: &workspace,
         })?;
 
+        // The superpowers arm runs a single `claude -p`; the ironmem arm drives a
+        // real /collab flow (Claude + Codex) via the injected IronmemArmRunner.
+        if matches!(arm, Arm::Ironmem) {
+            // Collab artifacts (collab.db, codex-home, remote.git) live as a
+            // SIBLING of the workspaces tree: workspace_root is <out>/workspaces,
+            // so its parent <out> is the task-dir root. A root-less workspace_root
+            // is not a real run layout, so derive the dir fail-loud rather than
+            // silently mis-placing artifacts inside the workspaces tree.
+            let out_task_dir = self
+                .workspace_root
+                .parent()
+                .ok_or_else(|| anyhow::anyhow!(
+                    "workspace_root {} has no parent; cannot derive ironmem output dir",
+                    self.workspace_root.display()
+                ))?
+                .join(&task.id);
+            std::fs::create_dir_all(&out_task_dir).with_context(|| {
+                format!("creating ironmem out dir {}", out_task_dir.display())
+            })?;
+            return self.ironmem_runner.run(task, &workspace, &out_task_dir);
+        }
+
+        let (program, args) = arm_command(task, arm);
         let output = self.runner.run(&program, &args, &workspace)?;
         let parsed = parse_cli_result(&output.stdout)?;
 
@@ -560,6 +631,9 @@ impl<R: CommandRunner, P: WorkspaceProvisioner> ArmExecutor for LiveExecutor<R, 
         Ok(ArmOutcome {
             arm,
             usage: parsed.usage,
+            codex_usage: Usage::default(),
+            review_rounds: 0,
+            fix_commits: 0,
             outcome: outcome.to_string(),
             transcript: output.stdout,
         })

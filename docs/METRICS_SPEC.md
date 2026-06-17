@@ -659,3 +659,50 @@ this records how the §11 A/B protocol is operationalized by the runner.
    rework_loops) are written as `0` by the live writer in this PR; precise
    derivation (ironmem `task_outcomes` for the ironmem arm, git history for the
    superpowers arm) is a follow-up before the headline rework delta is claimed.
+
+### 2026-06-17 — issue #98/#97: headless collab driver + Codex token attribution (clarifies §2.1/§7.2/§11.2/§11.4)
+
+Operationalizes the §11 A/B collab arm so it runs a real `/collab` flow and its
+Codex cost is counted. No §1–§11 counter name, unit, or aggregation is removed;
+these record how the arm is executed and measured.
+
+1. **Codex tokens count toward `tokens_to_done` (clarifies §2.1).** Codex tokens
+   attributed to a collab task (from `~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl`,
+   matched by `session_meta.cwd == <task worktree>` AND a time window, taking each
+   session's FINAL `token_count` cumulative `total_token_usage`) ARE included in
+   that task's `tokens_to_done`: `tokens_to_done = claude.total + codex.total`.
+   Codex `cost_usd` stays UNPRICED (§7.2 unchanged).
+
+2. **Codex field mapping avoids double-counting (clarifies §2.1).** Codex's
+   `total_token_usage.input_tokens` INCLUDES `cached_input_tokens` (unlike the
+   Anthropic convention, where `input_tokens` excludes cache reads). To make the
+   four-component §2.1 sum equal Codex's own `total_tokens`, the mapping is
+   `input = input_tokens − cached_input_tokens`, `cache_read = cached_input_tokens`,
+   `output = output_tokens` (already includes `reasoning_output_tokens`),
+   `cache_creation = 0`. A literal field copy would inflate Codex tokens by the
+   cached amount (~85% on observed sessions); this mapping counts every real token
+   exactly once. (Deviation from the design spec's literal wording, verified across
+   6 real sessions.)
+
+3. **The collab arm runs via the headless driver, not `claude -p "/collab start"`
+   (clarifies §11.2).** A single `claude -p` exits before the multi-actor
+   dispatcher loop can hand a turn to Codex, so it never runs Codex. The arm is
+   executed by a built headless driver that polls the per-task collab session and
+   spawns the matching `collab-turn-*.md` worker (`claude -p`) on Claude-owned
+   turns and `codex exec -s danger-full-access -C <worktree>` (isolated
+   `CODEX_HOME`) on Codex-owned turns. A completed collab run with **zero
+   attributed Codex sessions is INVALID** and is excluded — never recorded as full
+   burn.
+
+4. **No-push PR proxy (clarifies §2.2/§11.2 done for the collab arm).** Reaching
+   `CodingComplete` normally runs `gh pr create`; for abeval the final-review
+   submit is replaced by sending `final_review` with a synthetic, un-pushed
+   `pr_url` (`local://abeval/<task_id>`). Intermediate collab pushes go to a
+   per-task LOCAL bare remote (nothing reaches the real origin; `main` untouched).
+   "done" remains the §12 2026-06-16 proxy: agent-completed (reached
+   `CodingComplete`) AND frozen gates green in the worktree.
+
+5. **`rework_loops` for the collab arm (clarifies §11.4).** `review_rounds` is the
+   session's `global_review_round`; `fix_commits` is the count of commits Codex
+   adds to the worktree during `CodeReviewFixGlobalPending` turns. Both are now
+   measured (superseding the #122 placeholder zeros for the ironmem arm).

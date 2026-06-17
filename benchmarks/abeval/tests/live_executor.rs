@@ -7,7 +7,7 @@ use std::sync::{Arc, Mutex};
 use abeval::arms::Arm;
 use abeval::client::{
     arm_command, parse_cli_result, ArmExecutor, ArmOutcome, CommandOutput, CommandRunner,
-    LiveExecutor, ProvisionRequest, Usage, WorkspaceProvisioner,
+    IronmemArmRunner, LiveExecutor, ProvisionRequest, Usage, WorkspaceProvisioner,
 };
 use abeval::corpus::Task;
 
@@ -85,32 +85,57 @@ fn fake(stdout: &str, success: bool) -> (FakeRunner, Captured) {
     )
 }
 
-/// The ironmem arm drives `claude -p "/collab start <prompt>"` and the parsed
-/// usage + success flow to a "completed" outcome.
+/// Fake ironmem-arm runner: returns a synthetic collab ArmOutcome WITHOUT
+/// spawning real git/claude/codex. Lets the executor/aggregation tests drive the
+/// ironmem arm under the new contract (it delegates to an IronmemArmRunner).
+struct FakeIronmemArm {
+    outcome: String,
+}
+impl IronmemArmRunner for FakeIronmemArm {
+    fn run(&self, _task: &Task, _ws: &Path, _out: &Path) -> anyhow::Result<ArmOutcome> {
+        Ok(ArmOutcome {
+            arm: Arm::Ironmem,
+            usage: Usage {
+                input_tokens: 1000,
+                output_tokens: 200,
+                ..Default::default()
+            },
+            codex_usage: Usage {
+                input_tokens: 60,
+                cache_read_input_tokens: 40,
+                output_tokens: 10,
+                cache_creation_input_tokens: 0,
+            },
+            review_rounds: 2,
+            fix_commits: 1,
+            outcome: self.outcome.clone(),
+            transcript: "fake-collab".to_string(),
+        })
+    }
+}
+
+/// Contract changed (METRICS_SPEC §12 2026-06-17): the ironmem arm drives the
+/// headless collab loop via the injected IronmemArmRunner, not a single
+/// `claude -p /collab start`; the executor must surface the runner's Claude+Codex
+/// ArmOutcome.
 #[test]
-fn live_executor_ironmem_arm_runs_collab_and_parses_usage() {
-    let (runner, captured) = fake(SUCCESS_JSON, true);
+fn live_executor_ironmem_arm_delegates_to_collab_driver() {
+    let (runner, _captured) = fake(SUCCESS_JSON, true);
     let ws = tempfile::tempdir().unwrap();
-    let exec = LiveExecutor::new(runner, NoOpProvisioner, ws.path().to_path_buf(), None);
+    let exec = LiveExecutor::new(runner, NoOpProvisioner, ws.path().to_path_buf(), None)
+        .with_ironmem_runner(Box::new(FakeIronmemArm {
+            outcome: "completed".into(),
+        }));
 
     let outcome = exec.execute(&task(), Arm::Ironmem).unwrap();
 
+    // The executor surfaces the runner's full ArmOutcome unchanged: Claude side …
     assert_eq!(outcome.outcome, "completed");
-    assert_eq!(outcome.usage.input_tokens, 1200);
-    assert_eq!(outcome.usage.total(), 1450);
-
-    let cap = captured.lock().unwrap();
-    assert_eq!(cap.len(), 1);
-    assert_eq!(cap[0].0, "claude");
-    // `/collab start` is carried inside the single `-p` prompt arg (print mode).
-    assert!(
-        cap[0].1.iter().any(|a| a.contains("/collab start")),
-        "ironmem arm uses /collab start (inside -p prompt)"
-    );
-    assert!(
-        cap[0].1.iter().any(|a| a.contains("PROMPT-BODY")),
-        "task prompt is passed"
-    );
+    assert_eq!(outcome.usage.input_tokens, 1000);
+    // … AND the Codex side + rework counters flow through.
+    assert_eq!(outcome.codex_usage.total(), 110);
+    assert_eq!(outcome.review_rounds, 2);
+    assert_eq!(outcome.fix_commits, 1);
 }
 
 /// The superpowers arm runs the prompt with the skills-only prefix and NEVER
@@ -189,13 +214,15 @@ fn ironmem_arm_keeps_inherited_mcp_config() {
 
 /// A non-zero exit OR an is_error envelope yields a "failed" outcome (never a
 /// silent completion), while still recording the tokens that were spent.
+/// The process-exit→failed-outcome behavior is the single-command arm path,
+/// which is now the superpowers arm (ironmem drives the collab loop).
 #[test]
 fn live_executor_failed_process_records_failed_outcome() {
     let (runner, _c) = fake(SUCCESS_JSON, false); // process exited non-zero
     let ws = tempfile::tempdir().unwrap();
     let exec = LiveExecutor::new(runner, NoOpProvisioner, ws.path().to_path_buf(), None);
 
-    let outcome = exec.execute(&task(), Arm::Ironmem).unwrap();
+    let outcome = exec.execute(&task(), Arm::Superpowers).unwrap();
     assert_eq!(outcome.outcome, "failed");
     assert_eq!(
         outcome.usage.input_tokens, 1200,
@@ -272,6 +299,9 @@ fn arm_outcome(outcome: &str, input: u32) -> ArmOutcome {
             cache_creation_input_tokens: 0,
             cache_read_input_tokens: 0,
         },
+        codex_usage: Usage::default(),
+        review_rounds: 0,
+        fix_commits: 0,
         outcome: outcome.to_string(),
         transcript: String::new(),
     }
@@ -374,11 +404,15 @@ fn task_n(n: usize) -> Task {
 
 /// run_task_live drives every arm through the executor, runs gates per arm, and
 /// returns merged+done metrics when the agent completes and gates are green.
+// ironmem arm driven via FakeIronmemArm (new contract); superpowers via FakeRunner.
 #[test]
 fn run_task_live_completed_and_green_yields_done_metrics() {
     let (runner, _c) = fake(SUCCESS_JSON, true);
     let ws = tempfile::tempdir().unwrap();
-    let exec = LiveExecutor::new(runner, NoOpProvisioner, ws.path().to_path_buf(), None);
+    let exec = LiveExecutor::new(runner, NoOpProvisioner, ws.path().to_path_buf(), None)
+        .with_ironmem_runner(Box::new(FakeIronmemArm {
+            outcome: "completed".into(),
+        }));
     let gates = FakeGates { green: true };
 
     let metrics = run_task_live(&task(), &[Arm::Ironmem, Arm::Superpowers], &exec, &gates).unwrap();
@@ -393,11 +427,15 @@ fn run_task_live_completed_and_green_yields_done_metrics() {
 }
 
 /// Gates RED → arms are attempted but not done (no silent merge).
+// ironmem arm driven via FakeIronmemArm (new contract); gates red → not done.
 #[test]
 fn run_task_live_red_gates_are_not_done() {
     let (runner, _c) = fake(SUCCESS_JSON, true);
     let ws = tempfile::tempdir().unwrap();
-    let exec = LiveExecutor::new(runner, NoOpProvisioner, ws.path().to_path_buf(), None);
+    let exec = LiveExecutor::new(runner, NoOpProvisioner, ws.path().to_path_buf(), None)
+        .with_ironmem_runner(Box::new(FakeIronmemArm {
+            outcome: "completed".into(),
+        }));
     let gates = FakeGates { green: false };
 
     let metrics = run_task_live(&task(), &[Arm::Ironmem], &exec, &gates).unwrap();
@@ -413,8 +451,12 @@ fn full_pipeline_eight_tasks_produces_headline_delta() {
     let mut all = Vec::new();
     for n in 0..8 {
         // Distinct usage per arm so spreads are meaningful; success envelope.
+        // ironmem arm driven via FakeIronmemArm (new contract); superpowers via FakeRunner.
         let (runner, _c) = fake(SUCCESS_JSON, true);
-        let exec = LiveExecutor::new(runner, NoOpProvisioner, ws.path().to_path_buf(), None);
+        let exec = LiveExecutor::new(runner, NoOpProvisioner, ws.path().to_path_buf(), None)
+            .with_ironmem_runner(Box::new(FakeIronmemArm {
+                outcome: "completed".into(),
+            }));
         let metrics =
             run_task_live(&task_n(n), &[Arm::Ironmem, Arm::Superpowers], &exec, &gates).unwrap();
         all.extend(metrics);
@@ -436,9 +478,13 @@ fn full_pipeline_eight_tasks_produces_headline_delta() {
 /// gate; this proves the write/aggregate logic the entry delegates to.)
 #[test]
 fn execute_approved_live_writes_live_metrics_file() {
+    // ironmem arm driven via FakeIronmemArm (new contract); superpowers via FakeRunner.
     let (runner, _c) = fake(SUCCESS_JSON, true);
     let out = tempfile::tempdir().unwrap();
-    let exec = LiveExecutor::new(runner, NoOpProvisioner, out.path().join("ws"), None);
+    let exec = LiveExecutor::new(runner, NoOpProvisioner, out.path().join("ws"), None)
+        .with_ironmem_runner(Box::new(FakeIronmemArm {
+            outcome: "completed".into(),
+        }));
     let gates = FakeGates { green: true };
 
     let path = abeval::runner::execute_approved_live(
@@ -563,12 +609,14 @@ const ZERO_USAGE_JSON: &str = r#"{"is_error":false,"result":"done",
 /// it means the usage block was absent/renamed. Recording it as a merged
 /// zero-token row would silently deflate the headline cost metric, so it must be
 /// a loud error, not a silent measurement.
+/// The zero-token loud-error guard lives on the single-`claude -p` arm, which is
+/// now the superpowers arm (ironmem drives the collab loop).
 #[test]
 fn live_executor_zero_usage_on_success_is_loud_error() {
     let (runner, _c) = fake(ZERO_USAGE_JSON, true);
     let ws = tempfile::tempdir().unwrap();
     let exec = LiveExecutor::new(runner, NoOpProvisioner, ws.path().to_path_buf(), None);
-    let err = exec.execute(&task(), Arm::Ironmem).unwrap_err();
+    let err = exec.execute(&task(), Arm::Superpowers).unwrap_err();
     assert!(
         err.to_string().to_lowercase().contains("usage")
             || err.to_string().to_lowercase().contains("zero-token"),
@@ -578,11 +626,13 @@ fn live_executor_zero_usage_on_success_is_loud_error() {
 
 /// Zero usage on a FAILED run is fine (a crashed agent may have spent nothing
 /// parseable) — it records a "failed" row, never an error.
+/// The zero-token guard lives on the single-`claude -p` arm, which is now the
+/// superpowers arm (ironmem drives the collab loop).
 #[test]
 fn live_executor_zero_usage_on_failure_is_recorded_failed() {
     let (runner, _c) = fake(ZERO_USAGE_JSON, false);
     let ws = tempfile::tempdir().unwrap();
     let exec = LiveExecutor::new(runner, NoOpProvisioner, ws.path().to_path_buf(), None);
-    let o = exec.execute(&task(), Arm::Ironmem).unwrap();
+    let o = exec.execute(&task(), Arm::Superpowers).unwrap();
     assert_eq!(o.outcome, "failed");
 }

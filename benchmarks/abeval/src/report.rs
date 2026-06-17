@@ -29,18 +29,29 @@ pub struct TaskMetric {
     #[serde(default)]
     pub cache_read_input_tokens: u32,
     #[serde(default)]
+    pub codex_input_tokens: u32,
+    #[serde(default)]
+    pub codex_output_tokens: u32,
+    #[serde(default)]
+    pub codex_cache_read_input_tokens: u32,
+    #[serde(default)]
     pub review_rounds: u32,
     #[serde(default)]
     pub fix_commits: u32,
 }
 
 impl TaskMetric {
-    /// §2.1 four-component sum.
+    /// §2.1 four-component Claude sum + the three Codex components (Codex has no
+    /// cache_creation). For the superpowers arm the Codex fields are zero, so this
+    /// reduces to the Claude-only total.
     pub fn tokens_to_done(&self) -> u64 {
         self.input_tokens as u64
             + self.output_tokens as u64
             + self.cache_creation_input_tokens as u64
             + self.cache_read_input_tokens as u64
+            + self.codex_input_tokens as u64
+            + self.codex_output_tokens as u64
+            + self.codex_cache_read_input_tokens as u64
     }
 
     /// §11.4 rework_loops = review_rounds + fix_commits.
@@ -87,6 +98,7 @@ pub fn build_arm_metric(
         arm_outcome.outcome.clone()
     };
     let u = &arm_outcome.usage;
+    let c = &arm_outcome.codex_usage;
     TaskMetric {
         arm: arm.to_string(),
         task_key: format!("{task_id}:{arm}"),
@@ -97,8 +109,11 @@ pub fn build_arm_metric(
         output_tokens: u.output_tokens,
         cache_creation_input_tokens: u.cache_creation_input_tokens,
         cache_read_input_tokens: u.cache_read_input_tokens,
-        review_rounds: 0,
-        fix_commits: 0,
+        codex_input_tokens: c.input_tokens,
+        codex_output_tokens: c.output_tokens,
+        codex_cache_read_input_tokens: c.cache_read_input_tokens,
+        review_rounds: arm_outcome.review_rounds,
+        fix_commits: arm_outcome.fix_commits,
     }
 }
 
@@ -320,6 +335,9 @@ pub fn metrics_from_run_dir(run: impl AsRef<Path>) -> Result<MetricsInput> {
                 output_tokens: usage.output_tokens,
                 cache_creation_input_tokens: usage.cache_creation_input_tokens,
                 cache_read_input_tokens: usage.cache_read_input_tokens,
+                codex_input_tokens: 0,
+                codex_output_tokens: 0,
+                codex_cache_read_input_tokens: 0,
                 review_rounds: 0,
                 fix_commits: 0,
             });
