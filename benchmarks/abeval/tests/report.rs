@@ -1,4 +1,7 @@
-use abeval::report::{load_metrics, metrics_from_run_dir, render_report, MetricsInput, TaskMetric};
+use abeval::report::{
+    load_metrics, load_metrics_dir, metrics_from_run_dir, render_report, write_live_metrics,
+    MetricsInput, TaskMetric,
+};
 
 fn fixture(name: &str) -> std::path::PathBuf {
     std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -351,4 +354,67 @@ fn delta_requires_live_evidence_even_with_enough_tasks() {
         !out.contains("DELTA"),
         "smoke evidence never yields a headline"
     );
+}
+
+// --- batch aggregation: load_metrics_dir unions per-task live_metrics.json ---
+
+/// Write a per-task `<dir>/<task_id>/live_metrics.json` like the live runner.
+fn write_task_metrics(dir: &std::path::Path, task_id: &str, rows: &[TaskMetric]) {
+    let task_dir = dir.join(task_id);
+    std::fs::create_dir_all(&task_dir).unwrap();
+    write_live_metrics(task_dir.join("live_metrics.json"), rows).unwrap();
+}
+
+#[test]
+fn load_metrics_dir_unions_per_task_files_into_headline_delta() {
+    let tmp = tempfile::tempdir().unwrap();
+    // Eight tasks, run "2 at a time" — each writes its own per-task file.
+    for i in 0..8 {
+        let task_id = format!("abeval-{i:02}");
+        let ir = TaskMetric {
+            task_key: format!("ironmem:{task_id}"),
+            ..merged("ironmem", 100 + i)
+        };
+        let sp = TaskMetric {
+            task_key: format!("superpowers:{task_id}"),
+            ..merged("superpowers", 200 + i)
+        };
+        write_task_metrics(tmp.path(), &task_id, &[ir, sp]);
+    }
+
+    let input = load_metrics_dir(tmp.path()).unwrap();
+    assert_eq!(input.evidence_class, "live");
+    assert_eq!(input.tasks.len(), 16, "8 tasks x 2 arms unioned");
+
+    let out = render_report(&input);
+    assert!(
+        out.contains("DELTA"),
+        "8 merged+green per arm clears the gate"
+    );
+}
+
+#[test]
+fn load_metrics_dir_rejects_smoke_evidence() {
+    let tmp = tempfile::tempdir().unwrap();
+    let task_dir = tmp.path().join("abeval-00");
+    std::fs::create_dir_all(&task_dir).unwrap();
+    // A smoke file must never silently dilute a live aggregate.
+    let smoke = MetricsInput {
+        evidence_class: "smoke".to_string(),
+        tasks: vec![merged("ironmem", 100)],
+    };
+    std::fs::write(
+        task_dir.join("live_metrics.json"),
+        serde_json::to_string(&smoke).unwrap(),
+    )
+    .unwrap();
+
+    let err = load_metrics_dir(tmp.path()).unwrap_err().to_string();
+    assert!(err.contains("live"), "got: {err}");
+}
+
+#[test]
+fn load_metrics_dir_errors_on_empty_tree() {
+    let tmp = tempfile::tempdir().unwrap();
+    assert!(load_metrics_dir(tmp.path()).is_err());
 }

@@ -64,6 +64,17 @@ cargo run --manifest-path benchmarks/abeval/Cargo.toml -- run \
 # run-level fallback for unpinned hand-built tasks only; it cannot override a
 # committed corpus pin.
 
+# Batched runs — pace a heavy live campaign N tasks at a time (default 2)
+# instead of executing the whole corpus (and the whole Max-plan quota) at once.
+# --batch <index> selects a contiguous chunk of the FROZEN corpus order into a
+# SHARED --out tree; run the indices in turn (0, 1, 2, ...). Mutually exclusive
+# with --task. An out-of-range index errors with the batch count.
+cargo run --manifest-path benchmarks/abeval/Cargo.toml -- run \
+  --batch 0 --batch-size 2 --arms both --dry-run --out /tmp/abeval-campaign
+cargo run --manifest-path benchmarks/abeval/Cargo.toml -- run \
+  --batch 1 --batch-size 2 --arms both --dry-run --out /tmp/abeval-campaign
+# ... up to the last batch (8 tasks / 2 = batches 0..4)
+
 # Summarize the run and enforce the §11.3 headline gate.
 # Exactly one of --run / --metrics is required (they are mutually exclusive):
 #   --run <dir>      a smoke run directory produced by `run` above.
@@ -71,7 +82,20 @@ cargo run --manifest-path benchmarks/abeval/Cargo.toml -- run \
 #                    evidence, since a run dir is always smoke in this PR.
 cargo run --manifest-path benchmarks/abeval/Cargo.toml -- report --run /tmp/abeval-run
 cargo run --manifest-path benchmarks/abeval/Cargo.toml -- report --metrics benchmarks/abeval/fixtures/live_8_per_arm.json
+
+# Aggregate a batched campaign: union every per-task live_metrics.json under the
+# shared --out tree into one live report and enforce the §11.3 headline gate.
+# --metrics-dir is mutually exclusive with --run / --metrics. It errors if the
+# tree holds no live_metrics.json, or if any file is not evidence_class:"live"
+# (a smoke file can never silently dilute live evidence).
+cargo run --manifest-path benchmarks/abeval/Cargo.toml -- report --metrics-dir /tmp/abeval-campaign
 ```
+
+`report` accepts exactly one of `--run <dir>`, `--metrics <file>`, or
+`--metrics-dir <tree>`. The headline gate is unchanged: it still needs ≥8
+merged+CI-green tasks per arm of live evidence, and it already ignores duplicate
+`task_key` rows — so re-running a task (which overwrites its per-task file)
+cannot inflate `n`.
 
 ---
 

@@ -15,12 +15,21 @@ enum Command {
         #[arg(long, default_value = abeval::constants::DEFAULT_CORPUS_PATH)]
         corpus: String,
     },
-    /// Run one task across one/both arms (dry-run by default).
+    /// Run one task (`--task`) OR a contiguous batch of the corpus
+    /// (`--batch <index>`, size `--batch-size`, default 2) across one/both arms.
+    /// Dry-run by default. Batching paces heavy live runs N tasks at a time into
+    /// a shared `--out` tree; aggregate later with `report --metrics-dir`.
     Run {
         #[arg(long, default_value = abeval::constants::DEFAULT_CORPUS_PATH)]
         corpus: String,
+        #[arg(long, required_unless_present = "batch", conflicts_with = "batch")]
+        task: Option<String>,
+        /// 0-based index of the batch to run (chunks the frozen corpus order).
         #[arg(long)]
-        task: String,
+        batch: Option<usize>,
+        /// Tasks per batch (only meaningful with `--batch`).
+        #[arg(long, default_value_t = 2)]
+        batch_size: usize,
         #[arg(long, default_value = "both")]
         arms: String,
         #[arg(long, conflicts_with = "execute_live")]
@@ -39,12 +48,16 @@ enum Command {
     /// Summarize a run directory OR a normalized metrics file; enforce the
     /// §11.3 headline gate. Exactly one of --run / --metrics is required.
     Report {
-        /// Smoke run directory produced by `run` (mutually exclusive with --metrics).
-        #[arg(long, required_unless_present = "metrics", conflicts_with = "metrics")]
+        /// Smoke run directory produced by `run`.
+        #[arg(long, conflicts_with_all = ["metrics", "metrics_dir"])]
         run: Option<String>,
-        /// Normalized metrics file, e.g. live evidence (mutually exclusive with --run).
-        #[arg(long)]
+        /// A single normalized metrics file, e.g. live evidence.
+        #[arg(long, conflicts_with = "metrics_dir")]
         metrics: Option<String>,
+        /// An `--out` tree of per-task `live_metrics.json` files to aggregate
+        /// (the batched-run output). Unions all task rows into one live report.
+        #[arg(long)]
+        metrics_dir: Option<String>,
     },
 }
 
@@ -61,6 +74,8 @@ fn main() -> Result<()> {
         Command::Run {
             corpus,
             task,
+            batch,
+            batch_size,
             arms,
             dry_run,
             execute_live,
@@ -71,41 +86,75 @@ fn main() -> Result<()> {
         } => {
             let tasks = abeval::corpus::load_corpus(&corpus)?;
             abeval::corpus::validate_corpus(&tasks)?;
-            let selected = tasks
-                .into_iter()
-                .find(|t| t.id == task)
-                .ok_or_else(|| anyhow::anyhow!("task {task} not found in corpus"))?;
-            // Base-commit precedence (including the illegal "override a pin"
-            // state) is enforced by the single authority `resolve_base_commit`,
-            // reached via the live executor; no duplicate guard here.
-            let arm_list = abeval::arms::assign_arms(&selected.id, &arms)?;
+            // clap guarantees exactly one of --task / --batch; the remaining
+            // arms are defensive bails for a hand-built invocation.
+            let selected = match (task, batch) {
+                (Some(id), None) => {
+                    let t = tasks
+                        .into_iter()
+                        .find(|t| t.id == id)
+                        .ok_or_else(|| anyhow::anyhow!("task {id} not found in corpus"))?;
+                    vec![t]
+                }
+                (None, Some(index)) => abeval::corpus::select_batch(&tasks, batch_size, index)?,
+                (Some(_), Some(_)) => anyhow::bail!("pass either --task or --batch, not both"),
+                (None, None) => anyhow::bail!("provide --task <id> or --batch <index>"),
+            };
             // Default to dry-run unless --execute-live was explicitly passed.
             let dry = dry_run || !execute_live;
-            let summary = abeval::runner::run_task(abeval::runner::RunArgs {
-                task: selected,
-                arms: arm_list,
-                dry_run: dry,
-                execute_live,
-                budget_usd,
-                approval_file,
-                out_dir: std::path::PathBuf::from(out),
-                base_sha,
-            })?;
-            println!("ran {} ({} arms)", summary.task_id, summary.arms_run);
+            // Each task in a batch runs independently into its own
+            // `<out>/<task_id>/` subtree; the live cost-approval gate is
+            // re-checked per task inside `run_task`.
+            for selected_task in selected {
+                // Base-commit precedence (including the illegal "override a pin"
+                // state) is enforced by the single authority `resolve_base_commit`,
+                // reached via the live executor; no duplicate guard here.
+                let arm_list = abeval::arms::assign_arms(&selected_task.id, &arms)?;
+                let summary = abeval::runner::run_task(abeval::runner::RunArgs {
+                    task: selected_task,
+                    arms: arm_list,
+                    dry_run: dry,
+                    execute_live,
+                    budget_usd,
+                    approval_file: approval_file.clone(),
+                    out_dir: std::path::PathBuf::from(&out),
+                    base_sha: base_sha.clone(),
+                })?;
+                println!("ran {} ({} arms)", summary.task_id, summary.arms_run);
+            }
             Ok(())
         }
-        Command::Report { run, metrics } => {
-            // clap enforces exactly-one-of via required_unless_present +
-            // conflicts_with; the final arm is an unreachable safety bail.
-            let input = match (run, metrics) {
-                (_, Some(metrics_path)) => abeval::report::load_metrics(&metrics_path)?,
-                (Some(run_dir), None) => abeval::report::metrics_from_run_dir(&run_dir)?,
-                (None, None) => {
-                    anyhow::bail!("provide exactly one of --run <dir> or --metrics <file>")
-                }
+        Command::Report {
+            run,
+            metrics,
+            metrics_dir,
+        } => {
+            // clap enforces mutual exclusion; the final arm is the
+            // none-provided error (clap can't require exactly-one of three).
+            let input = match (run, metrics, metrics_dir) {
+                (Some(run_dir), None, None) => abeval::report::metrics_from_run_dir(&run_dir)?,
+                (None, Some(metrics_path), None) => abeval::report::load_metrics(&metrics_path)?,
+                (None, None, Some(dir)) => abeval::report::load_metrics_dir(&dir)?,
+                _ => anyhow::bail!(
+                    "provide exactly one of --run <dir>, --metrics <file>, or --metrics-dir <dir>"
+                ),
             };
             print!("{}", abeval::report::render_report(&input));
             Ok(())
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Cli;
+    use clap::CommandFactory;
+
+    /// Guards every `conflicts_with*` / `required_unless_present` id against the
+    /// arg ids that actually exist — the check that would have caught the
+    /// `name = "metrics-dir"` id-rename breaking `conflicts_with = "metrics_dir"`.
+    #[test]
+    fn cli_definition_is_internally_consistent() {
+        Cli::command().debug_assert();
     }
 }

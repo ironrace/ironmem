@@ -138,6 +138,61 @@ pub fn load_metrics(path: impl AsRef<Path>) -> Result<MetricsInput> {
     Ok(input)
 }
 
+/// Aggregate every per-task `live_metrics.json` written under an `--out` tree
+/// into a single live [`MetricsInput`], so batches run separately (e.g. 2 at a
+/// time) can be scored together against the §11.3 headline gate.
+///
+/// Scans immediate subdirectories `<dir>/<task_id>/live_metrics.json` (the shape
+/// the live runner writes), in sorted order for determinism, and unions their
+/// task rows. Errors if:
+/// - the tree holds no such file (nothing to report — never an empty pass), or
+/// - any loaded file is not `evidence_class:"live"` (a smoke file must never
+///   silently dilute live evidence into a fabricated headline).
+///
+/// Duplicate `task_key` rows (e.g. a task re-run) are NOT collapsed here; the
+/// §11.3 gate already ignores duplicate keys, so aggregation cannot inflate `n`.
+pub fn load_metrics_dir(dir: impl AsRef<Path>) -> Result<MetricsInput> {
+    let dir = dir.as_ref();
+    let mut files: Vec<PathBuf> = Vec::new();
+    let entries =
+        std::fs::read_dir(dir).with_context(|| format!("reading metrics dir {}", dir.display()))?;
+    for entry in entries {
+        let path = entry
+            .with_context(|| format!("reading entry in {}", dir.display()))?
+            .path();
+        if path.is_dir() {
+            let candidate = path.join("live_metrics.json");
+            if candidate.is_file() {
+                files.push(candidate);
+            }
+        }
+    }
+    files.sort();
+
+    let mut tasks: Vec<TaskMetric> = Vec::new();
+    for file in &files {
+        let input = load_metrics(file)?;
+        if input.evidence_class != "live" {
+            anyhow::bail!(
+                "{}: expected evidence_class \"live\" for aggregation, got {:?}",
+                file.display(),
+                input.evidence_class
+            );
+        }
+        tasks.extend(input.tasks);
+    }
+    if tasks.is_empty() {
+        anyhow::bail!(
+            "no */live_metrics.json found under {} (nothing to aggregate)",
+            dir.display()
+        );
+    }
+    Ok(MetricsInput {
+        evidence_class: "live".to_string(),
+        tasks,
+    })
+}
+
 /// The subset of `run_meta.json` the report path reads back. Typed (not
 /// `serde_json::Value`) so an unexpected `evidence_class` is rejected rather
 /// than silently downgraded to smoke: a mistyped field (e.g. a number) is a
