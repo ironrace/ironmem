@@ -5,6 +5,7 @@
 
 pub mod arms;
 pub mod client;
+pub mod collab_db;
 pub mod constants;
 pub mod corpus;
 pub mod report;
