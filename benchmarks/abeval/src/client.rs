@@ -11,7 +11,7 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
 use crate::arms::Arm;
-use crate::corpus::Task;
+use crate::corpus::{BaseCommit, Task};
 
 const SUPERPOWERS_PROMPT_PREFIX: &str = "Run this task with superpowers skills only. \
 Do not use /collab, ironmem MCP tools, semantic search, KG reads/writes, drawer \
@@ -125,38 +125,45 @@ impl ArmExecutor for DryRunExecutor {
     }
 }
 
+/// Single source of truth for the headless permission tokens both arms carry,
+/// so a future CLI change is a one-line edit and the arms stay in lockstep.
+/// Fallback form if the deployed CLI lacks `--permission-mode`:
+/// `["--dangerously-skip-permissions"]`.
+fn headless_permission_args() -> Vec<String> {
+    vec![
+        "--permission-mode".to_string(),
+        "bypassPermissions".to_string(),
+    ]
+}
+
 /// Build the command for an arm. Returns the program and args that are spawned
 /// by a [`CommandRunner`].
 ///
-/// - `ironmem` arm: starts a `/collab` flow for the task.
+/// - `ironmem` arm: starts a `/collab` flow for the task (carried INSIDE the
+///   print-mode `-p` prompt string so the command is genuinely non-interactive
+///   and JSON-emitting).
 /// - `superpowers` arm: runs the task prompt with superpowers skills ONLY
 ///   (C1: NO `/collab`, NO semantic search/KG/drawer writes, NO ironmem
 ///   server-side state in the working context). Any task_tag/reporting
 ///   instrumentation is measurement-only and kept out of the working path.
 ///
-/// Both arms request `--output-format json` so usage is machine-parseable.
+/// Both arms request `--output-format json` AND `-p` (print mode, required for
+/// `--output-format` to take effect) AND headless permission tokens.
 pub fn arm_command(task: &Task, arm: Arm) -> (String, Vec<String>) {
+    let mut argv = vec!["--output-format".to_string(), "json".to_string()];
+    argv.extend(headless_permission_args());
+    argv.push("-p".to_string());
     match arm {
-        Arm::Ironmem => (
-            "claude".to_string(),
-            vec![
-                "--output-format".to_string(),
-                "json".to_string(),
-                "/collab".to_string(),
-                "start".to_string(),
-                task.prompt.clone(),
-            ],
-        ),
-        Arm::Superpowers => (
-            "claude".to_string(),
-            vec![
-                "--output-format".to_string(),
-                "json".to_string(),
-                "-p".to_string(),
-                format!("{SUPERPOWERS_PROMPT_PREFIX}{}", task.prompt),
-            ],
-        ),
+        Arm::Ironmem => {
+            // `/collab start` preserved INSIDE the print-mode prompt string so
+            // the command is genuinely non-interactive and JSON-emitting.
+            argv.push(format!("/collab start {}", task.prompt));
+        }
+        Arm::Superpowers => {
+            argv.push(format!("{SUPERPOWERS_PROMPT_PREFIX}{}", task.prompt));
+        }
     }
+    ("claude".to_string(), argv)
 }
 
 /// Output of running one arm command.
@@ -192,20 +199,286 @@ impl CommandRunner for ProcessCommandRunner {
     }
 }
 
-/// Live executor — builds the arm command, runs it via the injected
-/// [`CommandRunner`] in a per-task/arm workspace, and parses the CLI envelope
-/// into an [`ArmOutcome`]. Spawning a real process is still gated behind the
-/// approval guard in `runner::run_task_live_guarded`.
-pub struct LiveExecutor<R: CommandRunner> {
-    runner: R,
-    workspace_root: PathBuf,
+/// Inputs to provisioning one arm's workspace.
+pub struct ProvisionRequest<'a> {
+    pub task: &'a Task,
+    pub arm: Arm,
+    pub base_commit: &'a BaseCommit,
+    pub workspace_root: &'a Path,
+    pub workspace: &'a Path,
 }
 
-impl<R: CommandRunner> LiveExecutor<R> {
-    pub fn new(runner: R, workspace_root: PathBuf) -> Self {
+/// Abstraction over creating a populated per-task/arm workspace. Production does
+/// a real `git worktree add`; tests use a fake. Mirrors [`CommandRunner`].
+pub trait WorkspaceProvisioner {
+    fn provision(&self, req: &ProvisionRequest) -> Result<()>;
+}
+
+/// Resolve the base commit for a task. THE single authority on base-commit
+/// precedence:
+///
+/// - BOTH a (validated) task pin AND a non-empty run override present → error.
+///   Overriding a deliberate corpus pin from the CLI is illegal; the corpus pin
+///   must be edited intentionally instead.
+/// - Task pin present (and valid) → use it.
+/// - No task pin but a run override present → validate and use the override.
+/// - Neither present → error (no silent HEAD fallback).
+/// - Either value present but invalid → error with a value-specific message.
+///
+/// `task.base_commit` is already a validated [`BaseCommit`]; an empty inner ref
+/// (only reachable via [`BaseCommit::unset`] for hand-built run-override tasks)
+/// means "no task pin". The run override is the one value still arriving as a
+/// raw string, so it is validated here via [`BaseCommit::parse`].
+pub fn resolve_base_commit(task: &Task, run_override: Option<&str>) -> Result<BaseCommit> {
+    let has_pin = !task.base_commit.as_str().trim().is_empty();
+    let override_raw = run_override.map(str::trim).filter(|s| !s.is_empty());
+
+    match (has_pin, override_raw) {
+        (true, Some(sha)) => anyhow::bail!(
+            "--base-sha {:?} cannot override pinned base_commit for task {}; \
+             edit the corpus pin intentionally instead",
+            sha,
+            task.id
+        ),
+        // The pin is an already-validated `BaseCommit`; clone it through.
+        (true, None) => Ok(task.base_commit.clone()),
+        (false, Some(sha)) => {
+            BaseCommit::parse(sha).map_err(|e| anyhow::anyhow!("--base-sha is {e}"))
+        }
+        (false, None) => anyhow::bail!(
+            "task {} has no base_commit and no --base-sha was provided; \
+             refusing to provision a workspace at an undefined base",
+            task.id
+        ),
+    }
+}
+
+/// Pure builder for the `git worktree add` command (no spawn). Exposed so the
+/// argv can be unit-tested without touching real git.
+pub fn worktree_add_argv(
+    repo: &std::path::Path,
+    workspace: &std::path::Path,
+    base: &str,
+) -> (String, Vec<String>) {
+    (
+        "git".to_string(),
+        vec![
+            "-C".to_string(),
+            repo.display().to_string(),
+            "worktree".to_string(),
+            "add".to_string(),
+            "--detach".to_string(),
+            "--".to_string(),
+            workspace.display().to_string(),
+            base.to_string(),
+        ],
+    )
+}
+
+/// The parent directory of the arm workspace leaf (`<root>/<task_id>` for a
+/// `<root>/<task_id>/<arm>` workspace). The caller creates it via
+/// `create_dir_all` before `git worktree add`, because `git worktree add` does
+/// not create missing intermediate parents.
+pub fn worktree_parent_dir(workspace: &std::path::Path) -> Option<PathBuf> {
+    workspace.parent().map(Path::to_path_buf)
+}
+
+/// Enforce that the arm workspace is a safe leaf under the workspace root.
+/// Three guards, each failing loud with a distinct message:
+///
+/// 1. Containment / under-root: `workspace` must be a descendant of
+///    `workspace_root` (`strip_prefix` must succeed).
+/// 2. `..`/root escape: the relative path must contain no `ParentDir`
+///    (`..`) or `RootDir` component that would climb out of the root.
+/// 3. Symlink: neither the workspace root nor any intermediate path component
+///    down to the arm workspace may be a symlink.
+///
+/// Live runs write into user-supplied `--out`; this prevents a reused/shared
+/// output tree from redirecting worktree creation outside the intended root.
+pub fn ensure_workspace_path_safe(workspace_root: &Path, workspace: &Path) -> Result<()> {
+    let rel = workspace.strip_prefix(workspace_root).with_context(|| {
+        format!(
+            "workspace {} is not under workspace root {}",
+            workspace.display(),
+            workspace_root.display()
+        )
+    })?;
+    if rel.components().any(|c| {
+        matches!(
+            c,
+            std::path::Component::ParentDir | std::path::Component::RootDir
+        )
+    }) {
+        anyhow::bail!(
+            "workspace {} escapes workspace root {}",
+            workspace.display(),
+            workspace_root.display()
+        );
+    }
+
+    if let Ok(meta) = std::fs::symlink_metadata(workspace_root) {
+        if meta.file_type().is_symlink() {
+            anyhow::bail!(
+                "workspace root {} is a symlink; refusing live provisioning",
+                workspace_root.display()
+            );
+        }
+    }
+
+    let mut path = workspace_root.to_path_buf();
+    for component in rel.components() {
+        path.push(component.as_os_str());
+        if let Ok(meta) = std::fs::symlink_metadata(&path) {
+            if meta.file_type().is_symlink() {
+                anyhow::bail!(
+                    "workspace path {} contains symlink {}; refusing live provisioning",
+                    workspace.display(),
+                    path.display()
+                );
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Production provisioner: real `git worktree add` of the ironmem repo at the
+/// resolved base commit, no shell. Tests use a fake provisioner; this impl is
+/// exercised only behind the approval gate.
+pub struct ProcessWorkspaceProvisioner {
+    pub ironmem_repo: PathBuf,
+}
+
+impl WorkspaceProvisioner for ProcessWorkspaceProvisioner {
+    fn provision(&self, req: &ProvisionRequest) -> Result<()> {
+        std::fs::create_dir_all(req.workspace_root)
+            .with_context(|| format!("creating workspace root {}", req.workspace_root.display()))?;
+        ensure_workspace_path_safe(req.workspace_root, req.workspace)?;
+
+        // (1) Create the parent (<root>/<task_id>); git worktree add does not
+        // create missing intermediate parents, and only <out_dir>/workspaces is
+        // guaranteed to exist by run_task_live_guarded.
+        if let Some(parent) = worktree_parent_dir(req.workspace) {
+            std::fs::create_dir_all(&parent)
+                .with_context(|| format!("creating workspace parent {}", parent.display()))?;
+        }
+        ensure_workspace_path_safe(req.workspace_root, req.workspace)?;
+
+        if let Some(parent) = worktree_parent_dir(req.workspace) {
+            let root = req.workspace_root.canonicalize().with_context(|| {
+                format!(
+                    "canonicalizing workspace root {}",
+                    req.workspace_root.display()
+                )
+            })?;
+            let parent = parent
+                .canonicalize()
+                .with_context(|| format!("canonicalizing workspace parent {}", parent.display()))?;
+            if !parent.starts_with(&root) {
+                anyhow::bail!(
+                    "workspace parent {} resolves outside workspace root {}",
+                    parent.display(),
+                    root.display()
+                );
+            }
+        }
+
+        // (2) Stale-worktree guard: never silently reuse a populated leaf. A
+        // read_dir error on an EXISTING path (permissions, race) must fail loud
+        // with context — not be swallowed as "empty/safe".
+        if req.workspace.exists() {
+            let non_empty = std::fs::read_dir(req.workspace)
+                .with_context(|| {
+                    format!(
+                        "reading existing workspace {} for stale-worktree check",
+                        req.workspace.display()
+                    )
+                })?
+                .next()
+                .is_some();
+            if non_empty {
+                anyhow::bail!(
+                    "workspace {} already exists and is non-empty (stale worktree); \
+                     refusing to reuse it",
+                    req.workspace.display()
+                );
+            }
+        }
+        // (3) Validate the base ref exists before adding the worktree (no shell).
+        let verify = std::process::Command::new("git")
+            .args([
+                "-C",
+                &self.ironmem_repo.display().to_string(),
+                "rev-parse",
+                "--verify",
+                "--end-of-options",
+                &format!("{}^{{commit}}", req.base_commit.as_str()),
+            ])
+            .output()
+            .with_context(|| {
+                format!(
+                    "verifying base {} in {}",
+                    req.base_commit,
+                    self.ironmem_repo.display()
+                )
+            })?;
+        if !verify.status.success() {
+            anyhow::bail!(
+                "task {} base ref {:?} is unknown/ambiguous in repo {}",
+                req.task.id,
+                req.base_commit.as_str(),
+                self.ironmem_repo.display()
+            );
+        }
+        // (4) Add the worktree (no shell, program+argv, same hardening as ProcessGateRunner).
+        let (program, argv) =
+            worktree_add_argv(&self.ironmem_repo, req.workspace, req.base_commit.as_str());
+        let status = std::process::Command::new(&program)
+            .args(&argv)
+            .status()
+            .with_context(|| {
+                format!(
+                    "git worktree add failed: repo={} base={} workspace={}",
+                    self.ironmem_repo.display(),
+                    req.base_commit,
+                    req.workspace.display()
+                )
+            })?;
+        if !status.success() {
+            anyhow::bail!(
+                "git worktree add exited non-zero: repo={} base={} workspace={}",
+                self.ironmem_repo.display(),
+                req.base_commit,
+                req.workspace.display()
+            );
+        }
+        Ok(())
+    }
+}
+
+/// Live executor — builds the arm command, provisions the workspace via the
+/// injected [`WorkspaceProvisioner`], runs the command via the injected
+/// [`CommandRunner`], and parses the CLI envelope. Spawning a real process is
+/// still gated behind the approval guard in `runner::run_task_live_guarded`.
+pub struct LiveExecutor<R: CommandRunner, P: WorkspaceProvisioner> {
+    runner: R,
+    provisioner: P,
+    workspace_root: PathBuf,
+    base_override: Option<String>,
+}
+
+impl<R: CommandRunner, P: WorkspaceProvisioner> LiveExecutor<R, P> {
+    pub fn new(
+        runner: R,
+        provisioner: P,
+        workspace_root: PathBuf,
+        base_override: Option<String>,
+    ) -> Self {
         Self {
             runner,
+            provisioner,
             workspace_root,
+            base_override,
         }
     }
 
@@ -216,12 +489,20 @@ impl<R: CommandRunner> LiveExecutor<R> {
     }
 }
 
-impl<R: CommandRunner> ArmExecutor for LiveExecutor<R> {
+impl<R: CommandRunner, P: WorkspaceProvisioner> ArmExecutor for LiveExecutor<R, P> {
     fn execute(&self, task: &Task, arm: Arm) -> Result<ArmOutcome> {
         let (program, args) = arm_command(task, arm);
         let workspace = self.workspace_for(task, arm);
-        std::fs::create_dir_all(&workspace)
-            .with_context(|| format!("creating workspace {}", workspace.display()))?;
+        // Single-authority, fail-loud base resolution (see `resolve_base_commit`):
+        // exactly one of task pin / run override must be present, else error.
+        let base = resolve_base_commit(task, self.base_override.as_deref())?;
+        self.provisioner.provision(&ProvisionRequest {
+            task,
+            arm,
+            base_commit: &base,
+            workspace_root: &self.workspace_root,
+            workspace: &workspace,
+        })?;
 
         let output = self.runner.run(&program, &args, &workspace)?;
         let parsed = parse_cli_result(&output.stdout)?;

@@ -6,7 +6,10 @@ use anyhow::{Context, Result};
 use serde::Serialize;
 
 use crate::arms::Arm;
-use crate::client::{ArmExecutor, ArmOutcome, CommandRunner, DryRunExecutor, LiveExecutor, Usage};
+use crate::client::{
+    ArmExecutor, ArmOutcome, CommandRunner, DryRunExecutor, LiveExecutor,
+    ProcessWorkspaceProvisioner, Usage, WorkspaceProvisioner,
+};
 use crate::corpus::Task;
 use crate::report::{build_arm_metric, TaskMetric};
 
@@ -18,6 +21,12 @@ pub struct RunArgs {
     pub budget_usd: Option<f64>,
     pub approval_file: Option<PathBuf>,
     pub out_dir: PathBuf,
+    /// Run-level base override; used only when a task has no `base_commit`.
+    /// Hex refs only. Committed corpus task pins cannot be overridden by the CLI.
+    /// Precedence (including rejecting an override-of-a-pin and validating the
+    /// hex form) is enforced by `client::resolve_base_commit`, the single
+    /// authority — there is no longer a duplicate check in `main`.
+    pub base_sha: Option<String>,
 }
 
 #[derive(Debug)]
@@ -204,10 +213,10 @@ impl GateRunner for ProcessGateRunner {
 /// run its gates in the produced workspace, and map (agent outcome, gate result)
 /// into a per-arm [`TaskMetric`] via the §12 done-proxy. Gates are only run when
 /// the agent completed — a failed agent is already not headline-eligible.
-pub fn run_task_live<R: CommandRunner, G: GateRunner>(
+pub fn run_task_live<R: CommandRunner, P: WorkspaceProvisioner, G: GateRunner>(
     task: &Task,
     arms: &[Arm],
-    executor: &LiveExecutor<R>,
+    executor: &LiveExecutor<R, P>,
     gates: &G,
 ) -> Result<Vec<TaskMetric>> {
     let mut metrics = Vec::with_capacity(arms.len());
@@ -230,10 +239,10 @@ pub fn run_task_live<R: CommandRunner, G: GateRunner>(
 ///
 /// Generic over the runner/gate seams so it is exercised with fakes; the guarded
 /// CLI entry wires the REAL `claude`-spawning runner behind the approval gate.
-pub fn execute_approved_live<R: CommandRunner, G: GateRunner>(
+pub fn execute_approved_live<R: CommandRunner, P: WorkspaceProvisioner, G: GateRunner>(
     task: &Task,
     arms: &[Arm],
-    executor: &LiveExecutor<R>,
+    executor: &LiveExecutor<R, P>,
     gates: &G,
     out_dir: &Path,
 ) -> Result<PathBuf> {
@@ -296,12 +305,29 @@ pub fn run_task_live_guarded(args: RunArgs) -> Result<RunSummary> {
         );
     }
 
-    // Approved: build the REAL `claude`-spawning runner + shell gate runner and
-    // run the task. Arm workspaces live under `<out_dir>/workspaces/...`; the
+    // Approved: build the REAL `claude`-spawning runner + no-shell gate runner
+    // and run the task. Arm workspaces live under `<out_dir>/workspaces/...`; the
     // normalized live metrics file is written to `<out_dir>/<task_id>/`.
+    //
+    // CARGO_MANIFEST_DIR is `<repo>/benchmarks/abeval`; two parent() hops reach
+    // the repo root, which is the ironmem repo for worktree provisioning. Fail
+    // loud rather than silently provisioning against the process CWD.
+    let manifest_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let ironmem_repo = manifest_dir
+        .parent()
+        .and_then(|p| p.parent())
+        .map(|p| p.to_path_buf())
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "cannot derive ironmem repo root: CARGO_MANIFEST_DIR ({}) has fewer than two parents",
+                manifest_dir.display()
+            )
+        })?;
     let executor = LiveExecutor::new(
         crate::client::ProcessCommandRunner,
+        ProcessWorkspaceProvisioner { ironmem_repo },
         args.out_dir.join("workspaces"),
+        args.base_sha.clone(),
     );
     let metrics_path = execute_approved_live(
         &args.task,

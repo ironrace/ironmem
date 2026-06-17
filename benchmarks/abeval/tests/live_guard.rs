@@ -18,6 +18,8 @@ fn task() -> Task {
         acceptance: vec!["ok".to_string()],
         gates: vec!["cargo test".to_string()],
         setup_notes: None,
+        base_commit: abeval::corpus::BaseCommit::parse("ce2b27f2bcf3d318e0142ff5a1ece578559d9261")
+            .unwrap(),
     }
 }
 
@@ -48,6 +50,7 @@ fn execute_live_without_approval_errors_and_spawns_nothing() {
         budget_usd: Some(1.0),
         approval_file: None,
         out_dir: dir.path().to_path_buf(),
+        base_sha: None,
     })
     .unwrap_err();
 
@@ -139,6 +142,7 @@ fn live_run_without_approval_never_spawns() {
         budget_usd: Some(1.0),
         approval_file: None,
         out_dir: dir.path().to_path_buf(),
+        base_sha: None,
     })
     .unwrap_err();
 
@@ -207,6 +211,7 @@ fn approved_live_without_budget_ceiling_errors_before_spawn() {
         budget_usd: None,
         approval_file: None,
         out_dir: dir.path().to_path_buf(),
+        base_sha: None,
     })
     .unwrap_err();
     std::env::remove_var(abeval::constants::APPROVAL_ENV);
@@ -239,6 +244,7 @@ fn live_unsafe_task_id_rejected_before_spawn() {
         budget_usd: Some(1.0),
         approval_file: None,
         out_dir: dir.path().to_path_buf(),
+        base_sha: None,
     })
     .unwrap_err();
     std::env::remove_var(abeval::constants::APPROVAL_ENV);

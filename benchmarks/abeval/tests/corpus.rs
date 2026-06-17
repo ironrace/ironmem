@@ -11,6 +11,8 @@ fn sample_task(id: &str) -> Task {
         acceptance: vec!["it works".to_string()],
         gates: vec!["cargo test".to_string()],
         setup_notes: None,
+        base_commit: abeval::corpus::BaseCommit::parse("ce2b27f2bcf3d318e0142ff5a1ece578559d9261")
+            .unwrap(),
     }
 }
 
@@ -127,8 +129,9 @@ fn committed_corpus_validates() {
     // corpus changes this hash and must be a deliberate, reviewed update.
     assert_eq!(
         content_hash(&t),
-        "9fe0e8c4d04b1b6b2a45f3bd90f760a0f21a3aeaa6bd4e9913e180c976e8ac91",
-        "frozen corpus content hash changed — update intentionally if the corpus changed"
+        "e6f464ce6c75f76254bbb483f71a8ff7e3794cfeafe030c8cbb5c8f1719c8cab",
+        "frozen corpus content hash changed — re-pinned 2026-06-16: added \
+         Task.base_commit per session 9f49a93d steering decision (intentional)"
     );
 }
 

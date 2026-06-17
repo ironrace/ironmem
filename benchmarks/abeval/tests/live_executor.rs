@@ -6,9 +6,21 @@ use std::sync::{Arc, Mutex};
 
 use abeval::arms::Arm;
 use abeval::client::{
-    parse_cli_result, ArmExecutor, ArmOutcome, CommandOutput, CommandRunner, LiveExecutor, Usage,
+    parse_cli_result, ArmExecutor, ArmOutcome, CommandOutput, CommandRunner, LiveExecutor,
+    ProvisionRequest, Usage, WorkspaceProvisioner,
 };
 use abeval::corpus::Task;
+
+/// No-op provisioner for tests that don't test provisioning behavior — just
+/// creates the workspace directory so the runner can write artifacts into it.
+struct NoOpProvisioner;
+
+impl WorkspaceProvisioner for NoOpProvisioner {
+    fn provision(&self, req: &ProvisionRequest) -> anyhow::Result<()> {
+        std::fs::create_dir_all(req.workspace)?;
+        Ok(())
+    }
+}
 use abeval::report::{build_arm_metric, load_metrics, render_report, write_live_metrics};
 
 fn task() -> Task {
@@ -21,6 +33,8 @@ fn task() -> Task {
         acceptance: vec!["ok".to_string()],
         gates: vec!["cargo test".to_string()],
         setup_notes: None,
+        base_commit: abeval::corpus::BaseCommit::parse("ce2b27f2bcf3d318e0142ff5a1ece578559d9261")
+            .unwrap(),
     }
 }
 
@@ -71,13 +85,13 @@ fn fake(stdout: &str, success: bool) -> (FakeRunner, Captured) {
     )
 }
 
-/// The ironmem arm drives `claude /collab start <prompt>` and the parsed usage +
-/// success flow to a "completed" outcome.
+/// The ironmem arm drives `claude -p "/collab start <prompt>"` and the parsed
+/// usage + success flow to a "completed" outcome.
 #[test]
 fn live_executor_ironmem_arm_runs_collab_and_parses_usage() {
     let (runner, captured) = fake(SUCCESS_JSON, true);
     let ws = tempfile::tempdir().unwrap();
-    let exec = LiveExecutor::new(runner, ws.path().to_path_buf());
+    let exec = LiveExecutor::new(runner, NoOpProvisioner, ws.path().to_path_buf(), None);
 
     let outcome = exec.execute(&task(), Arm::Ironmem).unwrap();
 
@@ -88,12 +102,13 @@ fn live_executor_ironmem_arm_runs_collab_and_parses_usage() {
     let cap = captured.lock().unwrap();
     assert_eq!(cap.len(), 1);
     assert_eq!(cap[0].0, "claude");
+    // `/collab start` is carried inside the single `-p` prompt arg (print mode).
     assert!(
-        cap[0].1.iter().any(|a| a == "/collab"),
-        "ironmem arm uses /collab"
+        cap[0].1.iter().any(|a| a.contains("/collab start")),
+        "ironmem arm uses /collab start (inside -p prompt)"
     );
     assert!(
-        cap[0].1.iter().any(|a| a == "PROMPT-BODY"),
+        cap[0].1.iter().any(|a| a.contains("PROMPT-BODY")),
         "task prompt is passed"
     );
 }
@@ -104,7 +119,7 @@ fn live_executor_ironmem_arm_runs_collab_and_parses_usage() {
 fn live_executor_superpowers_arm_excludes_collab() {
     let (runner, captured) = fake(SUCCESS_JSON, true);
     let ws = tempfile::tempdir().unwrap();
-    let exec = LiveExecutor::new(runner, ws.path().to_path_buf());
+    let exec = LiveExecutor::new(runner, NoOpProvisioner, ws.path().to_path_buf(), None);
 
     exec.execute(&task(), Arm::Superpowers).unwrap();
 
@@ -135,7 +150,7 @@ fn live_executor_superpowers_arm_excludes_collab() {
 fn live_executor_failed_process_records_failed_outcome() {
     let (runner, _c) = fake(SUCCESS_JSON, false); // process exited non-zero
     let ws = tempfile::tempdir().unwrap();
-    let exec = LiveExecutor::new(runner, ws.path().to_path_buf());
+    let exec = LiveExecutor::new(runner, NoOpProvisioner, ws.path().to_path_buf(), None);
 
     let outcome = exec.execute(&task(), Arm::Ironmem).unwrap();
     assert_eq!(outcome.outcome, "failed");
@@ -309,6 +324,8 @@ fn task_n(n: usize) -> Task {
         acceptance: vec!["ok".to_string()],
         gates: vec!["cargo test".to_string()],
         setup_notes: None,
+        base_commit: abeval::corpus::BaseCommit::parse("ce2b27f2bcf3d318e0142ff5a1ece578559d9261")
+            .unwrap(),
     }
 }
 
@@ -318,7 +335,7 @@ fn task_n(n: usize) -> Task {
 fn run_task_live_completed_and_green_yields_done_metrics() {
     let (runner, _c) = fake(SUCCESS_JSON, true);
     let ws = tempfile::tempdir().unwrap();
-    let exec = LiveExecutor::new(runner, ws.path().to_path_buf());
+    let exec = LiveExecutor::new(runner, NoOpProvisioner, ws.path().to_path_buf(), None);
     let gates = FakeGates { green: true };
 
     let metrics = run_task_live(&task(), &[Arm::Ironmem, Arm::Superpowers], &exec, &gates).unwrap();
@@ -337,7 +354,7 @@ fn run_task_live_completed_and_green_yields_done_metrics() {
 fn run_task_live_red_gates_are_not_done() {
     let (runner, _c) = fake(SUCCESS_JSON, true);
     let ws = tempfile::tempdir().unwrap();
-    let exec = LiveExecutor::new(runner, ws.path().to_path_buf());
+    let exec = LiveExecutor::new(runner, NoOpProvisioner, ws.path().to_path_buf(), None);
     let gates = FakeGates { green: false };
 
     let metrics = run_task_live(&task(), &[Arm::Ironmem], &exec, &gates).unwrap();
@@ -354,7 +371,7 @@ fn full_pipeline_eight_tasks_produces_headline_delta() {
     for n in 0..8 {
         // Distinct usage per arm so spreads are meaningful; success envelope.
         let (runner, _c) = fake(SUCCESS_JSON, true);
-        let exec = LiveExecutor::new(runner, ws.path().to_path_buf());
+        let exec = LiveExecutor::new(runner, NoOpProvisioner, ws.path().to_path_buf(), None);
         let metrics =
             run_task_live(&task_n(n), &[Arm::Ironmem, Arm::Superpowers], &exec, &gates).unwrap();
         all.extend(metrics);
@@ -378,7 +395,7 @@ fn full_pipeline_eight_tasks_produces_headline_delta() {
 fn execute_approved_live_writes_live_metrics_file() {
     let (runner, _c) = fake(SUCCESS_JSON, true);
     let out = tempfile::tempdir().unwrap();
-    let exec = LiveExecutor::new(runner, out.path().join("ws"));
+    let exec = LiveExecutor::new(runner, NoOpProvisioner, out.path().join("ws"), None);
     let gates = FakeGates { green: true };
 
     let path = abeval::runner::execute_approved_live(
@@ -403,7 +420,7 @@ use abeval::client::ProcessCommandRunner;
 use abeval::runner::ProcessGateRunner;
 
 /// The real runner spawns a process, captures its stdout, and reports success.
-/// Uses `printf` — NEVER an agent.
+/// Uses `printf` — NEVER an agent; safe to run in CI.
 #[test]
 fn process_command_runner_captures_stdout_and_success() {
     let runner = ProcessCommandRunner;
@@ -420,6 +437,7 @@ fn process_command_runner_captures_stdout_and_success() {
 }
 
 /// A non-zero exit is reported as `success = false` (not an Err).
+/// Uses `false` — NEVER an agent; safe to run in CI.
 #[test]
 fn process_command_runner_reports_failure_exit() {
     let runner = ProcessCommandRunner;
@@ -429,6 +447,7 @@ fn process_command_runner_reports_failure_exit() {
 }
 
 /// A missing program is a loud error, not a silent empty success.
+/// Spawns no real workload — only a non-existent binary; safe to run in CI.
 #[test]
 fn process_command_runner_errors_on_missing_program() {
     let runner = ProcessCommandRunner;
@@ -439,7 +458,7 @@ fn process_command_runner_errors_on_missing_program() {
 }
 
 /// ProcessGateRunner runs each gate (program + argv, no shell) in the workspace;
-/// all-zero-exit passes.
+/// all-zero-exit passes. Uses `true` — NEVER an agent; safe to run in CI.
 #[test]
 fn process_gate_runner_passes_when_all_gates_succeed() {
     let g = ProcessGateRunner;
@@ -450,6 +469,7 @@ fn process_gate_runner_passes_when_all_gates_succeed() {
 }
 
 /// Any non-zero gate fails the set (no silent green).
+/// Uses `true`/`false` — NEVER an agent; safe to run in CI.
 #[test]
 fn process_gate_runner_fails_when_a_gate_fails() {
     let g = ProcessGateRunner;
@@ -462,6 +482,7 @@ fn process_gate_runner_fails_when_a_gate_fails() {
 /// SECURITY: gates run WITHOUT a shell — metacharacters in a gate string are
 /// passed as inert argv tokens, never interpreted. With `sh -c`, `true ; touch X`
 /// would create X; here the `; touch X` tokens are just args to `true`.
+/// Uses `true` — NEVER an agent; safe to run in CI (regression guard for #122).
 #[test]
 fn process_gate_runner_does_not_interpret_shell_metacharacters() {
     let g = ProcessGateRunner;
@@ -503,7 +524,7 @@ const ZERO_USAGE_JSON: &str = r#"{"is_error":false,"result":"done",
 fn live_executor_zero_usage_on_success_is_loud_error() {
     let (runner, _c) = fake(ZERO_USAGE_JSON, true);
     let ws = tempfile::tempdir().unwrap();
-    let exec = LiveExecutor::new(runner, ws.path().to_path_buf());
+    let exec = LiveExecutor::new(runner, NoOpProvisioner, ws.path().to_path_buf(), None);
     let err = exec.execute(&task(), Arm::Ironmem).unwrap_err();
     assert!(
         err.to_string().to_lowercase().contains("usage")
@@ -518,7 +539,7 @@ fn live_executor_zero_usage_on_success_is_loud_error() {
 fn live_executor_zero_usage_on_failure_is_recorded_failed() {
     let (runner, _c) = fake(ZERO_USAGE_JSON, false);
     let ws = tempfile::tempdir().unwrap();
-    let exec = LiveExecutor::new(runner, ws.path().to_path_buf());
+    let exec = LiveExecutor::new(runner, NoOpProvisioner, ws.path().to_path_buf(), None);
     let o = exec.execute(&task(), Arm::Ironmem).unwrap();
     assert_eq!(o.outcome, "failed");
 }
