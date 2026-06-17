@@ -23,7 +23,75 @@ pub struct Task {
     pub setup_notes: Option<String>,
     /// Pinned git base commit the live workspace is provisioned at (REQUIRED).
     /// Hex object ref, length 7..=40. Reproducibility: prefer a full 40-char SHA.
-    pub base_commit: String,
+    pub base_commit: BaseCommit,
+}
+
+/// Validated git base-commit ref. The smart constructor [`BaseCommit::parse`] is
+/// the SINGLE place the hex/length (7..=40) predicate lives — there is no other
+/// validity check for base commits anywhere in the crate.
+///
+/// On-disk JSON shape is an unadorned string: it deserializes via
+/// `#[serde(try_from = "String")]` (validating on load) and serializes
+/// transparently as its inner `String`, so the frozen corpus content hash is
+/// byte-identical to the plain-string form.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(try_from = "String")]
+pub struct BaseCommit(String);
+
+// Serialize transparently as the bare inner string. `#[serde(transparent)]`
+// cannot be combined with `try_from`, so the serialize half is hand-written to
+// keep the on-disk shape (and thus the corpus content hash) a plain string.
+impl Serialize for BaseCommit {
+    fn serialize<S: serde::Serializer>(
+        &self,
+        serializer: S,
+    ) -> std::result::Result<S::Ok, S::Error> {
+        serializer.serialize_str(&self.0)
+    }
+}
+
+impl BaseCommit {
+    /// Parse and validate a base commit: non-empty hex of git-object-ref length
+    /// (7..=40). Surrounding whitespace is trimmed before validation. Network/repo
+    /// existence is validated at provision time, not here.
+    pub fn parse(s: &str) -> Result<Self> {
+        let trimmed = s.trim();
+        if !((7..=40).contains(&trimmed.len()) && trimmed.bytes().all(|b| b.is_ascii_hexdigit())) {
+            bail!(
+                "invalid base_commit {:?} (expected hex git ref of length 7..=40)",
+                s
+            );
+        }
+        Ok(BaseCommit(trimmed.to_string()))
+    }
+
+    /// The explicit "no pin set" sentinel: an empty inner ref. The on-disk
+    /// corpus always carries a real pin (the `try_from`/`validate_corpus` path
+    /// rejects empty), so this is only reachable for hand-built `Task`s whose
+    /// base is supplied at run time via `--base-sha`. `resolve_base_commit`
+    /// treats an empty ref as "no task pin".
+    pub fn unset() -> Self {
+        BaseCommit(String::new())
+    }
+
+    /// The validated inner ref (empty only for [`BaseCommit::unset`]).
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Display for BaseCommit {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl TryFrom<String> for BaseCommit {
+    type Error = anyhow::Error;
+
+    fn try_from(value: String) -> Result<Self> {
+        BaseCommit::parse(&value)
+    }
 }
 
 /// Load tasks from a JSONL file (one Task object per non-blank line).
@@ -84,13 +152,9 @@ pub fn validate_corpus(tasks: &[Task]) -> Result<()> {
         if t.gates.is_empty() {
             bail!("task {} has no gates", t.id);
         }
-        if !is_valid_base_commit(&t.base_commit) {
-            bail!(
-                "task {} has invalid base_commit {:?} (expected hex git ref of length 7..=40)",
-                t.id,
-                t.base_commit
-            );
-        }
+        // `t.base_commit` is a validated `BaseCommit` newtype: validity is
+        // enforced at construction (`BaseCommit::parse`) / on-disk deserialization
+        // (`#[serde(try_from = "String")]`), so no re-derivation is needed here.
         if !SOURCE_PREFIXES.iter().any(|p| t.source.starts_with(p)) {
             bail!(
                 "task {} has non-real source {:?} (must start with one of {:?})",
@@ -112,12 +176,6 @@ pub(crate) fn is_safe_task_id(id: &str) -> bool {
         && id
             .bytes()
             .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
-}
-
-/// A `base_commit` must be non-empty hex of git-object-ref length (7..=40).
-/// Network/repo existence is validated at provision time, not here.
-pub(crate) fn is_valid_base_commit(s: &str) -> bool {
-    (7..=40).contains(&s.len()) && s.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
 /// Deterministic content hash over the canonicalized corpus.
@@ -163,54 +221,57 @@ fn to_canonical(value: &serde_json::Value) -> serde_json::Value {
 mod base_commit_tests {
     use super::*;
 
-    fn valid_task(n: usize) -> Task {
-        Task {
-            id: format!("t{n}"),
-            title: "T".to_string(),
-            source: "issue:#1".to_string(),
-            repo_scope: vec!["crates/ironmem/src/lib.rs".to_string()],
-            prompt: "do".to_string(),
-            acceptance: vec!["a".to_string()],
-            gates: vec!["cargo test".to_string()],
-            setup_notes: None,
-            base_commit: "abcdef1234567890abcdef1234567890abcdef12".to_string(),
-        }
-    }
-
-    /// Build a minimum-sized corpus (8 tasks) with the first slot replaced by `t`.
-    fn corpus_with(t: Task) -> Vec<Task> {
-        let mut tasks: Vec<Task> = (1..=8).map(valid_task).collect();
-        tasks[0] = t;
-        tasks
+    #[test]
+    fn parse_rejects_empty_base_commit() {
+        let err = BaseCommit::parse("").unwrap_err().to_string();
+        assert!(err.contains("invalid base_commit"), "got: {err}");
     }
 
     #[test]
-    fn rejects_empty_base_commit() {
-        let mut t = valid_task(0);
-        t.base_commit = String::new();
-        let err = validate_corpus(&corpus_with(t)).unwrap_err().to_string();
-        assert!(err.contains("base_commit"), "got: {err}");
+    fn parse_rejects_non_hex_base_commit() {
+        let err = BaseCommit::parse("not-a-sha-zzzz").unwrap_err().to_string();
+        assert!(err.contains("invalid base_commit"), "got: {err}");
     }
 
     #[test]
-    fn rejects_non_hex_base_commit() {
-        let mut t = valid_task(0);
-        t.base_commit = "not-a-sha-zzzz".to_string();
-        let err = validate_corpus(&corpus_with(t)).unwrap_err().to_string();
-        assert!(err.contains("base_commit"), "got: {err}");
+    fn parse_rejects_too_short_base_commit() {
+        let err = BaseCommit::parse("abc").unwrap_err().to_string();
+        assert!(err.contains("invalid base_commit"), "got: {err}");
     }
 
     #[test]
-    fn rejects_too_short_base_commit() {
-        let mut t = valid_task(0);
-        t.base_commit = "abc".to_string();
-        let err = validate_corpus(&corpus_with(t)).unwrap_err().to_string();
-        assert!(err.contains("base_commit"), "got: {err}");
+    fn parse_accepts_valid_full_sha() {
+        let bc = BaseCommit::parse("abcdef1234567890abcdef1234567890abcdef12")
+            .expect("valid base_commit accepted");
+        assert_eq!(bc.as_str(), "abcdef1234567890abcdef1234567890abcdef12");
     }
 
     #[test]
-    fn accepts_valid_full_sha() {
-        let tasks: Vec<Task> = (1..=8).map(valid_task).collect();
-        validate_corpus(&tasks).expect("valid base_commit accepted");
+    fn parse_trims_surrounding_whitespace() {
+        let bc = BaseCommit::parse("  abcdef1  ").expect("trimmed valid ref accepted");
+        assert_eq!(bc.as_str(), "abcdef1");
+    }
+
+    #[test]
+    fn deserialize_validates_via_try_from() {
+        // On-disk JSON shape is a plain string; an invalid value must fail to
+        // deserialize (the `try_from = "String"` path), not silently construct.
+        let ok: BaseCommit =
+            serde_json::from_str("\"abcdef1234567890abcdef1234567890abcdef12\"").unwrap();
+        assert_eq!(ok.as_str(), "abcdef1234567890abcdef1234567890abcdef12");
+
+        let err = serde_json::from_str::<BaseCommit>("\"zzz\"").unwrap_err();
+        assert!(
+            err.to_string().contains("invalid base_commit"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn serialize_is_transparent_plain_string() {
+        // The content hash depends on this: a BaseCommit must serialize as the
+        // bare inner string, not as a wrapper object.
+        let bc = BaseCommit::parse("abcdef1").unwrap();
+        assert_eq!(serde_json::to_string(&bc).unwrap(), "\"abcdef1\"");
     }
 }
