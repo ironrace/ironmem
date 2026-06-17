@@ -131,7 +131,9 @@ pinned `base_commit`, provisions a detached git worktree at
 non-empty workspaces, and then spawns the per-arm `claude` command in that populated
 workspace. Both arms use `--output-format json --permission-mode bypassPermissions -p`;
 the ironmem arm carries `/collab start <prompt>` inside the single print-mode prompt
-argument. The runner parses the CLI usage envelope, runs the task's frozen `gates` in
+argument, while the superpowers arm additionally carries `--strict-mcp-config --mcp-config
+'{"mcpServers":{}}'` for C1 MCP isolation (see below). The runner parses the CLI usage
+envelope, runs the task's frozen `gates` in
 that workspace, and writes a normalized `evidence_class:"live"` metrics file to
 `<out>/<task_id>/live_metrics.json` — consumable by `report --metrics`. A row is counted
 `merged`+`ci_green` only when the agent completed **and** the gates pass (the §12
@@ -152,12 +154,18 @@ The `superpowers` arm working context must be isolated from ironmem server-side 
 
 The `LiveExecutor` command template includes these prohibitions in the task prompt.
 **The prompt prefix is NOT the enforcement boundary** — a model can ignore an instruction.
-Any future live runner MUST enforce C1 by *environment isolation*: launch the `superpowers`
-arm in a harness configuration that physically omits the ironmem MCP server and starts from
-clean state (no ironmem state dir), so the arm cannot reach ironmem even if it tried. The
-prompt prefix is belt-and-suspenders only. Task_tag or reporting instrumentation (needed to
+C1 is therefore enforced by *environment isolation*: the `superpowers` arm command carries
+`--strict-mcp-config` together with an empty `--mcp-config` (`{"mcpServers":{}}`), so the
+spawned CLI loads **zero** MCP servers and physically cannot reach the ironmem MCP server
+even if it tried (see `superpowers_mcp_isolation_args` in `src/client.rs`). The prompt
+prefix is belt-and-suspenders only. Task_tag or reporting instrumentation (needed to
 attribute token rows in the ironmem DB) is **measurement-only** and kept strictly separate
 from the arm's working context.
+
+> Scope note: this isolates the *MCP surface* (ironmem search/KG/drawers), which is the C1
+> server-side-state boundary §11.2 names. A future hardening could additionally start the arm
+> from a clean ironmem state dir; the MCP-config isolation already removes the reachable tool
+> surface that would let the arm read or write ironmem state.
 
 This separation is required by METRICS_SPEC §11.2 and the C1 clarification from the
 Codex review of the canonical plan.
