@@ -3,7 +3,7 @@
 
 use abeval::arms::Arm;
 use abeval::client::{
-    ensure_workspace_path_safe, worktree_add_argv, worktree_parent_dir,
+    checkout_detach_argv, clone_argv, ensure_workspace_path_safe, worktree_parent_dir,
     ProcessWorkspaceProvisioner, ProvisionRequest, WorkspaceProvisioner,
 };
 use abeval::corpus::Task;
@@ -24,23 +24,39 @@ fn task() -> Task {
 }
 
 #[test]
-fn worktree_add_argv_is_no_shell_and_detached() {
-    let (program, argv) = worktree_add_argv(
+fn clone_argv_is_no_shell_local_and_terminated() {
+    let (program, argv) = clone_argv(
         &PathBuf::from("/repo"),
         &PathBuf::from("/ws/t1/ironmem"),
-        "abcdef1",
     );
     assert_eq!(program, "git");
     assert_eq!(
         argv,
         vec![
-            "-C".to_string(),
-            "/repo".to_string(),
-            "worktree".to_string(),
-            "add".to_string(),
-            "--detach".to_string(),
+            "clone".to_string(),
+            "--local".to_string(),
+            "--quiet".to_string(),
             "--".to_string(),
+            "/repo".to_string(),
             "/ws/t1/ironmem".to_string(),
+        ]
+    );
+}
+
+#[test]
+fn checkout_detach_argv_pins_base_no_shell() {
+    let (program, argv) = checkout_detach_argv(&PathBuf::from("/ws/t1/ironmem"), "abcdef1");
+    assert_eq!(program, "git");
+    assert_eq!(
+        argv,
+        vec![
+            "-C".to_string(),
+            "/ws/t1/ironmem".to_string(),
+            "-c".to_string(),
+            "advice.detachedHead=false".to_string(),
+            "checkout".to_string(),
+            "--detach".to_string(),
+            "--end-of-options".to_string(),
             "abcdef1".to_string(),
         ]
     );
@@ -123,10 +139,11 @@ fn workspace_path_safety_rejects_symlinked_arm_workspace() {
 
 /// Real git smoke — manually runnable only; never fires in default `cargo test`.
 /// Inits a temp repo, commits, then asserts BOTH the unknown-base-ref bail and a
-/// successful `git worktree add` at the real HEAD commit.
+/// successful isolated clone pinned at the real HEAD commit — and that the clone
+/// has its OWN `origin` (so repointing it never touches the source repo).
 #[test]
 #[ignore = "spawns real git; run manually behind the live gate"]
-fn real_worktree_add_smoke() {
+fn real_clone_provision_smoke() {
     use std::process::Command;
 
     fn git(repo: &std::path::Path, args: &[&str]) -> std::process::Output {
@@ -191,9 +208,18 @@ fn real_worktree_add_smoke() {
             workspace_root: &workspace_root,
             workspace: &workspace,
         })
-        .expect("worktree add at real HEAD must succeed");
+        .expect("clone provision at real HEAD must succeed");
     assert!(
         workspace.join("file.txt").exists(),
-        "worktree should contain the committed file"
+        "clone should contain the committed file"
+    );
+    // The clone owns an isolated `origin` (→ source repo): repointing it is a
+    // per-task mutation that never reaches the real repo's config — the property
+    // that a linked worktree could not provide.
+    let origin = git(&workspace, &["remote", "get-url", "origin"]).stdout;
+    assert_eq!(
+        String::from_utf8(origin).unwrap().trim(),
+        repo.to_string_lossy(),
+        "cloned workspace origin must point at the source repo, isolated from it"
     );
 }

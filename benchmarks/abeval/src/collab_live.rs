@@ -199,8 +199,24 @@ pub fn provision_collab_env(
     // Per-task local bare remote so intermediate pushes go nowhere real.
     run_git(&["init", "--bare", &remote_bare.display().to_string()])?;
     run_git_in(worktree, &["checkout", "-b", branch])?;
-    run_git_in(worktree, &["remote", "add", "origin", &remote_bare.display().to_string()])?;
+    // The isolated clone already carries an `origin` (→ the source repo); repoint
+    // it at this task's throwaway bare so collab workers' `git push origin` stays
+    // local. Because the workspace is a clone (not a linked worktree) this mutates
+    // only the per-task config — never the real repo's. Fall back to `add` if the
+    // clone somehow lacks an origin.
+    wire_origin(worktree, remote_bare)?;
     run_git_in(worktree, &["push", "-u", "origin", branch])?;
+    Ok(())
+}
+
+/// Point the workspace's `origin` at `bare`, whether or not an `origin` already
+/// exists. A clone has one (→ source repo) so `set-url` is the normal path; the
+/// `add` fallback covers a repo that lacks it.
+fn wire_origin(worktree: &Path, bare: &Path) -> Result<()> {
+    let bare_s = bare.display().to_string();
+    if run_git_in(worktree, &["remote", "set-url", "origin", &bare_s]).is_err() {
+        run_git_in(worktree, &["remote", "add", "origin", &bare_s])?;
+    }
     Ok(())
 }
 
