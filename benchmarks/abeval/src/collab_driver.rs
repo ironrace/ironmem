@@ -163,6 +163,9 @@ pub struct WorkerResult {
 /// Result of one spawned Codex turn. `commits_added` is the count of commits the
 /// turn added to the worktree (used for `fix_commits` on rework turns).
 pub struct CodexResult {
+    /// Reserved; real Codex token attribution comes from rollout-log scanning via
+    /// [`CodexAttributor`], not from this field — present so fakes can signal a
+    /// spawn happened without wiring up a full attributor.
     pub usage_hint: Usage,
     pub commits_added: u32,
 }
@@ -305,6 +308,16 @@ pub fn run_collab_task<R: CollabStateReader, S: WorkerSpawner, A: CodexAttributo
     let last_state = last_state.ok_or_else(|| anyhow!("loop never polled a session state"))?;
     let reached_phase = last_state.phase.clone();
     let review_rounds = last_state.global_review_round;
+
+    if !matches!(reached_phase.as_str(), "CodingComplete" | "CodingFailed") {
+        return Err(anyhow!(
+            "collab run for task {} exhausted MAX_TURNS ({}) without reaching a \
+             terminal phase; last phase was {} — INVALID run",
+            ctx.task_id,
+            MAX_TURNS,
+            reached_phase
+        ));
+    }
 
     // (3) Attribute Codex tokens; a completed run with zero Codex is INVALID.
     let codex_usage = attributor.attribute()?;

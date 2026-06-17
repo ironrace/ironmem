@@ -110,8 +110,9 @@ fn full_happy_path_sums_usage_and_counts_rework() {
     assert_eq!(res.fix_commits, 2);            // one codex fix turn × 2 commits
     assert_eq!(*spawner.codex_calls.borrow(), 3); // draft + plan-review + fix
     assert_eq!(res.codex_usage.total(), 1200);
-    // Claude usage = bootstrap + each claude turn (sends + compose/submit pairs).
-    assert!(res.claude_usage.total() > 0);
+    // Claude usage = 1 bootstrap + 11 loop spawns (ClaudeSend×3, ClaudeCompose×3×2,
+    // FinalReviewSynthetic×2) = 12 spawns × 15 tokens each = 180.
+    assert_eq!(res.claude_usage.total(), 180);
     assert_eq!(res.pr_url_synthetic, "local://abeval/task1");
     // The final-review path produced a synthetic submit, never a gh pr create.
     let prompts_seen = spawner.claude_prompts.borrow();
@@ -147,5 +148,21 @@ fn anomaly_phase_owner_combo_errors() {
     };
     let spawner = FakeSpawner { claude_prompts: RefCell::new(vec![]), codex_calls: RefCell::new(0) };
     let attributor = FixedAttributor(Usage { input_tokens: 1, ..Default::default() });
-    assert!(run_collab_task(&ctx(&prompts), &reader, &spawner, &attributor).is_err());
+    let err = run_collab_task(&ctx(&prompts), &reader, &spawner, &attributor).unwrap_err();
+    assert!(err.to_string().to_lowercase().contains("anomaly"), "expected anomaly error: {err}");
+}
+
+#[test]
+fn max_turns_exhaustion_without_terminal_is_invalid() {
+    let prompts = repo_prompts_dir();
+    // Always a Claude-owned send phase; never terminal.
+    let reader = ScriptedReader {
+        states: vec![st("CodeImplementPending", "claude", 0)],
+        idx: RefCell::new(0),
+    };
+    let spawner = FakeSpawner { claude_prompts: RefCell::new(vec![]), codex_calls: RefCell::new(0) };
+    let attributor = FixedAttributor(Usage { input_tokens: 1, ..Default::default() });
+    let err = run_collab_task(&ctx(&prompts), &reader, &spawner, &attributor).unwrap_err();
+    let msg = err.to_string().to_lowercase();
+    assert!(msg.contains("max_turns") || msg.contains("terminal"), "expected exhaustion error: {err}");
 }
