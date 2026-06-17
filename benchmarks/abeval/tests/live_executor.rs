@@ -6,8 +6,8 @@ use std::sync::{Arc, Mutex};
 
 use abeval::arms::Arm;
 use abeval::client::{
-    parse_cli_result, ArmExecutor, ArmOutcome, CommandOutput, CommandRunner, LiveExecutor,
-    ProvisionRequest, Usage, WorkspaceProvisioner,
+    arm_command, parse_cli_result, ArmExecutor, ArmOutcome, CommandOutput, CommandRunner,
+    LiveExecutor, ProvisionRequest, Usage, WorkspaceProvisioner,
 };
 use abeval::corpus::Task;
 
@@ -142,6 +142,49 @@ fn live_executor_superpowers_arm_excludes_collab() {
         "skills-only prefix is applied"
     );
     assert!(args.iter().any(|a| a.contains("PROMPT-BODY")));
+}
+
+/// C1 (METRICS_SPEC §11.2): the superpowers arm must be ENVIRONMENT-isolated
+/// from ironmem, not merely prompted. The spawned `claude` must carry
+/// `--strict-mcp-config` with an empty `--mcp-config` so it loads ZERO MCP
+/// servers and physically cannot reach the ironmem MCP server.
+#[test]
+fn superpowers_arm_is_mcp_isolated_from_ironmem() {
+    let (_program, args) = arm_command(&task(), Arm::Superpowers);
+
+    assert!(
+        args.iter().any(|a| a == "--strict-mcp-config"),
+        "superpowers arm must pass --strict-mcp-config to ignore inherited MCP config"
+    );
+    // --mcp-config must be present and its value must declare no servers.
+    let cfg_idx = args
+        .iter()
+        .position(|a| a == "--mcp-config")
+        .expect("superpowers arm must pass --mcp-config");
+    let cfg_val = args
+        .get(cfg_idx + 1)
+        .expect("--mcp-config must be followed by a config value");
+    let parsed: serde_json::Value =
+        serde_json::from_str(cfg_val).expect("--mcp-config value must be valid JSON");
+    let servers = parsed
+        .get("mcpServers")
+        .and_then(|v| v.as_object())
+        .expect("config must declare an mcpServers object");
+    assert!(
+        servers.is_empty(),
+        "superpowers arm must declare zero MCP servers (got {servers:?})"
+    );
+}
+
+/// The ironmem arm intentionally KEEPS the inherited MCP config (it needs the
+/// ironmem server for /collab + memory tools), so it must NOT be strict-isolated.
+#[test]
+fn ironmem_arm_keeps_inherited_mcp_config() {
+    let (_program, args) = arm_command(&task(), Arm::Ironmem);
+    assert!(
+        !args.iter().any(|a| a == "--strict-mcp-config"),
+        "ironmem arm must inherit the real MCP config (no --strict-mcp-config)"
+    );
 }
 
 /// A non-zero exit OR an is_error envelope yields a "failed" outcome (never a

@@ -167,6 +167,42 @@ pub fn validate_corpus(tasks: &[Task]) -> Result<()> {
     Ok(())
 }
 
+/// Split the corpus into contiguous batches of `batch_size` and return the
+/// `batch_index`-th batch (0-based) as owned tasks.
+///
+/// Used to pace heavy live runs N tasks at a time (e.g. 2) instead of executing
+/// the whole corpus — and thus the whole Max-plan quota — in a single sitting.
+/// Batches are over the corpus's frozen file order, so the split is
+/// deterministic and resumable: run index 0, then 1, etc., into the same `--out`
+/// tree, then aggregate with [`crate::report::load_metrics_dir`].
+///
+/// The final batch may be shorter than `batch_size`. Errors loudly on a zero
+/// `batch_size` or an out-of-range `batch_index` (stating how many batches
+/// exist) so a typo runs nothing visibly rather than silently.
+pub fn select_batch(tasks: &[Task], batch_size: usize, batch_index: usize) -> Result<Vec<Task>> {
+    if batch_size == 0 {
+        bail!("batch-size must be >= 1");
+    }
+    if tasks.is_empty() {
+        bail!("corpus is empty; nothing to batch");
+    }
+    let num_batches = tasks.len().div_ceil(batch_size);
+    if batch_index >= num_batches {
+        // `num_batches >= 1` here (corpus is non-empty), so the inclusive upper
+        // index is well-defined. Inclusive `0..=last` wording avoids the
+        // exclusive-range ambiguity of `0..N` for an operator-facing message.
+        let last = num_batches - 1;
+        bail!(
+            "batch index {batch_index} out of range: corpus of {} tasks splits into \
+             {num_batches} batch(es) of size {batch_size} (valid indices 0..={last})",
+            tasks.len()
+        );
+    }
+    let start = batch_index * batch_size;
+    let end = (start + batch_size).min(tasks.len());
+    Ok(tasks[start..end].to_vec())
+}
+
 /// Basename-safe id check: ASCII letters, digits, `-`, or `_` only.
 /// Used both at corpus validation and as a defense-in-depth guard before any
 /// id is interpolated into an on-disk output path (prevents `..`/separator

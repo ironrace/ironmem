@@ -1,4 +1,7 @@
-use abeval::report::{load_metrics, metrics_from_run_dir, render_report, MetricsInput, TaskMetric};
+use abeval::report::{
+    load_metrics, load_metrics_dir, metrics_from_run_dir, render_report, write_live_metrics,
+    MetricsInput, TaskMetric,
+};
 
 fn fixture(name: &str) -> std::path::PathBuf {
     std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -350,5 +353,157 @@ fn delta_requires_live_evidence_even_with_enough_tasks() {
     assert!(
         !out.contains("DELTA"),
         "smoke evidence never yields a headline"
+    );
+}
+
+// --- batch aggregation: load_metrics_dir unions per-task live_metrics.json ---
+
+/// Write a per-task `<dir>/<task_id>/live_metrics.json` like the live runner.
+fn write_task_metrics(dir: &std::path::Path, task_id: &str, rows: &[TaskMetric]) {
+    let task_dir = dir.join(task_id);
+    std::fs::create_dir_all(&task_dir).unwrap();
+    write_live_metrics(task_dir.join("live_metrics.json"), rows).unwrap();
+}
+
+#[test]
+fn load_metrics_dir_unions_per_task_files_into_headline_delta() {
+    let tmp = tempfile::tempdir().unwrap();
+    // Eight tasks, run "2 at a time" — each writes its own per-task file.
+    for i in 0..8 {
+        let task_id = format!("abeval-{i:02}");
+        let ir = TaskMetric {
+            task_key: format!("ironmem:{task_id}"),
+            ..merged("ironmem", 100 + i)
+        };
+        let sp = TaskMetric {
+            task_key: format!("superpowers:{task_id}"),
+            ..merged("superpowers", 200 + i)
+        };
+        write_task_metrics(tmp.path(), &task_id, &[ir, sp]);
+    }
+
+    let input = load_metrics_dir(tmp.path()).unwrap();
+    assert_eq!(input.evidence_class, "live");
+    assert_eq!(input.tasks.len(), 16, "8 tasks x 2 arms unioned");
+
+    let out = render_report(&input);
+    assert!(
+        out.contains("DELTA"),
+        "8 merged+green per arm clears the gate"
+    );
+}
+
+#[test]
+fn load_metrics_dir_rejects_smoke_evidence() {
+    let tmp = tempfile::tempdir().unwrap();
+    let task_dir = tmp.path().join("abeval-00");
+    std::fs::create_dir_all(&task_dir).unwrap();
+    // A smoke file must never silently dilute a live aggregate.
+    let smoke = MetricsInput {
+        evidence_class: "smoke".to_string(),
+        tasks: vec![merged("ironmem", 100)],
+    };
+    std::fs::write(
+        task_dir.join("live_metrics.json"),
+        serde_json::to_string(&smoke).unwrap(),
+    )
+    .unwrap();
+
+    let err = load_metrics_dir(tmp.path()).unwrap_err().to_string();
+    assert!(err.contains("live"), "got: {err}");
+}
+
+#[test]
+fn load_metrics_dir_errors_on_empty_tree() {
+    let tmp = tempfile::tempdir().unwrap();
+    assert!(load_metrics_dir(tmp.path()).is_err());
+}
+
+#[test]
+fn load_metrics_dir_rejects_mixed_live_and_smoke() {
+    let tmp = tempfile::tempdir().unwrap();
+    // One valid live task plus one smoke task: the smoke file must poison the
+    // whole aggregate rather than being silently dropped from an otherwise-good
+    // batch.
+    write_task_metrics(
+        tmp.path(),
+        "abeval-00",
+        &[TaskMetric {
+            task_key: "ironmem:abeval-00".to_string(),
+            ..merged("ironmem", 100)
+        }],
+    );
+    let smoke_dir = tmp.path().join("abeval-01");
+    std::fs::create_dir_all(&smoke_dir).unwrap();
+    let smoke = MetricsInput {
+        evidence_class: "smoke".to_string(),
+        tasks: vec![merged("superpowers", 200)],
+    };
+    std::fs::write(
+        smoke_dir.join("live_metrics.json"),
+        serde_json::to_string(&smoke).unwrap(),
+    )
+    .unwrap();
+
+    let err = load_metrics_dir(tmp.path()).unwrap_err().to_string();
+    assert!(err.contains("live"), "got: {err}");
+}
+
+#[test]
+fn load_metrics_dir_propagates_a_corrupt_file() {
+    let tmp = tempfile::tempdir().unwrap();
+    let task_dir = tmp.path().join("abeval-00");
+    std::fs::create_dir_all(&task_dir).unwrap();
+    // A malformed metrics file must surface a loud parse error naming the file,
+    // never be silently skipped (which would under-count n).
+    std::fs::write(task_dir.join("live_metrics.json"), "{ not valid json").unwrap();
+
+    let err = load_metrics_dir(tmp.path()).unwrap_err().to_string();
+    assert!(
+        err.contains("abeval-00") || err.to_lowercase().contains("pars"),
+        "corrupt file must propagate a contextual error, got: {err}"
+    );
+}
+
+#[test]
+fn load_metrics_dir_skips_fileless_subdirs_and_stray_files() {
+    let tmp = tempfile::tempdir().unwrap();
+    // A real per-task result...
+    write_task_metrics(
+        tmp.path(),
+        "abeval-00",
+        &[
+            TaskMetric {
+                task_key: "ironmem:abeval-00".to_string(),
+                ..merged("ironmem", 100)
+            },
+            TaskMetric {
+                task_key: "superpowers:abeval-00".to_string(),
+                ..merged("superpowers", 200)
+            },
+        ],
+    );
+    // ...plus the sibling `workspaces/` dir the live runner writes (no metrics
+    // file) and a stray top-level file. Both must be tolerated, not errors.
+    std::fs::create_dir_all(tmp.path().join("workspaces").join("abeval-00")).unwrap();
+    std::fs::write(tmp.path().join("run.log"), "noise").unwrap();
+
+    let input = load_metrics_dir(tmp.path()).unwrap();
+    assert_eq!(
+        input.tasks.len(),
+        2,
+        "only the real task dir contributes rows"
+    );
+}
+
+#[test]
+fn load_metrics_dir_empty_error_reports_subdirs_scanned() {
+    let tmp = tempfile::tempdir().unwrap();
+    // A subdir present but with no live_metrics.json (e.g. only workspaces/).
+    std::fs::create_dir_all(tmp.path().join("workspaces")).unwrap();
+    let err = load_metrics_dir(tmp.path()).unwrap_err().to_string();
+    assert!(
+        err.contains("scanned"),
+        "empty error should distinguish dirs-present from no-dirs: {err}"
     );
 }

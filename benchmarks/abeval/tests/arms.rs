@@ -87,6 +87,11 @@ fn superpowers_arm_exact_argv() {
             "json".to_string(),
             "--permission-mode".to_string(),
             "bypassPermissions".to_string(),
+            // C1 (§11.2) env isolation: zero MCP servers, before `-p` so the
+            // prompt stays the print-mode positional.
+            "--strict-mcp-config".to_string(),
+            "--mcp-config".to_string(),
+            r#"{"mcpServers":{}}"#.to_string(),
             "-p".to_string(),
             "Run this task with superpowers skills only. Do not use /collab, ironmem MCP tools, semantic search, KG reads/writes, drawer reads/writes, or any ironmem server-side memory state in the working context. Passive measurement-only task tagging must stay outside the task-solving path.\n\nTask:\nsolve X".to_string(),
         ]

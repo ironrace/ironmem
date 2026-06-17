@@ -64,6 +64,19 @@ cargo run --manifest-path benchmarks/abeval/Cargo.toml -- run \
 # run-level fallback for unpinned hand-built tasks only; it cannot override a
 # committed corpus pin.
 
+# Batched runs — pace a heavy live campaign N tasks at a time (default 2)
+# instead of executing the whole corpus (and the whole Max-plan quota) at once.
+# --batch <index> selects a contiguous chunk of the FROZEN corpus order into a
+# SHARED --out tree; run the indices in turn (0, 1, 2, ...). Mutually exclusive
+# with --task. An out-of-range index errors with the batch count.
+cargo run --manifest-path benchmarks/abeval/Cargo.toml -- run \
+  --batch 0 --batch-size 2 --arms both --dry-run --out /tmp/abeval-campaign
+cargo run --manifest-path benchmarks/abeval/Cargo.toml -- run \
+  --batch 1 --batch-size 2 --arms both --dry-run --out /tmp/abeval-campaign
+# ... up to the last batch: 8 tasks / 2 = 4 batches, valid indices 0–3.
+# A failing task does not strand the batch — every task is attempted, a
+# per-task ledger is printed, and the process exits non-zero if any failed.
+
 # Summarize the run and enforce the §11.3 headline gate.
 # Exactly one of --run / --metrics is required (they are mutually exclusive):
 #   --run <dir>      a smoke run directory produced by `run` above.
@@ -71,7 +84,20 @@ cargo run --manifest-path benchmarks/abeval/Cargo.toml -- run \
 #                    evidence, since a run dir is always smoke in this PR.
 cargo run --manifest-path benchmarks/abeval/Cargo.toml -- report --run /tmp/abeval-run
 cargo run --manifest-path benchmarks/abeval/Cargo.toml -- report --metrics benchmarks/abeval/fixtures/live_8_per_arm.json
+
+# Aggregate a batched campaign: union every per-task live_metrics.json under the
+# shared --out tree into one live report and enforce the §11.3 headline gate.
+# --metrics-dir is mutually exclusive with --run / --metrics. It errors if the
+# tree holds no live_metrics.json, or if any file is not evidence_class:"live"
+# (a smoke file can never silently dilute live evidence).
+cargo run --manifest-path benchmarks/abeval/Cargo.toml -- report --metrics-dir /tmp/abeval-campaign
 ```
+
+`report` accepts exactly one of `--run <dir>`, `--metrics <file>`, or
+`--metrics-dir <tree>`. The headline gate is unchanged: it still needs ≥8
+merged+CI-green tasks per arm of live evidence, and it already ignores duplicate
+`task_key` rows — so re-running a task (which overwrites its per-task file)
+cannot inflate `n`.
 
 ---
 
@@ -131,7 +157,9 @@ pinned `base_commit`, provisions a detached git worktree at
 non-empty workspaces, and then spawns the per-arm `claude` command in that populated
 workspace. Both arms use `--output-format json --permission-mode bypassPermissions -p`;
 the ironmem arm carries `/collab start <prompt>` inside the single print-mode prompt
-argument. The runner parses the CLI usage envelope, runs the task's frozen `gates` in
+argument, while the superpowers arm additionally carries `--strict-mcp-config --mcp-config
+'{"mcpServers":{}}'` for C1 MCP isolation (see below). The runner parses the CLI usage
+envelope, runs the task's frozen `gates` in
 that workspace, and writes a normalized `evidence_class:"live"` metrics file to
 `<out>/<task_id>/live_metrics.json` — consumable by `report --metrics`. A row is counted
 `merged`+`ci_green` only when the agent completed **and** the gates pass (the §12
@@ -152,12 +180,18 @@ The `superpowers` arm working context must be isolated from ironmem server-side 
 
 The `LiveExecutor` command template includes these prohibitions in the task prompt.
 **The prompt prefix is NOT the enforcement boundary** — a model can ignore an instruction.
-Any future live runner MUST enforce C1 by *environment isolation*: launch the `superpowers`
-arm in a harness configuration that physically omits the ironmem MCP server and starts from
-clean state (no ironmem state dir), so the arm cannot reach ironmem even if it tried. The
-prompt prefix is belt-and-suspenders only. Task_tag or reporting instrumentation (needed to
+C1 is therefore enforced by *environment isolation*: the `superpowers` arm command carries
+`--strict-mcp-config` together with an empty `--mcp-config` (`{"mcpServers":{}}`), so the
+spawned CLI loads **zero** MCP servers and physically cannot reach the ironmem MCP server
+even if it tried (see `superpowers_mcp_isolation_args` in `src/client.rs`). The prompt
+prefix is belt-and-suspenders only. Task_tag or reporting instrumentation (needed to
 attribute token rows in the ironmem DB) is **measurement-only** and kept strictly separate
 from the arm's working context.
+
+> Scope note: this isolates the *MCP surface* (ironmem search/KG/drawers), which is the C1
+> server-side-state boundary §11.2 names. A future hardening could additionally start the arm
+> from a clean ironmem state dir; the MCP-config isolation already removes the reachable tool
+> surface that would let the arm read or write ironmem state.
 
 This separation is required by METRICS_SPEC §11.2 and the C1 clarification from the
 Codex review of the canonical plan.

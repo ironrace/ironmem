@@ -136,6 +136,22 @@ fn headless_permission_args() -> Vec<String> {
     ]
 }
 
+/// C1 (METRICS_SPEC §11.2) environment isolation for the `superpowers` arm.
+///
+/// `--strict-mcp-config` makes the CLI ignore every inherited MCP configuration
+/// and use ONLY servers from the accompanying `--mcp-config`; that config
+/// declares zero servers. The result is that the arm physically cannot reach the
+/// ironmem MCP server (search/KG/drawers) no matter what the prompt does — the
+/// prompt prefix is belt-and-suspenders only. Single source of truth so a CLI
+/// flag change is a one-line edit, mirroring [`headless_permission_args`].
+fn superpowers_mcp_isolation_args() -> Vec<String> {
+    vec![
+        "--strict-mcp-config".to_string(),
+        "--mcp-config".to_string(),
+        r#"{"mcpServers":{}}"#.to_string(),
+    ]
+}
+
 /// Build the command for an arm. Returns the program and args that are spawned
 /// by a [`CommandRunner`].
 ///
@@ -144,14 +160,25 @@ fn headless_permission_args() -> Vec<String> {
 ///   and JSON-emitting).
 /// - `superpowers` arm: runs the task prompt with superpowers skills ONLY
 ///   (C1: NO `/collab`, NO semantic search/KG/drawer writes, NO ironmem
-///   server-side state in the working context). Any task_tag/reporting
-///   instrumentation is measurement-only and kept out of the working path.
+///   server-side state in the working context). This arm is ENVIRONMENT-isolated
+///   via [`superpowers_mcp_isolation_args`] (`--strict-mcp-config` + empty
+///   `--mcp-config`), so it cannot reach the ironmem MCP server even if the model
+///   ignores the prompt prefix. Any task_tag/reporting instrumentation is
+///   measurement-only and kept out of the working path.
 ///
 /// Both arms request `--output-format json` AND `-p` (print mode, required for
-/// `--output-format` to take effect) AND headless permission tokens.
+/// `--output-format` to take effect) AND headless permission tokens. The
+/// isolation flags precede `-p` so the prompt remains the print-mode positional.
 pub fn arm_command(task: &Task, arm: Arm) -> (String, Vec<String>) {
     let mut argv = vec!["--output-format".to_string(), "json".to_string()];
     argv.extend(headless_permission_args());
+    // C1 (§11.2): the superpowers arm loads ZERO MCP servers so it physically
+    // cannot reach ironmem; the ironmem arm keeps the inherited config because it
+    // needs that server for /collab + memory tools. Added before `-p` so the
+    // prompt stays the print-mode positional argument.
+    if matches!(arm, Arm::Superpowers) {
+        argv.extend(superpowers_mcp_isolation_args());
+    }
     argv.push("-p".to_string());
     match arm {
         Arm::Ironmem => {
