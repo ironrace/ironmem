@@ -71,6 +71,10 @@ fn codex_config_pins_ironmem_mcp_and_avoids_unparseable_app_keys() {
     assert!(!toml.contains("relative-agent-paths"));
     // The ironmem MCP must be configured so Codex actually has the collab tools,
     // pinned to THIS task's DB in trusted (write-enabled) mode.
+    // The model must be one the ChatGPT/subscription account supports; gpt-5-codex
+    // / gpt-5 return HTTP 400 and no-op the turn.
+    assert!(toml.contains(r#"model = "gpt-5.5""#));
+    assert!(!toml.contains("gpt-5-codex"));
     assert!(toml.contains("[mcp_servers.ironmem]"));
     assert!(toml.contains(r#"command = "ironmem""#));
     assert!(toml.contains(r#"IRONMEM_DB_PATH = "/out/t1/collab.db""#));

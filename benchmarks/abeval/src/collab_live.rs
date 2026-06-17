@@ -95,8 +95,12 @@ pub fn codex_config(db_path: &Path) -> String {
         .to_string()
         .replace('\\', "\\\\")
         .replace('"', "\\\"");
+    // `gpt-5.5` is the model the user's ChatGPT/subscription Codex account
+    // supports (and what their real ~/.codex/config.toml uses). `gpt-5-codex` /
+    // `gpt-5` return HTTP 400 "not supported when using Codex with a ChatGPT
+    // account", which makes every Codex turn a ~2s null no-op.
     format!(
-        "model = \"gpt-5-codex\"\n\
+        "model = \"gpt-5.5\"\n\
          model_reasoning_effort = \"xhigh\"\n\
          \n\
          [mcp_servers.ironmem]\n\
