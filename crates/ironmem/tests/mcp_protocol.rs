@@ -406,7 +406,7 @@ fn collab_send_allows_either_agent_during_parallel_drafts() {
 }
 
 #[test]
-fn collab_request_changes_loops_back_to_synthesis_and_locks_after_revision() {
+fn collab_request_changes_advances_to_finalize_and_locks() {
     let app = App::open_for_test().unwrap();
 
     let started = call_tool(
@@ -466,8 +466,10 @@ fn collab_request_changes_loops_back_to_synthesis_and_locks_after_revision() {
         .unwrap_or("")
         .contains("content_hash does not match canonical_plan_hash"));
 
-    // Codex requests changes → revision round 1; phase returns to synthesis so
-    // Claude can revise the canonical plan.
+    // One-pass review (MAX_REVIEW_ROUNDS = 1): Codex requests changes, which no
+    // longer returns to synthesis — it advances directly to
+    // PlanClaudeFinalizePending so Claude can fold the requested changes into the
+    // final plan and lock. review_round bumps to its single-pass cap of 1.
     call_tool(
         &app,
         "collab_send",
@@ -479,32 +481,12 @@ fn collab_request_changes_loops_back_to_synthesis_and_locks_after_revision() {
         }),
     );
     let status_after_rc = call_tool(&app, "collab_status", json!({ "session_id": session_id }));
-    assert_eq!(status_after_rc["phase"], "PlanSynthesisPending");
+    assert_eq!(status_after_rc["phase"], "PlanClaudeFinalizePending");
     assert_eq!(status_after_rc["current_owner"], "claude");
     assert_eq!(status_after_rc["review_round"], 1);
 
-    // Claude publishes a revised canonical; Codex now approves. After approval
-    // Claude publishes the final plan and the session locks.
-    call_tool(
-        &app,
-        "collab_send",
-        json!({
-            "session_id": session_id,
-            "sender": "claude",
-            "topic": "canonical",
-            "content": "Merged canonical v2"
-        }),
-    );
-    call_tool(
-        &app,
-        "collab_send",
-        json!({
-            "session_id": session_id,
-            "sender": "codex",
-            "topic": "review",
-            "content": json!({ "verdict": "approve" }).to_string()
-        }),
-    );
+    // Claude folds Codex's requested changes into the final plan (distinct from
+    // the canonical body) and publishes it; the session locks.
     call_tool(
         &app,
         "collab_send",
@@ -512,30 +494,23 @@ fn collab_request_changes_loops_back_to_synthesis_and_locks_after_revision() {
             "session_id": session_id,
             "sender": "claude",
             "topic": "final",
-            "content": json!({ "plan": "Merged canonical v2" }).to_string()
+            "content": json!({ "plan": "Final plan: canonical v1 + Codex's changes" }).to_string()
         }),
     );
     let status = call_tool(&app, "collab_status", json!({ "session_id": session_id }));
     assert_eq!(status["phase"], "PlanLocked");
-    assert_eq!(status["final_plan_hash"], status["canonical_plan_hash"]);
+    // The final plan differs from the single canonical body, so their hashes and
+    // drawer refs must differ (no second canonical round re-stamped them equal).
+    assert_ne!(status["final_plan_hash"], status["canonical_plan_hash"]);
     // Plan-by-reference (#90): by default collab_status now returns only the
     // compact references, so the full bodies are absent.
     assert!(status.get("canonical_plan").is_none());
     assert!(status.get("final_plan").is_none());
-    assert_eq!(
-        status["canonical_plan_ref"]["drawer_id"]
-            .as_str()
-            .unwrap()
-            .len(),
-        32
-    );
-    assert_eq!(
-        status["final_plan_ref"]["drawer_id"]
-            .as_str()
-            .unwrap()
-            .len(),
-        32
-    );
+    let canonical_ref = status["canonical_plan_ref"]["drawer_id"].as_str().unwrap();
+    let final_ref = status["final_plan_ref"]["drawer_id"].as_str().unwrap();
+    assert_eq!(canonical_ref.len(), 32);
+    assert_eq!(final_ref.len(), 32);
+    assert_ne!(canonical_ref, final_ref);
     // A fresh agent joining at PlanLocked must still be able to pull the full
     // plan text back without recv'ing its own previously-sent (and peer-acked)
     // outbound message — now via verbose:true. The final body is the PARSED
@@ -546,8 +521,11 @@ fn collab_request_changes_loops_back_to_synthesis_and_locks_after_revision() {
         "collab_status",
         json!({ "session_id": session_id, "verbose": true }),
     );
-    assert_eq!(verbose["canonical_plan"], "Merged canonical v2");
-    assert_eq!(verbose["final_plan"], "Merged canonical v2");
+    assert_eq!(verbose["canonical_plan"], "Merged canonical v1");
+    assert_eq!(
+        verbose["final_plan"],
+        "Final plan: canonical v1 + Codex's changes"
+    );
 }
 
 #[test]
@@ -585,7 +563,7 @@ fn collab_status_omits_plan_text_before_plan_is_sent() {
 }
 
 #[test]
-fn collab_two_rounds_of_request_changes_force_finalize() {
+fn collab_single_review_caps_round_and_rejects_canonical_resend() {
     let app = App::open_for_test().unwrap();
 
     let started = call_tool(
@@ -613,7 +591,9 @@ fn collab_two_rounds_of_request_changes_force_finalize() {
         );
     }
 
-    // Round 1: canonical → request_changes (back to synthesis).
+    // Canonical v1, then the single allowed review. One-pass review
+    // (MAX_REVIEW_ROUNDS = 1): request_changes caps review_round at 1 and
+    // advances to PlanClaudeFinalizePending — there is no second review round.
     call_tool(
         &app,
         "collab_send",
@@ -635,9 +615,13 @@ fn collab_two_rounds_of_request_changes_force_finalize() {
         }),
     );
 
-    // Round 2: canonical → request_changes again. Revision cap hit, so we
-    // must advance to PlanClaudeFinalizePending (Claude gets the last word).
-    call_tool(
+    let status = call_tool(&app, "collab_status", json!({ "session_id": session_id }));
+    assert_eq!(status["phase"], "PlanClaudeFinalizePending");
+    assert_eq!(status["review_round"], 1);
+
+    // Planning never loops back to synthesis, so a second canonical is rejected:
+    // the phase now expects `final`, not another canonical round.
+    let resend_err = call_tool_expect_error(
         &app,
         "collab_send",
         json!({
@@ -647,22 +631,13 @@ fn collab_two_rounds_of_request_changes_force_finalize() {
             "content": "v2"
         }),
     );
-    call_tool(
-        &app,
-        "collab_send",
-        json!({
-            "session_id": session_id,
-            "sender": "codex",
-            "topic": "review",
-            "content": json!({ "verdict": "request_changes" }).to_string()
-        }),
+    assert!(
+        resend_err.contains("PublishFinal"),
+        "canonical re-send must be rejected with a finalize-phase mismatch, got: {resend_err}"
     );
 
-    let status = call_tool(&app, "collab_status", json!({ "session_id": session_id }));
-    assert_eq!(status["phase"], "PlanClaudeFinalizePending");
-    assert_eq!(status["review_round"], 2);
-
-    // Claude publishes final despite Codex's objection; session locks.
+    // Claude publishes final despite Codex's objection; the round stays capped at
+    // 1 and the session locks.
     call_tool(
         &app,
         "collab_send",
@@ -675,6 +650,7 @@ fn collab_two_rounds_of_request_changes_force_finalize() {
     );
     let status = call_tool(&app, "collab_status", json!({ "session_id": session_id }));
     assert_eq!(status["phase"], "PlanLocked");
+    assert_eq!(status["review_round"], 1);
 }
 
 #[test]
