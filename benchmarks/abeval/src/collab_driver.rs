@@ -156,12 +156,15 @@ pub fn render_worker_prompt(
 const MAX_TURNS: usize = 60;
 
 /// Consecutive worker turns dispatched against an unchanged `(phase, owner,
-/// global_review_round)` before the run is declared stalled. A productive turn
-/// always changes at least one of those (owner flip within a phase, phase
-/// advance, or review-round bump), so repeats mean the turn returns without
-/// advancing the session — a hung/looping turn or a submit that never lands.
-/// Bailing here bounds wasted work to ~`STUCK_LIMIT` turns instead of grinding
-/// the full `MAX_TURNS`.
+/// plan_round, global_round)` key before the run is declared stalled. Most
+/// productive turns flip at least one component (owner flip within a phase, phase
+/// advance, or review-round bump). The key deliberately omits `fix_commits`, so a
+/// commit-only Codex rework turn within `CodeReviewFixGlobalPending` can make
+/// progress without moving it — which is why `STUCK_LIMIT > 1`, giving such a turn
+/// room to then flip the owner/phase. A key that repeats `STUCK_LIMIT` times means
+/// the session is genuinely wedged (hung/looping turn or a submit that never
+/// lands), not merely mid-rework. Bailing here bounds wasted work to ~`STUCK_LIMIT`
+/// turns instead of grinding the full `MAX_TURNS`.
 const STUCK_LIMIT: usize = 2;
 
 /// Driver-owned synthetic final-review submit (replaces `gh pr create`): the
@@ -549,6 +552,82 @@ mod tests {
             task_review_round: 0,
             last_head_sha: None,
         }
+    }
+
+    /// Reader that returns a fixed sequence of states (one per `read` call),
+    /// repeating the last once exhausted. Lets a test drive the dispatcher through
+    /// an exact phase trajectory to pin the stall-count reset boundary.
+    struct SequenceReader {
+        states: Vec<SessionState>,
+        idx: std::cell::Cell<usize>,
+    }
+    impl CollabStateReader for SequenceReader {
+        fn read(&self, _session_id: &str) -> Result<SessionState> {
+            let i = self.idx.get();
+            self.idx.set(i + 1);
+            let last = self.states.len() - 1;
+            Ok(self.states[i.min(last)].clone())
+        }
+        fn newest_draft_drawer(&self, _after_rowid: i64) -> Result<Option<(String, i64)>> {
+            Ok(None)
+        }
+    }
+
+    /// Spawner whose bootstrap emits the session sentinel AND non-zero usage (so a
+    /// run that reaches `CodingComplete` isn't rejected as zero-Claude). Codex turns
+    /// add no commits.
+    struct UsageSpawner;
+    impl WorkerSpawner for UsageSpawner {
+        fn spawn_claude(&self, _prompt: &str, _worktree: &Path) -> Result<WorkerResult> {
+            Ok(WorkerResult {
+                usage: Usage {
+                    output_tokens: 10,
+                    ..Usage::default()
+                },
+                stdout: "ABEVAL_SESSION_ID=s-seq\n".to_string(),
+            })
+        }
+        fn spawn_codex(&self, _session_id: &str, _worktree: &Path) -> Result<CodexResult> {
+            Ok(CodexResult { commits_added: 0 })
+        }
+    }
+
+    /// Attributor that yields non-zero Codex usage so a completed run passes the
+    /// zero-Codex INVALID guard.
+    struct NonZeroAttributor;
+    impl CodexAttributor for NonZeroAttributor {
+        fn attribute(&self) -> Result<Usage> {
+            Ok(Usage {
+                output_tokens: 5,
+                ..Usage::default()
+            })
+        }
+    }
+
+    #[test]
+    fn stall_count_resets_when_key_advances_then_repeats() {
+        // Trajectory [A, A, B, terminal]: the key A repeats exactly once (one short
+        // of STUCK_LIMIT), then B advances the key — which must RESET the counter,
+        // not accumulate toward a false stall bail. The run then reaches a terminal
+        // phase and succeeds. A naive non-resetting counter would have bailed at B.
+        let a = pinned_state("CodeReviewFixGlobalPending", "codex");
+        let mut b = pinned_state("CodeReviewFixGlobalPending", "codex");
+        b.global_review_round = 1; // distinct key component → counter must reset
+        let terminal = pinned_state(PHASE_CODING_COMPLETE, "claude");
+        let reader = SequenceReader {
+            states: vec![a.clone(), a, b, terminal],
+            idx: std::cell::Cell::new(0),
+        };
+        let ctx = CollabTaskCtx {
+            task_id: "abeval-seq".into(),
+            worktree: PathBuf::from("/tmp/nonexistent-wt"),
+            branch: "abeval/seq".into(),
+            prompts_dir: PathBuf::from("/tmp/nonexistent-prompts"),
+            bootstrap_prompt: "boot".into(),
+        };
+        let res = run_collab_task(&ctx, &reader, &UsageSpawner, &NonZeroAttributor)
+            .expect("key advance must reset the stall counter, not bail");
+        assert_eq!(res.reached_phase, PHASE_CODING_COMPLETE);
     }
 
     #[test]

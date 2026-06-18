@@ -101,6 +101,10 @@ pub fn apply_event(
                 return Err(CollabError::InvalidVerdictValue(verdict.clone()));
             }
             next.codex_review_verdict = Some(verdict.clone());
+            // The `.min(MAX_REVIEW_ROUNDS)` clamp is defensive-only today: with a
+            // single one-pass review the phase never re-enters synthesis, so a
+            // second `SubmitReview` can't fire and the bump can't exceed the cap. It
+            // becomes load-bearing the moment a synthesis loop is re-added — keep it.
             next.review_round = session
                 .review_round
                 .saturating_add(1)
