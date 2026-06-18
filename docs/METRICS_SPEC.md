@@ -706,3 +706,12 @@ these record how the arm is executed and measured.
    session's `global_review_round`; `fix_commits` is the count of commits Codex
    adds to the worktree during `CodeReviewFixGlobalPending` turns. Both are now
    measured (superseding the #122 placeholder zeros for the ironmem arm).
+
+### 2026-06-18 — collab planning shortcut for A/B runs (clarifies §11.2)
+
+The collab arm now uses the production shortcut planning flow in benchmark
+runs: two parallel planning drafts, Claude canonical synthesis, exactly one
+Codex plan-review turn, and a single human gate on Claude's final Superpowers
+task plan. The `PlanLocked` bridge mechanically parses that approved markdown
+into `task_list` and rejects tasks timeboxed above 20 minutes. Phase bucket names
+and the `task_list` planning attribution bucket remain unchanged.

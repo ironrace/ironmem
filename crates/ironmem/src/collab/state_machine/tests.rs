@@ -193,13 +193,11 @@ fn test_codex_review_approve_advances_to_finalize() {
 }
 
 #[test]
-fn test_request_changes_at_cap_forces_finalize() {
+fn test_request_changes_after_one_review_advances_to_finalize() {
     let s = session();
     let s = draft(Agent::Claude, "c1", &s);
     let s = draft(Agent::Codex, "c2", &s);
     let s = canonical("v1", &s);
-    let s = review("request_changes", &s);
-    let s = canonical("v2", &s);
     let s = review("request_changes", &s);
 
     assert_eq!(s.review_round, MAX_REVIEW_ROUNDS);
@@ -580,25 +578,16 @@ fn test_v3_phase_sequence_is_global_then_local() {
 }
 
 #[test]
-fn test_v1_force_finalize_still_works_at_max_rounds() {
-    // Regression: the v1 force-finalize cap at MAX_REVIEW_ROUNDS must
-    // remain intact after the v3 reorder. The substantive assertion is
-    // already covered by `test_request_changes_at_cap_forces_finalize`
-    // above (state_machine/tests.rs:194-205): two `request_changes`
-    // rounds force the phase to PlanClaudeFinalizePending and pin
-    // `review_round == MAX_REVIEW_ROUNDS`. This pointer test makes the
-    // regression contract explicit so a future v3 rewire cannot silently
-    // bypass the cap.
+fn test_v1_one_pass_review_cap_survives_v3_reorder() {
+    // Regression: v1 planning must stay one-pass even after v3 rewires.
+    // Codex can request changes, but that request moves directly to
+    // Claude's final execution-plan step rather than back to synthesis.
     let s = session();
     let s = draft(Agent::Claude, "c1", &s);
     let s = draft(Agent::Codex, "c2", &s);
     let s = canonical("v1", &s);
     let s = review("request_changes", &s);
-    assert_eq!(s.phase, Phase::PlanSynthesisPending);
-    let s = canonical("v2", &s);
-    let s = review("request_changes", &s);
 
-    // Force-finalize trips here (review_round == MAX_REVIEW_ROUNDS).
     assert_eq!(s.phase, Phase::PlanClaudeFinalizePending);
     assert_eq!(s.review_round, MAX_REVIEW_ROUNDS);
 }

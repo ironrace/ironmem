@@ -33,6 +33,7 @@ fn st(phase: &str, owner: &str, grr: u32) -> SessionState {
         current_owner: owner.into(),
         implementer: "claude".into(),
         pr_url: None,
+        review_round: 0,
         global_review_round: grr,
         task_review_round: 0,
         last_head_sha: Some("h".into()),
@@ -49,10 +50,9 @@ impl WorkerSpawner for FakeSpawner {
         self.claude_prompts.borrow_mut().push(prompt.to_string());
         let stdout = if prompt.contains("ABEVAL_BOOTSTRAP") {
             "ABEVAL_SESSION_ID=sess-xyz\n".to_string()
-        } else if prompt.contains("fidelity") {
-            // task_list bridge verdict shape (compose): `<path> hash:<h>` + fidelity.
-            "result: plan composed (tasks:2 headings:2 fidelity:pass)\n\
-             ref: docs/superpowers/plans/x.md hash:abc123\nblocker: none\n"
+        } else if prompt.contains("submit task_list from approved final plan") {
+            "result: task_list sent (2 tasks)\n\
+             ref: docs/superpowers/plans/x.md\nblocker: none\n"
                 .to_string()
         } else {
             "result: ok\nref: drawer-1\nblocker: none\n".to_string()
@@ -138,9 +138,10 @@ fn full_happy_path_sums_usage_and_counts_rework() {
     assert_eq!(res.fix_commits, 2); // one codex fix turn × 2 commits
     assert_eq!(*spawner.codex_calls.borrow(), 3); // draft + plan-review + fix
     assert_eq!(res.codex_usage.total(), 1200);
-    // Claude usage = 1 bootstrap + 11 loop spawns (ClaudeSend×3, ClaudeCompose×2×2,
-    // TaskListBridge×2, FinalReviewSynthetic×2) = 12 spawns × 15 tokens each = 180.
-    assert_eq!(res.claude_usage.total(), 180);
+    // Claude usage = 1 bootstrap + 9 loop spawns (ClaudeSend×4,
+    // ClaudeCompose×1×2, TaskListBridge×1, FinalReviewSynthetic×2)
+    // = 10 spawns × 15 tokens each = 150.
+    assert_eq!(res.claude_usage.total(), 150);
     assert_eq!(res.pr_url_synthetic, "local://abeval/task1");
     // The final-review path produced a synthetic submit, never a gh pr create.
     let prompts_seen = spawner.claude_prompts.borrow();
@@ -196,14 +197,42 @@ fn anomaly_phase_owner_combo_errors() {
     );
 }
 
+/// Reader that cycles its scripted states modulo their length (never clamps), so
+/// the `(phase, owner, round)` key changes every poll. This drives a session that
+/// progresses *between* states yet never reaches a terminal phase — the only
+/// scenario that still exhausts `MAX_TURNS` now that an unchanging state bails
+/// early via the stall guard.
+struct CyclingReader {
+    states: Vec<SessionState>,
+    idx: RefCell<usize>,
+}
+impl CollabStateReader for CyclingReader {
+    fn read(&self, _session_id: &str) -> anyhow::Result<SessionState> {
+        let mut i = self.idx.borrow_mut();
+        let s = self.states[*i % self.states.len()].clone();
+        *i += 1;
+        Ok(s)
+    }
+    fn newest_draft_drawer(&self, _after_rowid: i64) -> anyhow::Result<Option<(String, i64)>> {
+        Ok(None)
+    }
+}
+
 #[test]
 fn max_turns_exhaustion_without_terminal_is_invalid() {
+    // CONTRACT CHANGE: a *fixed* non-advancing state now trips the earlier stall
+    // guard (see `stalled_phase_bails_invalid_before_exhausting_max_turns`), so
+    // MAX_TURNS is reached only by a session that keeps changing key without ever
+    // terminating. Alternating Claude/Codex ownership at PlanParallelDrafts cycles
+    // forever: each poll flips the owner (key changes → no stall) but the phase
+    // never advances to a terminal one.
     let prompts = repo_prompts_dir();
-    // Always a Claude-owned send phase; never terminal.
-    let reader = ScriptedReader {
-        states: vec![st("CodeImplementPending", "claude", 0)],
+    let reader = CyclingReader {
+        states: vec![
+            st("PlanParallelDrafts", "claude", 0),
+            st("PlanParallelDrafts", "codex", 0),
+        ],
         idx: RefCell::new(0),
-        draft: None,
     };
     let spawner = FakeSpawner {
         claude_prompts: RefCell::new(vec![]),
@@ -214,7 +243,6 @@ fn max_turns_exhaustion_without_terminal_is_invalid() {
         ..Default::default()
     });
     let err = run_collab_task(&ctx(&prompts), &reader, &spawner, &attributor).unwrap_err();
-    // TEST 8a: tighten to the real message (production says "exhausted MAX_TURNS").
     let msg = err.to_string();
     assert!(
         msg.contains("MAX_TURNS"),
@@ -326,9 +354,9 @@ impl WorkerSpawner for NoRefSpawner {
 #[test]
 fn compose_worker_returning_no_ref_errors() {
     let prompts = repo_prompts_dir();
-    // PlanSynthesisPending + claude + round 0 → ClaudeCompose, which requires a ref: line.
+    // PlanClaudeFinalizePending + claude → ClaudeCompose, which requires a ref: line.
     let reader = ScriptedReader {
-        states: vec![st("PlanSynthesisPending", "claude", 0)],
+        states: vec![st("PlanClaudeFinalizePending", "claude", 0)],
         idx: RefCell::new(0),
         draft: None,
     };
@@ -380,10 +408,10 @@ impl CollabStateReader for RecoverReader {
 #[test]
 fn compose_worker_missing_ref_recovers_persisted_drawer() {
     let prompts = repo_prompts_dir();
-    // One compose phase (canonical), then terminal. The worker omits `ref:`.
+    // One compose phase (final), then terminal. The worker omits `ref:`.
     let reader = RecoverReader {
         states: vec![
-            st("PlanSynthesisPending", "claude", 0),
+            st("PlanClaudeFinalizePending", "claude", 0),
             st("CodingComplete", "claude", 1),
         ],
         idx: RefCell::new(0),
@@ -399,22 +427,20 @@ fn compose_worker_missing_ref_recovers_persisted_drawer() {
     let res = run_collab_task(&ctx(&prompts), &reader, &spawner, &attributor)
         .expect("missing ref: line must be recovered from the persisted drawer, not fail");
     // Reaching the terminal phase is the proof: without recovery, the compose at
-    // PlanSynthesisPending would have errored with "no ref: line".
+    // PlanClaudeFinalizePending would have errored with "no ref: line".
     assert_eq!(res.reached_phase, "CodingComplete");
 }
 
 /// TEST 8 (layer 9) — the PlanLocked TaskListBridge must fail clean when the
-/// compose worker reports `fidelity:fail` (authored markdown diverged from the
-/// manifest), rather than submitting a bad plan.
-struct FidelityFailSpawner;
-impl WorkerSpawner for FidelityFailSpawner {
+/// submit worker reports a blocker, rather than waiting for the stall guard.
+struct TaskListBlockerSpawner;
+impl WorkerSpawner for TaskListBlockerSpawner {
     fn spawn_claude(&self, prompt: &str, _wt: &std::path::Path) -> anyhow::Result<WorkerResult> {
         let stdout = if prompt.contains("ABEVAL_BOOTSTRAP") {
             "ABEVAL_SESSION_ID=sess-xyz\n".to_string()
         } else {
-            // task_list compose reporting a fidelity failure.
-            "result: plan composed (tasks:2 headings:1 fidelity:fail)\n\
-             ref: docs/superpowers/plans/x.md hash:abc123\nblocker: heading-count parity\n"
+            "result: task_list not sent\n\
+             ref: none\nblocker: task 2 exceeds 20 minutes\n"
                 .to_string()
         };
         Ok(WorkerResult {
@@ -432,21 +458,21 @@ impl WorkerSpawner for FidelityFailSpawner {
 }
 
 #[test]
-fn task_list_fidelity_fail_aborts_clean() {
+fn task_list_blocker_aborts_clean() {
     let prompts = repo_prompts_dir();
     let reader = ScriptedReader {
         states: vec![st("PlanLocked", "claude", 0)],
         idx: RefCell::new(0),
         draft: None,
     };
-    let spawner = FidelityFailSpawner;
+    let spawner = TaskListBlockerSpawner;
     let attributor = FixedAttributor(Usage {
         input_tokens: 1,
         ..Default::default()
     });
     let err = run_collab_task(&ctx(&prompts), &reader, &spawner, &attributor).unwrap_err();
     assert!(
-        err.to_string().to_lowercase().contains("fidelity"),
-        "fidelity:fail must abort the run naming 'fidelity': {err}"
+        err.to_string().contains("20 minutes"),
+        "task-list blocker must abort the run with the blocker detail: {err}"
     );
 }

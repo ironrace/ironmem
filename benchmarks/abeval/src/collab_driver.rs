@@ -19,8 +19,8 @@ pub const PHASE_CODING_FAILED: &str = "CodingFailed";
 /// dispatch matrix in `.claude-plugin/commands/collab.md` (owner-first dispatch).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WorkerAction {
-    /// A single Claude turn that sends its phase event directly (no compose/submit
-    /// split). `mode` is substituted into `$MODE` (e.g. plan-synthesis revision).
+    /// A single Claude turn that sends its phase event directly. `mode` is
+    /// substituted into `$MODE` for templates that still branch.
     ClaudeSend {
         template: &'static str,
         mode: &'static str,
@@ -31,12 +31,9 @@ pub enum WorkerAction {
         template: &'static str,
         topic: &'static str,
     },
-    /// The PlanLocked v3 bridge: a compose turn authors the plan markdown via
-    /// `writing-plans` (returning `plan_file_path` + content hash + fidelity),
-    /// then the SAME template in `$MODE=submit` sends `task_list` by file path +
-    /// hash. Distinct from [`ClaudeCompose`] because the artifact is a file (not
-    /// a drawer), the submit reuses the bridge template (not
-    /// `collab-turn-submit.md`), and a hash must be threaded.
+    /// The PlanLocked v3 bridge: one mechanical worker parses the approved final
+    /// Superpowers markdown and sends `task_list`. The old two-step bridge
+    /// was removed so no second planning step runs after the final human gate.
     TaskListBridge,
     /// A Codex turn (`codex exec ... join <session>`); usage attributed later.
     Codex,
@@ -49,8 +46,8 @@ pub enum WorkerAction {
     Anomaly,
 }
 
-/// Map a `(phase, owner, global_review_round)` poll to a [`WorkerAction`].
-pub fn worker_action(phase: &str, owner: &str, global_review_round: u32) -> WorkerAction {
+/// Map a `(phase, owner)` poll to a [`WorkerAction`].
+pub fn worker_action(phase: &str, owner: &str, _review_round: u32) -> WorkerAction {
     if matches!(phase, PHASE_CODING_COMPLETE | PHASE_CODING_FAILED) {
         return WorkerAction::Terminal;
     }
@@ -66,19 +63,10 @@ pub fn worker_action(phase: &str, owner: &str, global_review_round: u32) -> Work
                 template: "collab-turn-plan-draft.md",
                 mode: "send",
             },
-            "PlanSynthesisPending" => {
-                if global_review_round == 0 {
-                    WorkerAction::ClaudeCompose {
-                        template: "collab-turn-plan-synthesis.md",
-                        topic: "canonical",
-                    }
-                } else {
-                    WorkerAction::ClaudeSend {
-                        template: "collab-turn-plan-synthesis.md",
-                        mode: "send",
-                    }
-                }
-            }
+            "PlanSynthesisPending" => WorkerAction::ClaudeSend {
+                template: "collab-turn-plan-synthesis.md",
+                mode: "send",
+            },
             "PlanClaudeFinalizePending" => WorkerAction::ClaudeCompose {
                 template: "collab-turn-plan-finalize.md",
                 topic: "final",
@@ -114,28 +102,19 @@ pub fn parse_ref_line(stdout: &str) -> Option<String> {
     None
 }
 
-/// Split a `collab-turn-task-list.md` compose verdict's `ref:` line —
-/// `ref: <plan_file_path> hash:<h>` — into `(plan_file_path, content_hash)`.
-/// The submit turn needs both to recompute and verify the approved plan.
-pub fn parse_task_list_ref(stdout: &str) -> Result<(String, String)> {
-    let ref_val =
-        parse_ref_line(stdout).ok_or_else(|| anyhow!("task_list compose returned no ref: line"))?;
-    let (path, hash) = ref_val
-        .split_once(" hash:")
-        .ok_or_else(|| anyhow!("task_list ref missing ` hash:` segment: {ref_val:?}"))?;
-    let (path, hash) = (path.trim(), hash.trim());
-    if path.is_empty() || hash.is_empty() {
-        return Err(anyhow!("task_list ref has empty path or hash: {ref_val:?}"));
+/// Extract a non-empty blocker from a worker verdict. `none` / absent → None.
+pub fn parse_blocker_line(stdout: &str) -> Option<String> {
+    for line in stdout.lines() {
+        if let Some(rest) = line.trim().strip_prefix("blocker:") {
+            let v = rest.trim();
+            return if v.is_empty() || v.eq_ignore_ascii_case("none") {
+                None
+            } else {
+                Some(v.to_string())
+            };
+        }
     }
-    Ok((path.to_string(), hash.to_string()))
-}
-
-/// Whether a `collab-turn-task-list.md` compose verdict reports `fidelity:fail`
-/// (heading-count/ID-continuity/acceptance mismatch). A failed fidelity check
-/// means the authored markdown diverged from the manifest — the driver must not
-/// submit it.
-pub fn task_list_fidelity_failed(stdout: &str) -> bool {
-    stdout.contains("fidelity:fail")
+    None
 }
 
 /// Read the `ABEVAL_SESSION_ID=<id>` line the bootstrap worker prints.
@@ -175,6 +154,18 @@ pub fn render_worker_prompt(
 // ── Dispatcher loop ──────────────────────────────────────────────────────────
 
 const MAX_TURNS: usize = 60;
+
+/// Consecutive worker turns dispatched against an unchanged `(phase, owner,
+/// plan_round, global_round)` key before the run is declared stalled. Most
+/// productive turns flip at least one component (owner flip within a phase, phase
+/// advance, or review-round bump). The key deliberately omits `fix_commits`, so a
+/// commit-only Codex rework turn within `CodeReviewFixGlobalPending` can make
+/// progress without moving it — which is why `STUCK_LIMIT > 1`, giving such a turn
+/// room to then flip the owner/phase. A key that repeats `STUCK_LIMIT` times means
+/// the session is genuinely wedged (hung/looping turn or a submit that never
+/// lands), not merely mid-rework. Bailing here bounds wasted work to ~`STUCK_LIMIT`
+/// turns instead of grinding the full `MAX_TURNS`.
+const STUCK_LIMIT: usize = 2;
 
 /// Driver-owned synthetic final-review submit (replaces `gh pr create`): the
 /// worker sends `final_review` with a synthetic, un-pushed `pr_url`. No network,
@@ -294,13 +285,39 @@ pub fn run_collab_task<R: CollabStateReader, S: WorkerSpawner, A: CodexAttributo
 
     // (2) Dispatcher loop.
     let mut last_state: Option<SessionState> = None;
+    // Stall guard: the `(phase, owner, plan_round, global_round)` key last
+    // dispatched, and how many
+    // consecutive turns have left it unchanged.
+    let mut stall_key: Option<(String, String, u32, u32)> = None;
+    let mut stall_count: usize = 0;
     for _ in 0..MAX_TURNS {
         let state = reader.read(&session_id)?;
-        let action = worker_action(
-            &state.phase,
-            &state.current_owner,
+        let key = (
+            state.phase.clone(),
+            state.current_owner.clone(),
+            state.review_round,
             state.global_review_round,
         );
+        if stall_key.as_ref() == Some(&key) {
+            stall_count += 1;
+            if stall_count >= STUCK_LIMIT {
+                return Err(anyhow!(
+                    "collab run for task {} stalled: phase {} (owner {}, plan round {}, global round {}) did not \
+                     advance after {} consecutive worker turns — INVALID run (hung or \
+                     looping turn / submit never landed)",
+                    ctx.task_id,
+                    state.phase,
+                    state.current_owner,
+                    state.review_round,
+                    state.global_review_round,
+                    STUCK_LIMIT
+                ));
+            }
+        } else {
+            stall_count = 0;
+            stall_key = Some(key);
+        }
+        let action = worker_action(&state.phase, &state.current_owner, state.review_round);
         last_state = Some(state.clone());
         match action {
             WorkerAction::Terminal => break,
@@ -359,41 +376,20 @@ pub fn run_collab_task<R: CollabStateReader, S: WorkerSpawner, A: CodexAttributo
                 claude_usage.add_assign(&sr.usage);
             }
             WorkerAction::TaskListBridge => {
-                let compose = render_worker_prompt(
+                let prompt = render_worker_prompt(
                     &ctx.prompts_dir,
                     "collab-turn-task-list.md",
-                    &[
-                        ("$SESSION_ID", &session_id),
-                        ("$BRANCH", &ctx.branch),
-                        ("$MODE", "compose"),
-                    ],
+                    &[("$SESSION_ID", &session_id), ("$BRANCH", &ctx.branch)],
                 )?;
-                let cr = spawner.spawn_claude(&compose, wt)?;
-                claude_usage.add_assign(&cr.usage);
-                // Auto-approve on fidelity:pass (post-plan-lock gates are dropped
-                // in headless); fidelity:fail means the markdown diverged from the
-                // manifest — fail clean rather than submit a bad plan.
-                if task_list_fidelity_failed(&cr.stdout) {
+                let r = spawner.spawn_claude(&prompt, wt)?;
+                claude_usage.add_assign(&r.usage);
+                if let Some(blocker) = parse_blocker_line(&r.stdout) {
                     return Err(anyhow!(
-                        "task_list compose for task {} returned fidelity:fail — \
-                         INVALID run (plan markdown diverged from manifest)",
-                        ctx.task_id
+                        "task_list bridge for task {} returned blocker: {} — INVALID run",
+                        ctx.task_id,
+                        blocker
                     ));
                 }
-                let (plan_path, plan_hash) = parse_task_list_ref(&cr.stdout)?;
-                let submit = render_worker_prompt(
-                    &ctx.prompts_dir,
-                    "collab-turn-task-list.md",
-                    &[
-                        ("$SESSION_ID", &session_id),
-                        ("$BRANCH", &ctx.branch),
-                        ("$MODE", "submit"),
-                        ("$ARTIFACT_REF", &plan_path),
-                        ("$ARTIFACT_HASH", &plan_hash),
-                    ],
-                )?;
-                let sr = spawner.spawn_claude(&submit, wt)?;
-                claude_usage.add_assign(&sr.usage);
             }
             WorkerAction::Codex => {
                 let cr = spawner.spawn_codex(&session_id, wt)?;
@@ -510,33 +506,147 @@ mod tests {
         );
     }
 
-    #[test]
-    fn task_list_ref_splits_path_and_hash() {
-        let stdout = "result: plan composed (tasks:3 headings:3 fidelity:pass)\n\
-                      ref: docs/superpowers/plans/2026-06-17-x.md hash:deadbeef\n\
-                      blocker: none\n";
-        let (path, hash) = parse_task_list_ref(stdout).unwrap();
-        assert_eq!(path, "docs/superpowers/plans/2026-06-17-x.md");
-        assert_eq!(hash, "deadbeef");
+    /// A reader pinned to one never-advancing state, plus minimal spawner/
+    /// attributor fakes, to exercise the stall guard without touching the
+    /// filesystem. The pinned phase is Codex-owned so the dispatched action is
+    /// [`WorkerAction::Codex`] (no worker-template file read).
+    struct StuckReader(SessionState);
+    impl CollabStateReader for StuckReader {
+        fn read(&self, _session_id: &str) -> Result<SessionState> {
+            Ok(self.0.clone())
+        }
+        fn newest_draft_drawer(&self, _after_rowid: i64) -> Result<Option<(String, i64)>> {
+            Ok(None)
+        }
+    }
+
+    struct FakeSpawner;
+    impl WorkerSpawner for FakeSpawner {
+        fn spawn_claude(&self, _prompt: &str, _worktree: &Path) -> Result<WorkerResult> {
+            // Only the bootstrap turn hits this path here; emit the session sentinel.
+            Ok(WorkerResult {
+                usage: Usage::default(),
+                stdout: "ABEVAL_SESSION_ID=s-stuck\n".to_string(),
+            })
+        }
+        fn spawn_codex(&self, _session_id: &str, _worktree: &Path) -> Result<CodexResult> {
+            Ok(CodexResult { commits_added: 0 })
+        }
+    }
+
+    struct FakeAttributor;
+    impl CodexAttributor for FakeAttributor {
+        fn attribute(&self) -> Result<Usage> {
+            unreachable!("stall bail returns before Codex attribution")
+        }
+    }
+
+    fn pinned_state(phase: &str, owner: &str) -> SessionState {
+        SessionState {
+            phase: phase.to_string(),
+            current_owner: owner.to_string(),
+            implementer: "claude".to_string(),
+            pr_url: None,
+            global_review_round: 0,
+            review_round: 0,
+            task_review_round: 0,
+            last_head_sha: None,
+        }
+    }
+
+    /// Reader that returns a fixed sequence of states (one per `read` call),
+    /// repeating the last once exhausted. Lets a test drive the dispatcher through
+    /// an exact phase trajectory to pin the stall-count reset boundary.
+    struct SequenceReader {
+        states: Vec<SessionState>,
+        idx: std::cell::Cell<usize>,
+    }
+    impl CollabStateReader for SequenceReader {
+        fn read(&self, _session_id: &str) -> Result<SessionState> {
+            let i = self.idx.get();
+            self.idx.set(i + 1);
+            let last = self.states.len() - 1;
+            Ok(self.states[i.min(last)].clone())
+        }
+        fn newest_draft_drawer(&self, _after_rowid: i64) -> Result<Option<(String, i64)>> {
+            Ok(None)
+        }
+    }
+
+    /// Spawner whose bootstrap emits the session sentinel AND non-zero usage (so a
+    /// run that reaches `CodingComplete` isn't rejected as zero-Claude). Codex turns
+    /// add no commits.
+    struct UsageSpawner;
+    impl WorkerSpawner for UsageSpawner {
+        fn spawn_claude(&self, _prompt: &str, _worktree: &Path) -> Result<WorkerResult> {
+            Ok(WorkerResult {
+                usage: Usage {
+                    output_tokens: 10,
+                    ..Usage::default()
+                },
+                stdout: "ABEVAL_SESSION_ID=s-seq\n".to_string(),
+            })
+        }
+        fn spawn_codex(&self, _session_id: &str, _worktree: &Path) -> Result<CodexResult> {
+            Ok(CodexResult { commits_added: 0 })
+        }
+    }
+
+    /// Attributor that yields non-zero Codex usage so a completed run passes the
+    /// zero-Codex INVALID guard.
+    struct NonZeroAttributor;
+    impl CodexAttributor for NonZeroAttributor {
+        fn attribute(&self) -> Result<Usage> {
+            Ok(Usage {
+                output_tokens: 5,
+                ..Usage::default()
+            })
+        }
     }
 
     #[test]
-    fn task_list_ref_without_hash_segment_errors() {
-        // A bare drawer-style ref (no ` hash:`) is not a valid task_list ref.
-        let err = parse_task_list_ref("result: ok\nref: drawer-1\nblocker: none\n").unwrap_err();
+    fn stall_count_resets_when_key_advances_then_repeats() {
+        // Trajectory [A, A, B, terminal]: the key A repeats exactly once (one short
+        // of STUCK_LIMIT), then B advances the key — which must RESET the counter,
+        // not accumulate toward a false stall bail. The run then reaches a terminal
+        // phase and succeeds. A naive non-resetting counter would have bailed at B.
+        let a = pinned_state("CodeReviewFixGlobalPending", "codex");
+        let mut b = pinned_state("CodeReviewFixGlobalPending", "codex");
+        b.global_review_round = 1; // distinct key component → counter must reset
+        let terminal = pinned_state(PHASE_CODING_COMPLETE, "claude");
+        let reader = SequenceReader {
+            states: vec![a.clone(), a, b, terminal],
+            idx: std::cell::Cell::new(0),
+        };
+        let ctx = CollabTaskCtx {
+            task_id: "abeval-seq".into(),
+            worktree: PathBuf::from("/tmp/nonexistent-wt"),
+            branch: "abeval/seq".into(),
+            prompts_dir: PathBuf::from("/tmp/nonexistent-prompts"),
+            bootstrap_prompt: "boot".into(),
+        };
+        let res = run_collab_task(&ctx, &reader, &UsageSpawner, &NonZeroAttributor)
+            .expect("key advance must reset the stall counter, not bail");
+        assert_eq!(res.reached_phase, PHASE_CODING_COMPLETE);
+    }
+
+    #[test]
+    fn stalled_phase_bails_invalid_before_exhausting_max_turns() {
+        let reader = StuckReader(pinned_state("CodeReviewFixGlobalPending", "codex"));
+        let ctx = CollabTaskCtx {
+            task_id: "abeval-test".into(),
+            worktree: PathBuf::from("/tmp/nonexistent-wt"),
+            branch: "abeval/test".into(),
+            prompts_dir: PathBuf::from("/tmp/nonexistent-prompts"),
+            bootstrap_prompt: "boot".into(),
+        };
+        let err = run_collab_task(&ctx, &reader, &FakeSpawner, &FakeAttributor).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("stalled"), "must report a stall: {msg}");
+        assert!(msg.contains("INVALID"), "must mark INVALID: {msg}");
         assert!(
-            err.to_string().contains("hash:"),
-            "must name the missing hash segment: {err}"
+            msg.contains("CodeReviewFixGlobalPending"),
+            "must name the stuck phase: {msg}"
         );
-    }
-
-    #[test]
-    fn fidelity_pass_is_not_a_failure() {
-        assert!(!task_list_fidelity_failed(
-            "result: plan composed (fidelity:pass)\nref: p hash:h\n"
-        ));
-        assert!(task_list_fidelity_failed(
-            "result: plan composed (fidelity:fail)\nref: p hash:h\n"
-        ));
     }
 }
