@@ -329,10 +329,7 @@ pub fn resolve_base_commit(task: &Task, run_override: Option<&str>) -> Result<Ba
 /// racing on — the real repo's config. An isolated clone has its own config, so
 /// each task owns its `origin`. `--local` hardlinks the object store (fast, cheap)
 /// and brings every commit, so the pinned base ref is always present for checkout.
-pub fn clone_argv(
-    repo: &std::path::Path,
-    workspace: &std::path::Path,
-) -> (String, Vec<String>) {
+pub fn clone_argv(repo: &std::path::Path, workspace: &std::path::Path) -> (String, Vec<String>) {
     (
         "git".to_string(),
         vec![
@@ -350,10 +347,7 @@ pub fn clone_argv(
 /// clone lands on the source default branch; this pins the workspace to the
 /// resolved base commit. `advice.detachedHead=false` silences the detached-HEAD
 /// advice so it never pollutes captured output.
-pub fn checkout_detach_argv(
-    workspace: &std::path::Path,
-    base: &str,
-) -> (String, Vec<String>) {
+pub fn checkout_detach_argv(workspace: &std::path::Path, base: &str) -> (String, Vec<String>) {
     (
         "git".to_string(),
         vec![
@@ -638,14 +632,15 @@ impl<R: CommandRunner, P: WorkspaceProvisioner> ArmExecutor for LiveExecutor<R, 
             let out_task_dir = self
                 .workspace_root
                 .parent()
-                .ok_or_else(|| anyhow::anyhow!(
-                    "workspace_root {} has no parent; cannot derive ironmem output dir",
-                    self.workspace_root.display()
-                ))?
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "workspace_root {} has no parent; cannot derive ironmem output dir",
+                        self.workspace_root.display()
+                    )
+                })?
                 .join(&task.id);
-            std::fs::create_dir_all(&out_task_dir).with_context(|| {
-                format!("creating ironmem out dir {}", out_task_dir.display())
-            })?;
+            std::fs::create_dir_all(&out_task_dir)
+                .with_context(|| format!("creating ironmem out dir {}", out_task_dir.display()))?;
             return self.ironmem_runner.run(task, &workspace, &out_task_dir);
         }
 
