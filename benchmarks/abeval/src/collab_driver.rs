@@ -176,6 +176,15 @@ pub fn render_worker_prompt(
 
 const MAX_TURNS: usize = 60;
 
+/// Consecutive worker turns dispatched against an unchanged `(phase, owner,
+/// global_review_round)` before the run is declared stalled. A productive turn
+/// always changes at least one of those (owner flip within a phase, phase
+/// advance, or review-round bump), so repeats mean the turn returns without
+/// advancing the session — a hung/looping turn or a submit that never lands.
+/// Bailing here bounds wasted work to ~`STUCK_LIMIT` turns instead of grinding
+/// the full `MAX_TURNS`.
+const STUCK_LIMIT: usize = 2;
+
 /// Driver-owned synthetic final-review submit (replaces `gh pr create`): the
 /// worker sends `final_review` with a synthetic, un-pushed `pr_url`. No network,
 /// nothing pushed. `$SESSION_ID` and `$PR_URL` are substituted by the driver.
@@ -294,8 +303,35 @@ pub fn run_collab_task<R: CollabStateReader, S: WorkerSpawner, A: CodexAttributo
 
     // (2) Dispatcher loop.
     let mut last_state: Option<SessionState> = None;
+    // Stall guard: the `(phase, owner, round)` key last dispatched, and how many
+    // consecutive turns have left it unchanged.
+    let mut stall_key: Option<(String, String, u32)> = None;
+    let mut stall_count: usize = 0;
     for _ in 0..MAX_TURNS {
         let state = reader.read(&session_id)?;
+        let key = (
+            state.phase.clone(),
+            state.current_owner.clone(),
+            state.global_review_round,
+        );
+        if stall_key.as_ref() == Some(&key) {
+            stall_count += 1;
+            if stall_count >= STUCK_LIMIT {
+                return Err(anyhow!(
+                    "collab run for task {} stalled: phase {} (owner {}, round {}) did not \
+                     advance after {} consecutive worker turns — INVALID run (hung or \
+                     looping turn / submit never landed)",
+                    ctx.task_id,
+                    state.phase,
+                    state.current_owner,
+                    state.global_review_round,
+                    STUCK_LIMIT
+                ));
+            }
+        } else {
+            stall_count = 0;
+            stall_key = Some(key);
+        }
         let action = worker_action(
             &state.phase,
             &state.current_owner,
@@ -527,6 +563,73 @@ mod tests {
         assert!(
             err.to_string().contains("hash:"),
             "must name the missing hash segment: {err}"
+        );
+    }
+
+    /// A reader pinned to one never-advancing state, plus minimal spawner/
+    /// attributor fakes, to exercise the stall guard without touching the
+    /// filesystem. The pinned phase is Codex-owned so the dispatched action is
+    /// [`WorkerAction::Codex`] (no worker-template file read).
+    struct StuckReader(SessionState);
+    impl CollabStateReader for StuckReader {
+        fn read(&self, _session_id: &str) -> Result<SessionState> {
+            Ok(self.0.clone())
+        }
+        fn newest_draft_drawer(&self, _after_rowid: i64) -> Result<Option<(String, i64)>> {
+            Ok(None)
+        }
+    }
+
+    struct FakeSpawner;
+    impl WorkerSpawner for FakeSpawner {
+        fn spawn_claude(&self, _prompt: &str, _worktree: &Path) -> Result<WorkerResult> {
+            // Only the bootstrap turn hits this path here; emit the session sentinel.
+            Ok(WorkerResult {
+                usage: Usage::default(),
+                stdout: "ABEVAL_SESSION_ID=s-stuck\n".to_string(),
+            })
+        }
+        fn spawn_codex(&self, _session_id: &str, _worktree: &Path) -> Result<CodexResult> {
+            Ok(CodexResult { commits_added: 0 })
+        }
+    }
+
+    struct FakeAttributor;
+    impl CodexAttributor for FakeAttributor {
+        fn attribute(&self) -> Result<Usage> {
+            unreachable!("stall bail returns before Codex attribution")
+        }
+    }
+
+    fn pinned_state(phase: &str, owner: &str) -> SessionState {
+        SessionState {
+            phase: phase.to_string(),
+            current_owner: owner.to_string(),
+            implementer: "claude".to_string(),
+            pr_url: None,
+            global_review_round: 0,
+            task_review_round: 0,
+            last_head_sha: None,
+        }
+    }
+
+    #[test]
+    fn stalled_phase_bails_invalid_before_exhausting_max_turns() {
+        let reader = StuckReader(pinned_state("CodeReviewFixGlobalPending", "codex"));
+        let ctx = CollabTaskCtx {
+            task_id: "abeval-test".into(),
+            worktree: PathBuf::from("/tmp/nonexistent-wt"),
+            branch: "abeval/test".into(),
+            prompts_dir: PathBuf::from("/tmp/nonexistent-prompts"),
+            bootstrap_prompt: "boot".into(),
+        };
+        let err = run_collab_task(&ctx, &reader, &FakeSpawner, &FakeAttributor).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("stalled"), "must report a stall: {msg}");
+        assert!(msg.contains("INVALID"), "must mark INVALID: {msg}");
+        assert!(
+            msg.contains("CodeReviewFixGlobalPending"),
+            "must name the stuck phase: {msg}"
         );
     }
 

@@ -17,6 +17,7 @@ use crate::collab_driver::{
     CollabTaskCtx, WorkerResult, WorkerSpawner,
 };
 use crate::corpus::Task;
+use crate::proc_timeout::{run_with_timeout, turn_timeout};
 
 /// `claude -p` worker argv: JSON output, headless permissions, and the
 /// driver-supplied `--mcp-config` (so the worker's ironmem MCP server shares the
@@ -135,12 +136,14 @@ impl WorkerSpawner for ProcessWorkerSpawner {
     fn spawn_claude(&self, prompt: &str, worktree: &Path) -> Result<WorkerResult> {
         let (prog, mut args) = claude_worker_argv(&self.mcp_config);
         args.push(prompt.to_string());
-        let out = std::process::Command::new(&prog)
-            .args(&args)
+        let mut cmd = std::process::Command::new(&prog);
+        cmd.args(&args)
             .current_dir(worktree)
-            .env("IRONMEM_DB_PATH", &self.db_path)
-            .output()
-            .with_context(|| format!("spawning claude worker in {}", worktree.display()))?;
+            .env("IRONMEM_DB_PATH", &self.db_path);
+        // Bound the turn: a hung worker must not stall the driver indefinitely,
+        // and a timeout kill reaps the per-turn `ironmem serve` MCP child too.
+        let out = run_with_timeout(cmd, turn_timeout())
+            .with_context(|| format!("claude worker in {}", worktree.display()))?;
         if !out.status.success() {
             let stderr = String::from_utf8_lossy(&out.stderr);
             return Err(anyhow!(
@@ -159,15 +162,20 @@ impl WorkerSpawner for ProcessWorkerSpawner {
         let head_before = git_head(worktree)?;
         let prompt = codex_collab_prompt(session_id)?;
         let (prog, args) = codex_exec_argv(worktree, &prompt);
-        let status = std::process::Command::new(&prog)
-            .args(&args)
-            .env("CODEX_HOME", &self.codex_home)
-            .status()
-            .with_context(|| format!("spawning codex exec in {}", worktree.display()))?;
-        if !status.success() {
+        let mut cmd = std::process::Command::new(&prog);
+        cmd.args(&args).env("CODEX_HOME", &self.codex_home);
+        // Same per-turn watchdog as the Claude worker (Codex review/fix turns can
+        // also hang); output is captured rather than streamed — the durable record
+        // is the rollout jsonl, which `attribute_codex_tokens` reads.
+        let out = run_with_timeout(cmd, turn_timeout())
+            .with_context(|| format!("codex exec in {}", worktree.display()))?;
+        if !out.status.success() {
+            let stderr = String::from_utf8_lossy(&out.stderr);
             return Err(anyhow!(
-                "codex exec exited non-zero in {}",
-                worktree.display()
+                "codex exec exited {:?} in {} — stderr: {}",
+                out.status.code(),
+                worktree.display(),
+                stderr.trim()
             ));
         }
         let head_after = git_head(worktree)?;

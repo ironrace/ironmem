@@ -11,5 +11,6 @@ pub mod collab_driver;
 pub mod collab_live;
 pub mod constants;
 pub mod corpus;
+pub mod proc_timeout;
 pub mod report;
 pub mod runner;

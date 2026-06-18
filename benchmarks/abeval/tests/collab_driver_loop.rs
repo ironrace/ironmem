@@ -196,14 +196,42 @@ fn anomaly_phase_owner_combo_errors() {
     );
 }
 
+/// Reader that cycles its scripted states modulo their length (never clamps), so
+/// the `(phase, owner, round)` key changes every poll. This drives a session that
+/// progresses *between* states yet never reaches a terminal phase — the only
+/// scenario that still exhausts `MAX_TURNS` now that an unchanging state bails
+/// early via the stall guard.
+struct CyclingReader {
+    states: Vec<SessionState>,
+    idx: RefCell<usize>,
+}
+impl CollabStateReader for CyclingReader {
+    fn read(&self, _session_id: &str) -> anyhow::Result<SessionState> {
+        let mut i = self.idx.borrow_mut();
+        let s = self.states[*i % self.states.len()].clone();
+        *i += 1;
+        Ok(s)
+    }
+    fn newest_draft_drawer(&self, _after_rowid: i64) -> anyhow::Result<Option<(String, i64)>> {
+        Ok(None)
+    }
+}
+
 #[test]
 fn max_turns_exhaustion_without_terminal_is_invalid() {
+    // CONTRACT CHANGE: a *fixed* non-advancing state now trips the earlier stall
+    // guard (see `stalled_phase_bails_invalid_before_exhausting_max_turns`), so
+    // MAX_TURNS is reached only by a session that keeps changing key without ever
+    // terminating. Alternating Claude/Codex ownership at PlanParallelDrafts cycles
+    // forever: each poll flips the owner (key changes → no stall) but the phase
+    // never advances to a terminal one.
     let prompts = repo_prompts_dir();
-    // Always a Claude-owned send phase; never terminal.
-    let reader = ScriptedReader {
-        states: vec![st("CodeImplementPending", "claude", 0)],
+    let reader = CyclingReader {
+        states: vec![
+            st("PlanParallelDrafts", "claude", 0),
+            st("PlanParallelDrafts", "codex", 0),
+        ],
         idx: RefCell::new(0),
-        draft: None,
     };
     let spawner = FakeSpawner {
         claude_prompts: RefCell::new(vec![]),
@@ -214,7 +242,6 @@ fn max_turns_exhaustion_without_terminal_is_invalid() {
         ..Default::default()
     });
     let err = run_collab_task(&ctx(&prompts), &reader, &spawner, &attributor).unwrap_err();
-    // TEST 8a: tighten to the real message (production says "exhausted MAX_TURNS").
     let msg = err.to_string();
     assert!(
         msg.contains("MAX_TURNS"),
