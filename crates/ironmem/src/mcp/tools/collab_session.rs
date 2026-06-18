@@ -1866,9 +1866,13 @@ mod tests {
     }
 
     #[test]
-    fn revision_round_canonical_re_send_overwrites_drawer_id() {
-        // request_changes returns to synthesis; a second, different canonical
-        // body must re-stamp canonical_plan_drawer_id to the v2-derived id.
+    fn request_changes_advances_to_finalize_and_rejects_canonical_resend() {
+        // One-pass planning review (MAX_REVIEW_ROUNDS = 1): a `request_changes`
+        // verdict no longer returns to synthesis. It advances to
+        // PlanClaudeFinalizePending, where Codex's requested changes are folded
+        // into the `final` plan — there is no second canonical round. So a
+        // canonical re-send after review is rejected (the phase now expects
+        // `final`), and the canonical drawer id stays pinned to the single v1 body.
         let app = test_app();
         let sid = start_session(&app);
         send(&app, &sid, "claude", "draft", "claude draft");
@@ -1881,19 +1885,36 @@ mod tests {
             "review",
             r#"{"verdict":"request_changes"}"#,
         );
-        send(&app, &sid, "claude", "canonical", "CANONICAL V2");
 
+        // Re-sending canonical is no longer accepted: planning advanced to finalize.
+        let err = handle_collab_send(
+            &app,
+            &json!({
+                "session_id": sid, "sender": "claude",
+                "topic": "canonical", "content": "CANONICAL V2",
+            }),
+        )
+        .expect_err(
+            "canonical re-send must be rejected after one-pass review advances to finalize",
+        );
+        let msg = format!("{err:?}");
+        assert!(
+            msg.contains("PublishFinal") && msg.contains("PublishCanonical"),
+            "error must name the finalize-phase mismatch, got: {msg}"
+        );
+
+        // The canonical drawer id remains pinned to the single accepted v1 body.
         let record = app.db.collab_load_session_record(&sid).unwrap();
         let id = record.session.canonical_plan_drawer_id.unwrap();
         let id_v1 =
             crate::db::drawers::generate_id("CANONICAL V1", "ironrace-memory", "collab-plans");
-        let id_v2 =
-            crate::db::drawers::generate_id("CANONICAL V2", "ironrace-memory", "collab-plans");
-        assert_eq!(id, id_v2, "drawer id must point at the v2 body");
-        assert_ne!(id, id_v1);
+        assert_eq!(
+            id, id_v1,
+            "canonical drawer id must stay pinned to the v1 body"
+        );
         assert_eq!(
             app.db.get_drawer(&id).unwrap().unwrap().content,
-            "CANONICAL V2"
+            "CANONICAL V1"
         );
     }
 
