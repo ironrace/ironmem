@@ -15,6 +15,7 @@ pub struct SessionState {
     pub current_owner: String,
     pub implementer: String,
     pub pr_url: Option<String>,
+    pub review_round: u32,
     pub global_review_round: u32,
     pub task_review_round: u32,
     pub last_head_sha: Option<String>,
@@ -38,7 +39,7 @@ pub fn read_session_state(db_path: &Path, session_id: &str) -> Result<SessionSta
 
     let mut stmt = conn.prepare(
         "SELECT phase, current_owner, implementer, pr_url, \
-                global_review_round, task_review_round, last_head_sha \
+                review_round, global_review_round, task_review_round, last_head_sha \
          FROM collab_sessions WHERE id = ?1",
     )?;
 
@@ -48,9 +49,10 @@ pub fn read_session_state(db_path: &Path, session_id: &str) -> Result<SessionSta
             current_owner: row.get(1)?,
             implementer: row.get(2)?,
             pr_url: row.get(3)?,
-            global_review_round: row.get::<_, i64>(4)?.max(0) as u32,
-            task_review_round: row.get::<_, i64>(5)?.max(0) as u32,
-            last_head_sha: row.get(6)?,
+            review_round: row.get::<_, i64>(4)?.max(0) as u32,
+            global_review_round: row.get::<_, i64>(5)?.max(0) as u32,
+            task_review_round: row.get::<_, i64>(6)?.max(0) as u32,
+            last_head_sha: row.get(7)?,
         })
     })
     .with_context(|| format!("no collab_sessions row for session {session_id}"))

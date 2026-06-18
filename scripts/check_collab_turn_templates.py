@@ -45,9 +45,9 @@ EXPECTED_TEMPLATES = {
     },
     "collab-turn-task-list.md": {
         "turn": "task_list",
-        "tier": "planning",
-        "model": "opus",
-        "topics": ["task_list", "failure_report"],
+        "tier": "mechanical",
+        "model": "sonnet",
+        "topics": ["task_list"],
     },
     "collab-turn-code-implement.md": {
         "turn": "implementation_done",
@@ -71,15 +71,18 @@ EXPECTED_TEMPLATES = {
         "turn": "submit",
         "tier": "mechanical",
         "model": "sonnet",
-        "topics": ["canonical", "final", "final_review", "failure_report"],
+        "topics": ["final", "final_review", "failure_report"],
     },
 }
 REQUIRED_TEMPLATE_SNIPPETS = {
     "collab-turn-task-list.md": [
-        "$ARTIFACT_REF",
-        "$ARTIFACT_HASH",
-        "approved_plan_hash_mismatch",
-        "plan_file_path:<$ARTIFACT_REF>",
+        "Timebox: <=20 minutes",
+        "PlanLocked is pre-coding",
+        "plan_file_path",
+    ],
+    "collab-turn-plan-finalize.md": [
+        "Timebox: <=20 minutes",
+        "docs/superpowers/plans/YYYY-MM-DD-<short-feature>.md",
     ],
     "collab-turn-final-review.md": [
         '{"title":"<title>","body":"<body>"}',

@@ -23,9 +23,10 @@ pub fn start_global_review_session(
 }
 
 /// Maximum number of review cycles Codex may run on the canonical plan.
-/// After this many reviews, Claude is forced into finalize regardless of the
-/// verdict (she always gets the last word).
-pub(super) const MAX_REVIEW_ROUNDS: u8 = 2;
+/// Planning is intentionally one-pass after the blind drafts: Claude
+/// synthesizes once, Codex reviews once, then Claude finalizes the
+/// execution-ready task plan.
+pub(super) const MAX_REVIEW_ROUNDS: u8 = 1;
 
 /// Require an actor to match the expected agent, else return `NotYourTurn`.
 fn require_actor(actor: Agent, expected: Agent) -> Result<(), CollabError> {
@@ -100,18 +101,16 @@ pub fn apply_event(
                 return Err(CollabError::InvalidVerdictValue(verdict.clone()));
             }
             next.codex_review_verdict = Some(verdict.clone());
-            next.review_round = session.review_round.saturating_add(1);
+            next.review_round = session
+                .review_round
+                .saturating_add(1)
+                .min(MAX_REVIEW_ROUNDS);
 
-            // request_changes returns to synthesis (Claude revises) unless we've
-            // hit the cap — then Claude is forced into finalize with the last word.
-            let force_finalize = next.review_round >= MAX_REVIEW_ROUNDS;
-            if verdict == "request_changes" && !force_finalize {
-                next.phase = Phase::PlanSynthesisPending;
-                next.current_owner = Agent::Claude;
-            } else {
-                next.phase = Phase::PlanClaudeFinalizePending;
-                next.current_owner = Agent::Claude;
-            }
+            // Codex gets exactly one review pass. Any requested changes are
+            // folded into Claude's final execution-ready task plan; planning
+            // never re-enters synthesis.
+            next.phase = Phase::PlanClaudeFinalizePending;
+            next.current_owner = Agent::Claude;
         }
         (Phase::PlanClaudeFinalizePending, CollabEvent::PublishFinal { content_hash }) => {
             require_actor(actor, Agent::Claude)?;

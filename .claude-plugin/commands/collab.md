@@ -1,5 +1,5 @@
 ---
-description: Start or join an IronRace bounded planning session with Codex, auto-flowing into v3 batch coding. Covers v1 planning, v3 batch implementation (Claude or Codex via writing-plans + subagent-driven-development) → global review → PR handoff, and the post-subagent review shortcut. Usage — /collab start [--implementer=claude|codex] <task>  |  /collab join [--implementer=claude|codex] <session_id>  |  /collab review <short-topic>
+description: Start or join an IronRace bounded planning session with Codex, auto-flowing into v3 batch coding. Covers v1 planning, v3 batch implementation (Claude or Codex via approved Superpowers task plan + subagent-driven-development) → global review → PR handoff, and the post-subagent review shortcut. Usage — /collab start [--implementer=claude|codex] <task>  |  /collab join [--implementer=claude|codex] <session_id>  |  /collab review <short-topic>
 argument-hint: start [--implementer=claude|codex] <task> | join [--implementer=claude|codex] <session_id> | review <short-topic>
 ---
 
@@ -55,9 +55,9 @@ branch names.
    user approval here.** The draft is yours alone, Codex cannot see it.
    Once drafted, call `mcp__ironmem__collab_send` with
    `sender="claude"`, `topic="draft"`, `content=<the plan text>`. Your
-   user gate is the combined plan at `PlanSynthesisPending`, not here —
-   sending the draft autonomously lets Codex start grinding immediately
-   instead of waiting on a user think-time gate.
+   only planning user gate is the final Superpowers task plan at
+   `PlanClaudeFinalizePending`; sending the draft autonomously lets Codex
+   start grinding immediately instead of waiting on a user think-time gate.
 6. After the draft is sent, begin the v1 planning loop (below). The send
    normally flips `current_owner` to `"codex"`, so the loop's next
    iteration dispatches Codex via bg-exec immediately (see "Codex handoff
@@ -106,9 +106,9 @@ paths, branches, or SHAs.
 5. Because shortcut sessions have no collab `task_list`, the Codex review
    prompt must recover context before judging the branch: search ironmem
    checkpoints for the same `repo_path`/`branch`, read any referenced
-   writing-plans markdown, and scan the current code/diff to determine
+   Superpowers task markdown, and scan the current code/diff to determine
    which acceptance criteria are already complete. If no checkpoint exists,
-   fall back to the branch diff plus nearby writing-plans docs in the repo.
+   fall back to the branch diff plus nearby Superpowers plan docs in the repo.
 6. Enter the v3 dispatch loop at phase `CodeReviewFixGlobalPending`. The
    loop handles the three remaining turns (`review_fix_global` from Codex,
    `review_local` from Claude, then `final_review` from Claude) and
@@ -204,24 +204,24 @@ own `collab_status` / `collab_recv` / drawer fetches.
 
 <!-- LINT:gates-ref-only -->
 ### Approval gates are reference-only
-The two user gates (first `canonical`, `final`) and the PlanLocked bridge's
-**fidelity-fail fallback** use a two-phase split: a compose worker writes the
-artifact to a drawer/file and returns `{ref, ≤3-line summary}`; the orchestrator
-surfaces ONLY ref+summary for approval (never the full body); a
-`collab-turn-submit.md` worker sends the approved artifact by ref. For drawer
-refs, **drawer immutability is the integrity anchor** — drawers are append-only,
-so an approved `drawer_id`'s content cannot change and no hash recompute is
-needed. Two post-plan-lock steps run autonomously (no user gate): the PlanLocked
-bridge auto-approves when its fidelity check passes (see "v3 Bridge"), and the
-v3 `final_review` PR creation always auto-proceeds (the diff has already passed
-`review_fix_global` + `review_local`).
+The only planning user gate is `final`: a compose worker writes the
+Superpowers-compatible task plan to `docs/superpowers/plans/...` and stages the
+exact markdown in a drawer, then returns `{ref, file path, ≤3-line summary}`.
+The orchestrator surfaces ONLY ref+path+summary for approval (never the full
+body); `collab-turn-submit.md` sends the approved final artifact by ref. For
+drawer refs, **drawer immutability is the integrity anchor** — drawers are
+append-only, so an approved `drawer_id`'s content cannot change and no hash
+recompute is needed. Post-plan-lock steps run autonomously (no user gate): the
+PlanLocked bridge mechanically parses/submits `task_list` from that approved
+markdown, and the v3 `final_review` PR creation auto-proceeds (the diff has
+already passed `review_fix_global` + `review_local`).
 
 <!-- LINT:fail-closed-tiering -->
 ### Model tiers + fail-closed
-Planning (`draft`, `canonical`, `final`, `task_list`) → `Agent(model=opus)` at
+Planning (`draft`, `canonical`, `final`) → `Agent(model=opus)` at
 max effort. Review (`review_local`, `final_review`) → `Agent(model=opus)`.
-Mechanical (`code-implement` controller, `submit`) → `Agent(model=sonnet)` /
-default. Codex side unchanged (xhigh). "max effort" = the harness thinking-budget
+Mechanical (`task_list`, `code-implement` controller, `submit`) →
+`Agent(model=sonnet)` / default. Codex side unchanged (xhigh). "max effort" = the harness thinking-budget
 mechanism. **If the harness cannot select the requested tier for a
 planning/review dispatch, ABORT the turn and surface to the user — never silently
 fall back to a lower tier.**
@@ -233,7 +233,7 @@ fall back to a lower tier.**
 | PlanParallelDrafts | claude | `collab-turn-plan-draft.md` | planning | opus |
 | PlanSynthesisPending | claude | `collab-turn-plan-synthesis.md` | planning | opus |
 | PlanClaudeFinalizePending | claude | `collab-turn-plan-finalize.md` | planning | opus |
-| PlanLocked (bridge) | claude | `collab-turn-task-list.md` | planning | opus |
+| PlanLocked (bridge) | claude | `collab-turn-task-list.md` | mechanical | sonnet |
 | CodeImplementPending | claude | `collab-turn-code-implement.md` | mechanical | sonnet |
 | CodeReviewLocalPending | claude | `collab-turn-review-local.md` | review | opus |
 | CodeReviewFinalPending | claude | `collab-turn-final-review.md` | review | opus |
@@ -246,94 +246,53 @@ Repeat the dispatch loop with these actions:
 | Phase | What to do (is_my_turn == true) |
 |---|---|
 | `PlanParallelDrafts` | The draft worker (`collab-turn-plan-draft.md`, planning/opus) was already dispatched from the `start` branch. is_my_turn should be false here — if true, verify with `collab_status`. If `collab_status` confirms Claude is the owner in a Codex-owned phase, this is a protocol-level anomaly — exit the loop and report to the user; do not attempt a send. |
-| `PlanSynthesisPending` | Read `review_round` from `collab_status`. **`review_round == 0` (first synthesis): enter Plan Mode and get user approval — this is the user's primary v1 steering gate (the first artifact combining both drafts).** Under reference-only gates, dispatch `collab-turn-plan-synthesis.md` (planning/opus) with `$MODE=compose` to merge both drafts into a drawer and return `{drawer_id, ≤3-line summary}`; surface ONLY ref+summary for approval; on approval dispatch `collab-turn-submit.md` (mechanical/sonnet) with `$TOPIC=canonical` `$ARTIFACT_REF=<drawer_id>` to send it (drawer immutability is the integrity anchor — the approved drawer's content cannot change, so no hash recompute is needed). **`review_round >= 1` (revision rounds, re-entered on `request_changes`): send autonomously, no Plan Mode** — dispatch `collab-turn-plan-synthesis.md` with `$MODE=send`, which revises the prior canonical and sends `topic="canonical"` directly. `draft` and `canonical` are the only v1 topics that are NOT JSON-wrapped; the worker recovers the prior canonical via `collab_status(verbose:true)` reading `canonical_plan`. Ingest only the ≤3-line verdict; loop. |
-| `PlanCodexReviewPending` | Codex's turn. is_my_turn should be false — if true, verify with `collab_status`. If the inconsistency persists, exit the loop and report to the user. **Review cap:** the server enforces `MAX_REVIEW_ROUNDS = 2` at `crates/ironmem/src/collab/state_machine/mod.rs:28`. Codex gets at most two review rounds; after the 2nd review the server transitions to `PlanClaudeFinalizePending` regardless of verdict (`approve`, `approve_with_minor_edits`, or `request_changes` all map to the same next phase). Do not model v1 as open-ended iteration. |
-| `PlanClaudeFinalizePending` | **Enter Plan Mode and get user approval — this is the v1 commit-point gate.** Under reference-only gates, dispatch `collab-turn-plan-finalize.md` (planning/opus), which produces the final plan (incorporating Codex's review notes unless they conflict with user intent), writes it to a drawer as `{"plan":...}`, and returns `{drawer_id, ≤3-line summary}`; surface ONLY ref+summary for approval. On approval dispatch `collab-turn-submit.md` (mechanical/sonnet) with `$TOPIC=final` `$ARTIFACT_REF=<drawer_id>` to send `topic="final"` (v1 `final` is the only v1 topic wrapped in JSON); drawer immutability is the integrity anchor — the approved drawer's content cannot change, so no hash recompute is needed. After send, `PlanLocked` is reached. Ingest only the ≤3-line verdict; loop. |
+| `PlanSynthesisPending` | Dispatch `collab-turn-plan-synthesis.md` (planning/opus) autonomously. It merges both blind drafts and sends `topic="canonical"` directly. Do not enter Plan Mode here; the single human planning gate is the final Superpowers task plan. `draft` and `canonical` are the only v1 topics that are NOT JSON-wrapped. Ingest only the ≤3-line verdict; loop. |
+| `PlanCodexReviewPending` | Codex's turn. is_my_turn should be false — if true, verify with `collab_status`. If the inconsistency persists, exit the loop and report to the user. **Review cap:** the server enforces `MAX_REVIEW_ROUNDS = 1` at `crates/ironmem/src/collab/state_machine/mod.rs:28`. Codex gets one plan-review pass; after that review the server transitions to `PlanClaudeFinalizePending` regardless of verdict (`approve`, `approve_with_minor_edits`, or `request_changes` all map to the same next phase). Do not model v1 as open-ended iteration or return to synthesis. |
+| `PlanClaudeFinalizePending` | **Enter Plan Mode and get user approval — this is the only planning human gate.** Under reference-only gates, dispatch `collab-turn-plan-finalize.md` (planning/opus), which incorporates Codex's one review pass and produces the final Superpowers-compatible task markdown in `docs/superpowers/plans/...`. Every `### Task N:` must be sized for 20 minutes or less; split anything larger before asking for approval. The worker stages `{"plan": "<exact markdown>"}` in a drawer and returns `{drawer_id, file path, ≤3-line summary}`; surface ONLY ref+path+summary for approval. On approval dispatch `collab-turn-submit.md` (mechanical/sonnet) with `$TOPIC=final` `$ARTIFACT_REF=<drawer_id>` to send `topic="final"` (v1 `final` is the only v1 topic wrapped in JSON); drawer immutability is the integrity anchor. After send, `PlanLocked` is reached. Ingest only the ≤3-line verdict; loop. |
 
-Rationale: the user approves the first combined plan and the final plan;
-blind draft and revision rounds run autonomously. The first canonical is
-the first artifact worth steering (it combines both drafts and gives the
-user Codex-side context they lack at draft time); the final is the
-commit point.
+Rationale: blind drafts, synthesis, and Codex's single review run
+autonomously. The final Superpowers task plan is the commit point and the
+only artifact worth interrupting the human for.
 
 ## v3 Bridge: PlanLocked → CodeImplementPending
 
 <!-- LINT:bridge-worker-owned -->
 ### v3 bridge (PlanLocked → CodeImplementPending) — worker-owned
-The orchestrator does NOT call `Skill('writing-plans')` inline, read verbose
-`final_plan`, or build the manifest. It dispatches `collab-turn-task-list.md`
-`$MODE=compose` (authors the plan markdown, derives the manifest, runs the
-fidelity check, returns `plan_file_path` + hash + `fidelity:<pass|fail>`).
-On `fidelity:pass` it **auto-proceeds** (no prompt); on `fidelity:fail` it
-falls back to the manual reference-only gate (surface path+hash+summary). It
-then dispatches the same template `$MODE=submit` with
-`$ARTIFACT_REF=<approved plan_file_path>` and `$ARTIFACT_HASH=<approved hash>`
-to recheck the approved file, derive + validate the manifest, and send
-`task_list`. Only refs/paths/hashes cross the orchestrator boundary.
+The orchestrator does NOT call a separate plan-expansion skill, read verbose
+`final_plan`, or build the manifest inline. It dispatches
+`collab-turn-task-list.md` once (mechanical/sonnet). That worker reads the
+approved final markdown from `collab_status(verbose:true)`, verifies or restores
+the exact file named by its leading `plan_file_path` comment, parses tasks, and
+sends `task_list`. Only the worker's ≤3-line verdict crosses the orchestrator
+boundary.
 
 Once `PlanLocked` is reached with `final_plan_hash` set and no `task_list`
-yet, run the worker-owned bridge. **Do not enter harness Plan Mode here** —
-the `$MODE=compose` worker authors the markdown plan via `writing-plans` in
-produce-only mode, then the orchestrator auto-approves on the fidelity check
-(manual `plan_file_path + hash + summary` gate only on `fidelity:fail`).
+yet, run this worker-owned bridge. **Do not enter harness Plan Mode here** —
+the user already approved the final Superpowers task plan.
 
-1. **Compose.** Dispatch `collab-turn-task-list.md` (planning/opus) with
-   `$MODE=compose`. The worker reads `final_plan`/`final_plan_hash` itself
-   (via `collab_status(verbose:true)`), invokes `Skill('writing-plans')` in
-   produce-only mode, saves
-   `docs/superpowers/plans/YYYY-MM-DD-<feature>.md`, derives the manifest, and
-   runs the **fidelity check** (below) against the markdown it just authored. It
-   returns the `plan_file_path` + content hash + `fidelity:<pass|fail>` (with
-   task and heading counts) in its ≤3-line verdict. Full artifacts never transit
-   the orchestrator.
-2. **Auto-approve gate (fidelity-conditional).** Read `fidelity` from the
-   compose verdict.
-   - `fidelity:pass` → **auto-proceed, no prompt.** Emit a ≤1-line audit note
-     (`bridge auto-approved: <N> tasks, heading-parity OK`) and go to Submit.
-   - `fidelity:fail` → **fall back to the existing manual gate.** Surface ONLY
-     the `plan_file_path` + hash + ≤3-line summary for user approval
-     (reference-only gate — never the full plan body). If the user declines,
-     abort the bridge cleanly (do not dispatch `$MODE=submit`, do not send
-     `task_list`) **and exit the dispatch loop with a one-line note** — the
-     session stays at `PlanLocked`; do NOT silently re-dispatch `$MODE=compose`
-     in a loop.
-
-   The fidelity check is needed because the COMPOSE→SUBMIT step transcribes the
-   locked plan into a manifest via an **LLM worker**, not a deterministic
-   parser, so silent under-counting (e.g. one dropped task, or the `## Task` vs
-   `### Task` heading mismatch that has parsed **0 tasks** in practice) is a
-   real risk. It asserts, against the just-authored markdown:
-   1. **Heading-count parity** — count `^### Task ` headings; assert
-      `manifest.tasks.length == heading_count` **and** both counts are ≥ 1. A
-      zero count on either side is a fidelity *failure*, not a pass — this is
-      exactly the `## Task` (h2) heading-level mismatch, which yields 0
-      `^### Task ` headings.
-   2. **ID continuity** — task IDs are `1..N` contiguous.
-   3. **Non-empty `acceptance`** — every task has ≥1 acceptance entry.
-
-   Any failed check → `fidelity:fail` (manual gate). The
-   `approved_plan_hash_mismatch` hard-fail in Submit is unchanged and applies on
-   both the auto-approve and manual-gate paths. **Scope:** the check is
-   count/structure-only (heading parity, ID continuity, acceptance presence) —
-   it does NOT verify per-task content mapping (e.g. a task whose title/
-   acceptance was transcribed from the wrong heading while the count still
-   matches). The plan-file hash pins the source markdown; manifest transcription
-   fidelity beyond count is an accepted residual risk on the auto-approve path.
-3. **Submit.** On auto-proceed or manual approval, dispatch
-   `collab-turn-task-list.md` again with `$MODE=submit`,
-   `$ARTIFACT_REF=<approved plan_file_path>`, and `$ARTIFACT_HASH=<approved
-   hash>`. The worker recomputes the file's SHA-256 and aborts with
-   `failure_report` on mismatch, then parses each `### Task N:` heading into
-   `{id, title, acceptance:[...]}`, builds the `task_list` manifest `{plan_hash,
-   base_sha:<HEAD>, head_sha:<HEAD>, plan_file_path:<$ARTIFACT_REF>, tasks:[...]}`
-   (adding `execution_mode:"mechanical_direct"` only when the single-task
-   eligibility rule in `docs/COLLAB.md` holds). It re-asserts **heading-count
-   parity** (`tasks.length == ^### Task heading count`) as a defense-in-depth
-   integrity anchor and, on mismatch or zero tasks parsed, sends a
-   `failure_report` instead of `task_list`. Otherwise it `collab_send`s
-   `topic="task_list"`. Ingest only the ≤3-line verdict. Session
-   advances to `CodeImplementPending`; the `current_owner` after this
-   transition matches the session's current `implementer`. A later
+1. Dispatch `collab-turn-task-list.md` (mechanical/sonnet). The worker reads
+   `final_plan`/`final_plan_hash` itself, extracts the repo-relative
+   `plan_file_path` from the leading markdown comment, verifies the file content
+   is byte-identical to `final_plan` (or recreates the missing file from the
+   exact approved body), and parses each `### Task N:` heading into
+   `{id, title, timebox_minutes, acceptance:[...]}`.
+2. The worker must reject the bridge before sending if:
+   - there are zero `### Task ` headings
+   - task IDs are not contiguous `1..N`
+   - any task is missing acceptance criteria
+   - any task is missing `Timebox: <=20 minutes`
+   - any task is sized above 20 minutes
+   - the existing plan file differs from the approved `final_plan`
+   PlanLocked is pre-coding, so `failure_report` is not valid here; the worker
+   returns the concrete issue on `blocker:` and sends nothing.
+3. On success, the worker builds the manifest
+   `{plan_hash:final_plan_hash, base_sha:<HEAD>, head_sha:<HEAD>,
+   plan_file_path:<path>, tasks:[...]}` (adding
+   `execution_mode:"mechanical_direct"` only when the single-task eligibility
+   rule in `docs/COLLAB.md` holds) and `collab_send`s `topic="task_list"`.
+   Ingest only the ≤3-line verdict. Session advances to
+   `CodeImplementPending`; the `current_owner` after this transition matches
+   the session's current `implementer`. A later
    `/collab join --implementer=...` may reassign `CodeImplementPending`; the
    new owner must resume from the latest ironmem checkpoint plus a fresh
    plan/code scan. **Log:** `t1_task_list_sent`
@@ -565,7 +524,7 @@ remain:
 - The `implementation_done` payload carries ONLY `head_sha`. Do not
   embed subagent notes, self-critique, success summaries, or
   instructions for Codex in any other field — there are no other
-  fields. Codex reads the diff and the writing-plans markdown at
+  fields. Codex reads the diff and the approved Superpowers task markdown at
   `plan_file_path` to form its own judgment.
 - When dispatching Codex via `codex exec`, the prompt file passed is
   the verbatim expanded Codex prompt with `$ARGUMENTS` substituted —
@@ -681,7 +640,7 @@ d. **Log the appropriate timing event** immediately before launch. Use the
    - For `CodeImplementPending`: **Log:** `t2_codex_dispatched phase=CodeImplementPending round=1`
    - For `CodeReviewFixGlobalPending`: **Log:** `t6_codex_review_dispatched phase=CodeReviewFixGlobalPending round=1`
    - For `PlanParallelDrafts`: **Log:** `t2_codex_dispatched phase=PlanParallelDrafts round=1`
-   - For `PlanCodexReviewPending`: **Log:** `t2_codex_dispatched phase=PlanCodexReviewPending round=<1 or 2>`
+   - For `PlanCodexReviewPending`: **Log:** `t2_codex_dispatched phase=PlanCodexReviewPending round=1`
 
 e. Launch via Bash with `run_in_background: true`. Include `-c model_reasoning_effort=xhigh`
    only for `CodeImplementPending+codex`; omit for all other phases:
@@ -740,7 +699,7 @@ f. **Polling loop** — the dispatcher's interactive surface during this phase.
       - For `CodeImplementPending`: **Log:** `t3_codex_returned phase=CodeImplementPending round=1`
       - For `CodeReviewFixGlobalPending`: **Log:** `t7_codex_review_returned phase=CodeReviewFixGlobalPending round=1`
       - For `PlanParallelDrafts`: **Log:** `t3_codex_returned phase=PlanParallelDrafts round=1`
-      - For `PlanCodexReviewPending`: **Log:** `t3_codex_returned phase=PlanCodexReviewPending round=<1 or 2>`
+      - For `PlanCodexReviewPending`: **Log:** `t3_codex_returned phase=PlanCodexReviewPending round=1`
       Continue to step g.
 
    2. `collab_status.phase` reaches `CodingFailed` →
@@ -828,16 +787,14 @@ Writes are best-effort and never block the protocol.
   benign diagnostic prompt or rely on the background task-completion
   notification; the duplicate-session guard is the server-side backstop, not
   a license to schedule the entry command.
-- **Harness Plan Mode gates only at: v1 FIRST `canonical`
-  (`PlanSynthesisPending` with `review_round == 0`) and v1 `final`
-  (`PlanClaudeFinalizePending`).** The blind `draft` send (from
-  `/collab start`) and revision-round canonicals (`PlanSynthesisPending`
-  with `review_round >= 1`) run autonomously. The v3 `task_list` send is
-  gated by the orchestrator's fidelity check — auto-approve on pass, manual
-  reference-only fallback on fail — not by writing-plans's interactive handoff
-  and not by harness Plan Mode. The v3 `final_review` PR creation runs
-  autonomously (no gate; the diff already passed `review_fix_global` +
-  `review_local`). Every other turn runs autonomously.
+- **Harness Plan Mode gates only at v1 `final`
+  (`PlanClaudeFinalizePending`).** The blind `draft` send, canonical synthesis,
+  and Codex's one plan-review pass run autonomously. The v3 `task_list` send is
+  a mechanical parse/submit from the already-approved Superpowers markdown, not
+  an extra task-planning handoff and not a harness Plan Mode gate. The v3
+  `final_review` PR creation runs autonomously (no gate; the diff already
+  passed `review_fix_global` + `review_local`). Every other turn runs
+  autonomously.
 - **Every v3 `collab_send` payload is JSON** per the matrix in `docs/COLLAB.md`.
   Never send prose payloads for v3 topics.
 - **`head_sha` in every v3 payload must be the current `HEAD` AFTER any
@@ -848,10 +805,10 @@ Writes are best-effort and never block the protocol.
   the only topic that bypasses the owner check. A `coding_failure` prefixed
   `"branch_drift:"` is the canonical drift signal; do not suppress it.
 - If the user interrupts with a question or correction during v1, answer it
-  inside Plan Mode and incorporate it into the next send. During v3, all turns
-  are autonomous — the only remaining content gates are the v1 first
-  `canonical` and `final` (Plan Mode). The bridge auto-approves on its fidelity
-  check (manual fallback only on `fidelity:fail`) and `final_review` PR creation
+  inside the final Plan Mode gate when possible and incorporate it into the
+  final Superpowers task plan. During v3, all turns are autonomous — the only
+  remaining content gate is v1 `final` (Plan Mode). The bridge mechanically
+  submits `task_list` from the approved markdown and `final_review` PR creation
   is gateless.
 
 ## Session handoff (fallback succession)

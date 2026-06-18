@@ -9,6 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Collab planning now skips the extra post-review planning loop: Claude merges
+  the two blind drafts, Codex gets exactly one plan-review pass, then Claude
+  asks for human approval only on the final Superpowers task plan. The
+  PlanLocked bridge now parses that approved plan mechanically into `task_list`
+  entries, and every task must be timeboxed to 20 minutes or less.
 - **`ironrace-rerank` 0.3.4 → 0.4.0 (breaking, workspace-internal):**
   `LlmClient::call` now returns `Result<LlmResponse>` instead of
   `Result<String>`. `LlmResponse` carries the assistant `text` plus token

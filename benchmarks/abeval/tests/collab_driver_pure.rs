@@ -15,12 +15,12 @@ fn dispatch_matrix_maps_each_phase() {
     );
     assert_eq!(
         worker_action("PlanSynthesisPending", "claude", 0),
-        WorkerAction::ClaudeCompose {
+        WorkerAction::ClaudeSend {
             template: "collab-turn-plan-synthesis.md",
-            topic: "canonical"
+            mode: "send"
         }
     );
-    // Revision round: send, not compose.
+    // Synthesis is always autonomous now; final is the only human planning gate.
     assert_eq!(
         worker_action("PlanSynthesisPending", "claude", 1),
         WorkerAction::ClaudeSend {
@@ -36,8 +36,8 @@ fn dispatch_matrix_maps_each_phase() {
         }
     );
     assert_eq!(
-        // PlanLocked is the v3 bridge: task-list compose+submit (own template,
-        // file+hash artifact), not a generic drawer compose.
+        // PlanLocked is the v3 bridge: one mechanical task-list submit worker,
+        // not another Superpowers planning pass.
         worker_action("PlanLocked", "claude", 0),
         WorkerAction::TaskListBridge
     );
