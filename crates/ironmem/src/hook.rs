@@ -3879,6 +3879,81 @@ mod tests {
     }
 
     #[test]
+    fn fallback_key_no_double_count_when_transcript_grows_between_stop_and_precompact() {
+        // H1 end-to-end: with NO session id (content-hash fallback), a transcript
+        // that GROWS between `stop` and `precompact` must not re-insert the
+        // already-recorded messages. The fallback key hashes only the stable
+        // first line, so msg-1 keeps its turn_id across growth and the upsert
+        // dedups it; only the newly-appended msg-2 is added.
+        let _env = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let _metrics = crate::metrics::METRICS_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        std::env::remove_var("IRONMEM_METRICS");
+        std::env::set_var("IRONMEM_DISABLE_MIGRATION", "1");
+
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = temp.path().join("workspace");
+        std::fs::create_dir_all(&workspace).unwrap();
+
+        let config = Config {
+            db_path: temp.path().join("memory.sqlite3"),
+            model_dir: temp.path().join("model"),
+            model_dir_explicit: true,
+            state_dir: temp.path().join("hook_state"),
+            mcp_access_mode: McpAccessMode::Trusted,
+            embed_mode: EmbedMode::Noop,
+        };
+
+        let assistant = |id: &str| {
+            serde_json::json!({
+                "type": "assistant",
+                "message": { "id": id, "model": "claude-sonnet-4-6", "usage": {
+                    "input_tokens": 100, "output_tokens": 20,
+                    "cache_creation_input_tokens": 0, "cache_read_input_tokens": 0 }}
+            })
+            .to_string()
+        };
+        let result = serde_json::json!({"type": "result", "is_error": false}).to_string();
+        let msg1 = assistant("grow-msg-1");
+
+        let transcript = temp.path().join("t.jsonl");
+        // First read: msg-1 + result (no session id).
+        std::fs::write(&transcript, format!("{msg1}\n{result}\n")).unwrap();
+        let input = |hook_session: &str| {
+            serde_json::json!({
+                "cwd": workspace.to_string_lossy(),
+                "session_id": "",
+                "transcript_path": transcript.to_string_lossy(),
+                "hook": hook_session,
+            })
+        };
+        run_hook_with_input("stop", "claude", config.clone(), input("stop")).unwrap();
+
+        // Transcript grows by one assistant message, then precompact re-reads it.
+        std::fs::write(
+            &transcript,
+            format!("{msg1}\n{}\n{result}\n", assistant("grow-msg-2")),
+        )
+        .unwrap();
+        run_hook_with_input("precompact", "claude", config.clone(), input("precompact")).unwrap();
+
+        let app = App::new(config).unwrap();
+        let rows = app
+            .db
+            .query_token_usage(&crate::db::metrics::TokenUsageQuery::default())
+            .unwrap();
+        let tx_rows: Vec<_> = rows.iter().filter(|r| r.source == "transcript").collect();
+        assert_eq!(
+            tx_rows.len(),
+            2,
+            "msg-1 must dedup across growth; only msg-2 is added (no double-count)"
+        );
+
+        std::env::remove_var("IRONMEM_DISABLE_MIGRATION");
+    }
+
+    #[test]
     fn malformed_transcripts_do_not_fail_hook_or_write_transcript_rows() {
         let _env = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
         let _metrics = crate::metrics::METRICS_ENV_LOCK

@@ -111,7 +111,7 @@ pub(crate) fn parse_claude_stream_json(
 
     let session_key = harness_session_id
         .map(|s| s.to_string())
-        .unwrap_or_else(|| content_hash(raw));
+        .unwrap_or_else(|| fallback_session_key(raw));
 
     let rows = usage_by_id
         .into_iter()
@@ -138,7 +138,11 @@ pub(crate) fn parse_claude_stream_json(
 /// - `cache_read = cached_input_tokens`.
 /// - `cache_creation = 0` (not tracked by Codex rollout).
 /// - `cached > input` → `Err` (loud error, never silent miscount).
-/// - No `token_count` event → `Ok(None)` (session still running or no usage yet).
+/// - A non-empty rollout with NO parseable JSON line → `Err` (corrupt, not
+///   "not started"); individual non-JSON lines among valid ones are tolerated
+///   but counted and `warn!`-ed (a truncated tail can drop trailing counts).
+/// - No `token_count` event (but valid JSON present) → `Ok(None)` (session still
+///   running or no usage yet). Empty/whitespace input → `Ok(None)`.
 /// - No parseable `session_meta` cwd is acceptable for the hook path (we use the
 ///   caller-supplied `harness_session_id` directly).
 ///
@@ -149,16 +153,27 @@ pub(crate) fn parse_codex_rollout(
     harness_session_id: Option<&str>,
 ) -> Result<Option<TranscriptRow>, String> {
     let mut last_usage: Option<(i64, i64, i64)> = None; // (input, cached, output)
+    let mut saw_nonblank = false;
+    let mut saw_valid_json = false;
+    let mut skipped_lines = 0usize;
 
     for line in raw.lines() {
         let line = line.trim();
         if line.is_empty() {
             continue;
         }
+        saw_nonblank = true;
         let event: serde_json::Value = match serde_json::from_str(line) {
             Ok(v) => v,
-            Err(_) => continue, // Codex rollout tolerates non-conforming lines
+            // Codex rollout legitimately contains non-conforming lines; tolerate
+            // them individually but count them (a wholly-garbage file is rejected
+            // below, and partial corruption is surfaced via a warn).
+            Err(_) => {
+                skipped_lines += 1;
+                continue;
+            }
         };
+        saw_valid_json = true;
         let kind = event.get("type").and_then(|v| v.as_str()).unwrap_or("");
         if kind == "event_msg" {
             let payload = &event["payload"];
@@ -174,6 +189,25 @@ pub(crate) fn parse_codex_rollout(
         }
     }
 
+    // A non-empty rollout that produced ZERO parseable JSON lines is corrupt,
+    // not "not started yet" — reject it loudly so the hook never banks a silent
+    // zero (mirrors the Claude parser's non-JSON rejection). An empty/whitespace
+    // file legitimately means the session has not started → Ok(None).
+    if saw_nonblank && !saw_valid_json {
+        return Err(
+            "codex rollout had no parseable JSON lines — refusing to persist possibly-corrupt usage"
+                .to_string(),
+        );
+    }
+    // Partial corruption (some lines skipped among valid ones) can drop trailing
+    // token_count events and silently undercount; leave a diagnostic trace.
+    if skipped_lines > 0 {
+        tracing::warn!(
+            skipped_lines,
+            "codex rollout: skipped non-JSON line(s); cumulative token count may be truncated"
+        );
+    }
+
     let Some((input_raw, cached, output)) = last_usage else {
         return Ok(None);
     };
@@ -186,7 +220,7 @@ pub(crate) fn parse_codex_rollout(
 
     let session_key = harness_session_id
         .map(|s| s.to_string())
-        .unwrap_or_else(|| content_hash(raw));
+        .unwrap_or_else(|| fallback_session_key(raw));
 
     Ok(Some(TranscriptRow {
         turn_id: format!("transcript:{session_key}:codex-final"),
@@ -217,9 +251,28 @@ fn parse_usage_object(v: Option<&serde_json::Value>) -> TranscriptUsage {
     }
 }
 
-/// Stable 16-hex-char hash of raw content for use as a session key fallback.
-/// SHA-256 truncated to 8 bytes (16 hex chars) — sufficient for dedup within
-/// one transcript; NOT a cryptographic guarantee.
+/// Derive a session-key namespace when no harness session id is available.
+///
+/// Hashes ONLY the first non-blank line of the transcript, not the whole file.
+/// Transcripts are append-only, so the first line is stable across re-reads —
+/// `stop` then `precompact` (or two `stop`s) see a grown file but an unchanged
+/// first line, yielding the SAME key and preserving turn_id idempotency. Hashing
+/// the whole transcript would change the key on every re-read and double-count
+/// already-recorded turns (H1). For Claude the per-message `message.id` suffix
+/// keeps turn_ids unique even if two sessions shared a first line; for Codex the
+/// first line is the `session_meta` event whose timestamp makes it unique.
+fn fallback_session_key(raw: &str) -> String {
+    let first_line = raw
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .unwrap_or("");
+    content_hash(first_line)
+}
+
+/// Stable 16-hex-char hash of the given content. SHA-256 truncated to 8 bytes
+/// (16 hex chars) — sufficient for namespacing within one session; NOT a
+/// cryptographic guarantee.
 fn content_hash(raw: &str) -> String {
     use sha2::{Digest, Sha256};
 
@@ -468,5 +521,93 @@ mod tests {
         assert_eq!(h1, "2cf24dba5fb0a30e", "hash is truncated SHA-256");
         assert_eq!(h1.len(), 16, "hash must be 16 hex chars");
         assert!(h1.chars().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    // ── H1: session-key fallback must be stable as the transcript grows ──────
+
+    #[test]
+    fn claude_fallback_turn_id_is_stable_across_transcript_growth() {
+        // With NO harness session id, the turn_id namespace must be derived from
+        // an append-stable property — NOT the whole transcript. `stop` then
+        // `precompact` re-read a file that has grown; a whole-transcript hash
+        // would change the namespace and re-insert msg-1 under a new turn_id,
+        // double-counting it in §10.4.
+        let msg1 = make_assistant_line("msg-1", "claude-sonnet-4-6", 100, 20, 0, 0);
+        let early = format!("{}\n{}\n", msg1, result_line());
+        let grown = format!(
+            "{}\n{}\n{}\n",
+            msg1,
+            make_assistant_line("msg-2", "claude-sonnet-4-6", 200, 30, 0, 0),
+            result_line()
+        );
+
+        let early_rows = parse_claude_stream_json(&early, None).unwrap();
+        let grown_rows = parse_claude_stream_json(&grown, None).unwrap();
+
+        let early_msg1 = early_rows
+            .iter()
+            .find(|r| r.turn_id.ends_with(":msg-1"))
+            .unwrap();
+        let grown_msg1 = grown_rows
+            .iter()
+            .find(|r| r.turn_id.ends_with(":msg-1"))
+            .unwrap();
+        assert_eq!(
+            early_msg1.turn_id, grown_msg1.turn_id,
+            "msg-1 turn_id must be identical across transcript growth (idempotent)"
+        );
+    }
+
+    #[test]
+    fn codex_fallback_turn_id_is_stable_across_rollout_growth() {
+        let meta = serde_json::json!({
+            "type": "session_meta",
+            "payload": { "cwd": "/tmp/repo", "timestamp": "2026-06-19T10:00:00Z" }
+        })
+        .to_string();
+        let count1 = serde_json::json!({
+            "type": "event_msg",
+            "payload": { "type": "token_count", "info": { "total_token_usage": {
+                "input_tokens": 1000, "cached_input_tokens": 400, "output_tokens": 200 }}}
+        })
+        .to_string();
+        let count2 = serde_json::json!({
+            "type": "event_msg",
+            "payload": { "type": "token_count", "info": { "total_token_usage": {
+                "input_tokens": 1500, "cached_input_tokens": 600, "output_tokens": 300 }}}
+        })
+        .to_string();
+
+        let early = format!("{meta}\n{count1}\n");
+        let grown = format!("{meta}\n{count1}\n{count2}\n");
+        let early_row = parse_codex_rollout(&early, None).unwrap().unwrap();
+        let grown_row = parse_codex_rollout(&grown, None).unwrap().unwrap();
+        assert_eq!(
+            early_row.turn_id, grown_row.turn_id,
+            "codex-final turn_id must be stable across rollout growth (idempotent)"
+        );
+    }
+
+    // ── H2: an all-garbage Codex rollout is a loud error, not a silent None ──
+
+    #[test]
+    fn codex_rejects_rollout_with_no_parseable_json() {
+        // A non-empty rollout where NO line parses as JSON must be a loud `Err`,
+        // not `Ok(None)` (which is reserved for "valid rollout, no token_count
+        // yet"). Otherwise a fully-corrupt/truncated rollout is indistinguishable
+        // from a still-running session and silently banks zero rows.
+        let raw = "this is not json\nneither is this\n";
+        let err = parse_codex_rollout(raw, Some("codex-sess")).unwrap_err();
+        assert!(
+            err.contains("no parseable JSON"),
+            "expected no-parseable-JSON error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn codex_empty_rollout_is_none_not_error() {
+        // An empty / whitespace-only rollout is "not started", not corrupt.
+        assert!(parse_codex_rollout("", Some("s")).unwrap().is_none());
+        assert!(parse_codex_rollout("  \n \n", Some("s")).unwrap().is_none());
     }
 }
