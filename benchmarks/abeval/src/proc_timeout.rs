@@ -22,12 +22,15 @@ use std::time::Duration;
 
 use anyhow::{anyhow, Context, Result};
 
-/// Default per-turn wall-clock ceiling (15 min). A turn exceeding this is treated
-/// as hung or too-large: with a pre-warmed shared `CARGO_TARGET_DIR` every gate
-/// pass is incremental, so no single legitimate collab turn should approach it.
-/// Override with `ABEVAL_TURN_TIMEOUT_SECS` (e.g. raise it if a cold first gate
-/// turn ever trips the watchdog).
-pub const DEFAULT_TURN_TIMEOUT_SECS: u64 = 900;
+/// Default per-turn wall-clock ceiling (30 min). A turn exceeding this is treated
+/// as hung or too-large. Gate turns are incremental on a pre-warmed shared
+/// `CARGO_TARGET_DIR`, but the **implement** turn is the model authoring code
+/// (one validated run committed a change and was 100+ lines into a second edit
+/// past the old 15-min cap, which killed live progress), so the ceiling must
+/// clear a real implement turn while still reaping a genuine hang. Override with
+/// `ABEVAL_TURN_TIMEOUT_SECS` (e.g. raise it if a cold first gate turn ever trips
+/// the watchdog).
+pub const DEFAULT_TURN_TIMEOUT_SECS: u64 = 1800;
 
 /// Grace period between SIGTERM and SIGKILL when force-killing a timed-out group.
 const KILL_GRACE: Duration = Duration::from_secs(3);
@@ -255,7 +258,7 @@ mod tests {
     #[test]
     fn kills_and_errors_when_turn_exceeds_timeout() {
         // `sleep 30` with a 300ms ceiling must be killed promptly (well under the
-        // real 15-min default), not waited out.
+        // real 30-min default), not waited out.
         let start = std::time::Instant::now();
         let mut cmd = Command::new("/bin/sleep");
         cmd.arg("30");

@@ -273,7 +273,12 @@ pub fn run_collab_task<R: CollabStateReader, S: WorkerSpawner, A: CodexAttributo
     attributor: &A,
 ) -> Result<CollabRunResult> {
     let wt = ctx.worktree.as_path();
-    let synthetic_pr = format!("local://abeval/{}", ctx.task_id);
+    // Synthetic, un-pushed PR URL. Must be `https://`-schemed: the server's
+    // `final_review` event validation (collab_events.rs) rejects any other scheme
+    // (a `javascript:`/`file://` guard), so a `local://` URL is refused and the
+    // FinalReview event never lands. The reserved `.invalid` TLD (RFC 6761) keeps
+    // it unmistakably fake — nothing is created or pushed.
+    let synthetic_pr = format!("https://abeval.invalid/{}", ctx.task_id);
 
     let mut claude_usage = Usage::default();
     let mut fix_commits: u32 = 0;
