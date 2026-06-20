@@ -753,11 +753,19 @@ separately per §12 2026-06-17), so this is a Claude-only correction.
    parent's roll-up; adding it would double-count the parent).
 4. `result` text (the model's printed output, where collab sentinel lines live)
    and `is_error` come from the terminal `result` event.
+5. **Undercount exclusion.** A collab worker turn whose transcript is unparseable
+   (the loud-error case of rule 1, reached via the `worker_text_and_usage`
+   fallback) records a fallback ZERO for that turn and is flagged. A run that
+   reaches `CodingComplete` with **any** such flagged turn is **INVALID and
+   excluded** — its Claude `tokens_to_done` is a known undercount, and a completed
+   run is headline-eligible. This is a partial-loss guard: the all-zero guard
+   below cannot see a non-zero total that is missing one turn's tokens.
 
 This is implemented in `benchmarks/abeval/src/stream_usage.rs::parse_stream_json`
 and consumed by both the superpowers single-`claude -p` path
 (`client::LiveExecutor`) and the ironmem collab worker path
-(`collab_live::worker_text_and_usage`). The §11.2 zero-token loud-error guard is
-unchanged: it now fires on a zero *summed* total. Because this can move the §11.3
-headline materially, it gates any fresh A/B campaign — it must land before
-tokens-to-done is reported.
+(`collab_live::worker_text_and_usage`); the rule-5 exclusion lives in
+`collab_driver::run_collab_task` alongside the existing zero-Claude / zero-Codex
+INVALID guards. The §11.2 zero-token loud-error guard is unchanged: it now fires
+on a zero *summed* total. Because this can move the §11.3 headline materially, it
+gates any fresh A/B campaign — it must land before tokens-to-done is reported.
