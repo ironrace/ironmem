@@ -769,3 +769,53 @@ and consumed by both the superpowers single-`claude -p` path
 INVALID guards. The §11.2 zero-token loud-error guard is unchanged: it now fires
 on a zero *summed* total. Because this can move the §11.3 headline materially, it
 gates any fresh A/B campaign — it must land before tokens-to-done is reported.
+
+---
+
+### §12 Amendment — 2026-06-20: Production hook persists `source='transcript'` rows
+
+**Summary.** The `stop` and `precompact` lifecycle hooks now persistently write
+full-transcript token-usage rows to `token_usage` with `source='transcript'`,
+`estimated=false`, in addition to the existing occupancy samples and
+`source='mcp_response'` rows. This makes the **production ironmem arm** measurement-
+valid for the abeval A/B experiment — previously, real `/collab` runs had no
+`tokens_to_done` because only `mcp_response` (serving footprint) rows were written.
+No counter names, units, §1–§11 aggregation rules, or schema migrations changed.
+
+**Idempotency key.** Each row is keyed by `turn_id`:
+- Claude stream-json: `transcript:<harness-session-id-or-content-hash>:<message-id>`.
+  One row per distinct `message.id`.
+- Codex rollout: `transcript:<harness-session-id-or-content-hash>:codex-final`.
+  One cumulative row per session.
+
+Dedup: `SELECT … WHERE source='transcript' AND turn_id=?` before INSERT — if found,
+UPDATE the four components; else INSERT. Scoped to `source='transcript'` so
+`mcp_response`/`llm_rerank`/`pref_extract` rows with the same `turn_id` are not
+affected.
+
+**Codex cached-token subtraction.** Codex `input_tokens` INCLUDES
+`cached_input_tokens`, unlike the Anthropic convention. Production hook maps:
+`input = input_tokens − cached_input_tokens`, `cache_read = cached_input_tokens`,
+`cache_creation = 0`. A `cached > input` value is a loud warn (row skipped).
+
+**Full-transcript parse (not the occupancy tail).** The occupancy tail reader
+(`extract_last_assistant_usage`) reads only the last 2 MB and returns a single
+last-assistant usage — undercounting subagent-heavy streams. Transcript token
+persistence uses a separate full-file parser (`crates/ironmem/src/metrics/transcript.rs`)
+that reads the entire transcript and emits one row per distinct `message.id` (Claude)
+or one cumulative row (Codex). The tail reader is unchanged.
+
+**Transcript-row task_tag.** For rows inside an active collab session, `task_tag`
+is set to `collab_session_id`. This is transcript-row-specific and preserves the
+§10.4 OR-join invariant (`u.task_tag = t.task_tag OR u.collab_session_id =
+t.collab_session_id`) so transcript rows are visible in `ironmem report`.
+
+**Gate.** Transcript persistence fires under `metrics_enabled()` (same gate as
+occupancy), DECOUPLED from `allows_writes`/`mcp_access_mode` (same §113 pattern as
+occupancy decoupling). `IRONMEM_METRICS=0` suppresses transcript rows too. `stop` and
+`precompact` only — UserPromptSubmit remains occupancy-only (N3: no real message id
+available in UPS).
+
+**Implementation.** `crates/ironmem/src/metrics/transcript.rs` (parsers),
+`crates/ironmem/src/db/metrics.rs::upsert_transcript_token_usage` (idempotent DB
+helper), `crates/ironmem/src/hook.rs::persist_transcript_tokens` (wiring).

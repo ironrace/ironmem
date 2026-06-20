@@ -10,6 +10,8 @@
 //!   `IRONMEM_METRICS`/`IRONMEM_CONTEXT_WINDOW` gating is read fresh by the callers
 //!   (`search::tunables`), not here.
 
+pub(crate) mod transcript;
+
 /// Token usage extracted from a transcript's last assistant message.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct Usage {
