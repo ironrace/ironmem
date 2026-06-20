@@ -61,19 +61,22 @@ pub(crate) fn parse_claude_stream_json(
     harness_session_id: Option<&str>,
 ) -> Result<Vec<TranscriptRow>, String> {
     let mut usage_by_id: BTreeMap<String, (Option<String>, TranscriptUsage)> = BTreeMap::new();
-    let mut saw_result = false;
+    let mut last_event_type: Option<String> = None;
     let mut saw_any = false;
 
-    for line in raw.lines() {
+    for (idx, line) in raw.lines().enumerate() {
         let line = line.trim();
         if line.is_empty() {
             continue;
         }
         saw_any = true;
         let event: serde_json::Value = serde_json::from_str(line)
-            .map_err(|e| format!("non-JSON line in transcript: {e} — line: {line}"))?;
+            .map_err(|e| format!("non-JSON line {} in transcript: {e}", idx + 1))?;
 
-        match event.get("type").and_then(|v| v.as_str()) {
+        let event_type = event.get("type").and_then(|v| v.as_str());
+        last_event_type = event_type.map(str::to_string);
+
+        match event_type {
             Some("assistant") => {
                 let Some(message) = event.get("message") else {
                     continue;
@@ -90,7 +93,6 @@ pub(crate) fn parse_claude_stream_json(
                 usage_by_id.insert(id.to_string(), (model, usage));
             }
             Some("result") => {
-                saw_result = true;
                 // Deliberately do NOT add result.usage — it is the parent
                 // roll-up and would double-count per-message assistant usage.
             }
@@ -101,9 +103,9 @@ pub(crate) fn parse_claude_stream_json(
     if !saw_any {
         return Err("stream-json transcript was empty".to_string());
     }
-    if !saw_result {
+    if last_event_type.as_deref() != Some("result") {
         return Err(
-            "stream-json transcript had no terminal `result` event — refusing to persist possibly-incomplete usage".to_string(),
+            "stream-json transcript did not end with a terminal `result` event — refusing to persist possibly-incomplete usage".to_string(),
         );
     }
 
@@ -219,11 +221,12 @@ fn parse_usage_object(v: Option<&serde_json::Value>) -> TranscriptUsage {
 /// SHA-256 truncated to 8 bytes (16 hex chars) — sufficient for dedup within
 /// one transcript; NOT a cryptographic guarantee.
 fn content_hash(raw: &str) -> String {
-    use std::collections::hash_map::DefaultHasher;
-    use std::hash::{Hash, Hasher};
-    let mut h = DefaultHasher::new();
-    raw.hash(&mut h);
-    format!("{:016x}", h.finish())
+    use sha2::{Digest, Sha256};
+
+    let mut hasher = Sha256::new();
+    hasher.update(raw.as_bytes());
+    let digest = hasher.finalize();
+    format!("{digest:x}").chars().take(16).collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -335,6 +338,10 @@ mod tests {
             err.contains("non-JSON"),
             "expected non-JSON error, got: {err}"
         );
+        assert!(
+            !err.contains("this is not json"),
+            "parser errors must not include raw transcript content"
+        );
     }
 
     #[test]
@@ -358,6 +365,21 @@ mod tests {
         assert!(
             err.contains("result"),
             "expected missing-result error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn claude_rejects_result_that_is_not_terminal() {
+        let raw = format!(
+            "{}\n{}\n{}\n",
+            make_assistant_line("msg-1", "claude-sonnet-4-6", 100, 20, 0, 0),
+            result_line(),
+            make_assistant_line("msg-2", "claude-sonnet-4-6", 200, 40, 0, 0)
+        );
+        let err = parse_claude_stream_json(&raw, Some("sess")).unwrap_err();
+        assert!(
+            err.contains("terminal") || err.contains("result"),
+            "expected non-terminal-result error, got: {err}"
         );
     }
 
@@ -443,6 +465,7 @@ mod tests {
         let h1 = content_hash("hello");
         let h2 = content_hash("hello");
         assert_eq!(h1, h2, "hash must be deterministic");
+        assert_eq!(h1, "2cf24dba5fb0a30e", "hash is truncated SHA-256");
         assert_eq!(h1.len(), 16, "hash must be 16 hex chars");
         assert!(h1.chars().all(|c| c.is_ascii_hexdigit()));
     }

@@ -20,6 +20,7 @@ use crate::sanitize::{sanitize_harness, sanitize_session_id};
 const REVIEW_WING: &str = "reviews";
 const REVIEW_MAX_BYTES: usize = 24_000;
 const METRICS_TRANSCRIPT_TAIL_BYTES: u64 = 2 * 1024 * 1024;
+const METRICS_FULL_TRANSCRIPT_MAX_BYTES: u64 = 128 * 1024 * 1024;
 
 /// ~400-token budget for the injected block (~4 chars/token).
 const SESSION_CONTEXT_MAX_BYTES: usize = 1600;
@@ -300,6 +301,14 @@ fn read_full_transcript(path: &Path) -> Option<String> {
     if !metadata.file_type().is_file() {
         return None;
     }
+    if metadata.len() > METRICS_FULL_TRANSCRIPT_MAX_BYTES {
+        tracing::warn!(
+            bytes = metadata.len(),
+            max_bytes = METRICS_FULL_TRANSCRIPT_MAX_BYTES,
+            "transcript metrics: skipping oversized transcript file"
+        );
+        return None;
+    }
     let mut file = {
         use std::os::unix::fs::OpenOptionsExt;
         std::fs::OpenOptions::new()
@@ -342,16 +351,17 @@ fn persist_transcript_tokens(
 
     let ctx = resolve_transcript_context(app, workspace_root);
     let now = crate::metrics::now_rfc3339();
+    let transcript_session_id = session_id.filter(|sid| *sid != "unknown");
 
     if harness_norm == "codex" {
-        match crate::metrics::transcript::parse_codex_rollout(&raw, session_id) {
+        match crate::metrics::transcript::parse_codex_rollout(&raw, transcript_session_id) {
             Ok(Some(trow)) => {
                 let row = crate::db::metrics::NewTokenUsage {
                     ts: now,
                     source: "transcript".to_string(),
                     harness: "codex".to_string(),
                     model: trow.model,
-                    session_id: session_id.map(|s| s.to_string()),
+                    session_id: transcript_session_id.map(|s| s.to_string()),
                     collab_session_id: ctx.collab_session_id.clone(),
                     collab_phase: ctx.collab_phase.clone(),
                     task_tag: ctx.task_tag.clone(),
@@ -374,15 +384,16 @@ fn persist_transcript_tokens(
             Err(e) => tracing::warn!("transcript metrics: codex parse failed: {e}"),
         }
     } else {
-        match crate::metrics::transcript::parse_claude_stream_json(&raw, session_id) {
+        match crate::metrics::transcript::parse_claude_stream_json(&raw, transcript_session_id) {
             Ok(rows) => {
-                for trow in rows {
-                    let row = crate::db::metrics::NewTokenUsage {
+                let db_rows: Vec<_> = rows
+                    .into_iter()
+                    .map(|trow| crate::db::metrics::NewTokenUsage {
                         ts: now.clone(),
                         source: "transcript".to_string(),
                         harness: "claude".to_string(),
                         model: trow.model,
-                        session_id: session_id.map(|s| s.to_string()),
+                        session_id: transcript_session_id.map(|s| s.to_string()),
                         collab_session_id: ctx.collab_session_id.clone(),
                         collab_phase: ctx.collab_phase.clone(),
                         task_tag: ctx.task_tag.clone(),
@@ -396,10 +407,10 @@ fn persist_transcript_tokens(
                         map_status: None,
                         turn_id: Some(trow.turn_id),
                         area: None,
-                    };
-                    if let Err(e) = app.db.upsert_transcript_token_usage(&row) {
-                        tracing::warn!("transcript metrics: claude upsert failed: {e}");
-                    }
+                    })
+                    .collect();
+                if let Err(e) = app.db.upsert_transcript_token_usage_many(&db_rows) {
+                    tracing::warn!("transcript metrics: claude upsert failed: {e}");
                 }
             }
             Err(e) => tracing::warn!("transcript metrics: claude stream-json parse failed: {e}"),
@@ -3803,6 +3814,196 @@ mod tests {
             tx_rows.len(),
             2,
             "ReadOnly mode must still write transcript rows"
+        );
+
+        std::env::remove_var("IRONMEM_DISABLE_MIGRATION");
+    }
+
+    #[test]
+    fn unknown_session_id_uses_content_hash_fallback_for_transcript_key() {
+        let _env = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let _metrics = crate::metrics::METRICS_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        std::env::remove_var("IRONMEM_METRICS");
+        std::env::set_var("IRONMEM_DISABLE_MIGRATION", "1");
+
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = temp.path().join("workspace");
+        std::fs::create_dir_all(&workspace).unwrap();
+
+        let config = Config {
+            db_path: temp.path().join("memory.sqlite3"),
+            model_dir: temp.path().join("model"),
+            model_dir_explicit: true,
+            state_dir: temp.path().join("hook_state"),
+            mcp_access_mode: McpAccessMode::Trusted,
+            embed_mode: EmbedMode::Noop,
+        };
+
+        let transcript = temp.path().join("t.jsonl");
+        std::fs::write(&transcript, make_claude_transcript("fallback")).unwrap();
+
+        run_hook_with_input(
+            "stop",
+            "claude",
+            config.clone(),
+            serde_json::json!({
+                "cwd": workspace.to_string_lossy(),
+                "session_id": "",
+                "transcript_path": transcript.to_string_lossy(),
+            }),
+        )
+        .unwrap();
+
+        let app = App::new(config).unwrap();
+        let rows = app
+            .db
+            .query_token_usage(&crate::db::metrics::TokenUsageQuery::default())
+            .unwrap();
+        let tx_rows: Vec<_> = rows.iter().filter(|r| r.source == "transcript").collect();
+        assert_eq!(tx_rows.len(), 2);
+        for row in tx_rows {
+            assert!(
+                row.session_id.is_none(),
+                "sanitized unknown session id must be treated as absent"
+            );
+            let turn_id = row.turn_id.as_deref().unwrap_or("");
+            assert!(
+                !turn_id.contains(":unknown:"),
+                "turn_id must use content-hash fallback, got {turn_id}"
+            );
+        }
+
+        std::env::remove_var("IRONMEM_DISABLE_MIGRATION");
+    }
+
+    #[test]
+    fn malformed_transcripts_do_not_fail_hook_or_write_transcript_rows() {
+        let _env = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let _metrics = crate::metrics::METRICS_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        std::env::remove_var("IRONMEM_METRICS");
+        std::env::set_var("IRONMEM_DISABLE_MIGRATION", "1");
+
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = temp.path().join("workspace");
+        std::fs::create_dir_all(&workspace).unwrap();
+
+        let config = Config {
+            db_path: temp.path().join("memory.sqlite3"),
+            model_dir: temp.path().join("model"),
+            model_dir_explicit: true,
+            state_dir: temp.path().join("hook_state"),
+            mcp_access_mode: McpAccessMode::Trusted,
+            embed_mode: EmbedMode::Noop,
+        };
+
+        let bad_claude = temp.path().join("bad-claude.jsonl");
+        std::fs::write(&bad_claude, "not json\n").unwrap();
+        run_hook_with_input(
+            "stop",
+            "claude",
+            config.clone(),
+            serde_json::json!({
+                "cwd": workspace.to_string_lossy(),
+                "session_id": "bad-claude-session",
+                "transcript_path": bad_claude.to_string_lossy(),
+            }),
+        )
+        .unwrap();
+
+        let bad_codex = temp.path().join("bad-codex.jsonl");
+        std::fs::write(
+            &bad_codex,
+            serde_json::json!({
+                "type": "event_msg",
+                "payload": {
+                    "type": "token_count",
+                    "info": {
+                        "total_token_usage": {
+                            "input_tokens": 100,
+                            "cached_input_tokens": 200,
+                            "output_tokens": 50
+                        }
+                    }
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+        run_hook_with_input(
+            "precompact",
+            "codex",
+            config.clone(),
+            serde_json::json!({
+                "cwd": workspace.to_string_lossy(),
+                "session_id": "bad-codex-session",
+                "transcript_path": bad_codex.to_string_lossy(),
+            }),
+        )
+        .unwrap();
+
+        let app = App::new(config).unwrap();
+        let rows = app
+            .db
+            .query_token_usage(&crate::db::metrics::TokenUsageQuery::default())
+            .unwrap();
+        assert!(
+            rows.iter().all(|r| r.source != "transcript"),
+            "malformed transcripts must not write partial transcript rows"
+        );
+
+        std::env::remove_var("IRONMEM_DISABLE_MIGRATION");
+    }
+
+    #[test]
+    fn oversized_transcript_is_skipped_without_token_rows() {
+        let _env = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let _metrics = crate::metrics::METRICS_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        std::env::remove_var("IRONMEM_METRICS");
+        std::env::set_var("IRONMEM_DISABLE_MIGRATION", "1");
+
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = temp.path().join("workspace");
+        std::fs::create_dir_all(&workspace).unwrap();
+
+        let config = Config {
+            db_path: temp.path().join("memory.sqlite3"),
+            model_dir: temp.path().join("model"),
+            model_dir_explicit: true,
+            state_dir: temp.path().join("hook_state"),
+            mcp_access_mode: McpAccessMode::Trusted,
+            embed_mode: EmbedMode::Noop,
+        };
+
+        let transcript = temp.path().join("huge.jsonl");
+        let file = std::fs::File::create(&transcript).unwrap();
+        file.set_len(METRICS_FULL_TRANSCRIPT_MAX_BYTES + 1).unwrap();
+
+        run_hook_with_input(
+            "stop",
+            "claude",
+            config.clone(),
+            serde_json::json!({
+                "cwd": workspace.to_string_lossy(),
+                "session_id": "huge-transcript-session",
+                "transcript_path": transcript.to_string_lossy(),
+            }),
+        )
+        .unwrap();
+
+        let app = App::new(config).unwrap();
+        let rows = app
+            .db
+            .query_token_usage(&crate::db::metrics::TokenUsageQuery::default())
+            .unwrap();
+        assert!(
+            rows.iter().all(|r| r.source != "transcript"),
+            "oversized transcripts must be skipped before full-file read"
         );
 
         std::env::remove_var("IRONMEM_DISABLE_MIGRATION");

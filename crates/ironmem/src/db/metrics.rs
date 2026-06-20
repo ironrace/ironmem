@@ -1008,43 +1008,27 @@ impl Database {
     /// Scoping dedup to `source='transcript'` leaves `mcp_response`/`llm_rerank`/
     /// `pref_extract` rows untouched even when they share the same `turn_id`.
     pub fn upsert_transcript_token_usage(&self, row: &NewTokenUsage) -> Result<(), MemoryError> {
-        self.conn.execute_batch("BEGIN")?;
-        let result = (|| -> Result<(), MemoryError> {
-            let existing_id: Option<i64> = self
-                .conn
-                .query_row(
-                    "SELECT id FROM token_usage WHERE source = 'transcript' AND turn_id = ?1",
-                    params![row.turn_id],
-                    |r| r.get::<_, i64>(0),
-                )
-                .optional()?;
+        self.upsert_transcript_token_usage_many(std::slice::from_ref(row))
+    }
 
-            if let Some(id) = existing_id {
-                self.conn.execute(
-                    "UPDATE token_usage SET
-                        input_tokens = ?2,
-                        output_tokens = ?3,
-                        cache_creation_input_tokens = ?4,
-                        cache_read_input_tokens = ?5,
-                        model = ?6,
-                        collab_session_id = ?7,
-                        collab_phase = ?8,
-                        task_tag = ?9
-                     WHERE id = ?1",
-                    params![
-                        id,
-                        row.input_tokens,
-                        row.output_tokens,
-                        row.cache_creation_input_tokens,
-                        row.cache_read_input_tokens,
-                        row.model,
-                        row.collab_session_id,
-                        row.collab_phase,
-                        row.task_tag,
-                    ],
-                )?;
-            } else {
-                self.insert_token_usage(row)?;
+    /// Batch variant for full-transcript hook writes. Uses one immediate
+    /// transaction for all parsed rows so overlapping hooks are serialized once
+    /// and long Claude transcripts do not pay one lock/lookup cycle per message.
+    pub fn upsert_transcript_token_usage_many(
+        &self,
+        rows: &[NewTokenUsage],
+    ) -> Result<(), MemoryError> {
+        if rows.is_empty() {
+            return Ok(());
+        }
+        // `stop` and `precompact` can overlap in separate hook processes. A
+        // deferred transaction allows both writers to observe "no row" before
+        // either inserts; `BEGIN IMMEDIATE` serializes that SELECT/INSERT window
+        // without requiring a schema migration.
+        self.conn.execute_batch("BEGIN IMMEDIATE")?;
+        let result = (|| -> Result<(), MemoryError> {
+            for row in rows {
+                self.upsert_transcript_token_usage_in_tx(row)?;
             }
             Ok(())
         })();
@@ -1058,6 +1042,57 @@ impl Database {
                 Err(e)
             }
         }
+    }
+
+    fn upsert_transcript_token_usage_in_tx(&self, row: &NewTokenUsage) -> Result<(), MemoryError> {
+        if row.source != "transcript" {
+            return Err(MemoryError::Validation(
+                "upsert_transcript_token_usage requires source='transcript'".to_string(),
+            ));
+        }
+        if row.turn_id.is_none() {
+            return Err(MemoryError::Validation(
+                "upsert_transcript_token_usage requires turn_id".to_string(),
+            ));
+        }
+
+        let existing_id: Option<i64> = self
+            .conn
+            .query_row(
+                "SELECT id FROM token_usage WHERE source = 'transcript' AND turn_id = ?1",
+                params![row.turn_id],
+                |r| r.get::<_, i64>(0),
+            )
+            .optional()?;
+
+        if let Some(id) = existing_id {
+            self.conn.execute(
+                "UPDATE token_usage SET
+                    input_tokens = ?2,
+                    output_tokens = ?3,
+                    cache_creation_input_tokens = ?4,
+                    cache_read_input_tokens = ?5,
+                    model = ?6,
+                    collab_session_id = ?7,
+                    collab_phase = ?8,
+                    task_tag = ?9
+                 WHERE id = ?1",
+                params![
+                    id,
+                    row.input_tokens,
+                    row.output_tokens,
+                    row.cache_creation_input_tokens,
+                    row.cache_read_input_tokens,
+                    row.model,
+                    row.collab_session_id,
+                    row.collab_phase,
+                    row.task_tag,
+                ],
+            )?;
+        } else {
+            self.insert_token_usage(row)?;
+        }
+        Ok(())
     }
 
     fn headline_inner(
