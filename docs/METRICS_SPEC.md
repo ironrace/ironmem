@@ -716,7 +716,7 @@ task plan. The `PlanLocked` bridge mechanically parses that approved markdown
 into `task_list` and rejects tasks timeboxed above 20 minutes. Phase bucket names
 and the `task_list` planning attribution bucket remain unchanged.
 
-### 2026-06-19 — Claude-side token capture switches to stream-json (supersedes 2026-06-16 #2 / 2026-06-17 #1 source clause)
+### 2026-06-19 — Claude-side token capture switches to stream-json (supersedes the 2026-06-16 #2 source clause)
 
 **What changed.** The Claude-side component of `tokens_to_done` (§2.1) is now read
 from a `claude -p --output-format stream-json --verbose` transcript, summing each
@@ -727,8 +727,9 @@ four-component sum.
 
 **Why (the bug this fixes).** The single-envelope top-level `usage` reports ONLY
 the orchestrator session's tokens. Task-subagents run in **separate sessions**
-whose usage is never rolled up into that block (confirmed against Claude Code
-docs). The driver parsed only that envelope, so every subagent-heavy turn was
+whose usage is never rolled up into that block (as observed in Claude Code
+stream-json output and docs, 2026-06-19). The driver parsed only that envelope,
+so every subagent-heavy turn was
 **undercounted** — invisibly on BOTH arms' Claude side:
 
 - the `superpowers` arm's single `claude -p` runs `subagent-driven-development`,

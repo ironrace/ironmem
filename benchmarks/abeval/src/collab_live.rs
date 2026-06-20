@@ -64,7 +64,19 @@ pub fn claude_worker_argv(mcp_config: &str) -> (String, Vec<String>) {
 pub fn worker_text_and_usage(raw: &str) -> (String, Usage) {
     match parse_stream_json(raw) {
         Ok(r) => (r.result, r.usage),
-        Err(_) => (raw.to_string(), Usage::default()),
+        // `parse_stream_json` fails loud on malformed/empty/result-less output;
+        // this call site must KEEP a tolerant fallback (the sentinel-text path
+        // still wants the raw bytes), but it must NOT defeat that signal silently
+        // — a 0-token turn here undercounts the ironmem arm's Claude `tokens_to_done`
+        // and the run-level zero guard only catches an all-zero CodingComplete run,
+        // not a single drifted turn. So log loud, then fall back.
+        Err(e) => {
+            eprintln!(
+                "abeval: claude worker transcript was unparseable, recording ZERO \
+                 tokens for this turn (undercount risk): {e}"
+            );
+            (raw.to_string(), Usage::default())
+        }
     }
 }
 

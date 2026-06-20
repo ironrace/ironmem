@@ -60,14 +60,26 @@ pub fn parse_stream_json(stdout: &str) -> Result<CliResult> {
                 let Some(id) = message.get("id").and_then(Value::as_str) else {
                     continue;
                 };
-                // Usage derives `#[serde(default)]` on every field, so this only
-                // defaults-to-zero when the block is absent or non-object schema
-                // drift — a single odd message contributes 0 rather than failing
-                // the whole transcript (aggregate zero is caught run-level).
-                let usage = message
-                    .get("usage")
-                    .map(|u| serde_json::from_value::<Usage>(u.clone()).unwrap_or_default())
-                    .unwrap_or_default();
+                // `Usage` is permissive (every field `#[serde(default)]`, no
+                // `deny_unknown_fields` — a real Claude `usage` block carries extra
+                // keys like `service_tier`/`cache_creation`, so denying them would
+                // reject well-formed data). An ABSENT `usage` is legitimate for some
+                // event shapes → default to 0 silently. A PRESENT-but-non-object
+                // `usage` is genuine schema drift that would silently undercount
+                // `tokens_to_done`, so log it loud rather than swallow (the value is
+                // still counted as 0 so one odd message can't fail the whole
+                // transcript; aggregate zero is additionally caught run-level).
+                let usage = match message.get("usage") {
+                    None => Usage::default(),
+                    Some(u) => serde_json::from_value::<Usage>(u.clone()).unwrap_or_else(|e| {
+                        eprintln!(
+                            "abeval: assistant message {id} has a non-deserializable \
+                             usage block (schema drift?), counting it as zero: {e} — \
+                             usage: {u}"
+                        );
+                        Usage::default()
+                    }),
+                };
                 usage_by_id.insert(id.to_string(), usage);
             }
             Some("result") => {

@@ -349,6 +349,91 @@ fn parse_stream_json_rejects_missing_result_event() {
     );
 }
 
+/// A transcript that accumulated REAL subagent usage but then drifted before
+/// emitting a terminal `result` must still error — accumulated tokens never leak
+/// out as a silent partial measurement row. (Strengthens the guard above past the
+/// trivial single-message case.)
+#[test]
+fn parse_stream_json_missing_result_discards_accumulated_usage() {
+    let stdout = concat!(
+        r#"{"type":"assistant","message":{"id":"msg_p","usage":{"input_tokens":1000,"output_tokens":200,"cache_creation_input_tokens":0,"cache_read_input_tokens":0}}}"#,
+        "\n",
+        r#"{"type":"assistant","message":{"id":"msg_s","usage":{"input_tokens":5000,"output_tokens":800,"cache_creation_input_tokens":0,"cache_read_input_tokens":0}}}"#,
+    );
+    assert!(
+        parse_stream_json(stdout).is_err(),
+        "substantial accumulated usage must not leak out without a terminal result event"
+    );
+}
+
+/// Per-message usage that is ABSENT or a NON-OBJECT (schema drift) contributes 0
+/// rather than failing the whole transcript — the well-formed messages still sum.
+/// Pins the `unwrap_or_default`/absent-vs-drift fallback so a future change to
+/// `?`-on-drift (whole-transcript failure) or to double-counting is caught.
+#[test]
+fn parse_stream_json_tolerates_absent_and_nonobject_per_message_usage() {
+    let stdout = concat!(
+        // well-formed
+        r#"{"type":"assistant","message":{"id":"ok","usage":{"input_tokens":500,"output_tokens":70,"cache_creation_input_tokens":0,"cache_read_input_tokens":0}}}"#,
+        "\n",
+        // usage key absent entirely
+        r#"{"type":"assistant","message":{"id":"no_usage"}}"#,
+        "\n",
+        // usage present but a non-object (drift) — counted as 0, logged loud
+        r#"{"type":"assistant","message":{"id":"bad_usage","usage":"oops"}}"#,
+        "\n",
+        r#"{"type":"result","is_error":false,"result":"ok","usage":{}}"#,
+    );
+
+    let parsed =
+        parse_stream_json(stdout).expect("odd per-message usage must not fail the transcript");
+    assert_eq!(
+        parsed.usage.input_tokens, 500,
+        "only the well-formed message contributes"
+    );
+    assert_eq!(parsed.usage.output_tokens, 70);
+}
+
+/// Cache-token fields (`cache_creation_input_tokens` / `cache_read_input_tokens`)
+/// must accumulate across MULTIPLE messages — on real collab runs cache tokens
+/// dominate the bill. A regression that dropped a cache field in `Usage::add_assign`
+/// would pass every single-message test; this asserts each component independently.
+#[test]
+fn parse_stream_json_sums_cache_fields_across_messages() {
+    let stdout = concat!(
+        r#"{"type":"assistant","message":{"id":"a","usage":{"input_tokens":10,"output_tokens":2,"cache_creation_input_tokens":100,"cache_read_input_tokens":7000}}}"#,
+        "\n",
+        r#"{"type":"assistant","message":{"id":"b","usage":{"input_tokens":20,"output_tokens":3,"cache_creation_input_tokens":300,"cache_read_input_tokens":9000}}}"#,
+        "\n",
+        r#"{"type":"result","is_error":false,"result":"ok","usage":{}}"#,
+    );
+
+    let parsed = parse_stream_json(stdout).expect("transcript parses");
+    assert_eq!(parsed.usage.input_tokens, 10 + 20);
+    assert_eq!(parsed.usage.output_tokens, 2 + 3);
+    assert_eq!(parsed.usage.cache_creation_input_tokens, 100 + 300);
+    assert_eq!(parsed.usage.cache_read_input_tokens, 7000 + 9000);
+}
+
+/// Blank/whitespace lines and a trailing newline are tolerated, not treated as
+/// malformed-JSON loud errors — real CLI stream-json output ends with a trailing
+/// `\n` and can carry blank separator lines.
+#[test]
+fn parse_stream_json_tolerates_blank_lines_and_trailing_newline() {
+    let stdout = concat!(
+        "\n",
+        r#"{"type":"assistant","message":{"id":"a","usage":{"input_tokens":42,"output_tokens":6,"cache_creation_input_tokens":0,"cache_read_input_tokens":0}}}"#,
+        "\n",
+        "   \n",
+        r#"{"type":"result","is_error":false,"result":"ok","usage":{}}"#,
+        "\n",
+    );
+
+    let parsed = parse_stream_json(stdout).expect("blank lines and trailing newline are tolerated");
+    assert_eq!(parsed.usage.input_tokens, 42);
+    assert_eq!(parsed.usage.output_tokens, 6);
+}
+
 fn arm_outcome(outcome: &str, input: u32) -> ArmOutcome {
     ArmOutcome {
         arm: Arm::Ironmem,
