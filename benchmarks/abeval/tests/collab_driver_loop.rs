@@ -142,12 +142,12 @@ fn full_happy_path_sums_usage_and_counts_rework() {
     // ClaudeCompose×1×2, TaskListBridge×1, FinalReviewSynthetic×2)
     // = 10 spawns × 15 tokens each = 150.
     assert_eq!(res.claude_usage.total(), 150);
-    assert_eq!(res.pr_url_synthetic, "local://abeval/task1");
+    assert_eq!(res.pr_url_synthetic, "https://abeval.invalid/task1");
     // The final-review path produced a synthetic submit, never a gh pr create.
     let prompts_seen = spawner.claude_prompts.borrow();
     assert!(prompts_seen
         .iter()
-        .any(|p| p.contains("local://abeval/task1")));
+        .any(|p| p.contains("https://abeval.invalid/task1")));
 }
 
 #[test]
