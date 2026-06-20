@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{anyhow, Context, Result};
 use chrono::Utc;
 
-use crate::client::{parse_cli_result, ArmOutcome, Usage};
+use crate::client::{ArmOutcome, Usage};
 use crate::codex_tokens::{attribute_codex_tokens, TimeWindow};
 use crate::collab_db::read_session_state;
 use crate::collab_driver::{
@@ -18,11 +18,17 @@ use crate::collab_driver::{
 };
 use crate::corpus::Task;
 use crate::proc_timeout::{run_with_timeout, turn_timeout};
+use crate::stream_usage::parse_stream_json;
 
-/// `claude -p` worker argv: JSON output, headless permissions, and the
-/// driver-supplied `--mcp-config` (so the worker's ironmem MCP server shares the
-/// per-task DB via inherited `IRONMEM_DB_PATH`). The prompt is appended as the
-/// `-p` positional by the caller.
+/// `claude -p` worker argv: `stream-json` output (with the required `--verbose`),
+/// headless permissions, and the driver-supplied `--mcp-config` (so the worker's
+/// ironmem MCP server shares the per-task DB via inherited `IRONMEM_DB_PATH`). The
+/// prompt is appended as the `-p` positional by the caller.
+///
+/// `stream-json` (over the single-envelope `json`) is what lets
+/// [`worker_text_and_usage`] sum subagent token usage: a collab implement/review
+/// turn fans out to Task-subagents whose tokens never appear in the single
+/// envelope's top-level `usage` (METRICS_SPEC §12 2026-06-19).
 ///
 /// The trailing `--` is REQUIRED: the collab-turn worker templates begin with
 /// `---` YAML frontmatter, so a prompt passed without an end-of-options marker is
@@ -33,7 +39,8 @@ pub fn claude_worker_argv(mcp_config: &str) -> (String, Vec<String>) {
         "claude".to_string(),
         vec![
             "--output-format".into(),
-            "json".into(),
+            "stream-json".into(),
+            "--verbose".into(),
             "--permission-mode".into(),
             "bypassPermissions".into(),
             "--mcp-config".into(),
@@ -45,15 +52,17 @@ pub fn claude_worker_argv(mcp_config: &str) -> (String, Vec<String>) {
 }
 
 /// Extract the worker's *printed text* and token usage from a raw `claude -p
-/// --output-format json` envelope. The envelope is a single JSON line, so the
-/// model's actual output (where sentinel lines like `ABEVAL_SESSION_ID=` / `ref:`
-/// live) is the `result` field — NOT the raw bytes. The driver's line parsers
-/// must see that text, not the `{...}` wrapper. On an unparseable envelope
-/// (schema drift) fall back to the raw bytes + default usage: a 0-exit worker
-/// then contributes zero tokens for the turn (the rare tolerance the run-level
-/// zero-token guards still catch in aggregate).
+/// --output-format stream-json --verbose` transcript. The model's actual output
+/// (where sentinel lines like `ABEVAL_SESSION_ID=` / `ref:` live) is the terminal
+/// `result` event's `result` field — NOT the raw JSONL bytes. The driver's line
+/// parsers must see that text, not the event wrappers. The returned usage is
+/// summed across every assistant message (parent + subagents), so subagent tokens
+/// are counted. On an unparseable transcript (schema drift / no `result` event)
+/// fall back to the raw bytes + default usage: a 0-exit worker then contributes
+/// zero tokens for the turn (the rare tolerance the run-level zero-token guards
+/// still catch in aggregate).
 pub fn worker_text_and_usage(raw: &str) -> (String, Usage) {
-    match parse_cli_result(raw) {
+    match parse_stream_json(raw) {
         Ok(r) => (r.result, r.usage),
         Err(_) => (raw.to_string(), Usage::default()),
     }

@@ -220,10 +220,10 @@ fn resolve_compose_ref<R: CollabStateReader>(
 /// Result of one spawned Claude worker turn.
 pub struct WorkerResult {
     pub usage: Usage,
-    /// The worker's *printed text* — the `--output-format json` envelope's
-    /// `result` field, NOT the raw `{...}` wrapper. Sentinel lines parsed by
-    /// [`parse_session_id`]/[`parse_ref_line`] live here. See
-    /// `collab_live::worker_text_and_usage`.
+    /// The worker's *printed text* — the `--output-format stream-json --verbose`
+    /// transcript's terminal `result` event's `result` field, NOT the raw JSONL
+    /// wrappers. Sentinel lines parsed by [`parse_session_id`]/[`parse_ref_line`]
+    /// live here. See `collab_live::worker_text_and_usage`.
     pub stdout: String,
 }
 

@@ -14,3 +14,4 @@ pub mod corpus;
 pub mod proc_timeout;
 pub mod report;
 pub mod runner;
+pub mod stream_usage;

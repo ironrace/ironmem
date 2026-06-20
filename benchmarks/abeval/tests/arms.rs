@@ -67,7 +67,8 @@ fn ironmem_arm_exact_argv() {
         argv,
         vec![
             "--output-format".to_string(),
-            "json".to_string(),
+            "stream-json".to_string(),
+            "--verbose".to_string(),
             "--permission-mode".to_string(),
             "bypassPermissions".to_string(),
             "-p".to_string(),
@@ -84,7 +85,8 @@ fn superpowers_arm_exact_argv() {
         argv,
         vec![
             "--output-format".to_string(),
-            "json".to_string(),
+            "stream-json".to_string(),
+            "--verbose".to_string(),
             "--permission-mode".to_string(),
             "bypassPermissions".to_string(),
             // C1 (§11.2) env isolation: zero MCP servers, before `-p` so the
