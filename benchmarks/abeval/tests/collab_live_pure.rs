@@ -1,4 +1,4 @@
-use abeval::collab_driver::parse_session_id;
+use abeval::collab_driver::{parse_session_id, ModelTier};
 use abeval::collab_live::{
     claude_worker_argv, codex_config, codex_exec_argv, worker_text_and_usage,
 };
@@ -21,7 +21,7 @@ fn codex_exec_argv_is_no_shell_and_isolated() {
 
 #[test]
 fn claude_worker_argv_carries_stream_json_and_mcp_config() {
-    let (prog, args) = claude_worker_argv(r#"{"mcpServers":{}}"#);
+    let (prog, args) = claude_worker_argv(r#"{"mcpServers":{}}"#, ModelTier::Opus);
     assert_eq!(prog, "claude");
     // stream-json (not the single envelope) so subagent token usage is summed;
     // stream-json itself requires --verbose.
@@ -36,6 +36,27 @@ fn claude_worker_argv_carries_stream_json_and_mcp_config() {
     // as an option ("unknown option '---'").
     assert_eq!(args.last().map(String::as_str), Some("--"));
     assert!(args.windows(2).any(|w| w == ["-p", "--"]));
+}
+
+#[test]
+fn claude_worker_argv_pins_the_model_tier() {
+    // The headless driver must pin `--model` per turn: the turn-template `model:`
+    // frontmatter is inert under `claude -p` (only the interactive orchestrator's
+    // Agent(model=) honors it). Opus for planning/review, Sonnet for mechanical/
+    // implementation turns (memory project_abeval_campaign_model_tiering).
+    let (_, opus) = claude_worker_argv(r#"{"mcpServers":{}}"#, ModelTier::Opus);
+    assert!(
+        opus.windows(2).any(|w| w == ["--model", "opus"]),
+        "opus tier must inject `--model opus`: {opus:?}"
+    );
+    let (_, sonnet) = claude_worker_argv(r#"{"mcpServers":{}}"#, ModelTier::Sonnet);
+    assert!(
+        sonnet.windows(2).any(|w| w == ["--model", "sonnet"]),
+        "sonnet tier must inject `--model sonnet`: {sonnet:?}"
+    );
+    // The `--model <flag>` pair must precede the trailing `-p --` (the prompt is the
+    // last positional), so the model flag is never swallowed as the prompt.
+    assert_eq!(sonnet.last().map(String::as_str), Some("--"));
 }
 
 #[test]

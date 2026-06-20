@@ -15,21 +15,49 @@ use crate::collab_db::SessionState;
 pub const PHASE_CODING_COMPLETE: &str = "CodingComplete";
 pub const PHASE_CODING_FAILED: &str = "CodingFailed";
 
+/// Which Claude model a worker turn pins via `--model`. The interactive
+/// orchestrator honors the turn-template `model:` frontmatter through its
+/// `Agent(model=)` calls, but that frontmatter is INERT under `claude -p`, so the
+/// headless driver must pin the tier on the argv itself. Locked tiering (memory
+/// `project_abeval_campaign_model_tiering`): planning + review run on opus (deepest
+/// reasoning for design/review); mechanical and implementation turns run on sonnet
+/// (the designated best coding model — opus already did the design in planning).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ModelTier {
+    Opus,
+    Sonnet,
+}
+
+impl ModelTier {
+    /// The `--model` value the CLI accepts for this tier.
+    pub fn as_flag(self) -> &'static str {
+        match self {
+            ModelTier::Opus => "opus",
+            ModelTier::Sonnet => "sonnet",
+        }
+    }
+}
+
 /// One dispatch decision for a `(phase, owner)` poll. Frozen mirror of the
 /// dispatch matrix in `.claude-plugin/commands/collab.md` (owner-first dispatch).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WorkerAction {
     /// A single Claude turn that sends its phase event directly. `mode` is
-    /// substituted into `$MODE` for templates that still branch.
+    /// substituted into `$MODE` for templates that still branch. `model` pins the
+    /// turn's `--model` tier.
     ClaudeSend {
         template: &'static str,
         mode: &'static str,
+        model: ModelTier,
     },
     /// A Claude compose turn (writes an artifact, returns a `ref:`), then an
-    /// auto-approved `collab-turn-submit.md` send of `topic` by that ref.
+    /// auto-approved `collab-turn-submit.md` send of `topic` by that ref. `model`
+    /// pins the compose turn's tier; the follow-on submit is always mechanical
+    /// (sonnet), pinned at the call site.
     ClaudeCompose {
         template: &'static str,
         topic: &'static str,
+        model: ModelTier,
     },
     /// The PlanLocked v3 bridge: one mechanical worker parses the approved final
     /// Superpowers markdown and sends `task_list`. The old two-step bridge
@@ -62,23 +90,28 @@ pub fn worker_action(phase: &str, owner: &str, _review_round: u32) -> WorkerActi
             "PlanParallelDrafts" => WorkerAction::ClaudeSend {
                 template: "collab-turn-plan-draft.md",
                 mode: "send",
+                model: ModelTier::Opus,
             },
             "PlanSynthesisPending" => WorkerAction::ClaudeSend {
                 template: "collab-turn-plan-synthesis.md",
                 mode: "send",
+                model: ModelTier::Opus,
             },
             "PlanClaudeFinalizePending" => WorkerAction::ClaudeCompose {
                 template: "collab-turn-plan-finalize.md",
                 topic: "final",
+                model: ModelTier::Opus,
             },
             "PlanLocked" => WorkerAction::TaskListBridge,
             "CodeImplementPending" => WorkerAction::ClaudeSend {
                 template: "collab-turn-code-implement.md",
                 mode: "send",
+                model: ModelTier::Sonnet,
             },
             "CodeReviewLocalPending" => WorkerAction::ClaudeSend {
                 template: "collab-turn-review-local.md",
                 mode: "send",
+                model: ModelTier::Opus,
             },
             "CodeReviewFinalPending" => WorkerAction::FinalReviewSynthetic,
             _ => WorkerAction::Anomaly,
@@ -241,7 +274,8 @@ pub struct CodexResult {
 /// Spawn workers (claude `-p` / `codex exec`). Injected so the loop is tested
 /// with a fake; the prod impl lives in `collab_live.rs`.
 pub trait WorkerSpawner {
-    fn spawn_claude(&self, prompt: &str, worktree: &Path) -> Result<WorkerResult>;
+    fn spawn_claude(&self, prompt: &str, worktree: &Path, model: ModelTier)
+        -> Result<WorkerResult>;
     fn spawn_codex(&self, session_id: &str, worktree: &Path) -> Result<CodexResult>;
 }
 
@@ -298,8 +332,9 @@ pub fn run_collab_task<R: CollabStateReader, S: WorkerSpawner, A: CodexAttributo
     let mut any_usage_unparseable = false;
     let mut fix_commits: u32 = 0;
 
-    // (1) Bootstrap: collab_start + print ABEVAL_SESSION_ID=<id>.
-    let boot = spawner.spawn_claude(&ctx.bootstrap_prompt, wt)?;
+    // (1) Bootstrap: collab_start + print ABEVAL_SESSION_ID=<id>. Mechanical
+    // (one tool call + one sentinel line) → sonnet.
+    let boot = spawner.spawn_claude(&ctx.bootstrap_prompt, wt, ModelTier::Sonnet)?;
     accumulate_claude(&mut claude_usage, &mut any_usage_unparseable, &boot);
     let session_id = parse_session_id(&boot.stdout)?;
 
@@ -348,7 +383,11 @@ pub fn run_collab_task<R: CollabStateReader, S: WorkerSpawner, A: CodexAttributo
                     state.current_owner
                 ));
             }
-            WorkerAction::ClaudeSend { template, mode } => {
+            WorkerAction::ClaudeSend {
+                template,
+                mode,
+                model,
+            } => {
                 let prompt = render_worker_prompt(
                     &ctx.prompts_dir,
                     template,
@@ -358,10 +397,14 @@ pub fn run_collab_task<R: CollabStateReader, S: WorkerSpawner, A: CodexAttributo
                         ("$MODE", mode),
                     ],
                 )?;
-                let r = spawner.spawn_claude(&prompt, wt)?;
+                let r = spawner.spawn_claude(&prompt, wt, model)?;
                 accumulate_claude(&mut claude_usage, &mut any_usage_unparseable, &r);
             }
-            WorkerAction::ClaudeCompose { template, topic } => {
+            WorkerAction::ClaudeCompose {
+                template,
+                topic,
+                model,
+            } => {
                 let compose = render_worker_prompt(
                     &ctx.prompts_dir,
                     template,
@@ -378,7 +421,7 @@ pub fn run_collab_task<R: CollabStateReader, S: WorkerSpawner, A: CodexAttributo
                     .newest_draft_drawer(i64::MIN)?
                     .map(|(_, rowid)| rowid)
                     .unwrap_or(i64::MIN);
-                let cr = spawner.spawn_claude(&compose, wt)?;
+                let cr = spawner.spawn_claude(&compose, wt, model)?;
                 accumulate_claude(&mut claude_usage, &mut any_usage_unparseable, &cr);
                 let artifact_ref = resolve_compose_ref(reader, &cr.stdout, before_rowid, topic)?;
                 let submit = render_worker_prompt(
@@ -392,7 +435,9 @@ pub fn run_collab_task<R: CollabStateReader, S: WorkerSpawner, A: CodexAttributo
                         ("$ARTIFACT_REF", &artifact_ref),
                     ],
                 )?;
-                let sr = spawner.spawn_claude(&submit, wt)?;
+                // The submit is a mechanical event send → sonnet, regardless of the
+                // compose turn's tier.
+                let sr = spawner.spawn_claude(&submit, wt, ModelTier::Sonnet)?;
                 accumulate_claude(&mut claude_usage, &mut any_usage_unparseable, &sr);
             }
             WorkerAction::TaskListBridge => {
@@ -401,7 +446,8 @@ pub fn run_collab_task<R: CollabStateReader, S: WorkerSpawner, A: CodexAttributo
                     "collab-turn-task-list.md",
                     &[("$SESSION_ID", &session_id), ("$BRANCH", &ctx.branch)],
                 )?;
-                let r = spawner.spawn_claude(&prompt, wt)?;
+                // Mechanical bridge (parse approved plan markdown → send task_list).
+                let r = spawner.spawn_claude(&prompt, wt, ModelTier::Sonnet)?;
                 accumulate_claude(&mut claude_usage, &mut any_usage_unparseable, &r);
                 if let Some(blocker) = parse_blocker_line(&r.stdout) {
                     return Err(anyhow!(
@@ -427,12 +473,14 @@ pub fn run_collab_task<R: CollabStateReader, S: WorkerSpawner, A: CodexAttributo
                         ("$MODE", "compose"),
                     ],
                 )?;
-                let cr = spawner.spawn_claude(&compose, wt)?;
+                // Final-review compose is a review turn → opus; the synthetic submit
+                // is a mechanical event send → sonnet.
+                let cr = spawner.spawn_claude(&compose, wt, ModelTier::Opus)?;
                 accumulate_claude(&mut claude_usage, &mut any_usage_unparseable, &cr);
                 let submit = SYNTHETIC_FINAL_SUBMIT
                     .replace("$SESSION_ID", &session_id)
                     .replace("$PR_URL", &synthetic_pr);
-                let sr = spawner.spawn_claude(&submit, wt)?;
+                let sr = spawner.spawn_claude(&submit, wt, ModelTier::Sonnet)?;
                 accumulate_claude(&mut claude_usage, &mut any_usage_unparseable, &sr);
             }
         }
@@ -554,7 +602,12 @@ mod tests {
 
     struct FakeSpawner;
     impl WorkerSpawner for FakeSpawner {
-        fn spawn_claude(&self, _prompt: &str, _worktree: &Path) -> Result<WorkerResult> {
+        fn spawn_claude(
+            &self,
+            _prompt: &str,
+            _worktree: &Path,
+            _model: ModelTier,
+        ) -> Result<WorkerResult> {
             // Only the bootstrap turn hits this path here; emit the session sentinel.
             Ok(WorkerResult {
                 usage: Usage::default(),
@@ -611,7 +664,12 @@ mod tests {
     /// add no commits.
     struct UsageSpawner;
     impl WorkerSpawner for UsageSpawner {
-        fn spawn_claude(&self, _prompt: &str, _worktree: &Path) -> Result<WorkerResult> {
+        fn spawn_claude(
+            &self,
+            _prompt: &str,
+            _worktree: &Path,
+            _model: ModelTier,
+        ) -> Result<WorkerResult> {
             Ok(WorkerResult {
                 usage: Usage {
                     output_tokens: 10,
@@ -632,7 +690,12 @@ mod tests {
     /// past the all-zero guard.
     struct UnparseableUsageSpawner;
     impl WorkerSpawner for UnparseableUsageSpawner {
-        fn spawn_claude(&self, _prompt: &str, _worktree: &Path) -> Result<WorkerResult> {
+        fn spawn_claude(
+            &self,
+            _prompt: &str,
+            _worktree: &Path,
+            _model: ModelTier,
+        ) -> Result<WorkerResult> {
             Ok(WorkerResult {
                 usage: Usage {
                     output_tokens: 10,

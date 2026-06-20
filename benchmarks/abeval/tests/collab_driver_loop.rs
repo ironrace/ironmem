@@ -1,8 +1,8 @@
 use abeval::client::Usage;
 use abeval::collab_db::SessionState;
 use abeval::collab_driver::{
-    run_collab_task, CodexAttributor, CodexResult, CollabStateReader, CollabTaskCtx, WorkerResult,
-    WorkerSpawner,
+    run_collab_task, CodexAttributor, CodexResult, CollabStateReader, CollabTaskCtx, ModelTier,
+    WorkerResult, WorkerSpawner,
 };
 use std::cell::RefCell;
 use std::path::{Path, PathBuf};
@@ -46,7 +46,12 @@ struct FakeSpawner {
     codex_calls: RefCell<u32>,
 }
 impl WorkerSpawner for FakeSpawner {
-    fn spawn_claude(&self, prompt: &str, _wt: &Path) -> anyhow::Result<WorkerResult> {
+    fn spawn_claude(
+        &self,
+        prompt: &str,
+        _wt: &Path,
+        _model: ModelTier,
+    ) -> anyhow::Result<WorkerResult> {
         self.claude_prompts.borrow_mut().push(prompt.to_string());
         let stdout = if prompt.contains("ABEVAL_BOOTSTRAP") {
             "ABEVAL_SESSION_ID=sess-xyz\n".to_string()
@@ -283,7 +288,12 @@ fn coding_failed_with_zero_codex_is_ok_not_err() {
 struct ZeroUsageSpawner;
 
 impl WorkerSpawner for ZeroUsageSpawner {
-    fn spawn_claude(&self, prompt: &str, _wt: &std::path::Path) -> anyhow::Result<WorkerResult> {
+    fn spawn_claude(
+        &self,
+        prompt: &str,
+        _wt: &std::path::Path,
+        _model: ModelTier,
+    ) -> anyhow::Result<WorkerResult> {
         let stdout = if prompt.contains("ABEVAL_BOOTSTRAP") {
             "ABEVAL_SESSION_ID=sess-xyz\n".to_string()
         } else {
@@ -332,7 +342,12 @@ fn zero_claude_completed_run_is_invalid() {
 struct NoRefSpawner;
 
 impl WorkerSpawner for NoRefSpawner {
-    fn spawn_claude(&self, prompt: &str, _wt: &std::path::Path) -> anyhow::Result<WorkerResult> {
+    fn spawn_claude(
+        &self,
+        prompt: &str,
+        _wt: &std::path::Path,
+        _model: ModelTier,
+    ) -> anyhow::Result<WorkerResult> {
         let stdout = if prompt.contains("ABEVAL_BOOTSTRAP") {
             "ABEVAL_SESSION_ID=sess-xyz\n".to_string()
         } else {
@@ -438,7 +453,12 @@ fn compose_worker_missing_ref_recovers_persisted_drawer() {
 /// submit worker reports a blocker, rather than waiting for the stall guard.
 struct TaskListBlockerSpawner;
 impl WorkerSpawner for TaskListBlockerSpawner {
-    fn spawn_claude(&self, prompt: &str, _wt: &std::path::Path) -> anyhow::Result<WorkerResult> {
+    fn spawn_claude(
+        &self,
+        prompt: &str,
+        _wt: &std::path::Path,
+        _model: ModelTier,
+    ) -> anyhow::Result<WorkerResult> {
         let stdout = if prompt.contains("ABEVAL_BOOTSTRAP") {
             "ABEVAL_SESSION_ID=sess-xyz\n".to_string()
         } else {

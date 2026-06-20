@@ -1,5 +1,5 @@
 use abeval::collab_driver::{
-    parse_ref_line, parse_session_id, render_worker_prompt, worker_action, WorkerAction,
+    parse_ref_line, parse_session_id, render_worker_prompt, worker_action, ModelTier, WorkerAction,
 };
 use std::fs;
 
@@ -10,14 +10,16 @@ fn dispatch_matrix_maps_each_phase() {
         worker_action("PlanParallelDrafts", "claude", 0),
         WorkerAction::ClaudeSend {
             template: "collab-turn-plan-draft.md",
-            mode: "send"
+            mode: "send",
+            model: ModelTier::Opus,
         }
     );
     assert_eq!(
         worker_action("PlanSynthesisPending", "claude", 0),
         WorkerAction::ClaudeSend {
             template: "collab-turn-plan-synthesis.md",
-            mode: "send"
+            mode: "send",
+            model: ModelTier::Opus,
         }
     );
     // Synthesis is always autonomous now; final is the only human planning gate.
@@ -25,14 +27,16 @@ fn dispatch_matrix_maps_each_phase() {
         worker_action("PlanSynthesisPending", "claude", 1),
         WorkerAction::ClaudeSend {
             template: "collab-turn-plan-synthesis.md",
-            mode: "send"
+            mode: "send",
+            model: ModelTier::Opus,
         }
     );
     assert_eq!(
         worker_action("PlanClaudeFinalizePending", "claude", 0),
         WorkerAction::ClaudeCompose {
             template: "collab-turn-plan-finalize.md",
-            topic: "final"
+            topic: "final",
+            model: ModelTier::Opus,
         }
     );
     assert_eq!(
@@ -45,14 +49,16 @@ fn dispatch_matrix_maps_each_phase() {
         worker_action("CodeImplementPending", "claude", 0),
         WorkerAction::ClaudeSend {
             template: "collab-turn-code-implement.md",
-            mode: "send"
+            mode: "send",
+            model: ModelTier::Sonnet,
         }
     );
     assert_eq!(
         worker_action("CodeReviewLocalPending", "claude", 0),
         WorkerAction::ClaudeSend {
             template: "collab-turn-review-local.md",
-            mode: "send"
+            mode: "send",
+            model: ModelTier::Opus,
         }
     );
     assert_eq!(
@@ -99,6 +105,48 @@ fn dispatch_matrix_maps_each_phase() {
     assert_eq!(
         worker_action("CodingComplete", "nobody", 0),
         WorkerAction::Terminal
+    );
+}
+
+/// The per-turn model tier is the contribution of this campaign patch (memory
+/// project_abeval_campaign_model_tiering): planning + review turns run on opus
+/// (deepest reasoning for design/review), implementation runs on sonnet (the
+/// designated best coding model — opus already did the design in planning). The
+/// mechanical TaskListBridge/submit turns are pinned to sonnet at their call sites
+/// (they carry no action-level model). This test is the frozen contract for the
+/// tiers that ARE a dispatch decision.
+#[test]
+fn dispatch_matrix_pins_model_tier_per_phase() {
+    fn model_of(action: WorkerAction) -> ModelTier {
+        match action {
+            WorkerAction::ClaudeSend { model, .. } | WorkerAction::ClaudeCompose { model, .. } => {
+                model
+            }
+            other => panic!("expected a Claude action carrying a model tier, got {other:?}"),
+        }
+    }
+    // Planning turns → opus.
+    assert_eq!(
+        model_of(worker_action("PlanParallelDrafts", "claude", 0)),
+        ModelTier::Opus
+    );
+    assert_eq!(
+        model_of(worker_action("PlanSynthesisPending", "claude", 0)),
+        ModelTier::Opus
+    );
+    assert_eq!(
+        model_of(worker_action("PlanClaudeFinalizePending", "claude", 0)),
+        ModelTier::Opus
+    );
+    // Review turn → opus.
+    assert_eq!(
+        model_of(worker_action("CodeReviewLocalPending", "claude", 0)),
+        ModelTier::Opus
+    );
+    // Implementation → sonnet (the one Claude work turn that drops a tier).
+    assert_eq!(
+        model_of(worker_action("CodeImplementPending", "claude", 0)),
+        ModelTier::Sonnet
     );
 }
 

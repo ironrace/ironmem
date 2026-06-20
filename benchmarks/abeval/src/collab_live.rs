@@ -14,7 +14,7 @@ use crate::codex_tokens::{attribute_codex_tokens, TimeWindow};
 use crate::collab_db::read_session_state;
 use crate::collab_driver::{
     run_collab_task, CodexAttributor, CodexResult, CollabRunResult, CollabStateReader,
-    CollabTaskCtx, WorkerResult, WorkerSpawner,
+    CollabTaskCtx, ModelTier, WorkerResult, WorkerSpawner,
 };
 use crate::corpus::Task;
 use crate::proc_timeout::{run_with_timeout, turn_timeout};
@@ -34,7 +34,12 @@ use crate::stream_usage::parse_stream_json;
 /// `---` YAML frontmatter, so a prompt passed without an end-of-options marker is
 /// parsed by the CLI as an option (`error: unknown option '---'`). `--` forces
 /// the prompt to be a positional even when it starts with dashes.
-pub fn claude_worker_argv(mcp_config: &str) -> (String, Vec<String>) {
+///
+/// `--model <tier>` pins the per-turn model: the turn-template `model:` frontmatter
+/// is inert under `claude -p`, so the headless driver pins the tier here (memory
+/// `project_abeval_campaign_model_tiering`). The flag precedes the trailing `-p --`
+/// so the model value is never swallowed as the prompt positional.
+pub fn claude_worker_argv(mcp_config: &str, model: ModelTier) -> (String, Vec<String>) {
     (
         "claude".to_string(),
         vec![
@@ -43,6 +48,8 @@ pub fn claude_worker_argv(mcp_config: &str) -> (String, Vec<String>) {
             "--verbose".into(),
             "--permission-mode".into(),
             "bypassPermissions".into(),
+            "--model".into(),
+            model.as_flag().into(),
             "--mcp-config".into(),
             mcp_config.to_string(),
             "-p".into(),
@@ -167,8 +174,13 @@ pub struct ProcessWorkerSpawner {
     pub mcp_config: String,
 }
 impl WorkerSpawner for ProcessWorkerSpawner {
-    fn spawn_claude(&self, prompt: &str, worktree: &Path) -> Result<WorkerResult> {
-        let (prog, mut args) = claude_worker_argv(&self.mcp_config);
+    fn spawn_claude(
+        &self,
+        prompt: &str,
+        worktree: &Path,
+        model: ModelTier,
+    ) -> Result<WorkerResult> {
+        let (prog, mut args) = claude_worker_argv(&self.mcp_config, model);
         args.push(prompt.to_string());
         let mut cmd = std::process::Command::new(&prog);
         cmd.args(&args)
