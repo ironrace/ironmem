@@ -20,6 +20,7 @@ use crate::sanitize::{sanitize_harness, sanitize_session_id};
 const REVIEW_WING: &str = "reviews";
 const REVIEW_MAX_BYTES: usize = 24_000;
 const METRICS_TRANSCRIPT_TAIL_BYTES: u64 = 2 * 1024 * 1024;
+const METRICS_FULL_TRANSCRIPT_MAX_BYTES: u64 = 128 * 1024 * 1024;
 
 /// ~400-token budget for the injected block (~4 chars/token).
 const SESSION_CONTEXT_MAX_BYTES: usize = 1600;
@@ -165,6 +166,18 @@ fn run_hook_with_input(
             workspace_root.as_deref(),
             transcript_path.as_deref(),
         );
+        // Transcript token persistence: stop + precompact only, OUTSIDE allows_writes
+        // gate (N1 from Codex review). Decoupled from content-write access mode so
+        // transcript rows are banked in ReadOnly/Restricted mode too (issue #113 pattern).
+        if matches!(hook_name, "stop" | "precompact") {
+            persist_transcript_tokens(
+                &app,
+                harness,
+                session_id.as_deref(),
+                workspace_root.as_deref(),
+                transcript_path.as_deref(),
+            );
+        }
     }
     let bootstrap_workspace = if allows_writes {
         workspace_root.as_deref()
@@ -227,6 +240,158 @@ fn run_hook_with_input(
     }
 
     Ok(response)
+}
+
+/// Resolve collab attribution for a transcript row from the hook process.
+///
+/// Unlike `MetricsContext::resolve` (which reads from `App::active_collab_session_snapshot`,
+/// empty in the hook's separate process), this function performs a fresh DB lookup
+/// by repo path — the same shape as `collab_line()` for session-start context, but
+/// loading the typed `Phase` for the `phase_bucket()` call required by METRICS_SPEC §3.2.
+///
+/// `task_tag` is set to `collab_session_id` (per §10.4 OR-join invariant: both keys
+/// for a collab task refer to the same task). Outside a collab session, returns
+/// `None` for all fields.
+fn resolve_transcript_context(
+    app: &App,
+    workspace_root: Option<&Path>,
+) -> crate::metrics::MetricsContext {
+    let Some(root) = workspace_root else {
+        return crate::metrics::MetricsContext::default();
+    };
+    let repo_path = root.to_string_lossy();
+    let session_id = match app.db.with_connection(|conn| {
+        crate::collab::queue::find_active_session_by_repo(conn, repo_path.as_ref())
+    }) {
+        Ok(Some((id, _raw_phase))) => id,
+        Ok(None) => return crate::metrics::MetricsContext::default(),
+        Err(e) => {
+            tracing::warn!("transcript metrics: collab session lookup failed: {e}");
+            return crate::metrics::MetricsContext::default();
+        }
+    };
+
+    // Load the typed record to get the Phase enum for `phase_bucket`.
+    let record = match app
+        .db
+        .with_connection(|conn| crate::collab::queue::load_session_record(conn, &session_id))
+    {
+        Ok(r) if r.ended_at.is_none() => r,
+        Ok(_) => return crate::metrics::MetricsContext::default(), // ended
+        Err(e) => {
+            tracing::warn!("transcript metrics: collab session record load failed: {e}");
+            return crate::metrics::MetricsContext::default();
+        }
+    };
+
+    let collab_phase = crate::metrics::phase_bucket(record.session.phase).to_string();
+    // task_tag mirrors collab_session_id for §10.4 OR-join compatibility.
+    crate::metrics::MetricsContext {
+        collab_session_id: Some(session_id.clone()),
+        collab_phase: Some(collab_phase),
+        task_tag: Some(session_id),
+    }
+}
+
+/// Read the FULL transcript file (not the tail) for token accounting.
+/// Returns `None` on any I/O error; symlinks are rejected (same TOCTOU guard as
+/// `read_transcript_tail`). Lossy UTF-8 decode matches the tail reader.
+fn read_full_transcript(path: &Path) -> Option<String> {
+    let metadata = std::fs::symlink_metadata(path).ok()?;
+    if !metadata.file_type().is_file() {
+        return None;
+    }
+    if metadata.len() > METRICS_FULL_TRANSCRIPT_MAX_BYTES {
+        tracing::warn!(
+            bytes = metadata.len(),
+            max_bytes = METRICS_FULL_TRANSCRIPT_MAX_BYTES,
+            "transcript metrics: skipping oversized transcript file"
+        );
+        return None;
+    }
+    let mut file = {
+        use std::os::unix::fs::OpenOptionsExt;
+        std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(path)
+            .ok()?
+    };
+    let mut buf = Vec::new();
+    use std::io::Read;
+    file.read_to_end(&mut buf).ok()?;
+    Some(String::from_utf8_lossy(&buf).into_owned())
+}
+
+/// Parse and persist full-transcript token usage rows for `stop`/`precompact`.
+/// Runs under `metrics_enabled()` ONLY, OUTSIDE the `allows_writes` gate (N1).
+/// Best-effort: warns on failure, never fails the hook (N5).
+fn persist_transcript_tokens(
+    app: &App,
+    harness: &str,
+    session_id: Option<&str>,
+    workspace_root: Option<&Path>,
+    transcript_path: Option<&Path>,
+) {
+    let Some(tp) = transcript_path else { return };
+    let Some(raw) = read_full_transcript(tp) else {
+        tracing::warn!(
+            "transcript metrics: could not read transcript file {}",
+            tp.display()
+        );
+        return;
+    };
+
+    // Normalize harness to the two DB-legal values.
+    let harness_norm = if harness.starts_with("codex") {
+        "codex"
+    } else {
+        "claude"
+    };
+
+    let ctx = resolve_transcript_context(app, workspace_root);
+    let now = crate::metrics::now_rfc3339();
+    let transcript_session_id = session_id.filter(|sid| *sid != "unknown");
+
+    if harness_norm == "codex" {
+        match crate::metrics::transcript::parse_codex_rollout(&raw, transcript_session_id) {
+            Ok(Some(trow)) => {
+                let row = crate::db::metrics::NewTokenUsage::from_transcript(
+                    trow,
+                    harness_norm,
+                    now,
+                    transcript_session_id,
+                    &ctx,
+                );
+                if let Err(e) = app.db.upsert_transcript_token_usage(&row) {
+                    tracing::warn!("transcript metrics: codex upsert failed: {e}");
+                }
+            }
+            Ok(None) => {} // no token_count yet — skip silently
+            Err(e) => tracing::warn!("transcript metrics: codex parse failed: {e}"),
+        }
+    } else {
+        match crate::metrics::transcript::parse_claude_stream_json(&raw, transcript_session_id) {
+            Ok(rows) => {
+                let db_rows: Vec<_> = rows
+                    .into_iter()
+                    .map(|trow| {
+                        crate::db::metrics::NewTokenUsage::from_transcript(
+                            trow,
+                            harness_norm,
+                            now.clone(),
+                            transcript_session_id,
+                            &ctx,
+                        )
+                    })
+                    .collect();
+                if let Err(e) = app.db.upsert_transcript_token_usage_many(&db_rows) {
+                    tracing::warn!("transcript metrics: claude upsert failed: {e}");
+                }
+            }
+            Err(e) => tracing::warn!("transcript metrics: claude stream-json parse failed: {e}"),
+        }
+    }
 }
 
 fn sample_occupancy(
@@ -3273,6 +3438,681 @@ mod tests {
         std::env::remove_var("IRONMEM_CONTEXT_WARN_PCT");
         std::env::remove_var("IRONMEM_CONTEXT_HANDOFF_PCT");
         std::env::remove_var("IRONMEM_CONTEXT_WINDOW");
+    }
+
+    // ── Tasks 6-8: transcript token persistence integration tests ────────────
+
+    /// Seed a collab session in the given `app`'s DB. Returns the session id.
+    fn seed_collab(app: &App, repo_path: &str, sid: &str) {
+        app.db
+            .with_transaction(|tx| {
+                crate::collab::queue::create_session(
+                    tx,
+                    sid,
+                    repo_path,
+                    "main",
+                    None,
+                    crate::collab::Agent::Claude,
+                )
+            })
+            .unwrap();
+        // Advance to CodeImplementPending so phase_bucket returns "impl".
+        app.db
+            .with_transaction(|tx| {
+                let mut s = crate::collab::queue::load_session(tx, sid)?;
+                s.phase = crate::collab::Phase::CodeImplementPending;
+                crate::collab::queue::save_session(tx, &s)
+            })
+            .unwrap();
+    }
+
+    /// Build a valid Claude stream-json transcript with two assistant messages
+    /// and a terminal result event.
+    fn make_claude_transcript(session_id: &str) -> String {
+        let msg1 = serde_json::json!({
+            "type": "assistant",
+            "message": {
+                "id": format!("{session_id}-msg-1"),
+                "model": "claude-sonnet-4-6",
+                "usage": {
+                    "input_tokens": 100,
+                    "output_tokens": 20,
+                    "cache_creation_input_tokens": 5,
+                    "cache_read_input_tokens": 10
+                }
+            }
+        })
+        .to_string();
+        let msg2 = serde_json::json!({
+            "type": "assistant",
+            "message": {
+                "id": format!("{session_id}-msg-2"),
+                "model": "claude-sonnet-4-6",
+                "usage": {
+                    "input_tokens": 200,
+                    "output_tokens": 40,
+                    "cache_creation_input_tokens": 0,
+                    "cache_read_input_tokens": 50
+                }
+            }
+        })
+        .to_string();
+        let result = serde_json::json!({
+            "type": "result",
+            "is_error": false,
+            "result": "done"
+        })
+        .to_string();
+        format!("{msg1}\n{msg2}\n{result}\n")
+    }
+
+    /// Build a valid Codex rollout JSONL transcript.
+    fn make_codex_transcript() -> String {
+        serde_json::json!({
+            "type": "event_msg",
+            "payload": {
+                "type": "token_count",
+                "info": {
+                    "total_token_usage": {
+                        "input_tokens": 1500,
+                        "cached_input_tokens": 600,
+                        "output_tokens": 300
+                    }
+                }
+            }
+        })
+        .to_string()
+    }
+
+    #[test]
+    fn stop_claude_with_active_collab_persists_transcript_rows_with_attribution() {
+        let _env = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let _metrics = crate::metrics::METRICS_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        std::env::remove_var("IRONMEM_METRICS"); // metrics enabled (env absent)
+        std::env::set_var("IRONMEM_DISABLE_MIGRATION", "1");
+
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = temp.path().join("workspace");
+        std::fs::create_dir_all(&workspace).unwrap();
+
+        let config = Config {
+            db_path: temp.path().join("memory.sqlite3"),
+            model_dir: temp.path().join("model"),
+            model_dir_explicit: true,
+            state_dir: temp.path().join("hook_state"),
+            mcp_access_mode: McpAccessMode::Trusted,
+            embed_mode: EmbedMode::Noop,
+        };
+
+        // Seed a collab session in the DB for this workspace.
+        {
+            let app = App::new(config.clone()).unwrap();
+            seed_collab(
+                &app,
+                &workspace.to_string_lossy(),
+                "collab-attribution-test",
+            );
+        }
+
+        // Write a Claude stream-json transcript.
+        let session_id = "claude-sess-1";
+        let tx_content = make_claude_transcript(session_id);
+        let transcript = temp.path().join("t.jsonl");
+        std::fs::write(&transcript, &tx_content).unwrap();
+
+        run_hook_with_input(
+            "stop",
+            "claude",
+            config.clone(),
+            serde_json::json!({
+                "cwd": workspace.to_string_lossy(),
+                "session_id": session_id,
+                "transcript_path": transcript.to_string_lossy(),
+            }),
+        )
+        .unwrap();
+
+        let app = App::new(config).unwrap();
+        let rows = app
+            .db
+            .query_token_usage(&crate::db::metrics::TokenUsageQuery::default())
+            .unwrap();
+        let tx_rows: Vec<_> = rows.iter().filter(|r| r.source == "transcript").collect();
+
+        assert_eq!(
+            tx_rows.len(),
+            2,
+            "two transcript rows (one per assistant message)"
+        );
+
+        for row in &tx_rows {
+            assert!(!row.estimated, "transcript rows must be measured");
+            assert_eq!(row.harness, "claude");
+            assert_eq!(row.model.as_deref(), Some("claude-sonnet-4-6"));
+            // Collab attribution stamped correctly.
+            assert_eq!(
+                row.collab_session_id.as_deref(),
+                Some("collab-attribution-test"),
+                "collab_session_id must be stamped"
+            );
+            assert_eq!(
+                row.collab_phase.as_deref(),
+                Some("impl"),
+                "phase_bucket(CodeImplementPending) == impl"
+            );
+            // task_tag mirrors collab_session_id for §10.4 join.
+            assert_eq!(
+                row.task_tag.as_deref(),
+                Some("collab-attribution-test"),
+                "task_tag must equal collab_session_id for §10.4 OR-join"
+            );
+        }
+
+        // Verify four components are correct for msg-1.
+        let msg1 = tx_rows
+            .iter()
+            .find(|r| r.turn_id.as_deref().unwrap_or("").contains("msg-1"))
+            .unwrap();
+        assert_eq!(msg1.input_tokens, 100);
+        assert_eq!(msg1.output_tokens, 20);
+        assert_eq!(msg1.cache_creation_input_tokens, 5);
+        assert_eq!(msg1.cache_read_input_tokens, 10);
+
+        std::env::remove_var("IRONMEM_DISABLE_MIGRATION");
+    }
+
+    #[test]
+    fn stop_hook_transcript_persistence_is_idempotent_no_double_count() {
+        let _env = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let _metrics = crate::metrics::METRICS_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        std::env::remove_var("IRONMEM_METRICS");
+        std::env::set_var("IRONMEM_DISABLE_MIGRATION", "1");
+
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = temp.path().join("workspace");
+        std::fs::create_dir_all(&workspace).unwrap();
+
+        let config = Config {
+            db_path: temp.path().join("memory.sqlite3"),
+            model_dir: temp.path().join("model"),
+            model_dir_explicit: true,
+            state_dir: temp.path().join("hook_state"),
+            mcp_access_mode: McpAccessMode::Trusted,
+            embed_mode: EmbedMode::Noop,
+        };
+
+        let session_id = "claude-dedup-sess";
+        let tx_content = make_claude_transcript(session_id);
+        let transcript = temp.path().join("t.jsonl");
+        std::fs::write(&transcript, &tx_content).unwrap();
+
+        let hook_input = serde_json::json!({
+            "cwd": workspace.to_string_lossy(),
+            "session_id": session_id,
+            "transcript_path": transcript.to_string_lossy(),
+        });
+
+        // Run the same hook input twice — simulates overlap (Stop + PreCompact).
+        run_hook_with_input("stop", "claude", config.clone(), hook_input.clone()).unwrap();
+        run_hook_with_input("precompact", "claude", config.clone(), hook_input).unwrap();
+
+        let app = App::new(config).unwrap();
+        let rows = app
+            .db
+            .query_token_usage(&crate::db::metrics::TokenUsageQuery::default())
+            .unwrap();
+        let tx_rows: Vec<_> = rows.iter().filter(|r| r.source == "transcript").collect();
+        // Exactly 2 rows (one per distinct message id), NOT 4 (no double-count).
+        assert_eq!(
+            tx_rows.len(),
+            2,
+            "re-running the same hook input must not double-count transcript rows"
+        );
+
+        std::env::remove_var("IRONMEM_DISABLE_MIGRATION");
+    }
+
+    #[test]
+    fn stop_codex_harness_persists_transcript_row_with_cache_subtracted() {
+        let _env = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let _metrics = crate::metrics::METRICS_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        std::env::remove_var("IRONMEM_METRICS");
+        std::env::set_var("IRONMEM_DISABLE_MIGRATION", "1");
+
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = temp.path().join("workspace");
+        std::fs::create_dir_all(&workspace).unwrap();
+
+        let config = Config {
+            db_path: temp.path().join("memory.sqlite3"),
+            model_dir: temp.path().join("model"),
+            model_dir_explicit: true,
+            state_dir: temp.path().join("hook_state"),
+            mcp_access_mode: McpAccessMode::Trusted,
+            embed_mode: EmbedMode::Noop,
+        };
+
+        let session_id = "codex-sess-1";
+        let transcript = temp.path().join("rollout.jsonl");
+        std::fs::write(&transcript, make_codex_transcript()).unwrap();
+
+        run_hook_with_input(
+            "stop",
+            "codex",
+            config.clone(),
+            serde_json::json!({
+                "cwd": workspace.to_string_lossy(),
+                "session_id": session_id,
+                "transcript_path": transcript.to_string_lossy(),
+            }),
+        )
+        .unwrap();
+
+        let app = App::new(config).unwrap();
+        let rows = app
+            .db
+            .query_token_usage(&crate::db::metrics::TokenUsageQuery::default())
+            .unwrap();
+        let codex_rows: Vec<_> = rows
+            .iter()
+            .filter(|r| r.source == "transcript" && r.harness == "codex")
+            .collect();
+        assert_eq!(codex_rows.len(), 1, "one codex transcript row");
+        let r = codex_rows[0];
+        // input = 1500 − 600 = 900; cache_read = 600; output = 300
+        assert_eq!(r.input_tokens, 900, "cached must be subtracted from input");
+        assert_eq!(r.cache_read_input_tokens, 600);
+        assert_eq!(r.output_tokens, 300);
+        assert_eq!(r.cache_creation_input_tokens, 0);
+        assert!(!r.estimated);
+        assert_eq!(r.harness, "codex");
+
+        std::env::remove_var("IRONMEM_DISABLE_MIGRATION");
+    }
+
+    #[test]
+    fn readonly_mode_still_persists_transcript_rows() {
+        // N6 from Codex review: ReadOnly mode must still write transcript rows
+        // (metrics-only telemetry, decoupled from allows_writes just like occupancy).
+        let _env = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let _metrics = crate::metrics::METRICS_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        std::env::remove_var("IRONMEM_METRICS");
+        std::env::set_var("IRONMEM_DISABLE_MIGRATION", "1");
+
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = temp.path().join("workspace");
+        std::fs::create_dir_all(&workspace).unwrap();
+
+        let config = Config {
+            db_path: temp.path().join("memory.sqlite3"),
+            model_dir: temp.path().join("model"),
+            model_dir_explicit: true,
+            state_dir: temp.path().join("hook_state"),
+            mcp_access_mode: McpAccessMode::ReadOnly, // NOT Trusted
+            embed_mode: EmbedMode::Noop,
+        };
+
+        let session_id = "sess-ro-transcript";
+        let tx_content = make_claude_transcript(session_id);
+        let transcript = temp.path().join("t.jsonl");
+        std::fs::write(&transcript, &tx_content).unwrap();
+
+        run_hook_with_input(
+            "stop",
+            "claude",
+            config.clone(),
+            serde_json::json!({
+                "cwd": workspace.to_string_lossy(),
+                "session_id": session_id,
+                "transcript_path": transcript.to_string_lossy(),
+            }),
+        )
+        .unwrap();
+
+        let app = App::new(config).unwrap();
+        // Content-write gate: no mining drawers.
+        assert_eq!(app.db.count_drawers(None).unwrap(), 0);
+        // Transcript rows: still written (metrics decoupled from allows_writes).
+        let rows = app
+            .db
+            .query_token_usage(&crate::db::metrics::TokenUsageQuery::default())
+            .unwrap();
+        let tx_rows: Vec<_> = rows.iter().filter(|r| r.source == "transcript").collect();
+        assert_eq!(
+            tx_rows.len(),
+            2,
+            "ReadOnly mode must still write transcript rows"
+        );
+
+        std::env::remove_var("IRONMEM_DISABLE_MIGRATION");
+    }
+
+    #[test]
+    fn unknown_session_id_uses_content_hash_fallback_for_transcript_key() {
+        let _env = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let _metrics = crate::metrics::METRICS_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        std::env::remove_var("IRONMEM_METRICS");
+        std::env::set_var("IRONMEM_DISABLE_MIGRATION", "1");
+
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = temp.path().join("workspace");
+        std::fs::create_dir_all(&workspace).unwrap();
+
+        let config = Config {
+            db_path: temp.path().join("memory.sqlite3"),
+            model_dir: temp.path().join("model"),
+            model_dir_explicit: true,
+            state_dir: temp.path().join("hook_state"),
+            mcp_access_mode: McpAccessMode::Trusted,
+            embed_mode: EmbedMode::Noop,
+        };
+
+        let transcript = temp.path().join("t.jsonl");
+        std::fs::write(&transcript, make_claude_transcript("fallback")).unwrap();
+
+        run_hook_with_input(
+            "stop",
+            "claude",
+            config.clone(),
+            serde_json::json!({
+                "cwd": workspace.to_string_lossy(),
+                "session_id": "",
+                "transcript_path": transcript.to_string_lossy(),
+            }),
+        )
+        .unwrap();
+
+        let app = App::new(config).unwrap();
+        let rows = app
+            .db
+            .query_token_usage(&crate::db::metrics::TokenUsageQuery::default())
+            .unwrap();
+        let tx_rows: Vec<_> = rows.iter().filter(|r| r.source == "transcript").collect();
+        assert_eq!(tx_rows.len(), 2);
+        for row in tx_rows {
+            assert!(
+                row.session_id.is_none(),
+                "sanitized unknown session id must be treated as absent"
+            );
+            let turn_id = row.turn_id.as_deref().unwrap_or("");
+            assert!(
+                !turn_id.contains(":unknown:"),
+                "turn_id must use content-hash fallback, got {turn_id}"
+            );
+        }
+
+        std::env::remove_var("IRONMEM_DISABLE_MIGRATION");
+    }
+
+    #[test]
+    fn fallback_key_no_double_count_when_transcript_grows_between_stop_and_precompact() {
+        // H1 end-to-end: with NO session id (content-hash fallback), a transcript
+        // that GROWS between `stop` and `precompact` must not re-insert the
+        // already-recorded messages. The fallback key hashes only the stable
+        // first line, so msg-1 keeps its turn_id across growth and the upsert
+        // dedups it; only the newly-appended msg-2 is added.
+        let _env = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let _metrics = crate::metrics::METRICS_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        std::env::remove_var("IRONMEM_METRICS");
+        std::env::set_var("IRONMEM_DISABLE_MIGRATION", "1");
+
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = temp.path().join("workspace");
+        std::fs::create_dir_all(&workspace).unwrap();
+
+        let config = Config {
+            db_path: temp.path().join("memory.sqlite3"),
+            model_dir: temp.path().join("model"),
+            model_dir_explicit: true,
+            state_dir: temp.path().join("hook_state"),
+            mcp_access_mode: McpAccessMode::Trusted,
+            embed_mode: EmbedMode::Noop,
+        };
+
+        let assistant = |id: &str| {
+            serde_json::json!({
+                "type": "assistant",
+                "message": { "id": id, "model": "claude-sonnet-4-6", "usage": {
+                    "input_tokens": 100, "output_tokens": 20,
+                    "cache_creation_input_tokens": 0, "cache_read_input_tokens": 0 }}
+            })
+            .to_string()
+        };
+        let result = serde_json::json!({"type": "result", "is_error": false}).to_string();
+        let msg1 = assistant("grow-msg-1");
+
+        let transcript = temp.path().join("t.jsonl");
+        // First read: msg-1 + result (no session id).
+        std::fs::write(&transcript, format!("{msg1}\n{result}\n")).unwrap();
+        let input = |hook_session: &str| {
+            serde_json::json!({
+                "cwd": workspace.to_string_lossy(),
+                "session_id": "",
+                "transcript_path": transcript.to_string_lossy(),
+                "hook": hook_session,
+            })
+        };
+        run_hook_with_input("stop", "claude", config.clone(), input("stop")).unwrap();
+
+        // Transcript grows by one assistant message, then precompact re-reads it.
+        std::fs::write(
+            &transcript,
+            format!("{msg1}\n{}\n{result}\n", assistant("grow-msg-2")),
+        )
+        .unwrap();
+        run_hook_with_input("precompact", "claude", config.clone(), input("precompact")).unwrap();
+
+        let app = App::new(config).unwrap();
+        let rows = app
+            .db
+            .query_token_usage(&crate::db::metrics::TokenUsageQuery::default())
+            .unwrap();
+        let tx_rows: Vec<_> = rows.iter().filter(|r| r.source == "transcript").collect();
+        assert_eq!(
+            tx_rows.len(),
+            2,
+            "msg-1 must dedup across growth; only msg-2 is added (no double-count)"
+        );
+
+        std::env::remove_var("IRONMEM_DISABLE_MIGRATION");
+    }
+
+    #[test]
+    fn malformed_transcripts_do_not_fail_hook_or_write_transcript_rows() {
+        let _env = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let _metrics = crate::metrics::METRICS_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        std::env::remove_var("IRONMEM_METRICS");
+        std::env::set_var("IRONMEM_DISABLE_MIGRATION", "1");
+
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = temp.path().join("workspace");
+        std::fs::create_dir_all(&workspace).unwrap();
+
+        let config = Config {
+            db_path: temp.path().join("memory.sqlite3"),
+            model_dir: temp.path().join("model"),
+            model_dir_explicit: true,
+            state_dir: temp.path().join("hook_state"),
+            mcp_access_mode: McpAccessMode::Trusted,
+            embed_mode: EmbedMode::Noop,
+        };
+
+        let bad_claude = temp.path().join("bad-claude.jsonl");
+        std::fs::write(&bad_claude, "not json\n").unwrap();
+        run_hook_with_input(
+            "stop",
+            "claude",
+            config.clone(),
+            serde_json::json!({
+                "cwd": workspace.to_string_lossy(),
+                "session_id": "bad-claude-session",
+                "transcript_path": bad_claude.to_string_lossy(),
+            }),
+        )
+        .unwrap();
+
+        let bad_codex = temp.path().join("bad-codex.jsonl");
+        std::fs::write(
+            &bad_codex,
+            serde_json::json!({
+                "type": "event_msg",
+                "payload": {
+                    "type": "token_count",
+                    "info": {
+                        "total_token_usage": {
+                            "input_tokens": 100,
+                            "cached_input_tokens": 200,
+                            "output_tokens": 50
+                        }
+                    }
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+        run_hook_with_input(
+            "precompact",
+            "codex",
+            config.clone(),
+            serde_json::json!({
+                "cwd": workspace.to_string_lossy(),
+                "session_id": "bad-codex-session",
+                "transcript_path": bad_codex.to_string_lossy(),
+            }),
+        )
+        .unwrap();
+
+        let app = App::new(config).unwrap();
+        let rows = app
+            .db
+            .query_token_usage(&crate::db::metrics::TokenUsageQuery::default())
+            .unwrap();
+        assert!(
+            rows.iter().all(|r| r.source != "transcript"),
+            "malformed transcripts must not write partial transcript rows"
+        );
+
+        std::env::remove_var("IRONMEM_DISABLE_MIGRATION");
+    }
+
+    #[test]
+    fn oversized_transcript_is_skipped_without_token_rows() {
+        let _env = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let _metrics = crate::metrics::METRICS_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        std::env::remove_var("IRONMEM_METRICS");
+        std::env::set_var("IRONMEM_DISABLE_MIGRATION", "1");
+
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = temp.path().join("workspace");
+        std::fs::create_dir_all(&workspace).unwrap();
+
+        let config = Config {
+            db_path: temp.path().join("memory.sqlite3"),
+            model_dir: temp.path().join("model"),
+            model_dir_explicit: true,
+            state_dir: temp.path().join("hook_state"),
+            mcp_access_mode: McpAccessMode::Trusted,
+            embed_mode: EmbedMode::Noop,
+        };
+
+        let transcript = temp.path().join("huge.jsonl");
+        let file = std::fs::File::create(&transcript).unwrap();
+        file.set_len(METRICS_FULL_TRANSCRIPT_MAX_BYTES + 1).unwrap();
+
+        run_hook_with_input(
+            "stop",
+            "claude",
+            config.clone(),
+            serde_json::json!({
+                "cwd": workspace.to_string_lossy(),
+                "session_id": "huge-transcript-session",
+                "transcript_path": transcript.to_string_lossy(),
+            }),
+        )
+        .unwrap();
+
+        let app = App::new(config).unwrap();
+        let rows = app
+            .db
+            .query_token_usage(&crate::db::metrics::TokenUsageQuery::default())
+            .unwrap();
+        assert!(
+            rows.iter().all(|r| r.source != "transcript"),
+            "oversized transcripts must be skipped before full-file read"
+        );
+
+        std::env::remove_var("IRONMEM_DISABLE_MIGRATION");
+    }
+
+    #[test]
+    fn ironmem_metrics_disabled_suppresses_transcript_rows() {
+        // IRONMEM_METRICS=0 must suppress ALL metrics writes including transcript rows.
+        let _env = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let _metrics = crate::metrics::METRICS_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("IRONMEM_METRICS", "0"); // DISABLED
+        std::env::set_var("IRONMEM_DISABLE_MIGRATION", "1");
+
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = temp.path().join("workspace");
+        std::fs::create_dir_all(&workspace).unwrap();
+
+        let config = Config {
+            db_path: temp.path().join("memory.sqlite3"),
+            model_dir: temp.path().join("model"),
+            model_dir_explicit: true,
+            state_dir: temp.path().join("hook_state"),
+            mcp_access_mode: McpAccessMode::Trusted,
+            embed_mode: EmbedMode::Noop,
+        };
+
+        let session_id = "sess-metrics-off";
+        let tx_content = make_claude_transcript(session_id);
+        let transcript = temp.path().join("t.jsonl");
+        std::fs::write(&transcript, &tx_content).unwrap();
+
+        run_hook_with_input(
+            "stop",
+            "claude",
+            config.clone(),
+            serde_json::json!({
+                "cwd": workspace.to_string_lossy(),
+                "session_id": session_id,
+                "transcript_path": transcript.to_string_lossy(),
+            }),
+        )
+        .unwrap();
+
+        let app = App::new(config).unwrap();
+        let rows = app
+            .db
+            .query_token_usage(&crate::db::metrics::TokenUsageQuery::default())
+            .unwrap();
+        assert_eq!(
+            rows.len(),
+            0,
+            "IRONMEM_METRICS=0 must suppress all token_usage writes including transcript"
+        );
+
+        std::env::remove_var("IRONMEM_METRICS");
+        std::env::remove_var("IRONMEM_DISABLE_MIGRATION");
     }
 
     #[test]

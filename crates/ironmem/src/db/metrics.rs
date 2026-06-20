@@ -135,6 +135,41 @@ pub fn new_token_usage_from_llm(
 }
 
 impl NewTokenUsage {
+    /// Build a `source='transcript'` row from a parsed transcript row plus the
+    /// resolved attribution context. Centralizes the ~12 invariant columns
+    /// (`source="transcript"`, `estimated=false`, `cost_usd=None`, `chars=0`,
+    /// `map_status=None`, `area=None`) that the Claude and Codex hook branches
+    /// would otherwise duplicate field-for-field. `harness` is the normalized
+    /// `"claude"`/`"codex"`; `turn_id` carries the parser's idempotency key.
+    pub(crate) fn from_transcript(
+        row: crate::metrics::transcript::TranscriptRow,
+        harness: &str,
+        ts: String,
+        session_id: Option<&str>,
+        ctx: &crate::metrics::MetricsContext,
+    ) -> NewTokenUsage {
+        NewTokenUsage {
+            ts,
+            source: "transcript".to_string(),
+            harness: harness.to_string(),
+            model: row.model,
+            session_id: session_id.map(|s| s.to_string()),
+            collab_session_id: ctx.collab_session_id.clone(),
+            collab_phase: ctx.collab_phase.clone(),
+            task_tag: ctx.task_tag.clone(),
+            input_tokens: row.usage.input_tokens,
+            output_tokens: row.usage.output_tokens,
+            cache_creation_input_tokens: row.usage.cache_creation_input_tokens,
+            cache_read_input_tokens: row.usage.cache_read_input_tokens,
+            estimated: false,
+            chars: 0,
+            cost_usd: None,
+            map_status: None,
+            turn_id: Some(row.turn_id),
+            area: None,
+        }
+    }
+
     /// Return a copy stamped with the resolved attribution context
     /// (METRICS_SPEC §2.3/§3). Consuming builder: callers chain it after
     /// construction; the resolved context replaces all three attribution
@@ -995,6 +1030,104 @@ impl Database {
             mean_tokens_map_hit,
             mean_tokens_map_miss,
         })
+    }
+
+    /// Idempotent upsert for a `source='transcript'` token_usage row (METRICS_SPEC
+    /// §12 / Tasks 4+5). Inside one transaction:
+    /// - `SELECT id FROM token_usage WHERE source='transcript' AND turn_id=?`
+    /// - If found: UPDATE the four token components, `model`, `collab_session_id`,
+    ///   `collab_phase`, `task_tag` on that row.
+    /// - If not found: INSERT a new row with `source='transcript'`,
+    ///   `estimated=false`, `cost_usd=NULL`.
+    ///
+    /// Scoping dedup to `source='transcript'` leaves `mcp_response`/`llm_rerank`/
+    /// `pref_extract` rows untouched even when they share the same `turn_id`.
+    pub fn upsert_transcript_token_usage(&self, row: &NewTokenUsage) -> Result<(), MemoryError> {
+        self.upsert_transcript_token_usage_many(std::slice::from_ref(row))
+    }
+
+    /// Batch variant for full-transcript hook writes. Uses one immediate
+    /// transaction for all parsed rows so overlapping hooks are serialized once
+    /// and long Claude transcripts do not pay one lock/lookup cycle per message.
+    pub fn upsert_transcript_token_usage_many(
+        &self,
+        rows: &[NewTokenUsage],
+    ) -> Result<(), MemoryError> {
+        if rows.is_empty() {
+            return Ok(());
+        }
+        // `stop` and `precompact` can overlap in separate hook processes. A
+        // deferred transaction allows both writers to observe "no row" before
+        // either inserts; `BEGIN IMMEDIATE` serializes that SELECT/INSERT window
+        // without requiring a schema migration.
+        self.conn.execute_batch("BEGIN IMMEDIATE")?;
+        let result = (|| -> Result<(), MemoryError> {
+            for row in rows {
+                self.upsert_transcript_token_usage_in_tx(row)?;
+            }
+            Ok(())
+        })();
+        match result {
+            Ok(()) => {
+                self.conn.execute_batch("COMMIT")?;
+                Ok(())
+            }
+            Err(e) => {
+                let _ = self.conn.execute_batch("ROLLBACK");
+                Err(e)
+            }
+        }
+    }
+
+    fn upsert_transcript_token_usage_in_tx(&self, row: &NewTokenUsage) -> Result<(), MemoryError> {
+        if row.source != "transcript" {
+            return Err(MemoryError::Validation(
+                "upsert_transcript_token_usage requires source='transcript'".to_string(),
+            ));
+        }
+        if row.turn_id.is_none() {
+            return Err(MemoryError::Validation(
+                "upsert_transcript_token_usage requires turn_id".to_string(),
+            ));
+        }
+
+        let existing_id: Option<i64> = self
+            .conn
+            .query_row(
+                "SELECT id FROM token_usage WHERE source = 'transcript' AND turn_id = ?1",
+                params![row.turn_id],
+                |r| r.get::<_, i64>(0),
+            )
+            .optional()?;
+
+        if let Some(id) = existing_id {
+            self.conn.execute(
+                "UPDATE token_usage SET
+                    input_tokens = ?2,
+                    output_tokens = ?3,
+                    cache_creation_input_tokens = ?4,
+                    cache_read_input_tokens = ?5,
+                    model = ?6,
+                    collab_session_id = ?7,
+                    collab_phase = ?8,
+                    task_tag = ?9
+                 WHERE id = ?1",
+                params![
+                    id,
+                    row.input_tokens,
+                    row.output_tokens,
+                    row.cache_creation_input_tokens,
+                    row.cache_read_input_tokens,
+                    row.model,
+                    row.collab_session_id,
+                    row.collab_phase,
+                    row.task_tag,
+                ],
+            )?;
+        } else {
+            self.insert_token_usage(row)?;
+        }
+        Ok(())
     }
 
     fn headline_inner(
@@ -2195,5 +2328,323 @@ mod tests {
             .sum();
         let estimated: i64 = split.iter().filter(|s| s.estimated).map(|s| s.tokens).sum();
         assert_eq!((measured, estimated), (100, 40));
+    }
+
+    // ── Tasks 4 + 5: upsert_transcript_token_usage idempotency ────────────────
+
+    fn transcript_row(turn_id: &str, inp: i64, out: i64, cc: i64, cr: i64) -> NewTokenUsage {
+        NewTokenUsage {
+            ts: "2026-06-19T00:00:00Z".into(),
+            source: "transcript".into(),
+            harness: "claude".into(),
+            model: Some("claude-sonnet-4-6".into()),
+            session_id: Some("sess-t1".into()),
+            collab_session_id: Some("collab-t1".into()),
+            collab_phase: Some("impl".into()),
+            task_tag: Some("collab-t1".into()),
+            input_tokens: inp,
+            output_tokens: out,
+            cache_creation_input_tokens: cc,
+            cache_read_input_tokens: cr,
+            estimated: false,
+            chars: 0,
+            cost_usd: None,
+            map_status: None,
+            turn_id: Some(turn_id.to_string()),
+            area: None,
+        }
+    }
+
+    #[test]
+    fn upsert_transcript_twice_yields_one_row_with_latest_usage() {
+        let db = db();
+        let first = transcript_row("transcript:sess-t1:msg-1", 100, 20, 5, 10);
+        db.upsert_transcript_token_usage(&first).unwrap();
+
+        // Second upsert with different (updated) token values.
+        let second = transcript_row("transcript:sess-t1:msg-1", 999, 888, 7, 6);
+        db.upsert_transcript_token_usage(&second).unwrap();
+
+        // Exactly one transcript row.
+        let rows = db
+            .query_token_usage(&TokenUsageQuery {
+                ..Default::default()
+            })
+            .unwrap();
+        let transcript_rows: Vec<_> = rows.iter().filter(|r| r.source == "transcript").collect();
+        assert_eq!(
+            transcript_rows.len(),
+            1,
+            "idempotent: exactly one row after two upserts"
+        );
+        assert_eq!(transcript_rows[0].input_tokens, 999, "latest usage stored");
+        assert_eq!(transcript_rows[0].output_tokens, 888);
+        assert_eq!(transcript_rows[0].cache_creation_input_tokens, 7);
+        assert_eq!(transcript_rows[0].cache_read_input_tokens, 6);
+        assert!(!transcript_rows[0].estimated, "estimated must be false");
+        assert!(transcript_rows[0].cost_usd.is_none());
+    }
+
+    #[test]
+    fn upsert_transcript_does_not_touch_mcp_response_row_sharing_nominal_turn_id() {
+        let db = db();
+        // Insert an mcp_response row with the same turn_id string.
+        let mcp_row = NewTokenUsage {
+            ts: "2026-06-19T00:00:00Z".into(),
+            source: "mcp_response".into(),
+            harness: "claude".into(),
+            model: None,
+            session_id: None,
+            collab_session_id: None,
+            collab_phase: None,
+            task_tag: None,
+            input_tokens: 0,
+            output_tokens: 42,
+            cache_creation_input_tokens: 0,
+            cache_read_input_tokens: 0,
+            estimated: true,
+            chars: 168,
+            cost_usd: None,
+            map_status: None,
+            turn_id: Some("transcript:sess-t1:msg-1".to_string()),
+            area: None,
+        };
+        db.insert_token_usage(&mcp_row).unwrap();
+
+        // Now upsert a transcript row with the same turn_id.
+        let tx_row = transcript_row("transcript:sess-t1:msg-1", 100, 20, 0, 0);
+        db.upsert_transcript_token_usage(&tx_row).unwrap();
+
+        // Two total rows: one mcp_response (untouched) + one transcript (new).
+        let all = db.query_token_usage(&TokenUsageQuery::default()).unwrap();
+        assert_eq!(all.len(), 2, "mcp_response row must not be clobbered");
+
+        let mcp = all.iter().find(|r| r.source == "mcp_response").unwrap();
+        assert_eq!(mcp.output_tokens, 42, "mcp_response row unchanged");
+        assert!(mcp.estimated, "mcp_response estimated flag unchanged");
+
+        let tx = all.iter().find(|r| r.source == "transcript").unwrap();
+        assert_eq!(tx.input_tokens, 100);
+        assert!(!tx.estimated);
+    }
+
+    // ── Task 9: report regression — transcript rows flow into §10.4 headline ──
+
+    #[test]
+    fn transcript_rows_flow_into_headline_tokens_to_done() {
+        // METRICS_SPEC §10.4: the headline JOIN is on
+        //   `u.task_tag = t.task_tag OR u.collab_session_id = t.collab_session_id`
+        // and uses `estimated = 0`. Transcript rows (source='transcript', estimated=false)
+        // must appear in `tokens_to_done` when their collab_session_id matches the
+        // task_outcomes row.
+        let db = db();
+
+        // Seed a task_outcomes row.
+        db.upsert_task_outcome(&TaskOutcome {
+            task_tag: "tx-task".into(),
+            collab_session_id: Some("tx-collab".into()),
+            started_at: Some("2026-06-19T00:00:00Z".into()),
+            done_at: Some("2026-06-19T01:00:00Z".into()),
+            outcome: Some("merged".into()),
+            review_rounds: 1,
+            fix_commits: 2,
+            handoffs: 0,
+            pr_url: None,
+        })
+        .unwrap();
+
+        // Claude transcript row (collab_session_id match).
+        db.insert_token_usage(&NewTokenUsage {
+            ts: "2026-06-19T00:30:00Z".into(),
+            source: "transcript".into(),
+            harness: "claude".into(),
+            model: Some("claude-sonnet-4-6".into()),
+            session_id: Some("sess-1".into()),
+            collab_session_id: Some("tx-collab".into()),
+            collab_phase: Some("impl".into()),
+            task_tag: Some("tx-collab".into()),
+            input_tokens: 300,
+            output_tokens: 60,
+            cache_creation_input_tokens: 10,
+            cache_read_input_tokens: 50,
+            estimated: false,
+            chars: 0,
+            cost_usd: None,
+            map_status: None,
+            turn_id: Some("transcript:sess-1:msg-1".into()),
+            area: None,
+        })
+        .unwrap();
+
+        // Codex transcript row (cached subtracted from input, collab_session_id match).
+        db.insert_token_usage(&NewTokenUsage {
+            ts: "2026-06-19T00:45:00Z".into(),
+            source: "transcript".into(),
+            harness: "codex".into(),
+            model: None,
+            session_id: Some("codex-sess-1".into()),
+            collab_session_id: Some("tx-collab".into()),
+            collab_phase: Some("impl".into()),
+            task_tag: Some("tx-collab".into()),
+            input_tokens: 900, // 1500 − 600
+            output_tokens: 300,
+            cache_creation_input_tokens: 0,
+            cache_read_input_tokens: 600,
+            estimated: false,
+            chars: 0,
+            cost_usd: None,
+            map_status: None,
+            turn_id: Some("transcript:codex-sess-1:codex-final".into()),
+            area: None,
+        })
+        .unwrap();
+
+        let headline = db.report_headline(Some("tx-task"), None).unwrap();
+        assert_eq!(headline.len(), 1, "one merged task");
+        let h = &headline[0];
+        // Expected: (300+60+10+50) + (900+300+0+600) = 420 + 1800 = 2220
+        assert_eq!(
+            h.tokens_to_done, 2220,
+            "transcript rows (claude + codex) must sum into tokens_to_done"
+        );
+        assert_eq!(h.task_tag, "tx-task");
+        assert_eq!(h.collab_session_id.as_deref(), Some("tx-collab"));
+    }
+
+    #[test]
+    fn estimated_transcript_rows_are_excluded_from_headline() {
+        // `source='transcript'` rows with `estimated=true` must NOT appear in the
+        // §10.4 headline (estimated=0 filter). This is a guardrail: the production
+        // path always writes estimated=false, but a stale row must not pollute.
+        let db = db();
+        db.upsert_task_outcome(&TaskOutcome {
+            task_tag: "est-task".into(),
+            collab_session_id: Some("est-collab".into()),
+            started_at: Some("2026-06-19T00:00:00Z".into()),
+            done_at: Some("2026-06-19T01:00:00Z".into()),
+            outcome: Some("merged".into()),
+            review_rounds: 0,
+            fix_commits: 0,
+            handoffs: 0,
+            pr_url: None,
+        })
+        .unwrap();
+        db.insert_token_usage(&NewTokenUsage {
+            ts: "2026-06-19T00:30:00Z".into(),
+            source: "transcript".into(),
+            harness: "claude".into(),
+            model: None,
+            session_id: None,
+            collab_session_id: Some("est-collab".into()),
+            collab_phase: Some("impl".into()),
+            task_tag: Some("est-collab".into()),
+            input_tokens: 99999,
+            output_tokens: 0,
+            cache_creation_input_tokens: 0,
+            cache_read_input_tokens: 0,
+            estimated: true, // <-- must be excluded from §10.4
+            chars: 0,
+            cost_usd: None,
+            map_status: None,
+            turn_id: Some("transcript:x:y".into()),
+            area: None,
+        })
+        .unwrap();
+        let headline = db.report_headline(Some("est-task"), None).unwrap();
+        // Zero rows because the only transcript row is estimated=true.
+        assert!(
+            headline.is_empty(),
+            "estimated transcript rows must not appear in §10.4 headline"
+        );
+    }
+
+    #[test]
+    fn upsert_transcript_codex_row_is_idempotent() {
+        let db = db();
+        let codex_row = NewTokenUsage {
+            ts: "2026-06-19T00:00:00Z".into(),
+            source: "transcript".into(),
+            harness: "codex".into(),
+            model: None,
+            session_id: Some("codex-sess-1".into()),
+            collab_session_id: Some("collab-t1".into()),
+            collab_phase: Some("impl".into()),
+            task_tag: Some("collab-t1".into()),
+            input_tokens: 900,
+            output_tokens: 300,
+            cache_creation_input_tokens: 0,
+            cache_read_input_tokens: 600,
+            estimated: false,
+            chars: 0,
+            cost_usd: None,
+            map_status: None,
+            turn_id: Some("transcript:codex-sess-1:codex-final".to_string()),
+            area: None,
+        };
+        db.upsert_transcript_token_usage(&codex_row).unwrap();
+        db.upsert_transcript_token_usage(&codex_row).unwrap();
+
+        let rows = db.query_token_usage(&TokenUsageQuery::default()).unwrap();
+        let codex_rows: Vec<_> = rows
+            .iter()
+            .filter(|r| r.harness == "codex" && r.source == "transcript")
+            .collect();
+        assert_eq!(
+            codex_rows.len(),
+            1,
+            "codex transcript row must be idempotent"
+        );
+        assert_eq!(codex_rows[0].input_tokens, 900);
+        assert_eq!(codex_rows[0].cache_read_input_tokens, 600);
+    }
+
+    // ── M3: BEGIN IMMEDIATE serializes overlapping cross-connection writers ───
+
+    #[test]
+    fn upsert_transcript_is_serialized_across_concurrent_connections() {
+        // The `stop` and `precompact` hooks run in SEPARATE processes, so the
+        // SELECT/INSERT dedup window must serialize across connections — that is
+        // the reason `upsert_transcript_token_usage_many` uses `BEGIN IMMEDIATE`
+        // rather than the crate's DEFERRED `with_transaction`. The in-memory
+        // `db()` helper gives each handle its OWN database, so it cannot exercise
+        // this; use a single file-backed DB opened from two threads.
+        use std::sync::{Arc, Barrier};
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("concurrent.sqlite3");
+        // First open creates the file and runs migrations.
+        Database::open(&path).unwrap().migrate().unwrap();
+
+        let row = transcript_row("transcript:race:msg-1", 100, 20, 0, 0);
+        // Barrier maximizes the overlap: both threads reach the upsert together,
+        // so without IMMEDIATE both could SELECT "no row" before either inserts.
+        let barrier = Arc::new(Barrier::new(2));
+        let handles: Vec<_> = (0..2)
+            .map(|_| {
+                let path = path.clone();
+                let barrier = Arc::clone(&barrier);
+                let row = row.clone();
+                std::thread::spawn(move || {
+                    let db = Database::open(&path).unwrap();
+                    barrier.wait();
+                    db.upsert_transcript_token_usage(&row)
+                })
+            })
+            .collect();
+        for h in handles {
+            // Both writers must succeed (the loser blocks on busy_timeout, then
+            // observes the committed row and UPDATEs it) — neither errors.
+            h.join().unwrap().unwrap();
+        }
+
+        let db = Database::open(&path).unwrap();
+        let rows = db.query_token_usage(&TokenUsageQuery::default()).unwrap();
+        let tx_rows: Vec<_> = rows.iter().filter(|r| r.source == "transcript").collect();
+        assert_eq!(
+            tx_rows.len(),
+            1,
+            "BEGIN IMMEDIATE must serialize concurrent upserts of one turn_id to a single row"
+        );
+        assert_eq!(tx_rows[0].input_tokens, 100);
     }
 }

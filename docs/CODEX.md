@@ -24,14 +24,28 @@ What works now:
 
 What hooks currently do on `stop` / `precompact`:
 
+- **Transcript token persistence** — the full transcript is parsed and per-turn agent token usage
+  is written as `source='transcript'`, `estimated=false` rows in `token_usage`. One row per distinct
+  `message.id` for Claude stream-json; one cumulative row (`codex-final`) for Codex rollouts (cached
+  tokens subtracted from input per §12 2026-06-20). Idempotent: re-running the same hook input
+  does not double-count. Runs under `IRONMEM_METRICS` gate only, decoupled from `allows_writes`
+  (same §113 pattern as occupancy sampling). See METRICS_SPEC.md §12 2026-06-20 for the full
+  accounting rules and idempotency key format.
+- **Occupancy sampling** — the last assistant message's input + cache_read token counts are sampled
+  into `occupancy_samples` and merged into `session_summary`. Runs under `IRONMEM_METRICS` gate,
+  decoupled from `allows_writes` (issue #113).
 - **Transcript review capture** — assistant messages in the transcript are scanned in reverse
   chronological order for code-review-like content (severity labels, file references, decision
   keywords). The most recent review-like assistant message is stored as a drawer in the
-  `reviews/` wing so it can be recalled in future sessions.
+  `reviews/` wing so it can be recalled in future sessions. Gated by `allows_writes`.
 - **Metadata diary entry** — a structured summary line is written to the diary recording the hook
   name, harness, session ID, working directory, and transcript path, plus the review room if a
-  review was captured.
+  review was captured. Gated by `allows_writes`.
 - **Incremental re-mine** — workspace files changed since the last hook run are re-embedded.
+  Gated by `allows_writes`.
+
+`user-prompt-submit` (Claude Code only) — occupancy sampling only (no transcript token persistence;
+no real message id is available in UPS).
 
 What does not work yet:
 
@@ -104,8 +118,8 @@ The database is kept up to date automatically through hooks:
 |------|-------------|
 | `session-start` | Bootstrap if first run; initial mine if workspace not yet indexed. On the Claude Code harness, also emits a compact memory-status block via `hookSpecificOutput.additionalContext` (drawer/wing/room counts, active collab session + phase, last-diary pointer, `MEMORY_PROTOCOL`); Codex receives no such output (silent degrade) |
 | `user-prompt-submit` | Claude Code only — FTS/BM25 drawer lookup and optional context injection (see below). Codex registers no UserPromptSubmit hook |
-| `stop` | Persist session summary to diary; re-mine files changed since last hook run |
-| `precompact` | Snapshot pending session context; re-mine changed files |
+| `stop` | Persist measured transcript token rows and occupancy samples under `IRONMEM_METRICS`; persist session summary to diary and re-mine changed files when writes are allowed |
+| `precompact` | Persist measured transcript token rows and occupancy samples under `IRONMEM_METRICS`; snapshot pending session context and re-mine changed files when writes are allowed |
 
 ### UserPromptSubmit (Claude Code only)
 
