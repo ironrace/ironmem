@@ -6,10 +6,11 @@ use std::sync::{Arc, Mutex};
 
 use abeval::arms::Arm;
 use abeval::client::{
-    arm_command, parse_cli_result, ArmExecutor, ArmOutcome, CommandOutput, CommandRunner,
-    IronmemArmRunner, LiveExecutor, ProvisionRequest, Usage, WorkspaceProvisioner,
+    arm_command, ArmExecutor, ArmOutcome, CommandOutput, CommandRunner, IronmemArmRunner,
+    LiveExecutor, ProvisionRequest, Usage, WorkspaceProvisioner,
 };
 use abeval::corpus::Task;
+use abeval::stream_usage::parse_stream_json;
 
 /// No-op provisioner for tests that don't test provisioning behavior — just
 /// creates the workspace directory so the runner can write artifacts into it.
@@ -38,11 +39,14 @@ fn task() -> Task {
     }
 }
 
-const SUCCESS_JSON: &str = r#"{
-    "type": "result", "is_error": false, "result": "done",
-    "usage": {"input_tokens": 1200, "cache_creation_input_tokens": 0,
-              "cache_read_input_tokens": 0, "output_tokens": 250}
-}"#;
+// A `--output-format stream-json --verbose` transcript: one assistant message
+// carrying the turn's usage, then the terminal `result` event. Summed usage =
+// 1200 input / 250 output, so existing per-component assertions are unchanged.
+const SUCCESS_JSON: &str = concat!(
+    r#"{"type":"assistant","message":{"id":"msg_1","usage":{"input_tokens":1200,"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"output_tokens":250}}}"#,
+    "\n",
+    r#"{"type":"result","is_error":false,"result":"done","usage":{"input_tokens":1200,"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"output_tokens":250}}"#,
+);
 
 type Captured = Arc<Mutex<Vec<(String, Vec<String>, PathBuf)>>>;
 
@@ -230,26 +234,19 @@ fn live_executor_failed_process_records_failed_outcome() {
     );
 }
 
-/// The `claude -p --output-format json` success envelope parses into the four
-/// §2.1 token components plus the success outcome.
+/// A stream-json transcript parses into the four §2.1 token components (summed
+/// from its assistant messages) plus the terminal `result` event's text/flag.
 #[test]
-fn parse_cli_result_reads_usage_and_success() {
-    let stdout = r#"{
-        "type": "result",
-        "subtype": "success",
-        "is_error": false,
-        "result": "done",
-        "session_id": "abc",
-        "total_cost_usd": 0.012,
-        "usage": {
-            "input_tokens": 1200,
-            "cache_creation_input_tokens": 300,
-            "cache_read_input_tokens": 40,
-            "output_tokens": 250
-        }
-    }"#;
+fn parse_stream_json_reads_usage_and_success() {
+    let stdout = concat!(
+        r#"{"type":"system","subtype":"init","session_id":"abc"}"#,
+        "\n",
+        r#"{"type":"assistant","message":{"id":"msg_1","usage":{"input_tokens":1200,"cache_creation_input_tokens":300,"cache_read_input_tokens":40,"output_tokens":250}}}"#,
+        "\n",
+        r#"{"type":"result","subtype":"success","is_error":false,"result":"done","session_id":"abc","total_cost_usd":0.012,"usage":{"input_tokens":1200,"cache_creation_input_tokens":300,"cache_read_input_tokens":40,"output_tokens":250}}"#,
+    );
 
-    let parsed = parse_cli_result(stdout).expect("valid envelope parses");
+    let parsed = parse_stream_json(stdout).expect("valid transcript parses");
 
     assert!(!parsed.is_error);
     assert_eq!(parsed.result, "done");
@@ -261,33 +258,180 @@ fn parse_cli_result_reads_usage_and_success() {
     assert_eq!(parsed.usage.total(), 1200 + 300 + 40 + 250);
 }
 
-/// An `is_error: true` envelope is parsed (not rejected) and surfaces the error
-/// flag so the runner can record a non-completed outcome rather than crashing.
+/// THE point of stream-json (METRICS_SPEC §12 2026-06-19): a Task-subagent's
+/// assistant messages run in a separate sub-session that the single-envelope
+/// top-level `usage` never rolls up. Summing per-message usage across parent AND
+/// subagent ids counts those tokens. The terminal `result` event's own top-level
+/// usage (parent-only) must NOT be added on top, or the parent double-counts.
 #[test]
-fn parse_cli_result_surfaces_error_envelope() {
-    let stdout = r#"{
-        "type": "result",
-        "subtype": "error_max_turns",
-        "is_error": true,
-        "result": "hit limit",
-        "usage": {"input_tokens": 10, "output_tokens": 5,
-                  "cache_creation_input_tokens": 0, "cache_read_input_tokens": 0}
-    }"#;
+fn parse_stream_json_sums_subagent_messages() {
+    let stdout = concat!(
+        // parent orchestrator turn
+        r#"{"type":"assistant","parent_tool_use_id":null,"message":{"id":"msg_parent","usage":{"input_tokens":1000,"output_tokens":200,"cache_creation_input_tokens":0,"cache_read_input_tokens":0}}}"#,
+        "\n",
+        // subagent turn (separate sub-session, distinct message id)
+        r#"{"type":"assistant","parent_tool_use_id":"toolu_abc","message":{"id":"msg_sub","usage":{"input_tokens":5000,"output_tokens":800,"cache_creation_input_tokens":0,"cache_read_input_tokens":0}}}"#,
+        "\n",
+        // terminal envelope reports ONLY the parent's roll-up
+        r#"{"type":"result","is_error":false,"result":"ok","usage":{"input_tokens":1000,"output_tokens":200,"cache_creation_input_tokens":0,"cache_read_input_tokens":0}}"#,
+    );
 
-    let parsed = parse_cli_result(stdout).expect("error envelope still parses");
+    let parsed = parse_stream_json(stdout).expect("transcript parses");
+    assert_eq!(
+        parsed.usage.input_tokens,
+        1000 + 5000,
+        "subagent input summed"
+    );
+    assert_eq!(
+        parsed.usage.output_tokens,
+        200 + 800,
+        "subagent output summed"
+    );
+    // The parent-only top-level usage (1200) would be a >5x undercount.
+    assert_eq!(parsed.usage.total(), 1000 + 200 + 5000 + 800);
+}
+
+/// A repeated `message.id` (streamed/partial duplicate) is counted once, at its
+/// final usage — last-write-wins per id, never additive double-counting.
+#[test]
+fn parse_stream_json_dedups_by_message_id() {
+    let stdout = concat!(
+        r#"{"type":"assistant","message":{"id":"msg_dup","usage":{"input_tokens":10,"output_tokens":1,"cache_creation_input_tokens":0,"cache_read_input_tokens":0}}}"#,
+        "\n",
+        r#"{"type":"assistant","message":{"id":"msg_dup","usage":{"input_tokens":300,"output_tokens":50,"cache_creation_input_tokens":0,"cache_read_input_tokens":0}}}"#,
+        "\n",
+        r#"{"type":"result","is_error":false,"result":"ok","usage":{}}"#,
+    );
+
+    let parsed = parse_stream_json(stdout).expect("transcript parses");
+    assert_eq!(
+        parsed.usage.input_tokens, 300,
+        "same id counted once (last wins)"
+    );
+    assert_eq!(parsed.usage.output_tokens, 50);
+}
+
+/// An `is_error: true` terminal event is parsed (not rejected) and surfaces the
+/// error flag so the runner records a non-completed outcome rather than crashing.
+#[test]
+fn parse_stream_json_surfaces_error_event() {
+    let stdout = concat!(
+        r#"{"type":"assistant","message":{"id":"msg_1","usage":{"input_tokens":10,"output_tokens":5,"cache_creation_input_tokens":0,"cache_read_input_tokens":0}}}"#,
+        "\n",
+        r#"{"type":"result","subtype":"error_max_turns","is_error":true,"result":"hit limit","usage":{"input_tokens":10,"output_tokens":5,"cache_creation_input_tokens":0,"cache_read_input_tokens":0}}"#,
+    );
+
+    let parsed = parse_stream_json(stdout).expect("error transcript still parses");
     assert!(parsed.is_error);
     assert_eq!(parsed.usage.total(), 15);
 }
 
-/// Non-JSON / truncated CLI output is a loud error, never a silent zero-usage row.
+/// A malformed JSONL line is a loud error, never a silent zero-usage row.
 #[test]
-fn parse_cli_result_rejects_non_json() {
-    let err = parse_cli_result("not json at all").unwrap_err();
+fn parse_stream_json_rejects_non_json() {
+    let err = parse_stream_json("not json at all").unwrap_err();
     assert!(
         err.to_string().to_lowercase().contains("parse")
             || err.to_string().to_lowercase().contains("expected"),
         "non-JSON must surface a parse error, got: {err}"
     );
+}
+
+/// A transcript with assistant messages but NO terminal `result` event is schema
+/// drift — a loud error, not a silently truncated measurement.
+#[test]
+fn parse_stream_json_rejects_missing_result_event() {
+    let stdout = r#"{"type":"assistant","message":{"id":"m","usage":{"input_tokens":5,"output_tokens":1,"cache_creation_input_tokens":0,"cache_read_input_tokens":0}}}"#;
+    let err = parse_stream_json(stdout).unwrap_err();
+    assert!(
+        err.to_string().to_lowercase().contains("result"),
+        "missing terminal result event must be loud, got: {err}"
+    );
+}
+
+/// A transcript that accumulated REAL subagent usage but then drifted before
+/// emitting a terminal `result` must still error — accumulated tokens never leak
+/// out as a silent partial measurement row. (Strengthens the guard above past the
+/// trivial single-message case.)
+#[test]
+fn parse_stream_json_missing_result_discards_accumulated_usage() {
+    let stdout = concat!(
+        r#"{"type":"assistant","message":{"id":"msg_p","usage":{"input_tokens":1000,"output_tokens":200,"cache_creation_input_tokens":0,"cache_read_input_tokens":0}}}"#,
+        "\n",
+        r#"{"type":"assistant","message":{"id":"msg_s","usage":{"input_tokens":5000,"output_tokens":800,"cache_creation_input_tokens":0,"cache_read_input_tokens":0}}}"#,
+    );
+    assert!(
+        parse_stream_json(stdout).is_err(),
+        "substantial accumulated usage must not leak out without a terminal result event"
+    );
+}
+
+/// Per-message usage that is ABSENT or a NON-OBJECT (schema drift) contributes 0
+/// rather than failing the whole transcript — the well-formed messages still sum.
+/// Pins the `unwrap_or_default`/absent-vs-drift fallback so a future change to
+/// `?`-on-drift (whole-transcript failure) or to double-counting is caught.
+#[test]
+fn parse_stream_json_tolerates_absent_and_nonobject_per_message_usage() {
+    let stdout = concat!(
+        // well-formed
+        r#"{"type":"assistant","message":{"id":"ok","usage":{"input_tokens":500,"output_tokens":70,"cache_creation_input_tokens":0,"cache_read_input_tokens":0}}}"#,
+        "\n",
+        // usage key absent entirely
+        r#"{"type":"assistant","message":{"id":"no_usage"}}"#,
+        "\n",
+        // usage present but a non-object (drift) — counted as 0, logged loud
+        r#"{"type":"assistant","message":{"id":"bad_usage","usage":"oops"}}"#,
+        "\n",
+        r#"{"type":"result","is_error":false,"result":"ok","usage":{}}"#,
+    );
+
+    let parsed =
+        parse_stream_json(stdout).expect("odd per-message usage must not fail the transcript");
+    assert_eq!(
+        parsed.usage.input_tokens, 500,
+        "only the well-formed message contributes"
+    );
+    assert_eq!(parsed.usage.output_tokens, 70);
+}
+
+/// Cache-token fields (`cache_creation_input_tokens` / `cache_read_input_tokens`)
+/// must accumulate across MULTIPLE messages — on real collab runs cache tokens
+/// dominate the bill. A regression that dropped a cache field in `Usage::add_assign`
+/// would pass every single-message test; this asserts each component independently.
+#[test]
+fn parse_stream_json_sums_cache_fields_across_messages() {
+    let stdout = concat!(
+        r#"{"type":"assistant","message":{"id":"a","usage":{"input_tokens":10,"output_tokens":2,"cache_creation_input_tokens":100,"cache_read_input_tokens":7000}}}"#,
+        "\n",
+        r#"{"type":"assistant","message":{"id":"b","usage":{"input_tokens":20,"output_tokens":3,"cache_creation_input_tokens":300,"cache_read_input_tokens":9000}}}"#,
+        "\n",
+        r#"{"type":"result","is_error":false,"result":"ok","usage":{}}"#,
+    );
+
+    let parsed = parse_stream_json(stdout).expect("transcript parses");
+    assert_eq!(parsed.usage.input_tokens, 10 + 20);
+    assert_eq!(parsed.usage.output_tokens, 2 + 3);
+    assert_eq!(parsed.usage.cache_creation_input_tokens, 100 + 300);
+    assert_eq!(parsed.usage.cache_read_input_tokens, 7000 + 9000);
+}
+
+/// Blank/whitespace lines and a trailing newline are tolerated, not treated as
+/// malformed-JSON loud errors — real CLI stream-json output ends with a trailing
+/// `\n` and can carry blank separator lines.
+#[test]
+fn parse_stream_json_tolerates_blank_lines_and_trailing_newline() {
+    let stdout = concat!(
+        "\n",
+        r#"{"type":"assistant","message":{"id":"a","usage":{"input_tokens":42,"output_tokens":6,"cache_creation_input_tokens":0,"cache_read_input_tokens":0}}}"#,
+        "\n",
+        "   \n",
+        r#"{"type":"result","is_error":false,"result":"ok","usage":{}}"#,
+        "\n",
+    );
+
+    let parsed = parse_stream_json(stdout).expect("blank lines and trailing newline are tolerated");
+    assert_eq!(parsed.usage.input_tokens, 42);
+    assert_eq!(parsed.usage.output_tokens, 6);
 }
 
 fn arm_outcome(outcome: &str, input: u32) -> ArmOutcome {
@@ -601,9 +745,13 @@ fn process_gate_runner_rejects_empty_gate() {
 
 // --- Review fixes (issue #122 review round) ---
 
-const ZERO_USAGE_JSON: &str = r#"{"is_error":false,"result":"done",
-    "usage":{"input_tokens":0,"output_tokens":0,
-             "cache_creation_input_tokens":0,"cache_read_input_tokens":0}}"#;
+// stream-json transcript whose summed assistant usage is zero (schema drift /
+// absent usage), so the run-level zero-token guard must fire on success.
+const ZERO_USAGE_JSON: &str = concat!(
+    r#"{"type":"assistant","message":{"id":"msg_0","usage":{"input_tokens":0,"output_tokens":0,"cache_creation_input_tokens":0,"cache_read_input_tokens":0}}}"#,
+    "\n",
+    r#"{"type":"result","is_error":false,"result":"done","usage":{"input_tokens":0,"output_tokens":0,"cache_creation_input_tokens":0,"cache_read_input_tokens":0}}"#,
+);
 
 /// A success envelope reporting ZERO total tokens is not physically plausible —
 /// it means the usage block was absent/renamed. Recording it as a merged

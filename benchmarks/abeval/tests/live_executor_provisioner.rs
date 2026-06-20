@@ -155,7 +155,12 @@ fn execute_provisions_before_running_with_resolved_base() {
         calls: calls.clone(),
     };
     let runner = FakeRunner {
-        stdout: r#"{"is_error":false,"result":"ok","usage":{"input_tokens":10,"output_tokens":5,"cache_creation_input_tokens":0,"cache_read_input_tokens":0}}"#.to_string(),
+        stdout: concat!(
+            r#"{"type":"assistant","message":{"id":"msg_1","usage":{"input_tokens":10,"output_tokens":5,"cache_creation_input_tokens":0,"cache_read_input_tokens":0}}}"#,
+            "\n",
+            r#"{"type":"result","is_error":false,"result":"ok","usage":{"input_tokens":10,"output_tokens":5,"cache_creation_input_tokens":0,"cache_read_input_tokens":0}}"#,
+        )
+        .to_string(),
         ran: ran.clone(),
     };
     let exec = LiveExecutor::new(runner, prov, PathBuf::from("/tmp/ws-root"), None);
@@ -180,7 +185,12 @@ fn execute_forwards_run_override_when_task_pin_empty() {
         calls: calls.clone(),
     };
     let runner = FakeRunner {
-        stdout: r#"{"is_error":false,"result":"ok","usage":{"input_tokens":10,"output_tokens":5,"cache_creation_input_tokens":0,"cache_read_input_tokens":0}}"#.to_string(),
+        stdout: concat!(
+            r#"{"type":"assistant","message":{"id":"msg_1","usage":{"input_tokens":10,"output_tokens":5,"cache_creation_input_tokens":0,"cache_read_input_tokens":0}}}"#,
+            "\n",
+            r#"{"type":"result","is_error":false,"result":"ok","usage":{"input_tokens":10,"output_tokens":5,"cache_creation_input_tokens":0,"cache_read_input_tokens":0}}"#,
+        )
+        .to_string(),
         ran,
     };
     let exec = LiveExecutor::new(
@@ -249,7 +259,12 @@ struct OrderingIronmemRunner {
 }
 
 impl IronmemArmRunner for OrderingIronmemRunner {
-    fn run(&self, _task: &Task, _workspace: &Path, _out_task_dir: &Path) -> anyhow::Result<ArmOutcome> {
+    fn run(
+        &self,
+        _task: &Task,
+        _workspace: &Path,
+        _out_task_dir: &Path,
+    ) -> anyhow::Result<ArmOutcome> {
         {
             let log = self.order.lock().unwrap();
             assert!(

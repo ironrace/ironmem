@@ -12,6 +12,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::arms::Arm;
 use crate::corpus::{BaseCommit, Task};
+use crate::stream_usage::parse_stream_json;
 
 const SUPERPOWERS_PROMPT_PREFIX: &str = "Run this task with superpowers skills only. \
 Do not use /collab, ironmem MCP tools, semantic search, KG reads/writes, drawer \
@@ -80,38 +81,17 @@ pub trait ArmExecutor {
     fn execute(&self, task: &Task, arm: Arm) -> Result<ArmOutcome>;
 }
 
-/// Parsed `claude -p --output-format json` result envelope. Only the fields the
-/// harness needs are read; unknown fields are ignored.
+/// Parsed result of a `claude -p` run: the terminal envelope's error flag and
+/// printed text, plus the summed token usage. Built by
+/// [`crate::stream_usage::parse_stream_json`] from the `--output-format
+/// stream-json --verbose` transcript, where `usage` is the sum of every
+/// assistant message's usage (parent orchestrator + Task-subagents), so
+/// subagent tokens are counted. Only the fields the harness needs are read.
 #[derive(Debug, Clone)]
 pub struct CliResult {
     pub is_error: bool,
     pub result: String,
     pub usage: Usage,
-}
-
-#[derive(Deserialize)]
-struct CliEnvelope {
-    #[serde(default)]
-    is_error: bool,
-    #[serde(default)]
-    result: String,
-    #[serde(default)]
-    usage: Usage,
-}
-
-/// Parse the `claude -p --output-format json` envelope into a [`CliResult`].
-///
-/// The error flag is surfaced (not rejected) so the runner can record a
-/// non-completed outcome; malformed/non-JSON output is a loud error rather than
-/// a silent zero-usage row.
-pub fn parse_cli_result(stdout: &str) -> Result<CliResult> {
-    let env: CliEnvelope = serde_json::from_str(stdout)
-        .map_err(|e| anyhow::anyhow!("failed to parse claude CLI JSON envelope: {e}"))?;
-    Ok(CliResult {
-        is_error: env.is_error,
-        result: env.result,
-        usage: env.usage,
-    })
 }
 
 /// Deterministic, network-free executor used for the committed smoke path.
@@ -180,9 +160,14 @@ fn superpowers_mcp_isolation_args() -> Vec<String> {
 ///   ignores the prompt prefix. Any task_tag/reporting instrumentation is
 ///   measurement-only and kept out of the working path.
 ///
-/// Both arms request `--output-format json` AND `-p` (print mode, required for
-/// `--output-format` to take effect) AND headless permission tokens. The
-/// isolation flags precede `-p` so the prompt remains the print-mode positional.
+/// Both arms request `--output-format stream-json --verbose` AND `-p` (print
+/// mode, required for `--output-format` to take effect; `stream-json` itself
+/// requires `--verbose`) AND headless permission tokens. The stream-json
+/// transcript is parsed by [`crate::stream_usage::parse_stream_json`], which sums
+/// per-assistant-message usage so Task-subagent tokens are counted (METRICS_SPEC
+/// §12 2026-06-19) — the single-envelope `--output-format json` `usage` block
+/// excluded them. The isolation flags precede `-p` so the prompt remains the
+/// print-mode positional.
 ///
 /// NOTE: as of METRICS_SPEC §12 2026-06-17, `LiveExecutor::execute` no longer
 /// calls `arm_command` for `Arm::Ironmem` — that arm delegates to an
@@ -190,7 +175,11 @@ fn superpowers_mcp_isolation_args() -> Vec<String> {
 /// here is retained only for `arm_command` unit tests (`tests/arms.rs`,
 /// `tests/live_executor.rs`).
 pub fn arm_command(task: &Task, arm: Arm) -> (String, Vec<String>) {
-    let mut argv = vec!["--output-format".to_string(), "json".to_string()];
+    let mut argv = vec![
+        "--output-format".to_string(),
+        "stream-json".to_string(),
+        "--verbose".to_string(),
+    ];
     argv.extend(headless_permission_args());
     // C1 (§11.2): the superpowers arm loads ZERO MCP servers so it physically
     // cannot reach ironmem; the ironmem arm keeps the inherited config because it
@@ -646,7 +635,7 @@ impl<R: CommandRunner, P: WorkspaceProvisioner> ArmExecutor for LiveExecutor<R, 
 
         let (program, args) = arm_command(task, arm);
         let output = self.runner.run(&program, &args, &workspace)?;
-        let parsed = parse_cli_result(&output.stdout)?;
+        let parsed = parse_stream_json(&output.stdout)?;
 
         // A non-zero exit OR an is_error envelope is a non-completion; tokens
         // spent are still recorded so a failed arm is never a silent zero row.

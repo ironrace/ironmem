@@ -715,3 +715,57 @@ Codex plan-review turn, and a single human gate on Claude's final Superpowers
 task plan. The `PlanLocked` bridge mechanically parses that approved markdown
 into `task_list` and rejects tasks timeboxed above 20 minutes. Phase bucket names
 and the `task_list` planning attribution bucket remain unchanged.
+
+### 2026-06-19 — Claude-side token capture switches to stream-json (supersedes the 2026-06-16 #2 source clause)
+
+**What changed.** The Claude-side component of `tokens_to_done` (§2.1) is now read
+from a `claude -p --output-format stream-json --verbose` transcript, summing each
+**assistant message's** `usage` deduplicated by `message.id`, instead of the
+single `--output-format json` envelope's top-level `usage` block. No counter name,
+unit, or aggregation in §1–§11 changed — only the *source* of the Claude-side
+four-component sum.
+
+**Why (the bug this fixes).** The single-envelope top-level `usage` reports ONLY
+the orchestrator session's tokens. Task-subagents run in **separate sessions**
+whose usage is never rolled up into that block (as observed in Claude Code
+stream-json output and docs, 2026-06-19). The driver parsed only that envelope,
+so every subagent-heavy turn was
+**undercounted** — invisibly on BOTH arms' Claude side:
+
+- the `superpowers` arm's single `claude -p` runs `subagent-driven-development`,
+  whose implement subagents are sub-sessions;
+- the `ironmem` collab arm's worker turns fan out to `/ultrareview-local` +
+  `/pr-review-toolkit` review subagents and implement subagents.
+
+Codex's side was always complete (its rollout is process-wide, attributed
+separately per §12 2026-06-17), so this is a Claude-only correction.
+
+**Accounting rule (canonical).** From the stream-json transcript:
+1. Each line is one JSON event. A malformed line, an empty transcript, or a
+   transcript with no terminal `result` event is a **loud error** (never a silent
+   zero-usage row).
+2. `type=="assistant"` events contribute `message.usage` keyed by `message.id`.
+   Dedup is **last-write-wins per id** (a streamed/repeated id is counted once at
+   its final usage). Each subagent assistant message has its own id, so its tokens
+   enter the sum here.
+3. The Claude-side `usage` is the field-wise sum over all distinct ids. The
+   terminal `result` event's OWN top-level `usage` is **NOT** added (it is the
+   parent's roll-up; adding it would double-count the parent).
+4. `result` text (the model's printed output, where collab sentinel lines live)
+   and `is_error` come from the terminal `result` event.
+5. **Undercount exclusion.** A collab worker turn whose transcript is unparseable
+   (the loud-error case of rule 1, reached via the `worker_text_and_usage`
+   fallback) records a fallback ZERO for that turn and is flagged. A run that
+   reaches `CodingComplete` with **any** such flagged turn is **INVALID and
+   excluded** — its Claude `tokens_to_done` is a known undercount, and a completed
+   run is headline-eligible. This is a partial-loss guard: the all-zero guard
+   below cannot see a non-zero total that is missing one turn's tokens.
+
+This is implemented in `benchmarks/abeval/src/stream_usage.rs::parse_stream_json`
+and consumed by both the superpowers single-`claude -p` path
+(`client::LiveExecutor`) and the ironmem collab worker path
+(`collab_live::worker_text_and_usage`); the rule-5 exclusion lives in
+`collab_driver::run_collab_task` alongside the existing zero-Claude / zero-Codex
+INVALID guards. The §11.2 zero-token loud-error guard is unchanged: it now fires
+on a zero *summed* total. Because this can move the §11.3 headline materially, it
+gates any fresh A/B campaign — it must land before tokens-to-done is reported.
