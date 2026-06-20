@@ -57,9 +57,9 @@ tracing.**
    modules** spanned (distinct `crates/*`), and whether a **test surface**
    exists for the area.
 3. Flag structural design-judgment markers: public API / trait / exported
-   contract changes, state-machine changes (e.g. `collab/state_machine`),
-   schema **migrations** (`migrations/`, version bumps), or a **new
-   subsystem / crate**.
+   contract changes, state-machine changes (e.g.
+   `crates/ironmem/src/collab/state_machine`), schema **migrations**
+   (`crates/*/migrations/`, version bumps), or a **new subsystem / crate**.
 
 A prose-only issue (docs, process, a question) may find nothing — that is
 itself a DIRECT signal.
@@ -77,12 +77,18 @@ itself a DIRECT signal.
 ## Step 4 — Decide (first match wins)
 
 Check in this order — DIRECT is cheapest (check first), COLLAB is most
-expensive (must be justified), SUPERPOWERS is the default middle.
+expensive (must be justified), SUPERPOWERS is the default middle. The counts
+below touch at the seams; when they overlap, the deciding factor is **task
+independence, not the number** (one tightly-coupled unit → DIRECT; two or
+more independently shippable tasks → SUPERPOWERS), and COLLAB's
+design-judgment / adversarial-review triggers dominate its crate-count range
+(a purely mechanical 3+-crate rename is SUPERPOWERS, not COLLAB).
 
-1. **DIRECT** — choose when **all** hold: ≤ ~2 files / single module; 1–2
-   tightly-coupled steps; no architectural / contract / migration /
-   new-subsystem decision; well-specified. (Localized bug fix, small helper,
-   doc/config fix, contained refactor, single added test.)
+1. **DIRECT** — choose when **all** hold: ≤ ~2 files / single crate / module;
+   one unit of work (1 task, or 2 steps too coupled to ship apart); no
+   architectural / contract / migration / new-subsystem decision;
+   well-specified. (Localized bug fix, small helper, doc/config fix, contained
+   refactor, single added test.)
 
 2. **COLLAB** — choose when **any** hold: requires real design judgment
    (public API/contract, state-machine, schema migration, new subsystem);
@@ -93,9 +99,10 @@ expensive (must be justified), SUPERPOWERS is the default middle.
    migrations, cross-crate features.)
 
 3. **SUPERPOWERS** — the default middle when neither above fits: 2–6
-   independent tasks; moderate blast radius (1–2 crates); plannable up front;
-   no cross-model design review needed. (A feature within an existing
-   subsystem, a multi-file mechanical change, test-coverage expansion.)
+   independently shippable tasks; moderate blast radius (1–2 crates);
+   plannable up front; no cross-model design review needed. (A feature within
+   an existing subsystem, a multi-file mechanical change, test-coverage
+   expansion.)
 
 When one signal pulls toward COLLAB but the rest sit firmly in SUPERPOWERS,
 name the tension in the rationale rather than silently rounding up.
@@ -121,7 +128,7 @@ Proceed with this path? [y/N]
 ```
 
 Then **wait for the user**. On an explicit yes, invoke the recommended path.
-On anything else, stop without side effects.
+On anything else (including no response), stop without side effects.
 
 ### Codex path mapping
 

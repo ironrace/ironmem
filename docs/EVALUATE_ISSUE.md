@@ -52,7 +52,9 @@ scan reflects the current working tree, not that repo.
 
 Fetch the issue with the GitHub MCP tool when available
 (`mcp__github__issue_read`), otherwise shell out to
-`gh issue view <ref> --json number,title,body,labels,comments`.
+`gh issue view <ref> --json number,title,body,labels,comments`. Codex has no
+GitHub MCP tool, so the Codex mirror uses `gh` directly — keep that host
+difference when editing this step.
 
 Capture: `number`, `title`, `body`, `labels[]`, and the text of any
 `comments`. Labels and comments often carry the strongest routing signal
@@ -73,8 +75,8 @@ Goal: a rough estimate of how much code the issue touches.
    - whether a **test surface** exists for the area
 3. Note structural red flags that point to design judgment:
    - changes to a public API, trait, or exported contract
-   - changes to a state machine (e.g. `collab/state_machine`)
-   - a schema **migration** (`migrations/`, version bumps)
+   - changes to a state machine (e.g. `crates/ironmem/src/collab/state_machine`)
+   - a schema **migration** (`crates/*/migrations/`, version bumps)
    - a **new subsystem / crate**
 
 Keep this to a handful of searches. If the issue is purely prose (docs,
@@ -99,12 +101,20 @@ Evaluate in this order. The order is deliberate: DIRECT is the cheapest, so
 it is checked first; COLLAB is the most expensive, so it must be positively
 justified; SUPERPOWERS is the safe default for everything in between.
 
+The numeric thresholds below are guidance, not bright lines, and they
+intentionally touch at the seams. When counts overlap, the deciding factor
+is **task independence, not the number**: a single unit of tightly-coupled
+work routes DIRECT; two or more *independently shippable* tasks route up to
+SUPERPOWERS. Likewise the COLLAB **design-judgment** and **adversarial-review**
+triggers dominate the crate-count range — a purely mechanical change spanning
+3+ crates (e.g. a rename) is SUPERPOWERS, not COLLAB.
+
 ### 1. DIRECT — `/plan` + TDD
 
 Choose when **all** hold:
 
 - blast radius ≤ ~2 files, single crate / module
-- decomposes to 1 (at most 2 tightly-coupled) steps
+- one unit of work — 1 task, or 2 steps too tightly coupled to ship apart
 - **no** architectural / contract / migration / new-subsystem decision
 - well-specified
 
@@ -126,11 +136,11 @@ Choose when **any** hold:
 Typical issues: protocol or state-machine changes, migrations, cross-crate
 features, anything touching the collab state machine or a public boundary.
 
-### 3. SUPERPOWERS — writing-plans → subagent-driven-development → TDD
+### 3. SUPERPOWERS — writing-plans → subagent-driven-development
 
 The default middle tier. Choose when the issue is neither DIRECT nor COLLAB:
 
-- 2–6 independent tasks
+- 2–6 *independently shippable* tasks
 - moderate blast radius (1–2 crates)
 - well-enough specified to write a plan up front
 - no need for cross-model design review
@@ -174,7 +184,7 @@ The verdict (DIRECT / SUPERPOWERS / COLLAB) is platform-agnostic; the
 
 | Verdict | Claude | Codex |
 |---|---|---|
-| DIRECT | `/plan` to scope, then the `test-driven-development` skill (`/tdd`) | the `test-driven-development` skill directly |
+| DIRECT | `/plan` to scope, then the `test-driven-development` skill | the `test-driven-development` skill directly |
 | SUPERPOWERS | invoke the `writing-plans` skill on the issue spec (flows into `subagent-driven-development`) | invoke the `writing-plans` skill |
 | COLLAB | `/collab start <one-line task summary derived from the issue>` | `/collab` is Claude-driven: recommend the user run `/collab start <task>` in a Claude terminal (Codex joins via the protocol) |
 
