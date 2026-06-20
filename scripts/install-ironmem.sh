@@ -48,11 +48,13 @@ REQUIRED_CLAUDE_AGENTS=(
 # script.
 REQUIRED_CLAUDE_COMMANDS=(
   collab
+  evaluate-issue
 )
 
 REQUIRED_CODEX_PROMPTS=(
   collab
   collab-batch-impl
+  evaluate-issue
 )
 
 SKIP_BUILD=0
