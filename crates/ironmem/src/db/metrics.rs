@@ -135,6 +135,41 @@ pub fn new_token_usage_from_llm(
 }
 
 impl NewTokenUsage {
+    /// Build a `source='transcript'` row from a parsed transcript row plus the
+    /// resolved attribution context. Centralizes the ~12 invariant columns
+    /// (`source="transcript"`, `estimated=false`, `cost_usd=None`, `chars=0`,
+    /// `map_status=None`, `area=None`) that the Claude and Codex hook branches
+    /// would otherwise duplicate field-for-field. `harness` is the normalized
+    /// `"claude"`/`"codex"`; `turn_id` carries the parser's idempotency key.
+    pub(crate) fn from_transcript(
+        row: crate::metrics::transcript::TranscriptRow,
+        harness: &str,
+        ts: String,
+        session_id: Option<&str>,
+        ctx: &crate::metrics::MetricsContext,
+    ) -> NewTokenUsage {
+        NewTokenUsage {
+            ts,
+            source: "transcript".to_string(),
+            harness: harness.to_string(),
+            model: row.model,
+            session_id: session_id.map(|s| s.to_string()),
+            collab_session_id: ctx.collab_session_id.clone(),
+            collab_phase: ctx.collab_phase.clone(),
+            task_tag: ctx.task_tag.clone(),
+            input_tokens: row.usage.input_tokens,
+            output_tokens: row.usage.output_tokens,
+            cache_creation_input_tokens: row.usage.cache_creation_input_tokens,
+            cache_read_input_tokens: row.usage.cache_read_input_tokens,
+            estimated: false,
+            chars: 0,
+            cost_usd: None,
+            map_status: None,
+            turn_id: Some(row.turn_id),
+            area: None,
+        }
+    }
+
     /// Return a copy stamped with the resolved attribution context
     /// (METRICS_SPEC §2.3/§3). Consuming builder: callers chain it after
     /// construction; the resolved context replaces all three attribution
@@ -2561,5 +2596,55 @@ mod tests {
         );
         assert_eq!(codex_rows[0].input_tokens, 900);
         assert_eq!(codex_rows[0].cache_read_input_tokens, 600);
+    }
+
+    // ── M3: BEGIN IMMEDIATE serializes overlapping cross-connection writers ───
+
+    #[test]
+    fn upsert_transcript_is_serialized_across_concurrent_connections() {
+        // The `stop` and `precompact` hooks run in SEPARATE processes, so the
+        // SELECT/INSERT dedup window must serialize across connections — that is
+        // the reason `upsert_transcript_token_usage_many` uses `BEGIN IMMEDIATE`
+        // rather than the crate's DEFERRED `with_transaction`. The in-memory
+        // `db()` helper gives each handle its OWN database, so it cannot exercise
+        // this; use a single file-backed DB opened from two threads.
+        use std::sync::{Arc, Barrier};
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("concurrent.sqlite3");
+        // First open creates the file and runs migrations.
+        Database::open(&path).unwrap().migrate().unwrap();
+
+        let row = transcript_row("transcript:race:msg-1", 100, 20, 0, 0);
+        // Barrier maximizes the overlap: both threads reach the upsert together,
+        // so without IMMEDIATE both could SELECT "no row" before either inserts.
+        let barrier = Arc::new(Barrier::new(2));
+        let handles: Vec<_> = (0..2)
+            .map(|_| {
+                let path = path.clone();
+                let barrier = Arc::clone(&barrier);
+                let row = row.clone();
+                std::thread::spawn(move || {
+                    let db = Database::open(&path).unwrap();
+                    barrier.wait();
+                    db.upsert_transcript_token_usage(&row)
+                })
+            })
+            .collect();
+        for h in handles {
+            // Both writers must succeed (the loser blocks on busy_timeout, then
+            // observes the committed row and UPDATEs it) — neither errors.
+            h.join().unwrap().unwrap();
+        }
+
+        let db = Database::open(&path).unwrap();
+        let rows = db.query_token_usage(&TokenUsageQuery::default()).unwrap();
+        let tx_rows: Vec<_> = rows.iter().filter(|r| r.source == "transcript").collect();
+        assert_eq!(
+            tx_rows.len(),
+            1,
+            "BEGIN IMMEDIATE must serialize concurrent upserts of one turn_id to a single row"
+        );
+        assert_eq!(tx_rows[0].input_tokens, 100);
     }
 }

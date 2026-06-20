@@ -356,26 +356,13 @@ fn persist_transcript_tokens(
     if harness_norm == "codex" {
         match crate::metrics::transcript::parse_codex_rollout(&raw, transcript_session_id) {
             Ok(Some(trow)) => {
-                let row = crate::db::metrics::NewTokenUsage {
-                    ts: now,
-                    source: "transcript".to_string(),
-                    harness: "codex".to_string(),
-                    model: trow.model,
-                    session_id: transcript_session_id.map(|s| s.to_string()),
-                    collab_session_id: ctx.collab_session_id.clone(),
-                    collab_phase: ctx.collab_phase.clone(),
-                    task_tag: ctx.task_tag.clone(),
-                    input_tokens: trow.usage.input_tokens,
-                    output_tokens: trow.usage.output_tokens,
-                    cache_creation_input_tokens: trow.usage.cache_creation_input_tokens,
-                    cache_read_input_tokens: trow.usage.cache_read_input_tokens,
-                    estimated: false,
-                    chars: 0,
-                    cost_usd: None,
-                    map_status: None,
-                    turn_id: Some(trow.turn_id),
-                    area: None,
-                };
+                let row = crate::db::metrics::NewTokenUsage::from_transcript(
+                    trow,
+                    harness_norm,
+                    now,
+                    transcript_session_id,
+                    &ctx,
+                );
                 if let Err(e) = app.db.upsert_transcript_token_usage(&row) {
                     tracing::warn!("transcript metrics: codex upsert failed: {e}");
                 }
@@ -388,25 +375,14 @@ fn persist_transcript_tokens(
             Ok(rows) => {
                 let db_rows: Vec<_> = rows
                     .into_iter()
-                    .map(|trow| crate::db::metrics::NewTokenUsage {
-                        ts: now.clone(),
-                        source: "transcript".to_string(),
-                        harness: "claude".to_string(),
-                        model: trow.model,
-                        session_id: transcript_session_id.map(|s| s.to_string()),
-                        collab_session_id: ctx.collab_session_id.clone(),
-                        collab_phase: ctx.collab_phase.clone(),
-                        task_tag: ctx.task_tag.clone(),
-                        input_tokens: trow.usage.input_tokens,
-                        output_tokens: trow.usage.output_tokens,
-                        cache_creation_input_tokens: trow.usage.cache_creation_input_tokens,
-                        cache_read_input_tokens: trow.usage.cache_read_input_tokens,
-                        estimated: false,
-                        chars: 0,
-                        cost_usd: None,
-                        map_status: None,
-                        turn_id: Some(trow.turn_id),
-                        area: None,
+                    .map(|trow| {
+                        crate::db::metrics::NewTokenUsage::from_transcript(
+                            trow,
+                            harness_norm,
+                            now.clone(),
+                            transcript_session_id,
+                            &ctx,
+                        )
                     })
                     .collect();
                 if let Err(e) = app.db.upsert_transcript_token_usage_many(&db_rows) {
