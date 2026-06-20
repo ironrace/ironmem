@@ -51,6 +51,16 @@ pub fn claude_worker_argv(mcp_config: &str) -> (String, Vec<String>) {
     )
 }
 
+/// Outcome of extracting a worker turn's printed text + usage from its raw
+/// transcript. `usage_unparseable` records that `usage` is a fallback ZERO rather
+/// than a measured value — the driver propagates it so a completed run with any
+/// unparseable turn is excluded (its Claude `tokens_to_done` is undercounted).
+pub struct WorkerText {
+    pub text: String,
+    pub usage: Usage,
+    pub usage_unparseable: bool,
+}
+
 /// Extract the worker's *printed text* and token usage from a raw `claude -p
 /// --output-format stream-json --verbose` transcript. The model's actual output
 /// (where sentinel lines like `ABEVAL_SESSION_ID=` / `ref:` live) is the terminal
@@ -58,24 +68,27 @@ pub fn claude_worker_argv(mcp_config: &str) -> (String, Vec<String>) {
 /// parsers must see that text, not the event wrappers. The returned usage is
 /// summed across every assistant message (parent + subagents), so subagent tokens
 /// are counted. On an unparseable transcript (schema drift / no `result` event)
-/// fall back to the raw bytes + default usage: a 0-exit worker then contributes
-/// zero tokens for the turn (the rare tolerance the run-level zero-token guards
-/// still catch in aggregate).
-pub fn worker_text_and_usage(raw: &str) -> (String, Usage) {
+/// fall back to the raw bytes + default usage AND set `usage_unparseable`: the
+/// sentinel-text path still gets the raw bytes, but the zero usage is flagged
+/// loud (here) and surfaced to the run-level guard (a single drifted turn would
+/// otherwise undercount silently — the all-zero guard can't see a partial loss).
+pub fn worker_text_and_usage(raw: &str) -> WorkerText {
     match parse_stream_json(raw) {
-        Ok(r) => (r.result, r.usage),
-        // `parse_stream_json` fails loud on malformed/empty/result-less output;
-        // this call site must KEEP a tolerant fallback (the sentinel-text path
-        // still wants the raw bytes), but it must NOT defeat that signal silently
-        // — a 0-token turn here undercounts the ironmem arm's Claude `tokens_to_done`
-        // and the run-level zero guard only catches an all-zero CodingComplete run,
-        // not a single drifted turn. So log loud, then fall back.
+        Ok(r) => WorkerText {
+            text: r.result,
+            usage: r.usage,
+            usage_unparseable: false,
+        },
         Err(e) => {
             eprintln!(
                 "abeval: claude worker transcript was unparseable, recording ZERO \
                  tokens for this turn (undercount risk): {e}"
             );
-            (raw.to_string(), Usage::default())
+            WorkerText {
+                text: raw.to_string(),
+                usage: Usage::default(),
+                usage_unparseable: true,
+            }
         }
     }
 }
@@ -175,8 +188,12 @@ impl WorkerSpawner for ProcessWorkerSpawner {
             ));
         }
         let raw = String::from_utf8_lossy(&out.stdout).into_owned();
-        let (stdout, usage) = worker_text_and_usage(&raw);
-        Ok(WorkerResult { usage, stdout })
+        let parsed = worker_text_and_usage(&raw);
+        Ok(WorkerResult {
+            usage: parsed.usage,
+            stdout: parsed.text,
+            usage_unparseable: parsed.usage_unparseable,
+        })
     }
 
     fn spawn_codex(&self, session_id: &str, worktree: &Path) -> Result<CodexResult> {

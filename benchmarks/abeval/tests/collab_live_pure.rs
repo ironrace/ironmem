@@ -61,18 +61,22 @@ fn worker_text_extracts_result_and_sums_usage_from_stream_json() {
 
     // Extracted text: sentinel parses; usage is the PARENT + SUBAGENT sum, not the
     // terminal envelope's parent-only top-level usage.
-    let (text, usage) = worker_text_and_usage(transcript);
+    let wt = worker_text_and_usage(transcript);
+    assert!(
+        !wt.usage_unparseable,
+        "a parseable transcript is not flagged"
+    );
     assert_eq!(
-        parse_session_id(&text).unwrap(),
+        parse_session_id(&wt.text).unwrap(),
         "d234877e-f538-4925-a66b-75c1a2380c74"
     );
     assert_eq!(
-        usage.input_tokens,
+        wt.usage.input_tokens,
         12 + 100,
         "subagent input tokens summed in"
     );
     assert_eq!(
-        usage.output_tokens,
+        wt.usage.output_tokens,
         3 + 40,
         "subagent output tokens summed in"
     );
@@ -80,10 +84,16 @@ fn worker_text_extracts_result_and_sums_usage_from_stream_json() {
 
 #[test]
 fn worker_text_falls_back_to_raw_on_unparseable_envelope() {
-    let (text, usage) = worker_text_and_usage("not json at all");
-    assert_eq!(text, "not json at all");
-    assert_eq!(usage.input_tokens, 0);
-    assert_eq!(usage.output_tokens, 0);
+    let wt = worker_text_and_usage("not json at all");
+    assert_eq!(wt.text, "not json at all");
+    assert_eq!(wt.usage.input_tokens, 0);
+    assert_eq!(wt.usage.output_tokens, 0);
+    // The zero usage here is a FALLBACK, not a measurement — must be flagged so the
+    // driver can exclude a completed run that hit it.
+    assert!(
+        wt.usage_unparseable,
+        "an unparseable transcript must flag usage_unparseable"
+    );
 }
 
 #[test]

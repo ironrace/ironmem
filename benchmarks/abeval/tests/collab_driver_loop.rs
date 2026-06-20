@@ -64,6 +64,7 @@ impl WorkerSpawner for FakeSpawner {
                 ..Default::default()
             },
             stdout,
+            usage_unparseable: false,
         })
     }
     fn spawn_codex(&self, _session_id: &str, _wt: &Path) -> anyhow::Result<CodexResult> {
@@ -291,6 +292,7 @@ impl WorkerSpawner for ZeroUsageSpawner {
         Ok(WorkerResult {
             usage: Usage::default(), // zero every turn
             stdout,
+            usage_unparseable: false,
         })
     }
     fn spawn_codex(&self, _session_id: &str, _wt: &std::path::Path) -> anyhow::Result<CodexResult> {
@@ -344,6 +346,7 @@ impl WorkerSpawner for NoRefSpawner {
                 ..Default::default()
             },
             stdout,
+            usage_unparseable: false,
         })
     }
     fn spawn_codex(&self, _session_id: &str, _wt: &std::path::Path) -> anyhow::Result<CodexResult> {
@@ -450,6 +453,7 @@ impl WorkerSpawner for TaskListBlockerSpawner {
                 ..Default::default()
             },
             stdout,
+            usage_unparseable: false,
         })
     }
     fn spawn_codex(&self, _session_id: &str, _wt: &std::path::Path) -> anyhow::Result<CodexResult> {

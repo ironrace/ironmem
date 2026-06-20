@@ -225,6 +225,11 @@ pub struct WorkerResult {
     /// wrappers. Sentinel lines parsed by [`parse_session_id`]/[`parse_ref_line`]
     /// live here. See `collab_live::worker_text_and_usage`.
     pub stdout: String,
+    /// True iff this turn's transcript was unparseable and `usage` is a fallback
+    /// ZERO (the turn's real Claude tokens are unknown). The driver excludes a
+    /// completed run with any such turn — see [`accumulate_claude`] and the
+    /// undercount guard in [`run_collab_task`].
+    pub usage_unparseable: bool,
 }
 
 /// Result of one spawned Codex turn. `commits_added` is the count of commits the
@@ -265,6 +270,15 @@ pub struct CollabRunResult {
     pub pr_url_synthetic: String,
 }
 
+/// Fold one Claude worker turn into the run totals: accumulate its usage AND
+/// carry forward whether its usage was unparseable. Centralized so every spawn
+/// site keeps the undercount flag in lockstep with the token sum (a site that
+/// only `add_assign`ed the usage would silently drop a drifted turn's flag).
+fn accumulate_claude(claude_usage: &mut Usage, any_unparseable: &mut bool, r: &WorkerResult) {
+    claude_usage.add_assign(&r.usage);
+    *any_unparseable |= r.usage_unparseable;
+}
+
 /// Run one task through the headless collab dispatcher loop.
 pub fn run_collab_task<R: CollabStateReader, S: WorkerSpawner, A: CodexAttributor>(
     ctx: &CollabTaskCtx,
@@ -281,11 +295,12 @@ pub fn run_collab_task<R: CollabStateReader, S: WorkerSpawner, A: CodexAttributo
     let synthetic_pr = format!("https://abeval.invalid/{}", ctx.task_id);
 
     let mut claude_usage = Usage::default();
+    let mut any_usage_unparseable = false;
     let mut fix_commits: u32 = 0;
 
     // (1) Bootstrap: collab_start + print ABEVAL_SESSION_ID=<id>.
     let boot = spawner.spawn_claude(&ctx.bootstrap_prompt, wt)?;
-    claude_usage.add_assign(&boot.usage);
+    accumulate_claude(&mut claude_usage, &mut any_usage_unparseable, &boot);
     let session_id = parse_session_id(&boot.stdout)?;
 
     // (2) Dispatcher loop.
@@ -344,7 +359,7 @@ pub fn run_collab_task<R: CollabStateReader, S: WorkerSpawner, A: CodexAttributo
                     ],
                 )?;
                 let r = spawner.spawn_claude(&prompt, wt)?;
-                claude_usage.add_assign(&r.usage);
+                accumulate_claude(&mut claude_usage, &mut any_usage_unparseable, &r);
             }
             WorkerAction::ClaudeCompose { template, topic } => {
                 let compose = render_worker_prompt(
@@ -364,7 +379,7 @@ pub fn run_collab_task<R: CollabStateReader, S: WorkerSpawner, A: CodexAttributo
                     .map(|(_, rowid)| rowid)
                     .unwrap_or(i64::MIN);
                 let cr = spawner.spawn_claude(&compose, wt)?;
-                claude_usage.add_assign(&cr.usage);
+                accumulate_claude(&mut claude_usage, &mut any_usage_unparseable, &cr);
                 let artifact_ref = resolve_compose_ref(reader, &cr.stdout, before_rowid, topic)?;
                 let submit = render_worker_prompt(
                     &ctx.prompts_dir,
@@ -378,7 +393,7 @@ pub fn run_collab_task<R: CollabStateReader, S: WorkerSpawner, A: CodexAttributo
                     ],
                 )?;
                 let sr = spawner.spawn_claude(&submit, wt)?;
-                claude_usage.add_assign(&sr.usage);
+                accumulate_claude(&mut claude_usage, &mut any_usage_unparseable, &sr);
             }
             WorkerAction::TaskListBridge => {
                 let prompt = render_worker_prompt(
@@ -387,7 +402,7 @@ pub fn run_collab_task<R: CollabStateReader, S: WorkerSpawner, A: CodexAttributo
                     &[("$SESSION_ID", &session_id), ("$BRANCH", &ctx.branch)],
                 )?;
                 let r = spawner.spawn_claude(&prompt, wt)?;
-                claude_usage.add_assign(&r.usage);
+                accumulate_claude(&mut claude_usage, &mut any_usage_unparseable, &r);
                 if let Some(blocker) = parse_blocker_line(&r.stdout) {
                     return Err(anyhow!(
                         "task_list bridge for task {} returned blocker: {} — INVALID run",
@@ -413,12 +428,12 @@ pub fn run_collab_task<R: CollabStateReader, S: WorkerSpawner, A: CodexAttributo
                     ],
                 )?;
                 let cr = spawner.spawn_claude(&compose, wt)?;
-                claude_usage.add_assign(&cr.usage);
+                accumulate_claude(&mut claude_usage, &mut any_usage_unparseable, &cr);
                 let submit = SYNTHETIC_FINAL_SUBMIT
                     .replace("$SESSION_ID", &session_id)
                     .replace("$PR_URL", &synthetic_pr);
                 let sr = spawner.spawn_claude(&submit, wt)?;
-                claude_usage.add_assign(&sr.usage);
+                accumulate_claude(&mut claude_usage, &mut any_usage_unparseable, &sr);
             }
         }
     }
@@ -453,6 +468,18 @@ pub fn run_collab_task<R: CollabStateReader, S: WorkerSpawner, A: CodexAttributo
         return Err(anyhow!(
             "collab run for task {} reached CodingComplete but accumulated ZERO Claude \
              tokens across all turns — INVALID run (workers emitted no usage); excluded",
+            ctx.task_id
+        ));
+    }
+    // Partial-undercount guard: even with a non-zero total, a single worker turn
+    // whose transcript was unparseable means `claude_usage` is missing that turn's
+    // real tokens. A completed run is headline-eligible, so a known undercount must
+    // exclude it — the all-zero guard above cannot see a partial loss.
+    if reached_phase == PHASE_CODING_COMPLETE && any_usage_unparseable {
+        return Err(anyhow!(
+            "collab run for task {} reached CodingComplete but ≥1 Claude worker turn had \
+             an unparseable usage transcript — Claude tokens are undercounted; INVALID \
+             run (excluded)",
             ctx.task_id
         ));
     }
@@ -532,6 +559,7 @@ mod tests {
             Ok(WorkerResult {
                 usage: Usage::default(),
                 stdout: "ABEVAL_SESSION_ID=s-stuck\n".to_string(),
+                usage_unparseable: false,
             })
         }
         fn spawn_codex(&self, _session_id: &str, _worktree: &Path) -> Result<CodexResult> {
@@ -590,6 +618,28 @@ mod tests {
                     ..Usage::default()
                 },
                 stdout: "ABEVAL_SESSION_ID=s-seq\n".to_string(),
+                usage_unparseable: false,
+            })
+        }
+        fn spawn_codex(&self, _session_id: &str, _worktree: &Path) -> Result<CodexResult> {
+            Ok(CodexResult { commits_added: 0 })
+        }
+    }
+
+    /// Spawner that reaches `CodingComplete` with NON-ZERO usage but flags every
+    /// turn's usage as unparseable — the partial-undercount case (`total > 0`, yet
+    /// the turn's real Claude tokens are unknown). Exercises the undercount guard
+    /// past the all-zero guard.
+    struct UnparseableUsageSpawner;
+    impl WorkerSpawner for UnparseableUsageSpawner {
+        fn spawn_claude(&self, _prompt: &str, _worktree: &Path) -> Result<WorkerResult> {
+            Ok(WorkerResult {
+                usage: Usage {
+                    output_tokens: 10,
+                    ..Usage::default()
+                },
+                stdout: "ABEVAL_SESSION_ID=s-bad\n".to_string(),
+                usage_unparseable: true,
             })
         }
         fn spawn_codex(&self, _session_id: &str, _worktree: &Path) -> Result<CodexResult> {
@@ -633,6 +683,38 @@ mod tests {
         let res = run_collab_task(&ctx, &reader, &UsageSpawner, &NonZeroAttributor)
             .expect("key advance must reset the stall counter, not bail");
         assert_eq!(res.reached_phase, PHASE_CODING_COMPLETE);
+    }
+
+    #[test]
+    fn completed_run_with_unparseable_worker_usage_is_invalid() {
+        // Same completing trajectory as above, but the (bootstrap) Claude turn
+        // reports usage_unparseable=true with NON-ZERO usage. The run reaches
+        // CodingComplete and clears the zero-Claude and zero-Codex guards, yet must
+        // still be INVALID because its Claude total is a known undercount — the
+        // partial-loss case the all-zero guard cannot see.
+        let a = pinned_state("CodeReviewFixGlobalPending", "codex");
+        let mut b = pinned_state("CodeReviewFixGlobalPending", "codex");
+        b.global_review_round = 1;
+        let terminal = pinned_state(PHASE_CODING_COMPLETE, "claude");
+        let reader = SequenceReader {
+            states: vec![a.clone(), a, b, terminal],
+            idx: std::cell::Cell::new(0),
+        };
+        let ctx = CollabTaskCtx {
+            task_id: "abeval-undercount".into(),
+            worktree: PathBuf::from("/tmp/nonexistent-wt"),
+            branch: "abeval/undercount".into(),
+            prompts_dir: PathBuf::from("/tmp/nonexistent-prompts"),
+            bootstrap_prompt: "boot".into(),
+        };
+        let err = run_collab_task(&ctx, &reader, &UnparseableUsageSpawner, &NonZeroAttributor)
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("INVALID"), "must mark INVALID: {msg}");
+        assert!(
+            msg.contains("undercount"),
+            "must name the undercount cause: {msg}"
+        );
     }
 
     #[test]
