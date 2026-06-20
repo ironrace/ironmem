@@ -89,6 +89,12 @@ Severity labels:
 
 If there are no findings, state that clearly and list remaining risk or unrun checks.
 
+When the caller is a wrapper that will apply fixes after this review (for
+example IronRace Collab's `review_fix_global` turn), keep this skill
+read-only but make each finding independently actionable: include the
+minimal affected file/scope and a fix direction precise enough for a
+separate fix subagent to own that one cluster.
+
 ## Review Boundaries
 
 - Do not include style nits unless they hide a bug or maintenance hazard.

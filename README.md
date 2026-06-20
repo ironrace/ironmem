@@ -87,9 +87,10 @@ Prebuilt macOS (arm64) and Linux (x86_64) binaries, with SHA-256 checksums, are 
 - `test-driven-development`
 
 Codex also receives the `pr-review-toolkit` skill used by the `/collab`
-`review_fix_global` turn before Claude runs `/ultrareview-local`.
+`review_fix_global` turn before Codex fans confirmed fixes out to
+subagents and Claude runs `/ultrareview-local`.
 
-Existing identical skills are skipped. Existing divergent skills are left in place unless you pass `--force-skills`; use `--skip-skills` when you only want to replace the binary.
+Existing identical skills are skipped. Existing bundled skills, agents, commands, and prompts that differ are updated to the packaged copies; use `--skip-skills` when you only want to replace the binary or preserve local copies.
 For Claude Code, the installer also installs the `code-reviewer` agent used by the vendored review flow.
 
 ## CLI

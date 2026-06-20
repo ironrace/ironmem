@@ -32,3 +32,6 @@ ironmem write-rules --target CLAUDE.md
 - `test-driven-development`
 
 It also installs the `code-reviewer` agent into `$CLAUDE_HOME/agents`.
+
+Existing bundled copies are updated on install; pass `--skip-skills` to leave
+local skills, prompts, commands, and agents untouched.
