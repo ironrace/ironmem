@@ -72,8 +72,9 @@ Options:
                    and prompt dependencies.
   --skip-wiring    Do not register the ironmem MCP server in Claude/Codex
                    config or warn about missing /ultrareview-local.
-  --force-skills   Replace existing skill/agent/command/prompt files with
-                   bundled copies.
+  --force-skills   Compatibility flag. Bundled skill/agent/command/prompt
+                   files are updated by default; use --skip-skills to leave
+                   existing copies untouched.
   --force-wiring   Replace an existing 'ironmem' MCP entry in
                    ~/.claude.json or ~/.codex/config.toml with the bundled one
                    (use only when the config has drifted from a fresh install).
@@ -177,15 +178,9 @@ install_skill_set() {
       continue
     fi
 
-    if [[ "$FORCE_SKILLS" -eq 1 ]]; then
-      rm -rf "$target"
-      cp -R "$source" "$target"
-      echo "    replaced $skill"
-      continue
-    fi
-
-    echo "    WARN: $skill already exists and differs from bundled copy; leaving it unchanged" >&2
-    echo "          Re-run with --force-skills to replace it." >&2
+    rm -rf "$target"
+    cp -R "$source" "$target"
+    echo "    updated $skill"
   done
 }
 
@@ -214,14 +209,8 @@ install_agent_set() {
       continue
     fi
 
-    if [[ "$FORCE_SKILLS" -eq 1 ]]; then
-      cp "$source" "$target"
-      echo "    replaced $agent"
-      continue
-    fi
-
-    echo "    WARN: $agent already exists and differs from bundled copy; leaving it unchanged" >&2
-    echo "          Re-run with --force-skills to replace it." >&2
+    cp "$source" "$target"
+    echo "    updated $agent"
   done
 }
 
@@ -264,14 +253,8 @@ install_md_set() {
       continue
     fi
 
-    if [[ "$FORCE_SKILLS" -eq 1 ]]; then
-      cp "$source" "$target"
-      echo "    replaced $name"
-      continue
-    fi
-
-    echo "    WARN: $name already exists and differs from bundled copy; leaving it unchanged" >&2
-    echo "          Re-run with --force-skills to replace it." >&2
+    cp "$source" "$target"
+    echo "    updated $name"
   done
 }
 
@@ -305,6 +288,10 @@ CODEX_HOME="${CODEX_HOME:-$HOME/.codex}"
 CLAUDE_HOME="${CLAUDE_HOME:-$HOME/.claude}"
 
 if [[ "$SKIP_SKILLS" -eq 0 ]]; then
+  if [[ "$FORCE_SKILLS" -eq 1 ]]; then
+    echo "==> --force-skills is no longer required; bundled files update by default"
+  fi
+
   CODEX_SKILLS_DIR="${CODEX_SKILLS_DIR:-$CODEX_HOME/skills}"
   CLAUDE_SKILLS_DIR="${CLAUDE_SKILLS_DIR:-$CLAUDE_HOME/skills}"
   CLAUDE_AGENTS_DIR="${CLAUDE_AGENTS_DIR:-$CLAUDE_HOME/agents}"

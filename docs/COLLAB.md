@@ -12,10 +12,11 @@ MCP server.
   markdown, then the
   session's `implementer` runs per-task subagents via
   `subagent-driven-development` and signals completion with
-  `implementation_done`) → global 3-phase linear flow (Codex review+fix →
-  Claude local audit → Claude final with PR URL) → `CodingComplete` /
-  `CodingFailed`. Per-task implementation is single-agent on the selected
-  implementer's side; Codex always owns the first branch-scope review pass.
+  `implementation_done`) → global 3-phase linear flow (Codex review plus
+  parallel fix fan-out → Claude local audit plus parallel fix fan-out →
+  Claude final with PR URL) → `CodingComplete` / `CodingFailed`. Per-task
+  implementation is single-agent on the selected implementer's side; Codex
+  always owns the first branch-scope review pass.
 
 This document covers:
 
@@ -220,8 +221,9 @@ by the implementer after each task boundary. After `implementation_done`,
 the phase advances to `CodeReviewFixGlobalPending` with **Codex** as
 owner regardless of who implemented — Codex runs `/pr-review-toolkit:review-pr`
 on the raw post-implementation diff first (no Claude pre-clean) and
-applies any confirmed fixes directly. Claude's `/ultrareview-local` then
-audits Codex's commits at `CodeReviewLocalPending`.
+uses parallel fix subagents for confirmed, partitionable findings. Claude's
+`/ultrareview-local` then audits Codex's commits at `CodeReviewLocalPending`
+and uses the same fix fan-out model for confirmed audit findings.
 
 | Phase | Owner | Event | Next |
 |---|---|---|---|
@@ -295,13 +297,15 @@ the collab `final_review` turn, not to the subagent skill.
 
 After `implementation_done`, the session enters a 3-turn linear review at
 branch scope. Codex runs `/pr-review-toolkit:review-pr` on the raw
-post-implementation diff first; Claude then audits Codex's commits via
-`/ultrareview-local`; Claude opens the PR on the final turn.
+post-implementation diff first, then fans confirmed findings out to
+parallel fix subagents where they can be safely partitioned; Claude then
+audits Codex's commits via `/ultrareview-local` and fans confirmed audit
+findings out the same way; Claude opens the PR on the final turn.
 
 | Phase | Owner | Event | Next |
 |---|---|---|---|
-| `CodeReviewFixGlobalPending` | `codex` | `CodeReviewFixGlobal{head_sha}` — Codex ran `/pr-review-toolkit:review-pr` on the full diff AS-IS (no Claude pre-clean) and (if needed) pushed fixes directly | `CodeReviewLocalPending` |
-| `CodeReviewLocalPending` | `claude` | `ReviewLocal{head_sha}` — Claude ran `/ultrareview-local` as an audit of Codex's commits + code-quality issues both agents missed; pushed any fixes | `CodeReviewFinalPending` |
+| `CodeReviewFixGlobalPending` | `codex` | `CodeReviewFixGlobal{head_sha}` — Codex ran `/pr-review-toolkit:review-pr` on the full diff AS-IS (no Claude pre-clean), partitioned confirmed findings, used parallel fix subagents where safe, merged/cherry-picked the fixes, then pushed | `CodeReviewLocalPending` |
+| `CodeReviewLocalPending` | `claude` | `ReviewLocal{head_sha}` — Claude ran `/ultrareview-local` as an audit of Codex's commits + code-quality issues both agents missed, partitioned confirmed findings, used parallel fix subagents where safe, merged/cherry-picked the fixes, then pushed | `CodeReviewFinalPending` |
 | `CodeReviewFinalPending` | `claude` | `FinalReview{head_sha, pr_url}` — Claude opens the PR and sends the URL in the same event | `CodingComplete` (terminal) |
 
 ### Shortcut: post-subagent coding review
@@ -320,9 +324,10 @@ branch diff plus nearby Superpowers plan docs in the repo.
 
 The no-op handshake turn is collapsed: `head_sha` is supplied at session
 creation time. From there, the surviving flow follows the new ordering:
-Codex `review_fix_global` (`/pr-review-toolkit:review-pr` plus confirmed
-fixes on the raw diff) → Claude `review_local` (audit Codex's commits)
-→ Claude `final_review` (PR creation).
+Codex `review_fix_global` (`/pr-review-toolkit:review-pr` plus parallel
+fix fan-out for confirmed findings on the raw diff) → Claude `review_local`
+(audit Codex's commits plus parallel fix fan-out) → Claude `final_review`
+(PR creation).
 
 | Phase | Owner | Event | Next |
 |---|---|---|---|
@@ -791,8 +796,8 @@ orchestrator from steering the reviewer's conclusion.
 |---|---|---|---|
 | `task_list` | `claude` | `{"plan_hash","base_sha","head_sha","plan_file_path"?,"execution_mode"?,"tasks":[{"id","title","timebox_minutes","acceptance":[...]}]}` | `plan_hash` must equal `final_plan_hash`; `tasks` must be non-empty and strictly ordered by `id`; each task requires `timebox_minutes <= 20` and ≥1 `acceptance` entry. Optional `plan_file_path` (repo-relative; no leading `/`; no `..` segments) points at the approved Superpowers task markdown driving subagent execution. Optional `execution_mode` — see below. |
 | `implementation_done` | `claude` or `codex` (per session `implementer`) | `{"head_sha"}` | In `CodeImplementPending` only. Fired once after the subagent batch completes and gates pass. Carries only `head_sha` — no prose, no subagent notes. |
-| `review_fix_global` | `codex` | `{"head_sha"}` | In `CodeReviewFixGlobalPending` only. Codex ran `/pr-review-toolkit:review-pr` on the raw post-implementation diff (no Claude pre-clean) and has pushed any branch-level fixes. |
-| `review_local` | `claude` | `{"head_sha"}` | In `CodeReviewLocalPending` only. Claude ran `/ultrareview-local` as an audit of Codex's `review_fix_global` commits + caught code-quality issues both agents missed; has pushed any fixes. |
+| `review_fix_global` | `codex` | `{"head_sha"}` | In `CodeReviewFixGlobalPending` only. Codex ran `/pr-review-toolkit:review-pr` on the raw post-implementation diff (no Claude pre-clean), used parallel fix subagents for confirmed partitionable findings, merged/cherry-picked the resulting fixes, and pushed the branch-level fix commit(s). |
+| `review_local` | `claude` | `{"head_sha"}` | In `CodeReviewLocalPending` only. Claude ran `/ultrareview-local` as an audit of Codex's `review_fix_global` commits + caught code-quality issues both agents missed, used parallel fix subagents for confirmed partitionable findings, merged/cherry-picked the resulting fixes, and pushed. |
 | `final_review` | `claude` | `{"head_sha","pr_url"}` | In `CodeReviewFinalPending` only. Claude has opened the PR; the event carries the URL and advances directly to `CodingComplete`. `pr_url` must start with `https://` and be ≤2048 chars. |
 | `failure_report` | either | `{"coding_failure":"<reason>"}` | Valid in any coding-active phase. |
 
@@ -846,8 +851,8 @@ exactly one event variant — there is no phase overloading.
 | `PlanClaudeFinalizePending` | `final` | v1 — Claude finalizes |
 | `PlanLocked` | `task_list` | v1 → v3 hand-off |
 | `CodeImplementPending` | `implementation_done`, `failure_report` | v3 — single implementer turn after subagent batch |
-| `CodeReviewFixGlobalPending` | `review_fix_global`, `failure_report` | v3 — Codex runs `/pr-review-toolkit:review-pr` on the raw post-implementation diff (first review pass) |
-| `CodeReviewLocalPending` | `review_local`, `failure_report` | v3 — Claude audits Codex's commits via `/ultrareview-local` |
+| `CodeReviewFixGlobalPending` | `review_fix_global`, `failure_report` | v3 — Codex runs `/pr-review-toolkit:review-pr` on the raw post-implementation diff, then fans confirmed fixes out to subagents |
+| `CodeReviewLocalPending` | `review_local`, `failure_report` | v3 — Claude audits Codex's commits via `/ultrareview-local`, then fans confirmed fixes out to subagents |
 | `CodeReviewFinalPending` | `final_review`, `failure_report` | v3 — Claude opens PR |
 | `CodingComplete` / `CodingFailed` | *(none — terminal; only `collab_end` accepted)* | |
 
@@ -904,16 +909,31 @@ before each coding-active `collab_send`:
   task markdown when available. The collab `base_sha` and `last_head_sha`
   define the review target; Codex must not let the toolkit silently
   substitute a different base branch. Codex treats the toolkit output as
-  a read-only finding pass, independently verifies findings, then makes
-  direct code edits + commit + push for confirmed branch-level issues.
+  a read-only finding pass, independently verifies findings, then groups
+  confirmed branch-level issues into non-overlapping fix clusters. For
+  multiple independent clusters, Codex creates one temporary worktree per
+  cluster on a unique throwaway branch from the same review head and
+  dispatches fix subagents in parallel; each subagent owns exactly one
+  cluster and returns/commits only that cluster's edits. Codex then merges
+  or cherry-picks those fix commits back onto the collab branch, resolves
+  conflicts, runs the required gates, commits/pushes the integrated result,
+  and sends `review_fix_global`.
+  If findings overlap or touch the same fragile area, Codex fixes that
+  cluster sequentially instead of forcing unsafe parallelism.
   `/ultrareview-local` is NOT used here — it runs later at Claude's
   `review_local` audit step. Codex's judgment is expressed as commits,
   not prose.
 - **Audit tooling** during Claude's `review_local`: `/ultrareview-local`
   (code-reviewer + security-reviewer + architect + doc-reviewer in
   parallel) runs against the post-`review_fix_global` head, auditing
-  Codex's commits + catching code-quality issues both agents missed.
-  Claude fixes any CRITICAL/HIGH/MEDIUM findings in place + commits + pushes.
+  Codex's commits + catching code-quality issues both agents missed. Claude
+  independently verifies the synthesized findings, groups confirmed
+  CRITICAL/HIGH/MEDIUM findings into non-overlapping fix clusters, uses
+  temporary worktrees on unique throwaway branches plus parallel fix
+  subagents for independent clusters, merges or cherry-picks those fix
+  commits back onto the collab branch, resolves conflicts, runs the required
+  gates, commits/pushes the integrated result, and sends `review_local`.
+  Overlapping or risky findings are fixed sequentially by the review worker.
 - **Shortcut ancestry validation** during shortcut-started
   `review_fix_global` and `review_local`: the server shells out narrowly
   to `git merge-base --is-ancestor` to distinguish a true descendant
@@ -1101,8 +1121,8 @@ Phase → action (v3):
 | `PlanLocked` (post-final) | dispatch one mechanical `collab-turn-task-list.md` worker; worker parses the approved final markdown and sends `task_list` | n/a |
 | `CodeImplementPending` (implementer=claude) | dispatch `collab-turn-code-implement.md`; worker searches checkpoints, runs `subagent-driven-development`, gates, checkpoints, and sends `implementation_done{head_sha}` | wait |
 | `CodeImplementPending` (implementer=codex) | dispatch Codex via bg-exec; poll | one-shot bg-exec: search implementation checkpoints, resume/run `subagent-driven-development`, checkpoint every task boundary, emit `implementation_done{head_sha}`, exit |
-| `CodeReviewFixGlobalPending` | dispatch Codex via bg-exec; poll | one-shot bg-exec: run `/pr-review-toolkit:review-pr` on the raw post-implementation diff, fix confirmed branch-level issues in place, send `review_fix_global`, exit |
-| `CodeReviewLocalPending` | dispatch `collab-turn-review-local.md`; worker runs `/ultrareview-local`, fixes CRITICAL/HIGH/MEDIUM in place, and sends `review_local` | wait |
+| `CodeReviewFixGlobalPending` | dispatch Codex via bg-exec; poll | one-shot bg-exec: run `/pr-review-toolkit:review-pr` on the raw post-implementation diff, partition confirmed branch-level issues, fan out independent fix subagents in temporary worktrees on unique throwaway branches, merge/cherry-pick fixes back, send `review_fix_global`, exit |
+| `CodeReviewLocalPending` | dispatch `collab-turn-review-local.md`; worker runs `/ultrareview-local`, partitions confirmed CRITICAL/HIGH/MEDIUM findings, fans out independent fix subagents in temporary worktrees on unique throwaway branches, merges/cherry-picks fixes back, and sends `review_local` | wait |
 | `CodeReviewFinalPending` | dispatch `collab-turn-final-review.md` compose worker, then dispatch `collab-turn-submit.md` **directly** (no gate) to `gh pr create` (ready PR) and send `final_review{pr_url}` | wait |
 | `CodingComplete` / `CodingFailed` | exit loop | n/a |
 
@@ -1445,9 +1465,10 @@ Under the new v3 ordering, `CodeReviewLocalPending` runs after Codex's
 catching code-quality, maintainability, consistency, and local-read
 issues that Codex's pr-review-toolkit-backed branch review may miss.
 `/ultrareview-local` (code-reviewer + security-reviewer +
-architect + doc-reviewer in parallel, synthesized inline) exercises a
-different set of agent prompts and a different synthesis path than
-Codex's review toolkit pass.
+architect + doc-reviewer in parallel, synthesized by the review worker,
+then fixed via isolated fix-subagent fan-out where safe) exercises a
+different set of agent prompts, a different synthesis path, and a
+different fix integration pass than Codex's review toolkit turn.
 
 Removing the `CodeReviewLocalPending` stage from the v3 flow therefore
 requires a written **overlap audit**: a demonstration, against a

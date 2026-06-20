@@ -197,11 +197,11 @@ The shared required set is:
 - `test-driven-development`
 
 Codex also receives `pr-review-toolkit`, which `/collab` uses during the
-`CodeReviewFixGlobalPending` / `review_fix_global` turn before Claude's
-`/ultrareview-local` audit.
+`CodeReviewFixGlobalPending` / `review_fix_global` turn before Codex fans
+confirmed fixes out to subagents and Claude's `/ultrareview-local` audit runs.
 
-Existing identical skills are skipped. Existing divergent skills are left untouched unless the
-installer is run with `--force-skills`; `--skip-skills` skips this step entirely.
+Existing identical skills are skipped. Existing bundled skills, agents, commands, and prompts
+that differ are updated to the packaged copies; `--skip-skills` skips this step entirely.
 For Claude Code, the installer also provisions the `code-reviewer` agent used by the vendored
 `subagent-driven-development` review flow into `$CLAUDE_HOME/agents`.
 

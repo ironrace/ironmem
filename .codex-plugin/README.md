@@ -33,6 +33,9 @@ ironmem write-rules --target AGENTS.md
 - `test-driven-development`
 - `pr-review-toolkit`
 
+Existing bundled copies are updated on install; pass `--skip-skills` to leave
+local skills, prompts, and commands untouched.
+
 ## Notes
 
 - The plugin wrapper builds `ironmem` automatically if the binary does not exist yet.
