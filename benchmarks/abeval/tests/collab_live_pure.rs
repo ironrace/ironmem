@@ -1,8 +1,47 @@
 use abeval::collab_driver::{parse_session_id, ModelTier};
 use abeval::collab_live::{
-    claude_worker_argv, codex_config, codex_exec_argv, worker_text_and_usage,
+    claude_worker_argv, codex_config, codex_exec_argv, format_worker_failure, worker_text_and_usage,
 };
 use std::path::Path;
+
+#[test]
+fn worker_failure_surfaces_stdout_tail_when_stderr_empty() {
+    // For `claude -p` the actionable cause (the result event / synthetic error,
+    // e.g. a session-limit notice) is printed to STDOUT, not stderr. A failure
+    // message built from exit code + stderr alone is useless: it reads
+    // "exited Some(1) — stderr:" with nothing after it. The stdout tail must be
+    // surfaced so the operator (and Gap 2's classifier) can see the real cause.
+    let stdout = "lots of earlier output\nClaude usage limit reached. Resets at 9pm.";
+    let msg = format_worker_failure("claude worker", Some(1), "/tmp/wt", "", stdout);
+    assert!(msg.contains("Some(1)"), "exit code must be present: {msg}");
+    assert!(msg.contains("/tmp/wt"), "location must be present: {msg}");
+    assert!(
+        msg.contains("Claude usage limit reached"),
+        "the stdout tail (the real cause) must be surfaced: {msg}"
+    );
+    assert!(
+        msg.to_lowercase().contains("stdout"),
+        "the tail must be clearly labeled as stdout: {msg}"
+    );
+}
+
+#[test]
+fn worker_failure_bounds_the_stdout_tail() {
+    // A multi-megabyte transcript must not be dumped wholesale into the error —
+    // only a bounded tail (the end, where the terminal result/error lives) is
+    // included, and the head is dropped.
+    let head = "HEAD_MARKER_SHOULD_BE_DROPPED";
+    let big = format!("{head}{}TAIL_MARKER", "x".repeat(8192));
+    let msg = format_worker_failure("claude worker", Some(1), "/tmp/wt", "", &big);
+    assert!(
+        msg.contains("TAIL_MARKER"),
+        "the END of stdout (terminal result/error) must be kept: {msg}"
+    );
+    assert!(
+        !msg.contains(head),
+        "the head of an oversized transcript must be dropped, not dumped: {msg}"
+    );
+}
 
 #[test]
 fn codex_exec_argv_is_no_shell_and_isolated() {

@@ -58,6 +58,44 @@ pub fn claude_worker_argv(mcp_config: &str, model: ModelTier) -> (String, Vec<St
     )
 }
 
+/// Max bytes of a worker's stdout tail included in a non-zero-exit error. The
+/// terminal `result`/synthetic-error event (the actionable cause) lives at the
+/// END of the transcript, so we keep the tail and drop the head.
+const WORKER_STDOUT_TAIL_BYTES: usize = 2048;
+
+/// Build the error message for a worker process that exited non-zero. For
+/// `claude -p` the actionable cause (the terminal `result` event / synthetic
+/// error such as a session-limit notice) is printed to STDOUT, not stderr, so a
+/// bounded tail of stdout is surfaced alongside the exit code and stderr. Pure
+/// (no spawn) so the formatting is unit-tested directly.
+pub fn format_worker_failure(
+    label: &str,
+    code: Option<i32>,
+    location: &str,
+    stderr: &str,
+    stdout: &str,
+) -> String {
+    let tail = stdout_tail(stdout.trim(), WORKER_STDOUT_TAIL_BYTES);
+    format!(
+        "{label} exited {code:?} in {location} — stderr: {} — stdout tail: {}",
+        stderr.trim(),
+        tail
+    )
+}
+
+/// Keep at most `max` bytes from the END of `s`, on a UTF-8 char boundary, with
+/// a leading ellipsis when the head was dropped.
+fn stdout_tail(s: &str, max: usize) -> String {
+    if s.len() <= max {
+        return s.to_string();
+    }
+    let mut start = s.len() - max;
+    while start < s.len() && !s.is_char_boundary(start) {
+        start += 1;
+    }
+    format!("…{}", &s[start..])
+}
+
 /// Outcome of extracting a worker turn's printed text + usage from its raw
 /// transcript. `usage_unparseable` records that `usage` is a fallback ZERO rather
 /// than a measured value — the driver propagates it so a completed run with any
@@ -192,12 +230,14 @@ impl WorkerSpawner for ProcessWorkerSpawner {
             .with_context(|| format!("claude worker in {}", worktree.display()))?;
         if !out.status.success() {
             let stderr = String::from_utf8_lossy(&out.stderr);
-            return Err(anyhow!(
-                "claude worker exited {:?} in {} — stderr: {}",
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            return Err(anyhow!(format_worker_failure(
+                "claude worker",
                 out.status.code(),
-                worktree.display(),
-                stderr.trim()
-            ));
+                &worktree.display().to_string(),
+                &stderr,
+                &stdout,
+            )));
         }
         let raw = String::from_utf8_lossy(&out.stdout).into_owned();
         let parsed = worker_text_and_usage(&raw);
@@ -221,12 +261,14 @@ impl WorkerSpawner for ProcessWorkerSpawner {
             .with_context(|| format!("codex exec in {}", worktree.display()))?;
         if !out.status.success() {
             let stderr = String::from_utf8_lossy(&out.stderr);
-            return Err(anyhow!(
-                "codex exec exited {:?} in {} — stderr: {}",
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            return Err(anyhow!(format_worker_failure(
+                "codex exec",
                 out.status.code(),
-                worktree.display(),
-                stderr.trim()
-            ));
+                &worktree.display().to_string(),
+                &stderr,
+                &stdout,
+            )));
         }
         let head_after = git_head(worktree)?;
         let commits_added = count_commits_between(worktree, &head_before, &head_after)?;
