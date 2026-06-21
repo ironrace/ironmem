@@ -5,12 +5,13 @@
 //! §7-derived `cost` figure is labelled distinctly from the stored
 //! `provider`(-reported) figure. Sections, in order: a per-task **Headline**
 //! list, **Non-completions**, a per-task **by-phase** decomposition, the
-//! **Code-map exploration** line, **Baseline gate** line, and an **Unpriced
-//! models** line.
+//! product-facing **Exploration value** summary (issue #145, sample-gated), the
+//! diagnostic **Code-map exploration** line, **Baseline gate** line, and an
+//! **Unpriced models** line.
 
 use std::fmt::Write as _;
 
-use crate::report::{HeadlineRow, Report, TaskReport};
+use crate::report::{HeadlineRow, Report, TaskReport, ValueSummary};
 
 /// Format an optional §7/provider cost: `"$12.34"` or `"n/a"` when `None`
 /// (the row was unpriceable — never rendered as `$0.00`).
@@ -67,6 +68,49 @@ fn render_task_phases(out: &mut String, task: &TaskReport) {
     );
 }
 
+/// Render the product-facing **Exploration value** section (issue #145). On a
+/// thin sample (`!sufficient_data`) it states so and never prints a savings
+/// headline; otherwise it leads with hit rate + the per-hit-turn token-proxy
+/// delta, then any recorded repeated-context indicators.
+fn render_value_summary(out: &mut String, vs: &ValueSummary) {
+    if !vs.sufficient_data {
+        let _ = writeln!(
+            out,
+            "\nExploration value: not enough exploration data yet ({turns}/{min} turns) — collect more before reading savings.",
+            turns = vs.total_turns,
+            min = vs.min_turns,
+        );
+        return;
+    }
+
+    let _ = writeln!(
+        out,
+        "\nExploration value: {hits}/{total} hit turns ({rate:.1}%) · ~{delta:.1} tokens saved per hit turn (proxy)",
+        hits = vs.map_hit_turns,
+        total = vs.total_turns,
+        rate = vs.hit_rate * 100.0,
+        delta = vs.exploration_token_delta,
+    );
+
+    // Repeated-context indicators, only when their underlying rows were recorded.
+    if let Some(mcp) = &vs.mcp_response {
+        let _ = writeln!(
+            out,
+            "  MCP responses: {count} calls · mean {mean:.1} tokens (response-size proxy)",
+            count = mcp.row_count,
+            mean = mcp.mean_output_tokens,
+        );
+    }
+    if let Some(cov) = &vs.transcript_coverage {
+        let _ = writeln!(
+            out,
+            "  Transcript coverage: {turns} turns · {tokens} tokens",
+            turns = cov.turn_count,
+            tokens = cov.total_tokens,
+        );
+    }
+}
+
 /// Render the assembled [`Report`] as plain text. Pure: no DB access, no
 /// wallclock — output depends only on `report`, so it is golden-stable.
 pub fn render_text(report: &Report) -> String {
@@ -112,10 +156,12 @@ pub fn render_text(report: &Report) -> String {
         }
     }
 
+    render_value_summary(&mut out, &report.value_summary);
+
     let delta = report.exploration.mean_tokens_map_miss - report.exploration.mean_tokens_map_hit;
     let _ = writeln!(
         out,
-        "\nCode-map exploration: {hits}/{total} hit turns ({rate:.1}%) · mean hit {hit:.1} tokens · mean miss {miss:.1} tokens · delta {delta:.1}",
+        "\nCode-map exploration (diagnostic): {hits}/{total} hit turns ({rate:.1}%) · mean hit {hit:.1} tokens · mean miss {miss:.1} tokens · delta {delta:.1}",
         hits = report.exploration.map_hit_turns,
         total = report.exploration.total_turns,
         rate = report.exploration.hit_rate * 100.0,
@@ -299,6 +345,83 @@ mod tests {
         // review/rework phases are unpriced → cost renders `n/a`, never `$0.00`.
         assert!(text.contains("n/a"), "unpriced cost renders n/a");
         assert!(!text.contains("$0.00"), "unpriced cost is never $0.00");
+    }
+
+    /// issue #145: with too few exploration turns, the product-facing value
+    /// section must say so rather than print a savings headline.
+    #[test]
+    fn render_text_value_summary_reports_insufficient_data() {
+        use crate::db::metrics::MapStatus;
+        let db = Database::open_in_memory().unwrap();
+        db.record_exploration_tokens(
+            "2026-06-21T00:00:00Z",
+            "claude",
+            0,
+            25,
+            Some(MapStatus::Hit),
+            Some("turn-hit"),
+            Some("core"),
+        )
+        .unwrap();
+        let report = crate::report::run_report(&db, &Default::default()).unwrap();
+        let text = crate::report::render_text(&report);
+        assert!(
+            text.contains("Exploration value"),
+            "product section present: {text}"
+        );
+        assert!(
+            text.contains("not enough") || text.contains("Not enough"),
+            "insufficient-data notice present: {text}"
+        );
+        // The savings delta headline must NOT be presented on a thin sample.
+        assert!(
+            !text.contains("tokens saved"),
+            "no savings headline on thin sample: {text}"
+        );
+    }
+
+    /// issue #145: with a sufficient sample, the value section presents the
+    /// hit rate and the per-hit-turn token-proxy delta.
+    #[test]
+    fn render_text_value_summary_reports_savings_when_sufficient() {
+        use crate::db::metrics::MapStatus;
+        let db = Database::open_in_memory().unwrap();
+        for i in 0..8 {
+            db.record_exploration_tokens(
+                "2026-06-21T00:00:00Z",
+                "claude",
+                0,
+                25,
+                Some(MapStatus::Hit),
+                Some(&format!("hit-{i}")),
+                Some("core"),
+            )
+            .unwrap();
+        }
+        for i in 0..2 {
+            db.record_exploration_tokens(
+                "2026-06-21T00:00:00Z",
+                "claude",
+                0,
+                75,
+                Some(MapStatus::Miss),
+                Some(&format!("miss-{i}")),
+                Some("core"),
+            )
+            .unwrap();
+        }
+        let report = crate::report::run_report(&db, &Default::default()).unwrap();
+        let text = crate::report::render_text(&report);
+        assert!(
+            text.contains("Exploration value"),
+            "section present: {text}"
+        );
+        assert!(text.contains("tokens saved"), "savings headline: {text}");
+        assert!(text.contains("80.0%"), "hit rate rendered: {text}");
+        assert!(
+            !text.contains("not enough"),
+            "no insufficient notice: {text}"
+        );
     }
 
     #[test]

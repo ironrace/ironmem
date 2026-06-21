@@ -841,8 +841,110 @@ const EXPECTED_JSON: &str = r#"{
     "mean_tokens_map_hit": 0.0,
     "mean_tokens_map_miss": 0.0
   },
+  "value_summary": {
+    "min_turns": 8,
+    "sufficient_data": false,
+    "total_turns": 0,
+    "map_hit_turns": 0,
+    "map_miss_turns": 0,
+    "hit_rate": 0.0,
+    "mean_tokens_map_hit": 0.0,
+    "mean_tokens_map_miss": 0.0,
+    "exploration_token_delta": 0.0,
+    "mcp_response": null,
+    "transcript_coverage": null
+  },
   "unpriced_models": [
     "claude-future-9",
     "codex"
   ]
 }"#;
+
+/// Build a `source='mcp_response'` exploration row (the production source the
+/// value summary reads) with a per-turn `map_status` and `turn_id`. Uses only
+/// the public `insert_token_usage` API — the `record_exploration_tokens` seed
+/// helper is `#[cfg(test)]`-gated to the crate and not visible here.
+fn mcp_turn(turn_id: &str, out: i64, status: ironmem::db::MapStatus) -> NewTokenUsage {
+    NewTokenUsage {
+        ts: "2026-06-21T00:00:00Z".into(),
+        source: "mcp_response".into(),
+        harness: "claude".into(),
+        model: None,
+        session_id: None,
+        collab_session_id: None,
+        collab_phase: None,
+        task_tag: None,
+        input_tokens: 0,
+        output_tokens: out,
+        cache_creation_input_tokens: 0,
+        cache_read_input_tokens: 0,
+        estimated: false,
+        chars: 0,
+        cost_usd: None,
+        map_status: Some(status),
+        turn_id: Some(turn_id.into()),
+        area: Some("core".into()),
+    }
+}
+
+/// issue #145: end-to-end `--json` contract for the product-facing value
+/// summary on a SUFFICIENT sample. Asserts the stable field names are present
+/// and the savings-relevant values are hand-correct. Seeds only via public API.
+#[test]
+fn value_summary_json_exposes_stable_fields_when_sufficient() {
+    let db = Database::open_in_memory().unwrap();
+    // 8 hit turns (50 tok each) + 2 miss turns (100 tok each) = 10 turns ≥ 8.
+    for i in 0..8 {
+        db.insert_token_usage(&mcp_turn(
+            &format!("hit-{i}"),
+            50,
+            ironmem::db::MapStatus::Hit,
+        ))
+        .unwrap();
+    }
+    for i in 0..2 {
+        db.insert_token_usage(&mcp_turn(
+            &format!("miss-{i}"),
+            100,
+            ironmem::db::MapStatus::Miss,
+        ))
+        .unwrap();
+    }
+
+    let report = run_report(&db, &ReportOptions::default()).unwrap();
+    let json: serde_json::Value =
+        serde_json::from_str(&serde_json::to_string(&report).unwrap()).unwrap();
+    let vs = &json["value_summary"];
+
+    // Stable field names (the issue's JSON contract).
+    assert_eq!(vs["min_turns"], 8);
+    assert_eq!(vs["sufficient_data"], true);
+    assert_eq!(vs["total_turns"], 10);
+    assert_eq!(vs["map_hit_turns"], 8);
+    assert_eq!(vs["map_miss_turns"], 2);
+    assert_eq!(vs["hit_rate"], 0.8);
+    assert_eq!(vs["mean_tokens_map_hit"], 50.0);
+    assert_eq!(vs["mean_tokens_map_miss"], 100.0);
+    // delta = 100 - 50 = 50 tokens saved per hit turn (proxy).
+    assert_eq!(vs["exploration_token_delta"], 50.0);
+    // MCP-response indicator present (10 mcp_response rows); transcript absent.
+    assert_eq!(vs["mcp_response"]["row_count"], 10);
+    assert!(vs["transcript_coverage"].is_null());
+}
+
+/// issue #145: on a THIN sample the JSON still exposes the fields but flags
+/// `sufficient_data == false` so consumers never read a savings headline.
+#[test]
+fn value_summary_json_flags_insufficient_sample() {
+    let db = Database::open_in_memory().unwrap();
+    db.insert_token_usage(&mcp_turn("only-turn", 50, ironmem::db::MapStatus::Hit))
+        .unwrap();
+
+    let report = run_report(&db, &ReportOptions::default()).unwrap();
+    let json: serde_json::Value =
+        serde_json::from_str(&serde_json::to_string(&report).unwrap()).unwrap();
+    let vs = &json["value_summary"];
+    assert_eq!(vs["sufficient_data"], false);
+    assert_eq!(vs["total_turns"], 1);
+    assert_eq!(vs["min_turns"], 8);
+}
