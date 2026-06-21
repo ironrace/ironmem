@@ -7,14 +7,21 @@ use std::path::PathBuf;
 use serde::Serialize;
 
 use crate::code_maps::freshness::{classify, Freshness};
+use crate::db::drawers::SearchFilters;
 use crate::error::MemoryError;
 use crate::mcp::app::App;
 use crate::sanitize::sanitize_name;
+use crate::search::pipeline::search;
 
 pub mod render;
 
 /// Default token budget when the caller does not pass `--budget`.
 pub const DEFAULT_BUDGET_TOKENS: usize = 2000;
+
+/// Maximum characters kept from a drawer body when building a memory snippet.
+pub const SNIPPET_MAX_CHARS: usize = 240;
+/// Maximum memory hits requested before budget bounding.
+pub const MAX_MEMORY_HITS: usize = 10;
 
 /// Inputs for a single context-pack request.
 #[derive(Debug, Clone)]
@@ -100,11 +107,37 @@ pub fn run_context(app: &App, opts: &ContextPackOptions) -> Result<ContextPack, 
             status: resolve_area(app, &repo, repo_path, raw),
         })
         .collect();
+    let filters = SearchFilters {
+        wing: None,
+        room: None,
+        limit: MAX_MEMORY_HITS,
+    };
+    let memory_hits: Vec<MemoryHit> = match search(app, &opts.task, &filters) {
+        Ok(result) => result
+            .results
+            .into_iter()
+            .map(|sd| {
+                let snippet = snippet(&sd.drawer.content);
+                MemoryHit {
+                    id: sd.drawer.id,
+                    wing: sd.drawer.wing,
+                    room: sd.drawer.room,
+                    score: sd.score,
+                    snippet,
+                }
+            })
+            .collect(),
+        // Recall is best-effort context, never a hard failure for the pack.
+        Err(e) => {
+            eprintln!("context: memory recall failed, continuing without hits: {e}");
+            Vec::new()
+        }
+    };
     Ok(ContextPack {
         task: opts.task.clone(),
         repo,
         budget_tokens: opts.budget_tokens,
-        memory_hits: Vec::new(),
+        memory_hits,
         decisions: Vec::new(),
         areas,
         truncated: false,
@@ -171,10 +204,42 @@ fn short_sha(sha: &str) -> String {
     sha.chars().take(7).collect()
 }
 
+/// Trim a drawer body to a bounded, single-line-ish snippet.
+fn snippet(content: &str) -> String {
+    let collapsed = content.split_whitespace().collect::<Vec<_>>().join(" ");
+    if collapsed.chars().count() <= SNIPPET_MAX_CHARS {
+        collapsed
+    } else {
+        let truncated: String = collapsed.chars().take(SNIPPET_MAX_CHARS).collect();
+        format!("{truncated}…")
+    }
+}
+
 /// Canonicalize the repo path for code-map lookup; fall back to the raw
 /// lossy path when canonicalization fails (e.g. path does not exist).
 fn canonical_repo(repo: &std::path::Path) -> String {
     std::fs::canonicalize(repo)
         .map(|p| p.to_string_lossy().into_owned())
         .unwrap_or_else(|_| repo.to_string_lossy().into_owned())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn snippet_collapses_whitespace_and_passes_short_content_through() {
+        let s = snippet("metrics   reporting\n\trendered");
+        assert_eq!(s, "metrics reporting rendered");
+    }
+
+    #[test]
+    fn snippet_truncates_long_multibyte_content_without_panic() {
+        // 300 multibyte chars (é = U+00E9). Must not panic on a byte boundary.
+        let input: String = "é".repeat(300);
+        let out = snippet(&input);
+        // Bounded to the cap plus the single-char ellipsis.
+        assert_eq!(out.chars().count(), SNIPPET_MAX_CHARS + 1);
+        assert!(out.ends_with('…'));
+    }
 }

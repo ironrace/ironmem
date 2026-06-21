@@ -178,3 +178,59 @@ fn context_fresh_map_surfaces_summary_and_sha() {
     assert!(area["summary"].as_str().unwrap().contains("collab handoff"));
     assert_eq!(area["head_sha"].as_str(), Some(&head[..7]));
 }
+
+#[test]
+fn context_surfaces_lexically_matching_memory_hit() {
+    let temp = tempfile::tempdir().unwrap();
+    let home = temp.path().join("home");
+    let db_path = temp.path().join("ctx_mem.sqlite3");
+    std::fs::create_dir_all(&home).unwrap();
+    {
+        let db = ironmem::db::schema::Database::open(&db_path).unwrap();
+        db.migrate().unwrap();
+        // Seed one drawer whose content lexically matches the task query.
+        let content = "metrics reporting is rendered by report::render_text";
+        let wing = "ironmem";
+        let room = "docs";
+        let drawer_id = ironmem::db::drawers::generate_id(content, wing, room);
+        let embedding = vec![0.0f32; ironrace_embed::embedder::EMBED_DIM];
+        db.insert_drawer(
+            &drawer_id,
+            content,
+            &embedding,
+            wing,
+            room,
+            "report.rs",
+            "test",
+        )
+        .unwrap();
+    }
+
+    let out = context_command(&home, &db_path)
+        .arg("--repo")
+        .arg(temp.path())
+        .arg("--task")
+        .arg("metrics reporting")
+        .arg("--json")
+        .output()
+        .unwrap();
+
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let value: serde_json::Value =
+        serde_json::from_str(&String::from_utf8(out.stdout).unwrap()).unwrap();
+    let hits = value["memory_hits"].as_array().unwrap();
+    assert!(!hits.is_empty(), "expected at least one memory hit");
+    assert!(hits[0]["snippet"]
+        .as_str()
+        .unwrap()
+        .contains("metrics reporting"));
+    assert_eq!(hits[0]["wing"].as_str(), Some("ironmem"));
+    // Snippet is bounded.
+    assert!(
+        hits[0]["snippet"].as_str().unwrap().chars().count() <= ironmem::context::SNIPPET_MAX_CHARS
+    );
+}
