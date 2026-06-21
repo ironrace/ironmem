@@ -38,6 +38,45 @@ impl ModelTier {
     }
 }
 
+/// How a collab run terminated, beyond the phase it reached. Distinguishes a
+/// genuine task failure from an EXTERNAL account-wide condition (Claude
+/// session/rate limit) so the latter is excluded from the corpus row set and
+/// re-run rather than corrupting an n>=8 data point as a false FAILED.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RunDisposition {
+    /// Reached a terminal phase (`CodingComplete`/`CodingFailed`) normally.
+    Terminal,
+    /// A worker process died from a genuine, task-attributable error. The task
+    /// FAILED — a valid (non-headline) data point.
+    WorkerFailed,
+    /// A worker process died from an EXTERNAL session/rate-limit condition. The
+    /// run is EXCLUDED from the corpus row set and must be re-run; it is NOT a
+    /// task failure.
+    ExcludedRetryable,
+}
+
+/// Case-insensitive signatures of an EXTERNAL Claude account-wide session/rate
+/// limit condition. Deliberately specific multi-word phrases so a genuine red
+/// gate or task output that merely mentions "limit"/"rate" is NOT misclassified
+/// as retryable (which would silently drop a real FAILED data point). Sourced
+/// from the `claude -p` result/synthetic-error text and the Anthropic API error
+/// shape; matched against the worker-failure error string, which (per Gap 1)
+/// includes the worker's stdout tail where these messages appear.
+const SESSION_LIMIT_SIGNATURES: &[&str] = &[
+    "usage limit reached",
+    "session limit",
+    "rate_limit_error",
+    "rate limit exceeded",
+    "too many requests",
+];
+
+/// True iff `msg` bears an external session/rate-limit signature. Such a worker
+/// failure is EXCLUDED + retryable, never a task FAILED.
+pub fn is_session_limit_error(msg: &str) -> bool {
+    let lower = msg.to_ascii_lowercase();
+    SESSION_LIMIT_SIGNATURES.iter().any(|s| lower.contains(s))
+}
+
 /// One dispatch decision for a `(phase, owner)` poll. Frozen mirror of the
 /// dispatch matrix in `.claude-plugin/commands/collab.md` (owner-first dispatch).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -302,6 +341,9 @@ pub struct CollabRunResult {
     pub review_rounds: u32,
     pub fix_commits: u32,
     pub pr_url_synthetic: String,
+    /// How the run ended — distinguishes a normal terminal from a worker-abort
+    /// (genuine FAILED vs external EXCLUDED). See [`RunDisposition`].
+    pub disposition: RunDisposition,
 }
 
 /// Fold one Claude worker turn into the run totals: accumulate its usage AND
@@ -320,7 +362,6 @@ pub fn run_collab_task<R: CollabStateReader, S: WorkerSpawner, A: CodexAttributo
     spawner: &S,
     attributor: &A,
 ) -> Result<CollabRunResult> {
-    let wt = ctx.worktree.as_path();
     // Synthetic, un-pushed PR URL. Must be `https://`-schemed: the server's
     // `final_review` event validation (collab_events.rs) rejects any other scheme
     // (a `javascript:`/`file://` guard), so a `local://` URL is refused and the
@@ -328,164 +369,71 @@ pub fn run_collab_task<R: CollabStateReader, S: WorkerSpawner, A: CodexAttributo
     // it unmistakably fake — nothing is created or pushed.
     let synthetic_pr = format!("https://abeval.invalid/{}", ctx.task_id);
 
-    let mut claude_usage = Usage::default();
-    let mut any_usage_unparseable = false;
-    let mut fix_commits: u32 = 0;
+    let mut acc = RunAccum {
+        claude_usage: Usage::default(),
+        any_usage_unparseable: false,
+        fix_commits: 0,
+        last_state: None,
+    };
 
-    // (1) Bootstrap: collab_start + print ABEVAL_SESSION_ID=<id>. Mechanical
-    // (one tool call + one sentinel line) → sonnet.
-    let boot = spawner.spawn_claude(&ctx.bootstrap_prompt, wt, ModelTier::Sonnet)?;
-    accumulate_claude(&mut claude_usage, &mut any_usage_unparseable, &boot);
-    let session_id = parse_session_id(&boot.stdout)?;
-
-    // (2) Dispatcher loop.
-    let mut last_state: Option<SessionState> = None;
-    // Stall guard: the `(phase, owner, plan_round, global_round)` key last
-    // dispatched, and how many
-    // consecutive turns have left it unchanged.
-    let mut stall_key: Option<(String, String, u32, u32)> = None;
-    let mut stall_count: usize = 0;
-    for _ in 0..MAX_TURNS {
-        let state = reader.read(&session_id)?;
-        let key = (
-            state.phase.clone(),
-            state.current_owner.clone(),
-            state.review_round,
-            state.global_review_round,
-        );
-        if stall_key.as_ref() == Some(&key) {
-            stall_count += 1;
-            if stall_count >= STUCK_LIMIT {
-                return Err(anyhow!(
-                    "collab run for task {} stalled: phase {} (owner {}, plan round {}, global round {}) did not \
-                     advance after {} consecutive worker turns — INVALID run (hung or \
-                     looping turn / submit never landed)",
-                    ctx.task_id,
-                    state.phase,
-                    state.current_owner,
-                    state.review_round,
-                    state.global_review_round,
-                    STUCK_LIMIT
-                ));
-            }
-        } else {
-            stall_count = 0;
-            stall_key = Some(key);
-        }
-        let action = worker_action(&state.phase, &state.current_owner, state.review_round);
-        last_state = Some(state.clone());
-        match action {
-            WorkerAction::Terminal => break,
-            WorkerAction::Anomaly => {
-                return Err(anyhow!(
-                    "collab anomaly: phase {} owned by {} (unexpected)",
-                    state.phase,
-                    state.current_owner
-                ));
-            }
-            WorkerAction::ClaudeSend {
-                template,
-                mode,
-                model,
-            } => {
-                let prompt = render_worker_prompt(
-                    &ctx.prompts_dir,
-                    template,
-                    &[
-                        ("$SESSION_ID", &session_id),
-                        ("$BRANCH", &ctx.branch),
-                        ("$MODE", mode),
-                    ],
-                )?;
-                let r = spawner.spawn_claude(&prompt, wt, model)?;
-                accumulate_claude(&mut claude_usage, &mut any_usage_unparseable, &r);
-            }
-            WorkerAction::ClaudeCompose {
-                template,
-                topic,
-                model,
-            } => {
-                let compose = render_worker_prompt(
-                    &ctx.prompts_dir,
-                    template,
-                    &[
-                        ("$SESSION_ID", &session_id),
-                        ("$BRANCH", &ctx.branch),
-                        ("$MODE", "compose"),
-                        ("$TOPIC", topic),
-                    ],
-                )?;
-                // Snapshot the newest staged drawer before the turn so we can
-                // identify the one this compose persists (rowid advances).
-                let before_rowid = reader
-                    .newest_draft_drawer(i64::MIN)?
-                    .map(|(_, rowid)| rowid)
-                    .unwrap_or(i64::MIN);
-                let cr = spawner.spawn_claude(&compose, wt, model)?;
-                accumulate_claude(&mut claude_usage, &mut any_usage_unparseable, &cr);
-                let artifact_ref = resolve_compose_ref(reader, &cr.stdout, before_rowid, topic)?;
-                let submit = render_worker_prompt(
-                    &ctx.prompts_dir,
-                    "collab-turn-submit.md",
-                    &[
-                        ("$SESSION_ID", &session_id),
-                        ("$BRANCH", &ctx.branch),
-                        ("$MODE", "submit"),
-                        ("$TOPIC", topic),
-                        ("$ARTIFACT_REF", &artifact_ref),
-                    ],
-                )?;
-                // The submit is a mechanical event send → sonnet, regardless of the
-                // compose turn's tier.
-                let sr = spawner.spawn_claude(&submit, wt, ModelTier::Sonnet)?;
-                accumulate_claude(&mut claude_usage, &mut any_usage_unparseable, &sr);
-            }
-            WorkerAction::TaskListBridge => {
-                let prompt = render_worker_prompt(
-                    &ctx.prompts_dir,
-                    "collab-turn-task-list.md",
-                    &[("$SESSION_ID", &session_id), ("$BRANCH", &ctx.branch)],
-                )?;
-                // Mechanical bridge (parse approved plan markdown → send task_list).
-                let r = spawner.spawn_claude(&prompt, wt, ModelTier::Sonnet)?;
-                accumulate_claude(&mut claude_usage, &mut any_usage_unparseable, &r);
-                if let Some(blocker) = parse_blocker_line(&r.stdout) {
-                    return Err(anyhow!(
-                        "task_list bridge for task {} returned blocker: {} — INVALID run",
-                        ctx.task_id,
-                        blocker
-                    ));
+    // Drive the bootstrap + dispatcher loop. A spawned-worker process failure
+    // must NOT abort the whole run via `?` — that loses every token spent so far
+    // and reports an EXTERNAL session-limit kill identically to a genuine crash.
+    // Catch worker failures here, classify them (external session/rate limit →
+    // EXCLUDED + retryable; otherwise → FAILED), and surface the partial usage.
+    // Structural/anomaly/stall errors stay a hard `Err` (the run is INVALID, not
+    // a data point).
+    match drive_collab_loop(ctx, reader, spawner, &synthetic_pr, &mut acc) {
+        Ok(()) => {}
+        Err(DriveError::Invalid(e)) => return Err(e),
+        Err(DriveError::Worker(e)) => {
+            let disposition = if is_session_limit_error(&format!("{e:#}")) {
+                RunDisposition::ExcludedRetryable
+            } else {
+                RunDisposition::WorkerFailed
+            };
+            // Best-effort Codex attribution so partial Codex spend is captured
+            // too; a failure to attribute must not mask the Claude partial we
+            // already hold, but it is surfaced (never silently swallowed).
+            let codex_usage = match attributor.attribute() {
+                Ok(u) => u,
+                Err(ae) => {
+                    eprintln!(
+                        "abeval: could not attribute Codex tokens on aborted run for \
+                         task {}: {ae:#}",
+                        ctx.task_id
+                    );
+                    Usage::default()
                 }
-            }
-            WorkerAction::Codex => {
-                let cr = spawner.spawn_codex(&session_id, wt)?;
-                if state.phase == "CodeReviewFixGlobalPending" {
-                    fix_commits = fix_commits.saturating_add(cr.commits_added);
-                }
-            }
-            WorkerAction::FinalReviewSynthetic => {
-                let compose = render_worker_prompt(
-                    &ctx.prompts_dir,
-                    "collab-turn-final-review.md",
-                    &[
-                        ("$SESSION_ID", &session_id),
-                        ("$BRANCH", &ctx.branch),
-                        ("$MODE", "compose"),
-                    ],
-                )?;
-                // Final-review compose is a review turn → opus; the synthetic submit
-                // is a mechanical event send → sonnet.
-                let cr = spawner.spawn_claude(&compose, wt, ModelTier::Opus)?;
-                accumulate_claude(&mut claude_usage, &mut any_usage_unparseable, &cr);
-                let submit = SYNTHETIC_FINAL_SUBMIT
-                    .replace("$SESSION_ID", &session_id)
-                    .replace("$PR_URL", &synthetic_pr);
-                let sr = spawner.spawn_claude(&submit, wt, ModelTier::Sonnet)?;
-                accumulate_claude(&mut claude_usage, &mut any_usage_unparseable, &sr);
-            }
+            };
+            let (reached_phase, review_rounds) = match &acc.last_state {
+                Some(s) => (s.phase.clone(), s.global_review_round),
+                None => ("WorkerAborted".to_string(), 0),
+            };
+            eprintln!(
+                "abeval: collab run for task {} aborted after a worker failure \
+                 ({disposition:?}); preserving partial Claude tokens={}: {e:#}",
+                ctx.task_id,
+                acc.claude_usage.total()
+            );
+            return Ok(CollabRunResult {
+                claude_usage: acc.claude_usage,
+                codex_usage,
+                reached_phase,
+                review_rounds,
+                fix_commits: acc.fix_commits,
+                pr_url_synthetic: synthetic_pr,
+                disposition,
+            });
         }
     }
 
+    let RunAccum {
+        claude_usage,
+        any_usage_unparseable,
+        fix_commits,
+        last_state,
+    } = acc;
     let last_state = last_state.ok_or_else(|| anyhow!("loop never polled a session state"))?;
     let reached_phase = last_state.phase.clone();
     let review_rounds = last_state.global_review_round;
@@ -539,7 +487,219 @@ pub fn run_collab_task<R: CollabStateReader, S: WorkerSpawner, A: CodexAttributo
         review_rounds,
         fix_commits,
         pr_url_synthetic: synthetic_pr,
+        disposition: RunDisposition::Terminal,
     })
+}
+
+/// Mutable run state threaded through [`drive_collab_loop`] so that, when a
+/// worker turn aborts the loop, [`run_collab_task`] still holds the partial
+/// totals (rather than losing them to `?` propagation).
+struct RunAccum {
+    claude_usage: Usage,
+    any_usage_unparseable: bool,
+    fix_commits: u32,
+    last_state: Option<SessionState>,
+}
+
+/// Error class from the dispatcher loop. A [`DriveError::Worker`] is a spawned
+/// worker process failure — caught and classified (external session-limit vs
+/// genuine) so the run is excluded/failed with partial usage preserved. A
+/// [`DriveError::Invalid`] is a structural/anomaly/stall condition — the run is
+/// INVALID and propagates as a hard `Err`.
+enum DriveError {
+    Worker(anyhow::Error),
+    Invalid(anyhow::Error),
+}
+
+/// Bootstrap the session and run the dispatcher loop, folding each turn's usage
+/// into `acc`. Returns `Ok(())` when the loop ends (terminal phase reached, or
+/// `MAX_TURNS` exhausted — the caller's terminal-phase guard decides validity).
+/// Worker spawn failures map to [`DriveError::Worker`]; every other failure
+/// (DB read, render, anomaly, stall, blocker) maps to [`DriveError::Invalid`].
+fn drive_collab_loop<R: CollabStateReader, S: WorkerSpawner>(
+    ctx: &CollabTaskCtx,
+    reader: &R,
+    spawner: &S,
+    synthetic_pr: &str,
+    acc: &mut RunAccum,
+) -> std::result::Result<(), DriveError> {
+    let wt = ctx.worktree.as_path();
+
+    // (1) Bootstrap: collab_start + print ABEVAL_SESSION_ID=<id>. Mechanical
+    // (one tool call + one sentinel line) → sonnet.
+    let boot = spawner
+        .spawn_claude(&ctx.bootstrap_prompt, wt, ModelTier::Sonnet)
+        .map_err(DriveError::Worker)?;
+    accumulate_claude(&mut acc.claude_usage, &mut acc.any_usage_unparseable, &boot);
+    let session_id = parse_session_id(&boot.stdout).map_err(DriveError::Invalid)?;
+
+    // (2) Dispatcher loop.
+    // Stall guard: the `(phase, owner, plan_round, global_round)` key last
+    // dispatched, and how many consecutive turns have left it unchanged.
+    let mut stall_key: Option<(String, String, u32, u32)> = None;
+    let mut stall_count: usize = 0;
+    for _ in 0..MAX_TURNS {
+        let state = reader.read(&session_id).map_err(DriveError::Invalid)?;
+        let key = (
+            state.phase.clone(),
+            state.current_owner.clone(),
+            state.review_round,
+            state.global_review_round,
+        );
+        if stall_key.as_ref() == Some(&key) {
+            stall_count += 1;
+            if stall_count >= STUCK_LIMIT {
+                return Err(DriveError::Invalid(anyhow!(
+                    "collab run for task {} stalled: phase {} (owner {}, plan round {}, global round {}) did not \
+                     advance after {} consecutive worker turns — INVALID run (hung or \
+                     looping turn / submit never landed)",
+                    ctx.task_id,
+                    state.phase,
+                    state.current_owner,
+                    state.review_round,
+                    state.global_review_round,
+                    STUCK_LIMIT
+                )));
+            }
+        } else {
+            stall_count = 0;
+            stall_key = Some(key);
+        }
+        let action = worker_action(&state.phase, &state.current_owner, state.review_round);
+        acc.last_state = Some(state.clone());
+        match action {
+            WorkerAction::Terminal => break,
+            WorkerAction::Anomaly => {
+                return Err(DriveError::Invalid(anyhow!(
+                    "collab anomaly: phase {} owned by {} (unexpected)",
+                    state.phase,
+                    state.current_owner
+                )));
+            }
+            WorkerAction::ClaudeSend {
+                template,
+                mode,
+                model,
+            } => {
+                let prompt = render_worker_prompt(
+                    &ctx.prompts_dir,
+                    template,
+                    &[
+                        ("$SESSION_ID", &session_id),
+                        ("$BRANCH", &ctx.branch),
+                        ("$MODE", mode),
+                    ],
+                )
+                .map_err(DriveError::Invalid)?;
+                let r = spawner
+                    .spawn_claude(&prompt, wt, model)
+                    .map_err(DriveError::Worker)?;
+                accumulate_claude(&mut acc.claude_usage, &mut acc.any_usage_unparseable, &r);
+            }
+            WorkerAction::ClaudeCompose {
+                template,
+                topic,
+                model,
+            } => {
+                let compose = render_worker_prompt(
+                    &ctx.prompts_dir,
+                    template,
+                    &[
+                        ("$SESSION_ID", &session_id),
+                        ("$BRANCH", &ctx.branch),
+                        ("$MODE", "compose"),
+                        ("$TOPIC", topic),
+                    ],
+                )
+                .map_err(DriveError::Invalid)?;
+                // Snapshot the newest staged drawer before the turn so we can
+                // identify the one this compose persists (rowid advances).
+                let before_rowid = reader
+                    .newest_draft_drawer(i64::MIN)
+                    .map_err(DriveError::Invalid)?
+                    .map(|(_, rowid)| rowid)
+                    .unwrap_or(i64::MIN);
+                let cr = spawner
+                    .spawn_claude(&compose, wt, model)
+                    .map_err(DriveError::Worker)?;
+                accumulate_claude(&mut acc.claude_usage, &mut acc.any_usage_unparseable, &cr);
+                let artifact_ref = resolve_compose_ref(reader, &cr.stdout, before_rowid, topic)
+                    .map_err(DriveError::Invalid)?;
+                let submit = render_worker_prompt(
+                    &ctx.prompts_dir,
+                    "collab-turn-submit.md",
+                    &[
+                        ("$SESSION_ID", &session_id),
+                        ("$BRANCH", &ctx.branch),
+                        ("$MODE", "submit"),
+                        ("$TOPIC", topic),
+                        ("$ARTIFACT_REF", &artifact_ref),
+                    ],
+                )
+                .map_err(DriveError::Invalid)?;
+                // The submit is a mechanical event send → sonnet, regardless of the
+                // compose turn's tier.
+                let sr = spawner
+                    .spawn_claude(&submit, wt, ModelTier::Sonnet)
+                    .map_err(DriveError::Worker)?;
+                accumulate_claude(&mut acc.claude_usage, &mut acc.any_usage_unparseable, &sr);
+            }
+            WorkerAction::TaskListBridge => {
+                let prompt = render_worker_prompt(
+                    &ctx.prompts_dir,
+                    "collab-turn-task-list.md",
+                    &[("$SESSION_ID", &session_id), ("$BRANCH", &ctx.branch)],
+                )
+                .map_err(DriveError::Invalid)?;
+                // Mechanical bridge (parse approved plan markdown → send task_list).
+                let r = spawner
+                    .spawn_claude(&prompt, wt, ModelTier::Sonnet)
+                    .map_err(DriveError::Worker)?;
+                accumulate_claude(&mut acc.claude_usage, &mut acc.any_usage_unparseable, &r);
+                if let Some(blocker) = parse_blocker_line(&r.stdout) {
+                    return Err(DriveError::Invalid(anyhow!(
+                        "task_list bridge for task {} returned blocker: {} — INVALID run",
+                        ctx.task_id,
+                        blocker
+                    )));
+                }
+            }
+            WorkerAction::Codex => {
+                let cr = spawner
+                    .spawn_codex(&session_id, wt)
+                    .map_err(DriveError::Worker)?;
+                if state.phase == "CodeReviewFixGlobalPending" {
+                    acc.fix_commits = acc.fix_commits.saturating_add(cr.commits_added);
+                }
+            }
+            WorkerAction::FinalReviewSynthetic => {
+                let compose = render_worker_prompt(
+                    &ctx.prompts_dir,
+                    "collab-turn-final-review.md",
+                    &[
+                        ("$SESSION_ID", &session_id),
+                        ("$BRANCH", &ctx.branch),
+                        ("$MODE", "compose"),
+                    ],
+                )
+                .map_err(DriveError::Invalid)?;
+                // Final-review compose is a review turn → opus; the synthetic submit
+                // is a mechanical event send → sonnet.
+                let cr = spawner
+                    .spawn_claude(&compose, wt, ModelTier::Opus)
+                    .map_err(DriveError::Worker)?;
+                accumulate_claude(&mut acc.claude_usage, &mut acc.any_usage_unparseable, &cr);
+                let submit = SYNTHETIC_FINAL_SUBMIT
+                    .replace("$SESSION_ID", &session_id)
+                    .replace("$PR_URL", synthetic_pr);
+                let sr = spawner
+                    .spawn_claude(&submit, wt, ModelTier::Sonnet)
+                    .map_err(DriveError::Worker)?;
+                accumulate_claude(&mut acc.claude_usage, &mut acc.any_usage_unparseable, &sr);
+            }
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]

@@ -2,10 +2,134 @@ use abeval::client::Usage;
 use abeval::collab_db::SessionState;
 use abeval::collab_driver::{
     run_collab_task, CodexAttributor, CodexResult, CollabStateReader, CollabTaskCtx, ModelTier,
-    WorkerResult, WorkerSpawner,
+    RunDisposition, WorkerResult, WorkerSpawner,
 };
 use std::cell::RefCell;
 use std::path::{Path, PathBuf};
+
+/// Spawner whose Nth claude turn (1-based, counting the bootstrap as turn 1)
+/// dies with an injected worker error. `limit=true` injects an external
+/// session-limit signature (Gap 1 surfaces it in the error string);
+/// `limit=false` injects a genuine task-attributable failure. All other turns
+/// succeed with fixed non-zero usage.
+struct FailAtNthSpawner {
+    fail_at: u32,
+    limit: bool,
+    calls: RefCell<u32>,
+}
+impl WorkerSpawner for FailAtNthSpawner {
+    fn spawn_claude(
+        &self,
+        prompt: &str,
+        _wt: &Path,
+        _model: ModelTier,
+    ) -> anyhow::Result<WorkerResult> {
+        let n = {
+            let mut c = self.calls.borrow_mut();
+            *c += 1;
+            *c
+        };
+        if n == self.fail_at {
+            // Mirror the real spawn_claude error shape: the cause lives in the
+            // surfaced stdout tail (Gap 1).
+            return if self.limit {
+                Err(anyhow::anyhow!(
+                    "claude worker exited Some(1) in /wt — stderr:  — \
+                     stdout tail: …Claude usage limit reached. Resets at 9pm."
+                ))
+            } else {
+                Err(anyhow::anyhow!(
+                    "claude worker exited Some(1) in /wt — stderr: thread panicked — \
+                     stdout tail: …error[E0599]: no method named `frobnicate`"
+                ))
+            };
+        }
+        let stdout = if prompt.contains("ABEVAL_BOOTSTRAP") {
+            "ABEVAL_SESSION_ID=sess-xyz\n".to_string()
+        } else {
+            "result: ok\nref: drawer-1\nblocker: none\n".to_string()
+        };
+        Ok(WorkerResult {
+            usage: Usage {
+                input_tokens: 10,
+                output_tokens: 5,
+                ..Default::default()
+            },
+            stdout,
+            usage_unparseable: false,
+        })
+    }
+    fn spawn_codex(&self, _session_id: &str, _wt: &Path) -> anyhow::Result<CodexResult> {
+        Ok(CodexResult { commits_added: 0 })
+    }
+}
+
+/// Two-state reader: a claude-owned implement phase that would advance to a
+/// terminal phase — but the worker dies on the first loop turn before that.
+fn implement_then_complete_reader() -> ScriptedReader {
+    ScriptedReader {
+        states: vec![
+            st("CodeImplementPending", "claude", 0),
+            st("CodingComplete", "claude", 0),
+        ],
+        idx: RefCell::new(0),
+        draft: None,
+    }
+}
+
+#[test]
+fn session_limit_worker_error_is_excluded_and_keeps_partial_usage() {
+    // Bootstrap (turn 1) succeeds and spends 15 tokens; the first loop turn
+    // (turn 2, the implement send) dies with a session-limit signature. The run
+    // must resolve to a distinct EXCLUDED/retryable outcome (NOT FAILED — that
+    // would corrupt a data point in an n>=8 campaign), and the partial usage
+    // spent through the bootstrap must NOT be silently lost.
+    let spawner = FailAtNthSpawner {
+        fail_at: 2,
+        limit: true,
+        calls: RefCell::new(0),
+    };
+    let attributor = FixedAttributor(Usage::default());
+    let res = run_collab_task(
+        &ctx(&repo_prompts_dir()),
+        &implement_then_complete_reader(),
+        &spawner,
+        &attributor,
+    )
+    .expect("a session-limit worker abort must not propagate as a hard Err");
+    assert_eq!(res.disposition, RunDisposition::ExcludedRetryable);
+    assert_eq!(
+        res.claude_usage.total(),
+        15,
+        "partial usage through the bootstrap turn must be preserved, not lost"
+    );
+}
+
+#[test]
+fn genuine_worker_error_maps_to_failed_and_keeps_partial_usage() {
+    // Same trajectory, but the injected error is a genuine task failure (no
+    // limit signature). It must map to FAILED (a real data point), still with
+    // the partial usage preserved.
+    let spawner = FailAtNthSpawner {
+        fail_at: 2,
+        limit: false,
+        calls: RefCell::new(0),
+    };
+    let attributor = FixedAttributor(Usage::default());
+    let res = run_collab_task(
+        &ctx(&repo_prompts_dir()),
+        &implement_then_complete_reader(),
+        &spawner,
+        &attributor,
+    )
+    .expect("a genuine worker failure is a FAILED data point, not a hard Err");
+    assert_eq!(res.disposition, RunDisposition::WorkerFailed);
+    assert_eq!(
+        res.claude_usage.total(),
+        15,
+        "partial usage must be preserved on the FAILED path too"
+    );
+}
 
 /// State reader that returns a scripted sequence of phases, one per poll.
 struct ScriptedReader {
@@ -140,6 +264,7 @@ fn full_happy_path_sums_usage_and_counts_rework() {
     let res = run_collab_task(&ctx(&prompts), &reader, &spawner, &attributor).unwrap();
 
     assert_eq!(res.reached_phase, "CodingComplete");
+    assert_eq!(res.disposition, RunDisposition::Terminal);
     assert_eq!(res.review_rounds, 1); // from global_review_round
     assert_eq!(res.fix_commits, 2); // one codex fix turn × 2 commits
     assert_eq!(*spawner.codex_calls.borrow(), 3); // draft + plan-review + fix

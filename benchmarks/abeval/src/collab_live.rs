@@ -488,12 +488,28 @@ pub fn run_ironmem_arm(task: &Task, worktree: &Path, out_task_dir: &Path) -> Res
         codex_usage: result.codex_usage,
         review_rounds: result.review_rounds,
         fix_commits: result.fix_commits,
-        outcome: if result.reached_phase == crate::collab_driver::PHASE_CODING_COMPLETE {
-            crate::constants::OUTCOME_COMPLETED.to_string()
-        } else {
-            crate::constants::OUTCOME_FAILED.to_string()
+        // Map the run disposition (not just the phase) to the outcome string: a
+        // worker-abort run never reached a terminal phase, and an external
+        // session/rate-limit abort must be EXCLUDED, never recorded as FAILED.
+        outcome: match result.disposition {
+            crate::collab_driver::RunDisposition::Terminal => {
+                if result.reached_phase == crate::collab_driver::PHASE_CODING_COMPLETE {
+                    crate::constants::OUTCOME_COMPLETED.to_string()
+                } else {
+                    crate::constants::OUTCOME_FAILED.to_string()
+                }
+            }
+            crate::collab_driver::RunDisposition::WorkerFailed => {
+                crate::constants::OUTCOME_FAILED.to_string()
+            }
+            crate::collab_driver::RunDisposition::ExcludedRetryable => {
+                crate::constants::OUTCOME_EXCLUDED.to_string()
+            }
         },
-        transcript: format!("collab reached {}", result.reached_phase),
+        transcript: format!(
+            "collab reached {} ({:?})",
+            result.reached_phase, result.disposition
+        ),
     })
 }
 

@@ -1,7 +1,39 @@
 use abeval::collab_driver::{
-    parse_ref_line, parse_session_id, render_worker_prompt, worker_action, ModelTier, WorkerAction,
+    is_session_limit_error, parse_ref_line, parse_session_id, render_worker_prompt, worker_action,
+    ModelTier, WorkerAction,
 };
 use std::fs;
+
+#[test]
+fn session_limit_signature_detected_but_not_overmatched() {
+    // External account-wide limit conditions (surfaced in the worker error's
+    // stdout tail by Gap 1) → retryable/excludable, never a task FAILED.
+    assert!(is_session_limit_error(
+        "claude worker exited Some(1) in /wt — stderr:  — \
+         stdout tail: …Claude usage limit reached. Resets at 9pm."
+    ));
+    assert!(is_session_limit_error(
+        "…you've hit your session limit, try again later…"
+    ));
+    assert!(is_session_limit_error(
+        r#"{"type":"error","error":{"type":"rate_limit_error","message":"…"}}"#
+    ));
+
+    // Genuine red gates / task output that merely mention "limit" or "rate" must
+    // NOT be misclassified as retryable — that would corrupt the FAILED data
+    // point by silently dropping it from the corpus.
+    assert!(!is_session_limit_error(
+        "claude worker exited Some(1) in /wt — stderr: thread 'main' panicked — \
+         stdout tail: …error[E0599]: no method named `rate` found"
+    ));
+    assert!(!is_session_limit_error(
+        "test failed: assert_eq!(left == right) where left=`limit` right=`5`"
+    ));
+    assert!(!is_session_limit_error(
+        "compilation error: unused variable `rate_limiter`"
+    ));
+    assert!(!is_session_limit_error(""));
+}
 
 #[test]
 fn dispatch_matrix_maps_each_phase() {
