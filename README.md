@@ -144,6 +144,7 @@ the first `[FAIL]`:
 
 - **`model` not found** → run `ironmem setup` to download the embedding model.
 - **`model` failed checksum** → delete the model directory and re-run `ironmem setup`.
+- **`model` present but unreadable** → check file permissions on the model directory.
 - **`database` cannot be opened/read** → the store may be corrupt; check the path
   and that no other process holds a lock.
 - **`database` schema behind** (a `[WARN]`) → harmless; migrations apply

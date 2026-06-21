@@ -21,7 +21,7 @@ const COLLAB_GENERATION_LEASE_SQL: &str =
 const CODE_MAPS_SQL: &str = include_str!("../../migrations/011_code_maps.sql");
 
 /// Highest schema version a fully-migrated database reports. Bump alongside the
-/// `run_version_gated_migrations` ladder above so `ironmem doctor` can tell a
+/// `run_version_gated_migrations` ladder below so `ironmem doctor` can tell a
 /// behind-migration database from an up-to-date one.
 pub const LATEST_SCHEMA_VERSION: i64 = 11;
 

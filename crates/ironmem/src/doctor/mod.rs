@@ -144,6 +144,7 @@ fn check_database(db_path: &Path) -> Check {
     // must not mutate the store (no WAL switch, no chmod, no schema changes).
     let db = match Database::open_with_busy_timeout(db_path, Duration::from_millis(500)) {
         Ok(db) => db,
+        Err(e) if is_db_busy(&e) => return database_busy_check(&shown),
         Err(e) => {
             return Check::new(
                 "database",
@@ -172,6 +173,9 @@ fn check_database(db_path: &Path) -> Check {
             format!("schema v{v} is newer than this binary's v{LATEST_SCHEMA_VERSION} at {shown}"),
         )
         .with_hint("upgrade ironmem to match the database"),
+        // A transient busy/locked condition means the store is healthy but
+        // in use — report it as retryable, not as a blocking corruption.
+        Err(e) if is_db_busy(&e) => database_busy_check(&shown),
         Err(e) => Check::new(
             "database",
             CheckStatus::Error,
@@ -179,6 +183,33 @@ fn check_database(db_path: &Path) -> Check {
         )
         .with_hint("the database appears initialized but unreadable; it may be corrupt"),
     }
+}
+
+/// The non-blocking `[WARN]` for a database that is healthy but momentarily
+/// locked by another process (e.g. the MCP server mid-write).
+fn database_busy_check(shown: &std::path::Display) -> Check {
+    Check::new(
+        "database",
+        CheckStatus::Warn,
+        format!("database is in use by another process at {shown}"),
+    )
+    .with_hint("a running ironmem server holds the lock; re-run when it is idle")
+}
+
+/// True when a [`MemoryError`] is a transient SQLite busy/locked condition
+/// rather than a structural problem — so an in-use database is reported as a
+/// retryable warning instead of a blocking corruption error.
+fn is_db_busy(err: &crate::MemoryError) -> bool {
+    matches!(
+        err,
+        crate::MemoryError::Db(rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error {
+                code: rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked,
+                ..
+            },
+            _,
+        ))
+    )
 }
 
 /// Inspect the embedding-model cache.
@@ -328,7 +359,7 @@ fn harness_check(name: &'static str, label: &str, config: &Path, state: HarnessS
         HarnessState::Registered => Check::new(
             name,
             CheckStatus::Ok,
-            format!("{label}: ironmem MCP server registered"),
+            format!("{label}: ironmem MCP server registered in {shown}"),
         ),
         HarnessState::NotRegistered => Check::new(
             name,
@@ -452,6 +483,35 @@ mod tests {
         let c = check_database(&path);
         assert_eq!(c.status, CheckStatus::Warn);
         assert!(c.summary.contains("newer"));
+    }
+
+    #[test]
+    fn is_db_busy_classifies_only_busy_and_locked() {
+        let busy = crate::MemoryError::Db(rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(5), // SQLITE_BUSY
+            None,
+        ));
+        let locked = crate::MemoryError::Db(rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(6), // SQLITE_LOCKED
+            None,
+        ));
+        let corrupt = crate::MemoryError::Db(rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(11), // SQLITE_CORRUPT
+            None,
+        ));
+        assert!(is_db_busy(&busy));
+        assert!(is_db_busy(&locked));
+        assert!(!is_db_busy(&corrupt));
+        assert!(!is_db_busy(&crate::MemoryError::Validation("x".into())));
+    }
+
+    #[test]
+    fn database_busy_is_warn_not_blocking() {
+        let path = std::path::Path::new("/tmp/in-use.sqlite3");
+        let c = database_busy_check(&path.display());
+        assert_eq!(c.status, CheckStatus::Warn);
+        assert!(!c.status.is_blocking());
+        assert!(c.summary.contains("in use"));
     }
 
     #[test]

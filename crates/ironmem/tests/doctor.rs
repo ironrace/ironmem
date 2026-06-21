@@ -136,6 +136,36 @@ fn invalid_harness_config_warns_but_does_not_block() {
 }
 
 #[test]
+fn missing_database_is_warn_and_db_flag_is_honored() {
+    // No IRONMEM_DB_PATH; the DB path comes from the `--db` flag and points at a
+    // nonexistent file (the fresh-install state). It must be a non-blocking
+    // warning, exit 0.
+    let temp = tempfile::tempdir().unwrap();
+    let home = temp.path().join("home");
+    let missing_db = temp.path().join("does-not-exist.sqlite3");
+    std::fs::create_dir_all(&home).unwrap();
+
+    let out = Command::new(bin())
+        .env("HOME", &home)
+        .env("CODEX_HOME", home.join(".codex"))
+        .env("IRONMEM_EMBED_MODE", "noop")
+        .arg("doctor")
+        .arg("--db")
+        .arg(&missing_db)
+        .output()
+        .unwrap();
+
+    assert!(
+        out.status.success(),
+        "a missing database is a warning, not a blocking failure: {out:?}"
+    );
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    assert!(stdout.contains("[WARN]"));
+    assert!(stdout.contains("database not found"));
+    assert!(stdout.contains("no blocking failures"));
+}
+
+#[test]
 fn registered_harnesses_report_ok_end_to_end() {
     let temp = tempfile::tempdir().unwrap();
     let home = temp.path().join("home");
