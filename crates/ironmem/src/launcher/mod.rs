@@ -101,7 +101,6 @@ fn warm_best_effort(canonical: &Path) {
 }
 
 /// Entry point for the `claude` / `codex` subcommands.
-#[allow(dead_code)] // wired up in Task 5
 pub fn run_launcher(
     harness: Harness,
     repo: &str,
