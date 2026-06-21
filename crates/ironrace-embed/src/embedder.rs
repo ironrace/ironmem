@@ -48,7 +48,7 @@ const _: () = {
     );
 };
 
-/// Get the local model cache directory (~/.ironrace/models/all-MiniLM-L6-v2/).
+/// Get the local model cache directory (~/.ironrace/models/bge-base-en-v1.5/).
 pub fn model_cache_dir() -> Result<PathBuf> {
     let home = dirs::home_dir()
         .ok_or_else(|| anyhow::anyhow!("Could not determine home directory. Set HOME env var."))?;
@@ -60,6 +60,39 @@ fn model_files_exist(dir: &Path) -> bool {
     dir.join("model.onnx").exists() && dir.join("tokenizer.json").exists()
 }
 
+/// Non-mutating health of the model cache, for diagnostics (`ironmem doctor`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ModelStatus {
+    /// Both files present and checksums match the pinned values.
+    Ready,
+    /// One or both model files are absent.
+    Missing,
+    /// Files present but a checksum does not match (corrupt or tampered).
+    Corrupt,
+    /// Files present but could not be read (permissions, I/O error). The string
+    /// is the underlying error for display. Distinct from [`Corrupt`] so the
+    /// caller can recommend "check permissions" rather than "delete and
+    /// re-download".
+    Unreadable(String),
+}
+
+/// Classify the model cache directory without downloading or modifying it.
+///
+/// Unlike [`ensure_model_in_dir`], this never touches the network and never
+/// errors — it returns a [`ModelStatus`] suitable for reporting. A genuine
+/// checksum *mismatch* is [`ModelStatus::Corrupt`]; an I/O failure reading a
+/// present file is [`ModelStatus::Unreadable`].
+pub fn model_status(dir: &Path) -> ModelStatus {
+    if !model_files_exist(dir) {
+        return ModelStatus::Missing;
+    }
+    match verify_checksums(dir) {
+        Ok(true) => ModelStatus::Ready,
+        Ok(false) => ModelStatus::Corrupt,
+        Err(e) => ModelStatus::Unreadable(e.to_string()),
+    }
+}
+
 /// Compute SHA-256 hex digest of a file.
 fn sha256_file(path: &Path) -> Result<String> {
     let bytes = std::fs::read(path).context("Failed to read file for checksum")?;
@@ -68,30 +101,15 @@ fn sha256_file(path: &Path) -> Result<String> {
     Ok(format!("{:x}", hasher.finalize()))
 }
 
-/// Verify model file checksums. Returns Ok(true) if valid, Ok(false) if
-/// checksums don't match the pinned values (which may happen on first
-/// release before we've pinned the real hashes).
+/// Verify model file checksums against the pinned digests. Returns `Ok(true)`
+/// when both match, `Ok(false)` on any mismatch (corrupt or tampered file), and
+/// `Err` only when a file cannot be read. This function is side-effect-free so
+/// it is safe to call from the read-only diagnostic path (`model_status`);
+/// callers that want to report a mismatch do so themselves.
 fn verify_checksums(dir: &Path) -> Result<bool> {
     let model_hash = sha256_file(&dir.join("model.onnx"))?;
     let tokenizer_hash = sha256_file(&dir.join("tokenizer.json"))?;
-
-    if model_hash != MODEL_ONNX_SHA256 {
-        eprintln!(
-            "ERROR: model.onnx checksum mismatch.\n  Expected: {}\n  Got:      {}",
-            MODEL_ONNX_SHA256, model_hash
-        );
-        return Ok(false);
-    }
-
-    if tokenizer_hash != TOKENIZER_JSON_SHA256 {
-        eprintln!(
-            "ERROR: tokenizer.json checksum mismatch.\n  Expected: {}\n  Got:      {}",
-            TOKENIZER_JSON_SHA256, tokenizer_hash
-        );
-        return Ok(false);
-    }
-
-    Ok(true)
+    Ok(model_hash == MODEL_ONNX_SHA256 && tokenizer_hash == TOKENIZER_JSON_SHA256)
 }
 
 /// Download model files from HuggingFace Hub.
@@ -235,7 +253,7 @@ impl Embedder {
         }
     }
 
-    /// Embed a single text, returning a 384-dim vector.
+    /// Embed a single text, returning an [`EMBED_DIM`]-dimensional vector.
     pub fn embed_one(&mut self, text: &str) -> Result<Vec<f32>> {
         let results = self.embed_batch(&[text])?;
         debug_assert_eq!(
@@ -436,6 +454,34 @@ mod tests {
         assert!(dir
             .to_string_lossy()
             .contains(".ironrace/models/bge-base-en-v1.5"));
+    }
+
+    #[test]
+    fn model_status_missing_when_files_absent() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(model_status(dir.path()), ModelStatus::Missing);
+    }
+
+    #[test]
+    fn model_status_corrupt_when_checksums_mismatch() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("model.onnx"), b"not the real model").unwrap();
+        std::fs::write(dir.path().join("tokenizer.json"), b"not the real tokenizer").unwrap();
+        assert_eq!(model_status(dir.path()), ModelStatus::Corrupt);
+    }
+
+    #[test]
+    fn model_status_unreadable_when_present_file_cannot_be_read() {
+        // A "model.onnx" that exists (so files_exist is true) but is a directory
+        // rather than a file makes the checksum read fail with an I/O error,
+        // which must classify as Unreadable, not Corrupt.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("model.onnx")).unwrap();
+        std::fs::write(dir.path().join("tokenizer.json"), b"present").unwrap();
+        assert!(matches!(
+            model_status(dir.path()),
+            ModelStatus::Unreadable(_)
+        ));
     }
 
     #[test]

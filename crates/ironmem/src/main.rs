@@ -67,6 +67,15 @@ enum Commands {
         #[arg(long)]
         json: bool,
     },
+    /// Diagnose the local installation (binary, db, model, MCP mode, harnesses)
+    Doctor {
+        /// Path to the database
+        #[arg(long)]
+        db: Option<String>,
+        /// Emit JSON instead of text
+        #[arg(long)]
+        json: bool,
+    },
     /// Write the ironmem memory-protocol managed block into rules file(s) (explicit opt-in)
     WriteRules {
         /// Target file. Omit to write BOTH CLAUDE.md and AGENTS.md.
@@ -182,6 +191,21 @@ async fn run(cli: Cli) -> Result<(), MemoryError> {
                 println!("{}", serde_json::to_string_pretty(&report)?);
             } else {
                 println!("{}", report::render_text(&report));
+            }
+            Ok(())
+        }
+        Commands::Doctor { db, json } => {
+            let cfg = config::Config::load(db)?;
+            let report = ironmem::doctor::run_doctor(&cfg);
+            if json {
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            } else {
+                print!("{}", ironmem::doctor::render_text(&report));
+            }
+            // Diagnose-only: a clean run exits 0; blocking setup failures exit
+            // non-zero so scripts and CI can gate on `ironmem doctor`.
+            if report.has_blocking() {
+                process::exit(2);
             }
             Ok(())
         }

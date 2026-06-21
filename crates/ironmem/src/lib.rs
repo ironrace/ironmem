@@ -36,6 +36,9 @@ pub mod search;
 /// Lazy per-area code maps — freshness classification (issue #94).
 pub mod code_maps;
 
+/// `ironmem doctor` — local setup diagnostics (issue #142).
+pub mod doctor;
+
 pub mod write_rules;
 
 /// Canonical crate error type used by CLI, MCP, and storage layers.
