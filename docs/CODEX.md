@@ -193,6 +193,7 @@ Embedding-dependent tools (`search`, `add_drawer`, diary writes) return `{"warmi
 - `plugin.json`
 - `hooks.json`
 - wrapper scripts for the MCP server and hooks
+- the `/collab` command shim
 - Codex-specific README content
 - bundled collab skill dependencies under `skills/`
 

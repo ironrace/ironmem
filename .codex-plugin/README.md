@@ -9,6 +9,7 @@ Persistent workspace memory for Codex using the local Rust `ironmem` binary.
 - initializes a fresh store if no previous memory exists
 - mines the current workspace on first run
 - re-mines incrementally on `Stop` and `PreCompact`
+- installs the `/collab` command shim used by Codex
 - bundles the collab skills used by the Claude/Codex handoff flow
 
 ## Memory protocol
@@ -34,7 +35,7 @@ ironmem write-rules --target AGENTS.md
 - `pr-review-toolkit`
 
 Existing bundled copies are updated on install; pass `--skip-skills` to leave
-local skills, prompts, and commands untouched.
+local skills, commands, and prompts untouched.
 
 ## Notes
 

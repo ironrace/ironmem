@@ -75,7 +75,8 @@ IRONMEM_MCP_MODE = "trusted"
 
 Prebuilt macOS (arm64) and Linux (x86_64) binaries, with SHA-256 checksums, are attached to every [tagged release](https://github.com/ironrace/ironmem/releases).
 
-`scripts/install-ironmem.sh` also installs the bundled collab skill dependencies for both Codex and Claude Code:
+`scripts/install-ironmem.sh` also installs the Codex `/collab` command shim
+and the bundled collab skill dependencies for both Codex and Claude Code:
 
 - `writing-plans`
 - `subagent-driven-development`

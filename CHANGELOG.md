@@ -25,6 +25,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `scripts/install-ironmem.sh` now installs the Codex `/collab` command shim
+  into `~/.codex/commands/collab.md`, so a fresh install can resolve the
+  slash command without the legacy personal `ironmem-collab` plugin.
 - **UserPromptSubmit FTS-injection hook (Claude Code):** a new `user-prompt-submit`
   hook runs an FTS/BM25-only drawer search on **every** prompt and injects up to 3
   sanitized one-line untrusted-memory excerpts via
