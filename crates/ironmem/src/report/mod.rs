@@ -285,6 +285,18 @@ fn build_value_summary(
     mcp: McpResponseSizing,
     coverage: TranscriptCoverage,
 ) -> ValueSummary {
+    // The exploration aggregate is produced by trusted SQL; assert its
+    // cross-field invariants at the projection boundary so an upstream
+    // regression surfaces here (debug builds only — zero release cost).
+    debug_assert_eq!(
+        exploration.total_turns,
+        exploration.map_hit_turns + exploration.map_miss_turns,
+        "exploration turn counts must sum to total_turns",
+    );
+    debug_assert!(
+        (0.0..=1.0).contains(&exploration.hit_rate),
+        "hit_rate must be a fraction in [0, 1]",
+    );
     ValueSummary {
         min_turns: EXPLORATION_MIN_TURNS as i64,
         sufficient_data: exploration.total_turns >= EXPLORATION_MIN_TURNS as i64,
@@ -786,8 +798,9 @@ mod tests {
         assert_eq!(vs.total_turns, 1);
         assert!(!vs.sufficient_data, "1 turn < {EXPLORATION_MIN_TURNS}");
         assert_eq!(vs.map_hit_turns, 1);
-        // No transcript / mcp-of-its-own → indicators present (mcp_response has
-        // the 1 exploration row), transcript_coverage absent.
+        // The 1 exploration row is a `source='mcp_response'` row, so the MCP
+        // indicator is present; no transcript rows → coverage absent.
+        assert!(vs.mcp_response.is_some(), "mcp indicator present");
         assert!(vs.transcript_coverage.is_none());
     }
 
@@ -852,7 +865,8 @@ mod tests {
         assert_eq!(vs.map_hit_turns, 8);
         assert_eq!(vs.map_miss_turns, 2);
         assert!((vs.hit_rate - 0.8).abs() < 1e-9);
-        // delta = mean miss (75) - mean hit (25) = 50 tokens saved per hit turn.
+        // token-proxy delta = mean miss (75) - mean hit (25) = 50 (NOT a savings
+        // claim — a difference across disjoint turn populations).
         assert!((vs.exploration_token_delta - 50.0).abs() < 1e-9);
         // mcp_response indicator present (10 exploration rows are mcp_response).
         let mcp = vs.mcp_response.as_ref().expect("mcp sizing present");
@@ -863,6 +877,46 @@ mod tests {
             .as_ref()
             .expect("transcript coverage present");
         assert_eq!(cov.turn_count, 1);
+    }
+
+    /// issue #145: boundary-value test for the `>=` sufficiency gate. Exactly
+    /// `EXPLORATION_MIN_TURNS` turns must be sufficient; one fewer must not be.
+    /// Guards against a `>=`→`>` regression silently raising the floor.
+    #[test]
+    fn value_summary_sufficiency_at_exact_threshold_boundary() {
+        let seed = |n: usize| {
+            let db = Database::open_in_memory().unwrap();
+            for i in 0..n {
+                db.record_exploration_tokens(
+                    "2026-06-21T00:00:00Z",
+                    "claude",
+                    0,
+                    25,
+                    Some(MapStatus::Hit),
+                    Some(&format!("hit-{i}")),
+                    Some("core"),
+                )
+                .unwrap();
+            }
+            run_report(&db, &ReportOptions::default())
+                .unwrap()
+                .value_summary
+        };
+
+        let at = seed(EXPLORATION_MIN_TURNS);
+        assert_eq!(at.total_turns, EXPLORATION_MIN_TURNS as i64);
+        assert!(
+            at.sufficient_data,
+            "exactly {EXPLORATION_MIN_TURNS} is enough"
+        );
+
+        let below = seed(EXPLORATION_MIN_TURNS - 1);
+        assert_eq!(below.total_turns, EXPLORATION_MIN_TURNS as i64 - 1);
+        assert!(
+            !below.sufficient_data,
+            "{} turns is below the floor",
+            EXPLORATION_MIN_TURNS - 1
+        );
     }
 
     #[test]

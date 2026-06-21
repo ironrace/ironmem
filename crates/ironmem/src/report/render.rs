@@ -69,34 +69,50 @@ fn render_task_phases(out: &mut String, task: &TaskReport) {
 }
 
 /// Render the product-facing **Exploration value** section (issue #145). On a
-/// thin sample (`!sufficient_data`) it states so and never prints a savings
-/// headline; otherwise it leads with hit rate + the per-hit-turn token-proxy
-/// delta, then any recorded repeated-context indicators.
+/// thin sample (`!sufficient_data`) it states so and prints no headline. With a
+/// sufficient sample it leads with the hit rate, then a neutral map-hit-vs-
+/// map-miss token-proxy comparison — but only when BOTH verdict buckets are
+/// populated (the delta is a difference across disjoint turn populations, so a
+/// one-sided sample yields no meaningful comparison and the delta is withheld
+/// rather than presented as a savings figure). Then any recorded
+/// repeated-context indicators.
 fn render_value_summary(out: &mut String, vs: &ValueSummary) {
     if !vs.sufficient_data {
         let _ = writeln!(
             out,
-            "\nExploration value: not enough exploration data yet ({turns}/{min} turns) — collect more before reading savings.",
+            "\nExploration value: not enough exploration data yet ({turns}/{min} turns) — collect more before reading results.",
             turns = vs.total_turns,
             min = vs.min_turns,
         );
         return;
     }
 
-    let _ = writeln!(
-        out,
-        "\nExploration value: {hits}/{total} hit turns ({rate:.1}%) · ~{delta:.1} tokens saved per hit turn (proxy)",
+    let headline = format!(
+        "Exploration value: {hits}/{total} hit turns ({rate:.1}%)",
         hits = vs.map_hit_turns,
         total = vs.total_turns,
         rate = vs.hit_rate * 100.0,
-        delta = vs.exploration_token_delta,
     );
+    if vs.map_hit_turns > 0 && vs.map_miss_turns > 0 {
+        let _ = writeln!(
+            out,
+            "\n{headline} · map-hit ~{hit:.1} vs map-miss ~{miss:.1} tokens/turn (proxy; Δ {delta:.1})",
+            hit = vs.mean_tokens_map_hit,
+            miss = vs.mean_tokens_map_miss,
+            delta = vs.exploration_token_delta,
+        );
+    } else {
+        let _ = writeln!(
+            out,
+            "\n{headline} · token-proxy delta n/a (need both map-hit and map-miss turns)",
+        );
+    }
 
     // Repeated-context indicators, only when their underlying rows were recorded.
     if let Some(mcp) = &vs.mcp_response {
         let _ = writeln!(
             out,
-            "  MCP responses: {count} calls · mean {mean:.1} tokens (response-size proxy)",
+            "  MCP responses (all calls): {count} · mean {mean:.1} tokens (response-size proxy)",
             count = mcp.row_count,
             mean = mcp.mean_output_tokens,
         );
@@ -380,10 +396,12 @@ mod tests {
         );
     }
 
-    /// issue #145: with a sufficient sample, the value section presents the
-    /// hit rate and the per-hit-turn token-proxy delta.
+    /// issue #145: with a sufficient sample and BOTH verdict buckets populated,
+    /// the value section presents the hit rate and a neutral map-hit-vs-map-miss
+    /// token-proxy comparison — never the overclaiming word "saved". When no
+    /// transcript rows exist, the transcript-coverage line must be omitted.
     #[test]
-    fn render_text_value_summary_reports_savings_when_sufficient() {
+    fn render_text_value_summary_reports_comparison_when_sufficient() {
         use crate::db::metrics::MapStatus;
         let db = Database::open_in_memory().unwrap();
         for i in 0..8 {
@@ -416,12 +434,52 @@ mod tests {
             text.contains("Exploration value"),
             "section present: {text}"
         );
-        assert!(text.contains("tokens saved"), "savings headline: {text}");
         assert!(text.contains("80.0%"), "hit rate rendered: {text}");
+        assert!(
+            text.contains("map-hit") && text.contains("map-miss"),
+            "neutral token-proxy comparison present: {text}"
+        );
+        // Must NOT overclaim with the word "saved" (issue #145 scope).
+        assert!(!text.contains("saved"), "no 'saved' overclaim: {text}");
         assert!(
             !text.contains("not enough"),
             "no insufficient notice: {text}"
         );
+        // No transcript rows seeded → indicator line omitted (absent-branch).
+        assert!(
+            !text.contains("Transcript coverage"),
+            "transcript indicator omitted when no rows: {text}"
+        );
+    }
+
+    /// issue #145: a sufficient sample that is one-sided (all hits, no misses)
+    /// must NOT present a numeric token-proxy delta headline — the difference is
+    /// across disjoint turn populations, so the renderer says it is n/a.
+    #[test]
+    fn render_text_value_summary_delta_na_when_one_sided() {
+        use crate::db::metrics::MapStatus;
+        let db = Database::open_in_memory().unwrap();
+        for i in 0..8 {
+            db.record_exploration_tokens(
+                "2026-06-21T00:00:00Z",
+                "claude",
+                0,
+                25,
+                Some(MapStatus::Hit),
+                Some(&format!("hit-{i}")),
+                Some("core"),
+            )
+            .unwrap();
+        }
+        let report = crate::report::run_report(&db, &Default::default()).unwrap();
+        let text = crate::report::render_text(&report);
+        // Sufficient (8 ≥ 8) so still a headline, but delta is withheld.
+        assert!(text.contains("100.0%"), "hit rate rendered: {text}");
+        assert!(
+            text.contains("delta n/a") || text.contains("delta unavailable"),
+            "one-sided sample withholds the delta: {text}"
+        );
+        assert!(!text.contains("saved"), "no 'saved' overclaim: {text}");
     }
 
     #[test]

@@ -836,12 +836,15 @@ existing §10 Phase-5 `exploration` aggregate plus two repeated-context indicato
 - `sufficient_data` (bool) — `total_turns >= min_turns`. **Only when true should a
   savings headline be read.**
 - `total_turns`, `map_hit_turns`, `map_miss_turns` (int) — distinct exploration
-  turns and their per-turn verdicts (same definitions as §10 / the §94 amendment).
+  turns and their per-turn verdicts (same definitions as §10 / the 2026-06-15 issue #94 amendment).
 - `hit_rate` (float) — `map_hit_turns / total_turns`.
 - `mean_tokens_map_hit`, `mean_tokens_map_miss` (float) — per-turn token proxy
-  (v0 = response-size `ceil(chars/4)`; see the 2026-06-15 §94 amendment).
+  (v0 = response-size `ceil(chars/4)`; see the 2026-06-15 issue #94 amendment).
 - `exploration_token_delta` (float) — `mean_tokens_map_miss - mean_tokens_map_hit`.
-  A token-proxy difference per hit turn, **not** a percentage-savings claim.
+  A token-proxy difference across disjoint turn populations, **not** a measured
+  saving and **not** a percentage-savings claim. JSON always carries the raw
+  value; the **text** renderer withholds it (shows `delta n/a`) when either
+  verdict bucket is empty, since a one-sided sample yields no comparison.
 - `mcp_response` (object|null) — repeated-context indicator over all
   `source='mcp_response'` rows: `{ row_count, total_output_tokens, mean_output_tokens }`.
   `null` when none recorded.
@@ -850,7 +853,7 @@ existing §10 Phase-5 `exploration` aggregate plus two repeated-context indicato
 
 **Too-little-data behaviour.** Below `min_turns` exploration turns the text renderer
 prints `Exploration value: not enough exploration data yet (N/min turns) — collect
-more before reading savings.` and the JSON sets `sufficient_data=false` while still
+more before reading results.` and the JSON sets `sufficient_data=false` while still
 exposing every field (the counts are honest; only the *headline* is withheld).
 
 **Threshold.** `EXPLORATION_MIN_TURNS = 8` (`crates/ironmem/src/report/mod.rs`),
