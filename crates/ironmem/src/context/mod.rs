@@ -6,8 +6,10 @@ use std::path::PathBuf;
 
 use serde::Serialize;
 
+use crate::code_maps::freshness::{classify, Freshness};
 use crate::error::MemoryError;
 use crate::mcp::app::App;
+use crate::sanitize::sanitize_name;
 
 pub mod render;
 
@@ -89,16 +91,84 @@ pub struct ContextPack {
 /// skeleton returns an empty-but-well-formed pack.
 pub fn run_context(app: &App, opts: &ContextPackOptions) -> Result<ContextPack, MemoryError> {
     let repo = canonical_repo(&opts.repo);
-    let _ = app; // used by later tasks
+    let repo_path = std::path::Path::new(&repo);
+    let areas: Vec<AreaContext> = opts
+        .areas
+        .iter()
+        .map(|raw| AreaContext {
+            area: raw.clone(),
+            status: resolve_area(app, &repo, repo_path, raw),
+        })
+        .collect();
     Ok(ContextPack {
         task: opts.task.clone(),
         repo,
         budget_tokens: opts.budget_tokens,
         memory_hits: Vec::new(),
         decisions: Vec::new(),
-        areas: Vec::new(),
+        areas,
         truncated: false,
     })
+}
+
+/// Resolve one requested area into its freshness-tagged status.
+fn resolve_area(app: &App, repo: &str, repo_path: &std::path::Path, raw_area: &str) -> AreaStatus {
+    let area = match sanitize_name(raw_area, "area") {
+        Ok(a) => a,
+        Err(_) => {
+            return AreaStatus::Missing {
+                reason: format!(
+                    "invalid area name '{raw_area}'; scout required (areas are short names, no slashes)"
+                ),
+            }
+        }
+    };
+
+    let map = match app.db.get_code_map(repo, &area) {
+        Ok(Some(m)) => m,
+        Ok(None) => {
+            return AreaStatus::Missing {
+                reason: format!("no code map for area '{area}'; scout required"),
+            }
+        }
+        Err(e) => {
+            return AreaStatus::Missing {
+                reason: format!("code map lookup failed for '{area}': {e}; scout required"),
+            }
+        }
+    };
+
+    match classify(&map, repo_path) {
+        Freshness::Fresh => {
+            let summary = app
+                .db
+                .get_drawer(&map.drawer_id)
+                .ok()
+                .flatten()
+                .map(|d| d.content)
+                .unwrap_or_default();
+            AreaStatus::Fresh {
+                head_sha: short_sha(&map.head_sha),
+                source_file_count: map.source_files.len(),
+                summary,
+            }
+        }
+        Freshness::Stale { changed_files } => AreaStatus::Stale {
+            head_sha: short_sha(&map.head_sha),
+            changed_files,
+            refresh_recommendation:
+                "source files changed since this map was built; re-scout this area before trusting it"
+                    .to_string(),
+        },
+        Freshness::RescoutRequired { reason } => AreaStatus::Missing {
+            reason: format!("{reason}; scout required"),
+        },
+    }
+}
+
+/// First 7 characters of a SHA, or the whole string if shorter.
+fn short_sha(sha: &str) -> String {
+    sha.chars().take(7).collect()
 }
 
 /// Canonicalize the repo path for code-map lookup; fall back to the raw
