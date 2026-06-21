@@ -294,3 +294,55 @@ fn context_surfaces_decisions_for_requested_area() {
     assert_eq!(decision["subject"].as_str(), Some("collab"));
     assert_eq!(decision["object"].as_str(), Some("bounded planning v3"));
 }
+
+#[test]
+fn context_tiny_budget_sets_truncated_flag() {
+    let temp = tempfile::tempdir().unwrap();
+    let home = temp.path().join("home");
+    let db_path = temp.path().join("ctx_budget.sqlite3");
+    std::fs::create_dir_all(&home).unwrap();
+    {
+        let db = ironmem::db::schema::Database::open(&db_path).unwrap();
+        db.migrate().unwrap();
+        // Seed 6 drawers that all lexically match the task query.
+        for i in 0..6 {
+            let content =
+                format!("metrics reporting note number {i} with extra padding words here");
+            let wing = "ironmem";
+            let room = "docs";
+            let drawer_id = ironmem::db::drawers::generate_id(&content, wing, room);
+            let embedding = vec![0.0f32; ironrace_embed::embedder::EMBED_DIM];
+            db.insert_drawer(
+                &drawer_id,
+                &content,
+                &embedding,
+                wing,
+                room,
+                "report.rs",
+                "test",
+            )
+            .unwrap();
+        }
+    }
+
+    let out = context_command(&home, &db_path)
+        .arg("--repo")
+        .arg(temp.path())
+        .arg("--task")
+        .arg("metrics reporting note")
+        .arg("--budget")
+        .arg("10")
+        .arg("--json")
+        .output()
+        .unwrap();
+
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let value: serde_json::Value =
+        serde_json::from_str(&String::from_utf8(out.stdout).unwrap()).unwrap();
+    assert_eq!(value["truncated"].as_bool(), Some(true));
+    assert!(value["memory_hits"].as_array().unwrap().len() < 6);
+}

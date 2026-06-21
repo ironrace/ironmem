@@ -116,7 +116,7 @@ pub fn run_context(app: &App, opts: &ContextPackOptions) -> Result<ContextPack, 
         room: None,
         limit: MAX_MEMORY_HITS,
     };
-    let memory_hits: Vec<MemoryHit> = match search(app, &opts.task, &filters) {
+    let mut memory_hits: Vec<MemoryHit> = match search(app, &opts.task, &filters) {
         Ok(result) => result
             .results
             .into_iter()
@@ -170,6 +170,7 @@ pub fn run_context(app: &App, opts: &ContextPackOptions) -> Result<ContextPack, 
             }
         }
     }
+    let truncated = bound_memory_hits(&mut memory_hits, opts.budget_tokens);
     Ok(ContextPack {
         task: opts.task.clone(),
         repo,
@@ -177,7 +178,7 @@ pub fn run_context(app: &App, opts: &ContextPackOptions) -> Result<ContextPack, 
         memory_hits,
         decisions,
         areas,
-        truncated: false,
+        truncated,
     })
 }
 
@@ -234,6 +235,30 @@ fn resolve_area(app: &App, repo: &str, repo_path: &std::path::Path, raw_area: &s
             reason: format!("{reason}; scout required"),
         },
     }
+}
+
+/// Approximate tokens for a string (chars / 4, the common rough heuristic).
+fn approx_tokens(s: &str) -> usize {
+    s.chars().count().div_ceil(4)
+}
+
+/// Drop the lowest-ranked memory hits until their combined snippet token cost
+/// fits within the budget. Always keeps at least one hit if any exist. Returns
+/// true when one or more hits were dropped.
+fn bound_memory_hits(hits: &mut Vec<MemoryHit>, budget_tokens: usize) -> bool {
+    let original = hits.len();
+    let mut running = 0usize;
+    let mut keep = 0usize;
+    for h in hits.iter() {
+        let cost = approx_tokens(&h.snippet);
+        if keep > 0 && running + cost > budget_tokens {
+            break;
+        }
+        running += cost;
+        keep += 1;
+    }
+    hits.truncate(keep);
+    hits.len() < original
 }
 
 /// First 7 characters of a SHA, or the whole string if shorter.
@@ -296,5 +321,33 @@ mod tests {
         // Bounded to the cap plus the single-char ellipsis.
         assert_eq!(out.chars().count(), SNIPPET_MAX_CHARS + 1);
         assert!(out.ends_with('…'));
+    }
+
+    fn hit(id: &str) -> MemoryHit {
+        MemoryHit {
+            id: id.to_string(),
+            wing: "w".to_string(),
+            room: "r".to_string(),
+            score: 1.0,
+            snippet: "x".repeat(SNIPPET_MAX_CHARS),
+        }
+    }
+
+    #[test]
+    fn bound_to_budget_drops_excess_hits_and_sets_flag() {
+        let mut hits = vec![hit("a"), hit("b"), hit("c"), hit("d"), hit("e")];
+        let truncated = bound_memory_hits(&mut hits, 60);
+        assert!(truncated);
+        assert!(hits.len() < 5);
+        assert!(!hits.is_empty());
+        assert_eq!(hits[0].id, "a"); // highest-ranked retained
+    }
+
+    #[test]
+    fn bound_to_budget_keeps_all_when_generous() {
+        let mut hits = vec![hit("a"), hit("b")];
+        let truncated = bound_memory_hits(&mut hits, DEFAULT_BUDGET_TOKENS);
+        assert!(!truncated);
+        assert_eq!(hits.len(), 2);
     }
 }
