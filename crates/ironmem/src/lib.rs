@@ -8,6 +8,8 @@ pub mod bootstrap;
 pub mod collab;
 /// Configuration loading and environment-variable overrides.
 pub mod config;
+/// Task context packs — bounded memory/decisions/code-map view (issue #144).
+pub mod context;
 /// SQLite-backed persistence for drawers, WAL events, and graph state.
 pub mod db;
 /// Durable diary entry APIs layered on the shared memory store.

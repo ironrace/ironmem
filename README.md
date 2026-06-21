@@ -158,6 +158,50 @@ Codex's config location honors `CODEX_HOME` (default `~/.codex/config.toml`);
 Claude Code's is `~/.claude.json`. `doctor` reports each harness independently,
 so you do **not** need both installed.
 
+### `ironmem context`
+
+Assemble a compact, bounded **task context pack** before you open a coding
+session: relevant memory, known decisions, and per-area code-map freshness, all
+trimmed to fit a token budget so you can paste it into a session as a starting
+brief:
+
+```bash
+# Human-readable, with two code-map areas
+ironmem context --repo . --task "refactor collab handoff validation" \
+  --area collab --area metrics
+
+# JSON for tooling, with an explicit token budget
+ironmem context --repo . --task "explain metrics reporting" --budget 1500 --json
+```
+
+Flags:
+
+- `--task <text>` (**required**) — task description that drives memory recall.
+- `--repo <path>` (default `.`) — repository root for code-map lookup.
+- `--area <name>` (repeatable) — code-map area to include. Areas are short
+  names (e.g. `collab`), **not paths**; pass `--area` once per area.
+- `--budget <tokens>` (default `2000`) — approximate output token budget.
+  Memory hits are trimmed to fit; when any are dropped a truncation notice
+  (`memory hits truncated to fit`) appears on the budget line.
+- `--db <path>` — optional database path override (as with `report` / `doctor`).
+- `--json` — emit JSON instead of text.
+
+**Reading the output** — three sections:
+
+- **Known decisions** — drawn from the knowledge graph for the requested areas.
+- **Relevant memory** — semantic/lexical recall hits, each trimmed to a short
+  snippet. With a small `--budget`, lower-ranked hits are dropped (the
+  truncation notice fires).
+- **Code maps** — per area, a **pointer** to where things live, **not** an
+  authoritative fact. Always verify in source after navigating:
+  - `FRESH` — none of the map's source files changed since the map was built
+    (the shown SHA is the build commit, not necessarily repo `HEAD`); use it to
+    navigate, then confirm in source.
+  - `STALE` — the listed files changed since the map was built; re-scout that
+    area first.
+  - `SCOUT REQUIRED` — no usable map (missing, an invalid area name, or an
+    untrustable git state); explore the area before relying on memory for it.
+
 ## Current Status
 
 - MCP server works over stdio with non-blocking startup (responds to `initialize` in <25 ms)

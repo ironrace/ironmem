@@ -2,7 +2,7 @@ use clap::{Parser, Subcommand};
 use std::process;
 
 use ironmem::MemoryError;
-use ironmem::{bootstrap, config, ingest, mcp, migrate, reembed, report};
+use ironmem::{bootstrap, config, context, ingest, mcp, migrate, reembed, report};
 
 #[derive(Parser)]
 #[command(
@@ -72,6 +72,27 @@ enum Commands {
         /// Path to the database
         #[arg(long)]
         db: Option<String>,
+        /// Emit JSON instead of text
+        #[arg(long)]
+        json: bool,
+    },
+    /// Assemble a compact context pack for a task (memory + decisions + code maps)
+    Context {
+        /// Path to the database
+        #[arg(long)]
+        db: Option<String>,
+        /// Repository root for code-map lookup
+        #[arg(long, default_value = ".")]
+        repo: String,
+        /// Task description driving memory recall
+        #[arg(long)]
+        task: String,
+        /// Code-map area to include (repeatable)
+        #[arg(long = "area")]
+        areas: Vec<String>,
+        /// Approximate output token budget
+        #[arg(long, default_value_t = ironmem::context::DEFAULT_BUDGET_TOKENS)]
+        budget: usize,
         /// Emit JSON instead of text
         #[arg(long)]
         json: bool,
@@ -206,6 +227,30 @@ async fn run(cli: Cli) -> Result<(), MemoryError> {
             // non-zero so scripts and CI can gate on `ironmem doctor`.
             if report.has_blocking() {
                 process::exit(2);
+            }
+            Ok(())
+        }
+        Commands::Context {
+            db,
+            repo,
+            task,
+            areas,
+            budget,
+            json,
+        } => {
+            let cfg = config::Config::load(db)?;
+            let app = mcp::app::App::new(cfg)?;
+            let opts = context::ContextPackOptions {
+                repo: std::path::PathBuf::from(repo),
+                task,
+                areas,
+                budget_tokens: budget,
+            };
+            let pack = context::run_context(&app, &opts)?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&pack)?);
+            } else {
+                print!("{}", context::render::render_text(&pack));
             }
             Ok(())
         }
