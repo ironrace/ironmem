@@ -88,6 +88,11 @@ pub struct AreaContext {
 }
 
 /// The assembled, bounded context pack.
+///
+/// Produced only by [`run_context`]; there is no other constructor and no
+/// public builder. The `truncated` field is derived state — it is set by
+/// [`bound_memory_hits`] from `memory_hits` and is never independently
+/// authored — so `run_context` is the single owner of that invariant.
 #[derive(Debug, Clone, Serialize, PartialEq)]
 pub struct ContextPack {
     pub task: String,
@@ -98,19 +103,33 @@ pub struct ContextPack {
     pub areas: Vec<AreaContext>,
     /// True when budget bounding dropped one or more memory hits.
     pub truncated: bool,
+    /// Non-fatal degradations encountered while assembling the pack (recall
+    /// errors, entity-resolution errors, repo-canonicalization failure). Empty
+    /// on a fully successful run. Surfaced in both JSON and text output.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub warnings: Vec<String>,
 }
 
 /// Assemble a context pack: relevant memory hits, per-area code-map freshness,
 /// and known decisions, bounded to the requested token budget.
 pub fn run_context(app: &App, opts: &ContextPackOptions) -> Result<ContextPack, MemoryError> {
-    let repo = canonical_repo(&opts.repo);
+    let mut warnings: Vec<String> = Vec::new();
+    let (repo, repo_canonical) = canonical_repo(&opts.repo);
+    if !repo_canonical {
+        let msg = format!(
+            "repo path '{}' could not be canonicalized; code-map lookup may miss all areas — verify --repo",
+            opts.repo.display()
+        );
+        eprintln!("context: {msg}");
+        warnings.push(msg);
+    }
     let repo_path = std::path::Path::new(&repo);
     let areas: Vec<AreaContext> = opts
         .areas
         .iter()
         .map(|raw| AreaContext {
             area: raw.clone(),
-            status: resolve_area(app, &repo, repo_path, raw),
+            status: resolve_area(app, &repo, repo_path, raw, &mut warnings),
         })
         .collect();
     let filters = SearchFilters {
@@ -136,6 +155,7 @@ pub fn run_context(app: &App, opts: &ContextPackOptions) -> Result<ContextPack, 
         // Recall is best-effort context, never a hard failure for the pack.
         Err(e) => {
             eprintln!("context: memory recall failed, continuing without hits: {e}");
+            warnings.push(format!("memory recall failed: {e}"));
             Vec::new()
         }
     };
@@ -157,6 +177,7 @@ pub fn run_context(app: &App, opts: &ContextPackOptions) -> Result<ContextPack, 
             Err(MemoryError::NotFound(_)) => continue,
             Err(e) => {
                 eprintln!("context: entity resolution skipped for area '{name}': {e}");
+                warnings.push(format!("entity resolution failed for area '{name}': {e}"));
                 continue;
             }
         };
@@ -164,14 +185,15 @@ pub fn run_context(app: &App, opts: &ContextPackOptions) -> Result<ContextPack, 
             Ok(t) => t,
             Err(e) => {
                 eprintln!("context: decision recall failed for area '{name}', continuing: {e}");
+                warnings.push(format!("decision recall failed for area '{name}': {e}"));
                 continue;
             }
         };
         for t in triples {
             let key = (t.subject.clone(), t.predicate.clone(), t.object.clone());
             if seen.insert(key) {
-                let subject = resolve_entity_name(&kg, &mut name_cache, t.subject);
-                let object = resolve_entity_name(&kg, &mut name_cache, t.object);
+                let subject = resolve_entity_name(&kg, &mut name_cache, t.subject, &mut warnings);
+                let object = resolve_entity_name(&kg, &mut name_cache, t.object, &mut warnings);
                 decisions.push(DecisionHit {
                     subject,
                     predicate: t.predicate,
@@ -189,11 +211,18 @@ pub fn run_context(app: &App, opts: &ContextPackOptions) -> Result<ContextPack, 
         decisions,
         areas,
         truncated,
+        warnings,
     })
 }
 
 /// Resolve one requested area into its freshness-tagged status.
-fn resolve_area(app: &App, repo: &str, repo_path: &std::path::Path, raw_area: &str) -> AreaStatus {
+fn resolve_area(
+    app: &App,
+    repo: &str,
+    repo_path: &std::path::Path,
+    raw_area: &str,
+    warnings: &mut Vec<String>,
+) -> AreaStatus {
     let area = match sanitize_name(raw_area, "area") {
         Ok(a) => a,
         Err(_) => {
@@ -221,13 +250,20 @@ fn resolve_area(app: &App, repo: &str, repo_path: &std::path::Path, raw_area: &s
 
     match classify(&map, repo_path) {
         Freshness::Fresh => {
-            let summary = app
-                .db
-                .get_drawer(&map.drawer_id)
-                .ok()
-                .flatten()
-                .map(|d| bound_summary(&d.content))
-                .unwrap_or_default();
+            // Missing-drawer (`Ok(None)`) is a benign dangling reference; a real
+            // lookup `Err` is a degradation worth surfacing, but the area is
+            // still Fresh so we fall back to an empty summary either way.
+            let summary = match app.db.get_drawer(&map.drawer_id) {
+                Ok(Some(d)) => bound_summary(&d.content),
+                Ok(None) => String::new(),
+                Err(e) => {
+                    eprintln!(
+                        "context: summary fetch failed for area '{area}', continuing without it: {e}"
+                    );
+                    warnings.push(format!("summary fetch failed for area '{area}': {e}"));
+                    String::new()
+                }
+            };
             AreaStatus::Fresh {
                 head_sha: short_sha(&map.head_sha),
                 source_file_count: map.source_files.len(),
@@ -297,12 +333,17 @@ fn snippet(content: &str) -> String {
     }
 }
 
-/// Canonicalize the repo path for code-map lookup; fall back to the raw
-/// lossy path when canonicalization fails (e.g. path does not exist).
-fn canonical_repo(repo: &std::path::Path) -> String {
-    std::fs::canonicalize(repo)
-        .map(|p| p.to_string_lossy().into_owned())
-        .unwrap_or_else(|_| repo.to_string_lossy().into_owned())
+/// Canonicalize the repo path for code-map lookup. Returns
+/// `(path, canonicalized)` where `canonicalized` is `true` only when
+/// `std::fs::canonicalize` succeeded. On failure (e.g. the path does not
+/// exist) it returns the raw lossy path with `false`, so the caller can warn
+/// that the fallback key may never match the canonical key used at code-map
+/// write time (which would silently miss every area).
+fn canonical_repo(repo: &std::path::Path) -> (String, bool) {
+    match std::fs::canonicalize(repo) {
+        Ok(p) => (p.to_string_lossy().into_owned(), true),
+        Err(_) => (repo.to_string_lossy().into_owned(), false),
+    }
 }
 
 /// Resolve a KG entity id to its display name, memoized. Falls back to the raw
@@ -311,13 +352,23 @@ fn resolve_entity_name(
     kg: &KnowledgeGraph,
     cache: &mut HashMap<String, String>,
     id: String,
+    warnings: &mut Vec<String>,
 ) -> String {
     if let Some(name) = cache.get(&id) {
         return name.clone();
     }
     let name = match kg.get_entity(&id) {
         Ok(Some(entity)) => entity.name,
-        _ => id.clone(),
+        // `Ok(None)` is a benign dangling reference (the triple points at an
+        // entity row that no longer exists) — fall back silently to the id.
+        Ok(None) => id.clone(),
+        // A real lookup error is a degradation worth surfacing before we fall
+        // back to the raw id.
+        Err(e) => {
+            eprintln!("context: entity name lookup failed for '{id}', using id: {e}");
+            warnings.push(format!("entity name lookup failed for '{id}': {e}"));
+            id.clone()
+        }
     };
     cache.insert(id, name.clone());
     name
@@ -374,6 +425,18 @@ mod tests {
         assert!(hits.len() < 5);
         assert!(!hits.is_empty());
         assert_eq!(hits[0].id, "a"); // highest-ranked retained
+    }
+
+    #[test]
+    fn bound_to_budget_keeps_first_hit_even_when_it_exceeds_budget() {
+        // A single hit whose snippet alone blows a tiny budget must still be
+        // kept (keep-at-least-one), and nothing was actually dropped, so the
+        // returned flag is false.
+        let mut hits = vec![hit("only")];
+        let truncated = bound_memory_hits(&mut hits, 1);
+        assert_eq!(hits.len(), 1);
+        assert!(!truncated);
+        assert_eq!(hits[0].id, "only");
     }
 
     #[test]

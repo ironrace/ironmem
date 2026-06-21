@@ -455,6 +455,114 @@ fn context_tiny_budget_sets_truncated_flag() {
 }
 
 #[test]
+fn context_invalid_slash_area_reports_missing_invalid_area_name() {
+    // An area name containing a slash is rejected by sanitize_name (path
+    // traversal guard); the area must surface as Missing with a reason that
+    // names the invalid-area-name rejection, not a generic "no code map".
+    let temp = tempfile::tempdir().unwrap();
+    let home = temp.path().join("home");
+    let db_path = temp.path().join("ctx_invalid.sqlite3");
+    std::fs::create_dir_all(&home).unwrap();
+    {
+        let db = ironmem::db::schema::Database::open(&db_path).unwrap();
+        db.migrate().unwrap();
+    }
+
+    let out = context_command(&home, &db_path)
+        .arg("--repo")
+        .arg(temp.path())
+        .arg("--task")
+        .arg("touch invalid")
+        .arg("--area")
+        .arg("a/b")
+        .arg("--json")
+        .output()
+        .unwrap();
+
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let value: serde_json::Value =
+        serde_json::from_str(&String::from_utf8(out.stdout).unwrap()).unwrap();
+    let areas = value["areas"].as_array().unwrap();
+    assert_eq!(areas.len(), 1);
+    assert_eq!(areas[0]["status"].as_str(), Some("missing"));
+    assert!(
+        areas[0]["reason"]
+            .as_str()
+            .unwrap()
+            .to_lowercase()
+            .contains("invalid area name"),
+        "expected reason to flag the invalid area name, got {:?}",
+        areas[0]["reason"]
+    );
+}
+
+#[test]
+fn context_same_area_requested_twice_dedups_decision() {
+    // Requesting the same area name twice must yield two area entries (one per
+    // request) but the underlying decision triple must appear exactly once —
+    // the (subject, predicate, object) dedup guards against duplicates.
+    let temp = tempfile::tempdir().unwrap();
+    let home = temp.path().join("home");
+    let db_path = temp.path().join("ctx_dedup.sqlite3");
+    std::fs::create_dir_all(&home).unwrap();
+    {
+        let db = ironmem::db::schema::Database::open(&db_path).unwrap();
+        db.migrate().unwrap();
+        let kg = ironmem::db::knowledge_graph::KnowledgeGraph::new(&db);
+        kg.add_triple(
+            "collab",
+            "area",
+            "uses_state_machine",
+            "bounded planning v3",
+            "design",
+            None,
+            1.0,
+            None,
+        )
+        .unwrap();
+    }
+
+    let out = context_command(&home, &db_path)
+        .arg("--repo")
+        .arg(temp.path())
+        .arg("--task")
+        .arg("change collab")
+        .arg("--area")
+        .arg("collab")
+        .arg("--area")
+        .arg("collab")
+        .arg("--json")
+        .output()
+        .unwrap();
+
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let value: serde_json::Value =
+        serde_json::from_str(&String::from_utf8(out.stdout).unwrap()).unwrap();
+    // Two requests → two area entries.
+    let areas = value["areas"].as_array().unwrap();
+    assert_eq!(areas.len(), 2);
+    // But the decision is deduped to a single occurrence.
+    let decisions = value["decisions"].as_array().unwrap();
+    let matches: Vec<_> = decisions
+        .iter()
+        .filter(|d| d["predicate"].as_str() == Some("uses_state_machine"))
+        .collect();
+    assert_eq!(
+        matches.len(),
+        1,
+        "expected the decision exactly once after dedup, got {decisions:?}"
+    );
+}
+
+#[test]
 fn context_text_marks_fresh_maps_as_pointers_and_missing_as_scout() {
     let temp = tempfile::tempdir().unwrap();
     let home = temp.path().join("home");

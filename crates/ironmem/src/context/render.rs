@@ -82,6 +82,14 @@ pub fn render_text(pack: &ContextPack) -> String {
         }
     }
 
+    // Only emit the Warnings section when there are degradations to report.
+    if !pack.warnings.is_empty() {
+        out.push_str("\n## Warnings\n");
+        for w in &pack.warnings {
+            let _ = writeln!(out, "  - {w}");
+        }
+    }
+
     out
 }
 
@@ -99,6 +107,7 @@ mod tests {
             decisions: Vec::new(),
             areas,
             truncated: false,
+            warnings: Vec::new(),
         }
     }
 
@@ -166,5 +175,23 @@ mod tests {
         pack.truncated = true;
         let text = render_text(&pack);
         assert!(text.contains("budget: ~2000 tokens (memory hits truncated to fit)"));
+    }
+
+    #[test]
+    fn warnings_section_renders_only_when_present() {
+        // No warnings → no Warnings section header.
+        let clean = base_pack(Vec::new());
+        assert!(!render_text(&clean).contains("## Warnings"));
+
+        // With warnings → header plus each warning listed.
+        let mut pack = base_pack(Vec::new());
+        pack.warnings = vec![
+            "memory recall failed: boom".to_string(),
+            "repo path '/x' could not be canonicalized".to_string(),
+        ];
+        let text = render_text(&pack);
+        assert!(text.contains("## Warnings"));
+        assert!(text.contains("  - memory recall failed: boom"));
+        assert!(text.contains("  - repo path '/x' could not be canonicalized"));
     }
 }
