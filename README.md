@@ -92,7 +92,14 @@ Codex also receives the `pr-review-toolkit` skill used by the `/collab`
 `review_fix_global` turn before Codex fans confirmed fixes out to
 subagents and Claude runs `/ultrareview-local`.
 
-Existing identical skills are skipped. Existing bundled skills, agents, commands, and prompts that differ are updated to the packaged copies; use `--skip-skills` when you only want to replace the binary or preserve local copies.
+Existing identical files are skipped. The installer records hidden packaged
+baselines under each target root's `.ironmem-bases/` directory; on later
+installs it three-way merges packaged updates into locally edited skills,
+agents, commands, and prompts. If no baseline exists, the target is a symlink,
+or a merge conflict occurs, the local file is left unchanged and the packaged
+update is written next to it as `*.ironmem-packaged` (conflict drafts use
+`*.ironmem-merge-conflict`). Use `--skip-skills` when you only want to replace
+the binary or leave local copies untouched.
 For Claude Code, the installer also installs the `code-reviewer` agent used by the vendored review flow.
 
 ## CLI

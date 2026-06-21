@@ -79,8 +79,8 @@ Options:
   --skip-wiring    Do not register the ironmem MCP server in Claude/Codex
                    config or warn about missing /ultrareview-local.
   --force-skills   Compatibility flag. Bundled skill/agent/command/prompt
-                   files are updated by default; use --skip-skills to leave
-                   existing copies untouched.
+                   files are merged with packaged updates by default; use
+                   --skip-skills to leave existing copies untouched.
   --force-wiring   Replace an existing 'ironmem' MCP entry in
                    ~/.claude.json or ~/.codex/config.toml with the bundled one
                    (use only when the config has drifted from a fresh install).
@@ -167,9 +167,13 @@ install_skill_set() {
   for skill in "${skills[@]}"; do
     local source="$source_root/$skill"
     local target="$target_root/$skill"
+    local base="$target_root/.ironmem-bases/$skill"
 
     if [[ ! -e "$target" ]]; then
       cp -R "$source" "$target"
+      mkdir -p "$(dirname "$base")"
+      rm -rf "$base"
+      cp -R "$source" "$base"
       echo "    installed $skill"
       continue
     fi
@@ -179,14 +183,7 @@ install_skill_set() {
       continue
     fi
 
-    if diff -qr "$source" "$target" >/dev/null 2>&1; then
-      echo "    $skill already installed"
-      continue
-    fi
-
-    rm -rf "$target"
-    cp -R "$source" "$target"
-    echo "    updated $skill"
+    install_dir_with_merge "$harness skill" "$source" "$target" "$base"
   done
 }
 
@@ -204,20 +201,119 @@ install_agent_set() {
     local source="$source_root/$agent.md"
     local target="$target_root/$agent.md"
 
-    if [[ ! -e "$target" ]]; then
-      cp "$source" "$target"
-      echo "    installed $agent"
-      continue
-    fi
-
-    if diff -q "$source" "$target" >/dev/null 2>&1; then
-      echo "    $agent already installed"
-      continue
-    fi
-
-    cp "$source" "$target"
-    echo "    updated $agent"
+    install_file_with_merge "$harness agent" "$agent" "$source" "$target" \
+      "$target_root/.ironmem-bases/$agent.md"
   done
+}
+
+install_file_with_merge() {
+  local label="$1"
+  local name="$2"
+  local source="$3"
+  local target="$4"
+  local base="$5"
+
+  mkdir -p "$(dirname "$target")" "$(dirname "$base")"
+
+  if [[ ! -e "$target" ]]; then
+    cp -p "$source" "$target"
+    cp -p "$source" "$base"
+    echo "    installed $name"
+    return
+  fi
+
+  if [[ -L "$target" ]]; then
+    if cmp -s "$source" "$target"; then
+      cp -p "$source" "$base"
+      echo "    $name already installed"
+      return
+    fi
+
+    local packaged_symlink="$target.ironmem-packaged"
+    cp -p "$source" "$packaged_symlink"
+    echo "    WARN: $label $name is a symlink; left it unchanged" >&2
+    echo "          packaged copy: $packaged_symlink" >&2
+    return
+  fi
+
+  if [[ ! -f "$target" ]]; then
+    echo "    WARN: $target exists but is not a regular file; leaving it unchanged" >&2
+    return
+  fi
+
+  if cmp -s "$source" "$target"; then
+    cp -p "$source" "$base"
+    echo "    $name already installed"
+    return
+  fi
+
+  if [[ -f "$base" ]]; then
+    if cmp -s "$target" "$base"; then
+      cp -p "$source" "$target"
+      cp -p "$source" "$base"
+      echo "    updated $name"
+      return
+    fi
+
+    if cmp -s "$source" "$base"; then
+      echo "    kept local changes in $name (packaged copy unchanged)"
+      return
+    fi
+
+    if command -v git >/dev/null 2>&1; then
+      local merged
+      merged="$(mktemp)"
+      if git merge-file -p "$target" "$base" "$source" > "$merged"; then
+        cp "$merged" "$target"
+        cp -p "$source" "$base"
+        rm -f "$merged"
+        echo "    merged packaged updates into $name"
+        return
+      fi
+
+      local conflict="$target.ironmem-merge-conflict"
+      local packaged="$target.ironmem-packaged"
+      cp "$merged" "$conflict"
+      rm -f "$merged"
+      cp -p "$source" "$packaged"
+      echo "    WARN: $label $name has merge conflicts; left local file unchanged" >&2
+      echo "          conflict draft: $conflict" >&2
+      echo "          packaged copy:  $packaged" >&2
+      return
+    fi
+
+    local packaged_no_git="$target.ironmem-packaged"
+    cp -p "$source" "$packaged_no_git"
+    echo "    WARN: git not found; left local $label $name unchanged" >&2
+    echo "          packaged copy: $packaged_no_git" >&2
+    return
+  fi
+
+  local packaged_no_base="$target.ironmem-packaged"
+  cp -p "$source" "$packaged_no_base"
+  echo "    WARN: no install base for $label $name; left local file unchanged" >&2
+  echo "          packaged copy: $packaged_no_base" >&2
+}
+
+install_dir_with_merge() {
+  local label="$1"
+  local source_root="$2"
+  local target_root="$3"
+  local base_root="$4"
+
+  mkdir -p "$target_root" "$base_root"
+
+  while IFS= read -r rel_dir; do
+    rel_dir="${rel_dir#./}"
+    [[ "$rel_dir" == "." ]] && continue
+    mkdir -p "$target_root/$rel_dir" "$base_root/$rel_dir"
+  done < <(cd "$source_root" && find . -type d -print)
+
+  while IFS= read -r rel_file; do
+    rel_file="${rel_file#./}"
+    install_file_with_merge "$label" "$rel_file" \
+      "$source_root/$rel_file" "$target_root/$rel_file" "$base_root/$rel_file"
+  done < <(cd "$source_root" && find . -type f -print)
 }
 
 # Generic .md installer used by commands and prompts. We don't reuse
@@ -248,19 +344,8 @@ install_md_set() {
     local source="$source_root/$name.md"
     local target="$target_root/$name.md"
 
-    if [[ ! -e "$target" ]]; then
-      cp "$source" "$target"
-      echo "    installed $name"
-      continue
-    fi
-
-    if diff -q "$source" "$target" >/dev/null 2>&1; then
-      echo "    $name already installed"
-      continue
-    fi
-
-    cp "$source" "$target"
-    echo "    updated $name"
+    install_file_with_merge "$label" "$name" "$source" "$target" \
+      "$target_root/.ironmem-bases/$name.md"
   done
 }
 

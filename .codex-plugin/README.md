@@ -34,7 +34,12 @@ ironmem write-rules --target AGENTS.md
 - `test-driven-development`
 - `pr-review-toolkit`
 
-Existing bundled copies are updated on install; pass `--skip-skills` to leave
+Existing identical files are skipped. Packaged baselines are stored under each
+target root's hidden `.ironmem-bases/` directory so later installs can
+three-way merge packaged updates into locally edited files. If there is no
+baseline, a symlink target, or a merge conflict, the local file is left
+unchanged and the packaged update is written next to it as `*.ironmem-packaged`
+(conflict drafts use `*.ironmem-merge-conflict`). Pass `--skip-skills` to leave
 local skills, prompts, and commands untouched.
 
 ## Bundled commands and prompts
