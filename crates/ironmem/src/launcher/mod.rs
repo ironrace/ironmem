@@ -144,7 +144,14 @@ pub fn run_launcher(
         })?;
 
     if !status.success() {
-        std::process::exit(status.code().unwrap_or(1));
+        #[cfg(unix)]
+        let code = status.code().unwrap_or_else(|| {
+            use std::os::unix::process::ExitStatusExt;
+            128 + status.signal().unwrap_or(0)
+        });
+        #[cfg(not(unix))]
+        let code = status.code().unwrap_or(1);
+        std::process::exit(code);
     }
     Ok(())
 }

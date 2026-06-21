@@ -7,6 +7,21 @@ use std::path::Path;
 
 use crate::error::MemoryError;
 
+/// Escape a value for a TOML basic (double-quoted) string.
+fn toml_basic_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\t' => out.push_str("\\t"),
+            c => out.push(c),
+        }
+    }
+    out
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RegisterOutcome {
     Registered,
@@ -22,8 +37,10 @@ fn write_atomic(path: &Path, contents: &str) -> Result<(), MemoryError> {
     let tmp = path.with_extension("ironmem-tmp");
     std::fs::write(&tmp, contents)
         .map_err(|e| MemoryError::Config(format!("write {}: {e}", tmp.display())))?;
-    std::fs::rename(&tmp, path)
-        .map_err(|e| MemoryError::Config(format!("rename to {}: {e}", path.display())))?;
+    std::fs::rename(&tmp, path).map_err(|e| {
+        let _ = std::fs::remove_file(&tmp);
+        MemoryError::Config(format!("rename to {}: {e}", path.display()))
+    })?;
     Ok(())
 }
 
@@ -94,7 +111,8 @@ pub(crate) fn ensure_codex_registered(
         next.push('\n');
     }
     next.push_str(&format!(
-        "\n[mcp_servers.ironmem]\ncommand = \"{exe}\"\nargs = [\"serve\"]\n\n[mcp_servers.ironmem.env]\nIRONMEM_MCP_MODE = \"trusted\"\n"
+        "\n[mcp_servers.ironmem]\ncommand = \"{}\"\nargs = [\"serve\"]\n\n[mcp_servers.ironmem.env]\nIRONMEM_MCP_MODE = \"trusted\"\n",
+        toml_basic_escape(exe)
     ));
     write_atomic(config_path, &next)?;
     Ok(RegisterOutcome::Registered)
@@ -179,5 +197,31 @@ mod tests {
         let outcome = ensure_codex_registered(&cfg, "/bin/ironmem").unwrap();
         assert_eq!(outcome, RegisterOutcome::Registered);
         assert!(cfg.exists());
+    }
+
+    #[test]
+    fn codex_escapes_exe_path_with_special_chars() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = dir.path().join("config.toml");
+        // exe path contains a double-quote, which would break raw TOML interpolation.
+        let exe = r#"/opt/iron"mem/ironmem"#;
+        let outcome = ensure_codex_registered(&cfg, exe).unwrap();
+        assert_eq!(outcome, RegisterOutcome::Registered);
+
+        let body = std::fs::read_to_string(&cfg).unwrap();
+        // The file must contain the properly escaped TOML basic-string sequence.
+        assert!(
+            body.contains(r#"command = "/opt/iron\"mem/ironmem""#),
+            "expected escaped TOML command line, got:\n{body}"
+        );
+    }
+
+    #[test]
+    fn toml_basic_escape_handles_all_special_chars() {
+        assert_eq!(toml_basic_escape(r#"a"b"#), r#"a\"b"#);
+        assert_eq!(toml_basic_escape(r"a\b"), r"a\\b");
+        assert_eq!(toml_basic_escape("a\nb"), r"a\nb");
+        assert_eq!(toml_basic_escape("a\tb"), r"a\tb");
+        assert_eq!(toml_basic_escape("/plain/path"), "/plain/path");
     }
 }

@@ -14,13 +14,29 @@ pub(crate) fn find_on_path(name: &str) -> Result<PathBuf, MemoryError> {
     find_in_paths(name, &path_var)
 }
 
+/// Returns true if `p` is a regular file that the current process can execute.
+/// On Unix this checks for at least one execute bit; on other platforms the
+/// existence of the file is sufficient (Windows uses extension-based dispatch).
+#[cfg(unix)]
+fn is_executable_file(p: &std::path::Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::metadata(p)
+        .map(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+        .unwrap_or(false)
+}
+
+#[cfg(not(unix))]
+fn is_executable_file(p: &std::path::Path) -> bool {
+    p.is_file()
+}
+
 /// Locate `name` by scanning the directories in `path_var`. Returns the first
-/// existing regular-file match. Pure with respect to the process environment so
-/// it is safe to unit-test in parallel.
+/// existing executable-file match. Pure with respect to the process environment
+/// so it is safe to unit-test in parallel.
 pub(crate) fn find_in_paths(name: &str, path_var: &OsStr) -> Result<PathBuf, MemoryError> {
     for dir in std::env::split_paths(path_var) {
         let candidate = dir.join(name);
-        if candidate.is_file() {
+        if is_executable_file(&candidate) {
             return Ok(candidate);
         }
     }
@@ -62,6 +78,28 @@ mod tests {
         let err = find_in_paths("codex", &path_var).unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("codex"), "error should name the binary: {msg}");
+        assert!(msg.contains("PATH"), "error should mention PATH: {msg}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn non_executable_file_is_not_selected() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        // Create a file named "claude" that is NOT executable (mode 0o644).
+        let bin = dir.path().join("claude");
+        fs::write(&bin, "#!/bin/sh\n").unwrap();
+        let mut perms = fs::metadata(&bin).unwrap().permissions();
+        perms.set_mode(0o644);
+        fs::set_permissions(&bin, perms).unwrap();
+
+        let path_var = std::env::join_paths([dir.path()]).unwrap();
+        let err = find_in_paths("claude", &path_var).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("claude"),
+            "error should name the binary: {msg}"
+        );
         assert!(msg.contains("PATH"), "error should mention PATH: {msg}");
     }
 }
