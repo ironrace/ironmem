@@ -647,6 +647,56 @@ fn execute_approved_live_writes_live_metrics_file() {
     assert!(loaded.tasks.iter().all(|t| t.is_done()));
 }
 
+/// An arm aborted by an EXTERNAL session/rate limit (outcome "excluded") must be
+/// kept OUT of the corpus metrics file — counting it would dilute the §11.3
+/// denominators as a false failure — yet its partial token spend must NOT be
+/// lost: it is persisted to a sidecar so the run is auditable and re-runnable.
+#[test]
+fn execute_approved_live_excludes_session_limit_arm_but_persists_partial_usage() {
+    let (runner, _c) = fake(SUCCESS_JSON, true);
+    let out = tempfile::tempdir().unwrap();
+    let exec = LiveExecutor::new(runner, NoOpProvisioner, out.path().join("ws"), None)
+        .with_ironmem_runner(Box::new(FakeIronmemArm {
+            outcome: "excluded".into(),
+        }));
+    let gates = FakeGates { green: true };
+
+    let path = abeval::runner::execute_approved_live(
+        &task(),
+        &[Arm::Ironmem, Arm::Superpowers],
+        &exec,
+        &gates,
+        out.path(),
+    )
+    .unwrap();
+
+    // Corpus file holds ONLY the superpowers row; the excluded ironmem arm is absent.
+    let loaded = load_metrics(&path).unwrap();
+    assert_eq!(
+        loaded.tasks.len(),
+        1,
+        "an excluded arm must not enter the corpus row set"
+    );
+    assert_eq!(loaded.tasks[0].arm, "superpowers");
+    assert!(loaded.tasks.iter().all(|t| t.outcome != "excluded"));
+
+    // Sidecar holds the excluded arm WITH its partial usage (1000 input tokens
+    // from FakeIronmemArm) — accounting is preserved, not a black hole.
+    let sidecar = path.parent().unwrap().join("excluded_metrics.json");
+    assert!(
+        sidecar.exists(),
+        "excluded partial usage must be persisted to a sidecar"
+    );
+    let ex = load_metrics(&sidecar).unwrap();
+    assert_eq!(ex.tasks.len(), 1);
+    assert_eq!(ex.tasks[0].arm, "ironmem");
+    assert_eq!(ex.tasks[0].outcome, "excluded");
+    assert_eq!(
+        ex.tasks[0].input_tokens, 1000,
+        "the excluded arm's partial token spend must be preserved"
+    );
+}
+
 // --- Cycle 5: real subprocess plumbing, proven with harmless coreutils only ---
 
 use abeval::client::ProcessCommandRunner;

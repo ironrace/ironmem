@@ -1,8 +1,66 @@
-use abeval::collab_driver::parse_session_id;
+use abeval::collab_driver::{parse_session_id, ModelTier};
 use abeval::collab_live::{
-    claude_worker_argv, codex_config, codex_exec_argv, worker_text_and_usage,
+    claude_worker_argv, codex_config, codex_exec_argv, collab_outcome_for, format_worker_failure,
+    worker_text_and_usage,
 };
 use std::path::Path;
+
+#[test]
+fn worker_failure_surfaces_stdout_tail_when_stderr_empty() {
+    // For `claude -p` the actionable cause (the result event / synthetic error,
+    // e.g. a session-limit notice) is printed to STDOUT, not stderr. A failure
+    // message built from exit code + stderr alone is useless: it reads
+    // "exited Some(1) — stderr:" with nothing after it. The stdout tail must be
+    // surfaced so the operator (and Gap 2's classifier) can see the real cause.
+    let stdout = "lots of earlier output\nClaude usage limit reached. Resets at 9pm.";
+    let msg = format_worker_failure("claude worker", Some(1), "/tmp/wt", "", stdout);
+    assert!(msg.contains("Some(1)"), "exit code must be present: {msg}");
+    assert!(msg.contains("/tmp/wt"), "location must be present: {msg}");
+    assert!(
+        msg.contains("Claude usage limit reached"),
+        "the stdout tail (the real cause) must be surfaced: {msg}"
+    );
+    assert!(
+        msg.to_lowercase().contains("stdout"),
+        "the tail must be clearly labeled as stdout: {msg}"
+    );
+}
+
+#[test]
+fn worker_failure_bounds_the_stdout_tail() {
+    // A multi-megabyte transcript must not be dumped wholesale into the error —
+    // only a bounded tail (the end, where the terminal result/error lives) is
+    // included, and the head is dropped.
+    let head = "HEAD_MARKER_SHOULD_BE_DROPPED";
+    let big = format!("{head}{}TAIL_MARKER", "x".repeat(8192));
+    let msg = format_worker_failure("claude worker", Some(1), "/tmp/wt", "", &big);
+    assert!(
+        msg.contains("TAIL_MARKER"),
+        "the END of stdout (terminal result/error) must be kept: {msg}"
+    );
+    assert!(
+        !msg.contains(head),
+        "the head of an oversized transcript must be dropped, not dumped: {msg}"
+    );
+}
+
+#[test]
+fn collab_outcome_mapping_respects_disposition() {
+    use abeval::collab_driver::{RunDisposition, PHASE_CODING_COMPLETE, PHASE_CODING_FAILED};
+
+    assert_eq!(
+        collab_outcome_for(RunDisposition::Terminal, PHASE_CODING_COMPLETE),
+        "completed"
+    );
+    assert_eq!(
+        collab_outcome_for(RunDisposition::Terminal, PHASE_CODING_FAILED),
+        "failed"
+    );
+    assert_eq!(
+        collab_outcome_for(RunDisposition::ExcludedRetryable, "WorkerAborted"),
+        "excluded"
+    );
+}
 
 #[test]
 fn codex_exec_argv_is_no_shell_and_isolated() {
@@ -21,7 +79,7 @@ fn codex_exec_argv_is_no_shell_and_isolated() {
 
 #[test]
 fn claude_worker_argv_carries_stream_json_and_mcp_config() {
-    let (prog, args) = claude_worker_argv(r#"{"mcpServers":{}}"#);
+    let (prog, args) = claude_worker_argv(r#"{"mcpServers":{}}"#, ModelTier::Opus);
     assert_eq!(prog, "claude");
     // stream-json (not the single envelope) so subagent token usage is summed;
     // stream-json itself requires --verbose.
@@ -36,6 +94,27 @@ fn claude_worker_argv_carries_stream_json_and_mcp_config() {
     // as an option ("unknown option '---'").
     assert_eq!(args.last().map(String::as_str), Some("--"));
     assert!(args.windows(2).any(|w| w == ["-p", "--"]));
+}
+
+#[test]
+fn claude_worker_argv_pins_the_model_tier() {
+    // The headless driver must pin `--model` per turn: the turn-template `model:`
+    // frontmatter is inert under `claude -p` (only the interactive orchestrator's
+    // Agent(model=) honors it). Opus for planning/review, Sonnet for mechanical/
+    // implementation turns (memory project_abeval_campaign_model_tiering).
+    let (_, opus) = claude_worker_argv(r#"{"mcpServers":{}}"#, ModelTier::Opus);
+    assert!(
+        opus.windows(2).any(|w| w == ["--model", "opus"]),
+        "opus tier must inject `--model opus`: {opus:?}"
+    );
+    let (_, sonnet) = claude_worker_argv(r#"{"mcpServers":{}}"#, ModelTier::Sonnet);
+    assert!(
+        sonnet.windows(2).any(|w| w == ["--model", "sonnet"]),
+        "sonnet tier must inject `--model sonnet`: {sonnet:?}"
+    );
+    // The `--model <flag>` pair must precede the trailing `-p --` (the prompt is the
+    // last positional), so the model flag is never swallowed as the prompt.
+    assert_eq!(sonnet.last().map(String::as_str), Some("--"));
 }
 
 #[test]
@@ -80,6 +159,20 @@ fn worker_text_extracts_result_and_sums_usage_from_stream_json() {
         3 + 40,
         "subagent output tokens summed in"
     );
+}
+
+#[test]
+fn worker_text_preserves_terminal_is_error_flag() {
+    let transcript = concat!(
+        r#"{"type":"assistant","message":{"id":"msg","usage":{"input_tokens":10,"output_tokens":2,"cache_creation_input_tokens":0,"cache_read_input_tokens":0}}}"#,
+        "\n",
+        r#"{"type":"result","is_error":true,"result":"Claude usage limit reached. Resets at 9pm.","usage":{}}"#,
+    );
+
+    let wt = worker_text_and_usage(transcript);
+    assert!(wt.is_error, "terminal is_error must reach the driver");
+    assert_eq!(wt.text, "Claude usage limit reached. Resets at 9pm.");
+    assert_eq!(wt.usage.total(), 12);
 }
 
 #[test]

@@ -234,8 +234,11 @@ pub fn run_task_live<R: CommandRunner, P: WorkspaceProvisioner, G: GateRunner>(
 }
 
 /// Run one task across `arms` through the live executor + gates, then write a
-/// normalized `evidence_class:"live"` metrics file to
-/// `<out_dir>/<task_id>/live_metrics.json` and return its path.
+/// normalized `evidence_class:"live"` corpus metrics file to
+/// `<out_dir>/<task_id>/live_metrics.json` and return its path. Arms with
+/// `outcome:"excluded"` are omitted from that corpus file and, when present,
+/// written to `<out_dir>/<task_id>/excluded_metrics.json` so partial spend stays
+/// auditable without diluting the headline denominator.
 ///
 /// Generic over the runner/gate seams so it is exercised with fakes; the guarded
 /// CLI entry wires the REAL `claude`-spawning runner behind the approval gate.
@@ -250,8 +253,29 @@ pub fn execute_approved_live<R: CommandRunner, P: WorkspaceProvisioner, G: GateR
     let task_dir = out_dir.join(&task.id);
     std::fs::create_dir_all(&task_dir)
         .with_context(|| format!("creating {}", task_dir.display()))?;
+
+    // Partition EXCLUDED rows (an arm aborted by an external Claude session/rate
+    // limit) out of the corpus metrics file: counting them would dilute the
+    // §11.3 merged-rate denominator as a false failure. Their partial token spend
+    // is NOT discarded — it is persisted to a sidecar so the interrupted run is
+    // auditable and can be re-run, rather than a black hole.
+    let (excluded, corpus): (Vec<TaskMetric>, Vec<TaskMetric>) = metrics
+        .into_iter()
+        .partition(|m| m.outcome == crate::constants::OUTCOME_EXCLUDED);
+    if !excluded.is_empty() {
+        let excluded_path = task_dir.join("excluded_metrics.json");
+        crate::report::write_live_metrics(&excluded_path, &excluded)?;
+        eprintln!(
+            "abeval: {} arm(s) for task {} EXCLUDED (external session/rate limit); \
+             partial usage persisted to {} — re-run to obtain a corpus row",
+            excluded.len(),
+            task.id,
+            excluded_path.display()
+        );
+    }
+
     let path = task_dir.join("live_metrics.json");
-    crate::report::write_live_metrics(&path, &metrics)?;
+    crate::report::write_live_metrics(&path, &corpus)?;
     Ok(path)
 }
 

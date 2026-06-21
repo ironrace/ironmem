@@ -88,12 +88,25 @@ pub fn build_arm_metric(
     arm_outcome: &crate::client::ArmOutcome,
     ci_green: bool,
 ) -> TaskMetric {
+    let agent_outcome = arm_outcome.outcome.as_str();
+    assert!(
+        [
+            crate::constants::OUTCOME_COMPLETED,
+            crate::constants::OUTCOME_FAILED,
+            crate::constants::OUTCOME_EXCLUDED,
+        ]
+        .contains(&agent_outcome),
+        "invalid ArmOutcome.outcome {:?} for task {} arm {}",
+        arm_outcome.outcome,
+        task_id,
+        arm
+    );
     let completed = arm_outcome.outcome == crate::constants::OUTCOME_COMPLETED;
     let green = completed && ci_green;
     let outcome = if green {
         crate::constants::OUTCOME_MERGED.to_string()
     } else {
-        // Preserve the measured agent-level outcome ("completed"/"failed");
+        // Preserve the measured agent-level outcome ("completed"/"failed"/"excluded");
         // either way it is not headline-eligible without a green gate.
         arm_outcome.outcome.clone()
     };
@@ -176,7 +189,9 @@ pub fn load_metrics(path: impl AsRef<Path>) -> Result<MetricsInput> {
 /// A subdirectory WITHOUT `live_metrics.json` is skipped, not an error: the live
 /// runner writes a sibling `<dir>/workspaces/...` worktree tree that legitimately
 /// holds no metrics file. Each per-task file is assumed to carry BOTH arms (the
-/// writer, `execute_approved_live`, writes them together atomically); the §11.3
+/// writer, `execute_approved_live`, writes corpus rows together atomically.
+/// Excluded/retryable arm rows are intentionally moved to a sibling
+/// `excluded_metrics.json` audit sidecar and are not loaded here; the §11.3
 /// gate, not this loader, is the authority on per-arm completeness.
 ///
 /// Duplicate `task_key` rows (e.g. a task re-run) are NOT collapsed here; the

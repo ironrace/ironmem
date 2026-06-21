@@ -14,7 +14,7 @@ use crate::codex_tokens::{attribute_codex_tokens, TimeWindow};
 use crate::collab_db::read_session_state;
 use crate::collab_driver::{
     run_collab_task, CodexAttributor, CodexResult, CollabRunResult, CollabStateReader,
-    CollabTaskCtx, WorkerResult, WorkerSpawner,
+    CollabTaskCtx, ModelTier, WorkerResult, WorkerSpawner,
 };
 use crate::corpus::Task;
 use crate::proc_timeout::{run_with_timeout, turn_timeout};
@@ -34,7 +34,12 @@ use crate::stream_usage::parse_stream_json;
 /// `---` YAML frontmatter, so a prompt passed without an end-of-options marker is
 /// parsed by the CLI as an option (`error: unknown option '---'`). `--` forces
 /// the prompt to be a positional even when it starts with dashes.
-pub fn claude_worker_argv(mcp_config: &str) -> (String, Vec<String>) {
+///
+/// `--model <tier>` pins the per-turn model: the turn-template `model:` frontmatter
+/// is inert under `claude -p`, so the headless driver pins the tier here (memory
+/// `project_abeval_campaign_model_tiering`). The flag precedes the trailing `-p --`
+/// so the model value is never swallowed as the prompt positional.
+pub fn claude_worker_argv(mcp_config: &str, model: ModelTier) -> (String, Vec<String>) {
     (
         "claude".to_string(),
         vec![
@@ -43,12 +48,52 @@ pub fn claude_worker_argv(mcp_config: &str) -> (String, Vec<String>) {
             "--verbose".into(),
             "--permission-mode".into(),
             "bypassPermissions".into(),
+            "--model".into(),
+            model.as_flag().into(),
             "--mcp-config".into(),
             mcp_config.to_string(),
             "-p".into(),
             "--".into(),
         ],
     )
+}
+
+/// Max bytes of a worker's stdout tail included in a non-zero-exit error. The
+/// terminal `result`/synthetic-error event (the actionable cause) lives at the
+/// END of the transcript, so we keep the tail and drop the head.
+const WORKER_STDOUT_TAIL_BYTES: usize = 2048;
+
+/// Build the error message for a worker process that exited non-zero. For
+/// `claude -p` the actionable cause (the terminal `result` event / synthetic
+/// error such as a session-limit notice) is printed to STDOUT, not stderr, so a
+/// bounded tail of stdout is surfaced alongside the exit code and stderr. Pure
+/// (no spawn) so the formatting is unit-tested directly.
+pub fn format_worker_failure(
+    label: &str,
+    code: Option<i32>,
+    location: &str,
+    stderr: &str,
+    stdout: &str,
+) -> String {
+    let tail = stdout_tail(stdout.trim(), WORKER_STDOUT_TAIL_BYTES);
+    format!(
+        "{label} exited {code:?} in {location} — stderr: {} — stdout tail: {}",
+        stderr.trim(),
+        tail
+    )
+}
+
+/// Keep at most `max` bytes from the END of `s`, on a UTF-8 char boundary, with
+/// a leading ellipsis when the head was dropped.
+fn stdout_tail(s: &str, max: usize) -> String {
+    if s.len() <= max {
+        return s.to_string();
+    }
+    let mut start = s.len() - max;
+    while start < s.len() && !s.is_char_boundary(start) {
+        start += 1;
+    }
+    format!("…{}", &s[start..])
 }
 
 /// Outcome of extracting a worker turn's printed text + usage from its raw
@@ -59,6 +104,7 @@ pub struct WorkerText {
     pub text: String,
     pub usage: Usage,
     pub usage_unparseable: bool,
+    pub is_error: bool,
 }
 
 /// Extract the worker's *printed text* and token usage from a raw `claude -p
@@ -78,6 +124,7 @@ pub fn worker_text_and_usage(raw: &str) -> WorkerText {
             text: r.result,
             usage: r.usage,
             usage_unparseable: false,
+            is_error: r.is_error,
         },
         Err(e) => {
             eprintln!(
@@ -88,6 +135,7 @@ pub fn worker_text_and_usage(raw: &str) -> WorkerText {
                 text: raw.to_string(),
                 usage: Usage::default(),
                 usage_unparseable: true,
+                is_error: false,
             }
         }
     }
@@ -148,6 +196,24 @@ pub fn codex_config(db_path: &Path) -> String {
     )
 }
 
+pub fn collab_outcome_for(
+    disposition: crate::collab_driver::RunDisposition,
+    reached_phase: &str,
+) -> &'static str {
+    match disposition {
+        crate::collab_driver::RunDisposition::Terminal => {
+            if reached_phase == crate::collab_driver::PHASE_CODING_COMPLETE {
+                crate::constants::OUTCOME_COMPLETED
+            } else {
+                crate::constants::OUTCOME_FAILED
+            }
+        }
+        crate::collab_driver::RunDisposition::ExcludedRetryable => {
+            crate::constants::OUTCOME_EXCLUDED
+        }
+    }
+}
+
 pub struct SqliteStateReader {
     pub db_path: PathBuf,
 }
@@ -167,8 +233,13 @@ pub struct ProcessWorkerSpawner {
     pub mcp_config: String,
 }
 impl WorkerSpawner for ProcessWorkerSpawner {
-    fn spawn_claude(&self, prompt: &str, worktree: &Path) -> Result<WorkerResult> {
-        let (prog, mut args) = claude_worker_argv(&self.mcp_config);
+    fn spawn_claude(
+        &self,
+        prompt: &str,
+        worktree: &Path,
+        model: ModelTier,
+    ) -> Result<WorkerResult> {
+        let (prog, mut args) = claude_worker_argv(&self.mcp_config, model);
         args.push(prompt.to_string());
         let mut cmd = std::process::Command::new(&prog);
         cmd.args(&args)
@@ -180,12 +251,14 @@ impl WorkerSpawner for ProcessWorkerSpawner {
             .with_context(|| format!("claude worker in {}", worktree.display()))?;
         if !out.status.success() {
             let stderr = String::from_utf8_lossy(&out.stderr);
-            return Err(anyhow!(
-                "claude worker exited {:?} in {} — stderr: {}",
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            return Err(anyhow!(format_worker_failure(
+                "claude worker",
                 out.status.code(),
-                worktree.display(),
-                stderr.trim()
-            ));
+                &worktree.display().to_string(),
+                &stderr,
+                &stdout,
+            )));
         }
         let raw = String::from_utf8_lossy(&out.stdout).into_owned();
         let parsed = worker_text_and_usage(&raw);
@@ -193,6 +266,7 @@ impl WorkerSpawner for ProcessWorkerSpawner {
             usage: parsed.usage,
             stdout: parsed.text,
             usage_unparseable: parsed.usage_unparseable,
+            is_error: parsed.is_error,
         })
     }
 
@@ -209,12 +283,14 @@ impl WorkerSpawner for ProcessWorkerSpawner {
             .with_context(|| format!("codex exec in {}", worktree.display()))?;
         if !out.status.success() {
             let stderr = String::from_utf8_lossy(&out.stderr);
-            return Err(anyhow!(
-                "codex exec exited {:?} in {} — stderr: {}",
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            return Err(anyhow!(format_worker_failure(
+                "codex exec",
                 out.status.code(),
-                worktree.display(),
-                stderr.trim()
-            ));
+                &worktree.display().to_string(),
+                &stderr,
+                &stdout,
+            )));
         }
         let head_after = git_head(worktree)?;
         let commits_added = count_commits_between(worktree, &head_before, &head_after)?;
@@ -434,12 +510,14 @@ pub fn run_ironmem_arm(task: &Task, worktree: &Path, out_task_dir: &Path) -> Res
         codex_usage: result.codex_usage,
         review_rounds: result.review_rounds,
         fix_commits: result.fix_commits,
-        outcome: if result.reached_phase == crate::collab_driver::PHASE_CODING_COMPLETE {
-            crate::constants::OUTCOME_COMPLETED.to_string()
-        } else {
-            crate::constants::OUTCOME_FAILED.to_string()
-        },
-        transcript: format!("collab reached {}", result.reached_phase),
+        // Map the run disposition (not just the phase) to the outcome string: a
+        // worker-abort run never reached a terminal phase, and an external
+        // session/rate-limit abort must be EXCLUDED, never recorded as FAILED.
+        outcome: collab_outcome_for(result.disposition, &result.reached_phase).to_string(),
+        transcript: format!(
+            "collab reached {} ({:?})",
+            result.reached_phase, result.disposition
+        ),
     })
 }
 
