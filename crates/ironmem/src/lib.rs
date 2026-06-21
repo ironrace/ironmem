@@ -41,6 +41,9 @@ pub mod code_maps;
 /// `ironmem doctor` — local setup diagnostics (issue #142).
 pub mod doctor;
 
+/// One-command launchers for `claude` and `codex` (issue #143).
+pub mod launcher;
+
 pub mod write_rules;
 
 /// Canonical crate error type used by CLI, MCP, and storage layers.

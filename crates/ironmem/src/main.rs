@@ -2,7 +2,7 @@ use clap::{Parser, Subcommand};
 use std::process;
 
 use ironmem::MemoryError;
-use ironmem::{bootstrap, config, context, ingest, mcp, migrate, reembed, report};
+use ironmem::{bootstrap, config, context, ingest, launcher, mcp, migrate, reembed, report};
 
 #[derive(Parser)]
 #[command(
@@ -105,6 +105,28 @@ enum Commands {
         /// Directory containing the target file(s)
         #[arg(long, default_value = ".")]
         workspace: String,
+    },
+    /// Launch Claude Code in a repo with the ironmem MCP server attached
+    Claude {
+        /// Repository path to launch in
+        #[arg(default_value = ".")]
+        path: String,
+        /// Optional initial prompt for the session
+        prompt: Option<String>,
+        /// Skip ensuring the ironmem MCP server is registered (use existing manual setup)
+        #[arg(long)]
+        no_mcp_setup: bool,
+    },
+    /// Launch Codex in a repo with the ironmem MCP server attached
+    Codex {
+        /// Repository path to launch in
+        #[arg(default_value = ".")]
+        path: String,
+        /// Optional initial prompt for the session
+        prompt: Option<String>,
+        /// Skip ensuring the ironmem MCP server is registered (use existing manual setup)
+        #[arg(long)]
+        no_mcp_setup: bool,
     },
 }
 
@@ -254,6 +276,16 @@ async fn run(cli: Cli) -> Result<(), MemoryError> {
             }
             Ok(())
         }
+        Commands::Claude {
+            path,
+            prompt,
+            no_mcp_setup,
+        } => launcher::run_launcher(launcher::Harness::Claude, &path, prompt, no_mcp_setup),
+        Commands::Codex {
+            path,
+            prompt,
+            no_mcp_setup,
+        } => launcher::run_launcher(launcher::Harness::Codex, &path, prompt, no_mcp_setup),
         Commands::WriteRules { target, workspace } => {
             use ironmem::write_rules::{validate_rules_file, write_rules_file, WriteOutcome};
             let targets: Vec<&str> = match target.as_deref() {
