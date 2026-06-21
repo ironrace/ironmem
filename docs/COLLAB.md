@@ -29,11 +29,13 @@ This document covers:
 - copy-pasteable prompts (single-terminal default; Codex-terminal fallback)
 - a worked example
 
-The two slash-command prompts that agents actually run are derived from
-this spec — keep them in sync when protocol changes land:
+The command surfaces and protocol prompts that agents actually run are derived
+from this spec — keep them in sync when protocol changes land:
 
 - `.claude-plugin/commands/collab.md` — Claude's `/collab` prompt.
-- `.codex-plugin/prompts/collab.md` — Codex's `/collab` prompt.
+- `.codex-plugin/commands/collab.md` — Codex's `/collab` slash command.
+- `.codex-plugin/prompts/collab.md` — Codex's full one-turn protocol prompt,
+  loaded by the command and passed directly by Claude's background dispatcher.
 
 ## What It Is
 
@@ -1075,8 +1077,8 @@ The eight per-turn worker templates live under `.claude-plugin/prompts/`:
 
 The Claude-side dispatch tables and the authoritative tier matrix live in
 `.claude-plugin/commands/collab.md`; this section and that command file must
-stay in lockstep (see the three-file header rule at the top of
-`.codex-plugin/prompts/collab.md`).
+stay in lockstep with the Codex command/prompt surface (see the header rule at
+the top of `.codex-plugin/prompts/collab.md`).
 
 ## Autonomous Planning Loop
 
@@ -1309,9 +1311,10 @@ unchanged; only the transport differs.
    claude mcp add codex codex mcp-server
    ```
 2. Claude expands the Codex prompt locally — `codex mcp-server` does
-   **not** resolve slash commands from `.codex-plugin/prompts/`, so
-   passing a raw `/collab join <sid>` string would make Codex treat it
-   as ordinary user text and go off-script. Read the appropriate
+   **not** resolve interactive slash commands, even though Codex now has
+   `.codex-plugin/commands/collab.md`. Passing a raw
+   `/collab join <sid>` string through the MCP transport would make Codex
+   treat it as ordinary user text and go off-script. Read the appropriate
    prompt file (`.codex-plugin/prompts/collab.md` for plan/review
    phases; `.codex-plugin/prompts/collab-batch-impl.md` for
    `CodeImplementPending+codex`), substitute `$ARGUMENTS` with

@@ -51,6 +51,10 @@ REQUIRED_CLAUDE_COMMANDS=(
   evaluate-issue
 )
 
+REQUIRED_CODEX_COMMANDS=(
+  collab
+)
+
 REQUIRED_CODEX_PROMPTS=(
   collab
   collab-batch-impl
@@ -298,15 +302,22 @@ if [[ "$SKIP_SKILLS" -eq 0 ]]; then
   CLAUDE_SKILLS_DIR="${CLAUDE_SKILLS_DIR:-$CLAUDE_HOME/skills}"
   CLAUDE_AGENTS_DIR="${CLAUDE_AGENTS_DIR:-$CLAUDE_HOME/agents}"
   CLAUDE_COMMANDS_DIR="${CLAUDE_COMMANDS_DIR:-$CLAUDE_HOME/commands}"
+  CODEX_COMMANDS_DIR="${CODEX_COMMANDS_DIR:-$CODEX_HOME/commands}"
   CODEX_PROMPTS_DIR="${CODEX_PROMPTS_DIR:-$CODEX_HOME/prompts}"
 
   install_skill_set "Codex" "$REPO_ROOT/.codex-plugin/skills" "$CODEX_SKILLS_DIR" \
     "${REQUIRED_SHARED_SKILLS[@]}" "${REQUIRED_CODEX_SKILLS[@]}"
   install_skill_set "Claude" "$REPO_ROOT/.claude-plugin/skills" "$CLAUDE_SKILLS_DIR" \
-    "${REQUIRED_SHARED_SKILLS[@]}" "${REQUIRED_CLAUDE_SKILLS[@]}"
+    "${REQUIRED_SHARED_SKILLS[@]}"
+  if (( ${#REQUIRED_CLAUDE_SKILLS[@]} > 0 )); then
+    install_skill_set "Claude" "$REPO_ROOT/.claude-plugin/skills" "$CLAUDE_SKILLS_DIR" \
+      "${REQUIRED_CLAUDE_SKILLS[@]}"
+  fi
   install_agent_set "Claude" "$REPO_ROOT/.claude-plugin/agents" "$CLAUDE_AGENTS_DIR"
   install_md_set "Claude command" "$REPO_ROOT/.claude-plugin/commands" \
     "$CLAUDE_COMMANDS_DIR" "${REQUIRED_CLAUDE_COMMANDS[@]}"
+  install_md_set "Codex command" "$REPO_ROOT/.codex-plugin/commands" \
+    "$CODEX_COMMANDS_DIR" "${REQUIRED_CODEX_COMMANDS[@]}"
   install_md_set "Codex prompt" "$REPO_ROOT/.codex-plugin/prompts" \
     "$CODEX_PROMPTS_DIR" "${REQUIRED_CODEX_PROMPTS[@]}"
 else

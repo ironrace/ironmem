@@ -64,7 +64,8 @@ Same file: update `call_tool` match arms, `tool_known()`,
 - `scripts/mcp_smoke_test.py` (tool-list assertion)
 - `~/.claude/commands/collab.md` —
   `mcp__ironrace-memory__ironmem_collab_*` → `mcp__ironmem__collab_*`
-- `~/.codex/prompts/collab.md` — same prefix substitution
+- `~/.codex/commands/collab.md` and `~/.codex/prompts/collab.md` — same
+  prefix substitution
 - `~/.claude/settings.local.json` — allowlist entries
 
 **Verify:** full test suite + smoke test + start a live collab session.

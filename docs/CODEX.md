@@ -192,13 +192,18 @@ Embedding-dependent tools (`search`, `add_drawer`, diary writes) return `{"warmi
 
 - `plugin.json`
 - `hooks.json`
+- `commands/collab.md`, the Codex `/collab` slash-command shim
 - wrapper scripts for the MCP server and hooks
 - Codex-specific README content
+- protocol prompts under `prompts/`
 - bundled collab skill dependencies under `skills/`
 
 The shared collab skill dependencies are bundled for Claude Code under `.claude-plugin/skills/`.
-`scripts/install-ironmem.sh` installs the Codex copies into `$CODEX_HOME/skills` (default
-`~/.codex/skills`) and the Claude copies into `$CLAUDE_HOME/skills` (default `~/.claude/skills`).
+`scripts/install-ironmem.sh` installs the Codex command into `$CODEX_HOME/commands`
+(default `~/.codex/commands`), the Codex protocol prompts into `$CODEX_HOME/prompts`
+(default `~/.codex/prompts`), the Codex skills into `$CODEX_HOME/skills`
+(default `~/.codex/skills`), and the Claude copies into `$CLAUDE_HOME/skills`
+(default `~/.claude/skills`).
 The shared required set is:
 
 - `writing-plans`
