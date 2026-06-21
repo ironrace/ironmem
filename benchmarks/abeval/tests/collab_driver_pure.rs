@@ -32,6 +32,12 @@ fn session_limit_signature_detected_but_not_overmatched() {
     assert!(!is_session_limit_error(
         "compilation error: unused variable `rate_limiter`"
     ));
+    assert!(!is_session_limit_error(
+        "task output: 429 Too Many Requests from the app under test"
+    ));
+    assert!(!is_session_limit_error(
+        "integration test got HTTP 429: rate limit exceeded"
+    ));
     assert!(!is_session_limit_error(""));
 }
 

@@ -234,8 +234,11 @@ pub fn run_task_live<R: CommandRunner, P: WorkspaceProvisioner, G: GateRunner>(
 }
 
 /// Run one task across `arms` through the live executor + gates, then write a
-/// normalized `evidence_class:"live"` metrics file to
-/// `<out_dir>/<task_id>/live_metrics.json` and return its path.
+/// normalized `evidence_class:"live"` corpus metrics file to
+/// `<out_dir>/<task_id>/live_metrics.json` and return its path. Arms with
+/// `outcome:"excluded"` are omitted from that corpus file and, when present,
+/// written to `<out_dir>/<task_id>/excluded_metrics.json` so partial spend stays
+/// auditable without diluting the headline denominator.
 ///
 /// Generic over the runner/gate seams so it is exercised with fakes; the guarded
 /// CLI entry wires the REAL `claude`-spawning runner behind the approval gate.

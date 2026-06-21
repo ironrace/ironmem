@@ -104,6 +104,7 @@ pub struct WorkerText {
     pub text: String,
     pub usage: Usage,
     pub usage_unparseable: bool,
+    pub is_error: bool,
 }
 
 /// Extract the worker's *printed text* and token usage from a raw `claude -p
@@ -123,6 +124,7 @@ pub fn worker_text_and_usage(raw: &str) -> WorkerText {
             text: r.result,
             usage: r.usage,
             usage_unparseable: false,
+            is_error: r.is_error,
         },
         Err(e) => {
             eprintln!(
@@ -133,6 +135,7 @@ pub fn worker_text_and_usage(raw: &str) -> WorkerText {
                 text: raw.to_string(),
                 usage: Usage::default(),
                 usage_unparseable: true,
+                is_error: false,
             }
         }
     }
@@ -193,6 +196,24 @@ pub fn codex_config(db_path: &Path) -> String {
     )
 }
 
+pub fn collab_outcome_for(
+    disposition: crate::collab_driver::RunDisposition,
+    reached_phase: &str,
+) -> &'static str {
+    match disposition {
+        crate::collab_driver::RunDisposition::Terminal => {
+            if reached_phase == crate::collab_driver::PHASE_CODING_COMPLETE {
+                crate::constants::OUTCOME_COMPLETED
+            } else {
+                crate::constants::OUTCOME_FAILED
+            }
+        }
+        crate::collab_driver::RunDisposition::ExcludedRetryable => {
+            crate::constants::OUTCOME_EXCLUDED
+        }
+    }
+}
+
 pub struct SqliteStateReader {
     pub db_path: PathBuf,
 }
@@ -245,6 +266,7 @@ impl WorkerSpawner for ProcessWorkerSpawner {
             usage: parsed.usage,
             stdout: parsed.text,
             usage_unparseable: parsed.usage_unparseable,
+            is_error: parsed.is_error,
         })
     }
 
@@ -491,21 +513,7 @@ pub fn run_ironmem_arm(task: &Task, worktree: &Path, out_task_dir: &Path) -> Res
         // Map the run disposition (not just the phase) to the outcome string: a
         // worker-abort run never reached a terminal phase, and an external
         // session/rate-limit abort must be EXCLUDED, never recorded as FAILED.
-        outcome: match result.disposition {
-            crate::collab_driver::RunDisposition::Terminal => {
-                if result.reached_phase == crate::collab_driver::PHASE_CODING_COMPLETE {
-                    crate::constants::OUTCOME_COMPLETED.to_string()
-                } else {
-                    crate::constants::OUTCOME_FAILED.to_string()
-                }
-            }
-            crate::collab_driver::RunDisposition::WorkerFailed => {
-                crate::constants::OUTCOME_FAILED.to_string()
-            }
-            crate::collab_driver::RunDisposition::ExcludedRetryable => {
-                crate::constants::OUTCOME_EXCLUDED.to_string()
-            }
-        },
+        outcome: collab_outcome_for(result.disposition, &result.reached_phase).to_string(),
         transcript: format!(
             "collab reached {} ({:?})",
             result.reached_phase, result.disposition

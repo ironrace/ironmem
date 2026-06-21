@@ -71,8 +71,10 @@ pub struct ArmOutcome {
     pub review_rounds: u32,
     #[serde(default)]
     pub fix_commits: u32,
-    /// `"completed"`/`"failed"` (agent-level). The §12 done-proxy lifts this to
-    /// `"merged"` only when gates are green (in `build_arm_metric`).
+    /// Agent-level outcome: `"completed"`, `"failed"`, or `"excluded"` (external
+    /// retryable abort, currently only the ironmem collab arm). The §12 done-proxy
+    /// lifts `"completed"` to `"merged"` only when gates are green (in
+    /// `build_arm_metric`).
     pub outcome: String,
     pub transcript: String,
 }

@@ -10,8 +10,8 @@ use std::path::{Path, PathBuf};
 /// Spawner whose Nth claude turn (1-based, counting the bootstrap as turn 1)
 /// dies with an injected worker error. `limit=true` injects an external
 /// session-limit signature (Gap 1 surfaces it in the error string);
-/// `limit=false` injects a genuine task-attributable failure. All other turns
-/// succeed with fixed non-zero usage.
+/// `limit=false` injects a generic worker/infra failure that must stay INVALID.
+/// All other turns succeed with fixed non-zero usage.
 struct FailAtNthSpawner {
     fail_at: u32,
     limit: bool,
@@ -57,10 +57,90 @@ impl WorkerSpawner for FailAtNthSpawner {
             },
             stdout,
             usage_unparseable: false,
+            is_error: false,
         })
     }
     fn spawn_codex(&self, _session_id: &str, _wt: &Path) -> anyhow::Result<CodexResult> {
         Ok(CodexResult { commits_added: 0 })
+    }
+}
+
+/// Spawner whose Nth claude turn returns a successful process result carrying
+/// `is_error:true` in the terminal stream-json envelope. This is distinct from a
+/// non-zero process exit: the driver must still preserve that turn's parsed usage
+/// before classifying the abort.
+struct ErrorEnvelopeAtNthSpawner {
+    fail_at: u32,
+    limit: bool,
+    calls: RefCell<u32>,
+}
+impl WorkerSpawner for ErrorEnvelopeAtNthSpawner {
+    fn spawn_claude(
+        &self,
+        prompt: &str,
+        _wt: &Path,
+        _model: ModelTier,
+    ) -> anyhow::Result<WorkerResult> {
+        let n = {
+            let mut c = self.calls.borrow_mut();
+            *c += 1;
+            *c
+        };
+        let stdout = if n == self.fail_at {
+            if self.limit {
+                "Claude usage limit reached. Resets at 9pm.".to_string()
+            } else {
+                "task output: 429 Too Many Requests from the app under test".to_string()
+            }
+        } else if prompt.contains("ABEVAL_BOOTSTRAP") {
+            "ABEVAL_SESSION_ID=sess-xyz\n".to_string()
+        } else {
+            "result: ok\nref: drawer-1\nblocker: none\n".to_string()
+        };
+        Ok(WorkerResult {
+            usage: Usage {
+                input_tokens: 10,
+                output_tokens: 5,
+                ..Default::default()
+            },
+            stdout,
+            usage_unparseable: false,
+            is_error: n == self.fail_at,
+        })
+    }
+    fn spawn_codex(&self, _session_id: &str, _wt: &Path) -> anyhow::Result<CodexResult> {
+        Ok(CodexResult { commits_added: 0 })
+    }
+}
+
+struct CodexFailSpawner;
+impl WorkerSpawner for CodexFailSpawner {
+    fn spawn_claude(
+        &self,
+        prompt: &str,
+        _wt: &Path,
+        _model: ModelTier,
+    ) -> anyhow::Result<WorkerResult> {
+        Ok(WorkerResult {
+            usage: Usage {
+                input_tokens: 10,
+                output_tokens: 5,
+                ..Default::default()
+            },
+            stdout: if prompt.contains("ABEVAL_BOOTSTRAP") {
+                "ABEVAL_SESSION_ID=sess-xyz\n".to_string()
+            } else {
+                "result: ok\nref: drawer-1\nblocker: none\n".to_string()
+            },
+            usage_unparseable: false,
+            is_error: false,
+        })
+    }
+
+    fn spawn_codex(&self, _session_id: &str, _wt: &Path) -> anyhow::Result<CodexResult> {
+        Err(anyhow::anyhow!(
+            "codex exec exited Some(1) — stdout tail: Claude usage limit reached"
+        ))
     }
 }
 
@@ -89,7 +169,11 @@ fn session_limit_worker_error_is_excluded_and_keeps_partial_usage() {
         limit: true,
         calls: RefCell::new(0),
     };
-    let attributor = FixedAttributor(Usage::default());
+    let attributor = FixedAttributor(Usage {
+        input_tokens: 20,
+        output_tokens: 3,
+        ..Default::default()
+    });
     let res = run_collab_task(
         &ctx(&repo_prompts_dir()),
         &implement_then_complete_reader(),
@@ -103,13 +187,18 @@ fn session_limit_worker_error_is_excluded_and_keeps_partial_usage() {
         15,
         "partial usage through the bootstrap turn must be preserved, not lost"
     );
+    assert_eq!(
+        res.codex_usage.total(),
+        23,
+        "aborted-run Codex attribution must be preserved, not written as zero"
+    );
 }
 
 #[test]
-fn genuine_worker_error_maps_to_failed_and_keeps_partial_usage() {
-    // Same trajectory, but the injected error is a genuine task failure (no
-    // limit signature). It must map to FAILED (a real data point), still with
-    // the partial usage preserved.
+fn generic_worker_error_is_invalid_not_a_measured_failure() {
+    // Same trajectory, but the injected error has no external session-limit
+    // signature. A worker/process/infra failure must not be serialized as a
+    // measured task failure row.
     let spawner = FailAtNthSpawner {
         fail_at: 2,
         limit: false,
@@ -122,12 +211,131 @@ fn genuine_worker_error_maps_to_failed_and_keeps_partial_usage() {
         &spawner,
         &attributor,
     )
-    .expect("a genuine worker failure is a FAILED data point, not a hard Err");
-    assert_eq!(res.disposition, RunDisposition::WorkerFailed);
+    .unwrap_err();
+    assert!(
+        res.to_string().contains("INVALID run"),
+        "generic worker failures must stay invalid, not become corpus rows: {res}"
+    );
+}
+
+#[test]
+fn bootstrap_session_limit_abort_uses_worker_aborted_fallback_metadata() {
+    let spawner = FailAtNthSpawner {
+        fail_at: 1,
+        limit: true,
+        calls: RefCell::new(0),
+    };
+    let res = run_collab_task(
+        &ctx(&repo_prompts_dir()),
+        &implement_then_complete_reader(),
+        &spawner,
+        &FixedAttributor(Usage::default()),
+    )
+    .expect("bootstrap-time session limit is retryable/excluded, not invalid");
+    assert_eq!(res.disposition, RunDisposition::ExcludedRetryable);
+    assert_eq!(res.reached_phase, "WorkerAborted");
+    assert_eq!(res.review_rounds, 0);
+}
+
+#[test]
+fn bootstrap_non_limit_worker_error_is_invalid() {
+    let spawner = FailAtNthSpawner {
+        fail_at: 1,
+        limit: false,
+        calls: RefCell::new(0),
+    };
+    let err = run_collab_task(
+        &ctx(&repo_prompts_dir()),
+        &implement_then_complete_reader(),
+        &spawner,
+        &FixedAttributor(Usage::default()),
+    )
+    .unwrap_err();
+    assert!(
+        err.to_string().contains("BootstrapClaude") && err.to_string().contains("INVALID run"),
+        "bootstrap infra failures must stay invalid: {err}"
+    );
+}
+
+#[test]
+fn session_limit_error_envelope_is_excluded_and_keeps_error_turn_usage() {
+    let spawner = ErrorEnvelopeAtNthSpawner {
+        fail_at: 2,
+        limit: true,
+        calls: RefCell::new(0),
+    };
+    let res = run_collab_task(
+        &ctx(&repo_prompts_dir()),
+        &implement_then_complete_reader(),
+        &spawner,
+        &FixedAttributor(Usage::default()),
+    )
+    .expect("is_error session-limit envelope should be excluded");
+    assert_eq!(res.disposition, RunDisposition::ExcludedRetryable);
     assert_eq!(
         res.claude_usage.total(),
-        15,
-        "partial usage must be preserved on the FAILED path too"
+        30,
+        "usage from the zero-exit error envelope turn must be preserved"
+    );
+}
+
+#[test]
+fn generic_429_error_envelope_is_invalid_not_excluded() {
+    let spawner = ErrorEnvelopeAtNthSpawner {
+        fail_at: 2,
+        limit: false,
+        calls: RefCell::new(0),
+    };
+    let err = run_collab_task(
+        &ctx(&repo_prompts_dir()),
+        &implement_then_complete_reader(),
+        &spawner,
+        &FixedAttributor(Usage::default()),
+    )
+    .unwrap_err();
+    assert!(
+        err.to_string().contains("INVALID run"),
+        "generic task 429 output must not be excluded: {err}"
+    );
+}
+
+#[test]
+fn session_limit_abort_fails_loud_when_codex_attribution_fails() {
+    let spawner = FailAtNthSpawner {
+        fail_at: 2,
+        limit: true,
+        calls: RefCell::new(0),
+    };
+    let err = run_collab_task(
+        &ctx(&repo_prompts_dir()),
+        &implement_then_complete_reader(),
+        &spawner,
+        &FailingAttributor,
+    )
+    .unwrap_err();
+    assert!(
+        err.to_string().contains("Codex token attribution failed"),
+        "excluded sidecar must not write measured zero when attribution fails: {err}"
+    );
+}
+
+#[test]
+fn codex_process_failure_is_invalid_even_with_limit_like_text() {
+    let reader = ScriptedReader {
+        states: vec![st("PlanParallelDrafts", "codex", 0)],
+        idx: RefCell::new(0),
+        draft: None,
+    };
+    let err = run_collab_task(
+        &ctx(&repo_prompts_dir()),
+        &reader,
+        &CodexFailSpawner,
+        &FixedAttributor(Usage::default()),
+    )
+    .unwrap_err();
+    assert!(
+        err.to_string().contains("CodexTurn") && err.to_string().contains("INVALID run"),
+        "Codex CLI/process failures must not be classified as Claude exclusions: {err}"
     );
 }
 
@@ -194,6 +402,7 @@ impl WorkerSpawner for FakeSpawner {
             },
             stdout,
             usage_unparseable: false,
+            is_error: false,
         })
     }
     fn spawn_codex(&self, _session_id: &str, _wt: &Path) -> anyhow::Result<CodexResult> {
@@ -206,6 +415,13 @@ struct FixedAttributor(Usage);
 impl CodexAttributor for FixedAttributor {
     fn attribute(&self) -> anyhow::Result<Usage> {
         Ok(self.0.clone())
+    }
+}
+
+struct FailingAttributor;
+impl CodexAttributor for FailingAttributor {
+    fn attribute(&self) -> anyhow::Result<Usage> {
+        Err(anyhow::anyhow!("rollout scan failed"))
     }
 }
 
@@ -428,6 +644,7 @@ impl WorkerSpawner for ZeroUsageSpawner {
             usage: Usage::default(), // zero every turn
             stdout,
             usage_unparseable: false,
+            is_error: false,
         })
     }
     fn spawn_codex(&self, _session_id: &str, _wt: &std::path::Path) -> anyhow::Result<CodexResult> {
@@ -487,6 +704,7 @@ impl WorkerSpawner for NoRefSpawner {
             },
             stdout,
             usage_unparseable: false,
+            is_error: false,
         })
     }
     fn spawn_codex(&self, _session_id: &str, _wt: &std::path::Path) -> anyhow::Result<CodexResult> {
@@ -599,6 +817,7 @@ impl WorkerSpawner for TaskListBlockerSpawner {
             },
             stdout,
             usage_unparseable: false,
+            is_error: false,
         })
     }
     fn spawn_codex(&self, _session_id: &str, _wt: &std::path::Path) -> anyhow::Result<CodexResult> {

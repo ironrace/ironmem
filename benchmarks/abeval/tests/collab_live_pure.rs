@@ -1,6 +1,7 @@
 use abeval::collab_driver::{parse_session_id, ModelTier};
 use abeval::collab_live::{
-    claude_worker_argv, codex_config, codex_exec_argv, format_worker_failure, worker_text_and_usage,
+    claude_worker_argv, codex_config, codex_exec_argv, collab_outcome_for, format_worker_failure,
+    worker_text_and_usage,
 };
 use std::path::Path;
 
@@ -40,6 +41,24 @@ fn worker_failure_bounds_the_stdout_tail() {
     assert!(
         !msg.contains(head),
         "the head of an oversized transcript must be dropped, not dumped: {msg}"
+    );
+}
+
+#[test]
+fn collab_outcome_mapping_respects_disposition() {
+    use abeval::collab_driver::{RunDisposition, PHASE_CODING_COMPLETE, PHASE_CODING_FAILED};
+
+    assert_eq!(
+        collab_outcome_for(RunDisposition::Terminal, PHASE_CODING_COMPLETE),
+        "completed"
+    );
+    assert_eq!(
+        collab_outcome_for(RunDisposition::Terminal, PHASE_CODING_FAILED),
+        "failed"
+    );
+    assert_eq!(
+        collab_outcome_for(RunDisposition::ExcludedRetryable, "WorkerAborted"),
+        "excluded"
     );
 }
 
@@ -140,6 +159,20 @@ fn worker_text_extracts_result_and_sums_usage_from_stream_json() {
         3 + 40,
         "subagent output tokens summed in"
     );
+}
+
+#[test]
+fn worker_text_preserves_terminal_is_error_flag() {
+    let transcript = concat!(
+        r#"{"type":"assistant","message":{"id":"msg","usage":{"input_tokens":10,"output_tokens":2,"cache_creation_input_tokens":0,"cache_read_input_tokens":0}}}"#,
+        "\n",
+        r#"{"type":"result","is_error":true,"result":"Claude usage limit reached. Resets at 9pm.","usage":{}}"#,
+    );
+
+    let wt = worker_text_and_usage(transcript);
+    assert!(wt.is_error, "terminal is_error must reach the driver");
+    assert_eq!(wt.text, "Claude usage limit reached. Resets at 9pm.");
+    assert_eq!(wt.usage.total(), 12);
 }
 
 #[test]
