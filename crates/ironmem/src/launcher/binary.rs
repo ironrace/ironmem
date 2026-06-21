@@ -9,7 +9,6 @@ use std::path::PathBuf;
 use crate::error::MemoryError;
 
 /// Locate `name` using the process PATH.
-#[allow(dead_code)] // wired up in Task 4
 pub(crate) fn find_on_path(name: &str) -> Result<PathBuf, MemoryError> {
     let path_var = std::env::var_os("PATH").unwrap_or_default();
     find_in_paths(name, &path_var)

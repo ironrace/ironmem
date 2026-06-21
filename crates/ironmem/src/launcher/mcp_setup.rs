@@ -8,14 +8,12 @@ use std::path::Path;
 use crate::error::MemoryError;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[allow(dead_code)] // wired up in Task 4
 pub(crate) enum RegisterOutcome {
     Registered,
     AlreadyRegistered,
 }
 
 /// Write `contents` to `path` atomically (write to a temp sibling, then rename).
-#[allow(dead_code)] // wired up in Task 4
 fn write_atomic(path: &Path, contents: &str) -> Result<(), MemoryError> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
@@ -31,7 +29,6 @@ fn write_atomic(path: &Path, contents: &str) -> Result<(), MemoryError> {
 
 /// Ensure `mcpServers.ironmem = { command: <exe>, args: ["serve"] }` exists in a
 /// Claude `~/.claude.json`-shaped file. Idempotent.
-#[allow(dead_code)] // wired up in Task 4
 pub(crate) fn ensure_claude_registered(
     config_path: &Path,
     exe: &str,
@@ -74,7 +71,6 @@ pub(crate) fn ensure_claude_registered(
 
 /// Ensure a `[mcp_servers.ironmem]` block exists in a Codex `config.toml`.
 /// Appends (never rewrites existing content) so manual edits survive. Idempotent.
-#[allow(dead_code)] // wired up in Task 4
 pub(crate) fn ensure_codex_registered(
     config_path: &Path,
     exe: &str,

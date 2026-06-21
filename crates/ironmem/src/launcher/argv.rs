@@ -2,7 +2,6 @@
 //! Both `claude` and `codex` accept an optional initial prompt as a single
 //! positional argument: `<bin> [prompt]`.
 
-#[allow(dead_code)] // wired up in Task 4
 pub(crate) fn build_args(prompt: Option<&str>) -> Vec<String> {
     match prompt {
         Some(p) => vec![p.to_string()],
