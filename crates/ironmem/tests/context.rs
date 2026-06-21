@@ -234,3 +234,63 @@ fn context_surfaces_lexically_matching_memory_hit() {
         hits[0]["snippet"].as_str().unwrap().chars().count() <= ironmem::context::SNIPPET_MAX_CHARS
     );
 }
+
+#[test]
+fn context_surfaces_decisions_for_requested_area() {
+    let temp = tempfile::tempdir().unwrap();
+    let home = temp.path().join("home");
+    let db_path = temp.path().join("ctx_kg.sqlite3");
+    std::fs::create_dir_all(&home).unwrap();
+    {
+        let db = ironmem::db::schema::Database::open(&db_path).unwrap();
+        db.migrate().unwrap();
+        // Seed a decision keyed on the area name "collab" using the real KG
+        // write API. add_triple auto-creates the "collab" entity (subject) and
+        // stores the triple by entity id; resolve_entity("collab", None) then
+        // recovers that entity and query_entity_current surfaces this triple.
+        let kg = ironmem::db::knowledge_graph::KnowledgeGraph::new(&db);
+        kg.add_triple(
+            "collab",
+            "area",
+            "uses_state_machine",
+            "bounded planning v3",
+            "design",
+            None,
+            1.0,
+            None,
+        )
+        .unwrap();
+    }
+
+    let out = context_command(&home, &db_path)
+        .arg("--repo")
+        .arg(temp.path())
+        .arg("--task")
+        .arg("change collab")
+        .arg("--area")
+        .arg("collab")
+        .arg("--json")
+        .output()
+        .unwrap();
+
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let value: serde_json::Value =
+        serde_json::from_str(&String::from_utf8(out.stdout).unwrap()).unwrap();
+    let decisions = value["decisions"].as_array().unwrap();
+    assert!(
+        decisions
+            .iter()
+            .any(|d| d["predicate"].as_str() == Some("uses_state_machine")),
+        "expected the seeded decision, got {decisions:?}"
+    );
+    let decision = decisions
+        .iter()
+        .find(|d| d["predicate"].as_str() == Some("uses_state_machine"))
+        .expect("seeded decision present");
+    assert_eq!(decision["subject"].as_str(), Some("collab"));
+    assert_eq!(decision["object"].as_str(), Some("bounded planning v3"));
+}

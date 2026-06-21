@@ -2,12 +2,14 @@
 //! should start a coding session with — relevant memory, known decisions, and
 //! per-area code-map freshness — from existing memory/code-map primitives.
 
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
 use serde::Serialize;
 
 use crate::code_maps::freshness::{classify, Freshness};
 use crate::db::drawers::SearchFilters;
+use crate::db::knowledge_graph::KnowledgeGraph;
 use crate::error::MemoryError;
 use crate::mcp::app::App;
 use crate::sanitize::sanitize_name;
@@ -22,6 +24,8 @@ pub const DEFAULT_BUDGET_TOKENS: usize = 2000;
 pub const SNIPPET_MAX_CHARS: usize = 240;
 /// Maximum memory hits requested before budget bounding.
 pub const MAX_MEMORY_HITS: usize = 10;
+/// Maximum decisions surfaced per requested area.
+pub const MAX_DECISIONS_PER_AREA: usize = 5;
 
 /// Inputs for a single context-pack request.
 #[derive(Debug, Clone)]
@@ -133,12 +137,45 @@ pub fn run_context(app: &App, opts: &ContextPackOptions) -> Result<ContextPack, 
             Vec::new()
         }
     };
+    let kg = KnowledgeGraph::new(&app.db);
+    let mut decisions: Vec<DecisionHit> = Vec::new();
+    let mut seen: HashSet<(String, String, String)> = HashSet::new();
+    let mut name_cache: HashMap<String, String> = HashMap::new();
+    for raw in &opts.areas {
+        let name = match sanitize_name(raw, "area") {
+            Ok(a) => a,
+            Err(_) => continue,
+        };
+        // resolve_entity NotFound is the normal "area has no decisions" path — skip silently.
+        let Ok(entity) = kg.resolve_entity(&name, None) else {
+            continue;
+        };
+        let triples = match kg.query_entity_current(&entity.id, MAX_DECISIONS_PER_AREA) {
+            Ok(t) => t,
+            Err(e) => {
+                eprintln!("context: decision recall failed for area '{name}', continuing: {e}");
+                continue;
+            }
+        };
+        for t in triples {
+            let key = (t.subject.clone(), t.predicate.clone(), t.object.clone());
+            if seen.insert(key) {
+                let subject = resolve_entity_name(&kg, &mut name_cache, t.subject);
+                let object = resolve_entity_name(&kg, &mut name_cache, t.object);
+                decisions.push(DecisionHit {
+                    subject,
+                    predicate: t.predicate,
+                    object,
+                });
+            }
+        }
+    }
     Ok(ContextPack {
         task: opts.task.clone(),
         repo,
         budget_tokens: opts.budget_tokens,
         memory_hits,
-        decisions: Vec::new(),
+        decisions,
         areas,
         truncated: false,
     })
@@ -221,6 +258,24 @@ fn canonical_repo(repo: &std::path::Path) -> String {
     std::fs::canonicalize(repo)
         .map(|p| p.to_string_lossy().into_owned())
         .unwrap_or_else(|_| repo.to_string_lossy().into_owned())
+}
+
+/// Resolve a KG entity id to its display name, memoized. Falls back to the raw
+/// id when the entity cannot be looked up (best-effort, never fails the pack).
+fn resolve_entity_name(
+    kg: &KnowledgeGraph,
+    cache: &mut HashMap<String, String>,
+    id: String,
+) -> String {
+    if let Some(name) = cache.get(&id) {
+        return name.clone();
+    }
+    let name = match kg.get_entity(&id) {
+        Ok(Some(entity)) => entity.name,
+        _ => id.clone(),
+    };
+    cache.insert(id, name.clone());
+    name
 }
 
 #[cfg(test)]
