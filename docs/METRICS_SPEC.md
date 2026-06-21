@@ -819,3 +819,61 @@ available in UPS).
 **Implementation.** `crates/ironmem/src/metrics/transcript.rs` (parsers),
 `crates/ironmem/src/db/metrics.rs::upsert_transcript_token_usage` (idempotent DB
 helper), `crates/ironmem/src/hook.rs::persist_transcript_tokens` (wiring).
+
+### §13 — 2026-06-21: Product-facing exploration value summary (issue #145)
+
+**Summary.** `ironmem report` (text + `--json`) now leads its exploration output
+with a product-facing **value summary** that answers "is this reducing repeated
+exploration?" without overclaiming. It is a *presentation-layer projection* of the
+existing §10 Phase-5 `exploration` aggregate plus two repeated-context indicators —
+**no new counters, units, aggregation rules, or schema migrations.** The pre-existing
+`exploration` block is retained verbatim and relabelled `Code-map exploration
+(diagnostic)` in text.
+
+**JSON contract (`report.value_summary`, stable field names).**
+- `min_turns` (int) — the sufficiency threshold (see below), echoed so consumers
+  need not hard-code it.
+- `sufficient_data` (bool) — `total_turns >= min_turns`. **Only when true should a
+  savings headline be read.**
+- `total_turns`, `map_hit_turns`, `map_miss_turns` (int) — distinct exploration
+  turns and their per-turn verdicts (same definitions as §10 / the 2026-06-15 issue #94 amendment).
+- `hit_rate` (float) — `map_hit_turns / total_turns`.
+- `mean_tokens_map_hit`, `mean_tokens_map_miss` (float) — per-turn token proxy
+  (v0 = response-size `ceil(chars/4)`; see the 2026-06-15 issue #94 amendment).
+- `exploration_token_delta` (float) — `mean_tokens_map_miss - mean_tokens_map_hit`.
+  A token-proxy difference across disjoint turn populations, **not** a measured
+  saving and **not** a percentage-savings claim. JSON always carries the raw
+  value; the **text** renderer withholds it (shows `delta n/a`) when either
+  verdict bucket is empty, since a one-sided sample yields no comparison.
+- `mcp_response` (object|null) — repeated-context indicator over all
+  `source='mcp_response'` rows: `{ row_count, total_output_tokens, mean_output_tokens }`.
+  `null` when none recorded.
+- `transcript_coverage` (object|null) — `{ turn_count, total_tokens }` over
+  `source='transcript'` rows. `null` when none recorded.
+
+**Too-little-data behaviour.** Below `min_turns` exploration turns the text renderer
+prints `Exploration value: not enough exploration data yet (N/min turns) — collect
+more before reading results.` and the JSON sets `sufficient_data=false` while still
+exposing every field (the counts are honest; only the *headline* is withheld).
+
+**Threshold.** `EXPLORATION_MIN_TURNS = 8` (`crates/ironmem/src/report/mod.rs`),
+mirroring the spirit of §11.3's 8-completed-tasks reporting floor applied to
+exploration turns. Single source of truth, referenced by `run_report` and the text
+renderer.
+
+**How to collect enough data.** Exploration turns come from tagged
+`source='mcp_response'` rows (one distinct `turn_id` with a `map_hit`/`map_miss`
+verdict per turn), written by the live code-map MCP path (`account_mcp_response`,
+driven from `mcp/server.rs`) under `metrics_enabled()` / `IRONMEM_METRICS != 0`. To
+reach a readable summary: run real sessions that load/scout code maps until at least
+8 distinct exploration turns accrue (`ironmem report` shows the running `N/8`). The
+`mcp_response` and `transcript_coverage` indicators populate from the same
+production hooks documented in the §12 amendment; no extra configuration is needed
+beyond leaving metrics enabled.
+
+**Implementation.** Read-only aggregates
+`crates/ironmem/src/db/metrics.rs::{report_mcp_response_sizing, report_transcript_coverage}`;
+assembly `report/mod.rs::build_value_summary`; rendering
+`report/render.rs::render_value_summary`. Tests: unit (`report/mod.rs`,
+`report/render.rs`, `db/metrics.rs`) + integration JSON contract
+(`tests/report_golden.rs`).

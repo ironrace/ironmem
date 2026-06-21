@@ -417,6 +417,30 @@ pub struct ExplorationReport {
     pub mean_tokens_map_miss: f64,
 }
 
+/// Repeated-context indicator: aggregate sizing of all `source='mcp_response'`
+/// rows. `output_tokens` is the v0 response-size proxy (`ceil(chars / 4)`); a
+/// large mean signals heavy repeated context flowing through MCP responses.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct McpResponseSizing {
+    /// Number of `source='mcp_response'` rows.
+    pub row_count: i64,
+    /// Σ `output_tokens` (response-size proxy) over those rows.
+    pub total_output_tokens: i64,
+    /// `total_output_tokens / row_count`; `0.0` when `row_count == 0`.
+    pub mean_output_tokens: f64,
+}
+
+/// Repeated-context indicator: how many turns the transcript-token capture
+/// covers (`source='transcript'` rows). Higher coverage means richer per-turn
+/// token data underpinning the value summary.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TranscriptCoverage {
+    /// Distinct `turn_id` values with a `source='transcript'` row.
+    pub turn_count: i64,
+    /// Σ `input_tokens + output_tokens` over `source='transcript'` rows.
+    pub total_tokens: i64,
+}
+
 /// METRICS_SPEC §10.2 split row.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TaskEstimatedSplit {
@@ -1029,6 +1053,45 @@ impl Database {
             hit_rate,
             mean_tokens_map_hit,
             mean_tokens_map_miss,
+        })
+    }
+
+    /// Aggregate sizing over all `source='mcp_response'` rows (issue #145).
+    /// Read-only; no schema dependency beyond the existing `token_usage` table.
+    pub fn report_mcp_response_sizing(&self) -> Result<McpResponseSizing, MemoryError> {
+        let (row_count, total_output_tokens) = self.conn.query_row(
+            "SELECT COUNT(*), COALESCE(SUM(output_tokens), 0)
+             FROM token_usage
+             WHERE source = 'mcp_response'",
+            [],
+            |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)),
+        )?;
+        let mean_output_tokens = if row_count == 0 {
+            0.0
+        } else {
+            total_output_tokens as f64 / row_count as f64
+        };
+        Ok(McpResponseSizing {
+            row_count,
+            total_output_tokens,
+            mean_output_tokens,
+        })
+    }
+
+    /// Transcript-token coverage over `source='transcript'` rows (issue #145):
+    /// distinct covered turns + summed `input + output` tokens. Read-only.
+    pub fn report_transcript_coverage(&self) -> Result<TranscriptCoverage, MemoryError> {
+        let (turn_count, total_tokens) = self.conn.query_row(
+            "SELECT COUNT(DISTINCT turn_id),
+                    COALESCE(SUM(input_tokens + output_tokens), 0)
+             FROM token_usage
+             WHERE source = 'transcript' AND turn_id IS NOT NULL",
+            [],
+            |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)),
+        )?;
+        Ok(TranscriptCoverage {
+            turn_count,
+            total_tokens,
         })
     }
 
@@ -2646,5 +2709,73 @@ mod tests {
             "BEGIN IMMEDIATE must serialize concurrent upserts of one turn_id to a single row"
         );
         assert_eq!(tx_rows[0].input_tokens, 100);
+    }
+
+    // ---- issue #145: repeated-context indicators for the value summary ----
+
+    /// `report_mcp_response_sizing` aggregates ALL `source='mcp_response'` rows
+    /// (not just map-tagged exploration turns): row count + total/mean of the
+    /// response-size token proxy (`output_tokens`).
+    #[test]
+    fn report_mcp_response_sizing_aggregates_rows() {
+        let db = db();
+        // Two mcp_response rows (record_exploration_tokens writes source='mcp_response').
+        db.record_exploration_tokens(
+            "2026-06-21T00:00:01Z",
+            "claude",
+            10,
+            50,
+            Some(MapStatus::Hit),
+            Some("t1"),
+            Some("core"),
+        )
+        .unwrap();
+        db.record_exploration_tokens(
+            "2026-06-21T00:00:02Z",
+            "claude",
+            10,
+            30,
+            Some(MapStatus::Miss),
+            Some("t2"),
+            Some("auth"),
+        )
+        .unwrap();
+
+        let sizing = db.report_mcp_response_sizing().unwrap();
+        assert_eq!(sizing.row_count, 2);
+        assert_eq!(sizing.total_output_tokens, 80);
+        assert!((sizing.mean_output_tokens - 40.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn report_mcp_response_sizing_empty_is_zero() {
+        let db = db();
+        let sizing = db.report_mcp_response_sizing().unwrap();
+        assert_eq!(sizing.row_count, 0);
+        assert_eq!(sizing.total_output_tokens, 0);
+        assert_eq!(sizing.mean_output_tokens, 0.0);
+    }
+
+    /// `report_transcript_coverage` counts distinct transcript-covered turns and
+    /// sums their `input + output` tokens over `source='transcript'` rows.
+    #[test]
+    fn report_transcript_coverage_counts_turns() {
+        let db = db();
+        db.upsert_transcript_token_usage(&transcript_row("turn-1", 100, 20, 0, 0))
+            .unwrap();
+        db.upsert_transcript_token_usage(&transcript_row("turn-2", 200, 30, 0, 0))
+            .unwrap();
+
+        let cov = db.report_transcript_coverage().unwrap();
+        assert_eq!(cov.turn_count, 2);
+        assert_eq!(cov.total_tokens, 350);
+    }
+
+    #[test]
+    fn report_transcript_coverage_empty_is_zero() {
+        let db = db();
+        let cov = db.report_transcript_coverage().unwrap();
+        assert_eq!(cov.turn_count, 0);
+        assert_eq!(cov.total_tokens, 0);
     }
 }

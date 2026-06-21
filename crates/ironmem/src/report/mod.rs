@@ -19,7 +19,8 @@ use chrono::{DateTime, NaiveDate, SecondsFormat, Utc};
 use serde::Serialize;
 
 use crate::db::metrics::{
-    ExplorationReport, HeadlineTokens, TaskEstimatedSplit, TaskOutcome, TaskPhaseModelTokens,
+    ExplorationReport, HeadlineTokens, McpResponseSizing, TaskEstimatedSplit, TaskOutcome,
+    TaskPhaseModelTokens, TranscriptCoverage,
 };
 use crate::db::schema::Database;
 use crate::error::MemoryError;
@@ -34,6 +35,13 @@ const PHASE_ORDER: &[&str] = &["planning", "impl", "review", "rework", "other"];
 /// of truth for the threshold — referenced by [`run_report`], [`one_line_summary`],
 /// and the text renderer so the three can never drift apart.
 pub(crate) const BASELINE_READY_THRESHOLD: usize = 10;
+
+/// Minimum distinct exploration turns before the product-facing value summary
+/// (issue #145) presents a hit-rate / savings headline rather than a
+/// "not enough data yet" notice. Mirrors the spirit of METRICS_SPEC §11.3's
+/// 8-completed-tasks reporting floor, applied to exploration turns. Single
+/// source of truth — referenced by [`run_report`] and the text renderer.
+pub(crate) const EXPLORATION_MIN_TURNS: usize = 8;
 
 /// Sort key for a `collab_phase` bucket: its index in [`PHASE_ORDER`], or one
 /// past the end for any unrecognized bucket, with `None` sorting last of all.
@@ -210,6 +218,39 @@ pub struct HeadlineRow {
     pub provider_reported_cost_usd: Option<f64>,
 }
 
+/// Product-facing exploration value summary (issue #145). A presentation-layer
+/// projection of [`ExplorationReport`] plus the repeated-context indicators,
+/// gated by [`EXPLORATION_MIN_TURNS`] so a thin sample never yields a headline
+/// savings claim. JSON field names are stable contract surface.
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct ValueSummary {
+    /// Threshold (turns) below which `sufficient_data` is false. Echoed so JSON
+    /// consumers can render the "N/min" progress without hard-coding the gate.
+    pub min_turns: i64,
+    /// `total_turns >= min_turns` — only then should a savings headline be read.
+    pub sufficient_data: bool,
+    /// Distinct exploration turns (`map_hit_turns + map_miss_turns`).
+    pub total_turns: i64,
+    /// Turns whose verdict was `map_hit` (a hit and no miss).
+    pub map_hit_turns: i64,
+    /// Turns whose verdict was `map_miss`.
+    pub map_miss_turns: i64,
+    /// `map_hit_turns / total_turns`; `0.0` when no turns.
+    pub hit_rate: f64,
+    /// Mean per-turn token proxy for hit turns (METRICS_SPEC §10 v0 proxy).
+    pub mean_tokens_map_hit: f64,
+    /// Mean per-turn token proxy for miss turns.
+    pub mean_tokens_map_miss: f64,
+    /// `mean_tokens_map_miss - mean_tokens_map_hit`: the per-hit-turn
+    /// exploration-token proxy delta (positive ⟹ hits cost fewer tokens). Not a
+    /// percentage-savings claim — it is a token-proxy difference only.
+    pub exploration_token_delta: f64,
+    /// MCP-response sizing indicator; `None` when no `mcp_response` rows recorded.
+    pub mcp_response: Option<McpResponseSizing>,
+    /// Transcript-token coverage indicator; `None` when no transcript rows.
+    pub transcript_coverage: Option<TranscriptCoverage>,
+}
+
 /// The full `ironmem report` payload (serialized verbatim by `--json`).
 #[derive(Debug, Clone, Serialize, PartialEq)]
 pub struct Report {
@@ -228,9 +269,47 @@ pub struct Report {
     /// Phase-5 code-map exploration attribution: hit rate and per-turn token
     /// means for `map_hit` vs `map_miss` turns.
     pub exploration: ExplorationReport,
+    /// Product-facing exploration value summary (issue #145): a sample-gated
+    /// projection of `exploration` plus repeated-context indicators.
+    pub value_summary: ValueSummary,
     /// Sorted-unique labels for measured groups with no §7 price (unknown model
     /// id, `"<none>"` for NULL model, `"codex"` for any codex group).
     pub unpriced_models: Vec<String>,
+}
+
+/// Build the product-facing [`ValueSummary`] from the exploration aggregate and
+/// the two repeated-context indicators. An indicator with no recorded rows is
+/// surfaced as `None` (omitted) rather than a misleading zero.
+fn build_value_summary(
+    exploration: &ExplorationReport,
+    mcp: McpResponseSizing,
+    coverage: TranscriptCoverage,
+) -> ValueSummary {
+    // The exploration aggregate is produced by trusted SQL; assert its
+    // cross-field invariants at the projection boundary so an upstream
+    // regression surfaces here (debug builds only — zero release cost).
+    debug_assert_eq!(
+        exploration.total_turns,
+        exploration.map_hit_turns + exploration.map_miss_turns,
+        "exploration turn counts must sum to total_turns",
+    );
+    debug_assert!(
+        (0.0..=1.0).contains(&exploration.hit_rate),
+        "hit_rate must be a fraction in [0, 1]",
+    );
+    ValueSummary {
+        min_turns: EXPLORATION_MIN_TURNS as i64,
+        sufficient_data: exploration.total_turns >= EXPLORATION_MIN_TURNS as i64,
+        total_turns: exploration.total_turns,
+        map_hit_turns: exploration.map_hit_turns,
+        map_miss_turns: exploration.map_miss_turns,
+        hit_rate: exploration.hit_rate,
+        mean_tokens_map_hit: exploration.mean_tokens_map_hit,
+        mean_tokens_map_miss: exploration.mean_tokens_map_miss,
+        exploration_token_delta: exploration.mean_tokens_map_miss - exploration.mean_tokens_map_hit,
+        mcp_response: (mcp.row_count > 0).then_some(mcp),
+        transcript_coverage: (coverage.turn_count > 0).then_some(coverage),
+    }
 }
 
 /// Label a §7-unpriceable measured group for `unpriced_models`: `"codex"` for
@@ -302,6 +381,8 @@ pub fn run_report(db: &Database, opts: &ReportOptions) -> Result<Report, MemoryE
     let headline_rows = db.report_headline(task, since_filter)?;
     let non_completion_rows = db.report_non_completions(task, since_filter)?;
     let exploration = db.report_exploration_delta()?;
+    let mcp_sizing = db.report_mcp_response_sizing()?;
+    let transcript_coverage = db.report_transcript_coverage()?;
 
     // Distinct task_keys present in any canonical task-shaped query (§10.1,
     // §10.2, or §10.3). This keeps estimated-only and outcome-only tasks visible
@@ -339,6 +420,7 @@ pub fn run_report(db: &Database, opts: &ReportOptions) -> Result<Report, MemoryE
         headline,
         non_completions,
         tasks,
+        value_summary: build_value_summary(&exploration, mcp_sizing, transcript_coverage),
         exploration,
         unpriced_models,
     })
@@ -691,6 +773,150 @@ mod tests {
         assert!((report.exploration.hit_rate - 0.5).abs() < 1e-9);
         assert!((report.exploration.mean_tokens_map_hit - 10.0).abs() < 1e-9);
         assert!((report.exploration.mean_tokens_map_miss - 30.0).abs() < 1e-9);
+    }
+
+    /// issue #145: with fewer than `EXPLORATION_MIN_TURNS` exploration turns,
+    /// the value summary reports `sufficient_data == false` (no headline claim)
+    /// while still exposing the counts under stable names.
+    #[test]
+    fn value_summary_flags_insufficient_data_below_threshold() {
+        let db = Database::open_in_memory().unwrap();
+        db.record_exploration_tokens(
+            "2026-06-21T00:00:00Z",
+            "claude",
+            0,
+            25,
+            Some(MapStatus::Hit),
+            Some("turn-hit"),
+            Some("core"),
+        )
+        .unwrap();
+
+        let report = run_report(&db, &ReportOptions::default()).unwrap();
+        let vs = &report.value_summary;
+        assert_eq!(vs.min_turns, EXPLORATION_MIN_TURNS as i64);
+        assert_eq!(vs.total_turns, 1);
+        assert!(!vs.sufficient_data, "1 turn < {EXPLORATION_MIN_TURNS}");
+        assert_eq!(vs.map_hit_turns, 1);
+        // The 1 exploration row is a `source='mcp_response'` row, so the MCP
+        // indicator is present; no transcript rows → coverage absent.
+        assert!(vs.mcp_response.is_some(), "mcp indicator present");
+        assert!(vs.transcript_coverage.is_none());
+    }
+
+    /// issue #145: at/above the threshold the summary is `sufficient_data` and
+    /// carries the map-hit-vs-miss token proxy delta plus repeated-context
+    /// indicators (mcp sizing + transcript coverage) when those rows exist.
+    #[test]
+    fn value_summary_reports_delta_and_indicators_when_sufficient() {
+        let db = Database::open_in_memory().unwrap();
+        // 8 hit turns (25 tok) + 2 miss turns (75 tok) = 10 turns ≥ threshold.
+        for i in 0..8 {
+            db.record_exploration_tokens(
+                "2026-06-21T00:00:00Z",
+                "claude",
+                0,
+                25,
+                Some(MapStatus::Hit),
+                Some(&format!("hit-{i}")),
+                Some("core"),
+            )
+            .unwrap();
+        }
+        for i in 0..2 {
+            db.record_exploration_tokens(
+                "2026-06-21T00:00:00Z",
+                "claude",
+                0,
+                75,
+                Some(MapStatus::Miss),
+                Some(&format!("miss-{i}")),
+                Some("core"),
+            )
+            .unwrap();
+        }
+        // One transcript-covered turn so the coverage indicator is present.
+        db.upsert_transcript_token_usage(&NewTokenUsage {
+            ts: "2026-06-21T00:00:00Z".into(),
+            source: "transcript".into(),
+            harness: "claude".into(),
+            model: Some("claude-opus-4-8".into()),
+            session_id: None,
+            collab_session_id: None,
+            collab_phase: None,
+            task_tag: None,
+            input_tokens: 100,
+            output_tokens: 20,
+            cache_creation_input_tokens: 0,
+            cache_read_input_tokens: 0,
+            estimated: false,
+            chars: 0,
+            cost_usd: None,
+            map_status: None,
+            turn_id: Some("tx-1".into()),
+            area: None,
+        })
+        .unwrap();
+
+        let report = run_report(&db, &ReportOptions::default()).unwrap();
+        let vs = &report.value_summary;
+        assert!(vs.sufficient_data, "10 turns ≥ {EXPLORATION_MIN_TURNS}");
+        assert_eq!(vs.total_turns, 10);
+        assert_eq!(vs.map_hit_turns, 8);
+        assert_eq!(vs.map_miss_turns, 2);
+        assert!((vs.hit_rate - 0.8).abs() < 1e-9);
+        // token-proxy delta = mean miss (75) - mean hit (25) = 50 (NOT a savings
+        // claim — a difference across disjoint turn populations).
+        assert!((vs.exploration_token_delta - 50.0).abs() < 1e-9);
+        // mcp_response indicator present (10 exploration rows are mcp_response).
+        let mcp = vs.mcp_response.as_ref().expect("mcp sizing present");
+        assert_eq!(mcp.row_count, 10);
+        // transcript coverage present (1 covered turn).
+        let cov = vs
+            .transcript_coverage
+            .as_ref()
+            .expect("transcript coverage present");
+        assert_eq!(cov.turn_count, 1);
+    }
+
+    /// issue #145: boundary-value test for the `>=` sufficiency gate. Exactly
+    /// `EXPLORATION_MIN_TURNS` turns must be sufficient; one fewer must not be.
+    /// Guards against a `>=`→`>` regression silently raising the floor.
+    #[test]
+    fn value_summary_sufficiency_at_exact_threshold_boundary() {
+        let seed = |n: usize| {
+            let db = Database::open_in_memory().unwrap();
+            for i in 0..n {
+                db.record_exploration_tokens(
+                    "2026-06-21T00:00:00Z",
+                    "claude",
+                    0,
+                    25,
+                    Some(MapStatus::Hit),
+                    Some(&format!("hit-{i}")),
+                    Some("core"),
+                )
+                .unwrap();
+            }
+            run_report(&db, &ReportOptions::default())
+                .unwrap()
+                .value_summary
+        };
+
+        let at = seed(EXPLORATION_MIN_TURNS);
+        assert_eq!(at.total_turns, EXPLORATION_MIN_TURNS as i64);
+        assert!(
+            at.sufficient_data,
+            "exactly {EXPLORATION_MIN_TURNS} is enough"
+        );
+
+        let below = seed(EXPLORATION_MIN_TURNS - 1);
+        assert_eq!(below.total_turns, EXPLORATION_MIN_TURNS as i64 - 1);
+        assert!(
+            !below.sufficient_data,
+            "{} turns is below the floor",
+            EXPLORATION_MIN_TURNS - 1
+        );
     }
 
     #[test]
