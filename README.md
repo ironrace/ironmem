@@ -131,6 +131,9 @@ If you manage MCP configuration yourself, pass `--no-mcp-setup` to skip step 3:
 ironmem claude . --no-mcp-setup
 ```
 
+> A prompt that begins with `-` must be separated with `--`, e.g.
+> `ironmem claude . -- "--version is broken"`.
+
 The manual MCP setup path remains fully supported.
 
 ## CLI

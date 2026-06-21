@@ -76,6 +76,51 @@ fn claude_launcher_runs_stub_with_prompt_and_repo_cwd() {
 }
 
 #[test]
+fn claude_launcher_registers_mcp_server_by_default() {
+    let temp = tempfile::tempdir().unwrap();
+    let home = temp.path().join("home");
+    let db_path = temp.path().join("memory.sqlite3");
+    let bin_dir = temp.path().join("bin");
+    let repo = temp.path().join("repo");
+    let record = temp.path().join("rec");
+    std::fs::create_dir_all(&home).unwrap();
+    std::fs::create_dir_all(&bin_dir).unwrap();
+    std::fs::create_dir_all(&repo).unwrap();
+    std::fs::write(repo.join("README.md"), "# repo\ncontent to mine").unwrap();
+    write_stub(&bin_dir, "claude", &record);
+
+    // No --no-mcp-setup: the launcher must register the MCP server itself.
+    let out = launcher_command(&home, &db_path, &bin_dir)
+        .arg("claude")
+        .arg(&repo)
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "launcher failed: {out:?}");
+
+    // The stub still ran (launch happened after registration).
+    assert!(std::fs::metadata(format!("{}.args", record.display())).is_ok());
+
+    // ~/.claude.json under the hermetic HOME now contains the ironmem server,
+    // pointing `command` at this ironmem binary with `serve`.
+    let claude_cfg = std::fs::read_to_string(home.join(".claude.json"))
+        .expect("launcher should create ~/.claude.json");
+    let v: serde_json::Value = serde_json::from_str(&claude_cfg).unwrap();
+    let server = &v["mcpServers"]["ironmem"];
+    assert!(
+        server.is_object(),
+        "ironmem MCP server should be registered: {claude_cfg}"
+    );
+    assert_eq!(server["args"][0].as_str(), Some("serve"));
+    assert!(
+        server["command"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("ironmem"),
+        "command should point at the ironmem binary: {claude_cfg}"
+    );
+}
+
+#[test]
 fn launcher_errors_clearly_when_binary_missing() {
     let temp = tempfile::tempdir().unwrap();
     let home = temp.path().join("home");
