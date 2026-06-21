@@ -16,7 +16,7 @@ What that means in practice:
   repository from scratch.
 - **Local and private by default.** Everything lives in one local SQLite store
   on your machine (`~/.ironrace-memory/memory.sqlite3`). No cloud, no account,
-  no Python.
+  no Python runtime.
 - **Shared across Claude Code and Codex.** Both harnesses read and write the
   same memory, so context carried in a Claude session is available in Codex, and
   vice versa.
