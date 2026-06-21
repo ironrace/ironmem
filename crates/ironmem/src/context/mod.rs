@@ -26,6 +26,8 @@ pub const SNIPPET_MAX_CHARS: usize = 240;
 pub const MAX_MEMORY_HITS: usize = 10;
 /// Maximum decisions surfaced per requested area.
 pub const MAX_DECISIONS_PER_AREA: usize = 5;
+/// Maximum characters kept from a code-map drawer body when used as a summary.
+pub const SUMMARY_MAX_CHARS: usize = 1000;
 
 /// Inputs for a single context-pack request.
 #[derive(Debug, Clone)]
@@ -98,8 +100,8 @@ pub struct ContextPack {
     pub truncated: bool,
 }
 
-/// Assemble a context pack. Later tasks fill in memory/decisions/areas; this
-/// skeleton returns an empty-but-well-formed pack.
+/// Assemble a context pack: relevant memory hits, per-area code-map freshness,
+/// and known decisions, bounded to the requested token budget.
 pub fn run_context(app: &App, opts: &ContextPackOptions) -> Result<ContextPack, MemoryError> {
     let repo = canonical_repo(&opts.repo);
     let repo_path = std::path::Path::new(&repo);
@@ -146,9 +148,17 @@ pub fn run_context(app: &App, opts: &ContextPackOptions) -> Result<ContextPack, 
             Ok(a) => a,
             Err(_) => continue,
         };
-        // resolve_entity NotFound is the normal "area has no decisions" path — skip silently.
-        let Ok(entity) = kg.resolve_entity(&name, None) else {
-            continue;
+        // NotFound is the normal "area has no decisions" path — skip silently.
+        // Other errors (e.g. an ambiguous name → Validation) are genuine; log
+        // them to stderr (consistent with the eprintln! calls in this function)
+        // and continue without failing the pack.
+        let entity = match kg.resolve_entity(&name, None) {
+            Ok(e) => e,
+            Err(MemoryError::NotFound(_)) => continue,
+            Err(e) => {
+                eprintln!("context: entity resolution skipped for area '{name}': {e}");
+                continue;
+            }
         };
         let triples = match kg.query_entity_current(&entity.id, MAX_DECISIONS_PER_AREA) {
             Ok(t) => t,
@@ -216,7 +226,7 @@ fn resolve_area(app: &App, repo: &str, repo_path: &std::path::Path, raw_area: &s
                 .get_drawer(&map.drawer_id)
                 .ok()
                 .flatten()
-                .map(|d| d.content)
+                .map(|d| bound_summary(&d.content))
                 .unwrap_or_default();
             AreaStatus::Fresh {
                 head_sha: short_sha(&map.head_sha),
@@ -264,6 +274,16 @@ fn bound_memory_hits(hits: &mut Vec<MemoryHit>, budget_tokens: usize) -> bool {
 /// First 7 characters of a SHA, or the whole string if shorter.
 fn short_sha(sha: &str) -> String {
     sha.chars().take(7).collect()
+}
+
+/// Trim a code-map summary to a bounded length, preserving readability.
+fn bound_summary(content: &str) -> String {
+    if content.chars().count() <= SUMMARY_MAX_CHARS {
+        content.to_string()
+    } else {
+        let truncated: String = content.chars().take(SUMMARY_MAX_CHARS).collect();
+        format!("{truncated}…")
+    }
 }
 
 /// Trim a drawer body to a bounded, single-line-ish snippet.
@@ -321,6 +341,19 @@ mod tests {
         // Bounded to the cap plus the single-char ellipsis.
         assert_eq!(out.chars().count(), SNIPPET_MAX_CHARS + 1);
         assert!(out.ends_with('…'));
+    }
+
+    #[test]
+    fn bound_summary_caps_long_multibyte_and_passes_short_through() {
+        // >1000 multibyte chars must be capped to the cap plus a single ellipsis.
+        let long: String = "é".repeat(1500);
+        let out = bound_summary(&long);
+        assert_eq!(out.chars().count(), SUMMARY_MAX_CHARS + 1);
+        assert!(out.ends_with('…'));
+
+        // Short content passes through unchanged.
+        let short = "collab handoff lives in state_machine.rs";
+        assert_eq!(bound_summary(short), short);
     }
 
     fn hit(id: &str) -> MemoryHit {
