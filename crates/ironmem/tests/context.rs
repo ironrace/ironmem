@@ -346,3 +346,37 @@ fn context_tiny_budget_sets_truncated_flag() {
     assert_eq!(value["truncated"].as_bool(), Some(true));
     assert!(value["memory_hits"].as_array().unwrap().len() < 6);
 }
+
+#[test]
+fn context_text_marks_fresh_maps_as_pointers_and_missing_as_scout() {
+    let temp = tempfile::tempdir().unwrap();
+    let home = temp.path().join("home");
+    let db_path = temp.path().join("ctx_render.sqlite3");
+    std::fs::create_dir_all(&home).unwrap();
+    {
+        let db = ironmem::db::schema::Database::open(&db_path).unwrap();
+        db.migrate().unwrap();
+    }
+
+    let out = context_command(&home, &db_path)
+        .arg("--repo")
+        .arg(temp.path())
+        .arg("--task")
+        .arg("touch collab")
+        .arg("--area")
+        .arg("collab")
+        .output() // text mode (no --json)
+        .unwrap();
+
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let text = String::from_utf8(out.stdout).unwrap();
+    assert!(text.contains("touch collab"));
+    // Missing map renders an explicit scout-required section.
+    assert!(text.to_lowercase().contains("scout required"));
+    // The code-map pointer disclaimer is present whenever areas are shown.
+    assert!(text.to_lowercase().contains("pointer"));
+}
