@@ -20,6 +20,11 @@ const COLLAB_GENERATION_LEASE_SQL: &str =
     include_str!("../../migrations/010_collab_generation_lease.sql");
 const CODE_MAPS_SQL: &str = include_str!("../../migrations/011_code_maps.sql");
 
+/// Highest schema version a fully-migrated database reports. Bump alongside the
+/// `run_version_gated_migrations` ladder above so `ironmem doctor` can tell a
+/// behind-migration database from an up-to-date one.
+pub const LATEST_SCHEMA_VERSION: i64 = 11;
+
 /// Database wrapper around a SQLite connection.
 ///
 /// `conn` is intentionally restricted to `pub(super)` (visible only within
@@ -201,6 +206,13 @@ impl Database {
         Ok(())
     }
 
+    /// Read the highest applied schema version from this connection without
+    /// running any migration. Useful for diagnostics (`ironmem doctor`) on a
+    /// database that may be behind the current binary.
+    pub fn schema_version(&self) -> Result<i64, MemoryError> {
+        read_schema_version(&self.conn)
+    }
+
     pub fn create_collab_tables(&self) -> Result<(), MemoryError> {
         retry_on_busy(|| self.conn.execute_batch(COLLAB_SQL))?;
         Ok(())
@@ -347,6 +359,28 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("sub").join("test.db");
         (dir, db_path)
+    }
+
+    #[test]
+    fn latest_schema_version_matches_highest_migration() {
+        // The exported constant must track the highest migration a fresh,
+        // fully-migrated database reports — doctor compares against it.
+        let db = Database::open_in_memory().unwrap();
+        assert_eq!(LATEST_SCHEMA_VERSION, db.schema_version().unwrap());
+        assert_eq!(LATEST_SCHEMA_VERSION, 11);
+    }
+
+    #[test]
+    fn schema_version_reads_current_version_without_migrating() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("m.sqlite3");
+        {
+            let db = Database::open(&path).unwrap();
+            db.migrate().unwrap();
+        }
+        // Re-open without migrating; the persisted version is still readable.
+        let db = Database::open(&path).unwrap();
+        assert_eq!(db.schema_version().unwrap(), LATEST_SCHEMA_VERSION);
     }
 
     #[test]

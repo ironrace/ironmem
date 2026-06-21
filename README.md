@@ -123,6 +123,40 @@ The block is sourced from a single in-source constant (`MEMORY_PROTOCOL`) and is
 safe to re-run — it replaces only the managed block and never touches surrounding
 content. **Explicit opt-in only: no hook ever runs this for you.**
 
+### `ironmem doctor`
+
+Validate a local install in one command. `doctor` reports the binary version,
+database path and schema/migration status, embedding-model cache status, MCP
+access mode, warmup readiness, and which harnesses (Claude Code, Codex) have the
+`ironmem` MCP server registered:
+
+```bash
+ironmem doctor          # human-readable diagnostics
+ironmem doctor --json   # machine-readable, for scripts/CI
+```
+
+It **diagnoses only** — it never modifies your config. Each line is one of
+`[ OK ]`, `[INFO]`, `[WARN]`, or `[FAIL]`. The command exits non-zero **only**
+when a blocking setup failure (`[FAIL]`) is found; warnings and info lines exit 0.
+
+**Troubleshooting flow** — if memory isn't working, run `ironmem doctor` and fix
+the first `[FAIL]`:
+
+- **`model` not found** → run `ironmem setup` to download the embedding model.
+- **`model` failed checksum** → delete the model directory and re-run `ironmem setup`.
+- **`database` cannot be opened/read** → the store may be corrupt; check the path
+  and that no other process holds a lock.
+- **`database` schema behind** (a `[WARN]`) → harmless; migrations apply
+  automatically the next time the server starts.
+- **`harness_*` not registered** (a `[WARN]`) → run `scripts/install-ironmem.sh`
+  to register the MCP server with Claude Code and/or Codex. If a harness config
+  is reported **unreadable** or **malformed** (also a `[WARN]`), fix the file by
+  hand (permissions/encoding, or the JSON/TOML syntax) before re-registering.
+
+Codex's config location honors `CODEX_HOME` (default `~/.codex/config.toml`);
+Claude Code's is `~/.claude.json`. `doctor` reports each harness independently,
+so you do **not** need both installed.
+
 ## Current Status
 
 - MCP server works over stdio with non-blocking startup (responds to `initialize` in <25 ms)

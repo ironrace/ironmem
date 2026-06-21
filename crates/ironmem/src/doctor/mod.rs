@@ -1,0 +1,600 @@
+//! `ironmem doctor` — local setup diagnostics.
+//!
+//! Validates the pieces a fresh install needs (binary, database + schema, model
+//! cache, MCP access mode, warmup readiness, configured harnesses) and reports
+//! each as a [`Check`]. The command is diagnose-only: it never modifies user
+//! config. Only a [`CheckStatus::Error`] is a *blocking* setup failure and
+//! drives a non-zero exit; warnings and info lines are advisory.
+
+use std::path::{Path, PathBuf};
+use std::time::Duration;
+
+use serde::Serialize;
+
+use crate::config::{Config, EmbedMode, McpAccessMode};
+use crate::db::schema::{Database, LATEST_SCHEMA_VERSION};
+
+mod render;
+pub use render::render_text;
+
+/// Severity of a single diagnostic check.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum CheckStatus {
+    /// Healthy.
+    Ok,
+    /// Informational — nothing wrong, nothing to fix.
+    Info,
+    /// Non-blocking problem the user should look at.
+    Warn,
+    /// Blocking setup failure — drives a non-zero exit code.
+    Error,
+}
+
+impl CheckStatus {
+    /// Only [`CheckStatus::Error`] is a blocking setup failure. Written as an
+    /// exhaustive match (not `matches!`) so adding a future severity variant
+    /// forces a deliberate blocking/non-blocking decision here at compile time.
+    pub fn is_blocking(self) -> bool {
+        match self {
+            CheckStatus::Error => true,
+            CheckStatus::Ok | CheckStatus::Info | CheckStatus::Warn => false,
+        }
+    }
+}
+
+/// One diagnostic line.
+#[derive(Debug, Clone, Serialize)]
+pub struct Check {
+    /// Stable machine-readable key (e.g. `"database"`).
+    pub name: &'static str,
+    /// Severity.
+    pub status: CheckStatus,
+    /// Human-readable one-line summary.
+    pub summary: String,
+    /// Optional actionable remediation hint.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hint: Option<String>,
+}
+
+impl Check {
+    fn new(name: &'static str, status: CheckStatus, summary: impl Into<String>) -> Self {
+        Self {
+            name,
+            status,
+            summary: summary.into(),
+            hint: None,
+        }
+    }
+
+    fn with_hint(mut self, hint: impl Into<String>) -> Self {
+        self.hint = Some(hint.into());
+        self
+    }
+}
+
+/// Aggregate diagnostic result.
+#[derive(Debug, Clone, Serialize)]
+pub struct DoctorReport {
+    /// Checks in display order.
+    pub checks: Vec<Check>,
+}
+
+impl DoctorReport {
+    /// True when any check is a blocking setup failure (drives exit code).
+    pub fn has_blocking(&self) -> bool {
+        self.checks.iter().any(|c| c.status.is_blocking())
+    }
+}
+
+/// Run every diagnostic against the loaded configuration and the current
+/// environment (home directory, `CODEX_HOME`). Never fails: every problem is
+/// captured as a [`Check`] rather than returned as an error.
+pub fn run_doctor(cfg: &Config) -> DoctorReport {
+    let home = dirs::home_dir();
+
+    let binary = check_binary(env!("IRONMEM_VERSION"));
+    let database = check_database(&cfg.db_path);
+    let model = check_model_cache(&cfg.model_dir, cfg.embed_mode);
+    let mcp = check_mcp_mode(cfg.mcp_access_mode);
+    let warmup = check_warmup(database.status, model.status);
+
+    let claude = match home.as_deref() {
+        Some(h) => {
+            let path = h.join(".claude.json");
+            harness_check("harness_claude", "Claude Code", &path, detect_claude(&path))
+        }
+        None => Check::new(
+            "harness_claude",
+            CheckStatus::Info,
+            "Claude Code: home directory unknown, skipped",
+        ),
+    };
+    let codex = match codex_config_path(home.as_deref()) {
+        Some(path) => harness_check("harness_codex", "Codex", &path, detect_codex(&path)),
+        None => Check::new(
+            "harness_codex",
+            CheckStatus::Info,
+            "Codex: home directory unknown, skipped",
+        ),
+    };
+
+    DoctorReport {
+        checks: vec![binary, database, model, mcp, warmup, claude, codex],
+    }
+}
+
+fn check_binary(version: &str) -> Check {
+    Check::new("binary", CheckStatus::Ok, format!("ironmem {version}"))
+}
+
+/// Inspect the database file and its applied schema version.
+fn check_database(db_path: &Path) -> Check {
+    let shown = db_path.display();
+    if !db_path.exists() {
+        return Check::new(
+            "database",
+            CheckStatus::Warn,
+            format!("database not found at {shown}"),
+        )
+        .with_hint("run `ironmem init` (or start the MCP server) to create it");
+    }
+
+    // Open the existing file without migrating or creating it: a diagnostic
+    // must not mutate the store (no WAL switch, no chmod, no schema changes).
+    let db = match Database::open_with_busy_timeout(db_path, Duration::from_millis(500)) {
+        Ok(db) => db,
+        Err(e) => {
+            return Check::new(
+                "database",
+                CheckStatus::Error,
+                format!("cannot open database at {shown}: {e}"),
+            )
+            .with_hint("the file may be corrupt or locked by another process");
+        }
+    };
+
+    match db.schema_version() {
+        Ok(v) if v == LATEST_SCHEMA_VERSION => Check::new(
+            "database",
+            CheckStatus::Ok,
+            format!("schema v{v} (current) at {shown}"),
+        ),
+        Ok(v) if v < LATEST_SCHEMA_VERSION => Check::new(
+            "database",
+            CheckStatus::Warn,
+            format!("schema v{v} is behind current v{LATEST_SCHEMA_VERSION} at {shown}"),
+        )
+        .with_hint("migrations apply automatically next time the server starts"),
+        Ok(v) => Check::new(
+            "database",
+            CheckStatus::Warn,
+            format!("schema v{v} is newer than this binary's v{LATEST_SCHEMA_VERSION} at {shown}"),
+        )
+        .with_hint("upgrade ironmem to match the database"),
+        Err(e) => Check::new(
+            "database",
+            CheckStatus::Error,
+            format!("cannot read schema version at {shown}: {e}"),
+        )
+        .with_hint("the database appears initialized but unreadable; it may be corrupt"),
+    }
+}
+
+/// Inspect the embedding-model cache.
+fn check_model_cache(model_dir: &Path, embed_mode: EmbedMode) -> Check {
+    if matches!(embed_mode, EmbedMode::Noop) {
+        return Check::new(
+            "model",
+            CheckStatus::Info,
+            "noop embed mode — embedding model not required",
+        );
+    }
+
+    let shown = model_dir.display();
+    use ironrace_embed::embedder::ModelStatus;
+    match ironrace_embed::embedder::model_status(model_dir) {
+        ModelStatus::Ready => Check::new(
+            "model",
+            CheckStatus::Ok,
+            format!("embedding model present and verified at {shown}"),
+        ),
+        ModelStatus::Missing => Check::new(
+            "model",
+            CheckStatus::Error,
+            format!("embedding model not found at {shown}"),
+        )
+        .with_hint("run `ironmem setup` to download it"),
+        ModelStatus::Corrupt => Check::new(
+            "model",
+            CheckStatus::Error,
+            format!("embedding model failed checksum verification at {shown}"),
+        )
+        .with_hint("delete the directory and re-run `ironmem setup`"),
+        ModelStatus::Unreadable(e) => Check::new(
+            "model",
+            CheckStatus::Error,
+            format!("embedding model present but unreadable at {shown}: {e}"),
+        )
+        .with_hint("check file permissions on the model directory"),
+    }
+}
+
+fn check_mcp_mode(mode: McpAccessMode) -> Check {
+    let (label, writes) = match mode {
+        McpAccessMode::Trusted => ("trusted", "writes allowed"),
+        McpAccessMode::ReadOnly => ("read-only", "writes blocked"),
+        McpAccessMode::Restricted => ("restricted", "writes blocked, sensitive content redacted"),
+    };
+    Check::new(
+        "mcp_access",
+        CheckStatus::Info,
+        format!("MCP access mode: {label} ({writes})"),
+    )
+}
+
+/// Derived readiness: the server can warm up and serve once the database is
+/// reachable and the embedding model is usable (or not required).
+fn check_warmup(database: CheckStatus, model: CheckStatus) -> Check {
+    let db_ok = !database.is_blocking();
+    let model_ok = !model.is_blocking();
+    if db_ok && model_ok {
+        Check::new(
+            "warmup",
+            CheckStatus::Ok,
+            "ready to serve — database and model are usable",
+        )
+    } else {
+        Check::new(
+            "warmup",
+            CheckStatus::Warn,
+            "not ready to serve — resolve the blocking checks above",
+        )
+    }
+}
+
+/// Resolution of a harness config file's registration state. Distinguishing
+/// "absent" from "present but unreadable/malformed" is deliberate: collapsing
+/// them would report a config we simply could not inspect as "no config".
+#[derive(Debug, PartialEq, Eq)]
+enum HarnessState {
+    /// The config file does not exist.
+    Absent,
+    /// The config exists and registers the `ironmem` MCP server.
+    Registered,
+    /// The config exists but does not register `ironmem`.
+    NotRegistered,
+    /// The config exists but could not be read (permissions, I/O, non-UTF-8).
+    Unreadable(String),
+    /// The config exists and was read but could not be parsed.
+    Malformed(String),
+}
+
+/// Read a config file, mapping a not-found error to [`HarnessState::Absent`] and
+/// any other read error to [`HarnessState::Unreadable`]. Returns the file
+/// contents on success.
+fn read_harness_config(path: &Path) -> Result<String, HarnessState> {
+    match std::fs::read_to_string(path) {
+        Ok(raw) => Ok(raw),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Err(HarnessState::Absent),
+        Err(e) => Err(HarnessState::Unreadable(e.to_string())),
+    }
+}
+
+/// Resolve Claude Code registration from `~/.claude.json` (JSON with an
+/// `mcpServers.ironmem` entry).
+fn detect_claude(path: &Path) -> HarnessState {
+    let raw = match read_harness_config(path) {
+        Ok(raw) => raw,
+        Err(state) => return state,
+    };
+    match serde_json::from_str::<serde_json::Value>(&raw) {
+        Ok(v) if v.get("mcpServers").and_then(|m| m.get("ironmem")).is_some() => {
+            HarnessState::Registered
+        }
+        Ok(_) => HarnessState::NotRegistered,
+        Err(e) => HarnessState::Malformed(e.to_string()),
+    }
+}
+
+/// Resolve Codex registration from `config.toml` via line-based detection of the
+/// `[mcp_servers.ironmem]` section header (matching the install script rather
+/// than a full TOML parse, so there is no "malformed" outcome).
+fn detect_codex(path: &Path) -> HarnessState {
+    let raw = match read_harness_config(path) {
+        Ok(raw) => raw,
+        Err(state) => return state,
+    };
+    if raw
+        .lines()
+        .any(|line| line.trim() == "[mcp_servers.ironmem]")
+    {
+        HarnessState::Registered
+    } else {
+        HarnessState::NotRegistered
+    }
+}
+
+/// Build the harness [`Check`] from a resolved [`HarnessState`]. `label` is the
+/// harness display name (e.g. `"Claude Code"`); `config` is the path inspected.
+fn harness_check(name: &'static str, label: &str, config: &Path, state: HarnessState) -> Check {
+    let shown = config.display();
+    match state {
+        HarnessState::Absent => Check::new(
+            name,
+            CheckStatus::Info,
+            format!("{label}: no config at {shown}"),
+        ),
+        HarnessState::Registered => Check::new(
+            name,
+            CheckStatus::Ok,
+            format!("{label}: ironmem MCP server registered"),
+        ),
+        HarnessState::NotRegistered => Check::new(
+            name,
+            CheckStatus::Warn,
+            format!("{label}: config present but ironmem MCP server not registered"),
+        )
+        .with_hint("run scripts/install-ironmem.sh to register it"),
+        HarnessState::Unreadable(e) => Check::new(
+            name,
+            CheckStatus::Warn,
+            format!("{label}: config present at {shown} but unreadable: {e}"),
+        )
+        .with_hint("check file permissions and encoding"),
+        HarnessState::Malformed(e) => Check::new(
+            name,
+            CheckStatus::Warn,
+            format!("{label}: config at {shown} is malformed: {e}"),
+        )
+        .with_hint("fix the config file by hand, then re-check"),
+    }
+}
+
+/// Resolve the Codex config path from `$CODEX_HOME` (default `~/.codex`),
+/// ignoring an empty `CODEX_HOME`. `None` when no home is determinable.
+fn codex_config_path(home: Option<&Path>) -> Option<PathBuf> {
+    let codex_home = match std::env::var_os("CODEX_HOME") {
+        Some(v) if !v.is_empty() => PathBuf::from(v),
+        _ => home?.join(".codex"),
+    };
+    Some(codex_home.join("config.toml"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn error_status_is_blocking_others_are_not() {
+        assert!(CheckStatus::Error.is_blocking());
+        assert!(!CheckStatus::Warn.is_blocking());
+        assert!(!CheckStatus::Info.is_blocking());
+        assert!(!CheckStatus::Ok.is_blocking());
+    }
+
+    #[test]
+    fn report_has_blocking_only_with_an_error_check() {
+        let ok = DoctorReport {
+            checks: vec![Check::new("a", CheckStatus::Warn, "w")],
+        };
+        assert!(!ok.has_blocking());
+        let bad = DoctorReport {
+            checks: vec![Check::new("a", CheckStatus::Error, "e")],
+        };
+        assert!(bad.has_blocking());
+    }
+
+    #[test]
+    fn binary_check_reports_version_and_is_ok() {
+        let c = check_binary("1.2.3");
+        assert_eq!(c.status, CheckStatus::Ok);
+        assert!(c.summary.contains("1.2.3"));
+    }
+
+    #[test]
+    fn database_missing_file_is_warn_not_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let c = check_database(&dir.path().join("nope.sqlite3"));
+        assert_eq!(c.status, CheckStatus::Warn);
+        assert!(c.hint.is_some());
+    }
+
+    #[test]
+    fn database_migrated_is_ok_with_current_version() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("m.sqlite3");
+        Database::open(&path).unwrap().migrate().unwrap();
+        let c = check_database(&path);
+        assert_eq!(c.status, CheckStatus::Ok);
+        assert!(c.summary.contains(&format!("v{LATEST_SCHEMA_VERSION}")));
+    }
+
+    #[test]
+    fn database_unreadable_schema_is_blocking_error() {
+        // A file that exists but is not a valid schema'd DB: create the file
+        // empty so it opens but has no schema_version table.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("empty.sqlite3");
+        std::fs::write(&path, b"").unwrap();
+        let c = check_database(&path);
+        assert_eq!(c.status, CheckStatus::Error);
+    }
+
+    #[test]
+    fn database_behind_current_schema_is_warn() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("m.sqlite3");
+        Database::open(&path).unwrap().migrate().unwrap();
+        // Force the recorded version below the binary's latest.
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute("DELETE FROM schema_version", []).unwrap();
+        conn.execute("INSERT INTO schema_version (version) VALUES (7)", [])
+            .unwrap();
+        drop(conn);
+        let c = check_database(&path);
+        assert_eq!(c.status, CheckStatus::Warn);
+        assert!(c.summary.contains("behind"));
+    }
+
+    #[test]
+    fn database_ahead_of_binary_schema_is_warn() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("m.sqlite3");
+        Database::open(&path).unwrap().migrate().unwrap();
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute(
+            "INSERT INTO schema_version (version) VALUES (?1)",
+            [LATEST_SCHEMA_VERSION + 1],
+        )
+        .unwrap();
+        drop(conn);
+        let c = check_database(&path);
+        assert_eq!(c.status, CheckStatus::Warn);
+        assert!(c.summary.contains("newer"));
+    }
+
+    #[test]
+    fn model_check_skipped_in_noop_mode() {
+        let dir = tempfile::tempdir().unwrap();
+        let c = check_model_cache(dir.path(), EmbedMode::Noop);
+        assert_eq!(c.status, CheckStatus::Info);
+    }
+
+    #[test]
+    fn model_missing_in_real_mode_is_blocking_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let c = check_model_cache(&dir.path().join("models"), EmbedMode::Real);
+        assert_eq!(c.status, CheckStatus::Error);
+        assert!(c.hint.unwrap().contains("setup"));
+    }
+
+    #[test]
+    fn model_corrupt_in_real_mode_is_blocking_error() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("model.onnx"), b"bad").unwrap();
+        std::fs::write(dir.path().join("tokenizer.json"), b"bad").unwrap();
+        let c = check_model_cache(dir.path(), EmbedMode::Real);
+        assert_eq!(c.status, CheckStatus::Error);
+        assert!(c.summary.contains("checksum"));
+        assert!(c.hint.unwrap().contains("delete"));
+    }
+
+    #[test]
+    fn model_unreadable_in_real_mode_is_blocking_error_with_permissions_hint() {
+        // model.onnx present (so not Missing) but a directory → read fails →
+        // Unreadable, which must not be reported as Corrupt/"delete it".
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("model.onnx")).unwrap();
+        std::fs::write(dir.path().join("tokenizer.json"), b"present").unwrap();
+        let c = check_model_cache(dir.path(), EmbedMode::Real);
+        assert_eq!(c.status, CheckStatus::Error);
+        assert!(c.summary.contains("unreadable"));
+        assert!(c.hint.unwrap().contains("permissions"));
+    }
+
+    #[test]
+    fn mcp_mode_reports_each_variant_as_info() {
+        for mode in [
+            McpAccessMode::Trusted,
+            McpAccessMode::ReadOnly,
+            McpAccessMode::Restricted,
+        ] {
+            let c = check_mcp_mode(mode);
+            assert_eq!(c.status, CheckStatus::Info);
+        }
+        assert!(check_mcp_mode(McpAccessMode::ReadOnly)
+            .summary
+            .contains("read-only"));
+        assert!(check_mcp_mode(McpAccessMode::Trusted)
+            .summary
+            .contains("trusted"));
+    }
+
+    #[test]
+    fn warmup_ok_only_when_neither_blocks() {
+        assert_eq!(
+            check_warmup(CheckStatus::Ok, CheckStatus::Info).status,
+            CheckStatus::Ok
+        );
+        assert_eq!(
+            check_warmup(CheckStatus::Error, CheckStatus::Ok).status,
+            CheckStatus::Warn
+        );
+        assert_eq!(
+            check_warmup(CheckStatus::Ok, CheckStatus::Error).status,
+            CheckStatus::Warn
+        );
+    }
+
+    #[test]
+    fn detect_claude_classifies_every_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(".claude.json");
+        assert_eq!(detect_claude(&path), HarnessState::Absent);
+        std::fs::write(&path, r#"{"mcpServers":{"ironmem":{"command":"ironmem"}}}"#).unwrap();
+        assert_eq!(detect_claude(&path), HarnessState::Registered);
+        std::fs::write(&path, r#"{"mcpServers":{}}"#).unwrap();
+        assert_eq!(detect_claude(&path), HarnessState::NotRegistered);
+        // Malformed JSON must be distinguished from "not registered".
+        std::fs::write(&path, "{ not valid json").unwrap();
+        assert!(matches!(detect_claude(&path), HarnessState::Malformed(_)));
+    }
+
+    #[test]
+    fn detect_codex_classifies_states_via_section_header() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        assert_eq!(detect_codex(&path), HarnessState::Absent);
+        std::fs::write(&path, "[mcp_servers.ironmem]\ncommand = \"ironmem\"\n").unwrap();
+        assert_eq!(detect_codex(&path), HarnessState::Registered);
+        std::fs::write(&path, "[other]\nx = 1\n").unwrap();
+        assert_eq!(detect_codex(&path), HarnessState::NotRegistered);
+    }
+
+    #[test]
+    fn harness_check_maps_states_to_statuses() {
+        let p = Path::new("/tmp/example-config");
+        let cases = [
+            (HarnessState::Absent, CheckStatus::Info),
+            (HarnessState::Registered, CheckStatus::Ok),
+            (HarnessState::NotRegistered, CheckStatus::Warn),
+            (HarnessState::Unreadable("io".into()), CheckStatus::Warn),
+            (HarnessState::Malformed("syntax".into()), CheckStatus::Warn),
+        ];
+        for (state, expected) in cases {
+            let c = harness_check("harness_x", "X", p, state);
+            assert_eq!(c.status, expected);
+            // No harness state is ever a blocking setup failure.
+            assert!(!c.status.is_blocking());
+        }
+    }
+
+    #[test]
+    fn run_doctor_emits_the_expected_check_keys_in_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = Config {
+            db_path: dir.path().join("m.sqlite3"),
+            model_dir: dir.path().join("models"),
+            model_dir_explicit: true,
+            state_dir: dir.path().join("state"),
+            mcp_access_mode: McpAccessMode::ReadOnly,
+            embed_mode: EmbedMode::Noop,
+        };
+        let report = run_doctor(&cfg);
+        let names: Vec<&str> = report.checks.iter().map(|c| c.name).collect();
+        assert_eq!(
+            names,
+            vec![
+                "binary",
+                "database",
+                "model",
+                "mcp_access",
+                "warmup",
+                "harness_claude",
+                "harness_codex",
+            ],
+            "the toolable check-key set must stay stable"
+        );
+    }
+}

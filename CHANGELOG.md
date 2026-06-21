@@ -25,6 +25,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`ironmem doctor` setup diagnostics (issue #142):** a new diagnose-only CLI
+  command that validates the local install in one shot. It reports binary
+  version, database path + schema/migration status, embedding-model cache
+  status, MCP access mode, warmup readiness, and which harnesses (Claude Code
+  via `~/.claude.json`, Codex via `$CODEX_HOME/config.toml`) have the `ironmem`
+  MCP server registered — without requiring either to be installed. Each line is
+  `[ OK ]`/`[INFO]`/`[WARN]`/`[FAIL]`; the command distinguishes blocking errors
+  from warnings and exits non-zero **only** on a blocking setup failure.
+  Supports `--json` for toolable output and never modifies user config. New
+  public APIs: `ironmem::doctor` module, `Database::schema_version()` +
+  `db::schema::LATEST_SCHEMA_VERSION`, and `ironrace_embed::embedder::{model_status, ModelStatus}`.
 - **UserPromptSubmit FTS-injection hook (Claude Code):** a new `user-prompt-submit`
   hook runs an FTS/BM25-only drawer search on **every** prompt and injects up to 3
   sanitized one-line untrusted-memory excerpts via
