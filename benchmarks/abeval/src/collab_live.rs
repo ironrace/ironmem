@@ -561,3 +561,160 @@ pub fn codex_collab_prompt(session_id: &str) -> Result<String> {
         .map_err(|e| anyhow!("reading codex collab prompt {}: {e}", path.display()))?;
     Ok(body.replace("$ARGUMENTS", &format!("join {session_id}")))
 }
+
+#[cfg(test)]
+mod tests {
+    use std::path::Path;
+    use std::sync::{Mutex, OnceLock};
+
+    use anyhow::{bail, Context, Result};
+
+    use super::ProcessWorkerSpawner;
+    use crate::collab_driver::{ModelTier, WorkerSpawner};
+
+    static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+
+    #[test]
+    fn spawn_claude_nonzero_surfaces_stdout_tail() -> Result<()> {
+        let bin_dir = tempfile::tempdir()?;
+        write_fake_worker(
+            bin_dir.path(),
+            "claude",
+            "CLAUDE_STDOUT_CAUSE",
+            "claude stderr",
+        )?;
+
+        let msg = with_fake_worker_on_path(bin_dir.path(), || {
+            let worktree = tempfile::tempdir()?;
+            let spawner = test_spawner();
+            match spawner.spawn_claude("prompt", worktree.path(), ModelTier::Opus) {
+                Ok(_) => bail!("fake claude unexpectedly succeeded"),
+                Err(err) => Ok(err.to_string()),
+            }
+        })?;
+
+        assert!(
+            msg.contains("CLAUDE_STDOUT_CAUSE"),
+            "actual spawn_claude error must include stdout tail: {msg}"
+        );
+        assert!(
+            msg.contains("claude stderr"),
+            "actual spawn_claude error must retain stderr: {msg}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn spawn_codex_nonzero_surfaces_stdout_tail() -> Result<()> {
+        let bin_dir = tempfile::tempdir()?;
+        write_fake_worker(
+            bin_dir.path(),
+            "codex",
+            "CODEX_STDOUT_CAUSE",
+            "codex stderr",
+        )?;
+
+        let msg = with_fake_worker_on_path(bin_dir.path(), || {
+            let worktree = tempfile::tempdir()?;
+            init_git_repo(worktree.path())?;
+            let spawner = test_spawner();
+            match spawner.spawn_codex("session-1", worktree.path()) {
+                Ok(_) => bail!("fake codex unexpectedly succeeded"),
+                Err(err) => Ok(err.to_string()),
+            }
+        })?;
+
+        assert!(
+            msg.contains("CODEX_STDOUT_CAUSE"),
+            "actual spawn_codex error must include stdout tail: {msg}"
+        );
+        assert!(
+            msg.contains("codex stderr"),
+            "actual spawn_codex error must retain stderr: {msg}"
+        );
+        Ok(())
+    }
+
+    fn test_spawner() -> ProcessWorkerSpawner {
+        ProcessWorkerSpawner {
+            db_path: "/tmp/abeval-test.db".into(),
+            codex_home: "/tmp/abeval-codex-home".into(),
+            mcp_config: "{}".to_string(),
+        }
+    }
+
+    fn write_fake_worker(
+        bin_dir: &Path,
+        name: &str,
+        stdout_marker: &str,
+        stderr_marker: &str,
+    ) -> Result<()> {
+        let path = bin_dir.join(name);
+        std::fs::write(
+            &path,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' '{stdout_marker}'\nprintf '%s\\n' '{stderr_marker}' >&2\nexit 7\n"
+            ),
+        )
+        .with_context(|| format!("writing fake worker {}", path.display()))?;
+
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = std::fs::metadata(&path)?.permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&path, perms)?;
+        Ok(())
+    }
+
+    fn with_fake_worker_on_path<T>(bin_dir: &Path, f: impl FnOnce() -> Result<T>) -> Result<T> {
+        let _guard = ENV_LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .expect("test env lock poisoned");
+        let old_path = std::env::var_os("PATH");
+        let mut paths = vec![bin_dir.to_path_buf()];
+        if let Some(old) = old_path.as_ref() {
+            paths.extend(std::env::split_paths(old));
+        }
+        let joined = std::env::join_paths(paths).context("building test PATH")?;
+        std::env::set_var("PATH", &joined);
+
+        let result = f();
+
+        match old_path {
+            Some(path) => std::env::set_var("PATH", path),
+            None => std::env::remove_var("PATH"),
+        }
+        result
+    }
+
+    fn init_git_repo(worktree: &Path) -> Result<()> {
+        run_git(worktree, &["init"])?;
+        run_git(
+            worktree,
+            &["config", "user.email", "abeval@example.invalid"],
+        )?;
+        run_git(worktree, &["config", "user.name", "abeval test"])?;
+        run_git(worktree, &["config", "commit.gpgsign", "false"])?;
+        std::fs::write(worktree.join("README.md"), "test repo\n")?;
+        run_git(worktree, &["add", "README.md"])?;
+        run_git(worktree, &["commit", "-m", "init"])?;
+        Ok(())
+    }
+
+    fn run_git(worktree: &Path, args: &[&str]) -> Result<()> {
+        let out = std::process::Command::new("git")
+            .arg("-C")
+            .arg(worktree)
+            .args(args)
+            .output()
+            .with_context(|| format!("git -C {} {args:?}", worktree.display()))?;
+        if !out.status.success() {
+            bail!(
+                "git -C {} {args:?} failed: {}",
+                worktree.display(),
+                String::from_utf8_lossy(&out.stderr).trim()
+            );
+        }
+        Ok(())
+    }
+}
