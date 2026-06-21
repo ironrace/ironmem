@@ -192,13 +192,18 @@ Embedding-dependent tools (`search`, `add_drawer`, diary writes) return `{"warmi
 
 - `plugin.json`
 - `hooks.json`
+- `commands/collab.md`, the Codex `/collab` slash-command shim
 - wrapper scripts for the MCP server and hooks
 - Codex-specific README content
+- protocol prompts under `prompts/`
 - bundled collab skill dependencies under `skills/`
 
 The shared collab skill dependencies are bundled for Claude Code under `.claude-plugin/skills/`.
-`scripts/install-ironmem.sh` installs the Codex copies into `$CODEX_HOME/skills` (default
-`~/.codex/skills`) and the Claude copies into `$CLAUDE_HOME/skills` (default `~/.claude/skills`).
+`scripts/install-ironmem.sh` installs the Codex command into `$CODEX_HOME/commands`
+(default `~/.codex/commands`), the Codex protocol prompts into `$CODEX_HOME/prompts`
+(default `~/.codex/prompts`), the Codex skills into `$CODEX_HOME/skills`
+(default `~/.codex/skills`), and the Claude copies into `$CLAUDE_HOME/skills`
+(default `~/.claude/skills`).
 The shared required set is:
 
 - `writing-plans`
@@ -214,8 +219,13 @@ Codex also receives `pr-review-toolkit`, which `/collab` uses during the
 `CodeReviewFixGlobalPending` / `review_fix_global` turn before Codex fans
 confirmed fixes out to subagents and Claude's `/ultrareview-local` audit runs.
 
-Existing identical skills are skipped. Existing bundled skills, agents, commands, and prompts
-that differ are updated to the packaged copies; `--skip-skills` skips this step entirely.
+Existing identical files are skipped. The installer records hidden packaged
+baselines under each target root's `.ironmem-bases/` directory; on later
+installs it three-way merges packaged updates into locally edited skills,
+agents, commands, and prompts. If no baseline exists, the target is a symlink,
+or a merge conflict occurs, the local file is left unchanged and the packaged
+update is written next to it as `*.ironmem-packaged` (conflict drafts use
+`*.ironmem-merge-conflict`). `--skip-skills` skips this step entirely.
 For Claude Code, the installer also provisions the `code-reviewer` agent used by the vendored
 `subagent-driven-development` review flow into `$CLAUDE_HOME/agents`.
 

@@ -6,6 +6,7 @@ argument-hint: start [--implementer=claude|codex] <task> | join [--implementer=c
 <!-- DERIVED FROM docs/COLLAB.md — protocol changes must update:
      - docs/COLLAB.md (spec)
      - .claude-plugin/commands/collab.md (this file)
+     - .codex-plugin/commands/collab.md (Codex slash command)
      - .codex-plugin/prompts/collab.md (Codex mirror) -->
 
 

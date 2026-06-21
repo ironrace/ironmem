@@ -14,6 +14,7 @@ ROOT = pathlib.Path(os.environ.get(
 PROMPTS = ROOT / ".claude-plugin" / "prompts"
 COMMAND = ROOT / ".claude-plugin" / "commands" / "collab.md"
 DOC = ROOT / "docs" / "COLLAB.md"
+CODEX_COMMAND = ROOT / ".codex-plugin" / "commands" / "collab.md"
 CODEX_PROMPT = ROOT / ".codex-plugin" / "prompts" / "collab.md"
 
 ALLOWED_PLACEHOLDERS = {"SESSION_ID", "REPO_PATH", "BRANCH", "TOPIC",
@@ -281,6 +282,21 @@ def main() -> int:
     codex_text = CODEX_PROMPT.read_text()
     if "collab-turn-*.md" not in codex_text:
         err(".codex-plugin/prompts/collab.md: missing worker-template xref")
+
+    if not CODEX_COMMAND.exists():
+        err(".codex-plugin/commands/collab.md: missing Codex slash command")
+    else:
+        codex_cmd_text = CODEX_COMMAND.read_text()
+        for snippet in [
+            "$ARGUMENTS",
+            "$CODEX_HOME/prompts/collab.md",
+            "~/.codex/prompts/collab.md",
+            ".codex-plugin/prompts/collab.md",
+            "mcp__ironmem__collab_*",
+            "one invocation handles one",
+        ]:
+            if snippet not in codex_cmd_text:
+                err(f".codex-plugin/commands/collab.md: missing {snippet!r}")
 
     if errors:
         print("collab-turn template lint FAILED:")

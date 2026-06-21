@@ -9,7 +9,8 @@ Persistent workspace memory for Codex using the local Rust `ironmem` binary.
 - initializes a fresh store if no previous memory exists
 - mines the current workspace on first run
 - re-mines incrementally on `Stop` and `PreCompact`
-- bundles the collab skills used by the Claude/Codex handoff flow
+- bundles the Codex `/collab` command, protocol prompts, and skills used by
+  the Claude/Codex handoff flow
 
 ## Memory protocol
 
@@ -33,8 +34,25 @@ ironmem write-rules --target AGENTS.md
 - `test-driven-development`
 - `pr-review-toolkit`
 
-Existing bundled copies are updated on install; pass `--skip-skills` to leave
+Existing identical files are skipped. Packaged baselines are stored under each
+target root's hidden `.ironmem-bases/` directory so later installs can
+three-way merge packaged updates into locally edited files. If there is no
+baseline, a symlink target, or a merge conflict, the local file is left
+unchanged and the packaged update is written next to it as `*.ironmem-packaged`
+(conflict drafts use `*.ironmem-merge-conflict`). Pass `--skip-skills` to leave
 local skills, prompts, and commands untouched.
+
+## Bundled commands and prompts
+
+`scripts/install-ironmem.sh` installs:
+
+- `$CODEX_HOME/commands/collab.md` — the interactive Codex `/collab` slash command.
+- `$CODEX_HOME/prompts/collab.md` — the full Codex one-turn collab protocol.
+- `$CODEX_HOME/prompts/collab-batch-impl.md` — the slim codex-implementer batch prompt.
+
+The command loads the protocol prompt and substitutes the slash-command
+arguments. Claude's background dispatcher still passes the resolved protocol
+prompt directly when it drives Codex-owned turns.
 
 ## Notes
 
