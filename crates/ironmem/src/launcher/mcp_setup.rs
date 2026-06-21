@@ -34,7 +34,7 @@ fn write_atomic(path: &Path, contents: &str) -> Result<(), MemoryError> {
         std::fs::create_dir_all(parent)
             .map_err(|e| MemoryError::Config(format!("create {}: {e}", parent.display())))?;
     }
-    let tmp = path.with_extension("ironmem-tmp");
+    let tmp = path.with_extension(format!("ironmem-tmp-{}", std::process::id()));
     std::fs::write(&tmp, contents)
         .map_err(|e| MemoryError::Config(format!("write {}: {e}", tmp.display())))?;
     std::fs::rename(&tmp, path).map_err(|e| {
@@ -223,5 +223,23 @@ mod tests {
         assert_eq!(toml_basic_escape("a\nb"), r"a\nb");
         assert_eq!(toml_basic_escape("a\tb"), r"a\tb");
         assert_eq!(toml_basic_escape("/plain/path"), "/plain/path");
+    }
+
+    #[test]
+    fn claude_rejects_non_object_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = dir.path().join(".claude.json");
+        std::fs::write(&cfg, "[]").unwrap();
+        let err = ensure_claude_registered(&cfg, "/bin/ironmem").unwrap_err();
+        assert!(err.to_string().contains("not a JSON object"), "got: {err}");
+    }
+
+    #[test]
+    fn claude_rejects_non_object_mcpservers() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = dir.path().join(".claude.json");
+        std::fs::write(&cfg, r#"{"mcpServers": 5}"#).unwrap();
+        let err = ensure_claude_registered(&cfg, "/bin/ironmem").unwrap_err();
+        assert!(err.to_string().contains("is not an object"), "got: {err}");
     }
 }
