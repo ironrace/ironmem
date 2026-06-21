@@ -102,6 +102,37 @@ update is written next to it as `*.ironmem-packaged` (conflict drafts use
 the binary or leave local copies untouched.
 For Claude Code, the installer also installs the `code-reviewer` agent used by the vendored review flow.
 
+## First run: one-command launchers
+
+Start an assistant with ironmem already attached — no manual MCP config:
+
+```bash
+ironmem claude .                       # launch Claude Code in the current repo
+ironmem codex .                        # launch Codex in the current repo
+ironmem claude . "fix the login bug"   # launch with an initial prompt
+ironmem codex /path/to/repo "add tests"
+```
+
+Each launcher:
+
+1. Canonicalizes the repo path and validates that it exists.
+2. Validates that the target assistant (`claude` / `codex`) is on your `PATH`,
+   and prints a clear error if it is not.
+3. Ensures the ironmem MCP server is registered for that assistant
+   (idempotent — existing manual setup is preserved untouched).
+4. Warms the repo into memory on a best-effort basis (a warm failure is logged
+   but does not block launch — the assistant's own MCP server bootstraps on
+   `serve`).
+5. Launches the assistant with the repo as its working directory.
+
+If you manage MCP configuration yourself, pass `--no-mcp-setup` to skip step 3:
+
+```bash
+ironmem claude . --no-mcp-setup
+```
+
+The manual MCP setup path remains fully supported.
+
 ## CLI
 
 ### `ironmem write-rules`
