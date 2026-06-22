@@ -96,6 +96,51 @@ def heading_present(text: str, pattern: str) -> bool:
     return re.search(rf"^#{{1,6}}\s+.*{pattern}", text, re.IGNORECASE | re.MULTILINE) is not None
 
 
+def strip_fences(text: str) -> str:
+    """Drop fenced code blocks so command samples are not mistaken for links
+    or headings (e.g. ``# Validate …`` bash comments inside a ```` ``` ```` block)."""
+    return re.sub(r"```.*?```", "", text, flags=re.DOTALL)
+
+
+def slugify(heading: str) -> str:
+    """GitHub-style heading slug: lowercase, drop punctuation except word
+    chars / spaces / hyphens, then spaces to hyphens."""
+    s = heading.strip().lower()
+    s = re.sub(r"[^\w\s-]", "", s)
+    s = re.sub(r"\s+", "-", s)
+    return s
+
+
+def heading_slugs(text: str) -> set[str]:
+    body = strip_fences(text)
+    return {
+        slugify(m.group(1))
+        for m in re.finditer(r"^#{1,6}\s+(.*?)\s*$", body, re.MULTILINE)
+    }
+
+
+_LINK_RE = re.compile(r"\[[^\]]*\]\(([^)]+)\)")
+_EXTERNAL = ("http://", "https://", "mailto:", "tel:")
+
+
+def check_links(doc_text: str) -> None:
+    """Every local link in the doc must resolve to a real file, and any
+    ``#anchor`` on a Markdown target must match a heading in that file."""
+    for raw in _LINK_RE.findall(strip_fences(doc_text)):
+        target = raw.strip()
+        if target.lower().startswith(_EXTERNAL):
+            continue
+        path_part, _, anchor = target.partition("#")
+        tgt = DOC if path_part == "" else (DOC.parent / path_part).resolve()
+        if path_part and not tgt.exists():
+            fail(f"broken link in docs/BENCHMARKS.md: target not found: {target!r}")
+        if anchor and tgt.suffix.lower() == ".md":
+            slugs = heading_slugs(read(tgt, f"link target {path_part or 'BENCHMARKS.md'}"))
+            if anchor.lower() not in slugs:
+                where = path_part or "BENCHMARKS.md"
+                fail(f"broken anchor in docs/BENCHMARKS.md: #{anchor} not found in {where}")
+
+
 def main() -> None:
     text = read(DOC, "methodology doc")
 
@@ -114,10 +159,13 @@ def main() -> None:
                 f"docs/BENCHMARKS.md:{ln_no}: {line.strip()!r}"
             )
 
-    if "docs/BENCHMARKS.md" not in read(README, "README.md"):
+    check_links(text)
+
+    # Require a real link/href to the doc, not just an incidental substring.
+    if not re.search(r"\]\(docs/BENCHMARKS\.md", read(README, "README.md")):
         fail("README.md does not link to docs/BENCHMARKS.md")
 
-    if "docs/BENCHMARKS.md" not in read(SITE, "site/index.html"):
+    if not re.search(r'href="[^"]*docs/BENCHMARKS\.md[^"]*"', read(SITE, "site/index.html")):
         fail("site/index.html does not link to docs/BENCHMARKS.md")
 
     print("check_benchmark_methodology: OK")
