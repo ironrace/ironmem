@@ -116,6 +116,26 @@ args = ["serve"]
 IRONMEM_MCP_MODE = "trusted"
 ```
 
+### Use with any MCP client
+
+ironmem's core tools — `search`, `status`, the knowledge-graph tools (`kg_query`, `kg_add`, `traverse`, …), diary reads/writes, `get_taxonomy`, and the drawer tools — speak MCP over stdio, so **any MCP-capable client works with no new code**. Cursor, Cline, Windsurf, and others accept a standard `mcpServers` block:
+
+```json
+{
+  "mcpServers": {
+    "ironmem": {
+      "command": "/absolute/path/to/ironmem",
+      "args": ["serve"],
+      "env": { "IRONMEM_MCP_MODE": "trusted" }
+    }
+  }
+}
+```
+
+Some clients want only the inner object (the value under `"ironmem"`) rather than the full `mcpServers` wrapper — adapt to your client's config format. Use an absolute path to the installed binary (`~/.ironrace/bin/ironmem`), and keep `IRONMEM_MCP_MODE` set to `trusted` if you want the write tools.
+
+**Not available to generic clients.** The harness-driven automation listed under [Shared Memory Across Harnesses](#shared-memory-across-harnesses) — session-start memory injection, Stop/PreCompact mining, and UserPromptSubmit FTS injection — is wired into Claude Code and Codex specifically. A generic MCP client still gets the full read/search/write toolset on the shared store; it just won't fire those hooks automatically, which requires first-class harness support.
+
 Prebuilt macOS (arm64) and Linux (x86_64) binaries, with SHA-256 checksums, are attached to every [tagged release](https://github.com/ironrace/ironmem/releases).
 
 `scripts/install-ironmem.sh` also installs Codex's `/collab` command, the
