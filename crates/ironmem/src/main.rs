@@ -116,6 +116,15 @@ enum Commands {
         /// Skip ensuring the ironmem MCP server is registered (use existing manual setup)
         #[arg(long)]
         no_mcp_setup: bool,
+        /// Code-map area to pre-inject context for (repeatable)
+        #[arg(long = "area")]
+        areas: Vec<String>,
+        /// Disable compact context pre-injection into the initial prompt
+        #[arg(long)]
+        no_context: bool,
+        /// Approximate token budget for pre-injected context
+        #[arg(long, default_value_t = ironmem::context::DEFAULT_BUDGET_TOKENS)]
+        budget: usize,
     },
     /// Launch Codex in a repo with the ironmem MCP server attached
     Codex {
@@ -127,6 +136,15 @@ enum Commands {
         /// Skip ensuring the ironmem MCP server is registered (use existing manual setup)
         #[arg(long)]
         no_mcp_setup: bool,
+        /// Code-map area to pre-inject context for (repeatable)
+        #[arg(long = "area")]
+        areas: Vec<String>,
+        /// Disable compact context pre-injection into the initial prompt
+        #[arg(long)]
+        no_context: bool,
+        /// Approximate token budget for pre-injected context
+        #[arg(long, default_value_t = ironmem::context::DEFAULT_BUDGET_TOKENS)]
+        budget: usize,
     },
 }
 
@@ -280,12 +298,38 @@ async fn run(cli: Cli) -> Result<(), MemoryError> {
             path,
             prompt,
             no_mcp_setup,
-        } => launcher::run_launcher(launcher::Harness::Claude, &path, prompt, no_mcp_setup),
+            areas,
+            no_context,
+            budget,
+        } => launcher::run_launcher(
+            launcher::Harness::Claude,
+            &path,
+            prompt,
+            launcher::LaunchOptions {
+                no_mcp_setup,
+                no_context,
+                areas,
+                budget_tokens: budget,
+            },
+        ),
         Commands::Codex {
             path,
             prompt,
             no_mcp_setup,
-        } => launcher::run_launcher(launcher::Harness::Codex, &path, prompt, no_mcp_setup),
+            areas,
+            no_context,
+            budget,
+        } => launcher::run_launcher(
+            launcher::Harness::Codex,
+            &path,
+            prompt,
+            launcher::LaunchOptions {
+                no_mcp_setup,
+                no_context,
+                areas,
+                budget_tokens: budget,
+            },
+        ),
         Commands::WriteRules { target, workspace } => {
             use ironmem::write_rules::{validate_rules_file, write_rules_file, WriteOutcome};
             let targets: Vec<&str> = match target.as_deref() {
