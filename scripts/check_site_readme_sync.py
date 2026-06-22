@@ -44,7 +44,12 @@ DOC_PREFIXES = ("site/",)
 
 
 def _norm(path: str) -> str:
-    return path.strip().replace("\\", "/").lstrip("./")
+    p = path.strip().replace("\\", "/")
+    # Strip a leading "./" prefix only — not the character set {'.','/'},
+    # which str.lstrip("./") would do (mangling e.g. ".github/...").
+    while p.startswith("./"):
+        p = p[2:]
+    return p
 
 
 def is_surface(path: str) -> bool:
@@ -58,7 +63,25 @@ def is_doc(path: str) -> bool:
 
 
 def changed_from_git(base: str) -> list[str]:
-    """Files changed between ``base`` and HEAD (merge-base diff)."""
+    """Files changed between ``base`` and HEAD (merge-base diff).
+
+    Fails loudly (exit 2) if ``base`` does not resolve to a commit, so a bogus
+    ref cannot yield an empty diff that is silently read as "no drift".
+    """
+    try:
+        subprocess.run(
+            ["git", "rev-parse", "--verify", "--quiet", f"{base}^{{commit}}"],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+    except (OSError, subprocess.CalledProcessError) as exc:
+        print(
+            f"check_site_readme_sync: base ref {base!r} does not resolve to a "
+            f"commit; cannot compute drift ({exc})",
+            file=sys.stderr,
+        )
+        sys.exit(2)
     try:
         out = subprocess.run(
             ["git", "diff", "--name-only", f"{base}...HEAD"],
@@ -69,7 +92,16 @@ def changed_from_git(base: str) -> list[str]:
     except (OSError, subprocess.CalledProcessError) as exc:
         print(f"check_site_readme_sync: could not diff against {base!r}: {exc}", file=sys.stderr)
         sys.exit(2)
-    return [line for line in out.splitlines() if line.strip()]
+    changed = [line for line in out.splitlines() if line.strip()]
+    if not changed:
+        # On a real PR an empty change set vs the base is implausible — surface
+        # it rather than report a clean bill of health on a bad comparison.
+        print(
+            f"check_site_readme_sync: WARNING — 0 files changed vs {base!r}; "
+            "verify the base ref is correct",
+            file=sys.stderr,
+        )
+    return changed
 
 
 def evaluate(changed: list[str]) -> tuple[bool, list[str]]:

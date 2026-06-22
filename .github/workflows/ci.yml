@@ -187,6 +187,8 @@ jobs:
     # PR-only: the guard diffs the PR head against its base branch.
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
         with:
@@ -199,8 +201,14 @@ jobs:
 
       # Warn-only by default: drift is reported as a non-blocking annotation
       # and the step still passes. To make it a hard merge gate, add --strict
-      # to the command below (the one-line config change).
+      # to the python command below (the one-line config change).
       - name: site/README drift guard
         env:
           BASE_REF: ${{ github.base_ref }}
-        run: python3 scripts/check_site_readme_sync.py --base "origin/${BASE_REF}"
+        run: |
+          # Ensure the base ref is present (checkout fetch-depth:0 normally
+          # provides origin/<base>, but fetch explicitly as a fallback so the
+          # guard never silently diffs against a missing ref).
+          git rev-parse --verify --quiet "origin/${BASE_REF}^{commit}" >/dev/null \
+            || git fetch --no-tags origin "${BASE_REF}:refs/remotes/origin/${BASE_REF}"
+          python3 scripts/check_site_readme_sync.py --base "origin/${BASE_REF}"

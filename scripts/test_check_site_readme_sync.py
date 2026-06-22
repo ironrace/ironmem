@@ -11,9 +11,11 @@ Stdlib only (unittest + subprocess); run directly:
 """
 from __future__ import annotations
 
+import os
 import pathlib
 import subprocess
 import sys
+import tempfile
 import unittest
 
 SCRIPT = pathlib.Path(__file__).resolve().parent / "check_site_readme_sync.py"
@@ -39,9 +41,12 @@ def run_guard(*files: str, strict: bool = False) -> subprocess.CompletedProcess:
 class GuardSelfTest(unittest.TestCase):
     def assert_drift(self, r: subprocess.CompletedProcess, *, strict: bool) -> None:
         self.assertIn("DRIFT", r.stdout + r.stderr)
+        # The annotation severity is the contract with the GitHub Actions UI.
         if strict:
+            self.assertIn("::error", r.stdout)
             self.assertNotEqual(r.returncode, 0, f"expected strict failure:\n{r.stdout}\n{r.stderr}")
         else:
+            self.assertIn("::warning", r.stdout)
             self.assertEqual(r.returncode, 0, f"warn-only must exit 0:\n{r.stdout}\n{r.stderr}")
 
     def assert_clean(self, r: subprocess.CompletedProcess) -> None:
@@ -89,6 +94,93 @@ class GuardSelfTest(unittest.TestCase):
     def test_strict_clean_changeset_exits_zero(self):
         r = run_guard(INTERNAL, strict=True)
         self.assertEqual(r.returncode, 0, f"clean strict run must pass:\n{r.stderr}")
+
+    # --- path normalization ---------------------------------------------
+    def test_leading_dotslash_surface_still_flags(self):
+        self.assert_drift(run_guard("./" + CLI), strict=False)
+
+    def test_leading_dotslash_doc_counts_as_docs(self):
+        self.assert_clean(run_guard(CLI, "./" + README))
+
+    def test_backslash_surface_path_flags(self):
+        self.assert_drift(run_guard(CLI.replace("/", "\\")), strict=False)
+
+    # --- multi-surface aggregation --------------------------------------
+    def test_multiple_surfaces_all_listed_sorted(self):
+        r = run_guard(TUNABLES, CLI)  # passed out of order
+        self.assertEqual(r.returncode, 0)
+        msg = r.stdout + r.stderr
+        self.assertIn(CLI, msg)
+        self.assertIn(TUNABLES, msg)
+        # sorted: main.rs ("crates/ironmem/src/m...") before tunables ("...search/t...")
+        self.assertLess(msg.index(CLI), msg.index(TUNABLES))
+
+    # --- argument validation --------------------------------------------
+    def test_base_and_files_are_mutually_exclusive(self):
+        r = subprocess.run(
+            [sys.executable, str(SCRIPT), "--base", "HEAD", CLI],
+            capture_output=True,
+            text=True,
+        )
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("not both", r.stderr)
+
+    # --- --base git mode ------------------------------------------------
+    def test_base_missing_ref_exits_2(self):
+        r = subprocess.run(
+            [sys.executable, str(SCRIPT), "--base", "no-such-ref-xyz"],
+            capture_output=True,
+            text=True,
+            cwd=str(pathlib.Path(__file__).resolve().parents[1]),
+        )
+        self.assertEqual(r.returncode, 2, f"expected exit 2:\n{r.stdout}\n{r.stderr}")
+        self.assertIn("does not resolve", r.stderr)
+
+    def test_base_mode_detects_surface_drift_in_temp_repo(self):
+        repo = self._git_repo()
+        # Base commit: an internal-only file.
+        self._write(repo, INTERNAL, "// base\n")
+        self._git(repo, "add", "-A")
+        self._git(repo, "commit", "-m", "base")
+        base = self._git(repo, "rev-parse", "HEAD").strip()
+        # HEAD commit: change the CLI surface, no docs.
+        self._write(repo, CLI, "// changed\n")
+        self._git(repo, "add", "-A")
+        self._git(repo, "commit", "-m", "surface change")
+        r = subprocess.run(
+            [sys.executable, str(SCRIPT), "--base", base],
+            capture_output=True,
+            text=True,
+            cwd=str(repo),
+        )
+        self.assertEqual(r.returncode, 0, f"warn-only:\n{r.stdout}\n{r.stderr}")
+        self.assertIn("DRIFT", r.stdout + r.stderr)
+        self.assertIn(CLI, r.stdout + r.stderr)
+
+    # --- temp-git helpers ----------------------------------------------
+    def _git_repo(self) -> pathlib.Path:
+        d = tempfile.mkdtemp()
+        self.addCleanup(lambda: __import__("shutil").rmtree(d, ignore_errors=True))
+        repo = pathlib.Path(d)
+        self._git(repo, "init", "-q")
+        self._git(repo, "config", "user.email", "t@example.com")
+        self._git(repo, "config", "user.name", "test")
+        return repo
+
+    def _git(self, repo: pathlib.Path, *args: str) -> str:
+        return subprocess.run(
+            ["git", *args],
+            cwd=str(repo),
+            capture_output=True,
+            text=True,
+            check=True,
+            env={**os.environ, "GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_SYSTEM": os.devnull},
+        ).stdout
+
+    def _write(self, repo: pathlib.Path, rel: str, content: str) -> None:
+        p = repo / rel
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(content, encoding="utf-8")
 
 
 if __name__ == "__main__":
