@@ -187,6 +187,21 @@ IRONMEM_MCP_MODE=trusted ~/.ironrace/bin/ironmem serve</code></pre>
             <p>Point Codex at the installed binary and set trusted mode when write tools are needed.</p>
             <a href="https://github.com/ironrace/ironmem/blob/main/docs/CODEX.md" rel="noopener">Open Codex setup &rarr;</a>
           </div>
+          <div>
+            <h3>Any MCP client</h3>
+            <p>The core search, status, graph, diary, and write tools speak MCP over stdio, so Cursor, Cline, Windsurf, and other MCP clients work with no new code. Add a standard <code>mcpServers</code> block:</p>
+            <pre><code>{
+  "mcpServers": {
+    "ironmem": {
+      "command": "/absolute/path/to/ironmem",
+      "args": ["serve"],
+      "env": { "IRONMEM_MCP_MODE": "trusted" }
+    }
+  }
+}</code></pre>
+            <p>The Claude/Codex-only automation (session-start injection, Stop/PreCompact mining, prompt-time FTS injection) needs first-class harness support and is not fired by generic clients.</p>
+            <a href="https://github.com/ironrace/ironmem/blob/main/README.md#use-with-any-mcp-client" rel="noopener">Any MCP client setup &rarr;</a>
+          </div>
         </div>
       </section>
 
