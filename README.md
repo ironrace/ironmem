@@ -132,7 +132,7 @@ ironmem's core tools — `search`, `status`, the knowledge-graph tools (`kg_quer
 }
 ```
 
-Some clients want only the inner object (the value under `"ironmem"`) rather than the full `mcpServers` wrapper — adapt to your client's config format. Use an absolute path to the installed binary (`~/.ironrace/bin/ironmem`), and keep `IRONMEM_MCP_MODE = "trusted"` if you want the write tools.
+Some clients want only the inner object (the value under `"ironmem"`) rather than the full `mcpServers` wrapper — adapt to your client's config format. Use an absolute path to the installed binary (`~/.ironrace/bin/ironmem`), and keep `IRONMEM_MCP_MODE` set to `trusted` if you want the write tools.
 
 **Not available to generic clients.** The harness-driven automation listed under [Shared Memory Across Harnesses](#shared-memory-across-harnesses) — session-start memory injection, Stop/PreCompact mining, and UserPromptSubmit FTS injection — is wired into Claude Code and Codex specifically. A generic MCP client still gets the full read/search/write toolset on the shared store; it just won't fire those hooks automatically, which requires first-class harness support.
 
