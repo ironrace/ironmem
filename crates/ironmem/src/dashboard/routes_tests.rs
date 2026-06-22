@@ -82,7 +82,7 @@ fn fixture() -> Fixture {
     // status resolves to `missing` deterministically (no 400MB model needed).
     // Mirror the startup resolution so the fixture exercises the real mapping.
     let model_dir = dir.path().join("models");
-    let model_status = crate::dashboard::data::model_status_label(
+    let model_status = crate::dashboard::data::WarmingStatus::from(
         &ironrace_embed::embedder::model_status(&model_dir),
     );
     let state = Arc::new(ServerState {
@@ -277,7 +277,8 @@ async fn summary_surfaces_model_status_alongside_total_drawers() {
     // content readiness. The fixture resolves status against an empty model dir.
     let fx = fixture();
     assert_eq!(
-        fx.state.model_status, "missing",
+        fx.state.model_status,
+        crate::dashboard::data::WarmingStatus::Missing,
         "fixture must resolve an empty model cache to `missing`"
     );
 

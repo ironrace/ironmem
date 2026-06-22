@@ -5,10 +5,13 @@
 //! free of raw SQL.
 
 use std::collections::HashMap;
+use std::path::Path;
 
+use chrono::{DateTime, Utc};
 use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
 
+use crate::code_maps::freshness::{classify_with_diff, diff_against_head, Freshness};
 use crate::db::drawers::Drawer;
 use crate::db::CodeMap;
 use crate::db::ReadOnlyDb;
@@ -30,23 +33,39 @@ pub(crate) const DEFAULT_LIMIT: usize = 50;
 // Warming status (GAP 1: embed-model cache readiness)
 // ────────────────────────────────────────────────────────────────────────────
 
-/// Map an embed-model [`ModelStatus`] to a stable, leak-free label for the
-/// dashboard summary.
+/// Embed-model cache warming status, surfaced on `/api/summary`.
 ///
 /// IMPORTANT semantics: this reports whether the cache *can embed* (model files
 /// present and intact), NOT whether memory is populated. The summary surfaces
 /// this alongside `total_drawers` so warming readiness is never misread as
 /// content readiness.
 ///
-/// The [`ModelStatus::Unreadable`] detail string is deliberately dropped — only
-/// the four stable labels (`ready`/`missing`/`corrupt`/`unreadable`) are
-/// exposed so no filesystem/permission detail leaks into an HTTP response.
-pub fn model_status_label(status: &ModelStatus) -> &'static str {
-    match status {
-        ModelStatus::Ready => "ready",
-        ModelStatus::Missing => "missing",
-        ModelStatus::Corrupt => "corrupt",
-        ModelStatus::Unreadable(_) => "unreadable",
+/// This is a closed four-value set (mirroring [`AgeBucket`]/[`FreshnessBadge`]
+/// in this module) so the wire contract is compile-time enforced. It carries no
+/// payload: the [`ModelStatus::Unreadable`] detail string is deliberately
+/// dropped here so no filesystem/permission detail can leak into an HTTP
+/// response — callers that want the detail must log it server-side.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WarmingStatus {
+    /// Model files present and checksums match — embeddings can run.
+    Ready,
+    /// One or both model files are absent.
+    Missing,
+    /// Files present but a checksum mismatch (corrupt or tampered).
+    Corrupt,
+    /// Files present but could not be read (permissions, I/O error).
+    Unreadable,
+}
+
+impl From<&ModelStatus> for WarmingStatus {
+    fn from(status: &ModelStatus) -> Self {
+        match status {
+            ModelStatus::Ready => WarmingStatus::Ready,
+            ModelStatus::Missing => WarmingStatus::Missing,
+            ModelStatus::Corrupt => WarmingStatus::Corrupt,
+            ModelStatus::Unreadable(_) => WarmingStatus::Unreadable,
+        }
     }
 }
 
@@ -293,12 +312,6 @@ pub(crate) fn list_code_maps_conn(
 // Code-map freshness (GAP 2: per-row freshness badge — hybrid)
 // ────────────────────────────────────────────────────────────────────────────
 
-use std::path::Path;
-
-use chrono::{DateTime, Utc};
-
-use crate::code_maps::freshness::{classify, Freshness};
-
 /// A built-age bucket, used only when a map's `repo` path cannot be resolved to
 /// a real git worktree (so the real `classify` engine cannot run).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -345,11 +358,20 @@ const AGE_FRESH_DAYS: i64 = 7;
 /// Newer than this (in days) is [`AgeBucket::Aging`]; older is [`AgeBucket::Stale`].
 const AGE_AGING_DAYS: i64 = 30;
 
+// Guard the bucket ordering at compile time: a swap would make `Aging`
+// unreachable and silently mis-bucket every map.
+const _: () = assert!(
+    AGE_FRESH_DAYS < AGE_AGING_DAYS,
+    "AGE_FRESH_DAYS must be < AGE_AGING_DAYS"
+);
+
 /// Bucket a map's `built_at` timestamp by age relative to `now`. An
 /// unparseable timestamp is [`AgeBucket::Unknown`] (never silently treated as
-/// fresh).
+/// fresh) and is logged server-side: `built_at` is system-written, so a value
+/// that will not parse signals an upstream data-integrity bug, not user input.
 pub fn age_bucket(built_at: &str, now: DateTime<Utc>) -> AgeBucket {
     let Ok(built) = DateTime::parse_from_rfc3339(built_at) else {
+        eprintln!("dashboard: code-map built_at is not RFC3339: {built_at:?}");
         return AgeBucket::Unknown;
     };
     let age_days = (now - built.with_timezone(&Utc)).num_days();
@@ -362,38 +384,87 @@ pub fn age_bucket(built_at: &str, now: DateTime<Utc>) -> AgeBucket {
     }
 }
 
-/// Classify a single code-map row (hybrid):
-/// - If `map.repo` resolves to a real directory, run the real [`classify`]
-///   engine (`git diff` against HEAD) — the canonical absolute worktree path is
-///   stored at write time.
-/// - Otherwise fall back to a build-age bucket derived from `built_at`.
-///
-/// `now` is injected so the age path is deterministic and testable.
-pub fn row_freshness(map: &CodeMap, now: DateTime<Utc>) -> FreshnessBadge {
-    if Path::new(&map.repo).is_dir() {
-        match classify(map, Path::new(&map.repo)) {
-            Freshness::Fresh => FreshnessBadge::Fresh,
-            Freshness::Stale { changed_files } => FreshnessBadge::Stale {
-                changed_files: changed_files.len(),
-            },
-            Freshness::RescoutRequired { reason } => FreshnessBadge::Rescout { reason },
-        }
-    } else {
-        FreshnessBadge::Age {
-            bucket: age_bucket(&map.built_at, now),
-        }
+/// Map the freshness engine outcome to a badge (drops the `Stale` path list
+/// down to a count for the wire — the UI only needs the number).
+fn badge_from_freshness(freshness: Freshness) -> FreshnessBadge {
+    match freshness {
+        Freshness::Fresh => FreshnessBadge::Fresh,
+        Freshness::Stale { changed_files } => FreshnessBadge::Stale {
+            changed_files: changed_files.len(),
+        },
+        Freshness::RescoutRequired { reason } => FreshnessBadge::Rescout { reason },
     }
+}
+
+/// Test-only single-row convenience over [`row_freshness_cached`]. Production
+/// always goes through [`enrich_code_maps`], which shares one diff cache across
+/// the batch; this wrapper exists so single-row behavior can be asserted in
+/// isolation.
+#[cfg(test)]
+fn row_freshness(map: &CodeMap, now: DateTime<Utc>) -> FreshnessBadge {
+    let mut diff_cache = HashMap::new();
+    row_freshness_cached(map, now, &mut diff_cache)
 }
 
 /// Enrich code-map rows with freshness badges. Pure transform — builds new
 /// [`CodeMapView`] values and never mutates the inputs.
+///
+/// The git `diff` is memoized by `(repo, head_sha)`: many areas in one repo
+/// share the same worktree and build SHA, so a request listing N rows runs at
+/// most one `git diff` per distinct `(repo, head_sha)` instead of one per row,
+/// bounding the subprocess fan-out well under the row-limit clamp.
 pub fn enrich_code_maps(maps: Vec<CodeMap>, now: DateTime<Utc>) -> Vec<CodeMapView> {
+    let mut diff_cache: HashMap<(String, String), Result<Vec<String>, String>> = HashMap::new();
     maps.into_iter()
         .map(|map| {
-            let freshness = row_freshness(&map, now);
+            let freshness = row_freshness_cached(&map, now, &mut diff_cache);
             CodeMapView { map, freshness }
         })
         .collect()
+}
+
+/// Classify a single code-map row (hybrid), sharing a git-diff cache across a
+/// batch:
+/// - If `map.repo` resolves to a real directory, run the real freshness engine
+///   (`git diff` against HEAD, memoized by `(repo, head_sha)`) — the canonical
+///   absolute worktree path is stored at write time.
+/// - If the path does not exist (or is not a directory), fall back to a
+///   build-age bucket derived from `built_at` — the worktree simply is not
+///   checked out here.
+/// - If the path cannot be `stat`-ed for any OTHER reason (permission, transient
+///   I/O), freshness genuinely could not be determined: log server-side and emit
+///   a distinct `Rescout` badge rather than masquerading the unknown as a
+///   confident age signal (`Path::is_dir()` would silently collapse this into
+///   the age fallback).
+///
+/// `now` is injected so the age path is deterministic and testable.
+fn row_freshness_cached(
+    map: &CodeMap,
+    now: DateTime<Utc>,
+    diff_cache: &mut HashMap<(String, String), Result<Vec<String>, String>>,
+) -> FreshnessBadge {
+    match std::fs::metadata(&map.repo) {
+        Ok(meta) if meta.is_dir() => {
+            let key = (map.repo.clone(), map.head_sha.clone());
+            let diff = diff_cache
+                .entry(key)
+                .or_insert_with(|| diff_against_head(Path::new(&map.repo), &map.head_sha))
+                .clone();
+            badge_from_freshness(classify_with_diff(map, diff))
+        }
+        Ok(_) => FreshnessBadge::Age {
+            bucket: age_bucket(&map.built_at, now),
+        },
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => FreshnessBadge::Age {
+            bucket: age_bucket(&map.built_at, now),
+        },
+        Err(e) => {
+            eprintln!("dashboard: cannot stat code-map repo {:?}: {e}", map.repo);
+            FreshnessBadge::Rescout {
+                reason: "repo path unreadable; re-scout required".to_string(),
+            }
+        }
+    }
 }
 
 fn map_code_map_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<CodeMap> {
@@ -640,6 +711,80 @@ mod tests {
     }
 
     #[test]
+    fn row_freshness_resolvable_repo_malformed_sha_is_rescout() {
+        // Resolvable worktree but a non-hex head_sha: the engine's shape guard
+        // rejects it → RescoutRequired → Rescout badge (fail-safe, never Fresh).
+        let (_dir, root, _build_sha) = git_repo_with("a.rs", "// v1");
+        let map = map_with(
+            &root.to_string_lossy(),
+            "HEAD", // not a hex object name
+            vec!["a.rs".to_string()],
+            "2026-06-20T00:00:00Z",
+        );
+        let now = ts("2026-06-22T00:00:00Z");
+        assert!(
+            matches!(row_freshness(&map, now), FreshnessBadge::Rescout { .. }),
+            "non-hex head_sha on a real repo must classify as Rescout"
+        );
+    }
+
+    #[test]
+    fn row_freshness_unreadable_repo_path_is_rescout_not_age() {
+        // A `repo` whose parent is a FILE yields a non-NotFound stat error
+        // (ENOTDIR). That must surface as Rescout (freshness unknown), never be
+        // silently collapsed into a confident age badge.
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("not-a-dir");
+        std::fs::write(&file, b"x").unwrap();
+        let repo = file.join("child"); // stat() -> ENOTDIR (not NotFound)
+        let map = map_with(
+            &repo.to_string_lossy(),
+            "aabbccdd1122334455667788aabbccdd11223344",
+            vec!["a.rs".to_string()],
+            "2026-06-20T00:00:00Z",
+        );
+        let now = ts("2026-06-22T00:00:00Z");
+        assert!(
+            matches!(row_freshness(&map, now), FreshnessBadge::Rescout { .. }),
+            "an unreadable (non-NotFound) repo path must be Rescout, not an age badge"
+        );
+    }
+
+    #[test]
+    fn freshness_badge_serializes_stale_and_rescout_shapes() {
+        // Lock the wire contract the UI's freshnessLabel() reads.
+        let stale = serde_json::to_value(FreshnessBadge::Stale { changed_files: 3 }).unwrap();
+        assert_eq!(stale["kind"], "stale");
+        assert_eq!(stale["changed_files"], 3);
+
+        let rescout = serde_json::to_value(FreshnessBadge::Rescout {
+            reason: "map cannot be verified".to_string(),
+        })
+        .unwrap();
+        assert_eq!(rescout["kind"], "rescout");
+        assert_eq!(rescout["reason"], "map cannot be verified");
+
+        let fresh = serde_json::to_value(FreshnessBadge::Fresh).unwrap();
+        assert_eq!(fresh["kind"], "fresh");
+    }
+
+    #[test]
+    fn age_bucket_exact_threshold_boundaries() {
+        let now = ts("2026-06-22T00:00:00Z");
+        // num_days truncates; strict `<` means day 7 is Aging, day 30 is Stale.
+        assert_eq!(age_bucket("2026-06-16T00:00:00Z", now), AgeBucket::Fresh); // 6d
+        assert_eq!(age_bucket("2026-06-15T00:00:00Z", now), AgeBucket::Aging); // 7d
+        assert_eq!(age_bucket("2026-05-24T00:00:00Z", now), AgeBucket::Aging); // 29d
+        assert_eq!(age_bucket("2026-05-23T00:00:00Z", now), AgeBucket::Stale); // 30d
+    }
+
+    #[test]
+    fn enrich_code_maps_handles_empty_input() {
+        let now = ts("2026-06-22T00:00:00Z");
+        assert!(enrich_code_maps(vec![], now).is_empty());
+    }
+
+    #[test]
     fn code_map_view_serializes_flattened_fields_plus_freshness() {
         let map = map_with(
             "repo-a",
@@ -660,26 +805,53 @@ mod tests {
         assert_eq!(row["freshness"]["bucket"], "stale");
     }
 
-    // ── model_status_label (GAP 1: warming status) ────────────────────────────
+    // ── WarmingStatus (GAP 1: warming status) ─────────────────────────────────
 
     #[test]
-    fn model_status_label_maps_all_variants() {
+    fn warming_status_maps_all_model_status_variants() {
         use ironrace_embed::embedder::ModelStatus;
-        assert_eq!(model_status_label(&ModelStatus::Ready), "ready");
-        assert_eq!(model_status_label(&ModelStatus::Missing), "missing");
-        assert_eq!(model_status_label(&ModelStatus::Corrupt), "corrupt");
-        // The underlying I/O detail is never surfaced — only a stable label.
         assert_eq!(
-            model_status_label(&ModelStatus::Unreadable("permission denied".into())),
+            WarmingStatus::from(&ModelStatus::Ready),
+            WarmingStatus::Ready
+        );
+        assert_eq!(
+            WarmingStatus::from(&ModelStatus::Missing),
+            WarmingStatus::Missing
+        );
+        assert_eq!(
+            WarmingStatus::from(&ModelStatus::Corrupt),
+            WarmingStatus::Corrupt
+        );
+        // The underlying I/O detail is never carried — the enum has no payload.
+        assert_eq!(
+            WarmingStatus::from(&ModelStatus::Unreadable("permission denied".into())),
+            WarmingStatus::Unreadable
+        );
+    }
+
+    #[test]
+    fn warming_status_serializes_to_stable_snake_case_labels() {
+        // The wire contract consumed by the UI must stay these exact strings.
+        assert_eq!(serde_json::to_value(WarmingStatus::Ready).unwrap(), "ready");
+        assert_eq!(
+            serde_json::to_value(WarmingStatus::Missing).unwrap(),
+            "missing"
+        );
+        assert_eq!(
+            serde_json::to_value(WarmingStatus::Corrupt).unwrap(),
+            "corrupt"
+        );
+        assert_eq!(
+            serde_json::to_value(WarmingStatus::Unreadable).unwrap(),
             "unreadable"
         );
     }
 
     #[test]
-    fn model_status_label_missing_for_empty_dir() {
+    fn warming_status_missing_for_empty_dir() {
         let dir = tempfile::tempdir().unwrap();
         let status = ironrace_embed::embedder::model_status(dir.path());
-        assert_eq!(model_status_label(&status), "missing");
+        assert_eq!(WarmingStatus::from(&status), WarmingStatus::Missing);
     }
 
     /// File-backed fixture: the projection functions take a `ReadOnlyDb`, which

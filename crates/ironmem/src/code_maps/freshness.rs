@@ -99,7 +99,24 @@ fn changed_files(repo_root: &Path, build_sha: &str) -> Result<Vec<String>, Strin
 /// for the intersection to work correctly. Writers (e.g. `code_map_write`)
 /// must normalise paths to forward slashes before storing them.
 pub fn classify(map: &CodeMap, repo_root: &Path) -> Freshness {
-    match changed_files(repo_root, &map.head_sha) {
+    classify_with_diff(map, diff_against_head(repo_root, &map.head_sha))
+}
+
+/// The `git diff --name-only <build_sha>..HEAD` step of [`classify`], exposed so
+/// callers that classify many maps sharing the same `(repo, head_sha)` can run
+/// the git shell-out **once** and reuse the result. The returned value is the
+/// repo-relative changed-file list, or `Err(reason)` with a generic, leak-free
+/// message on any git failure (callers map that to `RescoutRequired`).
+pub fn diff_against_head(repo_root: &Path, build_sha: &str) -> Result<Vec<String>, String> {
+    changed_files(repo_root, build_sha)
+}
+
+/// The pure intersection step of [`classify`]: combine a map's `source_files`
+/// with an already-computed diff (from [`diff_against_head`]). Separated from the
+/// git shell-out so the expensive subprocess can be memoized by the caller while
+/// the per-map intersection stays cheap.
+pub fn classify_with_diff(map: &CodeMap, diff: Result<Vec<String>, String>) -> Freshness {
+    match diff {
         Err(reason) => Freshness::RescoutRequired { reason },
         Ok(diff) => {
             let source_set: std::collections::HashSet<&str> =

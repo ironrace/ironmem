@@ -528,10 +528,13 @@ dashboard to re-check after a model finishes downloading.
 **Code-map freshness:** each `/api/code-maps` row carries a `freshness` badge
 computed with a hybrid strategy. When the map's stored canonical worktree path
 resolves, the real freshness engine runs (`git diff` against `HEAD`) and reports
-`fresh` / `stale` (with changed-file count) / `rescout`. When the path is not a
-resolvable git worktree, it falls back to a build-age bucket (`fresh` <7d /
-`aging` <30d / `stale`) derived from `built_at`. `head_sha` is always shown for
-provenance.
+`fresh` / `stale` (with changed-file count) / `rescout`. When the path is absent
+(worktree not checked out here), it falls back to a build-age bucket (`fresh`
+<7d / `aging` <30d / `stale`) derived from `built_at`. When the path exists but
+cannot be read (permission/transient I/O error), freshness is reported as
+`rescout` rather than a misleading age signal. The git diff is memoized per
+`(repo, head_sha)`, so listing many areas of one repo runs at most one `git
+diff` per distinct build SHA. `head_sha` is always shown for provenance.
 
 **Remediation hints:** each section links to the real CLI command that acts on
 it — `ironmem mine <dir>` and `ironmem reembed` for memory, `ironmem mine <dir>`

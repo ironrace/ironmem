@@ -22,6 +22,7 @@ use tokio::net::TcpListener;
 use crate::db::schema::{Database, LATEST_SCHEMA_VERSION};
 use crate::error::MemoryError;
 
+use super::data::WarmingStatus;
 use super::routes::handle_request;
 
 /// Maximum time a connection may take to send its request headers before it is
@@ -33,12 +34,12 @@ const HEADER_READ_TIMEOUT: Duration = Duration::from_secs(10);
 pub(crate) struct ServerState {
     pub(crate) db_path: Arc<PathBuf>,
     pub(crate) schema_version: i64,
-    /// Warming status label (`ready`/`missing`/`corrupt`/`unreadable`), resolved
-    /// ONCE at startup. The model checksum is ~hundreds of MB of I/O, so it must
-    /// not run per request — the read path stays pure and the handler just
-    /// echoes this snapshot. Reflects the cache state at launch; restart to
-    /// re-check after warming.
-    pub(crate) model_status: &'static str,
+    /// Warming status (`ready`/`missing`/`corrupt`/`unreadable`), resolved ONCE
+    /// at startup. The model checksum is ~hundreds of MB of I/O, so it must not
+    /// run per request — the read path stays pure and the handler just echoes
+    /// this snapshot. Reflects the cache state at launch; restart to re-check
+    /// after warming.
+    pub(crate) model_status: WarmingStatus,
 }
 
 /// Configuration for the dashboard server.
@@ -93,7 +94,7 @@ pub async fn run_dashboard(cfg: DashboardConfig) -> Result<(), MemoryError> {
     let (schema_version, model_status) = {
         let path = cfg.db_path.clone();
         let model_dir = cfg.model_dir.clone();
-        tokio::task::spawn_blocking(move || -> Result<(i64, &'static str), MemoryError> {
+        tokio::task::spawn_blocking(move || -> Result<(i64, WarmingStatus), MemoryError> {
             let db = Database::open_read_only(&path)?;
             let ver = db.schema_version()?;
             if ver != LATEST_SCHEMA_VERSION {
@@ -102,10 +103,22 @@ pub async fn run_dashboard(cfg: DashboardConfig) -> Result<(), MemoryError> {
                      run `ironmem migrate` first"
                 )));
             }
-            let model_status = super::data::model_status_label(
-                &ironrace_embed::embedder::model_status(&model_dir),
-            );
-            Ok((ver, model_status))
+            let raw = ironrace_embed::embedder::model_status(&model_dir);
+            // The HTTP label intentionally drops any detail; log the underlying
+            // cause server-side so an operator can diagnose a non-Ready cache.
+            match &raw {
+                ironrace_embed::embedder::ModelStatus::Unreadable(detail) => {
+                    eprintln!("ironmem dashboard: embed-model cache unreadable: {detail}");
+                }
+                ironrace_embed::embedder::ModelStatus::Corrupt => {
+                    eprintln!(
+                        "ironmem dashboard: embed-model cache checksum mismatch (corrupt); \
+                         re-download with `ironmem reembed`"
+                    );
+                }
+                _ => {}
+            }
+            Ok((ver, WarmingStatus::from(&raw)))
         })
         .await
         .map_err(|e| MemoryError::Validation(format!("spawn_blocking: {e}")))??
