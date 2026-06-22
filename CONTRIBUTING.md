@@ -45,6 +45,7 @@ python3 scripts/mcp_smoke_test.py
 Notes:
 
 - `scripts/check_collab_turn_templates.py` lints the collab worker-per-turn templates and the `collab.md` dispatch surface; `tests/collab_turn_templates/` exercises that linter (including negative cases that assert it rejects malformed templates and matrix rows).
+- `scripts/check_site_readme_sync.py` is the site/README drift guard (issue #160): it warns when a user-facing surface (`crates/ironmem/src/main.rs`, `crates/ironmem/src/mcp/tools/`, or `crates/ironmem/src/search/tunables.rs`) changes without a matching update to `site/` or `README.md`. CI runs it warn-only on PRs; run it locally against your base with `python3 scripts/check_site_readme_sync.py --base origin/main`. `scripts/test_check_site_readme_sync.py` exercises the guard. For user-facing PRs, route the docs update through the `doc-updater` agent.
 - `scripts/check_versions.sh` verifies that plugin metadata versions stay in sync with `crates/ironmem/Cargo.toml`.
 - `scripts/mcp_smoke_test.py` starts a real `ironmem serve` process in noop-embedder mode and sends a live `initialize` call over stdio.
 - The smoke test uses an isolated temp DB and disables auto-bootstrap/migration so it stays fast and deterministic.
