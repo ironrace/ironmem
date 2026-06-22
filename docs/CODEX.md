@@ -2,7 +2,7 @@
 
 ## Purpose
 
-This guide explains how to use `ironmem` with Codex today, what is still missing, and how to compare it against `mempalace`.
+`ironmem` gives Codex a private, local memory that persists across sessions and is shared with Claude Code — so Codex can recall what a repository contains and what was already decided instead of re-exploring it every time. This guide explains how to set that up with Codex today, what is still missing, and how to compare it against `mempalace`.
 
 For the bounded Claude↔Codex planning protocol, see [COLLAB.md](COLLAB.md).
 

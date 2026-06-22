@@ -6,19 +6,19 @@
     <title>Ironrace | ironmem — local memory for AI agents</title>
     <meta
       name="description"
-      content="ironmem is an open-source Rust MCP server that gives Codex, Claude Code, and any MCP client a private local memory: semantic search, a knowledge graph, and a diary in a single binary."
+      content="ironmem gives Codex, Claude Code, and any MCP client a private local memory they share — so AI coding agents recall what was already explored and decided instead of re-reading your repo every session."
     />
     <meta name="theme-color" content="#ffffff" />
     <meta property="og:site_name" content="Ironrace" />
     <meta property="og:title" content="Ironrace | ironmem — local memory for AI agents" />
-    <meta property="og:description" content="Open-source Rust MCP memory server: semantic search, knowledge graph, and diary shared by Codex, Claude Code, and any MCP client." />
+    <meta property="og:description" content="ironmem gives Codex, Claude Code, and any MCP client a private local memory they share — so AI coding agents recall what was already explored and decided instead of re-reading your repo every session." />
     <meta property="og:type" content="website" />
     <meta property="og:url" content="https://ironrace.dev/" />
     <meta property="og:image" content="https://ironrace.dev/assets/ironrace-memory-graph.png" />
     <meta property="og:image:alt" content="A technical illustration of a local memory graph connected to vector search results" />
     <meta name="twitter:card" content="summary_large_image" />
     <meta name="twitter:title" content="Ironrace | ironmem — local memory for AI agents" />
-    <meta name="twitter:description" content="Open-source Rust MCP memory server: semantic search, knowledge graph, and diary shared by Codex, Claude Code, and any MCP client." />
+    <meta name="twitter:description" content="ironmem gives Codex, Claude Code, and any MCP client a private local memory they share — so AI coding agents recall what was already explored and decided instead of re-reading your repo every session." />
     <meta name="twitter:image" content="https://ironrace.dev/assets/ironrace-memory-graph.png" />
     <link rel="canonical" href="https://ironrace.dev/" />
     <script type="application/ld+json">
@@ -32,7 +32,7 @@
         "downloadUrl": "https://github.com/ironrace/ironmem/releases",
         "license": "https://www.apache.org/licenses/LICENSE-2.0",
         "offers": { "@type": "Offer", "price": "0", "priceCurrency": "USD" },
-        "description": "Open-source Rust MCP server that gives AI coding agents a private local memory: semantic search, a knowledge graph, and a diary in a single binary."
+        "description": "ironmem gives Codex, Claude Code, and any MCP client a private local memory they share — so AI coding agents recall what was already explored and decided instead of re-reading your repo every session."
       }
     </script>
     <link rel="icon" href="/favicon.svg" type="image/svg+xml" />
@@ -56,11 +56,11 @@
       <section class="hero" aria-labelledby="hero-title">
         <div class="hero-copy">
           <h1 id="hero-title">Ironrace</h1>
-          <p class="hero-lede">Memory for AI agents that outlives the session.</p>
+          <p class="hero-lede">Stop making AI agents re-learn your repo every session.</p>
           <p class="hero-body">
-            ironmem is an open-source Rust MCP server that gives Codex, Claude Code, and any MCP client a
-            private semantic memory: search, diary, taxonomy, and knowledge-graph tools over one local
-            SQLite store. No cloud, no Python — a single binary that starts serving in under 25&nbsp;ms.
+            ironmem gives Codex, Claude Code, and any MCP client a private local memory they share — so
+            they recall what was already explored and decided instead of re-reading the same files each
+            time. One Rust binary, one local SQLite store, no cloud, no account, no Python runtime.
           </p>
           <div class="actions" aria-label="Primary actions">
             <a class="button button-primary" href="#install">
@@ -104,25 +104,25 @@
         </div>
       </section>
 
-      <section id="ironmem" class="section section-tight" aria-labelledby="ships-title">
+      <section id="ironmem" class="section section-tight" aria-labelledby="features-title">
         <div class="section-heading">
-          <h2 id="ships-title">What ships today</h2>
-          <p>One local server, one database, and a tool surface agents can share.</p>
+          <h2 id="features-title">What ironmem gives your agents</h2>
+          <p>Memory that carries across sessions and across harnesses — explore your repo once, not every time.</p>
         </div>
         <div class="feature-grid">
           <article class="feature">
             <span class="feature-icon" aria-hidden="true">
               <svg viewBox="0 0 24 24"><path d="M4 7c0 2 16 2 16 0M4 7c0-2 16-2 16 0M4 7v10c0 2 16 2 16 0V7M4 12c0 2 16 2 16 0" /></svg>
             </span>
-            <h3>Semantic memory</h3>
-            <p>HNSW vector search over local embeddings for fast recall from agent context.</p>
+            <h3>Recall instead of re-reading</h3>
+            <p>Agents pull up prior context — decisions, file locations, earlier work — through local HNSW vector search, instead of re-exploring the repo each session.</p>
           </article>
           <article class="feature">
             <span class="feature-icon" aria-hidden="true">
               <svg viewBox="0 0 24 24"><path d="M8 8h8v8H8z" /><path d="M4 12h4m8 0h4M12 4v4m0 8v4" /></svg>
             </span>
-            <h3>Pure Rust embeddings</h3>
-            <p>ONNX sentence embeddings live inside the workspace through ironrace-embed.</p>
+            <h3>Local and private</h3>
+            <p>Embeddings run on your machine in pure Rust (ONNX via ironrace-embed) — no Python runtime and no external service.</p>
           </article>
           <article class="feature">
             <span class="feature-icon" aria-hidden="true">
@@ -143,7 +143,7 @@
               <svg viewBox="0 0 24 24"><path d="M4 6h16v12H4z" /><path d="M8 10h8M8 14h5" /></svg>
             </span>
             <h3>Shared across harnesses</h3>
-            <p>Codex and Claude Code read and write the same SQLite store by default.</p>
+            <p>Codex and Claude Code read and write the same local SQLite store by default, so context learned in one is available in the other.</p>
           </article>
           <article class="feature">
             <span class="feature-icon" aria-hidden="true">

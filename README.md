@@ -4,6 +4,47 @@
 [![Release](https://img.shields.io/github/v/release/ironrace/ironmem)](https://github.com/ironrace/ironmem/releases)
 [![License: Apache-2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
 
+**ironmem gives your AI coding agents a memory that survives the session.**
+Instead of re-reading the same files and re-deriving the same context every time
+you open Claude Code or Codex, ironmem keeps what was learned — decisions, file
+locations, prior work — in a private local store both harnesses share.
+
+What that means in practice:
+
+- **Fewer repeated file reads.** Agents recall where things live and what was
+  already decided, so they spend less of each session re-exploring the
+  repository from scratch.
+- **Local and private by default.** Everything lives in one local SQLite store
+  on your machine (`~/.ironrace-memory/memory.sqlite3`). No cloud, no account,
+  no Python runtime.
+- **Shared across Claude Code and Codex.** Both harnesses read and write the
+  same memory, so context carried in a Claude session is available in Codex, and
+  vice versa.
+
+## When to use ironmem
+
+Reach for ironmem when:
+
+- You work in the same repositories across many agent sessions and keep
+  re-explaining the same context.
+- You switch between Claude Code and Codex and want them to share what they have
+  learned.
+- You want memory to stay on your machine rather than in a hosted service.
+
+It is less useful for one-off questions, throwaway repos, or workflows where
+every session genuinely starts from a blank slate.
+
+## What it does not do yet
+
+- It does not yet build a rich, LLM-written session summary from transcript
+  content; summaries today are structured/metadata-based.
+- It makes no numeric claims about exploration or token savings. See
+  [Benchmarking](#benchmarking) for the measurement harness and run it yourself.
+- Install is from source or prebuilt release binaries today — there is no
+  single-command package-manager install yet.
+
+## Architecture
+
 `ironmem` is a Rust workspace for a local AI memory backend:
 
 - `ironrace-core`: shared HNSW vector index
