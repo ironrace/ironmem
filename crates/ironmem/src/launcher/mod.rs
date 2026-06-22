@@ -4,6 +4,7 @@
 
 mod argv;
 mod binary;
+mod context_inject;
 mod mcp_setup;
 
 use std::path::{Path, PathBuf};
