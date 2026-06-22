@@ -14,6 +14,7 @@ use crate::db::CodeMap;
 use crate::db::ReadOnlyDb;
 use crate::error::MemoryError;
 use crate::report::{Report, ReportOptions};
+use ironrace_embed::embedder::ModelStatus;
 
 /// Maximum content length for a drawer in list views (truncated beyond this).
 const LIST_CONTENT_LIMIT: usize = 200;
@@ -24,6 +25,30 @@ const LIST_CONTENT_LIMIT: usize = 200;
 pub(crate) const MAX_DASHBOARD_LIMIT: usize = 500;
 /// Default `limit` when a request omits it.
 pub(crate) const DEFAULT_LIMIT: usize = 50;
+
+// ────────────────────────────────────────────────────────────────────────────
+// Warming status (GAP 1: embed-model cache readiness)
+// ────────────────────────────────────────────────────────────────────────────
+
+/// Map an embed-model [`ModelStatus`] to a stable, leak-free label for the
+/// dashboard summary.
+///
+/// IMPORTANT semantics: this reports whether the cache *can embed* (model files
+/// present and intact), NOT whether memory is populated. The summary surfaces
+/// this alongside `total_drawers` so warming readiness is never misread as
+/// content readiness.
+///
+/// The [`ModelStatus::Unreadable`] detail string is deliberately dropped — only
+/// the four stable labels (`ready`/`missing`/`corrupt`/`unreadable`) are
+/// exposed so no filesystem/permission detail leaks into an HTTP response.
+pub fn model_status_label(status: &ModelStatus) -> &'static str {
+    match status {
+        ModelStatus::Ready => "ready",
+        ModelStatus::Missing => "missing",
+        ModelStatus::Corrupt => "corrupt",
+        ModelStatus::Unreadable(_) => "unreadable",
+    }
+}
 
 // ────────────────────────────────────────────────────────────────────────────
 // Memory summary projection (Task 2)
@@ -393,6 +418,28 @@ pub(crate) fn list_sessions_conn(
 mod tests {
     use super::*;
     use crate::db::schema::Database;
+
+    // ── model_status_label (GAP 1: warming status) ────────────────────────────
+
+    #[test]
+    fn model_status_label_maps_all_variants() {
+        use ironrace_embed::embedder::ModelStatus;
+        assert_eq!(model_status_label(&ModelStatus::Ready), "ready");
+        assert_eq!(model_status_label(&ModelStatus::Missing), "missing");
+        assert_eq!(model_status_label(&ModelStatus::Corrupt), "corrupt");
+        // The underlying I/O detail is never surfaced — only a stable label.
+        assert_eq!(
+            model_status_label(&ModelStatus::Unreadable("permission denied".into())),
+            "unreadable"
+        );
+    }
+
+    #[test]
+    fn model_status_label_missing_for_empty_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let status = ironrace_embed::embedder::model_status(dir.path());
+        assert_eq!(model_status_label(&status), "missing");
+    }
 
     /// File-backed fixture: the projection functions take a `ReadOnlyDb`, which
     /// cannot share an in-memory connection with a writer. Setup writes through a

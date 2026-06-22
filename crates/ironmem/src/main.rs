@@ -367,6 +367,9 @@ async fn run(cli: Cli) -> Result<(), MemoryError> {
                 port,
                 allow_non_loopback,
                 json_startup: json,
+                // Reuse the same model-dir resolution as the rest of the CLI so
+                // warming status reflects the actual embed cache the binary uses.
+                model_dir: cfg.model_dir.clone(),
             };
             dashboard::run_dashboard(dash_cfg).await
         }

@@ -88,6 +88,9 @@ pub async fn handle_request<B>(
 async fn handle_summary(state: Arc<ServerState>, _query: &str) -> HyperResponse {
     let db_path = Arc::clone(&state.db_path);
     let schema_version = state.schema_version;
+    // Warming status: "can it embed?" (model present at launch), independent of
+    // whether memory is populated (`total_drawers`). Resolved once at startup.
+    let model_status = state.model_status;
 
     match tokio::task::spawn_blocking(move || -> Result<serde_json::Value, MemoryError> {
         let db = Database::open_read_only(&db_path)?;
@@ -102,6 +105,7 @@ async fn handle_summary(state: Arc<ServerState>, _query: &str) -> HyperResponse 
             "total_drawers": mem.total_drawers,
             "wing_count": mem.wing_counts.len(),
             "kg_stats": mem.kg_stats,
+            "model_status": model_status,
         }))
     })
     .await

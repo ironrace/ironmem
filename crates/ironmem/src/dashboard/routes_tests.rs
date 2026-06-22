@@ -78,9 +78,17 @@ fn fixture() -> Fixture {
         })
         .unwrap();
     }
+    // A dedicated, empty model dir: no model files are written, so warming
+    // status resolves to `missing` deterministically (no 400MB model needed).
+    // Mirror the startup resolution so the fixture exercises the real mapping.
+    let model_dir = dir.path().join("models");
+    let model_status = crate::dashboard::data::model_status_label(
+        &ironrace_embed::embedder::model_status(&model_dir),
+    );
     let state = Arc::new(ServerState {
         db_path: Arc::new(db_path.clone()),
         schema_version: LATEST_SCHEMA_VERSION,
+        model_status,
     });
     Fixture {
         _dir: dir,
@@ -263,6 +271,27 @@ async fn dashboard_handlers_return_expected_shapes_against_fixture() {
 }
 
 #[tokio::test]
+async fn summary_surfaces_model_status_alongside_total_drawers() {
+    // GAP 1: /api/summary must report embed-model readiness (can it embed?)
+    // AND total_drawers (is memory populated?) so warming is never misread as
+    // content readiness. The fixture resolves status against an empty model dir.
+    let fx = fixture();
+    assert_eq!(
+        fx.state.model_status, "missing",
+        "fixture must resolve an empty model cache to `missing`"
+    );
+
+    let summary = handle_summary(Arc::clone(&fx.state), "").await;
+    assert_eq!(summary.status(), StatusCode::OK);
+    let json: serde_json::Value = serde_json::from_str(&body_text(summary).await).unwrap();
+
+    // Model readiness label is surfaced and is "missing" for an empty cache.
+    assert_eq!(json["model_status"], "missing");
+    // Content readiness is reported independently and is unaffected by warming.
+    assert_eq!(json["total_drawers"], 1);
+}
+
+#[tokio::test]
 async fn invalid_params_return_safe_400_bodies() {
     let fx = fixture();
 
@@ -282,6 +311,7 @@ async fn invalid_params_return_safe_400_bodies() {
     let missing_db_state = Arc::new(ServerState {
         db_path: Arc::new(fx.db_path.with_file_name("missing.sqlite3")),
         schema_version: LATEST_SCHEMA_VERSION,
+        model_status: fx.state.model_status,
     });
     let internal = handle_summary(missing_db_state, "").await;
     assert_eq!(internal.status(), StatusCode::INTERNAL_SERVER_ERROR);
@@ -360,6 +390,24 @@ fn dashboard_html_sections_and_user_text_rendering_are_stable() {
     assert!(
         !DASHBOARD_HTML.contains("function esc("),
         "dead esc() helper reintroduced"
+    );
+}
+
+#[test]
+fn dashboard_html_surfaces_model_status_with_readiness_framing() {
+    // GAP 1 UI: warming status is shown AND framed so model readiness is not
+    // misread as memory being populated.
+    assert!(
+        DASHBOARD_HTML.contains("model_status"),
+        "summary UI must read d.model_status"
+    );
+    assert!(
+        DASHBOARD_HTML.contains("Embed Model"),
+        "summary UI must label the model-readiness card"
+    );
+    assert!(
+        DASHBOARD_HTML.to_lowercase().contains("readiness"),
+        "summary UI must frame model status as readiness, not content"
     );
 }
 

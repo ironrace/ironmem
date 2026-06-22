@@ -33,6 +33,12 @@ const HEADER_READ_TIMEOUT: Duration = Duration::from_secs(10);
 pub(crate) struct ServerState {
     pub(crate) db_path: Arc<PathBuf>,
     pub(crate) schema_version: i64,
+    /// Warming status label (`ready`/`missing`/`corrupt`/`unreadable`), resolved
+    /// ONCE at startup. The model checksum is ~hundreds of MB of I/O, so it must
+    /// not run per request — the read path stays pure and the handler just
+    /// echoes this snapshot. Reflects the cache state at launch; restart to
+    /// re-check after warming.
+    pub(crate) model_status: &'static str,
 }
 
 /// Configuration for the dashboard server.
@@ -42,6 +48,10 @@ pub struct DashboardConfig {
     pub port: u16,
     pub allow_non_loopback: bool,
     pub json_startup: bool,
+    /// Embed-model cache dir, resolved by the caller the same way `Config` does
+    /// (env `IRONMEM_MODEL_DIR` else `model_cache_dir()`). Used only to report
+    /// warming status; never written to.
+    pub model_dir: PathBuf,
 }
 
 impl DashboardConfig {
@@ -77,10 +87,13 @@ pub async fn run_dashboard(cfg: DashboardConfig) -> Result<(), MemoryError> {
     cfg.validate_host()?;
 
     // Open and schema-check the DB before binding the port so startup errors
-    // are surfaced before we accept any connections.
-    let schema_version = {
+    // are surfaced before we accept any connections. The embed-model warming
+    // status is resolved here too (one checksum pass at startup) so the request
+    // path never pays the model-read cost.
+    let (schema_version, model_status) = {
         let path = cfg.db_path.clone();
-        tokio::task::spawn_blocking(move || -> Result<i64, MemoryError> {
+        let model_dir = cfg.model_dir.clone();
+        tokio::task::spawn_blocking(move || -> Result<(i64, &'static str), MemoryError> {
             let db = Database::open_read_only(&path)?;
             let ver = db.schema_version()?;
             if ver != LATEST_SCHEMA_VERSION {
@@ -89,7 +102,10 @@ pub async fn run_dashboard(cfg: DashboardConfig) -> Result<(), MemoryError> {
                      run `ironmem migrate` first"
                 )));
             }
-            Ok(ver)
+            let model_status = super::data::model_status_label(
+                &ironrace_embed::embedder::model_status(&model_dir),
+            );
+            Ok((ver, model_status))
         })
         .await
         .map_err(|e| MemoryError::Validation(format!("spawn_blocking: {e}")))??
@@ -118,6 +134,7 @@ pub async fn run_dashboard(cfg: DashboardConfig) -> Result<(), MemoryError> {
     let state = Arc::new(ServerState {
         db_path: Arc::new(cfg.db_path),
         schema_version,
+        model_status,
     });
 
     // Ctrl-C signal for clean shutdown.
@@ -179,6 +196,7 @@ mod tests {
             port: 0,
             allow_non_loopback,
             json_startup: false,
+            model_dir: PathBuf::from("/tmp/irrelevant-models"),
         }
     }
 
@@ -190,6 +208,7 @@ mod tests {
             port: 0,
             allow_non_loopback: false,
             json_startup: false,
+            model_dir: PathBuf::from("/tmp/irrelevant-models"),
         };
         assert!(cfg.validate_host().is_ok());
     }
@@ -202,6 +221,7 @@ mod tests {
             port: 0,
             allow_non_loopback: false,
             json_startup: false,
+            model_dir: PathBuf::from("/tmp/irrelevant-models"),
         };
         let err = cfg.validate_host().unwrap_err();
         let msg = format!("{err}");
@@ -219,6 +239,7 @@ mod tests {
             port: 0,
             allow_non_loopback: true,
             json_startup: false,
+            model_dir: PathBuf::from("/tmp/irrelevant-models"),
         };
         // Should not error; warning goes to stderr (not captured here).
         assert!(cfg.validate_host().is_ok());

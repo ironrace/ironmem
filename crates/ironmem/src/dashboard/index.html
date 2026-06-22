@@ -20,6 +20,12 @@
   .badge { display: inline-block; padding: 0.15rem 0.4rem; border-radius: 4px; font-size: 0.75rem; background: #2a2a4a; color: #a78bfa; }
   .error { color: #f87171; font-size: 0.85rem; padding: 0.5rem; }
   .loading { color: #888; font-style: italic; font-size: 0.85rem; }
+  .hint { color: #9ca3af; font-size: 0.8rem; margin: 0.25rem 0 0.75rem; }
+  .hint code { background: #111; border: 1px solid #333; border-radius: 3px; padding: 0.05rem 0.3rem; color: #c9a0dc; font-size: 0.78rem; }
+  .badge.fresh { background: #14532d; color: #86efac; }
+  .badge.stale { background: #78350f; color: #fcd34d; }
+  .badge.rescout { background: #7f1d1d; color: #fca5a5; }
+  .badge.age { background: #1e3a5f; color: #93c5fd; }
   .filter-row { display: flex; gap: 0.5rem; margin-bottom: 0.75rem; flex-wrap: wrap; }
   input, select { background: #1a1a2e; border: 1px solid #444; color: #e0e0e0; padding: 0.3rem 0.5rem; border-radius: 4px; font-size: 0.85rem; }
   button { background: #4c1d95; border: none; color: #e0e0e0; padding: 0.3rem 0.8rem; border-radius: 4px; cursor: pointer; font-size: 0.85rem; }
@@ -43,6 +49,7 @@
 
 <div id="summary" class="section">
   <h2>Summary</h2>
+  <p class="hint">Embed Model shows cache <em>readiness</em> (can it embed?), not whether memory is populated — Total Drawers is the content signal. Diagnose with <code>ironmem doctor</code> or inspect with <code>ironmem context</code>.</p>
   <div id="summary-grid" class="grid"><p class="loading">Loading…</p></div>
 </div>
 
@@ -109,6 +116,7 @@ async function loadSummary() {
     el.innerHTML = '';
     const cards = [
       ['Total Drawers', d.total_drawers],
+      ['Embed Model', d.model_status],
       ['Wings', d.wing_count],
       ['Schema Version', 'v' + d.schema_version],
       ['KG Entities', d.kg_stats && d.kg_stats.entity_count],
