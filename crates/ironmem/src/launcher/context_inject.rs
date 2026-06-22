@@ -32,10 +32,13 @@ pub(crate) fn injection_disabled(no_context_flag: bool) -> bool {
 }
 
 fn env_disabled() -> bool {
-    matches!(
-        std::env::var(ENV_DISABLE).as_deref(),
-        Ok("1" | "true" | "yes")
-    )
+    match std::env::var(ENV_DISABLE) {
+        Ok(v) => matches!(
+            v.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        ),
+        Err(_) => false,
+    }
 }
 
 /// Hard-cap `s` to `max_bytes`, truncating on a char boundary and appending an
@@ -103,11 +106,21 @@ fn build_context_block(
         return None;
     }
     let rendered = context::render::render_text(&pack);
-    let block = format!("{INJECT_HEADER}\n{rendered}");
-    Some(cap_bytes(
-        &block,
-        budget_tokens.saturating_mul(TOKENS_TO_BYTES),
-    ))
+    let max = budget_tokens.saturating_mul(TOKENS_TO_BYTES);
+    // Cap the rendered body, NOT the header: the untrusted-memory disclaimer must
+    // survive even at a tiny --budget. Re-neutralize fences in case the byte cut
+    // left a partial ``` run, and warn (never silently ship a truncated block).
+    let truncated = rendered.len() > max;
+    let body = cap_bytes(&rendered, max);
+    let body = if truncated {
+        eprintln!(
+            "ironmem: context block truncated to ~{max} bytes; raise --budget to include more"
+        );
+        body.replace("```", "`")
+    } else {
+        body
+    };
+    Some(format!("{INJECT_HEADER}\n{body}"))
 }
 
 /// Augment the launcher's initial prompt with a compact context block, or return
@@ -147,6 +160,12 @@ pub(crate) fn maybe_inject_context(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
+
+    /// Serializes tests that mutate the process-global `IRONMEM_LAUNCHER_NO_CONTEXT`
+    /// env var (Rust runs tests in a binary in parallel). Poison-tolerant: a
+    /// panicked holder must not wedge the rest. Mirrors `search/tunables.rs`.
+    static LAUNCHER_ENV_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
     fn injection_disabled_honors_flag() {
@@ -155,6 +174,7 @@ mod tests {
 
     #[test]
     fn injection_enabled_by_default() {
+        let _lock = LAUNCHER_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         // No flag, and the env guard ensures the kill-switch is unset.
         let _g = EnvGuard::unset(ENV_DISABLE);
         assert!(!injection_disabled(false));
@@ -162,6 +182,7 @@ mod tests {
 
     #[test]
     fn injection_disabled_honors_env() {
+        let _lock = LAUNCHER_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let _g = EnvGuard::set(ENV_DISABLE, "1");
         assert!(injection_disabled(false));
     }
@@ -185,6 +206,25 @@ mod tests {
     fn assemble_prompt_prepends_block_then_user_prompt() {
         let out = assemble_prompt("BLOCK", "do the thing");
         assert_eq!(out, "BLOCK\n\ndo the thing");
+    }
+
+    #[test]
+    fn cap_bytes_keeps_chars_ending_exactly_at_limit() {
+        // 5×2-byte chars = 10 bytes; cap at 6 keeps exactly 3 whole chars (no partial).
+        let input: String = "é".repeat(5);
+        let out = cap_bytes(&input, 6);
+        assert_eq!(out, format!("{}…", "é".repeat(3)));
+    }
+
+    #[test]
+    fn cap_bytes_zero_budget_yields_only_ellipsis() {
+        assert_eq!(cap_bytes("anything", 0), "…");
+    }
+
+    #[test]
+    fn assemble_prompt_handles_empty_block_and_prompt() {
+        assert_eq!(assemble_prompt("", "p"), "\n\np");
+        assert_eq!(assemble_prompt("B", ""), "B\n\n");
     }
 
     /// Scoped env var setter/unsetter so tests never leak process-global state.

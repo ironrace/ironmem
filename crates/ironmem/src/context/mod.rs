@@ -538,6 +538,27 @@ mod tests {
     }
 
     #[test]
+    fn has_signal_true_when_only_memory_hits_present() {
+        let pack = ContextPack {
+            task: "t".to_string(),
+            repo: "/r".to_string(),
+            budget_tokens: 2000,
+            memory_hits: vec![MemoryHit {
+                id: "a".to_string(),
+                wing: "w".to_string(),
+                room: "r".to_string(),
+                score: 1.0,
+                snippet: "x".to_string(),
+            }],
+            decisions: Vec::new(),
+            areas: Vec::new(),
+            truncated: false,
+            warnings: Vec::new(),
+        };
+        assert!(pack.has_signal());
+    }
+
+    #[test]
     fn has_signal_true_when_any_section_populated() {
         // Areas alone count as signal: even a Missing area is actionable (scout it).
         let mut pack = ContextPack {
