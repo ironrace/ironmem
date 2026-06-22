@@ -18,8 +18,9 @@ use hyper::header::{ALLOW, CONTENT_TYPE};
 use hyper::{Method, Request, Response, StatusCode};
 
 use crate::dashboard::data::{
-    drawer_detail, list_code_maps, list_sessions, memory_summary, report_projection, CodeMapParams,
-    MemoryParams, SessionParams, DEFAULT_LIMIT, MAX_DASHBOARD_LIMIT,
+    drawer_detail, enrich_code_maps, list_code_maps, list_sessions, memory_summary,
+    report_projection, CodeMapParams, MemoryParams, SessionParams, DEFAULT_LIMIT,
+    MAX_DASHBOARD_LIMIT,
 };
 use crate::dashboard::server::ServerState;
 use crate::db::schema::Database;
@@ -88,6 +89,9 @@ pub async fn handle_request<B>(
 async fn handle_summary(state: Arc<ServerState>, _query: &str) -> HyperResponse {
     let db_path = Arc::clone(&state.db_path);
     let schema_version = state.schema_version;
+    // Warming status: "can it embed?" (model present at launch), independent of
+    // whether memory is populated (`total_drawers`). Resolved once at startup.
+    let model_status = state.model_status;
 
     match tokio::task::spawn_blocking(move || -> Result<serde_json::Value, MemoryError> {
         let db = Database::open_read_only(&db_path)?;
@@ -102,6 +106,7 @@ async fn handle_summary(state: Arc<ServerState>, _query: &str) -> HyperResponse 
             "total_drawers": mem.total_drawers,
             "wing_count": mem.wing_counts.len(),
             "kg_stats": mem.kg_stats,
+            "model_status": model_status,
         }))
     })
     .await
@@ -158,7 +163,10 @@ async fn handle_code_maps(state: Arc<ServerState>, query: &str) -> HyperResponse
     match tokio::task::spawn_blocking(move || -> Result<serde_json::Value, MemoryError> {
         let db = Database::open_read_only(&db_path)?;
         let maps = list_code_maps(&db, &params)?;
-        serde_json::to_value(&maps).map_err(MemoryError::from)
+        // Per-row freshness: real `classify` when the repo path resolves, else
+        // a build-age badge. Bounded by the same limit clamp as the listing.
+        let views = enrich_code_maps(maps, chrono::Utc::now());
+        serde_json::to_value(&views).map_err(MemoryError::from)
     })
     .await
     {
