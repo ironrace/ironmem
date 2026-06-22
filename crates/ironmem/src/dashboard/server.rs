@@ -11,6 +11,7 @@
 use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 
 use hyper::server::conn::http1;
 use hyper::service::service_fn;
@@ -22,6 +23,10 @@ use crate::db::schema::{Database, LATEST_SCHEMA_VERSION};
 use crate::error::MemoryError;
 
 use super::routes::handle_request;
+
+/// Maximum time a connection may take to send its request headers before it is
+/// dropped. Bounds slow-header (slowloris-style) connection holding.
+const HEADER_READ_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Immutable server state shared (read-only) across all request tasks.
 #[derive(Clone)]
@@ -135,7 +140,9 @@ pub async fn run_dashboard(cfg: DashboardConfig) -> Result<(), MemoryError> {
                                 let state = Arc::clone(&state);
                                 async move { handle_request(req, state).await }
                             });
-                            let conn = http1::Builder::new().serve_connection(io, svc);
+                            let conn = http1::Builder::new()
+                                .header_read_timeout(HEADER_READ_TIMEOUT)
+                                .serve_connection(io, svc);
                             if let Err(e) = watcher.watch(conn).await {
                                 tracing::debug!("dashboard connection error: {e}");
                             }
@@ -157,23 +164,20 @@ pub async fn run_dashboard(cfg: DashboardConfig) -> Result<(), MemoryError> {
     Ok(())
 }
 
-/// Thin helper used by the integration smoke test to validate host rejection
-/// without starting the full server. Exported so `main.rs` and tests can reuse.
-#[cfg(test)]
-fn validate_host_only(host: IpAddr, allow_non_loopback: bool) -> Result<(), MemoryError> {
-    if !host.is_loopback() && !allow_non_loopback {
-        return Err(MemoryError::Validation(format!(
-            "non-loopback host {} rejected; pass --allow-non-loopback to override",
-            host
-        )));
-    }
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::net::Ipv4Addr;
+
+    fn cfg_for(host: IpAddr, allow_non_loopback: bool) -> DashboardConfig {
+        DashboardConfig {
+            db_path: PathBuf::from("/tmp/irrelevant.db"),
+            host,
+            port: 0,
+            allow_non_loopback,
+            json_startup: false,
+        }
+    }
 
     #[test]
     fn loopback_host_is_accepted() {
@@ -218,11 +222,10 @@ mod tests {
     }
 
     #[test]
-    fn validate_host_only_rejects_non_loopback() {
-        let result = validate_host_only(IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4)), false);
-        assert!(result.is_err());
-        let result_ok = validate_host_only(IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4)), true);
-        assert!(result_ok.is_ok());
+    fn validate_host_rejects_non_loopback_without_flag_and_allows_with_flag() {
+        let host = IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4));
+        assert!(cfg_for(host, false).validate_host().is_err());
+        assert!(cfg_for(host, true).validate_host().is_ok());
     }
 
     #[test]

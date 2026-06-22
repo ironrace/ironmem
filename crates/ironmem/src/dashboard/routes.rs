@@ -329,23 +329,26 @@ fn form_urlencoded(query: &str) -> Vec<(String, String)> {
 }
 
 fn percent_decode(s: &str) -> String {
-    // Replace '+' with space, then percent-decode.
+    // Replace '+' with space, then percent-decode into raw bytes and interpret
+    // the result as UTF-8. Accumulating bytes (rather than pushing each decoded
+    // byte as a `char`) is required so multi-byte UTF-8 sequences like
+    // `%E2%9C%93` decode to their real code point instead of Latin-1 garbage.
     let with_spaces = s.replace('+', " ");
-    let mut out = String::with_capacity(with_spaces.len());
+    let mut out: Vec<u8> = Vec::with_capacity(with_spaces.len());
     let mut chars = with_spaces.chars().peekable();
     while let Some(c) = chars.next() {
         if c == '%' {
             let h1 = chars.next().and_then(|c| c.to_digit(16));
             let h2 = chars.next().and_then(|c| c.to_digit(16));
             if let (Some(h1), Some(h2)) = (h1, h2) {
-                let byte = ((h1 << 4) | h2) as u8;
-                out.push(byte as char);
+                out.push(((h1 << 4) | h2) as u8);
             }
         } else {
-            out.push(c);
+            let mut buf = [0u8; 4];
+            out.extend_from_slice(c.encode_utf8(&mut buf).as_bytes());
         }
     }
-    out
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -909,6 +912,16 @@ mod tests {
         assert_eq!(map.get("task").map(|s| s.as_str()), Some("hello world"));
     }
 
+    #[test]
+    fn form_urlencoded_decodes_multibyte_utf8() {
+        // `%E2%9C%93` is the UTF-8 encoding of U+2713 CHECK MARK (✓).
+        // Decoding each byte as a `char` (Latin-1) would corrupt it.
+        let pairs = form_urlencoded("task=ok%E2%9C%93&room=caf%C3%A9");
+        let map: std::collections::HashMap<_, _> = pairs.into_iter().collect();
+        assert_eq!(map.get("task").map(|s| s.as_str()), Some("ok\u{2713}"));
+        assert_eq!(map.get("room").map(|s| s.as_str()), Some("café"));
+    }
+
     // ── parse_memory_params ──────────────────────────────────────────────────
 
     #[test]
@@ -1023,6 +1036,15 @@ mod tests {
             .schema_version()
             .unwrap();
         assert_eq!(version_before, version_after);
+
+        // No-write proof beyond schema version: re-read the drawer count through
+        // the read-only summary path after the full handler sweep and assert it
+        // is unchanged. A stray INSERT/DELETE on a data table would shift this
+        // even when schema_version stayed constant.
+        let summary_after = handle_summary(Arc::clone(&fx.state), "").await;
+        let summary_after_json: serde_json::Value =
+            serde_json::from_str(&body_text(summary_after).await).unwrap();
+        assert_eq!(summary_after_json["total_drawers"], 1);
     }
 
     #[tokio::test]
