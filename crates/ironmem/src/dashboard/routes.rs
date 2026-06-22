@@ -19,16 +19,16 @@ use hyper::{Method, Request, Response, StatusCode};
 
 use crate::dashboard::data::{
     drawer_detail, list_code_maps, list_sessions, memory_summary, report_projection, CodeMapParams,
-    MemoryParams, SessionParams,
+    MemoryParams, SessionParams, DEFAULT_LIMIT, MAX_DASHBOARD_LIMIT,
 };
 use crate::dashboard::server::ServerState;
 use crate::db::schema::Database;
 use crate::error::MemoryError;
 
-/// Maximum value for `limit` query parameter.
-const MAX_LIMIT: usize = 500;
-/// Default `limit` when not supplied.
-const DEFAULT_LIMIT: usize = 50;
+/// Maximum value for the `limit` query parameter. Aliases the single source of
+/// truth in [`crate::dashboard::data`] so the HTTP cap and the DB-layer clamp
+/// can never drift apart.
+const MAX_LIMIT: usize = MAX_DASHBOARD_LIMIT;
 const MAX_PARAM_CHARS: usize = 512;
 
 type HyperResponse = Response<Full<Bytes>>;

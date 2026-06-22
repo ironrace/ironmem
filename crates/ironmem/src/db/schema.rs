@@ -3,6 +3,7 @@ use std::time::Duration;
 
 use rusqlite::{Connection, Transaction};
 
+use crate::db::ReadOnlyDb;
 use crate::error::MemoryError;
 use ironrace_embed::embedder::EMBED_DIM;
 
@@ -64,22 +65,35 @@ impl Database {
     /// no `create_dir_all`, no `migrate`. `PRAGMA foreign_keys=ON` is the only
     /// pragma executed — it is safe in read-only mode.
     ///
-    /// Returns a descriptive error when the file is absent, containing the path
-    /// so callers can surface `db not found at <path>` to the operator.
-    pub fn open_read_only(path: &Path) -> Result<Self, MemoryError> {
-        if !path.exists() {
-            return Err(MemoryError::NotFound(format!(
-                "db not found at {}",
-                path.display()
-            )));
-        }
+    /// Returns [`ReadOnlyDb`], a thin newtype exposing only read/query methods,
+    /// so a dashboard handler that tries to write fails to compile rather than at
+    /// runtime.
+    ///
+    /// A missing file is handled by SQLite itself: opening with
+    /// `SQLITE_OPEN_READ_ONLY` (and no `SQLITE_OPEN_CREATE`) errors with
+    /// `SQLITE_CANTOPEN` and creates nothing. That open error is mapped to the
+    /// same descriptive `db not found at <path>` message — no TOCTOU
+    /// `path.exists()` pre-check is performed.
+    pub fn open_read_only(path: &Path) -> Result<ReadOnlyDb, MemoryError> {
         let conn = Connection::open_with_flags(
             path,
             rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
-        )?;
+        )
+        .map_err(|e| match e {
+            rusqlite::Error::SqliteFailure(
+                rusqlite::ffi::Error {
+                    code: rusqlite::ErrorCode::CannotOpen,
+                    ..
+                },
+                _,
+            ) => MemoryError::NotFound(format!("db not found at {}", path.display())),
+            other => MemoryError::Db(other),
+        })?;
         conn.busy_timeout(Duration::from_secs(5))?;
         conn.execute_batch("PRAGMA foreign_keys=ON;")?;
-        Ok(Self { conn })
+        Ok(ReadOnlyDb {
+            inner: Self { conn },
+        })
     }
 
     /// Open an EXISTING database with a caller-bounded busy timeout and **no

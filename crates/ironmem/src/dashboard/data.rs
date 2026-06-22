@@ -10,15 +10,20 @@ use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
 
 use crate::db::drawers::Drawer;
-use crate::db::knowledge_graph::KnowledgeGraph;
-use crate::db::schema::Database;
 use crate::db::CodeMap;
+use crate::db::ReadOnlyDb;
 use crate::error::MemoryError;
-use crate::report::{run_report, Report, ReportOptions};
+use crate::report::{Report, ReportOptions};
 
 /// Maximum content length for a drawer in list views (truncated beyond this).
 const LIST_CONTENT_LIMIT: usize = 200;
-const MAX_DASHBOARD_LIMIT: usize = 500;
+
+/// Single source of truth for the dashboard `limit` bounds. Both the data layer
+/// (clamping) and the HTTP layer (`routes.rs`) reference these so the cap and
+/// default can never drift apart.
+pub(crate) const MAX_DASHBOARD_LIMIT: usize = 500;
+/// Default `limit` when a request omits it.
+pub(crate) const DEFAULT_LIMIT: usize = 50;
 
 // ────────────────────────────────────────────────────────────────────────────
 // Memory summary projection (Task 2)
@@ -53,20 +58,32 @@ pub struct MemorySummary {
 }
 
 /// Query parameters for the memory summary endpoint.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct MemoryParams {
     pub wing: Option<String>,
     pub room: Option<String>,
     pub limit: usize,
 }
 
-/// Project the memory summary from a read-only [`Database`].
+impl Default for MemoryParams {
+    fn default() -> Self {
+        Self {
+            wing: None,
+            room: None,
+            limit: DEFAULT_LIMIT,
+        }
+    }
+}
+
+/// Project the memory summary from a read-only [`ReadOnlyDb`].
 ///
 /// Delegates entirely to existing read-only DB helpers; never calls `open` or
-/// `migrate`. `KnowledgeGraph::new(&db).stats()` is the approved read-only
-/// path for KG counts — it never calls `App::new`.
-pub fn memory_summary(db: &Database, params: &MemoryParams) -> Result<MemorySummary, MemoryError> {
-    let limit = params.limit.clamp(1, 500);
+/// `migrate`. `db.kg_stats()` is the approved read-only path for KG counts.
+pub fn memory_summary(
+    db: &ReadOnlyDb,
+    params: &MemoryParams,
+) -> Result<MemorySummary, MemoryError> {
+    let limit = params.limit.clamp(1, MAX_DASHBOARD_LIMIT);
 
     let total_drawers = db.count_drawers(params.wing.as_deref())?;
 
@@ -82,7 +99,7 @@ pub fn memory_summary(db: &Database, params: &MemoryParams) -> Result<MemorySumm
         .map(|(wing, rooms)| (wing, rooms.into_iter().collect()))
         .collect();
 
-    let kg_stats = KnowledgeGraph::new(db).stats()?;
+    let kg_stats = db.kg_stats()?;
 
     let drawers = db.get_drawers(params.wing.as_deref(), params.room.as_deref(), limit)?;
 
@@ -141,7 +158,7 @@ impl From<Drawer> for DrawerDetail {
     }
 }
 
-pub fn drawer_detail(db: &Database, id: &str) -> Result<Option<DrawerDetail>, MemoryError> {
+pub fn drawer_detail(db: &ReadOnlyDb, id: &str) -> Result<Option<DrawerDetail>, MemoryError> {
     Ok(db.get_drawer(id)?.map(DrawerDetail::from))
 }
 
@@ -165,12 +182,12 @@ fn truncate_content(content: &str, limit: usize) -> String {
 /// Thin wrapper: delegates to [`run_report`] so CLI and dashboard semantics
 /// are always identical. No reimplementation.
 pub fn report_projection(
-    db: &Database,
+    db: &ReadOnlyDb,
     task: Option<String>,
     since: Option<String>,
 ) -> Result<Report, MemoryError> {
     let opts = ReportOptions { task, since };
-    run_report(db, &opts)
+    db.run_report(&opts)
 }
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -190,7 +207,7 @@ impl Default for CodeMapParams {
         Self {
             repo: None,
             area: None,
-            limit: 50,
+            limit: DEFAULT_LIMIT,
         }
     }
 }
@@ -198,7 +215,10 @@ impl Default for CodeMapParams {
 /// List code-map rows with optional repo/area filters.
 ///
 /// Raw SQL is confined here; the HTTP handler stays SQL-free.
-pub fn list_code_maps(db: &Database, params: &CodeMapParams) -> Result<Vec<CodeMap>, MemoryError> {
+pub fn list_code_maps(
+    db: &ReadOnlyDb,
+    params: &CodeMapParams,
+) -> Result<Vec<CodeMap>, MemoryError> {
     db.with_connection(|conn| list_code_maps_conn(conn, params))
 }
 
@@ -299,7 +319,9 @@ pub struct SessionParams {
 
 impl Default for SessionParams {
     fn default() -> Self {
-        Self { limit: 50 }
+        Self {
+            limit: DEFAULT_LIMIT,
+        }
     }
 }
 
@@ -308,7 +330,7 @@ impl Default for SessionParams {
 /// Plan/message bodies are never returned — only drawer refs so the #90
 /// by-reference contract is respected.
 pub fn list_sessions(
-    db: &Database,
+    db: &ReadOnlyDb,
     params: &SessionParams,
 ) -> Result<Vec<CollabSessionSummary>, MemoryError> {
     db.with_connection(|conn| list_sessions_conn(conn, params))
@@ -372,8 +394,31 @@ mod tests {
     use super::*;
     use crate::db::schema::Database;
 
-    fn open_fresh() -> Database {
-        Database::open_in_memory().unwrap()
+    /// File-backed fixture: the projection functions take a `ReadOnlyDb`, which
+    /// cannot share an in-memory connection with a writer. Setup writes through a
+    /// `Database`; reads go through a fresh `ReadOnlyDb` opened on the same file.
+    struct Fixture {
+        _dir: tempfile::TempDir,
+        db: Database,
+        path: std::path::PathBuf,
+    }
+
+    impl Fixture {
+        fn reader(&self) -> crate::db::ReadOnlyDb {
+            Database::open_read_only(&self.path).unwrap()
+        }
+    }
+
+    fn open_fresh() -> Fixture {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("data.sqlite3");
+        let db = Database::open(&path).unwrap();
+        db.migrate().unwrap();
+        Fixture {
+            _dir: dir,
+            db,
+            path,
+        }
     }
 
     // ── memory_summary ──────────────────────────────────────────────────────
@@ -386,7 +431,7 @@ mod tests {
             room: None,
             limit: 10,
         };
-        let summary = memory_summary(&db, &params).unwrap();
+        let summary = memory_summary(&db.reader(), &params).unwrap();
         assert_eq!(summary.total_drawers, 0);
         assert!(summary.recent_drawers.is_empty());
         assert!(summary.wing_counts.is_empty());
@@ -398,26 +443,28 @@ mod tests {
         let db = open_fresh();
         // Insert two drawers in different wings.
         let emb = vec![0.0f32; ironrace_embed::embedder::EMBED_DIM];
-        db.insert_drawer(
-            &crate::db::drawers::generate_id("alpha content", "alpha", "general"),
-            "alpha content",
-            &emb,
-            "alpha",
-            "general",
-            "src/a.rs",
-            "test",
-        )
-        .unwrap();
-        db.insert_drawer(
-            &crate::db::drawers::generate_id("beta content", "beta", "notes"),
-            "beta content",
-            &emb,
-            "beta",
-            "notes",
-            "src/b.rs",
-            "test",
-        )
-        .unwrap();
+        db.db
+            .insert_drawer(
+                &crate::db::drawers::generate_id("alpha content", "alpha", "general"),
+                "alpha content",
+                &emb,
+                "alpha",
+                "general",
+                "src/a.rs",
+                "test",
+            )
+            .unwrap();
+        db.db
+            .insert_drawer(
+                &crate::db::drawers::generate_id("beta content", "beta", "notes"),
+                "beta content",
+                &emb,
+                "beta",
+                "notes",
+                "src/b.rs",
+                "test",
+            )
+            .unwrap();
 
         // Full summary.
         let params = MemoryParams {
@@ -425,7 +472,7 @@ mod tests {
             room: None,
             limit: 10,
         };
-        let summary = memory_summary(&db, &params).unwrap();
+        let summary = memory_summary(&db.reader(), &params).unwrap();
         assert_eq!(summary.total_drawers, 2);
         assert_eq!(summary.recent_drawers.len(), 2);
         assert_eq!(*summary.wing_counts.get("alpha").unwrap(), 1);
@@ -439,7 +486,7 @@ mod tests {
             room: None,
             limit: 10,
         };
-        let alpha = memory_summary(&db, &params_alpha).unwrap();
+        let alpha = memory_summary(&db.reader(), &params_alpha).unwrap();
         assert_eq!(alpha.total_drawers, 1);
         assert_eq!(alpha.recent_drawers.len(), 1);
         assert_eq!(alpha.recent_drawers[0].wing, "alpha");
@@ -453,7 +500,8 @@ mod tests {
         let long_content = "x".repeat(500);
         let emb = vec![0.0f32; ironrace_embed::embedder::EMBED_DIM];
         let drawer_id = crate::db::drawers::generate_id(&long_content, "w", "r");
-        db.insert_drawer(&drawer_id, &long_content, &emb, "w", "r", "", "test")
+        db.db
+            .insert_drawer(&drawer_id, &long_content, &emb, "w", "r", "", "test")
             .unwrap();
 
         let params = MemoryParams {
@@ -461,7 +509,8 @@ mod tests {
             room: None,
             limit: 10,
         };
-        let summary = memory_summary(&db, &params).unwrap();
+        let reader = db.reader();
+        let summary = memory_summary(&reader, &params).unwrap();
         assert_eq!(summary.recent_drawers.len(), 1);
         let preview = &summary.recent_drawers[0].content_preview;
         // Preview must be shorter than original.
@@ -472,7 +521,7 @@ mod tests {
         );
         assert_ne!(preview, &long_content);
 
-        let detail = drawer_detail(&db, &drawer_id).unwrap().unwrap();
+        let detail = drawer_detail(&reader, &drawer_id).unwrap().unwrap();
         assert_eq!(detail.content, long_content);
     }
 
@@ -483,33 +532,35 @@ mod tests {
         use crate::db::metrics::NewTokenUsage;
 
         let db = open_fresh();
-        db.insert_token_usage(&NewTokenUsage {
-            ts: "2026-01-02T00:00:00Z".to_string(),
-            source: "transcript".to_string(),
-            harness: "claude".to_string(),
-            model: Some("claude-opus-4-8".to_string()),
-            session_id: None,
-            collab_session_id: None,
-            collab_phase: Some("impl".to_string()),
-            task_tag: Some("dashboard-test".to_string()),
-            input_tokens: 10,
-            output_tokens: 5,
-            cache_creation_input_tokens: 0,
-            cache_read_input_tokens: 0,
-            estimated: false,
-            chars: 0,
-            cost_usd: None,
-            map_status: None,
-            turn_id: None,
-            area: None,
-        })
-        .unwrap();
+        db.db
+            .insert_token_usage(&NewTokenUsage {
+                ts: "2026-01-02T00:00:00Z".to_string(),
+                source: "transcript".to_string(),
+                harness: "claude".to_string(),
+                model: Some("claude-opus-4-8".to_string()),
+                session_id: None,
+                collab_session_id: None,
+                collab_phase: Some("impl".to_string()),
+                task_tag: Some("dashboard-test".to_string()),
+                input_tokens: 10,
+                output_tokens: 5,
+                cache_creation_input_tokens: 0,
+                cache_read_input_tokens: 0,
+                estimated: false,
+                chars: 0,
+                cost_usd: None,
+                map_status: None,
+                turn_id: None,
+                area: None,
+            })
+            .unwrap();
 
         let task = Some("dashboard-test".to_string());
         let since = Some("2026-01-01".to_string());
-        let projected = report_projection(&db, task.clone(), since.clone()).unwrap();
+        let projected = report_projection(&db.reader(), task.clone(), since.clone()).unwrap();
         let direct =
-            crate::report::run_report(&db, &crate::report::ReportOptions { task, since }).unwrap();
+            crate::report::run_report(&db.db, &crate::report::ReportOptions { task, since })
+                .unwrap();
         assert_eq!(projected, direct);
     }
 
@@ -518,7 +569,7 @@ mod tests {
     #[test]
     fn list_code_maps_empty() {
         let db = open_fresh();
-        let maps = list_code_maps(&db, &CodeMapParams::default()).unwrap();
+        let maps = list_code_maps(&db.reader(), &CodeMapParams::default()).unwrap();
         assert!(maps.is_empty());
     }
 
@@ -528,57 +579,63 @@ mod tests {
         let emb = vec![0.0f32; ironrace_embed::embedder::EMBED_DIM];
         // Insert a drawer to satisfy the code_maps FK.
         let drawer_id = crate::db::drawers::generate_id("map content", "code-maps", "code-maps");
-        db.insert_drawer(
-            &drawer_id,
-            "map content",
-            &emb,
-            "code-maps",
-            "code-maps",
-            "",
-            "test",
-        )
-        .unwrap();
-        db.upsert_code_map(
-            "my-repo",
-            "core",
-            &drawer_id,
-            "aabbccdd1122334455667788aabbccdd11223344",
-            &["src/lib.rs".to_string()],
-            "test-agent",
-            "2026-01-01T00:00:00Z",
-        )
-        .unwrap();
+        db.db
+            .insert_drawer(
+                &drawer_id,
+                "map content",
+                &emb,
+                "code-maps",
+                "code-maps",
+                "",
+                "test",
+            )
+            .unwrap();
+        db.db
+            .upsert_code_map(
+                "my-repo",
+                "core",
+                &drawer_id,
+                "aabbccdd1122334455667788aabbccdd11223344",
+                &["src/lib.rs".to_string()],
+                "test-agent",
+                "2026-01-01T00:00:00Z",
+            )
+            .unwrap();
         let drawer_id_2 =
             crate::db::drawers::generate_id("map content 2", "code-maps", "code-maps");
-        db.insert_drawer(
-            &drawer_id_2,
-            "map content 2",
-            &emb,
-            "code-maps",
-            "code-maps",
-            "",
-            "test",
-        )
-        .unwrap();
-        db.upsert_code_map(
-            "my-repo",
-            "docs",
-            &drawer_id_2,
-            "bbbbccdd1122334455667788aabbccdd11223344",
-            &["docs/readme.md".to_string()],
-            "test-agent",
-            "2026-01-02T00:00:00Z",
-        )
-        .unwrap();
+        db.db
+            .insert_drawer(
+                &drawer_id_2,
+                "map content 2",
+                &emb,
+                "code-maps",
+                "code-maps",
+                "",
+                "test",
+            )
+            .unwrap();
+        db.db
+            .upsert_code_map(
+                "my-repo",
+                "docs",
+                &drawer_id_2,
+                "bbbbccdd1122334455667788aabbccdd11223344",
+                &["docs/readme.md".to_string()],
+                "test-agent",
+                "2026-01-02T00:00:00Z",
+            )
+            .unwrap();
+
+        let reader = db.reader();
 
         // No filter — should return the row.
-        let all = list_code_maps(&db, &CodeMapParams::default()).unwrap();
+        let all = list_code_maps(&reader, &CodeMapParams::default()).unwrap();
         assert_eq!(all.len(), 2);
         assert!(all.iter().all(|row| row.repo == "my-repo"));
 
         // Repo filter match.
         let filtered = list_code_maps(
-            &db,
+            &reader,
             &CodeMapParams {
                 repo: Some("my-repo".to_string()),
                 area: None,
@@ -590,7 +647,7 @@ mod tests {
 
         // Area-only filter match.
         let area_only = list_code_maps(
-            &db,
+            &reader,
             &CodeMapParams {
                 repo: None,
                 area: Some("docs".to_string()),
@@ -603,7 +660,7 @@ mod tests {
 
         // Repo + area combined filter.
         let combined = list_code_maps(
-            &db,
+            &reader,
             &CodeMapParams {
                 repo: Some("my-repo".to_string()),
                 area: Some("core".to_string()),
@@ -616,7 +673,7 @@ mod tests {
 
         // SQL limit is enforced.
         let limited = list_code_maps(
-            &db,
+            &reader,
             &CodeMapParams {
                 repo: Some("my-repo".to_string()),
                 area: None,
@@ -628,7 +685,7 @@ mod tests {
 
         // Repo filter no match.
         let none = list_code_maps(
-            &db,
+            &reader,
             &CodeMapParams {
                 repo: Some("other-repo".to_string()),
                 area: None,
@@ -644,47 +701,49 @@ mod tests {
     #[test]
     fn list_sessions_empty() {
         let db = open_fresh();
-        let sessions = list_sessions(&db, &SessionParams::default()).unwrap();
+        let sessions = list_sessions(&db.reader(), &SessionParams::default()).unwrap();
         assert!(sessions.is_empty());
     }
 
     #[test]
     fn list_sessions_does_not_include_plan_bodies() {
         let db = open_fresh();
-        db.with_connection(|conn| {
-            crate::collab::queue::create_session(
-                conn,
-                "test-session-id-001",
-                "/repo",
-                "main",
-                Some("test task"),
-                crate::collab::Agent::Claude,
-            )
-        })
-        .unwrap();
-        db.with_connection(|conn| {
-            conn.execute(
-                "UPDATE collab_sessions
+        db.db
+            .with_connection(|conn| {
+                crate::collab::queue::create_session(
+                    conn,
+                    "test-session-id-001",
+                    "/repo",
+                    "main",
+                    Some("test task"),
+                    crate::collab::Agent::Claude,
+                )
+            })
+            .unwrap();
+        db.db
+            .with_connection(|conn| {
+                conn.execute(
+                    "UPDATE collab_sessions
                  SET canonical_plan_drawer_id = ?1,
                      canonical_plan_hash = ?2,
                      final_plan_drawer_id = ?3,
                      final_plan_hash = ?4,
                      task_list = ?5
                  WHERE id = ?6",
-                rusqlite::params![
-                    "canonical-drawer",
-                    "canonical-hash",
-                    "final-drawer",
-                    "final-hash",
-                    r#"{"tasks":[{"id":1},{"id":2}]}"#,
-                    "test-session-id-001",
-                ],
-            )?;
-            Ok(())
-        })
-        .unwrap();
+                    rusqlite::params![
+                        "canonical-drawer",
+                        "canonical-hash",
+                        "final-drawer",
+                        "final-hash",
+                        r#"{"tasks":[{"id":1},{"id":2}]}"#,
+                        "test-session-id-001",
+                    ],
+                )?;
+                Ok(())
+            })
+            .unwrap();
 
-        let sessions = list_sessions(&db, &SessionParams::default()).unwrap();
+        let sessions = list_sessions(&db.reader(), &SessionParams::default()).unwrap();
         assert_eq!(sessions.len(), 1);
         let s = &sessions[0];
         assert_eq!(s.id, "test-session-id-001");
