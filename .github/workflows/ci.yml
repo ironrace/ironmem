@@ -26,6 +26,12 @@ jobs:
       - name: collab template lint
         run: python3 scripts/check_collab_turn_templates.py
 
+      - name: benchmark methodology lint
+        run: python3 scripts/check_benchmark_methodology.py
+
+      - name: benchmark methodology guard self-test
+        run: python3 scripts/test_check_benchmark_methodology.py
+
       - name: cargo fmt --check
         run: cargo fmt --all -- --check
 

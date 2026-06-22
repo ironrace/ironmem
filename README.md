@@ -38,8 +38,9 @@ every session genuinely starts from a blank slate.
 
 - It does not yet build a rich, LLM-written session summary from transcript
   content; summaries today are structured/metadata-based.
-- It makes no numeric claims about exploration or token savings. See
-  [Benchmarking](#benchmarking) for the measurement harness and run it yourself.
+- It makes no numeric claims about exploration or token savings. See the
+  [Benchmark Methodology](docs/BENCHMARKS.md) for how savings would be measured
+  and the [Benchmarking](#benchmarking) harness to run it yourself.
 - Install is from source or prebuilt release binaries today — there is no
   single-command package-manager install yet.
 
@@ -59,6 +60,7 @@ Key docs:
 - [Cross-Harness Implementation Plan](IMPLEMENTATION_PLAN.md)
 - [Codex Guide](docs/CODEX.md)
 - [Collab Guide](docs/COLLAB.md)
+- [Benchmark Methodology](docs/BENCHMARKS.md)
 - [Cloudflare Pages Site](docs/CLOUDFLARE_PAGES.md)
 
 Public site source lives in [`site/`](site/) and is configured for Cloudflare
