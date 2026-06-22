@@ -4,6 +4,7 @@
 
 mod argv;
 mod binary;
+mod context_inject;
 mod mcp_setup;
 
 use std::path::{Path, PathBuf};
@@ -34,6 +35,20 @@ impl Harness {
             Harness::Codex => "Codex",
         }
     }
+}
+
+/// Options for a launcher invocation. Grouped into a struct so the public
+/// `run_launcher` seam stays readable as flags accrue (issue #147).
+#[derive(Debug, Clone)]
+pub struct LaunchOptions {
+    /// Skip idempotent ironmem MCP server registration.
+    pub no_mcp_setup: bool,
+    /// Disable compact context pre-injection into the initial prompt.
+    pub no_context: bool,
+    /// Code-map areas to include in the pre-injected context (repeatable).
+    pub areas: Vec<String>,
+    /// Approximate token budget for the pre-injected context pack.
+    pub budget_tokens: usize,
 }
 
 /// Resolve a user-supplied repo path to an existing canonical directory.
@@ -105,12 +120,12 @@ pub fn run_launcher(
     harness: Harness,
     repo: &str,
     prompt: Option<String>,
-    no_mcp_setup: bool,
+    opts: LaunchOptions,
 ) -> Result<(), MemoryError> {
     let canonical = canonicalize_repo(repo)?;
     let bin = binary::find_on_path(harness.binary())?;
 
-    if no_mcp_setup {
+    if opts.no_mcp_setup {
         eprintln!("ironmem: skipping MCP setup (--no-mcp-setup); using existing configuration");
     } else {
         match register(harness)? {
@@ -127,6 +142,11 @@ pub fn run_launcher(
     }
 
     warm_best_effort(&canonical);
+
+    // Best-effort context pre-injection AFTER warming, so the just-mined repo and
+    // FTS index are available to recall. Falls back to the bare prompt on any
+    // failure or when disabled.
+    let prompt = context_inject::maybe_inject_context(&canonical, prompt, &opts);
 
     let args = argv::build_args(prompt.as_deref());
     eprintln!(

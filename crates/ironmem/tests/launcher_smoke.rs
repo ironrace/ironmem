@@ -65,6 +65,7 @@ fn claude_launcher_runs_stub_with_prompt_and_repo_cwd() {
         .arg(&repo)
         .arg("fix the login bug")
         .arg("--no-mcp-setup")
+        .arg("--no-context")
         .output()
         .unwrap();
     assert!(out.status.success(), "launcher failed: {out:?}");
@@ -272,6 +273,125 @@ fn codex_launcher_registers_mcp_server_by_default() {
 }
 
 #[test]
+fn claude_launcher_preinjects_context_when_area_requested() {
+    let temp = tempfile::tempdir().unwrap();
+    let home = temp.path().join("home");
+    let db_path = temp.path().join("memory.sqlite3");
+    let bin_dir = temp.path().join("bin");
+    let repo = temp.path().join("repo");
+    let record = temp.path().join("rec");
+    std::fs::create_dir_all(&home).unwrap();
+    std::fs::create_dir_all(&bin_dir).unwrap();
+    std::fs::create_dir_all(&repo).unwrap();
+    std::fs::write(repo.join("README.md"), "# repo\ncontent to mine").unwrap();
+    write_stub(&bin_dir, "claude", &record, 0);
+
+    // A requested area with no code map is "Missing" -> the pack has signal, so
+    // the block is injected deterministically (no embedded memory needed).
+    let out = launcher_command(&home, &db_path, &bin_dir)
+        .arg("claude")
+        .arg(&repo)
+        .arg("fix the login bug")
+        .arg("--no-mcp-setup")
+        .arg("--area")
+        .arg("core")
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "launcher failed: {out:?}");
+
+    let recorded_args = std::fs::read_to_string(format!("{}.args", record.display())).unwrap();
+    // The combined positional carries the disclaimer header, the area, and the
+    // user prompt (all on one argv element, split across lines by the stub).
+    assert!(
+        recorded_args.contains("untrusted memory"),
+        "missing disclaimer header: {recorded_args}"
+    );
+    assert!(
+        recorded_args.contains("core"),
+        "missing requested area: {recorded_args}"
+    );
+    assert!(
+        recorded_args.contains("fix the login bug"),
+        "user prompt must survive injection: {recorded_args}"
+    );
+    let header_idx = recorded_args.find("untrusted memory").unwrap();
+    let prompt_idx = recorded_args.find("fix the login bug").unwrap();
+    assert!(
+        header_idx < prompt_idx,
+        "disclaimer must precede user prompt: {recorded_args}"
+    );
+}
+
+#[test]
+fn claude_launcher_omits_context_with_no_context_flag() {
+    let temp = tempfile::tempdir().unwrap();
+    let home = temp.path().join("home");
+    let db_path = temp.path().join("memory.sqlite3");
+    let bin_dir = temp.path().join("bin");
+    let repo = temp.path().join("repo");
+    let record = temp.path().join("rec");
+    std::fs::create_dir_all(&home).unwrap();
+    std::fs::create_dir_all(&bin_dir).unwrap();
+    std::fs::create_dir_all(&repo).unwrap();
+    std::fs::write(repo.join("README.md"), "# repo\ncontent to mine").unwrap();
+    write_stub(&bin_dir, "claude", &record, 0);
+
+    // Even with --area requested, --no-context suppresses all injection.
+    let out = launcher_command(&home, &db_path, &bin_dir)
+        .arg("claude")
+        .arg(&repo)
+        .arg("fix the login bug")
+        .arg("--no-mcp-setup")
+        .arg("--area")
+        .arg("core")
+        .arg("--no-context")
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "launcher failed: {out:?}");
+
+    let recorded_args = std::fs::read_to_string(format!("{}.args", record.display())).unwrap();
+    assert_eq!(
+        recorded_args.trim(),
+        "fix the login bug",
+        "prompt must be passed through untouched"
+    );
+}
+
+#[test]
+fn claude_launcher_omits_context_when_env_disabled() {
+    let temp = tempfile::tempdir().unwrap();
+    let home = temp.path().join("home");
+    let db_path = temp.path().join("memory.sqlite3");
+    let bin_dir = temp.path().join("bin");
+    let repo = temp.path().join("repo");
+    let record = temp.path().join("rec");
+    std::fs::create_dir_all(&home).unwrap();
+    std::fs::create_dir_all(&bin_dir).unwrap();
+    std::fs::create_dir_all(&repo).unwrap();
+    std::fs::write(repo.join("README.md"), "# repo\ncontent to mine").unwrap();
+    write_stub(&bin_dir, "claude", &record, 0);
+
+    let out = launcher_command(&home, &db_path, &bin_dir)
+        .env("IRONMEM_LAUNCHER_NO_CONTEXT", "1")
+        .arg("claude")
+        .arg(&repo)
+        .arg("fix the login bug")
+        .arg("--no-mcp-setup")
+        .arg("--area")
+        .arg("core")
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "launcher failed: {out:?}");
+
+    let recorded_args = std::fs::read_to_string(format!("{}.args", record.display())).unwrap();
+    assert_eq!(
+        recorded_args.trim(),
+        "fix the login bug",
+        "env kill-switch must suppress injection"
+    );
+}
+
+#[test]
 fn claude_launcher_is_idempotent_across_two_runs() {
     let temp = tempfile::tempdir().unwrap();
     let home = temp.path().join("home");
@@ -308,4 +428,99 @@ fn claude_launcher_is_idempotent_across_two_runs() {
     let cfg = std::fs::read_to_string(home.join(".claude.json")).unwrap();
     let v: serde_json::Value = serde_json::from_str(&cfg).unwrap();
     assert!(v["mcpServers"]["ironmem"].is_object());
+}
+
+#[test]
+fn codex_launcher_preinjects_context_when_area_requested() {
+    let temp = tempfile::tempdir().unwrap();
+    let home = temp.path().join("home");
+    let db_path = temp.path().join("memory.sqlite3");
+    let bin_dir = temp.path().join("bin");
+    let repo = temp.path().join("repo");
+    let record = temp.path().join("rec");
+    std::fs::create_dir_all(&home).unwrap();
+    std::fs::create_dir_all(&bin_dir).unwrap();
+    std::fs::create_dir_all(&repo).unwrap();
+    std::fs::write(repo.join("README.md"), "# repo\ncontent to mine").unwrap();
+    write_stub(&bin_dir, "codex", &record, 0);
+
+    let out = launcher_command(&home, &db_path, &bin_dir)
+        .arg("codex")
+        .arg(&repo)
+        .arg("fix the login bug")
+        .arg("--no-mcp-setup")
+        .arg("--area")
+        .arg("core")
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "codex launcher failed: {out:?}");
+
+    let recorded_args = std::fs::read_to_string(format!("{}.args", record.display())).unwrap();
+    assert!(
+        recorded_args.contains("untrusted memory"),
+        "missing disclaimer header: {recorded_args}"
+    );
+    assert!(
+        recorded_args.contains("core"),
+        "missing area: {recorded_args}"
+    );
+    assert!(
+        recorded_args.contains("fix the login bug"),
+        "user prompt must survive injection: {recorded_args}"
+    );
+}
+
+#[test]
+fn claude_launcher_bounds_injected_context_and_warns() {
+    let temp = tempfile::tempdir().unwrap();
+    let home = temp.path().join("home");
+    let db_path = temp.path().join("memory.sqlite3");
+    let bin_dir = temp.path().join("bin");
+    let repo = temp.path().join("repo");
+    let record = temp.path().join("rec");
+    std::fs::create_dir_all(&home).unwrap();
+    std::fs::create_dir_all(&bin_dir).unwrap();
+    std::fs::create_dir_all(&repo).unwrap();
+    std::fs::write(repo.join("README.md"), "# repo\ncontent to mine").unwrap();
+    write_stub(&bin_dir, "claude", &record, 0);
+
+    // Tiny budget (5 tokens -> 20-byte body cap) forces truncation of the rendered
+    // block for the requested area.
+    let out = launcher_command(&home, &db_path, &bin_dir)
+        .arg("claude")
+        .arg(&repo)
+        .arg("fix the login bug")
+        .arg("--no-mcp-setup")
+        .arg("--area")
+        .arg("core")
+        .arg("--budget")
+        .arg("5")
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "launcher failed: {out:?}");
+
+    let recorded_args = std::fs::read_to_string(format!("{}.args", record.display())).unwrap();
+    // Disclaimer header survives truncation (capped body, not the header).
+    let header_idx = recorded_args
+        .find("untrusted memory")
+        .expect("disclaimer header must survive: {recorded_args}");
+    // Body was truncated -> ellipsis marker present.
+    assert!(
+        recorded_args.contains('…'),
+        "expected truncation marker: {recorded_args}"
+    );
+    // User prompt is never truncated and comes AFTER the framing header.
+    let prompt_idx = recorded_args
+        .find("fix the login bug")
+        .expect("user prompt must survive untruncated");
+    assert!(
+        header_idx < prompt_idx,
+        "header must precede user prompt: {recorded_args}"
+    );
+    // Truncation is surfaced to the operator, not silent.
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("truncated"),
+        "truncation must warn on stderr: {stderr}"
+    );
 }
