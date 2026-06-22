@@ -110,6 +110,16 @@ pub struct ContextPack {
     pub warnings: Vec<String>,
 }
 
+impl ContextPack {
+    /// True when the pack carries something worth injecting: at least one memory
+    /// hit, a known decision, or a requested area (even a `Missing` area is
+    /// actionable — it tells the agent to scout). An all-empty pack is noise, so
+    /// launcher pre-injection skips it.
+    pub fn has_signal(&self) -> bool {
+        !self.memory_hits.is_empty() || !self.decisions.is_empty() || !self.areas.is_empty()
+    }
+}
+
 /// Assemble a context pack: relevant memory hits, per-area code-map freshness,
 /// and known decisions, bounded to the requested token budget.
 pub fn run_context(app: &App, opts: &ContextPackOptions) -> Result<ContextPack, MemoryError> {
@@ -312,10 +322,18 @@ fn short_sha(sha: &str) -> String {
     sha.chars().take(7).collect()
 }
 
+/// Neutralize markdown code-fence runs so untrusted recalled text cannot open a
+/// fenced block in a host prompt. Mirrors `hook.rs::compact_excerpt`'s defense:
+/// collapse every triple-backtick run to a single backtick.
+fn neutralize_fences(s: &str) -> String {
+    s.replace("```", "`")
+}
+
 /// Trim a code-map summary to a bounded length, preserving readability.
 fn bound_summary(content: &str) -> String {
+    let content = neutralize_fences(content);
     if content.chars().count() <= SUMMARY_MAX_CHARS {
-        content.to_string()
+        content
     } else {
         let truncated: String = content.chars().take(SUMMARY_MAX_CHARS).collect();
         format!("{truncated}…")
@@ -325,6 +343,7 @@ fn bound_summary(content: &str) -> String {
 /// Trim a drawer body to a bounded, single-line-ish snippet.
 fn snippet(content: &str) -> String {
     let collapsed = content.split_whitespace().collect::<Vec<_>>().join(" ");
+    let collapsed = neutralize_fences(&collapsed);
     if collapsed.chars().count() <= SNIPPET_MAX_CHARS {
         collapsed
     } else {
@@ -445,5 +464,52 @@ mod tests {
         let truncated = bound_memory_hits(&mut hits, DEFAULT_BUDGET_TOKENS);
         assert!(!truncated);
         assert_eq!(hits.len(), 2);
+    }
+
+    #[test]
+    fn snippet_neutralizes_code_fences() {
+        // Whitespace collapse joins the fence tokens; neutralization must leave no
+        // triple-backtick run that could open a fenced block in the host prompt.
+        let out = snippet("here is ```rust code``` end");
+        assert!(!out.contains("```"), "fence survived: {out}");
+        assert!(out.contains("rust code"), "content lost: {out}");
+    }
+
+    #[test]
+    fn bound_summary_neutralizes_code_fences() {
+        let out = bound_summary("summary with ```fence``` inside");
+        assert!(!out.contains("```"), "fence survived: {out}");
+        assert!(out.contains("summary with"), "content lost: {out}");
+    }
+
+    #[test]
+    fn has_signal_true_when_any_section_populated() {
+        // Areas alone count as signal: even a Missing area is actionable (scout it).
+        let mut pack = ContextPack {
+            task: "t".to_string(),
+            repo: "/r".to_string(),
+            budget_tokens: 2000,
+            memory_hits: Vec::new(),
+            decisions: Vec::new(),
+            areas: vec![AreaContext {
+                area: "core".to_string(),
+                status: AreaStatus::Missing {
+                    reason: "no code map".to_string(),
+                },
+            }],
+            truncated: false,
+            warnings: Vec::new(),
+        };
+        assert!(pack.has_signal());
+
+        pack.areas.clear();
+        assert!(!pack.has_signal(), "empty pack must report no signal");
+
+        pack.decisions.push(DecisionHit {
+            subject: "a".to_string(),
+            predicate: "b".to_string(),
+            object: "c".to_string(),
+        });
+        assert!(pack.has_signal());
     }
 }
