@@ -6,9 +6,10 @@
 
 use std::collections::HashMap;
 
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
 
+use crate::db::drawers::Drawer;
 use crate::db::knowledge_graph::KnowledgeGraph;
 use crate::db::schema::Database;
 use crate::db::CodeMap;
@@ -17,6 +18,7 @@ use crate::report::{run_report, Report, ReportOptions};
 
 /// Maximum content length for a drawer in list views (truncated beyond this).
 const LIST_CONTENT_LIMIT: usize = 200;
+const MAX_DASHBOARD_LIMIT: usize = 500;
 
 // ────────────────────────────────────────────────────────────────────────────
 // Memory summary projection (Task 2)
@@ -41,6 +43,8 @@ pub struct MemorySummary {
     pub total_drawers: usize,
     /// Wing → total drawer count.
     pub wing_counts: HashMap<String, usize>,
+    /// Room → total drawer count.
+    pub room_counts: HashMap<String, usize>,
     /// Wing → room → drawer count.
     pub taxonomy: HashMap<String, HashMap<String, usize>>,
     pub kg_stats: serde_json::Value,
@@ -67,6 +71,10 @@ pub fn memory_summary(db: &Database, params: &MemoryParams) -> Result<MemorySumm
     let total_drawers = db.count_drawers(params.wing.as_deref())?;
 
     let wing_counts: HashMap<String, usize> = db.wing_counts()?.into_iter().collect();
+    let room_counts: HashMap<String, usize> = db
+        .room_counts(params.wing.as_deref())?
+        .into_iter()
+        .collect();
 
     let raw_taxonomy = db.taxonomy()?;
     let taxonomy: HashMap<String, HashMap<String, usize>> = raw_taxonomy
@@ -97,10 +105,44 @@ pub fn memory_summary(db: &Database, params: &MemoryParams) -> Result<MemorySumm
     Ok(MemorySummary {
         total_drawers,
         wing_counts,
+        room_counts,
         taxonomy,
         kg_stats,
         recent_drawers,
     })
+}
+
+/// Exact drawer detail response. Full content is only exposed through this
+/// exact-id lookup path, never through list views.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DrawerDetail {
+    pub id: String,
+    pub content: String,
+    pub wing: String,
+    pub room: String,
+    pub source_file: String,
+    pub added_by: String,
+    pub filed_at: String,
+    pub date: String,
+}
+
+impl From<Drawer> for DrawerDetail {
+    fn from(drawer: Drawer) -> Self {
+        Self {
+            id: drawer.id,
+            content: drawer.content,
+            wing: drawer.wing,
+            room: drawer.room,
+            source_file: drawer.source_file,
+            added_by: drawer.added_by,
+            filed_at: drawer.filed_at,
+            date: drawer.date,
+        }
+    }
+}
+
+pub fn drawer_detail(db: &Database, id: &str) -> Result<Option<DrawerDetail>, MemoryError> {
+    Ok(db.get_drawer(id)?.map(DrawerDetail::from))
 }
 
 fn truncate_content(content: &str, limit: usize) -> String {
@@ -136,10 +178,21 @@ pub fn report_projection(
 // ────────────────────────────────────────────────────────────────────────────
 
 /// Query parameters for code-map listing.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct CodeMapParams {
     pub repo: Option<String>,
     pub area: Option<String>,
+    pub limit: usize,
+}
+
+impl Default for CodeMapParams {
+    fn default() -> Self {
+        Self {
+            repo: None,
+            area: None,
+            limit: 50,
+        }
+    }
 }
 
 /// List code-map rows with optional repo/area filters.
@@ -153,38 +206,39 @@ pub(crate) fn list_code_maps_conn(
     conn: &Connection,
     params: &CodeMapParams,
 ) -> Result<Vec<CodeMap>, MemoryError> {
+    let limit = params.limit.clamp(1, MAX_DASHBOARD_LIMIT) as i64;
     let sql = match (&params.repo, &params.area) {
         (Some(_), Some(_)) => {
             "SELECT repo, area, drawer_id, head_sha, source_files, built_by, built_at
-             FROM code_maps WHERE repo = ?1 AND area = ?2 ORDER BY built_at DESC"
+             FROM code_maps WHERE repo = ?1 AND area = ?2 ORDER BY built_at DESC LIMIT ?3"
         }
         (Some(_), None) => {
             "SELECT repo, area, drawer_id, head_sha, source_files, built_by, built_at
-             FROM code_maps WHERE repo = ?1 ORDER BY built_at DESC"
+             FROM code_maps WHERE repo = ?1 ORDER BY built_at DESC LIMIT ?2"
         }
         (None, Some(_)) => {
             "SELECT repo, area, drawer_id, head_sha, source_files, built_by, built_at
-             FROM code_maps WHERE area = ?1 ORDER BY built_at DESC"
+             FROM code_maps WHERE area = ?1 ORDER BY built_at DESC LIMIT ?2"
         }
         (None, None) => {
             "SELECT repo, area, drawer_id, head_sha, source_files, built_by, built_at
-             FROM code_maps ORDER BY built_at DESC"
+             FROM code_maps ORDER BY built_at DESC LIMIT ?1"
         }
     };
 
     let mut stmt = conn.prepare(sql)?;
     let rows = match (&params.repo, &params.area) {
         (Some(repo), Some(area)) => stmt
-            .query_map(params![repo, area], map_code_map_row)?
+            .query_map(params![repo, area, limit], map_code_map_row)?
             .collect::<rusqlite::Result<Vec<_>>>()?,
         (Some(repo), None) => stmt
-            .query_map(params![repo], map_code_map_row)?
+            .query_map(params![repo, limit], map_code_map_row)?
             .collect::<rusqlite::Result<Vec<_>>>()?,
         (None, Some(area)) => stmt
-            .query_map(params![area], map_code_map_row)?
+            .query_map(params![area, limit], map_code_map_row)?
             .collect::<rusqlite::Result<Vec<_>>>()?,
         (None, None) => stmt
-            .query_map([], map_code_map_row)?
+            .query_map(params![limit], map_code_map_row)?
             .collect::<rusqlite::Result<Vec<_>>>()?,
     };
     Ok(rows)
@@ -238,17 +292,33 @@ pub struct CollabSessionSummary {
     pub final_plan_hash: Option<String>,
 }
 
+#[derive(Debug, Clone)]
+pub struct SessionParams {
+    pub limit: usize,
+}
+
+impl Default for SessionParams {
+    fn default() -> Self {
+        Self { limit: 50 }
+    }
+}
+
 /// List compact collab session summaries (most recently updated first).
 ///
 /// Plan/message bodies are never returned — only drawer refs so the #90
 /// by-reference contract is respected.
-pub fn list_sessions(db: &Database) -> Result<Vec<CollabSessionSummary>, MemoryError> {
-    db.with_connection(list_sessions_conn)
+pub fn list_sessions(
+    db: &Database,
+    params: &SessionParams,
+) -> Result<Vec<CollabSessionSummary>, MemoryError> {
+    db.with_connection(|conn| list_sessions_conn(conn, params))
 }
 
 pub(crate) fn list_sessions_conn(
     conn: &Connection,
+    params: &SessionParams,
 ) -> Result<Vec<CollabSessionSummary>, MemoryError> {
+    let limit = params.limit.clamp(1, MAX_DASHBOARD_LIMIT) as i64;
     let mut stmt = conn.prepare(
         "SELECT id, task, repo_path, branch, phase, current_owner, implementer,
                 base_sha, last_head_sha, created_at, updated_at, ended_at,
@@ -256,10 +326,11 @@ pub(crate) fn list_sessions_conn(
                 canonical_plan_drawer_id, canonical_plan_hash,
                 final_plan_drawer_id, final_plan_hash
          FROM collab_sessions
-         ORDER BY updated_at DESC",
+         ORDER BY updated_at DESC
+         LIMIT ?1",
     )?;
 
-    let rows = stmt.query_map([], |row| {
+    let rows = stmt.query_map(params![limit], |row| {
         let task_list: Option<String> = row.get(14)?;
         let tasks_count = crate::collab::tasks_count_from_list(task_list.as_deref());
         Ok(CollabSessionSummary {
@@ -290,51 +361,6 @@ pub(crate) fn list_sessions_conn(
         result.push(row?);
     }
     Ok(result)
-}
-
-/// Fetch a single session summary by id. Returns `None` when not found.
-pub fn get_session(
-    db: &Database,
-    session_id: &str,
-) -> Result<Option<CollabSessionSummary>, MemoryError> {
-    db.with_connection(|conn| {
-        conn.query_row(
-            "SELECT id, task, repo_path, branch, phase, current_owner, implementer,
-                base_sha, last_head_sha, created_at, updated_at, ended_at,
-                coding_failure, pr_url, task_list,
-                canonical_plan_drawer_id, canonical_plan_hash,
-                final_plan_drawer_id, final_plan_hash
-         FROM collab_sessions WHERE id = ?1",
-            params![session_id],
-            |row: &rusqlite::Row<'_>| {
-                let task_list: Option<String> = row.get(14)?;
-                let tasks_count = crate::collab::tasks_count_from_list(task_list.as_deref());
-                Ok(CollabSessionSummary {
-                    id: row.get(0)?,
-                    task: row.get(1)?,
-                    repo_path: row.get(2)?,
-                    branch: row.get(3)?,
-                    phase: row.get(4)?,
-                    current_owner: row.get(5)?,
-                    implementer: row.get(6)?,
-                    base_sha: row.get(7)?,
-                    head_sha: row.get(8)?,
-                    created_at: row.get(9)?,
-                    updated_at: row.get(10)?,
-                    ended_at: row.get(11)?,
-                    coding_failure: row.get(12)?,
-                    pr_url: row.get(13)?,
-                    tasks_count,
-                    canonical_plan_drawer_id: row.get(15)?,
-                    canonical_plan_hash: row.get(16)?,
-                    final_plan_drawer_id: row.get(17)?,
-                    final_plan_hash: row.get(18)?,
-                })
-            },
-        )
-        .optional()
-        .map_err(MemoryError::from)
-    })
 }
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -404,6 +430,8 @@ mod tests {
         assert_eq!(summary.recent_drawers.len(), 2);
         assert_eq!(*summary.wing_counts.get("alpha").unwrap(), 1);
         assert_eq!(*summary.wing_counts.get("beta").unwrap(), 1);
+        assert_eq!(*summary.room_counts.get("general").unwrap(), 1);
+        assert_eq!(*summary.room_counts.get("notes").unwrap(), 1);
 
         // Wing-filtered.
         let params_alpha = MemoryParams {
@@ -415,23 +443,18 @@ mod tests {
         assert_eq!(alpha.total_drawers, 1);
         assert_eq!(alpha.recent_drawers.len(), 1);
         assert_eq!(alpha.recent_drawers[0].wing, "alpha");
+        assert_eq!(*alpha.room_counts.get("general").unwrap(), 1);
+        assert!(!alpha.room_counts.contains_key("notes"));
     }
 
     #[test]
-    fn drawer_content_is_truncated_in_list_views() {
+    fn drawer_content_is_truncated_in_list_views_but_full_by_exact_id() {
         let db = open_fresh();
         let long_content = "x".repeat(500);
         let emb = vec![0.0f32; ironrace_embed::embedder::EMBED_DIM];
-        db.insert_drawer(
-            &crate::db::drawers::generate_id(&long_content, "w", "r"),
-            &long_content,
-            &emb,
-            "w",
-            "r",
-            "",
-            "test",
-        )
-        .unwrap();
+        let drawer_id = crate::db::drawers::generate_id(&long_content, "w", "r");
+        db.insert_drawer(&drawer_id, &long_content, &emb, "w", "r", "", "test")
+            .unwrap();
 
         let params = MemoryParams {
             wing: None,
@@ -447,17 +470,47 @@ mod tests {
             "preview too long: {}",
             preview.len()
         );
+        assert_ne!(preview, &long_content);
+
+        let detail = drawer_detail(&db, &drawer_id).unwrap().unwrap();
+        assert_eq!(detail.content, long_content);
     }
 
     // ── report_projection ───────────────────────────────────────────────────
 
     #[test]
-    fn report_projection_returns_report_struct() {
+    fn report_projection_matches_run_report_for_same_filters() {
+        use crate::db::metrics::NewTokenUsage;
+
         let db = open_fresh();
-        let report = report_projection(&db, None, None).unwrap();
-        // An empty db yields an empty report (no tasks, no cost).
-        // We just verify the type round-trips without error.
-        assert!(report.tasks.is_empty());
+        db.insert_token_usage(&NewTokenUsage {
+            ts: "2026-01-02T00:00:00Z".to_string(),
+            source: "transcript".to_string(),
+            harness: "claude".to_string(),
+            model: Some("claude-opus-4-8".to_string()),
+            session_id: None,
+            collab_session_id: None,
+            collab_phase: Some("impl".to_string()),
+            task_tag: Some("dashboard-test".to_string()),
+            input_tokens: 10,
+            output_tokens: 5,
+            cache_creation_input_tokens: 0,
+            cache_read_input_tokens: 0,
+            estimated: false,
+            chars: 0,
+            cost_usd: None,
+            map_status: None,
+            turn_id: None,
+            area: None,
+        })
+        .unwrap();
+
+        let task = Some("dashboard-test".to_string());
+        let since = Some("2026-01-01".to_string());
+        let projected = report_projection(&db, task.clone(), since.clone()).unwrap();
+        let direct =
+            crate::report::run_report(&db, &crate::report::ReportOptions { task, since }).unwrap();
+        assert_eq!(projected, direct);
     }
 
     // ── list_code_maps ──────────────────────────────────────────────────────
@@ -495,12 +548,33 @@ mod tests {
             "2026-01-01T00:00:00Z",
         )
         .unwrap();
+        let drawer_id_2 =
+            crate::db::drawers::generate_id("map content 2", "code-maps", "code-maps");
+        db.insert_drawer(
+            &drawer_id_2,
+            "map content 2",
+            &emb,
+            "code-maps",
+            "code-maps",
+            "",
+            "test",
+        )
+        .unwrap();
+        db.upsert_code_map(
+            "my-repo",
+            "docs",
+            &drawer_id_2,
+            "bbbbccdd1122334455667788aabbccdd11223344",
+            &["docs/readme.md".to_string()],
+            "test-agent",
+            "2026-01-02T00:00:00Z",
+        )
+        .unwrap();
 
         // No filter — should return the row.
         let all = list_code_maps(&db, &CodeMapParams::default()).unwrap();
-        assert_eq!(all.len(), 1);
-        assert_eq!(all[0].repo, "my-repo");
-        assert_eq!(all[0].area, "core");
+        assert_eq!(all.len(), 2);
+        assert!(all.iter().all(|row| row.repo == "my-repo"));
 
         // Repo filter match.
         let filtered = list_code_maps(
@@ -508,10 +582,49 @@ mod tests {
             &CodeMapParams {
                 repo: Some("my-repo".to_string()),
                 area: None,
+                limit: 10,
             },
         )
         .unwrap();
-        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered.len(), 2);
+
+        // Area-only filter match.
+        let area_only = list_code_maps(
+            &db,
+            &CodeMapParams {
+                repo: None,
+                area: Some("docs".to_string()),
+                limit: 10,
+            },
+        )
+        .unwrap();
+        assert_eq!(area_only.len(), 1);
+        assert_eq!(area_only[0].area, "docs");
+
+        // Repo + area combined filter.
+        let combined = list_code_maps(
+            &db,
+            &CodeMapParams {
+                repo: Some("my-repo".to_string()),
+                area: Some("core".to_string()),
+                limit: 10,
+            },
+        )
+        .unwrap();
+        assert_eq!(combined.len(), 1);
+        assert_eq!(combined[0].area, "core");
+
+        // SQL limit is enforced.
+        let limited = list_code_maps(
+            &db,
+            &CodeMapParams {
+                repo: Some("my-repo".to_string()),
+                area: None,
+                limit: 1,
+            },
+        )
+        .unwrap();
+        assert_eq!(limited.len(), 1);
 
         // Repo filter no match.
         let none = list_code_maps(
@@ -519,6 +632,7 @@ mod tests {
             &CodeMapParams {
                 repo: Some("other-repo".to_string()),
                 area: None,
+                limit: 10,
             },
         )
         .unwrap();
@@ -530,7 +644,7 @@ mod tests {
     #[test]
     fn list_sessions_empty() {
         let db = open_fresh();
-        let sessions = list_sessions(&db).unwrap();
+        let sessions = list_sessions(&db, &SessionParams::default()).unwrap();
         assert!(sessions.is_empty());
     }
 
@@ -548,15 +662,40 @@ mod tests {
             )
         })
         .unwrap();
+        db.with_connection(|conn| {
+            conn.execute(
+                "UPDATE collab_sessions
+                 SET canonical_plan_drawer_id = ?1,
+                     canonical_plan_hash = ?2,
+                     final_plan_drawer_id = ?3,
+                     final_plan_hash = ?4,
+                     task_list = ?5
+                 WHERE id = ?6",
+                rusqlite::params![
+                    "canonical-drawer",
+                    "canonical-hash",
+                    "final-drawer",
+                    "final-hash",
+                    r#"{"tasks":[{"id":1},{"id":2}]}"#,
+                    "test-session-id-001",
+                ],
+            )?;
+            Ok(())
+        })
+        .unwrap();
 
-        let sessions = list_sessions(&db).unwrap();
+        let sessions = list_sessions(&db, &SessionParams::default()).unwrap();
         assert_eq!(sessions.len(), 1);
         let s = &sessions[0];
         assert_eq!(s.id, "test-session-id-001");
         assert_eq!(s.task.as_deref(), Some("test task"));
-        // Plan bodies must NOT be present — only refs (which are NULL at creation).
-        // The struct has no plan_body field by design.
-        assert!(s.canonical_plan_drawer_id.is_none());
-        assert!(s.final_plan_drawer_id.is_none());
+        assert_eq!(s.tasks_count, Some(2));
+        assert_eq!(
+            s.canonical_plan_drawer_id.as_deref(),
+            Some("canonical-drawer")
+        );
+        assert_eq!(s.canonical_plan_hash.as_deref(), Some("canonical-hash"));
+        assert_eq!(s.final_plan_drawer_id.as_deref(), Some("final-drawer"));
+        assert_eq!(s.final_plan_hash.as_deref(), Some("final-hash"));
     }
 }

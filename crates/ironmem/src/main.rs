@@ -361,14 +361,14 @@ async fn run(cli: Cli) -> Result<(), MemoryError> {
             let host_addr: std::net::IpAddr = host.parse().map_err(|e| {
                 MemoryError::Validation(format!("invalid host address {host:?}: {e}"))
             })?;
-            let dash_cfg = dashboard::server::DashboardConfig {
+            let dash_cfg = dashboard::DashboardConfig {
                 db_path: cfg.db_path.clone(),
                 host: host_addr,
                 port,
                 allow_non_loopback,
                 json_startup: json,
             };
-            dashboard::server::run_dashboard(dash_cfg).await
+            dashboard::run_dashboard(dash_cfg).await
         }
         Commands::WriteRules { target, workspace } => {
             use ironmem::write_rules::{validate_rules_file, write_rules_file, WriteOutcome};

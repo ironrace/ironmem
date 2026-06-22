@@ -18,7 +18,8 @@ use hyper::header::{ALLOW, CONTENT_TYPE};
 use hyper::{Method, Request, Response, StatusCode};
 
 use crate::dashboard::data::{
-    list_code_maps, list_sessions, memory_summary, report_projection, CodeMapParams, MemoryParams,
+    drawer_detail, list_code_maps, list_sessions, memory_summary, report_projection, CodeMapParams,
+    MemoryParams, SessionParams,
 };
 use crate::dashboard::server::ServerState;
 use crate::db::schema::Database;
@@ -28,8 +29,22 @@ use crate::error::MemoryError;
 const MAX_LIMIT: usize = 500;
 /// Default `limit` when not supplied.
 const DEFAULT_LIMIT: usize = 50;
+const MAX_PARAM_CHARS: usize = 512;
 
 type HyperResponse = Response<Full<Bytes>>;
+
+#[derive(Debug, Clone)]
+enum MemoryRequest {
+    List(MemoryParams),
+    Detail(String),
+}
+
+#[derive(Debug, Clone)]
+struct ReportParams {
+    task: Option<String>,
+    since: Option<String>,
+    limit: usize,
+}
 
 /// Entry-point for every inbound HTTP request. Never returns `Err` — errors
 /// are converted to appropriate HTTP error responses so the connection is not
@@ -49,22 +64,19 @@ pub async fn handle_request(
     let path = req.uri().path().to_string();
     let query = req.uri().query().unwrap_or("").to_string();
 
-    // Route dispatch.
+    if *req.method() == Method::HEAD {
+        return Ok(handle_head(&path, &query));
+    }
+
     let response = match path.as_str() {
         "/" => serve_html(DASHBOARD_HTML),
         "/api/summary" => handle_summary(state, &query).await,
         "/api/memory" => handle_memory(state, &query).await,
         "/api/code-maps" => handle_code_maps(state, &query).await,
-        "/api/sessions" => handle_sessions(state).await,
+        "/api/sessions" => handle_sessions(state, &query).await,
         "/api/report" => handle_report(state, &query).await,
         _ => not_found(),
     };
-
-    // For HEAD requests, strip the body.
-    if *req.method() == Method::HEAD {
-        let (parts, _body) = response.into_parts();
-        return Ok(Response::from_parts(parts, Full::new(Bytes::new())));
-    }
 
     Ok(response)
 }
@@ -101,19 +113,30 @@ async fn handle_summary(state: Arc<ServerState>, _query: &str) -> HyperResponse 
 }
 
 async fn handle_memory(state: Arc<ServerState>, query: &str) -> HyperResponse {
-    let params = match parse_memory_params(query) {
-        Ok(p) => p,
+    let request = match parse_memory_request(query) {
+        Ok(r) => r,
         Err(msg) => return bad_request(&msg),
     };
     let db_path = Arc::clone(&state.db_path);
 
     match tokio::task::spawn_blocking(move || -> Result<serde_json::Value, MemoryError> {
         let db = Database::open_read_only(&db_path)?;
-        let summary = memory_summary(&db, &params)?;
-        serde_json::to_value(&summary).map_err(MemoryError::from)
+        match request {
+            MemoryRequest::List(params) => {
+                let summary = memory_summary(&db, &params)?;
+                serde_json::to_value(&summary).map_err(MemoryError::from)
+            }
+            MemoryRequest::Detail(id) => match drawer_detail(&db, &id)? {
+                Some(drawer) => serde_json::to_value(&drawer).map_err(MemoryError::from),
+                None => Ok(serde_json::json!({ "error": "not found" })),
+            },
+        }
     })
     .await
     {
+        Ok(Ok(json)) if json.get("error").and_then(|v| v.as_str()) == Some("not found") => {
+            json_response(StatusCode::NOT_FOUND, &json)
+        }
         Ok(Ok(json)) => json_response(StatusCode::OK, &json),
         Ok(Err(e)) => internal_error_safe(&e),
         Err(e) => internal_error_safe(&MemoryError::Validation(format!("task error: {e}"))),
@@ -121,7 +144,10 @@ async fn handle_memory(state: Arc<ServerState>, query: &str) -> HyperResponse {
 }
 
 async fn handle_code_maps(state: Arc<ServerState>, query: &str) -> HyperResponse {
-    let params = parse_code_map_params(query);
+    let params = match parse_code_map_params(query) {
+        Ok(p) => p,
+        Err(msg) => return bad_request(&msg),
+    };
     let db_path = Arc::clone(&state.db_path);
 
     match tokio::task::spawn_blocking(move || -> Result<serde_json::Value, MemoryError> {
@@ -137,12 +163,16 @@ async fn handle_code_maps(state: Arc<ServerState>, query: &str) -> HyperResponse
     }
 }
 
-async fn handle_sessions(state: Arc<ServerState>) -> HyperResponse {
+async fn handle_sessions(state: Arc<ServerState>, query: &str) -> HyperResponse {
+    let params = match parse_session_params(query) {
+        Ok(p) => p,
+        Err(msg) => return bad_request(&msg),
+    };
     let db_path = Arc::clone(&state.db_path);
 
     match tokio::task::spawn_blocking(move || -> Result<serde_json::Value, MemoryError> {
         let db = Database::open_read_only(&db_path)?;
-        let sessions = list_sessions(&db)?;
+        let sessions = list_sessions(&db, &params)?;
         serde_json::to_value(&sessions).map_err(MemoryError::from)
     })
     .await
@@ -154,13 +184,18 @@ async fn handle_sessions(state: Arc<ServerState>) -> HyperResponse {
 }
 
 async fn handle_report(state: Arc<ServerState>, query: &str) -> HyperResponse {
-    let (task, since) = parse_report_params(query);
+    let params = match parse_report_params(query) {
+        Ok(p) => p,
+        Err(msg) => return bad_request(&msg),
+    };
     let db_path = Arc::clone(&state.db_path);
 
     match tokio::task::spawn_blocking(move || -> Result<serde_json::Value, MemoryError> {
         let db = Database::open_read_only(&db_path)?;
-        let report = report_projection(&db, task, since)?;
-        serde_json::to_value(&report).map_err(MemoryError::from)
+        let report = report_projection(&db, params.task, params.since)?;
+        let mut json = serde_json::to_value(&report).map_err(MemoryError::from)?;
+        cap_report_json(&mut json, params.limit);
+        Ok(json)
     })
     .await
     {
@@ -181,15 +216,10 @@ fn parse_memory_params(query: &str) -> Result<MemoryParams, String> {
 
     for (k, v) in form_urlencoded(query) {
         match k.as_str() {
-            "wing" => wing = Some(v),
-            "room" => room = Some(v),
+            "wing" => wing = Some(validate_param("wing", v)?),
+            "room" => room = Some(validate_param("room", v)?),
             "limit" => {
-                limit = v
-                    .parse::<usize>()
-                    .map_err(|_| format!("invalid limit value: {v:?}"))?;
-                if limit > MAX_LIMIT {
-                    return Err(format!("limit {limit} exceeds maximum {MAX_LIMIT}"));
-                }
+                limit = parse_limit(&v)?;
             }
             _ => {} // ignore unknown params
         }
@@ -198,30 +228,82 @@ fn parse_memory_params(query: &str) -> Result<MemoryParams, String> {
     Ok(MemoryParams { wing, room, limit })
 }
 
-fn parse_code_map_params(query: &str) -> CodeMapParams {
-    let mut repo = None;
-    let mut area = None;
+fn parse_memory_request(query: &str) -> Result<MemoryRequest, String> {
+    let mut id = None;
     for (k, v) in form_urlencoded(query) {
-        match k.as_str() {
-            "repo" => repo = Some(v),
-            "area" => area = Some(v),
-            _ => {}
+        if k == "id" {
+            let value = validate_param("id", v)?;
+            if value.is_empty() {
+                return Err("id must not be empty".to_string());
+            }
+            id = Some(value);
         }
     }
-    CodeMapParams { repo, area }
+    match id {
+        Some(id) => Ok(MemoryRequest::Detail(id)),
+        None => Ok(MemoryRequest::List(parse_memory_params(query)?)),
+    }
 }
 
-fn parse_report_params(query: &str) -> (Option<String>, Option<String>) {
-    let mut task = None;
-    let mut since = None;
+fn parse_code_map_params(query: &str) -> Result<CodeMapParams, String> {
+    let mut repo = None;
+    let mut area = None;
+    let mut limit = DEFAULT_LIMIT;
     for (k, v) in form_urlencoded(query) {
         match k.as_str() {
-            "task" => task = Some(v),
-            "since" => since = Some(v),
+            "repo" => repo = Some(validate_param("repo", v)?),
+            "area" => area = Some(validate_param("area", v)?),
+            "limit" => limit = parse_limit(&v)?,
             _ => {}
         }
     }
-    (task, since)
+    Ok(CodeMapParams { repo, area, limit })
+}
+
+fn parse_session_params(query: &str) -> Result<SessionParams, String> {
+    let mut limit = DEFAULT_LIMIT;
+    for (k, v) in form_urlencoded(query) {
+        if k == "limit" {
+            limit = parse_limit(&v)?;
+        }
+    }
+    Ok(SessionParams { limit })
+}
+
+fn parse_report_params(query: &str) -> Result<ReportParams, String> {
+    let mut task = None;
+    let mut since = None;
+    let mut limit = DEFAULT_LIMIT;
+    for (k, v) in form_urlencoded(query) {
+        match k.as_str() {
+            "task" => task = Some(validate_param("task", v)?),
+            "since" => since = Some(validate_param("since", v)?),
+            "limit" => limit = parse_limit(&v)?,
+            _ => {}
+        }
+    }
+    let since = crate::report::validate_since(since.as_deref()).map_err(|e| e.to_string())?;
+    Ok(ReportParams { task, since, limit })
+}
+
+fn validate_param(name: &str, value: String) -> Result<String, String> {
+    if value.chars().count() > MAX_PARAM_CHARS {
+        return Err(format!("{name} exceeds maximum length {MAX_PARAM_CHARS}"));
+    }
+    Ok(value)
+}
+
+fn parse_limit(value: &str) -> Result<usize, String> {
+    let limit = value
+        .parse::<usize>()
+        .map_err(|_| format!("invalid limit value: {value:?}"))?;
+    if limit == 0 {
+        return Err("limit must be at least 1".to_string());
+    }
+    if limit > MAX_LIMIT {
+        return Err(format!("limit {limit} exceeds maximum {MAX_LIMIT}"));
+    }
+    Ok(limit)
 }
 
 /// Minimal query-string parser that percent-decodes keys and values.
@@ -282,6 +364,40 @@ fn json_response(status: StatusCode, value: &serde_json::Value) -> HyperResponse
         .unwrap_or_else(|_| internal_fallback())
 }
 
+fn handle_head(path: &str, query: &str) -> HyperResponse {
+    match path {
+        "/" => empty_response(StatusCode::OK, "text/html; charset=utf-8"),
+        "/api/summary" => empty_response(StatusCode::OK, "application/json; charset=utf-8"),
+        "/api/memory" => match parse_memory_request(query) {
+            Ok(_) => empty_response(StatusCode::OK, "application/json; charset=utf-8"),
+            Err(msg) => bad_request_empty(&msg),
+        },
+        "/api/code-maps" => match parse_code_map_params(query) {
+            Ok(_) => empty_response(StatusCode::OK, "application/json; charset=utf-8"),
+            Err(msg) => bad_request_empty(&msg),
+        },
+        "/api/sessions" => match parse_session_params(query) {
+            Ok(_) => empty_response(StatusCode::OK, "application/json; charset=utf-8"),
+            Err(msg) => bad_request_empty(&msg),
+        },
+        "/api/report" => match parse_report_params(query) {
+            Ok(_) => empty_response(StatusCode::OK, "application/json; charset=utf-8"),
+            Err(msg) => bad_request_empty(&msg),
+        },
+        _ => empty_response(StatusCode::NOT_FOUND, "application/json; charset=utf-8"),
+    }
+}
+
+fn empty_response(status: StatusCode, content_type: &'static str) -> HyperResponse {
+    Response::builder()
+        .status(status)
+        .header(CONTENT_TYPE, content_type)
+        .header("X-Content-Type-Options", "nosniff")
+        .header("Cache-Control", "no-store")
+        .body(Full::new(Bytes::new()))
+        .unwrap_or_else(|_| internal_fallback())
+}
+
 fn serve_html(html: &'static str) -> HyperResponse {
     Response::builder()
         .status(StatusCode::OK)
@@ -326,6 +442,10 @@ fn bad_request(msg: &str) -> HyperResponse {
         .unwrap_or_else(|_| internal_fallback())
 }
 
+fn bad_request_empty(_msg: &str) -> HyperResponse {
+    empty_response(StatusCode::BAD_REQUEST, "application/json; charset=utf-8")
+}
+
 /// Produce a safe 500 response that never leaks raw SQLite or filesystem paths.
 fn internal_error_safe(e: &MemoryError) -> HyperResponse {
     // Log the real error server-side; surface only a safe generic message.
@@ -342,6 +462,29 @@ fn internal_fallback() -> HyperResponse {
     Response::new(Full::new(Bytes::from(
         r#"{"error":"internal server error"}"#,
     )))
+}
+
+fn cap_report_json(value: &mut serde_json::Value, limit: usize) {
+    let Some(obj) = value.as_object_mut() else {
+        return;
+    };
+    let mut meta = serde_json::Map::new();
+    for field in ["headline", "non_completions", "tasks", "unpriced_models"] {
+        if let Some(array) = obj.get_mut(field).and_then(|v| v.as_array_mut()) {
+            let original_len = array.len();
+            if original_len > limit {
+                array.truncate(limit);
+                meta.insert(field.to_string(), serde_json::json!(original_len));
+            }
+        }
+    }
+    if !meta.is_empty() {
+        meta.insert("limit".to_string(), serde_json::json!(limit));
+        obj.insert(
+            "dashboard_truncated".to_string(),
+            serde_json::Value::Object(meta),
+        );
+    }
 }
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -431,7 +574,7 @@ const DASHBOARD_HTML: &str = r####"<!DOCTYPE html>
     <input id="rpt-since" placeholder="since YYYY-MM-DD (optional)" style="width:180px">
     <button onclick="loadReport()">Load</button>
   </div>
-  <div id="report-output"><p class="loading">Loading…</p></div>
+  <div id="report-output"><p class="loading">Choose filters, then load the report.</p></div>
 </div>
 
 <script>
@@ -641,7 +784,6 @@ loadSummary();
 loadMemory();
 loadCodeMaps();
 loadSessions();
-loadReport();
 </script>
 </body>
 </html>"####;
@@ -653,6 +795,96 @@ loadReport();
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::db::metrics::NewTokenUsage;
+    use crate::db::schema::{Database, LATEST_SCHEMA_VERSION};
+    use http_body_util::BodyExt;
+    use std::path::PathBuf;
+
+    struct Fixture {
+        _dir: tempfile::TempDir,
+        db_path: PathBuf,
+        drawer_id: String,
+        state: Arc<ServerState>,
+    }
+
+    fn fixture() -> Fixture {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("memory.sqlite3");
+        let drawer_id;
+        {
+            let db = Database::open(&db_path).unwrap();
+            db.migrate().unwrap();
+            let emb = vec![0.0f32; ironrace_embed::embedder::EMBED_DIM];
+            drawer_id = crate::db::drawers::generate_id("full drawer content", "wing-a", "room-a");
+            db.insert_drawer(
+                &drawer_id,
+                "full drawer content",
+                &emb,
+                "wing-a",
+                "room-a",
+                "src/a.rs",
+                "test",
+            )
+            .unwrap();
+            db.upsert_code_map(
+                "repo-a",
+                "core",
+                &drawer_id,
+                "aabbccdd1122334455667788aabbccdd11223344",
+                &["src/lib.rs".to_string()],
+                "test-agent",
+                "2026-01-01T00:00:00Z",
+            )
+            .unwrap();
+            db.with_connection(|conn| {
+                crate::collab::queue::create_session(
+                    conn,
+                    "dash-session-001",
+                    "/repo-a",
+                    "main",
+                    Some("dashboard task"),
+                    crate::collab::Agent::Claude,
+                )
+            })
+            .unwrap();
+            db.insert_token_usage(&NewTokenUsage {
+                ts: "2026-01-02T00:00:00Z".to_string(),
+                source: "transcript".to_string(),
+                harness: "claude".to_string(),
+                model: Some("claude-opus-4-8".to_string()),
+                session_id: None,
+                collab_session_id: None,
+                collab_phase: Some("impl".to_string()),
+                task_tag: Some("dashboard-test".to_string()),
+                input_tokens: 10,
+                output_tokens: 5,
+                cache_creation_input_tokens: 0,
+                cache_read_input_tokens: 0,
+                estimated: false,
+                chars: 0,
+                cost_usd: None,
+                map_status: None,
+                turn_id: None,
+                area: None,
+            })
+            .unwrap();
+        }
+        let state = Arc::new(ServerState {
+            db_path: Arc::new(db_path.clone()),
+            schema_version: LATEST_SCHEMA_VERSION,
+        });
+        Fixture {
+            _dir: dir,
+            db_path,
+            drawer_id,
+            state,
+        }
+    }
+
+    async fn body_text(response: HyperResponse) -> String {
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        String::from_utf8(bytes.to_vec()).unwrap()
+    }
 
     // ── form_urlencoded ──────────────────────────────────────────────────────
 
@@ -699,6 +931,174 @@ mod tests {
     fn parse_memory_params_invalid_limit_is_rejected() {
         let result = parse_memory_params("limit=not_a_number");
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn parse_memory_request_exact_id_uses_detail_path() {
+        match parse_memory_request("id=drawer123").unwrap() {
+            MemoryRequest::Detail(id) => assert_eq!(id, "drawer123"),
+            MemoryRequest::List(_) => panic!("expected detail request"),
+        }
+    }
+
+    #[test]
+    fn parse_code_map_and_session_limits_are_capped() {
+        assert_eq!(parse_code_map_params("limit=7").unwrap().limit, 7);
+        assert_eq!(parse_session_params("limit=8").unwrap().limit, 8);
+        assert!(parse_code_map_params(&format!("limit={}", MAX_LIMIT + 1)).is_err());
+        assert!(parse_session_params("limit=0").is_err());
+    }
+
+    #[test]
+    fn parse_report_params_validates_and_normalizes_since() {
+        let params = parse_report_params("task=abc&since=2026-01-02&limit=3").unwrap();
+        assert_eq!(params.task.as_deref(), Some("abc"));
+        assert_eq!(params.since.as_deref(), Some("2026-01-02T00:00:00Z"));
+        assert_eq!(params.limit, 3);
+
+        let err = parse_report_params("since=not-a-date").unwrap_err();
+        assert!(err.contains("since must be RFC3339 or YYYY-MM-DD"));
+    }
+
+    #[tokio::test]
+    async fn dashboard_handlers_return_expected_shapes_against_fixture() {
+        let fx = fixture();
+        let version_before = Database::open_read_only(&fx.db_path)
+            .unwrap()
+            .schema_version()
+            .unwrap();
+
+        let html = serve_html(DASHBOARD_HTML);
+        assert_eq!(html.status(), StatusCode::OK);
+        let html_body = body_text(html).await;
+        assert!(html_body.contains("Memory Drawers"));
+        assert!(html_body.contains("Code Maps"));
+        assert!(html_body.contains("Collab Sessions"));
+        assert!(html_body.contains("Metrics Report"));
+
+        let summary = handle_summary(Arc::clone(&fx.state), "").await;
+        assert_eq!(summary.status(), StatusCode::OK);
+        let summary_json: serde_json::Value =
+            serde_json::from_str(&body_text(summary).await).unwrap();
+        assert_eq!(summary_json["schema_version"], LATEST_SCHEMA_VERSION);
+        assert_eq!(summary_json["total_drawers"], 1);
+
+        let memory = handle_memory(Arc::clone(&fx.state), "limit=10").await;
+        assert_eq!(memory.status(), StatusCode::OK);
+        let memory_json: serde_json::Value =
+            serde_json::from_str(&body_text(memory).await).unwrap();
+        assert_eq!(memory_json["total_drawers"], 1);
+        assert_eq!(memory_json["recent_drawers"].as_array().unwrap().len(), 1);
+        assert!(memory_json["recent_drawers"][0].get("content").is_none());
+
+        let detail = handle_memory(Arc::clone(&fx.state), &format!("id={}", fx.drawer_id)).await;
+        assert_eq!(detail.status(), StatusCode::OK);
+        let detail_json: serde_json::Value =
+            serde_json::from_str(&body_text(detail).await).unwrap();
+        assert_eq!(detail_json["content"], "full drawer content");
+
+        let code_maps =
+            handle_code_maps(Arc::clone(&fx.state), "repo=repo-a&area=core&limit=10").await;
+        assert_eq!(code_maps.status(), StatusCode::OK);
+        let code_maps_json: serde_json::Value =
+            serde_json::from_str(&body_text(code_maps).await).unwrap();
+        assert_eq!(code_maps_json.as_array().unwrap().len(), 1);
+
+        let sessions = handle_sessions(Arc::clone(&fx.state), "limit=10").await;
+        assert_eq!(sessions.status(), StatusCode::OK);
+        let sessions_json: serde_json::Value =
+            serde_json::from_str(&body_text(sessions).await).unwrap();
+        assert_eq!(sessions_json.as_array().unwrap().len(), 1);
+        assert!(sessions_json[0].get("canonical_plan").is_none());
+        assert!(sessions_json[0].get("final_plan").is_none());
+
+        let report = handle_report(Arc::clone(&fx.state), "task=dashboard-test&limit=10").await;
+        assert_eq!(report.status(), StatusCode::OK);
+        let report_json: serde_json::Value =
+            serde_json::from_str(&body_text(report).await).unwrap();
+        assert_eq!(report_json["generated_for"]["task"], "dashboard-test");
+
+        let version_after = Database::open_read_only(&fx.db_path)
+            .unwrap()
+            .schema_version()
+            .unwrap();
+        assert_eq!(version_before, version_after);
+    }
+
+    #[tokio::test]
+    async fn invalid_params_return_safe_400_bodies() {
+        let fx = fixture();
+
+        let limit = handle_memory(Arc::clone(&fx.state), "limit=501").await;
+        assert_eq!(limit.status(), StatusCode::BAD_REQUEST);
+        let limit_body = body_text(limit).await;
+        assert!(limit_body.contains("exceeds maximum"));
+        assert!(!limit_body.contains("sqlite"));
+        assert!(!limit_body.contains(&fx.db_path.display().to_string()));
+
+        let since = handle_report(Arc::clone(&fx.state), "since=not-a-date").await;
+        assert_eq!(since.status(), StatusCode::BAD_REQUEST);
+        let since_body = body_text(since).await;
+        assert!(since_body.contains("since must be RFC3339 or YYYY-MM-DD"));
+        assert!(!since_body.contains("internal server error"));
+
+        let missing_db_state = Arc::new(ServerState {
+            db_path: Arc::new(fx.db_path.with_file_name("missing.sqlite3")),
+            schema_version: LATEST_SCHEMA_VERSION,
+        });
+        let internal = handle_summary(missing_db_state, "").await;
+        assert_eq!(internal.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let internal_body = body_text(internal).await;
+        assert_eq!(internal_body, r#"{"error":"internal server error"}"#);
+    }
+
+    #[test]
+    fn head_requests_are_validated_without_dispatching_handlers() {
+        let ok = handle_head("/api/report", "task=dashboard-test&limit=10");
+        assert_eq!(ok.status(), StatusCode::OK);
+
+        let bad = handle_head("/api/report", "since=not-a-date");
+        assert_eq!(bad.status(), StatusCode::BAD_REQUEST);
+
+        let missing = handle_head("/nope", "");
+        assert_eq!(missing.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[test]
+    fn report_json_is_capped_and_marks_truncation() {
+        let mut value = serde_json::json!({
+            "headline": [1, 2],
+            "non_completions": [1, 2, 3],
+            "tasks": [1],
+            "unpriced_models": ["a", "b"],
+        });
+        cap_report_json(&mut value, 1);
+        assert_eq!(value["headline"].as_array().unwrap().len(), 1);
+        assert_eq!(value["non_completions"].as_array().unwrap().len(), 1);
+        assert_eq!(value["unpriced_models"].as_array().unwrap().len(), 1);
+        assert_eq!(value["dashboard_truncated"]["limit"], 1);
+        assert_eq!(value["dashboard_truncated"]["non_completions"], 3);
+    }
+
+    #[test]
+    fn dashboard_html_sections_and_user_text_rendering_are_stable() {
+        for needle in [
+            "id=\"memory\"",
+            "id=\"codemaps\"",
+            "id=\"sessions\"",
+            "id=\"reports\"",
+            "fetchJSON('/api/summary')",
+            "fetchJSON('/api/memory?'",
+            "fetchJSON('/api/code-maps?'",
+            "fetchJSON('/api/sessions')",
+            "fetchJSON('/api/report?'",
+        ] {
+            assert!(DASHBOARD_HTML.contains(needle), "missing {needle}");
+        }
+        assert!(DASHBOARD_HTML.contains("td.textContent = row[k] || ''"));
+        assert!(DASHBOARD_HTML.contains("td.textContent = v || ''"));
+        assert!(DASHBOARD_HTML.contains("pre.textContent = JSON.stringify"));
+        assert!(!DASHBOARD_HTML.contains("\nloadReport();"));
     }
 
     // ── method_not_allowed ───────────────────────────────────────────────────

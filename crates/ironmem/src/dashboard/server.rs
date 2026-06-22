@@ -9,12 +9,13 @@
 //! - No request handler calls any write path.
 
 use std::net::{IpAddr, SocketAddr};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use hyper::server::conn::http1;
 use hyper::service::service_fn;
 use hyper_util::rt::TokioIo;
+use hyper_util::server::graceful::GracefulShutdown;
 use tokio::net::TcpListener;
 
 use crate::db::schema::{Database, LATEST_SCHEMA_VERSION};
@@ -24,9 +25,9 @@ use super::routes::handle_request;
 
 /// Immutable server state shared (read-only) across all request tasks.
 #[derive(Clone)]
-pub struct ServerState {
-    pub db_path: Arc<PathBuf>,
-    pub schema_version: i64,
+pub(crate) struct ServerState {
+    pub(crate) db_path: Arc<PathBuf>,
+    pub(crate) schema_version: i64,
 }
 
 /// Configuration for the dashboard server.
@@ -119,6 +120,7 @@ pub async fn run_dashboard(cfg: DashboardConfig) -> Result<(), MemoryError> {
         let _ = tokio::signal::ctrl_c().await;
     };
     tokio::pin!(shutdown);
+    let graceful = GracefulShutdown::new();
 
     loop {
         tokio::select! {
@@ -127,12 +129,14 @@ pub async fn run_dashboard(cfg: DashboardConfig) -> Result<(), MemoryError> {
                     Ok((stream, _peer)) => {
                         let state = Arc::clone(&state);
                         let io = TokioIo::new(stream);
+                        let watcher = graceful.watcher();
                         tokio::spawn(async move {
                             let svc = service_fn(move |req| {
                                 let state = Arc::clone(&state);
                                 async move { handle_request(req, state).await }
                             });
-                            if let Err(e) = http1::Builder::new().serve_connection(io, svc).await {
+                            let conn = http1::Builder::new().serve_connection(io, svc);
+                            if let Err(e) = watcher.watch(conn).await {
                                 tracing::debug!("dashboard connection error: {e}");
                             }
                         });
@@ -149,12 +153,14 @@ pub async fn run_dashboard(cfg: DashboardConfig) -> Result<(), MemoryError> {
         }
     }
 
+    graceful.shutdown().await;
     Ok(())
 }
 
 /// Thin helper used by the integration smoke test to validate host rejection
 /// without starting the full server. Exported so `main.rs` and tests can reuse.
-pub fn validate_host_only(host: IpAddr, allow_non_loopback: bool) -> Result<(), MemoryError> {
+#[cfg(test)]
+fn validate_host_only(host: IpAddr, allow_non_loopback: bool) -> Result<(), MemoryError> {
     if !host.is_loopback() && !allow_non_loopback {
         return Err(MemoryError::Validation(format!(
             "non-loopback host {} rejected; pass --allow-non-loopback to override",
@@ -162,14 +168,6 @@ pub fn validate_host_only(host: IpAddr, allow_non_loopback: bool) -> Result<(), 
         )));
     }
     Ok(())
-}
-
-/// Open the database read-only and return its schema version.
-/// Exported for use from `main.rs` startup checks.
-pub fn open_and_check_schema(path: &Path) -> Result<(Database, i64), MemoryError> {
-    let db = Database::open_read_only(path)?;
-    let ver = db.schema_version()?;
-    Ok((db, ver))
 }
 
 #[cfg(test)]
@@ -228,10 +226,10 @@ mod tests {
     }
 
     #[test]
-    fn open_and_check_schema_fails_on_missing_db() {
+    fn open_read_only_fails_on_missing_db_for_startup() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("missing.db");
-        let result = open_and_check_schema(&path);
+        let result = Database::open_read_only(&path);
         assert!(result.is_err());
     }
 }

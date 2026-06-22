@@ -501,8 +501,9 @@ ironmem dashboard --port 0 --json
   unless `--allow-non-loopback` is explicitly passed (a warning is printed).
 - The database is opened **read-only** — the dashboard never creates, modifies,
   or migrates the file. A missing or schema-mismatched database fails fast with
-  a clear message (`db not found at <path>` / `expected schema vN, found M`).
+  a clear message (`db not found at <path>` / `schema version mismatch: expected N, found M`).
 - Only `GET` and `HEAD` requests are served; all other methods return `405`.
+- List/report responses are bounded with `?limit=` (default 50, max 500).
 - No authentication; keep it loopback-only on shared or networked machines.
 
 **Endpoints served:**
@@ -511,10 +512,10 @@ ironmem dashboard --port 0 --json
 |---|---|
 | `GET /` | Single-page HTML dashboard (Memory / Code Maps / Sessions / Reports) |
 | `GET /api/summary` | Quick headline counts (total drawers, wings, KG stats, schema version) |
-| `GET /api/memory` | Drawer list with `?wing=`, `?room=`, `?limit=` filters |
-| `GET /api/code-maps` | Code-map rows with `?repo=`, `?area=` filters |
-| `GET /api/sessions` | Compact collab session summaries (plan refs only, no full bodies) |
-| `GET /api/report` | Metrics report JSON with optional `?task=`, `?since=` filters |
+| `GET /api/memory` | Drawer list with `?wing=`, `?room=`, `?limit=` filters; `?id=<drawer_id>` returns one full drawer |
+| `GET /api/code-maps` | Code-map rows with `?repo=`, `?area=`, `?limit=` filters |
+| `GET /api/sessions` | Compact collab session summaries with `?limit=` (plan refs only, no full bodies) |
+| `GET /api/report` | Metrics report JSON with optional `?task=`, `?since=`, `?limit=` filters |
 
 ### Excluded benchmark crates
 

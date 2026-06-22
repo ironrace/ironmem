@@ -6,6 +6,8 @@
 //! `GET`/`HEAD`, and has no write paths.
 //!
 //! See `ironmem dashboard --help` for the CLI surface.
-pub mod data;
-pub mod routes;
-pub mod server;
+pub(crate) mod data;
+pub(crate) mod routes;
+mod server;
+
+pub use server::{run_dashboard, DashboardConfig};

@@ -85,7 +85,7 @@ fn task_outcome_key(outcome: &TaskOutcome) -> String {
         .unwrap_or_else(|| outcome.task_tag.clone())
 }
 
-fn validate_since(since: Option<&str>) -> Result<Option<String>, MemoryError> {
+pub(crate) fn validate_since(since: Option<&str>) -> Result<Option<String>, MemoryError> {
     let Some(since) = since else {
         return Ok(None);
     };
