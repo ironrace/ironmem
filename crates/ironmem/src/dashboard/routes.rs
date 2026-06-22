@@ -18,8 +18,9 @@ use hyper::header::{ALLOW, CONTENT_TYPE};
 use hyper::{Method, Request, Response, StatusCode};
 
 use crate::dashboard::data::{
-    drawer_detail, list_code_maps, list_sessions, memory_summary, report_projection, CodeMapParams,
-    MemoryParams, SessionParams, DEFAULT_LIMIT, MAX_DASHBOARD_LIMIT,
+    drawer_detail, enrich_code_maps, list_code_maps, list_sessions, memory_summary,
+    report_projection, CodeMapParams, MemoryParams, SessionParams, DEFAULT_LIMIT,
+    MAX_DASHBOARD_LIMIT,
 };
 use crate::dashboard::server::ServerState;
 use crate::db::schema::Database;
@@ -162,7 +163,10 @@ async fn handle_code_maps(state: Arc<ServerState>, query: &str) -> HyperResponse
     match tokio::task::spawn_blocking(move || -> Result<serde_json::Value, MemoryError> {
         let db = Database::open_read_only(&db_path)?;
         let maps = list_code_maps(&db, &params)?;
-        serde_json::to_value(&maps).map_err(MemoryError::from)
+        // Per-row freshness: real `classify` when the repo path resolves, else
+        // a build-age badge. Bounded by the same limit clamp as the listing.
+        let views = enrich_code_maps(maps, chrono::Utc::now());
+        serde_json::to_value(&views).map_err(MemoryError::from)
     })
     .await
     {

@@ -289,6 +289,113 @@ pub(crate) fn list_code_maps_conn(
     Ok(rows)
 }
 
+// ────────────────────────────────────────────────────────────────────────────
+// Code-map freshness (GAP 2: per-row freshness badge — hybrid)
+// ────────────────────────────────────────────────────────────────────────────
+
+use std::path::Path;
+
+use chrono::{DateTime, Utc};
+
+use crate::code_maps::freshness::{classify, Freshness};
+
+/// A built-age bucket, used only when a map's `repo` path cannot be resolved to
+/// a real git worktree (so the real `classify` engine cannot run).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgeBucket {
+    /// Built within [`AGE_FRESH_DAYS`].
+    Fresh,
+    /// Built within [`AGE_AGING_DAYS`].
+    Aging,
+    /// Older than [`AGE_AGING_DAYS`].
+    Stale,
+    /// `built_at` could not be parsed as a timestamp.
+    Unknown,
+}
+
+/// Per-row freshness badge. When the map's `repo` path resolves to a git
+/// worktree we report the real [`Freshness`] outcome; otherwise we fall back to
+/// a coarse build-age bucket so the row is never left without a signal.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum FreshnessBadge {
+    /// Real engine: no tracked source file changed since the map was built.
+    Fresh,
+    /// Real engine: tracked source files changed since the map was built.
+    Stale { changed_files: usize },
+    /// Real engine: the map cannot be trusted; a full re-scout is required.
+    Rescout { reason: String },
+    /// Fallback: `repo` path is not a resolvable git worktree — age-only signal.
+    Age { bucket: AgeBucket },
+}
+
+/// A code-map row enriched with a freshness badge for the dashboard. The
+/// original [`CodeMap`] fields are flattened so existing UI/consumers keep
+/// reading `repo`/`area`/`head_sha`/… unchanged; only `freshness` is added.
+#[derive(Debug, Clone, Serialize)]
+pub struct CodeMapView {
+    #[serde(flatten)]
+    pub map: CodeMap,
+    pub freshness: FreshnessBadge,
+}
+
+/// Newer than this (in days) is [`AgeBucket::Fresh`].
+const AGE_FRESH_DAYS: i64 = 7;
+/// Newer than this (in days) is [`AgeBucket::Aging`]; older is [`AgeBucket::Stale`].
+const AGE_AGING_DAYS: i64 = 30;
+
+/// Bucket a map's `built_at` timestamp by age relative to `now`. An
+/// unparseable timestamp is [`AgeBucket::Unknown`] (never silently treated as
+/// fresh).
+pub fn age_bucket(built_at: &str, now: DateTime<Utc>) -> AgeBucket {
+    let Ok(built) = DateTime::parse_from_rfc3339(built_at) else {
+        return AgeBucket::Unknown;
+    };
+    let age_days = (now - built.with_timezone(&Utc)).num_days();
+    if age_days < AGE_FRESH_DAYS {
+        AgeBucket::Fresh
+    } else if age_days < AGE_AGING_DAYS {
+        AgeBucket::Aging
+    } else {
+        AgeBucket::Stale
+    }
+}
+
+/// Classify a single code-map row (hybrid):
+/// - If `map.repo` resolves to a real directory, run the real [`classify`]
+///   engine (`git diff` against HEAD) — the canonical absolute worktree path is
+///   stored at write time.
+/// - Otherwise fall back to a build-age bucket derived from `built_at`.
+///
+/// `now` is injected so the age path is deterministic and testable.
+pub fn row_freshness(map: &CodeMap, now: DateTime<Utc>) -> FreshnessBadge {
+    if Path::new(&map.repo).is_dir() {
+        match classify(map, Path::new(&map.repo)) {
+            Freshness::Fresh => FreshnessBadge::Fresh,
+            Freshness::Stale { changed_files } => FreshnessBadge::Stale {
+                changed_files: changed_files.len(),
+            },
+            Freshness::RescoutRequired { reason } => FreshnessBadge::Rescout { reason },
+        }
+    } else {
+        FreshnessBadge::Age {
+            bucket: age_bucket(&map.built_at, now),
+        }
+    }
+}
+
+/// Enrich code-map rows with freshness badges. Pure transform — builds new
+/// [`CodeMapView`] values and never mutates the inputs.
+pub fn enrich_code_maps(maps: Vec<CodeMap>, now: DateTime<Utc>) -> Vec<CodeMapView> {
+    maps.into_iter()
+        .map(|map| {
+            let freshness = row_freshness(&map, now);
+            CodeMapView { map, freshness }
+        })
+        .collect()
+}
+
 fn map_code_map_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<CodeMap> {
     let source_files_json: String = row.get(4)?;
     let source_files: Vec<String> = serde_json::from_str(&source_files_json).map_err(|e| {
@@ -418,6 +525,140 @@ pub(crate) fn list_sessions_conn(
 mod tests {
     use super::*;
     use crate::db::schema::Database;
+
+    // ── freshness (GAP 2: per-code-map-row freshness) ─────────────────────────
+
+    fn ts(s: &str) -> chrono::DateTime<chrono::Utc> {
+        chrono::DateTime::parse_from_rfc3339(s)
+            .unwrap()
+            .with_timezone(&chrono::Utc)
+    }
+
+    fn git(root: &std::path::Path, args: &[&str]) {
+        std::process::Command::new("git")
+            .args(args)
+            .current_dir(root)
+            .output()
+            .unwrap();
+    }
+
+    /// Build a git repo, commit `path`, return (TempDir, root, head_sha).
+    fn git_repo_with(path: &str, content: &str) -> (tempfile::TempDir, std::path::PathBuf, String) {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        git(&root, &["init"]);
+        git(&root, &["config", "user.email", "t@t.com"]);
+        git(&root, &["config", "user.name", "T"]);
+        std::fs::write(root.join(path), content).unwrap();
+        git(&root, &["add", "."]);
+        git(&root, &["commit", "-m", "c1"]);
+        let out = std::process::Command::new("git")
+            .args(["rev-parse", "HEAD"])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+        let sha = String::from_utf8(out.stdout).unwrap().trim().to_string();
+        (dir, root, sha)
+    }
+
+    fn map_with(repo: &str, head_sha: &str, files: Vec<String>, built_at: &str) -> CodeMap {
+        CodeMap {
+            repo: repo.to_string(),
+            area: "core".to_string(),
+            drawer_id: "drawer-1".to_string(),
+            head_sha: head_sha.to_string(),
+            source_files: files,
+            built_by: "tester".to_string(),
+            built_at: built_at.to_string(),
+        }
+    }
+
+    #[test]
+    fn age_bucket_thresholds_and_unparseable() {
+        let now = ts("2026-06-22T00:00:00Z");
+        assert_eq!(age_bucket("2026-06-20T00:00:00Z", now), AgeBucket::Fresh); // 2d
+        assert_eq!(age_bucket("2026-06-14T00:00:00Z", now), AgeBucket::Aging); // 8d
+        assert_eq!(age_bucket("2026-01-01T00:00:00Z", now), AgeBucket::Stale); // ~172d
+        assert_eq!(age_bucket("not-a-timestamp", now), AgeBucket::Unknown);
+    }
+
+    #[test]
+    fn row_freshness_missing_repo_path_falls_back_to_age_badge() {
+        let now = ts("2026-06-22T00:00:00Z");
+        let map = map_with(
+            "/nonexistent/repo/path-xyz",
+            "aabbccdd1122334455667788aabbccdd11223344",
+            vec!["src/lib.rs".to_string()],
+            "2026-06-20T00:00:00Z",
+        );
+        assert_eq!(
+            row_freshness(&map, now),
+            FreshnessBadge::Age {
+                bucket: AgeBucket::Fresh
+            }
+        );
+    }
+
+    #[test]
+    fn row_freshness_resolvable_repo_uses_git_classify_stale() {
+        let (_dir, root, build_sha) = git_repo_with("a.rs", "// v1");
+        // Change the tracked source file after the build SHA.
+        std::fs::write(root.join("a.rs"), "// v2").unwrap();
+        git(&root, &["add", "."]);
+        git(&root, &["commit", "-m", "c2"]);
+
+        let map = map_with(
+            &root.to_string_lossy(),
+            &build_sha,
+            vec!["a.rs".to_string()],
+            "2026-06-20T00:00:00Z",
+        );
+        // `now` is irrelevant on the git branch (path resolves).
+        let now = ts("2026-06-22T00:00:00Z");
+        assert_eq!(
+            row_freshness(&map, now),
+            FreshnessBadge::Stale { changed_files: 1 }
+        );
+    }
+
+    #[test]
+    fn row_freshness_resolvable_repo_uses_git_classify_fresh() {
+        let (_dir, root, build_sha) = git_repo_with("a.rs", "// v1");
+        // Change a DIFFERENT file — the tracked source file is unchanged.
+        std::fs::write(root.join("b.rs"), "// b").unwrap();
+        git(&root, &["add", "."]);
+        git(&root, &["commit", "-m", "c2"]);
+
+        let map = map_with(
+            &root.to_string_lossy(),
+            &build_sha,
+            vec!["a.rs".to_string()],
+            "2026-06-20T00:00:00Z",
+        );
+        let now = ts("2026-06-22T00:00:00Z");
+        assert_eq!(row_freshness(&map, now), FreshnessBadge::Fresh);
+    }
+
+    #[test]
+    fn code_map_view_serializes_flattened_fields_plus_freshness() {
+        let map = map_with(
+            "repo-a",
+            "aabbccdd1122334455667788aabbccdd11223344",
+            vec!["src/lib.rs".to_string()],
+            "2026-01-01T00:00:00Z",
+        );
+        let now = ts("2026-06-22T00:00:00Z"); // ~172d → age:stale (path unresolved)
+        let views = enrich_code_maps(vec![map.clone()], now);
+        let json = serde_json::to_value(&views).unwrap();
+        let row = &json[0];
+        // Original fields are flattened (UI keeps reading them directly).
+        assert_eq!(row["repo"], "repo-a");
+        assert_eq!(row["head_sha"], map.head_sha);
+        assert_eq!(row["area"], "core");
+        // Freshness badge is tagged and, for an unresolved path, an age bucket.
+        assert_eq!(row["freshness"]["kind"], "age");
+        assert_eq!(row["freshness"]["bucket"], "stale");
+    }
 
     // ── model_status_label (GAP 1: warming status) ────────────────────────────
 

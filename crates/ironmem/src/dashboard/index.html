@@ -107,6 +107,19 @@ function renderError(msg) {
   return p;
 }
 
+// Human label for a freshness badge. `age` is the fallback when a map's repo
+// path can't be resolved to a git worktree; the others come from the real
+// classify engine.
+function freshnessLabel(f) {
+  switch (f && f.kind) {
+    case 'fresh': return 'fresh';
+    case 'stale': return 'stale (' + (f.changed_files || 0) + ')';
+    case 'rescout': return 'rescout';
+    case 'age': return 'age: ' + (f.bucket || 'unknown');
+    default: return 'unknown';
+  }
+}
+
 // ── Summary ─────────────────────────────────────────────────────────────────
 
 async function loadSummary() {
@@ -199,15 +212,30 @@ async function loadCodeMaps() {
       return;
     }
     const table = document.createElement('table');
-    table.innerHTML = '<thead><tr><th>Repo</th><th>Area</th><th>Head SHA</th><th>Built By</th><th>Built At</th><th>Files</th></tr></thead>';
+    table.innerHTML = '<thead><tr><th>Repo</th><th>Area</th><th>Freshness</th><th>Head SHA</th><th>Built By</th><th>Built At</th><th>Files</th></tr></thead>';
     const tbody = document.createElement('tbody');
     rows.forEach(row => {
       const tr = document.createElement('tr');
-      const vals = [row.repo, row.area, (row.head_sha||'').slice(0,12), row.built_by, row.built_at, (row.source_files||[]).length + ' files'];
-      vals.forEach((v, i) => {
+      // Repo + Area cells.
+      [row.repo, row.area].forEach(v => {
         const td = document.createElement('td');
         td.textContent = v || '';
-        if (i === 2) { td.style.fontFamily = 'monospace'; td.style.fontSize = '0.8rem'; }
+        tr.appendChild(td);
+      });
+      // Freshness badge cell (textContent only — never innerHTML).
+      const fcell = document.createElement('td');
+      const f = row.freshness || {};
+      const badge = document.createElement('span');
+      badge.className = 'badge ' + (f.kind || '');
+      badge.textContent = freshnessLabel(f);
+      fcell.appendChild(badge);
+      tr.appendChild(fcell);
+      // Remaining provenance cells.
+      const rest = [(row.head_sha||'').slice(0,12), row.built_by, row.built_at, (row.source_files||[]).length + ' files'];
+      rest.forEach((v, i) => {
+        const td = document.createElement('td');
+        td.textContent = v || '';
+        if (i === 0) { td.style.fontFamily = 'monospace'; td.style.fontSize = '0.8rem'; }
         tr.appendChild(td);
       });
       tbody.appendChild(tr);

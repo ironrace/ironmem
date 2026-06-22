@@ -292,6 +292,25 @@ async fn summary_surfaces_model_status_alongside_total_drawers() {
 }
 
 #[tokio::test]
+async fn code_maps_carry_per_row_freshness_with_head_sha() {
+    // GAP 2: each row gains a freshness badge. The fixture's repo path
+    // ("repo-a") is not a resolvable worktree, so it falls back to an age
+    // bucket — head_sha is always present for provenance.
+    let fx = fixture();
+    let resp = handle_code_maps(Arc::clone(&fx.state), "repo=repo-a&area=core&limit=10").await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let json: serde_json::Value = serde_json::from_str(&body_text(resp).await).unwrap();
+    let row = &json.as_array().unwrap()[0];
+
+    // Provenance: original fields still flattened in.
+    assert_eq!(row["head_sha"], "aabbccdd1122334455667788aabbccdd11223344");
+    assert_eq!(row["repo"], "repo-a");
+    // Hybrid fallback: unresolved path → age badge (built_at 2026-01-01 is old).
+    assert_eq!(row["freshness"]["kind"], "age");
+    assert_eq!(row["freshness"]["bucket"], "stale");
+}
+
+#[tokio::test]
 async fn invalid_params_return_safe_400_bodies() {
     let fx = fixture();
 
@@ -409,6 +428,26 @@ fn dashboard_html_surfaces_model_status_with_readiness_framing() {
         DASHBOARD_HTML.to_lowercase().contains("readiness"),
         "summary UI must frame model status as readiness, not content"
     );
+}
+
+#[test]
+fn dashboard_html_renders_code_map_freshness_badge() {
+    // GAP 2 UI: code-maps table has a Freshness column fed by row.freshness,
+    // rendered via textContent (never innerHTML) so it stays XSS-safe.
+    assert!(
+        DASHBOARD_HTML.contains("Freshness"),
+        "code-maps table must have a Freshness column header"
+    );
+    assert!(
+        DASHBOARD_HTML.contains("row.freshness"),
+        "freshness badge must read row.freshness"
+    );
+    assert!(
+        DASHBOARD_HTML.contains("freshnessLabel"),
+        "freshness badge must derive its label via freshnessLabel()"
+    );
+    // The badge text must be assigned via textContent, never innerHTML.
+    assert!(DASHBOARD_HTML.contains("badge.textContent"));
 }
 
 // ── method_not_allowed ───────────────────────────────────────────────────
