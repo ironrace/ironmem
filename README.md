@@ -511,11 +511,34 @@ ironmem dashboard --port 0 --json
 | Route | Description |
 |---|---|
 | `GET /` | Single-page HTML dashboard (Memory / Code Maps / Sessions / Reports) |
-| `GET /api/summary` | Quick headline counts (total drawers, wings, KG stats, schema version) |
+| `GET /api/summary` | Quick headline counts (total drawers, wings, KG stats, schema version) + `model_status` warming label |
 | `GET /api/memory` | Drawer list with `?wing=`, `?room=`, `?limit=` filters; `?id=<drawer_id>` returns one full drawer |
-| `GET /api/code-maps` | Code-map rows with `?repo=`, `?area=`, `?limit=` filters |
+| `GET /api/code-maps` | Code-map rows with `?repo=`, `?area=`, `?limit=` filters; each row carries a `freshness` badge |
 | `GET /api/sessions` | Compact collab session summaries with `?limit=` (plan refs only, no full bodies) |
 | `GET /api/report` | Metrics report JSON with optional `?task=`, `?since=`, `?limit=` filters |
+
+**Warming status (`model_status`):** `/api/summary` reports embed-model cache
+readiness as `ready` / `missing` / `corrupt` / `unreadable`. This answers *"can
+it embed?"* (model files present and intact) — **not** whether memory is
+populated (that's `total_drawers`). The UI surfaces both so warming is never
+misread as content readiness. The status is checksummed **once at startup**
+(the model is hundreds of MB, so it never runs per request); restart the
+dashboard to re-check after a model finishes downloading.
+
+**Code-map freshness:** each `/api/code-maps` row carries a `freshness` badge
+computed with a hybrid strategy. When the map's stored canonical worktree path
+resolves, the real freshness engine runs (`git diff` against `HEAD`) and reports
+`fresh` / `stale` (with changed-file count) / `rescout`. When the path is not a
+resolvable git worktree, it falls back to a build-age bucket (`fresh` <7d /
+`aging` <30d / `stale`) derived from `built_at`. `head_sha` is always shown for
+provenance.
+
+**Remediation hints:** each section links to the real CLI command that acts on
+it — `ironmem mine <dir>` and `ironmem reembed` for memory, `ironmem mine <dir>`
++ `ironmem doctor` for stale/rescout maps (there is no `code-map refresh`
+subcommand), `ironmem report` for sessions/metrics, and `ironmem doctor` /
+`ironmem context` for cache health. These are static text — no user-controlled
+data is rendered.
 
 ### Excluded benchmark crates
 

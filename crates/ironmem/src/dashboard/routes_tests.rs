@@ -450,6 +450,30 @@ fn dashboard_html_renders_code_map_freshness_badge() {
     assert!(DASHBOARD_HTML.contains("badge.textContent"));
 }
 
+#[test]
+fn dashboard_html_shows_real_remediation_commands_per_section() {
+    // GAP 3: every section points to REAL ironmem commands. Static text only —
+    // no user-controlled data, no invented subcommands.
+    for cmd in [
+        "ironmem mine",
+        "ironmem reembed",
+        "ironmem report",
+        "ironmem doctor",
+        "ironmem context",
+    ] {
+        assert!(
+            DASHBOARD_HTML.contains(cmd),
+            "missing remediation command: {cmd}"
+        );
+    }
+    // There is no `code-map refresh` subcommand — stale maps must point to
+    // re-mining / doctor, never an invented command.
+    assert!(
+        !DASHBOARD_HTML.contains("code-map refresh"),
+        "invented `code-map refresh` command must not appear"
+    );
+}
+
 // ── method_not_allowed ───────────────────────────────────────────────────
 
 #[test]

@@ -55,6 +55,7 @@
 
 <div id="memory" class="section">
   <h2>Memory Drawers</h2>
+  <p class="hint">Populate memory with <code>ironmem mine &lt;dir&gt;</code>; rebuild embeddings after a model change with <code>ironmem reembed</code>.</p>
   <div class="filter-row">
     <input id="mem-wing" placeholder="wing (optional)" style="width:150px">
     <input id="mem-room" placeholder="room (optional)" style="width:150px">
@@ -66,6 +67,7 @@
 
 <div id="codemaps" class="section">
   <h2>Code Maps</h2>
+  <p class="hint">A <span class="badge stale">stale</span> or <span class="badge rescout">rescout</span> map is refreshed by re-mining its area with <code>ironmem mine &lt;dir&gt;</code>; verify cache health with <code>ironmem doctor</code>.</p>
   <div class="filter-row">
     <input id="cm-repo" placeholder="repo (optional)" style="width:200px">
     <input id="cm-area" placeholder="area (optional)" style="width:150px">
@@ -76,11 +78,13 @@
 
 <div id="sessions" class="section">
   <h2>Collab Sessions</h2>
+  <p class="hint">Summarize token spend and outcomes across sessions with <code>ironmem report</code>.</p>
   <div id="sessions-table"><p class="loading">Loading…</p></div>
 </div>
 
 <div id="reports" class="section">
   <h2>Metrics Report</h2>
+  <p class="hint">This mirrors <code>ironmem report</code> on the CLI (pass <code>--task</code> / <code>--since</code> to scope it).</p>
   <div class="filter-row">
     <input id="rpt-task" placeholder="task (optional)" style="width:200px">
     <input id="rpt-since" placeholder="since YYYY-MM-DD (optional)" style="width:180px">
