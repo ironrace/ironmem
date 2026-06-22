@@ -2,7 +2,8 @@
 """Lint for the public benchmark methodology doc (issue #146).
 
 Asserts that ``docs/BENCHMARKS.md`` exists, covers the required methodology
-sections, distinguishes measured rows from estimates, ships reproduction
+sections (as real headings, not incidental prose), distinguishes measured rows
+from estimates, states a current-baseline status, ships runnable reproduction
 commands, makes no unsupported headline savings claim, and is linked from both
 the README and the marketing site.
 
@@ -15,6 +16,7 @@ import os
 import pathlib
 import re
 import sys
+from typing import NoReturn
 
 ROOT = pathlib.Path(
     os.environ.get(
@@ -27,57 +29,83 @@ DOC = ROOT / "docs" / "BENCHMARKS.md"
 README = ROOT / "README.md"
 SITE = ROOT / "site" / "index.html"
 
-# (label, regex) — each must appear at least once in the methodology doc.
-REQUIRED_SECTIONS = [
+# Required sections — each must appear as an actual Markdown heading, so a
+# passing mention in prose or a cross-reference line cannot satisfy the gate.
+# The measured-vs-estimated distinction and the baseline-status criterion are
+# enforced here too, as their own required headings.
+REQUIRED_SECTION_HEADINGS = [
     ("corpus selection", r"corpus\s+selection"),
     ("harness setup", r"harness\s+setup"),
     ("token accounting", r"token\s+accounting"),
     ("quality gates", r"quality\s+gates"),
     ("sample-size requirements", r"sample[- ]size\s+requirements"),
+    ("measured vs estimated", r"measured\s+vs\.?\s+estimated"),
+    ("current baseline status", r"current\s+baseline\s+status"),
 ]
 
-# The measured-vs-estimated distinction must be explicit.
-MEASURED_VS_ESTIMATED = r"measured[ -].{0,40}estimat"
+# Reproduction: a fenced code block carrying a real runner command.
+REPRO_COMMAND = re.compile(r"\b(cargo run|abeval|ironmem report)\b", re.IGNORECASE)
 
-# A reproduction surface must be present (a fenced command block reference).
-REPRODUCTION = r"reproduc"
-
-# Unsupported headline savings claim guard. A bare percentage tied to a
-# savings/fewer/faster word is only allowed when the same line is explicitly
-# qualified as not-yet-measured / illustrative / a target. Any unqualified
-# "NN% fewer/faster/savings/reduction" headline is a violation.
+# Unsupported headline savings claim guard. A quantified magnitude (NN%,
+# NN percent, or NNx) co-occurring on one line with a savings verb/noun is a
+# violation — UNLESS the same line carries an explicit disclaimer. The verb set
+# is deliberately broad (the doc's own thesis uses "lower"/"fewer"), and both
+# orderings (number-then-word and word-then-number) are caught.
+_MAGNITUDE = r"\d+(?:\.\d+)?\s*(?:%|percent|x\b)"
+_SAVINGS_WORD = (
+    r"(?:fewer|faster|savings?|saves?|saved|saving|reduction|reduces?|reduced|"
+    r"lowers?|lowered|lowering|cuts?|halves?|halve|cheaper|less)"
+)
 SAVINGS_CLAIM = re.compile(
-    r"\b\d+(?:\.\d+)?\s*%[^.\n]*\b(fewer|faster|savings?|saved|reduction|reduced|less)\b",
+    rf"{_MAGNITUDE}[^.\n]{{0,60}}\b{_SAVINGS_WORD}\b"
+    rf"|\b{_SAVINGS_WORD}\b[^.\n]{{0,60}}{_MAGNITUDE}",
     re.IGNORECASE,
 )
+# Explicit disclaimers only — not loose words like "target" that occur in
+# unrelated prose ("on target hardware").
 QUALIFIER = re.compile(
-    r"not\s+yet\s+measured|no\s+headline|illustrative|hypothes|target|example only|"
-    r"placeholder|not\s+a\s+(?:measured|savings)\s+claim|do\s+not\s+(?:read|treat)",
+    r"not\s+yet\s+measured|not\s+measured|no\s+headline|"
+    r"not\s+a\s+(?:measured|savings)\s+claim|hypothetical|illustrative|"
+    r"for\s+illustration|example\s+only|placeholder|do\s+not\s+(?:read|treat)",
     re.IGNORECASE,
 )
 
 
-def fail(msg: str) -> None:
+def _disp(path: pathlib.Path) -> str:
+    try:
+        return str(path.relative_to(ROOT))
+    except ValueError:
+        return str(path)
+
+
+def fail(msg: str) -> NoReturn:
     print(f"check_benchmark_methodology: FAIL — {msg}", file=sys.stderr)
     sys.exit(1)
 
 
+def read(path: pathlib.Path, what: str) -> str:
+    if not path.is_file():
+        fail(f"{what} not found: {_disp(path)}")
+    try:
+        return path.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError) as exc:
+        fail(f"could not read {what} ({_disp(path)}): {exc}")
+
+
+def heading_present(text: str, pattern: str) -> bool:
+    return re.search(rf"^#{{1,6}}\s+.*{pattern}", text, re.IGNORECASE | re.MULTILINE) is not None
+
+
 def main() -> None:
-    if not DOC.is_file():
-        fail(f"missing methodology doc: {DOC.relative_to(ROOT)}")
+    text = read(DOC, "methodology doc")
 
-    text = DOC.read_text(encoding="utf-8")
-    low = text.lower()
+    for label, pattern in REQUIRED_SECTION_HEADINGS:
+        if not heading_present(text, pattern):
+            fail(f"methodology doc missing required section heading: {label!r}")
 
-    for label, pattern in REQUIRED_SECTIONS:
-        if not re.search(pattern, low):
-            fail(f"methodology doc missing required section: {label!r}")
-
-    if not re.search(MEASURED_VS_ESTIMATED, low):
-        fail("methodology doc must distinguish measured rows from estimates")
-
-    if not re.search(REPRODUCTION, low):
-        fail("methodology doc must include reproduction commands / locations")
+    fenced = re.findall(r"```.*?```", text, re.DOTALL)
+    if not any(REPRO_COMMAND.search(block) for block in fenced):
+        fail("methodology doc must include a fenced reproduction-command block")
 
     for ln_no, line in enumerate(text.splitlines(), start=1):
         if SAVINGS_CLAIM.search(line) and not QUALIFIER.search(line):
@@ -86,14 +114,10 @@ def main() -> None:
                 f"docs/BENCHMARKS.md:{ln_no}: {line.strip()!r}"
             )
 
-    if not README.is_file():
-        fail("README.md not found")
-    if "docs/BENCHMARKS.md" not in README.read_text(encoding="utf-8"):
+    if "docs/BENCHMARKS.md" not in read(README, "README.md"):
         fail("README.md does not link to docs/BENCHMARKS.md")
 
-    if not SITE.is_file():
-        fail("site/index.html not found")
-    if "docs/BENCHMARKS.md" not in SITE.read_text(encoding="utf-8"):
+    if "docs/BENCHMARKS.md" not in read(SITE, "site/index.html"):
         fail("site/index.html does not link to docs/BENCHMARKS.md")
 
     print("check_benchmark_methodology: OK")

@@ -92,7 +92,7 @@ tokens_to_done(task) = Σ (input + output
   (`input = input_tokens − cached_input_tokens`), because Codex's `input_tokens`
   includes cache reads; a literal field copy would inflate Codex tokens by ~85%.
   Codex tokens count toward `tokens_to_done` but Codex cost is left unpriced —
-  it is a different provider ([METRICS_SPEC §7.2, §12](METRICS_SPEC.md)).
+  it is a different provider ([METRICS_SPEC §7.2, §12 2026-06-17](METRICS_SPEC.md)).
 
 ### Measured vs estimated
 
