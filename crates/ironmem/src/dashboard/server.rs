@@ -15,7 +15,7 @@ use std::time::Duration;
 
 use hyper::server::conn::http1;
 use hyper::service::service_fn;
-use hyper_util::rt::TokioIo;
+use hyper_util::rt::{TokioIo, TokioTimer};
 use hyper_util::server::graceful::GracefulShutdown;
 use tokio::net::TcpListener;
 
@@ -141,6 +141,9 @@ pub async fn run_dashboard(cfg: DashboardConfig) -> Result<(), MemoryError> {
                                 async move { handle_request(req, state).await }
                             });
                             let conn = http1::Builder::new()
+                                // A timer is required for `header_read_timeout`
+                                // to fire; without it hyper panics at runtime.
+                                .timer(TokioTimer::new())
                                 .header_read_timeout(HEADER_READ_TIMEOUT)
                                 .serve_connection(io, svc);
                             if let Err(e) = watcher.watch(conn).await {
@@ -226,6 +229,25 @@ mod tests {
         let host = IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4));
         assert!(cfg_for(host, false).validate_host().is_err());
         assert!(cfg_for(host, true).validate_host().is_ok());
+    }
+
+    #[test]
+    fn ipv6_loopback_is_accepted_and_non_loopback_v6_is_rejected() {
+        use std::net::Ipv6Addr;
+        // ::1 is the IPv6 loopback — must be accepted without the flag.
+        let loopback = IpAddr::V6(Ipv6Addr::LOCALHOST);
+        assert!(cfg_for(loopback, false).validate_host().is_ok());
+
+        // 2001:db8::1 is a documentation (non-loopback) address — must be
+        // rejected unless --allow-non-loopback is set.
+        let non_loopback = IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1));
+        let err = cfg_for(non_loopback, false).validate_host().unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("non-loopback") && msg.contains("allow-non-loopback"),
+            "v6 rejection must mention the flag: {msg}"
+        );
+        assert!(cfg_for(non_loopback, true).validate_host().is_ok());
     }
 
     #[test]
