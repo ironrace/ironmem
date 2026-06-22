@@ -166,7 +166,33 @@ Each launcher:
 4. Warms the repo into memory on a best-effort basis (a warm failure is logged
    but does not block launch — the assistant's own MCP server bootstraps on
    `serve`).
-5. Launches the assistant with the repo as its working directory.
+5. **Pre-injects a compact context block** into the initial prompt when you
+   pass one — relevant memory, known decisions, and per-area code-map freshness
+   — so the assistant starts with context instead of exploring from scratch. The
+   block is bounded to a token budget, sanitized (recalled memory is framed as
+   untrusted reference text and cannot open a code fence in the prompt), and
+   skipped when there is nothing relevant to add. This is best-effort: a build
+   failure falls back to your bare prompt and never blocks launch.
+6. Launches the assistant with the repo as its working directory.
+
+Pre-injection is driven by your prompt (the task) and any `--area` flags:
+
+```bash
+ironmem claude . "fix the login bug" --area auth --area session
+```
+
+To preview exactly what would be injected, run the same inputs through the
+context command:
+
+```bash
+ironmem context --repo . --task "fix the login bug" --area auth --area session
+```
+
+Tune or disable pre-injection:
+
+- `--budget <tokens>` — change the context budget (default 2000).
+- `--no-context` — skip pre-injection for a single launch.
+- `IRONMEM_LAUNCHER_NO_CONTEXT=1` — disable pre-injection for the environment.
 
 If you manage MCP configuration yourself, pass `--no-mcp-setup` to skip step 3:
 
