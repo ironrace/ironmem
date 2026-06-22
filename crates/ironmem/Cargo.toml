@@ -29,7 +29,11 @@ ironrace-embed = { version = "0.3.4", path = "../ironrace-embed" }
 ironrace-pref-extract = { version = "0.3.4", path = "../ironrace-pref-extract" }
 ironrace-rerank = { version = "0.4.0", path = "../ironrace-rerank" }
 
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "io-std", "io-util"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "io-std", "io-util", "net", "signal"] }
+hyper = { version = "1", features = ["http1", "server"] }
+hyper-util = { version = "0.1", features = ["server", "server-graceful", "tokio", "http1"] }
+http-body-util = "0.1"
+bytes = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 rusqlite = { version = "0.32", features = ["bundled"] }

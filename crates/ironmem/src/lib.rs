@@ -46,5 +46,8 @@ pub mod launcher;
 
 pub mod write_rules;
 
+/// Local read-only dashboard HTTP server (issue #165).
+pub mod dashboard;
+
 /// Canonical crate error type used by CLI, MCP, and storage layers.
 pub use error::MemoryError;

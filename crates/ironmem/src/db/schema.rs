@@ -3,6 +3,7 @@ use std::time::Duration;
 
 use rusqlite::{Connection, Transaction};
 
+use crate::db::ReadOnlyDb;
 use crate::error::MemoryError;
 use ironrace_embed::embedder::EMBED_DIM;
 
@@ -54,6 +55,45 @@ impl Database {
         }
 
         Ok(Self { conn })
+    }
+
+    /// Open an EXISTING database **read-only** and **without migration**.
+    ///
+    /// Designed for the dashboard server, which must never create, modify, or
+    /// migrate the database file. Uses `SQLITE_OPEN_READ_ONLY | NO_MUTEX` so a
+    /// missing file fails fast instead of being silently created. No WAL pragma,
+    /// no `create_dir_all`, no `migrate`. `PRAGMA foreign_keys=ON` is the only
+    /// pragma executed — it is safe in read-only mode.
+    ///
+    /// Returns [`ReadOnlyDb`], a thin newtype exposing only read/query methods,
+    /// so a dashboard handler that tries to write fails to compile rather than at
+    /// runtime.
+    ///
+    /// A missing file is handled by SQLite itself: opening with
+    /// `SQLITE_OPEN_READ_ONLY` (and no `SQLITE_OPEN_CREATE`) errors with
+    /// `SQLITE_CANTOPEN` and creates nothing. That open error is mapped to the
+    /// same descriptive `db not found at <path>` message — no TOCTOU
+    /// `path.exists()` pre-check is performed.
+    pub fn open_read_only(path: &Path) -> Result<ReadOnlyDb, MemoryError> {
+        let conn = Connection::open_with_flags(
+            path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )
+        .map_err(|e| match e {
+            rusqlite::Error::SqliteFailure(
+                rusqlite::ffi::Error {
+                    code: rusqlite::ErrorCode::CannotOpen,
+                    ..
+                },
+                _,
+            ) => MemoryError::NotFound(format!("db not found at {}", path.display())),
+            other => MemoryError::Db(other),
+        })?;
+        conn.busy_timeout(Duration::from_secs(5))?;
+        conn.execute_batch("PRAGMA foreign_keys=ON;")?;
+        Ok(ReadOnlyDb {
+            inner: Self { conn },
+        })
     }
 
     /// Open an EXISTING database with a caller-bounded busy timeout and **no
@@ -380,6 +420,58 @@ mod tests {
         }
         // Re-open without migrating; the persisted version is still readable.
         let db = Database::open(&path).unwrap();
+        assert_eq!(db.schema_version().unwrap(), LATEST_SCHEMA_VERSION);
+    }
+
+    // ---- open_read_only tests ----
+
+    #[test]
+    fn open_read_only_errors_on_missing_file_and_creates_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("nonexistent.sqlite3");
+        assert!(!path.exists(), "precondition: file must not exist");
+        let result = Database::open_read_only(&path);
+        assert!(result.is_err(), "open_read_only of missing path must error");
+        assert!(
+            !path.exists(),
+            "open_read_only must NOT create the file on error"
+        );
+    }
+
+    #[test]
+    fn open_read_only_does_not_upgrade_schema() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ro.sqlite3");
+        // Create + fully migrate a db.
+        {
+            let db = Database::open(&path).unwrap();
+            db.migrate().unwrap();
+        }
+        let version_before = {
+            let db = Database::open(&path).unwrap();
+            db.schema_version().unwrap()
+        };
+        // Open read-only — must not change schema version.
+        let db_ro = Database::open_read_only(&path).unwrap();
+        let version_after = db_ro.schema_version().unwrap();
+        assert_eq!(
+            version_before, version_after,
+            "open_read_only must not alter schema_version"
+        );
+        assert_eq!(version_after, LATEST_SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn open_read_only_schema_version_mismatch_is_readable() {
+        // Verify that schema_version() works on a read-only connection so the
+        // dashboard can report version mismatches without write access.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sv.sqlite3");
+        {
+            let db = Database::open(&path).unwrap();
+            db.migrate().unwrap();
+        }
+        let db = Database::open_read_only(&path).unwrap();
         assert_eq!(db.schema_version().unwrap(), LATEST_SCHEMA_VERSION);
     }
 

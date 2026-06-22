@@ -186,6 +186,39 @@ fn cli_init_mine_serve_and_hook_smoke_test() {
 }
 
 #[test]
+fn cli_dashboard_rejects_invalid_host() {
+    let temp = tempfile::tempdir().unwrap();
+    let home = temp.path().join("home");
+    let db_path = temp.path().join("memory.sqlite3");
+    std::fs::create_dir_all(&home).unwrap();
+
+    // Migrate a DB so startup gets past schema checks and fails only on host.
+    {
+        let db = Database::open(&db_path).unwrap();
+        db.migrate().unwrap();
+    }
+
+    let out = base_command(&home, &db_path)
+        .arg("dashboard")
+        .arg("--host")
+        .arg("not-an-ip")
+        .arg("--port")
+        .arg("0")
+        .output()
+        .unwrap();
+
+    assert!(
+        !out.status.success(),
+        "dashboard with invalid host must exit non-zero: {out:?}"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("invalid host"),
+        "stderr must mention invalid host: {stderr}"
+    );
+}
+
+#[test]
 fn cli_report_json_smoke_test() {
     let temp = tempfile::tempdir().unwrap();
     let home = temp.path().join("home");

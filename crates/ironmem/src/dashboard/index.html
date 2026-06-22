@@ -1,0 +1,288 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ironmem dashboard</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: system-ui, sans-serif; background: #0f0f0f; color: #e0e0e0; padding: 1rem; }
+  h1 { color: #c9a0dc; margin-bottom: 1.5rem; font-size: 1.5rem; }
+  h2 { color: #a78bfa; margin: 1.5rem 0 0.75rem; font-size: 1.1rem; border-bottom: 1px solid #333; padding-bottom: 0.25rem; }
+  .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 1rem; margin-bottom: 1.5rem; }
+  .card { background: #1a1a2e; border: 1px solid #333; border-radius: 8px; padding: 1rem; }
+  .stat { font-size: 2rem; font-weight: bold; color: #c9a0dc; }
+  .label { font-size: 0.8rem; color: #888; margin-top: 0.25rem; }
+  table { width: 100%; border-collapse: collapse; font-size: 0.85rem; }
+  th { text-align: left; padding: 0.4rem 0.6rem; color: #888; font-weight: 500; border-bottom: 1px solid #333; }
+  td { padding: 0.4rem 0.6rem; border-bottom: 1px solid #222; vertical-align: top; word-break: break-word; }
+  tr:hover td { background: #1f1f3a; }
+  .badge { display: inline-block; padding: 0.15rem 0.4rem; border-radius: 4px; font-size: 0.75rem; background: #2a2a4a; color: #a78bfa; }
+  .error { color: #f87171; font-size: 0.85rem; padding: 0.5rem; }
+  .loading { color: #888; font-style: italic; font-size: 0.85rem; }
+  .filter-row { display: flex; gap: 0.5rem; margin-bottom: 0.75rem; flex-wrap: wrap; }
+  input, select { background: #1a1a2e; border: 1px solid #444; color: #e0e0e0; padding: 0.3rem 0.5rem; border-radius: 4px; font-size: 0.85rem; }
+  button { background: #4c1d95; border: none; color: #e0e0e0; padding: 0.3rem 0.8rem; border-radius: 4px; cursor: pointer; font-size: 0.85rem; }
+  button:hover { background: #6d28d9; }
+  pre { background: #111; border: 1px solid #333; border-radius: 4px; padding: 0.75rem; font-size: 0.8rem; overflow-x: auto; white-space: pre-wrap; max-height: 300px; overflow-y: auto; }
+  .section { margin-bottom: 2rem; }
+  nav { display: flex; gap: 0.75rem; margin-bottom: 1.5rem; flex-wrap: wrap; }
+  nav a { color: #a78bfa; text-decoration: none; padding: 0.3rem 0.75rem; border: 1px solid #444; border-radius: 20px; font-size: 0.85rem; }
+  nav a:hover { background: #1a1a2e; }
+</style>
+</head>
+<body>
+<h1>ironmem dashboard</h1>
+<nav>
+  <a href="#summary">Summary</a>
+  <a href="#memory">Memory</a>
+  <a href="#codemaps">Code Maps</a>
+  <a href="#sessions">Sessions</a>
+  <a href="#reports">Reports</a>
+</nav>
+
+<div id="summary" class="section">
+  <h2>Summary</h2>
+  <div id="summary-grid" class="grid"><p class="loading">Loading…</p></div>
+</div>
+
+<div id="memory" class="section">
+  <h2>Memory Drawers</h2>
+  <div class="filter-row">
+    <input id="mem-wing" placeholder="wing (optional)" style="width:150px">
+    <input id="mem-room" placeholder="room (optional)" style="width:150px">
+    <input id="mem-limit" type="number" value="50" min="1" max="500" style="width:80px">
+    <button onclick="loadMemory()">Filter</button>
+  </div>
+  <div id="memory-table"><p class="loading">Loading…</p></div>
+</div>
+
+<div id="codemaps" class="section">
+  <h2>Code Maps</h2>
+  <div class="filter-row">
+    <input id="cm-repo" placeholder="repo (optional)" style="width:200px">
+    <input id="cm-area" placeholder="area (optional)" style="width:150px">
+    <button onclick="loadCodeMaps()">Filter</button>
+  </div>
+  <div id="codemaps-table"><p class="loading">Loading…</p></div>
+</div>
+
+<div id="sessions" class="section">
+  <h2>Collab Sessions</h2>
+  <div id="sessions-table"><p class="loading">Loading…</p></div>
+</div>
+
+<div id="reports" class="section">
+  <h2>Metrics Report</h2>
+  <div class="filter-row">
+    <input id="rpt-task" placeholder="task (optional)" style="width:200px">
+    <input id="rpt-since" placeholder="since YYYY-MM-DD (optional)" style="width:180px">
+    <button onclick="loadReport()">Load</button>
+  </div>
+  <div id="report-output"><p class="loading">Choose filters, then load the report.</p></div>
+</div>
+
+<script>
+'use strict';
+
+function setText(el, v) { el.textContent = String(v == null ? '' : v); }
+
+async function fetchJSON(url) {
+  const r = await fetch(url);
+  if (!r.ok) throw new Error(r.statusText + ' ' + r.status);
+  return r.json();
+}
+
+function renderError(msg) {
+  const p = document.createElement('p');
+  p.className = 'error';
+  p.textContent = 'Error: ' + msg;
+  return p;
+}
+
+// ── Summary ─────────────────────────────────────────────────────────────────
+
+async function loadSummary() {
+  const el = document.getElementById('summary-grid');
+  try {
+    const d = await fetchJSON('/api/summary');
+    el.innerHTML = '';
+    const cards = [
+      ['Total Drawers', d.total_drawers],
+      ['Wings', d.wing_count],
+      ['Schema Version', 'v' + d.schema_version],
+      ['KG Entities', d.kg_stats && d.kg_stats.entity_count],
+      ['KG Triples', d.kg_stats && d.kg_stats.current_triple_count],
+    ];
+    cards.forEach(([label, val]) => {
+      const card = document.createElement('div');
+      card.className = 'card';
+      const stat = document.createElement('div');
+      stat.className = 'stat';
+      setText(stat, val != null ? val : '—');
+      const lbl = document.createElement('div');
+      lbl.className = 'label';
+      lbl.textContent = label;
+      card.appendChild(stat);
+      card.appendChild(lbl);
+      el.appendChild(card);
+    });
+  } catch (e) {
+    el.innerHTML = '';
+    el.appendChild(renderError(e.message));
+  }
+}
+
+// ── Memory ───────────────────────────────────────────────────────────────────
+
+async function loadMemory() {
+  const el = document.getElementById('memory-table');
+  el.innerHTML = '<p class="loading">Loading…</p>';
+  const wing = document.getElementById('mem-wing').value.trim();
+  const room = document.getElementById('mem-room').value.trim();
+  const limit = document.getElementById('mem-limit').value.trim();
+  const params = new URLSearchParams();
+  if (wing) params.set('wing', wing);
+  if (room) params.set('room', room);
+  if (limit) params.set('limit', limit);
+  try {
+    const d = await fetchJSON('/api/memory?' + params.toString());
+    const rows = d.recent_drawers || [];
+    if (rows.length === 0) {
+      el.innerHTML = '<p class="loading">No drawers found.</p>';
+      return;
+    }
+    const table = document.createElement('table');
+    table.innerHTML = '<thead><tr><th>ID</th><th>Wing</th><th>Room</th><th>Preview</th><th>Filed At</th></tr></thead>';
+    const tbody = document.createElement('tbody');
+    rows.forEach(row => {
+      const tr = document.createElement('tr');
+      ['id', 'wing', 'room', 'content_preview', 'filed_at'].forEach((k, i) => {
+        const td = document.createElement('td');
+        td.textContent = row[k] || '';
+        if (i === 0) { td.style.fontFamily = 'monospace'; td.style.fontSize = '0.75rem'; }
+        tr.appendChild(td);
+      });
+      tbody.appendChild(tr);
+    });
+    table.appendChild(tbody);
+    el.innerHTML = '';
+    el.appendChild(table);
+  } catch (e) {
+    el.innerHTML = '';
+    el.appendChild(renderError(e.message));
+  }
+}
+
+// ── Code Maps ────────────────────────────────────────────────────────────────
+
+async function loadCodeMaps() {
+  const el = document.getElementById('codemaps-table');
+  el.innerHTML = '<p class="loading">Loading…</p>';
+  const repo = document.getElementById('cm-repo').value.trim();
+  const area = document.getElementById('cm-area').value.trim();
+  const params = new URLSearchParams();
+  if (repo) params.set('repo', repo);
+  if (area) params.set('area', area);
+  try {
+    const rows = await fetchJSON('/api/code-maps?' + params.toString());
+    if (!rows || rows.length === 0) {
+      el.innerHTML = '<p class="loading">No code maps found.</p>';
+      return;
+    }
+    const table = document.createElement('table');
+    table.innerHTML = '<thead><tr><th>Repo</th><th>Area</th><th>Head SHA</th><th>Built By</th><th>Built At</th><th>Files</th></tr></thead>';
+    const tbody = document.createElement('tbody');
+    rows.forEach(row => {
+      const tr = document.createElement('tr');
+      const vals = [row.repo, row.area, (row.head_sha||'').slice(0,12), row.built_by, row.built_at, (row.source_files||[]).length + ' files'];
+      vals.forEach((v, i) => {
+        const td = document.createElement('td');
+        td.textContent = v || '';
+        if (i === 2) { td.style.fontFamily = 'monospace'; td.style.fontSize = '0.8rem'; }
+        tr.appendChild(td);
+      });
+      tbody.appendChild(tr);
+    });
+    table.appendChild(tbody);
+    el.innerHTML = '';
+    el.appendChild(table);
+  } catch (e) {
+    el.innerHTML = '';
+    el.appendChild(renderError(e.message));
+  }
+}
+
+// ── Sessions ─────────────────────────────────────────────────────────────────
+
+async function loadSessions() {
+  const el = document.getElementById('sessions-table');
+  el.innerHTML = '<p class="loading">Loading…</p>';
+  try {
+    const rows = await fetchJSON('/api/sessions');
+    if (!rows || rows.length === 0) {
+      el.innerHTML = '<p class="loading">No sessions found.</p>';
+      return;
+    }
+    const table = document.createElement('table');
+    table.innerHTML = '<thead><tr><th>ID</th><th>Task</th><th>Branch</th><th>Phase</th><th>Owner</th><th>Tasks</th><th>Updated</th></tr></thead>';
+    const tbody = document.createElement('tbody');
+    rows.forEach(row => {
+      const tr = document.createElement('tr');
+      const vals = [
+        (row.id||'').slice(0,8) + '…',
+        row.task || '(none)',
+        row.branch,
+        row.phase,
+        row.current_owner,
+        row.tasks_count != null ? row.tasks_count : '—',
+        (row.updated_at||'').replace('T',' ').slice(0,16),
+      ];
+      vals.forEach((v, i) => {
+        const td = document.createElement('td');
+        td.textContent = v;
+        if (i === 0) { td.style.fontFamily = 'monospace'; td.style.fontSize = '0.8rem'; td.title = row.id; }
+        tr.appendChild(td);
+      });
+      tbody.appendChild(tr);
+    });
+    table.appendChild(tbody);
+    el.innerHTML = '';
+    el.appendChild(table);
+  } catch (e) {
+    el.innerHTML = '';
+    el.appendChild(renderError(e.message));
+  }
+}
+
+// ── Report ───────────────────────────────────────────────────────────────────
+
+async function loadReport() {
+  const el = document.getElementById('report-output');
+  el.innerHTML = '<p class="loading">Loading…</p>';
+  const task = document.getElementById('rpt-task').value.trim();
+  const since = document.getElementById('rpt-since').value.trim();
+  const params = new URLSearchParams();
+  if (task) params.set('task', task);
+  if (since) params.set('since', since);
+  try {
+    const d = await fetchJSON('/api/report?' + params.toString());
+    const pre = document.createElement('pre');
+    pre.textContent = JSON.stringify(d, null, 2);
+    el.innerHTML = '';
+    el.appendChild(pre);
+  } catch (e) {
+    el.innerHTML = '';
+    el.appendChild(renderError(e.message));
+  }
+}
+
+// ── Bootstrap ────────────────────────────────────────────────────────────────
+
+loadSummary();
+loadMemory();
+loadCodeMaps();
+loadSessions();
+</script>
+</body>
+</html>

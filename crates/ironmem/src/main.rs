@@ -2,7 +2,9 @@ use clap::{Parser, Subcommand};
 use std::process;
 
 use ironmem::MemoryError;
-use ironmem::{bootstrap, config, context, ingest, launcher, mcp, migrate, reembed, report};
+use ironmem::{
+    bootstrap, config, context, dashboard, ingest, launcher, mcp, migrate, reembed, report,
+};
 
 #[derive(Parser)]
 #[command(
@@ -125,6 +127,24 @@ enum Commands {
         /// Approximate token budget for pre-injected context
         #[arg(long, default_value_t = ironmem::context::DEFAULT_BUDGET_TOKENS)]
         budget: usize,
+    },
+    /// Start a local read-only dashboard server for inspecting memory, code maps, sessions, and metrics
+    Dashboard {
+        /// Path to the database
+        #[arg(long)]
+        db: Option<String>,
+        /// Host to bind (default: 127.0.0.1 loopback only)
+        #[arg(long, default_value = "127.0.0.1")]
+        host: String,
+        /// Port to bind (0 = ephemeral)
+        #[arg(long, default_value_t = 7384)]
+        port: u16,
+        /// Allow binding to a non-loopback address (WARNING: exposes dashboard to the network)
+        #[arg(long)]
+        allow_non_loopback: bool,
+        /// Emit startup metadata as JSON instead of prose
+        #[arg(long)]
+        json: bool,
     },
     /// Launch Codex in a repo with the ironmem MCP server attached
     Codex {
@@ -330,6 +350,26 @@ async fn run(cli: Cli) -> Result<(), MemoryError> {
                 budget_tokens: budget,
             },
         ),
+        Commands::Dashboard {
+            db,
+            host,
+            port,
+            allow_non_loopback,
+            json,
+        } => {
+            let cfg = config::Config::load(db)?;
+            let host_addr: std::net::IpAddr = host.parse().map_err(|e| {
+                MemoryError::Validation(format!("invalid host address {host:?}: {e}"))
+            })?;
+            let dash_cfg = dashboard::DashboardConfig {
+                db_path: cfg.db_path.clone(),
+                host: host_addr,
+                port,
+                allow_non_loopback,
+                json_startup: json,
+            };
+            dashboard::run_dashboard(dash_cfg).await
+        }
         Commands::WriteRules { target, workspace } => {
             use ironmem::write_rules::{validate_rules_file, write_rules_file, WriteOutcome};
             let targets: Vec<&str> = match target.as_deref() {
