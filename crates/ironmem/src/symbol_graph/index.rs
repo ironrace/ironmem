@@ -269,9 +269,15 @@ pub fn index_repo(db: &Database, repo_path: &str, force: bool) -> Result<IndexRe
                     &indexed_at,
                 )?;
 
-                // `import` edge: file → module.
-                let edge_id =
-                    sha256_hex_str(&format!("{canonical}:{rel_path}:import:{}", imp.module));
+                // `import` edge: file → module. The id includes the line so two
+                // imports of the same module on distinct lines yield distinct
+                // edges (matching `import_id`); without it the second edge
+                // collides under INSERT OR IGNORE and is silently dropped while
+                // `edges_inserted` still counts it.
+                let edge_id = sha256_hex_str(&format!(
+                    "{canonical}:{rel_path}:import:{}:{}",
+                    imp.module, imp.line
+                ));
                 Database::insert_edge_tx(
                     tx,
                     &edge_id,
@@ -670,6 +676,46 @@ mod tests {
 
         let new_syms = db.lookup_symbols(&canonical, "beta", None, 10).unwrap();
         assert_eq!(new_syms.len(), 1, "new symbol must be present");
+
+        drop(dir);
+    }
+
+    // ── Regression: same-module imports on distinct lines must not collide ──
+    // Two `use std::io::*` statements on different lines yield two import rows
+    // and must yield two distinct `import` edges; `edges_inserted` must equal
+    // the number of edges actually persisted (no INSERT-OR-IGNORE drop +
+    // unconditional overcount).
+    #[test]
+    fn same_module_imports_on_distinct_lines_produce_distinct_edges() {
+        let (dir, root) = make_git_repo();
+        write_file(&root, "lib.rs", "use std::io::Read;\nuse std::io::Write;\n");
+        commit_all(&root);
+
+        let db = Database::open_in_memory().unwrap();
+        let root_str = root.to_string_lossy().to_string();
+        let result = index_repo(&db, &root_str, false).unwrap();
+        let canonical = canonicalize_repo(&root_str).unwrap();
+
+        assert_eq!(
+            result.imports_inserted, 2,
+            "two same-module imports must yield two import rows"
+        );
+
+        let import_edges: Vec<_> = db
+            .lookup_neighbors(&canonical, "std::io", 10)
+            .unwrap()
+            .into_iter()
+            .filter(|edge| edge.edge_kind == "import")
+            .collect();
+        assert_eq!(
+            import_edges.len(),
+            2,
+            "two same-module imports on distinct lines must persist two import edges"
+        );
+        assert_eq!(
+            result.edges_inserted, 2,
+            "edges_inserted must equal the number of edges actually persisted"
+        );
 
         drop(dir);
     }
