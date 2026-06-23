@@ -291,7 +291,9 @@ impl Database {
     // ── Symbol insert ──────────────────────────────────────────────────────
 
     /// Insert a single `code_symbols` row. `signature` is truncated to
-    /// `MAX_SNIPPET_LEN` before storage.
+    /// `MAX_SNIPPET_LEN` before storage. Returns the number of rows actually
+    /// inserted (0 if `INSERT OR IGNORE` skipped an id collision), so callers
+    /// count only persisted rows rather than attempted inserts.
     #[allow(clippy::too_many_arguments)]
     pub fn insert_symbol_tx(
         tx: &Transaction<'_>,
@@ -310,10 +312,10 @@ impl Database {
         parent_id: Option<&str>,
         confidence: f64,
         indexed_at: &str,
-    ) -> Result<(), MemoryError> {
+    ) -> Result<usize, MemoryError> {
         validate_repo_path(repo, path)?;
         let signature_stored = signature.map(truncate_snippet);
-        tx.execute(
+        let inserted = tx.execute(
             "INSERT OR IGNORE INTO code_symbols
                  (id, repo, path, language, name, qualified_name, kind, visibility,
                   signature, start_line, start_col, end_line, parent_id, confidence, indexed_at)
@@ -336,13 +338,14 @@ impl Database {
                 indexed_at,
             ],
         )?;
-        Ok(())
+        Ok(inserted)
     }
 
     // ── Import insert ──────────────────────────────────────────────────────
 
     /// Insert a single `code_imports` row. `raw` is truncated to
-    /// `MAX_SNIPPET_LEN` before storage.
+    /// `MAX_SNIPPET_LEN` before storage. Returns the number of rows actually
+    /// inserted (0 if `INSERT OR IGNORE` skipped an id collision).
     #[allow(clippy::too_many_arguments)]
     pub fn insert_import_tx(
         tx: &Transaction<'_>,
@@ -357,10 +360,10 @@ impl Database {
         line: i64,
         confidence: f64,
         indexed_at: &str,
-    ) -> Result<(), MemoryError> {
+    ) -> Result<usize, MemoryError> {
         validate_repo_path(repo, path)?;
         let raw_stored = raw.map(truncate_snippet);
-        tx.execute(
+        let inserted = tx.execute(
             "INSERT OR IGNORE INTO code_imports
                  (id, repo, path, language, module, symbol, alias, raw, line, confidence, indexed_at)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
@@ -369,12 +372,13 @@ impl Database {
                 indexed_at
             ],
         )?;
-        Ok(())
+        Ok(inserted)
     }
 
     // ── Edge insert ────────────────────────────────────────────────────────
 
-    /// Insert a single `code_symbol_edges` row.
+    /// Insert a single `code_symbol_edges` row. Returns the number of rows
+    /// actually inserted (0 if `INSERT OR IGNORE` skipped an id collision).
     #[allow(clippy::too_many_arguments)]
     pub fn insert_edge_tx(
         tx: &Transaction<'_>,
@@ -389,9 +393,9 @@ impl Database {
         line: Option<i64>,
         confidence: f64,
         indexed_at: &str,
-    ) -> Result<(), MemoryError> {
+    ) -> Result<usize, MemoryError> {
         validate_repo_path(repo, path)?;
-        tx.execute(
+        let inserted = tx.execute(
             "INSERT OR IGNORE INTO code_symbol_edges
                  (id, repo, from_kind, from_id, to_kind, to_ref,
                   edge_kind, path, line, confidence, indexed_at)
@@ -401,7 +405,7 @@ impl Database {
                 indexed_at
             ],
         )?;
-        Ok(())
+        Ok(inserted)
     }
 
     // ── Query helpers ──────────────────────────────────────────────────────
@@ -432,8 +436,8 @@ impl Database {
             )?;
             let collected: Vec<CodeSymbol> = stmt
                 .query_map(params![repo, query, like_pat, k, limit], map_code_symbol)?
-                .filter_map(|r| r.ok())
-                .collect();
+                .map(|r| r.map_err(MemoryError::from))
+                .collect::<Result<Vec<_>, _>>()?;
             collected
         } else {
             let mut stmt = self.conn.prepare(
@@ -448,8 +452,8 @@ impl Database {
             )?;
             let collected: Vec<CodeSymbol> = stmt
                 .query_map(params![repo, query, like_pat, limit], map_code_symbol)?
-                .filter_map(|r| r.ok())
-                .collect();
+                .map(|r| r.map_err(MemoryError::from))
+                .collect::<Result<Vec<_>, _>>()?;
             collected
         };
         Ok(rows)
@@ -473,8 +477,8 @@ impl Database {
         )?;
         let rows = stmt
             .query_map(params![repo, path, limit], map_code_symbol)?
-            .filter_map(|r| r.ok())
-            .collect();
+            .map(|r| r.map_err(MemoryError::from))
+            .collect::<Result<Vec<_>, _>>()?;
         Ok(rows)
     }
 
@@ -499,8 +503,8 @@ impl Database {
         )?;
         let rows = stmt
             .query_map(params![repo, query, like_pat, limit], map_code_import)?
-            .filter_map(|r| r.ok())
-            .collect();
+            .map(|r| r.map_err(MemoryError::from))
+            .collect::<Result<Vec<_>, _>>()?;
         Ok(rows)
     }
 
@@ -537,8 +541,8 @@ impl Database {
         )?;
         let rows = stmt
             .query_map(params![repo, query, like_pat, limit], map_code_symbol_edge)?
-            .filter_map(|r| r.ok())
-            .collect();
+            .map(|r| r.map_err(MemoryError::from))
+            .collect::<Result<Vec<_>, _>>()?;
         Ok(rows)
     }
 }

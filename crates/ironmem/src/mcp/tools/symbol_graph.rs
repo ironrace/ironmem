@@ -55,7 +55,10 @@ pub(super) fn handle_symbol_graph_index(app: &App, args: &Value) -> Result<Value
     })?;
 
     Ok(json!({
-        "repo": canonical,
+        // Echo the caller-supplied repo, not the canonicalized absolute path:
+        // the latter resolves symlinks and would leak server filesystem
+        // topology the caller did not provide.
+        "repo": repo_raw,
         "files_indexed": result.files_indexed,
         "files_skipped": result.files_skipped,
         "files_purged": result.files_purged,

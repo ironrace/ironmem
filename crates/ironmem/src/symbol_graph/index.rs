@@ -105,14 +105,19 @@ pub fn index_repo(db: &Database, repo_path: &str, force: bool) -> Result<IndexRe
 
         walked_paths.insert(rel_path.clone());
 
-        // Read file bytes.
-        let bytes = match std::fs::read(&abs_path) {
+        // Read file bytes from the canonicalized, boundary-checked path (not
+        // `abs_path`). Reading `canonical_file` closes the TOCTOU window: the
+        // path we verified is inside the repo is the same one we read, so a
+        // symlink swapped in after the `starts_with` check cannot redirect the
+        // read outside the repo.
+        let bytes = match std::fs::read(&canonical_file) {
             Ok(b) => b,
             Err(e) => {
                 eprintln!(
                     "[symbol-graph] warn: could not read {}: {e}",
                     abs_path.display()
                 );
+                files_skipped += 1;
                 continue;
             }
         };
@@ -207,7 +212,10 @@ pub fn index_repo(db: &Database, repo_path: &str, force: bool) -> Result<IndexRe
                     .and_then(|pqn| sym_id_map.get(pqn))
                     .cloned();
 
-                Database::insert_symbol_tx(
+                // Count only rows actually persisted: `INSERT OR IGNORE` skips
+                // id collisions, so an unconditional increment would overcount
+                // and silently hide the dropped row.
+                local_symbols += Database::insert_symbol_tx(
                     tx,
                     &id,
                     &canonical,
@@ -230,7 +238,7 @@ pub fn index_repo(db: &Database, repo_path: &str, force: bool) -> Result<IndexRe
                 if let Some(ref pid) = parent_id {
                     let edge_id =
                         sha256_hex_str(&format!("{canonical}:{rel_path}:contains:{id}:{pid}"));
-                    Database::insert_edge_tx(
+                    local_edges += Database::insert_edge_tx(
                         tx,
                         &edge_id,
                         &canonical,
@@ -244,17 +252,15 @@ pub fn index_repo(db: &Database, repo_path: &str, force: bool) -> Result<IndexRe
                         1.0,
                         &indexed_at,
                     )?;
-                    local_edges += 1;
                 }
 
                 sym_id_map.insert(sym.qualified_name.clone(), id);
-                local_symbols += 1;
             }
 
             // Insert imports and `import` edges.
             for imp in &parsed.imports {
                 let id = import_id(&canonical, &rel_path, &imp.module, imp.line);
-                Database::insert_import_tx(
+                local_imports += Database::insert_import_tx(
                     tx,
                     &id,
                     &canonical,
@@ -278,7 +284,7 @@ pub fn index_repo(db: &Database, repo_path: &str, force: bool) -> Result<IndexRe
                     "{canonical}:{rel_path}:import:{}:{}",
                     imp.module, imp.line
                 ));
-                Database::insert_edge_tx(
+                local_edges += Database::insert_edge_tx(
                     tx,
                     &edge_id,
                     &canonical,
@@ -292,9 +298,6 @@ pub fn index_repo(db: &Database, repo_path: &str, force: bool) -> Result<IndexRe
                     imp.confidence,
                     &indexed_at,
                 )?;
-
-                local_imports += 1;
-                local_edges += 1;
             }
 
             symbols_inserted += local_symbols;
@@ -818,5 +821,129 @@ mod tests {
         assert!(validate_path_within_repo("/repo", "../outside.rs").is_err());
         assert!(validate_path_within_repo("/repo", "/absolute/path.rs").is_err());
         assert!(validate_path_within_repo("/repo", "src/lib.rs").is_ok());
+    }
+
+    // ── Defensive file-content skip paths ──────────────────────────────────
+
+    #[test]
+    fn oversized_file_is_skipped_not_indexed() {
+        let (dir, root) = make_git_repo();
+        // A valid symbol declaration followed by padding that pushes the file
+        // past MAX_FILE_BYTES (1 MiB). The symbol must NOT be indexed.
+        let padding = "// pad\n".repeat((MAX_FILE_BYTES / 7) + 1);
+        let content = format!("pub fn oversized_symbol() {{}}\n{padding}");
+        assert!(content.len() > MAX_FILE_BYTES, "fixture must exceed cap");
+        write_file(&root, "big.rs", &content);
+        commit_all(&root);
+
+        let db = Database::open_in_memory().unwrap();
+        let root_str = root.to_string_lossy().to_string();
+        let result = index_repo(&db, &root_str, false).unwrap();
+        let canonical = canonicalize_repo(&root_str).unwrap();
+
+        assert_eq!(
+            result.files_indexed, 0,
+            "oversized file must not be indexed"
+        );
+        assert_eq!(
+            result.files_skipped, 1,
+            "oversized file must be counted skipped"
+        );
+        let syms = db
+            .lookup_symbols(&canonical, "oversized_symbol", None, 10)
+            .unwrap();
+        assert!(
+            syms.is_empty(),
+            "symbol from oversized file must not persist"
+        );
+
+        drop(dir);
+    }
+
+    #[test]
+    fn binary_file_is_skipped_not_indexed() {
+        let (dir, root) = make_git_repo();
+        // Valid-looking source text with an embedded NUL byte in the first
+        // 8 KiB → treated as binary and skipped.
+        let mut bytes = b"pub fn binary_symbol() {}\n".to_vec();
+        bytes.push(0);
+        std::fs::write(root.join("bin.rs"), &bytes).unwrap();
+        commit_all(&root);
+
+        let db = Database::open_in_memory().unwrap();
+        let root_str = root.to_string_lossy().to_string();
+        let result = index_repo(&db, &root_str, false).unwrap();
+        let canonical = canonicalize_repo(&root_str).unwrap();
+
+        assert_eq!(result.files_indexed, 0, "binary file must not be indexed");
+        assert_eq!(
+            result.files_skipped, 1,
+            "binary file must be counted skipped"
+        );
+        let syms = db
+            .lookup_symbols(&canonical, "binary_symbol", None, 10)
+            .unwrap();
+        assert!(syms.is_empty(), "symbol from binary file must not persist");
+
+        drop(dir);
+    }
+
+    #[test]
+    fn non_utf8_file_is_skipped_not_indexed() {
+        let (dir, root) = make_git_repo();
+        // Valid source prefix followed by an invalid UTF-8 byte (0xFF), with no
+        // NUL so it passes the binary heuristic but fails UTF-8 decoding.
+        let mut bytes = b"pub fn utf8_symbol() {}\n".to_vec();
+        bytes.push(0xFF);
+        std::fs::write(root.join("bad.rs"), &bytes).unwrap();
+        commit_all(&root);
+
+        let db = Database::open_in_memory().unwrap();
+        let root_str = root.to_string_lossy().to_string();
+        let result = index_repo(&db, &root_str, false).unwrap();
+        let canonical = canonicalize_repo(&root_str).unwrap();
+
+        assert_eq!(
+            result.files_indexed, 0,
+            "non-UTF-8 file must not be indexed"
+        );
+        assert_eq!(
+            result.files_skipped, 1,
+            "non-UTF-8 file must be counted skipped"
+        );
+        let syms = db
+            .lookup_symbols(&canonical, "utf8_symbol", None, 10)
+            .unwrap();
+        assert!(
+            syms.is_empty(),
+            "symbol from non-UTF-8 file must not persist"
+        );
+
+        drop(dir);
+    }
+
+    #[test]
+    fn gitignored_file_is_not_indexed() {
+        let (dir, root) = make_git_repo();
+        write_file(&root, "kept.rs", "pub fn kept_symbol() {}\n");
+        write_file(&root, "ignored.rs", "pub fn ignored_symbol() {}\n");
+        write_file(&root, ".gitignore", "ignored.rs\n");
+        commit_all(&root);
+
+        let db = Database::open_in_memory().unwrap();
+        let root_str = root.to_string_lossy().to_string();
+        index_repo(&db, &root_str, false).unwrap();
+        let canonical = canonicalize_repo(&root_str).unwrap();
+
+        let kept = db
+            .lookup_symbols(&canonical, "kept_symbol", None, 10)
+            .unwrap();
+        assert_eq!(kept.len(), 1, "non-ignored file must be indexed");
+        let ignored = db
+            .lookup_symbols(&canonical, "ignored_symbol", None, 10)
+            .unwrap();
+        assert!(ignored.is_empty(), "gitignored file must not be indexed");
+
+        drop(dir);
     }
 }

@@ -8,10 +8,68 @@
 //! MAX_SNIPPET_LEN is applied to all `signature` and `raw` fields.
 
 use std::path::Path;
+use std::sync::OnceLock;
 
 use regex::Regex;
 
 use super::model::{ParsedFile, ParsedImport, ParsedSymbol, MAX_SNIPPET_LEN};
+
+// ── Compiled regex patterns ─────────────────────────────────────────────────────
+// Patterns are hardcoded and compiled exactly once on first use. `Regex::new`
+// builds a DFA, which is non-trivial work; recompiling per parsed file made
+// indexing latency scale with repo size. `.expect` is sound because each
+// pattern is a fixed literal verified by the unit tests in this module — it
+// can only fail if the pattern itself is edited to be invalid, which the tests
+// would catch immediately.
+
+/// Rust import pattern: `use path::...;` (incl. `pub use`, `as` alias, braces).
+fn rust_use_re() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        Regex::new(
+            r"(?m)^[ \t]*(?:pub(?:\([^)]*\))?\s+)?use\s+([\w:]+(?:::\{[^}]*\}|::[\w*]+)?)\s*(?:as\s+(\w+))?\s*;",
+        )
+        .expect("rust use pattern is a valid hardcoded regex")
+    })
+}
+
+/// Rust symbol declaration pattern (top-level and nested).
+fn rust_sym_re() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        Regex::new(
+            r"(?m)^([ \t]*)(?:(pub(?:\([^)]*\))?)\s+)?(fn|struct|enum|trait|impl|mod|const|static|type|macro_rules!|macro)\s+(\w+)",
+        )
+        .expect("rust symbol pattern is a valid hardcoded regex")
+    })
+}
+
+/// Python `import X` / `import X as Y` pattern.
+fn python_import_re() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        Regex::new(r"(?m)^[ \t]*import\s+([\w.]+(?:\s*,\s*[\w.]+)*)\s*(?:as\s+(\w+))?")
+            .expect("python import pattern is a valid hardcoded regex")
+    })
+}
+
+/// Python `from X import Y` pattern (incl. `as` alias and `*`).
+fn python_from_import_re() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        Regex::new(r"(?m)^[ \t]*from\s+([\w.]+)\s+import\s+((?:\w+(?:\s+as\s+\w+)?\s*,?\s*)+|\*)")
+            .expect("python from-import pattern is a valid hardcoded regex")
+    })
+}
+
+/// Python `def` / `async def` / `class` declaration pattern.
+fn python_sym_re() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        Regex::new(r"(?m)^([ \t]*)(async\s+)?(def|class)\s+(\w+)")
+            .expect("python symbol pattern is a valid hardcoded regex")
+    })
+}
 
 // ── Language detection ────────────────────────────────────────────────────────
 
@@ -76,10 +134,7 @@ pub fn parse_file(path: &Path, content: &str) -> ParsedFile {
 fn parse_rust(content: &str) -> ParsedFile {
     // ── Import pattern: `use path::...;` ──────────────────────────────────
     // Matches: use X; use X as Y; use X::{A, B}; pub use X;
-    let use_re = Regex::new(
-        r"(?m)^[ \t]*(?:pub(?:\([^)]*\))?\s+)?use\s+([\w:]+(?:::\{[^}]*\}|::[\w*]+)?)\s*(?:as\s+(\w+))?\s*;",
-    )
-    .unwrap();
+    let use_re = rust_use_re();
 
     let mut imports: Vec<ParsedImport> = Vec::new();
     for (line_idx, line) in content.lines().enumerate() {
@@ -131,9 +186,7 @@ fn parse_rust(content: &str) -> ParsedFile {
 
     // ── Symbol pattern ─────────────────────────────────────────────────────
     // Matches top-level and nested declarations.
-    let sym_re = Regex::new(
-        r"(?m)^([ \t]*)(?:(pub(?:\([^)]*\))?)\s+)?(fn|struct|enum|trait|impl|mod|const|static|type|macro_rules!|macro)\s+(\w+)",
-    ).unwrap();
+    let sym_re = rust_sym_re();
 
     let mut symbols: Vec<ParsedSymbol> = Vec::new();
     let lines: Vec<&str> = content.lines().collect();
@@ -227,12 +280,9 @@ fn parse_rust(content: &str) -> ParsedFile {
 fn parse_python(content: &str) -> ParsedFile {
     // ── Import patterns ────────────────────────────────────────────────────
     // `import X` / `import X as Y`
-    let import_re =
-        Regex::new(r"(?m)^[ \t]*import\s+([\w.]+(?:\s*,\s*[\w.]+)*)\s*(?:as\s+(\w+))?").unwrap();
+    let import_re = python_import_re();
     // `from X import Y` / `from X import Y as Z` / `from X import *`
-    let from_import_re =
-        Regex::new(r"(?m)^[ \t]*from\s+([\w.]+)\s+import\s+((?:\w+(?:\s+as\s+\w+)?\s*,?\s*)+|\*)")
-            .unwrap();
+    let from_import_re = python_from_import_re();
 
     let mut imports: Vec<ParsedImport> = Vec::new();
 
@@ -292,7 +342,7 @@ fn parse_python(content: &str) -> ParsedFile {
 
     // ── Symbol patterns ────────────────────────────────────────────────────
     // `def name(` / `async def name(` / `class name(`/:
-    let sym_re = Regex::new(r"(?m)^([ \t]*)(async\s+)?(def|class)\s+(\w+)").unwrap();
+    let sym_re = python_sym_re();
 
     let mut symbols: Vec<ParsedSymbol> = Vec::new();
     let lines: Vec<&str> = content.lines().collect();
