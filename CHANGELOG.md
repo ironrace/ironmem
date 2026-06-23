@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-06-22
+
 ### Changed
 
 - Collab planning now skips the extra post-review planning loop: Claude merges
@@ -22,6 +24,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `RerankerScorer::score_pairs` now returns `RerankScoreResult`. Both backends
   (`ClaudeCliClient`, `AnthropicApiClient`) parse real token counts (the CLI
   falls back to a chars/4 estimate, flagged `estimated`).
+- CI now keeps `ironrace.dev` and the README in sync when user-facing features
+  land, via a drift guard (issue #160).
 
 ### Added
 
@@ -70,6 +74,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   logs a warning and never breaks `add_drawer`/`search`. Context columns
   (session/collab/phase/task) are intentionally left `None` pending a later
   attribution pass.
+- **Local symbol/import graph index for code-aware retrieval (issue #148, PR #168):**
+  a SQLite-backed graph (migration 012: `code_index_files`, `code_symbols`,
+  `code_imports`, `code_symbol_edges`) over a git worktree. A regex/heuristic v0
+  parser extracts Rust (`use/mod/fn/struct/enum/trait/impl/const/static/type/macro_rules!`)
+  and Python (`import`, `from..import`, `def`/`async def`, `class`) declarations,
+  each carrying `language`, `kind`, span, and `confidence`. The indexer is
+  incremental (content-hash: new/changed/`--force` → reparse; unchanged → skip;
+  absent → purge), fully offline, and persists only bounded declaration metadata
+  (signatures/imports truncated to `MAX_SNIPPET_LEN`, never full source). New CLI
+  `ironmem symbols index|lookup|imports|neighbors` and four MCP tools
+  (`symbol_graph_index` write-gated; `symbol_lookup`/`symbol_imports`/`symbol_neighbors`
+  read-mode), with path-safety hardening (out-of-repo/traversal rejected,
+  repo-relative forward-slash paths, generic client-facing FS/git errors).
+- **Local read-only dashboard (issue #149):** `ironmem dashboard` serves a local
+  web view of memory drawers, code maps, and context-savings — with embed-model
+  warming status, per-row code-map freshness badges, and per-section CLI
+  remediation hints.
+- **One-command Claude and Codex launchers (issue #143):** `ironmem claude` /
+  `ironmem codex` subcommands that canonicalize the repo, idempotently register
+  the `ironmem` MCP server for the target harness, warm the embedder, and launch
+  the CLI.
+- **Launcher context pre-injection (issue #147):** launcher-managed sessions get a
+  compact memory/code-map context pack injected up front, behind a disclaimer
+  header, with untrusted pack text sanitized (control-char/newline stripping,
+  code-fence neutralization) and a context-truncation warning.
+- **Task context packs (issue #144):** `ironmem` assembles per-task context packs
+  backed by memory drawers and lazy code maps.
+- **Product-facing exploration-savings summary (issue #145):** `ironmem report`
+  gains a product-facing exploration value summary, with honest one-sided-sample
+  handling.
+- **Documentation:** benchmark methodology + first context-savings baseline
+  (issue #146); using ironmem with any MCP client — Cursor, Cline, Windsurf
+  (issue #159).
 
 ### Performance
 
