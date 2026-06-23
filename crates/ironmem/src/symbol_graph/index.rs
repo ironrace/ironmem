@@ -66,7 +66,30 @@ pub fn index_repo(db: &Database, repo_path: &str, force: bool) -> Result<IndexRe
 
     for entry in walker.flatten() {
         let abs_path = entry.path().to_path_buf();
-        if !abs_path.is_file() {
+        if !entry
+            .file_type()
+            .is_some_and(|file_type| file_type.is_file())
+        {
+            continue;
+        }
+
+        let canonical_file = match std::fs::canonicalize(&abs_path) {
+            Ok(path) => path,
+            Err(e) => {
+                eprintln!(
+                    "[symbol-graph] warn: could not canonicalize {}: {e}",
+                    abs_path.display()
+                );
+                files_skipped += 1;
+                continue;
+            }
+        };
+        if !canonical_file.starts_with(Path::new(&canonical)) {
+            eprintln!(
+                "[symbol-graph] warn: skipping out-of-repo file: {}",
+                abs_path.display()
+            );
+            files_skipped += 1;
             continue;
         }
 
@@ -206,15 +229,15 @@ pub fn index_repo(db: &Database, repo_path: &str, force: bool) -> Result<IndexRe
                 // Register `contains` edge if there is a parent.
                 if let Some(ref pid) = parent_id {
                     let edge_id =
-                        sha256_hex_str(&format!("{canonical}:{rel_path}:contains:{pid}:{id}"));
+                        sha256_hex_str(&format!("{canonical}:{rel_path}:contains:{id}:{pid}"));
                     Database::insert_edge_tx(
                         tx,
                         &edge_id,
                         &canonical,
                         "symbol",
-                        pid,
-                        "symbol",
                         &id,
+                        "symbol",
+                        pid,
                         "contains",
                         &rel_path,
                         Some(sym.start_line as i64),
@@ -311,11 +334,6 @@ pub fn canonicalize_repo(raw: &str) -> Result<String, MemoryError> {
     }
 
     let raw_path = Path::new(trimmed);
-    if !raw_path.is_absolute() {
-        return Err(MemoryError::Validation(format!(
-            "repo must be an absolute path: {trimmed}"
-        )));
-    }
     for component in raw_path.components() {
         if component == Component::ParentDir {
             return Err(MemoryError::Validation(format!(
@@ -324,7 +342,13 @@ pub fn canonicalize_repo(raw: &str) -> Result<String, MemoryError> {
         }
     }
 
-    let canonical = std::fs::canonicalize(raw_path).map_err(|e| {
+    let candidate = if raw_path.is_absolute() {
+        raw_path.to_path_buf()
+    } else {
+        std::env::current_dir()?.join(raw_path)
+    };
+
+    let canonical = std::fs::canonicalize(&candidate).map_err(|e| {
         MemoryError::Validation(format!(
             "repo must be an existing directory: {trimmed}: {e}"
         ))
@@ -650,6 +674,45 @@ mod tests {
         drop(dir);
     }
 
+    #[test]
+    fn neighbors_resolve_qualified_name_and_contains_points_to_parent() {
+        let (dir, root) = make_git_repo();
+        write_file(
+            &root,
+            "lib.rs",
+            "pub mod outer {\n    pub fn inner() {}\n}\n",
+        );
+        commit_all(&root);
+
+        let db = Database::open_in_memory().unwrap();
+        let root_str = root.to_string_lossy().to_string();
+        index_repo(&db, &root_str, false).unwrap();
+        let canonical = canonicalize_repo(&root_str).unwrap();
+
+        let child = db
+            .lookup_symbols(&canonical, "outer::inner", None, 10)
+            .unwrap()
+            .into_iter()
+            .find(|symbol| symbol.qualified_name == "outer::inner")
+            .expect("child symbol should be indexed");
+        let parent = db
+            .lookup_symbols(&canonical, "outer", Some("mod"), 10)
+            .unwrap()
+            .into_iter()
+            .find(|symbol| symbol.qualified_name == "outer")
+            .expect("parent symbol should be indexed");
+        let edges = db.lookup_neighbors(&canonical, "outer::inner", 10).unwrap();
+        let contains = edges
+            .iter()
+            .find(|edge| edge.edge_kind == "contains")
+            .expect("qualified-name neighbor lookup should return contains edge");
+
+        assert_eq!(contains.from_id, child.id);
+        assert_eq!(contains.to_ref, parent.id);
+
+        drop(dir);
+    }
+
     // ── Task 4 acceptance: no-commit repo → head_resolved=false, no error ──
 
     #[test]
@@ -669,6 +732,34 @@ mod tests {
         assert_eq!(
             result.head_sha, NO_COMMIT_SHA,
             "head_sha must be the placeholder"
+        );
+
+        drop(dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn out_of_repo_symlink_is_not_indexed() {
+        use std::os::unix::fs::symlink;
+
+        let (dir, root) = make_git_repo();
+        let external = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(external.path(), "pub fn leaked_external() {}\n").unwrap();
+        symlink(external.path(), root.join("leak.rs")).unwrap();
+        commit_all(&root);
+
+        let db = Database::open_in_memory().unwrap();
+        let root_str = root.to_string_lossy().to_string();
+        let result = index_repo(&db, &root_str, false).unwrap();
+        let canonical = canonicalize_repo(&root_str).unwrap();
+        let leaked = db
+            .lookup_symbols(&canonical, "leaked_external", None, 10)
+            .unwrap();
+
+        assert_eq!(result.files_indexed, 0, "symlink target must not be read");
+        assert!(
+            leaked.is_empty(),
+            "out-of-repo symlink content must not be indexed"
         );
 
         drop(dir);

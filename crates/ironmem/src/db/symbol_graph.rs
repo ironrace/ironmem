@@ -417,7 +417,7 @@ impl Database {
         limit: usize,
     ) -> Result<Vec<CodeSymbol>, MemoryError> {
         let limit = limit as i64;
-        let like_pat = format!("%{query}%");
+        let like_pat = format!("{query}%");
         let rows: Vec<CodeSymbol> = if let Some(k) = kind {
             let mut stmt = self.conn.prepare(
                 "SELECT id, repo, path, language, name, qualified_name, kind, visibility,
@@ -486,7 +486,7 @@ impl Database {
         limit: usize,
     ) -> Result<Vec<CodeImport>, MemoryError> {
         let limit = limit as i64;
-        let like_pat = format!("%{query}%");
+        let like_pat = format!("{query}%");
         let mut stmt = self.conn.prepare(
             "SELECT id, repo, path, language, module, symbol, alias, raw, line, confidence, indexed_at
              FROM code_imports
@@ -512,17 +512,31 @@ impl Database {
         limit: usize,
     ) -> Result<Vec<CodeSymbolEdge>, MemoryError> {
         let limit = limit as i64;
+        let like_pat = format!("{query}%");
         let mut stmt = self.conn.prepare(
             "SELECT id, repo, from_kind, from_id, to_kind, to_ref,
                     edge_kind, path, line, confidence, indexed_at
              FROM code_symbol_edges
              WHERE repo = ?1
-               AND (from_id = ?2 OR to_ref = ?2)
+               AND (from_id = ?2 OR to_ref = ?2
+                    OR from_id LIKE ?3 OR to_ref LIKE ?3
+                    OR from_id IN (
+                        SELECT id FROM code_symbols
+                        WHERE repo = ?1
+                          AND (name = ?2 OR qualified_name = ?2
+                               OR name LIKE ?3 OR qualified_name LIKE ?3)
+                    )
+                    OR to_ref IN (
+                        SELECT id FROM code_symbols
+                        WHERE repo = ?1
+                          AND (name = ?2 OR qualified_name = ?2
+                               OR name LIKE ?3 OR qualified_name LIKE ?3)
+                    ))
              ORDER BY edge_kind, path, line
-             LIMIT ?3",
+             LIMIT ?4",
         )?;
         let rows = stmt
-            .query_map(params![repo, query, limit], map_code_symbol_edge)?
+            .query_map(params![repo, query, like_pat, limit], map_code_symbol_edge)?
             .filter_map(|r| r.ok())
             .collect();
         Ok(rows)

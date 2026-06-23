@@ -172,7 +172,7 @@ fn parse_rust(content: &str) -> ParsedFile {
 
         // Signature: first line of the declaration (heuristic).
         let sig_line = lines.get(line_no.saturating_sub(1)).unwrap_or(&"");
-        let signature = Some(truncate(sig_line.trim()));
+        let signature = Some(rust_signature(sig_line, kind));
 
         // Qualified name: for nested items, prefix with the enclosing item name.
         // v0: use indent depth as a cheap nesting proxy.
@@ -247,16 +247,21 @@ fn parse_python(content: &str) -> ParsedFile {
                 .map(|m| m.as_str().trim().to_string())
                 .unwrap_or_default();
             let sym_part = cap.get(2).map(|m| m.as_str().trim()).unwrap_or("");
-            let symbol = if sym_part == "*" {
-                None
+            let (symbol, alias) = if sym_part == "*" {
+                (None, None)
+            } else if let Some((symbol, alias)) = sym_part.split_once(" as ") {
+                (
+                    Some(symbol.trim().to_string()),
+                    Some(alias.trim().trim_end_matches(',').to_string()),
+                )
             } else {
-                Some(sym_part.to_string())
+                (Some(sym_part.to_string()), None)
             };
             if !module.is_empty() {
                 imports.push(ParsedImport {
                     module,
                     symbol,
-                    alias: None,
+                    alias,
                     raw: Some(raw),
                     line: line_no,
                     confidence: 0.9,
@@ -310,13 +315,13 @@ fn parse_python(content: &str) -> ParsedFile {
 
         let kind = match kw {
             "class" => "class",
-            "def" if is_async => "method", // async def at any depth → method-ish
+            "def" if is_async && !indent.is_empty() => "method",
             "def" if !indent.is_empty() => "method", // indented def → method
             _ => "fn",
         };
 
         let sig_line = lines.get(line_no.saturating_sub(1)).unwrap_or(&"");
-        let signature = Some(truncate(sig_line.trim()));
+        let signature = Some(python_signature(sig_line));
         let indent_depth = indent.len();
 
         let parent_qualified_name = if indent_depth > 0 {
@@ -380,6 +385,25 @@ fn truncate(s: &str) -> String {
         }
         s[..end].to_string()
     }
+}
+
+fn rust_signature(line: &str, kind: &str) -> String {
+    let trimmed = line.trim();
+    let header = match kind {
+        "const" | "static" => trimmed.split_once('=').map(|(head, _)| head.trim()),
+        _ => trimmed.split_once('{').map(|(head, _)| head.trim()),
+    }
+    .unwrap_or(trimmed);
+    truncate(header)
+}
+
+fn python_signature(line: &str) -> String {
+    let trimmed = line.trim();
+    let header = trimmed
+        .find(':')
+        .map(|idx| trimmed[..=idx].trim())
+        .unwrap_or(trimmed);
+    truncate(header)
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -626,6 +650,17 @@ mod tests {
     }
 
     #[test]
+    fn python_parses_from_import_alias() {
+        let src = "from collections import OrderedDict as OD\n";
+        let result = parse_file(Path::new("main.py"), src);
+        let imp = result.imports.iter().find(|i| i.module == "collections");
+        assert!(imp.is_some(), "should find aliased from-import");
+        let imp = imp.unwrap();
+        assert_eq!(imp.symbol.as_deref(), Some("OrderedDict"));
+        assert_eq!(imp.alias.as_deref(), Some("OD"));
+    }
+
+    #[test]
     fn python_parses_from_import_wildcard() {
         let src = "from os.path import *\n";
         let result = parse_file(Path::new("main.py"), src);
@@ -667,7 +702,7 @@ mod tests {
         let result = parse_file(Path::new("main.py"), src);
         let sym = result.symbols.iter().find(|s| s.name == "fetch");
         assert!(sym.is_some(), "should find 'fetch' async def");
-        assert_eq!(sym.unwrap().kind, "method");
+        assert_eq!(sym.unwrap().kind, "fn");
     }
 
     #[test]
@@ -748,6 +783,29 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn rust_signature_excludes_inline_body() {
+        let src = "pub fn greet(name: &str) -> String { name.to_string() }\n";
+        let result = parse_file(Path::new("x.rs"), src);
+        let sym = result.symbols.iter().find(|s| s.name == "greet").unwrap();
+        let signature = sym.signature.as_deref().unwrap_or_default();
+        assert_eq!(signature, "pub fn greet(name: &str) -> String");
+        assert!(
+            !signature.contains("name.to_string"),
+            "signature must not persist inline body: {signature}"
+        );
+    }
+
+    #[test]
+    fn python_signature_excludes_inline_body() {
+        let src = "def greet(name): return name\nclass Model: pass\n";
+        let result = parse_file(Path::new("x.py"), src);
+        let fn_sym = result.symbols.iter().find(|s| s.name == "greet").unwrap();
+        assert_eq!(fn_sym.signature.as_deref(), Some("def greet(name):"));
+        let class_sym = result.symbols.iter().find(|s| s.name == "Model").unwrap();
+        assert_eq!(class_sym.signature.as_deref(), Some("class Model:"));
     }
 
     #[test]

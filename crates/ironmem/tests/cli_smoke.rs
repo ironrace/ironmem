@@ -365,7 +365,7 @@ fn cli_symbols_index_lookup_imports_neighbors_smoke() {
 
     // ── index ──────────────────────────────────────────────────────────────
     let index_out = symbols_cmd(&db_path, &home)
-        .args(["symbols", "index", "--json"])
+        .args(["symbols", "index", "--json", "--repo"])
         .arg(&repo)
         .output()
         .unwrap();
@@ -386,6 +386,22 @@ fn cli_symbols_index_lookup_imports_neighbors_smoke() {
     assert!(
         index_json["imports_inserted"].as_u64().unwrap_or(0) >= 1,
         "should insert at least 1 import: {index_json}"
+    );
+
+    let relative_index_out = symbols_cmd(&db_path, &home)
+        .current_dir(&repo)
+        .args(["symbols", "index", "--json", "--repo", "."])
+        .output()
+        .unwrap();
+    assert!(
+        relative_index_out.status.success(),
+        "symbols index must accept relative repo path '.': {relative_index_out:?}"
+    );
+    let relative_index_json: serde_json::Value = serde_json::from_slice(&relative_index_out.stdout)
+        .expect("symbols index --json . must emit JSON");
+    assert!(
+        relative_index_json["files_skipped"].as_u64().unwrap_or(0) >= 1,
+        "relative re-index should see unchanged indexed files: {relative_index_json}"
     );
 
     let repo_str = repo.to_string_lossy().to_string();
@@ -409,10 +425,15 @@ fn cli_symbols_index_lookup_imports_neighbors_smoke() {
     );
     // Verify shape: path, start_line, signature present.
     let greet = syms.iter().find(|s| s["name"] == "greet").unwrap();
-    assert!(greet["path"].is_string(), "symbol must have path");
+    assert_eq!(greet["path"].as_str(), Some("lib.rs"));
     assert!(
         greet["start_line"].is_number(),
         "symbol must have start_line"
+    );
+    assert!(greet["start_col"].is_number(), "symbol must have start_col");
+    assert_eq!(
+        greet["signature"].as_str(),
+        Some("pub fn greet(name: &str) -> String")
     );
 
     // ── imports ────────────────────────────────────────────────────────────
@@ -443,7 +464,9 @@ fn cli_symbols_index_lookup_imports_neighbors_smoke() {
         .iter()
         .find(|i| i["module"] == "std::collections")
         .unwrap();
-    assert!(imp["path"].is_string(), "import must have path");
+    assert_eq!(imp["path"].as_str(), Some("lib.rs"));
+    assert_eq!(imp["symbol"].as_str(), Some("HashMap"));
+    assert_eq!(imp["raw"].as_str(), Some("use std::collections::HashMap;"));
     assert!(imp["line"].is_number(), "import must have line");
 
     // ── neighbors ──────────────────────────────────────────────────────────
@@ -472,8 +495,16 @@ fn cli_symbols_index_lookup_imports_neighbors_smoke() {
         !edges.is_empty(),
         "neighbors for lib.rs must include import edges: {neighbors_json}"
     );
-    let edge = &edges[0];
-    assert!(edge["from_id"].is_string(), "edge must have from_id");
-    assert!(edge["to_ref"].is_string(), "edge must have to_ref");
-    assert!(edge["edge_kind"].is_string(), "edge must have edge_kind");
+    let edge = edges
+        .iter()
+        .find(|e| {
+            e["edge_kind"].as_str() == Some("import")
+                && e["from_id"].as_str() == Some("lib.rs")
+                && e["to_ref"].as_str() == Some("std::collections")
+        })
+        .expect("neighbors must include lib.rs import edge to std::collections");
+    assert_eq!(edge["from_kind"].as_str(), Some("file"));
+    assert_eq!(edge["to_kind"].as_str(), Some("module"));
+    assert_eq!(edge["path"].as_str(), Some("lib.rs"));
+    assert!(edge["line"].is_number(), "edge must include line");
 }

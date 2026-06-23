@@ -327,9 +327,9 @@ the rest of memory — no extra process or network required.
 
 ### Supported languages (v0)
 
-**Rust (`.rs`) and Python (`.py`) only.** Other extensions are logged and
-skipped; they do not cause errors. TypeScript, JavaScript, Go, etc. are
-explicitly unsupported in v0.
+**Rust (`.rs`) and Python (`.py`) only.** Other extensions are skipped; they do
+not cause errors. Supported files larger than 1 MiB are skipped with a warning.
+TypeScript, JavaScript, Go, etc. are explicitly unsupported in v0.
 
 ### Persisted metadata
 
@@ -338,7 +338,7 @@ Only declaration metadata is stored — **no full source bodies**:
 | Field | Stored? | Notes |
 |-------|---------|-------|
 | Symbol kind, name, qualified name | Yes | `fn`, `struct`, `class`, etc. |
-| Declaration signature | Yes, ≤ 512 bytes | First line of the declaration |
+| Declaration signature | Yes, ≤ 512 bytes | Declaration header with inline bodies stripped |
 | Span (start line, col; end line) | Yes | |
 | Visibility | Yes | `pub`, `pub(crate)`, `private`, etc. |
 | Import module, symbol, alias | Yes | |
@@ -361,9 +361,9 @@ Cross-symbol call/reference resolution is **not available in v0** — the
 | Tool | Mode requirement |
 |------|-----------------|
 | `symbol_graph_index` | **write-mode only** (`IRONMEM_MCP_MODE=trusted`) |
-| `symbol_graph_lookup` | read-mode allowed (ReadOnly, Restricted, Trusted) |
-| `symbol_graph_imports` | read-mode allowed |
-| `symbol_graph_neighbors` | read-mode allowed |
+| `symbol_lookup` | read-mode allowed (ReadOnly, Restricted, Trusted) |
+| `symbol_imports` | read-mode allowed |
+| `symbol_neighbors` | read-mode allowed |
 
 All read tools enforce a hard result cap of **100 items** per call to prevent
 unbounded responses. Raw FS/git errors are never returned to the client;
@@ -374,7 +374,7 @@ validation error.
 
 ```bash
 # Index (incremental; re-runs only changed files by content-hash)
-ironmem symbols index /path/to/repo
+ironmem symbols index --repo /path/to/repo
 
 # Look up symbols
 ironmem symbols lookup --repo /path/to/repo "parse_file"
@@ -387,7 +387,7 @@ ironmem symbols imports --repo /path/to/repo "std::collections"
 ironmem symbols neighbors --repo /path/to/repo "src/lib.rs"
 
 # JSON output for scripting
-ironmem symbols index --json /path/to/repo
+ironmem symbols index --json --repo /path/to/repo
 ```
 
 ## Benchmark Caveats

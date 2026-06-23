@@ -289,6 +289,26 @@ impl App {
         mode: crate::config::McpAccessMode,
     ) -> Result<Self, MemoryError> {
         let db = crate::db::schema::Database::open_in_memory()?;
+        Self::open_for_test_with_db(db, std::path::PathBuf::from(":memory:"), mode)
+    }
+
+    /// Like `open_for_test_with_mode`, but opens a caller-provided on-disk DB.
+    /// Useful for tests that need multiple App instances to share state.
+    #[cfg(test)]
+    pub fn open_for_test_at_path_with_mode(
+        db_path: &std::path::Path,
+        mode: crate::config::McpAccessMode,
+    ) -> Result<Self, MemoryError> {
+        let db = crate::db::schema::Database::open(db_path)?;
+        db.migrate()?;
+        Self::open_for_test_with_db(db, db_path.to_path_buf(), mode)
+    }
+
+    fn open_for_test_with_db(
+        db: crate::db::schema::Database,
+        db_path: std::path::PathBuf,
+        mode: crate::config::McpAccessMode,
+    ) -> Result<Self, MemoryError> {
         let state_dir = std::env::temp_dir().join(format!(
             "ironmem-test-{}-{}",
             std::process::id(),
@@ -299,7 +319,7 @@ impl App {
         ));
         std::fs::create_dir_all(&state_dir).map_err(MemoryError::Io)?;
         let config = crate::config::Config {
-            db_path: std::path::PathBuf::from(":memory:"),
+            db_path,
             model_dir: std::path::PathBuf::from("/nonexistent"),
             model_dir_explicit: true,
             state_dir,

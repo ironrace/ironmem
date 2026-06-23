@@ -448,19 +448,19 @@ pub fn tool_definitions(app: &App) -> Vec<Value> {
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "repo": { "type": "string", "description": "Absolute path to a git worktree root" },
+                    "repo": { "type": "string", "description": "Path to a git worktree root" },
                     "force": { "type": "boolean", "default": false, "description": "Re-index even unchanged files" }
                 },
                 "required": ["repo"]
             }
         }),
         json!({
-            "name": "symbol_graph_lookup",
+            "name": "symbol_lookup",
             "description": "Look up symbol declarations (functions, structs, classes, etc.) in the indexed symbol graph by name or qualified name. Returns bounded metadata — no full source bodies.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "repo": { "type": "string", "description": "Absolute path to the indexed git worktree root" },
+                    "repo": { "type": "string", "description": "Path to the indexed git worktree root" },
                     "query": { "type": "string", "description": "Name or qualified-name prefix to search for" },
                     "kind": { "type": "string", "description": "Optional filter by kind (fn, struct, enum, class, trait, …)" },
                     "limit": { "type": "integer", "default": 50, "description": "Max results (capped at 100)" }
@@ -469,12 +469,12 @@ pub fn tool_definitions(app: &App) -> Vec<Value> {
             }
         }),
         json!({
-            "name": "symbol_graph_imports",
+            "name": "symbol_imports",
             "description": "Look up import statements in the indexed symbol graph by file path (repo-relative) or module name prefix. Returns bounded metadata.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "repo": { "type": "string", "description": "Absolute path to the indexed git worktree root" },
+                    "repo": { "type": "string", "description": "Path to the indexed git worktree root" },
                     "query": { "type": "string", "description": "Repo-relative file path or module name prefix" },
                     "limit": { "type": "integer", "default": 50, "description": "Max results (capped at 100)" }
                 },
@@ -482,13 +482,13 @@ pub fn tool_definitions(app: &App) -> Vec<Value> {
             }
         }),
         json!({
-            "name": "symbol_graph_neighbors",
-            "description": "Look up symbol-graph edges (import or contains) by symbol id or file path. v0 edge scope: import (file→module) and contains (symbol→parent symbol).",
+            "name": "symbol_neighbors",
+            "description": "Look up symbol-graph edges (import or contains) by symbol id, name, qualified name, or file path. v0 edge scope: import (file→module) and contains (symbol→parent symbol).",
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "repo": { "type": "string", "description": "Absolute path to the indexed git worktree root" },
-                    "query": { "type": "string", "description": "Symbol id or repo-relative file path prefix" },
+                    "repo": { "type": "string", "description": "Path to the indexed git worktree root" },
+                    "query": { "type": "string", "description": "Symbol id, symbol/qualified name, or repo-relative file path prefix" },
                     "limit": { "type": "integer", "default": 50, "description": "Max results (capped at 100)" }
                 },
                 "required": ["repo", "query"]
@@ -564,9 +564,9 @@ pub fn call_tool(app: &App, name: &str, args: &Value) -> Result<Value, MemoryErr
         "code_map_load" => handle_code_map_load(app, args),
         "code_map_status" => handle_code_map_status(app, args),
         "symbol_graph_index" => handle_symbol_graph_index(app, args),
-        "symbol_graph_lookup" => handle_symbol_graph_lookup(app, args),
-        "symbol_graph_imports" => handle_symbol_graph_imports(app, args),
-        "symbol_graph_neighbors" => handle_symbol_graph_neighbors(app, args),
+        "symbol_lookup" | "symbol_graph_lookup" => handle_symbol_graph_lookup(app, args),
+        "symbol_imports" | "symbol_graph_imports" => handle_symbol_graph_imports(app, args),
+        "symbol_neighbors" | "symbol_graph_neighbors" => handle_symbol_graph_neighbors(app, args),
         _ => Err(MemoryError::Permission(format!(
             "Tool '{name}' is not available in the current MCP mode"
         ))),
@@ -612,6 +612,9 @@ fn tool_known(name: &str) -> bool {
             | "code_map_load"
             | "code_map_status"
             | "symbol_graph_index"
+            | "symbol_lookup"
+            | "symbol_imports"
+            | "symbol_neighbors"
             | "symbol_graph_lookup"
             | "symbol_graph_imports"
             | "symbol_graph_neighbors"
@@ -686,15 +689,15 @@ mod tests {
         ));
         assert!(tool_allowed_in_mode(
             McpAccessMode::ReadOnly,
-            "symbol_graph_lookup"
+            "symbol_lookup"
         ));
         assert!(tool_allowed_in_mode(
             McpAccessMode::ReadOnly,
-            "symbol_graph_imports"
+            "symbol_imports"
         ));
         assert!(tool_allowed_in_mode(
             McpAccessMode::ReadOnly,
-            "symbol_graph_neighbors"
+            "symbol_neighbors"
         ));
     }
 

@@ -2,9 +2,9 @@
 //!
 //! Tools:
 //! - `symbol_graph_index`  — index a repo (write-gated)
-//! - `symbol_graph_lookup` — look up symbols by name
-//! - `symbol_graph_imports`   — look up imports by file or module
-//! - `symbol_graph_neighbors` — look up edges by symbol id or file
+//! - `symbol_lookup` — look up symbols by name
+//! - `symbol_imports`   — look up imports by file or module
+//! - `symbol_neighbors` — look up edges by symbol id, name, or file
 
 use serde_json::{json, Value};
 
@@ -46,9 +46,7 @@ pub(super) fn handle_symbol_graph_index(app: &App, args: &Value) -> Result<Value
     let canonical = canonicalize_repo(repo_raw).map_err(|e| {
         // Log detail server-side; return generic message to client.
         eprintln!("[symbol-graph-mcp] index repo validation failed: {e}");
-        MemoryError::Validation(
-            "repo must be an accessible git worktree (absolute path required)".into(),
-        )
+        MemoryError::Validation("repo must be an accessible git worktree".into())
     })?;
 
     let result = index_repo(&app.db, &canonical, force).map_err(|e| {
@@ -69,7 +67,7 @@ pub(super) fn handle_symbol_graph_index(app: &App, args: &Value) -> Result<Value
     }))
 }
 
-/// `symbol_graph_lookup` — look up symbol declarations by name.
+/// `symbol_lookup` — look up symbol declarations by name.
 pub(super) fn handle_symbol_graph_lookup(app: &App, args: &Value) -> Result<Value, MemoryError> {
     let repo_raw = required_str(args, "repo")?;
     let query = required_str(args, "query")?;
@@ -78,9 +76,7 @@ pub(super) fn handle_symbol_graph_lookup(app: &App, args: &Value) -> Result<Valu
 
     let canonical = canonicalize_repo(repo_raw).map_err(|e| {
         eprintln!("[symbol-graph-mcp] lookup repo validation failed: {e}");
-        MemoryError::Validation(
-            "repo must be an accessible git worktree (absolute path required)".into(),
-        )
+        MemoryError::Validation("repo must be an accessible git worktree".into())
     })?;
 
     let symbols = lookup_symbols(&app.db, &canonical, query, kind, Some(limit))?;
@@ -109,7 +105,7 @@ pub(super) fn handle_symbol_graph_lookup(app: &App, args: &Value) -> Result<Valu
     Ok(json!({ "symbols": items, "count": items.len() }))
 }
 
-/// `symbol_graph_imports` — look up imports by file path or module name.
+/// `symbol_imports` — look up imports by file path or module name.
 pub(super) fn handle_symbol_graph_imports(app: &App, args: &Value) -> Result<Value, MemoryError> {
     let repo_raw = required_str(args, "repo")?;
     let query = required_str(args, "query")?;
@@ -117,9 +113,7 @@ pub(super) fn handle_symbol_graph_imports(app: &App, args: &Value) -> Result<Val
 
     let canonical = canonicalize_repo(repo_raw).map_err(|e| {
         eprintln!("[symbol-graph-mcp] imports repo validation failed: {e}");
-        MemoryError::Validation(
-            "repo must be an accessible git worktree (absolute path required)".into(),
-        )
+        MemoryError::Validation("repo must be an accessible git worktree".into())
     })?;
 
     let imports = lookup_imports(&app.db, &canonical, query, Some(limit))?;
@@ -144,7 +138,7 @@ pub(super) fn handle_symbol_graph_imports(app: &App, args: &Value) -> Result<Val
     Ok(json!({ "imports": items, "count": items.len() }))
 }
 
-/// `symbol_graph_neighbors` — look up edges by symbol id or file path.
+/// `symbol_neighbors` — look up edges by symbol id, name, or file path.
 pub(super) fn handle_symbol_graph_neighbors(app: &App, args: &Value) -> Result<Value, MemoryError> {
     let repo_raw = required_str(args, "repo")?;
     let query = required_str(args, "query")?;
@@ -152,9 +146,7 @@ pub(super) fn handle_symbol_graph_neighbors(app: &App, args: &Value) -> Result<V
 
     let canonical = canonicalize_repo(repo_raw).map_err(|e| {
         eprintln!("[symbol-graph-mcp] neighbors repo validation failed: {e}");
-        MemoryError::Validation(
-            "repo must be an accessible git worktree (absolute path required)".into(),
-        )
+        MemoryError::Validation("repo must be an accessible git worktree".into())
     })?;
 
     let edges = lookup_neighbors(&app.db, &canonical, query, Some(limit))?;
@@ -245,7 +237,7 @@ mod tests {
 
         let lookup = call_tool(
             &app,
-            "symbol_graph_lookup",
+            "symbol_lookup",
             &json!({ "repo": repo, "query": "my_fn" }),
         )
         .unwrap();
@@ -273,7 +265,7 @@ mod tests {
 
         let imp_result = call_tool(
             &app,
-            "symbol_graph_imports",
+            "symbol_imports",
             &json!({ "repo": repo, "query": "std::collections" }),
         )
         .unwrap();
@@ -302,7 +294,7 @@ mod tests {
 
         let nb_result = call_tool(
             &app,
-            "symbol_graph_neighbors",
+            "symbol_neighbors",
             &json!({ "repo": repo, "query": "lib.rs" }),
         )
         .unwrap();
@@ -338,46 +330,57 @@ mod tests {
     //    after indexing from a Trusted app.
     #[test]
     fn test_read_tools_allowed_in_readonly_mode() {
-        let trusted = test_app();
-        let (dir, repo) = make_git_repo("pub fn ronly() {}\n");
+        let db_dir = tempfile::tempdir().unwrap();
+        let db_path = db_dir.path().join("shared.sqlite3");
+        let trusted =
+            App::open_for_test_at_path_with_mode(&db_path, McpAccessMode::Trusted).unwrap();
+        let (dir, repo) = make_git_repo("use std::io;\npub fn ronly() {}\n");
 
         // Index via trusted app.
         call_tool(&trusted, "symbol_graph_index", &json!({ "repo": repo })).unwrap();
 
         // Now switch to a read-only app sharing the same DB.
-        let readonly = test_app_readonly();
+        let readonly =
+            App::open_for_test_at_path_with_mode(&db_path, McpAccessMode::ReadOnly).unwrap();
 
         let lookup = call_tool(
             &readonly,
-            "symbol_graph_lookup",
+            "symbol_lookup",
             &json!({ "repo": repo, "query": "ronly" }),
-        );
+        )
+        .unwrap();
+        let syms = lookup["symbols"].as_array().unwrap();
         assert!(
-            lookup.is_ok(),
-            "symbol_graph_lookup must be allowed in read-only mode: {lookup:?}"
+            syms.iter().any(|s| s["name"] == "ronly"),
+            "symbol_lookup must read indexed rows in read-only mode: {lookup}"
         );
 
         let imports = call_tool(
             &readonly,
-            "symbol_graph_imports",
-            &json!({ "repo": repo, "query": "lib.rs" }),
-        );
+            "symbol_imports",
+            &json!({ "repo": repo, "query": "std" }),
+        )
+        .unwrap();
+        let imps = imports["imports"].as_array().unwrap();
         assert!(
-            imports.is_ok(),
-            "symbol_graph_imports must be allowed in read-only mode: {imports:?}"
+            imps.iter().any(|i| i["module"] == "std"),
+            "symbol_imports must read indexed rows in read-only mode: {imports}"
         );
 
         let neighbors = call_tool(
             &readonly,
-            "symbol_graph_neighbors",
+            "symbol_neighbors",
             &json!({ "repo": repo, "query": "lib.rs" }),
-        );
+        )
+        .unwrap();
+        let edges = neighbors["edges"].as_array().unwrap();
         assert!(
-            neighbors.is_ok(),
-            "symbol_graph_neighbors must be allowed in read-only mode: {neighbors:?}"
+            edges.iter().any(|e| e["edge_kind"] == "import"),
+            "symbol_neighbors must read indexed rows in read-only mode: {neighbors}"
         );
 
         drop(dir);
+        drop(db_dir);
     }
 
     // 6. Traversal path in repo arg is rejected.
@@ -394,6 +397,37 @@ mod tests {
             result.is_err(),
             "traversal repo path must be rejected: {result:?}"
         );
+        let err = format!("{:?}", result.unwrap_err());
+        assert!(
+            err.contains("repo must be an accessible git worktree"),
+            "client-facing error should be generic: {err}"
+        );
+        assert!(
+            !err.contains("/tmp/../etc"),
+            "client-facing error must not echo raw path: {err}"
+        );
+    }
+
+    #[test]
+    fn test_index_error_redacts_filesystem_details() {
+        let app = test_app();
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().to_string_lossy().to_string();
+
+        let result = call_tool(&app, "symbol_graph_index", &json!({ "repo": repo }));
+        assert!(
+            result.is_err(),
+            "non-git directory must fail validation: {result:?}"
+        );
+        let err = format!("{:?}", result.unwrap_err());
+        assert!(
+            err.contains("repo must be an accessible git worktree"),
+            "client-facing error should be generic: {err}"
+        );
+        assert!(
+            !err.contains(dir.path().to_string_lossy().as_ref()),
+            "client-facing error must not include absolute filesystem path: {err}"
+        );
     }
 
     // 7. Explicit limit is enforced — results never exceed MAX_RESULTS.
@@ -407,7 +441,7 @@ mod tests {
         // Request limit=1 — must cap at 1.
         let result = call_tool(
             &app,
-            "symbol_graph_lookup",
+            "symbol_lookup",
             &json!({ "repo": repo, "query": "a", "limit": 1 }),
         )
         .unwrap();
@@ -417,7 +451,7 @@ mod tests {
         // Request limit=9999 — capped at MAX_RESULTS (100).
         let result_big = call_tool(
             &app,
-            "symbol_graph_lookup",
+            "symbol_lookup",
             &json!({ "repo": repo, "query": "a", "limit": 9999 }),
         )
         .unwrap();

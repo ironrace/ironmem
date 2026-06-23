@@ -331,14 +331,15 @@ Index and query a **local symbol/import graph** built from your Rust and Python 
 The graph is stored in SQLite alongside the memory store — no network required.
 
 **Supported languages (v0): Rust (`.rs`) and Python (`.py`) only.**
-TypeScript, JavaScript, and other extensions are skipped with a logged warning.
+TypeScript, JavaScript, and other extensions are skipped. Supported files larger
+than 1 MiB are skipped with a warning.
 
 ```bash
 # Index a repo (incremental by content-hash; re-runs only changed files)
-ironmem symbols index /path/to/repo
+ironmem symbols index --repo .
 
 # Force a full re-index even when content is unchanged
-ironmem symbols index --force /path/to/repo
+ironmem symbols index --repo /path/to/repo --force
 
 # Look up function/struct/class declarations by name
 ironmem symbols lookup --repo /path/to/repo "parse_file"
@@ -353,7 +354,7 @@ ironmem symbols imports --repo /path/to/repo "std::collections"
 ironmem symbols neighbors --repo /path/to/repo "src/db/schema.rs"
 
 # All commands support --json for structured output
-ironmem symbols index --json /path/to/repo
+ironmem symbols index --json --repo /path/to/repo
 ironmem symbols lookup --json --repo /path/to/repo "MyStruct"
 ```
 
@@ -366,7 +367,7 @@ Max snippet length is 512 bytes per field.
 resolution is not available in v0.
 
 The same index is also accessible via MCP tools (`symbol_graph_index`,
-`symbol_graph_lookup`, `symbol_graph_imports`, `symbol_graph_neighbors`) so
+`symbol_lookup`, `symbol_imports`, `symbol_neighbors`) so
 AI agents can query the graph without a shell.
 
 ## Current Status

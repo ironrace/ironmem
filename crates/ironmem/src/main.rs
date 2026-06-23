@@ -180,6 +180,7 @@ enum SymbolsCmd {
     /// Index a git repository (Rust + Python source files)
     Index {
         /// Path to the git repository root
+        #[arg(long)]
         repo: String,
         /// Re-index every file even if content hash is unchanged
         #[arg(long)]
