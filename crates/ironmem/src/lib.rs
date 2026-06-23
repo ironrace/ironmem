@@ -38,6 +38,10 @@ pub mod search;
 /// Lazy per-area code maps — freshness classification (issue #94).
 pub mod code_maps;
 
+/// Local symbol/import graph index — offline code-aware retrieval (migration 012).
+/// v0: Rust + Python only, regex/heuristic parsers, no network.
+pub mod symbol_graph;
+
 /// `ironmem doctor` — local setup diagnostics (issue #142).
 pub mod doctor;
 

@@ -325,6 +325,51 @@ Flags:
   - `SCOUT REQUIRED` — no usable map (missing, an invalid area name, or an
     untrustable git state); explore the area before relying on memory for it.
 
+### `ironmem symbols`
+
+Index and query a **local symbol/import graph** built from your Rust and Python sources.
+The graph is stored in SQLite alongside the memory store — no network required.
+
+**Supported languages (v0): Rust (`.rs`) and Python (`.py`) only.**
+TypeScript, JavaScript, and other extensions are skipped. Supported files larger
+than 1 MiB are skipped with a warning.
+
+```bash
+# Index a repo (incremental by content-hash; re-runs only changed files)
+ironmem symbols index --repo .
+
+# Force a full re-index even when content is unchanged
+ironmem symbols index --repo /path/to/repo --force
+
+# Look up function/struct/class declarations by name
+ironmem symbols lookup --repo /path/to/repo "parse_file"
+
+# Filter by kind
+ironmem symbols lookup --repo /path/to/repo --kind fn "handle_"
+
+# Find imports by file path (repo-relative) or module name
+ironmem symbols imports --repo /path/to/repo "std::collections"
+
+# Graph edges (import: file → module; contains: symbol → parent symbol)
+ironmem symbols neighbors --repo /path/to/repo "src/db/schema.rs"
+
+# All commands support --json for structured output
+ironmem symbols index --json --repo /path/to/repo
+ironmem symbols lookup --json --repo /path/to/repo "MyStruct"
+```
+
+**Storage note:** only declaration metadata is persisted (`signature`, `raw` import lines,
+spans, kind, visibility). No full source-file bodies are ever stored.
+Max snippet length is 512 bytes per field.
+
+**Edge scope (v0):** `import` (file → module from `use`/`import` statements) and
+`contains` (symbol → parent symbol for nested items). Cross-symbol call/reference
+resolution is not available in v0.
+
+The same index is also accessible via MCP tools (`symbol_graph_index`,
+`symbol_lookup`, `symbol_imports`, `symbol_neighbors`) so
+AI agents can query the graph without a shell.
+
 ## Current Status
 
 - MCP server works over stdio with non-blocking startup (responds to `initialize` in <25 ms)

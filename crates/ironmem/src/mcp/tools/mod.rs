@@ -15,6 +15,7 @@ mod drawers;
 mod handoff;
 mod kg;
 mod shared;
+mod symbol_graph;
 
 use code_maps::{handle_code_map_load, handle_code_map_status, handle_code_map_write};
 use collab_caps::{handle_collab_get_caps, handle_collab_register_caps};
@@ -32,6 +33,10 @@ use handoff::handle_session_handoff;
 use kg::{
     handle_find_tunnels, handle_graph_stats, handle_kg_add, handle_kg_invalidate, handle_kg_query,
     handle_kg_stats, handle_kg_timeline, handle_traverse,
+};
+use symbol_graph::{
+    handle_symbol_graph_imports, handle_symbol_graph_index, handle_symbol_graph_lookup,
+    handle_symbol_graph_neighbors,
 };
 
 /// Return tool definitions for tools/list.
@@ -438,6 +443,58 @@ pub fn tool_definitions(app: &App) -> Vec<Value> {
             }
         }),
         json!({
+            "name": "symbol_graph_index",
+            "description": "Index all Rust and Python source files in a git repository into the local symbol/import graph (migration 012). Only supported extensions (.rs, .py) are indexed; others are skipped. Incremental by content-hash: unchanged files are skipped unless --force. Write-mode only.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "repo": { "type": "string", "description": "Path to a git worktree root" },
+                    "force": { "type": "boolean", "default": false, "description": "Re-index even unchanged files" }
+                },
+                "required": ["repo"]
+            }
+        }),
+        json!({
+            "name": "symbol_lookup",
+            "description": "Look up symbol declarations (functions, structs, classes, etc.) in the indexed symbol graph by name or qualified name. Returns bounded metadata — no full source bodies.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "repo": { "type": "string", "description": "Path to the indexed git worktree root" },
+                    "query": { "type": "string", "description": "Name or qualified-name prefix to search for" },
+                    "kind": { "type": "string", "description": "Optional filter by kind (fn, struct, enum, class, trait, …)" },
+                    "limit": { "type": "integer", "default": 50, "description": "Max results (capped at 100)" }
+                },
+                "required": ["repo", "query"]
+            }
+        }),
+        json!({
+            "name": "symbol_imports",
+            "description": "Look up import statements in the indexed symbol graph by file path (repo-relative) or module name prefix. Returns bounded metadata.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "repo": { "type": "string", "description": "Path to the indexed git worktree root" },
+                    "query": { "type": "string", "description": "Repo-relative file path or module name prefix" },
+                    "limit": { "type": "integer", "default": 50, "description": "Max results (capped at 100)" }
+                },
+                "required": ["repo", "query"]
+            }
+        }),
+        json!({
+            "name": "symbol_neighbors",
+            "description": "Look up symbol-graph edges (import or contains) by symbol id, name, qualified name, or file path. v0 edge scope: import (file→module) and contains (symbol→parent symbol).",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "repo": { "type": "string", "description": "Path to the indexed git worktree root" },
+                    "query": { "type": "string", "description": "Symbol id, symbol/qualified name, or repo-relative file path prefix" },
+                    "limit": { "type": "integer", "default": 50, "description": "Max results (capped at 100)" }
+                },
+                "required": ["repo", "query"]
+            }
+        }),
+        json!({
             "name": "session_handoff",
             "description": "Issue (or byte-identically reuse) a one-time handoff token plus a deterministic, model-free session handoff block for an unplanned successor. Sets the pending generation; the successor presents handoff_token on its first mutating collab call to claim it, making this predecessor inert. The token is returned top-level (NOT inside the block) — the successor needs both.",
             "inputSchema": {
@@ -506,6 +563,10 @@ pub fn call_tool(app: &App, name: &str, args: &Value) -> Result<Value, MemoryErr
         "code_map_write" => handle_code_map_write(app, args),
         "code_map_load" => handle_code_map_load(app, args),
         "code_map_status" => handle_code_map_status(app, args),
+        "symbol_graph_index" => handle_symbol_graph_index(app, args),
+        "symbol_lookup" | "symbol_graph_lookup" => handle_symbol_graph_lookup(app, args),
+        "symbol_imports" | "symbol_graph_imports" => handle_symbol_graph_imports(app, args),
+        "symbol_neighbors" | "symbol_graph_neighbors" => handle_symbol_graph_neighbors(app, args),
         _ => Err(MemoryError::Permission(format!(
             "Tool '{name}' is not available in the current MCP mode"
         ))),
@@ -550,6 +611,13 @@ fn tool_known(name: &str) -> bool {
             | "code_map_write"
             | "code_map_load"
             | "code_map_status"
+            | "symbol_graph_index"
+            | "symbol_lookup"
+            | "symbol_imports"
+            | "symbol_neighbors"
+            | "symbol_graph_lookup"
+            | "symbol_graph_imports"
+            | "symbol_graph_neighbors"
     )
 }
 
@@ -575,6 +643,7 @@ fn tool_allowed_in_mode(mode: McpAccessMode, name: &str) -> bool {
                 | "collab_end"
                 | "session_handoff"
                 | "code_map_write"
+                | "symbol_graph_index"
         )
 }
 
@@ -604,6 +673,32 @@ mod tests {
         assert!(!tool_allowed_in_mode(McpAccessMode::ReadOnly, "add_drawer"));
         assert!(!tool_allowed_in_mode(McpAccessMode::Restricted, "kg_add"));
         assert!(tool_allowed_in_mode(McpAccessMode::Restricted, "search"));
+
+        // symbol_graph_index is write-gated; read tools are always allowed.
+        assert!(tool_allowed_in_mode(
+            McpAccessMode::Trusted,
+            "symbol_graph_index"
+        ));
+        assert!(!tool_allowed_in_mode(
+            McpAccessMode::ReadOnly,
+            "symbol_graph_index"
+        ));
+        assert!(!tool_allowed_in_mode(
+            McpAccessMode::Restricted,
+            "symbol_graph_index"
+        ));
+        assert!(tool_allowed_in_mode(
+            McpAccessMode::ReadOnly,
+            "symbol_lookup"
+        ));
+        assert!(tool_allowed_in_mode(
+            McpAccessMode::ReadOnly,
+            "symbol_imports"
+        ));
+        assert!(tool_allowed_in_mode(
+            McpAccessMode::ReadOnly,
+            "symbol_neighbors"
+        ));
     }
 
     #[test]

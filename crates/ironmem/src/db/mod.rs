@@ -8,6 +8,7 @@ pub mod knowledge_graph;
 pub mod metrics;
 pub mod read_only;
 pub mod schema;
+pub mod symbol_graph;
 pub mod wal;
 
 /// Search result types returned from drawer queries.
