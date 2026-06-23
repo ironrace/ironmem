@@ -20,11 +20,12 @@ const COLLAB_PLAN_DRAWERS_SQL: &str = include_str!("../../migrations/009_collab_
 const COLLAB_GENERATION_LEASE_SQL: &str =
     include_str!("../../migrations/010_collab_generation_lease.sql");
 const CODE_MAPS_SQL: &str = include_str!("../../migrations/011_code_maps.sql");
+const SYMBOL_IMPORT_GRAPH_SQL: &str = include_str!("../../migrations/012_symbol_import_graph.sql");
 
 /// Highest schema version a fully-migrated database reports. Bump alongside the
 /// `run_version_gated_migrations` ladder below so `ironmem doctor` can tell a
 /// behind-migration database from an up-to-date one.
-pub const LATEST_SCHEMA_VERSION: i64 = 11;
+pub const LATEST_SCHEMA_VERSION: i64 = 12;
 
 /// Database wrapper around a SQLite connection.
 ///
@@ -243,6 +244,12 @@ impl Database {
             self.conn.execute_batch(CODE_MAPS_SQL)?;
         }
 
+        // v12: local symbol/import graph index — code_index_files, code_symbols,
+        // code_imports, and code_symbol_edges tables for offline code-aware retrieval.
+        if current_version < 12 {
+            self.conn.execute_batch(SYMBOL_IMPORT_GRAPH_SQL)?;
+        }
+
         Ok(())
     }
 
@@ -407,7 +414,7 @@ mod tests {
         // fully-migrated database reports — doctor compares against it.
         let db = Database::open_in_memory().unwrap();
         assert_eq!(LATEST_SCHEMA_VERSION, db.schema_version().unwrap());
-        assert_eq!(LATEST_SCHEMA_VERSION, 11);
+        assert_eq!(LATEST_SCHEMA_VERSION, 12);
     }
 
     #[test]
@@ -660,7 +667,7 @@ mod tests {
     #[test]
     fn test_fresh_migrate_reaches_head_with_all_tables() {
         let db = Database::open_in_memory().unwrap();
-        assert_eq!(schema_version_of(&db), 11);
+        assert_eq!(schema_version_of(&db), 12);
         for t in METRICS_TABLES {
             assert!(table_exists(&db, t), "missing table {t}");
         }
@@ -678,7 +685,7 @@ mod tests {
             assert!(!table_exists(&db, t), "table {t} should not exist at v7");
         }
         db.migrate().unwrap();
-        assert_eq!(schema_version_of(&db), 11);
+        assert_eq!(schema_version_of(&db), 12);
         for t in METRICS_TABLES {
             assert!(table_exists(&db, t), "missing table {t} after upgrade");
         }
@@ -689,7 +696,7 @@ mod tests {
         let db = Database::open_in_memory().unwrap();
         db.migrate().unwrap();
         db.migrate().unwrap();
-        assert_eq!(schema_version_of(&db), 11);
+        assert_eq!(schema_version_of(&db), 12);
     }
 
     // ---- Migration 009 (plan-by-reference drawer-id columns) coverage ----
@@ -699,7 +706,7 @@ mod tests {
     #[test]
     fn test_fresh_migrate_reaches_v9_with_plan_drawer_columns() {
         let db = Database::open_in_memory().unwrap();
-        assert_eq!(schema_version_of(&db), 11);
+        assert_eq!(schema_version_of(&db), 12);
         for c in PLAN_DRAWER_COLUMNS {
             assert!(
                 column_exists(&db, "collab_sessions", c),
@@ -719,7 +726,7 @@ mod tests {
             );
         }
         db.migrate().unwrap();
-        assert_eq!(schema_version_of(&db), 11);
+        assert_eq!(schema_version_of(&db), 12);
         for c in PLAN_DRAWER_COLUMNS {
             assert!(
                 column_exists(&db, "collab_sessions", c),
@@ -753,7 +760,7 @@ mod tests {
             "lease table should not exist at v9"
         );
         db.migrate().unwrap();
-        assert_eq!(schema_version_of(&db), 11);
+        assert_eq!(schema_version_of(&db), 12);
         assert!(
             table_exists(&db, "collab_actor_generations"),
             "missing collab_actor_generations after upgrade"
@@ -817,10 +824,18 @@ mod tests {
 
     // ---- Migration 011 (code_maps table + token_usage exploration columns) ----
 
+    /// Build a connection migrated to exactly v11 (no symbol graph tables yet) by
+    /// replaying migrations 001-011 directly from the module consts.
+    fn open_at_v11() -> Database {
+        let db = open_at_v10();
+        db.conn.execute_batch(CODE_MAPS_SQL).unwrap();
+        db
+    }
+
     #[test]
-    fn test_fresh_migrate_reaches_v11() {
+    fn test_fresh_migrate_reaches_v11_tables() {
         let db = Database::open_in_memory().unwrap();
-        assert_eq!(schema_version_of(&db), 11);
+        assert_eq!(schema_version_of(&db), 12);
         assert!(table_exists(&db, "code_maps"), "code_maps table must exist");
     }
 
@@ -841,15 +856,15 @@ mod tests {
             );
         }
         db.migrate().unwrap();
-        assert_eq!(schema_version_of(&db), 11);
+        assert_eq!(schema_version_of(&db), 12);
         assert!(
             table_exists(&db, "code_maps"),
-            "code_maps must exist after upgrade to v11"
+            "code_maps must exist after upgrade to v11+"
         );
         for c in TOKEN_USAGE_V11_COLUMNS {
             assert!(
                 column_exists(&db, "token_usage", c),
-                "token_usage.{c} must exist after upgrade to v11"
+                "token_usage.{c} must exist after upgrade to v11+"
             );
         }
     }
@@ -871,7 +886,7 @@ mod tests {
             .unwrap();
 
         db.migrate().unwrap();
-        assert_eq!(schema_version_of(&db), 11);
+        assert_eq!(schema_version_of(&db), 12);
 
         // The pre-existing row must read back with the three new columns NULL.
         let (map_status, turn_id, area): (Option<String>, Option<String>, Option<String>) = db
@@ -893,6 +908,57 @@ mod tests {
         let db = Database::open_in_memory().unwrap();
         db.migrate().unwrap();
         db.migrate().unwrap();
+        assert_eq!(schema_version_of(&db), 12);
+    }
+
+    // ---- Migration 012 (symbol/import graph tables) ----
+
+    const SYMBOL_GRAPH_TABLES: [&str; 4] = [
+        "code_index_files",
+        "code_symbols",
+        "code_imports",
+        "code_symbol_edges",
+    ];
+
+    #[test]
+    fn test_fresh_migrate_reaches_v12() {
+        let db = Database::open_in_memory().unwrap();
+        assert_eq!(schema_version_of(&db), 12);
+        for t in SYMBOL_GRAPH_TABLES {
+            assert!(table_exists(&db, t), "missing table {t} at v12");
+        }
+        assert!(index_exists(&db, "idx_code_symbols_repo_name"));
+        assert!(index_exists(&db, "idx_code_symbols_repo_qname"));
+        assert!(index_exists(&db, "idx_code_symbols_repo_path"));
+        assert!(index_exists(&db, "idx_code_imports_repo_module"));
+        assert!(index_exists(&db, "idx_code_imports_repo_path"));
+        assert!(index_exists(&db, "idx_code_symbol_edges_repo_from"));
+        assert!(index_exists(&db, "idx_code_symbol_edges_repo_to"));
+        assert!(index_exists(&db, "idx_code_symbol_edges_repo_kind"));
+    }
+
+    #[test]
+    fn test_v11_to_v12_upgrade_adds_symbol_graph_tables() {
+        let db = open_at_v11();
         assert_eq!(schema_version_of(&db), 11);
+        for t in SYMBOL_GRAPH_TABLES {
+            assert!(!table_exists(&db, t), "table {t} should not exist at v11");
+        }
+        db.migrate().unwrap();
+        assert_eq!(schema_version_of(&db), 12);
+        for t in SYMBOL_GRAPH_TABLES {
+            assert!(
+                table_exists(&db, t),
+                "missing table {t} after upgrade to v12"
+            );
+        }
+    }
+
+    #[test]
+    fn test_migrate_twice_idempotent_v12() {
+        let db = Database::open_in_memory().unwrap();
+        db.migrate().unwrap();
+        db.migrate().unwrap();
+        assert_eq!(schema_version_of(&db), 12);
     }
 }
