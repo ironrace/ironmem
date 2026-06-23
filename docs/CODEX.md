@@ -21,6 +21,9 @@ What works now:
 - Codex plugin packaging
 - Automatic migrate-or-init bootstrap on first use
 - Stale `bootstrap.lock` files from crashed processes are auto-cleared on next startup
+- **Symbol/import graph index** — local, offline, SQLite-backed code index for Rust and
+  Python sources (migration 012); accessible via `ironmem symbols …` CLI or the
+  `symbol_graph_*` MCP tools (see [Symbol Graph](#symbol-import-graph) below)
 
 What hooks currently do on `stop` / `precompact`:
 
@@ -315,6 +318,77 @@ All flags:
 | `--debug-stderr` | false | Redirect server stderr to `/tmp/ironmem-*-stderr-*.log` |
 | `--output-json PATH` | — | Write machine-readable results to a JSON file |
 | `--keep-temp` | false | Keep temp benchmark workspace for inspection |
+
+## Symbol/Import Graph
+
+ironmem includes a **local, offline code index** for Rust and Python sources
+(migration 012, schema v12). The index is stored in the same SQLite database as
+the rest of memory — no extra process or network required.
+
+### Supported languages (v0)
+
+**Rust (`.rs`) and Python (`.py`) only.** Other extensions are logged and
+skipped; they do not cause errors. TypeScript, JavaScript, Go, etc. are
+explicitly unsupported in v0.
+
+### Persisted metadata
+
+Only declaration metadata is stored — **no full source bodies**:
+
+| Field | Stored? | Notes |
+|-------|---------|-------|
+| Symbol kind, name, qualified name | Yes | `fn`, `struct`, `class`, etc. |
+| Declaration signature | Yes, ≤ 512 bytes | First line of the declaration |
+| Span (start line, col; end line) | Yes | |
+| Visibility | Yes | `pub`, `pub(crate)`, `private`, etc. |
+| Import module, symbol, alias | Yes | |
+| Raw import line | Yes, ≤ 512 bytes | |
+| Full source file content | **No** | Never stored |
+
+### Edge scope (v0)
+
+| Edge kind | Meaning |
+|-----------|---------|
+| `import` | file → module (from `use`/`import` statements) |
+| `contains` | symbol → parent symbol (nested items) |
+
+Cross-symbol call/reference resolution is **not available in v0** — the
+`code_symbol_edges` table is created for forward-compatibility but only
+`import` and `contains` edges are emitted by the indexer.
+
+### MCP access-mode implications
+
+| Tool | Mode requirement |
+|------|-----------------|
+| `symbol_graph_index` | **write-mode only** (`IRONMEM_MCP_MODE=trusted`) |
+| `symbol_graph_lookup` | read-mode allowed (ReadOnly, Restricted, Trusted) |
+| `symbol_graph_imports` | read-mode allowed |
+| `symbol_graph_neighbors` | read-mode allowed |
+
+All read tools enforce a hard result cap of **100 items** per call to prevent
+unbounded responses. Raw FS/git errors are never returned to the client;
+they are `eprintln!`'d server-side and the client receives a generic
+validation error.
+
+### CLI quick-start
+
+```bash
+# Index (incremental; re-runs only changed files by content-hash)
+ironmem symbols index /path/to/repo
+
+# Look up symbols
+ironmem symbols lookup --repo /path/to/repo "parse_file"
+ironmem symbols lookup --repo /path/to/repo --kind struct "Config"
+
+# Imports
+ironmem symbols imports --repo /path/to/repo "std::collections"
+
+# Edges
+ironmem symbols neighbors --repo /path/to/repo "src/lib.rs"
+
+# JSON output for scripting
+ironmem symbols index --json /path/to/repo
+```
 
 ## Benchmark Caveats
 
