@@ -4,6 +4,7 @@ use std::process;
 use ironmem::MemoryError;
 use ironmem::{
     bootstrap, config, context, dashboard, ingest, launcher, mcp, migrate, reembed, report,
+    symbol_graph,
 };
 
 #[derive(Parser)]
@@ -146,6 +147,11 @@ enum Commands {
         #[arg(long)]
         json: bool,
     },
+    /// Build or query the local symbol/import graph index
+    Symbols {
+        #[command(subcommand)]
+        cmd: SymbolsCmd,
+    },
     /// Launch Codex in a repo with the ironmem MCP server attached
     Codex {
         /// Repository path to launch in
@@ -165,6 +171,67 @@ enum Commands {
         /// Approximate token budget for pre-injected context
         #[arg(long, default_value_t = ironmem::context::DEFAULT_BUDGET_TOKENS)]
         budget: usize,
+    },
+}
+
+/// Subcommands nested under `ironmem symbols`.
+#[derive(Subcommand)]
+enum SymbolsCmd {
+    /// Index a git repository (Rust + Python source files)
+    Index {
+        /// Path to the git repository root
+        repo: String,
+        /// Re-index every file even if content hash is unchanged
+        #[arg(long)]
+        force: bool,
+        /// Emit JSON instead of prose summary
+        #[arg(long)]
+        json: bool,
+    },
+    /// Look up symbol declarations by name
+    Lookup {
+        /// Path to the git repository root
+        #[arg(long)]
+        repo: String,
+        /// Name or qualified-name prefix to search for
+        query: String,
+        /// Filter by kind (fn, struct, enum, class, …)
+        #[arg(long)]
+        kind: Option<String>,
+        /// Maximum number of results (capped at 200)
+        #[arg(long)]
+        limit: Option<usize>,
+        /// Emit JSON instead of prose
+        #[arg(long)]
+        json: bool,
+    },
+    /// Look up import statements by file path or module name
+    Imports {
+        /// Path to the git repository root
+        #[arg(long)]
+        repo: String,
+        /// File path (repo-relative) or module name prefix
+        query: String,
+        /// Maximum number of results (capped at 200)
+        #[arg(long)]
+        limit: Option<usize>,
+        /// Emit JSON instead of prose
+        #[arg(long)]
+        json: bool,
+    },
+    /// Look up symbol-graph edges (neighbors) by symbol id or file path
+    Neighbors {
+        /// Path to the git repository root
+        #[arg(long)]
+        repo: String,
+        /// Symbol id or file path prefix
+        query: String,
+        /// Maximum number of results (capped at 200)
+        #[arg(long)]
+        limit: Option<usize>,
+        /// Emit JSON instead of prose
+        #[arg(long)]
+        json: bool,
     },
 }
 
@@ -372,6 +439,91 @@ async fn run(cli: Cli) -> Result<(), MemoryError> {
                 model_dir: cfg.model_dir.clone(),
             };
             dashboard::run_dashboard(dash_cfg).await
+        }
+        Commands::Symbols { cmd } => {
+            let cfg = config::Config::load(None)?;
+            let db = ironmem::db::schema::Database::open(&cfg.db_path)?;
+            db.migrate()?;
+            match cmd {
+                SymbolsCmd::Index { repo, force, json } => {
+                    let result = symbol_graph::index_repo(&db, &repo, force)?;
+                    if json {
+                        println!("{}", serde_json::to_string_pretty(&result)?);
+                    } else {
+                        eprintln!(
+                            "indexed: {} files, {} symbols, {} imports, {} edges ({} skipped, {} purged)",
+                            result.files_indexed,
+                            result.symbols_inserted,
+                            result.imports_inserted,
+                            result.edges_inserted,
+                            result.files_skipped,
+                            result.files_purged,
+                        );
+                    }
+                }
+                SymbolsCmd::Lookup {
+                    repo,
+                    query,
+                    kind,
+                    limit,
+                    json,
+                } => {
+                    let canonical = symbol_graph::canonicalize_repo(&repo)?;
+                    let results = symbol_graph::lookup_symbols(
+                        &db,
+                        &canonical,
+                        &query,
+                        kind.as_deref(),
+                        limit,
+                    )?;
+                    if json {
+                        println!("{}", serde_json::to_string_pretty(&results)?);
+                    } else {
+                        for s in &results {
+                            println!(
+                                "{} {} {}:{} ({})",
+                                s.kind, s.qualified_name, s.path, s.start_line, s.language,
+                            );
+                        }
+                        eprintln!("{} result(s)", results.len());
+                    }
+                }
+                SymbolsCmd::Imports {
+                    repo,
+                    query,
+                    limit,
+                    json,
+                } => {
+                    let canonical = symbol_graph::canonicalize_repo(&repo)?;
+                    let results = symbol_graph::lookup_imports(&db, &canonical, &query, limit)?;
+                    if json {
+                        println!("{}", serde_json::to_string_pretty(&results)?);
+                    } else {
+                        for imp in &results {
+                            println!("{} → {} (line {})", imp.path, imp.module, imp.line);
+                        }
+                        eprintln!("{} result(s)", results.len());
+                    }
+                }
+                SymbolsCmd::Neighbors {
+                    repo,
+                    query,
+                    limit,
+                    json,
+                } => {
+                    let canonical = symbol_graph::canonicalize_repo(&repo)?;
+                    let results = symbol_graph::lookup_neighbors(&db, &canonical, &query, limit)?;
+                    if json {
+                        println!("{}", serde_json::to_string_pretty(&results)?);
+                    } else {
+                        for e in &results {
+                            println!("{} --{}--> {}", e.from_id, e.edge_kind, e.to_ref);
+                        }
+                        eprintln!("{} result(s)", results.len());
+                    }
+                }
+            }
+            Ok(())
         }
         Commands::WriteRules { target, workspace } => {
             use ironmem::write_rules::{validate_rules_file, write_rules_file, WriteOutcome};

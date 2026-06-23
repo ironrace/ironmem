@@ -1,5 +1,5 @@
 use std::io::Write;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 use ironmem::config::{Config, EmbedMode, McpAccessMode};
@@ -301,4 +301,179 @@ fn cli_report_json_smoke_test() {
         value.get("headline").is_some(),
         "report JSON missing headline: {stdout}"
     );
+}
+
+// ── Helper: create a minimal git repo with one committed Rust file ──────────
+
+fn make_git_repo_with_rust(root: &Path, rs_content: &str) {
+    std::fs::create_dir_all(root).unwrap();
+    Command::new("git")
+        .args(["init", "-b", "main"])
+        .current_dir(root)
+        .output()
+        .unwrap();
+    Command::new("git")
+        .args(["config", "user.email", "test@example.com"])
+        .current_dir(root)
+        .output()
+        .unwrap();
+    Command::new("git")
+        .args(["config", "user.name", "Test"])
+        .current_dir(root)
+        .output()
+        .unwrap();
+    std::fs::write(root.join("lib.rs"), rs_content).unwrap();
+    Command::new("git")
+        .args(["add", "-A"])
+        .current_dir(root)
+        .output()
+        .unwrap();
+    Command::new("git")
+        .args(["commit", "-m", "init"])
+        .current_dir(root)
+        .output()
+        .unwrap();
+}
+
+fn symbols_cmd(db_path: &PathBuf, home: &Path) -> Command {
+    let mut cmd = Command::new(bin());
+    cmd.env("HOME", home)
+        .env("IRONMEM_DB_PATH", db_path)
+        .env("IRONMEM_EMBED_MODE", "noop")
+        .env("IRONMEM_AUTO_BOOTSTRAP", "0")
+        .env("IRONMEM_MCP_MODE", "trusted");
+    cmd
+}
+
+#[test]
+fn cli_symbols_index_lookup_imports_neighbors_smoke() {
+    let temp = tempfile::tempdir().unwrap();
+    let home = temp.path().join("home");
+    let db_path = temp.path().join("symbols.sqlite3");
+    let repo = temp.path().join("repo");
+    std::fs::create_dir_all(&home).unwrap();
+
+    {
+        let db = Database::open(&db_path).unwrap();
+        db.migrate().unwrap();
+    }
+
+    make_git_repo_with_rust(
+        &repo,
+        "use std::collections::HashMap;\npub fn greet(name: &str) -> String { name.to_string() }\n",
+    );
+
+    // ── index ──────────────────────────────────────────────────────────────
+    let index_out = symbols_cmd(&db_path, &home)
+        .args(["symbols", "index", "--json"])
+        .arg(&repo)
+        .output()
+        .unwrap();
+    assert!(
+        index_out.status.success(),
+        "symbols index failed: {index_out:?}"
+    );
+    let index_json: serde_json::Value =
+        serde_json::from_slice(&index_out.stdout).expect("symbols index --json must emit JSON");
+    assert!(
+        index_json["files_indexed"].as_u64().unwrap_or(0) >= 1,
+        "should index at least 1 file: {index_json}"
+    );
+    assert!(
+        index_json["symbols_inserted"].as_u64().unwrap_or(0) >= 1,
+        "should insert at least 1 symbol: {index_json}"
+    );
+    assert!(
+        index_json["imports_inserted"].as_u64().unwrap_or(0) >= 1,
+        "should insert at least 1 import: {index_json}"
+    );
+
+    let repo_str = repo.to_string_lossy().to_string();
+
+    // ── lookup ─────────────────────────────────────────────────────────────
+    let lookup_out = symbols_cmd(&db_path, &home)
+        .args(["symbols", "lookup", "--repo", &repo_str, "--json", "greet"])
+        .output()
+        .unwrap();
+    assert!(
+        lookup_out.status.success(),
+        "symbols lookup failed: {lookup_out:?}"
+    );
+    let lookup_json: serde_json::Value =
+        serde_json::from_slice(&lookup_out.stdout).expect("symbols lookup --json must emit JSON");
+    let syms = lookup_json.as_array().expect("lookup must return array");
+    assert!(
+        syms.iter()
+            .any(|s| s["name"].as_str() == Some("greet") && s["kind"].as_str() == Some("fn")),
+        "lookup must find 'greet' fn: {lookup_json}"
+    );
+    // Verify shape: path, start_line, signature present.
+    let greet = syms.iter().find(|s| s["name"] == "greet").unwrap();
+    assert!(greet["path"].is_string(), "symbol must have path");
+    assert!(
+        greet["start_line"].is_number(),
+        "symbol must have start_line"
+    );
+
+    // ── imports ────────────────────────────────────────────────────────────
+    let imports_out = symbols_cmd(&db_path, &home)
+        .args([
+            "symbols",
+            "imports",
+            "--repo",
+            &repo_str,
+            "--json",
+            "std::collections",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        imports_out.status.success(),
+        "symbols imports failed: {imports_out:?}"
+    );
+    let imports_json: serde_json::Value =
+        serde_json::from_slice(&imports_out.stdout).expect("symbols imports --json must emit JSON");
+    let imps = imports_json.as_array().expect("imports must return array");
+    assert!(
+        imps.iter()
+            .any(|i| i["module"].as_str() == Some("std::collections")),
+        "imports must find std::collections: {imports_json}"
+    );
+    let imp = imps
+        .iter()
+        .find(|i| i["module"] == "std::collections")
+        .unwrap();
+    assert!(imp["path"].is_string(), "import must have path");
+    assert!(imp["line"].is_number(), "import must have line");
+
+    // ── neighbors ──────────────────────────────────────────────────────────
+    let neighbors_out = symbols_cmd(&db_path, &home)
+        .args([
+            "symbols",
+            "neighbors",
+            "--repo",
+            &repo_str,
+            "--json",
+            "lib.rs",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        neighbors_out.status.success(),
+        "symbols neighbors failed: {neighbors_out:?}"
+    );
+    let neighbors_json: serde_json::Value = serde_json::from_slice(&neighbors_out.stdout)
+        .expect("symbols neighbors --json must emit JSON");
+    let edges = neighbors_json
+        .as_array()
+        .expect("neighbors must return array");
+    // At least one import edge from lib.rs → std::collections.
+    assert!(
+        !edges.is_empty(),
+        "neighbors for lib.rs must include import edges: {neighbors_json}"
+    );
+    let edge = &edges[0];
+    assert!(edge["from_id"].is_string(), "edge must have from_id");
+    assert!(edge["to_ref"].is_string(), "edge must have to_ref");
+    assert!(edge["edge_kind"].is_string(), "edge must have edge_kind");
 }
