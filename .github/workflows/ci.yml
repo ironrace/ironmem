@@ -72,6 +72,12 @@ jobs:
           rustup default stable
           echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
 
+      # macOS Xcode rotation can remove the selected Xcode's clang compiler-rt,
+      # breaking `clang_rt.osx` linking. Pin a present, validated Xcode. (#171)
+      - name: Pin a present Xcode toolchain (macOS clang_rt.osx linker fix, #171)
+        if: runner.os == 'macOS'
+        uses: ./.github/actions/pin-xcode
+
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32  # v2
 
       - name: cargo test
@@ -104,6 +110,12 @@ jobs:
         run: |
           rustup default stable
           echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+
+      # See the same step in the `test` job — macOS Xcode rotation breaks
+      # `clang_rt.osx` linking; pin a present Xcode. (#171)
+      - name: Pin a present Xcode toolchain (macOS clang_rt.osx linker fix, #171)
+        if: runner.os == 'macOS'
+        uses: ./.github/actions/pin-xcode
 
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32  # v2
 
