@@ -92,12 +92,19 @@ jobs:
           fi
           echo "Selecting Xcode: $pick"
           sudo xcode-select -s "$pick/Contents/Developer"
-          xcode-select -p
-          clang_rt=$(find "$(xcode-select -p)" -name 'libclang_rt.osx.a' 2>/dev/null | head -1 || true)
-          echo "clang_rt.osx: ${clang_rt:-<not found>}"
-          if [ -z "$clang_rt" ]; then
-            echo "::error::clang_rt.osx still missing after Xcode reselect (#171)"; exit 1
+          # A stale build cache (or stale DEVELOPER_DIR) can still pass a -L for
+          # a removed Xcode's clang/<ver>/lib/darwin, so `-lclang_rt.osx` fails to
+          # resolve. Add the *currently selected* clang's compiler-rt dir to the
+          # link search path; the removed one degrades to a harmless warning.
+          darwin_lib="$(clang -print-resource-dir)/lib/darwin"
+          echo "compiler-rt dir: $darwin_lib"
+          if [ ! -f "$darwin_lib/libclang_rt.osx.a" ]; then
+            echo "::error::libclang_rt.osx.a not found under $darwin_lib (#171)"; exit 1
           fi
+          {
+            echo "DEVELOPER_DIR=$pick/Contents/Developer"
+            echo "RUSTFLAGS=-L $darwin_lib ${RUSTFLAGS:-}"
+          } >> "$GITHUB_ENV"
 
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32  # v2
 
@@ -149,12 +156,19 @@ jobs:
           fi
           echo "Selecting Xcode: $pick"
           sudo xcode-select -s "$pick/Contents/Developer"
-          xcode-select -p
-          clang_rt=$(find "$(xcode-select -p)" -name 'libclang_rt.osx.a' 2>/dev/null | head -1 || true)
-          echo "clang_rt.osx: ${clang_rt:-<not found>}"
-          if [ -z "$clang_rt" ]; then
-            echo "::error::clang_rt.osx still missing after Xcode reselect (#171)"; exit 1
+          # A stale build cache (or stale DEVELOPER_DIR) can still pass a -L for
+          # a removed Xcode's clang/<ver>/lib/darwin, so `-lclang_rt.osx` fails to
+          # resolve. Add the *currently selected* clang's compiler-rt dir to the
+          # link search path; the removed one degrades to a harmless warning.
+          darwin_lib="$(clang -print-resource-dir)/lib/darwin"
+          echo "compiler-rt dir: $darwin_lib"
+          if [ ! -f "$darwin_lib/libclang_rt.osx.a" ]; then
+            echo "::error::libclang_rt.osx.a not found under $darwin_lib (#171)"; exit 1
           fi
+          {
+            echo "DEVELOPER_DIR=$pick/Contents/Developer"
+            echo "RUSTFLAGS=-L $darwin_lib ${RUSTFLAGS:-}"
+          } >> "$GITHUB_ENV"
 
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32  # v2
 
