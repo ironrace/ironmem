@@ -72,6 +72,33 @@ jobs:
           rustup default stable
           echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
 
+      # The macos-latest runner image periodically rotates Xcode versions.
+      # When the previously-selected Xcode (e.g. Xcode_16.4) is removed,
+      # clang's compiler-rt resource dir disappears and linking fails with
+      # `ld: library 'clang_rt.osx' not found`. Reselect a present Xcode and
+      # fail loudly if the builtins library is still missing. (#171)
+      - name: Pin a present Xcode toolchain (macOS clang_rt.osx linker fix, #171)
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -d /Applications/Xcode.app/Contents/Developer ]; then
+            pick=/Applications/Xcode.app
+          else
+            pick=$(ls -d /Applications/Xcode_*.app 2>/dev/null | grep -vi beta | sort -V | tail -1)
+          fi
+          if [ -z "${pick:-}" ]; then
+            echo "::error::No usable Xcode found under /Applications (#171)"; exit 1
+          fi
+          echo "Selecting Xcode: $pick"
+          sudo xcode-select -s "$pick/Contents/Developer"
+          xcode-select -p
+          clang_rt=$(find "$(xcode-select -p)" -name 'libclang_rt.osx.a' 2>/dev/null | head -1 || true)
+          echo "clang_rt.osx: ${clang_rt:-<not found>}"
+          if [ -z "$clang_rt" ]; then
+            echo "::error::clang_rt.osx still missing after Xcode reselect (#171)"; exit 1
+          fi
+
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32  # v2
 
       - name: cargo test
@@ -104,6 +131,30 @@ jobs:
         run: |
           rustup default stable
           echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+
+      # See the same step in the `test` job — macOS Xcode rotation breaks
+      # `clang_rt.osx` linking; reselect a present Xcode. (#171)
+      - name: Pin a present Xcode toolchain (macOS clang_rt.osx linker fix, #171)
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -d /Applications/Xcode.app/Contents/Developer ]; then
+            pick=/Applications/Xcode.app
+          else
+            pick=$(ls -d /Applications/Xcode_*.app 2>/dev/null | grep -vi beta | sort -V | tail -1)
+          fi
+          if [ -z "${pick:-}" ]; then
+            echo "::error::No usable Xcode found under /Applications (#171)"; exit 1
+          fi
+          echo "Selecting Xcode: $pick"
+          sudo xcode-select -s "$pick/Contents/Developer"
+          xcode-select -p
+          clang_rt=$(find "$(xcode-select -p)" -name 'libclang_rt.osx.a' 2>/dev/null | head -1 || true)
+          echo "clang_rt.osx: ${clang_rt:-<not found>}"
+          if [ -z "$clang_rt" ]; then
+            echo "::error::clang_rt.osx still missing after Xcode reselect (#171)"; exit 1
+          fi
 
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32  # v2
 

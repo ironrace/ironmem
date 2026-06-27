@@ -27,6 +27,30 @@ jobs:
         with:
           toolchain: stable
 
+      # macOS Xcode rotation breaks `clang_rt.osx` linking; reselect a
+      # present Xcode and fail loudly if the builtins lib is missing. (#171)
+      - name: Pin a present Xcode toolchain (macOS clang_rt.osx linker fix, #171)
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -d /Applications/Xcode.app/Contents/Developer ]; then
+            pick=/Applications/Xcode.app
+          else
+            pick=$(ls -d /Applications/Xcode_*.app 2>/dev/null | grep -vi beta | sort -V | tail -1)
+          fi
+          if [ -z "${pick:-}" ]; then
+            echo "::error::No usable Xcode found under /Applications (#171)"; exit 1
+          fi
+          echo "Selecting Xcode: $pick"
+          sudo xcode-select -s "$pick/Contents/Developer"
+          xcode-select -p
+          clang_rt=$(find "$(xcode-select -p)" -name 'libclang_rt.osx.a' 2>/dev/null | head -1 || true)
+          echo "clang_rt.osx: ${clang_rt:-<not found>}"
+          if [ -z "$clang_rt" ]; then
+            echo "::error::clang_rt.osx still missing after Xcode reselect (#171)"; exit 1
+          fi
+
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32  # v2
 
       - name: Verify plugin versions
