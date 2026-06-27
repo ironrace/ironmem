@@ -1,0 +1,53 @@
+name: Pin a present Xcode toolchain
+description: >-
+  Select a present, validated Xcode on macOS and pin DEVELOPER_DIR plus a valid
+  compiler-rt link path for all later steps in the job. Fixes the
+  `ld: library 'clang_rt.osx' not found` linker failure that occurs when the
+  runner's selected Xcode is rotated out from under the build (#171). The
+  caller is responsible for gating this on macOS (`if: runner.os == 'macOS'`).
+runs:
+  using: composite
+  steps:
+    - shell: bash
+      run: |
+        set -euo pipefail
+        # The runner's selected Xcode (via DEVELOPER_DIR or xcode-select) can
+        # point at a rotated-out Xcode whose clang compiler-rt is gone, so
+        # linking fails with `ld: library 'clang_rt.osx' not found`. Select a
+        # present, validated Xcode and derive the resource dir FROM it.
+        if [ -d /Applications/Xcode.app/Contents/Developer ]; then
+          dev=/Applications/Xcode.app/Contents/Developer
+        else
+          # Capture the candidate first so the friendly guard below — not a bare
+          # `set -e`/pipefail abort on the assignment — owns the no-Xcode path.
+          base="$(ls -d /Applications/Xcode_*.app 2>/dev/null | grep -vi beta | sort -V | tail -1 || true)"
+          if [ -z "$base" ]; then
+            echo "::error::No usable (non-beta) Xcode found under /Applications (#171)"; exit 1
+          fi
+          dev="$base/Contents/Developer"
+        fi
+        if [ ! -d "$dev" ]; then
+          echo "::error::Selected Xcode has no Developer dir: $dev (#171)"; exit 1
+        fi
+        echo "Using Xcode: $dev"
+        sudo xcode-select -s "$dev"
+        # Override any stale inherited DEVELOPER_DIR NOW, before probing clang,
+        # so the resource dir resolves against the Xcode we just pinned.
+        export DEVELOPER_DIR="$dev"
+        # Capture-then-guard again so a clang failure fires the #171 message
+        # rather than a bare abort on the assignment.
+        if ! resource_dir="$(clang -print-resource-dir 2>/dev/null)" || [ -z "$resource_dir" ]; then
+          echo "::error::clang -print-resource-dir failed under DEVELOPER_DIR=$dev (#171)"; exit 1
+        fi
+        darwin_lib="$resource_dir/lib/darwin"
+        echo "compiler-rt dir: $darwin_lib"
+        if [ ! -f "$darwin_lib/libclang_rt.osx.a" ]; then
+          echo "::error::libclang_rt.osx.a not found under $darwin_lib (#171)"; exit 1
+        fi
+        # Propagate to every later step in the job: pin the toolchain and add
+        # the valid compiler-rt dir to the link search path. Changing RUSTFLAGS
+        # also busts any stale build cache carrying a dead -L path.
+        {
+          echo "DEVELOPER_DIR=$dev"
+          echo "RUSTFLAGS=-L $darwin_lib ${RUSTFLAGS:-}"
+        } >> "$GITHUB_ENV"

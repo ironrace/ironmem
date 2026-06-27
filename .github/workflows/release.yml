@@ -27,42 +27,11 @@ jobs:
         with:
           toolchain: stable
 
-      # macOS Xcode rotation breaks `clang_rt.osx` linking; reselect a
-      # present Xcode and fail loudly if the builtins lib is missing. (#171)
+      # macOS Xcode rotation breaks `clang_rt.osx` linking; pin a present,
+      # validated Xcode. (#171)
       - name: Pin a present Xcode toolchain (macOS clang_rt.osx linker fix, #171)
         if: runner.os == 'macOS'
-        shell: bash
-        run: |
-          set -euo pipefail
-          # The runner's selected Xcode (via DEVELOPER_DIR or xcode-select) can
-          # point at a rotated-out Xcode whose clang compiler-rt is gone, so
-          # linking fails with `ld: library 'clang_rt.osx' not found`. Pin to a
-          # guaranteed-present Xcode and derive the resource dir FROM it.
-          if [ -d /Applications/Xcode.app/Contents/Developer ]; then
-            dev=/Applications/Xcode.app/Contents/Developer
-          else
-            dev="$(ls -d /Applications/Xcode_*.app 2>/dev/null | grep -vi beta | sort -V | tail -1)/Contents/Developer"
-          fi
-          if [ ! -d "$dev" ]; then
-            echo "::error::No usable Xcode found under /Applications (#171)"; exit 1
-          fi
-          echo "Using Xcode: $dev"
-          sudo xcode-select -s "$dev"
-          # Override any stale inherited DEVELOPER_DIR NOW, before probing clang,
-          # so the resource dir resolves against the Xcode we just pinned.
-          export DEVELOPER_DIR="$dev"
-          darwin_lib="$(clang -print-resource-dir)/lib/darwin"
-          echo "compiler-rt dir: $darwin_lib"
-          if [ ! -f "$darwin_lib/libclang_rt.osx.a" ]; then
-            echo "::error::libclang_rt.osx.a not found under $darwin_lib (#171)"; exit 1
-          fi
-          # Propagate to every later step (cargo build): pin the toolchain and
-          # add the valid compiler-rt dir to the link search path. Changing
-          # RUSTFLAGS also busts any stale build cache carrying a dead -L path.
-          {
-            echo "DEVELOPER_DIR=$dev"
-            echo "RUSTFLAGS=-L $darwin_lib ${RUSTFLAGS:-}"
-          } >> "$GITHUB_ENV"
+        uses: ./.github/actions/pin-xcode
 
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32  # v2
 
