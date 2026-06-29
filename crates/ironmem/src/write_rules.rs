@@ -559,6 +559,24 @@ mod tests {
     fn resolve_write_targets_unknown_harness_errors() {
         let err = resolve_write_targets(None, Some("gemini"), REGISTRY).unwrap_err();
         assert!(matches!(err, MemoryError::Validation(_)));
+        let msg = err.to_string();
+        assert!(
+            msg.contains("claude"),
+            "error must list known harness id 'claude'; got: {msg}"
+        );
+        assert!(
+            msg.contains("codex"),
+            "error must list known harness id 'codex'; got: {msg}"
+        );
+    }
+
+    #[test]
+    fn resolve_write_targets_both_args_errors() {
+        let err = resolve_write_targets(Some("CLAUDE.md"), Some("codex"), REGISTRY).unwrap_err();
+        assert!(
+            matches!(err, MemoryError::Validation(_)),
+            "both --target and --harness must produce a Validation error; got: {err:?}"
+        );
     }
 
     #[test]
