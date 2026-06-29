@@ -102,17 +102,50 @@ class TestCodexMapping(unittest.TestCase):
         self.assertEqual(total - excl, row.cx_cache_read)
 
     def test_reverting_subtraction_would_break_mapping(self):
-        """Regression guard: if noncached_input were input - cache_read, this fails.
+        """Regression guard exercised through load_rows (the real mapping site).
 
-        Prior (wrong) mapping: noncached = input_tokens - cached_input_tokens
-        In that model, total_21 = (input - cache_read) + output + cache_read = input + output.
-        With the corrected mapping, total_21 = input + output + cache_read (larger).
+        Prior (wrong) mapping: noncached = codex_input_tokens - codex_cache_read.
+        In that model, total_21 = (input - cache_read) + output + cache_read
+        = input + output, so codex_total_21 would NOT exceed input+output and
+        would NOT equal input+output+cache_read. With the corrected mapping
+        (separate fields) it equals input+output+cache_read and is strictly
+        greater than input+output. This test round-trips a JSON fixture through
+        load_rows so a revert of the mapping in load_rows actually fails it.
         """
-        row = _make_row(cx_noncached_input=1_000, cx_output=200, cx_cache_read=5_000)
-        wrong_total = row.cx_noncached_input + row.cx_output  # wrong: 1200
-        correct_total = row.codex_total_21                    # correct: 6200
-        self.assertGreater(correct_total, wrong_total)
-        self.assertEqual(correct_total, wrong_total + row.cx_cache_read)
+        codex_input, codex_output, codex_cache_read = 1_000, 200, 5_000
+        task = {
+            "arm": "ironmem",
+            "task_key": "guard:ironmem",
+            "outcome": "merged",
+            "ci_green": True,
+            "estimated": False,
+            "review_rounds": 0,
+            "fix_commits": 0,
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "cache_creation_input_tokens": 0,
+            "cache_read_input_tokens": 0,
+            "codex_input_tokens": codex_input,
+            "codex_output_tokens": codex_output,
+            "codex_cache_read_input_tokens": codex_cache_read,
+        }
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as tmp:
+            _write_json([task], tmp.name)
+            tmp_path = tmp.name
+        try:
+            (row,) = load_rows(tmp_path)
+        finally:
+            os.unlink(tmp_path)
+
+        # Corrected mapping: separate fields, summed.
+        self.assertEqual(
+            row.codex_total_21, codex_input + codex_output + codex_cache_read
+        )
+        # Strictly greater than input+output — fails under the wrong subtraction.
+        self.assertGreater(row.codex_total_21, codex_input + codex_output)
+        self.assertEqual(
+            row.codex_total_21 - row.codex_cache_excl, codex_cache_read
+        )
 
     def test_superpowers_arm_has_zero_codex_tokens(self):
         """Superpowers arm runs only Claude — all Codex fields are 0."""
@@ -382,15 +415,19 @@ class TestLoadFromCommittedFile(unittest.TestCase):
 
     def test_committed_file_loads_16_rows(self):
         path = self._committed_path()
-        if not os.path.isfile(path):
-            self.skipTest("campaign-merged-live.json not present")
+        self.assertTrue(
+            os.path.isfile(path),
+            msg=f"committed evidence artifact missing: {path}",
+        )
         rows = load_rows(path)
         self.assertEqual(len(rows), 16)
 
     def test_committed_file_eight_per_arm(self):
         path = self._committed_path()
-        if not os.path.isfile(path):
-            self.skipTest("campaign-merged-live.json not present")
+        self.assertTrue(
+            os.path.isfile(path),
+            msg=f"committed evidence artifact missing: {path}",
+        )
         rows = load_rows(path)
         im, sp = split_by_arm(rows)
         self.assertEqual(len(im), 8)
@@ -399,8 +436,10 @@ class TestLoadFromCommittedFile(unittest.TestCase):
     def test_committed_ironmem_21_mean_approximately_30m(self):
         """Spot-check: ironmem §2.1 mean ≈ 30.3M (±5% tolerance)."""
         path = self._committed_path()
-        if not os.path.isfile(path):
-            self.skipTest("campaign-merged-live.json not present")
+        self.assertTrue(
+            os.path.isfile(path),
+            msg=f"committed evidence artifact missing: {path}",
+        )
         rows = load_rows(path)
         im, _ = split_by_arm(rows)
         m = mean([r.total_21 for r in im])
@@ -410,8 +449,10 @@ class TestLoadFromCommittedFile(unittest.TestCase):
     def test_committed_superpowers_cache_excl_mean_approximately_21k(self):
         """Spot-check: superpowers cache-excluded mean ≈ 21K (±10% tolerance)."""
         path = self._committed_path()
-        if not os.path.isfile(path):
-            self.skipTest("campaign-merged-live.json not present")
+        self.assertTrue(
+            os.path.isfile(path),
+            msg=f"committed evidence artifact missing: {path}",
+        )
         rows = load_rows(path)
         _, sp = split_by_arm(rows)
         m = mean([r.cache_excl for r in sp])

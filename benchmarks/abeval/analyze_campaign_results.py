@@ -102,9 +102,11 @@ def load_rows(path: str) -> List[TaskRow]:
     """Load and parse campaign-merged-live.json into TaskRow objects."""
     with open(path) as f:
         data = json.load(f)
-    assert data.get("evidence_class") == "live", (
-        f"Expected evidence_class='live', got {data.get('evidence_class')!r}"
-    )
+    if data.get("evidence_class") != "live":
+        raise ValueError(
+            "Expected evidence_class='live', got "
+            f"{data.get('evidence_class')!r}"
+        )
     rows: List[TaskRow] = []
     for t in data["tasks"]:
         row = TaskRow(
@@ -166,6 +168,10 @@ def print_per_task_table(rows: List[TaskRow]) -> None:
 
 def print_arm_stats(rows: List[TaskRow], name: str) -> dict:
     n = len(rows)
+    if n == 0:
+        raise ValueError(
+            f"Arm {name!r} has zero rows; cannot compute headline statistics"
+        )
     merged = sum(1 for r in rows if r.outcome == "merged" and r.ci_green)
     total_21_vals = [r.total_21 for r in rows]
     cache_excl_vals = [r.cache_excl for r in rows]
