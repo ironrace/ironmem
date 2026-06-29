@@ -218,4 +218,6 @@ Codex review of the canonical plan.
 - `docs/METRICS_SPEC.md §11` — the frozen measurement contract this harness serves
 - `docs/METRICS_SPEC.md §2` — token accounting definitions (tokens-to-done §2.1,
   done semantics §2.2, task_key §2.3)
+- `docs/METRICS_RESULTS.md` — final A/B campaign results (n=8/arm, completed 2026-06-28);
+  includes headline verdict, confound analysis, and reproduction instructions
 - `benchmarks/provbench/baseline/` — reference crate this harness mirrors
