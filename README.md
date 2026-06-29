@@ -7,7 +7,8 @@
 **ironmem gives your AI coding agents a memory that survives the session.**
 Instead of re-reading the same files and re-deriving the same context every time
 you open Claude Code or Codex, ironmem keeps what was learned — decisions, file
-locations, prior work — in a private local store both harnesses share.
+locations, prior work — in a private local store shared across registered
+harnesses.
 
 What that means in practice:
 
@@ -17,9 +18,10 @@ What that means in practice:
 - **Local and private by default.** Everything lives in one local SQLite store
   on your machine (`~/.ironrace-memory/memory.sqlite3`). No cloud, no account,
   no Python runtime.
-- **Shared across Claude Code and Codex.** Both harnesses read and write the
-  same memory, so context carried in a Claude session is available in Codex, and
-  vice versa.
+- **Shared across registered harnesses.** All harnesses read and write the same
+  memory store. Claude Code and Codex are the two bundled defaults; the registry
+  is extensible for additional harnesses. Context carried in a Claude session is
+  available in Codex, and vice versa.
 
 ## When to use ironmem
 
@@ -233,18 +235,35 @@ Stamp the canonical memory-protocol guidance into your rules files as an
 idempotent, marker-delimited managed block:
 
 ```bash
-# Write both CLAUDE.md and AGENTS.md in the current directory.
-# With no --target, all targets are validated before any file is written.
+# Write all default-harness rules files (CLAUDE.md and AGENTS.md) in the
+# current directory. All targets are validated before any file is written.
 ironmem write-rules
 
-# Write a single file (--target accepts only CLAUDE.md or AGENTS.md),
-# optionally in a different directory via --workspace.
+# Write a single target by filename (validated against registered harness
+# rules files at runtime).
 ironmem write-rules --target AGENTS.md --workspace /path/to/repo
+
+# Write the rules file for a specific harness (resolves to its rules file).
+ironmem write-rules --harness codex   # writes AGENTS.md
+ironmem write-rules --harness claude  # writes CLAUDE.md
 ```
+
+`--target` and `--harness` are mutually exclusive. Both are validated at runtime
+against the harness registry — only filenames registered in a harness entry are
+accepted.
 
 The block is sourced from a single in-source constant (`MEMORY_PROTOCOL`) and is
 safe to re-run — it replaces only the managed block and never touches surrounding
 content. **Explicit opt-in only: no hook ever runs this for you.**
+
+### `ironmem harnesses`
+
+List all registered harnesses and their key attributes:
+
+```bash
+ironmem harnesses             # human-readable one line per harness
+ironmem harnesses --format=json  # machine-readable, for CI/packaging scripts
+```
 
 ### `ironmem doctor`
 

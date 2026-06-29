@@ -103,6 +103,79 @@ git push origin v0.1.0
 
 The release workflow builds macOS and Linux archives and attaches them to the GitHub release automatically.
 
+## Adding a Harness
+
+ironmem's harness support is registry-driven. Every harness is a single
+`HarnessSpec` entry in `REGISTRY` (`crates/ironmem/src/harness/mod.rs`). The
+steps below walk through registering a new harness end-to-end.
+
+### 1. Add a `HarnessSpec` entry to `REGISTRY`
+
+Open `crates/ironmem/src/harness/mod.rs` and add an entry to the `REGISTRY`
+constant. The fields are:
+
+| Field | Description |
+|---|---|
+| `id` | Lowercase slug (`[a-z0-9][a-z0-9_-]*`) — used in CLI output, metrics, and hook paths. |
+| `display_name` | Human-readable name shown in `ironmem harnesses` output. |
+| `binary` | Executable name looked up on `PATH` by `ironmem <harness> .` launcher. |
+| `rules_file` | File written by `ironmem write-rules --harness <id>` (e.g. `"GEMINI.md"`). |
+| `write_rules_default` | `true` to include this harness in a no-flag `ironmem write-rules` run. |
+| `client_info_aliases` | Substrings matched against `initialize.clientInfo.name` (lowercased) to attribute MCP sessions. |
+| `env_aliases` | Strings accepted by `IRONMEM_HARNESS` that map to this harness. |
+| `additional_context_support` | `true` if the harness supports `hookSpecificOutput.additionalContext`. Session-start memory injection and UserPromptSubmit context injection are only active when this is `true`. |
+| `occupancy_support` | `true` if the harness emits token counts that ironmem can sample. |
+| `transcript_parser` | `TranscriptParserKind::Claude`, `::Codex`, or `::None`. Use `None` if the harness has no recognized transcript format; token metric rows are skipped. |
+
+### 2. Add plugin packaging assets
+
+The packaging drift-lint test (`cargo test -p ironmem harness_packaging`) fails
+if a registered harness lacks a `.{id}-plugin/` directory at the repo root.
+Create it with at minimum:
+
+- `bin/ironmem-mcp.sh` — wrapper that launches `ironmem serve`.
+- `hooks/ironmem-hook.sh` — wrapper that calls `ironmem hook <name> --harness <id>`.
+- `plugin.json` — plugin metadata (version must match `crates/ironmem/Cargo.toml`).
+
+Use `.claude-plugin/` and `.codex-plugin/` as reference implementations.
+Run `bash scripts/check_versions.sh` to confirm the version field is in sync.
+
+### 3. Set `clientInfo` and env aliases
+
+Ensure `client_info_aliases` covers every variant of the harness's MCP
+`clientInfo.name` (the registry does a substring match after lowercasing). Set
+`env_aliases` to at least `[id]` so the `IRONMEM_HARNESS` test-seam works.
+
+### 4. Implement a transcript parser (optional)
+
+If the harness writes session transcripts in a parseable format and you want
+token metric rows to be captured:
+
+1. Implement parsing in `crates/ironmem/src/abeval/` (see `claude.rs` and
+   `codex.rs` for existing parsers).
+2. Wire `transcript_parser` to the matching `TranscriptParserKind` variant.
+
+If no parser is available, set `transcript_parser: TranscriptParserKind::None`;
+token rows for this harness will be skipped rather than mis-attributed.
+
+### 5. Note: `/collab` is not included
+
+`/collab` is a deliberate **two-party Claude↔Codex protocol** and does not
+extend to additional harnesses. See
+[docs/COLLAB.md — Harness generalization vs two-party protocol](docs/COLLAB.md)
+for the rationale.
+
+### 6. Run the gate suite
+
+```bash
+cargo test --workspace          # drift-lint + harness tests
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets --all-features -- -D warnings
+bash scripts/check_versions.sh  # plugin.json versions must match Cargo.toml
+```
+
+All four commands must pass before opening a PR.
+
 ## Pull Requests
 
 - Keep changes scoped and explain user-visible behavior in the PR description.

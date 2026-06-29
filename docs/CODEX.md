@@ -6,6 +6,30 @@
 
 For the bounded Claude↔Codex planning protocol, see [COLLAB.md](COLLAB.md).
 
+## Registry-Driven Hooks and Attribution
+
+Codex is one registered harness in the `REGISTRY` constant
+(`crates/ironmem/src/harness/mod.rs`). Its `HarnessSpec` entry records:
+
+- **`id`**: `"codex"` — used as the harness slug in metrics and hook paths.
+- **`binary`**: `"codex"` — the launcher binary looked up on `PATH`.
+- **`rules_file`**: `"AGENTS.md"` — the target for `ironmem write-rules --harness codex`.
+- **`client_info_aliases`**: `["codex"]` — substring matched against
+  `initialize.clientInfo.name` to attribute MCP sessions.
+- **`env_aliases`**: `["codex"]` — accepted by `IRONMEM_HARNESS` for test overrides.
+- **`additional_context_support`**: `false` — Codex has no
+  `hookSpecificOutput.additionalContext` channel, so session-start memory
+  injection and UserPromptSubmit context injection are Claude Code capabilities
+  only. This is a capability flag in the registry, not a hard-coded prefix
+  check; future harnesses that gain the channel can set this to `true`.
+- **`occupancy_support`**: `true` — Codex hook output carries token counts
+  that ironmem samples into `occupancy_samples`.
+- **`transcript_parser`**: `Codex` — the Codex rollup format (one
+  `codex-final` row per session, cached tokens subtracted from input).
+
+Run `ironmem harnesses --format=json` to inspect the current registry at any
+time.
+
 ## Current Support Level
 
 What works now:
@@ -265,6 +289,8 @@ Codex adopts the memory protocol through a managed rules-file block sourced from
 the `MEMORY_PROTOCOL` constant in `crates/ironmem/src/bootstrap.rs`:
 
 ```bash
+ironmem write-rules --harness codex   # resolves to AGENTS.md
+# or equivalently:
 ironmem write-rules --target AGENTS.md
 ```
 
