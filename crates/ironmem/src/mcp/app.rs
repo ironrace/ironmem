@@ -590,11 +590,8 @@ impl App {
 }
 
 fn env_metrics_harness() -> Option<String> {
-    match std::env::var("IRONMEM_HARNESS").ok().as_deref() {
-        Some("codex") => Some("codex".to_string()),
-        Some("claude") => Some("claude".to_string()),
-        _ => None,
-    }
+    let value = std::env::var("IRONMEM_HARNESS").ok()?;
+    crate::harness::canonicalize_input(&value, crate::harness::REGISTRY).map(|id| id.to_string())
 }
 
 fn normalize_session_id(value: &str) -> Option<String> {
@@ -617,11 +614,83 @@ fn harness_from_client_info(params: &serde_json::Value) -> Option<String> {
         .and_then(|v| v.as_str())
         .unwrap_or_default()
         .to_ascii_lowercase();
-    if name.contains("codex") {
-        Some("codex".to_string())
-    } else if name.contains("claude") {
-        Some("claude".to_string())
-    } else {
-        None
+    crate::harness::classify_client_info(&name, crate::harness::REGISTRY).map(|id| id.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::harness::{HarnessSpec, TranscriptParserKind};
+
+    // ---- harness_from_client_info wiring -----------------------------------
+
+    #[test]
+    fn harness_from_client_info_codex_cli() {
+        let params = serde_json::json!({ "clientInfo": { "name": "codex-cli", "version": "1.0" } });
+        assert_eq!(harness_from_client_info(&params).as_deref(), Some("codex"));
+    }
+
+    #[test]
+    fn harness_from_client_info_claude() {
+        let params = serde_json::json!({ "clientInfo": { "name": "claude", "version": "1.0" } });
+        assert_eq!(harness_from_client_info(&params).as_deref(), Some("claude"));
+    }
+
+    #[test]
+    fn harness_from_client_info_unknown() {
+        let params = serde_json::json!({ "clientInfo": { "name": "unknown-tool" } });
+        assert!(harness_from_client_info(&params).is_none());
+    }
+
+    // ---- env_metrics_harness wiring ----------------------------------------
+    //
+    // env_metrics_harness() is a thin wrapper: read IRONMEM_HARNESS, pass to
+    // canonicalize_input.  Manipulating a process-global env var in parallel
+    // tests is racy, so we test the delegate directly, which covers the same
+    // logical path without shared-state races.
+
+    #[test]
+    fn env_metrics_harness_delegate_accepts_claude_code_alias() {
+        // "claude-code" is an env_alias for claude; confirm canonicalize_input
+        // returns "claude", which is what env_metrics_harness produces when
+        // IRONMEM_HARNESS="claude-code".
+        let result = crate::harness::canonicalize_input("claude-code", crate::harness::REGISTRY);
+        assert_eq!(result, Some("claude"));
+    }
+
+    #[test]
+    fn env_metrics_harness_delegate_unknown_returns_none() {
+        // An unregistered value produces None, so env_metrics_harness() also
+        // returns None for unknown IRONMEM_HARNESS values.
+        let result = crate::harness::canonicalize_input("gemini", crate::harness::REGISTRY);
+        assert!(result.is_none());
+    }
+
+    // ---- third-harness classification via injected registry -----------------
+
+    const GEMINI_SPEC: HarnessSpec = HarnessSpec {
+        id: "gemini",
+        display_name: "Gemini CLI",
+        binary: "gemini",
+        rules_file: "GEMINI.md",
+        write_rules_default: false,
+        client_info_aliases: &["gemini"],
+        env_aliases: &["gemini"],
+        additional_context_support: false,
+        occupancy_support: false,
+        transcript_parser: TranscriptParserKind::None,
+    };
+
+    #[test]
+    fn classify_client_info_gemini_in_injected_registry() {
+        // Verify that a third registered harness attributes correctly through
+        // the registry-slice helper — same code path as harness_from_client_info.
+        let reg = [
+            crate::harness::REGISTRY[0],
+            crate::harness::REGISTRY[1],
+            GEMINI_SPEC,
+        ];
+        let result = crate::harness::classify_client_info("gemini-cli", &reg);
+        assert_eq!(result, Some("gemini"));
     }
 }
