@@ -50,6 +50,7 @@ class TaskRow:
     task_key: str
     outcome: str
     ci_green: bool
+    estimated: bool
     review_rounds: int
     fix_commits: int
     # Claude four-component buckets
@@ -111,6 +112,7 @@ def load_rows(path: str) -> List[TaskRow]:
             task_key=t["task_key"],
             outcome=t["outcome"],
             ci_green=bool(t["ci_green"]),
+            estimated=bool(t.get("estimated", False)),
             review_rounds=int(t["review_rounds"]),
             fix_commits=int(t["fix_commits"]),
             c_input=int(t["input_tokens"]),
@@ -121,6 +123,15 @@ def load_rows(path: str) -> List[TaskRow]:
             cx_output=int(t["codex_output_tokens"]),
             cx_cache_read=int(t["codex_cache_read_input_tokens"]),
         )
+        if row.estimated:
+            raise ValueError(
+                f"Estimated row is not allowed in headline metrics: {row.task_key}"
+            )
+        if row.outcome != "merged" or not row.ci_green:
+            raise ValueError(
+                "Non-completed row is not allowed in headline metrics: "
+                f"{row.task_key} outcome={row.outcome!r} ci_green={row.ci_green!r}"
+            )
         rows.append(row)
     return rows
 
@@ -185,9 +196,16 @@ def print_arm_stats(rows: List[TaskRow], name: str) -> dict:
 
 
 def main(argv: List[str] | None = None) -> None:
+    argv = sys.argv[1:] if argv is None else argv
     script_dir = os.path.dirname(os.path.abspath(__file__))
     default_path = os.path.join(script_dir, "campaign-merged-live.json")
-    path = (argv[1] if argv and len(argv) > 1 else None) or default_path
+    if len(argv) > 1:
+        print(
+            "Usage: analyze_campaign_results.py [campaign-merged-live.json]",
+            file=sys.stderr,
+        )
+        sys.exit(2)
+    path = argv[0] if argv else default_path
 
     if not os.path.isfile(path):
         print(f"ERROR: not found: {path}", file=sys.stderr)
@@ -221,4 +239,4 @@ def main(argv: List[str] | None = None) -> None:
 
 
 if __name__ == "__main__":
-    main(sys.argv[1:] if len(sys.argv) > 1 else None)
+    main()

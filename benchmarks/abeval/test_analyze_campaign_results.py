@@ -15,6 +15,7 @@ Covers:
 
 import json
 import os
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -33,6 +34,7 @@ def _make_row(
     task_key: str = "t1:ironmem",
     outcome: str = "merged",
     ci_green: bool = True,
+    estimated: bool = False,
     review_rounds: int = 0,
     fix_commits: int = 0,
     c_input: int = 0,
@@ -48,6 +50,7 @@ def _make_row(
         task_key=task_key,
         outcome=outcome,
         ci_green=ci_green,
+        estimated=estimated,
         review_rounds=review_rounds,
         fix_commits=fix_commits,
         c_input=c_input,
@@ -257,6 +260,114 @@ class TestMergedRate(unittest.TestCase):
             self.assertEqual(sp_merged, 8)
         finally:
             os.unlink(tmp_path)
+
+
+# ---------------------------------------------------------------------------
+# Headline row eligibility
+# ---------------------------------------------------------------------------
+
+class TestHeadlineEligibility(unittest.TestCase):
+
+    def _valid_task(self, **overrides) -> dict:
+        task = {
+            "arm": "ironmem",
+            "task_key": "abeval-test:ironmem",
+            "outcome": "merged",
+            "ci_green": True,
+            "estimated": False,
+            "review_rounds": 0,
+            "fix_commits": 0,
+            "input_tokens": 100,
+            "output_tokens": 10,
+            "cache_creation_input_tokens": 20,
+            "cache_read_input_tokens": 30,
+            "codex_input_tokens": 40,
+            "codex_output_tokens": 5,
+            "codex_cache_read_input_tokens": 60,
+        }
+        task.update(overrides)
+        return task
+
+    def _load_temp_tasks(self, tasks: list) -> None:
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as tmp:
+            _write_json(tasks, tmp.name)
+            tmp_path = tmp.name
+        try:
+            load_rows(tmp_path)
+        finally:
+            os.unlink(tmp_path)
+
+    def test_estimated_rows_are_rejected_from_headline_metrics(self):
+        with self.assertRaisesRegex(ValueError, "Estimated row"):
+            self._load_temp_tasks([self._valid_task(estimated=True)])
+
+    def test_non_completed_rows_are_rejected_from_headline_metrics(self):
+        with self.assertRaisesRegex(ValueError, "Non-completed row"):
+            self._load_temp_tasks([self._valid_task(outcome="failed")])
+
+        with self.assertRaisesRegex(ValueError, "Non-completed row"):
+            self._load_temp_tasks([self._valid_task(ci_green=False)])
+
+
+# ---------------------------------------------------------------------------
+# CLI path handling
+# ---------------------------------------------------------------------------
+
+class TestCliPathHandling(unittest.TestCase):
+
+    def _script_path(self) -> str:
+        here = os.path.dirname(os.path.abspath(__file__))
+        return os.path.join(here, "analyze_campaign_results.py")
+
+    def _custom_task(self, arm: str) -> dict:
+        return {
+            "arm": arm,
+            "task_key": f"custom-path:{arm}",
+            "outcome": "merged",
+            "ci_green": True,
+            "estimated": False,
+            "review_rounds": 0,
+            "fix_commits": 0,
+            "input_tokens": 1,
+            "output_tokens": 2,
+            "cache_creation_input_tokens": 3,
+            "cache_read_input_tokens": 4,
+            "codex_input_tokens": 5 if arm == "ironmem" else 0,
+            "codex_output_tokens": 6 if arm == "ironmem" else 0,
+            "codex_cache_read_input_tokens": 7 if arm == "ironmem" else 0,
+        }
+
+    def test_cli_uses_explicit_json_path(self):
+        tasks = [self._custom_task("ironmem"), self._custom_task("superpowers")]
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as tmp:
+            _write_json(tasks, tmp.name)
+            tmp_path = tmp.name
+        try:
+            result = subprocess.run(
+                [sys.executable, self._script_path(), tmp_path],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+        finally:
+            os.unlink(tmp_path)
+
+        self.assertEqual(result.returncode, 0, msg=result.stderr)
+        self.assertIn("custom-path", result.stdout)
+        self.assertNotIn("abeval-01-issue-95", result.stdout)
+
+    def test_cli_missing_explicit_path_errors(self):
+        missing = os.path.join(tempfile.gettempdir(), "abeval-missing-input.json")
+        if os.path.exists(missing):
+            os.unlink(missing)
+        result = subprocess.run(
+            [sys.executable, self._script_path(), missing],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("ERROR: not found", result.stderr)
 
 
 # ---------------------------------------------------------------------------

@@ -28,10 +28,10 @@ under the spec's stated confidence rule.
 
 The §1.1 claim requires a causal attribution of the token delta to memory. That
 attribution **cannot be made** from this campaign because the two arms differ on two
-confounding dimensions that together account for the observed gap (see §4). Neither
-exclusion of cache tokens nor stratification by model/provider closes the gap; instead,
-they reveal that the dominant cost driver is the structural multi-actor overhead of the
-`/collab` workflow, not memory.
+confounding dimensions that prevent a clean memory-on vs memory-off comparison (see
+§4). Neither exclusion of cache tokens nor stratification by model/provider closes the
+gap; instead, they show that structural multi-actor workflow overhead is a likely major
+contributor.
 
 The outcome sub-claim is confirmed: **both arms reached merged + CI-green on 100% of
 tasks** (outcome tie at 8/8). The `/collab` path demonstrably completes headlessly
@@ -144,9 +144,10 @@ the explanation for the gap — removing it makes the disparity larger, not smal
 ironmem arm consumes substantially more fresh input+output tokens per task because the
 multi-actor workflow generates many more turns of fresh context.
 
-### Confound 2 — two-model / two-harness asymmetry (dominant)
+### Confound 2 — two-model / two-harness asymmetry
 
-This is the structural cause of the gap. The two arms are not matched on workflow:
+This structural asymmetry prevents causal attribution. The two arms are not matched on
+workflow:
 
 | Dimension | ironmem arm | superpowers arm |
 |-----------|-------------|-----------------|
@@ -158,7 +159,7 @@ This is the structural cause of the gap. The two arms are not matched on workflo
 The ironmem arm runs a full two-model orchestration protocol: Claude plans, Codex
 implements (multiple worker turns), and Codex reviews. The superpowers arm is a
 single-harness Claude invocation. The comparison measures **"full multi-actor workflow
-vs single-agent skills"**, not **"memory on vs memory off"**.
+vs single-agent skills"**, not a clean **"memory on vs memory off"** contrast.
 
 View (c) — Claude-only §2.1 — shows the gap is 4.0× even when Codex tokens are excluded
 entirely. Claude alone consumes 4× more tokens on the ironmem arm because it runs more
@@ -179,8 +180,8 @@ asymmetry is not correctable post-hoc from this dataset.
    at this sample size. Neither arm abandoned or failed any task.
 
 2. **The `/collab` path completes headlessly end-to-end on real repo tasks.** The
-   campaign demonstrates that a headless `claude /collab start` invocation can drive
-   the full planning → implementation → review → PR lifecycle without human gates.
+   campaign demonstrates that the headless collab driver can drive a `/collab` flow
+   through planning, implementation, review, and PR lifecycle without human gates.
    This is an operational result independent of the token comparison.
 
 3. **The raw token delta is real and large.** The ironmem arm consumed 6.1× more §2.1
@@ -191,8 +192,8 @@ asymmetry is not correctable post-hoc from this dataset.
 ### CANNOT conclude
 
 1. **Cannot attribute the token delta to memory.** The arms are structurally unmatched
-   (multi-actor workflow vs single-agent, §4). The token difference is explained by the
-   workflow overhead, not by the presence or absence of ironmem as a memory backend.
+   (multi-actor workflow vs single-agent, §4). The token difference is not attributable
+   to the presence or absence of ironmem as a memory backend from this design.
 
 2. **Cannot confirm or cleanly falsify §1.1's "lower total tokens per task" claim.**
    To confirm or falsify it, the arms must be matched: same harness, same model, same
@@ -208,14 +209,15 @@ asymmetry is not correctable post-hoc from this dataset.
 
 ## §6 — Limitations and threats to validity
 
-1. **Done proxy (METRICS_SPEC §12 2026-06-16):** "done" is gates-green (CI passes after
-   merge), not wall-clock git-merge time. This is the correct proxy per §2.2 but is
-   not identical to business-value delivery time.
+1. **Done proxy (METRICS_SPEC §12 2026-06-16):** "done" is agent-completed with the
+   task's frozen gates green in the isolated workspace, recorded as `outcome:"merged"`
+   and `ci_green:true`. This is the correct proxy per §2.2 but is not identical to a
+   literal merge-to-main or business-value delivery time.
 
-2. **Headless `/collab` vs full interactive session:** The ironmem arm ran `/collab`
-   headlessly via `claude -p`. A real interactive session may spend tokens differently
-   (user confirmations, re-directions). The headless mode is a reasonable surrogate
-   for comparative measurement but not identical to the target use case.
+2. **Headless `/collab` vs full interactive session:** The ironmem arm ran through the
+   headless collab driver. A real interactive session may spend tokens differently
+   (user confirmations, re-directions). The headless mode is a reasonable surrogate for
+   comparative measurement but not identical to the target use case.
 
 3. **Codex cached-input subtraction (METRICS_SPEC §12 corrected mapping,
    2026-06-17):** The campaign JSON stores `codex_input_tokens` (noncached fresh
@@ -266,10 +268,10 @@ This design holds harness, model, and actor-count constant and varies only the p
 of the ironmem MCP server. It would produce a token delta attributable to memory access
 overhead and recall quality, decoupled from `/collab` workflow overhead.
 
-**Implementation:** requires an `arm_command` change in the runner plus a corpus re-pin
-(to set a fresh `base_commit` for the new run). The analysis scripts in this branch are
-forward-compatible with that design (they read per-row fields from the JSON and make no
-assumptions about which arm ran `/collab`).
+**Implementation:** requires runner changes to define the matched commands and MCP
+configuration plus a corpus re-pin (to set a fresh `base_commit` for the new run). The
+analysis scripts in this branch are forward-compatible with that design (they read
+per-row fields from the JSON and make no assumptions about which arm ran `/collab`).
 
 This experiment is **deferred**; no paid run is approved here.
 
@@ -286,8 +288,8 @@ python3 benchmarks/abeval/analyze_campaign_results.py
 
 The script reads `benchmarks/abeval/campaign-merged-live.json` (committed at the same
 commit as this document), applies the METRICS_SPEC §2.1 formula and the §12 corrected
-Codex mapping, and prints the per-task table and arm means. Output should match §3
-verbatim.
+Codex mapping, and prints the per-task table and arm means. Numeric values should match
+§3.
 
 To run the tests:
 
