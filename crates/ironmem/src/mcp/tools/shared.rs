@@ -12,6 +12,11 @@ pub(super) const MAX_READ_LIMIT: usize = 100;
 pub(super) const MAX_DEPTH: usize = 10;
 /// Maximum characters returned per sensitive text field.
 pub(super) const MAX_SENSITIVE_FIELD_CHARS: usize = 4_000;
+/// Maximum characters returned by an explicit by-id drawer fetch. Unlike search
+/// excerpts (capped at `MAX_SENSITIVE_FIELD_CHARS`), a `get_drawer` caller has
+/// the exact id and needs the full stored body, so this matches the write-side
+/// `sanitize_content` ceiling and round-trips any drawer `add_drawer` accepted.
+pub(super) const MAX_DRAWER_FETCH_CHARS: usize = 100_000;
 /// Maximum aggregate characters returned across search results.
 pub(super) const MAX_SEARCH_RESPONSE_CHARS: usize = 32_000;
 /// Maximum content length accepted by collab queue messages.

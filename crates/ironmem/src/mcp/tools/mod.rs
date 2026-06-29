@@ -26,8 +26,8 @@ use collab_session::{
 };
 use diary::{handle_diary_read, handle_diary_write};
 use drawers::{
-    handle_add_drawer, handle_delete_drawer, handle_get_taxonomy, handle_list_rooms,
-    handle_list_wings, handle_search, handle_status,
+    handle_add_drawer, handle_delete_drawer, handle_get_drawer, handle_get_taxonomy,
+    handle_list_rooms, handle_list_wings, handle_search, handle_status,
 };
 use handoff::handle_session_handoff;
 use kg::{
@@ -75,6 +75,17 @@ pub fn tool_definitions(app: &App) -> Vec<Value> {
                     "room": { "type": "string", "default": "general" }
                 },
                 "required": ["content", "wing"]
+            }
+        }),
+        json!({
+            "name": "get_drawer",
+            "description": "Fetch a single drawer's full content by its exact ID (deterministic read-by-id; use when you have the ID rather than a semantic query). Returns found:false if no drawer has that ID.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "id": { "type": "string" }
+                },
+                "required": ["id"]
             }
         }),
         json!({
@@ -533,6 +544,7 @@ pub fn call_tool(app: &App, name: &str, args: &Value) -> Result<Value, MemoryErr
         "status" => handle_status(app, args),
         "search" => handle_search(app, args),
         "add_drawer" => handle_add_drawer(app, args),
+        "get_drawer" => handle_get_drawer(app, args),
         "delete_drawer" => handle_delete_drawer(app, args),
         "list_wings" => handle_list_wings(app),
         "list_rooms" => handle_list_rooms(app, args),
@@ -581,6 +593,7 @@ fn tool_known(name: &str) -> bool {
         "status"
             | "search"
             | "add_drawer"
+            | "get_drawer"
             | "delete_drawer"
             | "list_wings"
             | "list_rooms"
@@ -698,6 +711,18 @@ mod tests {
         assert!(tool_allowed_in_mode(
             McpAccessMode::ReadOnly,
             "symbol_neighbors"
+        ));
+    }
+
+    #[test]
+    fn get_drawer_is_known_read_tool_allowed_in_all_modes() {
+        assert!(tool_known("get_drawer"));
+        // get_drawer is a pure read: never write-gated.
+        assert!(tool_allowed_in_mode(McpAccessMode::Trusted, "get_drawer"));
+        assert!(tool_allowed_in_mode(McpAccessMode::ReadOnly, "get_drawer"));
+        assert!(tool_allowed_in_mode(
+            McpAccessMode::Restricted,
+            "get_drawer"
         ));
     }
 

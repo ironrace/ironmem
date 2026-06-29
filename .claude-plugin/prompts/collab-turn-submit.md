@@ -16,8 +16,12 @@ preconditions: a prior compose worker wrote $ARTIFACT_REF; for final the user ap
 ## State discovery
 1. `collab_status(session_id=$SESSION_ID)` to confirm phase/owner and read
    `repo_path`, `branch`, and `base_sha`.
-2. Fetch the artifact named by `$ARTIFACT_REF` (drawer id → drawer fetch, or a
-   file path → read the file).
+2. Fetch the artifact named by `$ARTIFACT_REF`:
+   - **drawer id** → `mcp__ironmem__get_drawer(id=$ARTIFACT_REF)` (deterministic
+     read-by-id; do NOT use `search`, which is semantic and will not reliably
+     return a freshly-staged drawer). If the response is `found:false`, treat the
+     artifact as unfetchable and follow the failure path below.
+   - **file path** → read the file.
    - Drawers are immutable (append-only); the `$ARTIFACT_REF` content cannot
      change, so no hash recompute is needed — the ref is the integrity anchor.
      (For `final` the ref is the user-approved drawer; for `final_review` the

@@ -178,6 +178,38 @@ fn tools_list_read_only_mode_excludes_write_tools() {
     // Read tools still present
     assert!(names.contains(&"status"));
     assert!(names.contains(&"search"));
+    // get_drawer is a read tool — it must remain available in read-only mode.
+    assert!(names.contains(&"get_drawer"));
+}
+
+#[test]
+fn get_drawer_round_trips_by_id() {
+    let app = App::open_for_test().unwrap();
+
+    // A body larger than the search-excerpt cap (MAX_SENSITIVE_FIELD_CHARS =
+    // 4_000): verifies by-id fetch returns the FULL stored body, the case that
+    // broke the collab compose→submit handoff when only semantic search existed.
+    let body = "y".repeat(4_500);
+    let added = call_tool(
+        &app,
+        "add_drawer",
+        json!({"content": body, "wing": "ironrace-memory", "room": "collab-drafts"}),
+    );
+    let id = added["id"].as_str().expect("add_drawer returns id");
+
+    let got = call_tool(&app, "get_drawer", json!({ "id": id }));
+    assert_eq!(got["found"].as_bool(), Some(true));
+    assert_eq!(got["id"].as_str(), Some(id));
+    assert_eq!(
+        got["content"].as_str(),
+        Some(body.as_str()),
+        "full body must round-trip verbatim, not a truncated excerpt"
+    );
+    assert_eq!(got["content_truncated"].as_bool(), Some(false));
+
+    // A well-formed but absent id reports found:false (not an error).
+    let missing = call_tool(&app, "get_drawer", json!({ "id": "0".repeat(32) }));
+    assert_eq!(missing["found"].as_bool(), Some(false));
 }
 
 #[test]

@@ -6,8 +6,8 @@ use crate::sanitize;
 use crate::search;
 
 use super::shared::{
-    render_sensitive_text, validate_hex_id, MAX_SEARCH_LIMIT, MAX_SEARCH_RESPONSE_CHARS,
-    MAX_SENSITIVE_FIELD_CHARS,
+    render_sensitive_text, validate_hex_id, MAX_DRAWER_FETCH_CHARS, MAX_SEARCH_LIMIT,
+    MAX_SEARCH_RESPONSE_CHARS, MAX_SENSITIVE_FIELD_CHARS,
 };
 use crate::mcp::app::App;
 
@@ -198,6 +198,45 @@ fn build_synthetic(
         "pref_enrich"
     );
     Ok(Some((synth_id, synth_body, synth_emb)))
+}
+
+/// Fetch a single drawer by its exact id. This is the deterministic
+/// read-by-primary-key counterpart to `add_drawer`: `search` ranks semantically
+/// and cannot reliably return a specific freshly-written staging drawer, so any
+/// flow that stages an artifact under a known id (e.g. the collab compose→submit
+/// handoff) needs this to read it back. Returns the full body (subject only to
+/// access-mode redaction), not a truncated excerpt.
+pub(super) fn handle_get_drawer(app: &App, args: &Value) -> Result<Value, MemoryError> {
+    let id = args
+        .get("id")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| MemoryError::Validation("id is required".into()))?;
+    validate_hex_id(id, "id")?;
+
+    let drawer = match app.db.get_drawer(id)? {
+        Some(d) => d,
+        None => {
+            return Ok(json!({ "found": false, "id": id }));
+        }
+    };
+
+    let redact_content = app.config.mcp_access_mode.redacts_sensitive_content();
+    let (content, truncated, redacted, _consumed) =
+        render_sensitive_text(&drawer.content, MAX_DRAWER_FETCH_CHARS, redact_content);
+
+    Ok(json!({
+        "found": true,
+        "id": drawer.id,
+        "content": content,
+        "content_truncated": truncated,
+        "content_redacted": redacted,
+        "wing": drawer.wing,
+        "room": drawer.room,
+        "source_file": drawer.source_file,
+        "added_by": drawer.added_by,
+        "filed_at": drawer.filed_at,
+        "date": drawer.date,
+    }))
 }
 
 pub(super) fn handle_delete_drawer(app: &App, args: &Value) -> Result<Value, MemoryError> {
@@ -518,6 +557,104 @@ mod tests {
         assert!(
             task_outcome.is_none(),
             "set_task_tag must not create a task_outcomes row"
+        );
+    }
+
+    // ── get_drawer: deterministic read-by-id ─────────────────────────────────
+
+    #[test]
+    fn get_drawer_returns_full_content_for_existing_id() {
+        let app = test_app();
+        // A body LARGER than MAX_SENSITIVE_FIELD_CHARS (4_000): this is exactly
+        // the case search-excerpt truncation would corrupt — the bug that broke
+        // the collab compose→submit drawer handoff (a 4297-char PR body).
+        let big = "x".repeat(4_500);
+        let added = handle_add_drawer(
+            &app,
+            &json!({"content": big, "wing": "ironrace-memory", "room": "collab-drafts"}),
+        )
+        .unwrap();
+        let id = added["id"].as_str().unwrap().to_string();
+
+        let out = handle_get_drawer(&app, &json!({"id": id})).unwrap();
+        assert_eq!(out["found"].as_bool(), Some(true));
+        assert_eq!(out["id"].as_str(), Some(id.as_str()));
+        assert_eq!(out["wing"].as_str(), Some("ironrace-memory"));
+        assert_eq!(out["room"].as_str(), Some("collab-drafts"));
+        // Full body round-trips verbatim — not truncated at the excerpt cap.
+        assert_eq!(out["content"].as_str(), Some(big.as_str()));
+        assert_eq!(out["content_truncated"].as_bool(), Some(false));
+        assert_eq!(out["content_redacted"].as_bool(), Some(false));
+    }
+
+    #[test]
+    fn get_drawer_reports_not_found_for_unknown_id() {
+        let app = test_app();
+        // A well-formed (32-char hex) id that was never written.
+        let missing = "0".repeat(32);
+        let out = handle_get_drawer(&app, &json!({"id": missing})).unwrap();
+        assert_eq!(out["found"].as_bool(), Some(false));
+        assert_eq!(out["id"].as_str(), Some(missing.as_str()));
+        assert!(out.get("content").is_none(), "no content on a miss");
+    }
+
+    #[test]
+    fn get_drawer_rejects_non_hex_id() {
+        let app = test_app();
+        assert!(handle_get_drawer(&app, &json!({"id": "not-a-hex-id!!"})).is_err());
+        // Missing id is also a validation error.
+        assert!(handle_get_drawer(&app, &json!({})).is_err());
+    }
+
+    #[test]
+    fn get_drawer_redacts_content_in_restricted_mode() {
+        // Write in a trusted app, then read the same DB via a restricted app to
+        // confirm by-id fetch honors access-mode redaction like search does.
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("mem.sqlite3");
+        let model_dir = dir.path().join("model");
+        let state_dir = dir.path().join("state");
+
+        let trusted = {
+            let config = Config {
+                db_path: db_path.clone(),
+                model_dir: model_dir.clone(),
+                model_dir_explicit: true,
+                state_dir: state_dir.clone(),
+                mcp_access_mode: McpAccessMode::Trusted,
+                embed_mode: EmbedMode::Noop,
+            };
+            #[allow(clippy::arc_with_non_send_sync)]
+            Arc::new(App::new(config).unwrap())
+        };
+        let added = handle_add_drawer(
+            &trusted,
+            &json!({"content": "secret body", "wing": "secrets", "room": "vault"}),
+        )
+        .unwrap();
+        let id = added["id"].as_str().unwrap().to_string();
+        drop(trusted);
+
+        let restricted = {
+            let config = Config {
+                db_path,
+                model_dir,
+                model_dir_explicit: true,
+                state_dir,
+                mcp_access_mode: McpAccessMode::Restricted,
+                embed_mode: EmbedMode::Noop,
+            };
+            #[allow(clippy::arc_with_non_send_sync)]
+            Arc::new(App::new(config).unwrap())
+        };
+        std::mem::forget(dir);
+
+        let out = handle_get_drawer(&restricted, &json!({"id": id})).unwrap();
+        assert_eq!(out["found"].as_bool(), Some(true));
+        assert_eq!(out["content_redacted"].as_bool(), Some(true));
+        assert!(
+            out["content"].is_null(),
+            "restricted mode must not leak the body"
         );
     }
 
