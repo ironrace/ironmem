@@ -12,6 +12,15 @@ pub(super) const MAX_READ_LIMIT: usize = 100;
 pub(super) const MAX_DEPTH: usize = 10;
 /// Maximum characters returned per sensitive text field.
 pub(super) const MAX_SENSITIVE_FIELD_CHARS: usize = 4_000;
+/// Shared write/read content ceiling for drawer bodies.
+///
+/// On the **write side**, `sanitize_content` enforces this as a *byte* length
+/// (`value.len()`). On the **read side**, `render_sensitive_text` enforces it
+/// as a *char* count (`.chars().take()`). Since chars ≤ bytes (UTF-8 encodes
+/// each code-point in 1–4 bytes), the read cap can never truncate a body the
+/// write side accepted — the round-trip guarantee holds, though it is a
+/// consequence of the encoding contract rather than an explicit equality.
+pub(super) const MAX_DRAWER_CONTENT_CHARS: usize = 100_000;
 /// Maximum aggregate characters returned across search results.
 pub(super) const MAX_SEARCH_RESPONSE_CHARS: usize = 32_000;
 /// Maximum content length accepted by collab queue messages.

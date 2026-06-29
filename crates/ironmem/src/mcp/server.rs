@@ -248,7 +248,7 @@ pub fn dispatch(app: &App, request: &JsonRpcRequest) -> Option<JsonRpcResponse> 
                             }),
                         )),
                         Err(e) => {
-                            tracing::error!("Tool error in {}: {}", name, e);
+                            tracing::error!(request_id = ?id, "Tool error in {}: {}", name, e);
                             let user_message = match &e {
                                 MemoryError::Validation(msg) => msg.clone(),
                                 MemoryError::NotFound(msg) => msg.clone(),
