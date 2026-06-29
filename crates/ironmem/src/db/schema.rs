@@ -21,11 +21,13 @@ const COLLAB_GENERATION_LEASE_SQL: &str =
     include_str!("../../migrations/010_collab_generation_lease.sql");
 const CODE_MAPS_SQL: &str = include_str!("../../migrations/011_code_maps.sql");
 const SYMBOL_IMPORT_GRAPH_SQL: &str = include_str!("../../migrations/012_symbol_import_graph.sql");
+const METRICS_HARNESS_CHECK_SQL: &str =
+    include_str!("../../migrations/013_metrics_harness_check.sql");
 
 /// Highest schema version a fully-migrated database reports. Bump alongside the
 /// `run_version_gated_migrations` ladder below so `ironmem doctor` can tell a
 /// behind-migration database from an up-to-date one.
-pub const LATEST_SCHEMA_VERSION: i64 = 12;
+pub const LATEST_SCHEMA_VERSION: i64 = 13;
 
 /// Database wrapper around a SQLite connection.
 ///
@@ -250,6 +252,15 @@ impl Database {
             self.conn.execute_batch(SYMBOL_IMPORT_GRAPH_SQL)?;
         }
 
+        // v13: relax the metrics harness CHECK from claude/codex-only to the
+        // registry slug form so any registered harness can persist metrics
+        // (issue #155). Value-preserving rebuild of token_usage, occupancy_samples,
+        // session_summary; rows copied byte-for-byte. Collab implementer (006) and
+        // generation-lease agent (010) CHECKs stay claude/codex by design.
+        if current_version < 13 {
+            self.conn.execute_batch(METRICS_HARNESS_CHECK_SQL)?;
+        }
+
         Ok(())
     }
 
@@ -414,7 +425,7 @@ mod tests {
         // fully-migrated database reports — doctor compares against it.
         let db = Database::open_in_memory().unwrap();
         assert_eq!(LATEST_SCHEMA_VERSION, db.schema_version().unwrap());
-        assert_eq!(LATEST_SCHEMA_VERSION, 12);
+        assert_eq!(LATEST_SCHEMA_VERSION, 13);
     }
 
     #[test]
@@ -667,7 +678,7 @@ mod tests {
     #[test]
     fn test_fresh_migrate_reaches_head_with_all_tables() {
         let db = Database::open_in_memory().unwrap();
-        assert_eq!(schema_version_of(&db), 12);
+        assert_eq!(schema_version_of(&db), 13);
         for t in METRICS_TABLES {
             assert!(table_exists(&db, t), "missing table {t}");
         }
@@ -685,7 +696,7 @@ mod tests {
             assert!(!table_exists(&db, t), "table {t} should not exist at v7");
         }
         db.migrate().unwrap();
-        assert_eq!(schema_version_of(&db), 12);
+        assert_eq!(schema_version_of(&db), 13);
         for t in METRICS_TABLES {
             assert!(table_exists(&db, t), "missing table {t} after upgrade");
         }
@@ -696,7 +707,7 @@ mod tests {
         let db = Database::open_in_memory().unwrap();
         db.migrate().unwrap();
         db.migrate().unwrap();
-        assert_eq!(schema_version_of(&db), 12);
+        assert_eq!(schema_version_of(&db), 13);
     }
 
     // ---- Migration 009 (plan-by-reference drawer-id columns) coverage ----
@@ -706,7 +717,7 @@ mod tests {
     #[test]
     fn test_fresh_migrate_reaches_v9_with_plan_drawer_columns() {
         let db = Database::open_in_memory().unwrap();
-        assert_eq!(schema_version_of(&db), 12);
+        assert_eq!(schema_version_of(&db), 13);
         for c in PLAN_DRAWER_COLUMNS {
             assert!(
                 column_exists(&db, "collab_sessions", c),
@@ -726,7 +737,7 @@ mod tests {
             );
         }
         db.migrate().unwrap();
-        assert_eq!(schema_version_of(&db), 12);
+        assert_eq!(schema_version_of(&db), 13);
         for c in PLAN_DRAWER_COLUMNS {
             assert!(
                 column_exists(&db, "collab_sessions", c),
@@ -760,7 +771,7 @@ mod tests {
             "lease table should not exist at v9"
         );
         db.migrate().unwrap();
-        assert_eq!(schema_version_of(&db), 12);
+        assert_eq!(schema_version_of(&db), 13);
         assert!(
             table_exists(&db, "collab_actor_generations"),
             "missing collab_actor_generations after upgrade"
@@ -835,7 +846,7 @@ mod tests {
     #[test]
     fn test_fresh_migrate_reaches_v11_tables() {
         let db = Database::open_in_memory().unwrap();
-        assert_eq!(schema_version_of(&db), 12);
+        assert_eq!(schema_version_of(&db), 13);
         assert!(table_exists(&db, "code_maps"), "code_maps table must exist");
     }
 
@@ -856,7 +867,7 @@ mod tests {
             );
         }
         db.migrate().unwrap();
-        assert_eq!(schema_version_of(&db), 12);
+        assert_eq!(schema_version_of(&db), 13);
         assert!(
             table_exists(&db, "code_maps"),
             "code_maps must exist after upgrade to v11+"
@@ -886,7 +897,7 @@ mod tests {
             .unwrap();
 
         db.migrate().unwrap();
-        assert_eq!(schema_version_of(&db), 12);
+        assert_eq!(schema_version_of(&db), 13);
 
         // The pre-existing row must read back with the three new columns NULL.
         let (map_status, turn_id, area): (Option<String>, Option<String>, Option<String>) = db
@@ -908,7 +919,7 @@ mod tests {
         let db = Database::open_in_memory().unwrap();
         db.migrate().unwrap();
         db.migrate().unwrap();
-        assert_eq!(schema_version_of(&db), 12);
+        assert_eq!(schema_version_of(&db), 13);
     }
 
     // ---- Migration 012 (symbol/import graph tables) ----
@@ -923,7 +934,7 @@ mod tests {
     #[test]
     fn test_fresh_migrate_reaches_v12() {
         let db = Database::open_in_memory().unwrap();
-        assert_eq!(schema_version_of(&db), 12);
+        assert_eq!(schema_version_of(&db), 13);
         for t in SYMBOL_GRAPH_TABLES {
             assert!(table_exists(&db, t), "missing table {t} at v12");
         }
@@ -945,7 +956,7 @@ mod tests {
             assert!(!table_exists(&db, t), "table {t} should not exist at v11");
         }
         db.migrate().unwrap();
-        assert_eq!(schema_version_of(&db), 12);
+        assert_eq!(schema_version_of(&db), 13);
         for t in SYMBOL_GRAPH_TABLES {
             assert!(
                 table_exists(&db, t),
@@ -959,6 +970,232 @@ mod tests {
         let db = Database::open_in_memory().unwrap();
         db.migrate().unwrap();
         db.migrate().unwrap();
+        assert_eq!(schema_version_of(&db), 13);
+    }
+
+    // ---- Migration 013 (relax metrics harness CHECK to registry slug) ----
+
+    /// Build a connection migrated to exactly v12 (no harness CHECK relaxation yet)
+    /// by replaying migrations 001-012 directly from the module consts.
+    fn open_at_v12() -> Database {
+        let db = open_at_v11();
+        db.conn.execute_batch(SYMBOL_IMPORT_GRAPH_SQL).unwrap();
+        db
+    }
+
+    #[test]
+    fn test_v12_to_v13_preserves_existing_metrics_rows() {
+        let db = open_at_v12();
         assert_eq!(schema_version_of(&db), 12);
+
+        // Insert claude and codex rows into all three metrics tables before migration.
+        db.conn
+            .execute(
+                "INSERT INTO token_usage
+                    (ts, source, harness, input_tokens, output_tokens,
+                     cache_creation_input_tokens, cache_read_input_tokens,
+                     estimated, chars)
+                 VALUES ('2026-06-29T10:00:00Z', 'transcript', 'claude',
+                         100, 50, 10, 5, 0, 200)",
+                [],
+            )
+            .unwrap();
+        db.conn
+            .execute(
+                "INSERT INTO token_usage
+                    (ts, source, harness, input_tokens, output_tokens,
+                     cache_creation_input_tokens, cache_read_input_tokens,
+                     estimated, chars)
+                 VALUES ('2026-06-29T10:01:00Z', 'mcp_response', 'codex',
+                         80, 30, 0, 0, 0, 150)",
+                [],
+            )
+            .unwrap();
+        db.conn
+            .execute(
+                "INSERT INTO occupancy_samples
+                    (ts, harness, input_tokens, cache_read_input_tokens)
+                 VALUES ('2026-06-29T10:02:00Z', 'claude', 500, 100)",
+                [],
+            )
+            .unwrap();
+        db.conn
+            .execute(
+                "INSERT INTO occupancy_samples
+                    (ts, harness, input_tokens, cache_read_input_tokens)
+                 VALUES ('2026-06-29T10:03:00Z', 'codex', 400, 50)",
+                [],
+            )
+            .unwrap();
+        db.conn
+            .execute(
+                "INSERT INTO session_summary (session_id, harness)
+                 VALUES ('pre-v13-claude', 'claude')",
+                [],
+            )
+            .unwrap();
+        db.conn
+            .execute(
+                "INSERT INTO session_summary (session_id, harness)
+                 VALUES ('pre-v13-codex', 'codex')",
+                [],
+            )
+            .unwrap();
+
+        // Run the v13 migration.
+        db.migrate().unwrap();
+        assert_eq!(schema_version_of(&db), 13);
+
+        // Verify token_usage rows are preserved byte-for-byte.
+        let tu_rows: Vec<(String, String, i64, i64)> = {
+            let mut stmt = db
+                .conn
+                .prepare(
+                    "SELECT harness, source, input_tokens, output_tokens
+                     FROM token_usage ORDER BY ts",
+                )
+                .unwrap();
+            stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))
+                .unwrap()
+                .map(|r| r.unwrap())
+                .collect()
+        };
+        assert_eq!(tu_rows.len(), 2);
+        assert_eq!(tu_rows[0], ("claude".into(), "transcript".into(), 100, 50));
+        assert_eq!(tu_rows[1], ("codex".into(), "mcp_response".into(), 80, 30));
+
+        // Verify occupancy_samples rows are preserved.
+        let occ_rows: Vec<(String, i64)> = {
+            let mut stmt = db
+                .conn
+                .prepare("SELECT harness, input_tokens FROM occupancy_samples ORDER BY ts")
+                .unwrap();
+            stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+                .unwrap()
+                .map(|r| r.unwrap())
+                .collect()
+        };
+        assert_eq!(occ_rows.len(), 2);
+        assert_eq!(occ_rows[0], ("claude".into(), 500));
+        assert_eq!(occ_rows[1], ("codex".into(), 400));
+
+        // Verify session_summary rows are preserved.
+        let ss_rows: Vec<(String, String)> = {
+            let mut stmt = db
+                .conn
+                .prepare("SELECT session_id, harness FROM session_summary ORDER BY session_id")
+                .unwrap();
+            stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+                .unwrap()
+                .map(|r| r.unwrap())
+                .collect()
+        };
+        assert_eq!(ss_rows.len(), 2);
+        assert_eq!(ss_rows[0], ("pre-v13-claude".into(), "claude".into()));
+        assert_eq!(ss_rows[1], ("pre-v13-codex".into(), "codex".into()));
+    }
+
+    #[test]
+    fn test_v13_accepts_synthetic_third_harness_ids() {
+        let db = Database::open_in_memory().unwrap();
+        assert_eq!(schema_version_of(&db), 13);
+
+        for harness in &["gemini", "grok-2", "grok-ai", "grok_ai", "copilot4"] {
+            db.conn
+                .execute(
+                    "INSERT INTO token_usage
+                        (ts, source, harness, input_tokens, output_tokens,
+                         cache_creation_input_tokens, cache_read_input_tokens,
+                         estimated, chars)
+                     VALUES (?1, 'transcript', ?2, 0, 0, 0, 0, 0, 0)",
+                    rusqlite::params![format!("2026-06-29T12:00:00Z-{harness}"), harness],
+                )
+                .unwrap_or_else(|e| panic!("harness '{harness}' should be accepted: {e}"));
+
+            db.conn
+                .execute(
+                    "INSERT INTO occupancy_samples (ts, harness, input_tokens, cache_read_input_tokens)
+                     VALUES (?1, ?2, 0, 0)",
+                    rusqlite::params![format!("2026-06-29T12:01:00Z-{harness}"), harness],
+                )
+                .unwrap_or_else(|e| panic!("harness '{harness}' should be accepted: {e}"));
+
+            db.conn
+                .execute(
+                    "INSERT INTO session_summary (session_id, harness) VALUES (?1, ?2)",
+                    rusqlite::params![format!("synth-{harness}"), harness],
+                )
+                .unwrap_or_else(|e| panic!("harness '{harness}' should be accepted: {e}"));
+        }
+    }
+
+    #[test]
+    fn test_v13_rejects_invalid_harness_ids() {
+        let db = Database::open_in_memory().unwrap();
+        assert_eq!(schema_version_of(&db), 13);
+
+        // These must all be rejected by the relaxed CHECK.
+        let invalid: &[&str] = &[
+            "Claude", // uppercase
+            "a b",    // space
+            "a;b",    // semicolon
+            "-x",     // leading hyphen (not [a-z0-9])
+            "",       // empty string fails GLOB '[a-z0-9]*' (needs at least one char)
+        ];
+
+        for bad in invalid {
+            let tu_result = db.conn.execute(
+                "INSERT INTO token_usage
+                    (ts, source, harness, input_tokens, output_tokens,
+                     cache_creation_input_tokens, cache_read_input_tokens,
+                     estimated, chars)
+                 VALUES (?1, 'transcript', ?2, 0, 0, 0, 0, 0, 0)",
+                rusqlite::params![format!("2026-06-29T13:00:00Z-bad"), bad],
+            );
+            assert!(
+                tu_result.is_err(),
+                "token_usage should reject harness={bad:?}"
+            );
+
+            let occ_result = db.conn.execute(
+                "INSERT INTO occupancy_samples (ts, harness, input_tokens, cache_read_input_tokens)
+                 VALUES (?1, ?2, 0, 0)",
+                rusqlite::params![format!("2026-06-29T13:01:00Z-bad"), bad],
+            );
+            assert!(
+                occ_result.is_err(),
+                "occupancy_samples should reject harness={bad:?}"
+            );
+
+            let ss_result = db.conn.execute(
+                "INSERT INTO session_summary (session_id, harness) VALUES (?1, ?2)",
+                rusqlite::params![format!("bad-{bad}"), bad],
+            );
+            assert!(
+                ss_result.is_err(),
+                "session_summary should reject harness={bad:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_fresh_migrate_reaches_v13() {
+        let db = Database::open_in_memory().unwrap();
+        assert_eq!(schema_version_of(&db), 13);
+        // All three rebuilt tables and their indexes must still exist.
+        for t in ["token_usage", "occupancy_samples", "session_summary"] {
+            assert!(table_exists(&db, t), "missing table {t} at v13");
+        }
+        assert!(index_exists(&db, "idx_token_usage_task_ts"));
+        assert!(index_exists(&db, "idx_token_usage_collab_phase"));
+        assert!(index_exists(&db, "idx_occupancy_session_ts"));
+    }
+
+    #[test]
+    fn test_migrate_twice_idempotent_v13() {
+        let db = Database::open_in_memory().unwrap();
+        db.migrate().unwrap();
+        db.migrate().unwrap();
+        assert_eq!(schema_version_of(&db), 13);
     }
 }
