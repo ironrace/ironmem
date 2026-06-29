@@ -80,11 +80,14 @@ protocol. The two halves serve different concerns.
 
 Generic AI assistant identity is represented by `HarnessId` and the
 `crate::harness::REGISTRY` constant (`crates/ironmem/src/harness/mod.rs`).
-All of the following surfaces are driven entirely by iterating the registry —
-no harness id is hard-coded in them:
+The following generic surfaces consume registry metadata. Some outer
+integration edges still have per-harness strategy code where the host harnesses
+use different config files or plugin layouts.
 
-- **Launcher** — `HarnessSpec::binary` is the executable name; `ironmem
-  harnesses` dumps the full registry.
+- **Launcher metadata** — the existing `ironmem claude` / `ironmem codex`
+  launcher commands derive their binary and label from `HarnessSpec`;
+  `ironmem harnesses` dumps the full registry. Adding a registry entry does not
+  create a new launch subcommand.
 - **Attribution** — `classify_client_info` maps `clientInfo.name` to a
   harness id; `canonicalize_input` maps `IRONMEM_HARNESS` to a harness id.
 - **Hook capabilities** — per-harness flags (`additional_context_support`,
@@ -93,18 +96,23 @@ no harness id is hard-coded in them:
 - **Write-rules targets** — `default_rules_targets` and the `--harness` flag
   derive the rules file list from `HarnessSpec::rules_file` /
   `write_rules_default`.
-- **Doctor checks** — the `ironmem doctor` pass iterates the registry and
-  emits a `harness_<id>` check per entry.
+- **Doctor checks** — the `ironmem doctor` pass iterates the registry and emits
+  a `harness_<id>` check per entry. Claude and Codex keep their current
+  per-config detection strategies; additional entries report an advisory check
+  until a detection strategy is added.
 - **Metrics harness CHECK** — migration 013 relaxed the DB constraint from
   the hard-coded `'claude'/'codex'` domain to the `HarnessId` slug GLOB
   (`harness GLOB '[a-z0-9]*' AND harness NOT GLOB '*[^a-z0-9_-]*'`), so any
   registered harness can persist `token_usage`, `occupancy_samples`, and
   `session_summary` rows.
 - **Packaging drift-lint** — `check_packaging_coverage` asserts that every
-  registered harness has a corresponding entry in the packaging manifest.
+  registered harness has a corresponding `.<id>-plugin/` root with required
+  wrapper assets.
 
-Adding a new harness (e.g. Gemini) means adding one `HarnessSpec` to
-`REGISTRY`. All of the surfaces above pick it up automatically.
+Adding a new harness (e.g. Gemini) starts with one `HarnessSpec` in `REGISTRY`;
+the generic surfaces above pick up the shared metadata from there. The harness
+still needs its plugin root/assets, and any optional per-harness integration
+strategy such as launcher or doctor detection must be added explicitly.
 
 ### Intentionally still two-party: the `/collab` protocol
 
