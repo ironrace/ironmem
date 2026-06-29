@@ -6,7 +6,7 @@ use crate::sanitize;
 use crate::search;
 
 use super::shared::{
-    render_sensitive_text, validate_hex_id, MAX_DRAWER_FETCH_CHARS, MAX_SEARCH_LIMIT,
+    render_sensitive_text, validate_hex_id, MAX_DRAWER_CONTENT_CHARS, MAX_SEARCH_LIMIT,
     MAX_SEARCH_RESPONSE_CHARS, MAX_SENSITIVE_FIELD_CHARS,
 };
 use crate::mcp::app::App;
@@ -31,7 +31,7 @@ pub(super) fn handle_add_drawer(app: &App, args: &Value) -> Result<Value, Memory
         .and_then(|v| v.as_str())
         .unwrap_or("general");
 
-    let content = sanitize::sanitize_content(content, 100_000)?;
+    let content = sanitize::sanitize_content(content, MAX_DRAWER_CONTENT_CHARS)?;
     let wing = sanitize::sanitize_name(wing, "wing")?;
     let room = sanitize::sanitize_name(room, "room")?;
 
@@ -222,7 +222,21 @@ pub(super) fn handle_get_drawer(app: &App, args: &Value) -> Result<Value, Memory
 
     let redact_content = app.config.mcp_access_mode.redacts_sensitive_content();
     let (content, truncated, redacted, _consumed) =
-        render_sensitive_text(&drawer.content, MAX_DRAWER_FETCH_CHARS, redact_content);
+        render_sensitive_text(&drawer.content, MAX_DRAWER_CONTENT_CHARS, redact_content);
+
+    // Parity: when the body is redacted, also withhold source_file (a filesystem
+    // path) and added_by — both are potentially sensitive metadata. wing/room/
+    // filed_at/date are structural locators and are always returned.
+    let source_file = if redact_content {
+        Value::Null
+    } else {
+        json!(drawer.source_file)
+    };
+    let added_by = if redact_content {
+        Value::Null
+    } else {
+        json!(drawer.added_by)
+    };
 
     Ok(json!({
         "found": true,
@@ -232,8 +246,8 @@ pub(super) fn handle_get_drawer(app: &App, args: &Value) -> Result<Value, Memory
         "content_redacted": redacted,
         "wing": drawer.wing,
         "room": drawer.room,
-        "source_file": drawer.source_file,
-        "added_by": drawer.added_by,
+        "source_file": source_file,
+        "added_by": added_by,
         "filed_at": drawer.filed_at,
         "date": drawer.date,
     }))
@@ -565,9 +579,10 @@ mod tests {
     #[test]
     fn get_drawer_returns_full_content_for_existing_id() {
         let app = test_app();
-        // A body LARGER than MAX_SENSITIVE_FIELD_CHARS (4_000): this is exactly
-        // the case search-excerpt truncation would corrupt — the bug that broke
-        // the collab compose→submit drawer handoff (a 4297-char PR body).
+        // A body larger than MAX_SENSITIVE_FIELD_CHARS (4_000): this exercises
+        // full-body round-trip and fixes excerpt truncation, one of the two
+        // failure modes get_drawer addresses (the other being that semantic
+        // search cannot deterministically return a known-id drawer).
         let big = "x".repeat(4_500);
         let added = handle_add_drawer(
             &app,
@@ -585,6 +600,13 @@ mod tests {
         assert_eq!(out["content"].as_str(), Some(big.as_str()));
         assert_eq!(out["content_truncated"].as_bool(), Some(false));
         assert_eq!(out["content_redacted"].as_bool(), Some(false));
+        // Provenance fields written by add_drawer are present and well-typed.
+        assert_eq!(out["added_by"].as_str(), Some("mcp"));
+        assert_eq!(out["source_file"].as_str(), Some(""));
+        assert!(out.get("filed_at").is_some(), "filed_at must be present");
+        assert!(out["filed_at"].is_string(), "filed_at must be a string");
+        assert!(out.get("date").is_some(), "date must be present");
+        assert!(out["date"].is_string(), "date must be a string");
     }
 
     #[test]
@@ -604,6 +626,57 @@ mod tests {
         assert!(handle_get_drawer(&app, &json!({"id": "not-a-hex-id!!"})).is_err());
         // Missing id is also a validation error.
         assert!(handle_get_drawer(&app, &json!({})).is_err());
+    }
+
+    #[test]
+    fn get_drawer_returns_content_in_read_only_mode() {
+        // ReadOnly does not redact sensitive content — confirm the full body is
+        // returned unredacted. Write via a Trusted app (ReadOnly may block writes),
+        // then read back via a ReadOnly app against the same database.
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("mem.sqlite3");
+        let model_dir = dir.path().join("model");
+        let state_dir = dir.path().join("state");
+
+        let trusted = {
+            let config = Config {
+                db_path: db_path.clone(),
+                model_dir: model_dir.clone(),
+                model_dir_explicit: true,
+                state_dir: state_dir.clone(),
+                mcp_access_mode: McpAccessMode::Trusted,
+                embed_mode: EmbedMode::Noop,
+            };
+            #[allow(clippy::arc_with_non_send_sync)]
+            Arc::new(App::new(config).unwrap())
+        };
+        let body = "read-only mode content body";
+        let added = handle_add_drawer(
+            &trusted,
+            &json!({"content": body, "wing": "test", "room": "general"}),
+        )
+        .unwrap();
+        let id = added["id"].as_str().unwrap().to_string();
+        drop(trusted);
+
+        let readonly = {
+            let config = Config {
+                db_path,
+                model_dir,
+                model_dir_explicit: true,
+                state_dir,
+                mcp_access_mode: McpAccessMode::ReadOnly,
+                embed_mode: EmbedMode::Noop,
+            };
+            #[allow(clippy::arc_with_non_send_sync)]
+            Arc::new(App::new(config).unwrap())
+        };
+        std::mem::forget(dir);
+
+        let out = handle_get_drawer(&readonly, &json!({"id": id})).unwrap();
+        assert_eq!(out["found"].as_bool(), Some(true));
+        assert_eq!(out["content_redacted"].as_bool(), Some(false));
+        assert_eq!(out["content"].as_str(), Some(body));
     }
 
     #[test]
@@ -647,14 +720,21 @@ mod tests {
             #[allow(clippy::arc_with_non_send_sync)]
             Arc::new(App::new(config).unwrap())
         };
-        std::mem::forget(dir);
-
         let out = handle_get_drawer(&restricted, &json!({"id": id})).unwrap();
         assert_eq!(out["found"].as_bool(), Some(true));
         assert_eq!(out["content_redacted"].as_bool(), Some(true));
         assert!(
             out["content"].is_null(),
             "restricted mode must not leak the body"
+        );
+        // Parity: sensitive metadata is also withheld when the body is redacted.
+        assert!(
+            out["source_file"].is_null(),
+            "restricted mode must not leak source_file"
+        );
+        assert!(
+            out["added_by"].is_null(),
+            "restricted mode must not leak added_by"
         );
     }
 
