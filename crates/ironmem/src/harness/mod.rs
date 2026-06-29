@@ -5,6 +5,9 @@
 //! lookup helpers take an explicit `registry: &[HarnessSpec]` slice so they
 //! work on injected test slices without global-state mutation.
 
+mod packaging;
+pub use packaging::check_packaging_coverage;
+
 /// How a harness encodes session transcripts (used by the abeval token parser).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "lowercase")]
