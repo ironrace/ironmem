@@ -511,4 +511,124 @@ mod tests {
         assert!(ids.contains(&"claude"), "must still contain claude entry");
         assert!(ids.contains(&"codex"), "must still contain codex entry");
     }
+
+    // ---- Issue #155 end-to-end synthetic third-harness acceptance test ------
+
+    /// Issue #155 acceptance: "third registered harness end-to-end at unit level."
+    ///
+    /// Registers a synthetic "gemini" harness via an injected 3-entry registry
+    /// slice — no production registry or Gemini/Grok/Copilot code is touched.
+    /// Exercises all four registry-driven surfaces in one flow:
+    ///   (1) attribution (classify_client_info + canonicalize_input)
+    ///   (2) write-rules target resolution (resolve_write_targets)
+    ///   (3) metrics-row persistence (token_usage INSERT → SELECT round-trip)
+    ///   (4) launcher arg-build (launch_invocation from spec)
+    #[test]
+    fn e2e_synthetic_third_harness_flows_through_all_registry_surfaces() {
+        // Synthetic spec — lives in test scope only; NOT added to production REGISTRY.
+        const GEMINI_E2E: HarnessSpec = HarnessSpec {
+            id: "gemini",
+            display_name: "Gemini",
+            binary: "gemini",
+            rules_file: "GEMINI.md",
+            write_rules_default: false,
+            client_info_aliases: &["gemini", "gemini-cli"],
+            env_aliases: &["gemini"],
+            additional_context_support: true,
+            occupancy_support: true,
+            transcript_parser: TranscriptParserKind::None,
+        };
+
+        // Build 3-entry registry; look up by id, never by index, so the test
+        // is immune to future REGISTRY reordering.
+        let claude_spec = REGISTRY
+            .iter()
+            .find(|s| s.id == "claude")
+            .copied()
+            .expect("claude must be in REGISTRY");
+        let codex_spec = REGISTRY
+            .iter()
+            .find(|s| s.id == "codex")
+            .copied()
+            .expect("codex must be in REGISTRY");
+        let registry = [claude_spec, codex_spec, GEMINI_E2E];
+
+        // ── (1) Attribution ──────────────────────────────────────────────────
+        assert_eq!(
+            classify_client_info("gemini-cli", &registry),
+            Some("gemini"),
+            "classify_client_info must match 'gemini-cli' substring to gemini"
+        );
+        assert_eq!(
+            canonicalize_input("gemini", &registry),
+            Some("gemini"),
+            "canonicalize_input must map 'gemini' env alias to id"
+        );
+
+        // ── (2) Write-rules target resolution ────────────────────────────────
+        let targets = crate::write_rules::resolve_write_targets(None, Some("gemini"), &registry)
+            .expect("gemini harness must resolve to its rules_file in injected registry");
+        assert_eq!(
+            targets,
+            vec!["GEMINI.md"],
+            "resolve_write_targets must return GEMINI.md for gemini harness"
+        );
+
+        // ── (3) Metrics-row persistence ──────────────────────────────────────
+        // Migrated in-memory DB — migration 013 relaxed the harness CHECK to accept
+        // any [a-z0-9][a-z0-9_-]* slug, so "gemini" is a valid harness value.
+        let db =
+            crate::db::schema::Database::open_in_memory().expect("in-memory migrated DB must open");
+        let new_row = crate::db::metrics::NewTokenUsage {
+            ts: "2026-06-29T00:00:00Z".into(),
+            source: "mcp_response".into(),
+            harness: "gemini".into(),
+            model: None,
+            session_id: None,
+            collab_session_id: None,
+            collab_phase: None,
+            task_tag: Some("issue-155-e2e".into()),
+            input_tokens: 42,
+            output_tokens: 7,
+            cache_creation_input_tokens: 0,
+            cache_read_input_tokens: 0,
+            estimated: false,
+            chars: 0,
+            cost_usd: None,
+            map_status: None,
+            turn_id: None,
+            area: None,
+        };
+        let row_id = db
+            .insert_token_usage(&new_row)
+            .expect("gemini token_usage INSERT must succeed");
+        assert!(row_id > 0, "rowid must be positive");
+
+        let persisted = db
+            .query_token_usage(&crate::db::metrics::TokenUsageQuery {
+                task_tag: Some("issue-155-e2e".into()),
+                ..Default::default()
+            })
+            .expect("query must succeed");
+        assert_eq!(persisted.len(), 1, "exactly one row must persist");
+        assert_eq!(
+            persisted[0].harness, "gemini",
+            "harness field must round-trip"
+        );
+        assert_eq!(persisted[0].input_tokens, 42);
+
+        // ── (4) Launcher arg-build ────────────────────────────────────────────
+        // launch_invocation is pub(crate) + #[cfg(test)] and reachable from any
+        // test module within the same crate.
+        let (bin, args) = crate::launcher::launch_invocation(&GEMINI_E2E, Some("do it"));
+        assert_eq!(
+            bin, "gemini",
+            "launcher must derive binary from spec.binary"
+        );
+        assert_eq!(
+            args,
+            vec!["do it".to_string()],
+            "prompt must become the single positional argv"
+        );
+    }
 }
