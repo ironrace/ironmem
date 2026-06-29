@@ -20,20 +20,35 @@ pub enum Harness {
 }
 
 impl Harness {
-    /// Executable name looked up on PATH.
-    pub fn binary(self) -> &'static str {
+    /// Canonical registry id for this variant.  This is the single link from
+    /// the launcher's protocol-role enum to the harness registry.
+    pub fn harness_id(self) -> &'static str {
         match self {
             Harness::Claude => "claude",
             Harness::Codex => "codex",
         }
     }
 
-    /// Human-readable name for log lines.
+    /// Look up the full registry spec for this harness.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `REGISTRY` does not contain an entry for `self.harness_id()`.
+    /// This is a programming error: every `Harness` variant must have a
+    /// corresponding entry in `crate::harness::REGISTRY`.
+    pub fn spec(self) -> &'static crate::harness::HarnessSpec {
+        crate::harness::by_id(self.harness_id(), crate::harness::REGISTRY)
+            .expect("REGISTRY must contain the launcher harness id")
+    }
+
+    /// Executable name looked up on PATH.  Derived from the registry spec.
+    pub fn binary(self) -> &'static str {
+        self.spec().binary
+    }
+
+    /// Human-readable name for log lines.  Derived from the registry spec.
     pub fn label(self) -> &'static str {
-        match self {
-            Harness::Claude => "Claude Code",
-            Harness::Codex => "Codex",
-        }
+        self.spec().display_name
     }
 }
 
@@ -175,9 +190,22 @@ pub fn run_launcher(
     Ok(())
 }
 
+/// Build the `(binary, argv)` pair for launching a harness from its spec.
+///
+/// Pure and registry-driven so a synthetic third harness can be exercised
+/// without a real binary on PATH.
+#[cfg(test)]
+pub(crate) fn launch_invocation(
+    spec: &crate::harness::HarnessSpec,
+    prompt: Option<&str>,
+) -> (String, Vec<String>) {
+    (spec.binary.to_string(), argv::build_args(prompt))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::harness::{HarnessSpec, TranscriptParserKind};
 
     #[test]
     fn harness_maps_to_binary_and_label() {
@@ -185,6 +213,50 @@ mod tests {
         assert_eq!(Harness::Codex.binary(), "codex");
         assert_eq!(Harness::Claude.label(), "Claude Code");
         assert_eq!(Harness::Codex.label(), "Codex");
+    }
+
+    #[test]
+    fn harness_id_resolves_via_registry() {
+        let claude_spec =
+            crate::harness::by_id(Harness::Claude.harness_id(), crate::harness::REGISTRY)
+                .expect("claude must be in REGISTRY");
+        assert_eq!(claude_spec.id, "claude");
+        assert_eq!(claude_spec.binary, "claude");
+        assert_eq!(claude_spec.display_name, "Claude Code");
+
+        let codex_spec =
+            crate::harness::by_id(Harness::Codex.harness_id(), crate::harness::REGISTRY)
+                .expect("codex must be in REGISTRY");
+        assert_eq!(codex_spec.id, "codex");
+        assert_eq!(codex_spec.binary, "codex");
+        assert_eq!(codex_spec.display_name, "Codex");
+    }
+
+    const GEMINI_SPEC: HarnessSpec = HarnessSpec {
+        id: "gemini",
+        display_name: "Gemini",
+        binary: "gemini",
+        rules_file: "GEMINI.md",
+        write_rules_default: false,
+        client_info_aliases: &["gemini"],
+        env_aliases: &["gemini"],
+        additional_context_support: false,
+        occupancy_support: false,
+        transcript_parser: TranscriptParserKind::None,
+    };
+
+    #[test]
+    fn launch_invocation_third_harness_with_prompt() {
+        let (bin, args) = launch_invocation(&GEMINI_SPEC, Some("do the thing"));
+        assert_eq!(bin, "gemini");
+        assert_eq!(args, vec!["do the thing".to_string()]);
+    }
+
+    #[test]
+    fn launch_invocation_third_harness_no_prompt() {
+        let (bin, args) = launch_invocation(&GEMINI_SPEC, None);
+        assert_eq!(bin, "gemini");
+        assert!(args.is_empty());
     }
 
     #[test]
