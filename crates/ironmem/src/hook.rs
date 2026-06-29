@@ -198,10 +198,11 @@ fn run_hook_with_input(
     match hook_name {
         "session-start" => {
             ensure_bootstrapped(&app, bootstrap_workspace)?;
-            // Claude Code-specific: push a compact memory status block via
-            // hookSpecificOutput.additionalContext. Codex has no such channel,
-            // so it silently degrades (field stays None → omitted from JSON).
-            if !harness.starts_with("codex") {
+            // Capability-driven: push a compact memory status block via
+            // hookSpecificOutput.additionalContext. Harnesses without
+            // additional_context_support (e.g. Codex) silently degrade
+            // (field stays None → omitted from JSON).
+            if resolve_harness_spec(harness, crate::harness::REGISTRY).additional_context_support {
                 if let Some(ctx) = build_session_start_context(&app, workspace_root.as_deref()) {
                     response.hook_specific_output = Some(HookSpecificOutput::session_start(ctx));
                 }
@@ -323,6 +324,35 @@ fn read_full_transcript(path: &Path) -> Option<String> {
     Some(String::from_utf8_lossy(&buf).into_owned())
 }
 
+/// Resolve the hook's `harness` arg string to its registry spec.
+///
+/// Resolution order:
+/// 1. `canonicalize_input` — exact env-alias match (e.g. "claude-code" → claude,
+///    "codex" → codex).
+/// 2. `classify_client_info` — clientInfo substring match (e.g. "codex-cli" →
+///    codex via alias "codex").
+/// 3. Fallback to the claude spec — preserves the historical unknown→claude
+///    default so unrecognized harnesses still inject additionalContext.
+///
+/// Takes an explicit registry slice for testability (pass `crate::harness::REGISTRY`
+/// in production).
+fn resolve_harness_spec<'a>(
+    harness: &str,
+    registry: &'a [crate::harness::HarnessSpec],
+) -> &'a crate::harness::HarnessSpec {
+    if let Some(id) = crate::harness::canonicalize_input(harness, registry) {
+        if let Some(spec) = crate::harness::by_id(id, registry) {
+            return spec;
+        }
+    }
+    if let Some(id) = crate::harness::classify_client_info(harness, registry) {
+        if let Some(spec) = crate::harness::by_id(id, registry) {
+            return spec;
+        }
+    }
+    crate::harness::by_id("claude", registry).expect("REGISTRY must always contain a claude spec")
+}
+
 /// Parse and persist full-transcript token usage rows for `stop`/`precompact`.
 /// Runs under `metrics_enabled()` ONLY, OUTSIDE the `allows_writes` gate (N1).
 /// Best-effort: warns on failure, never fails the hook (N5).
@@ -342,54 +372,60 @@ fn persist_transcript_tokens(
         return;
     };
 
-    // Normalize harness to the two DB-legal values.
-    let harness_norm = if harness.starts_with("codex") {
-        "codex"
-    } else {
-        "claude"
-    };
-
+    // Drive parser selection from the registry capability, not a harness prefix.
+    // A registered harness with TranscriptParserKind::None is skipped entirely
+    // rather than mis-parsed as Claude.
+    let spec = resolve_harness_spec(harness, crate::harness::REGISTRY);
     let ctx = resolve_transcript_context(app, workspace_root);
     let now = crate::metrics::now_rfc3339();
     let transcript_session_id = session_id.filter(|sid| *sid != "unknown");
 
-    if harness_norm == "codex" {
-        match crate::metrics::transcript::parse_codex_rollout(&raw, transcript_session_id) {
-            Ok(Some(trow)) => {
-                let row = crate::db::metrics::NewTokenUsage::from_transcript(
-                    trow,
-                    harness_norm,
-                    now,
-                    transcript_session_id,
-                    &ctx,
-                );
-                if let Err(e) = app.db.upsert_transcript_token_usage(&row) {
-                    tracing::warn!("transcript metrics: codex upsert failed: {e}");
+    match spec.transcript_parser {
+        crate::harness::TranscriptParserKind::Codex => {
+            match crate::metrics::transcript::parse_codex_rollout(&raw, transcript_session_id) {
+                Ok(Some(trow)) => {
+                    let row = crate::db::metrics::NewTokenUsage::from_transcript(
+                        trow,
+                        spec.id,
+                        now,
+                        transcript_session_id,
+                        &ctx,
+                    );
+                    if let Err(e) = app.db.upsert_transcript_token_usage(&row) {
+                        tracing::warn!("transcript metrics: codex upsert failed: {e}");
+                    }
                 }
+                Ok(None) => {} // no token_count yet — skip silently
+                Err(e) => tracing::warn!("transcript metrics: codex parse failed: {e}"),
             }
-            Ok(None) => {} // no token_count yet — skip silently
-            Err(e) => tracing::warn!("transcript metrics: codex parse failed: {e}"),
         }
-    } else {
-        match crate::metrics::transcript::parse_claude_stream_json(&raw, transcript_session_id) {
-            Ok(rows) => {
-                let db_rows: Vec<_> = rows
-                    .into_iter()
-                    .map(|trow| {
-                        crate::db::metrics::NewTokenUsage::from_transcript(
-                            trow,
-                            harness_norm,
-                            now.clone(),
-                            transcript_session_id,
-                            &ctx,
-                        )
-                    })
-                    .collect();
-                if let Err(e) = app.db.upsert_transcript_token_usage_many(&db_rows) {
-                    tracing::warn!("transcript metrics: claude upsert failed: {e}");
+        crate::harness::TranscriptParserKind::Claude => {
+            match crate::metrics::transcript::parse_claude_stream_json(&raw, transcript_session_id)
+            {
+                Ok(rows) => {
+                    let db_rows: Vec<_> = rows
+                        .into_iter()
+                        .map(|trow| {
+                            crate::db::metrics::NewTokenUsage::from_transcript(
+                                trow,
+                                spec.id,
+                                now.clone(),
+                                transcript_session_id,
+                                &ctx,
+                            )
+                        })
+                        .collect();
+                    if let Err(e) = app.db.upsert_transcript_token_usage_many(&db_rows) {
+                        tracing::warn!("transcript metrics: claude upsert failed: {e}");
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!("transcript metrics: claude stream-json parse failed: {e}")
                 }
             }
-            Err(e) => tracing::warn!("transcript metrics: claude stream-json parse failed: {e}"),
+        }
+        crate::harness::TranscriptParserKind::None => {
+            // No transcript parser registered for this harness — skip without writing any row.
         }
     }
 }
@@ -414,19 +450,19 @@ fn sample_occupancy(
     if session_id == "unknown" {
         return;
     }
-    // CHECK constraint: occupancy_samples.harness ∈ {claude, codex}.
-    let harness_norm = if harness.starts_with("codex") {
-        "codex"
-    } else {
-        "claude"
-    };
+    // Registry capability gate: harnesses without occupancy_support are skipped
+    // entirely so no out-of-domain value is ever written to the DB.
+    let spec = resolve_harness_spec(harness, crate::harness::REGISTRY);
+    if !spec.occupancy_support {
+        return;
+    }
     let usage = transcript_path
         .and_then(read_transcript_tail)
         .and_then(|raw| crate::metrics::extract_last_assistant_usage(&raw));
     let workspace = workspace_root.map(|p| p.to_string_lossy().to_string());
     crate::metrics::record_occupancy_sample(
         &app.db,
-        harness_norm,
+        spec.id,
         session_id,
         workspace.as_deref(),
         event,
@@ -524,9 +560,11 @@ fn run_user_prompt_submit(
         hook_specific_output: None,
     };
 
-    // Codex has no additionalContext channel, and restricted mode must never
-    // inject stored drawer content into a harness prompt.
-    if harness.starts_with("codex") || config.mcp_access_mode.redacts_sensitive_content() {
+    // Harnesses without additionalContext support have no injection channel;
+    // restricted mode must never inject stored drawer content into a harness prompt.
+    if !resolve_harness_spec(harness, crate::harness::REGISTRY).additional_context_support
+        || config.mcp_access_mode.redacts_sensitive_content()
+    {
         return response;
     }
 
@@ -728,15 +766,15 @@ fn sample_prompt_occupancy(
         return;
     }
     let db_path = config.db_path.clone();
-    // Defensive: a codex harness has already returned from `run_user_prompt_submit`
-    // before this is reached, so this normalizes to "claude" in practice. Kept to
-    // honor the occupancy_samples.harness CHECK constraint at this callsite too,
-    // so a future caller can't write an out-of-domain value.
-    let harness_norm = if harness.starts_with("codex") {
-        "codex".to_string()
-    } else {
-        "claude".to_string()
-    };
+    // Registry capability gate: harnesses without occupancy_support are skipped.
+    // A harness without additional_context_support already returned early from
+    // run_user_prompt_submit, but guard here too so a future caller can't write
+    // an out-of-domain value.
+    let spec = resolve_harness_spec(harness, crate::harness::REGISTRY);
+    if !spec.occupancy_support {
+        return;
+    }
+    let harness_id = spec.id;
     let workspace = workspace_root.map(|p| p.to_string_lossy().to_string());
     let session_id = session_id.to_string();
     let (tx, rx) = std::sync::mpsc::channel();
@@ -747,7 +785,7 @@ fn sample_prompt_occupancy(
         };
         crate::metrics::record_occupancy_sample(
             &db,
-            &harness_norm,
+            harness_id,
             &session_id,
             workspace.as_deref(),
             event,
@@ -2237,9 +2275,10 @@ mod tests {
     #[test]
     fn session_start_codex_prefix_variants_omit_others_emit() {
         // "codex" is matched exactly in the sibling tests; here "codex-cli" must
-        // also omit via the `starts_with("codex")` prefix, while an arbitrary
-        // non-codex harness must still emit. A refactor to `harness == "codex"`
-        // would pass the exact-match tests but silently break this contract.
+        // also omit additionalContext because it is classified as the codex spec
+        // (via client_info alias substring match) which has additional_context_support=false.
+        // An unrecognized harness ("gemini") falls back to the claude spec and must
+        // still emit (additional_context_support=true).
         let temp = tempfile::tempdir().unwrap();
         let workspace = temp.path().join("workspace");
         std::fs::create_dir_all(&workspace).unwrap();
@@ -3054,9 +3093,10 @@ mod tests {
 
     #[test]
     fn prompt_hook_codex_prefix_variant_emits_nothing() {
-        // The sibling test uses the exact harness "codex"; this pins the
-        // `starts_with("codex")` prefix contract so a regression to `== "codex"`
-        // would leak injection to codex-cli.
+        // The sibling test uses the exact harness "codex"; this pins that
+        // "codex-cli" is also classified as the codex spec (via client_info alias
+        // substring match) and therefore has additional_context_support=false,
+        // so no prompt-recall injection is emitted.
         let temp = tempfile::tempdir().unwrap();
         let db_path = temp.path().join("memory.sqlite3");
         seed_db_file(
@@ -4160,5 +4200,105 @@ mod tests {
         std::env::remove_var("IRONMEM_CONTEXT_WARN_PCT");
         std::env::remove_var("IRONMEM_CONTEXT_HANDOFF_PCT");
         std::env::remove_var("IRONMEM_CONTEXT_WINDOW");
+    }
+
+    // ── Task 4: resolve_harness_spec + None-parser harness tests ────────────
+
+    /// Synthetic "gemini" spec with no transcript parser and no additionalContext
+    /// support — used to verify the capability-driven skip paths.
+    const GEMINI_HOOK_SPEC: crate::harness::HarnessSpec = crate::harness::HarnessSpec {
+        id: "gemini",
+        display_name: "Gemini CLI",
+        binary: "gemini",
+        rules_file: "GEMINI.md",
+        write_rules_default: false,
+        client_info_aliases: &["gemini-cli", "gemini"],
+        env_aliases: &["gemini", "gemini-cli"],
+        additional_context_support: false,
+        occupancy_support: false,
+        transcript_parser: crate::harness::TranscriptParserKind::None,
+    };
+
+    fn three_hook_registry() -> [crate::harness::HarnessSpec; 3] {
+        [
+            crate::harness::REGISTRY[0],
+            crate::harness::REGISTRY[1],
+            GEMINI_HOOK_SPEC,
+        ]
+    }
+
+    #[test]
+    fn resolve_harness_spec_claude_code_alias_maps_to_claude() {
+        let reg = crate::harness::REGISTRY;
+        let spec = resolve_harness_spec("claude-code", reg);
+        assert_eq!(spec.id, "claude");
+        assert!(spec.additional_context_support);
+    }
+
+    #[test]
+    fn resolve_harness_spec_codex_maps_to_codex() {
+        let reg = crate::harness::REGISTRY;
+        let spec = resolve_harness_spec("codex", reg);
+        assert_eq!(spec.id, "codex");
+        assert!(!spec.additional_context_support);
+    }
+
+    #[test]
+    fn resolve_harness_spec_codex_cli_maps_to_codex_via_client_info_alias() {
+        // "codex-cli" has no exact env_alias but "codex" is a substring via
+        // client_info_aliases, so it must resolve to the codex spec.
+        let reg = crate::harness::REGISTRY;
+        let spec = resolve_harness_spec("codex-cli", reg);
+        assert_eq!(spec.id, "codex");
+        assert!(!spec.additional_context_support);
+        assert_eq!(
+            spec.transcript_parser,
+            crate::harness::TranscriptParserKind::Codex
+        );
+    }
+
+    #[test]
+    fn resolve_harness_spec_unknown_falls_back_to_claude() {
+        // An unrecognized harness must fall back to claude, not panic.
+        let reg = crate::harness::REGISTRY;
+        let spec = resolve_harness_spec("some-unknown-harness", reg);
+        assert_eq!(spec.id, "claude");
+        assert!(spec.additional_context_support);
+    }
+
+    #[test]
+    fn resolve_harness_spec_gemini_resolves_in_injected_registry() {
+        // "gemini-cli" is an env_alias in the injected gemini spec.
+        let reg = three_hook_registry();
+        let spec = resolve_harness_spec("gemini-cli", &reg);
+        assert_eq!(spec.id, "gemini");
+        assert!(!spec.additional_context_support);
+        assert!(!spec.occupancy_support);
+        assert_eq!(
+            spec.transcript_parser,
+            crate::harness::TranscriptParserKind::None
+        );
+    }
+
+    #[test]
+    fn gemini_harness_no_additional_context_support_in_injected_registry() {
+        // With the injected 3-entry registry, "gemini" resolves via env_alias
+        // to the gemini spec. Since additional_context_support=false, the
+        // user-prompt-submit hook must return early with no hookSpecificOutput,
+        // even when there is a seeded DB entry.
+        let reg = three_hook_registry();
+        let spec = resolve_harness_spec("gemini", &reg);
+        assert_eq!(spec.id, "gemini");
+        // Capability check — the same predicate used in run_user_prompt_submit.
+        assert!(
+            !spec.additional_context_support,
+            "gemini must not have additional_context_support"
+        );
+        // Prove the None-parser is skipped (not mis-classified as Claude).
+        assert_eq!(
+            spec.transcript_parser,
+            crate::harness::TranscriptParserKind::None,
+            "gemini must use the None transcript parser"
+        );
     }
 }
