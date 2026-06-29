@@ -1,4 +1,11 @@
-//! Pure state machine for the bounded Claude↔Codex planning + coding flow.
+//! State machine for the bounded two-party Claude↔Codex planning + coding flow.
+//!
+//! **Design boundary:** This collab protocol version is intentionally
+//! Claude↔Codex-specific.  Generic harness identity is extensible via
+//! [`crate::harness::HarnessId`] and the open [`crate::harness::REGISTRY`];
+//! adding a third collab participant would require a new protocol version, not
+//! a registry entry.  The [`Agent`] role enum is the compiler-enforced type
+//! for collab protocol roles; harness-generic code uses `HarnessId` instead.
 //!
 //! v1 covers planning: `PlanParallelDrafts` → `PlanSynthesisPending`
 //! → `PlanCodexReviewPending` → `PlanClaudeFinalizePending` → `PlanLocked`.

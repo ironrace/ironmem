@@ -1,12 +1,20 @@
 //! Typed agent identity for collab sessions.
 //!
-//! The protocol has exactly two agents — `Claude` and `Codex`. Pre-refactor
-//! they lived as `String`/`&str` everywhere: in `CollabSession.current_owner`,
-//! `CollabSession.implementer`, the `actor` parameter of `apply_event`, and
-//! the `sender` parameter of `collab_send`. The DB CHECK constraint and an
-//! application-layer `require_agent` validator were the only invariant
-//! guards. This enum collapses those four `String` representations into one
-//! type so the compiler enforces the invariant.
+//! **Boundary note:** Generic harness identity (which AI assistant is running)
+//! is represented by [`crate::harness::HarnessId`] and the extensible
+//! [`crate::harness::REGISTRY`].  This `Agent` enum is *not* a general harness
+//! identifier — it is the **two-party collab protocol role type**.  The
+//! current collab protocol version is intentionally Claude↔Codex-specific;
+//! adding a third party would require a v2 protocol, not a new enum variant.
+//! The compiler keeps `HarnessId` and `Agent` distinct: harness-generic code
+//! uses `HarnessId`; collab-protocol code uses `Agent`.
+//!
+//! Pre-refactor the roles lived as `String`/`&str` everywhere: in
+//! `CollabSession.current_owner`, `CollabSession.implementer`, the `actor`
+//! parameter of `apply_event`, and the `sender` parameter of `collab_send`.
+//! The DB CHECK constraint and an application-layer `require_agent` validator
+//! were the only invariant guards.  This enum collapses those four `String`
+//! representations into one type so the compiler enforces the invariant.
 //!
 //! `Display`/`FromStr` use the canonical lowercase wire form (`"claude"` /
 //! `"codex"`) — same byte forms the DB stores and the MCP layer accepts —
@@ -29,6 +37,18 @@ impl Agent {
             Agent::Claude => "claude",
             Agent::Codex => "codex",
         }
+    }
+
+    /// Returns the [`crate::harness::HarnessId`] that corresponds to this
+    /// collab role — the single name source linking the closed protocol enum
+    /// to the open harness registry.
+    ///
+    /// `Agent::Claude.harness_id()` resolves to registry id `"claude"`;
+    /// `Agent::Codex.harness_id()` resolves to `"codex"`.  The returned id
+    /// is identical to `as_str()` so that DB values, wire bytes, and registry
+    /// lookups all agree on the same string.
+    pub fn harness_id(self) -> crate::harness::HarnessId {
+        crate::harness::HarnessId::new_unchecked(self.as_str())
     }
 }
 
@@ -81,5 +101,23 @@ mod tests {
     fn as_str_is_lowercase_canonical() {
         assert_eq!(Agent::Claude.as_str(), "claude");
         assert_eq!(Agent::Codex.as_str(), "codex");
+    }
+
+    #[test]
+    fn harness_id_matches_registry_entry() {
+        use crate::harness;
+        for agent in [Agent::Claude, Agent::Codex] {
+            let hid = agent.harness_id();
+            let spec = harness::by_id(hid.as_str(), harness::REGISTRY).unwrap_or_else(|| {
+                panic!(
+                    "Agent {:?} harness_id '{}' must resolve in REGISTRY",
+                    agent,
+                    hid.as_str()
+                )
+            });
+            assert_eq!(spec.id, hid.as_str());
+            // Wire form and registry id must agree
+            assert_eq!(agent.as_str(), spec.id);
+        }
     }
 }
