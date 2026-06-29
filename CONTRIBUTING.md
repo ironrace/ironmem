@@ -118,7 +118,7 @@ constant. The fields are:
 |---|---|
 | `id` | Lowercase slug (`[a-z0-9][a-z0-9_-]*`) — used in CLI output, metrics, and hook paths. |
 | `display_name` | Human-readable name shown in `ironmem harnesses` output. |
-| `binary` | Executable name looked up on `PATH` by `ironmem <harness> .` launcher. |
+| `binary` | Executable name carried in the spec; used to derive `Harness::binary()` and `Harness::label()` for the existing `claude`/`codex` launch subcommands. |
 | `rules_file` | File written by `ironmem write-rules --harness <id>` (e.g. `"GEMINI.md"`). |
 | `write_rules_default` | `true` to include this harness in a no-flag `ironmem write-rules` run. |
 | `client_info_aliases` | Substrings matched against `initialize.clientInfo.name` (lowercased) to attribute MCP sessions. |
@@ -126,6 +126,18 @@ constant. The fields are:
 | `additional_context_support` | `true` if the harness supports `hookSpecificOutput.additionalContext`. Session-start memory injection and UserPromptSubmit context injection are only active when this is `true`. |
 | `occupancy_support` | `true` if the harness emits token counts that ironmem can sample. |
 | `transcript_parser` | `TranscriptParserKind::Claude`, `::Codex`, or `::None`. Use `None` if the harness has no recognized transcript format; token metric rows are skipped. |
+
+> **What a `REGISTRY` entry enables:** attribution in `ironmem harnesses` output,
+> hook dispatch, `ironmem write-rules --harness <id>`, doctor checks, metrics
+> persistence, and packaging drift-lint coverage.
+>
+> **What it does NOT include:** an `ironmem <id> .` launch subcommand. The
+> launcher is a closed two-variant `Harness` enum in
+> `crates/ironmem/src/launcher/mod.rs` (`Claude` / `Codex`). Adding a
+> `HarnessSpec` to `REGISTRY` does not add a variant or expose a new
+> `ironmem <id> .` subcommand — the launcher subcommands and their
+> `ensure_*_registered` MCP-registration strategies are deliberate per-harness
+> code, mirroring how `/collab` is intentionally two-party.
 
 ### 2. Add plugin packaging assets
 
