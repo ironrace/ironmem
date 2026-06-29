@@ -156,6 +156,12 @@ enum Commands {
         #[command(subcommand)]
         cmd: SymbolsCmd,
     },
+    /// List registered harnesses (dev/CI helper for packaging scripts)
+    Harnesses {
+        /// Output format
+        #[arg(long, default_value = "text", value_parser = ["json", "text"])]
+        format: String,
+    },
     /// Launch Codex in a repo with the ironmem MCP server attached
     Codex {
         /// Repository path to launch in
@@ -527,6 +533,19 @@ async fn run(cli: Cli) -> Result<(), MemoryError> {
                         eprintln!("{} result(s)", results.len());
                     }
                 }
+            }
+            Ok(())
+        }
+        Commands::Harnesses { format } => {
+            match format.as_str() {
+                "json" => println!(
+                    "{}",
+                    ironmem::harness::registry_json(ironmem::harness::REGISTRY)?
+                ),
+                _ => print!(
+                    "{}",
+                    ironmem::harness::registry_text(ironmem::harness::REGISTRY)
+                ),
             }
             Ok(())
         }

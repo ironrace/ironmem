@@ -6,7 +6,8 @@
 //! work on injected test slices without global-state mutation.
 
 /// How a harness encodes session transcripts (used by the abeval token parser).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
 pub enum TranscriptParserKind {
     Claude,
     Codex,
@@ -91,7 +92,7 @@ impl HarnessId {
 }
 
 /// Static description of a single supported harness.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, serde::Serialize)]
 pub struct HarnessSpec {
     /// Canonical lowercase identifier (e.g. `"claude"`, `"codex"`).
     pub id: &'static str,
@@ -144,6 +145,32 @@ pub const REGISTRY: &[HarnessSpec] = &[
         transcript_parser: TranscriptParserKind::Codex,
     },
 ];
+
+// ---------------------------------------------------------------------------
+// Registry serialization helpers
+// ---------------------------------------------------------------------------
+
+/// Serialize the registry as pretty JSON (id, display_name, binary, rules_file,
+/// write_rules_default, aliases, capability flags). Used by `ironmem harnesses
+/// --format=json` and packaging drift-lint.
+pub fn registry_json(registry: &[HarnessSpec]) -> Result<String, serde_json::Error> {
+    serde_json::to_string_pretty(registry)
+}
+
+/// Human-readable one-line-per-harness listing.
+///
+/// Format: `{id}  {display_name}  rules={rules_file}  binary={binary}`
+pub fn registry_text(registry: &[HarnessSpec]) -> String {
+    registry
+        .iter()
+        .map(|s| {
+            format!(
+                "{}  {}  rules={}  binary={}\n",
+                s.id, s.display_name, s.rules_file, s.binary
+            )
+        })
+        .collect()
+}
 
 // ---------------------------------------------------------------------------
 // Lookup helpers
@@ -392,5 +419,93 @@ mod tests {
             "GEMINI.md should be excluded"
         );
         assert_eq!(targets.len(), 2);
+    }
+
+    // ---- registry_json / registry_text ------------------------------------
+
+    #[test]
+    fn registry_json_parses_as_two_entry_array() {
+        let json = registry_json(REGISTRY).expect("serialization must succeed");
+        let val: serde_json::Value =
+            serde_json::from_str(&json).expect("output must be valid JSON");
+        let arr = val.as_array().expect("top-level must be an array");
+        assert_eq!(arr.len(), 2);
+        let ids: Vec<&str> = arr.iter().filter_map(|e| e["id"].as_str()).collect();
+        assert!(ids.contains(&"claude"), "must contain claude entry");
+        assert!(ids.contains(&"codex"), "must contain codex entry");
+    }
+
+    #[test]
+    fn registry_json_entries_have_required_fields() {
+        let json = registry_json(REGISTRY).expect("serialization must succeed");
+        let arr: serde_json::Value = serde_json::from_str(&json).unwrap();
+        for entry in arr.as_array().unwrap() {
+            assert!(entry["id"].is_string(), "id must be a string");
+            assert!(
+                entry["display_name"].is_string(),
+                "display_name must be a string"
+            );
+            assert!(
+                entry["rules_file"].is_string(),
+                "rules_file must be a string"
+            );
+            assert!(entry["binary"].is_string(), "binary must be a string");
+            assert!(
+                entry["write_rules_default"].is_boolean(),
+                "write_rules_default must be bool"
+            );
+            assert!(entry["additional_context_support"].is_boolean());
+            assert!(entry["occupancy_support"].is_boolean());
+            assert!(
+                entry["transcript_parser"].is_string(),
+                "transcript_parser must be a string"
+            );
+        }
+    }
+
+    #[test]
+    fn registry_json_transcript_parser_uses_lowercase() {
+        let json = registry_json(REGISTRY).expect("serialization must succeed");
+        let arr: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let parsers: Vec<&str> = arr
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|e| e["transcript_parser"].as_str())
+            .collect();
+        assert!(
+            parsers.contains(&"claude"),
+            "claude parser must serialize as 'claude'"
+        );
+        assert!(
+            parsers.contains(&"codex"),
+            "codex parser must serialize as 'codex'"
+        );
+    }
+
+    #[test]
+    fn registry_text_contains_claude_and_codex() {
+        let text = registry_text(REGISTRY);
+        assert!(text.contains("claude"), "text must mention claude");
+        assert!(text.contains("codex"), "text must mention codex");
+        assert!(text.contains("CLAUDE.md"), "text must mention CLAUDE.md");
+        assert!(text.contains("AGENTS.md"), "text must mention AGENTS.md");
+    }
+
+    #[test]
+    fn registry_json_three_entry_registry_has_gemini() {
+        let reg = three_entry_registry();
+        let json = registry_json(&reg).expect("serialization must succeed");
+        let arr: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let arr = arr.as_array().unwrap();
+        assert_eq!(
+            arr.len(),
+            3,
+            "three-entry registry must produce 3 JSON objects"
+        );
+        let ids: Vec<&str> = arr.iter().filter_map(|e| e["id"].as_str()).collect();
+        assert!(ids.contains(&"gemini"), "must contain gemini entry");
+        assert!(ids.contains(&"claude"), "must still contain claude entry");
+        assert!(ids.contains(&"codex"), "must still contain codex entry");
     }
 }
