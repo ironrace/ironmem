@@ -112,7 +112,9 @@ mod tests {
             transcript_parser: TranscriptParserKind::None,
         };
 
-        let injected: [HarnessSpec; 3] = [REGISTRY[0], REGISTRY[1], GEMINI_SPEC];
+        let claude = REGISTRY.iter().find(|s| s.id == "claude").copied().unwrap();
+        let codex = REGISTRY.iter().find(|s| s.id == "codex").copied().unwrap();
+        let injected = [claude, codex, GEMINI_SPEC];
         let root = repo_root();
 
         let errs = check_packaging_coverage(&root, &injected)
