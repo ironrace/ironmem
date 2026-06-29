@@ -22,33 +22,71 @@ pub enum TranscriptParserKind {
 pub struct HarnessId(&'static str);
 
 impl HarnessId {
+    /// Validate a slug without storing it.
+    ///
+    /// Use this to check runtime strings (e.g. from `IRONMEM_HARNESS` or a
+    /// config file) that the caller owns.  No allocation is required — the
+    /// borrow is released when this function returns.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` with a description when `s` does not match
+    /// `[a-z0-9][a-z0-9_-]*`.
+    pub fn validate(s: &str) -> Result<(), String> {
+        if Self::is_valid_slug(s) {
+            Ok(())
+        } else {
+            Err(format!(
+                "invalid harness slug {:?}: must match [a-z0-9][a-z0-9_-]*",
+                s
+            ))
+        }
+    }
+
     /// Construct a `HarnessId` from a `&'static str`, validating slug format.
     ///
     /// # Errors
     ///
     /// Returns `Err(s)` with the offending string if validation fails.
     pub fn new(s: &'static str) -> Result<Self, &'static str> {
-        if s.is_empty() {
-            return Err(s);
+        if Self::is_valid_slug(s) {
+            Ok(Self(s))
+        } else {
+            Err(s)
         }
-        let mut chars = s.chars();
-        // First char: [a-z0-9]
-        match chars.next() {
-            Some(c) if c.is_ascii_lowercase() || c.is_ascii_digit() => {}
-            _ => return Err(s),
-        }
-        // Remaining chars: [a-z0-9_-]
-        for c in chars {
-            if !c.is_ascii_lowercase() && !c.is_ascii_digit() && c != '_' && c != '-' {
-                return Err(s);
-            }
-        }
-        Ok(Self(s))
+    }
+
+    /// Construct a `HarnessId` from a trusted `&'static str` without
+    /// validation.  Use only for compile-time-known values (e.g. registry
+    /// constants) where the slug is guaranteed correct.
+    pub const fn new_unchecked(s: &'static str) -> Self {
+        Self(s)
     }
 
     /// Return the inner string slice.
     pub fn as_str(self) -> &'static str {
         self.0
+    }
+
+    // ---- private -----------------------------------------------------------
+
+    fn is_valid_slug(s: &str) -> bool {
+        if s.is_empty() {
+            return false;
+        }
+        let mut chars = s.chars();
+        // First char: [a-z0-9]
+        match chars.next() {
+            Some(c) if c.is_ascii_lowercase() || c.is_ascii_digit() => {}
+            _ => return false,
+        }
+        // Remaining chars: [a-z0-9_-]
+        for c in chars {
+            if !c.is_ascii_lowercase() && !c.is_ascii_digit() && c != '_' && c != '-' {
+                return false;
+            }
+        }
+        true
     }
 }
 
@@ -224,6 +262,25 @@ mod tests {
         assert_eq!(id.as_str(), "gemini-2");
     }
 
+    #[test]
+    fn harness_id_accepts_underscore_slug() {
+        let id = HarnessId::new("grok_ai").expect("'grok_ai' is a valid slug");
+        assert_eq!(id.as_str(), "grok_ai");
+    }
+
+    #[test]
+    fn validate_accepts_runtime_string() {
+        let runtime = String::from("grok_ai");
+        assert!(HarnessId::validate(&runtime).is_ok());
+    }
+
+    #[test]
+    fn validate_rejects_invalid_runtime_string() {
+        let runtime = String::from("UPPERCASE");
+        let err = HarnessId::validate(&runtime).unwrap_err();
+        assert!(err.contains("invalid harness slug"));
+    }
+
     // ---- Injected 3-entry registry ----------------------------------------
 
     const GEMINI_SPEC: HarnessSpec = HarnessSpec {
@@ -276,6 +333,12 @@ mod tests {
     #[test]
     fn classify_client_info_unknown() {
         assert_eq!(classify_client_info("unknown-tool", REGISTRY), None);
+    }
+
+    #[test]
+    fn classify_client_info_gemini_in_injected_registry() {
+        let reg = three_entry_registry();
+        assert_eq!(classify_client_info("gemini", &reg), Some("gemini"));
     }
 
     #[test]
