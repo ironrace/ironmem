@@ -560,7 +560,7 @@ ironmem report --json                           # stable JSON for tooling
 ironmem report --task <tag> --since 2026-06-01  # scope to one task / start date (RFC3339 or YYYY-MM-DD)
 ```
 
-It surfaces tokens-to-done by task and phase, the measured-vs-estimated split, iteration counts/outcome, and a merged-only headline. Cost is **§7-derived** (the stored provider figure is reported separately as `provider_reported_cost_usd`); `baseline_ready` / `baseline_task_count` track the Phase-6 ≥10-merged-task recording gate (§11.5).
+It surfaces tokens-to-done by task and phase, the measured-vs-estimated split, iteration counts/outcome, and a merged-only headline. Cost is **§7-derived** (the stored provider figure is reported separately as `provider_reported_cost_usd`); `baseline_ready` / `baseline_task_count` track the Phase-6 ≥10-measured-task recording gate (§11.5).
 
 ### `ironmem dashboard`
 

@@ -192,7 +192,7 @@ pub fn render_text(report: &Report) -> String {
     };
     let _ = writeln!(
         out,
-        "\nBaseline gate: {count}/{threshold} merged tasks measured — {gate}",
+        "\nBaseline gate: {count}/{threshold} measured tasks — {gate}",
         count = report.baseline_task_count,
         threshold = crate::report::BASELINE_READY_THRESHOLD,
     );
@@ -355,7 +355,10 @@ mod tests {
         let text = crate::report::render_text(&report);
         assert!(text.contains("sess-rich"), "headline task key surfaced");
         assert!(text.contains("18.80"), "§7 cost rendered");
-        assert!(text.contains("baseline") || text.contains("Baseline"));
+        assert!(
+            text.contains("Baseline gate:") && text.contains("measured tasks"),
+            "baseline gate line uses measured-task wording (§11.5)"
+        );
         assert!(text.contains("claude-future-9"), "unpriced model surfaced");
         assert!(text.contains("provider"), "provider-reported cost labeled");
         // review/rework phases are unpriced → cost renders `n/a`, never `$0.00`.

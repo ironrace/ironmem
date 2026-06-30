@@ -245,8 +245,12 @@ fn report_golden_json_matches_hand_computed() {
     // ---- Hand-verified guard assertions (must pass before the JSON freeze) ----
     assert_eq!(report.generated_for.task, None);
     assert_eq!(report.generated_for.since, None);
-    assert_eq!(report.baseline_task_count, 2); // sess-rich, sess-min
-    assert!(!report.baseline_ready); // 2 < 10
+    // §11.5 counts distinct MEASURED task_keys; merged completion is not
+    // required (§12 2026-06-30). sess-fail is failed but has a measured row, so
+    // it now counts alongside sess-rich and sess-min. sess-est elsewhere stays
+    // excluded because it is estimated-only.
+    assert_eq!(report.baseline_task_count, 3); // sess-rich, sess-min, sess-fail
+    assert!(!report.baseline_ready); // 3 < 10
     assert_eq!(
         report.unpriced_models,
         vec!["claude-future-9".to_string(), "codex".to_string()]
@@ -280,10 +284,12 @@ fn report_golden_json_matches_hand_computed() {
     assert_eq!(json, EXPECTED_JSON);
 }
 
-/// Boundary: `baseline_ready` flips at exactly 10 distinct merged task_keys
-/// with ≥1 measured token row (METRICS_SPEC §11.5 gate).
+/// Boundary: `baseline_ready` flips at exactly 10 distinct measured task_keys
+/// (METRICS_SPEC §11.5 gate). These tasks are merged, but completion is not what
+/// gates them — see `baseline_count_includes_measured_tasks_without_merged_outcome`
+/// for the measured-but-unmerged case (§12 2026-06-30).
 #[test]
-fn baseline_ready_flips_at_ten_merged_tasks() {
+fn baseline_ready_flips_at_ten_measured_tasks() {
     let db = Database::open_in_memory().unwrap();
     for i in 0..9 {
         let collab = format!("b{i}");
@@ -418,7 +424,9 @@ fn tasks_include_estimated_only_and_outcome_only_identities() {
 
     assert_eq!(
         report.baseline_task_count, 0,
-        "baseline counts merged tasks with measured token rows only"
+        "baseline counts task_keys with measured token rows only: sess-est is \
+         estimated-only and sess-empty is outcome-only, so neither counts \
+         (merged completion is not what gates them — §11.5 + §12 2026-06-30)"
     );
 }
 
@@ -702,7 +710,7 @@ const EXPECTED_JSON: &str = r#"{
     "task": null,
     "since": null
   },
-  "baseline_task_count": 2,
+  "baseline_task_count": 3,
   "baseline_ready": false,
   "headline": [
     {
