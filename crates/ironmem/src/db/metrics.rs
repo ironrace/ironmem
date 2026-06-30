@@ -1528,9 +1528,11 @@ mod tests {
     #[test]
     fn token_usage_rejects_bad_enums_and_negatives() {
         let db = db();
+        // Migration 013 relaxed harness from IN ('claude','codex') to a registry slug
+        // GLOB check. Use "BOGUS" (uppercase) which still fails the slug check.
         let mutations: [fn(&mut NewTokenUsage); 9] = [
             |r| r.source = "bogus".into(),
-            |r| r.harness = "bogus".into(),
+            |r| r.harness = "BOGUS".into(),
             |r| r.collab_phase = Some("bogus".into()),
             |r| r.input_tokens = -1,
             |r| r.output_tokens = -1,
@@ -1604,8 +1606,10 @@ mod tests {
     #[test]
     fn occupancy_rejects_bad_harness_and_negatives() {
         let db = db();
+        // Migration 013 relaxed harness from IN ('claude','codex') to a registry slug
+        // GLOB check. Use "BOGUS" (uppercase) which still fails the slug check.
         let mutations: [fn(&mut NewOccupancySample); 5] = [
-            |r| r.harness = "bogus".into(),
+            |r| r.harness = "BOGUS".into(),
             |r| r.input_tokens = -1,
             |r| r.cache_read_input_tokens = -1,
             |r| r.context_window = 0,
@@ -1651,9 +1655,11 @@ mod tests {
     #[test]
     fn session_summary_rejects_bad_harness() {
         let db = db();
+        // Migration 013 relaxed harness from IN ('claude','codex') to a registry slug
+        // GLOB check. Use "BOGUS" (uppercase) which still fails the slug check.
         let s = SessionSummary {
             session_id: "sess-1".into(),
-            harness: "bogus".into(),
+            harness: "BOGUS".into(),
             workspace_root: None,
             started_at: None,
             ended_at: None,

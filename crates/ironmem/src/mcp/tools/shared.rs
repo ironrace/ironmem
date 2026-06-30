@@ -52,7 +52,12 @@ pub(super) fn require_implementer(value: &str) -> Result<Agent, MemoryError> {
         .map_err(|_| MemoryError::Validation("implementer must be 'claude' or 'codex'".to_string()))
 }
 
-pub(super) fn other_agent(agent: Agent) -> Agent {
+/// Return the other collab protocol role for the given sender.
+///
+/// This is a **two-party collab helper**: it is only meaningful within the
+/// bounded Claude↔Codex protocol.  Generic harness code that needs to name a
+/// harness should use [`crate::harness::HarnessId`] instead of `Agent`.
+pub(super) fn collab_counterpart(agent: Agent) -> Agent {
     match agent {
         Agent::Claude => Agent::Codex,
         Agent::Codex => Agent::Claude,

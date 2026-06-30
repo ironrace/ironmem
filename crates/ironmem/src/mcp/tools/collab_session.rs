@@ -14,7 +14,7 @@ use super::collab_events::{
     build_collab_event, failure_report_is_off_turn_admissible, parse_final_payload,
 };
 use super::shared::{
-    other_agent, require_agent, require_implementer, require_str, MAX_COLLAB_CONTENT_CHARS,
+    collab_counterpart, require_agent, require_implementer, require_str, MAX_COLLAB_CONTENT_CHARS,
 };
 
 /// Wing/room under which accepted plan bodies are filed as drawers. Runtime
@@ -669,7 +669,7 @@ pub(super) fn handle_collab_send(app: &App, args: &Value) -> Result<Value, Memor
             tx,
             session_id,
             sender.as_str(),
-            other_agent(sender).as_str(),
+            collab_counterpart(sender).as_str(),
             topic,
             content,
         )?;

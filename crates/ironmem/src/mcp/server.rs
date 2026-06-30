@@ -10,13 +10,13 @@ use super::tools;
 use crate::error::MemoryError;
 
 fn mcp_harness(app: &App) -> String {
-    match std::env::var("IRONMEM_HARNESS").ok().as_deref() {
-        Some("codex") => "codex".to_string(),
-        Some("claude") => "claude".to_string(),
-        _ => app
-            .harness_snapshot()
-            .unwrap_or_else(|| "claude".to_string()),
+    if let Ok(value) = std::env::var("IRONMEM_HARNESS") {
+        if let Some(id) = crate::harness::canonicalize_input(&value, crate::harness::REGISTRY) {
+            return id.to_string();
+        }
     }
+    app.harness_snapshot()
+        .unwrap_or_else(|| "claude".to_string())
 }
 
 /// Collab tool calls carry a `session_id` argument; use it as the D1 fallback

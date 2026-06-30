@@ -100,6 +100,65 @@ fn trim_trailing_line_endings(mut value: &str) -> &str {
     }
 }
 
+/// Resolve which rules files `write-rules` should target.
+///
+/// - Both `target` and `harness` `None` → all `default_rules_targets` (e.g. CLAUDE.md, AGENTS.md).
+/// - `target` `Some` → validate it equals one of the registry `rules_file`s; error listing allowed
+///   targets otherwise.
+/// - `harness` `Some` → canonicalize/look up the harness (accepts both ids like `"codex"` and
+///   env-aliases like `"claude-code"`); resolve to its `rules_file`; error if unknown harness.
+///
+/// `target` and `harness` are mutually exclusive — the caller (clap) enforces this.
+pub fn resolve_write_targets(
+    target: Option<&str>,
+    harness: Option<&str>,
+    registry: &[crate::harness::HarnessSpec],
+) -> Result<Vec<&'static str>, MemoryError> {
+    match (target, harness) {
+        (None, None) => Ok(crate::harness::default_rules_targets(registry)),
+        (Some(t), None) => {
+            // Collect all rules_files from the registry (sorted, deduped for a stable message).
+            let mut allowed: Vec<&'static str> = registry.iter().map(|s| s.rules_file).collect();
+            allowed.sort_unstable();
+            allowed.dedup();
+
+            registry
+                .iter()
+                .find(|s| s.rules_file == t)
+                .map(|s| vec![s.rules_file])
+                .ok_or_else(|| {
+                    MemoryError::Validation(format!(
+                        "unknown target '{}': allowed targets are {}",
+                        t,
+                        allowed.join(", ")
+                    ))
+                })
+        }
+        (None, Some(h)) => {
+            // Accept both an id (e.g. "codex") and an env-alias (e.g. "claude-code").
+            let spec = crate::harness::by_id(h, registry).or_else(|| {
+                crate::harness::canonicalize_input(h, registry)
+                    .and_then(|id| crate::harness::by_id(id, registry))
+            });
+            spec.map(|s| vec![s.rules_file]).ok_or_else(|| {
+                let mut known: Vec<&str> = registry.iter().map(|s| s.id).collect();
+                known.sort_unstable();
+                MemoryError::Validation(format!(
+                    "unknown harness '{}': known harnesses are {}",
+                    h,
+                    known.join(", ")
+                ))
+            })
+        }
+        (Some(_), Some(_)) => {
+            // clap's `conflicts_with` prevents this branch in production.
+            Err(MemoryError::Validation(
+                "--target and --harness are mutually exclusive".into(),
+            ))
+        }
+    }
+}
+
 /// Read `target_path` (missing = empty), upsert the block rendered from
 /// `protocol`, and write atomically. Skips the write when the result is
 /// byte-identical to the existing file.
@@ -429,6 +488,110 @@ mod tests {
         assert_eq!(outcome, WriteOutcome::Updated);
         let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600, "existing file mode must be preserved");
+    }
+
+    // ---- resolve_write_targets --------------------------------------------
+
+    use crate::harness::{HarnessSpec, TranscriptParserKind, REGISTRY};
+
+    const GEMINI_SPEC: HarnessSpec = HarnessSpec {
+        id: "gemini",
+        display_name: "Gemini CLI",
+        binary: "gemini",
+        rules_file: "GEMINI.md",
+        write_rules_default: false,
+        client_info_aliases: &["gemini"],
+        env_aliases: &["gemini"],
+        additional_context_support: false,
+        occupancy_support: false,
+        transcript_parser: TranscriptParserKind::None,
+    };
+
+    fn three_entry_registry() -> [HarnessSpec; 3] {
+        [REGISTRY[0], REGISTRY[1], GEMINI_SPEC]
+    }
+
+    #[test]
+    fn resolve_write_targets_no_args_returns_both_defaults() {
+        let targets = resolve_write_targets(None, None, REGISTRY).unwrap();
+        assert_eq!(targets, vec!["CLAUDE.md", "AGENTS.md"]);
+    }
+
+    #[test]
+    fn resolve_write_targets_target_claude_md() {
+        let targets = resolve_write_targets(Some("CLAUDE.md"), None, REGISTRY).unwrap();
+        assert_eq!(targets, vec!["CLAUDE.md"]);
+    }
+
+    #[test]
+    fn resolve_write_targets_target_agents_md() {
+        let targets = resolve_write_targets(Some("AGENTS.md"), None, REGISTRY).unwrap();
+        assert_eq!(targets, vec!["AGENTS.md"]);
+    }
+
+    #[test]
+    fn resolve_write_targets_unknown_target_lists_allowed() {
+        let err = resolve_write_targets(Some("FOO.md"), None, REGISTRY).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("CLAUDE.md"), "error should list CLAUDE.md");
+        assert!(msg.contains("AGENTS.md"), "error should list AGENTS.md");
+    }
+
+    #[test]
+    fn resolve_write_targets_harness_codex_by_id() {
+        let targets = resolve_write_targets(None, Some("codex"), REGISTRY).unwrap();
+        assert_eq!(targets, vec!["AGENTS.md"]);
+    }
+
+    #[test]
+    fn resolve_write_targets_harness_claude_by_id() {
+        let targets = resolve_write_targets(None, Some("claude"), REGISTRY).unwrap();
+        assert_eq!(targets, vec!["CLAUDE.md"]);
+    }
+
+    #[test]
+    fn resolve_write_targets_harness_claude_code_env_alias() {
+        let targets = resolve_write_targets(None, Some("claude-code"), REGISTRY).unwrap();
+        assert_eq!(targets, vec!["CLAUDE.md"]);
+    }
+
+    #[test]
+    fn resolve_write_targets_unknown_harness_errors() {
+        let err = resolve_write_targets(None, Some("gemini"), REGISTRY).unwrap_err();
+        assert!(matches!(err, MemoryError::Validation(_)));
+        let msg = err.to_string();
+        assert!(
+            msg.contains("claude"),
+            "error must list known harness id 'claude'; got: {msg}"
+        );
+        assert!(
+            msg.contains("codex"),
+            "error must list known harness id 'codex'; got: {msg}"
+        );
+    }
+
+    #[test]
+    fn resolve_write_targets_both_args_errors() {
+        let err = resolve_write_targets(Some("CLAUDE.md"), Some("codex"), REGISTRY).unwrap_err();
+        assert!(
+            matches!(err, MemoryError::Validation(_)),
+            "both --target and --harness must produce a Validation error; got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn resolve_write_targets_synthetic_gemini_in_injected_registry() {
+        let reg = three_entry_registry();
+        let targets = resolve_write_targets(None, Some("gemini"), &reg).unwrap();
+        assert_eq!(targets, vec!["GEMINI.md"]);
+    }
+
+    #[test]
+    fn default_rules_targets_injected_excludes_non_default() {
+        let reg = three_entry_registry();
+        let targets = crate::harness::default_rules_targets(&reg);
+        assert!(!targets.contains(&"GEMINI.md"));
+        assert_eq!(targets, vec!["CLAUDE.md", "AGENTS.md"]);
     }
 
     #[cfg(unix)]

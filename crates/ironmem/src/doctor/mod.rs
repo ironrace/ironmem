@@ -99,29 +99,70 @@ pub fn run_doctor(cfg: &Config) -> DoctorReport {
     let mcp = check_mcp_mode(cfg.mcp_access_mode);
     let warmup = check_warmup(database.status, model.status);
 
-    let claude = match home.as_deref() {
-        Some(h) => {
-            let path = h.join(".claude.json");
-            harness_check("harness_claude", "Claude Code", &path, detect_claude(&path))
-        }
-        None => Check::new(
-            "harness_claude",
-            CheckStatus::Info,
-            "Claude Code: home directory unknown, skipped",
-        ),
-    };
-    let codex = match codex_config_path(home.as_deref()) {
-        Some(path) => harness_check("harness_codex", "Codex", &path, detect_codex(&path)),
-        None => Check::new(
-            "harness_codex",
-            CheckStatus::Info,
-            "Codex: home directory unknown, skipped",
-        ),
-    };
+    let mut checks = vec![binary, database, model, mcp, warmup];
+    checks.extend(harness_checks(home.as_deref(), crate::harness::REGISTRY));
 
-    DoctorReport {
-        checks: vec![binary, database, model, mcp, warmup, claude, codex],
-    }
+    DoctorReport { checks }
+}
+
+/// Build the per-harness doctor checks by iterating the registry.
+///
+/// Detection strategy is dispatched per harness `id`:
+/// - `"claude"` → JSON parse of `~/.claude.json`.
+/// - `"codex"` → line-match TOML via `codex_config_path`.
+/// - Any other id → an `Info` check noting detection is not yet implemented.
+///
+/// Check keys are stable `"harness_<id>"` strings.  For the two production
+/// ids ("claude", "codex") the key is a string literal (`&'static str`).  For
+/// any additional id the key is produced by `Box::leak` — acceptable because
+/// `ironmem doctor` runs once per process and the leaked bytes are tiny and
+/// bounded by the (small, static) registry size.
+///
+/// Takes an explicit registry slice so tests can inject a synthetic 3-entry
+/// slice without mutating global state.
+fn harness_checks(home: Option<&Path>, registry: &[crate::harness::HarnessSpec]) -> Vec<Check> {
+    registry
+        .iter()
+        .map(|spec| {
+            // Stable check key: literal for the two known production ids;
+            // Box::leak for any additional registry entry (see doc comment).
+            let key: &'static str = match spec.id {
+                "claude" => "harness_claude",
+                "codex" => "harness_codex",
+                other => Box::leak(format!("harness_{other}").into_boxed_str()),
+            };
+
+            match spec.id {
+                "claude" => match home {
+                    Some(h) => {
+                        let path = h.join(".claude.json");
+                        harness_check(key, spec.display_name, &path, detect_claude(&path))
+                    }
+                    None => Check::new(
+                        key,
+                        CheckStatus::Info,
+                        format!("{}: home directory unknown, skipped", spec.display_name),
+                    ),
+                },
+                "codex" => match codex_config_path(home) {
+                    Some(path) => harness_check(key, spec.display_name, &path, detect_codex(&path)),
+                    None => Check::new(
+                        key,
+                        CheckStatus::Info,
+                        format!("{}: home directory unknown, skipped", spec.display_name),
+                    ),
+                },
+                _ => Check::new(
+                    key,
+                    CheckStatus::Info,
+                    format!(
+                        "{}: registration detection not yet implemented",
+                        spec.display_name
+                    ),
+                ),
+            }
+        })
+        .collect()
 }
 
 fn check_binary(version: &str) -> Check {
@@ -628,6 +669,48 @@ mod tests {
             // No harness state is ever a blocking setup failure.
             assert!(!c.status.is_blocking());
         }
+    }
+
+    #[test]
+    fn harness_checks_third_harness_yields_harness_id_key() {
+        use crate::harness::{HarnessSpec, TranscriptParserKind};
+
+        const GEMINI_SPEC: HarnessSpec = HarnessSpec {
+            id: "gemini",
+            display_name: "Gemini",
+            binary: "gemini",
+            rules_file: "GEMINI.md",
+            write_rules_default: false,
+            client_info_aliases: &["gemini"],
+            env_aliases: &["gemini"],
+            additional_context_support: false,
+            occupancy_support: false,
+            transcript_parser: TranscriptParserKind::None,
+        };
+
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path();
+        let injected = [
+            crate::harness::REGISTRY[0],
+            crate::harness::REGISTRY[1],
+            GEMINI_SPEC,
+        ];
+
+        let checks = harness_checks(Some(home), &injected);
+
+        assert_eq!(checks.len(), 3, "one check per registry entry");
+        assert_eq!(checks[0].name, "harness_claude", "first is claude");
+        assert_eq!(checks[1].name, "harness_codex", "second is codex");
+        // Box::leak path — verify the exact string value for the third harness.
+        assert_eq!(
+            checks[2].name, "harness_gemini",
+            "third is gemini via Box::leak"
+        );
+        assert_eq!(
+            checks[2].status,
+            CheckStatus::Info,
+            "unimplemented detection is Info"
+        );
     }
 
     #[test]

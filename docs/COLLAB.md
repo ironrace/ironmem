@@ -70,6 +70,100 @@ One review pass is a maximum, not an iteration target.
   then Claude finalizes. Docs/prompts that frame v1 planning as
   open-ended iteration to convergence are wrong.
 
+## Harness generalization vs two-party protocol
+
+Issue #155 generalized ironmem's harness support into an extensible registry
+while deliberately keeping `/collab` itself as a two-party Claude↔Codex
+protocol. The two halves serve different concerns.
+
+### Extensible via the harness registry
+
+Generic AI assistant identity is represented by `HarnessId` and the
+`crate::harness::REGISTRY` constant (`crates/ironmem/src/harness/mod.rs`).
+The following generic surfaces consume registry metadata. Some outer
+integration edges still have per-harness strategy code where the host harnesses
+use different config files or plugin layouts.
+
+- **Launcher metadata** — the existing `ironmem claude` / `ironmem codex`
+  launcher commands derive their binary and label from `HarnessSpec`;
+  `ironmem harnesses` dumps the full registry. Adding a registry entry does not
+  create a new launch subcommand.
+- **Attribution** — `classify_client_info` maps `clientInfo.name` to a
+  harness id; `canonicalize_input` maps `IRONMEM_HARNESS` to a harness id.
+- **Hook capabilities** — per-harness flags (`additional_context_support`,
+  `occupancy_support`, `transcript_parser`) control what hook data ironmem
+  captures.
+- **Write-rules targets** — `default_rules_targets` and the `--harness` flag
+  derive the rules file list from `HarnessSpec::rules_file` /
+  `write_rules_default`.
+- **Doctor checks** — the `ironmem doctor` pass iterates the registry and emits
+  a `harness_<id>` check per entry. Claude and Codex keep their current
+  per-config detection strategies; additional entries report an advisory check
+  until a detection strategy is added.
+- **Metrics harness CHECK** — migration 013 relaxed the DB constraint from
+  the hard-coded `'claude'/'codex'` domain to the `HarnessId` slug GLOB
+  (`harness GLOB '[a-z0-9]*' AND harness NOT GLOB '*[^a-z0-9_-]*'`), so any
+  registered harness can persist `token_usage`, `occupancy_samples`, and
+  `session_summary` rows.
+- **Packaging drift-lint** — `check_packaging_coverage` asserts that every
+  registered harness has a corresponding `.<id>-plugin/` root with required
+  wrapper assets.
+
+Adding a new harness (e.g. Gemini) starts with one `HarnessSpec` in `REGISTRY`;
+the generic surfaces above pick up the shared metadata from there. The harness
+still needs its plugin root/assets, and any optional per-harness integration
+strategy such as launcher or doctor detection must be added explicitly.
+
+### Intentionally still two-party: the `/collab` protocol
+
+`/collab` is a **bounded two-party protocol** between Claude and Codex. This
+is a deliberate design choice — the protocol's correctness proofs, state-machine
+transitions, and load-bearing invariants all assume exactly two named parties.
+The following are intentionally NOT generalized:
+
+- **State machine** — the entire v1 + v3 state machine (`collab/mod.rs`,
+  `collab/state_machine/`) names Claude and Codex as the two roles; turn
+  ownership and the review-cap logic depend on this.
+- **Blind dual-draft authoring** — the `PlanParallelDrafts` phase assumes
+  exactly two independent drafters; `collab_recv` filters drafts by
+  counterpart identity.
+- **Single Codex counterpart-review pass** — the `MAX_REVIEW_ROUNDS = 1`
+  cap is tied to one named counterpart; there is no general "other party"
+  abstraction.
+- **`collab_counterpart` role-flip** — the helper in
+  `mcp/tools/shared.rs` maps `Claude → Codex` and `Codex → Claude`; it is
+  exhaustive and closed.
+- **`collab::Agent` role enum** — the closed two-variant enum
+  (`Agent::Claude` / `Agent::Codex` in `collab/agent.rs`) is the
+  compiler-enforced type for protocol roles. Exhaustiveness is load-bearing:
+  `match` arms in the state machine must cover every variant, and the compiler
+  enforces this. Adding a third variant would silently require updates across
+  all match sites — the intentional design forces that cost to be visible.
+  See the boundary note at the top of `collab/agent.rs`.
+- **`collab_sessions.implementer` CHECK** (migration 006) — the DB constraint
+  pins the allowed implementer values to `'claude'` and `'codex'`.
+- **`collab_actor_generations.agent` CHECK** (migration 010) — the
+  generation-lease table's `agent` column is pinned to `'claude'` and
+  `'codex'`.
+
+Migrations 006 and 010 are explicitly left untouched by migration 013, which
+notes: *"protocol-specific and are NOT touched here — they stay claude/codex by
+design."*
+
+### Adding a new harness does not make it a `/collab` participant
+
+If a third harness is registered in `REGISTRY`, it immediately gains launcher,
+attribution, hooks, write-rules, doctor, and metrics support. It does NOT
+become a `/collab` participant. Extending the collab protocol to a third party
+(or swapping Codex for a different counterpart) is a future protocol revision —
+a v2 that redesigns the state machine, the DB schema constraints, and the
+`Agent` enum — not a registry registration.
+
+See the boundary doc comments at the top of
+`crates/ironmem/src/collab/agent.rs` and
+`crates/ironmem/src/collab/mod.rs` for the authoritative in-code statement of
+this boundary.
+
 ## Runtime Model
 
 ```text

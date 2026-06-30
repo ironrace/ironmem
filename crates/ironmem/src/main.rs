@@ -102,9 +102,13 @@ enum Commands {
     },
     /// Write the ironmem memory-protocol managed block into rules file(s) (explicit opt-in)
     WriteRules {
-        /// Target file. Omit to write BOTH CLAUDE.md and AGENTS.md.
-        #[arg(long, value_parser = ["CLAUDE.md", "AGENTS.md"])]
+        /// Target rules file. Omit to write all default harness rules files.
+        /// Validated at runtime against registered harness rules files.
+        #[arg(long, conflicts_with = "harness")]
         target: Option<String>,
+        /// Write only this harness's rules file (e.g. claude → CLAUDE.md, codex → AGENTS.md).
+        #[arg(long, conflicts_with = "target")]
+        harness: Option<String>,
         /// Directory containing the target file(s)
         #[arg(long, default_value = ".")]
         workspace: String,
@@ -151,6 +155,12 @@ enum Commands {
     Symbols {
         #[command(subcommand)]
         cmd: SymbolsCmd,
+    },
+    /// List registered harnesses (dev/CI helper for packaging scripts)
+    Harnesses {
+        /// Output format
+        #[arg(long, default_value = "text", value_parser = ["json", "text"])]
+        format: String,
     },
     /// Launch Codex in a repo with the ironmem MCP server attached
     Codex {
@@ -526,23 +536,43 @@ async fn run(cli: Cli) -> Result<(), MemoryError> {
             }
             Ok(())
         }
-        Commands::WriteRules { target, workspace } => {
-            use ironmem::write_rules::{validate_rules_file, write_rules_file, WriteOutcome};
-            let targets: Vec<&str> = match target.as_deref() {
-                Some(t) => vec![t],
-                None => vec!["CLAUDE.md", "AGENTS.md"],
+        Commands::Harnesses { format } => {
+            match format.as_str() {
+                "json" => println!(
+                    "{}",
+                    ironmem::harness::registry_json(ironmem::harness::REGISTRY)?
+                ),
+                _ => print!(
+                    "{}",
+                    ironmem::harness::registry_text(ironmem::harness::REGISTRY)
+                ),
+            }
+            Ok(())
+        }
+        Commands::WriteRules {
+            target,
+            harness,
+            workspace,
+        } => {
+            use ironmem::write_rules::{
+                resolve_write_targets, validate_rules_file, write_rules_file, WriteOutcome,
             };
+            let targets = resolve_write_targets(
+                target.as_deref(),
+                harness.as_deref(),
+                ironmem::harness::REGISTRY,
+            )?;
             let paths: Vec<_> = targets
                 .iter()
                 .map(|name| std::path::Path::new(&workspace).join(name))
                 .collect();
-            // For the default two-file run, pre-validate every target so a
+            // For the default multi-file run, pre-validate every target so a
             // malformed managed block in one file aborts before any file is
             // written. This makes *validation* all-or-nothing; the writes
             // themselves are still applied sequentially (a write-time I/O error
             // on the second file leaves the first written). Single-target runs
             // need no preflight — there is nothing to roll back.
-            if target.is_none() {
+            if targets.len() > 1 {
                 for path in &paths {
                     validate_rules_file(path, bootstrap::MEMORY_PROTOCOL)?;
                 }
