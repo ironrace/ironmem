@@ -118,7 +118,7 @@ constant. The fields are:
 |---|---|
 | `id` | Lowercase slug (`[a-z0-9][a-z0-9_-]*`) — used in CLI output, metrics, and hook paths. |
 | `display_name` | Human-readable name shown in `ironmem harnesses` output. |
-| `binary` | Executable name carried in the spec; used to derive `Harness::binary()` and `Harness::label()` for the existing `claude`/`codex` launch subcommands. |
+| `binary` | Executable name carried in the spec; used to derive `Harness::binary()` and `Harness::label()` for the existing `claude`/`codex` launch subcommands, printed in `ironmem harnesses` output, and fed to the `launch_invocation` arg-builder helper. |
 | `rules_file` | File written by `ironmem write-rules --harness <id>` (e.g. `"GEMINI.md"`). |
 | `write_rules_default` | `true` to include this harness in a no-flag `ironmem write-rules` run. |
 | `client_info_aliases` | Substrings matched against `initialize.clientInfo.name` (lowercased) to attribute MCP sessions. |
@@ -128,8 +128,15 @@ constant. The fields are:
 | `transcript_parser` | `TranscriptParserKind::Claude`, `::Codex`, or `::None`. Use `None` if the harness has no recognized transcript format; token metric rows are skipped. |
 
 > **What a `REGISTRY` entry enables:** attribution in `ironmem harnesses` output,
-> hook dispatch, `ironmem write-rules --harness <id>`, doctor checks, metrics
+> hook dispatch, `ironmem write-rules --harness <id>`, a doctor check row, metrics
 > persistence, and packaging drift-lint coverage.
+>
+> **Doctor detection is advisory by default.** A new `REGISTRY` entry produces a
+> doctor check row, but with only an `Info`-level "registration detection not yet
+> implemented" line — not an actionable `[OK]`/`[WARN]` result. Real detection
+> (e.g. inspecting the harness's own MCP config) requires adding a dedicated arm
+> in `doctor::harness_checks` keyed on the new `spec.id`, mirroring the existing
+> `claude` / `codex` arms.
 >
 > **What it does NOT include:** an `ironmem <id> .` launch subcommand. The
 > launcher is a closed two-variant `Harness` enum in
@@ -141,7 +148,7 @@ constant. The fields are:
 
 ### 2. Add plugin packaging assets
 
-The packaging drift-lint test (`cargo test -p ironmem harness_packaging`) fails
+The packaging drift-lint test (`cargo test -p ironmem packaging_coverage`) fails
 if a registered harness lacks a `.{id}-plugin/` directory at the repo root.
 Create it with at minimum:
 

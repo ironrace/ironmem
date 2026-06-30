@@ -63,7 +63,12 @@ impl HarnessId {
     /// Construct a `HarnessId` from a trusted `&'static str` without
     /// validation.  Use only for compile-time-known values (e.g. registry
     /// constants) where the slug is guaranteed correct.
-    pub const fn new_unchecked(s: &'static str) -> Self {
+    ///
+    /// Crate-internal: callers MUST pass a compile-time constant slug. This
+    /// bypasses [`Self::is_valid_slug`], so a leaked runtime string would
+    /// silently skip validation. Route untrusted input through
+    /// [`Self::validate`] / [`Self::new`] instead.
+    pub(crate) const fn new_unchecked(s: &'static str) -> Self {
         Self(s)
     }
 

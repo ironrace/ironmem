@@ -269,7 +269,7 @@ ironmem harnesses --format=json  # machine-readable, for CI/packaging scripts
 
 Validate a local install in one command. `doctor` reports the binary version,
 database path and schema/migration status, embedding-model cache status, MCP
-access mode, warmup readiness, and which harnesses (Claude Code, Codex) have the
+access mode, warmup readiness, and which registered harnesses have the
 `ironmem` MCP server registered:
 
 ```bash
