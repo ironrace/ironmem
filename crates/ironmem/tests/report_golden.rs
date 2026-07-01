@@ -285,18 +285,20 @@ fn report_golden_json_matches_hand_computed() {
 }
 
 /// Boundary: `baseline_ready` flips at exactly 10 distinct measured task_keys
-/// (METRICS_SPEC §11.5 gate). These tasks are merged, but completion is not what
-/// gates them — see `baseline_count_includes_measured_tasks_without_merged_outcome`
-/// for the measured-but-unmerged case (§12 2026-06-30).
+/// (METRICS_SPEC §11.5 gate), regardless of merge/outcome status. Tasks `b2`
+/// and `b5` are seeded with outcome "failed" (not "merged") to prove the gate
+/// counts measured task_keys, not merged ones — under the old merged-only gate
+/// this test would fail to reach 10 (§12 2026-06-30).
 #[test]
 fn baseline_ready_flips_at_ten_measured_tasks() {
     let db = Database::open_in_memory().unwrap();
     for i in 0..9 {
         let collab = format!("b{i}");
+        let status = if i == 2 || i == 5 { "failed" } else { "merged" };
         db.upsert_task_outcome(&outcome(
             &format!("issue-b{i}"),
             &collab,
-            "merged",
+            status,
             "2026-06-01T00:00:00Z",
             Some("2026-06-02T00:00:00Z"),
             0,

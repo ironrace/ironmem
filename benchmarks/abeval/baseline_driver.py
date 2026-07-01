@@ -24,18 +24,27 @@ Side effects on the production DB:
 
 from __future__ import annotations
 
+import argparse
 import json
 import os
+import select
+import sqlite3
 import subprocess
 import sys
 import time
 from pathlib import Path
 
 IRONMEM = os.environ.get("IRONMEM_BIN", str(Path.home() / ".ironrace/bin/ironmem"))
-DB_PATH = os.environ.get(
-    "IRONMEM_DB_PATH", str(Path.home() / ".ironrace-memory/memory.sqlite3")
-)
+DEFAULT_DB_PATH = str(Path.home() / ".ironrace-memory/memory.sqlite3")
+DB_PATH = os.environ.get("IRONMEM_DB_PATH", DEFAULT_DB_PATH)
+DEFAULT_LOG_PATH = "/tmp/baseline_driver.serve.log"
+LOG_PATH = os.environ.get("BASELINE_LOG_PATH", DEFAULT_LOG_PATH)
 N = int(os.environ.get("BASELINE_N", "10"))
+# Single-RPC-round-trip deadline. CLI backend runs ~43s/call in this
+# environment (see feedback_baseline_runs_need_flags_on memory); 120s gives
+# headroom without hanging forever on a wedged server.
+RPC_TIMEOUT_S = float(os.environ.get("BASELINE_RPC_TIMEOUT_S", "120"))
+MAX_CONSECUTIVE_SKIPS = 50
 BASELINE_WING = "abeval-baseline"
 
 # Varied real-ish recall queries so each search hits a different candidate set;
@@ -94,36 +103,79 @@ class Server:
                 "IRONMEM_METRICS": "1",
             },
         )
-        self.stderr = open("/tmp/baseline_driver.serve.log", "w")
-        self.p = subprocess.Popen(
-            [IRONMEM, "serve"],
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=self.stderr,
-            env=env,
-            text=True,
-            bufsize=1,
-        )
+        self.log_path = LOG_PATH
+        self.stderr = open(self.log_path, "w")
+        try:
+            self.p = subprocess.Popen(
+                [IRONMEM, "serve"],
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=self.stderr,
+                env=env,
+                text=True,
+                bufsize=1,
+            )
+        except Exception:
+            self.stderr.close()
+            raise
         self._id = 0
 
     def _send(self, obj: dict) -> None:
         assert self.p.stdin is not None
-        self.p.stdin.write(json.dumps(obj) + "\n")
-        self.p.stdin.flush()
+        if self.p.poll() is not None:
+            raise RuntimeError(
+                f"cannot send: server process already exited "
+                f"(code={self.p.returncode}) (see {self.log_path})"
+            )
+        try:
+            self.p.stdin.write(json.dumps(obj) + "\n")
+            self.p.stdin.flush()
+        except BrokenPipeError as exc:
+            raise RuntimeError(
+                f"broken pipe writing to server (exit code={self.p.poll()}) "
+                f"(see {self.log_path})"
+            ) from exc
 
-    def _read_result(self, want_id: int) -> dict:
+    def _read_result(self, want_id: int, timeout_s: float = RPC_TIMEOUT_S) -> dict:
         assert self.p.stdout is not None
+        deadline = time.time() + timeout_s
+        consecutive_skips = 0
         while True:
+            if self.p.poll() is not None:
+                raise RuntimeError(
+                    f"server process exited (code={self.p.returncode}) while "
+                    f"waiting for response id={want_id} (see {self.log_path})"
+                )
+            remaining = deadline - time.time()
+            if remaining <= 0:
+                raise TimeoutError(
+                    f"timed out after {timeout_s}s waiting for response "
+                    f"id={want_id} (see {self.log_path})"
+                )
+            ready, _, _ = select.select([self.p.stdout], [], [], min(remaining, 1.0))
+            if not ready:
+                continue
             line = self.p.stdout.readline()
             if not line:
-                raise RuntimeError("server closed stdout (see /tmp/baseline_driver.serve.log)")
+                # EOF: the process is likely exiting; loop back to the
+                # poll() check above instead of spinning on a dead pipe.
+                continue
             line = line.strip()
             if not line:
                 continue
             try:
                 msg = json.loads(line)
             except json.JSONDecodeError:
-                continue  # skip any stray non-JSON line
+                consecutive_skips += 1
+                print(f"skipping non-JSON line: {line[:200]!r}", file=sys.stderr)
+                if consecutive_skips >= MAX_CONSECUTIVE_SKIPS:
+                    raise RuntimeError(
+                        f"giving up after {MAX_CONSECUTIVE_SKIPS} consecutive "
+                        f"non-JSON lines waiting for response id={want_id} "
+                        f"(see {self.log_path})"
+                    )
+                continue
+            consecutive_skips = 0
             if msg.get("id") == want_id:
                 if "error" in msg:
                     raise RuntimeError(f"rpc error: {msg['error']}")
@@ -169,13 +221,76 @@ class Server:
         except Exception:
             self.p.kill()
         finally:
+            if self.p.returncode not in (None, 0):
+                print(
+                    f"warning: server process exited with code "
+                    f"{self.p.returncode} (see {self.log_path})",
+                    file=sys.stderr,
+                )
             self.stderr.close()
+
+
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Seed #95/#96 baseline measurement rows into the production ironmem DB."
+    )
+    parser.add_argument(
+        "--yes-write-production",
+        action="store_true",
+        help="Confirm writing baseline token_usage rows and drawers into the production DB.",
+    )
+    return parser.parse_args(argv)
+
+
+def _count_measured_task_keys(db_path: str, source: str, tag_prefix: str) -> int:
+    """Count distinct task_tag values with >=1 measured (estimated=0) row.
+
+    Mirrors the METRICS_SPEC §11.5 gate's task_key definition
+    (collab_session_id else task_tag): this driver never sets
+    collab_session_id, so task_key == task_tag here, and a direct task_tag
+    count over rows this run tagged is equivalent to the gate's count.
+    """
+    conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+    try:
+        cur = conn.execute(
+            "SELECT COUNT(DISTINCT task_tag) FROM token_usage "
+            "WHERE source = ? AND estimated = 0 AND task_tag LIKE ?",
+            (source, f"{tag_prefix}%"),
+        )
+        row = cur.fetchone()
+        return int(row[0]) if row else 0
+    finally:
+        conn.close()
 
 
 def main() -> int:
     if not Path(IRONMEM).exists():
         print(f"ironmem binary not found at {IRONMEM}", file=sys.stderr)
         return 2
+
+    args = parse_args()
+    db_path_overridden = os.environ.get("IRONMEM_DB_PATH") not in (None, DEFAULT_DB_PATH)
+    if not args.yes_write_production and not db_path_overridden:
+        print(
+            "Refusing to write to the production ironmem DB without confirmation.",
+            file=sys.stderr,
+        )
+        print(f"  target db                : {DB_PATH}", file=sys.stderr)
+        print(
+            f"  token_usage rows written : ~{2 * N} ({N} llm_rerank + {N} pref_extract)",
+            file=sys.stderr,
+        )
+        print(
+            f"  drawers written          : ~{N} (wing={BASELINE_WING!r})",
+            file=sys.stderr,
+        )
+        print(
+            "Pass --yes-write-production, or set IRONMEM_DB_PATH to a "
+            "non-default path, to proceed.",
+            file=sys.stderr,
+        )
+        return 2
+
     print(f"binary : {IRONMEM}")
     print(f"db     : {DB_PATH}")
     print(f"tasks  : {N} rerank + {N} pref\n")
@@ -217,6 +332,19 @@ def main() -> int:
         print(f"\ndone in {time.time() - t0:.1f}s")
     finally:
         srv.close()
+
+    print("\nverifying measured rows landed in production DB...")
+    rerank_count = _count_measured_task_keys(DB_PATH, "llm_rerank", "baseline-rerank-")
+    pref_count = _count_measured_task_keys(DB_PATH, "pref_extract", "baseline-pref-")
+    print(f"  llm_rerank   measured task_keys: {rerank_count}/{N}")
+    print(f"  pref_extract measured task_keys: {pref_count}/{N}")
+    if rerank_count < N or pref_count < N:
+        print(
+            f"FAIL: expected >={N} distinct measured task_keys for each "
+            f"operation, got llm_rerank={rerank_count} pref_extract={pref_count}",
+            file=sys.stderr,
+        )
+        return 1
     return 0
 
 
