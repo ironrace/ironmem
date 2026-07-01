@@ -31,9 +31,10 @@ use crate::error::MemoryError;
 const PHASE_ORDER: &[&str] = &["planning", "impl", "review", "rework", "other"];
 
 /// METRICS_SPEC §11.5 Phase-6 recording gate: `baseline_ready` becomes true at
-/// this many distinct merged task_keys with ≥1 measured token row. Single source
-/// of truth for the threshold — referenced by [`run_report`], [`one_line_summary`],
-/// and the text renderer so the three can never drift apart.
+/// this many distinct measured task_keys (a task with ≥1 measured token row;
+/// `merged` completion is not required — see §12 amendment 2026-06-30). Single
+/// source of truth for the threshold — referenced by [`run_report`],
+/// [`one_line_summary`], and the text renderer so the three can never drift apart.
 pub(crate) const BASELINE_READY_THRESHOLD: usize = 10;
 
 /// Minimum distinct exploration turns before the product-facing value summary
@@ -256,7 +257,8 @@ pub struct ValueSummary {
 pub struct Report {
     /// Filters used to generate this report.
     pub generated_for: GeneratedFor,
-    /// Distinct merged task_keys with ≥1 measured token row.
+    /// Distinct measured task_keys (each with ≥1 measured token row; `merged`
+    /// completion is not required — METRICS_SPEC §11.5 + §12 2026-06-30).
     pub baseline_task_count: usize,
     /// `baseline_task_count >= 10` (Phase-6 recording gate, METRICS_SPEC §11.5).
     pub baseline_ready: bool,
@@ -346,20 +348,21 @@ fn outcome_for_key<'a>(task_key: &str, outcomes: &'a [TaskOutcome]) -> Option<&'
 }
 
 /// METRICS_SPEC §11.5 baseline count: distinct **measured** task_keys (from the
-/// §10.1 roll-up) whose matched outcome is `merged`. Estimated-only and
-/// outcome-only tasks are excluded — the gate requires real measured tokens
-/// (§6.3). Shared by [`run_report`] and [`one_line_summary`] so the gate has a
-/// single definition.
-fn count_baseline_tasks(groups: &[TaskPhaseModelTokens], outcomes: &[TaskOutcome]) -> usize {
+/// §10.1 roll-up, which already filters `estimated = 0`). The spec gates Phase-6
+/// LLM-call reductions on "≥10 measured tasks" — task completion (`merged`) is
+/// NOT a precondition: a rerank/pref call burns the same tokens whether or not
+/// the surrounding task later merged, so call-frequency baseline data is a
+/// property of search/ingest traffic, not task success. Estimated-only and
+/// outcome-only tasks are still excluded — the gate requires real measured
+/// tokens (§6.3), which is exactly what membership in `groups` guarantees.
+/// Shared by [`run_report`] and [`one_line_summary`] so the gate has a single
+/// definition. See §12 amendment 2026-06-30.
+fn count_baseline_tasks(groups: &[TaskPhaseModelTokens]) -> usize {
     groups
         .iter()
         .map(|g| g.task_key.as_str())
         .collect::<std::collections::BTreeSet<_>>()
-        .into_iter()
-        .filter(|key| {
-            outcome_for_key(key, outcomes).and_then(|o| o.outcome.as_deref()) == Some("merged")
-        })
-        .count()
+        .len()
 }
 
 /// Assemble the METRICS_SPEC §10 report with §7-derived cost. No wallclock is
@@ -403,7 +406,7 @@ pub fn run_report(db: &Database, opts: &ReportOptions) -> Result<Report, MemoryE
         .map(|key| build_task(key, &groups, &splits, &outcomes))
         .collect();
 
-    let baseline_task_count = count_baseline_tasks(&groups, &outcomes);
+    let baseline_task_count = count_baseline_tasks(&groups);
 
     let unpriced_models = collect_unpriced(&groups);
 
@@ -618,7 +621,7 @@ fn one_line_summary_inner(db: &Database) -> Result<String, MemoryError> {
         })
         .sum();
     let cost: f64 = round6(groups.iter().filter_map(group_cost).sum());
-    let baseline = count_baseline_tasks(&groups, &outcomes);
+    let baseline = count_baseline_tasks(&groups);
 
     Ok(format!(
         "{n} tasks · {measured} measured tokens · ${cost:.2} (§7) · baseline {baseline}/{BASELINE_READY_THRESHOLD}"
@@ -672,6 +675,38 @@ mod tests {
         db.insert_token_usage(&row("impl", "claude-haiku-4-5", 1_000_000, Some(1.0)))
             .unwrap();
         db
+    }
+
+    /// Build a minimal measured §10.1 group for `task_key` (already measured —
+    /// the §10.1 query filters `estimated = 0` before these are constructed).
+    fn group(task_key: &str) -> TaskPhaseModelTokens {
+        TaskPhaseModelTokens {
+            task_key: task_key.into(),
+            collab_phase: Some("impl".into()),
+            model: Some("claude-haiku-4-5".into()),
+            harness: "claude".into(),
+            input_tokens: 1_000,
+            output_tokens: 10,
+            cache_creation_input_tokens: 0,
+            cache_read_input_tokens: 0,
+            provider_cost_usd: None,
+        }
+    }
+
+    /// METRICS_SPEC §11.5: the baseline gate counts distinct **measured** task
+    /// keys ("≥10 measured tasks") — task completion (`merged`) is NOT a
+    /// precondition. A measured `llm_rerank`/`pref_extract` task contributes its
+    /// baseline token data regardless of whether the surrounding task merged,
+    /// failed, or has no recorded outcome (e.g. a synthetic baseline probe). The
+    /// call cost of a rerank during a failed task is just as real.
+    #[test]
+    fn baseline_count_includes_measured_tasks_without_merged_outcome() {
+        // Three measured task_keys that would carry merged / failed / absent
+        // outcomes respectively. `count_baseline_tasks` takes only the measured
+        // groups (outcome is not an input), so all three count regardless of
+        // completion — the assertion proves the merged precondition is gone.
+        let groups = [group("t-merged"), group("t-failed"), group("t-noout")];
+        assert_eq!(count_baseline_tasks(&groups), 3);
     }
 
     #[test]

@@ -877,3 +877,34 @@ assembly `report/mod.rs::build_value_summary`; rendering
 `report/render.rs::render_value_summary`. Tests: unit (`report/mod.rs`,
 `report/render.rs`, `db/metrics.rs`) + integration JSON contract
 (`tests/report_golden.rs`).
+
+### 2026-06-30 — issue #95/#96: baseline gate counts measured tasks, not merged tasks (clarifies §11.5)
+
+§11.5 gates Phase-6 LLM-call reductions on "**≥10 tasks of baseline data**" /
+"**≥10 measured tasks**". The implementation (`report::count_baseline_tasks`) had
+additionally required each measured task's outcome to be `merged`, inheriting the
+completion filter from §11.3's tokens-to-done thesis gate (where merged-rate is
+load-bearing). That coupling is wrong for §11.5:
+
+- **What the baseline measures.** #95/#96 reduce how often the `llm_rerank` /
+  `pref_extract` LLM call fires and what it costs. A rerank/pref call consumes the
+  same tokens whether or not the surrounding task later reaches `merged`, so
+  call-frequency baseline data is a property of search/ingest **traffic**, not task
+  success. Excluding a measured rerank call because its task failed would understate
+  the real call volume the reduction is measured against.
+- **What §11.5 / the issues actually require.** §11.5 says "measured tasks"; #95/#96
+  say "≥10 tasks of `token_usage` baseline data … recorded in the report." Neither
+  says `merged`.
+
+**Change.** `count_baseline_tasks` now counts **distinct `task_key`s present in the
+§10.1 measured roll-up** (which already filters `estimated = 0`). The `merged`
+outcome filter is removed. Estimated-only and outcome-only tasks remain excluded —
+they are not in the measured roll-up — so the gate still requires real measured
+tokens (§6.3). The `BASELINE_READY_THRESHOLD` (10) is unchanged.
+
+**Impact.** `baseline_task_count` now includes measured tasks regardless of outcome
+(e.g. a `failed` task that still burned measured rerank tokens, or controlled
+baseline probes). No headline number, token source, or §7 cost changes. Tests:
+`tests/report_golden.rs` main golden (`baseline_task_count` 2 → 3, adding the
+measured-but-failed `sess-fail`) and a unit test in `report/mod.rs`
+(`baseline_count_includes_measured_tasks_without_merged_outcome`).
