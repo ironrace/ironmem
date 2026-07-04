@@ -7,6 +7,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`/ultrareview-local` hardened for bug-catching.** The orchestrator now
+  captures the full diff text up front (including untracked files via
+  `git add -N` in local mode), greps diff *content* — not just filenames — for
+  conditional-agent triggers, and adds two new conditional lenses: a
+  concurrency reviewer (races, TOCTOU, non-atomic read-modify-write,
+  non-idempotent retries) and a performance reviewer (N+1, unbounded queries).
+  Every agent brief now carries a shared output contract requiring a concrete
+  failure scenario for CRITICAL/HIGH findings and a >80% confidence floor, plus
+  a blast-radius requirement (verify callers of changed public symbols, with
+  ironmem symbol-graph tools when available). A new adversarial verification
+  phase (5.5) dispatches parallel verifiers that try to refute each
+  CRITICAL/HIGH before it can drive the verdict; refuted findings are reported,
+  not silently dropped. PR-mode validation now refuses to run tests when the
+  working tree isn't at the PR head. Core agents gained matching modes:
+  `code-reviewer` and `architect` get explicit diff-review modes (bug hunting
+  instead of plan alignment / system design; `architect` gains read-only Bash
+  so it can compute the diff), and `security-reviewer` gets multi-ecosystem
+  scanners (`cargo audit`, `pip-audit`, `bandit`, `govulncheck`, `gitleaks`)
+  and an explicit read-only rule under review commands.
+- **Install script now bundles the full `/collab` review surface.**
+  `scripts/install-ironmem.sh` installs `/ultrareview-local` (previously only a
+  preflight warning pointed at a separate plugin) plus its three core review
+  agents (`security-reviewer`, `architect`, `doc-reviewer`) alongside the
+  existing `code-reviewer`. It also installs the eight `collab-turn-*.md`
+  worker prompt templates to `~/.claude/prompts/`, and `/collab` now resolves
+  templates repo-relative first with a fallback to that installed copy — so
+  `/collab` can run against repos other than an ironrace-memory checkout. The
+  `/ultrareview-local` preflight warning is removed as obsolete.
+
 ## [0.4.0] - 2026-06-22
 
 ### Changed

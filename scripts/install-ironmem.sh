@@ -38,8 +38,14 @@ REQUIRED_CODEX_SKILLS=(
 
 REQUIRED_CLAUDE_SKILLS=()
 
+# code-reviewer is collab's inline review agent; the other three are
+# /ultrareview-local's core lenses (its pr-review-toolkit conditional agents
+# degrade gracefully when that plugin is absent, so they stay unbundled).
 REQUIRED_CLAUDE_AGENTS=(
   code-reviewer
+  security-reviewer
+  architect
+  doc-reviewer
 )
 
 # /collab-only command + prompt files the install must place so that a fresh
@@ -49,6 +55,21 @@ REQUIRED_CLAUDE_AGENTS=(
 REQUIRED_CLAUDE_COMMANDS=(
   collab
   evaluate-issue
+  ultrareview-local
+)
+
+# Worker-per-turn prompt templates. /collab resolves these repo-relative
+# (.claude-plugin/prompts/) when running inside an ironrace-memory checkout,
+# and falls back to this installed copy for any other target repo.
+REQUIRED_CLAUDE_PROMPTS=(
+  collab-turn-plan-draft
+  collab-turn-plan-synthesis
+  collab-turn-plan-finalize
+  collab-turn-task-list
+  collab-turn-code-implement
+  collab-turn-review-local
+  collab-turn-final-review
+  collab-turn-submit
 )
 
 REQUIRED_CODEX_COMMANDS=(
@@ -77,7 +98,7 @@ Options:
   --skip-skills    Do not install bundled Codex/Claude skill, agent, command,
                    and prompt dependencies.
   --skip-wiring    Do not register the ironmem MCP server in Claude/Codex
-                   config or warn about missing /ultrareview-local.
+                   config.
   --force-skills   Compatibility flag. Bundled skill/agent/command/prompt
                    files are merged with packaged updates by default; use
                    --skip-skills to leave existing copies untouched.
@@ -387,6 +408,7 @@ if [[ "$SKIP_SKILLS" -eq 0 ]]; then
   CLAUDE_SKILLS_DIR="${CLAUDE_SKILLS_DIR:-$CLAUDE_HOME/skills}"
   CLAUDE_AGENTS_DIR="${CLAUDE_AGENTS_DIR:-$CLAUDE_HOME/agents}"
   CLAUDE_COMMANDS_DIR="${CLAUDE_COMMANDS_DIR:-$CLAUDE_HOME/commands}"
+  CLAUDE_PROMPTS_DIR="${CLAUDE_PROMPTS_DIR:-$CLAUDE_HOME/prompts}"
   CODEX_COMMANDS_DIR="${CODEX_COMMANDS_DIR:-$CODEX_HOME/commands}"
   CODEX_PROMPTS_DIR="${CODEX_PROMPTS_DIR:-$CODEX_HOME/prompts}"
 
@@ -401,6 +423,8 @@ if [[ "$SKIP_SKILLS" -eq 0 ]]; then
   install_agent_set "Claude" "$REPO_ROOT/.claude-plugin/agents" "$CLAUDE_AGENTS_DIR"
   install_md_set "Claude command" "$REPO_ROOT/.claude-plugin/commands" \
     "$CLAUDE_COMMANDS_DIR" "${REQUIRED_CLAUDE_COMMANDS[@]}"
+  install_md_set "Claude prompt" "$REPO_ROOT/.claude-plugin/prompts" \
+    "$CLAUDE_PROMPTS_DIR" "${REQUIRED_CLAUDE_PROMPTS[@]}"
   install_md_set "Codex command" "$REPO_ROOT/.codex-plugin/commands" \
     "$CODEX_COMMANDS_DIR" "${REQUIRED_CODEX_COMMANDS[@]}"
   install_md_set "Codex prompt" "$REPO_ROOT/.codex-plugin/prompts" \
@@ -409,8 +433,8 @@ else
   echo "==> Skipping skill / command / prompt install"
 fi
 
-# MCP server registration + /ultrareview-local preflight. Split from skills
-# because a sysadmin may want to install the files but wire MCP themselves.
+# MCP server registration. Split from skills because a sysadmin may want to
+# install the files but wire MCP themselves.
 if [[ "$SKIP_WIRING" -eq 0 ]]; then
   CLAUDE_CONFIG_JSON="${CLAUDE_CONFIG_JSON:-$HOME/.claude.json}"
   CODEX_CONFIG_TOML="${CODEX_CONFIG_TOML:-$CODEX_HOME/config.toml}"
@@ -475,19 +499,8 @@ if [[ "$SKIP_WIRING" -eq 0 ]]; then
     } >> "$CODEX_CONFIG_TOML"
   fi
 
-  # ---- /ultrareview-local preflight -----------------------------------------
-  # /collab's CodeReviewLocalPending phase shells out to /ultrareview-local.
-  # It ships in a separate plugin, so we only warn (don't fail) if absent.
-  ULTRAREVIEW_CMD="$CLAUDE_HOME/commands/ultrareview-local.md"
-  if [[ ! -f "$ULTRAREVIEW_CMD" ]]; then
-    echo ""
-    echo "WARN: /ultrareview-local is not installed at $ULTRAREVIEW_CMD." >&2
-    echo "      /collab's CodeReviewLocalPending phase invokes it; without it the" >&2
-    echo "      flow will halt there. Install it from your /ultrareview-local source" >&2
-    echo "      (it is not bundled with ironmem)." >&2
-  fi
 else
-  echo "==> Skipping MCP wiring and /ultrareview-local preflight"
+  echo "==> Skipping MCP wiring"
 fi
 
 # Surface running `ironmem serve` instances as an FYI — the atomic install
