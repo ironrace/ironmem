@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Install script now bundles the full `/collab` review surface.**
+  `scripts/install-ironmem.sh` installs `/ultrareview-local` (previously only a
+  preflight warning pointed at a separate plugin) plus its three core review
+  agents (`security-reviewer`, `architect`, `doc-reviewer`) alongside the
+  existing `code-reviewer`. It also installs the eight `collab-turn-*.md`
+  worker prompt templates to `~/.claude/prompts/`, and `/collab` now resolves
+  templates repo-relative first with a fallback to that installed copy — so
+  `/collab` can run against repos other than an ironrace-memory checkout. The
+  `/ultrareview-local` preflight warning is removed as obsolete.
+
 ## [0.4.0] - 2026-06-22
 
 ### Changed

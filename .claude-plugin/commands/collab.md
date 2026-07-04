@@ -193,7 +193,12 @@ For every Claude-owned protocol turn, the orchestrator: reads slim
 the verbatim `.claude-plugin/prompts/collab-turn-<turn>.md` with `$VAR`s
 substituted (`$SESSION_ID`, and where the template uses them `$REPO_PATH`,
 `$BRANCH`, `$TOPIC`, `$ARTIFACT_REF`, `$ARTIFACT_HASH`, `$MODE`) → ingests ONLY the worker's
-≤3-line verdict → loops. The worker calls ironmem MCP tools directly; full
+≤3-line verdict → loops. Template path resolution: prefer
+`.claude-plugin/prompts/collab-turn-<turn>.md` in the target repo checkout
+(present when the target is ironrace-memory itself); otherwise use the
+installed copy at `~/.claude/prompts/collab-turn-<turn>.md` (placed by
+`scripts/install-ironmem.sh`). If neither exists, stop and report the missing
+template — never improvise a worker prompt from memory. The worker calls ironmem MCP tools directly; full
 artifacts never transit the orchestrator.
 
 **Anti-puppeteering:** pass ONLY the resolved template. Never append an inline
