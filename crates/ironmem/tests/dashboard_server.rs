@@ -8,7 +8,7 @@
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpStream;
 use std::path::Path;
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Command, ExitStatus, Stdio};
 use std::time::{Duration, Instant};
 
 use ironmem::db::schema::Database;
@@ -43,22 +43,60 @@ fn drawer_count(db_path: &Path) -> usize {
         .unwrap()
 }
 
+struct DashboardProcess {
+    child: Child,
+    addr: String,
+}
+
+impl DashboardProcess {
+    fn kill_and_wait(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+
+    fn wait_for_exit(&mut self, timeout: Duration) -> Option<ExitStatus> {
+        let deadline = Instant::now() + timeout;
+        loop {
+            if let Some(status) = self.child.try_wait().expect("poll dashboard child") {
+                return Some(status);
+            }
+            if Instant::now() >= deadline {
+                return None;
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
+    }
+}
+
+impl Drop for DashboardProcess {
+    fn drop(&mut self) {
+        self.kill_and_wait();
+    }
+}
+
 /// Spawn the dashboard with `--port 0 --json` and read the bound address from
 /// the JSON startup line on stdout.
-fn spawn_dashboard(db_path: &Path) -> (Child, String) {
-    let mut child = Command::new(bin())
+fn spawn_dashboard(db_path: &Path) -> DashboardProcess {
+    let child = Command::new(bin())
         .arg("dashboard")
         .arg("--db")
         .arg(db_path)
         .arg("--port")
         .arg("0")
         .arg("--json")
+        .arg("--exit-on-stdin-close")
+        .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
         .expect("spawn dashboard");
 
-    let stdout = child.stdout.take().expect("stdout");
+    let mut dashboard = DashboardProcess {
+        child,
+        addr: String::new(),
+    };
+
+    let stdout = dashboard.child.stdout.take().expect("stdout");
     let mut reader = BufReader::new(stdout);
     let mut line = String::new();
     reader.read_line(&mut line).expect("read startup line");
@@ -70,10 +108,10 @@ fn spawn_dashboard(db_path: &Path) -> (Child, String) {
         .expect("url in startup json")
         .to_string();
     // url is like http://127.0.0.1:54321 — strip scheme to get host:port.
-    let addr = url.strip_prefix("http://").expect("http url").to_string();
+    dashboard.addr = url.strip_prefix("http://").expect("http url").to_string();
     // Drain stderr in the background so the child never blocks on a full pipe,
     // and so we can surface server-side errors if a request misbehaves.
-    if let Some(err) = child.stderr.take() {
+    if let Some(err) = dashboard.child.stderr.take() {
         std::thread::spawn(move || {
             let mut r = BufReader::new(err);
             let mut l = String::new();
@@ -83,7 +121,7 @@ fn spawn_dashboard(db_path: &Path) -> (Child, String) {
             }
         });
     }
-    (child, addr)
+    dashboard
 }
 
 /// Issue a single raw HTTP/1.1 request and return (status_line, body).
@@ -140,22 +178,21 @@ fn live_dashboard_serves_readonly_over_tcp() {
         .schema_version()
         .unwrap();
 
-    let (mut child, addr) = spawn_dashboard(&db_path);
+    let mut dashboard = spawn_dashboard(&db_path);
 
     // GET /api/summary → 200 with the seeded drawer count.
-    let (get_status, get_body) = http_request(&addr, "GET", "/api/summary");
+    let (get_status, get_body) = http_request(&dashboard.addr, "GET", "/api/summary");
     assert!(get_status.contains("200"), "summary status: {get_status}");
     let summary: serde_json::Value = serde_json::from_str(&get_body)
         .unwrap_or_else(|e| panic!("summary json ({e}): {get_body}"));
     assert_eq!(summary["total_drawers"].as_u64(), Some(count_before as u64));
 
     // POST / → 405 (only GET/HEAD are served).
-    let (post_status, _post_body) = http_request(&addr, "POST", "/");
+    let (post_status, _post_body) = http_request(&dashboard.addr, "POST", "/");
     assert!(post_status.contains("405"), "POST status: {post_status}");
 
     // Tear down the server.
-    child.kill().ok();
-    child.wait().ok();
+    dashboard.kill_and_wait();
 
     // The DB must be byte-for-byte unchanged in schema + row count.
     let version_after = Database::open_read_only(&db_path)
@@ -164,4 +201,19 @@ fn live_dashboard_serves_readonly_over_tcp() {
         .unwrap();
     assert_eq!(version_before, version_after, "schema_version changed");
     assert_eq!(count_before, drawer_count(&db_path), "drawer count changed");
+}
+
+#[test]
+fn live_dashboard_exits_when_parent_stdin_closes() {
+    let temp = tempfile::tempdir().unwrap();
+    let db_path = temp.path().join("memory.sqlite3");
+    seed_db(&db_path);
+
+    let mut dashboard = spawn_dashboard(&db_path);
+    drop(dashboard.child.stdin.take());
+
+    let status = dashboard
+        .wait_for_exit(Duration::from_secs(5))
+        .expect("dashboard should exit after stdin closes");
+    assert!(status.success(), "dashboard exited with {status:?}");
 }

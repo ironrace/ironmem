@@ -150,6 +150,9 @@ enum Commands {
         /// Emit startup metadata as JSON instead of prose
         #[arg(long)]
         json: bool,
+        /// Internal test hook: exit when stdin closes
+        #[arg(long, hide = true)]
+        exit_on_stdin_close: bool,
     },
     /// Build or query the local symbol/import graph index
     Symbols {
@@ -434,6 +437,7 @@ async fn run(cli: Cli) -> Result<(), MemoryError> {
             port,
             allow_non_loopback,
             json,
+            exit_on_stdin_close,
         } => {
             let cfg = config::Config::load(db)?;
             let host_addr: std::net::IpAddr = host.parse().map_err(|e| {
@@ -445,6 +449,7 @@ async fn run(cli: Cli) -> Result<(), MemoryError> {
                 port,
                 allow_non_loopback,
                 json_startup: json,
+                exit_on_stdin_close,
                 // Reuse the same model-dir resolution as the rest of the CLI so
                 // warming status reflects the actual embed cache the binary uses.
                 model_dir: cfg.model_dir.clone(),

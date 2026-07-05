@@ -17,6 +17,7 @@ use hyper::server::conn::http1;
 use hyper::service::service_fn;
 use hyper_util::rt::{TokioIo, TokioTimer};
 use hyper_util::server::graceful::GracefulShutdown;
+use tokio::io::AsyncReadExt;
 use tokio::net::TcpListener;
 
 use crate::db::schema::{Database, LATEST_SCHEMA_VERSION};
@@ -53,6 +54,11 @@ pub struct DashboardConfig {
     /// (env `IRONMEM_MODEL_DIR` else `model_cache_dir()`). Used only to report
     /// warming status; never written to.
     pub model_dir: PathBuf,
+    /// Test/child-process lifecycle hook: shut down when stdin reaches EOF.
+    ///
+    /// This is disabled for normal CLI use so a background dashboard is not tied
+    /// to whatever stdin its launcher happened to provide.
+    pub exit_on_stdin_close: bool,
 }
 
 impl DashboardConfig {
@@ -86,12 +92,13 @@ impl DashboardConfig {
 /// and serves requests via [`handle_request`]. Clean shutdown on Ctrl-C.
 pub async fn run_dashboard(cfg: DashboardConfig) -> Result<(), MemoryError> {
     cfg.validate_host()?;
+    let mut parent_stdin_closed = spawn_parent_stdin_close_watcher(cfg.exit_on_stdin_close);
 
     // Open and schema-check the DB before binding the port so startup errors
     // are surfaced before we accept any connections. The embed-model warming
     // status is resolved here too (one checksum pass at startup) so the request
     // path never pays the model-read cost.
-    let (schema_version, model_status) = {
+    let startup = async {
         let path = cfg.db_path.clone();
         let model_dir = cfg.model_dir.clone();
         tokio::task::spawn_blocking(move || -> Result<(i64, WarmingStatus), MemoryError> {
@@ -121,7 +128,18 @@ pub async fn run_dashboard(cfg: DashboardConfig) -> Result<(), MemoryError> {
             Ok((ver, WarmingStatus::from(&raw)))
         })
         .await
-        .map_err(|e| MemoryError::Validation(format!("spawn_blocking: {e}")))??
+        .map_err(|e| MemoryError::Validation(format!("spawn_blocking: {e}")))?
+    };
+    let (schema_version, model_status) = if let Some(parent_closed) = parent_stdin_closed.as_mut() {
+        tokio::select! {
+            result = startup => result?,
+            _ = parent_closed => {
+                eprintln!("ironmem dashboard: parent stdin closed; shutting down.");
+                return Ok(());
+            }
+        }
+    } else {
+        startup.await?
     };
 
     let addr = SocketAddr::new(cfg.host, cfg.port);
@@ -155,6 +173,14 @@ pub async fn run_dashboard(cfg: DashboardConfig) -> Result<(), MemoryError> {
         let _ = tokio::signal::ctrl_c().await;
     };
     tokio::pin!(shutdown);
+    let parent_shutdown = async {
+        if let Some(parent_closed) = parent_stdin_closed.as_mut() {
+            let _ = parent_closed.await;
+        } else {
+            std::future::pending::<()>().await;
+        }
+    };
+    tokio::pin!(parent_shutdown);
     let graceful = GracefulShutdown::new();
 
     loop {
@@ -190,11 +216,32 @@ pub async fn run_dashboard(cfg: DashboardConfig) -> Result<(), MemoryError> {
                 eprintln!("\nironmem dashboard: shutting down.");
                 break;
             }
+            _ = &mut parent_shutdown => {
+                eprintln!("\nironmem dashboard: parent stdin closed; shutting down.");
+                break;
+            }
         }
     }
 
     graceful.shutdown().await;
     Ok(())
+}
+
+fn spawn_parent_stdin_close_watcher(enabled: bool) -> Option<tokio::task::JoinHandle<()>> {
+    if !enabled {
+        return None;
+    }
+
+    Some(tokio::spawn(async {
+        let mut stdin = tokio::io::stdin();
+        let mut buf = [0u8; 1];
+        loop {
+            match stdin.read(&mut buf).await {
+                Ok(0) | Err(_) => break,
+                Ok(_) => {}
+            }
+        }
+    }))
 }
 
 #[cfg(test)]
@@ -210,6 +257,7 @@ mod tests {
             allow_non_loopback,
             json_startup: false,
             model_dir: PathBuf::from("/tmp/irrelevant-models"),
+            exit_on_stdin_close: false,
         }
     }
 
@@ -222,6 +270,7 @@ mod tests {
             allow_non_loopback: false,
             json_startup: false,
             model_dir: PathBuf::from("/tmp/irrelevant-models"),
+            exit_on_stdin_close: false,
         };
         assert!(cfg.validate_host().is_ok());
     }
@@ -235,6 +284,7 @@ mod tests {
             allow_non_loopback: false,
             json_startup: false,
             model_dir: PathBuf::from("/tmp/irrelevant-models"),
+            exit_on_stdin_close: false,
         };
         let err = cfg.validate_host().unwrap_err();
         let msg = format!("{err}");
@@ -253,6 +303,7 @@ mod tests {
             allow_non_loopback: true,
             json_startup: false,
             model_dir: PathBuf::from("/tmp/irrelevant-models"),
+            exit_on_stdin_close: false,
         };
         // Should not error; warning goes to stderr (not captured here).
         assert!(cfg.validate_host().is_ok());
