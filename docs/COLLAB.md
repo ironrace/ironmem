@@ -1222,6 +1222,17 @@ Phase → action (v3):
 | `CodeReviewFinalPending` | dispatch `collab-turn-final-review.md` compose worker, then dispatch `collab-turn-submit.md` **directly** (no gate) to `gh pr create` (ready PR) and send `final_review{pr_url}` | wait |
 | `CodingComplete` / `CodingFailed` | exit loop | n/a |
 
+**Worktree cleanup reminder on `CodingComplete`.** The session's lifecycle
+ends here, before a human merges the PR on GitHub — collab has no way to
+observe the merge, so it cannot clean up automatically. If `start` created an
+isolated worktree for this session (check: `git rev-parse --git-common-dir`
+differs from `git rev-parse --git-dir` in `repo_path`), the exiting loop
+includes a line in its final report to the user naming the worktree path and
+pointing at the `engineering:git-worktree-manager` skill's
+`worktree_cleanup.py` (or a plain `git worktree remove <path>` once the PR
+merges). Cleanup is never run automatically — the branch/worktree must
+survive until the PR is actually merged.
+
 ### Claude's Plan Mode Integration
 
 Claude enters harness Plan Mode at **exactly one gate**, matching the
@@ -1262,16 +1273,55 @@ collab-start: <one-sentence task>
 Claude's behavior on receiving this:
 
 1. `repo_path` ← `git rev-parse --show-toplevel` of the current working directory.
-2. `branch` ← `git branch --show-current`.
-3. `initiator` ← `"claude"` (this is the Claude terminal).
-4. `task` ← the text after `start`/`start:`.
-5. Call `collab_start` with those four fields.
-6. Report the returned `session_id` back to the user as a single-line
+2. `current_branch` ← `git branch --show-current`.
+3. **If `current_branch` is non-empty and not `main`/`master`/`trunk`**,
+   you're already on an isolated branch (e.g. from `using-git-worktrees`, or
+   the user branched manually before running `/collab start`) — use it
+   as-is: `branch` ← `current_branch`, `repo_path` unchanged. Do not create
+   another branch or worktree.
+4. **Otherwise** (on `main`/`master`/`trunk`, or a detached HEAD), create an
+   isolated worktree on a new branch — never record `main`/`master`/`trunk`
+   as the collab branch:
+   - Derive a slug from `task` (lowercase; strip to alphanumerics/spaces/
+     hyphens; collapse whitespace to single hyphens; truncate to ~40 chars;
+     trim trailing hyphens; fall back to `session` if empty). Candidate
+     branch name: `collab/<slug>`; if it already exists locally or on
+     `origin`, append `-2`, `-3`, … until unique.
+   - Pick a worktree directory using the same priority order as the
+     `using-git-worktrees` skill: an existing `.worktrees/` (preferred) or
+     `worktrees/` at the repo root; otherwise a preference from `CLAUDE.md`
+     (`grep -i "worktree.*director" CLAUDE.md`); otherwise default to
+     `.worktrees/` — collab must never stop to ask, unlike the general
+     skill. For a project-local directory, verify it's gitignored
+     (`git check-ignore -q <dir>`); if not, add it to `.gitignore` and
+     commit that fix before proceeding.
+   - `git worktree add "<dir>/<name>" -b "<name>"` (branches from the
+     current HEAD).
+   - `repo_path` ← the new worktree's absolute path. `branch` ← `<name>`.
+
+   > **Why a worktree, not just `checkout -b`:** every git operation for
+   > this session — including Codex's pre-send harness, which does
+   > `git checkout <branch>; git reset --hard <last_head_sha>` — now runs
+   > entirely inside the isolated worktree directory, so it can never
+   > collide with whatever the user's own terminal has checked out.
+
+   > **Why never record `main`:** the collab `branch` field is fixed at
+   > `collab_start` time and has no update API. If the session starts on
+   > `main` and it's ever recorded as such, every subsequent turn that reads
+   > `collab_status.branch` — including Codex's pre-send harness — will
+   > check out and hard-reset local `main` to the session's `last_head_sha`,
+   > and any turn that then pushes will push straight to `main`, bypassing PR
+   > review entirely.
+5. `initiator` ← `"claude"` (this is the Claude terminal).
+6. `task` ← the text after `start`/`start:`.
+7. Call `collab_start` with those four fields.
+8. Report the returned `session_id` back to the user as a single-line
    tracking message (e.g. `Collab session started: <session_id>
-   (implementer: <claude|codex>)`). Do not instruct the user to paste
+   (implementer: <claude|codex>, branch: <branch>)`), plus the worktree path
+   on its own line if step 4 created one. Do not instruct the user to paste
    anything into a Codex terminal — Claude drives Codex inline via
    background `codex exec`.
-7. Enter the autonomous planning loop as `claude` (see § Autonomous
+9. Enter the autonomous planning loop as `claude` (see § Autonomous
    Planning Loop). Send the blind `draft` autonomously (no Plan Mode);
    enter Plan Mode only at the two gates listed in
    § Claude's Plan Mode Integration. Do not call `collab_end`.
@@ -1316,8 +1366,8 @@ When the command does not specify these, the agent resolves them silently:
 
 | Field | Source |
 |---|---|
-| `repo_path` | `git rev-parse --show-toplevel` |
-| `branch` | `git branch --show-current` |
+| `repo_path` | `git rev-parse --show-toplevel`, **unless** `start` created a worktree (see below), in which case the worktree's absolute path |
+| `branch` | **`start`, already on a non-default branch:** that branch, as-is. **`start`, on `main`/`master`/`trunk`/detached HEAD:** a newly created `collab/<task-slug>` branch in a new isolated worktree (see § Starting a session) — never `main`/`master`/`trunk` itself. **`join`:** the branch already recorded on the session (`collab_status.branch`); do not create another. |
 | `initiator` / `sender` / `receiver` / `agent` | `"claude"` in Claude's terminal, `"codex"` in Codex's |
 | `session_id` (after first turn) | remembered from the start/join call |
 
@@ -1333,7 +1383,10 @@ Single-terminal narrative (normal path). The user only types the
 user (Claude terminal):
   /collab start design marketing landing page
 
-Claude: resolves repo_path, branch, initiator=claude. start → s_abc.
+Claude: resolves repo_path; current branch is `main`, so creates an
+        isolated worktree at `.worktrees/collab/design-marketing-landing-page`
+        on a new branch of the same name; initiator=claude.
+        start → s_abc.
         Draft sent autonomously — no Plan Mode. Owner flips to codex.
 Claude: dispatches Codex via background `codex exec` with the resolved
         Codex prompt. Begins polling collab_status + BashOutput.

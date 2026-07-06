@@ -110,7 +110,41 @@ branch names.
 
 1. Resolve defaults:
    - `repo_path` ← `git rev-parse --show-toplevel`
-   - `branch` ← `git branch --show-current`
+   - `current_branch` ← `git branch --show-current`.
+   - **If `current_branch` is non-empty and not `main`/`master`/`trunk`**,
+     you're already on an isolated branch (e.g. from `using-git-worktrees`,
+     or the user branched manually before running `/collab start`) — use it
+     as-is: `branch` ← `current_branch`, `repo_path` unchanged. Do not create
+     another branch or worktree.
+   - **Otherwise** (on `main`/`master`/`trunk`, or a detached HEAD), create
+     an isolated worktree on a new branch — never record `main`/`master`/
+     `trunk` as the collab branch:
+     - Derive a slug from `task`: lowercase it, strip everything except
+       alphanumerics/spaces/hyphens, collapse whitespace to single hyphens,
+       truncate to ~40 chars, trim trailing hyphens (fall back to `session`
+       if the result is empty). Candidate branch name: `collab/<slug>`. If a
+       branch with that name already exists locally or on `origin`, append
+       `-2`, `-3`, … until unique.
+     - Pick a worktree directory using the same priority order as the
+       `using-git-worktrees` skill: an existing `.worktrees/` (preferred) or
+       `worktrees/` at the repo root; otherwise a preference from
+       `CLAUDE.md` (`grep -i "worktree.*director" CLAUDE.md`); otherwise
+       default to `.worktrees/` — never stop to ask. For a project-local
+       directory, verify it's gitignored (`git check-ignore -q <dir>`); if
+       not, add it to `.gitignore` and commit that fix before proceeding.
+     - `git worktree add "<dir>/<name>" -b "<name>"` (branches from the
+       current HEAD).
+     - `repo_path` ← the new worktree's absolute path. `branch` ← `<name>`.
+     - (**Why a worktree, not just `checkout -b`:** every git operation for
+       this session — including your own pre-send harness below
+       (`git checkout <branch>; git reset --hard <last_head_sha>`) — now
+       runs entirely inside the isolated worktree directory, so it can
+       never collide with whatever the user's own terminal has checked out.)
+     - (**Why never record `main`:** the `branch` field is fixed at
+       `collab_start` time with no update API — if it's ever recorded as
+       `main`, every later turn that trusts `collab_status.branch` will
+       check out and hard-reset local `main`, and the next push lands
+       straight on `main`, bypassing PR review entirely.)
    - `initiator` ← `"codex"`
    - `task` ← the remainder of `$ARGUMENTS` after the word `start`
 2. Call `mcp__ironmem__collab_start`.
@@ -197,6 +231,14 @@ You end your invocation after one successful send. The next handoff
 (whether another Codex turn or session close) will come as a new
 `/collab join` invocation from Claude. No background polling, no FIFO,
 no wake-up daemon.
+
+If your `report and exit` at `CodingComplete` is the one reaching the human
+(rare fallback path — normally Claude reports), and `start` created an
+isolated worktree for this session (`git rev-parse --git-common-dir` differs
+from `git rev-parse --git-dir` in `repo_path`), mention the worktree path and
+that it should be cleaned up (`engineering:git-worktree-manager`'s
+`worktree_cleanup.py`, or `git worktree remove <path>`) once the PR merges.
+Do not clean it up yourself — the session cannot observe the merge.
 
 If you reach a phase where it is not your turn (`is_my_turn == false`)
 on entry — that is a stale invocation; exit with a one-line status.
