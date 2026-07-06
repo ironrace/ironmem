@@ -31,7 +31,23 @@ branch names.
    - `task` ← the remaining text after stripping `start` and the flag.
 2. Resolve defaults:
    - `repo_path` ← output of `git rev-parse --show-toplevel` (run via Bash).
-   - `branch` ← output of `git branch --show-current`.
+   - `branch` ← **always create a new branch for this session; never record
+     `main`/`master`/`trunk` (or a detached HEAD) as the collab branch,
+     regardless of what is currently checked out.** Derive a slug from
+     `task`: lowercase it, strip everything except alphanumerics/spaces/
+     hyphens, collapse whitespace to single hyphens, truncate to ~40 chars,
+     trim trailing hyphens (fall back to `session` if the result is empty).
+     Candidate name: `collab/<slug>`. If a branch with that name already
+     exists locally or on `origin` (`git show-ref --verify --quiet
+     refs/heads/<name>` / `refs/remotes/origin/<name>`), append `-2`, `-3`,
+     … until unique. Run `git checkout -b <name>` from the current HEAD, then
+     use `<name>` as `branch`. (**Why:** the `branch` field is fixed at
+     `collab_start` time with no update API — if it's ever recorded as
+     `main`, every later turn that reads `collab_status.branch`, including
+     Codex's pre-send harness (`git checkout <branch>; git reset --hard
+     <last_head_sha>`), will check out and hard-reset local `main` to the
+     session head, and the next push lands straight on `main`, bypassing PR
+     review entirely.)
    - `initiator` ← `"claude"` (this is Claude's terminal).
 3. Call `mcp__ironmem__collab_start` with `repo_path`, `branch`,
    `initiator`, `task`, and `implementer`. The MCP tool returns
@@ -46,7 +62,7 @@ branch names.
    so they can track it:
 
    ```
-   Collab session started: <session_id> (implementer: <claude|codex>)
+   Collab session started: <session_id> (implementer: <claude|codex>, branch: <branch>)
    ```
 
    Only fall back to `"Run in Codex: /collab join <session_id>"` if

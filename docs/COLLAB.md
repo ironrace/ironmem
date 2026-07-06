@@ -1262,7 +1262,26 @@ collab-start: <one-sentence task>
 Claude's behavior on receiving this:
 
 1. `repo_path` ← `git rev-parse --show-toplevel` of the current working directory.
-2. `branch` ← `git branch --show-current`.
+2. `branch` ← **always create a new branch for this session** — never record
+   `main`/`master`/`trunk` (or a detached HEAD) as the collab branch,
+   regardless of what is currently checked out. Derive a slug from `task`
+   (lowercase; strip to alphanumerics/spaces/hyphens; collapse whitespace to
+   single hyphens; truncate to ~40 chars; trim trailing hyphens; fall back to
+   `session` if empty). Candidate name: `collab/<slug>`; if it already exists
+   locally or on `origin`, append `-2`, `-3`, … until unique. Run
+   `git checkout -b <name>` from the current HEAD and use `<name>` as
+   `branch`.
+
+   > **Why always branch:** the collab `branch` field is fixed at
+   > `collab_start` time and has no update API. If the session starts on
+   > `main` and the user (or agent) later switches to a feature branch
+   > without telling the session, every subsequent turn that reads
+   > `collab_status.branch` — including Codex's pre-send harness
+   > (`git checkout <branch>; git reset --hard <last_head_sha>`) — will
+   > check out and hard-reset local `main` to the session's `last_head_sha`,
+   > and any turn that then pushes will push straight to `main`, bypassing PR
+   > review entirely. Creating the branch inside `collab_start` itself makes
+   > the recorded `branch` authoritative from the first message.
 3. `initiator` ← `"claude"` (this is the Claude terminal).
 4. `task` ← the text after `start`/`start:`.
 5. Call `collab_start` with those four fields.
@@ -1317,7 +1336,7 @@ When the command does not specify these, the agent resolves them silently:
 | Field | Source |
 |---|---|
 | `repo_path` | `git rev-parse --show-toplevel` |
-| `branch` | `git branch --show-current` |
+| `branch` | **`start` only:** a newly created `collab/<task-slug>` branch (see § Starting a session) — never the branch that happened to be checked out. **`join`:** the branch already recorded on the session (`collab_status.branch`); do not create another. |
 | `initiator` / `sender` / `receiver` / `agent` | `"claude"` in Claude's terminal, `"codex"` in Codex's |
 | `session_id` (after first turn) | remembered from the start/join call |
 
@@ -1333,7 +1352,9 @@ Single-terminal narrative (normal path). The user only types the
 user (Claude terminal):
   /collab start design marketing landing page
 
-Claude: resolves repo_path, branch, initiator=claude. start → s_abc.
+Claude: resolves repo_path; creates and checks out
+        `collab/design-marketing-landing-page`; initiator=claude.
+        start → s_abc.
         Draft sent autonomously — no Plan Mode. Owner flips to codex.
 Claude: dispatches Codex via background `codex exec` with the resolved
         Codex prompt. Begins polling collab_status + BashOutput.
