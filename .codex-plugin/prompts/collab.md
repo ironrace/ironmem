@@ -232,6 +232,14 @@ You end your invocation after one successful send. The next handoff
 `/collab join` invocation from Claude. No background polling, no FIFO,
 no wake-up daemon.
 
+If your `report and exit` at `CodingComplete` is the one reaching the human
+(rare fallback path — normally Claude reports), and `start` created an
+isolated worktree for this session (`git rev-parse --git-common-dir` differs
+from `git rev-parse --git-dir` in `repo_path`), mention the worktree path and
+that it should be cleaned up (`engineering:git-worktree-manager`'s
+`worktree_cleanup.py`, or `git worktree remove <path>`) once the PR merges.
+Do not clean it up yourself — the session cannot observe the merge.
+
 If you reach a phase where it is not your turn (`is_my_turn == false`)
 on entry — that is a stale invocation; exit with a one-line status.
 Claude's dispatch will still complete cleanly.

@@ -219,6 +219,17 @@ loop:
 server is still writing state after a send. Do NOT use it as a
 wait-for-Codex mechanism — Codex isn't polling, Claude drives it.
 
+**Worktree cleanup reminder on `CodingComplete`.** The session's lifecycle
+ends here, before a human merges the PR on GitHub — collab has no way to
+observe the merge, so it cannot clean up automatically. If `start` created an
+isolated worktree for this session (check: `git rev-parse --git-common-dir`
+differs from `git rev-parse --git-dir` in `repo_path`), include a line in the
+final report to the user naming the worktree path and pointing at the
+`engineering:git-worktree-manager` skill's `worktree_cleanup.py` (or a plain
+`git worktree remove <path>` once the PR merges) — do not run cleanup
+yourself, since the branch/worktree must survive until the PR is actually
+merged.
+
 Terminal sets:
 - **v1**: `{PlanLocked}` (until `task_list` is sent)
 - **v3**: `{CodingComplete, CodingFailed}`

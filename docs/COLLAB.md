@@ -1222,6 +1222,17 @@ Phase → action (v3):
 | `CodeReviewFinalPending` | dispatch `collab-turn-final-review.md` compose worker, then dispatch `collab-turn-submit.md` **directly** (no gate) to `gh pr create` (ready PR) and send `final_review{pr_url}` | wait |
 | `CodingComplete` / `CodingFailed` | exit loop | n/a |
 
+**Worktree cleanup reminder on `CodingComplete`.** The session's lifecycle
+ends here, before a human merges the PR on GitHub — collab has no way to
+observe the merge, so it cannot clean up automatically. If `start` created an
+isolated worktree for this session (check: `git rev-parse --git-common-dir`
+differs from `git rev-parse --git-dir` in `repo_path`), the exiting loop
+includes a line in its final report to the user naming the worktree path and
+pointing at the `engineering:git-worktree-manager` skill's
+`worktree_cleanup.py` (or a plain `git worktree remove <path>` once the PR
+merges). Cleanup is never run automatically — the branch/worktree must
+survive until the PR is actually merged.
+
 ### Claude's Plan Mode Integration
 
 Claude enters harness Plan Mode at **exactly one gate**, matching the

@@ -60,8 +60,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `using-git-worktrees` skill: `.worktrees/` preferred, `CLAUDE.md`
   preference, else default — never an interactive ask), so the session's
   git operations can never collide with whatever the user's own terminal has
-  checked out. Fixed in lockstep across `docs/COLLAB.md`,
-  `.claude-plugin/commands/collab.md`, and `.codex-plugin/prompts/collab.md`.
+  checked out. The session's lifecycle ends at `CodingComplete`, before a
+  human merges the PR, so collab can't observe the merge and never cleans
+  the worktree up automatically; the terminal-phase report to the user now
+  names the worktree path and points at the `engineering:git-worktree-manager`
+  skill's `worktree_cleanup.py` (or `git worktree remove <path>`) as the
+  manual follow-up once the PR merges. Fixed in lockstep across
+  `docs/COLLAB.md`, `.claude-plugin/commands/collab.md`, and
+  `.codex-plugin/prompts/collab.md`.
 
 ## [0.4.0] - 2026-06-22
 
