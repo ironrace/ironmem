@@ -40,21 +40,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- **`/collab start` now always creates a new branch instead of recording
-  whatever was checked out.** The `branch` field is fixed at `collab_start`
-  time with no update API. Previously, if `start` ran from `main`/`master`/
-  `trunk` (or a detached HEAD) — e.g. the user branches off manually right
-  after starting the session — every later turn that trusts
+- **`/collab start` no longer records `main`/`master`/`trunk` as the
+  session's branch.** The `branch` field is fixed at `collab_start` time
+  with no update API. Previously, if `start` ran from the default branch
+  (or a detached HEAD) — e.g. the user branches off manually right after
+  starting the session — every later turn that trusts
   `collab_status.branch`, including Codex's pre-send harness
   (`git checkout <branch>; git reset --hard <last_head_sha>`), would check
   out and hard-reset local `main` to the session head, and the next push
   would land straight on `main`, bypassing PR review entirely. This is
   exactly what happened in a live session: Codex's global review turn pushed
   an unreviewed 10-commit security-hardening branch directly to `origin/main`
-  with no PR. `start` now always derives a `collab/<task-slug>` branch name
-  (deduplicated against existing local/remote refs) and `git checkout -b`s it
-  before calling `collab_start`, so the recorded `branch` is authoritative
-  from the first message. Fixed in lockstep across `docs/COLLAB.md`,
+  with no PR. `start` now checks the current branch first: if it's already
+  something other than `main`/`master`/`trunk` (e.g. from `using-git-worktrees`,
+  or the user branched manually), it's used as-is — no redundant branch or
+  worktree. Otherwise, `start` derives a `collab/<task-slug>` branch name
+  (deduplicated against existing local/remote refs) and creates it inside a
+  new **isolated git worktree** (same directory-selection convention as the
+  `using-git-worktrees` skill: `.worktrees/` preferred, `CLAUDE.md`
+  preference, else default — never an interactive ask), so the session's
+  git operations can never collide with whatever the user's own terminal has
+  checked out. Fixed in lockstep across `docs/COLLAB.md`,
   `.claude-plugin/commands/collab.md`, and `.codex-plugin/prompts/collab.md`.
 
 ## [0.4.0] - 2026-06-22

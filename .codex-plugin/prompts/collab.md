@@ -110,21 +110,41 @@ branch names.
 
 1. Resolve defaults:
    - `repo_path` ← `git rev-parse --show-toplevel`
-   - `branch` ← **always create a new branch for this session; never record
-     `main`/`master`/`trunk` (or a detached HEAD) as the collab branch,
-     regardless of what is currently checked out.** Derive a slug from
-     `task`: lowercase it, strip everything except alphanumerics/spaces/
-     hyphens, collapse whitespace to single hyphens, truncate to ~40 chars,
-     trim trailing hyphens (fall back to `session` if the result is empty).
-     Candidate name: `collab/<slug>`. If a branch with that name already
-     exists locally or on `origin`, append `-2`, `-3`, … until unique. Run
-     `git checkout -b <name>` from the current HEAD, then use `<name>` as
-     `branch`. (**Why:** the `branch` field is fixed at `collab_start` time
-     with no update API — if it's ever recorded as `main`, every later turn
-     that reads `collab_status.branch`, including your own pre-send harness
-     below (`git checkout <branch>; git reset --hard <last_head_sha>`), will
-     check out and hard-reset local `main`, and the next push lands straight
-     on `main`, bypassing PR review entirely.)
+   - `current_branch` ← `git branch --show-current`.
+   - **If `current_branch` is non-empty and not `main`/`master`/`trunk`**,
+     you're already on an isolated branch (e.g. from `using-git-worktrees`,
+     or the user branched manually before running `/collab start`) — use it
+     as-is: `branch` ← `current_branch`, `repo_path` unchanged. Do not create
+     another branch or worktree.
+   - **Otherwise** (on `main`/`master`/`trunk`, or a detached HEAD), create
+     an isolated worktree on a new branch — never record `main`/`master`/
+     `trunk` as the collab branch:
+     - Derive a slug from `task`: lowercase it, strip everything except
+       alphanumerics/spaces/hyphens, collapse whitespace to single hyphens,
+       truncate to ~40 chars, trim trailing hyphens (fall back to `session`
+       if the result is empty). Candidate branch name: `collab/<slug>`. If a
+       branch with that name already exists locally or on `origin`, append
+       `-2`, `-3`, … until unique.
+     - Pick a worktree directory using the same priority order as the
+       `using-git-worktrees` skill: an existing `.worktrees/` (preferred) or
+       `worktrees/` at the repo root; otherwise a preference from
+       `CLAUDE.md` (`grep -i "worktree.*director" CLAUDE.md`); otherwise
+       default to `.worktrees/` — never stop to ask. For a project-local
+       directory, verify it's gitignored (`git check-ignore -q <dir>`); if
+       not, add it to `.gitignore` and commit that fix before proceeding.
+     - `git worktree add "<dir>/<name>" -b "<name>"` (branches from the
+       current HEAD).
+     - `repo_path` ← the new worktree's absolute path. `branch` ← `<name>`.
+     - (**Why a worktree, not just `checkout -b`:** every git operation for
+       this session — including your own pre-send harness below
+       (`git checkout <branch>; git reset --hard <last_head_sha>`) — now
+       runs entirely inside the isolated worktree directory, so it can
+       never collide with whatever the user's own terminal has checked out.)
+     - (**Why never record `main`:** the `branch` field is fixed at
+       `collab_start` time with no update API — if it's ever recorded as
+       `main`, every later turn that trusts `collab_status.branch` will
+       check out and hard-reset local `main`, and the next push lands
+       straight on `main`, bypassing PR review entirely.)
    - `initiator` ← `"codex"`
    - `task` ← the remainder of `$ARGUMENTS` after the word `start`
 2. Call `mcp__ironmem__collab_start`.
