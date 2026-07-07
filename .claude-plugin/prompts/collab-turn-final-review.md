@@ -17,10 +17,14 @@ preconditions: phase == CodeReviewFinalPending, current_owner == claude
    `last_head_sha`.
 
 ## Actions
-1. Pre-send harness (no reset — Claude pushed at `review_local`): `git cat-file`
-   check; re-run gates.
+1. Pushed-head proof only (no reset and do NOT re-run gates): verify
+   `git cat-file -e <last_head_sha>^{commit}`, clean worktree,
+   `git rev-parse HEAD == <last_head_sha>`, and local HEAD matches the pushed
+   upstream head (`@{u}`, or `refs/remotes/origin/<branch>` if no upstream is
+   configured). If any proof check fails, do not run tests; return a blocker so
+   the orchestrator can triage branch drift.
 2. Draft the PR title (<70 chars) + body (summary + test plan from task_list +
-   gate results). `add_drawer(wing="ironrace-memory", room="collab-drafts",
+   prior gate evidence / pushed-head proof). `add_drawer(wing="ironrace-memory", room="collab-drafts",
    content=<JSON string {"title":"<title>","body":"<body>"}>)`; return its
    `drawer_id`. Do NOT open the PR — the orchestrator dispatches
    `collab-turn-submit.md` **directly** (no user-approval gate at this phase)

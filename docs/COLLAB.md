@@ -993,12 +993,18 @@ before each coding-active `collab_send`:
   implementer searches those checkpoints by `session_id` before doing
   work and resumes from the first unfinished task instead of relying on
   transcript context.
-- **Local gates** before every Claude-owned coding turn
-  (`implementation_done` in Claude-implementer mode, `review_local`,
-  `final_review`): `cargo fmt --check`, `cargo clippy -D warnings`,
-  `cargo test --workspace`. In Codex-implementer mode, Codex runs its own
-  gates before sending `implementation_done`. Any failure surfaces as
-  `failure_report`; don't hide it.
+- **Local gates** before Claude-owned code-changing turns
+  (`implementation_done` in Claude-implementer mode and `review_local`):
+  `cargo fmt --check`, `cargo clippy -D warnings`, `cargo test --workspace`.
+  In Codex-implementer mode, Codex runs its own gates before sending
+  `implementation_done`. Any failure surfaces as `failure_report`; don't hide
+  it.
+- **Pushed-head proof** during `final_review`: the final-review compose worker
+  does not re-run gates. It verifies a clean worktree, `HEAD == last_head_sha`,
+  and local HEAD equal to the pushed upstream/origin branch head. If that proof
+  fails, the worker blocks for branch-drift triage instead of burning another
+  full gate run. The successful push from `review_local` is the gate evidence
+  for this exact HEAD.
 - **Review + fix tooling** during Codex's `review_fix_global`:
   `/pr-review-toolkit:review-pr` runs as the final Codex review pass
   over the raw post-implementation diff, alongside the approved Superpowers
@@ -1037,11 +1043,11 @@ before each coding-active `collab_send`:
   when `task_list` is still unset. Both Codex's `review_fix_global` push
   and Claude's `review_local` audit-push must descend from the prior
   `last_head_sha`.
-- **PR creation** during `final_review`: Claude resolves a base branch from
-  the recorded `base_sha` (preferring `origin/main`, then `origin/master`, then
-  `origin/trunk` when they contain that commit), runs `gh pr create --base
-  <base_branch> ...`, and sends the URL inline with the `final_review` event.
-  There is no separate `pr_opened` turn.
+- **PR creation** during `final_review`: after pushed-head proof passes,
+  Claude resolves a base branch from the recorded `base_sha` (preferring
+  `origin/main`, then `origin/master`, then `origin/trunk` when they contain
+  that commit), runs `gh pr create --base <base_branch> ...`, and sends the URL
+  inline with the `final_review` event. There is no separate `pr_opened` turn.
 - **Codex must not create or check for PRs.** Codex never calls `gh pr
   create`, `gh pr list`, `git ls-remote refs/pull/*`, or any other
   PR-related GitHub API operation during any of its phases. PR creation
@@ -1219,7 +1225,7 @@ Phase → action (v3):
 | `CodeImplementPending` (implementer=codex) | dispatch Codex via bg-exec; poll | one-shot bg-exec: search implementation checkpoints, resume/run `subagent-driven-development`, checkpoint every task boundary, emit `implementation_done{head_sha}`, exit |
 | `CodeReviewFixGlobalPending` | dispatch Codex via bg-exec; poll | one-shot bg-exec: run `/pr-review-toolkit:review-pr` on the raw post-implementation diff, partition confirmed branch-level issues, fan out independent fix subagents in temporary worktrees on unique throwaway branches, merge/cherry-pick fixes back, send `review_fix_global`, exit |
 | `CodeReviewLocalPending` | dispatch `collab-turn-review-local.md`; worker runs `/ultrareview-local`, partitions confirmed CRITICAL/HIGH/MEDIUM findings, fans out independent fix subagents in temporary worktrees on unique throwaway branches, merges/cherry-picks fixes back, and sends `review_local` | wait |
-| `CodeReviewFinalPending` | dispatch `collab-turn-final-review.md` compose worker, then dispatch `collab-turn-submit.md` **directly** (no gate) to `gh pr create` (ready PR) and send `final_review{pr_url}` | wait |
+| `CodeReviewFinalPending` | dispatch `collab-turn-final-review.md` compose worker for pushed-head proof + PR body, then dispatch `collab-turn-submit.md` **directly** (no gate) to `gh pr create` (ready PR) and send `final_review{pr_url}` | wait |
 | `CodingComplete` / `CodingFailed` | exit loop | n/a |
 
 **Worktree cleanup reminder on `CodingComplete`.** The session's lifecycle

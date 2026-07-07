@@ -40,6 +40,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`/collab` final review no longer re-runs the full gate suite after a
+  successful push.** `CodeReviewFinalPending` now performs a cheap
+  pushed-head proof (clean worktree, `HEAD == last_head_sha`, and local HEAD
+  equal to upstream/origin) and uses the successful `review_local` push as gate
+  evidence for that exact commit. If proof fails, the worker blocks for
+  branch-drift triage instead of burning another full lint/typecheck/test/build
+  cycle.
 - **`/collab start` no longer records `main`/`master`/`trunk` as the
   session's branch.** The `branch` field is fixed at `collab_start` time
   with no update API. Previously, if `start` ran from the default branch
