@@ -246,6 +246,7 @@ fn cli_report_json_smoke_test() {
             source: "llm_rerank".into(),
             harness: "claude".into(),
             model: Some("claude-opus-4-8".into()),
+            tool_name: None,
             session_id: None,
             collab_session_id: Some("sess-rep".into()),
             collab_phase: Some("impl".into()),

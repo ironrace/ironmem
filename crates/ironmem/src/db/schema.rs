@@ -23,11 +23,12 @@ const CODE_MAPS_SQL: &str = include_str!("../../migrations/011_code_maps.sql");
 const SYMBOL_IMPORT_GRAPH_SQL: &str = include_str!("../../migrations/012_symbol_import_graph.sql");
 const METRICS_HARNESS_CHECK_SQL: &str =
     include_str!("../../migrations/013_metrics_harness_check.sql");
+const CONTEXT_SIZE_REFS_SQL: &str = include_str!("../../migrations/014_context_size_refs.sql");
 
 /// Highest schema version a fully-migrated database reports. Bump alongside the
 /// `run_version_gated_migrations` ladder below so `ironmem doctor` can tell a
 /// behind-migration database from an up-to-date one.
-pub const LATEST_SCHEMA_VERSION: i64 = 13;
+pub const LATEST_SCHEMA_VERSION: i64 = 14;
 
 /// Database wrapper around a SQLite connection.
 ///
@@ -261,6 +262,12 @@ impl Database {
             self.conn.execute_batch(METRICS_HARNESS_CHECK_SQL)?;
         }
 
+        // v14: compact collab task-list refs and per-tool MCP response
+        // attribution. Nullable columns preserve all pre-014 rows.
+        if current_version < 14 {
+            self.conn.execute_batch(CONTEXT_SIZE_REFS_SQL)?;
+        }
+
         Ok(())
     }
 
@@ -425,7 +432,7 @@ mod tests {
         // fully-migrated database reports — doctor compares against it.
         let db = Database::open_in_memory().unwrap();
         assert_eq!(LATEST_SCHEMA_VERSION, db.schema_version().unwrap());
-        assert_eq!(LATEST_SCHEMA_VERSION, 13);
+        assert_eq!(LATEST_SCHEMA_VERSION, 14);
     }
 
     #[test]
@@ -678,7 +685,7 @@ mod tests {
     #[test]
     fn test_fresh_migrate_reaches_head_with_all_tables() {
         let db = Database::open_in_memory().unwrap();
-        assert_eq!(schema_version_of(&db), 13);
+        assert_eq!(schema_version_of(&db), LATEST_SCHEMA_VERSION);
         for t in METRICS_TABLES {
             assert!(table_exists(&db, t), "missing table {t}");
         }
@@ -696,7 +703,7 @@ mod tests {
             assert!(!table_exists(&db, t), "table {t} should not exist at v7");
         }
         db.migrate().unwrap();
-        assert_eq!(schema_version_of(&db), 13);
+        assert_eq!(schema_version_of(&db), LATEST_SCHEMA_VERSION);
         for t in METRICS_TABLES {
             assert!(table_exists(&db, t), "missing table {t} after upgrade");
         }
@@ -707,7 +714,7 @@ mod tests {
         let db = Database::open_in_memory().unwrap();
         db.migrate().unwrap();
         db.migrate().unwrap();
-        assert_eq!(schema_version_of(&db), 13);
+        assert_eq!(schema_version_of(&db), LATEST_SCHEMA_VERSION);
     }
 
     // ---- Migration 009 (plan-by-reference drawer-id columns) coverage ----
@@ -717,7 +724,7 @@ mod tests {
     #[test]
     fn test_fresh_migrate_reaches_v9_with_plan_drawer_columns() {
         let db = Database::open_in_memory().unwrap();
-        assert_eq!(schema_version_of(&db), 13);
+        assert_eq!(schema_version_of(&db), LATEST_SCHEMA_VERSION);
         for c in PLAN_DRAWER_COLUMNS {
             assert!(
                 column_exists(&db, "collab_sessions", c),
@@ -737,7 +744,7 @@ mod tests {
             );
         }
         db.migrate().unwrap();
-        assert_eq!(schema_version_of(&db), 13);
+        assert_eq!(schema_version_of(&db), LATEST_SCHEMA_VERSION);
         for c in PLAN_DRAWER_COLUMNS {
             assert!(
                 column_exists(&db, "collab_sessions", c),
@@ -771,7 +778,7 @@ mod tests {
             "lease table should not exist at v9"
         );
         db.migrate().unwrap();
-        assert_eq!(schema_version_of(&db), 13);
+        assert_eq!(schema_version_of(&db), LATEST_SCHEMA_VERSION);
         assert!(
             table_exists(&db, "collab_actor_generations"),
             "missing collab_actor_generations after upgrade"
@@ -846,7 +853,7 @@ mod tests {
     #[test]
     fn test_fresh_migrate_reaches_v11_tables() {
         let db = Database::open_in_memory().unwrap();
-        assert_eq!(schema_version_of(&db), 13);
+        assert_eq!(schema_version_of(&db), LATEST_SCHEMA_VERSION);
         assert!(table_exists(&db, "code_maps"), "code_maps table must exist");
     }
 
@@ -867,7 +874,7 @@ mod tests {
             );
         }
         db.migrate().unwrap();
-        assert_eq!(schema_version_of(&db), 13);
+        assert_eq!(schema_version_of(&db), LATEST_SCHEMA_VERSION);
         assert!(
             table_exists(&db, "code_maps"),
             "code_maps must exist after upgrade to v11+"
@@ -897,7 +904,7 @@ mod tests {
             .unwrap();
 
         db.migrate().unwrap();
-        assert_eq!(schema_version_of(&db), 13);
+        assert_eq!(schema_version_of(&db), LATEST_SCHEMA_VERSION);
 
         // The pre-existing row must read back with the three new columns NULL.
         let (map_status, turn_id, area): (Option<String>, Option<String>, Option<String>) = db
@@ -919,7 +926,7 @@ mod tests {
         let db = Database::open_in_memory().unwrap();
         db.migrate().unwrap();
         db.migrate().unwrap();
-        assert_eq!(schema_version_of(&db), 13);
+        assert_eq!(schema_version_of(&db), LATEST_SCHEMA_VERSION);
     }
 
     // ---- Migration 012 (symbol/import graph tables) ----
@@ -934,7 +941,7 @@ mod tests {
     #[test]
     fn test_fresh_migrate_reaches_v12() {
         let db = Database::open_in_memory().unwrap();
-        assert_eq!(schema_version_of(&db), 13);
+        assert_eq!(schema_version_of(&db), LATEST_SCHEMA_VERSION);
         for t in SYMBOL_GRAPH_TABLES {
             assert!(table_exists(&db, t), "missing table {t} at v12");
         }
@@ -956,7 +963,7 @@ mod tests {
             assert!(!table_exists(&db, t), "table {t} should not exist at v11");
         }
         db.migrate().unwrap();
-        assert_eq!(schema_version_of(&db), 13);
+        assert_eq!(schema_version_of(&db), LATEST_SCHEMA_VERSION);
         for t in SYMBOL_GRAPH_TABLES {
             assert!(
                 table_exists(&db, t),
@@ -970,7 +977,7 @@ mod tests {
         let db = Database::open_in_memory().unwrap();
         db.migrate().unwrap();
         db.migrate().unwrap();
-        assert_eq!(schema_version_of(&db), 13);
+        assert_eq!(schema_version_of(&db), LATEST_SCHEMA_VERSION);
     }
 
     // ---- Migration 013 (relax metrics harness CHECK to registry slug) ----
@@ -1042,9 +1049,9 @@ mod tests {
             )
             .unwrap();
 
-        // Run the v13 migration.
+        // Run the remaining migrations.
         db.migrate().unwrap();
-        assert_eq!(schema_version_of(&db), 13);
+        assert_eq!(schema_version_of(&db), LATEST_SCHEMA_VERSION);
 
         // Verify token_usage rows are preserved byte-for-byte.
         let tu_rows: Vec<(String, String, i64, i64)> = {
@@ -1098,7 +1105,7 @@ mod tests {
     #[test]
     fn test_v13_accepts_synthetic_third_harness_ids() {
         let db = Database::open_in_memory().unwrap();
-        assert_eq!(schema_version_of(&db), 13);
+        assert_eq!(schema_version_of(&db), LATEST_SCHEMA_VERSION);
 
         for harness in &["gemini", "grok-2", "grok-ai", "grok_ai", "copilot4"] {
             db.conn
@@ -1132,7 +1139,7 @@ mod tests {
     #[test]
     fn test_v13_rejects_invalid_harness_ids() {
         let db = Database::open_in_memory().unwrap();
-        assert_eq!(schema_version_of(&db), 13);
+        assert_eq!(schema_version_of(&db), LATEST_SCHEMA_VERSION);
 
         // These must all be rejected by the relaxed CHECK.
         let invalid: &[&str] = &[
@@ -1179,23 +1186,95 @@ mod tests {
     }
 
     #[test]
-    fn test_fresh_migrate_reaches_v13() {
+    fn test_fresh_migrate_reaches_v14() {
         let db = Database::open_in_memory().unwrap();
-        assert_eq!(schema_version_of(&db), 13);
+        assert_eq!(schema_version_of(&db), LATEST_SCHEMA_VERSION);
         // All three rebuilt tables and their indexes must still exist.
         for t in ["token_usage", "occupancy_samples", "session_summary"] {
-            assert!(table_exists(&db, t), "missing table {t} at v13");
+            assert!(table_exists(&db, t), "missing table {t} at v14");
         }
         assert!(index_exists(&db, "idx_token_usage_task_ts"));
         assert!(index_exists(&db, "idx_token_usage_collab_phase"));
+        assert!(index_exists(&db, "idx_token_usage_mcp_tool"));
         assert!(index_exists(&db, "idx_occupancy_session_ts"));
+        assert!(column_exists(&db, "collab_sessions", "task_list_drawer_id"));
+        assert!(column_exists(&db, "token_usage", "tool_name"));
     }
 
     #[test]
-    fn test_migrate_twice_idempotent_v13() {
+    fn test_migrate_twice_idempotent_v14() {
         let db = Database::open_in_memory().unwrap();
         db.migrate().unwrap();
         db.migrate().unwrap();
+        assert_eq!(schema_version_of(&db), LATEST_SCHEMA_VERSION);
+    }
+
+    // ---- Migration 014 (compact task-list refs + tool-name metrics) ----
+
+    /// Build a connection migrated to exactly v13 (no task-list refs/tool-name
+    /// attribution yet) by replaying migrations 001-013 directly.
+    fn open_at_v13() -> Database {
+        let db = open_at_v12();
+        db.conn.execute_batch(METRICS_HARNESS_CHECK_SQL).unwrap();
+        db
+    }
+
+    #[test]
+    fn test_v13_to_v14_adds_context_size_columns_and_preserves_rows() {
+        let db = open_at_v13();
         assert_eq!(schema_version_of(&db), 13);
+        assert!(
+            !column_exists(&db, "collab_sessions", "task_list_drawer_id"),
+            "task_list_drawer_id should not exist at v13"
+        );
+        assert!(
+            !column_exists(&db, "token_usage", "tool_name"),
+            "token_usage.tool_name should not exist at v13"
+        );
+
+        crate::collab::queue::create_session(
+            &db.conn,
+            "legacy-v13-session",
+            "/repo",
+            "main",
+            Some("legacy task"),
+            crate::collab::Agent::Claude,
+        )
+        .unwrap();
+        db.conn
+            .execute(
+                "INSERT INTO token_usage
+                    (ts, source, harness, input_tokens, output_tokens,
+                     cache_creation_input_tokens, cache_read_input_tokens,
+                     estimated, chars)
+                 VALUES ('2026-07-01T00:00:00Z', 'mcp_response', 'claude',
+                         0, 40, 0, 0, 1, 160)",
+                [],
+            )
+            .unwrap();
+
+        db.migrate().unwrap();
+        assert_eq!(schema_version_of(&db), LATEST_SCHEMA_VERSION);
+        assert!(column_exists(&db, "collab_sessions", "task_list_drawer_id"));
+        assert!(column_exists(&db, "token_usage", "tool_name"));
+        assert!(index_exists(&db, "idx_token_usage_mcp_tool"));
+
+        let session = crate::collab::queue::load_session(&db.conn, "legacy-v13-session").unwrap();
+        assert!(
+            session.task_list_drawer_id.is_none(),
+            "legacy sessions backfill task_list_drawer_id as NULL"
+        );
+        let tool_name: Option<String> = db
+            .conn
+            .query_row(
+                "SELECT tool_name FROM token_usage WHERE ts = '2026-07-01T00:00:00Z'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(
+            tool_name.is_none(),
+            "legacy metrics rows backfill NULL tool_name"
+        );
     }
 }

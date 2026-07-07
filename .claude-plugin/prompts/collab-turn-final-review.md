@@ -13,8 +13,13 @@ preconditions: phase == CodeReviewFinalPending, current_owner == claude
 > paste the PR artifact.
 
 ## State discovery
-1. `collab_status(session_id=$SESSION_ID, verbose:true)`; read `task_list`,
+1. `collab_status(session_id=$SESSION_ID)`; read `task_list_ref`,
    `last_head_sha`.
+2. When composing the PR body, load task details by reference:
+   `get_drawer(id=<task_list_ref.drawer_id>)`. If `task_list_ref.drawer_id` is
+   null on a legacy session, call
+   `collab_status(session_id=$SESSION_ID, include_task_list:true)` and use the
+   returned `task_list`.
 
 ## Actions
 1. Pushed-head proof only (no reset and do NOT re-run gates): verify

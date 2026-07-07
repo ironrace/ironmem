@@ -61,6 +61,7 @@ fn fixture() -> Fixture {
             source: "transcript".to_string(),
             harness: "claude".to_string(),
             model: Some("claude-opus-4-8".to_string()),
+            tool_name: None,
             session_id: None,
             collab_session_id: None,
             collab_phase: Some("impl".to_string()),

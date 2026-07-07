@@ -589,6 +589,7 @@ mod tests {
             source: "mcp_response".into(),
             harness: "gemini".into(),
             model: None,
+            tool_name: None,
             session_id: None,
             collab_session_id: None,
             collab_phase: None,

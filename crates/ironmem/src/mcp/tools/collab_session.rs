@@ -14,7 +14,8 @@ use super::collab_events::{
     build_collab_event, failure_report_is_off_turn_admissible, parse_final_payload,
 };
 use super::shared::{
-    collab_counterpart, require_agent, require_implementer, require_str, MAX_COLLAB_CONTENT_CHARS,
+    collab_counterpart, require_agent, require_implementer, require_str, sha256_hex,
+    MAX_COLLAB_CONTENT_CHARS,
 };
 
 /// Wing/room under which accepted plan bodies are filed as drawers. Runtime
@@ -23,6 +24,7 @@ use super::shared::{
 /// their content.
 const COLLAB_PLAN_WING: &str = "ironrace-memory";
 const COLLAB_PLAN_ROOM: &str = "collab-plans";
+const COLLAB_TASK_LIST_ROOM: &str = "collab-task-lists";
 
 pub(super) fn collab_error_to_memory_error(error: CollabError) -> MemoryError {
     MemoryError::Validation(error.to_string())
@@ -71,6 +73,39 @@ fn store_collab_plan_drawer(
     Ok(id)
 }
 
+/// Store the accepted, canonicalized task-list JSON as a drawer. Status
+/// responses can then return a compact `task_list_ref` while flows that need the
+/// full checklist can dereference the id deliberately.
+fn store_collab_task_list_drawer(
+    tx: &rusqlite::Transaction<'_>,
+    session_id: &str,
+    content: &str,
+) -> Result<String, MemoryError> {
+    use ironrace_embed::embedder::EMBED_DIM;
+    let id = crate::db::drawers::generate_id(content, COLLAB_PLAN_WING, COLLAB_TASK_LIST_ROOM);
+    let zero = vec![0.0f32; EMBED_DIM];
+    crate::db::schema::Database::insert_drawer_tx(
+        tx,
+        &id,
+        content,
+        &zero,
+        COLLAB_PLAN_WING,
+        COLLAB_TASK_LIST_ROOM,
+        &format!("collab:{session_id}:task_list"),
+        "collab",
+    )?;
+    Ok(id)
+}
+
+fn task_list_ref_json(drawer_id: Option<&str>, body: Option<&str>) -> Option<Value> {
+    let body = body?;
+    Some(json!({
+        "drawer_id": drawer_id,
+        "hash": sha256_hex(body),
+        "first_200_chars": body.chars().take(200).collect::<String>(),
+    }))
+}
+
 pub(super) fn session_record_json(record: &SessionRecord) -> Value {
     json!({
         "id": record.session.id.as_str(),
@@ -87,7 +122,10 @@ pub(super) fn session_record_json(record: &SessionRecord) -> Value {
         "final_plan_drawer_id": record.session.final_plan_drawer_id.as_deref(),
         "codex_review_verdict": record.session.codex_review_verdict.as_deref(),
         "review_round": record.session.review_round,
-        "task_list": record.session.task_list.as_deref(),
+        "task_list_ref": task_list_ref_json(
+            record.session.task_list_drawer_id.as_deref(),
+            record.session.task_list.as_deref(),
+        ),
         "tasks_count": record.session.tasks_count(),
         // `plan_file_path` is parsed back out of the canonicalized
         // `task_list` JSON so consumers (notably the Codex prompt) can
@@ -658,6 +696,11 @@ pub(super) fn handle_collab_send(app: &App, args: &Value) -> Result<Value, Memor
         } else if topic == "final" {
             session.final_plan_drawer_id =
                 Some(store_collab_plan_drawer(tx, session_id, topic, content)?);
+        } else if topic == "task_list" {
+            if let Some(task_list) = session.task_list.as_deref() {
+                session.task_list_drawer_id =
+                    Some(store_collab_task_list_drawer(tx, session_id, task_list)?);
+            }
         }
         // Snapshot the post-event pr_url so the lifecycle writer can stamp it
         // on CodingComplete without an extra DB round-trip.
@@ -945,6 +988,19 @@ pub(super) fn handle_collab_status(app: &App, args: &Value) -> Result<Value, Mem
         .get("verbose")
         .and_then(Value::as_bool)
         .unwrap_or(false);
+    let include_task_list = args
+        .get("include_task_list")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    if include_task_list {
+        status["task_list"] = record
+            .session
+            .task_list
+            .as_deref()
+            .map_or(Value::Null, |task_list| {
+                Value::String(task_list.to_string())
+            });
+    }
     render_plan(
         &app.db,
         &mut status,
@@ -2087,6 +2143,79 @@ mod tests {
         assert!(
             !serde_json::to_string(&status).unwrap().contains(&big),
             "full final body must not appear anywhere in default status"
+        );
+    }
+
+    #[test]
+    fn status_default_returns_compact_task_list_ref_not_body() {
+        let app = test_app();
+        let sid = start_session(&app);
+        let final_hash = drive_to_plan_locked(&app, &sid);
+        let big_title = "TASK-LIST-BODY-SHOULD-NOT-INLINE".repeat(200);
+        let task_list = json!({
+            "plan_hash": final_hash,
+            "base_sha": "base",
+            "head_sha": "base",
+            "tasks": [{
+                "id": 1,
+                "title": big_title,
+                "acceptance": ["done"]
+            }]
+        })
+        .to_string();
+        send(&app, &sid, "claude", "task_list", &task_list);
+
+        let status = handle_collab_status(&app, &json!({ "session_id": sid })).unwrap();
+        let task_ref = &status["task_list_ref"];
+        assert!(task_ref.is_object(), "task_list_ref must be an object");
+        let drawer_id = task_ref["drawer_id"]
+            .as_str()
+            .expect("new sessions must have a task_list drawer id");
+        assert_eq!(drawer_id.len(), 32);
+        assert!(task_ref["hash"].is_string());
+        assert_eq!(status["tasks_count"].as_u64(), Some(1));
+        assert!(
+            status.get("task_list").is_none(),
+            "full task_list body must be absent by default"
+        );
+        assert!(
+            !serde_json::to_string(&status).unwrap().contains(&big_title),
+            "full task_list body must not appear in default status"
+        );
+
+        let drawer = app.db.get_drawer(drawer_id).unwrap().unwrap();
+        assert_eq!(drawer.room, "collab-task-lists");
+        assert_eq!(drawer.content, task_list);
+    }
+
+    #[test]
+    fn status_include_task_list_returns_full_task_list_body() {
+        let app = test_app();
+        let sid = start_session(&app);
+        let final_hash = drive_to_plan_locked(&app, &sid);
+        let task_list = json!({
+            "plan_hash": final_hash,
+            "base_sha": "base",
+            "head_sha": "base",
+            "tasks": [{
+                "id": 1,
+                "title": "task title",
+                "acceptance": ["done"]
+            }]
+        })
+        .to_string();
+        send(&app, &sid, "claude", "task_list", &task_list);
+
+        let status = handle_collab_status(
+            &app,
+            &json!({ "session_id": sid, "include_task_list": true }),
+        )
+        .unwrap();
+
+        assert_eq!(status["task_list"].as_str(), Some(task_list.as_str()));
+        assert!(
+            status["task_list_ref"].is_object(),
+            "full opt-in must still include compact ref"
         );
     }
 

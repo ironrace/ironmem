@@ -846,8 +846,14 @@ existing §10 Phase-5 `exploration` aggregate plus two repeated-context indicato
   value; the **text** renderer withholds it (shows `delta n/a`) when either
   verdict bucket is empty, since a one-sided sample yields no comparison.
 - `mcp_response` (object|null) — repeated-context indicator over all
-  `source='mcp_response'` rows: `{ row_count, total_output_tokens, mean_output_tokens }`.
-  `null` when none recorded.
+  `source='mcp_response'` rows:
+  `{ row_count, total_output_tokens, mean_output_tokens, top_tools }`. `top_tools`
+  is a ranked array of up to 10 groups
+  `{ collab_session_id, tool_name, row_count, total_chars, total_output_tokens, mean_output_tokens }`,
+  grouped by collab session and MCP tool. `collab_session_id` is `null` for
+  non-collab traffic; `tool_name` is `null` for protocol-level responses such
+  as `initialize`/`tools/list` and for pre-014 rows. `mcp_response` is `null`
+  when no MCP response rows were recorded.
 - `transcript_coverage` (object|null) — `{ turn_count, total_tokens }` over
   `source='transcript'` rows. `null` when none recorded.
 
@@ -877,6 +883,22 @@ assembly `report/mod.rs::build_value_summary`; rendering
 `report/render.rs::render_value_summary`. Tests: unit (`report/mod.rs`,
 `report/render.rs`, `db/metrics.rs`) + integration JSON contract
 (`tests/report_golden.rs`).
+
+### 2026-07-07 — migration 014: MCP tool attribution for repeated-context sizing
+
+**Schema changes (migration 014):**
+- `token_usage.tool_name TEXT` is nullable. The MCP server writes it for
+  `tools/call` responses; non-tool protocol responses and historical rows keep
+  NULL.
+- `collab_sessions.task_list_drawer_id TEXT` is nullable and belongs to the
+  collab protocol contract (see `docs/COLLAB.md`), not token accounting.
+
+**Reporting change:** `report_mcp_response_sizing()` still aggregates all
+`source='mcp_response'` rows for the existing row count / total / mean fields,
+and additionally returns `top_tools` grouped by `(collab_session_id, tool_name)`
+so expensive repeated-context contributors can be identified before deeper
+optimization work. This is additive; the token unit and estimation rule remain
+the response-size proxy `ceil(chars/4)`.
 
 ### 2026-06-30 — issue #95/#96: baseline gate counts measured tasks, not merged tasks (clarifies §11.5)
 

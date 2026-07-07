@@ -27,6 +27,10 @@ pub struct CollabSession {
     // tasks in a single Claude-driven phase) but remain as columns to avoid
     // disturbing the wire format.
     pub task_list: Option<String>,
+    /// Deterministic 32-char drawer id for the accepted task-list JSON. NULL on
+    /// pre-014 sessions, which still have `task_list` and can be rendered as
+    /// legacy compact refs without a dereferenceable drawer id.
+    pub task_list_drawer_id: Option<String>,
     pub task_review_round: u8,
     pub global_review_round: u8,
     pub base_sha: Option<String>,
@@ -69,6 +73,7 @@ impl CollabSession {
             codex_review_verdict: None,
             review_round: 0,
             task_list: None,
+            task_list_drawer_id: None,
             task_review_round: 0,
             global_review_round: 0,
             base_sha: None,
@@ -110,6 +115,7 @@ impl CollabSession {
             codex_review_verdict: None,
             review_round: 0,
             task_list: None,
+            task_list_drawer_id: None,
             task_review_round: 0,
             global_review_round: 0,
             base_sha: Some(base_sha.into()),

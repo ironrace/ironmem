@@ -30,6 +30,7 @@ fn tok(
         source: "llm_rerank".into(),
         harness: harness.into(),
         model: Some(model.into()),
+        tool_name: None,
         session_id: None,
         collab_session_id: Some(collab.into()),
         collab_phase: Some(phase.into()),
@@ -529,6 +530,7 @@ fn headline_cost_attaches_when_tokens_keyed_by_task_tag_not_collab_id() {
         source: "llm_rerank".into(),
         harness: "claude".into(),
         model: Some("claude-opus-4-8".into()),
+        tool_name: None,
         session_id: None,
         collab_session_id: None, // keyed by task_tag only
         collab_phase: Some("impl".into()),
@@ -880,6 +882,7 @@ fn mcp_turn(turn_id: &str, out: i64, status: ironmem::db::MapStatus) -> NewToken
         source: "mcp_response".into(),
         harness: "claude".into(),
         model: None,
+        tool_name: None,
         session_id: None,
         collab_session_id: None,
         collab_phase: None,

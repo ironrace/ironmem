@@ -13,8 +13,8 @@ preconditions: phase == CodeImplementPending, current_owner == claude, implement
 > paste diffs, task notes, or self-critique.
 
 ## State discovery
-1. `collab_status(session_id=$SESSION_ID, verbose:true)`; read `plan_file_path`,
-   `task_list`, `implementer`.
+1. `collab_status(session_id=$SESSION_ID)`; read `plan_file_path`,
+   `task_list_ref`, `tasks_count`, `implementer`.
 2. Search `wing="ironrace-memory" room="collab-checkpoints"` for `$SESSION_ID`;
    resume at the first unfinished task; scan the diff vs acceptance criteria.
 
@@ -22,15 +22,17 @@ preconditions: phase == CodeImplementPending, current_owner == claude, implement
 
 Before touching any code in a task, call:
 ```
-code_map_load(repo=<repo_path>, area=<touched_area>, turn_id=<turn_id>)
+code_map_status(repo=<repo_path>, area=<touched_area>)
 ```
 Interpret the response status and act accordingly:
 
-- **`Fresh`** — the map is current. Use it as a WHERE-to-look pointer when
-  deciding which files to open during exploration. Do NOT skip reading the
-  actual files; the map tells you where to look, not what the code says.
-- **`Stale`** — the map exists but `changed_files` have been modified since
-  it was built. Re-read only the files listed in `changed_files`, then call
+- **`Fresh`** — the map is current. If you need the map body as a WHERE-to-look
+  pointer, call `code_map_load(repo=<repo_path>, area=<touched_area>,
+  turn_id=<turn_id>)`; otherwise open the relevant source files directly. Do
+  NOT skip reading the actual files; the map tells you where to look, not what
+  the code says.
+- **`Stale`** — the map exists but source files changed. Do not call
+  `code_map_load` for the stale body; re-scout the area from source, then call
   `code_map_write` to refresh the map before proceeding.
 - **`RescoutRequired` or absent** — no map exists for this area. Scout the
   area (read relevant files, trace call paths, identify key entry points),
