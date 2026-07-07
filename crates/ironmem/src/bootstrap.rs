@@ -33,7 +33,7 @@ pub struct BootstrapReport {
     pub workspace_root: Option<String>,
 }
 
-pub const MEMORY_PROTOCOL: &str = "Before answering questions about prior work, decisions, project history, or people, check search or the KG tools first. After important progress or decisions, write durable summaries back into memory.";
+pub const MEMORY_PROTOCOL: &str = "Before answering questions about prior work, decisions, project history, or people, check search or KG tools first. Write important durable decisions back to memory. For mutable current task/project context, use add_drawer with logical_key so the latest state overwrites stale copies instead of accumulating forever. Treat collab-plans, collab-task-lists, and collab-checkpoints as operational artifacts; prefer compact durable summaries for long-term recall and prune stale operational drawers with ironmem memory gc --dry-run before --apply.";
 
 /// Write the current binary version to `state_dir/server.version`.
 /// If the version changed since last run, log an upgrade notice to stderr.

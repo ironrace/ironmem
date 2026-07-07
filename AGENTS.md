@@ -22,6 +22,8 @@ Use the memory tools this way:
 1. At session start, call `status` to load the memory overview and check whether memory is still warming up.
 2. Before answering questions about prior work, decisions, project history, people, or earlier sessions, call `search` or the knowledge-graph tools first.
 3. After important progress or decisions, write a durable summary back into memory.
+4. For mutable current task or project context, write with `add_drawer` plus a stable `logical_key` so the newest state overwrites the old drawer instead of creating stale copies.
+5. Treat `collab-plans`, `collab-task-lists`, and `collab-checkpoints` as operational artifacts, not permanent knowledge. Prefer compact durable summaries for long-term recall and use `ironmem memory gc --dry-run` before any `--apply` pruning.
 
 Preferred tools:
 
@@ -29,6 +31,7 @@ Preferred tools:
 - Recall: `search`
 - Structured facts: `kg_query`, `kg_stats`, related KG tools
 - Durable notes: `add_drawer`, diary tools, or other write tools that fit the context
+- Replaceable current context: `add_drawer` with `logical_key`
 
 ## Warmup Rule
 

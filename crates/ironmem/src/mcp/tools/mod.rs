@@ -66,13 +66,17 @@ pub fn tool_definitions(app: &App) -> Vec<Value> {
         }),
         json!({
             "name": "add_drawer",
-            "description": "File verbatim content into a wing/room",
+            "description": "File verbatim content into a wing/room. Omit logical_key for append/content-addressed durable notes; pass logical_key to overwrite a current-context drawer for that wing/room instead of accumulating stale copies.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "content": { "type": "string" },
                     "wing": { "type": "string" },
-                    "room": { "type": "string", "default": "general" }
+                    "room": { "type": "string", "default": "general" },
+                    "logical_key": {
+                        "type": "string",
+                        "description": "Optional stable key for replaceable current context, e.g. 'current-context' or 'task-state'. Same wing/room/logical_key rewrites the same drawer id."
+                    }
                 },
                 "required": ["content", "wing"]
             }
