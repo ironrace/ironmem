@@ -568,20 +568,31 @@ fn run_user_prompt_submit(
         return response;
     }
 
-    if let Some(prompt) = input.get("prompt").and_then(|v| v.as_str()) {
-        if !prompt.trim().is_empty() {
-            if let Some(ctx) = search_prompt_context(&config.db_path, prompt, start, budget) {
-                response.hook_specific_output = Some(HookSpecificOutput::user_prompt_submit(ctx));
-            }
-        }
-    }
-
     // Read the transcript tail once and parse usage here in the caller, so both
     // the occupancy notice (Task 3 / R11) and the metrics DB sample share the
     // same parsed result with no second file read.
     let usage = transcript_path
         .and_then(read_transcript_tail)
         .and_then(|raw| crate::metrics::extract_last_assistant_usage(&raw));
+
+    let should_sample_occupancy = crate::search::tunables::metrics_enabled()
+        && prompt_occupancy_sample_allowed(harness, session_id, usage);
+    let recall_budget = if should_sample_occupancy {
+        budget
+            .checked_sub(Duration::from_millis(PROMPT_HOOK_OCCUPANCY_RESERVE_MS))
+            .unwrap_or_default()
+    } else {
+        budget
+    };
+
+    if let Some(prompt) = input.get("prompt").and_then(|v| v.as_str()) {
+        if !prompt.trim().is_empty() && !recall_budget.is_zero() {
+            if let Some(ctx) = search_prompt_context(&config.db_path, prompt, start, recall_budget)
+            {
+                response.hook_specific_output = Some(HookSpecificOutput::user_prompt_submit(ctx));
+            }
+        }
+    }
 
     // Occupancy notice: NOT gated by IRONMEM_METRICS (R12). This is operator
     // guidance, not telemetry — it must fire even when metrics writes are disabled.
@@ -617,8 +628,8 @@ fn run_user_prompt_submit(
     // defaults to ReadOnly, so coupling it to the content-write gate meant it
     // never banked a row in production.
     let remaining = budget.checked_sub(start.elapsed()).unwrap_or_default();
-    if remaining >= Duration::from_millis(PROMPT_HOOK_OCCUPANCY_RESERVE_MS)
-        && crate::search::tunables::metrics_enabled()
+    if should_sample_occupancy
+        && remaining >= Duration::from_millis(PROMPT_HOOK_OCCUPANCY_RESERVE_MS)
     {
         // Cap the occupancy budget at the reserve so a contended best-effort
         // sample (which blocks on `recv_timeout`/`open_with_busy_timeout` for
@@ -636,6 +647,20 @@ fn run_user_prompt_submit(
     }
 
     response
+}
+
+fn prompt_occupancy_sample_allowed(
+    harness: &str,
+    session_id: Option<&str>,
+    usage: Option<crate::metrics::Usage>,
+) -> bool {
+    let Some(session_id) = session_id else {
+        return false;
+    };
+    if session_id == "unknown" || usage.is_none() {
+        return false;
+    }
+    resolve_harness_spec(harness, crate::harness::REGISTRY).occupancy_support
 }
 
 /// Run the BM25 lookup on a worker thread joined with `recv_timeout(remaining)`,
@@ -762,6 +787,7 @@ fn sample_prompt_occupancy(
     if session_id == "unknown" {
         return;
     }
+    let Some(usage) = usage else { return };
     if budget.is_zero() {
         return;
     }
@@ -789,7 +815,7 @@ fn sample_prompt_occupancy(
             &session_id,
             workspace.as_deref(),
             event,
-            usage,
+            Some(usage),
             crate::search::tunables::context_window(),
         );
         let _ = tx.send(());
@@ -2726,7 +2752,12 @@ mod tests {
             "claude-code",
             Some("busy-1"),
             None,
-            None, // pre-parsed usage (None -> no DB sample row; DB lock still holds the test)
+            Some(crate::metrics::Usage {
+                input_tokens: 1000,
+                output_tokens: 5,
+                cache_creation_input_tokens: 0,
+                cache_read_input_tokens: 0,
+            }),
             Duration::from_millis(1),
         );
         assert!(

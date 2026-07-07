@@ -46,8 +46,14 @@ actual source code. Never trust a map entry alone for contract-level claims.
    between tasks (no per-task user gate). Write started/completed/blocked/
    batch_complete checkpoints per the `docs/COLLAB.md` checkpoint rule. STOP
    before `finishing-a-development-branch` (no PR here).
-2. Verify no PR opened behind your back:
-   `gh pr list --head $BRANCH --json number --jq 'length'` must be `0`.
+2. Verify the local boundary invariant: the skill stopped after the final
+   task's approval+commit, did not invoke `finishing-a-development-branch`,
+   and did not report running a PR-producing command. Do not query GitHub by
+   default. Run `gh pr list --head $BRANCH --json number --jq 'length'` only
+   if the controller reports boundary uncertainty or the skill output mentions
+   PR creation/`finishing-a-development-branch`; if it returns >=1, send
+   `failure_report` with
+   `coding_failure: "skill_overran_pr_boundary: <pr_number>"`.
 3. Run gates: `cargo fmt --all -- --check`,
    `cargo clippy --workspace --all-targets --all-features -- -D warnings`,
    `cargo test --workspace`.

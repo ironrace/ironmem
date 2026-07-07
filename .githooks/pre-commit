@@ -4,15 +4,4 @@ set -euo pipefail
 repo_root="$(git rev-parse --show-toplevel)"
 cd "$repo_root"
 
-echo "[pre-commit] cargo fmt --all -- --check"
-cargo fmt --all -- --check
-
-if command -v python3 >/dev/null 2>&1; then
-  echo "[pre-commit] python3 scripts/check_collab_turn_templates.py"
-  python3 scripts/check_collab_turn_templates.py
-else
-  echo "[pre-commit] WARNING: python3 not found — skipping collab template lint (run scripts/check_collab_turn_templates.py manually)"
-fi
-
-echo "[pre-commit] cargo clippy --workspace --all-targets --all-features -- -D warnings"
-cargo clippy --workspace --all-targets --all-features -- -D warnings
+exec python3 scripts/run_git_hook.py pre-commit

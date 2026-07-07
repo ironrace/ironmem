@@ -13,7 +13,9 @@
 use std::collections::HashMap;
 
 use crate::db::{
-    drawers::PREF_SENTINEL, knowledge_graph::KnowledgeGraph, ScoredDrawer, SearchFilters,
+    drawers::{Drawer, PREF_SENTINEL},
+    knowledge_graph::KnowledgeGraph,
+    ScoredDrawer, SearchFilters,
 };
 use crate::error::MemoryError;
 use crate::mcp::app::App;
@@ -149,6 +151,7 @@ pub fn search(
     // preference-question gold sessions (E1: ranks 6-22) appear in the foreground.
     let mut prf_expanded_hnsw_ids: Option<Vec<String>> = None;
     let mut prf_expanded_bm25_ids: Option<Vec<String>> = None;
+    let mut prf_drawer_cache: HashMap<String, Drawer> = HashMap::new();
 
     if tunables::prf_enabled()
         && merged_ids.len() >= tunables::prf_top_k()
@@ -166,6 +169,16 @@ pub fn search(
         } else {
             app.db.get_drawers_by_ids(&bg_refs)?
         };
+        prf_drawer_cache.extend(
+            fg_drawers
+                .iter()
+                .map(|(id, drawer)| (id.clone(), drawer.clone())),
+        );
+        prf_drawer_cache.extend(
+            bg_drawers
+                .iter()
+                .map(|(id, drawer)| (id.clone(), drawer.clone())),
+        );
 
         // Build query term set to exclude from expansion.
         let query_lower = sanitized.clean_query.to_lowercase();
@@ -270,13 +283,26 @@ pub fn search(
         }
     }
 
-    // Step 6: Fetch drawer metadata with filters.
-    let candidate_id_refs: Vec<&str> = merged_ids.iter().map(|s| s.as_str()).collect();
-    let drawers = app.db.get_drawers_by_ids_filtered(
-        &candidate_id_refs,
+    // Step 6: Fetch drawer metadata with filters. When PRF fetched foreground /
+    // background drawers, carry those forward to avoid repeating the same lookup.
+    // Cached drawers still must satisfy final filters because HNSW candidates are
+    // not SQL-filtered before PRF.
+    let mut drawers: HashMap<String, Drawer> = HashMap::new();
+    let mut missing_candidate_ids: Vec<&str> = Vec::new();
+    for id in &merged_ids {
+        match prf_drawer_cache.get(id) {
+            Some(drawer) if drawer_matches_filters(drawer, filters) => {
+                drawers.insert(id.clone(), drawer.clone());
+            }
+            _ => missing_candidate_ids.push(id.as_str()),
+        }
+    }
+    let fetched = app.db.get_drawers_by_ids_filtered(
+        &missing_candidate_ids,
         filters.wing.as_deref(),
         filters.room.as_deref(),
     )?;
+    drawers.extend(fetched);
 
     // Compute RRF scores — 4-way if PRF fired, 2-way otherwise.
     let rrf_scores = match (&prf_expanded_hnsw_ids, &prf_expanded_bm25_ids) {
@@ -384,6 +410,17 @@ pub fn search(
         bm25_hit_count,
         content_word_variant_fired,
     })
+}
+
+fn drawer_matches_filters(drawer: &Drawer, filters: &SearchFilters) -> bool {
+    filters
+        .wing
+        .as_deref()
+        .is_none_or(|wing| drawer.wing == wing)
+        && filters
+            .room
+            .as_deref()
+            .is_none_or(|room| drawer.room == room)
 }
 
 /// Union two HNSW result lists by max score, deduplicating by index position.

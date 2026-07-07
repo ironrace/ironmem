@@ -87,6 +87,8 @@ REQUIRED_TEMPLATE_SNIPPETS = {
     ],
     "collab-turn-final-review.md": [
         '{"title":"<title>","body":"<body>"}',
+        "do NOT re-run gates",
+        "pushed-head proof",
     ],
     "collab-turn-submit.md": [
         'parse the artifact JSON as',
@@ -233,6 +235,14 @@ def main() -> int:
     for f in FORBIDDEN_IN_COMMAND:
         if f in cmd_text:
             err(f"collab.md: forbidden legacy instruction present: {f!r}")
+    for snippet in [
+        "Skip all local gates when `phase == CodeReviewFinalPending`",
+        "pushed-head proof only (no reset, no gate rerun)",
+    ]:
+        if snippet not in cmd_text:
+            err(f"collab.md: missing final-review gate-skip contract {snippet!r}")
+    if "re-runs gates" in cmd_text:
+        err("collab.md: CodeReviewFinalPending must not re-run gates")
     # Fable allowed in collab.md only on an explicit OFF/disabled line.
     for i, line in enumerate(cmd_text.splitlines(), 1):
         if re.search(r"fable", line, re.IGNORECASE) and not re.search(
@@ -275,6 +285,8 @@ def main() -> int:
         err("docs/COLLAB.md: missing Worker-per-turn dispatch section")
     if "### Measurement gate" not in doc_text:
         err("docs/COLLAB.md: missing worker context measurement gate")
+    if "Pushed-head proof" not in doc_text:
+        err("docs/COLLAB.md: missing final-review pushed-head proof section")
     for name in EXPECTED_TEMPLATES:
         if name not in doc_text:
             err(f"docs/COLLAB.md: missing template reference {name}")

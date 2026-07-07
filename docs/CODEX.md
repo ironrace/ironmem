@@ -96,15 +96,17 @@ This repo includes tracked Git hooks so Codex, Claude Code, and manual terminal 
 Enable it once per clone:
 
 ```bash
-git config core.hooksPath .githooks
-chmod +x .githooks/pre-commit .githooks/pre-push
+bash scripts/install-git-hooks.sh
 ```
 
-The hooks run:
+The installer sets `core.hooksPath=.githooks` and writes fallback shims under
+`.git/hooks/` to catch stale local hook bodies.
 
-- `pre-commit`: `cargo fmt --all -- --check`
-- `pre-commit`: `cargo clippy --workspace --all-targets --all-features -- -D warnings`
-- `pre-push`: `cargo test --workspace`
+The hooks are diff-aware:
+
+- collab protocol/template changes run the collab template lint
+- Rust/workspace changes run fmt and clippy on commit, then workspace tests on push
+- docs/config-only changes outside those surfaces skip heavy local gates
 
 ## Manual Codex MCP Setup
 

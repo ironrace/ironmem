@@ -192,11 +192,11 @@ branch names.
      (codex-implementer)" below.
    - **`CodeReviewFixGlobalPending`** → Codex's only mandatory v3 coding
      turn (always Codex regardless of `implementer`). Under the new v3
-     order this phase runs FIRST (before Claude's `/ultrareview-local`
-     audit). Run the global review action below.
+     order this phase runs FIRST (before Claude's `review_local` audit).
+     Run the global review action below.
    - **`CodeReviewLocalPending`** → Claude's audit turn — Claude is
-     running `/ultrareview-local` against your `review_fix_global`
-     commits. Exit.
+     running full or reduced `review_local` against your
+     `review_fix_global` commits. Exit.
    - **`CodeReviewFinalPending`** → Claude's PR turn. Exit.
    - **v3 terminal** (`CodingComplete` / `CodingFailed`) → report and exit.
 
@@ -301,7 +301,7 @@ working-tree reset on the common case where Codex is already at the right SHA
 |---|---|
 | `CodeImplementPending` | Owner depends on `implementer`. If `implementer == "claude"`, this is Claude's batch turn — exit. If `implementer == "codex"`, run the batch implementation action below, resuming from ironmem checkpoints and scanning the plan/code state before editing. |
 | `CodeReviewLocalPending` | Claude's turn. Exit. |
-| `CodeReviewFixGlobalPending` | **Run pre-send harness.** This is your only mandatory v3 coding review turn and the final Codex review before Claude runs `/ultrareview-local` — invoke `/pr-review-toolkit:review-pr` against the full branch diff (`git diff <base_sha>..<last_head_sha>`) alongside the approved Superpowers task markdown at `plan_file_path` when present. Pass the collab `base_sha` and `last_head_sha` as the review target; do not let the toolkit silently substitute a different base branch. In full-flow sessions, read `plan_file_path` from the canonicalized `task_list` JSON in `collab_status`. In shortcut sessions where `task_list` is null, first search ironmem checkpoints for the same `repo_path`/`branch`, read any referenced plan, and scan the current code/diff to determine what is already complete; if no checkpoint exists, fall back to nearby Superpowers plan docs plus the branch diff. Use the toolkit as a read-only finding pass for cross-task consistency, architectural drift, missed acceptance criteria, correctness, tests, docs, security, performance, and dependency risk. Then verify findings yourself and group confirmed issues into non-overlapping fix clusters. For independent clusters, create temporary worktrees on unique throwaway branches from the same review head, dispatch fix subagents in parallel, and have each subagent own exactly one cluster. Merge/cherry-pick the resulting fix commits back onto the collab branch, resolve conflicts, run gates, commit + push. Fix overlapping/risky clusters sequentially. Send `collab_send` with `sender="codex"`, `topic="review_fix_global"`, `content=<JSON {"head_sha":"<current HEAD>"}>`. |
+| `CodeReviewFixGlobalPending` | **Run pre-send harness.** This is your only mandatory v3 coding review turn and the final Codex review before Claude's `review_local` audit (full `/ultrareview-local` unless reduced-mode criteria apply) — invoke `/pr-review-toolkit:review-pr` against the full branch diff (`git diff <base_sha>..<last_head_sha>`) alongside the approved Superpowers task markdown at `plan_file_path` when present. Pass the collab `base_sha` and `last_head_sha` as the review target; do not let the toolkit silently substitute a different base branch. In full-flow sessions, read `plan_file_path` from the canonicalized `task_list` JSON in `collab_status`. In shortcut sessions where `task_list` is null, first search ironmem checkpoints for the same `repo_path`/`branch`, read any referenced plan, and scan the current code/diff to determine what is already complete; if no checkpoint exists, fall back to nearby Superpowers plan docs plus the branch diff. Use the toolkit as a read-only finding pass for cross-task consistency, architectural drift, missed acceptance criteria, correctness, tests, docs, security, performance, and dependency risk. Then verify findings yourself and group confirmed issues into non-overlapping fix clusters. For independent clusters, create temporary worktrees on unique throwaway branches from the same review head, dispatch fix subagents in parallel, and have each subagent own exactly one cluster. Merge/cherry-pick the resulting fix commits back onto the collab branch, resolve conflicts, run gates, commit + push. Fix overlapping/risky clusters sequentially. Send `collab_send` with `sender="codex"`, `topic="review_fix_global"`, `content=<JSON {"head_sha":"<current HEAD>"}>`. |
 | `CodeReviewFinalPending` | Claude's turn. Exit. |
 
 ### Batch implementation (codex-implementer)
@@ -316,8 +316,15 @@ newest checkpoint plus the git log to choose the first unfinished task:
 resume at `next_task_id`, or at the `started` task if the last checkpoint
 stopped mid-task. Then read the plan and scan the current code/diff to
 verify what is already complete against the acceptance criteria before
-editing. If the newest checkpoint is `batch_complete`, rerun final gates
-and send `implementation_done`; do not rerun completed tasks.
+editing. If the newest checkpoint is `batch_complete`, first try to reuse
+its gate proof: require clean pushed-head proof, local
+`HEAD == checkpoint.head_sha`, `checkpoint.gates_sha == checkpoint.head_sha`,
+`checkpoint.gates_result` starts with `passed`, and
+`checkpoint.gates_commands` exactly matches the current required gate set.
+When all checks hold, send `implementation_done` without rerunning gates.
+Rerun gates only on HEAD drift, changed gate commands, failed pushed-head
+proof, or a checkpoint that lacks the new gate-proof fields. Do not rerun
+completed tasks.
 
 While you own `CodeImplementPending`, write durable checkpoints via
 `mcp__ironmem__add_drawer` with `wing="ironrace-memory"` and
@@ -348,6 +355,9 @@ commit_sha: <task commit sha|none>
 completed_task_ids: <comma-separated ids>
 next_task_id: <N|none>
 gates: <not_run|passed|failed: short reason>
+gates_sha: <HEAD sha that gates ran against|none>
+gates_commands: <exact gate commands separated by " && "|none>
+gates_result: <not_run|passed|failed: short reason>
 summary: <one concise sentence>
 resume_hint: /collab join [--implementer=<claude|codex>] <session_id>
 ```
@@ -392,7 +402,9 @@ requiring no design judgment. Skip `subagent-driven-development` entirely.
    `tasks[0].acceptance` array in `collab_status.task_list`).
 7. Commit and push per the task's commit/push instructions in the plan.
 8. Write a `status: completed` checkpoint for task 1, then write a
-   `status: batch_complete` checkpoint for the full batch.
+   `status: batch_complete` checkpoint for the full batch with
+   `gates_sha=<HEAD>`, the exact `gates_commands`, and
+   `gates_result=passed`.
 9. Send `collab_send` with `sender="codex"`, `topic="implementation_done"`,
    `content=<JSON {"head_sha":"<current HEAD after commit>"}>`. Payload
    carries ONLY `head_sha`.
@@ -439,14 +451,15 @@ is `null`/absent (or any value other than `"mechanical_direct"`).
    `failure_report` with `coding_failure: "subagent_failure: <reason>"`
    or `coding_failure: "gate_failure: <reason>"` and exit. Do not
    return control to Claude with a half-batch.
-6. On full success, write a `status: batch_complete` checkpoint, then
-   send `collab_send` with `sender="codex"`,
+6. On full success, write a `status: batch_complete` checkpoint with
+   `gates_sha=<HEAD>`, the exact `gates_commands`, and
+   `gates_result=passed`, then send `collab_send` with `sender="codex"`,
    `topic="implementation_done"`,
    `content=<JSON {"head_sha":"<current HEAD>"}>`. Payload carries
    ONLY `head_sha` — no subagent notes, no summary.
 7. Exit. The session is now `CodeReviewFixGlobalPending` with Codex as
    owner; Codex will be re-invoked for `review_fix_global`, and Claude's
-   `/ultrareview-local` audit runs after that at `CodeReviewLocalPending`.
+   `review_local` audit runs after that at `CodeReviewLocalPending`.
 
 After one successful send, exit. Claude will re-invoke `/collab join`
 via its Codex MCP tool when the session needs you again.

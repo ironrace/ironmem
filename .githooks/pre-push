@@ -4,5 +4,4 @@ set -euo pipefail
 repo_root="$(git rev-parse --show-toplevel)"
 cd "$repo_root"
 
-echo "[pre-push] cargo test --workspace"
-cargo test --workspace
+exec python3 scripts/run_git_hook.py pre-push
