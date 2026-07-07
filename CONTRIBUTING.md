@@ -15,18 +15,18 @@ This repo ships tracked Git hooks in `.githooks/`.
 Enable it once per clone:
 
 ```bash
-git config core.hooksPath .githooks
-chmod +x .githooks/pre-commit .githooks/pre-push
+bash scripts/install-git-hooks.sh
 ```
 
-After that:
+The installer sets `core.hooksPath=.githooks` and installs fallback shims in
+`.git/hooks/` so stale local hooks cannot silently diverge from the tracked
+ones.
 
-- every `git commit` runs:
-- `cargo fmt --all -- --check`
-- `python3 scripts/check_collab_turn_templates.py`
-- `cargo clippy --workspace --all-targets --all-features -- -D warnings`
-- every `git push` runs:
-- `cargo test --workspace`
+After that, hooks run only the gates relevant to the changed files:
+
+- collab protocol/template changes: `python3 scripts/check_collab_turn_templates.py`
+- Rust/workspace changes: `cargo fmt --all -- --check` and clippy on commit, `cargo test --workspace` on push
+- docs/config-only changes outside those surfaces: no heavy local gate
 
 ## Local Development Loop
 
@@ -35,6 +35,8 @@ From the repo root:
 ```bash
 cargo fmt --all -- --check
 python3 scripts/check_collab_turn_templates.py
+python3 scripts/test_run_git_hook.py
+python3 scripts/sync_mcp_wrappers.py --check
 python3 -m pytest tests/collab_turn_templates/
 cargo clippy --workspace --all-targets --all-features -- -D warnings
 cargo test --workspace

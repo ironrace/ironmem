@@ -75,14 +75,17 @@ This repo includes tracked Git hooks for local commits and pushes.
 Enable it once per clone:
 
 ```bash
-git config core.hooksPath .githooks
-chmod +x .githooks/pre-commit .githooks/pre-push
+bash scripts/install-git-hooks.sh
 ```
 
-The hooks run:
+The installer sets `core.hooksPath=.githooks` and writes fallback shims under
+`.git/hooks/` so a local clone cannot silently keep using stale hook bodies.
 
-- `pre-commit`: `cargo fmt --all -- --check`, `python3 scripts/check_collab_turn_templates.py`, and `cargo clippy --workspace --all-targets --all-features -- -D warnings`
-- `pre-push`: `cargo test --workspace`
+The hooks are diff-aware:
+
+- collab protocol/template changes run `python3 scripts/check_collab_turn_templates.py`
+- Rust/workspace changes run `cargo fmt --all -- --check` and clippy on commit, then `cargo test --workspace` on push
+- docs/config-only changes that do not affect those surfaces skip heavy local gates
 
 ## Quickstart: Install and Run in 60 Seconds
 
