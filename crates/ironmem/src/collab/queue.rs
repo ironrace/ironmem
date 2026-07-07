@@ -204,7 +204,7 @@ pub fn load_session_record(
                 claude_draft_hash, codex_draft_hash, canonical_plan_hash,
                 final_plan_hash, codex_review_verdict,
                 review_round, task, ended_at,
-                task_list,
+                task_list, task_list_drawer_id,
                 task_review_round, global_review_round,
                 base_sha, last_head_sha, pr_url, coding_failure,
                 canonical_plan_drawer_id, final_plan_drawer_id,
@@ -235,6 +235,7 @@ pub fn load_session_record(
                     codex_review_verdict: row.get("codex_review_verdict")?,
                     review_round,
                     task_list,
+                    task_list_drawer_id: row.get("task_list_drawer_id")?,
                     task_review_round: task_review_round_i.clamp(0, u8::MAX as i64) as u8,
                     global_review_round: global_review_round_i.clamp(0, u8::MAX as i64) as u8,
                     base_sha: row.get("base_sha")?,
@@ -292,17 +293,18 @@ pub fn save_session(conn: &Connection, session: &CollabSession) -> Result<(), Me
              codex_review_verdict = ?7,
              review_round = ?8,
              task_list = ?9,
-             task_review_round = ?10,
-             global_review_round = ?11,
-             base_sha = ?12,
-             last_head_sha = ?13,
-             pr_url = ?14,
-             coding_failure = ?15,
-             canonical_plan_drawer_id = ?16,
-             final_plan_drawer_id = ?17,
-             implementer = ?18,
+             task_list_drawer_id = ?10,
+             task_review_round = ?11,
+             global_review_round = ?12,
+             base_sha = ?13,
+             last_head_sha = ?14,
+             pr_url = ?15,
+             coding_failure = ?16,
+             canonical_plan_drawer_id = ?17,
+             final_plan_drawer_id = ?18,
+             implementer = ?19,
              updated_at = datetime('now')
-        WHERE id = ?19",
+        WHERE id = ?20",
         params![
             session.phase.to_string(),
             session.current_owner.as_str(),
@@ -313,6 +315,7 @@ pub fn save_session(conn: &Connection, session: &CollabSession) -> Result<(), Me
             session.codex_review_verdict.as_deref(),
             session.review_round as i64,
             session.task_list.as_deref(),
+            session.task_list_drawer_id.as_deref(),
             session.task_review_round as i64,
             session.global_review_round as i64,
             session.base_sha.as_deref(),
@@ -543,6 +546,8 @@ mod tests {
         include_str!("../../migrations/009_collab_plan_drawers.sql");
     const COLLAB_GENERATION_LEASE_SQL: &str =
         include_str!("../../migrations/010_collab_generation_lease.sql");
+    const COLLAB_TASK_LIST_REF_SQL: &str = "ALTER TABLE collab_sessions \
+         ADD COLUMN task_list_drawer_id TEXT";
 
     fn open() -> Connection {
         let conn = Connection::open_in_memory().unwrap();
@@ -555,6 +560,7 @@ mod tests {
         conn.execute_batch(DROP_CURRENT_TASK_INDEX_SQL).unwrap();
         conn.execute_batch(COLLAB_PLAN_DRAWERS_SQL).unwrap();
         conn.execute_batch(COLLAB_GENERATION_LEASE_SQL).unwrap();
+        conn.execute_batch(COLLAB_TASK_LIST_REF_SQL).unwrap();
         conn
     }
 

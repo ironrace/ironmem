@@ -209,6 +209,7 @@ pub(crate) fn account_mcp_response(
     db: &Database,
     chars: i64,
     harness: &str,
+    tool_name: Option<&str>,
     session_id: Option<&str>,
     ctx: &MetricsContext,
     exploration: Option<&ExplorationContext>,
@@ -219,6 +220,7 @@ pub(crate) fn account_mcp_response(
         source: "mcp_response".to_string(),
         harness: harness.to_string(),
         model: None,
+        tool_name: tool_name.map(|s| s.to_string()),
         session_id: session_id.map(|s| s.to_string()),
         collab_session_id: None,
         collab_phase: None,
@@ -391,6 +393,7 @@ mod tests {
             source: "mcp_response".into(),
             harness: "claude".into(),
             model: None,
+            tool_name: None,
             session_id: Some("sess-1".into()),
             collab_session_id: None,
             collab_phase: None,
@@ -424,7 +427,15 @@ mod tests {
             map_status: Some(crate::db::metrics::MapStatus::Hit),
         };
 
-        account_mcp_response(&db, 9, "claude", None, &ctx, Some(&exploration));
+        account_mcp_response(
+            &db,
+            9,
+            "claude",
+            Some("code_map_load"),
+            None,
+            &ctx,
+            Some(&exploration),
+        );
 
         let rows = db
             .query_token_usage(&crate::db::metrics::TokenUsageQuery::default())
@@ -432,6 +443,7 @@ mod tests {
         assert_eq!(rows.len(), 1, "exploration tags the live row, no duplicate");
         assert!(rows[0].estimated);
         assert_eq!(rows[0].chars, 9);
+        assert_eq!(rows[0].tool_name.as_deref(), Some("code_map_load"));
         assert_eq!(rows[0].output_tokens, 3);
         assert_eq!(rows[0].map_status, Some(crate::db::metrics::MapStatus::Hit));
         assert_eq!(rows[0].turn_id.as_deref(), Some("turn-1"));

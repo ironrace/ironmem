@@ -79,6 +79,9 @@ pub struct NewTokenUsage {
     pub source: String,
     pub harness: String,
     pub model: Option<String>,
+    /// MCP tool name for `source='mcp_response'` rows. Non-tool protocol
+    /// responses and pre-014 rows keep NULL.
+    pub tool_name: Option<String>,
     pub session_id: Option<String>,
     pub collab_session_id: Option<String>,
     pub collab_phase: Option<String>,
@@ -117,6 +120,7 @@ pub fn new_token_usage_from_llm(
         } else {
             Some(resp.model.clone())
         },
+        tool_name: None,
         session_id: None,
         collab_session_id: None,
         collab_phase: None,
@@ -153,6 +157,7 @@ impl NewTokenUsage {
             source: "transcript".to_string(),
             harness: harness.to_string(),
             model: row.model,
+            tool_name: None,
             session_id: session_id.map(|s| s.to_string()),
             collab_session_id: ctx.collab_session_id.clone(),
             collab_phase: ctx.collab_phase.clone(),
@@ -193,6 +198,7 @@ pub struct TokenUsage {
     pub source: String,
     pub harness: String,
     pub model: Option<String>,
+    pub tool_name: Option<String>,
     pub session_id: Option<String>,
     pub collab_session_id: Option<String>,
     pub collab_phase: Option<String>,
@@ -299,27 +305,28 @@ pub struct TaskOutcome {
 // ---------------------------------------------------------------------------
 
 fn map_token_usage(row: &rusqlite::Row<'_>) -> rusqlite::Result<TokenUsage> {
-    let estimated_int: i64 = row.get(13)?;
+    let estimated_int: i64 = row.get(14)?;
     Ok(TokenUsage {
         id: row.get(0)?,
         ts: row.get(1)?,
         source: row.get(2)?,
         harness: row.get(3)?,
         model: row.get(4)?,
-        session_id: row.get(5)?,
-        collab_session_id: row.get(6)?,
-        collab_phase: row.get(7)?,
-        task_tag: row.get(8)?,
-        input_tokens: row.get(9)?,
-        output_tokens: row.get(10)?,
-        cache_creation_input_tokens: row.get(11)?,
-        cache_read_input_tokens: row.get(12)?,
+        tool_name: row.get(5)?,
+        session_id: row.get(6)?,
+        collab_session_id: row.get(7)?,
+        collab_phase: row.get(8)?,
+        task_tag: row.get(9)?,
+        input_tokens: row.get(10)?,
+        output_tokens: row.get(11)?,
+        cache_creation_input_tokens: row.get(12)?,
+        cache_read_input_tokens: row.get(13)?,
         estimated: estimated_int != 0,
-        chars: row.get(14)?,
-        cost_usd: row.get(15)?,
-        map_status: row.get(16)?,
-        turn_id: row.get(17)?,
-        area: row.get(18)?,
+        chars: row.get(15)?,
+        cost_usd: row.get(16)?,
+        map_status: row.get(17)?,
+        turn_id: row.get(18)?,
+        area: row.get(19)?,
     })
 }
 
@@ -428,6 +435,21 @@ pub struct McpResponseSizing {
     pub total_output_tokens: i64,
     /// `total_output_tokens / row_count`; `0.0` when `row_count == 0`.
     pub mean_output_tokens: f64,
+    /// Top response-size contributors grouped by collab session and MCP tool.
+    pub top_tools: Vec<McpResponseToolSizing>,
+}
+
+/// Per-tool MCP response sizing. `collab_session_id` is NULL for non-collab
+/// traffic; `tool_name` is NULL for protocol-level responses such as
+/// `initialize` or `tools/list`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct McpResponseToolSizing {
+    pub collab_session_id: Option<String>,
+    pub tool_name: Option<String>,
+    pub row_count: i64,
+    pub total_chars: i64,
+    pub total_output_tokens: i64,
+    pub mean_output_tokens: f64,
 }
 
 /// Repeated-context indicator: how many turns the transcript-token capture
@@ -481,16 +503,17 @@ impl Database {
     pub fn insert_token_usage(&self, row: &NewTokenUsage) -> Result<i64, MemoryError> {
         self.conn.execute(
             "INSERT INTO token_usage (
-                ts, source, harness, model, session_id, collab_session_id, collab_phase,
+                ts, source, harness, model, tool_name, session_id, collab_session_id, collab_phase,
                 task_tag, input_tokens, output_tokens, cache_creation_input_tokens,
                 cache_read_input_tokens, estimated, chars, cost_usd,
                 map_status, turn_id, area
-            ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18)",
+            ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19)",
             params![
                 row.ts,
                 row.source,
                 row.harness,
                 row.model,
+                row.tool_name,
                 row.session_id,
                 row.collab_session_id,
                 row.collab_phase,
@@ -518,7 +541,7 @@ impl Database {
     pub fn query_token_usage(&self, q: &TokenUsageQuery) -> Result<Vec<TokenUsage>, MemoryError> {
         let limit = q.limit.map(|l| l as i64).unwrap_or(-1);
         let mut stmt = self.conn.prepare(
-            "SELECT id, ts, source, harness, model, session_id, collab_session_id, collab_phase,
+            "SELECT id, ts, source, harness, model, tool_name, session_id, collab_session_id, collab_phase,
                     task_tag, input_tokens, output_tokens, cache_creation_input_tokens,
                     cache_read_input_tokens, estimated, chars, cost_usd,
                     map_status, turn_id, area
@@ -958,6 +981,7 @@ impl Database {
             source: "mcp_response".to_string(),
             harness: harness.to_string(),
             model: None,
+            tool_name: None,
             session_id: None,
             collab_session_id: None,
             collab_phase: None,
@@ -1071,10 +1095,43 @@ impl Database {
         } else {
             total_output_tokens as f64 / row_count as f64
         };
+        let mut stmt = self.conn.prepare(
+            "SELECT collab_session_id,
+                    tool_name,
+                    COUNT(*) AS row_count,
+                    COALESCE(SUM(chars), 0) AS total_chars,
+                    COALESCE(SUM(output_tokens), 0) AS total_output_tokens
+             FROM token_usage
+             WHERE source = 'mcp_response'
+             GROUP BY collab_session_id, tool_name
+             ORDER BY total_output_tokens DESC, total_chars DESC, row_count DESC,
+                      collab_session_id ASC, tool_name ASC
+             LIMIT 10",
+        )?;
+        let top_tools = stmt
+            .query_map([], |r| {
+                let rows = r.get::<_, i64>(2)?;
+                let total = r.get::<_, i64>(4)?;
+                Ok(McpResponseToolSizing {
+                    collab_session_id: r.get(0)?,
+                    tool_name: r.get(1)?,
+                    row_count: rows,
+                    total_chars: r.get(3)?,
+                    total_output_tokens: total,
+                    mean_output_tokens: if rows == 0 {
+                        0.0
+                    } else {
+                        total as f64 / rows as f64
+                    },
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(MemoryError::from)?;
         Ok(McpResponseSizing {
             row_count,
             total_output_tokens,
             mean_output_tokens,
+            top_tools,
         })
     }
 
@@ -1249,6 +1306,7 @@ mod tests {
             source: "mcp_response".into(),
             harness: "claude".into(),
             model: Some("claude-opus-4-8".into()),
+            tool_name: None,
             session_id: Some("sess-1".into()),
             collab_session_id: Some("collab-1".into()),
             collab_phase: Some("impl".into()),
@@ -1903,6 +1961,7 @@ mod tests {
             source: "llm_rerank".into(),
             harness: harness.into(),
             model: Some(model.into()),
+            tool_name: None,
             session_id: None,
             collab_session_id: task_key_collab.map(|s| s.into()),
             collab_phase: Some(phase.into()),
@@ -2407,6 +2466,7 @@ mod tests {
             source: "transcript".into(),
             harness: "claude".into(),
             model: Some("claude-sonnet-4-6".into()),
+            tool_name: None,
             session_id: Some("sess-t1".into()),
             collab_session_id: Some("collab-t1".into()),
             collab_phase: Some("impl".into()),
@@ -2463,6 +2523,7 @@ mod tests {
             source: "mcp_response".into(),
             harness: "claude".into(),
             model: None,
+            tool_name: None,
             session_id: None,
             collab_session_id: None,
             collab_phase: None,
@@ -2528,6 +2589,7 @@ mod tests {
             source: "transcript".into(),
             harness: "claude".into(),
             model: Some("claude-sonnet-4-6".into()),
+            tool_name: None,
             session_id: Some("sess-1".into()),
             collab_session_id: Some("tx-collab".into()),
             collab_phase: Some("impl".into()),
@@ -2551,6 +2613,7 @@ mod tests {
             source: "transcript".into(),
             harness: "codex".into(),
             model: None,
+            tool_name: None,
             session_id: Some("codex-sess-1".into()),
             collab_session_id: Some("tx-collab".into()),
             collab_phase: Some("impl".into()),
@@ -2603,6 +2666,7 @@ mod tests {
             source: "transcript".into(),
             harness: "claude".into(),
             model: None,
+            tool_name: None,
             session_id: None,
             collab_session_id: Some("est-collab".into()),
             collab_phase: Some("impl".into()),
@@ -2635,6 +2699,7 @@ mod tests {
             source: "transcript".into(),
             harness: "codex".into(),
             model: None,
+            tool_name: None,
             session_id: Some("codex-sess-1".into()),
             collab_session_id: Some("collab-t1".into()),
             collab_phase: Some("impl".into()),
@@ -2754,12 +2819,45 @@ mod tests {
     }
 
     #[test]
+    fn report_mcp_response_sizing_groups_top_tools_by_collab_session() {
+        let db = db();
+        let mut collab_status = sample_token_usage();
+        collab_status.collab_session_id = Some("collab-a".into());
+        collab_status.tool_name = Some("collab_status".into());
+        collab_status.output_tokens = 100;
+        collab_status.chars = 400;
+        db.insert_token_usage(&collab_status).unwrap();
+
+        let mut get_drawer = sample_token_usage();
+        get_drawer.collab_session_id = Some("collab-a".into());
+        get_drawer.tool_name = Some("get_drawer".into());
+        get_drawer.output_tokens = 25;
+        get_drawer.chars = 100;
+        db.insert_token_usage(&get_drawer).unwrap();
+
+        let sizing = db.report_mcp_response_sizing().unwrap();
+        assert_eq!(sizing.row_count, 2);
+        assert_eq!(sizing.top_tools.len(), 2);
+        assert_eq!(
+            sizing.top_tools[0].collab_session_id.as_deref(),
+            Some("collab-a")
+        );
+        assert_eq!(
+            sizing.top_tools[0].tool_name.as_deref(),
+            Some("collab_status")
+        );
+        assert_eq!(sizing.top_tools[0].total_chars, 400);
+        assert_eq!(sizing.top_tools[0].total_output_tokens, 100);
+    }
+
+    #[test]
     fn report_mcp_response_sizing_empty_is_zero() {
         let db = db();
         let sizing = db.report_mcp_response_sizing().unwrap();
         assert_eq!(sizing.row_count, 0);
         assert_eq!(sizing.total_output_tokens, 0);
         assert_eq!(sizing.mean_output_tokens, 0.0);
+        assert!(sizing.top_tools.is_empty());
     }
 
     /// `report_transcript_coverage` counts distinct transcript-covered turns and

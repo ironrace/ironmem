@@ -116,6 +116,17 @@ fn render_value_summary(out: &mut String, vs: &ValueSummary) {
             count = mcp.row_count,
             mean = mcp.mean_output_tokens,
         );
+        for row in mcp.top_tools.iter().take(5) {
+            let tool = row.tool_name.as_deref().unwrap_or("<protocol>");
+            let collab = row.collab_session_id.as_deref().unwrap_or("<none>");
+            let _ = writeln!(
+                out,
+                "    {collab} / {tool}: {count} calls · {tokens} tokens · {chars} chars",
+                count = row.row_count,
+                tokens = row.total_output_tokens,
+                chars = row.total_chars,
+            );
+        }
     }
     if let Some(cov) = &vs.transcript_coverage {
         let _ = writeln!(
@@ -230,6 +241,7 @@ mod tests {
             source: "llm_rerank".into(),
             harness: harness.into(),
             model: Some(model.into()),
+            tool_name: None,
             session_id: None,
             collab_session_id: Some(collab.into()),
             collab_phase: Some(phase.into()),

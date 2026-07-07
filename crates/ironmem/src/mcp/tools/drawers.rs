@@ -6,7 +6,7 @@ use crate::sanitize;
 use crate::search;
 
 use super::shared::{
-    render_sensitive_text, validate_hex_id, MAX_DRAWER_CONTENT_CHARS, MAX_SEARCH_LIMIT,
+    render_sensitive_text, sha256_hex, validate_hex_id, MAX_DRAWER_CONTENT_CHARS, MAX_SEARCH_LIMIT,
     MAX_SEARCH_RESPONSE_CHARS, MAX_SENSITIVE_FIELD_CHARS,
 };
 use crate::mcp::app::App;
@@ -204,14 +204,36 @@ fn build_synthetic(
 /// read-by-primary-key counterpart to `add_drawer`: `search` ranks semantically
 /// and cannot reliably return a specific freshly-written staging drawer, so any
 /// flow that stages an artifact under a known id (e.g. the collab compose→submit
-/// handoff) needs this to read it back. Returns the full body (subject only to
-/// access-mode redaction), not a truncated excerpt.
+/// handoff) needs this to read it back. By default it returns the full body
+/// (subject only to access-mode redaction); callers that only need identity or
+/// freshness checks can pass `include_content:false`, `max_chars`, or
+/// `hash_only:true`.
 pub(super) fn handle_get_drawer(app: &App, args: &Value) -> Result<Value, MemoryError> {
     let id = args
         .get("id")
         .and_then(|v| v.as_str())
         .ok_or_else(|| MemoryError::Validation("id is required".into()))?;
     validate_hex_id(id, "id")?;
+    let hash_only = args
+        .get("hash_only")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let include_content = !hash_only
+        && args
+            .get("include_content")
+            .and_then(Value::as_bool)
+            .unwrap_or(true);
+    let max_chars = match args.get("max_chars") {
+        Some(value) => {
+            let raw = value.as_u64().ok_or_else(|| {
+                MemoryError::Validation("max_chars must be a non-negative integer".into())
+            })?;
+            usize::try_from(raw)
+                .unwrap_or(MAX_DRAWER_CONTENT_CHARS)
+                .min(MAX_DRAWER_CONTENT_CHARS)
+        }
+        None => MAX_DRAWER_CONTENT_CHARS,
+    };
 
     let drawer = match app.db.get_drawer(id)? {
         Some(d) => d,
@@ -221,8 +243,14 @@ pub(super) fn handle_get_drawer(app: &App, args: &Value) -> Result<Value, Memory
     };
 
     let redact_content = app.config.mcp_access_mode.redacts_sensitive_content();
-    let (content, truncated, redacted, _consumed) =
-        render_sensitive_text(&drawer.content, MAX_DRAWER_CONTENT_CHARS, redact_content);
+    let content_chars = drawer.content.chars().count();
+    let (content, truncated, redacted) = if include_content {
+        let (content, truncated, redacted, _consumed) =
+            render_sensitive_text(&drawer.content, max_chars, redact_content);
+        (Some(content), Some(truncated), redacted)
+    } else {
+        (None, None, redact_content)
+    };
 
     // Parity: when the body is redacted, also withhold source_file (a filesystem
     // path) and added_by — both are potentially sensitive metadata. wing/room/
@@ -238,19 +266,33 @@ pub(super) fn handle_get_drawer(app: &App, args: &Value) -> Result<Value, Memory
         json!(drawer.added_by)
     };
 
-    Ok(json!({
+    let mut out = json!({
         "found": true,
         "id": drawer.id,
-        "content": content,
-        "content_truncated": truncated,
+        "content_included": include_content && !redacted,
         "content_redacted": redacted,
+        "content_chars": content_chars,
         "wing": drawer.wing,
         "room": drawer.room,
         "source_file": source_file,
         "added_by": added_by,
         "filed_at": drawer.filed_at,
         "date": drawer.date,
-    }))
+    });
+    if let Some(content) = content {
+        out["content"] = content;
+    }
+    if let Some(truncated) = truncated {
+        out["content_truncated"] = json!(truncated);
+    }
+    if hash_only && !redacted {
+        out["content_hash"] = json!(sha256_hex(&drawer.content));
+        out["hash_only"] = json!(true);
+    } else if hash_only {
+        out["hash_only"] = json!(true);
+        out["content_hash_redacted"] = json!(true);
+    }
+    Ok(out)
 }
 
 pub(super) fn handle_delete_drawer(app: &App, args: &Value) -> Result<Value, MemoryError> {
@@ -502,6 +544,7 @@ mod tests {
                 source: "llm_rerank".into(),
                 harness: "claude".into(),
                 model: Some("claude-opus-4-8".into()),
+                tool_name: None,
                 session_id: None,
                 collab_session_id: Some("sess-status".into()),
                 collab_phase: Some("impl".into()),
@@ -607,6 +650,113 @@ mod tests {
         assert!(out["filed_at"].is_string(), "filed_at must be a string");
         assert!(out.get("date").is_some(), "date must be present");
         assert!(out["date"].is_string(), "date must be a string");
+    }
+
+    #[test]
+    fn get_drawer_can_omit_content_for_metadata_only() {
+        let app = test_app();
+        let body = "metadata-only body";
+        let added = handle_add_drawer(
+            &app,
+            &json!({"content": body, "wing": "test", "room": "refs"}),
+        )
+        .unwrap();
+        let id = added["id"].as_str().unwrap().to_string();
+
+        let out = handle_get_drawer(&app, &json!({"id": id, "include_content": false})).unwrap();
+        assert_eq!(out["found"].as_bool(), Some(true));
+        assert_eq!(out["content_included"].as_bool(), Some(false));
+        assert_eq!(out["content_redacted"].as_bool(), Some(false));
+        assert_eq!(out["content_chars"].as_u64(), Some(body.len() as u64));
+        assert!(out.get("content").is_none(), "body must be omitted");
+        assert!(
+            out.get("content_truncated").is_none(),
+            "truncation flag only applies when content is returned"
+        );
+    }
+
+    #[test]
+    fn get_drawer_respects_max_chars() {
+        let app = test_app();
+        let body = "abcdef";
+        let added = handle_add_drawer(
+            &app,
+            &json!({"content": body, "wing": "test", "room": "refs"}),
+        )
+        .unwrap();
+        let id = added["id"].as_str().unwrap().to_string();
+
+        let out = handle_get_drawer(&app, &json!({"id": id, "max_chars": 3})).unwrap();
+        assert_eq!(out["content"].as_str(), Some("abc"));
+        assert_eq!(out["content_truncated"].as_bool(), Some(true));
+        assert_eq!(out["content_included"].as_bool(), Some(true));
+    }
+
+    #[test]
+    fn get_drawer_hash_only_returns_hash_without_body() {
+        let app = test_app();
+        let body = "hash me";
+        let added = handle_add_drawer(
+            &app,
+            &json!({"content": body, "wing": "test", "room": "refs"}),
+        )
+        .unwrap();
+        let id = added["id"].as_str().unwrap().to_string();
+
+        let out = handle_get_drawer(&app, &json!({"id": id, "hash_only": true})).unwrap();
+        let expected_hash = super::super::shared::sha256_hex(body);
+        assert_eq!(out["hash_only"].as_bool(), Some(true));
+        assert_eq!(out["content_hash"].as_str(), Some(expected_hash.as_str()));
+        assert_eq!(out["content_included"].as_bool(), Some(false));
+        assert!(out.get("content").is_none(), "hash-only must omit body");
+    }
+
+    #[test]
+    fn get_drawer_hash_only_redacts_hash_in_restricted_mode() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("mem.sqlite3");
+        let model_dir = dir.path().join("model");
+        let state_dir = dir.path().join("state");
+
+        let trusted = {
+            let config = Config {
+                db_path: db_path.clone(),
+                model_dir: model_dir.clone(),
+                model_dir_explicit: true,
+                state_dir: state_dir.clone(),
+                mcp_access_mode: McpAccessMode::Trusted,
+                embed_mode: EmbedMode::Noop,
+            };
+            #[allow(clippy::arc_with_non_send_sync)]
+            Arc::new(App::new(config).unwrap())
+        };
+        let added = handle_add_drawer(
+            &trusted,
+            &json!({"content": "secret hash body", "wing": "secrets", "room": "vault"}),
+        )
+        .unwrap();
+        let id = added["id"].as_str().unwrap().to_string();
+        drop(trusted);
+
+        let restricted = {
+            let config = Config {
+                db_path,
+                model_dir,
+                model_dir_explicit: true,
+                state_dir,
+                mcp_access_mode: McpAccessMode::Restricted,
+                embed_mode: EmbedMode::Noop,
+            };
+            #[allow(clippy::arc_with_non_send_sync)]
+            Arc::new(App::new(config).unwrap())
+        };
+
+        let out = handle_get_drawer(&restricted, &json!({"id": id, "hash_only": true})).unwrap();
+        assert_eq!(out["hash_only"].as_bool(), Some(true));
+        assert_eq!(out["content_hash_redacted"].as_bool(), Some(true));
+        assert_eq!(out["content_redacted"].as_bool(), Some(true));
+        assert!(out.get("content_hash").is_none());
+        assert!(out.get("content").is_none());
     }
 
     #[test]

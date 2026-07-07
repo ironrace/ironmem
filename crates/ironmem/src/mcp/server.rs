@@ -49,6 +49,7 @@ fn normalize_session_id(value: &str) -> Option<String> {
 fn account_response_metrics(
     app: &App,
     chars: usize,
+    tool_name: Option<&str>,
     session_id: Option<&str>,
     exploration: Option<&crate::metrics::ExplorationContext>,
 ) {
@@ -61,11 +62,19 @@ fn account_response_metrics(
             &app.db,
             chars as i64,
             &mcp_harness(app),
+            tool_name,
             session_id,
             &ctx,
             exploration,
         );
     });
+}
+
+fn request_tool_name(request: &JsonRpcRequest) -> Option<&str> {
+    if request.method != "tools/call" {
+        return None;
+    }
+    request.params.get("name").and_then(|v| v.as_str())
 }
 
 /// Extract the `turn_id` and `area` arguments from a `code_map_write` or
@@ -149,7 +158,13 @@ where
             Err(e) => {
                 let resp = JsonRpcResponse::error(None, -32700, &format!("Parse error: {e}"));
                 let chars = write_response(&mut stdout, &resp).await?;
-                account_response_metrics(&app, chars, app.session_id_snapshot().as_deref(), None);
+                account_response_metrics(
+                    &app,
+                    chars,
+                    None,
+                    app.session_id_snapshot().as_deref(),
+                    None,
+                );
                 continue;
             }
         };
@@ -161,7 +176,13 @@ where
                 "Invalid Request: jsonrpc must be '2.0'",
             );
             let chars = write_response(&mut stdout, &resp).await?;
-            account_response_metrics(&app, chars, app.session_id_snapshot().as_deref(), None);
+            account_response_metrics(
+                &app,
+                chars,
+                None,
+                app.session_id_snapshot().as_deref(),
+                None,
+            );
             continue;
         }
 
@@ -187,7 +208,13 @@ where
             let sid = app
                 .session_id_snapshot()
                 .or_else(|| request_collab_session_id(&request));
-            account_response_metrics(&app, chars, sid.as_deref(), exploration.as_ref());
+            account_response_metrics(
+                &app,
+                chars,
+                request_tool_name(&request),
+                sid.as_deref(),
+                exploration.as_ref(),
+            );
         }
     }
 
@@ -645,6 +672,15 @@ mod tests {
         assert_eq!(s.total_output_tokens, 567);
         assert_eq!(s.compactions, 3);
         assert_eq!(s.started_at.as_deref(), Some("2026-06-11T00:00:00Z"));
+        let rows = app
+            .db
+            .query_token_usage(&crate::db::metrics::TokenUsageQuery::default())
+            .unwrap();
+        let mcp = rows
+            .iter()
+            .find(|r| r.source == "mcp_response")
+            .expect("collab_status response row recorded");
+        assert_eq!(mcp.tool_name.as_deref(), Some("collab_status"));
     }
 
     #[allow(clippy::await_holding_lock)]

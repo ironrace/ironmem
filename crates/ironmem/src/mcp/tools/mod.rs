@@ -79,11 +79,24 @@ pub fn tool_definitions(app: &App) -> Vec<Value> {
         }),
         json!({
             "name": "get_drawer",
-            "description": "Fetch a single drawer's full content by its exact ID (deterministic read-by-id; use when you have the ID rather than a semantic query). Returns found:false if no drawer has that ID.",
+            "description": "Fetch a single drawer by exact ID. By default returns full content; pass include_content:false for metadata only, max_chars for a bounded excerpt, or hash_only:true for a content hash without body. Restricted mode redacts content_hash.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "id": { "type": "string" }
+                    "id": { "type": "string" },
+                    "include_content": {
+                        "type": "boolean",
+                        "description": "When false, omit the content body. Default true."
+                    },
+                    "max_chars": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "description": "Maximum content characters to return when include_content is true. Capped at the server max."
+                    },
+                    "hash_only": {
+                        "type": "boolean",
+                        "description": "When true, omit content and return content_hash unless restricted mode redacts it. Overrides include_content. Default false."
+                    }
                 },
                 "required": ["id"]
             }
@@ -317,7 +330,7 @@ pub fn tool_definitions(app: &App) -> Vec<Value> {
         }),
         json!({
             "name": "collab_status",
-            "description": "Return collab session state. Accepted plans are returned by reference by default — `canonical_plan_ref`/`final_plan_ref` = {drawer_id, hash, first_200_chars}; pass verbose:true to additionally inline the full canonical_plan/final_plan strings. (Legacy pre-009 sessions inline the full body and emit no *_plan_ref.)",
+            "description": "Return collab session state. Accepted plans and task lists are returned by reference by default — `canonical_plan_ref`/`final_plan_ref`/`task_list_ref` = {drawer_id, hash, first_200_chars}; pass verbose:true to additionally inline full canonical/final plans, and include_task_list:true to inline full task_list. (Legacy pre-009 plans inline the full body and emit no *_plan_ref.)",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -325,6 +338,10 @@ pub fn tool_definitions(app: &App) -> Vec<Value> {
                     "verbose": {
                         "type": "boolean",
                         "description": "When true, include the full canonical/final plan body alongside the compact reference. Default false (compact reference only)."
+                    },
+                    "include_task_list": {
+                        "type": "boolean",
+                        "description": "When true, include the full task_list JSON alongside task_list_ref. Default false (compact reference only)."
                     }
                 },
                 "required": ["session_id"]

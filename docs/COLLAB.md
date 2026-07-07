@@ -205,6 +205,8 @@ Stored in `collab_sessions`:
 | `canonical_plan_drawer_id` / `final_plan_drawer_id` | Deterministic 32-char id of the `collab-plans` drawer storing the canonical/final plan body once accepted (migration 009). NULL on pre-009 sessions → legacy inline path. |
 | `final_plan_hash` | SHA-256 of the locked plan |
 | `final_plan` / `final_plan_ref` | The locked `final` plan (present when `final_plan_hash` is set). By default returned as a compact `final_plan_ref` `{drawer_id, hash, first_200_chars}`; with `verbose:true` the full `final_plan` string is inlined as normalized, already-parsed plan text. No caller unwraps `{"plan":...}`, including legacy NULL-drawer sessions. Primary input to the v3 `task_list` bridge after `PlanLocked`. See "Plan-by-reference contract". |
+| `task_list` / `task_list_ref` | The accepted v3 task list. By default `collab_status` returns compact `task_list_ref` `{drawer_id, hash, first_200_chars}` plus top-level `tasks_count`, `plan_file_path`, and `execution_mode`; pass `include_task_list:true` to inline the full JSON. New sessions store the task list in `collab-task-lists`; pre-014 sessions may have `task_list_ref.drawer_id = null`. |
+| `task_list_drawer_id` | Deterministic 32-char id of the `collab-task-lists` drawer storing the canonicalized task-list JSON once accepted (migration 014). NULL on pre-014 sessions. |
 | `codex_review_verdict` | Last Codex verdict |
 | `review_round` | Number of completed Codex reviews (0, 1, or 2) |
 | `ended_at` | Non-null once `collab_end` has been called |
@@ -635,8 +637,8 @@ action.
 
 #### Plan-by-reference contract
 
-Accepted plan bodies are returned by reference by default to keep the status
-payload compact:
+Accepted plan and task-list bodies are returned by reference by default to keep
+the status payload compact:
 
 - **Default (`verbose` false or omitted):** the accepted `canonical` and
   `final` plans are returned as compact references —
@@ -646,6 +648,12 @@ payload compact:
   `final_plan` string. Callers that need the approved plan body (e.g. the v3
   `task_list` bridge, or recovering a prior canonical on a revision round)
   must pass `verbose:true`.
+- **`include_task_list:true`:** additionally inlines the full canonicalized
+  `task_list` JSON. The default status response omits it and returns
+  `task_list_ref` instead. For new sessions `task_list_ref.drawer_id` points to
+  a `collab-task-lists` drawer; for pre-014 sessions the ref may carry
+  `drawer_id:null`, so legacy callers that need the full body should use
+  `include_task_list:true`.
 - The `final` body exposed by `collab_status` is the **already-parsed plan
   text** — consumers no longer need to unwrap the legacy
   `{"plan":"<full text>"}` JSON. For post-009 sessions, the drawer stores
@@ -659,10 +667,11 @@ payload compact:
   `canonical_plan_ref` / `final_plan_ref`, so callers must not assume the
   compact reference object is always present.
 - **Recall note:** accepted plan bodies are filed as drawers in the
-  dedicated `collab-plans` room with a zero embedding (kept out of vector
-  recall), but the generic drawer FTS index still sees their content, so an
-  unscoped keyword `search` can surface them. This is an accepted tradeoff
-  for issue #90; excluding `collab-plans` from default recall is tracked as a
+  dedicated `collab-plans` room, and task lists in `collab-task-lists`, with a
+  zero embedding (kept out of vector recall). The generic drawer FTS index
+  still sees their content, so an unscoped keyword `search` can surface them.
+  This is an accepted tradeoff for issue #90; excluding these rooms from
+  default recall is tracked as a
   follow-up.
 
 ### `collab_approve`
