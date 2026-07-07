@@ -159,6 +159,11 @@ enum Commands {
         #[command(subcommand)]
         cmd: SymbolsCmd,
     },
+    /// Inspect or prune memory lifecycle artifacts
+    Memory {
+        #[command(subcommand)]
+        cmd: MemoryCmd,
+    },
     /// List registered harnesses (dev/CI helper for packaging scripts)
     Harnesses {
         /// Output format
@@ -184,6 +189,35 @@ enum Commands {
         /// Approximate token budget for pre-injected context
         #[arg(long, default_value_t = ironmem::context::DEFAULT_BUDGET_TOKENS)]
         budget: usize,
+    },
+}
+
+/// Subcommands nested under `ironmem memory`.
+#[derive(Subcommand)]
+enum MemoryCmd {
+    /// Dry-run or apply conservative stale-drawer garbage collection
+    Gc {
+        /// Path to the database
+        #[arg(long)]
+        db: Option<String>,
+        /// Show candidates without deleting anything (the default)
+        #[arg(long, conflicts_with = "apply")]
+        dry_run: bool,
+        /// Actually delete candidates. Omit for dry-run.
+        #[arg(long)]
+        apply: bool,
+        /// Retention for collab-checkpoints drawers
+        #[arg(long, default_value_t = ironmem::db::retention::DEFAULT_COLLAB_CHECKPOINT_RETENTION_DAYS)]
+        collab_checkpoint_days: i64,
+        /// Retention for collab-plans and collab-task-lists drawers
+        #[arg(long, default_value_t = ironmem::db::retention::DEFAULT_COLLAB_ARTIFACT_RETENTION_DAYS)]
+        collab_artifact_days: i64,
+        /// Maximum candidates to inspect
+        #[arg(long, default_value_t = ironmem::db::retention::DEFAULT_GC_LIMIT)]
+        limit: usize,
+        /// Emit JSON instead of text
+        #[arg(long)]
+        json: bool,
     },
 }
 
@@ -541,6 +575,39 @@ async fn run(cli: Cli) -> Result<(), MemoryError> {
             }
             Ok(())
         }
+        Commands::Memory { cmd } => match cmd {
+            MemoryCmd::Gc {
+                db,
+                dry_run: _,
+                apply,
+                collab_checkpoint_days,
+                collab_artifact_days,
+                limit,
+                json,
+            } => {
+                let cfg = config::Config::load(db)?;
+                let database = ironmem::db::schema::Database::open(&cfg.db_path)?;
+                database.migrate()?;
+                let report = ironmem::db::retention::run_memory_gc(
+                    &database,
+                    ironmem::db::retention::MemoryGcOptions {
+                        apply,
+                        collab_checkpoint_days,
+                        collab_artifact_days,
+                        limit,
+                    },
+                )?;
+                if json {
+                    println!("{}", serde_json::to_string_pretty(&report)?);
+                } else {
+                    print!(
+                        "{}",
+                        ironmem::db::retention::render_memory_gc_report(&report)
+                    );
+                }
+                Ok(())
+            }
+        },
         Commands::Harnesses { format } => {
             match format.as_str() {
                 "json" => println!(

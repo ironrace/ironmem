@@ -299,6 +299,28 @@ ironmem write-rules --target AGENTS.md
 This is explicit opt-in only; no hook or plugin path runs `write-rules`
 automatically.
 
+## Memory Lifecycle
+
+Use durable, append-only memory for decisions and facts. Use replaceable memory
+for current task or project state:
+
+- `add_drawer` without `logical_key` remains content-addressed and append-like.
+- `add_drawer` with `logical_key` is key-addressed by
+  wing/room/logical_key, so a later write updates the same drawer. This is the
+  preferred shape for "current context" that would otherwise go stale.
+
+Operational collab rooms are not permanent knowledge:
+
+- `collab-checkpoints`
+- `collab-plans`
+- `collab-task-lists`
+
+Run `ironmem memory gc --dry-run` to inspect stale operational drawers. Deletion
+requires `ironmem memory gc --apply`. The default policy deletes checkpoint
+candidates older than 60 days and unreferenced plan/task-list candidates older
+than 180 days; linked plan/task-list drawers are skipped to preserve historical
+collab session lookups.
+
 ## Benchmarking Against MemPalace
 
 This repo includes a benchmark harness at `scripts/benchmark_vs_mempalace.py`.

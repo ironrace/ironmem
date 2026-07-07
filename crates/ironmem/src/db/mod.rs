@@ -7,6 +7,7 @@ pub mod drawers;
 pub mod knowledge_graph;
 pub mod metrics;
 pub mod read_only;
+pub mod retention;
 pub mod schema;
 pub mod symbol_graph;
 pub mod wal;

@@ -347,6 +347,36 @@ Flags:
   - `SCOUT REQUIRED` — no usable map (missing, an invalid area name, or an
     untrustable git state); explore the area before relying on memory for it.
 
+### Memory lifecycle
+
+Use append-only drawers for durable decisions and facts. For mutable "current
+state" context, pass `logical_key` to `add_drawer`; the same
+wing/room/logical_key rewrites one stable drawer ID instead of accumulating
+stale copies:
+
+```json
+{
+  "content": "Current task state: auth refactor is blocked on token tests.",
+  "wing": "my-project",
+  "room": "current-context",
+  "logical_key": "task-state"
+}
+```
+
+Prune stale operational collab artifacts with a dry-run first:
+
+```bash
+ironmem memory gc --dry-run
+ironmem memory gc --apply
+```
+
+Defaults are conservative: `collab-checkpoints` older than 60 days are delete
+candidates; unreferenced `collab-plans` and `collab-task-lists` older than 180
+days are delete candidates. Referenced plan/task-list drawers are skipped so
+historical `collab_status` lookups are not broken. Durable summaries,
+project facts, source-mined drawers, diary entries, and knowledge-graph facts
+are not pruned by this command.
+
 ### `ironmem symbols`
 
 Index and query a **local symbol/import graph** built from your Rust and Python sources.

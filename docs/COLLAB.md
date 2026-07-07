@@ -673,6 +673,11 @@ the status payload compact:
   This is an accepted tradeoff for issue #90; excluding these rooms from
   default recall is tracked as a
   follow-up.
+- **Retention note:** `collab-plans`, `collab-task-lists`, and
+  `collab-checkpoints` are operational artifacts. Long-term project memory
+  should be captured as compact summaries or KG facts. Use
+  `ironmem memory gc --dry-run` before `--apply` to inspect stale operational
+  drawer candidates; referenced plan/task-list drawers are skipped.
 
 ### `collab_approve`
 

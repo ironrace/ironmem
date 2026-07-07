@@ -11,6 +11,9 @@ use super::shared::{
 };
 use crate::mcp::app::App;
 
+const LOGICAL_KEY_SOURCE_PREFIX: &str = "logical:";
+const LOGICAL_KEY_ID_PREFIX: &str = "logical-key:";
+
 pub(super) fn handle_add_drawer(app: &App, args: &Value) -> Result<Value, MemoryError> {
     if app.is_warming_up() {
         return Ok(json!({
@@ -30,12 +33,25 @@ pub(super) fn handle_add_drawer(app: &App, args: &Value) -> Result<Value, Memory
         .get("room")
         .and_then(|v| v.as_str())
         .unwrap_or("general");
+    let logical_key = args
+        .get("logical_key")
+        .and_then(|v| v.as_str())
+        .map(|v| sanitize::sanitize_name(v, "logical_key"))
+        .transpose()?;
 
     let content = sanitize::sanitize_content(content, MAX_DRAWER_CONTENT_CHARS)?;
     let wing = sanitize::sanitize_name(wing, "wing")?;
     let room = sanitize::sanitize_name(room, "room")?;
 
-    let id = crate::db::drawers::generate_id(content, &wing, &room);
+    let id_basis = logical_key
+        .as_ref()
+        .map(|key| format!("{LOGICAL_KEY_ID_PREFIX}{key}"))
+        .unwrap_or_else(|| content.to_string());
+    let id = crate::db::drawers::generate_id(&id_basis, &wing, &room);
+    let source_file = logical_key
+        .as_ref()
+        .map(|key| format!("{LOGICAL_KEY_SOURCE_PREFIX}{key}"))
+        .unwrap_or_default();
 
     app.ensure_embedder_ready()?;
 
@@ -53,7 +69,14 @@ pub(super) fn handle_add_drawer(app: &App, args: &Value) -> Result<Value, Memory
 
     app.db.with_transaction(|tx| {
         crate::db::schema::Database::insert_drawer_tx(
-            tx, &id, content, &embedding, &wing, &room, "", "mcp",
+            tx,
+            &id,
+            content,
+            &embedding,
+            &wing,
+            &room,
+            &source_file,
+            "mcp",
         )?;
         if let Some((sid, scontent, semb)) = synth.as_ref() {
             let parent_ref = format!("{}{id}", crate::db::drawers::PREF_SENTINEL);
@@ -71,7 +94,13 @@ pub(super) fn handle_add_drawer(app: &App, args: &Value) -> Result<Value, Memory
         crate::db::schema::Database::wal_log_tx(
             tx,
             "add_drawer",
-            &json!({"id": &id, "wing": &wing, "room": &room, "synth": synth.is_some()}),
+            &json!({
+                "id": &id,
+                "wing": &wing,
+                "room": &room,
+                "synth": synth.is_some(),
+                "logical_key": logical_key.as_deref()
+            }),
             None,
         )?;
         Ok(())
@@ -90,13 +119,18 @@ pub(super) fn handle_add_drawer(app: &App, args: &Value) -> Result<Value, Memory
         }
     }
 
-    Ok(json!({
+    let mut out = json!({
         "success": true,
         "id": id,
         "wing": wing,
         "room": room,
         "synth": synth.is_some(),
-    }))
+        "id_strategy": if logical_key.is_some() { "logical_key" } else { "content" },
+    });
+    if let Some(key) = logical_key {
+        out["logical_key"] = json!(key);
+    }
+    Ok(out)
 }
 
 /// Build a synthetic preference-enrichment drawer, or return Ok(None) if the
@@ -650,6 +684,39 @@ mod tests {
         assert!(out["filed_at"].is_string(), "filed_at must be a string");
         assert!(out.get("date").is_some(), "date must be present");
         assert!(out["date"].is_string(), "date must be a string");
+    }
+
+    #[test]
+    fn add_drawer_logical_key_overwrites_current_context() {
+        let app = test_app();
+        let first = handle_add_drawer(
+            &app,
+            &json!({
+                "content": "current context v1",
+                "wing": "project",
+                "room": "current",
+                "logical_key": "task state"
+            }),
+        )
+        .unwrap();
+        let second = handle_add_drawer(
+            &app,
+            &json!({
+                "content": "current context v2",
+                "wing": "project",
+                "room": "current",
+                "logical_key": "task state"
+            }),
+        )
+        .unwrap();
+
+        let id = first["id"].as_str().unwrap();
+        assert_eq!(second["id"].as_str(), Some(id));
+        assert_eq!(second["id_strategy"].as_str(), Some("logical_key"));
+        let out = handle_get_drawer(&app, &json!({"id": id})).unwrap();
+        assert_eq!(out["content"].as_str(), Some("current context v2"));
+        assert_eq!(out["source_file"].as_str(), Some("logical:task state"));
+        assert_eq!(app.db.count_drawers(Some("project")).unwrap(), 1);
     }
 
     #[test]

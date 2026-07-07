@@ -18,6 +18,11 @@ The memory protocol is single-sourced from the `MEMORY_PROTOCOL` constant in `cr
 ironmem write-rules --target CLAUDE.md
 ```
 
+The protocol tells Claude Code to use `add_drawer` with `logical_key` for
+mutable current context and to treat collab plan/task/checkpoint drawers as
+operational artifacts that can be reviewed with `ironmem memory gc --dry-run`
+before any `--apply` pruning.
+
 ## Bundled skills
 
 `scripts/install-ironmem.sh` installs these Claude Code skills into `$CLAUDE_HOME/skills`:
