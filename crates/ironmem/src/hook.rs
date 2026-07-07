@@ -1397,6 +1397,17 @@ mod tests {
 
     static ENV_MUTEX: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
+    fn prompt_hook_tunable_defaults() -> std::sync::MutexGuard<'static, ()> {
+        let guard = crate::search::tunables::PROMPT_HOOK_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        std::env::remove_var("IRONMEM_PROMPT_HOOK_BUDGET_MS");
+        std::env::remove_var("IRONMEM_PROMPT_HOOK_MAX_HITS");
+        std::env::remove_var("IRONMEM_PROMPT_HOOK_MIN_SCORE");
+        std::env::remove_var("IRONMEM_PROMPT_HOOK_SUMMARY_MAX_BYTES");
+        guard
+    }
+
     /// Drop guard that removes `IRONMEM_PROMPT_HOOK_BUDGET_MS` on scope exit,
     /// including on panic/unwind, so the var never leaks to other ENV_MUTEX tests.
     struct PromptHookBudgetEnvGuard;
@@ -2439,6 +2450,7 @@ mod tests {
 
     #[test]
     fn prompt_hook_injects_relevant_summary_without_embedder() {
+        let _prompt = prompt_hook_tunable_defaults();
         let temp = tempfile::tempdir().unwrap();
         let db_path = temp.path().join("memory.sqlite3");
         seed_db_file(
@@ -2504,6 +2516,7 @@ mod tests {
 
     #[test]
     fn prompt_hook_sanitizes_multiline_control_content() {
+        let _prompt = prompt_hook_tunable_defaults();
         let temp = tempfile::tempdir().unwrap();
         let db_path = temp.path().join("memory.sqlite3");
         seed_db_file(
@@ -2552,6 +2565,7 @@ mod tests {
 
     #[test]
     fn prompt_hook_marks_recalled_text_untrusted_and_quoted() {
+        let _prompt = prompt_hook_tunable_defaults();
         let temp = tempfile::tempdir().unwrap();
         let db_path = temp.path().join("memory.sqlite3");
         seed_db_file(
@@ -2650,6 +2664,7 @@ mod tests {
         use crate::metrics::METRICS_ENV_LOCK;
         let _env = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
         let _g = METRICS_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _prompt = prompt_hook_tunable_defaults();
         std::env::set_var("IRONMEM_METRICS", "1");
 
         let dir = tempfile::tempdir().unwrap();
@@ -2692,6 +2707,7 @@ mod tests {
         use crate::metrics::METRICS_ENV_LOCK;
         let _env = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
         let _g = METRICS_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _prompt = prompt_hook_tunable_defaults();
         std::env::set_var("IRONMEM_METRICS", "1");
 
         let dir = tempfile::tempdir().unwrap();
