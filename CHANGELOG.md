@@ -7,8 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-07-07
+
 ### Added
 
+- **Memory lifecycle management.** Added `ironmem memory gc` with dry-run and
+  apply modes for pruning stale operational/collab drawers while preserving
+  referenced plan/task artifacts. The retention policy deletes old unreferenced
+  operational drawers conservatively and reports planned actions as JSON for
+  automation.
+- **Mutable current-context drawers.** `add_drawer` now accepts a
+  `logical_key`, allowing agents to overwrite durable "current context" notes
+  instead of accumulating stale copies forever.
+- **Shared memory protocol guidance.** Updated Codex, Claude, README, and
+  project-agent docs so both harnesses proactively use ironmem for prior-work
+  recall and write back durable summaries in the right memory surface.
 - **`/ultrareview-local` hardened for bug-catching.** The orchestrator now
   captures the full diff text up front (including untracked files via
   `git add -N` in local mode), greps diff *content* — not just filenames — for
@@ -40,6 +53,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Linux CI runner stability.** GitHub Actions Linux jobs now pin
+  `ubuntu-24.04` instead of the moving `ubuntu-latest` alias, and Linux-only
+  steps key off `runner.os`.
+- **Prompt-hook test flake.** Prompt-hook tests that depend on environment
+  tunables now serialize those tunables before asserting deterministic recall
+  output, fixing the intermittent Linux failure seen before this release.
 - **`/collab` final review no longer re-runs the full gate suite after a
   successful push.** `CodeReviewFinalPending` now performs a cheap
   pushed-head proof (clean worktree, `HEAD == last_head_sha`, and local HEAD
