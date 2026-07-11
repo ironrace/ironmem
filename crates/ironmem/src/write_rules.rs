@@ -114,28 +114,30 @@ pub fn resolve_write_targets(
     harness: Option<&str>,
     registry: &[crate::harness::HarnessSpec],
 ) -> Result<Vec<&'static str>, MemoryError> {
-    match (target, harness) {
-        (None, None) => Ok(crate::harness::default_rules_targets(registry)),
-        (Some(t), None) => {
-            // Collect all rules_files from the registry (sorted, deduped for a stable message).
-            let mut allowed: Vec<&'static str> = registry.iter().map(|s| s.rules_file).collect();
-            allowed.sort_unstable();
-            allowed.dedup();
+    // Validate strategy/file invariants before resolving any target.
+    let normalized =
+        crate::harness::rules_file_entries(registry).map_err(MemoryError::Validation)?;
+    let mut allowed_files: Vec<&'static str> =
+        normalized.iter().map(|entry| entry.rules_file).collect();
 
-            registry
-                .iter()
-                .find(|s| s.rules_file == t)
-                .map(|s| vec![s.rules_file])
-                .ok_or_else(|| {
-                    MemoryError::Validation(format!(
-                        "unknown target '{}': allowed targets are {}",
-                        t,
-                        allowed.join(", ")
-                    ))
-                })
+    match (target, harness) {
+        (None, None) => {
+            crate::harness::default_rules_targets(registry).map_err(MemoryError::Validation)
+        }
+        (Some(t), None) => {
+            if let Some(entry) = normalized.iter().find(|entry| entry.rules_file == t) {
+                Ok(vec![entry.rules_file])
+            } else {
+                allowed_files.sort_unstable();
+                allowed_files.dedup();
+                Err(MemoryError::Validation(format!(
+                    "unknown target '{}': allowed targets are {}",
+                    t,
+                    allowed_files.join(", ")
+                )))
+            }
         }
         (None, Some(h)) => {
-            // Accept both an id (e.g. "codex") and an env-alias (e.g. "claude-code").
             let spec = crate::harness::by_id(h, registry).or_else(|| {
                 crate::harness::canonicalize_input(h, registry)
                     .and_then(|id| crate::harness::by_id(id, registry))
@@ -492,13 +494,16 @@ mod tests {
 
     // ---- resolve_write_targets --------------------------------------------
 
-    use crate::harness::{HarnessSpec, TranscriptParserKind, REGISTRY};
+    use crate::harness::{HarnessSpec, RulesStrategy, TranscriptParserKind, REGISTRY};
 
     const GEMINI_SPEC: HarnessSpec = HarnessSpec {
         id: "gemini",
         display_name: "Gemini CLI",
         binary: "gemini",
         rules_file: "GEMINI.md",
+        rules_strategy: RulesStrategy::Import {
+            directive: "@./AGENTS.md",
+        },
         write_rules_default: false,
         client_info_aliases: &["gemini"],
         env_aliases: &["gemini"],
@@ -580,6 +585,105 @@ mod tests {
     }
 
     #[test]
+    fn resolve_write_targets_target_can_dedupe_duplicate_native_rules_files() {
+        const AGENTS_NATIVE_1: HarnessSpec = HarnessSpec {
+            id: "agents-native-1",
+            display_name: "Agents Native 1",
+            binary: "agents-native-1",
+            rules_file: "AGENTS.md",
+            rules_strategy: RulesStrategy::Native,
+            write_rules_default: true,
+            client_info_aliases: &[],
+            env_aliases: &[],
+            additional_context_support: false,
+            occupancy_support: false,
+            transcript_parser: TranscriptParserKind::None,
+        };
+
+        const AGENTS_NATIVE_2: HarnessSpec = HarnessSpec {
+            id: "agents-native-2",
+            display_name: "Agents Native 2",
+            binary: "agents-native-2",
+            rules_file: "AGENTS.md",
+            rules_strategy: RulesStrategy::Native,
+            write_rules_default: false,
+            client_info_aliases: &[],
+            env_aliases: &[],
+            additional_context_support: false,
+            occupancy_support: false,
+            transcript_parser: TranscriptParserKind::None,
+        };
+
+        let reg = [REGISTRY[0], REGISTRY[1], AGENTS_NATIVE_1, AGENTS_NATIVE_2];
+        let targets = resolve_write_targets(Some("AGENTS.md"), None, &reg).unwrap();
+        assert_eq!(targets, vec!["AGENTS.md"]);
+        let defaults = resolve_write_targets(None, None, &reg).unwrap();
+        assert_eq!(defaults, vec!["CLAUDE.md", "AGENTS.md"]);
+    }
+
+    #[test]
+    fn resolve_write_targets_target_rejects_conflicting_rules_strategy() {
+        const SPEC_IMPORT: HarnessSpec = HarnessSpec {
+            id: "agents-import",
+            display_name: "Agents Import",
+            binary: "agents-import",
+            rules_file: "CLAUDE.md",
+            rules_strategy: RulesStrategy::Import {
+                directive: "@AGENTS.md",
+            },
+            write_rules_default: true,
+            client_info_aliases: &[],
+            env_aliases: &[],
+            additional_context_support: false,
+            occupancy_support: false,
+            transcript_parser: TranscriptParserKind::None,
+        };
+
+        const SPEC_COPY: HarnessSpec = HarnessSpec {
+            id: "agents-copy",
+            display_name: "Agents Copy",
+            binary: "agents-copy",
+            rules_file: "CLAUDE.md",
+            rules_strategy: RulesStrategy::Copy,
+            write_rules_default: true,
+            client_info_aliases: &[],
+            env_aliases: &[],
+            additional_context_support: false,
+            occupancy_support: false,
+            transcript_parser: TranscriptParserKind::None,
+        };
+
+        const SPECS: [HarnessSpec; 4] = [REGISTRY[0], REGISTRY[1], SPEC_IMPORT, SPEC_COPY];
+
+        let err = resolve_write_targets(Some("CLAUDE.md"), None, &SPECS).unwrap_err();
+        let message = err.to_string();
+        assert!(matches!(err, MemoryError::Validation(_)));
+        assert!(
+            message.contains("conflicting rules_strategy"),
+            "expected conflict error, got: {message}"
+        );
+
+        let err = resolve_write_targets(None, None, &SPECS).unwrap_err();
+        let message = err.to_string();
+        assert!(matches!(err, MemoryError::Validation(_)));
+        assert!(
+            message.contains("conflicting rules_strategy"),
+            "expected conflict error, got: {message}"
+        );
+    }
+
+    #[test]
+    fn default_rules_targets_excludes_non_default_synthetic_gemini() {
+        let reg = three_entry_registry();
+        let targets = crate::harness::default_rules_targets(&reg)
+            .expect("default target resolution should succeed for non-conflicting registry");
+        assert!(
+            !targets.contains(&"GEMINI.md"),
+            "non-default synthetic entry must be excluded"
+        );
+    }
+
+    #[test]
     fn resolve_write_targets_synthetic_gemini_in_injected_registry() {
         let reg = three_entry_registry();
         let targets = resolve_write_targets(None, Some("gemini"), &reg).unwrap();
@@ -589,7 +693,8 @@ mod tests {
     #[test]
     fn default_rules_targets_injected_excludes_non_default() {
         let reg = three_entry_registry();
-        let targets = crate::harness::default_rules_targets(&reg);
+        let targets = crate::harness::default_rules_targets(&reg)
+            .expect("default target resolution should succeed for non-conflicting registry");
         assert!(!targets.contains(&"GEMINI.md"));
         assert_eq!(targets, vec!["CLAUDE.md", "AGENTS.md"]);
     }
