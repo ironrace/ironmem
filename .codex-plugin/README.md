@@ -14,16 +14,30 @@ Persistent workspace memory for Codex using the local Rust `ironmem` binary.
 
 ## Memory protocol
 
-The memory protocol is single-sourced from the `MEMORY_PROTOCOL` constant in `crates/ironmem/src/bootstrap.rs`. Stamp it into your rules file with the explicit, opt-in command (no hook runs it for you):
+The memory protocol is single-sourced from the `MEMORY_PROTOCOL` constant in
+`crates/ironmem/src/bootstrap.rs` and is written as the canonical managed block in
+`AGENTS.md`:
 
 ```bash
-ironmem write-rules --target AGENTS.md
+ironmem write-rules --harness codex
 ```
 
 The protocol tells Codex to use `add_drawer` with `logical_key` for mutable
 current context and to treat collab plan/task/checkpoint drawers as operational
 artifacts that can be reviewed with `ironmem memory gc --dry-run` before any
 `--apply` pruning.
+
+Result shape:
+
+```markdown
+<!-- AGENTS.md -->
+... user content ...
+<!-- BEGIN IRONMEM MEMORY PROTOCOL -->
+<!-- Managed by `ironmem write-rules`. Do not edit between these markers. -->
+Before answering questions about prior work, decisions, project history, or people, check search or KG tools first. Write important durable decisions back to memory. For mutable current task/project context, use add_drawer with logical_key so the latest state overwrites stale copies instead of accumulating forever. Treat collab-plans, collab-task-lists, and collab-checkpoints as operational artifacts; prefer compact durable summaries for long-term recall and prune stale operational drawers with ironmem memory gc --dry-run before --apply.
+<!-- END IRONMEM MEMORY PROTOCOL -->
+... user content ...
+```
 
 ## Bundled skills
 

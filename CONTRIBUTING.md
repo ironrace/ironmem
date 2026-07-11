@@ -121,7 +121,8 @@ constant. The fields are:
 | `id` | Lowercase slug (`[a-z0-9][a-z0-9_-]*`) — used in CLI output, metrics, and hook paths. |
 | `display_name` | Human-readable name shown in `ironmem harnesses` output. |
 | `binary` | Executable name carried in the spec; used to derive `Harness::binary()` and `Harness::label()` for the existing `claude`/`codex` launch subcommands, printed in `ironmem harnesses` output, and fed to the `launch_invocation` arg-builder helper. |
-| `rules_file` | File written by `ironmem write-rules --harness <id>` (e.g. `"GEMINI.md"`). |
+| `rules_file` | Target filename written by `ironmem write-rules --harness <id>` (for example, `"CUSTOM_TOOL.md"`). |
+| `rules_strategy` | How dependent files are hydrated from canonical rules; one of `native`, `import`, or `copy`. See decision order below. |
 | `write_rules_default` | `true` to include this harness in a no-flag `ironmem write-rules` run. |
 | `client_info_aliases` | Substrings matched against `initialize.clientInfo.name` (lowercased) to attribute MCP sessions. |
 | `env_aliases` | Strings accepted by `IRONMEM_HARNESS` that map to this harness. |
@@ -132,6 +133,17 @@ constant. The fields are:
 > **What a `REGISTRY` entry enables:** attribution in `ironmem harnesses` output,
 > hook dispatch, `ironmem write-rules --harness <id>`, a doctor check row, metrics
 > persistence, and packaging drift-lint coverage.
+>
+> **`rules_strategy` selection (for write-rules):**
+> - **Native**: only valid for `AGENTS.md`. Use only when the harness reads this file directly.
+> - **Import**: preferred for dependent files that support a stable include directive.
+>    Choose this only when you can cite primary documentation in your PR that the
+>    harness reads that directive.
+> - **Copy**: fallback when the harness has no import support.
+>
+> When multiple harnesses share the same `rules_file`, their strategies must be
+> identical. `rules_strategy` conflicts on shared filenames are treated as invalid
+> registry state.
 >
 > **Doctor detection is advisory by default.** A new `REGISTRY` entry produces a
 > doctor check row, but with only an `Info`-level "registration detection not yet
