@@ -5,7 +5,7 @@
 //! bootstrap, or serve path ever calls this.
 
 use std::io::Write;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use crate::error::MemoryError;
 
@@ -14,7 +14,10 @@ const END_MARKER: &str = "<!-- END IRONMEM MEMORY PROTOCOL -->";
 const NOTICE: &str =
     "<!-- Managed by `ironmem write-rules`. Do not edit between these markers. -->";
 
-/// Outcome of a single `write_rules_file` call, for CLI reporting.
+/// Canonical rules file used as the source of truth for synthetic harness updates.
+pub const CANONICAL_RULES_FILE: &str = "AGENTS.md";
+
+/// Outcome of a single managed write, for CLI reporting.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WriteOutcome {
     Created,
@@ -22,56 +25,48 @@ pub enum WriteOutcome {
     Unchanged,
 }
 
-/// Render the managed block: BEGIN marker, notice, protocol, END marker — each
-/// on its own line (LF), with a single trailing newline. Deterministic.
-pub fn render_block(protocol: &str) -> String {
-    format!("{BEGIN_MARKER}\n{NOTICE}\n{protocol}\n{END_MARKER}\n")
+/// A preflighted write plan entry ready for batched persistence.
+#[derive(Debug, Clone)]
+pub struct WritePlanItem {
+    pub target_path: PathBuf,
+    pub planned_contents: String,
+    pub existing_metadata: Option<std::fs::Metadata>,
+    pub existing_contents: String,
 }
 
-/// Insert or replace the managed block in `existing`, returning the new content.
+#[derive(Debug, Clone, Copy)]
+struct StrategyTarget {
+    rules_file: &'static str,
+    rules_strategy: crate::harness::RulesStrategy,
+}
+
+/// Render a managed block: BEGIN marker, notice, contents, END marker — each on
+/// its own line (LF), with a single trailing newline. Deterministic.
+pub fn render_block(contents: &str) -> String {
+    format!("{BEGIN_MARKER}\n{NOTICE}\n{contents}\n{END_MARKER}\n")
+}
+
+/// Insert or replace a managed block in `existing`, returning the resulting text.
 ///
 /// - No markers: append `block`, separated from non-empty content by exactly one
 ///   blank line. Empty/whitespace-only input returns `block` alone.
 /// - Exactly one well-formed block (one BEGIN, one END, BEGIN before END):
-///   replace the block (and its single trailing newline) in place, preserving
-///   everything before and after byte-for-byte.
+///   replace the block in place, consuming a trailing newline after END and
+///   preserving everything else byte-for-byte.
 /// - Anything else (one marker only, END before BEGIN, duplicate pairs): return
 ///   an error so the caller can leave existing content untouched.
 pub fn upsert_block(existing: &str, block: &str) -> Result<String, MemoryError> {
-    let begins = existing.matches(BEGIN_MARKER).count();
-    let ends = existing.matches(END_MARKER).count();
+    let region = managed_block_region(existing)?;
 
-    match (begins, ends) {
-        (0, 0) => Ok(append_block(existing, block)),
-        (1, 1) => {
-            let begin_idx = existing
-                .find(BEGIN_MARKER)
-                .expect("counted exactly one BEGIN");
-            let end_idx = existing.find(END_MARKER).expect("counted exactly one END");
-            if begin_idx > end_idx {
-                return Err(MemoryError::Validation(
-                    "ironmem managed block is malformed: END marker precedes BEGIN marker".into(),
-                ));
-            }
-            let after_end = end_idx + END_MARKER.len();
-            // Consume one trailing line ending after END so replacement stays idempotent.
-            let region_end = if existing[after_end..].starts_with("\r\n") {
-                after_end + 2
-            } else if existing[after_end..].starts_with('\n') {
-                after_end + 1
-            } else {
-                after_end
-            };
+    match region {
+        None => Ok(append_block(existing, block)),
+        Some((begin_idx, _end_idx, region_end)) => {
             let mut result = String::with_capacity(existing.len() + block.len());
             result.push_str(&existing[..begin_idx]);
             result.push_str(block);
             result.push_str(&existing[region_end..]);
             Ok(result)
         }
-        _ => Err(MemoryError::Validation(format!(
-            "ironmem managed block is malformed: found {begins} BEGIN and {ends} END markers \
-             (expected exactly one of each)"
-        ))),
     }
 }
 
@@ -100,41 +95,53 @@ fn trim_trailing_line_endings(mut value: &str) -> &str {
     }
 }
 
-/// Resolve which rules files `write-rules` should target.
-///
-/// - Both `target` and `harness` `None` → all `default_rules_targets` (e.g. CLAUDE.md, AGENTS.md).
-/// - `target` `Some` → validate it equals one of the registry `rules_file`s; error listing allowed
-///   targets otherwise.
-/// - `harness` `Some` → canonicalize/look up the harness (accepts both ids like `"codex"` and
-///   env-aliases like `"claude-code"`); resolve to its `rules_file`; error if unknown harness.
-///
-/// `target` and `harness` are mutually exclusive — the caller (clap) enforces this.
-pub fn resolve_write_targets(
+/// Resolve strategy-bearing requested targets from `target` / `harness`.
+fn resolve_strategy_targets(
     target: Option<&str>,
     harness: Option<&str>,
     registry: &[crate::harness::HarnessSpec],
-) -> Result<Vec<&'static str>, MemoryError> {
-    // Validate strategy/file invariants before resolving any target.
+) -> Result<Vec<StrategyTarget>, MemoryError> {
+    // Validate strategy invariants and de-duplicate by file/strategy.
     let normalized =
         crate::harness::rules_file_entries(registry).map_err(MemoryError::Validation)?;
-    let mut allowed_files: Vec<&'static str> =
-        normalized.iter().map(|entry| entry.rules_file).collect();
+
+    let mut selected: Vec<StrategyTarget> = Vec::new();
 
     match (target, harness) {
         (None, None) => {
-            crate::harness::default_rules_targets(registry).map_err(MemoryError::Validation)
+            for spec in registry.iter().filter(|spec| spec.write_rules_default) {
+                if let Some(entry) = normalized
+                    .iter()
+                    .find(|entry| entry.rules_file == spec.rules_file)
+                {
+                    if !selected
+                        .iter()
+                        .any(|existing| existing.rules_file == entry.rules_file)
+                    {
+                        selected.push(StrategyTarget {
+                            rules_file: entry.rules_file,
+                            rules_strategy: entry.rules_strategy,
+                        });
+                    }
+                }
+            }
         }
         (Some(t), None) => {
             if let Some(entry) = normalized.iter().find(|entry| entry.rules_file == t) {
-                Ok(vec![entry.rules_file])
+                selected.push(StrategyTarget {
+                    rules_file: entry.rules_file,
+                    rules_strategy: entry.rules_strategy,
+                });
             } else {
-                allowed_files.sort_unstable();
-                allowed_files.dedup();
-                Err(MemoryError::Validation(format!(
+                let mut allowed: Vec<&str> =
+                    normalized.iter().map(|entry| entry.rules_file).collect();
+                allowed.sort_unstable();
+                allowed.dedup();
+                return Err(MemoryError::Validation(format!(
                     "unknown target '{}': allowed targets are {}",
                     t,
-                    allowed_files.join(", ")
-                )))
+                    allowed.join(", ")
+                )));
             }
         }
         (None, Some(h)) => {
@@ -142,33 +149,212 @@ pub fn resolve_write_targets(
                 crate::harness::canonicalize_input(h, registry)
                     .and_then(|id| crate::harness::by_id(id, registry))
             });
-            spec.map(|s| vec![s.rules_file]).ok_or_else(|| {
+            let spec = spec.ok_or_else(|| {
                 let mut known: Vec<&str> = registry.iter().map(|s| s.id).collect();
                 known.sort_unstable();
+                known.dedup();
                 MemoryError::Validation(format!(
                     "unknown harness '{}': known harnesses are {}",
                     h,
                     known.join(", ")
                 ))
-            })
+            })?;
+
+            if let Some(entry) = normalized
+                .iter()
+                .find(|entry| entry.rules_file == spec.rules_file)
+            {
+                selected.push(StrategyTarget {
+                    rules_file: entry.rules_file,
+                    rules_strategy: entry.rules_strategy,
+                });
+            }
         }
         (Some(_), Some(_)) => {
-            // clap's `conflicts_with` prevents this branch in production.
-            Err(MemoryError::Validation(
+            return Err(MemoryError::Validation(
                 "--target and --harness are mutually exclusive".into(),
-            ))
+            ));
         }
+    }
+
+    Ok(selected)
+}
+
+/// Resolve which files `write-rules` should target.
+///
+/// This legacy helper keeps existing CLI behavior: it returns deduplicated target
+/// filenames and surfaces the same validation errors as the strategy-aware planner.
+pub fn resolve_write_targets(
+    target: Option<&str>,
+    harness: Option<&str>,
+    registry: &[crate::harness::HarnessSpec],
+) -> Result<Vec<&'static str>, MemoryError> {
+    Ok(resolve_strategy_targets(target, harness, registry)?
+        .into_iter()
+        .map(|entry| entry.rules_file)
+        .collect())
+}
+
+/// Build an ordered, preflighted write plan.
+///
+/// Canonical rules (`AGENTS.md`) is always projected first, then deduplicated
+/// dependent files are written in target order.
+pub fn build_write_rules_plan(
+    workspace: &Path,
+    target: Option<&str>,
+    harness: Option<&str>,
+    registry: &[crate::harness::HarnessSpec],
+) -> Result<Vec<WritePlanItem>, MemoryError> {
+    let targets = resolve_strategy_targets(target, harness, registry)?;
+
+    let need_canonical = targets
+        .iter()
+        .any(|entry| entry.rules_file == CANONICAL_RULES_FILE)
+        || targets
+            .iter()
+            .any(|entry| entry.rules_strategy != crate::harness::RulesStrategy::Native);
+
+    let mut plan = Vec::new();
+    let mut projected_canonical = None;
+
+    if need_canonical {
+        let canonical_path = workspace.join(CANONICAL_RULES_FILE);
+        let canonical_block = render_block(crate::bootstrap::MEMORY_PROTOCOL);
+        let (canonical_metadata, canonical_existing) = read_rules_target(&canonical_path)?;
+        let canonical_planned = upsert_block(&canonical_existing, &canonical_block)?;
+
+        let canonical_entry = WritePlanItem {
+            target_path: canonical_path,
+            planned_contents: canonical_planned.clone(),
+            existing_metadata: canonical_metadata,
+            existing_contents: canonical_existing,
+        };
+        projected_canonical = Some(canonical_entry.planned_contents.clone());
+        plan.push(canonical_entry);
+    }
+
+    for target in targets {
+        if target.rules_file == CANONICAL_RULES_FILE {
+            continue;
+        }
+
+        let dependency_contents = match target.rules_strategy {
+            crate::harness::RulesStrategy::Native => {
+                continue;
+            }
+            crate::harness::RulesStrategy::Import { directive } => directive.to_owned(),
+            crate::harness::RulesStrategy::Copy => {
+                let projected = projected_canonical.as_ref().ok_or_else(|| {
+                    MemoryError::Validation("missing canonical projection for copy target".into())
+                })?;
+                flatten_and_rewrap_agent_canonical_rules(projected)?
+            }
+        };
+
+        let target_path = workspace.join(target.rules_file);
+        let (metadata, existing) = read_rules_target(&target_path)?;
+        let rendered = render_block(&dependency_contents);
+        let planned_contents = upsert_block(&existing, &rendered)?;
+
+        plan.push(WritePlanItem {
+            target_path,
+            planned_contents,
+            existing_metadata: metadata,
+            existing_contents: existing,
+        });
+    }
+
+    Ok(plan)
+}
+
+/// Apply a write plan. The caller can render outcomes directly.
+pub fn apply_write_rules_plan(
+    plan: &[WritePlanItem],
+) -> Result<Vec<(PathBuf, WriteOutcome)>, MemoryError> {
+    let mut preflight_matches: Vec<bool> = Vec::with_capacity(plan.len());
+    for item in plan {
+        let (metadata, existing) = read_rules_target(&item.target_path)?;
+        if !existing_contents_and_metadata_match(item, &existing, &metadata) {
+            return Err(MemoryError::Validation(format!(
+                "ironmem write-rules preflight detected out-of-date state for {}",
+                item.target_path.display()
+            )));
+        }
+        let _ = upsert_block(&existing, &item.planned_contents)?;
+        preflight_matches.push(existing == item.planned_contents);
+    }
+
+    let mut outcomes = Vec::new();
+    for (item, unchanged) in plan.iter().zip(preflight_matches.iter()) {
+        let outcome = if *unchanged {
+            WriteOutcome::Unchanged
+        } else {
+            write_atomic(
+                &item.target_path,
+                &item.planned_contents,
+                item.existing_metadata.as_ref(),
+            )?;
+            if item.existing_metadata.is_some() {
+                WriteOutcome::Updated
+            } else {
+                WriteOutcome::Created
+            }
+        };
+        outcomes.push((item.target_path.clone(), outcome));
+    }
+
+    Ok(outcomes)
+}
+
+fn existing_contents_and_metadata_match(
+    item: &WritePlanItem,
+    current: &str,
+    current_metadata: &Option<std::fs::Metadata>,
+) -> bool {
+    if current == item.planned_contents {
+        return true;
+    }
+
+    if current != item.existing_contents {
+        return false;
+    }
+
+    match (&item.existing_metadata, current_metadata) {
+        (None, None) => true,
+        (Some(before), Some(after)) => metadata_unchanged(before, after),
+        (None, Some(_)) => false,
+        (Some(_), None) => false,
     }
 }
 
-/// Read `target_path` (missing = empty), upsert the block rendered from
-/// `protocol`, and write atomically. Skips the write when the result is
-/// byte-identical to the existing file.
-pub fn write_rules_file(target_path: &Path, protocol: &str) -> Result<WriteOutcome, MemoryError> {
+fn metadata_unchanged(before: &std::fs::Metadata, after: &std::fs::Metadata) -> bool {
+    if before.file_type() != after.file_type() {
+        return false;
+    }
+    if before.permissions().readonly() != after.permissions().readonly() {
+        return false;
+    }
+    if before.len() != after.len() {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if before.permissions().mode() != after.permissions().mode() {
+            return false;
+        }
+    }
+    true
+}
+
+/// Insert or replace managed content in `target_path` using `contents`, and write
+/// atomically. Skips the write when resulting content is byte-identical to the
+/// existing file.
+pub fn write_rules_file(target_path: &Path, contents: &str) -> Result<WriteOutcome, MemoryError> {
     let (target_metadata, current) = read_rules_target(target_path)?;
     let existed = target_metadata.is_some();
 
-    let block = render_block(protocol);
+    let block = render_block(contents);
     let updated = upsert_block(&current, &block)?;
 
     if existed && updated == current {
@@ -183,9 +369,9 @@ pub fn write_rules_file(target_path: &Path, protocol: &str) -> Result<WriteOutco
 }
 
 /// Validate that `target_path` can be read and upserted without writing it.
-pub fn validate_rules_file(target_path: &Path, protocol: &str) -> Result<(), MemoryError> {
+pub fn validate_rules_file(target_path: &Path, contents: &str) -> Result<(), MemoryError> {
     let (_target_metadata, current) = read_rules_target(target_path)?;
-    let block = render_block(protocol);
+    let block = render_block(contents);
     upsert_block(&current, &block)?;
     Ok(())
 }
@@ -210,6 +396,95 @@ fn read_rules_target(
         String::new()
     };
     Ok((target_metadata, current))
+}
+
+fn managed_block_region(contents: &str) -> Result<Option<(usize, usize, usize)>, MemoryError> {
+    let begins = contents.matches(BEGIN_MARKER).count();
+    let ends = contents.matches(END_MARKER).count();
+
+    match (begins, ends) {
+        (0, 0) => Ok(None),
+        (1, 1) => {
+            let begin_idx = contents
+                .find(BEGIN_MARKER)
+                .expect("counted exactly one BEGIN marker");
+            let end_idx = contents
+                .find(END_MARKER)
+                .expect("counted exactly one END marker");
+            if begin_idx > end_idx {
+                return Err(MemoryError::Validation(
+                    "ironmem managed block is malformed: END marker precedes BEGIN marker".into(),
+                ));
+            }
+            let mut region_end = end_idx + END_MARKER.len();
+            region_end = if contents[region_end..].starts_with("\r\n") {
+                region_end + 2
+            } else if contents[region_end..].starts_with('\n') {
+                region_end + 1
+            } else {
+                region_end
+            };
+            Ok(Some((begin_idx, end_idx, region_end)))
+        }
+        _ => Err(MemoryError::Validation(format!(
+            "ironmem managed block is malformed: found {begins} BEGIN and {ends} END markers (expected exactly one of each)"
+        ))),
+    }
+}
+
+fn flatten_and_rewrap_agent_canonical_rules(contents: &str) -> Result<String, MemoryError> {
+    let (begin_idx, end_idx, end_region_end) =
+        managed_block_region(contents)?.ok_or_else(|| {
+            MemoryError::Validation(
+                "ironmem managed block is malformed: no markers found in canonical rules".into(),
+            )
+        })?;
+
+    let mut body = &contents[begin_idx + BEGIN_MARKER.len()..end_idx];
+    body = strip_single_newline(body).ok_or_else(|| {
+        MemoryError::Validation(
+            "ironmem managed block is malformed: expected newline after BEGIN marker".into(),
+        )
+    })?;
+
+    if !body.starts_with(NOTICE) {
+        return Err(MemoryError::Validation(
+            "ironmem managed block is malformed: missing managed NOTICE line".into(),
+        ));
+    }
+    body = &body[NOTICE.len()..];
+    let flattened = strip_single_newline(body).ok_or_else(|| {
+        MemoryError::Validation(
+            "ironmem managed block is malformed: expected managed contents line".into(),
+        )
+    })?;
+
+    let before = &contents[..begin_idx];
+    let after = &contents[end_region_end..];
+    let flattened = format!("{before}{flattened}{after}");
+    let flattened = strip_trailing_single_line_ending(flattened);
+    Ok(flattened)
+}
+
+fn strip_single_newline(value: &str) -> Option<&str> {
+    if let Some(next) = value.strip_prefix("\r\n") {
+        return Some(next);
+    }
+    value.strip_prefix('\n')
+}
+
+fn strip_trailing_single_newline(value: &str) -> Option<&str> {
+    if let Some(next) = value.strip_suffix("\r\n") {
+        return Some(next);
+    }
+    value.strip_suffix('\n')
+}
+
+fn strip_trailing_single_line_ending(value: String) -> String {
+    if let Some(stripped) = strip_trailing_single_newline(&value) {
+        return stripped.to_owned();
+    }
+    value
 }
 
 fn write_atomic(
@@ -313,7 +588,7 @@ fn sync_parent_dir(_path: &Path) -> Result<(), MemoryError> {
     Ok(())
 }
 
-fn temp_path_for(path: &Path) -> std::path::PathBuf {
+fn temp_path_for(path: &Path) -> PathBuf {
     let unique = format!(
         ".{}.tmp-{}-{}",
         path.file_name()
@@ -335,14 +610,27 @@ mod tests {
     const PROTO: &str = "Always check memory first. Write durable summaries after.";
 
     #[test]
-    fn render_block_is_deterministic_and_contains_protocol() {
+    fn render_block_is_deterministic_and_contains_contents() {
         let a = render_block(PROTO);
         let b = render_block(PROTO);
         assert_eq!(a, b, "render must be deterministic");
-        assert!(a.contains(PROTO), "block must contain the protocol text");
+        assert!(a.contains(PROTO), "block must contain the managed contents");
         assert!(a.starts_with(BEGIN_MARKER));
         assert!(a.trim_end().ends_with(END_MARKER));
+        assert_eq!(a.matches(BEGIN_MARKER).count(), 1);
+        assert_eq!(a.matches(END_MARKER).count(), 1);
         assert!(a.ends_with('\n'), "block ends with a trailing newline");
+    }
+
+    #[test]
+    fn render_block_wraps_arbitrary_contents() {
+        let directive = "@./AGENTS.md";
+        let a = render_block(directive);
+        let b = render_block(directive);
+        assert_eq!(a, b);
+        assert!(a.contains(directive));
+        assert_eq!(a.matches(BEGIN_MARKER).count(), 1);
+        assert_eq!(a.matches(END_MARKER).count(), 1);
     }
 
     #[test]
@@ -492,7 +780,7 @@ mod tests {
         assert_eq!(mode, 0o600, "existing file mode must be preserved");
     }
 
-    // ---- resolve_write_targets --------------------------------------------
+    // ---- plan helpers ---------------------------------------------
 
     use crate::harness::{HarnessSpec, RulesStrategy, TranscriptParserKind, REGISTRY};
 
@@ -697,6 +985,434 @@ mod tests {
             .expect("default target resolution should succeed for non-conflicting registry");
         assert!(!targets.contains(&"GEMINI.md"));
         assert_eq!(targets, vec!["CLAUDE.md", "AGENTS.md"]);
+    }
+
+    // ---- plan tests (new behavior) ----------------------------------
+
+    const DECLARED_COPY_SPEC: HarnessSpec = HarnessSpec {
+        id: "agents-copy-harness",
+        display_name: "Agents Copy Harness",
+        binary: "agents-copy-harness",
+        rules_file: "CLAUDE.md",
+        rules_strategy: RulesStrategy::Copy,
+        write_rules_default: true,
+        client_info_aliases: &[],
+        env_aliases: &[],
+        additional_context_support: false,
+        occupancy_support: false,
+        transcript_parser: TranscriptParserKind::None,
+    };
+
+    const DECLARED_IMPORT_SPEC: HarnessSpec = HarnessSpec {
+        id: "agents-import-harness",
+        display_name: "Agents Import Harness",
+        binary: "agents-import-harness",
+        rules_file: "CLAUDE.md",
+        rules_strategy: RulesStrategy::Import {
+            directive: "@./AGENTS.md",
+        },
+        write_rules_default: false,
+        client_info_aliases: &[],
+        env_aliases: &[],
+        additional_context_support: false,
+        occupancy_support: false,
+        transcript_parser: TranscriptParserKind::None,
+    };
+
+    const SYNTHEX_GROK_SPEC: HarnessSpec = HarnessSpec {
+        id: "grok",
+        display_name: "Synthetic Grok",
+        binary: "grok",
+        rules_file: "AGENTS.md",
+        rules_strategy: RulesStrategy::Native,
+        write_rules_default: false,
+        client_info_aliases: &[],
+        env_aliases: &["grok"],
+        additional_context_support: false,
+        occupancy_support: false,
+        transcript_parser: TranscriptParserKind::None,
+    };
+
+    fn to_path_contents(plan: &[WritePlanItem]) -> Vec<(PathBuf, String)> {
+        plan.iter()
+            .map(|item| (item.target_path.clone(), item.planned_contents.clone()))
+            .collect()
+    }
+
+    #[test]
+    fn build_plan_for_import_uses_directive_without_protocol_duplicate() {
+        let reg = [DECLARED_IMPORT_SPEC];
+        let dir = tempfile::tempdir().unwrap();
+
+        let plan = build_write_rules_plan(dir.path(), Some("CLAUDE.md"), None, &reg).unwrap();
+
+        assert_eq!(plan.len(), 2);
+        assert_eq!(
+            plan[0].target_path.file_name().unwrap(),
+            CANONICAL_RULES_FILE
+        );
+        assert_eq!(plan[1].target_path.file_name().unwrap(), "CLAUDE.md");
+        assert_eq!(plan[1].planned_contents, render_block("@./AGENTS.md"));
+        assert!(!plan[1]
+            .planned_contents
+            .contains(crate::bootstrap::MEMORY_PROTOCOL));
+    }
+
+    #[test]
+    fn build_plan_for_copy_preserves_human_text_protocol_and_single_wrapped_markers() {
+        let reg = [REGISTRY[1], DECLARED_COPY_SPEC];
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join(CANONICAL_RULES_FILE),
+            "# Human-authored block\n\nold\n\n",
+        )
+        .unwrap();
+
+        let plan = build_write_rules_plan(dir.path(), Some("CLAUDE.md"), None, &reg).unwrap();
+        assert_eq!(plan.len(), 2);
+
+        let copy_entry = &plan[1];
+        assert_eq!(copy_entry.target_path.file_name().unwrap(), "CLAUDE.md");
+        assert_eq!(copy_entry.planned_contents.matches(BEGIN_MARKER).count(), 1);
+        assert_eq!(copy_entry.planned_contents.matches(END_MARKER).count(), 1);
+        assert!(copy_entry
+            .planned_contents
+            .contains("# Human-authored block"));
+        assert!(copy_entry
+            .planned_contents
+            .contains(crate::bootstrap::MEMORY_PROTOCOL));
+        assert_eq!(
+            copy_entry
+                .planned_contents
+                .matches(crate::bootstrap::MEMORY_PROTOCOL)
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn build_plan_for_copy_has_flattened_single_newline_before_end_marker() {
+        let reg = [DECLARED_COPY_SPEC];
+        let dir = tempfile::tempdir().unwrap();
+
+        let plan = build_write_rules_plan(dir.path(), Some("CLAUDE.md"), None, &reg).unwrap();
+        let copy_entry = &plan[1];
+        assert_eq!(
+            copy_entry.planned_contents,
+            render_block(crate::bootstrap::MEMORY_PROTOCOL)
+        );
+        let no_double_newline = format!(
+            "{NOTICE}\n{}\n{END_MARKER}\n",
+            crate::bootstrap::MEMORY_PROTOCOL
+        );
+        assert!(
+            copy_entry.planned_contents.ends_with(&no_double_newline),
+            "flattened copy payload must terminate protocol with single newline"
+        );
+        let double_newline = format!(
+            "{NOTICE}\n{}\n\n{END_MARKER}\n",
+            crate::bootstrap::MEMORY_PROTOCOL
+        );
+        assert!(
+            !copy_entry.planned_contents.contains(&double_newline),
+            "exactly one newline is required between protocol and outer END marker"
+        );
+    }
+
+    #[test]
+    fn build_plan_for_copy_with_trailing_human_content_has_single_newline_before_end_marker() {
+        let reg = [DECLARED_COPY_SPEC];
+        let dir = tempfile::tempdir().unwrap();
+        let canonical_input = format!(
+            "# Human-authored block\n{BEGIN_MARKER}\n{NOTICE}\n{protocol}\n{END_MARKER}\nTrailing note\n",
+            protocol = crate::bootstrap::MEMORY_PROTOCOL,
+        );
+
+        std::fs::write(dir.path().join(CANONICAL_RULES_FILE), canonical_input).unwrap();
+
+        let plan = build_write_rules_plan(dir.path(), Some("CLAUDE.md"), None, &reg).unwrap();
+        let copy_entry = &plan[1];
+        assert_eq!(copy_entry.target_path.file_name().unwrap(), "CLAUDE.md");
+
+        let flattened_single = format!("Trailing note\n{END_MARKER}\n");
+        let flattened_double = format!("Trailing note\n\n{END_MARKER}\n");
+        assert!(
+            copy_entry.planned_contents.contains(&flattened_single),
+            "trailing human content must remain and be followed by exactly one newline"
+        );
+        assert!(
+            !copy_entry.planned_contents.contains(&flattened_double),
+            "flattening must normalize one trailing line ending before render_block"
+        );
+    }
+
+    #[test]
+    fn build_plan_for_copy_rejects_malformed_markers() {
+        let reg = [REGISTRY[1], DECLARED_COPY_SPEC];
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join(CANONICAL_RULES_FILE),
+            format!(
+                "# Human-authored block\n{}\n{}\n",
+                BEGIN_MARKER, // reversed: missing end marker
+                "No managed payload"
+            ),
+        )
+        .unwrap();
+
+        assert!(build_write_rules_plan(dir.path(), Some("CLAUDE.md"), None, &reg).is_err());
+    }
+
+    #[test]
+    fn build_plan_for_copy_rejects_duplicate_markers() {
+        let reg = [REGISTRY[1], DECLARED_COPY_SPEC];
+        let dir = tempfile::tempdir().unwrap();
+        let malformed = format!(
+            "{BEGIN_MARKER}\n{NOTICE}\nfirst\n{END_MARKER}\n{BEGIN_MARKER}\nsecond\n{END_MARKER}\n"
+        );
+        std::fs::write(dir.path().join(CANONICAL_RULES_FILE), malformed).unwrap();
+
+        assert!(build_write_rules_plan(dir.path(), Some("CLAUDE.md"), None, &reg).is_err());
+    }
+
+    #[test]
+    fn build_plan_for_copy_rejects_reversed_markers() {
+        let reg = [REGISTRY[1], DECLARED_COPY_SPEC];
+        let dir = tempfile::tempdir().unwrap();
+        let malformed = format!("{END_MARKER}\n{NOTICE}\nbody\n{BEGIN_MARKER}\n");
+        std::fs::write(dir.path().join(CANONICAL_RULES_FILE), malformed).unwrap();
+
+        assert!(build_write_rules_plan(dir.path(), Some("CLAUDE.md"), None, &reg).is_err());
+    }
+
+    #[test]
+    fn build_plan_for_non_native_target_writes_canonical_before_dependent() {
+        let reg = [DECLARED_IMPORT_SPEC];
+        let dir = tempfile::tempdir().unwrap();
+
+        let plan = build_write_rules_plan(dir.path(), Some("CLAUDE.md"), None, &reg).unwrap();
+        assert!(plan.len() >= 2);
+        assert_eq!(
+            plan[0].target_path.file_name().unwrap(),
+            CANONICAL_RULES_FILE
+        );
+        assert_eq!(plan[1].target_path.file_name().unwrap(), "CLAUDE.md");
+    }
+
+    #[test]
+    fn build_plan_for_native_harness_collapse_with_synthetic_grok() {
+        let reg = [REGISTRY[1], SYNTHEX_GROK_SPEC];
+        let dir = tempfile::tempdir().unwrap();
+
+        let plan = build_write_rules_plan(dir.path(), None, Some("grok"), &reg).unwrap();
+        assert_eq!(plan.len(), 1);
+        assert_eq!(
+            plan[0].target_path.file_name().unwrap(),
+            CANONICAL_RULES_FILE
+        );
+    }
+
+    #[test]
+    fn build_plan_for_duplicate_invocation_is_byte_identical() {
+        let reg = [DECLARED_COPY_SPEC];
+        let dir = tempfile::tempdir().unwrap();
+
+        let first = build_write_rules_plan(dir.path(), Some("CLAUDE.md"), None, &reg).unwrap();
+        let second = build_write_rules_plan(dir.path(), Some("CLAUDE.md"), None, &reg).unwrap();
+
+        assert_eq!(to_path_contents(&first), to_path_contents(&second));
+    }
+
+    #[test]
+    fn apply_write_rules_plan_preserves_outcomes() {
+        let reg = [DECLARED_IMPORT_SPEC];
+        let dir = tempfile::tempdir().unwrap();
+        let plan = build_write_rules_plan(dir.path(), Some("CLAUDE.md"), None, &reg).unwrap();
+
+        let first = apply_write_rules_plan(&plan).unwrap();
+        assert_eq!(first.len(), 2);
+        assert!(first
+            .iter()
+            .any(|(_, outcome)| *outcome == WriteOutcome::Created));
+
+        let second = apply_write_rules_plan(&plan).unwrap();
+        assert!(second
+            .iter()
+            .any(|(_, outcome)| *outcome == WriteOutcome::Unchanged));
+    }
+
+    #[test]
+    fn apply_write_rules_plan_reapplies_existing_file_without_stale_metadata_failure() {
+        let reg = [DECLARED_IMPORT_SPEC];
+        let dir = tempfile::tempdir().unwrap();
+        let canonical_path = dir.path().join(CANONICAL_RULES_FILE);
+        let dependency_path = dir.path().join("CLAUDE.md");
+
+        std::fs::write(&canonical_path, "# canonical before\n").unwrap();
+        std::fs::write(&dependency_path, "# claude before\n").unwrap();
+
+        let plan = build_write_rules_plan(dir.path(), Some("CLAUDE.md"), None, &reg).unwrap();
+
+        let first = apply_write_rules_plan(&plan).unwrap();
+        assert_eq!(first.len(), 2);
+        assert!(first
+            .iter()
+            .all(|(_, outcome)| *outcome == WriteOutcome::Updated));
+
+        let second = apply_write_rules_plan(&plan).unwrap();
+        assert!(second
+            .iter()
+            .all(|(_, outcome)| *outcome == WriteOutcome::Unchanged));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn apply_write_rules_plan_preflight_symlink_dependency_aborts_without_writes() {
+        use std::os::unix::fs::symlink;
+
+        let reg = [DECLARED_COPY_SPEC];
+        let dir = tempfile::tempdir().unwrap();
+        let canonical_path = dir.path().join(CANONICAL_RULES_FILE);
+        let dependency_path = dir.path().join("CLAUDE.md");
+        let target_file = dir.path().join("REAL_CLAUDE.md");
+
+        std::fs::write(&canonical_path, "# canonical before\n").unwrap();
+        std::fs::write(&target_file, "# real dependent\n").unwrap();
+
+        let plan = build_write_rules_plan(dir.path(), Some("CLAUDE.md"), None, &reg).unwrap();
+        let canonical_before = std::fs::read_to_string(&canonical_path).unwrap();
+
+        std::fs::remove_file(&dependency_path).ok();
+        symlink(&target_file, &dependency_path).unwrap();
+
+        let err = apply_write_rules_plan(&plan).unwrap_err();
+        assert!(matches!(err, MemoryError::Validation(_)));
+
+        assert_eq!(
+            std::fs::read_to_string(&canonical_path).unwrap(),
+            canonical_before
+        );
+        assert!(std::fs::symlink_metadata(&dependency_path)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+    }
+
+    #[test]
+    fn apply_write_rules_plan_preflight_malformed_dependency_contents_aborts_without_writes() {
+        let reg = [DECLARED_COPY_SPEC];
+        let dir = tempfile::tempdir().unwrap();
+        let canonical_path = dir.path().join(CANONICAL_RULES_FILE);
+        let dependency_path = dir.path().join("CLAUDE.md");
+
+        std::fs::write(&canonical_path, "# canonical before\n").unwrap();
+        std::fs::write(&dependency_path, "# stale dependent\n").unwrap();
+
+        let plan = build_write_rules_plan(dir.path(), Some("CLAUDE.md"), None, &reg).unwrap();
+        let canonical_before = std::fs::read_to_string(&canonical_path).unwrap();
+
+        let malformed = format!("{BEGIN_MARKER}\n{NOTICE}\nno trailing end\n");
+        std::fs::write(&dependency_path, malformed).unwrap();
+
+        let err = apply_write_rules_plan(&plan).unwrap_err();
+        assert!(matches!(err, MemoryError::Validation(_)));
+        assert_eq!(
+            std::fs::read_to_string(&canonical_path).unwrap(),
+            canonical_before
+        );
+    }
+
+    #[test]
+    fn apply_write_rules_plan_preflight_readability_error_aborts_without_writes() {
+        let reg = [DECLARED_IMPORT_SPEC];
+        let dir = tempfile::tempdir().unwrap();
+        let canonical_path = dir.path().join(CANONICAL_RULES_FILE);
+        let dependency_path = dir.path().join("CLAUDE.md");
+
+        std::fs::write(&canonical_path, "# canonical before\n").unwrap();
+
+        let plan = build_write_rules_plan(dir.path(), Some("CLAUDE.md"), None, &reg).unwrap();
+        let canonical_before = std::fs::read_to_string(&canonical_path).unwrap();
+
+        std::fs::remove_file(&dependency_path).ok();
+        std::fs::create_dir(&dependency_path).unwrap();
+
+        let err = apply_write_rules_plan(&plan).unwrap_err();
+        assert!(matches!(err, MemoryError::Io(_)));
+        assert_eq!(
+            std::fs::read_to_string(&canonical_path).unwrap(),
+            canonical_before
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn apply_write_rules_plan_preflight_metadata_change_aborts_without_writes() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let reg = [DECLARED_IMPORT_SPEC];
+        let dir = tempfile::tempdir().unwrap();
+        let canonical_path = dir.path().join(CANONICAL_RULES_FILE);
+        let dependency_path = dir.path().join("CLAUDE.md");
+
+        std::fs::write(&canonical_path, "# canonical before\n").unwrap();
+        std::fs::write(&dependency_path, "# stale dependent\n").unwrap();
+        std::fs::set_permissions(&canonical_path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        std::fs::set_permissions(&dependency_path, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+        let plan = build_write_rules_plan(dir.path(), Some("CLAUDE.md"), None, &reg).unwrap();
+        let canonical_before = std::fs::read_to_string(&canonical_path).unwrap();
+
+        std::fs::set_permissions(&canonical_path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        std::fs::set_permissions(&dependency_path, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        let err = apply_write_rules_plan(&plan).unwrap_err();
+        assert!(matches!(err, MemoryError::Validation(_)));
+        assert_eq!(
+            std::fs::read_to_string(&canonical_path).unwrap(),
+            canonical_before
+        );
+        let mode = std::fs::metadata(&canonical_path)
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o644);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn apply_write_rules_plan_preserves_existing_unix_modes() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let reg = [DECLARED_COPY_SPEC];
+        let dir = tempfile::tempdir().unwrap();
+        let canonical_path = dir.path().join(CANONICAL_RULES_FILE);
+        let dependency_path = dir.path().join("CLAUDE.md");
+
+        std::fs::write(&canonical_path, "# old canonical\n").unwrap();
+        std::fs::write(&dependency_path, "# old claude\n").unwrap();
+        std::fs::set_permissions(&canonical_path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        std::fs::set_permissions(&dependency_path, std::fs::Permissions::from_mode(0o640)).unwrap();
+
+        let plan = build_write_rules_plan(dir.path(), Some("CLAUDE.md"), None, &reg).unwrap();
+        let outcomes = apply_write_rules_plan(&plan).unwrap();
+        assert!(outcomes
+            .iter()
+            .any(|(_, outcome)| *outcome == WriteOutcome::Updated));
+
+        let canonical_mode = std::fs::metadata(&canonical_path)
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        let dependency_mode = std::fs::metadata(&dependency_path)
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(canonical_mode, 0o600);
+        assert_eq!(dependency_mode, 0o640);
     }
 
     #[cfg(unix)]
