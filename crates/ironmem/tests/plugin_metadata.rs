@@ -84,7 +84,7 @@ fn codex_plugin_json_has_required_fields() {
     }
     assert!(
         interface["defaultPrompt"].is_null(),
-        "codex plugin.json: interface.defaultPrompt duplicates MEMORY_PROTOCOL; use ironmem write-rules instead"
+        "codex plugin.json: defaultPrompt is forbidden under the canonical rules model; duplicating project rules or MEMORY_PROTOCOL here violates write-rules ownership"
     );
 }
 

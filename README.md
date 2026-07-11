@@ -238,15 +238,16 @@ Stamp the canonical memory-protocol guidance into your rules files as an
 idempotent, marker-delimited managed block:
 
 ```bash
-# Write all default-harness rules files (CLAUDE.md and AGENTS.md) in the
-# current directory. All targets are validated before any file is written.
+# Write all default-harness rules files in the current directory. All targets are
+# validated before any file is written.
 ironmem write-rules
 
 # Write a single target by filename (validated against registered harness
 # rules files at runtime).
 ironmem write-rules --target AGENTS.md --workspace /path/to/repo
+ironmem write-rules --target CLAUDE.md --workspace /path/to/repo
 
-# Write the rules file for a specific harness (resolves to its rules file).
+# Write the rules file for a specific harness.
 ironmem write-rules --harness codex   # writes AGENTS.md
 ironmem write-rules --harness claude  # writes CLAUDE.md
 ```
@@ -255,9 +256,43 @@ ironmem write-rules --harness claude  # writes CLAUDE.md
 against the harness registry — only filenames registered in a harness entry are
 accepted.
 
-The block is sourced from a single in-source constant (`MEMORY_PROTOCOL`) and is
-safe to re-run — it replaces only the managed block and never touches surrounding
-content. **Explicit opt-in only: no hook ever runs this for you.**
+`ironmem write-rules` writes managed protocol text via a two-model flow:
+
+- **Model A (source):** `MEMORY_PROTOCOL` -> canonical managed block in
+  `AGENTS.md` (the single source of truth).
+- **Model B (target):** canonical `AGENTS.md` -> dependent file based on the
+  harness strategy (`Native`, `Import`, or `Copy`).
+
+For Claude, `--harness claude` (or `--target CLAUDE.md`) runs both models:
+it writes the canonical block into `AGENTS.md` and then writes a managed
+`@AGENTS.md` block into `CLAUDE.md`. User-authored content around those managed
+blocks is preserved.
+
+Result shape:
+
+```markdown
+<!-- AGENTS.md (Model A) -->
+... user content ...
+<!-- BEGIN IRONMEM MEMORY PROTOCOL -->
+<!-- Managed by `ironmem write-rules`. Do not edit between these markers. -->
+Before answering questions about prior work, decisions, project history, or people, check search or KG tools first. Write important durable decisions back to memory. For mutable current task/project context, use add_drawer with logical_key so the latest state overwrites stale copies instead of accumulating forever. Treat collab-plans, collab-task-lists, and collab-checkpoints as operational artifacts; prefer compact durable summaries for long-term recall and prune stale operational drawers with ironmem memory gc --dry-run before --apply.
+<!-- END IRONMEM MEMORY PROTOCOL -->
+... user content ...
+```
+
+```markdown
+<!-- CLAUDE.md (Model B - Import) -->
+... user content ...
+<!-- BEGIN IRONMEM MEMORY PROTOCOL -->
+<!-- Managed by `ironmem write-rules`. Do not edit between these markers. -->
+@AGENTS.md
+<!-- END IRONMEM MEMORY PROTOCOL -->
+... user content ...
+```
+
+The block is safe to re-run: it replaces only the managed region and never touches
+surrounding text. **Explicit opt-in only: no hook or plugin path runs
+`write-rules` for you.**
 
 ### `ironmem harnesses`
 

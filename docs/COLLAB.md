@@ -93,9 +93,11 @@ use different config files or plugin layouts.
 - **Hook capabilities** — per-harness flags (`additional_context_support`,
   `occupancy_support`, `transcript_parser`) control what hook data ironmem
   captures.
-- **Write-rules targets** — `default_rules_targets` and the `--harness` flag
-  derive the rules file list from `HarnessSpec::rules_file` /
-  `write_rules_default`.
+- **Write-rules fanout** — `default_rules_targets` and the `--harness` flag now
+  resolve strategy-bearing targets from each `HarnessSpec::rules_strategy` +
+  `rules_file` pair, deduplicating only when both filename and strategy match.
+  Native is canonical (`AGENTS.md`), while non-native strategies (Import/Copy)
+  depend on canonical rules.
 - **Doctor checks** — the `ironmem doctor` pass iterates the registry and emits
   a `harness_<id>` check per entry. Claude and Codex keep their current
   per-config detection strategies; additional entries report an advisory check
@@ -113,6 +115,14 @@ Adding a new harness (e.g. Gemini) starts with one `HarnessSpec` in `REGISTRY`;
 the generic surfaces above pick up the shared metadata from there. The harness
 still needs its plugin root/assets, and any optional per-harness integration
 strategy such as launcher or doctor detection must be added explicitly.
+
+The write-rules registry contract is now strategy-aware:
+
+- `rules_file` + `rules_strategy` are resolved together during write planning.
+- `native` is only legal for `AGENTS.md`; non-native strategies reject
+  `AGENTS.md`.
+- Shared `rules_file` entries are allowed only when all strategies are
+  identical.
 
 ### Intentionally still two-party: the `/collab` protocol
 

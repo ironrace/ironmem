@@ -680,6 +680,9 @@ mod tests {
             display_name: "Gemini",
             binary: "gemini",
             rules_file: "GEMINI.md",
+            rules_strategy: crate::harness::RulesStrategy::Import {
+                directive: "@./AGENTS.md",
+            },
             write_rules_default: false,
             client_info_aliases: &["gemini"],
             env_aliases: &["gemini"],

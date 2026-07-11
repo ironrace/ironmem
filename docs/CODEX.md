@@ -14,6 +14,8 @@ Codex is one registered harness in the `REGISTRY` constant
 - **`id`**: `"codex"` — used as the harness slug in metrics and hook paths.
 - **`binary`**: `"codex"` — the launcher binary looked up on `PATH`.
 - **`rules_file`**: `"AGENTS.md"` — the target for `ironmem write-rules --harness codex`.
+- **`rules_strategy`**: `"native"` — `AGENTS.md` is written with the canonical
+  block directly.
 - **`client_info_aliases`**: `["codex"]` — substring matched against
   `initialize.clientInfo.name` to attribute MCP sessions.
 - **`env_aliases`**: `["codex"]` — accepted by `IRONMEM_HARNESS` for test overrides.
@@ -287,17 +289,30 @@ Current behavior for Codex:
 
 ## Memory Usage Guidance
 
-Codex adopts the memory protocol through a managed rules-file block sourced from
-the `MEMORY_PROTOCOL` constant in `crates/ironmem/src/bootstrap.rs`:
+`ironmem` uses a two-model flow for memory protocol rules:
+
+- **Model A (canonical):** the source content is the
+  `MEMORY_PROTOCOL` constant in `crates/ironmem/src/bootstrap.rs`, stamped as a
+  managed block in `AGENTS.md`.
+- **Model B (dependent):** harness-specific strategies derive dependent targets from
+  the canonical rules via strategy-specific propagation (`Native`, `Import`, `Copy`).
+
+`codex` uses Model A directly (native strategy), so the dependency file is `AGENTS.md` itself:
 
 ```bash
-ironmem write-rules --harness codex   # resolves to AGENTS.md
-# or equivalently:
-ironmem write-rules --target AGENTS.md
+ironmem write-rules --harness codex
 ```
 
-This is explicit opt-in only; no hook or plugin path runs `write-rules`
-automatically.
+Codex's `AGENTS.md` after write-rules includes the canonical managed block:
+
+```markdown
+<!-- BEGIN IRONMEM MEMORY PROTOCOL -->
+<!-- Managed by `ironmem write-rules`. Do not edit between these markers. -->
+Before answering questions about prior work, decisions, project history, or people, check search or KG tools first. Write important durable decisions back to memory. For mutable current task/project context, use add_drawer with logical_key so the latest state overwrites stale copies instead of accumulating forever. Treat collab-plans, collab-task-lists, and collab-checkpoints as operational artifacts; prefer compact durable summaries for long-term recall and prune stale operational drawers with ironmem memory gc --dry-run before --apply.
+<!-- END IRONMEM MEMORY PROTOCOL -->
+```
+
+This is explicit opt-in only; no hook or plugin path runs `write-rules` automatically.
 
 ## Memory Lifecycle
 

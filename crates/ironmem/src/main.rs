@@ -103,10 +103,12 @@ enum Commands {
     /// Write the ironmem memory-protocol managed block into rules file(s) (explicit opt-in)
     WriteRules {
         /// Target rules file. Omit to write all default harness rules files.
-        /// Validated at runtime against registered harness rules files.
+        /// Validated against registered harness rules files. Non-native selections
+        /// also ensure the canonical AGENTS.md dependency is updated.
         #[arg(long, conflicts_with = "harness")]
         target: Option<String>,
-        /// Write only this harness's rules file (e.g. claude → CLAUDE.md, codex → AGENTS.md).
+        /// Write this harness's rules file (e.g. claude → CLAUDE.md, codex → AGENTS.md).
+        /// Non-native harnesses also update the canonical AGENTS.md dependency.
         #[arg(long, conflicts_with = "target")]
         harness: Option<String>,
         /// Directory containing the target file(s)
@@ -627,30 +629,16 @@ async fn run(cli: Cli) -> Result<(), MemoryError> {
             workspace,
         } => {
             use ironmem::write_rules::{
-                resolve_write_targets, validate_rules_file, write_rules_file, WriteOutcome,
+                apply_write_rules_plan, build_write_rules_plan, WriteOutcome,
             };
-            let targets = resolve_write_targets(
+            let plan = build_write_rules_plan(
+                std::path::Path::new(&workspace),
                 target.as_deref(),
                 harness.as_deref(),
                 ironmem::harness::REGISTRY,
             )?;
-            let paths: Vec<_> = targets
-                .iter()
-                .map(|name| std::path::Path::new(&workspace).join(name))
-                .collect();
-            // For the default multi-file run, pre-validate every target so a
-            // malformed managed block in one file aborts before any file is
-            // written. This makes *validation* all-or-nothing; the writes
-            // themselves are still applied sequentially (a write-time I/O error
-            // on the second file leaves the first written). Single-target runs
-            // need no preflight — there is nothing to roll back.
-            if targets.len() > 1 {
-                for path in &paths {
-                    validate_rules_file(path, bootstrap::MEMORY_PROTOCOL)?;
-                }
-            }
-            for path in paths {
-                let outcome = write_rules_file(&path, bootstrap::MEMORY_PROTOCOL)?;
+            let outcomes = apply_write_rules_plan(&plan)?;
+            for (path, outcome) in outcomes {
                 let label = match outcome {
                     WriteOutcome::Created => "created",
                     WriteOutcome::Updated => "updated",
