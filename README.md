@@ -160,6 +160,12 @@ Codex also receives the `pr-review-toolkit` skill used by the `/collab`
 `review_fix_global` turn before Codex fans confirmed fixes out to
 subagents and Claude runs `/ultrareview-local`.
 
+The collab workflow uses explicit Codex model defaults: Luna at `max` for
+implementation, Luna at `medium` for exploration/docs/mechanical work, and
+Terra at `high` for planning and normal review. Sol at `high` is reserved for
+architecture/security escalation. These protocol defaults do not modify a
+user's personal Codex configuration.
+
 Existing identical files are skipped. The installer records hidden packaged
 baselines under each target root's `.ironmem-bases/` directory; on later
 installs it three-way merges packaged updates into locally edited skills,

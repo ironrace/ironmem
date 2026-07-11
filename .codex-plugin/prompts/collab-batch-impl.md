@@ -29,6 +29,20 @@ your phase isn't `CodeImplementPending`.
 
 **Never** call `collab_end` during an active phase. See Invariants.
 
+## Default model routing
+
+This batch prompt is expected to run under the repository's implementation
+default: `gpt-5.6-luna` with reasoning `max`. Pass explicit overrides when
+dispatching subagents as well:
+
+- implementation workers: `gpt-5.6-luna`, reasoning `max`
+- exploration, docs, and mechanical workers: `gpt-5.6-luna`, reasoning `medium`
+- plan/spec or normal review workers: `gpt-5.6-terra`, reasoning `high`
+- architecture/security escalation only: `gpt-5.6-sol`, reasoning `high`
+
+Do not silently inherit the parent model, and do not use Sol as the routine
+implementation or review default.
+
 ## `join <session_id>`
 
 1. Store `<session_id>` — reuse on every subsequent `collab_*` call.

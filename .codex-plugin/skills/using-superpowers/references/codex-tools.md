@@ -27,8 +27,11 @@ This enables `spawn_agent`, `wait_agent`, and `close_agent` for skills like `dis
 ## Named agent dispatch
 
 Claude Code skills reference named agent types like `superpowers:code-reviewer`.
-Codex does not have a named agent registry — `spawn_agent` creates generic agents
-from built-in roles (`default`, `explorer`, `worker`).
+Codex can expose named project/user roles through `[agents.<name>]` config
+entries. Prefer a configured native role when one matches the work (for
+example, `reviewer`, `explorer`, or `docs_researcher`). The plugin itself does
+not own those config entries, so this repository's defaults must remain
+correct even when a role is not configured.
 
 When a skill says to dispatch a named agent type:
 
@@ -36,12 +39,15 @@ When a skill says to dispatch a named agent type:
    local prompt template like `code-quality-reviewer-prompt.md`)
 2. Read the prompt content
 3. Fill any template placeholders (`{BASE_SHA}`, `{WHAT_WAS_IMPLEMENTED}`, etc.)
-4. Spawn a `worker` agent with the filled content as the `message`
+4. Spawn the configured native role with the filled content as the `message`
+   and the explicit model/reasoning override from the routing table below. If
+   the role or override is unavailable, spawn a `worker` agent with that same
+   explicit override.
 
 | Skill instruction | Codex equivalent |
 |-------------------|------------------|
-| `Task tool (superpowers:code-reviewer)` | `spawn_agent(agent_type="worker", message=...)` with `code-reviewer.md` content |
-| `Task tool (general-purpose)` with inline prompt | `spawn_agent(message=...)` with the same prompt |
+| `Task tool (superpowers:code-reviewer)` | `spawn_agent(agent_type="reviewer", model="gpt-5.6-terra", reasoning_effort="high", message=...)` when configured; otherwise `spawn_agent(agent_type="worker", model="gpt-5.6-terra", reasoning_effort="high", message=...)` with `code-reviewer.md` content |
+| `Task tool (general-purpose)` with inline prompt | `spawn_agent(agent_type="worker", model="gpt-5.6-luna", reasoning_effort="medium", message=...)` for exploration/mechanical work, or the matching explicit row below |
 
 ### Message framing
 
@@ -63,12 +69,21 @@ specified in the instructions above.
 - Wrap instructions in XML tags — the model treats tagged blocks as authoritative
 - End with an explicit execution directive to prevent summarization of the instructions
 
-### When this workaround can be removed
+### Model routing defaults
 
-This approach compensates for Codex's plugin system not yet supporting an `agents`
-field in `plugin.json`. When `RawPluginManifest` gains an `agents` field, the
-plugin can symlink to `agents/` (mirroring the existing `skills/` symlink) and
-skills can dispatch named agent types directly.
+Use explicit overrides for generic workers so behavior does not depend on the
+user's current Codex default:
+
+| Work | Model | Reasoning effort |
+|---|---|---|
+| Implementation controller/workers | `gpt-5.6-luna` | `max` |
+| Exploration, docs, and mechanical work | `gpt-5.6-luna` | `medium` |
+| Planning and normal review | `gpt-5.6-terra` | `high` |
+| Architecture/security escalation | `gpt-5.6-sol` | `high` |
+
+Sol is an explicit escalation tier, not the routine default. A native role's
+config may provide its own baseline, but protocol-critical dispatches should
+still pass the phase-appropriate override when the API allows it.
 
 ## Environment Detection
 

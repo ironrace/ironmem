@@ -30,6 +30,32 @@ def test_lint_passes_on_repo():
     assert r.returncode == 0, f"lint failed:\n{r.stdout}\n{r.stderr}"
 
 
+def test_codex_dispatch_uses_explicit_repository_model_defaults():
+    docs = (ROOT / "docs" / "COLLAB.md").read_text()
+    dispatcher = (ROOT / ".claude-plugin" / "commands" / "collab.md").read_text()
+    prompt = (ROOT / ".codex-plugin" / "prompts" / "collab.md").read_text()
+    batch_prompt = (ROOT / ".codex-plugin" / "prompts" / "collab-batch-impl.md").read_text()
+    tools = (ROOT / ".codex-plugin" / "skills" / "using-superpowers" /
+             "references" / "codex-tools.md").read_text()
+    source_tools = (ROOT / ".claude-plugin" / "skills" / "using-superpowers" /
+                    "references" / "codex-tools.md").read_text()
+    agents = (ROOT / "AGENTS.md").read_text()
+
+    for surface in (docs, dispatcher, prompt, batch_prompt, tools,
+                    source_tools, agents):
+        assert "gpt-5.6-luna" in surface
+        assert "gpt-5.6-terra" in surface
+        assert "gpt-5.6-sol" in surface
+
+    assert "CodeImplementPending" in dispatcher
+    assert "-m gpt-5.6-luna -c model_reasoning_effort=max" in dispatcher
+    assert "-m gpt-5.6-terra -c model_reasoning_effort=high" in dispatcher
+    assert "codex exec --prompt-file" not in dispatcher
+    assert "model_reasoning_effort=xhigh" not in dispatcher
+    assert "personal Codex default" in docs
+    assert "escalation tier, not the default" in prompt
+
+
 def test_lint_catches_unknown_placeholder(tmp_path):
     fixture = copy_fixture(tmp_path)
     bad = fixture / ".claude-plugin" / "prompts" / "collab-turn-plan-draft.md"

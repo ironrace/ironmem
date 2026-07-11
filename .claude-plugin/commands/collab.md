@@ -281,7 +281,9 @@ already passed `review_fix_global` + `review_local`).
 Planning (`draft`, `canonical`, `final`) → `Agent(model=opus)` at
 max effort. Review (`review_local`, `final_review`) → `Agent(model=opus)`.
 Mechanical (`task_list`, `code-implement` controller, `submit`) →
-`Agent(model=sonnet)` / default. Codex side unchanged (xhigh). "max effort" = the harness thinking-budget
+`Agent(model=sonnet)` / default. Codex uses the explicit phase-based defaults
+in the Codex matrix below; it never inherits the caller's personal model
+default. "max effort" = the harness thinking-budget
 mechanism. **If the harness cannot select the requested tier for a
 planning/review dispatch, ABORT the turn and surface to the user — never silently
 fall back to a lower tier.**
@@ -622,21 +624,19 @@ remain:
 
 ### Codex dispatch tuning matrix
 
-Codex's default reasoning effort is the dominant latency cost on long
-silent grinds. ALL Codex-owned non-terminal phases now dispatch via
-background `codex exec` (not synchronous `mcp__codex__codex`). The
-matrix below governs HOW `codex exec` is invoked — specifically the
-prompt file and the reasoning flag. Don't blanket-apply low reasoning
-— review and planning turns are where the independent-judgment value lives,
-and a shallow reviewer defeats the protocol's design.
+ALL Codex-owned non-terminal phases now dispatch via background `codex exec`
+(not synchronous `mcp__codex__codex`). The matrix below is the repository
+default: it governs the prompt file, model, and reasoning effort. Do not let a
+caller-supplied Codex default override a row. `gpt-5.6-sol` is reserved for an
+explicit architecture/security escalation from within a turn.
 
-| Phase from `collab_status` | `implementer` | Prompt file | Reasoning flag | Rationale |
-|---|---|---|---|---|
-| `CodeImplementPending` | `"codex"` | `collab-batch-impl.md` | `-c model_reasoning_effort=xhigh` | RecoverLead-class batch plans carry real design judgment; the T1 livelock showed shallow batch effort can over-gate instead of moving on |
-| `CodeReviewFixGlobalPending` | (any) | `collab.md` | *(none — default preserved)* | Reviewer judgment must not be shallow |
-| `PlanParallelDrafts` | (any) | `collab.md` | *(none — default preserved)* | Planning needs reasoning |
-| `PlanCodexReviewPending` | (any) | `collab.md` | *(none — default preserved)* | Plan review needs reasoning |
-| `CodeImplementPending` | `"claude"` | n/a — Codex isn't owner | n/a | Claude runs subagents on its side; no Codex dispatch |
+| Phase from `collab_status` | `implementer` | Prompt file | Model | Reasoning effort | Rationale |
+|---|---|---|---|---|---|
+| `CodeImplementPending` | `"codex"` | `collab-batch-impl.md` | `gpt-5.6-luna` | `max` | Luna is the default implementation controller/worker and handles the batch's design judgment at the higher implementation budget |
+| `CodeReviewFixGlobalPending` | (any) | `collab.md` | `gpt-5.6-terra` | `high` | Normal global review gets a dedicated review budget without paying the Sol escalation cost |
+| `PlanParallelDrafts` | (any) | `collab.md` | `gpt-5.6-terra` | `high` | Planning needs independent judgment |
+| `PlanCodexReviewPending` | (any) | `collab.md` | `gpt-5.6-terra` | `high` | Plan review needs independent judgment |
+| `CodeImplementPending` | `"claude"` | n/a — Codex isn't owner | n/a | n/a | Claude runs subagents on its side; no Codex dispatch |
 
 Match **both** `Phase` and `implementer` columns when looking up a row:
 `(any)` is a wildcard, quoted strings are exact matches. The two
@@ -645,14 +645,12 @@ do not stop at the first phase match.
 
 Read `phase` and `implementer` from the `collab_status` you fetched at
 the top of the dispatch step; branch on them when selecting the prompt
-file and reasoning flag below.
+file, model, and reasoning effort below.
 
 **When falling back to `mcp__codex__codex`** (see fallback path in the
-handoff section), apply the same prompt file selection from this
-matrix. The `model_reasoning_effort` override for `CodeImplementPending`
-becomes a `config` field (`{ "model_reasoning_effort": "xhigh" }`); all
-other phases omit `config` (no override). The matrix's intent is
-preserved whether the transport is `codex exec` or MCP.
+handoff section), apply the same prompt file, model, and effort from this
+matrix in the `config` object. The matrix's intent is preserved whether the
+transport is `codex exec` or MCP.
 
 ### Codex handoff — background `codex exec`
 
@@ -680,14 +678,15 @@ allows hang detection via wall-clock timeout on every Codex-owned phase.
 a. Read a fresh `collab_status`. If `current_owner == "claude"` or
    `phase` is terminal, skip this step and resume polling / exit.
 
-b. Select prompt file and reasoning flag from the "Codex dispatch tuning
+b. Select prompt file, model, and reasoning effort from the "Codex dispatch tuning
    matrix" above using `phase` and `implementer` from `collab_status`:
    - `CodeImplementPending` + `implementer == "codex"` → prompt file:
-     `.codex-plugin/prompts/collab-batch-impl.md`; reasoning flag:
-     `-c model_reasoning_effort=xhigh`
+     `.codex-plugin/prompts/collab-batch-impl.md`; model and reasoning:
+     `-m gpt-5.6-luna -c model_reasoning_effort=max`
    - All other Codex-owned phases (`PlanParallelDrafts`,
      `PlanCodexReviewPending`, `CodeReviewFixGlobalPending`) → prompt file:
-     `.codex-plugin/prompts/collab.md`; reasoning flag: *(none — omit)*
+     `.codex-plugin/prompts/collab.md`; model and reasoning:
+     `-m gpt-5.6-terra -c model_reasoning_effort=high`
 
    Both files live at
    `/Users/jeffreycrum/git-repos/ironrace-memory/.codex-plugin/prompts/`
@@ -721,23 +720,18 @@ d. **Log the appropriate timing event** immediately before launch. Use the
    - For `PlanParallelDrafts`: **Log:** `t2_codex_dispatched phase=PlanParallelDrafts round=1`
    - For `PlanCodexReviewPending`: **Log:** `t2_codex_dispatched phase=PlanCodexReviewPending round=1`
 
-e. Launch via Bash with `run_in_background: true`. Include `-c model_reasoning_effort=xhigh`
-   only for `CodeImplementPending+codex`; omit for all other phases:
+e. Launch via Bash with `run_in_background: true`. Pass the model and
+   reasoning effort selected above explicitly:
    ```bash
    # CodeImplementPending+codex:
-   cd <repo_path> && codex exec -c model_reasoning_effort=xhigh --prompt-file /tmp/codex-prompt-${session_id}.md > /tmp/codex-out-${session_id}.log 2>&1
+   cd <repo_path> && codex exec -m gpt-5.6-luna -c model_reasoning_effort=max - < /tmp/codex-prompt-${session_id}.md > /tmp/codex-out-${session_id}.log 2>&1
 
    # All other Codex-owned phases:
-   cd <repo_path> && codex exec --prompt-file /tmp/codex-prompt-${session_id}.md > /tmp/codex-out-${session_id}.log 2>&1
+   cd <repo_path> && codex exec -m gpt-5.6-terra -c model_reasoning_effort=high - < /tmp/codex-prompt-${session_id}.md > /tmp/codex-out-${session_id}.log 2>&1
    ```
-   > **CLI note (best-effort, verify with `codex --help`):** The exact flag for
-   > a prompt file may be `--prompt-file <path>`, `--file <path>`, or stdin
-   > redirect (`< /tmp/codex-prompt-…`). Run `codex exec --help` once at the
-   > start of this path to confirm. If stdin is supported, prefer:
-   > ```bash
-   > cd <repo_path> && codex exec [-c model_reasoning_effort=xhigh] - < /tmp/codex-prompt-${session_id}.md > /tmp/codex-out-${session_id}.log 2>&1
-   > ```
-   > Document in the log which invocation form was used.
+   > The current Codex CLI accepts `-` as the prompt source and reads the
+   > resolved prompt from stdin. Keep this stdin form as the canonical launch
+   > path; do not use the unsupported `--prompt-file` flag.
 
 f. **Polling loop** — the dispatcher's interactive surface during this phase.
    Poll on a bounded backoff curve (NOT a fixed cadence — long silent
@@ -809,12 +803,14 @@ g. Resume the normal dispatch loop. The next `collab_status` poll will
 **Failure modes:**
 
 - **`codex` not on PATH** → fall back to `mcp__codex__codex` synchronously
-  (same resolved prompt; for `CodeImplementPending+codex` add
-  `config: {model_reasoning_effort: "xhigh"}`; all other phases omit
-  `config`). **Log:** `t2_fallback_to_mcp` in place of the normal pre-launch
-  event. The fallback applies to ALL phases, not just batch impl. Do not pass
-  `model` or any other override — only `config` per the matrix. Model swap
-  is intentionally out of scope. If `mcp__codex__codex` is also not
+  with the same resolved prompt and the same explicit `config.model` plus
+  `config.model_reasoning_effort` selected from the matrix. For example,
+  `CodeImplementPending+codex` uses
+  `{model: "gpt-5.6-luna", model_reasoning_effort: "max"}` and normal
+  planning/review uses
+  `{model: "gpt-5.6-terra", model_reasoning_effort: "high"}`. **Log:**
+  `t2_fallback_to_mcp` in place of the normal pre-launch event. The fallback
+  applies to ALL phases, not just batch impl. If `mcp__codex__codex` is also not
   registered, tell the user to run `/collab join <session_id>` in a
   Codex terminal, then `ScheduleWakeup` and resume polling. **Never use a
   `/collab` entry command (`/collab start …`, `/collab join …`,

@@ -1142,14 +1142,33 @@ it does not ingest the body of whatever the worker produced.
 ### Model tiers + fail-closed
 
 Workers are dispatched at one of three tiers. Fable is OFF, so planning and
-review both run on Opus; mechanical turns run on Sonnet/default. The Codex side
-is unchanged (xhigh).
+review both run on Opus; mechanical turns run on Sonnet/default. Codex uses the
+explicit phase-based policy below rather than inheriting the caller's personal
+model default.
 
 | Tier | Turns | Dispatch |
 |---|---|---|
 | `planning` | `draft`, `canonical` (synthesis), `final` (finalize) | `Agent(model=opus)` at max effort |
 | `review` | `review_local`, `final_review` | `Agent(model=opus)` |
 | `mechanical` | `task_list`, `code-implement` controller, `submit` | `Agent(model=sonnet)` / default |
+
+### Codex model policy
+
+Codex dispatch is explicit and phase-based. The background dispatcher and
+Codex's Superpowers subagent dispatch use the same defaults:
+
+| Codex work | Model | Effort |
+|---|---|---|
+| Implementation controller/workers | `gpt-5.6-luna` | `max` |
+| Exploration, docs, and mechanical work | `gpt-5.6-luna` | `medium` |
+| Planning and normal review | `gpt-5.6-terra` | `high` |
+| Architecture/security escalation | `gpt-5.6-sol` | `high` |
+
+`gpt-5.6-sol` is an escalation tier, not the default. Use it when a
+discovered architecture, security, or other high-risk issue needs additional
+judgment; do not default to Sol or to Sol `max`. A protocol turn must pass its
+model and effort explicitly so a user's personal Codex default cannot silently
+change the collaboration behavior.
 
 "Max effort" is the harness thinking-budget mechanism. **Fail-closed rule: if
 the harness cannot select the requested tier for a planning or review dispatch,
@@ -1492,11 +1511,13 @@ handoff — background `codex exec`").
 that dominated latency in smoke testing (`PlanCodexReviewPending` hung
 24+ min; `CodeReviewFixGlobalPending` took 171s via synchronous MCP).
 The dispatch shape is now uniform across all Codex turns; only the prompt
-file and the reasoning flag vary by phase. `CodeImplementPending+codex`
-uses the slim `collab-batch-impl.md` prompt and
-`-c model_reasoning_effort=xhigh`;
-all other Codex turns use the full `collab.md` prompt with default reasoning
-preserved (reviewer and planner judgment must not be shallow).
+file and the explicit model/effort override vary by phase.
+`CodeImplementPending+codex` uses the slim `collab-batch-impl.md` prompt and
+`-m gpt-5.6-luna -c model_reasoning_effort=max`; all other Codex turns use the
+full `collab.md` prompt with `-m gpt-5.6-terra -c
+model_reasoning_effort=high`. A discovered architecture or security issue may
+escalate a subagent to `gpt-5.6-sol` at high effort, but the parent protocol
+dispatch remains on its phase default.
 
 #### Fallback: synchronous `mcp__codex__codex` MCP
 
@@ -1523,13 +1544,18 @@ unchanged; only the transport differs.
      "arguments": {
        "prompt": "<resolved prompt text>",
        "cwd": "<repo_path>",
-       "config": { "model_reasoning_effort": "xhigh" }
+       "config": {
+         "model": "gpt-5.6-luna",
+         "model_reasoning_effort": "max"
+       }
      }
    }
    ```
-   The `config` block with `model_reasoning_effort: "xhigh"` is added
-   **only** for `CodeImplementPending+codex`; all other phases omit
-   `config` so reviewer and planner judgment stays at default depth.
+   Select `config.model` and `config.model_reasoning_effort` from the Codex
+   model policy and dispatch matrix. For `CodeImplementPending+codex` use
+   `gpt-5.6-luna` at `max`; for planning and normal review use
+   `gpt-5.6-terra` at `high`. Do not omit the model override or inherit the
+   caller's personal default.
    The call blocks until Codex finishes its phase-specific action and
    hands control back. Claude then resumes the dispatch loop.
 
