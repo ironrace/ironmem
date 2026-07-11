@@ -42,6 +42,22 @@ session record's `implementer` field is `"codex"`.
 > file covers only the batch-impl turn so Codex doesn't process unreachable
 > v1/review content.
 
+## Default model routing
+
+The repository default is phase-based and explicit. The parent dispatcher
+passes these overrides rather than inheriting a caller's personal default:
+
+- implementation controller/workers: `gpt-5.6-luna`, reasoning `max`
+- exploration, docs, and mechanical work: `gpt-5.6-luna`, reasoning `medium`
+- planning and normal review: `gpt-5.6-terra`, reasoning `high`
+- architecture/security escalation: `gpt-5.6-sol`, reasoning `high`
+
+When this prompt dispatches subagents through Superpowers, apply the same
+routing to each role and pass model/reasoning overrides explicitly. Sol is an
+escalation tier, not the default; do not use Sol or Sol `max` unless a
+discovered high-risk issue justifies it. This prompt does not control the
+parent CLI's model selection — the Claude dispatcher must do that.
+
 ## v3 core rule — run PR review, then fan out fixes
 
 v3 batch mode gives Codex a single coding review turn:

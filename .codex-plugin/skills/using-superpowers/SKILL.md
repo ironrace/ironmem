@@ -3,7 +3,7 @@ name: using-superpowers
 description: Use when starting any conversation - establishes how to find and use skills, requiring Skill tool invocation before ANY response including clarifying questions
 ---
 
-> Codex adaptation: skills load natively from `~/.codex/skills`; interpret `Task` as `spawn_agent`, `TodoWrite` as `update_plan`, and named agent dispatch via the `spawn_agent(agent_type="worker", message=...)` workaround documented in `../using-superpowers/references/codex-tools.md` when a skill references a Claude-only named agent.
+> Codex adaptation: skills load natively from `~/.codex/skills`; interpret `Task` as `spawn_agent`, `TodoWrite` as `update_plan`, and prefer configured native agent roles with the explicit model-routing fallback documented in `../using-superpowers/references/codex-tools.md` when a skill references a Claude-only named agent.
 
 
 <SUBAGENT-STOP>

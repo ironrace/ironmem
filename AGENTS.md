@@ -40,6 +40,20 @@ Preferred tools:
 - If `status` shows `warming_up: true`, avoid write-heavy memory actions until warmup completes.
 - Poll `status` and wait for `warming_up: false` before relying on embedding-dependent tools such as semantic search or drawer writes.
 
+## Collab and Superpowers model defaults
+
+For `/collab` and its bundled Superpowers workflows, use explicit phase-based
+Codex routing rather than inheriting a personal default:
+
+- implementation controller/workers: `gpt-5.6-luna` at `max`
+- exploration, docs, and mechanical work: `gpt-5.6-luna` at `medium`
+- planning and normal review: `gpt-5.6-terra` at `high`
+- architecture/security escalation: `gpt-5.6-sol` at `high`
+
+Sol is an escalation tier, not the routine default. Personal Codex config may
+remain unchanged; protocol dispatches should pass the model and reasoning
+effort explicitly.
+
 ## Documentation Rules
 
 - When behavior, setup, release flow, or public API changes, update the relevant docs in the same change.

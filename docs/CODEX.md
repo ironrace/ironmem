@@ -260,6 +260,20 @@ update is written next to it as `*.ironmem-packaged` (conflict drafts use
 For Claude Code, the installer also provisions the `code-reviewer` agent used by the vendored
 `subagent-driven-development` review flow into `$CLAUDE_HOME/agents`.
 
+### Codex model defaults
+
+The bundled collab protocol uses explicit phase-based Codex routing: Luna at
+`max` for implementation controllers/workers, Luna at `medium` for
+exploration/docs/mechanical work, and Terra at `high` for planning and normal
+review. Sol at `high` is reserved for an explicit architecture/security or
+other high-risk escalation. Protocol dispatches pass the model and effort
+explicitly instead of inheriting the caller's personal default.
+
+The installer does not modify `$CODEX_HOME/config.toml` or user-defined agent
+roles. Those personal settings remain available for ordinary Codex sessions;
+the collab dispatcher and bundled Superpowers guidance carry the repository
+defaults themselves.
+
 The hook wrapper delegates to:
 
 ```bash

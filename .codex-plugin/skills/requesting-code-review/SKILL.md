@@ -34,7 +34,11 @@ HEAD_SHA=$(git rev-parse HEAD)
 
 **2. Dispatch code reviewer worker:**
 
-Fill `code-reviewer.md` locally, then dispatch a generic `worker` with `spawn_agent(...)` using the filled prompt as the `message`.
+Fill `code-reviewer.md` locally, then use the configured native `reviewer`
+role with `model="gpt-5.6-terra"` and `reasoning_effort="high"` when
+available. Otherwise dispatch a generic `worker` with the same explicit
+override and the filled prompt as the `message`. Escalate architecture or
+security findings to `gpt-5.6-sol` at high effort.
 
 **Placeholders:**
 - `{WHAT_WAS_IMPLEMENTED}` - What you just built

@@ -73,6 +73,19 @@ The command loads the protocol prompt and substitutes the slash-command
 arguments. Claude's background dispatcher still passes the resolved protocol
 prompt directly when it drives Codex-owned turns.
 
+## Default Codex routing
+
+The collab protocol passes model and reasoning overrides explicitly:
+
+- implementation controller/workers: `gpt-5.6-luna` at `max`
+- exploration, docs, and mechanical work: `gpt-5.6-luna` at `medium`
+- planning and normal review: `gpt-5.6-terra` at `high`
+- architecture/security escalation: `gpt-5.6-sol` at `high`
+
+Sol is an escalation tier, not the routine default. Installing the plugin does
+not modify personal `$CODEX_HOME/config.toml` agent roles; the protocol carries
+its own defaults so behavior is consistent across callers.
+
 ## Notes
 
 - The plugin wrapper builds `ironmem` automatically if the binary does not exist yet.

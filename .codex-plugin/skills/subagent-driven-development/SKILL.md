@@ -107,7 +107,20 @@ digraph process {
 
 ## Model Selection
 
-Use the least powerful model that can handle each role to conserve cost and increase speed.
+Use the least powerful model that can handle each role to conserve cost and
+increase speed, while passing the repository defaults explicitly so the
+workflow does not depend on the caller's personal Codex default.
+
+For Codex dispatch, use:
+
+- implementation controller/workers: `gpt-5.6-luna`, reasoning `max`
+- exploration, docs, and mechanical work: `gpt-5.6-luna`, reasoning `medium`
+- planning and normal review: `gpt-5.6-terra`, reasoning `high`
+- architecture/security escalation: `gpt-5.6-sol`, reasoning `high`
+
+Sol is an escalation tier, not the normal implementation or review choice.
+Use it only when the work reveals architecture, security, or another
+high-risk issue that warrants the extra judgment.
 
 **Mechanical implementation tasks** (isolated functions, clear specs, 1-2 files): use a fast, cheap model. Most implementation tasks are mechanical when the plan is well-specified.
 
