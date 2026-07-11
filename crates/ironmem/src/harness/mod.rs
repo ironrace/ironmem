@@ -8,6 +8,11 @@
 mod packaging;
 pub use packaging::check_packaging_coverage;
 
+/// Canonical rules file and single source of truth for dependent (non-native)
+/// harness rules files. `Native` strategies target this file directly; `Import`
+/// and `Copy` strategies derive their content from it.
+pub const CANONICAL_RULES_FILE: &str = "AGENTS.md";
+
 /// How a harness encodes session transcripts (used by the abeval token parser).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "lowercase")]
@@ -282,7 +287,7 @@ pub(crate) fn rules_file_entries(registry: &[HarnessSpec]) -> Result<Vec<RulesFi
     for spec in registry {
         match spec.rules_strategy {
             RulesStrategy::Native => {
-                if spec.rules_file != "AGENTS.md" {
+                if spec.rules_file != CANONICAL_RULES_FILE {
                     return Err(format!(
                         "invalid rules strategy for '{}': Native strategy requires AGENTS.md",
                         spec.id
@@ -290,7 +295,7 @@ pub(crate) fn rules_file_entries(registry: &[HarnessSpec]) -> Result<Vec<RulesFi
                 }
             }
             RulesStrategy::Import { .. } | RulesStrategy::Copy => {
-                if spec.rules_file == "AGENTS.md" {
+                if spec.rules_file == CANONICAL_RULES_FILE {
                     return Err(format!(
                         "invalid rules strategy for '{}': non-native strategies cannot target AGENTS.md",
                         spec.id
@@ -643,6 +648,70 @@ mod tests {
         );
     }
 
+    fn spec_with(rules_file: &'static str, rules_strategy: RulesStrategy) -> HarnessSpec {
+        HarnessSpec {
+            id: "probe",
+            display_name: "Probe",
+            binary: "probe",
+            rules_file,
+            rules_strategy,
+            write_rules_default: true,
+            client_info_aliases: &[],
+            env_aliases: &[],
+            additional_context_support: false,
+            occupancy_support: false,
+            transcript_parser: TranscriptParserKind::None,
+        }
+    }
+
+    #[test]
+    fn rules_file_entries_reject_native_strategy_on_non_agents_file() {
+        // Native is the canonical-file strategy: it must target AGENTS.md only.
+        let spec = spec_with("CLAUDE.md", RulesStrategy::Native);
+        let err = rules_file_entries(&[spec]).unwrap_err();
+        assert!(
+            err.contains("Native strategy requires AGENTS.md"),
+            "expected native-requires-AGENTS error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn rules_file_entries_reject_non_native_strategy_on_agents_file() {
+        // AGENTS.md is the source of truth; dependent strategies cannot own it.
+        let import = spec_with(
+            CANONICAL_RULES_FILE,
+            RulesStrategy::Import {
+                directive: "@AGENTS.md",
+            },
+        );
+        let err = rules_file_entries(&[import]).unwrap_err();
+        assert!(
+            err.contains("non-native strategies cannot target AGENTS.md"),
+            "expected import-cannot-target-AGENTS error, got: {err}"
+        );
+
+        let copy = spec_with(CANONICAL_RULES_FILE, RulesStrategy::Copy);
+        let err = rules_file_entries(&[copy]).unwrap_err();
+        assert!(
+            err.contains("non-native strategies cannot target AGENTS.md"),
+            "expected copy-cannot-target-AGENTS error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn every_registry_id_is_a_valid_harness_slug() {
+        // The registry stores ids as bare &'static str and bypasses HarnessId
+        // validation via new_unchecked; this test is the guard that a typo'd or
+        // uppercase id never ships undetected.
+        for spec in REGISTRY {
+            assert!(
+                HarnessId::validate(spec.id).is_ok(),
+                "REGISTRY id {:?} must be a valid harness slug",
+                spec.id
+            );
+        }
+    }
+
     // ---- registry_json / registry_text ------------------------------------
 
     #[test]
@@ -751,6 +820,30 @@ mod tests {
         assert!(
             text.contains("strategy=native"),
             "text must include strategy=native"
+        );
+    }
+
+    #[test]
+    fn copy_strategy_serializes_as_tagged_copy_in_json_and_text() {
+        // Copy is absent from the production REGISTRY, so its wire/text shape is
+        // otherwise untested; a rename of the serde tag or as_text arm must fail here.
+        let copy = spec_with("COPY.md", RulesStrategy::Copy);
+
+        let json = registry_json(&[copy]).expect("serialization must succeed");
+        let arr: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let strategy = arr.as_array().unwrap()[0]["rules_strategy"].clone();
+        assert_eq!(strategy["kind"].as_str(), Some("copy"));
+        assert_eq!(
+            strategy.as_object().map(|o| o.len()),
+            Some(1),
+            "copy strategy must carry no directive field"
+        );
+        assert!(strategy.get("directive").is_none());
+
+        let text = registry_text(&[copy]);
+        assert!(
+            text.contains("strategy=copy"),
+            "text must include strategy=copy; got: {text}"
         );
     }
 

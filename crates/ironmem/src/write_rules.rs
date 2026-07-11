@@ -1,8 +1,12 @@
 //! `ironmem write-rules` — stamp the canonical memory protocol into rules files.
 //!
-//! Writes an idempotent, marker-delimited managed block sourced solely from
-//! [`crate::bootstrap::MEMORY_PROTOCOL`]. Explicit opt-in only: no hook,
-//! bootstrap, or serve path ever calls this.
+//! Writes idempotent, marker-delimited managed blocks. Only the canonical
+//! `AGENTS.md` block is sourced from [`crate::bootstrap::MEMORY_PROTOCOL`];
+//! dependent harness files receive a strategy-derived block instead — an
+//! [`Import`](crate::harness::RulesStrategy::Import) directive such as
+//! `@AGENTS.md`, or a flattened [`Copy`](crate::harness::RulesStrategy::Copy)
+//! of the canonical block. Explicit opt-in only: no hook, bootstrap, or serve
+//! path ever calls this.
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -14,8 +18,9 @@ const END_MARKER: &str = "<!-- END IRONMEM MEMORY PROTOCOL -->";
 const NOTICE: &str =
     "<!-- Managed by `ironmem write-rules`. Do not edit between these markers. -->";
 
-/// Canonical rules file used as the source of truth for synthetic harness updates.
-pub const CANONICAL_RULES_FILE: &str = "AGENTS.md";
+/// Canonical rules file, re-exported from the harness registry so both layers
+/// reference a single definition.
+pub use crate::harness::CANONICAL_RULES_FILE;
 
 /// Outcome of a single managed write, for CLI reporting.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -197,8 +202,10 @@ pub fn resolve_write_targets(
 
 /// Build an ordered, preflighted write plan.
 ///
-/// Canonical rules (`AGENTS.md`) is always projected first, then deduplicated
-/// dependent files are written in target order.
+/// When a canonical or non-native target is present, the canonical `AGENTS.md`
+/// plan item is ordered first, followed by deduplicated dependent items in
+/// target order. This builds the plan only; [`apply_write_rules_plan`] performs
+/// the writes.
 pub fn build_write_rules_plan(
     workspace: &Path,
     target: Option<&str>,
@@ -267,7 +274,17 @@ pub fn build_write_rules_plan(
     Ok(plan)
 }
 
-/// Apply a write plan. The caller can render outcomes directly.
+/// Apply a write plan and return the per-file outcomes for rendering.
+///
+/// Two phases: every target is re-read and re-validated first, and any drift
+/// from the plan's captured snapshot (concurrent edit, symlink swap, metadata
+/// change) aborts the whole batch with a [`MemoryError::Validation`] before any
+/// file is written. Per-file writes are then applied sequentially; each is
+/// individually atomic, but the batch is not. If a write fails after earlier
+/// files were already written (e.g. the canonical `AGENTS.md` succeeds but a
+/// dependent then fails), the returned error names both the file that failed
+/// and the files already updated, so the caller can report the inconsistency
+/// and re-run to reconcile.
 pub fn apply_write_rules_plan(
     plan: &[WritePlanItem],
 ) -> Result<Vec<(PathBuf, WriteOutcome)>, MemoryError> {
@@ -285,15 +302,19 @@ pub fn apply_write_rules_plan(
     }
 
     let mut outcomes = Vec::new();
+    let mut written: Vec<PathBuf> = Vec::new();
     for (item, unchanged) in plan.iter().zip(preflight_matches.iter()) {
         let outcome = if *unchanged {
             WriteOutcome::Unchanged
         } else {
-            write_atomic(
+            if let Err(error) = write_atomic(
                 &item.target_path,
                 &item.planned_contents,
                 item.existing_metadata.as_ref(),
-            )?;
+            ) {
+                return Err(partial_write_error(&item.target_path, &written, error));
+            }
+            written.push(item.target_path.clone());
             if item.existing_metadata.is_some() {
                 WriteOutcome::Updated
             } else {
@@ -304,6 +325,28 @@ pub fn apply_write_rules_plan(
     }
 
     Ok(outcomes)
+}
+
+/// Build the error returned when a write fails mid-batch.
+///
+/// If nothing was written yet, the original error is propagated unchanged. Once
+/// at least one file has been written, the error is upgraded to name both the
+/// failed file and the already-updated files so the partial state is never
+/// silently discarded.
+fn partial_write_error(failed: &Path, written: &[PathBuf], error: MemoryError) -> MemoryError {
+    if written.is_empty() {
+        return error;
+    }
+    let already = written
+        .iter()
+        .map(|path| path.display().to_string())
+        .collect::<Vec<_>>()
+        .join(", ");
+    MemoryError::Validation(format!(
+        "ironmem write-rules failed writing {failed}: {error}. Already updated: {already}. \
+         These files may now be inconsistent with {failed} — re-run `ironmem write-rules` to reconcile.",
+        failed = failed.display(),
+    ))
 }
 
 fn existing_contents_and_metadata_match(
@@ -347,9 +390,14 @@ fn metadata_unchanged(before: &std::fs::Metadata, after: &std::fs::Metadata) -> 
     true
 }
 
-/// Insert or replace managed content in `target_path` using `contents`, and write
-/// atomically. Skips the write when resulting content is byte-identical to the
-/// existing file.
+/// Single-file managed write for an arbitrary `target_path`/`contents` pair.
+///
+/// Intentionally retained as a standalone primitive for callers that write one
+/// file directly rather than through a resolved harness plan. It shares the same
+/// [`upsert_block`] and [`write_atomic`] building blocks as
+/// [`apply_write_rules_plan`], so the write mechanism does not diverge between
+/// the two paths. Inserts or replaces the managed block and writes atomically,
+/// skipping the write when the result is byte-identical to the existing file.
 pub fn write_rules_file(target_path: &Path, contents: &str) -> Result<WriteOutcome, MemoryError> {
     let (target_metadata, current) = read_rules_target(target_path)?;
     let existed = target_metadata.is_some();
@@ -366,14 +414,6 @@ pub fn write_rules_file(target_path: &Path, contents: &str) -> Result<WriteOutco
     } else {
         WriteOutcome::Created
     })
-}
-
-/// Validate that `target_path` can be read and upserted without writing it.
-pub fn validate_rules_file(target_path: &Path, contents: &str) -> Result<(), MemoryError> {
-    let (_target_metadata, current) = read_rules_target(target_path)?;
-    let block = render_block(contents);
-    upsert_block(&current, &block)?;
-    Ok(())
 }
 
 fn read_rules_target(
@@ -1231,14 +1271,27 @@ mod tests {
 
         let first = apply_write_rules_plan(&plan).unwrap();
         assert_eq!(first.len(), 2);
-        assert!(first
-            .iter()
-            .any(|(_, outcome)| *outcome == WriteOutcome::Created));
+        assert_eq!(
+            first[0].0.file_name().unwrap(),
+            CANONICAL_RULES_FILE,
+            "canonical AGENTS.md must be the first outcome"
+        );
+        assert_eq!(first[1].0.file_name().unwrap(), "CLAUDE.md");
+        assert!(
+            first
+                .iter()
+                .all(|(_, outcome)| *outcome == WriteOutcome::Created),
+            "both files must be created on first apply; got {first:?}"
+        );
 
         let second = apply_write_rules_plan(&plan).unwrap();
-        assert!(second
-            .iter()
-            .any(|(_, outcome)| *outcome == WriteOutcome::Unchanged));
+        assert_eq!(second.len(), 2);
+        assert!(
+            second
+                .iter()
+                .all(|(_, outcome)| *outcome == WriteOutcome::Unchanged),
+            "both files must be unchanged on re-apply; got {second:?}"
+        );
     }
 
     #[test]
@@ -1437,6 +1490,138 @@ mod tests {
             std::fs::read_to_string(&real).unwrap(),
             "# Real target\n",
             "symlink target content must be untouched"
+        );
+    }
+
+    #[test]
+    fn apply_write_rules_plan_writes_copy_body_to_disk_and_is_idempotent() {
+        let reg = [DECLARED_COPY_SPEC];
+        let dir = tempfile::tempdir().unwrap();
+        let canonical_path = dir.path().join(CANONICAL_RULES_FILE);
+        let dependency_path = dir.path().join("CLAUDE.md");
+
+        let plan = build_write_rules_plan(dir.path(), Some("CLAUDE.md"), None, &reg).unwrap();
+        let expected_copy = plan[1].planned_contents.clone();
+
+        let first = apply_write_rules_plan(&plan).unwrap();
+        assert!(
+            first
+                .iter()
+                .all(|(_, outcome)| *outcome == WriteOutcome::Created),
+            "both files must be created on first apply; got {first:?}"
+        );
+
+        // The flattened Copy body must actually land on disk byte-for-byte — the
+        // build tests only assert on planned_contents, never the written file.
+        assert_eq!(
+            std::fs::read_to_string(&dependency_path).unwrap(),
+            expected_copy,
+            "dependent CLAUDE.md must contain the flattened copy body on disk"
+        );
+        assert!(std::fs::read_to_string(&canonical_path)
+            .unwrap()
+            .contains(BEGIN_MARKER));
+
+        // Re-deriving against the now-updated files and re-applying is a no-op.
+        let plan2 = build_write_rules_plan(dir.path(), Some("CLAUDE.md"), None, &reg).unwrap();
+        let before = std::fs::read(&dependency_path).unwrap();
+        let second = apply_write_rules_plan(&plan2).unwrap();
+        assert!(
+            second
+                .iter()
+                .all(|(_, outcome)| *outcome == WriteOutcome::Unchanged),
+            "re-apply must be unchanged on disk; got {second:?}"
+        );
+        assert_eq!(
+            std::fs::read(&dependency_path).unwrap(),
+            before,
+            "copy body must be byte-stable across re-apply"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn apply_write_rules_plan_reports_partial_write_when_dependent_fails() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let canonical_path = dir.path().join(CANONICAL_RULES_FILE);
+        let locked_dir = dir.path().join("locked");
+        std::fs::create_dir(&locked_dir).unwrap();
+        let dependency_path = locked_dir.join("CLAUDE.md");
+
+        std::fs::write(&canonical_path, "# canonical before\n").unwrap();
+        std::fs::write(&dependency_path, "# claude before\n").unwrap();
+
+        // Hand-build a two-item plan whose targets live in different directories,
+        // so only the dependent's write fails while the canonical write succeeds.
+        let canonical_existing = std::fs::read_to_string(&canonical_path).unwrap();
+        let dependency_existing = std::fs::read_to_string(&dependency_path).unwrap();
+        let canonical_planned = upsert_block(
+            &canonical_existing,
+            &render_block(crate::bootstrap::MEMORY_PROTOCOL),
+        )
+        .unwrap();
+        let dependency_planned =
+            upsert_block(&dependency_existing, &render_block("@AGENTS.md")).unwrap();
+        let plan = vec![
+            WritePlanItem {
+                target_path: canonical_path.clone(),
+                planned_contents: canonical_planned.clone(),
+                existing_metadata: std::fs::symlink_metadata(&canonical_path).ok(),
+                existing_contents: canonical_existing,
+            },
+            WritePlanItem {
+                target_path: dependency_path.clone(),
+                planned_contents: dependency_planned,
+                existing_metadata: std::fs::symlink_metadata(&dependency_path).ok(),
+                existing_contents: dependency_existing,
+            },
+        ];
+
+        // Make the dependent's directory unwritable so its atomic write fails
+        // after the canonical write (in the still-writable parent) has landed.
+        std::fs::set_permissions(&locked_dir, std::fs::Permissions::from_mode(0o500)).unwrap();
+        // Skip where the process can write despite 0o500 (e.g. running as root),
+        // where the permission-denied path this test exercises cannot occur.
+        let probe = locked_dir.join(".ironmem-write-probe");
+        if std::fs::File::create(&probe).is_ok() {
+            std::fs::remove_file(&probe).ok();
+            std::fs::set_permissions(&locked_dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+            return;
+        }
+
+        let err = apply_write_rules_plan(&plan).unwrap_err();
+        // Restore write permission so the tempdir can be cleaned up.
+        std::fs::set_permissions(&locked_dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+        assert!(matches!(err, MemoryError::Validation(_)));
+        let message = err.to_string();
+        assert!(
+            message.contains("CLAUDE.md"),
+            "error must name the failed dependent file; got: {message}"
+        );
+        assert!(
+            message.contains(CANONICAL_RULES_FILE),
+            "error must name the already-updated canonical file; got: {message}"
+        );
+        assert!(
+            message.contains("re-run"),
+            "error must tell the user how to reconcile; got: {message}"
+        );
+
+        // The canonical file was written before the failure — the partial state is
+        // real and surfaced, not silently hidden.
+        assert_eq!(
+            std::fs::read_to_string(&canonical_path).unwrap(),
+            canonical_planned,
+            "canonical file must reflect the completed write"
+        );
+        // The dependent file was never written.
+        assert_eq!(
+            std::fs::read_to_string(&dependency_path).unwrap(),
+            "# claude before\n",
+            "failed dependent file must be left untouched"
         );
     }
 }

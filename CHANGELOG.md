@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **`AGENTS.md` is now canonical for harness rules.** `ironmem write-rules`
+  treats `AGENTS.md` as the single source of truth and fans dependent harness
+  files out from it via registry-backed `Native`/`Import`/`Copy` strategies.
+  Note the migration behavior: selecting a non-native target (e.g.
+  `--target CLAUDE.md` or `--harness claude`) also creates/updates `AGENTS.md`
+  and rewrites the managed block in the dependent file down to an `@AGENTS.md`
+  pointer. User content outside the managed markers is preserved; content
+  *inside* the block is migrated.
+- **Partial multi-file writes are now surfaced.** When a fan-out write fails
+  after the canonical file was already written, the error names both the failed
+  file and the already-updated files and prompts a re-run to reconcile, instead
+  of discarding the partial-state report.
+
 ## [0.5.0] - 2026-07-07
 
 ### Added
