@@ -443,7 +443,7 @@ if [[ "$SKIP_WIRING" -eq 0 ]]; then
   if ! command -v jq >/dev/null 2>&1; then
     echo "==> WARN: jq not installed; skipping Claude MCP registration check." >&2
     echo "          Install jq, or add this manually to $CLAUDE_CONFIG_JSON:" >&2
-    echo "          { \"mcpServers\": { \"ironmem\": { \"command\": \"$TARGET\", \"args\": [\"serve\"] } } }" >&2
+    echo "          { \"mcpServers\": { \"ironmem\": { \"command\": \"$TARGET\", \"args\": [\"serve\"], \"env\": { \"IRONMEM_MCP_MODE\": \"trusted\" } } } }" >&2
   else
     if [[ ! -f "$CLAUDE_CONFIG_JSON" ]]; then
       echo "{}" > "$CLAUDE_CONFIG_JSON"
@@ -454,15 +454,23 @@ if [[ "$SKIP_WIRING" -eq 0 ]]; then
       echo "==> Registering 'ironmem' MCP server in $CLAUDE_CONFIG_JSON"
       TMP="$(mktemp)"
       jq --arg cmd "$TARGET" \
-        '.mcpServers = ((.mcpServers // {}) + {ironmem: {command: $cmd, args: ["serve"]}})' \
+        '.mcpServers = ((.mcpServers // {}) + {ironmem: {command: $cmd, args: ["serve"], env: {IRONMEM_MCP_MODE: "trusted"}}})' \
         "$CLAUDE_CONFIG_JSON" > "$TMP" && mv -f "$TMP" "$CLAUDE_CONFIG_JSON"
     elif [[ "$EXISTING_CMD" == "$TARGET" ]]; then
-      echo "    'ironmem' MCP server already registered for Claude"
+      if jq -e '.mcpServers.ironmem.env.IRONMEM_MCP_MODE == null' \
+        "$CLAUDE_CONFIG_JSON" >/dev/null 2>&1; then
+        echo "==> Adding trusted mode to the existing Claude MCP registration"
+        TMP="$(mktemp)"
+        jq '.mcpServers.ironmem.env = ((.mcpServers.ironmem.env // {}) + {IRONMEM_MCP_MODE: "trusted"})' \
+          "$CLAUDE_CONFIG_JSON" > "$TMP" && mv -f "$TMP" "$CLAUDE_CONFIG_JSON"
+      else
+        echo "    'ironmem' MCP server already registered for Claude"
+      fi
     elif [[ "$FORCE_WIRING" -eq 1 ]]; then
       echo "==> Replacing divergent 'ironmem' MCP entry (was: $EXISTING_CMD)"
       TMP="$(mktemp)"
       jq --arg cmd "$TARGET" \
-        '.mcpServers.ironmem = {command: $cmd, args: ["serve"]}' \
+        '.mcpServers.ironmem = {command: $cmd, args: ["serve"], env: {IRONMEM_MCP_MODE: "trusted"}}' \
         "$CLAUDE_CONFIG_JSON" > "$TMP" && mv -f "$TMP" "$CLAUDE_CONFIG_JSON"
     else
       echo "    WARN: 'ironmem' MCP entry already exists with command=$EXISTING_CMD" >&2
