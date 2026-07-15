@@ -319,16 +319,33 @@ async fn run(cli: Cli) -> Result<(), MemoryError> {
     match cli.command {
         Commands::Serve {
             db,
-            // TODO(#190 Task 6/8/10): wire daemon-bind (--listen), proxy/connect
-            // (--connect), and autospawn (--no-autospawn) dispatch. Until then every
-            // mode falls through to the existing in-process stdio server below, so
-            // `serve`, `serve --db X`, `serve --listen X`, and `serve --connect X`
-            // are currently all identical to today's behavior.
-            listen: _listen,
+            // TODO(#190 Task 8/10): wire proxy/connect (--connect) and autospawn
+            // (--no-autospawn) dispatch. --listen (daemon-bind) is wired below;
+            // --connect / --no-autospawn still fall through to the in-process
+            // stdio server.
+            listen,
             connect: _connect,
             no_autospawn: _no_autospawn,
         } => {
             let cfg = config::Config::load(db)?;
+
+            // `--listen <socket>`: run as the shared daemon (Unix only, Task 6).
+            // `run_daemon` owns its own runtime, so it must not nest inside this
+            // `#[tokio::main]` runtime — run it on a dedicated std thread and
+            // join. On the None path `cfg` is untouched (the taken branch
+            // diverges via `return`), so the stdio fallback below still owns it.
+            #[cfg(unix)]
+            if let Some(sock) = listen {
+                let socket_path = std::path::PathBuf::from(sock);
+                return std::thread::spawn(move || mcp::daemon::run_daemon(cfg, socket_path))
+                    .join()
+                    .map_err(|_| MemoryError::Config("daemon thread panicked".into()))?;
+            }
+            // On non-unix, `--listen` has no daemon transport yet (Task 10 adds a
+            // fallback); consume the flag so the in-process stdio server runs.
+            #[cfg(not(unix))]
+            let _ = listen;
+
             // Phase 1: fast server-ready init (DB open + schema migrate, ~50ms).
             // App is not Sync (single-threaded stdio server, block_in_place dispatch).
             #[allow(clippy::arc_with_non_send_sync)]
