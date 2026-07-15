@@ -25,6 +25,15 @@ enum Commands {
         /// Path to the database
         #[arg(long)]
         db: Option<String>,
+        /// Run as the shared daemon bound to this Unix socket path
+        #[arg(long)]
+        listen: Option<String>,
+        /// Run as a thin proxy connecting to this Unix socket path
+        #[arg(long, conflicts_with = "listen")]
+        connect: Option<String>,
+        /// Disable daemon auto-spawn from proxy (--connect) mode
+        #[arg(long)]
+        no_autospawn: bool,
     },
     /// Initialize a new memory store
     Init,
@@ -308,7 +317,17 @@ async fn main() {
 
 async fn run(cli: Cli) -> Result<(), MemoryError> {
     match cli.command {
-        Commands::Serve { db } => {
+        Commands::Serve {
+            db,
+            // TODO(#190 Task 6/8/10): wire daemon-bind (--listen), proxy/connect
+            // (--connect), and autospawn (--no-autospawn) dispatch. Until then every
+            // mode falls through to the existing in-process stdio server below, so
+            // `serve`, `serve --db X`, `serve --listen X`, and `serve --connect X`
+            // are currently all identical to today's behavior.
+            listen: _listen,
+            connect: _connect,
+            no_autospawn: _no_autospawn,
+        } => {
             let cfg = config::Config::load(db)?;
             // Phase 1: fast server-ready init (DB open + schema migrate, ~50ms).
             // App is not Sync (single-threaded stdio server, block_in_place dispatch).
@@ -648,5 +667,96 @@ async fn run(cli: Cli) -> Result<(), MemoryError> {
             }
             Ok(())
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Helper: parse argv and return the `Serve` fields, panicking if the parsed
+    /// command is not `Serve` (keeps each test focused on field assertions).
+    fn parse_serve(args: &[&str]) -> (Option<String>, Option<String>, Option<String>, bool) {
+        let cli = Cli::try_parse_from(args).expect("expected argv to parse");
+        match cli.command {
+            Commands::Serve {
+                db,
+                listen,
+                connect,
+                no_autospawn,
+            } => (db, listen, connect, no_autospawn),
+            _ => panic!("expected Commands::Serve, got a different variant"),
+        }
+    }
+
+    #[test]
+    fn serve_bare_uses_all_defaults() {
+        let (db, listen, connect, no_autospawn) = parse_serve(&["ironmem", "serve"]);
+        assert_eq!(db, None);
+        assert_eq!(listen, None);
+        assert_eq!(connect, None);
+        assert!(!no_autospawn);
+    }
+
+    #[test]
+    fn serve_db_preserved_with_new_fields_defaulted() {
+        let (db, listen, connect, no_autospawn) =
+            parse_serve(&["ironmem", "serve", "--db", "/tmp/x.sqlite3"]);
+        assert_eq!(db.as_deref(), Some("/tmp/x.sqlite3"));
+        assert_eq!(listen, None);
+        assert_eq!(connect, None);
+        assert!(!no_autospawn);
+    }
+
+    #[test]
+    fn serve_listen_sets_listen_only() {
+        let (db, listen, connect, no_autospawn) =
+            parse_serve(&["ironmem", "serve", "--listen", "/tmp/d.sock"]);
+        assert_eq!(db, None);
+        assert_eq!(listen.as_deref(), Some("/tmp/d.sock"));
+        assert_eq!(connect, None);
+        assert!(!no_autospawn);
+    }
+
+    #[test]
+    fn serve_connect_sets_connect_only() {
+        let (db, listen, connect, no_autospawn) =
+            parse_serve(&["ironmem", "serve", "--connect", "/tmp/d.sock"]);
+        assert_eq!(db, None);
+        assert_eq!(listen, None);
+        assert_eq!(connect.as_deref(), Some("/tmp/d.sock"));
+        assert!(!no_autospawn);
+    }
+
+    #[test]
+    fn serve_listen_and_connect_are_mutually_exclusive() {
+        let result = Cli::try_parse_from([
+            "ironmem",
+            "serve",
+            "--listen",
+            "/a.sock",
+            "--connect",
+            "/b.sock",
+        ]);
+        assert!(result.is_err(), "expected --listen + --connect to conflict");
+        let msg = result.err().unwrap().to_string();
+        assert!(
+            msg.contains("connect") && msg.contains("listen"),
+            "conflict error should mention both flags, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn serve_no_autospawn_with_connect() {
+        let (_db, listen, connect, no_autospawn) = parse_serve(&[
+            "ironmem",
+            "serve",
+            "--no-autospawn",
+            "--connect",
+            "/tmp/d.sock",
+        ]);
+        assert_eq!(listen, None);
+        assert_eq!(connect.as_deref(), Some("/tmp/d.sock"));
+        assert!(no_autospawn);
     }
 }
