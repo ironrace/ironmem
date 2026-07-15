@@ -145,6 +145,36 @@ where
     R: AsyncBufRead + Unpin,
     W: AsyncWrite + Unpin,
 {
+    // In-process stdio backend: dispatch synchronously against the local
+    // `App`, offloaded via `block_in_place` so blocking tool work doesn't
+    // stall the tokio reactor. A later shared-daemon backend swaps this
+    // closure for a channel round-trip to a single-owner dispatcher.
+    run_framing_loop(&app, reader, writer, |request| {
+        tokio::task::block_in_place(|| dispatch(&app, request))
+    })
+    .await
+}
+
+/// Per-connection MCP framing loop: read newline-delimited JSON-RPC requests
+/// from `reader`, hand each one to `dispatch_fn` to obtain a response, write
+/// the response to `writer`, and account response metrics. `dispatch_fn` is
+/// the dispatch backend — today an in-process synchronous call (see
+/// `run_server_io`), and in a future shared-daemon transport a channel
+/// round-trip to a single-owner dispatcher. Metrics accounting still needs
+/// direct access to `app` (for harness/session context) and to the original
+/// request (for tool name / session id / exploration context), independent
+/// of how the response was obtained.
+async fn run_framing_loop<R, W, F>(
+    app: &Arc<App>,
+    reader: R,
+    writer: W,
+    mut dispatch_fn: F,
+) -> Result<(), MemoryError>
+where
+    R: AsyncBufRead + Unpin,
+    W: AsyncWrite + Unpin,
+    F: FnMut(&JsonRpcRequest) -> Option<JsonRpcResponse>,
+{
     let mut stdout = writer;
     let mut lines = reader.lines();
     while let Ok(Some(line)) = lines.next_line().await {
@@ -159,7 +189,7 @@ where
                 let resp = JsonRpcResponse::error(None, -32700, &format!("Parse error: {e}"));
                 let chars = write_response(&mut stdout, &resp).await?;
                 account_response_metrics(
-                    &app,
+                    app,
                     chars,
                     None,
                     app.session_id_snapshot().as_deref(),
@@ -176,20 +206,11 @@ where
                 "Invalid Request: jsonrpc must be '2.0'",
             );
             let chars = write_response(&mut stdout, &resp).await?;
-            account_response_metrics(
-                &app,
-                chars,
-                None,
-                app.session_id_snapshot().as_deref(),
-                None,
-            );
+            account_response_metrics(app, chars, None, app.session_id_snapshot().as_deref(), None);
             continue;
         }
 
-        // Run synchronous tool dispatch without blocking the tokio reactor.
-        // block_in_place yields the current thread to the runtime for other async
-        // tasks while executing the blocking work inline (no Send requirement).
-        let response = tokio::task::block_in_place(|| dispatch(&app, &request));
+        let response = dispatch_fn(&request);
 
         if let Some(resp) = response {
             // Extract the tool result JSON (if this is a successful tools/call)
@@ -209,7 +230,7 @@ where
                 .session_id_snapshot()
                 .or_else(|| request_collab_session_id(&request));
             account_response_metrics(
-                &app,
+                app,
                 chars,
                 request_tool_name(&request),
                 sid.as_deref(),
