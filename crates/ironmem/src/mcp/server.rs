@@ -4,19 +4,59 @@ use std::sync::Arc;
 
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 
-use super::app::App;
+use super::app::{harness_from_client_info, session_id_from_params, App};
 use super::protocol::{self, JsonRpcRequest, JsonRpcResponse};
 use super::tools;
 use crate::error::MemoryError;
 
-fn mcp_harness(app: &App) -> String {
+/// Per-connection metrics attribution: harness + session id learned from
+/// *this* connection's own `initialize` request. Local to one
+/// `run_framing_loop` invocation (one per connection) so that when a single
+/// `App` is shared across multiple concurrent/sequential connections (the
+/// shared-daemon transport this crate is moving toward), one connection's
+/// `initialize` can never clobber — or be blocked by — another connection's
+/// learned attribution. This replaces the pre-existing `App::session_id` /
+/// `App::harness` fields, which were process-global set-once cells: correct
+/// for a single bare-stdio connection, but silently mis-attributing every
+/// subsequent connection's requests to the first connection's session/harness
+/// once shared.
+#[derive(Default)]
+struct ConnectionContext {
+    session_id: Option<String>,
+    harness: Option<String>,
+}
+
+impl ConnectionContext {
+    /// Seed from the `IRONMEM_SESSION_ID` env override, matching the
+    /// pre-existing `App::session_id` construction-time seed. An env value
+    /// takes priority over anything `initialize` supplies (`learn` never
+    /// overwrites an already-`Some` value), exactly mirroring prior behavior.
+    fn new() -> Self {
+        Self {
+            session_id: std::env::var("IRONMEM_SESSION_ID").ok(),
+            harness: None,
+        }
+    }
+
+    /// Learn session id + harness from an `initialize` request's params.
+    /// Set-once per connection: never overwrites an already-learned value.
+    fn learn(&mut self, params: &serde_json::Value) {
+        if self.session_id.is_none() {
+            self.session_id = session_id_from_params(params);
+        }
+        if self.harness.is_none() {
+            self.harness = harness_from_client_info(params);
+        }
+    }
+}
+
+fn mcp_harness(ctx: &ConnectionContext) -> String {
     if let Ok(value) = std::env::var("IRONMEM_HARNESS") {
         if let Some(id) = crate::harness::canonicalize_input(&value, crate::harness::REGISTRY) {
             return id.to_string();
         }
     }
-    app.harness_snapshot()
-        .unwrap_or_else(|| "claude".to_string())
+    ctx.harness.clone().unwrap_or_else(|| "claude".to_string())
 }
 
 /// Collab tool calls carry a `session_id` argument; use it as the D1 fallback
@@ -48,6 +88,7 @@ fn normalize_session_id(value: &str) -> Option<String> {
 
 fn account_response_metrics(
     app: &App,
+    conn: &ConnectionContext,
     chars: usize,
     tool_name: Option<&str>,
     session_id: Option<&str>,
@@ -57,14 +98,14 @@ fn account_response_metrics(
         return;
     }
     tokio::task::block_in_place(|| {
-        let ctx = crate::metrics::MetricsContext::resolve(app);
+        let metrics_ctx = crate::metrics::MetricsContext::resolve(app);
         crate::metrics::account_mcp_response(
             &app.db,
             chars as i64,
-            &mcp_harness(app),
+            &mcp_harness(conn),
             tool_name,
             session_id,
-            &ctx,
+            &metrics_ctx,
             exploration,
         );
     });
@@ -160,10 +201,13 @@ where
 /// the response to `writer`, and account response metrics. `dispatch_fn` is
 /// the dispatch backend — today an in-process synchronous call (see
 /// `run_server_io`), and in a future shared-daemon transport a channel
-/// round-trip to a single-owner dispatcher. Metrics accounting still needs
-/// direct access to `app` (for harness/session context) and to the original
-/// request (for tool name / session id / exploration context), independent
-/// of how the response was obtained.
+/// round-trip to a single-owner dispatcher. Metrics accounting needs access
+/// to `app` (for the DB + process-global collab/task-tag context) and a
+/// per-connection `ConnectionContext` (for harness/session attribution learned
+/// from *this* connection's own `initialize` — see `ConnectionContext` for
+/// why that must not live on `App`), plus the original request (for tool name
+/// / session id / exploration context), independent of how the response was
+/// obtained.
 async fn run_framing_loop<R, W, F>(
     app: &Arc<App>,
     reader: R,
@@ -177,6 +221,7 @@ where
 {
     let mut stdout = writer;
     let mut lines = reader.lines();
+    let mut conn = ConnectionContext::new();
     while let Ok(Some(line)) = lines.next_line().await {
         let line = line.trim().to_string();
         if line.is_empty() {
@@ -188,13 +233,7 @@ where
             Err(e) => {
                 let resp = JsonRpcResponse::error(None, -32700, &format!("Parse error: {e}"));
                 let chars = write_response(&mut stdout, &resp).await?;
-                account_response_metrics(
-                    app,
-                    chars,
-                    None,
-                    app.session_id_snapshot().as_deref(),
-                    None,
-                );
+                account_response_metrics(app, &conn, chars, None, conn.session_id.as_deref(), None);
                 continue;
             }
         };
@@ -206,8 +245,18 @@ where
                 "Invalid Request: jsonrpc must be '2.0'",
             );
             let chars = write_response(&mut stdout, &resp).await?;
-            account_response_metrics(app, chars, None, app.session_id_snapshot().as_deref(), None);
+            account_response_metrics(app, &conn, chars, None, conn.session_id.as_deref(), None);
             continue;
+        }
+
+        // Connection-local attribution: learn session id / harness from this
+        // connection's own `initialize` request before dispatching it. Kept
+        // in the framing loop (rather than inside `dispatch`) so `dispatch`'s
+        // signature — and its many direct test callers — stay untouched; the
+        // framing loop already owns the parsed `request` and is the one place
+        // that is per-connection by construction.
+        if request.method == "initialize" {
+            conn.learn(&request.params);
         }
 
         let response = dispatch_fn(&request);
@@ -226,11 +275,13 @@ where
                 .and_then(|s| serde_json::from_str(s).ok());
             let exploration = request_exploration_context(&request, tool_result_json.as_ref());
             let chars = write_response(&mut stdout, &resp).await?;
-            let sid = app
-                .session_id_snapshot()
+            let sid = conn
+                .session_id
+                .clone()
                 .or_else(|| request_collab_session_id(&request));
             account_response_metrics(
                 app,
+                &conn,
                 chars,
                 request_tool_name(&request),
                 sid.as_deref(),
@@ -258,13 +309,16 @@ pub fn dispatch(app: &App, request: &JsonRpcRequest) -> Option<JsonRpcResponse> 
     let id = request.id.clone();
 
     match request.method.as_str() {
-        "initialize" => {
-            app.learn_metrics_context(&request.params);
-            Some(JsonRpcResponse::success(
-                id,
-                protocol::capabilities_response(),
-            ))
-        }
+        // Metrics attribution (harness/session id) is learned per-connection
+        // in `run_framing_loop`'s `ConnectionContext`, not here — `dispatch`
+        // has no notion of "which connection" once a single `App` is shared
+        // across many (see `ConnectionContext` doc comment). `dispatch` stays
+        // a pure request -> response function so its many direct test callers
+        // (outside this module) are unaffected by this change.
+        "initialize" => Some(JsonRpcResponse::success(
+            id,
+            protocol::capabilities_response(),
+        )),
 
         "tools/list" => {
             let tool_list = tools::tool_definitions(app);
@@ -780,5 +834,104 @@ mod tests {
         client_out.read_to_string(&mut out).await.unwrap();
 
         assert!(app.db.get_session_summary("spoof").unwrap().is_none());
+    }
+
+    /// Task 2 acceptance test: two sequential connections through ONE shared
+    /// `App`, each with a distinct `clientInfo`/session, must each get their
+    /// own attribution — the second connection's `initialize` must not be
+    /// silently dropped in favor of the first's (the pre-fix behavior, when
+    /// `App::session_id`/`App::harness` were process-global "set once" cells).
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn sequential_connections_on_shared_app_get_independent_attribution() {
+        let _g = METRICS_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::remove_var("IRONMEM_METRICS");
+        std::env::remove_var("IRONMEM_HARNESS");
+        #[allow(clippy::arc_with_non_send_sync)]
+        let app = Arc::new(App::open_for_test().unwrap());
+
+        // Connection 1: claude-code client, session "session-one". Second
+        // request is a cheap `tools/call` (not `tools/list`, whose full tool
+        // catalog can exceed the duplex buffer and deadlock: the framing loop
+        // would block writing a response nobody drains until after
+        // `run_server_io` returns).
+        let (mut client_in, server_in) = tokio::io::duplex(65536);
+        let (server_out, mut client_out) = tokio::io::duplex(65536);
+        client_in
+            .write_all(
+                b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{\"sessionId\":\"session-one\",\"clientInfo\":{\"name\":\"claude-code\",\"version\":\"1.0.0\"}}}\n\
+                  {\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/call\",\"params\":{\"name\":\"status\",\"arguments\":{}}}\n",
+            )
+            .await
+            .unwrap();
+        client_in.shutdown().await.unwrap();
+        run_server_io(Arc::clone(&app), BufReader::new(server_in), server_out)
+            .await
+            .unwrap();
+        let mut out1 = String::new();
+        client_out.read_to_string(&mut out1).await.unwrap();
+        assert!(out1.contains("\"protocolVersion\""));
+
+        // Connection 2, on the SAME `App`: codex-cli client, session
+        // "session-two". If attribution were still process-global, this
+        // connection's `initialize` would be ignored (guard already `Some`
+        // from connection 1) and both of its responses below would be
+        // mis-attributed to connection 1's harness/session forever.
+        let (mut client_in2, server_in2) = tokio::io::duplex(65536);
+        let (server_out2, mut client_out2) = tokio::io::duplex(65536);
+        client_in2
+            .write_all(
+                b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{\"sessionId\":\"session-two\",\"clientInfo\":{\"name\":\"codex-cli\",\"version\":\"1.0.0\"}}}\n\
+                  {\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/call\",\"params\":{\"name\":\"status\",\"arguments\":{}}}\n",
+            )
+            .await
+            .unwrap();
+        client_in2.shutdown().await.unwrap();
+        run_server_io(Arc::clone(&app), BufReader::new(server_in2), server_out2)
+            .await
+            .unwrap();
+        let mut out2 = String::new();
+        client_out2.read_to_string(&mut out2).await.unwrap();
+        assert!(out2.contains("\"protocolVersion\""));
+
+        let rows = app
+            .db
+            .query_token_usage(&crate::db::metrics::TokenUsageQuery::default())
+            .unwrap();
+        let mcp: Vec<_> = rows.iter().filter(|r| r.source == "mcp_response").collect();
+        assert_eq!(
+            mcp.len(),
+            4,
+            "2 responses (initialize + tools/call status) per connection x 2 connections"
+        );
+
+        let conn1: Vec<_> = mcp
+            .iter()
+            .filter(|r| r.session_id.as_deref() == Some("session-one"))
+            .collect();
+        let conn2: Vec<_> = mcp
+            .iter()
+            .filter(|r| r.session_id.as_deref() == Some("session-two"))
+            .collect();
+        assert_eq!(
+            conn1.len(),
+            2,
+            "both of connection 1's responses attributed to session-one"
+        );
+        assert_eq!(
+            conn2.len(),
+            2,
+            "both of connection 2's responses attributed to session-two, \
+             not blocked by connection 1's already-learned session id"
+        );
+        assert!(
+            conn1.iter().all(|r| r.harness == "claude"),
+            "connection 1 attributed to the claude harness"
+        );
+        assert!(
+            conn2.iter().all(|r| r.harness == "codex"),
+            "connection 2 attributed to the codex harness, not clobbered by \
+             connection 1's already-learned harness"
+        );
     }
 }
