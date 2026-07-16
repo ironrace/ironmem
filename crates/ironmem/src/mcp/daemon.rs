@@ -348,6 +348,55 @@ pub async fn serve_accept_loop(
     Ok(())
 }
 
+/// RAII guard that removes the daemon's own socket file on drop.
+///
+/// Constructed ONLY after [`bind_daemon_listener`] has succeeded for THIS
+/// process (see [`run_daemon_async`]) — so a bind FAILURE (a live daemon
+/// already owns `path`, per `prepare_socket_path`'s live-peer check) never
+/// constructs this guard and never removes anything (C1). Once constructed,
+/// it fires on every exit path (idle-timeout, error, or otherwise) via normal
+/// `Drop` scoping, so cleanup can't be forgotten on a new early-return.
+///
+/// Deliberately does NOT also remove a lockfile (H1): `<socket>.lock` is
+/// owned by the `--connect` auto-spawn proxy's [`LockGuard`], not by the
+/// daemon process itself, so the daemon must never touch it.
+#[cfg(unix)]
+struct SocketCleanupGuard {
+    path: std::path::PathBuf,
+}
+
+#[cfg(unix)]
+impl Drop for SocketCleanupGuard {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+/// Async core of the daemon entry point, generic over an already-constructed
+/// `app` so it is directly testable (see `daemon_tests::
+/// bind_failure_does_not_unlink_the_live_daemons_socket`) without going
+/// through [`run_daemon`]'s dedicated-runtime/background-init wrapper.
+///
+/// Binds `socket_path`; a bind failure (live peer already owns it) propagates
+/// immediately via `?` and constructs no cleanup guard (C1: never unlinks a
+/// live daemon's socket). Only once bound does this process own the socket,
+/// at which point [`SocketCleanupGuard`] is created so the socket — and ONLY
+/// the socket, never the proxy-owned lockfile (H1) — is removed on every exit
+/// path from here on, including the idle timer inside `serve_accept_loop`.
+#[cfg(unix)]
+async fn run_daemon_async(
+    app: Arc<App>,
+    socket_path: std::path::PathBuf,
+    idle_timeout: std::time::Duration,
+    shutdown: oneshot::Receiver<()>,
+) -> Result<(), MemoryError> {
+    let listener = bind_daemon_listener(&socket_path).await?;
+    // Reached only after a successful bind: this process now owns the
+    // socket, so cleanup is safe to arm from this point on.
+    let _cleanup = SocketCleanupGuard { path: socket_path };
+    serve_accept_loop(app, listener, idle_timeout, shutdown).await
+}
+
 /// Production daemon entry point for `serve --listen <socket>`.
 ///
 /// Runs entirely on the CURRENT thread: builds a multi-thread runtime and drives
@@ -363,24 +412,25 @@ pub async fn serve_accept_loop(
 ///
 /// The shutdown receiver here is a never-fired channel: the daemon runs until
 /// process exit or the idle timer (from `Config::daemon_idle_timeout`) expires
-/// via `serve_accept_loop`. On EITHER exit path the daemon-owned socket and
-/// lockfile are removed (best-effort — a `NotFound` on either is expected and
-/// ignored), so a later `--connect` proxy correctly probes "no daemon" rather
-/// than finding a stale path.
+/// via `serve_accept_loop`. On a successful bind, EITHER exit path removes
+/// ONLY the daemon-owned socket (best-effort, via [`SocketCleanupGuard`]; a
+/// `NotFound` is expected and ignored), so a later `--connect` proxy correctly
+/// probes "no daemon" rather than finding a stale path. A FAILED bind (a live
+/// daemon already owns `socket_path`) removes nothing at all (C1) — see
+/// [`run_daemon_async`]. The lockfile is never touched here: it is proxy-owned
+/// (H1).
 #[cfg(unix)]
 pub fn run_daemon(
     config: crate::config::Config,
     socket_path: std::path::PathBuf,
 ) -> Result<(), MemoryError> {
     let idle_timeout = config.daemon_idle_timeout();
-    let lock_path = config.daemon_lock_path();
-    let socket_path_for_cleanup = socket_path.clone();
 
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
         .map_err(MemoryError::Io)?;
-    let result = rt.block_on(async move {
+    rt.block_on(async move {
         #[allow(clippy::arc_with_non_send_sync)]
         let app = Arc::new(App::new_server_ready(config.clone())?);
         // Mirror the stdio `serve` path: record version + kick background model
@@ -390,16 +440,11 @@ pub fn run_daemon(
         let memory_ready = Arc::clone(&app.memory_ready);
         crate::bootstrap::run_background_memory_init(config, memory_ready);
 
-        let listener = bind_daemon_listener(&socket_path).await?;
         // Never-fired shutdown: only the idle timer inside `serve_accept_loop`
         // ends this daemon absent an external kill.
         let (_tx, rx) = oneshot::channel::<()>();
-        serve_accept_loop(app, listener, idle_timeout, rx).await
-    });
-
-    let _ = std::fs::remove_file(&socket_path_for_cleanup);
-    let _ = std::fs::remove_file(&lock_path);
-    result
+        run_daemon_async(app, socket_path, idle_timeout, rx).await
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -1043,12 +1088,13 @@ mod daemon_tests {
         joined.join().unwrap().unwrap();
     }
 
-    /// Task 7: on idle-timeout exit, the daemon-owned socket AND lockfile must
-    /// both be removed — mirroring the cleanup `run_daemon` performs on every
-    /// exit path, so a subsequent `--connect` proxy correctly probes "no
-    /// daemon" instead of tripping over stale files.
+    /// Task 7 + H1: on idle-timeout exit, `run_daemon_async` removes ONLY the
+    /// daemon-owned socket via `SocketCleanupGuard` — never a lockfile, which
+    /// is proxy-owned (H1) and must survive untouched. A pre-existing lock at
+    /// this path stands in for one legitimately held by a `--connect` proxy
+    /// that spawned this daemon; the daemon must never reach for it.
     #[tokio::test]
-    async fn idle_exit_cleanup_removes_socket_and_lock() {
+    async fn idle_exit_cleanup_removes_only_the_socket_never_the_lock() {
         let dir = tempfile::tempdir().unwrap();
         let sock = dir.path().join("daemon.sock");
         let lock = dir.path().join("daemon.sock.lock");
@@ -1057,17 +1103,71 @@ mod daemon_tests {
         let (_shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
         #[allow(clippy::arc_with_non_send_sync)]
         let app = Arc::new(App::open_for_test().unwrap());
-        let listener = bind_daemon_listener(&sock).await.unwrap();
-
-        // Mirrors `run_daemon`'s post-`serve_accept_loop` cleanup exactly.
-        serve_accept_loop(app, listener, Duration::from_millis(50), shutdown_rx)
+        run_daemon_async(app, sock.clone(), Duration::from_millis(50), shutdown_rx)
             .await
             .unwrap();
-        let _ = std::fs::remove_file(&sock);
-        let _ = std::fs::remove_file(&lock);
 
         assert!(!sock.exists(), "socket file must be removed on idle exit");
-        assert!(!lock.exists(), "lockfile must be removed on idle exit");
+        assert!(
+            lock.exists(),
+            "the daemon must never remove the proxy-owned lockfile"
+        );
+    }
+
+    /// C1 acceptance: a losing `run_daemon_async` (bind fails because a live
+    /// daemon already owns the socket) must NOT unlink the winner's socket.
+    /// Before the fix, cleanup ran unconditionally after `rt.block_on`,
+    /// regardless of whether THIS process ever actually bound the listener —
+    /// so the loser would delete the winner's live socket out from under it.
+    #[test]
+    fn bind_failure_does_not_unlink_the_live_daemons_socket() {
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("daemon.sock");
+        let sock_thread = sock.clone();
+
+        let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+        let winner = std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            rt.block_on(async move {
+                #[allow(clippy::arc_with_non_send_sync)]
+                let app = Arc::new(App::open_for_test().unwrap());
+                run_daemon_async(app, sock_thread, Duration::from_secs(600), shutdown_rx).await
+            })
+        });
+
+        // Wait for the winner to actually bind before probing it.
+        for _ in 0..200 {
+            if sock.exists() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(sock.exists(), "winner must bind before the loser probes it");
+
+        // Loser: same socket path, must fail to bind (live peer detected by
+        // `prepare_socket_path`'s probe-connect) and must NOT unlink it.
+        let sock_loser = sock.clone();
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let (_tx2, rx2) = oneshot::channel::<()>();
+        let result = rt.block_on(async move {
+            #[allow(clippy::arc_with_non_send_sync)]
+            let app2 = Arc::new(App::open_for_test().unwrap());
+            run_daemon_async(app2, sock_loser, Duration::from_secs(600), rx2).await
+        });
+        assert!(
+            result.is_err(),
+            "the loser must fail to bind rather than steal the socket"
+        );
+        assert!(
+            sock.exists(),
+            "the winner's live socket must still exist after the loser's failed bind"
+        );
+
+        shutdown_tx.send(()).ok();
+        winner.join().unwrap().unwrap();
     }
 
     /// A dead/stale socket file (no live listener behind it) must not block a
