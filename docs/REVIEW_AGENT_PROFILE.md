@@ -17,6 +17,13 @@ Symbol-graph reads are excluded on purpose: the review briefs already use `grep`
 as the caller-tracing method and treat symbol lookups as optional. Excluding them
 keeps the profile zero-MCP and identical across every harness.
 
+The scope of this profile is the **MCP surface**: what the regression test and the
+"Enforced" status guarantee is that no review agent advertises an `mcp__ironmem__*`
+tool. `security-reviewer` additionally retains `Write`/`Edit` for its standalone
+remediation role; in review-dispatch mode its read-only behaviour is enforced by a
+prompt rule, not by its `tools:` allowlist. Stripping host write tools is a separate
+concern from the memory-surface cleanup this profile covers.
+
 ## Enforcement is client-side, not server-side
 
 Under shared-daemon mode (#190) the `IRONMEM_MCP_MODE` access mode is
