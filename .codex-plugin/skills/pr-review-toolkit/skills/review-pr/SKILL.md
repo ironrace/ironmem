@@ -29,6 +29,7 @@ When the user explicitly invokes `pr-review-toolkit:review-pr` or asks for subag
 Use `spawn_agent` with `agent_type: "reviewer"` where available. In every prompt, tell the agent:
 
 - This is a read-only review. Do not edit files, stage, commit, or revert.
+- Do not call any ironmem memory tools (`search`, `add_drawer`, `kg_*`, `diary_*`, `collab_*`, `code_map_*`, `symbol_*`). This is a diff review — read files with the host tools and report. Codex attaches MCP servers globally, so the tools may be visible; the review path must not use them. See `docs/REVIEW_AGENT_PROFILE.md`.
 - The codebase may contain user changes. Do not ask to revert unrelated work.
 - Verify file paths and line numbers from the current workspace.
 - Return only actionable findings, ordered by severity, plus a short residual-risk note.
