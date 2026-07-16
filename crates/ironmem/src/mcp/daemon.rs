@@ -441,9 +441,9 @@ where
 /// - Connect fails AND `autospawn_enabled` is `false` -> returns
 ///   [`ProxyOutcome::FallbackToInProcess`] so the caller runs the in-process
 ///   stdio server instead (no daemon, and the caller was told not to spawn one).
-/// - Connect fails AND `autospawn_enabled` is `true` -> propagates the connect
-///   error. Task 9 replaces this arm with single-flight auto-spawn + retry;
-///   until then there is no daemon to spawn from this seam.
+/// - Connect fails AND `autospawn_enabled` is `true` -> single-flight auto-spawn
+///   (Task 9): acquire `<socket>.lock`, spawn a detached daemon (unless another
+///   proxy already won the race), poll-connect until ready, then proxy.
 #[cfg(unix)]
 async fn run_connect_mode_io<R, W>(
     socket_path: &Path,
@@ -467,7 +467,12 @@ where
             );
             Ok(ProxyOutcome::FallbackToInProcess)
         }
-        Err(e) => Err(MemoryError::Io(e)),
+        Err(_) => {
+            let lock_path = lock_path_for_socket(socket_path);
+            let stream = autospawn_and_connect(socket_path, &lock_path).await?;
+            pump_proxy(stream, local_in, local_out).await?;
+            Ok(ProxyOutcome::Proxied)
+        }
     }
 }
 
@@ -484,6 +489,248 @@ pub async fn run_connect_mode(
         tokio::io::stdout(),
     )
     .await
+}
+
+// ---------------------------------------------------------------------------
+// Single-flight auto-spawn under an atomic lockfile (Task 9).
+//
+// When a `--connect` proxy finds no daemon listening and auto-spawn is
+// enabled, MANY proxies may race to start one at once (e.g. several MCP
+// clients launched together). Exactly one of them must actually spawn the
+// daemon; the rest must simply wait and then connect to the winner's daemon.
+// The `<socket>.lock` file is the single-flight gate: atomic `create_new`
+// decides the winner, a dead owner's stale lock is safely recovered, and a
+// live owner's lock is never stolen.
+
+/// Derive the lockfile path from a runtime socket path: `<socket>.lock`,
+/// mirroring `Config::daemon_lock_path` but applied to whatever socket path
+/// was actually supplied on the command line (which need not match a
+/// `Config`-derived default).
+#[cfg(unix)]
+fn lock_path_for_socket(socket_path: &Path) -> std::path::PathBuf {
+    let mut name = socket_path.as_os_str().to_os_string();
+    name.push(".lock");
+    std::path::PathBuf::from(name)
+}
+
+/// Result of attempting to acquire the single-flight lock.
+#[cfg(unix)]
+#[derive(Debug, PartialEq, Eq)]
+enum LockOutcome {
+    /// We now own the lock (our pid is recorded in the lockfile).
+    Acquired,
+    /// Another live process holds the lock; it is presumably spawning.
+    HeldByOther,
+}
+
+/// True unless `pid` is definitively gone. `kill(pid, 0)` sends no signal —
+/// it only checks deliverability. Success means the process exists; `ESRCH`
+/// means it does not. Any OTHER errno (chiefly `EPERM`, no permission to
+/// signal a process we don't own) still means the process exists, so only
+/// `ESRCH` is treated as "dead" — anything else is conservatively "alive" to
+/// avoid ever stealing a live owner's lock.
+#[cfg(unix)]
+fn pid_is_alive(pid: i32) -> bool {
+    if pid <= 0 {
+        return false;
+    }
+    if unsafe { libc::kill(pid, 0) } == 0 {
+        return true;
+    }
+    std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
+}
+
+/// Best-effort removal of `lock_path` on drop, releasing the single-flight
+/// lock whether the guarded section succeeded or returned early via `?`.
+#[cfg(unix)]
+struct LockGuard {
+    path: std::path::PathBuf,
+}
+
+#[cfg(unix)]
+impl Drop for LockGuard {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+/// Path for the private, per-process "claim" file used by [`try_acquire_lock`]
+/// to publish `lock_path` atomically-with-content (see that function's doc
+/// comment for why a plain `create_new` + separate write is unsafe).
+#[cfg(unix)]
+fn lock_claim_tmp_path(lock_path: &Path) -> std::path::PathBuf {
+    let mut name = lock_path.as_os_str().to_os_string();
+    name.push(format!(".claim-{}", std::process::id()));
+    std::path::PathBuf::from(name)
+}
+
+/// Attempt to acquire `lock_path` with our pid as content. If it already
+/// exists, a live owner means [`LockOutcome::HeldByOther`]; a dead owner (or
+/// an unreadable/malformed lockfile) is stale and is removed so the
+/// acquisition race can be retried. Bounded to avoid spinning forever under
+/// pathological contention.
+///
+/// Publishing is done via write-then-`hard_link`, NOT `create_new` followed by
+/// a separate write. The naive `create_new` + write has a real TOCTOU window:
+/// `create_new` creates an EMPTY file first, and the pid is written to it in a
+/// second, separate step. A peer that hits `AlreadyExists` in between those
+/// two steps reads an empty/unparseable lockfile, misjudges it as stale, and
+/// steals it out from under the true (still-alive, still-writing) owner —
+/// producing two "winners" and, in this daemon's case, two spawned daemons
+/// racing for the same socket. Writing full content to a private per-process
+/// temp file FIRST, then `hard_link`ing it onto `lock_path`, closes that
+/// window: `hard_link` is the single atomic publish step, and the linked
+/// inode already carries its final content the instant it becomes visible at
+/// `lock_path` — there is no intermediate "exists but empty" state for a peer
+/// to observe.
+#[cfg(unix)]
+fn try_acquire_lock(lock_path: &Path) -> Result<LockOutcome, MemoryError> {
+    const MAX_STALE_RECOVERY_ATTEMPTS: u32 = 20;
+
+    for _ in 0..MAX_STALE_RECOVERY_ATTEMPTS {
+        let tmp_path = lock_claim_tmp_path(lock_path);
+        std::fs::write(&tmp_path, std::process::id().to_string()).map_err(MemoryError::Io)?;
+        let link_result = std::fs::hard_link(&tmp_path, lock_path);
+        let _ = std::fs::remove_file(&tmp_path); // disposable either way
+
+        match link_result {
+            Ok(()) => return Ok(LockOutcome::Acquired),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                match std::fs::read_to_string(lock_path) {
+                    Ok(content) => {
+                        let owner_pid: Option<i32> = content.trim().parse().ok();
+                        if owner_pid.is_some_and(pid_is_alive) {
+                            return Ok(LockOutcome::HeldByOther);
+                        }
+                        // Stale (dead owner, or an unparseable/corrupt lock —
+                        // never left behind by this code, so it too is
+                        // treated as recoverable): remove and retry.
+                        let _ = std::fs::remove_file(lock_path);
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                        // Raced away between our AlreadyExists and this read
+                        // (another process's stale-recovery or release) —
+                        // just retry.
+                    }
+                    Err(e) => return Err(MemoryError::Io(e)),
+                }
+            }
+            Err(e) => return Err(MemoryError::Io(e)),
+        }
+    }
+
+    Err(MemoryError::Config(format!(
+        "could not acquire the daemon lock at {} after {MAX_STALE_RECOVERY_ATTEMPTS} attempts",
+        lock_path.display()
+    )))
+}
+
+/// Poll-connect with bounded exponential backoff until a freshly spawned
+/// daemon's socket accepts connections, or the attempts are exhausted.
+#[cfg(unix)]
+async fn poll_connect_with_backoff(socket_path: &Path) -> Result<UnixStream, MemoryError> {
+    const MAX_ATTEMPTS: u32 = 100;
+    let mut delay = std::time::Duration::from_millis(20);
+
+    for attempt in 0..MAX_ATTEMPTS {
+        match UnixStream::connect(socket_path).await {
+            Ok(stream) => return Ok(stream),
+            Err(e) if attempt + 1 == MAX_ATTEMPTS => return Err(MemoryError::Io(e)),
+            Err(_) => {
+                tokio::time::sleep(delay).await;
+                delay = (delay * 2).min(std::time::Duration::from_millis(500));
+            }
+        }
+    }
+    unreachable!("loop always returns via the attempt+1 == MAX_ATTEMPTS arm above")
+}
+
+/// Spawn a detached `ironmem serve --listen <socket>` daemon child process.
+/// No stdio is inherited (the daemon reads/writes nothing over stdio in
+/// `--listen` mode) and it is placed in its own process group so it survives
+/// the spawning proxy's terminal session ending.
+#[cfg(unix)]
+fn spawn_daemon_process(socket_path: &Path) -> Result<(), MemoryError> {
+    use std::os::unix::process::CommandExt;
+
+    let exe = std::env::current_exe()
+        .map_err(|e| MemoryError::Config(format!("cannot resolve ironmem path: {e}")))?;
+
+    std::process::Command::new(exe)
+        .arg("serve")
+        .arg("--listen")
+        .arg(socket_path)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .process_group(0)
+        .spawn()
+        .map_err(|e| MemoryError::Config(format!("failed to spawn daemon: {e}")))?;
+    Ok(())
+}
+
+/// Single-flight auto-spawn core, generic over how "start a daemon" is
+/// performed so it is testable without invoking a real subprocess (production
+/// goes through [`autospawn_and_connect`], which spawns the real `ironmem`
+/// binary). Acquires `lock_path`; the winner re-checks `socket_path` (another
+/// proxy may have already finished spawning between our failed initial
+/// connect and winning the lock) before calling `spawn`, then poll-connects.
+/// A loser (lock held by another live process) retries a plain connect first —
+/// the winner's daemon may already be bound even before it releases the lock —
+/// falling back to re-attempting the lock if that connect also fails.
+#[cfg(unix)]
+async fn autospawn_and_connect_with<F>(
+    socket_path: &Path,
+    lock_path: &Path,
+    spawn: F,
+) -> Result<UnixStream, MemoryError>
+where
+    F: FnOnce() -> Result<(), MemoryError>,
+{
+    const MAX_LOCK_WAIT_ATTEMPTS: u32 = 200;
+    let mut spawn = Some(spawn);
+
+    for _ in 0..MAX_LOCK_WAIT_ATTEMPTS {
+        match try_acquire_lock(lock_path)? {
+            LockOutcome::Acquired => {
+                let _guard = LockGuard {
+                    path: lock_path.to_path_buf(),
+                };
+                // Re-check inside the lock: another proxy may have already
+                // won and finished spawning before we got here.
+                if let Ok(stream) = UnixStream::connect(socket_path).await {
+                    return Ok(stream);
+                }
+                let spawn = spawn
+                    .take()
+                    .expect("autospawn_and_connect_with only reaches Acquired once");
+                spawn()?;
+                return poll_connect_with_backoff(socket_path).await;
+                // `_guard` drops here (success or `?`-propagated error),
+                // releasing the lock so any waiting proxy can proceed.
+            }
+            LockOutcome::HeldByOther => {
+                if let Ok(stream) = UnixStream::connect(socket_path).await {
+                    return Ok(stream);
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        }
+    }
+
+    Err(MemoryError::Config(format!(
+        "timed out waiting for the daemon lock at {}",
+        lock_path.display()
+    )))
+}
+
+/// Production single-flight auto-spawn: spawns the real `ironmem` binary.
+#[cfg(unix)]
+async fn autospawn_and_connect(
+    socket_path: &Path,
+    lock_path: &Path,
+) -> Result<UnixStream, MemoryError> {
+    autospawn_and_connect_with(socket_path, lock_path, || spawn_daemon_process(socket_path)).await
 }
 
 #[cfg(all(test, unix))]
@@ -879,21 +1126,196 @@ mod daemon_tests {
         assert_eq!(outcome, ProxyOutcome::FallbackToInProcess);
     }
 
-    /// When auto-spawn IS enabled but no daemon is reachable, Task 8 has no
-    /// spawn logic yet (that's Task 9) — the connect error must propagate
-    /// rather than being silently swallowed, so a future regression that
-    /// accidentally treats "autospawn enabled" the same as "disabled" is
-    /// caught here.
-    #[tokio::test]
-    async fn connect_mode_propagates_error_when_autospawn_enabled_and_no_daemon() {
-        let dir = tempfile::tempdir().unwrap();
-        let sock = dir.path().join("no-daemon-here.sock");
+    // ---- Task 9: single-flight auto-spawn under an atomic lockfile --------
+    //
+    // `run_connect_mode_io`'s autospawn-enabled + no-daemon arm now calls
+    // through to `autospawn_and_connect`, which spawns the REAL `ironmem`
+    // binary via `current_exe()`. Exercising that at this (unit-test) level
+    // would spawn the `cargo test` harness binary itself with `serve
+    // --listen <path>` argv — not a real daemon, and not something to spin up
+    // from a unit test. The real spawn path is covered by an integration test
+    // using `CARGO_BIN_EXE_ironmem` (Task 9/15). Here we test the pieces that
+    // ARE safely unit-testable: the lock mechanics, poll-connect backoff, and
+    // the single-flight contract via `autospawn_and_connect_with`'s injectable
+    // spawn closure (a fake that binds a real listener in-process, standing in
+    // for "a detached daemon came up").
 
-        let (client_in, client_out) = tokio::io::duplex(4096);
-        let err = run_connect_mode_io(&sock, true, client_in, client_out)
+    #[test]
+    fn try_acquire_lock_succeeds_when_absent() {
+        let dir = tempfile::tempdir().unwrap();
+        let lock = dir.path().join("d.sock.lock");
+
+        let outcome = try_acquire_lock(&lock).unwrap();
+        assert_eq!(outcome, LockOutcome::Acquired);
+        let content = std::fs::read_to_string(&lock).unwrap();
+        assert_eq!(content.trim(), std::process::id().to_string());
+    }
+
+    #[test]
+    fn try_acquire_lock_reports_held_by_other_for_a_live_owner() {
+        let dir = tempfile::tempdir().unwrap();
+        let lock = dir.path().join("d.sock.lock");
+        // Our own pid is, definitionally, alive.
+        std::fs::write(&lock, std::process::id().to_string()).unwrap();
+
+        let outcome = try_acquire_lock(&lock).unwrap();
+        assert_eq!(outcome, LockOutcome::HeldByOther);
+        // A live owner's lock must never be stolen/overwritten.
+        assert_eq!(
+            std::fs::read_to_string(&lock).unwrap().trim(),
+            std::process::id().to_string()
+        );
+    }
+
+    #[test]
+    fn try_acquire_lock_recovers_a_stale_dead_owner() {
+        let dir = tempfile::tempdir().unwrap();
+        let lock = dir.path().join("d.sock.lock");
+        // An implausibly large pid: guaranteed to not exist on any real OS
+        // (Linux pid_max and macOS PID_MAX are both far below this), so
+        // `pid_is_alive` reliably reports it as dead without relying on a
+        // real, racy "spawn a child and wait for it to exit" dance.
+        std::fs::write(&lock, "2000000000").unwrap();
+
+        let outcome = try_acquire_lock(&lock).unwrap();
+        assert_eq!(outcome, LockOutcome::Acquired);
+        let content = std::fs::read_to_string(&lock).unwrap();
+        assert_eq!(
+            content.trim(),
+            std::process::id().to_string(),
+            "stale lock must be recovered and re-owned by the caller"
+        );
+    }
+
+    #[tokio::test]
+    async fn poll_connect_with_backoff_succeeds_once_listener_appears() {
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("d.sock");
+        let sock_for_bind = sock.clone();
+
+        // Bind shortly after the poll starts, simulating a daemon that takes
+        // a little while to come up.
+        let bind_task = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(60)).await;
+            bind_daemon_listener(&sock_for_bind).await.unwrap()
+        });
+
+        let connected = poll_connect_with_backoff(&sock).await;
+        assert!(
+            connected.is_ok(),
+            "poll-connect must succeed once the listener binds"
+        );
+        drop(bind_task.await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn autospawn_single_flight_spawns_once_then_releases_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("d.sock");
+        let lock = dir.path().join("d.sock.lock");
+
+        let spawn_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let sc = Arc::clone(&spawn_count);
+        let sock_for_spawn = sock.clone();
+
+        // Fake "spawn": stands in for the detached `ironmem serve --listen`
+        // process — binds and serves in a background thread — without
+        // touching a real subprocess.
+        let fake_spawn = move || {
+            sc.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let sock_thread = sock_for_spawn.clone();
+            std::thread::spawn(move || {
+                let rt = tokio::runtime::Builder::new_multi_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap();
+                rt.block_on(async move {
+                    #[allow(clippy::arc_with_non_send_sync)]
+                    let app = Arc::new(App::open_for_test().unwrap());
+                    let listener = bind_daemon_listener(&sock_thread).await.unwrap();
+                    let (_tx, rx) = oneshot::channel::<()>();
+                    serve_accept_loop(app, listener, Duration::from_secs(600), rx)
+                        .await
+                        .unwrap();
+                });
+            });
+            Ok(())
+        };
+
+        let stream = autospawn_and_connect_with(&sock, &lock, fake_spawn)
             .await
-            .expect_err("no daemon + autospawn enabled must propagate the connect error");
-        assert!(matches!(err, MemoryError::Io(_)));
+            .expect("autospawn must acquire, spawn, poll-connect, and succeed");
+        assert_eq!(
+            spawn_count.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "spawn must be invoked exactly once"
+        );
+        drop(stream);
+        assert!(
+            !lock.exists(),
+            "the lock must be released once autospawn completes"
+        );
+    }
+
+    #[tokio::test]
+    async fn autospawn_skips_spawn_when_daemon_already_up_at_lock_acquisition() {
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("d.sock");
+        let lock = dir.path().join("d.sock.lock");
+        let sock_thread = sock.clone();
+
+        // A daemon that is ALREADY up by the time we acquire the lock,
+        // simulating another proxy having already won the spawn race just
+        // before us.
+        let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+        let daemon = std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            rt.block_on(async move {
+                #[allow(clippy::arc_with_non_send_sync)]
+                let app = Arc::new(App::open_for_test().unwrap());
+                let listener = bind_daemon_listener(&sock_thread).await.unwrap();
+                serve_accept_loop(app, listener, Duration::from_secs(600), shutdown_rx)
+                    .await
+                    .unwrap();
+            });
+        });
+        for _ in 0..200 {
+            if sock.exists() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        let spawn_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let sc = Arc::clone(&spawn_count);
+        let fake_spawn = move || {
+            sc.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        };
+
+        let stream = autospawn_and_connect_with(&sock, &lock, fake_spawn)
+            .await
+            .expect("must connect to the already-running daemon");
+        assert_eq!(
+            spawn_count.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "an already-up daemon must be reused, never respawned"
+        );
+        drop(stream);
+
+        shutdown_tx.send(()).ok();
+        daemon.join().unwrap();
+    }
+
+    #[test]
+    fn lock_path_for_socket_appends_dot_lock() {
+        assert_eq!(
+            lock_path_for_socket(Path::new("/tmp/x/daemon.sock")),
+            std::path::PathBuf::from("/tmp/x/daemon.sock.lock")
+        );
     }
 }
 
