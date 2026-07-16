@@ -9,6 +9,26 @@ use super::protocol::{self, JsonRpcRequest, JsonRpcResponse};
 use super::tools;
 use crate::error::MemoryError;
 
+/// Which kind of connection a framing loop is serving. Controls whether the
+/// process's own `IRONMEM_SESSION_ID`/`IRONMEM_HARNESS` env vars are honored
+/// as an attribution override (H4).
+///
+/// Those overrides are meaningful only for a direct single-client stdio
+/// `serve`: there the process itself IS the one client, so its env is exactly
+/// that client's identity. Once a single daemon process accepts many
+/// connections (`serve --listen`/`serve_accept_loop`), the daemon's OWN env
+/// — inherited from whichever process happened to spawn it first — must never
+/// be forced onto every OTHER connection; each connection's attribution must
+/// come purely from its own `initialize` request.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum TransportMode {
+    /// Direct single-client stdio `serve`: env overrides are honored.
+    Stdio,
+    /// A daemon-accepted connection: env overrides are ignored; attribution
+    /// comes only from this connection's own `initialize`.
+    DaemonConnection,
+}
+
 /// Per-connection metrics attribution: harness + session id learned from
 /// *this* connection's own `initialize` request. Local to one
 /// `run_framing_loop` invocation (one per connection) so that when a single
@@ -24,17 +44,26 @@ use crate::error::MemoryError;
 struct ConnectionContext {
     session_id: Option<String>,
     harness: Option<String>,
+    /// Whether the `IRONMEM_SESSION_ID`/`IRONMEM_HARNESS` env overrides apply
+    /// to this connection (H4) — true only for `TransportMode::Stdio`.
+    honor_env: bool,
 }
 
 impl ConnectionContext {
-    /// Seed from the `IRONMEM_SESSION_ID` env override, matching the
-    /// pre-existing `App::session_id` construction-time seed. An env value
-    /// takes priority over anything `initialize` supplies (`learn` never
-    /// overwrites an already-`Some` value), exactly mirroring prior behavior.
-    fn new() -> Self {
+    /// Seed from the `IRONMEM_SESSION_ID` env override when `mode` honors env
+    /// (`TransportMode::Stdio`), matching the pre-existing `App::session_id`
+    /// construction-time seed. An env value takes priority over anything
+    /// `initialize` supplies (`learn` never overwrites an already-`Some`
+    /// value), exactly mirroring prior stdio behavior. A daemon-connection
+    /// never seeds from env: attribution comes solely from `learn`.
+    fn new(mode: TransportMode) -> Self {
+        let honor_env = matches!(mode, TransportMode::Stdio);
         Self {
-            session_id: std::env::var("IRONMEM_SESSION_ID").ok(),
+            session_id: honor_env
+                .then(|| std::env::var("IRONMEM_SESSION_ID").ok())
+                .flatten(),
             harness: None,
+            honor_env,
         }
     }
 
@@ -51,9 +80,11 @@ impl ConnectionContext {
 }
 
 fn mcp_harness(ctx: &ConnectionContext) -> String {
-    if let Ok(value) = std::env::var("IRONMEM_HARNESS") {
-        if let Some(id) = crate::harness::canonicalize_input(&value, crate::harness::REGISTRY) {
-            return id.to_string();
+    if ctx.honor_env {
+        if let Ok(value) = std::env::var("IRONMEM_HARNESS") {
+            if let Some(id) = crate::harness::canonicalize_input(&value, crate::harness::REGISTRY) {
+                return id.to_string();
+            }
         }
     }
     ctx.harness.clone().unwrap_or_else(|| "claude".to_string())
@@ -190,9 +221,35 @@ where
     // `App`, offloaded via `block_in_place` so blocking tool work doesn't
     // stall the tokio reactor. A later shared-daemon backend swaps this
     // closure for a channel round-trip to a single-owner dispatcher.
-    run_framing_loop(&app, reader, writer, |request| {
+    run_framing_loop(&app, reader, writer, TransportMode::Stdio, |request| {
         tokio::task::block_in_place(|| dispatch(&app, request))
     })
+    .await
+}
+
+/// Daemon-connection variant of [`run_server_io`] (H4): identical framing
+/// loop, but `TransportMode::DaemonConnection` means this connection's
+/// `ConnectionContext` never seeds from — or overrides with — the daemon
+/// process's own `IRONMEM_SESSION_ID`/`IRONMEM_HARNESS` env vars. Used
+/// exclusively by `mcp::daemon::serve_accept_loop`, where a single daemon
+/// process serves many independent connections and the process env belongs
+/// to whichever client happened to spawn it first, not to every connection.
+pub(crate) async fn run_server_io_daemon_connection<R, W>(
+    app: Arc<App>,
+    reader: R,
+    writer: W,
+) -> Result<(), MemoryError>
+where
+    R: AsyncBufRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
+    run_framing_loop(
+        &app,
+        reader,
+        writer,
+        TransportMode::DaemonConnection,
+        |request| tokio::task::block_in_place(|| dispatch(&app, request)),
+    )
     .await
 }
 
@@ -201,17 +258,20 @@ where
 /// the response to `writer`, and account response metrics. `dispatch_fn` is
 /// the dispatch backend — today an in-process synchronous call (see
 /// `run_server_io`), and in a future shared-daemon transport a channel
-/// round-trip to a single-owner dispatcher. Metrics accounting needs access
-/// to `app` (for the DB + process-global collab/task-tag context) and a
-/// per-connection `ConnectionContext` (for harness/session attribution learned
-/// from *this* connection's own `initialize` — see `ConnectionContext` for
-/// why that must not live on `App`), plus the original request (for tool name
-/// / session id / exploration context), independent of how the response was
-/// obtained.
+/// round-trip to a single-owner dispatcher. `mode` (H4) controls whether this
+/// connection's `ConnectionContext` honors the `IRONMEM_SESSION_ID`/
+/// `IRONMEM_HARNESS` env overrides — see `TransportMode`. Metrics accounting
+/// needs access to `app` (for the DB + process-global collab/task-tag
+/// context) and a per-connection `ConnectionContext` (for harness/session
+/// attribution learned from *this* connection's own `initialize` — see
+/// `ConnectionContext` for why that must not live on `App`), plus the
+/// original request (for tool name / session id / exploration context),
+/// independent of how the response was obtained.
 async fn run_framing_loop<R, W, F>(
     app: &Arc<App>,
     reader: R,
     writer: W,
+    mode: TransportMode,
     mut dispatch_fn: F,
 ) -> Result<(), MemoryError>
 where
@@ -221,7 +281,7 @@ where
 {
     let mut stdout = writer;
     let mut lines = reader.lines();
-    let mut conn = ConnectionContext::new();
+    let mut conn = ConnectionContext::new(mode);
     while let Ok(Some(line)) = lines.next_line().await {
         let line = line.trim().to_string();
         if line.is_empty() {
@@ -933,5 +993,86 @@ mod tests {
             "connection 2 attributed to the codex harness, not clobbered by \
              connection 1's already-learned harness"
         );
+    }
+
+    /// H4 acceptance: with `IRONMEM_HARNESS=codex` set in the process env, a
+    /// `DaemonConnection`-mode connection whose `initialize` clientInfo says
+    /// "claude" must record harness "claude" — the env override must be
+    /// ignored for daemon connections, or every connection sharing a daemon
+    /// would be force-attributed to whatever harness happened to spawn it.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn daemon_connection_ignores_env_harness_override() {
+        let _g = METRICS_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::remove_var("IRONMEM_METRICS");
+        std::env::set_var("IRONMEM_HARNESS", "codex");
+        #[allow(clippy::arc_with_non_send_sync)]
+        let app = Arc::new(App::open_for_test().unwrap());
+        let (mut client_in, server_in) = tokio::io::duplex(4096);
+        let (server_out, mut client_out) = tokio::io::duplex(4096);
+        client_in
+            .write_all(
+                b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{\"clientInfo\":{\"name\":\"claude-code\",\"version\":\"1.0.0\"}}}\n",
+            )
+            .await
+            .unwrap();
+        client_in.shutdown().await.unwrap();
+        run_server_io_daemon_connection(Arc::clone(&app), BufReader::new(server_in), server_out)
+            .await
+            .unwrap();
+        let mut out = String::new();
+        client_out.read_to_string(&mut out).await.unwrap();
+
+        let rows = app
+            .db
+            .query_token_usage(&crate::db::metrics::TokenUsageQuery::default())
+            .unwrap();
+        let mcp: Vec<_> = rows.iter().filter(|r| r.source == "mcp_response").collect();
+        assert_eq!(mcp.len(), 1, "exactly one mcp_response row");
+        assert_eq!(
+            mcp[0].harness, "claude",
+            "daemon-connection mode must ignore IRONMEM_HARNESS and use this \
+             connection's own clientInfo"
+        );
+
+        std::env::remove_var("IRONMEM_HARNESS");
+    }
+
+    /// H4 counterpart: a plain stdio-mode connection (`run_server_io`) with NO
+    /// clientInfo still honors the `IRONMEM_HARNESS` env override, exactly as
+    /// before — the bare `serve` behavior must stay identical.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn stdio_connection_still_honors_env_harness_override() {
+        let _g = METRICS_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::remove_var("IRONMEM_METRICS");
+        std::env::set_var("IRONMEM_HARNESS", "codex");
+        #[allow(clippy::arc_with_non_send_sync)]
+        let app = Arc::new(App::open_for_test().unwrap());
+        let (mut client_in, server_in) = tokio::io::duplex(4096);
+        let (server_out, mut client_out) = tokio::io::duplex(4096);
+        client_in
+            .write_all(b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{}}\n")
+            .await
+            .unwrap();
+        client_in.shutdown().await.unwrap();
+        run_server_io(Arc::clone(&app), BufReader::new(server_in), server_out)
+            .await
+            .unwrap();
+        let mut out = String::new();
+        client_out.read_to_string(&mut out).await.unwrap();
+
+        let rows = app
+            .db
+            .query_token_usage(&crate::db::metrics::TokenUsageQuery::default())
+            .unwrap();
+        let mcp: Vec<_> = rows.iter().filter(|r| r.source == "mcp_response").collect();
+        assert_eq!(mcp.len(), 1, "exactly one mcp_response row");
+        assert_eq!(
+            mcp[0].harness, "codex",
+            "stdio mode must still honor IRONMEM_HARNESS when no clientInfo is given"
+        );
+
+        std::env::remove_var("IRONMEM_HARNESS");
     }
 }

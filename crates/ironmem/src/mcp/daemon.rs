@@ -120,16 +120,20 @@ pub async fn run_dispatcher(app: Arc<App>, mut rx: mpsc::Receiver<DispatchMessag
 // Concurrency across connections is achieved WITHOUT moving the `App`: all
 // per-connection handlers are `!Send` futures polled cooperatively on that same
 // thread via a `FuturesUnordered`, alongside the accept loop, under one
-// `tokio::select!`. Each handler reuses the EXISTING `run_server_io` framing
-// loop UNCHANGED (full framing + per-connection metrics), just over `UnixStream`
-// halves instead of stdin/stdout.
+// `tokio::select!`. Each handler reuses `run_server_io_daemon_connection` — the
+// SAME `run_framing_loop` machinery as bare stdio `serve` (full framing +
+// per-connection metrics), just over `UnixStream` halves instead of
+// stdin/stdout, and with env-based session/harness overrides disabled (H4:
+// see `mcp::server::TransportMode`) since a daemon's own env belongs to
+// whichever client happened to spawn it first, not to every connection.
 //
 // Why NOT `spawn_local`/`LocalSet`, and why a multi-thread runtime:
-// `run_server_io` offloads its synchronous `dispatch` + metrics work through
-// `tokio::task::block_in_place`. `block_in_place` PANICS both on a
-// `current_thread` runtime AND from within a `LocalSet`/`spawn_local` — so the
-// obvious "`current_thread` + `spawn_local`" confinement cannot run
-// `run_server_io` at all. It is, however, valid on the `block_on` thread of a
+// `run_server_io`/`run_server_io_daemon_connection` offload their synchronous
+// `dispatch` + metrics work through `tokio::task::block_in_place`.
+// `block_in_place` PANICS both on a `current_thread` runtime AND from within a
+// `LocalSet`/`spawn_local` — so the obvious "`current_thread` + `spawn_local`"
+// confinement cannot run this framing loop at all. It is, however, valid on
+// the `block_on` thread of a
 // MULTI-THREAD runtime when NOT inside a `LocalSet`. So the daemon builds a
 // multi-thread runtime and drives everything from its `block_on` thread with a
 // `FuturesUnordered` (no `LocalSet`), which both satisfies `block_in_place` and
@@ -242,7 +246,9 @@ pub async fn bind_daemon_listener(path: &Path) -> Result<UnixListener, MemoryErr
 /// until `shutdown` fires or the daemon has been idle (zero active connections)
 /// for `idle_timeout`. Owns the single `Arc<App>`. Every accepted connection
 /// becomes a `!Send` handler future (it clones `Arc<App>` — cheap, same thread,
-/// never moved) that reuses `run_server_io` over the `UnixStream` halves. All
+/// never moved) that reuses `run_server_io_daemon_connection` over the
+/// `UnixStream` halves (same framing loop as stdio `serve`, env overrides
+/// disabled — H4). All
 /// handlers are polled cooperatively on THIS thread via a `FuturesUnordered`,
 /// alongside the accept branch, under one `tokio::select!` — see the module doc
 /// for why this (not `spawn_local`) is the confinement mechanism.
@@ -259,7 +265,7 @@ pub async fn bind_daemon_listener(path: &Path) -> Result<UnixListener, MemoryErr
 /// connection is served, never dropped in favor of shutdown.
 ///
 /// MUST be driven on the `block_on` thread of a multi-thread runtime and NOT
-/// inside a `LocalSet`, so the `block_in_place` inside `run_server_io` is valid.
+/// inside a `LocalSet`, so the `block_in_place` inside the framing loop is valid.
 ///
 /// Accept errors are logged and the loop continues: a transient accept failure
 /// (a client that vanished mid-handshake, a momentary fd-limit hiccup) must not
@@ -316,8 +322,14 @@ pub async fn serve_accept_loop(
                         connections.push(async move {
                             let (read, write) = tokio::io::split(stream);
                             let reader = tokio::io::BufReader::new(read);
-                            if let Err(e) =
-                                super::server::run_server_io(app_conn, reader, write).await
+                            // H4: daemon connections must NOT honor the
+                            // daemon process's own IRONMEM_SESSION_ID/
+                            // IRONMEM_HARNESS env — attribution comes purely
+                            // from each connection's own `initialize`.
+                            if let Err(e) = super::server::run_server_io_daemon_connection(
+                                app_conn, reader, write,
+                            )
+                            .await
                             {
                                 tracing::warn!("daemon connection ended with error: {e}");
                             }
