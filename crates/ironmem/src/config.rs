@@ -173,14 +173,22 @@ impl Config {
     ///
     /// Defaults to 300s ([`DEFAULT_DAEMON_IDLE_SECS`]). Honors the
     /// `IRONMEM_DAEMON_IDLE_SECS` env override, parsed as `u64` seconds. A
-    /// present-but-unparseable value silently falls back to the default rather
-    /// than erroring, so no new error surface is introduced.
+    /// present-but-unparseable value falls back to the default rather than
+    /// erroring (no new error surface is introduced) but logs a `tracing::warn!`
+    /// (M8) so the mistake is diagnosable instead of silently ignored; an
+    /// ABSENT var is the normal case and stays silent.
     pub fn daemon_idle_timeout(&self) -> Duration {
         let secs = match std::env::var("IRONMEM_DAEMON_IDLE_SECS") {
-            Ok(raw) => raw
-                .trim()
-                .parse::<u64>()
-                .unwrap_or(DEFAULT_DAEMON_IDLE_SECS),
+            Ok(raw) => match raw.trim().parse::<u64>() {
+                Ok(secs) => secs,
+                Err(e) => {
+                    tracing::warn!(
+                        "IRONMEM_DAEMON_IDLE_SECS={raw:?} is not a valid number of seconds \
+                         ({e}); using the default of {DEFAULT_DAEMON_IDLE_SECS}s instead"
+                    );
+                    DEFAULT_DAEMON_IDLE_SECS
+                }
+            },
             Err(_) => DEFAULT_DAEMON_IDLE_SECS,
         };
         Duration::from_secs(secs)

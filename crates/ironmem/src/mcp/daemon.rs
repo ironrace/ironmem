@@ -1,160 +1,86 @@
-//! Single-owner dispatcher actor for shared-daemon mode.
+//! Shared-daemon transport for `ironmem serve`: `--listen` (the daemon
+//! process) and `--connect` (a thin proxy in front of it).
 //!
-//! `App` is `!Sync`, so `Arc<App>` is `!Send` and cannot cross a `tokio::spawn`
-//! boundary. To share one `App` across many concurrent connections, a single
-//! owner task holds the `Arc<App>` and is the SOLE caller of `dispatch`.
-//! Per-connection handlers send their request plus a oneshot reply channel over
-//! an mpsc; the owner serially dispatches and replies. This confines `App` to
-//! one task so it is never required to be `Send`.
-
-use std::sync::Arc;
-use tokio::sync::{mpsc, oneshot};
-
-use super::app::App;
-use super::protocol::{JsonRpcRequest, JsonRpcResponse};
-use super::server::dispatch;
-
-/// A request routed to the dispatcher owner, paired with the reply channel the
-/// owner uses to return the response to the originating connection handler.
-///
-/// The type is `pub` (fields stay private) because it appears in the return
-/// type of the public [`dispatcher_channel`] function via
-/// `mpsc::Receiver<DispatchMessage>`; keeping it private would trip the
-/// `private_interfaces` lint.
-pub struct DispatchMessage {
-    request: JsonRpcRequest,
-    respond_to: oneshot::Sender<Option<JsonRpcResponse>>,
-}
-
-/// Cloneable handle used by connection handlers to send requests to the single
-/// dispatcher owner. Cloning is cheap (clones the mpsc sender).
-#[derive(Clone)]
-pub struct DispatcherHandle {
-    tx: mpsc::Sender<DispatchMessage>,
-}
-
-impl DispatcherHandle {
-    /// Async round-trip: send `request` to the owner and await its response.
-    /// Returns `None` if the dispatcher owner has shut down (channel closed) or
-    /// produced no response (e.g. a notification).
-    pub async fn dispatch(&self, request: JsonRpcRequest) -> Option<JsonRpcResponse> {
-        let (respond_to, rx) = oneshot::channel();
-        if self
-            .tx
-            .send(DispatchMessage {
-                request,
-                respond_to,
-            })
-            .await
-            .is_err()
-        {
-            return None;
-        }
-        rx.await.ok().flatten()
-    }
-
-    /// Blocking round-trip for use INSIDE `tokio::task::block_in_place` from the
-    /// synchronous `run_framing_loop` dispatch backend (Task 6). Must NOT be
-    /// called on the dispatcher owner's own task (would deadlock) — only from a
-    /// distinct per-connection handler task.
-    pub fn blocking_dispatch(&self, request: JsonRpcRequest) -> Option<JsonRpcResponse> {
-        let (respond_to, rx) = oneshot::channel();
-        if self
-            .tx
-            .blocking_send(DispatchMessage {
-                request,
-                respond_to,
-            })
-            .is_err()
-        {
-            return None;
-        }
-        rx.blocking_recv().ok().flatten()
-    }
-}
-
-/// Create a dispatcher channel with the given mpsc buffer size, returning the
-/// cloneable handle and the receiver the owner loop consumes.
-pub fn dispatcher_channel(buffer: usize) -> (DispatcherHandle, mpsc::Receiver<DispatchMessage>) {
-    let (tx, rx) = mpsc::channel(buffer);
-    (DispatcherHandle { tx }, rx)
-}
-
-/// The single-owner dispatcher loop. Owns `Arc<App>` and is the sole caller of
-/// `dispatch`. This future is `!Send` (holds `Arc<App>`); it MUST be driven on a
-/// `LocalSet`/`spawn_local` or a dedicated current-thread runtime, NEVER
-/// `tokio::spawn`ed on the multi-thread runtime.
-///
-/// `dispatch` is called directly (synchronously) rather than via
-/// `block_in_place`: `block_in_place` is only valid on a multi-thread-runtime
-/// worker and panics inside a `LocalSet`/current-thread runtime — precisely the
-/// contexts this `!Send` owner must run on. Because the owner is the sole task
-/// on its dedicated execution context, a blocking `dispatch` starves nothing
-/// here. Concurrency is preserved on the OTHER side of the channel: connection
-/// handlers (Task 6) live on the multi-thread runtime and wrap their
-/// [`DispatcherHandle::blocking_dispatch`] round-trip in `block_in_place`, so
-/// their runtime worker keeps serving peers while this owner works.
-pub async fn run_dispatcher(app: Arc<App>, mut rx: mpsc::Receiver<DispatchMessage>) {
-    while let Some(DispatchMessage {
-        request,
-        respond_to,
-    }) = rx.recv().await
-    {
-        let response = dispatch(&app, &request);
-        // Ignore send errors: the connection handler may have dropped (client
-        // disconnected) before the reply was ready.
-        let _ = respond_to.send(response);
-    }
-}
-
-// ---------------------------------------------------------------------------
-// `--listen` shared-daemon transport (Task 6).
-//
-// Unix-domain sockets are Unix-only, so every socket-touching item below is
-// `#[cfg(unix)]`.
-//
-// Confining the `!Send` `App` to one thread — the runtime model.
-// `App` is `!Sync`, so `Arc<App>` is `!Send`: it can neither be `tokio::spawn`ed
-// nor moved across threads. The daemon therefore runs on ONE dedicated thread,
-// creates the single `Arc<App>` there, and keeps it there for its whole life.
-// Concurrency across connections is achieved WITHOUT moving the `App`: all
-// per-connection handlers are `!Send` futures polled cooperatively on that same
-// thread via a `FuturesUnordered`, alongside the accept loop, under one
-// `tokio::select!`. Each handler reuses `run_server_io_daemon_connection` — the
-// SAME `run_framing_loop` machinery as bare stdio `serve` (full framing +
-// per-connection metrics), just over `UnixStream` halves instead of
-// stdin/stdout, and with env-based session/harness overrides disabled (H4:
-// see `mcp::server::TransportMode`) since a daemon's own env belongs to
-// whichever client happened to spawn it first, not to every connection.
-//
-// Why NOT `spawn_local`/`LocalSet`, and why a multi-thread runtime:
-// `run_server_io`/`run_server_io_daemon_connection` offload their synchronous
-// `dispatch` + metrics work through `tokio::task::block_in_place`.
-// `block_in_place` PANICS both on a `current_thread` runtime AND from within a
-// `LocalSet`/`spawn_local` — so the obvious "`current_thread` + `spawn_local`"
-// confinement cannot run this framing loop at all. It is, however, valid on
-// the `block_on` thread of a
-// MULTI-THREAD runtime when NOT inside a `LocalSet`. So the daemon builds a
-// multi-thread runtime and drives everything from its `block_on` thread with a
-// `FuturesUnordered` (no `LocalSet`), which both satisfies `block_in_place` and
-// keeps every future — and the `Arc<App>` they clone — pinned to this one
-// thread. Because handlers are cooperatively scheduled on a single thread and
-// each `dispatch` runs inside `block_in_place`, dispatch is naturally
-// serialized: the "single writer / one App" invariant holds by thread
-// confinement, with no lock.
-//
-// This deliberately does NOT use the Task 5 `DispatcherHandle`/`run_dispatcher`
-// actor: that actor targets a design where handlers live on real worker threads
-// and reach the `App` owner over a channel; it is unnecessary here and is left
-// intact as tested infrastructure.
+//! # Architecture
+//!
+//! - **`--listen <socket>`** ([`run_daemon`] / [`run_daemon_async`]): binds a
+//!   `UnixListener`, creates the single `Arc<App>`, and runs an accept loop
+//!   ([`serve_accept_loop`]) that serves every connection over the SAME `App`
+//!   — see "Confining the `!Send` App to one thread" below for how that stays
+//!   sound without `App: Send`.
+//! - **`--connect <socket>`** ([`run_connect_mode`] / [`run_connect_mode_io`]):
+//!   a thin byte-pump proxy ([`pump_proxy`]) between the harness's stdio and
+//!   the daemon's socket. No model load, no direct DB connection — it starts
+//!   in milliseconds. If nothing is listening, it single-flight auto-spawns a
+//!   detached daemon under an atomic lockfile
+//!   ([`autospawn_and_connect`]/[`try_acquire_lock`]) so N proxies launched at
+//!   once converge on exactly one daemon.
+//! - **Idle-shutdown**: `serve_accept_loop` arms a timer the instant active
+//!   connections drop to zero and shuts the daemon down if nothing reconnects
+//!   before it fires — see that function's doc comment for the accept-vs-timer
+//!   race guarantee.
+//! - **Health probe** ([`probe_daemon_health`]): a throwaway one-shot
+//!   `initialize` connection `doctor` uses to report "is a daemon actually
+//!   reachable here" without spawning or disturbing anything.
+//!
+//! Access mode (`IRONMEM_MCP_MODE`) is daemon-process-global: every client
+//! sharing one daemon gets whichever mode the FIRST spawner's environment
+//! set. This is a known, accepted limitation (not re-architected here) — see
+//! `CODEX.md`'s shared-daemon section for the user-facing note.
+//!
+//! # Confining the `!Send` `App` to one thread
+//!
+//! `App` is `!Sync`, so `Arc<App>` is `!Send`: it can neither be
+//! `tokio::spawn`ed nor moved across threads. The daemon therefore runs on ONE
+//! dedicated thread, creates the single `Arc<App>` there, and keeps it there
+//! for its whole life. Concurrency across connections is achieved WITHOUT
+//! moving the `App`: all per-connection handlers are `!Send` futures polled
+//! cooperatively on that same thread via a `FuturesUnordered`, alongside the
+//! accept loop, under one `tokio::select!`. Each handler reuses
+//! `run_server_io_daemon_connection` — the SAME `run_framing_loop` machinery
+//! as bare stdio `serve` (full framing + per-connection metrics), just over
+//! `UnixStream` halves instead of stdin/stdout, and with env-based
+//! session/harness overrides disabled (see `mcp::server::TransportMode`)
+//! since a daemon's own env belongs to whichever client happened to spawn it
+//! first, not to every connection.
+//!
+//! Why NOT `spawn_local`/`LocalSet`, and why a multi-thread runtime:
+//! `run_server_io`/`run_server_io_daemon_connection` offload their synchronous
+//! `dispatch` + metrics work through `tokio::task::block_in_place`.
+//! `block_in_place` PANICS both on a `current_thread` runtime AND from within
+//! a `LocalSet`/`spawn_local` — so the obvious "`current_thread` +
+//! `spawn_local`" confinement cannot run this framing loop at all. It is,
+//! however, valid on the `block_on` thread of a MULTI-THREAD runtime when NOT
+//! inside a `LocalSet`. So the daemon builds a multi-thread runtime and
+//! drives everything from its `block_on` thread with a `FuturesUnordered` (no
+//! `LocalSet`), which both satisfies `block_in_place` and keeps every future —
+//! and the `Arc<App>` they clone — pinned to this one thread. Because
+//! handlers are cooperatively scheduled on a single thread and each `dispatch`
+//! runs inside `block_in_place`, dispatch is naturally serialized: the
+//! "single writer / one App" invariant holds by thread confinement, with no
+//! lock.
+//!
+//! An earlier design considered a single-owner dispatcher ACTOR — a
+//! `DispatcherHandle`/`run_dispatcher` pair where per-connection handlers on
+//! real worker threads would reach the `App` owner over an mpsc channel. It
+//! was built and tested but never wired into the shipping daemon (thread
+//! confinement above makes it unnecessary here) and has since been removed as
+//! dead code; see git history for `mcp::daemon` prior to this crate's #190
+//! cleanup if that design is ever needed for a different runtime model.
 
 #[cfg(unix)]
 use std::path::Path;
 #[cfg(unix)]
+use std::sync::Arc;
+#[cfg(unix)]
 use tokio::io::AsyncWriteExt;
 #[cfg(unix)]
 use tokio::net::{UnixListener, UnixStream};
+#[cfg(unix)]
+use tokio::sync::oneshot;
 
+#[cfg(unix)]
+use super::app::App;
 #[cfg(unix)]
 use crate::error::MemoryError;
 
@@ -238,10 +164,50 @@ pub async fn bind_daemon_listener(path: &Path) -> Result<UnixListener, MemoryErr
         }
     }
 
-    let listener = UnixListener::bind(path).map_err(MemoryError::Io)?;
-    // Owner-only socket: no other local user may connect.
-    std::fs::set_permissions(path, Permissions::from_mode(0o600)).map_err(MemoryError::Io)?;
+    // M7: bind under a private temp name in the SAME directory, chmod THAT,
+    // then atomically `rename` it into place at `path`. Binding directly at
+    // `path` would leave the socket visible there at whatever wide default
+    // mode the platform creates it with (e.g. 0755) for the window between
+    // `bind` and an explicit `chmod` — during which another local user could
+    // connect. Deliberately NOT `libc::umask`: umask is a process-GLOBAL
+    // setting, not per-thread, and this crate's own test suite calls this
+    // function from many concurrently running tests within one process —
+    // narrowing/restoring a process-global umask around each call would be a
+    // genuine cross-test race (one thread could restore a snapshot another
+    // thread already narrowed, permanently corrupting the process's umask).
+    // Temp-name+rename has no such shared mutable state: nothing ever
+    // appears at `path` until it is already 0600.
+    let tmp_path = temp_socket_path(path);
+    let _ = std::fs::remove_file(&tmp_path); // best-effort: clear an implausible stale leftover
+    let listener = UnixListener::bind(&tmp_path).map_err(MemoryError::Io)?;
+    if let Err(e) = std::fs::set_permissions(&tmp_path, Permissions::from_mode(0o600)) {
+        let _ = std::fs::remove_file(&tmp_path);
+        return Err(MemoryError::Io(e));
+    }
+    if let Err(e) = std::fs::rename(&tmp_path, path) {
+        let _ = std::fs::remove_file(&tmp_path);
+        return Err(MemoryError::Io(e));
+    }
     Ok(listener)
+}
+
+/// Derive a private, per-process temp socket path in the SAME directory as
+/// `path` (so the subsequent `rename` is atomic and same-filesystem), used by
+/// [`bind_daemon_listener`] (M7) to bind+chmod out of sight before publishing
+/// the socket at its real name.
+#[cfg(unix)]
+fn temp_socket_path(path: &Path) -> std::path::PathBuf {
+    let file_name = path
+        .file_name()
+        .map(|n| n.to_os_string())
+        .unwrap_or_else(|| std::ffi::OsString::from("daemon.sock"));
+    let mut tmp_name = std::ffi::OsString::from(".");
+    tmp_name.push(&file_name);
+    tmp_name.push(format!(".tmp-{}", std::process::id()));
+    match path.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent.join(tmp_name),
+        _ => std::path::PathBuf::from(tmp_name),
+    }
 }
 
 /// Accept connections on `listener` and serve each with the Task 1 framing loop
@@ -338,15 +304,31 @@ pub async fn serve_accept_loop(
                             active_conn.fetch_sub(1, Ordering::SeqCst)
                         });
                     }
-                    Err(e) => tracing::warn!("daemon accept error (continuing): {e}"),
+                    Err(e) => {
+                        tracing::warn!("daemon accept error (continuing): {e}");
+                        // M6: a short backoff before the next `accept()`
+                        // attempt. Without it, a persistent accept failure
+                        // (e.g. `EMFILE`/`ENFILE` fd exhaustion) would have
+                        // this branch fire on every single poll of the
+                        // `select!` loop — a 100%-CPU busy-loop that itself
+                        // makes fd exhaustion harder to recover from.
+                        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                    }
                 }
             }
             // Drive in-flight connection handlers to completion. `None` (empty
             // set) simply means no connections are pending; the branch resolves
             // immediately, so we guard with `!connections.is_empty()` to avoid a
             // busy-loop and let `select!` fall through to the other branches.
-            Some(prev_active) = connections.next(), if !connections.is_empty() => {
-                if prev_active == 1 {
+            Some(_prev_active) = connections.next(), if !connections.is_empty() => {
+                // M9: read the CURRENT count rather than trust the
+                // just-completed handler's pre-decrement snapshot equaling
+                // exactly 1 — equivalent in this single-threaded loop (no
+                // other task can observe/mutate `active` between the
+                // `fetch_sub` and this check), but more robust/self-evident:
+                // it directly asks "is anything still active" instead of
+                // inferring it from one handler's return value.
+                if active.load(Ordering::SeqCst) == 0 {
                     // The count just dropped to zero: arm the idle timer.
                     idle_deadline = Some(tokio::time::Instant::now() + idle_timeout);
                 }
@@ -1327,6 +1309,37 @@ mod daemon_tests {
         drop(first);
     }
 
+    /// M7 acceptance: `bind_daemon_listener`'s temp-name+rename sequence
+    /// leaves no stray `.{name}.tmp-<pid>` sibling behind, and the socket that
+    /// DOES appear at `path` is already `0600` — never observable at a wider
+    /// mode, since nothing is ever published at `path` until the temp file is
+    /// already chmod'd.
+    #[tokio::test]
+    async fn bind_daemon_listener_leaves_no_temp_file_and_is_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("daemon.sock");
+
+        let listener = bind_daemon_listener(&sock).await.unwrap();
+
+        let leftovers: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name())
+            .filter(|n| n != "daemon.sock")
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "no temp file should remain after bind: {leftovers:?}"
+        );
+
+        let mode = std::fs::metadata(&sock).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "the published socket must be owner-only");
+
+        drop(listener);
+    }
+
     /// Task 8 acceptance: with a live daemon, `run_connect_mode_io` proxies an
     /// `initialize` round trip and returns `Proxied`. The proxy task is
     /// `tokio::spawn`ed (it touches no `!Send` `App`) so the test can write the
@@ -1863,97 +1876,5 @@ mod daemon_tests {
 
         shutdown_tx.send(()).ok();
         daemon.join().unwrap();
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn parse_request(line: &str) -> JsonRpcRequest {
-        serde_json::from_str(line).expect("valid JSON-RPC request")
-    }
-
-    /// Drives two concurrent in-memory "connections" (cloned handles) through a
-    /// single dispatcher owned by a `spawn_local`'d future. Asserts each reply
-    /// carries the id of ITS request (no cross-talk), which proves correct
-    /// routing of concurrent in-flight requests. That the `Arc<App>`-owning
-    /// future is `spawn_local`'d (never `tokio::spawn`'d) proves `App` is never
-    /// required to be `Send`.
-    #[tokio::test(flavor = "multi_thread")]
-    async fn two_connections_route_to_correct_responses() {
-        #[allow(clippy::arc_with_non_send_sync)]
-        let app = Arc::new(App::open_for_test().unwrap());
-        let (handle, rx) = dispatcher_channel(16);
-
-        let local = tokio::task::LocalSet::new();
-        local
-            .run_until(async move {
-                let dispatcher = tokio::task::spawn_local(run_dispatcher(app, rx));
-
-                let h1 = handle.clone();
-                let h2 = handle.clone();
-
-                let req1 =
-                    parse_request(r#"{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}"#);
-                let req2 =
-                    parse_request(r#"{"jsonrpc":"2.0","id":2,"method":"initialize","params":{}}"#);
-
-                let (r1, r2) = tokio::join!(h1.dispatch(req1), h2.dispatch(req2));
-
-                let r1 = r1.expect("tools/list returns a response");
-                let r2 = r2.expect("initialize returns a response");
-
-                // Correctly-routed: each response carries the id of its own
-                // request, so concurrent in-flight requests did not swap replies.
-                assert_eq!(r1.id, Some(serde_json::json!(1)));
-                assert_eq!(r2.id, Some(serde_json::json!(2)));
-
-                // Sanity: the responses are the ones we expect for each method.
-                assert!(r1.result.is_some(), "tools/list is a success response");
-                assert!(r2.result.is_some(), "initialize is a success response");
-
-                // Drop every sender (the original plus both per-connection
-                // clones) so the mpsc closes and the dispatcher loop exits.
-                drop(handle);
-                drop(h1);
-                drop(h2);
-                dispatcher.await.unwrap();
-            })
-            .await;
-    }
-
-    /// Verifies the blocking round-trip used by Task 6's synchronous framing
-    /// backend: a `spawn_blocking` task calls `blocking_dispatch` while the
-    /// dispatcher runs on a `LocalSet`, and receives the correctly-routed reply.
-    #[tokio::test(flavor = "multi_thread")]
-    async fn blocking_dispatch_round_trips() {
-        #[allow(clippy::arc_with_non_send_sync)]
-        let app = Arc::new(App::open_for_test().unwrap());
-        let (handle, rx) = dispatcher_channel(16);
-
-        let local = tokio::task::LocalSet::new();
-        local
-            .run_until(async move {
-                let dispatcher = tokio::task::spawn_local(run_dispatcher(app, rx));
-
-                let h = handle.clone();
-                let response = tokio::task::spawn_blocking(move || {
-                    let req = parse_request(
-                        r#"{"jsonrpc":"2.0","id":7,"method":"tools/list","params":{}}"#,
-                    );
-                    h.blocking_dispatch(req)
-                })
-                .await
-                .unwrap();
-
-                let response = response.expect("tools/list returns a response");
-                assert_eq!(response.id, Some(serde_json::json!(7)));
-                assert!(response.result.is_some());
-
-                drop(handle);
-                dispatcher.await.unwrap();
-            })
-            .await;
     }
 }
