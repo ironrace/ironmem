@@ -223,40 +223,80 @@ pub async fn bind_daemon_listener(path: &Path) -> Result<UnixListener, MemoryErr
 }
 
 /// Accept connections on `listener` and serve each with the Task 1 framing loop
-/// until `shutdown` fires. Owns the single `Arc<App>`. Every accepted connection
+/// until `shutdown` fires or the daemon has been idle (zero active connections)
+/// for `idle_timeout`. Owns the single `Arc<App>`. Every accepted connection
 /// becomes a `!Send` handler future (it clones `Arc<App>` — cheap, same thread,
 /// never moved) that reuses `run_server_io` over the `UnixStream` halves. All
 /// handlers are polled cooperatively on THIS thread via a `FuturesUnordered`,
 /// alongside the accept branch, under one `tokio::select!` — see the module doc
 /// for why this (not `spawn_local`) is the confinement mechanism.
 ///
+/// Idle-timeout / refcount shutdown (Task 7): an `active` counter is
+/// incremented BEFORE a newly-accepted connection's handler future is even
+/// pushed onto `connections` — i.e. a connection is "admitted" the instant it
+/// is accepted, never after some later dispatch step — and decremented when
+/// its handler future completes. The idle timer is armed only while `active ==
+/// 0`; any accepted connection (including one racing the timer) disarms it
+/// immediately. The `select!` is `biased` with the accept branch listed first,
+/// so on any poll where BOTH a pending connection and an expired idle timer are
+/// simultaneously ready, the connection is always accepted first — an admitted
+/// connection is served, never dropped in favor of shutdown.
+///
 /// MUST be driven on the `block_on` thread of a multi-thread runtime and NOT
 /// inside a `LocalSet`, so the `block_in_place` inside `run_server_io` is valid.
 ///
 /// Accept errors are logged and the loop continues: a transient accept failure
 /// (a client that vanished mid-handshake, a momentary fd-limit hiccup) must not
-/// tear down a daemon serving many other peers. On `shutdown` we stop accepting
-/// and return immediately; in-flight handlers are dropped (their sockets close),
-/// which is the intended behavior for both idle-timeout (Task 7) and process
-/// exit.
+/// tear down a daemon serving many other peers. On `shutdown`, or on idle-timer
+/// expiry, we stop accepting and return immediately; in-flight handlers are
+/// dropped (their sockets close). Callers own removing the socket/lockfile on
+/// return (see `run_daemon`).
 #[cfg(unix)]
 pub async fn serve_accept_loop(
     app: Arc<App>,
     listener: UnixListener,
+    idle_timeout: std::time::Duration,
     mut shutdown: oneshot::Receiver<()>,
 ) -> Result<(), MemoryError> {
     use futures_util::stream::FuturesUnordered;
     use futures_util::StreamExt;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     // Connection handler futures, all `!Send`, polled on this single thread.
+    // Each resolves to the PRE-decrement active count, so the loop can tell
+    // when a completion just dropped the count to zero.
     let mut connections = FuturesUnordered::new();
+    let active = Arc::new(AtomicUsize::new(0));
+
+    // Armed from the moment the daemon starts (no connections yet), so a
+    // daemon that never receives a single connection still idles out.
+    let mut idle_deadline: Option<tokio::time::Instant> =
+        Some(tokio::time::Instant::now() + idle_timeout);
 
     loop {
+        let idle_sleep = async {
+            match idle_deadline {
+                Some(deadline) => tokio::time::sleep_until(deadline).await,
+                None => std::future::pending::<()>().await,
+            }
+        };
+
         tokio::select! {
+            biased;
+
+            // Highest priority: an accepted connection always wins over an
+            // expired idle timer on the same poll (see doc comment above).
             accepted = listener.accept() => {
                 match accepted {
                     Ok((stream, _addr)) => {
+                        // Admit BEFORE the handler future is even constructed:
+                        // this connection now holds the daemon open regardless
+                        // of anything that happens later in this loop turn.
+                        active.fetch_add(1, Ordering::SeqCst);
+                        idle_deadline = None;
+
                         let app_conn = Arc::clone(&app);
+                        let active_conn = Arc::clone(&active);
                         connections.push(async move {
                             let (read, write) = tokio::io::split(stream);
                             let reader = tokio::io::BufReader::new(read);
@@ -265,6 +305,7 @@ pub async fn serve_accept_loop(
                             {
                                 tracing::warn!("daemon connection ended with error: {e}");
                             }
+                            active_conn.fetch_sub(1, Ordering::SeqCst)
                         });
                     }
                     Err(e) => tracing::warn!("daemon accept error (continuing): {e}"),
@@ -273,10 +314,19 @@ pub async fn serve_accept_loop(
             // Drive in-flight connection handlers to completion. `None` (empty
             // set) simply means no connections are pending; the branch resolves
             // immediately, so we guard with `!connections.is_empty()` to avoid a
-            // busy-loop and let `select!` fall through to the accept/shutdown
-            // branches instead.
-            Some(()) = connections.next(), if !connections.is_empty() => {}
+            // busy-loop and let `select!` fall through to the other branches.
+            Some(prev_active) = connections.next(), if !connections.is_empty() => {
+                if prev_active == 1 {
+                    // The count just dropped to zero: arm the idle timer.
+                    idle_deadline = Some(tokio::time::Instant::now() + idle_timeout);
+                }
+            }
             _ = &mut shutdown => break,
+            // Lowest priority: only fires when nothing else was ready this poll.
+            _ = idle_sleep => {
+                tracing::info!("daemon idle for {idle_timeout:?}; shutting down");
+                break;
+            }
         }
     }
     Ok(())
@@ -296,18 +346,25 @@ pub async fn serve_accept_loop(
 /// runtime panic — see `main.rs`'s `--listen` arm.
 ///
 /// The shutdown receiver here is a never-fired channel: the daemon runs until
-/// the process is killed. Task 7 wires idle-timeout shutdown onto this same
-/// `serve_accept_loop` signal.
+/// process exit or the idle timer (from `Config::daemon_idle_timeout`) expires
+/// via `serve_accept_loop`. On EITHER exit path the daemon-owned socket and
+/// lockfile are removed (best-effort — a `NotFound` on either is expected and
+/// ignored), so a later `--connect` proxy correctly probes "no daemon" rather
+/// than finding a stale path.
 #[cfg(unix)]
 pub fn run_daemon(
     config: crate::config::Config,
     socket_path: std::path::PathBuf,
 ) -> Result<(), MemoryError> {
+    let idle_timeout = config.daemon_idle_timeout();
+    let lock_path = config.daemon_lock_path();
+    let socket_path_for_cleanup = socket_path.clone();
+
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
         .map_err(MemoryError::Io)?;
-    rt.block_on(async move {
+    let result = rt.block_on(async move {
         #[allow(clippy::arc_with_non_send_sync)]
         let app = Arc::new(App::new_server_ready(config.clone())?);
         // Mirror the stdio `serve` path: record version + kick background model
@@ -318,10 +375,15 @@ pub fn run_daemon(
         crate::bootstrap::run_background_memory_init(config, memory_ready);
 
         let listener = bind_daemon_listener(&socket_path).await?;
-        // Never-fired shutdown: run until process exit. Task 7 replaces this.
+        // Never-fired shutdown: only the idle timer inside `serve_accept_loop`
+        // ends this daemon absent an external kill.
         let (_tx, rx) = oneshot::channel::<()>();
-        serve_accept_loop(app, listener, rx).await
-    })
+        serve_accept_loop(app, listener, idle_timeout, rx).await
+    });
+
+    let _ = std::fs::remove_file(&socket_path_for_cleanup);
+    let _ = std::fs::remove_file(&lock_path);
+    result
 }
 
 #[cfg(all(test, unix))]
@@ -365,7 +427,11 @@ mod daemon_tests {
                 #[allow(clippy::arc_with_non_send_sync)]
                 let app = Arc::new(App::open_for_test().unwrap());
                 let listener = bind_daemon_listener(&sock_thread).await.unwrap();
-                serve_accept_loop(app, listener, shutdown_rx).await.unwrap();
+                // Idle timeout long enough to never fire during this test —
+                // shutdown is explicit via `shutdown_tx` below.
+                serve_accept_loop(app, listener, Duration::from_secs(600), shutdown_rx)
+                    .await
+                    .unwrap();
             });
         });
 
@@ -408,6 +474,174 @@ mod daemon_tests {
         drop(reader);
         shutdown_tx.send(()).ok();
         daemon.join().unwrap();
+    }
+
+    /// Task 7: a daemon with zero active connections shuts itself down once the
+    /// idle timer expires. Uses a short test-overridden idle window so the
+    /// test is fast and deterministic (no reliance on the real 300s default).
+    #[test]
+    fn idle_timeout_shuts_down_daemon_after_last_disconnect() {
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("daemon.sock");
+        let sock_thread = sock.clone();
+
+        let (_shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+        let idle_timeout = Duration::from_millis(150);
+
+        let daemon = std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            rt.block_on(async move {
+                #[allow(clippy::arc_with_non_send_sync)]
+                let app = Arc::new(App::open_for_test().unwrap());
+                let listener = bind_daemon_listener(&sock_thread).await.unwrap();
+                serve_accept_loop(app, listener, idle_timeout, shutdown_rx)
+                    .await
+                    .unwrap();
+            });
+        });
+
+        // Connect, exchange one request, then disconnect — the idle countdown
+        // starts the instant this connection's handler completes.
+        let stream = connect_with_retry(&sock);
+        let mut writer = stream.try_clone().unwrap();
+        let mut reader = StdBufReader::new(stream);
+        writer
+            .write_all(b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{}}\n")
+            .unwrap();
+        writer.flush().unwrap();
+        let mut line = String::new();
+        reader.read_line(&mut line).unwrap();
+        drop(writer);
+        drop(reader);
+
+        // The daemon thread must exit on its own (idle timeout), never needing
+        // `_shutdown_tx` to fire. `join` blocks until the thread returns; a
+        // generous bound keeps this from hanging forever if the feature
+        // regresses, while staying well clear of the 150ms idle window.
+        let joined = std::thread::spawn(move || daemon.join());
+        for _ in 0..50 {
+            if joined.is_finished() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(
+            joined.is_finished(),
+            "daemon must shut down on its own after the idle window elapses"
+        );
+        joined.join().unwrap().unwrap();
+    }
+
+    /// Task 7 acceptance: a new connection admitted WHILE the idle timer is
+    /// counting down must disarm it and be served normally — the daemon must
+    /// NOT shut down out from under an in-flight or freshly-admitted
+    /// connection. This proves the timer is reset (not merely deferred) by
+    /// activity, keeping the daemon alive well past the original deadline.
+    #[test]
+    fn new_connection_resets_idle_timer_and_is_served() {
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("daemon.sock");
+        let sock_thread = sock.clone();
+
+        let (_shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+        let idle_timeout = Duration::from_millis(200);
+
+        let daemon = std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            rt.block_on(async move {
+                #[allow(clippy::arc_with_non_send_sync)]
+                let app = Arc::new(App::open_for_test().unwrap());
+                let listener = bind_daemon_listener(&sock_thread).await.unwrap();
+                serve_accept_loop(app, listener, idle_timeout, shutdown_rx)
+                    .await
+                    .unwrap();
+            });
+        });
+
+        // Connection 1: connect + disconnect immediately, arming the timer.
+        {
+            let stream = connect_with_retry(&sock);
+            let mut writer = stream.try_clone().unwrap();
+            let mut reader = StdBufReader::new(stream);
+            writer
+                .write_all(
+                    b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{}}\n",
+                )
+                .unwrap();
+            writer.flush().unwrap();
+            let mut line = String::new();
+            reader.read_line(&mut line).unwrap();
+        }
+
+        // Wait well past half the idle window, then connect again — this must
+        // disarm the timer that connection 1 armed, rather than the daemon
+        // having already exited.
+        std::thread::sleep(idle_timeout / 2);
+        let stream2 = connect_with_retry(&sock);
+        let mut writer2 = stream2.try_clone().unwrap();
+        let mut reader2 = StdBufReader::new(stream2);
+        writer2
+            .write_all(b"{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"initialize\",\"params\":{}}\n")
+            .unwrap();
+        writer2.flush().unwrap();
+        let mut line2 = String::new();
+        reader2
+            .read_line(&mut line2)
+            .expect("second connection must be served, not dropped by a stale idle timer");
+        assert!(
+            line2.contains("\"protocolVersion\""),
+            "second connection got a real response: {line2}"
+        );
+        drop(writer2);
+        drop(reader2);
+
+        // Now let this (second) idle window fully elapse with no further
+        // activity: the daemon must eventually shut down on its own.
+        let joined = std::thread::spawn(move || daemon.join());
+        for _ in 0..50 {
+            if joined.is_finished() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(
+            joined.is_finished(),
+            "daemon must still shut down after the reset idle window elapses"
+        );
+        joined.join().unwrap().unwrap();
+    }
+
+    /// Task 7: on idle-timeout exit, the daemon-owned socket AND lockfile must
+    /// both be removed — mirroring the cleanup `run_daemon` performs on every
+    /// exit path, so a subsequent `--connect` proxy correctly probes "no
+    /// daemon" instead of tripping over stale files.
+    #[tokio::test]
+    async fn idle_exit_cleanup_removes_socket_and_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("daemon.sock");
+        let lock = dir.path().join("daemon.sock.lock");
+        std::fs::write(&lock, b"12345").unwrap();
+
+        let (_shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+        #[allow(clippy::arc_with_non_send_sync)]
+        let app = Arc::new(App::open_for_test().unwrap());
+        let listener = bind_daemon_listener(&sock).await.unwrap();
+
+        // Mirrors `run_daemon`'s post-`serve_accept_loop` cleanup exactly.
+        serve_accept_loop(app, listener, Duration::from_millis(50), shutdown_rx)
+            .await
+            .unwrap();
+        let _ = std::fs::remove_file(&sock);
+        let _ = std::fs::remove_file(&lock);
+
+        assert!(!sock.exists(), "socket file must be removed on idle exit");
+        assert!(!lock.exists(), "lockfile must be removed on idle exit");
     }
 
     /// A dead/stale socket file (no live listener behind it) must not block a
