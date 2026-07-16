@@ -158,7 +158,9 @@ daemon gets that mode too, even if ITS OWN `IRONMEM_MCP_MODE` env differs —
 there is currently no per-connection access-mode override. If you need
 different clients to have different access modes, give them separate sockets
 (`IRONMEM_DAEMON_SOCKET` or `--listen`/`--connect` pointed at distinct paths)
-rather than relying on per-client env with a shared daemon.
+rather than relying on per-client env with a shared daemon. Because access
+mode cannot be scoped per-client, review sub-agents get their lean tool
+profile client-side instead; see `docs/REVIEW_AGENT_PROFILE.md`.
 
 Leave `IRONMEM_DB_PATH` unset to use the shared default store
 (`~/.ironrace-memory/memory.sqlite3`). Set it only when you want an isolated

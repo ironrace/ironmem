@@ -9,6 +9,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Uniform lean MCP profile for review sub-agents (#189).** Read-only review
+  agents (`/ultrareview-local` lenses, `pr-review-toolkit` reviewers) now share
+  one canonical tool profile — `Read`/`Grep`/`Glob`/`Bash`, no `mcp__ironmem__*`
+  tools — documented in `docs/REVIEW_AGENT_PROFILE.md`. Claude Code enforces it
+  per-agent via `tools:` frontmatter (the `code-reviewer` agent no longer
+  inherits the full memory surface), guarded by a `plugin_metadata` regression
+  test. Codex/Grok/Gemini, whose MCP surface is global rather than per-agent,
+  rely on the reviewer-brief guard plus #190's thin proxies so the attached
+  surface stays cheap.
 - **Shared-daemon mode for `ironmem serve` (#190).** `serve --listen <socket>`
   runs as a long-lived daemon binding a Unix socket; `serve --connect <socket>`
   is a thin proxy that pumps bytes between the harness's stdio and that
