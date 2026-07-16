@@ -151,6 +151,8 @@ pub async fn run_dispatcher(app: Arc<App>, mut rx: mpsc::Receiver<DispatchMessag
 #[cfg(unix)]
 use std::path::Path;
 #[cfg(unix)]
+use tokio::io::AsyncWriteExt;
+#[cfg(unix)]
 use tokio::net::{UnixListener, UnixStream};
 
 #[cfg(unix)]
@@ -480,10 +482,16 @@ pub enum ProxyOutcome {
 
 /// Pump bytes between `local_in`/`local_out` (the harness's stdio in
 /// production; injectable in tests) and `stream` (the daemon connection)
-/// until EOF on EITHER side. Deliberately `select!`, not `try_join!`: a
-/// client that closes its stdin, or a daemon that closes the connection,
-/// should end the proxy immediately rather than waiting on the other,
-/// now-orphaned pump.
+/// until EOF on EITHER side, with one asymmetry (M2): if the DAEMON side
+/// closes first (`from_socket` completes), that is unconditionally
+/// terminal — nothing more will ever arrive, so we return immediately rather
+/// than waiting on the now-orphaned `to_socket` pump. But if the LOCAL input
+/// side hits EOF first (`to_socket` completes — e.g. a one-shot/piped client
+/// closed stdin right after sending its request), the daemon may still have a
+/// response in flight; we half-close the socket's write half (telling the
+/// daemon we're done sending) and keep draining `from_socket` until the
+/// daemon closes its end, so that in-flight response still reaches
+/// `local_out` instead of being dropped on the floor.
 #[cfg(unix)]
 async fn pump_proxy<R, W>(
     stream: UnixStream,
@@ -495,12 +503,18 @@ where
     W: tokio::io::AsyncWrite + Unpin,
 {
     let (mut sock_read, mut sock_write) = tokio::io::split(stream);
-    let to_socket = tokio::io::copy(&mut local_in, &mut sock_write);
-    let from_socket = tokio::io::copy(&mut sock_read, &mut local_out);
 
     tokio::select! {
-        result = to_socket => { result.map_err(MemoryError::Io)?; }
-        result = from_socket => { result.map_err(MemoryError::Io)?; }
+        result = tokio::io::copy(&mut local_in, &mut sock_write) => {
+            result.map_err(MemoryError::Io)?;
+            sock_write.shutdown().await.map_err(MemoryError::Io)?;
+            tokio::io::copy(&mut sock_read, &mut local_out)
+                .await
+                .map_err(MemoryError::Io)?;
+        }
+        result = tokio::io::copy(&mut sock_read, &mut local_out) => {
+            result.map_err(MemoryError::Io)?;
+        }
     }
     Ok(())
 }
@@ -514,13 +528,25 @@ where
 /// - Connect fails AND `autospawn_enabled` is `false` -> returns
 ///   [`ProxyOutcome::FallbackToInProcess`] so the caller runs the in-process
 ///   stdio server instead (no daemon, and the caller was told not to spawn one).
-/// - Connect fails AND `autospawn_enabled` is `true` -> single-flight auto-spawn
-///   (Task 9): acquire `<socket>.lock`, spawn a detached daemon (unless another
-///   proxy already won the race), poll-connect until ready, then proxy.
+/// - Connect fails with `NotFound`/`ConnectionRefused` (M4: "nothing is
+///   listening there yet", the only kinds that plausibly mean "no daemon")
+///   AND `autospawn_enabled` is `true` -> single-flight auto-spawn (Task 9):
+///   acquire `<socket>.lock`, spawn a detached daemon (unless another proxy
+///   already won the race, forwarding `db_path` so the spawned daemon serves
+///   the SAME database this proxy was invoked against — M3), poll-connect
+///   until ready, then proxy. If auto-spawn itself hard-fails (lock-wait or
+///   poll-connect exhausted), that must not take the whole `serve` process
+///   down with it (M5): fall back to in-process serve, same as the
+///   autospawn-disabled arm, just logging why.
+/// - Connect fails with any OTHER error kind (e.g. `PermissionDenied`) -> that
+///   is a real problem the caller should see, not a signal to guess "no
+///   daemon" and spawn a competing one (M4); propagated as-is.
 #[cfg(unix)]
 async fn run_connect_mode_io<R, W>(
     socket_path: &Path,
     autospawn_enabled: bool,
+    db_path: &Path,
+    daemon_log_path: &Path,
     local_in: R,
     local_out: W,
 ) -> Result<ProxyOutcome, MemoryError>
@@ -540,24 +566,58 @@ where
             );
             Ok(ProxyOutcome::FallbackToInProcess)
         }
-        Err(_) => {
+        Err(e)
+            if matches!(
+                e.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused
+            ) =>
+        {
             let lock_path = lock_path_for_socket(socket_path);
-            let stream = autospawn_and_connect(socket_path, &lock_path).await?;
-            pump_proxy(stream, local_in, local_out).await?;
-            Ok(ProxyOutcome::Proxied)
+            match autospawn_and_connect(socket_path, &lock_path, db_path, daemon_log_path).await {
+                Ok(stream) => {
+                    pump_proxy(stream, local_in, local_out).await?;
+                    Ok(ProxyOutcome::Proxied)
+                }
+                Err(spawn_err) => {
+                    tracing::warn!(
+                        "auto-spawn failed for {} ({spawn_err}); falling back to in-process serve",
+                        socket_path.display()
+                    );
+                    Ok(ProxyOutcome::FallbackToInProcess)
+                }
+            }
+        }
+        Err(e) => {
+            tracing::warn!(
+                "connect to {} failed with an unexpected error kind ({:?}), not spawning a daemon: {e}",
+                socket_path.display(),
+                e.kind()
+            );
+            Err(MemoryError::Io(e))
         }
     }
 }
 
 /// Production `--connect` entry point: proxies the real process stdio.
+///
+/// `db_path` is this proxy's OWN resolved database path (`Config::db_path` —
+/// whatever `--db` / `IRONMEM_DB_PATH` / default resolved to); it is forwarded
+/// as `--db` to an auto-spawned daemon (M3) so the daemon serves the SAME
+/// database this proxy was invoked against, rather than silently falling back
+/// to the default. `daemon_log_path` is where an auto-spawned daemon's stderr
+/// is redirected (H5).
 #[cfg(unix)]
 pub async fn run_connect_mode(
     socket_path: &Path,
     autospawn_enabled: bool,
+    db_path: &Path,
+    daemon_log_path: &Path,
 ) -> Result<ProxyOutcome, MemoryError> {
     run_connect_mode_io(
         socket_path,
         autospawn_enabled,
+        db_path,
+        daemon_log_path,
         tokio::io::stdin(),
         tokio::io::stdout(),
     )
@@ -780,24 +840,53 @@ async fn poll_connect_with_backoff(socket_path: &Path) -> Result<UnixStream, Mem
     unreachable!("loop always returns via the attempt+1 == MAX_ATTEMPTS arm above")
 }
 
-/// Spawn a detached `ironmem serve --listen <socket>` daemon child process.
-/// No stdio is inherited (the daemon reads/writes nothing over stdio in
-/// `--listen` mode) and it is placed in its own process group so it survives
-/// the spawning proxy's terminal session ending.
+/// Spawn a detached `ironmem serve --listen <socket> --db <db_path>` daemon
+/// child process. Stdin/stdout are not inherited (the daemon reads/writes
+/// nothing over stdio in `--listen` mode); it is placed in its own process
+/// group so it survives the spawning proxy's terminal session ending.
+///
+/// `db_path` (M3) is forwarded explicitly as `--db` so the auto-spawned
+/// daemon serves the SAME database the spawning proxy was invoked against —
+/// without this, the daemon would fall back to `Config::load(None)`'s default
+/// resolution and a proxy invoked with a custom `--db` would silently end up
+/// talking to the wrong database.
+///
+/// `log_path` (H5) is where the daemon's stderr — its `tracing` logs, panics,
+/// and fatal startup errors (bind failure, DB migration, config errors) — is
+/// redirected in append mode, so a daemon that fails to come up leaves a
+/// diagnosable trail instead of a silently-discarded stderr turning every
+/// startup failure into an undiagnosable "connection refused after retries"
+/// at the polling proxy. The log file's parent directory is created if
+/// missing.
 #[cfg(unix)]
-fn spawn_daemon_process(socket_path: &Path) -> Result<(), MemoryError> {
+fn spawn_daemon_process(
+    socket_path: &Path,
+    db_path: &Path,
+    log_path: &Path,
+) -> Result<(), MemoryError> {
     use std::os::unix::process::CommandExt;
 
     let exe = std::env::current_exe()
         .map_err(|e| MemoryError::Config(format!("cannot resolve ironmem path: {e}")))?;
 
+    if let Some(parent) = log_path.parent() {
+        std::fs::create_dir_all(parent).map_err(MemoryError::Io)?;
+    }
+    let log_file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(log_path)
+        .map_err(MemoryError::Io)?;
+
     std::process::Command::new(exe)
         .arg("serve")
         .arg("--listen")
         .arg(socket_path)
+        .arg("--db")
+        .arg(db_path)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
+        .stderr(log_file)
         .process_group(0)
         .spawn()
         .map_err(|e| MemoryError::Config(format!("failed to spawn daemon: {e}")))?;
@@ -864,8 +953,13 @@ where
 async fn autospawn_and_connect(
     socket_path: &Path,
     lock_path: &Path,
+    db_path: &Path,
+    log_path: &Path,
 ) -> Result<UnixStream, MemoryError> {
-    autospawn_and_connect_with(socket_path, lock_path, || spawn_daemon_process(socket_path)).await
+    autospawn_and_connect_with(socket_path, lock_path, || {
+        spawn_daemon_process(socket_path, db_path, log_path)
+    })
+    .await
 }
 
 #[cfg(all(test, unix))]
@@ -874,7 +968,7 @@ mod daemon_tests {
     use std::io::{BufRead, BufReader as StdBufReader, Write};
     use std::os::unix::net::UnixStream as StdUnixStream;
     use std::time::Duration;
-    use tokio::io::AsyncWriteExt;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     /// Poll-connect with bounded retries so we never race a not-yet-bound
     /// daemon and never rely on a fixed sleep.
@@ -1271,8 +1365,18 @@ mod daemon_tests {
         let (proxy_write_out, test_read_out) = tokio::io::duplex(4096);
 
         let sock_for_task = sock.clone();
+        let db_path = dir.path().join("unused.sqlite3");
+        let log_path = dir.path().join("unused-daemon.log");
         let proxy_task = tokio::spawn(async move {
-            run_connect_mode_io(&sock_for_task, true, proxy_read_in, proxy_write_out).await
+            run_connect_mode_io(
+                &sock_for_task,
+                true,
+                &db_path,
+                &log_path,
+                proxy_read_in,
+                proxy_write_out,
+            )
+            .await
         });
 
         test_write_in
@@ -1308,12 +1412,143 @@ mod daemon_tests {
     async fn connect_mode_falls_back_when_no_daemon_and_autospawn_disabled() {
         let dir = tempfile::tempdir().unwrap();
         let sock = dir.path().join("no-daemon-here.sock");
+        let db_path = dir.path().join("unused.sqlite3");
+        let log_path = dir.path().join("unused-daemon.log");
 
         let (client_in, client_out) = tokio::io::duplex(4096);
-        let outcome = run_connect_mode_io(&sock, false, client_in, client_out)
+        let outcome = run_connect_mode_io(&sock, false, &db_path, &log_path, client_in, client_out)
             .await
             .expect("fallback path must not error");
         assert_eq!(outcome, ProxyOutcome::FallbackToInProcess);
+    }
+
+    /// M4 acceptance: a connect error kind OTHER than `NotFound`/
+    /// `ConnectionRefused` (e.g. `PermissionDenied`) must propagate as a real
+    /// error, not be misread as "no daemon" and trigger auto-spawn. Simulated
+    /// by making the socket's parent directory unsearchable, which turns
+    /// `connect` into an `EACCES`/`PermissionDenied` rather than `ENOENT`.
+    #[tokio::test]
+    async fn connect_mode_propagates_permission_denied_instead_of_autospawning() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let restricted = dir.path().join("restricted");
+        std::fs::create_dir(&restricted).unwrap();
+        let sock = restricted.join("daemon.sock");
+
+        std::fs::set_permissions(&restricted, std::fs::Permissions::from_mode(0o000)).unwrap();
+        // Skip where the process can still traverse despite 0o000 (e.g.
+        // running as root), where the PermissionDenied path this test
+        // exercises cannot occur. Probed the same way as
+        // `write_rules`'s permission tests: try to create a file inside the
+        // supposedly-unsearchable directory.
+        let running_as_root_probe = restricted.join(".probe");
+        let can_bypass = std::fs::File::create(&running_as_root_probe).is_ok();
+        if can_bypass {
+            std::fs::remove_file(&running_as_root_probe).ok();
+            std::fs::set_permissions(&restricted, std::fs::Permissions::from_mode(0o700)).unwrap();
+            eprintln!(
+                "skipping: process can bypass directory permissions (likely running as root)"
+            );
+            return;
+        }
+
+        let db_path = dir.path().join("unused.sqlite3");
+        let log_path = dir.path().join("unused-daemon.log");
+        let (client_in, client_out) = tokio::io::duplex(4096);
+        let result =
+            run_connect_mode_io(&sock, true, &db_path, &log_path, client_in, client_out).await;
+
+        std::fs::set_permissions(&restricted, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+        assert!(
+            result.is_err(),
+            "a PermissionDenied connect error must propagate, not silently trigger autospawn"
+        );
+    }
+
+    /// M5 acceptance: a HARD auto-spawn failure (lock-wait exhausted without
+    /// ever acquiring the lock or connecting) must fall back to in-process
+    /// serve, not take down the whole `serve` process. Forced deterministically
+    /// by pre-seeding the lockfile with OUR OWN pid (definitionally alive, so
+    /// `try_acquire_lock` reports `HeldByOther` forever) against a socket path
+    /// nothing ever binds — `autospawn_and_connect_with` then exhausts its
+    /// bounded lock-wait attempts and returns `Err`, without ever invoking the
+    /// real spawn closure.
+    #[tokio::test]
+    async fn autospawn_hard_failure_falls_back_to_in_process_instead_of_erroring() {
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("never-bound.sock");
+        let lock = dir.path().join("never-bound.sock.lock");
+        std::fs::write(&lock, std::process::id().to_string()).unwrap();
+
+        let db_path = dir.path().join("unused.sqlite3");
+        let log_path = dir.path().join("unused-daemon.log");
+        let (client_in, client_out) = tokio::io::duplex(4096);
+
+        let outcome = run_connect_mode_io(&sock, true, &db_path, &log_path, client_in, client_out)
+            .await
+            .expect("a hard autospawn failure must fall back, not propagate as an error");
+        assert_eq!(outcome, ProxyOutcome::FallbackToInProcess);
+
+        std::fs::remove_file(&lock).ok();
+    }
+
+    /// M2 acceptance: if the LOCAL input side hits EOF before the daemon's
+    /// response arrives (a one-shot/piped client that writes its request then
+    /// immediately closes stdin — exactly what bare `serve --connect` sees
+    /// from a non-interactive caller), the in-flight response must still
+    /// reach `local_out` rather than being dropped when `to_socket` completes
+    /// first. A stub "daemon" replies only after a short delay, so the local
+    /// EOF is guaranteed to race ahead of the reply.
+    #[tokio::test]
+    async fn pump_proxy_drains_in_flight_daemon_response_after_local_input_eof() {
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("stub.sock");
+        let listener = UnixListener::bind(&sock).unwrap();
+
+        let stub = tokio::spawn(async move {
+            let (stream, _addr) = listener.accept().await.unwrap();
+            let (read, mut write) = tokio::io::split(stream);
+            let mut reader = tokio::io::BufReader::new(read);
+            let mut line = String::new();
+            tokio::io::AsyncBufReadExt::read_line(&mut reader, &mut line)
+                .await
+                .unwrap();
+            // Reply only after a beat, so the client's stdin EOF (below) is
+            // guaranteed to have already been observed by `pump_proxy` first.
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            write
+                .write_all(b"{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{}}\n")
+                .await
+                .unwrap();
+            write.shutdown().await.unwrap();
+        });
+
+        let client_stream = UnixStream::connect(&sock).await.unwrap();
+
+        let (mut test_write_in, proxy_in) = tokio::io::duplex(4096);
+        let (proxy_out, mut test_read_out) = tokio::io::duplex(4096);
+
+        test_write_in
+            .write_all(b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{}}\n")
+            .await
+            .unwrap();
+        // Immediate stdin EOF, before the stub's delayed reply arrives.
+        test_write_in.shutdown().await.unwrap();
+
+        pump_proxy(client_stream, proxy_in, proxy_out)
+            .await
+            .unwrap();
+
+        let mut out = String::new();
+        test_read_out.read_to_string(&mut out).await.unwrap();
+        assert!(
+            out.contains("\"id\":1") && out.contains("\"result\""),
+            "the daemon's in-flight reply must still reach local_out after local EOF: {out}"
+        );
+
+        stub.await.unwrap();
     }
 
     // ---- Task 9: single-flight auto-spawn under an atomic lockfile --------

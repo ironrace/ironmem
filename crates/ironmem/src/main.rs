@@ -393,7 +393,19 @@ async fn run(cli: Cli) -> Result<(), MemoryError> {
             if let Some(sock) = connect {
                 let socket_path = std::path::PathBuf::from(sock);
                 let autospawn_enabled = !no_autospawn && cfg.daemon_autospawn_enabled();
-                match mcp::daemon::run_connect_mode(&socket_path, autospawn_enabled).await? {
+                // M3: forward this proxy's own resolved db_path so an
+                // auto-spawned daemon serves the SAME database, not the
+                // default. H5: redirect an auto-spawned daemon's stderr to
+                // `<state_dir>/daemon.log` instead of discarding it.
+                let daemon_log_path = cfg.state_dir.join("daemon.log");
+                match mcp::daemon::run_connect_mode(
+                    &socket_path,
+                    autospawn_enabled,
+                    &cfg.db_path,
+                    &daemon_log_path,
+                )
+                .await?
+                {
                     mcp::daemon::ProxyOutcome::Proxied => return Ok(()),
                     mcp::daemon::ProxyOutcome::FallbackToInProcess => {}
                 }
