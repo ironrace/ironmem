@@ -100,13 +100,23 @@ fn claude_config_path() -> Result<PathBuf, MemoryError> {
 }
 
 /// Ensure the ironmem MCP server is registered for `harness`, idempotently.
+///
+/// Registers the shared-daemon proxy command (`harness::proxy_command_args` —
+/// `["serve", "--connect", <socket>]`), the canonical invocation every
+/// harness should converge on (#190 Task 11/12).
 fn register(harness: Harness) -> Result<mcp_setup::RegisterOutcome, MemoryError> {
     let exe = std::env::current_exe()
         .map_err(|e| MemoryError::Config(format!("cannot resolve ironmem path: {e}")))?;
     let exe = exe.to_string_lossy().to_string();
+    let cfg = config::Config::load(None)?;
+    let proxy_args = crate::harness::proxy_command_args(harness.harness_id(), &cfg);
     match harness {
-        Harness::Claude => mcp_setup::ensure_claude_registered(&claude_config_path()?, &exe),
-        Harness::Codex => mcp_setup::ensure_codex_registered(&codex_config_path()?, &exe),
+        Harness::Claude => {
+            mcp_setup::ensure_claude_registered(&claude_config_path()?, &exe, &proxy_args)
+        }
+        Harness::Codex => {
+            mcp_setup::ensure_codex_registered(&codex_config_path()?, &exe, &proxy_args)
+        }
     }
 }
 
@@ -146,6 +156,12 @@ pub fn run_launcher(
         match register(harness)? {
             mcp_setup::RegisterOutcome::Registered => {
                 eprintln!("ironmem: registered MCP server for {}", harness.label())
+            }
+            mcp_setup::RegisterOutcome::Upgraded => {
+                eprintln!(
+                    "ironmem: upgraded MCP server registration for {} to the shared-daemon proxy command",
+                    harness.label()
+                )
             }
             mcp_setup::RegisterOutcome::AlreadyRegistered => {
                 eprintln!(

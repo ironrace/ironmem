@@ -265,7 +265,20 @@ fn codex_launcher_registers_mcp_server_by_default() {
         cfg.contains("[mcp_servers.ironmem]"),
         "missing block: {cfg}"
     );
-    assert!(cfg.contains("args = [\"serve\"]"), "missing args: {cfg}");
+    // #190 Task 12: registration now writes the shared-daemon proxy command
+    // (["serve", "--connect", <default socket path>]), not bare ["serve"].
+    let expected_socket = home
+        .join(".ironrace-memory")
+        .join("hook_state")
+        .join("daemon.sock");
+    let expected_args = format!(
+        "args = [\"serve\", \"--connect\", \"{}\"]",
+        expected_socket.display()
+    );
+    assert!(
+        cfg.contains(&expected_args),
+        "missing proxy args {expected_args:?}: {cfg}"
+    );
     assert!(
         cfg.contains("IRONMEM_MCP_MODE = \"trusted\""),
         "missing env: {cfg}"
