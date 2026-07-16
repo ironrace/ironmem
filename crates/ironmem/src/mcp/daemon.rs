@@ -1176,6 +1176,84 @@ mod daemon_tests {
         joined.join().unwrap().unwrap();
     }
 
+    /// M9 acceptance: a connection held OPEN across an idle window that would
+    /// otherwise have expired must keep the daemon alive AND keep being
+    /// served — not merely "not disconnected", but actually still answering
+    /// requests. `active` never drops to zero while this connection is open,
+    /// so the idle timer must never even arm, let alone fire.
+    #[test]
+    fn connection_held_open_past_idle_window_keeps_daemon_alive_and_is_served() {
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("daemon.sock");
+        let sock_thread = sock.clone();
+
+        let (_shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+        let idle_timeout = Duration::from_millis(120);
+
+        let daemon = std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            rt.block_on(async move {
+                #[allow(clippy::arc_with_non_send_sync)]
+                let app = Arc::new(App::open_for_test().unwrap());
+                let listener = bind_daemon_listener(&sock_thread).await.unwrap();
+                serve_accept_loop(app, listener, idle_timeout, shutdown_rx)
+                    .await
+                    .unwrap();
+            });
+        });
+
+        // Open ONE connection and keep it open (never drop writer/reader)
+        // across more than the full idle window.
+        let stream = connect_with_retry(&sock);
+        let mut writer = stream.try_clone().unwrap();
+        let mut reader = StdBufReader::new(stream);
+        writer
+            .write_all(b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{}}\n")
+            .unwrap();
+        writer.flush().unwrap();
+        let mut line = String::new();
+        reader.read_line(&mut line).unwrap();
+        assert!(line.contains("\"protocolVersion\""));
+
+        // Sleep well past the idle window WITHOUT closing the connection:
+        // since `active` never drops to zero, the idle timer must never arm.
+        std::thread::sleep(idle_timeout * 3);
+
+        // The SAME still-open connection must still be served afterward.
+        writer
+            .write_all(b"{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"initialize\",\"params\":{}}\n")
+            .unwrap();
+        writer.flush().unwrap();
+        let mut line2 = String::new();
+        reader
+            .read_line(&mut line2)
+            .expect("daemon must still be alive and serving the held-open connection");
+        assert!(
+            line2.contains("\"protocolVersion\""),
+            "held-open connection still gets real responses: {line2}"
+        );
+
+        // Now close it and let the (now-armable) idle timer run out normally.
+        drop(writer);
+        drop(reader);
+        let joined = std::thread::spawn(move || daemon.join());
+        for _ in 0..50 {
+            if joined.is_finished() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(
+            joined.is_finished(),
+            "daemon must shut down after the held-open connection finally \
+             closes and the idle window elapses"
+        );
+        joined.join().unwrap().unwrap();
+    }
+
     /// Task 7 + H1: on idle-timeout exit, `run_daemon_async` removes ONLY the
     /// daemon-owned socket via `SocketCleanupGuard` — never a lockfile, which
     /// is proxy-owned (H1) and must survive untouched. A pre-existing lock at
