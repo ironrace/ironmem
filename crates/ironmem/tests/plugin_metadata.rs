@@ -164,6 +164,38 @@ fn frontmatter(raw: &str) -> Option<&str> {
     Some(&rest[..end])
 }
 
+/// Extract the full `tools:` value from YAML frontmatter, including any
+/// block-style continuation lines (indented `- item` list entries or a
+/// wrapped flow array). Returns `None` when there is no `tools:` key.
+///
+/// Collecting the whole value — not just the key line — matters: a reformat
+/// from inline flow style (`tools: ["Read", "Bash"]`) to block style
+/// (`tools:` then indented `- item` lines) is valid YAML, and a single-line
+/// check would let a memory tool on a following line slip past the exclusion
+/// assertion below — the exact drift this guard exists to catch.
+fn tools_value(front: &str) -> Option<String> {
+    let mut lines = front.lines();
+    let key_line = lines
+        .by_ref()
+        .find(|l| l.trim_start().starts_with("tools:"))?;
+    let key_indent = key_line.len() - key_line.trim_start().len();
+    let mut value = key_line.trim_start()["tools:".len()..].to_string();
+    // A YAML value continues onto lines indented deeper than its key; a line
+    // at or below the key's indentation (or a blank line) ends the block.
+    for line in lines {
+        if line.trim().is_empty() {
+            break;
+        }
+        let indent = line.len() - line.trim_start().len();
+        if indent <= key_indent {
+            break;
+        }
+        value.push('\n');
+        value.push_str(line);
+    }
+    Some(value)
+}
+
 /// Read-only Claude review sub-agents must advertise an explicit lean tool
 /// allowlist that excludes every ironmem MCP tool (issue #189). A missing
 /// `tools:` key means the agent inherits the full MCP surface — including
@@ -183,18 +215,46 @@ fn claude_review_agents_advertise_lean_profile() {
             .unwrap_or_else(|_| panic!("Could not read {}", path.display()));
         let front =
             frontmatter(&raw).unwrap_or_else(|| panic!("{rel}: missing YAML frontmatter block"));
-        let tools_line = front
-            .lines()
-            .find(|l| l.trim_start().starts_with("tools:"))
-            .unwrap_or_else(|| {
-                panic!(
-                    "{rel}: review agent must declare an explicit `tools:` allowlist \
-                     so it does not inherit the full MCP surface (issue #189)"
-                )
-            });
+        let tools = tools_value(front).unwrap_or_else(|| {
+            panic!(
+                "{rel}: review agent must declare an explicit `tools:` allowlist \
+                 so it does not inherit the full MCP surface (issue #189)"
+            )
+        });
         assert!(
-            !tools_line.contains("ironmem"),
-            "{rel}: review agent `tools:` must not list any ironmem MCP tool (found: {tools_line})"
+            !tools.contains("ironmem"),
+            "{rel}: review agent `tools:` must not list any ironmem MCP tool (found: {tools})"
         );
     }
+}
+
+/// `tools_value` must capture the whole `tools:` value in both YAML styles so
+/// the exclusion check cannot be evaded by reformatting. A block-style list
+/// with a memory tool on a continuation line must be surfaced, and a following
+/// top-level key must not bleed into the captured value.
+#[test]
+fn tools_value_captures_flow_and_block_styles() {
+    let flow = "name: x\ntools: [\"Read\", \"Bash\"]\nmodel: y";
+    assert_eq!(
+        tools_value(flow).as_deref(),
+        Some(" [\"Read\", \"Bash\"]"),
+        "flow-style value should be captured verbatim"
+    );
+
+    let block = "name: x\ntools:\n  - Read\n  - mcp__ironmem__search\nmodel: y";
+    let captured = tools_value(block).expect("block-style tools: should be found");
+    assert!(
+        captured.contains("mcp__ironmem__search"),
+        "block-style continuation lines must be captured, got: {captured}"
+    );
+    assert!(
+        !captured.contains("model:"),
+        "the next top-level key must not bleed into the tools value, got: {captured}"
+    );
+
+    assert_eq!(
+        tools_value("name: x\nmodel: y"),
+        None,
+        "a missing tools: key must return None"
+    );
 }
