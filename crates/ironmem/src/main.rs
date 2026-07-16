@@ -25,6 +25,15 @@ enum Commands {
         /// Path to the database
         #[arg(long)]
         db: Option<String>,
+        /// Run as the shared daemon bound to this Unix socket path
+        #[arg(long)]
+        listen: Option<String>,
+        /// Run as a thin proxy connecting to this Unix socket path
+        #[arg(long, conflicts_with = "listen")]
+        connect: Option<String>,
+        /// Disable daemon auto-spawn from proxy (--connect) mode
+        #[arg(long)]
+        no_autospawn: bool,
     },
     /// Initialize a new memory store
     Init,
@@ -192,6 +201,46 @@ enum Commands {
         #[arg(long, default_value_t = ironmem::context::DEFAULT_BUDGET_TOKENS)]
         budget: usize,
     },
+    /// Launch Grok in a repo with the ironmem MCP server attached (scaffolding — #190 Task 13)
+    Grok {
+        /// Repository path to launch in
+        #[arg(default_value = ".")]
+        path: String,
+        /// Optional initial prompt for the session
+        prompt: Option<String>,
+        /// Skip ensuring the ironmem MCP server is registered (use existing manual setup)
+        #[arg(long)]
+        no_mcp_setup: bool,
+        /// Code-map area to pre-inject context for (repeatable)
+        #[arg(long = "area")]
+        areas: Vec<String>,
+        /// Disable compact context pre-injection into the initial prompt
+        #[arg(long)]
+        no_context: bool,
+        /// Approximate token budget for pre-injected context
+        #[arg(long, default_value_t = ironmem::context::DEFAULT_BUDGET_TOKENS)]
+        budget: usize,
+    },
+    /// Launch Gemini CLI in a repo with the ironmem MCP server attached
+    Gemini {
+        /// Repository path to launch in
+        #[arg(default_value = ".")]
+        path: String,
+        /// Optional initial prompt for the session
+        prompt: Option<String>,
+        /// Skip ensuring the ironmem MCP server is registered (use existing manual setup)
+        #[arg(long)]
+        no_mcp_setup: bool,
+        /// Code-map area to pre-inject context for (repeatable)
+        #[arg(long = "area")]
+        areas: Vec<String>,
+        /// Disable compact context pre-injection into the initial prompt
+        #[arg(long)]
+        no_context: bool,
+        /// Approximate token budget for pre-injected context
+        #[arg(long, default_value_t = ironmem::context::DEFAULT_BUDGET_TOKENS)]
+        budget: usize,
+    },
 }
 
 /// Subcommands nested under `ironmem memory`.
@@ -308,8 +357,64 @@ async fn main() {
 
 async fn run(cli: Cli) -> Result<(), MemoryError> {
     match cli.command {
-        Commands::Serve { db } => {
+        Commands::Serve {
+            db,
+            listen,
+            connect,
+            no_autospawn,
+        } => {
             let cfg = config::Config::load(db)?;
+
+            // `--listen <socket>`: run as the shared daemon (Unix only, Task 6).
+            // `run_daemon` owns its own runtime, so it must not nest inside this
+            // `#[tokio::main]` runtime — run it on a dedicated std thread and
+            // join. On the None path `cfg` is untouched (the taken branch
+            // diverges via `return`), so the stdio fallback below still owns it.
+            #[cfg(unix)]
+            if let Some(sock) = listen {
+                let socket_path = std::path::PathBuf::from(sock);
+                return std::thread::spawn(move || mcp::daemon::run_daemon(cfg, socket_path))
+                    .join()
+                    .map_err(|_| MemoryError::Config("daemon thread panicked".into()))?;
+            }
+            // On non-unix, `--listen` has no daemon transport yet (Task 10 adds a
+            // fallback); consume the flag so the in-process stdio server runs.
+            #[cfg(not(unix))]
+            let _ = listen;
+
+            // `--connect <socket>`: run as a thin proxy (Unix only, Task 8).
+            // `no_autospawn` (CLI flag) forces auto-spawn off regardless of the
+            // `IRONMEM_NO_DAEMON` env var; otherwise the env-derived Config
+            // setting decides. A successful proxy session returns straight
+            // from here; `FallbackToInProcess` (no daemon + autospawn disabled)
+            // falls through to the same in-process stdio server used by bare
+            // `serve`, below.
+            #[cfg(unix)]
+            if let Some(sock) = connect {
+                let socket_path = std::path::PathBuf::from(sock);
+                let autospawn_enabled = !no_autospawn && cfg.daemon_autospawn_enabled();
+                // M3: forward this proxy's own resolved db_path so an
+                // auto-spawned daemon serves the SAME database, not the
+                // default. H5: redirect an auto-spawned daemon's stderr to
+                // `<state_dir>/daemon.log` instead of discarding it.
+                let daemon_log_path = cfg.state_dir.join("daemon.log");
+                match mcp::daemon::run_connect_mode(
+                    &socket_path,
+                    autospawn_enabled,
+                    &cfg.db_path,
+                    &daemon_log_path,
+                )
+                .await?
+                {
+                    mcp::daemon::ProxyOutcome::Proxied => return Ok(()),
+                    mcp::daemon::ProxyOutcome::FallbackToInProcess => {}
+                }
+            }
+            // On non-unix, `--connect` has no proxy transport yet (Task 10 adds
+            // a fallback); consume the flags so the in-process stdio server runs.
+            #[cfg(not(unix))]
+            let _ = (connect, no_autospawn);
+
             // Phase 1: fast server-ready init (DB open + schema migrate, ~50ms).
             // App is not Sync (single-threaded stdio server, block_in_place dispatch).
             #[allow(clippy::arc_with_non_send_sync)]
@@ -394,7 +499,9 @@ async fn run(cli: Cli) -> Result<(), MemoryError> {
         }
         Commands::Doctor { db, json } => {
             let cfg = config::Config::load(db)?;
-            let report = ironmem::doctor::run_doctor(&cfg);
+            // #190 Task 14: extends run_doctor with the shared-daemon health
+            // probe + auto-spawn config, which need an async socket connect.
+            let report = ironmem::doctor::run_doctor_with_daemon(&cfg).await;
             if json {
                 println!("{}", serde_json::to_string_pretty(&report)?);
             } else {
@@ -458,6 +565,42 @@ async fn run(cli: Cli) -> Result<(), MemoryError> {
             budget,
         } => launcher::run_launcher(
             launcher::Harness::Codex,
+            &path,
+            prompt,
+            launcher::LaunchOptions {
+                no_mcp_setup,
+                no_context,
+                areas,
+                budget_tokens: budget,
+            },
+        ),
+        Commands::Grok {
+            path,
+            prompt,
+            no_mcp_setup,
+            areas,
+            no_context,
+            budget,
+        } => launcher::run_launcher(
+            launcher::Harness::Grok,
+            &path,
+            prompt,
+            launcher::LaunchOptions {
+                no_mcp_setup,
+                no_context,
+                areas,
+                budget_tokens: budget,
+            },
+        ),
+        Commands::Gemini {
+            path,
+            prompt,
+            no_mcp_setup,
+            areas,
+            no_context,
+            budget,
+        } => launcher::run_launcher(
+            launcher::Harness::Gemini,
             &path,
             prompt,
             launcher::LaunchOptions {
@@ -648,5 +791,96 @@ async fn run(cli: Cli) -> Result<(), MemoryError> {
             }
             Ok(())
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Helper: parse argv and return the `Serve` fields, panicking if the parsed
+    /// command is not `Serve` (keeps each test focused on field assertions).
+    fn parse_serve(args: &[&str]) -> (Option<String>, Option<String>, Option<String>, bool) {
+        let cli = Cli::try_parse_from(args).expect("expected argv to parse");
+        match cli.command {
+            Commands::Serve {
+                db,
+                listen,
+                connect,
+                no_autospawn,
+            } => (db, listen, connect, no_autospawn),
+            _ => panic!("expected Commands::Serve, got a different variant"),
+        }
+    }
+
+    #[test]
+    fn serve_bare_uses_all_defaults() {
+        let (db, listen, connect, no_autospawn) = parse_serve(&["ironmem", "serve"]);
+        assert_eq!(db, None);
+        assert_eq!(listen, None);
+        assert_eq!(connect, None);
+        assert!(!no_autospawn);
+    }
+
+    #[test]
+    fn serve_db_preserved_with_new_fields_defaulted() {
+        let (db, listen, connect, no_autospawn) =
+            parse_serve(&["ironmem", "serve", "--db", "/tmp/x.sqlite3"]);
+        assert_eq!(db.as_deref(), Some("/tmp/x.sqlite3"));
+        assert_eq!(listen, None);
+        assert_eq!(connect, None);
+        assert!(!no_autospawn);
+    }
+
+    #[test]
+    fn serve_listen_sets_listen_only() {
+        let (db, listen, connect, no_autospawn) =
+            parse_serve(&["ironmem", "serve", "--listen", "/tmp/d.sock"]);
+        assert_eq!(db, None);
+        assert_eq!(listen.as_deref(), Some("/tmp/d.sock"));
+        assert_eq!(connect, None);
+        assert!(!no_autospawn);
+    }
+
+    #[test]
+    fn serve_connect_sets_connect_only() {
+        let (db, listen, connect, no_autospawn) =
+            parse_serve(&["ironmem", "serve", "--connect", "/tmp/d.sock"]);
+        assert_eq!(db, None);
+        assert_eq!(listen, None);
+        assert_eq!(connect.as_deref(), Some("/tmp/d.sock"));
+        assert!(!no_autospawn);
+    }
+
+    #[test]
+    fn serve_listen_and_connect_are_mutually_exclusive() {
+        let result = Cli::try_parse_from([
+            "ironmem",
+            "serve",
+            "--listen",
+            "/a.sock",
+            "--connect",
+            "/b.sock",
+        ]);
+        assert!(result.is_err(), "expected --listen + --connect to conflict");
+        let msg = result.err().unwrap().to_string();
+        assert!(
+            msg.contains("connect") && msg.contains("listen"),
+            "conflict error should mention both flags, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn serve_no_autospawn_with_connect() {
+        let (_db, listen, connect, no_autospawn) = parse_serve(&[
+            "ironmem",
+            "serve",
+            "--no-autospawn",
+            "--connect",
+            "/tmp/d.sock",
+        ]);
+        assert_eq!(listen, None);
+        assert_eq!(connect.as_deref(), Some("/tmp/d.sock"));
+        assert!(no_autospawn);
     }
 }

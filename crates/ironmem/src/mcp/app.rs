@@ -43,13 +43,6 @@ pub struct App {
     pub memory_ready: Arc<AtomicBool>,
     /// Guards the one-time HNSW rebuild triggered when memory_ready transitions to true.
     memory_ready_rebuilt: AtomicBool,
-    /// Harness session id learned from the MCP `initialize` request (or the
-    /// `IRONMEM_SESSION_ID` env), set once. Used to co-key `mcp_chars_served`
-    /// with the hook's `session_summary` row (METRICS_SPEC §5.3, Decision D1).
-    pub session_id: RwLock<Option<String>>,
-    /// Metrics harness attribution learned from MCP `initialize.clientInfo`
-    /// (or `IRONMEM_HARNESS`), set once. Stored as the DB enum value.
-    pub harness: RwLock<Option<String>>,
     /// Active collab session this server process is participating in. Set by
     /// `collab_start`/`collab_start_code_review` and refreshed by
     /// `collab_send`/`collab_recv`/`collab_wait_my_turn`; deliberately NOT set
@@ -134,8 +127,6 @@ impl App {
             graph_cache: RwLock::new(None),
             memory_ready: Arc::new(AtomicBool::new(true)),
             memory_ready_rebuilt: AtomicBool::new(true),
-            session_id: RwLock::new(std::env::var("IRONMEM_SESSION_ID").ok()),
-            harness: RwLock::new(env_metrics_harness()),
             active_collab_session_id: RwLock::new(None),
             explicit_task_tag: RwLock::new(None),
             active_collab_generations: RwLock::new(std::collections::HashMap::new()),
@@ -171,61 +162,10 @@ impl App {
             graph_cache: RwLock::new(None),
             memory_ready: Arc::new(AtomicBool::new(false)),
             memory_ready_rebuilt: AtomicBool::new(false),
-            session_id: RwLock::new(std::env::var("IRONMEM_SESSION_ID").ok()),
-            harness: RwLock::new(env_metrics_harness()),
             active_collab_session_id: RwLock::new(None),
             explicit_task_tag: RwLock::new(None),
             active_collab_generations: RwLock::new(std::collections::HashMap::new()),
         })
-    }
-
-    /// Learn metrics context from the MCP `initialize` params.
-    pub fn learn_metrics_context(&self, params: &serde_json::Value) {
-        self.learn_session_id(params);
-        self.learn_harness(params);
-    }
-
-    /// Learn the harness session id once, from the MCP `initialize` params.
-    /// Probes common locations clients may use; falls back to the env-seeded
-    /// value. Never overwrites a value already set (set-once).
-    fn learn_session_id(&self, params: &serde_json::Value) {
-        let mut guard = self.session_id.write().expect("session_id lock poisoned");
-        if guard.is_some() {
-            return;
-        }
-        let found = params
-            .get("sessionId")
-            .or_else(|| params.get("session_id"))
-            .or_else(|| params.get("_meta").and_then(|m| m.get("sessionId")))
-            .or_else(|| params.get("_meta").and_then(|m| m.get("session_id")))
-            .and_then(|v| v.as_str())
-            .and_then(normalize_session_id);
-        if found.is_some() {
-            *guard = found;
-        }
-    }
-
-    fn learn_harness(&self, params: &serde_json::Value) {
-        let mut guard = self.harness.write().expect("harness lock poisoned");
-        if guard.is_some() {
-            return;
-        }
-        if let Some(harness) = harness_from_client_info(params) {
-            *guard = Some(harness);
-        }
-    }
-
-    /// Snapshot of the learned harness session id.
-    pub fn session_id_snapshot(&self) -> Option<String> {
-        self.session_id
-            .read()
-            .expect("session_id lock poisoned")
-            .clone()
-    }
-
-    /// Snapshot of the learned metrics harness attribution.
-    pub fn harness_snapshot(&self) -> Option<String> {
-        self.harness.read().expect("harness lock poisoned").clone()
     }
 
     /// Mark `id` as the active collab session for metrics attribution.
@@ -342,8 +282,6 @@ impl App {
             graph_cache: RwLock::new(None),
             memory_ready: Arc::new(AtomicBool::new(true)),
             memory_ready_rebuilt: AtomicBool::new(true),
-            session_id: RwLock::new(std::env::var("IRONMEM_SESSION_ID").ok()),
-            harness: RwLock::new(env_metrics_harness()),
             active_collab_session_id: RwLock::new(None),
             explicit_task_tag: RwLock::new(None),
             active_collab_generations: RwLock::new(std::collections::HashMap::new()),
@@ -589,11 +527,6 @@ impl App {
     }
 }
 
-fn env_metrics_harness() -> Option<String> {
-    let value = std::env::var("IRONMEM_HARNESS").ok()?;
-    crate::harness::canonicalize_input(&value, crate::harness::REGISTRY).map(|id| id.to_string())
-}
-
 fn normalize_session_id(value: &str) -> Option<String> {
     let sanitized = crate::sanitize::sanitize_session_id(value);
     if sanitized == "unknown" {
@@ -603,7 +536,28 @@ fn normalize_session_id(value: &str) -> Option<String> {
     }
 }
 
-fn harness_from_client_info(params: &serde_json::Value) -> Option<String> {
+/// Extract a harness session id from MCP `initialize` params. Probes the
+/// common locations clients may use (top-level `sessionId`/`session_id`, or
+/// nested under `_meta`). Returns `None` if absent or the value sanitizes to
+/// `"unknown"`.
+///
+/// Pure and connection-agnostic: callers (e.g. `mcp::server::ConnectionContext`)
+/// own the "set once per connection" semantics — this function only extracts
+/// and normalizes, it never mutates any state.
+pub(crate) fn session_id_from_params(params: &serde_json::Value) -> Option<String> {
+    params
+        .get("sessionId")
+        .or_else(|| params.get("session_id"))
+        .or_else(|| params.get("_meta").and_then(|m| m.get("sessionId")))
+        .or_else(|| params.get("_meta").and_then(|m| m.get("session_id")))
+        .and_then(|v| v.as_str())
+        .and_then(normalize_session_id)
+}
+
+/// Extract a metrics harness id from MCP `initialize.clientInfo` (or
+/// `_meta.clientInfo`). Pure and connection-agnostic — see
+/// `session_id_from_params`.
+pub(crate) fn harness_from_client_info(params: &serde_json::Value) -> Option<String> {
     let client_info = params
         .get("clientInfo")
         .or_else(|| params.get("client_info"))
@@ -642,17 +596,17 @@ mod tests {
         assert!(harness_from_client_info(&params).is_none());
     }
 
-    // ---- env_metrics_harness wiring ----------------------------------------
+    // ---- IRONMEM_HARNESS env resolution ------------------------------------
     //
-    // env_metrics_harness() is a thin wrapper: read IRONMEM_HARNESS, pass to
-    // canonicalize_input.  Manipulating a process-global env var in parallel
+    // `mcp::server::mcp_harness` reads IRONMEM_HARNESS and passes it to
+    // canonicalize_input. Manipulating a process-global env var in parallel
     // tests is racy, so we test the delegate directly, which covers the same
     // logical path without shared-state races.
 
     #[test]
     fn env_metrics_harness_delegate_accepts_claude_code_alias() {
         // "claude-code" is an env_alias for claude; confirm canonicalize_input
-        // returns "claude", which is what env_metrics_harness produces when
+        // returns "claude", which is what `mcp_harness` produces when
         // IRONMEM_HARNESS="claude-code".
         let result = crate::harness::canonicalize_input("claude-code", crate::harness::REGISTRY);
         assert_eq!(result, Some("claude"));
@@ -660,9 +614,12 @@ mod tests {
 
     #[test]
     fn env_metrics_harness_delegate_unknown_returns_none() {
-        // An unregistered value produces None, so env_metrics_harness() also
-        // returns None for unknown IRONMEM_HARNESS values.
-        let result = crate::harness::canonicalize_input("gemini", crate::harness::REGISTRY);
+        // An unregistered value produces None, so `mcp_harness` also falls
+        // back to its default for unknown IRONMEM_HARNESS values. "gemini" is
+        // now a REAL registered harness (#190 Task 11); use a placeholder id
+        // that is genuinely absent from REGISTRY instead.
+        let result =
+            crate::harness::canonicalize_input("not-a-real-harness", crate::harness::REGISTRY);
         assert!(result.is_none());
     }
 

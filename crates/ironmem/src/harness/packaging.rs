@@ -95,21 +95,23 @@ mod tests {
         });
     }
 
-    /// Synthetic-failure: adding a "gemini" harness without its plugin root
-    /// must produce a non-empty Err list mentioning "gemini".
+    /// Synthetic-failure: adding an unpackaged harness (one with no matching
+    /// `.<id>-plugin/` root) must produce a non-empty Err list naming it.
+    /// Uses a placeholder id rather than "gemini" — gemini is now a REAL
+    /// registered harness with real (if minimal) packaging (#190 Task 11).
     #[test]
     fn packaging_coverage_fails_for_unpackaged_synthetic_harness() {
-        const GEMINI_SPEC: HarnessSpec = HarnessSpec {
-            id: "gemini",
-            display_name: "Gemini CLI",
-            binary: "gemini",
-            rules_file: "GEMINI.md",
+        const UNPACKAGED_SPEC: HarnessSpec = HarnessSpec {
+            id: "totally-unpackaged-harness",
+            display_name: "Totally Unpackaged Harness",
+            binary: "totally-unpackaged-harness",
+            rules_file: "UNPACKAGED.md",
             rules_strategy: crate::harness::RulesStrategy::Import {
                 directive: "@./AGENTS.md",
             },
             write_rules_default: false,
-            client_info_aliases: &["gemini"],
-            env_aliases: &["gemini"],
+            client_info_aliases: &["totally-unpackaged-harness"],
+            env_aliases: &["totally-unpackaged-harness"],
             additional_context_support: false,
             occupancy_support: false,
             transcript_parser: TranscriptParserKind::None,
@@ -117,19 +119,20 @@ mod tests {
 
         let claude = REGISTRY.iter().find(|s| s.id == "claude").copied().unwrap();
         let codex = REGISTRY.iter().find(|s| s.id == "codex").copied().unwrap();
-        let injected = [claude, codex, GEMINI_SPEC];
+        let injected = [claude, codex, UNPACKAGED_SPEC];
         let root = repo_root();
 
         let errs = check_packaging_coverage(&root, &injected)
-            .expect_err("must fail when .gemini-plugin/ does not exist");
+            .expect_err("must fail when .totally-unpackaged-harness-plugin/ does not exist");
 
         assert!(
             !errs.is_empty(),
             "error list must be non-empty for unpackaged harness"
         );
         assert!(
-            errs.iter().any(|e| e.contains("gemini")),
-            "error list must mention 'gemini'; got: {errs:?}"
+            errs.iter()
+                .any(|e| e.contains("totally-unpackaged-harness")),
+            "error list must mention the unpackaged harness id; got: {errs:?}"
         );
     }
 }

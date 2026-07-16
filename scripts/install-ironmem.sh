@@ -21,6 +21,13 @@ INSTALL_DIR="${IRONMEM_INSTALL_DIR:-$HOME/.ironrace/bin}"
 TARGET="$INSTALL_DIR/ironmem"
 SOURCE="$REPO_ROOT/target/release/ironmem"
 
+# #190 shared-daemon default socket path — mirrors `Config::daemon_socket_path`
+# exactly (`<state_dir>/daemon.sock`, honoring an `IRONMEM_DAEMON_SOCKET`
+# override) so MCP registrations written by this script match what the
+# `ironmem serve --connect`/`--listen` Rust launchers bind/connect against by
+# default.
+DAEMON_SOCKET_PATH="${IRONMEM_DAEMON_SOCKET:-$HOME/.ironrace-memory/hook_state/daemon.sock}"
+
 REQUIRED_SHARED_SKILLS=(
   writing-plans
   subagent-driven-development
@@ -443,7 +450,7 @@ if [[ "$SKIP_WIRING" -eq 0 ]]; then
   if ! command -v jq >/dev/null 2>&1; then
     echo "==> WARN: jq not installed; skipping Claude MCP registration check." >&2
     echo "          Install jq, or add this manually to $CLAUDE_CONFIG_JSON:" >&2
-    echo "          { \"mcpServers\": { \"ironmem\": { \"command\": \"$TARGET\", \"args\": [\"serve\"], \"env\": { \"IRONMEM_MCP_MODE\": \"trusted\" } } } }" >&2
+    echo "          { \"mcpServers\": { \"ironmem\": { \"command\": \"$TARGET\", \"args\": [\"serve\", \"--connect\", \"$DAEMON_SOCKET_PATH\"], \"env\": { \"IRONMEM_MCP_MODE\": \"trusted\" } } } }" >&2
   else
     if [[ ! -f "$CLAUDE_CONFIG_JSON" ]]; then
       echo "{}" > "$CLAUDE_CONFIG_JSON"
@@ -453,8 +460,8 @@ if [[ "$SKIP_WIRING" -eq 0 ]]; then
     if [[ -z "$EXISTING_CMD" ]]; then
       echo "==> Registering 'ironmem' MCP server in $CLAUDE_CONFIG_JSON"
       TMP="$(mktemp)"
-      jq --arg cmd "$TARGET" \
-        '.mcpServers = ((.mcpServers // {}) + {ironmem: {command: $cmd, args: ["serve"], env: {IRONMEM_MCP_MODE: "trusted"}}})' \
+      jq --arg cmd "$TARGET" --arg sock "$DAEMON_SOCKET_PATH" \
+        '.mcpServers = ((.mcpServers // {}) + {ironmem: {command: $cmd, args: ["serve", "--connect", $sock], env: {IRONMEM_MCP_MODE: "trusted"}}})' \
         "$CLAUDE_CONFIG_JSON" > "$TMP" && mv -f "$TMP" "$CLAUDE_CONFIG_JSON"
     elif [[ "$EXISTING_CMD" == "$TARGET" ]]; then
       if jq -e '.mcpServers.ironmem.env.IRONMEM_MCP_MODE == null' \
@@ -469,8 +476,8 @@ if [[ "$SKIP_WIRING" -eq 0 ]]; then
     elif [[ "$FORCE_WIRING" -eq 1 ]]; then
       echo "==> Replacing divergent 'ironmem' MCP entry (was: $EXISTING_CMD)"
       TMP="$(mktemp)"
-      jq --arg cmd "$TARGET" \
-        '.mcpServers.ironmem = {command: $cmd, args: ["serve"], env: {IRONMEM_MCP_MODE: "trusted"}}' \
+      jq --arg cmd "$TARGET" --arg sock "$DAEMON_SOCKET_PATH" \
+        '.mcpServers.ironmem = {command: $cmd, args: ["serve", "--connect", $sock], env: {IRONMEM_MCP_MODE: "trusted"}}' \
         "$CLAUDE_CONFIG_JSON" > "$TMP" && mv -f "$TMP" "$CLAUDE_CONFIG_JSON"
     else
       echo "    WARN: 'ironmem' MCP entry already exists with command=$EXISTING_CMD" >&2
@@ -500,7 +507,7 @@ if [[ "$SKIP_WIRING" -eq 0 ]]; then
       echo ""
       echo "[mcp_servers.ironmem]"
       echo "command = \"$TARGET\""
-      echo "args = [\"serve\"]"
+      echo "args = [\"serve\", \"--connect\", \"$DAEMON_SOCKET_PATH\"]"
       echo ""
       echo "[mcp_servers.ironmem.env]"
       echo "IRONMEM_MCP_MODE = \"trusted\""

@@ -121,6 +121,14 @@ args = ["serve"]
 IRONMEM_MCP_MODE = "trusted"
 ```
 
+`args = ["serve"]` above is the simplest, always-supported setup: one
+in-process server per client. If you attach `ironmem` to several assistants
+in the same repo, `args = ["serve", "--connect", "<socket>"]` shares one
+daemon/DB/embedding-model across all of them instead — see
+[Shared Daemon Mode](#shared-daemon-mode). `ironmem claude`/`ironmem codex`
+(and the other one-command launchers below) already write the shared-daemon
+form for you.
+
 ### Use with any MCP client
 
 ironmem's core tools — `search`, `status`, the knowledge-graph tools (`kg_query`, `kg_add`, `traverse`, …), diary reads/writes, `get_taxonomy`, and the drawer tools — speak MCP over stdio, so **any MCP-capable client works with no new code**. Cursor, Cline, Windsurf, and others accept a standard `mcpServers` block:
@@ -185,7 +193,16 @@ ironmem claude .                       # launch Claude Code in the current repo
 ironmem codex .                        # launch Codex in the current repo
 ironmem claude . "fix the login bug"   # launch with an initial prompt
 ironmem codex /path/to/repo "add tests"
+ironmem gemini .                       # launch Gemini CLI in the current repo
+ironmem grok .                         # launch Grok in the current repo (early scaffolding)
 ```
+
+`gemini`/`grok` onboard from the same harness registry as `claude`/`codex`
+(see [Current Status](#current-status)) but are newer and less battle-tested:
+Gemini CLI's config convention (`~/.gemini/settings.json`) is confirmed from
+its own docs, while Grok's (`~/.grok/settings.json`) is a best-effort default
+pending a single confirmed "the" Grok CLI MCP config convention. Neither is a
+default `write-rules` target yet.
 
 Each launcher:
 
@@ -235,6 +252,147 @@ ironmem claude . --no-mcp-setup
 > `ironmem claude . -- "--version is broken"`.
 
 The manual MCP setup path remains fully supported.
+
+## Shared Daemon Mode
+
+By default, each MCP client that launches `ironmem serve` gets its own
+in-process server: its own DB connection, its own embedding model load, its
+own memory. That is simple and always works, but N clients (Claude Code,
+Codex, a dashboard, a review agent, …) attached to the same repo means N
+redundant model loads and N separate connections to one database.
+
+**Shared daemon mode** puts one `ironmem` process — one `App`, one DB
+connection, one loaded embedding model — behind a Unix-domain socket, and lets
+every client be a thin proxy that just pumps stdio bytes to that socket. This
+is opt-in and additive: **bare `ironmem serve` (no flags) is unchanged and is
+always the fallback** — nothing about existing setups breaks.
+
+### Flags
+
+| Flag | Meaning |
+|------|---------|
+| `--listen <socket>` | Run as the shared daemon: bind `<socket>`, own the single `App`, serve every connection. |
+| `--connect <socket>` | Run as a thin proxy: connect to `<socket>` and pump stdin/stdout to it. No model load, no direct DB open. |
+| `--no-autospawn` | With `--connect`: if no daemon is listening, fall back to in-process `serve` instead of spawning one. |
+
+`--listen` and `--connect` are mutually exclusive. Both are Unix-only (Unix
+domain sockets); on other platforms the flag is accepted and ignored, falling
+straight through to in-process `serve`.
+
+### The fallback guarantee
+
+`--connect` never leaves a client stuck:
+
+1. **Daemon already running** → connects and proxies. Fast, no model load.
+2. **No daemon, auto-spawn enabled (default)** → single-flight-spawns exactly
+   one detached `ironmem serve --listen <socket>` (even if many clients race
+   to start it at once — see below), waits for it to become ready, then
+   proxies.
+3. **No daemon, auto-spawn disabled** (`--no-autospawn` or
+   `IRONMEM_NO_DAEMON=1`) → transparently answers via in-process `serve`,
+   exactly like bare `ironmem serve` would.
+
+So a client that only ever uses `--connect` still works with zero daemon
+infrastructure present — it just runs in-process, the same as today.
+
+### Auto-spawn and single-flight
+
+When several clients launch around the same time (e.g. Claude Code and Codex
+both attached to one repo), each independently tries `--connect`, finds no
+daemon, and tries to spawn one. An atomic lockfile (`<socket>.lock`) makes
+exactly one of them the winner: it spawns the detached daemon and polls the
+socket until it accepts connections; every other client either connects to
+the (now-ready) daemon directly, or waits briefly on the lock and then
+connects. A lock left behind by a crashed process is detected (its recorded
+pid is dead) and safely recovered — a *live* lock is never stolen.
+
+### Idle shutdown
+
+The daemon tracks its active-connection count and arms an idle timer the
+instant it drops to zero; any new connection disarms it immediately, even one
+accepted in the same instant the timer would have fired. When idle for
+`IRONMEM_DAEMON_IDLE_SECS` (default **300**, i.e. 5 minutes) with no
+connections, it shuts down on its own and removes its own socket and
+lockfile — no separate process manager, cron job, or `kill` required.
+
+### Configuration (env vars)
+
+| Variable | Default | Effect |
+|----------|---------|--------|
+| `IRONMEM_DAEMON_SOCKET` | `<state_dir>/daemon.sock` (i.e. `~/.ironrace-memory/hook_state/daemon.sock`) | Overrides the default socket path used when a config-derived path (rather than an explicit `--listen`/`--connect` argument) is needed. |
+| `IRONMEM_DAEMON_IDLE_SECS` | `300` | Seconds of zero active connections before the daemon shuts itself down. |
+| `IRONMEM_NO_DAEMON` | unset (auto-spawn **enabled**) | Any value other than empty/`0`/`false`/`no` disables auto-spawn — `--connect` then behaves as if `--no-autospawn` were passed. |
+
+### Security and permissions
+
+- The socket is created with **owner-only permissions (`0600`)** — no other
+  local user can connect.
+- A stale socket file (no live listener behind it) is safely replaced on
+  `--listen`; a **live** socket is never unlinked — a second `--listen` on an
+  already-bound path fails loudly instead of silently displacing the running
+  daemon.
+- **Single writer**: the daemon confines its one `App` to a single dedicated
+  thread for its entire lifetime and serializes all dispatch on that thread —
+  there is no lock to reason about, and no possibility of two connections
+  racing a write against the same DB connection.
+- The lockfile used for single-flight auto-spawn carries only a pid (used to
+  detect a dead owner) — no secrets, no credentials.
+
+### Wiring a new harness
+
+Registering a harness's MCP client with the shared-daemon proxy command is
+the same three-element argv every harness gets, derived from the harness
+registry so every install path agrees:
+
+```json
+{
+  "mcpServers": {
+    "ironmem": {
+      "command": "/absolute/path/to/ironmem",
+      "args": ["serve", "--connect", "/absolute/path/to/.ironrace-memory/hook_state/daemon.sock"]
+    }
+  }
+}
+```
+
+```toml
+# Codex-shaped TOML equivalent
+[mcp_servers.ironmem]
+command = "/absolute/path/to/ironmem"
+args = ["serve", "--connect", "/absolute/path/to/.ironrace-memory/hook_state/daemon.sock"]
+
+[mcp_servers.ironmem.env]
+IRONMEM_MCP_MODE = "trusted"
+```
+
+`ironmem claude`, `ironmem codex`, `ironmem gemini`, and `ironmem grok` (the
+last two are early scaffolding — see [Current Status](#current-status))
+already write this for you idempotently. A pre-existing bare `["serve"]`
+entry from before this feature is upgraded in place the next time you run the
+launcher; anything else you've hand-customized is left untouched. Bare
+`serve` (no args) always keeps working as the fallback, so an MCP client that
+doesn't know about `--connect` yet just runs in-process, same as before.
+
+### Troubleshooting
+
+`ironmem doctor` reports the shared daemon's reachability, the auto-spawn
+setting, and — for each registered harness — whether its `ironmem` entry is
+wired with the proxy command or still on the legacy bare `serve` command:
+
+```bash
+ironmem doctor
+```
+
+```
+[ OK ] daemon: shared daemon reachable at /home/you/.ironrace-memory/hook_state/daemon.sock
+[INFO] daemon_autospawn: daemon auto-spawn: enabled
+[ OK ] harness_claude: Claude Code: ironmem MCP server registered in /home/you/.claude.json; wired with the shared-daemon proxy command
+```
+
+No daemon running is reported as `[INFO]`, never a failure — bare `serve` and
+`--connect` (with auto-spawn) both work with nothing listening yet. If a
+harness shows "wired with the legacy bare `serve` command", re-run its
+launcher (`ironmem claude .`, `ironmem codex .`, …) to upgrade it in place.
 
 ## CLI
 
@@ -313,8 +471,12 @@ ironmem harnesses --format=json  # machine-readable, for CI/packaging scripts
 
 Validate a local install in one command. `doctor` reports the binary version,
 database path and schema/migration status, embedding-model cache status, MCP
-access mode, warmup readiness, and which registered harnesses have the
-`ironmem` MCP server registered:
+access mode, warmup readiness, which registered harnesses have the `ironmem`
+MCP server registered (and whether they're wired with the shared-daemon proxy
+command or the legacy bare `serve`), and the shared daemon's own reachability
+and auto-spawn configuration — see
+[Troubleshooting](#troubleshooting) under Shared Daemon Mode for the daemon-
+specific checks:
 
 ```bash
 ironmem doctor          # human-readable diagnostics
@@ -474,6 +636,8 @@ AI agents can query the graph without a shell.
 - Codex and Claude Code plugin packaging is included, including bundled collab skill dependencies
 - `~/.ironrace/bin/ironmem` is the preferred installed binary location; plugin launch scripts check there first
 - Bounded Claude↔Codex collaboration protocol (v1 planning + v3 coding) is available via the `collab_*` MCP tools, including long-poll `wait_my_turn` for autonomous operation — see [docs/COLLAB.md](docs/COLLAB.md)
+- **Shared daemon mode** (`serve --listen`/`--connect`) lets many clients share one `App`/DB/embedding-model behind a Unix socket, with automatic single-flight spawn-on-demand and idle self-shutdown — see [Shared Daemon Mode](#shared-daemon-mode). Bare `serve` is unchanged and remains the always-available fallback.
+- **Grok and Gemini CLI** are registered harnesses (`ironmem grok`/`ironmem gemini`, `harness_grok`/`harness_gemini` in `doctor`) but are scaffolding: neither is a default `write-rules` target yet, and Grok's MCP config convention is a best-effort default rather than a confirmed one — see [First run: one-command launchers](#first-run-one-command-launchers)
 
 ## Shared Memory Across Harnesses
 

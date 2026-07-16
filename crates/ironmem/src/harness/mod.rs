@@ -182,6 +182,42 @@ pub const REGISTRY: &[HarnessSpec] = &[
         occupancy_support: true,
         transcript_parser: TranscriptParserKind::Codex,
     },
+    HarnessSpec {
+        id: "grok",
+        display_name: "Grok",
+        binary: "grok",
+        rules_file: "GROK.md",
+        rules_strategy: RulesStrategy::Import {
+            directive: "@AGENTS.md",
+        },
+        // Scaffolding only (#190 Task 11): not yet a default write-rules
+        // target, and its `.grok-plugin/` packaging is a minimal stand-in —
+        // real Grok CLI integration lands separately.
+        write_rules_default: false,
+        client_info_aliases: &["grok"],
+        env_aliases: &["grok"],
+        additional_context_support: false,
+        occupancy_support: false,
+        transcript_parser: TranscriptParserKind::None,
+    },
+    HarnessSpec {
+        id: "gemini",
+        display_name: "Gemini CLI",
+        binary: "gemini",
+        rules_file: "GEMINI.md",
+        rules_strategy: RulesStrategy::Import {
+            directive: "@AGENTS.md",
+        },
+        // Scaffolding only (#190 Task 11): not yet a default write-rules
+        // target, and its `.gemini-plugin/` packaging is a minimal stand-in —
+        // real Gemini CLI integration lands separately.
+        write_rules_default: false,
+        client_info_aliases: &["gemini"],
+        env_aliases: &["gemini"],
+        additional_context_support: false,
+        occupancy_support: false,
+        transcript_parser: TranscriptParserKind::None,
+    },
 ];
 
 // ---------------------------------------------------------------------------
@@ -322,6 +358,32 @@ pub(crate) fn rules_file_entries(registry: &[HarnessSpec]) -> Result<Vec<RulesFi
     }
 
     Ok(entries)
+}
+
+// ---------------------------------------------------------------------------
+// Proxy MCP registration helper (#190 Task 11)
+// ---------------------------------------------------------------------------
+
+/// Build the canonical `--connect` proxy MCP command args every harness
+/// should register: `["serve", "--connect", <default daemon socket path>]`.
+///
+/// Deliberately does NOT branch on `_harness_id`: every harness gets back the
+/// exact same args for the same `config`, using `Config::daemon_socket_path`
+/// (the same default the `--listen` daemon binds and the auto-spawn path
+/// spawns against — see `crate::config::Config` and `crate::mcp::daemon`).
+/// `_harness_id` is accepted anyway so every registration call site
+/// (`ensure_claude_registered`, `ensure_codex_registered`, and future
+/// grok/gemini launchers, #190 Task 12/13) threads the harness it is
+/// registering through this one seam — a future regression that
+/// accidentally introduces per-harness variation changes this function's
+/// signature/behavior in an obvious, reviewable way, and is caught by
+/// `proxy_command_args_identical_for_every_registry_harness` below.
+pub fn proxy_command_args(_harness_id: &str, config: &crate::config::Config) -> Vec<String> {
+    vec![
+        "serve".to_string(),
+        "--connect".to_string(),
+        config.daemon_socket_path().display().to_string(),
+    ]
 }
 
 // ---------------------------------------------------------------------------
@@ -715,15 +777,17 @@ mod tests {
     // ---- registry_json / registry_text ------------------------------------
 
     #[test]
-    fn registry_json_parses_as_two_entry_array() {
+    fn registry_json_parses_as_four_entry_array() {
         let json = registry_json(REGISTRY).expect("serialization must succeed");
         let val: serde_json::Value =
             serde_json::from_str(&json).expect("output must be valid JSON");
         let arr = val.as_array().expect("top-level must be an array");
-        assert_eq!(arr.len(), 2);
+        assert_eq!(arr.len(), 4, "claude, codex, grok, gemini (#190 Task 11)");
         let ids: Vec<&str> = arr.iter().filter_map(|e| e["id"].as_str()).collect();
         assert!(ids.contains(&"claude"), "must contain claude entry");
         assert!(ids.contains(&"codex"), "must contain codex entry");
+        assert!(ids.contains(&"grok"), "must contain grok entry");
+        assert!(ids.contains(&"gemini"), "must contain gemini entry");
     }
 
     #[test]
@@ -985,6 +1049,117 @@ mod tests {
             args,
             vec!["do it".to_string()],
             "prompt must become the single positional argv"
+        );
+    }
+
+    // ---- #190 Task 11: grok/gemini registry rows + proxy-command helper ---
+
+    #[test]
+    fn registry_contains_grok_spec() {
+        let spec = by_id("grok", REGISTRY).expect("grok must be in REGISTRY");
+        assert_eq!(spec.display_name, "Grok");
+        assert_eq!(spec.binary, "grok");
+        assert_eq!(spec.rules_file, "GROK.md");
+        assert_eq!(
+            spec.rules_strategy,
+            RulesStrategy::Import {
+                directive: "@AGENTS.md"
+            }
+        );
+        assert!(
+            !spec.write_rules_default,
+            "grok is scaffolding-only, not yet a default write-rules target"
+        );
+        assert_eq!(spec.client_info_aliases, &["grok"]);
+        assert_eq!(spec.env_aliases, &["grok"]);
+    }
+
+    #[test]
+    fn registry_contains_gemini_spec() {
+        let spec = by_id("gemini", REGISTRY).expect("gemini must be in REGISTRY");
+        assert_eq!(spec.display_name, "Gemini CLI");
+        assert_eq!(spec.binary, "gemini");
+        assert_eq!(spec.rules_file, "GEMINI.md");
+        assert_eq!(
+            spec.rules_strategy,
+            RulesStrategy::Import {
+                directive: "@AGENTS.md"
+            }
+        );
+        assert!(
+            !spec.write_rules_default,
+            "gemini is scaffolding-only, not yet a default write-rules target"
+        );
+        assert_eq!(spec.client_info_aliases, &["gemini"]);
+        assert_eq!(spec.env_aliases, &["gemini"]);
+    }
+
+    #[test]
+    fn grok_and_gemini_ids_are_valid_harness_slugs() {
+        // Guards against a typo'd/uppercase id shipping undetected, same as
+        // `every_registry_id_is_a_valid_harness_slug` above but scoped to
+        // just the two new rows for a focused failure message.
+        assert!(HarnessId::validate("grok").is_ok());
+        assert!(HarnessId::validate("gemini").is_ok());
+    }
+
+    fn test_config_for_proxy_helper(state_dir: &std::path::Path) -> crate::config::Config {
+        crate::config::Config {
+            db_path: state_dir.join("memory.sqlite3"),
+            model_dir: state_dir.join("models"),
+            model_dir_explicit: false,
+            state_dir: state_dir.to_path_buf(),
+            mcp_access_mode: crate::config::McpAccessMode::ReadOnly,
+            embed_mode: crate::config::EmbedMode::Noop,
+        }
+    }
+
+    #[test]
+    fn proxy_command_args_matches_the_canonical_connect_invocation() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = test_config_for_proxy_helper(dir.path());
+
+        let args = proxy_command_args("claude", &cfg);
+
+        assert_eq!(
+            args,
+            vec![
+                "serve".to_string(),
+                "--connect".to_string(),
+                cfg.daemon_socket_path().display().to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn proxy_command_args_identical_for_every_registry_harness() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = test_config_for_proxy_helper(dir.path());
+
+        let mut results: Vec<Vec<String>> = REGISTRY
+            .iter()
+            .map(|spec| proxy_command_args(spec.id, &cfg))
+            .collect();
+        assert_eq!(results.len(), REGISTRY.len());
+
+        let first = results.pop().expect("REGISTRY is non-empty");
+        assert!(
+            results.into_iter().all(|args| args == first),
+            "every harness id must resolve to the exact same proxy command args"
+        );
+    }
+
+    #[test]
+    fn proxy_command_args_uses_the_default_socket_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = test_config_for_proxy_helper(dir.path());
+
+        let args = proxy_command_args("gemini", &cfg);
+        let socket_arg = args.last().expect("args must end with the socket path");
+        assert_eq!(socket_arg, &cfg.daemon_socket_path().display().to_string());
+        assert!(
+            socket_arg.ends_with("daemon.sock"),
+            "must be Config::daemon_socket_path's default, got: {socket_arg}"
         );
     }
 }
