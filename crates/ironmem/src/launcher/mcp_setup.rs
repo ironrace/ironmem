@@ -117,14 +117,32 @@ pub(crate) fn ensure_claude_registered(
         Some(entry) if !is_bare_serve_json(&entry) => {
             return Ok(RegisterOutcome::AlreadyRegistered)
         }
-        Some(_) => RegisterOutcome::Upgraded,
-        None => RegisterOutcome::Registered,
+        Some(mut entry) => {
+            // Upgrade IN PLACE: mutate only `command`/`args` on the existing
+            // entry object, preserving `env` and any other existing keys
+            // (H2) — e.g. a script-installed `IRONMEM_MCP_MODE=trusted`
+            // survives an automatic upgrade instead of silently reverting to
+            // read-only. Only the fresh-registration (`None`) path below
+            // writes a brand-new object from scratch.
+            let entry_obj = entry.as_object_mut().ok_or_else(|| {
+                MemoryError::Config(format!(
+                    "mcpServers.ironmem in {} is not an object",
+                    config_path.display()
+                ))
+            })?;
+            entry_obj.insert("command".to_string(), serde_json::json!(exe));
+            entry_obj.insert("args".to_string(), serde_json::json!(proxy_args));
+            servers.insert("ironmem".to_string(), entry);
+            RegisterOutcome::Upgraded
+        }
+        None => {
+            servers.insert(
+                "ironmem".to_string(),
+                serde_json::json!({ "command": exe, "args": proxy_args }),
+            );
+            RegisterOutcome::Registered
+        }
     };
-
-    servers.insert(
-        "ironmem".to_string(),
-        serde_json::json!({ "command": exe, "args": proxy_args }),
-    );
 
     let pretty = serde_json::to_string_pretty(&root)
         .map_err(|e| MemoryError::Config(format!("serialize claude config: {e}")))?;
@@ -166,14 +184,25 @@ pub(crate) fn ensure_codex_registered(
 
     let args_toml = toml_string_array(proxy_args);
 
-    if existing
-        .lines()
-        .any(|line| line.trim() == "[mcp_servers.ironmem]")
-    {
-        if let Some(idx) = existing.find(STALE_BARE_SERVE_TOML_LINE) {
+    // H3: scope the stale-line search to the `[mcp_servers.ironmem]` section
+    // itself — from its header to the next `\n[` (or EOF) — mirroring
+    // `doctor::codex_proxy_wiring`'s section-slicing. A whole-file
+    // `existing.find(STALE_BARE_SERVE_TOML_LINE)` would happily rewrite a
+    // DIFFERENT `[mcp_servers.*]` block's `args = ["serve"]` line if one
+    // happened to appear earlier in the file.
+    if let Some(header_idx) = existing.find("[mcp_servers.ironmem]") {
+        let section = &existing[header_idx..];
+        let section_end = section[1..]
+            .find("\n[")
+            .map(|i| i + 1)
+            .unwrap_or(section.len());
+        let scoped = &section[..section_end];
+
+        if let Some(rel_idx) = scoped.find(STALE_BARE_SERVE_TOML_LINE) {
+            let abs_idx = header_idx + rel_idx;
             let mut upgraded = existing.clone();
             upgraded.replace_range(
-                idx..idx + STALE_BARE_SERVE_TOML_LINE.len(),
+                abs_idx..abs_idx + STALE_BARE_SERVE_TOML_LINE.len(),
                 &format!("args = {args_toml}"),
             );
             write_atomic(config_path, &upgraded)?;
@@ -288,6 +317,37 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&cfg).unwrap(), raw);
     }
 
+    /// H2 acceptance: a pre-existing bare `["serve"]` entry that also carries
+    /// an `env` block (e.g. a script-installed `IRONMEM_MCP_MODE=trusted`)
+    /// must keep that `env` block after the automatic upgrade — the upgrade
+    /// must mutate only `args`/`command`, never replace the whole object.
+    #[test]
+    fn claude_upgrade_preserves_existing_env_block() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = dir.path().join(".claude.json");
+        std::fs::write(
+            &cfg,
+            r#"{"mcpServers":{"ironmem":{"command":"/bin/ironmem","args":["serve"],"env":{"IRONMEM_MCP_MODE":"trusted"}}}}"#,
+        )
+        .unwrap();
+        let proxy_args = test_proxy_args();
+
+        let outcome = ensure_claude_registered(&cfg, "/bin/ironmem", &proxy_args).unwrap();
+        assert_eq!(outcome, RegisterOutcome::Upgraded);
+
+        let v: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&cfg).unwrap()).unwrap();
+        assert_eq!(
+            v["mcpServers"]["ironmem"]["args"],
+            serde_json::json!(proxy_args)
+        );
+        assert_eq!(
+            v["mcpServers"]["ironmem"]["env"]["IRONMEM_MCP_MODE"].as_str(),
+            Some("trusted"),
+            "env block must survive the automatic args upgrade"
+        );
+    }
+
     /// A hand-customized (or already-upgraded-with-different-args) entry must
     /// NEVER be silently rewritten — only the exact stale `["serve"]` shape
     /// is eligible for automatic upgrade.
@@ -364,6 +424,40 @@ mod tests {
         let second = ensure_codex_registered(&cfg, "/bin/ironmem", &proxy_args).unwrap();
         assert_eq!(second, RegisterOutcome::AlreadyRegistered);
         assert_eq!(std::fs::read_to_string(&cfg).unwrap(), body);
+    }
+
+    /// H3 acceptance: a stale bare-serve `[mcp_servers.ironmem]` block that
+    /// comes AFTER an unrelated `[mcp_servers.other]` block (which also has
+    /// `args = ["serve"]`) must only have ITS OWN line upgraded — the other
+    /// section's args must be left untouched. Before the fix, a whole-file
+    /// `existing.find(STALE_BARE_SERVE_TOML_LINE)` would match the FIRST
+    /// occurrence in the file, which belongs to `other`, and corrupt it.
+    #[test]
+    fn codex_upgrade_is_scoped_to_the_ironmem_section_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = dir.path().join("config.toml");
+        std::fs::write(
+            &cfg,
+            "[mcp_servers.other]\ncommand = \"/bin/other\"\nargs = [\"serve\"]\n\n[mcp_servers.ironmem]\ncommand = \"/bin/ironmem\"\nargs = [\"serve\"]\n\n[mcp_servers.ironmem.env]\nIRONMEM_MCP_MODE = \"trusted\"\n",
+        )
+        .unwrap();
+        let proxy_args = test_proxy_args();
+
+        let outcome = ensure_codex_registered(&cfg, "/bin/ironmem", &proxy_args).unwrap();
+        assert_eq!(outcome, RegisterOutcome::Upgraded);
+
+        let body = std::fs::read_to_string(&cfg).unwrap();
+        let other_section_end = body.find("[mcp_servers.ironmem]").unwrap();
+        let other_section = &body[..other_section_end];
+        assert!(
+            other_section.contains("args = [\"serve\"]"),
+            "unrelated section's args must be untouched, got:\n{body}"
+        );
+        let ironmem_section = &body[other_section_end..];
+        assert!(
+            ironmem_section.contains(&format!("args = {}", toml_string_array(&proxy_args))),
+            "ironmem section's args must be upgraded, got:\n{body}"
+        );
     }
 
     /// A hand-customized args line must never be silently rewritten.
