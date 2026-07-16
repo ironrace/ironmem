@@ -132,6 +132,22 @@ pub(crate) fn ensure_claude_registered(
     Ok(outcome)
 }
 
+/// Ensure `mcpServers.ironmem` exists in ANY config file that shares Claude's
+/// exact `mcpServers`-JSON shape (#190 Task 13) — Gemini CLI's
+/// `~/.gemini/settings.json` and, best-effort, Grok CLI's
+/// `~/.grok/settings.json` both use this same top-level `mcpServers` object.
+/// `ensure_claude_registered` is the historical name (Claude was first and
+/// remains the primary/most-tested caller); this is a thin, more honestly-named
+/// alias so non-Claude call sites don't read as if they were registering
+/// Claude specifically.
+pub(crate) fn ensure_json_mcpservers_registered(
+    config_path: &Path,
+    exe: &str,
+    proxy_args: &[String],
+) -> Result<RegisterOutcome, MemoryError> {
+    ensure_claude_registered(config_path, exe, proxy_args)
+}
+
 /// Ensure a `[mcp_servers.ironmem]` block exists in a Codex `config.toml`.
 /// Appends (never rewrites existing content) so manual edits survive.
 /// Idempotent; upgrades a stale bare `args = ["serve"]` line in place (see

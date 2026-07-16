@@ -13,10 +13,23 @@ use crate::error::MemoryError;
 use crate::{config, ingest, mcp};
 
 /// The assistant a launcher targets.
+///
+/// Each variant's behavior (`spec`/`binary`/`label`) is entirely
+/// registry-driven (#190 Task 13): `harness_id` is the only per-variant
+/// mapping, and everything else comes from `crate::harness::REGISTRY` via
+/// `spec()`. `Grok`/`Gemini` onboard the same way Claude/Codex already did —
+/// one registry row (added in Task 11) plus one `harness_id` mapping here.
+/// The enum itself (and clap's `Commands::Grok`/`Commands::Gemini` in
+/// `main.rs`) still needs one variant per launchable harness: clap subcommands
+/// are compile-time, so the CLI surface can't be generated from a runtime
+/// registry without a larger redesign (e.g. a single generic `launch
+/// --harness <id>` subcommand) — out of scope here.
 #[derive(Debug, Clone, Copy)]
 pub enum Harness {
     Claude,
     Codex,
+    Grok,
+    Gemini,
 }
 
 impl Harness {
@@ -26,6 +39,8 @@ impl Harness {
         match self {
             Harness::Claude => "claude",
             Harness::Codex => "codex",
+            Harness::Grok => "grok",
+            Harness::Gemini => "gemini",
         }
     }
 
@@ -99,11 +114,40 @@ fn claude_config_path() -> Result<PathBuf, MemoryError> {
     Ok(home.join(".claude.json"))
 }
 
+/// Resolve the Gemini CLI config path: `~/.gemini/settings.json`. This is
+/// Gemini CLI's documented global settings file, with a top-level
+/// `mcpServers` object in the exact same shape Claude's `~/.claude.json` uses
+/// — hence `ensure_json_mcpservers_registered` reuses the same writer.
+fn gemini_config_path() -> Result<PathBuf, MemoryError> {
+    let home = dirs::home_dir()
+        .ok_or_else(|| MemoryError::Config("cannot determine home directory".into()))?;
+    Ok(home.join(".gemini").join("settings.json"))
+}
+
+/// Resolve a best-effort Grok CLI config path: `~/.grok/settings.json`.
+///
+/// Unlike Claude/Codex/Gemini, there is no single confirmed "the" Grok CLI
+/// config convention as of #190 Task 13 — multiple tools answer to "grok
+/// cli" (xAI's own "Grok Build" agent vs. community projects), and
+/// documentation for either's MCP client config is thin. `.grok/settings.json`
+/// with an `mcpServers` key is `superagent-ai/grok-cli`'s documented
+/// convention and the best-effort default here; grok registration is
+/// deliberately scaffolding (`write_rules_default: false` on its registry
+/// row) until a real, confirmed convention narrows this down.
+fn grok_config_path() -> Result<PathBuf, MemoryError> {
+    let home = dirs::home_dir()
+        .ok_or_else(|| MemoryError::Config("cannot determine home directory".into()))?;
+    Ok(home.join(".grok").join("settings.json"))
+}
+
 /// Ensure the ironmem MCP server is registered for `harness`, idempotently.
 ///
 /// Registers the shared-daemon proxy command (`harness::proxy_command_args` —
 /// `["serve", "--connect", <socket>]`), the canonical invocation every
-/// harness should converge on (#190 Task 11/12).
+/// harness should converge on (#190 Task 11/12). Claude, Gemini CLI, and
+/// (best-effort) Grok CLI all share the same `mcpServers`-JSON config shape,
+/// so all three route through `ensure_json_mcpservers_registered`; only Codex
+/// uses a different (TOML) format.
 fn register(harness: Harness) -> Result<mcp_setup::RegisterOutcome, MemoryError> {
     let exe = std::env::current_exe()
         .map_err(|e| MemoryError::Config(format!("cannot resolve ironmem path: {e}")))?;
@@ -112,10 +156,16 @@ fn register(harness: Harness) -> Result<mcp_setup::RegisterOutcome, MemoryError>
     let proxy_args = crate::harness::proxy_command_args(harness.harness_id(), &cfg);
     match harness {
         Harness::Claude => {
-            mcp_setup::ensure_claude_registered(&claude_config_path()?, &exe, &proxy_args)
+            mcp_setup::ensure_json_mcpservers_registered(&claude_config_path()?, &exe, &proxy_args)
         }
         Harness::Codex => {
             mcp_setup::ensure_codex_registered(&codex_config_path()?, &exe, &proxy_args)
+        }
+        Harness::Gemini => {
+            mcp_setup::ensure_json_mcpservers_registered(&gemini_config_path()?, &exe, &proxy_args)
+        }
+        Harness::Grok => {
+            mcp_setup::ensure_json_mcpservers_registered(&grok_config_path()?, &exe, &proxy_args)
         }
     }
 }
@@ -231,6 +281,20 @@ mod tests {
         assert_eq!(Harness::Codex.label(), "Codex");
     }
 
+    /// #190 Task 13 acceptance: grok/gemini launchers resolve from the
+    /// registry (added in Task 11) exactly the way Claude/Codex already do —
+    /// one registry row, one `harness_id` mapping, everything else derived.
+    #[test]
+    fn grok_and_gemini_harness_resolve_from_registry() {
+        assert_eq!(Harness::Grok.harness_id(), "grok");
+        assert_eq!(Harness::Grok.binary(), "grok");
+        assert_eq!(Harness::Grok.label(), "Grok");
+
+        assert_eq!(Harness::Gemini.harness_id(), "gemini");
+        assert_eq!(Harness::Gemini.binary(), "gemini");
+        assert_eq!(Harness::Gemini.label(), "Gemini CLI");
+    }
+
     #[test]
     fn harness_id_resolves_via_registry() {
         let claude_spec =
@@ -246,6 +310,35 @@ mod tests {
         assert_eq!(codex_spec.id, "codex");
         assert_eq!(codex_spec.binary, "codex");
         assert_eq!(codex_spec.display_name, "Codex");
+
+        let grok_spec = crate::harness::by_id(Harness::Grok.harness_id(), crate::harness::REGISTRY)
+            .expect("grok must be in REGISTRY");
+        assert_eq!(grok_spec.id, "grok");
+
+        let gemini_spec =
+            crate::harness::by_id(Harness::Gemini.harness_id(), crate::harness::REGISTRY)
+                .expect("gemini must be in REGISTRY");
+        assert_eq!(gemini_spec.id, "gemini");
+    }
+
+    #[test]
+    fn grok_config_path_defaults_to_home_grok_settings() {
+        let path = grok_config_path().unwrap();
+        assert!(
+            path.ends_with(".grok/settings.json"),
+            "got: {}",
+            path.display()
+        );
+    }
+
+    #[test]
+    fn gemini_config_path_defaults_to_home_gemini_settings() {
+        let path = gemini_config_path().unwrap();
+        assert!(
+            path.ends_with(".gemini/settings.json"),
+            "got: {}",
+            path.display()
+        );
     }
 
     const GEMINI_SPEC: HarnessSpec = HarnessSpec {

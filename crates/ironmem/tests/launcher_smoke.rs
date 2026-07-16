@@ -285,6 +285,92 @@ fn codex_launcher_registers_mcp_server_by_default() {
     );
 }
 
+/// #190 Task 13 acceptance: the grok launcher resolves from the registry
+/// (Task 11's row) and registers the shared-daemon proxy command exactly like
+/// Claude/Gemini's JSON `mcpServers` writer.
+#[test]
+fn grok_launcher_registers_mcp_server_by_default() {
+    let temp = tempfile::tempdir().unwrap();
+    let home = temp.path().join("home");
+    let db_path = temp.path().join("memory.sqlite3");
+    let bin_dir = temp.path().join("bin");
+    let repo = temp.path().join("repo");
+    let record = temp.path().join("rec");
+    std::fs::create_dir_all(&home).unwrap();
+    std::fs::create_dir_all(&bin_dir).unwrap();
+    std::fs::create_dir_all(&repo).unwrap();
+    std::fs::write(repo.join("README.md"), "# repo\ncontent to mine").unwrap();
+    write_stub(&bin_dir, "grok", &record, 0);
+
+    let out = launcher_command(&home, &db_path, &bin_dir)
+        .arg("grok")
+        .arg(&repo)
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "grok launcher failed: {out:?}");
+    assert!(std::fs::metadata(format!("{}.cwd", record.display())).is_ok());
+
+    let cfg_path = home.join(".grok").join("settings.json");
+    let cfg = std::fs::read_to_string(&cfg_path)
+        .unwrap_or_else(|e| panic!("launcher should create {}: {e}", cfg_path.display()));
+    let v: serde_json::Value = serde_json::from_str(&cfg).unwrap();
+    let server = &v["mcpServers"]["ironmem"];
+    assert!(
+        server.is_object(),
+        "ironmem MCP server should be registered: {cfg}"
+    );
+    let expected_socket = home
+        .join(".ironrace-memory")
+        .join("hook_state")
+        .join("daemon.sock");
+    assert_eq!(
+        server["args"],
+        serde_json::json!(["serve", "--connect", expected_socket.display().to_string()])
+    );
+}
+
+/// Same acceptance for the gemini launcher.
+#[test]
+fn gemini_launcher_registers_mcp_server_by_default() {
+    let temp = tempfile::tempdir().unwrap();
+    let home = temp.path().join("home");
+    let db_path = temp.path().join("memory.sqlite3");
+    let bin_dir = temp.path().join("bin");
+    let repo = temp.path().join("repo");
+    let record = temp.path().join("rec");
+    std::fs::create_dir_all(&home).unwrap();
+    std::fs::create_dir_all(&bin_dir).unwrap();
+    std::fs::create_dir_all(&repo).unwrap();
+    std::fs::write(repo.join("README.md"), "# repo\ncontent to mine").unwrap();
+    write_stub(&bin_dir, "gemini", &record, 0);
+
+    let out = launcher_command(&home, &db_path, &bin_dir)
+        .arg("gemini")
+        .arg(&repo)
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "gemini launcher failed: {out:?}");
+    assert!(std::fs::metadata(format!("{}.cwd", record.display())).is_ok());
+
+    let cfg_path = home.join(".gemini").join("settings.json");
+    let cfg = std::fs::read_to_string(&cfg_path)
+        .unwrap_or_else(|e| panic!("launcher should create {}: {e}", cfg_path.display()));
+    let v: serde_json::Value = serde_json::from_str(&cfg).unwrap();
+    let server = &v["mcpServers"]["ironmem"];
+    assert!(
+        server.is_object(),
+        "ironmem MCP server should be registered: {cfg}"
+    );
+    let expected_socket = home
+        .join(".ironrace-memory")
+        .join("hook_state")
+        .join("daemon.sock");
+    assert_eq!(
+        server["args"],
+        serde_json::json!(["serve", "--connect", expected_socket.display().to_string()])
+    );
+}
+
 #[test]
 fn claude_launcher_preinjects_context_when_area_requested() {
     let temp = tempfile::tempdir().unwrap();

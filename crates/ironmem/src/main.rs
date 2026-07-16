@@ -201,6 +201,46 @@ enum Commands {
         #[arg(long, default_value_t = ironmem::context::DEFAULT_BUDGET_TOKENS)]
         budget: usize,
     },
+    /// Launch Grok in a repo with the ironmem MCP server attached (scaffolding — #190 Task 13)
+    Grok {
+        /// Repository path to launch in
+        #[arg(default_value = ".")]
+        path: String,
+        /// Optional initial prompt for the session
+        prompt: Option<String>,
+        /// Skip ensuring the ironmem MCP server is registered (use existing manual setup)
+        #[arg(long)]
+        no_mcp_setup: bool,
+        /// Code-map area to pre-inject context for (repeatable)
+        #[arg(long = "area")]
+        areas: Vec<String>,
+        /// Disable compact context pre-injection into the initial prompt
+        #[arg(long)]
+        no_context: bool,
+        /// Approximate token budget for pre-injected context
+        #[arg(long, default_value_t = ironmem::context::DEFAULT_BUDGET_TOKENS)]
+        budget: usize,
+    },
+    /// Launch Gemini CLI in a repo with the ironmem MCP server attached
+    Gemini {
+        /// Repository path to launch in
+        #[arg(default_value = ".")]
+        path: String,
+        /// Optional initial prompt for the session
+        prompt: Option<String>,
+        /// Skip ensuring the ironmem MCP server is registered (use existing manual setup)
+        #[arg(long)]
+        no_mcp_setup: bool,
+        /// Code-map area to pre-inject context for (repeatable)
+        #[arg(long = "area")]
+        areas: Vec<String>,
+        /// Disable compact context pre-injection into the initial prompt
+        #[arg(long)]
+        no_context: bool,
+        /// Approximate token budget for pre-injected context
+        #[arg(long, default_value_t = ironmem::context::DEFAULT_BUDGET_TOKENS)]
+        budget: usize,
+    },
 }
 
 /// Subcommands nested under `ironmem memory`.
@@ -511,6 +551,42 @@ async fn run(cli: Cli) -> Result<(), MemoryError> {
             budget,
         } => launcher::run_launcher(
             launcher::Harness::Codex,
+            &path,
+            prompt,
+            launcher::LaunchOptions {
+                no_mcp_setup,
+                no_context,
+                areas,
+                budget_tokens: budget,
+            },
+        ),
+        Commands::Grok {
+            path,
+            prompt,
+            no_mcp_setup,
+            areas,
+            no_context,
+            budget,
+        } => launcher::run_launcher(
+            launcher::Harness::Grok,
+            &path,
+            prompt,
+            launcher::LaunchOptions {
+                no_mcp_setup,
+                no_context,
+                areas,
+                budget_tokens: budget,
+            },
+        ),
+        Commands::Gemini {
+            path,
+            prompt,
+            no_mcp_setup,
+            areas,
+            no_context,
+            budget,
+        } => launcher::run_launcher(
+            launcher::Harness::Gemini,
             &path,
             prompt,
             launcher::LaunchOptions {
