@@ -7,6 +7,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Shared-daemon mode for `ironmem serve` (#190).** `serve --listen <socket>`
+  runs as a long-lived daemon binding a Unix socket; `serve --connect <socket>`
+  is a thin proxy that pumps bytes between the harness's stdio and that
+  daemon, starting in milliseconds regardless of daemon startup cost. If no
+  daemon is listening, `--connect` single-flight auto-spawns one under an
+  atomic lockfile (`<socket>.lock`) so many clients launched at once converge
+  on exactly one shared daemon and one shared database, instead of one
+  `ironmem` process per client. Falls back transparently to the original
+  in-process stdio server when `--no-autospawn` is set (or
+  `IRONMEM_NO_DAEMON` is truthy) and no daemon is reachable. New env vars:
+  `IRONMEM_DAEMON_SOCKET` (override the default `<state_dir>/daemon.sock`),
+  `IRONMEM_DAEMON_IDLE_SECS` (override the 300s idle-shutdown window), and
+  `IRONMEM_NO_DAEMON` (disable auto-spawn). `ironmem doctor` gained a daemon
+  health probe and per-harness proxy-wiring checks.
+- **`ironmem grok` / `ironmem gemini` launchers.** Registry-backed launchers
+  for Grok CLI and Gemini CLI alongside the existing Claude/Codex launchers,
+  all registering the shared-daemon proxy command by default.
+- **Fresh MCP registrations now default to the shared-daemon proxy command**
+  (`serve --connect <socket>`) instead of bare `serve`, for Claude, Codex,
+  Gemini, and Grok. A pre-existing bare `["serve"]` entry from before this
+  change is upgraded in place on the next registration; anything else
+  (already-upgraded or hand-customized) is left untouched. Bare `serve`
+  itself remains a fully-supported fallback.
+
 ### Changed
 
 - **`AGENTS.md` is now canonical for harness rules.** `ironmem write-rules`

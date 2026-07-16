@@ -151,6 +151,15 @@ codex` already writes this form for you, and upgrades a pre-existing bare
 [Shared Daemon Mode](../README.md#shared-daemon-mode) in the main README for
 the full flag/env-var reference, the fallback guarantee, and security notes.
 
+**Access mode is daemon-process-global, not per-client.** `IRONMEM_MCP_MODE`
+is read once, from whichever process's environment happened to spawn the
+shared daemon first. Every OTHER client that later connects to that same
+daemon gets that mode too, even if ITS OWN `IRONMEM_MCP_MODE` env differs —
+there is currently no per-connection access-mode override. If you need
+different clients to have different access modes, give them separate sockets
+(`IRONMEM_DAEMON_SOCKET` or `--listen`/`--connect` pointed at distinct paths)
+rather than relying on per-client env with a shared daemon.
+
 Leave `IRONMEM_DB_PATH` unset to use the shared default store
 (`~/.ironrace-memory/memory.sqlite3`). Set it only when you want an isolated
 store — for example a project-local path, or a Codex-only database as shown in
