@@ -156,3 +156,45 @@ fn plugin_versions_match_cargo_toml() {
         "claude plugin.json version ({claude_version}) must match Cargo.toml ({cargo_version})"
     );
 }
+
+/// Return the text between the first two `---` fences of a markdown file.
+fn frontmatter(raw: &str) -> Option<&str> {
+    let rest = raw.strip_prefix("---")?;
+    let end = rest.find("\n---")?;
+    Some(&rest[..end])
+}
+
+/// Read-only Claude review sub-agents must advertise an explicit lean tool
+/// allowlist that excludes every ironmem MCP tool (issue #189). A missing
+/// `tools:` key means the agent inherits the full MCP surface — including
+/// memory tools — which is exactly the drift this guards against.
+#[test]
+fn claude_review_agents_advertise_lean_profile() {
+    let review_agents = [
+        "code-reviewer",
+        "architect",
+        "doc-reviewer",
+        "security-reviewer",
+    ];
+    for agent in review_agents {
+        let rel = format!(".claude-plugin/agents/{agent}.md");
+        let path = workspace_root().join(&rel);
+        let raw = std::fs::read_to_string(&path)
+            .unwrap_or_else(|_| panic!("Could not read {}", path.display()));
+        let front =
+            frontmatter(&raw).unwrap_or_else(|| panic!("{rel}: missing YAML frontmatter block"));
+        let tools_line = front
+            .lines()
+            .find(|l| l.trim_start().starts_with("tools:"))
+            .unwrap_or_else(|| {
+                panic!(
+                    "{rel}: review agent must declare an explicit `tools:` allowlist \
+                     so it does not inherit the full MCP surface (issue #189)"
+                )
+            });
+        assert!(
+            !tools_line.contains("ironmem"),
+            "{rel}: review agent `tools:` must not list any ironmem MCP tool (found: {tools_line})"
+        );
+    }
+}
