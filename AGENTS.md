@@ -40,6 +40,18 @@ Preferred tools:
 - If `status` shows `warming_up: true`, avoid write-heavy memory actions until warmup completes.
 - Poll `status` and wait for `warming_up: false` before relying on embedding-dependent tools such as semantic search or drawer writes.
 
+## Shared Daemon Transport
+
+`ironmem serve` supports an opt-in shared-daemon mode (`--listen`/`--connect`)
+so multiple attached harnesses can share one `App`/DB/embedding-model behind a
+Unix socket instead of each loading its own. Bare `serve` (no flags) is
+unaffected and remains the always-available fallback — this does not change
+the Shared Memory Protocol above. See
+[Shared Daemon Mode](README.md#shared-daemon-mode) for flags, env vars
+(`IRONMEM_DAEMON_IDLE_SECS`, `IRONMEM_NO_DAEMON`), the fallback guarantee, and
+security notes; `ironmem doctor` reports daemon reachability and per-harness
+proxy-command wiring.
+
 ## Collab and Superpowers model defaults
 
 For `/collab` and its bundled Superpowers workflows, use explicit phase-based

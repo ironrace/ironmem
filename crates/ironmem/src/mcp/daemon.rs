@@ -175,15 +175,31 @@ async fn prepare_socket_path(path: &Path) -> Result<(), MemoryError> {
         Err(e) => return Err(MemoryError::Io(e)),
     };
 
-    // Probe: a successful connect means a live daemon is listening.
-    if UnixStream::connect(path).await.is_ok() {
-        return Err(MemoryError::Config(format!(
-            "daemon already running at {}",
-            path.display()
-        )));
+    // Probe: a successful connect means a live daemon is listening. Retried a
+    // few times with a short delay rather than a single attempt: under heavy
+    // system contention (many concurrent processes starving this host of
+    // scheduling), a momentarily-slow-but-alive listener's `accept()` can be
+    // delayed just long enough for a single `connect()` probe to time out /
+    // get refused even though the daemon is genuinely up. A single failed
+    // probe there would misjudge a LIVE daemon as stale and unlink its
+    // socket out from under it — observed as an intermittent lost write in
+    // the auto-spawn race integration test under a fully parallel `cargo
+    // test --workspace` run. A truly dead socket (no listener at all) fails
+    // EVERY attempt just as fast, so this adds negligible latency to the
+    // common (dead-socket) case while closing that race.
+    for attempt in 0..5 {
+        if UnixStream::connect(path).await.is_ok() {
+            return Err(MemoryError::Config(format!(
+                "daemon already running at {}",
+                path.display()
+            )));
+        }
+        if attempt + 1 < 5 {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
     }
 
-    // Connect failed -> stale. Only unlink a genuine socket file.
+    // Every probe attempt failed -> stale. Only unlink a genuine socket file.
     if meta.file_type().is_socket() {
         std::fs::remove_file(path).map_err(MemoryError::Io)?;
         Ok(())

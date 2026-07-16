@@ -30,7 +30,11 @@ Codex is one registered harness in the `REGISTRY` constant
   `codex-final` row per session, cached tokens subtracted from input).
 
 Run `ironmem harnesses --format=json` to inspect the current registry at any
-time.
+time. The registry also carries `grok` and `gemini` rows (`GROK.md`/`GEMINI.md`
+via `@AGENTS.md` import, `write_rules_default: false`) — scaffolding for the
+`ironmem grok`/`ironmem gemini` launchers, not yet default `write-rules`
+targets. See [First run: one-command launchers](../README.md#first-run-one-command-launchers)
+in the main README.
 
 ## Current Support Level
 
@@ -114,7 +118,8 @@ The hooks are diff-aware:
 
 Add a server entry to your Codex MCP config.
 
-Example `~/.codex/config.toml` fragment:
+Example `~/.codex/config.toml` fragment (one in-process server per client —
+always works, no other moving parts):
 
 ```toml
 [mcp_servers.ironmem]
@@ -124,6 +129,27 @@ args = ["serve"]
 [mcp_servers.ironmem.env]
 IRONMEM_MCP_MODE = "trusted"
 ```
+
+If Codex shares this repo with other MCP clients (Claude Code, a dashboard,
+…), point Codex at the shared daemon proxy instead so they all use one
+DB/embedding-model:
+
+```toml
+[mcp_servers.ironmem]
+command = "/absolute/path/to/.ironrace/bin/ironmem"
+args = ["serve", "--connect", "/absolute/path/to/.ironrace-memory/hook_state/daemon.sock"]
+
+[mcp_servers.ironmem.env]
+IRONMEM_MCP_MODE = "trusted"
+```
+
+The daemon is spawned automatically on first connect (single-flight, so
+multiple clients racing to start it still converge on one), and shuts itself
+down after `IRONMEM_DAEMON_IDLE_SECS` (default 300s) of no connections. `ironmem
+codex` already writes this form for you, and upgrades a pre-existing bare
+`["serve"]` entry in place. See
+[Shared Daemon Mode](../README.md#shared-daemon-mode) in the main README for
+the full flag/env-var reference, the fallback guarantee, and security notes.
 
 Leave `IRONMEM_DB_PATH` unset to use the shared default store
 (`~/.ironrace-memory/memory.sqlite3`). Set it only when you want an isolated
@@ -216,6 +242,13 @@ Embedding-dependent tools (`search`, `add_drawer`, diary writes) return `{"warmi
 - `IRONMEM_EMBED_MODE=noop` disables the ONNX embedder entirely (useful for process-level tests or smoke runs without the model).
 - `IRONMEM_AUTO_BOOTSTRAP=0` disables the automatic bootstrap on `serve` start.
 - `IRONMEM_DISABLE_MIGRATION=1` disables the first-run mempalace migration.
+- `IRONMEM_DAEMON_SOCKET` overrides the shared daemon's default socket path
+  (`<state_dir>/daemon.sock`, i.e. `~/.ironrace-memory/hook_state/daemon.sock`).
+- `IRONMEM_DAEMON_IDLE_SECS` (default `300`) — seconds an idle shared daemon
+  (zero active connections) waits before shutting itself down.
+- `IRONMEM_NO_DAEMON` — set to any value other than empty/`0`/`false`/`no` to
+  disable `serve --connect`'s auto-spawn (equivalent to always passing
+  `--no-autospawn`); see [Shared Daemon Mode](../README.md#shared-daemon-mode).
 
 ## Codex Packaging Gap
 

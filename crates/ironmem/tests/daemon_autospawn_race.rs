@@ -34,10 +34,19 @@ fn base_command(home: &Path, db_path: &Path, sock: &Path) -> Command {
         .env("IRONMEM_EMBED_MODE", "noop")
         .env("IRONMEM_MCP_MODE", "trusted")
         .env("IRONMEM_AUTO_BOOTSTRAP", "0")
-        // Short idle window: the auto-spawned daemon should clean itself up
-        // quickly once this test's proxies all disconnect, rather than
-        // lingering as an orphaned background process for the default 300s.
-        .env("IRONMEM_DAEMON_IDLE_SECS", "3")
+        // Idle window: the auto-spawned daemon should clean itself up after
+        // this test's proxies all disconnect, rather than lingering as an
+        // orphaned background process for the default 300s. NOT razor-thin:
+        // the daemon's idle timer arms the instant it starts (by design —
+        // see mcp::daemon::serve_accept_loop — a `--listen` daemon nobody
+        // ever connects to must still clean itself up), so under a heavily
+        // parallel `cargo test --workspace` run, 5 real subprocesses racing
+        // to fork/exec/connect can occasionally take longer than a very
+        // short window to land their first connection. 10s gives that real
+        // OS-scheduling jitter comfortable headroom while still keeping the
+        // test itself fast (it does not wait out the full window on the
+        // happy path — only the trailing self-cleanup check does).
+        .env("IRONMEM_DAEMON_IDLE_SECS", "10")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null());
@@ -161,11 +170,12 @@ fn concurrent_proxies_single_flight_one_daemon_and_share_one_db() {
         );
     }
 
-    // Hygiene: the auto-spawned daemon's idle timer (3s, set above) should
+    // Hygiene: the auto-spawned daemon's idle timer (10s, set above) should
     // clean it up shortly after every proxy above disconnected. Give it a
-    // generous bound and confirm no orphaned daemon process or socket file is
-    // left behind.
-    for _ in 0..50 {
+    // generous bound (comfortably longer than the idle window itself, plus
+    // scheduling slack under a busy `cargo test --workspace` run) and confirm
+    // no orphaned daemon process or socket file is left behind.
+    for _ in 0..150 {
         if count_daemon_processes(&sock) == 0 {
             break;
         }

@@ -106,7 +106,13 @@ fn admitted_connection_near_idle_boundary_is_served_not_dropped() {
     let sock = temp.path().join("daemon.sock");
     std::fs::create_dir_all(&home).unwrap();
 
-    let idle_secs = 2;
+    // Not razor-thin: the idle timer arms the instant the daemon starts (by
+    // design), so under a heavily parallel `cargo test --workspace` run,
+    // real OS-scheduling jitter for this subprocess to actually bind and for
+    // our own `connect_with_retry` to land could eat into a very short
+    // window. 6s keeps the boundary meaningfully "near" while giving that
+    // jitter comfortable headroom.
+    let idle_secs = 6;
     let mut listen_cmd = Command::new(bin());
     listen_cmd
         .arg("serve")
