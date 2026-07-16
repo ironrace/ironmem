@@ -739,6 +739,11 @@ mod tests {
                 "warmup",
                 "harness_claude",
                 "harness_codex",
+                // grok + gemini added to REGISTRY by #190 Task 11 (scaffolding
+                // only; detection is "not yet implemented" -> Info, same as
+                // any registry entry beyond claude/codex).
+                "harness_grok",
+                "harness_gemini",
             ],
             "the toolable check-key set must stay stable"
         );

@@ -2314,8 +2314,10 @@ mod tests {
         // "codex" is matched exactly in the sibling tests; here "codex-cli" must
         // also omit additionalContext because it is classified as the codex spec
         // (via client_info alias substring match) which has additional_context_support=false.
-        // An unrecognized harness ("gemini") falls back to the claude spec and must
-        // still emit (additional_context_support=true).
+        // An unrecognized harness ("unknown-harness-xyz" — "gemini" is now a
+        // REAL registered harness, #190 Task 11, so it can no longer stand in
+        // for "unrecognized") falls back to the claude spec and must still
+        // emit (additional_context_support=true).
         let temp = tempfile::tempdir().unwrap();
         let workspace = temp.path().join("workspace");
         std::fs::create_dir_all(&workspace).unwrap();
@@ -2345,7 +2347,7 @@ mod tests {
             "codex-* prefix must omit additionalContext"
         );
         assert!(
-            emits("gemini"),
+            emits("unknown-harness-xyz"),
             "non-codex harness must emit additionalContext"
         );
     }

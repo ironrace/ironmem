@@ -615,8 +615,11 @@ mod tests {
     #[test]
     fn env_metrics_harness_delegate_unknown_returns_none() {
         // An unregistered value produces None, so `mcp_harness` also falls
-        // back to its default for unknown IRONMEM_HARNESS values.
-        let result = crate::harness::canonicalize_input("gemini", crate::harness::REGISTRY);
+        // back to its default for unknown IRONMEM_HARNESS values. "gemini" is
+        // now a REAL registered harness (#190 Task 11); use a placeholder id
+        // that is genuinely absent from REGISTRY instead.
+        let result =
+            crate::harness::canonicalize_input("not-a-real-harness", crate::harness::REGISTRY);
         assert!(result.is_none());
     }
 

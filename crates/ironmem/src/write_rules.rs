@@ -890,7 +890,9 @@ mod tests {
 
     #[test]
     fn resolve_write_targets_unknown_harness_errors() {
-        let err = resolve_write_targets(None, Some("gemini"), REGISTRY).unwrap_err();
+        // "gemini" is now a REAL registered harness (#190 Task 11); use a
+        // placeholder id that is genuinely absent from REGISTRY instead.
+        let err = resolve_write_targets(None, Some("not-a-real-harness"), REGISTRY).unwrap_err();
         assert!(matches!(err, MemoryError::Validation(_)));
         let msg = err.to_string();
         assert!(
