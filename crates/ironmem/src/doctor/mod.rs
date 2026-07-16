@@ -105,6 +105,73 @@ pub fn run_doctor(cfg: &Config) -> DoctorReport {
     DoctorReport { checks }
 }
 
+/// Extend [`run_doctor`]'s report with the shared-daemon health probe and
+/// auto-spawn configuration (#190 Task 14). Async because probing the daemon
+/// needs a real Unix-socket connect + `initialize` round trip; every other
+/// check in `run_doctor` is synchronous file/DB I/O and is unaffected — this
+/// wrapper exists so `run_doctor` itself, and its many existing synchronous
+/// callers/tests, stay untouched.
+#[cfg(unix)]
+pub async fn run_doctor_with_daemon(cfg: &Config) -> DoctorReport {
+    let mut report = run_doctor(cfg);
+    let socket_path = cfg.daemon_socket_path();
+    let health =
+        crate::mcp::daemon::probe_daemon_health(&socket_path, Duration::from_millis(500)).await;
+    report.checks.push(daemon_check(&socket_path, health));
+    report.checks.push(autospawn_check(cfg));
+    report
+}
+
+/// Non-Unix fallback (#190 Task 10): no Unix-domain-socket transport exists on
+/// this platform, so the daemon check reports that directly instead of
+/// attempting a probe that could never succeed.
+#[cfg(not(unix))]
+pub async fn run_doctor_with_daemon(cfg: &Config) -> DoctorReport {
+    let mut report = run_doctor(cfg);
+    report.checks.push(Check::new(
+        "daemon",
+        CheckStatus::Info,
+        "shared daemon not supported on this platform (Unix-domain sockets only)",
+    ));
+    report.checks.push(autospawn_check(cfg));
+    report
+}
+
+#[cfg(unix)]
+fn daemon_check(socket_path: &Path, health: crate::mcp::daemon::DaemonHealth) -> Check {
+    match health {
+        crate::mcp::daemon::DaemonHealth::Reachable => Check::new(
+            "daemon",
+            CheckStatus::Ok,
+            format!("shared daemon reachable at {}", socket_path.display()),
+        ),
+        crate::mcp::daemon::DaemonHealth::Unreachable => Check::new(
+            "daemon",
+            CheckStatus::Info,
+            format!("no shared daemon running at {}", socket_path.display()),
+        )
+        .with_hint("a `serve --connect` proxy will auto-spawn one on demand, unless disabled"),
+    }
+}
+
+/// Report whether `serve --connect` auto-spawn is currently enabled
+/// (`Config::daemon_autospawn_enabled`, `IRONMEM_NO_DAEMON`).
+fn autospawn_check(cfg: &Config) -> Check {
+    if cfg.daemon_autospawn_enabled() {
+        Check::new(
+            "daemon_autospawn",
+            CheckStatus::Info,
+            "daemon auto-spawn: enabled",
+        )
+    } else {
+        Check::new(
+            "daemon_autospawn",
+            CheckStatus::Info,
+            "daemon auto-spawn: disabled (IRONMEM_NO_DAEMON)",
+        )
+    }
+}
+
 /// Build the per-harness doctor checks by iterating the registry.
 ///
 /// Detection strategy is dispatched per harness `id`:
@@ -136,7 +203,12 @@ fn harness_checks(home: Option<&Path>, registry: &[crate::harness::HarnessSpec])
                 "claude" => match home {
                     Some(h) => {
                         let path = h.join(".claude.json");
-                        harness_check(key, spec.display_name, &path, detect_claude(&path))
+                        let state = detect_claude(&path);
+                        with_proxy_wiring_note(
+                            harness_check(key, spec.display_name, &path, state.clone()),
+                            &state,
+                            || claude_proxy_wiring(&path),
+                        )
                     }
                     None => Check::new(
                         key,
@@ -145,7 +217,14 @@ fn harness_checks(home: Option<&Path>, registry: &[crate::harness::HarnessSpec])
                     ),
                 },
                 "codex" => match codex_config_path(home) {
-                    Some(path) => harness_check(key, spec.display_name, &path, detect_codex(&path)),
+                    Some(path) => {
+                        let state = detect_codex(&path);
+                        with_proxy_wiring_note(
+                            harness_check(key, spec.display_name, &path, state.clone()),
+                            &state,
+                            || codex_proxy_wiring(&path),
+                        )
+                    }
                     None => Check::new(
                         key,
                         CheckStatus::Info,
@@ -163,6 +242,65 @@ fn harness_checks(home: Option<&Path>, registry: &[crate::harness::HarnessSpec])
             }
         })
         .collect()
+}
+
+/// Append a "wired with the shared-daemon proxy command?" note (#190 Task 14)
+/// to `check`'s summary, but ONLY when `state` is [`HarnessState::Registered`]
+/// — an absent/unreadable/malformed config has nothing meaningful to say
+/// about wiring. `detect_wiring` is called lazily (only when registered) and
+/// may return `None` if the config couldn't be re-read/parsed for this
+/// narrower question, in which case the summary is left as-is.
+fn with_proxy_wiring_note(
+    mut check: Check,
+    state: &HarnessState,
+    detect_wiring: impl FnOnce() -> Option<bool>,
+) -> Check {
+    if *state == HarnessState::Registered {
+        if let Some(is_wired) = detect_wiring() {
+            check.summary = format!("{}; {}", check.summary, proxy_wiring_note(is_wired));
+        }
+    }
+    check
+}
+
+fn proxy_wiring_note(is_wired: bool) -> &'static str {
+    if is_wired {
+        "wired with the shared-daemon proxy command"
+    } else {
+        "wired with the legacy bare `serve` command (upgrade available via `ironmem claude`/`ironmem codex`)"
+    }
+}
+
+/// Whether Claude's registered `ironmem` entry uses the shared-daemon proxy
+/// command (`args[1] == "--connect"`) rather than bare `["serve"]` or
+/// something else. `None` if the config can't be read/parsed at all (should
+/// not happen here — `detect_claude` already proved it parses as
+/// `Registered` before this is called, but this stays independently
+/// fallible rather than assuming that).
+fn claude_proxy_wiring(path: &Path) -> Option<bool> {
+    let raw = std::fs::read_to_string(path).ok()?;
+    let v: serde_json::Value = serde_json::from_str(&raw).ok()?;
+    let args = v
+        .get("mcpServers")?
+        .get("ironmem")?
+        .get("args")?
+        .as_array()?;
+    Some(args.get(1).and_then(|a| a.as_str()) == Some("--connect"))
+}
+
+/// Whether Codex's registered `ironmem` entry uses the shared-daemon proxy
+/// command. Scoped to the `[mcp_servers.ironmem]` section specifically (not a
+/// whole-file substring search) so an unrelated section mentioning
+/// `--connect` can never produce a false positive.
+fn codex_proxy_wiring(path: &Path) -> Option<bool> {
+    let raw = std::fs::read_to_string(path).ok()?;
+    let start = raw.find("[mcp_servers.ironmem]")?;
+    let section = &raw[start..];
+    let end = section[1..]
+        .find("\n[")
+        .map(|i| i + 1)
+        .unwrap_or(section.len());
+    Some(section[..end].contains("--connect"))
 }
 
 fn check_binary(version: &str) -> Check {
@@ -328,7 +466,7 @@ fn check_warmup(database: CheckStatus, model: CheckStatus) -> Check {
 /// Resolution of a harness config file's registration state. Distinguishing
 /// "absent" from "present but unreadable/malformed" is deliberate: collapsing
 /// them would report a config we simply could not inspect as "no config".
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum HarnessState {
     /// The config file does not exist.
     Absent,
@@ -747,5 +885,298 @@ mod tests {
             ],
             "the toolable check-key set must stay stable"
         );
+    }
+
+    // ---- #190 Task 14: proxy-wiring detection ------------------------------
+
+    #[test]
+    fn claude_proxy_wiring_detects_connect_arg() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(".claude.json");
+        std::fs::write(
+            &path,
+            r#"{"mcpServers":{"ironmem":{"command":"ironmem","args":["serve","--connect","/tmp/d.sock"]}}}"#,
+        )
+        .unwrap();
+        assert_eq!(claude_proxy_wiring(&path), Some(true));
+    }
+
+    #[test]
+    fn claude_proxy_wiring_detects_bare_serve() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(".claude.json");
+        std::fs::write(
+            &path,
+            r#"{"mcpServers":{"ironmem":{"command":"ironmem","args":["serve"]}}}"#,
+        )
+        .unwrap();
+        assert_eq!(claude_proxy_wiring(&path), Some(false));
+    }
+
+    #[test]
+    fn claude_proxy_wiring_none_when_unparseable() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(".claude.json");
+        std::fs::write(&path, "{ not valid json").unwrap();
+        assert_eq!(claude_proxy_wiring(&path), None);
+    }
+
+    #[test]
+    fn codex_proxy_wiring_detects_connect_arg() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            "[mcp_servers.ironmem]\ncommand = \"ironmem\"\nargs = [\"serve\", \"--connect\", \"/tmp/d.sock\"]\n",
+        )
+        .unwrap();
+        assert_eq!(codex_proxy_wiring(&path), Some(true));
+    }
+
+    #[test]
+    fn codex_proxy_wiring_detects_bare_serve() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            "[mcp_servers.ironmem]\ncommand = \"ironmem\"\nargs = [\"serve\"]\n",
+        )
+        .unwrap();
+        assert_eq!(codex_proxy_wiring(&path), Some(false));
+    }
+
+    /// A `--connect` mention in some OTHER section must never produce a false
+    /// positive for the `ironmem` section specifically.
+    #[test]
+    fn codex_proxy_wiring_scoped_to_ironmem_section_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            "[mcp_servers.other]\nargs = [\"--connect\", \"unrelated\"]\n\n[mcp_servers.ironmem]\ncommand = \"ironmem\"\nargs = [\"serve\"]\n",
+        )
+        .unwrap();
+        assert_eq!(
+            codex_proxy_wiring(&path),
+            Some(false),
+            "the ironmem section itself has no --connect; the other section's must not leak in"
+        );
+    }
+
+    #[test]
+    fn harness_checks_notes_proxy_wiring_for_registered_claude() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path();
+        std::fs::write(
+            home.join(".claude.json"),
+            r#"{"mcpServers":{"ironmem":{"command":"ironmem","args":["serve","--connect","/tmp/d.sock"]}}}"#,
+        )
+        .unwrap();
+
+        let checks = harness_checks(Some(home), crate::harness::REGISTRY);
+        let claude = checks
+            .iter()
+            .find(|c| c.name == "harness_claude")
+            .expect("harness_claude check must exist");
+        assert!(
+            claude
+                .summary
+                .contains("wired with the shared-daemon proxy command"),
+            "got: {}",
+            claude.summary
+        );
+    }
+
+    #[test]
+    fn harness_checks_flags_legacy_bare_serve_for_registered_codex() {
+        let dir = tempfile::tempdir().unwrap();
+        // Set CODEX_HOME explicitly (rather than clearing it) so this test
+        // is deterministic regardless of the ambient environment — no other
+        // test in this crate touches CODEX_HOME, so this doesn't race.
+        let codex_home = dir.path().join("codex-home");
+        std::fs::create_dir_all(&codex_home).unwrap();
+        std::env::set_var("CODEX_HOME", &codex_home);
+        std::fs::write(
+            codex_home.join("config.toml"),
+            "[mcp_servers.ironmem]\ncommand = \"ironmem\"\nargs = [\"serve\"]\n",
+        )
+        .unwrap();
+
+        let checks = harness_checks(Some(dir.path()), crate::harness::REGISTRY);
+        let codex = checks
+            .iter()
+            .find(|c| c.name == "harness_codex")
+            .expect("harness_codex check must exist");
+        assert!(
+            codex.summary.contains("legacy bare `serve` command"),
+            "got: {}",
+            codex.summary
+        );
+        std::env::remove_var("CODEX_HOME");
+    }
+
+    #[test]
+    fn harness_checks_no_wiring_note_when_not_registered() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path();
+        // No .claude.json at all -> Absent, not Registered.
+        let checks = harness_checks(Some(home), crate::harness::REGISTRY);
+        let claude = checks
+            .iter()
+            .find(|c| c.name == "harness_claude")
+            .expect("harness_claude check must exist");
+        assert!(!claude.summary.contains("wired with"));
+    }
+
+    // ---- #190 Task 14: run_doctor_with_daemon ------------------------------
+
+    fn test_doctor_config(dir: &Path) -> Config {
+        Config {
+            db_path: dir.join("m.sqlite3"),
+            model_dir: dir.join("models"),
+            model_dir_explicit: true,
+            state_dir: dir.join("state"),
+            mcp_access_mode: McpAccessMode::ReadOnly,
+            embed_mode: EmbedMode::Noop,
+        }
+    }
+
+    #[tokio::test]
+    async fn run_doctor_with_daemon_reports_unreachable_when_no_daemon() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = test_doctor_config(dir.path());
+
+        let report = run_doctor_with_daemon(&cfg).await;
+        let daemon = report
+            .checks
+            .iter()
+            .find(|c| c.name == "daemon")
+            .expect("daemon check must exist");
+        assert_eq!(daemon.status, CheckStatus::Info);
+        assert!(daemon.summary.contains("no shared daemon running"));
+        assert!(
+            !daemon.status.is_blocking(),
+            "no daemon running is advisory, not blocking"
+        );
+    }
+
+    /// #190 Task 14 acceptance: probing a running daemon reports reachable
+    /// AND does not disturb its recorded attribution — this daemon-level
+    /// guarantee is proven directly in `mcp::daemon`'s
+    /// `health_probe_does_not_disturb_another_connections_attribution`; here
+    /// we confirm `doctor`'s own wiring reports `Ok`/"reachable" through the
+    /// full `run_doctor_with_daemon` seam.
+    #[tokio::test]
+    async fn run_doctor_with_daemon_reports_reachable_for_running_daemon() {
+        use crate::mcp::app::App;
+        use crate::mcp::daemon::{bind_daemon_listener, serve_accept_loop};
+        use std::sync::Arc;
+        use tokio::sync::oneshot;
+
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = test_doctor_config(dir.path());
+        // Default derivation: `<state_dir>/daemon.sock` — no env override
+        // needed (and none used, so this can't race config.rs's own
+        // IRONMEM_DAEMON_SOCKET-mutating tests, which guard that var with a
+        // dedicated lock this module doesn't share).
+        let socket_path = cfg.daemon_socket_path();
+        let socket_path_thread = socket_path.clone();
+
+        // `Arc<App>` is `!Send` (App is `!Sync`), so the daemon MUST run on
+        // its own dedicated thread with its own runtime — never
+        // `tokio::spawn`ed onto this test's own (multi-thread) runtime. This
+        // mirrors every daemon-binding test in `mcp::daemon`.
+        let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+        let daemon = std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            rt.block_on(async move {
+                #[allow(clippy::arc_with_non_send_sync)]
+                let app = Arc::new(App::open_for_test().unwrap());
+                let listener = bind_daemon_listener(&socket_path_thread).await.unwrap();
+                serve_accept_loop(
+                    app,
+                    listener,
+                    std::time::Duration::from_secs(600),
+                    shutdown_rx,
+                )
+                .await
+                .unwrap();
+            });
+        });
+        for _ in 0..200 {
+            if socket_path.exists() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+
+        let report = run_doctor_with_daemon(&cfg).await;
+        let daemon_check = report
+            .checks
+            .iter()
+            .find(|c| c.name == "daemon")
+            .expect("daemon check must exist");
+        assert_eq!(daemon_check.status, CheckStatus::Ok);
+        assert!(daemon_check.summary.contains("reachable"));
+
+        shutdown_tx.send(()).ok();
+        tokio::task::spawn_blocking(move || daemon.join().unwrap())
+            .await
+            .unwrap();
+    }
+
+    #[test]
+    fn autospawn_check_reports_enabled_and_disabled() {
+        std::env::remove_var("IRONMEM_NO_DAEMON");
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = test_doctor_config(dir.path());
+        assert_eq!(autospawn_check(&cfg).status, CheckStatus::Info);
+        assert!(autospawn_check(&cfg).summary.contains("enabled"));
+
+        std::env::set_var("IRONMEM_NO_DAEMON", "1");
+        assert!(autospawn_check(&cfg).summary.contains("disabled"));
+        std::env::remove_var("IRONMEM_NO_DAEMON");
+    }
+
+    /// #190 Task 14 acceptance: doctor JSON includes the new daemon +
+    /// per-harness wired keys, appended after the existing stable key set, in
+    /// a stable order.
+    #[tokio::test]
+    async fn run_doctor_with_daemon_includes_new_keys_in_stable_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = test_doctor_config(dir.path());
+
+        let report = run_doctor_with_daemon(&cfg).await;
+        let names: Vec<&str> = report.checks.iter().map(|c| c.name).collect();
+        assert_eq!(
+            names,
+            vec![
+                "binary",
+                "database",
+                "model",
+                "mcp_access",
+                "warmup",
+                "harness_claude",
+                "harness_codex",
+                "harness_grok",
+                "harness_gemini",
+                "daemon",
+                "daemon_autospawn",
+            ]
+        );
+
+        // Also confirm the JSON serialization round-trips these keys.
+        let json = serde_json::to_string(&report).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let json_names: Vec<&str> = v["checks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|c| c["name"].as_str())
+            .collect();
+        assert_eq!(json_names, names);
     }
 }

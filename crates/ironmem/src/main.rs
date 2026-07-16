@@ -487,7 +487,9 @@ async fn run(cli: Cli) -> Result<(), MemoryError> {
         }
         Commands::Doctor { db, json } => {
             let cfg = config::Config::load(db)?;
-            let report = ironmem::doctor::run_doctor(&cfg);
+            // #190 Task 14: extends run_doctor with the shared-daemon health
+            // probe + auto-spawn config, which need an async socket connect.
+            let report = ironmem::doctor::run_doctor_with_daemon(&cfg).await;
             if json {
                 println!("{}", serde_json::to_string_pretty(&report)?);
             } else {
