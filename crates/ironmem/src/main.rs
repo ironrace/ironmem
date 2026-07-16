@@ -319,13 +319,9 @@ async fn run(cli: Cli) -> Result<(), MemoryError> {
     match cli.command {
         Commands::Serve {
             db,
-            // TODO(#190 Task 8/10): wire proxy/connect (--connect) and autospawn
-            // (--no-autospawn) dispatch. --listen (daemon-bind) is wired below;
-            // --connect / --no-autospawn still fall through to the in-process
-            // stdio server.
             listen,
-            connect: _connect,
-            no_autospawn: _no_autospawn,
+            connect,
+            no_autospawn,
         } => {
             let cfg = config::Config::load(db)?;
 
@@ -345,6 +341,27 @@ async fn run(cli: Cli) -> Result<(), MemoryError> {
             // fallback); consume the flag so the in-process stdio server runs.
             #[cfg(not(unix))]
             let _ = listen;
+
+            // `--connect <socket>`: run as a thin proxy (Unix only, Task 8).
+            // `no_autospawn` (CLI flag) forces auto-spawn off regardless of the
+            // `IRONMEM_NO_DAEMON` env var; otherwise the env-derived Config
+            // setting decides. A successful proxy session returns straight
+            // from here; `FallbackToInProcess` (no daemon + autospawn disabled)
+            // falls through to the same in-process stdio server used by bare
+            // `serve`, below.
+            #[cfg(unix)]
+            if let Some(sock) = connect {
+                let socket_path = std::path::PathBuf::from(sock);
+                let autospawn_enabled = !no_autospawn && cfg.daemon_autospawn_enabled();
+                match mcp::daemon::run_connect_mode(&socket_path, autospawn_enabled).await? {
+                    mcp::daemon::ProxyOutcome::Proxied => return Ok(()),
+                    mcp::daemon::ProxyOutcome::FallbackToInProcess => {}
+                }
+            }
+            // On non-unix, `--connect` has no proxy transport yet (Task 10 adds
+            // a fallback); consume the flags so the in-process stdio server runs.
+            #[cfg(not(unix))]
+            let _ = (connect, no_autospawn);
 
             // Phase 1: fast server-ready init (DB open + schema migrate, ~50ms).
             // App is not Sync (single-threaded stdio server, block_in_place dispatch).

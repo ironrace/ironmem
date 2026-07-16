@@ -386,12 +386,113 @@ pub fn run_daemon(
     result
 }
 
+// ---------------------------------------------------------------------------
+// `--connect` thin proxy (Task 8).
+//
+// The proxy does NO model load and opens NO direct DB connection: it is just
+// two byte pumps wired between the harness's stdio and the daemon's Unix
+// socket, so a `--connect` client starts in milliseconds regardless of how
+// heavy the shared daemon's `App` is.
+
+/// Outcome of attempting the `--connect` transport.
+#[cfg(unix)]
+#[derive(Debug, PartialEq, Eq)]
+pub enum ProxyOutcome {
+    /// Connected to a live daemon and proxied until either side hit EOF.
+    Proxied,
+    /// No live daemon and auto-spawn is disabled: the caller must fall
+    /// through to an in-process `run_server` instead.
+    FallbackToInProcess,
+}
+
+/// Pump bytes between `local_in`/`local_out` (the harness's stdio in
+/// production; injectable in tests) and `stream` (the daemon connection)
+/// until EOF on EITHER side. Deliberately `select!`, not `try_join!`: a
+/// client that closes its stdin, or a daemon that closes the connection,
+/// should end the proxy immediately rather than waiting on the other,
+/// now-orphaned pump.
+#[cfg(unix)]
+async fn pump_proxy<R, W>(
+    stream: UnixStream,
+    mut local_in: R,
+    mut local_out: W,
+) -> Result<(), MemoryError>
+where
+    R: tokio::io::AsyncRead + Unpin,
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    let (mut sock_read, mut sock_write) = tokio::io::split(stream);
+    let to_socket = tokio::io::copy(&mut local_in, &mut sock_write);
+    let from_socket = tokio::io::copy(&mut sock_read, &mut local_out);
+
+    tokio::select! {
+        result = to_socket => { result.map_err(MemoryError::Io)?; }
+        result = from_socket => { result.map_err(MemoryError::Io)?; }
+    }
+    Ok(())
+}
+
+/// Core `--connect` decision, parameterized over the local reader/writer so it
+/// is directly testable without redirecting the real process stdio. Production
+/// use goes through [`run_connect_mode`].
+///
+/// - Connect succeeds -> proxy the connection; returns [`ProxyOutcome::Proxied`]
+///   once the connection ends.
+/// - Connect fails AND `autospawn_enabled` is `false` -> returns
+///   [`ProxyOutcome::FallbackToInProcess`] so the caller runs the in-process
+///   stdio server instead (no daemon, and the caller was told not to spawn one).
+/// - Connect fails AND `autospawn_enabled` is `true` -> propagates the connect
+///   error. Task 9 replaces this arm with single-flight auto-spawn + retry;
+///   until then there is no daemon to spawn from this seam.
+#[cfg(unix)]
+async fn run_connect_mode_io<R, W>(
+    socket_path: &Path,
+    autospawn_enabled: bool,
+    local_in: R,
+    local_out: W,
+) -> Result<ProxyOutcome, MemoryError>
+where
+    R: tokio::io::AsyncRead + Unpin,
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    match UnixStream::connect(socket_path).await {
+        Ok(stream) => {
+            pump_proxy(stream, local_in, local_out).await?;
+            Ok(ProxyOutcome::Proxied)
+        }
+        Err(e) if !autospawn_enabled => {
+            tracing::info!(
+                "no daemon at {} ({e}); auto-spawn disabled, falling back to in-process serve",
+                socket_path.display()
+            );
+            Ok(ProxyOutcome::FallbackToInProcess)
+        }
+        Err(e) => Err(MemoryError::Io(e)),
+    }
+}
+
+/// Production `--connect` entry point: proxies the real process stdio.
+#[cfg(unix)]
+pub async fn run_connect_mode(
+    socket_path: &Path,
+    autospawn_enabled: bool,
+) -> Result<ProxyOutcome, MemoryError> {
+    run_connect_mode_io(
+        socket_path,
+        autospawn_enabled,
+        tokio::io::stdin(),
+        tokio::io::stdout(),
+    )
+    .await
+}
+
 #[cfg(all(test, unix))]
 mod daemon_tests {
     use super::*;
     use std::io::{BufRead, BufReader as StdBufReader, Write};
     use std::os::unix::net::UnixStream as StdUnixStream;
     use std::time::Duration;
+    use tokio::io::AsyncWriteExt;
 
     /// Poll-connect with bounded retries so we never race a not-yet-bound
     /// daemon and never rely on a fixed sleep.
@@ -693,6 +794,106 @@ mod daemon_tests {
             "first live listener's socket must remain connectable"
         );
         drop(first);
+    }
+
+    /// Task 8 acceptance: with a live daemon, `run_connect_mode_io` proxies an
+    /// `initialize` round trip and returns `Proxied`. The proxy task is
+    /// `tokio::spawn`ed (it touches no `!Send` `App`) so the test can write the
+    /// request, read the response, and only THEN close the local input side —
+    /// avoiding a race between "client closed stdin" and "response arrived".
+    #[tokio::test]
+    async fn connect_mode_proxies_initialize_against_running_daemon() {
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("daemon.sock");
+        let sock_thread = sock.clone();
+
+        let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+        let daemon = std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            rt.block_on(async move {
+                #[allow(clippy::arc_with_non_send_sync)]
+                let app = Arc::new(App::open_for_test().unwrap());
+                let listener = bind_daemon_listener(&sock_thread).await.unwrap();
+                serve_accept_loop(app, listener, Duration::from_secs(600), shutdown_rx)
+                    .await
+                    .unwrap();
+            });
+        });
+
+        for _ in 0..200 {
+            if sock.exists() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        let (mut test_write_in, proxy_read_in) = tokio::io::duplex(4096);
+        let (proxy_write_out, test_read_out) = tokio::io::duplex(4096);
+
+        let sock_for_task = sock.clone();
+        let proxy_task = tokio::spawn(async move {
+            run_connect_mode_io(&sock_for_task, true, proxy_read_in, proxy_write_out).await
+        });
+
+        test_write_in
+            .write_all(b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{}}\n")
+            .await
+            .unwrap();
+        test_write_in.flush().await.unwrap();
+
+        let mut out_reader = tokio::io::BufReader::new(test_read_out);
+        let mut line = String::new();
+        tokio::io::AsyncBufReadExt::read_line(&mut out_reader, &mut line)
+            .await
+            .unwrap();
+        assert!(
+            line.contains("\"protocolVersion\""),
+            "proxied response should carry the protocol version: {line}"
+        );
+
+        // Only now signal EOF on the input side, so the race described above
+        // cannot cause this test to observe a truncated response.
+        test_write_in.shutdown().await.unwrap();
+        let outcome = proxy_task.await.unwrap().unwrap();
+        assert_eq!(outcome, ProxyOutcome::Proxied);
+
+        shutdown_tx.send(()).ok();
+        daemon.join().unwrap();
+    }
+
+    /// Task 8 acceptance: no daemon listening + auto-spawn disabled ->
+    /// `run_connect_mode_io` reports `FallbackToInProcess` instead of erroring,
+    /// so the caller can transparently answer via `run_server_io` in-process.
+    #[tokio::test]
+    async fn connect_mode_falls_back_when_no_daemon_and_autospawn_disabled() {
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("no-daemon-here.sock");
+
+        let (client_in, client_out) = tokio::io::duplex(4096);
+        let outcome = run_connect_mode_io(&sock, false, client_in, client_out)
+            .await
+            .expect("fallback path must not error");
+        assert_eq!(outcome, ProxyOutcome::FallbackToInProcess);
+    }
+
+    /// When auto-spawn IS enabled but no daemon is reachable, Task 8 has no
+    /// spawn logic yet (that's Task 9) — the connect error must propagate
+    /// rather than being silently swallowed, so a future regression that
+    /// accidentally treats "autospawn enabled" the same as "disabled" is
+    /// caught here.
+    #[tokio::test]
+    async fn connect_mode_propagates_error_when_autospawn_enabled_and_no_daemon() {
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("no-daemon-here.sock");
+
+        let (client_in, client_out) = tokio::io::duplex(4096);
+        let err = run_connect_mode_io(&sock, true, client_in, client_out)
+            .await
+            .expect_err("no daemon + autospawn enabled must propagate the connect error");
+        assert!(matches!(err, MemoryError::Io(_)));
     }
 }
 
