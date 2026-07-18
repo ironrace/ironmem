@@ -478,6 +478,241 @@ def test_classify_path_does_not_strip_trailing_newline_before_matching():
     assert hook.classify_path(path) == hook.UNKNOWN
 
 
+# --- Task 3: resolve_gates -- unknown phase raises -----------------------
+
+
+def test_resolve_gates_unknown_phase_raises():
+    changes = hook.ChangeSet(paths=(), unknown=False, reason=None)
+    with pytest.raises(ValueError):
+        hook.resolve_gates("typo-phase", changes)
+
+
+def test_resolve_gates_empty_phase_string_raises():
+    changes = hook.ChangeSet(paths=(), unknown=False, reason=None)
+    with pytest.raises(ValueError):
+        hook.resolve_gates("", changes)
+
+
+# --- Task 3: resolve_gates -- phase filtering tested both directions -----
+
+
+def test_resolve_gates_pre_commit_excludes_pre_push_only_gate():
+    changes = hook.ChangeSet(
+        paths=("crates/ironmem/src/hook.rs",), unknown=False, reason=None
+    )
+    names = [gate.name for gate in hook.resolve_gates(hook.PHASE_PRE_COMMIT, changes)]
+    assert names == ["rust_fmt_check", "rust_clippy"]
+    assert "rust_test" not in names
+
+
+def test_resolve_gates_pre_push_excludes_pre_commit_only_gates():
+    changes = hook.ChangeSet(
+        paths=("crates/ironmem/src/hook.rs",), unknown=False, reason=None
+    )
+    names = [gate.name for gate in hook.resolve_gates(hook.PHASE_PRE_PUSH, changes)]
+    assert names == ["rust_test"]
+    assert "rust_fmt_check" not in names
+    assert "rust_clippy" not in names
+
+
+# --- Task 3: resolve_gates -- docs inert, unknown dominates ---------------
+
+
+def test_resolve_gates_docs_only_selects_no_gates():
+    # No gate in today's manifest is marked always=True (see
+    # test_manifest_no_gate_marked_always_yet), so an all-docs change with a
+    # known shape selects nothing: DOCS is inert, not an escalation trigger.
+    changes = hook.ChangeSet(paths=("README.md",), unknown=False, reason=None)
+    assert hook.resolve_gates(hook.PHASE_PRE_COMMIT, changes) == ()
+    assert hook.resolve_gates(hook.PHASE_PRE_PUSH, changes) == ()
+
+
+def test_resolve_gates_docs_plus_code_path_does_not_skip():
+    changes = hook.ChangeSet(
+        paths=("README.md", "crates/ironmem/src/hook.rs"), unknown=False, reason=None
+    )
+    names = [gate.name for gate in hook.resolve_gates(hook.PHASE_PRE_COMMIT, changes)]
+    assert names == ["rust_fmt_check", "rust_clippy"]
+
+
+def test_resolve_gates_unrecognized_path_alone_runs_every_gate_for_phase():
+    # "notes.txt" is a safe shape but classifies UNKNOWN (no declared surface
+    # matches it). classify_path()'s UNKNOWN is the escalation signal, same
+    # as changes.unknown=True -- it forces every phase-matching gate to run.
+    changes = hook.ChangeSet(paths=("notes.txt",), unknown=False, reason=None)
+    result = hook.resolve_gates(hook.PHASE_PRE_COMMIT, changes)
+    expected = tuple(gate for gate in hook.GATES if hook.PHASE_PRE_COMMIT in gate.phases)
+    assert result == expected
+
+
+def test_resolve_gates_docs_plus_unrecognized_runs_every_gate_unknown_dominates():
+    changes = hook.ChangeSet(
+        paths=("README.md", "notes.txt"), unknown=False, reason=None
+    )
+    result = hook.resolve_gates(hook.PHASE_PRE_PUSH, changes)
+    expected = tuple(gate for gate in hook.GATES if hook.PHASE_PRE_PUSH in gate.phases)
+    assert result == expected
+
+
+# --- Task 3: resolve_gates -- changes.unknown=True dominates paths --------
+
+
+def test_resolve_gates_unknown_true_selects_full_phase_set_regardless_of_paths():
+    changes = hook.ChangeSet(paths=("README.md",), unknown=True, reason="git diff failed")
+    result = hook.resolve_gates(hook.PHASE_PRE_COMMIT, changes)
+    expected = tuple(gate for gate in hook.GATES if hook.PHASE_PRE_COMMIT in gate.phases)
+    assert result == expected
+
+
+def test_resolve_gates_unknown_true_with_empty_paths_selects_full_phase_set():
+    changes = hook.ChangeSet(paths=(), unknown=True, reason="malformed stdin")
+    result = hook.resolve_gates(hook.PHASE_PRE_PUSH, changes)
+    expected = tuple(gate for gate in hook.GATES if hook.PHASE_PRE_PUSH in gate.phases)
+    assert result == expected
+
+
+# --- Task 3: resolve_gates -- empty paths, unknown=False escalates nothing
+
+
+def test_resolve_gates_empty_paths_unknown_false_selects_only_always_gates():
+    changes = hook.ChangeSet(paths=(), unknown=False, reason=None)
+    assert hook.resolve_gates(hook.PHASE_PRE_COMMIT, changes) == ()
+    assert hook.resolve_gates(hook.PHASE_PRE_PUSH, changes) == ()
+
+
+# --- Task 3: resolve_gates -- output order is manifest order, invariant to
+# input path order and duplicates; dedupe never changes the result ---------
+
+
+def test_resolve_gates_output_order_is_manifest_order_invariant_to_input_order():
+    forward = hook.ChangeSet(
+        paths=("crates/ironmem/src/hook.rs", "docs/COLLAB.md"),
+        unknown=False,
+        reason=None,
+    )
+    reordered = hook.ChangeSet(
+        paths=("docs/COLLAB.md", "crates/ironmem/src/hook.rs"),
+        unknown=False,
+        reason=None,
+    )
+    result_forward = hook.resolve_gates(hook.PHASE_PRE_COMMIT, forward)
+    result_reordered = hook.resolve_gates(hook.PHASE_PRE_COMMIT, reordered)
+    assert result_forward == result_reordered
+    # Manifest order (see test_manifest_declaration_order_is_preserved), not
+    # input order: collab_template_lint is declared before the rust gates.
+    assert [gate.name for gate in result_forward] == [
+        "collab_template_lint",
+        "rust_fmt_check",
+        "rust_clippy",
+    ]
+
+
+def test_resolve_gates_output_invariant_to_duplicate_paths():
+    deduped = hook.ChangeSet(
+        paths=("crates/ironmem/src/hook.rs",), unknown=False, reason=None
+    )
+    duplicated = hook.ChangeSet(
+        paths=(
+            "crates/ironmem/src/hook.rs",
+            "crates/ironmem/src/hook.rs",
+            "crates/ironmem/src/hook.rs",
+        ),
+        unknown=False,
+        reason=None,
+    )
+    assert hook.resolve_gates(hook.PHASE_PRE_COMMIT, deduped) == hook.resolve_gates(
+        hook.PHASE_PRE_COMMIT, duplicated
+    )
+
+
+def test_resolve_gates_dedupes_by_first_seen_not_by_sorting():
+    # Monkeypatch-free: assert on classify_path call order via a spy that
+    # wraps the real function, proving resolve_gates visits each distinct
+    # path exactly once, in first-seen order -- never a sorted order, which
+    # would reorder "notes_b.txt" before "notes_a.txt".
+    calls: list[str] = []
+    original = hook.classify_path
+
+    def spy(path):
+        calls.append(path)
+        return original(path)
+
+    changes = hook.ChangeSet(
+        paths=("notes_b.txt", "notes_a.txt", "notes_b.txt", "notes_a.txt"),
+        unknown=False,
+        reason=None,
+    )
+    real_classify_path = hook.classify_path
+    hook.classify_path = spy
+    try:
+        hook.resolve_gates(hook.PHASE_PRE_COMMIT, changes)
+    finally:
+        hook.classify_path = real_classify_path
+
+    assert calls == ["notes_b.txt", "notes_a.txt"]
+
+
+# --- Task 3: resolve_gates -- overlapping surfaces select each gate once --
+
+
+def test_resolve_gates_overlapping_surfaces_select_each_gate_exactly_once():
+    # Two different paths that both classify to SURFACE_HOOK_SELF_TEST must
+    # not duplicate hook_self_test / hook_install_check in the result.
+    changes = hook.ChangeSet(
+        paths=("scripts/run_git_hook.py", "scripts/install-git-hooks.sh"),
+        unknown=False,
+        reason=None,
+    )
+    result = hook.resolve_gates(hook.PHASE_PRE_COMMIT, changes)
+    names = [gate.name for gate in result]
+    assert names == ["hook_self_test", "hook_install_check"]
+    assert len(names) == len(set(names))
+
+
+# --- Task 3: resolve_gates -- returns a new tuple, never mutates inputs ---
+
+
+def test_resolve_gates_returns_a_tuple():
+    changes = hook.ChangeSet(paths=(), unknown=True, reason="test")
+    result = hook.resolve_gates(hook.PHASE_PRE_COMMIT, changes)
+    assert isinstance(result, tuple)
+
+
+def test_resolve_gates_does_not_mutate_changeset_paths():
+    original_paths = ("crates/ironmem/src/hook.rs", "crates/ironmem/src/hook.rs")
+    changes = hook.ChangeSet(paths=original_paths, unknown=False, reason=None)
+    hook.resolve_gates(hook.PHASE_PRE_COMMIT, changes)
+    assert changes.paths == original_paths
+
+
+# --- Task 3: resolve_gates -- parametrized per-gate reachability ----------
+#
+# Derived from GATES itself, not a hardcoded list of gate names: a future
+# gate appended to the manifest without an entry in
+# _SURFACE_EXAMPLE_PATH_FOR_TEST below fails with a KeyError right here,
+# rather than silently going unexercised.
+
+_SURFACE_EXAMPLE_PATH_FOR_TEST = {
+    hook.SURFACE_RUST_WORKSPACE: "crates/ironmem/src/hook.rs",
+    hook.SURFACE_COLLAB_PROTOCOL: "docs/COLLAB.md",
+    hook.SURFACE_HOOK_SELF_TEST: "scripts/run_git_hook.py",
+    hook.SURFACE_DOCS: "README.md",
+}
+
+
+@pytest.mark.parametrize("gate", hook.GATES, ids=[gate.name for gate in hook.GATES])
+def test_resolve_gates_reaches_every_manifest_gate(gate):
+    phase = next(iter(gate.phases))
+    if gate.always:
+        changes = hook.ChangeSet(paths=(), unknown=False, reason=None)
+    else:
+        surface_id = next(iter(gate.surfaces))
+        path = _SURFACE_EXAMPLE_PATH_FOR_TEST[surface_id]
+        changes = hook.ChangeSet(paths=(path,), unknown=False, reason=None)
+    result = hook.resolve_gates(phase, changes)
+    assert gate in result
+
+
 # --- __main__ delegation must fail loudly, never exit 0, if pytest is absent ---
 
 

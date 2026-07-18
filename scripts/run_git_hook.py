@@ -355,6 +355,52 @@ GATES: tuple[Gate, ...] = (
 )
 
 
+# Declared phase vocabulary for resolve_gates()'s fail-loud guard below --
+# not GATES-derived, because an empty/mistyped manifest must not silently
+# widen or narrow which phase strings are considered valid.
+_KNOWN_PHASES = frozenset({PHASE_PRE_COMMIT, PHASE_PRE_PUSH})
+
+
+def resolve_gates(phase: str, changes: ChangeSet) -> tuple[Gate, ...]:
+    """Select the gates in ``GATES`` that must run for ``phase`` given ``changes``.
+
+    Pure and total: no I/O, no env, no clock, no cwd -- every input is the two
+    arguments, every output is a new tuple built fresh from ``GATES`` in
+    declaration order. Never mutates ``changes`` or ``GATES``. Output order is
+    manifest order, invariant to input path order and duplicates.
+
+    A gate is selected when ``phase in gate.phases`` and at least one of:
+    - ``gate.always`` is True, or
+    - ``changes.unknown`` is True (the collection layer could not determine
+      the real change set and fails closed), or
+    - classifying ``changes.paths`` (deduped by first-seen via
+      ``dict.fromkeys``, never by sorting) yields ``UNKNOWN`` for any path --
+      an unsafe or unrecognized path shape fails closed exactly like
+      ``changes.unknown``, forcing every phase-matching gate to run, or
+    - the set of surfaces those paths classify to intersects ``gate.surfaces``.
+
+    ``SURFACE_DOCS`` is explicitly inert: classifying to DOCS never by itself
+    satisfies a gate's surface intersection, so an all-docs, all-safe-shape
+    change selects only ``always`` gates (none exist in today's manifest).
+
+    Raises ``ValueError`` for a phase outside the declared phase vocabulary --
+    a typo must not silently disable every gate.
+    """
+    if phase not in _KNOWN_PHASES:
+        raise ValueError(f"unknown phase: {phase!r}")
+
+    deduped_paths = tuple(dict.fromkeys(changes.paths))
+    classified_surfaces = frozenset(classify_path(path) for path in deduped_paths)
+    escalate = changes.unknown or UNKNOWN in classified_surfaces
+
+    return tuple(
+        gate
+        for gate in GATES
+        if phase in gate.phases
+        and (gate.always or escalate or classified_surfaces & gate.surfaces)
+    )
+
+
 def gate_summary(paths: list[str]) -> tuple[bool, bool, bool]:
     return (
         any(is_collab_protocol_path(path) for path in paths),
