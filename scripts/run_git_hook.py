@@ -73,14 +73,20 @@ def git(args: list[str], *, input_text: str | None = None, check: bool = True) -
 _HEX_DIGITS = frozenset("0123456789abcdefABCDEF")
 
 
-def _is_hex_sha(value: str) -> bool:
-    """True if `value` is a non-empty run of hex digits.
+_SHA_LENGTHS = frozenset({40, 64})  # SHA-1 (40 hex) and SHA-256 (64 hex) object ids
 
-    Git object ids in a pre-push stdin line are always hex; a `sha` field is
-    not a path, so validating/rejecting it is not covered by the
-    byte-exact-path constraint.
+
+def _is_hex_sha(value: str) -> bool:
+    """True if `value` is a hex string of a real Git object-id length.
+
+    Git object ids in a pre-push stdin line are always 40-hex (SHA-1) or
+    64-hex (SHA-256); a `sha` field is not a path, so validating/rejecting it
+    is not covered by the byte-exact-path constraint. The length check
+    matters: accepting any positive-length hex run (e.g. `"abc"`) would make
+    this guard a formality that a malformed-but-hex-looking stdin line could
+    still slip past.
     """
-    return len(value) > 0 and all(char in _HEX_DIGITS for char in value)
+    return len(value) in _SHA_LENGTHS and all(char in _HEX_DIGITS for char in value)
 
 
 def _split_nul(output: str) -> tuple[str, ...]:
@@ -123,7 +129,12 @@ def _run_git(args: tuple[str, ...]) -> tuple[bool, int, str, str]:
             check=False,
         )
     except Exception as exc:  # fail-closed: never let this propagate
-        return False, -1, "", f"git {args[0]} invocation raised {type(exc).__name__}"
+        # Guard args[0]: an empty `args` tuple must still fail closed with a
+        # structured reason, not raise IndexError from inside this handler
+        # (which would itself escape the fail-closed boundary this function
+        # exists to provide).
+        subcommand = args[0] if args else "<no-args>"
+        return False, -1, "", f"git {subcommand} invocation raised {type(exc).__name__}"
     return True, result.returncode, result.stdout, ""
 
 
@@ -139,6 +150,11 @@ def _git_diff_paths_z(args: tuple[str, ...]) -> tuple[bool, tuple[str, ...], str
     if not ok:
         return False, (), reason
     if returncode != 0:
+        # `reason` interpolates the full argv verbatim. That's safe only
+        # because every caller in this module passes subcommands, flags, and
+        # shas -- never a remote URL or a `user:pass@host` remote spec. This
+        # constraint must hold for every future caller too, or `reason`
+        # (which is allowed to reach stderr/logs) could leak credentials.
         return False, (), f"git {' '.join(args)} exited {returncode}"
     return True, _split_nul(stdout), ""
 
@@ -228,6 +244,10 @@ def collect_pre_commit_changes() -> ChangeSet:
     `unknown=False` means genuinely nothing is staged, never that
     collection broke.
     """
+    # No `--diff-filter`: staged deletions are intentionally in scope
+    # (deleting a `.rs` file or `Cargo.toml` is exactly the kind of change
+    # that should still trigger the Rust gates). The absence of
+    # `--diff-filter=ACMRTUXB` here is a deliberate choice, not a lost flag.
     ok, paths, reason = _git_diff_paths_z(("diff", "--cached", "--name-only", "-z"))
     if not ok:
         return ChangeSet(paths=paths, unknown=True, reason=reason)
@@ -281,25 +301,54 @@ def collect_pre_push_changes(stdin_text: str) -> ChangeSet:
 def staged_paths() -> list[str]:
     """Legacy adapter kept only for `run_pre_commit()`/`gate_summary()`
     (Task 6 retires both along with this shim). Delegates real collection to
-    `collect_pre_commit_changes()`; the pre-refactor call site has no
-    `unknown` concept to propagate.
+    `collect_pre_commit_changes()`.
+
+    The pre-refactor call site had no `unknown` concept, but it was still
+    fail-closed by construction: it called `git([...])` with the default
+    `check=True`, so a non-zero `git diff --cached` exit raised
+    `SystemExit(returncode)` and aborted the commit loudly. Flattening
+    `changes.unknown` away here (i.e. just returning `list(changes.paths)`)
+    would silently convert that into "no staged files, skip gates, exit 0" --
+    a fail-closed collection failure re-presenting as fail-open at the only
+    wired call site. Raise `SystemExit` instead, preserving the pre-refactor
+    loudness.
     """
-    return list(collect_pre_commit_changes().paths)
+    changes = collect_pre_commit_changes()
+    if changes.unknown:
+        sys.stderr.write(f"[git-hook] failed to collect staged changes: {changes.reason}\n")
+        raise SystemExit(1)
+    return list(changes.paths)
 
 
 def pushed_paths(stdin_text: str) -> list[str]:
     """Legacy adapter kept only for `run_pre_push()`/`gate_summary()` (Task
     6 retires both along with this shim). Delegates real collection to
-    `collect_pre_push_changes()`; when that yields zero paths (empty/no-op
-    stdin, or any fail-closed escalation the pre-refactor code had no
-    concept of), falls through to the original direct/manual-invocation
-    fallback via `@{u}`, ported unchanged (still via the pre-refactor
-    `git()` helper -- `upstream` is a ref name, not a path, so its
-    `.strip()` is not the byte-exact violation the brief flagged).
+    `collect_pre_push_changes()`.
+
+    Escalates immediately -- raising `SystemExit`, mirroring `staged_paths()`
+    -- when `changes.unknown` is True, rather than falling through to the
+    `@{u}` fallback below or returning `[]`: either of those would convert a
+    fail-closed Git failure into "no pushed changes, skip gates, exit 0" at
+    the only wired call site, exactly the defect being fixed here. Only a
+    *genuine* empty result (`unknown=False`, e.g. empty/no-op stdin, the
+    manual-invocation case the pre-refactor code handled) falls through to
+    the original direct-invocation fallback via `@{u}`, ported unchanged
+    (still via the pre-refactor `git()` helper -- `upstream` is a ref name,
+    not a path, so its `.strip()` is not the byte-exact violation the brief
+    flagged).
     """
     changes = collect_pre_push_changes(stdin_text)
+    if changes.unknown:
+        sys.stderr.write(f"[git-hook] failed to collect pushed changes: {changes.reason}\n")
+        raise SystemExit(1)
     if changes.paths:
         return list(changes.paths)
+    # Task 6 deletes this shim (`pushed_paths()`) along with the rest of the
+    # legacy adapters. Nothing outside this function today exercises this
+    # `@{u}` fallback except a manual `pre-push`-style invocation with no
+    # stdin (no upstream-tracking ref piped in). If Task 6 removes this
+    # function without carrying an equivalent fallback forward, that manual
+    # invocation path silently loses it -- this comment is the tripwire.
     upstream = git(["rev-parse", "--verify", "@{u}"], check=False).strip()
     if upstream:
         output = git(["diff", "--name-only", "-z", f"{upstream}..HEAD"])

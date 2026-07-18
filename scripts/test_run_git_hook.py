@@ -841,6 +841,21 @@ def test_is_hex_sha_rejects_non_hex_characters():
     assert hook._is_hex_sha("z" * 40) is False
 
 
+def test_is_hex_sha_rejects_short_hex_run():
+    # "abc" is hex-shaped but far shorter than a real Git object id (40 or
+    # 64 hex chars). Accepting any positive-length hex run would make this
+    # guard a formality rather than a load-bearing malformed-stdin check.
+    assert hook._is_hex_sha("abc") is False
+
+
+def test_is_hex_sha_accepts_sha256_length():
+    assert hook._is_hex_sha("a" * 64) is True
+
+
+def test_is_hex_sha_rejects_length_between_40_and_64():
+    assert hook._is_hex_sha("a" * 50) is False
+
+
 # --- _parse_pre_push_line ---------------------------------------------------
 
 
@@ -851,6 +866,26 @@ def test_parse_pre_push_line_valid_four_fields():
 
 def test_parse_pre_push_line_wrong_field_count_is_none():
     assert hook._parse_pre_push_line("refs/heads/a onlytwo") is None
+
+
+# --- _run_git -- fail-closed boundary itself must never raise --------------
+
+
+def test_run_git_guards_empty_args_on_subprocess_failure(monkeypatch):
+    # `_run_git(())` -- an empty args tuple -- must not raise IndexError from
+    # inside its own except-block while building `reason`; that would let an
+    # exception escape the one boundary that exists to convert Git
+    # subprocess failures into a structured, non-raising signal.
+    def raiser(cmd, **kwargs):
+        raise OSError("boom")
+
+    monkeypatch.setattr(hook.subprocess, "run", raiser)
+    ok, returncode, stdout, reason = hook._run_git(())
+    assert ok is False
+    assert returncode == -1
+    assert stdout == ""
+    assert reason
+    assert "boom" not in reason
 
 
 # --- collect_pre_commit_changes ---------------------------------------------
@@ -901,6 +936,43 @@ def test_collect_pre_commit_changes_preserves_byte_exact_paths(monkeypatch):
     monkeypatch.setattr(hook.subprocess, "run", fake)
     changes = hook.collect_pre_commit_changes()
     assert changes.paths == (weird,)
+
+
+def test_collect_pre_commit_changes_no_diff_filter_flag(monkeypatch):
+    # Pins that collect_pre_commit_changes() never passes --diff-filter: the
+    # exact argv it must invoke is asserted by _FakeGitRun's KeyError-on-
+    # unanticipated-call behavior (see class docstring above) -- any
+    # additional flag, including a reintroduced --diff-filter, would make
+    # this call miss the fake's response table and fail loudly.
+    fake = _FakeGitRun(
+        {("diff", "--cached", "--name-only", "-z"): (0, "crates/ironmem/src/deleted.rs\0")}
+    )
+    monkeypatch.setattr(hook.subprocess, "run", fake)
+    hook.collect_pre_commit_changes()
+    assert fake.calls == [("diff", "--cached", "--name-only", "-z")]
+
+
+def test_staged_deletion_of_rust_path_is_collected_and_selects_rust_gates(monkeypatch):
+    # The human-ratified behavior change: staged deletions reach gate
+    # selection because --diff-filter=ACMRTUXB was deliberately dropped (see
+    # the comment at collect_pre_commit_changes()). `git diff --name-only`
+    # reports a deleted path exactly like any other changed path -- there is
+    # no separate "deleted" marker in `-z --name-only` output -- so a fake
+    # response containing only the path is a faithful stand-in for a staged
+    # deletion of that path. This pins the ratified behavior: the deletion
+    # is collected (not dropped) and it selects the Rust gates for
+    # pre-commit.
+    fake = _FakeGitRun(
+        {("diff", "--cached", "--name-only", "-z"): (0, "crates/ironmem/src/deleted.rs\0")}
+    )
+    monkeypatch.setattr(hook.subprocess, "run", fake)
+    changes = hook.collect_pre_commit_changes()
+    assert changes == hook.ChangeSet(
+        paths=("crates/ironmem/src/deleted.rs",), unknown=False, reason=None
+    )
+    names = [gate.name for gate in hook.resolve_gates(hook.PHASE_PRE_COMMIT, changes)]
+    assert "rust_fmt_check" in names
+    assert "rust_clippy" in names
 
 
 # --- collect_pre_push_changes -- happy paths --------------------------------
@@ -1084,6 +1156,92 @@ def test_pushed_paths_no_upstream_returns_empty_list(monkeypatch):
     fake = _FakeGitRun({("rev-parse", "--verify", "@{u}"): (128, "")})
     monkeypatch.setattr(hook.subprocess, "run", fake)
     assert hook.pushed_paths("") == []
+
+
+# --- legacy adapters -- escalate on collection failure, never flatten to []
+#
+# This is the fix for the critical finding: staged_paths()/pushed_paths()
+# used to discard `changes.unknown` and return `list(changes.paths)`
+# unconditionally, which turned a fail-closed Git failure into an empty list
+# at the only wired call site (run_pre_commit()/run_pre_push() both treat an
+# empty list as "nothing to do, exit 0, run zero gates"). Both adapters must
+# now raise SystemExit instead of ever returning a flattened `[]` on
+# `unknown=True`.
+
+
+def test_staged_paths_raises_systemexit_on_git_failure(monkeypatch, capsys):
+    fake = _FakeGitRun({("diff", "--cached", "--name-only", "-z"): (128, "")})
+    monkeypatch.setattr(hook.subprocess, "run", fake)
+    with pytest.raises(SystemExit) as excinfo:
+        hook.staged_paths()
+    assert excinfo.value.code != 0
+    assert "failed to collect staged changes" in capsys.readouterr().err
+
+
+def test_staged_paths_raises_systemexit_on_subprocess_failure(monkeypatch):
+    fake = _FakeGitRun(
+        {("diff", "--cached", "--name-only", "-z"): FileNotFoundError("git: command not found")}
+    )
+    monkeypatch.setattr(hook.subprocess, "run", fake)
+    with pytest.raises(SystemExit):
+        hook.staged_paths()
+
+
+def test_pushed_paths_raises_systemexit_on_malformed_stdin(monkeypatch, capsys):
+    fake = _FakeGitRun({})
+    monkeypatch.setattr(hook.subprocess, "run", fake)
+    with pytest.raises(SystemExit) as excinfo:
+        hook.pushed_paths("refs/heads/a onlythreefields\n")
+    assert excinfo.value.code != 0
+    assert "failed to collect pushed changes" in capsys.readouterr().err
+    # Escalation happens before any fallback -- the @{u} path must never be
+    # attempted once unknown=True.
+    assert fake.calls == []
+
+
+def test_pushed_paths_raises_systemexit_on_git_failure_mid_batch(monkeypatch):
+    stdin = _pre_push_line("refs/heads/a", SHA_B, "refs/heads/a", SHA_A) + "\n"
+    fake = _FakeGitRun({("diff", "--name-only", "-z", f"{SHA_A}..{SHA_B}"): (128, "")})
+    monkeypatch.setattr(hook.subprocess, "run", fake)
+    with pytest.raises(SystemExit):
+        hook.pushed_paths(stdin)
+
+
+# --- run_pre_commit/run_pre_push -- the property that was lost: a Git
+# failure must never present as "no changes, zero gates, exit 0" -----------
+
+
+def test_run_pre_commit_never_exits_zero_with_no_gates_on_git_failure(monkeypatch):
+    fake = _FakeGitRun({("diff", "--cached", "--name-only", "-z"): (128, "")})
+    monkeypatch.setattr(hook.subprocess, "run", fake)
+    with pytest.raises(SystemExit) as excinfo:
+        hook.run_pre_commit()
+    # The old defect: this would print "no staged files; skipping gates" and
+    # return 0, running zero gates on a broken/unavailable Git. It must now
+    # abort loudly instead.
+    assert excinfo.value.code != 0
+
+
+def test_run_pre_push_never_exits_zero_with_no_gates_on_git_failure(monkeypatch):
+    stdin = _pre_push_line("refs/heads/a", SHA_B, "refs/heads/a", SHA_A) + "\n"
+    fake = _FakeGitRun({("diff", "--name-only", "-z", f"{SHA_A}..{SHA_B}"): (128, "")})
+    monkeypatch.setattr(hook.subprocess, "run", fake)
+    monkeypatch.setattr(sys, "stdin", _StdinStub(stdin))
+    with pytest.raises(SystemExit) as excinfo:
+        hook.run_pre_push()
+    assert excinfo.value.code != 0
+
+
+class _StdinStub:
+    """Minimal stand-in for sys.stdin exposing only the .read() that
+    run_pre_push() calls -- avoids touching the real process stdin in tests.
+    """
+
+    def __init__(self, text: str) -> None:
+        self._text = text
+
+    def read(self) -> str:
+        return self._text
 
 
 # --- module-wide static guard -----------------------------------------------
