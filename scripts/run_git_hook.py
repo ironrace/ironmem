@@ -140,6 +140,17 @@ def is_hook_path(path: str) -> bool:
     return path in HOOK_EXACT_PATHS
 
 
+def is_docs_path(path: str) -> bool:
+    """Explicitly inert documentation surface: any Markdown file, or any path
+    under a top-level ``docs/`` directory.
+
+    Matched on the leading ``/``-split segment (``path.split("/", 1)[0]``),
+    never on ``"docs" in path`` -- a substring check would wrongly match a
+    look-alike directory such as ``docsite/notes.txt``.
+    """
+    return path.endswith(".md") or path.split("/", 1)[0] == "docs"
+
+
 # --- Frozen data model -------------------------------------------------
 #
 # `Gate`/`ChangeSet`/`GATES`/`SURFACES` are the pure data layer the rest of
@@ -152,6 +163,14 @@ PHASE_PRE_PUSH = "pre-push"
 SURFACE_RUST_WORKSPACE = "rust_workspace"
 SURFACE_COLLAB_PROTOCOL = "collab_protocol"
 SURFACE_HOOK_SELF_TEST = "hook_self_test"
+SURFACE_DOCS = "docs"
+
+# Not a declared surface -- the fail-closed fallback classify_path() returns
+# when a path is unsafe-shaped or matches no entry in SURFACES (including
+# DOCS). Deliberately absent from SURFACES: unlike DOCS, UNKNOWN is not a
+# recognized surface later stages select gates for -- it is the signal that
+# forces every gate for the phase to run.
+UNKNOWN = "unknown"
 
 
 @dataclasses.dataclass(frozen=True)
@@ -205,14 +224,78 @@ class ChangeSet:
 
 
 # surface_id -> predicate. Predicates ported unchanged from the existing
-# is_rust_path/is_collab_protocol_path/is_hook_path classifiers above.
+# is_rust_path/is_collab_protocol_path/is_hook_path classifiers above, plus
+# the DOCS surface's is_docs_path. Iteration order is declaration order:
+# classify_path() below checks DOCS last, so a more specific surface (e.g.
+# collab protocol) wins over the generic inert docs catch-all when a path
+# happens to satisfy both (docs/COLLAB.md is both under docs/ and in the
+# collab-protocol exact set).
 SURFACES: MappingProxyType[str, Callable[[str], bool]] = MappingProxyType(
     {
         SURFACE_RUST_WORKSPACE: is_rust_path,
         SURFACE_COLLAB_PROTOCOL: is_collab_protocol_path,
         SURFACE_HOOK_SELF_TEST: is_hook_path,
+        SURFACE_DOCS: is_docs_path,
     }
 )
+
+# Control bytes (codepoint < 0x20, plus DEL 0x7F) are rejected as unsafe path
+# shapes, except newline: Git's `-z`/NUL-delimited output can legitimately
+# carry an embedded newline inside a filename, and that byte must classify
+# normally, not be treated as an attack shape.
+_ALLOWED_CONTROL_CHARS = frozenset({"\n"})
+
+
+def _unsafe_path_reason(path: object) -> str | None:
+    """Return a reason string if `path` is an unsafe or malformed shape for
+    classification, else None.
+
+    Never cleans, strips, or rewrites `path` -- callers must escalate on a
+    non-None reason, not sanitize and continue. Sanitizing an
+    attacker-influenced path would let classification diverge from what Git
+    actually staged.
+    """
+    if not isinstance(path, str):
+        return f"non-str path: {type(path).__name__}"
+    if path == "":
+        return "empty path"
+    if path.startswith("/"):
+        return "absolute path"
+    if path.startswith("-"):
+        return "path starts with '-'"
+    for char in path:
+        if char in _ALLOWED_CONTROL_CHARS:
+            continue
+        codepoint = ord(char)
+        if codepoint < 0x20 or codepoint == 0x7F:
+            return "control byte in path"
+    if ".." in path.split("/"):
+        return "'..' path segment"
+    return None
+
+
+def classify_path(path: object) -> str:
+    """Classify a single Git-reported path into a declared surface id, or
+    UNKNOWN.
+
+    Total: never raises regardless of input shape or type. Pure: never
+    mutates its argument and performs no `.strip()`/unquoting/case-folding --
+    matching is byte-exact on `/`-split segments, not substrings, so a
+    look-alike like `docsite/` or `contests/` never matches the surface it
+    resembles. Unsafe shapes (absolute paths, `..` segments, NUL/control
+    bytes, empty string, leading `-`, non-`str`) are rejected to UNKNOWN
+    before any surface is checked, never sanitized. DOCS is a declared
+    surface like any other, not a fallback; UNKNOWN is the true fallback,
+    returned only when the shape is unsafe or no declared surface (including
+    DOCS) matches.
+    """
+    if _unsafe_path_reason(path) is not None:
+        return UNKNOWN
+    for surface_id, predicate in SURFACES.items():
+        if predicate(path):
+            return surface_id
+    return UNKNOWN
+
 
 # Declaration order IS execution order. Never sorted at runtime. Ported
 # unchanged from today's run_pre_commit()/run_pre_push() conditional

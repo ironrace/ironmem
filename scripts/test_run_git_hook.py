@@ -280,6 +280,7 @@ def test_surfaces_contains_expected_ids():
         hook.SURFACE_RUST_WORKSPACE,
         hook.SURFACE_COLLAB_PROTOCOL,
         hook.SURFACE_HOOK_SELF_TEST,
+        hook.SURFACE_DOCS,
     }
 
 
@@ -287,6 +288,10 @@ def test_surfaces_ported_unchanged_from_existing_predicates():
     assert hook.SURFACES[hook.SURFACE_RUST_WORKSPACE] is hook.is_rust_path
     assert hook.SURFACES[hook.SURFACE_COLLAB_PROTOCOL] is hook.is_collab_protocol_path
     assert hook.SURFACES[hook.SURFACE_HOOK_SELF_TEST] is hook.is_hook_path
+
+
+def test_surfaces_docs_entry_is_is_docs_path():
+    assert hook.SURFACES[hook.SURFACE_DOCS] is hook.is_docs_path
 
 
 def test_surfaces_is_a_frozen_mapping():
@@ -299,6 +304,178 @@ def test_every_gate_surface_id_is_registered():
     for gate in hook.GATES:
         for surface_id in gate.surfaces:
             assert surface_id in hook.SURFACES
+
+
+# --- Task 2: is_docs_path -----------------------------------------------
+
+
+def test_is_docs_path_matches_markdown_suffix():
+    assert hook.is_docs_path("README.md") is True
+    assert hook.is_docs_path("AGENTS.md") is True
+
+
+def test_is_docs_path_matches_top_level_docs_directory():
+    assert hook.is_docs_path("docs/CODEX.md") is True
+    assert hook.is_docs_path("docs/superpowers/plans/notes.txt") is True
+
+
+def test_is_docs_path_rejects_look_alike_directory():
+    # "docsite/" is not "docs/" -- a substring check ("docs" in path) would
+    # wrongly match this; a segment/prefix check must not.
+    assert hook.is_docs_path("docsite/architecture.txt") is False
+
+
+def test_is_docs_path_rejects_non_markdown_non_docs_path():
+    assert hook.is_docs_path("crates/ironmem/src/hook.rs") is False
+
+
+# --- Task 2: UNKNOWN is a distinct fallback, not a declared surface -----
+
+
+def test_unknown_is_not_a_declared_surface():
+    assert hook.UNKNOWN not in hook.SURFACES
+
+
+# --- Task 2: classify_path -- known surfaces ----------------------------
+
+
+def test_classify_path_rust_source():
+    assert hook.classify_path("crates/ironmem/src/hook.rs") == hook.SURFACE_RUST_WORKSPACE
+
+
+def test_classify_path_collab_exact_path():
+    assert hook.classify_path("scripts/check_collab_turn_templates.py") == (
+        hook.SURFACE_COLLAB_PROTOCOL
+    )
+
+
+def test_classify_path_hook_self_test_run_git_hook():
+    assert hook.classify_path("scripts/run_git_hook.py") == hook.SURFACE_HOOK_SELF_TEST
+
+
+def test_classify_path_hook_self_test_test_run_git_hook():
+    assert hook.classify_path("scripts/test_run_git_hook.py") == hook.SURFACE_HOOK_SELF_TEST
+
+
+def test_classify_path_docs_markdown_file():
+    assert hook.classify_path("README.md") == hook.SURFACE_DOCS
+
+
+def test_classify_path_docs_directory():
+    assert hook.classify_path("docs/superpowers/plans/notes.txt") == hook.SURFACE_DOCS
+
+
+def test_classify_path_known_surface_beats_generic_docs():
+    # docs/COLLAB.md is both under docs/ and in the collab-protocol exact
+    # set. The more specific declared surface wins over the generic inert
+    # docs catch-all -- DOCS is checked last, never first.
+    assert hook.classify_path("docs/COLLAB.md") == hook.SURFACE_COLLAB_PROTOCOL
+
+
+# --- Task 2: classify_path -- near-misses classify UNKNOWN, not the surface
+# they resemble -----------------------------------------------------------
+
+
+def test_classify_path_near_miss_contests_is_not_collab_protocol():
+    assert hook.classify_path("contests/collab_turn_templates/example.txt") == hook.UNKNOWN
+
+
+def test_classify_path_near_miss_docsite_is_not_docs():
+    assert hook.classify_path("docsite/architecture.txt") == hook.UNKNOWN
+
+
+def test_classify_path_near_miss_src_backup_is_unknown():
+    assert hook.classify_path("src_backup/lib.py") == hook.UNKNOWN
+
+
+def test_classify_path_unrecognized_safe_shape_is_unknown():
+    assert hook.classify_path("notes.txt") == hook.UNKNOWN
+
+
+# --- Task 2: classify_path -- unsafe shapes classify UNKNOWN by rejection,
+# never by crash and never by cleaning ------------------------------------
+
+
+def test_classify_path_absolute_path_is_unknown():
+    assert hook.classify_path("/etc/passwd") == hook.UNKNOWN
+
+
+def test_classify_path_dotdot_segment_is_unknown():
+    assert hook.classify_path("scripts/../etc/passwd") == hook.UNKNOWN
+
+
+def test_classify_path_bare_dotdot_segment_is_unknown():
+    assert hook.classify_path("..") == hook.UNKNOWN
+
+
+def test_classify_path_nul_byte_is_unknown():
+    assert hook.classify_path("weird\x00path.md") == hook.UNKNOWN
+
+
+def test_classify_path_control_byte_is_unknown():
+    assert hook.classify_path("weird\x1bpath.md") == hook.UNKNOWN
+
+
+def test_classify_path_empty_string_is_unknown():
+    assert hook.classify_path("") == hook.UNKNOWN
+
+
+def test_classify_path_leading_dash_is_unknown():
+    # Even though the extension would otherwise match the Rust surface, the
+    # unsafe leading '-' shape check is rejected before surface matching.
+    assert hook.classify_path("-danger.rs") == hook.UNKNOWN
+
+
+def test_classify_path_non_str_int_is_unknown():
+    assert hook.classify_path(123) == hook.UNKNOWN
+
+
+def test_classify_path_non_str_none_is_unknown():
+    assert hook.classify_path(None) == hook.UNKNOWN
+
+
+def test_classify_path_non_str_list_is_unknown():
+    assert hook.classify_path(["scripts/run_git_hook.py"]) == hook.UNKNOWN
+
+
+def test_classify_path_never_raises_on_unsafe_shapes():
+    # Escalation, not a crash: none of these may propagate an exception.
+    unsafe_inputs = [
+        "/etc/passwd",
+        "..",
+        "weird\x00path",
+        "weird\x1bpath",
+        "",
+        "-rf",
+        123,
+        None,
+        ["a"],
+    ]
+    for value in unsafe_inputs:
+        assert hook.classify_path(value) == hook.UNKNOWN
+
+
+# --- Task 2: paths are matched byte-exact -- no strip/case-fold/rewrite --
+
+
+def test_classify_path_preserves_newline_space_and_non_ascii_segments():
+    path = "docs/plan\n notes (β).md"
+    assert hook.classify_path(path) == hook.SURFACE_DOCS
+    # Segment-based matching operated on the real, unmodified bytes.
+    assert path.split("/") == ["docs", "plan\n notes (β).md"]
+
+
+def test_classify_path_does_not_strip_whitespace_before_matching():
+    # If classify_path stripped the path before matching, this would
+    # collapse to the exact hook-self-test path and misclassify. Byte-exact
+    # matching must leave it unrecognized instead.
+    path = " scripts/run_git_hook.py"
+    assert hook.classify_path(path) == hook.UNKNOWN
+
+
+def test_classify_path_does_not_strip_trailing_newline_before_matching():
+    path = "scripts/run_git_hook.py\n"
+    assert hook.classify_path(path) == hook.UNKNOWN
 
 
 # --- __main__ delegation must fail loudly, never exit 0, if pytest is absent ---
