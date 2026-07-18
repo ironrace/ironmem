@@ -554,6 +554,15 @@ def resolve_gates(phase: str, changes: ChangeSet) -> tuple[Gate, ...]:
     declaration order. Never mutates ``changes`` or ``GATES``. Output order is
     manifest order, invariant to input path order and duplicates.
 
+    Byte-preserving: every path in ``changes.paths`` is classified exactly as
+    received. Deduping via ``dict.fromkeys`` compares paths byte-for-byte
+    (never after ``.strip()``/unquoting/case-folding), and ``classify_path``
+    itself never rewrites a path before matching it against ``SURFACES`` --
+    an unsafe or attacker-influenced path is escalated to ``UNKNOWN``, never
+    sanitized and reclassified. This is deliberate: rewriting a path before
+    classifying it would let this function's decision disagree with what Git
+    actually staged.
+
     A gate is selected when ``phase in gate.phases`` and at least one of:
     - ``gate.always`` is True, or
     - ``changes.unknown`` is True (the collection layer could not determine

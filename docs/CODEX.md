@@ -114,6 +114,142 @@ The hooks are diff-aware:
 - Rust/workspace changes run fmt and clippy on commit, then workspace tests on push
 - docs/config-only changes outside those surfaces skip heavy local gates
 
+### `run_git_hook.py`: collect → resolve → execute
+
+`scripts/run_git_hook.py` is the diff-aware dispatcher both hooks delegate to.
+`main(phase)` wires it as three layers, each with one job and no layer
+reaching backwards — the resolver never shells out, the collector never
+decides which gates run, the executor never re-derives what the resolver
+already decided:
+
+| Layer | Entry point | Impure? | Job |
+|---|---|---|---|
+| Collect | `collect_pre_commit_changes()` / `collect_pre_push_changes(stdin)` | Yes — the only Git subprocess calls in the pipeline | Turn Git's own diff output into a `ChangeSet`. Decides nothing about which gates run. |
+| Resolve | `resolve_gates(phase, changes)` | No — pure and total | Turn `(phase, ChangeSet)` into the tuple of `Gate`s to run, in `GATES` declaration order. No I/O, no env, no clock, no subprocess. |
+| Execute | `execute_gates(phase, changes)` | Yes — runs subprocesses | Call `resolve_gates` exactly once, then run each selected gate with a hardened `subprocess.run`, printing one line per gate (`run` / `skip (...)` / `fail (...)`) and stopping at the first non-zero exit. |
+
+#### The `ChangeSet` fail-closed interface
+
+```python
+@dataclasses.dataclass(frozen=True)
+class ChangeSet:
+    paths: tuple[str, ...]
+    unknown: bool
+    reason: str | None
+```
+
+- `paths=()` with `unknown=False` means **genuinely no changes** — nothing
+  staged (pre-commit) or nothing in the pushed range (pre-push). It never
+  means "collection broke."
+- `unknown=True` means the collector could not determine the real change set
+  — a Git subprocess call failed, pre-push stdin was malformed, a sha field
+  wasn't hex, etc. `resolve_gates` treats `unknown=True` as an automatic
+  escalation: **every gate declared for the phase runs**, regardless of
+  `paths`. `reason` is always non-empty in this case, and `execute_gates`
+  prints it first (`[git-hook] escalating: <reason>`) so a surprisingly full
+  run explains itself instead of looking arbitrary.
+- The subprocess boundary itself is fail-closed: `_run_git`'s success flag is
+  False only when the `git` call could not be made at all (missing binary,
+  undecodable output) — never based on git's own exit code, which callers
+  interpret themselves — and any such failure always becomes
+  `ChangeSet(unknown=True, ...)`, never a raised exception out of collection.
+
+#### Classification table
+
+`classify_path(path)` is pure and total (never raises, regardless of input
+shape) and returns one of:
+
+| Surface id | Predicate | Matches |
+|---|---|---|
+| `rust_workspace` | `is_rust_path` | `.rs` files, `Cargo.toml`/`Cargo.lock`/`build.rs`, anything under `.cargo/` |
+| `collab_protocol` | `is_collab_protocol_path` | collab command/prompt/template files (`COLLAB_EXACT_PATHS`, `.claude-plugin/prompts/collab-turn-*`, `tests/collab_turn_templates/`) |
+| `hook_self_test` | `is_hook_path` | the tracked hook scripts themselves (`.githooks/*`, `scripts/install-git-hooks.sh`, `scripts/run_git_hook.py`, `scripts/test_run_git_hook.py`) |
+| `docs` | `is_docs_path` | any `.md` file, or any path whose leading `/`-split segment is `docs` |
+| `UNKNOWN` | *(fallback — not in `SURFACES`)* | an unsafe-shaped path, or a path that matches no declared surface |
+
+`docs` is a declared, first-class entry in `SURFACES` — **not a fallback** —
+and that distinction is the point of the feature: an all-docs, all-safe-shape
+change classifies cleanly to `docs` and selects only `always` gates (none
+exist in today's manifest), which is cheaper and more precise than the
+`UNKNOWN` path. `UNKNOWN` is the true fallback, returned only when a path is
+unsafe-shaped (absolute, contains a `..` segment, a control byte other than
+`\n`, empty, starts with `-`, or isn't even a `str`) or matches no entry in
+`SURFACES` at all — and, like `changes.unknown`, it escalates `resolve_gates`
+to running every gate for the phase.
+
+#### Byte-exact paths — why stripping is forbidden
+
+Every Git invocation in the collection layer uses `-z` (NUL-delimited)
+output. That removes `core.quotepath` escaping at the source, and —
+critically — **a newline is a legal byte inside a Git filename**: with NUL as
+the only delimiter, there is no delimiter newline to strip, so one is never
+stripped. `_split_nul` drops exactly one trailing empty field (`-z`'s own
+output framing, not path content) and touches nothing else.
+
+`classify_path` and every surface predicate never call `.strip()`, unquote,
+or case-fold a path. Rewriting an attacker-influenced path before classifying
+it would let classification disagree with what Git actually staged — matching
+byte-exact means what gets classified is what Git reported, never a
+cleaned-up guess at it. Unsafe shapes are rejected straight to `UNKNOWN`
+(which escalates to running every gate) — **never sanitized and
+reclassified**.
+
+#### How to add a gate
+
+Two steps, nothing else:
+
+1. Append a `Gate(...)` entry to the `GATES` tuple in
+   `scripts/run_git_hook.py`.
+2. If the gate declares a surface that has no existing example, add one to
+   `_SURFACE_EXAMPLE_PATH_FOR_TEST` in `scripts/test_run_git_hook.py`.
+
+`test_resolve_gates_reaches_every_manifest_gate` derives its parametrized
+cases directly from `GATES` — it is not a hand-maintained list of gate names.
+A gate added without a matching `_SURFACE_EXAMPLE_PATH_FOR_TEST` entry fails
+that test loudly with a `KeyError` naming the missing surface, rather than
+silently going unexercised. `GATES` order is execution order (declaration
+order) and is never sorted at runtime.
+
+#### The argv-literal rule
+
+`Gate.argv` entries are string literals only, e.g.
+`("cargo", "clippy", "--workspace", ...)`. No caller ever interpolates a
+Git- or path-derived value (a changed filename, a sha, a branch name) into a
+gate's `argv`. `execute_gates` runs
+`subprocess.run(list(gate.argv), shell=False, ...)` with the argv taken
+verbatim from the manifest, so the set of commands the hook can ever run is
+fixed at manifest-authoring time — never influenced by what's in the diff.
+
+#### The `GIT_*` environment scrub
+
+`execute_gates` runs every gate with `env=` built by `_scrub_git_env`, which
+drops every `GIT_*`-prefixed variable except an explicit keep-list
+(`GIT_ASKPASS`, `GIT_SSH`, `GIT_SSH_COMMAND`, `GIT_TERMINAL_PROMPT`,
+`GIT_TRACE*`). This exists because a pre-push hook exporting
+`GIT_DIR`/`GIT_INDEX_FILE`/`GIT_WORK_TREE` let a `cargo test` tempdir Git
+fixture inherit them and commit into the real repository (PR #186) — those
+variables redirect a child Git invocation at a *different* repo/worktree/
+index, and are always stripped.
+
+`GIT_CONFIG_*` is deliberately **not** on the keep-list. `GIT_CONFIG_COUNT` +
+`GIT_CONFIG_KEY_n`/`GIT_CONFIG_VALUE_n` are the documented equivalent of
+`git -c <key>=<value>` for arbitrary config — including `core.worktree`, the
+config equivalent of `GIT_WORK_TREE` that this same scrub strips above. A
+caller could otherwise set `GIT_CONFIG_COUNT=1
+GIT_CONFIG_KEY_0=core.worktree GIT_CONFIG_VALUE_0=/real/repo` and reproduce
+exactly the redirection this scrub exists to prevent, through the front
+door. The keep-list is an allowlist, not a denylist: anything `GIT_*`-
+prefixed that isn't explicitly named or prefix-matched is dropped, including
+variables not yet invented.
+
+#### Staged deletions are in scope
+
+`collect_pre_commit_changes` runs `git diff --cached --name-only -z` with no
+`--diff-filter`. `--diff-filter=ACMRTUXB` (which would exclude deletions) is
+deliberately absent — deleting a `.rs` file or `Cargo.toml` is exactly the
+kind of change that should still trigger the Rust gates. This is a ratified
+decision, not a lost flag.
+
 ## Manual Codex MCP Setup
 
 Add a server entry to your Codex MCP config.
