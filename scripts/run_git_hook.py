@@ -11,11 +11,12 @@ match the changed surface:
 from __future__ import annotations
 
 import dataclasses
+import os
 import pathlib
 import subprocess
 import sys
 from types import MappingProxyType
-from typing import Callable
+from typing import Callable, Mapping
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 ZERO_SHA = "0" * 40
@@ -636,6 +637,124 @@ def resolve_gates(phase: str, changes: ChangeSet) -> tuple[Gate, ...]:
         if phase in gate.phases
         and (gate.always or escalate or classified_surfaces & gate.surfaces)
     )
+
+
+# --- Execution layer -- run resolver-selected gates, hardened subprocess
+# contract ---------------------------------------------------------------
+#
+# `execute_gates` is the last stage of collect -> resolve -> execute. It
+# re-derives nothing: `resolve_gates` alone decides which gates run, this
+# layer only runs them and reports. Not wired into run_pre_commit()/
+# run_pre_push()/main() yet -- Task 6 does that and retires the legacy
+# run_pre_commit()/run_pre_push()/gate_summary()/run() functions below.
+
+# Repo-redirecting variables: inheriting any of these points a child Git
+# invocation at a *different* repository than the one the hook is running
+# in. This is not theoretical -- a pre-push hook exporting GIT_DIR/
+# GIT_INDEX_FILE/GIT_WORK_TREE let a `cargo test` tempdir Git fixture
+# inherit them and commit into the real repo (PR #186). Always stripped;
+# never in the keep-list.
+#   GIT_DIR / GIT_WORK_TREE / GIT_INDEX_FILE   -- which repo/worktree/index
+#   GIT_OBJECT_DIRECTORY / GIT_ALTERNATE_OBJECT_DIRECTORIES -- which object store
+#   GIT_COMMON_DIR                              -- which shared worktree dir
+#   GIT_NAMESPACE                                -- which ref namespace
+#
+# Keep-list: variables that configure *how* Git authenticates or reports,
+# not *where* it points. Dropping these can break a legitimate developer
+# setup (e.g. an SSH-agent wrapper or corporate proxy needed for a gate
+# that itself shells out to Git) without buying any safety, since none of
+# them can redirect a child Git invocation at another repository:
+#   GIT_ASKPASS, GIT_SSH, GIT_SSH_COMMAND -- how Git authenticates over SSH
+#   GIT_TERMINAL_PROMPT                    -- whether Git may prompt interactively
+#   GIT_CONFIG_*                           -- one-off config overrides (GIT_CONFIG_COUNT
+#                                              + GIT_CONFIG_KEY_n/GIT_CONFIG_VALUE_n)
+#   GIT_TRACE*                             -- diagnostic tracing output
+# Default toward scrubbing: anything GIT_*-prefixed that isn't explicitly
+# named or prefix-matched here is dropped, including variables not yet
+# invented. The keep-list is an allowlist, not a denylist.
+_GIT_ENV_KEEP_EXACT: frozenset[str] = frozenset(
+    {"GIT_ASKPASS", "GIT_SSH", "GIT_SSH_COMMAND", "GIT_TERMINAL_PROMPT"}
+)
+_GIT_ENV_KEEP_PREFIXES: tuple[str, ...] = ("GIT_CONFIG_", "GIT_TRACE")
+
+
+def _scrub_git_env(source_env: Mapping[str, str]) -> dict[str, str]:
+    """Build a child-process env from `source_env` (normally `os.environ`)
+    with every `GIT_*` variable removed except the explicit keep-list above.
+
+    Returns a new dict; never mutates `source_env`. Non-`GIT_*` variables
+    (PATH, HOME, ...) always pass through untouched.
+    """
+    return {
+        key: value
+        for key, value in source_env.items()
+        if not key.startswith("GIT_")
+        or key in _GIT_ENV_KEEP_EXACT
+        or key.startswith(_GIT_ENV_KEEP_PREFIXES)
+    }
+
+
+# Declaration position of each surface id in SURFACES, used only to render a
+# gate's `surfaces` frozenset in a deterministic order for the skip line
+# below. Frozenset iteration order depends on CPython's per-process string
+# hash randomization, so printing straight from the frozenset would make
+# the skip line's surfaces field vary run to run for any gate declaring more
+# than one surface, even though nothing else changed.
+_SURFACE_ORDER: MappingProxyType[str, int] = MappingProxyType(
+    {surface_id: index for index, surface_id in enumerate(SURFACES)}
+)
+
+
+def _ordered_surfaces(surface_ids: frozenset[str]) -> tuple[str, ...]:
+    return tuple(sorted(surface_ids, key=lambda surface_id: _SURFACE_ORDER[surface_id]))
+
+
+def execute_gates(phase: str, changes: ChangeSet) -> int:
+    """Run every `GATES` entry matching `phase` that `resolve_gates` selects,
+    in manifest declaration order; print one deterministic line per gate
+    (`run` / `skip (<surfaces-not-touched>)` / `fail (<exit>)`) and stop at
+    the first non-zero exit, returning that exit code immediately without
+    invoking any later gate. Returns 0 when every executed gate exits 0,
+    including the trivial all-skipped case.
+
+    Re-derives nothing: `resolve_gates(phase, changes)` alone decides what
+    runs (and raises `ValueError` for an unknown `phase`, not re-checked
+    here). Each subprocess call uses the hardened contract required by this
+    layer: `shell=False`, a list argv taken verbatim from `gate.argv`,
+    `cwd=ROOT`, `check=False`, and an explicit `env=` -- computed once via
+    `_scrub_git_env(os.environ)` and passed to every gate this call runs --
+    never the inherited process env as-is.
+
+    When `changes.unknown` is True, `resolve_gates` has already escalated to
+    running every phase-matching gate; this function additionally prints
+    `changes.reason` first so a surprising full run explains itself rather
+    than looking arbitrary.
+    """
+    # resolve_gates() validates `phase` (raises ValueError for an unrecognized
+    # one) -- called before any output is printed, so an invalid phase fails
+    # loudly with no partial/misleading output ahead of the raise.
+    selected = set(resolve_gates(phase, changes))
+
+    if changes.unknown and changes.reason:
+        print(f"[git-hook] escalating: {changes.reason}", flush=True)
+
+    child_env = _scrub_git_env(os.environ)
+
+    for gate in GATES:
+        if phase not in gate.phases:
+            continue
+        if gate not in selected:
+            surfaces = ",".join(_ordered_surfaces(gate.surfaces))
+            print(f"[git-hook] {gate.name}: skip ({surfaces})", flush=True)
+            continue
+        print(f"[git-hook] {gate.name}: run", flush=True)
+        result = subprocess.run(
+            list(gate.argv), shell=False, cwd=ROOT, env=child_env, check=False
+        )
+        if result.returncode != 0:
+            print(f"[git-hook] {gate.name}: fail ({result.returncode})", flush=True)
+            return result.returncode
+    return 0
 
 
 def gate_summary(paths: list[str]) -> tuple[bool, bool, bool]:

@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import dataclasses
 import importlib.util
+import os
 import pathlib
 import subprocess
 import sys
@@ -1242,6 +1243,335 @@ class _StdinStub:
 
     def read(self) -> str:
         return self._text
+
+
+# --- Task 5: execution layer -- hardened subprocess contract --------------
+#
+# No test in this section invokes a real gate command (cargo/pytest/bash are
+# slow and side-effecting). Every `subprocess.run` call is replaced by
+# `_FakeGateRun`, keyed on the exact argv *list* execute_gates passes --
+# distinct from `_FakeGitRun` above, which asserts `cmd[0] == "git"` and
+# would reject a gate invocation outright.
+
+
+class _FakeGateRun:
+    """Stand-in for `subprocess.run` used by every Task 5 test. Never shells
+    out and never runs a real gate. `responses` maps an argv tuple to the
+    returncode that call should yield. An unanticipated call raises
+    KeyError, proving each test drives an exact, intentional sequence of
+    gate invocations.
+    """
+
+    def __init__(self, responses):
+        self.responses = responses
+        self.calls: list[tuple[list, dict]] = []
+
+    def __call__(self, cmd, **kwargs):
+        self.calls.append((list(cmd), kwargs))
+        key = tuple(cmd)
+        returncode = self.responses[key]
+        return subprocess.CompletedProcess(cmd, returncode)
+
+
+def _only_rust_changes():
+    return hook.ChangeSet(
+        paths=("crates/ironmem/src/hook.rs",), unknown=False, reason=None
+    )
+
+
+# --- execute_gates -- runs only resolver-selected gates, in manifest order -
+
+
+def test_execute_gates_runs_only_selected_gates_in_manifest_order(monkeypatch):
+    fake = _FakeGateRun(
+        {
+            ("cargo", "fmt", "--all", "--", "--check"): 0,
+            (
+                "cargo",
+                "clippy",
+                "--workspace",
+                "--all-targets",
+                "--all-features",
+                "--",
+                "-D",
+                "warnings",
+            ): 0,
+        }
+    )
+    monkeypatch.setattr(hook.subprocess, "run", fake)
+    rc = hook.execute_gates(hook.PHASE_PRE_COMMIT, _only_rust_changes())
+    assert rc == 0
+    assert [cmd for cmd, _kwargs in fake.calls] == [
+        ["cargo", "fmt", "--all", "--", "--check"],
+        [
+            "cargo",
+            "clippy",
+            "--workspace",
+            "--all-targets",
+            "--all-features",
+            "--",
+            "-D",
+            "warnings",
+        ],
+    ]
+
+
+def test_execute_gates_returns_zero_when_nothing_selected(monkeypatch):
+    fake = _FakeGateRun({})
+    monkeypatch.setattr(hook.subprocess, "run", fake)
+    changes = hook.ChangeSet(paths=("README.md",), unknown=False, reason=None)
+    rc = hook.execute_gates(hook.PHASE_PRE_COMMIT, changes)
+    assert rc == 0
+    assert fake.calls == []
+
+
+# --- execute_gates -- the hardened subprocess contract itself -------------
+
+
+def test_execute_gates_calls_subprocess_run_with_exact_contract(monkeypatch):
+    fake = _FakeGateRun(
+        {
+            ("cargo", "fmt", "--all", "--", "--check"): 0,
+            (
+                "cargo",
+                "clippy",
+                "--workspace",
+                "--all-targets",
+                "--all-features",
+                "--",
+                "-D",
+                "warnings",
+            ): 0,
+        }
+    )
+    monkeypatch.setattr(hook.subprocess, "run", fake)
+    hook.execute_gates(hook.PHASE_PRE_COMMIT, _only_rust_changes())
+    cmd, kwargs = fake.calls[0]
+    assert cmd == ["cargo", "fmt", "--all", "--", "--check"]
+    assert kwargs.get("shell") is False
+    assert kwargs.get("cwd") == hook.ROOT
+    assert kwargs.get("check") is False
+    assert "env" in kwargs
+
+
+# --- execute_gates -- stop-at-first-failure, propagate exact exit code ----
+
+
+def test_execute_gates_stops_at_first_failure_and_propagates_exit_code(monkeypatch):
+    fake = _FakeGateRun(
+        {
+            ("cargo", "fmt", "--all", "--", "--check"): 3,
+            (
+                "cargo",
+                "clippy",
+                "--workspace",
+                "--all-targets",
+                "--all-features",
+                "--",
+                "-D",
+                "warnings",
+            ): 0,
+        }
+    )
+    monkeypatch.setattr(hook.subprocess, "run", fake)
+    rc = hook.execute_gates(hook.PHASE_PRE_COMMIT, _only_rust_changes())
+    assert rc == 3
+    # rust_clippy must never be invoked once rust_fmt_check has failed.
+    assert [cmd for cmd, _kwargs in fake.calls] == [
+        ["cargo", "fmt", "--all", "--", "--check"]
+    ]
+
+
+# --- execute_gates -- one deterministic line per gate: run/skip/fail ------
+
+
+def test_execute_gates_prints_run_line_for_selected_gate(monkeypatch, capsys):
+    fake = _FakeGateRun({("cargo", "fmt", "--all", "--", "--check"): 0})
+    monkeypatch.setattr(hook.subprocess, "run", fake)
+    changes = hook.ChangeSet(
+        paths=("crates/ironmem/src/hook.rs",), unknown=False, reason=None
+    )
+    # Restrict to a single-gate manifest slice so this test only proves the
+    # run-line, not interactions with the rest of the real manifest.
+    fmt_gate = next(gate for gate in hook.GATES if gate.name == "rust_fmt_check")
+    monkeypatch.setattr(hook, "GATES", (fmt_gate,))
+    hook.execute_gates(hook.PHASE_PRE_COMMIT, changes)
+    out = capsys.readouterr().out
+    assert "rust_fmt_check" in out
+    assert "run" in out
+
+
+def test_execute_gates_prints_skip_line_with_surfaces_not_touched(monkeypatch, capsys):
+    fake = _FakeGateRun({})
+    monkeypatch.setattr(hook.subprocess, "run", fake)
+    collab_gate = next(
+        gate for gate in hook.GATES if gate.name == "collab_template_lint"
+    )
+    monkeypatch.setattr(hook, "GATES", (collab_gate,))
+    changes = hook.ChangeSet(paths=(), unknown=False, reason=None)
+    hook.execute_gates(hook.PHASE_PRE_COMMIT, changes)
+    out = capsys.readouterr().out
+    assert "collab_template_lint" in out
+    assert "skip" in out
+    assert hook.SURFACE_COLLAB_PROTOCOL in out
+    assert fake.calls == []
+
+
+def test_execute_gates_skip_line_lists_surfaces_deterministically(monkeypatch, capsys):
+    # Print the skip line twice for the same gate and assert both renderings
+    # are byte-identical -- proves the surfaces field isn't drawn straight
+    # from frozenset iteration (hash-randomized per process, not per call,
+    # so a within-process rerun is the strongest test-time proxy available).
+    fake = _FakeGateRun({})
+    monkeypatch.setattr(hook.subprocess, "run", fake)
+    hook_gate = next(gate for gate in hook.GATES if gate.name == "hook_self_test")
+    monkeypatch.setattr(hook, "GATES", (hook_gate,))
+    changes = hook.ChangeSet(paths=(), unknown=False, reason=None)
+    hook.execute_gates(hook.PHASE_PRE_COMMIT, changes)
+    first = capsys.readouterr().out
+    hook.execute_gates(hook.PHASE_PRE_COMMIT, changes)
+    second = capsys.readouterr().out
+    assert first == second
+
+
+def test_execute_gates_prints_fail_line_with_exit_code(monkeypatch, capsys):
+    fake = _FakeGateRun({("cargo", "fmt", "--all", "--", "--check"): 7})
+    monkeypatch.setattr(hook.subprocess, "run", fake)
+    fmt_gate = next(gate for gate in hook.GATES if gate.name == "rust_fmt_check")
+    monkeypatch.setattr(hook, "GATES", (fmt_gate,))
+    changes = hook.ChangeSet(
+        paths=("crates/ironmem/src/hook.rs",), unknown=False, reason=None
+    )
+    rc = hook.execute_gates(hook.PHASE_PRE_COMMIT, changes)
+    assert rc == 7
+    out = capsys.readouterr().out
+    assert "rust_fmt_check" in out
+    assert "fail" in out
+    assert "7" in out
+
+
+# --- execute_gates -- unknown=True prints the escalation reason -----------
+
+
+def test_execute_gates_prints_escalation_reason_when_unknown(monkeypatch, capsys):
+    fake = _FakeGateRun({("python3", "scripts/test_run_git_hook.py"): 0})
+    monkeypatch.setattr(hook.subprocess, "run", fake)
+    hook_gate = next(gate for gate in hook.GATES if gate.name == "hook_self_test")
+    monkeypatch.setattr(hook, "GATES", (hook_gate,))
+    changes = hook.ChangeSet(paths=(), unknown=True, reason="git diff failed mid-batch")
+    hook.execute_gates(hook.PHASE_PRE_COMMIT, changes)
+    out = capsys.readouterr().out
+    assert "git diff failed mid-batch" in out
+
+
+def test_execute_gates_no_escalation_line_when_known(monkeypatch, capsys):
+    fake = _FakeGateRun({})
+    monkeypatch.setattr(hook.subprocess, "run", fake)
+    changes = hook.ChangeSet(paths=(), unknown=False, reason=None)
+    hook.execute_gates(hook.PHASE_PRE_COMMIT, changes)
+    out = capsys.readouterr().out
+    assert "escalat" not in out.lower()
+
+
+# --- execute_gates -- invalid phase still fails loudly (delegates to
+# resolve_gates's own guard, not re-implemented) ----------------------------
+
+
+def test_execute_gates_unknown_phase_raises():
+    changes = hook.ChangeSet(paths=(), unknown=False, reason=None)
+    with pytest.raises(ValueError):
+        hook.execute_gates("typo-phase", changes)
+
+
+# --- _scrub_git_env -- the security-critical part of this task ------------
+#
+# This is the direct regression guard for PR #186: a pre-push hook exporting
+# GIT_DIR/GIT_INDEX_FILE/GIT_WORK_TREE, inherited by a `cargo test` tempdir
+# Git fixture, committed junk onto the real branch. These tests assert on
+# the env dict itself, not a call count.
+
+
+def test_scrub_git_env_strips_repo_redirecting_vars():
+    source = {
+        "GIT_DIR": "/tmp/evil/.git",
+        "GIT_INDEX_FILE": "/tmp/evil/index",
+        "GIT_WORK_TREE": "/tmp/evil",
+        "GIT_OBJECT_DIRECTORY": "/tmp/evil/objects",
+        "GIT_ALTERNATE_OBJECT_DIRECTORIES": "/tmp/evil/alt",
+        "GIT_COMMON_DIR": "/tmp/evil/common",
+        "GIT_NAMESPACE": "evil-namespace",
+        "PATH": "/usr/bin",
+    }
+    scrubbed = hook._scrub_git_env(source)
+    for dangerous_key in (
+        "GIT_DIR",
+        "GIT_INDEX_FILE",
+        "GIT_WORK_TREE",
+        "GIT_OBJECT_DIRECTORY",
+        "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+        "GIT_COMMON_DIR",
+        "GIT_NAMESPACE",
+    ):
+        assert dangerous_key not in scrubbed
+    assert scrubbed["PATH"] == "/usr/bin"
+
+
+def test_scrub_git_env_keeps_explicit_keep_list():
+    source = {
+        "GIT_ASKPASS": "/usr/bin/askpass",
+        "GIT_SSH": "/usr/bin/ssh",
+        "GIT_SSH_COMMAND": "ssh -i key",
+        "GIT_TERMINAL_PROMPT": "0",
+        "GIT_CONFIG_COUNT": "1",
+        "GIT_CONFIG_KEY_0": "core.pager",
+        "GIT_CONFIG_VALUE_0": "cat",
+        "GIT_TRACE": "1",
+        "GIT_TRACE_PACKET": "1",
+    }
+    scrubbed = hook._scrub_git_env(source)
+    assert scrubbed == source
+
+
+def test_scrub_git_env_strips_unlisted_git_var_not_yet_enumerated():
+    # Default-toward-scrubbing: an unrecognized GIT_* variable not in the
+    # keep-list must be dropped, not silently passed through.
+    source = {"GIT_SOME_FUTURE_FLAG": "danger", "PATH": "/usr/bin"}
+    scrubbed = hook._scrub_git_env(source)
+    assert "GIT_SOME_FUTURE_FLAG" not in scrubbed
+    assert scrubbed["PATH"] == "/usr/bin"
+
+
+def test_scrub_git_env_returns_new_dict_never_mutates_source():
+    source = {"GIT_DIR": "/tmp/evil", "PATH": "/usr/bin"}
+    original = dict(source)
+    hook._scrub_git_env(source)
+    assert source == original
+
+
+# --- execute_gates -- env scrub wired end-to-end into the subprocess call -
+
+
+def test_execute_gates_scrubs_git_env_before_running_a_gate(monkeypatch):
+    monkeypatch.setenv("GIT_DIR", "/tmp/evil/.git")
+    monkeypatch.setenv("GIT_INDEX_FILE", "/tmp/evil/index")
+    monkeypatch.setenv("GIT_WORK_TREE", "/tmp/evil")
+    monkeypatch.setenv("GIT_ASKPASS", "/usr/bin/askpass")
+    fake = _FakeGateRun({("cargo", "fmt", "--all", "--", "--check"): 0})
+    monkeypatch.setattr(hook.subprocess, "run", fake)
+    fmt_gate = next(gate for gate in hook.GATES if gate.name == "rust_fmt_check")
+    monkeypatch.setattr(hook, "GATES", (fmt_gate,))
+    changes = hook.ChangeSet(
+        paths=("crates/ironmem/src/hook.rs",), unknown=False, reason=None
+    )
+    hook.execute_gates(hook.PHASE_PRE_COMMIT, changes)
+    _cmd, kwargs = fake.calls[0]
+    child_env = kwargs["env"]
+    assert "GIT_DIR" not in child_env
+    assert "GIT_INDEX_FILE" not in child_env
+    assert "GIT_WORK_TREE" not in child_env
+    assert child_env.get("GIT_ASKPASS") == "/usr/bin/askpass"
+    # Non-Git variables inherited from the real environment must survive.
+    assert child_env.get("PATH") == os.environ.get("PATH")
 
 
 # --- module-wide static guard -----------------------------------------------
