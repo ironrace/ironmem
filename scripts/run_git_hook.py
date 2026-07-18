@@ -38,7 +38,13 @@ from types import MappingProxyType
 from typing import Callable, Mapping
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
-ZERO_SHA = "0" * 40
+
+# Wall-clock ceiling for every Git subprocess this module runs. A hung Git
+# (an unreachable remote, a stuck index.lock, a credential helper waiting on a
+# tty) would otherwise hang the hook -- and therefore the developer's commit or
+# push -- forever with no output. Exceeding it raises `TimeoutExpired`, which
+# the collection layer's fail-closed boundary turns into `unknown=True`.
+_GIT_TIMEOUT_SECONDS = 60
 
 COLLAB_EXACT_PATHS = {
     ".claude-plugin/commands/collab.md",
@@ -81,6 +87,7 @@ def git(args: list[str], *, input_text: str | None = None, check: bool = True) -
         capture_output=True,
         check=False,
         env=_scrub_git_env(os.environ),
+        timeout=_GIT_TIMEOUT_SECONDS,
     )
     if check and result.returncode != 0:
         sys.stderr.write(result.stderr)
@@ -167,9 +174,16 @@ def _run_git(args: tuple[str, ...]) -> tuple[bool, int, str, str]:
     missing, output undecodable, etc.) -- never based on git's own exit
     code, which callers interpret themselves; this is the single fail-closed
     boundary for Git subprocess calls in the collection layer, so a failure
-    here becomes a structured signal, never a traceback. `reason` is built
-    only from the argv and the exception's class name -- never from
-    output or environment -- so it cannot carry credentials or secrets.
+    here becomes a structured signal, never a traceback.
+
+    `reason` is built from the full argv, the exception's class name, and the
+    exception's message -- never from the subprocess's captured output or from
+    the environment. The class name alone made `PermissionError`, `OSError`,
+    and `UnicodeDecodeError` indistinguishable in a failure report; the
+    message is what makes them debuggable. The same constraint the argv
+    interpolation carries applies to it: every caller in this module passes
+    subcommands, flags, and shas -- never a remote URL or a `user:pass@host`
+    remote spec -- so neither half can carry credentials.
 
     Runs with `env=_scrub_git_env(os.environ)`, the same scrub the execution
     layer applies. This is not merely outbound hygiene here: an inherited
@@ -186,14 +200,25 @@ def _run_git(args: tuple[str, ...]) -> tuple[bool, int, str, str]:
             capture_output=True,
             check=False,
             env=_scrub_git_env(os.environ),
+            timeout=_GIT_TIMEOUT_SECONDS,
         )
     except Exception as exc:  # fail-closed: never let this propagate
-        # Guard args[0]: an empty `args` tuple must still fail closed with a
-        # structured reason, not raise IndexError from inside this handler
-        # (which would itself escape the fail-closed boundary this function
-        # exists to provide).
-        subcommand = args[0] if args else "<no-args>"
-        return False, -1, "", f"git {subcommand} invocation raised {type(exc).__name__}"
+        # `subprocess.TimeoutExpired` lands here like any other failure and
+        # becomes an ordinary fail-closed `unknown=True` ChangeSet upstream --
+        # a hung Git escalates, it never presents as "no changes".
+        #
+        # The full argv, not just `args[0]`: `git diff exited` is not enough
+        # to tell which of this module's four diff invocations failed. An
+        # empty `args` tuple renders as `<no-args>` rather than raising
+        # IndexError from inside this handler (which would itself escape the
+        # fail-closed boundary this function exists to provide).
+        rendered_args = " ".join(args) if args else "<no-args>"
+        return (
+            False,
+            -1,
+            "",
+            f"git {rendered_args} invocation raised {type(exc).__name__}: {exc}",
+        )
     return True, result.returncode, result.stdout, ""
 
 
@@ -273,9 +298,20 @@ def _collect_update_paths(local_sha: str, remote_sha: str) -> tuple[bool, tuple[
     if not ok:
         return False, (), reason
     if base is not None:
-        return _git_diff_paths_z(("diff", "--name-only", "--no-renames", "-z", f"{base}..{local_sha}"))
+        return _git_diff_paths_z(
+            ("diff", "--name-only", "--no-renames", "-z", f"{base}..{local_sha}")
+        )
     return _git_diff_paths_z(
-        ("diff-tree", "--root", "--no-commit-id", "--name-only", "--no-renames", "-z", "-r", local_sha)
+        (
+            "diff-tree",
+            "--root",
+            "--no-commit-id",
+            "--name-only",
+            "--no-renames",
+            "-z",
+            "-r",
+            local_sha,
+        )
     )
 
 
@@ -1057,8 +1093,13 @@ def execute_gates(phase: str, changes: ChangeSet) -> int:
 
 def _pre_push_manual_upstream_changes() -> ChangeSet:
     """Fallback for a manual/direct `pre-push` invocation with genuinely
-    empty stdin (nothing piped at all). `main()` calls this only when the
-    raw stdin text itself is empty or whitespace-only -- the real
+    empty stdin (nothing piped at all). `main()` calls this only when the raw
+    stdin text is exactly empty. Whitespace-only stdin does NOT reach here:
+    a blank line is a ref-update line with zero fields, so
+    `collect_pre_push_changes` rejects it as malformed and returns
+    `unknown=True`, which `main()`'s `not changes.unknown` guard blocks. That
+    is fail-closed and deliberate -- whitespace-only stdin escalates to every
+    gate rather than silently diffing an unrelated range. The real
     `git push`-invoked hook always pipes at least one ref-update line per
     the pre-push hook contract, so a real push (including a deletion-only
     `git push --delete branch`, whose lines are all-zero-sha and are
@@ -1106,12 +1147,19 @@ def main(phase: str) -> int:
 
     pre-commit collects via `collect_pre_commit_changes()`. pre-push reads
     the ref-update batch from stdin via `collect_pre_push_changes()`; when
-    the raw stdin text itself is empty or whitespace-only (nothing piped at
-    all -- never true for a real `git push`-invoked hook, which always pipes
-    at least one ref-update line per the pre-push hook contract), falls back
-    to `_pre_push_manual_upstream_changes()` for a manual invocation outside
+    the raw stdin text is exactly empty (nothing piped at all -- never true
+    for a real `git push`-invoked hook, which always pipes at least one
+    ref-update line per the pre-push hook contract), falls back to
+    `_pre_push_manual_upstream_changes()` for a manual invocation outside
     Git's stdin contract (see that function's docstring for why this is kept
     and what it does and does not cover).
+
+    Whitespace-only stdin never reaches that fallback, despite `strip()`
+    appearing in the guard below: a blank line is a zero-field ref-update
+    line, so `collect_pre_push_changes` has already returned `unknown=True`
+    and the `not changes.unknown` half of the guard is False. Whitespace-only
+    input therefore escalates to every gate -- fail-closed, and deliberately
+    kept that way.
 
     Gating on the raw stdin text, not on `changes.paths` being empty, is
     deliberate: a deletion-only push (`git push --delete branch`) pipes

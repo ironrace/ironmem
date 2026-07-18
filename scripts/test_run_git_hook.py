@@ -1166,6 +1166,36 @@ SHA_A = "a" * 40
 SHA_B = "b" * 40
 SHA_C = "c" * 40
 
+# The exact collection-layer argv tuples, spelled once. `--no-renames` is
+# load-bearing (see run_git_hook.py's collection-layer comment); _FakeGitRun
+# raises KeyError on any argv it was not primed for, so these constants still
+# pin the invocation byte-for-byte.
+_PRE_COMMIT_DIFF = ("diff", "--cached", "--name-only", "--no-renames", "-z")
+
+
+def _range_diff(base, head):
+    return ("diff", "--name-only", "--no-renames", "-z", f"{base}..{head}")
+
+
+def _root_diff(sha):
+    return (
+        "diff-tree",
+        "--root",
+        "--no-commit-id",
+        "--name-only",
+        "--no-renames",
+        "-z",
+        "-r",
+        sha,
+    )
+
+
+# Git's all-zero null object ids, derived from the module's own supported
+# object-id lengths rather than from a SHA-1-only literal: the production code
+# recognizes both, so the tests must exercise the same vocabulary.
+ZERO_SHA_1 = "0" * min(hook._SHA_LENGTHS)
+ZERO_SHA_256 = "0" * max(hook._SHA_LENGTHS)
+
 
 class _FakeGitRun:
     """Stand-in for `subprocess.run` used by every Task 4 test. Never shells
@@ -1247,8 +1277,8 @@ def test_is_hex_sha_rejects_length_between_40_and_64():
 
 
 def test_is_zero_sha_accepts_sha1_and_sha256_null_object_ids():
-    assert hook._is_zero_sha("0" * 40) is True
-    assert hook._is_zero_sha("0" * 64) is True
+    assert hook._is_zero_sha(ZERO_SHA_1) is True
+    assert hook._is_zero_sha(ZERO_SHA_256) is True
 
 
 def test_is_zero_sha_rejects_non_null_or_invalid_object_ids():
@@ -1285,22 +1315,30 @@ def test_run_git_guards_empty_args_on_subprocess_failure(monkeypatch):
     assert returncode == -1
     assert stdout == ""
     assert reason
-    assert "boom" not in reason
+    assert "<no-args>" in reason
+    # CONTRACT CHANGE: `reason` now carries the exception message as well as
+    # its class name (see _run_git's docstring). The class name alone made
+    # PermissionError/OSError/UnicodeDecodeError indistinguishable in a
+    # failure report. The invariant that still holds -- and is what the
+    # earlier "message excluded" assertion was really protecting -- is that
+    # `reason` never carries the subprocess's captured output or the
+    # environment, and that no caller passes a remote URL in the argv.
+    assert "OSError: boom" in reason
 
 
 # --- collect_pre_commit_changes ---------------------------------------------
 
 
 def test_collect_pre_commit_changes_success(monkeypatch):
-    fake = _FakeGitRun({("diff", "--cached", "--name-only", "--no-renames", "-z"): (0, "a.py\0b/c.txt\0")})
+    fake = _FakeGitRun({_PRE_COMMIT_DIFF: (0, "a.py\0b/c.txt\0")})
     monkeypatch.setattr(hook.subprocess, "run", fake)
     changes = hook.collect_pre_commit_changes()
     assert changes == hook.ChangeSet(paths=("a.py", "b/c.txt"), unknown=False, reason=None)
-    assert fake.calls == [("diff", "--cached", "--name-only", "--no-renames", "-z")]
+    assert fake.calls == [_PRE_COMMIT_DIFF]
 
 
 def test_collect_pre_commit_changes_no_staged_files_is_not_unknown(monkeypatch):
-    fake = _FakeGitRun({("diff", "--cached", "--name-only", "--no-renames", "-z"): (0, "")})
+    fake = _FakeGitRun({_PRE_COMMIT_DIFF: (0, "")})
     monkeypatch.setattr(hook.subprocess, "run", fake)
     changes = hook.collect_pre_commit_changes()
     # Empty paths + unknown=False must mean "genuinely no changes", never
@@ -1309,7 +1347,7 @@ def test_collect_pre_commit_changes_no_staged_files_is_not_unknown(monkeypatch):
 
 
 def test_collect_pre_commit_changes_nonzero_exit_is_unknown(monkeypatch):
-    fake = _FakeGitRun({("diff", "--cached", "--name-only", "--no-renames", "-z"): (128, "")})
+    fake = _FakeGitRun({_PRE_COMMIT_DIFF: (128, "")})
     monkeypatch.setattr(hook.subprocess, "run", fake)
     changes = hook.collect_pre_commit_changes()
     assert changes.paths == ()
@@ -1319,20 +1357,22 @@ def test_collect_pre_commit_changes_nonzero_exit_is_unknown(monkeypatch):
 
 def test_collect_pre_commit_changes_subprocess_failure_is_unknown_never_raises(monkeypatch):
     fake = _FakeGitRun(
-        {("diff", "--cached", "--name-only", "--no-renames", "-z"): FileNotFoundError("git: command not found")}
+        {_PRE_COMMIT_DIFF: FileNotFoundError("git: command not found")}
     )
     monkeypatch.setattr(hook.subprocess, "run", fake)
     changes = hook.collect_pre_commit_changes()
     assert changes.paths == ()
     assert changes.unknown is True
     assert changes.reason
-    # The raw exception message is never propagated into `reason`.
-    assert "command not found" not in changes.reason
+    # CONTRACT CHANGE: the exception message is now propagated into `reason`
+    # (see test_run_git_guards_empty_args_on_subprocess_failure); the
+    # subprocess's captured output still never is.
+    assert "FileNotFoundError: git: command not found" in changes.reason
 
 
 def test_collect_pre_commit_changes_preserves_byte_exact_paths(monkeypatch):
     weird = "docs/plan\n notes (β).md"
-    fake = _FakeGitRun({("diff", "--cached", "--name-only", "--no-renames", "-z"): (0, f"{weird}\0")})
+    fake = _FakeGitRun({_PRE_COMMIT_DIFF: (0, f"{weird}\0")})
     monkeypatch.setattr(hook.subprocess, "run", fake)
     changes = hook.collect_pre_commit_changes()
     assert changes.paths == (weird,)
@@ -1345,11 +1385,11 @@ def test_collect_pre_commit_changes_no_diff_filter_flag(monkeypatch):
     # additional flag, including a reintroduced --diff-filter, would make
     # this call miss the fake's response table and fail loudly.
     fake = _FakeGitRun(
-        {("diff", "--cached", "--name-only", "--no-renames", "-z"): (0, "crates/ironmem/src/deleted.rs\0")}
+        {_PRE_COMMIT_DIFF: (0, "crates/ironmem/src/deleted.rs\0")}
     )
     monkeypatch.setattr(hook.subprocess, "run", fake)
     hook.collect_pre_commit_changes()
-    assert fake.calls == [("diff", "--cached", "--name-only", "--no-renames", "-z")]
+    assert fake.calls == [_PRE_COMMIT_DIFF]
 
 
 def test_staged_deletion_of_rust_path_is_collected_and_selects_rust_gates(monkeypatch):
@@ -1363,7 +1403,7 @@ def test_staged_deletion_of_rust_path_is_collected_and_selects_rust_gates(monkey
     # is collected (not dropped) and it selects the Rust gates for
     # pre-commit.
     fake = _FakeGitRun(
-        {("diff", "--cached", "--name-only", "--no-renames", "-z"): (0, "crates/ironmem/src/deleted.rs\0")}
+        {_PRE_COMMIT_DIFF: (0, "crates/ironmem/src/deleted.rs\0")}
     )
     monkeypatch.setattr(hook.subprocess, "run", fake)
     changes = hook.collect_pre_commit_changes()
@@ -1373,6 +1413,71 @@ def test_staged_deletion_of_rust_path_is_collected_and_selects_rust_gates(monkey
     names = [gate.name for gate in hook.resolve_gates(hook.PHASE_PRE_COMMIT, changes)]
     assert "rust_fmt_check" in names
     assert "rust_clippy" in names
+
+
+# --- _run_git reason detail and timeout ------------------------------------
+
+
+def test_run_git_reason_includes_full_argv_not_just_the_subcommand():
+    args = _PRE_COMMIT_DIFF
+    fake = _FakeGitRun({args: OSError("boom")})
+    ok, _rc, _stdout, reason = _call_with_fake_run(fake, hook._run_git, args)
+    assert ok is False
+    for token in args:
+        assert token in reason
+
+
+def test_run_git_reason_includes_the_exception_message():
+    # PermissionError / OSError / UnicodeDecodeError are indistinguishable
+    # when only the class name is recorded.
+    args = _PRE_COMMIT_DIFF
+    fake = _FakeGitRun({args: PermissionError("permission denied: /usr/bin/git")})
+    _ok, _rc, _stdout, reason = _call_with_fake_run(fake, hook._run_git, args)
+    assert "PermissionError" in reason
+    assert "permission denied: /usr/bin/git" in reason
+
+
+def test_run_git_passes_a_timeout():
+    args = _PRE_COMMIT_DIFF
+    recorder = _KwargRecordingRun()
+    _call_with_fake_run(recorder, hook._run_git, args)
+    assert recorder.kwargs[0]["timeout"] == hook._GIT_TIMEOUT_SECONDS
+
+
+def test_legacy_git_helper_passes_a_timeout():
+    recorder = _KwargRecordingRun()
+    _call_with_fake_run(recorder, hook.git, ["rev-parse", "--verify", "@{u}"], check=False)
+    assert recorder.kwargs[0]["timeout"] == hook._GIT_TIMEOUT_SECONDS
+
+
+def test_collect_pre_commit_changes_timeout_is_fail_closed(monkeypatch):
+    # A hung git must escalate, never present as "nothing staged".
+    args = _PRE_COMMIT_DIFF
+    fake = _FakeGitRun({args: subprocess.TimeoutExpired(["git", *args], 60)})
+    monkeypatch.setattr(hook.subprocess, "run", fake)
+    changes = hook.collect_pre_commit_changes()
+    assert changes.unknown is True
+    assert "TimeoutExpired" in changes.reason
+
+
+class _KwargRecordingRun:
+    """`subprocess.run` stand-in recording every call's kwargs."""
+
+    def __init__(self):
+        self.kwargs: list[dict] = []
+
+    def __call__(self, cmd, **kwargs):
+        self.kwargs.append(kwargs)
+        return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+
+def _call_with_fake_run(fake, func, *args, **kwargs):
+    real = hook.subprocess.run
+    hook.subprocess.run = fake
+    try:
+        return func(*args, **kwargs)
+    finally:
+        hook.subprocess.run = real
 
 
 # --- collection layer runs with a scrubbed GIT_* env ------------------------
@@ -1476,7 +1581,7 @@ def test_collect_pre_commit_changes_disables_rename_detection(monkeypatch):
     # longer compile. `--no-renames` makes Git report both sides.
     fake = _FakeGitRun(
         {
-            ("diff", "--cached", "--name-only", "--no-renames", "-z"): (
+            _PRE_COMMIT_DIFF: (
                 0,
                 "docs/foo.md\0crates/ironmem/src/foo.rs\0",
             )
@@ -1495,7 +1600,7 @@ def test_collect_pre_commit_changes_disables_rename_detection(monkeypatch):
 
 def test_collect_pre_push_changes_single_update(monkeypatch):
     stdin = _pre_push_line("refs/heads/feature", SHA_B, "refs/heads/feature", SHA_A) + "\n"
-    fake = _FakeGitRun({("diff", "--name-only", "--no-renames", "-z", f"{SHA_A}..{SHA_B}"): (0, "x.py\0y.py\0")})
+    fake = _FakeGitRun({_range_diff(SHA_A, SHA_B): (0, "x.py\0y.py\0")})
     monkeypatch.setattr(hook.subprocess, "run", fake)
     changes = hook.collect_pre_push_changes(stdin)
     assert changes == hook.ChangeSet(paths=("x.py", "y.py"), unknown=False, reason=None)
@@ -1508,7 +1613,7 @@ def test_collect_pre_push_changes_disables_rename_detection(monkeypatch):
     stdin = _pre_push_line("refs/heads/feature", SHA_B, "refs/heads/feature", SHA_A) + "\n"
     fake = _FakeGitRun(
         {
-            ("diff", "--name-only", "--no-renames", "-z", f"{SHA_A}..{SHA_B}"): (
+            _range_diff(SHA_A, SHA_B): (
                 0,
                 "docs/foo.md\0crates/ironmem/src/foo.rs\0",
             )
@@ -1524,8 +1629,7 @@ def test_collect_pre_push_changes_disables_rename_detection(monkeypatch):
 def test_collect_pre_push_branch_creation_diff_tree_disables_rename_detection(monkeypatch):
     # The branch-creation root-diff path (`git diff-tree`) has the same
     # default rename detection and needs the same flag.
-    zero = "0" * 40
-    stdin = _pre_push_line("refs/heads/new", SHA_B, "refs/heads/new", zero) + "\n"
+    stdin = _pre_push_line("refs/heads/new", SHA_B, "refs/heads/new", ZERO_SHA_1) + "\n"
     fake = _FakeGitRun(
         {
             ("symbolic-ref", "--quiet", "refs/remotes/origin/HEAD"): (1, ""),
@@ -1533,16 +1637,7 @@ def test_collect_pre_push_branch_creation_diff_tree_disables_rename_detection(mo
             ("merge-base", SHA_B, "origin/master"): (1, ""),
             ("merge-base", SHA_B, "main"): (1, ""),
             ("merge-base", SHA_B, "master"): (1, ""),
-            (
-                "diff-tree",
-                "--root",
-                "--no-commit-id",
-                "--name-only",
-                "--no-renames",
-                "-z",
-                "-r",
-                SHA_B,
-            ): (0, "crates/ironmem/src/foo.rs\0"),
+            _root_diff(SHA_B): (0, "crates/ironmem/src/foo.rs\0"),
         }
     )
     monkeypatch.setattr(hook.subprocess, "run", fake)
@@ -1562,8 +1657,8 @@ def test_collect_pre_push_changes_multi_ref_dedupes_first_seen(monkeypatch):
     )
     fake = _FakeGitRun(
         {
-            ("diff", "--name-only", "--no-renames", "-z", f"{SHA_A}..{SHA_B}"): (0, "x.py\0shared.py\0"),
-            ("diff", "--name-only", "--no-renames", "-z", f"{SHA_A}..{SHA_C}"): (0, "shared.py\0z.py\0"),
+            _range_diff(SHA_A, SHA_B): (0, "x.py\0shared.py\0"),
+            _range_diff(SHA_A, SHA_C): (0, "shared.py\0z.py\0"),
         }
     )
     monkeypatch.setattr(hook.subprocess, "run", fake)
@@ -1573,7 +1668,7 @@ def test_collect_pre_push_changes_multi_ref_dedupes_first_seen(monkeypatch):
 
 
 def test_collect_pre_push_changes_skips_deletion_ref(monkeypatch):
-    stdin = _pre_push_line("refs/heads/gone", hook.ZERO_SHA, "refs/heads/gone", SHA_A) + "\n"
+    stdin = _pre_push_line("refs/heads/gone", ZERO_SHA_1, "refs/heads/gone", SHA_A) + "\n"
     fake = _FakeGitRun({})  # no git diff call should happen at all
     monkeypatch.setattr(hook.subprocess, "run", fake)
     changes = hook.collect_pre_push_changes(stdin)
@@ -1582,9 +1677,8 @@ def test_collect_pre_push_changes_skips_deletion_ref(monkeypatch):
 
 
 def test_collect_pre_push_changes_skips_sha256_deletion_ref(monkeypatch):
-    zero_sha256 = "0" * 64
     sha256_remote = "a" * 64
-    stdin = _pre_push_line("refs/heads/gone", zero_sha256, "refs/heads/gone", sha256_remote) + "\n"
+    stdin = _pre_push_line("refs/heads/gone", ZERO_SHA_256, "refs/heads/gone", sha256_remote) + "\n"
     fake = _FakeGitRun({})  # no git diff call should happen at all
     monkeypatch.setattr(hook.subprocess, "run", fake)
     changes = hook.collect_pre_push_changes(stdin)
@@ -1593,7 +1687,7 @@ def test_collect_pre_push_changes_skips_sha256_deletion_ref(monkeypatch):
 
 
 def test_collect_pre_push_changes_branch_creation_uses_default_base(monkeypatch):
-    stdin = _pre_push_line("refs/heads/new", SHA_B, "refs/heads/new", hook.ZERO_SHA) + "\n"
+    stdin = _pre_push_line("refs/heads/new", SHA_B, "refs/heads/new", ZERO_SHA_1) + "\n"
     fake = _FakeGitRun(
         {
             ("symbolic-ref", "--quiet", "refs/remotes/origin/HEAD"): (
@@ -1601,7 +1695,7 @@ def test_collect_pre_push_changes_branch_creation_uses_default_base(monkeypatch)
                 "refs/remotes/origin/main\n",
             ),
             ("merge-base", SHA_B, "refs/remotes/origin/main"): (0, SHA_A + "\n"),
-            ("diff", "--name-only", "--no-renames", "-z", f"{SHA_A}..{SHA_B}"): (0, "new_file.py\0"),
+            _range_diff(SHA_A, SHA_B): (0, "new_file.py\0"),
         }
     )
     monkeypatch.setattr(hook.subprocess, "run", fake)
@@ -1610,10 +1704,9 @@ def test_collect_pre_push_changes_branch_creation_uses_default_base(monkeypatch)
 
 
 def test_collect_pre_push_changes_sha256_branch_creation_uses_default_base(monkeypatch):
-    zero_sha256 = "0" * 64
     sha256_base = "a" * 64
     sha256_local = "b" * 64
-    stdin = _pre_push_line("refs/heads/new", sha256_local, "refs/heads/new", zero_sha256) + "\n"
+    stdin = _pre_push_line("refs/heads/new", sha256_local, "refs/heads/new", ZERO_SHA_256) + "\n"
     fake = _FakeGitRun(
         {
             ("symbolic-ref", "--quiet", "refs/remotes/origin/HEAD"): (
@@ -1621,7 +1714,7 @@ def test_collect_pre_push_changes_sha256_branch_creation_uses_default_base(monke
                 "refs/remotes/origin/main\n",
             ),
             ("merge-base", sha256_local, "refs/remotes/origin/main"): (0, sha256_base + "\n"),
-            ("diff", "--name-only", "--no-renames", "-z", f"{sha256_base}..{sha256_local}"): (0, "new_file.py\0"),
+            _range_diff(sha256_base, sha256_local): (0, "new_file.py\0"),
         }
     )
     monkeypatch.setattr(hook.subprocess, "run", fake)
@@ -1630,7 +1723,7 @@ def test_collect_pre_push_changes_sha256_branch_creation_uses_default_base(monke
 
 
 def test_collect_pre_push_changes_missing_upstream_falls_back_to_root_diff(monkeypatch):
-    stdin = _pre_push_line("refs/heads/new", SHA_B, "refs/heads/new", hook.ZERO_SHA) + "\n"
+    stdin = _pre_push_line("refs/heads/new", SHA_B, "refs/heads/new", ZERO_SHA_1) + "\n"
     fake = _FakeGitRun(
         {
             ("symbolic-ref", "--quiet", "refs/remotes/origin/HEAD"): (1, ""),
@@ -1638,7 +1731,7 @@ def test_collect_pre_push_changes_missing_upstream_falls_back_to_root_diff(monke
             ("merge-base", SHA_B, "origin/master"): (1, ""),
             ("merge-base", SHA_B, "main"): (1, ""),
             ("merge-base", SHA_B, "master"): (1, ""),
-            ("diff-tree", "--root", "--no-commit-id", "--name-only", "--no-renames", "-z", "-r", SHA_B): (
+            _root_diff(SHA_B): (
                 0,
                 "root.py\0",
             ),
@@ -1672,8 +1765,8 @@ def test_collect_pre_push_changes_git_failure_mid_batch_preserves_prior_paths(mo
     )
     fake = _FakeGitRun(
         {
-            ("diff", "--name-only", "--no-renames", "-z", f"{SHA_A}..{SHA_B}"): (0, "x.py\0"),
-            ("diff", "--name-only", "--no-renames", "-z", f"{SHA_A}..{SHA_C}"): (128, ""),
+            _range_diff(SHA_A, SHA_B): (0, "x.py\0"),
+            _range_diff(SHA_A, SHA_C): (128, ""),
         }
     )
     monkeypatch.setattr(hook.subprocess, "run", fake)
@@ -1687,13 +1780,13 @@ def test_collect_pre_push_changes_git_failure_mid_batch_preserves_prior_paths(mo
 
 def test_collect_pre_push_changes_subprocess_failure_is_unknown_never_raises(monkeypatch):
     stdin = _pre_push_line("refs/heads/a", SHA_B, "refs/heads/a", SHA_A) + "\n"
-    fake = _FakeGitRun({("diff", "--name-only", "--no-renames", "-z", f"{SHA_A}..{SHA_B}"): OSError("boom")})
+    fake = _FakeGitRun({_range_diff(SHA_A, SHA_B): OSError("boom")})
     monkeypatch.setattr(hook.subprocess, "run", fake)
     changes = hook.collect_pre_push_changes(stdin)
     assert changes.paths == ()
     assert changes.unknown is True
     assert changes.reason
-    assert "boom" not in changes.reason
+    assert "OSError: boom" in changes.reason
 
 
 # --- collect_pre_push_changes -- fail-closed: malformed stdin ---------------
@@ -2527,6 +2620,29 @@ def test_main_pre_push_manual_invocation_falls_back_to_upstream(monkeypatch):
     ]
 
 
+def test_main_pre_push_whitespace_only_stdin_escalates_and_never_reaches_fallback(
+    monkeypatch, capsys
+):
+    # Pins the corrected docstring claim: main()/_pre_push_manual_upstream_
+    # changes() used to say the @{u} fallback fires when stdin is "empty or
+    # whitespace-only". Whitespace-only stdin is a malformed ref-update line,
+    # so collect_pre_push_changes returns unknown=True and the `not
+    # changes.unknown` guard keeps the fallback unreachable -- fail-closed,
+    # which is the correct behavior and is deliberately left unchanged. Only
+    # genuinely empty stdin reaches the fallback.
+    fake = _FakeSubprocessRun(
+        {_HOOK_SELF_TEST_ARGV: 0, _COLLAB_LINT_ARGV: 0, _RUST_TEST_ARGV: 0}
+    )
+    monkeypatch.setattr(hook.subprocess, "run", fake)
+    monkeypatch.setattr(sys, "stdin", _StdinStub("   \n"))
+    rc = hook.main(hook.PHASE_PRE_PUSH)
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "escalating" in out
+    # No `git` call at all: not the fallback's rev-parse, not a diff.
+    assert [cmd for cmd in fake.calls if cmd[0] == "git"] == []
+
+
 def test_main_pre_push_manual_invocation_no_upstream_runs_no_gates(monkeypatch):
     fake = _FakeSubprocessRun({("git", "rev-parse", "--verify", "@{u}"): (128, "")})
     monkeypatch.setattr(hook.subprocess, "run", fake)
@@ -2557,7 +2673,7 @@ def test_main_pre_push_manual_invocation_upstream_diff_failure_raises_systemexit
 def test_main_pre_push_with_stdin_paths_never_triggers_upstream_fallback(monkeypatch):
     stdin = _pre_push_line("refs/heads/a", SHA_B, "refs/heads/a", SHA_A) + "\n"
     fake = _FakeSubprocessRun(
-        {("git", "diff", "--name-only", "--no-renames", "-z", f"{SHA_A}..{SHA_B}"): (0, "README.md\0")}
+        {("git", *_range_diff(SHA_A, SHA_B)): (0, "README.md\0")}
     )
     monkeypatch.setattr(hook.subprocess, "run", fake)
     monkeypatch.setattr(sys, "stdin", _StdinStub(stdin))
@@ -2583,7 +2699,7 @@ def test_main_pre_push_deletion_only_push_does_not_trigger_upstream_fallback(mon
     # `stdin_text.strip()` instead means a real deletion-only push (non-empty
     # stdin) never reaches the fallback: no git calls at all, since there is
     # nothing to diff for a pure ref deletion.
-    stdin = _pre_push_line("refs/heads/gone", hook.ZERO_SHA, "refs/heads/gone", SHA_A) + "\n"
+    stdin = _pre_push_line("refs/heads/gone", ZERO_SHA_1, "refs/heads/gone", SHA_A) + "\n"
     fake = _FakeSubprocessRun({})  # no git call of any kind is expected
     monkeypatch.setattr(hook.subprocess, "run", fake)
     monkeypatch.setattr(sys, "stdin", _StdinStub(stdin))
