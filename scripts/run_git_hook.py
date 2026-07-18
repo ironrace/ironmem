@@ -111,6 +111,18 @@ def _is_hex_sha(value: str) -> bool:
     return len(value) in _SHA_LENGTHS and all(char in _HEX_DIGITS for char in value)
 
 
+def _is_zero_sha(value: str) -> bool:
+    """True if `value` is Git's all-zero null object id for a supported hash.
+
+    Git uses an all-zero object id to mark a pre-push branch creation
+    (remote SHA) or deletion (local SHA). The sentinel has the repository's
+    object-id length, so both SHA-1's 40 zeros and SHA-256's 64 zeros must be
+    recognized; treating a 64-zero SHA as an ordinary revision would make a
+    valid SHA-256 create/delete push fail collection and spuriously escalate.
+    """
+    return len(value) in _SHA_LENGTHS and value == "0" * len(value)
+
+
 def _split_nul(output: str) -> tuple[str, ...]:
     """Split `-z` NUL-delimited Git output into a byte-exact tuple of paths.
 
@@ -227,7 +239,7 @@ def _collect_update_paths(local_sha: str, remote_sha: str) -> tuple[bool, tuple[
     (missing upstream), falls back to a root diff of `local_sha`. `-z`
     NUL-delimited output throughout.
     """
-    if remote_sha != ZERO_SHA:
+    if not _is_zero_sha(remote_sha):
         return _git_diff_paths_z(("diff", "--name-only", "-z", f"{remote_sha}..{local_sha}"))
 
     ok, base, reason = _default_base(local_sha)
@@ -308,7 +320,7 @@ def collect_pre_push_changes(stdin_text: str) -> ChangeSet:
                 unknown=True,
                 reason=f"malformed pre-push stdin line {line_number}: non-hex sha",
             )
-        if local_sha == ZERO_SHA:
+        if _is_zero_sha(local_sha):
             continue  # deletion ref: nothing to diff
 
         ok, update_paths, reason = _collect_update_paths(local_sha, remote_sha)
@@ -405,7 +417,7 @@ def is_docs_path(path: str) -> bool:
 # Extensions no gate in GATES parses, executes, or otherwise inspects
 # *outside a gate-covered plugin root* (see `is_gate_covered_plugin_path`):
 # none of the five gates (hook self-test, install-drift check, collab
-# template lint, cargo fmt/clippy/test) reads JSON/YAML/shell/CSV/HTML
+# template lint, cargo fmt/clippy/test) reads JSON/YAML/shell/CSV
 # content when it lives outside `.claude-plugin/`-shaped directories -- but
 # `cargo test --workspace` does read exactly these formats inside one (see
 # the module comment above `is_gate_covered_plugin_path`). A
@@ -419,7 +431,6 @@ _INERT_CONFIG_EXTENSIONS = (
     ".yml",
     ".sh",
     ".csv",
-    ".html",
 )
 
 
@@ -440,8 +451,11 @@ def is_inert_config_path(path: str) -> bool:
     Three patterns, each justified by "no existing gate parses, executes, or
     otherwise inspects this file outside a gate-covered plugin root":
 
-    - A file extension in ``_INERT_CONFIG_EXTENSIONS`` (JSON/YAML/shell/CSV/
-      HTML) -- none of the five gates reads these formats there.
+    - A file extension in ``_INERT_CONFIG_EXTENSIONS`` (JSON/YAML/shell/CSV)
+      -- none of the five gates reads these formats there. HTML is deliberately
+      excluded: `crates/ironmem/src/dashboard/index.html` is compiled into the
+      binary with `include_str!`, so an HTML change must stay UNKNOWN and run
+      the Rust gates.
     - Any path under a top-level ``site/`` directory (the static site,
       entirely outside the Rust workspace and the hook/collab scope),
       matched the same way ``is_docs_path`` matches ``docs/``: on the

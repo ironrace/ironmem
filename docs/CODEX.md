@@ -113,7 +113,7 @@ The hooks are diff-aware:
 - collab protocol/template changes run the collab template lint
 - Rust/workspace changes run fmt and clippy on commit, then workspace tests on push
 - docs changes (`*.md`, any path under `docs/`) and inert config/data changes
-  (`*.json`/`*.jsonc`/`*.jsonl`/`*.yaml`/`*.yml`/`*.sh`/`*.csv`/`*.html`, any
+  (`*.json`/`*.jsonc`/`*.jsonl`/`*.yaml`/`*.yml`/`*.sh`/`*.csv`, any
   path under `site/`, or a `.py` file under `benchmarks/`) skip heavy local
   gates -- *outside a harness plugin root*, no gate parses, executes, or
   otherwise inspects those formats
@@ -211,7 +211,7 @@ shape) and returns one of:
 | `collab_protocol` | `is_collab_protocol_path` | collab command/prompt/template files (`COLLAB_EXACT_PATHS`, `.claude-plugin/prompts/collab-turn-*`, `tests/collab_turn_templates/`) |
 | `hook_self_test` | `is_hook_path` | the tracked hook scripts themselves — an exact-set membership check (`HOOK_EXACT_PATHS`), not a prefix: `.githooks/pre-commit`, `.githooks/pre-push`, `scripts/install-git-hooks.sh`, `scripts/run_git_hook.py`, `scripts/test_run_git_hook.py`. Contrast `collab_protocol` below, whose `collab-turn-*` genuinely is a prefix match. |
 | `docs` | `is_docs_path` | any `.md` file, or any path whose leading `/`-split segment is `docs` — **unless** the leading segment is a harness plugin root (see below), in which case it does not match |
-| `inert_config` | `is_inert_config_path` | a `.json`/`.jsonc`/`.jsonl`/`.yaml`/`.yml`/`.sh`/`.csv`/`.html` file, any path whose leading `/`-split segment is `site`, or a `.py` file whose leading `/`-split segment is `benchmarks` — **unless** the leading segment is a harness plugin root, in which case it does not match |
+| `inert_config` | `is_inert_config_path` | a `.json`/`.jsonc`/`.jsonl`/`.yaml`/`.yml`/`.sh`/`.csv` file, any path whose leading `/`-split segment is `site`, or a `.py` file whose leading `/`-split segment is `benchmarks` — **unless** the leading segment is a harness plugin root, in which case it does not match. HTML is not globally inert: the dashboard's `index.html` is compiled into the Rust binary. |
 | `UNKNOWN` | *(fallback — not in `SURFACES`)* | an unsafe-shaped path, or a path that matches no declared surface |
 
 `is_gate_covered_plugin_path` (checked first inside both `is_docs_path` and

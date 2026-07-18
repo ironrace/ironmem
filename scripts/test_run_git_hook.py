@@ -412,8 +412,8 @@ def test_is_inert_config_path_matches_csv_and_jsonl_and_jsonc():
     assert hook.is_inert_config_path("wrangler.jsonc") is True
 
 
-def test_is_inert_config_path_matches_html_extension():
-    assert hook.is_inert_config_path("crates/ironmem/src/dashboard/index.html") is True
+def test_is_inert_config_path_rejects_dashboard_html_compiled_into_binary():
+    assert hook.is_inert_config_path("crates/ironmem/src/dashboard/index.html") is False
 
 
 def test_is_inert_config_path_matches_site_directory_regardless_of_extension():
@@ -819,6 +819,18 @@ def test_resolve_gates_inert_config_does_not_protect_sql_migration_from_escalati
     assert result == expected
 
 
+def test_resolve_gates_dashboard_html_change_escalates_to_rust_gates():
+    # The dashboard embeds index.html with include_str!, so an HTML/XSS
+    # regression is source-equivalent and must be tested, not classified as
+    # inert static-site content.
+    changes = hook.ChangeSet(
+        paths=("crates/ironmem/src/dashboard/index.html",), unknown=False, reason=None
+    )
+    result = hook.resolve_gates(hook.PHASE_PRE_COMMIT, changes)
+    expected = tuple(gate for gate in hook.GATES if hook.PHASE_PRE_COMMIT in gate.phases)
+    assert result == expected
+
+
 def test_resolve_gates_unrecognized_path_alone_runs_every_gate_for_phase():
     # "notes.txt" is a safe shape but classifies UNKNOWN (no declared surface
     # matches it). classify_path()'s UNKNOWN is the escalation signal, same
@@ -1140,6 +1152,16 @@ def test_is_hex_sha_rejects_length_between_40_and_64():
     assert hook._is_hex_sha("a" * 50) is False
 
 
+def test_is_zero_sha_accepts_sha1_and_sha256_null_object_ids():
+    assert hook._is_zero_sha("0" * 40) is True
+    assert hook._is_zero_sha("0" * 64) is True
+
+
+def test_is_zero_sha_rejects_non_null_or_invalid_object_ids():
+    assert hook._is_zero_sha(SHA_A) is False
+    assert hook._is_zero_sha("0" * 50) is False
+
+
 # --- _parse_pre_push_line ---------------------------------------------------
 
 
@@ -1301,6 +1323,17 @@ def test_collect_pre_push_changes_skips_deletion_ref(monkeypatch):
     assert fake.calls == []
 
 
+def test_collect_pre_push_changes_skips_sha256_deletion_ref(monkeypatch):
+    zero_sha256 = "0" * 64
+    sha256_remote = "a" * 64
+    stdin = _pre_push_line("refs/heads/gone", zero_sha256, "refs/heads/gone", sha256_remote) + "\n"
+    fake = _FakeGitRun({})  # no git diff call should happen at all
+    monkeypatch.setattr(hook.subprocess, "run", fake)
+    changes = hook.collect_pre_push_changes(stdin)
+    assert changes == hook.ChangeSet(paths=(), unknown=False, reason=None)
+    assert fake.calls == []
+
+
 def test_collect_pre_push_changes_branch_creation_uses_default_base(monkeypatch):
     stdin = _pre_push_line("refs/heads/new", SHA_B, "refs/heads/new", hook.ZERO_SHA) + "\n"
     fake = _FakeGitRun(
@@ -1311,6 +1344,26 @@ def test_collect_pre_push_changes_branch_creation_uses_default_base(monkeypatch)
             ),
             ("merge-base", SHA_B, "refs/remotes/origin/main"): (0, SHA_A + "\n"),
             ("diff", "--name-only", "-z", f"{SHA_A}..{SHA_B}"): (0, "new_file.py\0"),
+        }
+    )
+    monkeypatch.setattr(hook.subprocess, "run", fake)
+    changes = hook.collect_pre_push_changes(stdin)
+    assert changes == hook.ChangeSet(paths=("new_file.py",), unknown=False, reason=None)
+
+
+def test_collect_pre_push_changes_sha256_branch_creation_uses_default_base(monkeypatch):
+    zero_sha256 = "0" * 64
+    sha256_base = "a" * 64
+    sha256_local = "b" * 64
+    stdin = _pre_push_line("refs/heads/new", sha256_local, "refs/heads/new", zero_sha256) + "\n"
+    fake = _FakeGitRun(
+        {
+            ("symbolic-ref", "--quiet", "refs/remotes/origin/HEAD"): (
+                0,
+                "refs/remotes/origin/main\n",
+            ),
+            ("merge-base", sha256_local, "refs/remotes/origin/main"): (0, sha256_base + "\n"),
+            ("diff", "--name-only", "-z", f"{sha256_base}..{sha256_local}"): (0, "new_file.py\0"),
         }
     )
     monkeypatch.setattr(hook.subprocess, "run", fake)
