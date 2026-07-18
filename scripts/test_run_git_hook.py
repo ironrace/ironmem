@@ -394,11 +394,11 @@ def test_classify_path_known_surface_beats_generic_docs():
 
 
 def test_is_inert_config_path_matches_json_extension():
-    assert hook.is_inert_config_path(".claude-plugin/plugin.json") is True
+    assert hook.is_inert_config_path("crates/ironmem/schema/example.json") is True
 
 
 def test_is_inert_config_path_matches_yaml_and_yml_extensions():
-    assert hook.is_inert_config_path(".codex-plugin/skills/pr-review-toolkit/agents/openai.yaml") is True
+    assert hook.is_inert_config_path("ops/deploy.yaml") is True
     assert hook.is_inert_config_path(".github/workflows/ci.yml") is True
 
 
@@ -460,6 +460,110 @@ def test_is_inert_config_path_rejects_non_matching_extension_outside_declared_di
     assert hook.is_inert_config_path("notes.txt") is False
 
 
+# --- Task 9 fix: gate-covered plugin roots are NOT inert -----------------
+#
+# Part A's original premise ("no existing gate would catch a defect in this
+# file") is false for a harness plugin root: cargo test --workspace reads
+# plugin.json/hooks.json/.mcp.json (plugin_metadata.rs's read_json and
+# plugin_versions_match_cargo_toml), asserts hooks.json's UserPromptSubmit
+# command (hook.rs), enforces the plugin's required shell assets exist
+# (packaging.rs's REQUIRED_ASSETS via packaging_coverage_passes_for_
+# production_registry), and parses review-agent Markdown frontmatter
+# (plugin_metadata.rs's claude_review_agents_advertise_lean_profile). A path
+# whose leading segment matches the `.<name>-plugin` shape must therefore
+# never classify docs or inert_config -- it must escalate to UNKNOWN.
+
+
+def test_is_gate_covered_plugin_path_matches_known_plugin_roots():
+    assert hook.is_gate_covered_plugin_path(".claude-plugin/plugin.json") is True
+    assert hook.is_gate_covered_plugin_path(".codex-plugin/hooks.json") is True
+    assert hook.is_gate_covered_plugin_path(".gemini-plugin/plugin.json") is True
+    assert hook.is_gate_covered_plugin_path(".grok-plugin/plugin.json") is True
+
+
+def test_is_gate_covered_plugin_path_matches_future_plugin_shape():
+    # Not an allowlist of today's four harnesses -- any future
+    # `.<name>-plugin/` root matches the same shape check.
+    assert hook.is_gate_covered_plugin_path(".newharness-plugin/plugin.json") is True
+
+
+def test_is_gate_covered_plugin_path_rejects_look_alike_backup_directory():
+    # ".claude-plugin-backup" ends with "-backup", not "-plugin" -- a
+    # substring check ("plugin" in segment) would wrongly match this; the
+    # whole-segment endswith("-plugin") check must not.
+    assert hook.is_gate_covered_plugin_path(".claude-plugin-backup/x.json") is False
+
+
+def test_is_gate_covered_plugin_path_rejects_non_dotted_segment():
+    assert hook.is_gate_covered_plugin_path("claude-plugin/plugin.json") is False
+
+
+def test_is_gate_covered_plugin_path_rejects_ordinary_path():
+    assert hook.is_gate_covered_plugin_path("crates/ironmem/src/lib.rs") is False
+
+
+def test_is_inert_config_path_rejects_plugin_json():
+    assert hook.is_inert_config_path(".claude-plugin/plugin.json") is False
+    assert hook.is_inert_config_path(".codex-plugin/hooks.json") is False
+    assert hook.is_inert_config_path(".claude-plugin/.mcp.json") is False
+
+
+def test_is_inert_config_path_rejects_plugin_shell_assets():
+    assert hook.is_inert_config_path(".claude-plugin/bin/ironmem-mcp.sh") is False
+    assert hook.is_inert_config_path(".claude-plugin/hooks/ironmem-hook.sh") is False
+
+
+def test_is_docs_path_rejects_plugin_agent_markdown():
+    assert hook.is_docs_path(".claude-plugin/agents/code-reviewer.md") is False
+
+
+def test_is_inert_config_path_still_matches_look_alike_backup_directory():
+    # The look-alike negative: ".claude-plugin-backup/" must not trip the
+    # plugin exclusion, so its .json file stays classified as ordinary
+    # inert config -- proving the exclusion is a segment match, not a
+    # substring match.
+    assert hook.is_inert_config_path(".claude-plugin-backup/x.json") is True
+
+
+def test_classify_path_plugin_json_files_escalate():
+    for path in (
+        ".claude-plugin/plugin.json",
+        ".codex-plugin/hooks.json",
+        ".claude-plugin/.mcp.json",
+    ):
+        assert hook.classify_path(path) == hook.UNKNOWN
+
+
+def test_classify_path_plugin_shell_assets_escalate():
+    for path in (
+        ".claude-plugin/bin/ironmem-mcp.sh",
+        ".claude-plugin/hooks/ironmem-hook.sh",
+    ):
+        assert hook.classify_path(path) == hook.UNKNOWN
+
+
+def test_classify_path_plugin_agent_markdown_escalates():
+    assert hook.classify_path(".claude-plugin/agents/code-reviewer.md") == hook.UNKNOWN
+
+
+def test_classify_path_plugin_backup_look_alike_stays_inert_config():
+    assert hook.classify_path(".claude-plugin-backup/x.json") == hook.SURFACE_INERT_CONFIG
+
+
+def test_resolve_gates_plugin_json_change_escalates_to_every_gate():
+    # The regression this whole fix exists to close: a change touching only
+    # .claude-plugin/plugin.json must select every phase-matching gate, not
+    # just always-gates (there are none today) -- because
+    # plugin_versions_match_cargo_toml (cargo test) reads this exact file.
+    changes = hook.ChangeSet(
+        paths=(".claude-plugin/plugin.json",), unknown=False, reason=None
+    )
+    for phase in (hook.PHASE_PRE_COMMIT, hook.PHASE_PRE_PUSH):
+        result = hook.resolve_gates(phase, changes)
+        expected = tuple(gate for gate in hook.GATES if phase in gate.phases)
+        assert result == expected
+
+
 # --- Task 9: classify_path -- ordering protection for the new surface ----
 #
 # The whole-branch review's acceptance bullet: a `.sh` gate script must keep
@@ -496,7 +600,7 @@ def test_classify_path_check_collab_turn_templates_stays_collab_protocol():
 
 
 def test_classify_path_inert_config_json_file():
-    assert hook.classify_path(".claude-plugin/plugin.json") == hook.SURFACE_INERT_CONFIG
+    assert hook.classify_path("crates/ironmem/schema/example.json") == hook.SURFACE_INERT_CONFIG
 
 
 def test_classify_path_genuinely_unrecognized_path_still_escalates():
@@ -681,7 +785,11 @@ def test_resolve_gates_docs_plus_code_path_does_not_skip():
 
 def test_resolve_gates_inert_config_only_selects_no_gates():
     changes = hook.ChangeSet(
-        paths=(".claude-plugin/plugin.json", "site/index.html", "benchmarks/abeval/baseline_driver.py"),
+        paths=(
+            "crates/ironmem/schema/example.json",
+            "site/index.html",
+            "benchmarks/abeval/baseline_driver.py",
+        ),
         unknown=False,
         reason=None,
     )
@@ -691,7 +799,7 @@ def test_resolve_gates_inert_config_only_selects_no_gates():
 
 def test_resolve_gates_inert_config_plus_code_path_does_not_skip():
     changes = hook.ChangeSet(
-        paths=(".claude-plugin/plugin.json", "crates/ironmem/src/hook.rs"),
+        paths=("crates/ironmem/schema/example.json", "crates/ironmem/src/hook.rs"),
         unknown=False,
         reason=None,
     )
@@ -1710,7 +1818,7 @@ def test_execute_gates_prints_no_local_gates_required_for_inert_config_only(monk
     fake = _FakeGateRun({})
     monkeypatch.setattr(hook.subprocess, "run", fake)
     changes = hook.ChangeSet(
-        paths=(".claude-plugin/plugin.json",), unknown=False, reason=None
+        paths=("crates/ironmem/schema/example.json",), unknown=False, reason=None
     )
     rc = hook.execute_gates(hook.PHASE_PRE_PUSH, changes)
     out = capsys.readouterr().out
@@ -2173,7 +2281,6 @@ def test_main_pre_push_deletion_only_push_does_not_trigger_upstream_fallback(mon
     rc = hook.main(hook.PHASE_PRE_PUSH)
     assert rc == 0
     assert fake.calls == []
-    assert ("git", "rev-parse", "--verify", "@{u}") not in [tuple(c) for c in fake.calls]
 
 
 # --- _cli_main(argv) -- the usage-error / exit-2 contract, preserved from

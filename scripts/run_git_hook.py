@@ -16,8 +16,10 @@ reaching backwards:
   declaration order. `UNKNOWN` -- an unsafe-shaped path, or one matching no
   declared surface -- escalates to running every gate declared for the
   phase. That fail-closed contract is what lets an inert-only change (docs,
-  or config/data formats no gate parses or executes) skip heavy local gates
-  without ever letting a genuinely unrecognized path skip silently.
+  or config/data formats no gate parses or executes -- outside a
+  gate-covered plugin directory such as `.claude-plugin/`, see
+  `is_gate_covered_plugin_path()`) skip heavy local gates without ever
+  letting a genuinely unrecognized path skip silently.
 - Execute (`execute_gates(phase, changes)`) runs the selected gates with a
   hardened `subprocess.run` (scrubbed `GIT_*` env, no shell, `check=False`),
   printing one deterministic line per gate (`run` / `skip (...)` /
@@ -339,20 +341,74 @@ def is_hook_path(path: str) -> bool:
     return path in HOOK_EXACT_PATHS
 
 
+# A harness plugin root -- `.claude-plugin/`, `.codex-plugin/`,
+# `.gemini-plugin/`, `.grok-plugin/`, and any future one -- is NOT an inert
+# surface, even though its contents are JSON/shell/Markdown, the exact
+# formats `is_inert_config_path`/`is_docs_path` otherwise treat as unread.
+# `cargo test --workspace` reads every one of those formats inside a plugin
+# root:
+#   - `crates/ironmem/tests/plugin_metadata.rs`'s `read_json` panics on
+#     invalid JSON in `plugin.json`/`hooks.json`/`.mcp.json`, and
+#     `plugin_versions_match_cargo_toml` asserts `plugin.json`'s `version`
+#     equals `CARGO_PKG_VERSION` -- a version-sync defect there is exactly
+#     the kind of thing this manifest exists to catch.
+#   - `crates/ironmem/src/hook.rs` parses `.claude-plugin/hooks/hooks.json`
+#     and asserts its `UserPromptSubmit` command string.
+#   - `crates/ironmem/src/harness/packaging.rs`'s `REQUIRED_ASSETS`
+#     (`bin/<id>-mcp.sh`, `hooks/<id>-hook.sh`, `plugin.json`) is enforced
+#     against the real repo root by `packaging_coverage_passes_for_production_registry`.
+#   - `plugin_metadata.rs`'s `claude_review_agents_advertise_lean_profile`
+#     parses YAML frontmatter from `.claude-plugin/agents/*.md` and fails if
+#     `tools:` is missing or lists an ironmem tool.
+# Every plugin-root path is therefore gate-covered and must classify UNKNOWN
+# (escalate), never `docs` or `inert_config`.
+def _is_gate_covered_plugin_segment(segment: str) -> bool:
+    """True if `segment` has the shape of a harness plugin root: starts with
+    ``.`` and ends with ``-plugin``.
+
+    A whole-segment check, not a substring one: ``.claude-plugin-backup``
+    ends with ``-backup``, not ``-plugin``, so it does not match -- the
+    look-alike directory a future plugin backup/staging copy might use stays
+    correctly classified by the ordinary docs/inert-config rules.
+    """
+    return segment.startswith(".") and segment.endswith("-plugin")
+
+
+def is_gate_covered_plugin_path(path: str) -> bool:
+    """True when `path`'s leading ``/``-split segment is a harness plugin
+    root (see the module comment above this function for which `cargo test`
+    assertions read plugin-root JSON/shell/Markdown content).
+
+    Matched on ``path.split("/", 1)[0]``, never a substring, for the same
+    byte-exact-segment reason `is_docs_path`/`is_inert_config_path` match
+    ``docs``/``site``/``benchmarks`` that way.
+    """
+    return _is_gate_covered_plugin_segment(path.split("/", 1)[0])
+
+
 def is_docs_path(path: str) -> bool:
     """Explicitly inert documentation surface: any Markdown file, or any path
-    under a top-level ``docs/`` directory.
+    under a top-level ``docs/`` directory -- unless it is inside a
+    gate-covered plugin root (see `is_gate_covered_plugin_path`), in which
+    case it is NOT inert: `.claude-plugin/agents/*.md` frontmatter is parsed
+    and asserted by `plugin_metadata.rs`'s lean-profile guard test.
 
     Matched on the leading ``/``-split segment (``path.split("/", 1)[0]``),
     never on ``"docs" in path`` -- a substring check would wrongly match a
     look-alike directory such as ``docsite/notes.txt``.
     """
+    if is_gate_covered_plugin_path(path):
+        return False
     return path.endswith(".md") or path.split("/", 1)[0] == "docs"
 
 
-# Extensions no gate in GATES parses, executes, or otherwise inspects: none
-# of the five gates (hook self-test, install-drift check, collab template
-# lint, cargo fmt/clippy/test) reads JSON/YAML/shell/CSV/HTML content. A
+# Extensions no gate in GATES parses, executes, or otherwise inspects
+# *outside a gate-covered plugin root* (see `is_gate_covered_plugin_path`):
+# none of the five gates (hook self-test, install-drift check, collab
+# template lint, cargo fmt/clippy/test) reads JSON/YAML/shell/CSV/HTML
+# content when it lives outside `.claude-plugin/`-shaped directories -- but
+# `cargo test --workspace` does read exactly these formats inside one (see
+# the module comment above `is_gate_covered_plugin_path`). A
 # `str.endswith()` tuple argument is a byte-exact suffix check, same as
 # `is_docs_path`'s `.md` check -- no case-folding.
 _INERT_CONFIG_EXTENSIONS = (
@@ -369,13 +425,23 @@ _INERT_CONFIG_EXTENSIONS = (
 
 def is_inert_config_path(path: str) -> bool:
     """Second explicitly-inert surface: non-code config/data files that no
-    declared gate would catch a defect in.
+    declared gate would catch a defect in -- outside a gate-covered plugin
+    root.
+
+    Checked first, before any of the three patterns below: `path` inside a
+    gate-covered plugin root (see `is_gate_covered_plugin_path`) is NEVER
+    inert, regardless of extension. `cargo test --workspace` reads
+    plugin-root JSON (`plugin_metadata.rs`), asserts plugin-root shell
+    assets exist (`packaging.rs`'s `REQUIRED_ASSETS`), and parses
+    plugin-root agent Markdown frontmatter (`plugin_metadata.rs`'s
+    lean-profile guard) -- a defect in any of those is gate-covered, so
+    those paths must classify UNKNOWN (escalate), not `inert_config`.
 
     Three patterns, each justified by "no existing gate parses, executes, or
-    otherwise inspects this file":
+    otherwise inspects this file outside a gate-covered plugin root":
 
     - A file extension in ``_INERT_CONFIG_EXTENSIONS`` (JSON/YAML/shell/CSV/
-      HTML) -- none of the five gates reads these formats.
+      HTML) -- none of the five gates reads these formats there.
     - Any path under a top-level ``site/`` directory (the static site,
       entirely outside the Rust workspace and the hook/collab scope),
       matched the same way ``is_docs_path`` matches ``docs/``: on the
@@ -401,6 +467,8 @@ def is_inert_config_path(path: str) -> bool:
     `docs/COLLAB.md` win to `collab_protocol` over the generic `docs`
     catch-all.
     """
+    if is_gate_covered_plugin_path(path):
+        return False
     if path.endswith(_INERT_CONFIG_EXTENSIONS):
         return True
     top_segment = path.split("/", 1)[0]
@@ -819,6 +887,7 @@ def execute_gates(phase: str, changes: ChangeSet) -> int:
         print(f"[git-hook] escalating: {changes.reason}", flush=True)
 
     child_env = _scrub_git_env(os.environ)
+    ran_count = 0
 
     for gate in GATES:
         # This re-checks `phase in gate.phases` even though `selected` (from
@@ -859,6 +928,7 @@ def execute_gates(phase: str, changes: ChangeSet) -> int:
         if returncode != 0:
             print(f"[git-hook] {gate.name}: fail ({returncode})", flush=True)
             return returncode
+        ran_count += 1
 
     # Every phase-matching gate either ran successfully or was skipped -- the
     # run completed. State that plainly rather than leaving a docs/inert-only
@@ -866,11 +936,16 @@ def execute_gates(phase: str, changes: ChangeSet) -> int:
     # was the intended outcome, not a run that broke before printing
     # anything. Restores the pre-Task-6 `[pre-commit] staged files: N` /
     # "no local gates required" summary this refactor had dropped with no
-    # replacement.
-    if not selected:
+    # replacement. `ran_count` (incremented only after a gate's subprocess
+    # actually completed with exit 0), not `len(selected)`, is what's
+    # printed -- `selected` is what the resolver picked, which today always
+    # equals what ran (the loop returns immediately on the first failure),
+    # but counting what ran keeps the two concepts distinct rather than
+    # relying on that coincidence.
+    if ran_count == 0:
         print(f"[git-hook] {phase}: no local gates required", flush=True)
     else:
-        print(f"[git-hook] {phase}: {len(selected)} gate(s) run, 0 failed", flush=True)
+        print(f"[git-hook] {phase}: {ran_count} gate(s) run, 0 failed", flush=True)
     return 0
 
 

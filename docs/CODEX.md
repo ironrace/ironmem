@@ -115,7 +115,19 @@ The hooks are diff-aware:
 - docs changes (`*.md`, any path under `docs/`) and inert config/data changes
   (`*.json`/`*.jsonc`/`*.jsonl`/`*.yaml`/`*.yml`/`*.sh`/`*.csv`/`*.html`, any
   path under `site/`, or a `.py` file under `benchmarks/`) skip heavy local
-  gates -- no gate parses, executes, or otherwise inspects those formats
+  gates -- *outside a harness plugin root*, no gate parses, executes, or
+  otherwise inspects those formats
+- a path under a harness plugin root (`.claude-plugin/`, `.codex-plugin/`,
+  `.gemini-plugin/`, `.grok-plugin/`, or any future `.<name>-plugin/`) is
+  NOT inert, even though its content is JSON/shell/Markdown: `cargo test
+  --workspace` reads `plugin.json`/`hooks.json`/`.mcp.json` and asserts
+  `plugin.json`'s version matches `Cargo.toml` (`plugin_metadata.rs`),
+  parses `hooks/hooks.json`'s `UserPromptSubmit` command (`hook.rs`),
+  requires the plugin's `bin/*.sh`/`hooks/*.sh` assets to exist
+  (`packaging.rs`'s `REQUIRED_ASSETS`), and parses review-agent Markdown
+  frontmatter (`plugin_metadata.rs`'s lean-profile guard) -- so these paths
+  escalate to running every gate declared for the phase, the same as any
+  other gate-covered change
 - any other path (including an unrecognized extension, or a
   `crates/*/migrations/*.sql` change -- `include_str!`'d into the binary and
   replayed by `cargo test`'s migration tests, so a real gate *does* catch a
@@ -198,9 +210,23 @@ shape) and returns one of:
 | `rust_workspace` | `is_rust_path` | `.rs` files, `Cargo.toml`/`Cargo.lock`/`build.rs`, anything under `.cargo/` |
 | `collab_protocol` | `is_collab_protocol_path` | collab command/prompt/template files (`COLLAB_EXACT_PATHS`, `.claude-plugin/prompts/collab-turn-*`, `tests/collab_turn_templates/`) |
 | `hook_self_test` | `is_hook_path` | the tracked hook scripts themselves — an exact-set membership check (`HOOK_EXACT_PATHS`), not a prefix: `.githooks/pre-commit`, `.githooks/pre-push`, `scripts/install-git-hooks.sh`, `scripts/run_git_hook.py`, `scripts/test_run_git_hook.py`. Contrast `collab_protocol` below, whose `collab-turn-*` genuinely is a prefix match. |
-| `docs` | `is_docs_path` | any `.md` file, or any path whose leading `/`-split segment is `docs` |
-| `inert_config` | `is_inert_config_path` | a `.json`/`.jsonc`/`.jsonl`/`.yaml`/`.yml`/`.sh`/`.csv`/`.html` file, any path whose leading `/`-split segment is `site`, or a `.py` file whose leading `/`-split segment is `benchmarks` |
+| `docs` | `is_docs_path` | any `.md` file, or any path whose leading `/`-split segment is `docs` — **unless** the leading segment is a harness plugin root (see below), in which case it does not match |
+| `inert_config` | `is_inert_config_path` | a `.json`/`.jsonc`/`.jsonl`/`.yaml`/`.yml`/`.sh`/`.csv`/`.html` file, any path whose leading `/`-split segment is `site`, or a `.py` file whose leading `/`-split segment is `benchmarks` — **unless** the leading segment is a harness plugin root, in which case it does not match |
 | `UNKNOWN` | *(fallback — not in `SURFACES`)* | an unsafe-shaped path, or a path that matches no declared surface |
+
+`is_gate_covered_plugin_path` (checked first inside both `is_docs_path` and
+`is_inert_config_path`) matches any path whose leading `/`-split segment has
+the shape `.<name>-plugin` — `.claude-plugin`, `.codex-plugin`,
+`.gemini-plugin`, `.grok-plugin`, and any future one. Every one of those
+directories' JSON, shell assets, and agent Markdown is read by `cargo test
+--workspace` (`plugin_metadata.rs`'s `read_json`/
+`plugin_versions_match_cargo_toml`/`claude_review_agents_advertise_lean_
+profile`, `hook.rs`'s `hooks.json` parse, `packaging.rs`'s `REQUIRED_ASSETS`
+check), so a path inside one is gate-covered, not inert, and must classify
+`UNKNOWN` (escalate) instead. A look-alike segment like
+`.claude-plugin-backup` does not match — the check is a whole-segment
+`endswith("-plugin")`, not a substring test, so it stays classified by the
+ordinary docs/inert-config rules.
 
 `docs` and `inert_config` are declared, first-class entries in `SURFACES` —
 **not a fallback** — and that distinction is the point of the feature: an
