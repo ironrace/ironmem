@@ -580,6 +580,32 @@ def test_resolve_gates_empty_paths_unknown_false_selects_only_always_gates():
     assert hook.resolve_gates(hook.PHASE_PRE_PUSH, changes) == ()
 
 
+# --- Task 3: resolve_gates -- the `gate.always` disjunct, exercised for real
+#
+# No gate in today's manifest sets always=True (see
+# test_manifest_no_gate_marked_always_yet), so the assertion above only ever
+# proves the degenerate "() == ()" case: it can't distinguish "always works"
+# from "always is unreachable dead code". Inject a synthetic always-gate via
+# monkeypatch (same technique as
+# test_resolve_gates_dedupes_by_first_seen_not_by_sorting) to cover the
+# branch with a gate that actually sets always=True.
+
+
+def test_resolve_gates_gate_always_true_runs_with_empty_paths(monkeypatch):
+    always_gate = hook.Gate(
+        name="synthetic_always_gate",
+        argv=("true",),
+        phases=frozenset({hook.PHASE_PRE_COMMIT}),
+        surfaces=frozenset(),
+        always=True,
+    )
+    monkeypatch.setattr(hook, "GATES", hook.GATES + (always_gate,))
+    changes = hook.ChangeSet(paths=(), unknown=False, reason=None)
+    # Empty paths, unknown=False: nothing escalates. Only the always=True
+    # gate fires -- every real manifest gate (always=False) is excluded.
+    assert hook.resolve_gates(hook.PHASE_PRE_COMMIT, changes) == (always_gate,)
+
+
 # --- Task 3: resolve_gates -- output order is manifest order, invariant to
 # input path order and duplicates; dedupe never changes the result ---------
 
@@ -625,29 +651,26 @@ def test_resolve_gates_output_invariant_to_duplicate_paths():
     )
 
 
-def test_resolve_gates_dedupes_by_first_seen_not_by_sorting():
-    # Monkeypatch-free: assert on classify_path call order via a spy that
-    # wraps the real function, proving resolve_gates visits each distinct
-    # path exactly once, in first-seen order -- never a sorted order, which
-    # would reorder "notes_b.txt" before "notes_a.txt".
+def test_resolve_gates_dedupes_by_first_seen_not_by_sorting(monkeypatch):
+    # Fixture-based monkeypatch (auto-restores on teardown): assert on
+    # classify_path call order via a spy that wraps the real function,
+    # proving resolve_gates visits each distinct path exactly once, in
+    # first-seen order -- never a sorted order, which would reorder
+    # "notes_b.txt" before "notes_a.txt".
     calls: list[str] = []
-    original = hook.classify_path
+    real_classify_path = hook.classify_path
 
     def spy(path):
         calls.append(path)
-        return original(path)
+        return real_classify_path(path)
 
     changes = hook.ChangeSet(
         paths=("notes_b.txt", "notes_a.txt", "notes_b.txt", "notes_a.txt"),
         unknown=False,
         reason=None,
     )
-    real_classify_path = hook.classify_path
-    hook.classify_path = spy
-    try:
-        hook.resolve_gates(hook.PHASE_PRE_COMMIT, changes)
-    finally:
-        hook.classify_path = real_classify_path
+    monkeypatch.setattr(hook, "classify_path", spy)
+    hook.resolve_gates(hook.PHASE_PRE_COMMIT, changes)
 
     assert calls == ["notes_b.txt", "notes_a.txt"]
 
@@ -685,32 +708,59 @@ def test_resolve_gates_does_not_mutate_changeset_paths():
     assert changes.paths == original_paths
 
 
-# --- Task 3: resolve_gates -- parametrized per-gate reachability ----------
+# --- Task 3: resolve_gates -- parametrized per-gate-per-phase reachability -
 #
 # Derived from GATES itself, not a hardcoded list of gate names: a future
 # gate appended to the manifest without an entry in
 # _SURFACE_EXAMPLE_PATH_FOR_TEST below fails with a KeyError right here,
 # rather than silently going unexercised.
-
+#
+# Parametrized over (gate, phase) pairs, not just gates: gate.phases is a
+# frozenset, and CPython randomizes string hashing per process, so iterating
+# a single `next(iter(gate.phases))` would exercise a different phase on
+# different runs -- never both, never reproducibly, for any gate declaring
+# more than one phase. Expanding to every declared pair removes that
+# nondeterminism and strengthens the property being checked: every declared
+# (gate, phase) pair must be reachable, not just one arbitrarily-chosen
+# phase per gate. `sorted(gate.phases)` here is for deterministic *test
+# parametrization ids*, not runtime gate ordering -- GATES itself is never
+# sorted.
+#
+# SURFACE_DOCS is deliberately absent from the map below: no gate declares
+# it today, and DOCS is defined as inert (see
+# test_resolve_gates_docs_only_selects_no_gates). If a future gate declared
+# SURFACE_DOCS, this map must raise KeyError naming that gate immediately,
+# not silently resolve to a docs-classified path that would make the
+# always/escalate-only property look satisfied when it isn't.
 _SURFACE_EXAMPLE_PATH_FOR_TEST = {
     hook.SURFACE_RUST_WORKSPACE: "crates/ironmem/src/hook.rs",
     hook.SURFACE_COLLAB_PROTOCOL: "docs/COLLAB.md",
     hook.SURFACE_HOOK_SELF_TEST: "scripts/run_git_hook.py",
-    hook.SURFACE_DOCS: "README.md",
 }
 
+_GATE_PHASE_PARAMS_FOR_TEST = [
+    (gate, phase) for gate in hook.GATES for phase in sorted(gate.phases)
+]
 
-@pytest.mark.parametrize("gate", hook.GATES, ids=[gate.name for gate in hook.GATES])
-def test_resolve_gates_reaches_every_manifest_gate(gate):
-    phase = next(iter(gate.phases))
+
+@pytest.mark.parametrize(
+    "gate, phase",
+    _GATE_PHASE_PARAMS_FOR_TEST,
+    ids=[f"{gate.name}-{phase}" for gate, phase in _GATE_PHASE_PARAMS_FOR_TEST],
+)
+def test_resolve_gates_reaches_every_manifest_gate(gate, phase):
     if gate.always:
         changes = hook.ChangeSet(paths=(), unknown=False, reason=None)
-    else:
-        surface_id = next(iter(gate.surfaces))
+        assert gate in hook.resolve_gates(phase, changes)
+        return
+    # Iterate every declared surface, not just one: a future gate declaring
+    # two surfaces -- one mapped here, one not -- must raise KeyError
+    # unconditionally (not on a hash-order coin flip), and must be proven
+    # reachable from each surface it declares, not just an arbitrary one.
+    for surface_id in gate.surfaces:
         path = _SURFACE_EXAMPLE_PATH_FOR_TEST[surface_id]
         changes = hook.ChangeSet(paths=(path,), unknown=False, reason=None)
-    result = hook.resolve_gates(phase, changes)
-    assert gate in result
+        assert gate in hook.resolve_gates(phase, changes)
 
 
 # --- __main__ delegation must fail loudly, never exit 0, if pytest is absent ---
