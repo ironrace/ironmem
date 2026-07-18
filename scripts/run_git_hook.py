@@ -1,12 +1,27 @@
 #!/usr/bin/env python3
-"""Diff-aware local Git hook runner.
+"""Diff-aware local Git hook runner: collect -> resolve -> execute.
 
-The tracked hooks delegate here so local commits and pushes only run gates that
-match the changed surface:
+The tracked `.githooks/pre-commit` and `.githooks/pre-push` hooks delegate
+here. `main(phase)` wires three layers, each with one job and no layer
+reaching backwards:
 
-- collab protocol/template changes -> collab template lint
-- Rust/workspace changes -> Rust gates
-- hook runner changes -> hook self-tests and install drift check
+- Collect (`collect_pre_commit_changes()` / `collect_pre_push_changes(stdin)`)
+  turns Git's own diff output into a `ChangeSet`. Fail-closed: a Git
+  subprocess failure, or malformed pre-push stdin, sets `unknown=True` --
+  never presents as "no changes".
+- Resolve (`resolve_gates(phase, changes)`) is pure and total: it classifies
+  every changed path via `classify_path()` against the declared `SURFACES`
+  (`rust_workspace`, `collab_protocol`, `hook_self_test`, `docs`,
+  `inert_config`) and selects the matching `GATES` entries, in manifest
+  declaration order. `UNKNOWN` -- an unsafe-shaped path, or one matching no
+  declared surface -- escalates to running every gate declared for the
+  phase. That fail-closed contract is what lets an inert-only change (docs,
+  or config/data formats no gate parses or executes) skip heavy local gates
+  without ever letting a genuinely unrecognized path skip silently.
+- Execute (`execute_gates(phase, changes)`) runs the selected gates with a
+  hardened `subprocess.run` (scrubbed `GIT_*` env, no shell, `check=False`),
+  printing one deterministic line per gate (`run` / `skip (...)` /
+  `fail (...)`) and stopping at the first non-zero exit.
 """
 from __future__ import annotations
 
@@ -335,6 +350,67 @@ def is_docs_path(path: str) -> bool:
     return path.endswith(".md") or path.split("/", 1)[0] == "docs"
 
 
+# Extensions no gate in GATES parses, executes, or otherwise inspects: none
+# of the five gates (hook self-test, install-drift check, collab template
+# lint, cargo fmt/clippy/test) reads JSON/YAML/shell/CSV/HTML content. A
+# `str.endswith()` tuple argument is a byte-exact suffix check, same as
+# `is_docs_path`'s `.md` check -- no case-folding.
+_INERT_CONFIG_EXTENSIONS = (
+    ".json",
+    ".jsonc",
+    ".jsonl",
+    ".yaml",
+    ".yml",
+    ".sh",
+    ".csv",
+    ".html",
+)
+
+
+def is_inert_config_path(path: str) -> bool:
+    """Second explicitly-inert surface: non-code config/data files that no
+    declared gate would catch a defect in.
+
+    Three patterns, each justified by "no existing gate parses, executes, or
+    otherwise inspects this file":
+
+    - A file extension in ``_INERT_CONFIG_EXTENSIONS`` (JSON/YAML/shell/CSV/
+      HTML) -- none of the five gates reads these formats.
+    - Any path under a top-level ``site/`` directory (the static site,
+      entirely outside the Rust workspace and the hook/collab scope),
+      matched the same way ``is_docs_path`` matches ``docs/``: on the
+      leading ``/``-split segment, never a substring, so a look-alike
+      directory such as ``sitehost/`` never matches.
+    - A ``.py`` file under a top-level ``benchmarks/`` directory. The
+      ``benchmarks/*`` Cargo crates are listed in the workspace manifest's
+      ``exclude`` list, so `cargo fmt --all`/`cargo clippy --workspace`/
+      `cargo test --workspace` never touch them either way -- but their own
+      ``.rs`` source files still classify ``rust_workspace`` via
+      `is_rust_path` (checked before this surface, see the `SURFACES`
+      ordering comment below), so this pattern is scoped to `.py` only, not
+      the whole `benchmarks/` tree. `crates/*/migrations/*.sql` is
+      deliberately NOT covered by any pattern here: those files are
+      `include_str!`'d into the Rust binary and replayed by `cargo test`'s
+      migration tests, so a real gate *does* catch a defect there -- they
+      must stay `UNKNOWN` (escalate), not become inert.
+
+    Declared after every specific surface in `SURFACES` (see the ordering
+    comment there): `scripts/install-git-hooks.sh` matches this predicate's
+    `.sh` check too, but `SURFACE_HOOK_SELF_TEST`'s exact-path predicate is
+    checked first and wins -- the same ordering protection that lets
+    `docs/COLLAB.md` win to `collab_protocol` over the generic `docs`
+    catch-all.
+    """
+    if path.endswith(_INERT_CONFIG_EXTENSIONS):
+        return True
+    top_segment = path.split("/", 1)[0]
+    if top_segment == "site":
+        return True
+    if top_segment == "benchmarks" and path.endswith(".py"):
+        return True
+    return False
+
+
 # --- Frozen data model -------------------------------------------------
 #
 # `Gate`/`ChangeSet`/`GATES`/`SURFACES` are the pure data layer the
@@ -349,6 +425,7 @@ SURFACE_RUST_WORKSPACE = "rust_workspace"
 SURFACE_COLLAB_PROTOCOL = "collab_protocol"
 SURFACE_HOOK_SELF_TEST = "hook_self_test"
 SURFACE_DOCS = "docs"
+SURFACE_INERT_CONFIG = "inert_config"
 
 # Not a declared surface -- the fail-closed fallback classify_path() returns
 # when a path is unsafe-shaped or matches no entry in SURFACES (including
@@ -410,17 +487,22 @@ class ChangeSet:
 
 # surface_id -> predicate. Predicates ported unchanged from the existing
 # is_rust_path/is_collab_protocol_path/is_hook_path classifiers above, plus
-# the DOCS surface's is_docs_path. Iteration order is declaration order:
-# classify_path() below checks DOCS last, so a more specific surface (e.g.
-# collab protocol) wins over the generic inert docs catch-all when a path
-# happens to satisfy both (docs/COLLAB.md is both under docs/ and in the
-# collab-protocol exact set).
+# the DOCS surface's is_docs_path and the INERT_CONFIG surface's
+# is_inert_config_path. Iteration order is declaration order: classify_path()
+# below checks the specific surfaces first and the two generic inert
+# catch-alls (DOCS, then INERT_CONFIG) last, so a more specific surface (e.g.
+# collab protocol) wins over a generic inert catch-all when a path happens to
+# satisfy both (docs/COLLAB.md is both under docs/ and in the collab-protocol
+# exact set; scripts/install-git-hooks.sh is both a .sh file and in the
+# hook_self_test exact set -- HOOK_SELF_TEST is declared, and therefore
+# checked, before INERT_CONFIG, so it wins).
 SURFACES: MappingProxyType[str, Callable[[str], bool]] = MappingProxyType(
     {
         SURFACE_RUST_WORKSPACE: is_rust_path,
         SURFACE_COLLAB_PROTOCOL: is_collab_protocol_path,
         SURFACE_HOOK_SELF_TEST: is_hook_path,
         SURFACE_DOCS: is_docs_path,
+        SURFACE_INERT_CONFIG: is_inert_config_path,
     }
 )
 
@@ -466,13 +548,13 @@ def classify_path(path: object) -> str:
     Total: never raises regardless of input shape or type. Pure: never
     mutates its argument and performs no `.strip()`/unquoting/case-folding --
     matching is byte-exact on `/`-split segments, not substrings, so a
-    look-alike like `docsite/` or `contests/` never matches the surface it
-    resembles. Unsafe shapes (absolute paths, `..` segments, NUL/control
-    bytes, empty string, leading `-`, non-`str`) are rejected to UNKNOWN
-    before any surface is checked, never sanitized. DOCS is a declared
-    surface like any other, not a fallback; UNKNOWN is the true fallback,
-    returned only when the shape is unsafe or no declared surface (including
-    DOCS) matches.
+    look-alike like `docsite/`, `sitehost/`, `benchmarksish/`, or `contests/`
+    never matches the surface it resembles. Unsafe shapes (absolute paths,
+    `..` segments, NUL/control bytes, empty string, leading `-`, non-`str`)
+    are rejected to UNKNOWN before any surface is checked, never sanitized.
+    DOCS and INERT_CONFIG are declared surfaces like any other, not a
+    fallback; UNKNOWN is the true fallback, returned only when the shape is
+    unsafe or no declared surface (including DOCS and INERT_CONFIG) matches.
     """
     if _unsafe_path_reason(path) is not None:
         return UNKNOWN
@@ -573,9 +655,10 @@ def resolve_gates(phase: str, changes: ChangeSet) -> tuple[Gate, ...]:
       ``changes.unknown``, forcing every phase-matching gate to run, or
     - the set of surfaces those paths classify to intersects ``gate.surfaces``.
 
-    ``SURFACE_DOCS`` is explicitly inert: classifying to DOCS never by itself
-    satisfies a gate's surface intersection, so an all-docs, all-safe-shape
-    change selects only ``always`` gates (none exist in today's manifest).
+    ``SURFACE_DOCS`` and ``SURFACE_INERT_CONFIG`` are explicitly inert:
+    classifying to either never by itself satisfies a gate's surface
+    intersection, so an all-docs/all-inert-config, all-safe-shape change
+    selects only ``always`` gates (none exist in today's manifest).
 
     Raises ``ValueError`` for a phase outside the declared phase vocabulary --
     a typo must not silently disable every gate.
@@ -718,6 +801,14 @@ def execute_gates(phase: str, changes: ChangeSet) -> int:
     running every phase-matching gate; this function additionally prints
     `changes.reason` first so a surprising full run explains itself rather
     than looking arbitrary.
+
+    After every phase-matching gate has run or been skipped with no failure,
+    prints exactly one trailing completion line: `[git-hook] <phase>: no
+    local gates required` when nothing was selected (an all-docs or
+    all-inert-config change), or `[git-hook] <phase>: N gate(s) run, 0
+    failed` otherwise. This line is never printed on the early-return failure
+    path -- a run that stopped at a non-zero exit did not complete, so
+    nothing claims it did.
     """
     # resolve_gates() validates `phase` (raises ValueError for an unrecognized
     # one) -- called before any output is printed, so an invalid phase fails
@@ -768,6 +859,18 @@ def execute_gates(phase: str, changes: ChangeSet) -> int:
         if returncode != 0:
             print(f"[git-hook] {gate.name}: fail ({returncode})", flush=True)
             return returncode
+
+    # Every phase-matching gate either ran successfully or was skipped -- the
+    # run completed. State that plainly rather than leaving a docs/inert-only
+    # commit with nothing but `skip (...)` lines and no statement that this
+    # was the intended outcome, not a run that broke before printing
+    # anything. Restores the pre-Task-6 `[pre-commit] staged files: N` /
+    # "no local gates required" summary this refactor had dropped with no
+    # replacement.
+    if not selected:
+        print(f"[git-hook] {phase}: no local gates required", flush=True)
+    else:
+        print(f"[git-hook] {phase}: {len(selected)} gate(s) run, 0 failed", flush=True)
     return 0
 
 
@@ -780,13 +883,25 @@ def execute_gates(phase: str, changes: ChangeSet) -> int:
 
 
 def _pre_push_manual_upstream_changes() -> ChangeSet:
-    """Fallback for a manual/direct `pre-push` invocation with no piped
-    ref-update lines on stdin. `main()` calls this only when
-    `collect_pre_push_changes` already returned a genuinely empty,
-    non-`unknown` result -- the real `git push`-invoked hook always pipes
-    stdin per the pre-push hook contract, so this exists solely for a
-    developer running `python3 scripts/run_git_hook.py pre-push` directly
-    with no input.
+    """Fallback for a manual/direct `pre-push` invocation with genuinely
+    empty stdin (nothing piped at all). `main()` calls this only when the
+    raw stdin text itself is empty or whitespace-only -- the real
+    `git push`-invoked hook always pipes at least one ref-update line per
+    the pre-push hook contract, so a real push (including a deletion-only
+    `git push --delete branch`, whose lines are all-zero-sha and are
+    skipped by `collect_pre_push_changes`, not absent) can never reach this
+    fallback. This exists solely for a developer running
+    `python3 scripts/run_git_hook.py pre-push` directly with no input.
+
+    Gating on stdin emptiness rather than on `changes.paths` being empty
+    matters: a deletion-only push has real, non-empty stdin but yields
+    `ChangeSet(paths=(), unknown=False)` from `collect_pre_push_changes`
+    (nothing to diff for a pure ref deletion) -- indistinguishable from the
+    manual-invocation case if the check were `not changes.paths`. Diffing
+    `@{u}..HEAD` of the *currently checked-out* branch in that case would be
+    a range unrelated to the refs actually being pushed. Gating on the raw
+    stdin text keeps this fallback reachable only from genuine manual
+    invocation with no piped input.
 
     DECISION (Task 6): kept, ported unchanged from the retired
     `pushed_paths()`'s `@{u}` fallback -- including reusing the original ad
@@ -818,20 +933,33 @@ def main(phase: str) -> int:
 
     pre-commit collects via `collect_pre_commit_changes()`. pre-push reads
     the ref-update batch from stdin via `collect_pre_push_changes()`; when
-    that yields a genuinely empty, non-`unknown` result (no piped lines at
-    all), falls back to `_pre_push_manual_upstream_changes()` for a manual
-    invocation outside Git's stdin contract (see that function's docstring
-    for why this is kept and what it does and does not cover). Either way,
-    `execute_gates(phase, changes)` alone decides and runs the gates -- this
-    function never re-derives that decision.
+    the raw stdin text itself is empty or whitespace-only (nothing piped at
+    all -- never true for a real `git push`-invoked hook, which always pipes
+    at least one ref-update line per the pre-push hook contract), falls back
+    to `_pre_push_manual_upstream_changes()` for a manual invocation outside
+    Git's stdin contract (see that function's docstring for why this is kept
+    and what it does and does not cover).
+
+    Gating on the raw stdin text, not on `changes.paths` being empty, is
+    deliberate: a deletion-only push (`git push --delete branch`) pipes
+    real, non-empty stdin whose lines are all skipped by
+    `collect_pre_push_changes` (all-zero local sha), yielding a genuinely
+    empty, non-`unknown` `ChangeSet` from real piped input -- that must
+    never be mistaken for the no-stdin-at-all manual-invocation case, or the
+    fallback would diff `@{u}..HEAD` of the *currently checked-out* branch,
+    a range unrelated to the refs actually being pushed.
+
+    Either way, `execute_gates(phase, changes)` alone decides and runs the
+    gates -- this function never re-derives that decision.
     """
     if phase not in _KNOWN_PHASES:
         raise ValueError(f"unknown phase: {phase!r}")
     if phase == PHASE_PRE_COMMIT:
         changes = collect_pre_commit_changes()
     else:
-        changes = collect_pre_push_changes(sys.stdin.read())
-        if not changes.unknown and not changes.paths:
+        stdin_text = sys.stdin.read()
+        changes = collect_pre_push_changes(stdin_text)
+        if not changes.unknown and not stdin_text.strip():
             changes = _pre_push_manual_upstream_changes()
     return execute_gates(phase, changes)
 

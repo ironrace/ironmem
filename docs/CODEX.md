@@ -112,7 +112,15 @@ The hooks are diff-aware:
 
 - collab protocol/template changes run the collab template lint
 - Rust/workspace changes run fmt and clippy on commit, then workspace tests on push
-- docs/config-only changes outside those surfaces skip heavy local gates
+- docs changes (`*.md`, any path under `docs/`) and inert config/data changes
+  (`*.json`/`*.jsonc`/`*.jsonl`/`*.yaml`/`*.yml`/`*.sh`/`*.csv`/`*.html`, any
+  path under `site/`, or a `.py` file under `benchmarks/`) skip heavy local
+  gates -- no gate parses, executes, or otherwise inspects those formats
+- any other path (including an unrecognized extension, or a
+  `crates/*/migrations/*.sql` change -- `include_str!`'d into the binary and
+  replayed by `cargo test`'s migration tests, so a real gate *does* catch a
+  defect there) escalates to running every gate declared for the phase,
+  fail-closed
 
 ### `run_git_hook.py`: collect → resolve → execute
 
@@ -129,15 +137,30 @@ already decided:
 | Execute | `execute_gates(phase, changes)` | Yes — runs subprocesses | Call `resolve_gates` exactly once, then run each selected gate with a hardened `subprocess.run`, printing one line per gate (`run` / `skip (...)` / `fail (...)`) and stopping at the first non-zero exit. |
 
 One more Git call site exists outside the hardened path above: `main()`
-falls back to `_pre_push_manual_upstream_changes()` when a manual, direct
-`python3 scripts/run_git_hook.py pre-push` invocation (no piped ref-update
-stdin — never the real `git push`-invoked hook) yields a genuinely empty,
-non-`unknown` `ChangeSet`. That fallback resolves `@{u}` and diffs it
-through the separate, unhardened `git()` helper, not `_run_git`/
-`_git_diff_paths_z`. That's deliberate, not an oversight: it's a
-best-effort convenience for invocation outside Git's stdin contract, kept
-unchanged from the pre-refactor fallback, and is not part of the
-fail-closed contract this section otherwise describes.
+falls back to `_pre_push_manual_upstream_changes()` when the raw pre-push
+stdin text itself is empty or whitespace-only — nothing piped at all. A real
+`git push`-invoked hook always pipes at least one ref-update line per the
+pre-push hook contract, so this fallback is genuinely unreachable from a
+real push; it exists solely for a developer running
+`python3 scripts/run_git_hook.py pre-push` directly with no input.
+
+The gate is on the raw stdin text, not on the resulting `ChangeSet.paths`
+being empty — that distinction is load-bearing. `git push --delete branch`
+pipes real, non-empty stdin whose lines all carry an all-zero local sha;
+`collect_pre_push_changes` skips every one of them (nothing to diff for a
+pure ref deletion) and returns a genuinely empty, non-`unknown` `ChangeSet`
+from that real piped input. Gating on `not changes.paths` instead (as an
+earlier version of this dispatcher did) would have mistaken that for the
+no-stdin-at-all manual-invocation case and fired the `@{u}` fallback —
+diffing `@{u}..HEAD` of the *currently checked-out* branch, a range
+unrelated to the ref actually being deleted. Gating on the stdin text keeps
+the fallback reachable only from genuine manual invocation.
+
+That fallback resolves `@{u}` and diffs it through the separate, unhardened
+`git()` helper, not `_run_git`/`_git_diff_paths_z`. That's deliberate, not
+an oversight: it's a best-effort convenience for invocation outside Git's
+stdin contract, kept unchanged from the pre-refactor fallback, and is not
+part of the fail-closed contract this section otherwise describes.
 
 #### The `ChangeSet` fail-closed interface
 
@@ -176,17 +199,27 @@ shape) and returns one of:
 | `collab_protocol` | `is_collab_protocol_path` | collab command/prompt/template files (`COLLAB_EXACT_PATHS`, `.claude-plugin/prompts/collab-turn-*`, `tests/collab_turn_templates/`) |
 | `hook_self_test` | `is_hook_path` | the tracked hook scripts themselves — an exact-set membership check (`HOOK_EXACT_PATHS`), not a prefix: `.githooks/pre-commit`, `.githooks/pre-push`, `scripts/install-git-hooks.sh`, `scripts/run_git_hook.py`, `scripts/test_run_git_hook.py`. Contrast `collab_protocol` below, whose `collab-turn-*` genuinely is a prefix match. |
 | `docs` | `is_docs_path` | any `.md` file, or any path whose leading `/`-split segment is `docs` |
+| `inert_config` | `is_inert_config_path` | a `.json`/`.jsonc`/`.jsonl`/`.yaml`/`.yml`/`.sh`/`.csv`/`.html` file, any path whose leading `/`-split segment is `site`, or a `.py` file whose leading `/`-split segment is `benchmarks` |
 | `UNKNOWN` | *(fallback — not in `SURFACES`)* | an unsafe-shaped path, or a path that matches no declared surface |
 
-`docs` is a declared, first-class entry in `SURFACES` — **not a fallback** —
-and that distinction is the point of the feature: an all-docs, all-safe-shape
-change classifies cleanly to `docs` and selects only `always` gates (none
-exist in today's manifest), which is cheaper and more precise than the
-`UNKNOWN` path. `UNKNOWN` is the true fallback, returned only when a path is
-unsafe-shaped (absolute, contains a `..` segment, a control byte other than
-`\n`, empty, starts with `-`, or isn't even a `str`) or matches no entry in
-`SURFACES` at all — and, like `changes.unknown`, it escalates `resolve_gates`
-to running every gate for the phase.
+`docs` and `inert_config` are declared, first-class entries in `SURFACES` —
+**not a fallback** — and that distinction is the point of the feature: an
+all-docs/all-inert-config, all-safe-shape change classifies cleanly and
+selects only `always` gates (none exist in today's manifest), which is
+cheaper and more precise than the `UNKNOWN` path. Both are declared after
+every specific surface (`rust_workspace`, `collab_protocol`,
+`hook_self_test`), so a path that would otherwise match one of their
+generic patterns — `scripts/install-git-hooks.sh` is a `.sh` file, exactly
+the kind `inert_config` matches — still classifies to the specific surface
+it belongs to, because `SURFACES` is checked in declaration order and the
+first match wins. `UNKNOWN` is the true fallback, returned only when a path
+is unsafe-shaped (absolute, contains a `..` segment, a control byte other
+than `\n`, empty, starts with `-`, or isn't even a `str`) or matches no
+entry in `SURFACES` at all — and, like `changes.unknown`, it escalates
+`resolve_gates` to running every gate for the phase. `crates/*/migrations/
+*.sql` is a deliberate example of a path that stays `UNKNOWN`: it is
+`include_str!`'d into the Rust binary and replayed by `cargo test`'s
+migration tests, so a real gate does catch a defect there.
 
 #### Byte-exact paths — why stripping is forbidden
 

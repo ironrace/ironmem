@@ -248,6 +248,7 @@ def test_surfaces_contains_expected_ids():
         hook.SURFACE_COLLAB_PROTOCOL,
         hook.SURFACE_HOOK_SELF_TEST,
         hook.SURFACE_DOCS,
+        hook.SURFACE_INERT_CONFIG,
     }
 
 
@@ -259,6 +260,31 @@ def test_surfaces_ported_unchanged_from_existing_predicates():
 
 def test_surfaces_docs_entry_is_is_docs_path():
     assert hook.SURFACES[hook.SURFACE_DOCS] is hook.is_docs_path
+
+
+def test_surfaces_inert_config_entry_is_is_inert_config_path():
+    assert hook.SURFACES[hook.SURFACE_INERT_CONFIG] is hook.is_inert_config_path
+
+
+# --- Task 9: SURFACE_INERT_CONFIG declared after the specific surfaces ---
+#
+# Ordering is the load-bearing property here, not mere presence: a `.sh` gate
+# script like scripts/install-git-hooks.sh matches is_inert_config_path's
+# extension check too, so if SURFACE_INERT_CONFIG were ever declared before
+# SURFACE_HOOK_SELF_TEST, classify_path() would return the wrong surface for
+# every hook script -- the dict-iteration-order win, not a hardcoded
+# precedence rule.
+
+
+def test_surface_inert_config_declared_after_every_specific_surface():
+    order = list(hook.SURFACES)
+    inert_index = order.index(hook.SURFACE_INERT_CONFIG)
+    for specific in (
+        hook.SURFACE_RUST_WORKSPACE,
+        hook.SURFACE_COLLAB_PROTOCOL,
+        hook.SURFACE_HOOK_SELF_TEST,
+    ):
+        assert order.index(specific) < inert_index
 
 
 def test_surfaces_is_a_frozen_mapping():
@@ -362,6 +388,129 @@ def test_classify_path_known_surface_beats_generic_docs():
     # set. The more specific declared surface wins over the generic inert
     # docs catch-all -- DOCS is checked last, never first.
     assert hook.classify_path("docs/COLLAB.md") == hook.SURFACE_COLLAB_PROTOCOL
+
+
+# --- Task 9: is_inert_config_path -- second explicitly-inert surface -----
+
+
+def test_is_inert_config_path_matches_json_extension():
+    assert hook.is_inert_config_path(".claude-plugin/plugin.json") is True
+
+
+def test_is_inert_config_path_matches_yaml_and_yml_extensions():
+    assert hook.is_inert_config_path(".codex-plugin/skills/pr-review-toolkit/agents/openai.yaml") is True
+    assert hook.is_inert_config_path(".github/workflows/ci.yml") is True
+
+
+def test_is_inert_config_path_matches_shell_script_extension():
+    assert hook.is_inert_config_path("scripts/check_versions.sh") is True
+
+
+def test_is_inert_config_path_matches_csv_and_jsonl_and_jsonc():
+    assert hook.is_inert_config_path("benchmarks/provbench/spotcheck/sample-eaf82d2.csv") is True
+    assert hook.is_inert_config_path("benchmarks/abeval/corpus/tasks.jsonl") is True
+    assert hook.is_inert_config_path("wrangler.jsonc") is True
+
+
+def test_is_inert_config_path_matches_html_extension():
+    assert hook.is_inert_config_path("crates/ironmem/src/dashboard/index.html") is True
+
+
+def test_is_inert_config_path_matches_site_directory_regardless_of_extension():
+    assert hook.is_inert_config_path("site/index.html") is True
+    assert hook.is_inert_config_path("site/script.js") is True
+    assert hook.is_inert_config_path("site/_headers") is True  # no extension at all
+
+
+def test_is_inert_config_path_matches_benchmarks_python_files():
+    assert hook.is_inert_config_path("benchmarks/abeval/baseline_driver.py") is True
+    assert (
+        hook.is_inert_config_path("benchmarks/provbench/spotcheck/tools/autofilter.py") is True
+    )
+
+
+def test_is_inert_config_path_rejects_benchmarks_rust_source():
+    # The workspace-excluded benchmarks/* Cargo crates still ship real .rs
+    # source; is_rust_path (checked before this surface) already classifies
+    # those correctly as SURFACE_RUST_WORKSPACE. This predicate itself must
+    # not claim a .rs file even in isolation, or a future reordering bug
+    # would silently misclassify Rust source as inert.
+    assert hook.is_inert_config_path("benchmarks/provbench/labeler/src/lib.rs") is False
+
+
+def test_is_inert_config_path_rejects_sql_migration():
+    # crates/ironmem/migrations/*.sql is include_str!'d into the Rust binary
+    # and exercised by cargo test's migration-replay tests -- a real gate
+    # catches a defect here, so it must stay UNKNOWN (escalate), never
+    # become inert.
+    assert hook.is_inert_config_path("crates/ironmem/migrations/001_init.sql") is False
+
+
+def test_is_inert_config_path_rejects_look_alike_site_directory():
+    # "sitehost/" is not "site/" -- segment-based matching, not substring.
+    assert hook.is_inert_config_path("sitehost/notes.txt") is False
+
+
+def test_is_inert_config_path_rejects_look_alike_benchmarks_directory():
+    assert hook.is_inert_config_path("benchmarksish/tool.py") is False
+
+
+def test_is_inert_config_path_rejects_non_matching_extension_outside_declared_dirs():
+    assert hook.is_inert_config_path("crates/ironmem/src/lib.rs") is False
+    assert hook.is_inert_config_path("notes.txt") is False
+
+
+# --- Task 9: classify_path -- ordering protection for the new surface ----
+#
+# The whole-branch review's acceptance bullet: a `.sh` gate script must keep
+# classifying hook_self_test even though it also matches
+# is_inert_config_path's extension check, because SURFACE_HOOK_SELF_TEST is
+# declared (and checked) before SURFACE_INERT_CONFIG.
+
+
+def test_classify_path_install_git_hooks_sh_stays_hook_self_test():
+    assert hook.classify_path("scripts/install-git-hooks.sh") == hook.SURFACE_HOOK_SELF_TEST
+
+
+def test_classify_path_run_git_hook_py_stays_hook_self_test():
+    assert hook.classify_path("scripts/run_git_hook.py") == hook.SURFACE_HOOK_SELF_TEST
+
+
+def test_classify_path_test_run_git_hook_py_stays_hook_self_test():
+    assert hook.classify_path("scripts/test_run_git_hook.py") == hook.SURFACE_HOOK_SELF_TEST
+
+
+def test_classify_path_githooks_pre_commit_stays_hook_self_test():
+    assert hook.classify_path(".githooks/pre-commit") == hook.SURFACE_HOOK_SELF_TEST
+
+
+def test_classify_path_githooks_pre_push_stays_hook_self_test():
+    assert hook.classify_path(".githooks/pre-push") == hook.SURFACE_HOOK_SELF_TEST
+
+
+def test_classify_path_check_collab_turn_templates_stays_collab_protocol():
+    assert (
+        hook.classify_path("scripts/check_collab_turn_templates.py")
+        == hook.SURFACE_COLLAB_PROTOCOL
+    )
+
+
+def test_classify_path_inert_config_json_file():
+    assert hook.classify_path(".claude-plugin/plugin.json") == hook.SURFACE_INERT_CONFIG
+
+
+def test_classify_path_genuinely_unrecognized_path_still_escalates():
+    # weird/thing.xyz matches no declared surface -- including the new
+    # inert_config one -- so it must still classify UNKNOWN, and every
+    # phase-matching gate must still be selected. The fail-closed property
+    # must survive where it matters: an unrecognized extension is not
+    # silently treated as inert.
+    assert hook.classify_path("weird/thing.xyz") == hook.UNKNOWN
+    changes = hook.ChangeSet(paths=("weird/thing.xyz",), unknown=False, reason=None)
+    for phase in (hook.PHASE_PRE_COMMIT, hook.PHASE_PRE_PUSH):
+        result = hook.resolve_gates(phase, changes)
+        expected = tuple(gate for gate in hook.GATES if phase in gate.phases)
+        assert result == expected
 
 
 # --- Task 2: classify_path -- near-misses classify UNKNOWN, not the surface
@@ -525,6 +674,41 @@ def test_resolve_gates_docs_plus_code_path_does_not_skip():
     )
     names = [gate.name for gate in hook.resolve_gates(hook.PHASE_PRE_COMMIT, changes)]
     assert names == ["rust_fmt_check", "rust_clippy"]
+
+
+# --- Task 9: resolve_gates -- inert_config is inert like docs -------------
+
+
+def test_resolve_gates_inert_config_only_selects_no_gates():
+    changes = hook.ChangeSet(
+        paths=(".claude-plugin/plugin.json", "site/index.html", "benchmarks/abeval/baseline_driver.py"),
+        unknown=False,
+        reason=None,
+    )
+    assert hook.resolve_gates(hook.PHASE_PRE_COMMIT, changes) == ()
+    assert hook.resolve_gates(hook.PHASE_PRE_PUSH, changes) == ()
+
+
+def test_resolve_gates_inert_config_plus_code_path_does_not_skip():
+    changes = hook.ChangeSet(
+        paths=(".claude-plugin/plugin.json", "crates/ironmem/src/hook.rs"),
+        unknown=False,
+        reason=None,
+    )
+    names = [gate.name for gate in hook.resolve_gates(hook.PHASE_PRE_COMMIT, changes)]
+    assert names == ["rust_fmt_check", "rust_clippy"]
+
+
+def test_resolve_gates_inert_config_does_not_protect_sql_migration_from_escalation():
+    # A staged crates/ironmem/migrations/*.sql change classifies UNKNOWN (not
+    # inert_config -- see test_is_inert_config_path_rejects_sql_migration),
+    # so it must still escalate to every gate for the phase.
+    changes = hook.ChangeSet(
+        paths=("crates/ironmem/migrations/001_init.sql",), unknown=False, reason=None
+    )
+    result = hook.resolve_gates(hook.PHASE_PRE_COMMIT, changes)
+    expected = tuple(gate for gate in hook.GATES if hook.PHASE_PRE_COMMIT in gate.phases)
+    assert result == expected
 
 
 def test_resolve_gates_unrecognized_path_alone_runs_every_gate_for_phase():
@@ -718,12 +902,13 @@ def test_resolve_gates_does_not_mutate_changeset_paths():
 # parametrization ids*, not runtime gate ordering -- GATES itself is never
 # sorted.
 #
-# SURFACE_DOCS is deliberately absent from the map below: no gate declares
-# it today, and DOCS is defined as inert (see
-# test_resolve_gates_docs_only_selects_no_gates). If a future gate declared
-# SURFACE_DOCS, this map must raise KeyError naming that gate immediately,
-# not silently resolve to a docs-classified path that would make the
-# always/escalate-only property look satisfied when it isn't.
+# SURFACE_DOCS and SURFACE_INERT_CONFIG are deliberately absent from the map
+# below: no gate declares either today, and both are defined as inert (see
+# test_resolve_gates_docs_only_selects_no_gates and
+# test_resolve_gates_inert_config_only_selects_no_gates). If a future gate
+# declared either one, this map must raise KeyError naming that gate
+# immediately, not silently resolve to an inert-classified path that would
+# make the always/escalate-only property look satisfied when it isn't.
 _SURFACE_EXAMPLE_PATH_FOR_TEST = {
     hook.SURFACE_RUST_WORKSPACE: "crates/ironmem/src/hook.rs",
     hook.SURFACE_COLLAB_PROTOCOL: "docs/COLLAB.md",
@@ -1299,10 +1484,13 @@ def test_execute_gates_prints_run_line_for_selected_gate(monkeypatch, capsys):
     monkeypatch.setattr(hook, "GATES", (fmt_gate,))
     hook.execute_gates(hook.PHASE_PRE_COMMIT, changes)
     out = capsys.readouterr().out
-    # Exact line, not a substring check -- the task calls this format
-    # deterministic, so the test should pin the literal bytes rather than
-    # accept e.g. "rerun" or a stray "7" anywhere in unrelated output.
-    assert out == "[git-hook] rust_fmt_check: run\n"
+    # Exact output, not a substring check -- the task calls the per-gate
+    # format deterministic, so the test should pin the literal bytes rather
+    # than accept e.g. "rerun" or a stray "7" anywhere in unrelated output.
+    # The trailing completion line (Task 9 Part C) restores the "the run
+    # completed intentionally" statement the pre-Task-6 runner printed
+    # (`[pre-commit] staged files: N`) and this refactor had dropped.
+    assert out == "[git-hook] rust_fmt_check: run\n[git-hook] pre-commit: 1 gate(s) run, 0 failed\n"
 
 
 def test_execute_gates_prints_skip_line_with_surfaces_not_touched(monkeypatch, capsys):
@@ -1493,6 +1681,81 @@ def test_execute_gates_unknown_phase_raises():
     changes = hook.ChangeSet(paths=(), unknown=False, reason=None)
     with pytest.raises(ValueError):
         hook.execute_gates("typo-phase", changes)
+
+
+# --- Task 9 Part C: a completed run states plainly that it completed ------
+#
+# `[pre-commit] staged files: N` and "no local gates required" were removed
+# with no replacement when the manifest resolver replaced the old
+# run_pre_commit()/run_pre_push() conditional assembly: a docs/inert-only
+# commit printed only `skip (...)` lines, with nothing stating the run
+# completed intentionally rather than, say, crashing silently before
+# printing anything. This restores an equivalent completion statement.
+
+
+def test_execute_gates_prints_no_local_gates_required_when_nothing_selected(monkeypatch, capsys):
+    fake = _FakeGateRun({})
+    monkeypatch.setattr(hook.subprocess, "run", fake)
+    # Real GATES manifest, all-docs change: every gate is phase-matching but
+    # none is selected (docs is inert), so every gate prints a skip line --
+    # the plain completion statement must still appear after them.
+    changes = hook.ChangeSet(paths=("README.md",), unknown=False, reason=None)
+    rc = hook.execute_gates(hook.PHASE_PRE_COMMIT, changes)
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert out.splitlines()[-1] == "[git-hook] pre-commit: no local gates required"
+
+
+def test_execute_gates_prints_no_local_gates_required_for_inert_config_only(monkeypatch, capsys):
+    fake = _FakeGateRun({})
+    monkeypatch.setattr(hook.subprocess, "run", fake)
+    changes = hook.ChangeSet(
+        paths=(".claude-plugin/plugin.json",), unknown=False, reason=None
+    )
+    rc = hook.execute_gates(hook.PHASE_PRE_PUSH, changes)
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert out.splitlines()[-1] == "[git-hook] pre-push: no local gates required"
+
+
+def test_execute_gates_prints_completion_summary_when_gates_run(monkeypatch, capsys):
+    fake = _FakeGateRun(
+        {
+            ("cargo", "fmt", "--all", "--", "--check"): 0,
+            (
+                "cargo",
+                "clippy",
+                "--workspace",
+                "--all-targets",
+                "--all-features",
+                "--",
+                "-D",
+                "warnings",
+            ): 0,
+        }
+    )
+    monkeypatch.setattr(hook.subprocess, "run", fake)
+    rc = hook.execute_gates(hook.PHASE_PRE_COMMIT, _only_rust_changes())
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert out.splitlines()[-1] == "[git-hook] pre-commit: 2 gate(s) run, 0 failed"
+
+
+def test_execute_gates_no_completion_line_when_a_gate_fails(monkeypatch, capsys):
+    # A failed gate returns early -- the run did not complete, so no
+    # completion line (of either flavor) should print.
+    fake = _FakeGateRun({("cargo", "fmt", "--all", "--", "--check"): 3})
+    monkeypatch.setattr(hook.subprocess, "run", fake)
+    fmt_gate = next(gate for gate in hook.GATES if gate.name == "rust_fmt_check")
+    monkeypatch.setattr(hook, "GATES", (fmt_gate,))
+    changes = hook.ChangeSet(
+        paths=("crates/ironmem/src/hook.rs",), unknown=False, reason=None
+    )
+    rc = hook.execute_gates(hook.PHASE_PRE_COMMIT, changes)
+    out = capsys.readouterr().out
+    assert rc == 3
+    assert "no local gates required" not in out
+    assert "gate(s) run" not in out
 
 
 # --- _scrub_git_env -- the security-critical part of this task ------------
@@ -1887,6 +2150,30 @@ def test_main_pre_push_with_stdin_paths_never_triggers_upstream_fallback(monkeyp
     # trigger the @{u} fallback -- it is reserved for the genuinely-empty
     # case only.
     assert fake.calls == [["git", "diff", "--name-only", "-z", f"{SHA_A}..{SHA_B}"]]
+
+
+def test_main_pre_push_deletion_only_push_does_not_trigger_upstream_fallback(monkeypatch):
+    # Regression test for the false "unreachable from a real git push" claim
+    # (scripts/run_git_hook.py's _pre_push_manual_upstream_changes docstring
+    # and docs/CODEX.md both claimed this). `git push --delete branch` pipes
+    # a real, non-empty stdin line whose local_sha is ZERO_SHA -- every line
+    # hits collect_pre_push_changes's deletion-ref `continue`, so the
+    # resulting ChangeSet is genuinely paths=(), unknown=False despite stdin
+    # being non-empty. The old `not changes.paths` gate in main() could not
+    # tell that apart from a manual invocation with no piped stdin at all,
+    # and would fire the @{u} fallback -- diffing the *checked-out* branch's
+    # upstream range, unrelated to the deletion being pushed. Gating on
+    # `stdin_text.strip()` instead means a real deletion-only push (non-empty
+    # stdin) never reaches the fallback: no git calls at all, since there is
+    # nothing to diff for a pure ref deletion.
+    stdin = _pre_push_line("refs/heads/gone", hook.ZERO_SHA, "refs/heads/gone", SHA_A) + "\n"
+    fake = _FakeSubprocessRun({})  # no git call of any kind is expected
+    monkeypatch.setattr(hook.subprocess, "run", fake)
+    monkeypatch.setattr(sys, "stdin", _StdinStub(stdin))
+    rc = hook.main(hook.PHASE_PRE_PUSH)
+    assert rc == 0
+    assert fake.calls == []
+    assert ("git", "rev-parse", "--verify", "@{u}") not in [tuple(c) for c in fake.calls]
 
 
 # --- _cli_main(argv) -- the usage-error / exit-2 contract, preserved from
