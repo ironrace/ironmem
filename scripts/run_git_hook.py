@@ -396,7 +396,9 @@ def is_hook_path(path: str) -> bool:
 #   - `crates/ironmem/src/hook.rs` parses `.claude-plugin/hooks/hooks.json`
 #     and asserts its `UserPromptSubmit` command string.
 #   - `crates/ironmem/src/harness/packaging.rs`'s `REQUIRED_ASSETS`
-#     (`bin/<id>-mcp.sh`, `hooks/<id>-hook.sh`, `plugin.json`) is enforced
+#     -- a fixed literal list, identical for every harness and never
+#     `<id>`-templated: `bin/ironmem-mcp.sh`, `hooks/ironmem-hook.sh`,
+#     `plugin.json` -- is enforced
 #     against the real repo root by `packaging_coverage_passes_for_production_registry`.
 #   - `plugin_metadata.rs`'s `claude_review_agents_advertise_lean_profile`
 #     parses YAML frontmatter from `.claude-plugin/agents/*.md` and fails if

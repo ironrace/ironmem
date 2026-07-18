@@ -123,8 +123,10 @@ The hooks are diff-aware:
   --workspace` reads `plugin.json`/`hooks.json`/`.mcp.json` and asserts
   `plugin.json`'s version matches `Cargo.toml` (`plugin_metadata.rs`),
   parses `hooks/hooks.json`'s `UserPromptSubmit` command (`hook.rs`),
-  requires the plugin's `bin/*.sh`/`hooks/*.sh` assets to exist
-  (`packaging.rs`'s `REQUIRED_ASSETS`), and parses review-agent Markdown
+  requires the plugin's `bin/ironmem-mcp.sh` and `hooks/ironmem-hook.sh` to
+  exist (`packaging.rs`'s `REQUIRED_ASSETS` is a fixed literal list --
+  `bin/ironmem-mcp.sh`, `hooks/ironmem-hook.sh`, `plugin.json` -- identical
+  for every harness, never `<id>`-templated), and parses review-agent Markdown
   frontmatter (`plugin_metadata.rs`'s lean-profile guard) -- so these paths
   escalate to running every gate declared for the phase, the same as any
   other gate-covered change
@@ -222,7 +224,9 @@ directories' JSON, shell assets, and agent Markdown is read by `cargo test
 --workspace` (`plugin_metadata.rs`'s `read_json`/
 `plugin_versions_match_cargo_toml`/`claude_review_agents_advertise_lean_
 profile`, `hook.rs`'s `hooks.json` parse, `packaging.rs`'s `REQUIRED_ASSETS`
-check), so a path inside one is gate-covered, not inert, and must classify
+existence check for the literal `bin/ironmem-mcp.sh`,
+`hooks/ironmem-hook.sh`, and `plugin.json`), so a path inside one is
+gate-covered, not inert, and must classify
 `UNKNOWN` (escalate) instead. A look-alike segment like
 `.claude-plugin-backup` does not match — the check is a whole-segment
 `endswith("-plugin")`, not a substring test, so it stays classified by the
