@@ -31,7 +31,13 @@ def load_hook_module():
     # type hints via sys.modules[cls.__module__]; the module must be
     # registered there before exec_module runs the class bodies.
     sys.modules[spec.name] = module
-    spec.loader.exec_module(module)
+    try:
+        spec.loader.exec_module(module)
+    except BaseException:
+        # Don't leave a partially-initialized module registered under a
+        # shared name if exec_module fails partway through.
+        sys.modules.pop(spec.name, None)
+        raise
     return module
 
 
@@ -81,11 +87,22 @@ def test_gate_is_frozen():
         name="example",
         argv=("python3", "scripts/example.py"),
         phases=frozenset({"pre-commit"}),
-        surfaces=frozenset({hook.SURFACE_DOCS}),
+        surfaces=frozenset({hook.SURFACE_HOOK_SELF_TEST}),
         always=False,
     )
     with pytest.raises(dataclasses.FrozenInstanceError):
         gate.name = "mutated"  # type: ignore[misc]
+
+
+def test_gate_rejects_non_str_name():
+    with pytest.raises(TypeError):
+        hook.Gate(
+            name=123,  # type: ignore[arg-type]
+            argv=("python3", "scripts/example.py"),
+            phases=frozenset({"pre-commit"}),
+            surfaces=frozenset({hook.SURFACE_HOOK_SELF_TEST}),
+            always=False,
+        )
 
 
 def test_gate_rejects_non_tuple_argv():
@@ -94,7 +111,7 @@ def test_gate_rejects_non_tuple_argv():
             name="example",
             argv=["python3", "scripts/example.py"],  # type: ignore[arg-type]
             phases=frozenset({"pre-commit"}),
-            surfaces=frozenset({hook.SURFACE_DOCS}),
+            surfaces=frozenset({hook.SURFACE_HOOK_SELF_TEST}),
             always=False,
         )
 
@@ -105,7 +122,7 @@ def test_gate_rejects_non_frozenset_phases():
             name="example",
             argv=("python3", "scripts/example.py"),
             phases={"pre-commit"},  # type: ignore[arg-type]
-            surfaces=frozenset({hook.SURFACE_DOCS}),
+            surfaces=frozenset({hook.SURFACE_HOOK_SELF_TEST}),
             always=False,
         )
 
@@ -116,8 +133,19 @@ def test_gate_rejects_non_frozenset_surfaces():
             name="example",
             argv=("python3", "scripts/example.py"),
             phases=frozenset({"pre-commit"}),
-            surfaces={hook.SURFACE_DOCS},  # type: ignore[arg-type]
+            surfaces={hook.SURFACE_HOOK_SELF_TEST},  # type: ignore[arg-type]
             always=False,
+        )
+
+
+def test_gate_rejects_non_bool_always():
+    with pytest.raises(TypeError):
+        hook.Gate(
+            name="example",
+            argv=("python3", "scripts/example.py"),
+            phases=frozenset({"pre-commit"}),
+            surfaces=frozenset({hook.SURFACE_HOOK_SELF_TEST}),
+            always="false",  # type: ignore[arg-type]
         )
 
 
@@ -133,6 +161,21 @@ def test_changeset_is_frozen():
 def test_changeset_rejects_non_tuple_paths():
     with pytest.raises(TypeError):
         hook.ChangeSet(paths=["a.py"], unknown=False, reason=None)  # type: ignore[arg-type]
+
+
+def test_changeset_rejects_non_bool_unknown():
+    with pytest.raises(TypeError):
+        hook.ChangeSet(paths=(), unknown="false", reason=None)  # type: ignore[arg-type]
+
+
+def test_changeset_rejects_non_str_reason():
+    with pytest.raises(TypeError):
+        hook.ChangeSet(paths=(), unknown=True, reason=404)  # type: ignore[arg-type]
+
+
+def test_changeset_accepts_none_reason():
+    changeset = hook.ChangeSet(paths=(), unknown=False, reason=None)
+    assert changeset.reason is None
 
 
 def test_changeset_default_construction():
@@ -237,7 +280,6 @@ def test_surfaces_contains_expected_ids():
         hook.SURFACE_RUST_WORKSPACE,
         hook.SURFACE_COLLAB_PROTOCOL,
         hook.SURFACE_HOOK_SELF_TEST,
-        hook.SURFACE_DOCS,
     }
 
 
@@ -251,13 +293,6 @@ def test_surfaces_is_a_frozen_mapping():
     assert isinstance(hook.SURFACES, MappingProxyType)
     with pytest.raises(TypeError):
         hook.SURFACES["new_surface"] = lambda path: False  # type: ignore[index]
-
-
-def test_docs_surface_is_explicitly_inert():
-    # The docs surface exists in the map but no gate lists it: matching it
-    # should never cause a gate to run.
-    referencing_gates = [gate.name for gate in hook.GATES if hook.SURFACE_DOCS in gate.surfaces]
-    assert referencing_gates == []
 
 
 def test_every_gate_surface_id_is_registered():

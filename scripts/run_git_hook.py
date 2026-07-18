@@ -140,15 +140,6 @@ def is_hook_path(path: str) -> bool:
     return path in HOOK_EXACT_PATHS
 
 
-def is_docs_path(path: str) -> bool:
-    """Minimal placeholder predicate for the explicitly inert docs surface.
-
-    Real path classification is Task 2's job; this is intentionally simple
-    scaffolding so the surface map has an entry to point at.
-    """
-    return path.endswith(".md") or path.startswith("docs/")
-
-
 # --- Frozen data model -------------------------------------------------
 #
 # `Gate`/`ChangeSet`/`GATES`/`SURFACES` are the pure data layer the rest of
@@ -161,7 +152,6 @@ PHASE_PRE_PUSH = "pre-push"
 SURFACE_RUST_WORKSPACE = "rust_workspace"
 SURFACE_COLLAB_PROTOCOL = "collab_protocol"
 SURFACE_HOOK_SELF_TEST = "hook_self_test"
-SURFACE_DOCS = "docs"
 
 
 @dataclasses.dataclass(frozen=True)
@@ -175,6 +165,8 @@ class Gate:
     always: bool
 
     def __post_init__(self) -> None:
+        if not isinstance(self.name, str):
+            raise TypeError(f"Gate.name must be a str, got {type(self.name).__name__}")
         if not isinstance(self.argv, tuple):
             raise TypeError(f"Gate.argv must be a tuple, got {type(self.argv).__name__}")
         if not isinstance(self.phases, frozenset):
@@ -183,6 +175,8 @@ class Gate:
             raise TypeError(
                 f"Gate.surfaces must be a frozenset, got {type(self.surfaces).__name__}"
             )
+        if not isinstance(self.always, bool):
+            raise TypeError(f"Gate.always must be a bool, got {type(self.always).__name__}")
 
 
 @dataclasses.dataclass(frozen=True)
@@ -200,6 +194,14 @@ class ChangeSet:
     def __post_init__(self) -> None:
         if not isinstance(self.paths, tuple):
             raise TypeError(f"ChangeSet.paths must be a tuple, got {type(self.paths).__name__}")
+        if not isinstance(self.unknown, bool):
+            raise TypeError(
+                f"ChangeSet.unknown must be a bool, got {type(self.unknown).__name__}"
+            )
+        if self.reason is not None and not isinstance(self.reason, str):
+            raise TypeError(
+                f"ChangeSet.reason must be a str or None, got {type(self.reason).__name__}"
+            )
 
 
 # surface_id -> predicate. Predicates ported unchanged from the existing
@@ -209,7 +211,6 @@ SURFACES: MappingProxyType[str, Callable[[str], bool]] = MappingProxyType(
         SURFACE_RUST_WORKSPACE: is_rust_path,
         SURFACE_COLLAB_PROTOCOL: is_collab_protocol_path,
         SURFACE_HOOK_SELF_TEST: is_hook_path,
-        SURFACE_DOCS: is_docs_path,
     }
 )
 
