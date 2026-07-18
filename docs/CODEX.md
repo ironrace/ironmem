@@ -124,9 +124,20 @@ already decided:
 
 | Layer | Entry point | Impure? | Job |
 |---|---|---|---|
-| Collect | `collect_pre_commit_changes()` / `collect_pre_push_changes(stdin)` | Yes — the only Git subprocess calls in the pipeline | Turn Git's own diff output into a `ChangeSet`. Decides nothing about which gates run. |
+| Collect | `collect_pre_commit_changes()` / `collect_pre_push_changes(stdin)` | Yes — the only place the fail-closed `_run_git`/`_git_diff_paths_z` helpers are called | Turn Git's own diff output into a `ChangeSet`. Decides nothing about which gates run. |
 | Resolve | `resolve_gates(phase, changes)` | No — pure and total | Turn `(phase, ChangeSet)` into the tuple of `Gate`s to run, in `GATES` declaration order. No I/O, no env, no clock, no subprocess. |
 | Execute | `execute_gates(phase, changes)` | Yes — runs subprocesses | Call `resolve_gates` exactly once, then run each selected gate with a hardened `subprocess.run`, printing one line per gate (`run` / `skip (...)` / `fail (...)`) and stopping at the first non-zero exit. |
+
+One more Git call site exists outside the hardened path above: `main()`
+falls back to `_pre_push_manual_upstream_changes()` when a manual, direct
+`python3 scripts/run_git_hook.py pre-push` invocation (no piped ref-update
+stdin — never the real `git push`-invoked hook) yields a genuinely empty,
+non-`unknown` `ChangeSet`. That fallback resolves `@{u}` and diffs it
+through the separate, unhardened `git()` helper, not `_run_git`/
+`_git_diff_paths_z`. That's deliberate, not an oversight: it's a
+best-effort convenience for invocation outside Git's stdin contract, kept
+unchanged from the pre-refactor fallback, and is not part of the
+fail-closed contract this section otherwise describes.
 
 #### The `ChangeSet` fail-closed interface
 
@@ -163,7 +174,7 @@ shape) and returns one of:
 |---|---|---|
 | `rust_workspace` | `is_rust_path` | `.rs` files, `Cargo.toml`/`Cargo.lock`/`build.rs`, anything under `.cargo/` |
 | `collab_protocol` | `is_collab_protocol_path` | collab command/prompt/template files (`COLLAB_EXACT_PATHS`, `.claude-plugin/prompts/collab-turn-*`, `tests/collab_turn_templates/`) |
-| `hook_self_test` | `is_hook_path` | the tracked hook scripts themselves (`.githooks/*`, `scripts/install-git-hooks.sh`, `scripts/run_git_hook.py`, `scripts/test_run_git_hook.py`) |
+| `hook_self_test` | `is_hook_path` | the tracked hook scripts themselves — an exact-set membership check (`HOOK_EXACT_PATHS`), not a prefix: `.githooks/pre-commit`, `.githooks/pre-push`, `scripts/install-git-hooks.sh`, `scripts/run_git_hook.py`, `scripts/test_run_git_hook.py`. Contrast `collab_protocol` below, whose `collab-turn-*` genuinely is a prefix match. |
 | `docs` | `is_docs_path` | any `.md` file, or any path whose leading `/`-split segment is `docs` |
 | `UNKNOWN` | *(fallback — not in `SURFACES`)* | an unsafe-shaped path, or a path that matches no declared surface |
 
@@ -179,8 +190,11 @@ to running every gate for the phase.
 
 #### Byte-exact paths — why stripping is forbidden
 
-Every Git invocation in the collection layer uses `-z` (NUL-delimited)
-output. That removes `core.quotepath` escaping at the source, and —
+Every Git invocation in the collection layer that returns paths uses `-z`
+(NUL-delimited) output (`_default_base`'s `symbolic-ref`/`merge-base` calls
+are the exceptions — they return a ref name and a sha, never a path list,
+so byte-exactness doesn't apply and they don't pass `-z`). That removes
+`core.quotepath` escaping at the source, and —
 critically — **a newline is a legal byte inside a Git filename**: with NUL as
 the only delimiter, there is no delimiter newline to strip, so one is never
 stripped. `_split_nul` drops exactly one trailing empty field (`-z`'s own
