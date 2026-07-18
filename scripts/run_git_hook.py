@@ -660,22 +660,46 @@ def resolve_gates(phase: str, changes: ChangeSet) -> tuple[Gate, ...]:
 #   GIT_NAMESPACE                                -- which ref namespace
 #
 # Keep-list: variables that configure *how* Git authenticates or reports,
-# not *where* it points. Dropping these can break a legitimate developer
-# setup (e.g. an SSH-agent wrapper or corporate proxy needed for a gate
-# that itself shells out to Git) without buying any safety, since none of
-# them can redirect a child Git invocation at another repository:
-#   GIT_ASKPASS, GIT_SSH, GIT_SSH_COMMAND -- how Git authenticates over SSH
+# not *where* it points. GIT_CONFIG_* is deliberately NOT here (see below).
+#   GIT_ASKPASS, GIT_SSH, GIT_SSH_COMMAND -- each execs a caller-chosen helper
+#                                              program to authenticate over SSH.
+#                                              They cannot redirect a child Git
+#                                              invocation at a different repo,
+#                                              and dropping them breaks
+#                                              legitimate SSH-agent wrappers and
+#                                              CI credential setups -- kept
+#                                              despite executing arbitrary code,
+#                                              not because they are inert.
 #   GIT_TERMINAL_PROMPT                    -- whether Git may prompt interactively
-#   GIT_CONFIG_*                           -- one-off config overrides (GIT_CONFIG_COUNT
-#                                              + GIT_CONFIG_KEY_n/GIT_CONFIG_VALUE_n)
-#   GIT_TRACE*                             -- diagnostic tracing output
+#   GIT_TRACE*                             -- GIT_TRACE=<path> appends trace
+#                                              output to that path: a file-write
+#                                              primitive, not merely diagnostic
+#                                              output, but it cannot redirect a
+#                                              child Git invocation at another
+#                                              repository the way GIT_CONFIG_*
+#                                              can (see below), so it stays.
+#
+# GIT_CONFIG_* is excluded on purpose, not an oversight: GIT_CONFIG_COUNT +
+# GIT_CONFIG_KEY_n/GIT_CONFIG_VALUE_n are the documented equivalent of
+# `git -c <key>=<value>` for ARBITRARY config, and GIT_CONFIG_GLOBAL/
+# GIT_CONFIG_SYSTEM (also matched by this prefix) replace whole config files.
+# That includes core.worktree -- the config equivalent of GIT_WORK_TREE, which
+# this module strips above as a repo-redirecting variable -- plus core.bare,
+# core.hooksPath, credential.helper, core.pager, core.sshCommand, alias.*, and
+# *.textconv. A caller could set GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=
+# core.worktree GIT_CONFIG_VALUE_0=/real/repo and reproduce exactly the
+# redirection this scrub exists to prevent (PR #186) through the front door.
+# Keeping it would make the docstring's "no kept variable can redirect a
+# child Git invocation" premise false, so it is stripped like any other
+# unrecognized GIT_*-prefixed variable.
+#
 # Default toward scrubbing: anything GIT_*-prefixed that isn't explicitly
 # named or prefix-matched here is dropped, including variables not yet
 # invented. The keep-list is an allowlist, not a denylist.
 _GIT_ENV_KEEP_EXACT: frozenset[str] = frozenset(
     {"GIT_ASKPASS", "GIT_SSH", "GIT_SSH_COMMAND", "GIT_TERMINAL_PROMPT"}
 )
-_GIT_ENV_KEEP_PREFIXES: tuple[str, ...] = ("GIT_CONFIG_", "GIT_TRACE")
+_GIT_ENV_KEEP_PREFIXES: tuple[str, ...] = ("GIT_TRACE",)
 
 
 def _scrub_git_env(source_env: Mapping[str, str]) -> dict[str, str]:
@@ -706,6 +730,12 @@ _SURFACE_ORDER: MappingProxyType[str, int] = MappingProxyType(
 
 
 def _ordered_surfaces(surface_ids: frozenset[str]) -> tuple[str, ...]:
+    # Every `surface_id` here always comes from a `Gate.surfaces` frozenset,
+    # and every surface a Gate declares is a key in `SURFACES` (enforced by
+    # construction in the GATES manifest above), so `_SURFACE_ORDER[surface_id]`
+    # cannot KeyError today. Left unguarded deliberately: a gate declaring a
+    # surface absent from SURFACES is a manifest bug that should fail loud
+    # and immediately, not be swallowed into a silently-unordered fallback.
     return tuple(sorted(surface_ids, key=lambda surface_id: _SURFACE_ORDER[surface_id]))
 
 
@@ -715,7 +745,11 @@ def execute_gates(phase: str, changes: ChangeSet) -> int:
     (`run` / `skip (<surfaces-not-touched>)` / `fail (<exit>)`) and stop at
     the first non-zero exit, returning that exit code immediately without
     invoking any later gate. Returns 0 when every executed gate exits 0,
-    including the trivial all-skipped case.
+    including the trivial all-skipped case. A negative (signal-killed)
+    returncode is normalized to the positive shell convention (128 + signal)
+    before it is printed or returned. A gate binary that can't be exec'd at
+    all (`OSError`, e.g. missing `cargo`) prints its own `fail (...)` line
+    and then propagates the exception -- fail-loud, not a returned code.
 
     Re-derives nothing: `resolve_gates(phase, changes)` alone decides what
     runs (and raises `ValueError` for an unknown `phase`, not re-checked
@@ -741,6 +775,14 @@ def execute_gates(phase: str, changes: ChangeSet) -> int:
     child_env = _scrub_git_env(os.environ)
 
     for gate in GATES:
+        # This re-checks `phase in gate.phases` even though `selected` (from
+        # resolve_gates) already excludes phase-mismatched gates -- not a
+        # re-derivation of the resolver's decision, but the candidate set the
+        # skip line needs: a gate outside this phase shouldn't print a skip
+        # line at all (it isn't a candidate for this run), while a
+        # phase-matching gate that `selected` excluded prints skip with its
+        # untouched surfaces. `selected` alone can't distinguish those two
+        # cases.
         if phase not in gate.phases:
             continue
         if gate not in selected:
@@ -748,12 +790,29 @@ def execute_gates(phase: str, changes: ChangeSet) -> int:
             print(f"[git-hook] {gate.name}: skip ({surfaces})", flush=True)
             continue
         print(f"[git-hook] {gate.name}: run", flush=True)
-        result = subprocess.run(
-            list(gate.argv), shell=False, cwd=ROOT, env=child_env, check=False
-        )
-        if result.returncode != 0:
-            print(f"[git-hook] {gate.name}: fail ({result.returncode})", flush=True)
-            return result.returncode
+        try:
+            result = subprocess.run(
+                list(gate.argv), shell=False, cwd=ROOT, env=child_env, check=False
+            )
+        except OSError as exc:
+            # A missing/non-executable gate binary (e.g. no `cargo` on PATH)
+            # raises out of subprocess.run before any CompletedProcess
+            # exists. Print the fail line the one-line-per-gate contract
+            # promises before re-raising -- still fail-loud (this is a
+            # broken environment, not a recoverable gate failure), just no
+            # longer silent about which gate broke.
+            print(f"[git-hook] {gate.name}: fail (exec error: {exc})", flush=True)
+            raise
+        returncode = result.returncode
+        if returncode < 0:
+            # A signal-killed gate (e.g. SIGKILL) reports a negative
+            # returncode; normalize to the shell convention (128 + signal)
+            # so a downstream `sys.exit(code)` doesn't get bitten by
+            # Python's exit-code modulo (sys.exit(-9) -> 247, not -9).
+            returncode = 128 - returncode
+        if returncode != 0:
+            print(f"[git-hook] {gate.name}: fail ({returncode})", flush=True)
+            return returncode
     return 0
 
 

@@ -1256,10 +1256,11 @@ class _StdinStub:
 
 class _FakeGateRun:
     """Stand-in for `subprocess.run` used by every Task 5 test. Never shells
-    out and never runs a real gate. `responses` maps an argv tuple to the
-    returncode that call should yield. An unanticipated call raises
-    KeyError, proving each test drives an exact, intentional sequence of
-    gate invocations.
+    out and never runs a real gate. `responses` maps an argv tuple to either
+    the returncode that call should yield, or an exception instance to raise
+    (simulating exec-time failures such as a missing gate binary). An
+    unanticipated call raises KeyError, proving each test drives an exact,
+    intentional sequence of gate invocations.
     """
 
     def __init__(self, responses):
@@ -1269,8 +1270,10 @@ class _FakeGateRun:
     def __call__(self, cmd, **kwargs):
         self.calls.append((list(cmd), kwargs))
         key = tuple(cmd)
-        returncode = self.responses[key]
-        return subprocess.CompletedProcess(cmd, returncode)
+        outcome = self.responses[key]
+        if isinstance(outcome, BaseException):
+            raise outcome
+        return subprocess.CompletedProcess(cmd, outcome)
 
 
 def _only_rust_changes():
@@ -1397,8 +1400,10 @@ def test_execute_gates_prints_run_line_for_selected_gate(monkeypatch, capsys):
     monkeypatch.setattr(hook, "GATES", (fmt_gate,))
     hook.execute_gates(hook.PHASE_PRE_COMMIT, changes)
     out = capsys.readouterr().out
-    assert "rust_fmt_check" in out
-    assert "run" in out
+    # Exact line, not a substring check -- the task calls this format
+    # deterministic, so the test should pin the literal bytes rather than
+    # accept e.g. "rerun" or a stray "7" anywhere in unrelated output.
+    assert out == "[git-hook] rust_fmt_check: run\n"
 
 
 def test_execute_gates_prints_skip_line_with_surfaces_not_touched(monkeypatch, capsys):
@@ -1418,10 +1423,14 @@ def test_execute_gates_prints_skip_line_with_surfaces_not_touched(monkeypatch, c
 
 
 def test_execute_gates_skip_line_lists_surfaces_deterministically(monkeypatch, capsys):
-    # Print the skip line twice for the same gate and assert both renderings
-    # are byte-identical -- proves the surfaces field isn't drawn straight
-    # from frozenset iteration (hash-randomized per process, not per call,
-    # so a within-process rerun is the strongest test-time proxy available).
+    # NOTE: kept for its original within-process-rerun angle, but every gate
+    # in today's manifest (including hook_self_test, used here) declares
+    # exactly one surface, so this test cannot actually distinguish ordered
+    # output from raw frozenset iteration -- with one element the two are
+    # byte-identical by construction. It would pass identically against the
+    # bug it was meant to catch. The real ordering-property coverage is
+    # test__ordered_surfaces_returns_declaration_order below, which drives
+    # _ordered_surfaces directly with a genuinely multi-element frozenset.
     fake = _FakeGateRun({})
     monkeypatch.setattr(hook.subprocess, "run", fake)
     hook_gate = next(gate for gate in hook.GATES if gate.name == "hook_self_test")
@@ -1432,6 +1441,40 @@ def test_execute_gates_skip_line_lists_surfaces_deterministically(monkeypatch, c
     hook.execute_gates(hook.PHASE_PRE_COMMIT, changes)
     second = capsys.readouterr().out
     assert first == second
+
+
+# --- _ordered_surfaces -- the real ordering-property coverage -------------
+
+
+def test__ordered_surfaces_returns_declaration_order():
+    # SURFACES declares SURFACE_RUST_WORKSPACE before SURFACE_COLLAB_PROTOCOL
+    # before SURFACE_HOOK_SELF_TEST before SURFACE_DOCS (see the SURFACES
+    # MappingProxyType above). Passing the two later-declared ids in reverse
+    # frozenset-construction order and asserting the exact declaration-order
+    # tuple back is the property test_execute_gates_skip_line_lists_
+    # surfaces_deterministically cannot provide with a single-element input:
+    # this fails if _ordered_surfaces ever regresses to raw frozenset
+    # iteration (hash-randomized, not declaration order).
+    surface_ids = frozenset({hook.SURFACE_DOCS, hook.SURFACE_HOOK_SELF_TEST})
+    assert hook._ordered_surfaces(surface_ids) == (
+        hook.SURFACE_HOOK_SELF_TEST,
+        hook.SURFACE_DOCS,
+    )
+
+    all_surfaces = frozenset(
+        {
+            hook.SURFACE_DOCS,
+            hook.SURFACE_COLLAB_PROTOCOL,
+            hook.SURFACE_HOOK_SELF_TEST,
+            hook.SURFACE_RUST_WORKSPACE,
+        }
+    )
+    assert hook._ordered_surfaces(all_surfaces) == (
+        hook.SURFACE_RUST_WORKSPACE,
+        hook.SURFACE_COLLAB_PROTOCOL,
+        hook.SURFACE_HOOK_SELF_TEST,
+        hook.SURFACE_DOCS,
+    )
 
 
 def test_execute_gates_prints_fail_line_with_exit_code(monkeypatch, capsys):
@@ -1448,6 +1491,50 @@ def test_execute_gates_prints_fail_line_with_exit_code(monkeypatch, capsys):
     assert "rust_fmt_check" in out
     assert "fail" in out
     assert "7" in out
+
+
+def test_execute_gates_normalizes_negative_returncode_from_signal_kill(monkeypatch, capsys):
+    # A signal-killed gate (e.g. SIGKILL) reports a negative returncode from
+    # subprocess.run. Pin the shell-convention normalization (128 + signal)
+    # so a downstream `sys.exit(code)` can't land on the wrong exit status
+    # via Python's exit-code modulo (sys.exit(-9) -> 247, not -9).
+    fake = _FakeGateRun({("cargo", "fmt", "--all", "--", "--check"): -9})
+    monkeypatch.setattr(hook.subprocess, "run", fake)
+    fmt_gate = next(gate for gate in hook.GATES if gate.name == "rust_fmt_check")
+    monkeypatch.setattr(hook, "GATES", (fmt_gate,))
+    changes = hook.ChangeSet(
+        paths=("crates/ironmem/src/hook.rs",), unknown=False, reason=None
+    )
+    rc = hook.execute_gates(hook.PHASE_PRE_COMMIT, changes)
+    assert rc == 137
+    out = capsys.readouterr().out
+    assert out == "[git-hook] rust_fmt_check: run\n[git-hook] rust_fmt_check: fail (137)\n"
+
+
+def test_execute_gates_missing_gate_binary_prints_fail_line_then_raises(monkeypatch, capsys):
+    # A gate binary absent from PATH (e.g. no `cargo` installed) makes
+    # subprocess.run raise FileNotFoundError before any CompletedProcess
+    # exists. This must not silently traceback with no fail(...) line --
+    # the one-line-per-gate contract still applies, then the exception
+    # propagates (fail-loud: a broken environment, not a recoverable gate
+    # failure).
+    fake = _FakeGateRun(
+        {
+            ("cargo", "fmt", "--all", "--", "--check"): FileNotFoundError(
+                2, "No such file or directory", "cargo"
+            )
+        }
+    )
+    monkeypatch.setattr(hook.subprocess, "run", fake)
+    fmt_gate = next(gate for gate in hook.GATES if gate.name == "rust_fmt_check")
+    monkeypatch.setattr(hook, "GATES", (fmt_gate,))
+    changes = hook.ChangeSet(
+        paths=("crates/ironmem/src/hook.rs",), unknown=False, reason=None
+    )
+    with pytest.raises(FileNotFoundError):
+        hook.execute_gates(hook.PHASE_PRE_COMMIT, changes)
+    out = capsys.readouterr().out
+    assert "rust_fmt_check: fail" in out
 
 
 # --- execute_gates -- unknown=True prints the escalation reason -----------
@@ -1471,6 +1558,32 @@ def test_execute_gates_no_escalation_line_when_known(monkeypatch, capsys):
     hook.execute_gates(hook.PHASE_PRE_COMMIT, changes)
     out = capsys.readouterr().out
     assert "escalat" not in out.lower()
+
+
+def test_execute_gates_unknown_true_reason_none_prints_no_escalation_line_but_still_escalates(
+    monkeypatch, capsys
+):
+    # Pins the previously-untested `unknown=True, reason=None` combination:
+    # `if changes.unknown and changes.reason:` at the top of execute_gates
+    # means no escalation line prints when reason is falsy, even though
+    # resolve_gates still escalates to running every phase-matching gate on
+    # `changes.unknown` alone (independent of `reason`). Both halves of that
+    # behavior are asserted here so a future change can't silently drop
+    # either the guard or the escalation.
+    fake = _FakeGateRun({("python3", "scripts/test_run_git_hook.py"): 0})
+    monkeypatch.setattr(hook.subprocess, "run", fake)
+    hook_gate = next(gate for gate in hook.GATES if gate.name == "hook_self_test")
+    monkeypatch.setattr(hook, "GATES", (hook_gate,))
+    changes = hook.ChangeSet(paths=(), unknown=True, reason=None)
+    rc = hook.execute_gates(hook.PHASE_PRE_COMMIT, changes)
+    out = capsys.readouterr().out
+    assert "escalat" not in out.lower()
+    # The gate still ran despite the silent escalation -- unknown=True alone
+    # is enough for resolve_gates to select it.
+    assert rc == 0
+    assert [cmd for cmd, _kwargs in fake.calls] == [
+        ["python3", "scripts/test_run_git_hook.py"]
+    ]
 
 
 # --- execute_gates -- invalid phase still fails loudly (delegates to
@@ -1517,19 +1630,54 @@ def test_scrub_git_env_strips_repo_redirecting_vars():
 
 
 def test_scrub_git_env_keeps_explicit_keep_list():
+    # NOTE: this test previously also asserted GIT_CONFIG_COUNT/
+    # GIT_CONFIG_KEY_0/GIT_CONFIG_VALUE_0 were kept. That was a genuine spec
+    # bug, not a preference: GIT_CONFIG_* is the documented equivalent of
+    # `git -c <key>=<value>` for arbitrary config, including core.worktree --
+    # the config equivalent of GIT_WORK_TREE, which this same module strips
+    # as a repo-redirecting variable a few lines above. Keeping GIT_CONFIG_*
+    # let GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=core.worktree
+    # GIT_CONFIG_VALUE_0=/real/repo reproduce the exact PR #186 redirection
+    # this scrub exists to prevent. The contract changed to strip
+    # GIT_CONFIG_*; see test_scrub_git_env_strips_git_config_star below for
+    # the corrected behavior.
     source = {
         "GIT_ASKPASS": "/usr/bin/askpass",
         "GIT_SSH": "/usr/bin/ssh",
         "GIT_SSH_COMMAND": "ssh -i key",
         "GIT_TERMINAL_PROMPT": "0",
-        "GIT_CONFIG_COUNT": "1",
-        "GIT_CONFIG_KEY_0": "core.pager",
-        "GIT_CONFIG_VALUE_0": "cat",
         "GIT_TRACE": "1",
         "GIT_TRACE_PACKET": "1",
     }
     scrubbed = hook._scrub_git_env(source)
     assert scrubbed == source
+
+
+def test_scrub_git_env_strips_git_config_star():
+    # Regression guard for the GIT_CONFIG_* keep-list bug: GIT_CONFIG_COUNT +
+    # GIT_CONFIG_KEY_n/GIT_CONFIG_VALUE_n are the documented equivalent of
+    # `git -c <key>=<value>` -- arbitrary config, including core.worktree
+    # (the config equivalent of GIT_WORK_TREE). GIT_CONFIG_GLOBAL/
+    # GIT_CONFIG_SYSTEM (also GIT_CONFIG_-prefixed) replace whole config
+    # files. All must be stripped like any other unrecognized GIT_* var.
+    source = {
+        "GIT_CONFIG_COUNT": "1",
+        "GIT_CONFIG_KEY_0": "core.worktree",
+        "GIT_CONFIG_VALUE_0": "/real/repo",
+        "GIT_CONFIG_GLOBAL": "/tmp/evil/gitconfig",
+        "GIT_CONFIG_SYSTEM": "/tmp/evil/gitconfig",
+        "PATH": "/usr/bin",
+    }
+    scrubbed = hook._scrub_git_env(source)
+    for dangerous_key in (
+        "GIT_CONFIG_COUNT",
+        "GIT_CONFIG_KEY_0",
+        "GIT_CONFIG_VALUE_0",
+        "GIT_CONFIG_GLOBAL",
+        "GIT_CONFIG_SYSTEM",
+    ):
+        assert dangerous_key not in scrubbed
+    assert scrubbed["PATH"] == "/usr/bin"
 
 
 def test_scrub_git_env_strips_unlisted_git_var_not_yet_enumerated():
