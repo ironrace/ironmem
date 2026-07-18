@@ -114,9 +114,14 @@ The hooks are diff-aware:
 - Rust/workspace changes run fmt and clippy on commit, then workspace tests on push
 - docs changes (`*.md`, any path under `docs/`) and inert config/data changes
   (`*.json`/`*.jsonc`/`*.jsonl`/`*.yaml`/`*.yml`/`*.sh`/`*.csv`, any
-  path under `site/`, or a `.py` file under `benchmarks/`) skip heavy local
+  path under `site/`, or any path under `benchmarks/`) skip heavy local
   gates -- *outside a harness plugin root*, no gate parses, executes, or
-  otherwise inspects those formats
+  otherwise inspects those formats. `benchmarks/` is inert as a whole tree,
+  including its Rust source: every crate there is workspace-`exclude`d, so
+  no cargo gate compiles, lints, or formats it
+- `.github/` is inert for the same reason and no other: no gate reads it, so
+  escalating a workflow edit would run cargo gates that cannot parse YAML.
+  CI is its own backstop
 - a path under a harness plugin root (`.claude-plugin/`, `.codex-plugin/`,
   `.gemini-plugin/`, `.grok-plugin/`, or any future `.<name>-plugin/`) is
   NOT inert, even though its content is JSON/shell/Markdown: `cargo test
@@ -139,16 +144,35 @@ The hooks are diff-aware:
 ### `run_git_hook.py`: collect → resolve → execute
 
 `scripts/run_git_hook.py` is the diff-aware dispatcher both hooks delegate to.
-`main(phase)` wires it as three layers, each with one job and no layer
-reaching backwards — the resolver never shells out, the collector never
-decides which gates run, the executor never re-derives what the resolver
-already decided:
+It is only the wiring: `main(phase)` joins three layers that live in the
+`scripts/git_hook/` package, each with one job and no layer reaching
+backwards — the resolver never shells out, the collector never decides which
+gates run, the executor never re-derives what the resolver already decided:
 
-| Layer | Entry point | Impure? | Job |
-|---|---|---|---|
-| Collect | `collect_pre_commit_changes()` / `collect_pre_push_changes(stdin)` | Yes — the only place the fail-closed `_run_git`/`_git_diff_paths_z` helpers are called | Turn Git's own diff output into a `ChangeSet`. Decides nothing about which gates run. |
-| Resolve | `resolve_gates(phase, changes)` | No — pure and total | Turn `(phase, ChangeSet)` into the tuple of `Gate`s to run, in `GATES` declaration order. No I/O, no env, no clock, no subprocess. |
-| Execute | `execute_gates(phase, changes)` | Yes — runs subprocesses | Call `resolve_gates` exactly once, then run each selected gate with a hardened `subprocess.run`, printing one line per gate (`run` / `skip (...)` / `fail (...)`) and stopping at the first non-zero exit. |
+| Layer | Module | Entry point | Impure? | Job |
+|---|---|---|---|---|
+| Collect | `git_hook.collect` | `collect_pre_commit_changes()` / `collect_pre_push_changes(stdin)` | Yes — the only place the fail-closed `_run_git`/`_git_diff_paths_z` helpers are called | Turn Git's own diff output into a `ChangeSet`. Decides nothing about which gates run. |
+| Resolve | `git_hook.manifest` | `resolve_gates(phase, changes)` | No — pure and total | Turn `(phase, ChangeSet)` into the tuple of `Gate`s to run, in `GATES` declaration order. No I/O, no env, no clock, no subprocess. Also owns `SURFACES`/`classify_path` and the `GATES` manifest itself. |
+| Execute | `git_hook.execute` | `execute_gates(phase, changes)` | Yes — runs subprocesses | Call `resolve_gates` exactly once, then run each selected gate with a hardened `subprocess.run`, printing one line per gate (`run` / `skip (...)` / `fail (...)`) and stopping at the first non-zero exit. |
+
+`git_hook.runtime` holds the two facts both shelling-out layers share: `ROOT`
+and the `GIT_*` env scrub. `_scrub_git_env` lives there rather than with the
+execution layer precisely because the collection layer must pass it too —
+scrubbing only outbound gate invocations would leave the Git calls that
+*decide* which gates run redirectable, which fails open.
+
+Two constraints on this package are load-bearing and easy to undo by accident:
+
+- **`git_hook.execute` reads `manifest.GATES` / `manifest.resolve_gates`
+  through the module, never via `from ... import`.** Binding them directly
+  would make `monkeypatch.setattr(manifest, "GATES", ...)` patch a name the
+  executor never reads, and those tests would silently exercise the real
+  manifest instead of their fixture.
+- **Every module here is listed in `HOOK_EXACT_PATHS`.** A new module without
+  an entry would not select the hook self-test gate, so a change to the gate
+  resolver would skip the gate that validates the gate resolver.
+  `test_hook_exact_paths_covers_every_git_hook_module` walks the directory
+  rather than trusting the list.
 
 One more Git call site exists outside the hardened path above: `main()`
 falls back to `_pre_push_manual_upstream_changes()` when the raw pre-push
@@ -209,11 +233,11 @@ shape) and returns one of:
 
 | Surface id | Predicate | Matches |
 |---|---|---|
-| `rust_workspace` | `is_rust_path` | `.rs` files, `Cargo.toml`/`Cargo.lock`/`build.rs`, anything under `.cargo/` |
+| `rust_workspace` | `is_rust_path` | `.rs` files, `Cargo.toml`/`Cargo.lock`/`build.rs`, anything under `.cargo/` — **except** anything whose leading `/`-split segment is `benchmarks`, whose crates are all workspace-`exclude`d and therefore untouched by `cargo fmt --all`/`clippy --workspace`/`test --workspace` |
 | `collab_protocol` | `is_collab_protocol_path` | collab command/prompt/template files (`COLLAB_EXACT_PATHS`, `.claude-plugin/prompts/collab-turn-*`, `tests/collab_turn_templates/`) |
-| `hook_self_test` | `is_hook_path` | the tracked hook scripts themselves — an exact-set membership check (`HOOK_EXACT_PATHS`), not a prefix: `.githooks/pre-commit`, `.githooks/pre-push`, `scripts/install-git-hooks.sh`, `scripts/run_git_hook.py`, `scripts/test_run_git_hook.py`. Contrast `collab_protocol` below, whose `collab-turn-*` genuinely is a prefix match. |
+| `hook_self_test` | `is_hook_path` | the tracked hook scripts themselves — an exact-set membership check (`HOOK_EXACT_PATHS`), not a prefix: `.githooks/pre-commit`, `.githooks/pre-push`, `scripts/install-git-hooks.sh`, `scripts/run_git_hook.py`, `scripts/test_run_git_hook.py`, and every module in `scripts/git_hook/`. Contrast `collab_protocol` below, whose `collab-turn-*` genuinely is a prefix match. |
 | `docs` | `is_docs_path` | any `.md` file, or any path whose leading `/`-split segment is `docs` — **unless** the leading segment is a harness plugin root (see below), in which case it does not match |
-| `inert_config` | `is_inert_config_path` | a `.json`/`.jsonc`/`.jsonl`/`.yaml`/`.yml`/`.sh`/`.csv` file, any path whose leading `/`-split segment is `site`, or a `.py` file whose leading `/`-split segment is `benchmarks` — **unless** the leading segment is a harness plugin root, in which case it does not match. HTML is not globally inert: the dashboard's `index.html` is compiled into the Rust binary. |
+| `inert_config` | `is_inert_config_path` | a `.json`/`.jsonc`/`.jsonl`/`.yaml`/`.yml`/`.sh`/`.csv` file, any path whose leading `/`-split segment is `site`, or any path whose leading `/`-split segment is `benchmarks` (the whole tree: those Cargo crates are workspace-`exclude`d, so no cargo gate compiles, lints, or formats them) — **unless** the leading segment is a harness plugin root, in which case it does not match. HTML is not globally inert: the dashboard's `index.html` is compiled into the Rust binary. |
 | `UNKNOWN` | *(fallback — not in `SURFACES`)* | an unsafe-shaped path, or a path that matches no declared surface |
 
 `is_gate_covered_plugin_path` (checked first inside both `is_docs_path` and
@@ -276,7 +300,7 @@ reclassified**.
 Two steps, nothing else:
 
 1. Append a `Gate(...)` entry to the `GATES` tuple in
-   `scripts/run_git_hook.py`.
+   `scripts/git_hook/manifest.py`.
 2. If the gate declares a surface that has no existing example, add one to
    `_SURFACE_EXAMPLE_PATH_FOR_TEST` in `scripts/test_run_git_hook.py`.
 

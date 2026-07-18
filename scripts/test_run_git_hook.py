@@ -9,7 +9,6 @@ Invoked directly by the tracked Git hooks as
 from __future__ import annotations
 
 import dataclasses
-import importlib.util
 import os
 import pathlib
 import subprocess
@@ -22,39 +21,36 @@ except ImportError:  # pragma: no cover - exercised only when pytest is absent
     pytest = None  # type: ignore[assignment]
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
-HOOK = ROOT / "scripts" / "run_git_hook.py"
+SCRIPTS = ROOT / "scripts"
 
+# `scripts/` on sys.path, then ordinary imports -- not the previous
+# spec_from_file_location load of a single file. The hook is a package now, and
+# loading `run_git_hook.py` by path would leave its `from git_hook import ...`
+# unresolvable. `python3 scripts/run_git_hook.py` gets the same sys.path[0] for
+# free, so the hook and its tests resolve the package identically.
+if str(SCRIPTS) not in sys.path:
+    sys.path.insert(0, str(SCRIPTS))
 
-def load_hook_module():
-    spec = importlib.util.spec_from_file_location("run_git_hook", HOOK)
-    assert spec and spec.loader
-    module = importlib.util.module_from_spec(spec)
-    # dataclasses (frozen=True, `from __future__ import annotations`) resolves
-    # type hints via sys.modules[cls.__module__]; the module must be
-    # registered there before exec_module runs the class bodies.
-    sys.modules[spec.name] = module
-    try:
-        spec.loader.exec_module(module)
-    except BaseException:
-        # Don't leave a partially-initialized module registered under a
-        # shared name if exec_module fails partway through.
-        sys.modules.pop(spec.name, None)
-        raise
-    return module
+import run_git_hook as cli  # noqa: E402
+from git_hook import collect, execute, manifest, runtime  # noqa: E402
 
-
-hook = load_hook_module()
+# Tests address each symbol through the module that OWNS it -- `manifest.GATES`,
+# `collect._run_git`, `runtime._scrub_git_env` -- rather than through a single
+# re-exporting handle. That is deliberate: `execute` reads `manifest.GATES` at
+# call time, so `monkeypatch.setattr(manifest, "GATES", ...)` reaches the
+# binding under test. Patching a re-export would silently leave the real
+# manifest in play and the test would assert against the wrong gate set.
 
 
 # --- Task 1: Gate is frozen ---
 
 
 def test_gate_is_frozen():
-    gate = hook.Gate(
+    gate = manifest.Gate(
         name="example",
         argv=("python3", "scripts/example.py"),
         phases=frozenset({"pre-commit"}),
-        surfaces=frozenset({hook.SURFACE_HOOK_SELF_TEST}),
+        surfaces=frozenset({manifest.SURFACE_HOOK_SELF_TEST}),
         always=False,
     )
     with pytest.raises(dataclasses.FrozenInstanceError):
@@ -63,55 +59,55 @@ def test_gate_is_frozen():
 
 def test_gate_rejects_non_str_name():
     with pytest.raises(TypeError):
-        hook.Gate(
+        manifest.Gate(
             name=123,  # type: ignore[arg-type]
             argv=("python3", "scripts/example.py"),
             phases=frozenset({"pre-commit"}),
-            surfaces=frozenset({hook.SURFACE_HOOK_SELF_TEST}),
+            surfaces=frozenset({manifest.SURFACE_HOOK_SELF_TEST}),
             always=False,
         )
 
 
 def test_gate_rejects_non_tuple_argv():
     with pytest.raises(TypeError):
-        hook.Gate(
+        manifest.Gate(
             name="example",
             argv=["python3", "scripts/example.py"],  # type: ignore[arg-type]
             phases=frozenset({"pre-commit"}),
-            surfaces=frozenset({hook.SURFACE_HOOK_SELF_TEST}),
+            surfaces=frozenset({manifest.SURFACE_HOOK_SELF_TEST}),
             always=False,
         )
 
 
 def test_gate_rejects_non_frozenset_phases():
     with pytest.raises(TypeError):
-        hook.Gate(
+        manifest.Gate(
             name="example",
             argv=("python3", "scripts/example.py"),
             phases={"pre-commit"},  # type: ignore[arg-type]
-            surfaces=frozenset({hook.SURFACE_HOOK_SELF_TEST}),
+            surfaces=frozenset({manifest.SURFACE_HOOK_SELF_TEST}),
             always=False,
         )
 
 
 def test_gate_rejects_non_frozenset_surfaces():
     with pytest.raises(TypeError):
-        hook.Gate(
+        manifest.Gate(
             name="example",
             argv=("python3", "scripts/example.py"),
             phases=frozenset({"pre-commit"}),
-            surfaces={hook.SURFACE_HOOK_SELF_TEST},  # type: ignore[arg-type]
+            surfaces={manifest.SURFACE_HOOK_SELF_TEST},  # type: ignore[arg-type]
             always=False,
         )
 
 
 def test_gate_rejects_non_bool_always():
     with pytest.raises(TypeError):
-        hook.Gate(
+        manifest.Gate(
             name="example",
             argv=("python3", "scripts/example.py"),
             phases=frozenset({"pre-commit"}),
-            surfaces=frozenset({hook.SURFACE_HOOK_SELF_TEST}),
+            surfaces=frozenset({manifest.SURFACE_HOOK_SELF_TEST}),
             always="false",  # type: ignore[arg-type]
         )
 
@@ -128,12 +124,12 @@ def _gate(**overrides):
     kwargs = {
         "name": "example",
         "argv": ("python3", "scripts/example.py"),
-        "phases": frozenset({hook.PHASE_PRE_COMMIT}),
-        "surfaces": frozenset({hook.SURFACE_HOOK_SELF_TEST}),
+        "phases": frozenset({manifest.PHASE_PRE_COMMIT}),
+        "surfaces": frozenset({manifest.SURFACE_HOOK_SELF_TEST}),
         "always": False,
     }
     kwargs.update(overrides)
-    return hook.Gate(**kwargs)
+    return manifest.Gate(**kwargs)
 
 
 def test_gate_rejects_misspelled_phase():
@@ -189,38 +185,38 @@ def test_gate_rejects_empty_argv():
 
 def test_gate_accepts_every_declared_phase_and_surface():
     gate = _gate(
-        phases=frozenset({hook.PHASE_PRE_COMMIT, hook.PHASE_PRE_PUSH}),
-        surfaces=frozenset(hook.SURFACES),
+        phases=frozenset({manifest.PHASE_PRE_COMMIT, manifest.PHASE_PRE_PUSH}),
+        surfaces=frozenset(manifest.SURFACES),
     )
-    assert gate.surfaces == frozenset(hook.SURFACES)
+    assert gate.surfaces == frozenset(manifest.SURFACES)
 
 
 # --- Task 1: ChangeSet is frozen ---
 
 
 def test_changeset_is_frozen():
-    changeset = hook.ChangeSet(paths=(), unknown=False, reason=None)
+    changeset = manifest.ChangeSet(paths=(), unknown=False, reason=None)
     with pytest.raises(dataclasses.FrozenInstanceError):
         changeset.unknown = True  # type: ignore[misc]
 
 
 def test_changeset_rejects_non_tuple_paths():
     with pytest.raises(TypeError):
-        hook.ChangeSet(paths=["a.py"], unknown=False, reason=None)  # type: ignore[arg-type]
+        manifest.ChangeSet(paths=["a.py"], unknown=False, reason=None)  # type: ignore[arg-type]
 
 
 def test_changeset_rejects_non_bool_unknown():
     with pytest.raises(TypeError):
-        hook.ChangeSet(paths=(), unknown="false", reason=None)  # type: ignore[arg-type]
+        manifest.ChangeSet(paths=(), unknown="false", reason=None)  # type: ignore[arg-type]
 
 
 def test_changeset_rejects_non_str_reason():
     with pytest.raises(TypeError):
-        hook.ChangeSet(paths=(), unknown=True, reason=404)  # type: ignore[arg-type]
+        manifest.ChangeSet(paths=(), unknown=True, reason=404)  # type: ignore[arg-type]
 
 
 def test_changeset_accepts_none_reason():
-    changeset = hook.ChangeSet(paths=(), unknown=False, reason=None)
+    changeset = manifest.ChangeSet(paths=(), unknown=False, reason=None)
     assert changeset.reason is None
 
 
@@ -229,26 +225,26 @@ def test_changeset_rejects_escalation_without_a_reason():
     # Allowing reason=None let an escalation run every gate while printing no
     # explanation at all, so a surprising full run looked arbitrary.
     with pytest.raises(ValueError):
-        hook.ChangeSet(paths=(), unknown=True, reason=None)
+        manifest.ChangeSet(paths=(), unknown=True, reason=None)
 
 
 def test_changeset_rejects_escalation_with_an_empty_reason():
     # An empty string is the same silent escalation as None: execute_gates'
     # `if changes.unknown and changes.reason:` guard is falsy for both.
     with pytest.raises(ValueError):
-        hook.ChangeSet(paths=(), unknown=True, reason="")
+        manifest.ChangeSet(paths=(), unknown=True, reason="")
 
 
 def test_changeset_default_construction():
-    changeset = hook.ChangeSet(paths=(), unknown=False, reason=None)
+    changeset = manifest.ChangeSet(paths=(), unknown=False, reason=None)
     assert changeset.paths == ()
     assert changeset.unknown is False
     assert changeset.reason is None
 
 
 def test_changeset_default_is_distinct_from_escalated():
-    default = hook.ChangeSet(paths=(), unknown=False, reason=None)
-    escalated = hook.ChangeSet(
+    default = manifest.ChangeSet(paths=(), unknown=False, reason=None)
+    escalated = manifest.ChangeSet(
         paths=("weird\x00path",), unknown=True, reason="null byte in path"
     )
     assert default != escalated
@@ -260,16 +256,16 @@ def test_changeset_default_is_distinct_from_escalated():
 
 
 def test_manifest_is_a_tuple():
-    assert isinstance(hook.GATES, tuple)
+    assert isinstance(manifest.GATES, tuple)
     with pytest.raises(AttributeError):
-        hook.GATES.append(hook.GATES[0])  # type: ignore[attr-defined]
+        manifest.GATES.append(manifest.GATES[0])  # type: ignore[attr-defined]
 
 
 def test_manifest_declaration_order_is_preserved():
     # This is the literal authored order. If anything ever sorts GATES at
     # runtime this test must fail, because the authored order below is not
     # alphabetical (see test_manifest_declaration_order_is_not_alphabetical).
-    names = [gate.name for gate in hook.GATES]
+    names = [gate.name for gate in manifest.GATES]
     assert names == [
         "hook_self_test",
         "hook_install_check",
@@ -283,7 +279,7 @@ def test_manifest_declaration_order_is_preserved():
 def test_manifest_declaration_order_is_not_alphabetical():
     # Proves the preceding order-equality test is a meaningful check for "no
     # runtime sort", not an accident of already-sorted input.
-    names = [gate.name for gate in hook.GATES]
+    names = [gate.name for gate in manifest.GATES]
     assert names != sorted(names)
 
 
@@ -307,7 +303,7 @@ def test_manifest_matches_pre_commit_argv_and_order():
             "warnings",
         ),
     ]
-    actual = [gate.argv for gate in hook.GATES if "pre-commit" in gate.phases]
+    actual = [gate.argv for gate in manifest.GATES if "pre-commit" in gate.phases]
     assert actual == expected
 
 
@@ -317,12 +313,12 @@ def test_manifest_matches_pre_push_argv_and_order():
         ("python3", "scripts/check_collab_turn_templates.py"),
         ("cargo", "test", "--workspace"),
     ]
-    actual = [gate.argv for gate in hook.GATES if "pre-push" in gate.phases]
+    actual = [gate.argv for gate in manifest.GATES if "pre-push" in gate.phases]
     assert actual == expected
 
 
 def test_manifest_gate_argv_entries_are_string_literals():
-    for gate in hook.GATES:
+    for gate in manifest.GATES:
         for entry in gate.argv:
             assert isinstance(entry, str)
 
@@ -330,34 +326,34 @@ def test_manifest_gate_argv_entries_are_string_literals():
 def test_manifest_no_gate_marked_always_yet():
     # None of today's ported gates run unconditionally; `always` exists for
     # future gates but nothing in the current set uses it.
-    assert all(gate.always is False for gate in hook.GATES)
+    assert all(gate.always is False for gate in manifest.GATES)
 
 
 # --- Task 1: surface map ---
 
 
 def test_surfaces_contains_expected_ids():
-    assert set(hook.SURFACES) == {
-        hook.SURFACE_RUST_WORKSPACE,
-        hook.SURFACE_COLLAB_PROTOCOL,
-        hook.SURFACE_HOOK_SELF_TEST,
-        hook.SURFACE_DOCS,
-        hook.SURFACE_INERT_CONFIG,
+    assert set(manifest.SURFACES) == {
+        manifest.SURFACE_RUST_WORKSPACE,
+        manifest.SURFACE_COLLAB_PROTOCOL,
+        manifest.SURFACE_HOOK_SELF_TEST,
+        manifest.SURFACE_DOCS,
+        manifest.SURFACE_INERT_CONFIG,
     }
 
 
 def test_surfaces_ported_unchanged_from_existing_predicates():
-    assert hook.SURFACES[hook.SURFACE_RUST_WORKSPACE] is hook.is_rust_path
-    assert hook.SURFACES[hook.SURFACE_COLLAB_PROTOCOL] is hook.is_collab_protocol_path
-    assert hook.SURFACES[hook.SURFACE_HOOK_SELF_TEST] is hook.is_hook_path
+    assert manifest.SURFACES[manifest.SURFACE_RUST_WORKSPACE] is manifest.is_rust_path
+    assert manifest.SURFACES[manifest.SURFACE_COLLAB_PROTOCOL] is manifest.is_collab_protocol_path
+    assert manifest.SURFACES[manifest.SURFACE_HOOK_SELF_TEST] is manifest.is_hook_path
 
 
 def test_surfaces_docs_entry_is_is_docs_path():
-    assert hook.SURFACES[hook.SURFACE_DOCS] is hook.is_docs_path
+    assert manifest.SURFACES[manifest.SURFACE_DOCS] is manifest.is_docs_path
 
 
 def test_surfaces_inert_config_entry_is_is_inert_config_path():
-    assert hook.SURFACES[hook.SURFACE_INERT_CONFIG] is hook.is_inert_config_path
+    assert manifest.SURFACES[manifest.SURFACE_INERT_CONFIG] is manifest.is_inert_config_path
 
 
 # --- Task 9: SURFACE_INERT_CONFIG declared after the specific surfaces ---
@@ -371,68 +367,68 @@ def test_surfaces_inert_config_entry_is_is_inert_config_path():
 
 
 def test_surface_inert_config_declared_after_every_specific_surface():
-    order = list(hook.SURFACES)
-    inert_index = order.index(hook.SURFACE_INERT_CONFIG)
+    order = list(manifest.SURFACES)
+    inert_index = order.index(manifest.SURFACE_INERT_CONFIG)
     for specific in (
-        hook.SURFACE_RUST_WORKSPACE,
-        hook.SURFACE_COLLAB_PROTOCOL,
-        hook.SURFACE_HOOK_SELF_TEST,
+        manifest.SURFACE_RUST_WORKSPACE,
+        manifest.SURFACE_COLLAB_PROTOCOL,
+        manifest.SURFACE_HOOK_SELF_TEST,
     ):
         assert order.index(specific) < inert_index
 
 
 def test_surfaces_is_a_frozen_mapping():
-    assert isinstance(hook.SURFACES, MappingProxyType)
+    assert isinstance(manifest.SURFACES, MappingProxyType)
     with pytest.raises(TypeError):
-        hook.SURFACES["new_surface"] = lambda path: False  # type: ignore[index]
+        manifest.SURFACES["new_surface"] = lambda path: False  # type: ignore[index]
 
 
 def test_every_gate_surface_id_is_registered():
-    for gate in hook.GATES:
+    for gate in manifest.GATES:
         for surface_id in gate.surfaces:
-            assert surface_id in hook.SURFACES
+            assert surface_id in manifest.SURFACES
 
 
 # --- Task 2: is_docs_path -----------------------------------------------
 
 
 def test_is_docs_path_matches_markdown_suffix():
-    assert hook.is_docs_path("README.md") is True
-    assert hook.is_docs_path("AGENTS.md") is True
+    assert manifest.is_docs_path("README.md") is True
+    assert manifest.is_docs_path("AGENTS.md") is True
 
 
 def test_is_docs_path_matches_top_level_docs_directory():
-    assert hook.is_docs_path("docs/CODEX.md") is True
-    assert hook.is_docs_path("docs/superpowers/plans/notes.txt") is True
+    assert manifest.is_docs_path("docs/CODEX.md") is True
+    assert manifest.is_docs_path("docs/superpowers/plans/notes.txt") is True
 
 
 def test_is_docs_path_rejects_look_alike_directory():
     # "docsite/" is not "docs/" -- a substring check ("docs" in path) would
     # wrongly match this; a segment/prefix check must not.
-    assert hook.is_docs_path("docsite/architecture.txt") is False
+    assert manifest.is_docs_path("docsite/architecture.txt") is False
 
 
 def test_is_docs_path_rejects_non_markdown_non_docs_path():
-    assert hook.is_docs_path("crates/ironmem/src/hook.rs") is False
+    assert manifest.is_docs_path("crates/ironmem/src/hook.rs") is False
 
 
 # --- Task 2: UNKNOWN is a distinct fallback, not a declared surface -----
 
 
 def test_unknown_is_not_a_declared_surface():
-    assert hook.UNKNOWN not in hook.SURFACES
+    assert manifest.UNKNOWN not in manifest.SURFACES
 
 
 # --- Task 2: classify_path -- known surfaces ----------------------------
 
 
 def test_classify_path_rust_source():
-    assert hook.classify_path("crates/ironmem/src/hook.rs") == hook.SURFACE_RUST_WORKSPACE
+    assert manifest.classify_path("crates/ironmem/src/hook.rs") == manifest.SURFACE_RUST_WORKSPACE
 
 
 def test_classify_path_collab_exact_path():
-    assert hook.classify_path("scripts/check_collab_turn_templates.py") == (
-        hook.SURFACE_COLLAB_PROTOCOL
+    assert manifest.classify_path("scripts/check_collab_turn_templates.py") == (
+        manifest.SURFACE_COLLAB_PROTOCOL
     )
 
 
@@ -442,9 +438,9 @@ def test_classify_path_collab_turn_prompt_prefix_selects_collab_lint():
     # classification and the gate selection asserted here, not just the
     # classification.
     path = ".claude-plugin/prompts/collab-turn-plan.md"
-    assert hook.classify_path(path) == hook.SURFACE_COLLAB_PROTOCOL
-    changes = hook.ChangeSet(paths=(path,), unknown=False, reason=None)
-    names = [gate.name for gate in hook.resolve_gates(hook.PHASE_PRE_COMMIT, changes)]
+    assert manifest.classify_path(path) == manifest.SURFACE_COLLAB_PROTOCOL
+    changes = manifest.ChangeSet(paths=(path,), unknown=False, reason=None)
+    names = [gate.name for gate in manifest.resolve_gates(manifest.PHASE_PRE_COMMIT, changes)]
     assert "collab_template_lint" in names
 
 
@@ -455,65 +451,65 @@ def test_classify_path_collab_turn_templates_dir_prefix_selects_collab_lint():
     # proves a *look-alike* path is rejected; it passes even if this branch
     # is deleted entirely. This test is the missing positive case.
     path = "tests/collab_turn_templates/example.txt"
-    assert hook.classify_path(path) == hook.SURFACE_COLLAB_PROTOCOL
-    changes = hook.ChangeSet(paths=(path,), unknown=False, reason=None)
-    names = [gate.name for gate in hook.resolve_gates(hook.PHASE_PRE_COMMIT, changes)]
+    assert manifest.classify_path(path) == manifest.SURFACE_COLLAB_PROTOCOL
+    changes = manifest.ChangeSet(paths=(path,), unknown=False, reason=None)
+    names = [gate.name for gate in manifest.resolve_gates(manifest.PHASE_PRE_COMMIT, changes)]
     assert "collab_template_lint" in names
 
 
 def test_classify_path_hook_self_test_run_git_hook():
-    assert hook.classify_path("scripts/run_git_hook.py") == hook.SURFACE_HOOK_SELF_TEST
+    assert manifest.classify_path("scripts/run_git_hook.py") == manifest.SURFACE_HOOK_SELF_TEST
 
 
 def test_classify_path_hook_self_test_test_run_git_hook():
-    assert hook.classify_path("scripts/test_run_git_hook.py") == hook.SURFACE_HOOK_SELF_TEST
+    assert manifest.classify_path("scripts/test_run_git_hook.py") == manifest.SURFACE_HOOK_SELF_TEST
 
 
 def test_classify_path_docs_markdown_file():
-    assert hook.classify_path("README.md") == hook.SURFACE_DOCS
+    assert manifest.classify_path("README.md") == manifest.SURFACE_DOCS
 
 
 def test_classify_path_docs_directory():
-    assert hook.classify_path("docs/superpowers/plans/notes.txt") == hook.SURFACE_DOCS
+    assert manifest.classify_path("docs/superpowers/plans/notes.txt") == manifest.SURFACE_DOCS
 
 
 def test_classify_path_known_surface_beats_generic_docs():
     # docs/COLLAB.md is both under docs/ and in the collab-protocol exact
     # set. The more specific declared surface wins over the generic inert
     # docs catch-all -- DOCS is checked last, never first.
-    assert hook.classify_path("docs/COLLAB.md") == hook.SURFACE_COLLAB_PROTOCOL
+    assert manifest.classify_path("docs/COLLAB.md") == manifest.SURFACE_COLLAB_PROTOCOL
 
 
 # --- Task 9: is_inert_config_path -- second explicitly-inert surface -----
 
 
 def test_is_inert_config_path_matches_json_extension():
-    assert hook.is_inert_config_path("crates/ironmem/schema/example.json") is True
+    assert manifest.is_inert_config_path("crates/ironmem/schema/example.json") is True
 
 
 def test_is_inert_config_path_matches_yaml_and_yml_extensions():
-    assert hook.is_inert_config_path("ops/deploy.yaml") is True
-    assert hook.is_inert_config_path(".github/workflows/ci.yml") is True
+    assert manifest.is_inert_config_path("ops/deploy.yaml") is True
+    assert manifest.is_inert_config_path(".github/workflows/ci.yml") is True
 
 
 def test_is_inert_config_path_matches_shell_script_extension():
-    assert hook.is_inert_config_path("scripts/check_versions.sh") is True
+    assert manifest.is_inert_config_path("scripts/check_versions.sh") is True
 
 
 def test_is_inert_config_path_matches_csv_and_jsonl_and_jsonc():
-    assert hook.is_inert_config_path("benchmarks/provbench/spotcheck/sample-eaf82d2.csv") is True
-    assert hook.is_inert_config_path("benchmarks/abeval/corpus/tasks.jsonl") is True
-    assert hook.is_inert_config_path("wrangler.jsonc") is True
+    assert manifest.is_inert_config_path("benchmarks/provbench/spotcheck/sample-eaf82d2.csv") is True
+    assert manifest.is_inert_config_path("benchmarks/abeval/corpus/tasks.jsonl") is True
+    assert manifest.is_inert_config_path("wrangler.jsonc") is True
 
 
 def test_is_inert_config_path_rejects_dashboard_html_compiled_into_binary():
-    assert hook.is_inert_config_path("crates/ironmem/src/dashboard/index.html") is False
+    assert manifest.is_inert_config_path("crates/ironmem/src/dashboard/index.html") is False
 
 
 def test_is_inert_config_path_matches_site_directory_regardless_of_extension():
-    assert hook.is_inert_config_path("site/index.html") is True
-    assert hook.is_inert_config_path("site/script.js") is True
-    assert hook.is_inert_config_path("site/_headers") is True  # no extension at all
+    assert manifest.is_inert_config_path("site/index.html") is True
+    assert manifest.is_inert_config_path("site/script.js") is True
+    assert manifest.is_inert_config_path("site/_headers") is True  # no extension at all
 
 
 def test_is_inert_config_path_matches_whole_benchmarks_tree():
@@ -529,28 +525,28 @@ def test_is_inert_config_path_matches_whole_benchmarks_tree():
     # fact this predicate can see. test_every_benchmarks_crate_is_workspace_
     # excluded below is the load-bearing guard: adding a benchmarks crate to
     # `members` fails there loudly instead of failing open here silently.
-    assert hook.is_inert_config_path("benchmarks/abeval/baseline_driver.py") is True
+    assert manifest.is_inert_config_path("benchmarks/abeval/baseline_driver.py") is True
     assert (
-        hook.is_inert_config_path("benchmarks/provbench/spotcheck/tools/autofilter.py") is True
+        manifest.is_inert_config_path("benchmarks/provbench/spotcheck/tools/autofilter.py") is True
     )
-    assert hook.is_inert_config_path("benchmarks/provbench/labeler/src/lib.rs") is True
-    assert hook.is_inert_config_path("benchmarks/abeval/Cargo.toml") is True
+    assert manifest.is_inert_config_path("benchmarks/provbench/labeler/src/lib.rs") is True
+    assert manifest.is_inert_config_path("benchmarks/abeval/Cargo.toml") is True
 
 
 def test_is_rust_path_excludes_workspace_excluded_benchmarks_tree():
     # is_rust_path is checked before the inert surface, so it -- not just the
     # inert predicate -- has to yield for benchmarks/ to classify inert at all.
-    assert hook.is_rust_path("benchmarks/provbench/labeler/src/lib.rs") is False
-    assert hook.is_rust_path("benchmarks/abeval/Cargo.toml") is False
+    assert manifest.is_rust_path("benchmarks/provbench/labeler/src/lib.rs") is False
+    assert manifest.is_rust_path("benchmarks/abeval/Cargo.toml") is False
     # ...without disturbing real workspace crates or the look-alike directory.
-    assert hook.is_rust_path("crates/ironmem/src/lib.rs") is True
-    assert hook.is_rust_path("benchmarksish/src/lib.rs") is True
+    assert manifest.is_rust_path("crates/ironmem/src/lib.rs") is True
+    assert manifest.is_rust_path("benchmarksish/src/lib.rs") is True
 
 
 def test_classify_path_benchmarks_rust_source_is_inert():
     assert (
-        hook.classify_path("benchmarks/provbench/labeler/src/lib.rs")
-        == hook.SURFACE_INERT_CONFIG
+        manifest.classify_path("benchmarks/provbench/labeler/src/lib.rs")
+        == manifest.SURFACE_INERT_CONFIG
     )
 
 
@@ -596,21 +592,21 @@ def test_is_inert_config_path_rejects_sql_migration():
     # and exercised by cargo test's migration-replay tests -- a real gate
     # catches a defect here, so it must stay UNKNOWN (escalate), never
     # become inert.
-    assert hook.is_inert_config_path("crates/ironmem/migrations/001_init.sql") is False
+    assert manifest.is_inert_config_path("crates/ironmem/migrations/001_init.sql") is False
 
 
 def test_is_inert_config_path_rejects_look_alike_site_directory():
     # "sitehost/" is not "site/" -- segment-based matching, not substring.
-    assert hook.is_inert_config_path("sitehost/notes.txt") is False
+    assert manifest.is_inert_config_path("sitehost/notes.txt") is False
 
 
 def test_is_inert_config_path_rejects_look_alike_benchmarks_directory():
-    assert hook.is_inert_config_path("benchmarksish/tool.py") is False
+    assert manifest.is_inert_config_path("benchmarksish/tool.py") is False
 
 
 def test_is_inert_config_path_rejects_non_matching_extension_outside_declared_dirs():
-    assert hook.is_inert_config_path("crates/ironmem/src/lib.rs") is False
-    assert hook.is_inert_config_path("notes.txt") is False
+    assert manifest.is_inert_config_path("crates/ironmem/src/lib.rs") is False
+    assert manifest.is_inert_config_path("notes.txt") is False
 
 
 # --- Task 9 fix: gate-covered plugin roots are NOT inert -----------------
@@ -628,46 +624,46 @@ def test_is_inert_config_path_rejects_non_matching_extension_outside_declared_di
 
 
 def test_is_gate_covered_plugin_path_matches_known_plugin_roots():
-    assert hook.is_gate_covered_plugin_path(".claude-plugin/plugin.json") is True
-    assert hook.is_gate_covered_plugin_path(".codex-plugin/hooks.json") is True
-    assert hook.is_gate_covered_plugin_path(".gemini-plugin/plugin.json") is True
-    assert hook.is_gate_covered_plugin_path(".grok-plugin/plugin.json") is True
+    assert manifest.is_gate_covered_plugin_path(".claude-plugin/plugin.json") is True
+    assert manifest.is_gate_covered_plugin_path(".codex-plugin/hooks.json") is True
+    assert manifest.is_gate_covered_plugin_path(".gemini-plugin/plugin.json") is True
+    assert manifest.is_gate_covered_plugin_path(".grok-plugin/plugin.json") is True
 
 
 def test_is_gate_covered_plugin_path_matches_future_plugin_shape():
     # Not an allowlist of today's four harnesses -- any future
     # `.<name>-plugin/` root matches the same shape check.
-    assert hook.is_gate_covered_plugin_path(".newharness-plugin/plugin.json") is True
+    assert manifest.is_gate_covered_plugin_path(".newharness-plugin/plugin.json") is True
 
 
 def test_is_gate_covered_plugin_path_rejects_look_alike_backup_directory():
     # ".claude-plugin-backup" ends with "-backup", not "-plugin" -- a
     # substring check ("plugin" in segment) would wrongly match this; the
     # whole-segment endswith("-plugin") check must not.
-    assert hook.is_gate_covered_plugin_path(".claude-plugin-backup/x.json") is False
+    assert manifest.is_gate_covered_plugin_path(".claude-plugin-backup/x.json") is False
 
 
 def test_is_gate_covered_plugin_path_rejects_non_dotted_segment():
-    assert hook.is_gate_covered_plugin_path("claude-plugin/plugin.json") is False
+    assert manifest.is_gate_covered_plugin_path("claude-plugin/plugin.json") is False
 
 
 def test_is_gate_covered_plugin_path_rejects_ordinary_path():
-    assert hook.is_gate_covered_plugin_path("crates/ironmem/src/lib.rs") is False
+    assert manifest.is_gate_covered_plugin_path("crates/ironmem/src/lib.rs") is False
 
 
 def test_is_inert_config_path_rejects_plugin_json():
-    assert hook.is_inert_config_path(".claude-plugin/plugin.json") is False
-    assert hook.is_inert_config_path(".codex-plugin/hooks.json") is False
-    assert hook.is_inert_config_path(".claude-plugin/.mcp.json") is False
+    assert manifest.is_inert_config_path(".claude-plugin/plugin.json") is False
+    assert manifest.is_inert_config_path(".codex-plugin/hooks.json") is False
+    assert manifest.is_inert_config_path(".claude-plugin/.mcp.json") is False
 
 
 def test_is_inert_config_path_rejects_plugin_shell_assets():
-    assert hook.is_inert_config_path(".claude-plugin/bin/ironmem-mcp.sh") is False
-    assert hook.is_inert_config_path(".claude-plugin/hooks/ironmem-hook.sh") is False
+    assert manifest.is_inert_config_path(".claude-plugin/bin/ironmem-mcp.sh") is False
+    assert manifest.is_inert_config_path(".claude-plugin/hooks/ironmem-hook.sh") is False
 
 
 def test_is_docs_path_rejects_plugin_agent_markdown():
-    assert hook.is_docs_path(".claude-plugin/agents/code-reviewer.md") is False
+    assert manifest.is_docs_path(".claude-plugin/agents/code-reviewer.md") is False
 
 
 def test_is_inert_config_path_still_matches_look_alike_backup_directory():
@@ -675,7 +671,7 @@ def test_is_inert_config_path_still_matches_look_alike_backup_directory():
     # plugin exclusion, so its .json file stays classified as ordinary
     # inert config -- proving the exclusion is a segment match, not a
     # substring match.
-    assert hook.is_inert_config_path(".claude-plugin-backup/x.json") is True
+    assert manifest.is_inert_config_path(".claude-plugin-backup/x.json") is True
 
 
 def test_classify_path_plugin_json_files_escalate():
@@ -684,7 +680,7 @@ def test_classify_path_plugin_json_files_escalate():
         ".codex-plugin/hooks.json",
         ".claude-plugin/.mcp.json",
     ):
-        assert hook.classify_path(path) == hook.UNKNOWN
+        assert manifest.classify_path(path) == manifest.UNKNOWN
 
 
 def test_classify_path_plugin_shell_assets_escalate():
@@ -692,15 +688,15 @@ def test_classify_path_plugin_shell_assets_escalate():
         ".claude-plugin/bin/ironmem-mcp.sh",
         ".claude-plugin/hooks/ironmem-hook.sh",
     ):
-        assert hook.classify_path(path) == hook.UNKNOWN
+        assert manifest.classify_path(path) == manifest.UNKNOWN
 
 
 def test_classify_path_plugin_agent_markdown_escalates():
-    assert hook.classify_path(".claude-plugin/agents/code-reviewer.md") == hook.UNKNOWN
+    assert manifest.classify_path(".claude-plugin/agents/code-reviewer.md") == manifest.UNKNOWN
 
 
 def test_classify_path_plugin_backup_look_alike_stays_inert_config():
-    assert hook.classify_path(".claude-plugin-backup/x.json") == hook.SURFACE_INERT_CONFIG
+    assert manifest.classify_path(".claude-plugin-backup/x.json") == manifest.SURFACE_INERT_CONFIG
 
 
 def test_resolve_gates_plugin_json_change_escalates_to_every_gate():
@@ -708,12 +704,12 @@ def test_resolve_gates_plugin_json_change_escalates_to_every_gate():
     # .claude-plugin/plugin.json must select every phase-matching gate, not
     # just always-gates (there are none today) -- because
     # plugin_versions_match_cargo_toml (cargo test) reads this exact file.
-    changes = hook.ChangeSet(
+    changes = manifest.ChangeSet(
         paths=(".claude-plugin/plugin.json",), unknown=False, reason=None
     )
-    for phase in (hook.PHASE_PRE_COMMIT, hook.PHASE_PRE_PUSH):
-        result = hook.resolve_gates(phase, changes)
-        expected = tuple(gate for gate in hook.GATES if phase in gate.phases)
+    for phase in (manifest.PHASE_PRE_COMMIT, manifest.PHASE_PRE_PUSH):
+        result = manifest.resolve_gates(phase, changes)
+        expected = tuple(gate for gate in manifest.GATES if phase in gate.phases)
         assert result == expected
 
 
@@ -726,34 +722,34 @@ def test_resolve_gates_plugin_json_change_escalates_to_every_gate():
 
 
 def test_classify_path_install_git_hooks_sh_stays_hook_self_test():
-    assert hook.classify_path("scripts/install-git-hooks.sh") == hook.SURFACE_HOOK_SELF_TEST
+    assert manifest.classify_path("scripts/install-git-hooks.sh") == manifest.SURFACE_HOOK_SELF_TEST
 
 
 def test_classify_path_run_git_hook_py_stays_hook_self_test():
-    assert hook.classify_path("scripts/run_git_hook.py") == hook.SURFACE_HOOK_SELF_TEST
+    assert manifest.classify_path("scripts/run_git_hook.py") == manifest.SURFACE_HOOK_SELF_TEST
 
 
 def test_classify_path_test_run_git_hook_py_stays_hook_self_test():
-    assert hook.classify_path("scripts/test_run_git_hook.py") == hook.SURFACE_HOOK_SELF_TEST
+    assert manifest.classify_path("scripts/test_run_git_hook.py") == manifest.SURFACE_HOOK_SELF_TEST
 
 
 def test_classify_path_githooks_pre_commit_stays_hook_self_test():
-    assert hook.classify_path(".githooks/pre-commit") == hook.SURFACE_HOOK_SELF_TEST
+    assert manifest.classify_path(".githooks/pre-commit") == manifest.SURFACE_HOOK_SELF_TEST
 
 
 def test_classify_path_githooks_pre_push_stays_hook_self_test():
-    assert hook.classify_path(".githooks/pre-push") == hook.SURFACE_HOOK_SELF_TEST
+    assert manifest.classify_path(".githooks/pre-push") == manifest.SURFACE_HOOK_SELF_TEST
 
 
 def test_classify_path_check_collab_turn_templates_stays_collab_protocol():
     assert (
-        hook.classify_path("scripts/check_collab_turn_templates.py")
-        == hook.SURFACE_COLLAB_PROTOCOL
+        manifest.classify_path("scripts/check_collab_turn_templates.py")
+        == manifest.SURFACE_COLLAB_PROTOCOL
     )
 
 
 def test_classify_path_inert_config_json_file():
-    assert hook.classify_path("crates/ironmem/schema/example.json") == hook.SURFACE_INERT_CONFIG
+    assert manifest.classify_path("crates/ironmem/schema/example.json") == manifest.SURFACE_INERT_CONFIG
 
 
 def test_classify_path_genuinely_unrecognized_path_still_escalates():
@@ -762,11 +758,11 @@ def test_classify_path_genuinely_unrecognized_path_still_escalates():
     # phase-matching gate must still be selected. The fail-closed property
     # must survive where it matters: an unrecognized extension is not
     # silently treated as inert.
-    assert hook.classify_path("weird/thing.xyz") == hook.UNKNOWN
-    changes = hook.ChangeSet(paths=("weird/thing.xyz",), unknown=False, reason=None)
-    for phase in (hook.PHASE_PRE_COMMIT, hook.PHASE_PRE_PUSH):
-        result = hook.resolve_gates(phase, changes)
-        expected = tuple(gate for gate in hook.GATES if phase in gate.phases)
+    assert manifest.classify_path("weird/thing.xyz") == manifest.UNKNOWN
+    changes = manifest.ChangeSet(paths=("weird/thing.xyz",), unknown=False, reason=None)
+    for phase in (manifest.PHASE_PRE_COMMIT, manifest.PHASE_PRE_PUSH):
+        result = manifest.resolve_gates(phase, changes)
+        expected = tuple(gate for gate in manifest.GATES if phase in gate.phases)
         assert result == expected
 
 
@@ -775,19 +771,19 @@ def test_classify_path_genuinely_unrecognized_path_still_escalates():
 
 
 def test_classify_path_near_miss_contests_is_not_collab_protocol():
-    assert hook.classify_path("contests/collab_turn_templates/example.txt") == hook.UNKNOWN
+    assert manifest.classify_path("contests/collab_turn_templates/example.txt") == manifest.UNKNOWN
 
 
 def test_classify_path_near_miss_docsite_is_not_docs():
-    assert hook.classify_path("docsite/architecture.txt") == hook.UNKNOWN
+    assert manifest.classify_path("docsite/architecture.txt") == manifest.UNKNOWN
 
 
 def test_classify_path_near_miss_src_backup_is_unknown():
-    assert hook.classify_path("src_backup/lib.py") == hook.UNKNOWN
+    assert manifest.classify_path("src_backup/lib.py") == manifest.UNKNOWN
 
 
 def test_classify_path_unrecognized_safe_shape_is_unknown():
-    assert hook.classify_path("notes.txt") == hook.UNKNOWN
+    assert manifest.classify_path("notes.txt") == manifest.UNKNOWN
 
 
 # --- Task 2: classify_path -- unsafe shapes classify UNKNOWN by rejection,
@@ -795,45 +791,45 @@ def test_classify_path_unrecognized_safe_shape_is_unknown():
 
 
 def test_classify_path_absolute_path_is_unknown():
-    assert hook.classify_path("/etc/passwd") == hook.UNKNOWN
+    assert manifest.classify_path("/etc/passwd") == manifest.UNKNOWN
 
 
 def test_classify_path_dotdot_segment_is_unknown():
-    assert hook.classify_path("scripts/../etc/passwd") == hook.UNKNOWN
+    assert manifest.classify_path("scripts/../etc/passwd") == manifest.UNKNOWN
 
 
 def test_classify_path_bare_dotdot_segment_is_unknown():
-    assert hook.classify_path("..") == hook.UNKNOWN
+    assert manifest.classify_path("..") == manifest.UNKNOWN
 
 
 def test_classify_path_nul_byte_is_unknown():
-    assert hook.classify_path("weird\x00path.md") == hook.UNKNOWN
+    assert manifest.classify_path("weird\x00path.md") == manifest.UNKNOWN
 
 
 def test_classify_path_control_byte_is_unknown():
-    assert hook.classify_path("weird\x1bpath.md") == hook.UNKNOWN
+    assert manifest.classify_path("weird\x1bpath.md") == manifest.UNKNOWN
 
 
 def test_classify_path_empty_string_is_unknown():
-    assert hook.classify_path("") == hook.UNKNOWN
+    assert manifest.classify_path("") == manifest.UNKNOWN
 
 
 def test_classify_path_leading_dash_is_unknown():
     # Even though the extension would otherwise match the Rust surface, the
     # unsafe leading '-' shape check is rejected before surface matching.
-    assert hook.classify_path("-danger.rs") == hook.UNKNOWN
+    assert manifest.classify_path("-danger.rs") == manifest.UNKNOWN
 
 
 def test_classify_path_non_str_int_is_unknown():
-    assert hook.classify_path(123) == hook.UNKNOWN
+    assert manifest.classify_path(123) == manifest.UNKNOWN
 
 
 def test_classify_path_non_str_none_is_unknown():
-    assert hook.classify_path(None) == hook.UNKNOWN
+    assert manifest.classify_path(None) == manifest.UNKNOWN
 
 
 def test_classify_path_non_str_list_is_unknown():
-    assert hook.classify_path(["scripts/run_git_hook.py"]) == hook.UNKNOWN
+    assert manifest.classify_path(["scripts/run_git_hook.py"]) == manifest.UNKNOWN
 
 
 def test_classify_path_never_raises_on_unsafe_shapes():
@@ -850,7 +846,7 @@ def test_classify_path_never_raises_on_unsafe_shapes():
         ["a"],
     ]
     for value in unsafe_inputs:
-        assert hook.classify_path(value) == hook.UNKNOWN
+        assert manifest.classify_path(value) == manifest.UNKNOWN
 
 
 # --- Task 2: paths are matched byte-exact -- no strip/case-fold/rewrite --
@@ -858,7 +854,7 @@ def test_classify_path_never_raises_on_unsafe_shapes():
 
 def test_classify_path_preserves_newline_space_and_non_ascii_segments():
     path = "docs/plan\n notes (β).md"
-    assert hook.classify_path(path) == hook.SURFACE_DOCS
+    assert manifest.classify_path(path) == manifest.SURFACE_DOCS
     # Segment-based matching operated on the real, unmodified bytes.
     assert path.split("/") == ["docs", "plan\n notes (β).md"]
 
@@ -868,8 +864,8 @@ def test_classify_path_preserves_carriage_return_like_newline():
     # is, and `-z` NUL framing makes both unambiguous at the source. Rejecting
     # \r while allowing \n was an asymmetry with no stated justification: it
     # escalated a correctly-classifiable docs path to a full gate run.
-    assert hook.classify_path("docs/plan\rnotes.md") == hook.SURFACE_DOCS
-    assert hook.classify_path("docs/plan\r\nnotes.md") == hook.SURFACE_DOCS
+    assert manifest.classify_path("docs/plan\rnotes.md") == manifest.SURFACE_DOCS
+    assert manifest.classify_path("docs/plan\r\nnotes.md") == manifest.SURFACE_DOCS
 
 
 def test_classify_path_rejects_control_bytes_other_than_line_terminators():
@@ -878,7 +874,7 @@ def test_classify_path_rejects_control_bytes_other_than_line_terminators():
     # to "all control bytes" fails here rather than passing silently.
     for codepoint in (0x00, 0x01, 0x08, 0x0B, 0x0C, 0x1B, 0x1F, 0x7F):
         path = f"docs/plan{chr(codepoint)}notes.md"
-        assert hook.classify_path(path) == hook.UNKNOWN, f"U+{codepoint:04X} must escalate"
+        assert manifest.classify_path(path) == manifest.UNKNOWN, f"U+{codepoint:04X} must escalate"
 
 
 def test_classify_path_does_not_strip_whitespace_before_matching():
@@ -886,46 +882,46 @@ def test_classify_path_does_not_strip_whitespace_before_matching():
     # collapse to the exact hook-self-test path and misclassify. Byte-exact
     # matching must leave it unrecognized instead.
     path = " scripts/run_git_hook.py"
-    assert hook.classify_path(path) == hook.UNKNOWN
+    assert manifest.classify_path(path) == manifest.UNKNOWN
 
 
 def test_classify_path_does_not_strip_trailing_newline_before_matching():
     path = "scripts/run_git_hook.py\n"
-    assert hook.classify_path(path) == hook.UNKNOWN
+    assert manifest.classify_path(path) == manifest.UNKNOWN
 
 
 # --- Task 3: resolve_gates -- unknown phase raises -----------------------
 
 
 def test_resolve_gates_unknown_phase_raises():
-    changes = hook.ChangeSet(paths=(), unknown=False, reason=None)
+    changes = manifest.ChangeSet(paths=(), unknown=False, reason=None)
     with pytest.raises(ValueError):
-        hook.resolve_gates("typo-phase", changes)
+        manifest.resolve_gates("typo-phase", changes)
 
 
 def test_resolve_gates_empty_phase_string_raises():
-    changes = hook.ChangeSet(paths=(), unknown=False, reason=None)
+    changes = manifest.ChangeSet(paths=(), unknown=False, reason=None)
     with pytest.raises(ValueError):
-        hook.resolve_gates("", changes)
+        manifest.resolve_gates("", changes)
 
 
 # --- Task 3: resolve_gates -- phase filtering tested both directions -----
 
 
 def test_resolve_gates_pre_commit_excludes_pre_push_only_gate():
-    changes = hook.ChangeSet(
+    changes = manifest.ChangeSet(
         paths=("crates/ironmem/src/hook.rs",), unknown=False, reason=None
     )
-    names = [gate.name for gate in hook.resolve_gates(hook.PHASE_PRE_COMMIT, changes)]
+    names = [gate.name for gate in manifest.resolve_gates(manifest.PHASE_PRE_COMMIT, changes)]
     assert names == ["rust_fmt_check", "rust_clippy"]
     assert "rust_test" not in names
 
 
 def test_resolve_gates_pre_push_excludes_pre_commit_only_gates():
-    changes = hook.ChangeSet(
+    changes = manifest.ChangeSet(
         paths=("crates/ironmem/src/hook.rs",), unknown=False, reason=None
     )
-    names = [gate.name for gate in hook.resolve_gates(hook.PHASE_PRE_PUSH, changes)]
+    names = [gate.name for gate in manifest.resolve_gates(manifest.PHASE_PRE_PUSH, changes)]
     assert names == ["rust_test"]
     assert "rust_fmt_check" not in names
     assert "rust_clippy" not in names
@@ -938,16 +934,16 @@ def test_resolve_gates_docs_only_selects_no_gates():
     # No gate in today's manifest is marked always=True (see
     # test_manifest_no_gate_marked_always_yet), so an all-docs change with a
     # known shape selects nothing: DOCS is inert, not an escalation trigger.
-    changes = hook.ChangeSet(paths=("README.md",), unknown=False, reason=None)
-    assert hook.resolve_gates(hook.PHASE_PRE_COMMIT, changes) == ()
-    assert hook.resolve_gates(hook.PHASE_PRE_PUSH, changes) == ()
+    changes = manifest.ChangeSet(paths=("README.md",), unknown=False, reason=None)
+    assert manifest.resolve_gates(manifest.PHASE_PRE_COMMIT, changes) == ()
+    assert manifest.resolve_gates(manifest.PHASE_PRE_PUSH, changes) == ()
 
 
 def test_resolve_gates_docs_plus_code_path_does_not_skip():
-    changes = hook.ChangeSet(
+    changes = manifest.ChangeSet(
         paths=("README.md", "crates/ironmem/src/hook.rs"), unknown=False, reason=None
     )
-    names = [gate.name for gate in hook.resolve_gates(hook.PHASE_PRE_COMMIT, changes)]
+    names = [gate.name for gate in manifest.resolve_gates(manifest.PHASE_PRE_COMMIT, changes)]
     assert names == ["rust_fmt_check", "rust_clippy"]
 
 
@@ -955,7 +951,7 @@ def test_resolve_gates_docs_plus_code_path_does_not_skip():
 
 
 def test_resolve_gates_inert_config_only_selects_no_gates():
-    changes = hook.ChangeSet(
+    changes = manifest.ChangeSet(
         paths=(
             "crates/ironmem/schema/example.json",
             "site/index.html",
@@ -964,17 +960,17 @@ def test_resolve_gates_inert_config_only_selects_no_gates():
         unknown=False,
         reason=None,
     )
-    assert hook.resolve_gates(hook.PHASE_PRE_COMMIT, changes) == ()
-    assert hook.resolve_gates(hook.PHASE_PRE_PUSH, changes) == ()
+    assert manifest.resolve_gates(manifest.PHASE_PRE_COMMIT, changes) == ()
+    assert manifest.resolve_gates(manifest.PHASE_PRE_PUSH, changes) == ()
 
 
 def test_resolve_gates_inert_config_plus_code_path_does_not_skip():
-    changes = hook.ChangeSet(
+    changes = manifest.ChangeSet(
         paths=("crates/ironmem/schema/example.json", "crates/ironmem/src/hook.rs"),
         unknown=False,
         reason=None,
     )
-    names = [gate.name for gate in hook.resolve_gates(hook.PHASE_PRE_COMMIT, changes)]
+    names = [gate.name for gate in manifest.resolve_gates(manifest.PHASE_PRE_COMMIT, changes)]
     assert names == ["rust_fmt_check", "rust_clippy"]
 
 
@@ -982,11 +978,11 @@ def test_resolve_gates_inert_config_does_not_protect_sql_migration_from_escalati
     # A staged crates/ironmem/migrations/*.sql change classifies UNKNOWN (not
     # inert_config -- see test_is_inert_config_path_rejects_sql_migration),
     # so it must still escalate to every gate for the phase.
-    changes = hook.ChangeSet(
+    changes = manifest.ChangeSet(
         paths=("crates/ironmem/migrations/001_init.sql",), unknown=False, reason=None
     )
-    result = hook.resolve_gates(hook.PHASE_PRE_COMMIT, changes)
-    expected = tuple(gate for gate in hook.GATES if hook.PHASE_PRE_COMMIT in gate.phases)
+    result = manifest.resolve_gates(manifest.PHASE_PRE_COMMIT, changes)
+    expected = tuple(gate for gate in manifest.GATES if manifest.PHASE_PRE_COMMIT in gate.phases)
     assert result == expected
 
 
@@ -994,11 +990,11 @@ def test_resolve_gates_dashboard_html_change_escalates_to_rust_gates():
     # The dashboard embeds index.html with include_str!, so an HTML/XSS
     # regression is source-equivalent and must be tested, not classified as
     # inert static-site content.
-    changes = hook.ChangeSet(
+    changes = manifest.ChangeSet(
         paths=("crates/ironmem/src/dashboard/index.html",), unknown=False, reason=None
     )
-    result = hook.resolve_gates(hook.PHASE_PRE_COMMIT, changes)
-    expected = tuple(gate for gate in hook.GATES if hook.PHASE_PRE_COMMIT in gate.phases)
+    result = manifest.resolve_gates(manifest.PHASE_PRE_COMMIT, changes)
+    expected = tuple(gate for gate in manifest.GATES if manifest.PHASE_PRE_COMMIT in gate.phases)
     assert result == expected
 
 
@@ -1006,18 +1002,18 @@ def test_resolve_gates_unrecognized_path_alone_runs_every_gate_for_phase():
     # "notes.txt" is a safe shape but classifies UNKNOWN (no declared surface
     # matches it). classify_path()'s UNKNOWN is the escalation signal, same
     # as changes.unknown=True -- it forces every phase-matching gate to run.
-    changes = hook.ChangeSet(paths=("notes.txt",), unknown=False, reason=None)
-    result = hook.resolve_gates(hook.PHASE_PRE_COMMIT, changes)
-    expected = tuple(gate for gate in hook.GATES if hook.PHASE_PRE_COMMIT in gate.phases)
+    changes = manifest.ChangeSet(paths=("notes.txt",), unknown=False, reason=None)
+    result = manifest.resolve_gates(manifest.PHASE_PRE_COMMIT, changes)
+    expected = tuple(gate for gate in manifest.GATES if manifest.PHASE_PRE_COMMIT in gate.phases)
     assert result == expected
 
 
 def test_resolve_gates_docs_plus_unrecognized_runs_every_gate_unknown_dominates():
-    changes = hook.ChangeSet(
+    changes = manifest.ChangeSet(
         paths=("README.md", "notes.txt"), unknown=False, reason=None
     )
-    result = hook.resolve_gates(hook.PHASE_PRE_PUSH, changes)
-    expected = tuple(gate for gate in hook.GATES if hook.PHASE_PRE_PUSH in gate.phases)
+    result = manifest.resolve_gates(manifest.PHASE_PRE_PUSH, changes)
+    expected = tuple(gate for gate in manifest.GATES if manifest.PHASE_PRE_PUSH in gate.phases)
     assert result == expected
 
 
@@ -1025,16 +1021,16 @@ def test_resolve_gates_docs_plus_unrecognized_runs_every_gate_unknown_dominates(
 
 
 def test_resolve_gates_unknown_true_selects_full_phase_set_regardless_of_paths():
-    changes = hook.ChangeSet(paths=("README.md",), unknown=True, reason="git diff failed")
-    result = hook.resolve_gates(hook.PHASE_PRE_COMMIT, changes)
-    expected = tuple(gate for gate in hook.GATES if hook.PHASE_PRE_COMMIT in gate.phases)
+    changes = manifest.ChangeSet(paths=("README.md",), unknown=True, reason="git diff failed")
+    result = manifest.resolve_gates(manifest.PHASE_PRE_COMMIT, changes)
+    expected = tuple(gate for gate in manifest.GATES if manifest.PHASE_PRE_COMMIT in gate.phases)
     assert result == expected
 
 
 def test_resolve_gates_unknown_true_with_empty_paths_selects_full_phase_set():
-    changes = hook.ChangeSet(paths=(), unknown=True, reason="malformed stdin")
-    result = hook.resolve_gates(hook.PHASE_PRE_PUSH, changes)
-    expected = tuple(gate for gate in hook.GATES if hook.PHASE_PRE_PUSH in gate.phases)
+    changes = manifest.ChangeSet(paths=(), unknown=True, reason="malformed stdin")
+    result = manifest.resolve_gates(manifest.PHASE_PRE_PUSH, changes)
+    expected = tuple(gate for gate in manifest.GATES if manifest.PHASE_PRE_PUSH in gate.phases)
     assert result == expected
 
 
@@ -1042,9 +1038,9 @@ def test_resolve_gates_unknown_true_with_empty_paths_selects_full_phase_set():
 
 
 def test_resolve_gates_empty_paths_unknown_false_selects_only_always_gates():
-    changes = hook.ChangeSet(paths=(), unknown=False, reason=None)
-    assert hook.resolve_gates(hook.PHASE_PRE_COMMIT, changes) == ()
-    assert hook.resolve_gates(hook.PHASE_PRE_PUSH, changes) == ()
+    changes = manifest.ChangeSet(paths=(), unknown=False, reason=None)
+    assert manifest.resolve_gates(manifest.PHASE_PRE_COMMIT, changes) == ()
+    assert manifest.resolve_gates(manifest.PHASE_PRE_PUSH, changes) == ()
 
 
 # --- Task 3: resolve_gates -- the `gate.always` disjunct, exercised for real
@@ -1059,18 +1055,18 @@ def test_resolve_gates_empty_paths_unknown_false_selects_only_always_gates():
 
 
 def test_resolve_gates_gate_always_true_runs_with_empty_paths(monkeypatch):
-    always_gate = hook.Gate(
+    always_gate = manifest.Gate(
         name="synthetic_always_gate",
         argv=("true",),
-        phases=frozenset({hook.PHASE_PRE_COMMIT}),
+        phases=frozenset({manifest.PHASE_PRE_COMMIT}),
         surfaces=frozenset(),
         always=True,
     )
-    monkeypatch.setattr(hook, "GATES", hook.GATES + (always_gate,))
-    changes = hook.ChangeSet(paths=(), unknown=False, reason=None)
+    monkeypatch.setattr(manifest, "GATES", manifest.GATES + (always_gate,))
+    changes = manifest.ChangeSet(paths=(), unknown=False, reason=None)
     # Empty paths, unknown=False: nothing escalates. Only the always=True
     # gate fires -- every real manifest gate (always=False) is excluded.
-    assert hook.resolve_gates(hook.PHASE_PRE_COMMIT, changes) == (always_gate,)
+    assert manifest.resolve_gates(manifest.PHASE_PRE_COMMIT, changes) == (always_gate,)
 
 
 # --- Task 3: resolve_gates -- output order is manifest order, invariant to
@@ -1078,18 +1074,18 @@ def test_resolve_gates_gate_always_true_runs_with_empty_paths(monkeypatch):
 
 
 def test_resolve_gates_output_order_is_manifest_order_invariant_to_input_order():
-    forward = hook.ChangeSet(
+    forward = manifest.ChangeSet(
         paths=("crates/ironmem/src/hook.rs", "docs/COLLAB.md"),
         unknown=False,
         reason=None,
     )
-    reordered = hook.ChangeSet(
+    reordered = manifest.ChangeSet(
         paths=("docs/COLLAB.md", "crates/ironmem/src/hook.rs"),
         unknown=False,
         reason=None,
     )
-    result_forward = hook.resolve_gates(hook.PHASE_PRE_COMMIT, forward)
-    result_reordered = hook.resolve_gates(hook.PHASE_PRE_COMMIT, reordered)
+    result_forward = manifest.resolve_gates(manifest.PHASE_PRE_COMMIT, forward)
+    result_reordered = manifest.resolve_gates(manifest.PHASE_PRE_COMMIT, reordered)
     assert result_forward == result_reordered
     # Manifest order (see test_manifest_declaration_order_is_preserved), not
     # input order: collab_template_lint is declared before the rust gates.
@@ -1101,10 +1097,10 @@ def test_resolve_gates_output_order_is_manifest_order_invariant_to_input_order()
 
 
 def test_resolve_gates_output_invariant_to_duplicate_paths():
-    deduped = hook.ChangeSet(
+    deduped = manifest.ChangeSet(
         paths=("crates/ironmem/src/hook.rs",), unknown=False, reason=None
     )
-    duplicated = hook.ChangeSet(
+    duplicated = manifest.ChangeSet(
         paths=(
             "crates/ironmem/src/hook.rs",
             "crates/ironmem/src/hook.rs",
@@ -1113,8 +1109,8 @@ def test_resolve_gates_output_invariant_to_duplicate_paths():
         unknown=False,
         reason=None,
     )
-    assert hook.resolve_gates(hook.PHASE_PRE_COMMIT, deduped) == hook.resolve_gates(
-        hook.PHASE_PRE_COMMIT, duplicated
+    assert manifest.resolve_gates(manifest.PHASE_PRE_COMMIT, deduped) == manifest.resolve_gates(
+        manifest.PHASE_PRE_COMMIT, duplicated
     )
 
 
@@ -1125,19 +1121,19 @@ def test_resolve_gates_dedupes_by_first_seen_not_by_sorting(monkeypatch):
     # first-seen order -- never a sorted order, which would reorder
     # "notes_b.txt" before "notes_a.txt".
     calls: list[str] = []
-    real_classify_path = hook.classify_path
+    real_classify_path = manifest.classify_path
 
     def spy(path):
         calls.append(path)
         return real_classify_path(path)
 
-    changes = hook.ChangeSet(
+    changes = manifest.ChangeSet(
         paths=("notes_b.txt", "notes_a.txt", "notes_b.txt", "notes_a.txt"),
         unknown=False,
         reason=None,
     )
-    monkeypatch.setattr(hook, "classify_path", spy)
-    hook.resolve_gates(hook.PHASE_PRE_COMMIT, changes)
+    monkeypatch.setattr(manifest, "classify_path", spy)
+    manifest.resolve_gates(manifest.PHASE_PRE_COMMIT, changes)
 
     assert calls == ["notes_b.txt", "notes_a.txt"]
 
@@ -1148,12 +1144,12 @@ def test_resolve_gates_dedupes_by_first_seen_not_by_sorting(monkeypatch):
 def test_resolve_gates_overlapping_surfaces_select_each_gate_exactly_once():
     # Two different paths that both classify to SURFACE_HOOK_SELF_TEST must
     # not duplicate hook_self_test / hook_install_check in the result.
-    changes = hook.ChangeSet(
+    changes = manifest.ChangeSet(
         paths=("scripts/run_git_hook.py", "scripts/install-git-hooks.sh"),
         unknown=False,
         reason=None,
     )
-    result = hook.resolve_gates(hook.PHASE_PRE_COMMIT, changes)
+    result = manifest.resolve_gates(manifest.PHASE_PRE_COMMIT, changes)
     names = [gate.name for gate in result]
     assert names == ["hook_self_test", "hook_install_check"]
     assert len(names) == len(set(names))
@@ -1163,15 +1159,15 @@ def test_resolve_gates_overlapping_surfaces_select_each_gate_exactly_once():
 
 
 def test_resolve_gates_returns_a_tuple():
-    changes = hook.ChangeSet(paths=(), unknown=True, reason="test")
-    result = hook.resolve_gates(hook.PHASE_PRE_COMMIT, changes)
+    changes = manifest.ChangeSet(paths=(), unknown=True, reason="test")
+    result = manifest.resolve_gates(manifest.PHASE_PRE_COMMIT, changes)
     assert isinstance(result, tuple)
 
 
 def test_resolve_gates_does_not_mutate_changeset_paths():
     original_paths = ("crates/ironmem/src/hook.rs", "crates/ironmem/src/hook.rs")
-    changes = hook.ChangeSet(paths=original_paths, unknown=False, reason=None)
-    hook.resolve_gates(hook.PHASE_PRE_COMMIT, changes)
+    changes = manifest.ChangeSet(paths=original_paths, unknown=False, reason=None)
+    manifest.resolve_gates(manifest.PHASE_PRE_COMMIT, changes)
     assert changes.paths == original_paths
 
 
@@ -1201,13 +1197,13 @@ def test_resolve_gates_does_not_mutate_changeset_paths():
 # immediately, not silently resolve to an inert-classified path that would
 # make the always/escalate-only property look satisfied when it isn't.
 _SURFACE_EXAMPLE_PATH_FOR_TEST = {
-    hook.SURFACE_RUST_WORKSPACE: "crates/ironmem/src/hook.rs",
-    hook.SURFACE_COLLAB_PROTOCOL: "docs/COLLAB.md",
-    hook.SURFACE_HOOK_SELF_TEST: "scripts/run_git_hook.py",
+    manifest.SURFACE_RUST_WORKSPACE: "crates/ironmem/src/hook.rs",
+    manifest.SURFACE_COLLAB_PROTOCOL: "docs/COLLAB.md",
+    manifest.SURFACE_HOOK_SELF_TEST: "scripts/run_git_hook.py",
 }
 
 _GATE_PHASE_PARAMS_FOR_TEST = [
-    (gate, phase) for gate in hook.GATES for phase in sorted(gate.phases)
+    (gate, phase) for gate in manifest.GATES for phase in sorted(gate.phases)
 ]
 
 
@@ -1218,8 +1214,8 @@ _GATE_PHASE_PARAMS_FOR_TEST = [
 )
 def test_resolve_gates_reaches_every_manifest_gate(gate, phase):
     if gate.always:
-        changes = hook.ChangeSet(paths=(), unknown=False, reason=None)
-        assert gate in hook.resolve_gates(phase, changes)
+        changes = manifest.ChangeSet(paths=(), unknown=False, reason=None)
+        assert gate in manifest.resolve_gates(phase, changes)
         return
     # Iterate every declared surface, not just one: a future gate declaring
     # two surfaces -- one mapped here, one not -- must raise KeyError
@@ -1227,8 +1223,8 @@ def test_resolve_gates_reaches_every_manifest_gate(gate, phase):
     # reachable from each surface it declares, not just an arbitrary one.
     for surface_id in gate.surfaces:
         path = _SURFACE_EXAMPLE_PATH_FOR_TEST[surface_id]
-        changes = hook.ChangeSet(paths=(path,), unknown=False, reason=None)
-        assert gate in hook.resolve_gates(phase, changes)
+        changes = manifest.ChangeSet(paths=(path,), unknown=False, reason=None)
+        assert gate in manifest.resolve_gates(phase, changes)
 
 
 # --- Task 4: collection layer -- Git to ChangeSet, fail-closed ------------
@@ -1270,8 +1266,8 @@ def _root_diff(sha):
 # Git's all-zero null object ids, derived from the module's own supported
 # object-id lengths rather than from a SHA-1-only literal: the production code
 # recognizes both, so the tests must exercise the same vocabulary.
-ZERO_SHA_1 = "0" * min(hook._SHA_LENGTHS)
-ZERO_SHA_256 = "0" * max(hook._SHA_LENGTHS)
+ZERO_SHA_1 = "0" * min(collect._SHA_LENGTHS)
+ZERO_SHA_256 = "0" * max(collect._SHA_LENGTHS)
 
 
 class _FakeGitRun:
@@ -1288,7 +1284,7 @@ class _FakeGitRun:
 
     def __call__(self, cmd, **kwargs):
         assert cmd[0] == "git"
-        assert kwargs.get("cwd") == hook.ROOT
+        assert kwargs.get("cwd") == runtime.ROOT
         assert kwargs.get("text") is True
         assert kwargs.get("capture_output") is True
         assert kwargs.get("check") is False
@@ -1310,57 +1306,57 @@ def _pre_push_line(local_ref, local_sha, remote_ref, remote_sha):
 
 
 def test_split_nul_empty_output_is_no_paths():
-    assert hook._split_nul("") == ()
+    assert collect._split_nul("") == ()
 
 
 def test_split_nul_drops_only_trailing_empty_field():
-    assert hook._split_nul("a.py\0b.py\0") == ("a.py", "b.py")
+    assert collect._split_nul("a.py\0b.py\0") == ("a.py", "b.py")
 
 
 def test_split_nul_preserves_interior_bytes_no_strip():
     # Leading/trailing whitespace and an embedded newline inside a field
     # must survive untouched -- -z framing removal is not path mutation.
-    assert hook._split_nul(" a.py \0b\n.py\0") == (" a.py ", "b\n.py")
+    assert collect._split_nul(" a.py \0b\n.py\0") == (" a.py ", "b\n.py")
 
 
 # --- _is_hex_sha -- sha validation (not a path, .strip()/case rules N/A) --
 
 
 def test_is_hex_sha_accepts_full_hex_sha():
-    assert hook._is_hex_sha(SHA_A) is True
+    assert collect._is_hex_sha(SHA_A) is True
 
 
 def test_is_hex_sha_rejects_empty_string():
-    assert hook._is_hex_sha("") is False
+    assert collect._is_hex_sha("") is False
 
 
 def test_is_hex_sha_rejects_non_hex_characters():
-    assert hook._is_hex_sha("z" * 40) is False
+    assert collect._is_hex_sha("z" * 40) is False
 
 
 def test_is_hex_sha_rejects_short_hex_run():
     # "abc" is hex-shaped but far shorter than a real Git object id (40 or
     # 64 hex chars). Accepting any positive-length hex run would make this
     # guard a formality rather than a load-bearing malformed-stdin check.
-    assert hook._is_hex_sha("abc") is False
+    assert collect._is_hex_sha("abc") is False
 
 
 def test_is_hex_sha_accepts_sha256_length():
-    assert hook._is_hex_sha("a" * 64) is True
+    assert collect._is_hex_sha("a" * 64) is True
 
 
 def test_is_hex_sha_rejects_length_between_40_and_64():
-    assert hook._is_hex_sha("a" * 50) is False
+    assert collect._is_hex_sha("a" * 50) is False
 
 
 def test_is_zero_sha_accepts_sha1_and_sha256_null_object_ids():
-    assert hook._is_zero_sha(ZERO_SHA_1) is True
-    assert hook._is_zero_sha(ZERO_SHA_256) is True
+    assert collect._is_zero_sha(ZERO_SHA_1) is True
+    assert collect._is_zero_sha(ZERO_SHA_256) is True
 
 
 def test_is_zero_sha_rejects_non_null_or_invalid_object_ids():
-    assert hook._is_zero_sha(SHA_A) is False
-    assert hook._is_zero_sha("0" * 50) is False
+    assert collect._is_zero_sha(SHA_A) is False
+    assert collect._is_zero_sha("0" * 50) is False
 
 
 # --- _parse_pre_push_line ---------------------------------------------------
@@ -1368,11 +1364,11 @@ def test_is_zero_sha_rejects_non_null_or_invalid_object_ids():
 
 def test_parse_pre_push_line_valid_four_fields():
     line = _pre_push_line("refs/heads/a", SHA_A, "refs/heads/a", SHA_B)
-    assert hook._parse_pre_push_line(line) == ("refs/heads/a", SHA_A, "refs/heads/a", SHA_B)
+    assert collect._parse_pre_push_line(line) == ("refs/heads/a", SHA_A, "refs/heads/a", SHA_B)
 
 
 def test_parse_pre_push_line_wrong_field_count_is_none():
-    assert hook._parse_pre_push_line("refs/heads/a onlytwo") is None
+    assert collect._parse_pre_push_line("refs/heads/a onlytwo") is None
 
 
 # --- _run_git -- fail-closed boundary itself must never raise --------------
@@ -1386,8 +1382,8 @@ def test_run_git_guards_empty_args_on_subprocess_failure(monkeypatch):
     def raiser(cmd, **kwargs):
         raise OSError("boom")
 
-    monkeypatch.setattr(hook.subprocess, "run", raiser)
-    ok, returncode, stdout, reason = hook._run_git(())
+    monkeypatch.setattr(subprocess, "run", raiser)
+    ok, returncode, stdout, reason = collect._run_git(())
     assert ok is False
     assert returncode == -1
     assert stdout == ""
@@ -1408,25 +1404,25 @@ def test_run_git_guards_empty_args_on_subprocess_failure(monkeypatch):
 
 def test_collect_pre_commit_changes_success(monkeypatch):
     fake = _FakeGitRun({_PRE_COMMIT_DIFF: (0, "a.py\0b/c.txt\0")})
-    monkeypatch.setattr(hook.subprocess, "run", fake)
-    changes = hook.collect_pre_commit_changes()
-    assert changes == hook.ChangeSet(paths=("a.py", "b/c.txt"), unknown=False, reason=None)
+    monkeypatch.setattr(subprocess, "run", fake)
+    changes = collect.collect_pre_commit_changes()
+    assert changes == manifest.ChangeSet(paths=("a.py", "b/c.txt"), unknown=False, reason=None)
     assert fake.calls == [_PRE_COMMIT_DIFF]
 
 
 def test_collect_pre_commit_changes_no_staged_files_is_not_unknown(monkeypatch):
     fake = _FakeGitRun({_PRE_COMMIT_DIFF: (0, "")})
-    monkeypatch.setattr(hook.subprocess, "run", fake)
-    changes = hook.collect_pre_commit_changes()
+    monkeypatch.setattr(subprocess, "run", fake)
+    changes = collect.collect_pre_commit_changes()
     # Empty paths + unknown=False must mean "genuinely no changes", never
     # "collection broke".
-    assert changes == hook.ChangeSet(paths=(), unknown=False, reason=None)
+    assert changes == manifest.ChangeSet(paths=(), unknown=False, reason=None)
 
 
 def test_collect_pre_commit_changes_nonzero_exit_is_unknown(monkeypatch):
     fake = _FakeGitRun({_PRE_COMMIT_DIFF: (128, "")})
-    monkeypatch.setattr(hook.subprocess, "run", fake)
-    changes = hook.collect_pre_commit_changes()
+    monkeypatch.setattr(subprocess, "run", fake)
+    changes = collect.collect_pre_commit_changes()
     assert changes.paths == ()
     assert changes.unknown is True
     assert changes.reason
@@ -1436,8 +1432,8 @@ def test_collect_pre_commit_changes_subprocess_failure_is_unknown_never_raises(m
     fake = _FakeGitRun(
         {_PRE_COMMIT_DIFF: FileNotFoundError("git: command not found")}
     )
-    monkeypatch.setattr(hook.subprocess, "run", fake)
-    changes = hook.collect_pre_commit_changes()
+    monkeypatch.setattr(subprocess, "run", fake)
+    changes = collect.collect_pre_commit_changes()
     assert changes.paths == ()
     assert changes.unknown is True
     assert changes.reason
@@ -1450,8 +1446,8 @@ def test_collect_pre_commit_changes_subprocess_failure_is_unknown_never_raises(m
 def test_collect_pre_commit_changes_preserves_byte_exact_paths(monkeypatch):
     weird = "docs/plan\n notes (β).md"
     fake = _FakeGitRun({_PRE_COMMIT_DIFF: (0, f"{weird}\0")})
-    monkeypatch.setattr(hook.subprocess, "run", fake)
-    changes = hook.collect_pre_commit_changes()
+    monkeypatch.setattr(subprocess, "run", fake)
+    changes = collect.collect_pre_commit_changes()
     assert changes.paths == (weird,)
 
 
@@ -1464,8 +1460,8 @@ def test_collect_pre_commit_changes_no_diff_filter_flag(monkeypatch):
     fake = _FakeGitRun(
         {_PRE_COMMIT_DIFF: (0, "crates/ironmem/src/deleted.rs\0")}
     )
-    monkeypatch.setattr(hook.subprocess, "run", fake)
-    hook.collect_pre_commit_changes()
+    monkeypatch.setattr(subprocess, "run", fake)
+    collect.collect_pre_commit_changes()
     assert fake.calls == [_PRE_COMMIT_DIFF]
 
 
@@ -1482,12 +1478,12 @@ def test_staged_deletion_of_rust_path_is_collected_and_selects_rust_gates(monkey
     fake = _FakeGitRun(
         {_PRE_COMMIT_DIFF: (0, "crates/ironmem/src/deleted.rs\0")}
     )
-    monkeypatch.setattr(hook.subprocess, "run", fake)
-    changes = hook.collect_pre_commit_changes()
-    assert changes == hook.ChangeSet(
+    monkeypatch.setattr(subprocess, "run", fake)
+    changes = collect.collect_pre_commit_changes()
+    assert changes == manifest.ChangeSet(
         paths=("crates/ironmem/src/deleted.rs",), unknown=False, reason=None
     )
-    names = [gate.name for gate in hook.resolve_gates(hook.PHASE_PRE_COMMIT, changes)]
+    names = [gate.name for gate in manifest.resolve_gates(manifest.PHASE_PRE_COMMIT, changes)]
     assert "rust_fmt_check" in names
     assert "rust_clippy" in names
 
@@ -1498,7 +1494,7 @@ def test_staged_deletion_of_rust_path_is_collected_and_selects_rust_gates(monkey
 def test_run_git_reason_includes_full_argv_not_just_the_subcommand():
     args = _PRE_COMMIT_DIFF
     fake = _FakeGitRun({args: OSError("boom")})
-    ok, _rc, _stdout, reason = _call_with_fake_run(fake, hook._run_git, args)
+    ok, _rc, _stdout, reason = _call_with_fake_run(fake, collect._run_git, args)
     assert ok is False
     for token in args:
         assert token in reason
@@ -1509,7 +1505,7 @@ def test_run_git_reason_includes_the_exception_message():
     # when only the class name is recorded.
     args = _PRE_COMMIT_DIFF
     fake = _FakeGitRun({args: PermissionError("permission denied: /usr/bin/git")})
-    _ok, _rc, _stdout, reason = _call_with_fake_run(fake, hook._run_git, args)
+    _ok, _rc, _stdout, reason = _call_with_fake_run(fake, collect._run_git, args)
     assert "PermissionError" in reason
     assert "permission denied: /usr/bin/git" in reason
 
@@ -1517,22 +1513,22 @@ def test_run_git_reason_includes_the_exception_message():
 def test_run_git_passes_a_timeout():
     args = _PRE_COMMIT_DIFF
     recorder = _KwargRecordingRun()
-    _call_with_fake_run(recorder, hook._run_git, args)
-    assert recorder.kwargs[0]["timeout"] == hook._GIT_TIMEOUT_SECONDS
+    _call_with_fake_run(recorder, collect._run_git, args)
+    assert recorder.kwargs[0]["timeout"] == runtime._GIT_TIMEOUT_SECONDS
 
 
 def test_legacy_git_helper_passes_a_timeout():
     recorder = _KwargRecordingRun()
-    _call_with_fake_run(recorder, hook.git, ["rev-parse", "--verify", "@{u}"], check=False)
-    assert recorder.kwargs[0]["timeout"] == hook._GIT_TIMEOUT_SECONDS
+    _call_with_fake_run(recorder, collect.git, ["rev-parse", "--verify", "@{u}"], check=False)
+    assert recorder.kwargs[0]["timeout"] == runtime._GIT_TIMEOUT_SECONDS
 
 
 def test_collect_pre_commit_changes_timeout_is_fail_closed(monkeypatch):
     # A hung git must escalate, never present as "nothing staged".
     args = _PRE_COMMIT_DIFF
     fake = _FakeGitRun({args: subprocess.TimeoutExpired(["git", *args], 60)})
-    monkeypatch.setattr(hook.subprocess, "run", fake)
-    changes = hook.collect_pre_commit_changes()
+    monkeypatch.setattr(subprocess, "run", fake)
+    changes = collect.collect_pre_commit_changes()
     assert changes.unknown is True
     assert "TimeoutExpired" in changes.reason
 
@@ -1549,12 +1545,12 @@ class _KwargRecordingRun:
 
 
 def _call_with_fake_run(fake, func, *args, **kwargs):
-    real = hook.subprocess.run
-    hook.subprocess.run = fake
+    real = subprocess.run
+    subprocess.run = fake
     try:
         return func(*args, **kwargs)
     finally:
-        hook.subprocess.run = real
+        subprocess.run = real
 
 
 # --- collection layer runs with a scrubbed GIT_* env ------------------------
@@ -1600,8 +1596,8 @@ def _poison_git_env(monkeypatch):
 def test_collect_pre_commit_changes_scrubs_repo_redirecting_git_env(monkeypatch):
     _poison_git_env(monkeypatch)
     fake = _EnvRecordingGitRun("a.py\0")
-    monkeypatch.setattr(hook.subprocess, "run", fake)
-    hook.collect_pre_commit_changes()
+    monkeypatch.setattr(subprocess, "run", fake)
+    collect.collect_pre_commit_changes()
     assert fake.envs, "collection layer made no subprocess call"
     for env in fake.envs:
         assert env is not None, "collection layer inherited the ambient env"
@@ -1614,8 +1610,8 @@ def test_collect_pre_push_changes_scrubs_repo_redirecting_git_env(monkeypatch):
     _poison_git_env(monkeypatch)
     stdin = _pre_push_line("refs/heads/feature", SHA_B, "refs/heads/feature", SHA_A) + "\n"
     fake = _EnvRecordingGitRun("a.py\0")
-    monkeypatch.setattr(hook.subprocess, "run", fake)
-    hook.collect_pre_push_changes(stdin)
+    monkeypatch.setattr(subprocess, "run", fake)
+    collect.collect_pre_push_changes(stdin)
     assert fake.envs
     for env in fake.envs:
         assert env is not None
@@ -1629,8 +1625,8 @@ def test_legacy_git_helper_scrubs_repo_redirecting_git_env(monkeypatch):
     # invocation inherits the same redirection.
     _poison_git_env(monkeypatch)
     fake = _EnvRecordingGitRun("")
-    monkeypatch.setattr(hook.subprocess, "run", fake)
-    hook.git(["rev-parse", "--verify", "@{u}"], check=False)
+    monkeypatch.setattr(subprocess, "run", fake)
+    collect.git(["rev-parse", "--verify", "@{u}"], check=False)
     assert fake.envs
     for env in fake.envs:
         assert env is not None
@@ -1644,8 +1640,8 @@ def test_collection_layer_env_keeps_ssh_auth_variables(monkeypatch):
     _poison_git_env(monkeypatch)
     monkeypatch.setenv("GIT_SSH_COMMAND", "ssh -i /key")
     fake = _EnvRecordingGitRun("")
-    monkeypatch.setattr(hook.subprocess, "run", fake)
-    hook.collect_pre_commit_changes()
+    monkeypatch.setattr(subprocess, "run", fake)
+    collect.collect_pre_commit_changes()
     assert fake.envs[0]["GIT_SSH_COMMAND"] == "ssh -i /key"
 
 
@@ -1664,10 +1660,10 @@ def test_collect_pre_commit_changes_disables_rename_detection(monkeypatch):
             )
         }
     )
-    monkeypatch.setattr(hook.subprocess, "run", fake)
-    changes = hook.collect_pre_commit_changes()
+    monkeypatch.setattr(subprocess, "run", fake)
+    changes = collect.collect_pre_commit_changes()
     assert "crates/ironmem/src/foo.rs" in changes.paths
-    names = [gate.name for gate in hook.resolve_gates(hook.PHASE_PRE_COMMIT, changes)]
+    names = [gate.name for gate in manifest.resolve_gates(manifest.PHASE_PRE_COMMIT, changes)]
     assert "rust_fmt_check" in names
     assert "rust_clippy" in names
 
@@ -1678,9 +1674,9 @@ def test_collect_pre_commit_changes_disables_rename_detection(monkeypatch):
 def test_collect_pre_push_changes_single_update(monkeypatch):
     stdin = _pre_push_line("refs/heads/feature", SHA_B, "refs/heads/feature", SHA_A) + "\n"
     fake = _FakeGitRun({_range_diff(SHA_A, SHA_B): (0, "x.py\0y.py\0")})
-    monkeypatch.setattr(hook.subprocess, "run", fake)
-    changes = hook.collect_pre_push_changes(stdin)
-    assert changes == hook.ChangeSet(paths=("x.py", "y.py"), unknown=False, reason=None)
+    monkeypatch.setattr(subprocess, "run", fake)
+    changes = collect.collect_pre_push_changes(stdin)
+    assert changes == manifest.ChangeSet(paths=("x.py", "y.py"), unknown=False, reason=None)
 
 
 def test_collect_pre_push_changes_disables_rename_detection(monkeypatch):
@@ -1696,10 +1692,10 @@ def test_collect_pre_push_changes_disables_rename_detection(monkeypatch):
             )
         }
     )
-    monkeypatch.setattr(hook.subprocess, "run", fake)
-    changes = hook.collect_pre_push_changes(stdin)
+    monkeypatch.setattr(subprocess, "run", fake)
+    changes = collect.collect_pre_push_changes(stdin)
     assert "crates/ironmem/src/foo.rs" in changes.paths
-    names = [gate.name for gate in hook.resolve_gates(hook.PHASE_PRE_PUSH, changes)]
+    names = [gate.name for gate in manifest.resolve_gates(manifest.PHASE_PRE_PUSH, changes)]
     assert "rust_test" in names
 
 
@@ -1717,8 +1713,8 @@ def test_collect_pre_push_branch_creation_diff_tree_disables_rename_detection(mo
             _root_diff(SHA_B): (0, "crates/ironmem/src/foo.rs\0"),
         }
     )
-    monkeypatch.setattr(hook.subprocess, "run", fake)
-    changes = hook.collect_pre_push_changes(stdin)
+    monkeypatch.setattr(subprocess, "run", fake)
+    changes = collect.collect_pre_push_changes(stdin)
     assert changes.paths == ("crates/ironmem/src/foo.rs",)
 
 
@@ -1738,8 +1734,8 @@ def test_collect_pre_push_changes_multi_ref_dedupes_first_seen(monkeypatch):
             _range_diff(SHA_A, SHA_C): (0, "shared.py\0z.py\0"),
         }
     )
-    monkeypatch.setattr(hook.subprocess, "run", fake)
-    changes = hook.collect_pre_push_changes(stdin)
+    monkeypatch.setattr(subprocess, "run", fake)
+    changes = collect.collect_pre_push_changes(stdin)
     assert changes.paths == ("x.py", "shared.py", "z.py")
     assert changes.unknown is False
 
@@ -1747,9 +1743,9 @@ def test_collect_pre_push_changes_multi_ref_dedupes_first_seen(monkeypatch):
 def test_collect_pre_push_changes_skips_deletion_ref(monkeypatch):
     stdin = _pre_push_line("refs/heads/gone", ZERO_SHA_1, "refs/heads/gone", SHA_A) + "\n"
     fake = _FakeGitRun({})  # no git diff call should happen at all
-    monkeypatch.setattr(hook.subprocess, "run", fake)
-    changes = hook.collect_pre_push_changes(stdin)
-    assert changes == hook.ChangeSet(paths=(), unknown=False, reason=None)
+    monkeypatch.setattr(subprocess, "run", fake)
+    changes = collect.collect_pre_push_changes(stdin)
+    assert changes == manifest.ChangeSet(paths=(), unknown=False, reason=None)
     assert fake.calls == []
 
 
@@ -1757,9 +1753,9 @@ def test_collect_pre_push_changes_skips_sha256_deletion_ref(monkeypatch):
     sha256_remote = "a" * 64
     stdin = _pre_push_line("refs/heads/gone", ZERO_SHA_256, "refs/heads/gone", sha256_remote) + "\n"
     fake = _FakeGitRun({})  # no git diff call should happen at all
-    monkeypatch.setattr(hook.subprocess, "run", fake)
-    changes = hook.collect_pre_push_changes(stdin)
-    assert changes == hook.ChangeSet(paths=(), unknown=False, reason=None)
+    monkeypatch.setattr(subprocess, "run", fake)
+    changes = collect.collect_pre_push_changes(stdin)
+    assert changes == manifest.ChangeSet(paths=(), unknown=False, reason=None)
     assert fake.calls == []
 
 
@@ -1775,9 +1771,9 @@ def test_collect_pre_push_changes_branch_creation_uses_default_base(monkeypatch)
             _range_diff(SHA_A, SHA_B): (0, "new_file.py\0"),
         }
     )
-    monkeypatch.setattr(hook.subprocess, "run", fake)
-    changes = hook.collect_pre_push_changes(stdin)
-    assert changes == hook.ChangeSet(paths=("new_file.py",), unknown=False, reason=None)
+    monkeypatch.setattr(subprocess, "run", fake)
+    changes = collect.collect_pre_push_changes(stdin)
+    assert changes == manifest.ChangeSet(paths=("new_file.py",), unknown=False, reason=None)
 
 
 def test_collect_pre_push_changes_sha256_branch_creation_uses_default_base(monkeypatch):
@@ -1794,9 +1790,9 @@ def test_collect_pre_push_changes_sha256_branch_creation_uses_default_base(monke
             _range_diff(sha256_base, sha256_local): (0, "new_file.py\0"),
         }
     )
-    monkeypatch.setattr(hook.subprocess, "run", fake)
-    changes = hook.collect_pre_push_changes(stdin)
-    assert changes == hook.ChangeSet(paths=("new_file.py",), unknown=False, reason=None)
+    monkeypatch.setattr(subprocess, "run", fake)
+    changes = collect.collect_pre_push_changes(stdin)
+    assert changes == manifest.ChangeSet(paths=("new_file.py",), unknown=False, reason=None)
 
 
 def test_collect_pre_push_changes_missing_upstream_falls_back_to_root_diff(monkeypatch):
@@ -1814,16 +1810,16 @@ def test_collect_pre_push_changes_missing_upstream_falls_back_to_root_diff(monke
             ),
         }
     )
-    monkeypatch.setattr(hook.subprocess, "run", fake)
-    changes = hook.collect_pre_push_changes(stdin)
-    assert changes == hook.ChangeSet(paths=("root.py",), unknown=False, reason=None)
+    monkeypatch.setattr(subprocess, "run", fake)
+    changes = collect.collect_pre_push_changes(stdin)
+    assert changes == manifest.ChangeSet(paths=("root.py",), unknown=False, reason=None)
 
 
 def test_collect_pre_push_changes_empty_stdin_is_not_unknown(monkeypatch):
     fake = _FakeGitRun({})
-    monkeypatch.setattr(hook.subprocess, "run", fake)
-    changes = hook.collect_pre_push_changes("")
-    assert changes == hook.ChangeSet(paths=(), unknown=False, reason=None)
+    monkeypatch.setattr(subprocess, "run", fake)
+    changes = collect.collect_pre_push_changes("")
+    assert changes == manifest.ChangeSet(paths=(), unknown=False, reason=None)
     assert fake.calls == []
 
 
@@ -1846,8 +1842,8 @@ def test_collect_pre_push_changes_git_failure_mid_batch_preserves_prior_paths(mo
             _range_diff(SHA_A, SHA_C): (128, ""),
         }
     )
-    monkeypatch.setattr(hook.subprocess, "run", fake)
-    changes = hook.collect_pre_push_changes(stdin)
+    monkeypatch.setattr(subprocess, "run", fake)
+    changes = collect.collect_pre_push_changes(stdin)
     # Whatever was collected before the failure is preserved -- never wiped
     # back to an empty tuple.
     assert changes.paths == ("x.py",)
@@ -1858,8 +1854,8 @@ def test_collect_pre_push_changes_git_failure_mid_batch_preserves_prior_paths(mo
 def test_collect_pre_push_changes_subprocess_failure_is_unknown_never_raises(monkeypatch):
     stdin = _pre_push_line("refs/heads/a", SHA_B, "refs/heads/a", SHA_A) + "\n"
     fake = _FakeGitRun({_range_diff(SHA_A, SHA_B): OSError("boom")})
-    monkeypatch.setattr(hook.subprocess, "run", fake)
-    changes = hook.collect_pre_push_changes(stdin)
+    monkeypatch.setattr(subprocess, "run", fake)
+    changes = collect.collect_pre_push_changes(stdin)
     assert changes.paths == ()
     assert changes.unknown is True
     assert changes.reason
@@ -1881,8 +1877,8 @@ def test_collect_pre_push_changes_subprocess_failure_is_unknown_never_raises(mon
 )
 def test_collect_pre_push_changes_malformed_stdin_is_unknown_never_raises(monkeypatch, stdin):
     fake = _FakeGitRun({})
-    monkeypatch.setattr(hook.subprocess, "run", fake)
-    changes = hook.collect_pre_push_changes(stdin)
+    monkeypatch.setattr(subprocess, "run", fake)
+    changes = collect.collect_pre_push_changes(stdin)
     assert changes.unknown is True
     assert changes.reason
     # Malformed input is rejected before any Git call is attempted.
@@ -1915,7 +1911,11 @@ def test_legacy_pre_task6_functions_are_removed():
         "staged_paths",
         "pushed_paths",
     ):
-        assert not hasattr(hook, name), f"{name} should have been retired in Task 6"
+        for module in (cli, manifest, collect, execute, runtime):
+            assert not hasattr(module, name), (
+                f"{name} should have been retired in Task 6, found on "
+                f"{module.__name__}"
+            )
 
 
 # --- Task 5: execution layer -- hardened subprocess contract --------------
@@ -1950,7 +1950,7 @@ class _FakeGateRun:
 
 
 def _only_rust_changes():
-    return hook.ChangeSet(
+    return manifest.ChangeSet(
         paths=("crates/ironmem/src/hook.rs",), unknown=False, reason=None
     )
 
@@ -1974,8 +1974,8 @@ def test_execute_gates_runs_only_selected_gates_in_manifest_order(monkeypatch):
             ): 0,
         }
     )
-    monkeypatch.setattr(hook.subprocess, "run", fake)
-    rc = hook.execute_gates(hook.PHASE_PRE_COMMIT, _only_rust_changes())
+    monkeypatch.setattr(subprocess, "run", fake)
+    rc = execute.execute_gates(manifest.PHASE_PRE_COMMIT, _only_rust_changes())
     assert rc == 0
     assert [cmd for cmd, _kwargs in fake.calls] == [
         ["cargo", "fmt", "--all", "--", "--check"],
@@ -1994,9 +1994,9 @@ def test_execute_gates_runs_only_selected_gates_in_manifest_order(monkeypatch):
 
 def test_execute_gates_returns_zero_when_nothing_selected(monkeypatch):
     fake = _FakeGateRun({})
-    monkeypatch.setattr(hook.subprocess, "run", fake)
-    changes = hook.ChangeSet(paths=("README.md",), unknown=False, reason=None)
-    rc = hook.execute_gates(hook.PHASE_PRE_COMMIT, changes)
+    monkeypatch.setattr(subprocess, "run", fake)
+    changes = manifest.ChangeSet(paths=("README.md",), unknown=False, reason=None)
+    rc = execute.execute_gates(manifest.PHASE_PRE_COMMIT, changes)
     assert rc == 0
     assert fake.calls == []
 
@@ -2020,12 +2020,12 @@ def test_execute_gates_calls_subprocess_run_with_exact_contract(monkeypatch):
             ): 0,
         }
     )
-    monkeypatch.setattr(hook.subprocess, "run", fake)
-    hook.execute_gates(hook.PHASE_PRE_COMMIT, _only_rust_changes())
+    monkeypatch.setattr(subprocess, "run", fake)
+    execute.execute_gates(manifest.PHASE_PRE_COMMIT, _only_rust_changes())
     cmd, kwargs = fake.calls[0]
     assert cmd == ["cargo", "fmt", "--all", "--", "--check"]
     assert kwargs.get("shell") is False
-    assert kwargs.get("cwd") == hook.ROOT
+    assert kwargs.get("cwd") == runtime.ROOT
     assert kwargs.get("check") is False
     assert "env" in kwargs
 
@@ -2049,8 +2049,8 @@ def test_execute_gates_stops_at_first_failure_and_propagates_exit_code(monkeypat
             ): 0,
         }
     )
-    monkeypatch.setattr(hook.subprocess, "run", fake)
-    rc = hook.execute_gates(hook.PHASE_PRE_COMMIT, _only_rust_changes())
+    monkeypatch.setattr(subprocess, "run", fake)
+    rc = execute.execute_gates(manifest.PHASE_PRE_COMMIT, _only_rust_changes())
     assert rc == 3
     # rust_clippy must never be invoked once rust_fmt_check has failed.
     assert [cmd for cmd, _kwargs in fake.calls] == [
@@ -2063,15 +2063,15 @@ def test_execute_gates_stops_at_first_failure_and_propagates_exit_code(monkeypat
 
 def test_execute_gates_prints_run_line_for_selected_gate(monkeypatch, capsys):
     fake = _FakeGateRun({("cargo", "fmt", "--all", "--", "--check"): 0})
-    monkeypatch.setattr(hook.subprocess, "run", fake)
-    changes = hook.ChangeSet(
+    monkeypatch.setattr(subprocess, "run", fake)
+    changes = manifest.ChangeSet(
         paths=("crates/ironmem/src/hook.rs",), unknown=False, reason=None
     )
     # Restrict to a single-gate manifest slice so this test only proves the
     # run-line, not interactions with the rest of the real manifest.
-    fmt_gate = next(gate for gate in hook.GATES if gate.name == "rust_fmt_check")
-    monkeypatch.setattr(hook, "GATES", (fmt_gate,))
-    hook.execute_gates(hook.PHASE_PRE_COMMIT, changes)
+    fmt_gate = next(gate for gate in manifest.GATES if gate.name == "rust_fmt_check")
+    monkeypatch.setattr(manifest, "GATES", (fmt_gate,))
+    execute.execute_gates(manifest.PHASE_PRE_COMMIT, changes)
     out = capsys.readouterr().out
     # Exact output, not a substring check -- the task calls the per-gate
     # format deterministic, so the test should pin the literal bytes rather
@@ -2084,13 +2084,13 @@ def test_execute_gates_prints_run_line_for_selected_gate(monkeypatch, capsys):
 
 def test_execute_gates_prints_skip_line_with_surfaces_not_touched(monkeypatch, capsys):
     fake = _FakeGateRun({})
-    monkeypatch.setattr(hook.subprocess, "run", fake)
+    monkeypatch.setattr(subprocess, "run", fake)
     collab_gate = next(
-        gate for gate in hook.GATES if gate.name == "collab_template_lint"
+        gate for gate in manifest.GATES if gate.name == "collab_template_lint"
     )
-    monkeypatch.setattr(hook, "GATES", (collab_gate,))
-    changes = hook.ChangeSet(paths=(), unknown=False, reason=None)
-    hook.execute_gates(hook.PHASE_PRE_COMMIT, changes)
+    monkeypatch.setattr(manifest, "GATES", (collab_gate,))
+    changes = manifest.ChangeSet(paths=(), unknown=False, reason=None)
+    execute.execute_gates(manifest.PHASE_PRE_COMMIT, changes)
     out = capsys.readouterr().out
     # Exact output, not three substring checks. The per-gate format is a
     # deterministic contract, and the substring form passed against output
@@ -2114,13 +2114,13 @@ def test_execute_gates_skip_line_lists_surfaces_deterministically(monkeypatch, c
     # test__ordered_surfaces_returns_declaration_order below, which drives
     # _ordered_surfaces directly with a genuinely multi-element frozenset.
     fake = _FakeGateRun({})
-    monkeypatch.setattr(hook.subprocess, "run", fake)
-    hook_gate = next(gate for gate in hook.GATES if gate.name == "hook_self_test")
-    monkeypatch.setattr(hook, "GATES", (hook_gate,))
-    changes = hook.ChangeSet(paths=(), unknown=False, reason=None)
-    hook.execute_gates(hook.PHASE_PRE_COMMIT, changes)
+    monkeypatch.setattr(subprocess, "run", fake)
+    hook_gate = next(gate for gate in manifest.GATES if gate.name == "hook_self_test")
+    monkeypatch.setattr(manifest, "GATES", (hook_gate,))
+    changes = manifest.ChangeSet(paths=(), unknown=False, reason=None)
+    execute.execute_gates(manifest.PHASE_PRE_COMMIT, changes)
     first = capsys.readouterr().out
-    hook.execute_gates(hook.PHASE_PRE_COMMIT, changes)
+    execute.execute_gates(manifest.PHASE_PRE_COMMIT, changes)
     second = capsys.readouterr().out
     assert first == second
 
@@ -2137,37 +2137,37 @@ def test__ordered_surfaces_returns_declaration_order():
     # surfaces_deterministically cannot provide with a single-element input:
     # this fails if _ordered_surfaces ever regresses to raw frozenset
     # iteration (hash-randomized, not declaration order).
-    surface_ids = frozenset({hook.SURFACE_DOCS, hook.SURFACE_HOOK_SELF_TEST})
-    assert hook._ordered_surfaces(surface_ids) == (
-        hook.SURFACE_HOOK_SELF_TEST,
-        hook.SURFACE_DOCS,
+    surface_ids = frozenset({manifest.SURFACE_DOCS, manifest.SURFACE_HOOK_SELF_TEST})
+    assert manifest._ordered_surfaces(surface_ids) == (
+        manifest.SURFACE_HOOK_SELF_TEST,
+        manifest.SURFACE_DOCS,
     )
 
     all_surfaces = frozenset(
         {
-            hook.SURFACE_DOCS,
-            hook.SURFACE_COLLAB_PROTOCOL,
-            hook.SURFACE_HOOK_SELF_TEST,
-            hook.SURFACE_RUST_WORKSPACE,
+            manifest.SURFACE_DOCS,
+            manifest.SURFACE_COLLAB_PROTOCOL,
+            manifest.SURFACE_HOOK_SELF_TEST,
+            manifest.SURFACE_RUST_WORKSPACE,
         }
     )
-    assert hook._ordered_surfaces(all_surfaces) == (
-        hook.SURFACE_RUST_WORKSPACE,
-        hook.SURFACE_COLLAB_PROTOCOL,
-        hook.SURFACE_HOOK_SELF_TEST,
-        hook.SURFACE_DOCS,
+    assert manifest._ordered_surfaces(all_surfaces) == (
+        manifest.SURFACE_RUST_WORKSPACE,
+        manifest.SURFACE_COLLAB_PROTOCOL,
+        manifest.SURFACE_HOOK_SELF_TEST,
+        manifest.SURFACE_DOCS,
     )
 
 
 def test_execute_gates_prints_fail_line_with_exit_code(monkeypatch, capsys):
     fake = _FakeGateRun({("cargo", "fmt", "--all", "--", "--check"): 7})
-    monkeypatch.setattr(hook.subprocess, "run", fake)
-    fmt_gate = next(gate for gate in hook.GATES if gate.name == "rust_fmt_check")
-    monkeypatch.setattr(hook, "GATES", (fmt_gate,))
-    changes = hook.ChangeSet(
+    monkeypatch.setattr(subprocess, "run", fake)
+    fmt_gate = next(gate for gate in manifest.GATES if gate.name == "rust_fmt_check")
+    monkeypatch.setattr(manifest, "GATES", (fmt_gate,))
+    changes = manifest.ChangeSet(
         paths=("crates/ironmem/src/hook.rs",), unknown=False, reason=None
     )
-    rc = hook.execute_gates(hook.PHASE_PRE_COMMIT, changes)
+    rc = execute.execute_gates(manifest.PHASE_PRE_COMMIT, changes)
     assert rc == 7
     out = capsys.readouterr().out
     # Exact output. `assert "7" in out` was the weakest check in the suite:
@@ -2184,13 +2184,13 @@ def test_execute_gates_normalizes_negative_returncode_from_signal_kill(monkeypat
     # so a downstream `sys.exit(code)` can't land on the wrong exit status
     # via Python's exit-code modulo (sys.exit(-9) -> 247, not -9).
     fake = _FakeGateRun({("cargo", "fmt", "--all", "--", "--check"): -9})
-    monkeypatch.setattr(hook.subprocess, "run", fake)
-    fmt_gate = next(gate for gate in hook.GATES if gate.name == "rust_fmt_check")
-    monkeypatch.setattr(hook, "GATES", (fmt_gate,))
-    changes = hook.ChangeSet(
+    monkeypatch.setattr(subprocess, "run", fake)
+    fmt_gate = next(gate for gate in manifest.GATES if gate.name == "rust_fmt_check")
+    monkeypatch.setattr(manifest, "GATES", (fmt_gate,))
+    changes = manifest.ChangeSet(
         paths=("crates/ironmem/src/hook.rs",), unknown=False, reason=None
     )
-    rc = hook.execute_gates(hook.PHASE_PRE_COMMIT, changes)
+    rc = execute.execute_gates(manifest.PHASE_PRE_COMMIT, changes)
     assert rc == 137
     out = capsys.readouterr().out
     assert out == "[git-hook] rust_fmt_check: run\n[git-hook] rust_fmt_check: fail (137)\n"
@@ -2210,14 +2210,14 @@ def test_execute_gates_missing_gate_binary_prints_fail_line_then_raises(monkeypa
             )
         }
     )
-    monkeypatch.setattr(hook.subprocess, "run", fake)
-    fmt_gate = next(gate for gate in hook.GATES if gate.name == "rust_fmt_check")
-    monkeypatch.setattr(hook, "GATES", (fmt_gate,))
-    changes = hook.ChangeSet(
+    monkeypatch.setattr(subprocess, "run", fake)
+    fmt_gate = next(gate for gate in manifest.GATES if gate.name == "rust_fmt_check")
+    monkeypatch.setattr(manifest, "GATES", (fmt_gate,))
+    changes = manifest.ChangeSet(
         paths=("crates/ironmem/src/hook.rs",), unknown=False, reason=None
     )
     with pytest.raises(FileNotFoundError):
-        hook.execute_gates(hook.PHASE_PRE_COMMIT, changes)
+        execute.execute_gates(manifest.PHASE_PRE_COMMIT, changes)
     out = capsys.readouterr().out
     assert "rust_fmt_check: fail" in out
 
@@ -2227,20 +2227,20 @@ def test_execute_gates_missing_gate_binary_prints_fail_line_then_raises(monkeypa
 
 def test_execute_gates_prints_escalation_reason_when_unknown(monkeypatch, capsys):
     fake = _FakeGateRun({("python3", "scripts/test_run_git_hook.py"): 0})
-    monkeypatch.setattr(hook.subprocess, "run", fake)
-    hook_gate = next(gate for gate in hook.GATES if gate.name == "hook_self_test")
-    monkeypatch.setattr(hook, "GATES", (hook_gate,))
-    changes = hook.ChangeSet(paths=(), unknown=True, reason="git diff failed mid-batch")
-    hook.execute_gates(hook.PHASE_PRE_COMMIT, changes)
+    monkeypatch.setattr(subprocess, "run", fake)
+    hook_gate = next(gate for gate in manifest.GATES if gate.name == "hook_self_test")
+    monkeypatch.setattr(manifest, "GATES", (hook_gate,))
+    changes = manifest.ChangeSet(paths=(), unknown=True, reason="git diff failed mid-batch")
+    execute.execute_gates(manifest.PHASE_PRE_COMMIT, changes)
     out = capsys.readouterr().out
     assert "git diff failed mid-batch" in out
 
 
 def test_execute_gates_no_escalation_line_when_known(monkeypatch, capsys):
     fake = _FakeGateRun({})
-    monkeypatch.setattr(hook.subprocess, "run", fake)
-    changes = hook.ChangeSet(paths=(), unknown=False, reason=None)
-    hook.execute_gates(hook.PHASE_PRE_COMMIT, changes)
+    monkeypatch.setattr(subprocess, "run", fake)
+    changes = manifest.ChangeSet(paths=(), unknown=False, reason=None)
+    execute.execute_gates(manifest.PHASE_PRE_COMMIT, changes)
     out = capsys.readouterr().out
     assert "escalat" not in out.lower()
 
@@ -2256,11 +2256,11 @@ def test_execute_gates_escalation_always_explains_itself(monkeypatch, capsys):
     # guarantee: whenever escalation happens, the reason is printed AND every
     # phase-matching gate still runs.
     fake = _FakeGateRun({("python3", "scripts/test_run_git_hook.py"): 0})
-    monkeypatch.setattr(hook.subprocess, "run", fake)
-    hook_gate = next(gate for gate in hook.GATES if gate.name == "hook_self_test")
-    monkeypatch.setattr(hook, "GATES", (hook_gate,))
-    changes = hook.ChangeSet(paths=(), unknown=True, reason="git diff exited 128")
-    rc = hook.execute_gates(hook.PHASE_PRE_COMMIT, changes)
+    monkeypatch.setattr(subprocess, "run", fake)
+    hook_gate = next(gate for gate in manifest.GATES if gate.name == "hook_self_test")
+    monkeypatch.setattr(manifest, "GATES", (hook_gate,))
+    changes = manifest.ChangeSet(paths=(), unknown=True, reason="git diff exited 128")
+    rc = execute.execute_gates(manifest.PHASE_PRE_COMMIT, changes)
     out = capsys.readouterr().out
     assert "escalating: git diff exited 128" in out
     assert rc == 0
@@ -2274,9 +2274,9 @@ def test_execute_gates_escalation_always_explains_itself(monkeypatch, capsys):
 
 
 def test_execute_gates_unknown_phase_raises():
-    changes = hook.ChangeSet(paths=(), unknown=False, reason=None)
+    changes = manifest.ChangeSet(paths=(), unknown=False, reason=None)
     with pytest.raises(ValueError):
-        hook.execute_gates("typo-phase", changes)
+        execute.execute_gates("typo-phase", changes)
 
 
 # --- Task 9 Part C: a completed run states plainly that it completed ------
@@ -2291,12 +2291,12 @@ def test_execute_gates_unknown_phase_raises():
 
 def test_execute_gates_prints_no_local_gates_required_when_nothing_selected(monkeypatch, capsys):
     fake = _FakeGateRun({})
-    monkeypatch.setattr(hook.subprocess, "run", fake)
+    monkeypatch.setattr(subprocess, "run", fake)
     # Real GATES manifest, all-docs change: every gate is phase-matching but
     # none is selected (docs is inert), so every gate prints a skip line --
     # the plain completion statement must still appear after them.
-    changes = hook.ChangeSet(paths=("README.md",), unknown=False, reason=None)
-    rc = hook.execute_gates(hook.PHASE_PRE_COMMIT, changes)
+    changes = manifest.ChangeSet(paths=("README.md",), unknown=False, reason=None)
+    rc = execute.execute_gates(manifest.PHASE_PRE_COMMIT, changes)
     out = capsys.readouterr().out
     assert rc == 0
     assert out.splitlines()[-1] == "[git-hook] pre-commit: no local gates required"
@@ -2304,11 +2304,11 @@ def test_execute_gates_prints_no_local_gates_required_when_nothing_selected(monk
 
 def test_execute_gates_prints_no_local_gates_required_for_inert_config_only(monkeypatch, capsys):
     fake = _FakeGateRun({})
-    monkeypatch.setattr(hook.subprocess, "run", fake)
-    changes = hook.ChangeSet(
+    monkeypatch.setattr(subprocess, "run", fake)
+    changes = manifest.ChangeSet(
         paths=("crates/ironmem/schema/example.json",), unknown=False, reason=None
     )
-    rc = hook.execute_gates(hook.PHASE_PRE_PUSH, changes)
+    rc = execute.execute_gates(manifest.PHASE_PRE_PUSH, changes)
     out = capsys.readouterr().out
     assert rc == 0
     assert out.splitlines()[-1] == "[git-hook] pre-push: no local gates required"
@@ -2330,8 +2330,8 @@ def test_execute_gates_prints_completion_summary_when_gates_run(monkeypatch, cap
             ): 0,
         }
     )
-    monkeypatch.setattr(hook.subprocess, "run", fake)
-    rc = hook.execute_gates(hook.PHASE_PRE_COMMIT, _only_rust_changes())
+    monkeypatch.setattr(subprocess, "run", fake)
+    rc = execute.execute_gates(manifest.PHASE_PRE_COMMIT, _only_rust_changes())
     out = capsys.readouterr().out
     assert rc == 0
     assert out.splitlines()[-1] == "[git-hook] pre-commit: 2 gate(s) run, 0 failed"
@@ -2341,13 +2341,13 @@ def test_execute_gates_no_completion_line_when_a_gate_fails(monkeypatch, capsys)
     # A failed gate returns early -- the run did not complete, so no
     # completion line (of either flavor) should print.
     fake = _FakeGateRun({("cargo", "fmt", "--all", "--", "--check"): 3})
-    monkeypatch.setattr(hook.subprocess, "run", fake)
-    fmt_gate = next(gate for gate in hook.GATES if gate.name == "rust_fmt_check")
-    monkeypatch.setattr(hook, "GATES", (fmt_gate,))
-    changes = hook.ChangeSet(
+    monkeypatch.setattr(subprocess, "run", fake)
+    fmt_gate = next(gate for gate in manifest.GATES if gate.name == "rust_fmt_check")
+    monkeypatch.setattr(manifest, "GATES", (fmt_gate,))
+    changes = manifest.ChangeSet(
         paths=("crates/ironmem/src/hook.rs",), unknown=False, reason=None
     )
-    rc = hook.execute_gates(hook.PHASE_PRE_COMMIT, changes)
+    rc = execute.execute_gates(manifest.PHASE_PRE_COMMIT, changes)
     out = capsys.readouterr().out
     assert rc == 3
     assert "no local gates required" not in out
@@ -2373,7 +2373,7 @@ def test_scrub_git_env_strips_repo_redirecting_vars():
         "GIT_NAMESPACE": "evil-namespace",
         "PATH": "/usr/bin",
     }
-    scrubbed = hook._scrub_git_env(source)
+    scrubbed = runtime._scrub_git_env(source)
     for dangerous_key in (
         "GIT_DIR",
         "GIT_INDEX_FILE",
@@ -2407,7 +2407,7 @@ def test_scrub_git_env_keeps_explicit_keep_list():
         "GIT_TRACE": "1",
         "GIT_TRACE_PACKET": "1",
     }
-    scrubbed = hook._scrub_git_env(source)
+    scrubbed = runtime._scrub_git_env(source)
     assert scrubbed == source
 
 
@@ -2426,7 +2426,7 @@ def test_scrub_git_env_strips_git_config_star():
         "GIT_CONFIG_SYSTEM": "/tmp/evil/gitconfig",
         "PATH": "/usr/bin",
     }
-    scrubbed = hook._scrub_git_env(source)
+    scrubbed = runtime._scrub_git_env(source)
     for dangerous_key in (
         "GIT_CONFIG_COUNT",
         "GIT_CONFIG_KEY_0",
@@ -2442,7 +2442,7 @@ def test_scrub_git_env_strips_unlisted_git_var_not_yet_enumerated():
     # Default-toward-scrubbing: an unrecognized GIT_* variable not in the
     # keep-list must be dropped, not silently passed through.
     source = {"GIT_SOME_FUTURE_FLAG": "danger", "PATH": "/usr/bin"}
-    scrubbed = hook._scrub_git_env(source)
+    scrubbed = runtime._scrub_git_env(source)
     assert "GIT_SOME_FUTURE_FLAG" not in scrubbed
     assert scrubbed["PATH"] == "/usr/bin"
 
@@ -2476,7 +2476,7 @@ def test_scrub_git_env_passes_ambient_config_vars_through_by_design():
         "XDG_CONFIG_HOME": "/tmp/evil/config",
         "PATH": "/tmp/evil/bin",
     }
-    assert hook._scrub_git_env(source) == source
+    assert runtime._scrub_git_env(source) == source
 
 
 def test_scrub_git_env_strips_every_var_git_injects_into_a_hook():
@@ -2493,7 +2493,7 @@ def test_scrub_git_env_strips_every_var_git_injects_into_a_hook():
         "GIT_PREFIX": "subdir/",
         "GIT_EXEC_PATH": "/tmp/evil/git-core",
     }
-    scrubbed = hook._scrub_git_env({**git_injected, "PATH": "/usr/bin"})
+    scrubbed = runtime._scrub_git_env({**git_injected, "PATH": "/usr/bin"})
     leaked = sorted(key for key in git_injected if key in scrubbed)
     assert not leaked, f"Git-injected variable(s) {leaked} leaked into the child env"
     assert scrubbed["PATH"] == "/usr/bin"
@@ -2502,7 +2502,7 @@ def test_scrub_git_env_strips_every_var_git_injects_into_a_hook():
 def test_scrub_git_env_returns_new_dict_never_mutates_source():
     source = {"GIT_DIR": "/tmp/evil", "PATH": "/usr/bin"}
     original = dict(source)
-    hook._scrub_git_env(source)
+    runtime._scrub_git_env(source)
     assert source == original
 
 
@@ -2515,13 +2515,13 @@ def test_execute_gates_scrubs_git_env_before_running_a_gate(monkeypatch):
     monkeypatch.setenv("GIT_WORK_TREE", "/tmp/evil")
     monkeypatch.setenv("GIT_ASKPASS", "/usr/bin/askpass")
     fake = _FakeGateRun({("cargo", "fmt", "--all", "--", "--check"): 0})
-    monkeypatch.setattr(hook.subprocess, "run", fake)
-    fmt_gate = next(gate for gate in hook.GATES if gate.name == "rust_fmt_check")
-    monkeypatch.setattr(hook, "GATES", (fmt_gate,))
-    changes = hook.ChangeSet(
+    monkeypatch.setattr(subprocess, "run", fake)
+    fmt_gate = next(gate for gate in manifest.GATES if gate.name == "rust_fmt_check")
+    monkeypatch.setattr(manifest, "GATES", (fmt_gate,))
+    changes = manifest.ChangeSet(
         paths=("crates/ironmem/src/hook.rs",), unknown=False, reason=None
     )
-    hook.execute_gates(hook.PHASE_PRE_COMMIT, changes)
+    execute.execute_gates(manifest.PHASE_PRE_COMMIT, changes)
     _cmd, kwargs = fake.calls[0]
     child_env = kwargs["env"]
     assert "GIT_DIR" not in child_env
@@ -2598,8 +2598,8 @@ def test_main_pre_commit_rust_only_change_runs_exact_gate_sequence(monkeypatch):
             _RUST_CLIPPY_ARGV: 0,
         }
     )
-    monkeypatch.setattr(hook.subprocess, "run", fake)
-    rc = hook.main(hook.PHASE_PRE_COMMIT)
+    monkeypatch.setattr(subprocess, "run", fake)
+    rc = cli.main(manifest.PHASE_PRE_COMMIT)
     assert rc == 0
     assert fake.calls == [
         ["git", "diff", "--cached", "--name-only", "--no-renames", "-z"],
@@ -2619,9 +2619,9 @@ def test_main_pre_push_rust_only_change_runs_exact_gate_sequence(monkeypatch):
             _RUST_TEST_ARGV: 0,
         }
     )
-    monkeypatch.setattr(hook.subprocess, "run", fake)
+    monkeypatch.setattr(subprocess, "run", fake)
     monkeypatch.setattr(sys, "stdin", _StdinStub(stdin))
-    rc = hook.main(hook.PHASE_PRE_PUSH)
+    rc = cli.main(manifest.PHASE_PRE_PUSH)
     assert rc == 0
     assert fake.calls == [
         ["git", "diff", "--name-only", "--no-renames", "-z", f"{SHA_A}..{SHA_B}"],
@@ -2656,8 +2656,8 @@ def test_main_pre_commit_git_failure_escalates_to_every_gate_never_zero_gates_ru
             _RUST_CLIPPY_ARGV: 0,
         }
     )
-    monkeypatch.setattr(hook.subprocess, "run", fake)
-    rc = hook.main(hook.PHASE_PRE_COMMIT)
+    monkeypatch.setattr(subprocess, "run", fake)
+    rc = cli.main(manifest.PHASE_PRE_COMMIT)
     out = capsys.readouterr().out
     assert rc == 0
     assert "escalating" in out
@@ -2681,8 +2681,8 @@ def test_main_pre_commit_git_failure_escalated_gate_failure_is_nonzero_exit(monk
             _HOOK_SELF_TEST_ARGV: 1,
         }
     )
-    monkeypatch.setattr(hook.subprocess, "run", fake)
-    rc = hook.main(hook.PHASE_PRE_COMMIT)
+    monkeypatch.setattr(subprocess, "run", fake)
+    rc = cli.main(manifest.PHASE_PRE_COMMIT)
     assert rc == 1
 
 
@@ -2696,9 +2696,9 @@ def test_main_pre_push_git_failure_escalates_to_every_gate(monkeypatch, capsys):
             _RUST_TEST_ARGV: 0,
         }
     )
-    monkeypatch.setattr(hook.subprocess, "run", fake)
+    monkeypatch.setattr(subprocess, "run", fake)
     monkeypatch.setattr(sys, "stdin", _StdinStub(stdin))
-    rc = hook.main(hook.PHASE_PRE_PUSH)
+    rc = cli.main(manifest.PHASE_PRE_PUSH)
     out = capsys.readouterr().out
     assert rc == 0
     assert "escalating" in out
@@ -2717,9 +2717,9 @@ def test_main_unknown_phase_raises_before_any_io(monkeypatch):
     def poison(cmd, **kwargs):
         raise AssertionError(f"unexpected subprocess.run call: {cmd}")
 
-    monkeypatch.setattr(hook.subprocess, "run", poison)
+    monkeypatch.setattr(subprocess, "run", poison)
     with pytest.raises(ValueError):
-        hook.main("typo-phase")
+        cli.main("typo-phase")
 
 
 # --- main("pre-push") -- @{u} fallback for manual/direct invocation -------
@@ -2747,9 +2747,9 @@ def test_main_pre_push_manual_invocation_falls_back_to_upstream(monkeypatch):
             _RUST_TEST_ARGV: 0,
         }
     )
-    monkeypatch.setattr(hook.subprocess, "run", fake)
+    monkeypatch.setattr(subprocess, "run", fake)
     monkeypatch.setattr(sys, "stdin", _StdinStub(""))
-    rc = hook.main(hook.PHASE_PRE_PUSH)
+    rc = cli.main(manifest.PHASE_PRE_PUSH)
     assert rc == 0
     assert fake.calls == [
         ["git", "rev-parse", "--verify", "@{u}"],
@@ -2771,9 +2771,9 @@ def test_main_pre_push_whitespace_only_stdin_escalates_and_never_reaches_fallbac
     fake = _FakeSubprocessRun(
         {_HOOK_SELF_TEST_ARGV: 0, _COLLAB_LINT_ARGV: 0, _RUST_TEST_ARGV: 0}
     )
-    monkeypatch.setattr(hook.subprocess, "run", fake)
+    monkeypatch.setattr(subprocess, "run", fake)
     monkeypatch.setattr(sys, "stdin", _StdinStub("   \n"))
-    rc = hook.main(hook.PHASE_PRE_PUSH)
+    rc = cli.main(manifest.PHASE_PRE_PUSH)
     out = capsys.readouterr().out
     assert rc == 0
     assert "[git-hook] escalating: malformed pre-push stdin line 1" in out
@@ -2790,9 +2790,9 @@ def test_main_pre_push_whitespace_only_stdin_escalates_and_never_reaches_fallbac
 
 def test_main_pre_push_manual_invocation_no_upstream_runs_no_gates(monkeypatch):
     fake = _FakeSubprocessRun({("git", "rev-parse", "--verify", "@{u}"): (128, "")})
-    monkeypatch.setattr(hook.subprocess, "run", fake)
+    monkeypatch.setattr(subprocess, "run", fake)
     monkeypatch.setattr(sys, "stdin", _StdinStub(""))
-    rc = hook.main(hook.PHASE_PRE_PUSH)
+    rc = cli.main(manifest.PHASE_PRE_PUSH)
     assert rc == 0
     assert fake.calls == [["git", "rev-parse", "--verify", "@{u}"]]
 
@@ -2809,10 +2809,10 @@ def test_main_pre_push_manual_invocation_upstream_diff_failure_raises_systemexit
             ("git", "diff", "--name-only", "--no-renames", "-z", f"{SHA_A}..HEAD"): (128, ""),
         }
     )
-    monkeypatch.setattr(hook.subprocess, "run", fake)
+    monkeypatch.setattr(subprocess, "run", fake)
     monkeypatch.setattr(sys, "stdin", _StdinStub(""))
     with pytest.raises(SystemExit):
-        hook.main(hook.PHASE_PRE_PUSH)
+        cli.main(manifest.PHASE_PRE_PUSH)
 
 
 def test_main_pre_push_with_stdin_paths_never_triggers_upstream_fallback(monkeypatch):
@@ -2820,9 +2820,9 @@ def test_main_pre_push_with_stdin_paths_never_triggers_upstream_fallback(monkeyp
     fake = _FakeSubprocessRun(
         {("git", *_range_diff(SHA_A, SHA_B)): (0, "README.md\0")}
     )
-    monkeypatch.setattr(hook.subprocess, "run", fake)
+    monkeypatch.setattr(subprocess, "run", fake)
     monkeypatch.setattr(sys, "stdin", _StdinStub(stdin))
-    rc = hook.main(hook.PHASE_PRE_PUSH)
+    rc = cli.main(manifest.PHASE_PRE_PUSH)
     assert rc == 0
     # Non-empty paths (even docs-only, which selects zero gates) must never
     # trigger the @{u} fallback -- it is reserved for the genuinely-empty
@@ -2846,9 +2846,9 @@ def test_main_pre_push_deletion_only_push_does_not_trigger_upstream_fallback(mon
     # nothing to diff for a pure ref deletion.
     stdin = _pre_push_line("refs/heads/gone", ZERO_SHA_1, "refs/heads/gone", SHA_A) + "\n"
     fake = _FakeSubprocessRun({})  # no git call of any kind is expected
-    monkeypatch.setattr(hook.subprocess, "run", fake)
+    monkeypatch.setattr(subprocess, "run", fake)
     monkeypatch.setattr(sys, "stdin", _StdinStub(stdin))
-    rc = hook.main(hook.PHASE_PRE_PUSH)
+    rc = cli.main(manifest.PHASE_PRE_PUSH)
     assert rc == 0
     assert fake.calls == []
 
@@ -2869,20 +2869,20 @@ def test_cli_main_missing_argument_prints_usage_and_returns_2(monkeypatch, capsy
     def poison(cmd, **kwargs):
         raise AssertionError(f"unexpected subprocess.run call: {cmd}")
 
-    monkeypatch.setattr(hook.subprocess, "run", poison)
-    assert hook._cli_main(["scripts/run_git_hook.py"]) == 2
+    monkeypatch.setattr(subprocess, "run", poison)
+    assert cli._cli_main(["scripts/run_git_hook.py"]) == 2
     err = capsys.readouterr().err
     assert err == "usage: scripts/run_git_hook.py <pre-commit|pre-push>\n"
 
 
 def test_cli_main_bad_argument_prints_usage_and_returns_2(capsys):
-    assert hook._cli_main(["scripts/run_git_hook.py", "typo-phase"]) == 2
+    assert cli._cli_main(["scripts/run_git_hook.py", "typo-phase"]) == 2
     err = capsys.readouterr().err
     assert err == "usage: scripts/run_git_hook.py <pre-commit|pre-push>\n"
 
 
 def test_cli_main_extra_arguments_prints_usage_and_returns_2(capsys):
-    assert hook._cli_main(["scripts/run_git_hook.py", "pre-commit", "extra"]) == 2
+    assert cli._cli_main(["scripts/run_git_hook.py", "pre-commit", "extra"]) == 2
 
 
 def test_cli_main_valid_phase_delegates_to_main(monkeypatch):
@@ -2892,21 +2892,94 @@ def test_cli_main_valid_phase_delegates_to_main(monkeypatch):
         calls.append(phase)
         return 0
 
-    monkeypatch.setattr(hook, "main", fake_main)
-    assert hook._cli_main(["scripts/run_git_hook.py", "pre-commit"]) == 0
+    monkeypatch.setattr(cli, "main", fake_main)
+    assert cli._cli_main(["scripts/run_git_hook.py", "pre-commit"]) == 0
     assert calls == ["pre-commit"]
 
 
 def test_cli_main_propagates_main_exit_code(monkeypatch):
-    monkeypatch.setattr(hook, "main", lambda phase: 3)
-    assert hook._cli_main(["scripts/run_git_hook.py", "pre-push"]) == 3
+    monkeypatch.setattr(cli, "main", lambda phase: 3)
+    assert cli._cli_main(["scripts/run_git_hook.py", "pre-push"]) == 3
 
 
 # --- module-wide static guard -----------------------------------------------
 
 
+def test_script_entry_point_is_wired_as_a_subprocess():
+    # Every other test calls main()/_cli_main() in-process, so a
+    # `run_git_hook.py` missing its `if __name__ == "__main__"` block -- or
+    # unable to import its own package because sys.path[0] isn't scripts/ --
+    # passes all of them while the real hook silently does nothing and exits
+    # 0. That is a total fail-open: `git commit` would run no gates at all.
+    # Caught in exactly that way when this module was split into a package.
+    #
+    # The invalid-phase path is used deliberately: it exercises __main__ ->
+    # _cli_main end-to-end but returns before any gate runs, so this test
+    # cannot recursively invoke cargo (it runs *inside* the hook self-test
+    # gate, which the pre-commit hook itself calls).
+    result = subprocess.run(
+        [sys.executable, str(SCRIPTS / "run_git_hook.py"), "not-a-phase"],
+        capture_output=True,
+        text=True,
+        cwd=ROOT,
+        check=False,
+    )
+    assert result.returncode == 2, (
+        f"expected usage exit 2, got {result.returncode}; "
+        f"stdout={result.stdout!r} stderr={result.stderr!r}"
+    )
+    assert "usage: scripts/run_git_hook.py <pre-commit|pre-push>" in result.stderr
+
+
+def _hook_source_files() -> list[pathlib.Path]:
+    """Every Python file implementing the hook, discovered rather than listed.
+
+    A hardcoded list would have silently stopped covering the extracted
+    modules the moment run_git_hook.py was split -- which is exactly when the
+    static guards below matter most.
+    """
+    return sorted([SCRIPTS / "run_git_hook.py", *(SCRIPTS / "git_hook").glob("*.py")])
+
+
 def test_module_source_never_uses_shell_true():
-    assert "shell=True" not in HOOK.read_text()
+    offenders = [
+        path.name for path in _hook_source_files() if "shell=True" in path.read_text()
+    ]
+    assert not offenders, f"shell=True found in {offenders}"
+
+
+def test_hook_exact_paths_covers_every_git_hook_module():
+    # HOOK_EXACT_PATHS is what makes an edit to the hook select the hook
+    # self-test gate. A module added to scripts/git_hook/ without an entry
+    # there would classify inert_config (a .py under no declared surface is
+    # UNKNOWN, but the package is not special-cased anywhere else) and could
+    # change gate resolution without ever running the suite that validates
+    # gate resolution. Walk the directory instead of trusting the list.
+    on_disk = {
+        path.relative_to(ROOT).as_posix() for path in (SCRIPTS / "git_hook").glob("*.py")
+    }
+    missing = sorted(on_disk - manifest.HOOK_EXACT_PATHS)
+    assert not missing, (
+        f"git_hook module(s) {missing} are not in HOOK_EXACT_PATHS, so editing them "
+        "would not select the hook self-test gate"
+    )
+    # And the reverse: no stale entry for a module that no longer exists.
+    declared = {
+        path for path in manifest.HOOK_EXACT_PATHS if path.startswith("scripts/git_hook/")
+    }
+    stale = sorted(declared - on_disk)
+    assert not stale, f"HOOK_EXACT_PATHS names non-existent module(s) {stale}"
+
+
+def test_every_git_hook_module_classifies_hook_self_test():
+    # The end-to-end property the entry above only half-guarantees: each hook
+    # module must actually resolve to SURFACE_HOOK_SELF_TEST.
+    for path in (SCRIPTS / "git_hook").glob("*.py"):
+        relative = path.relative_to(ROOT).as_posix()
+        assert manifest.classify_path(relative) == manifest.SURFACE_HOOK_SELF_TEST, (
+            f"{relative} must classify hook_self_test so editing it runs the "
+            "hook's own test suite"
+        )
 
 
 # --- __main__ delegation must fail loudly, never exit 0, if pytest is absent ---
