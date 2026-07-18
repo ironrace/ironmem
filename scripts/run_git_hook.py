@@ -8,7 +8,9 @@ reaching backwards:
 - Collect (`collect_pre_commit_changes()` / `collect_pre_push_changes(stdin)`)
   turns Git's own diff output into a `ChangeSet`. Fail-closed: a Git
   subprocess failure, or malformed pre-push stdin, sets `unknown=True` --
-  never presents as "no changes".
+  never presents as "no changes". Its Git calls run with the same scrubbed
+  `GIT_*` env the execution layer uses, so an inherited `GIT_DIR` cannot
+  redirect the decision itself at another repository.
 - Resolve (`resolve_gates(phase, changes)`) is pure and total: it classifies
   every changed path via `classify_path()` against the declared `SURFACES`
   (`rust_workspace`, `collab_protocol`, `hook_self_test`, `docs`,
@@ -65,6 +67,11 @@ def git(args: list[str], *, input_text: str | None = None, check: bool = True) -
     abort-on-failure behavior is deliberate and pinned by a test). All other
     Git invocations in this module go through the fail-closed `_run_git` /
     `_git_diff_paths_z` helpers below. New code must use those, not this one.
+
+    Un-hardened refers to its error handling only: like every other Git call
+    in this module it runs with `env=_scrub_git_env(os.environ)`, so an
+    inherited repo-redirecting `GIT_*` variable cannot point it at another
+    repository.
     """
     result = subprocess.run(
         ["git", *args],
@@ -73,6 +80,7 @@ def git(args: list[str], *, input_text: str | None = None, check: bool = True) -
         text=True,
         capture_output=True,
         check=False,
+        env=_scrub_git_env(os.environ),
     )
     if check and result.returncode != 0:
         sys.stderr.write(result.stderr)
@@ -162,6 +170,13 @@ def _run_git(args: tuple[str, ...]) -> tuple[bool, int, str, str]:
     here becomes a structured signal, never a traceback. `reason` is built
     only from the argv and the exception's class name -- never from
     output or environment -- so it cannot carry credentials or secrets.
+
+    Runs with `env=_scrub_git_env(os.environ)`, the same scrub the execution
+    layer applies. This is not merely outbound hygiene here: an inherited
+    `GIT_DIR`/`GIT_INDEX_FILE`/`GIT_WORK_TREE`/`GIT_CONFIG_COUNT` redirects
+    this call at a *different* repository, and Git then exits 0 against it --
+    so `unknown` is never set and the hook gates on someone else's change set.
+    That is a fail-OPEN outcome, the opposite of this layer's contract.
     """
     try:
         result = subprocess.run(
@@ -170,6 +185,7 @@ def _run_git(args: tuple[str, ...]) -> tuple[bool, int, str, str]:
             text=True,
             capture_output=True,
             check=False,
+            env=_scrub_git_env(os.environ),
         )
     except Exception as exc:  # fail-closed: never let this propagate
         # Guard args[0]: an empty `args` tuple must still fail closed with a
@@ -781,6 +797,12 @@ def resolve_gates(phase: str, changes: ChangeSet) -> tuple[Gate, ...]:
 # layer only runs them and reports. `main()` (bottom of this file) wires
 # this together with the collection layer above.
 
+# `_scrub_git_env` is declared here, with the execution layer, but is used by
+# BOTH layers: the collection layer's `_run_git`/`git` helpers above pass it
+# too. Scrubbing only outbound gate invocations would leave the Git calls that
+# *decide* which gates run redirectable, which fails open (see `_run_git`'s
+# docstring).
+#
 # Repo-redirecting variables: inheriting any of these points a child Git
 # invocation at a *different* repository than the one the hook is running
 # in. This is not theoretical -- a pre-push hook exporting GIT_DIR/

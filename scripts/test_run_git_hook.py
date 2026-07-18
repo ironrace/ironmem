@@ -1281,6 +1281,98 @@ def test_staged_deletion_of_rust_path_is_collected_and_selects_rust_gates(monkey
     assert "rust_clippy" in names
 
 
+# --- collection layer runs with a scrubbed GIT_* env ------------------------
+#
+# Verified empirically before these tests were written: with `GIT_DIR` exported
+# at repo A and the process cwd inside repo B, `git diff --cached --name-only`
+# reports repo A's staged paths and exits 0. Because it exits 0, the
+# collection layer's fail-closed `unknown=True` is never set -- the hook
+# silently gates on a different repository's change set. That is a fail-OPEN
+# bug, strictly worse than the outbound leak `_scrub_git_env` already targeted
+# at the execution boundary.
+
+_REPO_REDIRECTING_VARS = (
+    "GIT_DIR",
+    "GIT_INDEX_FILE",
+    "GIT_WORK_TREE",
+    "GIT_OBJECT_DIRECTORY",
+    "GIT_COMMON_DIR",
+    "GIT_NAMESPACE",
+    "GIT_CONFIG_COUNT",
+    "GIT_CONFIG_GLOBAL",
+)
+
+
+class _EnvRecordingGitRun:
+    """`subprocess.run` stand-in that records the `env=` kwarg of every call."""
+
+    def __init__(self, stdout=""):
+        self.stdout = stdout
+        self.envs: list[object] = []
+
+    def __call__(self, cmd, **kwargs):
+        self.envs.append(kwargs.get("env"))
+        return subprocess.CompletedProcess(cmd, 0, stdout=self.stdout, stderr="")
+
+
+def _poison_git_env(monkeypatch):
+    for name in _REPO_REDIRECTING_VARS:
+        monkeypatch.setenv(name, "/somewhere/else")
+    monkeypatch.setenv("PATH", "/usr/bin")
+
+
+def test_collect_pre_commit_changes_scrubs_repo_redirecting_git_env(monkeypatch):
+    _poison_git_env(monkeypatch)
+    fake = _EnvRecordingGitRun("a.py\0")
+    monkeypatch.setattr(hook.subprocess, "run", fake)
+    hook.collect_pre_commit_changes()
+    assert fake.envs, "collection layer made no subprocess call"
+    for env in fake.envs:
+        assert env is not None, "collection layer inherited the ambient env"
+        for name in _REPO_REDIRECTING_VARS:
+            assert name not in env
+        assert env["PATH"] == "/usr/bin"
+
+
+def test_collect_pre_push_changes_scrubs_repo_redirecting_git_env(monkeypatch):
+    _poison_git_env(monkeypatch)
+    stdin = _pre_push_line("refs/heads/feature", SHA_B, "refs/heads/feature", SHA_A) + "\n"
+    fake = _EnvRecordingGitRun("a.py\0")
+    monkeypatch.setattr(hook.subprocess, "run", fake)
+    hook.collect_pre_push_changes(stdin)
+    assert fake.envs
+    for env in fake.envs:
+        assert env is not None
+        for name in _REPO_REDIRECTING_VARS:
+            assert name not in env
+
+
+def test_legacy_git_helper_scrubs_repo_redirecting_git_env(monkeypatch):
+    # The manual `@{u}` fallback still goes through the un-hardened `git()`
+    # helper; its subprocess env must be scrubbed too, or a manual pre-push
+    # invocation inherits the same redirection.
+    _poison_git_env(monkeypatch)
+    fake = _EnvRecordingGitRun("")
+    monkeypatch.setattr(hook.subprocess, "run", fake)
+    hook.git(["rev-parse", "--verify", "@{u}"], check=False)
+    assert fake.envs
+    for env in fake.envs:
+        assert env is not None
+        for name in _REPO_REDIRECTING_VARS:
+            assert name not in env
+
+
+def test_collection_layer_env_keeps_ssh_auth_variables(monkeypatch):
+    # The scrub is the same allowlist the execution layer uses: variables that
+    # configure *how* Git authenticates survive; only repo-redirecting ones go.
+    _poison_git_env(monkeypatch)
+    monkeypatch.setenv("GIT_SSH_COMMAND", "ssh -i /key")
+    fake = _EnvRecordingGitRun("")
+    monkeypatch.setattr(hook.subprocess, "run", fake)
+    hook.collect_pre_commit_changes()
+    assert fake.envs[0]["GIT_SSH_COMMAND"] == "ssh -i /key"
+
+
 def test_collect_pre_commit_changes_disables_rename_detection(monkeypatch):
     # Regression: `git diff --name-only` has rename detection ON by default
     # and prints ONLY the destination path. Renaming a gated file to an inert
