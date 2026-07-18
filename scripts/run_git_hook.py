@@ -91,6 +91,15 @@ def git(args: list[str], *, input_text: str | None = None, check: bool = True) -
 # here. No `.strip()`/unquoting/case-folding is ever applied to a *path*;
 # `.strip()` on a sha or ref name below is not a path and is not covered by
 # that rule.
+#
+# Every diff invocation also passes `--no-renames`. Rename detection is ON by
+# default and reports ONLY the destination path, which is a fail-open hole in
+# exactly the direction this manifest exists to close: `git mv
+# crates/ironmem/src/foo.rs docs/foo.md` would report only `docs/foo.md`, which
+# classifies `docs`, selects no gate, and exits 0 -- fmt/clippy/test never
+# running on a workspace that may no longer compile. With `--no-renames` Git
+# reports both sides, so the source path still classifies `rust_workspace`.
+# This flag is load-bearing, not cosmetic: never drop it from a diff here.
 
 _HEX_DIGITS = frozenset("0123456789abcdefABCDEF")
 
@@ -240,15 +249,17 @@ def _collect_update_paths(local_sha: str, remote_sha: str) -> tuple[bool, tuple[
     NUL-delimited output throughout.
     """
     if not _is_zero_sha(remote_sha):
-        return _git_diff_paths_z(("diff", "--name-only", "-z", f"{remote_sha}..{local_sha}"))
+        return _git_diff_paths_z(
+            ("diff", "--name-only", "--no-renames", "-z", f"{remote_sha}..{local_sha}")
+        )
 
     ok, base, reason = _default_base(local_sha)
     if not ok:
         return False, (), reason
     if base is not None:
-        return _git_diff_paths_z(("diff", "--name-only", "-z", f"{base}..{local_sha}"))
+        return _git_diff_paths_z(("diff", "--name-only", "--no-renames", "-z", f"{base}..{local_sha}"))
     return _git_diff_paths_z(
-        ("diff-tree", "--root", "--no-commit-id", "--name-only", "-z", "-r", local_sha)
+        ("diff-tree", "--root", "--no-commit-id", "--name-only", "--no-renames", "-z", "-r", local_sha)
     )
 
 
@@ -271,10 +282,10 @@ def _parse_pre_push_line(line: str) -> tuple[str, str, str, str] | None:
 def collect_pre_commit_changes() -> ChangeSet:
     """Collect the `ChangeSet` for the pre-commit phase.
 
-    Runs `git diff --cached --name-only -z` -- the only Git invocation in
-    this function. Fails closed: a non-zero exit or any subprocess-level
-    failure (e.g. unreadable output) returns `unknown=True` with a
-    non-empty `reason` and never a traceback. An empty result with
+    Runs `git diff --cached --name-only --no-renames -z` -- the only Git
+    invocation in this function. Fails closed: a non-zero exit or any
+    subprocess-level failure (e.g. unreadable output) returns `unknown=True`
+    with a non-empty `reason` and never a traceback. An empty result with
     `unknown=False` means genuinely nothing is staged, never that
     collection broke.
     """
@@ -282,7 +293,9 @@ def collect_pre_commit_changes() -> ChangeSet:
     # (deleting a `.rs` file or `Cargo.toml` is exactly the kind of change
     # that should still trigger the Rust gates). The absence of
     # `--diff-filter=ACMRTUXB` here is a deliberate choice, not a lost flag.
-    ok, paths, reason = _git_diff_paths_z(("diff", "--cached", "--name-only", "-z"))
+    ok, paths, reason = _git_diff_paths_z(
+        ("diff", "--cached", "--name-only", "--no-renames", "-z")
+    )
     if not ok:
         return ChangeSet(paths=paths, unknown=True, reason=reason)
     return ChangeSet(paths=paths, unknown=False, reason=None)
@@ -1007,7 +1020,7 @@ def _pre_push_manual_upstream_changes() -> ChangeSet:
     upstream = git(["rev-parse", "--verify", "@{u}"], check=False).strip()
     if not upstream:
         return ChangeSet(paths=(), unknown=False, reason=None)
-    output = git(["diff", "--name-only", "-z", f"{upstream}..HEAD"])
+    output = git(["diff", "--name-only", "--no-renames", "-z", f"{upstream}..HEAD"])
     return ChangeSet(paths=_split_nul(output), unknown=False, reason=None)
 
 
