@@ -397,7 +397,26 @@ def collect_pre_push_changes(stdin_text: str) -> ChangeSet:
     return ChangeSet(paths=tuple(seen), unknown=False, reason=None)
 
 
+# Top-level directory holding Cargo crates that are deliberately OUTSIDE the
+# root workspace (every one of them is in that manifest's `exclude` list), so
+# no `--workspace`/`--all` cargo gate compiles, lints, or formats them. Named
+# here because `is_rust_path` is checked before the inert surface: without this
+# yield, benchmarks Rust source would classify `rust_workspace` and select
+# three slow gates that cannot observe the change.
+#
+# Load-bearing precondition, pinned by `test_every_benchmarks_crate_is_
+# workspace_excluded`: a benchmarks crate that joins `members` IS gate-covered,
+# and treating it as inert would let a non-compiling workspace push clean.
+# That test fails loudly at the manifest fact rather than letting this
+# classifier fail open.
+_WORKSPACE_EXCLUDED_ROOT = "benchmarks"
+
+
 def is_rust_path(path: str) -> bool:
+    # Segment-based, never a substring: `benchmarksish/src/lib.rs` is an
+    # ordinary workspace-shaped path and must still classify `rust_workspace`.
+    if path.split("/", 1)[0] == _WORKSPACE_EXCLUDED_ROOT:
+        return False
     name = pathlib.PurePosixPath(path).name
     return (
         path.endswith(".rs")
@@ -528,18 +547,36 @@ def is_inert_config_path(path: str) -> bool:
       matched the same way ``is_docs_path`` matches ``docs/``: on the
       leading ``/``-split segment, never a substring, so a look-alike
       directory such as ``sitehost/`` never matches.
-    - A ``.py`` file under a top-level ``benchmarks/`` directory. The
-      ``benchmarks/*`` Cargo crates are listed in the workspace manifest's
+    - Any path under a top-level ``benchmarks/`` directory -- the whole tree,
+      including its ``.rs`` source and ``Cargo.toml`` files. Every
+      ``benchmarks/*`` Cargo crate is in the root workspace manifest's
       ``exclude`` list, so `cargo fmt --all`/`cargo clippy --workspace`/
-      `cargo test --workspace` never touch them either way -- but their own
-      ``.rs`` source files still classify ``rust_workspace`` via
-      `is_rust_path` (checked before this surface, see the `SURFACES`
-      ordering comment below), so this pattern is scoped to `.py` only, not
-      the whole `benchmarks/` tree. `crates/*/migrations/*.sql` is
-      deliberately NOT covered by any pattern here: those files are
-      `include_str!`'d into the Rust binary and replayed by `cargo test`'s
-      migration tests, so a real gate *does* catch a defect there -- they
-      must stay `UNKNOWN` (escalate), not become inert.
+      `cargo test --workspace` never compile, lint, or format any of them:
+      a defect there is not gate-covered, and classifying it
+      ``rust_workspace`` (as this surface previously left `is_rust_path` to
+      do) selected three slow gates that could not observe the change.
+      `is_rust_path` now yields for this root (see `_WORKSPACE_EXCLUDED_ROOT`)
+      so the classification actually reaches here. The precondition that
+      makes this safe -- the exclude list staying complete -- is not visible
+      to this predicate and is pinned by
+      `test_every_benchmarks_crate_is_workspace_excluded`.
+
+      `crates/*/migrations/*.sql` is deliberately NOT covered by any pattern
+      here: those files are `include_str!`'d into the Rust binary and replayed
+      by `cargo test`'s migration tests, so a real gate *does* catch a defect
+      there -- they must stay `UNKNOWN` (escalate), not become inert.
+
+    `.github/workflows/*.yml` matches the extension pattern above and is
+    therefore inert. That is a deliberate, verified decision, not an oversight:
+    no declared gate reads `.github/` at all (no Rust test references it), so
+    escalating a workflow edit would run the cargo gates -- which cannot parse
+    YAML and cannot detect a broken workflow -- purely as wasted wall-clock.
+    A workflow defect has no local backstop either way; CI is its own backstop
+    and surfaces the failure on the very push that introduced it. Adding a
+    hook-time `actionlint`/PyYAML gate was considered and rejected: neither is
+    in the standard library or guaranteed installed, so it would either break
+    commits on machines lacking it or have to skip when absent -- a fail-OPEN
+    gate, which is worse than no gate in a manifest built on failing closed.
 
     Declared after every specific surface in `SURFACES` (see the ordering
     comment there): `scripts/install-git-hooks.sh` matches this predicate's
@@ -555,7 +592,7 @@ def is_inert_config_path(path: str) -> bool:
     top_segment = path.split("/", 1)[0]
     if top_segment == "site":
         return True
-    if top_segment == "benchmarks" and path.endswith(".py"):
+    if top_segment == _WORKSPACE_EXCLUDED_ROOT:
         return True
     return False
 
@@ -707,10 +744,22 @@ SURFACES: MappingProxyType[str, Callable[[str], bool]] = MappingProxyType(
 )
 
 # Control bytes (codepoint < 0x20, plus DEL 0x7F) are rejected as unsafe path
-# shapes, except newline: Git's `-z`/NUL-delimited output can legitimately
-# carry an embedded newline inside a filename, and that byte must classify
-# normally, not be treated as an attack shape.
-_ALLOWED_CONTROL_CHARS = frozenset({"\n"})
+# shapes, except the two line terminators: Git's `-z`/NUL-delimited output can
+# legitimately carry an embedded LF *or* CR inside a filename, and both bytes
+# must classify normally rather than be treated as an attack shape.
+#
+# Both, not just LF. A POSIX filename may contain any byte except NUL and `/`,
+# which makes CR exactly as ordinary inside one as LF; `-z` framing removes the
+# only reason either was ever a parsing hazard. Allowing LF while rejecting CR
+# escalated a correctly-classifiable path to a full gate run for no stated
+# reason -- an asymmetry, not a defense.
+#
+# The allowance is deliberately exactly this wide. Every other control byte
+# still escalates: not because it could redirect anything (paths here are
+# never printed, shelled out, or interpolated into a command), but because a
+# path Git would not normally produce is a signal the collection layer's
+# assumptions may not hold, and escalating is the fail-closed response.
+_ALLOWED_CONTROL_CHARS = frozenset({"\n", "\r"})
 
 
 def _unsafe_path_reason(path: object) -> str | None:
@@ -926,10 +975,30 @@ def resolve_gates(phase: str, changes: ChangeSet) -> tuple[Gate, ...]:
 # core.hooksPath, credential.helper, core.pager, core.sshCommand, alias.*, and
 # *.textconv. A caller could set GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=
 # core.worktree GIT_CONFIG_VALUE_0=/real/repo and reproduce exactly the
-# redirection this scrub exists to prevent (PR #186) through the front door.
-# Keeping it would make the docstring's "no kept variable can redirect a
-# child Git invocation" premise false, so it is stripped like any other
-# unrecognized GIT_*-prefixed variable.
+# redirection this scrub exists to prevent (PR #186) through the front door,
+# so it is stripped like any other unrecognized GIT_*-prefixed variable.
+#
+# SCOPE -- what this scrub does and does not claim. The invariant is "no
+# variable Git injects into the hook environment leaks into a child", NOT the
+# broader "no kept variable can influence Git", which is false and was
+# previously asserted here. HOME and XDG_CONFIG_HOME survive the scrub and
+# reach the very same arbitrary-config primitive as GIT_CONFIG_*: Git reads
+# $XDG_CONFIG_HOME/git/config and $HOME/.gitconfig, either of which can set
+# core.worktree, core.hooksPath, or credential.helper. They are kept anyway,
+# deliberately:
+#   - Provenance. GIT_DIR/GIT_INDEX_FILE/... are set *by Git* when it invokes
+#     a hook, so they are present by default and leak outward -- that is the
+#     PR #186 bug this scrub was built for. HOME/XDG_CONFIG_HOME are ambient
+#     developer environment that every gate (cargo needs HOME for ~/.cargo)
+#     already depends on; dropping them breaks the gates outright.
+#   - PATH dominates them. PATH cannot be scrubbed -- the gates need it to
+#     find git and cargo at all -- and whoever can set PATH can replace the
+#     git binary, which is strictly more power than redirecting its config.
+#     Scrubbing XDG_CONFIG_HOME while PATH stays writable is theater.
+# A hostile ambient environment is therefore explicitly out of this module's
+# threat model. Both halves are pinned by tests: `test_scrub_git_env_passes_
+# ambient_config_vars_through_by_design` and
+# `test_scrub_git_env_strips_every_var_git_injects_into_a_hook`.
 #
 # Default toward scrubbing: anything GIT_*-prefixed that isn't explicitly
 # named or prefix-matched here is dropped, including variables not yet
@@ -945,7 +1014,12 @@ def _scrub_git_env(source_env: Mapping[str, str]) -> dict[str, str]:
     with every `GIT_*` variable removed except the explicit keep-list above.
 
     Returns a new dict; never mutates `source_env`. Non-`GIT_*` variables
-    (PATH, HOME, ...) always pass through untouched.
+    (PATH, HOME, XDG_CONFIG_HOME, ...) always pass through untouched -- see
+    the SCOPE note above for why HOME/XDG_CONFIG_HOME are kept even though
+    they reach the same arbitrary-Git-config primitive as the `GIT_CONFIG_*`
+    variables this function strips. This function guarantees that no
+    Git-injected variable leaks into a child; it does not, and cannot, defend
+    against a hostile ambient environment.
     """
     return {
         key: value

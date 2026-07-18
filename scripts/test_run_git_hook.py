@@ -516,20 +516,79 @@ def test_is_inert_config_path_matches_site_directory_regardless_of_extension():
     assert hook.is_inert_config_path("site/_headers") is True  # no extension at all
 
 
-def test_is_inert_config_path_matches_benchmarks_python_files():
+def test_is_inert_config_path_matches_whole_benchmarks_tree():
+    # CONTRACT CHANGE (was: .py under benchmarks/ only, with .rs there
+    # deliberately classifying rust_workspace). Every benchmarks/* Cargo crate
+    # is in the root workspace manifest's `exclude` list, so `cargo fmt --all`,
+    # `cargo clippy --workspace`, and `cargo test --workspace` never compile,
+    # lint, or format any of them -- a defect in benchmarks Rust source is not
+    # gate-covered, and selecting the Rust gates for it ran three slow gates
+    # that cannot observe the change. The whole tree is inert.
+    #
+    # This is only safe while that exclude list stays complete, which is not a
+    # fact this predicate can see. test_every_benchmarks_crate_is_workspace_
+    # excluded below is the load-bearing guard: adding a benchmarks crate to
+    # `members` fails there loudly instead of failing open here silently.
     assert hook.is_inert_config_path("benchmarks/abeval/baseline_driver.py") is True
     assert (
         hook.is_inert_config_path("benchmarks/provbench/spotcheck/tools/autofilter.py") is True
     )
+    assert hook.is_inert_config_path("benchmarks/provbench/labeler/src/lib.rs") is True
+    assert hook.is_inert_config_path("benchmarks/abeval/Cargo.toml") is True
 
 
-def test_is_inert_config_path_rejects_benchmarks_rust_source():
-    # The workspace-excluded benchmarks/* Cargo crates still ship real .rs
-    # source; is_rust_path (checked before this surface) already classifies
-    # those correctly as SURFACE_RUST_WORKSPACE. This predicate itself must
-    # not claim a .rs file even in isolation, or a future reordering bug
-    # would silently misclassify Rust source as inert.
-    assert hook.is_inert_config_path("benchmarks/provbench/labeler/src/lib.rs") is False
+def test_is_rust_path_excludes_workspace_excluded_benchmarks_tree():
+    # is_rust_path is checked before the inert surface, so it -- not just the
+    # inert predicate -- has to yield for benchmarks/ to classify inert at all.
+    assert hook.is_rust_path("benchmarks/provbench/labeler/src/lib.rs") is False
+    assert hook.is_rust_path("benchmarks/abeval/Cargo.toml") is False
+    # ...without disturbing real workspace crates or the look-alike directory.
+    assert hook.is_rust_path("crates/ironmem/src/lib.rs") is True
+    assert hook.is_rust_path("benchmarksish/src/lib.rs") is True
+
+
+def test_classify_path_benchmarks_rust_source_is_inert():
+    assert (
+        hook.classify_path("benchmarks/provbench/labeler/src/lib.rs")
+        == hook.SURFACE_INERT_CONFIG
+    )
+
+
+def test_every_benchmarks_crate_is_workspace_excluded():
+    # The guard that makes the whole-benchmarks-tree inert surface safe.
+    # `benchmarks/` is inert ONLY because every Cargo crate under it is
+    # workspace-excluded. If a future crate there joins `members` (or a new
+    # crate is added without an `exclude` entry), cargo gates WOULD cover it,
+    # and treating it as inert would let a non-compiling workspace push
+    # clean -- the exact fail-open this manifest exists to prevent. Fail here,
+    # at the manifest fact, rather than silently in the classifier.
+    import tomllib
+
+    manifest = tomllib.loads((ROOT / "Cargo.toml").read_text(encoding="utf-8"))
+    workspace = manifest["workspace"]
+    excluded = set(workspace.get("exclude", []))
+
+    crate_dirs = {
+        path.parent.relative_to(ROOT).as_posix()
+        for path in (ROOT / "benchmarks").rglob("Cargo.toml")
+        if "target" not in path.parts
+    }
+    assert crate_dirs, "expected at least one benchmarks Cargo crate to guard"
+
+    unexcluded = sorted(crate_dirs - excluded)
+    assert not unexcluded, (
+        f"benchmarks crate(s) {unexcluded} are not in the workspace `exclude` list, "
+        "so cargo gates DO cover them -- is_inert_config_path must stop treating "
+        "benchmarks/ as inert, or these crates must be excluded"
+    )
+
+    members_under_benchmarks = sorted(
+        member for member in workspace.get("members", []) if member.startswith("benchmarks/")
+    )
+    assert not members_under_benchmarks, (
+        f"workspace members {members_under_benchmarks} live under benchmarks/, which "
+        "the hook manifest classifies as inert -- these would skip the Rust gates"
+    )
 
 
 def test_is_inert_config_path_rejects_sql_migration():
@@ -802,6 +861,24 @@ def test_classify_path_preserves_newline_space_and_non_ascii_segments():
     assert hook.classify_path(path) == hook.SURFACE_DOCS
     # Segment-based matching operated on the real, unmodified bytes.
     assert path.split("/") == ["docs", "plan\n notes (β).md"]
+
+
+def test_classify_path_preserves_carriage_return_like_newline():
+    # A carriage return is exactly as legal inside a Git filename as a newline
+    # is, and `-z` NUL framing makes both unambiguous at the source. Rejecting
+    # \r while allowing \n was an asymmetry with no stated justification: it
+    # escalated a correctly-classifiable docs path to a full gate run.
+    assert hook.classify_path("docs/plan\rnotes.md") == hook.SURFACE_DOCS
+    assert hook.classify_path("docs/plan\r\nnotes.md") == hook.SURFACE_DOCS
+
+
+def test_classify_path_rejects_control_bytes_other_than_line_terminators():
+    # The line-terminator allowance is exactly two bytes wide -- every other
+    # control byte still escalates. Pinned so widening _ALLOWED_CONTROL_CHARS
+    # to "all control bytes" fails here rather than passing silently.
+    for codepoint in (0x00, 0x01, 0x08, 0x0B, 0x0C, 0x1B, 0x1F, 0x7F):
+        path = f"docs/plan{chr(codepoint)}notes.md"
+        assert hook.classify_path(path) == hook.UNKNOWN, f"U+{codepoint:04X} must escalate"
 
 
 def test_classify_path_does_not_strip_whitespace_before_matching():
@@ -2015,9 +2092,15 @@ def test_execute_gates_prints_skip_line_with_surfaces_not_touched(monkeypatch, c
     changes = hook.ChangeSet(paths=(), unknown=False, reason=None)
     hook.execute_gates(hook.PHASE_PRE_COMMIT, changes)
     out = capsys.readouterr().out
-    assert "collab_template_lint" in out
-    assert "skip" in out
-    assert hook.SURFACE_COLLAB_PROTOCOL in out
+    # Exact output, not three substring checks. The per-gate format is a
+    # deterministic contract, and the substring form passed against output
+    # that merely mentioned the gate and the word "skip" anywhere -- it could
+    # not tell `skip (collab_protocol)` from `skip (collab_protocol,docs)` or
+    # from a skip line emitted for some other gate entirely.
+    assert out == (
+        "[git-hook] collab_template_lint: skip (collab_protocol)\n"
+        "[git-hook] pre-commit: no local gates required\n"
+    )
     assert fake.calls == []
 
 
@@ -2087,9 +2170,12 @@ def test_execute_gates_prints_fail_line_with_exit_code(monkeypatch, capsys):
     rc = hook.execute_gates(hook.PHASE_PRE_COMMIT, changes)
     assert rc == 7
     out = capsys.readouterr().out
-    assert "rust_fmt_check" in out
-    assert "fail" in out
-    assert "7" in out
+    # Exact output. `assert "7" in out` was the weakest check in the suite:
+    # any exit code containing the digit 7, any gate name, or any unrelated
+    # line carrying a 7 satisfied it. Pin the literal bytes instead -- and
+    # note there is deliberately NO trailing completion line here, because a
+    # run that stopped at a non-zero exit did not complete.
+    assert out == "[git-hook] rust_fmt_check: run\n[git-hook] rust_fmt_check: fail (7)\n"
 
 
 def test_execute_gates_normalizes_negative_returncode_from_signal_kill(monkeypatch, capsys):
@@ -2358,6 +2444,58 @@ def test_scrub_git_env_strips_unlisted_git_var_not_yet_enumerated():
     source = {"GIT_SOME_FUTURE_FLAG": "danger", "PATH": "/usr/bin"}
     scrubbed = hook._scrub_git_env(source)
     assert "GIT_SOME_FUTURE_FLAG" not in scrubbed
+    assert scrubbed["PATH"] == "/usr/bin"
+
+
+def test_scrub_git_env_passes_ambient_config_vars_through_by_design():
+    # The DOCUMENTED BOUNDARY of this scrub, asserted rather than left as a
+    # comment someone can quietly delete.
+    #
+    # HOME and XDG_CONFIG_HOME reach the same arbitrary-Git-config primitive
+    # that GIT_CONFIG_* does: Git reads $XDG_CONFIG_HOME/git/config and
+    # $HOME/.gitconfig, either of which can set core.worktree, core.hooksPath,
+    # or credential.helper. They are nonetheless passed through, and this
+    # scrub does NOT claim to stop them, for two reasons:
+    #
+    #   1. Provenance. This scrub exists to stop variables *Git itself injects
+    #      into the hook environment* (GIT_DIR, GIT_INDEX_FILE, ...) from
+    #      leaking into children -- the PR #186 bug, where a `cargo test`
+    #      tempdir fixture inherited them and committed into the real repo.
+    #      HOME/XDG_CONFIG_HOME are ambient developer environment, not
+    #      hook-injected, and every tool the gates run already trusts them.
+    #   2. PATH dominates. PATH cannot be scrubbed -- the gates need it to
+    #      find git and cargo -- and whoever can set PATH can substitute the
+    #      git binary outright, which is strictly more power than redirecting
+    #      its config. Stripping XDG_CONFIG_HOME while PATH stays writable
+    #      would be theater, not defense.
+    #
+    # So the honest invariant is "no Git-injected variable leaks into a child",
+    # NOT "no kept variable can influence Git". Pinned here in that form.
+    source = {
+        "HOME": "/tmp/evil",
+        "XDG_CONFIG_HOME": "/tmp/evil/config",
+        "PATH": "/tmp/evil/bin",
+    }
+    assert hook._scrub_git_env(source) == source
+
+
+def test_scrub_git_env_strips_every_var_git_injects_into_a_hook():
+    # The invariant the scrub DOES guarantee, stated as the closed set it
+    # actually covers: the variables Git sets in a hook's environment.
+    git_injected = {
+        "GIT_DIR": "/real/repo/.git",
+        "GIT_WORK_TREE": "/real/repo",
+        "GIT_INDEX_FILE": "/real/repo/.git/index",
+        "GIT_COMMON_DIR": "/real/repo/.git",
+        "GIT_OBJECT_DIRECTORY": "/real/repo/.git/objects",
+        "GIT_ALTERNATE_OBJECT_DIRECTORIES": "/other/objects",
+        "GIT_NAMESPACE": "refs/namespaces/evil",
+        "GIT_PREFIX": "subdir/",
+        "GIT_EXEC_PATH": "/tmp/evil/git-core",
+    }
+    scrubbed = hook._scrub_git_env({**git_injected, "PATH": "/usr/bin"})
+    leaked = sorted(key for key in git_injected if key in scrubbed)
+    assert not leaked, f"Git-injected variable(s) {leaked} leaked into the child env"
     assert scrubbed["PATH"] == "/usr/bin"
 
 
@@ -2638,9 +2776,16 @@ def test_main_pre_push_whitespace_only_stdin_escalates_and_never_reaches_fallbac
     rc = hook.main(hook.PHASE_PRE_PUSH)
     out = capsys.readouterr().out
     assert rc == 0
-    assert "escalating" in out
-    # No `git` call at all: not the fallback's rev-parse, not a diff.
-    assert [cmd for cmd in fake.calls if cmd[0] == "git"] == []
+    assert "[git-hook] escalating: malformed pre-push stdin line 1" in out
+    # Escalation means EVERY pre-push gate ran -- assert the actual call list,
+    # not just the absence of git calls. The previous "no git call happened"
+    # check was satisfied by a run that escalated and then ran nothing at all,
+    # which is the fail-open outcome this test exists to rule out.
+    assert fake.calls == [
+        list(_HOOK_SELF_TEST_ARGV),
+        list(_COLLAB_LINT_ARGV),
+        list(_RUST_TEST_ARGV),
+    ]
 
 
 def test_main_pre_push_manual_invocation_no_upstream_runs_no_gates(monkeypatch):
