@@ -40,6 +40,15 @@ HOOK_EXACT_PATHS = {
 
 
 def git(args: list[str], *, input_text: str | None = None, check: bool = True) -> str:
+    """Un-hardened `subprocess.run(["git", ...])` wrapper (`check=True` by
+    default -> raises `SystemExit` on a non-zero exit).
+
+    Retained solely for `_pre_push_manual_upstream_changes()`'s manual `@{u}`
+    fallback path (see that function's docstring for why that path's
+    abort-on-failure behavior is deliberate and pinned by a test). All other
+    Git invocations in this module go through the fail-closed `_run_git` /
+    `_git_diff_paths_z` helpers below. New code must use those, not this one.
+    """
     result = subprocess.run(
         ["git", *args],
         cwd=ROOT,

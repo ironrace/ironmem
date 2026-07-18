@@ -316,6 +316,31 @@ def test_classify_path_collab_exact_path():
     )
 
 
+def test_classify_path_collab_turn_prompt_prefix_selects_collab_lint():
+    # Covers the `.claude-plugin/prompts/collab-turn-` startswith branch in
+    # is_collab_protocol_path -- deleting that clause must break both the
+    # classification and the gate selection asserted here, not just the
+    # classification.
+    path = ".claude-plugin/prompts/collab-turn-plan.md"
+    assert hook.classify_path(path) == hook.SURFACE_COLLAB_PROTOCOL
+    changes = hook.ChangeSet(paths=(path,), unknown=False, reason=None)
+    names = [gate.name for gate in hook.resolve_gates(hook.PHASE_PRE_COMMIT, changes)]
+    assert "collab_template_lint" in names
+
+
+def test_classify_path_collab_turn_templates_dir_prefix_selects_collab_lint():
+    # Covers the `tests/collab_turn_templates/` startswith branch in
+    # is_collab_protocol_path. The existing near-miss test
+    # (test_classify_path_near_miss_contests_is_not_collab_protocol) only
+    # proves a *look-alike* path is rejected; it passes even if this branch
+    # is deleted entirely. This test is the missing positive case.
+    path = "tests/collab_turn_templates/example.txt"
+    assert hook.classify_path(path) == hook.SURFACE_COLLAB_PROTOCOL
+    changes = hook.ChangeSet(paths=(path,), unknown=False, reason=None)
+    names = [gate.name for gate in hook.resolve_gates(hook.PHASE_PRE_COMMIT, changes)]
+    assert "collab_template_lint" in names
+
+
 def test_classify_path_hook_self_test_run_git_hook():
     assert hook.classify_path("scripts/run_git_hook.py") == hook.SURFACE_HOOK_SELF_TEST
 
@@ -1871,7 +1896,16 @@ def test_main_pre_push_with_stdin_paths_never_triggers_upstream_fallback(monkeyp
 # reject before any collection or gate I/O is attempted.
 
 
-def test_cli_main_missing_argument_prints_usage_and_returns_2(capsys):
+def test_cli_main_missing_argument_prints_usage_and_returns_2(monkeypatch, capsys):
+    # `_cli_main` must reject a missing argument and return before ever
+    # calling `main()` -- poison `subprocess.run` so that if this guard ever
+    # regressed (e.g. started calling `main()` on invalid argv), the test
+    # fails loudly on an unexpected subprocess call instead of silently
+    # invoking real Git and real gates.
+    def poison(cmd, **kwargs):
+        raise AssertionError(f"unexpected subprocess.run call: {cmd}")
+
+    monkeypatch.setattr(hook.subprocess, "run", poison)
     assert hook._cli_main(["scripts/run_git_hook.py"]) == 2
     err = capsys.readouterr().err
     assert err == "usage: scripts/run_git_hook.py <pre-commit|pre-push>\n"
