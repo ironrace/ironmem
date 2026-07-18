@@ -10,10 +10,12 @@ match the changed surface:
 """
 from __future__ import annotations
 
+import dataclasses
 import pathlib
 import subprocess
 import sys
-from typing import Iterable
+from types import MappingProxyType
+from typing import Callable, Iterable
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 ZERO_SHA = "0" * 40
@@ -136,6 +138,137 @@ def is_collab_protocol_path(path: str) -> bool:
 
 def is_hook_path(path: str) -> bool:
     return path in HOOK_EXACT_PATHS
+
+
+def is_docs_path(path: str) -> bool:
+    """Minimal placeholder predicate for the explicitly inert docs surface.
+
+    Real path classification is Task 2's job; this is intentionally simple
+    scaffolding so the surface map has an entry to point at.
+    """
+    return path.endswith(".md") or path.startswith("docs/")
+
+
+# --- Frozen data model -------------------------------------------------
+#
+# `Gate`/`ChangeSet`/`GATES`/`SURFACES` are the pure data layer the rest of
+# the collect -> resolve -> execute pipeline (later tasks) will read. Nothing
+# below is wired into run_pre_commit()/run_pre_push() yet.
+
+PHASE_PRE_COMMIT = "pre-commit"
+PHASE_PRE_PUSH = "pre-push"
+
+SURFACE_RUST_WORKSPACE = "rust_workspace"
+SURFACE_COLLAB_PROTOCOL = "collab_protocol"
+SURFACE_HOOK_SELF_TEST = "hook_self_test"
+SURFACE_DOCS = "docs"
+
+
+@dataclasses.dataclass(frozen=True)
+class Gate:
+    """One subprocess invocation, gated by phase and changed surface."""
+
+    name: str
+    argv: tuple[str, ...]
+    phases: frozenset[str]
+    surfaces: frozenset[str]
+    always: bool
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.argv, tuple):
+            raise TypeError(f"Gate.argv must be a tuple, got {type(self.argv).__name__}")
+        if not isinstance(self.phases, frozenset):
+            raise TypeError(f"Gate.phases must be a frozenset, got {type(self.phases).__name__}")
+        if not isinstance(self.surfaces, frozenset):
+            raise TypeError(
+                f"Gate.surfaces must be a frozenset, got {type(self.surfaces).__name__}"
+            )
+
+
+@dataclasses.dataclass(frozen=True)
+class ChangeSet:
+    """The changed paths for a phase, plus escalation state.
+
+    `unknown=True` (with `reason` set) marks an unsafe or unrecognized path
+    shape that must escalate to running every gate, never be sanitized away.
+    """
+
+    paths: tuple[str, ...]
+    unknown: bool
+    reason: str | None
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.paths, tuple):
+            raise TypeError(f"ChangeSet.paths must be a tuple, got {type(self.paths).__name__}")
+
+
+# surface_id -> predicate. Predicates ported unchanged from the existing
+# is_rust_path/is_collab_protocol_path/is_hook_path classifiers above.
+SURFACES: MappingProxyType[str, Callable[[str], bool]] = MappingProxyType(
+    {
+        SURFACE_RUST_WORKSPACE: is_rust_path,
+        SURFACE_COLLAB_PROTOCOL: is_collab_protocol_path,
+        SURFACE_HOOK_SELF_TEST: is_hook_path,
+        SURFACE_DOCS: is_docs_path,
+    }
+)
+
+# Declaration order IS execution order. Never sorted at runtime. Ported
+# unchanged from today's run_pre_commit()/run_pre_push() conditional
+# assembly (same argv, same phase membership).
+GATES: tuple[Gate, ...] = (
+    Gate(
+        name="hook_self_test",
+        argv=("python3", "scripts/test_run_git_hook.py"),
+        phases=frozenset({PHASE_PRE_COMMIT, PHASE_PRE_PUSH}),
+        surfaces=frozenset({SURFACE_HOOK_SELF_TEST}),
+        always=False,
+    ),
+    Gate(
+        name="hook_install_check",
+        argv=("bash", "scripts/install-git-hooks.sh", "--check"),
+        phases=frozenset({PHASE_PRE_COMMIT}),
+        surfaces=frozenset({SURFACE_HOOK_SELF_TEST}),
+        always=False,
+    ),
+    Gate(
+        name="collab_template_lint",
+        argv=("python3", "scripts/check_collab_turn_templates.py"),
+        phases=frozenset({PHASE_PRE_COMMIT, PHASE_PRE_PUSH}),
+        surfaces=frozenset({SURFACE_COLLAB_PROTOCOL}),
+        always=False,
+    ),
+    Gate(
+        name="rust_fmt_check",
+        argv=("cargo", "fmt", "--all", "--", "--check"),
+        phases=frozenset({PHASE_PRE_COMMIT}),
+        surfaces=frozenset({SURFACE_RUST_WORKSPACE}),
+        always=False,
+    ),
+    Gate(
+        name="rust_clippy",
+        argv=(
+            "cargo",
+            "clippy",
+            "--workspace",
+            "--all-targets",
+            "--all-features",
+            "--",
+            "-D",
+            "warnings",
+        ),
+        phases=frozenset({PHASE_PRE_COMMIT}),
+        surfaces=frozenset({SURFACE_RUST_WORKSPACE}),
+        always=False,
+    ),
+    Gate(
+        name="rust_test",
+        argv=("cargo", "test", "--workspace"),
+        phases=frozenset({PHASE_PRE_PUSH}),
+        surfaces=frozenset({SURFACE_RUST_WORKSPACE}),
+        always=False,
+    ),
+)
 
 
 def gate_summary(paths: list[str]) -> tuple[bool, bool, bool]:
