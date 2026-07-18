@@ -116,6 +116,85 @@ def test_gate_rejects_non_bool_always():
         )
 
 
+# --- Gate domain validation -- a manifest typo must fail loudly ------------
+#
+# Shape-only type checks let a typo construct a perfectly well-formed Gate
+# that silently never runs (a misspelled phase) or blows up far from the
+# mistake with a bare KeyError (a misspelled surface). Domain validation moves
+# both failures to import time, where the offending value is still visible.
+
+
+def _gate(**overrides):
+    kwargs = {
+        "name": "example",
+        "argv": ("python3", "scripts/example.py"),
+        "phases": frozenset({hook.PHASE_PRE_COMMIT}),
+        "surfaces": frozenset({hook.SURFACE_HOOK_SELF_TEST}),
+        "always": False,
+    }
+    kwargs.update(overrides)
+    return hook.Gate(**kwargs)
+
+
+def test_gate_rejects_misspelled_phase():
+    # Without this guard `pre-comit` constructs cleanly and the gate never
+    # runs in any phase, with no error and no skip line.
+    with pytest.raises(ValueError) as excinfo:
+        _gate(phases=frozenset({"pre-comit"}))
+    assert "pre-comit" in str(excinfo.value)
+    assert "example" in str(excinfo.value)
+
+
+def test_gate_rejects_empty_phases():
+    with pytest.raises(ValueError) as excinfo:
+        _gate(phases=frozenset())
+    assert "example" in str(excinfo.value)
+
+
+def test_gate_rejects_misspelled_surface():
+    # Without this guard `rust_workspce` surfaces later as a bare KeyError
+    # from _SURFACE_ORDER, far from the manifest line that caused it.
+    with pytest.raises(ValueError) as excinfo:
+        _gate(surfaces=frozenset({"rust_workspce"}))
+    assert "rust_workspce" in str(excinfo.value)
+    assert "example" in str(excinfo.value)
+
+
+def test_gate_rejects_empty_surfaces_for_a_surface_selected_gate():
+    with pytest.raises(ValueError) as excinfo:
+        _gate(surfaces=frozenset(), always=False)
+    assert "example" in str(excinfo.value)
+
+
+def test_gate_allows_empty_surfaces_for_an_always_gate():
+    # An always=True gate runs regardless of what changed and never prints a
+    # skip line, so declaring no surface is meaningful for it -- unlike a
+    # surface-selected gate, which would simply never be selected.
+    gate = _gate(surfaces=frozenset(), always=True)
+    assert gate.surfaces == frozenset()
+
+
+def test_gate_rejects_empty_name():
+    with pytest.raises(ValueError):
+        _gate(name="")
+
+
+def test_gate_rejects_empty_argv():
+    # An empty argv reaches subprocess.run and raises outside the OSError-only
+    # catch in execute_gates.
+    with pytest.raises(ValueError) as excinfo:
+        _gate(argv=())
+    assert "example" in str(excinfo.value)
+
+
+def test_gate_accepts_every_declared_phase_and_surface():
+    gate = _gate(
+        phases=frozenset({hook.PHASE_PRE_COMMIT, hook.PHASE_PRE_PUSH}),
+        surfaces=frozenset(hook.SURFACES),
+    )
+    assert gate.surfaces == frozenset(hook.SURFACES)
+
+
 # --- Task 1: ChangeSet is frozen ---
 
 
@@ -143,6 +222,21 @@ def test_changeset_rejects_non_str_reason():
 def test_changeset_accepts_none_reason():
     changeset = hook.ChangeSet(paths=(), unknown=False, reason=None)
     assert changeset.reason is None
+
+
+def test_changeset_rejects_escalation_without_a_reason():
+    # The class docstring says `unknown=True` comes "with `reason` set".
+    # Allowing reason=None let an escalation run every gate while printing no
+    # explanation at all, so a surprising full run looked arbitrary.
+    with pytest.raises(ValueError):
+        hook.ChangeSet(paths=(), unknown=True, reason=None)
+
+
+def test_changeset_rejects_escalation_with_an_empty_reason():
+    # An empty string is the same silent escalation as None: execute_gates'
+    # `if changes.unknown and changes.reason:` guard is falsy for both.
+    with pytest.raises(ValueError):
+        hook.ChangeSet(paths=(), unknown=True, reason="")
 
 
 def test_changeset_default_construction():
@@ -1972,26 +2066,24 @@ def test_execute_gates_no_escalation_line_when_known(monkeypatch, capsys):
     assert "escalat" not in out.lower()
 
 
-def test_execute_gates_unknown_true_reason_none_prints_no_escalation_line_but_still_escalates(
-    monkeypatch, capsys
-):
-    # Pins the previously-untested `unknown=True, reason=None` combination:
-    # `if changes.unknown and changes.reason:` at the top of execute_gates
-    # means no escalation line prints when reason is falsy, even though
-    # resolve_gates still escalates to running every phase-matching gate on
-    # `changes.unknown` alone (independent of `reason`). Both halves of that
-    # behavior are asserted here so a future change can't silently drop
-    # either the guard or the escalation.
+def test_execute_gates_escalation_always_explains_itself(monkeypatch, capsys):
+    # CONTRACT CHANGE. This test previously pinned the `unknown=True,
+    # reason=None` combination: escalate to every phase-matching gate while
+    # printing no escalation line at all. That state is now unconstructible
+    # (ChangeSet.__post_init__ rejects it -- see
+    # test_changeset_rejects_escalation_without_a_reason), because a silent
+    # full run contradicts ChangeSet's own docstring and leaves a surprising
+    # run looking arbitrary. What is pinned here now is the replacement
+    # guarantee: whenever escalation happens, the reason is printed AND every
+    # phase-matching gate still runs.
     fake = _FakeGateRun({("python3", "scripts/test_run_git_hook.py"): 0})
     monkeypatch.setattr(hook.subprocess, "run", fake)
     hook_gate = next(gate for gate in hook.GATES if gate.name == "hook_self_test")
     monkeypatch.setattr(hook, "GATES", (hook_gate,))
-    changes = hook.ChangeSet(paths=(), unknown=True, reason=None)
+    changes = hook.ChangeSet(paths=(), unknown=True, reason="git diff exited 128")
     rc = hook.execute_gates(hook.PHASE_PRE_COMMIT, changes)
     out = capsys.readouterr().out
-    assert "escalat" not in out.lower()
-    # The gate still ran despite the silent escalation -- unknown=True alone
-    # is enough for resolve_gates to select it.
+    assert "escalating: git diff exited 128" in out
     assert rc == 0
     assert [cmd for cmd, _kwargs in fake.calls] == [
         ["python3", "scripts/test_run_git_hook.py"]

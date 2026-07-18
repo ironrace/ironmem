@@ -538,6 +538,14 @@ SURFACE_HOOK_SELF_TEST = "hook_self_test"
 SURFACE_DOCS = "docs"
 SURFACE_INERT_CONFIG = "inert_config"
 
+# Declared phase vocabulary, used by `Gate.__post_init__`'s domain validation,
+# `resolve_gates()`'s fail-loud guard, and `_cli_main`. Deliberately not
+# GATES-derived: an empty or mistyped manifest must not silently widen or
+# narrow which phase strings are considered valid. Declared here, above the
+# `GATES` manifest, because `Gate.__post_init__` reads it while that manifest
+# is being constructed at import time.
+_KNOWN_PHASES = frozenset({PHASE_PRE_COMMIT, PHASE_PRE_PUSH})
+
 # Not a declared surface -- the fail-closed fallback classify_path() returns
 # when a path is unsafe-shaped or matches no entry in SURFACES (including
 # DOCS). Deliberately absent from SURFACES: unlike DOCS, UNKNOWN is not a
@@ -570,6 +578,42 @@ class Gate:
         if not isinstance(self.always, bool):
             raise TypeError(f"Gate.always must be a bool, got {type(self.always).__name__}")
 
+        # Domain validation, not just shape. A type-correct typo is silent
+        # and permanent: `phases={"pre-comit"}` constructs cleanly and the
+        # gate then never runs in any phase, with no error and no skip line;
+        # `surfaces={"rust_workspce"}` surfaces much later as a bare KeyError
+        # out of `_SURFACE_ORDER`, far from the manifest line at fault. Both
+        # are raised here so a bad manifest fails at import time, naming the
+        # gate and the offending value. `SURFACES` and `_KNOWN_PHASES` are
+        # both declared above the `GATES` manifest for exactly this reason.
+        if not self.name:
+            raise ValueError("Gate.name must be a non-empty str")
+        if not self.argv:
+            raise ValueError(f"Gate {self.name!r}: argv must be a non-empty tuple")
+        if not self.phases:
+            raise ValueError(f"Gate {self.name!r}: phases must be a non-empty frozenset")
+        unknown_phases = self.phases - _KNOWN_PHASES
+        if unknown_phases:
+            raise ValueError(
+                f"Gate {self.name!r}: unknown phase(s) {sorted(unknown_phases)}; "
+                f"declared phases are {sorted(_KNOWN_PHASES)}"
+            )
+        if not self.surfaces and not self.always:
+            # An `always=True` gate legitimately declares no surface (it runs
+            # regardless of what changed and never prints a skip line). A
+            # surface-selected gate with no surface would simply never be
+            # selected -- the same silent no-op a misspelled phase produces.
+            raise ValueError(
+                f"Gate {self.name!r}: surfaces must be a non-empty frozenset "
+                "unless the gate is always=True"
+            )
+        unknown_surfaces = self.surfaces - frozenset(SURFACES)
+        if unknown_surfaces:
+            raise ValueError(
+                f"Gate {self.name!r}: unknown surface(s) {sorted(unknown_surfaces)}; "
+                f"declared surfaces are {sorted(SURFACES)}"
+            )
+
 
 @dataclasses.dataclass(frozen=True)
 class ChangeSet:
@@ -594,6 +638,13 @@ class ChangeSet:
             raise TypeError(
                 f"ChangeSet.reason must be a str or None, got {type(self.reason).__name__}"
             )
+        # Domain validation: escalation without an explanation contradicts
+        # this class's own docstring and makes a full gate run look
+        # arbitrary. `execute_gates` prints `reason` only when it is truthy,
+        # so an empty string is the same silent escalation as None -- both
+        # are rejected at construction rather than discovered at read time.
+        if self.unknown and not self.reason:
+            raise ValueError("ChangeSet.unknown=True requires a non-empty reason")
 
 
 # surface_id -> predicate. Predicates ported unchanged from the existing
@@ -731,12 +782,6 @@ GATES: tuple[Gate, ...] = (
         always=False,
     ),
 )
-
-
-# Declared phase vocabulary for resolve_gates()'s fail-loud guard below --
-# not GATES-derived, because an empty/mistyped manifest must not silently
-# widen or narrow which phase strings are considered valid.
-_KNOWN_PHASES = frozenset({PHASE_PRE_COMMIT, PHASE_PRE_PUSH})
 
 
 def resolve_gates(phase: str, changes: ChangeSet) -> tuple[Gate, ...]:
@@ -886,11 +931,13 @@ _SURFACE_ORDER: MappingProxyType[str, int] = MappingProxyType(
 
 def _ordered_surfaces(surface_ids: frozenset[str]) -> tuple[str, ...]:
     # Every `surface_id` here always comes from a `Gate.surfaces` frozenset,
-    # and every surface a Gate declares is a key in `SURFACES` (enforced by
-    # construction in the GATES manifest above), so `_SURFACE_ORDER[surface_id]`
-    # cannot KeyError today. Left unguarded deliberately: a gate declaring a
-    # surface absent from SURFACES is a manifest bug that should fail loud
-    # and immediately, not be swallowed into a silently-unordered fallback.
+    # every surface a Gate declares is a key in `SURFACES` -- enforced at
+    # construction by `Gate.__post_init__`'s domain validation, so a gate
+    # declaring an unknown surface now raises ValueError at import time
+    # naming the gate and the value, rather than reaching this lookup as a
+    # bare KeyError. Left unguarded deliberately for the same reason: a
+    # manifest bug should fail loud, not be swallowed into a
+    # silently-unordered fallback.
     return tuple(sorted(surface_ids, key=lambda surface_id: _SURFACE_ORDER[surface_id]))
 
 
