@@ -15,7 +15,7 @@ import pathlib
 import subprocess
 import sys
 from types import MappingProxyType
-from typing import Callable, Iterable
+from typing import Callable
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 ZERO_SHA = "0" * 40
@@ -58,64 +58,252 @@ def git(args: list[str], *, input_text: str | None = None, check: bool = True) -
     return result.stdout
 
 
-def unique(paths: Iterable[str]) -> list[str]:
-    seen: set[str] = set()
-    ordered: list[str] = []
-    for path in paths:
-        clean = path.strip()
-        if clean and clean not in seen:
-            seen.add(clean)
-            ordered.append(clean)
-    return ordered
+# --- Collection layer -- Git to ChangeSet, fail-closed ---------------------
+#
+# The only place in the collection layer that shells out. Decides nothing:
+# these functions turn Git's own output into a `ChangeSet` (see the frozen
+# data model below) and let `resolve_gates` decide what runs. Every Git
+# invocation uses `-z` NUL-delimited output, which removes `core.quotepath`
+# escaping at the source and makes newline-bearing filenames unambiguous
+# rather than a parsing hazard -- that is what makes byte-exact paths safe
+# here. No `.strip()`/unquoting/case-folding is ever applied to a *path*;
+# `.strip()` on a sha or ref name below is not a path and is not covered by
+# that rule.
+
+_HEX_DIGITS = frozenset("0123456789abcdefABCDEF")
 
 
-def staged_paths() -> list[str]:
-    output = git(["diff", "--cached", "--name-only", "--diff-filter=ACMRTUXB"])
-    return unique(output.splitlines())
+def _is_hex_sha(value: str) -> bool:
+    """True if `value` is a non-empty run of hex digits.
+
+    Git object ids in a pre-push stdin line are always hex; a `sha` field is
+    not a path, so validating/rejecting it is not covered by the
+    byte-exact-path constraint.
+    """
+    return len(value) > 0 and all(char in _HEX_DIGITS for char in value)
 
 
-def default_base(local_sha: str) -> str | None:
+def _split_nul(output: str) -> tuple[str, ...]:
+    """Split `-z` NUL-delimited Git output into a byte-exact tuple of paths.
+
+    Drops exactly one trailing empty field: `-z` terminates every path with
+    a NUL, so a non-empty listing always splits into N paths plus one
+    trailing empty string, and an empty listing is the empty string. That
+    trailing field is output *framing*, not path content -- dropping it is
+    not the byte-exact-path violation the no-`.strip()` rule forbids, and no
+    interior field (including one that happens to be empty, or one carrying
+    an embedded newline) is ever touched.
+    """
+    if output == "":
+        return ()
+    parts = output.split("\0")
+    if parts and parts[-1] == "":
+        parts = parts[:-1]
+    return tuple(parts)
+
+
+def _run_git(args: tuple[str, ...]) -> tuple[bool, int, str, str]:
+    """Invoke `git <args>`, capturing output without raising.
+
+    Returns `(subprocess_ok, returncode, stdout, reason)`. `subprocess_ok`
+    is False only when the subprocess call itself failed (git binary
+    missing, output undecodable, etc.) -- never based on git's own exit
+    code, which callers interpret themselves; this is the single fail-closed
+    boundary for Git subprocess calls in the collection layer, so a failure
+    here becomes a structured signal, never a traceback. `reason` is built
+    only from the argv and the exception's class name -- never from
+    output or environment -- so it cannot carry credentials or secrets.
+    """
+    try:
+        result = subprocess.run(
+            ["git", *args],
+            cwd=ROOT,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+    except Exception as exc:  # fail-closed: never let this propagate
+        return False, -1, "", f"git {args[0]} invocation raised {type(exc).__name__}"
+    return True, result.returncode, result.stdout, ""
+
+
+def _git_diff_paths_z(args: tuple[str, ...]) -> tuple[bool, tuple[str, ...], str]:
+    """Run a Git command expected to print `-z` NUL-delimited paths.
+
+    Returns `(ok, paths, reason)`. Unlike `_run_git`'s raw semantics (where a
+    non-zero exit is left to the caller), here a non-zero exit *is* a
+    collection failure: `ok=False` whenever the diff itself failed, not just
+    when the subprocess call did.
+    """
+    ok, returncode, stdout, reason = _run_git(args)
+    if not ok:
+        return False, (), reason
+    if returncode != 0:
+        return False, (), f"git {' '.join(args)} exited {returncode}"
+    return True, _split_nul(stdout), ""
+
+
+def _default_base(local_sha: str) -> tuple[bool, str | None, str]:
+    """Find a merge-base candidate for `local_sha`.
+
+    Tries, in order: `refs/remotes/origin/HEAD` (resolved via
+    `symbolic-ref`), then `origin/main`, `origin/master`, `main`, `master`.
+    Ported unchanged from the pre-refactor `default_base()`'s candidate
+    search.
+
+    Returns `(ok, base_or_none, reason)`. `ok` is False only on a
+    subprocess-level Git failure -- a candidate ref simply not existing
+    (non-zero exit) is expected and the next candidate is tried, not a
+    collection failure. `base_or_none` is `None` when no candidate resolves
+    (the caller falls back to a root diff), never when `ok` is False.
+    """
     candidates: list[str] = []
-    origin_head = git(["symbolic-ref", "--quiet", "refs/remotes/origin/HEAD"], check=False).strip()
-    if origin_head:
-        candidates.append(origin_head)
+    ok, returncode, stdout, reason = _run_git(
+        ("symbolic-ref", "--quiet", "refs/remotes/origin/HEAD")
+    )
+    if not ok:
+        return False, None, reason
+    if returncode == 0:
+        origin_head = stdout.strip()  # a ref name, not a path
+        if origin_head:
+            candidates.append(origin_head)
     candidates.extend(["origin/main", "origin/master", "main", "master"])
 
     for candidate in candidates:
-        base = git(["merge-base", local_sha, candidate], check=False).strip()
-        if base:
-            return base
-    return None
+        ok, returncode, stdout, reason = _run_git(("merge-base", local_sha, candidate))
+        if not ok:
+            return False, None, reason
+        if returncode == 0:
+            base = stdout.strip()  # a sha, not a path
+            if base:
+                return True, base, ""
+    return True, None, ""
+
+
+def _collect_update_paths(local_sha: str, remote_sha: str) -> tuple[bool, tuple[str, ...], str]:
+    """Collect the changed paths for one pre-push ref update.
+
+    Diffs `remote_sha..local_sha` directly when `remote_sha` is known.
+    Otherwise (branch creation / all-zero remote sha) resolves a base via
+    `_default_base` and diffs `base..local_sha`; when no base is found
+    (missing upstream), falls back to a root diff of `local_sha`. `-z`
+    NUL-delimited output throughout.
+    """
+    if remote_sha != ZERO_SHA:
+        return _git_diff_paths_z(("diff", "--name-only", "-z", f"{remote_sha}..{local_sha}"))
+
+    ok, base, reason = _default_base(local_sha)
+    if not ok:
+        return False, (), reason
+    if base is not None:
+        return _git_diff_paths_z(("diff", "--name-only", "-z", f"{base}..{local_sha}"))
+    return _git_diff_paths_z(
+        ("diff-tree", "--root", "--no-commit-id", "--name-only", "-z", "-r", local_sha)
+    )
+
+
+def _parse_pre_push_line(line: str) -> tuple[str, str, str, str] | None:
+    """Split one pre-push stdin line into its four whitespace-separated
+    fields (`local_ref local_sha remote_ref remote_sha`), or `None` if the
+    line is not exactly four fields.
+
+    `str.split()` (whitespace, no separator argument) is correct here: ref
+    names and shas never contain whitespace. Splitting/counting *stdin
+    fields* is not a path operation and is not covered by the
+    byte-exact-path constraint.
+    """
+    fields = line.split()
+    if len(fields) != 4:
+        return None
+    return fields[0], fields[1], fields[2], fields[3]
+
+
+def collect_pre_commit_changes() -> ChangeSet:
+    """Collect the `ChangeSet` for the pre-commit phase.
+
+    Runs `git diff --cached --name-only -z` -- the only Git invocation in
+    this function. Fails closed: a non-zero exit or any subprocess-level
+    failure (e.g. unreadable output) returns `unknown=True` with a
+    non-empty `reason` and never a traceback. An empty result with
+    `unknown=False` means genuinely nothing is staged, never that
+    collection broke.
+    """
+    ok, paths, reason = _git_diff_paths_z(("diff", "--cached", "--name-only", "-z"))
+    if not ok:
+        return ChangeSet(paths=paths, unknown=True, reason=reason)
+    return ChangeSet(paths=paths, unknown=False, reason=None)
+
+
+def collect_pre_push_changes(stdin_text: str) -> ChangeSet:
+    """Collect the `ChangeSet` for the pre-push phase from the ref-update
+    lines Git writes to stdin (`<local_ref> <local_sha> <remote_ref>
+    <remote_sha>` per line, per the pre-push hook contract).
+
+    Deletion refs (`local_sha` all-zero) are skipped. Each remaining update
+    is diffed via `_collect_update_paths`; the resulting paths accumulate
+    first-seen and dedupe across every update in the batch.
+
+    Fails closed on the first problem encountered -- a malformed line
+    (wrong field count, non-hex sha) or any per-update Git failure -- and
+    returns immediately with `unknown=True`, a non-empty `reason`, and
+    whatever paths were already collected from earlier updates in this same
+    batch. Never returns an empty path list to mean "collection broke";
+    that state is only ever `unknown=True`.
+    """
+    seen: dict[str, None] = {}
+    for line_number, line in enumerate(stdin_text.splitlines(), start=1):
+        fields = _parse_pre_push_line(line)
+        if fields is None:
+            return ChangeSet(
+                paths=tuple(seen),
+                unknown=True,
+                reason=f"malformed pre-push stdin line {line_number}: expected 4 fields",
+            )
+        _local_ref, local_sha, _remote_ref, remote_sha = fields
+        if not (_is_hex_sha(local_sha) and _is_hex_sha(remote_sha)):
+            return ChangeSet(
+                paths=tuple(seen),
+                unknown=True,
+                reason=f"malformed pre-push stdin line {line_number}: non-hex sha",
+            )
+        if local_sha == ZERO_SHA:
+            continue  # deletion ref: nothing to diff
+
+        ok, update_paths, reason = _collect_update_paths(local_sha, remote_sha)
+        if not ok:
+            return ChangeSet(paths=tuple(seen), unknown=True, reason=reason)
+        for path in update_paths:
+            seen.setdefault(path, None)
+
+    return ChangeSet(paths=tuple(seen), unknown=False, reason=None)
+
+
+def staged_paths() -> list[str]:
+    """Legacy adapter kept only for `run_pre_commit()`/`gate_summary()`
+    (Task 6 retires both along with this shim). Delegates real collection to
+    `collect_pre_commit_changes()`; the pre-refactor call site has no
+    `unknown` concept to propagate.
+    """
+    return list(collect_pre_commit_changes().paths)
 
 
 def pushed_paths(stdin_text: str) -> list[str]:
-    paths: list[str] = []
-    for line in stdin_text.splitlines():
-        parts = line.split()
-        if len(parts) != 4:
-            continue
-        _local_ref, local_sha, _remote_ref, remote_sha = parts
-        if local_sha == ZERO_SHA:
-            continue
-        if remote_sha != ZERO_SHA:
-            output = git(["diff", "--name-only", f"{remote_sha}..{local_sha}"])
-        else:
-            base = default_base(local_sha)
-            if base:
-                output = git(["diff", "--name-only", f"{base}..{local_sha}"])
-            else:
-                output = git(["diff-tree", "--root", "--no-commit-id", "--name-only", "-r", local_sha])
-        paths.extend(output.splitlines())
-
-    if paths:
-        return unique(paths)
-
-    # Defensive fallback for direct/manual invocation outside Git's pre-push
-    # stdin contract.
+    """Legacy adapter kept only for `run_pre_push()`/`gate_summary()` (Task
+    6 retires both along with this shim). Delegates real collection to
+    `collect_pre_push_changes()`; when that yields zero paths (empty/no-op
+    stdin, or any fail-closed escalation the pre-refactor code had no
+    concept of), falls through to the original direct/manual-invocation
+    fallback via `@{u}`, ported unchanged (still via the pre-refactor
+    `git()` helper -- `upstream` is a ref name, not a path, so its
+    `.strip()` is not the byte-exact violation the brief flagged).
+    """
+    changes = collect_pre_push_changes(stdin_text)
+    if changes.paths:
+        return list(changes.paths)
     upstream = git(["rev-parse", "--verify", "@{u}"], check=False).strip()
     if upstream:
-        output = git(["diff", "--name-only", f"{upstream}..HEAD"])
-        return unique(output.splitlines())
+        output = git(["diff", "--name-only", "-z", f"{upstream}..HEAD"])
+        return list(_split_nul(output))
     return []
 
 
