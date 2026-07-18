@@ -46,41 +46,6 @@ def load_hook_module():
 hook = load_hook_module()
 
 
-# --- path classification (ported from the former plain-assert self-test) ---
-
-
-def test_gate_summary_collab_exact_path():
-    collab, rust, hooks = hook.gate_summary(["docs/COLLAB.md"])
-    assert collab and not rust and not hooks
-
-
-def test_gate_summary_collab_turn_prefix():
-    collab, rust, hooks = hook.gate_summary(
-        [".claude-plugin/prompts/collab-turn-code-implement.md"]
-    )
-    assert collab and not rust and not hooks
-
-
-def test_gate_summary_rust_source():
-    collab, rust, hooks = hook.gate_summary(["crates/ironmem/src/hook.rs"])
-    assert rust and not collab and not hooks
-
-
-def test_gate_summary_rust_cargo_toml():
-    collab, rust, hooks = hook.gate_summary(["crates/ironmem/Cargo.toml"])
-    assert rust and not collab and not hooks
-
-
-def test_gate_summary_docs_only():
-    collab, rust, hooks = hook.gate_summary(["README.md"])
-    assert not collab and not rust and not hooks
-
-
-def test_gate_summary_hook_path():
-    collab, rust, hooks = hook.gate_summary(["scripts/run_git_hook.py"])
-    assert hooks and not collab and not rust
-
-
 # --- Task 1: Gate is frozen ---
 
 
@@ -1125,117 +1090,10 @@ def test_collect_pre_push_changes_malformed_stdin_is_unknown_never_raises(monkey
     assert fake.calls == []
 
 
-# --- legacy adapters (Task 6 retires run_pre_commit/run_pre_push and these
-# adapters together; kept working in the meantime per the task brief) ------
-
-
-def test_staged_paths_delegates_to_collect_pre_commit_changes(monkeypatch):
-    fake = _FakeGitRun({("diff", "--cached", "--name-only", "-z"): (0, "a.py\0")})
-    monkeypatch.setattr(hook.subprocess, "run", fake)
-    assert hook.staged_paths() == ["a.py"]
-
-
-def test_pushed_paths_delegates_when_stdin_yields_paths(monkeypatch):
-    stdin = _pre_push_line("refs/heads/a", SHA_B, "refs/heads/a", SHA_A) + "\n"
-    fake = _FakeGitRun({("diff", "--name-only", "-z", f"{SHA_A}..{SHA_B}"): (0, "x.py\0")})
-    monkeypatch.setattr(hook.subprocess, "run", fake)
-    assert hook.pushed_paths(stdin) == ["x.py"]
-
-
-def test_pushed_paths_falls_back_to_upstream_when_no_stdin_paths(monkeypatch):
-    fake = _FakeGitRun(
-        {
-            ("rev-parse", "--verify", "@{u}"): (0, SHA_A + "\n"),
-            ("diff", "--name-only", "-z", f"{SHA_A}..HEAD"): (0, "manual.py\0"),
-        }
-    )
-    monkeypatch.setattr(hook.subprocess, "run", fake)
-    assert hook.pushed_paths("") == ["manual.py"]
-
-
-def test_pushed_paths_no_upstream_returns_empty_list(monkeypatch):
-    fake = _FakeGitRun({("rev-parse", "--verify", "@{u}"): (128, "")})
-    monkeypatch.setattr(hook.subprocess, "run", fake)
-    assert hook.pushed_paths("") == []
-
-
-# --- legacy adapters -- escalate on collection failure, never flatten to []
-#
-# This is the fix for the critical finding: staged_paths()/pushed_paths()
-# used to discard `changes.unknown` and return `list(changes.paths)`
-# unconditionally, which turned a fail-closed Git failure into an empty list
-# at the only wired call site (run_pre_commit()/run_pre_push() both treat an
-# empty list as "nothing to do, exit 0, run zero gates"). Both adapters must
-# now raise SystemExit instead of ever returning a flattened `[]` on
-# `unknown=True`.
-
-
-def test_staged_paths_raises_systemexit_on_git_failure(monkeypatch, capsys):
-    fake = _FakeGitRun({("diff", "--cached", "--name-only", "-z"): (128, "")})
-    monkeypatch.setattr(hook.subprocess, "run", fake)
-    with pytest.raises(SystemExit) as excinfo:
-        hook.staged_paths()
-    assert excinfo.value.code != 0
-    assert "failed to collect staged changes" in capsys.readouterr().err
-
-
-def test_staged_paths_raises_systemexit_on_subprocess_failure(monkeypatch):
-    fake = _FakeGitRun(
-        {("diff", "--cached", "--name-only", "-z"): FileNotFoundError("git: command not found")}
-    )
-    monkeypatch.setattr(hook.subprocess, "run", fake)
-    with pytest.raises(SystemExit):
-        hook.staged_paths()
-
-
-def test_pushed_paths_raises_systemexit_on_malformed_stdin(monkeypatch, capsys):
-    fake = _FakeGitRun({})
-    monkeypatch.setattr(hook.subprocess, "run", fake)
-    with pytest.raises(SystemExit) as excinfo:
-        hook.pushed_paths("refs/heads/a onlythreefields\n")
-    assert excinfo.value.code != 0
-    assert "failed to collect pushed changes" in capsys.readouterr().err
-    # Escalation happens before any fallback -- the @{u} path must never be
-    # attempted once unknown=True.
-    assert fake.calls == []
-
-
-def test_pushed_paths_raises_systemexit_on_git_failure_mid_batch(monkeypatch):
-    stdin = _pre_push_line("refs/heads/a", SHA_B, "refs/heads/a", SHA_A) + "\n"
-    fake = _FakeGitRun({("diff", "--name-only", "-z", f"{SHA_A}..{SHA_B}"): (128, "")})
-    monkeypatch.setattr(hook.subprocess, "run", fake)
-    with pytest.raises(SystemExit):
-        hook.pushed_paths(stdin)
-
-
-# --- run_pre_commit/run_pre_push -- the property that was lost: a Git
-# failure must never present as "no changes, zero gates, exit 0" -----------
-
-
-def test_run_pre_commit_never_exits_zero_with_no_gates_on_git_failure(monkeypatch):
-    fake = _FakeGitRun({("diff", "--cached", "--name-only", "-z"): (128, "")})
-    monkeypatch.setattr(hook.subprocess, "run", fake)
-    with pytest.raises(SystemExit) as excinfo:
-        hook.run_pre_commit()
-    # The old defect: this would print "no staged files; skipping gates" and
-    # return 0, running zero gates on a broken/unavailable Git. It must now
-    # abort loudly instead.
-    assert excinfo.value.code != 0
-
-
-def test_run_pre_push_never_exits_zero_with_no_gates_on_git_failure(monkeypatch):
-    stdin = _pre_push_line("refs/heads/a", SHA_B, "refs/heads/a", SHA_A) + "\n"
-    fake = _FakeGitRun({("diff", "--name-only", "-z", f"{SHA_A}..{SHA_B}"): (128, "")})
-    monkeypatch.setattr(hook.subprocess, "run", fake)
-    monkeypatch.setattr(sys, "stdin", _StdinStub(stdin))
-    with pytest.raises(SystemExit) as excinfo:
-        hook.run_pre_push()
-    assert excinfo.value.code != 0
-
-
 class _StdinStub:
     """Minimal stand-in for sys.stdin exposing only the .read() that
-    run_pre_push() calls -- avoids touching the real process stdin in tests.
+    main("pre-push") calls -- avoids touching the real process stdin in
+    tests.
     """
 
     def __init__(self, text: str) -> None:
@@ -1243,6 +1101,22 @@ class _StdinStub:
 
     def read(self) -> str:
         return self._text
+
+
+# --- Task 6: legacy retirement -- these symbols must be gone, not merely
+# unused --------------------------------------------------------------------
+
+
+def test_legacy_pre_task6_functions_are_removed():
+    for name in (
+        "run_pre_commit",
+        "run_pre_push",
+        "gate_summary",
+        "run",
+        "staged_paths",
+        "pushed_paths",
+    ):
+        assert not hasattr(hook, name), f"{name} should have been retired in Task 6"
 
 
 # --- Task 5: execution layer -- hardened subprocess contract --------------
@@ -1720,6 +1594,314 @@ def test_execute_gates_scrubs_git_env_before_running_a_gate(monkeypatch):
     assert child_env.get("GIT_ASKPASS") == "/usr/bin/askpass"
     # Non-Git variables inherited from the real environment must survive.
     assert child_env.get("PATH") == os.environ.get("PATH")
+
+
+# --- Task 6: main(phase) -- collect -> resolve -> execute, wired end-to-end
+#
+# No test in this section invokes real Git or a real gate command. Every
+# `subprocess.run` call goes through `_FakeSubprocessRun` below: unlike
+# `_FakeGitRun` (asserts `cmd[0] == "git"`) or `_FakeGateRun` (keyed only on
+# gate argv), `main()` drives both kinds of call through the same
+# `subprocess.run` seam in one test, so this fake is keyed on the exact full
+# argv tuple regardless of program name. An unanticipated call raises
+# KeyError, proving each test drives an exact, intentional call sequence.
+
+
+class _FakeSubprocessRun:
+    """Stand-in for `subprocess.run` used by every Task 6 `main()`/
+    `_cli_main()` test. `responses` maps a full argv tuple to either
+    `(returncode, stdout)` (the shape Git collection calls need), a bare
+    `int` returncode (the shape gate calls need -- `execute_gates` never
+    reads `stdout`), or an exception instance to raise.
+    """
+
+    def __init__(self, responses):
+        self.responses = responses
+        self.calls: list[list[str]] = []
+
+    def __call__(self, cmd, **kwargs):
+        self.calls.append(list(cmd))
+        outcome = self.responses[tuple(cmd)]
+        if isinstance(outcome, BaseException):
+            raise outcome
+        if isinstance(outcome, tuple):
+            returncode, stdout = outcome
+            return subprocess.CompletedProcess(cmd, returncode, stdout=stdout, stderr="")
+        return subprocess.CompletedProcess(cmd, outcome)
+
+
+_RUST_FMT_ARGV = ("cargo", "fmt", "--all", "--", "--check")
+_RUST_CLIPPY_ARGV = (
+    "cargo",
+    "clippy",
+    "--workspace",
+    "--all-targets",
+    "--all-features",
+    "--",
+    "-D",
+    "warnings",
+)
+_RUST_TEST_ARGV = ("cargo", "test", "--workspace")
+_HOOK_SELF_TEST_ARGV = ("python3", "scripts/test_run_git_hook.py")
+_HOOK_INSTALL_CHECK_ARGV = ("bash", "scripts/install-git-hooks.sh", "--check")
+_COLLAB_LINT_ARGV = ("python3", "scripts/check_collab_turn_templates.py")
+
+
+# --- main() -- end-to-end, one phase at a time: a Rust-only change selects
+# exactly today's gate set for that phase (exact sequence, not a count) ----
+
+
+def test_main_pre_commit_rust_only_change_runs_exact_gate_sequence(monkeypatch):
+    fake = _FakeSubprocessRun(
+        {
+            ("git", "diff", "--cached", "--name-only", "-z"): (
+                0,
+                "crates/ironmem/src/hook.rs\0",
+            ),
+            _RUST_FMT_ARGV: 0,
+            _RUST_CLIPPY_ARGV: 0,
+        }
+    )
+    monkeypatch.setattr(hook.subprocess, "run", fake)
+    rc = hook.main(hook.PHASE_PRE_COMMIT)
+    assert rc == 0
+    assert fake.calls == [
+        ["git", "diff", "--cached", "--name-only", "-z"],
+        list(_RUST_FMT_ARGV),
+        list(_RUST_CLIPPY_ARGV),
+    ]
+
+
+def test_main_pre_push_rust_only_change_runs_exact_gate_sequence(monkeypatch):
+    stdin = _pre_push_line("refs/heads/feature", SHA_B, "refs/heads/feature", SHA_A) + "\n"
+    fake = _FakeSubprocessRun(
+        {
+            ("git", "diff", "--name-only", "-z", f"{SHA_A}..{SHA_B}"): (
+                0,
+                "crates/ironmem/src/hook.rs\0",
+            ),
+            _RUST_TEST_ARGV: 0,
+        }
+    )
+    monkeypatch.setattr(hook.subprocess, "run", fake)
+    monkeypatch.setattr(sys, "stdin", _StdinStub(stdin))
+    rc = hook.main(hook.PHASE_PRE_PUSH)
+    assert rc == 0
+    assert fake.calls == [
+        ["git", "diff", "--name-only", "-z", f"{SHA_A}..{SHA_B}"],
+        list(_RUST_TEST_ARGV),
+    ]
+
+
+# --- main() -- fail-closed property, now via collect -> execute_gates
+# directly (no raising legacy adapter in between)
+#
+# Global constraint: "A Git failure must not let the hook exit 0 with zero
+# gates run." Under this architecture that guarantee is upheld differently
+# than the pre-Task-6 staged_paths()/pushed_paths() SystemExit: a Git
+# failure sets ChangeSet.unknown=True, and resolve_gates (already wired,
+# unchanged by this task) escalates unknown=True to select every
+# phase-matching gate -- main() never special-cases this, it falls out
+# directly from collect -> execute_gates. So the property proven here is
+# "every phase gate is actually attempted, and its real result decides the
+# exit code" -- never "silently present as success having run nothing".
+
+
+def test_main_pre_commit_git_failure_escalates_to_every_gate_never_zero_gates_run(
+    monkeypatch, capsys
+):
+    fake = _FakeSubprocessRun(
+        {
+            ("git", "diff", "--cached", "--name-only", "-z"): (128, ""),
+            _HOOK_SELF_TEST_ARGV: 0,
+            _HOOK_INSTALL_CHECK_ARGV: 0,
+            _COLLAB_LINT_ARGV: 0,
+            _RUST_FMT_ARGV: 0,
+            _RUST_CLIPPY_ARGV: 0,
+        }
+    )
+    monkeypatch.setattr(hook.subprocess, "run", fake)
+    rc = hook.main(hook.PHASE_PRE_COMMIT)
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "escalating" in out
+    non_git_calls = [cmd for cmd in fake.calls if cmd[0] != "git"]
+    # Every pre-commit gate was actually attempted -- the old defect ("no
+    # staged files; skipping gates", exit 0, zero gates run) cannot recur: a
+    # Git failure here forces the full phase gate set to run.
+    assert non_git_calls == [
+        list(_HOOK_SELF_TEST_ARGV),
+        list(_HOOK_INSTALL_CHECK_ARGV),
+        list(_COLLAB_LINT_ARGV),
+        list(_RUST_FMT_ARGV),
+        list(_RUST_CLIPPY_ARGV),
+    ]
+
+
+def test_main_pre_commit_git_failure_escalated_gate_failure_is_nonzero_exit(monkeypatch):
+    fake = _FakeSubprocessRun(
+        {
+            ("git", "diff", "--cached", "--name-only", "-z"): (128, ""),
+            _HOOK_SELF_TEST_ARGV: 1,
+        }
+    )
+    monkeypatch.setattr(hook.subprocess, "run", fake)
+    rc = hook.main(hook.PHASE_PRE_COMMIT)
+    assert rc == 1
+
+
+def test_main_pre_push_git_failure_escalates_to_every_gate(monkeypatch, capsys):
+    stdin = _pre_push_line("refs/heads/a", SHA_B, "refs/heads/a", SHA_A) + "\n"
+    fake = _FakeSubprocessRun(
+        {
+            ("git", "diff", "--name-only", "-z", f"{SHA_A}..{SHA_B}"): (128, ""),
+            _HOOK_SELF_TEST_ARGV: 0,
+            _COLLAB_LINT_ARGV: 0,
+            _RUST_TEST_ARGV: 0,
+        }
+    )
+    monkeypatch.setattr(hook.subprocess, "run", fake)
+    monkeypatch.setattr(sys, "stdin", _StdinStub(stdin))
+    rc = hook.main(hook.PHASE_PRE_PUSH)
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "escalating" in out
+    non_git_calls = [cmd for cmd in fake.calls if cmd[0] != "git"]
+    assert non_git_calls == [
+        list(_HOOK_SELF_TEST_ARGV),
+        list(_COLLAB_LINT_ARGV),
+        list(_RUST_TEST_ARGV),
+    ]
+    # The @{u} fallback must never fire once unknown=True -- escalation, not
+    # the manual-invocation fallback, is the fail-closed path here.
+    assert ("git", "rev-parse", "--verify", "@{u}") not in [tuple(c) for c in fake.calls]
+
+
+def test_main_unknown_phase_raises_before_any_io(monkeypatch):
+    def poison(cmd, **kwargs):
+        raise AssertionError(f"unexpected subprocess.run call: {cmd}")
+
+    monkeypatch.setattr(hook.subprocess, "run", poison)
+    with pytest.raises(ValueError):
+        hook.main("typo-phase")
+
+
+# --- main("pre-push") -- @{u} fallback for manual/direct invocation -------
+#
+# DECISION (see task-6-report.md for the full rationale): kept, ported from
+# the retired pushed_paths()'s `@{u}` fallback. The real `git push`-invoked
+# hook always pipes ref-update lines to stdin, so collect_pre_push_changes
+# never legitimately sees empty/no-line stdin in that path; this fallback
+# exists solely for a developer running
+# `python3 scripts/run_git_hook.py pre-push` directly with no piped stdin.
+# Implemented in main() itself, not inside collect_pre_push_changes() --
+# that function's empty-stdin contract (unknown=False, paths=(), no Git
+# calls -- see test_collect_pre_push_changes_empty_stdin_is_not_unknown) is
+# Task 4's already-tested collection-layer behavior and is not touched here.
+
+
+def test_main_pre_push_manual_invocation_falls_back_to_upstream(monkeypatch):
+    fake = _FakeSubprocessRun(
+        {
+            ("git", "rev-parse", "--verify", "@{u}"): (0, SHA_A + "\n"),
+            ("git", "diff", "--name-only", "-z", f"{SHA_A}..HEAD"): (
+                0,
+                "crates/ironmem/src/hook.rs\0",
+            ),
+            _RUST_TEST_ARGV: 0,
+        }
+    )
+    monkeypatch.setattr(hook.subprocess, "run", fake)
+    monkeypatch.setattr(sys, "stdin", _StdinStub(""))
+    rc = hook.main(hook.PHASE_PRE_PUSH)
+    assert rc == 0
+    assert fake.calls == [
+        ["git", "rev-parse", "--verify", "@{u}"],
+        ["git", "diff", "--name-only", "-z", f"{SHA_A}..HEAD"],
+        list(_RUST_TEST_ARGV),
+    ]
+
+
+def test_main_pre_push_manual_invocation_no_upstream_runs_no_gates(monkeypatch):
+    fake = _FakeSubprocessRun({("git", "rev-parse", "--verify", "@{u}"): (128, "")})
+    monkeypatch.setattr(hook.subprocess, "run", fake)
+    monkeypatch.setattr(sys, "stdin", _StdinStub(""))
+    rc = hook.main(hook.PHASE_PRE_PUSH)
+    assert rc == 0
+    assert fake.calls == [["git", "rev-parse", "--verify", "@{u}"]]
+
+
+def test_main_pre_push_manual_invocation_upstream_diff_failure_raises_systemexit(monkeypatch):
+    # Ported behavior: the fallback's diff call uses the legacy `git()`
+    # helper at its default `check=True`, so a Git failure here aborts
+    # immediately via SystemExit -- zero gates run, matching the literal
+    # pre-Task-6 pushed_paths() `@{u}` fallback behavior (distinct from the
+    # primary collection path above, which escalates instead of aborting).
+    fake = _FakeSubprocessRun(
+        {
+            ("git", "rev-parse", "--verify", "@{u}"): (0, SHA_A + "\n"),
+            ("git", "diff", "--name-only", "-z", f"{SHA_A}..HEAD"): (128, ""),
+        }
+    )
+    monkeypatch.setattr(hook.subprocess, "run", fake)
+    monkeypatch.setattr(sys, "stdin", _StdinStub(""))
+    with pytest.raises(SystemExit):
+        hook.main(hook.PHASE_PRE_PUSH)
+
+
+def test_main_pre_push_with_stdin_paths_never_triggers_upstream_fallback(monkeypatch):
+    stdin = _pre_push_line("refs/heads/a", SHA_B, "refs/heads/a", SHA_A) + "\n"
+    fake = _FakeSubprocessRun(
+        {("git", "diff", "--name-only", "-z", f"{SHA_A}..{SHA_B}"): (0, "README.md\0")}
+    )
+    monkeypatch.setattr(hook.subprocess, "run", fake)
+    monkeypatch.setattr(sys, "stdin", _StdinStub(stdin))
+    rc = hook.main(hook.PHASE_PRE_PUSH)
+    assert rc == 0
+    # Non-empty paths (even docs-only, which selects zero gates) must never
+    # trigger the @{u} fallback -- it is reserved for the genuinely-empty
+    # case only.
+    assert fake.calls == [["git", "diff", "--name-only", "-z", f"{SHA_A}..{SHA_B}"]]
+
+
+# --- _cli_main(argv) -- the usage-error / exit-2 contract, preserved from
+# the pre-Task-6 main(argv) ---------------------------------------------
+#
+# No subprocess mocking needed for the invalid-argv cases: validation must
+# reject before any collection or gate I/O is attempted.
+
+
+def test_cli_main_missing_argument_prints_usage_and_returns_2(capsys):
+    assert hook._cli_main(["scripts/run_git_hook.py"]) == 2
+    err = capsys.readouterr().err
+    assert err == "usage: scripts/run_git_hook.py <pre-commit|pre-push>\n"
+
+
+def test_cli_main_bad_argument_prints_usage_and_returns_2(capsys):
+    assert hook._cli_main(["scripts/run_git_hook.py", "typo-phase"]) == 2
+    err = capsys.readouterr().err
+    assert err == "usage: scripts/run_git_hook.py <pre-commit|pre-push>\n"
+
+
+def test_cli_main_extra_arguments_prints_usage_and_returns_2(capsys):
+    assert hook._cli_main(["scripts/run_git_hook.py", "pre-commit", "extra"]) == 2
+
+
+def test_cli_main_valid_phase_delegates_to_main(monkeypatch):
+    calls = []
+
+    def fake_main(phase):
+        calls.append(phase)
+        return 0
+
+    monkeypatch.setattr(hook, "main", fake_main)
+    assert hook._cli_main(["scripts/run_git_hook.py", "pre-commit"]) == 0
+    assert calls == ["pre-commit"]
+
+
+def test_cli_main_propagates_main_exit_code(monkeypatch):
+    monkeypatch.setattr(hook, "main", lambda phase: 3)
+    assert hook._cli_main(["scripts/run_git_hook.py", "pre-push"]) == 3
 
 
 # --- module-wide static guard -----------------------------------------------

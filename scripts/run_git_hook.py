@@ -39,11 +39,6 @@ HOOK_EXACT_PATHS = {
 }
 
 
-def run(cmd: list[str]) -> int:
-    print(f"[git-hook] {' '.join(cmd)}", flush=True)
-    return subprocess.run(cmd, cwd=ROOT).returncode
-
-
 def git(args: list[str], *, input_text: str | None = None, check: bool = True) -> str:
     result = subprocess.run(
         ["git", *args],
@@ -299,64 +294,6 @@ def collect_pre_push_changes(stdin_text: str) -> ChangeSet:
     return ChangeSet(paths=tuple(seen), unknown=False, reason=None)
 
 
-def staged_paths() -> list[str]:
-    """Legacy adapter kept only for `run_pre_commit()`/`gate_summary()`
-    (Task 6 retires both along with this shim). Delegates real collection to
-    `collect_pre_commit_changes()`.
-
-    The pre-refactor call site had no `unknown` concept, but it was still
-    fail-closed by construction: it called `git([...])` with the default
-    `check=True`, so a non-zero `git diff --cached` exit raised
-    `SystemExit(returncode)` and aborted the commit loudly. Flattening
-    `changes.unknown` away here (i.e. just returning `list(changes.paths)`)
-    would silently convert that into "no staged files, skip gates, exit 0" --
-    a fail-closed collection failure re-presenting as fail-open at the only
-    wired call site. Raise `SystemExit` instead, preserving the pre-refactor
-    loudness.
-    """
-    changes = collect_pre_commit_changes()
-    if changes.unknown:
-        sys.stderr.write(f"[git-hook] failed to collect staged changes: {changes.reason}\n")
-        raise SystemExit(1)
-    return list(changes.paths)
-
-
-def pushed_paths(stdin_text: str) -> list[str]:
-    """Legacy adapter kept only for `run_pre_push()`/`gate_summary()` (Task
-    6 retires both along with this shim). Delegates real collection to
-    `collect_pre_push_changes()`.
-
-    Escalates immediately -- raising `SystemExit`, mirroring `staged_paths()`
-    -- when `changes.unknown` is True, rather than falling through to the
-    `@{u}` fallback below or returning `[]`: either of those would convert a
-    fail-closed Git failure into "no pushed changes, skip gates, exit 0" at
-    the only wired call site, exactly the defect being fixed here. Only a
-    *genuine* empty result (`unknown=False`, e.g. empty/no-op stdin, the
-    manual-invocation case the pre-refactor code handled) falls through to
-    the original direct-invocation fallback via `@{u}`, ported unchanged
-    (still via the pre-refactor `git()` helper -- `upstream` is a ref name,
-    not a path, so its `.strip()` is not the byte-exact violation the brief
-    flagged).
-    """
-    changes = collect_pre_push_changes(stdin_text)
-    if changes.unknown:
-        sys.stderr.write(f"[git-hook] failed to collect pushed changes: {changes.reason}\n")
-        raise SystemExit(1)
-    if changes.paths:
-        return list(changes.paths)
-    # Task 6 deletes this shim (`pushed_paths()`) along with the rest of the
-    # legacy adapters. Nothing outside this function today exercises this
-    # `@{u}` fallback except a manual `pre-push`-style invocation with no
-    # stdin (no upstream-tracking ref piped in). If Task 6 removes this
-    # function without carrying an equivalent fallback forward, that manual
-    # invocation path silently loses it -- this comment is the tripwire.
-    upstream = git(["rev-parse", "--verify", "@{u}"], check=False).strip()
-    if upstream:
-        output = git(["diff", "--name-only", "-z", f"{upstream}..HEAD"])
-        return list(_split_nul(output))
-    return []
-
-
 def is_rust_path(path: str) -> bool:
     name = pathlib.PurePosixPath(path).name
     return (
@@ -391,9 +328,10 @@ def is_docs_path(path: str) -> bool:
 
 # --- Frozen data model -------------------------------------------------
 #
-# `Gate`/`ChangeSet`/`GATES`/`SURFACES` are the pure data layer the rest of
-# the collect -> resolve -> execute pipeline (later tasks) will read. Nothing
-# below is wired into run_pre_commit()/run_pre_push() yet.
+# `Gate`/`ChangeSet`/`GATES`/`SURFACES` are the pure data layer the
+# collect -> resolve -> execute pipeline reads. `main()` (bottom of this
+# file) is what wires collection, `resolve_gates`, and `execute_gates`
+# together; nothing in this section performs I/O itself.
 
 PHASE_PRE_COMMIT = "pre-commit"
 PHASE_PRE_PUSH = "pre-push"
@@ -536,8 +474,8 @@ def classify_path(path: object) -> str:
 
 
 # Declaration order IS execution order. Never sorted at runtime. Ported
-# unchanged from today's run_pre_commit()/run_pre_push() conditional
-# assembly (same argv, same phase membership).
+# unchanged from the pre-Task-6 run_pre_commit()/run_pre_push() conditional
+# assembly this manifest replaced (same argv, same phase membership).
 GATES: tuple[Gate, ...] = (
     Gate(
         name="hook_self_test",
@@ -644,9 +582,8 @@ def resolve_gates(phase: str, changes: ChangeSet) -> tuple[Gate, ...]:
 #
 # `execute_gates` is the last stage of collect -> resolve -> execute. It
 # re-derives nothing: `resolve_gates` alone decides which gates run, this
-# layer only runs them and reports. Not wired into run_pre_commit()/
-# run_pre_push()/main() yet -- Task 6 does that and retires the legacy
-# run_pre_commit()/run_pre_push()/gate_summary()/run() functions below.
+# layer only runs them and reports. `main()` (bottom of this file) wires
+# this together with the collection layer above.
 
 # Repo-redirecting variables: inheriting any of these points a child Git
 # invocation at a *different* repository than the one the hook is running
@@ -816,97 +753,86 @@ def execute_gates(phase: str, changes: ChangeSet) -> int:
     return 0
 
 
-def gate_summary(paths: list[str]) -> tuple[bool, bool, bool]:
-    return (
-        any(is_collab_protocol_path(path) for path in paths),
-        any(is_rust_path(path) for path in paths),
-        any(is_hook_path(path) for path in paths),
-    )
+# --- Task 6: main(phase) -- collect -> resolve -> execute, wired end-to-end
+#
+# This is the only place run_pre_commit()/run_pre_push()'s old conditional
+# assembly is replaced: no per-surface branching lives here or anywhere else
+# in the file -- `resolve_gates` (via `execute_gates`) alone decides which
+# gates run.
 
 
-def run_pre_commit() -> int:
-    paths = staged_paths()
-    if not paths:
-        print("[pre-commit] no staged files; skipping gates")
-        return 0
+def _pre_push_manual_upstream_changes() -> ChangeSet:
+    """Fallback for a manual/direct `pre-push` invocation with no piped
+    ref-update lines on stdin. `main()` calls this only when
+    `collect_pre_push_changes` already returned a genuinely empty,
+    non-`unknown` result -- the real `git push`-invoked hook always pipes
+    stdin per the pre-push hook contract, so this exists solely for a
+    developer running `python3 scripts/run_git_hook.py pre-push` directly
+    with no input.
 
-    collab_changed, rust_changed, hooks_changed = gate_summary(paths)
-    print(f"[pre-commit] staged files: {len(paths)}")
+    DECISION (Task 6): kept, ported unchanged from the retired
+    `pushed_paths()`'s `@{u}` fallback -- including reusing the original ad
+    hoc `git()` helper (not the fail-closed `_run_git`/`_git_diff_paths_z`
+    helpers the real collection path above uses). This is a best-effort
+    convenience for manual invocation, not the hardened contract those
+    helpers exist to provide: a diff failure here raises `SystemExit` via
+    `git()`'s default `check=True`, aborting before any gate runs, the same
+    way the pre-Task-6 fallback did. An absent `@{u}` (no upstream
+    configured) resolves to a genuinely empty `ChangeSet`, not
+    `unknown=True` -- that is an expected outcome for a branch with no
+    upstream, not a collection failure.
+    """
+    upstream = git(["rev-parse", "--verify", "@{u}"], check=False).strip()
+    if not upstream:
+        return ChangeSet(paths=(), unknown=False, reason=None)
+    output = git(["diff", "--name-only", "-z", f"{upstream}..HEAD"])
+    return ChangeSet(paths=_split_nul(output), unknown=False, reason=None)
 
-    commands: list[list[str]] = []
-    if hooks_changed:
-        commands.extend(
-            [
-                ["python3", "scripts/test_run_git_hook.py"],
-                ["bash", "scripts/install-git-hooks.sh", "--check"],
-            ]
+
+def main(phase: str) -> int:
+    """Run the collect -> resolve -> execute pipeline for `phase`.
+
+    `phase` must be `PHASE_PRE_COMMIT` or `PHASE_PRE_PUSH`; anything else
+    raises `ValueError` (the same phase-vocabulary guard `resolve_gates`
+    enforces), checked here first so an invalid phase fails before any I/O
+    -- CLI-level validation (the usage message, exit code 2) is
+    `_cli_main`'s job, not this function's.
+
+    pre-commit collects via `collect_pre_commit_changes()`. pre-push reads
+    the ref-update batch from stdin via `collect_pre_push_changes()`; when
+    that yields a genuinely empty, non-`unknown` result (no piped lines at
+    all), falls back to `_pre_push_manual_upstream_changes()` for a manual
+    invocation outside Git's stdin contract (see that function's docstring
+    for why this is kept and what it does and does not cover). Either way,
+    `execute_gates(phase, changes)` alone decides and runs the gates -- this
+    function never re-derives that decision.
+    """
+    if phase not in _KNOWN_PHASES:
+        raise ValueError(f"unknown phase: {phase!r}")
+    if phase == PHASE_PRE_COMMIT:
+        changes = collect_pre_commit_changes()
+    else:
+        changes = collect_pre_push_changes(sys.stdin.read())
+        if not changes.unknown and not changes.paths:
+            changes = _pre_push_manual_upstream_changes()
+    return execute_gates(phase, changes)
+
+
+def _cli_main(argv: list[str]) -> int:
+    """Parse `argv` (as `sys.argv`: `argv[0]` the script path, `argv[1]` the
+    phase) and dispatch to `main()`. A missing, unrecognized, or extra
+    argument prints the usage line to stderr and returns 2 without calling
+    `main()` -- the CLI contract preserved unchanged from the pre-Task-6
+    `main(argv)`.
+    """
+    if len(argv) != 2 or argv[1] not in _KNOWN_PHASES:
+        print(
+            f"usage: scripts/run_git_hook.py <{PHASE_PRE_COMMIT}|{PHASE_PRE_PUSH}>",
+            file=sys.stderr,
         )
-    if collab_changed:
-        commands.append(["python3", "scripts/check_collab_turn_templates.py"])
-    if rust_changed:
-        commands.extend(
-            [
-                ["cargo", "fmt", "--all", "--", "--check"],
-                [
-                    "cargo",
-                    "clippy",
-                    "--workspace",
-                    "--all-targets",
-                    "--all-features",
-                    "--",
-                    "-D",
-                    "warnings",
-                ],
-            ]
-        )
-
-    if not commands:
-        print("[pre-commit] docs/config-only change; no local gates required")
-        return 0
-
-    for cmd in commands:
-        rc = run(cmd)
-        if rc != 0:
-            return rc
-    return 0
-
-
-def run_pre_push() -> int:
-    paths = pushed_paths(sys.stdin.read())
-    if not paths:
-        print("[pre-push] no pushed file changes detected; skipping gates")
-        return 0
-
-    collab_changed, rust_changed, hooks_changed = gate_summary(paths)
-    print(f"[pre-push] pushed files: {len(paths)}")
-
-    commands: list[list[str]] = []
-    if hooks_changed:
-        commands.append(["python3", "scripts/test_run_git_hook.py"])
-    if collab_changed:
-        commands.append(["python3", "scripts/check_collab_turn_templates.py"])
-    if rust_changed:
-        commands.append(["cargo", "test", "--workspace"])
-
-    if not commands:
-        print("[pre-push] docs/config-only change; no local gates required")
-        return 0
-
-    for cmd in commands:
-        rc = run(cmd)
-        if rc != 0:
-            return rc
-    return 0
-
-
-def main(argv: list[str]) -> int:
-    if len(argv) != 2 or argv[1] not in {"pre-commit", "pre-push"}:
-        print("usage: scripts/run_git_hook.py <pre-commit|pre-push>", file=sys.stderr)
         return 2
-    if argv[1] == "pre-commit":
-        return run_pre_commit()
-    return run_pre_push()
+    return main(argv[1])
 
 
 if __name__ == "__main__":
-    raise SystemExit(main(sys.argv))
+    raise SystemExit(_cli_main(sys.argv))
