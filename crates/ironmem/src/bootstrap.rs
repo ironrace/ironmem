@@ -1,7 +1,6 @@
 //! Background bootstrap, workspace initialization, and stale-lock recovery.
 
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -11,6 +10,7 @@ use sha2::{Digest, Sha256};
 use crate::config::Config;
 use crate::error::MemoryError;
 use crate::mcp::app::App;
+use crate::mcp::readiness::ReadinessGate;
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct GlobalBootstrapState {
@@ -198,38 +198,100 @@ impl Drop for BootstrapLock {
 }
 
 /// Spawn a background thread that runs the full memory init (model load + bootstrap).
-/// Signals `memory_ready` when done — even on failure — so the serve loop is never
-/// permanently blocked in warming-up mode.
+/// Always resolves `memory_ready` to a terminal state when done, so the serve loop
+/// is never left waiting forever: `App::new` failing resolves the gate `Failed`
+/// (write-shaped tools stay blocked/rejected — see `ReadinessGate` — until the process
+/// restarts, since the embedder/index never came up); otherwise it resolves `Ready`,
+/// regardless of whether the best-effort `ensure_bootstrapped` step below succeeded.
 ///
 /// The thread opens its own `App` (its own DB connection). SQLite WAL handles
 /// concurrent access from the serve loop's connection and this background connection.
-pub fn run_background_memory_init(config: Config, memory_ready: Arc<AtomicBool>) {
-    std::thread::spawn(move || {
+/// Resolves the readiness gate `Failed` if the init thread exits without
+/// having resolved it — including by PANIC.
+///
+/// Without this, a panic anywhere in init (a corrupt `model.onnx` making the
+/// ONNX runtime panic rather than return `Err`, say) leaves the gate `Pending`
+/// forever: the `JoinHandle` is dropped so nothing observes the unwind, `status`
+/// reports `warming_up` for the life of the process, and `search` keeps
+/// answering "available shortly" — exactly the dead-server-looks-slow lie the
+/// terminal `Failed` state was introduced to prevent.
+///
+/// Resolution is first-wins, so on both normal paths (which resolve explicitly)
+/// this drop is a no-op.
+struct ResolveOnExit(Arc<ReadinessGate>);
+
+impl Drop for ResolveOnExit {
+    fn drop(&mut self) {
+        self.0
+            .resolve_failed(crate::mcp::readiness::STARTUP_FAILURE_CLIENT_REASON.to_string());
+    }
+}
+
+pub fn run_background_memory_init(config: Config, memory_ready: Arc<ReadinessGate>) {
+    std::thread::spawn(move || init_thread_body(config, memory_ready));
+}
+
+/// The init thread's body, factored out so tests can drive the REAL exit paths
+/// rather than a reconstruction of them.
+fn init_thread_body(config: Config, memory_ready: Arc<ReadinessGate>) {
+    {
+        // Armed before any fallible work, so no exit path can skip it.
+        let _resolve_on_exit = ResolveOnExit(Arc::clone(&memory_ready));
         // Capture write permission before config is moved into App::new.
         let writes_allowed = config.mcp_access_mode.allows_writes();
         let workspace = resolve_workspace_root(None);
         let app = match App::new(config) {
             Ok(a) => a,
             Err(e) => {
-                tracing::error!("Background memory init failed (App::new): {e}");
-                memory_ready.store(true, Ordering::Release);
+                // Fail-closed: the embedder/index never came up, so write-shaped
+                // tools must keep blocking/rejecting (via `wait_for_write`) rather
+                // than silently unblocking against a half-initialized `App`.
+                tracing::error!(
+                    "Background memory init failed (App::new): {e}; write-shaped tools will \
+                     stay blocked until the process restarts"
+                );
+                // No explicit resolve here: `ResolveOnExit` resolves `Failed`
+                // on the way out. Deliberately the SOLE mechanism, so the guard
+                // is load-bearing on a path a test can actually drive — a
+                // second, redundant resolve would let the guard rot unnoticed.
+                //
+                // The gate's reason crosses the MCP client boundary verbatim
+                // (see `STARTUP_FAILURE_CLIENT_REASON`), so `e` — which can
+                // carry database paths and OS error text — stays in the log
+                // line above and never in the reason.
                 return;
             }
         };
+        // Deliberately asymmetric with the `App::new` failure above: `app` itself came
+        // up fine here, so the embedder/index are usable even if this best-effort
+        // migration/mining step fails — resolve `Ready` either way rather than
+        // permanently blocking writes over a non-fatal bootstrap error.
         if writes_allowed {
-            match ensure_bootstrapped(&app, workspace.as_deref()) {
-                Ok(r) => tracing::info!(
+            // `catch_unwind` so a PANIC here is treated exactly like the `Err`
+            // arm below. Without it the `ResolveOnExit` guard would fire and
+            // resolve `Failed`, permanently disabling writes and making
+            // `search` report a terminal failure — over a best-effort mining
+            // step, on a server whose embedder and index are fully working.
+            // That would silently invert the asymmetry documented above.
+            let bootstrapped = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                ensure_bootstrapped(&app, workspace.as_deref())
+            }));
+            match bootstrapped {
+                Ok(Ok(r)) => tracing::info!(
                     "Bootstrap complete (initialized={}, mine_ran={})",
                     r.initialized_store,
                     r.initial_mine_ran
                 ),
-                Err(e) => tracing::error!("Bootstrap failed: {e}"),
+                Ok(Err(e)) => tracing::error!("Bootstrap failed: {e}"),
+                Err(_) => tracing::error!(
+                    "Bootstrap panicked; continuing with a usable embedder and index"
+                ),
             }
         } else {
             tracing::debug!("Skipping auto-bootstrap: MCP access mode does not allow writes");
         }
-        memory_ready.store(true, Ordering::Release);
-    });
+        memory_ready.resolve_ready();
+    }
 }
 
 pub fn record_workspace_mine(config: &Config, workspace_root: &Path) -> Result<(), MemoryError> {
@@ -380,6 +442,92 @@ fn temp_path_for(path: &Path) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A panic in the init thread must still leave the gate TERMINAL.
+    ///
+    /// `run_background_memory_init` drops its `JoinHandle`, so an unwind is
+    /// observed by nothing. If the gate stayed `Pending`, `status` would report
+    /// `warming_up` forever and `search` would keep promising results
+    /// "shortly" from a server that is never coming up — the precise pathology
+    /// the terminal `Failed` state exists to prevent. Every write would also
+    /// burn the full readiness timeout, once per call, forever.
+    #[test]
+    fn a_panicking_init_thread_still_resolves_the_gate() {
+        let gate = Arc::new(ReadinessGate::new_pending());
+
+        let thread_gate = Arc::clone(&gate);
+        let handle = std::thread::spawn(move || {
+            let _resolve_on_exit = ResolveOnExit(Arc::clone(&thread_gate));
+            panic!("simulated ONNX session panic during model load");
+        });
+        assert!(handle.join().is_err(), "the thread must have panicked");
+
+        assert!(
+            !gate.is_ready(),
+            "a panicked init must never report the server as ready"
+        );
+        assert!(
+            matches!(
+                gate.snapshot(),
+                crate::mcp::readiness::ReadinessState::Failed(_)
+            ),
+            "a panicked init must leave the gate terminally Failed, not Pending — \
+             got {:?}",
+            gate.snapshot()
+        );
+    }
+
+    /// Drives the REAL `init_thread_body` down its failure path, which is the
+    /// only way to prove the guard is actually ARMED in production.
+    ///
+    /// `ResolveOnExit` is deliberately the sole resolver on that path, so
+    /// deleting or sinking the arming line leaves the gate `Pending` and this
+    /// test fails. A test that constructed the guard itself could not detect
+    /// that — it would only re-test `Drop`.
+    #[test]
+    fn init_thread_body_resolves_the_gate_when_app_new_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        // `db_path` points AT a directory, so `Database::open` cannot succeed.
+        let config = Config {
+            db_path: dir.path().to_path_buf(),
+            model_dir: dir.path().join("models"),
+            model_dir_explicit: true,
+            state_dir: dir.path().join("state"),
+            mcp_access_mode: crate::config::McpAccessMode::ReadOnly,
+            embed_mode: crate::config::EmbedMode::Noop,
+        };
+
+        let gate = Arc::new(ReadinessGate::new_pending());
+        init_thread_body(config, Arc::clone(&gate));
+
+        assert!(
+            !gate.is_ready(),
+            "a failed init must never report the server as ready"
+        );
+        assert!(
+            matches!(
+                gate.snapshot(),
+                crate::mcp::readiness::ReadinessState::Failed(_)
+            ),
+            "init must leave the gate terminally Failed, not Pending — got {:?}",
+            gate.snapshot()
+        );
+    }
+
+    /// The guard must not override a real resolution: first-wins means the
+    /// normal success path stays `Ready` even though the guard runs on drop.
+    #[test]
+    fn resolve_on_exit_does_not_override_a_successful_resolution() {
+        let gate = Arc::new(ReadinessGate::new_pending());
+        {
+            let _resolve_on_exit = ResolveOnExit(Arc::clone(&gate));
+            gate.resolve_ready();
+        }
+        assert!(
+            gate.is_ready(),
+            "the drop guard must not downgrade an already-Ready gate"
+        );
+    }
 
     #[test]
     fn detects_default_mempalace_store_from_config() {

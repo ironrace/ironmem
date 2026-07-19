@@ -470,15 +470,26 @@ IRONMEM_DB_PATH = "~/.ironmem/codex.sqlite3"
 | Phase 1 | DB open + schema migration | ~50 ms |
 | Phase 2 | ONNX model load + auto-bootstrap + mine (background thread) | 5–120 s |
 
-Embedding-dependent tools (`search`, `add_drawer`, diary writes) return `{"warming_up": true}` until Phase 2 completes. The benchmark harness polls `status` until `warming_up: false` before starting measurements.
+`search` (embedding-dependent but read-shaped) returns `{"warming_up": true, "results": []}` immediately while Phase 2 is still in progress. The abeval driver polls `status` until `readiness` is `"ready"`, and aborts immediately on `"failed"` rather than waiting out its timeout. (The older `scripts/benchmark_*.py` harnesses still poll the `warming_up` bool; they remain correct on the happy path, but a terminal startup failure costs them their full poll deadline before it surfaces.) If startup fails terminally, `search` returns `isError: true` instead of the soft body — "available shortly" would be a promise the server cannot keep, and an empty result set would read as "no matches" rather than "no search". Write-shaped tools (`add_drawer`, diary writes, `code_map_write`) do NOT return that soft body — they block until readiness resolves, bounded by `Config::write_readiness_timeout()` (default 90 s, override via `IRONMEM_WRITE_READINESS_TIMEOUT_SECS`), then perform the real write, or return `isError: true` if readiness resolves failed or the timeout expires. This keeps a success-shaped tool result equivalent to "the write happened."
+
+`status` is the diagnostic endpoint and stays answerable in every state, including a failed one. `readiness` (`"ready"` / `"warming_up"` / `"failed"`) is what distinguishes "keep polling" from "this server is not coming up"; `readiness_error` carries the client-facing reason when `readiness` is `"failed"`, and is `null` otherwise. A client that sees `readiness: "failed"` must treat it as terminal and restart the server rather than keep polling.
 
 ```json
 // status response during warmup
-{"warming_up": true, "total_drawers": 0, ...}
+{"warming_up": true, "readiness": "warming_up", "readiness_error": null, "total_drawers": 0, ...}
 
 // status response once ready
-{"warming_up": false, "total_drawers": 42, ...}
+{"warming_up": false, "readiness": "ready", "readiness_error": null, "total_drawers": 42, ...}
+
+// status response after a terminal startup failure — restart required
+{"warming_up": true, "readiness": "failed", "readiness_error": "<reason>", "total_drawers": 0, ...}
 ```
+
+Requests on a single connection are pipelined, for both the stdio transport and daemon connections, so a write parked on the readiness gate does not head-of-line block later requests on that connection. Reads may be answered out of request order; clients match responses to requests by `id`, so order is not significant.
+
+Mutations are held to their arrival order and run one at a time per connection. The guarantee is that **no mutation executes after a mutation that was refused on the same connection**: once a write is refused for backlog overflow (more than 64 queued), later writes on that connection are refused until the backlog drains, so a refused write can never be stepped over. Reads are never refused by this rule.
+
+A write is classified by its arguments, not just its name: `collab_recv` with `auto_ack: true` acks the messages it returns, and any collab call carrying a `handoff_token` claims the generation lease. Both count as writes for ordering and for `IRONMEM_MCP_MODE` gating — in read-only mode the mode gate lets a plain `collab_recv` through, while `auto_ack: true` is refused rather than silently downgraded. Passing the mode gate is not sufficient on its own: a session already handed off (generation > 0) cannot be read without a `handoff_token`, and presenting one is itself a write, so a read-only client can follow a session from generation 0 but cannot attach to one after a handoff.
 
 ## Operational Notes
 
@@ -490,6 +501,9 @@ Embedding-dependent tools (`search`, `add_drawer`, diary writes) return `{"warmi
 - `IRONMEM_EMBED_MODE=noop` disables the ONNX embedder entirely (useful for process-level tests or smoke runs without the model).
 - `IRONMEM_AUTO_BOOTSTRAP=0` disables the automatic bootstrap on `serve` start.
 - `IRONMEM_DISABLE_MIGRATION=1` disables the first-run mempalace migration.
+- `IRONMEM_WRITE_READINESS_TIMEOUT_SECS` (default `90`) — how long a
+  write-shaped tool waits for readiness before returning `isError: true`.
+  Clamped to a 24-hour maximum; unparseable values fall back to the default.
 - `IRONMEM_DAEMON_SOCKET` overrides the shared daemon's default socket path
   (`<state_dir>/daemon.sock`, i.e. `~/.ironrace-memory/hook_state/daemon.sock`).
 - `IRONMEM_DAEMON_IDLE_SECS` (default `300`) — seconds an idle shared daemon

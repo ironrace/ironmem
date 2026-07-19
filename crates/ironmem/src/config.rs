@@ -9,6 +9,20 @@ use crate::error::MemoryError;
 /// down. Overridable at runtime via `IRONMEM_DAEMON_IDLE_SECS`.
 const DEFAULT_DAEMON_IDLE_SECS: u64 = 300;
 
+/// Default fail-safe bound on how long a write-shaped MCP tool handler will
+/// block waiting for background memory init (`ReadinessGate::wait_for_write`)
+/// before giving up and returning `MemoryError::NotReady`. Overridable at
+/// runtime via `IRONMEM_WRITE_READINESS_TIMEOUT_SECS`. 90s is generous enough
+/// to cover a real first-run ONNX model download + init (which can take tens
+/// of seconds) while still bounding how long a caller can be left hanging if
+/// init never completes.
+const DEFAULT_WRITE_READINESS_TIMEOUT_SECS: u64 = 90;
+/// Upper bound on `IRONMEM_WRITE_READINESS_TIMEOUT_SECS` (1 day). Keeps an
+/// operator typo from producing a duration whose derived `Instant` deadline is
+/// unrepresentable — `Instant + Duration` panics on overflow, and in a daemon
+/// that panic would take down every connected client, not just the caller.
+const MAX_WRITE_READINESS_TIMEOUT_SECS: u64 = 24 * 60 * 60;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum McpAccessMode {
     Trusted,
@@ -194,6 +208,54 @@ impl Config {
         Duration::from_secs(secs)
     }
 
+    /// Fail-safe bound on how long a write-shaped MCP tool waits for readiness
+    /// during server warm-up before giving up.
+    ///
+    /// Consumed by `server::dispatch_request` via
+    /// `ReadinessGate::wait_for_write_async` on the production path, and by
+    /// `tools::call_tool` via the synchronous `wait_for_write` fallback. No
+    /// tool handler blocks on it directly.
+    ///
+    /// Defaults to 90s ([`DEFAULT_WRITE_READINESS_TIMEOUT_SECS`]). Honors the
+    /// `IRONMEM_WRITE_READINESS_TIMEOUT_SECS` env override, parsed as `u64`
+    /// seconds. A present-but-unparseable value falls back to the default
+    /// rather than erroring (no new error surface is introduced) but logs a
+    /// `tracing::warn!` so the mistake is diagnosable instead of silently
+    /// ignored; an ABSENT var is the normal case and stays silent. Read fresh
+    /// on every call (not cached on `Config`), so tests can override it with
+    /// `std::env::set_var` immediately before exercising a still-pending gate,
+    /// without needing to reconstruct `Config`.
+    ///
+    /// Clamped to [`MAX_WRITE_READINESS_TIMEOUT_SECS`] (1 day). The value is a
+    /// crash guard, not a schedule — anything beyond a day is already
+    /// indistinguishable from "wait forever" — and clamping keeps the derived
+    /// deadline representable for every downstream `Instant`/timer arithmetic
+    /// instead of relying on each of them to defend itself.
+    pub fn write_readiness_timeout(&self) -> Duration {
+        let secs = match std::env::var("IRONMEM_WRITE_READINESS_TIMEOUT_SECS") {
+            Ok(raw) => match raw.trim().parse::<u64>() {
+                Ok(secs) if secs > MAX_WRITE_READINESS_TIMEOUT_SECS => {
+                    tracing::warn!(
+                        "IRONMEM_WRITE_READINESS_TIMEOUT_SECS={secs} exceeds the maximum of \
+                         {MAX_WRITE_READINESS_TIMEOUT_SECS}s; clamping to the maximum"
+                    );
+                    MAX_WRITE_READINESS_TIMEOUT_SECS
+                }
+                Ok(secs) => secs,
+                Err(e) => {
+                    tracing::warn!(
+                        "IRONMEM_WRITE_READINESS_TIMEOUT_SECS={raw:?} is not a valid number of \
+                         seconds ({e}); using the default of \
+                         {DEFAULT_WRITE_READINESS_TIMEOUT_SECS}s instead"
+                    );
+                    DEFAULT_WRITE_READINESS_TIMEOUT_SECS
+                }
+            },
+            Err(_) => DEFAULT_WRITE_READINESS_TIMEOUT_SECS,
+        };
+        Duration::from_secs(secs)
+    }
+
     /// Whether `ironmem serve` may auto-spawn a shared daemon.
     ///
     /// Enabled by default. Auto-spawn is disabled when `IRONMEM_NO_DAEMON` is
@@ -212,15 +274,70 @@ impl Config {
     }
 }
 
+/// THE lock for tests that mutate a process-global env var read by [`Config`].
+///
+/// Crate-wide on purpose. Env vars are process-global, and `config::tests` and
+/// `mcp::server::tests` live in the SAME test binary — two separate mutexes
+/// each "guarding" `IRONMEM_WRITE_READINESS_TIMEOUT_SECS` exclude nothing from
+/// each other, so a clamp test setting `u64::MAX` could make an unrelated
+/// framing-loop test park for a day and fail with a bogus diagnosis. Anything
+/// touching these vars must take THIS lock.
+#[cfg(test)]
+pub(crate) static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Sets an env var for the duration of a test and restores the prior value on
+/// drop, holding [`ENV_LOCK`] for its whole lifetime.
+///
+/// Drop-based rather than `catch_unwind`-based so it is panic-safe *and* works
+/// across `.await` points (an async test cannot be wrapped in `catch_unwind`).
+/// A failing assertion can therefore never leak an override into a later test.
+#[cfg(test)]
+pub(crate) struct EnvGuard {
+    key: &'static str,
+    previous: Option<String>,
+    _lock: std::sync::MutexGuard<'static, ()>,
+}
+
+#[cfg(test)]
+impl EnvGuard {
+    pub(crate) fn set(key: &'static str, value: &str) -> Self {
+        let lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let previous = std::env::var(key).ok();
+        std::env::set_var(key, value);
+        Self {
+            key,
+            previous,
+            _lock: lock,
+        }
+    }
+
+    /// Take the lock without changing anything — for tests that only READ an
+    /// env-controlled value but must not race one that writes it.
+    pub(crate) fn pin(key: &'static str) -> Self {
+        let lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let previous = std::env::var(key).ok();
+        Self {
+            key,
+            previous,
+            _lock: lock,
+        }
+    }
+}
+
+#[cfg(test)]
+impl Drop for EnvGuard {
+    fn drop(&mut self) {
+        match &self.previous {
+            Some(value) => std::env::set_var(self.key, value),
+            None => std::env::remove_var(self.key),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Mutex;
     use std::time::Duration;
-
-    /// Serializes env-mutating tests: `set_var`/`remove_var` are process-global
-    /// and would otherwise race under the parallel test runner.
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     /// Build a `Config` with a known `state_dir` without touching the real home
     /// directory (so path derivation is deterministic under test).
@@ -234,6 +351,35 @@ mod tests {
             mcp_access_mode: McpAccessMode::ReadOnly,
             embed_mode: EmbedMode::Noop,
         }
+    }
+
+    /// `Instant + Duration` panics on overflow, and this duration is derived
+    /// from an operator-supplied env var. In a shared daemon that panic takes
+    /// down every connected client over one bad value, so an absurd timeout
+    /// has to clamp rather than propagate.
+    #[test]
+    fn write_readiness_timeout_clamps_an_absurd_override() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let config = test_config("/tmp/ironmem-clamp-test");
+
+        std::env::set_var("IRONMEM_WRITE_READINESS_TIMEOUT_SECS", u64::MAX.to_string());
+        let clamped = config.write_readiness_timeout();
+        assert_eq!(
+            clamped,
+            Duration::from_secs(MAX_WRITE_READINESS_TIMEOUT_SECS),
+            "an out-of-range override must clamp to the maximum"
+        );
+        // The point of clamping: the derived deadline stays representable.
+        assert!(
+            std::time::Instant::now().checked_add(clamped).is_some(),
+            "a clamped timeout must still produce a representable deadline"
+        );
+
+        // A sane override is still honored untouched.
+        std::env::set_var("IRONMEM_WRITE_READINESS_TIMEOUT_SECS", "5");
+        assert_eq!(config.write_readiness_timeout(), Duration::from_secs(5));
+
+        std::env::remove_var("IRONMEM_WRITE_READINESS_TIMEOUT_SECS");
     }
 
     #[test]
@@ -313,6 +459,33 @@ mod tests {
         // Bad value silently uses the default; no error surface introduced.
         assert_eq!(cfg.daemon_idle_timeout(), Duration::from_secs(300));
         std::env::remove_var("IRONMEM_DAEMON_IDLE_SECS");
+    }
+
+    #[test]
+    fn write_readiness_timeout_defaults_to_90s() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::remove_var("IRONMEM_WRITE_READINESS_TIMEOUT_SECS");
+        let cfg = test_config("/tmp/ironmem-test-state");
+        assert_eq!(cfg.write_readiness_timeout(), Duration::from_secs(90));
+    }
+
+    #[test]
+    fn write_readiness_timeout_env_override_parses() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("IRONMEM_WRITE_READINESS_TIMEOUT_SECS", "5");
+        let cfg = test_config("/tmp/ironmem-test-state");
+        assert_eq!(cfg.write_readiness_timeout(), Duration::from_secs(5));
+        std::env::remove_var("IRONMEM_WRITE_READINESS_TIMEOUT_SECS");
+    }
+
+    #[test]
+    fn write_readiness_timeout_bad_value_falls_back_to_default() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("IRONMEM_WRITE_READINESS_TIMEOUT_SECS", "not-a-number");
+        let cfg = test_config("/tmp/ironmem-test-state");
+        // Bad value silently uses the default; no error surface introduced.
+        assert_eq!(cfg.write_readiness_timeout(), Duration::from_secs(90));
+        std::env::remove_var("IRONMEM_WRITE_READINESS_TIMEOUT_SECS");
     }
 
     #[test]

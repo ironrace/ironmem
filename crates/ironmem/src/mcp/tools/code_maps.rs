@@ -126,15 +126,38 @@ fn validate_repo(raw: &str) -> Result<String, MemoryError> {
 
 // ── Handlers ─────────────────────────────────────────────────────────────────
 
-pub(super) fn handle_code_map_write(app: &App, args: &Value) -> Result<Value, MemoryError> {
-    if app.is_warming_up() {
-        return Ok(json!({
-            "warming_up": true,
-            "message": "Memory server is initializing. Please retry in a moment.",
-        }));
-    }
+/// `code_map_write`'s arguments after validation. `summary` and `head_sha`
+/// borrow from the request; the rest are owned/canonicalized.
+pub(super) struct CodeMapWriteArgs<'a> {
+    repo: String,
+    area: String,
+    summary: &'a str,
+    head_sha: &'a str,
+    source_files: Vec<String>,
+    built_by: &'a str,
+}
 
-    // --- Validate inputs ---
+/// `code_map_write`'s arguments after everything that can be checked without
+/// running `git`. `repo_raw` is only known to be *present* here; resolving it
+/// to a worktree root is [`validate_repo`]'s job.
+struct CodeMapWriteFields<'a> {
+    repo_raw: &'a str,
+    area: String,
+    summary: &'a str,
+    head_sha: &'a str,
+    source_files: Vec<String>,
+    built_by: &'a str,
+}
+
+/// The structural half of `code_map_write` validation: every field check that
+/// does not shell out to `git`.
+///
+/// Split from [`validate_code_map_write_args`] so the daemon's pre-wait
+/// precheck can reject a malformed call — the thing it exists to do — without
+/// forking `git` on the thread that owns the `App`. The handler runs the full
+/// validation after the gate resolves regardless, so the `git` check is not
+/// skipped, only performed once instead of twice.
+fn validate_code_map_write_fields(args: &Value) -> Result<CodeMapWriteFields<'_>, MemoryError> {
     let repo_raw = args
         .get("repo")
         .and_then(|v| v.as_str())
@@ -186,13 +209,57 @@ pub(super) fn handle_code_map_write(app: &App, args: &Value) -> Result<Value, Me
         .collect::<Result<_, _>>()?;
     let source_files = validate_source_files(&source_files_raw)?;
 
-    let repo = validate_repo(repo_raw)?;
-
     let built_by = args
         .get("built_by")
         .and_then(|v| v.as_str())
         .filter(|s| !s.is_empty())
         .ok_or_else(|| MemoryError::Validation("built_by is required".into()))?;
+
+    Ok(CodeMapWriteFields {
+        repo_raw,
+        area,
+        summary,
+        head_sha,
+        source_files,
+        built_by,
+    })
+}
+
+/// Pre-wait precheck for `code_map_write`: structural validation only, no
+/// `git` fork. See [`validate_code_map_write_fields`].
+pub(super) fn precheck_code_map_write_args(args: &Value) -> Result<(), MemoryError> {
+    validate_code_map_write_fields(args).map(drop)
+}
+
+/// Readiness-independent validation for `code_map_write` — see
+/// `drawers::validate_add_drawer_args` for why this is split out. The full
+/// check, including resolving `repo` to a git worktree root.
+pub(super) fn validate_code_map_write_args(
+    args: &Value,
+) -> Result<CodeMapWriteArgs<'_>, MemoryError> {
+    let fields = validate_code_map_write_fields(args)?;
+    Ok(CodeMapWriteArgs {
+        repo: validate_repo(fields.repo_raw)?,
+        area: fields.area,
+        summary: fields.summary,
+        head_sha: fields.head_sha,
+        source_files: fields.source_files,
+        built_by: fields.built_by,
+    })
+}
+
+pub(super) fn handle_code_map_write(app: &App, args: &Value) -> Result<Value, MemoryError> {
+    // Readiness is already resolved by the time this runs (see
+    // `tools::WRITE_SHAPED_TOOLS`); validation is split out so
+    // `precheck_write_request` can reject a malformed call BEFORE the wait.
+    let CodeMapWriteArgs {
+        repo,
+        area,
+        summary,
+        head_sha,
+        source_files,
+        built_by,
+    } = validate_code_map_write_args(args)?;
 
     // turn_id is optional — just read it for wal/metrics if provided
     let _turn_id = args.get("turn_id").and_then(|v| v.as_str());

@@ -628,7 +628,7 @@ AI agents can query the graph without a shell.
 ## Current Status
 
 - MCP server works over stdio with non-blocking startup (responds to `initialize` in <25 ms)
-- Embedding and bootstrap run in a background thread; `status` returns `warming_up: true` until ready
+- Embedding and bootstrap run in a background thread; `status` reports `readiness` (`ready` / `warming_up` / `failed`) alongside the legacy `warming_up` bool
 - Search, taxonomy, graph, diary, and knowledge-graph tools exist
 - Automatic bootstrap runs on first server or hook start
 - Direct migration from `mempalace` Chroma stores is implemented
@@ -669,7 +669,30 @@ IRONMEM_DB_PATH = "~/.ironmem/codex.sqlite3"
 | Phase 1 | DB open + schema migration | ~50 ms |
 | Phase 2 | ONNX model load + auto-bootstrap + mine (background thread) | 5–120 s |
 
-Embedding-dependent tools (`search`, `add_drawer`, diary writes) return `{"warming_up": true}` until Phase 2 completes. Poll `status` and check `warming_up: false` before issuing write-heavy workloads.
+`search` returns `{"warming_up": true, "results": []}` immediately while Phase 2 is still in progress — treat that as "retry shortly", not as "no matches". If startup fails terminally, `search` returns `isError: true` instead, rather than promising results shortly from a server that is never coming up.
+
+Write-shaped tools (`add_drawer`, diary writes, `code_map_write`) never return that soft body — they block until readiness resolves, bounded by `Config::write_readiness_timeout()`, then perform the real write, or report `isError: true` if readiness resolves failed or the timeout expires. A success-shaped result therefore always means the write happened, so writes are safe to issue during warm-up. The wait is bounded by:
+
+| Variable | Default | Effect |
+|---|---|---|
+| `IRONMEM_WRITE_READINESS_TIMEOUT_SECS` | `90` | How long a write-shaped tool waits for readiness before giving up and returning `isError: true`. Clamped to a 24-hour maximum; larger values are clamped and unparseable values fall back to the default. |
+
+`status` stays answerable in every state — it is the diagnostic endpoint, so it reports a failed gate rather than erroring on it. Alongside the existing `warming_up` bool it returns:
+
+| Field | Values | Meaning |
+|---|---|---|
+| `readiness` | `"ready"`, `"warming_up"`, `"failed"` | Distinguishes "keep polling" from "this server is not coming up". |
+| `readiness_error` | reason string, or `null` | Client-facing reason when `readiness` is `"failed"`; `null` otherwise. |
+
+A client that polls must treat `readiness: "failed"` as terminal — the server needs a restart — and stop polling rather than waiting for a `warming_up: false` that will never arrive.
+
+Requests on a single connection are pipelined, for both the stdio transport and daemon connections, so a write parked on the readiness gate does not block later requests on that same connection. Reads may therefore be answered out of request order; clients match responses to requests by `id`, so order is not significant.
+
+Mutations are held to their arrival order and run one at a time per connection. The guarantee is that **no mutation executes after a mutation that was refused on the same connection**: each write is either executed in arrival order or refused, and once one is refused for backlog overflow (more than 64 writes queued), later writes on that connection are refused too until the backlog drains. So a `delete_drawer` can never land without the `add_drawer` it was meant to follow. Reads are never refused by this rule and continue to be answered throughout.
+
+A write is classified by its arguments, not just its name — `collab_recv` with `auto_ack: true` acks the messages it returns, and any collab call carrying a `handoff_token` claims the generation lease, so both count as writes for ordering and for `IRONMEM_MCP_MODE` gating. In read-only mode the mode gate lets a plain `collab_recv` through; only the write-triggering argument is refused.
+
+Note that passing the mode gate is not the whole story for collab reads: a session that has already been handed off (generation > 0) requires a `handoff_token` to touch at all, and presenting one is itself a write. So a read-only client can follow a session it joined from generation 0, but cannot attach to one that has since been handed off.
 
 ## Benchmarking
 
