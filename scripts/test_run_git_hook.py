@@ -17,8 +17,22 @@ from types import MappingProxyType
 
 try:
     import pytest
-except ImportError:  # pragma: no cover - exercised only when pytest is absent
-    pytest = None  # type: ignore[assignment]
+except ImportError:  # pragma: no cover - exercised via subprocess, see below
+    # Fail here, at the import, not later in `_run_as_script()`.
+    #
+    # This module used to bind `pytest = None` and defer the friendly error to
+    # `_run_as_script()`. That path was unreachable: the first
+    # `@pytest.mark.parametrize` at module scope is evaluated during import, so
+    # a missing pytest produced `AttributeError: 'NoneType' object has no
+    # attribute 'mark'` and a traceback instead. CI ran this file for weeks in
+    # exactly that state -- the hook self-test gate reported failure for a
+    # missing test dependency rather than ever running, which is how a gate
+    # stops gating without anyone noticing.
+    sys.stderr.write(
+        "ERROR: pytest is required to run scripts/test_run_git_hook.py but is "
+        "not installed.\nInstall it with: pip install pytest\n"
+    )
+    raise SystemExit(1) from None
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 SCRIPTS = ROOT / "scripts"
@@ -2985,22 +2999,38 @@ def test_every_git_hook_module_classifies_hook_self_test():
 # --- __main__ delegation must fail loudly, never exit 0, if pytest is absent ---
 
 
-def test_run_as_script_fails_loudly_without_pytest(monkeypatch, capsys):
-    this_module = sys.modules[__name__]
-    monkeypatch.setattr(this_module, "pytest", None)
-    exit_code = _run_as_script()
-    assert exit_code != 0
-    captured = capsys.readouterr()
-    assert "pytest" in captured.err.lower()
+def test_missing_pytest_fails_loudly_with_an_actionable_message(tmp_path):
+    # REPLACES a monkeypatch-based test that set this module's `pytest`
+    # attribute to None and called `_run_as_script()`. That asserted against a
+    # branch the interpreter could never reach: by the time any function runs,
+    # the module-level `@pytest.mark.parametrize` decorators have already been
+    # evaluated, so a genuinely missing pytest crashed at import instead. The
+    # old test passed for years of CI runs that were failing on a traceback.
+    #
+    # This drives the real path: a subprocess whose sys.path leads with a
+    # `pytest.py` that raises ImportError, which is what an uninstalled pytest
+    # actually looks like to the import system.
+    (tmp_path / "pytest.py").write_text('raise ImportError("pytest not installed")\n')
+    env = {**os.environ, "PYTHONPATH": str(tmp_path)}
+    result = subprocess.run(
+        [sys.executable, str(SCRIPTS / "test_run_git_hook.py")],
+        capture_output=True,
+        text=True,
+        cwd=ROOT,
+        env=env,
+        check=False,
+    )
+    assert result.returncode == 1, (
+        f"expected a clean exit 1, got {result.returncode}; "
+        f"stderr={result.stderr!r}"
+    )
+    assert "pip install pytest" in result.stderr
+    # The specific regression: a traceback here means the friendly message is
+    # unreachable again.
+    assert "Traceback" not in result.stderr, result.stderr
 
 
 def _run_as_script() -> int:
-    if pytest is None:
-        sys.stderr.write(
-            "ERROR: pytest is required to run scripts/test_run_git_hook.py but is "
-            "not installed.\nInstall it with: pip install pytest\n"
-        )
-        return 1
     return pytest.main([__file__])
 
 
