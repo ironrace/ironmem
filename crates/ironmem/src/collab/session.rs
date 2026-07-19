@@ -47,6 +47,38 @@ pub struct CollabSession {
     /// completes. The DB CHECK constraint enforces the allowed set as
     /// defense-in-depth.
     pub implementer: Agent,
+    // Recovery-state fields (issue #197). All six persist as nullable
+    // columns added in migration 015 and stay NULL/0 for the common case
+    // where no tooling failure is in flight.
+    /// Classified failure kind pending recovery (see `failure_class::classify`),
+    /// `None` when no failure is in flight. Same storage shape as
+    /// `coding_failure` — a plain string, not a typed enum, since the
+    /// classification vocabulary is still open-ended.
+    pub pending_failure: Option<String>,
+    /// The `Phase` the session was in when the failure was recorded, so
+    /// recovery can resume in place. Wire-encoded exactly like the
+    /// non-nullable `phase` column (`Phase::to_string()` / `FromStr`).
+    pub failed_from_phase: Option<Phase>,
+    /// Sub-phase of the recovery flow itself, distinct from the session's
+    /// normal `phase` column. Same encoding as `failed_from_phase`.
+    pub recovery_phase: Option<Phase>,
+    /// Which `Agent` currently drives recovery. Same encoding as
+    /// `current_owner`/`implementer` (`Agent::as_str()` / `FromStr`).
+    pub recovery_owner: Option<Agent>,
+    /// Which `Agent` owned the session when the failure occurred, so
+    /// recovery can hand control back. Same encoding as `recovery_owner`.
+    pub recovery_origin_owner: Option<Agent>,
+    /// How many recovery attempts have been made so far.
+    ///
+    /// The DB column (`recovery_attempts INTEGER`) is nullable — legacy
+    /// pre-015 rows have no value — but this Rust field is a plain `u8`,
+    /// not `Option<u8>`: a NULL in the DB is read back as `0`, never as an
+    /// error. `load_session_record` must read the column as `Option<i64>`
+    /// first and map `None -> 0` (clamping only applies to the `Some` arm);
+    /// `save_session` always writes a concrete `i64`, so a NULL can only
+    /// occur on a row that has never been through `save_session` — i.e. a
+    /// genuinely legacy row.
+    pub recovery_attempts: u8,
 }
 
 impl CollabSession {
@@ -81,6 +113,12 @@ impl CollabSession {
             pr_url: None,
             coding_failure: None,
             implementer,
+            pending_failure: None,
+            failed_from_phase: None,
+            recovery_phase: None,
+            recovery_owner: None,
+            recovery_origin_owner: None,
+            recovery_attempts: 0,
         }
     }
 
@@ -123,6 +161,12 @@ impl CollabSession {
             pr_url: None,
             coding_failure: None,
             implementer: Agent::Claude,
+            pending_failure: None,
+            failed_from_phase: None,
+            recovery_phase: None,
+            recovery_owner: None,
+            recovery_origin_owner: None,
+            recovery_attempts: 0,
         }
     }
 
