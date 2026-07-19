@@ -669,7 +669,7 @@ IRONMEM_DB_PATH = "~/.ironmem/codex.sqlite3"
 | Phase 1 | DB open + schema migration | ~50 ms |
 | Phase 2 | ONNX model load + auto-bootstrap + mine (background thread) | 5–120 s |
 
-Embedding-dependent tools (`search`, `add_drawer`, diary writes) return `{"warming_up": true}` until Phase 2 completes. Poll `status` and check `warming_up: false` before issuing write-heavy workloads.
+`search` returns `{"warming_up": true}` immediately until Phase 2 completes. Write-shaped tools (`add_drawer`, diary writes, `code_map_write`) no longer return that soft body — they block until readiness resolves, bounded by `Config::write_readiness_timeout()` (default 90 s, override via `IRONMEM_WRITE_READINESS_TIMEOUT_SECS`), then perform the real write, or report `isError: true` if readiness resolves failed or the timeout expires. Poll `status` and check `warming_up: false` if you'd rather avoid the write-side wait entirely.
 
 ## Benchmarking
 
