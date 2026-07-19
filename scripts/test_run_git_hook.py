@@ -572,18 +572,41 @@ def test_every_benchmarks_crate_is_workspace_excluded():
     # and treating it as inert would let a non-compiling workspace push
     # clean -- the exact fail-open this manifest exists to prevent. Fail here,
     # at the manifest fact, rather than silently in the classifier.
+    #
+    # Enumerated from `git ls-files` -- TRACKED files only -- never a
+    # filesystem walk. The first version of this guard used
+    # `(ROOT / "benchmarks").rglob("Cargo.toml")` and passed in CI and in a
+    # fresh worktree while failing in a working clone, because `benchmarks/`
+    # also accumulates untracked content that is nothing to do with this
+    # repo's crates: abeval campaign workspaces (which contain entire cloned
+    # copies of ironmem, each with its own crates/ and benchmarks/), and
+    # provbench's `work/ripgrep` + `work/serde` upstream checkouts. Those are
+    # not this workspace's crates and `cargo --workspace` never sees them, but
+    # the walk counted every one and the guard failed with ~200 bogus paths --
+    # blocking commits on any hook-file edit.
+    #
+    # The manifest's `exclude` list is a statement about tracked crates, so the
+    # guard has to be too. `git ls-files` is also what makes this correct under
+    # a `git clean`-less workflow: what is committed is what cargo builds.
     import tomllib
 
-    manifest = tomllib.loads((ROOT / "Cargo.toml").read_text(encoding="utf-8"))
-    workspace = manifest["workspace"]
+    root_manifest = tomllib.loads((ROOT / "Cargo.toml").read_text(encoding="utf-8"))
+    workspace = root_manifest["workspace"]
     excluded = set(workspace.get("exclude", []))
 
+    tracked = subprocess.run(
+        ["git", "ls-files", "-z", "--", "benchmarks"],
+        capture_output=True,
+        text=True,
+        cwd=ROOT,
+        check=True,
+    ).stdout
     crate_dirs = {
-        path.parent.relative_to(ROOT).as_posix()
-        for path in (ROOT / "benchmarks").rglob("Cargo.toml")
-        if "target" not in path.parts
+        pathlib.PurePosixPath(entry).parent.as_posix()
+        for entry in tracked.split("\0")
+        if entry.endswith("/Cargo.toml")
     }
-    assert crate_dirs, "expected at least one benchmarks Cargo crate to guard"
+    assert crate_dirs, "expected at least one tracked benchmarks Cargo crate to guard"
 
     unexcluded = sorted(crate_dirs - excluded)
     assert not unexcluded, (
