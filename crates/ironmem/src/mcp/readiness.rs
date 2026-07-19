@@ -44,6 +44,15 @@ pub const STARTUP_FAILURE_CLIENT_REASON: &str =
     "server memory initialization failed at startup; writes are unavailable until the \
      server is restarted (see server logs for details)";
 
+/// Largest timeout this gate will honor, and the ceiling every caller-supplied
+/// `Duration` is clamped to.
+///
+/// A day is already indistinguishable from "wait forever" for a warm-up guard,
+/// and clamping keeps `Instant::now() + timeout` representable — that addition
+/// panics on overflow, and in a shared daemon one such panic takes down every
+/// connected client, not just the caller.
+const MAX_REPRESENTABLE_TIMEOUT: Duration = Duration::from_secs(24 * 60 * 60);
+
 /// Terminal-resolution state guarded by the gate's `Mutex`.
 ///
 /// `Pending` is the only non-terminal state. Once the state transitions to
@@ -203,6 +212,10 @@ impl ReadinessGate {
     /// should source it from config with a default generous enough for a
     /// real model load.
     pub fn wait_for_write(&self, timeout: Duration) -> Result<(), MemoryError> {
+        // Clamped for the same reason as the async variant: `pub`, takes an
+        // arbitrary `Duration`, and the platform condvar computes a deadline
+        // internally from it.
+        let timeout = timeout.min(MAX_REPRESENTABLE_TIMEOUT);
         // Fast path: read the terminal state under a brief lock and return.
         // The mutex IS taken (the reason lives behind it); what this avoids is
         // ever parking on the condvar.
@@ -257,12 +270,20 @@ impl ReadinessGate {
     /// work for the entire readiness timeout. Here a waiter costs a `Notify`
     /// registration instead.
     pub async fn wait_for_write_async(&self, timeout: Duration) -> Result<(), MemoryError> {
-        // `Instant + Duration` PANICS on overflow, and `timeout` comes from an
-        // operator-supplied env var. A daemon serves every client in the
-        // process, so an absurd `IRONMEM_WRITE_READINESS_TIMEOUT_SECS` must
-        // degrade to "effectively forever", not take the server down for
-        // everyone. `checked_add` is the whole guard.
-        let deadline = Instant::now().checked_add(timeout);
+        // `Instant + Duration` PANICS on overflow, and `timeout` ultimately
+        // comes from an operator-supplied env var. `Config` clamps that to a
+        // day, but this method is `pub` and takes an arbitrary `Duration`, so
+        // it defends itself rather than trusting a bound enforced in another
+        // module.
+        //
+        // Clamped, NOT degraded to an unbounded wait: this method's contract is
+        // a bounded fail-safe, and a caller that waits forever would occupy an
+        // in-flight slot and never answer its client — the hang the timeout
+        // exists to prevent.
+        let timeout = timeout.min(MAX_REPRESENTABLE_TIMEOUT);
+        let deadline = Instant::now()
+            .checked_add(timeout)
+            .unwrap_or_else(|| Instant::now() + MAX_REPRESENTABLE_TIMEOUT);
         loop {
             // Register with `Notify` BEFORE reading the state. `notify_waiters`
             // only wakes already-registered waiters, and resolution publishes
@@ -278,11 +299,6 @@ impl ReadinessGate {
                 return result;
             }
 
-            // No representable deadline: wait without one rather than panicking.
-            let Some(deadline) = deadline else {
-                notified.await;
-                continue;
-            };
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() || tokio::time::timeout(remaining, notified).await.is_err() {
                 return Err(MemoryError::NotReady(format!(
@@ -569,6 +585,44 @@ mod tests {
         });
     }
 
+    /// `Instant::now() + timeout` panics on overflow, and in a shared daemon
+    /// that panic takes down every connected client, not just the caller. Both
+    /// waits are `pub` and take an arbitrary `Duration`, so neither may rely on
+    /// `Config` having clamped first — this passes the worst possible value
+    /// straight in, against a PENDING gate so the deadline is really built.
+    ///
+    /// Asymmetry worth knowing: the async path is where the panic actually
+    /// lives, and removing its guard makes this test fail (verified by
+    /// mutation). The synchronous path's clamp is defense-in-depth — this
+    /// platform's `Condvar::wait_timeout_while` saturates rather than
+    /// panicking, so removing it changes nothing observable here. It stays for
+    /// the platforms and future callers that offer no such guarantee.
+    #[test]
+    fn an_absurd_timeout_is_clamped_rather_than_panicking() {
+        // A PENDING gate, so the call reaches the condvar and actually builds
+        // a deadline from the absurd duration — an already-ready gate returns
+        // via the terminal fast path and never does the arithmetic at all.
+        let gate = Arc::new(ReadinessGate::new_pending());
+        let resolver = Arc::clone(&gate);
+        let handle = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(50));
+            resolver.resolve_ready();
+        });
+        assert!(gate.wait_for_write(Duration::MAX).is_ok());
+        handle.join().expect("resolver thread");
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("build runtime");
+        runtime.block_on(async {
+            let gate = ReadinessGate::new_pending();
+            gate.resolve_failed("startup died".to_string());
+            // Reaches the deadline arithmetic before the terminal peek returns.
+            assert!(gate.wait_for_write_async(Duration::MAX).await.is_err());
+        });
+    }
+
     #[test]
     fn redundant_resolve_calls_do_not_panic() {
         let gate = ReadinessGate::new_pending();
@@ -581,5 +635,12 @@ mod tests {
         gate2.resolve_failed("x".to_string());
         gate2.resolve_failed("y".to_string());
         assert!(!gate2.is_ready());
+        // First-wins applies to the REASON too: a second resolution that
+        // overwrote it would otherwise pass this test unnoticed.
+        assert_eq!(
+            gate2.snapshot(),
+            ReadinessState::Failed("x".to_string()),
+            "the first failure reason must survive a second resolve_failed"
+        );
     }
 }

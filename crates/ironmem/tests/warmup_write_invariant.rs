@@ -501,6 +501,21 @@ fn status_distinguishes_a_failed_gate_from_an_ongoing_warmup() {
         "an unresolved gate must report readiness=warming_up: {pending}"
     );
 
+    // The Ready arm: unasserted until now, so mislabeling it would have gone
+    // undetected. `open_for_test` starts resolved-ready.
+    let ready = App::open_for_test().unwrap();
+    let (is_error, payload) = call_tool_raw(&ready, "status", json!({}));
+    assert!(!is_error, "status must not error when ready: {payload}");
+    assert_eq!(
+        payload["readiness"].as_str(),
+        Some("ready"),
+        "a resolved-ready gate must report readiness=ready: {payload}"
+    );
+    assert!(
+        payload["readiness_error"].is_null(),
+        "a ready gate must carry no failure reason: {payload}"
+    );
+
     let mut failed = App::open_for_test().unwrap();
     force_readiness_failed(&mut failed, "model load exploded");
     let (is_error, payload) = call_tool_raw(&failed, "status", json!({}));
