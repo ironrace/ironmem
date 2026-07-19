@@ -32,4 +32,13 @@ pub enum MemoryError {
 
     #[error("Lock error: {0}")]
     Lock(String),
+
+    /// Server-readiness precondition unmet: either readiness resolved to a
+    /// failed terminal state, or a bounded wait for readiness timed out.
+    /// No existing variant fits this "resource temporarily unavailable"
+    /// semantic — `Lock` denotes mutex poisoning, `Config` denotes bad
+    /// configuration, `Validation` denotes bad input — so this is a small,
+    /// dedicated addition rather than an overload of an unrelated variant.
+    #[error("Not ready: {0}")]
+    NotReady(String),
 }

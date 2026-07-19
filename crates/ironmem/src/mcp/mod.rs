@@ -3,5 +3,6 @@
 pub mod app;
 pub mod daemon;
 pub mod protocol;
+pub mod readiness;
 pub mod server;
 pub mod tools;
