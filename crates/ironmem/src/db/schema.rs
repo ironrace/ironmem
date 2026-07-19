@@ -24,11 +24,13 @@ const SYMBOL_IMPORT_GRAPH_SQL: &str = include_str!("../../migrations/012_symbol_
 const METRICS_HARNESS_CHECK_SQL: &str =
     include_str!("../../migrations/013_metrics_harness_check.sql");
 const CONTEXT_SIZE_REFS_SQL: &str = include_str!("../../migrations/014_context_size_refs.sql");
+const COLLAB_RECOVERY_STATE_SQL: &str =
+    include_str!("../../migrations/015_collab_recovery_state.sql");
 
 /// Highest schema version a fully-migrated database reports. Bump alongside the
 /// `run_version_gated_migrations` ladder below so `ironmem doctor` can tell a
 /// behind-migration database from an up-to-date one.
-pub const LATEST_SCHEMA_VERSION: i64 = 14;
+pub const LATEST_SCHEMA_VERSION: i64 = 15;
 
 /// Database wrapper around a SQLite connection.
 ///
@@ -268,6 +270,13 @@ impl Database {
             self.conn.execute_batch(CONTEXT_SIZE_REFS_SQL)?;
         }
 
+        // v15: recoverable tooling-failure state on collab_sessions (issue
+        // #197). Six nullable columns; NULL means no failure/recovery in
+        // flight, which is every pre-015 row.
+        if current_version < 15 {
+            self.conn.execute_batch(COLLAB_RECOVERY_STATE_SQL)?;
+        }
+
         Ok(())
     }
 
@@ -432,7 +441,7 @@ mod tests {
         // fully-migrated database reports — doctor compares against it.
         let db = Database::open_in_memory().unwrap();
         assert_eq!(LATEST_SCHEMA_VERSION, db.schema_version().unwrap());
-        assert_eq!(LATEST_SCHEMA_VERSION, 14);
+        assert_eq!(LATEST_SCHEMA_VERSION, 15);
     }
 
     #[test]
@@ -1276,5 +1285,87 @@ mod tests {
             tool_name.is_none(),
             "legacy metrics rows backfill NULL tool_name"
         );
+    }
+
+    // ---- Migration 015 (collab recovery-state columns, issue #197) ----
+
+    /// Build a connection migrated to exactly v14 (no recovery-state columns
+    /// yet) by replaying migrations 001-014 directly from the module consts.
+    fn open_at_v14() -> Database {
+        let db = open_at_v13();
+        db.conn.execute_batch(CONTEXT_SIZE_REFS_SQL).unwrap();
+        db
+    }
+
+    const RECOVERY_STATE_COLUMNS: [&str; 6] = [
+        "pending_failure",
+        "failed_from_phase",
+        "recovery_phase",
+        "recovery_owner",
+        "recovery_origin_owner",
+        "recovery_attempts",
+    ];
+
+    #[test]
+    fn test_v14_to_v15_upgrade_preserves_existing_collab_sessions_and_adds_recovery_columns() {
+        let db = open_at_v14();
+        assert_eq!(schema_version_of(&db), 14);
+        for col in RECOVERY_STATE_COLUMNS {
+            assert!(
+                !column_exists(&db, "collab_sessions", col),
+                "{col} should not exist at v14"
+            );
+        }
+
+        crate::collab::queue::create_session(
+            &db.conn,
+            "legacy-v14-session",
+            "/repo",
+            "main",
+            Some("legacy task"),
+            crate::collab::Agent::Codex,
+        )
+        .unwrap();
+
+        db.migrate().unwrap();
+        assert_eq!(schema_version_of(&db), LATEST_SCHEMA_VERSION);
+
+        for col in RECOVERY_STATE_COLUMNS {
+            assert!(
+                column_exists(&db, "collab_sessions", col),
+                "missing {col} after upgrade"
+            );
+        }
+
+        // Pre-existing column values survive the upgrade untouched.
+        let record =
+            crate::collab::queue::load_session_record(&db.conn, "legacy-v14-session").unwrap();
+        assert_eq!(record.repo_path, "/repo");
+        assert_eq!(record.branch, "main");
+        assert_eq!(record.task.as_deref(), Some("legacy task"));
+        assert_eq!(record.session.implementer, crate::collab::Agent::Codex);
+
+        // The six new columns backfill NULL for legacy rows. Each is read back
+        // as its own `query_row` (rather than one wide tuple) to keep the
+        // return type simple for clippy's `type_complexity` lint.
+        for col in RECOVERY_STATE_COLUMNS {
+            let value: Option<String> = db
+                .conn
+                .query_row(
+                    &format!("SELECT {col} FROM collab_sessions WHERE id = ?1"),
+                    ["legacy-v14-session"],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert!(value.is_none(), "{col} should be NULL for a legacy row");
+        }
+    }
+
+    #[test]
+    fn test_migrate_twice_idempotent_v15() {
+        let db = Database::open_in_memory().unwrap();
+        db.migrate().unwrap();
+        db.migrate().unwrap();
+        assert_eq!(schema_version_of(&db), LATEST_SCHEMA_VERSION);
     }
 }
