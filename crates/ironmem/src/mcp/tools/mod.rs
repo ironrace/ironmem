@@ -1143,11 +1143,80 @@ mod tests {
         }
     }
 
-    /// The bypass this whole classification change exists to close, asserted at
-    /// the gating layer rather than through the list constants: under
-    /// `read-only`, a plain `collab_recv` must still work while the same call
-    /// with `auto_ack:true` — which acks every message it returns — must be
-    /// refused.
+    /// Builds a ReadOnly-mode `App` over a fresh temporary DB.
+    fn read_only_app() -> (App, tempfile::TempDir) {
+        use crate::config::{Config, EmbedMode};
+        let dir = tempfile::tempdir().unwrap();
+        let config = Config {
+            db_path: dir.path().join("mem.sqlite3"),
+            model_dir: dir.path().join("model"),
+            model_dir_explicit: true,
+            state_dir: dir.path().join("state"),
+            mcp_access_mode: McpAccessMode::ReadOnly,
+            embed_mode: EmbedMode::Noop,
+        };
+        (App::new(config).unwrap(), dir)
+    }
+
+    /// The bypass this classification change exists to close, asserted through
+    /// the ENFORCEMENT path.
+    ///
+    /// The predicate test below is NOT sufficient on its own, and that is the
+    /// whole reason this test exists: `call_allowed_in_mode` is a pure
+    /// function, so an `ensure_tool_allowed` that ignores its `args` and gates
+    /// on the tool name alone — precisely the pre-fix behavior, and precisely
+    /// the bypass — leaves a predicate-only test green. This drives
+    /// `call_tool`, the path a real MCP request actually takes.
+    #[test]
+    fn read_only_mode_refuses_auto_ack_through_the_enforcement_path() {
+        let (app, _dir) = read_only_app();
+
+        let refused = call_tool(
+            &app,
+            "collab_recv",
+            &json!({"session_id": "s", "receiver": "claude", "auto_ack": true}),
+        )
+        .expect_err("auto_ack acks the messages it returns; read-only must refuse it");
+        assert!(
+            matches!(refused, MemoryError::Permission(_)),
+            "expected a Permission refusal, got {refused:?}"
+        );
+        assert!(
+            refused.to_string().contains("auto_ack"),
+            "the refusal must name the offending argument so a client knows what to \
+             drop; got {refused}"
+        );
+
+        // The control: a plain recv must get PAST mode gating. It may still fail
+        // on the session not existing — what matters is that the failure is not a
+        // Permission refusal, since that is what proves the gate let it through.
+        let plain = call_tool(
+            &app,
+            "collab_recv",
+            &json!({"session_id": "s", "receiver": "claude"}),
+        );
+        assert!(
+            !matches!(plain, Err(MemoryError::Permission(_))),
+            "a plain collab_recv is a read and must pass read-only gating; got {plain:?}"
+        );
+
+        // The async long-poll path in `server` bypasses `call_tool` entirely and
+        // therefore carries its own gating call. Pin it here, or the daemon path
+        // can lose read-only enforcement while `call_tool` still has it.
+        let via_long_poll = wait_my_turn_begin(
+            &app,
+            &json!({"session_id": "s", "agent": "claude", "handoff_token": "tok"}),
+        );
+        assert!(
+            matches!(via_long_poll, Err(MemoryError::Permission(_))),
+            "the async long-poll path must apply the same read-only gating as \
+             call_tool; got {via_long_poll:?}"
+        );
+    }
+
+    /// Predicate-level companion to the enforcement test above. Kept because it
+    /// pins the classification itself, but it is deliberately NOT the only
+    /// coverage — see that test for why.
     #[test]
     fn read_only_mode_refuses_auto_ack_but_allows_plain_recv() {
         assert!(
