@@ -489,7 +489,7 @@ Requests on a single connection are pipelined, for both the stdio transport and 
 
 Mutations are held to their arrival order and run one at a time per connection. The guarantee is that **no mutation executes after a mutation that was refused on the same connection**: once a write is refused for backlog overflow (more than 64 queued), later writes on that connection are refused until the backlog drains, so a refused write can never be stepped over. Reads are never refused by this rule.
 
-A write is classified by its arguments, not just its name: `collab_recv` with `auto_ack: true` acks the messages it returns, and any collab call carrying a `handoff_token` claims the generation lease. Both count as writes for ordering and for `IRONMEM_MCP_MODE` gating — in read-only mode a plain `collab_recv` still works, but `auto_ack: true` is refused rather than silently downgraded.
+A write is classified by its arguments, not just its name: `collab_recv` with `auto_ack: true` acks the messages it returns, and any collab call carrying a `handoff_token` claims the generation lease. Both count as writes for ordering and for `IRONMEM_MCP_MODE` gating — in read-only mode the mode gate lets a plain `collab_recv` through, while `auto_ack: true` is refused rather than silently downgraded. Passing the mode gate is not sufficient on its own: a session already handed off (generation > 0) cannot be read without a `handoff_token`, and presenting one is itself a write, so a read-only client can follow a session from generation 0 but cannot attach to one after a handoff.
 
 ## Operational Notes
 

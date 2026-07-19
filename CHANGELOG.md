@@ -99,12 +99,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Writes hidden behind read-shaped tool names are now classified as writes.**
   Whether a call mutates is decided from its ARGUMENTS, not just its tool name.
   `collab_recv` with `auto_ack: true` acks every message it returns, and any
-  collab call carrying a `handoff_token` claims the generation lease — all of
-  these persist state while being named like queries. Classified as reads, they
-  were permitted under `IRONMEM_MCP_MODE=read-only` and were free to overtake a
-  write parked on the readiness gate. They are now gated and ordered as the
-  writes they are. Plain `collab_recv` remains a read and keeps working in
-  read-only mode; only the write-triggering argument is refused, and refused
+  collab call carrying a `handoff_token` claims the generation lease — both
+  persist state while being named like queries. The two had different
+  consequences, and only one was a mode-gating hole:
+  - `auto_ack: true` was genuinely permitted under `IRONMEM_MCP_MODE=read-only`
+    and wrote there. That bypass is now closed.
+  - `handoff_token` was already refused in read-only mode by the guard in
+    `ensure_actor_generation_current`, so there was **no** mode bypass to fix.
+    What it did escape was the per-connection ordering barrier: classified as a
+    read, a lease claim could overtake a write still parked on the readiness
+    gate.
+
+  Both are now gated and ordered as the writes they are. Plain `collab_recv`
+  remains a read; only the write-triggering argument is refused, and refused
   explicitly rather than silently downgraded.
 - **Overflowing the write backlog no longer breaks write ordering.** When more
   than 64 writes were queued on one connection the overflowing write was

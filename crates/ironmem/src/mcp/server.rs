@@ -294,9 +294,13 @@ const MAX_IN_FLIGHT_REQUESTS: usize = 64;
 ///
 /// Mutations are serialized (see `run_framing_loop`), so a client that
 /// pipelines writes during warm-up builds a backlog here rather than in
-/// `in_flight`. Bounding it bounds the memory one connection can pin: request
-/// bodies are capped at 100k chars, so this is the difference between a few MB
-/// and unbounded. Exceeding it is answered with an explicit error rather than
+/// `in_flight`. This bounds the NUMBER of queued requests, not their size: the
+/// framing loop queues each parsed request whole and argument validation only
+/// happens later, on the far side of the barrier, so a client sending very
+/// large bodies still pins proportionally more memory. Bounding the count is
+/// what keeps the backlog from growing without limit; a byte-level cap in the
+/// read arm would be the fix if body size ever becomes the binding constraint.
+/// Exceeding it is answered with an explicit error rather than
 /// by stalling the reader — a stall would silently re-create the head-of-line
 /// blocking this loop exists to avoid, and would be far harder to diagnose.
 ///
