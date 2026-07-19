@@ -25,6 +25,19 @@
 //! success), while `search`'s case passes unchanged. This is the documented
 //! RED step of TDD for the daemon-autospawn-race root-cause fix; the write
 //! handlers are not touched by this task.
+//!
+//! Task 6 (this file, extended): once the write handlers call
+//! `app.wait_for_write_ready()` (a later task), the three tests above become
+//! the **timeout** terminal-path coverage — the readiness gate is forced
+//! `Pending` and a short injected timeout proves each write tool errors out
+//! bounded rather than hanging. This file additionally covers the **failed**
+//! terminal path: the gate resolved explicitly to `Failed(reason)` rather
+//! than timing out. In both terminal paths a completed write is
+//! structurally impossible (the gate never becomes `Ready`), so the
+//! assertion for all six of these tests is tightened to require
+//! `isError == true` outright (`assert_write_errored`), not the looser
+//! either/or allowance that would still make sense for a hypothetical
+//! fast-resolving-to-Ready race.
 
 use std::sync::{Arc, Mutex};
 
@@ -54,13 +67,14 @@ static WRITE_READINESS_TIMEOUT_ENV_LOCK: Mutex<()> = Mutex::new(());
 /// multiplying into a slow suite. `Config::write_readiness_timeout()` reads
 /// its env var fresh on every call (not cached on `Config`), so overriding it
 /// here — immediately before driving the request — takes effect without
-/// needing to reconstruct `App`/`Config`. `assert_write_completed_or_errored`
-/// already accepts `isError: true` as a valid outcome alongside a completed
-/// write, so proving the bounded-timeout-then-error path is a faithful
-/// exercise of the real contract, not a weakening of it.
+/// needing to reconstruct `App`/`Config`. `assert_write_errored` requires
+/// `isError: true` outright here, since a still-`Pending` gate that only
+/// ever times out can never let the write complete — proving the
+/// bounded-timeout-then-error path is a faithful exercise of the real
+/// contract, not a weakening of it.
 ///
-/// Panic-safe: `f`'s body is an assertion (`assert_write_completed_or_errored`)
-/// that can panic on failure. `catch_unwind` ensures the env var is always
+/// Panic-safe: `f`'s body is an assertion (`assert_write_errored`) that can
+/// panic on failure. `catch_unwind` ensures the env var is always
 /// removed — via the lock guard and unconditionally, not just on the happy
 /// path — before the original panic (if any) is resumed, so a failing
 /// assertion here can never leak the override into a later test.
@@ -118,6 +132,22 @@ fn force_warming_up(app: &mut App) {
     assert!(app.is_warming_up(), "failed to force warm-up state");
 }
 
+/// Force the `App`'s readiness gate into a terminal `Failed` state (e.g. a
+/// background model load that errored out), rather than leaving it
+/// `Pending`. Same swap-in pattern as `force_warming_up`, but the fresh gate
+/// is resolved failed *before* being installed so `wait_for_write_ready`
+/// observes the fast, already-terminal path (see
+/// `ReadinessGate::peek_terminal`) instead of blocking at all.
+fn force_readiness_failed(app: &mut App, reason: &str) {
+    let gate = ReadinessGate::new_pending();
+    gate.resolve_failed(reason.to_string());
+    app.memory_ready = Arc::new(gate);
+    assert!(
+        app.is_warming_up(),
+        "a Failed gate must still report is_warming_up() (is_ready() stays false on Failed)"
+    );
+}
+
 /// Mirrors `code_maps.rs`'s own test helper: a minimal real git repo so
 /// `code_map_write`'s `repo`/`head_sha` validation (which shells out to git)
 /// can succeed.
@@ -170,22 +200,33 @@ fn make_git_repo_with_file(
     (dir, root, sha)
 }
 
-/// The RED assertion shared by all three write-tool tests: a warm-up no-op
-/// body (`{"warming_up": true, ...}`) must never be returned as if it were a
-/// completed write. It is acceptable only when paired with `isError: true`
-/// (a hard rejection is a distinguishable, honest failure); as a plain
-/// success it is invisible to the caller and silently drops the write.
-fn assert_write_completed_or_errored(tool: &str, is_error: bool, payload: &Value) {
+/// The Task 6 assertion shared by all six write-tool terminal-path tests
+/// below (three timeout cases, three failed-resolution cases): in both
+/// scenarios the readiness gate can never resolve `Ready` (it either times
+/// out still `Pending`, or resolves explicitly `Failed`), so a completed
+/// write is structurally impossible here — this requires `isError: true`
+/// outright, and additionally rejects the soft warm-up no-op body even when
+/// paired with `isError: true`.
+fn assert_write_errored(tool: &str, is_error: bool, payload: &Value) {
+    assert!(
+        is_error,
+        "{tool}: expected isError:true (readiness gate can never resolve Ready in \
+         this scenario, so a completed write is impossible) but got isError=false, \
+         payload={payload}"
+    );
     let warming_up_body = payload.get("warming_up").and_then(Value::as_bool) == Some(true);
     assert!(
-        !warming_up_body || is_error,
-        "{tool}: warm-up no-op body returned as an ordinary success \
-         (isError={is_error}, payload={payload}) — a write-shaped tool must not \
-         silently no-op during warm-up; it must either complete the write or \
-         surface isError:true"
+        !warming_up_body,
+        "{tool}: must not return the soft warm-up no-op body even when paired with \
+         isError:true in this scenario — payload={payload}"
     );
 }
 
+/// Task 6, timeout case: gate resolved `Pending` and never resolves within
+/// the short injected `IRONMEM_WRITE_READINESS_TIMEOUT_SECS` override. This
+/// can never produce a completed write (the gate stays `Pending` for the
+/// full call), so the assertion is tightened to `isError == true` outright
+/// rather than the looser `assert_write_completed_or_errored` allowance.
 #[test]
 fn add_drawer_does_not_silently_noop_during_warmup() {
     with_short_write_readiness_timeout(|| {
@@ -198,10 +239,11 @@ fn add_drawer_does_not_silently_noop_during_warmup() {
             json!({ "content": "warmup race test content", "wing": "ironrace-memory" }),
         );
 
-        assert_write_completed_or_errored("add_drawer", is_error, &payload);
+        assert_write_errored("add_drawer", is_error, &payload);
     });
 }
 
+/// Task 6, timeout case (see doc comment above `add_drawer`'s counterpart).
 #[test]
 fn diary_write_does_not_silently_noop_during_warmup() {
     with_short_write_readiness_timeout(|| {
@@ -214,10 +256,11 @@ fn diary_write_does_not_silently_noop_during_warmup() {
             json!({ "content": "warmup race diary entry" }),
         );
 
-        assert_write_completed_or_errored("diary_write", is_error, &payload);
+        assert_write_errored("diary_write", is_error, &payload);
     });
 }
 
+/// Task 6, timeout case (see doc comment above `add_drawer`'s counterpart).
 #[test]
 fn code_map_write_does_not_silently_noop_during_warmup() {
     with_short_write_readiness_timeout(|| {
@@ -239,8 +282,68 @@ fn code_map_write_does_not_silently_noop_during_warmup() {
             }),
         );
 
-        assert_write_completed_or_errored("code_map_write", is_error, &payload);
+        assert_write_errored("code_map_write", is_error, &payload);
     });
+}
+
+/// Task 6, failed-resolution case: the readiness gate resolves explicitly
+/// to `Failed` (e.g. background model init errored out) rather than timing
+/// out still `Pending`. No timeout override is needed here — a `Failed`
+/// gate is already terminal, so `wait_for_write_ready` returns immediately
+/// via the fast path (`ReadinessGate::peek_terminal`).
+#[test]
+fn add_drawer_errors_when_readiness_resolves_failed() {
+    let mut app = App::open_for_test().unwrap();
+    force_readiness_failed(&mut app, "model load exploded");
+
+    let (is_error, payload) = call_tool_raw(
+        &app,
+        "add_drawer",
+        json!({ "content": "warmup race test content", "wing": "ironrace-memory" }),
+    );
+
+    assert_write_errored("add_drawer", is_error, &payload);
+}
+
+/// Task 6, failed-resolution case (see doc comment above `add_drawer`'s
+/// counterpart).
+#[test]
+fn diary_write_errors_when_readiness_resolves_failed() {
+    let mut app = App::open_for_test().unwrap();
+    force_readiness_failed(&mut app, "model load exploded");
+
+    let (is_error, payload) = call_tool_raw(
+        &app,
+        "diary_write",
+        json!({ "content": "warmup race diary entry" }),
+    );
+
+    assert_write_errored("diary_write", is_error, &payload);
+}
+
+/// Task 6, failed-resolution case (see doc comment above `add_drawer`'s
+/// counterpart).
+#[test]
+fn code_map_write_errors_when_readiness_resolves_failed() {
+    let mut app = App::open_for_test().unwrap();
+    force_readiness_failed(&mut app, "model load exploded");
+
+    let (_dir, root, sha) = make_git_repo_with_file("src/lib.rs", "// lib");
+
+    let (is_error, payload) = call_tool_raw(
+        &app,
+        "code_map_write",
+        json!({
+            "repo": root.to_string_lossy(),
+            "area": "core",
+            "summary": "warmup race code map summary",
+            "head_sha": sha,
+            "source_files": ["src/lib.rs"],
+            "built_by": "test",
+        }),
+    );
+
+    assert_write_errored("code_map_write", is_error, &payload);
 }
 
 /// Companion assertion: `search` is READ-shaped, and its soft
