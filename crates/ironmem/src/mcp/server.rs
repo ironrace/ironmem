@@ -142,31 +142,38 @@ fn account_response_metrics(
     });
 }
 
-/// A request being dispatched, paired with the request itself so the framing
-/// loop can account metrics and release the ordering barrier when it lands.
+/// A request being dispatched, paired with its stamped sequence number and
+/// the request itself so the framing loop can account metrics and release the
+/// ordering barrier when it lands.
 ///
 /// Boxed because the loop pushes from two sites — newly read, and released
 /// from the mutation queue — and two `async` blocks are two distinct opaque
 /// types that cannot share one `FuturesUnordered`. `LocalBoxFuture`, not
 /// `BoxFuture`: `Arc<App>` is `!Send` (see `daemon`'s module doc).
 type InFlightRequest<'a> =
-    futures_util::future::LocalBoxFuture<'a, (JsonRpcRequest, Option<JsonRpcResponse>)>;
+    futures_util::future::LocalBoxFuture<'a, (u64, JsonRpcRequest, Option<JsonRpcResponse>)>;
 
 fn dispatch_in_flight<'a>(
     app: &'a Arc<App>,
+    seq: u64,
     request: JsonRpcRequest,
     arrived_at: std::time::Instant,
 ) -> InFlightRequest<'a> {
     Box::pin(async move {
         let response = dispatch_request(app, &request, arrived_at).await;
-        (request, response)
+        (seq, request, response)
     })
 }
 
 /// Whether this request persists state, and so must hold its place in the
-/// per-connection ordering barrier. Derived from `tools::is_mutating_call` —
-/// the same predicate that drives read-only mode gating — so the two cannot
-/// disagree about what a "write" is.
+/// per-connection ordering barrier ON ENTRY. Derived from
+/// `tools::is_mutating_call` — the same predicate that drives read-only mode
+/// gating — so the two cannot disagree about what a "write" is.
+///
+/// This predicate governs barrier ENTRY only — whether a request must become
+/// the barrier owner (or queue behind one). Barrier EXIT is a separate
+/// decision, keyed on the owning request's stamped `seq` rather than on this
+/// predicate — see `release_barrier`.
 ///
 /// Argument-aware, not name-aware: `collab_recv{auto_ack:true}` acks the
 /// messages it returns, so classifying by tool name alone would let it overtake
@@ -380,12 +387,22 @@ where
     let mut conn = ConnectionContext::new(mode);
     let mut in_flight = FuturesUnordered::new();
     let mut reader_done = false;
+    // Monotonic per-connection request sequence number. Every dispatched
+    // request is stamped with the seq it held at admission time, so the
+    // mutation barrier below can identify its owner unambiguously even
+    // across a stale or duplicate release (see `mutation_barrier`).
+    let mut next_seq: u64 = 0;
     // Ordering barrier: mutations run strictly FIFO, one at a time.
     // Each entry keeps its arrival time so a queued mutation's readiness
     // budget is measured from when the client sent it, not from when the
     // barrier released it.
     let mut queued_mutations: VecDeque<(JsonRpcRequest, std::time::Instant)> = VecDeque::new();
-    let mut mutation_in_flight = false;
+    // `Some(seq)` while a mutation is holding the per-connection ordering
+    // barrier, naming the seq of the request that currently owns it. Barrier
+    // release is keyed on this seq matching (`release_barrier`), not on a
+    // bare boolean, so a stale or duplicate release can never clear a
+    // *different* owner's barrier out from under it.
+    let mut mutation_barrier: Option<u64> = None;
     // Set when a mutation is rejected for queue overflow, cleared once the
     // backlog has fully drained. While set, every further mutation on this
     // connection is rejected too — see `writes_blocked_message`.
@@ -401,18 +418,24 @@ where
             // over accepting more of it.
             biased;
 
-            Some((request, response)) = in_flight.next() => {
-                if is_mutating_request(&request) {
-                    mutation_in_flight = false;
-                }
+            Some((seq, request, response)) = in_flight.next() => {
+                // This request is no longer in flight regardless of whether it
+                // still holds the mutation barrier — those are two separate
+                // facts. Whether it held the barrier at all, and whether THIS
+                // completion is the one that releases it, is decided below by
+                // `release_barrier` matching on `seq`.
+                let released = release_barrier(&mut mutation_barrier, seq);
+
                 write_and_account(app, &conn, &mut stdout, &request, response).await?;
 
-                // Release the next queued mutation, preserving arrival order.
-                if !mutation_in_flight {
-                    if let Some((next, arrived_at)) = queued_mutations.pop_front() {
-                        mutation_in_flight = true;
-                        in_flight.push(dispatch_in_flight(app, next, arrived_at));
-                    }
+                // Only the completion that actually released the barrier may
+                // drain the queue — a release that found a mismatched (stale
+                // or already-cleared) seq must not pop a queued mutation onto
+                // a barrier some other owner still holds.
+                if released {
+                    start_next_queued_mutation(
+                        app, &mut queued_mutations, &mut mutation_barrier, &mut next_seq, &mut in_flight,
+                    );
                 }
 
                 // The backlog is empty and nothing is running, so every mutation
@@ -420,7 +443,7 @@ where
                 // can a new one start without landing after a skipped
                 // predecessor, so this is the single point where the connection
                 // may accept writes again.
-                if mutations_blocked && !mutation_in_flight && queued_mutations.is_empty() {
+                if mutations_blocked && mutation_barrier.is_none() && queued_mutations.is_empty() {
                     mutations_blocked = false;
                 }
             }
@@ -506,7 +529,7 @@ where
                         ).await?;
                         continue;
                     }
-                    if mutation_in_flight {
+                    if mutation_barrier.is_some() {
                         if queued_mutations.len() >= MAX_QUEUED_MUTATIONS {
                             // Rejecting one write would otherwise punch a hole in
                             // the ordering guarantee: the writes behind it would
@@ -522,10 +545,16 @@ where
                         queued_mutations.push_back((request, arrived_at));
                         continue;
                     }
-                    mutation_in_flight = true;
+                    let seq = next_seq;
+                    next_seq += 1;
+                    mutation_barrier = Some(seq);
+                    in_flight.push(dispatch_in_flight(app, seq, request, arrived_at));
+                    continue;
                 }
 
-                in_flight.push(dispatch_in_flight(app, request, arrived_at));
+                let seq = next_seq;
+                next_seq += 1;
+                in_flight.push(dispatch_in_flight(app, seq, request, arrived_at));
             }
 
             else => break,
@@ -537,6 +566,46 @@ where
     }
 
     Ok(())
+}
+
+/// Release the per-connection mutation barrier, but ONLY if `seq` is the
+/// request that currently owns it. Returns whether it actually cleared.
+///
+/// Keyed on identity rather than "is something held" so a stale or duplicate
+/// release — a completion for a request that never owned the barrier, or one
+/// that already released it — can never clear a *different* owner's barrier
+/// out from under it. Callers must drain the queue (`start_next_queued_mutation`)
+/// only when this returns `true`; see the completion-branch call site in
+/// `run_framing_loop`.
+fn release_barrier(mutation_barrier: &mut Option<u64>, seq: u64) -> bool {
+    if *mutation_barrier == Some(seq) {
+        *mutation_barrier = None;
+        true
+    } else {
+        false
+    }
+}
+
+/// Pop the next queued mutation (if any), admit it as the new barrier owner,
+/// and dispatch it — preserving arrival order.
+///
+/// Must be called only after a `release_barrier` call that returned `true`
+/// for the barrier being drained here: that is the sole guarantee that no
+/// other request currently owns it, so admitting a new owner cannot collide
+/// with one already running.
+fn start_next_queued_mutation<'a>(
+    app: &'a Arc<App>,
+    queued_mutations: &mut std::collections::VecDeque<(JsonRpcRequest, std::time::Instant)>,
+    mutation_barrier: &mut Option<u64>,
+    next_seq: &mut u64,
+    in_flight: &mut futures_util::stream::FuturesUnordered<InFlightRequest<'a>>,
+) {
+    if let Some((next, arrived_at)) = queued_mutations.pop_front() {
+        let seq = *next_seq;
+        *next_seq += 1;
+        *mutation_barrier = Some(seq);
+        in_flight.push(dispatch_in_flight(app, seq, next, arrived_at));
+    }
 }
 
 /// The write that overflowed the per-connection ordering backlog.
