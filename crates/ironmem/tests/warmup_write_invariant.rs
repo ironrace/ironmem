@@ -16,28 +16,28 @@
 //!
 //! This test drives each tool through the real wire-level `dispatch` entry
 //! point (not the handler function directly) against a single in-process
-//! `App::open_for_test()` forced into the warm-up state, and asserts that
-//! each write tool's response is either a completed-write acknowledgement or
-//! an explicit `isError: true` — never the soft `warming_up` no-op body.
+//! `App::open_for_test()` forced into the warm-up state.
 //!
-//! Expected to FAIL on HEAD for `add_drawer`, `diary_write`, and
-//! `code_map_write` (all three currently return the soft body as if it were a
-//! success), while `search`'s case passes unchanged. This is the documented
-//! RED step of TDD for the daemon-autospawn-race root-cause fix; the write
-//! handlers are not touched by this task.
+//! History: this file started (Task 1) as a RED test — on HEAD at that point,
+//! `add_drawer`/`diary_write`/`code_map_write` returned the soft
+//! `warming_up` body as if it were a success, and this file failed on all
+//! three while `search`'s companion case passed. Task 5 fixed the handlers to
+//! call `app.wait_for_write_ready()` instead of no-opping, turning those
+//! three RED cases GREEN.
 //!
-//! Task 6 (this file, extended): once the write handlers call
-//! `app.wait_for_write_ready()` (a later task), the three tests above become
-//! the **timeout** terminal-path coverage — the readiness gate is forced
-//! `Pending` and a short injected timeout proves each write tool errors out
-//! bounded rather than hanging. This file additionally covers the **failed**
-//! terminal path: the gate resolved explicitly to `Failed(reason)` rather
-//! than timing out. In both terminal paths a completed write is
-//! structurally impossible (the gate never becomes `Ready`), so the
-//! assertion for all six of these tests is tightened to require
-//! `isError == true` outright (`assert_write_errored`), not the looser
-//! either/or allowance that would still make sense for a hypothetical
-//! fast-resolving-to-Ready race.
+//! Task 6 (this file, extended): with the handlers now blocking on
+//! `wait_for_write_ready()`, the original three tests became the **timeout**
+//! terminal-path coverage — the readiness gate is forced `Pending` and a
+//! short injected timeout proves each write tool errors out bounded rather
+//! than hanging. This file additionally covers the **failed** terminal path:
+//! the gate resolved explicitly to `Failed(reason)` rather than timing out.
+//! In both terminal paths a completed write is structurally impossible (the
+//! gate never becomes `Ready`), so the assertion for all six of these tests
+//! is tightened to require `isError == true` outright (`assert_write_errored`),
+//! not the looser either/or allowance that would still make sense for a
+//! hypothetical fast-resolving-to-Ready race. `search` (read-shaped) keeps
+//! its soft `{"warming_up": true, "results": []}` body unchanged throughout —
+//! that behavior is correct and must not change.
 
 use std::sync::{Arc, Mutex};
 
