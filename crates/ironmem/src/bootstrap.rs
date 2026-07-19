@@ -221,8 +221,13 @@ pub fn run_background_memory_init(config: Config, memory_ready: Arc<ReadinessGat
                     "Background memory init failed (App::new): {e}; write-shaped tools will \
                      stay blocked until the process restarts"
                 );
-                memory_ready
-                    .resolve_failed(format!("Background memory init failed (App::new): {e}"));
+                // The gate's reason crosses the MCP client boundary verbatim
+                // (see `STARTUP_FAILURE_CLIENT_REASON`), so `e` — which can
+                // carry database paths and OS error text — stays in the log
+                // line above and never in the reason.
+                memory_ready.resolve_failed(
+                    crate::mcp::readiness::STARTUP_FAILURE_CLIENT_REASON.to_string(),
+                );
                 return;
             }
         };

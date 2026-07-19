@@ -23,6 +23,18 @@ use std::time::Duration;
 
 use crate::error::MemoryError;
 
+/// Client-facing reason recorded when server startup fails.
+///
+/// A `Failed` reason is NOT an internal-only breadcrumb: [`ReadinessGate::wait_for_write`]
+/// embeds it in `MemoryError::NotReady`, and the MCP server forwards a
+/// `NotReady` message to the client verbatim. So a reason built from the
+/// underlying error would publish internal paths and OS/driver error text to
+/// every MCP client. Startup call sites log the full error via `tracing` and
+/// hand the gate this constant instead.
+pub const STARTUP_FAILURE_CLIENT_REASON: &str =
+    "server memory initialization failed at startup; writes are unavailable until the \
+     server is restarted (see server logs for details)";
+
 /// Internal terminal-resolution state guarded by the gate's `Mutex`.
 ///
 /// `Pending` is the only non-terminal state. Once the state transitions to
