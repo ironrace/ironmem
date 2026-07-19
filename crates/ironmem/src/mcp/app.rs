@@ -9,6 +9,7 @@ use ironrace_embed::Embedder;
 use crate::config::{Config, EmbedMode};
 use crate::db::schema::Database;
 use crate::error::MemoryError;
+use crate::mcp::readiness::ReadinessGate;
 use crate::search::graph::MemoryGraph;
 
 /// HNSW index + id_map bundled together to eliminate TOCTOU between separate locks.
@@ -38,9 +39,10 @@ pub struct App {
     dirty: AtomicBool,
     /// Cached memory graph (wing/room adjacency). Invalidated on writes.
     pub graph_cache: RwLock<Option<MemoryGraph>>,
-    /// Set to true once background memory init (model load + bootstrap) completes.
-    /// False during warmup; tools that need the embedder return a warming_up response.
-    pub memory_ready: Arc<AtomicBool>,
+    /// Resolves once background memory init (model load + bootstrap) completes
+    /// (or fails). Pending during warmup; tools that need the embedder return
+    /// a warming_up response while `is_warming_up()` is true.
+    pub memory_ready: Arc<ReadinessGate>,
     /// Guards the one-time HNSW rebuild triggered when memory_ready transitions to true.
     memory_ready_rebuilt: AtomicBool,
     /// Active collab session this server process is participating in. Set by
@@ -125,7 +127,7 @@ impl App {
             index_state: RwLock::new(IndexState { index, id_map }),
             dirty: AtomicBool::new(false),
             graph_cache: RwLock::new(None),
-            memory_ready: Arc::new(AtomicBool::new(true)),
+            memory_ready: Arc::new(ReadinessGate::new_ready()),
             memory_ready_rebuilt: AtomicBool::new(true),
             active_collab_session_id: RwLock::new(None),
             explicit_task_tag: RwLock::new(None),
@@ -160,7 +162,7 @@ impl App {
             }),
             dirty: AtomicBool::new(false),
             graph_cache: RwLock::new(None),
-            memory_ready: Arc::new(AtomicBool::new(false)),
+            memory_ready: Arc::new(ReadinessGate::new_pending()),
             memory_ready_rebuilt: AtomicBool::new(false),
             active_collab_session_id: RwLock::new(None),
             explicit_task_tag: RwLock::new(None),
@@ -215,7 +217,7 @@ impl App {
     /// Returns true while background memory init is still in progress.
     /// Embedding-dependent tools should return a warming_up response during this window.
     pub fn is_warming_up(&self) -> bool {
-        !self.memory_ready.load(Ordering::Relaxed)
+        !self.memory_ready.is_ready()
     }
 
     /// Create an App with an in-memory DB and noop embedder for testing.
@@ -280,7 +282,7 @@ impl App {
             }),
             dirty: AtomicBool::new(false),
             graph_cache: RwLock::new(None),
-            memory_ready: Arc::new(AtomicBool::new(true)),
+            memory_ready: Arc::new(ReadinessGate::new_ready()),
             memory_ready_rebuilt: AtomicBool::new(true),
             active_collab_session_id: RwLock::new(None),
             explicit_task_tag: RwLock::new(None),
@@ -360,10 +362,25 @@ impl App {
     /// If background init just completed, swap in the real embedder.
     /// Must be called before any embed operation (add, diary write, search).
     /// Idempotent: the swap happens at most once per server lifetime.
+    ///
+    /// Ordering note: this used to load the old `Arc<AtomicBool>` with
+    /// `Ordering::Acquire`, pairing with a `Release` store in
+    /// `bootstrap::run_background_memory_init`. `ReadinessGate::is_ready()`
+    /// (Task 3) is documented as a plain `Relaxed` load — matching
+    /// `is_warming_up()`'s existing semantics — and `resolve_ready()` stores
+    /// its fast-path flag with `Relaxed` too, so there was never a `Release`
+    /// counterpart on the `ReadinessGate` side to pair with an `Acquire` load
+    /// in the first place; an `Acquire` load here would be acquire-in-name
+    /// only, with no matching release to synchronize against. The real data
+    /// this method depends on (drawers written by the background bootstrap)
+    /// lives in SQLite, reached through a *separate* DB connection owned by
+    /// the background thread's own `App`; cross-connection visibility is
+    /// provided by SQLite's own file-level locking/WAL protocol (a syscall
+    /// boundary, which is already a full barrier), not by Rust's atomic
+    /// ordering on this flag. So downgrading this check to `is_ready()`
+    /// (`Relaxed`) does not remove a real happens-before guarantee.
     pub fn ensure_embedder_ready(&self) -> Result<(), MemoryError> {
-        if self.memory_ready.load(Ordering::Acquire)
-            && !self.memory_ready_rebuilt.swap(true, Ordering::AcqRel)
-        {
+        if self.memory_ready.is_ready() && !self.memory_ready_rebuilt.swap(true, Ordering::AcqRel) {
             self.reload_embedder()?;
             // Mark dirty so the HNSW index is rebuilt on the next search, picking
             // up all drawers written by the background bootstrap.

@@ -1,7 +1,6 @@
 //! Background bootstrap, workspace initialization, and stale-lock recovery.
 
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -11,6 +10,7 @@ use sha2::{Digest, Sha256};
 use crate::config::Config;
 use crate::error::MemoryError;
 use crate::mcp::app::App;
+use crate::mcp::readiness::ReadinessGate;
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct GlobalBootstrapState {
@@ -203,7 +203,7 @@ impl Drop for BootstrapLock {
 ///
 /// The thread opens its own `App` (its own DB connection). SQLite WAL handles
 /// concurrent access from the serve loop's connection and this background connection.
-pub fn run_background_memory_init(config: Config, memory_ready: Arc<AtomicBool>) {
+pub fn run_background_memory_init(config: Config, memory_ready: Arc<ReadinessGate>) {
     std::thread::spawn(move || {
         // Capture write permission before config is moved into App::new.
         let writes_allowed = config.mcp_access_mode.allows_writes();
@@ -212,7 +212,8 @@ pub fn run_background_memory_init(config: Config, memory_ready: Arc<AtomicBool>)
             Ok(a) => a,
             Err(e) => {
                 tracing::error!("Background memory init failed (App::new): {e}");
-                memory_ready.store(true, Ordering::Release);
+                memory_ready
+                    .resolve_failed(format!("Background memory init failed (App::new): {e}"));
                 return;
             }
         };
@@ -228,7 +229,7 @@ pub fn run_background_memory_init(config: Config, memory_ready: Arc<AtomicBool>)
         } else {
             tracing::debug!("Skipping auto-bootstrap: MCP access mode does not allow writes");
         }
-        memory_ready.store(true, Ordering::Release);
+        memory_ready.resolve_ready();
     });
 }
 

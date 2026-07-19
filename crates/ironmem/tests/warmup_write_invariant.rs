@@ -26,10 +26,11 @@
 //! RED step of TDD for the daemon-autospawn-race root-cause fix; the write
 //! handlers are not touched by this task.
 
-use std::sync::atomic::Ordering;
+use std::sync::Arc;
 
 use ironmem::mcp::app::App;
 use ironmem::mcp::protocol::JsonRpcRequest;
+use ironmem::mcp::readiness::ReadinessGate;
 use ironmem::mcp::server::dispatch;
 use serde_json::{json, Value};
 
@@ -64,11 +65,14 @@ fn call_tool_raw(app: &App, name: &str, args: Value) -> (bool, Value) {
 }
 
 /// Force the `App` into the warm-up state that `is_warming_up()` reads.
-/// `App::open_for_test()` starts with `memory_ready = true`; storing `false`
-/// here reproduces the daemon's real warm-up window without needing a real
-/// background init thread.
-fn force_warming_up(app: &App) {
-    app.memory_ready.store(false, Ordering::Relaxed);
+/// `App::open_for_test()` starts with `memory_ready` already resolved
+/// `Ready` (see `ReadinessGate::new_ready`). `ReadinessGate` has no raw
+/// setter to flip a resolved gate back to pending (deliberately — first
+/// resolution wins, by design), so this swaps in a *fresh* `Pending` gate
+/// in place of the resolved one, reproducing the daemon's real warm-up
+/// window without needing a real background init thread.
+fn force_warming_up(app: &mut App) {
+    app.memory_ready = Arc::new(ReadinessGate::new_pending());
     assert!(app.is_warming_up(), "failed to force warm-up state");
 }
 
@@ -142,8 +146,8 @@ fn assert_write_completed_or_errored(tool: &str, is_error: bool, payload: &Value
 
 #[test]
 fn add_drawer_does_not_silently_noop_during_warmup() {
-    let app = App::open_for_test().unwrap();
-    force_warming_up(&app);
+    let mut app = App::open_for_test().unwrap();
+    force_warming_up(&mut app);
 
     let (is_error, payload) = call_tool_raw(
         &app,
@@ -156,8 +160,8 @@ fn add_drawer_does_not_silently_noop_during_warmup() {
 
 #[test]
 fn diary_write_does_not_silently_noop_during_warmup() {
-    let app = App::open_for_test().unwrap();
-    force_warming_up(&app);
+    let mut app = App::open_for_test().unwrap();
+    force_warming_up(&mut app);
 
     let (is_error, payload) = call_tool_raw(
         &app,
@@ -170,8 +174,8 @@ fn diary_write_does_not_silently_noop_during_warmup() {
 
 #[test]
 fn code_map_write_does_not_silently_noop_during_warmup() {
-    let app = App::open_for_test().unwrap();
-    force_warming_up(&app);
+    let mut app = App::open_for_test().unwrap();
+    force_warming_up(&mut app);
 
     let (_dir, root, sha) = make_git_repo_with_file("src/lib.rs", "// lib");
 
@@ -197,8 +201,8 @@ fn code_map_write_does_not_silently_noop_during_warmup() {
 /// above.
 #[test]
 fn search_is_allowed_to_return_soft_warmup_body() {
-    let app = App::open_for_test().unwrap();
-    force_warming_up(&app);
+    let mut app = App::open_for_test().unwrap();
+    force_warming_up(&mut app);
 
     let (is_error, payload) = call_tool_raw(&app, "search", json!({ "query": "anything" }));
 
