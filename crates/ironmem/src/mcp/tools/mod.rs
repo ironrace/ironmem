@@ -767,6 +767,42 @@ pub(crate) const MUTATING_TOOLS: &[&str] = &[
     "symbol_graph_index",
 ];
 
+/// Every advertised tool that does NOT persist state.
+///
+/// Exists solely so `write_shaped_tools_are_a_subset_of_mutating_tools` can
+/// require every advertised tool to be explicitly classified. Without it a
+/// newly added tool defaults to "read" by omission — permitted in read-only
+/// mode and free to overtake a parked write in the framing loop's ordering
+/// barrier — with nothing to catch it.
+#[cfg(test)]
+pub(crate) const READ_ONLY_TOOLS: &[&str] = &[
+    "status",
+    "search",
+    "get_drawer",
+    "list_wings",
+    "list_rooms",
+    "get_taxonomy",
+    "kg_query",
+    "kg_timeline",
+    "kg_stats",
+    "traverse",
+    "find_tunnels",
+    "graph_stats",
+    "diary_read",
+    "collab_recv",
+    "collab_status",
+    "collab_get_caps",
+    "collab_wait_my_turn",
+    "code_map_load",
+    "code_map_status",
+    "symbol_lookup",
+    "symbol_imports",
+    "symbol_neighbors",
+    "symbol_graph_lookup",
+    "symbol_graph_imports",
+    "symbol_graph_neighbors",
+];
+
 /// Whether `name` persists state — see [`MUTATING_TOOLS`].
 pub(crate) fn is_mutating_tool(name: &str) -> bool {
     MUTATING_TOOLS.contains(&name)
@@ -837,13 +873,38 @@ mod tests {
                 tool_known(name),
                 "{name} is listed as mutating but is not a known tool"
             );
+        }
+
+        // The direction that actually bites: enumerate every tool the server
+        // ADVERTISES — an source independent of both constants — and require
+        // each one to be explicitly classified. A newly added tool that nobody
+        // classified fails here instead of silently defaulting to "read", which
+        // would let it through read-only mode AND let it overtake a parked
+        // write in the framing loop's ordering barrier.
+        //
+        // `tool_allowed_in_mode` is NOT usable for this: it now derives from
+        // `is_mutating_tool`, so asserting against it would be the code's own
+        // output fed back to itself.
+        let app = App::open_for_test().unwrap();
+        for tool in tool_definitions(&app) {
+            let name = tool["name"].as_str().expect("advertised tool needs a name");
             assert!(
-                !tool_allowed_in_mode(McpAccessMode::ReadOnly, name),
-                "{name} is listed as mutating but read-only mode permits it"
+                is_mutating_tool(name) || READ_ONLY_TOOLS.contains(&name),
+                "{name} is advertised but classified as neither mutating nor \
+                 read-only — add it to MUTATING_TOOLS or READ_ONLY_TOOLS"
+            );
+            assert!(
+                !(is_mutating_tool(name) && READ_ONLY_TOOLS.contains(&name)),
+                "{name} is classified as both mutating and read-only"
             );
         }
     }
 
+    /// Each entry is a real tool with its own `precheck_write_request` arm, so
+    /// a malformed write fails fast instead of waiting out the readiness
+    /// timeout only to be rejected anyway. The complementary direction — a
+    /// tool that should be classified and is not — is
+    /// `write_shaped_tools_are_a_subset_of_mutating_tools`.
     #[test]
     fn write_shaped_tools_are_covered_end_to_end() {
         let app = App::open_for_test().unwrap();

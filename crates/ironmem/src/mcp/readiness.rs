@@ -281,9 +281,18 @@ impl ReadinessGate {
         // in-flight slot and never answer its client — the hang the timeout
         // exists to prevent.
         let timeout = timeout.min(MAX_REPRESENTABLE_TIMEOUT);
-        let deadline = Instant::now()
-            .checked_add(timeout)
-            .unwrap_or_else(|| Instant::now() + MAX_REPRESENTABLE_TIMEOUT);
+        // The clamp above makes `None` unreachable — a day of headroom on an
+        // `Instant` is not a thing any real platform lacks. Report the timeout
+        // rather than inventing a fallback deadline: an unrepresentable
+        // deadline means the wait cannot be bounded, and every alternative
+        // (waiting unbounded, or adding the same duration again) either breaks
+        // this method's contract or re-raises the very panic being avoided.
+        let Some(deadline) = Instant::now().checked_add(timeout) else {
+            return Err(MemoryError::NotReady(format!(
+                "cannot represent a deadline {timeout:?} from now; \
+                 refusing to wait unbounded for server readiness"
+            )));
+        };
         loop {
             // Register with `Notify` BEFORE reading the state. `notify_waiters`
             // only wakes already-registered waiters, and resolution publishes

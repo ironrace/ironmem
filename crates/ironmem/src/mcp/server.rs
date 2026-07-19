@@ -152,9 +152,13 @@ fn account_response_metrics(
 type InFlightRequest<'a> =
     futures_util::future::LocalBoxFuture<'a, (JsonRpcRequest, Option<JsonRpcResponse>)>;
 
-fn dispatch_in_flight<'a>(app: &'a Arc<App>, request: JsonRpcRequest) -> InFlightRequest<'a> {
+fn dispatch_in_flight<'a>(
+    app: &'a Arc<App>,
+    request: JsonRpcRequest,
+    arrived_at: std::time::Instant,
+) -> InFlightRequest<'a> {
     Box::pin(async move {
-        let response = dispatch_request(app, &request).await;
+        let response = dispatch_request(app, &request, arrived_at).await;
         (request, response)
     })
 }
@@ -343,7 +347,10 @@ where
     let mut in_flight = FuturesUnordered::new();
     let mut reader_done = false;
     // Ordering barrier: mutations run strictly FIFO, one at a time.
-    let mut queued_mutations: VecDeque<JsonRpcRequest> = VecDeque::new();
+    // Each entry keeps its arrival time so a queued mutation's readiness
+    // budget is measured from when the client sent it, not from when the
+    // barrier released it.
+    let mut queued_mutations: VecDeque<(JsonRpcRequest, std::time::Instant)> = VecDeque::new();
     let mut mutation_in_flight = false;
 
     loop {
@@ -364,9 +371,9 @@ where
 
                 // Release the next queued mutation, preserving arrival order.
                 if !mutation_in_flight {
-                    if let Some(next) = queued_mutations.pop_front() {
+                    if let Some((next, arrived_at)) = queued_mutations.pop_front() {
                         mutation_in_flight = true;
-                        in_flight.push(dispatch_in_flight(app, next));
+                        in_flight.push(dispatch_in_flight(app, next, arrived_at));
                     }
                 }
             }
@@ -393,6 +400,9 @@ where
                         return Err(MemoryError::Io(e));
                     }
                 };
+                // Stamped here, before parsing, so every request's readiness
+                // budget starts when it actually arrived.
+                let arrived_at = std::time::Instant::now();
                 let line = line.trim().to_string();
                 if line.is_empty() {
                     continue;
@@ -458,13 +468,13 @@ where
                             );
                             continue;
                         }
-                        queued_mutations.push_back(request);
+                        queued_mutations.push_back((request, arrived_at));
                         continue;
                     }
                     mutation_in_flight = true;
                 }
 
-                in_flight.push(dispatch_in_flight(app, request));
+                in_flight.push(dispatch_in_flight(app, request, arrived_at));
             }
 
             else => break,
@@ -545,7 +555,11 @@ async fn write_response(
 /// connection, so a write parked inside its handler would head-of-line block
 /// that client's own reads just as surely — and stdio is the transport a
 /// harness uses directly.
-async fn dispatch_request(app: &Arc<App>, request: &JsonRpcRequest) -> Option<JsonRpcResponse> {
+async fn dispatch_request(
+    app: &Arc<App>,
+    request: &JsonRpcRequest,
+    arrived_at: std::time::Instant,
+) -> Option<JsonRpcResponse> {
     let tool_name = request.params.get("name").and_then(|value| value.as_str());
     let is_write =
         request.method == "tools/call" && tool_name.is_some_and(tools::is_write_shaped_tool);
@@ -573,7 +587,17 @@ async fn dispatch_request(app: &Arc<App>, request: &JsonRpcRequest) -> Option<Js
         // number of connected clients, and one blocking-pool thread per
         // waiter would starve every other `spawn_blocking` user in the
         // process for the length of the readiness timeout.
-        let timeout = app.config.write_readiness_timeout();
+        //
+        // The budget runs from when the request ARRIVED, not from when it
+        // reached this point. Mutations are serialized by the framing loop's
+        // ordering barrier, so a fresh per-request timeout would compound:
+        // N queued writes against a gate that never resolves would take
+        // N x timeout to all report, and the last client would wait hours for
+        // a bound documented as 90 seconds.
+        let timeout = app
+            .config
+            .write_readiness_timeout()
+            .saturating_sub(arrived_at.elapsed());
         if let Err(error) = app.memory_ready.wait_for_write_async(timeout).await {
             return Some(tool_error_response(request.id.clone(), tool_name, error));
         }
@@ -758,7 +782,7 @@ mod tests {
         }))
         .unwrap();
 
-        let write_wait = dispatch_request(&app, &write);
+        let write_wait = dispatch_request(&app, &write, std::time::Instant::now());
         tokio::pin!(write_wait);
 
         // Rust futures are lazy: constructing `write_wait` does NOT start the
@@ -780,11 +804,13 @@ mod tests {
         // request must still be serviced. If that wait occupied the daemon's
         // single dispatcher, this search call would not complete before the
         // gate resolves.
-        let search_response =
-            tokio::time::timeout(Duration::from_millis(250), dispatch_request(&app, &search))
-                .await
-                .expect("read-only search must stay responsive while a write waits")
-                .expect("search produces a response");
+        let search_response = tokio::time::timeout(
+            Duration::from_millis(250),
+            dispatch_request(&app, &search, std::time::Instant::now()),
+        )
+        .await
+        .expect("read-only search must stay responsive while a write waits")
+        .expect("search produces a response");
         assert_eq!(search_response.id, Some(json!(2)));
         assert_eq!(
             search_response.result.unwrap()["content"][0]["text"]
@@ -1108,11 +1134,13 @@ mod tests {
         // `content` is required by `add_drawer` and is absent here.
         let invalid = tool_call(1, "add_drawer", json!({ "wing": "race" }));
 
-        let response =
-            tokio::time::timeout(Duration::from_secs(2), dispatch_request(&app, &invalid))
-                .await
-                .expect("an invalid write must fail fast, not wait out the readiness timeout")
-                .expect("tools/call produces a response");
+        let response = tokio::time::timeout(
+            Duration::from_secs(2),
+            dispatch_request(&app, &invalid, std::time::Instant::now()),
+        )
+        .await
+        .expect("an invalid write must fail fast, not wait out the readiness timeout")
+        .expect("tools/call produces a response");
 
         let message = tool_error_text(&response);
         assert!(
@@ -1139,11 +1167,13 @@ mod tests {
 
         let forbidden = tool_call(1, "add_drawer", json!({ "content": "x", "wing": "race" }));
 
-        let response =
-            tokio::time::timeout(Duration::from_secs(2), dispatch_request(&app, &forbidden))
-                .await
-                .expect("a forbidden write must fail fast, not wait out the readiness timeout")
-                .expect("tools/call produces a response");
+        let response = tokio::time::timeout(
+            Duration::from_secs(2),
+            dispatch_request(&app, &forbidden, std::time::Instant::now()),
+        )
+        .await
+        .expect("a forbidden write must fail fast, not wait out the readiness timeout")
+        .expect("tools/call produces a response");
 
         let message = tool_error_text(&response);
         assert!(
@@ -1191,7 +1221,7 @@ mod tests {
                 .collect();
             let mut waiters: FuturesUnordered<_> = requests
                 .iter()
-                .map(|request| dispatch_request(&app, request))
+                .map(|request| dispatch_request(&app, request, std::time::Instant::now()))
                 .collect();
 
             // Drive every write to its readiness await point. None can

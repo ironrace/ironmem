@@ -677,6 +677,34 @@ mod tests {
     /// A failure must therefore leave the latch unclaimed, so the next call
     /// tries again and — until it succeeds — keeps reporting the error rather
     /// than returning `Ok(())` against a noop embedder.
+    /// `ensure_embedder_ready` must FAIL rather than return `Ok(())` while the
+    /// gate is unresolved. Returning `Ok` let the caller embed through the noop
+    /// embedder and persist an all-zero vector that no search can ever match —
+    /// silent, permanent data loss reported as success. `tools::WRITE_SHAPED_TOOLS`
+    /// is documented as only an optimization *because* of this check, so the
+    /// check has to be pinned.
+    #[test]
+    fn ensure_embedder_ready_fails_closed_while_not_ready() {
+        let mut app = App::open_for_test().unwrap();
+
+        app.memory_ready = Arc::new(ReadinessGate::new_pending());
+        let pending = app.ensure_embedder_ready();
+        assert!(
+            matches!(pending, Err(MemoryError::NotReady(_))),
+            "a Pending gate must fail closed, got {pending:?}"
+        );
+
+        let gate = ReadinessGate::new_pending();
+        gate.resolve_failed("model load exploded".to_string());
+        app.memory_ready = Arc::new(gate);
+        let failed = app.ensure_embedder_ready();
+        assert!(
+            matches!(&failed, Err(MemoryError::NotReady(reason))
+                if reason.contains("model load exploded")),
+            "a Failed gate must surface its reason, got {failed:?}"
+        );
+    }
+
     #[test]
     fn ensure_embedder_ready_retries_after_a_failed_reload() {
         let mut app = App::open_for_test().unwrap();

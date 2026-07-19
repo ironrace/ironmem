@@ -228,7 +228,13 @@ impl Drop for ResolveOnExit {
 }
 
 pub fn run_background_memory_init(config: Config, memory_ready: Arc<ReadinessGate>) {
-    std::thread::spawn(move || {
+    std::thread::spawn(move || init_thread_body(config, memory_ready));
+}
+
+/// The init thread's body, factored out so tests can drive the REAL exit paths
+/// rather than a reconstruction of them.
+fn init_thread_body(config: Config, memory_ready: Arc<ReadinessGate>) {
+    {
         // Armed before any fallible work, so no exit path can skip it.
         let _resolve_on_exit = ResolveOnExit(Arc::clone(&memory_ready));
         // Capture write permission before config is moved into App::new.
@@ -244,13 +250,15 @@ pub fn run_background_memory_init(config: Config, memory_ready: Arc<ReadinessGat
                     "Background memory init failed (App::new): {e}; write-shaped tools will \
                      stay blocked until the process restarts"
                 );
+                // No explicit resolve here: `ResolveOnExit` resolves `Failed`
+                // on the way out. Deliberately the SOLE mechanism, so the guard
+                // is load-bearing on a path a test can actually drive — a
+                // second, redundant resolve would let the guard rot unnoticed.
+                //
                 // The gate's reason crosses the MCP client boundary verbatim
                 // (see `STARTUP_FAILURE_CLIENT_REASON`), so `e` — which can
                 // carry database paths and OS error text — stays in the log
                 // line above and never in the reason.
-                memory_ready.resolve_failed(
-                    crate::mcp::readiness::STARTUP_FAILURE_CLIENT_REASON.to_string(),
-                );
                 return;
             }
         };
@@ -259,19 +267,31 @@ pub fn run_background_memory_init(config: Config, memory_ready: Arc<ReadinessGat
         // migration/mining step fails — resolve `Ready` either way rather than
         // permanently blocking writes over a non-fatal bootstrap error.
         if writes_allowed {
-            match ensure_bootstrapped(&app, workspace.as_deref()) {
-                Ok(r) => tracing::info!(
+            // `catch_unwind` so a PANIC here is treated exactly like the `Err`
+            // arm below. Without it the `ResolveOnExit` guard would fire and
+            // resolve `Failed`, permanently disabling writes and making
+            // `search` report a terminal failure — over a best-effort mining
+            // step, on a server whose embedder and index are fully working.
+            // That would silently invert the asymmetry documented above.
+            let bootstrapped = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                ensure_bootstrapped(&app, workspace.as_deref())
+            }));
+            match bootstrapped {
+                Ok(Ok(r)) => tracing::info!(
                     "Bootstrap complete (initialized={}, mine_ran={})",
                     r.initialized_store,
                     r.initial_mine_ran
                 ),
-                Err(e) => tracing::error!("Bootstrap failed: {e}"),
+                Ok(Err(e)) => tracing::error!("Bootstrap failed: {e}"),
+                Err(_) => tracing::error!(
+                    "Bootstrap panicked; continuing with a usable embedder and index"
+                ),
             }
         } else {
             tracing::debug!("Skipping auto-bootstrap: MCP access mode does not allow writes");
         }
         memory_ready.resolve_ready();
-    });
+    }
 }
 
 pub fn record_workspace_mine(config: &Config, workspace_root: &Path) -> Result<(), MemoryError> {
@@ -453,6 +473,43 @@ mod tests {
             ),
             "a panicked init must leave the gate terminally Failed, not Pending — \
              got {:?}",
+            gate.snapshot()
+        );
+    }
+
+    /// Drives the REAL `init_thread_body` down its failure path, which is the
+    /// only way to prove the guard is actually ARMED in production.
+    ///
+    /// `ResolveOnExit` is deliberately the sole resolver on that path, so
+    /// deleting or sinking the arming line leaves the gate `Pending` and this
+    /// test fails. A test that constructed the guard itself could not detect
+    /// that — it would only re-test `Drop`.
+    #[test]
+    fn init_thread_body_resolves_the_gate_when_app_new_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        // `db_path` points AT a directory, so `Database::open` cannot succeed.
+        let config = Config {
+            db_path: dir.path().to_path_buf(),
+            model_dir: dir.path().join("models"),
+            model_dir_explicit: true,
+            state_dir: dir.path().join("state"),
+            mcp_access_mode: crate::config::McpAccessMode::ReadOnly,
+            embed_mode: crate::config::EmbedMode::Noop,
+        };
+
+        let gate = Arc::new(ReadinessGate::new_pending());
+        init_thread_body(config, Arc::clone(&gate));
+
+        assert!(
+            !gate.is_ready(),
+            "a failed init must never report the server as ready"
+        );
+        assert!(
+            matches!(
+                gate.snapshot(),
+                crate::mcp::readiness::ReadinessState::Failed(_)
+            ),
+            "init must leave the gate terminally Failed, not Pending — got {:?}",
             gate.snapshot()
         );
     }
