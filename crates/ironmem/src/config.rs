@@ -208,9 +208,13 @@ impl Config {
         Duration::from_secs(secs)
     }
 
-    /// Fail-safe bound on how long a write-shaped MCP tool handler will block
-    /// on `ReadinessGate::wait_for_write` during server warm-up before giving
-    /// up.
+    /// Fail-safe bound on how long a write-shaped MCP tool waits for readiness
+    /// during server warm-up before giving up.
+    ///
+    /// Consumed by `server::dispatch_request` via
+    /// `ReadinessGate::wait_for_write_async` on the production path, and by
+    /// `tools::call_tool` via the synchronous `wait_for_write` fallback. No
+    /// tool handler blocks on it directly.
     ///
     /// Defaults to 90s ([`DEFAULT_WRITE_READINESS_TIMEOUT_SECS`]). Honors the
     /// `IRONMEM_WRITE_READINESS_TIMEOUT_SECS` env override, parsed as `u64`
@@ -270,15 +274,70 @@ impl Config {
     }
 }
 
+/// THE lock for tests that mutate a process-global env var read by [`Config`].
+///
+/// Crate-wide on purpose. Env vars are process-global, and `config::tests` and
+/// `mcp::server::tests` live in the SAME test binary — two separate mutexes
+/// each "guarding" `IRONMEM_WRITE_READINESS_TIMEOUT_SECS` exclude nothing from
+/// each other, so a clamp test setting `u64::MAX` could make an unrelated
+/// framing-loop test park for a day and fail with a bogus diagnosis. Anything
+/// touching these vars must take THIS lock.
+#[cfg(test)]
+pub(crate) static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Sets an env var for the duration of a test and restores the prior value on
+/// drop, holding [`ENV_LOCK`] for its whole lifetime.
+///
+/// Drop-based rather than `catch_unwind`-based so it is panic-safe *and* works
+/// across `.await` points (an async test cannot be wrapped in `catch_unwind`).
+/// A failing assertion can therefore never leak an override into a later test.
+#[cfg(test)]
+pub(crate) struct EnvGuard {
+    key: &'static str,
+    previous: Option<String>,
+    _lock: std::sync::MutexGuard<'static, ()>,
+}
+
+#[cfg(test)]
+impl EnvGuard {
+    pub(crate) fn set(key: &'static str, value: &str) -> Self {
+        let lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let previous = std::env::var(key).ok();
+        std::env::set_var(key, value);
+        Self {
+            key,
+            previous,
+            _lock: lock,
+        }
+    }
+
+    /// Take the lock without changing anything — for tests that only READ an
+    /// env-controlled value but must not race one that writes it.
+    pub(crate) fn pin(key: &'static str) -> Self {
+        let lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let previous = std::env::var(key).ok();
+        Self {
+            key,
+            previous,
+            _lock: lock,
+        }
+    }
+}
+
+#[cfg(test)]
+impl Drop for EnvGuard {
+    fn drop(&mut self) {
+        match &self.previous {
+            Some(value) => std::env::set_var(self.key, value),
+            None => std::env::remove_var(self.key),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Mutex;
     use std::time::Duration;
-
-    /// Serializes env-mutating tests: `set_var`/`remove_var` are process-global
-    /// and would otherwise race under the parallel test runner.
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     /// Build a `Config` with a known `state_dir` without touching the real home
     /// directory (so path derivation is deterministic under test).

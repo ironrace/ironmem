@@ -636,9 +636,10 @@ pub fn call_tool(app: &App, name: &str, args: &Value) -> Result<Value, MemoryErr
 /// the framing loop is unaware of it and freeze every connection for the whole
 /// readiness timeout.
 ///
-/// `write_shaped_tools_are_covered_end_to_end` in this module's tests pins
-/// every one of those obligations, so a fourth entry cannot be added here and
-/// silently left half-wired.
+/// `write_shaped_tools_are_covered_end_to_end` pins that each entry is a known
+/// tool with its own `precheck_write_request` arm;
+/// `write_shaped_tools_are_a_subset_of_mutating_tools` pins the relationship to
+/// `MUTATING_TOOLS` from the independent mode-gating side.
 pub(crate) const WRITE_SHAPED_TOOLS: &[&str] = &["add_drawer", "diary_write", "code_map_write"];
 
 /// Whether `name` is one of [`WRITE_SHAPED_TOOLS`].
@@ -728,30 +729,54 @@ fn tool_known(name: &str) -> bool {
     )
 }
 
+/// Every tool that PERSISTS state — the superset of [`WRITE_SHAPED_TOOLS`].
+///
+/// Two different questions get asked about a tool and they must not be
+/// confused:
+///
+/// - "does it persist anything?" → this list. Drives read-only mode gating and
+///   the framing loop's per-connection ordering barrier.
+/// - "does it need the embedder?" → [`WRITE_SHAPED_TOOLS`], a strict subset.
+///   Only those have to block on the readiness gate.
+///
+/// The distinction matters because a mutating tool that is NOT embedder-
+/// dependent skips the gate entirely. If such a tool were also allowed to skip
+/// the ordering barrier, it could execute and commit while an earlier write on
+/// the same connection was still parked — e.g. `delete_drawer` landing before
+/// the `add_drawer` it was meant to follow, so the parked add then re-creates
+/// the row the client just deleted.
+///
+/// `write_shaped_tools_are_a_subset_of_mutating_tools` pins the subset
+/// relationship, so the two lists cannot drift apart.
+pub(crate) const MUTATING_TOOLS: &[&str] = &[
+    "add_drawer",
+    "delete_drawer",
+    "kg_add",
+    "kg_invalidate",
+    "diary_write",
+    "collab_start",
+    "collab_start_code_review",
+    "collab_set_implementer",
+    "collab_send",
+    "collab_ack",
+    "collab_approve",
+    "collab_register_caps",
+    "collab_end",
+    "session_handoff",
+    "code_map_write",
+    "symbol_graph_index",
+];
+
+/// Whether `name` persists state — see [`MUTATING_TOOLS`].
+pub(crate) fn is_mutating_tool(name: &str) -> bool {
+    MUTATING_TOOLS.contains(&name)
+}
+
 fn tool_allowed_in_mode(mode: McpAccessMode, name: &str) -> bool {
     if !tool_known(name) {
         return false;
     }
-    mode.allows_writes()
-        || !matches!(
-            name,
-            "add_drawer"
-                | "delete_drawer"
-                | "kg_add"
-                | "kg_invalidate"
-                | "diary_write"
-                | "collab_start"
-                | "collab_start_code_review"
-                | "collab_set_implementer"
-                | "collab_send"
-                | "collab_ack"
-                | "collab_approve"
-                | "collab_register_caps"
-                | "collab_end"
-                | "session_handoff"
-                | "code_map_write"
-                | "symbol_graph_index"
-        )
+    mode.allows_writes() || !is_mutating_tool(name)
 }
 
 fn ensure_tool_allowed(app: &App, name: &str) -> Result<(), MemoryError> {
@@ -784,6 +809,41 @@ mod tests {
     ///
     /// This pins each obligation that [`WRITE_SHAPED_TOOLS`] now carries, so a
     /// new entry cannot be added half-wired.
+    /// The converse of the test below, and the direction that actually bites.
+    ///
+    /// `write_shaped_tools_are_covered_end_to_end` iterates
+    /// `WRITE_SHAPED_TOOLS`, so it can only ever check entries that are already
+    /// there — it is blind to the dangerous case, a tool that SHOULD be in the
+    /// list and is not. This checks the relationship from the independent
+    /// `MUTATING_TOOLS` side, which is also what read-only mode gating uses, so
+    /// the two lists cannot drift into disagreeing about what a write is.
+    ///
+    /// The remaining risk — a mutating tool that needs the embedder but is
+    /// absent from `WRITE_SHAPED_TOOLS` — is no longer silent: since
+    /// `App::ensure_embedder_ready` fails closed, such a tool errors during
+    /// warm-up instead of persisting an all-zero vector.
+    #[test]
+    fn write_shaped_tools_are_a_subset_of_mutating_tools() {
+        for name in WRITE_SHAPED_TOOLS {
+            assert!(
+                is_mutating_tool(name),
+                "{name} blocks on the readiness gate but is not in MUTATING_TOOLS, \
+                 so read-only mode would let it through and the framing loop would \
+                 not hold it in connection order"
+            );
+        }
+        for name in MUTATING_TOOLS {
+            assert!(
+                tool_known(name),
+                "{name} is listed as mutating but is not a known tool"
+            );
+            assert!(
+                !tool_allowed_in_mode(McpAccessMode::ReadOnly, name),
+                "{name} is listed as mutating but read-only mode permits it"
+            );
+        }
+    }
+
     #[test]
     fn write_shaped_tools_are_covered_end_to_end() {
         let app = App::open_for_test().unwrap();
@@ -792,10 +852,6 @@ mod tests {
             assert!(
                 tool_known(name),
                 "{name} is listed as write-shaped but is not a known tool"
-            );
-            assert!(
-                is_write_shaped_tool(name),
-                "{name} must be recognized by the predicate the framing loop uses"
             );
             // A dedicated precheck arm, not the `_ => Ok(())` fallthrough:
             // empty arguments must be rejected on their own merits, so a

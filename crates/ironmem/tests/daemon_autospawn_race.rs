@@ -135,7 +135,8 @@ fn concurrent_proxies_single_flight_one_daemon_and_share_one_db() {
             .unwrap_or_else(|e| panic!("client {i} add_drawer read failed: {e}"));
 
         // Parse as JSON-RPC and require an actual completed write acknowledgement,
-        // not merely a success-shaped envelope. A `warming_up` no-op body (see
+        // not merely a success-shaped envelope. Before this fix a
+        // `warming_up` no-op body (then returned by `handle_add_drawer`; see
         // handle_add_drawer in src/mcp/tools/drawers.rs) would satisfy a bare
         // substring check like `contains("\"id\":2")` while performing no write
         // at all — that's precisely the silent-data-loss hole this assertion

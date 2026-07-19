@@ -206,8 +206,31 @@ impl Drop for BootstrapLock {
 ///
 /// The thread opens its own `App` (its own DB connection). SQLite WAL handles
 /// concurrent access from the serve loop's connection and this background connection.
+/// Resolves the readiness gate `Failed` if the init thread exits without
+/// having resolved it — including by PANIC.
+///
+/// Without this, a panic anywhere in init (a corrupt `model.onnx` making the
+/// ONNX runtime panic rather than return `Err`, say) leaves the gate `Pending`
+/// forever: the `JoinHandle` is dropped so nothing observes the unwind, `status`
+/// reports `warming_up` for the life of the process, and `search` keeps
+/// answering "available shortly" — exactly the dead-server-looks-slow lie the
+/// terminal `Failed` state was introduced to prevent.
+///
+/// Resolution is first-wins, so on both normal paths (which resolve explicitly)
+/// this drop is a no-op.
+struct ResolveOnExit(Arc<ReadinessGate>);
+
+impl Drop for ResolveOnExit {
+    fn drop(&mut self) {
+        self.0
+            .resolve_failed(crate::mcp::readiness::STARTUP_FAILURE_CLIENT_REASON.to_string());
+    }
+}
+
 pub fn run_background_memory_init(config: Config, memory_ready: Arc<ReadinessGate>) {
     std::thread::spawn(move || {
+        // Armed before any fallible work, so no exit path can skip it.
+        let _resolve_on_exit = ResolveOnExit(Arc::clone(&memory_ready));
         // Capture write permission before config is moved into App::new.
         let writes_allowed = config.mcp_access_mode.allows_writes();
         let workspace = resolve_workspace_root(None);
@@ -399,6 +422,55 @@ fn temp_path_for(path: &Path) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A panic in the init thread must still leave the gate TERMINAL.
+    ///
+    /// `run_background_memory_init` drops its `JoinHandle`, so an unwind is
+    /// observed by nothing. If the gate stayed `Pending`, `status` would report
+    /// `warming_up` forever and `search` would keep promising results
+    /// "shortly" from a server that is never coming up — the precise pathology
+    /// the terminal `Failed` state exists to prevent. Every write would also
+    /// burn the full readiness timeout, once per call, forever.
+    #[test]
+    fn a_panicking_init_thread_still_resolves_the_gate() {
+        let gate = Arc::new(ReadinessGate::new_pending());
+
+        let thread_gate = Arc::clone(&gate);
+        let handle = std::thread::spawn(move || {
+            let _resolve_on_exit = ResolveOnExit(Arc::clone(&thread_gate));
+            panic!("simulated ONNX session panic during model load");
+        });
+        assert!(handle.join().is_err(), "the thread must have panicked");
+
+        assert!(
+            !gate.is_ready(),
+            "a panicked init must never report the server as ready"
+        );
+        assert!(
+            matches!(
+                gate.snapshot(),
+                crate::mcp::readiness::ReadinessState::Failed(_)
+            ),
+            "a panicked init must leave the gate terminally Failed, not Pending — \
+             got {:?}",
+            gate.snapshot()
+        );
+    }
+
+    /// The guard must not override a real resolution: first-wins means the
+    /// normal success path stays `Ready` even though the guard runs on drop.
+    #[test]
+    fn resolve_on_exit_does_not_override_a_successful_resolution() {
+        let gate = Arc::new(ReadinessGate::new_pending());
+        {
+            let _resolve_on_exit = ResolveOnExit(Arc::clone(&gate));
+            gate.resolve_ready();
+        }
+        assert!(
+            gate.is_ready(),
+            "the drop guard must not downgrade an already-Ready gate"
+        );
+    }
 
     #[test]
     fn detects_default_mempalace_store_from_config() {

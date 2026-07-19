@@ -249,7 +249,9 @@ pub(super) fn validate_code_map_write_args(
 }
 
 pub(super) fn handle_code_map_write(app: &App, args: &Value) -> Result<Value, MemoryError> {
-    // Validate before waiting on readiness — see `handle_add_drawer`.
+    // Readiness is already resolved by the time this runs (see
+    // `tools::WRITE_SHAPED_TOOLS`); validation is split out so
+    // `precheck_write_request` can reject a malformed call BEFORE the wait.
     let CodeMapWriteArgs {
         repo,
         area,

@@ -1,43 +1,47 @@
-//! Task 1 (RED test, root cause of `daemon_autospawn_race.rs` flakiness):
-//! write-shaped MCP tool handlers silently no-op during warm-up.
+//! Wire-level proof that a success-shaped MCP tool result means the work
+//! actually happened, even during server warm-up.
 //!
-//! `handle_add_drawer`, `handle_diary_write`, and `handle_code_map_write` each
-//! begin with `if app.is_warming_up() { return Ok(json!({"warming_up": true,
-//! ...})) }` — a success-shaped response that performs NO write. At the wire
-//! level, `mcp::server::dispatch` renders any `Ok(_)` from `tools::call_tool`
-//! as an ordinary JSON-RPC success with no `isError` — so this warm-up no-op
-//! is indistinguishable from a genuine successful write to a caller. That is
-//! the root cause of 5 concurrent `add_drawer` callers over a shared,
-//! still-warming daemon landing only 4/5 rows.
+//! **The bug this pins.** `add_drawer`, `diary_write`, and `code_map_write`
+//! used to open with `if app.is_warming_up() { return Ok(json!({"warming_up":
+//! true, ...})) }` — a success-shaped response that performed NO write.
+//! `mcp::server::dispatch` renders any `Ok(_)` from `tools::call_tool` as an
+//! ordinary JSON-RPC success with no `isError`, so a caller could not tell that
+//! body apart from a real write. That is why 5 concurrent `add_drawer` callers
+//! over a shared, still-warming daemon landed only 4/5 rows
+//! (`daemon_autospawn_race.rs`).
 //!
-//! `handle_search` also checks `is_warming_up()`, but it is READ-shaped and
-//! its soft `{"warming_up": true, "results": []}` body is correct, existing
-//! behavior that must NOT change.
+//! **Where the wait lives now — NOT in the handlers.** The three handlers are
+//! readiness-agnostic: they neither check `is_warming_up()` nor call
+//! `wait_for_write_ready()`. The wait happens in exactly two places, both
+//! driven off `tools::WRITE_SHAPED_TOOLS`:
 //!
-//! This test drives each tool through the real wire-level `dispatch` entry
-//! point (not the handler function directly) against a single in-process
-//! `App::open_for_test()` forced into the warm-up state.
+//! - `mcp::server::dispatch_request` — the production path. Awaits readiness
+//!   asynchronously BEFORE dispatch, so a parked write does not occupy the
+//!   thread that owns the `App`.
+//! - `tools::call_tool` — a synchronous fallback for callers that reach
+//!   `dispatch`/`call_tool` directly, including these tests.
 //!
-//! History: this file started (Task 1) as a RED test — on HEAD at that point,
-//! `add_drawer`/`diary_write`/`code_map_write` returned the soft
-//! `warming_up` body as if it were a success, and this file failed on all
-//! three while `search`'s companion case passed. Task 5 fixed the handlers to
-//! call `app.wait_for_write_ready()` instead of no-opping, turning those
-//! three RED cases GREEN.
+//! Adding a write-shaped tool therefore means adding its name to
+//! `WRITE_SHAPED_TOOLS` — nothing else. Putting a wait in a handler is the
+//! mistake this design exists to prevent.
 //!
-//! Task 6 (this file, extended): with the handlers now blocking on
-//! `wait_for_write_ready()`, the original three tests became the **timeout**
-//! terminal-path coverage — the readiness gate is forced `Pending` and a
-//! short injected timeout proves each write tool errors out bounded rather
-//! than hanging. This file additionally covers the **failed** terminal path:
-//! the gate resolved explicitly to `Failed(reason)` rather than timing out.
-//! In both terminal paths a completed write is structurally impossible (the
-//! gate never becomes `Ready`), so the assertion for all six of these tests
-//! is tightened to require `isError == true` outright (`assert_write_errored`),
-//! not the looser either/or allowance that would still make sense for a
-//! hypothetical fast-resolving-to-Ready race. `search` (read-shaped) keeps
-//! its soft `{"warming_up": true, "results": []}` body unchanged throughout —
-//! that behavior is correct and must not change.
+//! **What is covered here.** Both terminal paths in which readiness can never
+//! become `Ready`, for all three write tools:
+//!
+//! - **timeout** — the gate is forced `Pending` and a short injected
+//!   `IRONMEM_WRITE_READINESS_TIMEOUT_SECS` proves the call errors out bounded
+//!   rather than hanging.
+//! - **failed** — the gate is resolved explicitly to `Failed(reason)`.
+//!
+//! A completed write is structurally impossible in both, so `assert_write_errored`
+//! requires `isError: true` outright and additionally rejects the soft warm-up
+//! body; `GateFailure` makes each test assert WHICH of the two failures it got,
+//! so neither family can pass against the other's behavior.
+//!
+//! `search` is read-shaped and keeps its soft `{"warming_up": true,
+//! "results": []}` body while readiness is `Pending` — correct, and pinned
+//! here. On a terminally `Failed` gate it errors instead: "available shortly"
+//! from a server that is never coming up is the same lie in read form.
 
 use std::sync::{Arc, Mutex};
 

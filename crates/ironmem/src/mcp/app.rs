@@ -45,11 +45,14 @@ pub struct App {
     /// How a tool should consult this depends on its shape, and getting it
     /// wrong is how warm-up writes were silently discarded:
     ///
-    /// - **Write-shaped** (persists something): block on it —
-    ///   `App::wait_for_write_ready`, and add the tool to
-    ///   `tools::WRITE_SHAPED_TOOLS` so the framing loop performs that wait
-    ///   asynchronously instead. Returning a soft `warming_up` body here is a
-    ///   success-shaped response for a write that never happened.
+    /// - **Write-shaped** (needs the embedder): add the tool's name to
+    ///   `tools::WRITE_SHAPED_TOOLS`. That is the ONLY step — `call_tool` and
+    ///   `server::dispatch_request` derive the wait from that list. Do NOT
+    ///   call `App::wait_for_write_ready` from a handler: that runs the
+    ///   SYNCHRONOUS wait on the thread that owns the `App` and freezes every
+    ///   connection for the readiness timeout. Returning a soft `warming_up`
+    ///   body is worse still — a success-shaped response for a write that
+    ///   never happened.
     /// - **Read-shaped**: branch on `App::readiness_snapshot`. A soft
     ///   `warming_up` body is correct for `Pending` only; `Failed` is terminal
     ///   and must be reported as an error, not as "try again shortly".
@@ -249,9 +252,12 @@ impl App {
     /// tool handlers that must never silently no-op during warm-up. Returns
     /// `Err(MemoryError::NotReady(_))` if readiness resolves as failed or the
     /// fail-safe timeout (`Config::write_readiness_timeout`) expires — see
-    /// `ReadinessGate::wait_for_write`. Read-shaped tools (e.g. `search`) do
-    /// NOT use this — they keep the lock-free `is_warming_up()` soft-body
-    /// check unchanged.
+    /// `ReadinessGate::wait_for_write`. Called from `tools::call_tool` for
+    /// every `WRITE_SHAPED_TOOLS` entry — not from individual handlers.
+    ///
+    /// Read-shaped tools do NOT use this: they branch on
+    /// `App::readiness_snapshot`, returning a soft `warming_up` body while
+    /// `Pending` and an error on `Failed`.
     pub fn wait_for_write_ready(&self) -> Result<(), MemoryError> {
         self.memory_ready
             .wait_for_write(self.config.write_readiness_timeout())
@@ -423,7 +429,27 @@ impl App {
     /// all-zero vector that no search can ever match, with each individual
     /// call returning `Ok(())`.
     pub fn ensure_embedder_ready(&self) -> Result<(), MemoryError> {
-        if self.memory_ready.is_ready() && !self.memory_ready_rebuilt.swap(true, Ordering::AcqRel) {
+        // Fail CLOSED. Returning `Ok(())` while the gate is unresolved used to
+        // leave the caller embedding through the noop embedder installed by
+        // `new_server_ready`, persisting an all-zero vector that no search can
+        // ever match — a silent, permanent data loss reported as success.
+        //
+        // That made `tools::WRITE_SHAPED_TOOLS` a *correctness* invariant: a
+        // tool that embedded but was missing from the list would corrupt data
+        // silently. With this check the list is only an optimization (park on
+        // the gate and then succeed, rather than erroring), and the failure
+        // mode of forgetting it is a loud error instead of unsearchable rows.
+        if !self.memory_ready.is_ready() {
+            return Err(match self.memory_ready.snapshot() {
+                ReadinessState::Failed(reason) => MemoryError::NotReady(reason),
+                _ => MemoryError::NotReady(
+                    "server memory initialization is still in progress; the embedder \
+                     is not loaded yet"
+                        .to_string(),
+                ),
+            });
+        }
+        if !self.memory_ready_rebuilt.swap(true, Ordering::AcqRel) {
             if let Err(e) = self.reload_embedder() {
                 self.memory_ready_rebuilt.store(false, Ordering::Release);
                 return Err(e);

@@ -26,7 +26,9 @@ pub(super) fn validate_diary_write_args(args: &Value) -> Result<DiaryWriteArgs<'
 }
 
 pub(super) fn handle_diary_write(app: &App, args: &Value) -> Result<Value, MemoryError> {
-    // Validate before waiting on readiness — see `handle_add_drawer`.
+    // Readiness is already resolved by the time this runs (see
+    // `tools::WRITE_SHAPED_TOOLS`); validation is split out so
+    // `precheck_write_request` can reject a malformed call BEFORE the wait.
     let DiaryWriteArgs { content, wing } = validate_diary_write_args(args)?;
     app.ensure_embedder_ready()?;
     let entry = diary::write_entry(app, content, wing, "diary", 100_000)?;

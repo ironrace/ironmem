@@ -686,7 +686,7 @@ Write-shaped tools (`add_drawer`, diary writes, `code_map_write`) never return t
 
 A client that polls must treat `readiness: "failed"` as terminal — the server needs a restart — and stop polling rather than waiting for a `warming_up: false` that will never arrive.
 
-Requests on a single connection are pipelined, for both the stdio transport and daemon connections, so a write parked on the readiness gate does not block later requests on that same connection. Responses may therefore arrive out of request order; JSON-RPC 2.0 permits this, and clients match responses to requests by `id`.
+Requests on a single connection are pipelined, for both the stdio transport and daemon connections, so a write parked on the readiness gate does not block later requests on that same connection. Reads may therefore be answered out of request order; clients match responses to requests by `id`, so order is not significant. Mutations are held to their arrival order.
 
 ## Benchmarking
 

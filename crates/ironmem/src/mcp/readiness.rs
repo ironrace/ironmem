@@ -15,13 +15,14 @@
 //! what a client is told. Write-shaped tools — the set in
 //! `tools::WRITE_SHAPED_TOOLS` — block via [`ReadinessGate::wait_for_write`].
 //!
-//! The gate exposes both a blocking wait ([`ReadinessGate::wait_for_write`],
-//! for the synchronous tool handlers invoked from inside `block_in_place`)
-//! and an async one ([`ReadinessGate::wait_for_write_async`], used by
-//! `server::dispatch_request` for BOTH transports). Both observe the same
-//! terminal state; the async variant exists so a waiter costs a task
-//! registration rather than an OS thread, and so the wait happens before the
-//! single-owner `dispatch` rather than inside it.
+//! The gate exposes two waits over the same terminal state.
+//! [`ReadinessGate::wait_for_write_async`] is the PRODUCTION path:
+//! `server::dispatch_request` awaits it before dispatch on both transports, so
+//! a waiter costs a `Notify` registration rather than an OS thread and never
+//! occupies the single thread that owns the `App`.
+//! [`ReadinessGate::wait_for_write`] is the synchronous fallback, reached via
+//! `tools::call_tool` for callers that enter `dispatch`/`call_tool` directly.
+//! No tool handler calls either one — see `tools::WRITE_SHAPED_TOOLS`.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Condvar, Mutex};
@@ -202,8 +203,9 @@ impl ReadinessGate {
     /// should source it from config with a default generous enough for a
     /// real model load.
     pub fn wait_for_write(&self, timeout: Duration) -> Result<(), MemoryError> {
-        // Fast path: check without ever touching the mutex/condvar if
-        // already resolved.
+        // Fast path: read the terminal state under a brief lock and return.
+        // The mutex IS taken (the reason lives behind it); what this avoids is
+        // ever parking on the condvar.
         match self.peek_terminal() {
             Some(Ok(())) => return Ok(()),
             Some(Err(e)) => return Err(e),
@@ -521,10 +523,15 @@ mod tests {
         );
     }
 
-    /// Many concurrent async waiters must all wake from a single resolution,
-    /// with no per-waiter thread involved: this runs on a `current_thread`
-    /// runtime, which has no worker threads to spare and would deadlock if
-    /// waiting were implemented by blocking.
+    /// Many concurrent async waiters must all wake from a single resolution.
+    ///
+    /// Scope note: running on a `current_thread` runtime proves waiting is not
+    /// INLINE blocking (that would deadlock here). It does NOT prove the
+    /// absence of a per-waiter blocking-pool thread — a
+    /// `spawn_blocking(wait_for_write)` implementation would pass this too, at
+    /// 256 waiters against a 512-thread default pool. That property is pinned
+    /// by `many_readiness_waiters_do_not_starve_the_blocking_pool` in
+    /// `mcp::server`, which caps the pool at one thread.
     #[test]
     fn many_async_waiters_all_wake_on_a_single_resolution() {
         use futures_util::stream::{FuturesUnordered, StreamExt};

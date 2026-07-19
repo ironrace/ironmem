@@ -485,7 +485,7 @@ IRONMEM_DB_PATH = "~/.ironmem/codex.sqlite3"
 {"warming_up": true, "readiness": "failed", "readiness_error": "<reason>", "total_drawers": 0, ...}
 ```
 
-Requests on a single connection are pipelined, for both the stdio transport and daemon connections, so a write parked on the readiness gate does not head-of-line block later requests on that connection. Responses may arrive out of request order; JSON-RPC 2.0 allows this and clients match responses to requests by `id`.
+Requests on a single connection are pipelined, for both the stdio transport and daemon connections, so a write parked on the readiness gate does not head-of-line block later requests on that connection. Reads may be answered out of request order; clients match responses to requests by `id`, so order is not significant. Mutations are held to their arrival order.
 
 ## Operational Notes
 

@@ -58,9 +58,9 @@ pub(super) fn validate_add_drawer_args(args: &Value) -> Result<AddDrawerArgs<'_>
 }
 
 pub(super) fn handle_add_drawer(app: &App, args: &Value) -> Result<Value, MemoryError> {
-    // Validate first: argument errors do not depend on readiness, so a
-    // malformed call must never serve out the warm-up window before being
-    // rejected.
+    // Readiness is already resolved by the time this runs (see
+    // `tools::WRITE_SHAPED_TOOLS`); validation is split out so
+    // `precheck_write_request` can reject a malformed call BEFORE the wait.
     let AddDrawerArgs {
         content,
         wing,

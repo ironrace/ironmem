@@ -142,6 +142,32 @@ fn account_response_metrics(
     });
 }
 
+/// A request being dispatched, paired with the request itself so the framing
+/// loop can account metrics and release the ordering barrier when it lands.
+///
+/// Boxed because the loop pushes from two sites — newly read, and released
+/// from the mutation queue — and two `async` blocks are two distinct opaque
+/// types that cannot share one `FuturesUnordered`. `LocalBoxFuture`, not
+/// `BoxFuture`: `Arc<App>` is `!Send` (see `daemon`'s module doc).
+type InFlightRequest<'a> =
+    futures_util::future::LocalBoxFuture<'a, (JsonRpcRequest, Option<JsonRpcResponse>)>;
+
+fn dispatch_in_flight<'a>(app: &'a Arc<App>, request: JsonRpcRequest) -> InFlightRequest<'a> {
+    Box::pin(async move {
+        let response = dispatch_request(app, &request).await;
+        (request, response)
+    })
+}
+
+/// Whether this request persists state, and so must hold its place in the
+/// per-connection ordering barrier. Derived from `tools::MUTATING_TOOLS` — the
+/// same list that drives read-only mode gating — so the two cannot disagree
+/// about what a "write" is.
+fn is_mutating_request(request: &JsonRpcRequest) -> bool {
+    request.method == "tools/call"
+        && request_tool_name(request).is_some_and(tools::is_mutating_tool)
+}
+
 fn request_tool_name(request: &JsonRpcRequest) -> Option<&str> {
     if request.method != "tools/call" {
         return None;
@@ -249,23 +275,46 @@ where
 /// warm-up", not "concurrent CPU work".
 const MAX_IN_FLIGHT_REQUESTS: usize = 64;
 
+/// How many mutations may sit in the per-connection ordering queue.
+///
+/// Mutations are serialized (see `run_framing_loop`), so a client that
+/// pipelines writes during warm-up builds a backlog here rather than in
+/// `in_flight`. Bounding it bounds the memory one connection can pin: request
+/// bodies are capped at 100k chars, so this is the difference between a few MB
+/// and unbounded. Exceeding it is answered with an explicit error rather than
+/// by stalling the reader — a stall would silently re-create the head-of-line
+/// blocking this loop exists to avoid, and would be far harder to diagnose.
+const MAX_QUEUED_MUTATIONS: usize = 64;
+
 /// Per-connection MCP framing loop: read newline-delimited JSON-RPC requests
 /// from `reader`, dispatch each one, write the response to `writer`, and
 /// account response metrics.
 ///
-/// Requests are pipelined: a request parked on the readiness gate does not
-/// stop this loop from reading and answering the ones behind it. That matters
-/// because one MCP client is one connection — without it, a warm-up
+/// Requests are pipelined, but only READS may overtake. That matters because
+/// one MCP client is one connection — without pipelining, a warm-up
 /// `add_drawer` would stall a following `search` on the *same* connection for
 /// the whole readiness timeout, which is precisely the stall the gate exists
-/// to avoid. Responses may therefore be written out of request order; JSON-RPC
-/// 2.0 explicitly allows this, and clients match responses by `id`.
+/// to avoid.
+///
+/// Mutations (`tools::MUTATING_TOOLS`) are held to their arrival order and run
+/// one at a time. Letting them overtake would corrupt state, not just reorder
+/// replies: only the three embedder-dependent tools park on the readiness
+/// gate, so an unordered `delete_drawer` would execute and commit while the
+/// `add_drawer` before it was still parked, and the add would then re-create
+/// the row the client asked to delete. Reads are unaffected and still overtake
+/// freely, which is the whole point of the pipeline.
+///
+/// Responses are therefore written out of request order for reads; clients
+/// match responses to requests by `id`, so order is not significant.
 ///
 /// Concurrency here is limited to await points. `dispatch` runs inside
 /// `block_in_place` and this whole loop is `!Send` (see `daemon`'s module
 /// doc), so at most one `dispatch` ever runs at a time and `App`'s
-/// single-owner invariant is preserved. `MAX_IN_FLIGHT_REQUESTS` bounds how
-/// far the pipeline may run ahead.
+/// single-owner invariant is preserved. `MAX_IN_FLIGHT_REQUESTS` bounds the
+/// dispatched set and `MAX_QUEUED_MUTATIONS` the ordering backlog. Because a
+/// mutation occupies at most ONE `in_flight` slot no matter how many are
+/// queued, a pipelined burst of writes cannot exhaust the in-flight budget and
+/// lock the reader out — read admission is preserved by construction.
 ///
 /// `mode` (H4) controls whether this connection's `ConnectionContext` honors
 /// the `IRONMEM_SESSION_ID`/`IRONMEM_HARNESS` env overrides — see
@@ -286,15 +335,20 @@ where
     W: AsyncWrite + Unpin,
 {
     use futures_util::stream::{FuturesUnordered, StreamExt};
+    use std::collections::VecDeque;
 
     let mut stdout = writer;
     let mut lines = reader.lines();
     let mut conn = ConnectionContext::new(mode);
     let mut in_flight = FuturesUnordered::new();
     let mut reader_done = false;
+    // Ordering barrier: mutations run strictly FIFO, one at a time.
+    let mut queued_mutations: VecDeque<JsonRpcRequest> = VecDeque::new();
+    let mut mutation_in_flight = false;
 
     loop {
-        // Stop reading at the pipeline depth cap; resume once one drains.
+        // Only the dispatched set is capped here. Queued mutations are bounded
+        // separately, so a burst of writes can never starve read admission.
         let may_read = !reader_done && in_flight.len() < MAX_IN_FLIGHT_REQUESTS;
 
         tokio::select! {
@@ -303,13 +357,41 @@ where
             biased;
 
             Some((request, response)) = in_flight.next() => {
+                if is_mutating_request(&request) {
+                    mutation_in_flight = false;
+                }
                 write_and_account(app, &conn, &mut stdout, &request, response).await?;
+
+                // Release the next queued mutation, preserving arrival order.
+                if !mutation_in_flight {
+                    if let Some(next) = queued_mutations.pop_front() {
+                        mutation_in_flight = true;
+                        in_flight.push(dispatch_in_flight(app, next));
+                    }
+                }
             }
 
             line = lines.next_line(), if may_read => {
-                let Ok(Some(line)) = line else {
-                    reader_done = true;
-                    continue;
+                let line = match line {
+                    Ok(Some(line)) => line,
+                    Ok(None) => {
+                        reader_done = true;
+                        continue;
+                    }
+                    // A read error is NOT a clean close: anything the client
+                    // already sent and we have not parsed is lost, and
+                    // pipelining means that can be a whole batch rather than
+                    // one request. Say so, and surface it to the caller so the
+                    // daemon logs an error close rather than a normal one.
+                    Err(e) => {
+                        tracing::warn!(
+                            error = %e,
+                            in_flight = in_flight.len(),
+                            queued_mutations = queued_mutations.len(),
+                            "connection read failed; unread requests are abandoned"
+                        );
+                        return Err(MemoryError::Io(e));
+                    }
                 };
                 let line = line.trim().to_string();
                 if line.is_empty() {
@@ -354,16 +436,41 @@ where
                     conn.learn(&request.params);
                 }
 
-                in_flight.push(async move {
-                    let response = dispatch_request(app, &request).await;
-                    (request, response)
-                });
+                // Mutations queue behind any mutation already running, so their
+                // arrival order is their execution order. Reads bypass this
+                // entirely.
+                if is_mutating_request(&request) {
+                    if mutation_in_flight {
+                        if queued_mutations.len() >= MAX_QUEUED_MUTATIONS {
+                            let resp = tool_error_response(
+                                request.id.clone(),
+                                request_tool_name(&request),
+                                MemoryError::Validation(format!(
+                                    "too many writes queued on this connection \
+                                     ({MAX_QUEUED_MUTATIONS}); retry once earlier \
+                                     writes complete"
+                                )),
+                            );
+                            let chars = write_response(&mut stdout, &resp).await?;
+                            account_response_metrics(
+                                app, &conn, chars, request_tool_name(&request),
+                                conn.session_id.as_deref(), None,
+                            );
+                            continue;
+                        }
+                        queued_mutations.push_back(request);
+                        continue;
+                    }
+                    mutation_in_flight = true;
+                }
+
+                in_flight.push(dispatch_in_flight(app, request));
             }
 
             else => break,
         }
 
-        if reader_done && in_flight.is_empty() {
+        if reader_done && in_flight.is_empty() && queued_mutations.is_empty() {
             break;
         }
     }
@@ -623,6 +730,9 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn daemon_warmup_write_wait_does_not_block_a_read_only_request() {
+        // Reads the env-controlled readiness timeout; pin it so a test that
+        // WRITES that var cannot change this test's bound mid-run.
+        let _env = EnvGuard::pin(WRITE_READINESS_TIMEOUT_ENV);
         #[allow(clippy::arc_with_non_send_sync)]
         let mut app = Arc::new(App::open_for_test().unwrap());
         let readiness = Arc::new(ReadinessGate::new_pending());
@@ -697,10 +807,13 @@ mod tests {
         );
     }
 
-    /// Serializes tests that override `IRONMEM_WRITE_READINESS_TIMEOUT_SECS`,
-    /// which `Config::write_readiness_timeout()` reads fresh from the process
-    /// environment on every call.
-    static WRITE_READINESS_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    use crate::config::EnvGuard;
+
+    /// The env var `Config::write_readiness_timeout()` reads fresh on every
+    /// call. Every test here that sets OR merely depends on it goes through
+    /// `EnvGuard`, which holds the one crate-wide `config::ENV_LOCK` — see
+    /// that lock's doc for why a second, local mutex would have been useless.
+    const WRITE_READINESS_TIMEOUT_ENV: &str = "IRONMEM_WRITE_READINESS_TIMEOUT_SECS";
 
     /// Feeds `requests` down one connection and returns the first response the
     /// server writes back, driving `run_framing_loop` inline.
@@ -714,8 +827,12 @@ mod tests {
         mode: TransportMode,
         requests: &[serde_json::Value],
     ) -> serde_json::Value {
-        let (mut client_in, server_in) = tokio::io::duplex(8192);
-        let (server_out, client_out) = tokio::io::duplex(8192);
+        // Big enough to hold every request before the loop starts draining:
+        // these writes happen up front, so a buffer smaller than the batch
+        // would block the writer and deadlock the test rather than exercise
+        // the server.
+        let (mut client_in, server_in) = tokio::io::duplex(1 << 20);
+        let (server_out, client_out) = tokio::io::duplex(1 << 20);
         for request in requests {
             let line = format!("{request}\n");
             client_in.write_all(line.as_bytes()).await.unwrap();
@@ -751,10 +868,7 @@ mod tests {
     #[allow(clippy::await_holding_lock)]
     #[tokio::test(flavor = "multi_thread")]
     async fn framing_loop_services_a_read_while_a_write_waits_for_readiness() {
-        let _g = WRITE_READINESS_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        std::env::set_var("IRONMEM_WRITE_READINESS_TIMEOUT_SECS", "5");
+        let _g = EnvGuard::set(WRITE_READINESS_TIMEOUT_ENV, "5");
 
         for mode in [TransportMode::Stdio, TransportMode::DaemonConnection] {
             #[allow(clippy::arc_with_non_send_sync)]
@@ -795,8 +909,145 @@ mod tests {
                  waiting on an unresolved gate"
             );
         }
+    }
 
-        std::env::remove_var("IRONMEM_WRITE_READINESS_TIMEOUT_SECS");
+    /// Ordering companion to the test above. Pipelining must let READS overtake
+    /// a parked write — it must NOT let one mutation overtake another.
+    ///
+    /// `WRITE_SHAPED_TOOLS` is only the three embedder-dependent tools, so
+    /// every other mutating tool (`delete_drawer`, `kg_add`, `collab_send`, …)
+    /// skips the readiness wait entirely. Without an ordering barrier a client
+    /// that sends `add_drawer` then `delete_drawer` on one connection during
+    /// warm-up gets the delete executed and committed first, and the parked add
+    /// then re-creates the row the client asked to remove — a silent
+    /// data-integrity inversion the pre-pipelining serial loop made impossible.
+    ///
+    /// Asserted as: while a write is parked on an unresolved gate, a following
+    /// mutation produces NO response at all.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn framing_loop_does_not_let_a_mutation_overtake_a_parked_write() {
+        let _g = EnvGuard::set(WRITE_READINESS_TIMEOUT_ENV, "30");
+
+        #[allow(clippy::arc_with_non_send_sync)]
+        let mut app = Arc::new(App::open_for_test().unwrap());
+        let readiness = force_warming_up(&mut app);
+
+        let (mut client_in, server_in) = tokio::io::duplex(8192);
+        let (server_out, client_out) = tokio::io::duplex(8192);
+        for request in [
+            json!({
+                "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                "params": {
+                    "name": "add_drawer",
+                    "arguments": {
+                        "content": "v1", "wing": "race", "logical_key": "ordering-key"
+                    }
+                }
+            }),
+            // Mutating but NOT write-shaped: it never touches the gate, so
+            // nothing but an explicit ordering barrier holds it back.
+            json!({
+                "jsonrpc": "2.0", "id": 2, "method": "tools/call",
+                "params": {"name": "delete_drawer", "arguments": {"id": "a".repeat(64)}}
+            }),
+        ] {
+            client_in
+                .write_all(format!("{request}\n").as_bytes())
+                .await
+                .unwrap();
+        }
+
+        let mut loop_fut = Box::pin(run_framing_loop(
+            &app,
+            BufReader::new(server_in),
+            server_out,
+            TransportMode::DaemonConnection,
+        ));
+        let mut responses = BufReader::new(client_out).lines();
+
+        let early = tokio::select! {
+            result = &mut loop_fut => panic!("framing loop exited early: {result:?}"),
+            line = responses.next_line() => Some(line.unwrap().unwrap_or_default()),
+            _ = tokio::time::sleep(Duration::from_millis(400)) => None,
+        };
+        assert!(
+            early.is_none(),
+            "a mutation was executed while an earlier write was still parked on \
+             the readiness gate — per-connection mutation order is not preserved. \
+             Got: {early:?}"
+        );
+
+        // Once the gate resolves both run, and the earlier write goes first.
+        readiness.resolve_ready();
+        let mut ids = Vec::new();
+        for _ in 0..2 {
+            let line = tokio::select! {
+                result = &mut loop_fut => panic!("framing loop exited early: {result:?}"),
+                line = responses.next_line() => line.unwrap().expect("a response"),
+            };
+            let value: serde_json::Value = serde_json::from_str(&line).unwrap();
+            ids.push(value["id"].clone());
+        }
+        assert_eq!(
+            ids,
+            vec![json!(1), json!(2)],
+            "mutations must be answered in the order they were received"
+        );
+    }
+
+    /// A backpressure cap that counted every accepted request would re-create
+    /// the very stall this loop exists to remove: an agent restoring state at
+    /// session start fires a burst of writes and then a `search`, and once the
+    /// cap is reached the loop stops READING, so the search is not even parsed
+    /// until a write drains — up to the full readiness timeout.
+    ///
+    /// The fix is structural rather than a bigger number: mutations are
+    /// serialized, so they occupy exactly ONE in-flight slot no matter how many
+    /// are outstanding, and the backlog is bounded separately. This drives more
+    /// writes than either cap and still demands the read come back.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn framing_loop_answers_a_read_behind_a_full_pipeline_of_writes() {
+        let _g = EnvGuard::set(WRITE_READINESS_TIMEOUT_ENV, "30");
+
+        #[allow(clippy::arc_with_non_send_sync)]
+        let mut app = Arc::new(App::open_for_test().unwrap());
+        let _readiness = force_warming_up(&mut app);
+
+        let write_count = MAX_IN_FLIGHT_REQUESTS + 1;
+        let mut requests: Vec<serde_json::Value> = (0..write_count)
+            .map(|i| {
+                json!({
+                    "jsonrpc": "2.0", "id": i, "method": "tools/call",
+                    "params": {
+                        "name": "add_drawer",
+                        "arguments": {"content": format!("burst {i}"), "wing": "race"}
+                    }
+                })
+            })
+            .collect();
+        // The read is last, behind every one of those writes.
+        requests.push(json!({
+            "jsonrpc": "2.0", "id": 9999, "method": "tools/call",
+            "params": {"name": "search", "arguments": {"query": "burst"}}
+        }));
+
+        let first = tokio::time::timeout(
+            Duration::from_secs(5),
+            first_response_from_connection(&app, TransportMode::DaemonConnection, &requests),
+        )
+        .await
+        .expect(
+            "the read behind a full write pipeline got no response — the \
+             backpressure cap has re-created head-of-line blocking",
+        );
+
+        assert_eq!(
+            first["id"],
+            json!(9999),
+            "the read must be answered while every write is still parked"
+        );
     }
 
     /// Installs a fresh, never-resolved `Pending` readiness gate so every
@@ -847,6 +1098,9 @@ mod tests {
     /// still runs first, this times out instead of returning.
     #[tokio::test(flavor = "multi_thread")]
     async fn daemon_invalid_write_is_rejected_without_waiting_for_readiness() {
+        // Reads the env-controlled readiness timeout; pin it so a test that
+        // WRITES that var cannot change this test's bound mid-run.
+        let _env = EnvGuard::pin(WRITE_READINESS_TIMEOUT_ENV);
         #[allow(clippy::arc_with_non_send_sync)]
         let mut app = Arc::new(App::open_for_test().unwrap());
         let _readiness = force_warming_up(&mut app);
@@ -875,6 +1129,9 @@ mod tests {
     /// authorization does not depend on readiness either.
     #[tokio::test(flavor = "multi_thread")]
     async fn daemon_forbidden_write_is_rejected_without_waiting_for_readiness() {
+        // Reads the env-controlled readiness timeout; pin it so a test that
+        // WRITES that var cannot change this test's bound mid-run.
+        let _env = EnvGuard::pin(WRITE_READINESS_TIMEOUT_ENV);
         #[allow(clippy::arc_with_non_send_sync)]
         let mut app =
             Arc::new(App::open_for_test_with_mode(crate::config::McpAccessMode::ReadOnly).unwrap());
@@ -906,6 +1163,10 @@ mod tests {
     #[test]
     fn many_readiness_waiters_do_not_starve_the_blocking_pool() {
         use futures_util::stream::{FuturesUnordered, StreamExt};
+
+        // Reads the env-controlled readiness timeout; pin it so a test that
+        // WRITES that var cannot change this test's bound mid-run.
+        let _env = EnvGuard::pin(WRITE_READINESS_TIMEOUT_ENV);
 
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
