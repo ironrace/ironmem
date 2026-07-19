@@ -354,9 +354,12 @@ async fn write_response(
 /// Write-shaped tools must wait for readiness, but the daemon's `App` is
 /// intentionally confined to one synchronous dispatcher thread. Waiting in a
 /// handler would park that dispatcher and prevent unrelated connections from
-/// receiving even their read-only warm-up responses. The gate itself is
-/// thread-safe, so wait on Tokio's blocking pool before entering `dispatch`;
-/// once ready, the normal synchronous handler remains serialized as before.
+/// receiving even their read-only warm-up responses. So the wait happens
+/// here, asynchronously, before entering `dispatch`; once ready, the normal
+/// synchronous handler remains serialized as before. Anything that can be
+/// rejected without readiness is rejected before the wait, and the wait
+/// itself consumes no thread — see `tools::precheck_write_request` and
+/// `ReadinessGate::wait_for_write_async`.
 async fn dispatch_daemon_request(
     app: &Arc<App>,
     request: &JsonRpcRequest,
@@ -386,20 +389,14 @@ async fn dispatch_daemon_request(
             }
         }
 
-        let readiness = Arc::clone(&app.memory_ready);
+        // `wait_for_write_async`, not `spawn_blocking(wait_for_write)`: the
+        // number of concurrently warming-up writes is bounded only by the
+        // number of connected clients, and one blocking-pool thread per
+        // waiter would starve every other `spawn_blocking` user in the
+        // process for the length of the readiness timeout.
         let timeout = app.config.write_readiness_timeout();
-        match tokio::task::spawn_blocking(move || readiness.wait_for_write(timeout)).await {
-            Ok(Ok(())) => {}
-            Ok(Err(error)) => {
-                return Some(tool_error_response(request.id.clone(), tool_name, error))
-            }
-            Err(error) => {
-                return Some(tool_error_response(
-                    request.id.clone(),
-                    tool_name,
-                    MemoryError::NotReady(format!("readiness wait task failed: {error}")),
-                ));
-            }
+        if let Err(error) = app.memory_ready.wait_for_write_async(timeout).await {
+            return Some(tool_error_response(request.id.clone(), tool_name, error));
         }
     }
 
@@ -728,6 +725,66 @@ mod tests {
             !message.contains("readiness") && !message.contains("timed out"),
             "a forbidden write must not be reported as a readiness failure: {message}"
         );
+    }
+
+    /// Readiness waiters must not each consume a Tokio blocking-pool thread.
+    /// The pool is a shared, bounded resource — every other `spawn_blocking`
+    /// user in the process (and `tokio::fs`) queues behind it — so a warm-up
+    /// window with many concurrent writes must not be able to occupy it.
+    ///
+    /// `max_blocking_threads(1)` makes that exposure observable at small
+    /// scale: with one waiter per blocking thread, a single parked waiter is
+    /// enough to starve everything else for the full readiness timeout.
+    #[test]
+    fn many_readiness_waiters_do_not_starve_the_blocking_pool() {
+        use futures_util::stream::{FuturesUnordered, StreamExt};
+
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .max_blocking_threads(1)
+            .enable_all()
+            .build()
+            .expect("build runtime");
+
+        runtime.block_on(async {
+            #[allow(clippy::arc_with_non_send_sync)]
+            let mut app = Arc::new(App::open_for_test().unwrap());
+            let _readiness = force_warming_up(&mut app);
+
+            let requests: Vec<JsonRpcRequest> = (0..32)
+                .map(|i| {
+                    tool_call(
+                        i,
+                        "add_drawer",
+                        json!({ "content": format!("queued write {i}"), "wing": "race" }),
+                    )
+                })
+                .collect();
+            let mut waiters: FuturesUnordered<_> = requests
+                .iter()
+                .map(|request| dispatch_daemon_request(&app, request))
+                .collect();
+
+            // Drive every write to its readiness await point. None can
+            // complete: the gate is never resolved.
+            assert!(
+                tokio::time::timeout(Duration::from_millis(500), waiters.next())
+                    .await
+                    .is_err(),
+                "no write can complete while the readiness gate is unresolved"
+            );
+
+            // With 32 writes parked on readiness, the blocking pool must still
+            // be usable by anything else in the process.
+            let probe = tokio::time::timeout(
+                Duration::from_secs(2),
+                tokio::task::spawn_blocking(|| 42_u8),
+            )
+            .await
+            .expect("readiness waiters starved the Tokio blocking pool")
+            .expect("probe task panicked");
+            assert_eq!(probe, 42);
+        });
     }
 
     #[tokio::test(flavor = "multi_thread")]

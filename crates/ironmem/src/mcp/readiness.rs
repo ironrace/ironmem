@@ -13,13 +13,17 @@
 //! Write-shaped tools (wired up in a later task) will instead call
 //! [`ReadinessGate::wait_for_write`].
 //!
-//! This module is intentionally `std`-only (no `tokio`/async): call sites
-//! are synchronous tool handlers invoked from inside `block_in_place`, per
-//! this crate's existing daemon architecture.
+//! The gate exposes both a blocking wait ([`ReadinessGate::wait_for_write`],
+//! for the synchronous tool handlers invoked from inside `block_in_place`)
+//! and an async one ([`ReadinessGate::wait_for_write_async`], for the daemon
+//! dispatch path). Both observe the same terminal state; the async variant
+//! exists so a waiter costs a task registration rather than an OS thread.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Condvar, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
+
+use tokio::sync::Notify;
 
 use crate::error::MemoryError;
 
@@ -73,7 +77,12 @@ pub struct ReadinessGate {
     /// resolves to `Ready` (never set on `Failed`).
     ready_flag: AtomicBool,
     state: Mutex<ReadinessState>,
+    /// Wakes blocking waiters (`wait_for_write`).
     condvar: Condvar,
+    /// Wakes async waiters (`wait_for_write_async`). Kept alongside the
+    /// condvar rather than replacing it: both waiter kinds read the same
+    /// `state`, and every resolution signals both.
+    notify: Notify,
 }
 
 impl ReadinessGate {
@@ -86,6 +95,7 @@ impl ReadinessGate {
             ready_flag: AtomicBool::new(false),
             state: Mutex::new(ReadinessState::Pending),
             condvar: Condvar::new(),
+            notify: Notify::new(),
         }
     }
 
@@ -97,6 +107,7 @@ impl ReadinessGate {
             ready_flag: AtomicBool::new(true),
             state: Mutex::new(ReadinessState::Ready),
             condvar: Condvar::new(),
+            notify: Notify::new(),
         }
     }
 
@@ -123,6 +134,7 @@ impl ReadinessGate {
         self.ready_flag.store(true, Ordering::Relaxed);
         drop(state);
         self.condvar.notify_all();
+        self.notify.notify_waiters();
     }
 
     /// Resolves the gate to `Failed(reason)`, waking all current/future
@@ -141,6 +153,7 @@ impl ReadinessGate {
         *state = ReadinessState::Failed(reason);
         drop(state);
         self.condvar.notify_all();
+        self.notify.notify_waiters();
     }
 
     /// Blocks the calling thread until the gate resolves, or `timeout`
@@ -198,6 +211,45 @@ impl ReadinessGate {
                     "timed out after {timeout:?} waiting for server readiness"
                 )))
             }
+        }
+    }
+
+    /// Async counterpart to [`ReadinessGate::wait_for_write`], with identical
+    /// return semantics: `Ok(())` on `Ready`, `Err(NotReady)` on `Failed` or
+    /// on `timeout` expiry.
+    ///
+    /// Callers that are already inside an async context must use this rather
+    /// than wrapping `wait_for_write` in `spawn_blocking`. The blocking pool
+    /// is bounded (512 threads by default) and shared with every other
+    /// `spawn_blocking` user in the process, so one thread per parked waiter
+    /// lets a warm-up window with many concurrent writes starve unrelated
+    /// work for the entire readiness timeout. Here a waiter costs a `Notify`
+    /// registration instead.
+    pub async fn wait_for_write_async(&self, timeout: Duration) -> Result<(), MemoryError> {
+        let deadline = Instant::now() + timeout;
+        loop {
+            // Register with `Notify` BEFORE reading the state. `notify_waiters`
+            // only wakes already-registered waiters, and resolution publishes
+            // the terminal state before notifying — so registering first is
+            // what closes the window where a resolution lands between the
+            // state read and the wait, which would otherwise park this waiter
+            // until its timeout despite the gate being resolved.
+            let notified = self.notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+
+            if let Some(result) = self.peek_terminal() {
+                return result;
+            }
+
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() || tokio::time::timeout(remaining, notified).await.is_err() {
+                return Err(MemoryError::NotReady(format!(
+                    "timed out after {timeout:?} waiting for server readiness"
+                )));
+            }
+            // Woken: loop back to re-read the state. `notify_waiters` carries
+            // no payload, so the state — not the wakeup — is the authority.
         }
     }
 
@@ -369,6 +421,106 @@ mod tests {
 
         assert!(gate.is_ready(), "is_ready() must not flip after Ready won");
         assert!(gate.wait_for_write(Duration::from_secs(1)).is_ok());
+    }
+
+    #[tokio::test]
+    async fn async_waiter_returns_immediately_when_already_terminal() {
+        let ready = ReadinessGate::new_ready();
+        assert!(ready
+            .wait_for_write_async(Duration::from_secs(5))
+            .await
+            .is_ok());
+
+        let failed = ReadinessGate::new_pending();
+        failed.resolve_failed("model load exploded".to_string());
+        let err = failed
+            .wait_for_write_async(Duration::from_secs(5))
+            .await
+            .expect_err("expected Err after resolve_failed");
+        assert!(err.to_string().contains("model load exploded"));
+    }
+
+    #[tokio::test]
+    async fn async_waiter_stays_parked_until_resolution() {
+        let gate = Arc::new(ReadinessGate::new_pending());
+
+        let waiter_gate = Arc::clone(&gate);
+        let mut waiter = Box::pin(async move {
+            waiter_gate
+                .wait_for_write_async(Duration::from_secs(30))
+                .await
+        });
+
+        // Drive the waiter to its registration point; it must not resolve.
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), &mut waiter)
+                .await
+                .is_err(),
+            "waiter must stay parked while the gate is Pending"
+        );
+
+        gate.resolve_ready();
+        let result = tokio::time::timeout(Duration::from_secs(5), waiter)
+            .await
+            .expect("waiter must wake once the gate resolves");
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn async_waiter_times_out_while_pending() {
+        let gate = ReadinessGate::new_pending();
+        let timeout = Duration::from_millis(50);
+
+        let start = Instant::now();
+        let result = gate.wait_for_write_async(timeout).await;
+        let elapsed = start.elapsed();
+
+        assert!(result.is_err(), "expected Err on timeout expiry");
+        assert!(
+            elapsed >= timeout,
+            "wait returned before the timeout elapsed: {elapsed:?} < {timeout:?}"
+        );
+    }
+
+    /// Many concurrent async waiters must all wake from a single resolution,
+    /// with no per-waiter thread involved: this runs on a `current_thread`
+    /// runtime, which has no worker threads to spare and would deadlock if
+    /// waiting were implemented by blocking.
+    #[test]
+    fn many_async_waiters_all_wake_on_a_single_resolution() {
+        use futures_util::stream::{FuturesUnordered, StreamExt};
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("build runtime");
+
+        runtime.block_on(async {
+            let gate = Arc::new(ReadinessGate::new_pending());
+            let mut waiters: FuturesUnordered<_> = (0..256)
+                .map(|_| gate.wait_for_write_async(Duration::from_secs(30)))
+                .collect();
+
+            // Drive every waiter to its registration point.
+            assert!(
+                tokio::time::timeout(Duration::from_millis(100), waiters.next())
+                    .await
+                    .is_err(),
+                "no waiter may resolve while the gate is Pending"
+            );
+
+            gate.resolve_ready();
+
+            let mut woken = 0;
+            while let Some(result) = tokio::time::timeout(Duration::from_secs(5), waiters.next())
+                .await
+                .expect("all waiters must wake from the single resolution")
+            {
+                assert!(result.is_ok(), "resolution was Ready: {result:?}");
+                woken += 1;
+            }
+            assert_eq!(woken, 256);
+        });
     }
 
     #[test]
