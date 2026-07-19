@@ -198,8 +198,11 @@ impl Drop for BootstrapLock {
 }
 
 /// Spawn a background thread that runs the full memory init (model load + bootstrap).
-/// Signals `memory_ready` when done — even on failure — so the serve loop is never
-/// permanently blocked in warming-up mode.
+/// Always resolves `memory_ready` to a terminal state when done, so the serve loop
+/// is never left waiting forever: `App::new` failing resolves the gate `Failed`
+/// (write-shaped tools stay blocked/rejected — see `ReadinessGate` — until the process
+/// restarts, since the embedder/index never came up); otherwise it resolves `Ready`,
+/// regardless of whether the best-effort `ensure_bootstrapped` step below succeeded.
 ///
 /// The thread opens its own `App` (its own DB connection). SQLite WAL handles
 /// concurrent access from the serve loop's connection and this background connection.
@@ -211,12 +214,22 @@ pub fn run_background_memory_init(config: Config, memory_ready: Arc<ReadinessGat
         let app = match App::new(config) {
             Ok(a) => a,
             Err(e) => {
-                tracing::error!("Background memory init failed (App::new): {e}");
+                // Fail-closed: the embedder/index never came up, so write-shaped
+                // tools must keep blocking/rejecting (via `wait_for_write`) rather
+                // than silently unblocking against a half-initialized `App`.
+                tracing::error!(
+                    "Background memory init failed (App::new): {e}; write-shaped tools will \
+                     stay blocked until the process restarts"
+                );
                 memory_ready
                     .resolve_failed(format!("Background memory init failed (App::new): {e}"));
                 return;
             }
         };
+        // Deliberately asymmetric with the `App::new` failure above: `app` itself came
+        // up fine here, so the embedder/index are usable even if this best-effort
+        // migration/mining step fails — resolve `Ready` either way rather than
+        // permanently blocking writes over a non-fatal bootstrap error.
         if writes_allowed {
             match ensure_bootstrapped(&app, workspace.as_deref()) {
                 Ok(r) => tracing::info!(

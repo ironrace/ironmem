@@ -43,7 +43,7 @@ pub struct App {
     /// (or fails). Pending during warmup; tools that need the embedder return
     /// a warming_up response while `is_warming_up()` is true.
     pub memory_ready: Arc<ReadinessGate>,
-    /// Guards the one-time HNSW rebuild triggered when memory_ready transitions to true.
+    /// Guards the one-time HNSW rebuild triggered when `memory_ready` resolves `Ready`.
     memory_ready_rebuilt: AtomicBool,
     /// Active collab session this server process is participating in. Set by
     /// `collab_start`/`collab_start_code_review` and refreshed by
