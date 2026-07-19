@@ -346,6 +346,37 @@ fn code_map_write_errors_when_readiness_resolves_failed() {
     assert_write_errored("code_map_write", is_error, &payload);
 }
 
+/// Argument validation does not depend on readiness, so it must run BEFORE
+/// the readiness wait: a malformed write has to be rejected immediately
+/// rather than serving out the whole `IRONMEM_WRITE_READINESS_TIMEOUT_SECS`
+/// window first. The override here is 1s (see
+/// `with_short_write_readiness_timeout`); the assertion allows generously
+/// less than that, so it fails if the handler waits at all.
+#[test]
+fn invalid_write_is_rejected_without_waiting_for_readiness() {
+    with_short_write_readiness_timeout(|| {
+        let mut app = App::open_for_test().unwrap();
+        force_warming_up(&mut app);
+
+        let start = std::time::Instant::now();
+        // `content` is required by `add_drawer` and is absent here.
+        let (is_error, payload) = call_tool_raw(&app, "add_drawer", json!({ "wing": "race" }));
+        let elapsed = start.elapsed();
+
+        assert!(is_error, "an invalid write must be rejected: {payload}");
+        let message = payload["error"].as_str().unwrap_or_default();
+        assert!(
+            message.contains("content is required"),
+            "expected the validation error, got: {payload}"
+        );
+        assert!(
+            elapsed < std::time::Duration::from_millis(500),
+            "invalid input must fail fast, but the call took {elapsed:?} — it waited on \
+             the readiness gate before validating"
+        );
+    });
+}
+
 /// Companion assertion: `search` is READ-shaped, and its soft
 /// `{"warming_up": true, "results": []}` body during warm-up is CORRECT
 /// existing behavior — it must keep passing, unlike the three write tools

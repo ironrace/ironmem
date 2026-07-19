@@ -369,6 +369,23 @@ async fn dispatch_daemon_request(
         );
 
     if is_write && app.is_warming_up() {
+        // Reject what does not depend on readiness — unknown tool, mode
+        // gating, malformed arguments — before parking this request on the
+        // gate. Otherwise a single malformed call blocks for the full
+        // readiness timeout and is then rejected anyway.
+        let arguments = request
+            .params
+            .get("arguments")
+            .cloned()
+            .unwrap_or(serde_json::json!({}));
+        if let Some(name) = tool_name {
+            if let Err(error) =
+                tokio::task::block_in_place(|| tools::precheck_write_request(app, name, &arguments))
+            {
+                return Some(tool_error_response(request.id.clone(), tool_name, error));
+            }
+        }
+
         let readiness = Arc::clone(&app.memory_ready);
         let timeout = app.config.write_readiness_timeout();
         match tokio::task::spawn_blocking(move || readiness.wait_for_write(timeout)).await {
@@ -610,6 +627,106 @@ mod tests {
             write_response.result.unwrap()["isError"].as_bool(),
             Some(true),
             "resolved write must not become an error"
+        );
+    }
+
+    /// Installs a fresh, never-resolved `Pending` readiness gate so every
+    /// write-shaped request has to contend with an open warm-up window.
+    fn force_warming_up(app: &mut Arc<App>) -> Arc<ReadinessGate> {
+        let readiness = Arc::new(ReadinessGate::new_pending());
+        Arc::get_mut(app)
+            .expect("test has the only App reference")
+            .memory_ready = Arc::clone(&readiness);
+        readiness
+    }
+
+    fn tool_call(id: i64, name: &str, arguments: serde_json::Value) -> JsonRpcRequest {
+        serde_json::from_value(json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": "tools/call",
+            "params": { "name": name, "arguments": arguments },
+        }))
+        .expect("request fixture must deserialize")
+    }
+
+    fn tool_error_text(response: &JsonRpcResponse) -> String {
+        let result = response
+            .result
+            .as_ref()
+            .expect("tool result must be present");
+        assert_eq!(
+            result["isError"].as_bool(),
+            Some(true),
+            "expected an error response, got {result}"
+        );
+        let text = result["content"][0]["text"]
+            .as_str()
+            .expect("content[0].text must be a string");
+        let payload: serde_json::Value =
+            serde_json::from_str(text).expect("tool response text must be valid JSON");
+        payload["error"]
+            .as_str()
+            .expect("error payload must carry a string message")
+            .to_string()
+    }
+
+    /// A write whose arguments are malformed does not depend on readiness to
+    /// be rejected, so it must not serve out the whole
+    /// `IRONMEM_WRITE_READINESS_TIMEOUT_SECS` window (90s by default) first.
+    /// The outer bound here is far below that default: if the readiness wait
+    /// still runs first, this times out instead of returning.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn daemon_invalid_write_is_rejected_without_waiting_for_readiness() {
+        #[allow(clippy::arc_with_non_send_sync)]
+        let mut app = Arc::new(App::open_for_test().unwrap());
+        let _readiness = force_warming_up(&mut app);
+
+        // `content` is required by `add_drawer` and is absent here.
+        let invalid = tool_call(1, "add_drawer", json!({ "wing": "race" }));
+
+        let response = tokio::time::timeout(
+            Duration::from_secs(2),
+            dispatch_daemon_request(&app, &invalid),
+        )
+        .await
+        .expect("an invalid write must fail fast, not wait out the readiness timeout")
+        .expect("tools/call produces a response");
+
+        let message = tool_error_text(&response);
+        assert!(
+            message.contains("content is required"),
+            "expected the validation error, got: {message}"
+        );
+        assert!(
+            !message.contains("readiness") && !message.contains("timed out"),
+            "invalid input must not be reported as a readiness failure: {message}"
+        );
+    }
+
+    /// Same fast-fail requirement for a request rejected by mode gating:
+    /// authorization does not depend on readiness either.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn daemon_forbidden_write_is_rejected_without_waiting_for_readiness() {
+        #[allow(clippy::arc_with_non_send_sync)]
+        let mut app =
+            Arc::new(App::open_for_test_with_mode(crate::config::McpAccessMode::ReadOnly).unwrap());
+        let _readiness = force_warming_up(&mut app);
+
+        let forbidden = tool_call(1, "add_drawer", json!({ "content": "x", "wing": "race" }));
+
+        let response = tokio::time::timeout(
+            Duration::from_secs(2),
+            dispatch_daemon_request(&app, &forbidden),
+        )
+        .await
+        .expect("a forbidden write must fail fast, not wait out the readiness timeout")
+        .expect("tools/call produces a response");
+
+        let message = tool_error_text(&response);
+        assert!(
+            !message.contains("readiness") && !message.contains("timed out"),
+            "a forbidden write must not be reported as a readiness failure: {message}"
         );
     }
 

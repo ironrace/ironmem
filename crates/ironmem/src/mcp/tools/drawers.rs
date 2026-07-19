@@ -14,8 +14,22 @@ use crate::mcp::app::App;
 const LOGICAL_KEY_SOURCE_PREFIX: &str = "logical:";
 const LOGICAL_KEY_ID_PREFIX: &str = "logical-key:";
 
-pub(super) fn handle_add_drawer(app: &App, args: &Value) -> Result<Value, MemoryError> {
-    app.wait_for_write_ready()?;
+/// `add_drawer`'s arguments after validation. Borrows `content` from the
+/// request (`sanitize_content` returns a borrowed slice).
+pub(super) struct AddDrawerArgs<'a> {
+    content: &'a str,
+    wing: String,
+    room: String,
+    logical_key: Option<String>,
+}
+
+/// Readiness-independent validation for `add_drawer`.
+///
+/// Split out from the handler so the daemon can reject a malformed call
+/// *before* parking it on the readiness gate — none of this depends on the
+/// embedder or index being up. The handler calls it too, so there is exactly
+/// one definition of what a valid `add_drawer` is.
+pub(super) fn validate_add_drawer_args(args: &Value) -> Result<AddDrawerArgs<'_>, MemoryError> {
     let content = args
         .get("content")
         .and_then(|v| v.as_str())
@@ -34,9 +48,25 @@ pub(super) fn handle_add_drawer(app: &App, args: &Value) -> Result<Value, Memory
         .map(|v| sanitize::sanitize_name(v, "logical_key"))
         .transpose()?;
 
-    let content = sanitize::sanitize_content(content, MAX_DRAWER_CONTENT_CHARS)?;
-    let wing = sanitize::sanitize_name(wing, "wing")?;
-    let room = sanitize::sanitize_name(room, "room")?;
+    Ok(AddDrawerArgs {
+        content: sanitize::sanitize_content(content, MAX_DRAWER_CONTENT_CHARS)?,
+        wing: sanitize::sanitize_name(wing, "wing")?,
+        room: sanitize::sanitize_name(room, "room")?,
+        logical_key,
+    })
+}
+
+pub(super) fn handle_add_drawer(app: &App, args: &Value) -> Result<Value, MemoryError> {
+    // Validate first: argument errors do not depend on readiness, so a
+    // malformed call must never serve out the warm-up window before being
+    // rejected.
+    let AddDrawerArgs {
+        content,
+        wing,
+        room,
+        logical_key,
+    } = validate_add_drawer_args(args)?;
+    app.wait_for_write_ready()?;
 
     let id_basis = logical_key
         .as_ref()

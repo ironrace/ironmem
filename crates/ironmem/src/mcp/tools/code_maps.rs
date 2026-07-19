@@ -126,10 +126,26 @@ fn validate_repo(raw: &str) -> Result<String, MemoryError> {
 
 // ── Handlers ─────────────────────────────────────────────────────────────────
 
-pub(super) fn handle_code_map_write(app: &App, args: &Value) -> Result<Value, MemoryError> {
-    app.wait_for_write_ready()?;
+/// `code_map_write`'s arguments after validation. `summary` and `head_sha`
+/// borrow from the request; the rest are owned/canonicalized.
+pub(super) struct CodeMapWriteArgs<'a> {
+    repo: String,
+    area: String,
+    summary: &'a str,
+    head_sha: &'a str,
+    source_files: Vec<String>,
+    built_by: &'a str,
+}
 
-    // --- Validate inputs ---
+/// Readiness-independent validation for `code_map_write` — see
+/// `drawers::validate_add_drawer_args` for why this is split out. This shells
+/// out to `git` (via `validate_repo`), which the daemon precheck therefore
+/// runs once before the readiness wait and the handler runs again after it;
+/// the cost is a couple of milliseconds and buys a single definition of
+/// validity rather than a drifting copy.
+pub(super) fn validate_code_map_write_args(
+    args: &Value,
+) -> Result<CodeMapWriteArgs<'_>, MemoryError> {
     let repo_raw = args
         .get("repo")
         .and_then(|v| v.as_str())
@@ -188,6 +204,28 @@ pub(super) fn handle_code_map_write(app: &App, args: &Value) -> Result<Value, Me
         .and_then(|v| v.as_str())
         .filter(|s| !s.is_empty())
         .ok_or_else(|| MemoryError::Validation("built_by is required".into()))?;
+
+    Ok(CodeMapWriteArgs {
+        repo,
+        area,
+        summary,
+        head_sha,
+        source_files,
+        built_by,
+    })
+}
+
+pub(super) fn handle_code_map_write(app: &App, args: &Value) -> Result<Value, MemoryError> {
+    // Validate before waiting on readiness — see `handle_add_drawer`.
+    let CodeMapWriteArgs {
+        repo,
+        area,
+        summary,
+        head_sha,
+        source_files,
+        built_by,
+    } = validate_code_map_write_args(args)?;
+    app.wait_for_write_ready()?;
 
     // turn_id is optional — just read it for wal/metrics if provided
     let _turn_id = args.get("turn_id").and_then(|v| v.as_str());

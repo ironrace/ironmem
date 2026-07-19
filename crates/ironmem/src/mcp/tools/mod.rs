@@ -606,6 +606,34 @@ pub fn call_tool(app: &App, name: &str, args: &Value) -> Result<Value, MemoryErr
     }
 }
 
+/// Everything about a write-shaped `tools/call` that can be rejected without
+/// the server being ready: the tool existing, mode gating, and argument
+/// validation.
+///
+/// The daemon runs this before parking a write on the readiness gate, so a
+/// malformed or forbidden call fails immediately instead of serving out the
+/// whole `IRONMEM_WRITE_READINESS_TIMEOUT_SECS` window (90s by default) and
+/// only then being rejected. `call_tool` still performs all of these checks
+/// itself — this is a pre-pass, never the sole enforcement point, and it
+/// delegates to the same validators the handlers use so the two cannot drift
+/// apart.
+pub(crate) fn precheck_write_request(
+    app: &App,
+    name: &str,
+    args: &Value,
+) -> Result<(), MemoryError> {
+    if !tool_known(name) {
+        return Err(MemoryError::NotFound(format!("Unknown tool: {name}")));
+    }
+    ensure_tool_allowed(app, name)?;
+    match name {
+        "add_drawer" => drawers::validate_add_drawer_args(args).map(drop),
+        "diary_write" => diary::validate_diary_write_args(args).map(drop),
+        "code_map_write" => code_maps::validate_code_map_write_args(args).map(drop),
+        _ => Ok(()),
+    }
+}
+
 // ── Mode-gating helpers ──────────────────────────────────────────────────────
 
 fn tool_known(name: &str) -> bool {
