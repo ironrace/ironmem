@@ -112,7 +112,244 @@ The hooks are diff-aware:
 
 - collab protocol/template changes run the collab template lint
 - Rust/workspace changes run fmt and clippy on commit, then workspace tests on push
-- docs/config-only changes outside those surfaces skip heavy local gates
+- docs changes (`*.md`, any path under `docs/`) and inert config/data changes
+  (`*.json`/`*.jsonc`/`*.jsonl`/`*.yaml`/`*.yml`/`*.sh`/`*.csv`, any
+  path under `site/`, or any path under `benchmarks/`) skip heavy local
+  gates -- *outside a harness plugin root*, no gate parses, executes, or
+  otherwise inspects those formats. `benchmarks/` is inert as a whole tree,
+  including its Rust source: every crate there is workspace-`exclude`d, so
+  no cargo gate compiles, lints, or formats it
+- `.github/` is inert for the same reason and no other: no gate reads it, so
+  escalating a workflow edit would run cargo gates that cannot parse YAML.
+  CI is its own backstop
+- a path under a harness plugin root (`.claude-plugin/`, `.codex-plugin/`,
+  `.gemini-plugin/`, `.grok-plugin/`, or any future `.<name>-plugin/`) is
+  NOT inert, even though its content is JSON/shell/Markdown: `cargo test
+  --workspace` reads `plugin.json`/`hooks.json`/`.mcp.json` and asserts
+  `plugin.json`'s version matches `Cargo.toml` (`plugin_metadata.rs`),
+  parses `hooks/hooks.json`'s `UserPromptSubmit` command (`hook.rs`),
+  requires the plugin's `bin/ironmem-mcp.sh` and `hooks/ironmem-hook.sh` to
+  exist (`packaging.rs`'s `REQUIRED_ASSETS` is a fixed literal list --
+  `bin/ironmem-mcp.sh`, `hooks/ironmem-hook.sh`, `plugin.json` -- identical
+  for every harness, never `<id>`-templated), and parses review-agent Markdown
+  frontmatter (`plugin_metadata.rs`'s lean-profile guard) -- so these paths
+  escalate to running every gate declared for the phase, the same as any
+  other gate-covered change
+- any other path (including an unrecognized extension, or a
+  `crates/*/migrations/*.sql` change -- `include_str!`'d into the binary and
+  replayed by `cargo test`'s migration tests, so a real gate *does* catch a
+  defect there) escalates to running every gate declared for the phase,
+  fail-closed
+
+### `run_git_hook.py`: collect → resolve → execute
+
+`scripts/run_git_hook.py` is the diff-aware dispatcher both hooks delegate to.
+It is only the wiring: `main(phase)` joins three layers that live in the
+`scripts/git_hook/` package, each with one job and no layer reaching
+backwards — the resolver never shells out, the collector never decides which
+gates run, the executor never re-derives what the resolver already decided:
+
+| Layer | Module | Entry point | Impure? | Job |
+|---|---|---|---|---|
+| Collect | `git_hook.collect` | `collect_pre_commit_changes()` / `collect_pre_push_changes(stdin)` | Yes — the only place the fail-closed `_run_git`/`_git_diff_paths_z` helpers are called | Turn Git's own diff output into a `ChangeSet`. Decides nothing about which gates run. |
+| Resolve | `git_hook.manifest` | `resolve_gates(phase, changes)` | No — pure and total | Turn `(phase, ChangeSet)` into the tuple of `Gate`s to run, in `GATES` declaration order. No I/O, no env, no clock, no subprocess. Also owns `SURFACES`/`classify_path` and the `GATES` manifest itself. |
+| Execute | `git_hook.execute` | `execute_gates(phase, changes)` | Yes — runs subprocesses | Call `resolve_gates` exactly once, then run each selected gate with a hardened `subprocess.run`, printing one line per gate (`run` / `skip (...)` / `fail (...)`) and stopping at the first non-zero exit. |
+
+`git_hook.runtime` holds the two facts both shelling-out layers share: `ROOT`
+and the `GIT_*` env scrub. `_scrub_git_env` lives there rather than with the
+execution layer precisely because the collection layer must pass it too —
+scrubbing only outbound gate invocations would leave the Git calls that
+*decide* which gates run redirectable, which fails open.
+
+Two constraints on this package are load-bearing and easy to undo by accident:
+
+- **`git_hook.execute` reads `manifest.GATES` / `manifest.resolve_gates`
+  through the module, never via `from ... import`.** Binding them directly
+  would make `monkeypatch.setattr(manifest, "GATES", ...)` patch a name the
+  executor never reads, and those tests would silently exercise the real
+  manifest instead of their fixture.
+- **Every module here is listed in `HOOK_EXACT_PATHS`.** A new module without
+  an entry would not select the hook self-test gate, so a change to the gate
+  resolver would skip the gate that validates the gate resolver.
+  `test_hook_exact_paths_covers_every_git_hook_module` walks the directory
+  rather than trusting the list.
+
+One more Git call site exists outside the hardened path above: `main()`
+falls back to `_pre_push_manual_upstream_changes()` when the raw pre-push
+stdin text itself is empty or whitespace-only — nothing piped at all. A real
+`git push`-invoked hook always pipes at least one ref-update line per the
+pre-push hook contract, so this fallback is genuinely unreachable from a
+real push; it exists solely for a developer running
+`python3 scripts/run_git_hook.py pre-push` directly with no input.
+
+The gate is on the raw stdin text, not on the resulting `ChangeSet.paths`
+being empty — that distinction is load-bearing. `git push --delete branch`
+pipes real, non-empty stdin whose lines all carry an all-zero local sha;
+`collect_pre_push_changes` skips every one of them (nothing to diff for a
+pure ref deletion) and returns a genuinely empty, non-`unknown` `ChangeSet`
+from that real piped input. Gating on `not changes.paths` instead (as an
+earlier version of this dispatcher did) would have mistaken that for the
+no-stdin-at-all manual-invocation case and fired the `@{u}` fallback —
+diffing `@{u}..HEAD` of the *currently checked-out* branch, a range
+unrelated to the ref actually being deleted. Gating on the stdin text keeps
+the fallback reachable only from genuine manual invocation.
+
+That fallback resolves `@{u}` and diffs it through the separate, unhardened
+`git()` helper, not `_run_git`/`_git_diff_paths_z`. That's deliberate, not
+an oversight: it's a best-effort convenience for invocation outside Git's
+stdin contract, kept unchanged from the pre-refactor fallback, and is not
+part of the fail-closed contract this section otherwise describes.
+
+#### The `ChangeSet` fail-closed interface
+
+```python
+@dataclasses.dataclass(frozen=True)
+class ChangeSet:
+    paths: tuple[str, ...]
+    unknown: bool
+    reason: str | None
+```
+
+- `paths=()` with `unknown=False` means **genuinely no changes** — nothing
+  staged (pre-commit) or nothing in the pushed range (pre-push). It never
+  means "collection broke."
+- `unknown=True` means the collector could not determine the real change set
+  — a Git subprocess call failed, pre-push stdin was malformed, a sha field
+  wasn't hex, etc. `resolve_gates` treats `unknown=True` as an automatic
+  escalation: **every gate declared for the phase runs**, regardless of
+  `paths`. `reason` is always non-empty in this case, and `execute_gates`
+  prints it first (`[git-hook] escalating: <reason>`) so a surprisingly full
+  run explains itself instead of looking arbitrary.
+- The subprocess boundary itself is fail-closed: `_run_git`'s success flag is
+  False only when the `git` call could not be made at all (missing binary,
+  undecodable output) — never based on git's own exit code, which callers
+  interpret themselves — and any such failure always becomes
+  `ChangeSet(unknown=True, ...)`, never a raised exception out of collection.
+
+#### Classification table
+
+`classify_path(path)` is pure and total (never raises, regardless of input
+shape) and returns one of:
+
+| Surface id | Predicate | Matches |
+|---|---|---|
+| `rust_workspace` | `is_rust_path` | `.rs` files, `Cargo.toml`/`Cargo.lock`/`build.rs`, anything under `.cargo/` — **except** anything whose leading `/`-split segment is `benchmarks`, whose crates are all workspace-`exclude`d and therefore untouched by `cargo fmt --all`/`clippy --workspace`/`test --workspace` |
+| `collab_protocol` | `is_collab_protocol_path` | collab command/prompt/template files (`COLLAB_EXACT_PATHS`, `.claude-plugin/prompts/collab-turn-*`, `tests/collab_turn_templates/`) |
+| `hook_self_test` | `is_hook_path` | the tracked hook scripts themselves — an exact-set membership check (`HOOK_EXACT_PATHS`), not a prefix: `.githooks/pre-commit`, `.githooks/pre-push`, `scripts/install-git-hooks.sh`, `scripts/run_git_hook.py`, `scripts/test_run_git_hook.py`, and every module in `scripts/git_hook/`. Contrast `collab_protocol` below, whose `collab-turn-*` genuinely is a prefix match. |
+| `docs` | `is_docs_path` | any `.md` file, or any path whose leading `/`-split segment is `docs` — **unless** the leading segment is a harness plugin root (see below), in which case it does not match |
+| `inert_config` | `is_inert_config_path` | a `.json`/`.jsonc`/`.jsonl`/`.yaml`/`.yml`/`.sh`/`.csv` file, any path whose leading `/`-split segment is `site`, or any path whose leading `/`-split segment is `benchmarks` (the whole tree: those Cargo crates are workspace-`exclude`d, so no cargo gate compiles, lints, or formats them) — **unless** the leading segment is a harness plugin root, in which case it does not match. HTML is not globally inert: the dashboard's `index.html` is compiled into the Rust binary. |
+| `UNKNOWN` | *(fallback — not in `SURFACES`)* | an unsafe-shaped path, or a path that matches no declared surface |
+
+`is_gate_covered_plugin_path` (checked first inside both `is_docs_path` and
+`is_inert_config_path`) matches any path whose leading `/`-split segment has
+the shape `.<name>-plugin` — `.claude-plugin`, `.codex-plugin`,
+`.gemini-plugin`, `.grok-plugin`, and any future one. Every one of those
+directories' JSON, shell assets, and agent Markdown is read by `cargo test
+--workspace` (`plugin_metadata.rs`'s `read_json`/
+`plugin_versions_match_cargo_toml`/`claude_review_agents_advertise_lean_
+profile`, `hook.rs`'s `hooks.json` parse, `packaging.rs`'s `REQUIRED_ASSETS`
+existence check for the literal `bin/ironmem-mcp.sh`,
+`hooks/ironmem-hook.sh`, and `plugin.json`), so a path inside one is
+gate-covered, not inert, and must classify
+`UNKNOWN` (escalate) instead. A look-alike segment like
+`.claude-plugin-backup` does not match — the check is a whole-segment
+`endswith("-plugin")`, not a substring test, so it stays classified by the
+ordinary docs/inert-config rules.
+
+`docs` and `inert_config` are declared, first-class entries in `SURFACES` —
+**not a fallback** — and that distinction is the point of the feature: an
+all-docs/all-inert-config, all-safe-shape change classifies cleanly and
+selects only `always` gates (none exist in today's manifest), which is
+cheaper and more precise than the `UNKNOWN` path. Both are declared after
+every specific surface (`rust_workspace`, `collab_protocol`,
+`hook_self_test`), so a path that would otherwise match one of their
+generic patterns — `scripts/install-git-hooks.sh` is a `.sh` file, exactly
+the kind `inert_config` matches — still classifies to the specific surface
+it belongs to, because `SURFACES` is checked in declaration order and the
+first match wins. `UNKNOWN` is the true fallback, returned only when a path
+is unsafe-shaped (absolute, contains a `..` segment, a control byte other
+than `\n`, empty, starts with `-`, or isn't even a `str`) or matches no
+entry in `SURFACES` at all — and, like `changes.unknown`, it escalates
+`resolve_gates` to running every gate for the phase. `crates/*/migrations/
+*.sql` is a deliberate example of a path that stays `UNKNOWN`: it is
+`include_str!`'d into the Rust binary and replayed by `cargo test`'s
+migration tests, so a real gate does catch a defect there.
+
+#### Byte-exact paths — why stripping is forbidden
+
+Every Git invocation in the collection layer that returns paths uses `-z`
+(NUL-delimited) output (`_default_base`'s `symbolic-ref`/`merge-base` calls
+are the exceptions — they return a ref name and a sha, never a path list,
+so byte-exactness doesn't apply and they don't pass `-z`). That removes
+`core.quotepath` escaping at the source, and —
+critically — **a newline is a legal byte inside a Git filename**: with NUL as
+the only delimiter, there is no delimiter newline to strip, so one is never
+stripped. `_split_nul` drops exactly one trailing empty field (`-z`'s own
+output framing, not path content) and touches nothing else.
+
+`classify_path` and every surface predicate never call `.strip()`, unquote,
+or case-fold a path. Rewriting an attacker-influenced path before classifying
+it would let classification disagree with what Git actually staged — matching
+byte-exact means what gets classified is what Git reported, never a
+cleaned-up guess at it. Unsafe shapes are rejected straight to `UNKNOWN`
+(which escalates to running every gate) — **never sanitized and
+reclassified**.
+
+#### How to add a gate
+
+Two steps, nothing else:
+
+1. Append a `Gate(...)` entry to the `GATES` tuple in
+   `scripts/git_hook/manifest.py`.
+2. If the gate declares a surface that has no existing example, add one to
+   `_SURFACE_EXAMPLE_PATH_FOR_TEST` in `scripts/test_run_git_hook.py`.
+
+`test_resolve_gates_reaches_every_manifest_gate` derives its parametrized
+cases directly from `GATES` — it is not a hand-maintained list of gate names.
+A gate added without a matching `_SURFACE_EXAMPLE_PATH_FOR_TEST` entry fails
+that test loudly with a `KeyError` naming the missing surface, rather than
+silently going unexercised. `GATES` order is execution order (declaration
+order) and is never sorted at runtime.
+
+#### The argv-literal rule
+
+`Gate.argv` entries are string literals only, e.g.
+`("cargo", "clippy", "--workspace", ...)`. No caller ever interpolates a
+Git- or path-derived value (a changed filename, a sha, a branch name) into a
+gate's `argv`. `execute_gates` runs
+`subprocess.run(list(gate.argv), shell=False, ...)` with the argv taken
+verbatim from the manifest, so the set of commands the hook can ever run is
+fixed at manifest-authoring time — never influenced by what's in the diff.
+
+#### The `GIT_*` environment scrub
+
+`execute_gates` runs every gate with `env=` built by `_scrub_git_env`, which
+drops every `GIT_*`-prefixed variable except an explicit keep-list
+(`GIT_ASKPASS`, `GIT_SSH`, `GIT_SSH_COMMAND`, `GIT_TERMINAL_PROMPT`,
+`GIT_TRACE*`). This exists because a pre-push hook exporting
+`GIT_DIR`/`GIT_INDEX_FILE`/`GIT_WORK_TREE` let a `cargo test` tempdir Git
+fixture inherit them and commit into the real repository (PR #186) — those
+variables redirect a child Git invocation at a *different* repo/worktree/
+index, and are always stripped.
+
+`GIT_CONFIG_*` is deliberately **not** on the keep-list. `GIT_CONFIG_COUNT` +
+`GIT_CONFIG_KEY_n`/`GIT_CONFIG_VALUE_n` are the documented equivalent of
+`git -c <key>=<value>` for arbitrary config — including `core.worktree`, the
+config equivalent of `GIT_WORK_TREE` that this same scrub strips above. A
+caller could otherwise set `GIT_CONFIG_COUNT=1
+GIT_CONFIG_KEY_0=core.worktree GIT_CONFIG_VALUE_0=/real/repo` and reproduce
+exactly the redirection this scrub exists to prevent, through the front
+door. The keep-list is an allowlist, not a denylist: anything `GIT_*`-
+prefixed that isn't explicitly named or prefix-matched is dropped, including
+variables not yet invented.
+
+#### Staged deletions are in scope
+
+`collect_pre_commit_changes` runs `git diff --cached --name-only -z` with no
+`--diff-filter`. `--diff-filter=ACMRTUXB` (which would exclude deletions) is
+deliberately absent — deleting a `.rs` file or `Cargo.toml` is exactly the
+kind of change that should still trigger the Rust gates. This is a ratified
+decision, not a lost flag.
 
 ## Manual Codex MCP Setup
 

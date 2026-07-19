@@ -35,6 +35,12 @@ jobs:
       - name: site/README drift guard self-test
         run: python3 scripts/test_check_site_readme_sync.py
 
+      # The git hook runner self-test is a pytest suite (parametrized cases are
+      # derived from the GATES manifest, so it cannot be plain unittest). Every
+      # other Python self-test above is stdlib-only and needs no install step.
+      - name: install pytest
+        run: python3 -m pip install --break-system-packages pytest
+
       - name: git hook runner self-test
         run: python3 scripts/test_run_git_hook.py
 
