@@ -18,7 +18,7 @@ use std::process::{Command, Stdio};
 use std::time::Duration;
 
 use ironmem::db::schema::Database;
-use serde_json::json;
+use serde_json::{json, Value};
 
 fn bin() -> &'static str {
     env!("CARGO_BIN_EXE_ironmem")
@@ -133,9 +133,57 @@ fn concurrent_proxies_single_flight_one_daemon_and_share_one_db() {
         reader
             .read_line(&mut add_line)
             .unwrap_or_else(|e| panic!("client {i} add_drawer read failed: {e}"));
+
+        // Parse as JSON-RPC and require an actual completed write acknowledgement,
+        // not merely a success-shaped envelope. A `warming_up` no-op body (see
+        // handle_add_drawer in src/mcp/tools/drawers.rs) would satisfy a bare
+        // substring check like `contains("\"id\":2")` while performing no write
+        // at all — that's precisely the silent-data-loss hole this assertion
+        // must close.
+        let envelope: Value = serde_json::from_str(&add_line).unwrap_or_else(|e| {
+            panic!("client {i} add_drawer response is not JSON: {e}\nraw: {add_line}")
+        });
+        assert_eq!(
+            envelope["id"], 2,
+            "client {i} add_drawer response has wrong JSON-RPC id: {add_line}"
+        );
+        let result = envelope
+            .get("result")
+            .unwrap_or_else(|| panic!("client {i} add_drawer response has no result: {add_line}"));
         assert!(
-            add_line.contains("\"id\":2") && !add_line.contains("\"isError\":true"),
-            "client {i} add_drawer response: {add_line}"
+            !result
+                .get("isError")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
+            "client {i} add_drawer response reported isError: {add_line}"
+        );
+        let text = result
+            .get("content")
+            .and_then(|c| c.get(0))
+            .and_then(|c| c.get("text"))
+            .and_then(Value::as_str)
+            .unwrap_or_else(|| {
+                panic!("client {i} add_drawer response missing content[0].text: {add_line}")
+            });
+        let payload: Value = serde_json::from_str(text).unwrap_or_else(|e| {
+            panic!("client {i} add_drawer content text is not JSON: {e}\ntext: {text}")
+        });
+        assert!(
+            payload.get("warming_up").is_none(),
+            "client {i} add_drawer returned a warming_up no-op instead of a real write: {text}"
+        );
+        assert_eq!(
+            payload["success"].as_bool(),
+            Some(true),
+            "client {i} add_drawer payload missing success:true: {text}"
+        );
+        assert!(
+            payload
+                .get("id")
+                .and_then(Value::as_str)
+                .filter(|id| !id.is_empty())
+                .is_some(),
+            "client {i} add_drawer payload missing a persisted drawer id: {text}"
         );
 
         drop(stdin);
