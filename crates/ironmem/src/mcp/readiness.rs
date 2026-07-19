@@ -134,9 +134,10 @@ impl ReadinessGate {
     /// Blocks the calling thread until the gate resolves, or `timeout`
     /// elapses, whichever comes first.
     ///
-    /// - Returns `Ok(())` immediately if already `Ready` (no lock/condvar
-    ///   touched at all).
-    /// - Returns `Err` immediately if already `Failed`.
+    /// - Returns `Ok(())` immediately if already `Ready` — a brief mutex
+    ///   lock to read the terminal state, but the condvar is never touched
+    ///   and the calling thread never blocks/parks.
+    /// - Returns `Err` immediately if already `Failed`, same fast path.
     /// - Otherwise blocks on the condvar (no busy-spin, no
     ///   `thread::sleep`); returns `Ok(())` if woken by `resolve_ready`,
     ///   `Err` if woken by `resolve_failed`, or `Err` if `timeout` elapses
