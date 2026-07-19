@@ -28,7 +28,6 @@ pub(super) fn validate_diary_write_args(args: &Value) -> Result<DiaryWriteArgs<'
 pub(super) fn handle_diary_write(app: &App, args: &Value) -> Result<Value, MemoryError> {
     // Validate before waiting on readiness — see `handle_add_drawer`.
     let DiaryWriteArgs { content, wing } = validate_diary_write_args(args)?;
-    app.wait_for_write_ready()?;
     app.ensure_embedder_ready()?;
     let entry = diary::write_entry(app, content, wing, "diary", 100_000)?;
     app.db.wal_log(

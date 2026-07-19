@@ -200,14 +200,45 @@ fn make_git_repo_with_file(
     (dir, root, sha)
 }
 
+/// Which unresolvable-gate scenario a write-tool test is exercising.
+///
+/// The two are genuinely different failures — one is "startup died", the
+/// other is "startup is taking longer than the fail-safe bound" — and they
+/// call for different operator responses. Asserting only `isError: true`
+/// would let each family of tests pass against the OTHER family's behavior,
+/// so each carries the message fragment that identifies its own path.
+#[derive(Clone, Copy)]
+enum GateFailure {
+    /// Gate stayed `Pending` past the injected timeout.
+    Timeout,
+    /// Gate resolved terminally to `Failed`.
+    Resolved,
+}
+
+impl GateFailure {
+    fn expected_fragment(self) -> &'static str {
+        match self {
+            GateFailure::Timeout => "timed out",
+            GateFailure::Resolved => "resolved as failed",
+        }
+    }
+
+    fn other_fragment(self) -> &'static str {
+        match self {
+            GateFailure::Timeout => "resolved as failed",
+            GateFailure::Resolved => "timed out",
+        }
+    }
+}
+
 /// The Task 6 assertion shared by all six write-tool terminal-path tests
 /// below (three timeout cases, three failed-resolution cases): in both
 /// scenarios the readiness gate can never resolve `Ready` (it either times
 /// out still `Pending`, or resolves explicitly `Failed`), so a completed
 /// write is structurally impossible here — this requires `isError: true`
-/// outright, and additionally rejects the soft warm-up no-op body even when
-/// paired with `isError: true`.
-fn assert_write_errored(tool: &str, is_error: bool, payload: &Value) {
+/// outright, rejects the soft warm-up no-op body even when paired with
+/// `isError: true`, and pins WHICH of the two failures was reported.
+fn assert_write_errored(tool: &str, is_error: bool, payload: &Value, cause: GateFailure) {
     assert!(
         is_error,
         "{tool}: expected isError:true (readiness gate can never resolve Ready in \
@@ -219,6 +250,22 @@ fn assert_write_errored(tool: &str, is_error: bool, payload: &Value) {
         !warming_up_body,
         "{tool}: must not return the soft warm-up no-op body even when paired with \
          isError:true in this scenario — payload={payload}"
+    );
+    let message = payload
+        .get("error")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    assert!(
+        message.contains(cause.expected_fragment()),
+        "{tool}: error must identify the readiness failure as \
+         {expected:?}, got: {message}",
+        expected = cause.expected_fragment()
+    );
+    assert!(
+        !message.contains(cause.other_fragment()),
+        "{tool}: error must not also report the other failure mode \
+         ({other:?}), got: {message}",
+        other = cause.other_fragment()
     );
 }
 
@@ -239,7 +286,7 @@ fn add_drawer_does_not_silently_noop_during_warmup() {
             json!({ "content": "warmup race test content", "wing": "ironrace-memory" }),
         );
 
-        assert_write_errored("add_drawer", is_error, &payload);
+        assert_write_errored("add_drawer", is_error, &payload, GateFailure::Timeout);
     });
 }
 
@@ -256,7 +303,7 @@ fn diary_write_does_not_silently_noop_during_warmup() {
             json!({ "content": "warmup race diary entry" }),
         );
 
-        assert_write_errored("diary_write", is_error, &payload);
+        assert_write_errored("diary_write", is_error, &payload, GateFailure::Timeout);
     });
 }
 
@@ -282,7 +329,7 @@ fn code_map_write_does_not_silently_noop_during_warmup() {
             }),
         );
 
-        assert_write_errored("code_map_write", is_error, &payload);
+        assert_write_errored("code_map_write", is_error, &payload, GateFailure::Timeout);
     });
 }
 
@@ -302,7 +349,7 @@ fn add_drawer_errors_when_readiness_resolves_failed() {
         json!({ "content": "warmup race test content", "wing": "ironrace-memory" }),
     );
 
-    assert_write_errored("add_drawer", is_error, &payload);
+    assert_write_errored("add_drawer", is_error, &payload, GateFailure::Resolved);
 }
 
 /// Task 6, failed-resolution case (see doc comment above `add_drawer`'s
@@ -318,7 +365,7 @@ fn diary_write_errors_when_readiness_resolves_failed() {
         json!({ "content": "warmup race diary entry" }),
     );
 
-    assert_write_errored("diary_write", is_error, &payload);
+    assert_write_errored("diary_write", is_error, &payload, GateFailure::Resolved);
 }
 
 /// Task 6, failed-resolution case (see doc comment above `add_drawer`'s
@@ -343,7 +390,7 @@ fn code_map_write_errors_when_readiness_resolves_failed() {
         }),
     );
 
-    assert_write_errored("code_map_write", is_error, &payload);
+    assert_write_errored("code_map_write", is_error, &payload, GateFailure::Resolved);
 }
 
 /// Argument validation does not depend on readiness, so it must run BEFORE
@@ -398,5 +445,73 @@ fn search_is_allowed_to_return_soft_warmup_body() {
         payload["results"].as_array().map(Vec::len),
         Some(0),
         "search's warm-up body must still report empty results: {payload}"
+    );
+}
+
+/// `Pending` and `Failed` are not the same thing to a reader, and the soft
+/// warm-up body is only honest about the first.
+///
+/// `Failed` is terminal: startup died and nothing will resolve the gate short
+/// of a process restart. Answering `{"warming_up": true, ... "available
+/// shortly"}` there tells every client a dead server is a slow one, forever —
+/// and the README instructs clients to poll `status` for exactly that flag, so
+/// a lie here is a lie a client is documented to sit in a loop believing. This
+/// is the silent-success class the write path was just fixed for, relocated to
+/// the read path.
+#[test]
+fn search_reports_a_failed_gate_instead_of_a_forever_warming_up_body() {
+    let mut app = App::open_for_test().unwrap();
+    force_readiness_failed(&mut app, "model load exploded");
+
+    let (is_error, payload) = call_tool_raw(&app, "search", json!({ "query": "anything" }));
+
+    assert!(
+        is_error,
+        "a terminally-failed gate must surface as an error, not a soft \
+         warm-up body: {payload}"
+    );
+    assert_ne!(
+        payload.get("warming_up").and_then(Value::as_bool),
+        Some(true),
+        "a failed gate must never be reported as still warming up: {payload}"
+    );
+}
+
+/// `status` is the diagnostic endpoint clients are told to poll, so unlike
+/// `search` it must keep answering rather than erroring — but it has to say
+/// which terminal state it is in. Reporting only `warming_up: true` leaves a
+/// polling client with no way to ever distinguish "wait longer" from "restart
+/// the server".
+#[test]
+fn status_distinguishes_a_failed_gate_from_an_ongoing_warmup() {
+    let mut warming = App::open_for_test().unwrap();
+    force_warming_up(&mut warming);
+    let (is_error, pending) = call_tool_raw(&warming, "status", json!({}));
+    assert!(
+        !is_error,
+        "status must not error while warming up: {pending}"
+    );
+    assert_eq!(
+        pending["readiness"].as_str(),
+        Some("warming_up"),
+        "an unresolved gate must report readiness=warming_up: {pending}"
+    );
+
+    let mut failed = App::open_for_test().unwrap();
+    force_readiness_failed(&mut failed, "model load exploded");
+    let (is_error, payload) = call_tool_raw(&failed, "status", json!({}));
+
+    assert!(
+        !is_error,
+        "status must stay answerable so a client can diagnose: {payload}"
+    );
+    assert_eq!(
+        payload["readiness"].as_str(),
+        Some("failed"),
+        "a terminally-failed gate must be reported as failed, not as warm-up: {payload}"
+    );
+    assert!(
+        payload["readiness_error"].as_str().is_some(),
+        "a failed gate must carry a client-facing reason: {payload}"
     );
 }

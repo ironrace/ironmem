@@ -207,7 +207,21 @@ class Server:
         deadline = time.time() + timeout_s
         while time.time() < deadline:
             st = self.tool("status", {})
-            if not st.get("warming_up", False):
+            # `readiness` distinguishes a startup that is still in progress from
+            # one that died. Without it, a failed start looks identical to a
+            # slow one and this loop burns the whole timeout before reporting
+            # the wrong cause.
+            readiness = st.get("readiness")
+            if readiness == "failed":
+                raise RuntimeError(
+                    "server startup failed, it will not become ready: "
+                    f"{st.get('readiness_error') or 'no reason reported'}"
+                )
+            # Fall back to the legacy bool when talking to an older server that
+            # predates the `readiness` field.
+            if readiness == "ready" or (
+                readiness is None and not st.get("warming_up", False)
+            ):
                 print(f"  warm: {st.get('total_drawers')} drawers ready")
                 return
             time.sleep(2)

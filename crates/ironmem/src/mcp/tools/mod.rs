@@ -561,6 +561,24 @@ pub fn call_tool(app: &App, name: &str, args: &Value) -> Result<Value, MemoryErr
         return Err(MemoryError::NotFound(format!("Unknown tool: {name}")));
     }
     ensure_tool_allowed(app, name)?;
+    // The single readiness wait for every write-shaped tool, driven off
+    // `WRITE_SHAPED_TOOLS` rather than opted into by each handler. Handlers
+    // used to call `wait_for_write_ready` individually, which meant a new
+    // write tool could be given the wait without being added to the list the
+    // framing loop dispatches on — and would then take this SYNCHRONOUS wait
+    // on the thread that owns the `App`, freezing every connection for the
+    // whole timeout. One list, one wait site, so that cannot be split.
+    //
+    // Normally a no-op: `server::dispatch_request` already awaited readiness
+    // asynchronously before calling this, so the gate is resolved and this
+    // returns via the fast path. It still matters for callers that reach
+    // `call_tool`/`dispatch` directly.
+    if is_write_shaped_tool(name) {
+        // Validate first, so a malformed write is rejected outright instead of
+        // waiting out the readiness timeout only to be rejected anyway.
+        precheck_write_request(app, name, args)?;
+        app.wait_for_write_ready()?;
+    }
     match name {
         "status" => handle_status(app, args),
         "search" => handle_search(app, args),
@@ -606,17 +624,44 @@ pub fn call_tool(app: &App, name: &str, args: &Value) -> Result<Value, MemoryErr
     }
 }
 
+/// The tools that must not run against a not-yet-ready embedder, and so block
+/// on `ReadinessGate` instead of returning a soft `warming_up` body.
+///
+/// THE single source of truth for "is this a write?". Everything derives from
+/// this list: the framing loop (`server::dispatch_request`) parks exactly
+/// these on the gate asynchronously, `call_tool` performs the synchronous
+/// fallback wait for exactly these, and `precheck_write_request` validates
+/// exactly these. Adding a write-shaped tool is one edit here — no handler
+/// opts itself in, so a tool cannot end up taking the synchronous wait while
+/// the framing loop is unaware of it and freeze every connection for the whole
+/// readiness timeout.
+///
+/// `write_shaped_tools_are_covered_end_to_end` in this module's tests pins
+/// every one of those obligations, so a fourth entry cannot be added here and
+/// silently left half-wired.
+pub(crate) const WRITE_SHAPED_TOOLS: &[&str] = &["add_drawer", "diary_write", "code_map_write"];
+
+/// Whether `name` is one of [`WRITE_SHAPED_TOOLS`].
+pub(crate) fn is_write_shaped_tool(name: &str) -> bool {
+    WRITE_SHAPED_TOOLS.contains(&name)
+}
+
 /// Everything about a write-shaped `tools/call` that can be rejected without
 /// the server being ready: the tool existing, mode gating, and argument
 /// validation.
 ///
-/// The daemon runs this before parking a write on the readiness gate, so a
-/// malformed or forbidden call fails immediately instead of serving out the
+/// The framing loop runs this before parking a write on the readiness gate, so
+/// a malformed or forbidden call fails immediately instead of serving out the
 /// whole `IRONMEM_WRITE_READINESS_TIMEOUT_SECS` window (90s by default) and
 /// only then being rejected. `call_tool` still performs all of these checks
 /// itself — this is a pre-pass, never the sole enforcement point, and it
 /// delegates to the same validators the handlers use so the two cannot drift
 /// apart.
+///
+/// Deliberately runs only the *structural* half of `code_map_write`'s
+/// validation: the full check shells out to `git`, and `call_tool` repeats it
+/// on the far side of the gate regardless, so doing it here would fork `git`
+/// twice per request — once on the pre-wait path — to reach the same verdict.
 pub(crate) fn precheck_write_request(
     app: &App,
     name: &str,
@@ -629,7 +674,7 @@ pub(crate) fn precheck_write_request(
     match name {
         "add_drawer" => drawers::validate_add_drawer_args(args).map(drop),
         "diary_write" => diary::validate_diary_write_args(args).map(drop),
-        "code_map_write" => code_maps::validate_code_map_write_args(args).map(drop),
+        "code_map_write" => code_maps::precheck_code_map_write_args(args),
         _ => Ok(()),
     }
 }
@@ -728,6 +773,51 @@ fn ensure_tool_allowed(app: &App, name: &str) -> Result<(), MemoryError> {
 mod tests {
     use super::shared::render_sensitive_text;
     use super::*;
+
+    /// The write-tool set used to be spelled out in three unlinked places —
+    /// the framing loop's dispatch check, this module's precheck match, and
+    /// the handlers themselves. Adding a fourth write tool and updating only
+    /// some of them compiles cleanly and passes every other test, while the
+    /// tool silently takes the SYNCHRONOUS wait inside its handler and freezes
+    /// the single-owner dispatcher — and therefore every connection — for the
+    /// whole readiness timeout.
+    ///
+    /// This pins each obligation that [`WRITE_SHAPED_TOOLS`] now carries, so a
+    /// new entry cannot be added half-wired.
+    #[test]
+    fn write_shaped_tools_are_covered_end_to_end() {
+        let app = App::open_for_test().unwrap();
+
+        for name in WRITE_SHAPED_TOOLS {
+            assert!(
+                tool_known(name),
+                "{name} is listed as write-shaped but is not a known tool"
+            );
+            assert!(
+                is_write_shaped_tool(name),
+                "{name} must be recognized by the predicate the framing loop uses"
+            );
+            // A dedicated precheck arm, not the `_ => Ok(())` fallthrough:
+            // empty arguments must be rejected on their own merits, so a
+            // malformed write fails fast instead of waiting out the gate.
+            let precheck = precheck_write_request(&app, name, &json!({}));
+            assert!(
+                matches!(precheck, Err(MemoryError::Validation(_))),
+                "{name} needs its own arm in precheck_write_request; empty args \
+                 produced {precheck:?} instead of a validation error"
+            );
+        }
+
+        // The converse: a read-shaped tool must NOT be parked on the gate,
+        // or `search` would block during warm-up instead of returning its
+        // soft body.
+        for name in ["search", "status", "get_drawer", "code_map_load"] {
+            assert!(
+                !is_write_shaped_tool(name),
+                "{name} is read-shaped and must not block on readiness"
+            );
+        }
+    }
 
     #[test]
     fn test_tool_access_modes_disable_writes_outside_trusted_mode() {

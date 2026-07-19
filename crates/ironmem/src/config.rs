@@ -17,6 +17,11 @@ const DEFAULT_DAEMON_IDLE_SECS: u64 = 300;
 /// of seconds) while still bounding how long a caller can be left hanging if
 /// init never completes.
 const DEFAULT_WRITE_READINESS_TIMEOUT_SECS: u64 = 90;
+/// Upper bound on `IRONMEM_WRITE_READINESS_TIMEOUT_SECS` (1 day). Keeps an
+/// operator typo from producing a duration whose derived `Instant` deadline is
+/// unrepresentable — `Instant + Duration` panics on overflow, and in a daemon
+/// that panic would take down every connected client, not just the caller.
+const MAX_WRITE_READINESS_TIMEOUT_SECS: u64 = 24 * 60 * 60;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum McpAccessMode {
@@ -216,9 +221,22 @@ impl Config {
     /// on every call (not cached on `Config`), so tests can override it with
     /// `std::env::set_var` immediately before exercising a still-pending gate,
     /// without needing to reconstruct `Config`.
+    ///
+    /// Clamped to [`MAX_WRITE_READINESS_TIMEOUT_SECS`] (1 day). The value is a
+    /// crash guard, not a schedule — anything beyond a day is already
+    /// indistinguishable from "wait forever" — and clamping keeps the derived
+    /// deadline representable for every downstream `Instant`/timer arithmetic
+    /// instead of relying on each of them to defend itself.
     pub fn write_readiness_timeout(&self) -> Duration {
         let secs = match std::env::var("IRONMEM_WRITE_READINESS_TIMEOUT_SECS") {
             Ok(raw) => match raw.trim().parse::<u64>() {
+                Ok(secs) if secs > MAX_WRITE_READINESS_TIMEOUT_SECS => {
+                    tracing::warn!(
+                        "IRONMEM_WRITE_READINESS_TIMEOUT_SECS={secs} exceeds the maximum of \
+                         {MAX_WRITE_READINESS_TIMEOUT_SECS}s; clamping to the maximum"
+                    );
+                    MAX_WRITE_READINESS_TIMEOUT_SECS
+                }
                 Ok(secs) => secs,
                 Err(e) => {
                     tracing::warn!(
@@ -274,6 +292,35 @@ mod tests {
             mcp_access_mode: McpAccessMode::ReadOnly,
             embed_mode: EmbedMode::Noop,
         }
+    }
+
+    /// `Instant + Duration` panics on overflow, and this duration is derived
+    /// from an operator-supplied env var. In a shared daemon that panic takes
+    /// down every connected client over one bad value, so an absurd timeout
+    /// has to clamp rather than propagate.
+    #[test]
+    fn write_readiness_timeout_clamps_an_absurd_override() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let config = test_config("/tmp/ironmem-clamp-test");
+
+        std::env::set_var("IRONMEM_WRITE_READINESS_TIMEOUT_SECS", u64::MAX.to_string());
+        let clamped = config.write_readiness_timeout();
+        assert_eq!(
+            clamped,
+            Duration::from_secs(MAX_WRITE_READINESS_TIMEOUT_SECS),
+            "an out-of-range override must clamp to the maximum"
+        );
+        // The point of clamping: the derived deadline stays representable.
+        assert!(
+            std::time::Instant::now().checked_add(clamped).is_some(),
+            "a clamped timeout must still produce a representable deadline"
+        );
+
+        // A sane override is still honored untouched.
+        std::env::set_var("IRONMEM_WRITE_READINESS_TIMEOUT_SECS", "5");
+        assert_eq!(config.write_readiness_timeout(), Duration::from_secs(5));
+
+        std::env::remove_var("IRONMEM_WRITE_READINESS_TIMEOUT_SECS");
     }
 
     #[test]

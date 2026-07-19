@@ -9,7 +9,7 @@ use ironrace_embed::Embedder;
 use crate::config::{Config, EmbedMode};
 use crate::db::schema::Database;
 use crate::error::MemoryError;
-use crate::mcp::readiness::ReadinessGate;
+use crate::mcp::readiness::{ReadinessGate, ReadinessState};
 use crate::search::graph::MemoryGraph;
 
 /// HNSW index + id_map bundled together to eliminate TOCTOU between separate locks.
@@ -40,8 +40,22 @@ pub struct App {
     /// Cached memory graph (wing/room adjacency). Invalidated on writes.
     pub graph_cache: RwLock<Option<MemoryGraph>>,
     /// Resolves once background memory init (model load + bootstrap) completes
-    /// (or fails). Pending during warmup; tools that need the embedder return
-    /// a warming_up response while `is_warming_up()` is true.
+    /// (or fails). Pending during warm-up.
+    ///
+    /// How a tool should consult this depends on its shape, and getting it
+    /// wrong is how warm-up writes were silently discarded:
+    ///
+    /// - **Write-shaped** (persists something): block on it —
+    ///   `App::wait_for_write_ready`, and add the tool to
+    ///   `tools::WRITE_SHAPED_TOOLS` so the framing loop performs that wait
+    ///   asynchronously instead. Returning a soft `warming_up` body here is a
+    ///   success-shaped response for a write that never happened.
+    /// - **Read-shaped**: branch on `App::readiness_snapshot`. A soft
+    ///   `warming_up` body is correct for `Pending` only; `Failed` is terminal
+    ///   and must be reported as an error, not as "try again shortly".
+    ///
+    /// `is_warming_up()` is the narrow "can I touch the embedder" check and
+    /// collapses `Pending` and `Failed` — do not report it to a client.
     pub memory_ready: Arc<ReadinessGate>,
     /// Guards the one-time HNSW rebuild triggered when `memory_ready` resolves `Ready`.
     memory_ready_rebuilt: AtomicBool,
@@ -214,10 +228,21 @@ impl App {
             .clone()
     }
 
-    /// Returns true while background memory init is still in progress.
-    /// Embedding-dependent tools should return a warming_up response during this window.
+    /// Returns true while the embedder is not usable — which covers BOTH an
+    /// in-progress warm-up and a startup that failed outright.
+    ///
+    /// Use this only to decide whether the embedder can be touched. Anything
+    /// that reports state back to a client must use
+    /// [`App::readiness_snapshot`] instead: answering "warming up, try again
+    /// shortly" to a client whose server failed at startup is a lie the client
+    /// will poll on forever. See [`ReadinessState`].
     pub fn is_warming_up(&self) -> bool {
         !self.memory_ready.is_ready()
+    }
+
+    /// Tri-state readiness, for tools that report warm-up state to a client.
+    pub fn readiness_snapshot(&self) -> ReadinessState {
+        self.memory_ready.snapshot()
     }
 
     /// Blocks (bounded) until background memory init resolves, for write-shaped
@@ -391,9 +416,18 @@ impl App {
     /// boundary, which is already a full barrier), not by Rust's atomic
     /// ordering on this flag. So downgrading this check to `is_ready()`
     /// (`Relaxed`) does not remove a real happens-before guarantee.
+    /// Failure handling: the latch is claimed up front so the reload is
+    /// single-flight, but RELEASED again if the reload fails, so the next
+    /// caller retries. Leaving it claimed on failure would be permanent — the
+    /// noop embedder stays installed and every later write persists an
+    /// all-zero vector that no search can ever match, with each individual
+    /// call returning `Ok(())`.
     pub fn ensure_embedder_ready(&self) -> Result<(), MemoryError> {
         if self.memory_ready.is_ready() && !self.memory_ready_rebuilt.swap(true, Ordering::AcqRel) {
-            self.reload_embedder()?;
+            if let Err(e) = self.reload_embedder() {
+                self.memory_ready_rebuilt.store(false, Ordering::Release);
+                return Err(e);
+            }
             // Mark dirty so the HNSW index is rebuilt on the next search, picking
             // up all drawers written by the background bootstrap.
             self.dirty.store(true, Ordering::Release);
@@ -604,6 +638,45 @@ pub(crate) fn harness_from_client_info(params: &serde_json::Value) -> Option<Str
 mod tests {
     use super::*;
     use crate::harness::{HarnessSpec, TranscriptParserKind};
+
+    // ---- ensure_embedder_ready failure handling ----------------------------
+
+    /// `ensure_embedder_ready` swaps a one-shot latch to guarantee the real
+    /// embedder is loaded at most once. If that latch is claimed *before*
+    /// `reload_embedder()` is known to have succeeded, a failed load is
+    /// permanent: no later call retries it, and every subsequent write embeds
+    /// through the still-installed noop embedder, persisting all-zero vectors
+    /// that are silently unsearchable forever.
+    ///
+    /// A failure must therefore leave the latch unclaimed, so the next call
+    /// tries again and — until it succeeds — keeps reporting the error rather
+    /// than returning `Ok(())` against a noop embedder.
+    #[test]
+    fn ensure_embedder_ready_retries_after_a_failed_reload() {
+        let mut app = App::open_for_test().unwrap();
+        // Point at a model dir that does not exist, marked explicit so the
+        // loader fails outright instead of trying to fetch a model.
+        app.config.embed_mode = EmbedMode::Real;
+        app.config.model_dir = std::path::PathBuf::from("/nonexistent/ironmem-test-model");
+        app.config.model_dir_explicit = true;
+        // `open_for_test` starts with the reload already accounted for; clear
+        // it so this exercises the real post-warm-up reload path.
+        app.memory_ready_rebuilt.store(false, Ordering::Release);
+
+        let first = app.ensure_embedder_ready();
+        assert!(
+            first.is_err(),
+            "a model dir that cannot be loaded must surface as an error"
+        );
+
+        let second = app.ensure_embedder_ready();
+        assert!(
+            second.is_err(),
+            "a failed embedder load must be retried, not latched as done — \
+             returning Ok() here would leave the noop embedder installed and \
+             every later write would persist all-zero vectors"
+        );
+    }
 
     // ---- harness_from_client_info wiring -----------------------------------
 

@@ -45,8 +45,8 @@
 //! first, not to every connection.
 //!
 //! Why NOT `spawn_local`/`LocalSet`, and why a multi-thread runtime:
-//! `run_server_io`/`run_server_io_daemon_connection` offload their synchronous
-//! `dispatch` + metrics work through `tokio::task::block_in_place`.
+//! `run_server_io`/`run_server_io_daemon_connection` wrap their synchronous
+//! `dispatch` + metrics work in `tokio::task::block_in_place`.
 //! `block_in_place` PANICS both on a `current_thread` runtime AND from within
 //! a `LocalSet`/`spawn_local` — so the obvious "`current_thread` +
 //! `spawn_local`" confinement cannot run this framing loop at all. It is,
@@ -54,11 +54,24 @@
 //! inside a `LocalSet`. So the daemon builds a multi-thread runtime and
 //! drives everything from its `block_on` thread with a `FuturesUnordered` (no
 //! `LocalSet`), which both satisfies `block_in_place` and keeps every future —
-//! and the `Arc<App>` they clone — pinned to this one thread. Because
-//! handlers are cooperatively scheduled on a single thread and each `dispatch`
-//! runs inside `block_in_place`, dispatch is naturally serialized: the
-//! "single writer / one App" invariant holds by thread confinement, with no
-//! lock.
+//! and the `Arc<App>` they clone — pinned to this one thread.
+//!
+//! What `block_in_place` does NOT buy here: it offloads nothing on this
+//! thread. Its effect is to hand a worker's *queued tasks* to another worker
+//! before the caller blocks, and the `block_on` thread has no such queue —
+//! every future in this design lives inside the one `select!` and is `!Send`,
+//! so none of it can migrate. A synchronous `dispatch` therefore stalls this
+//! thread, and with it every connection, for its duration. That is accepted
+//! because `dispatch` is short; it is exactly why the readiness wait (up to
+//! `IRONMEM_WRITE_READINESS_TIMEOUT_SECS`) was moved OUT of the handlers and
+//! made `async` — see `server::dispatch_request`.
+//!
+//! Because handlers are cooperatively scheduled on a single thread and each
+//! `dispatch` runs inside `block_in_place`, dispatch is naturally serialized:
+//! the "single writer / one App" invariant holds by thread confinement, with
+//! no lock. Request pipelining within a connection (see `run_framing_loop`)
+//! does not weaken this — it adds concurrency only at await points, never two
+//! simultaneous `dispatch` calls.
 //!
 //! An earlier design considered a single-owner dispatcher ACTOR — a
 //! `DispatcherHandle`/`run_dispatcher` pair where per-connection handlers on

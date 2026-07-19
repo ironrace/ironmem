@@ -10,6 +10,7 @@ use super::shared::{
     MAX_SEARCH_RESPONSE_CHARS, MAX_SENSITIVE_FIELD_CHARS,
 };
 use crate::mcp::app::App;
+use crate::mcp::readiness::ReadinessState;
 
 const LOGICAL_KEY_SOURCE_PREFIX: &str = "logical:";
 const LOGICAL_KEY_ID_PREFIX: &str = "logical-key:";
@@ -66,7 +67,6 @@ pub(super) fn handle_add_drawer(app: &App, args: &Value) -> Result<Value, Memory
         room,
         logical_key,
     } = validate_add_drawer_args(args)?;
-    app.wait_for_write_ready()?;
 
     let id_basis = logical_key
         .as_ref()
@@ -399,12 +399,21 @@ pub(super) fn handle_get_taxonomy(app: &App) -> Result<Value, MemoryError> {
 }
 
 pub(super) fn handle_search(app: &App, args: &Value) -> Result<Value, MemoryError> {
-    if app.is_warming_up() {
-        return Ok(json!({
-            "warming_up": true,
-            "message": "Memory server is initializing. Search will be available shortly.",
-            "results": [],
-        }));
+    match app.readiness_snapshot() {
+        ReadinessState::Ready => {}
+        // Non-terminal: the soft body is honest — the caller should retry.
+        ReadinessState::Pending => {
+            return Ok(json!({
+                "warming_up": true,
+                "message": "Memory server is initializing. Search will be available shortly.",
+                "results": [],
+            }));
+        }
+        // Terminal: nothing will resolve this short of a restart, so
+        // "available shortly" would be a promise the server cannot keep, and
+        // an empty result set would read as "no matches" rather than "no
+        // search". Fail loudly instead.
+        ReadinessState::Failed(reason) => return Err(MemoryError::NotReady(reason)),
     }
     let query = args
         .get("query")
@@ -479,12 +488,28 @@ pub(super) fn handle_status(app: &App, args: &Value) -> Result<Value, MemoryErro
     let kg = crate::db::knowledge_graph::KnowledgeGraph::new(&app.db);
     let kg_stats = kg.stats()?;
 
+    // `status` deliberately reports a failed gate rather than erroring on it:
+    // it is the endpoint clients are told to poll to diagnose the server, so
+    // it has to stay answerable when the server is broken.
+    let (readiness_label, readiness_error) = match app.readiness_snapshot() {
+        ReadinessState::Ready => ("ready", None),
+        ReadinessState::Pending => ("warming_up", None),
+        ReadinessState::Failed(reason) => ("failed", Some(reason)),
+    };
+
     Ok(json!({
         "total_drawers": total,
         "wings": wings.into_iter().collect::<std::collections::HashMap<_, _>>(),
         "knowledge_graph": kg_stats,
         "memory_protocol": crate::bootstrap::MEMORY_PROTOCOL,
+        // `warming_up` stays a bool for compatibility with existing clients
+        // (and the README's poll-until-false instruction). `readiness` is what
+        // distinguishes "keep polling" from "this server is not coming up" —
+        // without it a client told to poll `warming_up` would loop forever
+        // against a server that failed at startup.
         "warming_up": app.is_warming_up(),
+        "readiness": readiness_label,
+        "readiness_error": readiness_error,
         "task_tag": app.explicit_task_tag_snapshot(),
         "active_collab_session_id": app.active_collab_session_snapshot(),
         "metrics": crate::report::one_line_summary(&app.db),

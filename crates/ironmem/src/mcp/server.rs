@@ -239,19 +239,42 @@ where
     run_framing_loop(&app, reader, writer, TransportMode::DaemonConnection).await
 }
 
+/// How many requests one connection may have in flight at once.
+///
+/// Backpressure, not a throughput target: the loop simply stops reading new
+/// requests at this depth until one completes, so a client that pipelines
+/// without bound cannot make the server buffer without bound. Requests park
+/// here only while awaiting readiness — `dispatch` itself is still serialized
+/// — so the depth needed is "writes a client may have outstanding during
+/// warm-up", not "concurrent CPU work".
+const MAX_IN_FLIGHT_REQUESTS: usize = 64;
+
 /// Per-connection MCP framing loop: read newline-delimited JSON-RPC requests
 /// from `reader`, dispatch each one, write the response to `writer`, and
-/// account response metrics. Daemon write requests wait for readiness outside
-/// the single-owner dispatcher so they do not stall unrelated connections.
-/// `mode` (H4) controls whether this
-/// connection's `ConnectionContext` honors the `IRONMEM_SESSION_ID`/
-/// `IRONMEM_HARNESS` env overrides — see `TransportMode`. Metrics accounting
-/// needs access to `app` (for the DB + process-global collab/task-tag
-/// context) and a per-connection `ConnectionContext` (for harness/session
-/// attribution learned from *this* connection's own `initialize` — see
-/// `ConnectionContext` for why that must not live on `App`), plus the
-/// original request (for tool name / session id / exploration context),
-/// independent of how the response was obtained.
+/// account response metrics.
+///
+/// Requests are pipelined: a request parked on the readiness gate does not
+/// stop this loop from reading and answering the ones behind it. That matters
+/// because one MCP client is one connection — without it, a warm-up
+/// `add_drawer` would stall a following `search` on the *same* connection for
+/// the whole readiness timeout, which is precisely the stall the gate exists
+/// to avoid. Responses may therefore be written out of request order; JSON-RPC
+/// 2.0 explicitly allows this, and clients match responses by `id`.
+///
+/// Concurrency here is limited to await points. `dispatch` runs inside
+/// `block_in_place` and this whole loop is `!Send` (see `daemon`'s module
+/// doc), so at most one `dispatch` ever runs at a time and `App`'s
+/// single-owner invariant is preserved. `MAX_IN_FLIGHT_REQUESTS` bounds how
+/// far the pipeline may run ahead.
+///
+/// `mode` (H4) controls whether this connection's `ConnectionContext` honors
+/// the `IRONMEM_SESSION_ID`/`IRONMEM_HARNESS` env overrides — see
+/// `TransportMode`. Metrics accounting needs access to `app` (for the DB +
+/// process-global collab/task-tag context) and a per-connection
+/// `ConnectionContext` (for harness/session attribution learned from *this*
+/// connection's own `initialize` — see `ConnectionContext` for why that must
+/// not live on `App`), plus the original request (for tool name / session id /
+/// exploration context), independent of how the response was obtained.
 async fn run_framing_loop<R, W>(
     app: &Arc<App>,
     reader: R,
@@ -262,80 +285,129 @@ where
     R: AsyncBufRead + Unpin,
     W: AsyncWrite + Unpin,
 {
+    use futures_util::stream::{FuturesUnordered, StreamExt};
+
     let mut stdout = writer;
     let mut lines = reader.lines();
     let mut conn = ConnectionContext::new(mode);
-    while let Ok(Some(line)) = lines.next_line().await {
-        let line = line.trim().to_string();
-        if line.is_empty() {
-            continue;
-        }
+    let mut in_flight = FuturesUnordered::new();
+    let mut reader_done = false;
 
-        let request: JsonRpcRequest = match serde_json::from_str(&line) {
-            Ok(r) => r,
-            Err(e) => {
-                let resp = JsonRpcResponse::error(None, -32700, &format!("Parse error: {e}"));
-                let chars = write_response(&mut stdout, &resp).await?;
-                account_response_metrics(app, &conn, chars, None, conn.session_id.as_deref(), None);
-                continue;
+    loop {
+        // Stop reading at the pipeline depth cap; resume once one drains.
+        let may_read = !reader_done && in_flight.len() < MAX_IN_FLIGHT_REQUESTS;
+
+        tokio::select! {
+            // Biased toward draining: prefer answering work already accepted
+            // over accepting more of it.
+            biased;
+
+            Some((request, response)) = in_flight.next() => {
+                write_and_account(app, &conn, &mut stdout, &request, response).await?;
             }
-        };
 
-        if request.jsonrpc != "2.0" {
-            let resp = JsonRpcResponse::error(
-                request.id.clone(),
-                -32600,
-                "Invalid Request: jsonrpc must be '2.0'",
-            );
-            let chars = write_response(&mut stdout, &resp).await?;
-            account_response_metrics(app, &conn, chars, None, conn.session_id.as_deref(), None);
-            continue;
+            line = lines.next_line(), if may_read => {
+                let Ok(Some(line)) = line else {
+                    reader_done = true;
+                    continue;
+                };
+                let line = line.trim().to_string();
+                if line.is_empty() {
+                    continue;
+                }
+
+                let request: JsonRpcRequest = match serde_json::from_str(&line) {
+                    Ok(r) => r,
+                    Err(e) => {
+                        let resp =
+                            JsonRpcResponse::error(None, -32700, &format!("Parse error: {e}"));
+                        let chars = write_response(&mut stdout, &resp).await?;
+                        account_response_metrics(
+                            app, &conn, chars, None, conn.session_id.as_deref(), None,
+                        );
+                        continue;
+                    }
+                };
+
+                if request.jsonrpc != "2.0" {
+                    let resp = JsonRpcResponse::error(
+                        request.id.clone(),
+                        -32600,
+                        "Invalid Request: jsonrpc must be '2.0'",
+                    );
+                    let chars = write_response(&mut stdout, &resp).await?;
+                    account_response_metrics(
+                        app, &conn, chars, None, conn.session_id.as_deref(), None,
+                    );
+                    continue;
+                }
+
+                // Connection-local attribution: learn session id / harness from
+                // this connection's own `initialize` request before dispatching
+                // it. Kept in the framing loop (rather than inside `dispatch`)
+                // so `dispatch`'s signature — and its many direct test callers —
+                // stay untouched; the framing loop already owns the parsed
+                // `request` and is the one place that is per-connection by
+                // construction. Done at read time, so it is ordered against the
+                // requests behind it even though dispatch is pipelined.
+                if request.method == "initialize" {
+                    conn.learn(&request.params);
+                }
+
+                in_flight.push(async move {
+                    let response = dispatch_request(app, &request).await;
+                    (request, response)
+                });
+            }
+
+            else => break,
         }
 
-        // Connection-local attribution: learn session id / harness from this
-        // connection's own `initialize` request before dispatching it. Kept
-        // in the framing loop (rather than inside `dispatch`) so `dispatch`'s
-        // signature — and its many direct test callers — stay untouched; the
-        // framing loop already owns the parsed `request` and is the one place
-        // that is per-connection by construction.
-        if request.method == "initialize" {
-            conn.learn(&request.params);
-        }
-
-        let response = match mode {
-            TransportMode::Stdio => tokio::task::block_in_place(|| dispatch(app, &request)),
-            TransportMode::DaemonConnection => dispatch_daemon_request(app, &request).await,
-        };
-
-        if let Some(resp) = response {
-            // Extract the tool result JSON (if this is a successful tools/call)
-            // so code-map tools can determine map_hit vs map_miss from `found`.
-            let tool_result_json: Option<serde_json::Value> = resp
-                .result
-                .as_ref()
-                .and_then(|r| r.get("content"))
-                .and_then(|c| c.as_array())
-                .and_then(|arr| arr.first())
-                .and_then(|item| item.get("text"))
-                .and_then(|t| t.as_str())
-                .and_then(|s| serde_json::from_str(s).ok());
-            let exploration = request_exploration_context(&request, tool_result_json.as_ref());
-            let chars = write_response(&mut stdout, &resp).await?;
-            let sid = conn
-                .session_id
-                .clone()
-                .or_else(|| request_collab_session_id(&request));
-            account_response_metrics(
-                app,
-                &conn,
-                chars,
-                request_tool_name(&request),
-                sid.as_deref(),
-                exploration.as_ref(),
-            );
+        if reader_done && in_flight.is_empty() {
+            break;
         }
     }
 
+    Ok(())
+}
+
+/// Write one dispatched response and account its metrics. Split out of
+/// `run_framing_loop` so the pipelined completion branch stays readable.
+async fn write_and_account(
+    app: &Arc<App>,
+    conn: &ConnectionContext,
+    stdout: &mut (impl AsyncWrite + Unpin),
+    request: &JsonRpcRequest,
+    response: Option<JsonRpcResponse>,
+) -> Result<(), MemoryError> {
+    let Some(resp) = response else {
+        return Ok(());
+    };
+    // Extract the tool result JSON (if this is a successful tools/call)
+    // so code-map tools can determine map_hit vs map_miss from `found`.
+    let tool_result_json: Option<serde_json::Value> = resp
+        .result
+        .as_ref()
+        .and_then(|r| r.get("content"))
+        .and_then(|c| c.as_array())
+        .and_then(|arr| arr.first())
+        .and_then(|item| item.get("text"))
+        .and_then(|t| t.as_str())
+        .and_then(|s| serde_json::from_str(s).ok());
+    let exploration = request_exploration_context(request, tool_result_json.as_ref());
+    let chars = write_response(stdout, &resp).await?;
+    let sid = conn
+        .session_id
+        .clone()
+        .or_else(|| request_collab_session_id(request));
+    account_response_metrics(
+        app,
+        conn,
+        chars,
+        request_tool_name(request),
+        sid.as_deref(),
+        exploration.as_ref(),
+    );
     Ok(())
 }
 
@@ -351,25 +423,25 @@ async fn write_response(
     Ok(chars)
 }
 
-/// Write-shaped tools must wait for readiness, but the daemon's `App` is
-/// intentionally confined to one synchronous dispatcher thread. Waiting in a
-/// handler would park that dispatcher and prevent unrelated connections from
-/// receiving even their read-only warm-up responses. So the wait happens
-/// here, asynchronously, before entering `dispatch`; once ready, the normal
+/// Write-shaped tools must wait for readiness, but `App` is confined to a
+/// single owner: every `dispatch` runs synchronously inside `block_in_place`,
+/// on the one thread that owns the `App`. Waiting *inside* a handler therefore
+/// parks that thread, which stalls not just this connection's later requests
+/// but every other connection the daemon is serving. So the wait happens here,
+/// asynchronously, before entering `dispatch`; once ready, the normal
 /// synchronous handler remains serialized as before. Anything that can be
-/// rejected without readiness is rejected before the wait, and the wait
-/// itself consumes no thread — see `tools::precheck_write_request` and
+/// rejected without readiness is rejected before the wait, and the wait itself
+/// consumes no thread — see `tools::precheck_write_request` and
 /// `ReadinessGate::wait_for_write_async`.
-async fn dispatch_daemon_request(
-    app: &Arc<App>,
-    request: &JsonRpcRequest,
-) -> Option<JsonRpcResponse> {
+///
+/// Applies to BOTH transports. A bare stdio `serve` is one client on one
+/// connection, so a write parked inside its handler would head-of-line block
+/// that client's own reads just as surely — and stdio is the transport a
+/// harness uses directly.
+async fn dispatch_request(app: &Arc<App>, request: &JsonRpcRequest) -> Option<JsonRpcResponse> {
     let tool_name = request.params.get("name").and_then(|value| value.as_str());
-    let is_write = request.method == "tools/call"
-        && matches!(
-            tool_name,
-            Some("add_drawer" | "diary_write" | "code_map_write")
-        );
+    let is_write =
+        request.method == "tools/call" && tool_name.is_some_and(tools::is_write_shaped_tool);
 
     if is_write && app.is_warming_up() {
         // Reject what does not depend on readiness — unknown tool, mode
@@ -576,7 +648,7 @@ mod tests {
         }))
         .unwrap();
 
-        let write_wait = dispatch_daemon_request(&app, &write);
+        let write_wait = dispatch_request(&app, &write);
         tokio::pin!(write_wait);
 
         // Rust futures are lazy: constructing `write_wait` does NOT start the
@@ -598,13 +670,11 @@ mod tests {
         // request must still be serviced. If that wait occupied the daemon's
         // single dispatcher, this search call would not complete before the
         // gate resolves.
-        let search_response = tokio::time::timeout(
-            Duration::from_millis(250),
-            dispatch_daemon_request(&app, &search),
-        )
-        .await
-        .expect("read-only search must stay responsive while a write waits")
-        .expect("search produces a response");
+        let search_response =
+            tokio::time::timeout(Duration::from_millis(250), dispatch_request(&app, &search))
+                .await
+                .expect("read-only search must stay responsive while a write waits")
+                .expect("search produces a response");
         assert_eq!(search_response.id, Some(json!(2)));
         assert_eq!(
             search_response.result.unwrap()["content"][0]["text"]
@@ -625,6 +695,108 @@ mod tests {
             Some(true),
             "resolved write must not become an error"
         );
+    }
+
+    /// Serializes tests that override `IRONMEM_WRITE_READINESS_TIMEOUT_SECS`,
+    /// which `Config::write_readiness_timeout()` reads fresh from the process
+    /// environment on every call.
+    static WRITE_READINESS_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Feeds `requests` down one connection and returns the first response the
+    /// server writes back, driving `run_framing_loop` inline.
+    ///
+    /// `run_framing_loop`'s future is `!Send` (`App` is `!Sync`), so it cannot
+    /// be `tokio::spawn`ed. `select!` drives the loop and the response reader
+    /// concurrently on this one task instead, which is also exactly how the
+    /// daemon runs it.
+    async fn first_response_from_connection(
+        app: &Arc<App>,
+        mode: TransportMode,
+        requests: &[serde_json::Value],
+    ) -> serde_json::Value {
+        let (mut client_in, server_in) = tokio::io::duplex(8192);
+        let (server_out, client_out) = tokio::io::duplex(8192);
+        for request in requests {
+            let line = format!("{request}\n");
+            client_in.write_all(line.as_bytes()).await.unwrap();
+        }
+
+        let mut loop_fut = Box::pin(run_framing_loop(
+            app,
+            BufReader::new(server_in),
+            server_out,
+            mode,
+        ));
+        let mut responses = BufReader::new(client_out).lines();
+
+        tokio::select! {
+            result = &mut loop_fut => panic!("framing loop exited early: {result:?}"),
+            line = responses.next_line() => serde_json::from_str(
+                &line.unwrap().expect("server must write a response"),
+            )
+            .expect("response must be valid JSON"),
+        }
+    }
+
+    /// The headline claim of the readiness gate — reads stay serviceable while
+    /// a write waits out warm-up — has to hold at the *connection* level, which
+    /// is the only level a real MCP client can observe. One client is one
+    /// connection, so if the framing loop awaits request N before it will even
+    /// read request N+1, a warm-up `add_drawer` stalls a following `search` for
+    /// the entire readiness timeout.
+    ///
+    /// Both transports are covered: `Stdio` is what Claude Code actually uses.
+    /// The env override bounds how long this takes to FAIL — without it a
+    /// regression parks on the 90s production default rather than reporting.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn framing_loop_services_a_read_while_a_write_waits_for_readiness() {
+        let _g = WRITE_READINESS_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("IRONMEM_WRITE_READINESS_TIMEOUT_SECS", "5");
+
+        for mode in [TransportMode::Stdio, TransportMode::DaemonConnection] {
+            #[allow(clippy::arc_with_non_send_sync)]
+            let mut app = Arc::new(App::open_for_test().unwrap());
+            let _readiness = force_warming_up(&mut app);
+
+            // Write first, read second, down a single connection.
+            let requests = [
+                json!({
+                    "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                    "params": {
+                        "name": "add_drawer",
+                        "arguments": {"content": "queued write", "wing": "race"}
+                    }
+                }),
+                json!({
+                    "jsonrpc": "2.0", "id": 2, "method": "tools/call",
+                    "params": {"name": "search", "arguments": {"query": "queued"}}
+                }),
+            ];
+
+            let first = tokio::time::timeout(
+                Duration::from_secs(2),
+                first_response_from_connection(&app, mode, &requests),
+            )
+            .await
+            .unwrap_or_else(|_| {
+                panic!(
+                    "{mode:?}: the read got no response while the write was parked on \
+                     readiness — the connection is head-of-line blocked"
+                )
+            });
+
+            assert_eq!(
+                first["id"],
+                json!(2),
+                "{mode:?}: the read must be answered first; the write is still \
+                 waiting on an unresolved gate"
+            );
+        }
+
+        std::env::remove_var("IRONMEM_WRITE_READINESS_TIMEOUT_SECS");
     }
 
     /// Installs a fresh, never-resolved `Pending` readiness gate so every
@@ -682,13 +854,11 @@ mod tests {
         // `content` is required by `add_drawer` and is absent here.
         let invalid = tool_call(1, "add_drawer", json!({ "wing": "race" }));
 
-        let response = tokio::time::timeout(
-            Duration::from_secs(2),
-            dispatch_daemon_request(&app, &invalid),
-        )
-        .await
-        .expect("an invalid write must fail fast, not wait out the readiness timeout")
-        .expect("tools/call produces a response");
+        let response =
+            tokio::time::timeout(Duration::from_secs(2), dispatch_request(&app, &invalid))
+                .await
+                .expect("an invalid write must fail fast, not wait out the readiness timeout")
+                .expect("tools/call produces a response");
 
         let message = tool_error_text(&response);
         assert!(
@@ -712,13 +882,11 @@ mod tests {
 
         let forbidden = tool_call(1, "add_drawer", json!({ "content": "x", "wing": "race" }));
 
-        let response = tokio::time::timeout(
-            Duration::from_secs(2),
-            dispatch_daemon_request(&app, &forbidden),
-        )
-        .await
-        .expect("a forbidden write must fail fast, not wait out the readiness timeout")
-        .expect("tools/call produces a response");
+        let response =
+            tokio::time::timeout(Duration::from_secs(2), dispatch_request(&app, &forbidden))
+                .await
+                .expect("a forbidden write must fail fast, not wait out the readiness timeout")
+                .expect("tools/call produces a response");
 
         let message = tool_error_text(&response);
         assert!(
@@ -762,7 +930,7 @@ mod tests {
                 .collect();
             let mut waiters: FuturesUnordered<_> = requests
                 .iter()
-                .map(|request| dispatch_daemon_request(&app, request))
+                .map(|request| dispatch_request(&app, request))
                 .collect();
 
             // Drive every write to its readiness await point. None can

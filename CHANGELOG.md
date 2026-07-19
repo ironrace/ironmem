@@ -32,6 +32,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `IRONMEM_DAEMON_IDLE_SECS` (override the 300s idle-shutdown window), and
   `IRONMEM_NO_DAEMON` (disable auto-spawn). `ironmem doctor` gained a daemon
   health probe and per-harness proxy-wiring checks.
+- **`IRONMEM_WRITE_READINESS_TIMEOUT_SECS` env var.** Bounds how long a
+  write-shaped MCP tool waits for startup readiness before giving up and
+  returning `isError: true`. Defaults to 90s — generous enough to cover a cold
+  ONNX model load plus bootstrap, short enough that a wedged startup surfaces
+  as an error rather than an indefinite hang. Clamped to a 24-hour maximum;
+  unparseable values fall back to the default.
 - **`ironmem grok` / `ironmem gemini` launchers.** Registry-backed launchers
   for Grok CLI and Gemini CLI alongside the existing Claude/Codex launchers,
   all registering the shared-daemon proxy command by default.
@@ -56,6 +62,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   after the canonical file was already written, the error names both the failed
   file and the already-updated files and prompts a re-run to reconcile, instead
   of discarding the partial-state report.
+
+### Fixed
+
+- **Write-shaped MCP tools no longer silently discard writes during warm-up.**
+  `add_drawer`, `diary_write`, and `code_map_write` previously returned the same
+  soft `{"warming_up": true}` body as `search` while startup was still in
+  progress. That body is success-shaped, so a client saw an OK result for a
+  write that never happened, and the memory was simply lost — the failure mode
+  the flaky `daemon_autospawn_race` test was surfacing. These tools now block on
+  a readiness gate and then perform the real write, or return `isError: true` if
+  readiness resolves failed or the wait times out. A success-shaped result is
+  once again equivalent to "the write happened." Requests that do not depend on
+  readiness at all — unknown tool, mode rejection, malformed arguments — are
+  still rejected up front rather than waiting out the timeout first.
+- **Startup readiness now has a terminal failed state, and reads report it
+  honestly.** Readiness was a bool, so a server that failed terminally at
+  startup was indistinguishable from one still warming up: `search` kept
+  returning an empty result set with "results will be available shortly", and a
+  client following the documented poll-until-`warming_up: false` loop would spin
+  forever against a server that was never coming up. Readiness is now a
+  three-state gate (pending / ready / failed, first resolution wins) — `search`
+  returns `isError: true` on a failed gate instead of the soft body, and
+  `status`, which stays answerable in every state because it is the diagnostic
+  endpoint, gained `readiness` (`"ready"` / `"warming_up"` / `"failed"`) and
+  `readiness_error` alongside the retained `warming_up` bool. Startup error
+  detail is sanitized into a client-facing reason rather than forwarded raw.
+- **A warm-up write no longer head-of-line blocks later requests on the same
+  connection.** Requests on a single connection are now pipelined, for both the
+  stdio transport and daemon connections, so a write parked on the readiness
+  gate no longer stalls every subsequent request behind it for the full
+  readiness timeout — reads stay serviceable while a write waits. Responses may
+  arrive out of request order; JSON-RPC 2.0 permits this and clients match
+  responses to requests by `id`. Waiters park without consuming a blocking-pool
+  thread each, so many concurrent parked writes cannot starve the runtime.
 
 ## [0.5.0] - 2026-07-07
 

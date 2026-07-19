@@ -37,8 +37,10 @@ Preferred tools:
 
 `ironmem serve` uses background warmup.
 
-- If `status` shows `warming_up: true`, avoid write-heavy memory actions until warmup completes.
-- Poll `status` and wait for `warming_up: false` before relying on embedding-dependent tools such as semantic search or drawer writes.
+- Writes are safe during warmup — do not defer or skip them. `add_drawer`, diary writes, and `code_map_write` block until readiness resolves (bounded by `IRONMEM_WRITE_READINESS_TIMEOUT_SECS`, default 90s) and then perform the real write, so a success result always means the write landed.
+- `search` returns a soft `{"warming_up": true, "results": []}` body while startup is still in progress. Treat that as "retry shortly", not as "no matches".
+- Read `readiness` from `status` — `"ready"`, `"warming_up"`, or `"failed"` — rather than polling the `warming_up` bool. `status` stays answerable in every state, including a broken one.
+- Treat `readiness: "failed"` as terminal: the server needs a restart and will never become ready. Surface `readiness_error` and stop polling. On a failed gate `search` reports an error instead of the soft body.
 
 ## Shared Daemon Transport
 

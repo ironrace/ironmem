@@ -8,16 +8,20 @@
 //! soon as readiness resolves, or a bounded timeout as a fail-safe crash
 //! guard so a handler never hangs forever.
 //!
-//! Read-shaped tools keep using the existing lock-free fast path via
-//! [`ReadinessGate::is_ready`] (mirrors today's `is_warming_up()` check).
-//! Write-shaped tools (wired up in a later task) will instead call
-//! [`ReadinessGate::wait_for_write`].
+//! Read-shaped tools branch on [`ReadinessGate::snapshot`], which
+//! distinguishes `Pending` (retry shortly) from `Failed` (this server is not
+//! coming up). The lock-free [`ReadinessGate::is_ready`] remains the "may I
+//! touch the embedder" check, but it collapses those two and so must not be
+//! what a client is told. Write-shaped tools — the set in
+//! `tools::WRITE_SHAPED_TOOLS` — block via [`ReadinessGate::wait_for_write`].
 //!
 //! The gate exposes both a blocking wait ([`ReadinessGate::wait_for_write`],
 //! for the synchronous tool handlers invoked from inside `block_in_place`)
-//! and an async one ([`ReadinessGate::wait_for_write_async`], for the daemon
-//! dispatch path). Both observe the same terminal state; the async variant
-//! exists so a waiter costs a task registration rather than an OS thread.
+//! and an async one ([`ReadinessGate::wait_for_write_async`], used by
+//! `server::dispatch_request` for BOTH transports). Both observe the same
+//! terminal state; the async variant exists so a waiter costs a task
+//! registration rather than an OS thread, and so the wait happens before the
+//! single-owner `dispatch` rather than inside it.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Condvar, Mutex};
@@ -39,13 +43,20 @@ pub const STARTUP_FAILURE_CLIENT_REASON: &str =
     "server memory initialization failed at startup; writes are unavailable until the \
      server is restarted (see server logs for details)";
 
-/// Internal terminal-resolution state guarded by the gate's `Mutex`.
+/// Terminal-resolution state guarded by the gate's `Mutex`.
 ///
 /// `Pending` is the only non-terminal state. Once the state transitions to
 /// `Ready` or `Failed`, it never changes again (first resolution wins — see
 /// [`ReadinessGate::resolve_ready`] / [`ReadinessGate::resolve_failed`]).
+///
+/// Read-shaped callers observe this through [`ReadinessGate::snapshot`] rather
+/// than the boolean [`ReadinessGate::is_ready`], because `Pending` and
+/// `Failed` are both "not ready" but mean opposite things to a client:
+/// `Pending` means poll again, `Failed` means this server will never come up.
+/// Collapsing them into one bool is what let a dead server report itself as a
+/// slow one indefinitely.
 #[derive(Debug, Clone, PartialEq, Eq)]
-enum ReadinessState {
+pub enum ReadinessState {
     Pending,
     Ready,
     Failed(String),
@@ -114,8 +125,26 @@ impl ReadinessGate {
     /// Lock-free readiness check. Preserves today's `is_warming_up()`
     /// semantics (`!memory_ready.load(Relaxed)`): a plain `Relaxed` load of
     /// the underlying `AtomicBool`, no stronger ordering introduced.
+    ///
+    /// Returns `false` for BOTH `Pending` and `Failed`. Callers that report
+    /// state to a client must use [`ReadinessGate::snapshot`] instead — see
+    /// [`ReadinessState`].
     pub fn is_ready(&self) -> bool {
         self.ready_flag.load(Ordering::Relaxed)
+    }
+
+    /// Full tri-state snapshot, for callers that have to tell a client the
+    /// difference between "still warming up" and "startup failed".
+    ///
+    /// Takes the mutex (unlike [`ReadinessGate::is_ready`]) because the
+    /// failure reason lives behind it. That is fine for the read-shaped tool
+    /// handlers that call this — they hold it only long enough to clone —
+    /// but it is not the lock-free fast path.
+    pub fn snapshot(&self) -> ReadinessState {
+        match self.state.lock() {
+            Ok(guard) => guard.clone(),
+            Err(poisoned) => poisoned.into_inner().clone(),
+        }
     }
 
     /// Resolves the gate to `Ready`, waking all current/future waiters.
@@ -226,7 +255,12 @@ impl ReadinessGate {
     /// work for the entire readiness timeout. Here a waiter costs a `Notify`
     /// registration instead.
     pub async fn wait_for_write_async(&self, timeout: Duration) -> Result<(), MemoryError> {
-        let deadline = Instant::now() + timeout;
+        // `Instant + Duration` PANICS on overflow, and `timeout` comes from an
+        // operator-supplied env var. A daemon serves every client in the
+        // process, so an absurd `IRONMEM_WRITE_READINESS_TIMEOUT_SECS` must
+        // degrade to "effectively forever", not take the server down for
+        // everyone. `checked_add` is the whole guard.
+        let deadline = Instant::now().checked_add(timeout);
         loop {
             // Register with `Notify` BEFORE reading the state. `notify_waiters`
             // only wakes already-registered waiters, and resolution publishes
@@ -242,6 +276,11 @@ impl ReadinessGate {
                 return result;
             }
 
+            // No representable deadline: wait without one rather than panicking.
+            let Some(deadline) = deadline else {
+                notified.await;
+                continue;
+            };
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() || tokio::time::timeout(remaining, notified).await.is_err() {
                 return Err(MemoryError::NotReady(format!(
