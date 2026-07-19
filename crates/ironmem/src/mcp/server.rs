@@ -217,14 +217,7 @@ where
     R: AsyncBufRead + Unpin,
     W: AsyncWrite + Unpin,
 {
-    // In-process stdio backend: dispatch synchronously against the local
-    // `App`, offloaded via `block_in_place` so blocking tool work doesn't
-    // stall the tokio reactor. A later shared-daemon backend swaps this
-    // closure for a channel round-trip to a single-owner dispatcher.
-    run_framing_loop(&app, reader, writer, TransportMode::Stdio, |request| {
-        tokio::task::block_in_place(|| dispatch(&app, request))
-    })
-    .await
+    run_framing_loop(&app, reader, writer, TransportMode::Stdio).await
 }
 
 /// Daemon-connection variant of [`run_server_io`] (H4): identical framing
@@ -243,22 +236,14 @@ where
     R: AsyncBufRead + Unpin,
     W: AsyncWrite + Unpin,
 {
-    run_framing_loop(
-        &app,
-        reader,
-        writer,
-        TransportMode::DaemonConnection,
-        |request| tokio::task::block_in_place(|| dispatch(&app, request)),
-    )
-    .await
+    run_framing_loop(&app, reader, writer, TransportMode::DaemonConnection).await
 }
 
 /// Per-connection MCP framing loop: read newline-delimited JSON-RPC requests
-/// from `reader`, hand each one to `dispatch_fn` to obtain a response, write
-/// the response to `writer`, and account response metrics. `dispatch_fn` is
-/// the dispatch backend — today an in-process synchronous call (see
-/// `run_server_io`), and in a future shared-daemon transport a channel
-/// round-trip to a single-owner dispatcher. `mode` (H4) controls whether this
+/// from `reader`, dispatch each one, write the response to `writer`, and
+/// account response metrics. Daemon write requests wait for readiness outside
+/// the single-owner dispatcher so they do not stall unrelated connections.
+/// `mode` (H4) controls whether this
 /// connection's `ConnectionContext` honors the `IRONMEM_SESSION_ID`/
 /// `IRONMEM_HARNESS` env overrides — see `TransportMode`. Metrics accounting
 /// needs access to `app` (for the DB + process-global collab/task-tag
@@ -267,17 +252,15 @@ where
 /// `ConnectionContext` for why that must not live on `App`), plus the
 /// original request (for tool name / session id / exploration context),
 /// independent of how the response was obtained.
-async fn run_framing_loop<R, W, F>(
+async fn run_framing_loop<R, W>(
     app: &Arc<App>,
     reader: R,
     writer: W,
     mode: TransportMode,
-    mut dispatch_fn: F,
 ) -> Result<(), MemoryError>
 where
     R: AsyncBufRead + Unpin,
     W: AsyncWrite + Unpin,
-    F: FnMut(&JsonRpcRequest) -> Option<JsonRpcResponse>,
 {
     let mut stdout = writer;
     let mut lines = reader.lines();
@@ -319,7 +302,10 @@ where
             conn.learn(&request.params);
         }
 
-        let response = dispatch_fn(&request);
+        let response = match mode {
+            TransportMode::Stdio => tokio::task::block_in_place(|| dispatch(app, &request)),
+            TransportMode::DaemonConnection => dispatch_daemon_request(app, &request).await,
+        };
 
         if let Some(resp) = response {
             // Extract the tool result JSON (if this is a successful tools/call)
@@ -363,6 +349,71 @@ async fn write_response(
     stdout.write_all(b"\n").await?;
     stdout.flush().await?;
     Ok(chars)
+}
+
+/// Write-shaped tools must wait for readiness, but the daemon's `App` is
+/// intentionally confined to one synchronous dispatcher thread. Waiting in a
+/// handler would park that dispatcher and prevent unrelated connections from
+/// receiving even their read-only warm-up responses. The gate itself is
+/// thread-safe, so wait on Tokio's blocking pool before entering `dispatch`;
+/// once ready, the normal synchronous handler remains serialized as before.
+async fn dispatch_daemon_request(
+    app: &Arc<App>,
+    request: &JsonRpcRequest,
+) -> Option<JsonRpcResponse> {
+    let tool_name = request.params.get("name").and_then(|value| value.as_str());
+    let is_write = request.method == "tools/call"
+        && matches!(
+            tool_name,
+            Some("add_drawer" | "diary_write" | "code_map_write")
+        );
+
+    if is_write && app.is_warming_up() {
+        let readiness = Arc::clone(&app.memory_ready);
+        let timeout = app.config.write_readiness_timeout();
+        match tokio::task::spawn_blocking(move || readiness.wait_for_write(timeout)).await {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                return Some(tool_error_response(request.id.clone(), tool_name, error))
+            }
+            Err(error) => {
+                return Some(tool_error_response(
+                    request.id.clone(),
+                    tool_name,
+                    MemoryError::NotReady(format!("readiness wait task failed: {error}")),
+                ));
+            }
+        }
+    }
+
+    tokio::task::block_in_place(|| dispatch(app, request))
+}
+
+fn tool_error_response(
+    id: Option<serde_json::Value>,
+    tool_name: Option<&str>,
+    error: MemoryError,
+) -> JsonRpcResponse {
+    tracing::error!(request_id = ?id, "Tool error in {}: {}", tool_name.unwrap_or("<unknown>"), error);
+    let user_message = match &error {
+        MemoryError::Validation(message)
+        | MemoryError::NotFound(message)
+        | MemoryError::Permission(message)
+        | MemoryError::NotReady(message) => message.clone(),
+        MemoryError::Json(error) => format!("invalid JSON: {error}"),
+        MemoryError::Config(message) => format!("config error: {message}"),
+        _ => "Internal server error".to_string(),
+    };
+    JsonRpcResponse::success(
+        id,
+        serde_json::json!({
+            "content": [{
+                "type": "text",
+                "text": serde_json::json!({"error": user_message}).to_string()
+            }],
+            "isError": true
+        }),
+    )
 }
 
 pub fn dispatch(app: &App, request: &JsonRpcRequest) -> Option<JsonRpcResponse> {
@@ -409,28 +460,7 @@ pub fn dispatch(app: &App, request: &JsonRpcRequest) -> Option<JsonRpcResponse> 
                                 }]
                             }),
                         )),
-                        Err(e) => {
-                            tracing::error!(request_id = ?id, "Tool error in {}: {}", name, e);
-                            let user_message = match &e {
-                                MemoryError::Validation(msg) => msg.clone(),
-                                MemoryError::NotFound(msg) => msg.clone(),
-                                MemoryError::Permission(msg) => msg.clone(),
-                                MemoryError::Json(err) => format!("invalid JSON: {err}"),
-                                MemoryError::Config(msg) => format!("config error: {msg}"),
-                                MemoryError::NotReady(msg) => msg.clone(),
-                                _ => "Internal server error".to_string(),
-                            };
-                            Some(JsonRpcResponse::success(
-                                id,
-                                serde_json::json!({
-                                    "content": [{
-                                        "type": "text",
-                                        "text": serde_json::json!({"error": user_message}).to_string()
-                                    }],
-                                    "isError": true
-                                }),
-                            ))
-                        }
+                        Err(error) => Some(tool_error_response(id, Some(name), error)),
                     }
                 }
                 None => Some(JsonRpcResponse::error(id, -32602, "Missing tool name")),
@@ -450,6 +480,9 @@ pub fn dispatch(app: &App, request: &JsonRpcRequest) -> Option<JsonRpcResponse> 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::mcp::readiness::ReadinessGate;
+    use serde_json::json;
+    use std::time::Duration;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     async fn run_with_input(input: &str) -> String {
@@ -500,6 +533,68 @@ mod tests {
         let mut output = String::new();
         client_out.read_to_string(&mut output).await.unwrap();
         assert!(output.contains("\"protocolVersion\":\"2024-11-05\""));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn daemon_warmup_write_wait_does_not_block_a_read_only_request() {
+        #[allow(clippy::arc_with_non_send_sync)]
+        let mut app = Arc::new(App::open_for_test().unwrap());
+        let readiness = Arc::new(ReadinessGate::new_pending());
+        Arc::get_mut(&mut app)
+            .expect("test has the only App reference")
+            .memory_ready = Arc::clone(&readiness);
+
+        let write: JsonRpcRequest = serde_json::from_value(json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {
+                "name": "add_drawer",
+                "arguments": {"content": "queued write", "wing": "race"}
+            }
+        }))
+        .unwrap();
+        let search: JsonRpcRequest = serde_json::from_value(json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "tools/call",
+            "params": {"name": "search", "arguments": {"query": "queued"}}
+        }))
+        .unwrap();
+
+        let write_wait = dispatch_daemon_request(&app, &write);
+        tokio::pin!(write_wait);
+
+        // Polling the warm-up write first must yield to the readiness wait.
+        // If that wait occupied the daemon's single dispatcher, this search
+        // call would not complete before the gate resolves.
+        let search_response = tokio::time::timeout(
+            Duration::from_millis(250),
+            dispatch_daemon_request(&app, &search),
+        )
+        .await
+        .expect("read-only search must stay responsive while a write waits")
+        .expect("search produces a response");
+        assert_eq!(search_response.id, Some(json!(2)));
+        assert_eq!(
+            search_response.result.unwrap()["content"][0]["text"]
+                .as_str()
+                .and_then(|text| serde_json::from_str::<serde_json::Value>(text).ok())
+                .and_then(|payload| payload["warming_up"].as_bool()),
+            Some(true)
+        );
+
+        readiness.resolve_ready();
+        let write_response = tokio::time::timeout(Duration::from_secs(1), &mut write_wait)
+            .await
+            .expect("write must resume when readiness resolves")
+            .expect("write produces a response");
+        assert_eq!(write_response.id, Some(json!(1)));
+        assert_ne!(
+            write_response.result.unwrap()["isError"].as_bool(),
+            Some(true),
+            "resolved write must not become an error"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]
