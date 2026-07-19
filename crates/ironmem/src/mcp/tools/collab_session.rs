@@ -1098,21 +1098,40 @@ pub(super) fn handle_collab_approve(app: &App, args: &Value) -> Result<Value, Me
     })
 }
 
-pub(super) fn handle_collab_wait_my_turn(app: &App, args: &Value) -> Result<Value, MemoryError> {
-    let session_id = require_str(args, "session_id")?;
-    ensure_no_conflicting_process_session(app, session_id)?;
-    let agent = require_agent(require_str(args, "agent")?)?;
-    let timeout_secs = args
+/// Gap between `collab_wait_my_turn` snapshot reads.
+pub(super) const WAIT_MY_TURN_POLL_INTERVAL: std::time::Duration =
+    std::time::Duration::from_millis(WAIT_MY_TURN_POLL_MS);
+
+/// How long `collab_wait_my_turn` polls before answering "not your turn".
+///
+/// Parsed in ONE place so the asynchronous long-poll in `server` and the
+/// synchronous fallback below cannot disagree about the bound — a disagreement
+/// would show up as a wait that returns early or runs long, both of which look
+/// like protocol bugs rather than a parsing difference.
+pub(super) fn wait_my_turn_timeout(args: &Value) -> std::time::Duration {
+    let secs = args
         .get("timeout_secs")
         .and_then(Value::as_u64)
         .unwrap_or(WAIT_MY_TURN_DEFAULT_TIMEOUT_SECS)
         .clamp(1, WAIT_MY_TURN_MAX_TIMEOUT_SECS);
+    std::time::Duration::from_secs(secs)
+}
 
-    // Run the generation guard in its own transaction before the polling loop:
-    // the polling loop makes no collab-state write that must be atomic with the
-    // claim, and a token claim commits unconditionally before polling begins, so
-    // the process cache update is correct even if the session snapshot is read
-    // later in a separate connection.
+/// Validate the arguments and settle the generation, once, before any polling.
+///
+/// Run in its own transaction ahead of the loop: the loop makes no collab-state
+/// write that must be atomic with the claim, and a token claim commits
+/// unconditionally before polling begins, so the process cache update is
+/// correct even if the session snapshot is read later on a separate connection.
+///
+/// Split out of the handler so the claim happens exactly ONCE per request even
+/// when the polling is driven from outside — claiming on every poll would try
+/// to re-consume a one-time handoff token and fail on the second iteration.
+pub(super) fn wait_my_turn_begin(app: &App, args: &Value) -> Result<(), MemoryError> {
+    let session_id = require_str(args, "session_id")?;
+    ensure_no_conflicting_process_session(app, session_id)?;
+    let agent = require_agent(require_str(args, "agent")?)?;
+
     app.db.with_transaction(|tx| {
         super::handoff::ensure_actor_generation_current(
             app,
@@ -1121,34 +1140,52 @@ pub(super) fn handle_collab_wait_my_turn(app: &App, args: &Value) -> Result<Valu
             agent,
             super::handoff::opt_handoff_token(args).as_deref(),
         )
-    })?;
+    })
+}
 
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
-    let poll_interval = std::time::Duration::from_millis(WAIT_MY_TURN_POLL_MS);
-    let mut cell_set = false;
+/// One snapshot read. Returns the response body and whether it SETTLES the wait
+/// — my turn, session ended, or a terminal phase — i.e. whether the caller
+/// should stop polling before the deadline.
+///
+/// Deliberately free of sleeping and of any write, so a caller can drive it
+/// from an async loop without holding the dispatch thread across the wait.
+pub(super) fn wait_my_turn_poll(app: &App, args: &Value) -> Result<(Value, bool), MemoryError> {
+    let session_id = require_str(args, "session_id")?;
+    let agent = require_agent(require_str(args, "agent")?)?;
 
+    let record = app.db.collab_load_session_record(session_id)?;
+    app.set_active_collab_session(session_id);
+    let snap = wait_turn_snapshot(&record, agent);
+    let settled = snap.is_my_turn || snap.ended || snap.phase_is_terminal;
+
+    Ok((
+        json!({
+            "is_my_turn": snap.is_my_turn,
+            "phase": snap.phase,
+            "current_owner": snap.current_owner,
+            "session_ended": snap.ended,
+        }),
+        settled,
+    ))
+}
+
+/// Synchronous fallback for callers that reach `call_tool`/`dispatch` directly.
+///
+/// `server::dispatch_wait_my_turn` normally drives the same primitives with an
+/// ASYNC sleep, because this loop's `std::thread::sleep` would otherwise hold
+/// the single dispatch thread — and therefore every connection — for the whole
+/// timeout. Kept so the tool still behaves correctly for direct callers.
+pub(super) fn handle_collab_wait_my_turn(app: &App, args: &Value) -> Result<Value, MemoryError> {
+    let timeout = wait_my_turn_timeout(args);
+    wait_my_turn_begin(app, args)?;
+
+    let deadline = std::time::Instant::now() + timeout;
     loop {
-        let record = app.db.collab_load_session_record(session_id)?;
-        if !cell_set {
-            app.set_active_collab_session(session_id);
-            cell_set = true;
+        let (body, settled) = wait_my_turn_poll(app, args)?;
+        if settled || std::time::Instant::now() >= deadline {
+            return Ok(body);
         }
-        let snap = wait_turn_snapshot(&record, agent);
-
-        if snap.is_my_turn
-            || snap.ended
-            || snap.phase_is_terminal
-            || std::time::Instant::now() >= deadline
-        {
-            return Ok(json!({
-                "is_my_turn": snap.is_my_turn,
-                "phase": snap.phase,
-                "current_owner": snap.current_owner,
-                "session_ended": snap.ended,
-            }));
-        }
-
-        std::thread::sleep(poll_interval);
+        std::thread::sleep(WAIT_MY_TURN_POLL_INTERVAL);
     }
 }
 

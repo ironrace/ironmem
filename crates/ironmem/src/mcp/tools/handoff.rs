@@ -765,9 +765,14 @@ gates: passed\n";
     }
 
     /// The no-token path of `ensure_actor_generation_current` must not create a
-    /// lease row in `collab_actor_generations`. This proves that read-only/restricted
-    /// tools that call this guard (e.g. `collab_recv`, `collab_wait_my_turn`) do not
-    /// write a DB row on the no-token path.
+    /// lease row in `collab_actor_generations`.
+    ///
+    /// `collab_recv` and `collab_wait_my_turn` are conditionally mutating
+    /// (`tools::CONDITIONALLY_MUTATING_TOOLS`): WITH a `handoff_token` they claim
+    /// the lease and are classified as writes, and without one they are reads.
+    /// This pins the second half — that the no-token path really writes nothing —
+    /// which is what makes classifying those calls as reads honest rather than
+    /// merely convenient.
     #[test]
     fn guard_no_token_does_not_create_lease_row() {
         let (app, _dir) = test_handoff_app();

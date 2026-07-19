@@ -560,7 +560,7 @@ pub fn call_tool(app: &App, name: &str, args: &Value) -> Result<Value, MemoryErr
     if !tool_known(name) {
         return Err(MemoryError::NotFound(format!("Unknown tool: {name}")));
     }
-    ensure_tool_allowed(app, name)?;
+    ensure_tool_allowed(app, name, args)?;
     // The single readiness wait for every write-shaped tool, driven off
     // `WRITE_SHAPED_TOOLS` rather than opted into by each handler. Handlers
     // used to call `wait_for_write_ready` individually, which meant a new
@@ -671,7 +671,7 @@ pub(crate) fn precheck_write_request(
     if !tool_known(name) {
         return Err(MemoryError::NotFound(format!("Unknown tool: {name}")));
     }
-    ensure_tool_allowed(app, name)?;
+    ensure_tool_allowed(app, name, args)?;
     match name {
         "add_drawer" => drawers::validate_add_drawer_args(args).map(drop),
         "diary_write" => diary::validate_diary_write_args(args).map(drop),
@@ -767,13 +767,105 @@ pub(crate) const MUTATING_TOOLS: &[&str] = &[
     "symbol_graph_index",
 ];
 
-/// Every advertised tool that does NOT persist state.
+/// A tool that persists state for SOME arguments and not others.
+///
+/// `collab_recv` is the motivating case: it is a read, but with
+/// `auto_ack: true` it acks every message it returns in the same transaction
+/// (`collab_session::handle_collab_recv`). Classifying it by NAME alone gets
+/// one of the two cases wrong — as "read" it slipped through read-only mode
+/// and past the framing loop's ordering barrier while genuinely writing; as
+/// "mutating" it would stop plain `collab_recv` working in read-only mode at
+/// all, which is how review agents read collab traffic without acking it.
+///
+/// So classification is per-CALL, not per-tool: see [`is_mutating_call`].
+pub(crate) struct ConditionalMutation {
+    /// The tool this describes.
+    pub name: &'static str,
+    /// Whether THIS call persists state. Must be a PURE function of the
+    /// request: the framing loop asks it once to enqueue a mutation and again
+    /// to release the barrier, and a predicate that answered differently the
+    /// second time would leave `mutation_in_flight` set forever, hanging every
+    /// later write on that connection with no error and no log.
+    pub mutates: fn(&Value) -> bool,
+    /// Named in the read-only rejection so a client learns which argument to
+    /// drop, rather than being told the whole tool is disabled.
+    pub trigger: &'static str,
+    /// Arguments that MUST classify as a write, and as a read.
+    /// `conditionally_mutating_tools_actually_flip` runs every witness through
+    /// `mutates`, so an entry whose argument was renamed — or whose handler
+    /// stopped writing — fails loudly instead of sitting here decoratively
+    /// while `is_mutating_call` quietly returns false for every call.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub mutating_witnesses: &'static [&'static str],
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub read_witnesses: &'static [&'static str],
+}
+
+/// Presence of a non-empty `handoff_token`, which makes an otherwise-read
+/// collab call claim the generation lease (`handoff::claim_handoff_token`).
+///
+/// Delegates to `handoff::opt_handoff_token` — the same function the handlers
+/// pass to `ensure_actor_generation_current` — so "is this a write?" cannot
+/// drift from "does this actually claim?".
+fn claims_handoff_token(args: &Value) -> bool {
+    handoff::opt_handoff_token(args).is_some()
+}
+
+/// `collab_recv` writes two different ways: `auto_ack` acks every message it
+/// returns, and `handoff_token` claims the generation lease.
+fn collab_recv_mutates(args: &Value) -> bool {
+    args.get("auto_ack")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+        || claims_handoff_token(args)
+}
+
+/// Every tool that writes only for certain arguments.
+///
+/// Both entries are collab reads that take `handoff_token`; `collab_recv` adds
+/// `auto_ack`. Every OTHER `ensure_actor_generation_current` caller
+/// (`collab_send`, `collab_ack`, `collab_approve`, `collab_end`,
+/// `collab_set_implementer`, `collab_register_caps`) is already in
+/// [`MUTATING_TOOLS`], so this list plus that one covers the whole guard.
+pub(crate) const CONDITIONALLY_MUTATING_TOOLS: &[ConditionalMutation] = &[
+    ConditionalMutation {
+        name: "collab_recv",
+        mutates: collab_recv_mutates,
+        trigger: "auto_ack (acks the messages it returns) or handoff_token \
+                  (claims the generation lease)",
+        mutating_witnesses: &[
+            r#"{"auto_ack": true}"#,
+            r#"{"handoff_token": "tok"}"#,
+            r#"{"auto_ack": false, "handoff_token": "tok"}"#,
+        ],
+        read_witnesses: &[
+            "{}",
+            r#"{"auto_ack": false}"#,
+            r#"{"handoff_token": ""}"#,
+            r#"{"handoff_token": null}"#,
+        ],
+    },
+    ConditionalMutation {
+        name: "collab_wait_my_turn",
+        mutates: claims_handoff_token,
+        trigger: "handoff_token (claims the generation lease)",
+        mutating_witnesses: &[r#"{"handoff_token": "tok"}"#],
+        // `auto_ack` is meaningless here, so it must NOT flip this tool — a
+        // witness that would catch the two predicates being wired up swapped.
+        read_witnesses: &["{}", r#"{"auto_ack": true}"#, r#"{"handoff_token": ""}"#],
+    },
+];
+
+/// Every advertised tool that does NOT persist state under ANY arguments.
 ///
 /// Exists solely so `write_shaped_tools_are_a_subset_of_mutating_tools` can
 /// require every advertised tool to be explicitly classified. Without it a
 /// newly added tool defaults to "read" by omission — permitted in read-only
 /// mode and free to overtake a parked write in the framing loop's ordering
 /// barrier — with nothing to catch it.
+///
+/// A tool that writes only for certain arguments belongs in
+/// [`CONDITIONALLY_MUTATING_TOOLS`], not here.
 #[cfg(test)]
 pub(crate) const READ_ONLY_TOOLS: &[&str] = &[
     "status",
@@ -789,10 +881,8 @@ pub(crate) const READ_ONLY_TOOLS: &[&str] = &[
     "find_tunnels",
     "graph_stats",
     "diary_read",
-    "collab_recv",
     "collab_status",
     "collab_get_caps",
-    "collab_wait_my_turn",
     "code_map_load",
     "code_map_status",
     "symbol_lookup",
@@ -803,11 +893,75 @@ pub(crate) const READ_ONLY_TOOLS: &[&str] = &[
     "symbol_graph_neighbors",
 ];
 
-/// Whether `name` persists state — see [`MUTATING_TOOLS`].
+/// Whether `name` persists state for EVERY call — see [`MUTATING_TOOLS`].
+///
+/// Prefer [`is_mutating_call`] anywhere the arguments are in hand: this
+/// answers "is this tool always a write?", which is False for a
+/// conditionally-mutating tool even on the call where it does write.
 pub(crate) fn is_mutating_tool(name: &str) -> bool {
     MUTATING_TOOLS.contains(&name)
 }
 
+/// The conditional-mutation entry for `name`, if it has one.
+fn conditional_mutation(name: &str) -> Option<&'static ConditionalMutation> {
+    CONDITIONALLY_MUTATING_TOOLS
+        .iter()
+        .find(|entry| entry.name == name)
+}
+
+/// Whether THIS CALL persists state: always-mutating tools, plus
+/// conditionally-mutating ones whose write-triggering argument is set.
+///
+/// This — not [`is_mutating_tool`] — is what read-only mode gating and the
+/// framing loop's ordering barrier ask, so a write cannot escape either by
+/// hiding behind a read's tool name.
+pub(crate) fn is_mutating_call(name: &str, args: &Value) -> bool {
+    is_mutating_tool(name) || conditional_mutation(name).is_some_and(|entry| (entry.mutates)(args))
+}
+
+/// Gap between `collab_wait_my_turn` snapshot reads, for the async long-poll
+/// driver in `server`.
+pub(crate) const WAIT_MY_TURN_POLL_INTERVAL: std::time::Duration =
+    collab_session::WAIT_MY_TURN_POLL_INTERVAL;
+
+/// How long a `collab_wait_my_turn` call should poll — see
+/// [`collab_session::wait_my_turn_timeout`].
+pub(crate) fn wait_my_turn_timeout(args: &Value) -> std::time::Duration {
+    collab_session::wait_my_turn_timeout(args)
+}
+
+/// Mode-gate, validate, and settle the generation for a `collab_wait_my_turn`
+/// call, once, before polling starts.
+///
+/// Carries the mode gating that `call_tool` would otherwise apply: the async
+/// long-poll path in `server` bypasses `call_tool`, so without this a
+/// `handoff_token` claim would skip read-only enforcement entirely.
+pub(crate) fn wait_my_turn_begin(app: &App, args: &Value) -> Result<(), MemoryError> {
+    ensure_tool_allowed(app, "collab_wait_my_turn", args)?;
+    collab_session::wait_my_turn_begin(app, args)
+}
+
+/// One non-blocking `collab_wait_my_turn` snapshot — see
+/// [`collab_session::wait_my_turn_poll`].
+pub(crate) fn wait_my_turn_poll(app: &App, args: &Value) -> Result<(Value, bool), MemoryError> {
+    collab_session::wait_my_turn_poll(app, args)
+}
+
+/// Mode gating for a call whose arguments are known. `tool_allowed_in_mode` is
+/// the name-only form used for ADVERTISING, where no arguments exist yet.
+fn call_allowed_in_mode(mode: McpAccessMode, name: &str, args: &Value) -> bool {
+    if !tool_known(name) {
+        return false;
+    }
+    mode.allows_writes() || !is_mutating_call(name, args)
+}
+
+/// Whether `name` may be advertised at all in `mode`.
+///
+/// Deliberately argument-blind, and deliberately permissive for a
+/// conditionally-mutating tool: `collab_recv` stays advertised in read-only
+/// mode because plain `collab_recv` genuinely works there. The write-triggering
+/// argument is rejected per call by [`call_allowed_in_mode`].
 fn tool_allowed_in_mode(mode: McpAccessMode, name: &str) -> bool {
     if !tool_known(name) {
         return false;
@@ -815,18 +969,35 @@ fn tool_allowed_in_mode(mode: McpAccessMode, name: &str) -> bool {
     mode.allows_writes() || !is_mutating_tool(name)
 }
 
-fn ensure_tool_allowed(app: &App, name: &str) -> Result<(), MemoryError> {
-    if tool_allowed_in_mode(app.config.mcp_access_mode, name) {
-        Ok(())
-    } else {
-        Err(MemoryError::Permission(format!(
-            "Tool '{name}' is disabled when IRONMEM_MCP_MODE={}",
-            match app.config.mcp_access_mode {
-                McpAccessMode::Trusted => "trusted",
-                McpAccessMode::ReadOnly => "read-only",
-                McpAccessMode::Restricted => "restricted",
-            }
-        )))
+fn ensure_tool_allowed(app: &App, name: &str, args: &Value) -> Result<(), MemoryError> {
+    if call_allowed_in_mode(app.config.mcp_access_mode, name, args) {
+        return Ok(());
+    }
+    // A conditionally-mutating tool rejected for its ARGUMENT gets a message
+    // that says so: "collab_recv is disabled" would be actively misleading when
+    // dropping one argument makes the same call succeed.
+    if !is_mutating_tool(name) {
+        if let Some(entry) = conditional_mutation(name) {
+            return Err(MemoryError::Permission(format!(
+                "Tool '{name}' persists state for this call — {} — which is disabled \
+                 when IRONMEM_MCP_MODE={}; call it without that argument to read \
+                 without writing",
+                entry.trigger,
+                mode_label(app.config.mcp_access_mode),
+            )));
+        }
+    }
+    Err(MemoryError::Permission(format!(
+        "Tool '{name}' is disabled when IRONMEM_MCP_MODE={}",
+        mode_label(app.config.mcp_access_mode)
+    )))
+}
+
+fn mode_label(mode: McpAccessMode) -> &'static str {
+    match mode {
+        McpAccessMode::Trusted => "trusted",
+        McpAccessMode::ReadOnly => "read-only",
+        McpAccessMode::Restricted => "restricted",
     }
 }
 
@@ -888,16 +1059,132 @@ mod tests {
         let app = App::open_for_test().unwrap();
         for tool in tool_definitions(&app) {
             let name = tool["name"].as_str().expect("advertised tool needs a name");
-            assert!(
-                is_mutating_tool(name) || READ_ONLY_TOOLS.contains(&name),
-                "{name} is advertised but classified as neither mutating nor \
-                 read-only — add it to MUTATING_TOOLS or READ_ONLY_TOOLS"
-            );
-            assert!(
-                !(is_mutating_tool(name) && READ_ONLY_TOOLS.contains(&name)),
-                "{name} is classified as both mutating and read-only"
+            let classifications = [
+                is_mutating_tool(name),
+                conditional_mutation(name).is_some(),
+                READ_ONLY_TOOLS.contains(&name),
+            ];
+            let count = classifications.iter().filter(|held| **held).count();
+            assert_eq!(
+                count, 1,
+                "{name} is advertised but has {count} classifications; it must be in \
+                 EXACTLY one of MUTATING_TOOLS, CONDITIONALLY_MUTATING_TOOLS, or \
+                 READ_ONLY_TOOLS (got mutating={}, conditional={}, read-only={})",
+                classifications[0], classifications[1], classifications[2]
             );
         }
+    }
+
+    /// A conditionally-mutating entry is only worth anything if the argument it
+    /// names actually flips the classification. A stale entry — the argument
+    /// renamed, or the handler's write removed — would otherwise sit here
+    /// looking like enforcement while `is_mutating_call` returned false for
+    /// every call, silently restoring the read-only bypass this list exists to
+    /// close.
+    #[test]
+    fn conditionally_mutating_tools_actually_flip() {
+        for entry in CONDITIONALLY_MUTATING_TOOLS {
+            let name = entry.name;
+            assert!(
+                tool_known(name),
+                "{name} is listed as conditionally mutating but is not a known tool"
+            );
+            assert!(
+                !is_mutating_tool(name),
+                "{name} is in CONDITIONALLY_MUTATING_TOOLS and MUTATING_TOOLS; the \
+                 conditional entry is then dead — it is already always a write"
+            );
+            assert!(
+                !entry.mutating_witnesses.is_empty() && !entry.read_witnesses.is_empty(),
+                "{name} needs witnesses in BOTH directions, or this test cannot tell \
+                 a working predicate from one stuck at a constant"
+            );
+
+            for witness in entry.mutating_witnesses {
+                let args: Value = serde_json::from_str(witness)
+                    .unwrap_or_else(|e| panic!("{name} witness {witness} must parse: {e}"));
+                assert!(
+                    is_mutating_call(name, &args),
+                    "{name}{witness} must classify as a WRITE, or it bypasses read-only \
+                     mode and the framing loop's ordering barrier while genuinely writing"
+                );
+            }
+
+            for witness in entry.read_witnesses {
+                let args: Value = serde_json::from_str(witness)
+                    .unwrap_or_else(|e| panic!("{name} witness {witness} must parse: {e}"));
+                assert!(
+                    !is_mutating_call(name, &args),
+                    "{name}{witness} must classify as a READ, or plain calls stop \
+                     working in read-only mode and queue behind the write barrier"
+                );
+            }
+        }
+    }
+
+    /// The generation-lease claim is a write, and it hides behind two tools
+    /// whose names read as pure queries. Pinned separately from the witness
+    /// loop because the danger is a tool being absent from
+    /// `CONDITIONALLY_MUTATING_TOOLS` entirely — which the loop, iterating that
+    /// same list, is structurally blind to.
+    #[test]
+    fn handoff_token_makes_every_read_shaped_collab_tool_a_write() {
+        let claiming = json!({"handoff_token": "tok"});
+        for name in ["collab_recv", "collab_wait_my_turn"] {
+            assert!(
+                is_mutating_call(name, &claiming),
+                "{name} with a handoff_token claims the generation lease \
+                 (handoff::claim_handoff_token) — it must classify as a write"
+            );
+            assert!(
+                !is_mutating_call(name, &json!({})),
+                "{name} without a handoff_token is a read"
+            );
+        }
+    }
+
+    /// The bypass this whole classification change exists to close, asserted at
+    /// the gating layer rather than through the list constants: under
+    /// `read-only`, a plain `collab_recv` must still work while the same call
+    /// with `auto_ack:true` — which acks every message it returns — must be
+    /// refused.
+    #[test]
+    fn read_only_mode_refuses_auto_ack_but_allows_plain_recv() {
+        assert!(
+            call_allowed_in_mode(McpAccessMode::ReadOnly, "collab_recv", &json!({})),
+            "plain collab_recv is a read and must stay available in read-only mode"
+        );
+        assert!(
+            call_allowed_in_mode(
+                McpAccessMode::ReadOnly,
+                "collab_recv",
+                &json!({"auto_ack": false})
+            ),
+            "collab_recv with auto_ack:false is a read"
+        );
+        assert!(
+            !call_allowed_in_mode(
+                McpAccessMode::ReadOnly,
+                "collab_recv",
+                &json!({"auto_ack": true})
+            ),
+            "collab_recv with auto_ack:true acks messages — read-only mode must refuse it"
+        );
+        assert!(
+            call_allowed_in_mode(
+                McpAccessMode::Trusted,
+                "collab_recv",
+                &json!({"auto_ack": true})
+            ),
+            "trusted mode allows writes, so auto_ack is fine there"
+        );
+
+        // Still ADVERTISED in read-only mode: the tool is usable there, just not
+        // with that argument. Dropping it from the list would hide the read.
+        assert!(
+            tool_allowed_in_mode(McpAccessMode::ReadOnly, "collab_recv"),
+            "collab_recv must remain advertised in read-only mode"
+        );
     }
 
     /// Each entry is a real tool with its own `precheck_write_request` arm, so

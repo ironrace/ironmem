@@ -686,7 +686,11 @@ Write-shaped tools (`add_drawer`, diary writes, `code_map_write`) never return t
 
 A client that polls must treat `readiness: "failed"` as terminal — the server needs a restart — and stop polling rather than waiting for a `warming_up: false` that will never arrive.
 
-Requests on a single connection are pipelined, for both the stdio transport and daemon connections, so a write parked on the readiness gate does not block later requests on that same connection. Reads may therefore be answered out of request order; clients match responses to requests by `id`, so order is not significant. Mutations are held to their arrival order.
+Requests on a single connection are pipelined, for both the stdio transport and daemon connections, so a write parked on the readiness gate does not block later requests on that same connection. Reads may therefore be answered out of request order; clients match responses to requests by `id`, so order is not significant.
+
+Mutations are held to their arrival order and run one at a time per connection. The guarantee is that **no mutation executes after a mutation that was refused on the same connection**: each write is either executed in arrival order or refused, and once one is refused for backlog overflow (more than 64 writes queued), later writes on that connection are refused too until the backlog drains. So a `delete_drawer` can never land without the `add_drawer` it was meant to follow. Reads are never refused by this rule and continue to be answered throughout.
+
+A write is classified by its arguments, not just its name — `collab_recv` with `auto_ack: true` acks the messages it returns, and any collab call carrying a `handoff_token` claims the generation lease, so both count as writes for ordering and for `IRONMEM_MCP_MODE` gating. In read-only mode a plain `collab_recv` still works; only the write-triggering argument is refused.
 
 ## Benchmarking
 

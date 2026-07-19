@@ -96,6 +96,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   arrive out of request order; JSON-RPC 2.0 permits this and clients match
   responses to requests by `id`. Waiters park without consuming a blocking-pool
   thread each, so many concurrent parked writes cannot starve the runtime.
+- **Writes hidden behind read-shaped tool names are now classified as writes.**
+  Whether a call mutates is decided from its ARGUMENTS, not just its tool name.
+  `collab_recv` with `auto_ack: true` acks every message it returns, and any
+  collab call carrying a `handoff_token` claims the generation lease — all of
+  these persist state while being named like queries. Classified as reads, they
+  were permitted under `IRONMEM_MCP_MODE=read-only` and were free to overtake a
+  write parked on the readiness gate. They are now gated and ordered as the
+  writes they are. Plain `collab_recv` remains a read and keeps working in
+  read-only mode; only the write-triggering argument is refused, and refused
+  explicitly rather than silently downgraded.
+- **Overflowing the write backlog no longer breaks write ordering.** When more
+  than 64 writes were queued on one connection the overflowing write was
+  rejected, but writes arriving behind it still ran — so a `delete_drawer` could
+  land without the `add_drawer` it was meant to follow, the exact inversion the
+  ordering barrier exists to prevent. A rejection now blocks that connection's
+  later writes until the backlog drains, making the documented guarantee literal:
+  no mutation executes after a mutation that was refused. Reads are never
+  refused by this rule and keep being answered throughout. The two refusals
+  carry distinct messages so a client can tell which write broke its sequence.
+- **A `collab_wait_my_turn` long poll no longer freezes the whole daemon.**
+  The tool polls for up to 60 seconds, and it did so with `std::thread::sleep`
+  inside the synchronous dispatch path — which, as the daemon's own design notes
+  state, "stalls this thread, and with it every connection, for its duration."
+  One agent waiting its turn therefore blocked every other connected client for
+  up to a minute, violating the "dispatch is short" assumption the daemon's
+  lock-free single-owner model is built on. The generation claim and each
+  snapshot read remain short synchronous steps, but the wait between them is now
+  asynchronous and yields the thread, so unrelated requests are served while an
+  agent waits. Timing out is measured from when the request arrived, so queueing
+  no longer extends the client's requested timeout.
 
 ## [0.5.0] - 2026-07-07
 
