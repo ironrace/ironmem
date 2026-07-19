@@ -565,9 +565,25 @@ mod tests {
         let write_wait = dispatch_daemon_request(&app, &write);
         tokio::pin!(write_wait);
 
-        // Polling the warm-up write first must yield to the readiness wait.
-        // If that wait occupied the daemon's single dispatcher, this search
-        // call would not complete before the gate resolves.
+        // Rust futures are lazy: constructing `write_wait` does NOT start the
+        // write. Drive it here so it genuinely reaches its readiness await
+        // point and is in flight for the rest of this test. It must still be
+        // pending afterwards — the gate is unresolved, so a correct dispatch
+        // cannot have produced a response yet. Without this step the test
+        // would pass even if the readiness wait were serialized inside the
+        // single-owner dispatcher, because no write would ever be in flight.
+        let still_pending = tokio::time::timeout(Duration::from_millis(250), &mut write_wait).await;
+        assert!(
+            still_pending.is_err(),
+            "warm-up write must still be waiting on the unresolved readiness gate, \
+             got a completed response instead: {:?}",
+            still_pending.ok().flatten()
+        );
+
+        // With a write genuinely parked on the readiness gate, a read-only
+        // request must still be serviced. If that wait occupied the daemon's
+        // single dispatcher, this search call would not complete before the
+        // gate resolves.
         let search_response = tokio::time::timeout(
             Duration::from_millis(250),
             dispatch_daemon_request(&app, &search),

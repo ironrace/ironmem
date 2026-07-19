@@ -247,15 +247,41 @@ mod tests {
         );
     }
 
+    /// Spawns a waiter thread and returns `(handle, finished)` where
+    /// `finished` flips to `true` only once `wait_for_write` has returned.
+    ///
+    /// The flag is what makes the two tests below able to fail for the reason
+    /// they exist: without it, a gate whose `wait_for_write` returned straight
+    /// away without ever blocking would still satisfy the final
+    /// `Ok`/`Err` assertion, so the "waits until resolution, then wakes"
+    /// contract would go untested.
+    fn spawn_waiter(
+        gate: &Arc<ReadinessGate>,
+    ) -> (thread::JoinHandle<Result<(), MemoryError>>, Arc<AtomicBool>) {
+        let finished = Arc::new(AtomicBool::new(false));
+        let waiter_gate = Arc::clone(gate);
+        let waiter_finished = Arc::clone(&finished);
+        let handle = thread::spawn(move || {
+            let result = waiter_gate.wait_for_write(Duration::from_secs(5));
+            waiter_finished.store(true, Ordering::SeqCst);
+            result
+        });
+        (handle, finished)
+    }
+
     #[test]
     fn waiter_wakes_on_resolve_ready() {
         let gate = Arc::new(ReadinessGate::new_pending());
         assert!(!gate.is_ready());
 
-        let waiter_gate = Arc::clone(&gate);
-        let waiter = thread::spawn(move || waiter_gate.wait_for_write(Duration::from_secs(5)));
+        let (waiter, finished) = spawn_waiter(&gate);
 
         thread::sleep(Duration::from_millis(50));
+        assert!(
+            !finished.load(Ordering::SeqCst),
+            "waiter must still be blocked while the gate is Pending"
+        );
+
         gate.resolve_ready();
 
         let result = waiter.join().expect("waiter thread panicked");
@@ -267,10 +293,14 @@ mod tests {
     fn waiter_wakes_on_resolve_failed() {
         let gate = Arc::new(ReadinessGate::new_pending());
 
-        let waiter_gate = Arc::clone(&gate);
-        let waiter = thread::spawn(move || waiter_gate.wait_for_write(Duration::from_secs(5)));
+        let (waiter, finished) = spawn_waiter(&gate);
 
         thread::sleep(Duration::from_millis(50));
+        assert!(
+            !finished.load(Ordering::SeqCst),
+            "waiter must still be blocked while the gate is Pending"
+        );
+
         gate.resolve_failed("embedder init failed".to_string());
 
         let result = waiter.join().expect("waiter thread panicked");
