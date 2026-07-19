@@ -58,13 +58,22 @@ static WRITE_READINESS_TIMEOUT_ENV_LOCK: Mutex<()> = Mutex::new(());
 /// already accepts `isError: true` as a valid outcome alongside a completed
 /// write, so proving the bounded-timeout-then-error path is a faithful
 /// exercise of the real contract, not a weakening of it.
-fn with_short_write_readiness_timeout<F: FnOnce()>(f: F) {
+///
+/// Panic-safe: `f`'s body is an assertion (`assert_write_completed_or_errored`)
+/// that can panic on failure. `catch_unwind` ensures the env var is always
+/// removed — via the lock guard and unconditionally, not just on the happy
+/// path — before the original panic (if any) is resumed, so a failing
+/// assertion here can never leak the override into a later test.
+fn with_short_write_readiness_timeout<F: FnOnce() + std::panic::UnwindSafe>(f: F) {
     let _guard = WRITE_READINESS_TIMEOUT_ENV_LOCK
         .lock()
         .unwrap_or_else(|e| e.into_inner());
     std::env::set_var("IRONMEM_WRITE_READINESS_TIMEOUT_SECS", "1");
-    f();
+    let result = std::panic::catch_unwind(f);
     std::env::remove_var("IRONMEM_WRITE_READINESS_TIMEOUT_SECS");
+    if let Err(panic_payload) = result {
+        std::panic::resume_unwind(panic_payload);
+    }
 }
 
 fn request(name: &str, arguments: Value) -> JsonRpcRequest {

@@ -222,7 +222,7 @@ impl App {
 
     /// Blocks (bounded) until background memory init resolves, for write-shaped
     /// tool handlers that must never silently no-op during warm-up. Returns
-    /// `Err(MemoryError::NotReady(_))` if readiness resolves failed or the
+    /// `Err(MemoryError::NotReady(_))` if readiness resolves as failed or the
     /// fail-safe timeout (`Config::write_readiness_timeout`) expires — see
     /// `ReadinessGate::wait_for_write`. Read-shaped tools (e.g. `search`) do
     /// NOT use this — they keep the lock-free `is_warming_up()` soft-body
