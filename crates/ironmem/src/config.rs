@@ -9,6 +9,15 @@ use crate::error::MemoryError;
 /// down. Overridable at runtime via `IRONMEM_DAEMON_IDLE_SECS`.
 const DEFAULT_DAEMON_IDLE_SECS: u64 = 300;
 
+/// Default fail-safe bound on how long a write-shaped MCP tool handler will
+/// block waiting for background memory init (`ReadinessGate::wait_for_write`)
+/// before giving up and returning `MemoryError::NotReady`. Overridable at
+/// runtime via `IRONMEM_WRITE_READINESS_TIMEOUT_SECS`. 90s is generous enough
+/// to cover a real first-run ONNX model download + init (which can take tens
+/// of seconds) while still bounding how long a caller can be left hanging if
+/// init never completes.
+const DEFAULT_WRITE_READINESS_TIMEOUT_SECS: u64 = 90;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum McpAccessMode {
     Trusted,
@@ -194,6 +203,37 @@ impl Config {
         Duration::from_secs(secs)
     }
 
+    /// Fail-safe bound on how long a write-shaped MCP tool handler will block
+    /// on `ReadinessGate::wait_for_write` during server warm-up before giving
+    /// up.
+    ///
+    /// Defaults to 90s ([`DEFAULT_WRITE_READINESS_TIMEOUT_SECS`]). Honors the
+    /// `IRONMEM_WRITE_READINESS_TIMEOUT_SECS` env override, parsed as `u64`
+    /// seconds. A present-but-unparseable value falls back to the default
+    /// rather than erroring (no new error surface is introduced) but logs a
+    /// `tracing::warn!` so the mistake is diagnosable instead of silently
+    /// ignored; an ABSENT var is the normal case and stays silent. Read fresh
+    /// on every call (not cached on `Config`), so tests can override it with
+    /// `std::env::set_var` immediately before exercising a still-pending gate,
+    /// without needing to reconstruct `Config`.
+    pub fn write_readiness_timeout(&self) -> Duration {
+        let secs = match std::env::var("IRONMEM_WRITE_READINESS_TIMEOUT_SECS") {
+            Ok(raw) => match raw.trim().parse::<u64>() {
+                Ok(secs) => secs,
+                Err(e) => {
+                    tracing::warn!(
+                        "IRONMEM_WRITE_READINESS_TIMEOUT_SECS={raw:?} is not a valid number of \
+                         seconds ({e}); using the default of \
+                         {DEFAULT_WRITE_READINESS_TIMEOUT_SECS}s instead"
+                    );
+                    DEFAULT_WRITE_READINESS_TIMEOUT_SECS
+                }
+            },
+            Err(_) => DEFAULT_WRITE_READINESS_TIMEOUT_SECS,
+        };
+        Duration::from_secs(secs)
+    }
+
     /// Whether `ironmem serve` may auto-spawn a shared daemon.
     ///
     /// Enabled by default. Auto-spawn is disabled when `IRONMEM_NO_DAEMON` is
@@ -313,6 +353,33 @@ mod tests {
         // Bad value silently uses the default; no error surface introduced.
         assert_eq!(cfg.daemon_idle_timeout(), Duration::from_secs(300));
         std::env::remove_var("IRONMEM_DAEMON_IDLE_SECS");
+    }
+
+    #[test]
+    fn write_readiness_timeout_defaults_to_90s() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::remove_var("IRONMEM_WRITE_READINESS_TIMEOUT_SECS");
+        let cfg = test_config("/tmp/ironmem-test-state");
+        assert_eq!(cfg.write_readiness_timeout(), Duration::from_secs(90));
+    }
+
+    #[test]
+    fn write_readiness_timeout_env_override_parses() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("IRONMEM_WRITE_READINESS_TIMEOUT_SECS", "5");
+        let cfg = test_config("/tmp/ironmem-test-state");
+        assert_eq!(cfg.write_readiness_timeout(), Duration::from_secs(5));
+        std::env::remove_var("IRONMEM_WRITE_READINESS_TIMEOUT_SECS");
+    }
+
+    #[test]
+    fn write_readiness_timeout_bad_value_falls_back_to_default() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("IRONMEM_WRITE_READINESS_TIMEOUT_SECS", "not-a-number");
+        let cfg = test_config("/tmp/ironmem-test-state");
+        // Bad value silently uses the default; no error surface introduced.
+        assert_eq!(cfg.write_readiness_timeout(), Duration::from_secs(90));
+        std::env::remove_var("IRONMEM_WRITE_READINESS_TIMEOUT_SECS");
     }
 
     #[test]

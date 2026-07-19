@@ -417,6 +417,7 @@ pub fn dispatch(app: &App, request: &JsonRpcRequest) -> Option<JsonRpcResponse> 
                                 MemoryError::Permission(msg) => msg.clone(),
                                 MemoryError::Json(err) => format!("invalid JSON: {err}"),
                                 MemoryError::Config(msg) => format!("config error: {msg}"),
+                                MemoryError::NotReady(msg) => msg.clone(),
                                 _ => "Internal server error".to_string(),
                             };
                             Some(JsonRpcResponse::success(

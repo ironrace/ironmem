@@ -8,12 +8,7 @@ use super::shared::{render_sensitive_text, MAX_READ_LIMIT, MAX_SENSITIVE_FIELD_C
 use crate::mcp::app::App;
 
 pub(super) fn handle_diary_write(app: &App, args: &Value) -> Result<Value, MemoryError> {
-    if app.is_warming_up() {
-        return Ok(json!({
-            "warming_up": true,
-            "message": "Memory server is initializing. Please retry in a moment.",
-        }));
-    }
+    app.wait_for_write_ready()?;
     let content = args
         .get("content")
         .and_then(|v| v.as_str())

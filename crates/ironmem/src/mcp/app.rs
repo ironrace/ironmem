@@ -220,6 +220,18 @@ impl App {
         !self.memory_ready.is_ready()
     }
 
+    /// Blocks (bounded) until background memory init resolves, for write-shaped
+    /// tool handlers that must never silently no-op during warm-up. Returns
+    /// `Err(MemoryError::NotReady(_))` if readiness resolves failed or the
+    /// fail-safe timeout (`Config::write_readiness_timeout`) expires — see
+    /// `ReadinessGate::wait_for_write`. Read-shaped tools (e.g. `search`) do
+    /// NOT use this — they keep the lock-free `is_warming_up()` soft-body
+    /// check unchanged.
+    pub fn wait_for_write_ready(&self) -> Result<(), MemoryError> {
+        self.memory_ready
+            .wait_for_write(self.config.write_readiness_timeout())
+    }
+
     /// Create an App with an in-memory DB and noop embedder for testing.
     /// No ONNX model required — suitable for unit and integration tests.
     pub fn open_for_test() -> Result<Self, MemoryError> {

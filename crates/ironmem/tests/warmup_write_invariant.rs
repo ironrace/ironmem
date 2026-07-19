@@ -26,13 +26,46 @@
 //! RED step of TDD for the daemon-autospawn-race root-cause fix; the write
 //! handlers are not touched by this task.
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use ironmem::mcp::app::App;
 use ironmem::mcp::protocol::JsonRpcRequest;
 use ironmem::mcp::readiness::ReadinessGate;
 use ironmem::mcp::server::dispatch;
 use serde_json::{json, Value};
+
+/// Serializes tests that override `IRONMEM_WRITE_READINESS_TIMEOUT_SECS`: env
+/// vars are process-global and would otherwise race under the parallel test
+/// runner within this binary (mirrors `crates/ironmem/src/config.rs`'s own
+/// `ENV_LOCK` pattern for the same class of hazard).
+static WRITE_READINESS_TIMEOUT_ENV_LOCK: Mutex<()> = Mutex::new(());
+
+/// Runs `f` with `IRONMEM_WRITE_READINESS_TIMEOUT_SECS` set to a short
+/// test-only override, restoring the env afterward.
+///
+/// Why this is needed: `force_warming_up` swaps in a *fresh* `Pending` gate
+/// that this test never resolves (that's the point — it reproduces the
+/// daemon's warm-up window without a real background init thread). Once the
+/// write handlers block on `app.wait_for_write_ready()` instead of no-op'ing,
+/// a still-pending gate means the call will genuinely block for the full
+/// configured timeout before giving up with `Err(NotReady)`. Left at its
+/// production default (tens of seconds, generous enough for a real model
+/// load), each of the three write-tool tests below would take that long,
+/// multiplying into a slow suite. `Config::write_readiness_timeout()` reads
+/// its env var fresh on every call (not cached on `Config`), so overriding it
+/// here — immediately before driving the request — takes effect without
+/// needing to reconstruct `App`/`Config`. `assert_write_completed_or_errored`
+/// already accepts `isError: true` as a valid outcome alongside a completed
+/// write, so proving the bounded-timeout-then-error path is a faithful
+/// exercise of the real contract, not a weakening of it.
+fn with_short_write_readiness_timeout<F: FnOnce()>(f: F) {
+    let _guard = WRITE_READINESS_TIMEOUT_ENV_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    std::env::set_var("IRONMEM_WRITE_READINESS_TIMEOUT_SECS", "1");
+    f();
+    std::env::remove_var("IRONMEM_WRITE_READINESS_TIMEOUT_SECS");
+}
 
 fn request(name: &str, arguments: Value) -> JsonRpcRequest {
     serde_json::from_value(json!({
@@ -146,53 +179,59 @@ fn assert_write_completed_or_errored(tool: &str, is_error: bool, payload: &Value
 
 #[test]
 fn add_drawer_does_not_silently_noop_during_warmup() {
-    let mut app = App::open_for_test().unwrap();
-    force_warming_up(&mut app);
+    with_short_write_readiness_timeout(|| {
+        let mut app = App::open_for_test().unwrap();
+        force_warming_up(&mut app);
 
-    let (is_error, payload) = call_tool_raw(
-        &app,
-        "add_drawer",
-        json!({ "content": "warmup race test content", "wing": "ironrace-memory" }),
-    );
+        let (is_error, payload) = call_tool_raw(
+            &app,
+            "add_drawer",
+            json!({ "content": "warmup race test content", "wing": "ironrace-memory" }),
+        );
 
-    assert_write_completed_or_errored("add_drawer", is_error, &payload);
+        assert_write_completed_or_errored("add_drawer", is_error, &payload);
+    });
 }
 
 #[test]
 fn diary_write_does_not_silently_noop_during_warmup() {
-    let mut app = App::open_for_test().unwrap();
-    force_warming_up(&mut app);
+    with_short_write_readiness_timeout(|| {
+        let mut app = App::open_for_test().unwrap();
+        force_warming_up(&mut app);
 
-    let (is_error, payload) = call_tool_raw(
-        &app,
-        "diary_write",
-        json!({ "content": "warmup race diary entry" }),
-    );
+        let (is_error, payload) = call_tool_raw(
+            &app,
+            "diary_write",
+            json!({ "content": "warmup race diary entry" }),
+        );
 
-    assert_write_completed_or_errored("diary_write", is_error, &payload);
+        assert_write_completed_or_errored("diary_write", is_error, &payload);
+    });
 }
 
 #[test]
 fn code_map_write_does_not_silently_noop_during_warmup() {
-    let mut app = App::open_for_test().unwrap();
-    force_warming_up(&mut app);
+    with_short_write_readiness_timeout(|| {
+        let mut app = App::open_for_test().unwrap();
+        force_warming_up(&mut app);
 
-    let (_dir, root, sha) = make_git_repo_with_file("src/lib.rs", "// lib");
+        let (_dir, root, sha) = make_git_repo_with_file("src/lib.rs", "// lib");
 
-    let (is_error, payload) = call_tool_raw(
-        &app,
-        "code_map_write",
-        json!({
-            "repo": root.to_string_lossy(),
-            "area": "core",
-            "summary": "warmup race code map summary",
-            "head_sha": sha,
-            "source_files": ["src/lib.rs"],
-            "built_by": "test",
-        }),
-    );
+        let (is_error, payload) = call_tool_raw(
+            &app,
+            "code_map_write",
+            json!({
+                "repo": root.to_string_lossy(),
+                "area": "core",
+                "summary": "warmup race code map summary",
+                "head_sha": sha,
+                "source_files": ["src/lib.rs"],
+                "built_by": "test",
+            }),
+        );
 
-    assert_write_completed_or_errored("code_map_write", is_error, &payload);
+        assert_write_completed_or_errored("code_map_write", is_error, &payload);
+    });
 }
 
 /// Companion assertion: `search` is READ-shaped, and its soft

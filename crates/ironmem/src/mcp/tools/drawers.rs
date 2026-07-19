@@ -15,12 +15,7 @@ const LOGICAL_KEY_SOURCE_PREFIX: &str = "logical:";
 const LOGICAL_KEY_ID_PREFIX: &str = "logical-key:";
 
 pub(super) fn handle_add_drawer(app: &App, args: &Value) -> Result<Value, MemoryError> {
-    if app.is_warming_up() {
-        return Ok(json!({
-            "warming_up": true,
-            "message": "Memory server is initializing. Please retry in a moment.",
-        }));
-    }
+    app.wait_for_write_ready()?;
     let content = args
         .get("content")
         .and_then(|v| v.as_str())

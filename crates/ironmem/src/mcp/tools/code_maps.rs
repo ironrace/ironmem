@@ -127,12 +127,7 @@ fn validate_repo(raw: &str) -> Result<String, MemoryError> {
 // ── Handlers ─────────────────────────────────────────────────────────────────
 
 pub(super) fn handle_code_map_write(app: &App, args: &Value) -> Result<Value, MemoryError> {
-    if app.is_warming_up() {
-        return Ok(json!({
-            "warming_up": true,
-            "message": "Memory server is initializing. Please retry in a moment.",
-        }));
-    }
+    app.wait_for_write_ready()?;
 
     // --- Validate inputs ---
     let repo_raw = args
