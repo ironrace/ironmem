@@ -3273,4 +3273,438 @@ mod tests {
              once its deadline expires; got {body:?}"
         );
     }
+
+    // ── Task 6: early-release ordering + fail-closed regression coverage ───
+    //
+    // The four tests below are the final proof that Tasks 1-5's early-release
+    // mechanism cannot reorder mutations or leak the ordering barrier. Every
+    // assertion here is on the ORDER responses are WRITTEN (`response["id"]`
+    // as read off the wire), not on wall-clock gaps — timing bounds exist
+    // only to keep the tests fast and fail-fast on a real hang.
+
+    /// The wire-level ordering proof, and the primary evidence for the
+    /// "signal-before-completion" direction of design decision 5: a real,
+    /// token-bearing wait that never settles on its own, with a follow-on
+    /// mutation and a third mutation pipelined directly behind it on one
+    /// connection.
+    ///
+    /// The wait's `BarrierRelease` fires (freeing the barrier for the
+    /// follow-on, then the third write) the instant its claim commits —
+    /// long before its own multi-second poll loop ever finishes. When that
+    /// poll loop finally DOES finish and its completion reaches the framing
+    /// loop, `release_barrier` finds `mutation_barrier` already `None` (nothing
+    /// left queued), so the stale completion cannot pop a fourth response out
+    /// of nowhere. Exactly 3 responses are collected below with a bounded
+    /// timeout; a regression that made the wait's own late completion
+    /// re-trigger `start_next_queued_mutation` or otherwise misbehave would
+    /// either produce a 4th id inside the window or simply hang.
+    ///
+    /// Regression sensitivity: reverting `dispatch_wait_my_turn` to fire
+    /// `barrier.release()` only from the normal completion path (deleting the
+    /// early call) would force the follow-on and third write to wait out this
+    /// wait's full `timeout_secs` before running at all — the ids below would
+    /// then arrive in a different order, or the bound would simply time out.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_early_released_wait_lets_the_follow_on_and_third_write_finish_before_it_does() {
+        #[allow(clippy::arc_with_non_send_sync)]
+        let app = Arc::new(App::open_for_test().unwrap());
+        // Never settles on its own (`codex` is never made the owner and the
+        // session is never ended), so its own response can only arrive by
+        // running out its `timeout_secs` — giving the follow-on and third
+        // write a wide, unambiguous window to finish first.
+        let (session_id, token) = wait_session_and_token(&app);
+
+        let timeout_secs = 2u64;
+        let wait_id = 1u64;
+        let follow_on_id = 2usize;
+        let third_id = 3usize;
+
+        let requests = vec![
+            wait_request(wait_id, &session_id, &token, timeout_secs),
+            add_drawer_request(follow_on_id),
+            add_drawer_request(third_id),
+        ];
+
+        let responses = collect_responses(
+            &app,
+            TransportMode::DaemonConnection,
+            &requests,
+            3,
+            Duration::from_secs(timeout_secs + 5),
+        )
+        .await;
+
+        let ids: Vec<_> = responses.iter().map(|r| r["id"].clone()).collect();
+        assert_eq!(
+            ids,
+            vec![json!(follow_on_id), json!(third_id), json!(wait_id)],
+            "the follow-on and third write must both be answered — in arrival \
+             order — before the wait's own response, which can only land once \
+             its {timeout_secs}s timeout actually elapses; got {ids:?}"
+        );
+
+        // The wait itself must still report its own honest, unsettled
+        // outcome — early release frees the BARRIER, not the wait's own
+        // answer.
+        let wait_text = responses[2]["result"]["content"][0]["text"]
+            .as_str()
+            .expect("wait response must carry content[0].text");
+        let wait_body: serde_json::Value = serde_json::from_str(wait_text).unwrap();
+        assert_eq!(
+            wait_body["is_my_turn"],
+            json!(false),
+            "the turn was never flipped, so the wait must settle as \"not my \
+             turn\" once its own deadline expires; got {wait_body:?}"
+        );
+    }
+
+    /// The fail-closed proof: a token-bearing wait whose claim FAILS —
+    /// `wait_my_turn_begin` returns `Err` because the token presented was
+    /// never issued for this `(session_id, agent)` pair — must still hold the
+    /// mutation barrier until ITS OWN (immediate) completion, and release it
+    /// only through the normal completion path. `barrier` is simply dropped,
+    /// unfired, on the `Err` early-return in `dispatch_wait_my_turn` — never
+    /// released, never signaled through the early-release channel.
+    ///
+    /// Regression this catches: firing `barrier.release()` unconditionally
+    /// (or before the `Ok` check) would let the follow-on mutation start
+    /// concurrently with, or even before, this failed wait's own error
+    /// response — this test would then see the follow-on's id arrive before,
+    /// or racing, the wait's.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_failed_claim_holds_the_barrier_until_its_own_error_response() {
+        #[allow(clippy::arc_with_non_send_sync)]
+        let app = Arc::new(App::open_for_test().unwrap());
+        // A real session with a real, unclaimed token issued for `codex` —
+        // deliberately NOT used below. The request instead carries a
+        // freshly-minted UUID that was never issued for this session, so
+        // `claim_handoff_token` rejects it (`pending_token != token`).
+        let (session_id, _real_token) = wait_session_and_token(&app);
+        let bogus_token = uuid::Uuid::new_v4().to_string();
+
+        let wait_id = 1u64;
+        let follow_on_id = 2usize;
+        let requests = vec![
+            wait_request(wait_id, &session_id, &bogus_token, 30),
+            add_drawer_request(follow_on_id),
+        ];
+
+        let responses = collect_responses(
+            &app,
+            TransportMode::DaemonConnection,
+            &requests,
+            2,
+            Duration::from_secs(2),
+        )
+        .await;
+
+        let ids: Vec<_> = responses.iter().map(|r| r["id"].clone()).collect();
+        assert_eq!(
+            ids,
+            vec![json!(wait_id), json!(follow_on_id)],
+            "the failed wait's own error response must be written before the \
+             follow-on queued behind it — the barrier must have been held \
+             until this request's own (immediate) completion; got {ids:?}"
+        );
+
+        assert_eq!(
+            responses[0]["result"]["isError"].as_bool(),
+            Some(true),
+            "a failed claim must produce an error response; got {:?}",
+            responses[0]
+        );
+        let message = error_text_of(&responses[0]);
+        assert!(
+            message.contains("invalid handoff_token"),
+            "expected a claim-rejection message; got {message:?}"
+        );
+    }
+
+    /// The "completion-before-signal" ordering — the trickier of the two
+    /// possible race outcomes between a wait's own normal completion and its
+    /// early-release channel signal (the companion, "signal-before-completion"
+    /// direction is what
+    /// `an_early_released_wait_lets_the_follow_on_and_third_write_finish_before_it_does`
+    /// proves above, end to end).
+    ///
+    /// `barrier.release()` fires the instant `wait_my_turn_begin` returns
+    /// `Ok`, strictly BEFORE the poll loop runs even once. If the very first
+    /// `wait_my_turn_poll` already settles (the turn is flipped to `codex`
+    /// BEFORE this wait is ever dispatched), `dispatch_wait_my_turn`'s entire
+    /// body — claim, release, one poll, return — executes on a SINGLE poll of
+    /// its future, without ever reaching `tokio::time::sleep`. That means
+    /// both the completed future (`in_flight`) AND the queued channel message
+    /// (`early_release_rx`) become ready inside the very same `select!` pass.
+    /// Because the `select!` in `run_framing_loop` is `biased` with the
+    /// completion arm listed BEFORE the early-release arm, the completion arm
+    /// always wins that race: this wait's barrier release is therefore first
+    /// evaluated via NORMAL completion (which succeeds and would drain the
+    /// queue if anything were queued), and the early-release channel's
+    /// message for the SAME seq is only drained on a LATER loop pass — by
+    /// which point `mutation_barrier` no longer matches, so `release_barrier`
+    /// must reject it as stale (a no-op), not re-drain the queue or clear
+    /// anything a second time.
+    ///
+    /// Constructed by flipping `current_owner` to `codex` via
+    /// `set_implementer` BEFORE the wait is ever dispatched — the same
+    /// technique
+    /// `a_wait_already_settled_at_dispatch_returns_immediately_despite_an_old_arrival`
+    /// (Task 5) uses — so the wait's own first snapshot read already
+    /// settles.
+    ///
+    /// Regression this catches: if the stale early-release signal were ever
+    /// allowed to re-run `start_next_queued_mutation` or otherwise act, a 4th,
+    /// spurious response could appear on the wire, or `mutations_blocked`
+    /// bookkeeping could be double-processed — either would show up as an
+    /// unexpected extra line arriving after the three expected ids below.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_same_tick_settlement_processes_completion_before_the_stale_release_signal() {
+        #[allow(clippy::arc_with_non_send_sync)]
+        let app = Arc::new(App::open_for_test().unwrap());
+        let (session_id, token) = wait_session_and_token(&app);
+
+        // Flip the turn to `codex` BEFORE dispatching the wait at all, so its
+        // very first snapshot read already settles — no sleep is ever
+        // reached.
+        app.db
+            .with_transaction(|tx| {
+                crate::collab::queue::set_implementer(
+                    tx,
+                    &session_id,
+                    crate::collab::Agent::Claude,
+                    Some(crate::collab::Agent::Codex),
+                )
+            })
+            .unwrap();
+
+        let wait_id = 1u64;
+        let follow_on_id = 2usize;
+        let second_follow_on_id = 3usize;
+
+        let (mut client_in, server_in) = tokio::io::duplex(1 << 20);
+        let (server_out, client_out) = tokio::io::duplex(1 << 20);
+        let mut loop_fut = Box::pin(run_framing_loop(
+            &app,
+            BufReader::new(server_in),
+            server_out,
+            TransportMode::DaemonConnection,
+        ));
+        let mut responses = BufReader::new(client_out).lines();
+
+        for request in [
+            wait_request(wait_id, &session_id, &token, 30),
+            add_drawer_request(follow_on_id),
+            add_drawer_request(second_follow_on_id),
+        ] {
+            client_in
+                .write_all(format!("{request}\n").as_bytes())
+                .await
+                .unwrap();
+        }
+
+        // Collect exactly 3 responses: the already-settled wait, plus the two
+        // mutations freed behind it.
+        let mut collected = Vec::new();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while collected.len() < 3 {
+                tokio::select! {
+                    result = &mut loop_fut => panic!("framing loop exited early: {result:?}"),
+                    line = responses.next_line() => {
+                        let line = line.unwrap().expect("a response");
+                        collected.push(serde_json::from_str::<serde_json::Value>(&line).unwrap());
+                    }
+                }
+            }
+        })
+        .await
+        .expect("all three responses (wait + two queued mutations) must arrive within 5s");
+
+        let ids: Vec<_> = collected.iter().map(|r| r["id"].clone()).collect();
+        assert_eq!(
+            ids,
+            vec![
+                json!(wait_id),
+                json!(follow_on_id),
+                json!(second_follow_on_id)
+            ],
+            "the already-settled wait must complete (releasing its barrier via \
+             NORMAL completion) before either mutation behind it, and those two \
+             must still run in FIFO order behind it; got {ids:?}"
+        );
+
+        // No fourth, spurious response: the early-release channel's now-stale
+        // message for this same seq must be silently dropped by
+        // `release_barrier`'s seq mismatch, not re-fire a queue drain or
+        // duplicate anything observable on the wire.
+        let extra = tokio::select! {
+            result = &mut loop_fut => panic!("framing loop exited early: {result:?}"),
+            line = responses.next_line() => Some(line.unwrap()),
+            _ = tokio::time::sleep(Duration::from_millis(300)) => None,
+        };
+        assert!(
+            extra.is_none(),
+            "a stale early-release signal produced an unexpected extra response: {extra:?}"
+        );
+    }
+
+    /// Design decision 5, explicit coverage: an early release must NEVER
+    /// clear `mutations_blocked` — only the completion arm may, and only once
+    /// the WHOLE backlog (queue AND barrier) is empty.
+    ///
+    /// Construction: `add_drawer` (write-shaped) parks indefinitely on a
+    /// force-pending readiness gate as the first barrier owner, exactly like
+    /// `framing_loop_blocks_further_writes_after_a_queue_overflow`. A backlog
+    /// of `MAX_QUEUED_MUTATIONS` mutations queues behind it — the LAST of
+    /// which is a real, token-bearing wait — followed by one more mutation
+    /// that overflows the backlog (`mutations_blocked = true`) and a
+    /// collateral one behind that (both rejected, exactly as in the PR #198
+    /// overflow test this reuses). Resolving the gate then lets the whole
+    /// backlog cascade: every plain `add_drawer` in front of the wait
+    /// completes and hands the barrier onward, and when the wait itself
+    /// finally becomes owner it claims its (real, valid) token and fires its
+    /// `BarrierRelease` — an early release occurring, this time, strictly
+    /// AFTER `mutations_blocked` was already set. A probe mutation sent right
+    /// after must still be rejected as blocked: if a regression ever taught
+    /// the early-release arm to also clear `mutations_blocked` (a very
+    /// plausible copy-paste of the completion arm's check), this probe would
+    /// instead be accepted or queued.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn mutations_blocked_survives_an_early_release_and_still_gates_new_writes() {
+        let _g = EnvGuard::set(WRITE_READINESS_TIMEOUT_ENV, "30");
+
+        #[allow(clippy::arc_with_non_send_sync)]
+        let mut app = Arc::new(App::open_for_test().unwrap());
+        let readiness = force_warming_up(&mut app);
+        let (session_id, token) = wait_session_and_token(&app);
+
+        let q = MAX_QUEUED_MUTATIONS;
+        // id 1 dispatches and parks on the never-(yet)-resolved gate; ids
+        // 2..=q are plain fillers; id (q+1) — the LAST queued entry — is the
+        // real wait; (q+2) overflows the backlog; (q+3) is collateral.
+        let special_wait_id = (q + 1) as u64;
+        let overflow_id = q + 2;
+        let collateral_id = q + 3;
+
+        let (mut client_in, server_in) = tokio::io::duplex(1 << 20);
+        let (server_out, client_out) = tokio::io::duplex(1 << 20);
+        let mut loop_fut = Box::pin(run_framing_loop(
+            &app,
+            BufReader::new(server_in),
+            server_out,
+            TransportMode::DaemonConnection,
+        ));
+        let mut responses = BufReader::new(client_out).lines();
+
+        client_in
+            .write_all(format!("{}\n", add_drawer_request(1)).as_bytes())
+            .await
+            .unwrap();
+        drive_briefly(&mut loop_fut, Duration::from_millis(100)).await;
+
+        for i in 2..=q {
+            client_in
+                .write_all(format!("{}\n", add_drawer_request(i)).as_bytes())
+                .await
+                .unwrap();
+        }
+        let special_wait = wait_request(special_wait_id, &session_id, &token, 5);
+        client_in
+            .write_all(format!("{special_wait}\n").as_bytes())
+            .await
+            .unwrap();
+        drive_briefly(&mut loop_fut, Duration::from_millis(100)).await;
+
+        client_in
+            .write_all(format!("{}\n", add_drawer_request(overflow_id)).as_bytes())
+            .await
+            .unwrap();
+        client_in
+            .write_all(format!("{}\n", add_drawer_request(collateral_id)).as_bytes())
+            .await
+            .unwrap();
+
+        let mut collected = Vec::new();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while collected.len() < 2 {
+                tokio::select! {
+                    result = &mut loop_fut => panic!("framing loop exited early: {result:?}"),
+                    line = responses.next_line() => {
+                        let line = line.unwrap().expect("a response");
+                        collected.push(serde_json::from_str::<serde_json::Value>(&line).unwrap());
+                    }
+                }
+            }
+        })
+        .await
+        .expect("the overflow and collateral rejections must arrive promptly");
+
+        assert_eq!(
+            collected[0]["id"],
+            json!(overflow_id),
+            "got {:?}",
+            collected[0]
+        );
+        assert_eq!(
+            collected[1]["id"],
+            json!(collateral_id),
+            "got {:?}",
+            collected[1]
+        );
+        assert!(
+            error_text_of(&collected[0]).contains("too many writes queued"),
+            "got {:?}",
+            collected[0]
+        );
+        assert!(
+            error_text_of(&collected[1]).contains("writes are blocked on this connection"),
+            "got {:?}",
+            collected[1]
+        );
+
+        // Resolve readiness: id 1 completes, and the whole backlog cascades
+        // — every plain filler hands the barrier onward, and the real wait at
+        // the end of the queue claims its token and fires an EARLY release,
+        // strictly after `mutations_blocked` was set above.
+        readiness.resolve_ready();
+        drive_briefly(&mut loop_fut, Duration::from_millis(500)).await;
+
+        // A brand-new mutation sent now must STILL be rejected as blocked:
+        // the wait's early release (the early-release `select!` arm)
+        // deliberately does not touch `mutations_blocked` — only the
+        // completion arm does, and that has not run for the wait itself yet
+        // (it is still polling toward its own settlement).
+        let probe_id = q + 4;
+        client_in
+            .write_all(format!("{}\n", add_drawer_request(probe_id)).as_bytes())
+            .await
+            .unwrap();
+
+        let probe_response = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                tokio::select! {
+                    result = &mut loop_fut => panic!("framing loop exited early: {result:?}"),
+                    line = responses.next_line() => {
+                        let line = line.unwrap().expect("a response");
+                        let value: serde_json::Value = serde_json::from_str(&line).unwrap();
+                        if value["id"] == json!(probe_id) {
+                            break value;
+                        }
+                        // Otherwise: one of the cascading backlog responses
+                        // draining in the background — not the one we're
+                        // waiting for; keep going.
+                    }
+                }
+            }
+        })
+        .await
+        .expect("the probe mutation got no answer within 2s");
+
+        let probe_error = error_text_of(&probe_response);
+        assert!(
+            probe_error.contains("writes are blocked on this connection"),
+            "a new mutation arriving after the wait's early release must still be \
+             rejected as blocked — `mutations_blocked` must not have been cleared \
+             by the early-release arm; got {probe_error:?}"
+        );
+    }
 }
