@@ -940,10 +940,14 @@ pub(crate) fn is_mutating_call(name: &str, args: &Value) -> bool {
 pub(crate) const WAIT_MY_TURN_POLL_INTERVAL: std::time::Duration =
     collab_session::WAIT_MY_TURN_POLL_INTERVAL;
 
-/// How long a `collab_wait_my_turn` call should poll — see
-/// [`collab_session::wait_my_turn_timeout`].
-pub(crate) fn wait_my_turn_timeout(args: &Value) -> std::time::Duration {
-    collab_session::wait_my_turn_timeout(args)
+/// Deadline for the `collab_wait_my_turn` poll loop — see
+/// [`collab_session::wait_my_turn_deadline`].
+pub(crate) fn wait_my_turn_deadline(
+    arrived_at: std::time::Instant,
+    begin_completed_at: std::time::Instant,
+    args: &Value,
+) -> std::time::Instant {
+    collab_session::wait_my_turn_deadline(arrived_at, begin_completed_at, args)
 }
 
 /// Mode-gate, validate, and settle the generation for a `collab_wait_my_turn`

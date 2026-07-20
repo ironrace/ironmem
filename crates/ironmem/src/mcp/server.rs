@@ -998,11 +998,12 @@ async fn dispatch_wait_my_turn(
         .get("arguments")
         .cloned()
         .unwrap_or(serde_json::json!({}));
-    let deadline = arrived_at + tools::wait_my_turn_timeout(&args);
 
     if let Err(error) = tokio::task::block_in_place(|| tools::wait_my_turn_begin(app, &args)) {
         return tool_error_response(request.id.clone(), tool_name, error);
     }
+    let begin_completed_at = std::time::Instant::now();
+    let deadline = tools::wait_my_turn_deadline(arrived_at, begin_completed_at, &args);
 
     if let Some(barrier) = barrier {
         barrier.release();
