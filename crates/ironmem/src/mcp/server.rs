@@ -779,14 +779,11 @@ async fn reject_mutation(
         MemoryError::Validation(message),
     );
     let chars = write_response(stdout, &resp).await?;
-    account_response_metrics(
-        app,
-        conn,
-        chars,
-        tool_name,
-        conn.session_id.as_deref(),
-        None,
-    );
+    let sid = conn
+        .session_id
+        .clone()
+        .or_else(|| request_collab_session_id(request));
+    account_response_metrics(app, conn, chars, tool_name, sid.as_deref(), None);
     Ok(())
 }
 
@@ -2478,6 +2475,144 @@ mod tests {
             overflow_error, collateral_error,
             "the two refusals must be distinguishable or a client cannot tell where \
              its write sequence actually broke"
+        );
+    }
+
+    /// Task 7: `reject_mutation` must mirror `write_and_account`'s attribution
+    /// fallback. A connection that never learned a session id (no
+    /// `initialize` was ever sent) rejects a collab mutation for queue
+    /// overflow; the `mcp_response` row it records must still fall back to
+    /// the sanitized collab session id carried in the request's own
+    /// arguments — otherwise a headless daemon connection loses collab
+    /// attribution the moment one of its writes is refused.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn reject_mutation_falls_back_to_request_collab_session_id() {
+        let _g = METRICS_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::remove_var("IRONMEM_METRICS");
+        std::env::remove_var("IRONMEM_HARNESS");
+        let _env = EnvGuard::set(WRITE_READINESS_TIMEOUT_ENV, "30");
+
+        #[allow(clippy::arc_with_non_send_sync)]
+        let mut app = Arc::new(App::open_for_test().unwrap());
+        let _readiness = force_warming_up(&mut app);
+
+        // id 1 dispatches and parks on the never-resolved gate; ids 2..=65
+        // fill the backlog exactly; the overflow id is a collab mutation
+        // carrying a `session_id` argument this connection never learned any
+        // other way.
+        let overflow_id = MAX_QUEUED_MUTATIONS + 2;
+        let mut requests: Vec<serde_json::Value> =
+            (1..overflow_id).map(add_drawer_request).collect();
+        requests.push(json!({
+            "jsonrpc": "2.0", "id": overflow_id, "method": "tools/call",
+            "params": {
+                "name": "collab_send",
+                "arguments": {
+                    "session_id": "fallback-collab-sess",
+                    "sender": "claude",
+                    "receiver": "codex",
+                    "message": "hi"
+                }
+            }
+        }));
+
+        let responses = collect_responses(
+            &app,
+            TransportMode::DaemonConnection,
+            &requests,
+            1,
+            Duration::from_secs(10),
+        )
+        .await;
+        assert_eq!(responses[0]["id"], json!(overflow_id));
+        assert!(
+            error_text_of(&responses[0]).contains("too many writes queued"),
+            "expected the overflow refusal; got {:?}",
+            responses[0]
+        );
+
+        let rows = app
+            .db
+            .query_token_usage(&crate::db::metrics::TokenUsageQuery::default())
+            .unwrap();
+        let rejected = rows
+            .iter()
+            .find(|r| r.source == "mcp_response" && r.tool_name.as_deref() == Some("collab_send"))
+            .expect("rejected collab_send must still record an mcp_response row");
+        assert_eq!(
+            rejected.session_id.as_deref(),
+            Some("fallback-collab-sess"),
+            "with no connection-learned session id, the rejected mutation's row \
+             must fall back to the sanitized collab session id from the request"
+        );
+    }
+
+    /// Control case for the fallback above: when the connection HAS learned a
+    /// session id (via `initialize`), that connection-level attribution must
+    /// still win over whatever `session_id` argument the rejected request
+    /// happens to carry — the fallback is last-resort only.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn reject_mutation_prefers_connection_session_id_over_request_fallback() {
+        let _g = METRICS_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::remove_var("IRONMEM_METRICS");
+        std::env::remove_var("IRONMEM_HARNESS");
+        let _env = EnvGuard::set(WRITE_READINESS_TIMEOUT_ENV, "30");
+
+        #[allow(clippy::arc_with_non_send_sync)]
+        let mut app = Arc::new(App::open_for_test().unwrap());
+        let _readiness = force_warming_up(&mut app);
+
+        let overflow_id = MAX_QUEUED_MUTATIONS + 2;
+        let mut requests = vec![json!({
+            "jsonrpc": "2.0", "id": 0, "method": "initialize",
+            "params": {"sessionId": "conn-learned-id"}
+        })];
+        requests.extend((1..overflow_id).map(add_drawer_request));
+        requests.push(json!({
+            "jsonrpc": "2.0", "id": overflow_id, "method": "tools/call",
+            "params": {
+                "name": "collab_send",
+                "arguments": {
+                    "session_id": "should-be-ignored",
+                    "sender": "claude",
+                    "receiver": "codex",
+                    "message": "hi"
+                }
+            }
+        }));
+
+        let responses = collect_responses(
+            &app,
+            TransportMode::DaemonConnection,
+            &requests,
+            2,
+            Duration::from_secs(10),
+        )
+        .await;
+        let overflow_response = responses
+            .iter()
+            .find(|r| r["id"] == json!(overflow_id))
+            .expect("overflow response must arrive");
+        assert!(
+            error_text_of(overflow_response).contains("too many writes queued"),
+            "expected the overflow refusal; got {overflow_response:?}"
+        );
+
+        let rows = app
+            .db
+            .query_token_usage(&crate::db::metrics::TokenUsageQuery::default())
+            .unwrap();
+        let rejected = rows
+            .iter()
+            .find(|r| r.source == "mcp_response" && r.tool_name.as_deref() == Some("collab_send"))
+            .expect("rejected collab_send must still record an mcp_response row");
+        assert_eq!(
+            rejected.session_id.as_deref(),
+            Some("conn-learned-id"),
+            "connection-learned session id must win over the request's own \
+             collab session id argument"
         );
     }
 
