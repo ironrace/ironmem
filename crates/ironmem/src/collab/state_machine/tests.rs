@@ -1223,3 +1223,175 @@ fn test_tasks_count_from_list_only_accepts_canonical_shape() {
     // Malformed JSON — swallowed by `ok()` and returns None.
     assert_eq!(tasks_count_from_list(Some("not json")), None);
 }
+
+// ── Task 5: delegated one-turn completion override ────────────────────
+
+/// Drive a session to `CodeReviewFixGlobalPending` (Codex owner) and have
+/// Codex report a recoverable tooling failure, handing control to Claude.
+/// Returns the resulting session with `recovery_owner == Some(Claude)`,
+/// `recovery_phase == Some(CodeReviewFixGlobalPending)`, and
+/// `recovery_origin_owner == Some(Codex)`.
+fn session_with_codex_recovery_in_fix_global_pending() -> CollabSession {
+    let s = locked_session("hf");
+    let s = submit_task_list(&s, "hf", 1);
+    let s = apply_event(
+        &s,
+        Agent::Claude,
+        &CollabEvent::ImplementationDone {
+            head_sha: "b".to_string(),
+        },
+    )
+    .unwrap();
+    apply_event(
+        &s,
+        Agent::Codex,
+        &CollabEvent::FailureReport {
+            coding_failure: "git_commit_failed: index.lock EPERM".to_string(),
+        },
+    )
+    .unwrap()
+}
+
+#[test]
+fn test_delegated_completion_override_accepted_and_clears_recovery_state() {
+    // Codex reports `git_commit_failed:` while it owns
+    // `CodeReviewFixGlobalPending`, handing control to Claude. Claude's
+    // `CodeReviewFixGlobal` is accepted once via the override, the phase
+    // advances, and every recovery field plus `pending_failure` is cleared
+    // in the same transition.
+    let s = session_with_codex_recovery_in_fix_global_pending();
+    assert_eq!(s.phase, Phase::CodeReviewFixGlobalPending);
+    assert_eq!(s.recovery_owner, Some(Agent::Claude));
+    assert_eq!(s.recovery_phase, Some(Phase::CodeReviewFixGlobalPending));
+    assert_eq!(s.recovery_origin_owner, Some(Agent::Codex));
+    assert_eq!(s.recovery_attempts, 1);
+    assert!(s.pending_failure.is_some());
+
+    let s = apply_event(
+        &s,
+        Agent::Claude,
+        &CollabEvent::CodeReviewFixGlobal {
+            head_sha: "g1".to_string(),
+        },
+    )
+    .unwrap();
+
+    assert_eq!(s.phase, Phase::CodeReviewLocalPending);
+    assert_eq!(s.pending_failure, None);
+    assert_eq!(s.recovery_phase, None);
+    assert_eq!(s.recovery_owner, None);
+    assert_eq!(s.recovery_origin_owner, None);
+    assert_eq!(s.recovery_attempts, 0);
+    assert_eq!(s.coding_failure, None);
+}
+
+#[test]
+fn test_delegated_completion_override_is_one_turn_only() {
+    // A second Claude `CodeReviewFixGlobal` after the override has already
+    // fired and cleared recovery state must be rejected: the session has
+    // moved on to `CodeReviewLocalPending`, so there is no longer a
+    // matching `(CodeReviewFixGlobalPending, CodeReviewFixGlobal)` arm —
+    // and even if there were, the override's own state is gone.
+    let s = session_with_codex_recovery_in_fix_global_pending();
+    let s = apply_event(
+        &s,
+        Agent::Claude,
+        &CollabEvent::CodeReviewFixGlobal {
+            head_sha: "g1".to_string(),
+        },
+    )
+    .unwrap();
+    assert_eq!(s.phase, Phase::CodeReviewLocalPending);
+
+    let err = apply_event(
+        &s,
+        Agent::Claude,
+        &CollabEvent::CodeReviewFixGlobal {
+            head_sha: "g2".to_string(),
+        },
+    )
+    .unwrap_err();
+    assert!(matches!(err, CollabError::WrongPhase { .. }));
+}
+
+#[test]
+fn test_delegated_completion_override_rejects_non_recovery_owner() {
+    // The override is exclusive to `recovery_owner`. Claude flags a Codex
+    // MCP dispatch failure off-turn (`codex_dispatch_failed:` is both
+    // off-turn-admissible and recoverable per `RECOVERABLE_FAILURE_PREFIXES`),
+    // which hands recovery to the counterpart of the *reporter* — Claude —
+    // i.e. back to Codex, not to Claude itself. Claude ends up as
+    // `recovery_origin_owner` but not `recovery_owner`, so Claude cannot use
+    // the override to complete `CodeReviewFixGlobal` in Codex's place.
+    let s = locked_session("hf");
+    let s = submit_task_list(&s, "hf", 1);
+    let s = apply_event(
+        &s,
+        Agent::Claude,
+        &CollabEvent::ImplementationDone {
+            head_sha: "b".to_string(),
+        },
+    )
+    .unwrap();
+    assert_eq!(s.phase, Phase::CodeReviewFixGlobalPending);
+    assert_eq!(s.current_owner, Agent::Codex);
+
+    let s = apply_event(
+        &s,
+        Agent::Claude,
+        &CollabEvent::FailureReport {
+            coding_failure: "codex_dispatch_failed: mcp call timed out".to_string(),
+        },
+    )
+    .unwrap();
+    assert_eq!(s.recovery_owner, Some(Agent::Codex));
+    assert_eq!(s.recovery_origin_owner, Some(Agent::Claude));
+    assert_eq!(s.recovery_phase, Some(Phase::CodeReviewFixGlobalPending));
+
+    let err = apply_event(
+        &s,
+        Agent::Claude,
+        &CollabEvent::CodeReviewFixGlobal {
+            head_sha: "g1".to_string(),
+        },
+    )
+    .unwrap_err();
+    assert!(matches!(err, CollabError::NotYourTurn { .. }));
+}
+
+#[test]
+fn test_delegated_completion_override_completed_session_has_no_coding_failure() {
+    // Even though a tooling failure was reported and recovered from
+    // mid-flight, the session that eventually reaches `CodingComplete` must
+    // carry `coding_failure == None` — the recoverable-failure path never
+    // touches that field (only `FailureClass::Terminal` does).
+    let s = session_with_codex_recovery_in_fix_global_pending();
+    let s = apply_event(
+        &s,
+        Agent::Claude,
+        &CollabEvent::CodeReviewFixGlobal {
+            head_sha: "g1".to_string(),
+        },
+    )
+    .unwrap();
+    let s = apply_event(
+        &s,
+        Agent::Claude,
+        &CollabEvent::ReviewLocal {
+            head_sha: "g2".to_string(),
+        },
+    )
+    .unwrap();
+    let s = apply_event(
+        &s,
+        Agent::Claude,
+        &CollabEvent::FinalReview {
+            head_sha: "g3".to_string(),
+            pr_url: "https://example/pr/1".to_string(),
+        },
+    )
+    .unwrap();
+
+    assert_eq!(s.phase, Phase::CodingComplete);
+    assert_eq!(s.coding_failure, None);
+}

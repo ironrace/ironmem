@@ -50,6 +50,44 @@ fn counterpart(agent: Agent) -> Agent {
     }
 }
 
+/// Like `require_actor`, but additionally permits a one-turn delegated
+/// completion: if `actor` is the agent recovery handed control to
+/// (`session.recovery_owner == Some(actor)`) AND the session is still in the
+/// exact phase that was interrupted (`session.recovery_phase ==
+/// Some(session.phase)`), the actor may complete the coding-phase event in
+/// place of `expected`. Otherwise this delegates to `require_actor`
+/// verbatim, so behavior is unchanged when there's no active recovery.
+///
+/// This function only decides whether the call is allowed — it does not
+/// clear any recovery state. Callers are responsible for clearing
+/// `pending_failure`/`recovery_phase`/`recovery_owner`/
+/// `recovery_origin_owner`/`recovery_attempts` in `next` on acceptance.
+fn require_actor_or_recovery(
+    session: &CollabSession,
+    actor: Agent,
+    expected: Agent,
+) -> Result<(), CollabError> {
+    if session.recovery_owner == Some(actor) && session.recovery_phase == Some(session.phase) {
+        return Ok(());
+    }
+    require_actor(actor, expected)
+}
+
+/// Clear all recovery bookkeeping on a successful coding-phase completion
+/// event. Applied unconditionally by all four `require_actor_or_recovery`
+/// call sites, not just when the override fired: a session with no active
+/// recovery already has these fields at their zero values
+/// (`None`/`None`/`None`/`None`/`0`), so this is a no-op in the normal case
+/// and the required clear in the recovery case — simpler than conditioning
+/// on whether the override actually fired, and provably correct either way.
+fn clear_recovery_state(next: &mut CollabSession) {
+    next.pending_failure = None;
+    next.recovery_phase = None;
+    next.recovery_owner = None;
+    next.recovery_origin_owner = None;
+    next.recovery_attempts = 0;
+}
+
 pub fn apply_event(
     session: &CollabSession,
     actor: Agent,
@@ -181,30 +219,34 @@ pub fn apply_event(
         // with Codex as owner — Codex first; Claude audits after. Payload
         // carries only `head_sha` (anti-puppeteering).
         (Phase::CodeImplementPending, CollabEvent::ImplementationDone { head_sha }) => {
-            require_actor(actor, session.implementer)?;
+            require_actor_or_recovery(session, actor, session.implementer)?;
             next.last_head_sha = Some(head_sha.clone());
             next.phase = Phase::CodeReviewFixGlobalPending;
             next.current_owner = Agent::Codex;
+            clear_recovery_state(&mut next);
         }
         // ── v3: global review, 3-phase linear (Codex first; Claude audits after) ──
         (Phase::CodeReviewFixGlobalPending, CollabEvent::CodeReviewFixGlobal { head_sha }) => {
-            require_actor(actor, Agent::Codex)?;
+            require_actor_or_recovery(session, actor, Agent::Codex)?;
             next.last_head_sha = Some(head_sha.clone());
             next.phase = Phase::CodeReviewLocalPending;
             next.current_owner = Agent::Claude;
+            clear_recovery_state(&mut next);
         }
         (Phase::CodeReviewLocalPending, CollabEvent::ReviewLocal { head_sha }) => {
-            require_actor(actor, Agent::Claude)?;
+            require_actor_or_recovery(session, actor, Agent::Claude)?;
             next.last_head_sha = Some(head_sha.clone());
             next.phase = Phase::CodeReviewFinalPending;
             next.current_owner = Agent::Claude;
+            clear_recovery_state(&mut next);
         }
         (Phase::CodeReviewFinalPending, CollabEvent::FinalReview { head_sha, pr_url }) => {
-            require_actor(actor, Agent::Claude)?;
+            require_actor_or_recovery(session, actor, Agent::Claude)?;
             next.last_head_sha = Some(head_sha.clone());
             next.pr_url = Some(pr_url.clone());
             next.phase = Phase::CodingComplete;
             next.current_owner = Agent::Claude;
+            clear_recovery_state(&mut next);
         }
         // ── v3: failure is valid from any coding-active phase ─────────────
         (phase, CollabEvent::FailureReport { coding_failure }) if phase.is_coding_active() => {
