@@ -47,6 +47,80 @@ pub struct CollabSession {
     /// completes. The DB CHECK constraint enforces the allowed set as
     /// defense-in-depth.
     pub implementer: Agent,
+    // Recovery-state fields (issue #197). All seven persist as nullable
+    // columns added in migration 015 and stay NULL/0 for the common case
+    // where no tooling failure is in flight.
+    /// The verbatim `coding_failure` diagnostic of the in-flight recoverable
+    /// failure, `None` when no failure is in flight. This is the raw reported
+    /// string, NOT the `FailureClass` it classifies as — same storage shape
+    /// as `coding_failure`, a plain string rather than a typed enum, since
+    /// the classification vocabulary is still open-ended. Callers that need
+    /// the class re-derive it with `failure_class::classify`.
+    pub pending_failure: Option<String>,
+    /// The `Phase` the session was in when the failure was recorded, so
+    /// recovery can resume in place. Wire-encoded exactly like the
+    /// non-nullable `phase` column (`Phase::to_string()` / `FromStr`).
+    ///
+    /// **Not a "session is currently failed" indicator.** `ResumeCoding`
+    /// (`state_machine::apply_event`) deliberately leaves this field set
+    /// after a successful resume, as a historical record of what phase the
+    /// session originally failed from — it does NOT clear it. A non-null
+    /// `failed_from_phase` on an active (non-`CodingFailed`) session is
+    /// normal and expected once that session has ever been resumed; only
+    /// `session.phase == Phase::CodingFailed` means the session is actually
+    /// down. Any caller exposing this field (e.g. `collab_status`) should
+    /// present it as audit history, not as a live-status flag.
+    pub failed_from_phase: Option<Phase>,
+    /// The phase the in-flight recovery is scoped to — i.e. the phase that
+    /// was interrupted, which the session stays parked in while recovery
+    /// runs. It is NOT a sub-phase of a separate recovery flow: while a
+    /// recovery is live this equals the session's own `phase` column, and
+    /// `require_actor_or_recovery` admits the delegated completion only on
+    /// that equality. Same encoding as `failed_from_phase`.
+    pub recovery_phase: Option<Phase>,
+    /// Which `Agent` currently drives recovery. Same encoding as
+    /// `current_owner`/`implementer` (`Agent::as_str()` / `FromStr`).
+    pub recovery_owner: Option<Agent>,
+    /// Which `Agent` owned the interrupted turn when the failure occurred.
+    /// Same encoding as `recovery_owner`. Control is NOT handed back to it —
+    /// the recovery owner completes the interrupted turn itself, and the
+    /// phase's normal completion event decides the next owner. This field is
+    /// the attribution record of whose turn was interrupted.
+    ///
+    /// Exposed in both `collab_status` and the session-handoff block. It was
+    /// initially omitted as out of scope (issue #197 task 9) on the grounds
+    /// that a dispatcher routing the turn only needs the destination; review
+    /// established a real caller need, since without the origin neither
+    /// surface shows that a completion event was produced by the delegated
+    /// recovery owner rather than by the phase's own expected agent.
+    pub recovery_origin_owner: Option<Agent>,
+    /// How many recovery attempts have been made so far.
+    ///
+    /// The DB column (`recovery_attempts INTEGER`) is nullable — legacy
+    /// pre-015 rows have no value — but this Rust field is a plain `u8`,
+    /// not `Option<u8>`: a NULL in the DB is read back as `0`, never as an
+    /// error. `load_session_record` must read the column as `Option<i64>`
+    /// first and map `None -> 0` (clamping only applies to the `Some` arm);
+    /// `save_session` always writes a concrete `i64`, so a NULL can only
+    /// occur on a row that has never been through `save_session` — i.e. a
+    /// genuinely legacy row.
+    pub recovery_attempts: u8,
+    /// How many recovery handoffs this session has made over its entire
+    /// lifetime — monotonic, and reset by nothing.
+    ///
+    /// `recovery_attempts` above is the *per-resume* budget: it is zeroed by
+    /// a successful delegated completion and again by `ResumeCoding`. That
+    /// makes it useless as a bound on total work, because `collab_resume` is
+    /// agent-callable (and is on the unattended successor's permission
+    /// allowlist), so a session could loop failure → ceiling → resume →
+    /// failure indefinitely with neither `collab_status` nor the handoff
+    /// block ever showing a count above `MAX_RECOVERY_ATTEMPTS`. This field
+    /// is the counter that actually converges: see
+    /// `state_machine::MAX_TOTAL_RECOVERY_ATTEMPTS`.
+    ///
+    /// Same nullable-column/`u8`-field treatment as `recovery_attempts`: the
+    /// DB column is nullable for legacy rows and reads back as `0`.
+    pub total_recovery_attempts: u8,
 }
 
 impl CollabSession {
@@ -81,6 +155,13 @@ impl CollabSession {
             pr_url: None,
             coding_failure: None,
             implementer,
+            pending_failure: None,
+            failed_from_phase: None,
+            recovery_phase: None,
+            recovery_owner: None,
+            recovery_origin_owner: None,
+            recovery_attempts: 0,
+            total_recovery_attempts: 0,
         }
     }
 
@@ -123,6 +204,13 @@ impl CollabSession {
             pr_url: None,
             coding_failure: None,
             implementer: Agent::Claude,
+            pending_failure: None,
+            failed_from_phase: None,
+            recovery_phase: None,
+            recovery_owner: None,
+            recovery_origin_owner: None,
+            recovery_attempts: 0,
+            total_recovery_attempts: 0,
         }
     }
 

@@ -50,6 +50,11 @@ pub enum CollabEvent {
     FailureReport {
         coding_failure: String,
     },
+    /// Resume a `CodingFailed` session that failed on a recoverable
+    /// ("tooling") failure. Carries no fields — the phase to restore comes
+    /// from the session's own `failed_from_phase`, not from the event
+    /// payload, so a caller cannot puppeteer which phase to jump back into.
+    ResumeCoding,
 }
 
 impl CollabEvent {
@@ -66,6 +71,7 @@ impl CollabEvent {
             Self::CodeReviewFixGlobal { .. } => "CodeReviewFixGlobal",
             Self::FinalReview { .. } => "FinalReview",
             Self::FailureReport { .. } => "FailureReport",
+            Self::ResumeCoding => "ResumeCoding",
         }
     }
 }

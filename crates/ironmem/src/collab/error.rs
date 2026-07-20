@@ -33,4 +33,12 @@ pub enum CollabError {
 
     #[error("head_sha is required but missing or empty")]
     MissingHeadSha,
+
+    /// `ResumeCoding` was rejected: either the `CodingFailed` session's
+    /// stored `coding_failure` does not classify as a recoverable tooling
+    /// failure, or `failed_from_phase` was never recorded (a pre-migration
+    /// row). `reason` states which, as a fact about the session's stored
+    /// state — never a guess about what actually happened during coding.
+    #[error("session cannot be resumed: {reason}")]
+    NotResumable { reason: String },
 }

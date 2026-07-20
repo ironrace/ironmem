@@ -221,11 +221,19 @@ Indexes: `(task_tag, ts)` and `(collab_session_id, collab_phase)`.
 | `collab_session_id` | string  | collab_start            | `task_outcomes.collab_session_id` |
 | `started_at`        | iso8601 | collab_start            | `task_outcomes.started_at` |
 | `done_at`           | iso8601 | end/PR                  | `task_outcomes.done_at` |
-| `outcome`           | enum    | end/PR                  | `task_outcomes.outcome` ∈ {`merged`,`failed`,`abandoned`} |
+| `outcome`           | enum    | end/PR                  | `task_outcomes.outcome` ∈ {`merged`,`failed`,`abandoned`} **or NULL = in flight** |
 | `review_rounds`     | count   | §4                      | `task_outcomes.review_rounds` |
 | `fix_commits`       | count   | §4                      | `task_outcomes.fix_commits` |
 | `handoffs`          | count   | §4                      | `task_outcomes.handoffs` |
 | `pr_url`            | string  | PR creation             | `task_outcomes.pr_url` |
+
+`outcome` is a **three-valued** column: one of the three terminal values, or
+NULL meaning "no terminal state recorded yet" (in flight). NULL is reachable
+two ways — a task that has not terminated yet, and a task whose recorded
+`failed` outcome was cleared by `collab_resume` (see the 2026-07-19 amendment
+in §12). Any query that partitions tasks into completions and non-completions
+must account for the NULL rows explicitly; `outcome = 'merged'` and
+`outcome IN ('failed','abandoned')` are **not** complements.
 
 In PR 05 / issue #83, `status(set_task_tag=...)` is token-usage-only: it
 annotates subsequent non-collab `token_usage` rows with `task_tag` and the
@@ -439,6 +447,12 @@ GROUP BY t.task_tag;
 
 Non-completions are reported by the same shape with `t.outcome IN ('failed','abandoned')`,
 in a separate section (§2.2, §9.4).
+
+> NULL-outcome caveat: `outcome` is three-valued (§5.4), so these two filters do not
+> partition the table. Rows with NULL `outcome` and a non-null `started_at` are
+> **in-flight/attempted** and appear in neither query — including rows a
+> `collab_resume` cleared back to NULL. Report them as a third bucket rather than
+> letting them vanish; see the 2026-07-19 amendment in §12.
 
 > JOIN-key invariant: the `OR` join is safe only because `task_tag` and `collab_session_id`
 > are each unique per task in `task_outcomes`, and a token_usage row's two keys must be
@@ -930,3 +944,72 @@ baseline probes). No headline number, token source, or §7 cost changes. Tests:
 `tests/report_golden.rs` main golden (`baseline_task_count` 2 → 3, adding the
 measured-but-failed `sess-fail`) and a unit test in `report/mod.rs`
 (`baseline_count_includes_measured_tasks_without_merged_outcome`).
+
+### 2026-07-19 — issue #197: `collab_resume` clears `outcome='failed'` back to NULL (amends §5.4, clarifies §10.3/§10.4)
+
+Issue #197 adds `collab_resume`, which restores a `CodingFailed` collab session
+to the coding phase it failed from. The metrics consequence was implemented but
+never specified; this amendment is that specification.
+
+**Behavior.** A terminal `failure_report` writes
+`task_outcomes.outcome = 'failed'` plus `done_at` for the session's task row
+(`mark_task_outcome_done`, `task_tag = session_id`). A subsequent successful
+`collab_resume` calls
+`crates/ironmem/src/db/metrics.rs::clear_failed_task_outcome`, which issues
+`UPDATE task_outcomes SET outcome = NULL, done_at = NULL WHERE task_tag = ?1
+AND outcome = 'failed'`. The row returns to the in-flight state it held before
+the failure, so the resumed session can later be marked `merged` (or `failed`
+again) by the normal path. Notes on the implementation:
+
+- The `AND outcome = 'failed'` guard means a `merged` or `abandoned` row is
+  never clobbered — only the specific state `collab_resume` is undoing.
+- It runs **after** the resume transaction commits, and a failure is logged at
+  warn and swallowed: metrics never roll back or fail a collab turn. A 0-row
+  match is not an error (metrics may have been disabled when the failure fired).
+- This is the only writer in the metrics layer that nulls a value back out.
+  `mark_task_outcome_done` uses `COALESCE` and can therefore only ever set a
+  field, never clear it — which is exactly why a dedicated clear was needed.
+
+**§5.4 amendment.** `outcome` is redeclared as three-valued: `merged`,
+`failed`, `abandoned`, **or NULL**. NULL means "no terminal state recorded" —
+either never terminated, or terminated and then cleared by `collab_resume`.
+The §5.4 column table is updated accordingly. No column, unit, or destination
+changed; only the declared domain, which previously omitted a state the schema
+and the code both already produced.
+
+**Reporting consequence (§10.3/§10.4).** Because `outcome` is nullable,
+`outcome = 'merged'` and `outcome IN ('failed','abandoned')` are not
+complements, and a NULL row is excluded from **both**. A session that was
+resumed and then abandoned without a further terminal write counts as neither
+a completion nor a non-completion and disappears from both sides of the
+merged-rate denominator. Any non-completion rate computed as
+`count(failed|abandoned) / count(all outcome-bearing rows)` therefore
+**under-reports failures** by exactly the resumed-in-flight population.
+
+**How to account for them.** Treat NULL `outcome` with a non-null `started_at`
+as a third bucket — *in flight / attempted* — rather than dropping it. This is
+the same convention §12's 2026-06-12 entry already applies to unmerged PRs
+(`final_review` records `done_at` + `pr_url` and leaves `outcome` NULL so an
+unmerged PR is never silently counted as done). The denominator for any
+completion or non-completion rate is the count of task rows with a non-null
+`started_at`, not the count of rows with a non-null `outcome`:
+
+```sql
+SELECT
+  CASE
+    WHEN outcome IS NOT NULL           THEN outcome
+    WHEN started_at IS NOT NULL        THEN 'in_flight'
+  END                                  AS outcome_bucket,
+  COUNT(*)                             AS tasks
+FROM task_outcomes
+GROUP BY outcome_bucket;
+```
+
+An `in_flight` count that is large relative to `merged` + `failed` +
+`abandoned` is itself the signal to investigate — under #197 it most often
+means sessions were resumed and then left unfinished.
+
+**No token-semantics change.** §2, §6, and §7 are untouched: token rows are
+never rewritten by resume, so a resumed task's tokens-to-done keeps
+accumulating across the failure and the resume, which is the correct
+attribution — the retry cost is part of the cost of that task.

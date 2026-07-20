@@ -111,6 +111,106 @@ VERDICT_RE = re.compile(r"## Verdict.*?```(?:[a-zA-Z0-9_-]+)?\n(.*?)\n```",
 
 errors: list[str] = []
 
+# ---- coding_failure prefix cross-check -------------------------------------
+#
+# The prompt surfaces tell agents which `coding_failure` strings to send, and
+# the server decides — from `crates/ironmem/src/collab/mod.rs` — which ones it
+# will admit off-turn and which classify as recoverable. Nothing used to
+# connect the two, and the drift was real: `.claude-plugin/commands/collab.md`
+# instructed the dispatcher to send `codex_exec_failed_silent:`,
+# `codex_exec_timeout` and `codex_exec_env_error:`, none of which exist
+# anywhere in the Rust. A Codex process dying silently produced a report the
+# server rejected as "not your turn", leaving the session stuck mid-phase with
+# no failure recorded at all.
+#
+# These two checks close that class mechanically instead of by review.
+COLLAB_RS = ROOT / "crates" / "ironmem" / "src" / "collab" / "mod.rs"
+RUST_PREFIX_RE = re.compile(
+    r'pub const [A-Z0-9_]+_PREFIX: &str = "([a-z0-9_]+:)";')
+# Prefixes the surfaces may legitimately use that are deliberately absent from
+# the Rust constants: `classify()` maps every unrecognized string to
+# `FailureClass::Terminal`, and these two are documented terminal failures. Any
+# OTHER unrecognized prefix is far more likely a typo than a deliberate
+# terminal report, so it fails the gate and has to be added here on purpose.
+#
+# Every entry here is reported by the phase's own on-turn owner, so off-turn
+# admissibility never applies to it, and every one is meant to stop the
+# session for human attention rather than hand off a retry:
+#   subagent_failure:              a task the batch could not complete
+#   gate_failure:                  fmt/clippy/test gate red at the end of a batch
+#   mechanical_direct_gate_failed: the same, on Codex's mechanical_direct path
+#   skill_overran_pr_boundary:     a sub-skill opened a PR outside the protocol
+#   pr_create_failed:              `gh pr create` failed on Claude's final turn
+# `pr_create_failed:` is deliberately NOT the prefix Codex uses when it owns
+# `final_review` under recovery — there it reports `network_failed:` /
+# `sandbox_denied:`, which classify Tooling and hand the PR turn to Claude,
+# who owns PR creation in the normal flow. The asymmetry is intentional: a
+# Codex PR failure has a live counterpart to fall back on, Claude's does not.
+DOCUMENTED_TERMINAL_PREFIXES = {
+    "subagent_failure:",
+    "gate_failure:",
+    "mechanical_direct_gate_failed:",
+    "skill_overran_pr_boundary:",
+    "pr_create_failed:",
+}
+# `coding_failure` in the surfaces is followed by the value across a few
+# punctuation shapes: `coding_failure: "git_push_failed: …"`,
+# `{"coding_failure":"branch_drift: …"}`, `coding_failure = 'disk_full: …'`.
+# Allow a short run of non-word characters between the key and the prefix, and
+# capture the prefix token up to its colon.
+CODING_FAILURE_USE_RE = re.compile(r'coding_failure\W{0,8}([a-z][a-z0-9_]*):')
+
+
+def failure_prefix_surfaces() -> list[pathlib.Path]:
+    """Every markdown surface that may instruct an agent to send a failure."""
+    paths = [COMMAND, DOC, CODEX_COMMAND, CODEX_PROMPT]
+    for directory in (PROMPTS, ROOT / ".codex-plugin" / "prompts"):
+        if directory.is_dir():
+            paths.extend(sorted(directory.glob("*.md")))
+    # Deduplicate while preserving order: CODEX_PROMPT is also inside the
+    # .codex-plugin prompts directory.
+    seen: set[pathlib.Path] = set()
+    unique = []
+    for path in paths:
+        if path.exists() and path not in seen:
+            seen.add(path)
+            unique.append(path)
+    return unique
+
+
+def check_failure_prefixes() -> None:
+    if not COLLAB_RS.exists():
+        err(f"{COLLAB_RS}: cannot cross-check coding_failure prefixes — "
+            f"collab/mod.rs not found")
+        return
+    rust_text = COLLAB_RS.read_text()
+    rust_prefixes = set(RUST_PREFIX_RE.findall(rust_text))
+    if not rust_prefixes:
+        err("collab/mod.rs: no *_PREFIX constants parsed — the prefix "
+            "cross-check would pass vacuously, so it fails instead")
+        return
+    known = rust_prefixes | DOCUMENTED_TERMINAL_PREFIXES
+
+    for path in failure_prefix_surfaces():
+        rel = path.relative_to(ROOT)
+        for line_no, line in enumerate(path.read_text().splitlines(), 1):
+            for token in CODING_FAILURE_USE_RE.findall(line):
+                prefix = f"{token}:"
+                if prefix not in known:
+                    err(f"{rel}:{line_no}: coding_failure prefix {prefix!r} "
+                        f"is not declared in collab/mod.rs and is not a "
+                        f"documented terminal prefix — the server would "
+                        f"reject or misclassify it")
+
+    # Drift in the other direction: a prefix the server recognizes but that
+    # docs/COLLAB.md never mentions is a prefix no agent will ever be told to
+    # send.
+    doc_body = DOC.read_text()
+    for prefix in sorted(rust_prefixes):
+        if prefix not in doc_body:
+            err(f"docs/COLLAB.md: recognized failure prefix {prefix!r} is "
+                f"never documented")
+
 
 def err(msg: str) -> None:
     errors.append(msg)
@@ -309,6 +409,8 @@ def main() -> int:
         ]:
             if snippet not in codex_cmd_text:
                 err(f".codex-plugin/commands/collab.md: missing {snippet!r}")
+
+    check_failure_prefixes()
 
     if errors:
         print("collab-turn template lint FAILED:")

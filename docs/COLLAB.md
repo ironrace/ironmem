@@ -431,6 +431,12 @@ findings out the same way; Claude opens the PR on the final turn.
 | `CodeReviewLocalPending` | `claude` | `ReviewLocal{head_sha}` — Claude ran full or reduced `review_local` audit of Codex's commits + issues both agents missed, partitioned confirmed findings, used parallel fix subagents where safe, merged/cherry-picked the fixes, then pushed | `CodeReviewFinalPending` |
 | `CodeReviewFinalPending` | `claude` | `FinalReview{head_sha, pr_url}` — Claude opens the PR and sends the URL in the same event | `CodingComplete` (terminal) |
 
+The `Owner` column is the normal flow. Under the delegated-completion
+override, the recovery owner sends the interrupted phase's event in the
+original owner's place — including `final_review`, in which case Codex opens
+the PR. See "Failure + terminal" above and the PR-ownership rule under
+"Harness-Side Responsibilities".
+
 ### Shortcut: post-subagent coding review
 
 When an orchestrator already completed the branch's implementation outside
@@ -462,8 +468,10 @@ Invariants that still apply:
 
 - `collab_end` is rejected during all review phases, same as any other
   coding-active phase.
-- `failure_report` is the only escape hatch and transitions to
-  `CodingFailed`.
+- `failure_report` is the only escape hatch. A **Terminal**-classified
+  report transitions to `CodingFailed`; a **Tooling**-classified report
+  (six recoverable prefixes — see "Failure + terminal") instead keeps the
+  session at its current phase and flips `current_owner`.
 - Drift detection is special-cased for shortcut-started sessions:
   the server validates `CodeReviewFixGlobal{head_sha}` **and**
   `ReviewLocal{head_sha}` with a git ancestry check when `task_list` is
@@ -492,14 +500,228 @@ migration logic.
 
 ### Failure + terminal
 
+`failure_report` failures classify into two severities. Classification is
+server-authoritative (`classify` in
+`crates/ironmem/src/collab/failure_class.rs`, re-exported from
+`collab::mod`) — an agent never decides its own
+severity, it only picks an accurate `coding_failure` prefix.
+
+| Severity | Behavior |
+|---|---|
+| **Tooling** (recoverable) | Session **stays in its current phase**; `current_owner` flips to the counterpart agent, who must recover the turn. |
+| **Terminal** (unrecoverable) | Session transitions to `CodingFailed`. |
+
+#### The six recoverable prefixes
+
+A `coding_failure` classifies **Tooling** only if it starts with one of
+these prefixes AND has >=1 byte of detail after the colon. A bare prefix
+with nothing after it — like every other unrecognized string — classifies
+**Terminal**:
+
+| Prefix | Example |
+|---|---|
+| `git_commit_failed:` | `git_commit_failed: index.lock EPERM` |
+| `git_push_failed:` | `git_push_failed: remote rejected` |
+| `sandbox_denied:` | `sandbox_denied: write outside workspace` |
+| `disk_full:` | `disk_full: no space left on device` |
+| `network_failed:` | `network_failed: connection reset` |
+| `codex_dispatch_failed:` | `codex_dispatch_failed: process exited 137` |
+
+Everything else classifies **Terminal**: a bare recoverable prefix with no
+suffix, `branch_drift:` (see the drift check in "Harness-Side
+Responsibilities" below), `subagent_failure:`, any unrecognized string, and
+the empty string.
+
 | Phase | Owner | Event | Next |
 |---|---|---|---|
-| *any coding-active phase* | either | `FailureReport{coding_failure}` | `CodingFailed` (terminal) |
+| *any coding-active phase* | owner; `codex_dispatch_failed:` may also be reported by Claude while Codex owns the interrupted turn | `FailureReport{coding_failure}` classifying **Tooling** | same phase; `current_owner` becomes the counterpart of the interrupted turn owner |
+| *any coding-active phase* | owner; `branch_drift:` with detail may also be reported by either agent | `FailureReport{coding_failure}` classifying **Terminal** | `CodingFailed` (terminal) |
+
+#### Two independent axes: off-turn admissibility vs recoverable classification
+
+These are separate questions decided by separate code, and conflating them
+produces wrong expectations:
+
+- **Admissibility** — *may a non-owner send this report at all?* Decided by
+  `off_turn_failure_is_admissible` against `OFF_TURN_FAILURE_PREFIXES`
+  (`branch_drift:`, `codex_dispatch_failed:`).
+- **Classification** — *does this report recover or kill the session?*
+  Decided by `failure_class::classify` against
+  `RECOVERABLE_FAILURE_PREFIXES` (the six prefixes above). The reporter's
+  identity is irrelevant here.
+
+The two vocabularies overlap but are not the same set.
+`codex_dispatch_failed:` is in both — off-turn-admissible *and* Tooling.
+`branch_drift:` is in only the first: **off-turn-admissible but always
+Terminal**, because it is not in `RECOVERABLE_FAILURE_PREFIXES`. Either
+agent may report drift at any time, and every such report ends the session
+in `CodingFailed` — drift means the two agents disagree about what is on
+the branch, which no in-place recovery turn can reconcile. The remaining
+five recoverable prefixes are Tooling but owner-only.
 
 `collab_end` is **rejected** in every coding-active phase
 (`CodeImplementPending`, `CodeReviewFixGlobalPending`,
 `CodeReviewLocalPending`, `CodeReviewFinalPending`). Only
 `CodingComplete` or `CodingFailed` end the session post-`task_list`.
+
+**There is no `collab_end` exit from an in-flight recovery.** A Tooling
+report keeps the session in its coding-active phase indefinitely, and that
+phase is exactly where `collab_end` is rejected — so an operator who wants
+to abandon a session mid-recovery must first drive it to a terminal phase.
+The intended procedure is one of:
+
+- (a) let the recovery owner complete the interrupted turn (the session
+  advances normally, and `collab_end` becomes valid at `CodingComplete`);
+  or
+- (b) drive the session to `CodingFailed` — either by exhausting a retry
+  ceiling below, or by sending a Terminal-classified `failure_report`
+  (e.g. `subagent_failure: operator abandoned mid-recovery`). `collab_end`
+  is valid from `CodingFailed`.
+
+Option (b) is the deliberate abandon path. It is not a workaround: the
+`CodingFailed` row records `coding_failure` and `failed_from_phase`, so
+the abandonment is auditable, and — if the recorded failure classifies
+Tooling and the lifetime ceiling below is not exhausted — the session
+stays eligible for `collab_resume` later.
+
+#### Retry ceilings: `MAX_RECOVERY_ATTEMPTS = 2` and `MAX_TOTAL_RECOVERY_ATTEMPTS = 5`
+
+Two counters bound recovery, and a Tooling `failure_report` degrades to the
+terminal `CodingFailed` path when **either** would be exceeded — that is,
+when `recovery_attempts + 1 > MAX_RECOVERY_ATTEMPTS` **or**
+`total_recovery_attempts + 1 > MAX_TOTAL_RECOVERY_ATTEMPTS`. The degrade
+uses that report's own diagnostic, not an earlier attempt's.
+
+| Counter | Scope | Incremented | Reset |
+|---|---|---|---|
+| `recovery_attempts` (ceiling 2) | **per resume** — the budget for the current recovery streak | on every accepted Tooling recovery handoff | to `0` on a successful delegated completion, and on `ResumeCoding` (`collab_resume`) |
+| `total_recovery_attempts` (ceiling 5) | **lifetime of the session** | on every accepted Tooling recovery handoff | **never** — not by a successful completion, not by `collab_resume`, not by anything |
+
+`collab_resume` is additionally rejected with `NotResumable` once
+`total_recovery_attempts >= MAX_TOTAL_RECOVERY_ATTEMPTS`, so an exhausted
+session cannot be resurrected into another recovery streak.
+
+**Why 5 and not a multiple of 2.** The lifetime ceiling is deliberately
+*not* a multiple of `MAX_RECOVERY_ATTEMPTS`. In exactly the loop it exists
+to stop — exhaust the budget, resume, exhaust it again, with no successful
+completion in between — the lifetime count advances in lockstep with the
+per-resume budget and therefore lands only on multiples of 2. A lifetime
+ceiling of 4 or 6 would only ever be reached on a report the per-resume
+ceiling already degrades, so it would never be the binding check on that
+path: unreachable in the one scenario it was written for, and
+indistinguishable from a missing check. At 5 it genuinely binds: two exhausted
+budgets put the lifetime count at 4, a `collab_resume` refills the
+per-resume budget to 0, the next accepted handoff takes the lifetime count
+to 5, and the one after that degrades the session to `CodingFailed` on the
+lifetime ceiling alone — with the per-resume budget still unspent at 1.
+
+**Why the lifetime counter exists.** `collab_resume` is agent-callable and
+sits in the unattended-successor permission allowlist, and it zeroes
+`recovery_attempts`. Before `total_recovery_attempts` existed, the
+per-resume budget was the only bound, so an autonomous agent could loop
+forever: N tooling failures → ceiling → `CodingFailed` → `collab_resume` →
+budget back to 0 → N more failures, burning tokens indefinitely. No
+surface could show a count above `2`, because the only counter that existed
+was the one being reset — `collab_status` and the handoff block both
+reported a session mid-loop as healthy. `total_recovery_attempts` is
+monotonic precisely so that the loop terminates and so that the true
+recovery cost of a session is visible on both surfaces.
+
+Both counters are exposed by `collab_status` and rendered in the
+`session_handoff` block, alongside `recovery_origin_owner`.
+`total_recovery_attempts` is a nullable `INTEGER` column on
+`collab_sessions` added by migration 015; legacy rows store `NULL` and read
+back as `0`.
+
+#### Reporter and recovery-owner protocol (operator instructions — not server-enforced)
+
+When an agent hits a recoverable tooling failure — e.g. Codex cannot `git
+commit` from inside a linked worktree — it sends `failure_report` with a
+recoverable prefix and a real detail suffix, e.g. `git_commit_failed:
+index.lock EPERM`. The phase does not change; only `current_owner` flips
+to the counterpart. Two rules apply to both agents by convention — the
+server does not enforce either:
+
+- **The reporter MUST leave the working tree and diff intact.** Do not
+  `git reset --hard` or otherwise discard staged/unstaged work when
+  reporting a tooling failure — the counterpart needs that exact diff to
+  finish the turn. (This is distinct from the ordinary pre-send sync
+  described in "Harness-Side Responsibilities" below, which resets to
+  `last_head_sha` at the *start* of a turn — not while abandoning one
+  mid-flight.)
+- **The reporter MUST NOT retry the same failing operation in a loop**
+  hoping it magically works. Report once per genuine attempt and let the
+  counterpart recover.
+
+For an ordinary owner-reported failure, the recovery owner is the reporter's
+counterpart. `codex_dispatch_failed:` is off-turn-admissible only when Claude
+reports it against a Codex-owned turn. (`branch_drift:` is off-turn-admissible
+for either agent but classifies Terminal, so it never produces a recovery owner
+— see "Two independent axes" above.) When Claude observes an unavailable Codex turn
+and reports `codex_dispatch_failed:`, recovery stays with Claude (the
+counterpart of the interrupted Codex owner), rather than being handed back to
+the unavailable process. The recovery owner (the agent `current_owner` now
+names) MUST:
+
+1. Inspect the preserved diff/working-tree state the reporter left behind.
+2. Run whatever gates apply to the interrupted phase itself — the protocol
+   has no way to verify the reporter's incomplete work was safe.
+3. Commit and push the result itself. This is the actual fix for the
+   worktree-`git commit` scenario above: a different agent, with different
+   sandbox/git permissions, finishes the operation the reporter couldn't.
+4. Send the phase's **normal** completion event (`implementation_done`,
+   `review_fix_global`, `review_local`, or `final_review`, whichever the
+   interrupted phase expects). The delegated-completion mechanism accepts
+   the recovery owner's normal completion event as if it were the original
+   owner's.
+
+   **Do not re-report the failure you were handed.** Echoing the same
+   tooling failure back (`git_commit_failed:` again, because you did not
+   actually try a different approach) does not complete the turn — it just
+   burns a retry attempt against both ceilings and flips ownership back.
+   Recovery means attempting the operation with your own tools and
+   permissions, not forwarding the diagnostic.
+
+   This is **not** a blanket ban on `failure_report` during recovery. A
+   *genuinely new* failure hit while recovering still gets its own report:
+   a real gate failure, an unrecoverable subagent failure, drift detected
+   on the branch. Report it with the prefix that accurately describes what
+   you hit — and accept that if it classifies **Terminal** (e.g.
+   `subagent_failure:`, `branch_drift:`) it correctly ends the session in
+   `CodingFailed` rather than recovering again. The agent prompts instruct
+   exactly this; an accurate terminal report is the right outcome, not a
+   protocol violation.
+
+#### `pending_failure` vs `coding_failure`
+
+- `pending_failure` holds the diagnostic for an **in-flight** recoverable
+  (Tooling) failure. It is set while the session stays in its
+  coding-active phase awaiting recovery, and is mutually exclusive with
+  `coding_failure`.
+- `coding_failure` is reserved for the **terminal** cause. It is only ever
+  set when the session actually enters `CodingFailed` — either a genuine
+  Terminal report, or a Tooling report that broke either retry ceiling.
+
+#### `collab_resume`
+
+`collab_resume` (a separate MCP tool — see below — not a `collab_send`
+topic) lets either agent restore a `CodingFailed` session back to its
+`failed_from_phase`. It is eligible only when ALL THREE hold:
+
+- the stored `coding_failure` classifies **Tooling**,
+- `failed_from_phase` was actually recorded, and
+- `total_recovery_attempts < MAX_TOTAL_RECOVERY_ATTEMPTS` (5) — the
+  monotonic lifetime budget is what makes resume terminate rather than
+  refill itself forever.
+
+A session that predates this feature has `failed_from_phase = NULL` and
+`collab_resume` returns a deterministic `NotResumable` error naming that
+the session "predates resume support" — never a guess about what actually
+happened during coding. This path is for when the per-resume retry ceiling
+was exceeded, or a genuinely fresh process wants to pick a
+dead-but-recoverable session back up — it is not needed for the normal
+in-flight recovery described above, since that session never leaves its
+phase in the first place.
 
 ## Blind-Draft Invariant
 
@@ -645,6 +867,36 @@ Returns the full session record including `phase`, `current_owner`, `task`,
 `review_round`, `ended_at`, and all hashes. Call this before every protocol
 action.
 
+**Recovery-state fields.** Also returns `pending_failure`, `failed_from_phase`,
+`recovery_phase`, `recovery_owner`, `recovery_origin_owner`,
+`recovery_attempts`, and `total_recovery_attempts` (see "Failure + terminal"
+above for the full semantics — `recovery_attempts` is the per-resume budget and
+resets; `total_recovery_attempts` is the monotonic lifetime count and never
+resets, so it is the field to read when judging whether a session is worth
+continuing).
+
+**`recovery_origin_owner`** names the agent that owned the turn the failure
+interrupted. Control is **not** handed back to it: the recovery owner
+(`recovery_owner`) completes the interrupted turn itself, and the phase's
+normal completion event picks the next owner exactly as it would have from
+the original owner. The field is provenance, not routing — it is the only
+thing on this surface that distinguishes a completion event produced by a
+delegated recovery owner from one produced by the phase's own expected
+agent. Read it when auditing who actually did the work in a phase, not when
+deciding who acts next.
+
+**`pending_failure` is the
+recovery-in-progress signal:** if it is non-null, `current_owner` was just
+flipped by a recoverable `failure_report` rather than by a normal turn
+advance — this is how an agent that reads `current_owner == <itself>`
+distinguishes "it's simply my turn" from "I am the recovery owner for an
+interrupted turn." A worker whose preconditions match `current_owner` should
+check `pending_failure` as part of state discovery: when set, follow the
+recovery-owner protocol above (inspect the preserved diff, run this phase's
+gates, commit + push, send the phase's own normal completion event rather than
+re-reporting the failure you were handed) before doing anything else. `coding_failure` is
+`null` whenever `pending_failure` is set — see the distinction above.
+
 #### Plan-by-reference contract
 
 Accepted plan and task-list bodies are returned by reference by default to keep
@@ -729,6 +981,50 @@ Idempotent once allowed: calling from a terminal phase or an
 already-ended session is a no-op, and subsequent `send`, `ack`, `approve`,
 `register_caps`, and `wait_my_turn` calls all treat the session as ended.
 
+### `collab_resume`
+
+Restores a `CodingFailed` session back to its `failed_from_phase`. This is
+a **separate MCP tool, not a `collab_send` topic**. See "Failure +
+terminal" above for the recoverable-vs-terminal classification and the two
+retry ceilings that can land a session in `CodingFailed` even from a
+Tooling-classified failure.
+
+```json
+{ "session_id": "...", "agent": "codex" }
+```
+
+Eligible only when the session's stored `coding_failure` classifies
+**Tooling** (one of the six recoverable prefixes, with a detail suffix),
+`failed_from_phase` was recorded, **and** the lifetime recovery budget is
+not exhausted. An ineligible call rejects with `NotResumable { reason }`:
+
+- A **Terminal**-classified `coding_failure` (unrecognized cause,
+  `branch_drift:`, or `subagent_failure:`) is never resumable — `reason`
+  states this as a fact about the stored classification, never a guess about
+  what happened during coding. A Tooling report that broke the per-resume
+  retry ceiling remains Tooling and is resumable.
+- A session whose `total_recovery_attempts >= MAX_TOTAL_RECOVERY_ATTEMPTS`
+  (5) is not resumable regardless of classification. This is the stop on the
+  resume→retry→resume loop: because `collab_resume` is agent-callable and
+  allowlisted for unattended successors, without this check a Tooling
+  failure could be resumed indefinitely.
+- A session whose `failed_from_phase` is `NULL` predates this feature;
+  `reason` says the session "predates resume support."
+
+On success: `phase` is restored to `failed_from_phase`, `current_owner`
+becomes the caller (`agent`), `coding_failure` clears, and the prior
+terminal diagnostic moves into `pending_failure` for audit.
+`recovery_attempts` resets to `0`, giving the restored turn a fresh
+per-resume retry budget. `total_recovery_attempts` is **not** reset — it
+carries the session's whole recovery history across every resume, and is
+what eventually makes the session permanently non-resumable.
+`failed_from_phase` itself is left set as a historical record. This path
+is for when the retry ceiling was exceeded, or a fresh process wants to
+pick a dead-but-recoverable session back up — it is not needed for the
+normal in-flight recovery path (staying in-phase after a Tooling
+`failure_report`), which never calls `collab_resume` since that session
+never leaves its phase in the first place.
+
 ### `session_handoff` (fallback succession)
 
 Issues a cryptographic succession token that lets a fresh process take over
@@ -748,6 +1044,15 @@ model-free fenced markdown block (` ```ironrace-session-handoff `) — it
 NEVER asks a model to summarize. This tool is a WRITE tool and is denied in
 read-only / restricted MCP mode.
 
+**Recovery-state lines.** The block mirrors the `collab_status` recovery
+fields — `pending_failure`, `failed_from_phase`, `recovery_phase`,
+`recovery_owner`, `recovery_origin_owner`, `recovery_attempts`, and
+`total_recovery_attempts` — so a successor can route an interrupted recovery
+turn, and judge how much recovery the session has already burned, from the
+block alone. The two counters render as plain integers (`0` on legacy rows
+whose columns are `NULL`); the four `Option` fields render an em-dash
+placeholder when unset, like every other unset field in the block.
+
 **Generation lease.** Each `(session_id, agent)` pair tracks an `active
 generation` and a `pending_handoff_generation`. `session_handoff` issues (or
 byte-identically reuses) a one-time `handoff_token` and sets
@@ -755,7 +1060,7 @@ byte-identically reuses) a one-time `handoff_token` and sets
 the active generation. A successor presents the `handoff_token` on its first
 actor-bearing mutating/binding collab call (`collab_send`, `collab_recv`,
 `collab_ack`, `collab_approve`, `collab_set_implementer`,
-`collab_register_caps`, `collab_wait_my_turn`, `collab_end`, or
+`collab_register_caps`, `collab_wait_my_turn`, `collab_end`, `collab_resume`, or
 `session_handoff` itself) to **claim** — the claim advances the active
 generation, making the predecessor process **inert**.
 
@@ -864,6 +1169,7 @@ An unattended `claude -p` successor needs at minimum:
 - `mcp__ironmem__collab_register_caps` — register capabilities
 - `mcp__ironmem__collab_wait_my_turn` — wait for turn
 - `mcp__ironmem__collab_end` — end session
+- `mcp__ironmem__collab_resume` — resume a tooling-class `CodingFailed` session
 - `mcp__ironmem__session_handoff` — re-handoff if needed
 - `mcp__ironmem__collab_status` — read session state
 - `Bash(claude -p "join ironmem collab *":*)` — re-spawn a further successor if
@@ -931,10 +1237,16 @@ orchestrator from steering the reviewer's conclusion.
 |---|---|---|---|
 | `task_list` | `claude` | `{"plan_hash","base_sha","head_sha","plan_file_path"?,"execution_mode"?,"tasks":[{"id","title","timebox_minutes","acceptance":[...]}]}` | `plan_hash` must equal `final_plan_hash`; `tasks` must be non-empty and strictly ordered by `id`; each task requires `timebox_minutes <= 20` and ≥1 `acceptance` entry. Optional `plan_file_path` (repo-relative; no leading `/`; no `..` segments) points at the approved Superpowers task markdown driving subagent execution. Optional `execution_mode` — see below. |
 | `implementation_done` | `claude` or `codex` (per session `implementer`) | `{"head_sha"}` | In `CodeImplementPending` only. Fired once after the subagent batch completes and gates pass. Carries only `head_sha` — no prose, no subagent notes. |
-| `review_fix_global` | `codex` | `{"head_sha"}` | In `CodeReviewFixGlobalPending` only. Codex ran `/pr-review-toolkit:review-pr` on the raw post-implementation diff (no Claude pre-clean), used parallel fix subagents for confirmed partitionable findings, merged/cherry-picked the resulting fixes, and pushed the branch-level fix commit(s). |
-| `review_local` | `claude` | `{"head_sha"}` | In `CodeReviewLocalPending` only. Claude ran full or reduced audit of Codex's `review_fix_global` commits + caught issues both agents missed, used parallel fix subagents for confirmed partitionable findings, merged/cherry-picked the resulting fixes, and pushed. |
-| `final_review` | `claude` | `{"head_sha","pr_url"}` | In `CodeReviewFinalPending` only. Claude has opened the PR; the event carries the URL and advances directly to `CodingComplete`. `pr_url` must start with `https://` and be ≤2048 chars. |
-| `failure_report` | either | `{"coding_failure":"<reason>"}` | Valid in any coding-active phase. |
+| `review_fix_global` | `codex` (or `claude` as recovery owner under the delegated-completion override) | `{"head_sha"}` | In `CodeReviewFixGlobalPending` only. Codex ran `/pr-review-toolkit:review-pr` on the raw post-implementation diff (no Claude pre-clean), used parallel fix subagents for confirmed partitionable findings, merged/cherry-picked the resulting fixes, and pushed the branch-level fix commit(s). |
+| `review_local` | `claude` (or `codex` as recovery owner under the delegated-completion override) | `{"head_sha"}` | In `CodeReviewLocalPending` only. Claude ran full or reduced audit of Codex's `review_fix_global` commits + caught issues both agents missed, used parallel fix subagents for confirmed partitionable findings, merged/cherry-picked the resulting fixes, and pushed. |
+| `final_review` | `claude` (or `codex` as recovery owner under the delegated-completion override) | `{"head_sha","pr_url"}` | In `CodeReviewFinalPending` only. The turn owner has opened the PR; the event carries the URL and advances directly to `CodingComplete`. `pr_url` must start with `https://` and be ≤2048 chars. |
+| `failure_report` | current owner; off-turn `branch_drift:` may come from either agent; off-turn `codex_dispatch_failed:` may come only from Claude against a Codex-owned turn | `{"coding_failure":"<reason>"}` | Valid in any coding-active phase. Classifies **Tooling** (six recoverable prefixes, stays in-phase, `current_owner` flips) or **Terminal** (everything else — including `branch_drift:` — transitions to `CodingFailed`) — see "Failure + terminal" above. |
+
+The `Sender` column above names the agent that owns the phase in the normal
+flow. While a recovery is in flight, the delegated-completion override
+accepts the **recovery owner** — the counterpart agent — sending that same
+completion event in the original owner's place; see "Reporter and
+recovery-owner protocol" under "Failure + terminal" above.
 
 ### `task_list` — `execution_mode` field
 
@@ -988,12 +1300,23 @@ exactly one event variant — there is no phase overloading.
 | `CodeImplementPending` | `implementation_done`, `failure_report` | v3 — single implementer turn after subagent batch |
 | `CodeReviewFixGlobalPending` | `review_fix_global`, `failure_report` | v3 — Codex runs `/pr-review-toolkit:review-pr` on the raw post-implementation diff, then fans confirmed fixes out to subagents |
 | `CodeReviewLocalPending` | `review_local`, `failure_report` | v3 — Claude audits Codex's commits, then fans confirmed fixes out to subagents |
-| `CodeReviewFinalPending` | `final_review`, `failure_report` | v3 — Claude opens PR |
+| `CodeReviewFinalPending` | `final_review`, `failure_report` | v3 — Claude opens PR (Codex opens it when recovery hands it this phase) |
 | `CodingComplete` / `CodingFailed` | *(none — terminal; only `collab_end` accepted)* | |
 
-`failure_report` is accepted from either agent in any coding-active phase
-and transitions the session to `CodingFailed`. All other topics are gated
-by the owner recorded in the phase table above.
+`failure_report` is accepted from the current owner in any coding-active
+phase. `branch_drift:` with real detail is also accepted off-turn from either
+agent; `codex_dispatch_failed:` with real detail is accepted off-turn only
+from Claude against a Codex-owned turn. A **Terminal**-classified report
+transitions the session to `CodingFailed`; a **Tooling**-classified report
+(one of the six recoverable prefixes, with detail — see "Failure + terminal"
+above) instead keeps the session in its current phase and hands recovery to
+the counterpart of the interrupted turn owner. All other topics are gated by
+the owner recorded in the phase table above.
+
+`collab_resume` is a separate MCP tool, not a `collab_send` topic, so it is
+out of scope for this table — but it is the one way back into a coding
+phase from `CodingFailed`, when the stored failure classifies `Tooling` and
+`failed_from_phase` was recorded. See "Failure + terminal" above.
 
 ## Harness-Side Responsibilities
 
@@ -1018,6 +1341,12 @@ before each coding-active `collab_send`:
   round-trip and a working-tree reset on the common case where the agent is
   already at the right SHA — for example, entering the batch-impl turn
   immediately after `task_list` is sent.
+- **Recovery turns preserve the diff.** If `pending_failure` is non-null and
+  the current harness owns the session, it is recovering an interrupted turn.
+  It must inspect the existing worktree and run that phase's gates before
+  fetching, checking out, or resetting; ordinary pre-send synchronization may
+  discard the reporter's uncommitted recovery diff. It then commits/pushes and
+  sends the interrupted phase's normal completion event.
 - **Subagent orchestration** during `CodeImplementPending`. Claude's final
   planning gate produces the Superpowers task markdown, and the PlanLocked
   bridge publishes it via `task_list`. The selected `implementer` then runs
@@ -1093,13 +1422,36 @@ before each coding-active `collab_send`:
   `origin/main`, then `origin/master`, then `origin/trunk` when they contain
   that commit), runs `gh pr create --base <base_branch> ...`, and sends the URL
   inline with the `final_review` event. There is no separate `pr_opened` turn.
-- **Codex must not create or check for PRs.** Codex never calls `gh pr
-  create`, `gh pr list`, `git ls-remote refs/pull/*`, or any other
-  PR-related GitHub API operation during any of its phases. PR creation
-  belongs exclusively to Claude's `final_review` turn. This boundary is
-  explicit: removing the PR check from Codex's batch turn also removes
-  Codex's dependency on `api.github.com` reachability, which was observed
-  as a fragility in practice.
+- **PR creation is scoped by protocol ownership, not by tooling.** Codex may
+  run any `gh`, git, or GitHub API operation it needs; nothing about the
+  tooling is off-limits. What is restricted is *who owns the turn that
+  creates the PR*. Codex creates a PR only when it actually owns
+  `CodeReviewFinalPending` under the recovery override — i.e. all three of
+  `pending_failure` non-null, `current_owner == "codex"`, and
+  `recovery_phase == "CodeReviewFinalPending"`. In the normal flow Claude
+  owns that turn and Codex never reaches it, so in practice Codex still
+  does not open PRs; it simply is no longer forbidden to when recovery
+  hands it the turn. Codex should still avoid gratuitous PR probes in its
+  ordinary phases (`gh pr list`, `git ls-remote refs/pull/*`) — they add an
+  `api.github.com` reachability dependency that was observed as a fragility
+  in practice — but that is a robustness preference, not a prohibition.
+
+  **Why the old blanket ban was a defect.** The previous rule said Codex
+  must never call any PR-related operation, full stop. Recovery can hand
+  `CodeReviewFinalPending` to Codex, and `parse_final_review_event` requires
+  a `pr_url` starting with `https://`. Under the blanket ban, a recovering
+  Codex had exactly two moves: fabricate a URL — permanently corrupting
+  `sessions.pr_url` and the downstream task-outcome metrics — or re-report
+  and burn the retry budget down to `CodingFailed`. Both are wrong outcomes
+  produced by the rule itself.
+
+- **Never fabricate or guess a `pr_url`.** The server validates the scheme
+  and length; it cannot tell a real PR from an invented one, so a made-up
+  URL is accepted and becomes permanent session state. If a PR genuinely
+  cannot be created, send `failure_report` with the prefix that describes
+  what actually failed (`network_failed:` or `sandbox_denied:` as
+  applicable) rather than inventing a URL. A recoverable failure report
+  costs one retry attempt; a fabricated URL corrupts the record forever.
 - **Plan Mode** on Claude's side is entered before only one gate: `final`
   (v1), where Claude produces the approved Superpowers task plan. Canonical
   synthesis runs autonomously. The `task_list` send mechanically parses that
@@ -1519,6 +1871,50 @@ model_reasoning_effort=high`. A discovered architecture or security issue may
 escalate a subagent to `gpt-5.6-sol` at high effort, but the parent protocol
 dispatch remains on its phase default.
 
+**Sandbox: every Codex-owned dispatch passes `-s danger-full-access`.** Both
+launch lines are:
+
+```bash
+# CodeImplementPending+codex:
+cd <repo_path> && codex exec -m gpt-5.6-luna -c model_reasoning_effort=max -s danger-full-access - < /tmp/codex-prompt-${session_id}.md > /tmp/codex-out-${session_id}.log 2>&1
+
+# All other Codex-owned phases:
+cd <repo_path> && codex exec -m gpt-5.6-terra -c model_reasoning_effort=high -s danger-full-access - < /tmp/codex-prompt-${session_id}.md > /tmp/codex-out-${session_id}.log 2>&1
+```
+
+The flag is unconditional — never phase-, model-, or worktree-topology-
+dependent. Codex runs unsandboxed by explicit choice, because the sandbox
+breaks the protocol. A collab session normally runs from a linked worktree,
+whose `.git` is a file pointing at `<main-repo>/.git/worktrees/<name>/`; that
+per-worktree gitdir and the shared object/ref database Codex's `commit`/`push`
+turn writes to both live outside any workspace-scoped root, so a
+workspace-write sandbox denies `git commit` outright. Denials are also not
+limited to the filesystem: under workspace-write, `cargo test --workspace`
+failed the daemon/doctor tests with "Operation not permitted" because Unix
+domain socket creation was denied, and no set of extra writable roots
+(`--add-dir` or otherwise) can grant that capability. An earlier
+`--add-dir "<common-gitdir>"` workaround addressed only the git-metadata half
+of the problem and is superseded by this flag; do not reintroduce it.
+
+**What the flag actually costs.** The decision stands, but the trade is not
+free, and the boundary given up is *not* agent-vs-user — it is
+agent-vs-**untrusted content**. Codex is dispatched by the user against the
+user's own repo, so nothing here protects the user from their own agent. What
+the sandbox would have contained is content the agent *reads*: Codex's
+`review_fix_global` turn runs `/pr-review-toolkit:review-pr` over PR diffs and
+review comments, both of which a third party can author. Prompt-injected
+instructions in that material execute with full local filesystem and process
+access — read any file the user can read, write anywhere, spawn anything.
+`danger-full-access` additionally removes any restriction on **network
+egress**, so injected content can also exfiltrate what it reads; the sandbox
+argument above is about writes and sockets and never covered egress at all.
+
+**Operational rule.** Do not run a collab session against a branch or PR whose
+diff or review comments come from an untrusted author. Collab is for work
+authored by the operator and their own agents. Reviewing third-party
+contributions needs a sandboxed, egress-restricted review path that this
+protocol does not currently provide.
+
 #### Fallback: synchronous `mcp__codex__codex` MCP
 
 When `codex` is not on PATH, the dispatcher falls back to synchronous
@@ -1546,7 +1942,8 @@ unchanged; only the transport differs.
        "cwd": "<repo_path>",
        "config": {
          "model": "gpt-5.6-luna",
-         "model_reasoning_effort": "max"
+         "model_reasoning_effort": "max",
+         "sandbox": "danger-full-access"
        }
      }
    }
@@ -1555,7 +1952,9 @@ unchanged; only the transport differs.
    model policy and dispatch matrix. For `CodeImplementPending+codex` use
    `gpt-5.6-luna` at `max`; for planning and normal review use
    `gpt-5.6-terra` at `high`. Do not omit the model override or inherit the
-   caller's personal default.
+   caller's personal default. `config.sandbox` is always
+   `"danger-full-access"`, matching the CLI launch lines — the MCP transport
+   gets no different sandbox treatment.
    The call blocks until Codex finishes its phase-specific action and
    hands control back. Claude then resumes the dispatch loop.
 

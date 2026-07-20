@@ -820,6 +820,34 @@ impl Database {
         Ok(())
     }
 
+    /// Clear a stale `outcome='failed'`/`done_at` row written by an earlier
+    /// terminal `failure_report`, so a `collab_resume`d session can complete
+    /// normally afterward (METRICS_SPEC §5.4 amendment, task 10). Unlike
+    /// `mark_task_outcome_done`'s `COALESCE` semantics (which can only ever
+    /// set a value, never null one back out), this issues a genuine clear.
+    ///
+    /// Scoped to `outcome = 'failed'` in the WHERE clause — a defensive guard
+    /// against clobbering a genuinely different terminal state
+    /// (`merged`/`abandoned`) if this is ever called against the wrong
+    /// `task_tag`. A 0-row match is not necessarily an error: metrics may
+    /// have been disabled when the original `failure_report` fired, so no
+    /// row was ever marked failed in the first place. Logged at debug rather
+    /// than `mark_task_outcome_done`'s warn, since that guards a different
+    /// invariant (a task_tag that should exist but doesn't).
+    pub fn clear_failed_task_outcome(&self, task_tag: &str) -> Result<(), MemoryError> {
+        let changed = self.conn.execute(
+            "UPDATE task_outcomes SET outcome = NULL, done_at = NULL
+             WHERE task_tag = ?1 AND outcome = 'failed'",
+            params![task_tag],
+        )?;
+        tracing::debug!(
+            task_tag = %task_tag,
+            rows_changed = changed,
+            "metrics: clear_failed_task_outcome"
+        );
+        Ok(())
+    }
+
     /// Return all `task_outcomes` rows for a given `collab_session_id`,
     /// ordered by `(started_at, id)` ascending.
     pub fn task_outcomes_for_collab(
@@ -1938,6 +1966,61 @@ mod tests {
         assert!(db
             .mark_task_outcome_done("issue-83", None, Some("bogus"), None)
             .is_err());
+    }
+
+    #[test]
+    fn clear_failed_task_outcome_nulls_outcome_and_done_at() {
+        let db = db();
+        db.upsert_task_outcome(&sample_task_outcome("issue-83", "2026-06-12T00:00:00Z"))
+            .unwrap();
+        db.mark_task_outcome_done(
+            "issue-83",
+            Some("2026-06-12T01:00:00Z"),
+            Some("failed"),
+            None,
+        )
+        .unwrap();
+        let got = db.get_task_outcome("issue-83").unwrap().unwrap();
+        assert_eq!(got.outcome.as_deref(), Some("failed"));
+        assert!(got.done_at.is_some());
+
+        db.clear_failed_task_outcome("issue-83").unwrap();
+
+        let got = db.get_task_outcome("issue-83").unwrap().unwrap();
+        assert_eq!(got.outcome, None, "outcome must be nulled");
+        assert_eq!(got.done_at, None, "done_at must be nulled");
+    }
+
+    #[test]
+    fn clear_failed_task_outcome_is_scoped_to_failed_only() {
+        let db = db();
+        db.upsert_task_outcome(&sample_task_outcome("issue-83", "2026-06-12T00:00:00Z"))
+            .unwrap();
+        db.mark_task_outcome_done(
+            "issue-83",
+            Some("2026-06-12T01:00:00Z"),
+            Some("merged"),
+            None,
+        )
+        .unwrap();
+
+        db.clear_failed_task_outcome("issue-83").unwrap();
+
+        let got = db.get_task_outcome("issue-83").unwrap().unwrap();
+        assert_eq!(
+            got.outcome.as_deref(),
+            Some("merged"),
+            "a non-'failed' outcome must not be clobbered by clear_failed_task_outcome"
+        );
+        assert!(got.done_at.is_some(), "done_at must be preserved too");
+    }
+
+    #[test]
+    fn clear_failed_task_outcome_missing_tag_is_noop_ok() {
+        let db = db();
+        assert!(db.get_task_outcome("missing-clear").unwrap().is_none());
+        assert!(db.clear_failed_task_outcome("missing-clear").is_ok());
+        assert!(db.get_task_outcome("missing-clear").unwrap().is_none());
     }
 
     // ---- §10 report aggregates ----

@@ -13,7 +13,24 @@ preconditions: phase == CodeReviewLocalPending, current_owner == claude
 > paste the review report.
 
 ## State discovery
-1. `collab_status(session_id=$SESSION_ID)`; read `last_head_sha`.
+1. `collab_status(session_id=$SESSION_ID)`; read `last_head_sha`,
+   `pending_failure`. A non-null `pending_failure` means you are the
+   **recovery owner** for an interrupted turn, not simply the next-in-line
+   owner — see "Recoverable vs terminal failures" below before proceeding.
+
+## Recoverable vs terminal failures
+
+The server classifies `failure_report`, not you — send an accurate
+`coding_failure` prefix and let it decide. Six prefixes recover the turn
+instead of ending the session: `git_commit_failed:`, `git_push_failed:`,
+`sandbox_denied:`, `disk_full:`, `network_failed:`,
+`codex_dispatch_failed:` (each needs real detail after the colon, e.g.
+`git_commit_failed: index.lock EPERM`); everything else (including
+`branch_drift:`/`subagent_failure:`) is terminal. If you are acting as
+**recovery owner** — control was handed to you after Codex's recoverable
+`failure_report`, or you resumed via `collab_resume` — inspect the
+preserved diff, run this turn's gates yourself, commit + push, then send
+the normal `review_local` (never a new `failure_report`).
 
 ## Actions
 1. Pre-send harness: `git fetch`; `git cat-file -e <last_head_sha>^{commit}`

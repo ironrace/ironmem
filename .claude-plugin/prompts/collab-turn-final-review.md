@@ -14,12 +14,32 @@ preconditions: phase == CodeReviewFinalPending, current_owner == claude
 
 ## State discovery
 1. `collab_status(session_id=$SESSION_ID)`; read `task_list_ref`,
-   `last_head_sha`.
+   `last_head_sha`, `pending_failure`.
 2. When composing the PR body, load task details by reference:
    `get_drawer(id=<task_list_ref.drawer_id>)`. If `task_list_ref.drawer_id` is
    null on a legacy session, call
    `collab_status(session_id=$SESSION_ID, include_task_list:true)` and use the
    returned `task_list`.
+
+## Recoverable vs terminal failures
+
+The server classifies `failure_report`, not you — an accurate
+`coding_failure` prefix is all that's needed. Six prefixes recover the turn
+instead of ending the session: `git_commit_failed:`, `git_push_failed:`,
+`sandbox_denied:`, `disk_full:`, `network_failed:`,
+`codex_dispatch_failed:` (each needs real detail after the colon, e.g.
+`git_commit_failed: index.lock EPERM`); everything else (including
+`branch_drift:`/`subagent_failure:`) is terminal.
+
+**This template neither sends `failure_report`/`final_review` nor runs
+gates** — it only drafts the PR body and hands off to
+`collab-turn-submit.md`, which does both. A non-null `pending_failure` on
+entry (you are the recovery owner for an interrupted turn) does not change
+what THIS template does: draft the PR body exactly as in step 2 of Actions
+below, same as any other invocation. `collab-turn-submit.md` is where the
+actual recovery-owner protocol (inspect the preserved diff, run this
+phase's gates, commit + push, send the normal completion event, never a new
+`failure_report`) applies — see that file.
 
 ## Actions
 1. Pushed-head proof only (no reset and do NOT re-run gates): verify

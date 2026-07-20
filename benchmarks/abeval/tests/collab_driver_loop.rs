@@ -369,6 +369,20 @@ fn st(phase: &str, owner: &str, grr: u32) -> SessionState {
         global_review_round: grr,
         task_review_round: 0,
         last_head_sha: Some("h".into()),
+        pending_failure: None,
+        recovery_phase: None,
+        recovery_owner: None,
+    }
+}
+
+/// `st` with a recoverable tooling failure in flight: the session stayed in
+/// `phase` and `owner` is the flipped recovery owner.
+fn st_recovering(phase: &str, owner: &str, grr: u32) -> SessionState {
+    SessionState {
+        pending_failure: Some("git_push_failed: remote hung up".into()),
+        recovery_phase: Some(phase.into()),
+        recovery_owner: Some(owner.into()),
+        ..st(phase, owner, grr)
     }
 }
 
@@ -541,6 +555,50 @@ fn anomaly_phase_owner_combo_errors() {
     assert!(
         err.to_string().to_lowercase().contains("anomaly"),
         "expected anomaly error: {err}"
+    );
+}
+
+/// The same `(CodeReviewFixGlobalPending, claude)` pair as
+/// `anomaly_phase_owner_combo_errors`, but with a recoverable tooling failure in
+/// flight: Claude is the delegated recovery owner, so the run must CONTINUE to a
+/// terminal phase and stay in the corpus. Aborting here would drop the run and
+/// bias an A/B campaign toward the arm that hit fewer tooling failures.
+#[test]
+fn recovery_flipped_owner_completes_the_run_instead_of_aborting() {
+    let prompts = repo_prompts_dir();
+    let reader = ScriptedReader {
+        states: vec![
+            st_recovering("CodeReviewFixGlobalPending", "claude", 0),
+            st("CodingComplete", "claude", 0),
+        ],
+        idx: RefCell::new(0),
+        draft: None,
+    };
+    let spawner = FakeSpawner {
+        claude_prompts: RefCell::new(vec![]),
+        codex_calls: RefCell::new(0),
+    };
+    let attributor = FixedAttributor(Usage {
+        input_tokens: 7,
+        ..Default::default()
+    });
+    let res = run_collab_task(&ctx(&prompts), &reader, &spawner, &attributor)
+        .expect("a recovery-flipped owner is a valid protocol state, not an anomaly");
+    assert_eq!(res.reached_phase, "CodingComplete");
+    assert_eq!(res.disposition, RunDisposition::Terminal);
+    // The recovery turn ran as a Claude worker turn carrying the delegated
+    // completion instructions for the interrupted phase.
+    let prompts_seen = spawner.claude_prompts.borrow();
+    assert!(
+        prompts_seen
+            .iter()
+            .any(|p| p.contains("topic=\"review_fix_global\"") && p.contains("RECOVERY OWNER")),
+        "expected a delegated review_fix_global completion prompt, got: {prompts_seen:?}"
+    );
+    assert_eq!(
+        *spawner.codex_calls.borrow(),
+        0,
+        "the interrupted turn must not be handed back to Codex"
     );
 }
 

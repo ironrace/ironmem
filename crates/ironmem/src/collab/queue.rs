@@ -48,6 +48,14 @@ pub fn create_session(
     // no application-layer string validation is needed here. The DB CHECK
     // constraint on the column remains as defense-in-depth against direct
     // SQL writes.
+    //
+    // Recovery-state columns (pending_failure, failed_from_phase,
+    // recovery_phase, recovery_owner, recovery_origin_owner,
+    // recovery_attempts, total_recovery_attempts; migration 015) are
+    // deliberately omitted here — they
+    // have no `DEFAULT` and are all nullable, so a fresh row lands on NULL,
+    // which `load_session_record` maps to `None`/`0` exactly like a legacy
+    // pre-015 row. `save_session` is the only writer for these fields.
     conn.execute(
         "INSERT INTO collab_sessions (id, repo_path, branch, task, implementer)
          VALUES (?1, ?2, ?3, ?4, ?5)",
@@ -208,7 +216,10 @@ pub fn load_session_record(
                 task_review_round, global_review_round,
                 base_sha, last_head_sha, pr_url, coding_failure,
                 canonical_plan_drawer_id, final_plan_drawer_id,
-                created_at, updated_at, implementer
+                created_at, updated_at, implementer,
+                pending_failure, failed_from_phase, recovery_phase,
+                recovery_owner, recovery_origin_owner, recovery_attempts,
+                total_recovery_attempts
          FROM collab_sessions
          WHERE id = ?1",
         params![session_id],
@@ -221,6 +232,20 @@ pub fn load_session_record(
             let task_list: Option<String> = row.get("task_list")?;
             let task_review_round_i: i64 = row.get("task_review_round")?;
             let global_review_round_i: i64 = row.get("global_review_round")?;
+            let failed_from_phase = parse_optional_text_column::<Phase>(row, "failed_from_phase")?;
+            let recovery_phase = parse_optional_text_column::<Phase>(row, "recovery_phase")?;
+            let recovery_owner = parse_optional_text_column::<Agent>(row, "recovery_owner")?;
+            let recovery_origin_owner =
+                parse_optional_text_column::<Agent>(row, "recovery_origin_owner")?;
+            // Nullable in the DB (legacy pre-015 rows have no value), but the
+            // Rust field is a plain `u8` — map the missing case to `0` rather
+            // than propagating an `Option`.
+            let recovery_attempts_i: Option<i64> = row.get("recovery_attempts")?;
+            let recovery_attempts =
+                recovery_attempts_i.map_or(0, |n| n.clamp(0, u8::MAX as i64) as u8);
+            let total_recovery_attempts_i: Option<i64> = row.get("total_recovery_attempts")?;
+            let total_recovery_attempts =
+                total_recovery_attempts_i.map_or(0, |n| n.clamp(0, u8::MAX as i64) as u8);
             Ok(SessionRecord {
                 session: CollabSession {
                     id: row.get("id")?,
@@ -243,6 +268,13 @@ pub fn load_session_record(
                     pr_url: row.get("pr_url")?,
                     coding_failure: row.get("coding_failure")?,
                     implementer,
+                    pending_failure: row.get("pending_failure")?,
+                    failed_from_phase,
+                    recovery_phase,
+                    recovery_owner,
+                    recovery_origin_owner,
+                    recovery_attempts,
+                    total_recovery_attempts,
                 },
                 repo_path: row.get("repo_path")?,
                 branch: row.get("branch")?,
@@ -278,6 +310,34 @@ where
     })
 }
 
+/// Read a nullable TEXT column and parse it via `FromStr` when present.
+/// `None` (SQL NULL) maps to `Ok(None)`; a present-but-unparseable value
+/// surfaces the same `FromSqlConversionFailure` shape as `parse_text_column`
+/// so a corrupt row still fails the row scan instead of panicking.
+fn parse_optional_text_column<T>(
+    row: &rusqlite::Row<'_>,
+    column: &str,
+) -> rusqlite::Result<Option<T>>
+where
+    T: std::str::FromStr,
+    T::Err: std::fmt::Display,
+{
+    let raw: Option<String> = row.get(column)?;
+    raw.map(|s| {
+        s.parse::<T>().map_err(|err| {
+            rusqlite::Error::FromSqlConversionFailure(
+                0,
+                rusqlite::types::Type::Text,
+                Box::new(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("column {column}: {err}"),
+                )),
+            )
+        })
+    })
+    .transpose()
+}
+
 pub fn save_session(conn: &Connection, session: &CollabSession) -> Result<(), MemoryError> {
     // `implementer` may be rebound by `collab_set_implementer` while a
     // planning or implementation handoff is still active, so keep it in the
@@ -303,8 +363,15 @@ pub fn save_session(conn: &Connection, session: &CollabSession) -> Result<(), Me
              canonical_plan_drawer_id = ?17,
              final_plan_drawer_id = ?18,
              implementer = ?19,
+             pending_failure = ?20,
+             failed_from_phase = ?21,
+             recovery_phase = ?22,
+             recovery_owner = ?23,
+             recovery_origin_owner = ?24,
+             recovery_attempts = ?25,
+             total_recovery_attempts = ?26,
              updated_at = datetime('now')
-        WHERE id = ?20",
+        WHERE id = ?27",
         params![
             session.phase.to_string(),
             session.current_owner.as_str(),
@@ -325,6 +392,13 @@ pub fn save_session(conn: &Connection, session: &CollabSession) -> Result<(), Me
             session.canonical_plan_drawer_id.as_deref(),
             session.final_plan_drawer_id.as_deref(),
             session.implementer.as_str(),
+            session.pending_failure.as_deref(),
+            session.failed_from_phase.map(|p| p.to_string()),
+            session.recovery_phase.map(|p| p.to_string()),
+            session.recovery_owner.map(|a| a.as_str()),
+            session.recovery_origin_owner.map(|a| a.as_str()),
+            session.recovery_attempts as i64,
+            session.total_recovery_attempts as i64,
             session.id.as_str(),
         ],
     )?;
@@ -548,6 +622,8 @@ mod tests {
         include_str!("../../migrations/010_collab_generation_lease.sql");
     const COLLAB_TASK_LIST_REF_SQL: &str = "ALTER TABLE collab_sessions \
          ADD COLUMN task_list_drawer_id TEXT";
+    const COLLAB_RECOVERY_STATE_SQL: &str =
+        include_str!("../../migrations/015_collab_recovery_state.sql");
 
     fn open() -> Connection {
         let conn = Connection::open_in_memory().unwrap();
@@ -561,6 +637,7 @@ mod tests {
         conn.execute_batch(COLLAB_PLAN_DRAWERS_SQL).unwrap();
         conn.execute_batch(COLLAB_GENERATION_LEASE_SQL).unwrap();
         conn.execute_batch(COLLAB_TASK_LIST_REF_SQL).unwrap();
+        conn.execute_batch(COLLAB_RECOVERY_STATE_SQL).unwrap();
         conn
     }
 
@@ -736,6 +813,67 @@ mod tests {
         assert!(session.canonical_plan_drawer_id.is_none());
         assert!(session.final_plan_drawer_id.is_none());
         assert_eq!(session.tasks_count(), None);
+    }
+
+    #[test]
+    fn test_recovery_fields_round_trip() {
+        let db = open();
+        create_session(&db, "sess-recovery", "/repo", "main", None, Agent::Claude).unwrap();
+        let mut session = load_session(&db, "sess-recovery").unwrap();
+        session.pending_failure = Some("git_push_failed: remote rejected".to_string());
+        session.failed_from_phase = Some(Phase::CodeImplementPending);
+        session.recovery_phase = Some(Phase::CodeReviewFixGlobalPending);
+        session.recovery_owner = Some(Agent::Codex);
+        session.recovery_origin_owner = Some(Agent::Claude);
+        session.recovery_attempts = 3;
+        // Distinct from `recovery_attempts` on purpose: the lifetime counter
+        // is monotonic while the per-resume budget is reset, so the two
+        // diverge in practice and a loader that mapped one column onto the
+        // other would still pass if both were 3.
+        session.total_recovery_attempts = 4;
+        save_session(&db, &session).unwrap();
+
+        let round_trip = load_session(&db, "sess-recovery").unwrap();
+        assert_eq!(
+            round_trip, session,
+            "all seven recovery fields must round-trip byte-identical"
+        );
+        assert_eq!(
+            round_trip.pending_failure.as_deref(),
+            Some("git_push_failed: remote rejected")
+        );
+        assert_eq!(
+            round_trip.failed_from_phase,
+            Some(Phase::CodeImplementPending)
+        );
+        assert_eq!(
+            round_trip.recovery_phase,
+            Some(Phase::CodeReviewFixGlobalPending)
+        );
+        assert_eq!(round_trip.recovery_owner, Some(Agent::Codex));
+        assert_eq!(round_trip.recovery_origin_owner, Some(Agent::Claude));
+        assert_eq!(round_trip.recovery_attempts, 3);
+        assert_eq!(round_trip.total_recovery_attempts, 4);
+    }
+
+    #[test]
+    fn test_recovery_fields_null_legacy_row_defaults() {
+        // A row that has never been through `save_session` — e.g. a legacy
+        // pre-015 row, simulated here by a fresh `create_session` insert,
+        // which leaves all seven recovery columns at their NULL column
+        // default — must load without error, with every Option field `None`
+        // and both attempt counters defaulted to `0` (not propagated as an
+        // error or left uninitialized).
+        let db = open();
+        create_session(&db, "sess-legacy", "/repo", "main", None, Agent::Claude).unwrap();
+        let session = load_session(&db, "sess-legacy").unwrap();
+        assert!(session.pending_failure.is_none());
+        assert!(session.failed_from_phase.is_none());
+        assert!(session.recovery_phase.is_none());
+        assert!(session.recovery_owner.is_none());
+        assert!(session.recovery_origin_owner.is_none());
+        assert_eq!(session.recovery_attempts, 0);
+        assert_eq!(session.total_recovery_attempts, 0);
     }
 
     #[test]

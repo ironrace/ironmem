@@ -14,7 +14,10 @@ preconditions: phase == CodeImplementPending, current_owner == claude, implement
 
 ## State discovery
 1. `collab_status(session_id=$SESSION_ID)`; read `plan_file_path`,
-   `task_list_ref`, `tasks_count`, `implementer`.
+   `task_list_ref`, `tasks_count`, `implementer`, `pending_failure`. A
+   non-null `pending_failure` means you are the **recovery owner** for an
+   interrupted turn, not simply the next-in-line owner — see "Recoverable vs
+   terminal failures" below before proceeding.
 2. Search `wing="ironrace-memory" room="collab-checkpoints"` for `$SESSION_ID`;
    resume at the first unfinished task; scan the diff vs acceptance criteria.
 
@@ -42,6 +45,20 @@ Interpret the response status and act accordingly:
 documentation. Before relying on any load-bearing detail — function
 signatures, type invariants, call-site counts — re-verify it against the
 actual source code. Never trust a map entry alone for contract-level claims.
+
+## Recoverable vs terminal failures
+
+The server classifies `failure_report`, not you — send an accurate
+`coding_failure` prefix and let it decide. Six prefixes recover the turn
+instead of ending the session: `git_commit_failed:`, `git_push_failed:`,
+`sandbox_denied:`, `disk_full:`, `network_failed:`,
+`codex_dispatch_failed:` (each needs real detail after the colon, e.g.
+`git_commit_failed: index.lock EPERM`); everything else (including
+`branch_drift:`/`subagent_failure:`) is terminal. If you are acting as
+**recovery owner** — control was handed to you after Codex's recoverable
+`failure_report`, or you resumed via `collab_resume` — inspect the
+preserved diff, run this turn's gates yourself, commit + push, then send
+the normal `implementation_done` (never a new `failure_report`).
 
 ## Actions
 1. Invoke `Skill('subagent-driven-development')` on `plan_file_path`. Auto-proceed

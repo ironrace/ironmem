@@ -146,6 +146,30 @@ pub(super) fn session_record_json(record: &SessionRecord) -> Value {
         "last_head_sha": record.session.last_head_sha.as_deref(),
         "pr_url": record.session.pr_url.as_deref(),
         "coding_failure": record.session.coding_failure.as_deref(),
+        // Recovery-state exposure (issue #197 task 9). `pending_failure` is
+        // the diagnostic for an in-flight *recoverable* failure — set only
+        // by the `Tooling` arm of `apply_event`'s `FailureReport` handling
+        // (state_machine/mod.rs), which never also sets `coding_failure`;
+        // the two are mutually exclusive by construction, enforced there
+        // and covered by `state_machine::tests`. `failed_from_phase`/
+        // `recovery_phase` serialize via `Phase::to_string()` like the
+        // top-level `phase` field.
+        //
+        // `recovery_origin_owner` and `total_recovery_attempts` were both
+        // added by review. Without the origin, nothing on this surface
+        // distinguishes a completion event sent by the phase's own expected
+        // agent from one sent by a delegated recovery owner. Without the
+        // lifetime counter, `recovery_attempts` alone can never read above
+        // `MAX_RECOVERY_ATTEMPTS`, so a session looping through
+        // `collab_resume` looks healthy from here no matter how many
+        // handoffs it has actually burned.
+        "pending_failure": record.session.pending_failure.as_deref(),
+        "failed_from_phase": record.session.failed_from_phase.map(|p| p.to_string()),
+        "recovery_phase": record.session.recovery_phase.map(|p| p.to_string()),
+        "recovery_owner": record.session.recovery_owner.map(|a| a.as_str()),
+        "recovery_origin_owner": record.session.recovery_origin_owner.map(|a| a.as_str()),
+        "recovery_attempts": record.session.recovery_attempts,
+        "total_recovery_attempts": record.session.total_recovery_attempts,
         "ended_at": record.ended_at.as_deref(),
         "created_at": record.created_at.as_str(),
         "updated_at": record.updated_at.as_str(),
@@ -647,7 +671,7 @@ pub(super) fn handle_collab_send(app: &App, args: &Value) -> Result<Value, Memor
         let turn_exempt = matches!(session.phase, crate::collab::Phase::PlanParallelDrafts)
             || (topic == "failure_report"
                 && sender != session.current_owner
-                && failure_report_is_off_turn_admissible(content));
+                && failure_report_is_off_turn_admissible(content, sender, session.current_owner));
         if !turn_exempt && sender != session.current_owner {
             return Err(MemoryError::Validation(format!(
                 "not your turn: phase {} expects sender '{}', got '{}'",
@@ -1259,6 +1283,83 @@ pub(super) fn handle_collab_end(app: &App, args: &Value) -> Result<Value, Memory
     Ok(json!({ "ok": true, "session_id": session_id }))
 }
 
+/// Resume a tooling-class `CodingFailed` session back to the phase it failed
+/// from. Honors the same generation-lease / `handoff_token` check every
+/// other collab writer does; admissibility (whether this specific session is
+/// eligible to resume at all) is entirely `apply_event`'s call via the
+/// `ResumeCoding` event — this handler does not reimplement or duplicate any
+/// of that eligibility logic, it only plumbs the request through and
+/// surfaces `CollabError::NotResumable` as a validation error via
+/// `collab_error_to_memory_error`.
+///
+/// After the protocol transaction commits, this also clears any stale
+/// `outcome='failed'`/`done_at` row that an earlier terminal `failure_report`
+/// wrote for this session (METRICS_SPEC §5.4 amendment, task 10) — a
+/// resumed session must be able to complete normally afterward. The clear is
+/// best-effort cleanup, run after commit so a database error can never roll
+/// back or fail a collab turn. This clear deliberately ignores
+/// `IRONMEM_METRICS`: the kill switch may have been enabled after the terminal
+/// failure wrote its outcome, and resuming must not leave that stale failed
+/// outcome behind.
+pub(super) fn handle_collab_resume(app: &App, args: &Value) -> Result<Value, MemoryError> {
+    let session_id = require_str(args, "session_id")?;
+    ensure_no_conflicting_process_session(app, session_id)?;
+    let agent = require_agent(require_str(args, "agent")?)?;
+
+    let (phase, current_owner) = app.db.with_transaction(|tx| {
+        super::handoff::ensure_actor_generation_current(
+            app,
+            tx,
+            session_id,
+            agent,
+            super::handoff::opt_handoff_token(args).as_deref(),
+        )?;
+        // A session already `collab_end`-ed cannot be resumed, even if it
+        // was `CodingFailed` at the time — `ensure_active` only rejects on
+        // `ended_at`, not on phase, so a still-open `CodingFailed` session
+        // (the common case: nobody has called `collab_end` on it yet) passes
+        // through untouched.
+        crate::collab::queue::ensure_active(tx, session_id)?;
+        let session = crate::collab::queue::load_session(tx, session_id)?;
+        let next = apply_event(&session, agent, &CollabEvent::ResumeCoding)
+            .map_err(collab_error_to_memory_error)?;
+        crate::collab::queue::save_session(tx, &next)?;
+        crate::db::schema::Database::wal_log_tx(
+            tx,
+            "collab_resume",
+            &json!({
+                "session_id": session_id,
+                "agent": agent.as_str(),
+            }),
+            Some(&json!({
+                "phase": next.phase.to_string(),
+                "current_owner": next.current_owner.to_string(),
+            })),
+        )?;
+        Ok((next.phase, next.current_owner))
+    })?;
+
+    // Clear the stale `outcome='failed'`/`done_at` row that `failure_report`
+    // wrote before this resume (METRICS_SPEC §5.4 amendment, task 10). Runs
+    // after the transaction commits, same as `handle_collab_end`'s operator
+    // attestation block — metrics failures never roll back or fail a
+    // collab turn.
+    if let Err(e) = app.db.clear_failed_task_outcome(session_id) {
+        tracing::warn!(session_id = %session_id, error = %e, "metrics: clear_failed_task_outcome failed");
+    }
+
+    // The session is active again post-resume, same bookkeeping
+    // `handle_collab_send` performs on every successful send.
+    app.set_active_collab_session(session_id);
+
+    Ok(json!({
+        "ok": true,
+        "session_id": session_id,
+        "phase": phase.to_string(),
+        "current_owner": current_owner.to_string(),
+    }))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1455,8 +1556,15 @@ mod tests {
         );
     }
 
+    /// Renamed from `failure_report_marks_outcome_failed` (task 10): since
+    /// task 4, `failure_report` has two distinct behaviors — a recoverable
+    /// (`Tooling`-classified) report leaves `outcome`/`done_at` untouched,
+    /// while a terminal report sets them. This test exercises the TERMINAL
+    /// branch only (`subagent_failure:` is not one of the six recoverable
+    /// prefixes — see `recoverable_failure_report_leaves_task_outcome_untouched`
+    /// for the recoverable counterpart).
     #[test]
-    fn failure_report_marks_outcome_failed() {
+    fn terminal_failure_report_marks_outcome_failed() {
         let _g = metrics_on_guard();
         let app = test_app();
         let sid = start_session(&app);
@@ -1477,6 +1585,40 @@ mod tests {
             "failure_report must set outcome=failed"
         );
         assert!(row.done_at.is_some(), "failure_report must set done_at");
+    }
+
+    /// Counterpart to `terminal_failure_report_marks_outcome_failed` (task
+    /// 10): a RECOVERABLE (`Tooling`-classified) `failure_report` leaves
+    /// `session.phase` unchanged (established in task 4), so
+    /// `record_task_outcome_transition`'s `before == after` early return
+    /// fires before the `CodingFailed` match arm is ever reached — the
+    /// `task_outcomes` row must stay untouched (`outcome`/`done_at` still
+    /// `None`).
+    #[test]
+    fn recoverable_failure_report_leaves_task_outcome_untouched() {
+        let _g = metrics_on_guard();
+        let app = test_app();
+        let sid = start_session(&app);
+        drive_to_implement(&app, &sid);
+
+        // git_commit_failed: is one of the six Task-1 recoverable prefixes.
+        send(
+            &app,
+            &sid,
+            "claude",
+            "failure_report",
+            r#"{"coding_failure":"git_commit_failed: index.lock EPERM"}"#,
+        );
+
+        let row = app.db.get_task_outcome(&sid).unwrap().unwrap();
+        assert_eq!(
+            row.outcome, None,
+            "a recoverable report must not set outcome"
+        );
+        assert_eq!(
+            row.done_at, None,
+            "a recoverable report must not set done_at"
+        );
     }
 
     #[test]
@@ -1801,8 +1943,12 @@ mod tests {
 
     // ── G.4: collab_end from CodingFailed leaves outcome 'failed' ─────────────
 
+    /// Renamed from `failure_report_marks_outcome_failed_and_end_does_not_overwrite`
+    /// (task 10) for the same reason as `terminal_failure_report_marks_outcome_failed`
+    /// above: `subagent_failure:` drives the TERMINAL branch of `failure_report`,
+    /// not the recoverable one — the name now says so explicitly.
     #[test]
-    fn failure_report_marks_outcome_failed_and_end_does_not_overwrite() {
+    fn terminal_failure_report_marks_outcome_failed_and_end_does_not_overwrite() {
         let _g = metrics_on_guard();
         let app = test_app();
         let sid = start_session(&app);
@@ -2550,5 +2696,625 @@ mod tests {
             issued.token,
             serialized
         );
+    }
+
+    // ── Task 8: collab_resume ───────────────────────────────────────────────
+
+    /// Drive `app`'s session `sid` to a genuinely tooling-class `CodingFailed`
+    /// state via real `handle_collab_send` calls — three successive
+    /// `git_commit_failed:` failure_reports, mirroring the state machine's
+    /// own `session_with_ceiling_degraded_tooling_failure` helper. Turn
+    /// ownership naturally alternates claude -> codex -> claude as each
+    /// recoverable report hands control to the counterpart, so the ceiling
+    /// break on the third report is reported by claude (the session's
+    /// implementer and `current_owner` right after `task_list`).
+    fn drive_to_tooling_coding_failed(app: &crate::mcp::app::App, sid: &str) {
+        drive_to_implement(app, sid);
+        send(
+            app,
+            sid,
+            "claude",
+            "failure_report",
+            r#"{"coding_failure":"git_commit_failed: attempt 1"}"#,
+        );
+        send(
+            app,
+            sid,
+            "codex",
+            "failure_report",
+            r#"{"coding_failure":"git_commit_failed: attempt 2"}"#,
+        );
+        send(
+            app,
+            sid,
+            "claude",
+            "failure_report",
+            r#"{"coding_failure":"git_commit_failed: attempt 3 breaks the ceiling"}"#,
+        );
+    }
+
+    /// A genuinely tooling-class `CodingFailed` session (reached via real
+    /// `handle_collab_send` calls, not a hand-constructed struct) resumes to
+    /// its recorded `failed_from_phase`, with the resumer as the new owner.
+    #[test]
+    fn collab_resume_restores_recorded_phase_for_tooling_failure() {
+        let app = test_app();
+        let sid = start_session(&app);
+        drive_to_tooling_coding_failed(&app, &sid);
+
+        let record = app.db.collab_load_session_record(&sid).unwrap();
+        assert_eq!(record.session.phase, Phase::CodingFailed);
+        assert_eq!(
+            record.session.failed_from_phase,
+            Some(Phase::CodeImplementPending)
+        );
+
+        // Codex resumes — mirrors the state-machine unit test's choice of
+        // resumer to prove the resumer need not be the original reporter.
+        let out =
+            handle_collab_resume(&app, &json!({ "session_id": sid, "agent": "codex" })).unwrap();
+
+        assert_eq!(out["ok"], json!(true));
+        assert_eq!(out["phase"], json!("CodeImplementPending"));
+        assert_eq!(out["current_owner"], json!("codex"));
+
+        let after = app.db.collab_load_session_record(&sid).unwrap();
+        assert_eq!(after.session.phase, Phase::CodeImplementPending);
+        assert_eq!(after.session.current_owner, crate::collab::Agent::Codex);
+        assert_eq!(
+            after.session.failed_from_phase,
+            Some(Phase::CodeImplementPending),
+            "failed_from_phase is a historical record and survives a successful resume"
+        );
+    }
+
+    /// task 10: `collab_resume` clears the stale `outcome='failed'`/`done_at`
+    /// row that the ceiling-degrade transition into `CodingFailed` wrote via
+    /// `record_task_outcome_transition` (the degrade DOES move `session.phase`
+    /// from `CodeImplementPending` to `CodingFailed`, unlike a plain
+    /// recoverable report, so the terminal write fires here same as any
+    /// other transition into `CodingFailed`).
+    #[test]
+    fn collab_resume_clears_stale_failed_outcome() {
+        let _g = metrics_on_guard();
+        let app = test_app();
+        let sid = start_session(&app);
+        drive_to_tooling_coding_failed(&app, &sid);
+
+        let row = app.db.get_task_outcome(&sid).unwrap().unwrap();
+        assert_eq!(
+            row.outcome.as_deref(),
+            Some("failed"),
+            "ceiling-degrade into CodingFailed must set outcome=failed"
+        );
+        assert!(row.done_at.is_some(), "ceiling-degrade must set done_at");
+
+        handle_collab_resume(&app, &json!({ "session_id": sid, "agent": "codex" })).unwrap();
+
+        let row = app.db.get_task_outcome(&sid).unwrap().unwrap();
+        assert_eq!(
+            row.outcome, None,
+            "collab_resume must clear the stale failed outcome"
+        );
+        assert_eq!(
+            row.done_at, None,
+            "collab_resume must clear the stale done_at"
+        );
+    }
+
+    #[test]
+    fn collab_resume_clears_stale_failed_outcome_when_metrics_are_disabled() {
+        let _g = crate::metrics::METRICS_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        std::env::remove_var("IRONMEM_METRICS");
+
+        let app = test_app();
+        let sid = start_session(&app);
+        drive_to_tooling_coding_failed(&app, &sid);
+
+        let before = app.db.get_task_outcome(&sid).unwrap().unwrap();
+        assert_eq!(before.outcome.as_deref(), Some("failed"));
+        assert!(before.done_at.is_some());
+
+        std::env::set_var("IRONMEM_METRICS", "0");
+        handle_collab_resume(&app, &json!({ "session_id": sid, "agent": "codex" })).unwrap();
+        std::env::remove_var("IRONMEM_METRICS");
+
+        let after = app.db.get_task_outcome(&sid).unwrap().unwrap();
+        assert_eq!(after.outcome, None);
+        assert_eq!(after.done_at, None);
+    }
+
+    #[test]
+    fn collab_resume_allows_restored_phase_completion_and_clears_recovery_state() {
+        let app = test_app();
+        let sid = start_session(&app);
+        drive_to_tooling_coding_failed(&app, &sid);
+
+        handle_collab_resume(&app, &json!({ "session_id": sid, "agent": "codex" })).unwrap();
+
+        // The resumed Codex owner completes the restored implementation phase.
+        // This exercises the tool-level turn gate and delegated-completion
+        // override together, rather than only asserting the resume snapshot.
+        send(
+            &app,
+            &sid,
+            "codex",
+            "implementation_done",
+            r#"{"head_sha":"resumed-implementation-head"}"#,
+        );
+
+        let after = app.db.collab_load_session_record(&sid).unwrap().session;
+        assert_eq!(after.phase, Phase::CodeReviewFixGlobalPending);
+        assert_eq!(after.current_owner, crate::collab::Agent::Codex);
+        assert_eq!(
+            after.last_head_sha.as_deref(),
+            Some("resumed-implementation-head")
+        );
+        assert_eq!(after.coding_failure, None);
+        assert_eq!(after.pending_failure, None);
+        assert_eq!(after.recovery_phase, None);
+        assert_eq!(after.recovery_owner, None);
+        assert_eq!(after.recovery_origin_owner, None);
+        assert_eq!(after.recovery_attempts, 0);
+    }
+
+    /// A stale predecessor process — one whose cached generation for the
+    /// resuming agent predates a successor claiming that agent's handoff
+    /// token — is rejected by the same generation-lease guard every other
+    /// collab writer honors. Mirrors `stale_predecessor_send_rejected_after_claim`.
+    #[test]
+    fn collab_resume_rejects_stale_generation_resumer() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("mem.sqlite3");
+
+        let pred = test_app_with_db_path(db_path.clone(), dir.path());
+        let succ = test_app_with_db_path(db_path, dir.path());
+
+        // Drive the whole session to a tooling CodingFailed state via pred —
+        // this binds pred's cached generation at 0 for both claude and codex
+        // (every guarded call along the way runs through pred).
+        let sid = start_session(&pred);
+        drive_to_tooling_coding_failed(&pred, &sid);
+
+        // Issue a handoff token for "claude" (the agent about to attempt a
+        // stale resume) via pred's DB.
+        let token = pred
+            .db
+            .with_transaction(|tx| {
+                crate::collab::issue_or_reuse_handoff(tx, &sid, crate::collab::Agent::Claude)
+            })
+            .unwrap()
+            .token;
+
+        // Successor claims the token via a guarded recv, advancing the DB
+        // generation for claude to 1.
+        handle_collab_recv(
+            &succ,
+            &json!({
+                "session_id": sid,
+                "receiver": "claude",
+                "handoff_token": token,
+            }),
+        )
+        .unwrap();
+
+        // Predecessor attempts to resume as claude — still cached at gen 0,
+        // DB is now at gen 1 -> rejected before apply_event ever runs.
+        let err = handle_collab_resume(&pred, &json!({ "session_id": sid, "agent": "claude" }))
+            .unwrap_err();
+
+        assert!(
+            err.to_string().contains("stale collab generation"),
+            "expected stale collab generation error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn collab_resume_rejects_switching_away_from_another_active_process_session() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("mem.sqlite3");
+        let first = test_app_with_db_path(db_path.clone(), dir.path());
+        let second = test_app_with_db_path(db_path, dir.path());
+
+        // Bind the first process to one live session.
+        let _first_sid = start_session(&first);
+
+        // Build a separate, resumable session through a separate process so
+        // both sessions are live in the same database without tripping the
+        // per-process attribution guard during setup.
+        let second_sid = handle_collab_start(
+            &second,
+            &json!({
+                "repo_path": "/tmp/other-repo",
+                "branch": "other-branch",
+                "initiator": "claude",
+                "task": "second lifecycle test",
+                "implementer": "claude",
+            }),
+        )
+        .unwrap()["session_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        drive_to_tooling_coding_failed(&second, &second_sid);
+
+        let err = handle_collab_resume(
+            &first,
+            &json!({ "session_id": second_sid, "agent": "codex" }),
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("another active collab session"),
+            "expected process-attribution guard, got: {err}"
+        );
+    }
+
+    /// A semantic-failure (`subagent_failure:`) `CodingFailed` session is
+    /// rejected with the deterministic `NotResumable` error, surfaced as a
+    /// validation error whose text names the session as unresumable.
+    #[test]
+    fn collab_resume_rejects_semantic_failure_session() {
+        let app = test_app();
+        let sid = start_session(&app);
+        drive_to_implement(&app, &sid);
+
+        // claude is current_owner right after task_list; subagent_failure:
+        // is not off-turn-admissible, so it must be sent on-turn.
+        send(
+            &app,
+            &sid,
+            "claude",
+            "failure_report",
+            r#"{"coding_failure":"subagent_failure: 1: env"}"#,
+        );
+
+        let record = app.db.collab_load_session_record(&sid).unwrap();
+        assert_eq!(record.session.phase, Phase::CodingFailed);
+
+        let err = handle_collab_resume(&app, &json!({ "session_id": sid, "agent": "claude" }))
+            .unwrap_err();
+
+        assert!(
+            err.to_string().contains("session cannot be resumed"),
+            "expected the deterministic NotResumable error text, got: {err}"
+        );
+    }
+
+    /// A `branch_drift:` semantic failure is likewise rejected — proves the
+    /// classification gate, not just the specific prefix used above.
+    #[test]
+    fn collab_resume_rejects_branch_drift_session() {
+        let app = test_app();
+        let sid = start_session(&app);
+        drive_to_implement(&app, &sid);
+
+        // `branch_drift:` is off-turn admissible, so codex (not the current
+        // owner claude) may report it directly.
+        send(
+            &app,
+            &sid,
+            "codex",
+            "failure_report",
+            r#"{"coding_failure":"branch_drift: head_sha abc not found"}"#,
+        );
+
+        let record = app.db.collab_load_session_record(&sid).unwrap();
+        assert_eq!(record.session.phase, Phase::CodingFailed);
+
+        let err = handle_collab_resume(&app, &json!({ "session_id": sid, "agent": "codex" }))
+            .unwrap_err();
+
+        assert!(
+            err.to_string().contains("session cannot be resumed"),
+            "expected the deterministic NotResumable error text, got: {err}"
+        );
+    }
+
+    // ── Task 9: status exposure + off-turn admission ────────────────────────
+
+    /// Required acceptance criterion: `collab_status` on a recovering session
+    /// reports the unchanged phase, `current_owner = claude`, a non-null
+    /// `pending_failure`, and a null `coding_failure`. Drives a real
+    /// `git_commit_failed:` on-turn report from Codex in
+    /// `CodeReviewFixGlobalPending` (Codex owns that phase after
+    /// `implementation_done`), which flips ownership to the counterpart
+    /// (Claude) without moving the phase.
+    #[test]
+    fn collab_status_on_recovering_session_reports_pending_failure_not_coding_failure() {
+        let app = test_app();
+        let sid = start_session(&app);
+        drive_to_implement(&app, &sid);
+        send(
+            &app,
+            &sid,
+            "claude",
+            "implementation_done",
+            r#"{"head_sha":"c1"}"#,
+        );
+
+        let record = app.db.collab_load_session_record(&sid).unwrap();
+        assert_eq!(record.session.phase, Phase::CodeReviewFixGlobalPending);
+        assert_eq!(record.session.current_owner, crate::collab::Agent::Codex);
+
+        send(
+            &app,
+            &sid,
+            "codex",
+            "failure_report",
+            r#"{"coding_failure":"git_commit_failed: index.lock EPERM"}"#,
+        );
+
+        let status = handle_collab_status(&app, &json!({ "session_id": sid })).unwrap();
+
+        assert_eq!(
+            status["phase"],
+            json!("CodeReviewFixGlobalPending"),
+            "a recoverable report must leave phase unchanged"
+        );
+        assert_eq!(status["current_owner"], json!("claude"));
+        assert_eq!(
+            status["pending_failure"],
+            json!("git_commit_failed: index.lock EPERM")
+        );
+        assert_eq!(
+            status["coding_failure"],
+            Value::Null,
+            "coding_failure must stay null for a recoverable (non-terminal) report"
+        );
+        assert_eq!(status["failed_from_phase"], Value::Null);
+        assert_eq!(
+            status["recovery_phase"],
+            json!("CodeReviewFixGlobalPending")
+        );
+        assert_eq!(status["recovery_owner"], json!("claude"));
+        assert_eq!(status["recovery_attempts"], json!(1));
+        // The origin is what separates a completion event produced by the
+        // delegated recovery owner from one produced by the phase's own
+        // expected agent — `recovery_owner` alone cannot express that.
+        assert_eq!(status["recovery_origin_owner"], json!("codex"));
+        // The lifetime counter tracks the per-resume budget on the first
+        // handoff and diverges from it only after a resume, so this assertion
+        // pins its presence; `state_machine::tests` covers the divergence.
+        assert_eq!(status["total_recovery_attempts"], json!(1));
+    }
+
+    /// Required acceptance criterion: the branch-drift off-turn path behaves
+    /// exactly as before. A non-owner (`codex`, while `claude` owns
+    /// `CodeImplementPending`) may send a `branch_drift:` failure_report
+    /// off-turn; this must still succeed and still land the session in
+    /// `CodingFailed` (branch drift stays `Terminal` — Task 9 does not widen
+    /// its classification or its off-turn admissibility).
+    #[test]
+    fn branch_drift_off_turn_admission_is_unchanged() {
+        let app = test_app();
+        let sid = start_session(&app);
+        drive_to_implement(&app, &sid);
+
+        let record = app.db.collab_load_session_record(&sid).unwrap();
+        assert_eq!(record.session.current_owner, crate::collab::Agent::Claude);
+
+        // Codex is NOT current_owner here, but branch_drift: is off-turn
+        // admissible — this must succeed exactly as it did before task 9.
+        send(
+            &app,
+            &sid,
+            "codex",
+            "failure_report",
+            r#"{"coding_failure":"branch_drift: head_sha abc not found"}"#,
+        );
+
+        let after = app.db.collab_load_session_record(&sid).unwrap();
+        assert_eq!(after.session.phase, Phase::CodingFailed);
+        assert_eq!(
+            after.session.coding_failure.as_deref(),
+            Some("branch_drift: head_sha abc not found")
+        );
+    }
+
+    /// Regression guard for the off-turn gate itself: task 9 must NOT widen
+    /// `failure_report_is_off_turn_admissible` to admit the five new
+    /// recoverable-but-not-off-turn prefixes (`git_commit_failed:` etc). An
+    /// off-turn `git_commit_failed:` report from a non-owner must still be
+    /// rejected as `NotYourTurn`, same as before task 9 existed.
+    #[test]
+    fn off_turn_git_commit_failed_report_is_still_rejected() {
+        let app = test_app();
+        let sid = start_session(&app);
+        drive_to_implement(&app, &sid);
+
+        let record = app.db.collab_load_session_record(&sid).unwrap();
+        assert_eq!(record.session.current_owner, crate::collab::Agent::Claude);
+
+        // Codex is NOT current_owner and git_commit_failed: is not in
+        // OFF_TURN_FAILURE_PREFIXES — this must be rejected before
+        // apply_event ever classifies it.
+        let err = handle_collab_send(
+            &app,
+            &json!({
+                "session_id": sid,
+                "sender": "codex",
+                "topic": "failure_report",
+                "content": r#"{"coding_failure":"git_commit_failed: index.lock EPERM"}"#,
+            }),
+        )
+        .unwrap_err();
+
+        assert!(
+            err.to_string().contains("not your turn"),
+            "expected a not-your-turn rejection, got: {err}"
+        );
+
+        // Confirm the session was untouched by the rejected send.
+        let after = app.db.collab_load_session_record(&sid).unwrap();
+        assert_eq!(after.session.phase, Phase::CodeImplementPending);
+        assert_eq!(after.session.pending_failure, None);
+    }
+
+    // ── Task 11: end-to-end MCP recovery regression ─────────────────────────
+
+    /// Codex review note 3: prove the full recovery path through the
+    /// tool-level turn gate in `handle_collab_send`, not just through
+    /// `apply_event` directly (already covered by `state_machine::tests`
+    /// from Task 5). `handle_collab_send` has its OWN pre-`apply_event` turn
+    /// gate (`sender == session.current_owner`) that is a separate, earlier
+    /// check from `apply_event`'s `require_actor_or_recovery`. This test
+    /// exercises the whole delegated-completion sequence: Codex reports a
+    /// recoverable `git_commit_failed:` failure from `CodeReviewFixGlobalPending`
+    /// (which flips `current_owner` to Claude per Task 4), then Claude sends
+    /// `review_fix_global` to complete Codex's interrupted turn. Claude's
+    /// send only succeeds because `current_owner` was already flipped to
+    /// Claude in the DB by the time it lands — if a future refactor changes
+    /// `handle_collab_send`'s turn gate to check a different field, or
+    /// tightens it without accounting for recovery-flipped ownership, this
+    /// test fails at the `send()` `.unwrap()` inside the helper, which is
+    /// the correct failure mode.
+    #[test]
+    fn full_recovery_path_through_tool_level_turn_gate_clears_on_delegated_completion() {
+        let _g = metrics_on_guard();
+        let app = test_app();
+        let sid = start_session(&app);
+        drive_to_implement(&app, &sid);
+
+        // 1. Claude finishes implementation → CodeReviewFixGlobalPending, Codex owns.
+        send(
+            &app,
+            &sid,
+            "claude",
+            "implementation_done",
+            r#"{"head_sha":"c1"}"#,
+        );
+        let record = app.db.collab_load_session_record(&sid).unwrap();
+        assert_eq!(record.session.phase, Phase::CodeReviewFixGlobalPending);
+        assert_eq!(record.session.current_owner, crate::collab::Agent::Codex);
+
+        // 2. Codex hits a recoverable tooling failure mid-turn.
+        send(
+            &app,
+            &sid,
+            "codex",
+            "failure_report",
+            r#"{"coding_failure":"git_commit_failed: index.lock EPERM"}"#,
+        );
+
+        // 3. collab_status reflects the recovering session: phase unchanged,
+        //    ownership flipped to Claude, pending_failure set, coding_failure
+        //    null, and no failed outcome recorded.
+        let status = handle_collab_status(&app, &json!({ "session_id": sid })).unwrap();
+        assert_eq!(
+            status["phase"],
+            json!("CodeReviewFixGlobalPending"),
+            "a recoverable report must leave phase unchanged"
+        );
+        assert_eq!(status["current_owner"], json!("claude"));
+        assert_eq!(
+            status["pending_failure"],
+            json!("git_commit_failed: index.lock EPERM")
+        );
+        assert_eq!(
+            status["coding_failure"],
+            Value::Null,
+            "coding_failure must stay null for a recoverable (non-terminal) report"
+        );
+        let outcome_row = app.db.get_task_outcome(&sid).unwrap().unwrap();
+        assert_eq!(
+            outcome_row.outcome, None,
+            "a recoverable report must not record a failed outcome"
+        );
+
+        // 4. Claude completes Codex's interrupted turn. This send MUST
+        //    succeed — if the tool-level owner gate incorrectly rejects
+        //    Claude here, `send()`'s `.unwrap()` panics, which is the
+        //    correct failure mode for this regression test.
+        send(
+            &app,
+            &sid,
+            "claude",
+            "review_fix_global",
+            r#"{"head_sha":"c2"}"#,
+        );
+
+        // 5. Phase advances and all recovery state clears.
+        let status = handle_collab_status(&app, &json!({ "session_id": sid })).unwrap();
+        assert_eq!(status["phase"], json!("CodeReviewLocalPending"));
+        assert_eq!(status["current_owner"], json!("claude"));
+        assert_eq!(status["pending_failure"], Value::Null);
+        assert_eq!(status["failed_from_phase"], Value::Null);
+        assert_eq!(status["recovery_phase"], Value::Null);
+        assert_eq!(status["recovery_owner"], Value::Null);
+        assert_eq!(status["recovery_origin_owner"], Value::Null);
+        assert_eq!(status["recovery_attempts"], json!(0));
+        // The lifetime counter is the one field a successful delegated
+        // completion must NOT clear — it is what bounds a session across
+        // resumes, so a reset here would silently reopen the loop the
+        // counter exists to close.
+        assert_eq!(status["total_recovery_attempts"], json!(1));
+    }
+
+    #[test]
+    fn off_turn_codex_dispatch_failure_hands_recovery_to_claude() {
+        let app = test_app();
+        let sid = start_session(&app);
+        drive_to_implement(&app, &sid);
+        send(
+            &app,
+            &sid,
+            "claude",
+            "implementation_done",
+            r#"{"head_sha":"impl-head"}"#,
+        );
+
+        // Claude observes that Codex never ran its global-review turn. This
+        // is the one recoverable failure that is valid from off-turn.
+        send(
+            &app,
+            &sid,
+            "claude",
+            "failure_report",
+            r#"{"coding_failure":"codex_dispatch_failed: process exited 137"}"#,
+        );
+
+        let recovering = handle_collab_status(&app, &json!({ "session_id": sid })).unwrap();
+        assert_eq!(recovering["phase"], json!("CodeReviewFixGlobalPending"));
+        assert_eq!(recovering["current_owner"], json!("claude"));
+        assert_eq!(recovering["recovery_owner"], json!("claude"));
+
+        // Claude can now complete the interrupted Codex-owned phase exactly
+        // once instead of the protocol returning control to unavailable Codex.
+        send(
+            &app,
+            &sid,
+            "claude",
+            "review_fix_global",
+            r#"{"head_sha":"recovered-head"}"#,
+        );
+        let after = handle_collab_status(&app, &json!({ "session_id": sid })).unwrap();
+        assert_eq!(after["phase"], json!("CodeReviewLocalPending"));
+        assert_eq!(after["pending_failure"], Value::Null);
+    }
+
+    #[test]
+    fn codex_cannot_report_dispatch_failure_while_claude_owns_the_turn() {
+        let app = test_app();
+        let sid = start_session(&app);
+        drive_to_implement(&app, &sid);
+
+        let err = handle_collab_send(
+            &app,
+            &json!({
+                "session_id": sid,
+                "sender": "codex",
+                "topic": "failure_report",
+                "content": r#"{"coding_failure":"codex_dispatch_failed: fabricated report"}"#,
+            }),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("not your turn"));
+
+        let after = app.db.collab_load_session_record(&sid).unwrap();
+        assert_eq!(after.session.phase, Phase::CodeImplementPending);
+        assert_eq!(after.session.current_owner, crate::collab::Agent::Claude);
+        assert_eq!(after.session.pending_failure, None);
     }
 }
