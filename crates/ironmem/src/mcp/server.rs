@@ -142,31 +142,67 @@ fn account_response_metrics(
     });
 }
 
-/// A request being dispatched, paired with the request itself so the framing
-/// loop can account metrics and release the ordering barrier when it lands.
+/// A request being dispatched, paired with its stamped sequence number and
+/// the request itself so the framing loop can account metrics and release the
+/// ordering barrier when it lands.
 ///
 /// Boxed because the loop pushes from two sites — newly read, and released
 /// from the mutation queue — and two `async` blocks are two distinct opaque
 /// types that cannot share one `FuturesUnordered`. `LocalBoxFuture`, not
 /// `BoxFuture`: `Arc<App>` is `!Send` (see `daemon`'s module doc).
 type InFlightRequest<'a> =
-    futures_util::future::LocalBoxFuture<'a, (JsonRpcRequest, Option<JsonRpcResponse>)>;
+    futures_util::future::LocalBoxFuture<'a, (u64, JsonRpcRequest, Option<JsonRpcResponse>)>;
+
+/// A one-shot signal that a mutation may release the per-connection ordering
+/// barrier BEFORE its response completes, the moment its claim on
+/// `collab_wait_my_turn`'s handoff token commits.
+///
+/// Consumed by `release` so it can be fired at most once, and stamped with the
+/// `seq` of the request it was issued to so the framing loop's
+/// `release_barrier` can reject it if it ever arrived for the wrong owner
+/// (defense in depth — only the barrier owner is ever handed one, see
+/// `run_framing_loop`).
+struct BarrierRelease {
+    tx: tokio::sync::mpsc::UnboundedSender<u64>,
+    seq: u64,
+}
+
+impl BarrierRelease {
+    /// Send the release signal once. A send failure means the framing loop's
+    /// receiver is gone — the connection is shutting down or already past the
+    /// point of caring — so it is logged at debug and otherwise ignored: the
+    /// normal completion path still releases the barrier when this request's
+    /// response lands (fail-closed, see design decision 2).
+    fn release(self) {
+        let seq = self.seq;
+        if self.tx.send(seq).is_err() {
+            tracing::debug!(seq, "early-release signal dropped: receiver gone");
+        }
+    }
+}
 
 fn dispatch_in_flight<'a>(
     app: &'a Arc<App>,
+    seq: u64,
     request: JsonRpcRequest,
     arrived_at: std::time::Instant,
+    barrier: Option<BarrierRelease>,
 ) -> InFlightRequest<'a> {
     Box::pin(async move {
-        let response = dispatch_request(app, &request, arrived_at).await;
-        (request, response)
+        let response = dispatch_request_with_barrier(app, &request, arrived_at, barrier).await;
+        (seq, request, response)
     })
 }
 
 /// Whether this request persists state, and so must hold its place in the
-/// per-connection ordering barrier. Derived from `tools::is_mutating_call` —
-/// the same predicate that drives read-only mode gating — so the two cannot
-/// disagree about what a "write" is.
+/// per-connection ordering barrier ON ENTRY. Derived from
+/// `tools::is_mutating_call` — the same predicate that drives read-only mode
+/// gating — so the two cannot disagree about what a "write" is.
+///
+/// This predicate governs barrier ENTRY only — whether a request must become
+/// the barrier owner (or queue behind one). Barrier EXIT is a separate
+/// decision, keyed on the owning request's stamped `seq` rather than on this
+/// predicate — see `release_barrier`.
 ///
 /// Argument-aware, not name-aware: `collab_recv{auto_ack:true}` acks the
 /// messages it returns, so classifying by tool name alone would let it overtake
@@ -311,6 +347,23 @@ const MAX_IN_FLIGHT_REQUESTS: usize = 64;
 /// quietly become a hole in the ordering guarantee.
 const MAX_QUEUED_MUTATIONS: usize = 64;
 
+/// How many mutations dispatched as barrier owner may hold an early-release
+/// reservation at once, on one connection.
+///
+/// Invariant this protects: reads keep at least
+/// `MAX_IN_FLIGHT_REQUESTS - MAX_EARLY_RELEASED_WAITS` admission slots even
+/// when every early-released wait sits out its full 60s poll. Without this
+/// cap, a pipeline of `collab_wait_my_turn` claims could each release the
+/// barrier instantly yet still occupy an `in_flight` slot for its whole poll,
+/// filling `MAX_IN_FLIGHT_REQUESTS` and starving read admission for up to the
+/// long-poll timeout — see `barrier_release_for`.
+const MAX_EARLY_RELEASED_WAITS: usize = MAX_IN_FLIGHT_REQUESTS / 4;
+
+// A zero cap would disable early release entirely and silently — every wait
+// would revert to holding the ordering barrier for its full poll, with no test
+// failing. Tuning `MAX_IN_FLIGHT_REQUESTS` below 4 must break the build instead.
+const _: () = assert!(MAX_EARLY_RELEASED_WAITS > 0);
+
 /// Per-connection MCP framing loop: read newline-delimited JSON-RPC requests
 /// from `reader`, dispatch each one, write the response to `writer`, and
 /// account response metrics.
@@ -380,18 +433,58 @@ where
     let mut conn = ConnectionContext::new(mode);
     let mut in_flight = FuturesUnordered::new();
     let mut reader_done = false;
+    // Monotonic per-connection request sequence number. Every dispatched
+    // request is stamped with the seq it held at admission time, so the
+    // mutation barrier below can identify its owner unambiguously even
+    // across a stale or duplicate release (see `mutation_barrier`).
+    let mut next_seq: u64 = 0;
     // Ordering barrier: mutations run strictly FIFO, one at a time.
     // Each entry keeps its arrival time so a queued mutation's readiness
     // budget is measured from when the client sent it, not from when the
     // barrier released it.
     let mut queued_mutations: VecDeque<(JsonRpcRequest, std::time::Instant)> = VecDeque::new();
-    let mut mutation_in_flight = false;
+    // `Some(seq)` while a mutation is holding the per-connection ordering
+    // barrier, naming the seq of the request that currently owns it. Barrier
+    // release is keyed on this seq matching (`release_barrier`), not on a
+    // bare boolean, so a stale or duplicate release can never clear a
+    // *different* owner's barrier out from under it.
+    let mut mutation_barrier: Option<u64> = None;
     // Set when a mutation is rejected for queue overflow, cleared once the
     // backlog has fully drained. While set, every further mutation on this
     // connection is rejected too — see `writes_blocked_message`.
     let mut mutations_blocked = false;
+    // Early-release channel: `collab_wait_my_turn`'s `BarrierRelease` signals
+    // over this the instant its claim commits, so the next queued mutation
+    // can start without waiting for the (up to 60s) poll loop that follows.
+    // `early_release_tx` is never dropped for the life of this loop — only
+    // clones handed to dispatched barrier owners are — so `recv()` below can
+    // never spuriously resolve to `None` from every sender disappearing.
+    let (early_release_tx, mut early_release_rx) = tokio::sync::mpsc::unbounded_channel::<u64>();
+    // Seqs of requests currently holding an early-release reservation — i.e.
+    // dispatched with `Some(BarrierRelease)` and not yet completed. Reserved
+    // at DISPATCH time (`barrier_release_for`), not when the signal actually
+    // fires, so a request that never calls `BarrierRelease::release` cannot
+    // leak a slot: it is freed unconditionally in the completion arm below.
+    let mut early_release_reserved: std::collections::HashSet<u64> =
+        std::collections::HashSet::new();
 
     loop {
+        // Checked at the TOP of the loop, before entering `select!`: this is
+        // the sole clean-shutdown path (as opposed to the error-return path
+        // taken by the read arm's `Err` branch below). The early-release arm
+        // below has no `if` guard (by design — `early_release_tx` is kept
+        // alive for the whole loop, so `recv()` must never resolve to
+        // `None`), which means once
+        // `reader_done` is true and `in_flight` is empty, `select!` still has
+        // one branch permanently enabled-but-pending. That makes `select!`
+        // block forever rather than reach its `else` arm, so the check cannot
+        // live after the `select!` the way it used to — control would never
+        // return there. Checking here instead lets the loop exit without ever
+        // entering the `select!` that would hang on it.
+        if reader_done && in_flight.is_empty() && queued_mutations.is_empty() {
+            break;
+        }
+
         // Only the dispatched set is capped here. Queued mutations are bounded
         // separately, so a burst of writes can never starve read admission.
         let may_read = !reader_done && in_flight.len() < MAX_IN_FLIGHT_REQUESTS;
@@ -401,18 +494,31 @@ where
             // over accepting more of it.
             biased;
 
-            Some((request, response)) = in_flight.next() => {
-                if is_mutating_request(&request) {
-                    mutation_in_flight = false;
-                }
+            Some((seq, request, response)) = in_flight.next() => {
+                // This request is no longer in flight regardless of whether it
+                // still holds the mutation barrier — those are two separate
+                // facts. Whether it held the barrier at all, and whether THIS
+                // completion is the one that releases it, is decided below by
+                // `release_barrier` matching on `seq`.
+                let released = release_barrier(&mut mutation_barrier, seq);
+                // Unconditional and independent of `released`: this seq no
+                // longer occupies an in-flight slot regardless of whether it
+                // ever held the barrier at all (a plain read, or a mutation
+                // dispatched over the cap with `None`, was never reserved —
+                // `HashSet::remove` on an absent key is a harmless no-op).
+                early_release_reserved.remove(&seq);
+
                 write_and_account(app, &conn, &mut stdout, &request, response).await?;
 
-                // Release the next queued mutation, preserving arrival order.
-                if !mutation_in_flight {
-                    if let Some((next, arrived_at)) = queued_mutations.pop_front() {
-                        mutation_in_flight = true;
-                        in_flight.push(dispatch_in_flight(app, next, arrived_at));
-                    }
+                // Only the completion that actually released the barrier may
+                // drain the queue — a release that found a mismatched (stale
+                // or already-cleared) seq must not pop a queued mutation onto
+                // a barrier some other owner still holds.
+                if released {
+                    start_next_queued_mutation(
+                        app, &mut queued_mutations, &mut mutation_barrier, &mut next_seq,
+                        &mut in_flight, &early_release_tx, &mut early_release_reserved,
+                    );
                 }
 
                 // The backlog is empty and nothing is running, so every mutation
@@ -420,9 +526,53 @@ where
                 // can a new one start without landing after a skipped
                 // predecessor, so this is the single point where the connection
                 // may accept writes again.
-                if mutations_blocked && !mutation_in_flight && queued_mutations.is_empty() {
+                if mutations_blocked && mutation_barrier.is_none() && queued_mutations.is_empty() {
                     mutations_blocked = false;
                 }
+            }
+
+            // A mutation dispatched as barrier owner signals here the instant
+            // its claim commits (see `BarrierRelease`, `dispatch_wait_my_turn`),
+            // rather than waiting for its full response — which for
+            // `collab_wait_my_turn` can be up to 60s away. Ordered after the
+            // completion arm (biased) so a request that finished in the same
+            // poll turn is accounted for before a same-tick early release is
+            // considered; ordered before the read arm so a freed barrier is
+            // handed to an already-queued mutation before any new request is
+            // admitted.
+            Some(seq) = early_release_rx.recv() => {
+                let released = release_barrier(&mut mutation_barrier, seq);
+                if released {
+                    start_next_queued_mutation(
+                        app, &mut queued_mutations, &mut mutation_barrier, &mut next_seq,
+                        &mut in_flight, &early_release_tx, &mut early_release_reserved,
+                    );
+                } else if early_release_reserved.contains(&seq) {
+                    // Unlike the completion arm — where a non-owning seq is
+                    // routine (every read, and any mutation dispatched over the
+                    // cap) — only the barrier OWNER is ever handed a
+                    // `BarrierRelease`, so a signal for a seq that still holds
+                    // its reservation yet no longer owns the barrier is a
+                    // should-never-happen: the seq bookkeeping has drifted.
+                    //
+                    // The one BENIGN stale signal — a wait that settled on its
+                    // first poll, so the biased `select!` took its completion
+                    // arm first — is excluded by this guard, because that arm
+                    // drops the reservation as it runs. Warning on it would
+                    // fire on every immediately-settling wait.
+                    tracing::warn!(
+                        seq,
+                        barrier = ?mutation_barrier,
+                        "early-release signal for a seq that does not own the mutation barrier \
+                         was ignored"
+                    );
+                }
+                // Deliberately does NOT touch `mutations_blocked`: early
+                // release only frees the barrier for a mutation that was
+                // already queued before any overflow occurred. It must not
+                // re-admit NEW writes on a connection that has already
+                // skipped one — that can only happen once the backlog is
+                // fully drained, which is decided in the completion arm above.
             }
 
             line = lines.next_line(), if may_read => {
@@ -506,7 +656,7 @@ where
                         ).await?;
                         continue;
                     }
-                    if mutation_in_flight {
+                    if mutation_barrier.is_some() {
                         if queued_mutations.len() >= MAX_QUEUED_MUTATIONS {
                             // Rejecting one write would otherwise punch a hole in
                             // the ordering guarantee: the writes behind it would
@@ -522,21 +672,106 @@ where
                         queued_mutations.push_back((request, arrived_at));
                         continue;
                     }
-                    mutation_in_flight = true;
+                    let seq = next_seq;
+                    next_seq += 1;
+                    mutation_barrier = Some(seq);
+                    let barrier =
+                        barrier_release_for(&early_release_tx, &mut early_release_reserved, seq);
+                    in_flight.push(dispatch_in_flight(app, seq, request, arrived_at, barrier));
+                    continue;
                 }
 
-                in_flight.push(dispatch_in_flight(app, request, arrived_at));
+                let seq = next_seq;
+                next_seq += 1;
+                in_flight.push(dispatch_in_flight(app, seq, request, arrived_at, None));
             }
 
+            // Unreachable while `early_release_tx` lives for the loop's
+            // lifetime (see the termination check at the top of the loop);
+            // kept as a defensive backstop.
             else => break,
-        }
-
-        if reader_done && in_flight.is_empty() && queued_mutations.is_empty() {
-            break;
         }
     }
 
     Ok(())
+}
+
+/// Release the per-connection mutation barrier, but ONLY if `seq` is the
+/// request that currently owns it. Returns whether it actually cleared.
+///
+/// Keyed on identity rather than "is something held" so a stale or duplicate
+/// release — a completion for a request that never owned the barrier, or one
+/// that already released it — can never clear a *different* owner's barrier
+/// out from under it. Callers must drain the queue (`start_next_queued_mutation`)
+/// only when this returns `true`; see the completion-branch call site in
+/// `run_framing_loop`.
+fn release_barrier(mutation_barrier: &mut Option<u64>, seq: u64) -> bool {
+    if *mutation_barrier == Some(seq) {
+        *mutation_barrier = None;
+        true
+    } else {
+        false
+    }
+}
+
+/// Pop the next queued mutation (if any), admit it as the new barrier owner,
+/// and dispatch it — preserving arrival order.
+///
+/// Must be called only after a `release_barrier` call that returned `true`
+/// for the barrier being drained here: that is the sole guarantee that no
+/// other request currently owns it, so admitting a new owner cannot collide
+/// with one already running.
+fn start_next_queued_mutation<'a>(
+    app: &'a Arc<App>,
+    queued_mutations: &mut std::collections::VecDeque<(JsonRpcRequest, std::time::Instant)>,
+    mutation_barrier: &mut Option<u64>,
+    next_seq: &mut u64,
+    in_flight: &mut futures_util::stream::FuturesUnordered<InFlightRequest<'a>>,
+    early_release_tx: &tokio::sync::mpsc::UnboundedSender<u64>,
+    early_release_reserved: &mut std::collections::HashSet<u64>,
+) {
+    if let Some((next, arrived_at)) = queued_mutations.pop_front() {
+        let seq = *next_seq;
+        *next_seq += 1;
+        *mutation_barrier = Some(seq);
+        let barrier = barrier_release_for(early_release_tx, early_release_reserved, seq);
+        in_flight.push(dispatch_in_flight(app, seq, next, arrived_at, barrier));
+    }
+}
+
+/// Decide whether the mutation about to be dispatched as barrier owner gets
+/// an early-release signal, or must hold the barrier for its full duration
+/// like pre-#199 behavior (see `MAX_EARLY_RELEASED_WAITS`).
+///
+/// Reservation is taken HERE, at dispatch time — not when the signal actually
+/// fires — so a request that never calls `BarrierRelease::release` (anything
+/// other than a successful `collab_wait_my_turn` claim) cannot leak a
+/// reservation slot: it is freed unconditionally in the completion arm of
+/// `run_framing_loop`, regardless of whether it was ever used.
+fn barrier_release_for(
+    early_release_tx: &tokio::sync::mpsc::UnboundedSender<u64>,
+    early_release_reserved: &mut std::collections::HashSet<u64>,
+    seq: u64,
+) -> Option<BarrierRelease> {
+    if early_release_reserved.len() >= MAX_EARLY_RELEASED_WAITS {
+        // Silent here would read to an operator as "writes are sometimes slow"
+        // with no signal at all: this mutation now holds the ordering barrier
+        // for its FULL poll (up to the long-poll timeout), stalling every
+        // mutation queued behind it on this connection.
+        tracing::warn!(
+            seq,
+            reserved = early_release_reserved.len(),
+            cap = MAX_EARLY_RELEASED_WAITS,
+            "early-release reservations are at the cap; this mutation will hold the \
+             per-connection ordering barrier for its full poll, stalling writes queued behind it"
+        );
+        return None;
+    }
+    early_release_reserved.insert(seq);
+    Some(BarrierRelease {
+        tx: early_release_tx.clone(),
+        seq,
+    })
 }
 
 /// The write that overflowed the per-connection ordering backlog.
@@ -579,14 +814,11 @@ async fn reject_mutation(
         MemoryError::Validation(message),
     );
     let chars = write_response(stdout, &resp).await?;
-    account_response_metrics(
-        app,
-        conn,
-        chars,
-        tool_name,
-        conn.session_id.as_deref(),
-        None,
-    );
+    let sid = conn
+        .session_id
+        .clone()
+        .or_else(|| request_collab_session_id(request));
+    account_response_metrics(app, conn, chars, tool_name, sid.as_deref(), None);
     Ok(())
 }
 
@@ -657,18 +889,41 @@ async fn write_response(
 /// connection, so a write parked inside its handler would head-of-line block
 /// that client's own reads just as surely — and stdio is the transport a
 /// harness uses directly.
+///
+/// `#[cfg(test)]`: since the barrier-threading refactor, `dispatch_in_flight`
+/// (the framing loop's only production dispatch site) calls
+/// `dispatch_request_with_barrier` directly, so this thin wrapper has no
+/// remaining non-test caller — it exists solely so the pre-existing direct
+/// test callers below keep compiling unchanged.
+#[cfg(test)]
 async fn dispatch_request(
     app: &Arc<App>,
     request: &JsonRpcRequest,
     arrived_at: std::time::Instant,
 ) -> Option<JsonRpcResponse> {
+    dispatch_request_with_barrier(app, request, arrived_at, None).await
+}
+
+/// The barrier-aware form of `dispatch_request`. `dispatch_request` itself
+/// stays a thin no-barrier wrapper over this — see its doc comment for why —
+/// and only `dispatch_in_flight` (the framing loop's actual dispatch site)
+/// ever passes a `Some(BarrierRelease)`, and only for the request it
+/// dispatched as the mutation barrier owner.
+async fn dispatch_request_with_barrier(
+    app: &Arc<App>,
+    request: &JsonRpcRequest,
+    arrived_at: std::time::Instant,
+    barrier: Option<BarrierRelease>,
+) -> Option<JsonRpcResponse> {
     let tool_name = request.params.get("name").and_then(|value| value.as_str());
 
     // The only tool that BLOCKS by design rather than by accident. Driven here
     // so its sleep does not hold the dispatch thread — see
-    // `dispatch_wait_my_turn`.
+    // `dispatch_wait_my_turn`. The only path `barrier` ever reaches: every
+    // other tool below drops it unfired, since only a wait's claim can early
+    // -release the ordering barrier.
     if request.method == "tools/call" && tool_name == Some("collab_wait_my_turn") {
-        return Some(dispatch_wait_my_turn(app, request, arrived_at).await);
+        return Some(dispatch_wait_my_turn(app, request, arrived_at, barrier).await);
     }
 
     let is_write =
@@ -750,13 +1005,36 @@ fn tool_success_response(
 /// exactly once — re-running it per poll would try to re-consume a one-time
 /// handoff token.
 ///
-/// The deadline runs from when the request ARRIVED, matching the readiness
-/// wait, so time spent queued behind the ordering barrier counts against the
-/// client's requested timeout rather than extending it.
+/// The deadline is computed by `wait_my_turn_deadline` (`collab_session.rs`),
+/// the single named helper holding the deadline formula (design decision 7,
+/// `docs/superpowers/plans/2026-07-19-wait-my-turn-barrier-early-release.md`);
+/// the synchronous fallback documents at its own deadline site why plain
+/// `now() + timeout` is the degenerate case rather than calling it. For a
+/// promptly-dispatched request it still runs from when the request
+/// ARRIVED, matching the readiness wait, so time spent queued behind the
+/// ordering barrier counts against the client's requested timeout rather than
+/// extending it. But a request that queued long enough to nearly exhaust that
+/// timeout before its claim committed instead gets a FLOOR measured from the
+/// commit instant (`begin_completed_at`) — guaranteeing at least a minimal
+/// polling window — capped so it can never stretch the wait past what the
+/// client itself asked for from that point.
+///
+/// `barrier` is `Some` only when this request is dispatched as the
+/// per-connection mutation barrier owner (see `run_framing_loop`). The claim
+/// in `wait_my_turn_begin` — the generation settle plus the process-global
+/// attribution stamp it commits — is this tool's entire write; the poll loop
+/// below is read-only. Once `wait_my_turn_begin` returns `Ok`, the mutation
+/// this barrier represents has fully committed, and the
+/// next queued mutation may start without waiting for the (up to 60s) poll
+/// loop below to finish. `barrier` is fired exactly there, before the loop,
+/// and nowhere else in this function: on the `Err` path it is simply dropped
+/// unfired, so the normal completion path releases the barrier instead
+/// (fail-closed — see design decision 2).
 async fn dispatch_wait_my_turn(
     app: &Arc<App>,
     request: &JsonRpcRequest,
     arrived_at: std::time::Instant,
+    barrier: Option<BarrierRelease>,
 ) -> JsonRpcResponse {
     let tool_name = request_tool_name(request);
     let args = request
@@ -764,10 +1042,16 @@ async fn dispatch_wait_my_turn(
         .get("arguments")
         .cloned()
         .unwrap_or(serde_json::json!({}));
-    let deadline = arrived_at + tools::wait_my_turn_timeout(&args);
 
     if let Err(error) = tokio::task::block_in_place(|| tools::wait_my_turn_begin(app, &args)) {
         return tool_error_response(request.id.clone(), tool_name, error);
+    }
+    let claim_committed_at = tools::ClaimCommittedAt(std::time::Instant::now());
+    let deadline =
+        tools::wait_my_turn_deadline(tools::ArrivedAt(arrived_at), claim_committed_at, &args);
+
+    if let Some(barrier) = barrier {
+        barrier.release();
     }
 
     loop {
@@ -1284,6 +1568,21 @@ mod tests {
             .as_str()
             .expect("error payload must carry a string message")
             .to_string()
+    }
+
+    /// Parse a successful `tool_success_response`'s `content[0].text` back into
+    /// the JSON body `wait_my_turn_poll` produced (`is_my_turn`, `phase`,
+    /// `current_owner`, `session_ended`) — the Task 5 tests below assert on
+    /// these fields directly rather than on the full JSON-RPC envelope.
+    fn wait_response_body(response: &JsonRpcResponse) -> serde_json::Value {
+        let result = response
+            .result
+            .as_ref()
+            .expect("tool result must be present");
+        let text = result["content"][0]["text"]
+            .as_str()
+            .expect("content[0].text must be a string");
+        serde_json::from_str(text).expect("tool response text must be valid JSON")
     }
 
     /// A write whose arguments are malformed does not depend on readiness to
@@ -2217,6 +2516,144 @@ mod tests {
         );
     }
 
+    /// Task 7: `reject_mutation` must mirror `write_and_account`'s attribution
+    /// fallback. A connection that never learned a session id (no
+    /// `initialize` was ever sent) rejects a collab mutation for queue
+    /// overflow; the `mcp_response` row it records must still fall back to
+    /// the sanitized collab session id carried in the request's own
+    /// arguments — otherwise a headless daemon connection loses collab
+    /// attribution the moment one of its writes is refused.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn reject_mutation_falls_back_to_request_collab_session_id() {
+        let _g = METRICS_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::remove_var("IRONMEM_METRICS");
+        std::env::remove_var("IRONMEM_HARNESS");
+        let _env = EnvGuard::set(WRITE_READINESS_TIMEOUT_ENV, "30");
+
+        #[allow(clippy::arc_with_non_send_sync)]
+        let mut app = Arc::new(App::open_for_test().unwrap());
+        let _readiness = force_warming_up(&mut app);
+
+        // id 1 dispatches and parks on the never-resolved gate; ids 2..=65
+        // fill the backlog exactly; the overflow id is a collab mutation
+        // carrying a `session_id` argument this connection never learned any
+        // other way.
+        let overflow_id = MAX_QUEUED_MUTATIONS + 2;
+        let mut requests: Vec<serde_json::Value> =
+            (1..overflow_id).map(add_drawer_request).collect();
+        requests.push(json!({
+            "jsonrpc": "2.0", "id": overflow_id, "method": "tools/call",
+            "params": {
+                "name": "collab_send",
+                "arguments": {
+                    "session_id": "fallback-collab-sess",
+                    "sender": "claude",
+                    "receiver": "codex",
+                    "message": "hi"
+                }
+            }
+        }));
+
+        let responses = collect_responses(
+            &app,
+            TransportMode::DaemonConnection,
+            &requests,
+            1,
+            Duration::from_secs(10),
+        )
+        .await;
+        assert_eq!(responses[0]["id"], json!(overflow_id));
+        assert!(
+            error_text_of(&responses[0]).contains("too many writes queued"),
+            "expected the overflow refusal; got {:?}",
+            responses[0]
+        );
+
+        let rows = app
+            .db
+            .query_token_usage(&crate::db::metrics::TokenUsageQuery::default())
+            .unwrap();
+        let rejected = rows
+            .iter()
+            .find(|r| r.source == "mcp_response" && r.tool_name.as_deref() == Some("collab_send"))
+            .expect("rejected collab_send must still record an mcp_response row");
+        assert_eq!(
+            rejected.session_id.as_deref(),
+            Some("fallback-collab-sess"),
+            "with no connection-learned session id, the rejected mutation's row \
+             must fall back to the sanitized collab session id from the request"
+        );
+    }
+
+    /// Control case for the fallback above: when the connection HAS learned a
+    /// session id (via `initialize`), that connection-level attribution must
+    /// still win over whatever `session_id` argument the rejected request
+    /// happens to carry — the fallback is last-resort only.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn reject_mutation_prefers_connection_session_id_over_request_fallback() {
+        let _g = METRICS_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::remove_var("IRONMEM_METRICS");
+        std::env::remove_var("IRONMEM_HARNESS");
+        let _env = EnvGuard::set(WRITE_READINESS_TIMEOUT_ENV, "30");
+
+        #[allow(clippy::arc_with_non_send_sync)]
+        let mut app = Arc::new(App::open_for_test().unwrap());
+        let _readiness = force_warming_up(&mut app);
+
+        let overflow_id = MAX_QUEUED_MUTATIONS + 2;
+        let mut requests = vec![json!({
+            "jsonrpc": "2.0", "id": 0, "method": "initialize",
+            "params": {"sessionId": "conn-learned-id"}
+        })];
+        requests.extend((1..overflow_id).map(add_drawer_request));
+        requests.push(json!({
+            "jsonrpc": "2.0", "id": overflow_id, "method": "tools/call",
+            "params": {
+                "name": "collab_send",
+                "arguments": {
+                    "session_id": "should-be-ignored",
+                    "sender": "claude",
+                    "receiver": "codex",
+                    "message": "hi"
+                }
+            }
+        }));
+
+        let responses = collect_responses(
+            &app,
+            TransportMode::DaemonConnection,
+            &requests,
+            2,
+            Duration::from_secs(10),
+        )
+        .await;
+        let overflow_response = responses
+            .iter()
+            .find(|r| r["id"] == json!(overflow_id))
+            .expect("overflow response must arrive");
+        assert!(
+            error_text_of(overflow_response).contains("too many writes queued"),
+            "expected the overflow refusal; got {overflow_response:?}"
+        );
+
+        let rows = app
+            .db
+            .query_token_usage(&crate::db::metrics::TokenUsageQuery::default())
+            .unwrap();
+        let rejected = rows
+            .iter()
+            .find(|r| r.source == "mcp_response" && r.tool_name.as_deref() == Some("collab_send"))
+            .expect("rejected collab_send must still record an mcp_response row");
+        assert_eq!(
+            rejected.session_id.as_deref(),
+            Some("conn-learned-id"),
+            "connection-learned session id must win over the request's own \
+             collab session id argument"
+        );
+    }
+
     /// Blocking WRITES after an overflow must not block reads: the pipeline's
     /// whole purpose is that a read is never held up by a write, and a
     /// fail-closed rule that swallowed reads too would be a worse bug than the
@@ -2415,6 +2852,1089 @@ mod tests {
             result.is_ok(),
             "a stream that ends cleanly must close normally, not as an error; \
              got {result:?}"
+        );
+    }
+
+    // ── Task 3: bounded admission for early-released waits ─────────────────
+
+    /// Build a `collab_wait_my_turn` request that carries a real `handoff_token`
+    /// — i.e. one the framing loop's `is_mutating_request` classifies as a
+    /// MUTATION (see `tools::CONDITIONALLY_MUTATING_TOOLS`'s `collab_wait_my_turn`
+    /// entry), so it actually goes through the mutation-ordering barrier and is
+    /// eligible for `barrier_release_for`'s early-release reservation — a
+    /// `collab_wait_my_turn` call without a token is a plain read and never
+    /// touches any of this.
+    fn wait_request(
+        id: u64,
+        session_id: &str,
+        token: &str,
+        timeout_secs: u64,
+    ) -> serde_json::Value {
+        json!({
+            "jsonrpc": "2.0", "id": id, "method": "tools/call",
+            "params": {
+                "name": "collab_wait_my_turn",
+                "arguments": {
+                    "session_id": session_id, "agent": "codex",
+                    "handoff_token": token, "timeout_secs": timeout_secs
+                }
+            }
+        })
+    }
+
+    /// A fresh session (implementer `Claude`) with a freshly issued, unclaimed
+    /// `handoff_token` for `Agent::Codex`.
+    ///
+    /// One (session, agent) pair can hold only ONE pending token at a time
+    /// (`collab_actor_generations`'s primary key), so getting N independent,
+    /// simultaneously-claimable tokens for N concurrent waits requires N
+    /// separate sessions — there is no way to mint several live tokens for one
+    /// session.
+    ///
+    /// Since `agent` here is always `Codex` and every session's `current_owner`
+    /// defaults to its `Claude` implementer, a wait claiming this token as
+    /// `codex` is never "my turn" and the session is never ended by this
+    /// helper, so the resulting wait genuinely long-polls rather than settling.
+    fn wait_session_and_token(app: &Arc<App>) -> (String, String) {
+        let session_id = uuid::Uuid::new_v4().to_string();
+        app.db
+            .with_transaction(|tx| {
+                crate::collab::queue::create_session(
+                    tx,
+                    &session_id,
+                    "/repo",
+                    "main",
+                    Some("task"),
+                    crate::collab::Agent::Claude,
+                )
+            })
+            .unwrap();
+        let token = app
+            .db
+            .with_transaction(|tx| {
+                crate::collab::handoff::issue_or_reuse_handoff(
+                    tx,
+                    &session_id,
+                    crate::collab::Agent::Codex,
+                )
+            })
+            .unwrap()
+            .token;
+        (session_id, token)
+    }
+
+    /// Give `loop_fut` up to `budget` of cooperative wall-clock time to react to
+    /// whatever was just written to its input side, then return.
+    ///
+    /// Every step Task 3's dispatch path takes synchronously — reading the
+    /// freshly-written line, admitting the mutation, `wait_my_turn_begin`'s
+    /// claim (which is what stamps the process-global "active collab session"
+    /// slot), sending the early-release signal, and the wait's own first,
+    /// read-only poll — completes without ever yielding to the
+    /// executor, so `budget` only has to be long enough for the runtime to give
+    /// `loop_fut` a few turns; it is not a real long-poll wait. A regression that
+    /// makes the loop hang instead panics via the `loop_fut` branch rather than
+    /// silently reporting "done" with nothing having happened.
+    async fn drive_briefly(
+        loop_fut: &mut (impl std::future::Future<Output = Result<(), MemoryError>> + Unpin),
+        budget: std::time::Duration,
+    ) {
+        tokio::select! {
+            result = &mut *loop_fut => panic!("framing loop exited early: {result:?}"),
+            _ = tokio::time::sleep(budget) => {}
+        }
+    }
+
+    /// Pins the cap-check branch in `barrier_release_for` directly: deleting
+    /// that `if early_release_reserved.len() >= MAX_EARLY_RELEASED_WAITS`
+    /// check would leave every other test in this module green, since the two
+    /// wire-level tests around the cap only exercise it indirectly through a
+    /// full framing-loop/duplex harness. This test calls the pure function
+    /// itself with no `tokio::test`, no wire harness — just a channel and a
+    /// `HashSet` — so it fails immediately, and only, if the cap enforcement
+    /// or the "don't insert on refusal" invariant regresses.
+    #[test]
+    fn barrier_release_for_enforces_the_cap_and_does_not_insert_on_refusal() {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<u64>();
+        let mut reserved: std::collections::HashSet<u64> = std::collections::HashSet::new();
+
+        // Fill the cap exactly: every call up to MAX_EARLY_RELEASED_WAITS gets
+        // Some, and the set grows by one each time.
+        for seq in 0..MAX_EARLY_RELEASED_WAITS as u64 {
+            let result = barrier_release_for(&tx, &mut reserved, seq);
+            assert!(result.is_some(), "seq {seq} should be under the cap");
+            assert!(reserved.contains(&seq));
+        }
+        assert_eq!(reserved.len(), MAX_EARLY_RELEASED_WAITS);
+
+        // One more, over the cap: must be refused, and must NOT be inserted —
+        // the whole leak-prevention invariant depends on refused seqs never
+        // occupying a slot in the set.
+        let over_cap_seq = MAX_EARLY_RELEASED_WAITS as u64;
+        let refused = barrier_release_for(&tx, &mut reserved, over_cap_seq);
+        assert!(
+            refused.is_none(),
+            "dispatching over the cap must return None"
+        );
+        assert!(
+            !reserved.contains(&over_cap_seq),
+            "a refused reservation must not be inserted into the set"
+        );
+        assert_eq!(
+            reserved.len(),
+            MAX_EARLY_RELEASED_WAITS,
+            "the set must not grow on a refusal"
+        );
+
+        // Freeing one slot (simulating the completion-branch removal) makes
+        // room for exactly one more admission.
+        reserved.remove(&0);
+        let admitted_again = barrier_release_for(&tx, &mut reserved, over_cap_seq);
+        assert!(
+            admitted_again.is_some(),
+            "freeing a slot must let the next dispatch get early release again"
+        );
+    }
+
+    /// Pins `release_barrier`'s seq-match guard directly: deleting it (making
+    /// every release unconditionally clear the barrier and report success)
+    /// leaves the rest of this module's tests green — see
+    /// `a_same_tick_settlement_processes_completion_before_the_stale_release_signal`'s
+    /// doc comment, whose own regression claim about this guard does not
+    /// actually hold under mutation testing, because nothing happens to be
+    /// queued at the moment its stale signal is processed. This test calls the
+    /// pure function directly against a barrier already owned by a DIFFERENT
+    /// seq, so it fails immediately, and only, if the guard regresses.
+    #[test]
+    fn release_barrier_ignores_a_stale_or_mismatched_seq() {
+        // A different request (seq 7) currently owns the barrier.
+        let mut mutation_barrier: Option<u64> = Some(7);
+
+        // A stale/duplicate release for some OTHER seq (5) must be a no-op: it
+        // must NOT clear the real owner's barrier, and must report that it did
+        // not release anything.
+        let released = release_barrier(&mut mutation_barrier, 5);
+        assert!(!released, "a mismatched seq must not report a release");
+        assert_eq!(
+            mutation_barrier,
+            Some(7),
+            "a mismatched seq must not clear a DIFFERENT owner's barrier"
+        );
+
+        // The real owner's OWN release still works normally.
+        let released = release_barrier(&mut mutation_barrier, 7);
+        assert!(released, "the actual owner's seq must release successfully");
+        assert_eq!(mutation_barrier, None);
+
+        // Once cleared, a SECOND release attempt for the same (now-stale) seq
+        // must also be a no-op — this is the literal "duplicate release" case
+        // (e.g. an early-release signal arriving after the completion arm
+        // already released the same seq).
+        let released_again = release_barrier(&mut mutation_barrier, 7);
+        assert!(
+            !released_again,
+            "a duplicate release for an already-cleared seq must not report success"
+        );
+        assert_eq!(mutation_barrier, None);
+    }
+
+    /// Task 3: dispatching a batch of token-bearing waits that straddles
+    /// `MAX_EARLY_RELEASED_WAITS` must not stall a read pipelined behind them.
+    ///
+    /// Each of the `MAX_EARLY_RELEASED_WAITS + 8` waits below claims its own
+    /// session's handoff token as `codex`, which is never that session's
+    /// current owner, and none of the sessions is ever ended — so no wait ever
+    /// settles on its own within this test's lifetime. Only the first
+    /// `MAX_EARLY_RELEASED_WAITS` get an early-release reservation
+    /// (`barrier_release_for`); the next one dispatched is forced to hold the
+    /// mutation barrier for its own full poll (fail-closed, pre-#199
+    /// behavior), which in turn leaves every wait behind IT stuck in the
+    /// per-connection ordering queue, never even dispatched. Every single one
+    /// of the 24 therefore remains unanswered for the entire test — which
+    /// makes the assertion below unambiguous: if the trailing `search` read's
+    /// response arrives at all, it did so while every wait was still
+    /// outstanding.
+    ///
+    /// One MCP process may have only one collab session "active" for metrics
+    /// attribution at a time (`ensure_no_conflicting_process_session`) — a
+    /// wait claims that slot for its own session in `wait_my_turn_begin`, once,
+    /// and a DIFFERENT session's claim attempt is refused while it's held.
+    /// Because every wait here uses its own distinct session, this test clears
+    /// that process-local marker (`App::clear_active_collab_session`, a public,
+    /// ordinary method) between each wait's dispatch so the next wait's own
+    /// claim isn't rejected as a cross-session conflict. This is pure test
+    /// bookkeeping to work around a real, unrelated single-active-session
+    /// invariant — it has nothing to do with, and does not touch, anything
+    /// Task 3 introduced.
+    ///
+    /// The clear is RELIABLE only because the claim is confined to
+    /// `wait_my_turn_begin`: that runs during the preceding `drive_briefly`,
+    /// before the clear, and the poll loop that keeps running afterwards is
+    /// write-free. If the claim were re-stamped on every poll (as it was before
+    /// the #199 fix), an already-dispatched wait could re-bind the cell between
+    /// this clear and the next wait's `wait_my_turn_begin`, refusing that wait
+    /// and making this test flaky under CPU load.
+    ///
+    /// What this test does NOT prove: with `MAX_IN_FLIGHT_REQUESTS = 64` and
+    /// only ~17 of the 24 waits ever actually admitted into `in_flight` (the
+    /// rest sit in the ordering queue for the whole test, since the one wait
+    /// dispatched over the cap holds the barrier for its full poll and blocks
+    /// the queue behind it), this is nowhere near exhausting
+    /// `MAX_IN_FLIGHT_REQUESTS` itself — that would need close to 64 genuinely
+    /// concurrent long-polling waits, which this test does not construct. It
+    /// is only an integration-level proof that a batch straddling the
+    /// `MAX_EARLY_RELEASED_WAITS` boundary does not stall a read behind it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn early_released_waits_are_capped_and_a_read_behind_them_still_answers() {
+        #[allow(clippy::arc_with_non_send_sync)]
+        let app = Arc::new(App::open_for_test().unwrap());
+
+        let wait_count = MAX_EARLY_RELEASED_WAITS + 8;
+        let (mut client_in, server_in) = tokio::io::duplex(1 << 20);
+        let (server_out, client_out) = tokio::io::duplex(1 << 20);
+        let mut loop_fut = Box::pin(run_framing_loop(
+            &app,
+            BufReader::new(server_in),
+            server_out,
+            TransportMode::DaemonConnection,
+        ));
+
+        for i in 0..wait_count {
+            let (session_id, token) = wait_session_and_token(&app);
+            let request = wait_request(i as u64, &session_id, &token, 30);
+            client_in
+                .write_all(format!("{request}\n").as_bytes())
+                .await
+                .unwrap();
+            drive_briefly(&mut loop_fut, Duration::from_millis(20)).await;
+            app.clear_active_collab_session();
+        }
+
+        let read_id = 999_999_u64;
+        let search = json!({
+            "jsonrpc": "2.0", "id": read_id, "method": "tools/call",
+            "params": {"name": "search", "arguments": {"query": "anything"}}
+        });
+        client_in
+            .write_all(format!("{search}\n").as_bytes())
+            .await
+            .unwrap();
+
+        let mut responses = BufReader::new(client_out).lines();
+        let first = tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::select! {
+                result = &mut loop_fut => panic!("framing loop exited early: {result:?}"),
+                line = responses.next_line() => serde_json::from_str::<serde_json::Value>(
+                    &line.unwrap().expect("server must write a response"),
+                )
+                .expect("response must be valid JSON"),
+            }
+        })
+        .await
+        .expect(
+            "the read pipelined behind a batch straddling MAX_EARLY_RELEASED_WAITS got no \
+             answer within 5s — the connection is stalled, which is exactly the starvation \
+             the cap exists to prevent",
+        );
+
+        assert_eq!(
+            first["id"],
+            json!(read_id),
+            "the read must be answered while every wait is still outstanding (none of the \
+             24 ever settles within this test's window); got {first:?} instead"
+        );
+    }
+
+    /// Task 3: the early-release reservation taken at dispatch must be freed
+    /// on COMPLETION, not merely when the mutation barrier itself is freed —
+    /// otherwise the slot leaks forever and the cap permanently ratchets down
+    /// after the first `MAX_EARLY_RELEASED_WAITS` early-released waits a
+    /// connection ever sees.
+    ///
+    /// Dispatches exactly `MAX_EARLY_RELEASED_WAITS` waits with the minimum
+    /// allowed `timeout_secs` (1, per `wait_my_turn_timeout`'s clamp) and lets
+    /// every one of them actually settle (their poll expires), which is the
+    /// completion event that should free their reservations
+    /// (`early_release_reserved.remove` in the completion arm). It then
+    /// dispatches one more wait with a long timeout — which never settles on
+    /// its own — followed immediately by a queued mutation (another short
+    /// wait). If the freed reservations were NOT reclaimed, the new wait would
+    /// find the reservation set still full, be dispatched with `None`, and be
+    /// forced to hold the barrier for its own full 30s poll — so the queued
+    /// mutation behind it would only be answered after that. Observing the
+    /// queued mutation's response arrive promptly (well under the new wait's
+    /// timeout, and strictly before the new wait's own response) is the proof
+    /// the reservations were correctly freed.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn early_release_reservation_is_freed_on_completion() {
+        #[allow(clippy::arc_with_non_send_sync)]
+        let app = Arc::new(App::open_for_test().unwrap());
+
+        let (mut client_in, server_in) = tokio::io::duplex(1 << 20);
+        let (server_out, client_out) = tokio::io::duplex(1 << 20);
+        let mut loop_fut = Box::pin(run_framing_loop(
+            &app,
+            BufReader::new(server_in),
+            server_out,
+            TransportMode::DaemonConnection,
+        ));
+        let mut responses = BufReader::new(client_out).lines();
+
+        for i in 0..MAX_EARLY_RELEASED_WAITS {
+            let (session_id, token) = wait_session_and_token(&app);
+            let request = wait_request(i as u64, &session_id, &token, 1);
+            client_in
+                .write_all(format!("{request}\n").as_bytes())
+                .await
+                .unwrap();
+            drive_briefly(&mut loop_fut, Duration::from_millis(20)).await;
+            app.clear_active_collab_session();
+        }
+
+        // Let all `MAX_EARLY_RELEASED_WAITS` waits actually settle (their 1s
+        // timeout expires), which is the completion event expected to free
+        // their reservations.
+        let mut settled_ids: std::collections::HashSet<u64> = std::collections::HashSet::new();
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while settled_ids.len() < MAX_EARLY_RELEASED_WAITS {
+                tokio::select! {
+                    result = &mut loop_fut => panic!("framing loop exited early: {result:?}"),
+                    line = responses.next_line() => {
+                        let line = line.unwrap().expect("a response");
+                        let response: serde_json::Value = serde_json::from_str(&line).unwrap();
+                        settled_ids.insert(response["id"].as_u64().unwrap());
+                    }
+                }
+            }
+        })
+        .await
+        .expect(
+            "the first MAX_EARLY_RELEASED_WAITS waits must all settle within 10s (their \
+             timeout_secs is 1) — a regression here is in the polling loop itself, not the \
+             reservation logic this test targets",
+        );
+
+        // The 16 waits above kept re-claiming the process-local "active collab
+        // session" marker on every poll until they settled (see
+        // `wait_session_and_token`'s doc comment) and were never cleaned up
+        // afterward, so it is still pinned to whichever of them polled last.
+        // Clear it here for the same reason the dispatch loop above does:
+        // this next wait uses yet another distinct session, so an unrelated
+        // leftover "active" session would otherwise reject its claim outright
+        // as a cross-session conflict before it ever reaches the reservation
+        // logic this test targets.
+        app.clear_active_collab_session();
+
+        // One more wait (long timeout, never settles on its own) plus a
+        // mutation queued right behind it.
+        let (new_session, new_token) = wait_session_and_token(&app);
+        let new_wait_id = 9_000_u64;
+        let new_wait = wait_request(new_wait_id, &new_session, &new_token, 30);
+        client_in
+            .write_all(format!("{new_wait}\n").as_bytes())
+            .await
+            .unwrap();
+        drive_briefly(&mut loop_fut, Duration::from_millis(20)).await;
+        app.clear_active_collab_session();
+
+        let (queued_session, queued_token) = wait_session_and_token(&app);
+        let queued_id = 9_100_u64;
+        let queued = wait_request(queued_id, &queued_session, &queued_token, 1);
+        client_in
+            .write_all(format!("{queued}\n").as_bytes())
+            .await
+            .unwrap();
+
+        let queued_response = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                tokio::select! {
+                    result = &mut loop_fut => panic!("framing loop exited early: {result:?}"),
+                    line = responses.next_line() => {
+                        let line = line.unwrap().expect("a response");
+                        let response: serde_json::Value = serde_json::from_str(&line).unwrap();
+                        assert_ne!(
+                            response["id"], json!(new_wait_id),
+                            "the NEW wait's own response arrived before the mutation queued \
+                             behind it — its reservation must have leaked from the earlier \
+                             batch, forcing it to hold the barrier for its full 30s timeout \
+                             instead of releasing early"
+                        );
+                        if response["id"] == json!(queued_id) {
+                            break response;
+                        }
+                    }
+                }
+            }
+        })
+        .await
+        .expect(
+            "the mutation queued behind the new wait got no answer within 5s — if the \
+             earlier MAX_EARLY_RELEASED_WAITS completions did not free their reservations, \
+             the new wait would hold the barrier for its own 30s timeout instead of \
+             releasing early, and this queued mutation would be stuck behind it the whole \
+             time",
+        );
+        assert_eq!(queued_response["id"], json!(queued_id));
+    }
+
+    // ── Task 5: minimum-window behavior tests ───────────────────────────────
+    //
+    // Task 4 added `wait_my_turn_deadline`'s floor (`max(arrived_at + timeout,
+    // begin_completed_at + min(timeout, WAIT_MY_TURN_MIN_POLL_WINDOW))`) with
+    // only pure unit tests on the helper itself. These four tests are the
+    // missing integration-level proof that `dispatch_wait_my_turn`, driven
+    // end-to-end, actually behaves correctly under the floor: a request that
+    // queued long enough for its own arrival deadline to already be in the
+    // past still gets a real poll cycle to observe a turn-flip, an
+    // already-settled wait is unaffected by the floor, an invalid request
+    // still fails fast, and an ordinary promptly-dispatched wait still honors
+    // its own requested bound.
+
+    /// A request whose `arrived_at` is already older than `timeout_secs` (as
+    /// if it queued behind other mutations for a long time before this
+    /// task's early-release logic could dispatch it) must still get at least
+    /// one real poll cycle to observe a turn-flip, instead of the pre-Task-4
+    /// behavior of the poll loop's first deadline check already being in the
+    /// past and returning "not my turn" before the flip below can land.
+    ///
+    /// Regression-sensitivity (see the commit message / self-review for this
+    /// task): reverting `wait_my_turn_deadline`'s `max(...)` back to plain
+    /// `arrived_at + timeout` was verified locally to make this specific test
+    /// FAIL — the response comes back with `is_my_turn: false` well before
+    /// the concurrent flip below ever runs, because the deadline collapses to
+    /// a point already in the past.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn delayed_wait_still_observes_a_turn_flip_after_one_poll_interval() {
+        #[allow(clippy::arc_with_non_send_sync)]
+        let app = Arc::new(App::open_for_test().unwrap());
+        let (session_id, token) = wait_session_and_token(&app);
+
+        let timeout_secs = 5u64;
+        let request = tool_call(
+            1,
+            "collab_wait_my_turn",
+            json!({
+                "session_id": session_id, "agent": "codex",
+                "handoff_token": token, "timeout_secs": timeout_secs
+            }),
+        );
+        // Simulate a request that sat queued for a long time before dispatch:
+        // `arrived_at + timeout_secs` is already in the past.
+        let arrived_at = std::time::Instant::now() - Duration::from_secs(timeout_secs + 5);
+
+        // `App` is `!Send` (interior `RefCell`s in its connection pool), so
+        // this cannot be a `tokio::spawn`ed task on a different worker thread
+        // — it has to be a plain future driven cooperatively on the same
+        // task as the wait itself, via `tokio::join!`. That still lands the
+        // flip concurrently with the wait's polling: both futures only make
+        // progress at `.await` points, and the wait yields to the executor
+        // every `WAIT_MY_TURN_POLL_INTERVAL` via `tokio::time::sleep`.
+        let flip = async {
+            // Roughly one poll interval, so the flip lands between the wait's
+            // first and second snapshot reads rather than before dispatch
+            // even starts.
+            tokio::time::sleep(tools::WAIT_MY_TURN_POLL_INTERVAL - Duration::from_millis(150))
+                .await;
+            app.db
+                .with_transaction(|tx| {
+                    crate::collab::queue::set_implementer(
+                        tx,
+                        &session_id,
+                        crate::collab::Agent::Claude,
+                        Some(crate::collab::Agent::Codex),
+                    )
+                })
+                .unwrap();
+        };
+        let wait = dispatch_wait_my_turn(&app, &request, arrived_at, None);
+
+        let (_, response) =
+            tokio::time::timeout(Duration::from_secs(3), async { tokio::join!(flip, wait) })
+                .await
+                .expect(
+                    "dispatch_wait_my_turn did not return within 3s — the floor should have kept \
+             it polling long enough to observe the concurrent turn-flip",
+                );
+
+        let body = wait_response_body(&response);
+        assert_eq!(
+            body["is_my_turn"],
+            json!(true),
+            "the wait must observe the concurrent turn-flip instead of returning \
+             immediately with an already-past deadline; got {body:?}"
+        );
+    }
+
+    /// An already-settled wait (the turn is flipped BEFORE dispatch, not
+    /// concurrently) must return at once despite carrying the same kind of
+    /// old `arrived_at` as the delayed-wait test above — the floor extends
+    /// how long an UNSETTLED wait may poll, it must never delay a settled
+    /// answer.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_wait_already_settled_at_dispatch_returns_immediately_despite_an_old_arrival() {
+        #[allow(clippy::arc_with_non_send_sync)]
+        let app = Arc::new(App::open_for_test().unwrap());
+        let (session_id, token) = wait_session_and_token(&app);
+
+        // Flip the turn to `codex` BEFORE dispatching at all, so the very
+        // first snapshot read already settles.
+        app.db
+            .with_transaction(|tx| {
+                crate::collab::queue::set_implementer(
+                    tx,
+                    &session_id,
+                    crate::collab::Agent::Claude,
+                    Some(crate::collab::Agent::Codex),
+                )
+            })
+            .unwrap();
+
+        let timeout_secs = 30u64;
+        let request = tool_call(
+            1,
+            "collab_wait_my_turn",
+            json!({
+                "session_id": session_id, "agent": "codex",
+                "handoff_token": token, "timeout_secs": timeout_secs
+            }),
+        );
+        let arrived_at = std::time::Instant::now() - Duration::from_secs(timeout_secs + 5);
+
+        let response = tokio::time::timeout(
+            Duration::from_millis(300),
+            dispatch_wait_my_turn(&app, &request, arrived_at, None),
+        )
+        .await
+        .expect(
+            "an already-settled wait must return in well under one poll interval — the \
+             extended floor deadline must never delay a settled answer",
+        );
+
+        let body = wait_response_body(&response);
+        assert_eq!(body["is_my_turn"], json!(true), "got {body:?}");
+    }
+
+    /// A request that fails validation (`wait_my_turn_begin` returns `Err`
+    /// before any deadline is ever computed) must still return immediately —
+    /// the floor only applies once a claim has actually committed.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn invalid_wait_request_returns_immediately_without_polling() {
+        #[allow(clippy::arc_with_non_send_sync)]
+        let app = Arc::new(App::open_for_test().unwrap());
+
+        // `session_id` is required and absent here, so `wait_my_turn_begin`
+        // fails validation before `wait_my_turn_deadline` is ever called.
+        let request = tool_call(
+            1,
+            "collab_wait_my_turn",
+            json!({ "agent": "codex", "timeout_secs": 30 }),
+        );
+        let arrived_at = std::time::Instant::now() - Duration::from_secs(35);
+
+        let response = tokio::time::timeout(
+            Duration::from_millis(200),
+            dispatch_wait_my_turn(&app, &request, arrived_at, None),
+        )
+        .await
+        .expect("an invalid wait request must fail validation immediately, not poll");
+
+        let message = tool_error_text(&response);
+        assert!(
+            message.contains("session_id"),
+            "expected a validation error about the missing session_id; got {message:?}"
+        );
+    }
+
+    /// Control: an ordinary promptly-dispatched wait (`arrived_at ==
+    /// dispatch time`, no simulated queueing delay) whose turn never flips
+    /// must still honor its own requested `timeout_secs` — neither
+    /// collapsing to near-zero (deadline too short) nor stretching past 1s
+    /// (the floor overriding the client's own requested bound, which
+    /// design decision 7 explicitly rules out).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_prompt_wait_honors_its_own_requested_timeout() {
+        #[allow(clippy::arc_with_non_send_sync)]
+        let app = Arc::new(App::open_for_test().unwrap());
+        // `codex` is never made the owner, so this wait genuinely never
+        // settles on its own and always runs out its full deadline.
+        let (session_id, token) = wait_session_and_token(&app);
+
+        let timeout_secs = 1u64;
+        let request = tool_call(
+            1,
+            "collab_wait_my_turn",
+            json!({
+                "session_id": session_id, "agent": "codex",
+                "handoff_token": token, "timeout_secs": timeout_secs
+            }),
+        );
+        let arrived_at = std::time::Instant::now();
+
+        let started = std::time::Instant::now();
+        let response = tokio::time::timeout(
+            Duration::from_millis(1800),
+            dispatch_wait_my_turn(&app, &request, arrived_at, None),
+        )
+        .await
+        .expect(
+            "a promptly-dispatched 1s wait must resolve within 1.8s — if the floor \
+             stretched it past its own requested timeout, this bound would be exceeded",
+        );
+        let elapsed = started.elapsed();
+
+        assert!(
+            elapsed >= Duration::from_millis(900),
+            "the wait resolved after only {elapsed:?} — the deadline collapsed to \
+             something far shorter than the requested 1s timeout"
+        );
+
+        let body = wait_response_body(&response);
+        assert_eq!(
+            body["is_my_turn"],
+            json!(false),
+            "the turn was never flipped, so the wait must settle as \"not my turn\" \
+             once its deadline expires; got {body:?}"
+        );
+    }
+
+    // ── Task 6: early-release ordering + fail-closed regression coverage ───
+    //
+    // The four tests below are the final proof that Tasks 1-5's early-release
+    // mechanism cannot reorder mutations or leak the ordering barrier. Every
+    // assertion here is on the ORDER responses are WRITTEN (`response["id"]`
+    // as read off the wire), not on wall-clock gaps — timing bounds exist
+    // only to keep the tests fast and fail-fast on a real hang.
+
+    /// The wire-level ordering proof, and the primary evidence for the
+    /// "signal-before-completion" direction of design decision 5: a real,
+    /// token-bearing wait that never settles on its own, with a follow-on
+    /// mutation and a third mutation pipelined directly behind it on one
+    /// connection.
+    ///
+    /// The wait's `BarrierRelease` fires (freeing the barrier for the
+    /// follow-on, then the third write) the instant its claim commits —
+    /// long before its own multi-second poll loop ever finishes. When that
+    /// poll loop finally DOES finish and its completion reaches the framing
+    /// loop, `release_barrier` finds `mutation_barrier` already `None` (nothing
+    /// left queued), so the stale completion cannot pop a fourth response out
+    /// of nowhere. Exactly 3 responses are collected below with a bounded
+    /// timeout; a regression that made the wait's own late completion
+    /// re-trigger `start_next_queued_mutation` or otherwise misbehave would
+    /// either produce a 4th id inside the window or simply hang.
+    ///
+    /// Regression sensitivity: reverting `dispatch_wait_my_turn` to fire
+    /// `barrier.release()` only from the normal completion path (deleting the
+    /// early call) would force the follow-on and third write to wait out this
+    /// wait's full `timeout_secs` before running at all — the ids below would
+    /// then arrive in a different order, or the bound would simply time out.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_early_released_wait_lets_the_follow_on_and_third_write_finish_before_it_does() {
+        #[allow(clippy::arc_with_non_send_sync)]
+        let app = Arc::new(App::open_for_test().unwrap());
+        // Never settles on its own (`codex` is never made the owner and the
+        // session is never ended), so its own response can only arrive by
+        // running out its `timeout_secs` — giving the follow-on and third
+        // write a wide, unambiguous window to finish first.
+        let (session_id, token) = wait_session_and_token(&app);
+
+        let timeout_secs = 2u64;
+        let wait_id = 1u64;
+        let follow_on_id = 2usize;
+        let third_id = 3usize;
+
+        let requests = vec![
+            wait_request(wait_id, &session_id, &token, timeout_secs),
+            add_drawer_request(follow_on_id),
+            add_drawer_request(third_id),
+        ];
+
+        let responses = collect_responses(
+            &app,
+            TransportMode::DaemonConnection,
+            &requests,
+            3,
+            Duration::from_secs(timeout_secs + 5),
+        )
+        .await;
+
+        let ids: Vec<_> = responses.iter().map(|r| r["id"].clone()).collect();
+        assert_eq!(
+            ids,
+            vec![json!(follow_on_id), json!(third_id), json!(wait_id)],
+            "the follow-on and third write must both be answered — in arrival \
+             order — before the wait's own response, which can only land once \
+             its {timeout_secs}s timeout actually elapses; got {ids:?}"
+        );
+
+        // The wait itself must still report its own honest, unsettled
+        // outcome — early release frees the BARRIER, not the wait's own
+        // answer.
+        let wait_text = responses[2]["result"]["content"][0]["text"]
+            .as_str()
+            .expect("wait response must carry content[0].text");
+        let wait_body: serde_json::Value = serde_json::from_str(wait_text).unwrap();
+        assert_eq!(
+            wait_body["is_my_turn"],
+            json!(false),
+            "the turn was never flipped, so the wait must settle as \"not my \
+             turn\" once its own deadline expires; got {wait_body:?}"
+        );
+    }
+
+    /// The fail-closed proof: a token-bearing wait whose claim FAILS —
+    /// `wait_my_turn_begin` returns `Err` because the token presented was
+    /// never issued for this `(session_id, agent)` pair — must still hold the
+    /// mutation barrier until ITS OWN (immediate) completion, and release it
+    /// only through the normal completion path. `barrier` is simply dropped,
+    /// unfired, on the `Err` early-return in `dispatch_wait_my_turn` — never
+    /// released, never signaled through the early-release channel.
+    ///
+    /// Regression this catches: firing `barrier.release()` unconditionally
+    /// (or before the `Ok` check) would let the follow-on mutation start
+    /// concurrently with, or even before, this failed wait's own error
+    /// response — this test would then see the follow-on's id arrive before,
+    /// or racing, the wait's.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_failed_claim_holds_the_barrier_until_its_own_error_response() {
+        #[allow(clippy::arc_with_non_send_sync)]
+        let app = Arc::new(App::open_for_test().unwrap());
+        // A real session with a real, unclaimed token issued for `codex` —
+        // deliberately NOT used below. The request instead carries a
+        // freshly-minted UUID that was never issued for this session, so
+        // `claim_handoff_token` rejects it (`pending_token != token`).
+        let (session_id, _real_token) = wait_session_and_token(&app);
+        let bogus_token = uuid::Uuid::new_v4().to_string();
+
+        let wait_id = 1u64;
+        let follow_on_id = 2usize;
+        let requests = vec![
+            wait_request(wait_id, &session_id, &bogus_token, 30),
+            add_drawer_request(follow_on_id),
+        ];
+
+        let responses = collect_responses(
+            &app,
+            TransportMode::DaemonConnection,
+            &requests,
+            2,
+            Duration::from_secs(2),
+        )
+        .await;
+
+        let ids: Vec<_> = responses.iter().map(|r| r["id"].clone()).collect();
+        assert_eq!(
+            ids,
+            vec![json!(wait_id), json!(follow_on_id)],
+            "the failed wait's own error response must be written before the \
+             follow-on queued behind it — the barrier must have been held \
+             until this request's own (immediate) completion; got {ids:?}"
+        );
+
+        assert_eq!(
+            responses[0]["result"]["isError"].as_bool(),
+            Some(true),
+            "a failed claim must produce an error response; got {:?}",
+            responses[0]
+        );
+        let message = error_text_of(&responses[0]);
+        assert!(
+            message.contains("invalid handoff_token"),
+            "expected a claim-rejection message; got {message:?}"
+        );
+    }
+
+    /// The "completion-before-signal" ordering — the trickier of the two
+    /// possible race outcomes between a wait's own normal completion and its
+    /// early-release channel signal (the companion, "signal-before-completion"
+    /// direction is what
+    /// `an_early_released_wait_lets_the_follow_on_and_third_write_finish_before_it_does`
+    /// proves above, end to end).
+    ///
+    /// `barrier.release()` fires the instant `wait_my_turn_begin` returns
+    /// `Ok`, strictly BEFORE the poll loop runs even once. If the very first
+    /// `wait_my_turn_poll` already settles (the turn is flipped to `codex`
+    /// BEFORE this wait is ever dispatched), `dispatch_wait_my_turn`'s entire
+    /// body — claim, release, one poll, return — executes on a SINGLE poll of
+    /// its future, without ever reaching `tokio::time::sleep`. That means
+    /// both the completed future (`in_flight`) AND the queued channel message
+    /// (`early_release_rx`) become ready inside the very same `select!` pass.
+    /// Because the `select!` in `run_framing_loop` is `biased` with the
+    /// completion arm listed BEFORE the early-release arm, the completion arm
+    /// always wins that race: this wait's barrier release is therefore first
+    /// evaluated via NORMAL completion (which succeeds and would drain the
+    /// queue if anything were queued), and the early-release channel's
+    /// message for the SAME seq is only drained on a LATER loop pass — by
+    /// which point `mutation_barrier` no longer matches, so `release_barrier`
+    /// must reject it as stale (a no-op), not re-drain the queue or clear
+    /// anything a second time.
+    ///
+    /// Constructed by flipping `current_owner` to `codex` via
+    /// `set_implementer` BEFORE the wait is ever dispatched — the same
+    /// technique
+    /// `a_wait_already_settled_at_dispatch_returns_immediately_despite_an_old_arrival`
+    /// (Task 5) uses — so the wait's own first snapshot read already
+    /// settles.
+    ///
+    /// What this test actually pins: the completion-before-signal ORDERING
+    /// (the three ids below, in that order) and that the stale signal
+    /// produces no observable fourth response. It does NOT, by itself, prove
+    /// `release_barrier`'s seq-match guard is load-bearing: mutation testing
+    /// shows that deleting that guard entirely leaves this test green too,
+    /// because `queued_mutations` is already empty by the time the stale
+    /// signal is drained here, so an unconditional clear-and-drain is a no-op
+    /// in this specific construction. The guard's regression coverage lives
+    /// in the direct unit test `release_barrier_ignores_a_stale_or_mismatched_seq`,
+    /// which calls `release_barrier` against a barrier already owned by a
+    /// DIFFERENT seq and confirms a mismatched or duplicate release is
+    /// rejected.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_same_tick_settlement_processes_completion_before_the_stale_release_signal() {
+        #[allow(clippy::arc_with_non_send_sync)]
+        let app = Arc::new(App::open_for_test().unwrap());
+        let (session_id, token) = wait_session_and_token(&app);
+
+        // Flip the turn to `codex` BEFORE dispatching the wait at all, so its
+        // very first snapshot read already settles — no sleep is ever
+        // reached.
+        app.db
+            .with_transaction(|tx| {
+                crate::collab::queue::set_implementer(
+                    tx,
+                    &session_id,
+                    crate::collab::Agent::Claude,
+                    Some(crate::collab::Agent::Codex),
+                )
+            })
+            .unwrap();
+
+        let wait_id = 1u64;
+        let follow_on_id = 2usize;
+        let second_follow_on_id = 3usize;
+
+        let (mut client_in, server_in) = tokio::io::duplex(1 << 20);
+        let (server_out, client_out) = tokio::io::duplex(1 << 20);
+        let mut loop_fut = Box::pin(run_framing_loop(
+            &app,
+            BufReader::new(server_in),
+            server_out,
+            TransportMode::DaemonConnection,
+        ));
+        let mut responses = BufReader::new(client_out).lines();
+
+        for request in [
+            wait_request(wait_id, &session_id, &token, 30),
+            add_drawer_request(follow_on_id),
+            add_drawer_request(second_follow_on_id),
+        ] {
+            client_in
+                .write_all(format!("{request}\n").as_bytes())
+                .await
+                .unwrap();
+        }
+
+        // Collect exactly 3 responses: the already-settled wait, plus the two
+        // mutations freed behind it.
+        let mut collected = Vec::new();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while collected.len() < 3 {
+                tokio::select! {
+                    result = &mut loop_fut => panic!("framing loop exited early: {result:?}"),
+                    line = responses.next_line() => {
+                        let line = line.unwrap().expect("a response");
+                        collected.push(serde_json::from_str::<serde_json::Value>(&line).unwrap());
+                    }
+                }
+            }
+        })
+        .await
+        .expect("all three responses (wait + two queued mutations) must arrive within 5s");
+
+        let ids: Vec<_> = collected.iter().map(|r| r["id"].clone()).collect();
+        assert_eq!(
+            ids,
+            vec![
+                json!(wait_id),
+                json!(follow_on_id),
+                json!(second_follow_on_id)
+            ],
+            "the already-settled wait must complete (releasing its barrier via \
+             NORMAL completion) before either mutation behind it, and those two \
+             must still run in FIFO order behind it; got {ids:?}"
+        );
+
+        // No fourth, spurious response: the early-release channel's now-stale
+        // message for this same seq must be silently dropped by
+        // `release_barrier`'s seq mismatch, not re-fire a queue drain or
+        // duplicate anything observable on the wire.
+        let extra = tokio::select! {
+            result = &mut loop_fut => panic!("framing loop exited early: {result:?}"),
+            line = responses.next_line() => Some(line.unwrap()),
+            _ = tokio::time::sleep(Duration::from_millis(300)) => None,
+        };
+        assert!(
+            extra.is_none(),
+            "a stale early-release signal produced an unexpected extra response: {extra:?}"
+        );
+    }
+
+    /// Design decision 5, explicit coverage: an early release must NEVER
+    /// clear `mutations_blocked` — only the completion arm may, and only once
+    /// the WHOLE backlog (queue AND barrier) is empty.
+    ///
+    /// Construction: `add_drawer` (write-shaped) parks indefinitely on a
+    /// force-pending readiness gate as the first barrier owner, exactly like
+    /// `framing_loop_blocks_further_writes_after_a_queue_overflow`. A backlog
+    /// of `MAX_QUEUED_MUTATIONS` mutations queues behind it — the LAST of
+    /// which is a real, token-bearing wait — followed by one more mutation
+    /// that overflows the backlog (`mutations_blocked = true`) and a
+    /// collateral one behind that (both rejected, exactly as in the PR #198
+    /// overflow test this reuses). Resolving the gate then lets the whole
+    /// backlog cascade: every plain `add_drawer` in front of the wait
+    /// completes and hands the barrier onward, and when the wait itself
+    /// finally becomes owner it claims its (real, valid) token and fires its
+    /// `BarrierRelease` — an early release occurring, this time, strictly
+    /// AFTER `mutations_blocked` was already set. A probe mutation sent right
+    /// after must still be rejected as blocked: if a regression ever taught
+    /// the early-release arm to also clear `mutations_blocked` (a very
+    /// plausible copy-paste of the completion arm's check), this probe would
+    /// instead be accepted or queued.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn mutations_blocked_survives_an_early_release_and_still_gates_new_writes() {
+        let _g = EnvGuard::set(WRITE_READINESS_TIMEOUT_ENV, "30");
+
+        #[allow(clippy::arc_with_non_send_sync)]
+        let mut app = Arc::new(App::open_for_test().unwrap());
+        let readiness = force_warming_up(&mut app);
+        let (session_id, token) = wait_session_and_token(&app);
+
+        let q = MAX_QUEUED_MUTATIONS;
+        // id 1 dispatches and parks on the never-(yet)-resolved gate; ids
+        // 2..=q are plain fillers; id (q+1) — the LAST queued entry — is the
+        // real wait; (q+2) overflows the backlog; (q+3) is collateral.
+        let special_wait_id = (q + 1) as u64;
+        let overflow_id = q + 2;
+        let collateral_id = q + 3;
+
+        let (mut client_in, server_in) = tokio::io::duplex(1 << 20);
+        let (server_out, client_out) = tokio::io::duplex(1 << 20);
+        let mut loop_fut = Box::pin(run_framing_loop(
+            &app,
+            BufReader::new(server_in),
+            server_out,
+            TransportMode::DaemonConnection,
+        ));
+        let mut responses = BufReader::new(client_out).lines();
+
+        client_in
+            .write_all(format!("{}\n", add_drawer_request(1)).as_bytes())
+            .await
+            .unwrap();
+        drive_briefly(&mut loop_fut, Duration::from_millis(100)).await;
+
+        for i in 2..=q {
+            client_in
+                .write_all(format!("{}\n", add_drawer_request(i)).as_bytes())
+                .await
+                .unwrap();
+        }
+        let special_wait = wait_request(special_wait_id, &session_id, &token, 5);
+        client_in
+            .write_all(format!("{special_wait}\n").as_bytes())
+            .await
+            .unwrap();
+        drive_briefly(&mut loop_fut, Duration::from_millis(100)).await;
+
+        client_in
+            .write_all(format!("{}\n", add_drawer_request(overflow_id)).as_bytes())
+            .await
+            .unwrap();
+        client_in
+            .write_all(format!("{}\n", add_drawer_request(collateral_id)).as_bytes())
+            .await
+            .unwrap();
+
+        let mut collected = Vec::new();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while collected.len() < 2 {
+                tokio::select! {
+                    result = &mut loop_fut => panic!("framing loop exited early: {result:?}"),
+                    line = responses.next_line() => {
+                        let line = line.unwrap().expect("a response");
+                        collected.push(serde_json::from_str::<serde_json::Value>(&line).unwrap());
+                    }
+                }
+            }
+        })
+        .await
+        .expect("the overflow and collateral rejections must arrive promptly");
+
+        assert_eq!(
+            collected[0]["id"],
+            json!(overflow_id),
+            "got {:?}",
+            collected[0]
+        );
+        assert_eq!(
+            collected[1]["id"],
+            json!(collateral_id),
+            "got {:?}",
+            collected[1]
+        );
+        assert!(
+            error_text_of(&collected[0]).contains("too many writes queued"),
+            "got {:?}",
+            collected[0]
+        );
+        assert!(
+            error_text_of(&collected[1]).contains("writes are blocked on this connection"),
+            "got {:?}",
+            collected[1]
+        );
+
+        // Resolve readiness: id 1 completes, and the whole backlog cascades
+        // — every plain filler hands the barrier onward, and the real wait at
+        // the end of the queue claims its token and fires an EARLY release,
+        // strictly after `mutations_blocked` was set above.
+        readiness.resolve_ready();
+        drive_briefly(&mut loop_fut, Duration::from_millis(500)).await;
+
+        // A brand-new mutation sent now must STILL be rejected as blocked:
+        // the wait's early release (the early-release `select!` arm)
+        // deliberately does not touch `mutations_blocked` — only the
+        // completion arm does, and that has not run for the wait itself yet
+        // (it is still polling toward its own settlement).
+        let probe_id = q + 4;
+        client_in
+            .write_all(format!("{}\n", add_drawer_request(probe_id)).as_bytes())
+            .await
+            .unwrap();
+
+        let probe_response = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                tokio::select! {
+                    result = &mut loop_fut => panic!("framing loop exited early: {result:?}"),
+                    line = responses.next_line() => {
+                        let line = line.unwrap().expect("a response");
+                        let value: serde_json::Value = serde_json::from_str(&line).unwrap();
+                        if value["id"] == json!(probe_id) {
+                            break value;
+                        }
+                        // Otherwise: one of the cascading backlog responses
+                        // draining in the background — not the one we're
+                        // waiting for; keep going.
+                    }
+                }
+            }
+        })
+        .await
+        .expect("the probe mutation got no answer within 2s");
+
+        let probe_error = error_text_of(&probe_response);
+        assert!(
+            probe_error.contains("writes are blocked on this connection"),
+            "a new mutation arriving after the wait's early release must still be \
+             rejected as blocked — `mutations_blocked` must not have been cleared \
+             by the early-release arm; got {probe_error:?}"
         );
     }
 }

@@ -1126,6 +1126,13 @@ pub(super) fn handle_collab_approve(app: &App, args: &Value) -> Result<Value, Me
 pub(super) const WAIT_MY_TURN_POLL_INTERVAL: std::time::Duration =
     std::time::Duration::from_millis(WAIT_MY_TURN_POLL_MS);
 
+/// Floor for how long a `collab_wait_my_turn` call polls once its claim has
+/// actually committed, regardless of how long the request sat queued before
+/// that — see [`wait_my_turn_deadline`]. One poll interval is the minimum
+/// useful floor: anything smaller wouldn't survive even a single snapshot
+/// read.
+pub(super) const WAIT_MY_TURN_MIN_POLL_WINDOW: std::time::Duration = WAIT_MY_TURN_POLL_INTERVAL;
+
 /// How long `collab_wait_my_turn` polls before answering "not your turn".
 ///
 /// Parsed in ONE place so the asynchronous long-poll in `server` and the
@@ -1141,6 +1148,46 @@ pub(super) fn wait_my_turn_timeout(args: &Value) -> std::time::Duration {
     std::time::Duration::from_secs(secs)
 }
 
+/// When a `collab_wait_my_turn` request ARRIVED on its connection.
+///
+/// A newtype rather than a bare `Instant` because [`wait_my_turn_deadline`]
+/// takes this and [`ClaimCommittedAt`] adjacently: as plain `Instant`s a swapped
+/// call site would compile, pass every test, and silently turn a client's
+/// requested 60s long poll into ~115s — the exact overrun the deadline formula
+/// exists to make impossible.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ArrivedAt(pub(crate) std::time::Instant);
+
+/// When a `collab_wait_my_turn` request's claim actually COMMITTED, i.e. when
+/// [`wait_my_turn_begin`] returned `Ok`. See [`ArrivedAt`] for why this is a
+/// newtype.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ClaimCommittedAt(pub(crate) std::time::Instant);
+
+/// Deadline for the `collab_wait_my_turn` poll loop, given when the request
+/// ARRIVED (`arrived_at`) and when its claim actually COMMITTED
+/// (`claim_committed_at`, i.e. `wait_my_turn_begin` returned `Ok`).
+///
+/// A request queued behind other mutations on the same connection can sit for
+/// nearly its whole requested timeout before `wait_my_turn_begin` even runs —
+/// at which point `arrived_at + timeout` may already be in the past, leaving
+/// the poll loop zero iterations to observe a settled state. The deadline is
+/// therefore the LATER of the original arrival-based bound (unaffected when
+/// dispatch is prompt — the two instants are equal) and a floor
+/// measured from the commit instant, capped at the client's own requested
+/// timeout from that point so the floor can never stretch the wait past what
+/// was actually asked for.
+pub(super) fn wait_my_turn_deadline(
+    arrived_at: ArrivedAt,
+    claim_committed_at: ClaimCommittedAt,
+    args: &Value,
+) -> std::time::Instant {
+    let timeout = wait_my_turn_timeout(args);
+    let arrival_deadline = arrived_at.0 + timeout;
+    let floor_deadline = claim_committed_at.0 + timeout.min(WAIT_MY_TURN_MIN_POLL_WINDOW);
+    arrival_deadline.max(floor_deadline)
+}
+
 /// Validate the arguments and settle the generation, once, before any polling.
 ///
 /// Run in its own transaction ahead of the loop: the loop makes no collab-state
@@ -1151,6 +1198,16 @@ pub(super) fn wait_my_turn_timeout(args: &Value) -> std::time::Duration {
 /// Split out of the handler so the claim happens exactly ONCE per request even
 /// when the polling is driven from outside — claiming on every poll would try
 /// to re-consume a one-time handoff token and fail on the second iteration.
+///
+/// The process-global metrics attribution is claimed here too, exactly once,
+/// immediately after the generation claim commits and guarded by
+/// `ensure_no_conflicting_process_session` above. It must NOT be re-stamped by
+/// the poll loop: the ordering barrier is released as soon as this function
+/// returns `Ok` (see `server::dispatch_wait_my_turn`), so a still-polling wait
+/// for session A would otherwise clobber the cell back to A after a newer,
+/// later-queued request had legitimately bound it to B — producing spurious
+/// "another active collab session is already bound to this MCP process"
+/// refusals.
 pub(super) fn wait_my_turn_begin(app: &App, args: &Value) -> Result<(), MemoryError> {
     let session_id = require_str(args, "session_id")?;
     ensure_no_conflicting_process_session(app, session_id)?;
@@ -1164,21 +1221,27 @@ pub(super) fn wait_my_turn_begin(app: &App, args: &Value) -> Result<(), MemoryEr
             agent,
             super::handoff::opt_handoff_token(args).as_deref(),
         )
-    })
+    })?;
+
+    app.set_active_collab_session(session_id);
+    Ok(())
 }
 
 /// One snapshot read. Returns the response body and whether it SETTLES the wait
 /// — my turn, session ended, or a terminal phase — i.e. whether the caller
 /// should stop polling before the deadline.
 ///
-/// Deliberately free of sleeping and of any write, so a caller can drive it
-/// from an async loop without holding the dispatch thread across the wait.
+/// Deliberately free of sleeping and of any write — including the
+/// process-global attribution claim, which belongs to
+/// [`wait_my_turn_begin`] and happens exactly once per request. That keeps a
+/// long poll from mutating shared state after its barrier was already released,
+/// and lets a caller drive it from an async loop without holding the dispatch
+/// thread across the wait.
 pub(super) fn wait_my_turn_poll(app: &App, args: &Value) -> Result<(Value, bool), MemoryError> {
     let session_id = require_str(args, "session_id")?;
     let agent = require_agent(require_str(args, "agent")?)?;
 
     let record = app.db.collab_load_session_record(session_id)?;
-    app.set_active_collab_session(session_id);
     let snap = wait_turn_snapshot(&record, agent);
     let settled = snap.is_my_turn || snap.ended || snap.phase_is_terminal;
 
@@ -1203,6 +1266,11 @@ pub(super) fn handle_collab_wait_my_turn(app: &App, args: &Value) -> Result<Valu
     let timeout = wait_my_turn_timeout(args);
     wait_my_turn_begin(app, args)?;
 
+    // No `wait_my_turn_deadline` call needed here: this function IS the
+    // entire request handling for a direct/synchronous caller, so there is no
+    // queueing delay between "arrived" and "claim committed" — both are this
+    // exact instant. `ArrivedAt` and `ClaimCommittedAt` would be identical,
+    // which collapses `wait_my_turn_deadline` back to plain `now() + timeout`.
     let deadline = std::time::Instant::now() + timeout;
     loop {
         let (body, settled) = wait_my_turn_poll(app, args)?;
@@ -1674,6 +1742,50 @@ mod tests {
             app.active_collab_session_snapshot().as_deref(),
             Some(sid.as_str())
         );
+    }
+
+    // ── wait_my_turn_deadline ──────────────────────────────────────────────────
+
+    #[test]
+    fn wait_my_turn_deadline_matches_arrival_when_dispatched_promptly() {
+        let now = std::time::Instant::now();
+        let args = json!({ "timeout_secs": 5 });
+        let timeout = wait_my_turn_timeout(&args);
+
+        // No queueing delay: arrival and claim-commit are the same instant.
+        let deadline = wait_my_turn_deadline(ArrivedAt(now), ClaimCommittedAt(now), &args);
+
+        assert_eq!(deadline, now + timeout);
+    }
+
+    #[test]
+    fn wait_my_turn_deadline_floors_at_min_window_when_arrival_deadline_already_passed() {
+        let timeout_secs = 5;
+        let args = json!({ "timeout_secs": timeout_secs });
+        // Arrival is old enough that arrival + timeout is already past.
+        let arrived_at = ArrivedAt(
+            std::time::Instant::now() - std::time::Duration::from_secs(timeout_secs + 10),
+        );
+        let claim_committed_at = ClaimCommittedAt(std::time::Instant::now());
+
+        let deadline = wait_my_turn_deadline(arrived_at, claim_committed_at, &args);
+
+        let timeout = wait_my_turn_timeout(&args);
+        assert_eq!(
+            deadline,
+            claim_committed_at.0 + WAIT_MY_TURN_MIN_POLL_WINDOW.min(timeout)
+        );
+    }
+
+    #[test]
+    fn wait_my_turn_deadline_never_extends_past_requested_timeout_from_commit() {
+        let args = json!({ "timeout_secs": 1 });
+        let arrived_at = ArrivedAt(std::time::Instant::now() - std::time::Duration::from_secs(30));
+        let claim_committed_at = ClaimCommittedAt(std::time::Instant::now());
+
+        let deadline = wait_my_turn_deadline(arrived_at, claim_committed_at, &args);
+
+        assert!(deadline <= claim_committed_at.0 + std::time::Duration::from_secs(1));
     }
 
     #[test]
