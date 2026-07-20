@@ -974,10 +974,11 @@ fn tool_success_response(
 /// handoff token.
 ///
 /// The deadline is computed by `wait_my_turn_deadline` (`collab_session.rs`),
-/// the single named helper the async dispatch here and the synchronous
-/// fallback both call so the two paths cannot drift (design decision 7,
-/// `docs/superpowers/plans/2026-07-19-wait-my-turn-barrier-early-release.md`).
-/// For a promptly-dispatched request it still runs from when the request
+/// the single named helper holding the deadline formula (design decision 7,
+/// `docs/superpowers/plans/2026-07-19-wait-my-turn-barrier-early-release.md`);
+/// the synchronous fallback documents at its own deadline site why plain
+/// `now() + timeout` is the degenerate case rather than calling it. For a
+/// promptly-dispatched request it still runs from when the request
 /// ARRIVED, matching the readiness wait, so time spent queued behind the
 /// ordering barrier counts against the client's requested timeout rather than
 /// extending it. But a request that queued long enough to nearly exhaust that
