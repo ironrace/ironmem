@@ -146,6 +146,19 @@ pub(super) fn session_record_json(record: &SessionRecord) -> Value {
         "last_head_sha": record.session.last_head_sha.as_deref(),
         "pr_url": record.session.pr_url.as_deref(),
         "coding_failure": record.session.coding_failure.as_deref(),
+        // Recovery-state exposure (issue #197 task 9). `pending_failure` is
+        // the diagnostic for an in-flight *recoverable* failure (never set
+        // alongside a non-null `coding_failure` — see the transition table
+        // in the plan doc); `failed_from_phase`/`recovery_phase` serialize
+        // via `Phase::to_string()` like the top-level `phase` field.
+        // `recovery_origin_owner` is deliberately NOT exposed here — it is
+        // an audit-only field the plan did not ask to surface in
+        // `collab_status`.
+        "pending_failure": record.session.pending_failure.as_deref(),
+        "failed_from_phase": record.session.failed_from_phase.map(|p| p.to_string()),
+        "recovery_phase": record.session.recovery_phase.map(|p| p.to_string()),
+        "recovery_owner": record.session.recovery_owner.map(|a| a.as_str()),
+        "recovery_attempts": record.session.recovery_attempts,
         "ended_at": record.ended_at.as_deref(),
         "created_at": record.created_at.as_str(),
         "updated_at": record.updated_at.as_str(),
@@ -2793,5 +2806,137 @@ mod tests {
             err.to_string().contains("session cannot be resumed"),
             "expected the deterministic NotResumable error text, got: {err}"
         );
+    }
+
+    // ── Task 9: status exposure + off-turn admission ────────────────────────
+
+    /// Required acceptance criterion: `collab_status` on a recovering session
+    /// reports the unchanged phase, `current_owner = claude`, a non-null
+    /// `pending_failure`, and a null `coding_failure`. Drives a real
+    /// `git_commit_failed:` on-turn report from Codex in
+    /// `CodeReviewFixGlobalPending` (Codex owns that phase after
+    /// `implementation_done`), which flips ownership to the counterpart
+    /// (Claude) without moving the phase.
+    #[test]
+    fn collab_status_on_recovering_session_reports_pending_failure_not_coding_failure() {
+        let app = test_app();
+        let sid = start_session(&app);
+        drive_to_implement(&app, &sid);
+        send(
+            &app,
+            &sid,
+            "claude",
+            "implementation_done",
+            r#"{"head_sha":"c1"}"#,
+        );
+
+        let record = app.db.collab_load_session_record(&sid).unwrap();
+        assert_eq!(record.session.phase, Phase::CodeReviewFixGlobalPending);
+        assert_eq!(record.session.current_owner, crate::collab::Agent::Codex);
+
+        send(
+            &app,
+            &sid,
+            "codex",
+            "failure_report",
+            r#"{"coding_failure":"git_commit_failed: index.lock EPERM"}"#,
+        );
+
+        let status = handle_collab_status(&app, &json!({ "session_id": sid })).unwrap();
+
+        assert_eq!(
+            status["phase"],
+            json!("CodeReviewFixGlobalPending"),
+            "a recoverable report must leave phase unchanged"
+        );
+        assert_eq!(status["current_owner"], json!("claude"));
+        assert_eq!(
+            status["pending_failure"],
+            json!("git_commit_failed: index.lock EPERM")
+        );
+        assert_eq!(
+            status["coding_failure"],
+            Value::Null,
+            "coding_failure must stay null for a recoverable (non-terminal) report"
+        );
+        assert_eq!(status["failed_from_phase"], Value::Null);
+        assert_eq!(
+            status["recovery_phase"],
+            json!("CodeReviewFixGlobalPending")
+        );
+        assert_eq!(status["recovery_owner"], json!("claude"));
+        assert_eq!(status["recovery_attempts"], json!(1));
+    }
+
+    /// Required acceptance criterion: the branch-drift off-turn path behaves
+    /// exactly as before. A non-owner (`codex`, while `claude` owns
+    /// `CodeImplementPending`) may send a `branch_drift:` failure_report
+    /// off-turn; this must still succeed and still land the session in
+    /// `CodingFailed` (branch drift stays `Terminal` — Task 9 does not widen
+    /// its classification or its off-turn admissibility).
+    #[test]
+    fn branch_drift_off_turn_admission_is_unchanged() {
+        let app = test_app();
+        let sid = start_session(&app);
+        drive_to_implement(&app, &sid);
+
+        let record = app.db.collab_load_session_record(&sid).unwrap();
+        assert_eq!(record.session.current_owner, crate::collab::Agent::Claude);
+
+        // Codex is NOT current_owner here, but branch_drift: is off-turn
+        // admissible — this must succeed exactly as it did before task 9.
+        send(
+            &app,
+            &sid,
+            "codex",
+            "failure_report",
+            r#"{"coding_failure":"branch_drift: head_sha abc not found"}"#,
+        );
+
+        let after = app.db.collab_load_session_record(&sid).unwrap();
+        assert_eq!(after.session.phase, Phase::CodingFailed);
+        assert_eq!(
+            after.session.coding_failure.as_deref(),
+            Some("branch_drift: head_sha abc not found")
+        );
+    }
+
+    /// Regression guard for the off-turn gate itself: task 9 must NOT widen
+    /// `failure_report_is_off_turn_admissible` to admit the five new
+    /// recoverable-but-not-off-turn prefixes (`git_commit_failed:` etc). An
+    /// off-turn `git_commit_failed:` report from a non-owner must still be
+    /// rejected as `NotYourTurn`, same as before task 9 existed.
+    #[test]
+    fn off_turn_git_commit_failed_report_is_still_rejected() {
+        let app = test_app();
+        let sid = start_session(&app);
+        drive_to_implement(&app, &sid);
+
+        let record = app.db.collab_load_session_record(&sid).unwrap();
+        assert_eq!(record.session.current_owner, crate::collab::Agent::Claude);
+
+        // Codex is NOT current_owner and git_commit_failed: is not in
+        // OFF_TURN_FAILURE_PREFIXES — this must be rejected before
+        // apply_event ever classifies it.
+        let err = handle_collab_send(
+            &app,
+            &json!({
+                "session_id": sid,
+                "sender": "codex",
+                "topic": "failure_report",
+                "content": r#"{"coding_failure":"git_commit_failed: index.lock EPERM"}"#,
+            }),
+        )
+        .unwrap_err();
+
+        assert!(
+            err.to_string().contains("not your turn"),
+            "expected a not-your-turn rejection, got: {err}"
+        );
+
+        // Confirm the session was untouched by the rejected send.
+        let after = app.db.collab_load_session_record(&sid).unwrap();
+        assert_eq!(after.session.phase, Phase::CodeImplementPending);
+        assert_eq!(after.session.pending_failure, None);
     }
 }

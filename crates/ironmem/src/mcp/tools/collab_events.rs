@@ -424,6 +424,37 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    // ── Task 9: off-turn admission regression guard ─────────────────────────
+
+    /// `failure_report_is_off_turn_admissible` must still recognize exactly
+    /// `branch_drift:` and `codex_dispatch_failed:` (`OFF_TURN_FAILURE_PREFIXES`)
+    /// and NOT the five other `RECOVERABLE_FAILURE_PREFIXES` added by tasks
+    /// 1-8. Task 9 does not widen this gate — pinning the full set here
+    /// documents that decision as a test, not just a comment.
+    #[test]
+    fn off_turn_admissible_prefixes_unchanged_by_task_9() {
+        assert!(failure_report_is_off_turn_admissible(
+            &json!({"coding_failure": "branch_drift: head_sha abc not found"}).to_string()
+        ));
+        assert!(failure_report_is_off_turn_admissible(
+            &json!({"coding_failure": "codex_dispatch_failed: mcp call timed out"}).to_string()
+        ));
+        for recoverable_only in [
+            "git_commit_failed: index.lock EPERM",
+            "git_push_failed: rejected non-fast-forward",
+            "sandbox_denied: workspace-write refused",
+            "disk_full: no space left on device",
+            "network_failed: connection reset",
+        ] {
+            assert!(
+                !failure_report_is_off_turn_admissible(
+                    &json!({"coding_failure": recoverable_only}).to_string()
+                ),
+                "{recoverable_only} must NOT be off-turn admissible"
+            );
+        }
+    }
+
     #[test]
     fn extract_required_str_pins_error_format() {
         let payload = json!({ "head_sha": "abc123", "empty": "", "n": 3 });

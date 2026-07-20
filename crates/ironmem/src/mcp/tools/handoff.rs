@@ -237,6 +237,30 @@ pub(super) fn compose_handoff_block(
     let _ = writeln!(out, "task_review_round: {}", s.task_review_round);
     let _ = writeln!(out, "global_review_round: {}", s.global_review_round);
     let _ = writeln!(out, "coding_failure: {}", opt(s.coding_failure.as_deref()));
+    // Recovery-state exposure (issue #197 task 9), mirrored from
+    // `session_record_json` so the dispatcher can route the recovery turn
+    // off this block alone. `failed_from_phase`/`recovery_phase` render via
+    // `Phase::to_string()` bound to a local first, matching how the top of
+    // this function derives `plan_file_path`/`execution_mode`.
+    let failed_from_phase = s.failed_from_phase.map(|p| p.to_string());
+    let recovery_phase = s.recovery_phase.map(|p| p.to_string());
+    let _ = writeln!(
+        out,
+        "pending_failure: {}",
+        opt(s.pending_failure.as_deref())
+    );
+    let _ = writeln!(
+        out,
+        "failed_from_phase: {}",
+        opt(failed_from_phase.as_deref())
+    );
+    let _ = writeln!(out, "recovery_phase: {}", opt(recovery_phase.as_deref()));
+    let _ = writeln!(
+        out,
+        "recovery_owner: {}",
+        opt(s.recovery_owner.map(|a| a.as_str()))
+    );
+    let _ = writeln!(out, "recovery_attempts: {}", s.recovery_attempts);
     let _ = writeln!(out, "pr_url: {}", opt(s.pr_url.as_deref()));
     let _ = writeln!(out, "expected_next_event: {}", s.phase.expected_event());
     let _ = writeln!(
@@ -582,6 +606,45 @@ gates: passed\n";
             block.contains("handoff.generation: 2"),
             "handoff.generation must be rendered"
         );
+    }
+
+    // ── Task 9: recovery-state exposure in the handoff block ────────────────
+
+    /// `compose_handoff_block` must render all five recovery fields, next to
+    /// `coding_failure`, using the same em-dash placeholder for unset values
+    /// and plain values for set ones.
+    #[test]
+    fn handoff_block_renders_recovery_fields() {
+        use crate::collab::{Agent as CollabAgent, Phase as CollabPhase};
+
+        let mut r = sample_record(CollabPhase::CodeReviewFixGlobalPending);
+        r.session.pending_failure = Some("git_commit_failed: index.lock EPERM".into());
+        r.session.failed_from_phase = Some(CollabPhase::CodeReviewFixGlobalPending);
+        r.session.recovery_phase = Some(CollabPhase::CodeReviewFixGlobalPending);
+        r.session.recovery_owner = Some(CollabAgent::Claude);
+        r.session.recovery_attempts = 1;
+
+        let block = compose_handoff_block(&r, Agent::Claude, 1, None);
+        assert!(block.contains("pending_failure: git_commit_failed: index.lock EPERM"));
+        assert!(block.contains("failed_from_phase: CodeReviewFixGlobalPending"));
+        assert!(block.contains("recovery_phase: CodeReviewFixGlobalPending"));
+        assert!(block.contains("recovery_owner: claude"));
+        assert!(block.contains("recovery_attempts: 1"));
+    }
+
+    /// The common case (no failure in flight) must render the em-dash
+    /// placeholder for the four `Option` recovery fields and a literal `0`
+    /// for `recovery_attempts`, matching every other unset `Option` field in
+    /// the block.
+    #[test]
+    fn handoff_block_renders_recovery_placeholders_when_unset() {
+        let r = sample_record(crate::collab::Phase::CodeImplementPending);
+        let block = compose_handoff_block(&r, Agent::Claude, 1, None);
+        assert!(block.contains("pending_failure: \u{2014}"));
+        assert!(block.contains("failed_from_phase: \u{2014}"));
+        assert!(block.contains("recovery_phase: \u{2014}"));
+        assert!(block.contains("recovery_owner: \u{2014}"));
+        assert!(block.contains("recovery_attempts: 0"));
     }
 
     // ── Task 4 tests ─────────────────────────────────────────────────────────
