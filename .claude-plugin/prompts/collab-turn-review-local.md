@@ -13,7 +13,10 @@ preconditions: phase == CodeReviewLocalPending, current_owner == claude
 > paste the review report.
 
 ## State discovery
-1. `collab_status(session_id=$SESSION_ID)`; read `last_head_sha`.
+1. `collab_status(session_id=$SESSION_ID)`; read `last_head_sha`,
+   `pending_failure`. A non-null `pending_failure` means you are the
+   **recovery owner** for an interrupted turn, not simply the next-in-line
+   owner — see "Recoverable vs terminal failures" below before proceeding.
 
 ## Recoverable vs terminal failures
 

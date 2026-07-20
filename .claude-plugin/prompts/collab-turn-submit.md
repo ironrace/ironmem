@@ -13,9 +13,26 @@ preconditions: a prior compose worker wrote $ARTIFACT_REF; for final the user ap
 > re-author or editorialize. Your final message MUST be the ≤3-line verdict
 > only.
 
+## Recoverable vs terminal failures
+
+The server classifies `failure_report`, not you — an accurate
+`coding_failure` prefix is all that's needed. Six prefixes recover the turn
+instead of ending the session: `git_commit_failed:`, `git_push_failed:`,
+`sandbox_denied:`, `disk_full:`, `network_failed:`,
+`codex_dispatch_failed:` (each needs real detail after the colon, e.g.
+`git_commit_failed: index.lock EPERM`); everything else (including
+`branch_drift:`/`subagent_failure:`, and both of THIS file's own failure
+prefixes below — `pr_create_failed:`/`approved_artifact_unfetchable:` — is
+terminal today). If `collab_status.pending_failure` is non-null, you are the
+**recovery owner** for an interrupted turn: this changes nothing about the
+Actions below — sending `$TOPIC` (e.g. `final_review`) via the normal
+`collab_send` call below already IS the correct recovery-completion step
+(never send a NEW `failure_report` just because you were not the original
+`current_owner`).
+
 ## State discovery
 1. `collab_status(session_id=$SESSION_ID)` to confirm phase/owner and read
-   `repo_path`, `branch`, and `base_sha`.
+   `repo_path`, `branch`, `base_sha`, and `pending_failure`.
 2. Fetch the artifact named by `$ARTIFACT_REF`:
    - **drawer id** → `mcp__ironmem__get_drawer(id=$ARTIFACT_REF)` (deterministic
      read-by-id; do NOT use `search`, which is semantic and will not reliably

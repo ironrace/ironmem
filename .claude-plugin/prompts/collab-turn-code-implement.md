@@ -14,7 +14,10 @@ preconditions: phase == CodeImplementPending, current_owner == claude, implement
 
 ## State discovery
 1. `collab_status(session_id=$SESSION_ID)`; read `plan_file_path`,
-   `task_list_ref`, `tasks_count`, `implementer`.
+   `task_list_ref`, `tasks_count`, `implementer`, `pending_failure`. A
+   non-null `pending_failure` means you are the **recovery owner** for an
+   interrupted turn, not simply the next-in-line owner — see "Recoverable vs
+   terminal failures" below before proceeding.
 2. Search `wing="ironrace-memory" room="collab-checkpoints"` for `$SESSION_ID`;
    resume at the first unfinished task; scan the diff vs acceptance criteria.
 

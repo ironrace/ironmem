@@ -752,6 +752,20 @@ Returns the full session record including `phase`, `current_owner`, `task`,
 `review_round`, `ended_at`, and all hashes. Call this before every protocol
 action.
 
+**Recovery-state fields.** Also returns `pending_failure`, `failed_from_phase`,
+`recovery_phase`, `recovery_owner`, and `recovery_attempts` (see "Failure +
+terminal" above for the full semantics). **`pending_failure` is the
+recovery-in-progress signal:** if it is non-null, `current_owner` was just
+flipped by a recoverable `failure_report` rather than by a normal turn
+advance — this is how an agent that reads `current_owner == <itself>`
+distinguishes "it's simply my turn" from "I am the recovery owner for an
+interrupted turn." A worker whose preconditions match `current_owner` should
+check `pending_failure` as part of state discovery: when set, follow the
+recovery-owner protocol above (inspect the preserved diff, run this phase's
+gates, commit + push, send the phase's own normal completion event — never a
+new `failure_report`) before doing anything else. `coding_failure` is
+`null` whenever `pending_failure` is set — see the distinction above.
+
 #### Plan-by-reference contract
 
 Accepted plan and task-list bodies are returned by reference by default to keep
