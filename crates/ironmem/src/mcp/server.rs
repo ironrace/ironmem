@@ -446,9 +446,11 @@ where
 
     loop {
         // Checked at the TOP of the loop, before entering `select!`: this is
-        // the sole termination path. The early-release arm below has no `if`
-        // guard (by design — `early_release_tx` is kept alive for the whole
-        // loop, so `recv()` must never resolve to `None`), which means once
+        // the sole clean-shutdown path (as opposed to the error-return path
+        // taken by the read arm's `Err` branch below). The early-release arm
+        // below has no `if` guard (by design — `early_release_tx` is kept
+        // alive for the whole loop, so `recv()` must never resolve to
+        // `None`), which means once
         // `reader_done` is true and `in_flight` is empty, `select!` still has
         // one branch permanently enabled-but-pending. That makes `select!`
         // block forever rather than reach its `else` arm, so the check cannot
@@ -634,6 +636,9 @@ where
                 in_flight.push(dispatch_in_flight(app, seq, request, arrived_at, None));
             }
 
+            // Unreachable while `early_release_tx` lives for the loop's
+            // lifetime (see the termination check at the top of the loop);
+            // kept as a defensive backstop.
             else => break,
         }
     }
@@ -808,8 +813,8 @@ async fn write_response(
 /// `#[cfg(test)]`: since the barrier-threading refactor, `dispatch_in_flight`
 /// (the framing loop's only production dispatch site) calls
 /// `dispatch_request_with_barrier` directly, so this thin wrapper has no
-/// remaining non-test caller — it exists solely so the five pre-existing
-/// direct test callers below keep compiling unchanged.
+/// remaining non-test caller — it exists solely so the pre-existing direct
+/// test callers below keep compiling unchanged.
 #[cfg(test)]
 async fn dispatch_request(
     app: &Arc<App>,
@@ -820,10 +825,10 @@ async fn dispatch_request(
 }
 
 /// The barrier-aware form of `dispatch_request`. `dispatch_request` itself
-/// stays a thin no-barrier wrapper over this so its five existing direct test
-/// callers keep compiling unchanged — only `dispatch_in_flight` (the framing
-/// loop's actual dispatch site) ever passes a `Some(BarrierRelease)`, and only
-/// for the request it dispatched as the mutation barrier owner.
+/// stays a thin no-barrier wrapper over this — see its doc comment for why —
+/// and only `dispatch_in_flight` (the framing loop's actual dispatch site)
+/// ever passes a `Some(BarrierRelease)`, and only for the request it
+/// dispatched as the mutation barrier owner.
 async fn dispatch_request_with_barrier(
     app: &Arc<App>,
     request: &JsonRpcRequest,
