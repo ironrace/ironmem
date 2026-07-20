@@ -153,14 +153,43 @@ fn account_response_metrics(
 type InFlightRequest<'a> =
     futures_util::future::LocalBoxFuture<'a, (u64, JsonRpcRequest, Option<JsonRpcResponse>)>;
 
+/// A one-shot signal that a mutation may release the per-connection ordering
+/// barrier BEFORE its response completes, the moment its claim on
+/// `collab_wait_my_turn`'s handoff token commits.
+///
+/// Consumed by `release` so it can be fired at most once, and stamped with the
+/// `seq` of the request it was issued to so the framing loop's
+/// `release_barrier` can reject it if it ever arrived for the wrong owner
+/// (defense in depth — only the barrier owner is ever handed one, see
+/// `run_framing_loop`).
+struct BarrierRelease {
+    tx: tokio::sync::mpsc::UnboundedSender<u64>,
+    seq: u64,
+}
+
+impl BarrierRelease {
+    /// Send the release signal once. A send failure means the framing loop's
+    /// receiver is gone — the connection is shutting down or already past the
+    /// point of caring — so it is logged at debug and otherwise ignored: the
+    /// normal completion path still releases the barrier when this request's
+    /// response lands (fail-closed, see design decision 2).
+    fn release(self) {
+        let seq = self.seq;
+        if self.tx.send(seq).is_err() {
+            tracing::debug!(seq, "early-release signal dropped: receiver gone");
+        }
+    }
+}
+
 fn dispatch_in_flight<'a>(
     app: &'a Arc<App>,
     seq: u64,
     request: JsonRpcRequest,
     arrived_at: std::time::Instant,
+    barrier: Option<BarrierRelease>,
 ) -> InFlightRequest<'a> {
     Box::pin(async move {
-        let response = dispatch_request(app, &request, arrived_at).await;
+        let response = dispatch_request_with_barrier(app, &request, arrived_at, barrier).await;
         (seq, request, response)
     })
 }
@@ -407,8 +436,29 @@ where
     // backlog has fully drained. While set, every further mutation on this
     // connection is rejected too — see `writes_blocked_message`.
     let mut mutations_blocked = false;
+    // Early-release channel: `collab_wait_my_turn`'s `BarrierRelease` signals
+    // over this the instant its claim commits, so the next queued mutation
+    // can start without waiting for the (up to 60s) poll loop that follows.
+    // `early_release_tx` is never dropped for the life of this loop — only
+    // clones handed to dispatched barrier owners are — so `recv()` below can
+    // never spuriously resolve to `None` from every sender disappearing.
+    let (early_release_tx, mut early_release_rx) = tokio::sync::mpsc::unbounded_channel::<u64>();
 
     loop {
+        // Checked at the TOP of the loop, before entering `select!`: this is
+        // the sole termination path. The early-release arm below has no `if`
+        // guard (by design — `early_release_tx` is kept alive for the whole
+        // loop, so `recv()` must never resolve to `None`), which means once
+        // `reader_done` is true and `in_flight` is empty, `select!` still has
+        // one branch permanently enabled-but-pending. That makes `select!`
+        // block forever rather than reach its `else` arm, so the check cannot
+        // live after the `select!` the way it used to — control would never
+        // return there. Checking here instead lets the loop exit without ever
+        // entering the `select!` that would hang on it.
+        if reader_done && in_flight.is_empty() && queued_mutations.is_empty() {
+            break;
+        }
+
         // Only the dispatched set is capped here. Queued mutations are bounded
         // separately, so a burst of writes can never starve read admission.
         let may_read = !reader_done && in_flight.len() < MAX_IN_FLIGHT_REQUESTS;
@@ -434,7 +484,8 @@ where
                 // a barrier some other owner still holds.
                 if released {
                     start_next_queued_mutation(
-                        app, &mut queued_mutations, &mut mutation_barrier, &mut next_seq, &mut in_flight,
+                        app, &mut queued_mutations, &mut mutation_barrier, &mut next_seq,
+                        &mut in_flight, &early_release_tx,
                     );
                 }
 
@@ -446,6 +497,31 @@ where
                 if mutations_blocked && mutation_barrier.is_none() && queued_mutations.is_empty() {
                     mutations_blocked = false;
                 }
+            }
+
+            // A mutation dispatched as barrier owner signals here the instant
+            // its claim commits (see `BarrierRelease`, `dispatch_wait_my_turn`),
+            // rather than waiting for its full response — which for
+            // `collab_wait_my_turn` can be up to 60s away. Ordered after the
+            // completion arm (biased) so a request that finished in the same
+            // poll turn is accounted for before a same-tick early release is
+            // considered; ordered before the read arm so a freed barrier is
+            // handed to an already-queued mutation before any new request is
+            // admitted.
+            Some(seq) = early_release_rx.recv() => {
+                let released = release_barrier(&mut mutation_barrier, seq);
+                if released {
+                    start_next_queued_mutation(
+                        app, &mut queued_mutations, &mut mutation_barrier, &mut next_seq,
+                        &mut in_flight, &early_release_tx,
+                    );
+                }
+                // Deliberately does NOT touch `mutations_blocked`: early
+                // release only frees the barrier for a mutation that was
+                // already queued before any overflow occurred. It must not
+                // re-admit NEW writes on a connection that has already
+                // skipped one — that can only happen once the backlog is
+                // fully drained, which is decided in the completion arm above.
             }
 
             line = lines.next_line(), if may_read => {
@@ -548,20 +624,17 @@ where
                     let seq = next_seq;
                     next_seq += 1;
                     mutation_barrier = Some(seq);
-                    in_flight.push(dispatch_in_flight(app, seq, request, arrived_at));
+                    let barrier = Some(BarrierRelease { tx: early_release_tx.clone(), seq });
+                    in_flight.push(dispatch_in_flight(app, seq, request, arrived_at, barrier));
                     continue;
                 }
 
                 let seq = next_seq;
                 next_seq += 1;
-                in_flight.push(dispatch_in_flight(app, seq, request, arrived_at));
+                in_flight.push(dispatch_in_flight(app, seq, request, arrived_at, None));
             }
 
             else => break,
-        }
-
-        if reader_done && in_flight.is_empty() && queued_mutations.is_empty() {
-            break;
         }
     }
 
@@ -599,12 +672,17 @@ fn start_next_queued_mutation<'a>(
     mutation_barrier: &mut Option<u64>,
     next_seq: &mut u64,
     in_flight: &mut futures_util::stream::FuturesUnordered<InFlightRequest<'a>>,
+    early_release_tx: &tokio::sync::mpsc::UnboundedSender<u64>,
 ) {
     if let Some((next, arrived_at)) = queued_mutations.pop_front() {
         let seq = *next_seq;
         *next_seq += 1;
         *mutation_barrier = Some(seq);
-        in_flight.push(dispatch_in_flight(app, seq, next, arrived_at));
+        let barrier = Some(BarrierRelease {
+            tx: early_release_tx.clone(),
+            seq,
+        });
+        in_flight.push(dispatch_in_flight(app, seq, next, arrived_at, barrier));
     }
 }
 
@@ -726,18 +804,41 @@ async fn write_response(
 /// connection, so a write parked inside its handler would head-of-line block
 /// that client's own reads just as surely — and stdio is the transport a
 /// harness uses directly.
+///
+/// `#[cfg(test)]`: since the barrier-threading refactor, `dispatch_in_flight`
+/// (the framing loop's only production dispatch site) calls
+/// `dispatch_request_with_barrier` directly, so this thin wrapper has no
+/// remaining non-test caller — it exists solely so the five pre-existing
+/// direct test callers below keep compiling unchanged.
+#[cfg(test)]
 async fn dispatch_request(
     app: &Arc<App>,
     request: &JsonRpcRequest,
     arrived_at: std::time::Instant,
 ) -> Option<JsonRpcResponse> {
+    dispatch_request_with_barrier(app, request, arrived_at, None).await
+}
+
+/// The barrier-aware form of `dispatch_request`. `dispatch_request` itself
+/// stays a thin no-barrier wrapper over this so its five existing direct test
+/// callers keep compiling unchanged — only `dispatch_in_flight` (the framing
+/// loop's actual dispatch site) ever passes a `Some(BarrierRelease)`, and only
+/// for the request it dispatched as the mutation barrier owner.
+async fn dispatch_request_with_barrier(
+    app: &Arc<App>,
+    request: &JsonRpcRequest,
+    arrived_at: std::time::Instant,
+    barrier: Option<BarrierRelease>,
+) -> Option<JsonRpcResponse> {
     let tool_name = request.params.get("name").and_then(|value| value.as_str());
 
     // The only tool that BLOCKS by design rather than by accident. Driven here
     // so its sleep does not hold the dispatch thread — see
-    // `dispatch_wait_my_turn`.
+    // `dispatch_wait_my_turn`. The only path `barrier` ever reaches: every
+    // other tool below drops it unfired, since only a wait's claim can early
+    // -release the ordering barrier.
     if request.method == "tools/call" && tool_name == Some("collab_wait_my_turn") {
-        return Some(dispatch_wait_my_turn(app, request, arrived_at).await);
+        return Some(dispatch_wait_my_turn(app, request, arrived_at, barrier).await);
     }
 
     let is_write =
@@ -822,10 +923,21 @@ fn tool_success_response(
 /// The deadline runs from when the request ARRIVED, matching the readiness
 /// wait, so time spent queued behind the ordering barrier counts against the
 /// client's requested timeout rather than extending it.
+///
+/// `barrier` is `Some` only when this request is dispatched as the
+/// per-connection mutation barrier owner (see `run_framing_loop`). The claim
+/// in `wait_my_turn_begin` is this tool's entire write — once it returns
+/// `Ok`, the mutation this barrier represents has fully committed, and the
+/// next queued mutation may start without waiting for the (up to 60s) poll
+/// loop below to finish. `barrier` is fired exactly there, before the loop,
+/// and nowhere else in this function: on the `Err` path it is simply dropped
+/// unfired, so the normal completion path releases the barrier instead
+/// (fail-closed — see design decision 2).
 async fn dispatch_wait_my_turn(
     app: &Arc<App>,
     request: &JsonRpcRequest,
     arrived_at: std::time::Instant,
+    barrier: Option<BarrierRelease>,
 ) -> JsonRpcResponse {
     let tool_name = request_tool_name(request);
     let args = request
@@ -837,6 +949,10 @@ async fn dispatch_wait_my_turn(
 
     if let Err(error) = tokio::task::block_in_place(|| tools::wait_my_turn_begin(app, &args)) {
         return tool_error_response(request.id.clone(), tool_name, error);
+    }
+
+    if let Some(barrier) = barrier {
+        barrier.release();
     }
 
     loop {
