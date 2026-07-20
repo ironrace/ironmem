@@ -1297,13 +1297,14 @@ mod tests {
         db
     }
 
-    const RECOVERY_STATE_COLUMNS: [&str; 6] = [
+    const RECOVERY_STATE_COLUMNS: [&str; 7] = [
         "pending_failure",
         "failed_from_phase",
         "recovery_phase",
         "recovery_owner",
         "recovery_origin_owner",
         "recovery_attempts",
+        "total_recovery_attempts",
     ];
 
     #[test]

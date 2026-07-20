@@ -47,13 +47,15 @@ pub struct CollabSession {
     /// completes. The DB CHECK constraint enforces the allowed set as
     /// defense-in-depth.
     pub implementer: Agent,
-    // Recovery-state fields (issue #197). All six persist as nullable
+    // Recovery-state fields (issue #197). All seven persist as nullable
     // columns added in migration 015 and stay NULL/0 for the common case
     // where no tooling failure is in flight.
-    /// Classified failure kind pending recovery (see `failure_class::classify`),
-    /// `None` when no failure is in flight. Same storage shape as
-    /// `coding_failure` — a plain string, not a typed enum, since the
-    /// classification vocabulary is still open-ended.
+    /// The verbatim `coding_failure` diagnostic of the in-flight recoverable
+    /// failure, `None` when no failure is in flight. This is the raw reported
+    /// string, NOT the `FailureClass` it classifies as — same storage shape
+    /// as `coding_failure`, a plain string rather than a typed enum, since
+    /// the classification vocabulary is still open-ended. Callers that need
+    /// the class re-derive it with `failure_class::classify`.
     pub pending_failure: Option<String>,
     /// The `Phase` the session was in when the failure was recorded, so
     /// recovery can resume in place. Wire-encoded exactly like the
@@ -69,24 +71,28 @@ pub struct CollabSession {
     /// down. Any caller exposing this field (e.g. `collab_status`) should
     /// present it as audit history, not as a live-status flag.
     pub failed_from_phase: Option<Phase>,
-    /// Sub-phase of the recovery flow itself, distinct from the session's
-    /// normal `phase` column. Same encoding as `failed_from_phase`.
+    /// The phase the in-flight recovery is scoped to — i.e. the phase that
+    /// was interrupted, which the session stays parked in while recovery
+    /// runs. It is NOT a sub-phase of a separate recovery flow: while a
+    /// recovery is live this equals the session's own `phase` column, and
+    /// `require_actor_or_recovery` admits the delegated completion only on
+    /// that equality. Same encoding as `failed_from_phase`.
     pub recovery_phase: Option<Phase>,
     /// Which `Agent` currently drives recovery. Same encoding as
     /// `current_owner`/`implementer` (`Agent::as_str()` / `FromStr`).
     pub recovery_owner: Option<Agent>,
-    /// Which `Agent` owned the session when the failure occurred, so
-    /// recovery can hand control back. Same encoding as `recovery_owner`.
+    /// Which `Agent` owned the interrupted turn when the failure occurred.
+    /// Same encoding as `recovery_owner`. Control is NOT handed back to it —
+    /// the recovery owner completes the interrupted turn itself, and the
+    /// phase's normal completion event decides the next owner. This field is
+    /// the attribution record of whose turn was interrupted.
     ///
-    /// **Audit-only — deliberately not exposed in `collab_status` or the
-    /// session-handoff block.** `mcp/tools/collab_session.rs`'s
-    /// `session_record_json` and `mcp/tools/handoff.rs`'s
-    /// `compose_handoff_block` both surface `recovery_owner` (who to hand
-    /// the turn to) but intentionally omit this field, since a dispatcher
-    /// routing the recovery turn only needs the destination, not the
-    /// origin. Before adding it to either surface, re-check whether a real
-    /// caller need has emerged — this omission was a deliberate scope
-    /// decision (issue #197 task 9), not an oversight.
+    /// Exposed in both `collab_status` and the session-handoff block. It was
+    /// initially omitted as out of scope (issue #197 task 9) on the grounds
+    /// that a dispatcher routing the turn only needs the destination; review
+    /// established a real caller need, since without the origin neither
+    /// surface shows that a completion event was produced by the delegated
+    /// recovery owner rather than by the phase's own expected agent.
     pub recovery_origin_owner: Option<Agent>,
     /// How many recovery attempts have been made so far.
     ///
@@ -99,6 +105,22 @@ pub struct CollabSession {
     /// occur on a row that has never been through `save_session` — i.e. a
     /// genuinely legacy row.
     pub recovery_attempts: u8,
+    /// How many recovery handoffs this session has made over its entire
+    /// lifetime — monotonic, and reset by nothing.
+    ///
+    /// `recovery_attempts` above is the *per-resume* budget: it is zeroed by
+    /// a successful delegated completion and again by `ResumeCoding`. That
+    /// makes it useless as a bound on total work, because `collab_resume` is
+    /// agent-callable (and is on the unattended successor's permission
+    /// allowlist), so a session could loop failure → ceiling → resume →
+    /// failure indefinitely with neither `collab_status` nor the handoff
+    /// block ever showing a count above `MAX_RECOVERY_ATTEMPTS`. This field
+    /// is the counter that actually converges: see
+    /// `state_machine::MAX_TOTAL_RECOVERY_ATTEMPTS`.
+    ///
+    /// Same nullable-column/`u8`-field treatment as `recovery_attempts`: the
+    /// DB column is nullable for legacy rows and reads back as `0`.
+    pub total_recovery_attempts: u8,
 }
 
 impl CollabSession {
@@ -139,6 +161,7 @@ impl CollabSession {
             recovery_owner: None,
             recovery_origin_owner: None,
             recovery_attempts: 0,
+            total_recovery_attempts: 0,
         }
     }
 
@@ -187,6 +210,7 @@ impl CollabSession {
             recovery_owner: None,
             recovery_origin_owner: None,
             recovery_attempts: 0,
+            total_recovery_attempts: 0,
         }
     }
 

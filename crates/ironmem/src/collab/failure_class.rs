@@ -9,8 +9,12 @@
 //! `subagent_failure:`, any unrecognized string, and the empty string all
 //! classify as [`FailureClass::Terminal`].
 //!
-//! This module only classifies; it does not wire the result into the state
-//! machine (that happens in a later task).
+//! This module only classifies. The wiring lives in
+//! [`crate::collab::state_machine::apply_event`], whose `FailureReport` arm
+//! matches on the result: `Tooling` parks the session in its current phase
+//! and hands the turn to the counterpart agent, `Terminal` transitions it to
+//! `CodingFailed`. `resume_eligibility` calls back into [`classify`] to
+//! decide whether a `CodingFailed` session may resume.
 
 use super::RECOVERABLE_FAILURE_PREFIXES;
 

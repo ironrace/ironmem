@@ -29,12 +29,36 @@ pub fn start_global_review_session(
 pub(super) const MAX_REVIEW_ROUNDS: u8 = 1;
 
 /// Maximum number of recoverable ("tooling") `FailureReport`s tolerated per
-/// session before recovery is abandoned. Two recoverable reports are
+/// *resume budget* before recovery is abandoned. Two recoverable reports are
 /// tolerated (the session stays in recovery, non-terminal); the third — the
 /// one whose increment would push `recovery_attempts` past this ceiling —
 /// degrades to the terminal `CodingFailed` path instead of recovering
 /// again. See the `FailureClass::Tooling` arm of `apply_event` below.
+///
+/// This ceiling alone does not bound a session: `recovery_attempts` is reset
+/// to 0 by a successful delegated completion and by `ResumeCoding`. The
+/// lifetime bound is [`MAX_TOTAL_RECOVERY_ATTEMPTS`].
 pub const MAX_RECOVERY_ATTEMPTS: u8 = 2;
+
+/// Maximum number of recoverable handoffs tolerated over a session's entire
+/// lifetime, counted by the monotonic `total_recovery_attempts`, which
+/// nothing resets. Once reached, a further tooling `FailureReport` degrades
+/// to `CodingFailed` and `ResumeCoding` is rejected as `NotResumable`.
+///
+/// Why this exists: `MAX_RECOVERY_ATTEMPTS` bounds a *budget*, not a
+/// session. `collab_resume` refreshes that budget, is agent-callable, and is
+/// on the unattended successor's permission allowlist — so without a
+/// monotonic counter a session could loop failure → ceiling → resume →
+/// failure without end, burning tokens, while `collab_status` and the
+/// handoff block never showed a count above 2.
+///
+/// Deliberately NOT a multiple of `MAX_RECOVERY_ATTEMPTS`. At an even value
+/// the per-resume ceiling would always trip first (a budget is only ever
+/// exhausted at 2, 4, 6 …) and this check would be unreachable. At 5 the
+/// lifetime ceiling genuinely binds: after two exhausted budgets (lifetime
+/// count 4) and a resume, the next handoff reaches 5 and the one after it
+/// degrades the session with the per-resume budget still unspent.
+pub const MAX_TOTAL_RECOVERY_ATTEMPTS: u8 = 5;
 
 /// Require an actor to match the expected agent, else return `NotYourTurn`.
 fn require_actor(actor: Agent, expected: Agent) -> Result<(), CollabError> {
@@ -88,6 +112,11 @@ fn require_actor_or_recovery(
 /// (`None`/`None`/`None`/`None`/`0`), so this is a no-op in the normal case
 /// and the required clear in the recovery case — simpler than conditioning
 /// on whether the override actually fired, and provably correct either way.
+///
+/// `total_recovery_attempts` is deliberately NOT cleared here. It is the
+/// lifetime counter behind [`MAX_TOTAL_RECOVERY_ATTEMPTS`]; zeroing it on a
+/// success would let a session that alternates failure/recovery/failure run
+/// unbounded, which is the exact hole the counter exists to close.
 fn clear_recovery_state(next: &mut CollabSession) {
     next.pending_failure = None;
     next.recovery_phase = None;
@@ -114,13 +143,18 @@ fn clear_recovery_pointers(next: &mut CollabSession) {
 }
 
 /// Determine whether a `CodingFailed` session is eligible for `ResumeCoding`,
-/// returning the `Phase` to restore on success. Admission requires BOTH
-/// `failed_from_phase.is_some()` AND the stored `coding_failure` classifying
-/// as `FailureClass::Tooling` — a session that fails either check returns a
-/// specific `NotResumable` reason rather than falling through to the
+/// returning the `Phase` to restore on success. Admission requires ALL of
+/// `failed_from_phase.is_some()`, the stored `coding_failure` classifying as
+/// `FailureClass::Tooling`, and `total_recovery_attempts` still being below
+/// [`MAX_TOTAL_RECOVERY_ATTEMPTS`] — a session that fails any check returns
+/// a specific `NotResumable` reason rather than falling through to the
 /// generic `SessionLocked`.
 ///
-/// The two rejection messages are deliberately distinct: a `None`
+/// The lifetime-ceiling check is what makes the ceiling a ceiling. Without
+/// it, resume refreshes `recovery_attempts` and the session can fail its way
+/// to terminal and back indefinitely.
+///
+/// The rejection messages are deliberately distinct: a `None`
 /// `failed_from_phase` means the row predates migration 015/Task 4 (a fact
 /// about schema provenance, stated plainly — never guessed at); a `Some`
 /// `failed_from_phase` whose `coding_failure` classifies `Terminal` (e.g.
@@ -146,6 +180,16 @@ fn resume_eligibility(session: &CollabSession) -> Result<Phase, CollabError> {
     if !is_tooling {
         return Err(CollabError::NotResumable {
             reason: "coding_failure does not classify as a recoverable tooling failure".to_string(),
+        });
+    }
+    if session.total_recovery_attempts >= MAX_TOTAL_RECOVERY_ATTEMPTS {
+        return Err(CollabError::NotResumable {
+            reason: format!(
+                "lifetime recovery ceiling reached: {} handoffs across this session's lifetime \
+                 (max {MAX_TOTAL_RECOVERY_ATTEMPTS}); resuming again would refresh the per-resume \
+                 budget without bound",
+                session.total_recovery_attempts
+            ),
         });
     }
     Ok(restored_phase)
@@ -361,7 +405,17 @@ pub fn apply_event(
                     // report — whose increment would take attempts to 3,
                     // exceeding `MAX_RECOVERY_ATTEMPTS` — abandons recovery
                     // instead of incrementing again.
-                    if session.recovery_attempts.saturating_add(1) > MAX_RECOVERY_ATTEMPTS {
+                    //
+                    // Both ceilings are checked, and either one degrades the
+                    // report to terminal. The per-resume budget bounds one
+                    // stretch of recovery; the monotonic lifetime counter
+                    // bounds the session, since `ResumeCoding` refreshes the
+                    // former but never the latter.
+                    let budget_exhausted =
+                        session.recovery_attempts.saturating_add(1) > MAX_RECOVERY_ATTEMPTS;
+                    let lifetime_exhausted = session.total_recovery_attempts.saturating_add(1)
+                        > MAX_TOTAL_RECOVERY_ATTEMPTS;
+                    if budget_exhausted || lifetime_exhausted {
                         // Degrade to terminal, mirroring `FailureClass::Terminal`
                         // below but using THIS report's own diagnostic (the
                         // one that broke the ceiling), not an earlier
@@ -397,6 +451,8 @@ pub fn apply_event(
                         next.recovery_owner = Some(owner);
                         next.recovery_origin_owner = Some(interrupted_owner);
                         next.recovery_attempts = session.recovery_attempts.saturating_add(1);
+                        next.total_recovery_attempts =
+                            session.total_recovery_attempts.saturating_add(1);
                         next.current_owner = owner;
                     }
                 }
@@ -460,10 +516,16 @@ pub fn apply_event(
             // `CodingFailed` (both the ceiling degrade and the direct
             // Terminal branch), so there is nothing stale to clear.
             //
-            // Resume begins a fresh recovery budget. The terminal row's
+            // Resume begins a fresh recovery *budget*. The terminal row's
             // exhausted count is historical diagnostic state; retaining it
             // here would make the first new tooling failure immediately
             // re-hit the retry ceiling instead of handing off recovery.
+            //
+            // `total_recovery_attempts` is emphatically not reset alongside
+            // it — that is the whole reason the field exists. Resume is
+            // already refused above once the lifetime ceiling is reached, so
+            // the refreshed budget is always bounded by whatever lifetime
+            // headroom is left.
             next.recovery_attempts = 0;
         }
         (phase, _) => {

@@ -153,13 +153,23 @@ pub(super) fn session_record_json(record: &SessionRecord) -> Value {
         // the two are mutually exclusive by construction, enforced there
         // and covered by `state_machine::tests`. `failed_from_phase`/
         // `recovery_phase` serialize via `Phase::to_string()` like the
-        // top-level `phase` field. `recovery_origin_owner` is deliberately
-        // NOT exposed here — see its doc comment on `CollabSession` for why.
+        // top-level `phase` field.
+        //
+        // `recovery_origin_owner` and `total_recovery_attempts` were both
+        // added by review. Without the origin, nothing on this surface
+        // distinguishes a completion event sent by the phase's own expected
+        // agent from one sent by a delegated recovery owner. Without the
+        // lifetime counter, `recovery_attempts` alone can never read above
+        // `MAX_RECOVERY_ATTEMPTS`, so a session looping through
+        // `collab_resume` looks healthy from here no matter how many
+        // handoffs it has actually burned.
         "pending_failure": record.session.pending_failure.as_deref(),
         "failed_from_phase": record.session.failed_from_phase.map(|p| p.to_string()),
         "recovery_phase": record.session.recovery_phase.map(|p| p.to_string()),
         "recovery_owner": record.session.recovery_owner.map(|a| a.as_str()),
+        "recovery_origin_owner": record.session.recovery_origin_owner.map(|a| a.as_str()),
         "recovery_attempts": record.session.recovery_attempts,
+        "total_recovery_attempts": record.session.total_recovery_attempts,
         "ended_at": record.ended_at.as_deref(),
         "created_at": record.created_at.as_str(),
         "updated_at": record.updated_at.as_str(),
@@ -3060,6 +3070,14 @@ mod tests {
         );
         assert_eq!(status["recovery_owner"], json!("claude"));
         assert_eq!(status["recovery_attempts"], json!(1));
+        // The origin is what separates a completion event produced by the
+        // delegated recovery owner from one produced by the phase's own
+        // expected agent — `recovery_owner` alone cannot express that.
+        assert_eq!(status["recovery_origin_owner"], json!("codex"));
+        // The lifetime counter tracks the per-resume budget on the first
+        // handoff and diverges from it only after a resume, so this assertion
+        // pins its presence; `state_machine::tests` covers the divergence.
+        assert_eq!(status["total_recovery_attempts"], json!(1));
     }
 
     /// Required acceptance criterion: the branch-drift off-turn path behaves
@@ -3225,7 +3243,13 @@ mod tests {
         assert_eq!(status["failed_from_phase"], Value::Null);
         assert_eq!(status["recovery_phase"], Value::Null);
         assert_eq!(status["recovery_owner"], Value::Null);
+        assert_eq!(status["recovery_origin_owner"], Value::Null);
         assert_eq!(status["recovery_attempts"], json!(0));
+        // The lifetime counter is the one field a successful delegated
+        // completion must NOT clear — it is what bounds a session across
+        // resumes, so a reset here would silently reopen the loop the
+        // counter exists to close.
+        assert_eq!(status["total_recovery_attempts"], json!(1));
     }
 
     #[test]

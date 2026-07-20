@@ -260,7 +260,17 @@ pub(super) fn compose_handoff_block(
         "recovery_owner: {}",
         opt(s.recovery_owner.map(|a| a.as_str()))
     );
+    let _ = writeln!(
+        out,
+        "recovery_origin_owner: {}",
+        opt(s.recovery_origin_owner.map(|a| a.as_str()))
+    );
     let _ = writeln!(out, "recovery_attempts: {}", s.recovery_attempts);
+    let _ = writeln!(
+        out,
+        "total_recovery_attempts: {}",
+        s.total_recovery_attempts
+    );
     let _ = writeln!(out, "pr_url: {}", opt(s.pr_url.as_deref()));
     let _ = writeln!(out, "expected_next_event: {}", s.phase.expected_event());
     let _ = writeln!(
@@ -622,14 +632,20 @@ gates: passed\n";
         r.session.failed_from_phase = Some(CollabPhase::CodeReviewFixGlobalPending);
         r.session.recovery_phase = Some(CollabPhase::CodeReviewFixGlobalPending);
         r.session.recovery_owner = Some(CollabAgent::Claude);
+        r.session.recovery_origin_owner = Some(CollabAgent::Codex);
         r.session.recovery_attempts = 1;
+        r.session.total_recovery_attempts = 3;
 
         let block = compose_handoff_block(&r, Agent::Claude, 1, None);
         assert!(block.contains("pending_failure: git_commit_failed: index.lock EPERM"));
         assert!(block.contains("failed_from_phase: CodeReviewFixGlobalPending"));
         assert!(block.contains("recovery_phase: CodeReviewFixGlobalPending"));
         assert!(block.contains("recovery_owner: claude"));
+        assert!(block.contains("recovery_origin_owner: codex"));
         assert!(block.contains("recovery_attempts: 1"));
+        // Distinct from `recovery_attempts` so a block that rendered the
+        // per-resume budget under both labels would fail here.
+        assert!(block.contains("total_recovery_attempts: 3"));
     }
 
     /// The common case (no failure in flight) must render the em-dash

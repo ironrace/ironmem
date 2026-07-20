@@ -51,7 +51,8 @@ pub fn create_session(
     //
     // Recovery-state columns (pending_failure, failed_from_phase,
     // recovery_phase, recovery_owner, recovery_origin_owner,
-    // recovery_attempts; migration 015) are deliberately omitted here — they
+    // recovery_attempts, total_recovery_attempts; migration 015) are
+    // deliberately omitted here — they
     // have no `DEFAULT` and are all nullable, so a fresh row lands on NULL,
     // which `load_session_record` maps to `None`/`0` exactly like a legacy
     // pre-015 row. `save_session` is the only writer for these fields.
@@ -217,7 +218,8 @@ pub fn load_session_record(
                 canonical_plan_drawer_id, final_plan_drawer_id,
                 created_at, updated_at, implementer,
                 pending_failure, failed_from_phase, recovery_phase,
-                recovery_owner, recovery_origin_owner, recovery_attempts
+                recovery_owner, recovery_origin_owner, recovery_attempts,
+                total_recovery_attempts
          FROM collab_sessions
          WHERE id = ?1",
         params![session_id],
@@ -241,6 +243,9 @@ pub fn load_session_record(
             let recovery_attempts_i: Option<i64> = row.get("recovery_attempts")?;
             let recovery_attempts =
                 recovery_attempts_i.map_or(0, |n| n.clamp(0, u8::MAX as i64) as u8);
+            let total_recovery_attempts_i: Option<i64> = row.get("total_recovery_attempts")?;
+            let total_recovery_attempts =
+                total_recovery_attempts_i.map_or(0, |n| n.clamp(0, u8::MAX as i64) as u8);
             Ok(SessionRecord {
                 session: CollabSession {
                     id: row.get("id")?,
@@ -269,6 +274,7 @@ pub fn load_session_record(
                     recovery_owner,
                     recovery_origin_owner,
                     recovery_attempts,
+                    total_recovery_attempts,
                 },
                 repo_path: row.get("repo_path")?,
                 branch: row.get("branch")?,
@@ -363,8 +369,9 @@ pub fn save_session(conn: &Connection, session: &CollabSession) -> Result<(), Me
              recovery_owner = ?23,
              recovery_origin_owner = ?24,
              recovery_attempts = ?25,
+             total_recovery_attempts = ?26,
              updated_at = datetime('now')
-        WHERE id = ?26",
+        WHERE id = ?27",
         params![
             session.phase.to_string(),
             session.current_owner.as_str(),
@@ -391,6 +398,7 @@ pub fn save_session(conn: &Connection, session: &CollabSession) -> Result<(), Me
             session.recovery_owner.map(|a| a.as_str()),
             session.recovery_origin_owner.map(|a| a.as_str()),
             session.recovery_attempts as i64,
+            session.total_recovery_attempts as i64,
             session.id.as_str(),
         ],
     )?;
@@ -818,12 +826,17 @@ mod tests {
         session.recovery_owner = Some(Agent::Codex);
         session.recovery_origin_owner = Some(Agent::Claude);
         session.recovery_attempts = 3;
+        // Distinct from `recovery_attempts` on purpose: the lifetime counter
+        // is monotonic while the per-resume budget is reset, so the two
+        // diverge in practice and a loader that mapped one column onto the
+        // other would still pass if both were 3.
+        session.total_recovery_attempts = 4;
         save_session(&db, &session).unwrap();
 
         let round_trip = load_session(&db, "sess-recovery").unwrap();
         assert_eq!(
             round_trip, session,
-            "all six recovery fields must round-trip byte-identical"
+            "all seven recovery fields must round-trip byte-identical"
         );
         assert_eq!(
             round_trip.pending_failure.as_deref(),
@@ -840,15 +853,16 @@ mod tests {
         assert_eq!(round_trip.recovery_owner, Some(Agent::Codex));
         assert_eq!(round_trip.recovery_origin_owner, Some(Agent::Claude));
         assert_eq!(round_trip.recovery_attempts, 3);
+        assert_eq!(round_trip.total_recovery_attempts, 4);
     }
 
     #[test]
     fn test_recovery_fields_null_legacy_row_defaults() {
         // A row that has never been through `save_session` — e.g. a legacy
         // pre-015 row, simulated here by a fresh `create_session` insert,
-        // which leaves all six recovery columns at their NULL column
+        // which leaves all seven recovery columns at their NULL column
         // default — must load without error, with every Option field `None`
-        // and `recovery_attempts` defaulted to `0` (not propagated as an
+        // and both attempt counters defaulted to `0` (not propagated as an
         // error or left uninitialized).
         let db = open();
         create_session(&db, "sess-legacy", "/repo", "main", None, Agent::Claude).unwrap();
@@ -859,6 +873,7 @@ mod tests {
         assert!(session.recovery_owner.is_none());
         assert!(session.recovery_origin_owner.is_none());
         assert_eq!(session.recovery_attempts, 0);
+        assert_eq!(session.total_recovery_attempts, 0);
     }
 
     #[test]

@@ -1315,10 +1315,10 @@ fn test_delegated_completion_override_is_one_turn_only() {
 }
 
 #[test]
-fn test_delegated_completion_override_rejects_non_recovery_owner() {
-    // The override is exclusive to `recovery_owner`. Claude flags a Codex
-    // MCP dispatch failure off-turn (`codex_dispatch_failed:` is both
-    // off-turn-admissible and recoverable per `RECOVERABLE_FAILURE_PREFIXES`).
+fn test_delegated_completion_override_accepts_recovery_owner_after_off_turn_dispatch_failure() {
+    // Claude flags a Codex MCP dispatch failure off-turn
+    // (`codex_dispatch_failed:` is both off-turn-admissible and recoverable
+    // per `RECOVERABLE_FAILURE_PREFIXES`).
     // Recovery must go to the counterpart of the interrupted turn's owner,
     // not to the counterpart of the reporting observer: otherwise the
     // dispatch failure would immediately hand control back to unavailable
@@ -1769,6 +1769,264 @@ fn test_resume_coding_rejects_legacy_row_with_null_failed_from_phase() {
                 reason.contains("predates resume support"),
                 "expected the NotResumable reason to name \"predates resume support\" \
                  verbatim (Codex note 2 — never guess), got: {reason:?}"
+            );
+        }
+        other => panic!("expected CollabError::NotResumable, got {other:?}"),
+    }
+}
+
+// ── Review follow-up: the delegated-completion guard's two conjuncts ────
+
+// `require_actor_or_recovery` admits an actor when BOTH
+// `session.recovery_owner == Some(actor)` AND
+// `session.recovery_phase == Some(session.phase)`. Neither conjunct is
+// falsifiable through `apply_event` in the two-agent protocol as it stands:
+// every coding phase has exactly one `expected` agent, so an actor that
+// fails the recovery clause always falls through to `require_actor` and is
+// accepted anyway when it is the expected owner. The two tests below
+// therefore drive the guard directly with hand-constructed sessions — states
+// a third agent, or a future phase-advancing recovery, would make reachable.
+// Without them, deleting either conjunct leaves the whole suite green.
+
+#[test]
+fn test_recovery_guard_rejects_an_actor_that_is_not_the_recovery_owner() {
+    // Conjunct 1. Recovery is in flight at this exact phase, but the actor
+    // is neither the recovery owner nor the expected owner.
+    let session = CollabSession {
+        phase: Phase::CodeReviewFixGlobalPending,
+        current_owner: Agent::Claude,
+        pending_failure: Some("git_push_failed: remote rejected".to_string()),
+        recovery_phase: Some(Phase::CodeReviewFixGlobalPending),
+        recovery_owner: Some(Agent::Claude),
+        recovery_attempts: 1,
+        total_recovery_attempts: 1,
+        ..CollabSession::new("guard-conjunct-1")
+    };
+
+    // Claude is the recovery owner and the phase matches, so Claude is in.
+    require_actor_or_recovery(&session, Agent::Claude, Agent::Claude).unwrap();
+
+    // Codex is not the recovery owner. Expect the plain `require_actor`
+    // rejection, proving the recovery clause did not fire for it.
+    let err = require_actor_or_recovery(&session, Agent::Codex, Agent::Claude).unwrap_err();
+    match err {
+        CollabError::NotYourTurn { expected, got } => {
+            assert_eq!(expected, "claude");
+            assert_eq!(got, "codex");
+        }
+        other => panic!("expected CollabError::NotYourTurn, got {other:?}"),
+    }
+}
+
+#[test]
+fn test_recovery_guard_rejects_a_recovery_owner_in_a_different_phase() {
+    // Conjunct 2. The actor IS the recovery owner, but the session has moved
+    // on from the phase the recovery was recorded against — the delegated
+    // completion is scoped to the interrupted phase alone, not to the
+    // session for as long as a recovery is open.
+    let session = CollabSession {
+        phase: Phase::CodeReviewLocalPending,
+        current_owner: Agent::Claude,
+        pending_failure: Some("git_push_failed: remote rejected".to_string()),
+        recovery_phase: Some(Phase::CodeReviewFixGlobalPending),
+        recovery_owner: Some(Agent::Codex),
+        recovery_attempts: 1,
+        total_recovery_attempts: 1,
+        ..CollabSession::new("guard-conjunct-2")
+    };
+
+    let err = require_actor_or_recovery(&session, Agent::Codex, Agent::Claude).unwrap_err();
+    match err {
+        CollabError::NotYourTurn { expected, got } => {
+            assert_eq!(expected, "claude");
+            assert_eq!(got, "codex");
+        }
+        other => panic!("expected CollabError::NotYourTurn, got {other:?}"),
+    }
+
+    // Same session, recovery pointed at the current phase → admitted. This
+    // is the control: it is the phase mismatch above that rejects, not
+    // something else about the fixture.
+    let aligned = CollabSession {
+        recovery_phase: Some(Phase::CodeReviewLocalPending),
+        ..session
+    };
+    require_actor_or_recovery(&aligned, Agent::Codex, Agent::Claude).unwrap();
+}
+
+// ── Review follow-up: the lifetime recovery ceiling ────────────────────
+
+/// Burn one full per-resume recovery budget: two tolerated Tooling reports,
+/// then a third whose increment breaks `MAX_RECOVERY_ATTEMPTS` and degrades
+/// the session to `CodingFailed`. Each report comes from whichever agent
+/// currently owns the turn, mirroring a real ping-ponging recovery.
+fn exhaust_one_recovery_budget(session: &CollabSession) -> CollabSession {
+    let out = (1..=3).fold(session.clone(), |current, attempt| {
+        let actor = current.current_owner;
+        apply_event(
+            &current,
+            actor,
+            &CollabEvent::FailureReport {
+                coding_failure: format!("git_commit_failed: attempt {attempt}"),
+            },
+        )
+        .unwrap()
+    });
+    assert_eq!(out.phase, Phase::CodingFailed);
+    out
+}
+
+#[test]
+fn test_total_recovery_attempts_is_monotonic_across_a_resume() {
+    // `recovery_attempts` is the per-resume budget and is refreshed by
+    // `ResumeCoding`. `total_recovery_attempts` is the lifetime counter and
+    // is not — that asymmetry is the whole point, since `collab_resume` is
+    // agent-callable and a resettable-only counter let a session loop
+    // failure → ceiling → resume → failure forever.
+    let session = submit_task_list(&locked_session("hf"), "hf", 1);
+    assert_eq!(session.total_recovery_attempts, 0);
+
+    let failed = exhaust_one_recovery_budget(&session);
+    // Two tolerated handoffs incremented both counters; the third degraded
+    // to terminal without incrementing either.
+    assert_eq!(failed.recovery_attempts, 2);
+    assert_eq!(failed.total_recovery_attempts, 2);
+
+    let resumed = apply_event(&failed, Agent::Claude, &CollabEvent::ResumeCoding).unwrap();
+    assert_eq!(resumed.recovery_attempts, 0);
+    assert_eq!(
+        resumed.total_recovery_attempts, 2,
+        "resume must not zero the lifetime counter"
+    );
+
+    let again = apply_event(
+        &resumed,
+        resumed.current_owner,
+        &CollabEvent::FailureReport {
+            coding_failure: "git_push_failed: first failure after resume".to_string(),
+        },
+    )
+    .unwrap();
+    assert_eq!(again.recovery_attempts, 1);
+    assert_eq!(again.total_recovery_attempts, 3);
+}
+
+#[test]
+fn test_total_recovery_attempts_survives_a_successful_delegated_completion() {
+    // `clear_recovery_state` zeroes the per-resume budget on success. The
+    // lifetime counter is deliberately excluded from that reset, so a
+    // session that alternates failure/recovery/failure still converges on
+    // the ceiling instead of running unbounded.
+    let session = session_with_codex_recovery_in_fix_global_pending();
+    assert_eq!(session.recovery_attempts, 1);
+    assert_eq!(session.total_recovery_attempts, 1);
+
+    let completed = apply_event(
+        &session,
+        Agent::Claude,
+        &CollabEvent::CodeReviewFixGlobal {
+            head_sha: "g1".to_string(),
+        },
+    )
+    .unwrap();
+
+    assert_eq!(completed.recovery_attempts, 0);
+    assert_eq!(completed.total_recovery_attempts, 1);
+}
+
+#[test]
+fn test_lifetime_ceiling_degrades_to_terminal_with_the_per_resume_budget_unspent() {
+    // The binding-ceiling case: `MAX_TOTAL_RECOVERY_ATTEMPTS` (5) is not a
+    // multiple of `MAX_RECOVERY_ATTEMPTS` (2), so the lifetime ceiling can
+    // and does fire while the per-resume budget still has room. Two
+    // exhausted budgets take the lifetime count to 4; after a resume, the
+    // first report takes it to 5 and the second breaks it — at
+    // `recovery_attempts == 1`, well inside the per-resume ceiling.
+    let session = submit_task_list(&locked_session("hf"), "hf", 1);
+
+    let after_first = exhaust_one_recovery_budget(&session);
+    let resumed = apply_event(&after_first, Agent::Claude, &CollabEvent::ResumeCoding).unwrap();
+    let after_second = exhaust_one_recovery_budget(&resumed);
+    assert_eq!(after_second.total_recovery_attempts, 4);
+
+    let resumed = apply_event(&after_second, Agent::Claude, &CollabEvent::ResumeCoding).unwrap();
+    assert_eq!(resumed.recovery_attempts, 0);
+
+    let at_ceiling = apply_event(
+        &resumed,
+        resumed.current_owner,
+        &CollabEvent::FailureReport {
+            coding_failure: "git_push_failed: fifth lifetime handoff".to_string(),
+        },
+    )
+    .unwrap();
+    assert_eq!(at_ceiling.phase, Phase::CodeImplementPending);
+    assert_eq!(at_ceiling.recovery_attempts, 1);
+    assert_eq!(
+        at_ceiling.total_recovery_attempts,
+        MAX_TOTAL_RECOVERY_ATTEMPTS
+    );
+
+    let past_ceiling = apply_event(
+        &at_ceiling,
+        at_ceiling.current_owner,
+        &CollabEvent::FailureReport {
+            coding_failure: "git_push_failed: sixth breaks the lifetime ceiling".to_string(),
+        },
+    )
+    .unwrap();
+
+    assert_eq!(past_ceiling.phase, Phase::CodingFailed);
+    assert_eq!(
+        past_ceiling.coding_failure.as_deref(),
+        Some("git_push_failed: sixth breaks the lifetime ceiling"),
+        "the degrade must carry the report that broke the ceiling, not an earlier one"
+    );
+    assert_eq!(
+        past_ceiling.recovery_attempts, 1,
+        "the per-resume budget was never exhausted — the lifetime ceiling is what bound"
+    );
+    assert_eq!(
+        past_ceiling.total_recovery_attempts,
+        MAX_TOTAL_RECOVERY_ATTEMPTS
+    );
+    assert_eq!(past_ceiling.recovery_phase, None);
+    assert_eq!(past_ceiling.recovery_owner, None);
+    assert_eq!(past_ceiling.recovery_origin_owner, None);
+}
+
+#[test]
+fn test_resume_is_rejected_once_the_lifetime_ceiling_is_reached() {
+    // The ceiling has to bound resumes too, not just in-phase handoffs.
+    // Otherwise `collab_resume` — agent-callable, and on the unattended
+    // successor's permission allowlist — reopens the session indefinitely.
+    let session = submit_task_list(&locked_session("hf"), "hf", 1);
+    let after_first = exhaust_one_recovery_budget(&session);
+    let resumed = apply_event(&after_first, Agent::Claude, &CollabEvent::ResumeCoding).unwrap();
+    let after_second = exhaust_one_recovery_budget(&resumed);
+    let resumed = apply_event(&after_second, Agent::Claude, &CollabEvent::ResumeCoding).unwrap();
+    let exhausted = (1..=2).fold(resumed, |current, attempt| {
+        apply_event(
+            &current,
+            current.current_owner,
+            &CollabEvent::FailureReport {
+                coding_failure: format!("git_push_failed: lifetime attempt {attempt}"),
+            },
+        )
+        .unwrap()
+    });
+    assert_eq!(exhausted.phase, Phase::CodingFailed);
+    assert_eq!(
+        exhausted.total_recovery_attempts,
+        MAX_TOTAL_RECOVERY_ATTEMPTS
+    );
+
+    let err = apply_event(&exhausted, Agent::Claude, &CollabEvent::ResumeCoding).unwrap_err();
+    match err {
+        CollabError::NotResumable { reason } => {
+            assert!(
+                reason.contains("lifetime recovery ceiling"),
+                "expected the NotResumable reason to name the lifetime ceiling, got: {reason:?}"
             );
         }
         other => panic!("expected CollabError::NotResumable, got {other:?}"),
