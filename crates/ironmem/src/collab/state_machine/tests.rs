@@ -1547,3 +1547,186 @@ fn test_terminal_report_mid_recovery_clears_stale_recovery_pointers() {
     // state — left as-is, same convention as the retry-ceiling degrade path.
     assert_eq!(s.recovery_attempts, 1);
 }
+
+// ── Task 7: ResumeCoding event and terminal-guard carve-out ─────────────
+
+/// Drive a session through the retry-ceiling degrade path (three
+/// successive `git_commit_failed:` reports, mirroring
+/// `test_third_recoverable_report_degrades_to_terminal_after_two_tolerated`
+/// above) to land in `CodingFailed` with a Tooling-classified
+/// `coding_failure` and `failed_from_phase` set. This is the realistic way
+/// a Tooling `CodingFailed` session comes to exist — via `apply_event`, not
+/// a struct literal.
+fn session_with_ceiling_degraded_tooling_failure() -> CollabSession {
+    let s = locked_session("hf");
+    let s = submit_task_list(&s, "hf", 1);
+    let s = apply_event(
+        &s,
+        Agent::Claude,
+        &CollabEvent::FailureReport {
+            coding_failure: "git_commit_failed: attempt 1".to_string(),
+        },
+    )
+    .unwrap();
+    let s = apply_event(
+        &s,
+        Agent::Codex,
+        &CollabEvent::FailureReport {
+            coding_failure: "git_commit_failed: attempt 2".to_string(),
+        },
+    )
+    .unwrap();
+    apply_event(
+        &s,
+        Agent::Claude,
+        &CollabEvent::FailureReport {
+            coding_failure: "git_commit_failed: attempt 3 breaks the ceiling".to_string(),
+        },
+    )
+    .unwrap()
+}
+
+#[test]
+fn test_resume_coding_restores_recorded_phase_with_resumer_as_owner() {
+    let s = session_with_ceiling_degraded_tooling_failure();
+    assert_eq!(s.phase, Phase::CodingFailed);
+    assert_eq!(s.failed_from_phase, Some(Phase::CodeImplementPending));
+    assert_eq!(
+        classify(s.coding_failure.as_deref().unwrap()),
+        FailureClass::Tooling
+    );
+
+    // Codex resumes. Resume is gated by `resume_eligibility`, not by
+    // `current_owner` (the session is terminal — there is no live owner to
+    // check against).
+    let s = apply_event(&s, Agent::Codex, &CollabEvent::ResumeCoding).unwrap();
+
+    // Restores the exact recorded phase.
+    assert_eq!(s.phase, Phase::CodeImplementPending);
+    // The resumer becomes BOTH current_owner and recovery_owner — "the
+    // resuming counterpart" in the plan text means "whoever is resuming"
+    // (`actor`), not `counterpart(actor)`.
+    assert_eq!(s.current_owner, Agent::Codex);
+    assert_eq!(s.recovery_owner, Some(Agent::Codex));
+    // recovery_phase mirrors the restored phase so a subsequent
+    // `require_actor_or_recovery` call accepts this resumer via the
+    // existing Task 5 mechanism.
+    assert_eq!(s.recovery_phase, Some(Phase::CodeImplementPending));
+    // The old terminal diagnostic moves to `pending_failure` for audit...
+    assert_eq!(
+        s.pending_failure.as_deref(),
+        Some("git_commit_failed: attempt 3 breaks the ceiling")
+    );
+    // ...and `coding_failure` is cleared.
+    assert_eq!(s.coding_failure, None);
+    // `failed_from_phase` is retained as a historical record of what phase
+    // this session originally failed from (judgment call — see
+    // `resume_eligibility`'s doc comment in state_machine/mod.rs).
+    assert_eq!(s.failed_from_phase, Some(Phase::CodeImplementPending));
+    // `recovery_attempts` carries forward unchanged — historical diagnostic,
+    // not live state, same convention Task 6 established.
+    assert_eq!(s.recovery_attempts, 2);
+    // Already cleared by the terminal transition (Task 6) and stays clear.
+    assert_eq!(s.recovery_origin_owner, None);
+}
+
+#[test]
+fn test_resume_coding_rejected_for_branch_drift_session() {
+    let s = start_global_review_session("s1", "basesha", "h0").unwrap();
+    let s = apply_event(
+        &s,
+        Agent::Claude,
+        &CollabEvent::FailureReport {
+            coding_failure: "branch_drift: last_head_sha=h0 not found".to_string(),
+        },
+    )
+    .unwrap();
+    assert_eq!(s.phase, Phase::CodingFailed);
+    // failed_from_phase IS recorded (Task 4's Terminal branch always sets
+    // it) — the rejection here comes from classify(...) != Tooling, not
+    // from a missing failed_from_phase.
+    assert!(s.failed_from_phase.is_some());
+
+    let err = apply_event(&s, Agent::Claude, &CollabEvent::ResumeCoding).unwrap_err();
+    assert!(matches!(err, CollabError::NotResumable { .. }));
+}
+
+#[test]
+fn test_resume_coding_rejected_for_subagent_failure_session() {
+    let s = locked_session("hf");
+    let s = submit_task_list(&s, "hf", 1);
+    let s = apply_event(
+        &s,
+        Agent::Claude,
+        &CollabEvent::FailureReport {
+            coding_failure: "subagent_failure: task 2 timed out".to_string(),
+        },
+    )
+    .unwrap();
+    assert_eq!(s.phase, Phase::CodingFailed);
+    assert!(s.failed_from_phase.is_some());
+
+    let err = apply_event(&s, Agent::Claude, &CollabEvent::ResumeCoding).unwrap_err();
+    assert!(matches!(err, CollabError::NotResumable { .. }));
+}
+
+#[test]
+fn test_resume_coding_from_coding_complete_is_session_locked() {
+    // CodingComplete gets zero carve-outs: ResumeCoding from it is rejected
+    // exactly like any other event, with the generic SessionLocked — never
+    // NotResumable (there is no recorded failure to be ineligible about).
+    let s = locked_session("hf");
+    let s = submit_task_list(&s, "hf", 1);
+    let s = finish_through_global_review(&s);
+    assert_eq!(s.phase, Phase::CodingComplete);
+
+    let err = apply_event(&s, Agent::Claude, &CollabEvent::ResumeCoding).unwrap_err();
+    assert!(matches!(err, CollabError::SessionLocked));
+}
+
+#[test]
+fn test_double_resume_is_rejected() {
+    let s = session_with_ceiling_degraded_tooling_failure();
+    let s = apply_event(&s, Agent::Codex, &CollabEvent::ResumeCoding).unwrap();
+    assert_eq!(s.phase, Phase::CodeImplementPending);
+
+    // The session is no longer CodingFailed, so a second ResumeCoding falls
+    // through to the ordinary WrongPhase catch-all — there is no longer a
+    // terminal phase, let alone a matching resume carve-out, to admit it.
+    let err = apply_event(&s, Agent::Codex, &CollabEvent::ResumeCoding).unwrap_err();
+    assert!(matches!(err, CollabError::WrongPhase { .. }));
+}
+
+#[test]
+fn test_resume_coding_rejects_legacy_row_with_null_failed_from_phase() {
+    // A legacy `CodingFailed` row that predates migration 015/Task 4 never
+    // had `failed_from_phase` populated, even though its `coding_failure`
+    // happens to classify as a recoverable tooling failure. Such a row is
+    // unreachable via `apply_event` (Task 4 always sets `failed_from_phase`
+    // on every transition into `CodingFailed`), so it is constructed
+    // directly via a struct literal — matching how a real pre-migration DB
+    // row would deserialize (NULL failed_from_phase).
+    let legacy = CollabSession {
+        phase: Phase::CodingFailed,
+        current_owner: Agent::Claude,
+        coding_failure: Some("git_commit_failed: index.lock EPERM".to_string()),
+        failed_from_phase: None,
+        ..CollabSession::new("legacy-session")
+    };
+    assert_eq!(
+        classify(legacy.coding_failure.as_deref().unwrap()),
+        FailureClass::Tooling
+    );
+
+    let err = apply_event(&legacy, Agent::Claude, &CollabEvent::ResumeCoding).unwrap_err();
+    match err {
+        CollabError::NotResumable { reason } => {
+            assert!(
+                reason.contains("predates resume support"),
+                "expected the NotResumable reason to name \"predates resume support\" \
+                 verbatim (Codex note 2 — never guess), got: {reason:?}"
+            );
+        }
+        other => panic!("expected CollabError::NotResumable, got {other:?}"),
+    }
+}

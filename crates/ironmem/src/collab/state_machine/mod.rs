@@ -113,16 +113,65 @@ fn clear_recovery_pointers(next: &mut CollabSession) {
     next.recovery_origin_owner = None;
 }
 
+/// Determine whether a `CodingFailed` session is eligible for `ResumeCoding`,
+/// returning the `Phase` to restore on success. Admission requires BOTH
+/// `failed_from_phase.is_some()` AND the stored `coding_failure` classifying
+/// as `FailureClass::Tooling` — a session that fails either check returns a
+/// specific `NotResumable` reason rather than falling through to the
+/// generic `SessionLocked`.
+///
+/// The two rejection messages are deliberately distinct: a `None`
+/// `failed_from_phase` means the row predates migration 015/Task 4 (a fact
+/// about schema provenance, stated plainly — never guessed at); a `Some`
+/// `failed_from_phase` whose `coding_failure` classifies `Terminal` (e.g.
+/// `branch_drift:`, `subagent_failure:`) means the session failed for a
+/// reason that was never recoverable in the first place.
+///
+/// Pure and side-effect-free — safe to call more than once against the same
+/// immutable `session` (the top-of-function guard and the `ResumeCoding`
+/// match arm both call it independently rather than threading a value
+/// through).
+fn resume_eligibility(session: &CollabSession) -> Result<Phase, CollabError> {
+    let Some(restored_phase) = session.failed_from_phase else {
+        return Err(CollabError::NotResumable {
+            reason: "session predates resume support: failed_from_phase was never recorded \
+                     for this CodingFailed row (pre-migration-015)"
+                .to_string(),
+        });
+    };
+    let is_tooling = session
+        .coding_failure
+        .as_deref()
+        .is_some_and(|failure| classify(failure) == FailureClass::Tooling);
+    if !is_tooling {
+        return Err(CollabError::NotResumable {
+            reason: "coding_failure does not classify as a recoverable tooling failure".to_string(),
+        });
+    }
+    Ok(restored_phase)
+}
+
 pub fn apply_event(
     session: &CollabSession,
     actor: Agent,
     event: &CollabEvent,
 ) -> Result<CollabSession, CollabError> {
-    // v3: terminal coding phases reject all further events. PlanLocked is
-    // transient pre-`task_list`; the only transition out of it is a
-    // `SubmitTaskList` from Claude.
+    // v3: terminal coding phases reject all further events, with exactly one
+    // carve-out: `ResumeCoding` from `CodingFailed`. `CodingComplete` gets
+    // zero carve-outs — any event from it, including `ResumeCoding`, hits
+    // `SessionLocked` below. An ineligible `ResumeCoding` from `CodingFailed`
+    // (semantic failure, or a legacy row) returns the specific
+    // `NotResumable` reason right here — NOT `SessionLocked`, and NOT a
+    // fall-through to the `WrongPhase` catch-all — so callers can tell "this
+    // session is locked" apart from "this session is locked AND could never
+    // have resumed anyway".
     if matches!(session.phase, Phase::CodingComplete | Phase::CodingFailed) {
-        return Err(CollabError::SessionLocked);
+        let is_resume_attempt =
+            session.phase == Phase::CodingFailed && matches!(event, CollabEvent::ResumeCoding);
+        if !is_resume_attempt {
+            return Err(CollabError::SessionLocked);
+        }
+        resume_eligibility(session)?;
     }
 
     let mut next = session.clone();
@@ -364,6 +413,47 @@ pub fn apply_event(
                     next.current_owner = actor;
                 }
             }
+        }
+        // ── ResumeCoding: the one carve-out through the terminal guard ────
+        (Phase::CodingFailed, CollabEvent::ResumeCoding) => {
+            // Eligibility (`failed_from_phase.is_some()` AND `classify(...)
+            // == Tooling`) was already enforced by the top-of-function
+            // guard — an ineligible resume attempt returns `NotResumable`
+            // there and never reaches this arm. Recomputing here is pure
+            // and side-effect-free, so this can only fail if the guard and
+            // this call somehow disagreed on the same immutable `session`,
+            // which they cannot.
+            let restored_phase = resume_eligibility(session)?;
+            next.phase = restored_phase;
+            // "The resuming counterpart" = whichever agent is calling
+            // resume (`actor`), not `counterpart(actor)`: the resumer
+            // becomes both the new current owner and its own recorded
+            // recovery owner.
+            next.current_owner = actor;
+            next.recovery_owner = Some(actor);
+            // Mirrors a freshly-recovered Tooling session so a subsequent
+            // `require_actor_or_recovery` call at `restored_phase` accepts
+            // this same resumer via the existing Task 5 mechanism, without
+            // a special case.
+            next.recovery_phase = Some(restored_phase);
+            // Move the terminal diagnostic into `pending_failure` for
+            // audit, mirroring the "ResumeCoding accepted" row of the
+            // binding-design-decisions table in the plan doc.
+            next.pending_failure = session.coding_failure.clone();
+            next.coding_failure = None;
+            // `failed_from_phase` is deliberately left set: it is a
+            // historical record of which phase this session originally
+            // failed from, which stays useful for audit even after resume
+            // and does not conflict with any acceptance criterion.
+            //
+            // `recovery_origin_owner` is already `None` here — Task 6's
+            // `clear_recovery_pointers` clears it on every transition into
+            // `CodingFailed` (both the ceiling degrade and the direct
+            // Terminal branch), so there is nothing stale to clear.
+            //
+            // `recovery_attempts` carries forward unchanged: it is
+            // historical attempt-count diagnostic, not live state, the same
+            // convention Task 6 established for the terminal paths.
         }
         (phase, _) => {
             // Terminal phases are short-circuited by the guard at the top of
