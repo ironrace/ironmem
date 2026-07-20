@@ -2746,6 +2746,57 @@ mod tests {
         }
     }
 
+    /// Pins the cap-check branch in `barrier_release_for` directly: deleting
+    /// that `if early_release_reserved.len() >= MAX_EARLY_RELEASED_WAITS`
+    /// check would leave every other test in this module green, since the two
+    /// wire-level tests around the cap only exercise it indirectly through a
+    /// full framing-loop/duplex harness. This test calls the pure function
+    /// itself with no `tokio::test`, no wire harness — just a channel and a
+    /// `HashSet` — so it fails immediately, and only, if the cap enforcement
+    /// or the "don't insert on refusal" invariant regresses.
+    #[test]
+    fn barrier_release_for_enforces_the_cap_and_does_not_insert_on_refusal() {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<u64>();
+        let mut reserved: std::collections::HashSet<u64> = std::collections::HashSet::new();
+
+        // Fill the cap exactly: every call up to MAX_EARLY_RELEASED_WAITS gets
+        // Some, and the set grows by one each time.
+        for seq in 0..MAX_EARLY_RELEASED_WAITS as u64 {
+            let result = barrier_release_for(&tx, &mut reserved, seq);
+            assert!(result.is_some(), "seq {seq} should be under the cap");
+            assert!(reserved.contains(&seq));
+        }
+        assert_eq!(reserved.len(), MAX_EARLY_RELEASED_WAITS);
+
+        // One more, over the cap: must be refused, and must NOT be inserted —
+        // the whole leak-prevention invariant depends on refused seqs never
+        // occupying a slot in the set.
+        let over_cap_seq = MAX_EARLY_RELEASED_WAITS as u64;
+        let refused = barrier_release_for(&tx, &mut reserved, over_cap_seq);
+        assert!(
+            refused.is_none(),
+            "dispatching over the cap must return None"
+        );
+        assert!(
+            !reserved.contains(&over_cap_seq),
+            "a refused reservation must not be inserted into the set"
+        );
+        assert_eq!(
+            reserved.len(),
+            MAX_EARLY_RELEASED_WAITS,
+            "the set must not grow on a refusal"
+        );
+
+        // Freeing one slot (simulating the completion-branch removal) makes
+        // room for exactly one more admission.
+        reserved.remove(&0);
+        let admitted_again = barrier_release_for(&tx, &mut reserved, over_cap_seq);
+        assert!(
+            admitted_again.is_some(),
+            "freeing a slot must let the next dispatch get early release again"
+        );
+    }
+
     /// Task 3: dispatching a batch of token-bearing waits that straddles
     /// `MAX_EARLY_RELEASED_WAITS` must not stall a read pipelined behind them.
     ///
