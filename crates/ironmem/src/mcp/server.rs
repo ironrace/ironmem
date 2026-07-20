@@ -542,6 +542,25 @@ where
                         app, &mut queued_mutations, &mut mutation_barrier, &mut next_seq,
                         &mut in_flight, &early_release_tx, &mut early_release_reserved,
                     );
+                } else if early_release_reserved.contains(&seq) {
+                    // Unlike the completion arm — where a non-owning seq is
+                    // routine (every read, and any mutation dispatched over the
+                    // cap) — only the barrier OWNER is ever handed a
+                    // `BarrierRelease`, so a signal for a seq that still holds
+                    // its reservation yet no longer owns the barrier is a
+                    // should-never-happen: the seq bookkeeping has drifted.
+                    //
+                    // The one BENIGN stale signal — a wait that settled on its
+                    // first poll, so the biased `select!` took its completion
+                    // arm first — is excluded by this guard, because that arm
+                    // drops the reservation as it runs. Warning on it would
+                    // fire on every immediately-settling wait.
+                    tracing::warn!(
+                        seq,
+                        barrier = ?mutation_barrier,
+                        "early-release signal for a seq that does not own the mutation barrier \
+                         was ignored"
+                    );
                 }
                 // Deliberately does NOT touch `mutations_blocked`: early
                 // release only frees the barrier for a mutation that was
@@ -730,6 +749,17 @@ fn barrier_release_for(
     seq: u64,
 ) -> Option<BarrierRelease> {
     if early_release_reserved.len() >= MAX_EARLY_RELEASED_WAITS {
+        // Silent here would read to an operator as "writes are sometimes slow"
+        // with no signal at all: this mutation now holds the ordering barrier
+        // for its FULL poll (up to the long-poll timeout), stalling every
+        // mutation queued behind it on this connection.
+        tracing::warn!(
+            seq,
+            reserved = early_release_reserved.len(),
+            cap = MAX_EARLY_RELEASED_WAITS,
+            "early-release reservations are at the cap; this mutation will hold the \
+             per-connection ordering barrier for its full poll, stalling writes queued behind it"
+        );
         return None;
     }
     early_release_reserved.insert(seq);
