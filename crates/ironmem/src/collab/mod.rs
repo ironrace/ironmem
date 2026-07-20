@@ -67,12 +67,37 @@ pub const BRANCH_DRIFT_PREFIX: &str = "branch_drift:";
 /// running to emit a regular failure report.
 pub const CODEX_DISPATCH_FAILED_PREFIX: &str = "codex_dispatch_failed:";
 
-/// Prefixes on `coding_failure` that may be emitted by a non-owner
-/// agent. Ordinary failures must still come from `current_owner` so an
-/// off-turn agent cannot unilaterally abort the other agent's work; the
-/// carve-out exists for failure modes that are structurally observable
-/// only from outside the owner's process.
+/// Prefixes considered for non-owner `failure_report`s. Branch drift is
+/// admissible for either reporter; Codex dispatch failure is admissible only
+/// from Claude against a Codex-owned turn. Use
+/// [`off_turn_failure_is_admissible`] rather than treating membership here as
+/// sufficient authorization.
 pub const OFF_TURN_FAILURE_PREFIXES: &[&str] = &[BRANCH_DRIFT_PREFIX, CODEX_DISPATCH_FAILED_PREFIX];
+
+/// Whether an agent may report this failure while it is not the current
+/// owner. Branch drift is independently observable by either participant.
+/// A Codex-dispatch failure is different: only Claude can observe that a
+/// Codex-owned background dispatch never ran, so accepting it from Codex (or
+/// while Claude owns the turn) would let a non-owner seize a live Claude turn.
+///
+/// A recognized prefix also needs at least one byte of detail. This keeps the
+/// pre-dispatch turn gate aligned with the state-machine enforcement.
+pub fn off_turn_failure_is_admissible(
+    coding_failure: &str,
+    reporter: Agent,
+    current_owner: Agent,
+) -> bool {
+    let has_detail = |prefix: &str| {
+        coding_failure
+            .strip_prefix(prefix)
+            .is_some_and(|detail| !detail.is_empty())
+    };
+
+    has_detail(BRANCH_DRIFT_PREFIX)
+        || (reporter == Agent::Claude
+            && current_owner == Agent::Codex
+            && has_detail(CODEX_DISPATCH_FAILED_PREFIX))
+}
 
 /// Prefix on `coding_failure` that marks a failed `git commit` — a
 /// recoverable tooling failure (see [`failure_class`]).

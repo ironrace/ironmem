@@ -153,19 +153,22 @@ pub(super) fn parse_failure_report_event(content: &str) -> Result<CollabEvent, M
     Ok(CollabEvent::FailureReport { coding_failure })
 }
 
-/// Best-effort check for any prefix that the state machine admits from a
-/// non-owner agent (branch drift, Codex dispatch failure). Returns false
-/// on any JSON parse failure so malformed payloads still fall through to
-/// the main `parse_failure_report_event` validation.
-pub(super) fn failure_report_is_off_turn_admissible(content: &str) -> bool {
+/// Best-effort check for a contextually authorized off-turn report. Branch
+/// drift is observable by either agent; a Codex-dispatch failure requires
+/// Claude reporting against a Codex-owned turn. Returns false on any JSON
+/// parse failure so malformed payloads still fall through to the main
+/// `parse_failure_report_event` validation.
+pub(super) fn failure_report_is_off_turn_admissible(
+    content: &str,
+    reporter: crate::collab::Agent,
+    current_owner: crate::collab::Agent,
+) -> bool {
     serde_json::from_str::<Value>(content)
         .ok()
         .and_then(|v| {
-            v.get("coding_failure").and_then(Value::as_str).map(|s| {
-                crate::collab::OFF_TURN_FAILURE_PREFIXES
-                    .iter()
-                    .any(|prefix| s.starts_with(prefix))
-            })
+            v.get("coding_failure")
+                .and_then(Value::as_str)
+                .map(|s| crate::collab::off_turn_failure_is_admissible(s, reporter, current_owner))
         })
         .unwrap_or(false)
 }
@@ -426,18 +429,26 @@ mod tests {
 
     // ── Task 9: off-turn admission regression guard ─────────────────────────
 
-    /// `failure_report_is_off_turn_admissible` must still recognize exactly
-    /// `branch_drift:` and `codex_dispatch_failed:` (`OFF_TURN_FAILURE_PREFIXES`)
-    /// and NOT the five other `RECOVERABLE_FAILURE_PREFIXES` added by tasks
-    /// 1-8. Task 9 does not widen this gate — pinning the full set here
-    /// documents that decision as a test, not just a comment.
+    /// Branch drift remains observable by either agent. A Codex dispatch
+    /// failure is admissible only when Claude reports it while Codex owns the
+    /// interrupted turn; the reverse direction would let Codex steal a Claude
+    /// turn.
     #[test]
-    fn off_turn_admissible_prefixes_unchanged_by_task_9() {
+    fn off_turn_failure_admission_respects_reporter_and_owner() {
         assert!(failure_report_is_off_turn_admissible(
-            &json!({"coding_failure": "branch_drift: head_sha abc not found"}).to_string()
+            &json!({"coding_failure": "branch_drift: head_sha abc not found"}).to_string(),
+            crate::collab::Agent::Codex,
+            crate::collab::Agent::Claude,
         ));
         assert!(failure_report_is_off_turn_admissible(
-            &json!({"coding_failure": "codex_dispatch_failed: mcp call timed out"}).to_string()
+            &json!({"coding_failure": "codex_dispatch_failed: mcp call timed out"}).to_string(),
+            crate::collab::Agent::Claude,
+            crate::collab::Agent::Codex,
+        ));
+        assert!(!failure_report_is_off_turn_admissible(
+            &json!({"coding_failure": "codex_dispatch_failed: mcp call timed out"}).to_string(),
+            crate::collab::Agent::Codex,
+            crate::collab::Agent::Claude,
         ));
         for recoverable_only in [
             "git_commit_failed: index.lock EPERM",
@@ -448,7 +459,9 @@ mod tests {
         ] {
             assert!(
                 !failure_report_is_off_turn_admissible(
-                    &json!({"coding_failure": recoverable_only}).to_string()
+                    &json!({"coding_failure": recoverable_only}).to_string(),
+                    crate::collab::Agent::Codex,
+                    crate::collab::Agent::Claude,
                 ),
                 "{recoverable_only} must NOT be off-turn admissible"
             );

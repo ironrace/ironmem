@@ -3,7 +3,7 @@ use super::error::CollabError;
 use super::event::CollabEvent;
 use super::phase::Phase;
 use super::session::CollabSession;
-use super::{classify, FailureClass, OFF_TURN_FAILURE_PREFIXES};
+use super::{classify, off_turn_failure_is_admissible, FailureClass};
 
 /// Construct a fresh `CollabSession` positioned at the v3 global-review
 /// stage, for the coding-review shortcut. Rejects empty SHAs so the
@@ -337,9 +337,8 @@ pub fn apply_event(
             // session participant abort the session with no diagnostic
             // value, so we reject the empty form and demand at least one
             // byte of context.
-            let is_off_turn_admissible = OFF_TURN_FAILURE_PREFIXES.iter().any(|prefix| {
-                coding_failure.starts_with(prefix) && coding_failure.len() > prefix.len()
-            });
+            let is_off_turn_admissible =
+                off_turn_failure_is_admissible(coding_failure, actor, session.current_owner);
             if !is_off_turn_admissible && actor != session.current_owner {
                 return Err(CollabError::NotYourTurn {
                     expected: session.current_owner.to_string(),

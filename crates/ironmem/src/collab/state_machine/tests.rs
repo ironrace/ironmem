@@ -1360,6 +1360,24 @@ fn test_delegated_completion_override_rejects_non_recovery_owner() {
 }
 
 #[test]
+fn test_codex_dispatch_failure_is_not_off_turn_admissible_against_claude_owner() {
+    let s = submit_task_list(&locked_session("hf"), "hf", 1);
+    assert_eq!(s.phase, Phase::CodeImplementPending);
+    assert_eq!(s.current_owner, Agent::Claude);
+
+    let err = apply_event(
+        &s,
+        Agent::Codex,
+        &CollabEvent::FailureReport {
+            coding_failure: "codex_dispatch_failed: fabricated report".to_string(),
+        },
+    )
+    .unwrap_err();
+
+    assert!(matches!(err, CollabError::NotYourTurn { .. }));
+}
+
+#[test]
 fn test_delegated_completion_override_completed_session_has_no_coding_failure() {
     // Even though a tooling failure was reported and recovered from
     // mid-flight, the session that eventually reaches `CodingComplete` must

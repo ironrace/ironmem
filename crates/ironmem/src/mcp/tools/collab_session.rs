@@ -661,7 +661,7 @@ pub(super) fn handle_collab_send(app: &App, args: &Value) -> Result<Value, Memor
         let turn_exempt = matches!(session.phase, crate::collab::Phase::PlanParallelDrafts)
             || (topic == "failure_report"
                 && sender != session.current_owner
-                && failure_report_is_off_turn_admissible(content));
+                && failure_report_is_off_turn_admissible(content, sender, session.current_owner));
         if !turn_exempt && sender != session.current_owner {
             return Err(MemoryError::Validation(format!(
                 "not your turn: phase {} expects sender '{}', got '{}'",
@@ -1286,9 +1286,11 @@ pub(super) fn handle_collab_end(app: &App, args: &Value) -> Result<Value, Memory
 /// `outcome='failed'`/`done_at` row that an earlier terminal `failure_report`
 /// wrote for this session (METRICS_SPEC §5.4 amendment, task 10) — a
 /// resumed session must be able to complete normally afterward. The clear is
-/// best-effort metrics bookkeeping, same as every other lifecycle write in
-/// this module: gated on `IRONMEM_METRICS`, non-fatal, and run after commit
-/// so a metrics failure can never roll back or fail a collab turn.
+/// best-effort cleanup, run after commit so a database error can never roll
+/// back or fail a collab turn. This clear deliberately ignores
+/// `IRONMEM_METRICS`: the kill switch may have been enabled after the terminal
+/// failure wrote its outcome, and resuming must not leave that stale failed
+/// outcome behind.
 pub(super) fn handle_collab_resume(app: &App, args: &Value) -> Result<Value, MemoryError> {
     let session_id = require_str(args, "session_id")?;
     ensure_no_conflicting_process_session(app, session_id)?;
@@ -1332,10 +1334,8 @@ pub(super) fn handle_collab_resume(app: &App, args: &Value) -> Result<Value, Mem
     // after the transaction commits, same as `handle_collab_end`'s operator
     // attestation block — metrics failures never roll back or fail a
     // collab turn.
-    if crate::search::tunables::metrics_enabled() {
-        if let Err(e) = app.db.clear_failed_task_outcome(session_id) {
-            tracing::warn!(session_id = %session_id, error = %e, "metrics: clear_failed_task_outcome failed");
-        }
+    if let Err(e) = app.db.clear_failed_task_outcome(session_id) {
+        tracing::warn!(session_id = %session_id, error = %e, "metrics: clear_failed_task_outcome failed");
     }
 
     // The session is active again post-resume, same bookkeeping
@@ -2792,6 +2792,64 @@ mod tests {
         );
     }
 
+    #[test]
+    fn collab_resume_clears_stale_failed_outcome_when_metrics_are_disabled() {
+        let _g = crate::metrics::METRICS_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        std::env::remove_var("IRONMEM_METRICS");
+
+        let app = test_app();
+        let sid = start_session(&app);
+        drive_to_tooling_coding_failed(&app, &sid);
+
+        let before = app.db.get_task_outcome(&sid).unwrap().unwrap();
+        assert_eq!(before.outcome.as_deref(), Some("failed"));
+        assert!(before.done_at.is_some());
+
+        std::env::set_var("IRONMEM_METRICS", "0");
+        handle_collab_resume(&app, &json!({ "session_id": sid, "agent": "codex" })).unwrap();
+        std::env::remove_var("IRONMEM_METRICS");
+
+        let after = app.db.get_task_outcome(&sid).unwrap().unwrap();
+        assert_eq!(after.outcome, None);
+        assert_eq!(after.done_at, None);
+    }
+
+    #[test]
+    fn collab_resume_allows_restored_phase_completion_and_clears_recovery_state() {
+        let app = test_app();
+        let sid = start_session(&app);
+        drive_to_tooling_coding_failed(&app, &sid);
+
+        handle_collab_resume(&app, &json!({ "session_id": sid, "agent": "codex" })).unwrap();
+
+        // The resumed Codex owner completes the restored implementation phase.
+        // This exercises the tool-level turn gate and delegated-completion
+        // override together, rather than only asserting the resume snapshot.
+        send(
+            &app,
+            &sid,
+            "codex",
+            "implementation_done",
+            r#"{"head_sha":"resumed-implementation-head"}"#,
+        );
+
+        let after = app.db.collab_load_session_record(&sid).unwrap().session;
+        assert_eq!(after.phase, Phase::CodeReviewFixGlobalPending);
+        assert_eq!(after.current_owner, crate::collab::Agent::Codex);
+        assert_eq!(
+            after.last_head_sha.as_deref(),
+            Some("resumed-implementation-head")
+        );
+        assert_eq!(after.coding_failure, None);
+        assert_eq!(after.pending_failure, None);
+        assert_eq!(after.recovery_phase, None);
+        assert_eq!(after.recovery_owner, None);
+        assert_eq!(after.recovery_origin_owner, None);
+        assert_eq!(after.recovery_attempts, 0);
+    }
+
     /// A stale predecessor process — one whose cached generation for the
     /// resuming agent predates a successor claiming that agent's handoff
     /// token — is rejected by the same generation-lease guard every other
@@ -3210,5 +3268,29 @@ mod tests {
         let after = handle_collab_status(&app, &json!({ "session_id": sid })).unwrap();
         assert_eq!(after["phase"], json!("CodeReviewLocalPending"));
         assert_eq!(after["pending_failure"], Value::Null);
+    }
+
+    #[test]
+    fn codex_cannot_report_dispatch_failure_while_claude_owns_the_turn() {
+        let app = test_app();
+        let sid = start_session(&app);
+        drive_to_implement(&app, &sid);
+
+        let err = handle_collab_send(
+            &app,
+            &json!({
+                "session_id": sid,
+                "sender": "codex",
+                "topic": "failure_report",
+                "content": r#"{"coding_failure":"codex_dispatch_failed: fabricated report"}"#,
+            }),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("not your turn"));
+
+        let after = app.db.collab_load_session_record(&sid).unwrap();
+        assert_eq!(after.session.phase, Phase::CodeImplementPending);
+        assert_eq!(after.session.current_owner, crate::collab::Agent::Claude);
+        assert_eq!(after.session.pending_failure, None);
     }
 }
