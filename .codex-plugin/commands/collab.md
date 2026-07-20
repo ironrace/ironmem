@@ -21,6 +21,18 @@ IronMEM collab protocol. It must behave like Claude's `/collab` command in
 style and rigor, but from the Codex role: one invocation handles one
 Codex-owned action and exits.
 
+**Sandbox note (background dispatch only, informational):** this
+interactive entrypoint never launches another `codex exec` process — only
+Claude dispatches Codex that way. But when Claude *does* dispatch you here
+via a background `codex exec` for this protocol, your `-s workspace-write`
+sandbox additionally includes one extra writable root beyond the checkout:
+the repo's common git directory, added via `--add-dir` so `git
+commit`/`git push` succeed even from inside a linked worktree (a linked
+worktree's `.git` metadata lives outside the worktree directory itself).
+This does not loosen the sandbox mode — it is one added root, nothing more.
+See `.claude-plugin/commands/collab.md`'s "Codex handoff — background
+`codex exec`" step (d) for the exact resolution and rationale.
+
 Before taking action, locate the full Codex protocol prompt at the first
 existing path:
 

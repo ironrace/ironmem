@@ -573,7 +573,7 @@ sequence before building the payload:
 | Phase | What to do (is_my_turn == true) |
 |---|---|
 | `CodeImplementPending` | Owner depends on `implementer`. **Claude is owner** (default or `/collab join --implementer=claude <session_id>`): dispatch the matrix worker `collab-turn-code-implement.md` (mechanical/sonnet) and ingest its ≤3-line verdict; loop. The worker resumes from `ironrace-memory/collab-checkpoints`, scans plan/code state, continues the local `subagent-driven-development` batch with the v3-bridge checkpoint rule, runs pre-send harness gates (no reset — no Codex push to sync), writes `status: batch_complete`, and `collab_send`s `sender="claude"`, `topic="implementation_done"`, `content=<JSON {"head_sha":"<current HEAD>"}>` (payload carries ONLY `head_sha`) on green, or `failure_report` on failure. After send, the phase advances to `CodeReviewFixGlobalPending` (Codex's turn — the new v3 order has Codex run `/pr-review-toolkit:review-pr` on the raw post-implementation diff first). **Codex is owner** (`--implementer=codex`): is_my_turn is false here; dispatch Codex via background `codex exec` (per the Codex handoff section). Codex must resume from ironmem checkpoints, scan the plan/code state, and emit `implementation_done` itself before the bg-exec polling loop detects phase advance. |
-| `CodeReviewFixGlobalPending` | Codex's turn. is_my_turn should be false. If `collab_status` confirms Claude is the owner, exit the loop and report the anomaly. **Log:** `t6_codex_review_dispatched` immediately before launching `codex exec`; Codex's prompt requires `/pr-review-toolkit:review-pr` as the final Codex review pass, followed by parallel fix subagents for confirmed independent findings, before this handoff returns to Claude for `review_local`. **Log:** `t7_codex_review_returned` immediately after the polling loop exits. Both events take structured `phase=CodeReviewFixGlobalPending round=1` metadata — see step d ("Codex handoff") for the exact form. After Codex sends `review_fix_global` the phase advances to `CodeReviewLocalPending` (Claude's audit turn). |
+| `CodeReviewFixGlobalPending` | Codex's turn. is_my_turn should be false. If `collab_status` confirms Claude is the owner, exit the loop and report the anomaly. **Log:** `t6_codex_review_dispatched` immediately before launching `codex exec`; Codex's prompt requires `/pr-review-toolkit:review-pr` as the final Codex review pass, followed by parallel fix subagents for confirmed independent findings, before this handoff returns to Claude for `review_local`. **Log:** `t7_codex_review_returned` immediately after the polling loop exits. Both events take structured `phase=CodeReviewFixGlobalPending round=1` metadata — see step e ("Codex handoff") for the exact form. After Codex sends `review_fix_global` the phase advances to `CodeReviewLocalPending` (Claude's audit turn). |
 | `CodeReviewLocalPending` | Dispatch the matrix worker `collab-turn-review-local.md` (review/opus) and ingest its ≤3-line verdict; loop. The worker runs the pre-send harness (with reset to `last_head_sha` — Codex just pushed at `review_fix_global`), then performs the overlap-mode audit. It runs full `/ultrareview-local` when Codex made fix commits or runtime/Rust files changed, and uses `review_local=reduced` when Codex made no fix commit or the branch diff is docs/config-only. Reduced mode is still an audit: inspect the diff summary, changed files, and Codex commits for protocol drift, docs/config breakage, generated metadata inconsistencies, and security-sensitive configuration; escalate to full `/ultrareview-local` on uncertainty or a substantive finding. Confirmed CRITICAL/HIGH/MEDIUM findings are partitioned into temporary worktrees on unique throwaway branches for parallel fix subagents where safe, merged/cherry-picked back, committed + pushed, and `collab_send`s `sender="claude"`, `topic="review_local"`, `content=<JSON {"head_sha":"<current HEAD>"}>`. **Log:** `t5_review_local_sent`. **Anti-removal:** under v3 ordering the stage audits Codex's `review_fix_global` work plus catches issues both agents missed. Its code-quality lens partially overlaps with Codex's `pr-review-toolkit`-backed branch review but does not fully duplicate it. Removing this stage requires a written overlap audit demonstrating that Codex's `review_fix_global` reviews catch the code-quality issues `/ultrareview-local` would have flagged AND that the audit-of-Codex role is unnecessary. |
 | `CodeReviewFinalPending` | **Auto-create the PR — no user-approval gate** (the diff already passed `review_fix_global` + `review_local`, and a PR is editable and unmerged after creation; do NOT enter Plan Mode here). Dispatch the matrix worker `collab-turn-final-review.md` (review/opus) with `$MODE=compose`: it performs pushed-head proof only (no reset, no gate rerun) by requiring a clean worktree, `HEAD == last_head_sha`, and local HEAD equal to the pushed upstream/origin branch head, then drafts the PR title (under 70 chars) + body (summary + test plan derived from task list + prior gate evidence / pushed-head proof), writes `{"title":"...","body":"..."}` to a drawer, and returns `{drawer_id, ≤3-line summary}`. If the proof fails, the worker returns a blocker instead of running tests. Then dispatch `collab-turn-submit.md` (mechanical/sonnet) **directly** with `$TOPIC=final_review` `$ARTIFACT_REF=<drawer_id>` (drawer immutability is the integrity anchor — the approved drawer's content cannot change, so no hash recompute is needed): it reads the title/body artifact, then runs a plain `gh pr create --base <base_branch> --head <current branch> --title <title> --body <body>` (a **ready** PR — no `--draft`), and on failure sends `failure_report` `coding_failure: "pr_create_failed: <error>"` (no silent retry). On success, **Log:** `t8_pr_created <pr_url>`, the worker captures `pr_url` and `collab_send`s `sender="claude"`, `topic="final_review"`, `content=<JSON {"head_sha":"<current HEAD>","pr_url":"<https url>"}>`. **Log:** `t9_final_review_sent`. Session advances directly to `CodingComplete`. **Log:** `t10_session_complete CodingComplete`. Exit loop. |
 
@@ -643,6 +643,15 @@ Match **both** `Phase` and `implementer` columns when looking up a row:
 `CodeImplementPending` rows are distinguished only by `implementer` —
 do not stop at the first phase match.
 
+**`--add-dir` applies uniformly across every row above, not per-row.**
+Whether the extra writable root is needed depends only on `repo_path`'s
+worktree topology (worktree checkout vs. plain checkout), never on which
+phase or model a row selects — so it is not a matrix column. Every row that
+actually dispatches Codex (i.e. every row except the `implementer=="claude"`
+one, which never launches `codex exec` at all) gets the identical
+resolve-quote-append treatment from step (d)/(f) of the Codex handoff
+procedure below.
+
 Read `phase` and `implementer` from the `collab_status` you fetched at
 the top of the dispatch step; branch on them when selecting the prompt
 file, model, and reasoning effort below.
@@ -710,7 +719,55 @@ c. Substitute `$ARGUMENTS` in the selected file with `join <session_id>`.
    fix everything") collapses the review into a rubber-stamp and defeats
    the point of an independent second pass.
 
-d. **Log the appropriate timing event** immediately before launch. Use the
+d. **Resolve the Codex writable root — pre-dispatch, before any logging or
+   launch.** Every Codex-owned dispatch (both launch lines in step (f), and
+   the dispatch-tuning matrix's `CodeImplementPending`/`"codex"` row above)
+   needs this. Run:
+   ```bash
+   git -C <repo_path> rev-parse --path-format=absolute --git-common-dir
+   ```
+   - **On success**, shell-quote the printed path (so a path containing
+     spaces cannot break the launch command) and hold it as
+     `<common-gitdir>` for step (f). Then decide whether it is needed at
+     all — the **omit-when-inside condition**: resolve `<common-gitdir>`
+     and `<repo_path>` to absolute form and compare. If `<common-gitdir>`
+     equals `<repo_path>`, or starts with `<repo_path>` followed by a path
+     separator, the common gitdir already lives inside the writable root
+     (a plain, non-worktree checkout where `.git` sits directly under
+     `repo_path`) — do **not** append `--add-dir` for this dispatch; the
+     flag would be redundant. Otherwise (the linked-worktree case — see the
+     "D1" rationale below), `--add-dir "<common-gitdir>"` is REQUIRED on
+     both launch lines in step (f).
+   - **On failure** (non-zero exit — e.g. `<repo_path>` is not actually a
+     git working tree, or some other git-level error), do **not** proceed
+     to dispatch. Send `collab_send(sender="claude", topic="failure_report",
+     content=<JSON {"coding_failure":"sandbox_denied: git rev-parse
+     --git-common-dir failed: <captured stderr>"}>)` and abort the
+     dispatcher loop for this turn. `sandbox_denied:` is one of the six
+     recoverable tooling-failure prefixes (see the failure classification
+     module) — reporting it this way keeps a broken `git` resolution a
+     RECOVERABLE tooling failure with a clear diagnostic trail, instead of
+     silently dispatching Codex without `--add-dir` and letting it fail
+     downstream with an unexplained `git commit`/`git push` permission
+     error that looks like a fresh, unclassified problem.
+
+   **Why exactly this one root, and nothing broader (D1 fix):** a linked
+   worktree's `.git` is a file pointing at
+   `<main-repo>/.git/worktrees/<name>/`; that per-worktree gitdir (where
+   `index.lock` lands) sits underneath the common gitdir this command
+   resolves, and the shared object/ref database Codex's `commit`/`push`
+   turn writes to lives there too — so this single root covers both writes.
+   Two broader alternatives were rejected: running the Codex turn from the
+   main checkout instead of the worktree (breaks worktree isolation and
+   races the dispatcher's own checkout), and `-s danger-full-access`
+   (removes the sandbox wholesale to fix access to one directory).
+   **`-s workspace-write` itself is unchanged by this fix** — these launch
+   lines do not pass an explicit `-s`/`--sandbox` flag at all today (the
+   Codex CLI's own default sandbox mode applies); `--add-dir` only adds one
+   extra writable root under whatever sandbox mode is already in effect, it
+   does not loosen the sandbox mode.
+
+e. **Log the appropriate timing event** immediately before launch. Use the
    structured-metadata form (`<event_name> phase=<phase> round=<N>`); fill
    `phase=` from `collab_status.phase` and `round=` from
    `collab_status.review_round + 1` for plan/code reviews (or `round=1` for
@@ -720,20 +777,29 @@ d. **Log the appropriate timing event** immediately before launch. Use the
    - For `PlanParallelDrafts`: **Log:** `t2_codex_dispatched phase=PlanParallelDrafts round=1`
    - For `PlanCodexReviewPending`: **Log:** `t2_codex_dispatched phase=PlanCodexReviewPending round=1`
 
-e. Launch via Bash with `run_in_background: true`. Pass the model and
-   reasoning effort selected above explicitly:
+f. Launch via Bash with `run_in_background: true`. Pass the model and
+   reasoning effort selected above explicitly, plus `--add-dir
+   "<common-gitdir>"` from step (d) whenever the omit-when-inside condition
+   did not apply (shown here as `[--add-dir "<common-gitdir>"]`, included
+   or omitted per that condition — not literal brackets):
    ```bash
    # CodeImplementPending+codex:
-   cd <repo_path> && codex exec -m gpt-5.6-luna -c model_reasoning_effort=max - < /tmp/codex-prompt-${session_id}.md > /tmp/codex-out-${session_id}.log 2>&1
+   cd <repo_path> && codex exec -m gpt-5.6-luna -c model_reasoning_effort=max [--add-dir "<common-gitdir>"] - < /tmp/codex-prompt-${session_id}.md > /tmp/codex-out-${session_id}.log 2>&1
 
    # All other Codex-owned phases:
-   cd <repo_path> && codex exec -m gpt-5.6-terra -c model_reasoning_effort=high - < /tmp/codex-prompt-${session_id}.md > /tmp/codex-out-${session_id}.log 2>&1
+   cd <repo_path> && codex exec -m gpt-5.6-terra -c model_reasoning_effort=high [--add-dir "<common-gitdir>"] - < /tmp/codex-prompt-${session_id}.md > /tmp/codex-out-${session_id}.log 2>&1
    ```
    > The current Codex CLI accepts `-` as the prompt source and reads the
    > resolved prompt from stdin. Keep this stdin form as the canonical launch
    > path; do not use the unsupported `--prompt-file` flag.
+   >
+   > Both launch lines take the identical `--add-dir` treatment: same
+   > resolved `<common-gitdir>` value, both derived from the same
+   > `repo_path` for this dispatch (there is only one worktree per collab
+   > session, so step (d) resolves it once per dispatch and both branches
+   > above reuse that one value).
 
-f. **Polling loop** — the dispatcher's interactive surface during this phase.
+g. **Polling loop** — the dispatcher's interactive surface during this phase.
    Poll on a bounded backoff curve (NOT a fixed cadence — long silent
    grinds churn the dispatcher without producing new information):
 
@@ -768,12 +834,12 @@ f. **Polling loop** — the dispatcher's interactive surface during this phase.
    1. `collab_status.phase` advances to a Claude-owned phase →
       Codex emitted its message cleanly. **SUCCESS.**
       **Log the appropriate return event** with structured metadata
-      (same `phase=` / `round=` values used at dispatch in step d):
+      (same `phase=` / `round=` values used at dispatch in step e):
       - For `CodeImplementPending`: **Log:** `t3_codex_returned phase=CodeImplementPending round=1`
       - For `CodeReviewFixGlobalPending`: **Log:** `t7_codex_review_returned phase=CodeReviewFixGlobalPending round=1`
       - For `PlanParallelDrafts`: **Log:** `t3_codex_returned phase=PlanParallelDrafts round=1`
       - For `PlanCodexReviewPending`: **Log:** `t3_codex_returned phase=PlanCodexReviewPending round=1`
-      Continue to step g.
+      Continue to step h.
 
    2. `collab_status.phase` reaches `CodingFailed` →
       Codex emitted `failure_report`. **ABORT** — surface failure to user,
@@ -797,7 +863,7 @@ f. **Polling loop** — the dispatcher's interactive surface during this phase.
    While polling, emit a one-line progress update each iteration
    (`[codex bg] <last stdout line>`) so the user can confirm Codex is alive.
 
-g. Resume the normal dispatch loop. The next `collab_status` poll will
+h. Resume the normal dispatch loop. The next `collab_status` poll will
    see a Claude-owned phase or a terminal condition.
 
 **Failure modes:**
