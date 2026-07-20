@@ -48,6 +48,13 @@ pub fn create_session(
     // no application-layer string validation is needed here. The DB CHECK
     // constraint on the column remains as defense-in-depth against direct
     // SQL writes.
+    //
+    // Recovery-state columns (pending_failure, failed_from_phase,
+    // recovery_phase, recovery_owner, recovery_origin_owner,
+    // recovery_attempts; migration 015) are deliberately omitted here — they
+    // have no `DEFAULT` and are all nullable, so a fresh row lands on NULL,
+    // which `load_session_record` maps to `None`/`0` exactly like a legacy
+    // pre-015 row. `save_session` is the only writer for these fields.
     conn.execute(
         "INSERT INTO collab_sessions (id, repo_path, branch, task, implementer)
          VALUES (?1, ?2, ?3, ?4, ?5)",
