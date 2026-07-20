@@ -1282,9 +1282,13 @@ pub(super) fn handle_collab_end(app: &App, args: &Value) -> Result<Value, Memory
 /// surfaces `CollabError::NotResumable` as a validation error via
 /// `collab_error_to_memory_error`.
 ///
-/// TODO(task 10): this is plumbing only. Clearing the stale `outcome=failed`
-/// task_outcomes row that `failure_report` wrote before this resume is Task
-/// 10's job, touching this same function again.
+/// After the protocol transaction commits, this also clears any stale
+/// `outcome='failed'`/`done_at` row that an earlier terminal `failure_report`
+/// wrote for this session (METRICS_SPEC §5.4 amendment, task 10) — a
+/// resumed session must be able to complete normally afterward. The clear is
+/// best-effort metrics bookkeeping, same as every other lifecycle write in
+/// this module: gated on `IRONMEM_METRICS`, non-fatal, and run after commit
+/// so a metrics failure can never roll back or fail a collab turn.
 pub(super) fn handle_collab_resume(app: &App, args: &Value) -> Result<Value, MemoryError> {
     let session_id = require_str(args, "session_id")?;
     let agent = require_agent(require_str(args, "agent")?)?;
@@ -1321,6 +1325,17 @@ pub(super) fn handle_collab_resume(app: &App, args: &Value) -> Result<Value, Mem
         )?;
         Ok((next.phase, next.current_owner))
     })?;
+
+    // Clear the stale `outcome='failed'`/`done_at` row that `failure_report`
+    // wrote before this resume (METRICS_SPEC §5.4 amendment, task 10). Runs
+    // after the transaction commits, same as `handle_collab_end`'s operator
+    // attestation block — metrics failures never roll back or fail a
+    // collab turn.
+    if crate::search::tunables::metrics_enabled() {
+        if let Err(e) = app.db.clear_failed_task_outcome(session_id) {
+            tracing::warn!(session_id = %session_id, error = %e, "metrics: clear_failed_task_outcome failed");
+        }
+    }
 
     // The session is active again post-resume, same bookkeeping
     // `handle_collab_send` performs on every successful send.
@@ -1530,8 +1545,15 @@ mod tests {
         );
     }
 
+    /// Renamed from `failure_report_marks_outcome_failed` (task 10): since
+    /// task 4, `failure_report` has two distinct behaviors — a recoverable
+    /// (`Tooling`-classified) report leaves `outcome`/`done_at` untouched,
+    /// while a terminal report sets them. This test exercises the TERMINAL
+    /// branch only (`subagent_failure:` is not one of the six recoverable
+    /// prefixes — see `recoverable_failure_report_leaves_task_outcome_untouched`
+    /// for the recoverable counterpart).
     #[test]
-    fn failure_report_marks_outcome_failed() {
+    fn terminal_failure_report_marks_outcome_failed() {
         let _g = metrics_on_guard();
         let app = test_app();
         let sid = start_session(&app);
@@ -1552,6 +1574,40 @@ mod tests {
             "failure_report must set outcome=failed"
         );
         assert!(row.done_at.is_some(), "failure_report must set done_at");
+    }
+
+    /// Counterpart to `terminal_failure_report_marks_outcome_failed` (task
+    /// 10): a RECOVERABLE (`Tooling`-classified) `failure_report` leaves
+    /// `session.phase` unchanged (established in task 4), so
+    /// `record_task_outcome_transition`'s `before == after` early return
+    /// fires before the `CodingFailed` match arm is ever reached — the
+    /// `task_outcomes` row must stay untouched (`outcome`/`done_at` still
+    /// `None`).
+    #[test]
+    fn recoverable_failure_report_leaves_task_outcome_untouched() {
+        let _g = metrics_on_guard();
+        let app = test_app();
+        let sid = start_session(&app);
+        drive_to_implement(&app, &sid);
+
+        // git_commit_failed: is one of the six Task-1 recoverable prefixes.
+        send(
+            &app,
+            &sid,
+            "claude",
+            "failure_report",
+            r#"{"coding_failure":"git_commit_failed: index.lock EPERM"}"#,
+        );
+
+        let row = app.db.get_task_outcome(&sid).unwrap().unwrap();
+        assert_eq!(
+            row.outcome, None,
+            "a recoverable report must not set outcome"
+        );
+        assert_eq!(
+            row.done_at, None,
+            "a recoverable report must not set done_at"
+        );
     }
 
     #[test]
@@ -1876,8 +1932,12 @@ mod tests {
 
     // ── G.4: collab_end from CodingFailed leaves outcome 'failed' ─────────────
 
+    /// Renamed from `failure_report_marks_outcome_failed_and_end_does_not_overwrite`
+    /// (task 10) for the same reason as `terminal_failure_report_marks_outcome_failed`
+    /// above: `subagent_failure:` drives the TERMINAL branch of `failure_report`,
+    /// not the recoverable one — the name now says so explicitly.
     #[test]
-    fn failure_report_marks_outcome_failed_and_end_does_not_overwrite() {
+    fn terminal_failure_report_marks_outcome_failed_and_end_does_not_overwrite() {
         let _g = metrics_on_guard();
         let app = test_app();
         let sid = start_session(&app);
@@ -2694,6 +2754,40 @@ mod tests {
             after.session.failed_from_phase,
             Some(Phase::CodeImplementPending),
             "failed_from_phase is a historical record and survives a successful resume"
+        );
+    }
+
+    /// task 10: `collab_resume` clears the stale `outcome='failed'`/`done_at`
+    /// row that the ceiling-degrade transition into `CodingFailed` wrote via
+    /// `record_task_outcome_transition` (the degrade DOES move `session.phase`
+    /// from `CodeImplementPending` to `CodingFailed`, unlike a plain
+    /// recoverable report, so the terminal write fires here same as any
+    /// other transition into `CodingFailed`).
+    #[test]
+    fn collab_resume_clears_stale_failed_outcome() {
+        let _g = metrics_on_guard();
+        let app = test_app();
+        let sid = start_session(&app);
+        drive_to_tooling_coding_failed(&app, &sid);
+
+        let row = app.db.get_task_outcome(&sid).unwrap().unwrap();
+        assert_eq!(
+            row.outcome.as_deref(),
+            Some("failed"),
+            "ceiling-degrade into CodingFailed must set outcome=failed"
+        );
+        assert!(row.done_at.is_some(), "ceiling-degrade must set done_at");
+
+        handle_collab_resume(&app, &json!({ "session_id": sid, "agent": "codex" })).unwrap();
+
+        let row = app.db.get_task_outcome(&sid).unwrap().unwrap();
+        assert_eq!(
+            row.outcome, None,
+            "collab_resume must clear the stale failed outcome"
+        );
+        assert_eq!(
+            row.done_at, None,
+            "collab_resume must clear the stale done_at"
         );
     }
 
