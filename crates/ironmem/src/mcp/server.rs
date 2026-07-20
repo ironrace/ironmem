@@ -2823,6 +2823,48 @@ mod tests {
         );
     }
 
+    /// Pins `release_barrier`'s seq-match guard directly: deleting it (making
+    /// every release unconditionally clear the barrier and report success)
+    /// leaves the rest of this module's tests green — see
+    /// `a_same_tick_settlement_processes_completion_before_the_stale_release_signal`'s
+    /// doc comment, whose own regression claim about this guard does not
+    /// actually hold under mutation testing, because nothing happens to be
+    /// queued at the moment its stale signal is processed. This test calls the
+    /// pure function directly against a barrier already owned by a DIFFERENT
+    /// seq, so it fails immediately, and only, if the guard regresses.
+    #[test]
+    fn release_barrier_ignores_a_stale_or_mismatched_seq() {
+        // A different request (seq 7) currently owns the barrier.
+        let mut mutation_barrier: Option<u64> = Some(7);
+
+        // A stale/duplicate release for some OTHER seq (5) must be a no-op: it
+        // must NOT clear the real owner's barrier, and must report that it did
+        // not release anything.
+        let released = release_barrier(&mut mutation_barrier, 5);
+        assert!(!released, "a mismatched seq must not report a release");
+        assert_eq!(
+            mutation_barrier,
+            Some(7),
+            "a mismatched seq must not clear a DIFFERENT owner's barrier"
+        );
+
+        // The real owner's OWN release still works normally.
+        let released = release_barrier(&mut mutation_barrier, 7);
+        assert!(released, "the actual owner's seq must release successfully");
+        assert_eq!(mutation_barrier, None);
+
+        // Once cleared, a SECOND release attempt for the same (now-stale) seq
+        // must also be a no-op — this is the literal "duplicate release" case
+        // (e.g. an early-release signal arriving after the completion arm
+        // already released the same seq).
+        let released_again = release_barrier(&mut mutation_barrier, 7);
+        assert!(
+            !released_again,
+            "a duplicate release for an already-cleared seq must not report success"
+        );
+        assert_eq!(mutation_barrier, None);
+    }
+
     /// Task 3: dispatching a batch of token-bearing waits that straddles
     /// `MAX_EARLY_RELEASED_WAITS` must not stall a read pipelined behind them.
     ///
@@ -3452,11 +3494,18 @@ mod tests {
     /// (Task 5) uses — so the wait's own first snapshot read already
     /// settles.
     ///
-    /// Regression this catches: if the stale early-release signal were ever
-    /// allowed to re-run `start_next_queued_mutation` or otherwise act, a 4th,
-    /// spurious response could appear on the wire, or `mutations_blocked`
-    /// bookkeeping could be double-processed — either would show up as an
-    /// unexpected extra line arriving after the three expected ids below.
+    /// What this test actually pins: the completion-before-signal ORDERING
+    /// (the three ids below, in that order) and that the stale signal
+    /// produces no observable fourth response. It does NOT, by itself, prove
+    /// `release_barrier`'s seq-match guard is load-bearing: mutation testing
+    /// shows that deleting that guard entirely leaves this test green too,
+    /// because `queued_mutations` is already empty by the time the stale
+    /// signal is drained here, so an unconditional clear-and-drain is a no-op
+    /// in this specific construction. The guard's regression coverage lives
+    /// in the direct unit test `release_barrier_ignores_a_stale_or_mismatched_seq`,
+    /// which calls `release_barrier` against a barrier already owned by a
+    /// DIFFERENT seq and confirms a mismatched or duplicate release is
+    /// rejected.
     #[tokio::test(flavor = "multi_thread")]
     async fn a_same_tick_settlement_processes_completion_before_the_stale_release_signal() {
         #[allow(clippy::arc_with_non_send_sync)]
