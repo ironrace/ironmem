@@ -147,13 +147,14 @@ pub(super) fn session_record_json(record: &SessionRecord) -> Value {
         "pr_url": record.session.pr_url.as_deref(),
         "coding_failure": record.session.coding_failure.as_deref(),
         // Recovery-state exposure (issue #197 task 9). `pending_failure` is
-        // the diagnostic for an in-flight *recoverable* failure (never set
-        // alongside a non-null `coding_failure` — see the transition table
-        // in the plan doc); `failed_from_phase`/`recovery_phase` serialize
-        // via `Phase::to_string()` like the top-level `phase` field.
-        // `recovery_origin_owner` is deliberately NOT exposed here — it is
-        // an audit-only field the plan did not ask to surface in
-        // `collab_status`.
+        // the diagnostic for an in-flight *recoverable* failure — set only
+        // by the `Tooling` arm of `apply_event`'s `FailureReport` handling
+        // (state_machine/mod.rs), which never also sets `coding_failure`;
+        // the two are mutually exclusive by construction, enforced there
+        // and covered by `state_machine::tests`. `failed_from_phase`/
+        // `recovery_phase` serialize via `Phase::to_string()` like the
+        // top-level `phase` field. `recovery_origin_owner` is deliberately
+        // NOT exposed here — see its doc comment on `CollabSession` for why.
         "pending_failure": record.session.pending_failure.as_deref(),
         "failed_from_phase": record.session.failed_from_phase.map(|p| p.to_string()),
         "recovery_phase": record.session.recovery_phase.map(|p| p.to_string()),

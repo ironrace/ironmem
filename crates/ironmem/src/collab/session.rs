@@ -77,6 +77,16 @@ pub struct CollabSession {
     pub recovery_owner: Option<Agent>,
     /// Which `Agent` owned the session when the failure occurred, so
     /// recovery can hand control back. Same encoding as `recovery_owner`.
+    ///
+    /// **Audit-only — deliberately not exposed in `collab_status` or the
+    /// session-handoff block.** `mcp/tools/collab_session.rs`'s
+    /// `session_record_json` and `mcp/tools/handoff.rs`'s
+    /// `compose_handoff_block` both surface `recovery_owner` (who to hand
+    /// the turn to) but intentionally omit this field, since a dispatcher
+    /// routing the recovery turn only needs the destination, not the
+    /// origin. Before adding it to either surface, re-check whether a real
+    /// caller need has emerged — this omission was a deliberate scope
+    /// decision (issue #197 task 9), not an oversight.
     pub recovery_origin_owner: Option<Agent>,
     /// How many recovery attempts have been made so far.
     ///
