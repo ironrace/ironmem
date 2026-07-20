@@ -1318,11 +1318,11 @@ fn test_delegated_completion_override_is_one_turn_only() {
 fn test_delegated_completion_override_rejects_non_recovery_owner() {
     // The override is exclusive to `recovery_owner`. Claude flags a Codex
     // MCP dispatch failure off-turn (`codex_dispatch_failed:` is both
-    // off-turn-admissible and recoverable per `RECOVERABLE_FAILURE_PREFIXES`),
-    // which hands recovery to the counterpart of the *reporter* — Claude —
-    // i.e. back to Codex, not to Claude itself. Claude ends up as
-    // `recovery_origin_owner` but not `recovery_owner`, so Claude cannot use
-    // the override to complete `CodeReviewFixGlobal` in Codex's place.
+    // off-turn-admissible and recoverable per `RECOVERABLE_FAILURE_PREFIXES`).
+    // Recovery must go to the counterpart of the interrupted turn's owner,
+    // not to the counterpart of the reporting observer: otherwise the
+    // dispatch failure would immediately hand control back to unavailable
+    // Codex instead of letting Claude complete Codex's turn.
     let s = locked_session("hf");
     let s = submit_task_list(&s, "hf", 1);
     let s = apply_event(
@@ -1344,19 +1344,19 @@ fn test_delegated_completion_override_rejects_non_recovery_owner() {
         },
     )
     .unwrap();
-    assert_eq!(s.recovery_owner, Some(Agent::Codex));
-    assert_eq!(s.recovery_origin_owner, Some(Agent::Claude));
+    assert_eq!(s.recovery_owner, Some(Agent::Claude));
+    assert_eq!(s.recovery_origin_owner, Some(Agent::Codex));
     assert_eq!(s.recovery_phase, Some(Phase::CodeReviewFixGlobalPending));
 
-    let err = apply_event(
+    let s = apply_event(
         &s,
         Agent::Claude,
         &CollabEvent::CodeReviewFixGlobal {
             head_sha: "g1".to_string(),
         },
     )
-    .unwrap_err();
-    assert!(matches!(err, CollabError::NotYourTurn { .. }));
+    .unwrap();
+    assert_eq!(s.phase, Phase::CodeReviewLocalPending);
 }
 
 #[test]

@@ -274,6 +274,13 @@ Claude's dispatch will still complete cleanly.
 For every Codex-owned coding phase, execute this pre-send harness sequence
 before building the payload:
 
+**Recovery override:** if `collab_status.pending_failure` is non-null and
+`current_owner == "codex"`, you own recovery of an interrupted turn even when
+the phase table normally names Claude. Preserve and inspect the existing
+working-tree diff; do **not** fetch, checkout, or `reset --hard` before that
+inspection. Run the interrupted phase's gates, commit + push the recovered
+work, then send that phase's normal completion event exactly once.
+
 **Pre-send Harness Sequence (v3 turns only):**
 1. `collab_status(session_id)` → read `last_head_sha`, `base_sha`,
    `repo_path`, and `task_list`.
@@ -316,9 +323,9 @@ working-tree reset on the common case where Codex is already at the right SHA
 | Phase | What to do (is_my_turn == true) |
 |---|---|
 | `CodeImplementPending` | Owner depends on `implementer`. If `implementer == "claude"`, this is Claude's batch turn — exit. If `implementer == "codex"`, run the batch implementation action below, resuming from ironmem checkpoints and scanning the plan/code state before editing. |
-| `CodeReviewLocalPending` | Claude's turn. Exit. |
+| `CodeReviewLocalPending` | Claude's turn unless `pending_failure` names Codex as the recovery owner; in that recovery case, follow the recovery override and send `review_local`. |
 | `CodeReviewFixGlobalPending` | **Run pre-send harness.** This is your only mandatory v3 coding review turn and the final Codex review before Claude's `review_local` audit (full `/ultrareview-local` unless reduced-mode criteria apply) — invoke `/pr-review-toolkit:review-pr` against the full branch diff (`git diff <base_sha>..<last_head_sha>`) alongside the approved Superpowers task markdown at `plan_file_path` when present. Pass the collab `base_sha` and `last_head_sha` as the review target; do not let the toolkit silently substitute a different base branch. In full-flow sessions, read `plan_file_path` from the canonicalized `task_list` JSON in `collab_status`. In shortcut sessions where `task_list` is null, first search ironmem checkpoints for the same `repo_path`/`branch`, read any referenced plan, and scan the current code/diff to determine what is already complete; if no checkpoint exists, fall back to nearby Superpowers plan docs plus the branch diff. Use the toolkit as a read-only finding pass for cross-task consistency, architectural drift, missed acceptance criteria, correctness, tests, docs, security, performance, and dependency risk. Then verify findings yourself and group confirmed issues into non-overlapping fix clusters. For independent clusters, create temporary worktrees on unique throwaway branches from the same review head, dispatch fix subagents in parallel, and have each subagent own exactly one cluster. Merge/cherry-pick the resulting fix commits back onto the collab branch, resolve conflicts, run gates, commit + push. Fix overlapping/risky clusters sequentially. Send `collab_send` with `sender="codex"`, `topic="review_fix_global"`, `content=<JSON {"head_sha":"<current HEAD>"}>`. |
-| `CodeReviewFinalPending` | Claude's turn. Exit. |
+| `CodeReviewFinalPending` | Claude's turn unless `pending_failure` names Codex as the recovery owner; in that recovery case, follow the recovery override and send `final_review`. |
 
 ### Batch implementation (codex-implementer)
 
@@ -529,10 +536,11 @@ All existing v3 anti-puppeteering rules apply unchanged.
 - **`head_sha` in every v3 payload is the current `HEAD` AFTER any commit
   and push you made on this turn.** If you made no commit, echo back
   `last_head_sha`.
-- **Branch-drift carve-out:** `failure_report` may be sent by either agent
-  at any time during a coding-active phase, independent of
-  `current_owner`. A `coding_failure` prefixed `"branch_drift:"` is the
-  canonical drift signal.
+- **Off-turn failure carve-out:** `failure_report` may be sent by either
+  agent only for `branch_drift:` or `codex_dispatch_failed:` with real
+  detail; all other reports require `current_owner`. `branch_drift:` is
+  terminal; `codex_dispatch_failed:` is recoverable and leaves recovery with
+  the counterpart of the interrupted owner.
 - **Recoverable vs terminal `failure_report`.** The server classifies every
   `coding_failure` string. Six prefixes are recoverable ("Tooling") when
   followed by >=1 byte of real detail after the colon:
@@ -658,7 +666,8 @@ An unattended `claude -p` successor needs at minimum:
   `mcp__ironmem__collab_set_implementer`,
   `mcp__ironmem__collab_register_caps`,
   `mcp__ironmem__collab_wait_my_turn`, `mcp__ironmem__collab_end`,
-  `mcp__ironmem__session_handoff`, `mcp__ironmem__collab_status`
+  `mcp__ironmem__collab_resume`, `mcp__ironmem__session_handoff`,
+  `mcp__ironmem__collab_status`
 - `Bash(claude -p "join ironmem collab *":*)` — re-spawn a further successor if
   needed (scope to the join-command form; avoid the broader `Bash(claude -p:*)`)
 - Git bash operations as needed for implementation tasks

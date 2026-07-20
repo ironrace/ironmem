@@ -60,6 +60,12 @@ implementation or review default.
 
 Execute these steps before building any send payload:
 
+**Recovery override:** if `pending_failure` is non-null, this invocation owns
+the interrupted `CodeImplementPending` turn. Preserve and inspect the existing
+working-tree diff; do **not** fetch, checkout, or `reset --hard` before that
+inspection. Run the phase's gates, commit + push the recovered work, and send
+`implementation_done` exactly once.
+
 1. `collab_status(session_id)` → read `last_head_sha`, `base_sha`,
    `repo_path`, and `task_list`.
 2. `cd` to `repo_path` (the session's target repo — may not be your cwd).
@@ -270,10 +276,11 @@ via its Codex MCP tool when the session needs you again.
 - **`head_sha` in every v3 payload is the current `HEAD` AFTER any commit
   and push you made on this turn.** If you made no commit, echo back
   `last_head_sha`.
-- **Branch-drift carve-out:** `failure_report` may be sent by either agent
-  at any time during a coding-active phase, independent of
-  `current_owner`. A `coding_failure` prefixed `"branch_drift:"` is the
-  canonical drift signal.
+- **Off-turn failure carve-out:** `failure_report` may be sent by either
+  agent only for `branch_drift:` or `codex_dispatch_failed:` with real
+  detail; all other reports require `current_owner`. `branch_drift:` is
+  terminal; `codex_dispatch_failed:` is recoverable and leaves recovery with
+  the counterpart of the interrupted owner.
 - **Recoverable vs terminal `failure_report`.** The server classifies every
   `coding_failure` string. Six prefixes are recoverable ("Tooling") when
   followed by >=1 byte of real detail after the colon:

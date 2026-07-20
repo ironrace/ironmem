@@ -382,11 +382,21 @@ pub fn apply_event(
                         next.phase = Phase::CodingFailed;
                         next.current_owner = actor;
                     } else {
-                        let owner = counterpart(actor);
+                        // Most tooling reports come from the interrupted
+                        // turn's owner, so this normally equals
+                        // `counterpart(actor)`. `codex_dispatch_failed:` is
+                        // deliberately off-turn-admissible, though: Claude
+                        // can report an unavailable Codex turn. Derive the
+                        // recovery owner from the interrupted owner rather
+                        // than the observing reporter so that case hands the
+                        // work to Claude instead of back to unavailable
+                        // Codex.
+                        let interrupted_owner = session.current_owner;
+                        let owner = counterpart(interrupted_owner);
                         next.pending_failure = Some(coding_failure.clone());
                         next.recovery_phase = Some(*phase);
                         next.recovery_owner = Some(owner);
-                        next.recovery_origin_owner = Some(actor);
+                        next.recovery_origin_owner = Some(interrupted_owner);
                         next.recovery_attempts = session.recovery_attempts.saturating_add(1);
                         next.current_owner = owner;
                     }

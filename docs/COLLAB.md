@@ -527,7 +527,7 @@ the empty string.
 
 | Phase | Owner | Event | Next |
 |---|---|---|---|
-| *any coding-active phase* | either | `FailureReport{coding_failure}` classifying **Tooling** | same phase; `current_owner` flips to the counterpart |
+| *any coding-active phase* | owner (or the two explicit off-turn prefixes below) | `FailureReport{coding_failure}` classifying **Tooling** | same phase; `current_owner` becomes the counterpart of the interrupted turn owner |
 | *any coding-active phase* | either | `FailureReport{coding_failure}` classifying **Terminal** | `CodingFailed` (terminal) |
 
 `collab_end` is **rejected** in every coding-active phase
@@ -564,7 +564,13 @@ server does not enforce either:
   hoping it magically works. Report once per genuine attempt and let the
   counterpart recover.
 
-The recovery owner (the agent `current_owner` now names) MUST:
+For an ordinary owner-reported failure, the recovery owner is the reporter's
+counterpart. `branch_drift:` and `codex_dispatch_failed:` are the only
+off-turn-admissible prefixes; when Claude observes an unavailable Codex turn
+and reports `codex_dispatch_failed:`, recovery stays with Claude (the
+counterpart of the interrupted Codex owner), rather than being handed back to
+the unavailable process. The recovery owner (the agent `current_owner` now
+names) MUST:
 
 1. Inspect the preserved diff/working-tree state the reporter left behind.
 2. Run whatever gates apply to the interrupted phase itself — the protocol
@@ -868,10 +874,10 @@ Eligible only when the session's stored `coding_failure` classifies
 `NotResumable { reason }`:
 
 - A **Terminal**-classified `coding_failure` (unrecognized cause,
-  `branch_drift:`, `subagent_failure:`, or a Tooling report that broke the
-  retry ceiling) is never resumable — `reason` states this as a fact about
-  the stored classification, never a guess about what happened during
-  coding.
+  `branch_drift:`, or `subagent_failure:`) is never resumable — `reason`
+  states this as a fact about the stored classification, never a guess about
+  what happened during coding. A Tooling report that broke the retry ceiling
+  remains Tooling and is resumable.
 - A session whose `failed_from_phase` is `NULL` predates this feature;
   `reason` says the session "predates resume support."
 
@@ -911,7 +917,7 @@ byte-identically reuses) a one-time `handoff_token` and sets
 the active generation. A successor presents the `handoff_token` on its first
 actor-bearing mutating/binding collab call (`collab_send`, `collab_recv`,
 `collab_ack`, `collab_approve`, `collab_set_implementer`,
-`collab_register_caps`, `collab_wait_my_turn`, `collab_end`, or
+`collab_register_caps`, `collab_wait_my_turn`, `collab_end`, `collab_resume`, or
 `session_handoff` itself) to **claim** — the claim advances the active
 generation, making the predecessor process **inert**.
 
@@ -1020,6 +1026,7 @@ An unattended `claude -p` successor needs at minimum:
 - `mcp__ironmem__collab_register_caps` — register capabilities
 - `mcp__ironmem__collab_wait_my_turn` — wait for turn
 - `mcp__ironmem__collab_end` — end session
+- `mcp__ironmem__collab_resume` — resume a tooling-class `CodingFailed` session
 - `mcp__ironmem__session_handoff` — re-handoff if needed
 - `mcp__ironmem__collab_status` — read session state
 - `Bash(claude -p "join ironmem collab *":*)` — re-spawn a further successor if
@@ -1147,12 +1154,14 @@ exactly one event variant — there is no phase overloading.
 | `CodeReviewFinalPending` | `final_review`, `failure_report` | v3 — Claude opens PR |
 | `CodingComplete` / `CodingFailed` | *(none — terminal; only `collab_end` accepted)* | |
 
-`failure_report` is accepted from either agent in any coding-active phase.
-A **Terminal**-classified report transitions the session to `CodingFailed`;
-a **Tooling**-classified report (one of the six recoverable prefixes, with
-detail — see "Failure + terminal" above) instead keeps the session in its
-current phase and flips `current_owner` to the counterpart. All other
-topics are gated by the owner recorded in the phase table above.
+`failure_report` is accepted from the current owner in any coding-active
+phase. Only `branch_drift:` and `codex_dispatch_failed:` (each with real
+detail) are also accepted off-turn. A **Terminal**-classified report
+transitions the session to `CodingFailed`; a **Tooling**-classified report
+(one of the six recoverable prefixes, with detail — see "Failure + terminal"
+above) instead keeps the session in its current phase and hands recovery to
+the counterpart of the interrupted turn owner. All other topics are gated by
+the owner recorded in the phase table above.
 
 `collab_resume` is a separate MCP tool, not a `collab_send` topic, so it is
 out of scope for this table — but it is the one way back into a coding
@@ -1182,6 +1191,12 @@ before each coding-active `collab_send`:
   round-trip and a working-tree reset on the common case where the agent is
   already at the right SHA — for example, entering the batch-impl turn
   immediately after `task_list` is sent.
+- **Recovery turns preserve the diff.** If `pending_failure` is non-null and
+  the current harness owns the session, it is recovering an interrupted turn.
+  It must inspect the existing worktree and run that phase's gates before
+  fetching, checking out, or resetting; ordinary pre-send synchronization may
+  discard the reporter's uncommitted recovery diff. It then commits/pushes and
+  sends the interrupted phase's normal completion event.
 - **Subagent orchestration** during `CodeImplementPending`. Claude's final
   planning gate produces the Superpowers task markdown, and the PlanLocked
   bridge publishes it via `task_list`. The selected `implementer` then runs

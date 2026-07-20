@@ -533,6 +533,12 @@ For every Claude-owned coding turn, execute this pre-send harness
 sequence before building the payload:
 
 **Pre-send Harness Sequence (Claude-owned v3 turns):**
+0. **Recovery override:** if `collab_status.pending_failure` is non-null and
+   `current_owner == "claude"`, Claude owns recovery of the interrupted turn
+   even if the normal matrix names Codex. Preserve and inspect the existing
+   diff; do **not** fetch, checkout, or reset before that inspection. Run the
+   interrupted phase's gates, commit + push, then send its normal completion
+   event exactly once.
 1. `collab_status(session_id)` → read `last_head_sha`.
 2. `git fetch` + `git cat-file -e <last_head_sha>^{commit}` — if the commit
    is missing locally after fetch, send `failure_report` with
@@ -573,7 +579,7 @@ sequence before building the payload:
 | Phase | What to do (is_my_turn == true) |
 |---|---|
 | `CodeImplementPending` | Owner depends on `implementer`. **Claude is owner** (default or `/collab join --implementer=claude <session_id>`): dispatch the matrix worker `collab-turn-code-implement.md` (mechanical/sonnet) and ingest its ≤3-line verdict; loop. The worker resumes from `ironrace-memory/collab-checkpoints`, scans plan/code state, continues the local `subagent-driven-development` batch with the v3-bridge checkpoint rule, runs pre-send harness gates (no reset — no Codex push to sync), writes `status: batch_complete`, and `collab_send`s `sender="claude"`, `topic="implementation_done"`, `content=<JSON {"head_sha":"<current HEAD>"}>` (payload carries ONLY `head_sha`) on green, or `failure_report` on failure. After send, the phase advances to `CodeReviewFixGlobalPending` (Codex's turn — the new v3 order has Codex run `/pr-review-toolkit:review-pr` on the raw post-implementation diff first). **Codex is owner** (`--implementer=codex`): is_my_turn is false here; dispatch Codex via background `codex exec` (per the Codex handoff section). Codex must resume from ironmem checkpoints, scan the plan/code state, and emit `implementation_done` itself before the bg-exec polling loop detects phase advance. |
-| `CodeReviewFixGlobalPending` | Codex's turn. is_my_turn should be false. If `collab_status` confirms Claude is the owner, exit the loop and report the anomaly. **Log:** `t6_codex_review_dispatched` immediately before launching `codex exec`; Codex's prompt requires `/pr-review-toolkit:review-pr` as the final Codex review pass, followed by parallel fix subagents for confirmed independent findings, before this handoff returns to Claude for `review_local`. **Log:** `t7_codex_review_returned` immediately after the polling loop exits. Both events take structured `phase=CodeReviewFixGlobalPending round=1` metadata — see step e ("Codex handoff") for the exact form. After Codex sends `review_fix_global` the phase advances to `CodeReviewLocalPending` (Claude's audit turn). |
+| `CodeReviewFixGlobalPending` | Codex's turn unless `pending_failure` makes Claude the recovery owner. In that recovery case, preserve the diff and complete the interrupted turn per the recovery override, sending `review_fix_global`; this is valid delegated completion, not an anomaly. Otherwise dispatch Codex via background `codex exec`, with the timing logs and `/pr-review-toolkit:review-pr` review pass described in the Codex handoff section. After `review_fix_global`, the phase advances to `CodeReviewLocalPending` (Claude's audit turn). |
 | `CodeReviewLocalPending` | Dispatch the matrix worker `collab-turn-review-local.md` (review/opus) and ingest its ≤3-line verdict; loop. The worker runs the pre-send harness (with reset to `last_head_sha` — Codex just pushed at `review_fix_global`), then performs the overlap-mode audit. It runs full `/ultrareview-local` when Codex made fix commits or runtime/Rust files changed, and uses `review_local=reduced` when Codex made no fix commit or the branch diff is docs/config-only. Reduced mode is still an audit: inspect the diff summary, changed files, and Codex commits for protocol drift, docs/config breakage, generated metadata inconsistencies, and security-sensitive configuration; escalate to full `/ultrareview-local` on uncertainty or a substantive finding. Confirmed CRITICAL/HIGH/MEDIUM findings are partitioned into temporary worktrees on unique throwaway branches for parallel fix subagents where safe, merged/cherry-picked back, committed + pushed, and `collab_send`s `sender="claude"`, `topic="review_local"`, `content=<JSON {"head_sha":"<current HEAD>"}>`. **Log:** `t5_review_local_sent`. **Anti-removal:** under v3 ordering the stage audits Codex's `review_fix_global` work plus catches issues both agents missed. Its code-quality lens partially overlaps with Codex's `pr-review-toolkit`-backed branch review but does not fully duplicate it. Removing this stage requires a written overlap audit demonstrating that Codex's `review_fix_global` reviews catch the code-quality issues `/ultrareview-local` would have flagged AND that the audit-of-Codex role is unnecessary. |
 | `CodeReviewFinalPending` | **Auto-create the PR — no user-approval gate** (the diff already passed `review_fix_global` + `review_local`, and a PR is editable and unmerged after creation; do NOT enter Plan Mode here). Dispatch the matrix worker `collab-turn-final-review.md` (review/opus) with `$MODE=compose`: it performs pushed-head proof only (no reset, no gate rerun) by requiring a clean worktree, `HEAD == last_head_sha`, and local HEAD equal to the pushed upstream/origin branch head, then drafts the PR title (under 70 chars) + body (summary + test plan derived from task list + prior gate evidence / pushed-head proof), writes `{"title":"...","body":"..."}` to a drawer, and returns `{drawer_id, ≤3-line summary}`. If the proof fails, the worker returns a blocker instead of running tests. Then dispatch `collab-turn-submit.md` (mechanical/sonnet) **directly** with `$TOPIC=final_review` `$ARTIFACT_REF=<drawer_id>` (drawer immutability is the integrity anchor — the approved drawer's content cannot change, so no hash recompute is needed): it reads the title/body artifact, then runs a plain `gh pr create --base <base_branch> --head <current branch> --title <title> --body <body>` (a **ready** PR — no `--draft`), and on failure sends `failure_report` `coding_failure: "pr_create_failed: <error>"` (no silent retry). On success, **Log:** `t8_pr_created <pr_url>`, the worker captures `pr_url` and `collab_send`s `sender="claude"`, `topic="final_review"`, `content=<JSON {"head_sha":"<current HEAD>","pr_url":"<https url>"}>`. **Log:** `t9_final_review_sent`. Session advances directly to `CodingComplete`. **Log:** `t10_session_complete CodingComplete`. Exit loop. |
 
@@ -740,16 +746,15 @@ d. **Resolve the Codex writable root — pre-dispatch, before any logging or
      both launch lines in step (f).
    - **On failure** (non-zero exit — e.g. `<repo_path>` is not actually a
      git working tree, or some other git-level error), do **not** proceed
-     to dispatch. Send `collab_send(sender="claude", topic="failure_report",
-     content=<JSON {"coding_failure":"sandbox_denied: git rev-parse
-     --git-common-dir failed: <captured stderr>"}>)` and abort the
-     dispatcher loop for this turn. `sandbox_denied:` is one of the six
-     recoverable tooling-failure prefixes (see the failure classification
-     module) — reporting it this way keeps a broken `git` resolution a
-     RECOVERABLE tooling failure with a clear diagnostic trail, instead of
-     silently dispatching Codex without `--add-dir` and letting it fail
-     downstream with an unexplained `git commit`/`git push` permission
-     error that looks like a fresh, unclassified problem.
+     to dispatch. During a coding phase, send
+     `collab_send(sender="claude", topic="failure_report",
+     content=<JSON {"coding_failure":"codex_dispatch_failed: git rev-parse
+     --git-common-dir failed: <captured stderr>"}>)` and abort this
+     dispatcher turn. `codex_dispatch_failed:` is explicitly
+     off-turn-admissible and recoverable, so Claude remains the recovery
+     owner for the unavailable Codex turn. During a planning phase,
+     `failure_report` is not a valid event: stop and surface the git
+     resolution blocker to the user rather than sending an invalid message.
 
    **Why exactly this one root, and nothing broader (D1 fix):** a linked
    worktree's `.git` is a file pointing at
@@ -941,10 +946,11 @@ Writes are best-effort and never block the protocol.
 - **`head_sha` in every v3 payload must be the current `HEAD` AFTER any
   commit/push that preceded this turn.** The server records branch progress
   via `head_sha`.
-- **Branch-drift carve-out:** `failure_report` may be sent by either agent at
-  any time during a coding-active phase, independent of `current_owner`. It is
-  the only topic that bypasses the owner check. A `coding_failure` prefixed
-  `"branch_drift:"` is the canonical drift signal; do not suppress it.
+- **Off-turn failure carve-out:** `failure_report` may be sent by either agent
+  only for `branch_drift:` or `codex_dispatch_failed:` with real detail; all
+  other reports require `current_owner`. `branch_drift:` is terminal;
+  `codex_dispatch_failed:` is recoverable and leaves recovery with the
+  counterpart of the interrupted owner.
 - If the user interrupts with a question or correction during v1, answer it
   inside the final Plan Mode gate when possible and incorporate it into the
   final Superpowers task plan. During v3, all turns are autonomous — the only
@@ -1034,7 +1040,8 @@ An unattended `claude -p` successor needs at minimum:
   `mcp__ironmem__collab_set_implementer`,
   `mcp__ironmem__collab_register_caps`,
   `mcp__ironmem__collab_wait_my_turn`, `mcp__ironmem__collab_end`,
-  `mcp__ironmem__session_handoff`, `mcp__ironmem__collab_status`
+  `mcp__ironmem__collab_resume`, `mcp__ironmem__session_handoff`,
+  `mcp__ironmem__collab_status`
 - `Bash(claude -p "join ironmem collab *":*)` — re-spawn a further successor if
   needed (scope to the join-command form; avoid the broader `Bash(claude -p:*)`)
 - Git bash operations as needed for implementation tasks

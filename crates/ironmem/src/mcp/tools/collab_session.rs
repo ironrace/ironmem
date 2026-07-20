@@ -1291,6 +1291,7 @@ pub(super) fn handle_collab_end(app: &App, args: &Value) -> Result<Value, Memory
 /// so a metrics failure can never roll back or fail a collab turn.
 pub(super) fn handle_collab_resume(app: &App, args: &Value) -> Result<Value, MemoryError> {
     let session_id = require_str(args, "session_id")?;
+    ensure_no_conflicting_process_session(app, session_id)?;
     let agent = require_agent(require_str(args, "agent")?)?;
 
     let (phase, current_owner) = app.db.with_transaction(|tx| {
@@ -2842,6 +2843,46 @@ mod tests {
         );
     }
 
+    #[test]
+    fn collab_resume_rejects_switching_away_from_another_active_process_session() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("mem.sqlite3");
+        let first = test_app_with_db_path(db_path.clone(), dir.path());
+        let second = test_app_with_db_path(db_path, dir.path());
+
+        // Bind the first process to one live session.
+        let _first_sid = start_session(&first);
+
+        // Build a separate, resumable session through a separate process so
+        // both sessions are live in the same database without tripping the
+        // per-process attribution guard during setup.
+        let second_sid = handle_collab_start(
+            &second,
+            &json!({
+                "repo_path": "/tmp/other-repo",
+                "branch": "other-branch",
+                "initiator": "claude",
+                "task": "second lifecycle test",
+                "implementer": "claude",
+            }),
+        )
+        .unwrap()["session_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        drive_to_tooling_coding_failed(&second, &second_sid);
+
+        let err = handle_collab_resume(
+            &first,
+            &json!({ "session_id": second_sid, "agent": "codex" }),
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("another active collab session"),
+            "expected process-attribution guard, got: {err}"
+        );
+    }
+
     /// A semantic-failure (`subagent_failure:`) `CodingFailed` session is
     /// rejected with the deterministic `NotResumable` error, surfaced as a
     /// validation error whose text names the session as unresumable.
@@ -3127,5 +3168,47 @@ mod tests {
         assert_eq!(status["recovery_phase"], Value::Null);
         assert_eq!(status["recovery_owner"], Value::Null);
         assert_eq!(status["recovery_attempts"], json!(0));
+    }
+
+    #[test]
+    fn off_turn_codex_dispatch_failure_hands_recovery_to_claude() {
+        let app = test_app();
+        let sid = start_session(&app);
+        drive_to_implement(&app, &sid);
+        send(
+            &app,
+            &sid,
+            "claude",
+            "implementation_done",
+            r#"{"head_sha":"impl-head"}"#,
+        );
+
+        // Claude observes that Codex never ran its global-review turn. This
+        // is the one recoverable failure that is valid from off-turn.
+        send(
+            &app,
+            &sid,
+            "claude",
+            "failure_report",
+            r#"{"coding_failure":"codex_dispatch_failed: process exited 137"}"#,
+        );
+
+        let recovering = handle_collab_status(&app, &json!({ "session_id": sid })).unwrap();
+        assert_eq!(recovering["phase"], json!("CodeReviewFixGlobalPending"));
+        assert_eq!(recovering["current_owner"], json!("claude"));
+        assert_eq!(recovering["recovery_owner"], json!("claude"));
+
+        // Claude can now complete the interrupted Codex-owned phase exactly
+        // once instead of the protocol returning control to unavailable Codex.
+        send(
+            &app,
+            &sid,
+            "claude",
+            "review_fix_global",
+            r#"{"head_sha":"recovered-head"}"#,
+        );
+        let after = handle_collab_status(&app, &json!({ "session_id": sid })).unwrap();
+        assert_eq!(after["phase"], json!("CodeReviewLocalPending"));
+        assert_eq!(after["pending_failure"], Value::Null);
     }
 }
