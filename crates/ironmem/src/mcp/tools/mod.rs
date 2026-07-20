@@ -21,7 +21,7 @@ use code_maps::{handle_code_map_load, handle_code_map_status, handle_code_map_wr
 use collab_caps::{handle_collab_get_caps, handle_collab_register_caps};
 use collab_session::{
     handle_collab_ack, handle_collab_approve, handle_collab_end, handle_collab_recv,
-    handle_collab_send, handle_collab_set_implementer, handle_collab_start,
+    handle_collab_resume, handle_collab_send, handle_collab_set_implementer, handle_collab_start,
     handle_collab_start_code_review, handle_collab_status, handle_collab_wait_my_turn,
 };
 use diary::{handle_diary_read, handle_diary_write};
@@ -429,6 +429,19 @@ pub fn tool_definitions(app: &App) -> Vec<Value> {
             }
         }),
         json!({
+            "name": "collab_resume",
+            "description": "Resume a tooling-class CodingFailed session back to the phase it failed from (e.g. a git_commit_failed: report). Rejects semantic-failure sessions (branch_drift:, subagent_failure:, or any non-tooling coding_failure) and legacy pre-migration rows with a deterministic error, and rejects a session that has already been collab_end-ed.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "session_id": { "type": "string" },
+                    "agent": { "type": "string", "enum": ["claude", "codex"] },
+                    "handoff_token": { "type": "string" }
+                },
+                "required": ["session_id", "agent"]
+            }
+        }),
+        json!({
             "name": "code_map_write",
             "description": "Write or refresh a per-area code map. Embeds summary, stores the drawer in room 'code-maps', and records the sidecar row keyed (repo, area). Write-mode only.",
             "inputSchema": {
@@ -610,6 +623,7 @@ pub fn call_tool(app: &App, name: &str, args: &Value) -> Result<Value, MemoryErr
         "collab_get_caps" => handle_collab_get_caps(app, args),
         "collab_wait_my_turn" => handle_collab_wait_my_turn(app, args),
         "collab_end" => handle_collab_end(app, args),
+        "collab_resume" => handle_collab_resume(app, args),
         "session_handoff" => handle_session_handoff(app, args),
         "code_map_write" => handle_code_map_write(app, args),
         "code_map_load" => handle_code_map_load(app, args),
@@ -715,6 +729,7 @@ fn tool_known(name: &str) -> bool {
             | "collab_get_caps"
             | "collab_wait_my_turn"
             | "collab_end"
+            | "collab_resume"
             | "session_handoff"
             | "code_map_write"
             | "code_map_load"
@@ -762,6 +777,7 @@ pub(crate) const MUTATING_TOOLS: &[&str] = &[
     "collab_approve",
     "collab_register_caps",
     "collab_end",
+    "collab_resume",
     "session_handoff",
     "code_map_write",
     "symbol_graph_index",

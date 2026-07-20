@@ -1259,6 +1259,67 @@ pub(super) fn handle_collab_end(app: &App, args: &Value) -> Result<Value, Memory
     Ok(json!({ "ok": true, "session_id": session_id }))
 }
 
+/// Resume a tooling-class `CodingFailed` session back to the phase it failed
+/// from. Honors the same generation-lease / `handoff_token` check every
+/// other collab writer does; admissibility (whether this specific session is
+/// eligible to resume at all) is entirely `apply_event`'s call via the
+/// `ResumeCoding` event — this handler does not reimplement or duplicate any
+/// of that eligibility logic, it only plumbs the request through and
+/// surfaces `CollabError::NotResumable` as a validation error via
+/// `collab_error_to_memory_error`.
+///
+/// TODO(task 10): this is plumbing only. Clearing the stale `outcome=failed`
+/// task_outcomes row that `failure_report` wrote before this resume is Task
+/// 10's job, touching this same function again.
+pub(super) fn handle_collab_resume(app: &App, args: &Value) -> Result<Value, MemoryError> {
+    let session_id = require_str(args, "session_id")?;
+    let agent = require_agent(require_str(args, "agent")?)?;
+
+    let (phase, current_owner) = app.db.with_transaction(|tx| {
+        super::handoff::ensure_actor_generation_current(
+            app,
+            tx,
+            session_id,
+            agent,
+            super::handoff::opt_handoff_token(args).as_deref(),
+        )?;
+        // A session already `collab_end`-ed cannot be resumed, even if it
+        // was `CodingFailed` at the time — `ensure_active` only rejects on
+        // `ended_at`, not on phase, so a still-open `CodingFailed` session
+        // (the common case: nobody has called `collab_end` on it yet) passes
+        // through untouched.
+        crate::collab::queue::ensure_active(tx, session_id)?;
+        let session = crate::collab::queue::load_session(tx, session_id)?;
+        let next = apply_event(&session, agent, &CollabEvent::ResumeCoding)
+            .map_err(collab_error_to_memory_error)?;
+        crate::collab::queue::save_session(tx, &next)?;
+        crate::db::schema::Database::wal_log_tx(
+            tx,
+            "collab_resume",
+            &json!({
+                "session_id": session_id,
+                "agent": agent.as_str(),
+            }),
+            Some(&json!({
+                "phase": next.phase.to_string(),
+                "current_owner": next.current_owner.to_string(),
+            })),
+        )?;
+        Ok((next.phase, next.current_owner))
+    })?;
+
+    // The session is active again post-resume, same bookkeeping
+    // `handle_collab_send` performs on every successful send.
+    app.set_active_collab_session(session_id);
+
+    Ok(json!({
+        "ok": true,
+        "session_id": session_id,
+        "phase": phase.to_string(),
+        "current_owner": current_owner.to_string(),
+    }))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2549,6 +2610,188 @@ mod tests {
             "serialized status must not expose the handoff token: token={}, status={}",
             issued.token,
             serialized
+        );
+    }
+
+    // ── Task 8: collab_resume ───────────────────────────────────────────────
+
+    /// Drive `app`'s session `sid` to a genuinely tooling-class `CodingFailed`
+    /// state via real `handle_collab_send` calls — three successive
+    /// `git_commit_failed:` failure_reports, mirroring the state machine's
+    /// own `session_with_ceiling_degraded_tooling_failure` helper. Turn
+    /// ownership naturally alternates claude -> codex -> claude as each
+    /// recoverable report hands control to the counterpart, so the ceiling
+    /// break on the third report is reported by claude (the session's
+    /// implementer and `current_owner` right after `task_list`).
+    fn drive_to_tooling_coding_failed(app: &crate::mcp::app::App, sid: &str) {
+        drive_to_implement(app, sid);
+        send(
+            app,
+            sid,
+            "claude",
+            "failure_report",
+            r#"{"coding_failure":"git_commit_failed: attempt 1"}"#,
+        );
+        send(
+            app,
+            sid,
+            "codex",
+            "failure_report",
+            r#"{"coding_failure":"git_commit_failed: attempt 2"}"#,
+        );
+        send(
+            app,
+            sid,
+            "claude",
+            "failure_report",
+            r#"{"coding_failure":"git_commit_failed: attempt 3 breaks the ceiling"}"#,
+        );
+    }
+
+    /// A genuinely tooling-class `CodingFailed` session (reached via real
+    /// `handle_collab_send` calls, not a hand-constructed struct) resumes to
+    /// its recorded `failed_from_phase`, with the resumer as the new owner.
+    #[test]
+    fn collab_resume_restores_recorded_phase_for_tooling_failure() {
+        let app = test_app();
+        let sid = start_session(&app);
+        drive_to_tooling_coding_failed(&app, &sid);
+
+        let record = app.db.collab_load_session_record(&sid).unwrap();
+        assert_eq!(record.session.phase, Phase::CodingFailed);
+        assert_eq!(
+            record.session.failed_from_phase,
+            Some(Phase::CodeImplementPending)
+        );
+
+        // Codex resumes — mirrors the state-machine unit test's choice of
+        // resumer to prove the resumer need not be the original reporter.
+        let out =
+            handle_collab_resume(&app, &json!({ "session_id": sid, "agent": "codex" })).unwrap();
+
+        assert_eq!(out["ok"], json!(true));
+        assert_eq!(out["phase"], json!("CodeImplementPending"));
+        assert_eq!(out["current_owner"], json!("codex"));
+
+        let after = app.db.collab_load_session_record(&sid).unwrap();
+        assert_eq!(after.session.phase, Phase::CodeImplementPending);
+        assert_eq!(after.session.current_owner, crate::collab::Agent::Codex);
+        assert_eq!(
+            after.session.failed_from_phase,
+            Some(Phase::CodeImplementPending),
+            "failed_from_phase is a historical record and survives a successful resume"
+        );
+    }
+
+    /// A stale predecessor process — one whose cached generation for the
+    /// resuming agent predates a successor claiming that agent's handoff
+    /// token — is rejected by the same generation-lease guard every other
+    /// collab writer honors. Mirrors `stale_predecessor_send_rejected_after_claim`.
+    #[test]
+    fn collab_resume_rejects_stale_generation_resumer() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("mem.sqlite3");
+
+        let pred = test_app_with_db_path(db_path.clone(), dir.path());
+        let succ = test_app_with_db_path(db_path, dir.path());
+
+        // Drive the whole session to a tooling CodingFailed state via pred —
+        // this binds pred's cached generation at 0 for both claude and codex
+        // (every guarded call along the way runs through pred).
+        let sid = start_session(&pred);
+        drive_to_tooling_coding_failed(&pred, &sid);
+
+        // Issue a handoff token for "claude" (the agent about to attempt a
+        // stale resume) via pred's DB.
+        let token = pred
+            .db
+            .with_transaction(|tx| {
+                crate::collab::issue_or_reuse_handoff(tx, &sid, crate::collab::Agent::Claude)
+            })
+            .unwrap()
+            .token;
+
+        // Successor claims the token via a guarded recv, advancing the DB
+        // generation for claude to 1.
+        handle_collab_recv(
+            &succ,
+            &json!({
+                "session_id": sid,
+                "receiver": "claude",
+                "handoff_token": token,
+            }),
+        )
+        .unwrap();
+
+        // Predecessor attempts to resume as claude — still cached at gen 0,
+        // DB is now at gen 1 -> rejected before apply_event ever runs.
+        let err = handle_collab_resume(&pred, &json!({ "session_id": sid, "agent": "claude" }))
+            .unwrap_err();
+
+        assert!(
+            err.to_string().contains("stale collab generation"),
+            "expected stale collab generation error, got: {err}"
+        );
+    }
+
+    /// A semantic-failure (`subagent_failure:`) `CodingFailed` session is
+    /// rejected with the deterministic `NotResumable` error, surfaced as a
+    /// validation error whose text names the session as unresumable.
+    #[test]
+    fn collab_resume_rejects_semantic_failure_session() {
+        let app = test_app();
+        let sid = start_session(&app);
+        drive_to_implement(&app, &sid);
+
+        // claude is current_owner right after task_list; subagent_failure:
+        // is not off-turn-admissible, so it must be sent on-turn.
+        send(
+            &app,
+            &sid,
+            "claude",
+            "failure_report",
+            r#"{"coding_failure":"subagent_failure: 1: env"}"#,
+        );
+
+        let record = app.db.collab_load_session_record(&sid).unwrap();
+        assert_eq!(record.session.phase, Phase::CodingFailed);
+
+        let err = handle_collab_resume(&app, &json!({ "session_id": sid, "agent": "claude" }))
+            .unwrap_err();
+
+        assert!(
+            err.to_string().contains("session cannot be resumed"),
+            "expected the deterministic NotResumable error text, got: {err}"
+        );
+    }
+
+    /// A `branch_drift:` semantic failure is likewise rejected — proves the
+    /// classification gate, not just the specific prefix used above.
+    #[test]
+    fn collab_resume_rejects_branch_drift_session() {
+        let app = test_app();
+        let sid = start_session(&app);
+        drive_to_implement(&app, &sid);
+
+        // `branch_drift:` is off-turn admissible, so codex (not the current
+        // owner claude) may report it directly.
+        send(
+            &app,
+            &sid,
+            "codex",
+            "failure_report",
+            r#"{"coding_failure":"branch_drift: head_sha abc not found"}"#,
+        );
+
+        let record = app.db.collab_load_session_record(&sid).unwrap();
+        assert_eq!(record.session.phase, Phase::CodingFailed);
+
+        let err = handle_collab_resume(&app, &json!({ "session_id": sid, "agent": "codex" }))
+            .unwrap_err();
+
+        assert!(
+            err.to_string().contains("session cannot be resumed"),
+            "expected the deterministic NotResumable error text, got: {err}"
         );
     }
 }
