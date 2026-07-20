@@ -1046,8 +1046,9 @@ async fn dispatch_wait_my_turn(
     if let Err(error) = tokio::task::block_in_place(|| tools::wait_my_turn_begin(app, &args)) {
         return tool_error_response(request.id.clone(), tool_name, error);
     }
-    let begin_completed_at = std::time::Instant::now();
-    let deadline = tools::wait_my_turn_deadline(arrived_at, begin_completed_at, &args);
+    let claim_committed_at = tools::ClaimCommittedAt(std::time::Instant::now());
+    let deadline =
+        tools::wait_my_turn_deadline(tools::ArrivedAt(arrived_at), claim_committed_at, &args);
 
     if let Some(barrier) = barrier {
         barrier.release();
