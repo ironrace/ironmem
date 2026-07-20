@@ -1395,3 +1395,110 @@ fn test_delegated_completion_override_completed_session_has_no_coding_failure() 
     assert_eq!(s.phase, Phase::CodingComplete);
     assert_eq!(s.coding_failure, None);
 }
+
+// ── Task 6: retry ceiling ──────────────────────────────────────────────
+
+#[test]
+fn test_third_recoverable_report_degrades_to_terminal_after_two_tolerated() {
+    // Two successive recoverable reports must stay non-terminal, each
+    // bumping `recovery_attempts` (monotonic: 0 -> 1 -> 2). The third
+    // report's increment would take `recovery_attempts` to 3, exceeding
+    // `MAX_RECOVERY_ATTEMPTS` (2), so it must degrade to `CodingFailed`
+    // instead of recovering again — carrying its OWN diagnostic (not the
+    // first or second report's) in `coding_failure`.
+    let s = locked_session("hf");
+    let s = submit_task_list(&s, "hf", 1);
+    assert_eq!(s.phase, Phase::CodeImplementPending);
+    assert_eq!(s.current_owner, Agent::Claude);
+    assert_eq!(s.recovery_attempts, 0);
+
+    // Report 1: Claude (current owner) reports; attempts 0 -> 1, still
+    // recovering, hands control to Codex.
+    let s = apply_event(
+        &s,
+        Agent::Claude,
+        &CollabEvent::FailureReport {
+            coding_failure: "git_commit_failed: attempt 1".to_string(),
+        },
+    )
+    .unwrap();
+    assert_eq!(s.phase, Phase::CodeImplementPending);
+    assert!(!s.phase.is_coding_terminal());
+    assert_eq!(s.recovery_attempts, 1);
+    assert_eq!(s.current_owner, Agent::Codex);
+    assert_eq!(s.coding_failure, None);
+    assert_eq!(s.failed_from_phase, None);
+
+    // Report 2: Codex (now current owner) reports; attempts 1 -> 2, still
+    // recovering (right at the ceiling, not past it), hands control back
+    // to Claude.
+    let s = apply_event(
+        &s,
+        Agent::Codex,
+        &CollabEvent::FailureReport {
+            coding_failure: "git_commit_failed: attempt 2".to_string(),
+        },
+    )
+    .unwrap();
+    assert_eq!(s.phase, Phase::CodeImplementPending);
+    assert!(!s.phase.is_coding_terminal());
+    assert_eq!(s.recovery_attempts, 2);
+    assert_eq!(s.current_owner, Agent::Claude);
+    assert_eq!(s.coding_failure, None);
+    assert_eq!(s.failed_from_phase, None);
+
+    // Report 3: Claude (current owner) reports a third time. attempts
+    // would go 2 -> 3, exceeding MAX_RECOVERY_ATTEMPTS (2), so this
+    // degrades to the terminal path instead of recovering.
+    let s = apply_event(
+        &s,
+        Agent::Claude,
+        &CollabEvent::FailureReport {
+            coding_failure: "git_commit_failed: attempt 3 breaks the ceiling".to_string(),
+        },
+    )
+    .unwrap();
+
+    assert_eq!(s.phase, Phase::CodingFailed);
+    assert_eq!(
+        s.coding_failure.as_deref(),
+        Some("git_commit_failed: attempt 3 breaks the ceiling")
+    );
+    assert_eq!(s.failed_from_phase, Some(Phase::CodeImplementPending));
+    assert_eq!(s.pending_failure, None);
+    assert_eq!(s.current_owner, Agent::Claude);
+    // `recovery_attempts` is left exactly as it was (2): this is neither
+    // the `clear_recovery_state` reset (reserved for successful delegated
+    // completion) nor a further increment.
+    assert_eq!(s.recovery_attempts, 2);
+    // Stale recovery pointers are cleared alongside the degrade so a
+    // `CodingFailed` session doesn't carry them next to a real
+    // `coding_failure`.
+    assert_eq!(s.recovery_phase, None);
+    assert_eq!(s.recovery_owner, None);
+    assert_eq!(s.recovery_origin_owner, None);
+}
+
+#[test]
+fn test_recovery_attempts_resets_to_zero_on_successful_delegated_completion() {
+    // Explicit Task 6 coverage for the second acceptance criterion:
+    // `recovery_attempts` resets to 0 once a delegated completion resolves
+    // the recovery, rather than lingering at whatever count it reached.
+    // (This exact transition is also exercised incidentally by
+    // `test_delegated_completion_override_accepted_and_clears_recovery_state`
+    // in the Task 5 section above; this test asserts it directly and in
+    // isolation so the acceptance criterion has an unambiguous home.)
+    let s = session_with_codex_recovery_in_fix_global_pending();
+    assert_eq!(s.recovery_attempts, 1);
+
+    let s = apply_event(
+        &s,
+        Agent::Claude,
+        &CollabEvent::CodeReviewFixGlobal {
+            head_sha: "g1".to_string(),
+        },
+    )
+    .unwrap();
+
+    assert_eq!(s.recovery_attempts, 0);
+}

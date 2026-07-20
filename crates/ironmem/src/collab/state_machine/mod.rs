@@ -28,6 +28,14 @@ pub fn start_global_review_session(
 /// execution-ready task plan.
 pub(super) const MAX_REVIEW_ROUNDS: u8 = 1;
 
+/// Maximum number of recoverable ("tooling") `FailureReport`s tolerated per
+/// session before recovery is abandoned. Two recoverable reports are
+/// tolerated (the session stays in recovery, non-terminal); the third — the
+/// one whose increment would push `recovery_attempts` past this ceiling —
+/// degrades to the terminal `CodingFailed` path instead of recovering
+/// again. See the `FailureClass::Tooling` arm of `apply_event` below.
+pub const MAX_RECOVERY_ATTEMPTS: u8 = 2;
+
 /// Require an actor to match the expected agent, else return `NotYourTurn`.
 fn require_actor(actor: Agent, expected: Agent) -> Result<(), CollabError> {
     if actor == expected {
@@ -278,18 +286,46 @@ pub fn apply_event(
                 // and record recovery state. `coding_failure` is left
                 // untouched (it is always `None` here — `CodingFailed` is
                 // terminal and unreachable once entered, so no in-flight
-                // coding-active session can already have it set). The
-                // `MAX_RECOVERY_ATTEMPTS` ceiling (degrade-to-terminal after
-                // too many attempts) is added in a later task; this
-                // increments unconditionally.
+                // coding-active session can already have it set) *unless*
+                // the retry ceiling is exceeded, in which case this report
+                // degrades to the terminal path below instead.
                 FailureClass::Tooling => {
-                    let owner = counterpart(actor);
-                    next.pending_failure = Some(coding_failure.clone());
-                    next.recovery_phase = Some(*phase);
-                    next.recovery_owner = Some(owner);
-                    next.recovery_origin_owner = Some(actor);
-                    next.recovery_attempts = session.recovery_attempts.saturating_add(1);
-                    next.current_owner = owner;
+                    // Check what the NEW attempt count would be, not the
+                    // current one: two recoverable reports are tolerated
+                    // (attempts 0→1, 1→2 both recover), but the third
+                    // report — whose increment would take attempts to 3,
+                    // exceeding `MAX_RECOVERY_ATTEMPTS` — abandons recovery
+                    // instead of incrementing again.
+                    if session.recovery_attempts.saturating_add(1) > MAX_RECOVERY_ATTEMPTS {
+                        // Degrade to terminal, mirroring `FailureClass::Terminal`
+                        // below but using THIS report's own diagnostic (the
+                        // one that broke the ceiling), not an earlier
+                        // attempt's. `recovery_attempts` is deliberately left
+                        // as-is (it is not reset to 0 nor bumped to 3):
+                        // `clear_recovery_state`'s zeroing is reserved for
+                        // *successful* delegated completion, which this is
+                        // not. `recovery_phase`/`recovery_owner`/
+                        // `recovery_origin_owner` are cleared so a
+                        // `CodingFailed` session doesn't carry stale
+                        // recovery pointers alongside a real
+                        // `coding_failure`.
+                        next.coding_failure = Some(coding_failure.clone());
+                        next.failed_from_phase = Some(*phase);
+                        next.pending_failure = None;
+                        next.recovery_phase = None;
+                        next.recovery_owner = None;
+                        next.recovery_origin_owner = None;
+                        next.phase = Phase::CodingFailed;
+                        next.current_owner = actor;
+                    } else {
+                        let owner = counterpart(actor);
+                        next.pending_failure = Some(coding_failure.clone());
+                        next.recovery_phase = Some(*phase);
+                        next.recovery_owner = Some(owner);
+                        next.recovery_origin_owner = Some(actor);
+                        next.recovery_attempts = session.recovery_attempts.saturating_add(1);
+                        next.current_owner = owner;
+                    }
                 }
                 // Terminal (unrecoverable) failure: today's exact behavior,
                 // plus capturing the phase the session was in at the time
