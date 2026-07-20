@@ -973,9 +973,18 @@ fn tool_success_response(
 /// exactly once — re-running it per poll would try to re-consume a one-time
 /// handoff token.
 ///
-/// The deadline runs from when the request ARRIVED, matching the readiness
-/// wait, so time spent queued behind the ordering barrier counts against the
-/// client's requested timeout rather than extending it.
+/// The deadline is computed by `wait_my_turn_deadline` (`collab_session.rs`),
+/// the single named helper the async dispatch here and the synchronous
+/// fallback both call so the two paths cannot drift (design decision 7,
+/// `docs/superpowers/plans/2026-07-19-wait-my-turn-barrier-early-release.md`).
+/// For a promptly-dispatched request it still runs from when the request
+/// ARRIVED, matching the readiness wait, so time spent queued behind the
+/// ordering barrier counts against the client's requested timeout rather than
+/// extending it. But a request that queued long enough to nearly exhaust that
+/// timeout before its claim committed instead gets a FLOOR measured from the
+/// commit instant (`begin_completed_at`) — guaranteeing at least a minimal
+/// polling window — capped so it can never stretch the wait past what the
+/// client itself asked for from that point.
 ///
 /// `barrier` is `Some` only when this request is dispatched as the
 /// per-connection mutation barrier owner (see `run_framing_loop`). The claim
