@@ -185,8 +185,22 @@ paths, branches, or SHAs.
      enter the v3 bridge (see "v3 bridge" section).
    - **v3 active** (`CodeImplementPending` .. `CodeReviewFinalPending`) →
      enter the v3 dispatch loop at the current phase (see "v3 dispatch loop").
-   - **v3 terminal** (`CodingComplete` / `CodingFailed`) →
-     report the status and exit.
+   - **`CodingComplete`** → report the status and exit.
+   - **`CodingFailed`** → read `coding_failure` and `failed_from_phase` from
+     status. If `failed_from_phase` is non-null AND `coding_failure` starts
+     with one of the six recoverable prefixes (`git_commit_failed:`,
+     `git_push_failed:`, `sandbox_denied:`, `disk_full:`, `network_failed:`,
+     `codex_dispatch_failed:`) with detail after the prefix, the session is
+     resumable: report the failure to the user and ask whether to resume. On
+     confirmation call
+     `mcp__ironmem__collab_resume(session_id, agent="claude")`, which restores
+     the session to `failed_from_phase` with the resumer as both
+     `current_owner` and `recovery_owner`, then enter the v3 dispatch loop at
+     that phase via the Recovery override (Pre-send Harness Sequence step 0 —
+     resume moves the old `coding_failure` into `pending_failure`, so the
+     override fires). If it is not resumable (`collab_resume` returns
+     `NotResumable`, or the failure classifies Terminal), report the status
+     and exit.
 
 ## Dispatch Loop Structure
 
@@ -201,7 +215,10 @@ loop:
 
   if session_ended or phase in terminal_set:
     Log: t10_session_complete <phase>       # CodingComplete or CodingFailed
-    exit and report to user
+    if phase == CodingFailed and resumable:  # see the resumability check below
+      offer collab_resume; on confirmation re-enter at failed_from_phase
+    else:
+      exit and report to user
 
   if current_owner == "codex":
     dispatch via background `codex exec`
@@ -233,6 +250,21 @@ merged.
 Terminal sets:
 - **v1**: `{PlanLocked}` (until `task_list` is sent)
 - **v3**: `{CodingComplete, CodingFailed}`
+
+**`CodingFailed` is only conditionally terminal — the resumability check.**
+A session is resumable when `failed_from_phase` is non-null AND
+`coding_failure` starts with one of the six recoverable prefixes
+(`git_commit_failed:`, `git_push_failed:`, `sandbox_denied:`, `disk_full:`,
+`network_failed:`, `codex_dispatch_failed:`) with at least one byte of detail
+after the prefix. Anything else — including `branch_drift:` and
+`subagent_failure:` — classifies Terminal and is a real exit. For a resumable
+session, report the failure and ask the user whether to resume; on
+confirmation call `mcp__ironmem__collab_resume(session_id, agent="claude")`
+and re-enter the v3 dispatch loop at the restored `failed_from_phase` through
+the Recovery override. The server also refuses the third recoverable report
+in a session (`MAX_RECOVERY_ATTEMPTS = 2`), degrading it to a real
+`CodingFailed`; `collab_resume` then returns `NotResumable`, which is an
+exit, not a retry loop.
 
 Once `task_list` has been sent, `PlanLocked` is no longer terminal: the session
 stays active and the terminal set flips to the v3 set above. The v3 bridge
@@ -585,7 +617,9 @@ sequence before building the payload:
 | `CodeReviewFinalPending` | **Auto-create the PR — no user-approval gate** (the diff already passed `review_fix_global` + `review_local`, and a PR is editable and unmerged after creation; do NOT enter Plan Mode here). Dispatch the matrix worker `collab-turn-final-review.md` (review/opus) with `$MODE=compose`: it performs pushed-head proof only (no reset, no gate rerun) by requiring a clean worktree, `HEAD == last_head_sha`, and local HEAD equal to the pushed upstream/origin branch head, then drafts the PR title (under 70 chars) + body (summary + test plan derived from task list + prior gate evidence / pushed-head proof), writes `{"title":"...","body":"..."}` to a drawer, and returns `{drawer_id, ≤3-line summary}`. If the proof fails, the worker returns a blocker instead of running tests. Then dispatch `collab-turn-submit.md` (mechanical/sonnet) **directly** with `$TOPIC=final_review` `$ARTIFACT_REF=<drawer_id>` (drawer immutability is the integrity anchor — the approved drawer's content cannot change, so no hash recompute is needed): it reads the title/body artifact, then runs a plain `gh pr create --base <base_branch> --head <current branch> --title <title> --body <body>` (a **ready** PR — no `--draft`), and on failure sends `failure_report` `coding_failure: "pr_create_failed: <error>"` (no silent retry). On success, **Log:** `t8_pr_created <pr_url>`, the worker captures `pr_url` and `collab_send`s `sender="claude"`, `topic="final_review"`, `content=<JSON {"head_sha":"<current HEAD>","pr_url":"<https url>"}>`. **Log:** `t9_final_review_sent`. Session advances directly to `CodingComplete`. **Log:** `t10_session_complete CodingComplete`. Exit loop. |
 
 After each send in v3, loop back to polling. The loop continues until
-`phase in {CodingComplete, CodingFailed}` or `session_ended`.
+`phase in {CodingComplete, CodingFailed}` or `session_ended` — and
+`CodingFailed` exits only after the resumability check above clears it as
+non-resumable.
 
 **Shortcut entry:** `/collab review` starts the loop at phase
 `CodeReviewFixGlobalPending` with `current_owner == "codex"`. No batch
@@ -754,11 +788,9 @@ e. Launch via Bash with `run_in_background: true`. Pass the model and
    > danger-full-access` is unconditional, never phase-, model-, or
    > topology-dependent, and never omitted.
 
-   **Why Codex runs unsandboxed, by explicit choice:** this Codex process is
-   dispatched by the user, on the user's own machine, against the user's own
-   repository — the sandbox buys no trust boundary that does not already
-   exist, and it demonstrably breaks the protocol. A collab session normally
-   runs from a linked worktree, whose `.git` is a file pointing at
+   **Why Codex runs unsandboxed, by explicit choice:** the flag stays because
+   sandboxing demonstrably breaks the protocol. A collab session normally runs
+   from a linked worktree, whose `.git` is a file pointing at
    `<main-repo>/.git/worktrees/<name>/`; that per-worktree gitdir and the
    shared object/ref database that Codex's `commit`/`push` turn writes to
    both live outside any workspace-scoped root, so a workspace-write sandbox
@@ -770,6 +802,19 @@ e. Launch via Bash with `run_in_background: true`. Pass the model and
    `--add-dir "<common-gitdir>"` workaround addressed only the git-metadata
    half of the problem and is superseded by this flag; do not reintroduce it.
 
+   **What the flag actually costs.** Against the user's own content the
+   sandbox buys little: this Codex process is dispatched by the user, on the
+   user's own machine, against a repository the agent already holds in full.
+   But the boundary `-s danger-full-access` gives up is not agent-vs-user —
+   it is agent-vs-**untrusted content**. Codex's `review_fix_global` turn
+   runs `/pr-review-toolkit:review-pr` over PR diffs and review comments,
+   material a third party can author; prompt-injected instructions there
+   execute with full local filesystem and process access. The flag also
+   lifts every restriction on **network egress**, so injected content can
+   exfiltrate as well as read. **Operational rule:** do not run a collab
+   session — and specifically the `review_fix_global` turn — against a branch
+   or PR whose diff or review comments come from an untrusted author.
+
 f. **Polling loop** — the dispatcher's interactive surface during this phase.
    Poll on a bounded backoff curve (NOT a fixed cadence — long silent
    grinds churn the dispatcher without producing new information):
@@ -780,7 +825,7 @@ f. **Polling loop** — the dispatcher's interactive surface during this phase.
    - After **300s** (5 min) of no progress → escalate to **30s** (cap).
    - **Reset to 10s** on ANY of: phase advance, new stdout line, bg
      process exit, bg process error/signal.
-   - 600s hang detection (termination condition 4 below) is unchanged.
+   - 600s hang detection (termination condition 5 below) is unchanged.
 
    Track "no progress" with two timestamps: `last_phase_change_at` (set
    when `collab_status.phase` differs from the prior poll) and
@@ -812,24 +857,45 @@ f. **Polling loop** — the dispatcher's interactive surface during this phase.
       - For `PlanCodexReviewPending`: **Log:** `t3_codex_returned phase=PlanCodexReviewPending round=1`
       Continue to step g.
 
-   2. `collab_status.phase` reaches `CodingFailed` →
-      Codex emitted `failure_report`. **ABORT** — surface failure to user,
-      exit the dispatcher loop.
+   2. `collab_status.pending_failure` is non-null AND
+      `collab_status.current_owner == "claude"` while `phase` is unchanged →
+      a recoverable tooling failure was recorded and recovery was handed to
+      Claude. **RECOVERY.**
+      - Kill the background Bash process via `KillShell` if it is still
+        running.
+      - Surface `pending_failure` to the user.
+      - Exit the polling loop and enter the Pre-send Harness Sequence step 0
+        "Recovery override" for the phase named by `recovery_phase`.
+      - Do NOT re-dispatch Codex and do NOT abort.
 
-   3. Bash background process exits (BashOutput shows "exit code N" or
+   3. `collab_status.phase` reaches `CodingFailed` →
+      a terminal `failure_report` landed (Codex's own, or a tooling report
+      that blew the recovery retry ceiling). **ABORT** — surface failure to
+      user, exit the dispatcher loop.
+
+   4. Bash background process exits (BashOutput shows "exit code N" or
       process is no longer running) AND no phase advance observed →
       Codex CLI failed silently. **ERROR.**
       - Capture the last 50 lines from `/tmp/codex-out-${session_id}.log`.
       - Send `collab_send(sender="claude", topic="failure_report",
-          content=<JSON {"coding_failure":"codex_exec_failed_silent: <last lines>"}>)`.
-      - **ABORT.**
+          content=<JSON {"coding_failure":"codex_dispatch_failed: codex exec exited without a phase advance — <last 50 log lines>"}>)`.
+      - Re-poll `collab_status`, then exit the polling loop via condition 2
+        (recovery handed to Claude) or condition 3 (retry ceiling exceeded).
 
-   4. Wall time exceeds 600 seconds (configurable) →
+      `codex_dispatch_failed:` is the ONLY off-turn-admissible prefix Claude
+      may use against a Codex-owned turn, and it classifies **Tooling**
+      (recoverable) — so conditions 4 and 5 hand recovery to Claude rather
+      than aborting the session. The server admits it only with at least one
+      byte of detail after the colon; a bare prefix, or any other prefix
+      (`branch_drift:` aside, which is terminal), is rejected off-turn.
+
+   5. Wall time exceeds 600 seconds (configurable) →
       **HANG.**
       - Kill the Bash background process via `KillShell`.
       - Send `collab_send(sender="claude", topic="failure_report",
-          content=<JSON {"coding_failure":"codex_exec_timeout"}>)`.
-      - **ABORT.**
+          content=<JSON {"coding_failure":"codex_dispatch_failed: codex exec exceeded the 600s hang timeout with no phase advance"}>)`.
+      - Re-poll `collab_status`, then exit the polling loop via condition 2
+        (recovery handed to Claude) or condition 3 (retry ceiling exceeded).
 
    While polling, emit a one-line progress update each iteration
    (`[codex bg] <last stdout line>`) so the user can confirm Codex is alive.
@@ -861,7 +927,8 @@ g. Resume the normal dispatch loop. The next `collab_status` poll will
   notification instead.
 
 - **Repository or PATH issues** → capture the error output, send
-  `failure_report` with `coding_failure: "codex_exec_env_error: <error>"`.
+  `failure_report` with
+  `coding_failure: "codex_dispatch_failed: repository or PATH error — <error>"`.
 
 - **User interrupts (Ctrl+C during polling)** → kill the background Bash
   process via `KillShell`. Do NOT automatically send `failure_report` —

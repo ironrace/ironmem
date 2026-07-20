@@ -1,5 +1,5 @@
 ---
-description: Slim phase-specific Codex prompt for the CodeImplementPending+codex batch implementation turn only. Contains identity, pre-send harness (with fast-path), batch implementation branch (mechanical_direct + subagent-driven), no-PR and no-spawn_agent rules, relevant invariants, and error handling. Excludes v1 planning, other v3 review rows, shortcut sessions, and the start subcommand path.
+description: Slim phase-specific Codex prompt for the CodeImplementPending+codex batch implementation turn only. Contains identity, pre-send harness (with fast-path), batch implementation branch (mechanical_direct + subagent-driven), PR-ownership and no-spawn_agent rules, relevant invariants, and error handling. Excludes v1 planning, other v3 review rows, shortcut sessions, and the start subcommand path.
 ---
 
 <!-- DERIVED FROM .codex-plugin/prompts/collab.md — any protocol change must
@@ -40,6 +40,15 @@ your phase isn't `CodeImplementPending`.
 > writable roots can grant that, so an earlier `--add-dir` workaround is
 > superseded. If you nonetheless hit a `sandbox_denied:` condition, report it
 > per the error-handling taxonomy rather than working around it silently.
+>
+> **What the trade actually costs.** The boundary given up is not
+> agent-vs-user — it is agent-vs-**untrusted content**. Later in this session
+> Codex's `review_fix_global` turn runs `/pr-review-toolkit:review-pr` over PR
+> diffs and review comments a third party can author, and prompt-injected
+> instructions in that content execute with full local filesystem and process
+> access. `danger-full-access` also lifts every restriction on **network
+> egress**. Operational rule: do not run a collab session against a branch or
+> PR whose diff or review comments come from an untrusted author.
 
 ## Default model routing
 
@@ -219,7 +228,8 @@ requiring no design judgment. Skip `subagent-driven-development` entirely.
    `content=<JSON {"head_sha":"<current HEAD after commit>"}>`. Payload
    carries ONLY `head_sha`.
 10. Exit. The session advances to `CodeReviewFixGlobalPending` with Codex as
-   owner. Skip the `gh pr list` PR-boundary check (Codex never touches PRs).
+   owner. Skip the `gh pr list` PR-boundary check — Claude owns PR creation
+   at `final_review`, so this turn has no reason to touch a PR.
 
 ---
 
@@ -248,12 +258,16 @@ is `null`/absent (or any value other than `"mechanical_direct"`).
    do not invoke `finishing-a-development-branch`" — the controller
    honors that direction.
 
-   **Codex must not create or check for PRs.** Do NOT call
-   `gh pr create`, `gh pr list`, `git ls-remote refs/pull/*`, or any
-   other PR-related GitHub API operation. Claude owns PR creation
-   (during `final_review`) and is responsible for any PR-boundary
-   sanity check. Skipping these calls also removes Codex's
-   dependency on `api.github.com` reachability for the batch turn.
+   **PR creation is scoped by ownership, not by tooling.** You may run
+   any `gh`/git/GitHub API operation you need; what you must not do is
+   create a PR for a turn you do not own. On THIS batch turn Claude owns
+   PR creation (during `final_review`) and any PR-boundary sanity check,
+   so you have no reason to call `gh pr create`, `gh pr list`, or
+   `git ls-remote refs/pull/*` here — and not calling them keeps the
+   batch turn free of any dependency on `api.github.com` reachability.
+   (The one case where Codex does create a PR is the recovery override
+   at `CodeReviewFinalPending`, which is out of scope for this prompt —
+   see `.codex-plugin/prompts/collab.md`.)
 5. Run final gates (project-appropriate: `cargo test`, `pytest`, etc).
    On gate failure or any unrecoverable subagent failure, write a
    `status: blocked` checkpoint, then send
@@ -313,9 +327,13 @@ via its Codex MCP tool when the session needs you again.
   preserved diff/working tree, run this phase's gates yourself, commit and
   push the result, then send the phase's **normal** completion event
   (`implementation_done`, `review_fix_global`, `review_local`, or
-  `final_review`) — never a new `failure_report`, which would just count
-  against the two-attempt retry ceiling instead of completing the turn.
-  Full detail: `docs/COLLAB.md` § "Failure + terminal".
+  `final_review`). Do **not** re-report the same tooling failure you were
+  handed to recover from — that just counts against the two-attempt retry
+  ceiling instead of completing the turn. A genuinely NEW failure you hit
+  while recovering (a real gate failure, an unrecoverable subagent failure,
+  branch drift) still gets its own `failure_report` with its own
+  `coding_failure` string — the step 5 gate-failure path above is exactly
+  that case. Full detail: `docs/COLLAB.md` § "Failure + terminal".
 - **One invocation handles one turn.** Each `/collab join` runs until
   you successfully send exactly one message, then exits.
 

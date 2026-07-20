@@ -43,14 +43,22 @@ exec`" step (b)). Either way, when you are running as a Codex process
 dispatched for this protocol, you run **unsandboxed** by explicit choice:
 the dispatcher launches you with `-s danger-full-access`. You are dispatched
 by the user, on the user's own machine, against the user's own repo, so the
-sandbox adds no trust boundary — and it broke the protocol twice. A linked
-worktree's git metadata and the shared object/ref database live outside any
-workspace-scoped root (so `git commit` was denied), and sandbox denials are
+sandbox buys little against the *user* — and it broke the protocol twice. A
+linked worktree's git metadata and the shared object/ref database live outside
+any workspace-scoped root (so `git commit` was denied), and sandbox denials are
 not limited to the filesystem (Unix domain socket creation was denied under
 workspace-write, failing `cargo test --workspace`'s daemon/doctor tests with
 "Operation not permitted"). No set of extra writable roots can grant that.
-See `.claude-plugin/commands/collab.md` step (e) for the launch lines and
-the full rationale.
+
+The decision stands, but state the trade honestly: the boundary given up is
+agent-vs-**untrusted content**, not agent-vs-user. Codex's `review_fix_global`
+turn runs `/pr-review-toolkit:review-pr` over PR diffs and review comments that
+a third party can author, and prompt-injected instructions in that content
+execute with full local filesystem and process access. `danger-full-access`
+also removes every restriction on **network egress**. Operational rule: do not
+run a collab session against a branch or PR whose diff or review comments come
+from an untrusted author. See `.claude-plugin/commands/collab.md` step (e) for
+the launch lines and the full rationale.
 
 If no protocol prompt exists, report that the IronMEM Codex collab prompt is
 not installed and ask the user to run `scripts/install-ironmem.sh` from the

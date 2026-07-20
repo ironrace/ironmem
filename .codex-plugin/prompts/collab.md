@@ -56,6 +56,15 @@ send the interrupted phase's normal completion event — including
 > writable roots can grant that, so an earlier `--add-dir` workaround is
 > superseded. If you nonetheless hit a `sandbox_denied:` condition, report it
 > per the error-handling taxonomy rather than working around it silently.
+>
+> **What the trade actually costs.** The boundary given up is not
+> agent-vs-user — it is agent-vs-**untrusted content**. Your
+> `review_fix_global` turn runs `/pr-review-toolkit:review-pr` over PR diffs
+> and review comments that a third party can author; prompt-injected
+> instructions in that content execute with full local filesystem and process
+> access. `danger-full-access` also lifts every restriction on **network
+> egress**. Operational rule: do not run a collab session against a branch or
+> PR whose diff or review comments come from an untrusted author.
 
 ## Default model routing
 
@@ -89,8 +98,14 @@ next-receiving-side gate after you send `review_fix_global` is
 separate `review` → `verdict` → `comment` cycle at the coding stage,
 and there are no per-task cross-agent turns — the selected implementer
 orchestrates per-task subagents on its own side, and you only see the
-consolidated result at `review_fix_global`. PR creation is Claude-only at
-`final_review`; do not call `gh pr create`.
+consolidated result at `review_fix_global`. In the normal flow `final_review`
+is Claude's turn and you never reach it, so you have no reason to call
+`gh pr create` here. The rule is protocol ownership, not tooling: you may run
+any `gh`/git/GitHub API operation you need, but you create a PR **only when
+you actually own `CodeReviewFinalPending`** — i.e. `pending_failure` is
+non-null, `current_owner == "codex"`, and `recovery_phase ==
+"CodeReviewFinalPending"`. See the `CodeReviewFinalPending` row in the v3
+phase table for what that recovery turn requires.
 
 - The session record's `task_list` field includes `plan_file_path`
   pointing at the markdown plan that drove subagent execution. Read it
@@ -340,7 +355,7 @@ working-tree reset on the common case where Codex is already at the right SHA
 | `CodeImplementPending` | Owner depends on `implementer`. If `implementer == "claude"`, this is Claude's batch turn — exit. If `implementer == "codex"`, run the batch implementation action below, resuming from ironmem checkpoints and scanning the plan/code state before editing. |
 | `CodeReviewLocalPending` | Claude's turn unless `pending_failure` names Codex as the recovery owner; in that recovery case, follow the recovery override and send `review_local`. |
 | `CodeReviewFixGlobalPending` | **Run pre-send harness.** This is your only mandatory v3 coding review turn and the final Codex review before Claude's `review_local` audit (full `/ultrareview-local` unless reduced-mode criteria apply) — invoke `/pr-review-toolkit:review-pr` against the full branch diff (`git diff <base_sha>..<last_head_sha>`) alongside the approved Superpowers task markdown at `plan_file_path` when present. Pass the collab `base_sha` and `last_head_sha` as the review target; do not let the toolkit silently substitute a different base branch. In full-flow sessions, read `plan_file_path` from the canonicalized `task_list` JSON in `collab_status`. In shortcut sessions where `task_list` is null, first search ironmem checkpoints for the same `repo_path`/`branch`, read any referenced plan, and scan the current code/diff to determine what is already complete; if no checkpoint exists, fall back to nearby Superpowers plan docs plus the branch diff. Use the toolkit as a read-only finding pass for cross-task consistency, architectural drift, missed acceptance criteria, correctness, tests, docs, security, performance, and dependency risk. Then verify findings yourself and group confirmed issues into non-overlapping fix clusters. For independent clusters, create temporary worktrees on unique throwaway branches from the same review head, dispatch fix subagents in parallel, and have each subagent own exactly one cluster. Merge/cherry-pick the resulting fix commits back onto the collab branch, resolve conflicts, run gates, commit + push. Fix overlapping/risky clusters sequentially. Send `collab_send` with `sender="codex"`, `topic="review_fix_global"`, `content=<JSON {"head_sha":"<current HEAD>"}>`. |
-| `CodeReviewFinalPending` | Claude's turn unless `pending_failure` names Codex as the recovery owner; in that recovery case, follow the recovery override and send `final_review`. |
+| `CodeReviewFinalPending` | Claude's turn unless `pending_failure` names Codex as the recovery owner. In that recovery case you own the PR turn: follow the recovery override, run the interrupted phase's gates, commit + push, then **create the PR yourself** — `gh pr create`, or reuse the existing PR for this branch if `gh pr list --head <branch>` already shows one. Send `collab_send` with `sender="codex"`, `topic="final_review"`, `content=<JSON {"head_sha":"<current HEAD>","pr_url":"<real https:// URL returned by gh>"}>`. **Never fabricate or guess a `pr_url`.** The server only validates the `https://` prefix — it cannot tell a real PR from an invented one, and a fake URL corrupts `sessions.pr_url` and the task-outcome metrics permanently. If a PR genuinely cannot be created (auth failure, no remote, network unreachable), send `failure_report` with `coding_failure: "network_failed: <detail>"` or `"sandbox_denied: <detail>"` as applicable rather than inventing a URL. |
 
 ### Batch implementation (codex-implementer)
 
@@ -447,7 +462,8 @@ requiring no design judgment. Skip `subagent-driven-development` entirely.
    `content=<JSON {"head_sha":"<current HEAD after commit>"}>`. Payload
    carries ONLY `head_sha`.
 10. Exit. The session advances to `CodeReviewFixGlobalPending` with Codex as
-   owner. Skip the `gh pr list` PR-boundary check (Codex never touches PRs).
+   owner. Skip the `gh pr list` PR-boundary check — Claude owns PR creation
+   at `final_review`, so this turn has no reason to touch a PR.
 
 ---
 
@@ -476,13 +492,16 @@ is `null`/absent (or any value other than `"mechanical_direct"`).
    do not invoke `finishing-a-development-branch`" — the controller
    honors that direction.
 
-   **Codex must not create or check for PRs.** Do NOT call
-   `gh pr create`, `gh pr list`, `git ls-remote refs/pull/*`, or any
-   other PR-related GitHub API operation. Claude owns PR creation
-   (during `final_review`) and is responsible for any PR-boundary
-   sanity check. Skipping these calls also removes Codex's
-   dependency on `api.github.com` reachability for the batch turn,
+   **PR creation is scoped by ownership, not by tooling.** You may run
+   any `gh`/git/GitHub API operation you need; what you must not do is
+   create a PR for a turn you do not own. On THIS batch turn Claude owns
+   PR creation (during `final_review`) and any PR-boundary sanity check,
+   so you have no reason to call `gh pr create`, `gh pr list`, or
+   `git ls-remote refs/pull/*` here — and not calling them keeps the
+   batch turn free of any dependency on `api.github.com` reachability,
    which the smoke run on session 991d3b49 surfaced as a fragility.
+   The one case where you do create a PR is the recovery override at
+   `CodeReviewFinalPending` (see that row in the v3 phase table).
 5. Run final gates (project-appropriate: `cargo test`, `pytest`, etc).
    On gate failure or any unrecoverable subagent failure, write a
    `status: blocked` checkpoint, then send
@@ -577,9 +596,13 @@ All existing v3 anti-puppeteering rules apply unchanged.
   preserved diff/working tree, run this phase's gates yourself, commit and
   push the result, then send the phase's **normal** completion event
   (`implementation_done`, `review_fix_global`, `review_local`, or
-  `final_review`) — never a new `failure_report`, which would just count
-  against the two-attempt retry ceiling instead of completing the turn.
-  Full detail: `docs/COLLAB.md` § "Failure + terminal".
+  `final_review`). Do **not** re-report the same tooling failure you were
+  handed to recover from — that just counts against the two-attempt retry
+  ceiling instead of completing the turn. A genuinely NEW failure you hit
+  while recovering (a real gate failure, an unrecoverable subagent failure,
+  branch drift) still gets its own `failure_report` with its own
+  `coding_failure` string. Full detail: `docs/COLLAB.md` § "Failure +
+  terminal".
 - **One invocation handles one turn.** Each `/collab join` runs until
   you successfully send exactly one message, then exits. Do not loop,
   do not self-wake.
