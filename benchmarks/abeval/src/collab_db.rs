@@ -19,6 +19,18 @@ pub struct SessionState {
     pub global_review_round: u32,
     pub task_review_round: u32,
     pub last_head_sha: Option<String>,
+    /// Recoverable ("tooling") failure currently in flight, e.g.
+    /// `git_push_failed: …` (migration 015). `Some` means the state machine
+    /// kept the session in `recovery_phase` and flipped `current_owner` to
+    /// `recovery_owner`, who completes the interrupted turn via the
+    /// delegated-completion override. `None` in the common case.
+    pub pending_failure: Option<String>,
+    /// The phase the interrupted turn was in, as a phase name (same encoding
+    /// as `phase`). Only meaningful while `pending_failure` is `Some`.
+    pub recovery_phase: Option<String>,
+    /// The agent recovery handed control to (`claude`/`codex`). Only
+    /// meaningful while `pending_failure` is `Some`.
+    pub recovery_owner: Option<String>,
 }
 
 impl SessionState {
@@ -39,7 +51,8 @@ pub fn read_session_state(db_path: &Path, session_id: &str) -> Result<SessionSta
 
     let mut stmt = conn.prepare(
         "SELECT phase, current_owner, implementer, pr_url, \
-                review_round, global_review_round, task_review_round, last_head_sha \
+                review_round, global_review_round, task_review_round, last_head_sha, \
+                pending_failure, recovery_phase, recovery_owner \
          FROM collab_sessions WHERE id = ?1",
     )?;
 
@@ -53,6 +66,9 @@ pub fn read_session_state(db_path: &Path, session_id: &str) -> Result<SessionSta
             global_review_round: row.get::<_, i64>(5)?.max(0) as u32,
             task_review_round: row.get::<_, i64>(6)?.max(0) as u32,
             last_head_sha: row.get(7)?,
+            pending_failure: row.get(8)?,
+            recovery_phase: row.get(9)?,
+            recovery_owner: row.get(10)?,
         })
     })
     .with_context(|| format!("no collab_sessions row for session {session_id}"))

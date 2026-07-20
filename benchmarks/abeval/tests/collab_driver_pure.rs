@@ -1,8 +1,18 @@
 use abeval::collab_driver::{
     is_session_limit_error, parse_ref_line, parse_session_id, render_worker_prompt, worker_action,
-    ModelTier, WorkerAction,
+    ModelTier, RecoveryState, WorkerAction,
 };
 use std::fs;
+
+/// A recovery in flight for `(phase, owner)`: the state machine kept the
+/// session in `phase` and flipped `current_owner` to `owner`.
+fn recovering<'a>(phase: &'a str, owner: &'a str) -> RecoveryState<'a> {
+    RecoveryState {
+        pending_failure: Some("git_push_failed: remote hung up"),
+        recovery_phase: Some(phase),
+        recovery_owner: Some(owner),
+    }
+}
 
 #[test]
 fn session_limit_signature_detected_but_not_overmatched() {
@@ -45,7 +55,7 @@ fn session_limit_signature_detected_but_not_overmatched() {
 fn dispatch_matrix_maps_each_phase() {
     // Claude-owned planning/coding phases.
     assert_eq!(
-        worker_action("PlanParallelDrafts", "claude", 0),
+        worker_action("PlanParallelDrafts", "claude", 0, RecoveryState::NONE),
         WorkerAction::ClaudeSend {
             template: "collab-turn-plan-draft.md",
             mode: "send",
@@ -53,7 +63,7 @@ fn dispatch_matrix_maps_each_phase() {
         }
     );
     assert_eq!(
-        worker_action("PlanSynthesisPending", "claude", 0),
+        worker_action("PlanSynthesisPending", "claude", 0, RecoveryState::NONE),
         WorkerAction::ClaudeSend {
             template: "collab-turn-plan-synthesis.md",
             mode: "send",
@@ -62,7 +72,7 @@ fn dispatch_matrix_maps_each_phase() {
     );
     // Synthesis is always autonomous now; final is the only human planning gate.
     assert_eq!(
-        worker_action("PlanSynthesisPending", "claude", 1),
+        worker_action("PlanSynthesisPending", "claude", 1, RecoveryState::NONE),
         WorkerAction::ClaudeSend {
             template: "collab-turn-plan-synthesis.md",
             mode: "send",
@@ -70,7 +80,12 @@ fn dispatch_matrix_maps_each_phase() {
         }
     );
     assert_eq!(
-        worker_action("PlanClaudeFinalizePending", "claude", 0),
+        worker_action(
+            "PlanClaudeFinalizePending",
+            "claude",
+            0,
+            RecoveryState::NONE
+        ),
         WorkerAction::ClaudeCompose {
             template: "collab-turn-plan-finalize.md",
             topic: "final",
@@ -80,11 +95,11 @@ fn dispatch_matrix_maps_each_phase() {
     assert_eq!(
         // PlanLocked is the v3 bridge: one mechanical task-list submit worker,
         // not another Superpowers planning pass.
-        worker_action("PlanLocked", "claude", 0),
+        worker_action("PlanLocked", "claude", 0, RecoveryState::NONE),
         WorkerAction::TaskListBridge
     );
     assert_eq!(
-        worker_action("CodeImplementPending", "claude", 0),
+        worker_action("CodeImplementPending", "claude", 0, RecoveryState::NONE),
         WorkerAction::ClaudeSend {
             template: "collab-turn-code-implement.md",
             mode: "send",
@@ -92,7 +107,7 @@ fn dispatch_matrix_maps_each_phase() {
         }
     );
     assert_eq!(
-        worker_action("CodeReviewLocalPending", "claude", 0),
+        worker_action("CodeReviewLocalPending", "claude", 0, RecoveryState::NONE),
         WorkerAction::ClaudeSend {
             template: "collab-turn-review-local.md",
             mode: "send",
@@ -100,49 +115,198 @@ fn dispatch_matrix_maps_each_phase() {
         }
     );
     assert_eq!(
-        worker_action("CodeReviewFinalPending", "claude", 0),
+        worker_action("CodeReviewFinalPending", "claude", 0, RecoveryState::NONE),
         WorkerAction::FinalReviewSynthetic
     );
     // Codex-owned phases.
     assert_eq!(
-        worker_action("PlanParallelDrafts", "codex", 0),
+        worker_action("PlanParallelDrafts", "codex", 0, RecoveryState::NONE),
         WorkerAction::Codex
     );
     assert_eq!(
-        worker_action("PlanCodexReviewPending", "codex", 0),
+        worker_action("PlanCodexReviewPending", "codex", 0, RecoveryState::NONE),
         WorkerAction::Codex
     );
     assert_eq!(
-        worker_action("CodeReviewFixGlobalPending", "codex", 0),
+        worker_action(
+            "CodeReviewFixGlobalPending",
+            "codex",
+            0,
+            RecoveryState::NONE
+        ),
         WorkerAction::Codex
     );
     // Terminal.
     assert_eq!(
-        worker_action("CodingComplete", "claude", 0),
+        worker_action("CodingComplete", "claude", 0, RecoveryState::NONE),
         WorkerAction::Terminal
     );
     assert_eq!(
-        worker_action("CodingFailed", "codex", 0),
+        worker_action("CodingFailed", "codex", 0, RecoveryState::NONE),
         WorkerAction::Terminal
     );
     // Owner/phase mismatch is an anomaly (e.g. claude owning a codex-only phase).
     assert_eq!(
-        worker_action("CodeReviewFixGlobalPending", "claude", 0),
+        worker_action(
+            "CodeReviewFixGlobalPending",
+            "claude",
+            0,
+            RecoveryState::NONE
+        ),
         WorkerAction::Anomaly
     );
     assert_eq!(
-        worker_action("CodeImplementPending", "codex", 0),
+        worker_action("CodeImplementPending", "codex", 0, RecoveryState::NONE),
         WorkerAction::Anomaly
     );
     // TEST 7: unknown owner string is always an anomaly, regardless of phase.
     assert_eq!(
-        worker_action("PlanLocked", "human", 0),
+        worker_action("PlanLocked", "human", 0, RecoveryState::NONE),
         WorkerAction::Anomaly
     );
     // Terminal wins regardless of owner — even an unknown owner string.
     assert_eq!(
-        worker_action("CodingComplete", "nobody", 0),
+        worker_action("CodingComplete", "nobody", 0, RecoveryState::NONE),
         WorkerAction::Terminal
+    );
+}
+
+/// A recoverable (`tooling`) `failure_report` keeps the session in its CURRENT
+/// phase and flips `current_owner` to the counterpart agent, who completes the
+/// interrupted turn via the delegated-completion override. Those flipped pairs
+/// are legitimate protocol states, not anomalies: classifying them `Anomaly`
+/// drops the whole run from the corpus, so one transient `git_push_failed:`
+/// would bias an A/B campaign toward whichever arm hit fewer tooling failures.
+#[test]
+fn recovery_flipped_pairs_dispatch_the_completing_worker() {
+    // Codex reported a tooling failure at its own global-review-fix turn →
+    // Claude is the recovery owner and completes it (sends `review_fix_global`).
+    assert_eq!(
+        worker_action(
+            "CodeReviewFixGlobalPending",
+            "claude",
+            0,
+            recovering("CodeReviewFixGlobalPending", "claude")
+        ),
+        WorkerAction::ClaudeRecoveryFixGlobal
+    );
+    // Claude (the implementer) reported a tooling failure mid-implementation →
+    // Codex is the recovery owner; its one join prompt branches on
+    // `collab_status`, so a plain Codex turn completes the phase.
+    assert_eq!(
+        worker_action(
+            "CodeImplementPending",
+            "codex",
+            0,
+            recovering("CodeImplementPending", "codex")
+        ),
+        WorkerAction::Codex
+    );
+    // Claude reported a tooling failure at its local-review audit → Codex
+    // recovery owner.
+    assert_eq!(
+        worker_action(
+            "CodeReviewLocalPending",
+            "codex",
+            0,
+            recovering("CodeReviewLocalPending", "codex")
+        ),
+        WorkerAction::Codex
+    );
+    // Claude recovery at CodeImplementPending (session ran
+    // `--implementer=codex`) is already the normal matrix entry — the recovery
+    // signal must not change it.
+    assert_eq!(
+        worker_action(
+            "CodeImplementPending",
+            "claude",
+            0,
+            recovering("CodeImplementPending", "claude")
+        ),
+        WorkerAction::ClaudeSend {
+            template: "collab-turn-code-implement.md",
+            mode: "send",
+            model: ModelTier::Sonnet,
+        }
+    );
+}
+
+/// The one recovery-flipped pair with no honest mapping in THIS harness: a
+/// Codex recovery owner at `CodeReviewFinalPending` must create a real PR
+/// (`.codex-plugin/prompts/collab.md`), which the synthetic-`pr_url` driver
+/// never does. It stays `Anomaly` deliberately.
+#[test]
+fn codex_recovery_at_final_review_stays_anomaly_in_the_synthetic_harness() {
+    assert_eq!(
+        worker_action(
+            "CodeReviewFinalPending",
+            "codex",
+            0,
+            recovering("CodeReviewFinalPending", "codex")
+        ),
+        WorkerAction::Anomaly
+    );
+}
+
+/// `Anomaly` keeps meaning "should not occur": the recovery signal only
+/// licenses the exact flipped pair the state machine created.
+#[test]
+fn recovery_signal_does_not_become_a_catch_all() {
+    // Recovery in flight for a DIFFERENT pair → normal matrix applies.
+    assert_eq!(
+        worker_action(
+            "CodeReviewFixGlobalPending",
+            "claude",
+            0,
+            recovering("CodeReviewLocalPending", "codex")
+        ),
+        WorkerAction::Anomaly
+    );
+    // Phase matches but the owner is not the recovery owner → normal matrix.
+    assert_eq!(
+        worker_action(
+            "CodeImplementPending",
+            "codex",
+            0,
+            recovering("CodeImplementPending", "claude")
+        ),
+        WorkerAction::Anomaly
+    );
+    // Recovery pointers set but no failure pending (a cleared/stale row) → the
+    // delegated-completion override is NOT active on the server either.
+    assert_eq!(
+        worker_action(
+            "CodeReviewFixGlobalPending",
+            "claude",
+            0,
+            RecoveryState {
+                pending_failure: None,
+                recovery_phase: Some("CodeReviewFixGlobalPending"),
+                recovery_owner: Some("claude"),
+            }
+        ),
+        WorkerAction::Anomaly
+    );
+    // An unknown owner string is impossible, recovery or not.
+    assert_eq!(
+        worker_action(
+            "CodeImplementPending",
+            "human",
+            0,
+            recovering("CodeImplementPending", "human")
+        ),
+        WorkerAction::Anomaly
+    );
+    // A recovery cannot exist outside the coding-active phases; if one is
+    // somehow claimed at a planning phase, the normal matrix still rules.
+    assert_eq!(
+        worker_action(
+            "PlanCodexReviewPending",
+            "claude",
+            0,
+            recovering("PlanCodexReviewPending", "claude")
+        ),
+        WorkerAction::Anomaly
     );
 }
 
@@ -165,25 +329,50 @@ fn dispatch_matrix_pins_model_tier_per_phase() {
     }
     // Planning turns → opus.
     assert_eq!(
-        model_of(worker_action("PlanParallelDrafts", "claude", 0)),
+        model_of(worker_action(
+            "PlanParallelDrafts",
+            "claude",
+            0,
+            RecoveryState::NONE
+        )),
         ModelTier::Opus
     );
     assert_eq!(
-        model_of(worker_action("PlanSynthesisPending", "claude", 0)),
+        model_of(worker_action(
+            "PlanSynthesisPending",
+            "claude",
+            0,
+            RecoveryState::NONE
+        )),
         ModelTier::Opus
     );
     assert_eq!(
-        model_of(worker_action("PlanClaudeFinalizePending", "claude", 0)),
+        model_of(worker_action(
+            "PlanClaudeFinalizePending",
+            "claude",
+            0,
+            RecoveryState::NONE
+        )),
         ModelTier::Opus
     );
     // Review turn → opus.
     assert_eq!(
-        model_of(worker_action("CodeReviewLocalPending", "claude", 0)),
+        model_of(worker_action(
+            "CodeReviewLocalPending",
+            "claude",
+            0,
+            RecoveryState::NONE
+        )),
         ModelTier::Opus
     );
     // Implementation → sonnet (the one Claude work turn that drops a tier).
     assert_eq!(
-        model_of(worker_action("CodeImplementPending", "claude", 0)),
+        model_of(worker_action(
+            "CodeImplementPending",
+            "claude",
+            0,
+            RecoveryState::NONE
+        )),
         ModelTier::Sonnet
     );
 }

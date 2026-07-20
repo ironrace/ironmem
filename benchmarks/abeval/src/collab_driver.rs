@@ -103,16 +103,122 @@ pub enum WorkerAction {
     /// The final-review compose + a driver-owned synthetic-`pr_url` submit (no
     /// `gh pr create`, nothing pushed).
     FinalReviewSynthetic,
+    /// Delegated completion of an interrupted Codex `CodeReviewFixGlobalPending`
+    /// turn by the Claude recovery owner. There is no matrix worker template for
+    /// this (the phase is Codex-owned in the normal flow, and `.claude-plugin`'s
+    /// templates each send their own phase's topic), so the driver carries the
+    /// prompt itself — see [`RECOVERY_FIX_GLOBAL_PROMPT`].
+    ClaudeRecoveryFixGlobal,
     /// Terminal phase: stop the loop.
     Terminal,
     /// Owner/phase combination that should not occur — stop and surface.
     Anomaly,
 }
 
+/// The recovery signal carried by one status poll (migration 015 columns).
+///
+/// A recovery is in flight iff `pending_failure` is `Some`: the state machine
+/// answered a recoverable ("tooling") `failure_report` by KEEPING the session in
+/// `recovery_phase` and flipping `current_owner` to `recovery_owner`, who then
+/// completes the interrupted turn through the delegated-completion override
+/// (`require_actor_or_recovery` in
+/// `crates/ironmem/src/collab/state_machine/mod.rs`).
+///
+/// Borrowed and `Copy` — this is a read-only view of one poll, never mutated.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct RecoveryState<'a> {
+    pub pending_failure: Option<&'a str>,
+    pub recovery_phase: Option<&'a str>,
+    pub recovery_owner: Option<&'a str>,
+}
+
+impl<'a> RecoveryState<'a> {
+    /// No recovery in flight — the common case, and what every non-recovery
+    /// caller/test passes.
+    pub const NONE: RecoveryState<'static> = RecoveryState {
+        pending_failure: None,
+        recovery_phase: None,
+        recovery_owner: None,
+    };
+
+    /// Borrow the recovery columns out of a polled session row.
+    pub fn from_state(state: &'a SessionState) -> Self {
+        RecoveryState {
+            pending_failure: state.pending_failure.as_deref(),
+            recovery_phase: state.recovery_phase.as_deref(),
+            recovery_owner: state.recovery_owner.as_deref(),
+        }
+    }
+
+    /// True iff a recovery is in flight AND this poll's `(phase, owner)` is
+    /// exactly the recovery-flipped pair the state machine created. Anything
+    /// else — no pending failure, a different phase, a different owner — is not
+    /// a delegated completion and must fall through to the normal matrix.
+    fn is_delegated(&self, phase: &str, owner: &str) -> bool {
+        self.pending_failure.is_some()
+            && self.recovery_phase == Some(phase)
+            && self.recovery_owner == Some(owner)
+    }
+}
+
+/// The worker that can complete `phase` when `owner` holds it as the RECOVERY
+/// owner of an interrupted turn, or `None` when the normal dispatch matrix
+/// already covers the pair (or nothing in this harness can serve it).
+///
+/// The phase decides WHICH completion event is owed; the owner decides WHICH
+/// agent runs it. `.codex-plugin/prompts/collab.md` is a single prompt that
+/// branches on `collab_status` and documents the recovery override for every
+/// coding-active phase, so a Codex recovery is always a plain Codex turn.
+fn delegated_completion_action(phase: &str, owner: &str) -> Option<WorkerAction> {
+    match (owner, phase) {
+        // Codex recovers Claude's interrupted implementation / local-review turn.
+        ("codex", "CodeImplementPending") | ("codex", "CodeReviewLocalPending") => {
+            Some(WorkerAction::Codex)
+        }
+        // Claude recovers Codex's interrupted global-review-fix turn. No matrix
+        // template sends `review_fix_global`, so the driver owns the prompt.
+        ("claude", "CodeReviewFixGlobalPending") => Some(WorkerAction::ClaudeRecoveryFixGlobal),
+        // A Codex recovery owner at `CodeReviewFinalPending` owes a REAL PR
+        // (`.codex-plugin/prompts/collab.md`: "create the PR yourself … never
+        // fabricate a pr_url"), and the Codex turn prompt is fixed — the driver
+        // cannot redirect it to the synthetic un-pushed `pr_url` this harness
+        // uses. There is no honest mapping here, so it stays `Anomaly`: the run
+        // stops rather than opening a real PR from a throwaway abeval branch.
+        ("codex", "CodeReviewFinalPending") => None,
+        // Claude recovering `CodeImplementPending` (an `--implementer=codex`
+        // session) is already the normal matrix entry, and its template is
+        // recovery-aware; fall through rather than duplicating it. Everything
+        // else — unknown owner, non-coding-active phase — is a pair recovery
+        // cannot produce and must stay whatever the normal matrix says.
+        _ => None,
+    }
+}
+
 /// Map a `(phase, owner)` poll to a [`WorkerAction`].
-pub fn worker_action(phase: &str, owner: &str, _review_round: u32) -> WorkerAction {
+///
+/// `recovery` carries the poll's migration-015 recovery columns. When a
+/// recoverable ("tooling") `failure_report` is in flight, the state machine
+/// leaves the session in its CURRENT phase and flips `current_owner` to the
+/// counterpart agent, who finishes the interrupted turn via the
+/// delegated-completion override (`require_actor_or_recovery`). Those flipped
+/// pairs are legitimate protocol states. Classifying them `Anomaly` would abort
+/// the run and drop it from the corpus row set, so a single transient
+/// `git_push_failed:` would silently bias an A/B campaign's arm totals toward
+/// whichever arm happened to hit fewer tooling failures — the run must be
+/// recorded, not discarded.
+pub fn worker_action(
+    phase: &str,
+    owner: &str,
+    _review_round: u32,
+    recovery: RecoveryState<'_>,
+) -> WorkerAction {
     if matches!(phase, PHASE_CODING_COMPLETE | PHASE_CODING_FAILED) {
         return WorkerAction::Terminal;
+    }
+    if recovery.is_delegated(phase, owner) {
+        if let Some(action) = delegated_completion_action(phase, owner) {
+            return action;
+        }
     }
     match owner {
         "codex" => match phase {
@@ -245,6 +351,36 @@ mcp__ironmem__collab_send with sender=\"claude\", topic=\"final_review\", \
 content=<JSON {\"head_sha\":\"<current HEAD of this worktree>\",\"pr_url\":\"$PR_URL\"}> \
 for session_id=$SESSION_ID.\n\
 Return EXACTLY:\nresult: final_review sent\nref: $PR_URL\nblocker: none\n";
+
+/// Driver-owned prompt for a Claude delegated completion of an interrupted
+/// Codex `CodeReviewFixGlobalPending` turn ([`WorkerAction::ClaudeRecoveryFixGlobal`]).
+///
+/// `.claude-plugin/prompts/` has no template for this: every matrix template
+/// sends its own phase's topic, and `review_fix_global` is Codex's in the normal
+/// flow. The interactive orchestrator handles it inline (the "Recovery override"
+/// in `.claude-plugin/commands/collab.md`), so the headless driver carries the
+/// equivalent instructions here. `$SESSION_ID` and `$BRANCH` are substituted by
+/// the driver.
+const RECOVERY_FIX_GLOBAL_PROMPT: &str = "\
+You are an abeval headless collab worker acting as the RECOVERY OWNER for an \
+interrupted turn on branch $BRANCH. Codex reported a recoverable tooling failure \
+during `CodeReviewFixGlobalPending`; the server kept the session in that phase and \
+handed control to you, so you may complete that turn in Codex's place.\n\
+1. `mcp__ironmem__collab_status(session_id=$SESSION_ID)`; confirm `pending_failure` \
+is non-null and `recovery_owner` is \"claude\". If it is not, stop and report it on \
+the blocker line — do not send anything.\n\
+2. Preserve the work in progress: do NOT fetch, checkout, or reset before you have \
+inspected the existing diff. Review the branch diff yourself for correctness, then \
+run `cargo fmt --all -- --check` and \
+`cargo clippy --workspace --all-targets -- -D warnings`, fixing what they flag.\n\
+3. Commit any changes you made and `git push` (the remote is this task's local \
+throwaway bare repo — nothing reaches GitHub).\n\
+4. Send the interrupted turn's normal completion event EXACTLY once — never a new \
+`failure_report` merely because you were not the original owner: \
+`mcp__ironmem__collab_send` with sender=\"claude\", topic=\"review_fix_global\", \
+content=<JSON {\"head_sha\":\"<current HEAD of this worktree>\"}> for \
+session_id=$SESSION_ID.\n\
+Return EXACTLY:\nresult: review_fix_global sent\nref: none\nblocker: none\n";
 
 /// Poll the per-task collab session row (DB read seam).
 pub trait CollabStateReader {
@@ -610,7 +746,12 @@ fn drive_collab_loop<R: CollabStateReader, S: WorkerSpawner>(
             stall_count = 0;
             stall_key = Some(key);
         }
-        let action = worker_action(&state.phase, &state.current_owner, state.review_round);
+        let action = worker_action(
+            &state.phase,
+            &state.current_owner,
+            state.review_round,
+            RecoveryState::from_state(&state),
+        );
         acc.last_state = Some(state.clone());
         match action {
             WorkerAction::Terminal => break,
@@ -735,6 +876,32 @@ fn drive_collab_loop<R: CollabStateReader, S: WorkerSpawner>(
                         ctx.task_id,
                         blocker
                     )));
+                }
+            }
+            WorkerAction::ClaudeRecoveryFixGlobal => {
+                // Delegated completion of Codex's interrupted global-review-fix
+                // turn. Review work → opus, same tier as the other review turns.
+                // ponytail: this turn's commits are not folded into
+                // `fix_commits` — the Claude spawn seam returns no commit count
+                // (only `CodexResult` carries one), so a recovery turn's fixes
+                // under-report that metric rather than corrupt it. Upgrade by
+                // giving `WorkerResult` a `commits_added` the live spawner fills
+                // from the same `git_head`/`count_commits_between` pair
+                // `spawn_codex` already uses.
+                let prompt = RECOVERY_FIX_GLOBAL_PROMPT
+                    .replace("$SESSION_ID", &session_id)
+                    .replace("$BRANCH", &ctx.branch);
+                let r = spawner
+                    .spawn_claude(&prompt, wt, ModelTier::Opus)
+                    .map_err(|e| {
+                        DriveError::Worker(WorkerFailure {
+                            site: WorkerFailureSite::ClaudeTurn,
+                            source: e,
+                        })
+                    })?;
+                accumulate_claude(&mut acc.claude_usage, &mut acc.any_usage_unparseable, &r);
+                if let Some(e) = worker_result_error(WorkerFailureSite::ClaudeTurn, &r) {
+                    return Err(e);
                 }
             }
             WorkerAction::Codex => {
@@ -890,6 +1057,9 @@ mod tests {
             review_round: 0,
             task_review_round: 0,
             last_head_sha: None,
+            pending_failure: None,
+            recovery_phase: None,
+            recovery_owner: None,
         }
     }
 

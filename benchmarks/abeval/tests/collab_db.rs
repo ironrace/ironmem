@@ -23,7 +23,11 @@ fn seed_db(
             task_review_round INTEGER NOT NULL DEFAULT 0,
             global_review_round INTEGER NOT NULL DEFAULT 0,
             last_head_sha TEXT,
-            pr_url TEXT
+            pr_url TEXT,
+            -- migration 015 recovery columns (nullable; NULL = no failure in flight)
+            pending_failure TEXT,
+            recovery_phase TEXT,
+            recovery_owner TEXT
         );",
     )
     .unwrap();
@@ -60,9 +64,49 @@ fn reads_existing_session_row() {
             global_review_round: 2,
             task_review_round: 0,
             last_head_sha: Some("abc123".into()),
+            pending_failure: None,
+            recovery_phase: None,
+            recovery_owner: None,
         }
     );
     assert!(!st.is_terminal());
+}
+
+/// A session with a recoverable tooling failure in flight must surface all
+/// three recovery columns to the driver — the dispatcher cannot tell a
+/// recovery-flipped `(phase, owner)` pair from a genuine anomaly without them.
+#[test]
+fn reads_recovery_state_when_a_tooling_failure_is_in_flight() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = seed_db(
+        dir.path(),
+        "sess-rec",
+        "CodeReviewFixGlobalPending",
+        "claude",
+        0,
+        1,
+    );
+    let conn = rusqlite::Connection::open(&db).unwrap();
+    conn.execute(
+        "UPDATE collab_sessions SET pending_failure = ?1, recovery_phase = ?2, \
+         recovery_owner = ?3 WHERE id = 'sess-rec'",
+        rusqlite::params![
+            "git_push_failed: remote rejected",
+            "CodeReviewFixGlobalPending",
+            "claude"
+        ],
+    )
+    .unwrap();
+    let st = read_session_state(&db, "sess-rec").unwrap();
+    assert_eq!(
+        st.pending_failure.as_deref(),
+        Some("git_push_failed: remote rejected")
+    );
+    assert_eq!(
+        st.recovery_phase.as_deref(),
+        Some("CodeReviewFixGlobalPending")
+    );
+    assert_eq!(st.recovery_owner.as_deref(), Some("claude"));
 }
 
 #[test]
