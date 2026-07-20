@@ -3034,4 +3034,98 @@ mod tests {
         assert_eq!(after.session.phase, Phase::CodeImplementPending);
         assert_eq!(after.session.pending_failure, None);
     }
+
+    // ── Task 11: end-to-end MCP recovery regression ─────────────────────────
+
+    /// Codex review note 3: prove the full recovery path through the
+    /// tool-level turn gate in `handle_collab_send`, not just through
+    /// `apply_event` directly (already covered by `state_machine::tests`
+    /// from Task 5). `handle_collab_send` has its OWN pre-`apply_event` turn
+    /// gate (`sender == session.current_owner`) that is a separate, earlier
+    /// check from `apply_event`'s `require_actor_or_recovery`. This test
+    /// exercises the whole delegated-completion sequence: Codex reports a
+    /// recoverable `git_commit_failed:` failure from `CodeReviewFixGlobalPending`
+    /// (which flips `current_owner` to Claude per Task 4), then Claude sends
+    /// `review_fix_global` to complete Codex's interrupted turn. Claude's
+    /// send only succeeds because `current_owner` was already flipped to
+    /// Claude in the DB by the time it lands — if a future refactor changes
+    /// `handle_collab_send`'s turn gate to check a different field, or
+    /// tightens it without accounting for recovery-flipped ownership, this
+    /// test fails at the `send()` `.unwrap()` inside the helper, which is
+    /// the correct failure mode.
+    #[test]
+    fn full_recovery_path_through_tool_level_turn_gate_clears_on_delegated_completion() {
+        let _g = metrics_on_guard();
+        let app = test_app();
+        let sid = start_session(&app);
+        drive_to_implement(&app, &sid);
+
+        // 1. Claude finishes implementation → CodeReviewFixGlobalPending, Codex owns.
+        send(
+            &app,
+            &sid,
+            "claude",
+            "implementation_done",
+            r#"{"head_sha":"c1"}"#,
+        );
+        let record = app.db.collab_load_session_record(&sid).unwrap();
+        assert_eq!(record.session.phase, Phase::CodeReviewFixGlobalPending);
+        assert_eq!(record.session.current_owner, crate::collab::Agent::Codex);
+
+        // 2. Codex hits a recoverable tooling failure mid-turn.
+        send(
+            &app,
+            &sid,
+            "codex",
+            "failure_report",
+            r#"{"coding_failure":"git_commit_failed: index.lock EPERM"}"#,
+        );
+
+        // 3. collab_status reflects the recovering session: phase unchanged,
+        //    ownership flipped to Claude, pending_failure set, coding_failure
+        //    null, and no failed outcome recorded.
+        let status = handle_collab_status(&app, &json!({ "session_id": sid })).unwrap();
+        assert_eq!(
+            status["phase"],
+            json!("CodeReviewFixGlobalPending"),
+            "a recoverable report must leave phase unchanged"
+        );
+        assert_eq!(status["current_owner"], json!("claude"));
+        assert_eq!(
+            status["pending_failure"],
+            json!("git_commit_failed: index.lock EPERM")
+        );
+        assert_eq!(
+            status["coding_failure"],
+            Value::Null,
+            "coding_failure must stay null for a recoverable (non-terminal) report"
+        );
+        let outcome_row = app.db.get_task_outcome(&sid).unwrap().unwrap();
+        assert_eq!(
+            outcome_row.outcome, None,
+            "a recoverable report must not record a failed outcome"
+        );
+
+        // 4. Claude completes Codex's interrupted turn. This send MUST
+        //    succeed — if the tool-level owner gate incorrectly rejects
+        //    Claude here, `send()`'s `.unwrap()` panics, which is the
+        //    correct failure mode for this regression test.
+        send(
+            &app,
+            &sid,
+            "claude",
+            "review_fix_global",
+            r#"{"head_sha":"c2"}"#,
+        );
+
+        // 5. Phase advances and all recovery state clears.
+        let status = handle_collab_status(&app, &json!({ "session_id": sid })).unwrap();
+        assert_eq!(status["phase"], json!("CodeReviewLocalPending"));
+        assert_eq!(status["current_owner"], json!("claude"));
+        assert_eq!(status["pending_failure"], Value::Null);
+        assert_eq!(status["failed_from_phase"], Value::Null);
+        assert_eq!(status["recovery_phase"], Value::Null);
+        assert_eq!(status["recovery_owner"], Value::Null);
+        assert_eq!(status["recovery_attempts"], json!(0));
+    }
 }
