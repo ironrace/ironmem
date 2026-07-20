@@ -1535,6 +1535,21 @@ mod tests {
             .to_string()
     }
 
+    /// Parse a successful `tool_success_response`'s `content[0].text` back into
+    /// the JSON body `wait_my_turn_poll` produced (`is_my_turn`, `phase`,
+    /// `current_owner`, `session_ended`) — the Task 5 tests below assert on
+    /// these fields directly rather than on the full JSON-RPC envelope.
+    fn wait_response_body(response: &JsonRpcResponse) -> serde_json::Value {
+        let result = response
+            .result
+            .as_ref()
+            .expect("tool result must be present");
+        let text = result["content"][0]["text"]
+            .as_str()
+            .expect("content[0].text must be a string");
+        serde_json::from_str(text).expect("tool response text must be valid JSON")
+    }
+
     /// A write whose arguments are malformed does not depend on readiness to
     /// be rejected, so it must not serve out the whole
     /// `IRONMEM_WRITE_READINESS_TIMEOUT_SECS` window (90s by default) first.
@@ -3037,5 +3052,225 @@ mod tests {
              time",
         );
         assert_eq!(queued_response["id"], json!(queued_id));
+    }
+
+    // ── Task 5: minimum-window behavior tests ───────────────────────────────
+    //
+    // Task 4 added `wait_my_turn_deadline`'s floor (`max(arrived_at + timeout,
+    // begin_completed_at + min(timeout, WAIT_MY_TURN_MIN_POLL_WINDOW))`) with
+    // only pure unit tests on the helper itself. These four tests are the
+    // missing integration-level proof that `dispatch_wait_my_turn`, driven
+    // end-to-end, actually behaves correctly under the floor: a request that
+    // queued long enough for its own arrival deadline to already be in the
+    // past still gets a real poll cycle to observe a turn-flip, an
+    // already-settled wait is unaffected by the floor, an invalid request
+    // still fails fast, and an ordinary promptly-dispatched wait still honors
+    // its own requested bound.
+
+    /// A request whose `arrived_at` is already older than `timeout_secs` (as
+    /// if it queued behind other mutations for a long time before this
+    /// task's early-release logic could dispatch it) must still get at least
+    /// one real poll cycle to observe a turn-flip, instead of the pre-Task-4
+    /// behavior of the poll loop's first deadline check already being in the
+    /// past and returning "not my turn" before the flip below can land.
+    ///
+    /// Regression-sensitivity (see the commit message / self-review for this
+    /// task): reverting `wait_my_turn_deadline`'s `max(...)` back to plain
+    /// `arrived_at + timeout` was verified locally to make this specific test
+    /// FAIL — the response comes back with `is_my_turn: false` well before
+    /// the concurrent flip below ever runs, because the deadline collapses to
+    /// a point already in the past.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn delayed_wait_still_observes_a_turn_flip_after_one_poll_interval() {
+        #[allow(clippy::arc_with_non_send_sync)]
+        let app = Arc::new(App::open_for_test().unwrap());
+        let (session_id, token) = wait_session_and_token(&app);
+
+        let timeout_secs = 5u64;
+        let request = tool_call(
+            1,
+            "collab_wait_my_turn",
+            json!({
+                "session_id": session_id, "agent": "codex",
+                "handoff_token": token, "timeout_secs": timeout_secs
+            }),
+        );
+        // Simulate a request that sat queued for a long time before dispatch:
+        // `arrived_at + timeout_secs` is already in the past.
+        let arrived_at = std::time::Instant::now() - Duration::from_secs(timeout_secs + 5);
+
+        // `App` is `!Send` (interior `RefCell`s in its connection pool), so
+        // this cannot be a `tokio::spawn`ed task on a different worker thread
+        // — it has to be a plain future driven cooperatively on the same
+        // task as the wait itself, via `tokio::join!`. That still lands the
+        // flip concurrently with the wait's polling: both futures only make
+        // progress at `.await` points, and the wait yields to the executor
+        // every `WAIT_MY_TURN_POLL_INTERVAL` via `tokio::time::sleep`.
+        let flip = async {
+            // Roughly one poll interval, so the flip lands between the wait's
+            // first and second snapshot reads rather than before dispatch
+            // even starts.
+            tokio::time::sleep(tools::WAIT_MY_TURN_POLL_INTERVAL - Duration::from_millis(150))
+                .await;
+            app.db
+                .with_transaction(|tx| {
+                    crate::collab::queue::set_implementer(
+                        tx,
+                        &session_id,
+                        crate::collab::Agent::Claude,
+                        Some(crate::collab::Agent::Codex),
+                    )
+                })
+                .unwrap();
+        };
+        let wait = dispatch_wait_my_turn(&app, &request, arrived_at, None);
+
+        let (_, response) =
+            tokio::time::timeout(Duration::from_secs(3), async { tokio::join!(flip, wait) })
+                .await
+                .expect(
+                    "dispatch_wait_my_turn did not return within 3s — the floor should have kept \
+             it polling long enough to observe the concurrent turn-flip",
+                );
+
+        let body = wait_response_body(&response);
+        assert_eq!(
+            body["is_my_turn"],
+            json!(true),
+            "the wait must observe the concurrent turn-flip instead of returning \
+             immediately with an already-past deadline; got {body:?}"
+        );
+    }
+
+    /// An already-settled wait (the turn is flipped BEFORE dispatch, not
+    /// concurrently) must return at once despite carrying the same kind of
+    /// old `arrived_at` as the delayed-wait test above — the floor extends
+    /// how long an UNSETTLED wait may poll, it must never delay a settled
+    /// answer.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_wait_already_settled_at_dispatch_returns_immediately_despite_an_old_arrival() {
+        #[allow(clippy::arc_with_non_send_sync)]
+        let app = Arc::new(App::open_for_test().unwrap());
+        let (session_id, token) = wait_session_and_token(&app);
+
+        // Flip the turn to `codex` BEFORE dispatching at all, so the very
+        // first snapshot read already settles.
+        app.db
+            .with_transaction(|tx| {
+                crate::collab::queue::set_implementer(
+                    tx,
+                    &session_id,
+                    crate::collab::Agent::Claude,
+                    Some(crate::collab::Agent::Codex),
+                )
+            })
+            .unwrap();
+
+        let timeout_secs = 30u64;
+        let request = tool_call(
+            1,
+            "collab_wait_my_turn",
+            json!({
+                "session_id": session_id, "agent": "codex",
+                "handoff_token": token, "timeout_secs": timeout_secs
+            }),
+        );
+        let arrived_at = std::time::Instant::now() - Duration::from_secs(timeout_secs + 5);
+
+        let response = tokio::time::timeout(
+            Duration::from_millis(300),
+            dispatch_wait_my_turn(&app, &request, arrived_at, None),
+        )
+        .await
+        .expect(
+            "an already-settled wait must return in well under one poll interval — the \
+             extended floor deadline must never delay a settled answer",
+        );
+
+        let body = wait_response_body(&response);
+        assert_eq!(body["is_my_turn"], json!(true), "got {body:?}");
+    }
+
+    /// A request that fails validation (`wait_my_turn_begin` returns `Err`
+    /// before any deadline is ever computed) must still return immediately —
+    /// the floor only applies once a claim has actually committed.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn invalid_wait_request_returns_immediately_without_polling() {
+        #[allow(clippy::arc_with_non_send_sync)]
+        let app = Arc::new(App::open_for_test().unwrap());
+
+        // `session_id` is required and absent here, so `wait_my_turn_begin`
+        // fails validation before `wait_my_turn_deadline` is ever called.
+        let request = tool_call(
+            1,
+            "collab_wait_my_turn",
+            json!({ "agent": "codex", "timeout_secs": 30 }),
+        );
+        let arrived_at = std::time::Instant::now() - Duration::from_secs(35);
+
+        let response = tokio::time::timeout(
+            Duration::from_millis(200),
+            dispatch_wait_my_turn(&app, &request, arrived_at, None),
+        )
+        .await
+        .expect("an invalid wait request must fail validation immediately, not poll");
+
+        let message = tool_error_text(&response);
+        assert!(
+            message.contains("session_id"),
+            "expected a validation error about the missing session_id; got {message:?}"
+        );
+    }
+
+    /// Control: an ordinary promptly-dispatched wait (`arrived_at ==
+    /// dispatch time`, no simulated queueing delay) whose turn never flips
+    /// must still honor its own requested `timeout_secs` — neither
+    /// collapsing to near-zero (deadline too short) nor stretching past 1s
+    /// (the floor overriding the client's own requested bound, which
+    /// design decision 7 explicitly rules out).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_prompt_wait_honors_its_own_requested_timeout() {
+        #[allow(clippy::arc_with_non_send_sync)]
+        let app = Arc::new(App::open_for_test().unwrap());
+        // `codex` is never made the owner, so this wait genuinely never
+        // settles on its own and always runs out its full deadline.
+        let (session_id, token) = wait_session_and_token(&app);
+
+        let timeout_secs = 1u64;
+        let request = tool_call(
+            1,
+            "collab_wait_my_turn",
+            json!({
+                "session_id": session_id, "agent": "codex",
+                "handoff_token": token, "timeout_secs": timeout_secs
+            }),
+        );
+        let arrived_at = std::time::Instant::now();
+
+        let started = std::time::Instant::now();
+        let response = tokio::time::timeout(
+            Duration::from_millis(1800),
+            dispatch_wait_my_turn(&app, &request, arrived_at, None),
+        )
+        .await
+        .expect(
+            "a promptly-dispatched 1s wait must resolve within 1.8s — if the floor \
+             stretched it past its own requested timeout, this bound would be exceeded",
+        );
+        let elapsed = started.elapsed();
+
+        assert!(
+            elapsed >= Duration::from_millis(900),
+            "the wait resolved after only {elapsed:?} — the deadline collapsed to \
+             something far shorter than the requested 1s timeout"
+        );
+
+        let body = wait_response_body(&response);
+        assert_eq!(
+            body["is_my_turn"],
+            json!(false),
+            "the turn was never flipped, so the wait must settle as \"not my turn\" \
+             once its deadline expires; got {body:?}"
+        );
     }
 }
