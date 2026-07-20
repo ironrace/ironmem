@@ -649,14 +649,13 @@ Match **both** `Phase` and `implementer` columns when looking up a row:
 `CodeImplementPending` rows are distinguished only by `implementer` —
 do not stop at the first phase match.
 
-**`--add-dir` applies uniformly across every row above, not per-row.**
-Whether the extra writable root is needed depends only on `repo_path`'s
-worktree topology (worktree checkout vs. plain checkout), never on which
+**`-s danger-full-access` applies uniformly across every row above, not
+per-row.** The sandbox setting is a property of the protocol, not of the
 phase or model a row selects — so it is not a matrix column. Every row that
 actually dispatches Codex (i.e. every row except the `implementer=="claude"`
-one, which never launches `codex exec` at all) gets the identical
-resolve-quote-append treatment from step (d)/(f) of the Codex handoff
-procedure below.
+one, which never launches `codex exec` at all) passes the identical
+`-s danger-full-access` flag in step (e) of the Codex handoff procedure
+below.
 
 Read `phase` and `implementer` from the `collab_status` you fetched at
 the top of the dispatch step; branch on them when selecting the prompt
@@ -664,8 +663,9 @@ file, model, and reasoning effort below.
 
 **When falling back to `mcp__codex__codex`** (see fallback path in the
 handoff section), apply the same prompt file, model, and effort from this
-matrix in the `config` object. The matrix's intent is preserved whether the
-transport is `codex exec` or MCP.
+matrix in the `config` object, and set `config.sandbox` to
+`"danger-full-access"` to match the CLI launch lines. The matrix's intent is
+preserved whether the transport is `codex exec` or MCP.
 
 ### Codex handoff — background `codex exec`
 
@@ -725,54 +725,7 @@ c. Substitute `$ARGUMENTS` in the selected file with `join <session_id>`.
    fix everything") collapses the review into a rubber-stamp and defeats
    the point of an independent second pass.
 
-d. **Resolve the Codex writable root — pre-dispatch, before any logging or
-   launch.** Every Codex-owned dispatch (both launch lines in step (f), and
-   the dispatch-tuning matrix's `CodeImplementPending`/`"codex"` row above)
-   needs this. Run:
-   ```bash
-   git -C <repo_path> rev-parse --path-format=absolute --git-common-dir
-   ```
-   - **On success**, shell-quote the printed path (so a path containing
-     spaces cannot break the launch command) and hold it as
-     `<common-gitdir>` for step (f). Then decide whether it is needed at
-     all — the **omit-when-inside condition**: resolve `<common-gitdir>`
-     and `<repo_path>` to absolute form and compare. If `<common-gitdir>`
-     equals `<repo_path>`, or starts with `<repo_path>` followed by a path
-     separator, the common gitdir already lives inside the writable root
-     (a plain, non-worktree checkout where `.git` sits directly under
-     `repo_path`) — do **not** append `--add-dir` for this dispatch; the
-     flag would be redundant. Otherwise (the linked-worktree case — see the
-     "D1" rationale below), `--add-dir "<common-gitdir>"` is REQUIRED on
-     both launch lines in step (f).
-   - **On failure** (non-zero exit — e.g. `<repo_path>` is not actually a
-     git working tree, or some other git-level error), do **not** proceed
-     to dispatch. During a coding phase, send
-     `collab_send(sender="claude", topic="failure_report",
-     content=<JSON {"coding_failure":"codex_dispatch_failed: git rev-parse
-     --git-common-dir failed: <captured stderr>"}>)` and abort this
-     dispatcher turn. `codex_dispatch_failed:` is explicitly
-     off-turn-admissible and recoverable, so Claude remains the recovery
-     owner for the unavailable Codex turn. During a planning phase,
-     `failure_report` is not a valid event: stop and surface the git
-     resolution blocker to the user rather than sending an invalid message.
-
-   **Why exactly this one root, and nothing broader (D1 fix):** a linked
-   worktree's `.git` is a file pointing at
-   `<main-repo>/.git/worktrees/<name>/`; that per-worktree gitdir (where
-   `index.lock` lands) sits underneath the common gitdir this command
-   resolves, and the shared object/ref database Codex's `commit`/`push`
-   turn writes to lives there too — so this single root covers both writes.
-   Two broader alternatives were rejected: running the Codex turn from the
-   main checkout instead of the worktree (breaks worktree isolation and
-   races the dispatcher's own checkout), and `-s danger-full-access`
-   (removes the sandbox wholesale to fix access to one directory).
-   **`-s workspace-write` itself is unchanged by this fix** — these launch
-   lines do not pass an explicit `-s`/`--sandbox` flag at all today (the
-   Codex CLI's own default sandbox mode applies); `--add-dir` only adds one
-   extra writable root under whatever sandbox mode is already in effect, it
-   does not loosen the sandbox mode.
-
-e. **Log the appropriate timing event** immediately before launch. Use the
+d. **Log the appropriate timing event** immediately before launch. Use the
    structured-metadata form (`<event_name> phase=<phase> round=<N>`); fill
    `phase=` from `collab_status.phase` and `round=` from
    `collab_status.review_round + 1` for plan/code reviews (or `round=1` for
@@ -782,29 +735,41 @@ e. **Log the appropriate timing event** immediately before launch. Use the
    - For `PlanParallelDrafts`: **Log:** `t2_codex_dispatched phase=PlanParallelDrafts round=1`
    - For `PlanCodexReviewPending`: **Log:** `t2_codex_dispatched phase=PlanCodexReviewPending round=1`
 
-f. Launch via Bash with `run_in_background: true`. Pass the model and
-   reasoning effort selected above explicitly, plus `--add-dir
-   "<common-gitdir>"` from step (d) whenever the omit-when-inside condition
-   did not apply (shown here as `[--add-dir "<common-gitdir>"]`, included
-   or omitted per that condition — not literal brackets):
+e. Launch via Bash with `run_in_background: true`. Pass the model and
+   reasoning effort selected above explicitly, plus `-s danger-full-access`
+   (required on both launch lines, verbatim — see the rationale below):
    ```bash
    # CodeImplementPending+codex:
-   cd <repo_path> && codex exec -m gpt-5.6-luna -c model_reasoning_effort=max [--add-dir "<common-gitdir>"] - < /tmp/codex-prompt-${session_id}.md > /tmp/codex-out-${session_id}.log 2>&1
+   cd <repo_path> && codex exec -m gpt-5.6-luna -c model_reasoning_effort=max -s danger-full-access - < /tmp/codex-prompt-${session_id}.md > /tmp/codex-out-${session_id}.log 2>&1
 
    # All other Codex-owned phases:
-   cd <repo_path> && codex exec -m gpt-5.6-terra -c model_reasoning_effort=high [--add-dir "<common-gitdir>"] - < /tmp/codex-prompt-${session_id}.md > /tmp/codex-out-${session_id}.log 2>&1
+   cd <repo_path> && codex exec -m gpt-5.6-terra -c model_reasoning_effort=high -s danger-full-access - < /tmp/codex-prompt-${session_id}.md > /tmp/codex-out-${session_id}.log 2>&1
    ```
    > The current Codex CLI accepts `-` as the prompt source and reads the
    > resolved prompt from stdin. Keep this stdin form as the canonical launch
    > path; do not use the unsupported `--prompt-file` flag.
    >
-   > Both launch lines take the identical `--add-dir` treatment: same
-   > resolved `<common-gitdir>` value, both derived from the same
-   > `repo_path` for this dispatch (there is only one worktree per collab
-   > session, so step (d) resolves it once per dispatch and both branches
-   > above reuse that one value).
+   > Both launch lines take the identical sandbox treatment: `-s
+   > danger-full-access` is unconditional, never phase-, model-, or
+   > topology-dependent, and never omitted.
 
-g. **Polling loop** — the dispatcher's interactive surface during this phase.
+   **Why Codex runs unsandboxed, by explicit choice:** this Codex process is
+   dispatched by the user, on the user's own machine, against the user's own
+   repository — the sandbox buys no trust boundary that does not already
+   exist, and it demonstrably breaks the protocol. A collab session normally
+   runs from a linked worktree, whose `.git` is a file pointing at
+   `<main-repo>/.git/worktrees/<name>/`; that per-worktree gitdir and the
+   shared object/ref database that Codex's `commit`/`push` turn writes to
+   both live outside any workspace-scoped root, so a workspace-write sandbox
+   denies `git commit` outright. Denials are also not limited to the
+   filesystem: under workspace-write, `cargo test --workspace` failed the
+   daemon/doctor tests with "Operation not permitted" because Unix domain
+   socket creation was denied, and no set of extra writable roots
+   (`--add-dir` or otherwise) can grant that capability. An earlier
+   `--add-dir "<common-gitdir>"` workaround addressed only the git-metadata
+   half of the problem and is superseded by this flag; do not reintroduce it.
+
+f. **Polling loop** — the dispatcher's interactive surface during this phase.
    Poll on a bounded backoff curve (NOT a fixed cadence — long silent
    grinds churn the dispatcher without producing new information):
 
@@ -839,12 +804,12 @@ g. **Polling loop** — the dispatcher's interactive surface during this phase.
    1. `collab_status.phase` advances to a Claude-owned phase →
       Codex emitted its message cleanly. **SUCCESS.**
       **Log the appropriate return event** with structured metadata
-      (same `phase=` / `round=` values used at dispatch in step e):
+      (same `phase=` / `round=` values used at dispatch in step d):
       - For `CodeImplementPending`: **Log:** `t3_codex_returned phase=CodeImplementPending round=1`
       - For `CodeReviewFixGlobalPending`: **Log:** `t7_codex_review_returned phase=CodeReviewFixGlobalPending round=1`
       - For `PlanParallelDrafts`: **Log:** `t3_codex_returned phase=PlanParallelDrafts round=1`
       - For `PlanCodexReviewPending`: **Log:** `t3_codex_returned phase=PlanCodexReviewPending round=1`
-      Continue to step h.
+      Continue to step g.
 
    2. `collab_status.phase` reaches `CodingFailed` →
       Codex emitted `failure_report`. **ABORT** — surface failure to user,
@@ -868,18 +833,19 @@ g. **Polling loop** — the dispatcher's interactive surface during this phase.
    While polling, emit a one-line progress update each iteration
    (`[codex bg] <last stdout line>`) so the user can confirm Codex is alive.
 
-h. Resume the normal dispatch loop. The next `collab_status` poll will
+g. Resume the normal dispatch loop. The next `collab_status` poll will
    see a Claude-owned phase or a terminal condition.
 
 **Failure modes:**
 
 - **`codex` not on PATH** → fall back to `mcp__codex__codex` synchronously
   with the same resolved prompt and the same explicit `config.model` plus
-  `config.model_reasoning_effort` selected from the matrix. For example,
-  `CodeImplementPending+codex` uses
-  `{model: "gpt-5.6-luna", model_reasoning_effort: "max"}` and normal
-  planning/review uses
-  `{model: "gpt-5.6-terra", model_reasoning_effort: "high"}`. **Log:**
+  `config.model_reasoning_effort` selected from the matrix, and
+  `config.sandbox: "danger-full-access"` to match the CLI launch lines. For
+  example, `CodeImplementPending+codex` uses
+  `{model: "gpt-5.6-luna", model_reasoning_effort: "max", sandbox: "danger-full-access"}`
+  and normal planning/review uses
+  `{model: "gpt-5.6-terra", model_reasoning_effort: "high", sandbox: "danger-full-access"}`. **Log:**
   `t2_fallback_to_mcp` in place of the normal pre-launch event. The fallback
   applies to ALL phases, not just batch impl. If `mcp__codex__codex` is also not
   registered, tell the user to run `/collab join <session_id>` in a

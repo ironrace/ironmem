@@ -40,13 +40,17 @@ does not go through this file either — it substitutes `$ARGUMENTS` directly
 into `.codex-plugin/prompts/collab.md` or `collab-batch-impl.md` (see
 `.claude-plugin/commands/collab.md`'s "Codex handoff — background `codex
 exec`" step (b)). Either way, when you are running as a Codex process
-dispatched for this protocol, your sandbox may include one extra writable
-root beyond the checkout: the repo's common git directory, added via
-`--add-dir` so `git commit`/`git push` succeed even from inside a linked
-worktree (a linked worktree's `.git` metadata lives outside the worktree
-directory itself). This does not loosen the sandbox mode itself — it is one
-added root, nothing more. See `.claude-plugin/commands/collab.md` step (d)
-for the exact resolution and rationale.
+dispatched for this protocol, you run **unsandboxed** by explicit choice:
+the dispatcher launches you with `-s danger-full-access`. You are dispatched
+by the user, on the user's own machine, against the user's own repo, so the
+sandbox adds no trust boundary — and it broke the protocol twice. A linked
+worktree's git metadata and the shared object/ref database live outside any
+workspace-scoped root (so `git commit` was denied), and sandbox denials are
+not limited to the filesystem (Unix domain socket creation was denied under
+workspace-write, failing `cargo test --workspace`'s daemon/doctor tests with
+"Operation not permitted"). No set of extra writable roots can grant that.
+See `.claude-plugin/commands/collab.md` step (e) for the launch lines and
+the full rationale.
 
 If no protocol prompt exists, report that the IronMEM Codex collab prompt is
 not installed and ask the user to run `scripts/install-ironmem.sh` from the

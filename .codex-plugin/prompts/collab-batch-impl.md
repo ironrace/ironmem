@@ -29,6 +29,18 @@ your phase isn't `CodeImplementPending`.
 
 **Never** call `collab_end` during an active phase. See Invariants.
 
+> **Sandbox:** the dispatcher launches you with `-s danger-full-access`, so
+> you run unsandboxed by explicit choice. You are dispatched by the user, on
+> the user's own machine, against the user's own repo. This is deliberate: a
+> linked worktree's git metadata and the shared object/ref database live
+> outside any workspace-scoped root (workspace-write denied `git commit`),
+> and sandbox denials are not limited to the filesystem — Unix domain socket
+> creation was denied under workspace-write, failing the daemon/doctor tests
+> in `cargo test --workspace` with "Operation not permitted". No set of extra
+> writable roots can grant that, so an earlier `--add-dir` workaround is
+> superseded. If you nonetheless hit a `sandbox_denied:` condition, report it
+> per the error-handling taxonomy rather than working around it silently.
+
 ## Default model routing
 
 This batch prompt is expected to run under the repository's implementation

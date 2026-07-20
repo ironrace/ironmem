@@ -1698,6 +1698,33 @@ model_reasoning_effort=high`. A discovered architecture or security issue may
 escalate a subagent to `gpt-5.6-sol` at high effort, but the parent protocol
 dispatch remains on its phase default.
 
+**Sandbox: every Codex-owned dispatch passes `-s danger-full-access`.** Both
+launch lines are:
+
+```bash
+# CodeImplementPending+codex:
+cd <repo_path> && codex exec -m gpt-5.6-luna -c model_reasoning_effort=max -s danger-full-access - < /tmp/codex-prompt-${session_id}.md > /tmp/codex-out-${session_id}.log 2>&1
+
+# All other Codex-owned phases:
+cd <repo_path> && codex exec -m gpt-5.6-terra -c model_reasoning_effort=high -s danger-full-access - < /tmp/codex-prompt-${session_id}.md > /tmp/codex-out-${session_id}.log 2>&1
+```
+
+The flag is unconditional — never phase-, model-, or worktree-topology-
+dependent. Codex runs unsandboxed by explicit choice: it is dispatched by the
+user, on the user's own machine, against the user's own repository, so the
+sandbox buys no trust boundary that does not already exist. It does, however,
+break the protocol. A collab session normally runs from a linked worktree,
+whose `.git` is a file pointing at `<main-repo>/.git/worktrees/<name>/`; that
+per-worktree gitdir and the shared object/ref database Codex's `commit`/`push`
+turn writes to both live outside any workspace-scoped root, so a
+workspace-write sandbox denies `git commit` outright. Denials are also not
+limited to the filesystem: under workspace-write, `cargo test --workspace`
+failed the daemon/doctor tests with "Operation not permitted" because Unix
+domain socket creation was denied, and no set of extra writable roots
+(`--add-dir` or otherwise) can grant that capability. An earlier
+`--add-dir "<common-gitdir>"` workaround addressed only the git-metadata half
+of the problem and is superseded by this flag; do not reintroduce it.
+
 #### Fallback: synchronous `mcp__codex__codex` MCP
 
 When `codex` is not on PATH, the dispatcher falls back to synchronous
@@ -1725,7 +1752,8 @@ unchanged; only the transport differs.
        "cwd": "<repo_path>",
        "config": {
          "model": "gpt-5.6-luna",
-         "model_reasoning_effort": "max"
+         "model_reasoning_effort": "max",
+         "sandbox": "danger-full-access"
        }
      }
    }
@@ -1734,7 +1762,9 @@ unchanged; only the transport differs.
    model policy and dispatch matrix. For `CodeImplementPending+codex` use
    `gpt-5.6-luna` at `max`; for planning and normal review use
    `gpt-5.6-terra` at `high`. Do not omit the model override or inherit the
-   caller's personal default.
+   caller's personal default. `config.sandbox` is always
+   `"danger-full-access"`, matching the CLI launch lines — the MCP transport
+   gets no different sandbox treatment.
    The call blocks until Codex finishes its phase-specific action and
    hands control back. Claude then resumes the dispatch loop.
 
