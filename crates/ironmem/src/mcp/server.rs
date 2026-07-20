@@ -359,6 +359,11 @@ const MAX_QUEUED_MUTATIONS: usize = 64;
 /// long-poll timeout — see `barrier_release_for`.
 const MAX_EARLY_RELEASED_WAITS: usize = MAX_IN_FLIGHT_REQUESTS / 4;
 
+// A zero cap would disable early release entirely and silently — every wait
+// would revert to holding the ordering barrier for its full poll, with no test
+// failing. Tuning `MAX_IN_FLIGHT_REQUESTS` below 4 must break the build instead.
+const _: () = assert!(MAX_EARLY_RELEASED_WAITS > 0);
+
 /// Per-connection MCP framing loop: read newline-delimited JSON-RPC requests
 /// from `reader`, dispatch each one, write the response to `writer`, and
 /// account response metrics.
