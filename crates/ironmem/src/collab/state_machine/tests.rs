@@ -1502,3 +1502,48 @@ fn test_recovery_attempts_resets_to_zero_on_successful_delegated_completion() {
 
     assert_eq!(s.recovery_attempts, 0);
 }
+
+#[test]
+fn test_terminal_report_mid_recovery_clears_stale_recovery_pointers() {
+    // Hygiene follow-up (flagged independently by two reviewers on Task 6):
+    // a Terminal-classified `FailureReport` can arrive while a prior
+    // Tooling recovery is still in flight and unresolved — the recovery
+    // owner may hit a genuinely unrecoverable error instead of completing
+    // the delegated turn. Without clearing the recovery pointer fields
+    // here, the resulting `CodingFailed` session would carry a stale
+    // `recovery_owner`/`recovery_phase`/`recovery_origin_owner` alongside a
+    // real `coding_failure` — exactly the state Task 6's retry-ceiling
+    // degrade path already guards against, just reached via a different
+    // path (a Terminal report, not the ceiling).
+    let s = session_with_codex_recovery_in_fix_global_pending();
+    assert_eq!(s.recovery_owner, Some(Agent::Claude));
+    assert_eq!(s.recovery_phase, Some(Phase::CodeReviewFixGlobalPending));
+    assert_eq!(s.recovery_origin_owner, Some(Agent::Codex));
+    assert_eq!(s.recovery_attempts, 1);
+    assert_eq!(s.current_owner, Agent::Claude);
+
+    // Claude is the current owner (post-recovery-handoff), so it may report
+    // on-turn. `subagent_failure:` is not a recoverable prefix -> Terminal.
+    let s = apply_event(
+        &s,
+        Agent::Claude,
+        &CollabEvent::FailureReport {
+            coding_failure: "subagent_failure: fix subagent crashed".to_string(),
+        },
+    )
+    .unwrap();
+
+    assert_eq!(s.phase, Phase::CodingFailed);
+    assert_eq!(
+        s.coding_failure.as_deref(),
+        Some("subagent_failure: fix subagent crashed")
+    );
+    assert_eq!(s.failed_from_phase, Some(Phase::CodeReviewFixGlobalPending));
+    assert_eq!(s.pending_failure, None);
+    assert_eq!(s.recovery_phase, None);
+    assert_eq!(s.recovery_owner, None);
+    assert_eq!(s.recovery_origin_owner, None);
+    // `recovery_attempts` is diagnostic history at this point, not live
+    // state — left as-is, same convention as the retry-ceiling degrade path.
+    assert_eq!(s.recovery_attempts, 1);
+}

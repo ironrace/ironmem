@@ -96,6 +96,23 @@ fn clear_recovery_state(next: &mut CollabSession) {
     next.recovery_attempts = 0;
 }
 
+/// Clear only the three recovery *pointer* fields (`recovery_phase`,
+/// `recovery_owner`, `recovery_origin_owner`), leaving `pending_failure` and
+/// `recovery_attempts` to the caller. Used by both terminal paths in the
+/// `FailureReport` arm — the retry-ceiling degrade and the direct
+/// `FailureClass::Terminal` branch — so a `CodingFailed` session never
+/// carries stale recovery pointers alongside a real `coding_failure`. Unlike
+/// [`clear_recovery_state`] (reserved for *successful* delegated completion,
+/// which also resets `recovery_attempts` to 0), a terminal report is not a
+/// success: `recovery_attempts` is left for the caller to decide, and
+/// `pending_failure` is cleared explicitly at each call site rather than
+/// here, to keep this helper's effect obvious from its name.
+fn clear_recovery_pointers(next: &mut CollabSession) {
+    next.recovery_phase = None;
+    next.recovery_owner = None;
+    next.recovery_origin_owner = None;
+}
+
 pub fn apply_event(
     session: &CollabSession,
     actor: Agent,
@@ -312,9 +329,7 @@ pub fn apply_event(
                         next.coding_failure = Some(coding_failure.clone());
                         next.failed_from_phase = Some(*phase);
                         next.pending_failure = None;
-                        next.recovery_phase = None;
-                        next.recovery_owner = None;
-                        next.recovery_origin_owner = None;
+                        clear_recovery_pointers(&mut next);
                         next.phase = Phase::CodingFailed;
                         next.current_owner = actor;
                     } else {
@@ -330,10 +345,21 @@ pub fn apply_event(
                 // Terminal (unrecoverable) failure: today's exact behavior,
                 // plus capturing the phase the session was in at the time
                 // of failure and defensively clearing `pending_failure`.
+                // `clear_recovery_pointers` also clears the three recovery
+                // pointer fields: a Terminal report can arrive while a prior
+                // Tooling recovery is still in flight (same phase, not yet
+                // resolved by a delegated completion), and without this the
+                // resulting `CodingFailed` session would carry stale
+                // `recovery_owner`/`recovery_phase`/`recovery_origin_owner`
+                // alongside a real `coding_failure`. `recovery_attempts` is
+                // deliberately left as-is, same as the retry-ceiling degrade
+                // path above — it's diagnostic history, not live state, once
+                // the session is terminal.
                 FailureClass::Terminal => {
                     next.coding_failure = Some(coding_failure.clone());
                     next.failed_from_phase = Some(*phase);
                     next.pending_failure = None;
+                    clear_recovery_pointers(&mut next);
                     next.phase = Phase::CodingFailed;
                     next.current_owner = actor;
                 }
