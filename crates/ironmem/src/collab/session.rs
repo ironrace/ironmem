@@ -58,6 +58,16 @@ pub struct CollabSession {
     /// The `Phase` the session was in when the failure was recorded, so
     /// recovery can resume in place. Wire-encoded exactly like the
     /// non-nullable `phase` column (`Phase::to_string()` / `FromStr`).
+    ///
+    /// **Not a "session is currently failed" indicator.** `ResumeCoding`
+    /// (`state_machine::apply_event`) deliberately leaves this field set
+    /// after a successful resume, as a historical record of what phase the
+    /// session originally failed from — it does NOT clear it. A non-null
+    /// `failed_from_phase` on an active (non-`CodingFailed`) session is
+    /// normal and expected once that session has ever been resumed; only
+    /// `session.phase == Phase::CodingFailed` means the session is actually
+    /// down. Any caller exposing this field (e.g. `collab_status`) should
+    /// present it as audit history, not as a live-status flag.
     pub failed_from_phase: Option<Phase>,
     /// Sub-phase of the recovery flow itself, distinct from the session's
     /// normal `phase` column. Same encoding as `failed_from_phase`.
