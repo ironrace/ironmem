@@ -21,18 +21,6 @@ IronMEM collab protocol. It must behave like Claude's `/collab` command in
 style and rigor, but from the Codex role: one invocation handles one
 Codex-owned action and exits.
 
-**Sandbox note (background dispatch only, informational):** this
-interactive entrypoint never launches another `codex exec` process — only
-Claude dispatches Codex that way. But when Claude *does* dispatch you here
-via a background `codex exec` for this protocol, your `-s workspace-write`
-sandbox additionally includes one extra writable root beyond the checkout:
-the repo's common git directory, added via `--add-dir` so `git
-commit`/`git push` succeed even from inside a linked worktree (a linked
-worktree's `.git` metadata lives outside the worktree directory itself).
-This does not loosen the sandbox mode — it is one added root, nothing more.
-See `.claude-plugin/commands/collab.md`'s "Codex handoff — background
-`codex exec`" step (d) for the exact resolution and rationale.
-
 Before taking action, locate the full Codex protocol prompt at the first
 existing path:
 
@@ -44,6 +32,21 @@ existing path:
 Read that file completely. Follow it as the authoritative IronMEM collab
 protocol, substituting the arguments above wherever the prompt says
 `$ARGUMENTS`.
+
+**Sandbox note (informational — this file is not the background-dispatch
+entrypoint):** this INTERACTIVE shim is what a human runs; it never itself
+launches another `codex exec` process, and Claude's background dispatch
+does not go through this file either — it substitutes `$ARGUMENTS` directly
+into `.codex-plugin/prompts/collab.md` or `collab-batch-impl.md` (see
+`.claude-plugin/commands/collab.md`'s "Codex handoff — background `codex
+exec`" step (b)). Either way, when you are running as a Codex process
+dispatched for this protocol, your sandbox may include one extra writable
+root beyond the checkout: the repo's common git directory, added via
+`--add-dir` so `git commit`/`git push` succeed even from inside a linked
+worktree (a linked worktree's `.git` metadata lives outside the worktree
+directory itself). This does not loosen the sandbox mode itself — it is one
+added root, nothing more. See `.claude-plugin/commands/collab.md` step (d)
+for the exact resolution and rationale.
 
 If no protocol prompt exists, report that the IronMEM Codex collab prompt is
 not installed and ask the user to run `scripts/install-ironmem.sh` from the
