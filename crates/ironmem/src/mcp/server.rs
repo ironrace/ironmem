@@ -2759,6 +2759,59 @@ mod tests {
         );
     }
 
+    /// An already-settled `collab_wait_my_turn` must send its own successful
+    /// response immediately through the production framing loop. The nearby
+    /// long-poll test only proves that a different request can overtake an
+    /// unsettled wait; it would remain green if this path ignored `settled`
+    /// and waited until its full timeout.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn framing_loop_returns_an_already_settled_wait_immediately() {
+        for mode in [TransportMode::Stdio, TransportMode::DaemonConnection] {
+            #[allow(clippy::arc_with_non_send_sync)]
+            let app = Arc::new(App::open_for_test().unwrap());
+            let session_id = uuid::Uuid::new_v4().to_string();
+            app.db
+                .with_transaction(|tx| {
+                    crate::collab::queue::create_session(
+                        tx,
+                        &session_id,
+                        "/repo",
+                        "main",
+                        Some("task"),
+                        crate::collab::Agent::Codex,
+                    )?;
+                    crate::collab::queue::set_implementer(
+                        tx,
+                        &session_id,
+                        crate::collab::Agent::Codex,
+                        Some(crate::collab::Agent::Codex),
+                    )
+                })
+                .unwrap();
+
+            let request = json!({
+                "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                "params": {
+                    "name": "collab_wait_my_turn",
+                    "arguments": {
+                        "session_id": session_id, "agent": "codex", "timeout_secs": 30
+                    }
+                }
+            });
+            let responses =
+                collect_responses(&app, mode, &[request], 1, Duration::from_millis(500)).await;
+
+            assert_eq!(responses[0]["id"], json!(1));
+            let body: serde_json::Value = serde_json::from_str(
+                responses[0]["result"]["content"][0]["text"]
+                    .as_str()
+                    .expect("successful wait response must contain JSON text"),
+            )
+            .expect("wait response text must be valid JSON");
+            assert_eq!(body["is_my_turn"], json!(true), "got {body:?}");
+        }
+    }
+
     /// An `AsyncRead` that serves `content` and then FAILS rather than ending.
     ///
     /// A `duplex` half cannot express this: dropping its peer yields EOF, which
