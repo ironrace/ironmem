@@ -481,8 +481,9 @@ the user already approved the final Superpowers task plan.
           send `failure_report` with `sender="claude"`,
           `topic="failure_report"`,
           `content=<JSON {"coding_failure":"codex_dispatch_failed: <error>"}>`.
-          The state machine's branch-drift carve-out admits this from
-          a non-owner, transitioning the session to `CodingFailed`.
+          This is the context-valid off-turn dispatch-failure carve-out: it
+          keeps the phase active and assigns recovery to Claude, who must
+          complete the interrupted Codex batch through the recovery override.
           Surface the original Codex error to the user.
 
      If `codex` is not on PATH, fall back to `mcp__codex__codex` before
@@ -912,8 +913,9 @@ Writes are best-effort and never block the protocol.
 - **`head_sha` in every v3 payload must be the current `HEAD` AFTER any
   commit/push that preceded this turn.** The server records branch progress
   via `head_sha`.
-- **Off-turn failure carve-out:** `failure_report` may be sent by either agent
-  only for `branch_drift:` or `codex_dispatch_failed:` with real detail; all
+- **Off-turn failure carve-out:** `branch_drift:` with real detail may be
+  reported by either agent. `codex_dispatch_failed:` with real detail may be
+  reported off-turn only by Claude while Codex owns the interrupted turn; all
   other reports require `current_owner`. `branch_drift:` is terminal;
   `codex_dispatch_failed:` is recoverable and leaves recovery with the
   counterpart of the interrupted owner.

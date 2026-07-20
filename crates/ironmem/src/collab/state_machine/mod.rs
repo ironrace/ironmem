@@ -460,9 +460,11 @@ pub fn apply_event(
             // `CodingFailed` (both the ceiling degrade and the direct
             // Terminal branch), so there is nothing stale to clear.
             //
-            // `recovery_attempts` carries forward unchanged: it is
-            // historical attempt-count diagnostic, not live state, the same
-            // convention Task 6 established for the terminal paths.
+            // Resume begins a fresh recovery budget. The terminal row's
+            // exhausted count is historical diagnostic state; retaining it
+            // here would make the first new tooling failure immediately
+            // re-hit the retry ceiling instead of handing off recovery.
+            next.recovery_attempts = 0;
         }
         (phase, _) => {
             // Terminal phases are short-circuited by the guard at the top of

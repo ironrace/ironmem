@@ -28,7 +28,10 @@ server rejects anything else):
 You never send `canonical`, `final`, `task_list`, `review_local`, or
 `final_review`. Those are Claude-only. `implementation_done` is also
 Claude-only in default sessions; it becomes Codex-valid only when the
-session record's `implementer` field is `"codex"`.
+session record's `implementer` field is `"codex"`. **Recovery exception:**
+when `pending_failure` is non-null and `current_owner == "codex"`, Codex may
+send the interrupted phase's normal completion event — including
+`implementation_done`, `review_local`, or `final_review` — exactly once.
 
 **Never** call `collab_end` during an active phase. See Invariants.
 
@@ -548,11 +551,12 @@ All existing v3 anti-puppeteering rules apply unchanged.
 - **`head_sha` in every v3 payload is the current `HEAD` AFTER any commit
   and push you made on this turn.** If you made no commit, echo back
   `last_head_sha`.
-- **Off-turn failure carve-out:** `failure_report` may be sent by either
-  agent only for `branch_drift:` or `codex_dispatch_failed:` with real
-  detail; all other reports require `current_owner`. `branch_drift:` is
-  terminal; `codex_dispatch_failed:` is recoverable and leaves recovery with
-  the counterpart of the interrupted owner.
+- **Off-turn failure carve-out:** `branch_drift:` with real detail may be
+  reported by either agent. `codex_dispatch_failed:` with real detail may be
+  reported off-turn only by Claude while Codex owns the interrupted turn; all
+  other reports require `current_owner`. `branch_drift:` is terminal;
+  `codex_dispatch_failed:` is recoverable and leaves recovery with the
+  counterpart of the interrupted owner.
 - **Recoverable vs terminal `failure_report`.** The server classifies every
   `coding_failure` string. Six prefixes are recoverable ("Tooling") when
   followed by >=1 byte of real detail after the colon:

@@ -527,8 +527,8 @@ the empty string.
 
 | Phase | Owner | Event | Next |
 |---|---|---|---|
-| *any coding-active phase* | owner (or the two explicit off-turn prefixes below) | `FailureReport{coding_failure}` classifying **Tooling** | same phase; `current_owner` becomes the counterpart of the interrupted turn owner |
-| *any coding-active phase* | either | `FailureReport{coding_failure}` classifying **Terminal** | `CodingFailed` (terminal) |
+| *any coding-active phase* | owner; `branch_drift:` may also be reported by either agent; `codex_dispatch_failed:` may also be reported by Claude while Codex owns the interrupted turn | `FailureReport{coding_failure}` classifying **Tooling** | same phase; `current_owner` becomes the counterpart of the interrupted turn owner |
+| *any coding-active phase* | owner; `branch_drift:` with detail may also be reported by either agent | `FailureReport{coding_failure}` classifying **Terminal** | `CodingFailed` (terminal) |
 
 `collab_end` is **rejected** in every coding-active phase
 (`CodeImplementPending`, `CodeReviewFixGlobalPending`,
@@ -565,8 +565,9 @@ server does not enforce either:
   counterpart recover.
 
 For an ordinary owner-reported failure, the recovery owner is the reporter's
-counterpart. `branch_drift:` and `codex_dispatch_failed:` are the only
-off-turn-admissible prefixes; when Claude observes an unavailable Codex turn
+counterpart. `branch_drift:` is off-turn-admissible for either agent;
+`codex_dispatch_failed:` is off-turn-admissible only when Claude reports it
+against a Codex-owned turn. When Claude observes an unavailable Codex turn
 and reports `codex_dispatch_failed:`, recovery stays with Claude (the
 counterpart of the interrupted Codex owner), rather than being handed back to
 the unavailable process. The recovery owner (the agent `current_owner` now
@@ -884,7 +885,8 @@ Eligible only when the session's stored `coding_failure` classifies
 On success: `phase` is restored to `failed_from_phase`, `current_owner`
 becomes the caller (`agent`), `coding_failure` clears, and the prior
 terminal diagnostic moves into `pending_failure` for audit.
-`failed_from_phase` itself is left set as a historical record. This path
+`recovery_attempts` resets to `0`, giving the restored turn a fresh retry
+budget; `failed_from_phase` itself is left set as a historical record. This path
 is for when the retry ceiling was exceeded, or a fresh process wants to
 pick a dead-but-recoverable session back up — it is not needed for the
 normal in-flight recovery path (staying in-phase after a Tooling
@@ -1097,7 +1099,7 @@ orchestrator from steering the reviewer's conclusion.
 | `review_fix_global` | `codex` | `{"head_sha"}` | In `CodeReviewFixGlobalPending` only. Codex ran `/pr-review-toolkit:review-pr` on the raw post-implementation diff (no Claude pre-clean), used parallel fix subagents for confirmed partitionable findings, merged/cherry-picked the resulting fixes, and pushed the branch-level fix commit(s). |
 | `review_local` | `claude` | `{"head_sha"}` | In `CodeReviewLocalPending` only. Claude ran full or reduced audit of Codex's `review_fix_global` commits + caught issues both agents missed, used parallel fix subagents for confirmed partitionable findings, merged/cherry-picked the resulting fixes, and pushed. |
 | `final_review` | `claude` | `{"head_sha","pr_url"}` | In `CodeReviewFinalPending` only. Claude has opened the PR; the event carries the URL and advances directly to `CodingComplete`. `pr_url` must start with `https://` and be ≤2048 chars. |
-| `failure_report` | either | `{"coding_failure":"<reason>"}` | Valid in any coding-active phase. Classifies **Tooling** (six recoverable prefixes, stays in-phase, `current_owner` flips) or **Terminal** (everything else, transitions to `CodingFailed`) — see "Failure + terminal" above. |
+| `failure_report` | current owner; off-turn `branch_drift:` may come from either agent; off-turn `codex_dispatch_failed:` may come only from Claude against a Codex-owned turn | `{"coding_failure":"<reason>"}` | Valid in any coding-active phase. Classifies **Tooling** (six recoverable prefixes, stays in-phase, `current_owner` flips) or **Terminal** (everything else, transitions to `CodingFailed`) — see "Failure + terminal" above. |
 
 ### `task_list` — `execution_mode` field
 
@@ -1155,8 +1157,9 @@ exactly one event variant — there is no phase overloading.
 | `CodingComplete` / `CodingFailed` | *(none — terminal; only `collab_end` accepted)* | |
 
 `failure_report` is accepted from the current owner in any coding-active
-phase. Only `branch_drift:` and `codex_dispatch_failed:` (each with real
-detail) are also accepted off-turn. A **Terminal**-classified report
+phase. `branch_drift:` with real detail is also accepted off-turn from either
+agent; `codex_dispatch_failed:` with real detail is accepted off-turn only
+from Claude against a Codex-owned turn. A **Terminal**-classified report
 transitions the session to `CodingFailed`; a **Tooling**-classified report
 (one of the six recoverable prefixes, with detail — see "Failure + terminal"
 above) instead keeps the session in its current phase and hands recovery to

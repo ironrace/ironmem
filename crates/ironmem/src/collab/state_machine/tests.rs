@@ -1641,11 +1641,37 @@ fn test_resume_coding_restores_recorded_phase_with_resumer_as_owner() {
     // this session originally failed from (judgment call — see
     // `resume_eligibility`'s doc comment in state_machine/mod.rs).
     assert_eq!(s.failed_from_phase, Some(Phase::CodeImplementPending));
-    // `recovery_attempts` carries forward unchanged — historical diagnostic,
-    // not live state, same convention Task 6 established.
-    assert_eq!(s.recovery_attempts, 2);
+    // A fresh recovery budget starts after an explicit resume. The exhausted
+    // pre-resume counter is no longer live state for the restored turn.
+    assert_eq!(s.recovery_attempts, 0);
     // Already cleared by the terminal transition (Task 6) and stays clear.
     assert_eq!(s.recovery_origin_owner, None);
+}
+
+#[test]
+fn test_resume_resets_retry_budget_for_a_subsequent_tooling_failure() {
+    // A session that hit the retry ceiling can be explicitly resumed. Its
+    // first new tooling failure must receive the normal one-turn handoff,
+    // rather than immediately degrading back to CodingFailed because the
+    // exhausted pre-resume counter leaked into the new recovery attempt.
+    let s = session_with_ceiling_degraded_tooling_failure();
+    let s = apply_event(&s, Agent::Codex, &CollabEvent::ResumeCoding).unwrap();
+    assert_eq!(s.recovery_attempts, 0);
+
+    let s = apply_event(
+        &s,
+        Agent::Codex,
+        &CollabEvent::FailureReport {
+            coding_failure: "git_push_failed: transient retry after resume".to_string(),
+        },
+    )
+    .unwrap();
+
+    assert_eq!(s.phase, Phase::CodeImplementPending);
+    assert_eq!(s.current_owner, Agent::Claude);
+    assert_eq!(s.recovery_owner, Some(Agent::Claude));
+    assert_eq!(s.recovery_attempts, 1);
+    assert_eq!(s.coding_failure, None);
 }
 
 #[test]
