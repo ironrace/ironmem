@@ -967,14 +967,33 @@ mod daemon_tests {
 
     /// Poll-connect with bounded retries so we never race a not-yet-bound
     /// daemon and never rely on a fixed sleep.
-    fn connect_with_retry(path: &std::path::Path) -> StdUnixStream {
-        for _ in 0..200 {
-            if let Ok(stream) = StdUnixStream::connect(path) {
-                return stream;
+    ///
+    /// `label` names the call site. Several tests connect more than once, and
+    /// on failure the panic previously named neither the attempt nor the
+    /// underlying errno — which made a CI-only failure impossible to diagnose
+    /// from the log, since "daemon never bound" and "daemon already exited"
+    /// produce the same message but have opposite causes. The last OS error
+    /// distinguishes them: `ENOENT` means the socket was never created (or was
+    /// cleaned up on exit), `ECONNREFUSED` means the file outlived its
+    /// listener.
+    fn connect_with_retry(path: &std::path::Path, label: &str) -> StdUnixStream {
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        let mut last_err = None;
+        while std::time::Instant::now() < deadline {
+            match StdUnixStream::connect(path) {
+                Ok(stream) => return stream,
+                Err(err) => last_err = Some(err),
             }
             std::thread::sleep(Duration::from_millis(10));
         }
-        panic!("could not connect to daemon socket within timeout");
+        panic!(
+            "could not connect to daemon socket within timeout \
+             (attempt: {label}, path: {}, last error: {})",
+            path.display(),
+            last_err
+                .map(|e| e.to_string())
+                .unwrap_or_else(|| "none recorded".to_string()),
+        );
     }
 
     /// End-to-end: a proxy-style connection does `initialize` (a read path) and
@@ -1007,7 +1026,7 @@ mod daemon_tests {
             });
         });
 
-        let stream = connect_with_retry(&sock);
+        let stream = connect_with_retry(&sock, "initial connect");
         let mut writer = stream.try_clone().unwrap();
         let mut reader = StdBufReader::new(stream);
 
@@ -1077,7 +1096,7 @@ mod daemon_tests {
 
         // Connect, exchange one request, then disconnect — the idle countdown
         // starts the instant this connection's handler completes.
-        let stream = connect_with_retry(&sock);
+        let stream = connect_with_retry(&sock, "initial connect");
         let mut writer = stream.try_clone().unwrap();
         let mut reader = StdBufReader::new(stream);
         writer
@@ -1119,7 +1138,31 @@ mod daemon_tests {
         let sock_thread = sock.clone();
 
         let (_shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
-        let idle_timeout = Duration::from_millis(200);
+        // Every interval below is a fraction of this window, so the test scales
+        // as a unit and has no absolute scheduling margin to blow.
+        //
+        // The previous shape — 200ms window, 100ms sleep, then "the second
+        // connect must be served" — failed on every macOS CI run: with ~100ms
+        // of margin, a runner executing the full suite in parallel let the
+        // timer fire, the daemon exited, and the second connect spent its whole
+        // retry budget against a dead socket.
+        //
+        // Simply widening the window does NOT work, and the failure is silent:
+        // once the remaining window comfortably exceeds one round-trip, the
+        // second connection is served whether or not the timer was ever
+        // disarmed, because the daemon has not reached the stale deadline yet.
+        // Deleting `idle_deadline = None` from the accept arm then leaves the
+        // test green. The old assertion was only ever detective by accident —
+        // it caught the bug solely because the round-trip had to beat a 100ms
+        // deadline, which is the same property that made it flaky.
+        //
+        // So this asserts the observable that actually distinguishes the two
+        // implementations: the accept-loop's `idle_sleep` arm breaks the loop
+        // UNCONDITIONALLY, without consulting `active`. A stale deadline
+        // therefore kills the daemon even with a connection open. Connection 2
+        // is held open ACROSS the original deadline and must still be answered
+        // afterward — impossible unless the deadline was genuinely disarmed.
+        let idle_timeout = Duration::from_secs(2);
 
         let daemon = std::thread::spawn(move || {
             let rt = tokio::runtime::Builder::new_multi_thread()
@@ -1137,8 +1180,10 @@ mod daemon_tests {
         });
 
         // Connection 1: connect + disconnect immediately, arming the timer.
+        // `armed_at` anchors the original deadline at roughly
+        // `armed_at + idle_timeout`; every later instant is measured from it.
         {
-            let stream = connect_with_retry(&sock);
+            let stream = connect_with_retry(&sock, "first connect, arms the idle timer");
             let mut writer = stream.try_clone().unwrap();
             let mut reader = StdBufReader::new(stream);
             writer
@@ -1150,12 +1195,14 @@ mod daemon_tests {
             let mut line = String::new();
             reader.read_line(&mut line).unwrap();
         }
+        let armed_at = std::time::Instant::now();
 
-        // Wait well past half the idle window, then connect again — this must
-        // disarm the timer that connection 1 armed, rather than the daemon
-        // having already exited.
-        std::thread::sleep(idle_timeout / 2);
-        let stream2 = connect_with_retry(&sock);
+        // Wait past the halfway mark, then connect again. Past half so an
+        // implementation that merely DEFERRED the deadline by half a window
+        // would already have expired; still 40% of the window short of the
+        // deadline, so the connect itself has generous margin.
+        std::thread::sleep(idle_timeout.mul_f64(0.6));
+        let stream2 = connect_with_retry(&sock, "second connect, inside the idle window");
         let mut writer2 = stream2.try_clone().unwrap();
         let mut reader2 = StdBufReader::new(stream2);
         writer2
@@ -1170,13 +1217,52 @@ mod daemon_tests {
             line2.contains("\"protocolVersion\""),
             "second connection got a real response: {line2}"
         );
+
+        // The load-bearing step. Hold connection 2 OPEN until well past the
+        // deadline connection 1 armed, then use it again. If the accept arm
+        // failed to disarm that deadline, `idle_sleep` has already fired and
+        // broken the accept loop — it does not consult `active` — so the
+        // daemon is gone and this request gets EOF instead of a response.
+        let past_original_deadline = armed_at + idle_timeout.mul_f64(1.3);
+        let now = std::time::Instant::now();
+        assert!(
+            now < past_original_deadline,
+            "test scheduling overran its own budget before the probe could run: \
+             {:?} already elapsed of a {:?} window",
+            now - armed_at,
+            idle_timeout,
+        );
+        std::thread::sleep(past_original_deadline - now);
+        writer2
+            .write_all(b"{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"initialize\",\"params\":{}}\n")
+            .unwrap();
+        writer2.flush().unwrap();
+        let mut line3 = String::new();
+        let read3 = reader2.read_line(&mut line3);
+        assert!(
+            matches!(read3, Ok(n) if n > 0),
+            "a connection held open across the original idle deadline must still \
+             be served — the deadline connection 1 armed was never disarmed, so \
+             the daemon shut down out from under an open connection (read: \
+             {read3:?})"
+        );
+        assert!(
+            line3.contains("\"protocolVersion\""),
+            "held-open connection got a real response after the original \
+             deadline passed: {line3}"
+        );
         drop(writer2);
         drop(reader2);
 
         // Now let this (second) idle window fully elapse with no further
-        // activity: the daemon must eventually shut down on its own.
+        // activity: the daemon must eventually shut down on its own. The bound
+        // is derived from `idle_timeout` rather than hardcoded — a fixed
+        // 50 x 20ms budget was shorter than the widened window and would have
+        // reported "never shut down" while the daemon was still correctly
+        // counting down.
+        let shutdown_deadline = std::time::Instant::now() + idle_timeout * 3;
         let joined = std::thread::spawn(move || daemon.join());
-        for _ in 0..50 {
+        while std::time::Instant::now() < shutdown_deadline {
             if joined.is_finished() {
                 break;
             }
@@ -1220,7 +1306,7 @@ mod daemon_tests {
 
         // Open ONE connection and keep it open (never drop writer/reader)
         // across more than the full idle window.
-        let stream = connect_with_retry(&sock);
+        let stream = connect_with_retry(&sock, "initial connect, held open across the idle window");
         let mut writer = stream.try_clone().unwrap();
         let mut reader = StdBufReader::new(stream);
         writer
@@ -1879,7 +1965,7 @@ mod daemon_tests {
                     .unwrap();
             });
         });
-        connect_with_retry(&sock); // wait for the socket to accept
+        connect_with_retry(&sock, "readiness probe"); // wait for the socket to accept
 
         // The probe itself needs its own tiny runtime — this test is
         // deliberately `#[test]` (not `#[tokio::test]`) so it can drive that
@@ -1924,7 +2010,7 @@ mod daemon_tests {
 
         // Real client: initialize with a distinct session id + codex clientInfo.
         {
-            let stream = connect_with_retry(&sock);
+            let stream = connect_with_retry(&sock, "concurrent client connect");
             let mut writer = stream.try_clone().unwrap();
             let mut reader = StdBufReader::new(stream);
             writer
@@ -1946,7 +2032,7 @@ mod daemon_tests {
         // The real client's recorded harness/session must be exactly as it
         // was — the probe's own throwaway `initialize` never touched it.
         {
-            let stream = connect_with_retry(&sock);
+            let stream = connect_with_retry(&sock, "concurrent client connect");
             let mut writer = stream.try_clone().unwrap();
             let mut reader = StdBufReader::new(stream);
             writer
