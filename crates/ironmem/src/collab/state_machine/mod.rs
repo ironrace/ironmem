@@ -3,7 +3,7 @@ use super::error::CollabError;
 use super::event::CollabEvent;
 use super::phase::Phase;
 use super::session::CollabSession;
-use super::OFF_TURN_FAILURE_PREFIXES;
+use super::{classify, FailureClass, OFF_TURN_FAILURE_PREFIXES};
 
 /// Construct a fresh `CollabSession` positioned at the v3 global-review
 /// stage, for the coding-review shortcut. Rejects empty SHAs so the
@@ -37,6 +37,16 @@ fn require_actor(actor: Agent, expected: Agent) -> Result<(), CollabError> {
             expected: expected.to_string(),
             got: actor.to_string(),
         })
+    }
+}
+
+/// The other agent in the two-party collab protocol. Used to flip
+/// `current_owner`/`recovery_owner` to the counterpart of whichever agent
+/// reported a recoverable ("tooling") failure.
+fn counterpart(agent: Agent) -> Agent {
+    match agent {
+        Agent::Claude => Agent::Codex,
+        Agent::Codex => Agent::Claude,
     }
 }
 
@@ -220,9 +230,36 @@ pub fn apply_event(
                     got: actor.to_string(),
                 });
             }
-            next.coding_failure = Some(coding_failure.clone());
-            next.phase = Phase::CodingFailed;
-            next.current_owner = actor;
+            match classify(coding_failure) {
+                // Recoverable tooling failure: stay in the current phase,
+                // hand control to the counterpart agent to drive recovery,
+                // and record recovery state. `coding_failure` is left
+                // untouched (it is always `None` here — `CodingFailed` is
+                // terminal and unreachable once entered, so no in-flight
+                // coding-active session can already have it set). The
+                // `MAX_RECOVERY_ATTEMPTS` ceiling (degrade-to-terminal after
+                // too many attempts) is added in a later task; this
+                // increments unconditionally.
+                FailureClass::Tooling => {
+                    let owner = counterpart(actor);
+                    next.pending_failure = Some(coding_failure.clone());
+                    next.recovery_phase = Some(*phase);
+                    next.recovery_owner = Some(owner);
+                    next.recovery_origin_owner = Some(actor);
+                    next.recovery_attempts = session.recovery_attempts.saturating_add(1);
+                    next.current_owner = owner;
+                }
+                // Terminal (unrecoverable) failure: today's exact behavior,
+                // plus capturing the phase the session was in at the time
+                // of failure and defensively clearing `pending_failure`.
+                FailureClass::Terminal => {
+                    next.coding_failure = Some(coding_failure.clone());
+                    next.failed_from_phase = Some(*phase);
+                    next.pending_failure = None;
+                    next.phase = Phase::CodingFailed;
+                    next.current_owner = actor;
+                }
+            }
         }
         (phase, _) => {
             // Terminal phases are short-circuited by the guard at the top of

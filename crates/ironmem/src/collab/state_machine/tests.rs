@@ -888,6 +888,311 @@ fn test_failure_report_from_code_review_final_pending_transitions_to_failed() {
     assert_eq!(s.phase, Phase::CodingFailed);
 }
 
+// ── v3: recoverable ("tooling") failure report ─────────────────────────
+
+/// The `counterpart` swap this module expects from the state machine —
+/// duplicated here (rather than reaching into `state_machine::mod`'s
+/// private helper) so the test's expectation is expressed independently of
+/// the implementation.
+fn expected_counterpart(agent: Agent) -> Agent {
+    match agent {
+        Agent::Claude => Agent::Codex,
+        Agent::Codex => Agent::Claude,
+    }
+}
+
+#[test]
+fn test_failure_report_recoverable_from_code_implement_pending_holds_phase() {
+    let s = locked_session("hf");
+    let s = submit_task_list(&s, "hf", 1);
+    assert_eq!(s.phase, Phase::CodeImplementPending);
+    let reporter = s.current_owner;
+    assert_eq!(reporter, Agent::Claude);
+
+    let s = apply_event(
+        &s,
+        reporter,
+        &CollabEvent::FailureReport {
+            coding_failure: "git_commit_failed: index.lock EPERM".to_string(),
+        },
+    )
+    .unwrap();
+
+    assert_eq!(s.phase, Phase::CodeImplementPending);
+    assert_eq!(s.current_owner, expected_counterpart(reporter));
+    assert_eq!(s.recovery_owner, Some(expected_counterpart(reporter)));
+    assert_eq!(s.recovery_phase, Some(Phase::CodeImplementPending));
+    assert_eq!(s.recovery_origin_owner, Some(reporter));
+    assert_eq!(s.recovery_attempts, 1);
+    assert_eq!(
+        s.pending_failure.as_deref(),
+        Some("git_commit_failed: index.lock EPERM")
+    );
+    assert_eq!(s.coding_failure, None);
+    assert_eq!(s.failed_from_phase, None);
+}
+
+#[test]
+fn test_failure_report_recoverable_from_code_review_fix_global_pending_holds_phase() {
+    let s = locked_session("hf");
+    let s = submit_task_list(&s, "hf", 1);
+    let s = apply_event(
+        &s,
+        Agent::Claude,
+        &CollabEvent::ImplementationDone {
+            head_sha: "b".to_string(),
+        },
+    )
+    .unwrap();
+    assert_eq!(s.phase, Phase::CodeReviewFixGlobalPending);
+    let reporter = s.current_owner;
+    assert_eq!(reporter, Agent::Codex);
+
+    let s = apply_event(
+        &s,
+        reporter,
+        &CollabEvent::FailureReport {
+            coding_failure: "sandbox_denied: write to /etc blocked".to_string(),
+        },
+    )
+    .unwrap();
+
+    assert_eq!(s.phase, Phase::CodeReviewFixGlobalPending);
+    assert_eq!(s.current_owner, expected_counterpart(reporter));
+    assert_eq!(s.recovery_owner, Some(expected_counterpart(reporter)));
+    assert_eq!(s.recovery_phase, Some(Phase::CodeReviewFixGlobalPending));
+    assert_eq!(s.recovery_origin_owner, Some(reporter));
+    assert_eq!(s.recovery_attempts, 1);
+    assert_eq!(s.coding_failure, None);
+    assert_eq!(s.failed_from_phase, None);
+}
+
+#[test]
+fn test_failure_report_recoverable_from_code_review_local_pending_holds_phase() {
+    let s = locked_session("hf");
+    let s = submit_task_list(&s, "hf", 1);
+    let s = apply_event(
+        &s,
+        Agent::Claude,
+        &CollabEvent::ImplementationDone {
+            head_sha: "b".to_string(),
+        },
+    )
+    .unwrap();
+    let s = apply_event(
+        &s,
+        Agent::Codex,
+        &CollabEvent::CodeReviewFixGlobal {
+            head_sha: "g1".to_string(),
+        },
+    )
+    .unwrap();
+    assert_eq!(s.phase, Phase::CodeReviewLocalPending);
+    let reporter = s.current_owner;
+    assert_eq!(reporter, Agent::Claude);
+
+    let s = apply_event(
+        &s,
+        reporter,
+        &CollabEvent::FailureReport {
+            coding_failure: "disk_full: /dev/sda1 at 100%".to_string(),
+        },
+    )
+    .unwrap();
+
+    assert_eq!(s.phase, Phase::CodeReviewLocalPending);
+    assert_eq!(s.current_owner, expected_counterpart(reporter));
+    assert_eq!(s.recovery_owner, Some(expected_counterpart(reporter)));
+    assert_eq!(s.recovery_phase, Some(Phase::CodeReviewLocalPending));
+    assert_eq!(s.recovery_origin_owner, Some(reporter));
+    assert_eq!(s.recovery_attempts, 1);
+    assert_eq!(s.coding_failure, None);
+    assert_eq!(s.failed_from_phase, None);
+}
+
+#[test]
+fn test_failure_report_recoverable_from_code_review_final_pending_holds_phase() {
+    let s = locked_session("hf");
+    let s = submit_task_list(&s, "hf", 1);
+    let s = apply_event(
+        &s,
+        Agent::Claude,
+        &CollabEvent::ImplementationDone {
+            head_sha: "b".to_string(),
+        },
+    )
+    .unwrap();
+    let s = apply_event(
+        &s,
+        Agent::Codex,
+        &CollabEvent::CodeReviewFixGlobal {
+            head_sha: "g1".to_string(),
+        },
+    )
+    .unwrap();
+    let s = apply_event(
+        &s,
+        Agent::Claude,
+        &CollabEvent::ReviewLocal {
+            head_sha: "g2".to_string(),
+        },
+    )
+    .unwrap();
+    assert_eq!(s.phase, Phase::CodeReviewFinalPending);
+    let reporter = s.current_owner;
+    assert_eq!(reporter, Agent::Claude);
+
+    let s = apply_event(
+        &s,
+        reporter,
+        &CollabEvent::FailureReport {
+            coding_failure: "network_failed: connection reset".to_string(),
+        },
+    )
+    .unwrap();
+
+    assert_eq!(s.phase, Phase::CodeReviewFinalPending);
+    assert_eq!(s.current_owner, expected_counterpart(reporter));
+    assert_eq!(s.recovery_owner, Some(expected_counterpart(reporter)));
+    assert_eq!(s.recovery_phase, Some(Phase::CodeReviewFinalPending));
+    assert_eq!(s.recovery_origin_owner, Some(reporter));
+    assert_eq!(s.recovery_attempts, 1);
+    assert_eq!(s.coding_failure, None);
+    assert_eq!(s.failed_from_phase, None);
+}
+
+#[test]
+fn test_failure_report_terminal_sets_failed_from_phase_and_clears_pending_failure() {
+    // A terminal (non-recoverable) report must still land in CodingFailed
+    // with `coding_failure` set, plus the new `failed_from_phase` recording
+    // exactly the phase the session was in when the failure hit, and
+    // `pending_failure` explicitly cleared.
+    let s = locked_session("hf");
+    let s = submit_task_list(&s, "hf", 1);
+    let s = apply_event(
+        &s,
+        Agent::Claude,
+        &CollabEvent::ImplementationDone {
+            head_sha: "b".to_string(),
+        },
+    )
+    .unwrap();
+    assert_eq!(s.phase, Phase::CodeReviewFixGlobalPending);
+
+    let s = apply_event(
+        &s,
+        Agent::Codex,
+        &CollabEvent::FailureReport {
+            coding_failure: "subagent_failure: task 3 crashed".to_string(),
+        },
+    )
+    .unwrap();
+
+    assert_eq!(s.phase, Phase::CodingFailed);
+    assert_eq!(
+        s.coding_failure.as_deref(),
+        Some("subagent_failure: task 3 crashed")
+    );
+    assert_eq!(s.failed_from_phase, Some(Phase::CodeReviewFixGlobalPending));
+    assert_eq!(s.pending_failure, None);
+}
+
+#[test]
+fn test_no_recoverable_failure_report_ever_reaches_a_terminal_phase() {
+    // Exhaustively cross every coding-active phase with every recoverable
+    // prefix: none of them may ever produce Phase::CodingFailed or
+    // Phase::CodingComplete.
+    let recoverable_failures = [
+        "git_commit_failed: index.lock EPERM",
+        "git_push_failed: non-fast-forward",
+        "sandbox_denied: write to /etc blocked",
+        "disk_full: /dev/sda1 at 100%",
+        "network_failed: connection reset",
+        "codex_dispatch_failed: mcp call timed out",
+    ];
+
+    // CodeImplementPending
+    let base = submit_task_list(&locked_session("hf"), "hf", 1);
+    for failure in recoverable_failures {
+        let s = apply_event(
+            &base,
+            base.current_owner,
+            &CollabEvent::FailureReport {
+                coding_failure: failure.to_string(),
+            },
+        )
+        .unwrap();
+        assert_eq!(s.phase, Phase::CodeImplementPending);
+        assert!(!s.phase.is_coding_terminal());
+    }
+
+    // CodeReviewFixGlobalPending
+    let base = apply_event(
+        &base,
+        Agent::Claude,
+        &CollabEvent::ImplementationDone {
+            head_sha: "b".to_string(),
+        },
+    )
+    .unwrap();
+    for failure in recoverable_failures {
+        let s = apply_event(
+            &base,
+            base.current_owner,
+            &CollabEvent::FailureReport {
+                coding_failure: failure.to_string(),
+            },
+        )
+        .unwrap();
+        assert_eq!(s.phase, Phase::CodeReviewFixGlobalPending);
+        assert!(!s.phase.is_coding_terminal());
+    }
+
+    // CodeReviewLocalPending
+    let base = apply_event(
+        &base,
+        Agent::Codex,
+        &CollabEvent::CodeReviewFixGlobal {
+            head_sha: "g1".to_string(),
+        },
+    )
+    .unwrap();
+    for failure in recoverable_failures {
+        let s = apply_event(
+            &base,
+            base.current_owner,
+            &CollabEvent::FailureReport {
+                coding_failure: failure.to_string(),
+            },
+        )
+        .unwrap();
+        assert_eq!(s.phase, Phase::CodeReviewLocalPending);
+        assert!(!s.phase.is_coding_terminal());
+    }
+
+    // CodeReviewFinalPending
+    let base = apply_event(
+        &base,
+        Agent::Claude,
+        &CollabEvent::ReviewLocal {
+            head_sha: "g2".to_string(),
+        },
+    )
+    .unwrap();
+    for failure in recoverable_failures {
+        let s = apply_event(
+            &base,
+            base.current_owner,
+            &CollabEvent::FailureReport {
+                coding_failure: failure.to_string(),
+            },
+        )
+        .unwrap();
+        assert_eq!(s.phase, Phase::CodeReviewFinalPending);
+        assert!(!s.phase.is_coding_terminal());
+    }
+}
+
 // ── helper: full batch happy path retains audit fields ───────────────
 
 #[test]
