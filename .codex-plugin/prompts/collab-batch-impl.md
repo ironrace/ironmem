@@ -274,6 +274,29 @@ via its Codex MCP tool when the session needs you again.
   at any time during a coding-active phase, independent of
   `current_owner`. A `coding_failure` prefixed `"branch_drift:"` is the
   canonical drift signal.
+- **Recoverable vs terminal `failure_report`.** The server classifies every
+  `coding_failure` string. Six prefixes are recoverable ("Tooling") when
+  followed by >=1 byte of real detail after the colon:
+  `git_commit_failed:`, `git_push_failed:`, `sandbox_denied:`,
+  `disk_full:`, `network_failed:`, `codex_dispatch_failed:` (e.g.
+  `git_commit_failed: index.lock EPERM`). Everything else — a bare prefix
+  with no detail, `branch_drift:`, `subagent_failure:`, any other string,
+  the empty string — is Terminal and ends the session in `CodingFailed`.
+  A Tooling report does **not** end the session: the phase stays put and
+  `current_owner` flips to the other agent, who must recover the turn.
+  When you (Codex) send a Tooling `failure_report`, leave the working tree
+  and diff exactly as they are — do **not** `git reset --hard` or discard
+  any staged/unstaged work — the counterpart needs that exact diff to
+  finish the turn, and don't retry the same failing operation in a loop.
+  If instead you become the **recovery owner** — because Claude sent a
+  Tooling `failure_report` and handed control to you, or you resumed a
+  `CodingFailed` session via `collab_resume` — you must: inspect the
+  preserved diff/working tree, run this phase's gates yourself, commit and
+  push the result, then send the phase's **normal** completion event
+  (`implementation_done`, `review_fix_global`, `review_local`, or
+  `final_review`) — never a new `failure_report`, which would just count
+  against the two-attempt retry ceiling instead of completing the turn.
+  Full detail: `docs/COLLAB.md` § "Failure + terminal".
 - **One invocation handles one turn.** Each `/collab join` runs until
   you successfully send exactly one message, then exits.
 

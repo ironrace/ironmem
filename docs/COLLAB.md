@@ -462,8 +462,10 @@ Invariants that still apply:
 
 - `collab_end` is rejected during all review phases, same as any other
   coding-active phase.
-- `failure_report` is the only escape hatch and transitions to
-  `CodingFailed`.
+- `failure_report` is the only escape hatch. A **Terminal**-classified
+  report transitions to `CodingFailed`; a **Tooling**-classified report
+  (six recoverable prefixes — see "Failure + terminal") instead keeps the
+  session at its current phase and flips `current_owner`.
 - Drift detection is special-cased for shortcut-started sessions:
   the server validates `CodeReviewFixGlobal{head_sha}` **and**
   `ReviewLocal{head_sha}` with a git ancestry check when `task_list` is
@@ -492,14 +494,119 @@ migration logic.
 
 ### Failure + terminal
 
+`failure_report` failures classify into two severities. Classification is
+server-authoritative (`failure_class::classify` in
+`crates/ironmem/src/collab/mod.rs`) — an agent never decides its own
+severity, it only picks an accurate `coding_failure` prefix.
+
+| Severity | Behavior |
+|---|---|
+| **Tooling** (recoverable) | Session **stays in its current phase**; `current_owner` flips to the counterpart agent, who must recover the turn. |
+| **Terminal** (unrecoverable) | Session transitions to `CodingFailed`. |
+
+#### The six recoverable prefixes
+
+A `coding_failure` classifies **Tooling** only if it starts with one of
+these prefixes AND has >=1 byte of detail after the colon. A bare prefix
+with nothing after it — like every other unrecognized string — classifies
+**Terminal**:
+
+| Prefix | Example |
+|---|---|
+| `git_commit_failed:` | `git_commit_failed: index.lock EPERM` |
+| `git_push_failed:` | `git_push_failed: remote rejected` |
+| `sandbox_denied:` | `sandbox_denied: write outside workspace` |
+| `disk_full:` | `disk_full: no space left on device` |
+| `network_failed:` | `network_failed: connection reset` |
+| `codex_dispatch_failed:` | `codex_dispatch_failed: process exited 137` |
+
+Everything else classifies **Terminal**: a bare recoverable prefix with no
+suffix, `branch_drift:` (see the drift check in "Harness-Side
+Responsibilities" below), `subagent_failure:`, any unrecognized string, and
+the empty string.
+
 | Phase | Owner | Event | Next |
 |---|---|---|---|
-| *any coding-active phase* | either | `FailureReport{coding_failure}` | `CodingFailed` (terminal) |
+| *any coding-active phase* | either | `FailureReport{coding_failure}` classifying **Tooling** | same phase; `current_owner` flips to the counterpart |
+| *any coding-active phase* | either | `FailureReport{coding_failure}` classifying **Terminal** | `CodingFailed` (terminal) |
 
 `collab_end` is **rejected** in every coding-active phase
 (`CodeImplementPending`, `CodeReviewFixGlobalPending`,
 `CodeReviewLocalPending`, `CodeReviewFinalPending`). Only
 `CodingComplete` or `CodingFailed` end the session post-`task_list`.
+
+#### Retry ceiling: `MAX_RECOVERY_ATTEMPTS = 2`
+
+Two recoverable reports in the same phase are tolerated — each one keeps
+the session in-phase and flips `current_owner` to the counterpart again. A
+*third* would-be-recoverable report in that phase degrades to **Terminal**
+instead, using that third report's own diagnostic (not an earlier
+attempt's), so the session doesn't loop forever on a tooling failure that
+never actually clears.
+
+#### Reporter and recovery-owner protocol (operator instructions — not server-enforced)
+
+When an agent hits a recoverable tooling failure — e.g. Codex cannot `git
+commit` from inside a linked worktree — it sends `failure_report` with a
+recoverable prefix and a real detail suffix, e.g. `git_commit_failed:
+index.lock EPERM`. The phase does not change; only `current_owner` flips
+to the counterpart. Two rules apply to both agents by convention — the
+server does not enforce either:
+
+- **The reporter MUST leave the working tree and diff intact.** Do not
+  `git reset --hard` or otherwise discard staged/unstaged work when
+  reporting a tooling failure — the counterpart needs that exact diff to
+  finish the turn. (This is distinct from the ordinary pre-send sync
+  described in "Harness-Side Responsibilities" below, which resets to
+  `last_head_sha` at the *start* of a turn — not while abandoning one
+  mid-flight.)
+- **The reporter MUST NOT retry the same failing operation in a loop**
+  hoping it magically works. Report once per genuine attempt and let the
+  counterpart recover.
+
+The recovery owner (the agent `current_owner` now names) MUST:
+
+1. Inspect the preserved diff/working-tree state the reporter left behind.
+2. Run whatever gates apply to the interrupted phase itself — the protocol
+   has no way to verify the reporter's incomplete work was safe.
+3. Commit and push the result itself. This is the actual fix for the
+   worktree-`git commit` scenario above: a different agent, with different
+   sandbox/git permissions, finishes the operation the reporter couldn't.
+4. Send the phase's **normal** completion event (`implementation_done`,
+   `review_fix_global`, `review_local`, or `final_review`, whichever the
+   interrupted phase expects) — **never** a new `failure_report`. The
+   delegated-completion mechanism accepts the recovery owner's normal
+   completion event as if it were the original owner's; sending
+   `failure_report` again would just count against the retry ceiling
+   instead of completing the turn.
+
+#### `pending_failure` vs `coding_failure`
+
+- `pending_failure` holds the diagnostic for an **in-flight** recoverable
+  (Tooling) failure. It is set while the session stays in its
+  coding-active phase awaiting recovery, and is mutually exclusive with
+  `coding_failure`.
+- `coding_failure` is reserved for the **terminal** cause. It is only ever
+  set when the session actually enters `CodingFailed` — either a genuine
+  Terminal report, or a Tooling report that broke the retry ceiling.
+
+#### `collab_resume`
+
+`collab_resume` (a separate MCP tool — see below — not a `collab_send`
+topic) lets either agent restore a `CodingFailed` session back to its
+`failed_from_phase`. It is eligible only when BOTH hold:
+
+- the stored `coding_failure` classifies **Tooling**, and
+- `failed_from_phase` was actually recorded.
+
+A session that predates this feature has `failed_from_phase = NULL` and
+`collab_resume` returns a deterministic `NotResumable` error naming that
+the session "predates resume support" — never a guess about what actually
+happened during coding. This path is for when the retry ceiling was
+exceeded, or a genuinely fresh process wants to pick a
+dead-but-recoverable session back up — it is not needed for the normal
+in-flight recovery described above, since that session never leaves its
+phase in the first place.
 
 ## Blind-Draft Invariant
 
@@ -729,6 +836,41 @@ Idempotent once allowed: calling from a terminal phase or an
 already-ended session is a no-op, and subsequent `send`, `ack`, `approve`,
 `register_caps`, and `wait_my_turn` calls all treat the session as ended.
 
+### `collab_resume`
+
+Restores a `CodingFailed` session back to its `failed_from_phase`. This is
+a **separate MCP tool, not a `collab_send` topic**. See "Failure +
+terminal" above for the recoverable-vs-terminal classification and the
+`MAX_RECOVERY_ATTEMPTS` retry ceiling that can land a session in
+`CodingFailed` even from a Tooling-classified failure.
+
+```json
+{ "session_id": "...", "agent": "codex" }
+```
+
+Eligible only when the session's stored `coding_failure` classifies
+**Tooling** (one of the six recoverable prefixes, with a detail suffix)
+**and** `failed_from_phase` was recorded. An ineligible call rejects with
+`NotResumable { reason }`:
+
+- A **Terminal**-classified `coding_failure` (unrecognized cause,
+  `branch_drift:`, `subagent_failure:`, or a Tooling report that broke the
+  retry ceiling) is never resumable — `reason` states this as a fact about
+  the stored classification, never a guess about what happened during
+  coding.
+- A session whose `failed_from_phase` is `NULL` predates this feature;
+  `reason` says the session "predates resume support."
+
+On success: `phase` is restored to `failed_from_phase`, `current_owner`
+becomes the caller (`agent`), `coding_failure` clears, and the prior
+terminal diagnostic moves into `pending_failure` for audit.
+`failed_from_phase` itself is left set as a historical record. This path
+is for when the retry ceiling was exceeded, or a fresh process wants to
+pick a dead-but-recoverable session back up — it is not needed for the
+normal in-flight recovery path (staying in-phase after a Tooling
+`failure_report`), which never calls `collab_resume` since that session
+never leaves its phase in the first place.
+
 ### `session_handoff` (fallback succession)
 
 Issues a cryptographic succession token that lets a fresh process take over
@@ -934,7 +1076,7 @@ orchestrator from steering the reviewer's conclusion.
 | `review_fix_global` | `codex` | `{"head_sha"}` | In `CodeReviewFixGlobalPending` only. Codex ran `/pr-review-toolkit:review-pr` on the raw post-implementation diff (no Claude pre-clean), used parallel fix subagents for confirmed partitionable findings, merged/cherry-picked the resulting fixes, and pushed the branch-level fix commit(s). |
 | `review_local` | `claude` | `{"head_sha"}` | In `CodeReviewLocalPending` only. Claude ran full or reduced audit of Codex's `review_fix_global` commits + caught issues both agents missed, used parallel fix subagents for confirmed partitionable findings, merged/cherry-picked the resulting fixes, and pushed. |
 | `final_review` | `claude` | `{"head_sha","pr_url"}` | In `CodeReviewFinalPending` only. Claude has opened the PR; the event carries the URL and advances directly to `CodingComplete`. `pr_url` must start with `https://` and be ≤2048 chars. |
-| `failure_report` | either | `{"coding_failure":"<reason>"}` | Valid in any coding-active phase. |
+| `failure_report` | either | `{"coding_failure":"<reason>"}` | Valid in any coding-active phase. Classifies **Tooling** (six recoverable prefixes, stays in-phase, `current_owner` flips) or **Terminal** (everything else, transitions to `CodingFailed`) — see "Failure + terminal" above. |
 
 ### `task_list` — `execution_mode` field
 
@@ -991,9 +1133,17 @@ exactly one event variant — there is no phase overloading.
 | `CodeReviewFinalPending` | `final_review`, `failure_report` | v3 — Claude opens PR |
 | `CodingComplete` / `CodingFailed` | *(none — terminal; only `collab_end` accepted)* | |
 
-`failure_report` is accepted from either agent in any coding-active phase
-and transitions the session to `CodingFailed`. All other topics are gated
-by the owner recorded in the phase table above.
+`failure_report` is accepted from either agent in any coding-active phase.
+A **Terminal**-classified report transitions the session to `CodingFailed`;
+a **Tooling**-classified report (one of the six recoverable prefixes, with
+detail — see "Failure + terminal" above) instead keeps the session in its
+current phase and flips `current_owner` to the counterpart. All other
+topics are gated by the owner recorded in the phase table above.
+
+`collab_resume` is a separate MCP tool, not a `collab_send` topic, so it is
+out of scope for this table — but it is the one way back into a coding
+phase from `CodingFailed`, when the stored failure classifies `Tooling` and
+`failed_from_phase` was recorded. See "Failure + terminal" above.
 
 ## Harness-Side Responsibilities
 

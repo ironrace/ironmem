@@ -21,7 +21,14 @@
 //! diff first, then Claude audits Codex's commits via `/ultrareview-local`,
 //! then Claude opens the PR — and lands directly in `CodingComplete`
 //! (terminal) on success — the final Claude turn opens the PR and carries
-//! its URL. `CodingFailed` is the unrecoverable-error terminal.
+//! its URL. `CodingFailed` is terminal for this session generation, but not
+//! always permanent: a `Tooling`-classified failure with a recorded
+//! `failed_from_phase` can be restored to that phase via `ResumeCoding`
+//! (the `collab_resume` MCP tool), while a `Terminal`-classified failure
+//! (unrecognized causes, `branch_drift:`, `subagent_failure:`, or a
+//! recoverable report that exceeded the retry ceiling) is genuinely
+//! unrecoverable. See [`failure_class::classify`] and
+//! [`MAX_RECOVERY_ATTEMPTS`] for the exact rule.
 
 pub mod handoff;
 pub mod queue;

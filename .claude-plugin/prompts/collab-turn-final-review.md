@@ -21,6 +21,22 @@ preconditions: phase == CodeReviewFinalPending, current_owner == claude
    `collab_status(session_id=$SESSION_ID, include_task_list:true)` and use the
    returned `task_list`.
 
+## Recoverable vs terminal failures
+
+The server classifies `failure_report`, not you — an accurate
+`coding_failure` prefix is all that's needed. Six prefixes recover the turn
+instead of ending the session: `git_commit_failed:`, `git_push_failed:`,
+`sandbox_denied:`, `disk_full:`, `network_failed:`,
+`codex_dispatch_failed:` (each needs real detail after the colon, e.g.
+`git_commit_failed: index.lock EPERM`); everything else (including
+`branch_drift:`/`subagent_failure:`) is terminal. `collab-turn-submit.md`
+sends this phase's `failure_report`/`final_review`, not this template. If
+you are acting as **recovery owner** — control was handed to you after a
+counterpart's recoverable `failure_report`, or you resumed via
+`collab_resume` — inspect the preserved diff, run this turn's gates
+yourself, commit + push, then send the normal completion event for
+whichever phase you're recovering (never a new `failure_report`).
+
 ## Actions
 1. Pushed-head proof only (no reset and do NOT re-run gates): verify
    `git cat-file -e <last_head_sha>^{commit}`, clean worktree,
