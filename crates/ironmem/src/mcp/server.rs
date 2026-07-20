@@ -986,8 +986,10 @@ fn tool_success_response(
 ///
 /// `barrier` is `Some` only when this request is dispatched as the
 /// per-connection mutation barrier owner (see `run_framing_loop`). The claim
-/// in `wait_my_turn_begin` is this tool's entire write — once it returns
-/// `Ok`, the mutation this barrier represents has fully committed, and the
+/// in `wait_my_turn_begin` — the generation settle plus the process-global
+/// attribution stamp it commits — is this tool's entire write; the poll loop
+/// below is read-only. Once `wait_my_turn_begin` returns `Ok`, the mutation
+/// this barrier represents has fully committed, and the
 /// next queued mutation may start without waiting for the (up to 60s) poll
 /// loop below to finish. `barrier` is fired exactly there, before the loop,
 /// and nowhere else in this function: on the `Err` path it is simply dropped
@@ -2890,9 +2892,9 @@ mod tests {
     ///
     /// Every step Task 3's dispatch path takes synchronously — reading the
     /// freshly-written line, admitting the mutation, `wait_my_turn_begin`'s
-    /// claim, sending the early-release signal, and the wait's own first poll
-    /// (`wait_my_turn_poll`, which is what actually claims the process-global
-    /// "active collab session" slot) — completes without ever yielding to the
+    /// claim (which is what stamps the process-global "active collab session"
+    /// slot), sending the early-release signal, and the wait's own first,
+    /// read-only poll — completes without ever yielding to the
     /// executor, so `budget` only has to be long enough for the runtime to give
     /// `loop_fut` a few turns; it is not a real long-poll wait. A regression that
     /// makes the loop hang instead panics via the `loop_fut` branch rather than
@@ -3019,15 +3021,23 @@ mod tests {
     ///
     /// One MCP process may have only one collab session "active" for metrics
     /// attribution at a time (`ensure_no_conflicting_process_session`) — a
-    /// wait's first poll claims that slot for its own session, and a
-    /// DIFFERENT session's claim attempt is refused while it's held. Because
-    /// every wait here uses its own distinct session, this test clears that
-    /// process-local marker (`App::clear_active_collab_session`, a public,
+    /// wait claims that slot for its own session in `wait_my_turn_begin`, once,
+    /// and a DIFFERENT session's claim attempt is refused while it's held.
+    /// Because every wait here uses its own distinct session, this test clears
+    /// that process-local marker (`App::clear_active_collab_session`, a public,
     /// ordinary method) between each wait's dispatch so the next wait's own
     /// claim isn't rejected as a cross-session conflict. This is pure test
     /// bookkeeping to work around a real, unrelated single-active-session
     /// invariant — it has nothing to do with, and does not touch, anything
     /// Task 3 introduced.
+    ///
+    /// The clear is RELIABLE only because the claim is confined to
+    /// `wait_my_turn_begin`: that runs during the preceding `drive_briefly`,
+    /// before the clear, and the poll loop that keeps running afterwards is
+    /// write-free. If the claim were re-stamped on every poll (as it was before
+    /// the #199 fix), an already-dispatched wait could re-bind the cell between
+    /// this clear and the next wait's `wait_my_turn_begin`, refusing that wait
+    /// and making this test flaky under CPU load.
     ///
     /// What this test does NOT prove: with `MAX_IN_FLIGHT_REQUESTS = 64` and
     /// only ~17 of the 24 waits ever actually admitted into `in_flight` (the

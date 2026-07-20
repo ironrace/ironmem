@@ -1182,6 +1182,16 @@ pub(super) fn wait_my_turn_deadline(
 /// Split out of the handler so the claim happens exactly ONCE per request even
 /// when the polling is driven from outside — claiming on every poll would try
 /// to re-consume a one-time handoff token and fail on the second iteration.
+///
+/// The process-global metrics attribution is claimed here too, exactly once,
+/// immediately after the generation claim commits and guarded by
+/// `ensure_no_conflicting_process_session` above. It must NOT be re-stamped by
+/// the poll loop: the ordering barrier is released as soon as this function
+/// returns `Ok` (see `server::dispatch_wait_my_turn`), so a still-polling wait
+/// for session A would otherwise clobber the cell back to A after a newer,
+/// later-queued request had legitimately bound it to B — producing spurious
+/// "another active collab session is already bound to this MCP process"
+/// refusals.
 pub(super) fn wait_my_turn_begin(app: &App, args: &Value) -> Result<(), MemoryError> {
     let session_id = require_str(args, "session_id")?;
     ensure_no_conflicting_process_session(app, session_id)?;
@@ -1195,21 +1205,27 @@ pub(super) fn wait_my_turn_begin(app: &App, args: &Value) -> Result<(), MemoryEr
             agent,
             super::handoff::opt_handoff_token(args).as_deref(),
         )
-    })
+    })?;
+
+    app.set_active_collab_session(session_id);
+    Ok(())
 }
 
 /// One snapshot read. Returns the response body and whether it SETTLES the wait
 /// — my turn, session ended, or a terminal phase — i.e. whether the caller
 /// should stop polling before the deadline.
 ///
-/// Deliberately free of sleeping and of any write, so a caller can drive it
-/// from an async loop without holding the dispatch thread across the wait.
+/// Deliberately free of sleeping and of any write — including the
+/// process-global attribution claim, which belongs to
+/// [`wait_my_turn_begin`] and happens exactly once per request. That keeps a
+/// long poll from mutating shared state after its barrier was already released,
+/// and lets a caller drive it from an async loop without holding the dispatch
+/// thread across the wait.
 pub(super) fn wait_my_turn_poll(app: &App, args: &Value) -> Result<(Value, bool), MemoryError> {
     let session_id = require_str(args, "session_id")?;
     let agent = require_agent(require_str(args, "agent")?)?;
 
     let record = app.db.collab_load_session_record(session_id)?;
-    app.set_active_collab_session(session_id);
     let snap = wait_turn_snapshot(&record, agent);
     let settled = snap.is_my_turn || snap.ended || snap.phase_is_terminal;
 
