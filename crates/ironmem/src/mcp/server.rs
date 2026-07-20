@@ -347,6 +347,18 @@ const MAX_IN_FLIGHT_REQUESTS: usize = 64;
 /// quietly become a hole in the ordering guarantee.
 const MAX_QUEUED_MUTATIONS: usize = 64;
 
+/// How many mutations dispatched as barrier owner may hold an early-release
+/// reservation at once, on one connection.
+///
+/// Invariant this protects: reads keep at least
+/// `MAX_IN_FLIGHT_REQUESTS - MAX_EARLY_RELEASED_WAITS` admission slots even
+/// when every early-released wait sits out its full 60s poll. Without this
+/// cap, a pipeline of `collab_wait_my_turn` claims could each release the
+/// barrier instantly yet still occupy an `in_flight` slot for its whole poll,
+/// filling `MAX_IN_FLIGHT_REQUESTS` and starving read admission for up to the
+/// long-poll timeout — see `barrier_release_for`.
+const MAX_EARLY_RELEASED_WAITS: usize = MAX_IN_FLIGHT_REQUESTS / 4;
+
 /// Per-connection MCP framing loop: read newline-delimited JSON-RPC requests
 /// from `reader`, dispatch each one, write the response to `writer`, and
 /// account response metrics.
@@ -443,6 +455,13 @@ where
     // clones handed to dispatched barrier owners are — so `recv()` below can
     // never spuriously resolve to `None` from every sender disappearing.
     let (early_release_tx, mut early_release_rx) = tokio::sync::mpsc::unbounded_channel::<u64>();
+    // Seqs of requests currently holding an early-release reservation — i.e.
+    // dispatched with `Some(BarrierRelease)` and not yet completed. Reserved
+    // at DISPATCH time (`barrier_release_for`), not when the signal actually
+    // fires, so a request that never calls `BarrierRelease::release` cannot
+    // leak a slot: it is freed unconditionally in the completion arm below.
+    let mut early_release_reserved: std::collections::HashSet<u64> =
+        std::collections::HashSet::new();
 
     loop {
         // Checked at the TOP of the loop, before entering `select!`: this is
@@ -477,6 +496,12 @@ where
                 // completion is the one that releases it, is decided below by
                 // `release_barrier` matching on `seq`.
                 let released = release_barrier(&mut mutation_barrier, seq);
+                // Unconditional and independent of `released`: this seq no
+                // longer occupies an in-flight slot regardless of whether it
+                // ever held the barrier at all (a plain read, or a mutation
+                // dispatched over the cap with `None`, was never reserved —
+                // `HashSet::remove` on an absent key is a harmless no-op).
+                early_release_reserved.remove(&seq);
 
                 write_and_account(app, &conn, &mut stdout, &request, response).await?;
 
@@ -487,7 +512,7 @@ where
                 if released {
                     start_next_queued_mutation(
                         app, &mut queued_mutations, &mut mutation_barrier, &mut next_seq,
-                        &mut in_flight, &early_release_tx,
+                        &mut in_flight, &early_release_tx, &mut early_release_reserved,
                     );
                 }
 
@@ -515,7 +540,7 @@ where
                 if released {
                     start_next_queued_mutation(
                         app, &mut queued_mutations, &mut mutation_barrier, &mut next_seq,
-                        &mut in_flight, &early_release_tx,
+                        &mut in_flight, &early_release_tx, &mut early_release_reserved,
                     );
                 }
                 // Deliberately does NOT touch `mutations_blocked`: early
@@ -626,7 +651,8 @@ where
                     let seq = next_seq;
                     next_seq += 1;
                     mutation_barrier = Some(seq);
-                    let barrier = Some(BarrierRelease { tx: early_release_tx.clone(), seq });
+                    let barrier =
+                        barrier_release_for(&early_release_tx, &mut early_release_reserved, seq);
                     in_flight.push(dispatch_in_flight(app, seq, request, arrived_at, barrier));
                     continue;
                 }
@@ -678,17 +704,39 @@ fn start_next_queued_mutation<'a>(
     next_seq: &mut u64,
     in_flight: &mut futures_util::stream::FuturesUnordered<InFlightRequest<'a>>,
     early_release_tx: &tokio::sync::mpsc::UnboundedSender<u64>,
+    early_release_reserved: &mut std::collections::HashSet<u64>,
 ) {
     if let Some((next, arrived_at)) = queued_mutations.pop_front() {
         let seq = *next_seq;
         *next_seq += 1;
         *mutation_barrier = Some(seq);
-        let barrier = Some(BarrierRelease {
-            tx: early_release_tx.clone(),
-            seq,
-        });
+        let barrier = barrier_release_for(early_release_tx, early_release_reserved, seq);
         in_flight.push(dispatch_in_flight(app, seq, next, arrived_at, barrier));
     }
+}
+
+/// Decide whether the mutation about to be dispatched as barrier owner gets
+/// an early-release signal, or must hold the barrier for its full duration
+/// like pre-#199 behavior (see `MAX_EARLY_RELEASED_WAITS`).
+///
+/// Reservation is taken HERE, at dispatch time — not when the signal actually
+/// fires — so a request that never calls `BarrierRelease::release` (anything
+/// other than a successful `collab_wait_my_turn` claim) cannot leak a
+/// reservation slot: it is freed unconditionally in the completion arm of
+/// `run_framing_loop`, regardless of whether it was ever used.
+fn barrier_release_for(
+    early_release_tx: &tokio::sync::mpsc::UnboundedSender<u64>,
+    early_release_reserved: &mut std::collections::HashSet<u64>,
+    seq: u64,
+) -> Option<BarrierRelease> {
+    if early_release_reserved.len() >= MAX_EARLY_RELEASED_WAITS {
+        return None;
+    }
+    early_release_reserved.insert(seq);
+    Some(BarrierRelease {
+        tx: early_release_tx.clone(),
+        seq,
+    })
 }
 
 /// The write that overflowed the per-connection ordering backlog.
@@ -2606,5 +2654,326 @@ mod tests {
             "a stream that ends cleanly must close normally, not as an error; \
              got {result:?}"
         );
+    }
+
+    // ── Task 3: bounded admission for early-released waits ─────────────────
+
+    /// Build a `collab_wait_my_turn` request that carries a real `handoff_token`
+    /// — i.e. one the framing loop's `is_mutating_request` classifies as a
+    /// MUTATION (see `tools::CONDITIONALLY_MUTATING_TOOLS`'s `collab_wait_my_turn`
+    /// entry), so it actually goes through the mutation-ordering barrier and is
+    /// eligible for `barrier_release_for`'s early-release reservation — a
+    /// `collab_wait_my_turn` call without a token is a plain read and never
+    /// touches any of this.
+    fn wait_request(
+        id: u64,
+        session_id: &str,
+        token: &str,
+        timeout_secs: u64,
+    ) -> serde_json::Value {
+        json!({
+            "jsonrpc": "2.0", "id": id, "method": "tools/call",
+            "params": {
+                "name": "collab_wait_my_turn",
+                "arguments": {
+                    "session_id": session_id, "agent": "codex",
+                    "handoff_token": token, "timeout_secs": timeout_secs
+                }
+            }
+        })
+    }
+
+    /// A fresh session (implementer `Claude`) with a freshly issued, unclaimed
+    /// `handoff_token` for `Agent::Codex`.
+    ///
+    /// One (session, agent) pair can hold only ONE pending token at a time
+    /// (`collab_actor_generations`'s primary key), so getting N independent,
+    /// simultaneously-claimable tokens for N concurrent waits requires N
+    /// separate sessions — there is no way to mint several live tokens for one
+    /// session.
+    ///
+    /// Since `agent` here is always `Codex` and every session's `current_owner`
+    /// defaults to its `Claude` implementer, a wait claiming this token as
+    /// `codex` is never "my turn" and the session is never ended by this
+    /// helper, so the resulting wait genuinely long-polls rather than settling.
+    fn wait_session_and_token(app: &Arc<App>) -> (String, String) {
+        let session_id = uuid::Uuid::new_v4().to_string();
+        app.db
+            .with_transaction(|tx| {
+                crate::collab::queue::create_session(
+                    tx,
+                    &session_id,
+                    "/repo",
+                    "main",
+                    Some("task"),
+                    crate::collab::Agent::Claude,
+                )
+            })
+            .unwrap();
+        let token = app
+            .db
+            .with_transaction(|tx| {
+                crate::collab::handoff::issue_or_reuse_handoff(
+                    tx,
+                    &session_id,
+                    crate::collab::Agent::Codex,
+                )
+            })
+            .unwrap()
+            .token;
+        (session_id, token)
+    }
+
+    /// Give `loop_fut` up to `budget` of cooperative wall-clock time to react to
+    /// whatever was just written to its input side, then return.
+    ///
+    /// Every step Task 3's dispatch path takes synchronously — reading the
+    /// freshly-written line, admitting the mutation, `wait_my_turn_begin`'s
+    /// claim, sending the early-release signal, and the wait's own first poll
+    /// (`wait_my_turn_poll`, which is what actually claims the process-global
+    /// "active collab session" slot) — completes without ever yielding to the
+    /// executor, so `budget` only has to be long enough for the runtime to give
+    /// `loop_fut` a few turns; it is not a real long-poll wait. A regression that
+    /// makes the loop hang instead panics via the `loop_fut` branch rather than
+    /// silently reporting "done" with nothing having happened.
+    async fn drive_briefly(
+        loop_fut: &mut (impl std::future::Future<Output = Result<(), MemoryError>> + Unpin),
+        budget: std::time::Duration,
+    ) {
+        tokio::select! {
+            result = &mut *loop_fut => panic!("framing loop exited early: {result:?}"),
+            _ = tokio::time::sleep(budget) => {}
+        }
+    }
+
+    /// Task 3: dispatching a batch of token-bearing waits that straddles
+    /// `MAX_EARLY_RELEASED_WAITS` must not stall a read pipelined behind them.
+    ///
+    /// Each of the `MAX_EARLY_RELEASED_WAITS + 8` waits below claims its own
+    /// session's handoff token as `codex`, which is never that session's
+    /// current owner, and none of the sessions is ever ended — so no wait ever
+    /// settles on its own within this test's lifetime. Only the first
+    /// `MAX_EARLY_RELEASED_WAITS` get an early-release reservation
+    /// (`barrier_release_for`); the next one dispatched is forced to hold the
+    /// mutation barrier for its own full poll (fail-closed, pre-#199
+    /// behavior), which in turn leaves every wait behind IT stuck in the
+    /// per-connection ordering queue, never even dispatched. Every single one
+    /// of the 24 therefore remains unanswered for the entire test — which
+    /// makes the assertion below unambiguous: if the trailing `search` read's
+    /// response arrives at all, it did so while every wait was still
+    /// outstanding.
+    ///
+    /// One MCP process may have only one collab session "active" for metrics
+    /// attribution at a time (`ensure_no_conflicting_process_session`) — a
+    /// wait's first poll claims that slot for its own session, and a
+    /// DIFFERENT session's claim attempt is refused while it's held. Because
+    /// every wait here uses its own distinct session, this test clears that
+    /// process-local marker (`App::clear_active_collab_session`, a public,
+    /// ordinary method) between each wait's dispatch so the next wait's own
+    /// claim isn't rejected as a cross-session conflict. This is pure test
+    /// bookkeeping to work around a real, unrelated single-active-session
+    /// invariant — it has nothing to do with, and does not touch, anything
+    /// Task 3 introduced.
+    ///
+    /// What this test does NOT prove: with `MAX_IN_FLIGHT_REQUESTS = 64` and
+    /// only ~17 of the 24 waits ever actually admitted into `in_flight` (the
+    /// rest sit in the ordering queue for the whole test, since the one wait
+    /// dispatched over the cap holds the barrier for its full poll and blocks
+    /// the queue behind it), this is nowhere near exhausting
+    /// `MAX_IN_FLIGHT_REQUESTS` itself — that would need close to 64 genuinely
+    /// concurrent long-polling waits, which this test does not construct. It
+    /// is only an integration-level proof that a batch straddling the
+    /// `MAX_EARLY_RELEASED_WAITS` boundary does not stall a read behind it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn early_released_waits_are_capped_and_a_read_behind_them_still_answers() {
+        #[allow(clippy::arc_with_non_send_sync)]
+        let app = Arc::new(App::open_for_test().unwrap());
+
+        let wait_count = MAX_EARLY_RELEASED_WAITS + 8;
+        let (mut client_in, server_in) = tokio::io::duplex(1 << 20);
+        let (server_out, client_out) = tokio::io::duplex(1 << 20);
+        let mut loop_fut = Box::pin(run_framing_loop(
+            &app,
+            BufReader::new(server_in),
+            server_out,
+            TransportMode::DaemonConnection,
+        ));
+
+        for i in 0..wait_count {
+            let (session_id, token) = wait_session_and_token(&app);
+            let request = wait_request(i as u64, &session_id, &token, 30);
+            client_in
+                .write_all(format!("{request}\n").as_bytes())
+                .await
+                .unwrap();
+            drive_briefly(&mut loop_fut, Duration::from_millis(20)).await;
+            app.clear_active_collab_session();
+        }
+
+        let read_id = 999_999_u64;
+        let search = json!({
+            "jsonrpc": "2.0", "id": read_id, "method": "tools/call",
+            "params": {"name": "search", "arguments": {"query": "anything"}}
+        });
+        client_in
+            .write_all(format!("{search}\n").as_bytes())
+            .await
+            .unwrap();
+
+        let mut responses = BufReader::new(client_out).lines();
+        let first = tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::select! {
+                result = &mut loop_fut => panic!("framing loop exited early: {result:?}"),
+                line = responses.next_line() => serde_json::from_str::<serde_json::Value>(
+                    &line.unwrap().expect("server must write a response"),
+                )
+                .expect("response must be valid JSON"),
+            }
+        })
+        .await
+        .expect(
+            "the read pipelined behind a batch straddling MAX_EARLY_RELEASED_WAITS got no \
+             answer within 5s — the connection is stalled, which is exactly the starvation \
+             the cap exists to prevent",
+        );
+
+        assert_eq!(
+            first["id"],
+            json!(read_id),
+            "the read must be answered while every wait is still outstanding (none of the \
+             24 ever settles within this test's window); got {first:?} instead"
+        );
+    }
+
+    /// Task 3: the early-release reservation taken at dispatch must be freed
+    /// on COMPLETION, not merely when the mutation barrier itself is freed —
+    /// otherwise the slot leaks forever and the cap permanently ratchets down
+    /// after the first `MAX_EARLY_RELEASED_WAITS` early-released waits a
+    /// connection ever sees.
+    ///
+    /// Dispatches exactly `MAX_EARLY_RELEASED_WAITS` waits with the minimum
+    /// allowed `timeout_secs` (1, per `wait_my_turn_timeout`'s clamp) and lets
+    /// every one of them actually settle (their poll expires), which is the
+    /// completion event that should free their reservations
+    /// (`early_release_reserved.remove` in the completion arm). It then
+    /// dispatches one more wait with a long timeout — which never settles on
+    /// its own — followed immediately by a queued mutation (another short
+    /// wait). If the freed reservations were NOT reclaimed, the new wait would
+    /// find the reservation set still full, be dispatched with `None`, and be
+    /// forced to hold the barrier for its own full 30s poll — so the queued
+    /// mutation behind it would only be answered after that. Observing the
+    /// queued mutation's response arrive promptly (well under the new wait's
+    /// timeout, and strictly before the new wait's own response) is the proof
+    /// the reservations were correctly freed.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn early_release_reservation_is_freed_on_completion() {
+        #[allow(clippy::arc_with_non_send_sync)]
+        let app = Arc::new(App::open_for_test().unwrap());
+
+        let (mut client_in, server_in) = tokio::io::duplex(1 << 20);
+        let (server_out, client_out) = tokio::io::duplex(1 << 20);
+        let mut loop_fut = Box::pin(run_framing_loop(
+            &app,
+            BufReader::new(server_in),
+            server_out,
+            TransportMode::DaemonConnection,
+        ));
+        let mut responses = BufReader::new(client_out).lines();
+
+        for i in 0..MAX_EARLY_RELEASED_WAITS {
+            let (session_id, token) = wait_session_and_token(&app);
+            let request = wait_request(i as u64, &session_id, &token, 1);
+            client_in
+                .write_all(format!("{request}\n").as_bytes())
+                .await
+                .unwrap();
+            drive_briefly(&mut loop_fut, Duration::from_millis(20)).await;
+            app.clear_active_collab_session();
+        }
+
+        // Let all `MAX_EARLY_RELEASED_WAITS` waits actually settle (their 1s
+        // timeout expires), which is the completion event expected to free
+        // their reservations.
+        let mut settled_ids: std::collections::HashSet<u64> = std::collections::HashSet::new();
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while settled_ids.len() < MAX_EARLY_RELEASED_WAITS {
+                tokio::select! {
+                    result = &mut loop_fut => panic!("framing loop exited early: {result:?}"),
+                    line = responses.next_line() => {
+                        let line = line.unwrap().expect("a response");
+                        let response: serde_json::Value = serde_json::from_str(&line).unwrap();
+                        settled_ids.insert(response["id"].as_u64().unwrap());
+                    }
+                }
+            }
+        })
+        .await
+        .expect(
+            "the first MAX_EARLY_RELEASED_WAITS waits must all settle within 10s (their \
+             timeout_secs is 1) — a regression here is in the polling loop itself, not the \
+             reservation logic this test targets",
+        );
+
+        // The 16 waits above kept re-claiming the process-local "active collab
+        // session" marker on every poll until they settled (see
+        // `wait_session_and_token`'s doc comment) and were never cleaned up
+        // afterward, so it is still pinned to whichever of them polled last.
+        // Clear it here for the same reason the dispatch loop above does:
+        // this next wait uses yet another distinct session, so an unrelated
+        // leftover "active" session would otherwise reject its claim outright
+        // as a cross-session conflict before it ever reaches the reservation
+        // logic this test targets.
+        app.clear_active_collab_session();
+
+        // One more wait (long timeout, never settles on its own) plus a
+        // mutation queued right behind it.
+        let (new_session, new_token) = wait_session_and_token(&app);
+        let new_wait_id = 9_000_u64;
+        let new_wait = wait_request(new_wait_id, &new_session, &new_token, 30);
+        client_in
+            .write_all(format!("{new_wait}\n").as_bytes())
+            .await
+            .unwrap();
+        drive_briefly(&mut loop_fut, Duration::from_millis(20)).await;
+        app.clear_active_collab_session();
+
+        let (queued_session, queued_token) = wait_session_and_token(&app);
+        let queued_id = 9_100_u64;
+        let queued = wait_request(queued_id, &queued_session, &queued_token, 1);
+        client_in
+            .write_all(format!("{queued}\n").as_bytes())
+            .await
+            .unwrap();
+
+        let queued_response = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                tokio::select! {
+                    result = &mut loop_fut => panic!("framing loop exited early: {result:?}"),
+                    line = responses.next_line() => {
+                        let line = line.unwrap().expect("a response");
+                        let response: serde_json::Value = serde_json::from_str(&line).unwrap();
+                        assert_ne!(
+                            response["id"], json!(new_wait_id),
+                            "the NEW wait's own response arrived before the mutation queued \
+                             behind it — its reservation must have leaked from the earlier \
+                             batch, forcing it to hold the barrier for its full 30s timeout \
+                             instead of releasing early"
+                        );
+                        if response["id"] == json!(queued_id) {
+                            break response;
+                        }
+                    }
+                }
+            }
+        })
+        .await
+        .expect(
+            "the mutation queued behind the new wait got no answer within 5s — if the \
+             earlier MAX_EARLY_RELEASED_WAITS completions did not free their reservations, \
+             the new wait would hold the barrier for its own 30s timeout instead of \
+             releasing early, and this queued mutation would be stuck behind it the whole \
+             time",
+        );
+        assert_eq!(queued_response["id"], json!(queued_id));
     }
 }
