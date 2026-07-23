@@ -218,7 +218,7 @@ Stored in `collab_sessions`:
 | `task_list` / `task_list_ref` | The accepted v3 task list. By default `collab_status` returns compact `task_list_ref` `{drawer_id, hash, first_200_chars}` plus top-level `tasks_count`, `plan_file_path`, and `execution_mode`; pass `include_task_list:true` to inline the full JSON. New sessions store the task list in `collab-task-lists`; pre-014 sessions may have `task_list_ref.drawer_id = null`. |
 | `task_list_drawer_id` | Deterministic 32-char id of the `collab-task-lists` drawer storing the canonicalized task-list JSON once accepted (migration 014). NULL on pre-014 sessions. |
 | `codex_review_verdict` | Last Codex verdict |
-| `review_round` | Number of completed Codex reviews (0, 1, or 2) |
+| `review_round` | Number of completed Codex reviews (0 or 1; planning has one review pass) |
 | `ended_at` | Non-null once `collab_end` has been called |
 
 All state changes are recorded in `wal_log`.
@@ -863,6 +863,10 @@ compact body reference `{drawer_id, hash, first_200_chars}`; it does not inline
 `get_drawer` with its `drawer_id` to retrieve the complete body. The `hash`
 matches that body, and `first_200_chars` is a preview of its first 200 Unicode
 characters (not bytes), or the whole body when it is shorter.
+
+Message `drawer_id` values are opaque transport references, not content-derived
+hashes. They are intentionally excluded from generic memory search; obtain one
+only from the message envelope before calling `get_drawer`.
 
 `full:true` additionally returns inline `content` for current rows, but exists
 for compatibility rather than normal retrieval. Pre-016 legacy rows can have
@@ -2283,7 +2287,7 @@ Scope (v1 + v3):
 
 - bounded planning (v1) and bounded coding loop (v3) through a single session
 - one plan → one task list → one PR per session
-- v1 planning is 2 review rounds; v3 coding is strictly linear (no rounds)
+- v1 planning has one Codex review round; v3 coding is strictly linear (no rounds)
 - Claude always gets the last word in planning (v1) and owns the
   audit/PR turns after Codex's first branch-scope review in v3
 - Claude runs the dispatcher loop; Codex-owned phases are one-shot

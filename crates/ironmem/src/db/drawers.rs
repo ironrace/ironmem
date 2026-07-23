@@ -39,6 +39,10 @@ use crate::error::MemoryError;
 /// A synthetic drawer has `source_file = "pref:<parent_drawer_id>"`.
 pub(crate) const PREF_SENTINEL: &str = "pref:";
 
+/// Transport-only collab message bodies are retrieved by their opaque drawer
+/// references and must not be discoverable through generic memory search.
+const COLLAB_MESSAGE_ROOM: &str = "collab-messages";
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Drawer {
     pub id: String,
@@ -146,6 +150,10 @@ impl Database {
                 added_by = excluded.added_by",
             params![id, content, blob, wing, room, source_file, added_by],
         )?;
+
+        if room == COLLAB_MESSAGE_ROOM {
+            return Ok(());
+        }
 
         // Keep FTS5 index in sync (delete-then-insert for upsert semantics).
         // Silently skip if the FTS table doesn't exist yet (pre-migration DBs).

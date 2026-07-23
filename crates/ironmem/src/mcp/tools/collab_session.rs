@@ -1,6 +1,7 @@
 use rusqlite::OptionalExtension;
 use serde_json::{json, Value};
 use std::process::Command;
+use uuid::Uuid;
 
 use crate::collab::queue::SessionRecord;
 use crate::collab::{
@@ -98,15 +99,19 @@ fn store_collab_task_list_drawer(
     Ok(id)
 }
 
-/// Store an accepted collab message body as an immutable, content-addressed
+/// Store an accepted collab message body as an immutable, opaque-reference
 /// drawer. Queue rows retain the per-session delivery metadata; this drawer is
 /// only the stable body reference shared by compact `collab_recv` responses.
+///
+/// The id must not be content-addressed: a client that can guess a message
+/// body must not be able to derive a reference that bypasses `collab_recv`'s
+/// restricted-mode redaction.
 fn store_collab_message_drawer(
     tx: &rusqlite::Transaction<'_>,
     content: &str,
 ) -> Result<String, MemoryError> {
     use ironrace_embed::embedder::EMBED_DIM;
-    let id = crate::db::drawers::generate_id(content, COLLAB_WING, COLLAB_MESSAGE_ROOM);
+    let id = Uuid::new_v4().simple().to_string();
     let zero = vec![0.0f32; EMBED_DIM];
     crate::db::schema::Database::insert_drawer_tx(
         tx,
@@ -272,8 +277,8 @@ struct WaitTurnSnapshot {
 fn wait_turn_snapshot(record: &SessionRecord, agent: Agent) -> WaitTurnSnapshot {
     let ended = record.ended_at.is_some();
     // Dynamic terminal set, evaluated on a single snapshot: pre-task_list,
-    // PlanLocked is terminal so v1 agents can exit cleanly after the plan
-    // locks. Post-task_list the v2 coding phase is underway and the terminal
+    // PlanLocked is terminal so v3 agents can exit cleanly after the plan
+    // locks. Post-task_list the v3 coding phase is underway and the terminal
     // set switches to `{CodingComplete, CodingFailed}`.
     let task_list_submitted = record.session.task_list.is_some();
     let phase_is_terminal = if task_list_submitted {
@@ -1352,7 +1357,7 @@ pub(super) fn handle_collab_end(app: &App, args: &Value) -> Result<Value, Memory
             super::handoff::opt_handoff_token(args).as_deref(),
         )?;
         // collab_end is valid only from PlanLocked (pre-task_list), or from
-        // the two v2 terminal phases. Rejecting during any active planning
+        // the two v3 terminal phases. Rejecting during any active planning
         // or coding phase prevents either agent from killing a session the
         // counterpart is still working in.
         let session = crate::collab::queue::load_session(tx, session_id)?;

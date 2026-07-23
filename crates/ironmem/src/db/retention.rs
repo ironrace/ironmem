@@ -1,7 +1,7 @@
 //! Conservative memory-retention helpers for operational drawers.
 
 use chrono::{Duration, Utc};
-use rusqlite::params;
+use rusqlite::{params, Transaction};
 use serde::Serialize;
 use serde_json::json;
 
@@ -313,6 +313,30 @@ impl Database {
         )?;
         Ok(count > 0)
     }
+
+    pub(crate) fn is_referenced_collab_drawer_tx(
+        tx: &Transaction<'_>,
+        drawer_id: &str,
+    ) -> Result<bool, MemoryError> {
+        let count: i64 = tx.query_row(
+            "SELECT COUNT(*)
+             FROM (
+                SELECT 1
+                FROM collab_sessions
+                WHERE canonical_plan_drawer_id = ?1
+                   OR final_plan_drawer_id = ?1
+                   OR task_list_drawer_id = ?1
+                UNION ALL
+                SELECT 1
+                FROM messages
+                WHERE drawer_id IS NOT NULL
+                  AND drawer_id = ?1
+             )",
+            params![drawer_id],
+            |row| row.get(0),
+        )?;
+        Ok(count > 0)
+    }
 }
 
 #[cfg(test)]
@@ -402,9 +426,9 @@ mod tests {
     }
 
     #[test]
-    fn apply_keeps_message_referenced_drawer() {
+    fn message_transport_drawers_are_not_gc_candidates() {
         let db = Database::open_in_memory().unwrap();
-        let message_drawer_id = insert_old(&db, "message drawer", PLAN_ROOM);
+        let message_drawer_id = insert_old(&db, "message drawer", "collab-messages");
         db.exec_raw(&format!(
             "INSERT INTO collab_sessions (id, repo_path, branch)
              VALUES ('message-session', '/tmp/repo', 'main');
@@ -428,11 +452,9 @@ mod tests {
         .unwrap();
 
         assert_eq!(report.delete_candidates, 0);
-        assert_eq!(report.skipped_candidates, 1);
+        assert_eq!(report.skipped_candidates, 0);
         assert_eq!(report.deleted, 0);
-        assert_eq!(report.candidates.len(), 1);
-        assert_eq!(report.candidates[0].id, message_drawer_id);
-        assert_eq!(report.candidates[0].action, MemoryGcAction::Skip);
+        assert!(report.candidates.is_empty());
         assert!(db.get_drawer(&message_drawer_id).unwrap().is_some());
     }
 

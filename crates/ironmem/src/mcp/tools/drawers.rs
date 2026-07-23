@@ -362,6 +362,11 @@ pub(super) fn handle_delete_drawer(app: &App, args: &Value) -> Result<Value, Mem
     validate_hex_id(id, "id")?;
 
     let deleted = app.db.with_transaction(|tx| {
+        if crate::db::schema::Database::is_referenced_collab_drawer_tx(tx, id)? {
+            return Err(MemoryError::Validation(
+                "cannot delete a drawer referenced by collab state".to_string(),
+            ));
+        }
         let deleted = crate::db::schema::Database::delete_drawer_tx(tx, id)?;
         crate::db::schema::Database::wal_log_tx(tx, "delete_drawer", &json!({"id": id}), None)?;
         Ok(deleted)

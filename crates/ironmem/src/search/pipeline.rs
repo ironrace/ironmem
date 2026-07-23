@@ -413,10 +413,11 @@ pub fn search(
 }
 
 fn drawer_matches_filters(drawer: &Drawer, filters: &SearchFilters) -> bool {
-    filters
-        .wing
-        .as_deref()
-        .is_none_or(|wing| drawer.wing == wing)
+    drawer.room != "collab-messages"
+        && filters
+            .wing
+            .as_deref()
+            .is_none_or(|wing| drawer.wing == wing)
         && filters
             .room
             .as_deref()

@@ -297,8 +297,7 @@ impl Database {
     }
 
     pub fn create_collab_tables(&self) -> Result<(), MemoryError> {
-        retry_on_busy(|| self.conn.execute_batch(COLLAB_SQL))?;
-        Ok(())
+        self.migrate()
     }
 
     /// Execute a closure inside a SQLite transaction and commit on success.
@@ -451,6 +450,17 @@ mod tests {
         let db = Database::open_in_memory().unwrap();
         assert_eq!(LATEST_SCHEMA_VERSION, db.schema_version().unwrap());
         assert_eq!(LATEST_SCHEMA_VERSION, 16);
+    }
+
+    #[test]
+    fn create_collab_tables_applies_the_current_collab_schema() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open(&dir.path().join("collab.sqlite3")).unwrap();
+
+        db.create_collab_tables().unwrap();
+
+        assert_eq!(db.schema_version().unwrap(), LATEST_SCHEMA_VERSION);
+        assert!(column_exists(&db, "messages", "drawer_id"));
     }
 
     #[test]

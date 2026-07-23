@@ -335,6 +335,27 @@ fn collab_happy_path_locks_via_mcp_handlers() {
     let status = call_tool(&app, "collab_status", json!({ "session_id": session_id }));
     assert_eq!(status["phase"], "PlanClaudeFinalizePending");
 
+    let reviews = call_tool(
+        &app,
+        "collab_recv",
+        json!({ "session_id": session_id, "receiver": "claude" }),
+    );
+    let review = reviews["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|message| message["topic"] == "review")
+        .expect("collab_approve must queue a review message for Claude");
+    assert!(review.get("content").is_none());
+    let review_drawer_id = review["drawer_id"]
+        .as_str()
+        .expect("approve review must have a durable drawer ref");
+    let review_drawer = call_tool(&app, "get_drawer", json!({ "id": review_drawer_id }));
+    assert_eq!(
+        review_drawer["content"],
+        json!({ "verdict": "approve", "content_hash": canonical_hash }).to_string()
+    );
+
     call_tool(
         &app,
         "collab_send",
@@ -787,7 +808,7 @@ fn collab_recv_blocks_draft_peek_before_own_draft_submitted() {
     let peek = call_tool(
         &app,
         "collab_recv",
-        json!({ "session_id": session_id, "receiver": "codex" }),
+        json!({ "session_id": session_id, "receiver": "codex", "auto_ack": true }),
     );
     let messages = peek["messages"].as_array().unwrap();
     assert!(
@@ -885,6 +906,23 @@ fn collab_recv_defaults_to_drawer_refs_that_get_drawer_can_dereference() {
     assert_eq!(drawer["content"], content);
     assert_eq!(drawer["wing"], "ironrace-memory");
     assert_eq!(drawer["room"], "collab-messages");
+
+    assert_ne!(
+        drawer_id,
+        ironmem::db::drawers::generate_id(content, "ironrace-memory", "collab-messages"),
+        "transport refs must be opaque rather than derivable from message content"
+    );
+    let search = call_tool(&app, "search", json!({ "query": content }));
+    assert!(
+        !search["results"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|result| result["id"] == drawer_id),
+        "transport drawers must not be discoverable through generic search"
+    );
+    let delete_error = call_tool_expect_error(&app, "delete_drawer", json!({ "id": drawer_id }));
+    assert!(delete_error.contains("referenced by collab state"));
 }
 
 #[test]
@@ -1060,8 +1098,6 @@ fn collab_recv_redacts_message_content_and_derivatives_in_restricted_mode() {
     // same persisted fixture to its restricted read view.
     let mut app = App::open_for_test().unwrap();
     let content = "SENSITIVE: do not expose the launch password";
-    let expected_drawer_id =
-        ironmem::db::drawers::generate_id(content, "ironrace-memory", "collab-messages");
     let started = call_tool(
         &app,
         "collab_start",
@@ -1114,10 +1150,70 @@ fn collab_recv_redacts_message_content_and_derivatives_in_restricted_mode() {
         assert!(message.get("content").is_none());
         assert!(
             !encoded.contains(content)
-                && !encoded.contains(&sha256_hex(content))
-                && !encoded.contains(&expected_drawer_id),
+                && !encoded.contains(&sha256_hex(content)),
             "restricted collab_recv must not expose a body or content-derived fingerprint: {encoded}"
         );
+    }
+}
+
+#[test]
+fn collab_recv_redacts_legacy_inline_content_in_restricted_mode() {
+    use ironmem::config::McpAccessMode;
+
+    let mut app = App::open_for_test().unwrap();
+    let content = "SENSITIVE legacy message body";
+    let started = call_tool(
+        &app,
+        "collab_start",
+        json!({ "repo_path": "/repo", "branch": "main", "initiator": "claude" }),
+    );
+    let session_id = started["session_id"].as_str().unwrap();
+    let sent = call_tool(
+        &app,
+        "collab_send",
+        json!({
+            "session_id": session_id,
+            "sender": "claude",
+            "topic": "draft",
+            "content": content,
+        }),
+    );
+    let message_id = sent["message_id"].as_str().unwrap();
+    call_tool(
+        &app,
+        "collab_send",
+        json!({
+            "session_id": session_id,
+            "sender": "codex",
+            "topic": "draft",
+            "content": "Codex's separate draft",
+        }),
+    );
+    app.db
+        .with_transaction(|tx| {
+            tx.execute(
+                "UPDATE messages SET drawer_id = NULL WHERE id = ?1",
+                [message_id],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+    app.config.mcp_access_mode = McpAccessMode::Restricted;
+
+    for args in [
+        json!({ "session_id": session_id, "receiver": "codex" }),
+        json!({ "session_id": session_id, "receiver": "codex", "full": true }),
+    ] {
+        let message = &call_tool(&app, "collab_recv", args)["messages"][0];
+        assert_eq!(message["content_redacted"], true);
+        assert_eq!(message["hash_redacted"], true);
+        for field in ["drawer_id", "hash", "first_200_chars", "content"] {
+            assert!(
+                message.get(field).is_none(),
+                "restricted legacy receive must omit {field}"
+            );
+        }
+        assert!(!message.to_string().contains(content));
     }
 }
 

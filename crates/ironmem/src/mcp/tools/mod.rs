@@ -306,7 +306,7 @@ pub fn tool_definitions(app: &App) -> Vec<Value> {
         }),
         json!({
             "name": "collab_recv",
-            "description": "Read pending collab messages for one agent. By default, each message returns its stable delivery envelope plus {drawer_id, hash, first_200_chars}; call get_drawer with drawer_id to fetch the full body. Set full:true to additionally include legacy inline content. When auto_ack is true, atomically marks all returned messages as acked in the same transaction, eliminating one round-trip compared to calling collab_ack separately for each message. Default false preserves the existing two-step recv+ack flow.",
+            "description": "Read pending collab messages for one agent. By default, each message returns its stable delivery envelope plus {drawer_id, hash, first_200_chars}; call get_drawer with drawer_id to fetch the full body. Set full:true to additionally include each message's inline content. When auto_ack is true, atomically marks all returned messages as acked in the same transaction, eliminating one round-trip compared to calling collab_ack separately for each message. Default false preserves the existing two-step recv+ack flow.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
