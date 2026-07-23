@@ -412,6 +412,11 @@ pub fn save_session(conn: &Connection, session: &CollabSession) -> Result<(), Me
     Ok(())
 }
 
+/// Persist a message that references an already-written drawer.
+///
+/// This low-level helper does not create the drawer. Production callers must
+/// insert the drawer and this message in one SQLite transaction so a successful
+/// collab write never leaves a dangling drawer reference.
 pub fn send_message(
     conn: &Connection,
     session_id: &str,
@@ -629,6 +634,32 @@ mod tests {
         include_str!("../../migrations/015_collab_recovery_state.sql");
     const COLLAB_MESSAGE_DRAWERS_SQL: &str =
         include_str!("../../migrations/016_collab_message_drawers.sql");
+    const QUEUE_TEST_DRAWER_IDS: [&str; 7] = [
+        "drawer-123",
+        "drawer-a",
+        "drawer-b",
+        "drawer-first",
+        "drawer-second",
+        "drawer-third",
+        "drawer-x",
+    ];
+
+    fn insert_queue_test_drawer(conn: &Connection, id: &str) {
+        conn.execute(
+            "INSERT INTO drawers (id, content, embedding, wing, room, source_file, added_by)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            rusqlite::params![
+                id,
+                "queue test drawer",
+                vec![0u8; ironrace_embed::embedder::EMBED_DIM * std::mem::size_of::<f32>()],
+                "ironrace-memory",
+                "collab-plans",
+                "",
+                "test",
+            ],
+        )
+        .unwrap();
+    }
 
     fn open() -> Connection {
         let conn = Connection::open_in_memory().unwrap();
@@ -644,6 +675,9 @@ mod tests {
         conn.execute_batch(COLLAB_TASK_LIST_REF_SQL).unwrap();
         conn.execute_batch(COLLAB_RECOVERY_STATE_SQL).unwrap();
         conn.execute_batch(COLLAB_MESSAGE_DRAWERS_SQL).unwrap();
+        for drawer_id in QUEUE_TEST_DRAWER_IDS {
+            insert_queue_test_drawer(&conn, drawer_id);
+        }
         conn
     }
 

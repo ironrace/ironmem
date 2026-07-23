@@ -218,7 +218,7 @@ fn collect_room_candidates(
                 filed_at: row.filed_at,
                 content_bytes: row.content_bytes,
                 action: MemoryGcAction::Skip,
-                reason: "referenced by a collab session".to_string(),
+                reason: "referenced by collab state".to_string(),
             });
         } else {
             candidates.push(MemoryGcCandidate {
@@ -296,10 +296,18 @@ impl Database {
     fn is_referenced_collab_drawer(&self, drawer_id: &str) -> Result<bool, MemoryError> {
         let count: i64 = self.conn.query_row(
             "SELECT COUNT(*)
-             FROM collab_sessions
-             WHERE canonical_plan_drawer_id = ?1
-                OR final_plan_drawer_id = ?1
-                OR task_list_drawer_id = ?1",
+             FROM (
+                SELECT 1
+                FROM collab_sessions
+                WHERE canonical_plan_drawer_id = ?1
+                   OR final_plan_drawer_id = ?1
+                   OR task_list_drawer_id = ?1
+                UNION ALL
+                SELECT 1
+                FROM messages
+                WHERE drawer_id IS NOT NULL
+                  AND drawer_id = ?1
+             )",
             params![drawer_id],
             |row| row.get(0),
         )?;
@@ -391,6 +399,41 @@ mod tests {
         assert!(db.get_drawer(&checkpoint_id).unwrap().is_none());
         assert!(db.get_drawer(&task_id).unwrap().is_none());
         assert!(db.get_drawer(&plan_id).unwrap().is_some());
+    }
+
+    #[test]
+    fn apply_keeps_message_referenced_drawer() {
+        let db = Database::open_in_memory().unwrap();
+        let message_drawer_id = insert_old(&db, "message drawer", PLAN_ROOM);
+        db.exec_raw(&format!(
+            "INSERT INTO collab_sessions (id, repo_path, branch)
+             VALUES ('message-session', '/tmp/repo', 'main');
+             INSERT INTO messages
+                (id, session_id, sender, receiver, topic, content, drawer_id)
+             VALUES
+                ('message-1', 'message-session', 'claude', 'codex', 'draft',
+                 'message body', '{message_drawer_id}')"
+        ))
+        .unwrap();
+
+        let report = run_memory_gc(
+            &db,
+            MemoryGcOptions {
+                apply: true,
+                collab_checkpoint_days: 1,
+                collab_artifact_days: 1,
+                limit: 10,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(report.delete_candidates, 0);
+        assert_eq!(report.skipped_candidates, 1);
+        assert_eq!(report.deleted, 0);
+        assert_eq!(report.candidates.len(), 1);
+        assert_eq!(report.candidates[0].id, message_drawer_id);
+        assert_eq!(report.candidates[0].action, MemoryGcAction::Skip);
+        assert!(db.get_drawer(&message_drawer_id).unwrap().is_some());
     }
 
     #[test]
