@@ -26,11 +26,13 @@ const METRICS_HARNESS_CHECK_SQL: &str =
 const CONTEXT_SIZE_REFS_SQL: &str = include_str!("../../migrations/014_context_size_refs.sql");
 const COLLAB_RECOVERY_STATE_SQL: &str =
     include_str!("../../migrations/015_collab_recovery_state.sql");
+const COLLAB_MESSAGE_DRAWERS_SQL: &str =
+    include_str!("../../migrations/016_collab_message_drawers.sql");
 
 /// Highest schema version a fully-migrated database reports. Bump alongside the
 /// `run_version_gated_migrations` ladder below so `ironmem doctor` can tell a
 /// behind-migration database from an up-to-date one.
-pub const LATEST_SCHEMA_VERSION: i64 = 15;
+pub const LATEST_SCHEMA_VERSION: i64 = 16;
 
 /// Database wrapper around a SQLite connection.
 ///
@@ -277,6 +279,13 @@ impl Database {
             self.conn.execute_batch(COLLAB_RECOVERY_STATE_SQL)?;
         }
 
+        // v16: nullable drawer references for collab messages (issue #206).
+        // NULL preserves the legacy inline-content messages sent before this
+        // migration; new queue writes always provide a drawer id.
+        if current_version < 16 {
+            self.conn.execute_batch(COLLAB_MESSAGE_DRAWERS_SQL)?;
+        }
+
         Ok(())
     }
 
@@ -441,7 +450,7 @@ mod tests {
         // fully-migrated database reports — doctor compares against it.
         let db = Database::open_in_memory().unwrap();
         assert_eq!(LATEST_SCHEMA_VERSION, db.schema_version().unwrap());
-        assert_eq!(LATEST_SCHEMA_VERSION, 15);
+        assert_eq!(LATEST_SCHEMA_VERSION, 16);
     }
 
     #[test]
@@ -1362,8 +1371,64 @@ mod tests {
         }
     }
 
+    /// Build a connection migrated to exactly v15 (before message drawer
+    /// references) by replaying migrations 001-015 directly from the module
+    /// consts.
+    fn open_at_v15() -> Database {
+        let db = open_at_v14();
+        db.conn.execute_batch(COLLAB_RECOVERY_STATE_SQL).unwrap();
+        db
+    }
+
     #[test]
-    fn test_migrate_twice_idempotent_v15() {
+    fn test_v15_to_v16_adds_message_drawer_id_and_preserves_legacy_messages() {
+        let db = open_at_v15();
+        assert_eq!(schema_version_of(&db), 15);
+        assert!(
+            !column_exists(&db, "messages", "drawer_id"),
+            "drawer_id should not exist at v15"
+        );
+
+        crate::collab::queue::create_session(
+            &db.conn,
+            "legacy-v15-message-session",
+            "/repo",
+            "main",
+            None,
+            crate::collab::Agent::Claude,
+        )
+        .unwrap();
+        db.conn
+            .execute(
+                "INSERT INTO messages (id, session_id, sender, receiver, topic, content)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                [
+                    "legacy-v15-message",
+                    "legacy-v15-message-session",
+                    "claude",
+                    "codex",
+                    "draft",
+                    "legacy message body",
+                ],
+            )
+            .unwrap();
+
+        db.migrate().unwrap();
+        assert_eq!(schema_version_of(&db), LATEST_SCHEMA_VERSION);
+        assert!(column_exists(&db, "messages", "drawer_id"));
+
+        let messages =
+            crate::collab::queue::recv_messages(&db.conn, "legacy-v15-message-session", "codex", 1)
+                .unwrap();
+        assert_eq!(messages.len(), 1);
+        assert!(
+            messages[0].drawer_id.is_none(),
+            "legacy message drawer_id must remain NULL"
+        );
+    }
+
+    #[test]
+    fn test_migrate_twice_idempotent_v16() {
         let db = Database::open_in_memory().unwrap();
         db.migrate().unwrap();
         db.migrate().unwrap();
