@@ -1052,6 +1052,75 @@ fn collab_recv_legacy_null_drawer_id_inlines_content_by_default() {
 }
 
 #[test]
+fn collab_recv_redacts_message_content_and_derivatives_in_restricted_mode() {
+    use ironmem::collab::{queue, Agent};
+    use ironmem::config::McpAccessMode;
+    use ironrace_embed::embedder::EMBED_DIM;
+
+    let app = App::open_for_test_with_mode(McpAccessMode::Restricted).unwrap();
+    let session_id = "restricted-collab-recv";
+    let drawer_id = "a".repeat(32);
+    let content = "SENSITIVE: do not expose the launch password";
+    let zero = vec![0.0f32; EMBED_DIM];
+    app.db
+        .insert_drawer(
+            &drawer_id,
+            content,
+            &zero,
+            "ironrace-memory",
+            "collab-messages",
+            "",
+            "test",
+        )
+        .unwrap();
+    app.db
+        .with_transaction(|tx| {
+            queue::create_session(tx, session_id, "/repo", "main", None, Agent::Claude)?;
+            queue::send_message(
+                tx,
+                session_id,
+                "claude",
+                "codex",
+                "canonical",
+                content,
+                &drawer_id,
+            )?;
+            Ok(())
+        })
+        .unwrap();
+
+    for (args, includes_content) in [
+        (
+            json!({ "session_id": session_id, "receiver": "codex" }),
+            false,
+        ),
+        (
+            json!({ "session_id": session_id, "receiver": "codex", "full": true }),
+            true,
+        ),
+    ] {
+        let recv = call_tool(&app, "collab_recv", args);
+        let message = &recv["messages"][0];
+        let encoded = message.to_string();
+
+        assert_eq!(message["drawer_id"], drawer_id);
+        assert!(message["first_200_chars"].is_null());
+        assert_eq!(message["content_redacted"], true);
+        assert!(message.get("hash").is_none());
+        assert_eq!(message["hash_redacted"], true);
+        assert!(
+            !encoded.contains(content) && !encoded.contains(&sha256_hex(content)),
+            "restricted collab_recv must not expose a body or body-derived hash: {encoded}"
+        );
+        if includes_content {
+            assert!(message["content"].is_null());
+        } else {
+            assert!(message.get("content").is_none());
+        }
+    }
+}
+
+#[test]
 fn collab_wait_my_turn_returns_immediately_when_owner() {
     let app = App::open_for_test().unwrap();
     let started = call_tool(

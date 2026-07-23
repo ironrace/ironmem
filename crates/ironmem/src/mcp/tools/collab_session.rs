@@ -14,8 +14,8 @@ use super::collab_events::{
     build_collab_event, failure_report_is_off_turn_admissible, parse_final_payload,
 };
 use super::shared::{
-    collab_counterpart, require_agent, require_implementer, require_str, sha256_hex,
-    MAX_COLLAB_CONTENT_CHARS,
+    collab_counterpart, render_sensitive_text, require_agent, require_implementer, require_str,
+    sha256_hex, MAX_COLLAB_CONTENT_CHARS,
 };
 
 /// Wing under which collaboration-owned drawer artifacts are filed. Runtime
@@ -884,24 +884,47 @@ pub(super) fn handle_collab_recv(app: &App, args: &Value) -> Result<Value, Memor
             crate::collab::queue::ack_messages_many(tx, session_id, &ids)?;
         }
 
+        let redact_content = app.config.mcp_access_mode.redacts_sensitive_content();
         let json_messages: Vec<Value> = filtered
             .iter()
             .map(|message| {
-                let mut out = json!({
-                    "id": message.id,
-                    "sender": message.sender,
-                    "topic": message.topic,
-                    "created_at": message.created_at,
-                    "drawer_id": message.drawer_id,
-                    "hash": sha256_hex(&message.content),
-                    // Char-boundary safe: take 200 Rust chars, not bytes.
-                    "first_200_chars": message.content.chars().take(200).collect::<String>(),
-                });
+                let (first_200_chars, _, content_redacted, _) =
+                    render_sensitive_text(&message.content, 200, redact_content);
+                let mut out = if content_redacted {
+                    json!({
+                        "id": message.id,
+                        "sender": message.sender,
+                        "topic": message.topic,
+                        "created_at": message.created_at,
+                        "drawer_id": message.drawer_id,
+                        // Char-boundary safe: take 200 Rust chars, not bytes.
+                        "first_200_chars": first_200_chars,
+                    })
+                } else {
+                    // Keep the trusted response field order and values exactly
+                    // as before the restricted-mode rendering branch.
+                    json!({
+                        "id": message.id,
+                        "sender": message.sender,
+                        "topic": message.topic,
+                        "created_at": message.created_at,
+                        "drawer_id": message.drawer_id,
+                        "hash": sha256_hex(&message.content),
+                        // Char-boundary safe: take 200 Rust chars, not bytes.
+                        "first_200_chars": first_200_chars,
+                    })
+                };
+                if content_redacted {
+                    out["content_redacted"] = Value::Bool(true);
+                    out["hash_redacted"] = Value::Bool(true);
+                }
                 // Pre-016 queue rows have no drawer reference. Preserve their
                 // usable legacy body even under the compact default rather
                 // than returning a reference the receiver cannot dereference.
                 if full || message.drawer_id.is_none() {
-                    out["content"] = Value::String(message.content.clone());
+                    let (content, _, _, _) =
+                        render_sensitive_text(&message.content, usize::MAX, redact_content);
+                    out["content"] = content;
                 }
                 out
             })
