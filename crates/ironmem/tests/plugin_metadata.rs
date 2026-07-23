@@ -33,6 +33,11 @@ fn read_json(rel_path: &str) -> serde_json::Value {
     serde_json::from_str(&raw).unwrap_or_else(|e| panic!("Invalid JSON in {rel_path}: {e}"))
 }
 
+fn read_text(rel_path: &str) -> String {
+    let path = workspace_root().join(rel_path);
+    std::fs::read_to_string(&path).unwrap_or_else(|_| panic!("Could not read {}", path.display()))
+}
+
 #[test]
 fn codex_plugin_json_has_required_fields() {
     let json = read_json(".codex-plugin/plugin.json");
@@ -100,6 +105,19 @@ fn codex_hooks_json_has_required_hooks() {
     assert!(
         hooks["PreCompact"].is_array(),
         "codex hooks.json: missing 'PreCompact'"
+    );
+}
+
+#[test]
+fn codex_collab_command_shim_is_packaged() {
+    let text = read_text(".codex-plugin/commands/collab.md");
+    assert!(
+        text.contains("~/.codex/prompts/collab.md"),
+        "codex /collab command must delegate to the installed collab prompt"
+    );
+    assert!(
+        text.contains("tool discovery for `ironmem collab`"),
+        "codex /collab command must explain how to lazy-load IronMEM tools"
     );
 }
 
