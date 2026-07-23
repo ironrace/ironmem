@@ -18,13 +18,14 @@ use super::shared::{
     MAX_COLLAB_CONTENT_CHARS,
 };
 
-/// Wing/room under which accepted plan bodies are filed as drawers. Runtime
-/// collab paths dereference these drawers by id; the dedicated room keeps them
-/// auditable/filterable even though the generic drawer FTS index still sees
-/// their content.
-const COLLAB_PLAN_WING: &str = "ironrace-memory";
+/// Wing under which collaboration-owned drawer artifacts are filed. Runtime
+/// collab paths dereference these drawers by id; each dedicated room keeps its
+/// artifacts auditable/filterable even though the generic drawer FTS index
+/// still sees their content.
+const COLLAB_WING: &str = "ironrace-memory";
 const COLLAB_PLAN_ROOM: &str = "collab-plans";
 const COLLAB_TASK_LIST_ROOM: &str = "collab-task-lists";
+const COLLAB_MESSAGE_ROOM: &str = "collab-messages";
 
 pub(super) fn collab_error_to_memory_error(error: CollabError) -> MemoryError {
     MemoryError::Validation(error.to_string())
@@ -58,14 +59,14 @@ fn store_collab_plan_drawer(
             )))
         }
     };
-    let id = crate::db::drawers::generate_id(&body, COLLAB_PLAN_WING, COLLAB_PLAN_ROOM);
+    let id = crate::db::drawers::generate_id(&body, COLLAB_WING, COLLAB_PLAN_ROOM);
     let zero = vec![0.0f32; EMBED_DIM];
     crate::db::schema::Database::insert_drawer_tx(
         tx,
         &id,
         &body,
         &zero,
-        COLLAB_PLAN_WING,
+        COLLAB_WING,
         COLLAB_PLAN_ROOM,
         &format!("collab:{session_id}:{topic}"),
         "collab",
@@ -82,16 +83,39 @@ fn store_collab_task_list_drawer(
     content: &str,
 ) -> Result<String, MemoryError> {
     use ironrace_embed::embedder::EMBED_DIM;
-    let id = crate::db::drawers::generate_id(content, COLLAB_PLAN_WING, COLLAB_TASK_LIST_ROOM);
+    let id = crate::db::drawers::generate_id(content, COLLAB_WING, COLLAB_TASK_LIST_ROOM);
     let zero = vec![0.0f32; EMBED_DIM];
     crate::db::schema::Database::insert_drawer_tx(
         tx,
         &id,
         content,
         &zero,
-        COLLAB_PLAN_WING,
+        COLLAB_WING,
         COLLAB_TASK_LIST_ROOM,
         &format!("collab:{session_id}:task_list"),
+        "collab",
+    )?;
+    Ok(id)
+}
+
+/// Store an accepted collab message body as an immutable, content-addressed
+/// drawer. Queue rows retain the per-session delivery metadata; this drawer is
+/// only the stable body reference shared by compact `collab_recv` responses.
+fn store_collab_message_drawer(
+    tx: &rusqlite::Transaction<'_>,
+    content: &str,
+) -> Result<String, MemoryError> {
+    use ironrace_embed::embedder::EMBED_DIM;
+    let id = crate::db::drawers::generate_id(content, COLLAB_WING, COLLAB_MESSAGE_ROOM);
+    let zero = vec![0.0f32; EMBED_DIM];
+    crate::db::schema::Database::insert_drawer_tx(
+        tx,
+        &id,
+        content,
+        &zero,
+        COLLAB_WING,
+        COLLAB_MESSAGE_ROOM,
+        "",
         "collab",
     )?;
     Ok(id)
@@ -732,6 +756,7 @@ pub(super) fn handle_collab_send(app: &App, args: &Value) -> Result<Value, Memor
         let phase_after_enum = session.phase;
         crate::collab::queue::save_session(tx, &session)?;
 
+        let drawer_id = store_collab_message_drawer(tx, content)?;
         let message_id = crate::collab::queue::send_message(
             tx,
             session_id,
@@ -739,6 +764,7 @@ pub(super) fn handle_collab_send(app: &App, args: &Value) -> Result<Value, Memor
             collab_counterpart(sender).as_str(),
             topic,
             content,
+            &drawer_id,
         )?;
         crate::db::schema::Database::wal_log_tx(
             tx,
@@ -825,6 +851,7 @@ pub(super) fn handle_collab_recv(app: &App, args: &Value) -> Result<Value, Memor
         .get("auto_ack")
         .and_then(Value::as_bool)
         .unwrap_or(false);
+    let full = args.get("full").and_then(Value::as_bool).unwrap_or(false);
 
     let result = app.db.with_transaction(|tx| {
         super::handoff::ensure_actor_generation_current(
@@ -860,13 +887,23 @@ pub(super) fn handle_collab_recv(app: &App, args: &Value) -> Result<Value, Memor
         let json_messages: Vec<Value> = filtered
             .iter()
             .map(|message| {
-                json!({
+                let mut out = json!({
                     "id": message.id,
                     "sender": message.sender,
                     "topic": message.topic,
-                    "content": message.content,
                     "created_at": message.created_at,
-                })
+                    "drawer_id": message.drawer_id,
+                    "hash": sha256_hex(&message.content),
+                    // Char-boundary safe: take 200 Rust chars, not bytes.
+                    "first_200_chars": message.content.chars().take(200).collect::<String>(),
+                });
+                // Pre-016 queue rows have no drawer reference. Preserve their
+                // usable legacy body even under the compact default rather
+                // than returning a reference the receiver cannot dereference.
+                if full || message.drawer_id.is_none() {
+                    out["content"] = Value::String(message.content.clone());
+                }
+                out
             })
             .collect();
         Ok(json!({ "messages": json_messages }))
@@ -1100,6 +1137,7 @@ pub(super) fn handle_collab_approve(app: &App, args: &Value) -> Result<Value, Me
         )
         .map_err(collab_error_to_memory_error)?;
         crate::collab::queue::save_session(tx, &session)?;
+        let drawer_id = store_collab_message_drawer(tx, &review_content)?;
         let _ = crate::collab::queue::send_message(
             tx,
             session_id,
@@ -1107,6 +1145,7 @@ pub(super) fn handle_collab_approve(app: &App, args: &Value) -> Result<Value, Me
             Agent::Claude.as_str(),
             "review",
             &review_content,
+            &drawer_id,
         )?;
         crate::db::schema::Database::wal_log_tx(
             tx,

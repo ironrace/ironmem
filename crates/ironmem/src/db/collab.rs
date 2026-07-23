@@ -41,8 +41,11 @@ impl Database {
         receiver: &str,
         topic: &str,
         content: &str,
+        drawer_id: &str,
     ) -> Result<String, MemoryError> {
-        queue::send_message(&self.conn, session_id, sender, receiver, topic, content)
+        queue::send_message(
+            &self.conn, session_id, sender, receiver, topic, content, drawer_id,
+        )
     }
 
     pub fn collab_recv_messages(
