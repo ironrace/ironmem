@@ -848,10 +848,44 @@ Returns pending messages. Enforces the blind-draft invariant.
 | `receiver` | string | required | `"claude"` or `"codex"` |
 | `limit` | integer | 10 (max 50) | Maximum messages to return |
 | `auto_ack` | boolean | `false` | When `true`, atomically marks all returned messages as acked in the same DB transaction as the read. Eliminates a separate `collab_ack` round-trip per turn. Backwards-compatible — existing callers that omit the field continue to use the two-step recv + ack flow. |
+| `full` | boolean | `false` | Compatibility-only: when `true`, additionally includes each current message's inline `content` alongside its drawer reference. Prefer `get_drawer` with the returned `drawer_id`. |
 
 Using `auto_ack=true` is recommended in the dispatch loop for any caller that
 always acks all received messages immediately. The explicit `collab_ack` call
 is still available when callers need selective acknowledgement.
+
+#### Compact message-reference contract
+
+The default response is `{ "messages": [...] }`. Each current message keeps
+its delivery envelope (`id`, `sender`, `topic`, `created_at`) and adds the
+compact body reference `{drawer_id, hash, first_200_chars}`; it does not inline
+`content`. After choosing the message to consume, deliberately call
+`get_drawer` with its `drawer_id` to retrieve the complete body. The `hash`
+matches that body, and `first_200_chars` is a preview of its first 200 Unicode
+characters (not bytes), or the whole body when it is shorter.
+
+`full:true` additionally returns inline `content` for current rows, but exists
+for compatibility rather than normal retrieval. Pre-016 legacy rows can have
+`drawer_id:null`; because they cannot be dereferenced, their `content` remains
+inline even under the default compact request.
+
+In restricted MCP mode, `collab_recv` does not expose the message body, preview,
+or hash: `first_200_chars` is `null`, `hash` is omitted, and
+`content_redacted:true` plus `hash_redacted:true` identify the redaction. This
+also applies when `full:true`; `content` is then `null`. A `get_drawer` lookup
+is subject to the same sensitive-content redaction.
+
+Every accepted message receives a durable immutable transport drawer in the
+`collab-messages` room, while its queue row retains the delivery metadata and
+`drawer_id` reference. Current retention does not make `collab-messages`
+drawers deletion candidates, and its linked-collab reference guard recognizes
+message drawers, so it does not orphan a message's transport reference.
+
+**Telemetry:** the existing MCP response-sizing report already tags and groups
+tool calls. The compact default is therefore observable as lower response
+sizing for `collab_recv`, while deliberate `get_drawer` retrievals are reported
+as their own tool calls; this introduces no collab-recv-specific metric, schema,
+or report.
 
 ### `collab_ack`
 
