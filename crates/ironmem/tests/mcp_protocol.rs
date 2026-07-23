@@ -1053,70 +1053,71 @@ fn collab_recv_legacy_null_drawer_id_inlines_content_by_default() {
 
 #[test]
 fn collab_recv_redacts_message_content_and_derivatives_in_restricted_mode() {
-    use ironmem::collab::{queue, Agent};
     use ironmem::config::McpAccessMode;
-    use ironrace_embed::embedder::EMBED_DIM;
 
-    let app = App::open_for_test_with_mode(McpAccessMode::Restricted).unwrap();
-    let session_id = "restricted-collab-recv";
-    let drawer_id = "a".repeat(32);
+    // Restricted mode correctly disallows writes, so establish a real collab
+    // message through the public trusted-mode protocol first, then switch the
+    // same persisted fixture to its restricted read view.
+    let mut app = App::open_for_test().unwrap();
     let content = "SENSITIVE: do not expose the launch password";
-    let zero = vec![0.0f32; EMBED_DIM];
-    app.db
-        .insert_drawer(
-            &drawer_id,
-            content,
-            &zero,
-            "ironrace-memory",
-            "collab-messages",
-            "",
-            "test",
-        )
-        .unwrap();
-    app.db
-        .with_transaction(|tx| {
-            queue::create_session(tx, session_id, "/repo", "main", None, Agent::Claude)?;
-            queue::send_message(
-                tx,
-                session_id,
-                "claude",
-                "codex",
-                "canonical",
-                content,
-                &drawer_id,
-            )?;
-            Ok(())
-        })
-        .unwrap();
+    let expected_drawer_id =
+        ironmem::db::drawers::generate_id(content, "ironrace-memory", "collab-messages");
+    let started = call_tool(
+        &app,
+        "collab_start",
+        json!({
+            "repo_path": "/repo",
+            "branch": "main",
+            "initiator": "claude",
+        }),
+    );
+    let session_id = started["session_id"].as_str().unwrap();
+    let sent = call_tool(
+        &app,
+        "collab_send",
+        json!({
+            "session_id": session_id,
+            "sender": "claude",
+            "topic": "draft",
+            "content": content,
+        }),
+    );
+    let message_id = sent["message_id"].as_str().unwrap().to_string();
+    call_tool(
+        &app,
+        "collab_send",
+        json!({
+            "session_id": session_id,
+            "sender": "codex",
+            "topic": "draft",
+            "content": "Codex's separate draft",
+        }),
+    );
+    app.config.mcp_access_mode = McpAccessMode::Restricted;
 
-    for (args, includes_content) in [
-        (
-            json!({ "session_id": session_id, "receiver": "codex" }),
-            false,
-        ),
-        (
-            json!({ "session_id": session_id, "receiver": "codex", "full": true }),
-            true,
-        ),
+    for args in [
+        json!({ "session_id": session_id, "receiver": "codex" }),
+        json!({ "session_id": session_id, "receiver": "codex", "full": true }),
     ] {
         let recv = call_tool(&app, "collab_recv", args);
         let message = &recv["messages"][0];
         let encoded = message.to_string();
 
-        assert_eq!(message["drawer_id"], drawer_id);
-        assert!(message["first_200_chars"].is_null());
+        assert_eq!(message["id"], message_id);
+        assert_eq!(message["sender"], "claude");
+        assert_eq!(message["topic"], "draft");
         assert_eq!(message["content_redacted"], true);
         assert!(message.get("hash").is_none());
         assert_eq!(message["hash_redacted"], true);
+        assert!(message.get("drawer_id").is_none());
+        assert!(message.get("first_200_chars").is_none());
+        assert!(message.get("content").is_none());
         assert!(
-            !encoded.contains(content) && !encoded.contains(&sha256_hex(content)),
-            "restricted collab_recv must not expose a body or body-derived hash: {encoded}"
+            !encoded.contains(content)
+                && !encoded.contains(&sha256_hex(content))
+                && !encoded.contains(&expected_drawer_id),
+            "restricted collab_recv must not expose a body or content-derived fingerprint: {encoded}"
         );
-        if includes_content {
-            assert!(message["content"].is_null());
-        } else {
-            assert!(message.get("content").is_none());
-        }
     }
 }
 

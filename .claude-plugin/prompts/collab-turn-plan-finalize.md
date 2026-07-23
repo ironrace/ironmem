@@ -13,9 +13,19 @@ preconditions: phase == PlanClaudeFinalizePending, current_owner == claude
 > paste the final-plan body.
 
 ## State discovery
-1. `collab_status(session_id=$SESSION_ID, verbose:true)`; read `canonical_plan`.
-2. `collab_recv(session_id=$SESSION_ID, receiver="claude", auto_ack=true)` to
-   read Codex's review notes.
+1. `collab_status(session_id=$SESSION_ID)`; verify
+   `phase == PlanClaudeFinalizePending` and inspect `canonical_plan_ref`.
+2. Call `collab_recv(session_id=$SESSION_ID, receiver="claude",
+   auto_ack=true)` exactly once. The first auto-ack response contains the
+   message refs. Do not call `collab_recv` again after it acknowledges.
+3. Before finalization, dereference every needed current body: call
+   `get_drawer(id=<canonical_plan_ref.drawer_id>)` for the canonical plan and
+   `get_drawer(id=<message.drawer_id>)` for Codex's `topic="review"` message.
+   `full:true` is compatibility-only: use it only on that first receive when a
+   known legacy `drawer_id:null` row requires inline content. For a legacy
+   canonical plan without a reference, use the status response's inline
+   `canonical_plan`; for a legacy review row, use its returned inline content.
+   Never issue a second receive after auto-ack.
 
 ## Actions
 1. Produce the final execution plan as a Superpowers-compatible task markdown
