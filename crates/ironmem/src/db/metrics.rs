@@ -437,6 +437,10 @@ pub struct McpResponseSizing {
     pub mean_output_tokens: f64,
     /// Top response-size contributors grouped by collab session and MCP tool.
     pub top_tools: Vec<McpResponseToolSizing>,
+    /// Complete response-size distributions grouped by harness and MCP tool.
+    /// This is intentionally separate from `top_tools`: a regression gate must
+    /// see every tool, not only the largest ten groups.
+    pub distributions: Vec<McpResponseToolDistribution>,
 }
 
 /// Per-tool MCP response sizing. `collab_session_id` is NULL for non-collab
@@ -450,6 +454,30 @@ pub struct McpResponseToolSizing {
     pub total_chars: i64,
     pub total_output_tokens: i64,
     pub mean_output_tokens: f64,
+}
+
+/// Response-size distribution for one `(harness, tool_name)` group.
+/// Percentiles use the nearest-rank rule over `output_tokens`, which keeps the
+/// result deterministic and avoids inventing an interpolated token count.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct McpResponseToolDistribution {
+    pub harness: String,
+    pub tool_name: Option<String>,
+    pub row_count: i64,
+    pub total_chars: i64,
+    pub total_output_tokens: i64,
+    pub mean_output_tokens: f64,
+    pub p50_output_tokens: i64,
+    pub p95_output_tokens: i64,
+    pub max_output_tokens: i64,
+}
+
+fn nearest_rank_percentile(sorted: &[i64], percentile: f64) -> i64 {
+    if sorted.is_empty() {
+        return 0;
+    }
+    let rank = (sorted.len() as f64 * percentile).ceil() as usize;
+    sorted[rank.saturating_sub(1).min(sorted.len() - 1)]
 }
 
 /// Repeated-context indicator: how many turns the transcript-token capture
@@ -1034,6 +1062,16 @@ impl Database {
     /// Groups by `(turn_id, map_status)` so multiple rows for the same turn
     /// (e.g. retries) collapse to a single per-turn token total.
     pub fn report_exploration_delta(&self) -> Result<ExplorationReport, MemoryError> {
+        self.report_exploration_delta_for(None, None)
+    }
+
+    /// Scoped variant of [`Self::report_exploration_delta`]. The task predicate
+    /// follows the report's `collab_session_id`/`task_tag` alias semantics.
+    pub fn report_exploration_delta_for(
+        &self,
+        task: Option<&str>,
+        since: Option<&str>,
+    ) -> Result<ExplorationReport, MemoryError> {
         // One row per DISTINCT turn_id. A turn's tokens are summed across all its
         // exploration rows; its verdict is a single value derived per turn:
         // `map_hit` only if the turn has a hit and NO miss, else `map_miss`.
@@ -1041,23 +1079,31 @@ impl Database {
         // double-counted as two turns, and (b) NULL turn_id rows collapsing into
         // one group — we exclude NULL turn_id entirely since an untagged row
         // cannot be attributed to a turn.
-        let mut stmt = self.conn.prepare(
+        const FILTER: &str = "source = 'mcp_response'
+               AND (?1 IS NULL
+                    OR COALESCE(collab_session_id, task_tag) = ?1
+                    OR collab_session_id IN (
+                        SELECT collab_session_id FROM task_outcomes
+                        WHERE task_tag = ?1 AND collab_session_id IS NOT NULL
+                    ))
+               AND (?2 IS NULL OR julianday(ts) >= julianday(?2))";
+        let mut stmt = self.conn.prepare(&format!(
             "SELECT
                  CASE WHEN SUM(map_status = 'map_miss') > 0 THEN 'map_miss'
                       ELSE 'map_hit' END AS turn_status,
                  SUM(input_tokens + output_tokens) AS total_tokens
              FROM token_usage
-             WHERE source = 'mcp_response'
+             WHERE {FILTER}
                AND turn_id IS NOT NULL
                AND map_status IN ('map_hit', 'map_miss')
-             GROUP BY turn_id",
-        )?;
+             GROUP BY turn_id"
+        ))?;
         struct TurnRow {
             map_status: String,
             total_tokens: i64,
         }
         let rows: Vec<TurnRow> = stmt
-            .query_map([], |r| {
+            .query_map(params![task, since], |r| {
                 Ok(TurnRow {
                     map_status: r.get(0)?,
                     total_tokens: r.get::<_, Option<i64>>(1)?.unwrap_or(0),
@@ -1111,11 +1157,37 @@ impl Database {
     /// Aggregate sizing over all `source='mcp_response'` rows (issue #145).
     /// Read-only; no schema dependency beyond the existing `token_usage` table.
     pub fn report_mcp_response_sizing(&self) -> Result<McpResponseSizing, MemoryError> {
-        let (row_count, total_output_tokens) = self.conn.query_row(
-            "SELECT COUNT(*), COALESCE(SUM(output_tokens), 0)
-             FROM token_usage
-             WHERE source = 'mcp_response'",
-            [],
+        self.report_mcp_response_sizing_for(None, None)
+    }
+
+    /// Aggregate MCP response sizing, optionally restricted to one report task
+    /// and/or a report `--since` instant. The task filter follows the report's
+    /// `collab_session_id`/`task_tag` alias semantics and is applied to all three
+    /// aggregate views so a captured reference session is isolated from
+    /// unrelated local traffic.
+    pub fn report_mcp_response_sizing_for(
+        &self,
+        task: Option<&str>,
+        since: Option<&str>,
+    ) -> Result<McpResponseSizing, MemoryError> {
+        const FILTER: &str = "source = 'mcp_response'
+             AND (?1 IS NULL
+                  OR COALESCE(collab_session_id, task_tag) = ?1
+                  OR collab_session_id IN (
+                      SELECT collab_session_id FROM task_outcomes
+                      WHERE task_tag = ?1 AND collab_session_id IS NOT NULL
+                  ))
+             AND (?2 IS NULL OR julianday(ts) >= julianday(?2))";
+        // Keep the three report views on one SQLite read snapshot. Without this,
+        // a concurrent MCP write could make the top-level totals disagree with
+        // the per-tool distributions returned in the same JSON report.
+        let tx = self.conn.unchecked_transaction()?;
+
+        let (row_count, total_output_tokens) = tx.query_row(
+            &format!(
+                "SELECT COUNT(*), COALESCE(SUM(output_tokens), 0) FROM token_usage WHERE {FILTER}"
+            ),
+            params![task, since],
             |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)),
         )?;
         let mean_output_tokens = if row_count == 0 {
@@ -1123,21 +1195,22 @@ impl Database {
         } else {
             total_output_tokens as f64 / row_count as f64
         };
-        let mut stmt = self.conn.prepare(
+        let top_sql = format!(
             "SELECT collab_session_id,
                     tool_name,
                     COUNT(*) AS row_count,
                     COALESCE(SUM(chars), 0) AS total_chars,
                     COALESCE(SUM(output_tokens), 0) AS total_output_tokens
              FROM token_usage
-             WHERE source = 'mcp_response'
+             WHERE {FILTER}
              GROUP BY collab_session_id, tool_name
              ORDER BY total_output_tokens DESC, total_chars DESC, row_count DESC,
                       collab_session_id ASC, tool_name ASC
-             LIMIT 10",
-        )?;
+             LIMIT 10"
+        );
+        let mut stmt = tx.prepare(&top_sql)?;
         let top_tools = stmt
-            .query_map([], |r| {
+            .query_map(params![task, since], |r| {
                 let rows = r.get::<_, i64>(2)?;
                 let total = r.get::<_, i64>(4)?;
                 Ok(McpResponseToolSizing {
@@ -1155,23 +1228,89 @@ impl Database {
             })?
             .collect::<rusqlite::Result<Vec<_>>>()
             .map_err(MemoryError::from)?;
+
+        let mut raw: std::collections::BTreeMap<(String, Option<String>), (Vec<i64>, i64)> =
+            std::collections::BTreeMap::new();
+        let mut stmt = tx.prepare(&format!(
+            "SELECT harness, tool_name, output_tokens, chars
+             FROM token_usage
+             WHERE {FILTER}
+             ORDER BY harness ASC, tool_name ASC, id ASC"
+        ))?;
+        let rows = stmt.query_map(params![task, since], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, Option<String>>(1)?,
+                r.get::<_, i64>(2)?,
+                r.get::<_, i64>(3)?,
+            ))
+        })?;
+        for row in rows {
+            let (harness, tool_name, output_tokens, chars) = row?;
+            let (tokens, total_chars) = raw
+                .entry((harness, tool_name))
+                .or_insert_with(|| (Vec::new(), 0));
+            tokens.push(output_tokens);
+            *total_chars += chars;
+        }
+        let distributions = raw
+            .into_iter()
+            .map(|((harness, tool_name), (mut tokens, total_chars))| {
+                tokens.sort_unstable();
+                let row_count = tokens.len() as i64;
+                let total_output_tokens = tokens.iter().sum();
+                McpResponseToolDistribution {
+                    harness,
+                    tool_name,
+                    row_count,
+                    total_chars,
+                    total_output_tokens,
+                    mean_output_tokens: total_output_tokens as f64 / row_count as f64,
+                    p50_output_tokens: nearest_rank_percentile(&tokens, 0.50),
+                    p95_output_tokens: nearest_rank_percentile(&tokens, 0.95),
+                    max_output_tokens: *tokens.last().unwrap_or(&0),
+                }
+            })
+            .collect();
         Ok(McpResponseSizing {
             row_count,
             total_output_tokens,
             mean_output_tokens,
             top_tools,
+            distributions,
         })
     }
 
     /// Transcript-token coverage over `source='transcript'` rows (issue #145):
     /// distinct covered turns + summed `input + output` tokens. Read-only.
     pub fn report_transcript_coverage(&self) -> Result<TranscriptCoverage, MemoryError> {
+        self.report_transcript_coverage_for(None, None)
+    }
+
+    /// Scoped variant of [`Self::report_transcript_coverage`]. The task
+    /// predicate follows the report's `collab_session_id`/`task_tag` alias
+    /// semantics.
+    pub fn report_transcript_coverage_for(
+        &self,
+        task: Option<&str>,
+        since: Option<&str>,
+    ) -> Result<TranscriptCoverage, MemoryError> {
+        const FILTER: &str = "source = 'transcript'
+             AND (?1 IS NULL
+                  OR COALESCE(collab_session_id, task_tag) = ?1
+                  OR collab_session_id IN (
+                      SELECT collab_session_id FROM task_outcomes
+                      WHERE task_tag = ?1 AND collab_session_id IS NOT NULL
+                  ))
+             AND (?2 IS NULL OR julianday(ts) >= julianday(?2))";
         let (turn_count, total_tokens) = self.conn.query_row(
-            "SELECT COUNT(DISTINCT turn_id),
+            &format!(
+                "SELECT COUNT(DISTINCT turn_id),
                     COALESCE(SUM(input_tokens + output_tokens), 0)
              FROM token_usage
-             WHERE source = 'transcript' AND turn_id IS NOT NULL",
-            [],
+             WHERE {FILTER} AND turn_id IS NOT NULL"
+            ),
+            params![task, since],
             |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)),
         )?;
         Ok(TranscriptCoverage {

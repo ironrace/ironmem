@@ -9,6 +9,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Deterministic `/collab` MCP-response distributions and offline baseline gate
+  (#212).** `ironmem report --json` now exposes p50/p95/max response-size
+  distributions for every harness/tool group. `scripts/collab_baseline.py`
+  captures and checks a committed JSON baseline without a live model or network;
+  malformed schemas, missing groups, and p95 regressions fail closed. The
+  committed reference is explicitly MCP-response sizing only because the
+  available real session had no measured non-MCP collab token rows.
+
 - **Uniform lean MCP profile for review sub-agents (#189).** Read-only review
   agents (`/ultrareview-local` lenses, `pr-review-toolkit` reviewers) now share
   one canonical tool profile — `Read`/`Grep`/`Glob`/`Bash`, no `mcp__ironmem__*`

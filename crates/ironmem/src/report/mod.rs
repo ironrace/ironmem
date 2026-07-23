@@ -383,9 +383,9 @@ pub fn run_report(db: &Database, opts: &ReportOptions) -> Result<Report, MemoryE
     let outcomes = db.report_task_outcomes(task, since_filter)?;
     let headline_rows = db.report_headline(task, since_filter)?;
     let non_completion_rows = db.report_non_completions(task, since_filter)?;
-    let exploration = db.report_exploration_delta()?;
-    let mcp_sizing = db.report_mcp_response_sizing()?;
-    let transcript_coverage = db.report_transcript_coverage()?;
+    let exploration = db.report_exploration_delta_for(task, since_filter)?;
+    let mcp_sizing = db.report_mcp_response_sizing_for(task, since_filter)?;
+    let transcript_coverage = db.report_transcript_coverage_for(task, since_filter)?;
 
     // Distinct task_keys present in any canonical task-shaped query (§10.1,
     // §10.2, or §10.3). This keeps estimated-only and outcome-only tasks visible

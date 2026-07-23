@@ -961,3 +961,191 @@ fn value_summary_json_flags_insufficient_sample() {
     assert_eq!(vs["total_turns"], 1);
     assert_eq!(vs["min_turns"], 8);
 }
+
+fn mcp_response(
+    session: &str,
+    harness: &str,
+    tool: Option<&str>,
+    output_tokens: i64,
+    chars: i64,
+) -> NewTokenUsage {
+    NewTokenUsage {
+        ts: "2026-07-22T00:00:00Z".into(),
+        source: "mcp_response".into(),
+        harness: harness.into(),
+        model: None,
+        tool_name: tool.map(str::to_string),
+        session_id: None,
+        collab_session_id: Some(session.into()),
+        collab_phase: Some("planning".into()),
+        task_tag: None,
+        input_tokens: 0,
+        output_tokens,
+        cache_creation_input_tokens: 0,
+        cache_read_input_tokens: 0,
+        estimated: true,
+        chars,
+        cost_usd: None,
+        map_status: None,
+        turn_id: None,
+        area: None,
+    }
+}
+
+#[test]
+fn report_task_includes_filtered_mcp_response_distributions() {
+    let db = Database::open_in_memory().unwrap();
+    for (tool, output, chars) in [
+        (Some("collab_status"), 10, 40),
+        (Some("collab_status"), 30, 120),
+        (Some("collab_status"), 50, 200),
+        (Some("search"), 7, 28),
+    ] {
+        db.insert_token_usage(&mcp_response("reference", "codex", tool, output, chars))
+            .unwrap();
+    }
+    db.insert_token_usage(&mcp_response(
+        "other-session",
+        "codex",
+        Some("collab_status"),
+        10_000,
+        40_000,
+    ))
+    .unwrap();
+
+    let report = run_report(
+        &db,
+        &ReportOptions {
+            task: Some("reference".into()),
+            since: None,
+        },
+    )
+    .unwrap();
+    let sizing = report.value_summary.mcp_response.unwrap();
+    assert_eq!(sizing.row_count, 4);
+    assert_eq!(sizing.top_tools.len(), 2);
+    assert!(sizing
+        .top_tools
+        .iter()
+        .all(|group| group.collab_session_id.as_deref() == Some("reference")));
+    assert_eq!(sizing.distributions.len(), 2);
+    assert_eq!(
+        sizing.distributions[0].tool_name.as_deref(),
+        Some("collab_status")
+    );
+    assert_eq!(sizing.distributions[0].p50_output_tokens, 30);
+    assert_eq!(sizing.distributions[0].p95_output_tokens, 50);
+    assert_eq!(sizing.distributions[0].max_output_tokens, 50);
+    assert_eq!(sizing.distributions[1].tool_name.as_deref(), Some("search"));
+    assert_eq!(sizing.distributions[1].p50_output_tokens, 7);
+    assert_eq!(sizing.distributions[1].p95_output_tokens, 7);
+}
+
+#[test]
+fn report_mcp_response_distributions_keep_the_protocol_tool_group() {
+    let db = Database::open_in_memory().unwrap();
+    db.insert_token_usage(&mcp_response("reference", "codex", None, 50, 200))
+        .unwrap();
+
+    let report = run_report(&db, &ReportOptions::default()).unwrap();
+    let sizing = report.value_summary.mcp_response.unwrap();
+    assert_eq!(sizing.distributions.len(), 1);
+    assert_eq!(sizing.distributions[0].tool_name, None);
+    assert_eq!(sizing.distributions[0].p50_output_tokens, 50);
+    assert_eq!(sizing.distributions[0].p95_output_tokens, 50);
+}
+
+#[test]
+fn report_task_tag_includes_its_collab_mcp_response_distributions() {
+    let db = Database::open_in_memory().unwrap();
+    db.upsert_task_outcome(&outcome(
+        "issue-reference",
+        "reference-session",
+        "merged",
+        "2026-07-22T00:00:00Z",
+        Some("2026-07-22T01:00:00Z"),
+        0,
+        0,
+        None,
+    ))
+    .unwrap();
+    db.insert_token_usage(&mcp_response(
+        "reference-session",
+        "codex",
+        Some("collab_status"),
+        50,
+        200,
+    ))
+    .unwrap();
+
+    let report = run_report(
+        &db,
+        &ReportOptions {
+            task: Some("issue-reference".into()),
+            since: None,
+        },
+    )
+    .unwrap();
+
+    let sizing = report.value_summary.mcp_response.unwrap();
+    assert_eq!(sizing.row_count, 1);
+    assert_eq!(sizing.distributions.len(), 1);
+    assert_eq!(
+        sizing.distributions[0].tool_name.as_deref(),
+        Some("collab_status")
+    );
+}
+
+#[test]
+fn report_task_tag_scopes_exploration_and_transcript_metrics() {
+    let db = Database::open_in_memory().unwrap();
+    db.upsert_task_outcome(&outcome(
+        "issue-reference",
+        "reference-session",
+        "merged",
+        "2026-07-22T00:00:00Z",
+        Some("2026-07-22T01:00:00Z"),
+        0,
+        0,
+        None,
+    ))
+    .unwrap();
+
+    let mut reference_exploration =
+        mcp_turn("reference-exploration", 50, ironmem::db::MapStatus::Hit);
+    reference_exploration.collab_session_id = Some("reference-session".into());
+    db.insert_token_usage(&reference_exploration).unwrap();
+    let mut unrelated_exploration =
+        mcp_turn("unrelated-exploration", 500, ironmem::db::MapStatus::Miss);
+    unrelated_exploration.collab_session_id = Some("unrelated-session".into());
+    db.insert_token_usage(&unrelated_exploration).unwrap();
+
+    let mut reference_transcript = reference_exploration.clone();
+    reference_transcript.source = "transcript".into();
+    reference_transcript.turn_id = Some("reference-transcript".into());
+    reference_transcript.map_status = None;
+    reference_transcript.input_tokens = 100;
+    db.insert_token_usage(&reference_transcript).unwrap();
+    let mut unrelated_transcript = unrelated_exploration.clone();
+    unrelated_transcript.source = "transcript".into();
+    unrelated_transcript.turn_id = Some("unrelated-transcript".into());
+    unrelated_transcript.map_status = None;
+    unrelated_transcript.input_tokens = 1_000;
+    db.insert_token_usage(&unrelated_transcript).unwrap();
+
+    let report = run_report(
+        &db,
+        &ReportOptions {
+            task: Some("issue-reference".into()),
+            since: None,
+        },
+    )
+    .unwrap();
+
+    assert_eq!(report.exploration.total_turns, 1);
+    assert_eq!(report.exploration.map_hit_turns, 1);
+    assert_eq!(report.exploration.map_miss_turns, 0);
+    let transcript = report.value_summary.transcript_coverage.unwrap();
+    assert_eq!(transcript.turn_count, 1);
+    assert_eq!(transcript.total_tokens, 150);
+}

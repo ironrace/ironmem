@@ -165,6 +165,37 @@ The in-repo A/B analysis artifact (issue #98) currently records a verdict of
 reported honestly rather than rounded up to a claim. This page will link a first
 baseline here once the data exists.
 
+## MCP response baseline (issue 212)
+
+Issue 212 adds a deterministic, response-size-only reference artifact:
+[`collab-baseline.json`](BENCHMARKS/collab-baseline.json) is captured from the
+real merged session `66ad33ba-3854-4b32-8ce9-e39a5f2a23fd` (PR #195), and its
+frozen `ironmem report --json` input is
+[`issue-212-reference-report.json`](BENCHMARKS/fixtures/issue-212-reference-report.json).
+It contains 56 recorded MCP-response rows across 13 `(harness, tool)` groups.
+The gate allows a 20% relative increase in each group's nearest-rank p95
+`output_tokens`; a missing baseline group fails the check.
+
+This is not a per-phase workflow-token baseline. The reference session has no
+measured non-MCP token rows, so `phase_totals` is intentionally `{}` and the
+MCP response values remain estimated response-size proxies. They must not be
+used as tokens-to-done or savings claims. Capture a new artifact only from a
+report with genuinely recorded rows:
+
+```bash
+python3 scripts/collab_baseline.py capture \
+  --session <collab-session-id> \
+  --ironmem-bin ./target/debug/ironmem \
+  --output docs/BENCHMARKS/collab-baseline.json \
+  --codex-prompt implementation=.codex-plugin/prompts/collab-batch-impl.md
+python3 scripts/collab_baseline.py check \
+  --baseline docs/BENCHMARKS/collab-baseline.json \
+  --report docs/BENCHMARKS/fixtures/issue-212-reference-report.json
+```
+
+The CI check consumes only the committed JSON fixture and baseline; it does
+not start a model, load the embedder, or use the network.
+
 ---
 
 ## Reproduce it yourself
