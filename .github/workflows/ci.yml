@@ -32,6 +32,17 @@ jobs:
       - name: benchmark methodology guard self-test
         run: python3 scripts/test_check_benchmark_methodology.py
 
+      - name: collab baseline self-test
+        run: python3 scripts/test_collab_baseline.py -v
+
+      # This compares two committed, deterministic JSON artifacts. It does not
+      # start ironmem, load the embedder, call a model, or require network access.
+      - name: collab baseline regression check
+        run: >-
+          python3 scripts/collab_baseline.py check
+          --baseline docs/BENCHMARKS/collab-baseline.json
+          --report docs/BENCHMARKS/fixtures/issue-212-reference-report.json
+
       - name: site/README drift guard self-test
         run: python3 scripts/test_check_site_readme_sync.py
 

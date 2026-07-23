@@ -1013,3 +1013,27 @@ means sessions were resumed and then left unfinished.
 never rewritten by resume, so a resumed task's tokens-to-done keeps
 accumulating across the failure and the resume, which is the correct
 attribution — the retry cost is part of the cost of that task.
+
+### 2026-07-22 — issue #212: deterministic MCP-response distributions and offline baseline gate
+
+**Report extension.** `McpResponseSizing` now includes deterministic nearest-rank
+`p50_output_tokens`, `p95_output_tokens`, and `max_output_tokens` distributions
+for every `(harness, tool_name)` group in the selected `source='mcp_response'`
+rows. `tool_name = NULL` is rendered as the protocol-level group. Rows are
+ordered by harness and tool name; percentiles are selected from sorted integer
+`output_tokens` values, with rank `ceil(n × percentile)` (clamped to the first
+row for a non-empty group). Existing row counts, sums, and means are unchanged.
+
+**Baseline artifact.** `scripts/collab_baseline.py` captures the report's full
+distribution list plus the collab reference, phase totals, and Codex prompt
+profile. Capture and check validate the JSON shape, reject empty or duplicate
+distribution keys, require non-negative finite numeric fields and ordered
+`p50 ≤ p95 ≤ max` values, fail on missing baseline groups, and fail when current
+p95 exceeds the configured relative threshold. The committed artifact under
+`docs/BENCHMARKS/` is an offline regression fixture, not a headline benchmark.
+
+**Evidence limitation.** The initial reference session contains MCP-response
+rows but no measured non-MCP collab token rows. Its empty `phase_totals` is
+intentional; estimated response-size proxies are not promoted to workflow
+tokens-to-done or savings evidence. A future genuinely recorded reference
+session may replace the artifact.

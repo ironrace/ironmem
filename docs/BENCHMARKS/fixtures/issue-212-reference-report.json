@@ -1,0 +1,285 @@
+{
+  "generated_for": {
+    "task": "66ad33ba-3854-4b32-8ce9-e39a5f2a23fd",
+    "since": null
+  },
+  "baseline_task_count": 0,
+  "baseline_ready": false,
+  "headline": [],
+  "non_completions": [],
+  "tasks": [
+    {
+      "task_key": "66ad33ba-3854-4b32-8ce9-e39a5f2a23fd",
+      "by_phase": [],
+      "split": {
+        "measured_tokens": 0,
+        "estimated_tokens": 73458
+      },
+      "outcome": {
+        "outcome": "merged",
+        "review_rounds": 1,
+        "fix_commits": 0,
+        "handoffs": 0,
+        "started_at": "2026-07-18T18:40:58.096986+00:00",
+        "done_at": "2026-07-18T19:25:07.191745+00:00",
+        "pr_url": "https://github.com/ironrace/ironmem/pull/195"
+      },
+      "tokens_to_done": 0,
+      "cost_usd": null,
+      "provider_reported_cost_usd": null
+    }
+  ],
+  "exploration": {
+    "total_turns": 7,
+    "map_hit_turns": 0,
+    "map_miss_turns": 7,
+    "hit_rate": 0.0,
+    "mean_tokens_map_hit": 0.0,
+    "mean_tokens_map_miss": 270.57142857142856
+  },
+  "value_summary": {
+    "min_turns": 8,
+    "sufficient_data": false,
+    "total_turns": 7,
+    "map_hit_turns": 0,
+    "map_miss_turns": 7,
+    "hit_rate": 0.0,
+    "mean_tokens_map_hit": 0.0,
+    "mean_tokens_map_miss": 270.57142857142856,
+    "exploration_token_delta": 270.57142857142856,
+    "mcp_response": {
+      "row_count": 56,
+      "total_output_tokens": 73458,
+      "mean_output_tokens": 1311.75,
+      "top_tools": [
+        {
+          "collab_session_id": "66ad33ba-3854-4b32-8ce9-e39a5f2a23fd",
+          "tool_name": null,
+          "row_count": 26,
+          "total_chars": 209573,
+          "total_output_tokens": 52403,
+          "mean_output_tokens": 2015.5
+        },
+        {
+          "collab_session_id": "66ad33ba-3854-4b32-8ce9-e39a5f2a23fd",
+          "tool_name": "search",
+          "row_count": 2,
+          "total_chars": 59093,
+          "total_output_tokens": 14774,
+          "mean_output_tokens": 7387.0
+        },
+        {
+          "collab_session_id": "66ad33ba-3854-4b32-8ce9-e39a5f2a23fd",
+          "tool_name": "collab_status",
+          "row_count": 14,
+          "total_chars": 16545,
+          "total_output_tokens": 4141,
+          "mean_output_tokens": 295.7857142857143
+        },
+        {
+          "collab_session_id": "66ad33ba-3854-4b32-8ce9-e39a5f2a23fd",
+          "tool_name": "get_drawer",
+          "row_count": 1,
+          "total_chars": 5817,
+          "total_output_tokens": 1455,
+          "mean_output_tokens": 1455.0
+        },
+        {
+          "collab_session_id": "66ad33ba-3854-4b32-8ce9-e39a5f2a23fd",
+          "tool_name": "add_drawer",
+          "row_count": 4,
+          "total_chars": 1065,
+          "total_output_tokens": 267,
+          "mean_output_tokens": 66.75
+        },
+        {
+          "collab_session_id": "66ad33ba-3854-4b32-8ce9-e39a5f2a23fd",
+          "tool_name": "collab_send",
+          "row_count": 3,
+          "total_chars": 531,
+          "total_output_tokens": 133,
+          "mean_output_tokens": 44.333333333333336
+        },
+        {
+          "collab_session_id": "66ad33ba-3854-4b32-8ce9-e39a5f2a23fd",
+          "tool_name": "collab_wait_my_turn",
+          "row_count": 2,
+          "total_chars": 418,
+          "total_output_tokens": 106,
+          "mean_output_tokens": 53.0
+        },
+        {
+          "collab_session_id": "66ad33ba-3854-4b32-8ce9-e39a5f2a23fd",
+          "tool_name": "collab_start",
+          "row_count": 1,
+          "total_chars": 332,
+          "total_output_tokens": 83,
+          "mean_output_tokens": 83.0
+        },
+        {
+          "collab_session_id": "66ad33ba-3854-4b32-8ce9-e39a5f2a23fd",
+          "tool_name": "collab_recv",
+          "row_count": 2,
+          "total_chars": 194,
+          "total_output_tokens": 50,
+          "mean_output_tokens": 25.0
+        },
+        {
+          "collab_session_id": "66ad33ba-3854-4b32-8ce9-e39a5f2a23fd",
+          "tool_name": "collab_start_code_review",
+          "row_count": 1,
+          "total_chars": 184,
+          "total_output_tokens": 46,
+          "mean_output_tokens": 46.0
+        }
+      ],
+      "distributions": [
+        {
+          "harness": "claude",
+          "tool_name": null,
+          "row_count": 2,
+          "total_chars": 16121,
+          "total_output_tokens": 4031,
+          "mean_output_tokens": 2015.5,
+          "p50_output_tokens": 43,
+          "p95_output_tokens": 3988,
+          "max_output_tokens": 3988
+        },
+        {
+          "harness": "claude",
+          "tool_name": "add_drawer",
+          "row_count": 4,
+          "total_chars": 1065,
+          "total_output_tokens": 267,
+          "mean_output_tokens": 66.75,
+          "p50_output_tokens": 67,
+          "p95_output_tokens": 67,
+          "max_output_tokens": 67
+        },
+        {
+          "harness": "claude",
+          "tool_name": "collab_send",
+          "row_count": 2,
+          "total_chars": 352,
+          "total_output_tokens": 88,
+          "mean_output_tokens": 44.0,
+          "p50_output_tokens": 43,
+          "p95_output_tokens": 45,
+          "max_output_tokens": 45
+        },
+        {
+          "harness": "claude",
+          "tool_name": "collab_start",
+          "row_count": 1,
+          "total_chars": 332,
+          "total_output_tokens": 83,
+          "mean_output_tokens": 83.0,
+          "p50_output_tokens": 83,
+          "p95_output_tokens": 83,
+          "max_output_tokens": 83
+        },
+        {
+          "harness": "claude",
+          "tool_name": "collab_start_code_review",
+          "row_count": 1,
+          "total_chars": 184,
+          "total_output_tokens": 46,
+          "mean_output_tokens": 46.0,
+          "p50_output_tokens": 46,
+          "p95_output_tokens": 46,
+          "max_output_tokens": 46
+        },
+        {
+          "harness": "claude",
+          "tool_name": "collab_status",
+          "row_count": 12,
+          "total_chars": 13809,
+          "total_output_tokens": 3457,
+          "mean_output_tokens": 288.0833333333333,
+          "p50_output_tokens": 336,
+          "p95_output_tokens": 345,
+          "max_output_tokens": 345
+        },
+        {
+          "harness": "claude",
+          "tool_name": "get_drawer",
+          "row_count": 1,
+          "total_chars": 5817,
+          "total_output_tokens": 1455,
+          "mean_output_tokens": 1455.0,
+          "p50_output_tokens": 1455,
+          "p95_output_tokens": 1455,
+          "max_output_tokens": 1455
+        },
+        {
+          "harness": "claude",
+          "tool_name": "search",
+          "row_count": 2,
+          "total_chars": 59093,
+          "total_output_tokens": 14774,
+          "mean_output_tokens": 7387.0,
+          "p50_output_tokens": 5597,
+          "p95_output_tokens": 9177,
+          "max_output_tokens": 9177
+        },
+        {
+          "harness": "codex",
+          "tool_name": null,
+          "row_count": 24,
+          "total_chars": 193452,
+          "total_output_tokens": 48372,
+          "mean_output_tokens": 2015.5,
+          "p50_output_tokens": 43,
+          "p95_output_tokens": 3988,
+          "max_output_tokens": 3988
+        },
+        {
+          "harness": "codex",
+          "tool_name": "collab_recv",
+          "row_count": 2,
+          "total_chars": 194,
+          "total_output_tokens": 50,
+          "mean_output_tokens": 25.0,
+          "p50_output_tokens": 25,
+          "p95_output_tokens": 25,
+          "max_output_tokens": 25
+        },
+        {
+          "harness": "codex",
+          "tool_name": "collab_send",
+          "row_count": 1,
+          "total_chars": 179,
+          "total_output_tokens": 45,
+          "mean_output_tokens": 45.0,
+          "p50_output_tokens": 45,
+          "p95_output_tokens": 45,
+          "max_output_tokens": 45
+        },
+        {
+          "harness": "codex",
+          "tool_name": "collab_status",
+          "row_count": 2,
+          "total_chars": 2736,
+          "total_output_tokens": 684,
+          "mean_output_tokens": 342.0,
+          "p50_output_tokens": 342,
+          "p95_output_tokens": 342,
+          "max_output_tokens": 342
+        },
+        {
+          "harness": "codex",
+          "tool_name": "collab_wait_my_turn",
+          "row_count": 2,
+          "total_chars": 418,
+          "total_output_tokens": 106,
+          "mean_output_tokens": 53.0,
+          "p50_output_tokens": 53,
+          "p95_output_tokens": 53,
+          "max_output_tokens": 53
+        }
+      ]
+    },
+    "transcript_coverage": null
+  },
+  "unpriced_models": []
+}
