@@ -869,10 +869,10 @@ for compatibility rather than normal retrieval. Pre-016 legacy rows can have
 `drawer_id:null`; because they cannot be dereferenced, their `content` remains
 inline even under the default compact request.
 
-In restricted MCP mode, `collab_recv` does not expose the message body, preview,
-or hash: `first_200_chars` is `null`, `hash` is omitted, and
-`content_redacted:true` plus `hash_redacted:true` identify the redaction. This
-also applies when `full:true`; `content` is then `null`. A `get_drawer` lookup
+In restricted MCP mode, `collab_recv` returns only the delivery envelope plus
+`content_redacted:true` and `hash_redacted:true`. It omits the body, preview,
+hash, and deterministic drawer ID, including when `full:true`, so the response
+cannot reveal or fingerprint sensitive message content. A `get_drawer` lookup
 is subject to the same sensitive-content redaction.
 
 Every accepted message receives a durable immutable transport drawer in the
