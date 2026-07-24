@@ -167,6 +167,13 @@ class InstallIronmemSelfTest(unittest.TestCase):
             legacy_base = claude_commands_dir / ".ironmem-bases"
             legacy_base.mkdir(parents=True)
             (legacy_base / "collab.md").write_text("legacy merge base\n", encoding="utf-8")
+            command_source = ROOT / ".claude-plugin" / "commands" / "collab.md"
+            relocated_base = claude_home / ".ironmem-bases" / "commands" / "collab.md"
+            relocated_base.parent.mkdir(parents=True)
+            relocated_base.write_text(command_source.read_text(encoding="utf-8"), encoding="utf-8")
+            (claude_commands_dir / "collab.md").write_text(
+                "local command changes\n", encoding="utf-8"
+            )
 
             self.run_installer(
                 home,
@@ -184,8 +191,9 @@ class InstallIronmemSelfTest(unittest.TestCase):
             for discovery_root in (*claude_dirs.values(), *codex_dirs.values()):
                 self.assertFalse((discovery_root / ".ironmem-bases").exists())
             self.assertTrue(
-                (claude_home / ".ironmem-bases" / "commands" / "collab.md").is_file()
+                relocated_base.is_file()
             )
+            self.assertEqual(relocated_base.read_text(encoding="utf-8"), command_source.read_text())
             self.assertFalse(legacy_base.exists())
 
 
