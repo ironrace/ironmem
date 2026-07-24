@@ -382,10 +382,27 @@ fn restricted_mode_redacts_search_content() {
         "search",
         json!({ "query": "roadmap", "limit": 5 }),
     );
+    assert_eq!(search["content_mode"], "excerpt");
     let results = search["results"].as_array().unwrap();
     assert!(!results.is_empty());
-    assert_eq!(results[0]["content"], Value::Null);
+    assert!(results[0].get("excerpt").is_some());
+    assert_eq!(results[0]["excerpt"], Value::Null);
+    assert!(results[0].get("content").is_none());
     assert_eq!(results[0]["content_redacted"], true);
+
+    let full_search = call(
+        &restricted,
+        "search",
+        json!({ "query": "roadmap", "full": true, "limit": 5 }),
+    );
+    assert_eq!(full_search["content_mode"], "full");
+    let full_results = full_search["results"].as_array().unwrap();
+    assert!(!full_results.is_empty());
+    let hit = &full_results[0];
+    assert!(hit.get("content").is_some());
+    assert_eq!(hit["content"], Value::Null);
+    assert_eq!(hit["content_redacted"], true);
+    assert!(hit.get("excerpt").is_none());
 
     let diary = call(
         &restricted,
