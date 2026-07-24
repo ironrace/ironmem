@@ -164,11 +164,14 @@ pub(super) fn render_search_excerpt(
     let leading_marker = start > 0;
     let trailing_marker = end < chars.len();
     let mut excerpt = String::new();
-    if leading_marker {
+    if leading_marker && max_chars > 0 {
         excerpt.push('…');
     }
-    excerpt.extend(chars[start..end].iter());
-    if trailing_marker {
+    let marker_chars = usize::from(leading_marker) + usize::from(trailing_marker);
+    let content_capacity = max_chars.saturating_sub(marker_chars);
+    let content_end = start.saturating_add(content_capacity).min(end);
+    excerpt.extend(chars[start..content_end].iter());
+    if trailing_marker && excerpt.chars().count() < max_chars {
         excerpt.push('…');
     }
 
@@ -214,7 +217,7 @@ fn find_case_insensitive_match(
         })
 }
 
-fn centered_excerpt_bounds(
+pub(super) fn centered_excerpt_bounds(
     chars: &[char],
     match_start: usize,
     match_end: usize,
@@ -228,7 +231,10 @@ fn centered_excerpt_bounds(
         return (0, 0);
     }
     if max_chars == 1 {
-        return (0, 0);
+        let match_start = match_start.min(total_chars);
+        let match_end = match_end.clamp(match_start, total_chars);
+        let midpoint = match_start + (match_end - match_start) / 2;
+        return (midpoint, midpoint);
     }
 
     // Reserve both markers first. The loop gives that spare character back
@@ -255,15 +261,18 @@ fn centered_window(
     match_end: usize,
     capacity: usize,
 ) -> (usize, usize) {
+    let match_start = match_start.min(total_chars);
+    let match_end = match_end.clamp(match_start, total_chars);
+    let match_len = match_end - match_start;
+
     if capacity == 0 {
-        return (match_start.min(total_chars), match_start.min(total_chars));
+        let midpoint = match_start + match_len / 2;
+        return (midpoint, midpoint);
     }
     if capacity >= total_chars {
         return (0, total_chars);
     }
 
-    let match_start = match_start.min(total_chars);
-    let match_end = match_end.clamp(match_start, total_chars);
     let match_center = match_start + (match_end - match_start) / 2;
     let mut start = match_center.saturating_sub(capacity / 2);
     if start + capacity > total_chars {
@@ -271,13 +280,15 @@ fn centered_window(
     }
     let mut end = start + capacity;
 
-    if start > match_start {
-        start = match_start;
-        end = (start + capacity).min(total_chars);
-    }
-    if end < match_end {
-        end = match_end.min(total_chars);
-        start = end.saturating_sub(capacity);
+    if match_len <= capacity {
+        if start > match_start {
+            start = match_start;
+            end = (start + capacity).min(total_chars);
+        }
+        if end < match_end {
+            end = match_end;
+            start = end.saturating_sub(capacity);
+        }
     }
 
     (start, end)

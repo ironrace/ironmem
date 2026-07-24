@@ -1032,7 +1032,10 @@ fn mode_label(mode: McpAccessMode) -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    use super::shared::{render_search_excerpt, render_sensitive_text, MAX_SEARCH_EXCERPT_CHARS};
+    use super::shared::{
+        centered_excerpt_bounds, render_search_excerpt, render_sensitive_text,
+        MAX_SEARCH_EXCERPT_CHARS,
+    };
     use super::*;
 
     /// The write-tool set used to be spelled out in three unlinked places —
@@ -1521,5 +1524,38 @@ mod tests {
             assert!(excerpt.chars().count() <= max_chars);
             assert_eq!(consumed, excerpt.chars().count());
         }
+    }
+
+    #[test]
+    fn centered_excerpt_bounds_anchors_an_interior_single_char_budget() {
+        let chars: Vec<char> = "prefix target suffix".chars().collect();
+        let match_start = "prefix ".chars().count();
+        let match_end = match_start + "target".chars().count();
+        let midpoint = match_start + (match_end - match_start) / 2;
+
+        assert_eq!(
+            centered_excerpt_bounds(&chars, match_start, match_end, 1),
+            (midpoint, midpoint)
+        );
+
+        let (excerpt, truncated, redacted, consumed) =
+            render_search_excerpt("prefix target suffix", "target", 1, false);
+        assert_eq!(excerpt, Value::String("…".into()));
+        assert!(truncated);
+        assert!(!redacted);
+        assert_eq!(consumed, 1);
+    }
+
+    #[test]
+    fn render_search_excerpt_centers_partial_long_match() {
+        let long_query = "abcdefghijklmnop";
+        let content = format!("{}{}{}", "x".repeat(40), long_query, "y".repeat(40));
+        let (excerpt, truncated, redacted, consumed) =
+            render_search_excerpt(&content, long_query, 12, false);
+
+        assert_eq!(excerpt, Value::String("…defghijklm…".into()));
+        assert!(truncated);
+        assert!(!redacted);
+        assert_eq!(consumed, 12);
     }
 }
