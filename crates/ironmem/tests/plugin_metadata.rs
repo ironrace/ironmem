@@ -199,6 +199,10 @@ fn codex_phase_prompts_are_packaged_and_invocable() {
             Some("## Invocation"),
             "{rel}: the last Markdown h2 before $ARGUMENTS must be `## Invocation`"
         );
+        assert!(
+            text.contains("collab_wait_my_turn"),
+            "{rel}: join-capable Codex phase prompts must bridge the one-shot handoff race"
+        );
     }
 
     assert!(
