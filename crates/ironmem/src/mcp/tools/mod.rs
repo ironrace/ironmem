@@ -306,7 +306,7 @@ pub fn tool_definitions(app: &App) -> Vec<Value> {
         }),
         json!({
             "name": "collab_recv",
-            "description": "Read pending collab messages for one agent. When auto_ack is true, atomically marks all returned messages as acked in the same transaction, eliminating one round-trip compared to calling collab_ack separately for each message. Default false preserves the existing two-step recv+ack flow.",
+            "description": "Read pending collab messages for one agent. By default, each message returns its stable delivery envelope plus {drawer_id, hash, first_200_chars}; call get_drawer with drawer_id to fetch the full body. Set full:true to additionally include each message's inline content. When auto_ack is true, atomically marks all returned messages as acked in the same transaction, eliminating one round-trip compared to calling collab_ack separately for each message. Default false preserves the existing two-step recv+ack flow.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -314,6 +314,11 @@ pub fn tool_definitions(app: &App) -> Vec<Value> {
                     "receiver": { "type": "string", "enum": ["claude", "codex"] },
                     "limit": { "type": "integer", "default": 10 },
                     "auto_ack": { "type": "boolean", "default": false },
+                    "full": {
+                        "type": "boolean",
+                        "default": false,
+                        "description": "When true, include each message's full inline content in addition to its drawer reference. Default false; dereference drawer_id with get_drawer instead."
+                    },
                     "handoff_token": { "type": "string" }
                 },
                 "required": ["session_id", "receiver"]

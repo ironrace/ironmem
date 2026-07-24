@@ -76,6 +76,12 @@ EXPECTED_TEMPLATES = {
     },
 }
 REQUIRED_TEMPLATE_SNIPPETS = {
+    "collab-turn-plan-synthesis.md": [
+        "first auto-ack response",
+        "get_drawer(id=<message.drawer_id>)",
+        "Do not call `collab_recv` again after it acknowledges.",
+        "`full:true` is compatibility-only",
+    ],
     "collab-turn-task-list.md": [
         "Timebox: <=20 minutes",
         "PlanLocked is pre-coding",
@@ -84,6 +90,11 @@ REQUIRED_TEMPLATE_SNIPPETS = {
     "collab-turn-plan-finalize.md": [
         "Timebox: <=20 minutes",
         "docs/superpowers/plans/YYYY-MM-DD-<short-feature>.md",
+        "first auto-ack response",
+        "get_drawer(id=<canonical_plan_ref.drawer_id>)",
+        "get_drawer(id=<message.drawer_id>)",
+        "Do not call `collab_recv` again after it acknowledges.",
+        "`full:true` is compatibility-only",
     ],
     "collab-turn-final-review.md": [
         '{"title":"<title>","body":"<body>"}',
@@ -93,6 +104,15 @@ REQUIRED_TEMPLATE_SNIPPETS = {
     "collab-turn-submit.md": [
         'parse the artifact JSON as',
         'gh pr create --base <base_branch>',
+    ],
+}
+FORBIDDEN_TEMPLATE_SNIPPETS = {
+    "collab-turn-plan-synthesis.md": [
+        "read Codex's draft",
+    ],
+    "collab-turn-plan-finalize.md": [
+        "read `canonical_plan`",
+        "read Codex's review notes",
     ],
 }
 REQUIRED_SENTINELS = ["<!-- LINT:worker-dispatch -->",
@@ -279,6 +299,9 @@ def lint_template(path: pathlib.Path) -> dict | None:
     for snippet in REQUIRED_TEMPLATE_SNIPPETS.get(name, []):
         if snippet not in text:
             err(f"{name}: missing required contract snippet {snippet!r}")
+    for stale_claim in FORBIDDEN_TEMPLATE_SNIPPETS.get(name, []):
+        if stale_claim in text:
+            err(f"{name}: forbidden stale direct-body claim {stale_claim!r}")
     return {"name": name, "turn": fm.get("turn"), "tier": fm.get("tier"),
             "model": fm.get("model"), "topics": topics}
 

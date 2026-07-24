@@ -1,6 +1,7 @@
 use rusqlite::OptionalExtension;
 use serde_json::{json, Value};
 use std::process::Command;
+use uuid::Uuid;
 
 use crate::collab::queue::SessionRecord;
 use crate::collab::{
@@ -18,13 +19,14 @@ use super::shared::{
     MAX_COLLAB_CONTENT_CHARS,
 };
 
-/// Wing/room under which accepted plan bodies are filed as drawers. Runtime
-/// collab paths dereference these drawers by id; the dedicated room keeps them
-/// auditable/filterable even though the generic drawer FTS index still sees
-/// their content.
-const COLLAB_PLAN_WING: &str = "ironrace-memory";
+/// Wing under which collaboration-owned drawer artifacts are filed. Runtime
+/// collab paths dereference these drawers by id; each dedicated room keeps its
+/// artifacts auditable/filterable even though the generic drawer FTS index
+/// still sees their content.
+const COLLAB_WING: &str = "ironrace-memory";
 const COLLAB_PLAN_ROOM: &str = "collab-plans";
 const COLLAB_TASK_LIST_ROOM: &str = "collab-task-lists";
+const COLLAB_MESSAGE_ROOM: &str = "collab-messages";
 
 pub(super) fn collab_error_to_memory_error(error: CollabError) -> MemoryError {
     MemoryError::Validation(error.to_string())
@@ -58,14 +60,14 @@ fn store_collab_plan_drawer(
             )))
         }
     };
-    let id = crate::db::drawers::generate_id(&body, COLLAB_PLAN_WING, COLLAB_PLAN_ROOM);
+    let id = crate::db::drawers::generate_id(&body, COLLAB_WING, COLLAB_PLAN_ROOM);
     let zero = vec![0.0f32; EMBED_DIM];
     crate::db::schema::Database::insert_drawer_tx(
         tx,
         &id,
         &body,
         &zero,
-        COLLAB_PLAN_WING,
+        COLLAB_WING,
         COLLAB_PLAN_ROOM,
         &format!("collab:{session_id}:{topic}"),
         "collab",
@@ -82,16 +84,43 @@ fn store_collab_task_list_drawer(
     content: &str,
 ) -> Result<String, MemoryError> {
     use ironrace_embed::embedder::EMBED_DIM;
-    let id = crate::db::drawers::generate_id(content, COLLAB_PLAN_WING, COLLAB_TASK_LIST_ROOM);
+    let id = crate::db::drawers::generate_id(content, COLLAB_WING, COLLAB_TASK_LIST_ROOM);
     let zero = vec![0.0f32; EMBED_DIM];
     crate::db::schema::Database::insert_drawer_tx(
         tx,
         &id,
         content,
         &zero,
-        COLLAB_PLAN_WING,
+        COLLAB_WING,
         COLLAB_TASK_LIST_ROOM,
         &format!("collab:{session_id}:task_list"),
+        "collab",
+    )?;
+    Ok(id)
+}
+
+/// Store an accepted collab message body as an immutable, opaque-reference
+/// drawer. Queue rows retain the per-session delivery metadata; this drawer is
+/// only the stable body reference shared by compact `collab_recv` responses.
+///
+/// The id must not be content-addressed: a client that can guess a message
+/// body must not be able to derive a reference that bypasses `collab_recv`'s
+/// restricted-mode redaction.
+fn store_collab_message_drawer(
+    tx: &rusqlite::Transaction<'_>,
+    content: &str,
+) -> Result<String, MemoryError> {
+    use ironrace_embed::embedder::EMBED_DIM;
+    let id = Uuid::new_v4().simple().to_string();
+    let zero = vec![0.0f32; EMBED_DIM];
+    crate::db::schema::Database::insert_drawer_tx(
+        tx,
+        &id,
+        content,
+        &zero,
+        COLLAB_WING,
+        COLLAB_MESSAGE_ROOM,
+        "",
         "collab",
     )?;
     Ok(id)
@@ -248,8 +277,8 @@ struct WaitTurnSnapshot {
 fn wait_turn_snapshot(record: &SessionRecord, agent: Agent) -> WaitTurnSnapshot {
     let ended = record.ended_at.is_some();
     // Dynamic terminal set, evaluated on a single snapshot: pre-task_list,
-    // PlanLocked is terminal so v1 agents can exit cleanly after the plan
-    // locks. Post-task_list the v2 coding phase is underway and the terminal
+    // PlanLocked is terminal so v3 agents can exit cleanly after the plan
+    // locks. Post-task_list the v3 coding phase is underway and the terminal
     // set switches to `{CodingComplete, CodingFailed}`.
     let task_list_submitted = record.session.task_list.is_some();
     let phase_is_terminal = if task_list_submitted {
@@ -732,6 +761,7 @@ pub(super) fn handle_collab_send(app: &App, args: &Value) -> Result<Value, Memor
         let phase_after_enum = session.phase;
         crate::collab::queue::save_session(tx, &session)?;
 
+        let drawer_id = store_collab_message_drawer(tx, content)?;
         let message_id = crate::collab::queue::send_message(
             tx,
             session_id,
@@ -739,6 +769,7 @@ pub(super) fn handle_collab_send(app: &App, args: &Value) -> Result<Value, Memor
             collab_counterpart(sender).as_str(),
             topic,
             content,
+            &drawer_id,
         )?;
         crate::db::schema::Database::wal_log_tx(
             tx,
@@ -825,6 +856,7 @@ pub(super) fn handle_collab_recv(app: &App, args: &Value) -> Result<Value, Memor
         .get("auto_ack")
         .and_then(Value::as_bool)
         .unwrap_or(false);
+    let full = args.get("full").and_then(Value::as_bool).unwrap_or(false);
 
     let result = app.db.with_transaction(|tx| {
         super::handoff::ensure_actor_generation_current(
@@ -857,16 +889,45 @@ pub(super) fn handle_collab_recv(app: &App, args: &Value) -> Result<Value, Memor
             crate::collab::queue::ack_messages_many(tx, session_id, &ids)?;
         }
 
+        let redact_content = app.config.mcp_access_mode.redacts_sensitive_content();
         let json_messages: Vec<Value> = filtered
             .iter()
             .map(|message| {
-                json!({
-                    "id": message.id,
-                    "sender": message.sender,
-                    "topic": message.topic,
-                    "content": message.content,
-                    "created_at": message.created_at,
-                })
+                if redact_content {
+                    // Queue message IDs are random UUIDs; retain only that
+                    // delivery metadata and explicit redaction markers. The
+                    // drawer id, hash, preview, and body are all derived from
+                    // (or reveal) the sensitive message content.
+                    json!({
+                        "id": message.id,
+                        "sender": message.sender,
+                        "topic": message.topic,
+                        "created_at": message.created_at,
+                        "content_redacted": true,
+                        "hash_redacted": true,
+                    })
+                } else {
+                    // Keep the trusted response field order and values exactly
+                    // as before the restricted-mode rendering branch.
+                    let mut out = json!({
+                        "id": message.id,
+                        "sender": message.sender,
+                        "topic": message.topic,
+                        "created_at": message.created_at,
+                        "drawer_id": message.drawer_id,
+                        "hash": sha256_hex(&message.content),
+                        // Char-boundary safe: take 200 Rust chars, not bytes.
+                        "first_200_chars": message.content.chars().take(200).collect::<String>(),
+                    });
+                    // Pre-016 queue rows have no drawer reference. Preserve
+                    // their usable legacy body even under the compact default
+                    // rather than returning a reference the receiver cannot
+                    // dereference.
+                    if full || message.drawer_id.is_none() {
+                        out["content"] = Value::String(message.content.clone());
+                    }
+                    out
+                }
             })
             .collect();
         Ok(json!({ "messages": json_messages }))
@@ -1100,6 +1161,7 @@ pub(super) fn handle_collab_approve(app: &App, args: &Value) -> Result<Value, Me
         )
         .map_err(collab_error_to_memory_error)?;
         crate::collab::queue::save_session(tx, &session)?;
+        let drawer_id = store_collab_message_drawer(tx, &review_content)?;
         let _ = crate::collab::queue::send_message(
             tx,
             session_id,
@@ -1107,6 +1169,7 @@ pub(super) fn handle_collab_approve(app: &App, args: &Value) -> Result<Value, Me
             Agent::Claude.as_str(),
             "review",
             &review_content,
+            &drawer_id,
         )?;
         crate::db::schema::Database::wal_log_tx(
             tx,
@@ -1294,7 +1357,7 @@ pub(super) fn handle_collab_end(app: &App, args: &Value) -> Result<Value, Memory
             super::handoff::opt_handoff_token(args).as_deref(),
         )?;
         // collab_end is valid only from PlanLocked (pre-task_list), or from
-        // the two v2 terminal phases. Rejecting during any active planning
+        // the two v3 terminal phases. Rejecting during any active planning
         // or coding phase prevents either agent from killing a session the
         // counterpart is still working in.
         let session = crate::collab::queue::load_session(tx, session_id)?;

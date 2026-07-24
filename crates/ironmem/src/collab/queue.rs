@@ -14,6 +14,7 @@ pub struct Message {
     pub receiver: String,
     pub topic: String,
     pub content: String,
+    pub drawer_id: Option<String>,
     pub status: String,
     pub created_at: String,
 }
@@ -411,6 +412,11 @@ pub fn save_session(conn: &Connection, session: &CollabSession) -> Result<(), Me
     Ok(())
 }
 
+/// Persist a message that references an already-written drawer.
+///
+/// This low-level helper does not create the drawer. Production callers must
+/// insert the drawer and this message in one SQLite transaction so a successful
+/// collab write never leaves a dangling drawer reference.
 pub fn send_message(
     conn: &Connection,
     session_id: &str,
@@ -418,12 +424,13 @@ pub fn send_message(
     receiver: &str,
     topic: &str,
     content: &str,
+    drawer_id: &str,
 ) -> Result<String, MemoryError> {
     let id = Uuid::new_v4().to_string();
     conn.execute(
-        "INSERT INTO messages (id, session_id, sender, receiver, topic, content)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-        params![id, session_id, sender, receiver, topic, content],
+        "INSERT INTO messages (id, session_id, sender, receiver, topic, content, drawer_id)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        params![id, session_id, sender, receiver, topic, content, drawer_id],
     )?;
     Ok(id)
 }
@@ -435,7 +442,7 @@ pub fn recv_messages(
     limit: usize,
 ) -> Result<Vec<Message>, MemoryError> {
     let mut stmt = conn.prepare(
-        "SELECT id, session_id, sender, receiver, topic, content, status, created_at
+        "SELECT id, session_id, sender, receiver, topic, content, drawer_id, status, created_at
          FROM messages
          WHERE session_id = ?1 AND receiver = ?2 AND status = 'pending'
          ORDER BY rowid ASC
@@ -449,8 +456,9 @@ pub fn recv_messages(
             receiver: row.get(3)?,
             topic: row.get(4)?,
             content: row.get(5)?,
-            status: row.get(6)?,
-            created_at: row.get(7)?,
+            drawer_id: row.get(6)?,
+            status: row.get(7)?,
+            created_at: row.get(8)?,
         })
     })?;
 
@@ -624,6 +632,34 @@ mod tests {
          ADD COLUMN task_list_drawer_id TEXT";
     const COLLAB_RECOVERY_STATE_SQL: &str =
         include_str!("../../migrations/015_collab_recovery_state.sql");
+    const COLLAB_MESSAGE_DRAWERS_SQL: &str =
+        include_str!("../../migrations/016_collab_message_drawers.sql");
+    const QUEUE_TEST_DRAWER_IDS: [&str; 7] = [
+        "drawer-123",
+        "drawer-a",
+        "drawer-b",
+        "drawer-first",
+        "drawer-second",
+        "drawer-third",
+        "drawer-x",
+    ];
+
+    fn insert_queue_test_drawer(conn: &Connection, id: &str) {
+        conn.execute(
+            "INSERT INTO drawers (id, content, embedding, wing, room, source_file, added_by)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            rusqlite::params![
+                id,
+                "queue test drawer",
+                vec![0u8; ironrace_embed::embedder::EMBED_DIM * std::mem::size_of::<f32>()],
+                "ironrace-memory",
+                "collab-plans",
+                "",
+                "test",
+            ],
+        )
+        .unwrap();
+    }
 
     fn open() -> Connection {
         let conn = Connection::open_in_memory().unwrap();
@@ -638,6 +674,10 @@ mod tests {
         conn.execute_batch(COLLAB_GENERATION_LEASE_SQL).unwrap();
         conn.execute_batch(COLLAB_TASK_LIST_REF_SQL).unwrap();
         conn.execute_batch(COLLAB_RECOVERY_STATE_SQL).unwrap();
+        conn.execute_batch(COLLAB_MESSAGE_DRAWERS_SQL).unwrap();
+        for drawer_id in QUEUE_TEST_DRAWER_IDS {
+            insert_queue_test_drawer(&conn, drawer_id);
+        }
         conn
     }
 
@@ -645,8 +685,26 @@ mod tests {
     fn test_send_recv_ack_fifo() {
         let db = open();
         create_session(&db, "sess1", "/repo", "main", None, Agent::Claude).unwrap();
-        let m1 = send_message(&db, "sess1", "claude", "codex", "draft", "first").unwrap();
-        let _m2 = send_message(&db, "sess1", "claude", "codex", "draft", "second").unwrap();
+        let m1 = send_message(
+            &db,
+            "sess1",
+            "claude",
+            "codex",
+            "draft",
+            "first",
+            "drawer-first",
+        )
+        .unwrap();
+        let _m2 = send_message(
+            &db,
+            "sess1",
+            "claude",
+            "codex",
+            "draft",
+            "second",
+            "drawer-second",
+        )
+        .unwrap();
 
         let received = recv_messages(&db, "sess1", "codex", 10).unwrap();
         assert_eq!(received.len(), 2);
@@ -660,10 +718,32 @@ mod tests {
     }
 
     #[test]
+    fn test_send_recv_preserves_drawer_id() {
+        let db = open();
+        create_session(&db, "sess-drawer", "/repo", "main", None, Agent::Claude).unwrap();
+
+        send_message(
+            &db,
+            "sess-drawer",
+            "claude",
+            "codex",
+            "draft",
+            "message body",
+            "drawer-123",
+        )
+        .unwrap();
+
+        let received = recv_messages(&db, "sess-drawer", "codex", 1).unwrap();
+        assert_eq!(received.len(), 1);
+        assert_eq!(received[0].drawer_id.as_deref(), Some("drawer-123"));
+    }
+
+    #[test]
     fn test_ack_idempotent() {
         let db = open();
         create_session(&db, "sess2", "/repo", "main", None, Agent::Claude).unwrap();
-        let message_id = send_message(&db, "sess2", "claude", "codex", "draft", "x").unwrap();
+        let message_id =
+            send_message(&db, "sess2", "claude", "codex", "draft", "x", "drawer-x").unwrap();
         ack_message(&db, "sess2", &message_id).unwrap();
         let err = ack_message(&db, "wrong-session", &message_id).unwrap_err();
         assert!(err.to_string().contains("not found"));
@@ -712,8 +792,16 @@ mod tests {
     #[test]
     fn test_orphan_message_fk_violation() {
         let db = open();
-        let err =
-            send_message(&db, "missing-session", "claude", "codex", "draft", "x").unwrap_err();
+        let err = send_message(
+            &db,
+            "missing-session",
+            "claude",
+            "codex",
+            "draft",
+            "x",
+            "drawer-x",
+        )
+        .unwrap_err();
         assert!(err.to_string().contains("Database error"));
     }
 
@@ -909,8 +997,20 @@ mod tests {
     fn test_ack_messages_many_marks_all_acked() {
         let db = open();
         create_session(&db, "amm-1", "/repo", "main", None, Agent::Claude).unwrap();
-        let m1 = send_message(&db, "amm-1", "claude", "codex", "draft", "msg-a").unwrap();
-        let m2 = send_message(&db, "amm-1", "claude", "codex", "canonical", "msg-b").unwrap();
+        let m1 = send_message(
+            &db, "amm-1", "claude", "codex", "draft", "msg-a", "drawer-a",
+        )
+        .unwrap();
+        let m2 = send_message(
+            &db,
+            "amm-1",
+            "claude",
+            "codex",
+            "canonical",
+            "msg-b",
+            "drawer-b",
+        )
+        .unwrap();
 
         let count = ack_messages_many(&db, "amm-1", &[m1.clone(), m2.clone()]).unwrap();
         assert_eq!(count, 2, "both messages should be updated");
@@ -927,7 +1027,10 @@ mod tests {
     fn test_ack_messages_many_empty_list_is_noop() {
         let db = open();
         create_session(&db, "amm-2", "/repo", "main", None, Agent::Claude).unwrap();
-        send_message(&db, "amm-2", "claude", "codex", "draft", "msg-a").unwrap();
+        send_message(
+            &db, "amm-2", "claude", "codex", "draft", "msg-a", "drawer-a",
+        )
+        .unwrap();
 
         // Acking an empty list must not touch any rows.
         let count = ack_messages_many(&db, "amm-2", &[]).unwrap();
@@ -941,9 +1044,36 @@ mod tests {
     fn test_ack_messages_many_partial_subset() {
         let db = open();
         create_session(&db, "amm-3", "/repo", "main", None, Agent::Claude).unwrap();
-        let m1 = send_message(&db, "amm-3", "claude", "codex", "draft", "first").unwrap();
-        let m2 = send_message(&db, "amm-3", "claude", "codex", "draft", "second").unwrap();
-        let m3 = send_message(&db, "amm-3", "claude", "codex", "draft", "third").unwrap();
+        let m1 = send_message(
+            &db,
+            "amm-3",
+            "claude",
+            "codex",
+            "draft",
+            "first",
+            "drawer-first",
+        )
+        .unwrap();
+        let m2 = send_message(
+            &db,
+            "amm-3",
+            "claude",
+            "codex",
+            "draft",
+            "second",
+            "drawer-second",
+        )
+        .unwrap();
+        let m3 = send_message(
+            &db,
+            "amm-3",
+            "claude",
+            "codex",
+            "draft",
+            "third",
+            "drawer-third",
+        )
+        .unwrap();
 
         // Ack only the first two; the third must remain pending.
         let count = ack_messages_many(&db, "amm-3", &[m1, m2]).unwrap();
@@ -959,7 +1089,7 @@ mod tests {
         let db = open();
         create_session(&db, "amm-4a", "/repo", "main", None, Agent::Claude).unwrap();
         create_session(&db, "amm-4b", "/repo", "main", None, Agent::Claude).unwrap();
-        let m1 = send_message(&db, "amm-4a", "claude", "codex", "draft", "x").unwrap();
+        let m1 = send_message(&db, "amm-4a", "claude", "codex", "draft", "x", "drawer-x").unwrap();
 
         // Passing the correct message ID but the WRONG session_id: zero rows
         // updated (no error, but the message is not acked in the correct session).

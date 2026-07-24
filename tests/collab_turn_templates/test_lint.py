@@ -78,6 +78,36 @@ def test_lint_catches_bad_verdict_schema(tmp_path):
     assert "verdict block must be result/ref/blocker lines" in r.stdout
 
 
+def test_lint_catches_stale_planning_direct_body_claim(tmp_path):
+    fixture = copy_fixture(tmp_path)
+    bad = fixture / ".claude-plugin" / "prompts" / "collab-turn-plan-synthesis.md"
+    bad.write_text(bad.read_text() + "\nread Codex's draft\n")
+
+    r = run({"COLLAB_LINT_ROOT": str(fixture)})
+
+    assert r.returncode == 1
+    assert "forbidden stale direct-body claim" in r.stdout
+
+
+def test_lint_requires_planning_body_dereferences(tmp_path):
+    fixture = copy_fixture(tmp_path)
+    required_refs = [
+        ("collab-turn-plan-synthesis.md", "get_drawer(id=<message.drawer_id>)"),
+        ("collab-turn-plan-finalize.md", "get_drawer(id=<canonical_plan_ref.drawer_id>)"),
+    ]
+    for name, ref in required_refs:
+        path = fixture / ".claude-plugin" / "prompts" / name
+        text = path.read_text()
+        assert ref in text, f"expected dereference contract missing from fixture: {name}"
+        path.write_text(text.replace(ref, "get_drawer(id=<removed>)", 1))
+
+    r = run({"COLLAB_LINT_ROOT": str(fixture)})
+
+    assert r.returncode == 1
+    for _, ref in required_refs:
+        assert f"missing required contract snippet {ref!r}" in r.stdout
+
+
 def test_lint_catches_typoed_matrix_tier(tmp_path):
     # A typo in a matrix tier token parses to None. The cross-check must NOT
     # silently skip it; it must record a specific "unrecognized tier/model"

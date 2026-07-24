@@ -41,8 +41,21 @@ impl Database {
         receiver: &str,
         topic: &str,
         content: &str,
+        drawer_id: &str,
     ) -> Result<String, MemoryError> {
-        queue::send_message(&self.conn, session_id, sender, receiver, topic, content)
+        let drawer = self.get_drawer(drawer_id)?.ok_or_else(|| {
+            MemoryError::Validation(format!(
+                "drawer_id {drawer_id:?} does not reference an existing drawer"
+            ))
+        })?;
+        if drawer.content != content {
+            return Err(MemoryError::Validation(
+                "drawer_id content does not match collab message content".to_string(),
+            ));
+        }
+        queue::send_message(
+            &self.conn, session_id, sender, receiver, topic, content, drawer_id,
+        )
     }
 
     pub fn collab_recv_messages(
@@ -93,5 +106,32 @@ impl Database {
         agent: Option<&str>,
     ) -> Result<Vec<Capability>, MemoryError> {
         queue::get_caps(&self.conn, session_id, agent)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn collab_send_message_rejects_a_dangling_drawer_ref() {
+        let db = Database::open_in_memory().unwrap();
+        db.collab_create_session("session", "/repo", "main", None, Agent::Claude)
+            .unwrap();
+
+        let err = db
+            .collab_send_message(
+                "session",
+                "claude",
+                "codex",
+                "draft",
+                "message body",
+                "missing-drawer",
+            )
+            .unwrap_err();
+
+        assert!(err
+            .to_string()
+            .contains("does not reference an existing drawer"));
     }
 }

@@ -7,6 +7,7 @@ use ironmem::mcp::app::App;
 use ironmem::mcp::protocol::JsonRpcRequest;
 use ironmem::mcp::server::dispatch;
 use serde_json::json;
+use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -108,6 +109,10 @@ fn call_tool_expect_error(app: &App, name: &str, args: serde_json::Value) -> Str
     let text = result["content"][0]["text"].as_str().unwrap_or("");
     let parsed: serde_json::Value = serde_json::from_str(text).unwrap_or(json!({}));
     parsed["error"].as_str().unwrap_or(text).to_string()
+}
+
+fn sha256_hex(content: &str) -> String {
+    format!("{:x}", Sha256::digest(content.as_bytes()))
 }
 
 #[test]
@@ -329,6 +334,27 @@ fn collab_happy_path_locks_via_mcp_handlers() {
     );
     let status = call_tool(&app, "collab_status", json!({ "session_id": session_id }));
     assert_eq!(status["phase"], "PlanClaudeFinalizePending");
+
+    let reviews = call_tool(
+        &app,
+        "collab_recv",
+        json!({ "session_id": session_id, "receiver": "claude" }),
+    );
+    let review = reviews["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|message| message["topic"] == "review")
+        .expect("collab_approve must queue a review message for Claude");
+    assert!(review.get("content").is_none());
+    let review_drawer_id = review["drawer_id"]
+        .as_str()
+        .expect("approve review must have a durable drawer ref");
+    let review_drawer = call_tool(&app, "get_drawer", json!({ "id": review_drawer_id }));
+    assert_eq!(
+        review_drawer["content"],
+        json!({ "verdict": "approve", "content_hash": canonical_hash }).to_string()
+    );
 
     call_tool(
         &app,
@@ -782,7 +808,7 @@ fn collab_recv_blocks_draft_peek_before_own_draft_submitted() {
     let peek = call_tool(
         &app,
         "collab_recv",
-        json!({ "session_id": session_id, "receiver": "codex" }),
+        json!({ "session_id": session_id, "receiver": "codex", "auto_ack": true }),
     );
     let messages = peek["messages"].as_array().unwrap();
     assert!(
@@ -809,7 +835,386 @@ fn collab_recv_blocks_draft_peek_before_own_draft_submitted() {
     );
     let messages = peek["messages"].as_array().unwrap();
     assert_eq!(messages.len(), 1);
-    assert_eq!(messages[0]["content"], "claude draft");
+    assert_eq!(messages[0]["first_200_chars"], "claude draft");
+    assert!(
+        messages[0].get("content").is_none(),
+        "default collab_recv must not inline message content"
+    );
+}
+
+#[test]
+fn collab_recv_defaults_to_drawer_refs_that_get_drawer_can_dereference() {
+    let app = App::open_for_test().unwrap();
+    let content = "Claude's durable draft body";
+    let started = call_tool(
+        &app,
+        "collab_start",
+        json!({
+            "repo_path": "/repo",
+            "branch": "main",
+            "initiator": "claude"
+        }),
+    );
+    let session_id = started["session_id"].as_str().unwrap();
+
+    call_tool(
+        &app,
+        "collab_send",
+        json!({
+            "session_id": session_id,
+            "sender": "claude",
+            "topic": "draft",
+            "content": content,
+        }),
+    );
+    call_tool(
+        &app,
+        "collab_send",
+        json!({
+            "session_id": session_id,
+            "sender": "codex",
+            "topic": "draft",
+            "content": "Codex's separate draft",
+        }),
+    );
+
+    let recv = call_tool(
+        &app,
+        "collab_recv",
+        json!({ "session_id": session_id, "receiver": "codex" }),
+    );
+    let messages = recv["messages"].as_array().unwrap();
+    assert_eq!(messages.len(), 1);
+    let message = &messages[0];
+
+    // The established delivery envelope remains intact.
+    assert!(message["id"].is_string());
+    assert_eq!(message["sender"], "claude");
+    assert_eq!(message["topic"], "draft");
+    assert!(message["created_at"].is_string());
+
+    // The default is compact and dereferenceable rather than body-inline.
+    assert!(message.get("content").is_none());
+    let drawer_id = message["drawer_id"]
+        .as_str()
+        .expect("new collab messages must carry a drawer id");
+    assert_eq!(message["hash"], sha256_hex(content));
+    assert_eq!(message["first_200_chars"], content);
+
+    let drawer = call_tool(&app, "get_drawer", json!({ "id": drawer_id }));
+    assert_eq!(drawer["found"], true);
+    assert_eq!(drawer["content"], content);
+    assert_eq!(drawer["wing"], "ironrace-memory");
+    assert_eq!(drawer["room"], "collab-messages");
+
+    assert_ne!(
+        drawer_id,
+        ironmem::db::drawers::generate_id(content, "ironrace-memory", "collab-messages"),
+        "transport refs must be opaque rather than derivable from message content"
+    );
+    let search = call_tool(&app, "search", json!({ "query": content }));
+    assert!(
+        !search["results"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|result| result["id"] == drawer_id),
+        "transport drawers must not be discoverable through generic search"
+    );
+    let delete_error = call_tool_expect_error(&app, "delete_drawer", json!({ "id": drawer_id }));
+    assert!(delete_error.contains("referenced by collab state"));
+}
+
+#[test]
+fn collab_recv_full_true_retains_inline_content_and_drawer_refs() {
+    let app = App::open_for_test().unwrap();
+    let content = "Claude's full legacy-compatible draft";
+    let started = call_tool(
+        &app,
+        "collab_start",
+        json!({
+            "repo_path": "/repo",
+            "branch": "main",
+            "initiator": "claude"
+        }),
+    );
+    let session_id = started["session_id"].as_str().unwrap();
+
+    call_tool(
+        &app,
+        "collab_send",
+        json!({
+            "session_id": session_id,
+            "sender": "claude",
+            "topic": "draft",
+            "content": content,
+        }),
+    );
+    call_tool(
+        &app,
+        "collab_send",
+        json!({
+            "session_id": session_id,
+            "sender": "codex",
+            "topic": "draft",
+            "content": "Codex's separate draft",
+        }),
+    );
+
+    let recv = call_tool(
+        &app,
+        "collab_recv",
+        json!({ "session_id": session_id, "receiver": "codex", "full": true }),
+    );
+    let messages = recv["messages"].as_array().unwrap();
+    assert_eq!(messages.len(), 1);
+    let message = &messages[0];
+    assert_eq!(message["content"], content);
+    assert!(message["drawer_id"].is_string());
+    assert_eq!(message["hash"], sha256_hex(content));
+    assert_eq!(message["first_200_chars"], content);
+}
+
+#[test]
+fn collab_recv_preview_is_bounded_by_rust_characters_not_bytes() {
+    let app = App::open_for_test().unwrap();
+    let content = "🦀".repeat(201);
+    let expected_preview: String = content.chars().take(200).collect();
+    let started = call_tool(
+        &app,
+        "collab_start",
+        json!({
+            "repo_path": "/repo",
+            "branch": "main",
+            "initiator": "claude"
+        }),
+    );
+    let session_id = started["session_id"].as_str().unwrap();
+
+    call_tool(
+        &app,
+        "collab_send",
+        json!({
+            "session_id": session_id,
+            "sender": "claude",
+            "topic": "draft",
+            "content": content,
+        }),
+    );
+    call_tool(
+        &app,
+        "collab_send",
+        json!({
+            "session_id": session_id,
+            "sender": "codex",
+            "topic": "draft",
+            "content": "Codex's separate draft",
+        }),
+    );
+
+    let recv = call_tool(
+        &app,
+        "collab_recv",
+        json!({ "session_id": session_id, "receiver": "codex" }),
+    );
+    let preview = recv["messages"][0]["first_200_chars"]
+        .as_str()
+        .expect("compact message ref must include a preview");
+    assert_eq!(preview, expected_preview);
+    assert_eq!(preview.chars().count(), 200);
+    assert!(
+        preview.len() > 200,
+        "a 200-character Unicode preview must not be byte-truncated"
+    );
+    assert!(recv["messages"][0].get("content").is_none());
+}
+
+#[test]
+fn collab_recv_legacy_null_drawer_id_inlines_content_by_default() {
+    let app = App::open_for_test().unwrap();
+    let content = "legacy inline message body";
+    let started = call_tool(
+        &app,
+        "collab_start",
+        json!({
+            "repo_path": "/repo",
+            "branch": "main",
+            "initiator": "claude"
+        }),
+    );
+    let session_id = started["session_id"].as_str().unwrap();
+
+    let sent = call_tool(
+        &app,
+        "collab_send",
+        json!({
+            "session_id": session_id,
+            "sender": "claude",
+            "topic": "draft",
+            "content": content,
+        }),
+    );
+    let message_id = sent["message_id"].as_str().unwrap();
+    call_tool(
+        &app,
+        "collab_send",
+        json!({
+            "session_id": session_id,
+            "sender": "codex",
+            "topic": "draft",
+            "content": "Codex's separate draft",
+        }),
+    );
+
+    // Simulate a pre-016 queue row whose migration had no drawer reference.
+    app.db
+        .with_transaction(|tx| {
+            tx.execute(
+                "UPDATE messages SET drawer_id = NULL WHERE id = ?1",
+                [message_id],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+
+    let recv = call_tool(
+        &app,
+        "collab_recv",
+        json!({ "session_id": session_id, "receiver": "codex" }),
+    );
+    let message = &recv["messages"][0];
+    assert!(message["drawer_id"].is_null());
+    assert_eq!(message["content"], content);
+    assert_eq!(message["hash"], sha256_hex(content));
+    assert_eq!(message["first_200_chars"], content);
+}
+
+#[test]
+fn collab_recv_redacts_message_content_and_derivatives_in_restricted_mode() {
+    use ironmem::config::McpAccessMode;
+
+    // Restricted mode correctly disallows writes, so establish a real collab
+    // message through the public trusted-mode protocol first, then switch the
+    // same persisted fixture to its restricted read view.
+    let mut app = App::open_for_test().unwrap();
+    let content = "SENSITIVE: do not expose the launch password";
+    let started = call_tool(
+        &app,
+        "collab_start",
+        json!({
+            "repo_path": "/repo",
+            "branch": "main",
+            "initiator": "claude",
+        }),
+    );
+    let session_id = started["session_id"].as_str().unwrap();
+    let sent = call_tool(
+        &app,
+        "collab_send",
+        json!({
+            "session_id": session_id,
+            "sender": "claude",
+            "topic": "draft",
+            "content": content,
+        }),
+    );
+    let message_id = sent["message_id"].as_str().unwrap().to_string();
+    call_tool(
+        &app,
+        "collab_send",
+        json!({
+            "session_id": session_id,
+            "sender": "codex",
+            "topic": "draft",
+            "content": "Codex's separate draft",
+        }),
+    );
+    app.config.mcp_access_mode = McpAccessMode::Restricted;
+
+    for args in [
+        json!({ "session_id": session_id, "receiver": "codex" }),
+        json!({ "session_id": session_id, "receiver": "codex", "full": true }),
+    ] {
+        let recv = call_tool(&app, "collab_recv", args);
+        let message = &recv["messages"][0];
+        let encoded = message.to_string();
+
+        assert_eq!(message["id"], message_id);
+        assert_eq!(message["sender"], "claude");
+        assert_eq!(message["topic"], "draft");
+        assert_eq!(message["content_redacted"], true);
+        assert!(message.get("hash").is_none());
+        assert_eq!(message["hash_redacted"], true);
+        assert!(message.get("drawer_id").is_none());
+        assert!(message.get("first_200_chars").is_none());
+        assert!(message.get("content").is_none());
+        assert!(
+            !encoded.contains(content)
+                && !encoded.contains(&sha256_hex(content)),
+            "restricted collab_recv must not expose a body or content-derived fingerprint: {encoded}"
+        );
+    }
+}
+
+#[test]
+fn collab_recv_redacts_legacy_inline_content_in_restricted_mode() {
+    use ironmem::config::McpAccessMode;
+
+    let mut app = App::open_for_test().unwrap();
+    let content = "SENSITIVE legacy message body";
+    let started = call_tool(
+        &app,
+        "collab_start",
+        json!({ "repo_path": "/repo", "branch": "main", "initiator": "claude" }),
+    );
+    let session_id = started["session_id"].as_str().unwrap();
+    let sent = call_tool(
+        &app,
+        "collab_send",
+        json!({
+            "session_id": session_id,
+            "sender": "claude",
+            "topic": "draft",
+            "content": content,
+        }),
+    );
+    let message_id = sent["message_id"].as_str().unwrap();
+    call_tool(
+        &app,
+        "collab_send",
+        json!({
+            "session_id": session_id,
+            "sender": "codex",
+            "topic": "draft",
+            "content": "Codex's separate draft",
+        }),
+    );
+    app.db
+        .with_transaction(|tx| {
+            tx.execute(
+                "UPDATE messages SET drawer_id = NULL WHERE id = ?1",
+                [message_id],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+    app.config.mcp_access_mode = McpAccessMode::Restricted;
+
+    for args in [
+        json!({ "session_id": session_id, "receiver": "codex" }),
+        json!({ "session_id": session_id, "receiver": "codex", "full": true }),
+    ] {
+        let message = &call_tool(&app, "collab_recv", args)["messages"][0];
+        assert_eq!(message["content_redacted"], true);
+        assert_eq!(message["hash_redacted"], true);
+        for field in ["drawer_id", "hash", "first_200_chars", "content"] {
+            assert!(
+                message.get(field).is_none(),
+                "restricted legacy receive must omit {field}"
+            );
+        }
+        assert!(!message.to_string().contains(content));
+    }
 }
 
 #[test]
