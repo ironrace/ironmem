@@ -37,6 +37,7 @@ from this spec — keep them in sync when protocol changes land:
 - `.codex-plugin/prompts/collab-plan-draft.md` — Codex's v1 draft turn.
 - `.codex-plugin/prompts/collab-plan-review.md` — Codex's v1 plan-review turn.
 - `.codex-plugin/prompts/collab-global-review.md` — Codex's v3 global-review/fix turn.
+- `.codex-plugin/prompts/collab-recovery.md` — delegated v3 local/final-review recovery.
 - `.codex-plugin/prompts/collab-batch-impl.md` — Codex's v3 batch-implementation turn.
 
 ## What It Is
@@ -1631,6 +1632,10 @@ The eight per-turn worker templates live under `.claude-plugin/prompts/`:
 - `collab-turn-final-review.md` — `CodeReviewFinalPending` PR-body compose
 - `collab-turn-submit.md` — generic submit-by-ref + PR create
 
+Codex uses four normal phase prompts plus `collab-recovery.md` for the rare
+recovery override that delegates `CodeReviewLocalPending` or
+`CodeReviewFinalPending` to Codex.
+
 The Claude-side dispatch tables and the authoritative tier matrix live in
 `.claude-plugin/commands/collab.md`; this section and that command file must
 stay in lockstep with the Codex command/prompt surface (see the headers in
@@ -1909,7 +1914,9 @@ file and the explicit model/effort override vary by phase.
 `PlanCodexReviewPending`, and `CodeReviewFixGlobalPending` use
 `collab-plan-draft.md`, `collab-plan-review.md`, and
 `collab-global-review.md` respectively with `-m gpt-5.6-terra -c
-model_reasoning_effort=high`. A discovered architecture or security issue may
+model_reasoning_effort=high`; delegated `CodeReviewLocalPending` or
+`CodeReviewFinalPending` recovery uses `collab-recovery.md` with that same
+review setting. A discovered architecture or security issue may
 escalate a subagent to `gpt-5.6-sol` at high effort, but the parent protocol
 dispatch remains on its phase default.
 
@@ -1975,7 +1982,8 @@ unchanged; only the transport differs.
    phase prompt file (`.codex-plugin/prompts/collab-plan-draft.md` for
    `PlanParallelDrafts`, `collab-plan-review.md` for
    `PlanCodexReviewPending`, `collab-global-review.md` for
-   `CodeReviewFixGlobalPending`, or `collab-batch-impl.md` for
+   `CodeReviewFixGlobalPending`, `collab-recovery.md` for delegated
+   `CodeReviewLocalPending` / `CodeReviewFinalPending`, or `collab-batch-impl.md` for
    `CodeImplementPending+codex`), substitute `$ARGUMENTS` with
    `join <session_id>`, and call:
    ```json

@@ -32,7 +32,10 @@ uses `gpt-5.6-sol` at `high`. Sol is an escalation tier, not the default.
 
 ## Review behavior
 
-Parse a join invocation with one session id. Read `collab_status`; if phase is
+Parse a join invocation with one session id after an optional recognized
+implementer flag (already applied by the command shim). Call
+`collab_wait_my_turn(session_id, "codex", 60)` once, then read `collab_status`;
+if phase is
 not `PlanCodexReviewPending` or Codex is not current owner, exit with one
 status line. Receive messages with automatic acknowledgement. Find the
 `canonical` message and retrieve its `drawer_id` using `get_drawer`; only a

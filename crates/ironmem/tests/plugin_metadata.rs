@@ -119,6 +119,7 @@ fn codex_collab_command_shim_is_packaged() {
         "collab-plan-draft.md",
         "collab-plan-review.md",
         "collab-global-review.md",
+        "collab-recovery.md",
         "collab-batch-impl.md",
     ] {
         assert!(
@@ -130,16 +131,25 @@ fn codex_collab_command_shim_is_packaged() {
         text.contains("tool discovery for `ironmem collab`"),
         "codex /collab command must explain how to lazy-load IronMEM tools"
     );
+    assert!(
+        text.contains("collab_set_implementer"),
+        "codex /collab command must preserve implementer handoff routing"
+    );
+    assert!(
+        text.contains("collab_wait_my_turn(session_id, \"codex\", 60)"),
+        "codex /collab command must preserve the one-shot handoff wait"
+    );
 }
 
 /// Phase-specific Codex prompts are installed independently so background
 /// collaboration turns receive only the context required for their phase.
 #[test]
 fn codex_phase_prompts_are_packaged_and_invocable() {
-    const REQUIRED_CODEX_PHASE_PROMPTS: [&str; 4] = [
+    const REQUIRED_CODEX_PHASE_PROMPTS: [&str; 5] = [
         "collab-plan-draft",
         "collab-plan-review",
         "collab-global-review",
+        "collab-recovery",
         "collab-batch-impl",
     ];
     const MAX_PROMPT_BYTES: usize = 42_832 / 3;
@@ -190,6 +200,20 @@ fn codex_phase_prompts_are_packaged_and_invocable() {
             "{rel}: the last Markdown h2 before $ARGUMENTS must be `## Invocation`"
         );
     }
+
+    assert!(
+        read_text(".codex-plugin/commands/collab.md").contains("collab_set_implementer"),
+        "codex /collab command must preserve implementer handoff routing"
+    );
+    assert!(
+        read_text(".codex-plugin/prompts/collab-global-review.md").contains("task_list` is null"),
+        "codex global-review prompt must preserve shortcut review recovery"
+    );
+    let recovery = read_text(".codex-plugin/prompts/collab-recovery.md");
+    assert!(
+        recovery.contains("topic `review_local`") && recovery.contains("topic `final_review`"),
+        "codex recovery prompt must cover delegated local and final review completions"
+    );
 }
 
 #[test]

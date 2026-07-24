@@ -69,6 +69,7 @@ local skills, prompts, and commands untouched.
 - `$CODEX_HOME/prompts/collab-plan-draft.md` — the v1 Codex draft turn.
 - `$CODEX_HOME/prompts/collab-plan-review.md` — the v1 Codex plan-review turn.
 - `$CODEX_HOME/prompts/collab-global-review.md` — the v3 Codex global-review/fix turn.
+- `$CODEX_HOME/prompts/collab-recovery.md` — delegated v3 local/final-review recovery.
 - `$CODEX_HOME/prompts/collab-batch-impl.md` — the Codex-implementer batch turn.
 
 The command reads session state and loads the matching phase prompt. Claude's

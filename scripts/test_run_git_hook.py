@@ -446,6 +446,22 @@ def test_classify_path_collab_exact_path():
     )
 
 
+def test_classify_path_install_ironmem_stays_collab_protocol():
+    path = "scripts/install-ironmem.sh"
+    assert manifest.classify_path(path) == manifest.SURFACE_COLLAB_PROTOCOL
+    changes = manifest.ChangeSet(paths=(path,), unknown=False, reason=None)
+    names = [gate.name for gate in manifest.resolve_gates(manifest.PHASE_PRE_COMMIT, changes)]
+    assert "collab_template_lint" in names
+
+
+def test_classify_path_codex_recovery_prompt_stays_collab_protocol():
+    path = ".codex-plugin/prompts/collab-recovery.md"
+    assert manifest.classify_path(path) == manifest.SURFACE_COLLAB_PROTOCOL
+    changes = manifest.ChangeSet(paths=(path,), unknown=False, reason=None)
+    names = [gate.name for gate in manifest.resolve_gates(manifest.PHASE_PRE_COMMIT, changes)]
+    assert "collab_template_lint" in names
+
+
 def test_classify_path_collab_turn_prompt_prefix_selects_collab_lint():
     # Covers the `.claude-plugin/prompts/collab-turn-` startswith branch in
     # is_collab_protocol_path -- deleting that clause must break both the

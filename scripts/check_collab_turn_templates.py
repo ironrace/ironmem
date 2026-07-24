@@ -21,6 +21,7 @@ CODEX_PROMPTS = [
         "collab-plan-draft.md",
         "collab-plan-review.md",
         "collab-global-review.md",
+        "collab-recovery.md",
         "collab-batch-impl.md",
     )
 ]
@@ -445,12 +446,26 @@ def main() -> int:
             "collab-plan-draft.md",
             "collab-plan-review.md",
             "collab-global-review.md",
+            "collab-recovery.md",
             "collab-batch-impl.md",
             "mcp__ironmem__collab_*",
             "one invocation handles one",
+            "collab_set_implementer",
+            "collab_wait_my_turn(session_id, \"codex\", 60)",
         ]:
             if snippet not in codex_cmd_text:
                 err(f".codex-plugin/commands/collab.md: missing {snippet!r}")
+
+        for prompt_name, required in [
+            ("collab-plan-draft.md", "selected implementer"),
+            ("collab-plan-review.md", "collab_wait_my_turn(session_id, \"codex\", 60)"),
+            ("collab-global-review.md", "task_list` is null"),
+            ("collab-recovery.md", "topic `final_review`"),
+            ("collab-batch-impl.md", "collab_wait_my_turn(session_id, \"codex\", 60)"),
+        ]:
+            prompt = ROOT / ".codex-plugin" / "prompts" / prompt_name
+            if prompt.exists() and required not in prompt.read_text():
+                err(f"{prompt.relative_to(ROOT)}: missing required recovery/dispatch contract {required!r}")
 
     check_failure_prefixes()
 

@@ -33,21 +33,25 @@ mechanical work use `gpt-5.6-luna` at `medium`; planning and normal review use
 
 ## Start behavior
 
-For `start`, resolve the repository root and current branch. If already on a
+For `start`, parse and strip an optional `--implementer=claude|codex` flag;
+reject any other value. Resolve the repository root and current branch. If already on a
 non-default branch, use it. Otherwise create an isolated `collab/<task-slug>`
 branch in the repository's `.worktrees/` (or `worktrees/`) directory, verify
 the directory is ignored, and use that worktree as `repo_path`. Never bind a
 session to `main`, `master`, or `trunk`.
 
 Call `collab_start` with the resolved repository, branch, `initiator="codex"`,
-and task. Tell the user exactly: `Run in Claude: /collab join <session_id>`.
+task, and the selected implementer (default `claude`). Tell the user exactly:
+`Run in Claude: /collab join <session_id>`.
 Then write an implementation-ready independent plan from the task returned by
 status and send one `draft` message. Do not wait or loop after the send.
 
 ## Join and draft behavior
 
-For `join`, parse one session id and no extra positional values. Call
-`collab_status`, report task and phase, and act only when the phase is
+For `join`, accept one session id after an optional recognized implementer
+flag. The command shim applies that flag before loading this prompt. Call
+`collab_wait_my_turn(session_id, "codex", 60)` once, then `collab_status`,
+report task and phase, and act only when the phase is
 `PlanParallelDrafts`. If the phase is not yours, exit with a concise status.
 
 The server enforces the blind-draft invariant: `collab_recv` does not reveal

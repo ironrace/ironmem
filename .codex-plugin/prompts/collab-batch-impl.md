@@ -32,7 +32,10 @@ escalation tier, not the default.
 
 ## Join guard and harness
 
-Parse a join invocation with one session id. Read `collab_status`; act only
+Parse a join invocation with one session id after an optional recognized
+implementer flag (already applied by the command shim). Call
+`collab_wait_my_turn(session_id, "codex", 60)` once, then read `collab_status`;
+act only
 when phase is `CodeImplementPending`, implementer is `codex`, and Codex owns
 the turn. Otherwise exit with a concise stale-invocation status.
 

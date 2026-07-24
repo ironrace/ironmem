@@ -87,6 +87,7 @@ REQUIRED_CODEX_PROMPTS=(
   collab-plan-draft
   collab-plan-review
   collab-global-review
+  collab-recovery
   collab-batch-impl
   evaluate-issue
 )

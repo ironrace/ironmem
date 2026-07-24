@@ -1,6 +1,6 @@
 ---
 description: Join or start an IronMEM bounded Claude/Codex collab session from Codex.
-argument-hint: "start <task> | join [--implementer=claude|codex] <session_id>"
+argument-hint: "start [--implementer=claude|codex] <task> | join [--implementer=claude|codex] <session_id>"
 ---
 
 # /collab
@@ -18,8 +18,15 @@ You are Codex. This is one-shot: one invocation handles one Codex-owned action
 and exits. Use the IronMEM collab tools; if `mcp__ironmem__collab_*` is
 unavailable, use tool discovery for `ironmem collab` first.
 
-For `start`, select `collab-plan-draft.md`. For `join`, call
-`collab_status` first, then select the prompt from session state:
+For `start`, select `collab-plan-draft.md`. For `join`, parse exactly one
+session id plus an optional `--implementer=claude|codex` flag. Reject any other
+flag or extra value. When that flag is present, call
+`collab_set_implementer` with `agent="codex"` before waiting or selecting a
+prompt; use its returned session record. That rebinds an active batch before
+the phase is routed. Without the flag, call `collab_status`.
+
+Then call `collab_wait_my_turn(session_id, "codex", 60)` once to bridge the
+handoff race, refresh `collab_status`, and select the prompt from session state:
 
 | Phase | Prompt |
 |---|---|
@@ -27,8 +34,9 @@ For `start`, select `collab-plan-draft.md`. For `join`, call
 | `PlanCodexReviewPending` | `collab-plan-review.md` |
 | `CodeImplementPending` with `implementer == "codex"` | `collab-batch-impl.md` |
 | `CodeReviewFixGlobalPending` | `collab-global-review.md` |
+| `CodeReviewLocalPending` or `CodeReviewFinalPending` with Codex recovery ownership | `collab-recovery.md` |
 
-For Claude-owned or terminal phases, report the concise status and exit.
+For a normal Claude-owned or terminal phase, report the concise status and exit.
 Locate the selected prompt at the first existing root:
 
 1. `$CODEX_HOME/prompts/<selected prompt>`
