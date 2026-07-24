@@ -25,7 +25,11 @@ pub fn render_text(pack: &ContextPack) -> String {
     if pack.decisions.is_empty() {
         out.push_str("  (none recorded for the requested areas)\n");
     } else {
-        for d in &pack.decisions {
+        let mut decisions: Vec<_> = pack.decisions.iter().collect();
+        decisions.sort_by(|a, b| {
+            (&a.subject, &a.predicate, &a.object).cmp(&(&b.subject, &b.predicate, &b.object))
+        });
+        for d in decisions {
             let _ = writeln!(out, "  - {} {} {}", d.subject, d.predicate, d.object);
         }
     }
@@ -34,7 +38,12 @@ pub fn render_text(pack: &ContextPack) -> String {
     if pack.memory_hits.is_empty() {
         out.push_str("  (no matching memory)\n");
     } else {
-        for h in &pack.memory_hits {
+        // Recall relevance selects the hits before rendering. Canonicalizing
+        // their display order here keeps this early prompt prefix byte-stable
+        // without changing which memories the search pipeline selected.
+        let mut memory_hits: Vec<_> = pack.memory_hits.iter().collect();
+        memory_hits.sort_by(|a, b| a.id.cmp(&b.id));
+        for h in memory_hits {
             let _ = writeln!(
                 out,
                 "  - [{}/{}] {} (score {:.3})",
@@ -193,5 +202,59 @@ mod tests {
         assert!(text.contains("## Warnings"));
         assert!(text.contains("  - memory recall failed: boom"));
         assert!(text.contains("  - repo path '/x' could not be canonicalized"));
+    }
+
+    #[test]
+    fn rendering_canonicalizes_unordered_memory_and_decision_hits() {
+        let mut first = base_pack(vec![
+            AreaContext {
+                area: "zeta".to_string(),
+                status: AreaStatus::Missing {
+                    reason: "no map".to_string(),
+                },
+            },
+            AreaContext {
+                area: "alpha".to_string(),
+                status: AreaStatus::Missing {
+                    reason: "no map".to_string(),
+                },
+            },
+        ]);
+        first.memory_hits = vec![
+            super::super::MemoryHit {
+                id: "drawer-z".to_string(),
+                wing: "w".to_string(),
+                room: "r".to_string(),
+                score: 0.1,
+                snippet: "last".to_string(),
+            },
+            super::super::MemoryHit {
+                id: "drawer-a".to_string(),
+                wing: "w".to_string(),
+                room: "r".to_string(),
+                score: 0.9,
+                snippet: "first".to_string(),
+            },
+        ];
+        first.decisions = vec![
+            super::super::DecisionHit {
+                subject: "z".to_string(),
+                predicate: "uses".to_string(),
+                object: "z".to_string(),
+            },
+            super::super::DecisionHit {
+                subject: "a".to_string(),
+                predicate: "uses".to_string(),
+                object: "a".to_string(),
+            },
+        ];
+        let mut second = first.clone();
+        second.memory_hits.reverse();
+        second.decisions.reverse();
+
+        let rendered = render_text(&first);
+        assert_eq!(rendered, render_text(&second));
+        assert!(rendered.find("first").unwrap() < rendered.find("last").unwrap());
+        assert!(rendered.find("a uses a").unwrap() < rendered.find("z uses z").unwrap());
     }
 }
