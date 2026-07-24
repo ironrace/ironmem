@@ -361,11 +361,16 @@ fn search_response_budget_preserves_references_in_excerpt_and_full_modes() {
             ids.iter().any(|id| hit["id"].as_str() == Some(id.as_str())),
             "excerpt hit id must identify an inserted drawer: {hit}"
         );
+        let excerpt = hit["excerpt"]
+            .as_str()
+            .expect("excerpt mode must return an excerpt string");
         assert!(
-            hit["excerpt"]
-                .as_str()
-                .is_some_and(|excerpt| !excerpt.is_empty()),
+            !excerpt.is_empty(),
             "excerpt mode must retain non-empty excerpts: {hit}"
+        );
+        assert!(
+            excerpt.chars().count() <= 300,
+            "excerpt mode must respect the 300-character cap: {hit}"
         );
         assert_eq!(hit["excerpt_truncated"], true);
         assert!(hit.get("content").is_none());
