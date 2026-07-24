@@ -48,11 +48,21 @@ class InstallIronmemSelfTest(unittest.TestCase):
         if cls.created_fixture:
             RELEASE_BINARY.unlink(missing_ok=True)
 
-    def run_installer(self, home: pathlib.Path, claude_config: pathlib.Path) -> None:
+    def run_installer(
+        self,
+        home: pathlib.Path,
+        claude_config: pathlib.Path,
+        *,
+        skip_skills: bool = True,
+        extra_env: dict[str, str] | None = None,
+    ) -> None:
         codex_home = home / ".codex"
         install_dir = home / ".ironrace" / "bin"
+        command = ["bash", str(INSTALLER), "--skip-build"]
+        if skip_skills:
+            command.append("--skip-skills")
         result = subprocess.run(
-            ["bash", str(INSTALLER), "--skip-build", "--skip-skills"],
+            command,
             cwd=ROOT,
             env={
                 **os.environ,
@@ -61,6 +71,7 @@ class InstallIronmemSelfTest(unittest.TestCase):
                 "CLAUDE_CONFIG_JSON": str(claude_config),
                 "CODEX_HOME": str(codex_home),
                 "CODEX_CONFIG_TOML": str(codex_home / "config.toml"),
+                **(extra_env or {}),
             },
             capture_output=True,
             text=True,
@@ -135,6 +146,47 @@ class InstallIronmemSelfTest(unittest.TestCase):
 
             server = self.read_claude_server(config)
             self.assertEqual(server["env"]["IRONMEM_MCP_MODE"], "read-only")
+
+    def test_full_install_moves_bases_outside_discovery_roots(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            home = pathlib.Path(directory)
+            claude_home = home / "claude-home"
+            codex_home = home / "codex-home"
+            claude_dirs = {
+                "CLAUDE_SKILLS_DIR": home / "claude-discovery" / "skills",
+                "CLAUDE_AGENTS_DIR": home / "claude-discovery" / "agents",
+                "CLAUDE_COMMANDS_DIR": home / "claude-discovery" / "commands",
+                "CLAUDE_PROMPTS_DIR": home / "claude-discovery" / "prompts",
+            }
+            codex_dirs = {
+                "CODEX_SKILLS_DIR": home / "codex-discovery" / "skills",
+                "CODEX_COMMANDS_DIR": home / "codex-discovery" / "commands",
+                "CODEX_PROMPTS_DIR": home / "codex-discovery" / "prompts",
+            }
+            claude_commands_dir = claude_dirs["CLAUDE_COMMANDS_DIR"]
+            legacy_base = claude_commands_dir / ".ironmem-bases"
+            legacy_base.mkdir(parents=True)
+            (legacy_base / "collab.md").write_text("legacy merge base\n", encoding="utf-8")
+
+            self.run_installer(
+                home,
+                home / ".claude.json",
+                skip_skills=False,
+                extra_env={
+                    "CLAUDE_HOME": str(claude_home),
+                    "CODEX_HOME": str(codex_home),
+                    **{name: str(path) for name, path in claude_dirs.items()},
+                    **{name: str(path) for name, path in codex_dirs.items()},
+                },
+            )
+
+            self.assertTrue((claude_commands_dir / "collab.md").is_file())
+            for discovery_root in (*claude_dirs.values(), *codex_dirs.values()):
+                self.assertFalse((discovery_root / ".ironmem-bases").exists())
+            self.assertTrue(
+                (claude_home / ".ironmem-bases" / "commands" / "collab.md").is_file()
+            )
+            self.assertFalse(legacy_base.exists())
 
 
 if __name__ == "__main__":
