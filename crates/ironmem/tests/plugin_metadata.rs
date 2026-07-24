@@ -121,6 +121,66 @@ fn codex_collab_command_shim_is_packaged() {
     );
 }
 
+/// Phase-specific Codex prompts are installed independently so background
+/// collaboration turns receive only the context required for their phase.
+#[test]
+fn codex_phase_prompts_are_packaged_and_invocable() {
+    const REQUIRED_CODEX_PHASE_PROMPTS: [&str; 4] = [
+        "collab-plan-draft",
+        "collab-plan-review",
+        "collab-global-review",
+        "collab-batch-impl",
+    ];
+    const MAX_PROMPT_BYTES: usize = 42_832 / 3;
+
+    let installer = read_text("scripts/install-ironmem.sh");
+    let required_prompts = installer
+        .split("REQUIRED_CODEX_PROMPTS=(")
+        .nth(1)
+        .and_then(|rest| rest.split(')').next())
+        .expect("scripts/install-ironmem.sh: missing REQUIRED_CODEX_PROMPTS array");
+
+    for prompt_name in REQUIRED_CODEX_PHASE_PROMPTS {
+        assert!(
+            required_prompts
+                .lines()
+                .any(|line| line.trim() == prompt_name),
+            "scripts/install-ironmem.sh: REQUIRED_CODEX_PROMPTS must include {prompt_name}"
+        );
+
+        let rel = format!(".codex-plugin/prompts/{prompt_name}.md");
+        let path = workspace_root().join(&rel);
+        let raw = std::fs::read(&path)
+            .unwrap_or_else(|_| panic!("Codex phase prompt is missing: {}", path.display()));
+        assert!(
+            raw.len() <= MAX_PROMPT_BYTES,
+            "{rel}: {} bytes exceeds the {MAX_PROMPT_BYTES}-byte phase-prompt budget",
+            raw.len()
+        );
+
+        let text = std::str::from_utf8(&raw)
+            .unwrap_or_else(|_| panic!("{rel}: prompt must be valid UTF-8"));
+        assert_eq!(
+            text.matches("$ARGUMENTS").count(),
+            1,
+            "{rel}: must contain exactly one $ARGUMENTS placeholder"
+        );
+
+        let invocation = text
+            .find("$ARGUMENTS")
+            .expect("placeholder count guarantees $ARGUMENTS is present");
+        let last_h2 = text[..invocation]
+            .lines()
+            .filter(|line| line.starts_with("## "))
+            .last();
+        assert_eq!(
+            last_h2,
+            Some("## Invocation"),
+            "{rel}: the last Markdown h2 before $ARGUMENTS must be `## Invocation`"
+        );
+    }
+}
+
 #[test]
 fn claude_plugin_json_has_required_fields() {
     let json = read_json(".claude-plugin/plugin.json");
