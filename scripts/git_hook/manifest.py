@@ -25,7 +25,9 @@ from typing import Callable
 COLLAB_EXACT_PATHS = {
     ".claude-plugin/commands/collab.md",
     ".codex-plugin/commands/collab.md",
-    ".codex-plugin/prompts/collab.md",
+    ".codex-plugin/prompts/collab-plan-draft.md",
+    ".codex-plugin/prompts/collab-plan-review.md",
+    ".codex-plugin/prompts/collab-global-review.md",
     ".codex-plugin/prompts/collab-batch-impl.md",
     "docs/COLLAB.md",
     "scripts/check_collab_turn_templates.py",

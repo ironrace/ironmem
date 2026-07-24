@@ -34,8 +34,10 @@ from this spec — keep them in sync when protocol changes land:
 
 - `.claude-plugin/commands/collab.md` — Claude's `/collab` prompt.
 - `.codex-plugin/commands/collab.md` — Codex's `/collab` slash command.
-- `.codex-plugin/prompts/collab.md` — Codex's full one-turn protocol prompt,
-  loaded by the command and passed directly by Claude's background dispatcher.
+- `.codex-plugin/prompts/collab-plan-draft.md` — Codex's v1 draft turn.
+- `.codex-plugin/prompts/collab-plan-review.md` — Codex's v1 plan-review turn.
+- `.codex-plugin/prompts/collab-global-review.md` — Codex's v3 global-review/fix turn.
+- `.codex-plugin/prompts/collab-batch-impl.md` — Codex's v3 batch-implementation turn.
 
 ## What It Is
 
@@ -1631,8 +1633,8 @@ The eight per-turn worker templates live under `.claude-plugin/prompts/`:
 
 The Claude-side dispatch tables and the authoritative tier matrix live in
 `.claude-plugin/commands/collab.md`; this section and that command file must
-stay in lockstep with the Codex command/prompt surface (see the header rule at
-the top of `.codex-plugin/prompts/collab.md`).
+stay in lockstep with the Codex command/prompt surface (see the headers in
+`.codex-plugin/prompts/collab-*.md`).
 
 ## Autonomous Planning Loop
 
@@ -1642,7 +1644,7 @@ each Codex-owned turn is dispatched inline via background `codex exec`
 state, sends exactly one protocol message, and exits. There is no
 symmetric long-running polling loop on the Codex side — Claude polls,
 Claude dispatches. A single bounded `wait_my_turn` call at invocation
-start (as in `.codex-plugin/prompts/collab.md`) is permitted to bridge
+start (as in the matching `.codex-plugin/prompts/collab-*.md`) is permitted to bridge
 the brief server-write race after Claude's dispatch — that's a one-shot
 boot-time wait, not a polling loop.
 
@@ -1902,9 +1904,11 @@ that dominated latency in smoke testing (`PlanCodexReviewPending` hung
 24+ min; `CodeReviewFixGlobalPending` took 171s via synchronous MCP).
 The dispatch shape is now uniform across all Codex turns; only the prompt
 file and the explicit model/effort override vary by phase.
-`CodeImplementPending+codex` uses the slim `collab-batch-impl.md` prompt and
-`-m gpt-5.6-luna -c model_reasoning_effort=max`; all other Codex turns use the
-full `collab.md` prompt with `-m gpt-5.6-terra -c
+`CodeImplementPending+codex` uses `collab-batch-impl.md` and
+`-m gpt-5.6-luna -c model_reasoning_effort=max`; `PlanParallelDrafts`,
+`PlanCodexReviewPending`, and `CodeReviewFixGlobalPending` use
+`collab-plan-draft.md`, `collab-plan-review.md`, and
+`collab-global-review.md` respectively with `-m gpt-5.6-terra -c
 model_reasoning_effort=high`. A discovered architecture or security issue may
 escalate a subagent to `gpt-5.6-sol` at high effort, but the parent protocol
 dispatch remains on its phase default.
@@ -1968,8 +1972,10 @@ unchanged; only the transport differs.
    `.codex-plugin/commands/collab.md`. Passing a raw
    `/collab join <sid>` string through the MCP transport would make Codex
    treat it as ordinary user text and go off-script. Read the appropriate
-   prompt file (`.codex-plugin/prompts/collab.md` for plan/review
-   phases; `.codex-plugin/prompts/collab-batch-impl.md` for
+   phase prompt file (`.codex-plugin/prompts/collab-plan-draft.md` for
+   `PlanParallelDrafts`, `collab-plan-review.md` for
+   `PlanCodexReviewPending`, `collab-global-review.md` for
+   `CodeReviewFixGlobalPending`, or `collab-batch-impl.md` for
    `CodeImplementPending+codex`), substitute `$ARGUMENTS` with
    `join <session_id>`, and call:
    ```json

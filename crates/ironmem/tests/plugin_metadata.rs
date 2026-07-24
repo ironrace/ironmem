@@ -112,9 +112,20 @@ fn codex_hooks_json_has_required_hooks() {
 fn codex_collab_command_shim_is_packaged() {
     let text = read_text(".codex-plugin/commands/collab.md");
     assert!(
-        text.contains("~/.codex/prompts/collab.md"),
-        "codex /collab command must delegate to the installed collab prompt"
+        text.contains("~/.codex/prompts/<selected prompt>"),
+        "codex /collab command must delegate to the selected installed phase prompt"
     );
+    for prompt in [
+        "collab-plan-draft.md",
+        "collab-plan-review.md",
+        "collab-global-review.md",
+        "collab-batch-impl.md",
+    ] {
+        assert!(
+            text.contains(prompt),
+            "codex /collab command must route to {prompt}"
+        );
+    }
     assert!(
         text.contains("tool discovery for `ironmem collab`"),
         "codex /collab command must explain how to lazy-load IronMEM tools"

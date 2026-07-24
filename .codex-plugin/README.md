@@ -66,12 +66,14 @@ local skills, prompts, and commands untouched.
 `scripts/install-ironmem.sh` installs:
 
 - `$CODEX_HOME/commands/collab.md` — the interactive Codex `/collab` slash command.
-- `$CODEX_HOME/prompts/collab.md` — the full Codex one-turn collab protocol.
-- `$CODEX_HOME/prompts/collab-batch-impl.md` — the slim codex-implementer batch prompt.
+- `$CODEX_HOME/prompts/collab-plan-draft.md` — the v1 Codex draft turn.
+- `$CODEX_HOME/prompts/collab-plan-review.md` — the v1 Codex plan-review turn.
+- `$CODEX_HOME/prompts/collab-global-review.md` — the v3 Codex global-review/fix turn.
+- `$CODEX_HOME/prompts/collab-batch-impl.md` — the Codex-implementer batch turn.
 
-The command loads the protocol prompt and substitutes the slash-command
-arguments. Claude's background dispatcher still passes the resolved protocol
-prompt directly when it drives Codex-owned turns.
+The command reads session state and loads the matching phase prompt. Claude's
+background dispatcher likewise passes the resolved phase prompt directly when
+it drives Codex-owned turns.
 
 ## Default Codex routing
 
