@@ -1478,4 +1478,48 @@ mod tests {
         assert!(!redacted);
         assert_eq!(consumed, "short body".chars().count());
     }
+
+    #[test]
+    fn render_search_excerpt_centers_on_late_case_insensitive_match() {
+        let content = format!("{}needle {}", "prefix ".repeat(430), "suffix ".repeat(430));
+        let result = render_search_excerpt(&content, "the NEEDLE", 96, false);
+
+        assert_eq!(
+            result,
+            render_search_excerpt(&content, "the NEEDLE", 96, false)
+        );
+        let excerpt = result.0.as_str().expect("excerpt should be a string");
+        assert!(excerpt.contains("needle"));
+        assert!(excerpt.starts_with('…'));
+        assert!(excerpt.ends_with('…'));
+        assert!(result.1);
+        assert!(!result.2);
+        assert!(excerpt.chars().count() <= 96);
+        assert_eq!(result.3, excerpt.chars().count());
+    }
+
+    #[test]
+    fn render_search_excerpt_handles_utf8_match_near_the_end() {
+        let content = format!("{}目标{}", "前🙂".repeat(180), "尾😀".repeat(40));
+        let result = render_search_excerpt(&content, "目标", 32, false);
+
+        let excerpt = result.0.as_str().expect("excerpt should be a string");
+        assert!(excerpt.contains("目标"));
+        assert_eq!(excerpt, excerpt.chars().collect::<String>());
+        assert!(excerpt.chars().count() <= 32);
+        assert_eq!(result.3, excerpt.chars().count());
+    }
+
+    #[test]
+    fn render_search_excerpt_markers_stay_within_every_small_budget() {
+        let content = "prefix target suffix";
+
+        for max_chars in 0..=20 {
+            let (excerpt, _, _, consumed) =
+                render_search_excerpt(content, "target", max_chars, false);
+            let excerpt = excerpt.as_str().expect("excerpt should be a string");
+            assert!(excerpt.chars().count() <= max_chars);
+            assert_eq!(consumed, excerpt.chars().count());
+        }
+    }
 }

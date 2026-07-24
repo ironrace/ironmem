@@ -3,6 +3,7 @@ use sha2::{Digest, Sha256};
 
 use crate::collab::Agent;
 use crate::error::MemoryError;
+use crate::search::sanitizer::is_content_word;
 
 /// Maximum allowed value for search `limit`.
 pub(super) const MAX_SEARCH_LIMIT: usize = 25;
@@ -122,8 +123,265 @@ pub(super) fn render_search_excerpt(
         return render_sensitive_text(content, max_chars, redact);
     }
 
-    // Query-aware matching is added in the next search-excerpt task. Until
-    // then, the no-match fallback is the leading prefix window.
-    let _ = clean_query;
-    render_sensitive_text(content, max_chars, false)
+    let tokens: Vec<&str> = clean_query
+        .split_whitespace()
+        .filter(|token| is_content_word(token))
+        .collect();
+    if tokens.is_empty() {
+        return render_sensitive_text(content, max_chars, false);
+    }
+
+    let lowered_content = lowercase_char_map(content);
+    // ponytail: naive per-token scan — fine at limit<=25; switch to FTS5 snippet()/offsets or a single Aho-Corasick pass if search widens
+    let matched_bytes = tokens
+        .iter()
+        .filter_map(|token| find_case_insensitive_match(&lowered_content, token))
+        .min_by_key(|(start, _)| *start);
+    let Some((match_start_byte, match_end_byte)) = matched_bytes else {
+        return render_sensitive_text(content, max_chars, false);
+    };
+
+    let chars: Vec<char> = content.chars().collect();
+    let char_offsets: Vec<usize> = content
+        .char_indices()
+        .map(|(byte, _)| byte)
+        .chain(std::iter::once(content.len()))
+        .collect();
+    debug_assert!(content.is_char_boundary(match_start_byte));
+    debug_assert!(content.is_char_boundary(match_end_byte));
+    let Some(match_start) = char_offsets.binary_search(&match_start_byte).ok() else {
+        return render_sensitive_text(content, max_chars, false);
+    };
+    let Some(match_end) = char_offsets.binary_search(&match_end_byte).ok() else {
+        return render_sensitive_text(content, max_chars, false);
+    };
+
+    if max_chars == 0 {
+        return (Value::String(String::new()), !content.is_empty(), false, 0);
+    }
+
+    let (start, end) = centered_excerpt_bounds(&chars, match_start, match_end, max_chars);
+    let leading_marker = start > 0;
+    let trailing_marker = end < chars.len();
+    let mut excerpt = String::new();
+    if leading_marker {
+        excerpt.push('…');
+    }
+    excerpt.extend(chars[start..end].iter());
+    if trailing_marker {
+        excerpt.push('…');
+    }
+
+    let consumed_chars = excerpt.chars().count();
+    debug_assert!(consumed_chars <= max_chars);
+    (
+        Value::String(excerpt),
+        leading_marker || trailing_marker,
+        false,
+        consumed_chars,
+    )
+}
+
+const MAX_OUTWARD_WHITESPACE_SNAP_CHARS: usize = 15;
+
+fn lowercase_char_map(content: &str) -> Vec<(char, usize, usize)> {
+    let mut lowered = Vec::new();
+    for (start, character) in content.char_indices() {
+        let end = start + character.len_utf8();
+        lowered.extend(character.to_lowercase().map(|lower| (lower, start, end)));
+    }
+    lowered
+}
+
+fn find_case_insensitive_match(
+    lowered_content: &[(char, usize, usize)],
+    token: &str,
+) -> Option<(usize, usize)> {
+    let lowered_token: Vec<char> = token.chars().flat_map(|c| c.to_lowercase()).collect();
+    if lowered_token.is_empty() {
+        return None;
+    }
+
+    lowered_content
+        .windows(lowered_token.len())
+        .find_map(|window| {
+            let matches = window
+                .iter()
+                .map(|(character, _, _)| *character)
+                .zip(lowered_token.iter().copied())
+                .all(|(left, right)| left == right);
+            matches.then(|| (window[0].1, window[window.len() - 1].2))
+        })
+}
+
+fn centered_excerpt_bounds(
+    chars: &[char],
+    match_start: usize,
+    match_end: usize,
+    max_chars: usize,
+) -> (usize, usize) {
+    let total_chars = chars.len();
+    if total_chars <= max_chars {
+        return (0, total_chars);
+    }
+    if max_chars == 0 {
+        return (0, 0);
+    }
+    if max_chars == 1 {
+        return (0, 0);
+    }
+
+    // Reserve both markers first. The loop gives that spare character back
+    // when the selected window reaches either content edge.
+    let mut capacity = max_chars.saturating_sub(2);
+    let mut bounds = (0, 0);
+    for _ in 0..8 {
+        let centered = centered_window(total_chars, match_start, match_end, capacity);
+        bounds = snap_window_outward(chars, centered, capacity, match_start, match_end);
+        let marker_count = usize::from(bounds.0 > 0) + usize::from(bounds.1 < total_chars);
+        let next_capacity = max_chars.saturating_sub(marker_count);
+        if next_capacity == capacity {
+            break;
+        }
+        capacity = next_capacity;
+    }
+
+    bounds
+}
+
+fn centered_window(
+    total_chars: usize,
+    match_start: usize,
+    match_end: usize,
+    capacity: usize,
+) -> (usize, usize) {
+    if capacity == 0 {
+        return (match_start.min(total_chars), match_start.min(total_chars));
+    }
+    if capacity >= total_chars {
+        return (0, total_chars);
+    }
+
+    let match_start = match_start.min(total_chars);
+    let match_end = match_end.clamp(match_start, total_chars);
+    let match_center = match_start + (match_end - match_start) / 2;
+    let mut start = match_center.saturating_sub(capacity / 2);
+    if start + capacity > total_chars {
+        start = total_chars - capacity;
+    }
+    let mut end = start + capacity;
+
+    if start > match_start {
+        start = match_start;
+        end = (start + capacity).min(total_chars);
+    }
+    if end < match_end {
+        end = match_end.min(total_chars);
+        start = end.saturating_sub(capacity);
+    }
+
+    (start, end)
+}
+
+#[derive(Clone, Copy)]
+struct WindowCandidate {
+    start: usize,
+    end: usize,
+    snapped_boundaries: usize,
+}
+
+fn snap_window_outward(
+    chars: &[char],
+    centered: (usize, usize),
+    capacity: usize,
+    match_start: usize,
+    match_end: usize,
+) -> (usize, usize) {
+    let (start, end) = centered;
+    let left = outward_left_boundary(chars, start);
+    let right = outward_right_boundary(chars, end);
+    let left_snapped = left < start;
+    let right_snapped = right > end;
+    let mut candidates = vec![WindowCandidate {
+        start,
+        end,
+        snapped_boundaries: 0,
+    }];
+
+    if left_snapped {
+        let candidate_end = left.saturating_add(capacity).min(chars.len());
+        if candidate_end >= match_end {
+            candidates.push(WindowCandidate {
+                start: left,
+                end: candidate_end,
+                snapped_boundaries: 1,
+            });
+        }
+    }
+    if right_snapped {
+        let candidate_start = right.saturating_sub(capacity);
+        if candidate_start <= match_start {
+            candidates.push(WindowCandidate {
+                start: candidate_start,
+                end: right,
+                snapped_boundaries: 1,
+            });
+        }
+    }
+    if left_snapped && right_snapped && right.saturating_sub(left) <= capacity {
+        candidates.push(WindowCandidate {
+            start: left,
+            end: right,
+            snapped_boundaries: 2,
+        });
+    }
+
+    candidates
+        .into_iter()
+        .max_by(|left_candidate, right_candidate| {
+            left_candidate
+                .snapped_boundaries
+                .cmp(&right_candidate.snapped_boundaries)
+                .then_with(|| {
+                    (left_candidate.end - left_candidate.start)
+                        .cmp(&(right_candidate.end - right_candidate.start))
+                })
+                .then_with(|| {
+                    let left_distance =
+                        (left_candidate.start + left_candidate.end).abs_diff(start + end);
+                    let right_distance =
+                        (right_candidate.start + right_candidate.end).abs_diff(start + end);
+                    right_distance.cmp(&left_distance)
+                })
+                .then_with(|| right_candidate.start.cmp(&left_candidate.start))
+        })
+        .map(|candidate| (candidate.start, candidate.end))
+        .unwrap_or((start, end))
+}
+
+fn outward_left_boundary(chars: &[char], start: usize) -> usize {
+    let lower_bound = start.saturating_sub(MAX_OUTWARD_WHITESPACE_SNAP_CHARS);
+    for index in (lower_bound..start).rev() {
+        if chars[index].is_whitespace() {
+            return index;
+        }
+    }
+    start
+}
+
+fn outward_right_boundary(chars: &[char], end: usize) -> usize {
+    let upper_bound = end
+        .saturating_add(MAX_OUTWARD_WHITESPACE_SNAP_CHARS)
+        .min(chars.len());
+    for (index, character) in chars
+        .iter()
+        .enumerate()
+        .skip(end)
+        .take(upper_bound.saturating_sub(end))
+    {
+        if character.is_whitespace() {
+            return index + 1;
+        }
+    }
+    end
 }
