@@ -306,7 +306,7 @@ impl Database {
             (Some(w), Some(r)) => {
                 let mut stmt = self.conn.prepare(
                     "SELECT id, content, wing, room, source_file, added_by, filed_at, date
-                     FROM drawers WHERE wing = ?1 AND room = ?2 ORDER BY filed_at DESC LIMIT ?3",
+                     FROM drawers WHERE wing = ?1 AND room = ?2 ORDER BY filed_at DESC, id ASC LIMIT ?3",
                 )?;
                 let rows = stmt.query_map(params![w, r, limit_i64], Self::row_to_drawer)?;
                 for row in rows {
@@ -316,7 +316,7 @@ impl Database {
             (Some(w), None) => {
                 let mut stmt = self.conn.prepare(
                     "SELECT id, content, wing, room, source_file, added_by, filed_at, date
-                     FROM drawers WHERE wing = ?1 ORDER BY filed_at DESC LIMIT ?2",
+                     FROM drawers WHERE wing = ?1 ORDER BY filed_at DESC, id ASC LIMIT ?2",
                 )?;
                 let rows = stmt.query_map(params![w, limit_i64], Self::row_to_drawer)?;
                 for row in rows {
@@ -326,7 +326,7 @@ impl Database {
             (None, Some(r)) => {
                 let mut stmt = self.conn.prepare(
                     "SELECT id, content, wing, room, source_file, added_by, filed_at, date
-                     FROM drawers WHERE room = ?1 ORDER BY filed_at DESC LIMIT ?2",
+                     FROM drawers WHERE room = ?1 ORDER BY filed_at DESC, id ASC LIMIT ?2",
                 )?;
                 let rows = stmt.query_map(params![r, limit_i64], Self::row_to_drawer)?;
                 for row in rows {
@@ -336,7 +336,7 @@ impl Database {
             (None, None) => {
                 let mut stmt = self.conn.prepare(
                     "SELECT id, content, wing, room, source_file, added_by, filed_at, date
-                     FROM drawers ORDER BY filed_at DESC LIMIT ?1",
+                     FROM drawers ORDER BY filed_at DESC, id ASC LIMIT ?1",
                 )?;
                 let rows = stmt.query_map(params![limit_i64], Self::row_to_drawer)?;
                 for row in rows {
@@ -754,6 +754,39 @@ mod tests {
 
         let alpha_notes = db.get_drawers(Some("alpha"), Some("notes"), 100).unwrap();
         assert_eq!(alpha_notes.len(), 1);
+    }
+
+    #[test]
+    fn get_drawers_tiebreaks_equal_filed_at_by_id_for_every_filter() {
+        let db = Database::open_in_memory().unwrap();
+        let emb = dummy_embedding();
+        let ids = [
+            "aaaa0000bbbb1111cccc2222dddd3333",
+            "ffff0000bbbb1111cccc2222dddd3333",
+        ];
+
+        for id in ids {
+            db.insert_drawer(id, "content", &emb, "wing", "room", "", "mcp")
+                .unwrap();
+        }
+        db.conn
+            .execute("UPDATE drawers SET filed_at = '2025-01-01T00:00:00Z'", [])
+            .unwrap();
+
+        let assert_ids = |wing, room| {
+            let drawers = db.get_drawers(wing, room, 10).unwrap();
+            assert_eq!(
+                drawers
+                    .iter()
+                    .map(|drawer| drawer.id.as_str())
+                    .collect::<Vec<_>>(),
+                ids
+            );
+        };
+        assert_ids(None, None);
+        assert_ids(Some("wing"), None);
+        assert_ids(None, Some("room"));
+        assert_ids(Some("wing"), Some("room"));
     }
 
     #[test]

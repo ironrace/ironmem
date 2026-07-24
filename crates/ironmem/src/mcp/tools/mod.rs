@@ -44,15 +44,15 @@ pub fn tool_definitions(app: &App) -> Vec<Value> {
     let tools = vec![
         json!({
             "name": "status",
-            "description": "Memory overview — total drawers, wing and room counts, knowledge graph summary, and one-line metrics summary. Optional set_task_tag/clear_task_tag manage the explicit metrics task tag for non-collab work (METRICS_SPEC §2.3).",
+            "description": "Memory, graph, and metrics overview. task-tag fields scope non-collab metrics.",
             "inputSchema": { "type": "object", "properties": {
-                "set_task_tag": { "type": "string", "description": "Set the explicit metrics task tag for subsequent token_usage rows. Process-local and ephemeral (cleared on server restart); shadowed while an active collab session is attributing (METRICS_SPEC §2.3 gives the collab session id priority)." },
+                "set_task_tag": { "type": "string", "description": "Process-local metrics task tag; active collab takes priority." },
                 "clear_task_tag": { "type": "boolean", "description": "Clear the explicit metrics task tag" }
             } }
         }),
         json!({
             "name": "search",
-            "description": "Semantic search with KG-boosted ranking. By default, returns a bounded, query-aware excerpt plus a stable `id`; `full:true` returns bounded full-content search results, while `get_drawer` returns the complete body by stable id.",
+            "description": "Semantic search. Returns bounded excerpts and stable IDs; use get_drawer for a complete body.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -63,7 +63,7 @@ pub fn tool_definitions(app: &App) -> Vec<Value> {
                     "full": {
                         "type": "boolean",
                         "default": false,
-                        "description": "When true, return bounded full-content search results subject to per-field and aggregate response caps. Default false; use `get_drawer` with the stable id for the complete body."
+                        "description": "Return bounded full content; use get_drawer for the complete body."
                     }
                 },
                 "required": ["query"]
@@ -71,7 +71,7 @@ pub fn tool_definitions(app: &App) -> Vec<Value> {
         }),
         json!({
             "name": "add_drawer",
-            "description": "File verbatim content into a wing/room. Omit logical_key for append/content-addressed durable notes; pass logical_key to overwrite a current-context drawer for that wing/room instead of accumulating stale copies.",
+            "description": "Store content in a wing/room. logical_key overwrites replaceable current context.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -80,7 +80,7 @@ pub fn tool_definitions(app: &App) -> Vec<Value> {
                     "room": { "type": "string", "default": "general" },
                     "logical_key": {
                         "type": "string",
-                        "description": "Optional stable key for replaceable current context, e.g. 'current-context' or 'task-state'. Same wing/room/logical_key rewrites the same drawer id."
+                        "description": "Stable key that rewrites this wing/room drawer."
                     }
                 },
                 "required": ["content", "wing"]
@@ -88,7 +88,7 @@ pub fn tool_definitions(app: &App) -> Vec<Value> {
         }),
         json!({
             "name": "get_drawer",
-            "description": "Fetch a single drawer by exact ID. By default returns full content; pass include_content:false for metadata only, max_chars for a bounded excerpt, or hash_only:true for a content hash without body. Restricted mode redacts content_hash.",
+            "description": "Fetch a drawer by ID; supports metadata, bounded content, or content hash.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -251,7 +251,7 @@ pub fn tool_definitions(app: &App) -> Vec<Value> {
         }),
         json!({
             "name": "collab_start",
-            "description": "Create a bounded Claude↔Codex planning session. Optional `task` describes the planning goal and is returned in collab_status so the counterpart agent can fetch it without a manual paste. Optional `implementer` (default 'claude') selects which agent runs the v3 batch implementation phase; 'codex' routes CodeImplementPending to Codex so it drives its own subagent-driven-development end-to-end.",
+            "description": "Create a bounded Claude↔Codex planning session. task is visible in collab_status; implementer selects the coding owner.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -266,7 +266,7 @@ pub fn tool_definitions(app: &App) -> Vec<Value> {
         }),
         json!({
             "name": "collab_start_code_review",
-            "description": "Create a bounded Claude↔Codex review-only session positioned directly at the v3 global-review stage. Codex owns the first turn; initiator must be claude.",
+            "description": "Create a Claude↔Codex review-only session at global review. Initiator must be claude.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -282,7 +282,7 @@ pub fn tool_definitions(app: &App) -> Vec<Value> {
         }),
         json!({
             "name": "collab_set_implementer",
-            "description": "Select or reassign which agent owns the v3 batch implementation phase. Valid during planning and during CodeImplementPending; in CodeImplementPending this also moves current_owner to the selected implementer so /collab join --implementer=... can resume from the last ironmem checkpoint.",
+            "description": "Select the coding owner during planning or CodeImplementPending.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -296,7 +296,7 @@ pub fn tool_definitions(app: &App) -> Vec<Value> {
         }),
         json!({
             "name": "collab_send",
-            "description": "Send a collab message and advance the bounded state machine. v1 planning topics: draft, canonical, review, final. v3 coding topics: task_list, implementation_done, review_local, review_fix_global, final_review, failure_report.",
+            "description": "Send a collab message and advance its state machine.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -311,7 +311,7 @@ pub fn tool_definitions(app: &App) -> Vec<Value> {
         }),
         json!({
             "name": "collab_recv",
-            "description": "Read pending collab messages for one agent. By default, each message returns its stable delivery envelope plus {drawer_id, hash, first_200_chars}; call get_drawer with drawer_id to fetch the full body. Set full:true to additionally include each message's inline content. When auto_ack is true, atomically marks all returned messages as acked in the same transaction, eliminating one round-trip compared to calling collab_ack separately for each message. Default false preserves the existing two-step recv+ack flow.",
+            "description": "Read pending collab messages. Default returns references; full includes content and auto_ack consumes returned messages.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -322,7 +322,7 @@ pub fn tool_definitions(app: &App) -> Vec<Value> {
                     "full": {
                         "type": "boolean",
                         "default": false,
-                        "description": "When true, include each message's full inline content in addition to its drawer reference. Default false; dereference drawer_id with get_drawer instead."
+                        "description": "Include inline content with each drawer reference."
                     },
                     "handoff_token": { "type": "string" }
                 },
@@ -344,7 +344,7 @@ pub fn tool_definitions(app: &App) -> Vec<Value> {
         }),
         json!({
             "name": "collab_status",
-            "description": "Return collab session state. Accepted plans and task lists are returned by reference by default — `canonical_plan_ref`/`final_plan_ref`/`task_list_ref` = {drawer_id, hash, first_200_chars}; pass verbose:true to additionally inline full canonical/final plans, and include_task_list:true to inline full task_list. (Legacy pre-009 plans inline the full body and emit no *_plan_ref.)",
+            "description": "Return collab state and compact plan/task-list references. Optional fields inline their bodies.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -427,7 +427,7 @@ pub fn tool_definitions(app: &App) -> Vec<Value> {
         }),
         json!({
             "name": "collab_end",
-            "description": "End a collab session. Valid only from PlanLocked (pre-task_list), CodingComplete, or CodingFailed; rejected in any active planning phase (PlanParallelDrafts through PlanClaudeFinalizePending) or coding-active phase (CodeImplementPending through CodeReviewFinalPending). Idempotent once allowed.",
+            "description": "End an eligible collab session; rejected during active planning or coding.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -440,7 +440,7 @@ pub fn tool_definitions(app: &App) -> Vec<Value> {
         }),
         json!({
             "name": "collab_resume",
-            "description": "Resume a tooling-class CodingFailed session back to the phase it failed from (e.g. a git_commit_failed: report). Rejects semantic-failure sessions (branch_drift:, subagent_failure:, or any non-tooling coding_failure) and legacy pre-migration rows with a deterministic error, and rejects a session that has already been collab_end-ed.",
+            "description": "Resume a tooling-failed CodingFailed session; semantic failures remain rejected.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -453,7 +453,7 @@ pub fn tool_definitions(app: &App) -> Vec<Value> {
         }),
         json!({
             "name": "code_map_write",
-            "description": "Write or refresh a per-area code map. Embeds summary, stores the drawer in room 'code-maps', and records the sidecar row keyed (repo, area). Write-mode only.",
+            "description": "Write or refresh a per-area code map. Write-mode only.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -499,7 +499,7 @@ pub fn tool_definitions(app: &App) -> Vec<Value> {
         }),
         json!({
             "name": "symbol_graph_index",
-            "description": "Index all Rust and Python source files in a git repository into the local symbol/import graph (migration 012). Only supported extensions (.rs, .py) are indexed; others are skipped. Incremental by content-hash: unchanged files are skipped unless --force. Write-mode only.",
+            "description": "Index Rust and Python into the symbol/import graph. Incremental unless force. Write-mode only.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -511,7 +511,7 @@ pub fn tool_definitions(app: &App) -> Vec<Value> {
         }),
         json!({
             "name": "symbol_lookup",
-            "description": "Look up symbol declarations (functions, structs, classes, etc.) in the indexed symbol graph by name or qualified name. Returns bounded metadata — no full source bodies.",
+            "description": "Look up symbol declarations by name or qualified name; returns bounded metadata.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -538,7 +538,7 @@ pub fn tool_definitions(app: &App) -> Vec<Value> {
         }),
         json!({
             "name": "symbol_neighbors",
-            "description": "Look up symbol-graph edges (import or contains) by symbol id, name, qualified name, or file path. v0 edge scope: import (file→module) and contains (symbol→parent symbol).",
+            "description": "Look up import or contains symbol-graph edges by symbol or file path.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -551,7 +551,7 @@ pub fn tool_definitions(app: &App) -> Vec<Value> {
         }),
         json!({
             "name": "session_handoff",
-            "description": "Issue (or byte-identically reuse) a one-time handoff token plus a deterministic, model-free session handoff block for an unplanned successor. Sets the pending generation; the successor presents handoff_token on its first mutating collab call to claim it, making this predecessor inert. The token is returned top-level (NOT inside the block) — the successor needs both.",
+            "description": "Issue or reuse a one-time handoff token and deterministic successor block. The successor claims the token on its first mutating collab call.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -559,7 +559,7 @@ pub fn tool_definitions(app: &App) -> Vec<Value> {
                     "agent": { "type": "string", "enum": ["claude", "codex"] },
                     "handoff_token": {
                         "type": "string",
-                        "description": "Required when the session's active generation > 0 (a prior handoff has been claimed); omit only on a generation-0 session. On the first mutating collab call a successor presents this to claim the new generation."
+                        "description": "Required after a prior handoff claim; successor uses it to claim this generation."
                     }
                 },
                 "required": ["session_id", "agent"]
@@ -1127,17 +1127,25 @@ mod tests {
         let description = search["description"]
             .as_str()
             .expect("search tool needs a description");
-        assert!(description
-            .contains("By default, returns a bounded, query-aware excerpt plus a stable `id`"));
-        assert!(description.contains("`full:true` returns bounded full-content search results"));
-        assert!(description.contains("`get_drawer` returns the complete body by stable id"));
+        assert!(description.contains("Returns bounded excerpts and stable IDs"));
+        assert!(description.contains("use get_drawer for a complete body"));
 
         let full_description = full["description"]
             .as_str()
             .expect("full property needs a description");
-        assert!(full_description.contains("bounded full-content search results"));
-        assert!(full_description.contains("per-field and aggregate response caps"));
-        assert!(full_description.contains("`get_drawer` with the stable id for the complete body"));
+        assert!(full_description.contains("Return bounded full content"));
+        assert!(full_description.contains("use get_drawer for the complete body"));
+    }
+
+    #[test]
+    fn tool_listing_stays_within_prompt_cache_schema_budget() {
+        let app = App::open_for_test().unwrap();
+        let bytes = serde_json::to_vec(&tool_definitions(&app)).unwrap().len();
+        let estimated_tokens = bytes.div_ceil(4);
+        assert!(
+            estimated_tokens <= 3_500,
+            "tool listing is ~{estimated_tokens} tokens ({bytes} bytes); trim descriptions that duplicate their schemas"
+        );
     }
 
     /// A conditionally-mutating entry is only worth anything if the argument it

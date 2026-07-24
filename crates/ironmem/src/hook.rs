@@ -737,8 +737,12 @@ fn bm25_block_from_db(
         return None;
     }
 
-    let ids: Vec<&str> = qualifying.iter().map(|(id, _)| id.as_str()).collect();
-    let drawers = match db.get_drawers_by_ids(&ids) {
+    // Preserve BM25 selection above, but render the selected drawers in stable
+    // ID order. `get_drawers_by_ids` returns a HashMap, so relying on either
+    // DB rank ties or map iteration would churn the early prompt prefix.
+    let mut selected_ids: Vec<&str> = qualifying.iter().map(|(id, _)| id.as_str()).collect();
+    selected_ids.sort_unstable();
+    let drawers = match db.get_drawers_by_ids(&selected_ids) {
         Ok(drawers) => drawers,
         Err(e) => {
             tracing::warn!("prompt-hook recall: drawer fetch failed: {e}");
@@ -747,7 +751,7 @@ fn bm25_block_from_db(
     };
 
     let mut lines = Vec::new();
-    for (id, _score) in &qualifying {
+    for id in selected_ids {
         if let Some(d) = drawers.get(id) {
             let excerpt = compact_excerpt(&d.content, line_bytes);
             if !excerpt.is_empty() {
@@ -3065,7 +3069,7 @@ mod tests {
     }
 
     #[test]
-    fn prompt_hook_caps_at_max_hits_in_bm25_order() {
+    fn prompt_hook_renders_selected_hits_in_drawer_id_order() {
         let temp = tempfile::tempdir().unwrap();
         let db_path = temp.path().join("memory.sqlite3");
         // Five drawers all matching the query (implicit-AND), with increasing
@@ -3092,20 +3096,28 @@ mod tests {
 
         let q = "alpha beta gamma";
         let db = crate::db::schema::Database::open(&db_path).unwrap();
-        // Sort rooms by their real BM25 score descending and take the top 3 —
-        // the order the capped recall block must reproduce.
+        // The recall set stays the top three by BM25 relevance, but its rendered
+        // order is canonicalized by stable drawer ID so equal-score/database
+        // ordering cannot churn the prompt-cache prefix.
         let mut scored: Vec<(String, f32)> = rows
             .iter()
             .map(|(c, w, r)| (r.clone(), bm25_score_of(&db, q, c, w, r)))
             .collect();
         scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
-        let expected: Vec<String> = scored.into_iter().take(3).map(|(r, _)| r).collect();
+        let mut expected: Vec<String> = scored.into_iter().take(3).map(|(r, _)| r).collect();
+        expected.sort_by_key(|room| {
+            let index = room.strip_prefix('r').unwrap().parse::<usize>().unwrap();
+            generate_id(rows[index].0.as_str(), "x", room)
+        });
 
         // max_hits = 3 even though five drawers qualify.
         let block = bm25_block_from_db(&db, q, 0.0, 3, 120).expect("five matches → recall injects");
         let injected = injected_source_rooms(&block);
         assert_eq!(injected.len(), 3, "max_hits caps the block at 3: {block}");
-        assert_eq!(injected, expected, "injected in BM25 score order: {block}");
+        assert_eq!(
+            injected, expected,
+            "injected in stable drawer-id order: {block}"
+        );
     }
 
     #[test]
