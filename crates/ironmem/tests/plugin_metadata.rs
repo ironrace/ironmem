@@ -183,7 +183,7 @@ fn codex_phase_prompts_are_packaged_and_invocable() {
         let last_h2 = text[..invocation]
             .lines()
             .filter(|line| line.starts_with("## "))
-            .last();
+            .next_back();
         assert_eq!(
             last_h2,
             Some("## Invocation"),

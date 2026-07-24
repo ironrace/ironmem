@@ -15,9 +15,8 @@ $ARGUMENTS
 ```
 
 You are Codex. This is one-shot: one invocation handles one Codex-owned action
-and exits. Use
-the IronMEM collab tools; if `mcp__ironmem__collab_*` is unavailable, use tool
-discovery for `ironmem collab` first.
+and exits. Use the IronMEM collab tools; if `mcp__ironmem__collab_*` is
+unavailable, use tool discovery for `ironmem collab` first.
 
 For `start`, select `collab-plan-draft.md`. For `join`, call
 `collab_status` first, then select the prompt from session state:
