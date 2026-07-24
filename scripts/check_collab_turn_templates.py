@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Lint for collab worker-per-turn templates and the collab.md dispatch surface.
+"""Lint collab worker templates and Codex's phase-prompt dispatch surface.
 
 Exit 0 iff all checks pass; non-zero with a printed reason otherwise.
 Stdlib only.
@@ -15,7 +15,16 @@ PROMPTS = ROOT / ".claude-plugin" / "prompts"
 COMMAND = ROOT / ".claude-plugin" / "commands" / "collab.md"
 DOC = ROOT / "docs" / "COLLAB.md"
 CODEX_COMMAND = ROOT / ".codex-plugin" / "commands" / "collab.md"
-CODEX_PROMPT = ROOT / ".codex-plugin" / "prompts" / "collab.md"
+CODEX_PROMPTS = [
+    ROOT / ".codex-plugin" / "prompts" / name
+    for name in (
+        "collab-plan-draft.md",
+        "collab-plan-review.md",
+        "collab-global-review.md",
+        "collab-recovery.md",
+        "collab-batch-impl.md",
+    )
+]
 
 ALLOWED_PLACEHOLDERS = {"SESSION_ID", "REPO_PATH", "BRANCH", "TOPIC",
                         "ARTIFACT_REF", "ARTIFACT_HASH", "MODE"}
@@ -183,11 +192,11 @@ CODING_FAILURE_USE_RE = re.compile(r'coding_failure\W{0,8}([a-z][a-z0-9_]*):')
 
 def failure_prefix_surfaces() -> list[pathlib.Path]:
     """Every markdown surface that may instruct an agent to send a failure."""
-    paths = [COMMAND, DOC, CODEX_COMMAND, CODEX_PROMPT]
+    paths = [COMMAND, DOC, CODEX_COMMAND, *CODEX_PROMPTS]
     for directory in (PROMPTS, ROOT / ".codex-plugin" / "prompts"):
         if directory.is_dir():
             paths.extend(sorted(directory.glob("*.md")))
-    # Deduplicate while preserving order: CODEX_PROMPT is also inside the
+    # Deduplicate while preserving order: phase prompts are also in the
     # .codex-plugin prompts directory.
     seen: set[pathlib.Path] = set()
     unique = []
@@ -414,9 +423,19 @@ def main() -> int:
         if name not in doc_text:
             err(f"docs/COLLAB.md: missing template reference {name}")
 
-    codex_text = CODEX_PROMPT.read_text()
-    if "collab-turn-*.md" not in codex_text:
-        err(".codex-plugin/prompts/collab.md: missing worker-template xref")
+    for prompt in CODEX_PROMPTS:
+        if not prompt.exists():
+            err(f"{prompt.relative_to(ROOT)}: missing Codex phase prompt")
+            continue
+        codex_text = prompt.read_text()
+        if codex_text.count("$ARGUMENTS") != 1:
+            err(f"{prompt.relative_to(ROOT)}: must contain exactly one $ARGUMENTS")
+        else:
+            prefix = codex_text.split("$ARGUMENTS", 1)[0]
+            if prefix.rstrip().splitlines()[-1] != "## Invocation":
+                err(f"{prompt.relative_to(ROOT)}: $ARGUMENTS must be in final Invocation section")
+            if "## Invocation" not in prefix or prefix.rfind("## Invocation") < prefix.rfind("\n## "):
+                err(f"{prompt.relative_to(ROOT)}: missing final ## Invocation section")
 
     if not CODEX_COMMAND.exists():
         err(".codex-plugin/commands/collab.md: missing Codex slash command")
@@ -424,14 +443,29 @@ def main() -> int:
         codex_cmd_text = CODEX_COMMAND.read_text()
         for snippet in [
             "$ARGUMENTS",
-            "$CODEX_HOME/prompts/collab.md",
-            "~/.codex/prompts/collab.md",
-            ".codex-plugin/prompts/collab.md",
+            "collab-plan-draft.md",
+            "collab-plan-review.md",
+            "collab-global-review.md",
+            "collab-recovery.md",
+            "collab-batch-impl.md",
             "mcp__ironmem__collab_*",
             "one invocation handles one",
+            "collab_set_implementer",
+            "collab_wait_my_turn(session_id, \"codex\", 60)",
         ]:
             if snippet not in codex_cmd_text:
                 err(f".codex-plugin/commands/collab.md: missing {snippet!r}")
+
+        for prompt_name, required in [
+            ("collab-plan-draft.md", "selected implementer"),
+            ("collab-plan-review.md", "collab_wait_my_turn(session_id, \"codex\", 60)"),
+            ("collab-global-review.md", "task_list` is null"),
+            ("collab-recovery.md", "topic `final_review`"),
+            ("collab-batch-impl.md", "collab_wait_my_turn(session_id, \"codex\", 60)"),
+        ]:
+            prompt = ROOT / ".codex-plugin" / "prompts" / prompt_name
+            if prompt.exists() and required not in prompt.read_text():
+                err(f"{prompt.relative_to(ROOT)}: missing required recovery/dispatch contract {required!r}")
 
     check_failure_prefixes()
 

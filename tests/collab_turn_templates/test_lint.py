@@ -33,7 +33,10 @@ def test_lint_passes_on_repo():
 def test_codex_dispatch_uses_explicit_repository_model_defaults():
     docs = (ROOT / "docs" / "COLLAB.md").read_text()
     dispatcher = (ROOT / ".claude-plugin" / "commands" / "collab.md").read_text()
-    prompt = (ROOT / ".codex-plugin" / "prompts" / "collab.md").read_text()
+    plan_draft_prompt = (ROOT / ".codex-plugin" / "prompts" / "collab-plan-draft.md").read_text()
+    plan_review_prompt = (ROOT / ".codex-plugin" / "prompts" / "collab-plan-review.md").read_text()
+    global_review_prompt = (ROOT / ".codex-plugin" / "prompts" / "collab-global-review.md").read_text()
+    recovery_prompt = (ROOT / ".codex-plugin" / "prompts" / "collab-recovery.md").read_text()
     batch_prompt = (ROOT / ".codex-plugin" / "prompts" / "collab-batch-impl.md").read_text()
     tools = (ROOT / ".codex-plugin" / "skills" / "using-superpowers" /
              "references" / "codex-tools.md").read_text()
@@ -41,7 +44,8 @@ def test_codex_dispatch_uses_explicit_repository_model_defaults():
                     "references" / "codex-tools.md").read_text()
     agents = (ROOT / "AGENTS.md").read_text()
 
-    for surface in (docs, dispatcher, prompt, batch_prompt, tools,
+    for surface in (docs, dispatcher, plan_draft_prompt, plan_review_prompt,
+                    global_review_prompt, recovery_prompt, batch_prompt, tools,
                     source_tools, agents):
         assert "gpt-5.6-luna" in surface
         assert "gpt-5.6-terra" in surface
@@ -53,7 +57,7 @@ def test_codex_dispatch_uses_explicit_repository_model_defaults():
     assert "codex exec --prompt-file" not in dispatcher
     assert "model_reasoning_effort=xhigh" not in dispatcher
     assert "personal Codex default" in docs
-    assert "escalation tier, not the default" in prompt
+    assert "escalation tier, not the default" in plan_draft_prompt
 
 
 def test_lint_catches_unknown_placeholder(tmp_path):

@@ -143,7 +143,7 @@ pub fn worker_text_and_usage(raw: &str) -> WorkerText {
 
 /// `codex exec` argv: sandbox full-access, run in the worktree, prompt positional.
 ///
-/// The `--` before the prompt is REQUIRED: the collab prompt (`collab.md`) begins
+/// The `--` before the prompt is REQUIRED: the rendered collab prompt begins
 /// with `---` YAML frontmatter, so without an end-of-options marker `codex exec`
 /// parses it as a flag (`error: unexpected argument '---'`). Same hazard the
 /// Claude worker argv guards against.
@@ -563,24 +563,17 @@ fn prompts_dir() -> Result<PathBuf> {
         .ok_or_else(|| anyhow!("cannot derive repo .claude-plugin/prompts dir"))
 }
 
-/// Repo `.codex-plugin/prompts` dir — the Codex-side collab prompt lives here
-/// (the counterpart to `.claude-plugin/prompts`).
-fn codex_prompts_dir() -> Result<PathBuf> {
+/// The Codex turn prompt: the interactive collab shim with its `$ARGUMENTS`
+/// placeholder bound to `join <session_id>`. The shim reads `collab_status` and
+/// selects the installed phase prompt, so one entrypoint serves every Codex-owned
+/// phase without relying on the removed monolithic prompt.
+pub fn codex_collab_prompt(session_id: &str) -> Result<String> {
     let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    manifest
+    let path = manifest
         .parent()
         .and_then(|p| p.parent())
-        .map(|p| p.join(".codex-plugin").join("prompts"))
-        .ok_or_else(|| anyhow!("cannot derive repo .codex-plugin/prompts dir"))
-}
-
-/// The Codex turn prompt: the full IronRace collab protocol prompt
-/// (`.codex-plugin/prompts/collab.md`) with its `$ARGUMENTS` placeholder bound to
-/// `join <session_id>`. The prompt itself branches by reading `collab_status`, so
-/// one prompt serves every Codex-owned phase (plan draft/review, global review).
-/// This replaces the bare `join <sid>` stub that left Codex with no instructions.
-pub fn codex_collab_prompt(session_id: &str) -> Result<String> {
-    let path = codex_prompts_dir()?.join("collab.md");
+        .map(|p| p.join(".codex-plugin").join("commands").join("collab.md"))
+        .ok_or_else(|| anyhow!("cannot derive repo .codex-plugin/commands dir"))?;
     let body = std::fs::read_to_string(&path)
         .map_err(|e| anyhow!("reading codex collab prompt {}: {e}", path.display()))?;
     Ok(body.replace("$ARGUMENTS", &format!("join {session_id}")))

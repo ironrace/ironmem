@@ -112,12 +112,110 @@ fn codex_hooks_json_has_required_hooks() {
 fn codex_collab_command_shim_is_packaged() {
     let text = read_text(".codex-plugin/commands/collab.md");
     assert!(
-        text.contains("~/.codex/prompts/collab.md"),
-        "codex /collab command must delegate to the installed collab prompt"
+        text.contains("~/.codex/prompts/<selected prompt>"),
+        "codex /collab command must delegate to the selected installed phase prompt"
     );
+    for prompt in [
+        "collab-plan-draft.md",
+        "collab-plan-review.md",
+        "collab-global-review.md",
+        "collab-recovery.md",
+        "collab-batch-impl.md",
+    ] {
+        assert!(
+            text.contains(prompt),
+            "codex /collab command must route to {prompt}"
+        );
+    }
     assert!(
         text.contains("tool discovery for `ironmem collab`"),
         "codex /collab command must explain how to lazy-load IronMEM tools"
+    );
+    assert!(
+        text.contains("collab_set_implementer"),
+        "codex /collab command must preserve implementer handoff routing"
+    );
+    assert!(
+        text.contains("collab_wait_my_turn(session_id, \"codex\", 60)"),
+        "codex /collab command must preserve the one-shot handoff wait"
+    );
+}
+
+/// Phase-specific Codex prompts are installed independently so background
+/// collaboration turns receive only the context required for their phase.
+#[test]
+fn codex_phase_prompts_are_packaged_and_invocable() {
+    const REQUIRED_CODEX_PHASE_PROMPTS: [&str; 5] = [
+        "collab-plan-draft",
+        "collab-plan-review",
+        "collab-global-review",
+        "collab-recovery",
+        "collab-batch-impl",
+    ];
+    const MAX_PROMPT_BYTES: usize = 42_832 / 3;
+
+    let installer = read_text("scripts/install-ironmem.sh");
+    let required_prompts = installer
+        .split("REQUIRED_CODEX_PROMPTS=(")
+        .nth(1)
+        .and_then(|rest| rest.split(')').next())
+        .expect("scripts/install-ironmem.sh: missing REQUIRED_CODEX_PROMPTS array");
+
+    for prompt_name in REQUIRED_CODEX_PHASE_PROMPTS {
+        assert!(
+            required_prompts
+                .lines()
+                .any(|line| line.trim() == prompt_name),
+            "scripts/install-ironmem.sh: REQUIRED_CODEX_PROMPTS must include {prompt_name}"
+        );
+
+        let rel = format!(".codex-plugin/prompts/{prompt_name}.md");
+        let path = workspace_root().join(&rel);
+        let raw = std::fs::read(&path)
+            .unwrap_or_else(|_| panic!("Codex phase prompt is missing: {}", path.display()));
+        assert!(
+            raw.len() <= MAX_PROMPT_BYTES,
+            "{rel}: {} bytes exceeds the {MAX_PROMPT_BYTES}-byte phase-prompt budget",
+            raw.len()
+        );
+
+        let text = std::str::from_utf8(&raw)
+            .unwrap_or_else(|_| panic!("{rel}: prompt must be valid UTF-8"));
+        assert_eq!(
+            text.matches("$ARGUMENTS").count(),
+            1,
+            "{rel}: must contain exactly one $ARGUMENTS placeholder"
+        );
+
+        let invocation = text
+            .find("$ARGUMENTS")
+            .expect("placeholder count guarantees $ARGUMENTS is present");
+        let last_h2 = text[..invocation]
+            .lines()
+            .rfind(|line| line.starts_with("## "));
+        assert_eq!(
+            last_h2,
+            Some("## Invocation"),
+            "{rel}: the last Markdown h2 before $ARGUMENTS must be `## Invocation`"
+        );
+        assert!(
+            text.contains("collab_wait_my_turn"),
+            "{rel}: join-capable Codex phase prompts must bridge the one-shot handoff race"
+        );
+    }
+
+    assert!(
+        read_text(".codex-plugin/commands/collab.md").contains("collab_set_implementer"),
+        "codex /collab command must preserve implementer handoff routing"
+    );
+    assert!(
+        read_text(".codex-plugin/prompts/collab-global-review.md").contains("task_list` is null"),
+        "codex global-review prompt must preserve shortcut review recovery"
+    );
+    let recovery = read_text(".codex-plugin/prompts/collab-recovery.md");
+    assert!(
+        recovery.contains("topic `review_local`") && recovery.contains("topic `final_review`"),
+        "codex recovery prompt must cover delegated local and final review completions"
     );
 }
 

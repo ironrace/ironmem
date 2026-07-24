@@ -84,7 +84,10 @@ REQUIRED_CODEX_COMMANDS=(
 )
 
 REQUIRED_CODEX_PROMPTS=(
-  collab
+  collab-plan-draft
+  collab-plan-review
+  collab-global-review
+  collab-recovery
   collab-batch-impl
   evaluate-issue
 )

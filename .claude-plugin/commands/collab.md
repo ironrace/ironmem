@@ -7,7 +7,7 @@ argument-hint: start [--implementer=claude|codex] <task> | join [--implementer=c
      - docs/COLLAB.md (spec)
      - .claude-plugin/commands/collab.md (this file)
      - .codex-plugin/commands/collab.md (Codex slash command)
-     - .codex-plugin/prompts/collab.md (Codex mirror) -->
+     - .codex-plugin/prompts/collab-*.md (Codex phase prompts) -->
 
 
 You are participating in the IronRace bounded collaboration protocol (v1 planning
@@ -595,7 +595,8 @@ sequence before building the payload:
    receive-side fetch/cat-file/checkout/reset-to-`last_head_sha` before
    reviewing — Codex syncs to whatever Claude pushed at `implementation_done`
    so review uses the canonical post-impl head. That rule lives in the
-   Codex prompt (`.codex-plugin/prompts/collab.md`); the rules in this list
+   Codex global-review prompt (`.codex-plugin/prompts/collab-global-review.md`);
+   the rules in this list
    apply to Claude's send-side harness only.
 4. Run local gates for code-changing Claude turns only (pre-work — fmt +
    clippy only):
@@ -652,8 +653,12 @@ remain:
   the verbatim expanded Codex prompt with `$ARGUMENTS` substituted —
   nothing more. Use `.codex-plugin/prompts/collab-batch-impl.md` for the
   `CodeImplementPending+codex` turn (slim phase-specific prompt) and
-  `.codex-plugin/prompts/collab.md` for all other Codex-owned phases
-  (v1 planning, global review). Do not append session context, state
+  `.codex-plugin/prompts/collab-plan-draft.md` for `PlanParallelDrafts`,
+  `.codex-plugin/prompts/collab-plan-review.md` for `PlanCodexReviewPending`,
+  and `.codex-plugin/prompts/collab-global-review.md` for
+  `CodeReviewFixGlobalPending`; use `.codex-plugin/prompts/collab-recovery.md`
+  only when the recovery override gives Codex `CodeReviewLocalPending` or
+  `CodeReviewFinalPending`. Do not append session context, state
   summary, or recommendations about what Codex should conclude. See the
   handoff section below. This rule applies equally when falling back to
   `mcp__codex__codex` — the prompt content must be the verbatim file
@@ -674,9 +679,10 @@ explicit architecture/security escalation from within a turn.
 | Phase from `collab_status` | `implementer` | Prompt file | Model | Reasoning effort | Rationale |
 |---|---|---|---|---|---|
 | `CodeImplementPending` | `"codex"` | `collab-batch-impl.md` | `gpt-5.6-luna` | `max` | Luna is the default implementation controller/worker and handles the batch's design judgment at the higher implementation budget |
-| `CodeReviewFixGlobalPending` | (any) | `collab.md` | `gpt-5.6-terra` | `high` | Normal global review gets a dedicated review budget without paying the Sol escalation cost |
-| `PlanParallelDrafts` | (any) | `collab.md` | `gpt-5.6-terra` | `high` | Planning needs independent judgment |
-| `PlanCodexReviewPending` | (any) | `collab.md` | `gpt-5.6-terra` | `high` | Plan review needs independent judgment |
+| `CodeReviewFixGlobalPending` | (any) | `collab-global-review.md` | `gpt-5.6-terra` | `high` | Normal global review gets a dedicated review budget without paying the Sol escalation cost |
+| `CodeReviewLocalPending` / `CodeReviewFinalPending` | Codex recovery owner | `collab-recovery.md` | `gpt-5.6-terra` | `high` | Recovery must finish the delegated normal-completion event without restoring the monolithic prompt |
+| `PlanParallelDrafts` | (any) | `collab-plan-draft.md` | `gpt-5.6-terra` | `high` | Planning needs an independent draft |
+| `PlanCodexReviewPending` | (any) | `collab-plan-review.md` | `gpt-5.6-terra` | `high` | Plan review needs independent judgment |
 | `CodeImplementPending` | `"claude"` | n/a — Codex isn't owner | n/a | n/a | Claude runs subagents on its side; no Codex dispatch |
 
 Match **both** `Phase` and `implementer` columns when looking up a row:
@@ -733,9 +739,12 @@ b. Select prompt file, model, and reasoning effort from the "Codex dispatch tuni
    - `CodeImplementPending` + `implementer == "codex"` → prompt file:
      `.codex-plugin/prompts/collab-batch-impl.md`; model and reasoning:
      `-m gpt-5.6-luna -c model_reasoning_effort=max`
-   - All other Codex-owned phases (`PlanParallelDrafts`,
-     `PlanCodexReviewPending`, `CodeReviewFixGlobalPending`) → prompt file:
-     `.codex-plugin/prompts/collab.md`; model and reasoning:
+   - `PlanParallelDrafts` → `.codex-plugin/prompts/collab-plan-draft.md`;
+     `PlanCodexReviewPending` → `.codex-plugin/prompts/collab-plan-review.md`;
+     `CodeReviewFixGlobalPending` →
+     `.codex-plugin/prompts/collab-global-review.md`; recovery-owned
+     `CodeReviewLocalPending` / `CodeReviewFinalPending` →
+     `.codex-plugin/prompts/collab-recovery.md`; each uses:
      `-m gpt-5.6-terra -c model_reasoning_effort=high`
 
    Both files live at
