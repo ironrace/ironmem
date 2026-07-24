@@ -186,7 +186,7 @@ migrate_legacy_base() {
 
   [[ -d "$old_base" ]] || return 0
   mkdir -p "$new_base"
-  cp -R "$old_base/." "$new_base/" 2>/dev/null || true
+  cp -R -n "$old_base/." "$new_base/" 2>/dev/null || true
   rm -rf "$old_base"
   echo "    migrated legacy install bases: $old_base → $new_base"
 }
