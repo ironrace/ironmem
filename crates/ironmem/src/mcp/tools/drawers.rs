@@ -6,7 +6,8 @@ use crate::sanitize;
 use crate::search;
 
 use super::shared::{
-    render_sensitive_text, sha256_hex, validate_hex_id, MAX_DRAWER_CONTENT_CHARS, MAX_SEARCH_LIMIT,
+    optional_bool, render_search_excerpt, render_sensitive_text, sha256_hex, validate_hex_id,
+    MAX_DRAWER_CONTENT_CHARS, MAX_SEARCH_EXCERPT_CHARS, MAX_SEARCH_LIMIT,
     MAX_SEARCH_RESPONSE_CHARS, MAX_SENSITIVE_FIELD_CHARS,
 };
 use crate::mcp::app::App;
@@ -404,6 +405,10 @@ pub(super) fn handle_get_taxonomy(app: &App) -> Result<Value, MemoryError> {
 }
 
 pub(super) fn handle_search(app: &App, args: &Value) -> Result<Value, MemoryError> {
+    // Validate request options before readiness can return a soft or terminal
+    // response.
+    let full = optional_bool(args, "full", false)?;
+
     match app.readiness_snapshot() {
         ReadinessState::Ready => {}
         // Non-terminal: the soft body is honest — the caller should retry.
@@ -441,31 +446,53 @@ pub(super) fn handle_search(app: &App, args: &Value) -> Result<Value, MemoryErro
         .results
         .iter()
         .map(|sd| {
-            let (content, truncated, redacted, consumed_chars) = render_sensitive_text(
-                &sd.drawer.content,
-                remaining_content_budget.min(MAX_SENSITIVE_FIELD_CHARS),
-                redact_content,
-            );
-            remaining_content_budget = remaining_content_budget.saturating_sub(consumed_chars);
-            json!({
-                "id": sd.drawer.id,
-                "content": content,
-                "content_truncated": truncated,
-                "content_redacted": redacted,
-                "wing": sd.drawer.wing,
-                "room": sd.drawer.room,
-                "score": sd.score,
-                "date": sd.drawer.date,
-            })
+            if full {
+                let (content, truncated, redacted, consumed_chars) = render_sensitive_text(
+                    &sd.drawer.content,
+                    remaining_content_budget.min(MAX_SENSITIVE_FIELD_CHARS),
+                    redact_content,
+                );
+                remaining_content_budget = remaining_content_budget.saturating_sub(consumed_chars);
+                json!({
+                    "id": sd.drawer.id,
+                    "content": content,
+                    "content_truncated": truncated,
+                    "content_redacted": redacted,
+                    "wing": sd.drawer.wing,
+                    "room": sd.drawer.room,
+                    "score": sd.score,
+                    "date": sd.drawer.date,
+                })
+            } else {
+                let (excerpt, truncated, redacted, consumed_chars) = render_search_excerpt(
+                    &sd.drawer.content,
+                    &result.sanitizer_info.clean_query,
+                    remaining_content_budget.min(MAX_SEARCH_EXCERPT_CHARS),
+                    redact_content,
+                );
+                remaining_content_budget = remaining_content_budget.saturating_sub(consumed_chars);
+                json!({
+                    "id": sd.drawer.id,
+                    "excerpt": excerpt,
+                    "excerpt_truncated": truncated,
+                    "content_redacted": redacted,
+                    "wing": sd.drawer.wing,
+                    "room": sd.drawer.room,
+                    "score": sd.score,
+                    "date": sd.drawer.date,
+                })
+            }
         })
         .collect();
 
-    Ok(json!({
+    let mut response = json!({
         "results": results,
         "total_candidates": result.total_candidates,
         "query_sanitized": result.sanitizer_info.was_sanitized,
         "sanitizer_method": result.sanitizer_info.method,
-    }))
+    });
+    response["content_mode"] = json!(if full { "full" } else { "excerpt" });
+    Ok(response)
 }
 
 pub(super) fn handle_status(app: &App, args: &Value) -> Result<Value, MemoryError> {
@@ -525,6 +552,7 @@ pub(super) fn handle_status(app: &App, args: &Value) -> Result<Value, MemoryErro
 mod tests {
     use super::*;
     use crate::config::{Config, EmbedMode, McpAccessMode};
+    use crate::mcp::readiness::ReadinessGate;
     use serde_json::json;
     use std::sync::Arc;
 
@@ -1008,6 +1036,107 @@ mod tests {
             out["added_by"].is_null(),
             "restricted mode must not leak added_by"
         );
+    }
+
+    #[test]
+    fn search_default_returns_excerpt_without_content() {
+        let app = test_app();
+        handle_add_drawer(
+            &app,
+            &json!({
+                "content": "A searchable memory about needle matching.",
+                "wing": "test",
+                "room": "search"
+            }),
+        )
+        .unwrap();
+
+        let out = handle_search(&app, &json!({"query": "needle", "limit": 1})).unwrap();
+        let hit = out["results"]
+            .as_array()
+            .and_then(|results| results.first())
+            .expect("search should return the inserted drawer");
+
+        assert_eq!(out["content_mode"].as_str(), Some("excerpt"));
+        assert!(
+            hit["id"].as_str().is_some_and(|id| !id.is_empty()),
+            "default search hit must include an id"
+        );
+        assert!(
+            hit["excerpt"]
+                .as_str()
+                .is_some_and(|excerpt| !excerpt.is_empty()),
+            "default search hit must include a non-empty excerpt"
+        );
+        assert!(hit.get("content").is_none());
+        assert!(hit.get("content_truncated").is_none());
+    }
+
+    #[test]
+    fn search_full_returns_bounded_content_without_excerpt() {
+        let app = test_app();
+        let body = format!("needle {}", "x".repeat(4_500));
+        handle_add_drawer(
+            &app,
+            &json!({
+                "content": body,
+                "wing": "test",
+                "room": "search"
+            }),
+        )
+        .unwrap();
+
+        let out = handle_search(&app, &json!({"query": "needle", "full": true})).unwrap();
+        let hit = out["results"]
+            .as_array()
+            .and_then(|results| results.first())
+            .expect("full search should return the inserted drawer");
+
+        assert_eq!(out["content_mode"].as_str(), Some("full"));
+        assert_eq!(hit["content_truncated"].as_bool(), Some(true));
+        assert!(hit["content"].as_str().is_some());
+        assert!(hit.get("excerpt").is_none());
+    }
+
+    #[test]
+    fn search_rejects_non_boolean_full() {
+        let app = test_app();
+
+        let error = handle_search(&app, &json!({"query": "memory", "full": "true"})).unwrap_err();
+        assert!(matches!(
+            error,
+            MemoryError::Validation(message) if message == "full must be a boolean"
+        ));
+    }
+
+    #[test]
+    fn search_rejects_non_boolean_full_before_readiness_handling() {
+        let mut app = test_app();
+        let args = json!({"query": "memory", "full": "true"});
+
+        if let Some(app) = Arc::get_mut(&mut app) {
+            app.memory_ready = Arc::new(ReadinessGate::new_pending());
+        } else {
+            panic!("test app unexpectedly shared");
+        }
+        let pending_error = handle_search(&app, &args).unwrap_err();
+        assert!(matches!(
+            pending_error,
+            MemoryError::Validation(message) if message == "full must be a boolean"
+        ));
+
+        let failed_gate = ReadinessGate::new_pending();
+        failed_gate.resolve_failed("startup failed".to_string());
+        if let Some(app) = Arc::get_mut(&mut app) {
+            app.memory_ready = Arc::new(failed_gate);
+        } else {
+            panic!("test app unexpectedly shared");
+        }
+        let failed_error = handle_search(&app, &args).unwrap_err();
+        assert!(matches!(
+            failed_error,
+            MemoryError::Validation(message) if message == "full must be a boolean"
+        ));
     }
 
     // ── G.6: status rejects invalid task_tag and leaves tag unset ────────────

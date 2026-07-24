@@ -671,6 +671,12 @@ IRONMEM_DB_PATH = "~/.ironmem/codex.sqlite3"
 
 `search` returns `{"warming_up": true, "results": []}` immediately while Phase 2 is still in progress — treat that as "retry shortly", not as "no matches". If startup fails terminally, `search` returns `isError: true` instead, rather than promising results shortly from a server that is never coming up.
 
+When ready, `search` returns bounded query-aware `excerpt` values plus a stable
+`id` reference by default, with `content_mode` set to `"excerpt"`. Pass
+`full:true` for bounded full-content search results (subject to the existing
+per-field and aggregate response caps), with `content_mode` set to `"full"`.
+For the complete body, dereference each result's `id` with `get_drawer`.
+
 Write-shaped tools (`add_drawer`, diary writes, `code_map_write`) never return that soft body — they block until readiness resolves, bounded by `Config::write_readiness_timeout()`, then perform the real write, or report `isError: true` if readiness resolves failed or the timeout expires. A success-shaped result therefore always means the write happened, so writes are safe to issue during warm-up. The wait is bounded by:
 
 | Variable | Default | Effect |

@@ -339,6 +339,10 @@ def run_locomo_benchmark(
                     "query": question,
                     "limit": n_results,
                     "wing": wing,
+                    # #213: default search now returns query-centered excerpts,
+                    # not `content`. Session mapping keys off the stored body's
+                    # 120-char prefix, so request `full` to keep `content` present.
+                    "full": True,
                 })
                 elapsed_ms = (time.perf_counter() - t0) * 1000
                 search_latencies.append(elapsed_ms)

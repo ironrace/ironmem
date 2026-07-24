@@ -46,6 +46,21 @@ static STOP_WORDS: LazyLock<HashSet<&'static str>> = LazyLock::new(|| {
     .collect()
 });
 
+/// Return the alphanumeric, lowercase form used for content-word matching.
+pub fn normalize_content_word(token: &str) -> String {
+    token
+        .chars()
+        .filter(|c| c.is_alphanumeric())
+        .collect::<String>()
+        .to_lowercase()
+}
+
+/// Return whether a token is a content word after normalisation.
+pub fn is_content_word(token: &str) -> bool {
+    let clean = normalize_content_word(token);
+    clean.len() >= 3 && !STOP_WORDS.contains(clean.as_str())
+}
+
 /// Extract content words from a query by removing stop words and short tokens.
 ///
 /// Returns `None` if the result is identical to the input (after normalisation)
@@ -53,15 +68,7 @@ static STOP_WORDS: LazyLock<HashSet<&'static str>> = LazyLock::new(|| {
 pub fn extract_content_words(query: &str) -> Option<String> {
     let words: Vec<&str> = query
         .split_whitespace()
-        .filter(|w| {
-            // Strip punctuation from both ends for comparison.
-            let clean: String = w
-                .chars()
-                .filter(|c| c.is_alphanumeric())
-                .collect::<String>()
-                .to_lowercase();
-            clean.len() >= 3 && !STOP_WORDS.contains(clean.as_str())
-        })
+        .filter(|w| is_content_word(w))
         .collect();
 
     if words.len() < 2 {
@@ -209,5 +216,23 @@ mod tests {
         let result = sanitize_query(&cjk);
         assert!(result.was_sanitized);
         assert!(result.clean_query.len() <= MAX_QUERY_LENGTH + 3); // +3 for char boundary
+    }
+
+    #[test]
+    fn test_is_content_word() {
+        assert!(is_content_word("roadmap"));
+        assert!(!is_content_word("the"));
+        assert!(!is_content_word("ab"));
+        assert!(is_content_word("api,"));
+    }
+
+    #[test]
+    fn test_extract_content_words_preserves_existing_behavior() {
+        assert_eq!(extract_content_words("roadmap"), None);
+        assert_eq!(extract_content_words("alpha beta"), None);
+        assert_eq!(
+            extract_content_words("what is the project roadmap"),
+            Some("project roadmap".to_string())
+        );
     }
 }

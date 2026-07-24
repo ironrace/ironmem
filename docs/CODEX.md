@@ -472,6 +472,13 @@ IRONMEM_DB_PATH = "~/.ironmem/codex.sqlite3"
 
 `search` (embedding-dependent but read-shaped) returns `{"warming_up": true, "results": []}` immediately while Phase 2 is still in progress. The abeval driver polls `status` until `readiness` is `"ready"`, and aborts immediately on `"failed"` rather than waiting out its timeout. (The older `scripts/benchmark_*.py` harnesses still poll the `warming_up` bool; they remain correct on the happy path, but a terminal startup failure costs them their full poll deadline before it surfaces.) If startup fails terminally, `search` returns `isError: true` instead of the soft body — "available shortly" would be a promise the server cannot keep, and an empty result set would read as "no matches" rather than "no search". Write-shaped tools (`add_drawer`, diary writes, `code_map_write`) do NOT return that soft body — they block until readiness resolves, bounded by `Config::write_readiness_timeout()` (default 90 s, override via `IRONMEM_WRITE_READINESS_TIMEOUT_SECS`), then perform the real write, or return `isError: true` if readiness resolves failed or the timeout expires. This keeps a success-shaped tool result equivalent to "the write happened."
 
+When ready, the default `search` response is an excerpt-plus-reference shape:
+each result has a bounded query-aware `excerpt`, a stable `id`, and the
+response has `content_mode: "excerpt"`. Pass `full:true` for bounded
+full-content search results, subject to the existing per-field and aggregate
+response caps; that response reports `content_mode: "full"`. To retrieve the
+complete body, call `get_drawer` with the result's `id`.
+
 `status` is the diagnostic endpoint and stays answerable in every state, including a failed one. `readiness` (`"ready"` / `"warming_up"` / `"failed"`) is what distinguishes "keep polling" from "this server is not coming up"; `readiness_error` carries the client-facing reason when `readiness` is `"failed"`, and is `null` otherwise. A client that sees `readiness: "failed"` must treat it as terminal and restart the server rather than keep polling.
 
 ```json

@@ -52,14 +52,19 @@ pub fn tool_definitions(app: &App) -> Vec<Value> {
         }),
         json!({
             "name": "search",
-            "description": "Semantic search with KG-boosted ranking. Returns bounded content excerpts.",
+            "description": "Semantic search with KG-boosted ranking. By default, returns a bounded, query-aware excerpt plus a stable `id`; `full:true` returns bounded full-content search results, while `get_drawer` returns the complete body by stable id.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "query": { "type": "string", "description": "Search query" },
                     "limit": { "type": "integer", "default": 10 },
                     "wing": { "type": "string" },
-                    "room": { "type": "string" }
+                    "room": { "type": "string" },
+                    "full": {
+                        "type": "boolean",
+                        "default": false,
+                        "description": "When true, return bounded full-content search results subject to per-field and aggregate response caps. Default false; use `get_drawer` with the stable id for the complete body."
+                    }
                 },
                 "required": ["query"]
             }
@@ -1032,7 +1037,10 @@ fn mode_label(mode: McpAccessMode) -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    use super::shared::render_sensitive_text;
+    use super::shared::{
+        centered_excerpt_bounds, render_search_excerpt, render_sensitive_text,
+        MAX_SEARCH_EXCERPT_CHARS,
+    };
     use super::*;
 
     /// The write-tool set used to be spelled out in three unlinked places —
@@ -1102,6 +1110,34 @@ mod tests {
                 classifications[0], classifications[1], classifications[2]
             );
         }
+    }
+
+    #[test]
+    fn search_tool_metadata_declares_excerpt_default_and_full_paths() {
+        let app = App::open_for_test().unwrap();
+        let search = tool_definitions(&app)
+            .into_iter()
+            .find(|tool| tool["name"] == "search")
+            .expect("search tool must be advertised");
+
+        let full = &search["inputSchema"]["properties"]["full"];
+        assert_eq!(full["type"], "boolean");
+        assert_eq!(full["default"], false);
+
+        let description = search["description"]
+            .as_str()
+            .expect("search tool needs a description");
+        assert!(description
+            .contains("By default, returns a bounded, query-aware excerpt plus a stable `id`"));
+        assert!(description.contains("`full:true` returns bounded full-content search results"));
+        assert!(description.contains("`get_drawer` returns the complete body by stable id"));
+
+        let full_description = full["description"]
+            .as_str()
+            .expect("full property needs a description");
+        assert!(full_description.contains("bounded full-content search results"));
+        assert!(full_description.contains("per-field and aggregate response caps"));
+        assert!(full_description.contains("`get_drawer` with the stable id for the complete body"));
     }
 
     /// A conditionally-mutating entry is only worth anything if the argument it
@@ -1446,5 +1482,149 @@ mod tests {
         assert!(!truncated);
         assert!(redacted);
         assert_eq!(consumed, 0);
+    }
+
+    #[test]
+    fn render_search_excerpt_redacts_with_sensitive_text_parity() {
+        let result = render_search_excerpt("abcdef", "abc", MAX_SEARCH_EXCERPT_CHARS, true);
+
+        assert_eq!(result, (Value::Null, false, true, 0));
+    }
+
+    #[test]
+    fn render_search_excerpt_empty_query_returns_truncated_prefix() {
+        let content = "a".repeat(MAX_SEARCH_EXCERPT_CHARS * 2);
+
+        let (excerpt, truncated, redacted, consumed) =
+            render_search_excerpt(&content, "", MAX_SEARCH_EXCERPT_CHARS, false);
+
+        assert_eq!(excerpt, Value::String("a".repeat(MAX_SEARCH_EXCERPT_CHARS)));
+        assert!(truncated);
+        assert!(!redacted);
+        assert_eq!(consumed, MAX_SEARCH_EXCERPT_CHARS);
+    }
+
+    #[test]
+    fn render_search_excerpt_short_body_is_not_truncated() {
+        let (excerpt, truncated, redacted, consumed) =
+            render_search_excerpt("short body", "", MAX_SEARCH_EXCERPT_CHARS, false);
+
+        assert_eq!(excerpt, Value::String("short body".into()));
+        assert!(!truncated);
+        assert!(!redacted);
+        assert_eq!(consumed, "short body".chars().count());
+    }
+
+    #[test]
+    fn render_search_excerpt_centers_on_late_case_insensitive_match() {
+        let content = format!("{}needle {}", "prefix ".repeat(430), "suffix ".repeat(430));
+        let result = render_search_excerpt(&content, "the NEEDLE", 96, false);
+
+        assert_eq!(
+            result,
+            render_search_excerpt(&content, "the NEEDLE", 96, false)
+        );
+        let excerpt = result.0.as_str().expect("excerpt should be a string");
+        assert!(excerpt.contains("needle"));
+        assert!(excerpt.starts_with('…'));
+        assert!(excerpt.ends_with('…'));
+        assert!(result.1);
+        assert!(!result.2);
+        assert!(excerpt.chars().count() <= 96);
+        assert_eq!(result.3, excerpt.chars().count());
+    }
+
+    #[test]
+    fn render_search_excerpt_handles_utf8_match_near_the_end() {
+        let content = format!("{}目标{}", "前🙂".repeat(180), "尾😀".repeat(40));
+        let result = render_search_excerpt(&content, "目标", 32, false);
+
+        let excerpt = result.0.as_str().expect("excerpt should be a string");
+        assert!(excerpt.contains("目标"));
+        assert_eq!(excerpt, excerpt.chars().collect::<String>());
+        assert!(excerpt.chars().count() <= 32);
+        assert_eq!(result.3, excerpt.chars().count());
+    }
+
+    #[test]
+    fn render_search_excerpt_markers_stay_within_every_small_budget() {
+        let content = "prefix target suffix";
+
+        for max_chars in 0..=20 {
+            let (excerpt, _, _, consumed) =
+                render_search_excerpt(content, "target", max_chars, false);
+            let excerpt = excerpt.as_str().expect("excerpt should be a string");
+            assert!(excerpt.chars().count() <= max_chars);
+            assert_eq!(consumed, excerpt.chars().count());
+        }
+    }
+
+    #[test]
+    fn centered_excerpt_bounds_anchors_an_interior_single_char_budget() {
+        let chars: Vec<char> = "prefix target suffix".chars().collect();
+        let match_start = "prefix ".chars().count();
+        let match_end = match_start + "target".chars().count();
+        let midpoint = match_start + (match_end - match_start) / 2;
+
+        assert_eq!(
+            centered_excerpt_bounds(&chars, match_start, match_end, 1),
+            (midpoint, midpoint)
+        );
+
+        let (excerpt, truncated, redacted, consumed) =
+            render_search_excerpt("prefix target suffix", "target", 1, false);
+        assert_eq!(excerpt, Value::String("…".into()));
+        assert!(truncated);
+        assert!(!redacted);
+        assert_eq!(consumed, 1);
+    }
+
+    #[test]
+    fn render_search_excerpt_centers_partial_long_match() {
+        let long_query = "abcdefghijklmnop";
+        let content = format!("{}{}{}", "x".repeat(40), long_query, "y".repeat(40));
+        let (excerpt, truncated, redacted, consumed) =
+            render_search_excerpt(&content, long_query, 12, false);
+
+        assert_eq!(excerpt, Value::String("…defghijklm…".into()));
+        assert!(truncated);
+        assert!(!redacted);
+        assert_eq!(consumed, 12);
+    }
+
+    #[test]
+    fn render_search_excerpt_normalizes_punctuation_bearing_query_tokens() {
+        let content = format!("{}needle{}", "x".repeat(400), "y".repeat(400));
+        let (excerpt, truncated, redacted, consumed) =
+            render_search_excerpt(&content, "\"Needle?,\"", 48, false);
+        let excerpt = excerpt.as_str().expect("excerpt should be a string");
+
+        assert!(excerpt.contains("needle"));
+        assert!(excerpt.starts_with('…'));
+        assert!(excerpt.ends_with('…'));
+        assert!(truncated);
+        assert!(!redacted);
+        assert_eq!(consumed, excerpt.chars().count());
+    }
+
+    #[test]
+    fn render_search_excerpt_whitespace_snap_stops_at_fifteen_chars() {
+        let prefix_at_fifteen = format!("{} {}", "x".repeat(100), "x".repeat(31));
+        let content_at_fifteen = format!("{prefix_at_fifteen}needle{}", "y".repeat(100));
+        let (excerpt_at_fifteen, _, _, _) =
+            render_search_excerpt(&content_at_fifteen, "needle", 42, false);
+        let excerpt_at_fifteen = excerpt_at_fifteen
+            .as_str()
+            .expect("excerpt should be a string");
+        assert!(excerpt_at_fifteen.starts_with("… "));
+
+        let prefix_at_sixteen = format!("{} {}", "x".repeat(100), "x".repeat(32));
+        let content_at_sixteen = format!("{prefix_at_sixteen}needle{}", "y".repeat(100));
+        let (excerpt_at_sixteen, _, _, _) =
+            render_search_excerpt(&content_at_sixteen, "needle", 42, false);
+        let excerpt_at_sixteen = excerpt_at_sixteen
+            .as_str()
+            .expect("excerpt should be a string");
+        assert!(excerpt_at_sixteen.starts_with("…x"));
     }
 }
