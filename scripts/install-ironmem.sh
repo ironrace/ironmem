@@ -180,22 +180,35 @@ validate_packaged_agents() {
   fi
 }
 
+migrate_legacy_base() {
+  local old_base="$1/.ironmem-bases"
+  local new_base="$2"
+
+  [[ -d "$old_base" ]] || return 0
+  mkdir -p "$new_base"
+  cp -R "$old_base/." "$new_base/" 2>/dev/null || true
+  rm -rf "$old_base"
+  echo "    migrated legacy install bases: $old_base → $new_base"
+}
+
 install_skill_set() {
   local harness="$1"
   local source_root="$2"
   local target_root="$3"
-  shift 3
+  local base_root="$4"
+  shift 4
   local skills=("$@")
 
   validate_packaged_skills "$harness" "$source_root" "${skills[@]}"
   mkdir -p "$target_root"
+  migrate_legacy_base "$target_root" "$base_root"
 
   echo "==> Installing $harness skill dependencies → $target_root"
 
   for skill in "${skills[@]}"; do
     local source="$source_root/$skill"
     local target="$target_root/$skill"
-    local base="$target_root/.ironmem-bases/$skill"
+    local base="$base_root/$skill"
 
     if [[ ! -e "$target" ]]; then
       cp -R "$source" "$target"
@@ -219,9 +232,11 @@ install_agent_set() {
   local harness="$1"
   local source_root="$2"
   local target_root="$3"
+  local base_root="$4"
 
   validate_packaged_agents "$harness" "$source_root"
   mkdir -p "$target_root"
+  migrate_legacy_base "$target_root" "$base_root"
 
   echo "==> Installing $harness agent dependencies → $target_root"
 
@@ -230,7 +245,7 @@ install_agent_set() {
     local target="$target_root/$agent.md"
 
     install_file_with_merge "$harness agent" "$agent" "$source" "$target" \
-      "$target_root/.ironmem-bases/$agent.md"
+      "$base_root/$agent.md"
   done
 }
 
@@ -351,7 +366,8 @@ install_md_set() {
   local label="$1"      # human-readable kind (e.g. "Claude command")
   local source_root="$2"
   local target_root="$3"
-  shift 3
+  local base_root="$4"
+  shift 4
   local names=("$@")
 
   local missing=0
@@ -366,6 +382,7 @@ install_md_set() {
   fi
 
   mkdir -p "$target_root"
+  migrate_legacy_base "$target_root" "$base_root"
   echo "==> Installing ${label}s → $target_root"
 
   for name in "${names[@]}"; do
@@ -373,7 +390,7 @@ install_md_set() {
     local target="$target_root/$name.md"
 
     install_file_with_merge "$label" "$name" "$source" "$target" \
-      "$target_root/.ironmem-bases/$name.md"
+      "$base_root/$name.md"
   done
 }
 
@@ -420,22 +437,30 @@ if [[ "$SKIP_SKILLS" -eq 0 ]]; then
   CODEX_PROMPTS_DIR="${CODEX_PROMPTS_DIR:-$CODEX_HOME/prompts}"
 
   install_skill_set "Codex" "$REPO_ROOT/.codex-plugin/skills" "$CODEX_SKILLS_DIR" \
+    "$CODEX_HOME/.ironmem-bases/skills" \
     "${REQUIRED_SHARED_SKILLS[@]}" "${REQUIRED_CODEX_SKILLS[@]}"
   install_skill_set "Claude" "$REPO_ROOT/.claude-plugin/skills" "$CLAUDE_SKILLS_DIR" \
+    "$CLAUDE_HOME/.ironmem-bases/skills" \
     "${REQUIRED_SHARED_SKILLS[@]}"
   if (( ${#REQUIRED_CLAUDE_SKILLS[@]} > 0 )); then
     install_skill_set "Claude" "$REPO_ROOT/.claude-plugin/skills" "$CLAUDE_SKILLS_DIR" \
+      "$CLAUDE_HOME/.ironmem-bases/skills" \
       "${REQUIRED_CLAUDE_SKILLS[@]}"
   fi
-  install_agent_set "Claude" "$REPO_ROOT/.claude-plugin/agents" "$CLAUDE_AGENTS_DIR"
+  install_agent_set "Claude" "$REPO_ROOT/.claude-plugin/agents" "$CLAUDE_AGENTS_DIR" \
+    "$CLAUDE_HOME/.ironmem-bases/agents"
   install_md_set "Claude command" "$REPO_ROOT/.claude-plugin/commands" \
-    "$CLAUDE_COMMANDS_DIR" "${REQUIRED_CLAUDE_COMMANDS[@]}"
+    "$CLAUDE_COMMANDS_DIR" "$CLAUDE_HOME/.ironmem-bases/commands" \
+    "${REQUIRED_CLAUDE_COMMANDS[@]}"
   install_md_set "Claude prompt" "$REPO_ROOT/.claude-plugin/prompts" \
-    "$CLAUDE_PROMPTS_DIR" "${REQUIRED_CLAUDE_PROMPTS[@]}"
+    "$CLAUDE_PROMPTS_DIR" "$CLAUDE_HOME/.ironmem-bases/prompts" \
+    "${REQUIRED_CLAUDE_PROMPTS[@]}"
   install_md_set "Codex command" "$REPO_ROOT/.codex-plugin/commands" \
-    "$CODEX_COMMANDS_DIR" "${REQUIRED_CODEX_COMMANDS[@]}"
+    "$CODEX_COMMANDS_DIR" "$CODEX_HOME/.ironmem-bases/commands" \
+    "${REQUIRED_CODEX_COMMANDS[@]}"
   install_md_set "Codex prompt" "$REPO_ROOT/.codex-plugin/prompts" \
-    "$CODEX_PROMPTS_DIR" "${REQUIRED_CODEX_PROMPTS[@]}"
+    "$CODEX_PROMPTS_DIR" "$CODEX_HOME/.ironmem-bases/prompts" \
+    "${REQUIRED_CODEX_PROMPTS[@]}"
 else
   echo "==> Skipping skill / command / prompt install"
 fi
