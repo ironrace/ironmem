@@ -134,7 +134,8 @@ pub(super) fn render_search_excerpt(
 
     let tokens: Vec<String> = clean_query
         .split_whitespace()
-        .filter_map(|token| is_content_word(token).then(|| normalize_content_word(token)))
+        .filter(|token| is_content_word(token))
+        .map(normalize_content_word)
         .collect();
     if tokens.is_empty() {
         return render_sensitive_text(content, max_chars, false);
