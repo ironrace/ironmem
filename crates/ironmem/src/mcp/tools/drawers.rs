@@ -6,8 +6,8 @@ use crate::sanitize;
 use crate::search;
 
 use super::shared::{
-    render_sensitive_text, sha256_hex, validate_hex_id, MAX_DRAWER_CONTENT_CHARS, MAX_SEARCH_LIMIT,
-    MAX_SEARCH_RESPONSE_CHARS, MAX_SENSITIVE_FIELD_CHARS,
+    optional_bool, render_sensitive_text, sha256_hex, validate_hex_id, MAX_DRAWER_CONTENT_CHARS,
+    MAX_SEARCH_LIMIT, MAX_SEARCH_RESPONSE_CHARS, MAX_SENSITIVE_FIELD_CHARS,
 };
 use crate::mcp::app::App;
 use crate::mcp::readiness::ReadinessState;
@@ -404,6 +404,10 @@ pub(super) fn handle_get_taxonomy(app: &App) -> Result<Value, MemoryError> {
 }
 
 pub(super) fn handle_search(app: &App, args: &Value) -> Result<Value, MemoryError> {
+    // Validate request options before readiness can return a soft or terminal
+    // response; response branching is wired in a later search task.
+    let _full = optional_bool(args, "full", false)?;
+
     match app.readiness_snapshot() {
         ReadinessState::Ready => {}
         // Non-terminal: the soft body is honest — the caller should retry.
@@ -525,6 +529,7 @@ pub(super) fn handle_status(app: &App, args: &Value) -> Result<Value, MemoryErro
 mod tests {
     use super::*;
     use crate::config::{Config, EmbedMode, McpAccessMode};
+    use crate::mcp::readiness::ReadinessGate;
     use serde_json::json;
     use std::sync::Arc;
 
@@ -1008,6 +1013,47 @@ mod tests {
             out["added_by"].is_null(),
             "restricted mode must not leak added_by"
         );
+    }
+
+    #[test]
+    fn search_rejects_non_boolean_full() {
+        let app = test_app();
+
+        let error = handle_search(&app, &json!({"query": "memory", "full": "true"})).unwrap_err();
+        assert!(matches!(
+            error,
+            MemoryError::Validation(message) if message == "full must be a boolean"
+        ));
+    }
+
+    #[test]
+    fn search_rejects_non_boolean_full_before_readiness_handling() {
+        let mut app = test_app();
+        let args = json!({"query": "memory", "full": "true"});
+
+        if let Some(app) = Arc::get_mut(&mut app) {
+            app.memory_ready = Arc::new(ReadinessGate::new_pending());
+        } else {
+            panic!("test app unexpectedly shared");
+        }
+        let pending_error = handle_search(&app, &args).unwrap_err();
+        assert!(matches!(
+            pending_error,
+            MemoryError::Validation(message) if message == "full must be a boolean"
+        ));
+
+        let failed_gate = ReadinessGate::new_pending();
+        failed_gate.resolve_failed("startup failed".to_string());
+        if let Some(app) = Arc::get_mut(&mut app) {
+            app.memory_ready = Arc::new(failed_gate);
+        } else {
+            panic!("test app unexpectedly shared");
+        }
+        let failed_error = handle_search(&app, &args).unwrap_err();
+        assert!(matches!(
+            failed_error,
+            MemoryError::Validation(message) if message == "full must be a boolean"
+        ));
     }
 
     // ── G.6: status rejects invalid task_tag and leaves tag unset ────────────

@@ -39,6 +39,15 @@ pub(super) fn require_str<'a>(args: &'a Value, key: &str) -> Result<&'a str, Mem
         .ok_or_else(|| MemoryError::Validation(format!("{key} is required")))
 }
 
+pub(super) fn optional_bool(args: &Value, key: &str, default: bool) -> Result<bool, MemoryError> {
+    match args.get(key) {
+        None | Some(Value::Null) => Ok(default),
+        Some(value) => value
+            .as_bool()
+            .ok_or_else(|| MemoryError::Validation(format!("{key} must be a boolean"))),
+    }
+}
+
 pub(super) fn require_agent(value: &str) -> Result<Agent, MemoryError> {
     value
         .parse::<Agent>()
@@ -395,4 +404,36 @@ fn outward_right_boundary(chars: &[char], end: usize) -> usize {
         }
     }
     end
+}
+
+#[cfg(test)]
+mod tests {
+    use super::optional_bool;
+    use crate::error::MemoryError;
+    use serde_json::json;
+
+    #[test]
+    fn optional_bool_uses_default_when_absent_or_null() {
+        assert!(!optional_bool(&json!({}), "full", false).unwrap());
+        assert!(optional_bool(&json!({}), "full", true).unwrap());
+        assert!(!optional_bool(&json!({"full": null}), "full", false).unwrap());
+        assert!(optional_bool(&json!({"full": null}), "full", true).unwrap());
+    }
+
+    #[test]
+    fn optional_bool_returns_json_boolean_value() {
+        assert!(optional_bool(&json!({"full": true}), "full", false).unwrap());
+        assert!(!optional_bool(&json!({"full": false}), "full", true).unwrap());
+    }
+
+    #[test]
+    fn optional_bool_rejects_non_boolean_values() {
+        for value in [json!("true"), json!(1), json!({})] {
+            let error = optional_bool(&json!({"full": value}), "full", false).unwrap_err();
+            assert!(matches!(
+                error,
+                MemoryError::Validation(message) if message == "full must be a boolean"
+            ));
+        }
+    }
 }
