@@ -192,8 +192,7 @@ fn codex_phase_prompts_are_packaged_and_invocable() {
             .expect("placeholder count guarantees $ARGUMENTS is present");
         let last_h2 = text[..invocation]
             .lines()
-            .filter(|line| line.starts_with("## "))
-            .next_back();
+            .rfind(|line| line.starts_with("## "));
         assert_eq!(
             last_h2,
             Some("## Invocation"),
