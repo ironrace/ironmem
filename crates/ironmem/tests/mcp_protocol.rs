@@ -8,6 +8,7 @@ use ironmem::mcp::protocol::JsonRpcRequest;
 use ironmem::mcp::server::dispatch;
 use serde_json::json;
 use sha2::{Digest, Sha256};
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -351,14 +352,21 @@ fn search_response_budget_preserves_references_in_excerpt_and_full_modes() {
         .expect("excerpt search results must be an array");
     assert_eq!(excerpt_results.len(), ids.len());
     assert_eq!(excerpt_response["content_mode"], "excerpt");
+    let inserted_ids: HashSet<String> = ids.iter().cloned().collect();
+    let mut excerpt_ids = HashSet::with_capacity(excerpt_results.len());
     // MAX_SEARCH_EXCERPT_CHARS * MAX_SEARCH_LIMIT is 300 * 25 = 7,500,
     // below MAX_SEARCH_RESPONSE_CHARS (32,000). Therefore excerpt mode cannot
     // exhaust the aggregate content budget; every bounded-page hit must retain
     // a usable excerpt and its dereference metadata.
     for hit in excerpt_results {
         assert_search_reference_fields(hit, wing, room);
+        let id = hit["id"].as_str().expect("excerpt hit must have an id");
         assert!(
-            ids.iter().any(|id| hit["id"].as_str() == Some(id.as_str())),
+            excerpt_ids.insert(id.to_owned()),
+            "excerpt results must not repeat an id: {hit}"
+        );
+        assert!(
+            inserted_ids.contains(id),
             "excerpt hit id must identify an inserted drawer: {hit}"
         );
         let excerpt = hit["excerpt"]
@@ -375,6 +383,7 @@ fn search_response_budget_preserves_references_in_excerpt_and_full_modes() {
         assert_eq!(hit["excerpt_truncated"], true);
         assert!(hit.get("content").is_none());
     }
+    assert_eq!(excerpt_ids, inserted_ids);
 
     let full_response = call_tool(
         &app,
@@ -386,6 +395,7 @@ fn search_response_budget_preserves_references_in_excerpt_and_full_modes() {
         .expect("full search results must be an array");
     assert_eq!(full_results.len(), ids.len());
     assert_eq!(full_response["content_mode"], "full");
+    let mut full_ids = HashSet::with_capacity(full_results.len());
     // Each fixture body is larger than the 4,000-character per-field cap, so
     // the first eight results consume the 32,000-character aggregate budget.
     // Later results must remain page references even though their content is
@@ -394,7 +404,11 @@ fn search_response_budget_preserves_references_in_excerpt_and_full_modes() {
         assert_search_reference_fields(hit, wing, room);
         let id = hit["id"].as_str().expect("full hit must have an id");
         assert!(
-            ids.iter().any(|expected| expected == id),
+            full_ids.insert(id.to_owned()),
+            "full results must not repeat an id: {hit}"
+        );
+        assert!(
+            inserted_ids.contains(id),
             "full hit id must identify an inserted drawer: {hit}"
         );
         assert_eq!(hit["content_truncated"], true);
@@ -411,6 +425,7 @@ fn search_response_budget_preserves_references_in_excerpt_and_full_modes() {
         }
         assert!(hit.get("excerpt").is_none());
     }
+    assert_eq!(full_ids, inserted_ids);
 }
 
 #[test]
