@@ -115,6 +115,49 @@ fn sha256_hex(content: &str) -> String {
     format!("{:x}", Sha256::digest(content.as_bytes()))
 }
 
+fn add_large_search_drawers(
+    app: &App,
+    query: &str,
+    wing: &str,
+    room: &str,
+    count: usize,
+) -> Vec<String> {
+    (0..count)
+        .map(|index| {
+            let content = format!(
+                "{query} large search fixture {index} {}",
+                "large-content ".repeat(600)
+            );
+            let added = call_tool(
+                app,
+                "add_drawer",
+                json!({ "content": content, "wing": wing, "room": room }),
+            );
+            added["id"]
+                .as_str()
+                .expect("large search fixture returns an id")
+                .to_owned()
+        })
+        .collect()
+}
+
+fn assert_search_reference_fields(hit: &serde_json::Value, wing: &str, room: &str) {
+    assert!(
+        hit["id"].as_str().is_some_and(|id| !id.is_empty()),
+        "search hit must retain a stable id: {hit}"
+    );
+    assert_eq!(hit["wing"].as_str(), Some(wing));
+    assert_eq!(hit["room"].as_str(), Some(room));
+    assert!(
+        hit["score"].is_number(),
+        "search hit must retain score: {hit}"
+    );
+    assert!(
+        hit["date"].is_string(),
+        "search hit must retain date: {hit}"
+    );
+}
+
 #[test]
 fn initialize_returns_capabilities() {
     let app = App::open_for_test().unwrap();
@@ -292,6 +335,110 @@ fn search_rejects_string_full_over_mcp() {
     let app = App::open_for_test().unwrap();
     let error = call_tool_expect_error(&app, "search", json!({ "query": "x", "full": "true" }));
     assert_eq!(error, "full must be a boolean");
+}
+
+#[test]
+fn search_response_budget_preserves_references_in_excerpt_and_full_modes() {
+    let app = App::open_for_test().unwrap();
+    let query = "aggregatebudgetfixture";
+    let wing = "protocol-tests";
+    let room = "mcp";
+    let ids = add_large_search_drawers(&app, query, wing, room, 25);
+
+    let excerpt_response = call_tool(&app, "search", json!({ "query": query, "limit": 25 }));
+    let excerpt_results = excerpt_response["results"]
+        .as_array()
+        .expect("excerpt search results must be an array");
+    assert_eq!(excerpt_results.len(), ids.len());
+    assert_eq!(excerpt_response["content_mode"], "excerpt");
+    // MAX_SEARCH_EXCERPT_CHARS * MAX_SEARCH_LIMIT is 300 * 25 = 7,500,
+    // below MAX_SEARCH_RESPONSE_CHARS (32,000). Therefore excerpt mode cannot
+    // exhaust the aggregate content budget; every bounded-page hit must retain
+    // a usable excerpt and its dereference metadata.
+    for hit in excerpt_results {
+        assert_search_reference_fields(hit, wing, room);
+        assert!(
+            ids.iter().any(|id| hit["id"].as_str() == Some(id.as_str())),
+            "excerpt hit id must identify an inserted drawer: {hit}"
+        );
+        assert!(
+            hit["excerpt"]
+                .as_str()
+                .is_some_and(|excerpt| !excerpt.is_empty()),
+            "excerpt mode must retain non-empty excerpts: {hit}"
+        );
+        assert_eq!(hit["excerpt_truncated"], true);
+        assert!(hit.get("content").is_none());
+    }
+
+    let full_response = call_tool(
+        &app,
+        "search",
+        json!({ "query": query, "full": true, "limit": 25 }),
+    );
+    let full_results = full_response["results"]
+        .as_array()
+        .expect("full search results must be an array");
+    assert_eq!(full_results.len(), ids.len());
+    assert_eq!(full_response["content_mode"], "full");
+    // Each fixture body is larger than the 4,000-character per-field cap, so
+    // the first eight results consume the 32,000-character aggregate budget.
+    // Later results must remain page references even though their content is
+    // empty, and call_tool has already parsed the tool text as valid JSON.
+    for (index, hit) in full_results.iter().enumerate() {
+        assert_search_reference_fields(hit, wing, room);
+        let id = hit["id"].as_str().expect("full hit must have an id");
+        assert!(
+            ids.iter().any(|expected| expected == id),
+            "full hit id must identify an inserted drawer: {hit}"
+        );
+        assert_eq!(hit["content_truncated"], true);
+        let content = hit["content"]
+            .as_str()
+            .expect("full hit content must remain a string");
+        if index < 8 {
+            assert_eq!(content.chars().count(), 4_000);
+        } else {
+            assert!(content.is_empty(), "budget-exhausted content must be empty");
+            let drawer = call_tool(&app, "get_drawer", json!({ "id": id }));
+            assert_eq!(drawer["found"], true);
+            assert_eq!(drawer["id"], id);
+        }
+        assert!(hit.get("excerpt").is_none());
+    }
+}
+
+#[test]
+fn search_default_response_is_at_least_five_times_smaller_than_full_response() {
+    let app = App::open_for_test().unwrap();
+    let query = "sizefloorfixture";
+    let ids = add_large_search_drawers(&app, query, "protocol-tests", "mcp", 10);
+
+    let default_response = call_tool(&app, "search", json!({ "query": query, "limit": 10 }));
+    let full_response = call_tool(
+        &app,
+        "search",
+        json!({ "query": query, "full": true, "limit": 10 }),
+    );
+    assert_eq!(
+        default_response["results"].as_array().map(Vec::len),
+        Some(ids.len())
+    );
+    assert_eq!(
+        full_response["results"].as_array().map(Vec::len),
+        Some(ids.len())
+    );
+
+    let default_size = serde_json::to_vec(&default_response)
+        .expect("default search response must serialize")
+        .len();
+    let full_size = serde_json::to_vec(&full_response)
+        .expect("full search response must serialize")
+        .len();
+    assert!(
+        full_size >= default_size.saturating_mul(5),
+        "default response should be at least 5x smaller: default={default_size}, full={full_size}"
+    );
 }
 
 #[test]
