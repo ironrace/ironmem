@@ -218,6 +218,83 @@ fn get_drawer_round_trips_by_id() {
 }
 
 #[test]
+fn search_defaults_to_excerpt_and_get_drawer_dereferences_the_full_body() {
+    let app = App::open_for_test().unwrap();
+    let body = format!(
+        "MCP protocol fixture prefix. {} needle exact body. {}after",
+        "before ".repeat(80),
+        "after ".repeat(79)
+    );
+    let added = call_tool(
+        &app,
+        "add_drawer",
+        json!({ "content": body, "wing": "protocol-tests", "room": "mcp" }),
+    );
+    let id = added["id"]
+        .as_str()
+        .expect("add_drawer returns a stable id")
+        .to_owned();
+
+    let search = call_tool(&app, "search", json!({ "query": "needle", "limit": 1 }));
+    assert_eq!(search["content_mode"], "excerpt");
+    let hit = search["results"]
+        .as_array()
+        .and_then(|results| results.iter().find(|result| result["id"] == id))
+        .expect("search should return the inserted drawer");
+    assert_eq!(hit["id"], id);
+    let excerpt = hit["excerpt"]
+        .as_str()
+        .expect("search hit returns an excerpt");
+    assert!(!excerpt.is_empty());
+    assert!(excerpt.contains("needle"));
+    assert!(excerpt.chars().count() < body.chars().count());
+    assert!(excerpt.chars().count() <= 300);
+    assert!(hit.get("content").is_none());
+
+    let drawer = call_tool(&app, "get_drawer", json!({ "id": id }));
+    assert_eq!(drawer["found"], true);
+    assert_eq!(
+        drawer["content"].as_str(),
+        Some(body.as_str()),
+        "get_drawer must return the verbatim body behind the search hit"
+    );
+}
+
+#[test]
+fn search_full_returns_content_over_mcp() {
+    let app = App::open_for_test().unwrap();
+    let body = "MCP full search fixture with the exact body";
+    let added = call_tool(
+        &app,
+        "add_drawer",
+        json!({ "content": body, "wing": "protocol-tests", "room": "mcp" }),
+    );
+    let id = added["id"]
+        .as_str()
+        .expect("add_drawer returns a stable id");
+
+    let search = call_tool(
+        &app,
+        "search",
+        json!({ "query": "full search fixture", "full": true, "limit": 1 }),
+    );
+    assert_eq!(search["content_mode"], "full");
+    let hit = search["results"]
+        .as_array()
+        .and_then(|results| results.iter().find(|result| result["id"] == id))
+        .expect("full search should return the inserted drawer");
+    assert_eq!(hit["content"], body);
+    assert!(hit.get("excerpt").is_none());
+}
+
+#[test]
+fn search_rejects_string_full_over_mcp() {
+    let app = App::open_for_test().unwrap();
+    let error = call_tool_expect_error(&app, "search", json!({ "query": "x", "full": "true" }));
+    assert_eq!(error, "full must be a boolean");
+}
+
+#[test]
 fn status_returns_expected_shape() {
     let app = App::open_for_test().unwrap();
     let status = call_tool(&app, "status", json!({}));
