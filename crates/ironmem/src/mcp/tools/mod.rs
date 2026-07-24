@@ -1558,4 +1558,40 @@ mod tests {
         assert!(!redacted);
         assert_eq!(consumed, 12);
     }
+
+    #[test]
+    fn render_search_excerpt_normalizes_punctuation_bearing_query_tokens() {
+        let content = format!("{}needle{}", "x".repeat(400), "y".repeat(400));
+        let (excerpt, truncated, redacted, consumed) =
+            render_search_excerpt(&content, "\"Needle?,\"", 48, false);
+        let excerpt = excerpt.as_str().expect("excerpt should be a string");
+
+        assert!(excerpt.contains("needle"));
+        assert!(excerpt.starts_with('…'));
+        assert!(excerpt.ends_with('…'));
+        assert!(truncated);
+        assert!(!redacted);
+        assert_eq!(consumed, excerpt.chars().count());
+    }
+
+    #[test]
+    fn render_search_excerpt_whitespace_snap_stops_at_fifteen_chars() {
+        let prefix_at_fifteen = format!("{} {}", "x".repeat(100), "x".repeat(31));
+        let content_at_fifteen = format!("{prefix_at_fifteen}needle{}", "y".repeat(100));
+        let (excerpt_at_fifteen, _, _, _) =
+            render_search_excerpt(&content_at_fifteen, "needle", 42, false);
+        let excerpt_at_fifteen = excerpt_at_fifteen
+            .as_str()
+            .expect("excerpt should be a string");
+        assert!(excerpt_at_fifteen.starts_with("… "));
+
+        let prefix_at_sixteen = format!("{} {}", "x".repeat(100), "x".repeat(32));
+        let content_at_sixteen = format!("{prefix_at_sixteen}needle{}", "y".repeat(100));
+        let (excerpt_at_sixteen, _, _, _) =
+            render_search_excerpt(&content_at_sixteen, "needle", 42, false);
+        let excerpt_at_sixteen = excerpt_at_sixteen
+            .as_str()
+            .expect("excerpt should be a string");
+        assert!(excerpt_at_sixteen.starts_with("…x"));
+    }
 }

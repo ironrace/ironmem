@@ -46,13 +46,18 @@ static STOP_WORDS: LazyLock<HashSet<&'static str>> = LazyLock::new(|| {
     .collect()
 });
 
-/// Return whether a token is a content word after normalisation.
-pub fn is_content_word(token: &str) -> bool {
-    let clean: String = token
+/// Return the alphanumeric, lowercase form used for content-word matching.
+pub fn normalize_content_word(token: &str) -> String {
+    token
         .chars()
         .filter(|c| c.is_alphanumeric())
         .collect::<String>()
-        .to_lowercase();
+        .to_lowercase()
+}
+
+/// Return whether a token is a content word after normalisation.
+pub fn is_content_word(token: &str) -> bool {
+    let clean = normalize_content_word(token);
     clean.len() >= 3 && !STOP_WORDS.contains(clean.as_str())
 }
 

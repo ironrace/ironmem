@@ -3,7 +3,7 @@ use sha2::{Digest, Sha256};
 
 use crate::collab::Agent;
 use crate::error::MemoryError;
-use crate::search::sanitizer::is_content_word;
+use crate::search::sanitizer::{is_content_word, normalize_content_word};
 
 /// Maximum allowed value for search `limit`.
 pub(super) const MAX_SEARCH_LIMIT: usize = 25;
@@ -123,9 +123,9 @@ pub(super) fn render_search_excerpt(
         return render_sensitive_text(content, max_chars, redact);
     }
 
-    let tokens: Vec<&str> = clean_query
+    let tokens: Vec<String> = clean_query
         .split_whitespace()
-        .filter(|token| is_content_word(token))
+        .filter_map(|token| is_content_word(token).then(|| normalize_content_word(token)))
         .collect();
     if tokens.is_empty() {
         return render_sensitive_text(content, max_chars, false);
