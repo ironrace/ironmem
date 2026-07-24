@@ -7,15 +7,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### Changed
-
-- **Breaking: `search` response shape changed (#213).** The default response
-  changed from `content` to `excerpt` + `content_mode`, with a stable `id`
-  reference. Migrate by passing `full:true` for bounded full-content search
-  results (subject to existing
-  per-field and aggregate response caps), or by calling `get_drawer` with the
-  result `id` for the complete body.
-
 ### Added
 
 - **Deterministic `/collab` MCP-response distributions and offline baseline gate
@@ -67,6 +58,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Breaking: `search` response shape changed (#213).** The default response
+  changed from `content` to `excerpt` + `content_mode`, with a stable `id`
+  reference. Migrate by passing `full:true` for bounded full-content search
+  results (subject to existing per-field and aggregate response caps), or by
+  calling `get_drawer` with the result `id` for the complete body.
 - **`AGENTS.md` is now canonical for harness rules.** `ironmem write-rules`
   treats `AGENTS.md` as the single source of truth and fans dependent harness
   files out from it via registry-backed `Native`/`Import`/`Copy` strategies.
