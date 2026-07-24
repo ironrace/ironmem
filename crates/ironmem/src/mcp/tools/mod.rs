@@ -52,14 +52,19 @@ pub fn tool_definitions(app: &App) -> Vec<Value> {
         }),
         json!({
             "name": "search",
-            "description": "Semantic search with KG-boosted ranking. Returns bounded content excerpts.",
+            "description": "Semantic search with KG-boosted ranking. By default, returns a bounded, query-aware excerpt plus a stable `id`; `full:true` returns bounded full-content search results, while `get_drawer` returns the complete body by stable id.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "query": { "type": "string", "description": "Search query" },
                     "limit": { "type": "integer", "default": 10 },
                     "wing": { "type": "string" },
-                    "room": { "type": "string" }
+                    "room": { "type": "string" },
+                    "full": {
+                        "type": "boolean",
+                        "default": false,
+                        "description": "When true, return bounded full-content search results subject to per-field and aggregate response caps. Default false; use `get_drawer` with the stable id for the complete body."
+                    }
                 },
                 "required": ["query"]
             }
@@ -1105,6 +1110,34 @@ mod tests {
                 classifications[0], classifications[1], classifications[2]
             );
         }
+    }
+
+    #[test]
+    fn search_tool_metadata_declares_excerpt_default_and_full_paths() {
+        let app = App::open_for_test().unwrap();
+        let search = tool_definitions(&app)
+            .into_iter()
+            .find(|tool| tool["name"] == "search")
+            .expect("search tool must be advertised");
+
+        let full = &search["inputSchema"]["properties"]["full"];
+        assert_eq!(full["type"], "boolean");
+        assert_eq!(full["default"], false);
+
+        let description = search["description"]
+            .as_str()
+            .expect("search tool needs a description");
+        assert!(description
+            .contains("By default, returns a bounded, query-aware excerpt plus a stable `id`"));
+        assert!(description.contains("`full:true` returns bounded full-content search results"));
+        assert!(description.contains("`get_drawer` returns the complete body by stable id"));
+
+        let full_description = full["description"]
+            .as_str()
+            .expect("full property needs a description");
+        assert!(full_description.contains("bounded full-content search results"));
+        assert!(full_description.contains("per-field and aggregate response caps"));
+        assert!(full_description.contains("`get_drawer` with the stable id for the complete body"));
     }
 
     /// A conditionally-mutating entry is only worth anything if the argument it

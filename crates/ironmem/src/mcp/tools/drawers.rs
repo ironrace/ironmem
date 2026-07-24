@@ -491,9 +491,7 @@ pub(super) fn handle_search(app: &App, args: &Value) -> Result<Value, MemoryErro
         "query_sanitized": result.sanitizer_info.was_sanitized,
         "sanitizer_method": result.sanitizer_info.method,
     });
-    if !full {
-        response["content_mode"] = json!("excerpt");
-    }
+    response["content_mode"] = json!(if full { "full" } else { "excerpt" });
     Ok(response)
 }
 
@@ -1072,6 +1070,32 @@ mod tests {
         );
         assert!(hit.get("content").is_none());
         assert!(hit.get("content_truncated").is_none());
+    }
+
+    #[test]
+    fn search_full_returns_bounded_content_without_excerpt() {
+        let app = test_app();
+        let body = format!("needle {}", "x".repeat(4_500));
+        handle_add_drawer(
+            &app,
+            &json!({
+                "content": body,
+                "wing": "test",
+                "room": "search"
+            }),
+        )
+        .unwrap();
+
+        let out = handle_search(&app, &json!({"query": "needle", "full": true})).unwrap();
+        let hit = out["results"]
+            .as_array()
+            .and_then(|results| results.first())
+            .expect("full search should return the inserted drawer");
+
+        assert_eq!(out["content_mode"].as_str(), Some("full"));
+        assert_eq!(hit["content_truncated"].as_bool(), Some(true));
+        assert!(hit["content"].as_str().is_some());
+        assert!(hit.get("excerpt").is_none());
     }
 
     #[test]
