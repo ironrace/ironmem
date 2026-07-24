@@ -1032,7 +1032,7 @@ fn mode_label(mode: McpAccessMode) -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    use super::shared::render_sensitive_text;
+    use super::shared::{render_search_excerpt, render_sensitive_text, MAX_SEARCH_EXCERPT_CHARS};
     use super::*;
 
     /// The write-tool set used to be spelled out in three unlinked places —
@@ -1446,5 +1446,36 @@ mod tests {
         assert!(!truncated);
         assert!(redacted);
         assert_eq!(consumed, 0);
+    }
+
+    #[test]
+    fn render_search_excerpt_redacts_with_sensitive_text_parity() {
+        let result = render_search_excerpt("abcdef", "abc", MAX_SEARCH_EXCERPT_CHARS, true);
+
+        assert_eq!(result, (Value::Null, false, true, 0));
+    }
+
+    #[test]
+    fn render_search_excerpt_empty_query_returns_truncated_prefix() {
+        let content = "a".repeat(MAX_SEARCH_EXCERPT_CHARS * 2);
+
+        let (excerpt, truncated, redacted, consumed) =
+            render_search_excerpt(&content, "", MAX_SEARCH_EXCERPT_CHARS, false);
+
+        assert_eq!(excerpt, Value::String("a".repeat(MAX_SEARCH_EXCERPT_CHARS)));
+        assert!(truncated);
+        assert!(!redacted);
+        assert_eq!(consumed, MAX_SEARCH_EXCERPT_CHARS);
+    }
+
+    #[test]
+    fn render_search_excerpt_short_body_is_not_truncated() {
+        let (excerpt, truncated, redacted, consumed) =
+            render_search_excerpt("short body", "", MAX_SEARCH_EXCERPT_CHARS, false);
+
+        assert_eq!(excerpt, Value::String("short body".into()));
+        assert!(!truncated);
+        assert!(!redacted);
+        assert_eq!(consumed, "short body".chars().count());
     }
 }

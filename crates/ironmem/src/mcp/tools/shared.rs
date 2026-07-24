@@ -6,6 +6,9 @@ use crate::error::MemoryError;
 
 /// Maximum allowed value for search `limit`.
 pub(super) const MAX_SEARCH_LIMIT: usize = 25;
+/// Default-mode per-result ceiling for search excerpts; use `full: true` or
+/// `get_drawer` to retrieve complete bodies.
+pub(super) const MAX_SEARCH_EXCERPT_CHARS: usize = 300;
 /// Maximum allowed value for list/read `limit` parameters.
 pub(super) const MAX_READ_LIMIT: usize = 100;
 /// Maximum allowed BFS traversal depth.
@@ -107,4 +110,20 @@ pub(super) fn render_sensitive_text(
     let truncated = excerpt_chars < content_chars;
 
     (Value::String(excerpt), truncated, false, excerpt_chars)
+}
+
+pub(super) fn render_search_excerpt(
+    content: &str,
+    clean_query: &str,
+    max_chars: usize,
+    redact: bool,
+) -> (Value, bool, bool, usize) {
+    if redact {
+        return render_sensitive_text(content, max_chars, redact);
+    }
+
+    // Query-aware matching is added in the next search-excerpt task. Until
+    // then, the no-match fallback is the leading prefix window.
+    let _ = clean_query;
+    render_sensitive_text(content, max_chars, false)
 }
