@@ -183,10 +183,27 @@ validate_packaged_agents() {
 migrate_legacy_base() {
   local old_base="$1/.ironmem-bases"
   local new_base="$2"
+  local migration_stage
 
   [[ -d "$old_base" ]] || return 0
   mkdir -p "$new_base"
-  cp -R -n "$old_base/." "$new_base/" 2>/dev/null || true
+  migration_stage="$(mktemp -d "$new_base/.ironmem-migrate.XXXXXX")"
+  if ! cp -R "$old_base/." "$migration_stage/"; then
+    echo "ERROR: failed to migrate legacy install bases: $old_base → $new_base" >&2
+    echo "       Leaving the legacy bases in place so they can be recovered." >&2
+    rm -rf "$migration_stage"
+    return 1
+  fi
+
+  while IFS= read -r staged_path; do
+    local relative_path="${staged_path#"$migration_stage/"}"
+    local destination="$new_base/$relative_path"
+    [[ -e "$destination" || -L "$destination" ]] && continue
+    mkdir -p "$(dirname "$destination")"
+    mv "$staged_path" "$destination"
+  done < <(find "$migration_stage" -mindepth 1 -depth -print)
+
+  rm -rf "$migration_stage"
   rm -rf "$old_base"
   echo "    migrated legacy install bases: $old_base → $new_base"
 }

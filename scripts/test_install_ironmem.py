@@ -55,7 +55,8 @@ class InstallIronmemSelfTest(unittest.TestCase):
         *,
         skip_skills: bool = True,
         extra_env: dict[str, str] | None = None,
-    ) -> None:
+        expected_returncode: int = 0,
+    ) -> subprocess.CompletedProcess[str]:
         codex_home = home / ".codex"
         install_dir = home / ".ironrace" / "bin"
         command = ["bash", str(INSTALLER), "--skip-build"]
@@ -78,9 +79,10 @@ class InstallIronmemSelfTest(unittest.TestCase):
         )
         self.assertEqual(
             result.returncode,
-            0,
+            expected_returncode,
             f"installer failed:\nstdout:\n{result.stdout}\nstderr:\n{result.stderr}",
         )
+        return result
 
     def read_claude_server(self, config: pathlib.Path) -> dict[str, object]:
         payload = json.loads(config.read_text(encoding="utf-8"))
@@ -195,6 +197,35 @@ class InstallIronmemSelfTest(unittest.TestCase):
             )
             self.assertEqual(relocated_base.read_text(encoding="utf-8"), command_source.read_text())
             self.assertFalse(legacy_base.exists())
+
+    def test_full_install_keeps_legacy_bases_when_migration_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            home = pathlib.Path(directory)
+            claude_home = home / "claude-home"
+            claude_commands_dir = home / "claude-discovery" / "commands"
+            legacy_base = claude_commands_dir / ".ironmem-bases"
+            unreadable_base = legacy_base / "collab.md"
+            legacy_base.mkdir(parents=True)
+            unreadable_base.write_text("legacy merge base\n", encoding="utf-8")
+            unreadable_base.chmod(0)
+
+            try:
+                result = self.run_installer(
+                    home,
+                    home / ".claude.json",
+                    skip_skills=False,
+                    extra_env={
+                        "CLAUDE_HOME": str(claude_home),
+                        "CLAUDE_COMMANDS_DIR": str(claude_commands_dir),
+                    },
+                    expected_returncode=1,
+                )
+            finally:
+                unreadable_base.chmod(stat.S_IRUSR | stat.S_IWUSR)
+
+            self.assertIn("failed to migrate legacy install bases", result.stderr)
+            self.assertTrue(legacy_base.exists())
+            self.assertFalse((claude_home / ".ironmem-bases" / "commands" / "collab.md").exists())
 
 
 if __name__ == "__main__":
