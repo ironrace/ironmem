@@ -6,8 +6,9 @@ use crate::sanitize;
 use crate::search;
 
 use super::shared::{
-    optional_bool, render_sensitive_text, sha256_hex, validate_hex_id, MAX_DRAWER_CONTENT_CHARS,
-    MAX_SEARCH_LIMIT, MAX_SEARCH_RESPONSE_CHARS, MAX_SENSITIVE_FIELD_CHARS,
+    optional_bool, render_search_excerpt, render_sensitive_text, sha256_hex, validate_hex_id,
+    MAX_DRAWER_CONTENT_CHARS, MAX_SEARCH_EXCERPT_CHARS, MAX_SEARCH_LIMIT,
+    MAX_SEARCH_RESPONSE_CHARS, MAX_SENSITIVE_FIELD_CHARS,
 };
 use crate::mcp::app::App;
 use crate::mcp::readiness::ReadinessState;
@@ -405,8 +406,8 @@ pub(super) fn handle_get_taxonomy(app: &App) -> Result<Value, MemoryError> {
 
 pub(super) fn handle_search(app: &App, args: &Value) -> Result<Value, MemoryError> {
     // Validate request options before readiness can return a soft or terminal
-    // response; response branching is wired in a later search task.
-    let _full = optional_bool(args, "full", false)?;
+    // response.
+    let full = optional_bool(args, "full", false)?;
 
     match app.readiness_snapshot() {
         ReadinessState::Ready => {}
@@ -445,31 +446,55 @@ pub(super) fn handle_search(app: &App, args: &Value) -> Result<Value, MemoryErro
         .results
         .iter()
         .map(|sd| {
-            let (content, truncated, redacted, consumed_chars) = render_sensitive_text(
-                &sd.drawer.content,
-                remaining_content_budget.min(MAX_SENSITIVE_FIELD_CHARS),
-                redact_content,
-            );
-            remaining_content_budget = remaining_content_budget.saturating_sub(consumed_chars);
-            json!({
-                "id": sd.drawer.id,
-                "content": content,
-                "content_truncated": truncated,
-                "content_redacted": redacted,
-                "wing": sd.drawer.wing,
-                "room": sd.drawer.room,
-                "score": sd.score,
-                "date": sd.drawer.date,
-            })
+            if full {
+                let (content, truncated, redacted, consumed_chars) = render_sensitive_text(
+                    &sd.drawer.content,
+                    remaining_content_budget.min(MAX_SENSITIVE_FIELD_CHARS),
+                    redact_content,
+                );
+                remaining_content_budget = remaining_content_budget.saturating_sub(consumed_chars);
+                json!({
+                    "id": sd.drawer.id,
+                    "content": content,
+                    "content_truncated": truncated,
+                    "content_redacted": redacted,
+                    "wing": sd.drawer.wing,
+                    "room": sd.drawer.room,
+                    "score": sd.score,
+                    "date": sd.drawer.date,
+                })
+            } else {
+                let (excerpt, truncated, redacted, consumed_chars) = render_search_excerpt(
+                    &sd.drawer.content,
+                    &result.sanitizer_info.clean_query,
+                    remaining_content_budget.min(MAX_SEARCH_EXCERPT_CHARS),
+                    redact_content,
+                );
+                remaining_content_budget = remaining_content_budget.saturating_sub(consumed_chars);
+                json!({
+                    "id": sd.drawer.id,
+                    "excerpt": excerpt,
+                    "excerpt_truncated": truncated,
+                    "content_redacted": redacted,
+                    "wing": sd.drawer.wing,
+                    "room": sd.drawer.room,
+                    "score": sd.score,
+                    "date": sd.drawer.date,
+                })
+            }
         })
         .collect();
 
-    Ok(json!({
+    let mut response = json!({
         "results": results,
         "total_candidates": result.total_candidates,
         "query_sanitized": result.sanitizer_info.was_sanitized,
         "sanitizer_method": result.sanitizer_info.method,
-    }))
+    });
+    if !full {
+        response["content_mode"] = json!("excerpt");
+    }
+    Ok(response)
 }
 
 pub(super) fn handle_status(app: &App, args: &Value) -> Result<Value, MemoryError> {
@@ -1013,6 +1038,40 @@ mod tests {
             out["added_by"].is_null(),
             "restricted mode must not leak added_by"
         );
+    }
+
+    #[test]
+    fn search_default_returns_excerpt_without_content() {
+        let app = test_app();
+        handle_add_drawer(
+            &app,
+            &json!({
+                "content": "A searchable memory about needle matching.",
+                "wing": "test",
+                "room": "search"
+            }),
+        )
+        .unwrap();
+
+        let out = handle_search(&app, &json!({"query": "needle", "limit": 1})).unwrap();
+        let hit = out["results"]
+            .as_array()
+            .and_then(|results| results.first())
+            .expect("search should return the inserted drawer");
+
+        assert_eq!(out["content_mode"].as_str(), Some("excerpt"));
+        assert!(
+            hit["id"].as_str().is_some_and(|id| !id.is_empty()),
+            "default search hit must include an id"
+        );
+        assert!(
+            hit["excerpt"]
+                .as_str()
+                .is_some_and(|excerpt| !excerpt.is_empty()),
+            "default search hit must include a non-empty excerpt"
+        );
+        assert!(hit.get("content").is_none());
+        assert!(hit.get("content_truncated").is_none());
     }
 
     #[test]
