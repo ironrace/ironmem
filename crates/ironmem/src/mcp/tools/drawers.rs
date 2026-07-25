@@ -1574,6 +1574,101 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn search_rejects_non_boolean_include_superseded_before_readiness_handling() {
+        let mut app = test_app();
+        let args = json!({"query": "memory", "include_superseded": "true"});
+
+        if let Some(app) = Arc::get_mut(&mut app) {
+            app.memory_ready = Arc::new(ReadinessGate::new_pending());
+        } else {
+            panic!("test app unexpectedly shared");
+        }
+        let pending_error = handle_search(&app, &args).unwrap_err();
+        assert!(matches!(
+            pending_error,
+            MemoryError::Validation(message) if message == "include_superseded must be a boolean"
+        ));
+
+        let failed_gate = ReadinessGate::new_pending();
+        failed_gate.resolve_failed("startup failed".to_string());
+        if let Some(app) = Arc::get_mut(&mut app) {
+            app.memory_ready = Arc::new(failed_gate);
+        } else {
+            panic!("test app unexpectedly shared");
+        }
+        let failed_error = handle_search(&app, &args).unwrap_err();
+        assert!(matches!(
+            failed_error,
+            MemoryError::Validation(message) if message == "include_superseded must be a boolean"
+        ));
+    }
+
+    #[test]
+    fn search_omits_superseded_drawers_unless_history_is_requested() {
+        let app = test_app();
+        let predecessor = handle_add_drawer(
+            &app,
+            &json!({
+                "content": "temporal search record version one",
+                "wing": "project",
+                "room": "state",
+            }),
+        )
+        .unwrap();
+        let predecessor_id = predecessor["id"].as_str().unwrap().to_owned();
+        let successor = handle_add_drawer(
+            &app,
+            &json!({
+                "content": "temporal search record version two",
+                "wing": "project",
+                "room": "state",
+                "supersedes": predecessor_id,
+            }),
+        )
+        .unwrap();
+        let successor_id = successor["id"].as_str().unwrap();
+
+        let default_results = handle_search(
+            &app,
+            &json!({
+                "query": "temporal search record",
+                "wing": "project",
+                "room": "state",
+                "limit": 10,
+            }),
+        )
+        .unwrap();
+        let default_ids: Vec<&str> = default_results["results"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|result| result["id"].as_str())
+            .collect();
+        assert_eq!(default_ids, vec![successor_id]);
+
+        let history_results = handle_search(
+            &app,
+            &json!({
+                "query": "temporal search record",
+                "wing": "project",
+                "room": "state",
+                "limit": 10,
+                "include_superseded": true,
+            }),
+        )
+        .unwrap();
+        let history_ids: Vec<&str> = history_results["results"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|result| result["id"].as_str())
+            .collect();
+        assert_eq!(history_ids.len(), 2);
+        assert!(history_ids.contains(&predecessor_id.as_str()));
+        assert!(history_ids.contains(&successor_id));
+    }
+
     // ── G.6: status rejects invalid task_tag and leaves tag unset ────────────
 
     #[test]

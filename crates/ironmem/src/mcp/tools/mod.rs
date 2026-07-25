@@ -1141,6 +1141,10 @@ mod tests {
         assert_eq!(full["type"], "boolean");
         assert_eq!(full["default"], false);
 
+        let include_superseded = &search["inputSchema"]["properties"]["include_superseded"];
+        assert_eq!(include_superseded["type"], "boolean");
+        assert_eq!(include_superseded["default"], false);
+
         let description = search["description"]
             .as_str()
             .expect("search tool needs a description");
