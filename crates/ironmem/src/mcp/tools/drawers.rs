@@ -413,6 +413,7 @@ pub(super) fn handle_delete_drawer(app: &App, args: &Value) -> Result<Value, Mem
 
 pub(super) fn handle_list_wings(app: &App) -> Result<Value, MemoryError> {
     let wings = app.db.wing_counts()?;
+
     Ok(json!({
         "wings": wings.into_iter().collect::<std::collections::HashMap<_, _>>()
     }))
@@ -559,6 +560,17 @@ pub(super) fn handle_status(app: &App, args: &Value) -> Result<Value, MemoryErro
         ReadinessState::Pending => ("warming_up", None),
         ReadinessState::Failed(reason) => ("failed", Some(reason)),
     };
+    let active_collab_sessions: Vec<Value> = app
+        .active_collab_sessions_snapshot()
+        .into_iter()
+        .map(|(repo_path, branch, session_id)| {
+            json!({
+                "repo_path": repo_path,
+                "branch": branch,
+                "session_id": session_id,
+            })
+        })
+        .collect();
 
     Ok(json!({
         "total_drawers": total,
@@ -574,6 +586,7 @@ pub(super) fn handle_status(app: &App, args: &Value) -> Result<Value, MemoryErro
         "readiness": readiness_label,
         "readiness_error": readiness_error,
         "task_tag": app.explicit_task_tag_snapshot(),
+        "active_collab_sessions": active_collab_sessions,
         "active_collab_session_id": app.active_collab_session_snapshot(),
         "metrics": crate::report::one_line_summary(&app.db),
     }))
@@ -643,7 +656,9 @@ mod tests {
         );
         assert!(out.get("warming_up").is_some(), "warming_up missing");
 
-        // active_collab_session_id is echoed (null when unset)
+        // The replacement collection makes an idle status explicit.
+        assert_eq!(out["active_collab_sessions"], json!([]));
+        // active_collab_session_id is echoed for the legacy single-session case.
         assert!(
             out["active_collab_session_id"].is_null(),
             "active_collab_session_id must be null when unset"
@@ -661,6 +676,59 @@ mod tests {
         let out = handle_status(&app, &json!({"clear_task_tag": true})).unwrap();
         assert!(out["task_tag"].is_null());
         assert!(app.explicit_task_tag_snapshot().is_none());
+    }
+
+    #[test]
+    fn status_reports_one_active_collab_scope() {
+        let app = test_app();
+        app.set_active_collab_session_for_scope("session-main", "/repo", "main");
+
+        let out = handle_status(&app, &json!({})).unwrap();
+
+        assert_eq!(out["active_collab_session_id"], json!("session-main"));
+        assert_eq!(
+            out["active_collab_sessions"],
+            json!([{
+                "repo_path": "/repo",
+                "branch": "main",
+                "session_id": "session-main",
+            }])
+        );
+    }
+
+    #[test]
+    fn status_reports_all_active_collab_scopes_in_stable_order() {
+        let app = test_app();
+        app.set_active_collab_session_for_scope("session-z", "/z-repo", "main");
+        app.set_active_collab_session_for_scope("session-feature", "/a-repo", "feature");
+        app.set_active_collab_session_for_scope("session-main", "/a-repo", "main");
+
+        let out = handle_status(&app, &json!({})).unwrap();
+
+        assert!(
+            out["active_collab_session_id"].is_null(),
+            "legacy single-session field must remain null when scopes are ambiguous"
+        );
+        assert_eq!(
+            out["active_collab_sessions"],
+            json!([
+                {
+                    "repo_path": "/a-repo",
+                    "branch": "feature",
+                    "session_id": "session-feature",
+                },
+                {
+                    "repo_path": "/a-repo",
+                    "branch": "main",
+                    "session_id": "session-main",
+                },
+                {
+                    "repo_path": "/z-repo",
+                    "branch": "main",
+                    "session_id": "session-z",
+                },
+            ])
+        );
     }
 
     #[test]

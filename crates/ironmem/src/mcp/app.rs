@@ -247,6 +247,22 @@ impl App {
             .len()
     }
 
+    /// Return every active collab binding in a stable order for status output.
+    /// Each tuple is `(repo_path, branch, session_id)`.
+    pub fn active_collab_sessions_snapshot(&self) -> Vec<(String, String, String)> {
+        let mut sessions: Vec<_> = self
+            .active_collab_sessions
+            .read()
+            .expect("active_collab_sessions lock poisoned")
+            .iter()
+            .map(|((repo_path, branch), session_id)| {
+                (repo_path.clone(), branch.clone(), session_id.clone())
+            })
+            .collect();
+        sessions.sort_unstable();
+        sessions
+    }
+
     /// Compatibility helper for internal callers that have only a session id.
     /// Production collab handlers must use `set_active_collab_session_for_scope`.
     pub fn set_active_collab_session(&self, id: &str) {
