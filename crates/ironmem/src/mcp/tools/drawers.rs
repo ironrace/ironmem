@@ -839,6 +839,224 @@ mod tests {
     }
 
     #[test]
+    fn add_drawer_supersession_retains_history_and_logs_the_linkage() {
+        let app = test_app();
+        let predecessor = handle_add_drawer(
+            &app,
+            &json!({"content": "temporal memory v1", "wing": "project", "room": "state"}),
+        )
+        .unwrap();
+        let predecessor_id = predecessor["id"].as_str().unwrap().to_owned();
+
+        let successor = handle_add_drawer(
+            &app,
+            &json!({
+                "content": "temporal memory v2",
+                "wing": "project",
+                "room": "state",
+                "supersedes": predecessor_id,
+            }),
+        )
+        .unwrap();
+        let successor_id = successor["id"].as_str().unwrap().to_owned();
+
+        assert_eq!(successor["supersedes"].as_str(), Some(predecessor_id.as_str()));
+        assert_eq!(
+            app.db.get_drawer(&predecessor_id).unwrap().unwrap().content,
+            "temporal memory v1",
+            "supersession must retain the predecessor body"
+        );
+
+        let old = handle_get_drawer(&app, &json!({"id": predecessor_id})).unwrap();
+        let current = handle_get_drawer(&app, &json!({"id": successor_id})).unwrap();
+        assert_eq!(old["superseded_by"].as_str(), Some(successor_id.as_str()));
+        assert!(current["superseded_by"].is_null());
+
+        let conn = rusqlite::Connection::open(&app.config.db_path).unwrap();
+        let params: String = conn
+            .query_row(
+                "SELECT params FROM wal_log WHERE operation = 'add_drawer' ORDER BY id DESC LIMIT 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let params: Value = serde_json::from_str(&params).unwrap();
+        assert_eq!(params["supersedes"].as_str(), Some(predecessor_id.as_str()));
+    }
+
+    #[test]
+    fn add_drawer_rejects_invalid_or_invalidly_scoped_supersession() {
+        let app = test_app();
+        let base = json!({"content": "original", "wing": "project", "room": "state"});
+        let predecessor = handle_add_drawer(&app, &base).unwrap();
+        let predecessor_id = predecessor["id"].as_str().unwrap().to_owned();
+
+        let missing = "0".repeat(32);
+        for supersedes in ["not-a-drawer-id", missing.as_str()] {
+            let error = handle_add_drawer(
+                &app,
+                &json!({
+                    "content": format!("candidate for {supersedes}"),
+                    "wing": "project",
+                    "room": "state",
+                    "supersedes": supersedes,
+                }),
+            )
+            .unwrap_err();
+            assert!(matches!(error, MemoryError::Validation(_) | MemoryError::NotFound(_)));
+        }
+
+        let self_reference = handle_add_drawer(
+            &app,
+            &json!({
+                "content": "original",
+                "wing": "project",
+                "room": "state",
+                "supersedes": predecessor_id,
+            }),
+        )
+        .unwrap_err();
+        assert!(matches!(self_reference, MemoryError::Validation(_)));
+
+        let successor = handle_add_drawer(
+            &app,
+            &json!({
+                "content": "replacement",
+                "wing": "project",
+                "room": "state",
+                "supersedes": predecessor_id,
+            }),
+        )
+        .unwrap();
+        assert_eq!(successor["supersedes"].as_str(), Some(predecessor_id.as_str()));
+
+        let already_superseded = handle_add_drawer(
+            &app,
+            &json!({
+                "content": "conflicting replacement",
+                "wing": "project",
+                "room": "state",
+                "supersedes": predecessor_id,
+            }),
+        )
+        .unwrap_err();
+        assert!(matches!(already_superseded, MemoryError::Validation(_)));
+
+        let cross_scope = handle_add_drawer(
+            &app,
+            &json!({
+                "content": "cross-scope replacement",
+                "wing": "other-project",
+                "room": "state",
+                "supersedes": predecessor_id,
+            }),
+        )
+        .unwrap_err();
+        assert!(matches!(cross_scope, MemoryError::Validation(_)));
+    }
+
+    #[test]
+    fn add_drawer_attaches_only_current_high_similarity_dedup_hints() {
+        let app = test_app();
+        let vector = {
+            let mut vector = vec![0.0; ironrace_embed::EMBED_DIM];
+            vector[0] = 1.0;
+            vector
+        };
+        let candidate_id = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        app.db
+            .insert_drawer(
+                candidate_id,
+                "similar current drawer",
+                &vector,
+                "project",
+                "state",
+                "",
+                "test",
+            )
+            .unwrap();
+
+        let args = json!({"content": "new similar drawer", "wing": "project", "room": "state"});
+        let added = handle_add_drawer_with_embedding(
+            &app,
+            validate_add_drawer_args(&args).unwrap(),
+            vector.clone(),
+        )
+        .unwrap();
+        assert_eq!(added["dedup_hint"]["id"].as_str(), Some(candidate_id));
+        assert!((added["dedup_hint"]["score"].as_f64().unwrap() - 1.0).abs() < f64::EPSILON);
+
+        let lower_than_threshold = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+        app.db
+            .insert_drawer(
+                lower_than_threshold,
+                "not similar enough",
+                &[0.9, 1.0],
+                "project",
+                "other-state",
+                "",
+                "test",
+            )
+            .unwrap();
+        let args = json!({"content": "not close", "wing": "project", "room": "other-state"});
+        let no_hint = handle_add_drawer_with_embedding(
+            &app,
+            validate_add_drawer_args(&args).unwrap(),
+            {
+                let mut vector = vec![0.0; ironrace_embed::EMBED_DIM];
+                vector[0] = 1.0;
+                vector
+            },
+        )
+        .unwrap();
+        assert!(no_hint.get("dedup_hint").is_none());
+
+        let replacement_id = "cccccccccccccccccccccccccccccccc";
+        app.db
+            .insert_drawer(
+                replacement_id,
+                "newer drawer",
+                &vector,
+                "project",
+                "retired-state",
+                "",
+                "test",
+            )
+            .unwrap();
+        let retired_id = "dddddddddddddddddddddddddddddddd";
+        app.db
+            .insert_drawer(
+                retired_id,
+                "retired similar drawer",
+                &vector,
+                "project",
+                "retired-state",
+                "",
+                "test",
+            )
+            .unwrap();
+        app.db
+            .with_transaction(|tx| {
+                crate::db::schema::Database::mark_drawer_superseded_tx(
+                    tx,
+                    retired_id,
+                    replacement_id,
+                    "project",
+                    "retired-state",
+                )
+            })
+            .unwrap();
+        let args = json!({"content": "replacement candidate", "wing": "project", "room": "retired-state"});
+        let no_hint = handle_add_drawer_with_embedding(
+            &app,
+            validate_add_drawer_args(&args).unwrap(),
+            vector,
+        )
+        .unwrap();
+        assert!(no_hint.get("dedup_hint").is_none());
+    }
+
+    #[test]
     fn get_drawer_resolves_logical_key_without_a_prior_id() {
         let app = test_app();
         let logical_key = "collab-checkpoint:test-session";

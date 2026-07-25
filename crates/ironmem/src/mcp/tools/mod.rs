@@ -81,6 +81,10 @@ pub fn tool_definitions(app: &App) -> Vec<Value> {
                     "logical_key": {
                         "type": "string",
                         "description": "Stable key that rewrites this wing/room drawer."
+                    },
+                    "supersedes": {
+                        "type": "string",
+                        "description": "32-hex ID of a current drawer in this wing/room that this new drawer supersedes. The predecessor is retained as temporal history; normal search will hide superseded history in a future release."
                     }
                 },
                 "required": ["content", "wing"]
