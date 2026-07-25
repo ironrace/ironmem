@@ -18,9 +18,10 @@ preconditions: phase == CodeImplementPending, current_owner == claude, implement
    non-null `pending_failure` means you are the **recovery owner** for an
    interrupted turn, not simply the next-in-line owner — see "Recoverable vs
    terminal failures" below before proceeding.
-2. Search `wing="ironrace-memory" room="collab-checkpoints"` for the one
-   logical-keyed current drawer for `$SESSION_ID`; resume at the first
-   unfinished task; scan the diff vs acceptance criteria.
+2. Fetch the one logical-keyed current drawer deterministically with
+   `get_drawer(wing=ironrace-memory, room=collab-checkpoints,
+   logical_key=collab-checkpoint:<session_id>)`; resume at the first unfinished
+   task; scan the diff vs acceptance criteria.
 
 ## Load area maps first
 

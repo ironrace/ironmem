@@ -61,20 +61,17 @@ def test_codex_dispatch_uses_explicit_repository_model_defaults():
     assert "escalation tier, not the default" in plan_draft_prompt
 
 
-def test_checkpoint_protocol_uses_one_logical_keyed_drawer_per_session():
-    surfaces = {
-        "protocol": ROOT / "docs" / "COLLAB.md",
-        "claude dispatcher": ROOT / ".claude-plugin" / "commands" / "collab.md",
-        "claude worker": ROOT / ".claude-plugin" / "prompts" / "collab-turn-code-implement.md",
-        "codex worker": ROOT / ".codex-plugin" / "prompts" / "collab-batch-impl.md",
-    }
+def test_lint_requires_logical_keyed_checkpoint_contract(tmp_path):
+    fixture = copy_fixture(tmp_path)
+    bad = fixture / ".codex-plugin" / "prompts" / "collab-batch-impl.md"
+    bad.write_text(bad.read_text().replace(
+        "collab-checkpoint:<session_id>", "missing-checkpoint-key"
+    ))
 
-    for name, path in surfaces.items():
-        text = path.read_text()
-        assert "logical_key" in text, name
-        assert "collab-checkpoint:<session_id>" in text, name
-        assert "one logical-keyed current drawer" in text, name
-        assert "completed_task_ids" in text, name
+    r = run({"COLLAB_LINT_ROOT": str(fixture)})
+
+    assert r.returncode == 1
+    assert "missing checkpoint contract 'collab-checkpoint:<session_id>'" in r.stdout
 
 
 def test_lint_catches_unknown_placeholder(tmp_path):

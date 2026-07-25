@@ -390,7 +390,7 @@ the user already approved the final Superpowers task plan.
    `CodeImplementPending`; the `current_owner` after this transition matches
    the session's current `implementer`. A later
    `/collab join --implementer=...` may reassign `CodeImplementPending`; the
-   new owner must resume from the latest ironmem checkpoint plus a fresh
+   new owner must resume from the one current logical-keyed ironmem checkpoint plus a fresh
    plan/code scan. **Log:** `t1_task_list_sent`
 5a. **Implementation checkpoint rule.** During `CodeImplementPending`,
    the implementer must write durable task-boundary checkpoints via
@@ -437,13 +437,16 @@ the user already approved the final Superpowers task plan.
    ```
 
    On any fresh `/collab join` where `phase == "CodeImplementPending"`
-   and `current_owner == "claude"`, search
-   `wing=ironrace-memory room=collab-checkpoints` for the one logical-keyed
-   current drawer for the `session_id` before doing work. Use that checkpoint
-   and the git log to resume at `next_task_id` (or the `started` task if the
+   and `current_owner == "claude"`, fetch the one logical-keyed current drawer
+   deterministically with `get_drawer(wing=ironrace-memory,
+   room=collab-checkpoints, logical_key=collab-checkpoint:<session_id>)`
+   before doing work. If it is absent, search
+   `wing=ironrace-memory room=collab-checkpoints` only as a legacy fallback and
+   verify the result against git. Use the checkpoint and the git log to resume at
+   `next_task_id` (or the `started` task if the
    last checkpoint stopped mid-task), then read the plan and scan the current code/diff to
    verify what is already complete against the acceptance criteria. If the
-   newest checkpoint is `batch_complete`, first try to reuse its gate
+   current checkpoint is `batch_complete`, first try to reuse its gate
    proof: require clean pushed-head proof, local
    `HEAD == checkpoint.head_sha`, `checkpoint.gates_sha == checkpoint.head_sha`,
    `checkpoint.gates_result` starts with `passed`, and
@@ -456,7 +459,8 @@ the user already approved the final Superpowers task plan.
 
    - **`implementer == "claude"`** — Dispatch the matrix worker
      `collab-turn-code-implement.md` (mechanical/sonnet) and ingest its
-     ≤3-line verdict. The worker resumes from the latest ironmem checkpoint,
+     ≤3-line verdict. The worker resumes from the one current logical-keyed
+     ironmem checkpoint,
      invokes `Skill('subagent-driven-development')` on `plan_file_path`
      (auto-proceeding between tasks, writing the step-5a checkpoints before
      and after every task), runs the gates, and `collab_send`s
@@ -1014,7 +1018,7 @@ Writes are best-effort and never block the protocol.
 When your context is exhausted mid-session, call `session_handoff` with
 `{ session_id, agent: "claude" }` before stopping. The server composes a
 deterministic, model-free ` ```ironrace-session-handoff ` block from
-persisted state + the newest `collab-checkpoints` drawer — it never asks a
+persisted state + the one logical-keyed current `collab-checkpoints` drawer — it never asks a
 model to summarize. The response carries both a `handoff_block` (context for
 the successor) and a top-level `handoff_token` (the claim credential — not
 embedded inside the block).

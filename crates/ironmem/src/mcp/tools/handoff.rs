@@ -115,9 +115,10 @@ fn opt(s: Option<&str>) -> &str {
     }
 }
 
-/// Newest collab checkpoint drawer for this session, parsed from the compact
-/// KV format. Deterministic SQL (exact wing/room + content match, newest by
-/// rowid) — never semantic search.
+/// Current collab checkpoint drawer for this session, parsed from the compact
+/// KV format. The logical-keyed drawer is preferred deterministically; legacy
+/// append-only checkpoints remain a fallback during rollout. Never use semantic
+/// search for recovery state.
 pub(super) fn latest_checkpoint(
     db: &crate::db::schema::Database,
     session_id: &str,
@@ -130,16 +131,16 @@ pub(super) fn latest_checkpoint(
         // "test-sid-extra") or cross-session matches. Concatenating char(10) on both
         // sides of `content` ensures first-line and last-line entries also match.
         let needle = format!("\nsession_id: {session_id}\n");
+        let logical_source = format!("logical:collab-checkpoint:{session_id}");
         let content: Option<String> = conn
             .query_row(
                 "SELECT content FROM drawers
                  WHERE wing = ?1 AND room = ?2
                    AND (char(10) || content || char(10)) LIKE '%' || ?3 || '%'
-                 -- drawer ids are content-hash based; inserts upsert-in-place (rowid stable
-                 -- on conflict), so rowid DESC = newest first-seen checkpoint content.
-                 -- A future switch to INSERT OR REPLACE would break this ordering.
-                 ORDER BY rowid DESC LIMIT 1",
-                rusqlite::params![CHECKPOINT_WING, CHECKPOINT_ROOM, needle],
+                 -- Prefer the current logical-keyed checkpoint. If absent, retain legacy
+                 -- recovery behavior by selecting the newest append-only checkpoint.
+                 ORDER BY CASE WHEN source_file = ?4 THEN 0 ELSE 1 END, rowid DESC LIMIT 1",
+                rusqlite::params![CHECKPOINT_WING, CHECKPOINT_ROOM, needle, logical_source],
                 |r| r.get(0),
             )
             .optional()?;
@@ -551,6 +552,51 @@ mod tests {
             "token must NOT appear inside the fenced block"
         );
         assert_eq!(out["generation"], json!(1));
+    }
+
+    #[test]
+    fn latest_checkpoint_prefers_current_logical_key_over_newer_legacy_drawer() {
+        let (app, _dir) = test_handoff_app();
+        let session_id = "test-current-checkpoint";
+        let wing = CHECKPOINT_WING;
+        let room = CHECKPOINT_ROOM;
+        let embedding = vec![0.0; 384];
+        let logical = format!(
+            "collab_checkpoint\nsession_id: {session_id}\nstatus: completed\ncompleted_task_ids: 1,2\nnext_task_id: 3"
+        );
+        let legacy = format!(
+            "collab_checkpoint\nsession_id: {session_id}\nstatus: started\ncompleted_task_ids: 1\nnext_task_id: 2"
+        );
+
+        app.db
+            .insert_drawer(
+                &crate::db::drawers::generate_id("logical-key:checkpoint", wing, room),
+                &logical,
+                &embedding,
+                wing,
+                room,
+                &format!("logical:collab-checkpoint:{session_id}"),
+                "test",
+            )
+            .unwrap();
+        // Insert after the logical drawer to prove the legacy row's newer rowid
+        // cannot supersede the one current checkpoint.
+        app.db
+            .insert_drawer(
+                &crate::db::drawers::generate_id("legacy-checkpoint", wing, room),
+                &legacy,
+                &embedding,
+                wing,
+                room,
+                "",
+                "test",
+            )
+            .unwrap();
+
+        let checkpoint = latest_checkpoint(&app.db, session_id).unwrap().unwrap();
+        assert_eq!(checkpoint.status.as_deref(), Some("completed"));
+        assert_eq!(checkpoint.completed_task_ids.as_deref(), Some("1,2"));
+        assert_eq!(checkpoint.next_task_id.as_deref(), Some("3"));
     }
 
     /// Verify that `parse_checkpoint` extracts all expected fields from a realistic

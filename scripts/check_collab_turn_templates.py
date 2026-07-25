@@ -129,6 +129,18 @@ FORBIDDEN_TEMPLATE_SNIPPETS = {
         "read Codex's review notes",
     ],
 }
+CHECKPOINT_PROTOCOL_SURFACES = {
+    DOC: "docs/COLLAB.md",
+    COMMAND: ".claude-plugin/commands/collab.md",
+    PROMPTS / "collab-turn-code-implement.md": ".claude-plugin/prompts/collab-turn-code-implement.md",
+    ROOT / ".codex-plugin" / "prompts" / "collab-batch-impl.md": ".codex-plugin/prompts/collab-batch-impl.md",
+}
+REQUIRED_CHECKPOINT_PROTOCOL_SNIPPETS = [
+    "collab-checkpoint:<session_id>",
+    "one logical-keyed current drawer",
+    "get_drawer(wing=ironrace-memory",
+    "completed_task_ids",
+]
 REQUIRED_SENTINELS = ["<!-- LINT:worker-dispatch -->",
                       "<!-- LINT:gates-ref-only -->",
                       "<!-- LINT:bridge-worker-owned -->",
@@ -450,6 +462,15 @@ def main() -> int:
     for name in EXPECTED_TEMPLATES:
         if name not in doc_text:
             err(f"docs/COLLAB.md: missing template reference {name}")
+
+    for path, label in CHECKPOINT_PROTOCOL_SURFACES.items():
+        if not path.exists():
+            err(f"{label}: missing checkpoint protocol surface")
+            continue
+        text = path.read_text()
+        for snippet in REQUIRED_CHECKPOINT_PROTOCOL_SNIPPETS:
+            if snippet not in text:
+                err(f"{label}: missing checkpoint contract {snippet!r}")
 
     for prompt in CODEX_PROMPTS:
         if not prompt.exists():

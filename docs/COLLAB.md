@@ -416,14 +416,14 @@ summary: <one concise sentence>
 resume_hint: /collab join [--implementer=<claude|codex>] <session_id>
 ```
 
-On any fresh `/collab join` that lands in `CodeImplementPending`, the
-owning implementer must search `wing=ironrace-memory`,
-`room=collab-checkpoints` for the one logical-keyed current drawer for the
-session id, then use that checkpoint plus the git log to choose the first
-unfinished task. The new implementer must then read the plan and scan the
-current code/diff to
+On any fresh `/collab join` that lands in `CodeImplementPending`, the owning
+implementer must fetch the one logical-keyed current drawer deterministically
+with `get_drawer(wing=ironrace-memory, room=collab-checkpoints,
+logical_key=collab-checkpoint:<session_id>)`, then use that checkpoint plus the
+git log to choose the first unfinished task. The new implementer must then read
+the plan and scan the current code/diff to
 verify which acceptance criteria are already complete before editing. If
-the newest checkpoint is `batch_complete`, first try to reuse its gate
+the current checkpoint is `batch_complete`, first try to reuse its gate
 proof: require clean pushed-head proof, local `HEAD == checkpoint.head_sha`,
 `checkpoint.gates_sha == checkpoint.head_sha`, `checkpoint.gates_result`
 starts with `passed`, and `checkpoint.gates_commands` exactly matches the
@@ -824,7 +824,7 @@ Valid during planning and during `CodeImplementPending`. During
 `CodeImplementPending`, this also moves `current_owner` to the selected
 implementer so `/collab join --implementer=<agent> <session_id>` can hand
 the active batch to another agent. The new implementer resumes from the
-latest ironmem checkpoint, then scans the plan and current code before
+one current logical-keyed ironmem checkpoint, then scans the plan and current code before
 continuing. Calls after `implementation_done` are rejected.
 
 ### `collab_start_code_review`
@@ -1104,8 +1104,9 @@ generation, handoff_token, handoff_block }` where `generation` is the
 **pending (to-be-claimed) generation** = active_generation + 1, not the
 caller's current active generation.
 
-**What it does.** The server reads persisted session state and the newest
-`collab-checkpoints` drawer for the session and composes a deterministic,
+**What it does.** The server reads persisted session state and the one
+logical-keyed current `collab-checkpoints` drawer for the session (falling back
+to the newest legacy checkpoint only during rollout) and composes a deterministic,
 model-free fenced markdown block (` ```ironrace-session-handoff `) — it
 NEVER asks a model to summarize. This tool is a WRITE tool and is denied in
 read-only / restricted MCP mode.

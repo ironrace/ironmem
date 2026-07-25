@@ -54,10 +54,11 @@ and push recovered work, and send the normal completion event exactly once.
 
 ## Checkpoints
 
-Before implementation, search `wing=ironrace-memory room=collab-checkpoints`
-for the one logical-keyed current drawer for the session. Use that checkpoint
-plus git history to resume the first unfinished or interrupted task and verify
-already-completed criteria.
+Before implementation, fetch the one logical-keyed current drawer
+deterministically with `get_drawer(wing=ironrace-memory,
+room=collab-checkpoints, logical_key=collab-checkpoint:<session_id>)`. Use that
+checkpoint plus git history to resume the first unfinished or interrupted task
+and verify already-completed criteria.
 If a `batch_complete` checkpoint proves clean pushed HEAD, matching gate SHA,
 passing gate result, and the exact current gate commands, reuse it and send
 `implementation_done` without rerunning work.
