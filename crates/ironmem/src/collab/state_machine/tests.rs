@@ -267,13 +267,130 @@ fn test_task_list_rejects_empty_tasks() {
         &CollabEvent::SubmitTaskList {
             plan_hash: "hash-final".to_string(),
             base_sha: "base".to_string(),
-            task_list_json: "[]".to_string(),
+            task_list_json: canonical_task_list(0),
             tasks_count: 0,
             head_sha: "h".to_string(),
         },
     )
     .unwrap_err();
     assert_eq!(err, CollabError::EmptyTaskList);
+}
+
+#[test]
+fn test_task_list_rejects_noncanonical_json() {
+    let s = locked_session("hash-final");
+    let err = apply_event(
+        &s,
+        Agent::Claude,
+        &CollabEvent::SubmitTaskList {
+            plan_hash: "hash-final".to_string(),
+            base_sha: "base".to_string(),
+            task_list_json: "[]".to_string(),
+            tasks_count: 0,
+            head_sha: "h".to_string(),
+        },
+    )
+    .unwrap_err();
+    assert_eq!(err, CollabError::InvalidTaskList);
+}
+
+#[test]
+fn test_task_list_rejects_invalid_task_body_from_direct_caller() {
+    let s = locked_session("hash-final");
+    let err = apply_event(
+        &s,
+        Agent::Claude,
+        &CollabEvent::SubmitTaskList {
+            plan_hash: "hash-final".to_string(),
+            base_sha: "base".to_string(),
+            task_list_json: serde_json::json!({
+                "tasks": [{"id": 1, "acceptance": []}],
+            })
+            .to_string(),
+            tasks_count: 1,
+            head_sha: "h".to_string(),
+        },
+    )
+    .unwrap_err();
+    assert_eq!(err, CollabError::InvalidTaskList);
+}
+
+#[test]
+fn test_task_list_rejects_unsafe_plan_file_path_from_direct_caller() {
+    let s = locked_session("hash-final");
+    let err = apply_event(
+        &s,
+        Agent::Claude,
+        &CollabEvent::SubmitTaskList {
+            plan_hash: "hash-final".to_string(),
+            base_sha: "base".to_string(),
+            task_list_json: serde_json::json!({
+                "plan_file_path": "../outside-plan.md",
+                "tasks": [{"id": 1, "acceptance": ["ok"]}],
+            })
+            .to_string(),
+            tasks_count: 1,
+            head_sha: "h".to_string(),
+        },
+    )
+    .unwrap_err();
+    assert_eq!(err, CollabError::InvalidTaskList);
+}
+
+#[test]
+fn test_task_list_rejects_more_than_ten_tasks() {
+    let s = locked_session("hash-final");
+    let err = apply_event(
+        &s,
+        Agent::Claude,
+        &CollabEvent::SubmitTaskList {
+            plan_hash: "hash-final".to_string(),
+            base_sha: "base".to_string(),
+            task_list_json: canonical_task_list(11),
+            tasks_count: 11,
+            head_sha: "h".to_string(),
+        },
+    )
+    .unwrap_err();
+    assert_eq!(
+        err,
+        CollabError::TooManyTasks {
+            actual: 11,
+            max: 10,
+        }
+    );
+}
+
+#[test]
+fn test_task_list_rejects_declared_count_that_hides_oversized_json() {
+    let s = locked_session("hash-final");
+    let err = apply_event(
+        &s,
+        Agent::Claude,
+        &CollabEvent::SubmitTaskList {
+            plan_hash: "hash-final".to_string(),
+            base_sha: "base".to_string(),
+            task_list_json: canonical_task_list(11),
+            tasks_count: 10,
+            head_sha: "h".to_string(),
+        },
+    )
+    .unwrap_err();
+    assert_eq!(
+        err,
+        CollabError::TaskListCountMismatch {
+            declared: 10,
+            actual: 11,
+        }
+    );
+}
+
+#[test]
+fn test_task_list_accepts_exactly_ten_tasks() {
+    let s = locked_session("hash-final");
+    let s = submit_task_list(&s, "hash-final", 10);
+    assert_eq!(s.phase, Phase::CodeImplementPending);
+    assert_eq!(s.tasks_count(), Some(10));
 }
 
 #[test]
@@ -285,7 +402,7 @@ fn test_task_list_rejects_missing_base_sha() {
         &CollabEvent::SubmitTaskList {
             plan_hash: "hash-final".to_string(),
             base_sha: "".to_string(),
-            task_list_json: "[]".to_string(),
+            task_list_json: canonical_task_list(1),
             tasks_count: 1,
             head_sha: "h".to_string(),
         },

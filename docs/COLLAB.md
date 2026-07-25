@@ -40,6 +40,22 @@ from this spec — keep them in sync when protocol changes land:
 - `.codex-plugin/prompts/collab-recovery.md` — delegated v3 local/final-review recovery.
 - `.codex-plugin/prompts/collab-batch-impl.md` — Codex's v3 batch-implementation turn.
 
+## Collab issue task budget
+
+One collab session implements exactly one independently shippable issue with
+**1–10 execution tasks**. A plan projected to require 11 or more tasks is too
+large for collab: split its scope into linked, independently executable child
+issues before starting implementation. Route every child through
+`/evaluate-issue`; only a child that itself receives a `COLLAB` verdict gets
+its own 1–10-task collab session.
+
+Do not make an oversized issue fit by merging unrelated work, weakening
+acceptance criteria, or silently dropping tasks. During `/evaluate-issue`,
+return the required `SPLIT` verdict and child-issue proposal; create the child
+issues only after the user confirms. Keep the parent open as the tracking
+issue. The MCP server rejects every `task_list` with more than 10 tasks as a
+final invariant, even if an upstream prompt or evaluator misses the split.
+
 ## What It Is
 
 IronRace Collab v1 is a **bounded planning protocol**, not an open-ended
@@ -269,14 +285,16 @@ Exit:
 
 Codex must put all requested edits, risks, and task-splitting concerns into
 this one review pass. In particular, any task that looks larger than 20 minutes
-must be called out so Claude can split it in the final plan.
+or any scope that credibly needs more than 10 tasks must be called out so Claude
+can split it into independently executable child issues before finalization.
 
 ### `PlanClaudeFinalizePending`
 
 Owner: `claude`. Claude writes the final Superpowers-compatible task markdown,
 asks for the only planning human approval, then sends one `final` message.
-Every task must be scoped to 20 minutes or less; larger work is split before
-approval.
+Every task must be scoped to 20 minutes or less, and the plan must contain
+1–10 tasks. Larger work or an 11+ task scope is split into independently
+executable child issues before approval.
 
 Exit → `PlanLocked` (always). Planning is done.
 
@@ -287,8 +305,8 @@ Plan is frozen; `final_plan_hash` is set. This is terminal for `wait_my_turn`
 
 - `collab_end` — abandon before coding starts (last point this is valid).
 - `collab_send` with `topic=task_list` from `claude` — enter the v3 coding
-  loop. The state machine verifies `plan_hash == final_plan_hash` and the
-  task list is non-empty; the session stays active and the terminal set for
+  loop. The state machine verifies `plan_hash == final_plan_hash` and that the
+  task list contains 1–10 tasks; the session stays active and the terminal set for
   `wait_my_turn` flips to `{CodingComplete, CodingFailed}`.
 
 ## v3 Coding Phase Model
@@ -1276,7 +1294,7 @@ orchestrator from steering the reviewer's conclusion.
 
 | Topic | Sender | Payload | Notes |
 |---|---|---|---|
-| `task_list` | `claude` | `{"plan_hash","base_sha","head_sha","plan_file_path"?,"execution_mode"?,"tasks":[{"id","title","timebox_minutes","acceptance":[...]}]}` | `plan_hash` must equal `final_plan_hash`; `tasks` must be non-empty and strictly ordered by `id`; each task requires `timebox_minutes <= 20` and ≥1 `acceptance` entry. Optional `plan_file_path` (repo-relative; no leading `/`; no `..` segments) points at the approved Superpowers task markdown driving subagent execution. Optional `execution_mode` — see below. |
+| `task_list` | `claude` | `{"plan_hash","base_sha","head_sha","plan_file_path"?,"execution_mode"?,"tasks":[{"id","title","timebox_minutes","acceptance":[...]}]}` | `plan_hash` must equal `final_plan_hash`; `tasks` must contain **1–10** strictly ordered entries; each task requires `timebox_minutes <= 20` and ≥1 `acceptance` entry. An 11+ task issue must be split into child issues before this message is sent. Optional `plan_file_path` (repo-relative; no leading `/`; no `..` segments) points at the approved Superpowers task markdown driving subagent execution. Optional `execution_mode` — see below. |
 | `implementation_done` | `claude` or `codex` (per session `implementer`) | `{"head_sha"}` | In `CodeImplementPending` only. Fired once after the subagent batch completes and gates pass. Carries only `head_sha` — no prose, no subagent notes. |
 | `review_fix_global` | `codex` (or `claude` as recovery owner under the delegated-completion override) | `{"head_sha"}` | In `CodeReviewFixGlobalPending` only. Codex ran `/pr-review-toolkit:review-pr` on the raw post-implementation diff (no Claude pre-clean), used parallel fix subagents for confirmed partitionable findings, merged/cherry-picked the resulting fixes, and pushed the branch-level fix commit(s). |
 | `review_local` | `claude` (or `codex` as recovery owner under the delegated-completion override) | `{"head_sha"}` | In `CodeReviewLocalPending` only. Claude ran full or reduced audit of Codex's `review_fix_global` commits + caught issues both agents missed, used parallel fix subagents for confirmed partitionable findings, merged/cherry-picked the resulting fixes, and pushed. |
@@ -1604,10 +1622,12 @@ The worker reads `final_plan`/`final_plan_hash`, extracts `plan_file_path` from
 the leading markdown comment, verifies the file content is byte-identical to the
 approved body (or recreates a missing file from that body), parses each
 `### Task N:` heading into `{id,title,timebox_minutes,acceptance}`, and sends
-`task_list`. It returns a blocker and sends nothing if any task is missing
-acceptance criteria, missing `Timebox: <=20 minutes`, sized above 20 minutes, or
-if the existing plan file differs from the approved body. PlanLocked is
-pre-coding, so `failure_report` is not valid in this bridge.
+`task_list`. It returns a blocker and sends nothing if the plan has zero or more
+than 10 tasks, any task is missing acceptance criteria, missing `Timebox: <=20
+minutes`, sized above 20 minutes, or if the existing plan file differs from the
+approved body. An 11+ task plan must be decomposed into child issues; it must
+not enter coding. PlanLocked is pre-coding, so `failure_report` is not valid in
+this bridge.
 
 Only the worker's ≤3-line verdict crosses the orchestrator boundary; the plan
 markdown and manifest JSON never do.
@@ -1706,8 +1726,9 @@ Claude enters harness Plan Mode at **exactly one gate**, matching the
 command-file invariant bullet:
 
 1. **v1 `final`** — `PlanClaudeFinalizePending`. Claude presents the final
-   Superpowers task plan for approval; each task must be timeboxed to 20
-   minutes or less. Post-send the session is `PlanLocked`.
+   Superpowers task plan for approval; it must contain 1–10 tasks, each
+   timeboxed to 20 minutes or less. A larger plan must first be split into
+   child issues. Post-send the session is `PlanLocked`.
 
 Every other step runs autonomously: the blind `draft` send (from
 `/collab start`), canonical synthesis, Codex's one plan-review pass, the v3
@@ -1868,7 +1889,8 @@ Codex (bg-exec):
         reads canonical, returns verdict=request_changes. Exits.
 Claude: poll observes phase=PlanClaudeFinalizePending. **Enters Plan
         Mode for final Superpowers task plan.** Splits tasks to 20 minutes
-        or less. User approves. Sends final. Phase now
+        or less and routes any 11+ task scope into child issues. User approves.
+        Sends final. Phase now
         PlanLocked. Loop exits.
 ```
 

@@ -22,6 +22,7 @@ def copy_fixture(tmp_path):
                     fixture / ".codex-plugin" / "prompts")
     (fixture / "docs").mkdir()
     shutil.copy2(ROOT / "docs" / "COLLAB.md", fixture / "docs" / "COLLAB.md")
+    shutil.copy2(ROOT / "docs" / "EVALUATE_ISSUE.md", fixture / "docs" / "EVALUATE_ISSUE.md")
     return fixture
 
 
@@ -133,4 +134,30 @@ def test_lint_catches_typoed_matrix_tier(tmp_path):
 
     assert r.returncode == 1
     assert "matrix row for collab-turn-submit.md: unrecognized tier/model" \
+        in r.stdout
+
+
+def test_lint_requires_evaluate_issue_split_contract(tmp_path):
+    fixture = copy_fixture(tmp_path)
+    prompt = fixture / ".codex-plugin" / "prompts" / "evaluate-issue.md"
+    prompt.write_text(prompt.read_text().replace("Child issues:", "Child work:", 1))
+
+    r = run({"COLLAB_LINT_ROOT": str(fixture)})
+
+    assert r.returncode == 1
+    assert ".codex-plugin/prompts/evaluate-issue.md: missing evaluate-issue SPLIT contract" \
+        in r.stdout
+
+
+def test_lint_requires_retry_safe_split_contract(tmp_path):
+    fixture = copy_fixture(tmp_path)
+    prompt = fixture / ".claude-plugin" / "commands" / "evaluate-issue.md"
+    prompt.write_text(
+        prompt.read_text().replace("Split-child-key:", "Child split key:", 1)
+    )
+
+    r = run({"COLLAB_LINT_ROOT": str(fixture)})
+
+    assert r.returncode == 1
+    assert ".claude-plugin/commands/evaluate-issue.md: missing evaluate-issue SPLIT contract" \
         in r.stdout
