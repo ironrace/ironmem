@@ -108,6 +108,38 @@ fn request_collab_session_id(request: &JsonRpcRequest) -> Option<String> {
         .and_then(normalize_session_id)
 }
 
+/// `collab_start` tools create their session id in the response rather than
+/// carrying one in request arguments. Resolve that response's exact session
+/// too, so a concurrent scope cannot make its metrics attribution ambiguous.
+fn response_collab_session_id(
+    request: &JsonRpcRequest,
+    response: &JsonRpcResponse,
+) -> Option<String> {
+    if request.method != "tools/call" {
+        return None;
+    }
+    let tool_name = request.params.get("name").and_then(|v| v.as_str())?;
+    if !tool_name.starts_with("collab_") {
+        return None;
+    }
+    response
+        .result
+        .as_ref()
+        .and_then(|result| result.get("content"))
+        .and_then(|content| content.as_array())
+        .and_then(|content| content.first())
+        .and_then(|item| item.get("text"))
+        .and_then(|text| text.as_str())
+        .and_then(|text| serde_json::from_str::<serde_json::Value>(text).ok())
+        .and_then(|body| {
+            body.get("session_id")
+                .and_then(|id| id.as_str())
+                .map(str::to_string)
+        })
+        .as_deref()
+        .and_then(normalize_session_id)
+}
+
 fn normalize_session_id(value: &str) -> Option<String> {
     let sanitized = crate::sanitize::sanitize_session_id(value);
     if sanitized == "unknown" {
@@ -123,13 +155,14 @@ fn account_response_metrics(
     chars: usize,
     tool_name: Option<&str>,
     session_id: Option<&str>,
+    request_collab_session_id: Option<&str>,
     exploration: Option<&crate::metrics::ExplorationContext>,
 ) {
     if !crate::search::tunables::metrics_enabled() {
         return;
     }
     tokio::task::block_in_place(|| {
-        let metrics_ctx = crate::metrics::MetricsContext::resolve(app);
+        let metrics_ctx = crate::metrics::MetricsContext::resolve(app, request_collab_session_id);
         crate::metrics::account_mcp_response(
             &app.db,
             chars as i64,
@@ -410,7 +443,7 @@ const _: () = assert!(MAX_EARLY_RELEASED_WAITS > 0);
 /// `mode` (H4) controls whether this connection's `ConnectionContext` honors
 /// the `IRONMEM_SESSION_ID`/`IRONMEM_HARNESS` env overrides — see
 /// `TransportMode`. Metrics accounting needs access to `app` (for the DB +
-/// process-global collab/task-tag context) and a per-connection
+/// scoped collab/task-tag context) and a per-connection
 /// `ConnectionContext` (for harness/session attribution learned from *this*
 /// connection's own `initialize` — see `ConnectionContext` for why that must
 /// not live on `App`), plus the original request (for tool name / session id /
@@ -612,7 +645,13 @@ where
                             JsonRpcResponse::error(None, -32700, &format!("Parse error: {e}"));
                         let chars = write_response(&mut stdout, &resp).await?;
                         account_response_metrics(
-                            app, &conn, chars, None, conn.session_id.as_deref(), None,
+                            app,
+                            &conn,
+                            chars,
+                            None,
+                            conn.session_id.as_deref(),
+                            None,
+                            None,
                         );
                         continue;
                     }
@@ -626,7 +665,13 @@ where
                     );
                     let chars = write_response(&mut stdout, &resp).await?;
                     account_response_metrics(
-                        app, &conn, chars, None, conn.session_id.as_deref(), None,
+                        app,
+                        &conn,
+                        chars,
+                        None,
+                        conn.session_id.as_deref(),
+                        None,
+                        None,
                     );
                     continue;
                 }
@@ -818,7 +863,16 @@ async fn reject_mutation(
         .session_id
         .clone()
         .or_else(|| request_collab_session_id(request));
-    account_response_metrics(app, conn, chars, tool_name, sid.as_deref(), None);
+    let request_collab_id = request_collab_session_id(request);
+    account_response_metrics(
+        app,
+        conn,
+        chars,
+        tool_name,
+        sid.as_deref(),
+        request_collab_id.as_deref(),
+        None,
+    );
     Ok(())
 }
 
@@ -851,12 +905,15 @@ async fn write_and_account(
         .session_id
         .clone()
         .or_else(|| request_collab_session_id(request));
+    let request_collab_id =
+        request_collab_session_id(request).or_else(|| response_collab_session_id(request, &resp));
     account_response_metrics(
         app,
         conn,
         chars,
         request_tool_name(request),
         sid.as_deref(),
+        request_collab_id.as_deref(),
         exploration.as_ref(),
     );
     Ok(())
@@ -1021,7 +1078,7 @@ fn tool_success_response(
 ///
 /// `barrier` is `Some` only when this request is dispatched as the
 /// per-connection mutation barrier owner (see `run_framing_loop`). The claim
-/// in `wait_my_turn_begin` — the generation settle plus the process-global
+/// in `wait_my_turn_begin` — the generation settle plus the scoped
 /// attribution stamp it commits — is this tool's entire write; the poll loop
 /// below is read-only. Once `wait_my_turn_begin` returns `Ok`, the mutation
 /// this barrier represents has fully committed, and the
@@ -3022,7 +3079,7 @@ mod tests {
     ///
     /// Every step Task 3's dispatch path takes synchronously — reading the
     /// freshly-written line, admitting the mutation, `wait_my_turn_begin`'s
-    /// claim (which is what stamps the process-global "active collab session"
+    /// claim (which is what stamps the scoped "active collab session"
     /// slot), sending the early-release signal, and the wait's own first,
     /// read-only poll — completes without ever yielding to the
     /// executor, so `budget` only has to be long enough for the runtime to give
@@ -3149,17 +3206,14 @@ mod tests {
     /// response arrives at all, it did so while every wait was still
     /// outstanding.
     ///
-    /// One MCP process may have only one collab session "active" for metrics
-    /// attribution at a time (`ensure_no_conflicting_process_session`) — a
-    /// wait claims that slot for its own session in `wait_my_turn_begin`, once,
-    /// and a DIFFERENT session's claim attempt is refused while it's held.
-    /// Because every wait here uses its own distinct session, this test clears
-    /// that process-local marker (`App::clear_active_collab_session`, a public,
-    /// ordinary method) between each wait's dispatch so the next wait's own
-    /// claim isn't rejected as a cross-session conflict. This is pure test
-    /// bookkeeping to work around a real, unrelated single-active-session
-    /// invariant — it has nothing to do with, and does not touch, anything
-    /// Task 3 introduced.
+    /// One MCP process may have one collab session per repository-and-branch
+    /// scope "active" for metrics attribution
+    /// (`ensure_no_conflicting_process_session`) — a wait claims that scope
+    /// for its own session in `wait_my_turn_begin`, once,
+    /// and a DIFFERENT session's claim attempt is refused while it owns the
+    /// same repository-and-branch scope. Because every helper session uses
+    /// that shared test scope, this test clears the bindings between waits;
+    /// the cleanup is unrelated to Task 3.
     ///
     /// The clear is RELIABLE only because the claim is confined to
     /// `wait_my_turn_begin`: that runs during the preceding `drive_briefly`,

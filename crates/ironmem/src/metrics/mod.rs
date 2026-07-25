@@ -81,14 +81,25 @@ pub(crate) struct MetricsContext {
 }
 
 impl MetricsContext {
-    /// §2.3 priority: active collab session first (stamps id + phase bucket,
-    /// INCLUDING terminal-but-not-ended sessions, which stamp `other`); else
-    /// the explicit task tag (phase defaults to `impl` per §3.3); else empty.
-    /// Ended (`ended_at IS NOT NULL`) or missing sessions clear the App cell;
-    /// the discovering row stays unstamped (returns `MetricsContext::default()`).
+    /// §2.3 priority: an explicit collab id first, otherwise the sole active
+    /// scoped binding (both stamp id + phase bucket, INCLUDING
+    /// terminal-but-not-ended sessions, which stamp `other`); else the explicit
+    /// task tag (phase defaults to `impl` per §3.3). Multiple active scopes are
+    /// intentionally not attributed implicitly. Ended (`ended_at IS NOT NULL`)
+    /// or missing sessions clear only their matching App binding; the
+    /// discovering row stays unstamped (returns `MetricsContext::default()`).
     /// Best-effort: a DB read error degrades to an empty context + warn.
-    pub(crate) fn resolve(app: &crate::mcp::app::App) -> MetricsContext {
-        if let Some(sid) = app.active_collab_session_snapshot() {
+    pub(crate) fn resolve(
+        app: &crate::mcp::app::App,
+        explicit_collab_session_id: Option<&str>,
+    ) -> MetricsContext {
+        let scoped = explicit_collab_session_id
+            .map(|sid| (None, sid.to_string()))
+            .or_else(|| {
+                app.sole_active_collab_session_snapshot()
+                    .map(|(scope, sid)| (Some(scope), sid))
+            });
+        if let Some((scope, sid)) = scoped {
             match app.db.collab_load_session_record(&sid) {
                 Ok(record) if record.ended_at.is_none() => {
                     return MetricsContext {
@@ -97,9 +108,13 @@ impl MetricsContext {
                         task_tag: None,
                     };
                 }
-                Ok(_) => {
-                    // Session has ended — self-heal silently.
-                    app.clear_active_collab_session();
+                Ok(record) => {
+                    // Session has ended — self-heal only its matching scope.
+                    app.clear_active_collab_session_for_scope_if_matches(
+                        &sid,
+                        &record.repo_path,
+                        &record.branch,
+                    );
                     return MetricsContext::default();
                 }
                 // `NotFound` is what the session loader returns for a missing row —
@@ -111,7 +126,11 @@ impl MetricsContext {
                         session_id = %sid,
                         "metrics attribution: active collab session not found — clearing cell"
                     );
-                    app.clear_active_collab_session();
+                    if let Some((repo_path, branch)) = scope {
+                        app.clear_active_collab_session_for_scope_if_matches(
+                            &sid, &repo_path, &branch,
+                        );
+                    }
                     return MetricsContext::default();
                 }
                 Err(e) => {
@@ -124,12 +143,17 @@ impl MetricsContext {
                 }
             }
         }
-        if let Some(tag) = app.explicit_task_tag_snapshot() {
-            return MetricsContext {
-                collab_session_id: None,
-                collab_phase: Some("impl".to_string()),
-                task_tag: Some(tag),
-            };
+        // An ambiguous set of scoped sessions is deliberately not allowed to
+        // fall through to a task tag: the request may belong to any one of
+        // those sessions, and leaving it unstamped is safer than guessing.
+        if app.active_collab_session_count() == 0 {
+            if let Some(tag) = app.explicit_task_tag_snapshot() {
+                return MetricsContext {
+                    collab_session_id: None,
+                    collab_phase: Some("impl".to_string()),
+                    task_tag: Some(tag),
+                };
+            }
         }
         MetricsContext::default()
     }

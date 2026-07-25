@@ -1,5 +1,6 @@
 //! Application state — initialized once, shared across MCP tool handlers.
 
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock};
 
@@ -62,19 +63,16 @@ pub struct App {
     pub memory_ready: Arc<ReadinessGate>,
     /// Guards the one-time HNSW rebuild triggered when `memory_ready` resolves `Ready`.
     memory_ready_rebuilt: AtomicBool,
-    /// Active collab session this server process is participating in. Set by
+    /// Active collab sessions this server process is participating in, scoped
+    /// by repository path and branch. Set by
     /// `collab_start`/`collab_start_code_review` and refreshed by
     /// `collab_send`/`collab_recv`/`collab_wait_my_turn`; deliberately NOT set
     /// by `collab_status`, which is also used to inspect foreign/stale
-    /// sessions. Process-global rather than request-local because the dominant
-    /// token volume (`search` rerank, pref-extract) carries no collab argument
-    /// — only process state can attribute it. Enforced invariant: one active
-    /// collab session per server process, regardless of repo — the collab
-    /// handlers' conflict guard rejects binding a second still-live session to
-    /// this slot. Parallel collab sessions require separate server processes so
-    /// `search` / pref-extract / rerank work cannot be stamped onto the wrong
-    /// session.
-    active_collab_session_id: RwLock<Option<String>>,
+    /// sessions. Requests carrying a collab session id resolve that id exactly;
+    /// unscoped work is attributed only when this map has one unambiguous
+    /// binding. This permits concurrent collaboration in separate repository
+    /// branches without stamping work onto an unrelated session.
+    active_collab_sessions: RwLock<HashMap<(String, String), String>>,
     /// Explicit task tag for non-collab work (METRICS_SPEC §2.3 item 2), set
     /// via `status` tool args. Only consulted when no active collab session
     /// resolves.
@@ -146,7 +144,7 @@ impl App {
             graph_cache: RwLock::new(None),
             memory_ready: Arc::new(ReadinessGate::new_ready()),
             memory_ready_rebuilt: AtomicBool::new(true),
-            active_collab_session_id: RwLock::new(None),
+            active_collab_sessions: RwLock::new(HashMap::new()),
             explicit_task_tag: RwLock::new(None),
             active_collab_generations: RwLock::new(std::collections::HashMap::new()),
         })
@@ -181,33 +179,97 @@ impl App {
             graph_cache: RwLock::new(None),
             memory_ready: Arc::new(ReadinessGate::new_pending()),
             memory_ready_rebuilt: AtomicBool::new(false),
-            active_collab_session_id: RwLock::new(None),
+            active_collab_sessions: RwLock::new(HashMap::new()),
             explicit_task_tag: RwLock::new(None),
             active_collab_generations: RwLock::new(std::collections::HashMap::new()),
         })
     }
 
-    /// Mark `id` as the active collab session for metrics attribution.
-    pub fn set_active_collab_session(&self, id: &str) {
-        *self
-            .active_collab_session_id
+    /// Mark `id` as the active collab session for metrics attribution in one
+    /// repository-and-branch scope.
+    pub fn set_active_collab_session_for_scope(&self, id: &str, repo_path: &str, branch: &str) {
+        self.active_collab_sessions
             .write()
-            .expect("active_collab_session_id lock poisoned") = Some(id.to_string());
+            .expect("active_collab_sessions lock poisoned")
+            .insert((repo_path.to_string(), branch.to_string()), id.to_string());
     }
 
-    /// Clear the active collab session (ended or missing).
-    pub fn clear_active_collab_session(&self) {
-        *self
-            .active_collab_session_id
-            .write()
-            .expect("active_collab_session_id lock poisoned") = None;
-    }
-
-    pub fn active_collab_session_snapshot(&self) -> Option<String> {
-        self.active_collab_session_id
+    /// Return the active session bound to exactly this repository-and-branch
+    /// scope, if any.
+    pub fn active_collab_session_snapshot_for_scope(
+        &self,
+        repo_path: &str,
+        branch: &str,
+    ) -> Option<String> {
+        self.active_collab_sessions
             .read()
-            .expect("active_collab_session_id lock poisoned")
-            .clone()
+            .expect("active_collab_sessions lock poisoned")
+            .get(&(repo_path.to_string(), branch.to_string()))
+            .cloned()
+    }
+
+    /// Remove a scope binding only when it still refers to `id`. This prevents
+    /// ending or self-healing an older session from erasing a newer binding.
+    pub fn clear_active_collab_session_for_scope_if_matches(
+        &self,
+        id: &str,
+        repo_path: &str,
+        branch: &str,
+    ) {
+        let mut sessions = self
+            .active_collab_sessions
+            .write()
+            .expect("active_collab_sessions lock poisoned");
+        let key = (repo_path.to_string(), branch.to_string());
+        if sessions.get(&key).is_some_and(|bound| bound == id) {
+            sessions.remove(&key);
+        }
+    }
+
+    /// Return the sole active binding, including its scope. `None` means no
+    /// binding or more than one binding, both of which are intentionally
+    /// ineligible for implicit attribution.
+    pub fn sole_active_collab_session_snapshot(&self) -> Option<((String, String), String)> {
+        let sessions = self
+            .active_collab_sessions
+            .read()
+            .expect("active_collab_sessions lock poisoned");
+        (sessions.len() == 1).then(|| {
+            let (scope, id) = sessions.iter().next().expect("len checked");
+            (scope.clone(), id.clone())
+        })
+    }
+
+    pub fn active_collab_session_count(&self) -> usize {
+        self.active_collab_sessions
+            .read()
+            .expect("active_collab_sessions lock poisoned")
+            .len()
+    }
+
+    /// Compatibility helper for internal callers that have only a session id.
+    /// Production collab handlers must use `set_active_collab_session_for_scope`.
+    pub fn set_active_collab_session(&self, id: &str) {
+        if let Ok(record) = self.db.collab_load_session_record(id) {
+            self.set_active_collab_session_for_scope(id, &record.repo_path, &record.branch);
+        } else {
+            self.set_active_collab_session_for_scope(id, "", "");
+        }
+    }
+
+    /// Clear all active collab bindings. Production lifecycle paths must use
+    /// `clear_active_collab_session_for_scope_if_matches`.
+    pub fn clear_active_collab_session(&self) {
+        self.active_collab_sessions
+            .write()
+            .expect("active_collab_sessions lock poisoned")
+            .clear();
+    }
+
+    /// Return the sole active session. Multiple scopes deliberately report no
+    /// single active id to status and other unscoped callers.
+    pub fn active_collab_session_snapshot(&self) -> Option<String> {
+        self.sole_active_collab_session_snapshot().map(|(_, id)| id)
     }
 
     pub fn set_explicit_task_tag(&self, tag: &str) {
@@ -327,7 +389,7 @@ impl App {
             graph_cache: RwLock::new(None),
             memory_ready: Arc::new(ReadinessGate::new_ready()),
             memory_ready_rebuilt: AtomicBool::new(true),
-            active_collab_session_id: RwLock::new(None),
+            active_collab_sessions: RwLock::new(HashMap::new()),
             explicit_task_tag: RwLock::new(None),
             active_collab_generations: RwLock::new(std::collections::HashMap::new()),
         })

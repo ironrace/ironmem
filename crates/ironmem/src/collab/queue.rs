@@ -145,13 +145,10 @@ pub fn ensure_active(conn: &Connection, session_id: &str) -> Result<(), MemoryEr
 /// Find the newest still-active (not yet `collab_end`-ed) session for a
 /// `repo_path` + `branch`, if any, returning `(id, phase)`.
 ///
-/// "Active" is keyed purely on `ended_at IS NULL` — deliberately including
-/// terminal phases (`CodingComplete` / `CodingFailed`) that have not been
-/// explicitly ended. `collab_start` uses this to reject accidental duplicate
-/// sessions (e.g. a fired `ScheduleWakeup` replaying the `/collab start` entry
-/// command after a session already reached `CodingComplete`): the only way to
-/// start a new session on the same branch is to `collab_end` the prior one or
-/// resume it, both of which require deliberate action a stray replay lacks.
+/// Terminal coding phases (`CodingComplete` / `CodingFailed`) are excluded
+/// even before an explicit `collab_end`: completion still needs operator
+/// attestation and tooling failures remain resumable, but neither blocks a
+/// newly started session in the same repository-and-branch scope.
 pub fn find_active_session_by_repo_branch(
     conn: &Connection,
     repo_path: &str,
@@ -160,6 +157,7 @@ pub fn find_active_session_by_repo_branch(
     conn.query_row(
         "SELECT id, phase FROM collab_sessions
          WHERE repo_path = ?1 AND branch = ?2 AND ended_at IS NULL
+           AND phase NOT IN ('CodingComplete', 'CodingFailed')
          ORDER BY created_at DESC, id DESC
          LIMIT 1",
         params![repo_path, branch],
