@@ -398,6 +398,7 @@ the user already approved the final Superpowers task plan.
 
    - `wing`: `ironrace-memory`
    - `room`: `collab-checkpoints`
+   - `logical_key`: `collab-checkpoint:<session_id>`
    - write `status: started` before each task
    - write `status: completed` after each task is implemented,
      reviewed, committed, and pushed
@@ -405,6 +406,10 @@ the user already approved the final Superpowers task plan.
      `failure_report`
    - write `status: batch_complete` after final gates pass and before
      `implementation_done`
+
+   Every write replaces the one logical-keyed current drawer for the session;
+   carry the complete cumulative `completed_task_ids` list into the replacement
+   body so recovery state is never lost.
 
    Use this compact content shape:
 
@@ -433,10 +438,10 @@ the user already approved the final Superpowers task plan.
 
    On any fresh `/collab join` where `phase == "CodeImplementPending"`
    and `current_owner == "claude"`, search
-   `wing=ironrace-memory room=collab-checkpoints` for the `session_id`
-   before doing work. Use the newest checkpoint and the git log to resume
-   at `next_task_id` (or the `started` task if the last checkpoint
-   stopped mid-task), then read the plan and scan the current code/diff to
+   `wing=ironrace-memory room=collab-checkpoints` for the one logical-keyed
+   current drawer for the `session_id` before doing work. Use that checkpoint
+   and the git log to resume at `next_task_id` (or the `started` task if the
+   last checkpoint stopped mid-task), then read the plan and scan the current code/diff to
    verify what is already complete against the acceptance criteria. If the
    newest checkpoint is `batch_complete`, first try to reuse its gate
    proof: require clean pushed-head proof, local
