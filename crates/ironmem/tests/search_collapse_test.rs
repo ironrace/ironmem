@@ -18,6 +18,7 @@ fn fixture_drawer(id: &str, content: &str, source_file: &str, score: f32) -> Sco
             added_by: "test".to_string(),
             filed_at: "2026-04-29".to_string(),
             date: "2026-04-29".to_string(),
+            superseded_by: None,
         },
         score,
     }

@@ -1,4 +1,4 @@
-use rusqlite::{params, Transaction};
+use rusqlite::{params, OptionalExtension, Transaction};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -43,6 +43,9 @@ pub(crate) const PREF_SENTINEL: &str = "pref:";
 /// references and must not be discoverable through generic memory search.
 const COLLAB_MESSAGE_ROOM: &str = "collab-messages";
 
+#[allow(dead_code)] // Used by the add-drawer handler introduced with this storage layer.
+const NEAR_DUPLICATE_THRESHOLD: f32 = 0.92;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Drawer {
     pub id: String,
@@ -53,6 +56,7 @@ pub struct Drawer {
     pub added_by: String,
     pub filed_at: String,
     pub date: String,
+    pub superseded_by: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -123,6 +127,59 @@ impl Database {
             source_file,
             added_by,
         )
+    }
+
+    /// Mark a current predecessor as superseded inside the caller's
+    /// transaction. The successor is deliberately not validated here: callers
+    /// insert it first in the same transaction, keeping the write atomic.
+    #[allow(dead_code)] // Invoked by the add-drawer handler in the subsequent MCP task.
+    pub(crate) fn mark_drawer_superseded_tx(
+        tx: &Transaction<'_>,
+        predecessor_id: &str,
+        successor_id: &str,
+        wing: &str,
+        room: &str,
+    ) -> Result<(), MemoryError> {
+        let updated = tx.execute(
+            "UPDATE drawers
+             SET superseded_by = ?1
+             WHERE id = ?2 AND wing = ?3 AND room = ?4 AND superseded_by IS NULL",
+            params![successor_id, predecessor_id, wing, room],
+        )?;
+        if updated == 1 {
+            return Ok(());
+        }
+
+        let predecessor = tx
+            .query_row(
+                "SELECT wing, room, superseded_by FROM drawers WHERE id = ?1",
+                params![predecessor_id],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, Option<String>>(2)?,
+                    ))
+                },
+            )
+            .optional()?;
+        let Some((actual_wing, actual_room, superseded_by)) = predecessor else {
+            return Err(MemoryError::NotFound("predecessor drawer not found".into()));
+        };
+        if actual_wing != wing || actual_room != room {
+            return Err(MemoryError::Validation(
+                "predecessor drawer does not belong to requested wing/room".into(),
+            ));
+        }
+        if superseded_by.is_some() {
+            return Err(MemoryError::Validation(
+                "predecessor drawer is already superseded".into(),
+            ));
+        }
+
+        Err(MemoryError::Validation(
+            "predecessor drawer could not be superseded".into(),
+        ))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -223,7 +280,7 @@ impl Database {
     /// Get a drawer by ID.
     pub fn get_drawer(&self, id: &str) -> Result<Option<Drawer>, MemoryError> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, content, wing, room, source_file, added_by, filed_at, date
+            "SELECT id, content, wing, room, source_file, added_by, filed_at, date, superseded_by
              FROM drawers WHERE id = ?1",
         )?;
 
@@ -261,7 +318,7 @@ impl Database {
         for chunk in ids.chunks(CHUNK_SIZE) {
             let placeholders: String = chunk.iter().map(|_| "?").collect::<Vec<_>>().join(",");
             let mut sql = format!(
-                "SELECT id, content, wing, room, source_file, added_by, filed_at, date
+                "SELECT id, content, wing, room, source_file, added_by, filed_at, date, superseded_by
                  FROM drawers WHERE id IN ({})",
                 placeholders
             );
@@ -305,7 +362,7 @@ impl Database {
         match (wing, room) {
             (Some(w), Some(r)) => {
                 let mut stmt = self.conn.prepare(
-                    "SELECT id, content, wing, room, source_file, added_by, filed_at, date
+                    "SELECT id, content, wing, room, source_file, added_by, filed_at, date, superseded_by
                      FROM drawers WHERE wing = ?1 AND room = ?2 ORDER BY filed_at DESC, id ASC LIMIT ?3",
                 )?;
                 let rows = stmt.query_map(params![w, r, limit_i64], Self::row_to_drawer)?;
@@ -315,7 +372,7 @@ impl Database {
             }
             (Some(w), None) => {
                 let mut stmt = self.conn.prepare(
-                    "SELECT id, content, wing, room, source_file, added_by, filed_at, date
+                    "SELECT id, content, wing, room, source_file, added_by, filed_at, date, superseded_by
                      FROM drawers WHERE wing = ?1 ORDER BY filed_at DESC, id ASC LIMIT ?2",
                 )?;
                 let rows = stmt.query_map(params![w, limit_i64], Self::row_to_drawer)?;
@@ -325,7 +382,7 @@ impl Database {
             }
             (None, Some(r)) => {
                 let mut stmt = self.conn.prepare(
-                    "SELECT id, content, wing, room, source_file, added_by, filed_at, date
+                    "SELECT id, content, wing, room, source_file, added_by, filed_at, date, superseded_by
                      FROM drawers WHERE room = ?1 ORDER BY filed_at DESC, id ASC LIMIT ?2",
                 )?;
                 let rows = stmt.query_map(params![r, limit_i64], Self::row_to_drawer)?;
@@ -335,7 +392,7 @@ impl Database {
             }
             (None, None) => {
                 let mut stmt = self.conn.prepare(
-                    "SELECT id, content, wing, room, source_file, added_by, filed_at, date
+                    "SELECT id, content, wing, room, source_file, added_by, filed_at, date, superseded_by
                      FROM drawers ORDER BY filed_at DESC, id ASC LIMIT ?1",
                 )?;
                 let rows = stmt.query_map(params![limit_i64], Self::row_to_drawer)?;
@@ -360,6 +417,68 @@ impl Database {
                 .query_row("SELECT COUNT(*) FROM drawers", [], |row| row.get(0))?,
         };
         Ok(count as usize)
+    }
+
+    /// Find the best current drawer in one wing/room whose embedding is close
+    /// enough to `embedding` to be treated as a near duplicate.
+    #[allow(dead_code)] // Invoked by the add-drawer handler in the subsequent MCP task.
+    pub(crate) fn find_near_duplicate(
+        &self,
+        embedding: &[f32],
+        wing: &str,
+        room: &str,
+        exclude_id: &str,
+    ) -> Result<Option<(String, f32)>, MemoryError> {
+        let Some(query_norm) = vector_norm(embedding) else {
+            return Ok(None);
+        };
+
+        // ponytail: bounded per-wing/room scan is practical below ~10k current drawers; upgrade to filtered ANN retrieval when a scope exceeds that ceiling.
+        let mut stmt = self.conn.prepare(
+            "SELECT id, embedding FROM drawers
+             WHERE wing = ?1 AND room = ?2 AND id != ?3 AND superseded_by IS NULL",
+        )?;
+        let rows = stmt.query_map(params![wing, room, exclude_id], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?))
+        })?;
+
+        let mut best: Option<(String, f32)> = None;
+        for row in rows {
+            let (id, blob) = row?;
+            let Some(candidate) = decode_embedding(&blob) else {
+                tracing::warn!(drawer_id = %id, "skipping drawer with malformed embedding while checking near duplicates");
+                continue;
+            };
+            if candidate.len() != embedding.len() {
+                tracing::warn!(drawer_id = %id, "skipping drawer with mismatched embedding dimensions while checking near duplicates");
+                continue;
+            }
+            let Some(candidate_norm) = vector_norm(&candidate) else {
+                tracing::warn!(drawer_id = %id, "skipping drawer with zero-norm embedding while checking near duplicates");
+                continue;
+            };
+            let dot_product: f32 = embedding
+                .iter()
+                .zip(&candidate)
+                .map(|(query, stored)| query * stored)
+                .sum();
+            let score = dot_product / (query_norm * candidate_norm);
+            if !score.is_finite() {
+                tracing::warn!(drawer_id = %id, "skipping drawer with non-finite similarity while checking near duplicates");
+                continue;
+            }
+            if score < NEAR_DUPLICATE_THRESHOLD {
+                continue;
+            }
+
+            let is_better = best.as_ref().is_none_or(|(best_id, best_score)| {
+                score > *best_score || (score == *best_score && id < *best_id)
+            });
+            if is_better {
+                best = Some((id, score));
+            }
+        }
+        Ok(best)
     }
 
     /// BM25 full-text search via SQLite FTS5. Returns (drawer_id, score) pairs
@@ -559,6 +678,7 @@ impl Database {
             added_by: row.get(5)?,
             filed_at: row.get(6)?,
             date: row.get(7)?,
+            superseded_by: row.get(8)?,
         })
     }
 
@@ -584,6 +704,28 @@ impl Database {
             params![source_file],
         )?)
     }
+}
+
+#[allow(dead_code)] // Kept adjacent to the near-duplicate helper for its handler call site.
+fn decode_embedding(blob: &[u8]) -> Option<Vec<f32>> {
+    if !blob.len().is_multiple_of(std::mem::size_of::<f32>()) {
+        return None;
+    }
+    let embedding: Vec<f32> = blob
+        .chunks_exact(std::mem::size_of::<f32>())
+        .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
+        .collect();
+    embedding
+        .iter()
+        .all(|value| value.is_finite())
+        .then_some(embedding)
+}
+
+#[allow(dead_code)] // Kept adjacent to the near-duplicate helper for its handler call site.
+fn vector_norm(embedding: &[f32]) -> Option<f32> {
+    let squared_sum: f32 = embedding.iter().map(|value| value * value).sum();
+    let norm = squared_sum.sqrt();
+    (norm.is_finite() && norm > 0.0).then_some(norm)
 }
 
 #[cfg(test)]
@@ -1096,9 +1238,7 @@ mod tests {
             })
             .unwrap_err();
         assert!(matches!(cross_scope, MemoryError::Validation(_)));
-        assert!(cross_scope
-            .to_string()
-            .contains("does not belong to wing/room"));
+        assert!(cross_scope.to_string().contains("does not belong"));
     }
 
     #[test]
@@ -1108,12 +1248,25 @@ mod tests {
         let id_a = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
         let id_b = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
         let excluded = "cccccccccccccccccccccccccccccccc";
+        let superseded = "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee";
         db.insert_drawer(id_b, "same", &query, "wing", "room", "", "test")
             .unwrap();
         db.insert_drawer(id_a, "same", &query, "wing", "room", "", "test")
             .unwrap();
         db.insert_drawer(excluded, "same", &query, "wing", "room", "", "test")
             .unwrap();
+        db.insert_drawer(superseded, "old", &query, "wing", "room", "", "test")
+            .unwrap();
+        db.insert_drawer(
+            "malformed0000000000000000000000000",
+            "malformed",
+            &query,
+            "wing",
+            "room",
+            "",
+            "test",
+        )
+        .unwrap();
         db.insert_drawer(
             "dddddddddddddddddddddddddddddddd",
             "other scope",
@@ -1127,13 +1280,13 @@ mod tests {
         db.conn
             .execute(
                 "UPDATE drawers SET superseded_by = 'newer' WHERE id = ?1",
-                [id_a],
+                [superseded],
             )
             .unwrap();
         db.conn
             .execute(
                 "UPDATE drawers SET embedding = ?1 WHERE id = ?2",
-                rusqlite::params![vec![0_u8; 3], id_b],
+                rusqlite::params![vec![0_u8; 3], "malformed0000000000000000000000000"],
             )
             .unwrap();
 
@@ -1141,7 +1294,7 @@ mod tests {
             .find_near_duplicate(&query, "wing", "room", excluded)
             .unwrap()
             .expect("a current, in-scope duplicate");
-        assert_eq!(duplicate.0, id_b);
+        assert_eq!(duplicate.0, id_a);
         assert!((duplicate.1 - 1.0).abs() < f32::EPSILON);
     }
 

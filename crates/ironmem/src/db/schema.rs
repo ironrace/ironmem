@@ -28,11 +28,12 @@ const COLLAB_RECOVERY_STATE_SQL: &str =
     include_str!("../../migrations/015_collab_recovery_state.sql");
 const COLLAB_MESSAGE_DRAWERS_SQL: &str =
     include_str!("../../migrations/016_collab_message_drawers.sql");
+const DRAWER_SUPERSESSION_SQL: &str = include_str!("../../migrations/017_drawer_supersession.sql");
 
 /// Highest schema version a fully-migrated database reports. Bump alongside the
 /// `run_version_gated_migrations` ladder below so `ironmem doctor` can tell a
 /// behind-migration database from an up-to-date one.
-pub const LATEST_SCHEMA_VERSION: i64 = 16;
+pub const LATEST_SCHEMA_VERSION: i64 = 17;
 
 /// Database wrapper around a SQLite connection.
 ///
@@ -284,6 +285,13 @@ impl Database {
         // migration; new queue writes always provide a drawer id.
         if current_version < 16 {
             self.conn.execute_batch(COLLAB_MESSAGE_DRAWERS_SQL)?;
+        }
+
+        // v17: durable drawer supersession lineage. NULL preserves every
+        // existing drawer as current, while a partial wing/room index supports
+        // current-only supersession and duplicate checks.
+        if current_version < 17 {
+            self.conn.execute_batch(DRAWER_SUPERSESSION_SQL)?;
         }
 
         Ok(())

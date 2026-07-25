@@ -99,6 +99,7 @@ mod tests {
                 added_by: String::new(),
                 filed_at: String::new(),
                 date: String::new(),
+                superseded_by: None,
             },
             score,
         }

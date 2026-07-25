@@ -24,6 +24,7 @@ fn make(content: &str, score: f32) -> ScoredDrawer {
             added_by: "".into(),
             filed_at: "".into(),
             date: "".into(),
+            superseded_by: None,
         },
         score,
     }

@@ -680,6 +680,7 @@ mod tests {
                 added_by: "t".into(),
                 filed_at: "2026-01-01T00:00:00Z".into(),
                 date: "2026-01-01".into(),
+                superseded_by: None,
             },
             score: 1.0,
         }
