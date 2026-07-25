@@ -1043,9 +1043,10 @@ async fn dispatch_wait_my_turn(
         .cloned()
         .unwrap_or(serde_json::json!({}));
 
-    if let Err(error) = tokio::task::block_in_place(|| tools::wait_my_turn_begin(app, &args)) {
-        return tool_error_response(request.id.clone(), tool_name, error);
-    }
+    let baseline = match tokio::task::block_in_place(|| tools::wait_my_turn_begin(app, &args)) {
+        Ok(baseline) => baseline,
+        Err(error) => return tool_error_response(request.id.clone(), tool_name, error),
+    };
     let claim_committed_at = tools::ClaimCommittedAt(std::time::Instant::now());
     let deadline =
         tools::wait_my_turn_deadline(tools::ArrivedAt(arrived_at), claim_committed_at, &args);
@@ -1055,7 +1056,7 @@ async fn dispatch_wait_my_turn(
     }
 
     loop {
-        match tokio::task::block_in_place(|| tools::wait_my_turn_poll(app, &args)) {
+        match tokio::task::block_in_place(|| tools::wait_my_turn_poll(app, &args, &baseline)) {
             Err(error) => return tool_error_response(request.id.clone(), tool_name, error),
             Ok((body, settled)) => {
                 if settled {

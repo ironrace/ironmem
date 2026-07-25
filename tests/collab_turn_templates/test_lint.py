@@ -102,6 +102,10 @@ def test_codex_background_dispatcher_uses_quiet_settled_waits():
     assert "On each iteration:" not in dispatcher
     assert "Call `mcp__ironmem__collab_status(session_id)` to detect phase advance." not in dispatcher
     assert "[codex bg] <last stdout line>" not in dispatcher
+    assert "no state transition" not in docs
+    assert "no state transition" not in dispatcher
+    assert "Every time a poll observes a new phase" not in docs
+    assert "polling loop exits" not in dispatcher
 
 
 def test_lint_catches_unknown_placeholder(tmp_path):
