@@ -344,7 +344,7 @@ pub fn search(
     // Cheap when no synthetic hit is in `scored` (single partition pass + early
     // return). Always-on by structural check; the only way a synth hit reaches
     // here is if pref-enrichment was enabled at ingest time.
-    collapse_synthetic_into_parents(app, &mut scored)?;
+    collapse_synthetic_into_parents(app, &mut scored, filters)?;
 
     // Step 8: Lexical shrinkage rerank (mempalace hybrid-v5 port)
     // Default ON; disable with IRONMEM_SHRINKAGE_RERANK=0 for eval comparisons.
@@ -549,6 +549,8 @@ fn rrf_scores_map_weighted<'a>(
 /// synth to disappear from the candidate list. If the parent is missing from
 /// `candidates` (because it didn't make HNSW top-N) but the synth did, fetch
 /// the parent by id and surface it with the synth's score; drop the synth.
+/// The fetch honors `include_superseded`, so a surviving synthetic sibling
+/// cannot restore an otherwise-hidden historical parent during normal search.
 /// If the parent has been deleted from the DB, drop the synth quietly.
 ///
 /// This runs *before* the rerank stages so all downstream scoring sees only
@@ -556,6 +558,7 @@ fn rrf_scores_map_weighted<'a>(
 pub fn collapse_synthetic_into_parents(
     app: &App,
     candidates: &mut Vec<ScoredDrawer>,
+    filters: &SearchFilters,
 ) -> Result<(), MemoryError> {
     // Partition: (synth, real). Both keep insertion order to keep the ordering
     // step downstream deterministic.
@@ -608,7 +611,9 @@ pub fn collapse_synthetic_into_parents(
 
     if !orphan_parent_ids.is_empty() {
         let id_refs: Vec<&str> = orphan_parent_ids.iter().map(|s| s.as_str()).collect();
-        let fetched = app.db.get_drawers_by_ids(&id_refs)?;
+        let fetched =
+            app.db
+                .get_drawers_by_ids_filtered(&id_refs, None, None, filters.include_superseded)?;
         for pid in &orphan_parent_ids {
             if let Some(parent) = fetched.get(pid) {
                 let score = orphan_scores.get(pid).copied().unwrap_or(0.0);

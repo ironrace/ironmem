@@ -44,7 +44,7 @@ pub fn tool_definitions(app: &App) -> Vec<Value> {
     let tools = vec![
         json!({
             "name": "status",
-            "description": "Memory, graph, and metrics overview. task-tag fields scope non-collab metrics.",
+            "description": "Memory, graph, and metrics overview.",
             "inputSchema": { "type": "object", "properties": {
                 "set_task_tag": { "type": "string", "description": "Process-local metrics task tag; active collab takes priority." },
                 "clear_task_tag": { "type": "boolean", "description": "Clear the explicit metrics task tag" }
@@ -67,7 +67,8 @@ pub fn tool_definitions(app: &App) -> Vec<Value> {
                     },
                     "include_superseded": {
                         "type": "boolean",
-                        "default": false
+                        "default": false,
+                        "description": "false hides retained superseded history; true includes it."
                     }
                 },
                 "required": ["query"]
@@ -88,7 +89,7 @@ pub fn tool_definitions(app: &App) -> Vec<Value> {
                     },
                     "supersedes": {
                         "type": "string",
-                        "description": "Current predecessor, retained history retrievable by ID."
+                        "description": "Retained; retrievable by ID."
                     }
                 },
                 "required": ["content", "wing"]
@@ -1148,6 +1149,13 @@ mod tests {
         let include_superseded = &search["inputSchema"]["properties"]["include_superseded"];
         assert_eq!(include_superseded["type"], "boolean");
         assert_eq!(include_superseded["default"], false);
+        let include_superseded_description = include_superseded["description"]
+            .as_str()
+            .expect("include_superseded property needs a description");
+        assert!(include_superseded_description.contains("false"));
+        assert!(include_superseded_description.contains("superseded"));
+        assert!(include_superseded_description.contains("history"));
+        assert!(include_superseded_description.contains("true"));
 
         let description = search["description"]
             .as_str()

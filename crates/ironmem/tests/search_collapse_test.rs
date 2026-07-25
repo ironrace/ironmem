@@ -1,6 +1,6 @@
 //! Pipeline-level tests for the synthetic-doc collapse step (step 7.5).
 
-use ironmem::db::ScoredDrawer;
+use ironmem::db::{ScoredDrawer, SearchFilters};
 use ironmem::mcp::app::App;
 use ironmem::mcp::protocol::JsonRpcRequest;
 use ironmem::mcp::server::dispatch;
@@ -24,6 +24,15 @@ fn fixture_drawer(id: &str, content: &str, source_file: &str, score: f32) -> Sco
     }
 }
 
+fn filters(include_superseded: bool) -> SearchFilters {
+    SearchFilters {
+        wing: None,
+        room: None,
+        limit: 10,
+        include_superseded,
+    }
+}
+
 #[test]
 fn synth_above_parent_promotes_parent_score_and_drops_synth() {
     let app = App::open_for_test().expect("build app");
@@ -41,7 +50,7 @@ fn synth_above_parent_promotes_parent_score_and_drops_synth() {
         fixture_drawer(&parent_id, "parent body", "", 0.4),
     ];
 
-    collapse_synthetic_into_parents(&app, &mut scored).unwrap();
+    collapse_synthetic_into_parents(&app, &mut scored, &filters(false)).unwrap();
 
     // Synth dropped; parent remains with the elevated score.
     assert_eq!(scored.len(), 1);
@@ -65,7 +74,7 @@ fn parent_above_synth_keeps_parent_unchanged_and_drops_synth() {
         ),
     ];
 
-    collapse_synthetic_into_parents(&app, &mut scored).unwrap();
+    collapse_synthetic_into_parents(&app, &mut scored, &filters(false)).unwrap();
 
     assert_eq!(scored.len(), 1);
     assert_eq!(scored[0].drawer.id, parent_id);
@@ -102,7 +111,7 @@ fn orphan_synth_fetches_missing_parent_when_present_in_db() {
         0.8,
     )];
 
-    collapse_synthetic_into_parents(&app, &mut scored).unwrap();
+    collapse_synthetic_into_parents(&app, &mut scored, &filters(false)).unwrap();
 
     // Synth dropped; parent surfaced from DB with synth's score.
     assert_eq!(scored.len(), 1);
@@ -124,9 +133,69 @@ fn orphan_synth_with_deleted_parent_drops_quietly() {
         0.6,
     )];
 
-    collapse_synthetic_into_parents(&app, &mut scored).unwrap();
+    collapse_synthetic_into_parents(&app, &mut scored, &filters(false)).unwrap();
 
     assert!(scored.is_empty(), "orphan synth without parent must drop");
+}
+
+#[test]
+fn orphan_synth_does_not_resurrect_a_superseded_parent_without_history_opt_in() {
+    let app = App::open_for_test().expect("build app");
+    let zero_vec: Vec<f32> = vec![0.0; 384];
+    let synth_id = "b".repeat(32);
+    let predecessor = call(
+        &app,
+        "add_drawer",
+        json!({"content": "old parent", "wing": "wing", "room": "room"}),
+    );
+    let parent_id = predecessor["id"]
+        .as_str()
+        .expect("predecessor id")
+        .to_owned();
+    let successor = call(
+        &app,
+        "add_drawer",
+        json!({
+            "content": "current replacement",
+            "wing": "wing",
+            "room": "room",
+            "supersedes": parent_id,
+        }),
+    );
+    assert!(successor["id"].is_string(), "successor must be stored");
+    app.db
+        .insert_drawer(
+            &synth_id,
+            "User has mentioned: old parent",
+            &zero_vec,
+            "wing",
+            "room",
+            &format!("pref:{parent_id}"),
+            "test",
+        )
+        .unwrap();
+
+    let mut default_scored = vec![fixture_drawer(
+        &synth_id,
+        "User has mentioned: old parent",
+        &format!("pref:{parent_id}"),
+        0.8,
+    )];
+    collapse_synthetic_into_parents(&app, &mut default_scored, &filters(false)).unwrap();
+    assert!(
+        default_scored.is_empty(),
+        "default search must not restore a superseded parent through a surviving synth"
+    );
+
+    let mut history_scored = vec![fixture_drawer(
+        &synth_id,
+        "User has mentioned: old parent",
+        &format!("pref:{parent_id}"),
+        0.8,
+    )];
+    collapse_synthetic_into_parents(&app, &mut history_scored, &filters(true)).unwrap();
+    assert_eq!(history_scored.len(), 1);
+    assert_eq!(history_scored[0].drawer.id, parent_id);
 }
 
 fn request(method: &str, params: Value) -> JsonRpcRequest {
