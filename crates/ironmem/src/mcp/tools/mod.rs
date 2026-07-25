@@ -422,7 +422,7 @@ pub fn tool_definitions(app: &App) -> Vec<Value> {
         }),
         json!({
             "name": "collab_wait_my_turn",
-            "description": "Long-poll: block until current_owner == agent or the timeout elapses. Returns {is_my_turn, phase, current_owner, session_ended}. Default timeout 30s, max 60s.",
+            "description": "Long-poll until the agent's turn or a post-claim phase, owner, terminal, ended, or recovery-state change. Timeout returns {unchanged:true}; otherwise returns {is_my_turn, phase, current_owner, session_ended}. Default 30s, max 60s.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -961,7 +961,7 @@ pub(crate) const WAIT_MY_TURN_POLL_INTERVAL: std::time::Duration =
 
 /// Distinct wrappers for the two `Instant`s `wait_my_turn_deadline` consumes,
 /// so the adjacent same-typed arguments cannot be swapped silently.
-pub(crate) use collab_session::{ArrivedAt, ClaimCommittedAt};
+pub(crate) use collab_session::{ArrivedAt, ClaimCommittedAt, WaitTurnBaseline};
 
 /// Deadline for the `collab_wait_my_turn` poll loop — see
 /// [`collab_session::wait_my_turn_deadline`].
@@ -979,15 +979,19 @@ pub(crate) fn wait_my_turn_deadline(
 /// Carries the mode gating that `call_tool` would otherwise apply: the async
 /// long-poll path in `server` bypasses `call_tool`, so without this a
 /// `handoff_token` claim would skip read-only enforcement entirely.
-pub(crate) fn wait_my_turn_begin(app: &App, args: &Value) -> Result<(), MemoryError> {
+pub(crate) fn wait_my_turn_begin(app: &App, args: &Value) -> Result<WaitTurnBaseline, MemoryError> {
     ensure_tool_allowed(app, "collab_wait_my_turn", args)?;
     collab_session::wait_my_turn_begin(app, args)
 }
 
 /// One non-blocking `collab_wait_my_turn` snapshot — see
 /// [`collab_session::wait_my_turn_poll`].
-pub(crate) fn wait_my_turn_poll(app: &App, args: &Value) -> Result<(Value, bool), MemoryError> {
-    collab_session::wait_my_turn_poll(app, args)
+pub(crate) fn wait_my_turn_poll(
+    app: &App,
+    args: &Value,
+    baseline: &WaitTurnBaseline,
+) -> Result<(Value, bool), MemoryError> {
+    collab_session::wait_my_turn_poll(app, args, baseline)
 }
 
 /// Mode gating for a call whose arguments are known. `tool_allowed_in_mode` is

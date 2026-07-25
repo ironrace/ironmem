@@ -1043,9 +1043,10 @@ async fn dispatch_wait_my_turn(
         .cloned()
         .unwrap_or(serde_json::json!({}));
 
-    if let Err(error) = tokio::task::block_in_place(|| tools::wait_my_turn_begin(app, &args)) {
-        return tool_error_response(request.id.clone(), tool_name, error);
-    }
+    let baseline = match tokio::task::block_in_place(|| tools::wait_my_turn_begin(app, &args)) {
+        Ok(baseline) => baseline,
+        Err(error) => return tool_error_response(request.id.clone(), tool_name, error),
+    };
     let claim_committed_at = tools::ClaimCommittedAt(std::time::Instant::now());
     let deadline =
         tools::wait_my_turn_deadline(tools::ArrivedAt(arrived_at), claim_committed_at, &args);
@@ -1055,11 +1056,17 @@ async fn dispatch_wait_my_turn(
     }
 
     loop {
-        match tokio::task::block_in_place(|| tools::wait_my_turn_poll(app, &args)) {
+        match tokio::task::block_in_place(|| tools::wait_my_turn_poll(app, &args, &baseline)) {
             Err(error) => return tool_error_response(request.id.clone(), tool_name, error),
             Ok((body, settled)) => {
-                if settled || std::time::Instant::now() >= deadline {
+                if settled {
                     return tool_success_response(request.id.clone(), &body);
+                }
+                if std::time::Instant::now() >= deadline {
+                    return tool_success_response(
+                        request.id.clone(),
+                        &serde_json::json!({ "unchanged": true }),
+                    );
                 }
             }
         }
@@ -2808,7 +2815,41 @@ mod tests {
                     .expect("successful wait response must contain JSON text"),
             )
             .expect("wait response text must be valid JSON");
-            assert_eq!(body["is_my_turn"], json!(true), "got {body:?}");
+            assert_eq!(
+                body,
+                json!({
+                    "is_my_turn": true,
+                    "phase": "PlanParallelDrafts",
+                    "current_owner": "codex",
+                    "session_ended": false,
+                }),
+                "got {body:?}"
+            );
+        }
+    }
+
+    /// An other-owned `collab_wait_my_turn` that remains unsettled through its
+    /// timeout returns only the compact unchanged frame through the production
+    /// framing loop; settled waits above continue to return their full status.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn framing_loop_compacts_an_unsettled_wait_timeout() {
+        for mode in [TransportMode::Stdio, TransportMode::DaemonConnection] {
+            #[allow(clippy::arc_with_non_send_sync)]
+            let app = Arc::new(App::open_for_test().unwrap());
+            let (session_id, token) = wait_session_and_token(&app);
+            let request = wait_request(1, &session_id, &token, 1);
+
+            let responses =
+                collect_responses(&app, mode, &[request], 1, Duration::from_secs(2)).await;
+
+            assert_eq!(responses[0]["id"], json!(1));
+            let body: serde_json::Value = serde_json::from_str(
+                responses[0]["result"]["content"][0]["text"]
+                    .as_str()
+                    .expect("successful wait response must contain JSON text"),
+            )
+            .expect("wait response text must be valid JSON");
+            assert_eq!(body, json!({"unchanged": true}), "got {body:?}");
         }
     }
 
@@ -3543,10 +3584,10 @@ mod tests {
 
         let body = wait_response_body(&response);
         assert_eq!(
-            body["is_my_turn"],
-            json!(false),
-            "the turn was never flipped, so the wait must settle as \"not my turn\" \
-             once its deadline expires; got {body:?}"
+            body,
+            json!({ "unchanged": true }),
+            "the turn was never flipped, so the deadline must return the compact unchanged \
+             frame; got {body:?}"
         );
     }
 
@@ -3619,7 +3660,7 @@ mod tests {
              its {timeout_secs}s timeout actually elapses; got {ids:?}"
         );
 
-        // The wait itself must still report its own honest, unsettled
+        // The wait itself must still report its compact, unsettled timeout
         // outcome — early release frees the BARRIER, not the wait's own
         // answer.
         let wait_text = responses[2]["result"]["content"][0]["text"]
@@ -3627,10 +3668,10 @@ mod tests {
             .expect("wait response must carry content[0].text");
         let wait_body: serde_json::Value = serde_json::from_str(wait_text).unwrap();
         assert_eq!(
-            wait_body["is_my_turn"],
-            json!(false),
-            "the turn was never flipped, so the wait must settle as \"not my \
-             turn\" once its own deadline expires; got {wait_body:?}"
+            wait_body,
+            json!({ "unchanged": true }),
+            "the turn was never flipped, so its deadline must return the compact unchanged \
+             frame; got {wait_body:?}"
         );
     }
 

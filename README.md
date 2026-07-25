@@ -635,7 +635,7 @@ AI agents can query the graph without a shell.
 - Workspace mining and incremental re-mining are implemented
 - Codex and Claude Code plugin packaging is included, including bundled collab skill dependencies
 - `~/.ironrace/bin/ironmem` is the preferred installed binary location; plugin launch scripts check there first
-- Bounded Claude↔Codex collaboration protocol (v1 planning + v3 coding) is available via the `collab_*` MCP tools, including long-poll `wait_my_turn` for autonomous operation — see [docs/COLLAB.md](docs/COLLAB.md)
+- Bounded Claude↔Codex collaboration protocol (v1 planning + v3 coding) is available via the `collab_*` MCP tools. Long-poll `wait_my_turn` wakes on actionable state changes and returns compact `{"unchanged": true}` only after an idle timeout — see [docs/COLLAB.md](docs/COLLAB.md)
 - **Shared daemon mode** (`serve --listen`/`--connect`) lets many clients share one `App`/DB/embedding-model behind a Unix socket, with automatic single-flight spawn-on-demand and idle self-shutdown — see [Shared Daemon Mode](#shared-daemon-mode). Bare `serve` is unchanged and remains the always-available fallback.
 - **Grok and Gemini CLI** are registered harnesses (`ironmem grok`/`ironmem gemini`, `harness_grok`/`harness_gemini` in `doctor`) but are scaffolding: neither is a default `write-rules` target yet, and Grok's MCP config convention is a best-effort default rather than a confirmed one — see [First run: one-command launchers](#first-run-one-command-launchers)
 

@@ -58,8 +58,8 @@ def test_codex_dispatch_uses_explicit_repository_model_defaults():
     agents = (ROOT / "AGENTS.md").read_text()
 
     for surface in (docs, dispatcher, plan_draft_prompt, plan_review_prompt,
-                    global_review_prompt, recovery_prompt, batch_prompt, tools,
-                    source_tools, agents):
+                    global_review_prompt, recovery_prompt, batch_prompt, tools, source_tools,
+                    agents):
         assert "gpt-5.6-luna" in surface
         assert "gpt-5.6-terra" in surface
         assert "gpt-5.6-sol" in surface
@@ -84,6 +84,27 @@ def test_lint_requires_logical_keyed_checkpoint_contract(tmp_path):
 
     assert r.returncode == 1
     assert "missing checkpoint contract 'collab-checkpoint:<session_id>'" in r.stdout
+
+
+def test_codex_background_dispatcher_uses_quiet_settled_waits():
+    docs = (ROOT / "docs" / "COLLAB.md").read_text()
+    dispatcher = (ROOT / ".claude-plugin" / "commands" / "collab.md").read_text()
+
+    for surface in (docs, dispatcher):
+        assert 'collab_wait_my_turn(session_id, "claude", 60)' in surface
+        assert '{"unchanged": true}' in surface
+        assert "consecutive-duplicate collapsing" in surface
+        assert "settled full frame" in surface
+        assert "actionable post-claim session-state change" in surface
+        assert "recovery-state changes" in surface
+
+    assert "On each iteration:" not in dispatcher
+    assert "Call `mcp__ironmem__collab_status(session_id)` to detect phase advance." not in dispatcher
+    assert "[codex bg] <last stdout line>" not in dispatcher
+    assert "no state transition" not in docs
+    assert "no state transition" not in dispatcher
+    assert "Every time a poll observes a new phase" not in docs
+    assert "polling loop exits" not in dispatcher
 
 
 def test_lint_catches_unknown_placeholder(tmp_path):

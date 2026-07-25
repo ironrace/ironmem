@@ -259,6 +259,32 @@ const WAIT_MY_TURN_DEFAULT_TIMEOUT_SECS: u64 = 30;
 /// Hard cap on `timeout_secs` — clients that want longer should re-poll.
 const WAIT_MY_TURN_MAX_TIMEOUT_SECS: u64 = 60;
 
+/// Actionable state captured after a wait's handoff/generation claim commits.
+///
+/// A later change to any field here settles the wait even when the requested
+/// agent does not own the new phase. In particular, a Codex-owned
+/// `CodeImplementPending` can advance to Codex-owned
+/// `CodeReviewFixGlobalPending`; Claude must wake to dispatch the next prompt
+/// rather than incorrectly treating the prior process's normal exit as a
+/// silent failure. Recovery data is included because it changes how Claude
+/// routes a delegated completion even when a phase remains parked.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct WaitTurnBaseline {
+    phase: String,
+    current_owner: String,
+    ended: bool,
+    phase_is_terminal: bool,
+    implementer: String,
+    coding_failure: Option<String>,
+    pending_failure: Option<String>,
+    failed_from_phase: Option<String>,
+    recovery_phase: Option<String>,
+    recovery_owner: Option<String>,
+    recovery_origin_owner: Option<String>,
+    recovery_attempts: u8,
+    total_recovery_attempts: u8,
+}
+
 /// Snapshot of session state read by `wait_my_turn` on each poll tick. Taken
 /// in one `load_session_record` call so `task_list_submitted` and `phase` are
 /// always from the same row — a concurrent `collab_send(task_list)` commit
@@ -266,11 +292,8 @@ const WAIT_MY_TURN_MAX_TIMEOUT_SECS: u64 = 60;
 /// decision. The returned status is stale-but-consistent: the next tick picks
 /// up the new phase.
 struct WaitTurnSnapshot {
+    baseline: WaitTurnBaseline,
     is_my_turn: bool,
-    phase: String,
-    current_owner: String,
-    ended: bool,
-    phase_is_terminal: bool,
 }
 
 fn wait_turn_snapshot(record: &SessionRecord, agent: Agent) -> WaitTurnSnapshot {
@@ -288,11 +311,28 @@ fn wait_turn_snapshot(record: &SessionRecord, agent: Agent) -> WaitTurnSnapshot 
     };
     let is_my_turn = !ended && !phase_is_terminal && record.session.current_owner == agent;
     WaitTurnSnapshot {
+        baseline: WaitTurnBaseline {
+            phase: record.session.phase.to_string(),
+            current_owner: record.session.current_owner.to_string(),
+            ended,
+            phase_is_terminal,
+            implementer: record.session.implementer.to_string(),
+            coding_failure: record.session.coding_failure.clone(),
+            pending_failure: record.session.pending_failure.clone(),
+            failed_from_phase: record
+                .session
+                .failed_from_phase
+                .map(|phase| phase.to_string()),
+            recovery_phase: record.session.recovery_phase.map(|phase| phase.to_string()),
+            recovery_owner: record.session.recovery_owner.map(|agent| agent.to_string()),
+            recovery_origin_owner: record
+                .session
+                .recovery_origin_owner
+                .map(|agent| agent.to_string()),
+            recovery_attempts: record.session.recovery_attempts,
+            total_recovery_attempts: record.session.total_recovery_attempts,
+        },
         is_my_turn,
-        phase: record.session.phase.to_string(),
-        current_owner: record.session.current_owner.to_string(),
-        ended,
-        phase_is_terminal,
     }
 }
 
@@ -1253,12 +1293,33 @@ pub(super) fn wait_my_turn_deadline(
     arrival_deadline.max(floor_deadline)
 }
 
-/// Validate the arguments and settle the generation, once, before any polling.
+/// Claim the generation and capture the matching wait baseline in one
+/// transaction.
 ///
-/// Run in its own transaction ahead of the loop: the loop makes no collab-state
-/// write that must be atomic with the claim, and a token claim commits
-/// unconditionally before polling begins, so the process cache update is
-/// correct even if the session snapshot is read later on a separate connection.
+/// A handoff claim is a write, so separating it from the baseline read would
+/// admit a committed phase/owner/recovery transition into the baseline and
+/// silently miss the wake it should cause. Reading the session record through
+/// the same transaction gives a transactionally consistent post-claim point.
+fn wait_my_turn_claim_and_capture_baseline(
+    app: &App,
+    tx: &rusqlite::Transaction<'_>,
+    session_id: &str,
+    agent: Agent,
+    args: &Value,
+) -> Result<WaitTurnBaseline, MemoryError> {
+    super::handoff::ensure_actor_generation_current(
+        app,
+        tx,
+        session_id,
+        agent,
+        super::handoff::opt_handoff_token(args).as_deref(),
+    )?;
+    let record = crate::collab::queue::load_session_record(tx, session_id)?;
+    Ok(wait_turn_snapshot(&record, agent).baseline)
+}
+
+/// Validate the arguments, settle the generation, and capture one baseline
+/// before any polling.
 ///
 /// Split out of the handler so the claim happens exactly ONCE per request even
 /// when the polling is driven from outside — claiming on every poll would try
@@ -1273,28 +1334,22 @@ pub(super) fn wait_my_turn_deadline(
 /// later-queued request had legitimately bound it to B — producing spurious
 /// "another active collab session is already bound to this MCP process"
 /// refusals.
-pub(super) fn wait_my_turn_begin(app: &App, args: &Value) -> Result<(), MemoryError> {
+pub(super) fn wait_my_turn_begin(app: &App, args: &Value) -> Result<WaitTurnBaseline, MemoryError> {
     let session_id = require_str(args, "session_id")?;
     ensure_no_conflicting_process_session(app, session_id)?;
     let agent = require_agent(require_str(args, "agent")?)?;
 
-    app.db.with_transaction(|tx| {
-        super::handoff::ensure_actor_generation_current(
-            app,
-            tx,
-            session_id,
-            agent,
-            super::handoff::opt_handoff_token(args).as_deref(),
-        )
+    let baseline = app.db.with_transaction(|tx| {
+        wait_my_turn_claim_and_capture_baseline(app, tx, session_id, agent, args)
     })?;
 
     app.set_active_collab_session(session_id);
-    Ok(())
+    Ok(baseline)
 }
 
 /// One snapshot read. Returns the response body and whether it SETTLES the wait
-/// — my turn, session ended, or a terminal phase — i.e. whether the caller
-/// should stop polling before the deadline.
+/// — a baseline state change, my turn, session ended, or a terminal phase —
+/// i.e. whether the caller should stop polling before the deadline.
 ///
 /// Deliberately free of sleeping and of any write — including the
 /// process-global attribution claim, which belongs to
@@ -1302,20 +1357,27 @@ pub(super) fn wait_my_turn_begin(app: &App, args: &Value) -> Result<(), MemoryEr
 /// long poll from mutating shared state after its barrier was already released,
 /// and lets a caller drive it from an async loop without holding the dispatch
 /// thread across the wait.
-pub(super) fn wait_my_turn_poll(app: &App, args: &Value) -> Result<(Value, bool), MemoryError> {
+pub(super) fn wait_my_turn_poll(
+    app: &App,
+    args: &Value,
+    baseline: &WaitTurnBaseline,
+) -> Result<(Value, bool), MemoryError> {
     let session_id = require_str(args, "session_id")?;
     let agent = require_agent(require_str(args, "agent")?)?;
 
     let record = app.db.collab_load_session_record(session_id)?;
     let snap = wait_turn_snapshot(&record, agent);
-    let settled = snap.is_my_turn || snap.ended || snap.phase_is_terminal;
+    let settled = snap.is_my_turn
+        || snap.baseline.ended
+        || snap.baseline.phase_is_terminal
+        || snap.baseline != *baseline;
 
     Ok((
         json!({
             "is_my_turn": snap.is_my_turn,
-            "phase": snap.phase,
-            "current_owner": snap.current_owner,
-            "session_ended": snap.ended,
+            "phase": snap.baseline.phase,
+            "current_owner": snap.baseline.current_owner,
+            "session_ended": snap.baseline.ended,
         }),
         settled,
     ))
@@ -1329,7 +1391,7 @@ pub(super) fn wait_my_turn_poll(app: &App, args: &Value) -> Result<(Value, bool)
 /// timeout. Kept so the tool still behaves correctly for direct callers.
 pub(super) fn handle_collab_wait_my_turn(app: &App, args: &Value) -> Result<Value, MemoryError> {
     let timeout = wait_my_turn_timeout(args);
-    wait_my_turn_begin(app, args)?;
+    let baseline = wait_my_turn_begin(app, args)?;
 
     // No `wait_my_turn_deadline` call needed here: this function IS the
     // entire request handling for a direct/synchronous caller, so there is no
@@ -1338,9 +1400,12 @@ pub(super) fn handle_collab_wait_my_turn(app: &App, args: &Value) -> Result<Valu
     // which collapses `wait_my_turn_deadline` back to plain `now() + timeout`.
     let deadline = std::time::Instant::now() + timeout;
     loop {
-        let (body, settled) = wait_my_turn_poll(app, args)?;
-        if settled || std::time::Instant::now() >= deadline {
+        let (body, settled) = wait_my_turn_poll(app, args, &baseline)?;
+        if settled {
             return Ok(body);
+        }
+        if std::time::Instant::now() >= deadline {
+            return Ok(json!({ "unchanged": true }));
         }
         std::thread::sleep(WAIT_MY_TURN_POLL_INTERVAL);
     }
@@ -1802,11 +1867,132 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(wait["is_my_turn"], true);
+        assert_eq!(
+            wait,
+            json!({
+                "is_my_turn": true,
+                "phase": "PlanParallelDrafts",
+                "current_owner": "claude",
+                "session_ended": false,
+            })
+        );
         assert_eq!(
             app.active_collab_session_snapshot().as_deref(),
             Some(sid.as_str())
         );
+    }
+
+    #[test]
+    fn wait_my_turn_timeout_returns_a_compact_unchanged_frame() {
+        let app = test_app();
+        let sid = start_session(&app);
+
+        let wait = handle_collab_wait_my_turn(
+            &app,
+            &json!({"session_id": sid, "agent": "codex", "timeout_secs": 1}),
+        )
+        .unwrap();
+
+        assert_eq!(
+            wait,
+            json!({"unchanged": true}),
+            "an other-owned session that remains unsettled through the timeout must return the compact frame"
+        );
+    }
+
+    #[test]
+    fn wait_my_turn_claim_baseline_is_captured_in_the_claim_transaction() {
+        let app = test_app();
+        let sid = start_session(&app);
+        let token = app
+            .db
+            .with_transaction(|tx| {
+                crate::collab::handoff::issue_or_reuse_handoff(tx, &sid, Agent::Codex)
+            })
+            .unwrap()
+            .token;
+        let wait_args = json!({
+            "session_id": sid,
+            "agent": "codex",
+            "handoff_token": token,
+        });
+
+        let baseline = app
+            .db
+            .with_transaction(|tx| {
+                let baseline = wait_my_turn_claim_and_capture_baseline(
+                    &app,
+                    tx,
+                    wait_args["session_id"].as_str().unwrap(),
+                    Agent::Codex,
+                    &wait_args,
+                )?;
+
+                let mut session = crate::collab::queue::load_session(
+                    tx,
+                    wait_args["session_id"].as_str().unwrap(),
+                )?;
+                session.phase = Phase::PlanSynthesisPending;
+                crate::collab::queue::save_session(tx, &session)?;
+                let after = wait_turn_snapshot(
+                    &crate::collab::queue::load_session_record(
+                        tx,
+                        wait_args["session_id"].as_str().unwrap(),
+                    )?,
+                    Agent::Codex,
+                )
+                .baseline;
+
+                assert_ne!(
+                    baseline, after,
+                    "the later transaction mutation must not be folded into the baseline"
+                );
+                Ok(baseline)
+            })
+            .unwrap();
+
+        assert_eq!(baseline.phase, "PlanParallelDrafts");
+        assert_eq!(baseline.current_owner, "claude");
+    }
+
+    #[test]
+    fn wait_my_turn_settles_when_phase_changes_with_the_same_nonwaiting_owner() {
+        let app = test_app();
+        let args = json!({
+            "repo_path": "/tmp/repo",
+            "branch": "main",
+            "initiator": "claude",
+            "task": "same-owner phase wake",
+            "implementer": "codex",
+        });
+        let sid = handle_collab_start(&app, &args).unwrap()["session_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        drive_to_implement(&app, &sid);
+        let wait_args = json!({"session_id": sid, "agent": "claude"});
+
+        let baseline = wait_my_turn_begin(&app, &wait_args).unwrap();
+        let (_, settled_before) = wait_my_turn_poll(&app, &wait_args, &baseline).unwrap();
+        assert!(!settled_before, "Codex still owns CodeImplementPending");
+
+        send(
+            &app,
+            wait_args["session_id"].as_str().unwrap(),
+            "codex",
+            "implementation_done",
+            r#"{"head_sha":"c1"}"#,
+        );
+
+        let (body, settled_after) = wait_my_turn_poll(&app, &wait_args, &baseline).unwrap();
+        assert!(
+            settled_after,
+            "a same-owner phase transition must wake Claude"
+        );
+        assert_eq!(body["is_my_turn"], json!(false));
+        assert_eq!(body["phase"], json!("CodeReviewFixGlobalPending"));
+        assert_eq!(body["current_owner"], json!("codex"));
+        assert_eq!(body["session_ended"], json!(false));
     }
 
     // ── wait_my_turn_deadline ──────────────────────────────────────────────────

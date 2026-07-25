@@ -341,7 +341,7 @@ session's current `implementer` field:
   `codex` is not on PATH). Codex runs its own
   `subagent-driven-development` (controller-owned loop, runs to
   completion) and emits `implementation_done` itself before the
-  bg-exec polling loop detects phase advance.
+  bg-exec settled wait wakes on the phase advance.
 
 In both modes the server stores the `task_list` manifest as an audit
 artifact but does not iterate it. Per-task progress is observable through
@@ -1001,16 +1001,21 @@ match the stored `canonical_plan_hash`.
 
 ### `collab_wait_my_turn` (long-poll)
 
-Blocks server-side until the caller is the owner, the session ends, the
-phase becomes terminal (`PlanLocked`), or `timeout_secs` elapses.
+Blocks server-side until the caller is the owner, an actionable post-claim
+session-state change occurs, or `timeout_secs` elapses.
 
 ```json
 { "session_id": "...", "agent": "claude", "timeout_secs": 30 }
 ```
 
-Returns `{ is_my_turn, phase, current_owner, session_ended }`. Default
-timeout 30s, max 60s. Agents loop on this instead of polling `status` on a
-fixed interval.
+The response is a union: a settled full frame (the caller owns the turn, or an
+**actionable post-claim session-state change** occurs) returns
+`{ is_my_turn, phase, current_owner, session_ended }`. Relevant changes include
+phase, owner, terminal/ended, and **recovery-state changes** such as a pending
+failure or recovery ownership; an elapsed timeout with no relevant change
+before the deadline returns exactly `{"unchanged": true}`. Default timeout
+30s, max 60s. Agents loop on this instead of polling `status` on a fixed
+interval.
 
 ### `collab_register_caps` / `collab_get_caps`
 
@@ -1919,7 +1924,7 @@ The Claude dispatcher invokes ALL Codex-owned non-terminal phases via
 rather than via the synchronous `mcp__codex__codex` MCP tool. This
 covers `PlanParallelDrafts`, `PlanCodexReviewPending`,
 `CodeReviewFixGlobalPending`, and `CodeImplementPending+codex`. The full
-procedure (prompt file selection, reasoning flag, polling loop, termination
+procedure (prompt file selection, reasoning flag, wait loop, termination
 conditions, and failure handling) is documented in the Claude-side
 dispatcher prompt (`.claude-plugin/commands/collab.md`, section "Codex
 handoff — background `codex exec`").
@@ -2071,7 +2076,7 @@ Codex-owned dispatch/return event (`t2_codex_dispatched`,
 `t3_codex_returned`, `t6_codex_review_dispatched`,
 `t7_codex_review_returned`) and on `t4_phase_advanced`. For
 `t4_phase_advanced`, `phase=` is the new destination phase and `round=`
-is the same dispatch round being watched by the polling loop (for
+is the same dispatch round being watched by the wait loop (for
 example, `round=1` for the single v1 plan review or the global review
 phase). Events that fire exactly once per session
 (`t0_session_started`, `t1_task_list_sent`, `t8_pr_created`,
@@ -2093,11 +2098,11 @@ echo "$(date +%s.%N) <event_name> phase=<phase> round=<N> [<extra>]" >> /tmp/col
 | `t1_task_list_sent` | (none required) | Right after `collab_send(topic="task_list")` returns |
 | `t2_codex_dispatched` | `phase=` `round=` | Immediately before launching background `codex exec` for any Codex-owned phase (PlanParallelDrafts, PlanCodexReviewPending, CodeImplementPending+codex) |
 | `t2_fallback_to_mcp` | `phase=` | When `codex` is not on PATH and falling back to synchronous MCP (any phase) |
-| `t3_codex_returned` | `phase=` `round=` | Immediately after the bg-exec polling loop exits successfully for PlanParallelDrafts, PlanCodexReviewPending, or CodeImplementPending+codex |
-| `t4_phase_advanced` | `phase=` `round=` | Every time a poll observes a new phase (destination phase goes in `phase=`, NOT in the event name; round is the same dispatch round being watched by the polling loop) |
+| `t3_codex_returned` | `phase=` `round=` | Immediately after a settled bg-exec wait reports success for PlanParallelDrafts, PlanCodexReviewPending, or CodeImplementPending+codex |
+| `t4_phase_advanced` | `phase=` `round=` | Every time a settled wait observes a new phase (destination phase goes in `phase=`, NOT in the event name; round is the same dispatch round being watched by the wait loop) |
 | `t5_review_local_sent` | `phase=CodeReviewLocalPending` | After `collab_send(topic="review_local")` returns |
 | `t6_codex_review_dispatched` | `phase=` `round=` | Immediately before launching background `codex exec` for `CodeReviewFixGlobalPending` |
-| `t7_codex_review_returned` | `phase=` `round=` | Immediately after the bg-exec polling loop exits successfully for `CodeReviewFixGlobalPending` |
+| `t7_codex_review_returned` | `phase=` `round=` | Immediately after a settled bg-exec wait reports success for `CodeReviewFixGlobalPending` |
 | `t8_pr_created` | `phase=CodeReviewFinalPending` | After `gh pr create` returns success; include the PR URL as `[extra]` |
 | `t9_final_review_sent` | `phase=CodeReviewFinalPending` | After `collab_send(topic="final_review")` returns |
 | `t10_session_complete` | `phase=` (CodingComplete or CodingFailed) | When `collab_status.phase` first reads `CodingComplete` or `CodingFailed` |
@@ -2133,28 +2138,40 @@ Named events span `t0_session_started` (after `collab_start` returns)
 through `t10_session_complete` (when `CodingComplete` or `CodingFailed`
 is first observed).
 
-### Polling backoff (Codex bg phases only)
+### Event-driven Codex background waits
 
-The Claude dispatcher polls `collab_status` + `BashOutput` on a fixed ~10s
-interval while a Codex-owned phase is running as a background
-`codex exec` process. For long silent grinds, that fixed cadence churns
-the dispatcher without producing new information. A bounded backoff curve
-reduces that churn:
+For a Codex-owned background `codex exec` phase, Claude waits with
+`collab_wait_my_turn(session_id, "claude", 60)`, not a fixed-interval
+`collab_status` poll. The wait response is the compact union documented
+above: exactly `{"unchanged": true}` is a 60-second timeout with no relevant
+change before the deadline; every other response is a settled full frame from an
+**actionable post-claim session-state change**. Relevant changes include phase,
+owner, terminal/ended, and **recovery-state changes** such as a pending failure
+or recovery ownership, even if Codex remains the owner.
 
-- Default poll interval: **10s**.
-- After **60s** of no progress (no `phase` advance AND no new stdout
-  line) → escalate to **20s**.
-- After **300s** (5 min) of no progress → escalate to **30s** (cap).
-- **Reset to 10s** on ANY of: phase advance, new stdout line, bg process
-  exit, bg process error/signal.
-- 600s hang detection is unchanged.
+On an unchanged timeout, Claude immediately starts the next wait without a
+`collab_status` call or an idle user update (except that it first performs the
+single bounded background-output drain below and checks the still-required
+process-exit and 600-second hang conditions). On a settled wake, it calls
+`collab_status` once and uses the normal success, recovery, terminal,
+process-exit, and hang handling in that order. If the changed phase remains
+Codex-owned, Claude immediately selects and launches the next Codex prompt;
+the prior process's normal exit is not a silent-dispatch error. This preserves
+phase-specific timing events, recovery/resume routing, and the 600-second
+no-progress safeguard; progress is a phase change or new stdout.
 
-Scope: this backoff applies **only** to Codex-owned background phases
+Claude reads background stdout once per wait wake. New output is relayed as
+one `[codex bg]` batch, using **consecutive-duplicate collapsing** and at
+most 20 displayed lines. If collapsed output would exceed the bound, the
+twentieth line is a truncation notice after 19 displayed output lines. A
+quiet wake has no relay; Claude never emits a per-raw-line or last-line
+status update.
+
+Scope: this applies **only** to Codex-owned background phases
 (`PlanParallelDrafts`, `PlanCodexReviewPending`,
-`CodeReviewFixGlobalPending`, `CodeImplementPending+codex`). It does NOT
-change the user-visible idle gap during Claude's Plan Mode prompts —
-those are gated on user input, not on poll cadence. Full curve + reset
-conditions are documented in the Claude-side dispatcher prompt.
+`CodeReviewFixGlobalPending`, `CodeImplementPending+codex`). It does not
+change the user-visible idle gap during Claude's Plan Mode prompts, which are
+gated on user input.
 
 ### Anti-removal: `/ultrareview-local` overlap audit
 
