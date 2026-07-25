@@ -98,6 +98,9 @@ def test_codex_background_dispatcher_uses_quiet_settled_waits():
         assert 'collab_wait_my_turn(session_id, "claude", 60)' in surface
         assert '{"unchanged": true}' in surface
         assert "consecutive-duplicate collapsing" in surface
+        assert "settled full frame" in surface
+        assert "actionable post-claim session-state change" in surface
+        assert "recovery-state changes" in surface
 
     assert "On each iteration:" not in dispatcher
     assert "Call `mcp__ironmem__collab_status(session_id)` to detect phase advance." not in dispatcher

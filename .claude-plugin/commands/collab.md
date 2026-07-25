@@ -843,9 +843,12 @@ f. **Event-driven wait loop** — the dispatcher's interactive surface during
    While this remains a Codex-owned background phase, call
    `mcp__ironmem__collab_wait_my_turn(session_id, "claude", 60)`. Its compact
    response is a union: exactly `{"unchanged": true}` means the 60-second
-   wait elapsed with no settling change; any other response is a settled wake.
-   A phase or owner change settles the wait even when Codex remains the owner.
-   This applies only to the Codex-owned background phases
+   wait elapsed with no relevant change before the deadline; any other response
+   is a settled full frame from an **actionable post-claim session-state change**.
+   Relevant changes include phase, owner, terminal/ended, and
+   **recovery-state changes** such as a pending failure or recovery ownership,
+   even when Codex remains the owner. This applies only to the Codex-owned
+   background phases
    listed above, never to a Claude Plan Mode prompt that is waiting for user
    input.
 

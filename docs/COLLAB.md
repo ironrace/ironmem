@@ -1001,20 +1001,21 @@ match the stored `canonical_plan_hash`.
 
 ### `collab_wait_my_turn` (long-poll)
 
-Blocks server-side until the caller is the owner, the session ends, the
-phase becomes terminal (`PlanLocked`), or `timeout_secs` elapses.
+Blocks server-side until the caller is the owner, an actionable post-claim
+session-state change occurs, or `timeout_secs` elapses.
 
 ```json
 { "session_id": "...", "agent": "claude", "timeout_secs": 30 }
 ```
 
-The response is a union: a settled wait (the caller owns the turn, the phase
-or owner changed from this wait's post-claim baseline, the session ended, or
-the phase is terminal) returns
-`{ is_my_turn, phase, current_owner, session_ended }`; an elapsed timeout with
-no settling change during this wait returns exactly `{"unchanged": true}`.
-Default timeout 30s, max 60s. Agents loop on this instead of polling `status`
-on a fixed interval.
+The response is a union: a settled full frame (the caller owns the turn, or an
+**actionable post-claim session-state change** occurs) returns
+`{ is_my_turn, phase, current_owner, session_ended }`. Relevant changes include
+phase, owner, terminal/ended, and **recovery-state changes** such as a pending
+failure or recovery ownership; an elapsed timeout with no relevant change
+before the deadline returns exactly `{"unchanged": true}`. Default timeout
+30s, max 60s. Agents loop on this instead of polling `status` on a fixed
+interval.
 
 ### `collab_register_caps` / `collab_get_caps`
 
@@ -2142,9 +2143,11 @@ is first observed).
 For a Codex-owned background `codex exec` phase, Claude waits with
 `collab_wait_my_turn(session_id, "claude", 60)`, not a fixed-interval
 `collab_status` poll. The wait response is the compact union documented
-above: exactly `{"unchanged": true}` is a 60-second timeout with no settling
-change during that wait; every other response is a settled wake. A phase or
-owner change settles even if Codex remains the owner.
+above: exactly `{"unchanged": true}` is a 60-second timeout with no relevant
+change before the deadline; every other response is a settled full frame from an
+**actionable post-claim session-state change**. Relevant changes include phase,
+owner, terminal/ended, and **recovery-state changes** such as a pending failure
+or recovery ownership, even if Codex remains the owner.
 
 On an unchanged timeout, Claude immediately starts the next wait without a
 `collab_status` call or an idle user update (except that it first performs the
