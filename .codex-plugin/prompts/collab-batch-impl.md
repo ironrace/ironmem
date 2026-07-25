@@ -39,8 +39,11 @@ act only
 when phase is `CodeImplementPending`, implementer is `codex`, and Codex owns
 the turn. Otherwise exit with a concise stale-invocation status.
 
-For a normal turn, read `last_head_sha`, `base_sha`, `repo_path`, branch, task
-list, and execution mode. Work in `repo_path`. First take the fast path when
+For a normal turn, read `last_head_sha`, `base_sha`, `repo_path`, branch,
+`task_list_ref`, and execution mode. Load the manifest with
+`get_drawer(id=<task_list_ref.drawer_id>)`, then verify its SHA-256 against
+`task_list_ref.hash`; do not request `include_task_list`. Work in `repo_path`.
+First take the fast path when
 both local HEAD equals `last_head_sha` and the checked-out branch equals the
 session branch. Otherwise fetch the branch, verify the SHA with
 `git cat-file -e`, checkout the session branch, and hard-reset to the recorded

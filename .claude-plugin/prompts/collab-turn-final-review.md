@@ -16,10 +16,10 @@ preconditions: phase == CodeReviewFinalPending, current_owner == claude
 1. `collab_status(session_id=$SESSION_ID)`; read `task_list_ref`,
    `last_head_sha`, `pending_failure`.
 2. When composing the PR body, load task details by reference:
-   `get_drawer(id=<task_list_ref.drawer_id>)`. If `task_list_ref.drawer_id` is
-   null on a legacy session, call
-   `collab_status(session_id=$SESSION_ID, include_task_list:true)` and use the
-   returned `task_list`.
+   `get_drawer(id=<task_list_ref.drawer_id>)` and verify its SHA-256 against
+   `task_list_ref.hash`. If `task_list_ref.drawer_id` is null on a legacy
+   session, return a blocker: `collab_status(include_task_list:true)` is
+   reference-only and never returns task-list JSON.
 
 ## Recoverable vs terminal failures
 

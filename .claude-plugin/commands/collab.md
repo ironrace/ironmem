@@ -352,23 +352,21 @@ only artifact worth interrupting the human for.
 
 <!-- LINT:bridge-worker-owned -->
 ### v3 bridge (PlanLocked → CodeImplementPending) — worker-owned
-The orchestrator does NOT call a separate plan-expansion skill, read verbose
-`final_plan`, or build the manifest inline. It dispatches
+The orchestrator does NOT call a separate plan-expansion skill, read a plan
+body from status, or build the manifest inline. It dispatches
 `collab-turn-task-list.md` once (mechanical/sonnet). That worker reads the
-approved final markdown from `collab_status(verbose:true)`, verifies or restores
-the exact file named by its leading `plan_file_path` comment, parses tasks, and
-sends `task_list`. Only the worker's ≤3-line verdict crosses the orchestrator
-boundary.
+approved plan's `{plan_file_path, hash}` reference from `collab_status`,
+verifies the exact file, parses tasks, and sends `task_list`. Only the worker's
+≤3-line verdict crosses the orchestrator boundary.
 
 Once `PlanLocked` is reached with `final_plan_hash` set and no `task_list`
 yet, run this worker-owned bridge. **Do not enter harness Plan Mode here** —
 the user already approved the final Superpowers task plan.
 
 1. Dispatch `collab-turn-task-list.md` (mechanical/sonnet). The worker reads
-   `final_plan`/`final_plan_hash` itself, extracts the repo-relative
-   `plan_file_path` from the leading markdown comment, verifies the file content
-   is byte-identical to `final_plan` (or recreates the missing file from the
-   exact approved body), and parses each `### Task N:` heading into
+   `final_plan_ref`/`final_plan_hash`, obtains the repo-relative
+   `plan_file_path` from that reference, verifies the file's SHA-256 against
+   the approved hash, and parses each `### Task N:` heading into
    `{id, title, timebox_minutes, acceptance:[...]}`.
 2. The worker must reject the bridge before sending if:
    - there are zero `### Task ` headings
@@ -378,7 +376,7 @@ the user already approved the final Superpowers task plan.
    - any task is missing acceptance criteria
    - any task is missing `Timebox: <=20 minutes`
    - any task is sized above 20 minutes
-   - the existing plan file differs from the approved `final_plan`
+   - the existing plan file's SHA-256 differs from the approved hash
    PlanLocked is pre-coding, so `failure_report` is not valid here; the worker
    returns the concrete issue on `blocker:` and sends nothing.
 3. On success, the worker builds the manifest

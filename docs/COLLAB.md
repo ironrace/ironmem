@@ -230,11 +230,11 @@ Stored in `collab_sessions`:
 | `current_owner` | Agent whose turn it is (`claude` or `codex`) |
 | `claude_draft_hash`, `codex_draft_hash` | SHA-256 of each first draft |
 | `canonical_plan_hash` | SHA-256 of Claude's synthesis |
-| `canonical_plan` / `canonical_plan_ref` | The latest `canonical` plan (present when `canonical_plan_hash` is set). By default returned as a compact `canonical_plan_ref` `{drawer_id, hash, first_200_chars}`; with `verbose:true` the full `canonical_plan` string (raw synthesis text — `canonical` has no JSON envelope) is inlined. Lets a fresh agent rejoining mid-planning pull back its own earlier synthesis without a counterpart `recv`. See "Plan-by-reference contract". |
-| `canonical_plan_drawer_id` / `final_plan_drawer_id` | Deterministic 32-char id of the `collab-plans` drawer storing the canonical/final plan body once accepted (migration 009). NULL on pre-009 sessions → legacy inline path. |
+| `canonical_plan_ref` | The latest `canonical` plan reference (present when `canonical_plan_hash` is set): `{drawer_id, hash, plan_file_path}`. `plan_file_path` is null unless the plan carries the required leading marker. Status never includes the plan body; dereference the drawer only when required. See "Plan-by-reference contract". |
+| `canonical_plan_drawer_id` / `final_plan_drawer_id` | Deterministic 32-char id of the `collab-plans` drawer storing the canonical/final plan body once accepted (migration 009). NULL on pre-009 sessions; status still exposes a body-free legacy reference when possible. |
 | `final_plan_hash` | SHA-256 of the locked plan |
-| `final_plan` / `final_plan_ref` | The locked `final` plan (present when `final_plan_hash` is set). By default returned as a compact `final_plan_ref` `{drawer_id, hash, first_200_chars}`; with `verbose:true` the full `final_plan` string is inlined as normalized, already-parsed plan text. No caller unwraps `{"plan":...}`, including legacy NULL-drawer sessions. Primary input to the v3 `task_list` bridge after `PlanLocked`. See "Plan-by-reference contract". |
-| `task_list` / `task_list_ref` | The accepted v3 task list. By default `collab_status` returns compact `task_list_ref` `{drawer_id, hash, first_200_chars}` plus top-level `tasks_count`, `plan_file_path`, and `execution_mode`; pass `include_task_list:true` to inline the full JSON. New sessions store the task list in `collab-task-lists`; pre-014 sessions may have `task_list_ref.drawer_id = null`. |
+| `final_plan_ref` | The locked `final` plan reference (present when `final_plan_hash` is set): `{drawer_id, hash, plan_file_path}`. It is the primary input to the v3 `task_list` bridge after `PlanLocked`; the worker verifies the file against `hash`. Status never returns the normalized plan text. See "Plan-by-reference contract". |
+| `task_list` / `task_list_ref` | The accepted v3 task-list reference: `{drawer_id, hash}` plus top-level `tasks_count`, `plan_file_path`, and `execution_mode`. `include_task_list:true` repeats this compact ref under `task_list`; it never inlines JSON. New sessions store the task list in `collab-task-lists`; pre-014 sessions may have `task_list_ref.drawer_id = null`. |
 | `task_list_drawer_id` | Deterministic 32-char id of the `collab-task-lists` drawer storing the canonicalized task-list JSON once accepted (migration 014). NULL on pre-014 sessions. |
 | `codex_review_verdict` | Last Codex verdict |
 | `review_round` | Number of completed Codex reviews (0 or 1; planning has one review pass) |
@@ -965,35 +965,22 @@ re-reporting the failure you were handed) before doing anything else. `coding_fa
 
 #### Plan-by-reference contract
 
-Accepted plan and task-list bodies are returned by reference by default to keep
-the status payload compact:
+Accepted plan and task-list bodies are returned by reference to keep status
+payloads bounded:
 
-- **Default (`verbose` false or omitted):** the accepted `canonical` and
-  `final` plans are returned as compact references —
-  `canonical_plan_ref` / `final_plan_ref` = `{drawer_id, hash,
-  first_200_chars}`. The full plan strings are omitted.
-- **`verbose:true`:** additionally inlines the full `canonical_plan` /
-  `final_plan` string. Callers that need the approved plan body (e.g. the v3
-  `task_list` bridge, or recovering a prior canonical on a revision round)
-  must pass `verbose:true`.
-- **`include_task_list:true`:** additionally inlines the full canonicalized
-  `task_list` JSON. The default status response omits it and returns
-  `task_list_ref` instead. For new sessions `task_list_ref.drawer_id` points to
-  a `collab-task-lists` drawer; for pre-014 sessions the ref may carry
-  `drawer_id:null`, so legacy callers that need the full body should use
-  `include_task_list:true`.
-- The `final` body exposed by `collab_status` is the **already-parsed plan
-  text** — consumers no longer need to unwrap the legacy
-  `{"plan":"<full text>"}` JSON. For post-009 sessions, the drawer stores
-  that parsed body; for legacy NULL-drawer sessions, `collab_status`
-  normalizes the raw stored message on read. The `hash` verifies the parsed
-  body.
-- **Backward compatibility:** pre-009 sessions (NULL drawer id) keep the
-  legacy inline path — the full plan text is inlined under
-  `canonical_plan` / `final_plan` regardless of `verbose`, with `final_plan`
-  normalized to parsed plan text. These sessions emit **no**
-  `canonical_plan_ref` / `final_plan_ref`, so callers must not assume the
-  compact reference object is always present.
+- **Plans:** `canonical_plan_ref` / `final_plan_ref` are always
+  `{drawer_id, hash, plan_file_path}`. `plan_file_path` is parsed from the
+  required leading marker and is null when absent. `verbose:true` remains an
+  accepted compatibility argument, but never inlines either plan body.
+- **Task lists:** `task_list_ref` is `{drawer_id, hash}`. With
+  `include_task_list:true`, the `task_list` field repeats the same compact
+  reference rather than inlining canonicalized JSON. New sessions can load the
+  manifest with `get_drawer(task_list_ref.drawer_id)` and verify its hash.
+- **Legacy sessions:** for a NULL plan drawer id, status reads the persisted
+  message only to produce a body-free `{drawer_id:null, hash, plan_file_path}`
+  reference. It never emits `canonical_plan` or `final_plan`.
+- The `final` plan drawer stores the already-parsed plan text. Its `hash`
+  verifies the on-disk plan file used by the task-list bridge.
 - **Recall note:** accepted plan bodies are filed as drawers in the
   dedicated `collab-plans` room, and task lists in `collab-task-lists`, with a
   zero embedding (kept out of vector recall). The generic drawer FTS index
@@ -1624,19 +1611,20 @@ mechanical parse/submit worker, not a compose gate.
 
 ### v3 bridge (PlanLocked → CodeImplementPending) — worker-owned
 
-The PlanLocked bridge is worker-owned. The orchestrator does NOT call
-any separate plan-expansion skill, does NOT read verbose `final_plan`, and does NOT build
-the `task_list` manifest. It dispatches `collab-turn-task-list.md` once.
+The PlanLocked bridge is worker-owned. The orchestrator does NOT call any
+separate plan-expansion skill, does NOT read a plan body from status, and does
+NOT build the `task_list` manifest. It dispatches `collab-turn-task-list.md`
+once.
 
-The worker reads `final_plan`/`final_plan_hash`, extracts `plan_file_path` from
-the leading markdown comment, verifies the file content is byte-identical to the
-approved body (or recreates a missing file from that body), parses each
-`### Task N:` heading into `{id,title,timebox_minutes,acceptance}`, and sends
-`task_list`. It returns a blocker and sends nothing if the plan has zero or more
-than 10 tasks, any task is missing acceptance criteria, missing `Timebox: <=20
-minutes`, sized above 20 minutes, or if the existing plan file differs from the
-approved body. An 11+ task plan must be decomposed into child issues; it must
-not enter coding. PlanLocked is pre-coding, so `failure_report` is not valid in
+The worker reads `final_plan_ref`/`final_plan_hash`, obtains
+`plan_file_path` from the reference, verifies the file's SHA-256 against the
+approved hash, parses each `### Task N:` heading into
+`{id,title,timebox_minutes,acceptance}`, and sends `task_list`. It returns a
+blocker and sends nothing if the plan file is missing or its hash differs, the
+plan has zero or more than 10 tasks, any task is missing acceptance criteria,
+missing `Timebox: <=20 minutes`, or is sized above 20 minutes. An 11+ task plan
+must be decomposed into child issues; it must not enter coding. PlanLocked is
+pre-coding, so `failure_report` is not valid in
 this bridge.
 
 Only the worker's ≤3-line verdict crosses the orchestrator boundary; the plan

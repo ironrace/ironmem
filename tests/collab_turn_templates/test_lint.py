@@ -31,6 +31,18 @@ def test_lint_passes_on_repo():
     assert r.returncode == 0, f"lint failed:\n{r.stdout}\n{r.stderr}"
 
 
+def test_plan_and_manifest_workers_use_verified_references():
+    task_list = (ROOT / ".claude-plugin" / "prompts" / "collab-turn-task-list.md").read_text()
+    batch = (ROOT / ".codex-plugin" / "prompts" / "collab-batch-impl.md").read_text()
+
+    assert "final_plan_ref.plan_file_path" in task_list
+    assert "SHA-256 equals both `final_plan_ref.hash` and `final_plan_hash`" in task_list
+    assert "recreate it from the exact `final_plan` body" not in task_list
+    assert "get_drawer(id=<task_list_ref.drawer_id>)" in batch
+    assert "verify its SHA-256 against\n`task_list_ref.hash`" in batch
+    assert "do not request `include_task_list`" in batch
+
+
 def test_codex_dispatch_uses_explicit_repository_model_defaults():
     docs = (ROOT / "docs" / "COLLAB.md").read_text()
     dispatcher = (ROOT / ".claude-plugin" / "commands" / "collab.md").read_text()

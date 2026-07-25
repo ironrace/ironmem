@@ -22,10 +22,9 @@ preconditions: phase == PlanClaudeFinalizePending, current_owner == claude
    `get_drawer(id=<canonical_plan_ref.drawer_id>)` for the canonical plan and
    `get_drawer(id=<message.drawer_id>)` for Codex's `topic="review"` message.
    `full:true` is compatibility-only: use it only on that first receive when a
-   known legacy `drawer_id:null` row requires inline content. For a legacy
-   canonical plan without a reference, use the status response's inline
-   `canonical_plan`; for a legacy review row, use its returned inline content.
-   Never issue a second receive after auto-ack.
+   known legacy review row requires inline content. A legacy canonical plan
+   without a drawer reference cannot be recovered through status; return a
+   blocker. Never issue a second receive after auto-ack.
 
 ## Actions
 1. Produce the final execution plan as a Superpowers-compatible task markdown
