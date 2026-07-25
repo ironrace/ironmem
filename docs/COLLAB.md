@@ -1008,9 +1008,12 @@ phase becomes terminal (`PlanLocked`), or `timeout_secs` elapses.
 { "session_id": "...", "agent": "claude", "timeout_secs": 30 }
 ```
 
-Returns `{ is_my_turn, phase, current_owner, session_ended }`. Default
-timeout 30s, max 60s. Agents loop on this instead of polling `status` on a
-fixed interval.
+The response is a union: a settled wait (the caller owns the turn, the
+session ended, or the phase is terminal) returns
+`{ is_my_turn, phase, current_owner, session_ended }`; an elapsed timeout
+that remains unsettled returns exactly `{"unchanged": true}`. Default timeout
+30s, max 60s. Agents loop on this instead of polling `status` on a fixed
+interval.
 
 ### `collab_register_caps` / `collab_get_caps`
 

@@ -1496,6 +1496,31 @@ fn collab_wait_my_turn_returns_immediately_when_owner() {
 }
 
 #[test]
+fn collab_wait_my_turn_returns_compact_frame_when_timeout_is_unsettled() {
+    let app = App::open_for_test().unwrap();
+    let started = call_tool(
+        &app,
+        "collab_start",
+        json!({
+            "repo_path": "/repo",
+            "branch": "main",
+            "initiator": "claude"
+        }),
+    );
+    let session_id = started["session_id"].as_str().unwrap();
+
+    // The fresh session belongs to Claude, so Codex remains unsettled until
+    // its minimum one-second timeout elapses.
+    let resp = call_tool(
+        &app,
+        "collab_wait_my_turn",
+        json!({ "session_id": session_id, "agent": "codex", "timeout_secs": 1 }),
+    );
+
+    assert_eq!(resp, json!({"unchanged": true}));
+}
+
+#[test]
 fn collab_end_blocks_subsequent_writes() {
     let app = App::open_for_test().unwrap();
     // Drive to PlanLocked so collab_end is actually allowed — calling it
