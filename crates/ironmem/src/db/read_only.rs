@@ -96,6 +96,25 @@ impl ReadOnlyDb {
 mod tests {
     use crate::db::schema::Database;
 
+    const V16_MIGRATIONS: [&str; 16] = [
+        include_str!("../../migrations/001_init.sql"),
+        include_str!("../../migrations/002_fts.sql"),
+        include_str!("../../migrations/003_collab.sql"),
+        include_str!("../../migrations/004_collab_planning_v1.sql"),
+        include_str!("../../migrations/005_collab_v2.sql"),
+        include_str!("../../migrations/006_collab_implementer.sql"),
+        include_str!("../../migrations/007_drop_current_task_index.sql"),
+        include_str!("../../migrations/008_metrics.sql"),
+        include_str!("../../migrations/009_collab_plan_drawers.sql"),
+        include_str!("../../migrations/010_collab_generation_lease.sql"),
+        include_str!("../../migrations/011_code_maps.sql"),
+        include_str!("../../migrations/012_symbol_import_graph.sql"),
+        include_str!("../../migrations/013_metrics_harness_check.sql"),
+        include_str!("../../migrations/014_context_size_refs.sql"),
+        include_str!("../../migrations/015_collab_recovery_state.sql"),
+        include_str!("../../migrations/016_collab_message_drawers.sql"),
+    ];
+
     /// Documents that `ReadOnlyDb` exposes the read methods the dashboard needs
     /// and that they return the same data as the underlying `Database`.
     ///
@@ -141,5 +160,51 @@ mod tests {
             })
             .unwrap();
         assert_eq!(n, 1);
+    }
+
+    #[test]
+    fn read_only_and_dashboard_drawer_queries_support_a_v16_database() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v16.sqlite3");
+        let id = crate::db::drawers::generate_id("legacy", "w", "r");
+        {
+            let db = Database::open(&path).unwrap();
+            for migration in V16_MIGRATIONS {
+                db.exec_raw(migration).unwrap();
+            }
+            assert_eq!(db.schema_version().unwrap(), 16);
+            db.insert_drawer(
+                &id,
+                "legacy drawer",
+                &[0.0; ironrace_embed::embedder::EMBED_DIM],
+                "w",
+                "r",
+                "",
+                "test",
+            )
+            .unwrap();
+        }
+
+        let ro = Database::open_read_only(&path).unwrap();
+        assert_eq!(ro.schema_version().unwrap(), 16);
+        assert_eq!(ro.get_drawers(None, None, 10).unwrap().len(), 1);
+        assert_eq!(
+            ro.get_drawer(&id).unwrap().unwrap().content,
+            "legacy drawer"
+        );
+
+        let summary = crate::dashboard::data::memory_summary(
+            &ro,
+            &crate::dashboard::data::MemoryParams::default(),
+        )
+        .unwrap();
+        assert_eq!(summary.recent_drawers.len(), 1);
+        assert_eq!(
+            crate::dashboard::data::drawer_detail(&ro, &id)
+                .unwrap()
+                .unwrap()
+                .content,
+            "legacy drawer"
+        );
     }
 }

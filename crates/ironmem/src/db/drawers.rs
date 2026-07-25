@@ -140,6 +140,28 @@ impl Database {
         wing: &str,
         room: &str,
     ) -> Result<(), MemoryError> {
+        if predecessor_id == successor_id {
+            return Err(MemoryError::Validation(
+                "successor drawer must differ from predecessor drawer".into(),
+            ));
+        }
+
+        let successor = tx
+            .query_row(
+                "SELECT wing, room FROM drawers WHERE id = ?1",
+                params![successor_id],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .optional()?;
+        let Some((successor_wing, successor_room)) = successor else {
+            return Err(MemoryError::NotFound("successor drawer not found".into()));
+        };
+        if successor_wing != wing || successor_room != room {
+            return Err(MemoryError::Validation(
+                "successor drawer does not belong to requested wing/room".into(),
+            ));
+        }
+
         let updated = tx.execute(
             "UPDATE drawers
              SET superseded_by = ?1
@@ -171,9 +193,12 @@ impl Database {
                 "predecessor drawer does not belong to requested wing/room".into(),
             ));
         }
+        if superseded_by.as_deref() == Some(successor_id) {
+            return Ok(());
+        }
         if superseded_by.is_some() {
             return Err(MemoryError::Validation(
-                "predecessor drawer is already superseded".into(),
+                "predecessor drawer is already superseded by a different successor".into(),
             ));
         }
 
@@ -279,10 +304,10 @@ impl Database {
 
     /// Get a drawer by ID.
     pub fn get_drawer(&self, id: &str) -> Result<Option<Drawer>, MemoryError> {
-        let mut stmt = self.conn.prepare(
-            "SELECT id, content, wing, room, source_file, added_by, filed_at, date, superseded_by
-             FROM drawers WHERE id = ?1",
-        )?;
+        let columns = Self::drawer_projection(&self.conn)?;
+        let mut stmt = self
+            .conn
+            .prepare(&format!("SELECT {columns} FROM drawers WHERE id = ?1"))?;
 
         let mut rows = stmt.query_map(params![id], Self::row_to_drawer)?;
         match rows.next() {
@@ -314,14 +339,11 @@ impl Database {
         }
 
         let mut result = std::collections::HashMap::new();
+        let columns = Self::drawer_projection(&self.conn)?;
 
         for chunk in ids.chunks(CHUNK_SIZE) {
             let placeholders: String = chunk.iter().map(|_| "?").collect::<Vec<_>>().join(",");
-            let mut sql = format!(
-                "SELECT id, content, wing, room, source_file, added_by, filed_at, date, superseded_by
-                 FROM drawers WHERE id IN ({})",
-                placeholders
-            );
+            let mut sql = format!("SELECT {columns} FROM drawers WHERE id IN ({placeholders})");
             let mut owned_params: Vec<String> = Vec::new();
             if let Some(w) = wing {
                 sql.push_str(" AND wing = ?");
@@ -357,44 +379,41 @@ impl Database {
         limit: usize,
     ) -> Result<Vec<Drawer>, MemoryError> {
         let limit_i64 = limit as i64;
+        let columns = Self::drawer_projection(&self.conn)?;
 
         let mut result = Vec::new();
         match (wing, room) {
             (Some(w), Some(r)) => {
-                let mut stmt = self.conn.prepare(
-                    "SELECT id, content, wing, room, source_file, added_by, filed_at, date, superseded_by
-                     FROM drawers WHERE wing = ?1 AND room = ?2 ORDER BY filed_at DESC, id ASC LIMIT ?3",
-                )?;
+                let mut stmt = self.conn.prepare(&format!(
+                    "SELECT {columns} FROM drawers WHERE wing = ?1 AND room = ?2 ORDER BY filed_at DESC, id ASC LIMIT ?3"
+                ))?;
                 let rows = stmt.query_map(params![w, r, limit_i64], Self::row_to_drawer)?;
                 for row in rows {
                     result.push(row?);
                 }
             }
             (Some(w), None) => {
-                let mut stmt = self.conn.prepare(
-                    "SELECT id, content, wing, room, source_file, added_by, filed_at, date, superseded_by
-                     FROM drawers WHERE wing = ?1 ORDER BY filed_at DESC, id ASC LIMIT ?2",
-                )?;
+                let mut stmt = self.conn.prepare(&format!(
+                    "SELECT {columns} FROM drawers WHERE wing = ?1 ORDER BY filed_at DESC, id ASC LIMIT ?2"
+                ))?;
                 let rows = stmt.query_map(params![w, limit_i64], Self::row_to_drawer)?;
                 for row in rows {
                     result.push(row?);
                 }
             }
             (None, Some(r)) => {
-                let mut stmt = self.conn.prepare(
-                    "SELECT id, content, wing, room, source_file, added_by, filed_at, date, superseded_by
-                     FROM drawers WHERE room = ?1 ORDER BY filed_at DESC, id ASC LIMIT ?2",
-                )?;
+                let mut stmt = self.conn.prepare(&format!(
+                    "SELECT {columns} FROM drawers WHERE room = ?1 ORDER BY filed_at DESC, id ASC LIMIT ?2"
+                ))?;
                 let rows = stmt.query_map(params![r, limit_i64], Self::row_to_drawer)?;
                 for row in rows {
                     result.push(row?);
                 }
             }
             (None, None) => {
-                let mut stmt = self.conn.prepare(
-                    "SELECT id, content, wing, room, source_file, added_by, filed_at, date, superseded_by
-                     FROM drawers ORDER BY filed_at DESC, id ASC LIMIT ?1",
-                )?;
+                let mut stmt = self.conn.prepare(&format!(
+                    "SELECT {columns} FROM drawers ORDER BY filed_at DESC, id ASC LIMIT ?1"
+                ))?;
                 let rows = stmt.query_map(params![limit_i64], Self::row_to_drawer)?;
                 for row in rows {
                     result.push(row?);
@@ -680,6 +699,22 @@ impl Database {
             date: row.get(7)?,
             superseded_by: row.get(8)?,
         })
+    }
+
+    /// Project the v17 supersession field when available, or an explicit NULL
+    /// for pre-v17 databases opened through the non-migrating read-only path.
+    fn drawer_projection(conn: &rusqlite::Connection) -> Result<&'static str, MemoryError> {
+        let mut stmt = conn.prepare("PRAGMA table_info(drawers)")?;
+        let mut rows = stmt.query([])?;
+        while let Some(row) = rows.next()? {
+            let name: String = row.get(1)?;
+            if name == "superseded_by" {
+                return Ok(
+                    "id, content, wing, room, source_file, added_by, filed_at, date, superseded_by",
+                );
+            }
+        }
+        Ok("id, content, wing, room, source_file, added_by, filed_at, date, NULL AS superseded_by")
     }
 
     fn delete_drawer_conn(conn: &rusqlite::Connection, id: &str) -> Result<usize, MemoryError> {
@@ -1201,16 +1236,95 @@ mod tests {
             db.get_drawer(predecessor).unwrap().unwrap().superseded_by,
             Some(successor.to_string())
         );
+    }
 
-        let already_superseded = db
+    #[test]
+    fn mark_drawer_superseded_tx_allows_same_successor_replay_but_rejects_a_different_one() {
+        let db = Database::open_in_memory().unwrap();
+        let emb = dummy_embedding();
+        let predecessor = "replaypredecessor000000000000000001";
+        let successor = "replaysuccessor000000000000000000001";
+        let different_successor = "different-successor00000000000000001";
+        for id in [predecessor, successor, different_successor] {
+            db.insert_drawer(id, "content", &emb, "wing", "room", "", "test")
+                .unwrap();
+        }
+
+        db.with_transaction(|tx| {
+            Database::mark_drawer_superseded_tx(tx, predecessor, successor, "wing", "room")
+        })
+        .unwrap();
+        db.with_transaction(|tx| {
+            Database::mark_drawer_superseded_tx(tx, predecessor, successor, "wing", "room")
+        })
+        .unwrap();
+
+        let different = db
             .with_transaction(|tx| {
-                Database::mark_drawer_superseded_tx(tx, predecessor, successor, "wing", "room")
+                Database::mark_drawer_superseded_tx(
+                    tx,
+                    predecessor,
+                    different_successor,
+                    "wing",
+                    "room",
+                )
             })
             .unwrap_err();
-        assert!(matches!(already_superseded, MemoryError::Validation(_)));
-        assert!(already_superseded
-            .to_string()
-            .contains("already superseded"));
+        assert!(matches!(different, MemoryError::Validation(_)));
+        assert!(different.to_string().contains("different successor"));
+    }
+
+    #[test]
+    fn mark_drawer_superseded_tx_validates_successor_before_marking() {
+        let db = Database::open_in_memory().unwrap();
+        let emb = dummy_embedding();
+        let predecessor = "validatedpredecessor0000000000000001";
+        let successor = "validatedsuccessor000000000000000001";
+        let cross_scope = "crossscopesuccessor000000000000000001";
+        db.insert_drawer(predecessor, "old", &emb, "wing", "room", "", "test")
+            .unwrap();
+        db.insert_drawer(successor, "new", &emb, "wing", "room", "", "test")
+            .unwrap();
+        db.insert_drawer(
+            cross_scope,
+            "wrong scope",
+            &emb,
+            "other-wing",
+            "room",
+            "",
+            "test",
+        )
+        .unwrap();
+
+        let missing = db
+            .with_transaction(|tx| {
+                Database::mark_drawer_superseded_tx(tx, predecessor, "missing", "wing", "room")
+            })
+            .unwrap_err();
+        assert!(matches!(missing, MemoryError::NotFound(_)));
+        assert!(missing.to_string().contains("successor drawer not found"));
+
+        let self_reference = db
+            .with_transaction(|tx| {
+                Database::mark_drawer_superseded_tx(tx, predecessor, predecessor, "wing", "room")
+            })
+            .unwrap_err();
+        assert!(matches!(self_reference, MemoryError::Validation(_)));
+        assert!(self_reference.to_string().contains("must differ"));
+
+        let wrong_scope = db
+            .with_transaction(|tx| {
+                Database::mark_drawer_superseded_tx(tx, predecessor, cross_scope, "wing", "room")
+            })
+            .unwrap_err();
+        assert!(matches!(wrong_scope, MemoryError::Validation(_)));
+        assert!(wrong_scope.to_string().contains("does not belong"));
+        assert!(db
+            .get_drawer(predecessor)
+            .unwrap()
+            .unwrap()
+            .superseded_by
+            .is_none());
     }
 
     #[test]
@@ -1327,5 +1441,31 @@ mod tests {
             .find_near_duplicate(&query, "wing", "room", "excluded")
             .unwrap()
             .is_none());
+    }
+
+    #[test]
+    fn find_near_duplicate_includes_the_exact_threshold() {
+        let db = Database::open_in_memory().unwrap();
+        let threshold_vector = [
+            NEAR_DUPLICATE_THRESHOLD,
+            (1.0 - NEAR_DUPLICATE_THRESHOLD.powi(2)).sqrt(),
+        ];
+        db.insert_drawer(
+            "threshold00000000000000000000000000",
+            "at threshold",
+            &threshold_vector,
+            "wing",
+            "room",
+            "",
+            "test",
+        )
+        .unwrap();
+
+        let duplicate = db
+            .find_near_duplicate(&[1.0, 0.0], "wing", "room", "excluded")
+            .unwrap()
+            .expect("a score exactly at the threshold must be included");
+        assert_eq!(duplicate.0, "threshold00000000000000000000000000");
+        assert!((duplicate.1 - NEAR_DUPLICATE_THRESHOLD).abs() < 1e-5);
     }
 }
