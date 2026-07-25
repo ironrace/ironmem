@@ -298,7 +298,21 @@ fn resolve_transcript_context(
 /// return `None`: hook attribution must remain absent rather than guessing a
 /// session from another branch.
 fn current_workspace_branch(workspace_root: &Path) -> Option<String> {
-    let output = Command::new("git")
+    let mut command = Command::new("git");
+    // Git treats GIT_* variables as repository-selection and configuration
+    // overrides. Retain the normal process environment (especially PATH) but
+    // remove every Git override so a hook's inherited environment cannot point
+    // this workspace lookup at another repository.
+    for (key, _) in std::env::vars_os() {
+        if key
+            .to_string_lossy()
+            .to_ascii_uppercase()
+            .starts_with("GIT_")
+        {
+            command.env_remove(key);
+        }
+    }
+    let output = command
         .arg("-C")
         .arg(workspace_root)
         .args(["branch", "--show-current"])
@@ -2184,6 +2198,28 @@ mod tests {
         git_test_repo(root, &["commit", "-m", "initial"]);
     }
 
+    struct ScopedEnvVar {
+        key: &'static str,
+        previous: Option<std::ffi::OsString>,
+    }
+
+    impl ScopedEnvVar {
+        fn set(key: &'static str, value: impl AsRef<std::ffi::OsStr>) -> Self {
+            let previous = std::env::var_os(key);
+            std::env::set_var(key, value);
+            Self { key, previous }
+        }
+    }
+
+    impl Drop for ScopedEnvVar {
+        fn drop(&mut self) {
+            match &self.previous {
+                Some(value) => std::env::set_var(self.key, value),
+                None => std::env::remove_var(self.key),
+            }
+        }
+    }
+
     fn seed_collab_in_branch(app: &App, repo_path: &str, sid: &str, branch: &str) {
         app.db
             .with_transaction(|tx| {
@@ -2255,6 +2291,24 @@ mod tests {
         let context = resolve_transcript_context(&app, Some(&root));
         assert_eq!(context, crate::metrics::MetricsContext::default());
         assert!(collab_line(&app, &root).is_none());
+    }
+
+    #[test]
+    fn current_workspace_branch_ignores_inherited_git_dir() {
+        let _env = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let temp = tempfile::tempdir().unwrap();
+        let intended = temp.path().join("intended");
+        let injected = temp.path().join("injected");
+        init_git_test_repo(&intended);
+        init_git_test_repo(&injected);
+        git_test_repo(&injected, &["checkout", "-b", "injected-branch"]);
+
+        let _git_dir = ScopedEnvVar::set("GIT_DIR", injected.join(".git"));
+        assert_eq!(
+            current_workspace_branch(&intended).as_deref(),
+            Some("main"),
+            "the workspace branch must never be selected from inherited GIT_DIR"
+        );
     }
 
     #[test]
