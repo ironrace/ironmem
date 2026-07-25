@@ -1,5 +1,5 @@
 ---
-description: Read a GitHub issue, score its complexity, and recommend one of three execution paths — DIRECT (TDD), SUPERPOWERS (writing-plans → subagent-driven-development), or COLLAB (Claude-driven /collab start). Advisory: prints a verdict and the exact next step, then confirms before invoking. Usage — /evaluate-issue <issue-number | #number | issue-url>
+description: Read a GitHub issue, score its complexity, and recommend DIRECT (TDD), SUPERPOWERS (writing-plans → subagent-driven-development), COLLAB (Claude-driven /collab start), or mandatory SPLIT above 10 tasks. Advisory: prints a verdict and the exact next step, then confirms before invoking. Usage — /evaluate-issue <issue-number | #number | issue-url>
 ---
 
 <!-- DERIVED FROM docs/EVALUATE_ISSUE.md — protocol changes must update all
@@ -69,20 +69,29 @@ itself a DIRECT signal.
 - **Blast radius** — files / crates / modules changed
 - **Design judgment** — architectural decisions (API/contract, state
   machine, migration, new subsystem)?
-- **Decomposability** — number of *independent* tasks
+- **Decomposability** — number of *independent* execution tasks; an estimate
+  above 10 requires `SPLIT`
 - **Spec clarity** — well-specified vs ambiguous / under-defined
 - **Verification value** — would adversarial second-model review materially
   de-risk it before merge?
 
 ## Step 4 — Decide (first match wins)
 
-Check in this order — DIRECT is cheapest (check first), COLLAB is most
-expensive (must be justified), SUPERPOWERS is the default middle. The counts
-below touch at the seams; when they overlap, the deciding factor is **task
-independence, not the number** (one tightly-coupled unit → DIRECT; two or
-more independently shippable tasks → SUPERPOWERS), and COLLAB's
+Check in this order — the hard `SPLIT` task-budget gate comes first, DIRECT is
+the cheapest route, COLLAB is the most expensive and must be justified, and
+SUPERPOWERS is the default middle. The counts below touch at the seams; when
+they overlap, the deciding factor is **task independence, not the number**
+(one tightly-coupled unit → DIRECT; two or more independently shippable tasks
+→ SUPERPOWERS), and COLLAB's
 design-judgment / adversarial-review triggers dominate its crate-count range
 (a purely mechanical 3+-crate rename is SUPERPOWERS, not COLLAB).
+
+0. **SPLIT** — choose before every other route when the issue credibly needs
+   **more than 10 independent execution tasks**. Do not start collab for the
+   parent. Propose 2+ independently executable child issues, each with focused
+   scope, acceptance criteria, dependencies, and a 1–10-task estimate. Never
+   merge unrelated work, weaken acceptance criteria, or discard scope merely to
+   fit the limit. Keep the parent open as the tracking issue.
 
 1. **DIRECT** — choose when **all** hold: ≤ ~2 files / single crate / module;
    one unit of work (1 task, or 2 steps too coupled to ship apart); no
@@ -113,7 +122,8 @@ Print exactly this shape:
 
 ```
 Issue #<number>: <title>
-Verdict: <DIRECT | SUPERPOWERS | COLLAB>
+Verdict: <DIRECT | SUPERPOWERS | COLLAB | SPLIT>
+Task estimate: <N | N+> independent execution tasks
 
 Why:
  - <signal>: <one-line evidence>
@@ -124,10 +134,20 @@ Blast radius: <N files, M crates> (<main ones>)
 Recommended path:
   <exact next step from the table below>
 
+For `SPLIT`, insert before the confirmation line:
+
+Child issues:
+  1. <title> — <scope, acceptance summary, 1–10 task estimate, dependencies>
+  2. <title> — <scope, acceptance summary, 1–10 task estimate, dependencies>
+  ...
+
 Proceed with this path? [y/N]
 ```
 
 Then **wait for the user**. On an explicit yes, invoke the recommended path.
+For `SPLIT`, create the proposed child GitHub issues, preserve relevant parent
+labels, add `Parent: #<number>` to each child body, and comment their links on
+the still-open parent. If a creation fails, report it and do not start collab.
 On anything else (including no response), stop without side effects.
 
 ### Codex path mapping
@@ -137,11 +157,14 @@ On anything else (including no response), stop without side effects.
 | DIRECT | Invoke the `test-driven-development` skill directly. |
 | SUPERPOWERS | Invoke the `writing-plans` skill on the issue spec; it flows into `subagent-driven-development`. |
 | COLLAB | `/collab` is Claude-driven. Recommend the user run `/collab start <one-line imperative task summary derived from the issue>` in a Claude terminal; Codex joins via the protocol. Do not paste the whole issue body. |
+| SPLIT | Create the confirmed child issues, then run `/evaluate-issue` for each child. |
 
 ## Invariants
 
 - **Read-only until the confirm gate.** Steps 1–4 never mutate state.
 - **Never auto-launch** — even an obvious DIRECT waits for `y`.
+- **Task-budget first** — an estimate above 10 tasks always yields `SPLIT`;
+  never launch collab for the oversized parent issue.
 - **Recommend one path, not a menu** — pick the single best fit and justify
   it; the user overrides by declining.
 - **Scan, don't trace** — Step 2 is a few grep/glob calls. If accurate

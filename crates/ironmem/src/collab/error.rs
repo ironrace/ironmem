@@ -25,6 +25,17 @@ pub enum CollabError {
     #[error("task_list must contain at least one task")]
     EmptyTaskList,
 
+    #[error(
+        "task_list contains {actual} tasks; a collab issue may contain at most {max} tasks; split it into smaller issues"
+    )]
+    TooManyTasks { actual: u32, max: u32 },
+
+    #[error("task_list_json must contain a canonical tasks array")]
+    InvalidTaskList,
+
+    #[error("task_list task count mismatch: declared {declared}, parsed {actual}")]
+    TaskListCountMismatch { declared: u32, actual: u32 },
+
     #[error("final_plan_hash not set — session has not reached PlanLocked")]
     PlanNotFinalized,
 

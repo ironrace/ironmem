@@ -14,6 +14,9 @@ ROOT = pathlib.Path(os.environ.get(
 PROMPTS = ROOT / ".claude-plugin" / "prompts"
 COMMAND = ROOT / ".claude-plugin" / "commands" / "collab.md"
 DOC = ROOT / "docs" / "COLLAB.md"
+EVALUATE_ISSUE_DOC = ROOT / "docs" / "EVALUATE_ISSUE.md"
+EVALUATE_ISSUE_CLAUDE = ROOT / ".claude-plugin" / "commands" / "evaluate-issue.md"
+EVALUATE_ISSUE_CODEX = ROOT / ".codex-plugin" / "prompts" / "evaluate-issue.md"
 CODEX_COMMAND = ROOT / ".codex-plugin" / "commands" / "collab.md"
 CODEX_PROMPTS = [
     ROOT / ".codex-plugin" / "prompts" / name
@@ -93,11 +96,13 @@ REQUIRED_TEMPLATE_SNIPPETS = {
     ],
     "collab-turn-task-list.md": [
         "Timebox: <=20 minutes",
+        "more than 10 tasks",
         "PlanLocked is pre-coding",
         "plan_file_path",
     ],
     "collab-turn-plan-finalize.md": [
         "Timebox: <=20 minutes",
+        "at most 10 tasks",
         "docs/superpowers/plans/YYYY-MM-DD-<short-feature>.md",
         "first auto-ack response",
         "get_drawer(id=<canonical_plan_ref.drawer_id>)",
@@ -129,6 +134,13 @@ REQUIRED_SENTINELS = ["<!-- LINT:worker-dispatch -->",
                       "<!-- LINT:bridge-worker-owned -->",
                       "<!-- LINT:fail-closed-tiering -->",
                       "<!-- LINT:dispatch-matrix -->"]
+REQUIRED_EVALUATE_ISSUE_SNIPPETS = [
+    "Verdict: <DIRECT | SUPERPOWERS | COLLAB | SPLIT>",
+    "Task estimate: <N | N+> independent execution tasks",
+    "more than 10",
+    "Child issues:",
+    "Parent: #<number>",
+]
 # Legacy inline-orchestrator instructions that must NOT survive the rewrite.
 FORBIDDEN_IN_COMMAND = [
     "Derive the `task_list` manifest from the markdown",
@@ -239,6 +251,19 @@ def check_failure_prefixes() -> None:
         if prefix not in doc_body:
             err(f"docs/COLLAB.md: recognized failure prefix {prefix!r} is "
                 f"never documented")
+
+
+def check_evaluate_issue_surfaces() -> None:
+    """Keep the evaluator's SPLIT safety contract in its three mirrors."""
+    for path in (EVALUATE_ISSUE_DOC, EVALUATE_ISSUE_CLAUDE, EVALUATE_ISSUE_CODEX):
+        if not path.exists():
+            err(f"{path.relative_to(ROOT)}: missing evaluate-issue surface")
+            continue
+        body = path.read_text()
+        for snippet in REQUIRED_EVALUATE_ISSUE_SNIPPETS:
+            if snippet not in body:
+                err(f"{path.relative_to(ROOT)}: missing evaluate-issue SPLIT contract "
+                    f"snippet {snippet!r}")
 
 
 def err(msg: str) -> None:
@@ -468,6 +493,7 @@ def main() -> int:
                 err(f"{prompt.relative_to(ROOT)}: missing required recovery/dispatch contract {required!r}")
 
     check_failure_prefixes()
+    check_evaluate_issue_surfaces()
 
     if errors:
         print("collab-turn template lint FAILED:")

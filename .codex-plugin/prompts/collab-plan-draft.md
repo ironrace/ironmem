@@ -58,8 +58,11 @@ The server enforces the blind-draft invariant: `collab_recv` does not reveal
 Claude's draft until you have submitted yours. Do not inspect files, drawers,
 or other state to bypass it. Build the draft strictly from `collab_status.task`.
 Make it concrete: goal, files, ordered small tasks, verification, risks, and
-acceptance criteria. Send exactly one `collab_send` with sender `codex`, topic
-`draft`, and the plan text. Exit immediately after a successful send.
+acceptance criteria. A collab issue may contain at most 10 execution tasks; if
+the work credibly needs more, draft an independently executable child-issue
+split rather than a single oversized plan. Send exactly one `collab_send` with
+sender `codex`, topic `draft`, and the plan text. Exit immediately after a
+successful send.
 
 If a duplicate active session is reported for the same repository and branch,
 join the reported session instead of retrying start. If a send is rejected,

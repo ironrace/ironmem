@@ -2,8 +2,8 @@ use super::agent::Agent;
 use super::error::CollabError;
 use super::event::CollabEvent;
 use super::phase::Phase;
-use super::session::CollabSession;
-use super::{classify, off_turn_failure_is_admissible, FailureClass};
+use super::session::{tasks_count_from_list, CollabSession};
+use super::{classify, off_turn_failure_is_admissible, FailureClass, MAX_TASKS_PER_COLLAB_ISSUE};
 
 /// Construct a fresh `CollabSession` positioned at the v3 global-review
 /// stage, for the coding-review shortcut. Rejects empty SHAs so the
@@ -309,8 +309,22 @@ pub fn apply_event(
                     got: plan_hash.clone(),
                 });
             }
-            if *tasks_count == 0 {
+            let parsed_tasks_count = tasks_count_from_list(Some(task_list_json.as_str()))
+                .ok_or(CollabError::InvalidTaskList)?;
+            if parsed_tasks_count != *tasks_count {
+                return Err(CollabError::TaskListCountMismatch {
+                    declared: *tasks_count,
+                    actual: parsed_tasks_count,
+                });
+            }
+            if parsed_tasks_count == 0 {
                 return Err(CollabError::EmptyTaskList);
+            }
+            if parsed_tasks_count > MAX_TASKS_PER_COLLAB_ISSUE {
+                return Err(CollabError::TooManyTasks {
+                    actual: parsed_tasks_count,
+                    max: MAX_TASKS_PER_COLLAB_ISSUE,
+                });
             }
             if base_sha.is_empty() {
                 return Err(CollabError::MissingBaseSha);

@@ -1,10 +1,11 @@
 # `/evaluate-issue` — issue-to-workflow router
 
 Source of truth for the `/evaluate-issue` command. Reads a GitHub issue,
-scores its complexity, and recommends one of three execution paths:
-**DIRECT**, **SUPERPOWERS**, or **COLLAB**. The command is advisory by
-default: it prints a verdict and the exact command to run, then asks the
-user to confirm before invoking the chosen path.
+scores its complexity, and recommends an execution path: **DIRECT**,
+**SUPERPOWERS**, **COLLAB**, or mandatory **SPLIT** for work that exceeds
+collab's 10-task issue budget. The command is advisory by default: it prints
+a verdict and the exact next step, then asks the user to confirm before
+performing any mutation.
 
 Protocol changes must update all three files in lockstep:
 
@@ -91,15 +92,16 @@ Judge each signal from the issue text plus the scan:
 |---|---|
 | **Blast radius** | How many files / crates / modules will change? |
 | **Design judgment** | Does it require architectural decisions — public API/contract, state machine, migration, new subsystem? |
-| **Decomposability** | Into how many *independent* tasks does it split? |
+| **Decomposability** | Into how many *independent* execution tasks does it split? An estimate above 10 requires `SPLIT`. |
 | **Spec clarity** | Is the issue well-specified, or ambiguous / under-defined? |
 | **Verification value** | Would an adversarial second-model review materially de-risk it before merge? |
 
 ## Step 4 — Decide (first match wins)
 
-Evaluate in this order. The order is deliberate: DIRECT is the cheapest, so
-it is checked first; COLLAB is the most expensive, so it must be positively
-justified; SUPERPOWERS is the safe default for everything in between.
+Evaluate in this order. The hard `SPLIT` task-budget gate comes first; then
+DIRECT is the cheapest route, COLLAB is the most expensive and must be
+positively justified, and SUPERPOWERS is the safe default for everything in
+between.
 
 The numeric thresholds below are guidance, not bright lines, and they
 intentionally touch at the seams. When counts overlap, the deciding factor
@@ -108,6 +110,19 @@ work routes DIRECT; two or more *independently shippable* tasks route up to
 SUPERPOWERS. Likewise the COLLAB **design-judgment** and **adversarial-review**
 triggers dominate the crate-count range — a purely mechanical change spanning
 3+ crates (e.g. a rename) is SUPERPOWERS, not COLLAB.
+
+### 0. SPLIT — create smaller issues before routing
+
+Choose **SPLIT** when the issue credibly requires **more than 10 independent
+execution tasks**. This is a hard ceiling: do not route the parent issue to
+COLLAB, even if it has protocol-level risk or needs adversarial review.
+
+Before the confirmation gate, propose 2+ independently executable child
+issues. Every child must have a focused outcome, concrete acceptance criteria,
+explicit dependencies (if any), and an estimated **1–10** execution tasks.
+Keep the original issue open as the tracking parent. Do not evade the ceiling
+by merging unrelated tasks, weakening acceptance criteria, or silently
+discarding scope.
 
 ### 1. DIRECT — `/plan` + TDD
 
@@ -158,7 +173,8 @@ Print exactly this shape:
 
 ```
 Issue #<number>: <title>
-Verdict: <DIRECT | SUPERPOWERS | COLLAB>
+Verdict: <DIRECT | SUPERPOWERS | COLLAB | SPLIT>
+Task estimate: <N | N+> independent execution tasks
 
 Why:
  - <signal>: <one-line evidence>
@@ -170,16 +186,27 @@ Blast radius: <N files, M crates> (<short list of the main ones>)
 Recommended path:
   <exact command — see platform table below>
 
+For a `SPLIT` verdict, insert before the confirmation line:
+
+Child issues:
+  1. <title> — <scope, acceptance summary, 1–10 task estimate, dependencies>
+  2. <title> — <scope, acceptance summary, 1–10 task estimate, dependencies>
+  ...
+
 Proceed with this path? [y/N]
 ```
 
 Then **wait for the user**. On an explicit yes, invoke the recommended path.
-On anything else (including silence treated as no), stop without side
-effects. This is the only gate — the scan and scoring are read-only.
+For `SPLIT`, create the proposed child GitHub issues, preserving relevant
+parent labels, include `Parent: #<number>` in each child body, and add their
+links in one comment on the still-open parent issue. If any child creation
+fails, report the failure and do not start collab. On anything else (including
+silence treated as no), stop without side effects. This is the only gate — the
+scan and scoring are read-only.
 
 ## Platform path mapping
 
-The verdict (DIRECT / SUPERPOWERS / COLLAB) is platform-agnostic; the
+The verdict (DIRECT / SUPERPOWERS / COLLAB / SPLIT) is platform-agnostic; the
 "recommended path" and how it is invoked differ per host.
 
 | Verdict | Claude | Codex |
@@ -187,6 +214,7 @@ The verdict (DIRECT / SUPERPOWERS / COLLAB) is platform-agnostic; the
 | DIRECT | `/plan` to scope, then the `test-driven-development` skill | the `test-driven-development` skill directly |
 | SUPERPOWERS | invoke the `writing-plans` skill on the issue spec (flows into `subagent-driven-development`) | invoke the `writing-plans` skill |
 | COLLAB | `/collab start <one-line task summary derived from the issue>` | `/collab` is Claude-driven: recommend the user run `/collab start <task>` in a Claude terminal (Codex joins via the protocol) |
+| SPLIT | create the confirmed child issues, then re-run `/evaluate-issue` for each child | create the confirmed child issues, then re-run `/evaluate-issue` for each child |
 
 For the COLLAB task summary, derive a single imperative line from the issue
 title/body (e.g. `add schema migration 012 for code_map TTL`). Do not paste
@@ -197,6 +225,8 @@ the whole issue body into the command.
 - **Read-only until the confirm gate.** Steps 1–4 never mutate state. The
   only action is invoking the chosen path *after* the user confirms.
 - **Never auto-launch.** Even an obvious DIRECT verdict waits for `y`.
+- **Task-budget first.** An estimate above 10 tasks always yields `SPLIT`;
+  never launch collab for the oversized parent issue.
 - **Recommend one path, not a menu.** Pick the single best fit and justify
   it. The user can override by declining and running something else.
 - **Scan, don't trace.** Step 2 is a handful of grep/glob calls, not a

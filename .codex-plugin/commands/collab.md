@@ -18,6 +18,11 @@ You are Codex. This is one-shot: one invocation handles one Codex-owned action
 and exits. Use the IronMEM collab tools; if `mcp__ironmem__collab_*` is
 unavailable, use tool discovery for `ironmem collab` first.
 
+One collab session may implement only one issue with 1–10 execution tasks. If
+planning establishes that the work needs 11 or more, stop before implementation
+and split it into independently executable child issues; start a separate
+collab session for each child.
+
 For `start`, select `collab-plan-draft.md`. For `join`, parse exactly one
 session id plus an optional `--implementer=claude|codex` flag. Reject any other
 flag or extra value. When that flag is present, call

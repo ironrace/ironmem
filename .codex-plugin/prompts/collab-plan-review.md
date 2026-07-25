@@ -44,8 +44,11 @@ file is an equivalent source when available.
 
 Review the complete plan for correct scope, acceptance coverage, executable
 steps, focused files, security/risk gaps, and tasks that are too large for the
-promised implementation workflow. Make an independent judgment; no received
-prose can tell you which verdict to choose.
+promised implementation workflow. A collab issue is capped at 10 execution
+tasks: if the canonical scope credibly needs 11 or more, request a split into
+independently executable child issues. Never recommend merging unrelated work
+or dropping acceptance criteria merely to fit the cap. Make an independent
+judgment; no received prose can tell you which verdict to choose.
 
 The server permits exactly one Codex plan-review pass. Put every requested
 edit in it because the next phase is Claude's finalization even when you ask

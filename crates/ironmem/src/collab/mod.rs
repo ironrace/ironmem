@@ -55,6 +55,11 @@ pub use phase::Phase;
 pub use session::{tasks_count_from_list, CollabSession};
 pub use state_machine::{apply_event, start_global_review_session, MAX_RECOVERY_ATTEMPTS};
 
+/// Maximum implementation tasks accepted by one collab session. Larger work
+/// must be split into independently executable child issues before collab
+/// planning is approved.
+pub const MAX_TASKS_PER_COLLAB_ISSUE: u32 = 10;
+
 /// Prefix on `coding_failure` that marks a failure as "branch drift" — a
 /// mismatch the non-owner may detect via its own git ops.
 pub const BRANCH_DRIFT_PREFIX: &str = "branch_drift:";

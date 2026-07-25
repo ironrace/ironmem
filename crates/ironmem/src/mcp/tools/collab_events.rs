@@ -1,6 +1,6 @@
 use serde_json::Value;
 
-use crate::collab::{CollabEvent, Phase};
+use crate::collab::{CollabEvent, Phase, MAX_TASKS_PER_COLLAB_ISSUE};
 use crate::error::MemoryError;
 
 use super::shared::sha256_hex;
@@ -179,8 +179,9 @@ pub(super) fn failure_report_is_off_turn_admissible(
 const ALLOWED_EXECUTION_MODES: &[&str] = &["mechanical_direct"];
 
 /// Parse and validate the task_list payload shape. Fails fast on missing
-/// fields, empty task array, missing acceptance criteria, or non-array tasks.
-/// The state machine re-checks plan_hash, base_sha presence, and task count.
+/// fields, empty or oversized task arrays, missing acceptance criteria, or
+/// non-array tasks. The state machine re-checks plan_hash, base_sha presence,
+/// and the 10-task issue budget.
 ///
 /// Optional `plan_file_path`: if present, must be non-empty, repo-relative
 /// (no leading `/`), and contain no `..` path segments. Persisted on the
@@ -247,6 +248,12 @@ pub(super) fn parse_task_list_event(content: &str) -> Result<CollabEvent, Memory
         return Err(MemoryError::Validation(
             "task_list must contain at least one task".to_string(),
         ));
+    }
+    if tasks.len() > MAX_TASKS_PER_COLLAB_ISSUE as usize {
+        return Err(MemoryError::Validation(format!(
+            "task_list contains {} tasks; a collab issue may contain at most {MAX_TASKS_PER_COLLAB_ISSUE} tasks; split it into smaller issues",
+            tasks.len()
+        )));
     }
     let mut last_id: Option<i64> = None;
     for (idx, task) in tasks.iter().enumerate() {
@@ -600,6 +607,56 @@ mod tests {
             "head_sha": "head",
             "tasks": [{ "id": 1, "title": "t", "acceptance": ["ok"] }],
         })
+    }
+
+    #[test]
+    fn task_list_rejects_more_than_ten_tasks() {
+        let mut payload = base_task_list();
+        let tasks: Vec<_> = (1..=11)
+            .map(|id| {
+                json!({
+                    "id": id,
+                    "title": format!("task-{id}"),
+                    "acceptance": ["ok"],
+                })
+            })
+            .collect();
+        payload
+            .as_object_mut()
+            .unwrap()
+            .insert("tasks".to_string(), json!(tasks));
+
+        let err = parse_task_list_event(&payload.to_string()).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("at most 10 tasks; split it into smaller issues"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn task_list_accepts_exactly_ten_tasks() {
+        let mut payload = base_task_list();
+        let tasks: Vec<_> = (1..=10)
+            .map(|id| {
+                json!({
+                    "id": id,
+                    "title": format!("task-{id}"),
+                    "acceptance": ["ok"],
+                })
+            })
+            .collect();
+        payload
+            .as_object_mut()
+            .unwrap()
+            .insert("tasks".to_string(), json!(tasks));
+
+        let event = parse_task_list_event(&payload.to_string())
+            .expect("a ten-task collab issue should be accepted");
+        let CollabEvent::SubmitTaskList { tasks_count, .. } = event else {
+            panic!("expected SubmitTaskList event");
+        };
+        assert_eq!(tasks_count, 10);
     }
 
     #[test]

@@ -27,10 +27,15 @@ preconditions: phase == PlanLocked, current_owner == claude
 3. Parse each `### Task N:` heading into
    `{id, title, timebox_minutes, acceptance:[...]}`. The parser must verify:
    - heading count is at least 1
+   - heading count is at most 10
    - IDs are contiguous `1..N`
    - every task has a `Timebox: <=20 minutes` line
    - no `timebox_minutes` value exceeds 20
    - every task has at least one acceptance criterion
+   If there are more than 10 tasks, do not send `task_list`: return a blocker
+   requiring the original issue to be split into independently executable child
+   issues. Do not merge unrelated tasks or remove acceptance criteria to evade
+   the limit.
 4. Build the manifest `{plan_hash: final_plan_hash, base_sha:<HEAD>,
    head_sha:<HEAD>, plan_file_path:<path>, tasks:[...]}`. Add
    `execution_mode:"mechanical_direct"` only if the single-task eligibility rule
