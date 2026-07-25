@@ -1058,11 +1058,25 @@ mod tests {
         assert!((added["dedup_hint"]["score"].as_f64().unwrap() - 1.0).abs() < f64::EPSILON);
 
         let lower_than_threshold = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+        let lower_similarity_vector = {
+            let mut vector = vec![0.0; ironrace_embed::EMBED_DIM];
+            vector[0] = 0.9;
+            vector[1] = 1.0;
+            vector
+        };
+        let cosine = lower_similarity_vector[0]
+            / (lower_similarity_vector
+                .iter()
+                .map(|value| value * value)
+                .sum::<f32>())
+            .sqrt();
+        assert_eq!(lower_similarity_vector.len(), vector.len());
+        assert!(cosine < 0.92, "fixture must be below the dedup threshold");
         app.db
             .insert_drawer(
                 lower_than_threshold,
                 "not similar enough",
-                &[0.9, 1.0],
+                &lower_similarity_vector,
                 "project",
                 "other-state",
                 "",
