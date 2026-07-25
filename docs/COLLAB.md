@@ -506,11 +506,12 @@ Invariants that still apply:
   still unset. Both Codex's `review_fix_global` push and Claude's
   `review_local` audit-push must descend from the prior `last_head_sha`.
   Full-flow v3 sessions keep their existing non-shell-out behavior.
-- **Process attribution:** one active collab session per MCP server process
-  (any repo). On the error `"another active collab session is already bound to
-  this MCP process for metrics attribution: <id>"`, do not retry blindly —
-  `collab_end` the named session if it is finished, or run the new session from
-  a separate server process.
+- **Scoped attribution:** one live collab session may own each
+  `(repo_path, branch)` scope. A shared daemon may therefore run live sessions
+  for different repositories or branches concurrently. A second live session
+  in the *same* scope is refused; use another branch, or finish the existing
+  session first. Missing, ended, and coding-terminal bindings self-heal only
+  in their own scope and never clear an unrelated live session.
 
 ### Deployment
 
@@ -785,28 +786,30 @@ on the `implementer` column enforces the same set, so direct writes
 cannot bypass validation.
 
 **Duplicate-session guard.** `collab_start` (and `collab_start_code_review`)
-reject the call when an **active** session already exists for the same
-`repo_path` + `branch`. "Active" means `ended_at IS NULL` — including a
-session sitting at a terminal phase (`CodingComplete` / `CodingFailed`) that
-was never explicitly ended. The error names the existing `session_id` and its
-phase. This prevents an accidental second session — most often a fired
-`ScheduleWakeup` replaying the `/collab start` entry command after the first
-session already finished. To proceed deliberately, either resume the existing
-session (`/collab join <id>`) or `collab_end` it first (valid only from
-`PlanLocked` pre-`task_list`, `CodingComplete`, or `CodingFailed`).
+reject the call when a live, non-terminal session already exists for the same
+`repo_path` + `branch`. This prevents an accidental second session — most
+often a fired `ScheduleWakeup` replaying the `/collab start` entry command.
+Different repositories and branches may proceed concurrently through one
+shared daemon. `CodingComplete` and `CodingFailed` do not reserve the
+start/attribution slot: a new session may claim that scope before
+`collab_end`.
 
-**Process attribution guard.** `collab_start`, `collab_start_code_review`,
-`collab_send`, `collab_recv`, and `collab_wait_my_turn` also reject the call
-when this MCP server process is already bound to a *different* still-live
-session for metrics attribution (regardless of repo or branch). The error
-message is: `"another active collab session is already bound to this MCP
-process for metrics attribution: <id>. End it or use a separate server process
-before switching to <requested_id>."` Remedy: call `collab_end` on the named
-session if it is finished, or run the new session from a separate server
-process. Stale or ended sessions self-clear automatically — no manual cleanup
-is needed for those. On the error `"could not verify active collab session"`,
-check the server logs for the underlying DB error detail; retry after the
-underlying issue clears.
+`collab_end` still matters. From `CodingComplete` it is the operator's
+completion attestation; from `CodingFailed` it records the terminal end when
+the session will not be retried. A tooling-class `CodingFailed` session that
+has not been ended remains resumable, unless a newer live session now owns the
+same scope. In that case the older session cannot reclaim the scope by
+resuming it.
+
+**Scoped attribution guard.** `collab_start`, `collab_start_code_review`,
+`collab_send`, `collab_recv`, `collab_wait_my_turn`, and `collab_resume` only
+conflict with a different still-live session in the same `(repo_path, branch)`
+scope. The refusal names the existing session and tells the caller to end it
+or use a different repository branch. Stale, missing, ended, and
+coding-terminal bindings self-clear automatically only for their matching
+scope; no manual cleanup or separate daemon is needed for independent repos
+or branches. On `"could not verify active collab session"`, check the server
+logs for the underlying DB error detail and retry after that issue clears.
 
 ### `collab_set_implementer`
 

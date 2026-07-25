@@ -338,6 +338,36 @@ lockfile — no separate process manager, cron job, or `kill` required.
 - The lockfile used for single-flight auto-spawn carries only a pid (used to
   detect a dead owner) — no secrets, no credentials.
 
+### Concurrent Collab Sessions
+
+Shared-daemon mode supports concurrent Collab sessions. Attribution is scoped
+to `(repo_path, branch)`, so different repositories and branches can coexist
+through one daemon; a second live session in the same scope is refused. There
+is no need to run separate daemons for independent repositories.
+
+`CodingComplete` and `CodingFailed` no longer reserve the scope's
+start/attribution slot, so a new live session can begin there before
+`collab_end`. `collab_end` still supplies the completion attestation for a
+completed session. An unended tooling-class failure stays resumable unless a
+newer live session has claimed the same scope. Missing, ended, and terminal
+bindings self-heal only for their own scope.
+
+The `status` tool reports the current bindings deterministically:
+
+```json
+{
+  "active_collab_sessions": [
+    {"repo_path":"/work/api","branch":"main","session_id":"sess-api"},
+    {"repo_path":"/work/web","branch":"feature/ui","session_id":"sess-web"}
+  ],
+  "active_collab_session_id": null
+}
+```
+
+`active_collab_sessions` is sorted by `repo_path`, then `branch`, then
+`session_id`. The legacy `active_collab_session_id` is non-null only when
+exactly one scope is active; otherwise it is `null`.
+
 ### Wiring a new harness
 
 Registering a harness's MCP client with the shared-daemon proxy command is
@@ -809,6 +839,11 @@ On every prompt, ironmem runs an FTS/BM25-only drawer lookup (the embedder is ne
 ### Metrics (instrumentation; on by default)
 
 ironmem records lightweight per-call metrics (MCP response sizing + transcript occupancy) into the migration-008 tables. See `docs/METRICS_SPEC.md` (§5, §8). All writes are best-effort — a metrics failure never breaks an MCP response or a hook.
+
+Collab tool responses use their explicit session IDs for metrics attribution.
+An unscoped call is stamped only when exactly one Collab scope is live; with
+multiple scopes it is deliberately unstamped rather than assigned to the wrong
+session.
 
 | Variable | Default | Effect |
 |---|---|---|
