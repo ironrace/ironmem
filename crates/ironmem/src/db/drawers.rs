@@ -1038,4 +1038,141 @@ mod tests {
         assert!(err.to_string().contains("forced wal failure"));
         assert!(db.get_drawer(id).unwrap().is_none());
     }
+
+    #[test]
+    fn mark_drawer_superseded_tx_updates_only_a_current_same_scope_predecessor() {
+        let db = Database::open_in_memory().unwrap();
+        let emb = dummy_embedding();
+        let predecessor = "predecessor00000000000000000000001";
+        let successor = "successor0000000000000000000000001";
+        db.insert_drawer(predecessor, "old", &emb, "wing", "room", "", "test")
+            .unwrap();
+        db.insert_drawer(successor, "new", &emb, "wing", "room", "", "test")
+            .unwrap();
+
+        db.with_transaction(|tx| {
+            Database::mark_drawer_superseded_tx(tx, predecessor, successor, "wing", "room")
+        })
+        .unwrap();
+
+        assert_eq!(
+            db.get_drawer(predecessor).unwrap().unwrap().superseded_by,
+            Some(successor.to_string())
+        );
+
+        let already_superseded = db
+            .with_transaction(|tx| {
+                Database::mark_drawer_superseded_tx(tx, predecessor, successor, "wing", "room")
+            })
+            .unwrap_err();
+        assert!(matches!(already_superseded, MemoryError::Validation(_)));
+        assert!(already_superseded
+            .to_string()
+            .contains("already superseded"));
+    }
+
+    #[test]
+    fn mark_drawer_superseded_tx_rejects_missing_and_cross_scope_predecessors() {
+        let db = Database::open_in_memory().unwrap();
+        let emb = dummy_embedding();
+        let predecessor = "scopepredecessor00000000000000001";
+        let successor = "scopesuccessor00000000000000000001";
+        db.insert_drawer(predecessor, "old", &emb, "other-wing", "room", "", "test")
+            .unwrap();
+        db.insert_drawer(successor, "new", &emb, "wing", "room", "", "test")
+            .unwrap();
+
+        let missing = db
+            .with_transaction(|tx| {
+                Database::mark_drawer_superseded_tx(tx, "missing", successor, "wing", "room")
+            })
+            .unwrap_err();
+        assert!(matches!(missing, MemoryError::NotFound(_)));
+        assert!(missing.to_string().contains("not found"));
+
+        let cross_scope = db
+            .with_transaction(|tx| {
+                Database::mark_drawer_superseded_tx(tx, predecessor, successor, "wing", "room")
+            })
+            .unwrap_err();
+        assert!(matches!(cross_scope, MemoryError::Validation(_)));
+        assert!(cross_scope
+            .to_string()
+            .contains("does not belong to wing/room"));
+    }
+
+    #[test]
+    fn find_near_duplicate_returns_deterministic_current_same_scope_match() {
+        let db = Database::open_in_memory().unwrap();
+        let query = vec![1.0, 0.0];
+        let id_a = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let id_b = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+        let excluded = "cccccccccccccccccccccccccccccccc";
+        db.insert_drawer(id_b, "same", &query, "wing", "room", "", "test")
+            .unwrap();
+        db.insert_drawer(id_a, "same", &query, "wing", "room", "", "test")
+            .unwrap();
+        db.insert_drawer(excluded, "same", &query, "wing", "room", "", "test")
+            .unwrap();
+        db.insert_drawer(
+            "dddddddddddddddddddddddddddddddd",
+            "other scope",
+            &query,
+            "other-wing",
+            "room",
+            "",
+            "test",
+        )
+        .unwrap();
+        db.conn
+            .execute(
+                "UPDATE drawers SET superseded_by = 'newer' WHERE id = ?1",
+                [id_a],
+            )
+            .unwrap();
+        db.conn
+            .execute(
+                "UPDATE drawers SET embedding = ?1 WHERE id = ?2",
+                rusqlite::params![vec![0_u8; 3], id_b],
+            )
+            .unwrap();
+
+        let duplicate = db
+            .find_near_duplicate(&query, "wing", "room", excluded)
+            .unwrap()
+            .expect("a current, in-scope duplicate");
+        assert_eq!(duplicate.0, id_b);
+        assert!((duplicate.1 - 1.0).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn find_near_duplicate_rejects_zero_norm_and_below_threshold_candidates() {
+        let db = Database::open_in_memory().unwrap();
+        let query = vec![1.0, 0.0];
+        db.insert_drawer(
+            "zero000000000000000000000000000000",
+            "zero",
+            &[0.0, 0.0],
+            "wing",
+            "room",
+            "",
+            "test",
+        )
+        .unwrap();
+        db.insert_drawer(
+            "low0000000000000000000000000000000",
+            "low",
+            &[0.9, 1.0],
+            "wing",
+            "room",
+            "",
+            "test",
+        )
+        .unwrap();
+
+        assert!(db
+            .find_near_duplicate(&query, "wing", "room", "excluded")
+            .unwrap()
+            .is_none());
+    }
 }

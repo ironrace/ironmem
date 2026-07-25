@@ -449,7 +449,7 @@ mod tests {
         // fully-migrated database reports — doctor compares against it.
         let db = Database::open_in_memory().unwrap();
         assert_eq!(LATEST_SCHEMA_VERSION, db.schema_version().unwrap());
-        assert_eq!(LATEST_SCHEMA_VERSION, 16);
+        assert_eq!(LATEST_SCHEMA_VERSION, 17);
     }
 
     #[test]
@@ -1443,5 +1443,49 @@ mod tests {
         db.migrate().unwrap();
         db.migrate().unwrap();
         assert_eq!(schema_version_of(&db), LATEST_SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn test_v16_to_v17_adds_drawer_supersession_and_preserves_legacy_drawers() {
+        let db = open_at_v15();
+        db.conn.execute_batch(COLLAB_MESSAGE_DRAWERS_SQL).unwrap();
+        assert_eq!(schema_version_of(&db), 16);
+        assert!(
+            !column_exists(&db, "drawers", "superseded_by"),
+            "superseded_by should not exist at v16"
+        );
+
+        db.conn
+            .execute(
+                "INSERT INTO drawers (id, content, embedding, wing, room, source_file, added_by)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                rusqlite::params![
+                    "legacy-v16-drawer",
+                    "legacy drawer",
+                    vec![0_u8; EMBED_DIM * std::mem::size_of::<f32>()],
+                    "legacy-wing",
+                    "legacy-room",
+                    "",
+                    "test"
+                ],
+            )
+            .unwrap();
+
+        db.migrate().unwrap();
+        assert_eq!(schema_version_of(&db), LATEST_SCHEMA_VERSION);
+        assert!(column_exists(&db, "drawers", "superseded_by"));
+        assert!(index_exists(&db, "idx_drawers_current_wing_room"));
+        let superseded_by: Option<String> = db
+            .conn
+            .query_row(
+                "SELECT superseded_by FROM drawers WHERE id = ?1",
+                ["legacy-v16-drawer"],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(
+            superseded_by.is_none(),
+            "legacy drawers must remain current"
+        );
     }
 }
