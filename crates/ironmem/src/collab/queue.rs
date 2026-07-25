@@ -168,16 +168,16 @@ pub fn find_active_session_by_repo_branch(
 }
 
 /// Newest active session for a repo path, branch-agnostic, returning
-/// `(id, phase)`. Companion to `find_active_session_by_repo_branch` for
-/// callers that lack a branch (e.g. the session-start hook, which only knows
-/// the workspace root). "Active" is `ended_at IS NULL`; ambiguity across
-/// branches is intentionally resolved as the newest active session for the
-/// repo (`created_at DESC, id DESC`).
+/// `(id, phase)`. This is for explicitly branch-agnostic callers only;
+/// workspace-bound hook attribution must use
+/// [`find_active_session_by_repo_branch`] after resolving the current branch.
+/// "Active" is `ended_at IS NULL`; ambiguity across branches is intentionally
+/// resolved as the newest active session for the repo (`created_at DESC, id DESC`).
 ///
 /// `phase` is returned as the raw column string (not parsed into [`Phase`]) on
-/// purpose, so the infallible session-start hook can treat it as an opaque
-/// display value; parsing here would add a failure path that caller must not
-/// have. Use [`load_session`] when a typed [`Phase`] is required.
+/// purpose, so branch-agnostic display callers can treat it as an opaque value;
+/// parsing here would add a failure path they do not need. Use [`load_session`]
+/// when a typed [`Phase`] is required.
 pub fn find_active_session_by_repo(
     conn: &Connection,
     repo_path: &str,

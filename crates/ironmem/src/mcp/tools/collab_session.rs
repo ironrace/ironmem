@@ -1535,7 +1535,23 @@ pub(super) fn handle_collab_resume(app: &App, args: &Value) -> Result<Value, Mem
         // (the common case: nobody has called `collab_end` on it yet) passes
         // through untouched.
         crate::collab::queue::ensure_active(tx, session_id)?;
-        let session = crate::collab::queue::load_session(tx, session_id)?;
+        let record = crate::collab::queue::load_session_record(tx, session_id)?;
+        if let Some((newer_session_id, phase)) =
+            crate::collab::queue::find_active_session_by_repo_branch(
+                tx,
+                &record.repo_path,
+                &record.branch,
+            )?
+        {
+            if newer_session_id != session_id {
+                return Err(MemoryError::Validation(format!(
+                    "cannot resume collab session {session_id}: newer active session {newer_session_id} \
+                     (phase {phase}) owns repo {} branch {}",
+                    record.repo_path, record.branch
+                )));
+            }
+        }
+        let session = record.session;
         let next = apply_event(&session, agent, &CollabEvent::ResumeCoding)
             .map_err(collab_error_to_memory_error)?;
         crate::collab::queue::save_session(tx, &next)?;
@@ -3411,6 +3427,45 @@ mod tests {
         assert!(
             result.is_ok(),
             "cross-scope resume must be allowed: {result:?}"
+        );
+    }
+
+    #[test]
+    fn collab_resume_rejects_newer_live_same_scope_after_cold_start() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("mem.sqlite3");
+        let old_owner = test_app_with_db_path(db_path.clone(), dir.path());
+
+        let old_session = start_session_in_scope(&old_owner, "/tmp/repo", "main");
+        drive_to_tooling_coding_failed(&old_owner, &old_session);
+
+        // A separate process starts a newer live session in the same scope.
+        // `CodingFailed` deliberately does not block that start.
+        let new_owner = test_app_with_db_path(db_path.clone(), dir.path());
+        let newer_session = start_session_in_scope(&new_owner, "/tmp/repo", "main");
+
+        // A cold process has no in-memory binding to catch this conflict, so
+        // resume must consult the durable same-scope owner inside its transaction.
+        let cold_resumer = test_app_with_db_path(db_path, dir.path());
+        let err = handle_collab_resume(
+            &cold_resumer,
+            &json!({ "session_id": old_session, "agent": "codex" }),
+        )
+        .unwrap_err();
+
+        assert!(
+            err.to_string().contains(&newer_session),
+            "rejection must name the newer same-scope session: {err}"
+        );
+        assert_eq!(
+            cold_resumer
+                .db
+                .collab_load_session_record(&old_session)
+                .unwrap()
+                .session
+                .phase,
+            Phase::CodingFailed,
+            "the old session must remain terminal after rejected resume"
         );
     }
 
