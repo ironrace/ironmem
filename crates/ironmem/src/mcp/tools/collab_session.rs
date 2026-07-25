@@ -1293,12 +1293,33 @@ pub(super) fn wait_my_turn_deadline(
     arrival_deadline.max(floor_deadline)
 }
 
-/// Validate the arguments and settle the generation, once, before any polling.
+/// Claim the generation and capture the matching wait baseline in one
+/// transaction.
 ///
-/// Run in its own transaction ahead of the loop: the loop makes no collab-state
-/// write that must be atomic with the claim, and a token claim commits
-/// unconditionally before polling begins, so the process cache update is
-/// correct even if the session snapshot is read later on a separate connection.
+/// A handoff claim is a write, so separating it from the baseline read would
+/// admit a committed phase/owner/recovery transition into the baseline and
+/// silently miss the wake it should cause. Reading the session record through
+/// the same transaction gives a transactionally consistent post-claim point.
+fn wait_my_turn_claim_and_capture_baseline(
+    app: &App,
+    tx: &rusqlite::Transaction<'_>,
+    session_id: &str,
+    agent: Agent,
+    args: &Value,
+) -> Result<WaitTurnBaseline, MemoryError> {
+    super::handoff::ensure_actor_generation_current(
+        app,
+        tx,
+        session_id,
+        agent,
+        super::handoff::opt_handoff_token(args).as_deref(),
+    )?;
+    let record = crate::collab::queue::load_session_record(tx, session_id)?;
+    Ok(wait_turn_snapshot(&record, agent).baseline)
+}
+
+/// Validate the arguments, settle the generation, and capture one baseline
+/// before any polling.
 ///
 /// Split out of the handler so the claim happens exactly ONCE per request even
 /// when the polling is driven from outside — claiming on every poll would try
@@ -1318,20 +1339,12 @@ pub(super) fn wait_my_turn_begin(app: &App, args: &Value) -> Result<WaitTurnBase
     ensure_no_conflicting_process_session(app, session_id)?;
     let agent = require_agent(require_str(args, "agent")?)?;
 
-    app.db.with_transaction(|tx| {
-        super::handoff::ensure_actor_generation_current(
-            app,
-            tx,
-            session_id,
-            agent,
-            super::handoff::opt_handoff_token(args).as_deref(),
-        )
+    let baseline = app.db.with_transaction(|tx| {
+        wait_my_turn_claim_and_capture_baseline(app, tx, session_id, agent, args)
     })?;
 
     app.set_active_collab_session(session_id);
-    let record = app.db.collab_load_session_record(session_id)?;
-    let snapshot = wait_turn_snapshot(&record, agent);
-    Ok(snapshot.baseline)
+    Ok(baseline)
 }
 
 /// One snapshot read. Returns the response body and whether it SETTLES the wait
@@ -1885,6 +1898,61 @@ mod tests {
             json!({"unchanged": true}),
             "an other-owned session that remains unsettled through the timeout must return the compact frame"
         );
+    }
+
+    #[test]
+    fn wait_my_turn_claim_baseline_is_captured_in_the_claim_transaction() {
+        let app = test_app();
+        let sid = start_session(&app);
+        let token = app
+            .db
+            .with_transaction(|tx| {
+                crate::collab::handoff::issue_or_reuse_handoff(tx, &sid, Agent::Codex)
+            })
+            .unwrap()
+            .token;
+        let wait_args = json!({
+            "session_id": sid,
+            "agent": "codex",
+            "handoff_token": token,
+        });
+
+        let baseline = app
+            .db
+            .with_transaction(|tx| {
+                let baseline = wait_my_turn_claim_and_capture_baseline(
+                    &app,
+                    tx,
+                    wait_args["session_id"].as_str().unwrap(),
+                    Agent::Codex,
+                    &wait_args,
+                )?;
+
+                let mut session = crate::collab::queue::load_session(
+                    tx,
+                    wait_args["session_id"].as_str().unwrap(),
+                )?;
+                session.phase = Phase::PlanSynthesisPending;
+                crate::collab::queue::save_session(tx, &session)?;
+                let after = wait_turn_snapshot(
+                    &crate::collab::queue::load_session_record(
+                        tx,
+                        wait_args["session_id"].as_str().unwrap(),
+                    )?,
+                    Agent::Codex,
+                )
+                .baseline;
+
+                assert_ne!(
+                    baseline, after,
+                    "the later transaction mutation must not be folded into the baseline"
+                );
+                Ok(baseline)
+            })
+            .unwrap();
+
+        assert_eq!(baseline.phase, "PlanParallelDrafts");
+        assert_eq!(baseline.current_owner, "claude");
     }
 
     #[test]
