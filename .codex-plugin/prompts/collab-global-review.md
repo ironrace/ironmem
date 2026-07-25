@@ -46,7 +46,8 @@ the working-tree diff before fetch, checkout, or reset. Complete the
 interrupted phase's gates, commit and push recovered work, then send that
 phase's normal completion event exactly once.
 
-For a full-flow session, read the approved task list and its `plan_file_path`
+For a full-flow session, load the approved task list through `task_list_ref`,
+verify its SHA-256 against `task_list_ref.hash`, and read its `plan_file_path`
 alongside the complete diff from `base_sha` to `last_head_sha`. For a shortcut
 session where `task_list` is null, search IronMEM checkpoints for the same
 `repo_path` and branch, read any referenced plan, and scan the branch diff; if

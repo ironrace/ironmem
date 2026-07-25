@@ -813,19 +813,25 @@ fn collab_request_changes_advances_to_finalize_and_locks() {
     assert_eq!(canonical_ref.len(), 32);
     assert_eq!(final_ref.len(), 32);
     assert_ne!(canonical_ref, final_ref);
-    // A fresh agent joining at PlanLocked must still be able to pull the full
-    // plan text back without recv'ing its own previously-sent (and peer-acked)
-    // outbound message — now via verbose:true. The final body is the PARSED
-    // plan text (the drawer stores the parsed body, whose sha256 is
-    // final_plan_hash), no longer the {"plan":...} JSON wrapper.
+    // A fresh agent joining at PlanLocked deliberately dereferences each plan
+    // drawer. `verbose:true` remains accepted but must not reintroduce inline
+    // plan text. The final drawer stores the PARSED plan text rather than the
+    // {"plan":...} transport wrapper.
     let verbose = call_tool(
         &app,
         "collab_status",
         json!({ "session_id": session_id, "verbose": true }),
     );
-    assert_eq!(verbose["canonical_plan"], "Merged canonical v1");
+    assert!(verbose.get("canonical_plan").is_none());
+    assert!(verbose.get("final_plan").is_none());
+    assert_eq!(verbose["canonical_plan_ref"]["drawer_id"], canonical_ref);
+    assert_eq!(verbose["final_plan_ref"]["drawer_id"], final_ref);
+
+    let canonical_drawer = call_tool(&app, "get_drawer", json!({ "id": canonical_ref }));
+    let final_drawer = call_tool(&app, "get_drawer", json!({ "id": final_ref }));
+    assert_eq!(canonical_drawer["content"], "Merged canonical v1");
     assert_eq!(
-        verbose["final_plan"],
+        final_drawer["content"],
         "Final plan: canonical v1 + Codex's changes"
     );
 }

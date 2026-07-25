@@ -13,18 +13,17 @@ preconditions: phase == PlanLocked, current_owner == claude
 > only; never paste the plan markdown or the manifest.
 
 ## State discovery
-1. `collab_status(session_id=$SESSION_ID, verbose:true)`; read `final_plan`,
+1. `collab_status(session_id=$SESSION_ID)`; read `final_plan_ref`,
    `final_plan_hash`, `repo_path`, and `branch`. Read current `HEAD` via git.
 
 ## Actions
-1. Extract `plan_file_path` from the leading markdown comment:
-   `<!-- plan_file_path: <repo-relative path> -->`.
-   If it is missing or not repo-relative, do not send; return a blocker.
-2. Verify the file at `plan_file_path` exists under `repo_path`. If it is
-   missing, recreate it from the exact `final_plan` body and create parent
-   directories as needed. If it exists, its content must be byte-identical to
-   `final_plan`; otherwise do not send and return a blocker.
-3. Parse each `### Task N:` heading into
+1. Read `plan_file_path` from `final_plan_ref.plan_file_path`. If it is missing
+   or not repo-relative, do not send; return a blocker.
+2. Verify the file at `plan_file_path` exists under `repo_path` and its
+   SHA-256 equals both `final_plan_ref.hash` and `final_plan_hash`. Otherwise
+   do not send and return a blocker. Do not fetch a plan drawer or recreate the
+   file: the file plus hash is the approved-plan transport.
+3. Parse the verified plan file's `### Task N:` headings into
    `{id, title, timebox_minutes, acceptance:[...]}`. The parser must verify:
    - heading count is at least 1
    - heading count is at most 10

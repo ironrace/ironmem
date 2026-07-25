@@ -58,6 +58,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Breaking: `collab_status` returns plan and task-list references only
+  (#207).** `verbose:true` no longer inlines accepted plan bodies; plan refs
+  now carry `{drawer_id, hash, plan_file_path}` so bridge workers verify the
+  approved file directly. `include_task_list:true` now returns the compact
+  `{drawer_id, hash}` reference instead of task-list JSON; callers load the
+  manifest through `get_drawer` and verify its hash.
 - **Breaking: `search` response shape changed (#213).** The default response
   changed from `content` to `excerpt` + `content_mode`, with a stable `id`
   reference. Migrate by passing `full:true` for bounded full-content search

@@ -131,7 +131,6 @@ fn task_list_ref_json(drawer_id: Option<&str>, body: Option<&str>) -> Option<Val
     Some(json!({
         "drawer_id": drawer_id,
         "hash": sha256_hex(body),
-        "first_200_chars": body.chars().take(200).collect::<String>(),
     }))
 }
 
@@ -981,24 +980,30 @@ pub(super) fn handle_collab_ack(app: &App, args: &Value) -> Result<Value, Memory
     Ok(json!({ "ok": true }))
 }
 
-/// Build the compact plan reference object surfaced by `collab_status` when an
-/// accepted plan body is filed as a drawer (post-009 sessions). The full body
-/// is dereferenced by `drawer_id` only on `verbose:true`; here we expose a
-/// fixed-size peek so a joining agent can recognize the plan without paying for
-/// the whole body.
-fn plan_ref_json(drawer_id: &str, hash: Option<&str>, body: &str) -> Value {
+/// Read the required leading plan-file marker without exposing the plan body.
+fn plan_file_path_from_plan(body: &str) -> Option<String> {
+    let first_nonblank = body.lines().find(|line| !line.trim().is_empty())?.trim();
+    first_nonblank
+        .strip_prefix("<!-- plan_file_path: ")?
+        .strip_suffix(" -->")
+        .map(str::to_string)
+}
+
+/// Build the reference-only plan shape surfaced by `collab_status`. A caller
+/// that needs plan content deliberately dereferences `drawer_id`; status never
+/// includes body text, including when `verbose:true` is requested.
+fn plan_ref_json(drawer_id: Option<&str>, hash: Option<&str>, body: &str) -> Value {
     json!({
         "drawer_id": drawer_id,
         "hash": hash,
-        // char-boundary safe: take 200 CHARS, not bytes.
-        "first_200_chars": body.chars().take(200).collect::<String>(),
+        "plan_file_path": plan_file_path_from_plan(body),
     })
 }
 
-/// Render one accepted plan (`canonical` or `final`) into `status`. Post-009
-/// sessions carry a `drawer_id`: we emit a compact `<kind>_plan_ref` and, only
-/// under `verbose`, inline the full `<kind>_plan` body. Pre-009 sessions have a
-/// NULL drawer id; we preserve the historical inline-from-messages behavior.
+/// Render one accepted plan (`canonical` or `final`) into `status` as a
+/// reference. Legacy sessions still read their persisted message internally so
+/// callers retain a verifiable hash/path, but their plan text never crosses the
+/// MCP boundary.
 fn render_plan(
     db: &crate::db::schema::Database,
     status: &mut Value,
@@ -1006,27 +1011,21 @@ fn render_plan(
     kind: &str, // "canonical" | "final"
     drawer_id: Option<&str>,
     hash: Option<&str>,
-    verbose: bool,
-) -> Result<(), MemoryError> {
+) -> Result<Option<String>, MemoryError> {
     let ref_key = format!("{kind}_plan_ref");
-    let body_key = format!("{kind}_plan");
-    match drawer_id {
+    let body = match drawer_id {
         Some(id) => {
             let drawer = db.get_drawer(id)?.ok_or_else(|| {
                 MemoryError::Validation(format!(
                     "{kind}_plan_drawer_id {id} points to a missing drawer"
                 ))
             })?;
-            status[ref_key] = plan_ref_json(id, hash, &drawer.content);
-            if verbose {
-                status[body_key] = Value::String(drawer.content);
-            }
+            status[ref_key] = plan_ref_json(Some(id), hash, &drawer.content);
+            Some(drawer.content)
         }
         None => {
-            // Legacy (pre-009): drawer id NULL. Inline full body from messages
-            // when the plan hash is present. Canonical was always raw text;
-            // final was stored as {"plan": "..."} but is normalized here so
-            // collab_status consistently exposes final_plan as plan text.
+            // Legacy (pre-009): drawer id NULL. Read from messages only to
+            // expose a compact reference, never to inline a plan body.
             // The `parse_final_payload` below cannot fail on a persisted final
             // message: `build_collab_event` (at the top of `handle_collab_send`,
             // before `send_message` persists the raw content) already ran
@@ -1040,7 +1039,8 @@ fn render_plan(
                         } else {
                             content
                         };
-                        status[body_key] = Value::String(body);
+                        status[ref_key] = plan_ref_json(None, hash, &body);
+                        Some(body)
                     }
                     None => {
                         // A locked plan hash with no backing message is an
@@ -1052,27 +1052,25 @@ fn render_plan(
                             kind = %kind,
                             "collab_status: {kind}_plan_hash set but no {kind} message found"
                         );
+                        None
                     }
                 }
+            } else {
+                None
             }
         }
-    }
-    Ok(())
+    };
+    Ok((kind == "final")
+        .then(|| body.as_deref().and_then(plan_file_path_from_plan))
+        .flatten())
 }
 
 pub(super) fn handle_collab_status(app: &App, args: &Value) -> Result<Value, MemoryError> {
     let session_id = require_str(args, "session_id")?;
     let record = app.db.collab_load_session_record(session_id)?;
     let mut status = session_record_json(&record);
-    // Surface the locked plan alongside the hashes so a fresh agent joining
-    // mid-session can build a task_list (or continue a review round) without
-    // re-deriving content it previously sent but already acked off its inbox.
-    // By default this is a compact reference (drawer id + hash + 200-char peek);
-    // the full body is inlined only on `verbose:true`.
-    let verbose = args
-        .get("verbose")
-        .and_then(Value::as_bool)
-        .unwrap_or(false);
+    // `verbose` remains accepted for backwards-compatible requests, but plans
+    // are always references: large plan bodies must never transit status.
     let include_task_list = args
         .get("include_task_list")
         .and_then(Value::as_bool)
@@ -1082,9 +1080,13 @@ pub(super) fn handle_collab_status(app: &App, args: &Value) -> Result<Value, Mem
             .session
             .task_list
             .as_deref()
-            .map_or(Value::Null, |task_list| {
-                Value::String(task_list.to_string())
-            });
+            .and_then(|_| {
+                task_list_ref_json(
+                    record.session.task_list_drawer_id.as_deref(),
+                    record.session.task_list.as_deref(),
+                )
+            })
+            .unwrap_or(Value::Null);
     }
     render_plan(
         &app.db,
@@ -1093,17 +1095,17 @@ pub(super) fn handle_collab_status(app: &App, args: &Value) -> Result<Value, Mem
         "canonical",
         record.session.canonical_plan_drawer_id.as_deref(),
         record.session.canonical_plan_hash.as_deref(),
-        verbose,
     )?;
-    render_plan(
+    if let Some(plan_file_path) = render_plan(
         &app.db,
         &mut status,
         session_id,
         "final",
         record.session.final_plan_drawer_id.as_deref(),
         record.session.final_plan_hash.as_deref(),
-        verbose,
-    )?;
+    )? {
+        status["plan_file_path"] = Value::String(plan_file_path);
+    }
     for ag in [Agent::Claude, Agent::Codex] {
         let g = app
             .db
@@ -2454,10 +2456,9 @@ mod tests {
             plan_ref["hash"].is_string(),
             "hash must be a string in the compact ref"
         );
-        let first_200 = plan_ref["first_200_chars"].as_str().unwrap();
         assert!(
-            first_200.chars().count() <= 200,
-            "first_200_chars must be at most 200 chars"
+            plan_ref["plan_file_path"].is_null(),
+            "a plan without a marker must expose no plan_file_path"
         );
         assert!(
             status.get("canonical_plan").is_none(),
@@ -2489,10 +2490,9 @@ mod tests {
             plan_ref["hash"].is_string(),
             "hash must be a string in the compact ref"
         );
-        let first_200 = plan_ref["first_200_chars"].as_str().unwrap();
         assert!(
-            first_200.chars().count() <= 200,
-            "first_200_chars must be at most 200 chars"
+            plan_ref["plan_file_path"].is_null(),
+            "a plan without a marker must expose no plan_file_path"
         );
         assert!(
             status.get("final_plan").is_none(),
@@ -2547,7 +2547,7 @@ mod tests {
     }
 
     #[test]
-    fn status_include_task_list_returns_full_task_list_body() {
+    fn status_include_task_list_returns_compact_task_list_ref() {
         let app = test_app();
         let sid = start_session(&app);
         let final_hash = drive_to_plan_locked(&app, &sid);
@@ -2570,15 +2570,17 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(status["task_list"].as_str(), Some(task_list.as_str()));
+        assert_eq!(status["task_list"], status["task_list_ref"]);
+        assert!(status["task_list"]["drawer_id"].is_string());
+        assert!(status["task_list"]["hash"].is_string());
         assert!(
-            status["task_list_ref"].is_object(),
-            "full opt-in must still include compact ref"
+            !serde_json::to_string(&status).unwrap().contains(&task_list),
+            "include_task_list must not inline the task-list JSON"
         );
     }
 
     #[test]
-    fn status_verbose_returns_full_canonical_body() {
+    fn status_verbose_returns_canonical_ref_not_body() {
         let app = test_app();
         let sid = start_session(&app);
         send(&app, &sid, "claude", "draft", "claude draft");
@@ -2588,32 +2590,48 @@ mod tests {
         let status =
             handle_collab_status(&app, &json!({ "session_id": sid, "verbose": true })).unwrap();
 
-        assert_eq!(
-            status["canonical_plan"], "FULL CANONICAL",
-            "verbose must inline the full canonical body"
-        );
         assert!(
             status["canonical_plan_ref"].is_object(),
-            "verbose must still include the compact reference"
+            "verbose must include the compact reference"
+        );
+        assert!(
+            status.get("canonical_plan").is_none(),
+            "verbose must not inline the canonical body"
+        );
+        assert!(
+            !serde_json::to_string(&status)
+                .unwrap()
+                .contains("FULL CANONICAL"),
+            "full canonical body must not transit collab_status"
         );
     }
 
     #[test]
-    fn status_verbose_returns_full_final_body() {
+    fn status_verbose_returns_final_ref_and_file_path_not_body() {
         let app = test_app();
         let sid = start_session(&app);
-        drive_to_final(&app, &sid, "canonical plan", "FULL FINAL");
+        let final_plan =
+            "<!-- plan_file_path: docs/superpowers/plans/issue-207.md -->\n\nFULL FINAL";
+        drive_to_final(&app, &sid, "canonical plan", final_plan);
 
         let status =
             handle_collab_status(&app, &json!({ "session_id": sid, "verbose": true })).unwrap();
 
-        assert_eq!(
-            status["final_plan"], "FULL FINAL",
-            "verbose must inline the full final body"
-        );
         assert!(
             status["final_plan_ref"].is_object(),
-            "verbose must still include the compact final reference"
+            "verbose must include the compact final reference"
+        );
+        assert_eq!(
+            status["plan_file_path"].as_str(),
+            Some("docs/superpowers/plans/issue-207.md")
+        );
+        assert!(
+            status.get("final_plan").is_none(),
+            "verbose must not inline the final body"
+        );
+        assert!(
+            !serde_json::to_string(&status).unwrap().contains(final_plan),
+            "full final body must not transit collab_status"
         );
     }
 
@@ -2637,13 +2655,15 @@ mod tests {
             let status =
                 handle_collab_status(&app, &json!({ "session_id": &sid, "verbose": true }))
                     .unwrap();
-            assert_eq!(status["canonical_plan"], "REOPEN CANONICAL");
-            assert_eq!(status["final_plan"], "REOPEN FINAL");
+            assert!(status["canonical_plan_ref"].is_object());
+            assert!(status["final_plan_ref"].is_object());
+            assert!(status.get("canonical_plan").is_none());
+            assert!(status.get("final_plan").is_none());
         }
     }
 
     #[test]
-    fn status_legacy_null_drawer_inlines_full_body() {
+    fn status_legacy_null_drawer_does_not_inline_full_body() {
         let app = test_app();
         let sid = start_session(&app);
         send(&app, &sid, "claude", "draft", "claude draft");
@@ -2657,21 +2677,19 @@ mod tests {
 
         let status = handle_collab_status(&app, &json!({ "session_id": sid })).unwrap();
 
-        assert_eq!(
-            status["canonical_plan"], "LEGACY BODY",
-            "legacy NULL-drawer path must inline the full body from messages"
-        );
         assert!(
-            status.get("canonical_plan_ref").is_none(),
-            "legacy path must not emit a compact reference"
+            status.get("canonical_plan").is_none(),
+            "legacy NULL-drawer path must not inline the full body"
         );
     }
 
     #[test]
-    fn status_legacy_null_final_drawer_inlines_parsed_final_plan() {
+    fn status_legacy_null_final_drawer_returns_file_path_without_body() {
         let app = test_app();
         let sid = start_session(&app);
-        drive_to_final(&app, &sid, "canonical plan", "LEGACY FINAL");
+        let final_plan =
+            "<!-- plan_file_path: docs/superpowers/plans/legacy.md -->\n\nLEGACY FINAL";
+        drive_to_final(&app, &sid, "canonical plan", final_plan);
 
         // Simulate a pre-009 session whose final drawer id was never recorded.
         let mut s = app.db.collab_load_session(&sid).unwrap();
@@ -2680,13 +2698,10 @@ mod tests {
 
         let status = handle_collab_status(&app, &json!({ "session_id": sid })).unwrap();
 
+        assert!(status.get("final_plan").is_none());
         assert_eq!(
-            status["final_plan"], "LEGACY FINAL",
-            "legacy NULL-drawer final path must normalize the raw final message to plan text"
-        );
-        assert!(
-            status.get("final_plan_ref").is_none(),
-            "legacy final path must not emit a compact reference"
+            status["plan_file_path"].as_str(),
+            Some("docs/superpowers/plans/legacy.md")
         );
     }
 
