@@ -422,7 +422,7 @@ pub fn tool_definitions(app: &App) -> Vec<Value> {
         }),
         json!({
             "name": "collab_wait_my_turn",
-            "description": "Long-poll: block until current_owner == agent or the timeout elapses. Returns {is_my_turn, phase, current_owner, session_ended}. Default timeout 30s, max 60s.",
+            "description": "Long-poll: block until current_owner == agent or the timeout elapses. A settled wait returns {is_my_turn, phase, current_owner, session_ended}; an unsettled timeout returns exactly {unchanged: true}. Default timeout 30s, max 60s.",
             "inputSchema": {
                 "type": "object",
                 "properties": {

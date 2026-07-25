@@ -1339,8 +1339,11 @@ pub(super) fn handle_collab_wait_my_turn(app: &App, args: &Value) -> Result<Valu
     let deadline = std::time::Instant::now() + timeout;
     loop {
         let (body, settled) = wait_my_turn_poll(app, args)?;
-        if settled || std::time::Instant::now() >= deadline {
+        if settled {
             return Ok(body);
+        }
+        if std::time::Instant::now() >= deadline {
+            return Ok(json!({ "unchanged": true }));
         }
         std::thread::sleep(WAIT_MY_TURN_POLL_INTERVAL);
     }
@@ -1802,10 +1805,36 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(wait["is_my_turn"], true);
+        assert_eq!(
+            wait,
+            json!({
+                "is_my_turn": true,
+                "phase": "PlanParallelDrafts",
+                "current_owner": "claude",
+                "session_ended": false,
+            })
+        );
         assert_eq!(
             app.active_collab_session_snapshot().as_deref(),
             Some(sid.as_str())
+        );
+    }
+
+    #[test]
+    fn wait_my_turn_timeout_returns_a_compact_unchanged_frame() {
+        let app = test_app();
+        let sid = start_session(&app);
+
+        let wait = handle_collab_wait_my_turn(
+            &app,
+            &json!({"session_id": sid, "agent": "codex", "timeout_secs": 1}),
+        )
+        .unwrap();
+
+        assert_eq!(
+            wait,
+            json!({"unchanged": true}),
+            "an other-owned session that remains unsettled through the timeout must return the compact frame"
         );
     }
 
