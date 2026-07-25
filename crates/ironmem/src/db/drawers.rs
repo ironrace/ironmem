@@ -70,6 +70,9 @@ pub struct SearchFilters {
     pub wing: Option<String>,
     pub room: Option<String>,
     pub limit: usize,
+    /// Retained historical rows are omitted from normal search, but callers
+    /// may opt in when reconstructing temporal state.
+    pub include_superseded: bool,
 }
 
 /// Generate a deterministic drawer ID from content + wing + room.
@@ -322,7 +325,7 @@ impl Database {
         &self,
         ids: &[&str],
     ) -> Result<std::collections::HashMap<String, Drawer>, MemoryError> {
-        self.get_drawers_by_ids_filtered(ids, None, None)
+        self.get_drawers_by_ids_filtered(ids, None, None, true)
     }
 
     /// Get multiple drawers by IDs with optional metadata filters applied in SQL.
@@ -331,6 +334,7 @@ impl Database {
         ids: &[&str],
         wing: Option<&str>,
         room: Option<&str>,
+        include_superseded: bool,
     ) -> Result<std::collections::HashMap<String, Drawer>, MemoryError> {
         const CHUNK_SIZE: usize = 900; // Stay well under SQLite's 999 limit
 
@@ -352,6 +356,9 @@ impl Database {
             if let Some(r) = room {
                 sql.push_str(" AND room = ?");
                 owned_params.push(r.to_string());
+            }
+            if !include_superseded && Self::has_superseded_by_column(&self.conn)? {
+                sql.push_str(" AND superseded_by IS NULL");
             }
             let mut stmt = self.conn.prepare(&sql)?;
             let mut params: Vec<&dyn rusqlite::types::ToSql> = chunk
@@ -514,43 +521,72 @@ impl Database {
         wing: Option<&str>,
         room: Option<&str>,
     ) -> Result<Vec<(String, f32)>, MemoryError> {
+        self.bm25_search_with_history(query, limit, wing, room, false)
+    }
+
+    /// BM25 full-text search with optional retained-history inclusion.
+    pub fn bm25_search_with_history(
+        &self,
+        query: &str,
+        limit: usize,
+        wing: Option<&str>,
+        room: Option<&str>,
+        include_superseded: bool,
+    ) -> Result<Vec<(String, f32)>, MemoryError> {
         if query.trim().is_empty() {
             return Ok(vec![]);
         }
         let fts_query = fts5_sanitize(query);
         let limit_i64 = limit as i64;
+        // Read-only pre-v17 databases intentionally project superseded_by as
+        // NULL. Do not reference the absent physical column in that path.
+        let current_only = !include_superseded && Self::has_superseded_by_column(&self.conn)?;
+        let supersession_filter = if current_only {
+            " AND d.superseded_by IS NULL"
+        } else {
+            ""
+        };
 
         let sql = match (wing, room) {
             (Some(_), Some(_)) => {
-                "SELECT f.drawer_id, -bm25(f) AS score
+                format!(
+                    "SELECT f.drawer_id, -bm25(f) AS score
                  FROM drawers_fts f
                  JOIN drawers d ON d.id = f.drawer_id
-                 WHERE f MATCH ?1 AND d.wing = ?3 AND d.room = ?4
+                 WHERE f MATCH ?1 AND d.wing = ?3 AND d.room = ?4{supersession_filter}
                  ORDER BY score DESC LIMIT ?2"
+                )
             }
             (Some(_), None) => {
-                "SELECT f.drawer_id, -bm25(f) AS score
+                format!(
+                    "SELECT f.drawer_id, -bm25(f) AS score
                  FROM drawers_fts f
                  JOIN drawers d ON d.id = f.drawer_id
-                 WHERE f MATCH ?1 AND d.wing = ?3
+                 WHERE f MATCH ?1 AND d.wing = ?3{supersession_filter}
                  ORDER BY score DESC LIMIT ?2"
+                )
             }
             (None, Some(_)) => {
-                "SELECT f.drawer_id, -bm25(f) AS score
+                format!(
+                    "SELECT f.drawer_id, -bm25(f) AS score
                  FROM drawers_fts f
                  JOIN drawers d ON d.id = f.drawer_id
-                 WHERE f MATCH ?1 AND d.room = ?4
+                 WHERE f MATCH ?1 AND d.room = ?4{supersession_filter}
                  ORDER BY score DESC LIMIT ?2"
+                )
             }
             (None, None) => {
-                "SELECT drawer_id, -bm25(drawers_fts) AS score
+                format!(
+                    "SELECT drawers_fts.drawer_id, -bm25(drawers_fts) AS score
                  FROM drawers_fts
-                 WHERE drawers_fts MATCH ?1
+                 JOIN drawers d ON d.id = drawers_fts.drawer_id
+                 WHERE drawers_fts MATCH ?1{supersession_filter}
                  ORDER BY score DESC LIMIT ?2"
+                )
             }
         };
 
-        let mut stmt = match self.conn.prepare(sql) {
+        let mut stmt = match self.conn.prepare(&sql) {
             Ok(s) => s,
             Err(e) => {
                 tracing::debug!("BM25 search skipped (FTS table may not exist): {e}");
@@ -706,17 +742,24 @@ impl Database {
     /// Project the v17 supersession field when available, or an explicit NULL
     /// for pre-v17 databases opened through the non-migrating read-only path.
     fn drawer_projection(conn: &rusqlite::Connection) -> Result<&'static str, MemoryError> {
+        if Self::has_superseded_by_column(conn)? {
+            return Ok(
+                "id, content, wing, room, source_file, added_by, filed_at, date, superseded_by",
+            );
+        }
+        Ok("id, content, wing, room, source_file, added_by, filed_at, date, NULL AS superseded_by")
+    }
+
+    fn has_superseded_by_column(conn: &rusqlite::Connection) -> Result<bool, MemoryError> {
         let mut stmt = conn.prepare("PRAGMA table_info(drawers)")?;
         let mut rows = stmt.query([])?;
         while let Some(row) = rows.next()? {
             let name: String = row.get(1)?;
             if name == "superseded_by" {
-                return Ok(
-                    "id, content, wing, room, source_file, added_by, filed_at, date, superseded_by",
-                );
+                return Ok(true);
             }
         }
-        Ok("id, content, wing, room, source_file, added_by, filed_at, date, NULL AS superseded_by")
+        Ok(false)
     }
 
     fn delete_drawer_conn(conn: &rusqlite::Connection, id: &str) -> Result<usize, MemoryError> {
@@ -1050,10 +1093,63 @@ mod tests {
                 ],
                 Some("alpha"),
                 Some("r1"),
+                true,
             )
             .unwrap();
         assert_eq!(result.len(), 1);
         assert!(result.contains_key("aaaa0000bbbb1111cccc2222dddd3333"));
+    }
+
+    #[test]
+    fn bm25_search_hides_superseded_rows_unless_history_is_requested() {
+        let db = Database::open_in_memory().unwrap();
+        let emb = dummy_embedding();
+        let predecessor = "aaaa0000bbbb1111cccc2222dddd3333";
+        let successor = "eeee4444ffff5555aaaa6666bbbb7777";
+        db.insert_drawer(
+            predecessor,
+            "searchable temporal record version one",
+            &emb,
+            "project",
+            "state",
+            "",
+            "mcp",
+        )
+        .unwrap();
+        db.insert_drawer(
+            successor,
+            "searchable temporal record version two",
+            &emb,
+            "project",
+            "state",
+            "",
+            "mcp",
+        )
+        .unwrap();
+        db.conn
+            .execute(
+                "UPDATE drawers SET superseded_by = ?1 WHERE id = ?2",
+                params![successor, predecessor],
+            )
+            .unwrap();
+
+        let current_ids: Vec<String> = db
+            .bm25_search("searchable temporal record", 10, None, None)
+            .unwrap()
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect();
+        assert_eq!(current_ids, vec![successor]);
+
+        let history_ids: Vec<String> = db
+            .bm25_search_with_history("searchable temporal record", 10, None, None, true)
+            .unwrap()
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect();
+        assert_eq!(history_ids.len(), 2);
+        assert!(history_ids.contains(&predecessor.to_string()));
+        assert!(history_ids.contains(&successor.to_string()));
     }
 
     #[test]

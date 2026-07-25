@@ -101,7 +101,6 @@ pub fn search(
         .map_err(|e| MemoryError::Lock(format!("IndexState lock poisoned: {e}")))?;
 
     let primary_hnsw = state.index.search(&primary_vec, overfetch);
-    let total_candidates = primary_hnsw.len();
 
     let hnsw_results = if let Some(cv) = maybe_content_vec {
         let content_hnsw = state.index.search(&cv, overfetch);
@@ -117,12 +116,19 @@ pub fn search(
 
     drop(state);
 
+    // HNSW is intentionally scope-agnostic. Remove only retained historical
+    // rows here so default retrieval cannot use them for RRF or PRF expansion;
+    // wing/room and collab-message behavior remains in the final filter.
+    let hnsw_ids = filter_superseded_candidate_ids(app, hnsw_ids, filters.include_superseded)?;
+    let total_candidates = hnsw_ids.len();
+
     // Step 4: BM25 full-text search.
-    let bm25_pairs = app.db.bm25_search(
+    let bm25_pairs = app.db.bm25_search_with_history(
         &sanitized.clean_query,
         overfetch,
         filters.wing.as_deref(),
         filters.room.as_deref(),
+        filters.include_superseded,
     )?;
     let bm25_hit_count = bm25_pairs.len();
     let bm25_ids: Vec<String> = bm25_pairs.into_iter().map(|(id, _)| id).collect();
@@ -265,12 +271,15 @@ pub fn search(
                 .filter_map(|(idx, _)| state.id_map.get(*idx).cloned())
                 .collect();
             drop(state);
+            let exp_hnsw_ids =
+                filter_superseded_candidate_ids(app, exp_hnsw_ids, filters.include_superseded)?;
 
-            let exp_bm25_pairs = app.db.bm25_search(
+            let exp_bm25_pairs = app.db.bm25_search_with_history(
                 &expanded_query,
                 overfetch,
                 filters.wing.as_deref(),
                 filters.room.as_deref(),
+                filters.include_superseded,
             )?;
             let exp_bm25_ids: Vec<String> = exp_bm25_pairs.into_iter().map(|(id, _)| id).collect();
 
@@ -301,6 +310,7 @@ pub fn search(
         &missing_candidate_ids,
         filters.wing.as_deref(),
         filters.room.as_deref(),
+        filters.include_superseded,
     )?;
     drawers.extend(fetched);
 
@@ -414,6 +424,7 @@ pub fn search(
 
 fn drawer_matches_filters(drawer: &Drawer, filters: &SearchFilters) -> bool {
     drawer.room != "collab-messages"
+        && (filters.include_superseded || drawer.superseded_by.is_none())
         && filters
             .wing
             .as_deref()
@@ -422,6 +433,28 @@ fn drawer_matches_filters(drawer: &Drawer, filters: &SearchFilters) -> bool {
             .room
             .as_deref()
             .is_none_or(|room| drawer.room == room)
+}
+
+/// Drop retained historical rows before they can influence RRF or PRF. This
+/// deliberately leaves scope and collab-message filtering to the existing
+/// final stage, preserving their established semantics.
+fn filter_superseded_candidate_ids(
+    app: &App,
+    candidate_ids: Vec<String>,
+    include_superseded: bool,
+) -> Result<Vec<String>, MemoryError> {
+    if include_superseded || candidate_ids.is_empty() {
+        return Ok(candidate_ids);
+    }
+
+    let refs: Vec<&str> = candidate_ids.iter().map(String::as_str).collect();
+    let current = app
+        .db
+        .get_drawers_by_ids_filtered(&refs, None, None, false)?;
+    Ok(candidate_ids
+        .into_iter()
+        .filter(|id| current.contains_key(id))
+        .collect())
 }
 
 /// Union two HNSW result lists by max score, deduplicating by index position.

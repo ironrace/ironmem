@@ -566,6 +566,13 @@ stale copies:
 }
 ```
 
+For retained temporal history, add a successor with `supersedes` pointing to
+the prior drawer. Normal semantic search omits superseded drawers so current
+context stays clear; pass `include_superseded: true` to `search` when you need
+both current and historical rows. `dedup_hint` is advisory and non-destructive:
+it only points at a similar current drawer and never merges, deletes, or hides
+memory.
+
 Prune stale operational collab artifacts with a dry-run first:
 
 ```bash

@@ -52,7 +52,7 @@ pub fn tool_definitions(app: &App) -> Vec<Value> {
         }),
         json!({
             "name": "search",
-            "description": "Semantic search. Returns bounded excerpts and stable IDs; use get_drawer for a complete body.",
+            "description": "Returns bounded excerpts and stable IDs; use get_drawer for a complete body.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -64,6 +64,10 @@ pub fn tool_definitions(app: &App) -> Vec<Value> {
                         "type": "boolean",
                         "default": false,
                         "description": "Return bounded full content; use get_drawer for the complete body."
+                    },
+                    "include_superseded": {
+                        "type": "boolean",
+                        "default": false
                     }
                 },
                 "required": ["query"]
@@ -84,7 +88,7 @@ pub fn tool_definitions(app: &App) -> Vec<Value> {
                     },
                     "supersedes": {
                         "type": "string",
-                        "description": "32-hex current same-scope predecessor, retained as history and retrievable by ID."
+                        "description": "Current predecessor, retained history retrievable by ID."
                     }
                 },
                 "required": ["content", "wing"]

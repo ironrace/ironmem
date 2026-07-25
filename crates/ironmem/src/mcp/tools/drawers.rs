@@ -501,6 +501,7 @@ pub(super) fn handle_search(app: &App, args: &Value) -> Result<Value, MemoryErro
     // Validate request options before readiness can return a soft or terminal
     // response.
     let full = optional_bool(args, "full", false)?;
+    let include_superseded = optional_bool(args, "include_superseded", false)?;
 
     match app.readiness_snapshot() {
         ReadinessState::Ready => {}
@@ -528,6 +529,7 @@ pub(super) fn handle_search(app: &App, args: &Value) -> Result<Value, MemoryErro
         room: args.get("room").and_then(|v| v.as_str()).map(String::from),
         limit: (args.get("limit").and_then(|v| v.as_u64()).unwrap_or(10) as usize)
             .min(MAX_SEARCH_LIMIT),
+        include_superseded,
     };
 
     let result = search::pipeline::search(app, query, &filters)?;

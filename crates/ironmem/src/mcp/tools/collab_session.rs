@@ -2588,6 +2588,7 @@ mod tests {
             wing: None,
             room: None,
             limit: 10,
+            include_superseded: false,
         };
         let result = crate::search::pipeline::search(&app, "canonical body", &filters);
         assert!(
