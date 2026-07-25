@@ -61,6 +61,19 @@ def test_codex_dispatch_uses_explicit_repository_model_defaults():
     assert "escalation tier, not the default" in plan_draft_prompt
 
 
+def test_lint_requires_logical_keyed_checkpoint_contract(tmp_path):
+    fixture = copy_fixture(tmp_path)
+    bad = fixture / ".codex-plugin" / "prompts" / "collab-batch-impl.md"
+    bad.write_text(bad.read_text().replace(
+        "collab-checkpoint:<session_id>", "missing-checkpoint-key"
+    ))
+
+    r = run({"COLLAB_LINT_ROOT": str(fixture)})
+
+    assert r.returncode == 1
+    assert "missing checkpoint contract 'collab-checkpoint:<session_id>'" in r.stdout
+
+
 def test_lint_catches_unknown_placeholder(tmp_path):
     fixture = copy_fixture(tmp_path)
     bad = fixture / ".claude-plugin" / "prompts" / "collab-turn-plan-draft.md"

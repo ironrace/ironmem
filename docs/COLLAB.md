@@ -377,12 +377,18 @@ Checkpoint storage:
 - Tool: `mcp__ironmem__add_drawer`
 - `wing`: `ironrace-memory`
 - `room`: `collab-checkpoints`
+- `logical_key`: `collab-checkpoint:<session_id>`
 - One checkpoint before starting each task (`status: started`)
 - One checkpoint after each task is implemented, reviewed, committed, and
   pushed (`status: completed`)
 - One checkpoint on unrecoverable task failure (`status: blocked`)
 - One final checkpoint before `implementation_done`
   (`status: batch_complete`)
+
+Every checkpoint write for a session uses that same logical key, replacing the
+one logical-keyed current drawer instead of appending another checkpoint.
+Carry `completed_task_ids` forward in the replacement content so the drawer
+always contains the full recovery state.
 
 Checkpoint content should be compact, line-oriented, and include enough
 state for another agent to resume without transcript context:
@@ -410,13 +416,14 @@ summary: <one concise sentence>
 resume_hint: /collab join [--implementer=<claude|codex>] <session_id>
 ```
 
-On any fresh `/collab join` that lands in `CodeImplementPending`, the
-owning implementer must first search `wing=ironrace-memory`,
-`room=collab-checkpoints` for the session id and use the newest
-checkpoint plus the git log to choose the first unfinished task. The new
-implementer must then read the plan and scan the current code/diff to
+On any fresh `/collab join` that lands in `CodeImplementPending`, the owning
+implementer must fetch the one logical-keyed current drawer deterministically
+with `get_drawer(wing=ironrace-memory, room=collab-checkpoints,
+logical_key=collab-checkpoint:<session_id>)`, then use that checkpoint plus the
+git log to choose the first unfinished task. The new implementer must then read
+the plan and scan the current code/diff to
 verify which acceptance criteria are already complete before editing. If
-the newest checkpoint is `batch_complete`, first try to reuse its gate
+the current checkpoint is `batch_complete`, first try to reuse its gate
 proof: require clean pushed-head proof, local `HEAD == checkpoint.head_sha`,
 `checkpoint.gates_sha == checkpoint.head_sha`, `checkpoint.gates_result`
 starts with `passed`, and `checkpoint.gates_commands` exactly matches the
@@ -817,7 +824,7 @@ Valid during planning and during `CodeImplementPending`. During
 `CodeImplementPending`, this also moves `current_owner` to the selected
 implementer so `/collab join --implementer=<agent> <session_id>` can hand
 the active batch to another agent. The new implementer resumes from the
-latest ironmem checkpoint, then scans the plan and current code before
+one current logical-keyed ironmem checkpoint, then scans the plan and current code before
 continuing. Calls after `implementation_done` are rejected.
 
 ### `collab_start_code_review`
@@ -1097,8 +1104,9 @@ generation, handoff_token, handoff_block }` where `generation` is the
 **pending (to-be-claimed) generation** = active_generation + 1, not the
 caller's current active generation.
 
-**What it does.** The server reads persisted session state and the newest
-`collab-checkpoints` drawer for the session and composes a deterministic,
+**What it does.** The server reads persisted session state and the one
+logical-keyed current `collab-checkpoints` drawer for the session (falling back
+to the newest legacy checkpoint only during rollout) and composes a deterministic,
 model-free fenced markdown block (` ```ironrace-session-handoff `) — it
 NEVER asks a model to summarize. This tool is a WRITE tool and is denied in
 read-only / restricted MCP mode.
@@ -1416,10 +1424,12 @@ before each coding-active `collab_send`:
 - **Implementation checkpoints** during `CodeImplementPending`. The
   implementer writes `ironrace-memory/collab-checkpoints` drawers before
   each task starts, after each task completes, on blocked failures, and
-  after final gates pass. On a fresh join at `CodeImplementPending`, the
-  implementer searches those checkpoints by `session_id` before doing
-  work and resumes from the first unfinished task instead of relying on
-  transcript context.
+  after final gates pass, always with
+  `logical_key: collab-checkpoint:<session_id>`. This replaces one
+  logical-keyed current drawer while preserving cumulative
+  `completed_task_ids`. On a fresh join at `CodeImplementPending`, the
+  implementer reads that one logical-keyed current drawer and resumes
+  from the first unfinished task instead of relying on transcript context.
 - **Local gates** before Claude-owned code-changing turns
   (`implementation_done` in Claude-implementer mode and `review_local`):
   `cargo fmt --check`, `cargo clippy -D warnings`, `cargo test --workspace`.

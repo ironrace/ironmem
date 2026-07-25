@@ -10,6 +10,11 @@ const MAX_NAME_LENGTH: usize = 128;
 static SAFE_NAME_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^[a-zA-Z0-9][a-zA-Z0-9_ .'\-]{0,126}[a-zA-Z0-9]$").unwrap());
 
+// Logical keys are not filesystem names. Permit `:` as a namespace separator
+// while retaining the path-traversal and bounded-length protections below.
+static SAFE_LOGICAL_KEY_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^[a-zA-Z0-9][a-zA-Z0-9_ .':\-]{0,126}[a-zA-Z0-9]$").unwrap());
+
 /// Validate and sanitize a wing/room/entity name or task tag.
 ///
 /// Called for: wing names, room names, entity names, and explicit task tags
@@ -48,6 +53,52 @@ pub fn sanitize_name(value: &str, field_name: &str) -> Result<String, MemoryErro
     }
 
     if !SAFE_NAME_RE.is_match(value) {
+        return Err(MemoryError::Validation(format!(
+            "{field_name} contains invalid characters"
+        )));
+    }
+
+    Ok(value.to_string())
+}
+
+/// Validate a stable key used to replace mutable drawer content.
+///
+/// Logical keys may use `:` to namespace independent current-state records,
+/// unlike wing and room names which remain restricted to filesystem-safe names.
+pub fn sanitize_logical_key(value: &str, field_name: &str) -> Result<String, MemoryError> {
+    let value = value.trim();
+
+    if value.is_empty() {
+        return Err(MemoryError::Validation(format!(
+            "{field_name} must be a non-empty string"
+        )));
+    }
+
+    if value.len() < 2 {
+        return Err(MemoryError::Validation(format!(
+            "{field_name} must be at least 2 characters long"
+        )));
+    }
+
+    if value.len() > MAX_NAME_LENGTH {
+        return Err(MemoryError::Validation(format!(
+            "{field_name} exceeds maximum length of {MAX_NAME_LENGTH}"
+        )));
+    }
+
+    if value.contains("..") || value.contains('/') || value.contains('\\') {
+        return Err(MemoryError::Validation(format!(
+            "{field_name} contains invalid path characters"
+        )));
+    }
+
+    if value.contains('\0') {
+        return Err(MemoryError::Validation(format!(
+            "{field_name} contains null bytes"
+        )));
+    }
+
+    if !SAFE_LOGICAL_KEY_RE.is_match(value) {
         return Err(MemoryError::Validation(format!(
             "{field_name} contains invalid characters"
         )));
@@ -170,6 +221,16 @@ mod tests {
     fn test_sanitize_name_rejects_special_chars() {
         assert!(sanitize_name("<script>", "field").is_err());
         assert!(sanitize_name("DROP TABLE;", "field").is_err());
+    }
+
+    #[test]
+    fn test_sanitize_logical_key_allows_namespaced_key_only() {
+        assert_eq!(
+            sanitize_logical_key("collab-checkpoint:test-session", "logical_key").unwrap(),
+            "collab-checkpoint:test-session"
+        );
+        assert!(sanitize_name("collab-checkpoint:test-session", "room").is_err());
+        assert!(sanitize_logical_key("checkpoint/../escape", "logical_key").is_err());
     }
 
     #[test]

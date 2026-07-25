@@ -18,8 +18,10 @@ preconditions: phase == CodeImplementPending, current_owner == claude, implement
    non-null `pending_failure` means you are the **recovery owner** for an
    interrupted turn, not simply the next-in-line owner — see "Recoverable vs
    terminal failures" below before proceeding.
-2. Search `wing="ironrace-memory" room="collab-checkpoints"` for `$SESSION_ID`;
-   resume at the first unfinished task; scan the diff vs acceptance criteria.
+2. Fetch the one logical-keyed current drawer deterministically with
+   `get_drawer(wing=ironrace-memory, room=collab-checkpoints,
+   logical_key=collab-checkpoint:<session_id>)`; resume at the first unfinished
+   task; scan the diff vs acceptance criteria.
 
 ## Load area maps first
 
@@ -63,7 +65,9 @@ the normal `implementation_done` (never a new `failure_report`).
 ## Actions
 1. Invoke `Skill('subagent-driven-development')` on `plan_file_path`. Auto-proceed
    between tasks (no per-task user gate). Write started/completed/blocked/
-   batch_complete checkpoints per the `docs/COLLAB.md` checkpoint rule. STOP
+   batch_complete checkpoints per the `docs/COLLAB.md` checkpoint rule, always
+   with `logical_key: collab-checkpoint:<session_id>` and cumulative
+   `completed_task_ids` in the one logical-keyed current drawer. STOP
    before `finishing-a-development-branch` (no PR here).
 2. Verify the local boundary invariant: the skill stopped after the final
    task's approval+commit, did not invoke `finishing-a-development-branch`,

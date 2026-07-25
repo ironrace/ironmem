@@ -47,7 +47,7 @@ pub(super) fn validate_add_drawer_args(args: &Value) -> Result<AddDrawerArgs<'_>
     let logical_key = args
         .get("logical_key")
         .and_then(|v| v.as_str())
-        .map(|v| sanitize::sanitize_name(v, "logical_key"))
+        .map(|v| sanitize::sanitize_logical_key(v, "logical_key"))
         .transpose()?;
 
     Ok(AddDrawerArgs {
@@ -260,20 +260,51 @@ fn build_synthetic(
     Ok(Some((synth_id, synth_body, synth_emb)))
 }
 
-/// Fetch a single drawer by its exact id. This is the deterministic
-/// read-by-primary-key counterpart to `add_drawer`: `search` ranks semantically
-/// and cannot reliably return a specific freshly-written staging drawer, so any
-/// flow that stages an artifact under a known id (e.g. the collab compose→submit
-/// handoff) needs this to read it back. By default it returns the full body
+/// Fetch a single drawer by its exact id or logical key. This is the deterministic
+/// counterpart to `add_drawer`: `search` ranks semantically and cannot reliably
+/// return a specific freshly-written staging drawer, so any flow that stages an
+/// artifact under a known ID or stable logical key (e.g. a collab checkpoint)
+/// needs this to read it back. By default it returns the full body
 /// (subject only to access-mode redaction); callers that only need identity or
 /// freshness checks can pass `include_content:false`, `max_chars`, or
 /// `hash_only:true`.
 pub(super) fn handle_get_drawer(app: &App, args: &Value) -> Result<Value, MemoryError> {
-    let id = args
-        .get("id")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| MemoryError::Validation("id is required".into()))?;
-    validate_hex_id(id, "id")?;
+    let id = match (
+        args.get("id").and_then(|v| v.as_str()),
+        args.get("logical_key").and_then(|v| v.as_str()),
+    ) {
+        (Some(_), Some(_)) => {
+            return Err(MemoryError::Validation(
+                "id and logical_key are mutually exclusive".into(),
+            ));
+        }
+        (Some(id), None) => {
+            validate_hex_id(id, "id")?;
+            id.to_string()
+        }
+        (None, Some(logical_key)) => {
+            let wing = args.get("wing").and_then(|v| v.as_str()).ok_or_else(|| {
+                MemoryError::Validation("wing is required with logical_key".into())
+            })?;
+            let room = args
+                .get("room")
+                .and_then(|v| v.as_str())
+                .unwrap_or("general");
+            let wing = sanitize::sanitize_name(wing, "wing")?;
+            let room = sanitize::sanitize_name(room, "room")?;
+            let logical_key = sanitize::sanitize_logical_key(logical_key, "logical_key")?;
+            crate::db::drawers::generate_id(
+                &format!("{LOGICAL_KEY_ID_PREFIX}{logical_key}"),
+                &wing,
+                &room,
+            )
+        }
+        (None, None) => {
+            return Err(MemoryError::Validation(
+                "id or logical_key with wing is required".into(),
+            ));
+        }
+    };
     let hash_only = args
         .get("hash_only")
         .and_then(Value::as_bool)
@@ -295,7 +326,7 @@ pub(super) fn handle_get_drawer(app: &App, args: &Value) -> Result<Value, Memory
         None => MAX_DRAWER_CONTENT_CHARS,
     };
 
-    let drawer = match app.db.get_drawer(id)? {
+    let drawer = match app.db.get_drawer(&id)? {
         Some(d) => d,
         None => {
             return Ok(json!({ "found": false, "id": id }));
@@ -772,13 +803,14 @@ mod tests {
     #[test]
     fn add_drawer_logical_key_overwrites_current_context() {
         let app = test_app();
+        let logical_key = "collab-checkpoint:test-session";
         let first = handle_add_drawer(
             &app,
             &json!({
                 "content": "current context v1",
                 "wing": "project",
                 "room": "current",
-                "logical_key": "task state"
+                "logical_key": logical_key
             }),
         )
         .unwrap();
@@ -788,7 +820,7 @@ mod tests {
                 "content": "current context v2",
                 "wing": "project",
                 "room": "current",
-                "logical_key": "task state"
+                "logical_key": logical_key
             }),
         )
         .unwrap();
@@ -796,10 +828,43 @@ mod tests {
         let id = first["id"].as_str().unwrap();
         assert_eq!(second["id"].as_str(), Some(id));
         assert_eq!(second["id_strategy"].as_str(), Some("logical_key"));
+        assert_eq!(second["logical_key"].as_str(), Some(logical_key));
         let out = handle_get_drawer(&app, &json!({"id": id})).unwrap();
         assert_eq!(out["content"].as_str(), Some("current context v2"));
-        assert_eq!(out["source_file"].as_str(), Some("logical:task state"));
+        assert_eq!(
+            out["source_file"].as_str(),
+            Some("logical:collab-checkpoint:test-session")
+        );
         assert_eq!(app.db.count_drawers(Some("project")).unwrap(), 1);
+    }
+
+    #[test]
+    fn get_drawer_resolves_logical_key_without_a_prior_id() {
+        let app = test_app();
+        let logical_key = "collab-checkpoint:test-session";
+        let added = handle_add_drawer(
+            &app,
+            &json!({
+                "content": "current checkpoint",
+                "wing": "ironrace-memory",
+                "room": "collab-checkpoints",
+                "logical_key": logical_key
+            }),
+        )
+        .unwrap();
+
+        let out = handle_get_drawer(
+            &app,
+            &json!({
+                "wing": "ironrace-memory",
+                "room": "collab-checkpoints",
+                "logical_key": logical_key
+            }),
+        )
+        .unwrap();
+        assert_eq!(out["found"].as_bool(), Some(true));
+        assert_eq!(out["id"].as_str(), added["id"].as_str());
+        assert_eq!(out["content"].as_str(), Some("current checkpoint"));
     }
 
     #[test]
@@ -926,6 +991,20 @@ mod tests {
         assert!(handle_get_drawer(&app, &json!({"id": "not-a-hex-id!!"})).is_err());
         // Missing id is also a validation error.
         assert!(handle_get_drawer(&app, &json!({})).is_err());
+        assert!(handle_get_drawer(
+            &app,
+            &json!({"logical_key": "collab-checkpoint:test-session"}),
+        )
+        .is_err());
+        assert!(handle_get_drawer(
+            &app,
+            &json!({
+                "id": "0".repeat(32),
+                "wing": "ironrace-memory",
+                "logical_key": "collab-checkpoint:test-session"
+            }),
+        )
+        .is_err());
     }
 
     #[test]

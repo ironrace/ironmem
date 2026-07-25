@@ -88,11 +88,17 @@ pub fn tool_definitions(app: &App) -> Vec<Value> {
         }),
         json!({
             "name": "get_drawer",
-            "description": "Fetch a drawer by ID; supports metadata, bounded content, or content hash.",
+            "description": "Fetch a drawer by ID or its wing/room/logical_key; supports metadata, bounded content, or content hash.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "id": { "type": "string" },
+                    "wing": { "type": "string", "description": "Required with logical_key." },
+                    "room": { "type": "string", "default": "general" },
+                    "logical_key": {
+                        "type": "string",
+                        "description": "Stable key used with wing and room to resolve a replaceable drawer."
+                    },
                     "include_content": {
                         "type": "boolean",
                         "description": "When false, omit the content body. Default true."
@@ -107,7 +113,10 @@ pub fn tool_definitions(app: &App) -> Vec<Value> {
                         "description": "When true, omit content and return content_hash unless restricted mode redacts it. Overrides include_content. Default false."
                     }
                 },
-                "required": ["id"]
+                "anyOf": [
+                    { "required": ["id"] },
+                    { "required": ["wing", "logical_key"] }
+                ]
             }
         }),
         json!({
