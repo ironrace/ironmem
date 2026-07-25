@@ -23,6 +23,7 @@ pub(super) struct AddDrawerArgs<'a> {
     wing: String,
     room: String,
     logical_key: Option<String>,
+    supersedes: Option<String>,
 }
 
 /// Readiness-independent validation for `add_drawer`.
@@ -49,12 +50,25 @@ pub(super) fn validate_add_drawer_args(args: &Value) -> Result<AddDrawerArgs<'_>
         .and_then(|v| v.as_str())
         .map(|v| sanitize::sanitize_logical_key(v, "logical_key"))
         .transpose()?;
+    let supersedes = match args.get("supersedes") {
+        Some(value) => {
+            let value = value.as_str().ok_or_else(|| {
+                MemoryError::Validation(
+                    "supersedes must be a 32-character hexadecimal drawer id".into(),
+                )
+            })?;
+            validate_hex_id(value, "supersedes")?;
+            Some(value.to_string())
+        }
+        None => None,
+    };
 
     Ok(AddDrawerArgs {
         content: sanitize::sanitize_content(content, MAX_DRAWER_CONTENT_CHARS)?,
         wing: sanitize::sanitize_name(wing, "wing")?,
         room: sanitize::sanitize_name(room, "room")?,
         logical_key,
+        supersedes,
     })
 }
 
@@ -62,22 +76,7 @@ pub(super) fn handle_add_drawer(app: &App, args: &Value) -> Result<Value, Memory
     // Readiness is already resolved by the time this runs (see
     // `tools::WRITE_SHAPED_TOOLS`); validation is split out so
     // `precheck_write_request` can reject a malformed call BEFORE the wait.
-    let AddDrawerArgs {
-        content,
-        wing,
-        room,
-        logical_key,
-    } = validate_add_drawer_args(args)?;
-
-    let id_basis = logical_key
-        .as_ref()
-        .map(|key| format!("{LOGICAL_KEY_ID_PREFIX}{key}"))
-        .unwrap_or_else(|| content.to_string());
-    let id = crate::db::drawers::generate_id(&id_basis, &wing, &room);
-    let source_file = logical_key
-        .as_ref()
-        .map(|key| format!("{LOGICAL_KEY_SOURCE_PREFIX}{key}"))
-        .unwrap_or_default();
+    let add_args = validate_add_drawer_args(args)?;
 
     app.ensure_embedder_ready()?;
 
@@ -86,8 +85,44 @@ pub(super) fn handle_add_drawer(app: &App, args: &Value) -> Result<Value, Memory
             .embedder
             .write()
             .map_err(|e| MemoryError::Lock(format!("Embedder lock poisoned: {e}")))?;
-        emb.embed_one(content).map_err(MemoryError::Embed)?
+        emb.embed_one(add_args.content)
+            .map_err(MemoryError::Embed)?
     };
+
+    handle_add_drawer_with_embedding(app, add_args, embedding)
+}
+
+/// Finish an `add_drawer` after its primary content has been embedded.
+///
+/// Keeping the storage half separate makes the transaction and post-write
+/// advisory behavior testable with a real, non-zero vector without changing
+/// production embedding semantics.
+fn handle_add_drawer_with_embedding(
+    app: &App,
+    add_args: AddDrawerArgs<'_>,
+    embedding: Vec<f32>,
+) -> Result<Value, MemoryError> {
+    let AddDrawerArgs {
+        content,
+        wing,
+        room,
+        logical_key,
+        supersedes,
+    } = add_args;
+    let id_basis = logical_key
+        .as_ref()
+        .map(|key| format!("{LOGICAL_KEY_ID_PREFIX}{key}"))
+        .unwrap_or_else(|| content.to_string());
+    let id = crate::db::drawers::generate_id(&id_basis, &wing, &room);
+    if supersedes.as_deref() == Some(id.as_str()) {
+        return Err(MemoryError::Validation(
+            "successor drawer must differ from predecessor drawer".into(),
+        ));
+    }
+    let source_file = logical_key
+        .as_ref()
+        .map(|key| format!("{LOGICAL_KEY_SOURCE_PREFIX}{key}"))
+        .unwrap_or_default();
 
     // Compute synthetic sibling, if enrichment is enabled and content qualifies.
     let synth: Option<(String, String, Vec<f32>)> =
@@ -104,6 +139,15 @@ pub(super) fn handle_add_drawer(app: &App, args: &Value) -> Result<Value, Memory
             &source_file,
             "mcp",
         )?;
+        if let Some(predecessor_id) = supersedes.as_deref() {
+            crate::db::schema::Database::mark_drawer_superseded_tx(
+                tx,
+                predecessor_id,
+                &id,
+                &wing,
+                &room,
+            )?;
+        }
         if let Some((sid, scontent, semb)) = synth.as_ref() {
             let parent_ref = format!("{}{id}", crate::db::drawers::PREF_SENTINEL);
             crate::db::schema::Database::insert_drawer_tx(
@@ -125,7 +169,8 @@ pub(super) fn handle_add_drawer(app: &App, args: &Value) -> Result<Value, Memory
                 "wing": &wing,
                 "room": &room,
                 "synth": synth.is_some(),
-                "logical_key": logical_key.as_deref()
+                "logical_key": logical_key.as_deref(),
+                "supersedes": supersedes.as_deref(),
             }),
             None,
         )?;
@@ -147,14 +192,30 @@ pub(super) fn handle_add_drawer(app: &App, args: &Value) -> Result<Value, Memory
 
     let mut out = json!({
         "success": true,
-        "id": id,
-        "wing": wing,
-        "room": room,
+        "id": &id,
+        "wing": &wing,
+        "room": &room,
         "synth": synth.is_some(),
         "id_strategy": if logical_key.is_some() { "logical_key" } else { "content" },
     });
     if let Some(key) = logical_key {
         out["logical_key"] = json!(key);
+    }
+    if let Some(predecessor_id) = supersedes {
+        out["supersedes"] = json!(predecessor_id);
+    }
+
+    // A duplicate is an advisory relationship only: the durable add has
+    // already committed and indexed, so a read-side failure must not turn it
+    // into a client-visible write failure or imply any destructive action.
+    match app.db.find_near_duplicate(&embedding, &wing, &room, &id) {
+        Ok(Some((candidate_id, score))) => {
+            out["dedup_hint"] = json!({ "id": candidate_id, "score": score });
+        }
+        Ok(None) => {}
+        Err(error) => {
+            tracing::warn!(error = %error, drawer_id = %id, "add_drawer near-duplicate advisory check failed");
+        }
     }
     Ok(out)
 }
@@ -369,6 +430,7 @@ pub(super) fn handle_get_drawer(app: &App, args: &Value) -> Result<Value, Memory
         "added_by": added_by,
         "filed_at": drawer.filed_at,
         "date": drawer.date,
+        "superseded_by": drawer.superseded_by,
     });
     if let Some(content) = content {
         out["content"] = content;
@@ -860,7 +922,10 @@ mod tests {
         .unwrap();
         let successor_id = successor["id"].as_str().unwrap().to_owned();
 
-        assert_eq!(successor["supersedes"].as_str(), Some(predecessor_id.as_str()));
+        assert_eq!(
+            successor["supersedes"].as_str(),
+            Some(predecessor_id.as_str())
+        );
         assert_eq!(
             app.db.get_drawer(&predecessor_id).unwrap().unwrap().content,
             "temporal memory v1",
@@ -903,7 +968,10 @@ mod tests {
                 }),
             )
             .unwrap_err();
-            assert!(matches!(error, MemoryError::Validation(_) | MemoryError::NotFound(_)));
+            assert!(matches!(
+                error,
+                MemoryError::Validation(_) | MemoryError::NotFound(_)
+            ));
         }
 
         let self_reference = handle_add_drawer(
@@ -928,7 +996,10 @@ mod tests {
             }),
         )
         .unwrap();
-        assert_eq!(successor["supersedes"].as_str(), Some(predecessor_id.as_str()));
+        assert_eq!(
+            successor["supersedes"].as_str(),
+            Some(predecessor_id.as_str())
+        );
 
         let already_superseded = handle_add_drawer(
             &app,
@@ -999,16 +1070,13 @@ mod tests {
             )
             .unwrap();
         let args = json!({"content": "not close", "wing": "project", "room": "other-state"});
-        let no_hint = handle_add_drawer_with_embedding(
-            &app,
-            validate_add_drawer_args(&args).unwrap(),
-            {
+        let no_hint =
+            handle_add_drawer_with_embedding(&app, validate_add_drawer_args(&args).unwrap(), {
                 let mut vector = vec![0.0; ironrace_embed::EMBED_DIM];
                 vector[0] = 1.0;
                 vector
-            },
-        )
-        .unwrap();
+            })
+            .unwrap();
         assert!(no_hint.get("dedup_hint").is_none());
 
         let replacement_id = "cccccccccccccccccccccccccccccccc";
@@ -1016,7 +1084,7 @@ mod tests {
             .insert_drawer(
                 replacement_id,
                 "newer drawer",
-                &vector,
+                &vec![0.0; ironrace_embed::EMBED_DIM],
                 "project",
                 "retired-state",
                 "",
@@ -1046,7 +1114,8 @@ mod tests {
                 )
             })
             .unwrap();
-        let args = json!({"content": "replacement candidate", "wing": "project", "room": "retired-state"});
+        let args =
+            json!({"content": "replacement candidate", "wing": "project", "room": "retired-state"});
         let no_hint = handle_add_drawer_with_embedding(
             &app,
             validate_add_drawer_args(&args).unwrap(),

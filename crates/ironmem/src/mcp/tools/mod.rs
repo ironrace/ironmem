@@ -71,7 +71,7 @@ pub fn tool_definitions(app: &App) -> Vec<Value> {
         }),
         json!({
             "name": "add_drawer",
-            "description": "Store content in a wing/room. logical_key overwrites replaceable current context.",
+            "description": "Store content; logical_key rewrites context.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -80,11 +80,11 @@ pub fn tool_definitions(app: &App) -> Vec<Value> {
                     "room": { "type": "string", "default": "general" },
                     "logical_key": {
                         "type": "string",
-                        "description": "Stable key that rewrites this wing/room drawer."
+                        "description": "Stable key rewrites a wing/room drawer."
                     },
                     "supersedes": {
                         "type": "string",
-                        "description": "32-hex ID of a current drawer in this wing/room that this new drawer supersedes. The predecessor is retained as temporal history; normal search will hide superseded history in a future release."
+                        "description": "32-hex current same-scope predecessor, retained as history; normal search will hide history in Task 3."
                     }
                 },
                 "required": ["content", "wing"]
@@ -1426,6 +1426,24 @@ mod tests {
             McpAccessMode::Restricted,
             "get_drawer"
         ));
+    }
+
+    #[test]
+    fn add_drawer_schema_documents_temporal_supersession() {
+        let app = App::open_for_test().unwrap();
+        let add_drawer = tool_definitions(&app)
+            .into_iter()
+            .find(|tool| tool["name"] == "add_drawer")
+            .expect("add_drawer must be advertised");
+        let supersedes = &add_drawer["inputSchema"]["properties"]["supersedes"];
+
+        assert_eq!(supersedes["type"].as_str(), Some("string"));
+        assert!(
+            supersedes["description"]
+                .as_str()
+                .is_some_and(|description| description.contains("retained")),
+            "schema must make clear that supersession retains temporal history"
+        );
     }
 
     #[test]
