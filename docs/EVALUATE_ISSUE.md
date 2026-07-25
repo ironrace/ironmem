@@ -47,7 +47,9 @@ Usage: /evaluate-issue <issue-number | #number | issue-url>
 
 If a URL names a different repo than the local checkout, prefer the URL's
 repo for the `gh issue view` call but warn the user that the local blast-radius
-scan reflects the current working tree, not that repo.
+scan reflects the current working tree, not that repo. A cross-repository
+`SPLIT` verdict is advisory-only: do not create child issues or comment on the
+parent; ask the user to rerun `/evaluate-issue` from a checkout of that repo.
 
 ## Step 1 — Read the issue
 
@@ -197,12 +199,23 @@ Proceed with this path? [y/N]
 ```
 
 Then **wait for the user**. On an explicit yes, invoke the recommended path.
-For `SPLIT`, create the proposed child GitHub issues, preserving relevant
-parent labels, include `Parent: #<number>` in each child body, and add their
-links in one comment on the still-open parent issue. If any child creation
-fails, report the failure and do not start collab. On anything else (including
-silence treated as no), stop without side effects. This is the only gate — the
-scan and scoring are read-only.
+For `SPLIT`, create the proposed child GitHub issues only when the issue repo
+matches the local checkout. Preserve relevant parent labels, include
+`Parent: #<number>` in each child body, and add their links in one comment on
+the still-open parent issue. If the repos differ, report that the proposal is
+advisory-only and ask the user to rerun from the issue repository. If any child
+creation fails, report the failure and do not start collab. On anything else
+(including silence treated as no), stop without side effects. This is the only
+gate — the scan and scoring are read-only.
+
+Make confirmed `SPLIT` writes retry-safe. For every proposed child ordinal,
+include `Split-child-key: <owner>/<repo>#<parent-number>:<ordinal>` in its
+body. Before creating it, search the local issue repository for that exact key
+and reuse an existing match. Before writing the parent summary, read its
+comments and create or update exactly one comment carrying
+`Split-parent-key: <owner>/<repo>#<parent-number>` and the full child-link
+list. A partial failure can then be retried without duplicate child issues or
+parent comments.
 
 ## Platform path mapping
 

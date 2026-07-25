@@ -1,6 +1,6 @@
 use serde_json::Value;
 
-use crate::collab::{CollabEvent, Phase, MAX_TASKS_PER_COLLAB_ISSUE};
+use crate::collab::{validate_task_list_body, CollabEvent, Phase};
 use crate::error::MemoryError;
 
 use super::shared::sha256_hex;
@@ -176,8 +176,6 @@ pub(super) fn failure_report_is_off_turn_admissible(
 /// Allowed values for `execution_mode` on a `task_list` payload.
 /// Absence means default (subagent-driven). The string `"subagent_driven"` is
 /// intentionally NOT in this set — callers omit the field for the default path.
-const ALLOWED_EXECUTION_MODES: &[&str] = &["mechanical_direct"];
-
 /// Parse and validate the task_list payload shape. Fails fast on missing
 /// fields, empty or oversized task arrays, missing acceptance criteria, or
 /// non-array tasks. The state machine re-checks plan_hash, base_sha presence,
@@ -218,72 +216,8 @@ pub(super) fn parse_task_list_event(content: &str) -> Result<CollabEvent, Memory
         .filter(|v| !v.is_empty())
         .ok_or_else(|| MemoryError::Validation("task_list missing non-empty head_sha".to_string()))?
         .to_string();
-    if let Some(raw) = payload.get("plan_file_path") {
-        let path = raw.as_str().ok_or_else(|| {
-            MemoryError::Validation("task_list plan_file_path must be a string".to_string())
-        })?;
-        validate_plan_file_path(path)?;
-    }
-    if let Some(raw) = payload.get("execution_mode") {
-        let mode = raw.as_str().ok_or_else(|| {
-            MemoryError::Validation("task_list execution_mode must be a string".to_string())
-        })?;
-        if !ALLOWED_EXECUTION_MODES.contains(&mode) {
-            return Err(MemoryError::Validation(format!(
-                "task_list execution_mode \"{}\" is not allowed; allowed values: [{}]",
-                mode,
-                ALLOWED_EXECUTION_MODES
-                    .iter()
-                    .map(|v| format!("\"{}\"", v))
-                    .collect::<Vec<_>>()
-                    .join(", "),
-            )));
-        }
-    }
-    let tasks = payload
-        .get("tasks")
-        .and_then(Value::as_array)
-        .ok_or_else(|| MemoryError::Validation("task_list missing \"tasks\" array".to_string()))?;
-    if tasks.is_empty() {
-        return Err(MemoryError::Validation(
-            "task_list must contain at least one task".to_string(),
-        ));
-    }
-    if tasks.len() > MAX_TASKS_PER_COLLAB_ISSUE as usize {
-        return Err(MemoryError::Validation(format!(
-            "task_list contains {} tasks; a collab issue may contain at most {MAX_TASKS_PER_COLLAB_ISSUE} tasks; split it into smaller issues",
-            tasks.len()
-        )));
-    }
-    let mut last_id: Option<i64> = None;
-    for (idx, task) in tasks.iter().enumerate() {
-        let task_id = task.get("id").and_then(Value::as_i64).ok_or_else(|| {
-            MemoryError::Validation(format!("task_list task[{idx}] missing integer \"id\""))
-        })?;
-        if let Some(prev) = last_id {
-            if task_id <= prev {
-                return Err(MemoryError::Validation(format!(
-                    "task_list tasks must be strictly ordered by id (task[{idx}].id={task_id} follows {prev})"
-                )));
-            }
-        }
-        last_id = Some(task_id);
-        let acceptance = task
-            .get("acceptance")
-            .and_then(Value::as_array)
-            .ok_or_else(|| {
-                MemoryError::Validation(format!(
-                    "task_list task[{idx}] missing \"acceptance\" array"
-                ))
-            })?;
-        if acceptance.is_empty() {
-            return Err(MemoryError::Validation(format!(
-                "task_list task[{idx}] must include at least one acceptance criterion"
-            )));
-        }
-    }
-    let tasks_count = u32::try_from(tasks.len())
-        .map_err(|_| MemoryError::Validation("task_list contains too many tasks".to_string()))?;
+    let tasks_count = validate_task_list_body(&payload)
+        .map_err(|error| MemoryError::Validation(error.to_string()))?;
     // Canonicalize the task_list JSON we store on the session so downstream
     // readers see a normalized form regardless of incoming whitespace.
     let task_list_json = serde_json::to_string(&payload)
@@ -295,84 +229,6 @@ pub(super) fn parse_task_list_event(content: &str) -> Result<CollabEvent, Memory
         tasks_count,
         head_sha,
     })
-}
-
-/// Validate the optional `plan_file_path` field on a `task_list` payload.
-///
-/// The field is consumed by the Codex prompt as a literal repo-relative
-/// path opened from `repo_path`. Any input that escapes the repo or
-/// smuggles control bytes is potentially exploitable as an arbitrary-file-
-/// read for the agent that follows the prompt. This validator therefore
-/// applies a strict allowlist:
-///
-/// - Non-empty, ≤512 chars (matches caps elsewhere in this module).
-/// - Must parse as a sequence of `Component::Normal` segments only —
-///   `ParentDir` (`..`), `RootDir` (`/...`), `Prefix` (Windows-style
-///   `C:\\...` or `\\?\` UNC), and `CurDir` (`.`) are all rejected.
-///   `Path::components` normalizes the path before iteration, so a value
-///   like `docs\..\..\etc\passwd` parses as a single `Normal` segment on
-///   POSIX (where `\` is a literal char) — that's still safe because it
-///   resolves to a literal filename, but a future cross-platform port
-///   would catch it via the `Prefix` arm.
-/// - No control bytes: rejects `\0` (path-truncation in C interop) and
-///   any character below `0x20` other than tab.
-/// - No percent-encoded escape sequences: a `%` byte is permitted only as
-///   a literal filename character, not as the start of a `%2e`/`%2f`
-///   pair, since downstream consumers may URL-decode unsafely. Easier to
-///   refuse the whole class than enumerate decoders.
-fn validate_plan_file_path(path: &str) -> Result<(), MemoryError> {
-    use std::path::{Component, Path};
-
-    const MAX_LEN: usize = 512;
-
-    if path.is_empty() {
-        return Err(MemoryError::Validation(
-            "task_list plan_file_path must be non-empty when present".to_string(),
-        ));
-    }
-    if path.chars().count() > MAX_LEN {
-        return Err(MemoryError::Validation(format!(
-            "task_list plan_file_path exceeds {MAX_LEN} chars"
-        )));
-    }
-    if path.bytes().any(|b| b == 0 || (b < 0x20 && b != b'\t')) {
-        return Err(MemoryError::Validation(
-            "task_list plan_file_path must not contain control bytes (incl. NUL)".to_string(),
-        ));
-    }
-    if path.contains('%') {
-        return Err(MemoryError::Validation(
-            "task_list plan_file_path must not contain percent-encoded sequences (no '%' allowed)"
-                .to_string(),
-        ));
-    }
-    for component in Path::new(path).components() {
-        match component {
-            Component::Normal(_) => {}
-            Component::ParentDir => {
-                return Err(MemoryError::Validation(
-                    "task_list plan_file_path must not contain '..' segments".to_string(),
-                ));
-            }
-            Component::RootDir => {
-                return Err(MemoryError::Validation(
-                    "task_list plan_file_path must be repo-relative (no leading '/')".to_string(),
-                ));
-            }
-            Component::Prefix(_) => {
-                return Err(MemoryError::Validation(
-                    "task_list plan_file_path must not contain a path prefix (e.g. drive letter or UNC root)"
-                        .to_string(),
-                ));
-            }
-            Component::CurDir => {
-                return Err(MemoryError::Validation(
-                    "task_list plan_file_path must not contain '.' segments".to_string(),
-                ));
-            }
-        }
-    }
-    Ok(())
 }
 
 pub(super) fn parse_required_head_sha(content: &str, topic: &str) -> Result<String, MemoryError> {

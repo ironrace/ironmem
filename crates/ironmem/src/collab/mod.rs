@@ -40,6 +40,7 @@ mod failure_class;
 mod phase;
 mod session;
 mod state_machine;
+mod task_list;
 
 pub use agent::Agent;
 pub use error::CollabError;
@@ -54,6 +55,9 @@ pub use handoff::{
 pub use phase::Phase;
 pub use session::{tasks_count_from_list, CollabSession};
 pub use state_machine::{apply_event, start_global_review_session, MAX_RECOVERY_ATTEMPTS};
+pub(crate) use task_list::{
+    task_count_from_payload, validate_task_list_body, TaskListValidationError,
+};
 
 /// Maximum implementation tasks accepted by one collab session. Larger work
 /// must be split into independently executable child issues before collab

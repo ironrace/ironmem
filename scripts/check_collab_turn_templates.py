@@ -140,6 +140,9 @@ REQUIRED_EVALUATE_ISSUE_SNIPPETS = [
     "more than 10",
     "Child issues:",
     "Parent: #<number>",
+    "advisory-only",
+    "Split-child-key:",
+    "Split-parent-key:",
 ]
 # Legacy inline-orchestrator instructions that must NOT survive the rewrite.
 FORBIDDEN_IN_COMMAND = [

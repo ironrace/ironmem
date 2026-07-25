@@ -45,8 +45,9 @@ from this spec — keep them in sync when protocol changes land:
 One collab session implements exactly one independently shippable issue with
 **1–10 execution tasks**. A plan projected to require 11 or more tasks is too
 large for collab: split its scope into linked, independently executable child
-issues before starting implementation. Each child issue must have its own
-1–10-task plan and collab session.
+issues before starting implementation. Route every child through
+`/evaluate-issue`; only a child that itself receives a `COLLAB` verdict gets
+its own 1–10-task collab session.
 
 Do not make an oversized issue fit by merging unrelated work, weakening
 acceptance criteria, or silently dropping tasks. During `/evaluate-issue`,

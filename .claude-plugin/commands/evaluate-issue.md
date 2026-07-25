@@ -35,7 +35,9 @@ Resolve the repo from the working tree, never from the user:
 
 If a URL names a different repo than the local checkout, query that repo for
 the issue but warn that the blast-radius scan reflects the local working
-tree.
+tree. A cross-repository `SPLIT` verdict is advisory-only: do not create child
+issues or comment on the parent; ask the user to rerun `/evaluate-issue` from a
+checkout of that repo.
 
 ## Step 1 — Read the issue
 
@@ -144,10 +146,22 @@ Proceed with this path? [y/N]
 ```
 
 Then **wait for the user**. On an explicit yes, invoke the recommended path.
-For `SPLIT`, create the proposed child GitHub issues, preserve relevant parent
-labels, add `Parent: #<number>` to each child body, and comment their links on
-the still-open parent. If a creation fails, report it and do not start collab.
-On anything else (including no response), stop without side effects.
+For `SPLIT`, create the proposed child GitHub issues only when the issue repo
+matches the local checkout. Preserve relevant parent labels, add
+`Parent: #<number>` to each child body, and comment their links on the
+still-open parent. If the repos differ, report that the proposal is
+advisory-only and ask the user to rerun from the issue repository. If a
+creation fails, report it and do not start collab. On anything else (including
+no response), stop without side effects.
+
+Make confirmed `SPLIT` writes retry-safe. For every proposed child ordinal,
+include `Split-child-key: <owner>/<repo>#<parent-number>:<ordinal>` in its
+body. Before creating it, search the local issue repository for that exact key
+and reuse an existing match. Before writing the parent summary, read its
+comments and create or update exactly one comment carrying
+`Split-parent-key: <owner>/<repo>#<parent-number>` and the full child-link
+list. A partial failure can then be retried without duplicate child issues or
+parent comments.
 
 ### Claude path mapping
 

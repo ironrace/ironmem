@@ -147,3 +147,17 @@ def test_lint_requires_evaluate_issue_split_contract(tmp_path):
     assert r.returncode == 1
     assert ".codex-plugin/prompts/evaluate-issue.md: missing evaluate-issue SPLIT contract" \
         in r.stdout
+
+
+def test_lint_requires_retry_safe_split_contract(tmp_path):
+    fixture = copy_fixture(tmp_path)
+    prompt = fixture / ".claude-plugin" / "commands" / "evaluate-issue.md"
+    prompt.write_text(
+        prompt.read_text().replace("Split-child-key:", "Child split key:", 1)
+    )
+
+    r = run({"COLLAB_LINT_ROOT": str(fixture)})
+
+    assert r.returncode == 1
+    assert ".claude-plugin/commands/evaluate-issue.md: missing evaluate-issue SPLIT contract" \
+        in r.stdout

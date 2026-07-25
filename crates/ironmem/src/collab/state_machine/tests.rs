@@ -277,6 +277,67 @@ fn test_task_list_rejects_empty_tasks() {
 }
 
 #[test]
+fn test_task_list_rejects_noncanonical_json() {
+    let s = locked_session("hash-final");
+    let err = apply_event(
+        &s,
+        Agent::Claude,
+        &CollabEvent::SubmitTaskList {
+            plan_hash: "hash-final".to_string(),
+            base_sha: "base".to_string(),
+            task_list_json: "[]".to_string(),
+            tasks_count: 0,
+            head_sha: "h".to_string(),
+        },
+    )
+    .unwrap_err();
+    assert_eq!(err, CollabError::InvalidTaskList);
+}
+
+#[test]
+fn test_task_list_rejects_invalid_task_body_from_direct_caller() {
+    let s = locked_session("hash-final");
+    let err = apply_event(
+        &s,
+        Agent::Claude,
+        &CollabEvent::SubmitTaskList {
+            plan_hash: "hash-final".to_string(),
+            base_sha: "base".to_string(),
+            task_list_json: serde_json::json!({
+                "tasks": [{"id": 1, "acceptance": []}],
+            })
+            .to_string(),
+            tasks_count: 1,
+            head_sha: "h".to_string(),
+        },
+    )
+    .unwrap_err();
+    assert_eq!(err, CollabError::InvalidTaskList);
+}
+
+#[test]
+fn test_task_list_rejects_unsafe_plan_file_path_from_direct_caller() {
+    let s = locked_session("hash-final");
+    let err = apply_event(
+        &s,
+        Agent::Claude,
+        &CollabEvent::SubmitTaskList {
+            plan_hash: "hash-final".to_string(),
+            base_sha: "base".to_string(),
+            task_list_json: serde_json::json!({
+                "plan_file_path": "../outside-plan.md",
+                "tasks": [{"id": 1, "acceptance": ["ok"]}],
+            })
+            .to_string(),
+            tasks_count: 1,
+            head_sha: "h".to_string(),
+        },
+    )
+    .unwrap_err();
+    assert_eq!(err, CollabError::InvalidTaskList);
+}
+
+#[test]
 fn test_task_list_rejects_more_than_ten_tasks() {
     let s = locked_session("hash-final");
     let err = apply_event(
