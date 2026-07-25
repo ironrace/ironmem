@@ -473,14 +473,23 @@ mod tests {
 
     /// Create a collab session row directly through the queue layer and return its id.
     fn seed_collab_session(app: &crate::mcp::app::App) -> String {
-        let sid = "ctx-test-session".to_string();
+        seed_collab_session_in_scope(app, "ctx-test-session", "/tmp/repo", "main")
+    }
+
+    fn seed_collab_session_in_scope(
+        app: &crate::mcp::app::App,
+        session_id: &str,
+        repo_path: &str,
+        branch: &str,
+    ) -> String {
+        let sid = session_id.to_string();
         app.db
             .with_transaction(|tx| {
                 crate::collab::queue::create_session(
                     tx,
                     &sid,
-                    "/tmp/repo",
-                    "main",
+                    repo_path,
+                    branch,
                     None,
                     crate::collab::Agent::Claude,
                 )
@@ -493,8 +502,8 @@ mod tests {
     fn resolve_stamps_active_collab_session_with_bucket() {
         let app = test_app();
         let sid = seed_collab_session(&app);
-        app.set_active_collab_session(&sid);
-        let ctx = MetricsContext::resolve(&app);
+        app.set_active_collab_session_for_scope(&sid, "/tmp/repo", "main");
+        let ctx = MetricsContext::resolve(&app, None);
         assert_eq!(ctx.collab_session_id.as_deref(), Some(sid.as_str()));
         assert_eq!(ctx.collab_phase.as_deref(), Some("planning")); // new session = PlanParallelDrafts
         assert!(ctx.task_tag.is_none());
@@ -512,8 +521,8 @@ mod tests {
                 crate::collab::queue::save_session(tx, &s)
             })
             .unwrap();
-        app.set_active_collab_session(&sid);
-        let ctx = MetricsContext::resolve(&app);
+        app.set_active_collab_session_for_scope(&sid, "/tmp/repo", "main");
+        let ctx = MetricsContext::resolve(&app, None);
         assert_eq!(ctx.collab_session_id.as_deref(), Some(sid.as_str()));
         assert_eq!(ctx.collab_phase.as_deref(), Some("other"));
     }
@@ -525,11 +534,12 @@ mod tests {
         app.db
             .with_transaction(|tx| crate::collab::queue::end_session(tx, &sid))
             .unwrap();
-        app.set_active_collab_session(&sid);
-        let ctx = MetricsContext::resolve(&app);
+        app.set_active_collab_session_for_scope(&sid, "/tmp/repo", "main");
+        let ctx = MetricsContext::resolve(&app, None);
         assert!(ctx.collab_session_id.is_none());
         assert!(
-            app.active_collab_session_snapshot().is_none(),
+            app.active_collab_session_snapshot_for_scope("/tmp/repo", "main")
+                .is_none(),
             "cell must self-clear"
         );
     }
@@ -541,10 +551,10 @@ mod tests {
         app.db
             .with_transaction(|tx| crate::collab::queue::end_session(tx, &sid))
             .unwrap();
-        app.set_active_collab_session(&sid);
+        app.set_active_collab_session_for_scope(&sid, "/tmp/repo", "main");
         app.set_explicit_task_tag("issue-85");
 
-        let ctx = MetricsContext::resolve(&app);
+        let ctx = MetricsContext::resolve(&app, None);
 
         assert!(ctx.collab_session_id.is_none());
         assert!(ctx.collab_phase.is_none());
@@ -552,25 +562,29 @@ mod tests {
             ctx.task_tag.is_none(),
             "the row that discovers a stale collab cell must stay unstamped"
         );
-        assert!(app.active_collab_session_snapshot().is_none());
+        assert!(app
+            .active_collab_session_snapshot_for_scope("/tmp/repo", "main")
+            .is_none());
     }
 
     #[test]
     fn resolve_unstamps_and_clears_cell_for_missing_session() {
         let app = test_app();
-        app.set_active_collab_session("does-not-exist");
-        let ctx = MetricsContext::resolve(&app);
+        app.set_active_collab_session_for_scope("does-not-exist", "/tmp/repo", "main");
+        let ctx = MetricsContext::resolve(&app, None);
         assert!(ctx.collab_session_id.is_none());
-        assert!(app.active_collab_session_snapshot().is_none());
+        assert!(app
+            .active_collab_session_snapshot_for_scope("/tmp/repo", "main")
+            .is_none());
     }
 
     #[test]
     fn resolve_does_not_fallback_to_task_tag_for_missing_active_session() {
         let app = test_app();
-        app.set_active_collab_session("does-not-exist");
+        app.set_active_collab_session_for_scope("does-not-exist", "/tmp/repo", "main");
         app.set_explicit_task_tag("issue-85");
 
-        let ctx = MetricsContext::resolve(&app);
+        let ctx = MetricsContext::resolve(&app, None);
 
         assert!(ctx.collab_session_id.is_none());
         assert!(ctx.collab_phase.is_none());
@@ -578,14 +592,16 @@ mod tests {
             ctx.task_tag.is_none(),
             "the row that discovers a missing collab cell must stay unstamped"
         );
-        assert!(app.active_collab_session_snapshot().is_none());
+        assert!(app
+            .active_collab_session_snapshot_for_scope("/tmp/repo", "main")
+            .is_none());
     }
 
     #[test]
     fn resolve_falls_back_to_explicit_task_tag_with_impl_default() {
         let app = test_app();
         app.set_explicit_task_tag("issue-85");
-        let ctx = MetricsContext::resolve(&app);
+        let ctx = MetricsContext::resolve(&app, None);
         assert!(ctx.collab_session_id.is_none());
         assert_eq!(ctx.task_tag.as_deref(), Some("issue-85"));
         assert_eq!(ctx.collab_phase.as_deref(), Some("impl")); // §3.3 default
@@ -595,9 +611,9 @@ mod tests {
     fn resolve_collab_session_takes_priority_over_task_tag() {
         let app = test_app();
         let sid = seed_collab_session(&app);
-        app.set_active_collab_session(&sid);
+        app.set_active_collab_session_for_scope(&sid, "/tmp/repo", "main");
         app.set_explicit_task_tag("issue-85");
-        let ctx = MetricsContext::resolve(&app);
+        let ctx = MetricsContext::resolve(&app, None);
         // §2.3 priority: collab id wins; task_tag not stamped alongside it.
         assert_eq!(ctx.collab_session_id.as_deref(), Some(sid.as_str()));
         assert!(ctx.task_tag.is_none());
@@ -606,9 +622,36 @@ mod tests {
     #[test]
     fn resolve_returns_empty_context_when_nothing_set() {
         let app = test_app();
-        let ctx = MetricsContext::resolve(&app);
+        let ctx = MetricsContext::resolve(&app, None);
         assert!(
             ctx.collab_session_id.is_none() && ctx.collab_phase.is_none() && ctx.task_tag.is_none()
+        );
+    }
+
+    #[test]
+    fn resolve_uses_exact_collab_session_and_leaves_ambiguous_unscoped_request_unstamped() {
+        let app = test_app();
+        let repo_main = seed_collab_session_in_scope(&app, "ctx-repo-main", "/tmp/repo", "main");
+        let other_repo =
+            seed_collab_session_in_scope(&app, "ctx-other-repo", "/tmp/other-repo", "main");
+        app.set_active_collab_session_for_scope(&repo_main, "/tmp/repo", "main");
+        app.set_active_collab_session_for_scope(&other_repo, "/tmp/other-repo", "main");
+
+        let exact = MetricsContext::resolve(&app, Some(other_repo.as_str()));
+        assert_eq!(
+            exact.collab_session_id.as_deref(),
+            Some(other_repo.as_str()),
+            "an explicit collab session id must resolve its own scope"
+        );
+        assert_eq!(exact.collab_phase.as_deref(), Some("planning"));
+        assert!(exact.task_tag.is_none());
+
+        let unscoped = MetricsContext::resolve(&app, None);
+        assert!(
+            unscoped.collab_session_id.is_none()
+                && unscoped.collab_phase.is_none()
+                && unscoped.task_tag.is_none(),
+            "with multiple scoped sessions, an unscoped request must not receive arbitrary attribution"
         );
     }
 

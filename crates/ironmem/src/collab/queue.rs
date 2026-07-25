@@ -1140,4 +1140,50 @@ mod tests {
         assert_eq!(b.0, "b-active");
         assert!(!b.1.is_empty());
     }
+
+    #[test]
+    fn find_active_session_by_repo_branch_excludes_terminal_phases() {
+        let db = open();
+        create_session(&db, "terminal-scope", "/repo", "main", None, Agent::Claude).unwrap();
+
+        assert_eq!(
+            find_active_session_by_repo_branch(&db, "/repo", "main")
+                .unwrap()
+                .map(|(id, _)| id),
+            Some("terminal-scope".to_string()),
+            "planning sessions are active"
+        );
+
+        let mut complete = load_session(&db, "terminal-scope").unwrap();
+        complete.phase = Phase::CodingComplete;
+        save_session(&db, &complete).unwrap();
+        assert!(
+            find_active_session_by_repo_branch(&db, "/repo", "main")
+                .unwrap()
+                .is_none(),
+            "CodingComplete is terminal even before collab_end"
+        );
+
+        create_session(&db, "coding-scope", "/repo", "main", None, Agent::Claude).unwrap();
+        let mut coding = load_session(&db, "coding-scope").unwrap();
+        coding.phase = Phase::CodeImplementPending;
+        coding.current_owner = Agent::Claude;
+        save_session(&db, &coding).unwrap();
+        assert_eq!(
+            find_active_session_by_repo_branch(&db, "/repo", "main")
+                .unwrap()
+                .map(|(id, _)| id),
+            Some("coding-scope".to_string()),
+            "coding sessions remain active"
+        );
+
+        coding.phase = Phase::CodingFailed;
+        save_session(&db, &coding).unwrap();
+        assert!(
+            find_active_session_by_repo_branch(&db, "/repo", "main")
+                .unwrap()
+                .is_none(),
+            "CodingFailed is terminal even before collab_end"
+        );
+    }
 }

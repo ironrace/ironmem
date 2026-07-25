@@ -1600,8 +1600,12 @@ mod tests {
     }
 
     fn start_session(app: &crate::mcp::app::App) -> String {
+        start_session_in_scope(app, "/tmp/repo", "main")
+    }
+
+    fn start_session_in_scope(app: &crate::mcp::app::App, repo_path: &str, branch: &str) -> String {
         let args = json!({
-            "repo_path": "/tmp/repo", "branch": "main",
+            "repo_path": repo_path, "branch": branch,
             "initiator": "claude", "task": "lifecycle test", "implementer": "claude",
         });
         let out = handle_collab_start(app, &args).unwrap();
@@ -1649,6 +1653,34 @@ mod tests {
         );
         send(app, sid, "claude", "task_list", &task_list_content);
         hash
+    }
+
+    /// Drive the normal v3 lifecycle through its terminal success phase while
+    /// deliberately leaving `collab_end` uncalled.
+    fn drive_to_coding_complete(app: &crate::mcp::app::App, sid: &str) {
+        drive_to_implement(app, sid);
+        send(
+            app,
+            sid,
+            "claude",
+            "implementation_done",
+            r#"{"head_sha":"c1"}"#,
+        );
+        send(
+            app,
+            sid,
+            "codex",
+            "review_fix_global",
+            r#"{"head_sha":"c2"}"#,
+        );
+        send(app, sid, "claude", "review_local", r#"{"head_sha":"c3"}"#);
+        send(
+            app,
+            sid,
+            "claude",
+            "final_review",
+            r#"{"head_sha":"c4","pr_url":"https://github.com/x/y/pull/9"}"#,
+        );
     }
 
     // ── lifecycle tests ───────────────────────────────────────────────────────
@@ -2040,17 +2072,35 @@ mod tests {
     }
 
     #[test]
-    fn second_live_session_cannot_steal_process_attribution_slot() {
+    fn scoped_slots_allow_distinct_repos_and_branches_but_reject_duplicate_scope() {
         let app = test_app();
-        let first = start_session(&app);
+        let repo_main = start_session_in_scope(&app, "/tmp/repo", "main");
+        let other_repo_main = start_session_in_scope(&app, "/tmp/other-repo", "main");
+        let repo_feature = start_session_in_scope(&app, "/tmp/repo", "feature");
+
+        assert_eq!(
+            app.active_collab_session_snapshot_for_scope("/tmp/repo", "main")
+                .as_deref(),
+            Some(repo_main.as_str())
+        );
+        assert_eq!(
+            app.active_collab_session_snapshot_for_scope("/tmp/other-repo", "main")
+                .as_deref(),
+            Some(other_repo_main.as_str())
+        );
+        assert_eq!(
+            app.active_collab_session_snapshot_for_scope("/tmp/repo", "feature")
+                .as_deref(),
+            Some(repo_feature.as_str())
+        );
 
         let err = handle_collab_start(
             &app,
             &json!({
                 "repo_path": "/tmp/repo",
-                "branch": "other-branch",
+                "branch": "main",
                 "initiator": "claude",
-                "task": "second live session",
+                "task": "duplicate scope",
                 "implementer": "claude",
             }),
         )
@@ -2058,12 +2108,34 @@ mod tests {
 
         assert!(
             err.to_string()
-                .contains("already bound to this MCP process"),
+                .contains("an active collab session already exists for repo /tmp/repo branch main"),
             "unexpected error: {err}"
         );
         assert_eq!(
-            app.active_collab_session_snapshot().as_deref(),
-            Some(first.as_str())
+            app.active_collab_session_snapshot_for_scope("/tmp/repo", "main")
+                .as_deref(),
+            Some(repo_main.as_str())
+        );
+    }
+
+    #[test]
+    fn coding_complete_session_does_not_block_a_new_different_scope_without_collab_end() {
+        let app = test_app();
+        let completed = start_session(&app);
+        drive_to_coding_complete(&app, &completed);
+
+        let next = start_session_in_scope(&app, "/tmp/next-repo", "main");
+
+        assert_eq!(
+            app.active_collab_session_snapshot_for_scope("/tmp/repo", "main")
+                .as_deref(),
+            Some(completed.as_str()),
+            "terminal session remains inspectable until an explicit collab_end"
+        );
+        assert_eq!(
+            app.active_collab_session_snapshot_for_scope("/tmp/next-repo", "main")
+                .as_deref(),
+            Some(next.as_str())
         );
     }
 
