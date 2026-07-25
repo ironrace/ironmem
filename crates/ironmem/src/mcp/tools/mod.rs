@@ -89,7 +89,7 @@ pub fn tool_definitions(app: &App) -> Vec<Value> {
                     },
                     "supersedes": {
                         "type": "string",
-                        "description": "Retained; retrievable by ID."
+                        "description": "The superseded drawer is retained and retrievable by ID."
                     }
                 },
                 "required": ["content", "wing"]
