@@ -422,7 +422,7 @@ pub fn tool_definitions(app: &App) -> Vec<Value> {
         }),
         json!({
             "name": "collab_wait_my_turn",
-            "description": "Long-poll: block until current_owner == agent, or an actionable post-claim session-state change occurs (phase, owner, terminal/ended, or recovery-state changes such as pending failure/recovery ownership), or the timeout elapses. A settled full frame returns {is_my_turn, phase, current_owner, session_ended}; exactly {unchanged: true} means no relevant change occurred before the deadline. Default timeout 30s, max 60s.",
+            "description": "Long-poll until the agent's turn or a post-claim phase, owner, terminal, ended, or recovery-state change. Timeout returns {unchanged:true}; otherwise returns {is_my_turn, phase, current_owner, session_ended}. Default 30s, max 60s.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
