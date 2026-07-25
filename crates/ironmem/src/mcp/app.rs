@@ -247,8 +247,8 @@ impl App {
             .len()
     }
 
-    /// Return every active collab binding in a stable order for status output.
-    /// Each tuple is `(repo_path, branch, session_id)`.
+    /// Return every active collab binding from one map read, in a stable order
+    /// for status output. Each tuple is `(repo_path, branch, session_id)`.
     pub fn active_collab_sessions_snapshot(&self) -> Vec<(String, String, String)> {
         let mut sessions: Vec<_> = self
             .active_collab_sessions

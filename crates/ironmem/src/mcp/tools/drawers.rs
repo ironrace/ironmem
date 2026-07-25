@@ -527,6 +527,31 @@ pub(super) fn handle_search(app: &App, args: &Value) -> Result<Value, MemoryErro
     Ok(response)
 }
 
+/// Build both collab status fields from one App snapshot. Keeping the legacy
+/// id derivation here prevents a second map read from contradicting the list
+/// when a concurrent handler changes scoped bindings.
+fn active_collab_status_fields_from_snapshot(
+    snapshot: Vec<(String, String, String)>,
+) -> (Value, Value) {
+    let active_collab_session_id = match snapshot.as_slice() {
+        [(_, _, session_id)] => Value::String(session_id.clone()),
+        _ => Value::Null,
+    };
+    let active_collab_sessions = Value::Array(
+        snapshot
+            .into_iter()
+            .map(|(repo_path, branch, session_id)| {
+                json!({
+                    "repo_path": repo_path,
+                    "branch": branch,
+                    "session_id": session_id,
+                })
+            })
+            .collect(),
+    );
+    (active_collab_sessions, active_collab_session_id)
+}
+
 pub(super) fn handle_status(app: &App, args: &Value) -> Result<Value, MemoryError> {
     let set_tag = args.get("set_task_tag").and_then(Value::as_str);
     let clear_tag = args
@@ -560,17 +585,8 @@ pub(super) fn handle_status(app: &App, args: &Value) -> Result<Value, MemoryErro
         ReadinessState::Pending => ("warming_up", None),
         ReadinessState::Failed(reason) => ("failed", Some(reason)),
     };
-    let active_collab_sessions: Vec<Value> = app
-        .active_collab_sessions_snapshot()
-        .into_iter()
-        .map(|(repo_path, branch, session_id)| {
-            json!({
-                "repo_path": repo_path,
-                "branch": branch,
-                "session_id": session_id,
-            })
-        })
-        .collect();
+    let (active_collab_sessions, active_collab_session_id) =
+        active_collab_status_fields_from_snapshot(app.active_collab_sessions_snapshot());
 
     Ok(json!({
         "total_drawers": total,
@@ -587,7 +603,7 @@ pub(super) fn handle_status(app: &App, args: &Value) -> Result<Value, MemoryErro
         "readiness_error": readiness_error,
         "task_tag": app.explicit_task_tag_snapshot(),
         "active_collab_sessions": active_collab_sessions,
-        "active_collab_session_id": app.active_collab_session_snapshot(),
+        "active_collab_session_id": active_collab_session_id,
         "metrics": crate::report::one_line_summary(&app.db),
     }))
 }
@@ -727,6 +743,33 @@ mod tests {
                     "branch": "main",
                     "session_id": "session-z",
                 },
+            ])
+        );
+    }
+
+    #[test]
+    fn active_collab_status_fields_use_one_snapshot_for_list_and_legacy_id() {
+        let snapshot = vec![
+            (
+                "/repo-a".to_string(),
+                "main".to_string(),
+                "session-a".to_string(),
+            ),
+            (
+                "/repo-b".to_string(),
+                "main".to_string(),
+                "session-b".to_string(),
+            ),
+        ];
+
+        let (sessions, legacy_id) = active_collab_status_fields_from_snapshot(snapshot);
+
+        assert!(legacy_id.is_null());
+        assert_eq!(
+            sessions,
+            json!([
+                {"repo_path": "/repo-a", "branch": "main", "session_id": "session-a"},
+                {"repo_path": "/repo-b", "branch": "main", "session_id": "session-b"},
             ])
         );
     }
