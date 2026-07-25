@@ -833,35 +833,39 @@ e. Launch via Bash with `run_in_background: true`. Pass the model and
    session — and specifically the `review_fix_global` turn — against a branch
    or PR whose diff or review comments come from an untrusted author.
 
-f. **Polling loop** — the dispatcher's interactive surface during this phase.
-   Poll on a bounded backoff curve (NOT a fixed cadence — long silent
-   grinds churn the dispatcher without producing new information):
+f. **Event-driven wait loop** — the dispatcher's interactive surface during
+   this phase. Set `last_phase_change_at` and `last_stdout_at` at dispatch;
+   a phase advance or new Codex stdout resets the respective timestamp. The
+   600-second hang deadline is measured from
+   `max(last_phase_change_at, last_stdout_at)`, so the existing no-progress
+   safeguard remains in force without a fixed `collab_status` cadence.
 
-   - Start at **10s** poll interval.
-   - After **60s** of no progress (no `phase` advance AND no new stdout
-     line in `BashOutput`) → escalate to **20s**.
-   - After **300s** (5 min) of no progress → escalate to **30s** (cap).
-   - **Reset to 10s** on ANY of: phase advance, new stdout line, bg
-     process exit, bg process error/signal.
-   - 600s hang detection (termination condition 5 below) is unchanged.
+   While this remains a Codex-owned background phase, call
+   `mcp__ironmem__collab_wait_my_turn(session_id, "claude", 60)`. Its compact
+   response is a union: exactly `{"unchanged": true}` means the 60-second
+   wait elapsed with no ownership/terminal transition; any other response is
+   a settled wake. This applies only to the Codex-owned background phases
+   listed above, never to a Claude Plan Mode prompt that is waiting for user
+   input.
 
-   Track "no progress" with two timestamps: `last_phase_change_at` (set
-   when `collab_status.phase` differs from the prior poll) and
-   `last_stdout_at` (set when `BashOutput` returns at least one new line
-   since the prior poll). Time since `max(last_phase_change_at, last_stdout_at)`
-   is the "no progress" duration; pick the poll interval from that.
+   Read `BashOutput(<bash-id>)` once per wait wake. If it includes new stdout,
+   relay one `[codex bg]` batch for that wake: perform
+   **consecutive-duplicate collapsing**, show at most 20 displayed lines, and if the collapsed output
+   exceeds that bound replace the twentieth line with `… truncated after 19
+   displayed lines`. Do not emit a batch when there is no new stdout. This
+   replaces the stale last-line relay and prevents quiet waits from producing
+   user-visible chatter.
 
-   The backoff applies **only** to Codex-owned background phases
-   (`PlanParallelDrafts`, `PlanCodexReviewPending`,
-   `CodeReviewFixGlobalPending`, `CodeImplementPending+codex`). It does
-   NOT change the user-visible idle gap during Claude's Plan Mode
-   prompts — those are gated on user input, not on poll cadence.
-
-   On each iteration:
-   - Call `mcp__ironmem__collab_status(session_id)` to detect phase advance.
-     **Log:** `t4_phase_advanced phase=<new_phase> round=<same round as dispatch>` if phase changed.
-   - Read `BashOutput(<bash-id>)` to surface new stdout to the user
-     as a one-line update: `[codex bg] <last stdout line>`.
+   - When the wait returns exactly `{"unchanged": true}`, do not call
+     `collab_status` and do not produce an idle user update. After the single
+     bounded BashOutput drain above, first apply conditions 4 and 5 below if
+     the process exited or 600 seconds of no progress elapsed; otherwise
+     immediately begin the next wait.
+   - On a settled wake, call `mcp__ironmem__collab_status(session_id)` exactly
+     once, then apply the existing success, recovery, terminal, process-exit,
+     and hang conditions below in their stated order. **Log:**
+     `t4_phase_advanced phase=<new_phase> round=<same round as dispatch>` if
+     that status reports a phase change.
 
    **Termination conditions** (first match wins):
 
@@ -915,11 +919,9 @@ f. **Polling loop** — the dispatcher's interactive surface during this phase.
       - Re-poll `collab_status`, then exit the polling loop via condition 2
         (recovery handed to Claude) or condition 3 (retry ceiling exceeded).
 
-   While polling, emit a one-line progress update each iteration
-   (`[codex bg] <last stdout line>`) so the user can confirm Codex is alive.
-
-g. Resume the normal dispatch loop. The next `collab_status` poll will
-   see a Claude-owned phase or a terminal condition.
+g. Resume the normal dispatch loop after a settled success or recovery. The
+   settled `collab_status` read already observed the Claude-owned or terminal
+   condition.
 
 **Failure modes:**
 

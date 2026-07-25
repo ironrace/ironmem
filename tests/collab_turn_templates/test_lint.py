@@ -58,11 +58,15 @@ def test_codex_dispatch_uses_explicit_repository_model_defaults():
     agents = (ROOT / "AGENTS.md").read_text()
 
     for surface in (docs, dispatcher, plan_draft_prompt, plan_review_prompt,
-                    global_review_prompt, recovery_prompt, batch_prompt, tools,
-                    source_tools, agents):
+                    global_review_prompt, batch_prompt, tools, source_tools,
+                    agents):
         assert "gpt-5.6-luna" in surface
         assert "gpt-5.6-terra" in surface
         assert "gpt-5.6-sol" in surface
+
+    # Recovery inherits the dispatcher-selected model; it is intentionally
+    # transport-agnostic and therefore does not name a tier itself.
+    assert "gpt-5.6-" not in recovery_prompt
 
     assert "CodeImplementPending" in dispatcher
     assert "-m gpt-5.6-luna -c model_reasoning_effort=max" in dispatcher
@@ -84,6 +88,20 @@ def test_lint_requires_logical_keyed_checkpoint_contract(tmp_path):
 
     assert r.returncode == 1
     assert "missing checkpoint contract 'collab-checkpoint:<session_id>'" in r.stdout
+
+
+def test_codex_background_dispatcher_uses_quiet_settled_waits():
+    docs = (ROOT / "docs" / "COLLAB.md").read_text()
+    dispatcher = (ROOT / ".claude-plugin" / "commands" / "collab.md").read_text()
+
+    for surface in (docs, dispatcher):
+        assert 'collab_wait_my_turn(session_id, "claude", 60)' in surface
+        assert '{"unchanged": true}' in surface
+        assert "consecutive-duplicate collapsing" in surface
+
+    assert "On each iteration:" not in dispatcher
+    assert "Call `mcp__ironmem__collab_status(session_id)` to detect phase advance." not in dispatcher
+    assert "[codex bg] <last stdout line>" not in dispatcher
 
 
 def test_lint_catches_unknown_placeholder(tmp_path):

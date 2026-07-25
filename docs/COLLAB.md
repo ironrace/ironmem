@@ -2136,28 +2136,35 @@ Named events span `t0_session_started` (after `collab_start` returns)
 through `t10_session_complete` (when `CodingComplete` or `CodingFailed`
 is first observed).
 
-### Polling backoff (Codex bg phases only)
+### Event-driven Codex background waits
 
-The Claude dispatcher polls `collab_status` + `BashOutput` on a fixed ~10s
-interval while a Codex-owned phase is running as a background
-`codex exec` process. For long silent grinds, that fixed cadence churns
-the dispatcher without producing new information. A bounded backoff curve
-reduces that churn:
+For a Codex-owned background `codex exec` phase, Claude waits with
+`collab_wait_my_turn(session_id, "claude", 60)`, not a fixed-interval
+`collab_status` poll. The wait response is the compact union documented
+above: exactly `{"unchanged": true}` is a 60-second timeout with no state
+transition; every other response is a settled wake.
 
-- Default poll interval: **10s**.
-- After **60s** of no progress (no `phase` advance AND no new stdout
-  line) → escalate to **20s**.
-- After **300s** (5 min) of no progress → escalate to **30s** (cap).
-- **Reset to 10s** on ANY of: phase advance, new stdout line, bg process
-  exit, bg process error/signal.
-- 600s hang detection is unchanged.
+On an unchanged timeout, Claude immediately starts the next wait without a
+`collab_status` call or an idle user update (except that it first performs the
+single bounded background-output drain below and checks the still-required
+process-exit and 600-second hang conditions). On a settled wake, it calls
+`collab_status` once and uses the normal success, recovery, terminal,
+process-exit, and hang handling in that order. This preserves phase-specific
+timing events, recovery/resume routing, and the 600-second no-progress
+safeguard; progress is a phase change or new stdout.
 
-Scope: this backoff applies **only** to Codex-owned background phases
+Claude reads background stdout once per wait wake. New output is relayed as
+one `[codex bg]` batch, using **consecutive-duplicate collapsing** and at
+most 20 displayed lines. If collapsed output would exceed the bound, the
+twentieth line is a truncation notice after 19 displayed output lines. A
+quiet wake has no relay; Claude never emits a per-raw-line or last-line
+status update.
+
+Scope: this applies **only** to Codex-owned background phases
 (`PlanParallelDrafts`, `PlanCodexReviewPending`,
-`CodeReviewFixGlobalPending`, `CodeImplementPending+codex`). It does NOT
-change the user-visible idle gap during Claude's Plan Mode prompts —
-those are gated on user input, not on poll cadence. Full curve + reset
-conditions are documented in the Claude-side dispatcher prompt.
+`CodeReviewFixGlobalPending`, `CodeImplementPending+codex`). It does not
+change the user-visible idle gap during Claude's Plan Mode prompts, which are
+gated on user input.
 
 ### Anti-removal: `/ultrareview-local` overlap audit
 
