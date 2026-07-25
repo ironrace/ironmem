@@ -19,6 +19,14 @@ turn delegated to Codex: safely complete that one interrupted turn and exit.
   compatibility. It permits filesystem, process, and network access to
   untrusted content; do not process untrusted-party content in this protocol.
 
+## Model routing
+
+Recovery review uses `gpt-5.6-terra` at `high`. Implementation
+controller/workers use `gpt-5.6-luna` at `max`; exploration, docs, and
+mechanical workers use `gpt-5.6-luna` at `medium`; architecture/security
+escalation uses `gpt-5.6-sol` at `high`. Sol is an escalation tier, not the
+default.
+
 ## Recovery guard
 
 Parse a join invocation with one session id after an optional recognized
