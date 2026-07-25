@@ -950,6 +950,61 @@ mod tests {
     }
 
     #[test]
+    fn replayed_add_drawer_supersession_keeps_one_index_visible_successor() {
+        let app = test_app();
+        let predecessor = handle_add_drawer(
+            &app,
+            &json!({"content": "index replay predecessor", "wing": "project", "room": "state"}),
+        )
+        .unwrap();
+        let predecessor_id = predecessor["id"].as_str().unwrap().to_owned();
+        let replay = json!({
+            "content": "index replay successor uniquely searchable",
+            "wing": "project",
+            "room": "state",
+            "supersedes": predecessor_id,
+        });
+
+        let first = handle_add_drawer(&app, &replay).unwrap();
+        let second = handle_add_drawer(&app, &replay).unwrap();
+        let successor_id = first["id"].as_str().unwrap();
+        assert_eq!(second["id"].as_str(), Some(successor_id));
+
+        let state = app.index_state.read().unwrap();
+        assert_eq!(
+            state
+                .id_map
+                .iter()
+                .filter(|id| id.as_str() == successor_id)
+                .count(),
+            1,
+            "a replayed upsert must not append a duplicate HNSW id"
+        );
+        drop(state);
+
+        let results = handle_search(
+            &app,
+            &json!({
+                "query": "uniquely searchable",
+                "wing": "project",
+                "room": "state",
+                "limit": 10,
+            }),
+        )
+        .unwrap();
+        assert_eq!(
+            results["results"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|result| result["id"].as_str() == Some(successor_id))
+                .count(),
+            1,
+            "search must expose the replayed successor once"
+        );
+    }
+
+    #[test]
     fn add_drawer_rejects_invalid_or_invalidly_scoped_supersession() {
         let app = test_app();
         let base = json!({"content": "original", "wing": "project", "room": "state"});

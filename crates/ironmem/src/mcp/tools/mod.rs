@@ -84,7 +84,7 @@ pub fn tool_definitions(app: &App) -> Vec<Value> {
                     },
                     "supersedes": {
                         "type": "string",
-                        "description": "32-hex current same-scope predecessor, retained as history; normal search will hide history in Task 3."
+                        "description": "32-hex current same-scope predecessor, retained as history and retrievable by ID."
                     }
                 },
                 "required": ["content", "wing"]
@@ -1438,11 +1438,16 @@ mod tests {
         let supersedes = &add_drawer["inputSchema"]["properties"]["supersedes"];
 
         assert_eq!(supersedes["type"].as_str(), Some("string"));
+        let description = supersedes["description"]
+            .as_str()
+            .expect("supersedes must have a description");
         assert!(
-            supersedes["description"]
-                .as_str()
-                .is_some_and(|description| description.contains("retained")),
+            description.contains("retained") && description.contains("retrievable by ID"),
             "schema must make clear that supersession retains temporal history"
+        );
+        assert!(
+            !description.contains("Task"),
+            "public schema must describe current behavior, not an internal roadmap"
         );
     }
 

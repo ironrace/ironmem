@@ -455,9 +455,11 @@ impl Database {
         // ponytail: bounded per-wing/room scan is practical below ~10k current drawers; upgrade to filtered ANN retrieval when a scope exceeds that ceiling.
         let mut stmt = self.conn.prepare(
             "SELECT id, embedding FROM drawers
-             WHERE wing = ?1 AND room = ?2 AND id != ?3 AND superseded_by IS NULL",
+             WHERE wing = ?1 AND room = ?2 AND id != ?3 AND superseded_by IS NULL
+               AND source_file NOT LIKE ?4",
         )?;
-        let rows = stmt.query_map(params![wing, room, exclude_id], |row| {
+        let synthetic_pattern = format!("{PREF_SENTINEL}%");
+        let rows = stmt.query_map(params![wing, room, exclude_id, synthetic_pattern], |row| {
             Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?))
         })?;
 
@@ -1410,6 +1412,43 @@ mod tests {
             .expect("a current, in-scope duplicate");
         assert_eq!(duplicate.0, id_a);
         assert!((duplicate.1 - 1.0).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn find_near_duplicate_ignores_synthetic_preference_siblings() {
+        let db = Database::open_in_memory().unwrap();
+        let query = vec![1.0, 0.0];
+        let synthetic_id = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let real_id = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+        let real_vector = [0.95, (1.0_f32 - 0.95_f32.powi(2)).sqrt()];
+
+        db.insert_drawer(
+            synthetic_id,
+            "synthetic preference artifact",
+            &query,
+            "wing",
+            "room",
+            &format!("{PREF_SENTINEL}parent"),
+            "mcp",
+        )
+        .unwrap();
+        db.insert_drawer(
+            real_id,
+            "real near duplicate",
+            &real_vector,
+            "wing",
+            "room",
+            "",
+            "mcp",
+        )
+        .unwrap();
+
+        let duplicate = db
+            .find_near_duplicate(&query, "wing", "room", "excluded")
+            .unwrap()
+            .expect("a qualifying real drawer");
+        assert_eq!(duplicate.0, real_id);
+        assert!((duplicate.1 - 0.95).abs() < 1e-5);
     }
 
     #[test]
