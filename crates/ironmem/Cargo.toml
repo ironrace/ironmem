@@ -23,11 +23,16 @@ path = "src/lib.rs"
 name = "ironmem"
 path = "src/main.rs"
 
+[features]
+default = []
+headroom-compression = ["dep:headroom-core"]
+
 [dependencies]
 ironrace-core = { version = "0.3.4", path = "../ironrace-core" }
 ironrace-embed = { version = "0.3.4", path = "../ironrace-embed" }
 ironrace-pref-extract = { version = "0.3.4", path = "../ironrace-pref-extract" }
 ironrace-rerank = { version = "0.4.0", path = "../ironrace-rerank" }
+headroom-core = { git = "https://github.com/headroomlabs-ai/headroom.git", rev = "5bd2266f16bb351a7a7334e1c29c598d28187b1d", package = "headroom-core", default-features = false, optional = true }
 
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "io-std", "io-util", "net", "signal", "sync", "time"] }
 hyper = { version = "1", features = ["http1", "server"] }
