@@ -591,9 +591,10 @@ Two behaviours are worth knowing:
   plus wing/room, so re-adding a superseded body lands on the same row and
   makes it current again. Reverting a decision restores it rather than writing
   into a hidden row.
-- **Deleting a successor restores its predecessor.** `superseded_by` has no
-  foreign key, so deleting a successor clears the pointers into it instead of
-  stranding the older version out of reach.
+- **Deleting a successor preserves the remaining lineage.** `superseded_by`
+  has no foreign key, so deleting an intermediate version reconnects its
+  predecessor to the surviving successor; deleting the final successor restores
+  the predecessor as current instead of leaving it hidden behind a missing row.
 
 A response may also carry `dedup_hint` (`{id, score}`), which is advisory and
 non-destructive: it only points at a similar current drawer and never merges,

@@ -19,8 +19,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   advisory `dedup_hint` (`{id, score}`), and `dedup_hint_status: "unavailable"`
   when the check could not run. Supersession refuses collab-referenced and
   synthetic enrichment drawers, rejects a successor that is itself superseded
-  (which would hide an entire lineage), restores a predecessor when its
-  successor is deleted, and treats re-filing a superseded body as a
+  (which would hide an entire lineage), reconnects a predecessor to its
+  surviving successor (or restores it when the final successor is deleted),
+  and treats re-filing a superseded body as a
   resurrection rather than a durable-but-hidden write.
 
 ### Fixed

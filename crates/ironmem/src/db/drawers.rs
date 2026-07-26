@@ -326,20 +326,7 @@ impl Database {
         parent_id: &str,
     ) -> Result<usize, MemoryError> {
         let sentinel = format!("{PREF_SENTINEL}{parent_id}");
-        // Remove matching drawers from FTS index first (best-effort).
-        // Silently skip if the FTS table doesn't exist yet (pre-migration DBs).
-        if let Err(e) = tx.execute(
-            "DELETE FROM drawers_fts WHERE drawer_id IN \
-             (SELECT id FROM drawers WHERE source_file = ?1)",
-            params![sentinel],
-        ) {
-            tracing::debug!("FTS5 sync skipped (table may not exist yet): {e}");
-        }
-        let n = tx.execute(
-            "DELETE FROM drawers WHERE source_file = ?1",
-            params![sentinel],
-        )?;
-        Ok(n)
+        Self::delete_drawers_by_source_file_conn(tx, &sentinel)
     }
 
     pub(crate) fn delete_drawers_by_source_file_tx(
@@ -856,37 +843,41 @@ impl Database {
         Ok(false)
     }
 
-    /// Restore any predecessor that pointed at rows about to be deleted.
+    /// Reconnect predecessors that pointed at a row about to be deleted.
     ///
     /// `superseded_by` has no foreign key, so without this a delete would leave
-    /// a predecessor pointing at a row that no longer exists — permanently
-    /// hidden from every `superseded_by IS NULL` filter even though it is now
-    /// the only surviving version of that memory.
-    fn clear_dangling_supersession_conn(
+    /// a predecessor pointing at a row that no longer exists. If the deleted
+    /// row itself was superseded, preserve the lineage by linking predecessors
+    /// directly to its current successor; otherwise restore them as current.
+    fn reconnect_predecessors_for_deleted_drawer_conn(
         conn: &rusqlite::Connection,
-        doomed_ids_sql: &str,
-        params: &[&dyn rusqlite::types::ToSql],
+        id: &str,
     ) -> Result<(), MemoryError> {
         if !Self::has_superseded_by_column(conn)? {
             return Ok(());
         }
-        let restored = conn.execute(
-            &format!(
-                "UPDATE drawers SET superseded_by = NULL WHERE superseded_by IN ({doomed_ids_sql})"
-            ),
-            params,
+        let successor: Option<String> = conn
+            .query_row(
+                "SELECT superseded_by FROM drawers WHERE id = ?1",
+                params![id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let reconnected = conn.execute(
+            "UPDATE drawers SET superseded_by = ?1 WHERE superseded_by = ?2",
+            params![successor, id],
         )?;
-        if restored > 0 {
+        if reconnected > 0 {
             tracing::info!(
-                restored,
-                "restored superseded predecessors whose successor was deleted"
+                reconnected,
+                "reconnected superseded predecessors whose successor was deleted"
             );
         }
         Ok(())
     }
 
     fn delete_drawer_conn(conn: &rusqlite::Connection, id: &str) -> Result<usize, MemoryError> {
-        Self::clear_dangling_supersession_conn(conn, "?1", params![id])?;
+        Self::reconnect_predecessors_for_deleted_drawer_conn(conn, id)?;
         // Remove from FTS index first (best-effort; ignore if table doesn't exist).
         let _ = conn.execute("DELETE FROM drawers_fts WHERE drawer_id = ?1", params![id]);
         Ok(conn.execute("DELETE FROM drawers WHERE id = ?1", params![id])?)
@@ -896,11 +887,17 @@ impl Database {
         conn: &rusqlite::Connection,
         source_file: &str,
     ) -> Result<usize, MemoryError> {
-        Self::clear_dangling_supersession_conn(
-            conn,
-            "SELECT id FROM drawers WHERE source_file = ?1",
-            params![source_file],
-        )?;
+        // A batch delete removes each lineage member, so restoring incoming
+        // predecessors is correct. Rewiring to a row in this doomed set would
+        // create a fresh dangling pointer.
+        if Self::has_superseded_by_column(conn)? {
+            conn.execute(
+                "UPDATE drawers
+                 SET superseded_by = NULL
+                 WHERE superseded_by IN (SELECT id FROM drawers WHERE source_file = ?1)",
+                params![source_file],
+            )?;
+        }
         // Remove matching drawers from FTS index first (best-effort).
         let _ = conn.execute(
             "DELETE FROM drawers_fts WHERE drawer_id IN (
@@ -1685,6 +1682,38 @@ mod tests {
             None,
             "deleting the successor must not strand the predecessor as permanently hidden"
         );
+    }
+
+    #[test]
+    fn deleting_an_intermediate_successor_preserves_the_remaining_lineage() {
+        let db = Database::open_in_memory().unwrap();
+        let emb = dummy_embedding();
+        let (first, middle, last) = ("a".repeat(32), "b".repeat(32), "c".repeat(32));
+        for id in [&first, &middle, &last] {
+            db.insert_drawer(id, "body", &emb, "wing", "room", "", "test")
+                .unwrap();
+        }
+        db.with_transaction(|tx| {
+            Database::mark_drawer_superseded_tx(tx, &first, &middle, "wing", "room")
+        })
+        .unwrap();
+        db.with_transaction(|tx| {
+            Database::mark_drawer_superseded_tx(tx, &middle, &last, "wing", "room")
+        })
+        .unwrap();
+
+        assert!(db.delete_drawer(&middle).unwrap());
+
+        assert_eq!(
+            db.get_drawer(&first).unwrap().unwrap().superseded_by,
+            Some(last.clone()),
+            "deleting a middle version must retain the link to its surviving successor"
+        );
+        let current = db
+            .get_drawers_by_ids_filtered(&[&first, &last], None, None, false)
+            .unwrap();
+        assert_eq!(current.len(), 1);
+        assert!(current.contains_key(&last));
     }
 
     /// FTS5 cannot resolve `MATCH`/`bm25()` through a table alias, so every
