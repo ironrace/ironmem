@@ -146,6 +146,7 @@ pub fn run_context(app: &App, opts: &ContextPackOptions) -> Result<ContextPack, 
         wing: None,
         room: None,
         limit: MAX_MEMORY_HITS,
+        include_superseded: false,
     };
     let mut memory_hits: Vec<MemoryHit> = match search(app, &opts.task, &filters) {
         Ok(result) => result

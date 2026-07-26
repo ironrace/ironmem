@@ -511,6 +511,15 @@ impl App {
             .write()
             .map_err(|e| MemoryError::Lock(format!("IndexState lock poisoned: {e}")))?;
 
+        if state.id_map.iter().any(|id| id == drawer_id) {
+            // An upsert replay may have changed the stored embedding. Avoid
+            // appending the ID a second time; a lazy rebuild refreshes the
+            // vector from SQLite before the next search.
+            drop(state);
+            self.mark_dirty();
+            return Ok(());
+        }
+
         let pos = state.index.insert_one(embedding);
         if pos == usize::MAX {
             drop(state);

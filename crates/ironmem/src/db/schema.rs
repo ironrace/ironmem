@@ -28,11 +28,12 @@ const COLLAB_RECOVERY_STATE_SQL: &str =
     include_str!("../../migrations/015_collab_recovery_state.sql");
 const COLLAB_MESSAGE_DRAWERS_SQL: &str =
     include_str!("../../migrations/016_collab_message_drawers.sql");
+const DRAWER_SUPERSESSION_SQL: &str = include_str!("../../migrations/017_drawer_supersession.sql");
 
 /// Highest schema version a fully-migrated database reports. Bump alongside the
 /// `run_version_gated_migrations` ladder below so `ironmem doctor` can tell a
 /// behind-migration database from an up-to-date one.
-pub const LATEST_SCHEMA_VERSION: i64 = 16;
+pub const LATEST_SCHEMA_VERSION: i64 = 17;
 
 /// Database wrapper around a SQLite connection.
 ///
@@ -286,6 +287,13 @@ impl Database {
             self.conn.execute_batch(COLLAB_MESSAGE_DRAWERS_SQL)?;
         }
 
+        // v17: durable drawer supersession lineage. NULL preserves every
+        // existing drawer as current, while a partial wing/room index supports
+        // current-only supersession and duplicate checks.
+        if current_version < 17 {
+            self.conn.execute_batch(DRAWER_SUPERSESSION_SQL)?;
+        }
+
         Ok(())
     }
 
@@ -449,7 +457,7 @@ mod tests {
         // fully-migrated database reports — doctor compares against it.
         let db = Database::open_in_memory().unwrap();
         assert_eq!(LATEST_SCHEMA_VERSION, db.schema_version().unwrap());
-        assert_eq!(LATEST_SCHEMA_VERSION, 16);
+        assert_eq!(LATEST_SCHEMA_VERSION, 17);
     }
 
     #[test]
@@ -1443,5 +1451,49 @@ mod tests {
         db.migrate().unwrap();
         db.migrate().unwrap();
         assert_eq!(schema_version_of(&db), LATEST_SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn test_v16_to_v17_adds_drawer_supersession_and_preserves_legacy_drawers() {
+        let db = open_at_v15();
+        db.conn.execute_batch(COLLAB_MESSAGE_DRAWERS_SQL).unwrap();
+        assert_eq!(schema_version_of(&db), 16);
+        assert!(
+            !column_exists(&db, "drawers", "superseded_by"),
+            "superseded_by should not exist at v16"
+        );
+
+        db.conn
+            .execute(
+                "INSERT INTO drawers (id, content, embedding, wing, room, source_file, added_by)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                rusqlite::params![
+                    "legacy-v16-drawer",
+                    "legacy drawer",
+                    vec![0_u8; EMBED_DIM * std::mem::size_of::<f32>()],
+                    "legacy-wing",
+                    "legacy-room",
+                    "",
+                    "test"
+                ],
+            )
+            .unwrap();
+
+        db.migrate().unwrap();
+        assert_eq!(schema_version_of(&db), LATEST_SCHEMA_VERSION);
+        assert!(column_exists(&db, "drawers", "superseded_by"));
+        assert!(index_exists(&db, "idx_drawers_current_wing_room"));
+        let superseded_by: Option<String> = db
+            .conn
+            .query_row(
+                "SELECT superseded_by FROM drawers WHERE id = ?1",
+                ["legacy-v16-drawer"],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(
+            superseded_by.is_none(),
+            "legacy drawers must remain current"
+        );
     }
 }

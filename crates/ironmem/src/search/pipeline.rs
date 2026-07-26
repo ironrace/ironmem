@@ -101,7 +101,6 @@ pub fn search(
         .map_err(|e| MemoryError::Lock(format!("IndexState lock poisoned: {e}")))?;
 
     let primary_hnsw = state.index.search(&primary_vec, overfetch);
-    let total_candidates = primary_hnsw.len();
 
     let hnsw_results = if let Some(cv) = maybe_content_vec {
         let content_hnsw = state.index.search(&cv, overfetch);
@@ -117,12 +116,19 @@ pub fn search(
 
     drop(state);
 
+    // HNSW is intentionally scope-agnostic. Remove only retained historical
+    // rows here so default retrieval cannot use them for RRF or PRF expansion;
+    // wing/room and collab-message behavior remains in the final filter.
+    let hnsw_ids = filter_superseded_candidate_ids(app, hnsw_ids, filters.include_superseded)?;
+    let total_candidates = hnsw_ids.len();
+
     // Step 4: BM25 full-text search.
-    let bm25_pairs = app.db.bm25_search(
+    let bm25_pairs = app.db.bm25_search_with_history(
         &sanitized.clean_query,
         overfetch,
         filters.wing.as_deref(),
         filters.room.as_deref(),
+        filters.include_superseded,
     )?;
     let bm25_hit_count = bm25_pairs.len();
     let bm25_ids: Vec<String> = bm25_pairs.into_iter().map(|(id, _)| id).collect();
@@ -265,12 +271,15 @@ pub fn search(
                 .filter_map(|(idx, _)| state.id_map.get(*idx).cloned())
                 .collect();
             drop(state);
+            let exp_hnsw_ids =
+                filter_superseded_candidate_ids(app, exp_hnsw_ids, filters.include_superseded)?;
 
-            let exp_bm25_pairs = app.db.bm25_search(
+            let exp_bm25_pairs = app.db.bm25_search_with_history(
                 &expanded_query,
                 overfetch,
                 filters.wing.as_deref(),
                 filters.room.as_deref(),
+                filters.include_superseded,
             )?;
             let exp_bm25_ids: Vec<String> = exp_bm25_pairs.into_iter().map(|(id, _)| id).collect();
 
@@ -301,6 +310,7 @@ pub fn search(
         &missing_candidate_ids,
         filters.wing.as_deref(),
         filters.room.as_deref(),
+        filters.include_superseded,
     )?;
     drawers.extend(fetched);
 
@@ -334,7 +344,7 @@ pub fn search(
     // Cheap when no synthetic hit is in `scored` (single partition pass + early
     // return). Always-on by structural check; the only way a synth hit reaches
     // here is if pref-enrichment was enabled at ingest time.
-    collapse_synthetic_into_parents(app, &mut scored)?;
+    collapse_synthetic_into_parents(app, &mut scored, filters)?;
 
     // Step 8: Lexical shrinkage rerank (mempalace hybrid-v5 port)
     // Default ON; disable with IRONMEM_SHRINKAGE_RERANK=0 for eval comparisons.
@@ -414,6 +424,7 @@ pub fn search(
 
 fn drawer_matches_filters(drawer: &Drawer, filters: &SearchFilters) -> bool {
     drawer.room != "collab-messages"
+        && (filters.include_superseded || drawer.superseded_by.is_none())
         && filters
             .wing
             .as_deref()
@@ -422,6 +433,28 @@ fn drawer_matches_filters(drawer: &Drawer, filters: &SearchFilters) -> bool {
             .room
             .as_deref()
             .is_none_or(|room| drawer.room == room)
+}
+
+/// Drop retained historical rows before they can influence RRF or PRF. This
+/// deliberately leaves scope and collab-message filtering to the existing
+/// final stage, preserving their established semantics.
+fn filter_superseded_candidate_ids(
+    app: &App,
+    candidate_ids: Vec<String>,
+    include_superseded: bool,
+) -> Result<Vec<String>, MemoryError> {
+    if include_superseded || candidate_ids.is_empty() {
+        return Ok(candidate_ids);
+    }
+
+    let refs: Vec<&str> = candidate_ids.iter().map(String::as_str).collect();
+    let current = app
+        .db
+        .get_drawers_by_ids_filtered(&refs, None, None, false)?;
+    Ok(candidate_ids
+        .into_iter()
+        .filter(|id| current.contains_key(id))
+        .collect())
 }
 
 /// Union two HNSW result lists by max score, deduplicating by index position.
@@ -516,6 +549,8 @@ fn rrf_scores_map_weighted<'a>(
 /// synth to disappear from the candidate list. If the parent is missing from
 /// `candidates` (because it didn't make HNSW top-N) but the synth did, fetch
 /// the parent by id and surface it with the synth's score; drop the synth.
+/// The fetch honors `include_superseded`, so a surviving synthetic sibling
+/// cannot restore an otherwise-hidden historical parent during normal search.
 /// If the parent has been deleted from the DB, drop the synth quietly.
 ///
 /// This runs *before* the rerank stages so all downstream scoring sees only
@@ -523,6 +558,7 @@ fn rrf_scores_map_weighted<'a>(
 pub fn collapse_synthetic_into_parents(
     app: &App,
     candidates: &mut Vec<ScoredDrawer>,
+    filters: &SearchFilters,
 ) -> Result<(), MemoryError> {
     // Partition: (synth, real). Both keep insertion order to keep the ordering
     // step downstream deterministic.
@@ -575,7 +611,9 @@ pub fn collapse_synthetic_into_parents(
 
     if !orphan_parent_ids.is_empty() {
         let id_refs: Vec<&str> = orphan_parent_ids.iter().map(|s| s.as_str()).collect();
-        let fetched = app.db.get_drawers_by_ids(&id_refs)?;
+        let fetched =
+            app.db
+                .get_drawers_by_ids_filtered(&id_refs, None, None, filters.include_superseded)?;
         for pid in &orphan_parent_ids {
             if let Some(parent) = fetched.get(pid) {
                 let score = orphan_scores.get(pid).copied().unwrap_or(0.0);
@@ -680,6 +718,7 @@ mod tests {
                 added_by: "t".into(),
                 filed_at: "2026-01-01T00:00:00Z".into(),
                 date: "2026-01-01".into(),
+                superseded_by: None,
             },
             score: 1.0,
         }

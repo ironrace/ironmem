@@ -64,6 +64,11 @@ pub fn tool_definitions(app: &App) -> Vec<Value> {
                         "type": "boolean",
                         "default": false,
                         "description": "Return bounded full content; use get_drawer for the complete body."
+                    },
+                    "include_superseded": {
+                        "type": "boolean",
+                        "default": false,
+                        "description": "true includes retained superseded history; false hides it."
                     }
                 },
                 "required": ["query"]
@@ -81,6 +86,10 @@ pub fn tool_definitions(app: &App) -> Vec<Value> {
                     "logical_key": {
                         "type": "string",
                         "description": "Stable key that rewrites this wing/room drawer."
+                    },
+                    "supersedes": {
+                        "type": "string",
+                        "description": "ID of a current drawer in this wing/room to retire; it is retained and retrievable by ID."
                     }
                 },
                 "required": ["content", "wing"]
@@ -110,7 +119,8 @@ pub fn tool_definitions(app: &App) -> Vec<Value> {
                     },
                     "hash_only": {
                         "type": "boolean",
-                        "description": "When true, omit content and return content_hash unless restricted mode redacts it. Overrides include_content. Default false."
+                        "default": false,
+                        "description": "Omit content and return content_hash unless restricted mode redacts it. Overrides include_content."
                     }
                 },
                 "anyOf": [
@@ -360,11 +370,13 @@ pub fn tool_definitions(app: &App) -> Vec<Value> {
                     "session_id": { "type": "string" },
                     "verbose": {
                         "type": "boolean",
-                        "description": "When true, include the full canonical/final plan body alongside the compact reference. Default false (compact reference only)."
+                        "default": false,
+                        "description": "Include the full canonical/final plan body beside the compact reference."
                     },
                     "include_task_list": {
                         "type": "boolean",
-                        "description": "When true, include the full task_list JSON alongside task_list_ref. Default false (compact reference only)."
+                        "default": false,
+                        "description": "Include the full task_list JSON beside task_list_ref."
                     }
                 },
                 "required": ["session_id"]
@@ -422,13 +434,13 @@ pub fn tool_definitions(app: &App) -> Vec<Value> {
         }),
         json!({
             "name": "collab_wait_my_turn",
-            "description": "Long-poll until the agent's turn or a post-claim phase, owner, terminal, ended, or recovery-state change. Timeout returns {unchanged:true}; otherwise returns {is_my_turn, phase, current_owner, session_ended}. Default 30s, max 60s.",
+            "description": "Long-poll until the agent's turn or a post-claim phase, owner, terminal, ended, or recovery-state change. Timeout returns {unchanged:true}; otherwise returns {is_my_turn, phase, current_owner, session_ended}.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "session_id": { "type": "string" },
                     "agent": { "type": "string", "enum": ["claude", "codex"] },
-                    "timeout_secs": { "type": "integer", "default": 30 },
+                    "timeout_secs": { "type": "integer", "default": 30, "maximum": 60 },
                     "handoff_token": { "type": "string" }
                 },
                 "required": ["session_id", "agent"]
@@ -1137,6 +1149,17 @@ mod tests {
         assert_eq!(full["type"], "boolean");
         assert_eq!(full["default"], false);
 
+        let include_superseded = &search["inputSchema"]["properties"]["include_superseded"];
+        assert_eq!(include_superseded["type"], "boolean");
+        assert_eq!(include_superseded["default"], false);
+        let include_superseded_description = include_superseded["description"]
+            .as_str()
+            .expect("include_superseded property needs a description");
+        assert!(include_superseded_description.contains("false"));
+        assert!(include_superseded_description.contains("superseded"));
+        assert!(include_superseded_description.contains("history"));
+        assert!(include_superseded_description.contains("true"));
+
         let description = search["description"]
             .as_str()
             .expect("search tool needs a description");
@@ -1150,13 +1173,23 @@ mod tests {
         assert!(full_description.contains("use get_drawer for the complete body"));
     }
 
+    /// Raised 3_500 -> 3_550 for the v17 supersession surface (#211): `search`
+    /// gained `include_superseded` and `add_drawer` gained `supersedes`, which
+    /// cost ~140 bytes more than the previous ceiling left spare.
+    ///
+    /// The budget is deliberately a whole-listing ceiling with no per-tool
+    /// allocation, so the cheapest way to land a new field is to delete prose
+    /// from whichever unrelated tool happens to be wordiest. That trade is not
+    /// acceptable: raise this constant when new capability genuinely needs the
+    /// room, and pay for it by moving prose into real schema keys (`default`,
+    /// `maximum`) — not by silently degrading a neighbour's description.
     #[test]
     fn tool_listing_stays_within_prompt_cache_schema_budget() {
         let app = App::open_for_test().unwrap();
         let bytes = serde_json::to_vec(&tool_definitions(&app)).unwrap().len();
         let estimated_tokens = bytes.div_ceil(4);
         assert!(
-            estimated_tokens <= 3_500,
+            estimated_tokens <= 3_550,
             "tool listing is ~{estimated_tokens} tokens ({bytes} bytes); trim descriptions that duplicate their schemas"
         );
     }
@@ -1422,6 +1455,29 @@ mod tests {
             McpAccessMode::Restricted,
             "get_drawer"
         ));
+    }
+
+    #[test]
+    fn add_drawer_schema_documents_temporal_supersession() {
+        let app = App::open_for_test().unwrap();
+        let add_drawer = tool_definitions(&app)
+            .into_iter()
+            .find(|tool| tool["name"] == "add_drawer")
+            .expect("add_drawer must be advertised");
+        let supersedes = &add_drawer["inputSchema"]["properties"]["supersedes"];
+
+        assert_eq!(supersedes["type"].as_str(), Some("string"));
+        let description = supersedes["description"]
+            .as_str()
+            .expect("supersedes must have a description");
+        assert!(
+            description.contains("retained") && description.contains("retrievable by ID"),
+            "schema must make clear that supersession retains temporal history"
+        );
+        assert!(
+            !description.contains("Task"),
+            "public schema must describe current behavior, not an internal roadmap"
+        );
     }
 
     #[test]

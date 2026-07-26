@@ -440,6 +440,7 @@ mod tests {
                 added_by: "".into(),
                 filed_at: "".into(),
                 date: "".into(),
+                superseded_by: None,
             },
             score,
         };
@@ -618,6 +619,7 @@ mod tests {
                     added_by: "".into(),
                     filed_at: "".into(),
                     date: "".into(),
+                    superseded_by: None,
                 },
                 // Spread scores so ordering is non-trivial.
                 score: 0.50 + (i % 50) as f32 / 100.0,
