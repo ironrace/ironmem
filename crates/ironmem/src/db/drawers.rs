@@ -860,9 +860,10 @@ impl Database {
             .query_row(
                 "SELECT superseded_by FROM drawers WHERE id = ?1",
                 params![id],
-                |row| row.get(0),
+                |row| row.get::<_, Option<String>>(0),
             )
-            .optional()?;
+            .optional()?
+            .flatten();
         let reconnected = conn.execute(
             "UPDATE drawers SET superseded_by = ?1 WHERE superseded_by = ?2",
             params![successor, id],
