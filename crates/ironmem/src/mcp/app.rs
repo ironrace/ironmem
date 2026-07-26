@@ -13,6 +13,12 @@ use crate::error::MemoryError;
 use crate::mcp::readiness::{ReadinessGate, ReadinessState};
 use crate::search::graph::MemoryGraph;
 
+/// Repository-and-branch key for process-local Collab attribution.
+pub type CollabScope = (String, String);
+
+/// One process-local Collab attribution binding: its scope and session id.
+pub type CollabAttributionBinding = (CollabScope, String);
+
 /// HNSW index + id_map bundled together to eliminate TOCTOU between separate locks.
 pub struct IndexState {
     pub index: VectorIndex,
@@ -64,18 +70,29 @@ pub struct App {
     /// Guards the one-time HNSW rebuild triggered when `memory_ready` resolves `Ready`.
     memory_ready_rebuilt: AtomicBool,
     /// Active collab sessions this server process is participating in, scoped
-    /// by repository path and branch. Set by
-    /// `collab_start`/`collab_start_code_review` and refreshed by
-    /// `collab_send`/`collab_recv`/`collab_wait_my_turn`; deliberately NOT set
-    /// by `collab_status`, which is also used to inspect foreign/stale
-    /// sessions. Requests carrying a collab session id resolve that id exactly;
-    /// unscoped work is attributed only when this map has one unambiguous
-    /// binding. This permits concurrent collaboration in separate repository
-    /// branches without stamping work onto an unrelated session.
-    active_collab_sessions: RwLock<HashMap<(String, String), String>>,
+    /// by repository path and branch.
+    ///
+    /// Set by `collab_start`/`collab_start_code_review`, refreshed by
+    /// `collab_send`/`collab_recv`/`collab_wait_my_turn`/`collab_resume`, and
+    /// cleared by `collab_end` via
+    /// `clear_active_collab_session_for_scope_if_matches` (compare-and-remove,
+    /// so ending an older session cannot erase a newer binding). Deliberately
+    /// NOT set by `collab_status`, which is also used to inspect foreign/stale
+    /// sessions — and, for the same reason, a session id carried on a request
+    /// is honoured for attribution only when it is already bound in THIS map.
+    ///
+    /// This is process state rather than request state because the dominant
+    /// token volume (`search` rerank, pref-extract) carries no collab argument
+    /// at all — only process state can attribute it. Keying by scope rather
+    /// than holding a single process-global slot is what permits concurrent
+    /// collaboration in separate repository branches; unscoped work is
+    /// attributed only when the map has one unambiguous binding, so a second
+    /// live scope makes such work unstamped rather than misattributed.
+    active_collab_sessions: RwLock<HashMap<CollabScope, String>>,
     /// Explicit task tag for non-collab work (METRICS_SPEC §2.3 item 2), set
-    /// via `status` tool args. Only consulted when no active collab session
-    /// resolves.
+    /// via `status` tool args. Consulted only when there are ZERO active collab
+    /// bindings — an ambiguous multi-scope set suppresses the tag too, since
+    /// the work may belong to any one of those collab sessions.
     explicit_task_tag: RwLock<Option<String>>,
     /// Process-local cache of the ACTIVE generation this MCP process is bound
     /// to per (session_id, agent). Inertness mechanism for the generation lease
@@ -229,22 +246,45 @@ impl App {
     /// Return the sole active binding, including its scope. `None` means no
     /// binding or more than one binding, both of which are intentionally
     /// ineligible for implicit attribution.
-    pub fn sole_active_collab_session_snapshot(&self) -> Option<((String, String), String)> {
+    pub fn sole_active_collab_session_snapshot(&self) -> Option<CollabAttributionBinding> {
+        self.collab_attribution_snapshot().1
+    }
+
+    pub fn active_collab_session_count(&self) -> usize {
+        self.collab_attribution_snapshot().0
+    }
+
+    /// Binding count plus the sole binding (when there is exactly one), from a
+    /// SINGLE map read. Attribution branches on both, and taking two separate
+    /// read locks can observe different map states — a concurrent bind between
+    /// them flips a row between "ambiguous, leave unstamped" and "no bindings,
+    /// use the task tag". Callers that need both values must use this.
+    pub fn collab_attribution_snapshot(&self) -> (usize, Option<CollabAttributionBinding>) {
         let sessions = self
             .active_collab_sessions
             .read()
             .expect("active_collab_sessions lock poisoned");
-        (sessions.len() == 1).then(|| {
+        let sole = (sessions.len() == 1).then(|| {
             let (scope, id) = sessions.iter().next().expect("len checked");
             (scope.clone(), id.clone())
-        })
+        });
+        (sessions.len(), sole)
     }
 
-    pub fn active_collab_session_count(&self) -> usize {
+    /// Return the scope `id` is bound to in THIS process, if any.
+    ///
+    /// Attribution uses this to decide whether a session id carried on a
+    /// request may be honoured. An id this process holds no binding for names a
+    /// session belonging to some other workspace — `collab_status` exists
+    /// precisely to inspect foreign and stale sessions — and must not have this
+    /// process's tokens stamped onto it.
+    pub fn scope_of_active_collab_session(&self, id: &str) -> Option<CollabScope> {
         self.active_collab_sessions
             .read()
             .expect("active_collab_sessions lock poisoned")
-            .len()
+            .iter()
+            .find(|(_, bound)| bound.as_str() == id)
+            .map(|(scope, _)| scope.clone())
     }
 
     /// Return every active collab binding from one map read, in a stable order
@@ -263,13 +303,29 @@ impl App {
         sessions
     }
 
-    /// Compatibility helper for internal callers that have only a session id.
-    /// Production collab handlers must use `set_active_collab_session_for_scope`.
+    /// Compatibility helper for internal callers that have only a session id;
+    /// it resolves the scope from the session record. Production collab
+    /// handlers already know their scope and must use
+    /// `set_active_collab_session_for_scope`.
+    ///
+    /// On a lookup failure this binds NOTHING and warns. Inventing a sentinel
+    /// scope would be worse than not binding: no production clear path passes
+    /// an empty repo/branch (`require_str` rejects empty strings at the MCP
+    /// boundary), so the entry could never be removed, and a permanent extra
+    /// binding suppresses implicit attribution and the task-tag fallback for
+    /// the life of the process.
     pub fn set_active_collab_session(&self, id: &str) {
-        if let Ok(record) = self.db.collab_load_session_record(id) {
-            self.set_active_collab_session_for_scope(id, &record.repo_path, &record.branch);
-        } else {
-            self.set_active_collab_session_for_scope(id, "", "");
+        match self.db.collab_load_session_record(id) {
+            Ok(record) => {
+                self.set_active_collab_session_for_scope(id, &record.repo_path, &record.branch);
+            }
+            Err(e) => {
+                tracing::warn!(
+                    session_id = %id,
+                    error = %e,
+                    "cannot resolve collab scope — attribution binding skipped"
+                );
+            }
         }
     }
 

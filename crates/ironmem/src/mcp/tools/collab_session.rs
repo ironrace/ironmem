@@ -412,10 +412,12 @@ fn record_task_outcome_transition(
 /// Shared decision logic for the process-attribution conflict guard.
 ///
 /// Invariant: one live collab session may own a repository-and-branch
-/// attribution scope at a time. Stale, missing, and coding-terminal sessions
-/// self-heal by clearing only their matching scope. The guard protects
-/// correctness whenever metrics get re-enabled — the conflict check is NOT
-/// gated on IRONMEM_METRICS.
+/// attribution scope at a time. Stale, missing, and slot-releasing sessions
+/// self-heal by clearing only their matching scope. "Slot-releasing" is
+/// `CodingComplete` alone ([`Phase::releases_start_slot`]) — a `CodingFailed`
+/// session still holds its scope so a replayed start cannot strand its
+/// recovery state. The guard protects correctness whenever metrics get
+/// re-enabled — the conflict check is NOT gated on IRONMEM_METRICS.
 ///
 /// A turn is refused rather than risking ambiguous attribution; the raw DB error
 /// detail lives in the server log, not in the MCP response.
@@ -426,7 +428,7 @@ fn check_conflicting_session(
 ) -> Result<(), MemoryError> {
     match load_result {
         Ok(record)
-            if record.ended_at.is_none() && !record.session.phase.is_coding_terminal() =>
+            if record.ended_at.is_none() && !record.session.phase.releases_start_slot() =>
         {
             Err(MemoryError::Validation(format!(
                 "another active collab session is already bound to this repository and branch for metrics attribution: {active_session_id}. End it or use a different repository branch before switching to {requested_session_id}."
@@ -534,8 +536,11 @@ pub(super) fn handle_collab_start(app: &App, args: &Value) -> Result<Value, Memo
     app.db.with_transaction(|tx| {
         // Guard against accidental duplicate sessions on the same repo+branch
         // (e.g. a fired ScheduleWakeup replaying the `/collab start` entry
-        // command after a session already reached CodingComplete). The check is
-        // atomic with the insert inside this transaction.
+        // command while a session is still mid-flight, or after it reached
+        // CodingFailed and is awaiting a resume). The check is atomic with the
+        // insert inside this transaction. A session at CodingComplete
+        // deliberately does NOT block the start — see
+        // `find_active_session_by_repo_branch`.
         if let Some((existing_id, phase)) =
             crate::collab::queue::find_active_session_by_repo_branch(tx, repo_path, branch)?
         {
@@ -1349,7 +1354,7 @@ fn wait_my_turn_claim_and_capture_baseline(
 /// returns `Ok` (see `server::dispatch_wait_my_turn`), so a still-polling wait
 /// for session A would otherwise clobber the cell back to A after a newer,
 /// later-queued request had legitimately bound it to B — producing spurious
-/// "another active collab session is already bound to this MCP process"
+/// "already bound to this repository and branch for metrics attribution"
 /// refusals.
 pub(super) fn wait_my_turn_begin(app: &App, args: &Value) -> Result<WaitTurnBaseline, MemoryError> {
     let session_id = require_str(args, "session_id")?;
@@ -2152,23 +2157,21 @@ mod tests {
     }
 
     #[test]
-    fn coding_complete_session_does_not_block_a_new_different_scope_without_collab_end() {
+    fn coding_complete_session_releases_its_scope_without_collab_end() {
         let app = test_app();
         let completed = start_session(&app);
         drive_to_coding_complete(&app, &completed);
 
-        let next = start_session_in_scope(&app, "/tmp/next-repo", "main");
+        let next = start_session_in_scope(&app, "/tmp/repo", "main");
 
         assert_eq!(
             app.active_collab_session_snapshot_for_scope("/tmp/repo", "main")
                 .as_deref(),
-            Some(completed.as_str()),
-            "terminal session remains inspectable until an explicit collab_end"
-        );
-        assert_eq!(
-            app.active_collab_session_snapshot_for_scope("/tmp/next-repo", "main")
-                .as_deref(),
             Some(next.as_str())
+        );
+        assert_ne!(
+            completed, next,
+            "a CodingComplete session must release its exact scope for the next session"
         );
     }
 

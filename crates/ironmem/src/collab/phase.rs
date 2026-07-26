@@ -71,6 +71,20 @@ impl Phase {
         matches!(self, Self::CodingComplete | Self::CodingFailed)
     }
 
+    /// True for the one terminal phase that releases its repository-and-branch
+    /// start slot before `collab_end`. Only `CodingComplete` qualifies:
+    /// attestation is a human step of unbounded duration, so holding the slot
+    /// for it would block the next session on that branch indefinitely.
+    ///
+    /// `CodingFailed` deliberately keeps its slot — it stays resumable, and the
+    /// resume guard refuses a scope owned by a newer live session, so releasing
+    /// it would let a replayed `collab_start` strand the failed session's plan
+    /// and recovery columns. Kept in lockstep with the `phase <> 'CodingComplete'`
+    /// predicate in [`crate::collab::queue::find_active_session_by_repo_branch`].
+    pub fn releases_start_slot(&self) -> bool {
+        matches!(self, Self::CodingComplete)
+    }
+
     /// True if the session is currently inside the v3 coding loop. Used by
     /// `collab_end` to reject early-end calls.
     pub fn is_coding_active(&self) -> bool {

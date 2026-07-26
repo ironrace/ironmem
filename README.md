@@ -345,12 +345,11 @@ to `(repo_path, branch)`, so different repositories and branches can coexist
 through one daemon; a second live session in the same scope is refused. There
 is no need to run separate daemons for independent repositories.
 
-`CodingComplete` and `CodingFailed` no longer reserve the scope's
-start/attribution slot, so a new live session can begin there before
-`collab_end`. `collab_end` still supplies the completion attestation for a
-completed session. An unended tooling-class failure stays resumable unless a
-newer live session has claimed the same scope. Missing, ended, and terminal
-bindings self-heal only for their own scope.
+`CodingComplete` releases the scope's start slot before `collab_end`, so a new
+live session can begin there while the completed session awaits operator
+attestation. A `CodingFailed` session keeps its slot: it remains resumable and
+cannot be stranded by a replayed start. Missing and ended bindings self-heal
+only for their own scope.
 
 The `status` tool reports the current bindings deterministically:
 

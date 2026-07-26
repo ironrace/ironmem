@@ -564,12 +564,11 @@ destination, or reporting query changed.
   (`collab_start`, `collab_start_code_review`, `collab_send`, `collab_recv`,
   `collab_wait_my_turn`, and `collab_resume`) refuse a different still-live session only in
   the same scope. Different repositories and branches can coexist in one shared daemon.
-  `CodingComplete` and `CodingFailed` do not reserve a start/attribution slot, though
-  `collab_end` remains the completion attestation and an unended tooling-class failure can
-  be resumed unless a newer live session owns its scope. Stale, missing, ended, and
-  coding-terminal bindings self-clear only in their matching scope. Explicit-session collab
-  responses remain correctly stamped; unscoped calls with multiple scopes are unstamped
-  rather than attributed incorrectly.
+  `CodingComplete` releases its start slot while it awaits the `collab_end` completion
+  attestation. `CodingFailed` keeps its slot, so an unended tooling-class failure remains
+  resumable and cannot be stranded by a replayed start. Stale, missing, and ended bindings
+  self-clear only in their matching scope. Explicit-session collab responses remain correctly
+  stamped; unscoped calls with multiple scopes are unstamped rather than attributed incorrectly.
 
 - **§4 `review_rounds` increment semantics (clarification of §4 "each entry into
   review_local / final_review following impl/rework" wording).** As shipped, `review_rounds`

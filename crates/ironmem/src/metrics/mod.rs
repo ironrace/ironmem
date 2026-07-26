@@ -84,22 +84,50 @@ impl MetricsContext {
     /// §2.3 priority: an explicit collab id first, otherwise the sole active
     /// scoped binding (both stamp id + phase bucket, INCLUDING
     /// terminal-but-not-ended sessions, which stamp `other`); else the explicit
-    /// task tag (phase defaults to `impl` per §3.3). Multiple active scopes are
-    /// intentionally not attributed implicitly. Ended (`ended_at IS NOT NULL`)
-    /// or missing sessions clear only their matching App binding; the
-    /// discovering row stays unstamped (returns `MetricsContext::default()`).
-    /// Best-effort: a DB read error degrades to an empty context + warn.
+    /// task tag (phase defaults to `impl` per §3.3).
+    ///
+    /// An explicit id only DISAMBIGUATES among this process's own bindings — an
+    /// id the process holds no binding for is ignored, so inspecting a foreign
+    /// session with `collab_status` cannot stamp that session with this
+    /// process's tokens.
+    ///
+    /// Multiple active scopes are intentionally not attributed implicitly, and
+    /// that also suppresses the task-tag fallback. Bindings for ended or
+    /// missing sessions are pruned before that decision, so a session ended
+    /// elsewhere cannot pin the map into ambiguity.
+    ///
+    /// Ended (`ended_at IS NOT NULL`) or missing sessions clear only their
+    /// matching App binding; the discovering row stays unstamped (returns
+    /// `MetricsContext::default()`). Best-effort: a DB read error degrades to
+    /// an empty context + warn.
     pub(crate) fn resolve(
         app: &crate::mcp::app::App,
         explicit_collab_session_id: Option<&str>,
     ) -> MetricsContext {
-        let scoped = explicit_collab_session_id
-            .map(|sid| (None, sid.to_string()))
-            .or_else(|| {
-                app.sole_active_collab_session_snapshot()
-                    .map(|(scope, sid)| (Some(scope), sid))
-            });
-        if let Some((scope, sid)) = scoped {
+        // An explicit id is a disambiguator among THIS process's bindings, not
+        // an attribution override. Honouring an unbound id would let a
+        // `collab_status` call on another workspace's session stamp that
+        // session with this process's tokens. Resolving the scope here also
+        // means the self-heal arms below can clear the binding on either path.
+        let explicit = explicit_collab_session_id.and_then(|sid| {
+            app.scope_of_active_collab_session(sid)
+                .map(|scope| (scope, sid.to_string()))
+        });
+        // One read: branching on the sole binding and on the count separately
+        // can observe two different map states.
+        let (mut binding_count, mut sole) = app.collab_attribution_snapshot();
+        // Only an ambiguous map is worth a sweep, so the common single-binding
+        // path pays no extra DB reads.
+        if explicit.is_none() && binding_count > 1 {
+            prune_stale_collab_bindings(app);
+            let refreshed = app.collab_attribution_snapshot();
+            binding_count = refreshed.0;
+            sole = refreshed.1;
+        }
+        // Both paths carry the scope the binding was found under, so a
+        // missing-session self-heal can always clear exactly that key.
+        let scoped = explicit.or(sole);
+        if let Some(((repo_path, branch), sid)) = scoped {
             match app.db.collab_load_session_record(&sid) {
                 Ok(record) if record.ended_at.is_none() => {
                     return MetricsContext {
@@ -124,13 +152,9 @@ impl MetricsContext {
                 Err(crate::error::MemoryError::NotFound(_)) => {
                     tracing::warn!(
                         session_id = %sid,
-                        "metrics attribution: active collab session not found — clearing cell"
+                        "metrics attribution: active collab session not found — clearing its binding"
                     );
-                    if let Some((repo_path, branch)) = scope {
-                        app.clear_active_collab_session_for_scope_if_matches(
-                            &sid, &repo_path, &branch,
-                        );
-                    }
+                    app.clear_active_collab_session_for_scope_if_matches(&sid, &repo_path, &branch);
                     return MetricsContext::default();
                 }
                 Err(e) => {
@@ -146,7 +170,7 @@ impl MetricsContext {
         // An ambiguous set of scoped sessions is deliberately not allowed to
         // fall through to a task tag: the request may belong to any one of
         // those sessions, and leaving it unstamped is safer than guessing.
-        if app.active_collab_session_count() == 0 {
+        if binding_count == 0 {
             if let Some(tag) = app.explicit_task_tag_snapshot() {
                 return MetricsContext {
                     collab_session_id: None,
@@ -154,8 +178,52 @@ impl MetricsContext {
                     task_tag: Some(tag),
                 };
             }
+        } else {
+            // Ambiguity drops both the session id and the task tag, so without
+            // this the coverage loss is invisible in the data and in the log.
+            tracing::debug!(
+                bindings = binding_count,
+                "metrics attribution: ambiguous collab scopes — row left unstamped"
+            );
         }
         MetricsContext::default()
+    }
+}
+
+/// Drop attribution bindings whose session has ended or no longer exists.
+///
+/// `collab_end` and the same-scope guard on a new start are the only other
+/// removals, so a session ended from a different process — or a row deleted
+/// out from under this one — leaves its scope bound here indefinitely. Two
+/// surviving bindings make every unscoped row ambiguous, which suppresses
+/// implicit attribution AND the task-tag fallback for as long as the daemon
+/// lives, so a single stale entry can silently zero out metrics coverage.
+///
+/// A session that merely fails to load (transient DB error) is KEPT: dropping
+/// it could hand its work to another scope's binding or to a task tag, and
+/// misattributed rows are worse than absent ones.
+///
+/// ponytail: only definitively-dead sessions are reaped — a harness killed
+/// mid-session leaves `ended_at IS NULL` and still pins the map until the
+/// daemon idles out. Add a last-touched stamp per binding and a TTL sweep if
+/// abandoned sessions turn out to be common; that needs care, since evicting a
+/// merely-idle live session would resurrect the misattribution this avoids.
+fn prune_stale_collab_bindings(app: &crate::mcp::app::App) {
+    for (repo_path, branch, session_id) in app.active_collab_sessions_snapshot() {
+        let dead = match app.db.collab_load_session_record(&session_id) {
+            Ok(record) => record.ended_at.is_some(),
+            Err(crate::error::MemoryError::NotFound(_)) => true,
+            Err(_) => false,
+        };
+        if dead {
+            tracing::debug!(
+                session_id = %session_id,
+                repo_path = %repo_path,
+                branch = %branch,
+                "metrics attribution: pruning binding for ended or missing session"
+            );
+            app.clear_active_collab_session_for_scope_if_matches(&session_id, &repo_path, &branch);
+        }
     }
 }
 
@@ -641,6 +709,60 @@ mod tests {
         // §2.3 priority: collab id wins; task_tag not stamped alongside it.
         assert_eq!(ctx.collab_session_id.as_deref(), Some(sid.as_str()));
         assert!(ctx.task_tag.is_none());
+    }
+
+    #[test]
+    fn resolve_ignores_an_explicit_id_not_bound_by_this_process() {
+        let app = test_app();
+        let local = seed_collab_session_in_scope(&app, "local-session", "/tmp/repo", "main");
+        let foreign =
+            seed_collab_session_in_scope(&app, "foreign-session", "/tmp/other-repo", "main");
+        app.set_active_collab_session_for_scope(&local, "/tmp/repo", "main");
+
+        let ctx = MetricsContext::resolve(&app, Some(&foreign));
+
+        assert_eq!(
+            ctx.collab_session_id.as_deref(),
+            Some(local.as_str()),
+            "a foreign explicit id must not steal this process's metrics attribution"
+        );
+        assert_ne!(ctx.collab_session_id.as_deref(), Some(foreign.as_str()));
+    }
+
+    #[test]
+    fn resolve_prunes_an_ended_binding_before_resolving_the_remaining_scope() {
+        let app = test_app();
+        let live = seed_collab_session_in_scope(&app, "live-session", "/tmp/live", "main");
+        let ended = seed_collab_session_in_scope(&app, "ended-session", "/tmp/ended", "main");
+        app.db
+            .with_transaction(|tx| crate::collab::queue::end_session(tx, &ended))
+            .unwrap();
+        app.set_active_collab_session_for_scope(&live, "/tmp/live", "main");
+        app.set_active_collab_session_for_scope(&ended, "/tmp/ended", "main");
+
+        let ctx = MetricsContext::resolve(&app, None);
+
+        assert_eq!(ctx.collab_session_id.as_deref(), Some(live.as_str()));
+        assert!(
+            app.active_collab_session_snapshot_for_scope("/tmp/ended", "main")
+                .is_none(),
+            "an externally ended session must not leave all unscoped work ambiguous"
+        );
+    }
+
+    #[test]
+    fn resolve_prunes_a_missing_binding_before_resolving_the_remaining_scope() {
+        let app = test_app();
+        let live = seed_collab_session_in_scope(&app, "live-session", "/tmp/live", "main");
+        app.set_active_collab_session_for_scope(&live, "/tmp/live", "main");
+        app.set_active_collab_session_for_scope("missing-session", "/tmp/missing", "main");
+
+        let ctx = MetricsContext::resolve(&app, None);
+
+        assert_eq!(ctx.collab_session_id.as_deref(), Some(live.as_str()));
+        assert!(app
+            .active_collab_session_snapshot_for_scope("/tmp/missing", "main")
+            .is_none());
     }
 
     #[test]

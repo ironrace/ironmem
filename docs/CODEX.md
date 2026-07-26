@@ -393,13 +393,12 @@ the full flag/env-var reference, the fallback guarantee, and security notes.
 One shared daemon can host concurrent Collab sessions for different
 repositories and branches. Attribution is scoped to `(repo_path, branch)`, so
 only a second live session in the same scope is refused; independent repos do
-not need separate daemons. Missing, ended, and coding-terminal bindings
-self-heal only in their matching scope.
+not need separate daemons. Missing and ended bindings self-heal only in their
+matching scope.
 
-`CodingComplete` and `CodingFailed` no longer occupy the scope's
-start/attribution slot. `collab_end` still records the completion attestation,
-and an unended tooling-class `CodingFailed` session remains resumable unless a
-newer live session has claimed that same scope.
+`CodingComplete` releases the scope's start slot while it awaits the
+`collab_end` completion attestation. A `CodingFailed` session keeps its slot:
+it remains resumable and cannot be stranded by a replayed start.
 
 Use `status` to inspect bindings. `active_collab_sessions` is a deterministic,
 sorted array of `{repo_path, branch, session_id}` records. The compatibility

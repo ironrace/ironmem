@@ -246,11 +246,13 @@ fn run_hook_with_input(
 
 /// Resolve collab attribution for a transcript row from the hook process.
 ///
-/// Unlike `MetricsContext::resolve` (which reads from `App::active_collab_session_snapshot`,
-/// empty in the hook's separate process), this function resolves the current Git
-/// branch and performs a fresh DB lookup by repo path plus branch — the same
-/// shape as `collab_line()` for session-start context, but loading the typed
-/// `Phase` for the `phase_bucket()` call required by METRICS_SPEC §3.2.
+/// Unlike `MetricsContext::resolve` (which reads `App`'s in-process scope
+/// bindings, empty in the hook's separate process), this function resolves the
+/// current Git branch and performs a fresh DB lookup by repo path plus branch —
+/// the same shape as `collab_line()` for session-start context, but loading the
+/// typed `Phase` for the `phase_bucket()` call required by METRICS_SPEC §3.2.
+/// The lookup includes terminal-but-unended sessions so this path and
+/// `MetricsContext::resolve` agree on which session owns the work.
 ///
 /// `task_tag` is set to `collab_session_id` (per §10.4 OR-join invariant: both keys
 /// for a collab task refer to the same task). Outside a collab session, returns
@@ -326,19 +328,38 @@ fn current_workspace_branch(workspace_root: &Path) -> Option<String> {
     (!branch.is_empty()).then(|| branch.to_string())
 }
 
-/// Return the active collab session for exactly the workspace's current Git
-/// branch. When the branch cannot be resolved, do not fall back to a
-/// repository-wide lookup: another branch may have a live session.
+/// Return the collab session that owns exactly the workspace's current Git
+/// branch, for attribution and for the session-start context line. When the
+/// branch cannot be resolved, do not fall back to a repository-wide lookup:
+/// another branch may have a live session, and a mis-keyed metrics row is
+/// worse than an absent one.
+///
+/// Uses the terminal-inclusive lookup on purpose. A session at
+/// `CodingComplete` awaiting operator attestation still owns its workspace and
+/// is still stamped (bucket `other`) by `MetricsContext::resolve`, so the hook
+/// must see it or transcript rows and MCP rows would disagree about the same
+/// session for the whole attestation window.
 fn active_collab_session_for_workspace(
     app: &App,
     workspace_root: &Path,
 ) -> Result<Option<(String, String)>, MemoryError> {
     let Some(branch) = current_workspace_branch(workspace_root) else {
+        // Fires legitimately for any non-git workspace, so `debug` rather than
+        // `warn`: without it, a detached HEAD (rebase, bisect, CI checkout)
+        // silently drops attribution with nothing to point at.
+        tracing::debug!(
+            workspace = %workspace_root.display(),
+            "collab attribution: branch unresolved — scoped lookup skipped"
+        );
         return Ok(None);
     };
     let repo_path = workspace_root.to_string_lossy();
     app.db.with_connection(|conn| {
-        crate::collab::queue::find_active_session_by_repo_branch(conn, repo_path.as_ref(), &branch)
+        crate::collab::queue::find_active_session_by_repo_branch_including_terminal(
+            conn,
+            repo_path.as_ref(),
+            &branch,
+        )
     })
 }
 
@@ -1387,9 +1408,9 @@ fn join_within_budget(lines: &[String], budget: usize) -> String {
 /// don't fit. Because `MEMORY_PROTOCOL` is that floor this always returns `Some`
 /// — the `Option` lets callers treat an empty block as "nothing to inject".
 ///
-/// The active collab session and diary pointer are read from the DB (not
-/// `App::active_collab_session_snapshot()`) because this hook runs in a separate
-/// process where that snapshot is empty.
+/// The active collab session and diary pointer are read from the DB (not from
+/// `App`'s in-process scope bindings) because this hook runs in a separate
+/// process where those bindings are empty.
 ///
 /// Diagnostics caveat: the `warn!`s above go to stderr, which Claude Code
 /// discards when the hook exits 0, so a persistent degradation shrinks the block

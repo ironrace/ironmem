@@ -142,13 +142,23 @@ pub fn ensure_active(conn: &Connection, session_id: &str) -> Result<(), MemoryEr
     Ok(())
 }
 
-/// Find the newest still-active (not yet `collab_end`-ed) session for a
+/// Find the session that currently *reserves the start slot* for a
 /// `repo_path` + `branch`, if any, returning `(id, phase)`.
 ///
-/// Terminal coding phases (`CodingComplete` / `CodingFailed`) are excluded
-/// even before an explicit `collab_end`: completion still needs operator
-/// attestation and tooling failures remain resumable, but neither blocks a
-/// newly started session in the same repository-and-branch scope.
+/// `CodingComplete` is excluded even before an explicit `collab_end`:
+/// completion needs operator attestation, which is a human step of unbounded
+/// duration, and holding the slot for it would block the next session on that
+/// branch indefinitely.
+///
+/// `CodingFailed` is deliberately NOT excluded. A tooling-class failure stays
+/// resumable (`ResumeCoding` is legal from `CodingFailed`), and
+/// [`super::super::mcp::tools::collab_session`]'s resume guard refuses to
+/// reclaim a scope owned by a newer live session — so releasing the slot here
+/// would let a replayed `collab_start` strand the failed session's plan,
+/// task list, and recovery columns with no API to get them back.
+///
+/// Use [`find_active_session_by_repo_branch_including_terminal`] for
+/// attribution lookups, which must still see a `CodingComplete` session.
 pub fn find_active_session_by_repo_branch(
     conn: &Connection,
     repo_path: &str,
@@ -157,7 +167,7 @@ pub fn find_active_session_by_repo_branch(
     conn.query_row(
         "SELECT id, phase FROM collab_sessions
          WHERE repo_path = ?1 AND branch = ?2 AND ended_at IS NULL
-           AND phase NOT IN ('CodingComplete', 'CodingFailed')
+           AND phase <> 'CodingComplete'
          ORDER BY created_at DESC, id DESC
          LIMIT 1",
         params![repo_path, branch],
@@ -167,27 +177,31 @@ pub fn find_active_session_by_repo_branch(
     .map_err(MemoryError::from)
 }
 
-/// Newest active session for a repo path, branch-agnostic, returning
-/// `(id, phase)`. This is for explicitly branch-agnostic callers only;
-/// workspace-bound hook attribution must use
-/// [`find_active_session_by_repo_branch`] after resolving the current branch.
-/// "Active" is `ended_at IS NULL`; ambiguity across branches is intentionally
-/// resolved as the newest active session for the repo (`created_at DESC, id DESC`).
+/// Newest session for a `repo_path` + `branch` that has not been
+/// `collab_end`-ed, returning `(id, phase)` — terminal coding phases included.
+///
+/// This is the *attribution* lookup, and it deliberately differs from
+/// [`find_active_session_by_repo_branch`] (the start-slot lookup). A session
+/// sitting at `CodingComplete` awaiting operator attestation still owns the
+/// work happening in its workspace: `MetricsContext::resolve` stamps such
+/// sessions with bucket `other`, so the hook must see them too or transcript
+/// rows and MCP rows would disagree about the same session.
 ///
 /// `phase` is returned as the raw column string (not parsed into [`Phase`]) on
-/// purpose, so branch-agnostic display callers can treat it as an opaque value;
-/// parsing here would add a failure path they do not need. Use [`load_session`]
-/// when a typed [`Phase`] is required.
-pub fn find_active_session_by_repo(
+/// purpose, so display callers can treat it as an opaque value; parsing here
+/// would add a failure path they do not need. Use [`load_session`] when a
+/// typed [`Phase`] is required.
+pub fn find_active_session_by_repo_branch_including_terminal(
     conn: &Connection,
     repo_path: &str,
+    branch: &str,
 ) -> Result<Option<(String, String)>, MemoryError> {
     conn.query_row(
         "SELECT id, phase FROM collab_sessions
-         WHERE repo_path = ?1 AND ended_at IS NULL
+         WHERE repo_path = ?1 AND branch = ?2 AND ended_at IS NULL
          ORDER BY created_at DESC, id DESC
          LIMIT 1",
-        params![repo_path],
+        params![repo_path, branch],
         |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
     )
     .optional()
@@ -1101,13 +1115,13 @@ mod tests {
     }
 
     #[test]
-    fn find_active_session_by_repo_returns_active_and_isolates_repos() {
+    fn find_active_session_including_terminal_isolates_repo_and_branch() {
         let db = open();
-        // /repo-a: one ended (older) + one active session.
+        // /repo-a: one ended (older) + one active session on the same branch.
         create_session(&db, "a-old", "/repo-a", "main", None, Agent::Claude).unwrap();
         end_session(&db, "a-old").unwrap();
-        create_session(&db, "a-active-1", "/repo-a", "feature", None, Agent::Claude).unwrap();
-        create_session(&db, "a-active-2", "/repo-a", "other", None, Agent::Claude).unwrap();
+        create_session(&db, "a-active-1", "/repo-a", "main", None, Agent::Claude).unwrap();
+        create_session(&db, "a-active-2", "/repo-a", "main", None, Agent::Claude).unwrap();
         // `created_at` is second-resolution, so insertion order alone may not
         // disambiguate two same-second rows. Pin both active rows to the SAME
         // instant so the `id DESC` tie-break (not creation timing) is what
@@ -1118,21 +1132,40 @@ mod tests {
             [],
         )
         .unwrap();
-        // Different repo must not leak.
+        // A different branch in the same repo, and a different repo, must not leak.
+        create_session(
+            &db,
+            "a-other-branch",
+            "/repo-a",
+            "feature",
+            None,
+            Agent::Claude,
+        )
+        .unwrap();
         create_session(&db, "b-active", "/repo-b", "main", None, Agent::Claude).unwrap();
 
-        let found = find_active_session_by_repo(&db, "/repo-a").unwrap();
+        let found =
+            find_active_session_by_repo_branch_including_terminal(&db, "/repo-a", "main").unwrap();
         assert_eq!(found.map(|(id, _)| id), Some("a-active-2".to_string()));
 
-        // Repo with only an ended session → None.
+        // Branch with only ended sessions → None, even though the repo has others.
         end_session(&db, "a-active-1").unwrap();
         end_session(&db, "a-active-2").unwrap();
-        assert!(find_active_session_by_repo(&db, "/repo-a")
-            .unwrap()
-            .is_none());
+        assert!(
+            find_active_session_by_repo_branch_including_terminal(&db, "/repo-a", "main")
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            find_active_session_by_repo_branch_including_terminal(&db, "/repo-a", "feature")
+                .unwrap()
+                .map(|(id, _)| id),
+            Some("a-other-branch".to_string()),
+            "a sibling branch keeps its own session"
+        );
 
         // Isolation: /repo-b still returns its own active session + a phase string.
-        let b = find_active_session_by_repo(&db, "/repo-b")
+        let b = find_active_session_by_repo_branch_including_terminal(&db, "/repo-b", "main")
             .unwrap()
             .unwrap();
         assert_eq!(b.0, "b-active");
@@ -1140,7 +1173,7 @@ mod tests {
     }
 
     #[test]
-    fn find_active_session_by_repo_branch_excludes_terminal_phases() {
+    fn find_active_session_by_repo_branch_releases_only_coding_complete() {
         let db = open();
         create_session(&db, "terminal-scope", "/repo", "main", None, Agent::Claude).unwrap();
 
@@ -1159,7 +1192,8 @@ mod tests {
             find_active_session_by_repo_branch(&db, "/repo", "main")
                 .unwrap()
                 .is_none(),
-            "CodingComplete is terminal even before collab_end"
+            "CodingComplete releases the start slot before collab_end — attestation \
+             is a human step and must not block the branch"
         );
 
         create_session(&db, "coding-scope", "/repo", "main", None, Agent::Claude).unwrap();
@@ -1177,11 +1211,54 @@ mod tests {
 
         coding.phase = Phase::CodingFailed;
         save_session(&db, &coding).unwrap();
+        assert_eq!(
+            find_active_session_by_repo_branch(&db, "/repo", "main")
+                .unwrap()
+                .map(|(id, _)| id),
+            Some("coding-scope".to_string()),
+            "CodingFailed KEEPS its start slot: the session stays resumable, and the \
+             resume guard refuses a scope owned by a newer session, so releasing it \
+             would strand the failed session's plan and recovery state"
+        );
+
+        end_session(&db, "coding-scope").unwrap();
         assert!(
             find_active_session_by_repo_branch(&db, "/repo", "main")
                 .unwrap()
                 .is_none(),
-            "CodingFailed is terminal even before collab_end"
+            "collab_end releases the slot"
+        );
+    }
+
+    #[test]
+    fn attribution_lookup_still_sees_coding_complete_sessions() {
+        let db = open();
+        create_session(&db, "attested", "/repo", "main", None, Agent::Claude).unwrap();
+        let mut complete = load_session(&db, "attested").unwrap();
+        complete.phase = Phase::CodingComplete;
+        save_session(&db, &complete).unwrap();
+
+        assert!(
+            find_active_session_by_repo_branch(&db, "/repo", "main")
+                .unwrap()
+                .is_none(),
+            "start slot is released"
+        );
+        assert_eq!(
+            find_active_session_by_repo_branch_including_terminal(&db, "/repo", "main")
+                .unwrap()
+                .map(|(id, _)| id),
+            Some("attested".to_string()),
+            "attribution must still see it: MetricsContext::resolve stamps \
+             terminal-but-unended sessions, so the hook path has to agree"
+        );
+
+        end_session(&db, "attested").unwrap();
+        assert!(
+            find_active_session_by_repo_branch_including_terminal(&db, "/repo", "main")
+                .unwrap()
+                .is_none(),
+            "collab_end ends attribution too"
         );
     }
 }

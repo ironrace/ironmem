@@ -413,7 +413,6 @@ pub(super) fn handle_delete_drawer(app: &App, args: &Value) -> Result<Value, Mem
 
 pub(super) fn handle_list_wings(app: &App) -> Result<Value, MemoryError> {
     let wings = app.db.wing_counts()?;
-
     Ok(json!({
         "wings": wings.into_iter().collect::<std::collections::HashMap<_, _>>()
     }))
