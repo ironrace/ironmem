@@ -2196,12 +2196,21 @@ mod tests {
     }
 
     fn git_test_repo(root: &Path, args: &[&str]) {
-        let output = std::process::Command::new("git")
-            .arg("-C")
-            .arg(root)
-            .args(args)
-            .output()
-            .unwrap();
+        let mut command = std::process::Command::new("git");
+        // Tests that exercise inherited Git overrides mutate `GIT_DIR` for
+        // their subprocess assertion. A parallel temporary-repo setup must
+        // not inherit that override, or its `git init`/`commit` operates on
+        // the wrong repository despite the explicit `-C` target.
+        for (key, _) in std::env::vars_os() {
+            if key
+                .to_string_lossy()
+                .to_ascii_uppercase()
+                .starts_with("GIT_")
+            {
+                command.env_remove(key);
+            }
+        }
+        let output = command.arg("-C").arg(root).args(args).output().unwrap();
         assert!(
             output.status.success(),
             "git {args:?} failed: {}",
