@@ -184,7 +184,7 @@ fn build_synthetic(
     // Record a `pref_extract` token_usage row from an LLM response (non-fatal:
     // a failed insert logs at warn and is dropped — pref-enrich is best-effort).
     let record_pref_usage = |resp: &ironrace_rerank::LlmResponse| {
-        let ctx = crate::metrics::MetricsContext::resolve(app);
+        let ctx = crate::metrics::MetricsContext::resolve(app, None);
         let row = crate::db::metrics::new_token_usage_from_llm(
             "pref_extract",
             resp,
@@ -526,6 +526,31 @@ pub(super) fn handle_search(app: &App, args: &Value) -> Result<Value, MemoryErro
     Ok(response)
 }
 
+/// Build both collab status fields from one App snapshot. Keeping the legacy
+/// id derivation here prevents a second map read from contradicting the list
+/// when a concurrent handler changes scoped bindings.
+fn active_collab_status_fields_from_snapshot(
+    snapshot: Vec<(String, String, String)>,
+) -> (Value, Value) {
+    let active_collab_session_id = match snapshot.as_slice() {
+        [(_, _, session_id)] => Value::String(session_id.clone()),
+        _ => Value::Null,
+    };
+    let active_collab_sessions = Value::Array(
+        snapshot
+            .into_iter()
+            .map(|(repo_path, branch, session_id)| {
+                json!({
+                    "repo_path": repo_path,
+                    "branch": branch,
+                    "session_id": session_id,
+                })
+            })
+            .collect(),
+    );
+    (active_collab_sessions, active_collab_session_id)
+}
+
 pub(super) fn handle_status(app: &App, args: &Value) -> Result<Value, MemoryError> {
     let set_tag = args.get("set_task_tag").and_then(Value::as_str);
     let clear_tag = args
@@ -559,6 +584,8 @@ pub(super) fn handle_status(app: &App, args: &Value) -> Result<Value, MemoryErro
         ReadinessState::Pending => ("warming_up", None),
         ReadinessState::Failed(reason) => ("failed", Some(reason)),
     };
+    let (active_collab_sessions, active_collab_session_id) =
+        active_collab_status_fields_from_snapshot(app.active_collab_sessions_snapshot());
 
     Ok(json!({
         "total_drawers": total,
@@ -574,7 +601,8 @@ pub(super) fn handle_status(app: &App, args: &Value) -> Result<Value, MemoryErro
         "readiness": readiness_label,
         "readiness_error": readiness_error,
         "task_tag": app.explicit_task_tag_snapshot(),
-        "active_collab_session_id": app.active_collab_session_snapshot(),
+        "active_collab_sessions": active_collab_sessions,
+        "active_collab_session_id": active_collab_session_id,
         "metrics": crate::report::one_line_summary(&app.db),
     }))
 }
@@ -643,7 +671,9 @@ mod tests {
         );
         assert!(out.get("warming_up").is_some(), "warming_up missing");
 
-        // active_collab_session_id is echoed (null when unset)
+        // The replacement collection makes an idle status explicit.
+        assert_eq!(out["active_collab_sessions"], json!([]));
+        // active_collab_session_id is echoed for the legacy single-session case.
         assert!(
             out["active_collab_session_id"].is_null(),
             "active_collab_session_id must be null when unset"
@@ -661,6 +691,86 @@ mod tests {
         let out = handle_status(&app, &json!({"clear_task_tag": true})).unwrap();
         assert!(out["task_tag"].is_null());
         assert!(app.explicit_task_tag_snapshot().is_none());
+    }
+
+    #[test]
+    fn status_reports_one_active_collab_scope() {
+        let app = test_app();
+        app.set_active_collab_session_for_scope("session-main", "/repo", "main");
+
+        let out = handle_status(&app, &json!({})).unwrap();
+
+        assert_eq!(out["active_collab_session_id"], json!("session-main"));
+        assert_eq!(
+            out["active_collab_sessions"],
+            json!([{
+                "repo_path": "/repo",
+                "branch": "main",
+                "session_id": "session-main",
+            }])
+        );
+    }
+
+    #[test]
+    fn status_reports_all_active_collab_scopes_in_stable_order() {
+        let app = test_app();
+        app.set_active_collab_session_for_scope("session-z", "/z-repo", "main");
+        app.set_active_collab_session_for_scope("session-feature", "/a-repo", "feature");
+        app.set_active_collab_session_for_scope("session-main", "/a-repo", "main");
+
+        let out = handle_status(&app, &json!({})).unwrap();
+
+        assert!(
+            out["active_collab_session_id"].is_null(),
+            "legacy single-session field must remain null when scopes are ambiguous"
+        );
+        assert_eq!(
+            out["active_collab_sessions"],
+            json!([
+                {
+                    "repo_path": "/a-repo",
+                    "branch": "feature",
+                    "session_id": "session-feature",
+                },
+                {
+                    "repo_path": "/a-repo",
+                    "branch": "main",
+                    "session_id": "session-main",
+                },
+                {
+                    "repo_path": "/z-repo",
+                    "branch": "main",
+                    "session_id": "session-z",
+                },
+            ])
+        );
+    }
+
+    #[test]
+    fn active_collab_status_fields_use_one_snapshot_for_list_and_legacy_id() {
+        let snapshot = vec![
+            (
+                "/repo-a".to_string(),
+                "main".to_string(),
+                "session-a".to_string(),
+            ),
+            (
+                "/repo-b".to_string(),
+                "main".to_string(),
+                "session-b".to_string(),
+            ),
+        ];
+
+        let (sessions, legacy_id) = active_collab_status_fields_from_snapshot(snapshot);
+
+        assert!(legacy_id.is_null());
+        assert_eq!(
+            sessions,
+            json!([
+                {"repo_path": "/repo-a", "branch": "main", "session_id": "session-a"},
+                {"repo_path": "/repo-b", "branch": "main", "session_id": "session-b"},
+            ])
+        );
     }
 
     #[test]

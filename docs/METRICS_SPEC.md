@@ -129,6 +129,14 @@ attribution keys on server-side phase state, never on the raw topic string, and 
 heuristic re-classification after the fact. Message `topic` strings (including the reused
 `final` and `review`, and `failure_report`) are not used for bucketing.
 
+**Scoped MCP-response attribution.** Collab tool responses carry their explicit
+`session_id`, so their metrics resolve to that session even while other scopes
+are live. For an unscoped request, the server stamps the sole active
+`(repo_path, branch)` binding only when exactly one exists. With multiple live
+scopes, the request is deliberately unstamped (and does not fall through to a
+task tag) rather than being attributed to the wrong session. A stale, missing,
+or ended binding self-heals only its matching scope.
+
 ### 3.3 Non-collab attribution
 
 For non-collab tagged tasks there is no topic stream. Rows are attributed by an explicit
@@ -551,14 +559,16 @@ destination, or reporting query changed.
   session-handoff machinery (PR 13/15); `fix_commits` needs commit-counting the MCP server
   cannot do without git access — deferred, tracked on the roadmap.
 
-- **Process-attribution constraint (clarification of §2.3 / §3).** Only one active collab
-  session may be bound to the process attribution slot of a given MCP server process at a
-  time — the constraint applies across all repos, not just the same repo+branch. The collab
-  handlers (`collab_start`, `collab_start_code_review`, `collab_send`, `collab_recv`,
-  `collab_wait_my_turn`) reject any attempt to bind a second still-live session to the
-  process slot. Stale or ended sessions self-clear automatically. Parallel collab sessions
-  require separate server processes so that `search`, pref-extract, and rerank token-usage
-  rows cannot be stamped onto the wrong session.
+- **Scoped-attribution constraint (clarification of §2.3 / §3).** One live collab session
+  may be bound to each `(repo_path, branch)` attribution scope. The collab handlers
+  (`collab_start`, `collab_start_code_review`, `collab_send`, `collab_recv`,
+  `collab_wait_my_turn`, and `collab_resume`) refuse a different still-live session only in
+  the same scope. Different repositories and branches can coexist in one shared daemon.
+  `CodingComplete` releases its start slot while it awaits the `collab_end` completion
+  attestation. `CodingFailed` keeps its slot, so an unended tooling-class failure remains
+  resumable and cannot be stranded by a replayed start. Stale, missing, and ended bindings
+  self-clear only in their matching scope. Explicit-session collab responses remain correctly
+  stamped; unscoped calls with multiple scopes are unstamped rather than attributed incorrectly.
 
 - **§4 `review_rounds` increment semantics (clarification of §4 "each entry into
   review_local / final_review following impl/rework" wording).** As shipped, `review_rounds`

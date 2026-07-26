@@ -1592,27 +1592,34 @@ fn collab_start_rejects_duplicate_active_session_on_same_branch() {
 }
 
 #[test]
-fn collab_start_rejects_distinct_branch_in_same_process_while_active() {
+fn collab_start_allows_distinct_branch_in_same_process() {
     let app = App::open_for_test().unwrap();
     let first = call_tool(
         &app,
         "collab_start",
         json!({ "repo_path": "/repo", "branch": "main", "initiator": "claude" }),
     );
-    let first_id = first["session_id"].as_str().unwrap();
+    let first_id = first["session_id"].as_str().unwrap().to_string();
 
-    let err = call_tool_expect_error(
+    let second = call_tool(
         &app,
         "collab_start",
         json!({ "repo_path": "/repo", "branch": "feature-x", "initiator": "claude" }),
     );
+    let second_id = second["session_id"].as_str().unwrap();
     assert!(
-        err.contains("already bound to this MCP process"),
-        "expected process-local attribution guard, got: {err}"
+        app.active_collab_session_snapshot().is_none(),
+        "status must not report one active session while multiple scopes are bound"
     );
-    assert!(
-        err.contains(first_id),
-        "error must name the active process-bound session, got: {err}"
+    assert_eq!(
+        app.active_collab_session_snapshot_for_scope("/repo", "main")
+            .as_deref(),
+        Some(first_id.as_str())
+    );
+    assert_eq!(
+        app.active_collab_session_snapshot_for_scope("/repo", "feature-x")
+            .as_deref(),
+        Some(second_id)
     );
 }
 

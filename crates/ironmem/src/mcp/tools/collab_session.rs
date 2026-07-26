@@ -411,11 +411,13 @@ fn record_task_outcome_transition(
 
 /// Shared decision logic for the process-attribution conflict guard.
 ///
-/// Invariant: one live collab session may own the process attribution slot at a time
-/// (any repo). Stale or missing sessions self-heal by clearing the cell. Returns
-/// `Ok(())` when the cell should be cleared (stale/missing); the live-session
-/// arm returns `Err` directly. The guard protects correctness whenever metrics
-/// get re-enabled — the conflict check is NOT gated on IRONMEM_METRICS.
+/// Invariant: one live collab session may own a repository-and-branch
+/// attribution scope at a time. Stale, missing, and slot-releasing sessions
+/// self-heal by clearing only their matching scope. "Slot-releasing" is
+/// `CodingComplete` alone ([`Phase::releases_start_slot`]) — a `CodingFailed`
+/// session still holds its scope so a replayed start cannot strand its
+/// recovery state. The guard protects correctness whenever metrics get
+/// re-enabled — the conflict check is NOT gated on IRONMEM_METRICS.
 ///
 /// A turn is refused rather than risking ambiguous attribution; the raw DB error
 /// detail lives in the server log, not in the MCP response.
@@ -425,9 +427,13 @@ fn check_conflicting_session(
     requested_session_id: &str,
 ) -> Result<(), MemoryError> {
     match load_result {
-        Ok(record) if record.ended_at.is_none() => Err(MemoryError::Validation(format!(
-            "another active collab session is already bound to this MCP process for metrics attribution: {active_session_id}. End it or use a separate server process before switching to {requested_session_id}."
-        ))),
+        Ok(record)
+            if record.ended_at.is_none() && !record.session.phase.releases_start_slot() =>
+        {
+            Err(MemoryError::Validation(format!(
+                "another active collab session is already bound to this repository and branch for metrics attribution: {active_session_id}. End it or use a different repository branch before switching to {requested_session_id}."
+            )))
+        }
         // `NotFound` is what the session loader returns for a missing row — matched
         // explicitly so only a confirmed-missing session clears the cell; any new
         // error variant lands in the warn arm below instead of being mistaken for
@@ -462,8 +468,11 @@ fn check_conflicting_session(
 fn ensure_no_conflicting_process_session(
     app: &App,
     requested_session_id: &str,
+    repo_path: &str,
+    branch: &str,
 ) -> Result<(), MemoryError> {
-    let Some(active_session_id) = app.active_collab_session_snapshot() else {
+    let Some(active_session_id) = app.active_collab_session_snapshot_for_scope(repo_path, branch)
+    else {
         return Ok(());
     };
     if active_session_id == requested_session_id {
@@ -472,7 +481,7 @@ fn ensure_no_conflicting_process_session(
 
     let load_result = app.db.collab_load_session_record(&active_session_id);
     check_conflicting_session(load_result, &active_session_id, requested_session_id)?;
-    app.clear_active_collab_session();
+    app.clear_active_collab_session_for_scope_if_matches(&active_session_id, repo_path, branch);
     Ok(())
 }
 
@@ -480,8 +489,11 @@ fn ensure_no_conflicting_process_session_tx(
     app: &App,
     tx: &rusqlite::Transaction<'_>,
     requested_session_id: &str,
+    repo_path: &str,
+    branch: &str,
 ) -> Result<(), MemoryError> {
-    let Some(active_session_id) = app.active_collab_session_snapshot() else {
+    let Some(active_session_id) = app.active_collab_session_snapshot_for_scope(repo_path, branch)
+    else {
         return Ok(());
     };
     if active_session_id == requested_session_id {
@@ -490,8 +502,13 @@ fn ensure_no_conflicting_process_session_tx(
 
     let load_result = crate::collab::queue::load_session_record(tx, &active_session_id);
     check_conflicting_session(load_result, &active_session_id, requested_session_id)?;
-    app.clear_active_collab_session();
+    app.clear_active_collab_session_for_scope_if_matches(&active_session_id, repo_path, branch);
     Ok(())
+}
+
+fn scope_for_session(app: &App, session_id: &str) -> Result<(String, String), MemoryError> {
+    let record = app.db.collab_load_session_record(session_id)?;
+    Ok((record.repo_path, record.branch))
 }
 
 pub(super) fn handle_collab_start(app: &App, args: &Value) -> Result<Value, MemoryError> {
@@ -519,8 +536,11 @@ pub(super) fn handle_collab_start(app: &App, args: &Value) -> Result<Value, Memo
     app.db.with_transaction(|tx| {
         // Guard against accidental duplicate sessions on the same repo+branch
         // (e.g. a fired ScheduleWakeup replaying the `/collab start` entry
-        // command after a session already reached CodingComplete). The check is
-        // atomic with the insert inside this transaction.
+        // command while a session is still mid-flight, or after it reached
+        // CodingFailed and is awaiting a resume). The check is atomic with the
+        // insert inside this transaction. A session at CodingComplete
+        // deliberately does NOT block the start — see
+        // `find_active_session_by_repo_branch`.
         if let Some((existing_id, phase)) =
             crate::collab::queue::find_active_session_by_repo_branch(tx, repo_path, branch)?
         {
@@ -530,7 +550,7 @@ pub(super) fn handle_collab_start(app: &App, args: &Value) -> Result<Value, Memo
                  if it is finished call collab_end on it before starting a new session here."
             )));
         }
-        ensure_no_conflicting_process_session_tx(app, tx, &session_id)?;
+        ensure_no_conflicting_process_session_tx(app, tx, &session_id, repo_path, branch)?;
         crate::collab::queue::create_session(
             tx,
             &session_id,
@@ -555,7 +575,7 @@ pub(super) fn handle_collab_start(app: &App, args: &Value) -> Result<Value, Memo
         Ok(())
     })?;
 
-    app.set_active_collab_session(&session_id);
+    app.set_active_collab_session_for_scope(&session_id, repo_path, branch);
     create_initial_task_outcome(app, &session_id);
 
     Ok(json!({
@@ -662,7 +682,7 @@ pub(super) fn handle_collab_start_code_review(
                  if it is finished call collab_end on it before starting a new session here."
             )));
         }
-        ensure_no_conflicting_process_session_tx(app, tx, &session_id)?;
+        ensure_no_conflicting_process_session_tx(app, tx, &session_id, repo_path, branch)?;
         // Shortcut sessions never enter `CodeImplementPending`, so the
         // `implementer` field is fixed at `Agent::Claude` for uniformity.
         crate::collab::queue::create_session(
@@ -691,7 +711,7 @@ pub(super) fn handle_collab_start_code_review(
         Ok(())
     })?;
 
-    app.set_active_collab_session(&session_id);
+    app.set_active_collab_session_for_scope(&session_id, repo_path, branch);
     create_initial_task_outcome(app, &session_id);
 
     Ok(json!({ "session_id": session_id, "task": task }))
@@ -699,7 +719,8 @@ pub(super) fn handle_collab_start_code_review(
 
 pub(super) fn handle_collab_send(app: &App, args: &Value) -> Result<Value, MemoryError> {
     let session_id = require_str(args, "session_id")?;
-    ensure_no_conflicting_process_session(app, session_id)?;
+    let (repo_path, branch) = scope_for_session(app, session_id)?;
+    ensure_no_conflicting_process_session(app, session_id, &repo_path, &branch)?;
     let sender = require_agent(require_str(args, "sender")?)?;
     let topic = require_str(args, "topic")?;
     let content =
@@ -836,9 +857,9 @@ pub(super) fn handle_collab_send(app: &App, args: &Value) -> Result<Value, Memor
         ))
     })?;
 
-    // Deliberately also set on terminal sends — terminal-but-not-ended sessions still attribute
-    // (bucket 'other'); resolve() self-clears once ended_at is set.
-    app.set_active_collab_session(session_id);
+    // Deliberately also set on terminal sends — terminal-but-not-ended sessions
+    // still attribute (bucket 'other') until a newer session claims this scope.
+    app.set_active_collab_session_for_scope(session_id, &repo_path, &branch);
     record_task_outcome_transition(app, session_id, before, after, pr_url.as_deref());
     Ok(response)
 }
@@ -888,7 +909,8 @@ fn validate_global_review_head_advance(
 
 pub(super) fn handle_collab_recv(app: &App, args: &Value) -> Result<Value, MemoryError> {
     let session_id = require_str(args, "session_id")?;
-    ensure_no_conflicting_process_session(app, session_id)?;
+    let (repo_path, branch) = scope_for_session(app, session_id)?;
+    ensure_no_conflicting_process_session(app, session_id, &repo_path, &branch)?;
     let receiver = require_agent(require_str(args, "receiver")?)?;
     let limit = (args.get("limit").and_then(|v| v.as_u64()).unwrap_or(10) as usize).min(50);
     let auto_ack = args
@@ -971,7 +993,7 @@ pub(super) fn handle_collab_recv(app: &App, args: &Value) -> Result<Value, Memor
             .collect();
         Ok(json!({ "messages": json_messages }))
     })?;
-    app.set_active_collab_session(session_id);
+    app.set_active_collab_session_for_scope(session_id, &repo_path, &branch);
     Ok(result)
 }
 
@@ -1325,25 +1347,26 @@ fn wait_my_turn_claim_and_capture_baseline(
 /// when the polling is driven from outside — claiming on every poll would try
 /// to re-consume a one-time handoff token and fail on the second iteration.
 ///
-/// The process-global metrics attribution is claimed here too, exactly once,
+/// The scoped metrics attribution is claimed here too, exactly once,
 /// immediately after the generation claim commits and guarded by
 /// `ensure_no_conflicting_process_session` above. It must NOT be re-stamped by
 /// the poll loop: the ordering barrier is released as soon as this function
 /// returns `Ok` (see `server::dispatch_wait_my_turn`), so a still-polling wait
 /// for session A would otherwise clobber the cell back to A after a newer,
 /// later-queued request had legitimately bound it to B — producing spurious
-/// "another active collab session is already bound to this MCP process"
+/// "already bound to this repository and branch for metrics attribution"
 /// refusals.
 pub(super) fn wait_my_turn_begin(app: &App, args: &Value) -> Result<WaitTurnBaseline, MemoryError> {
     let session_id = require_str(args, "session_id")?;
-    ensure_no_conflicting_process_session(app, session_id)?;
+    let (repo_path, branch) = scope_for_session(app, session_id)?;
+    ensure_no_conflicting_process_session(app, session_id, &repo_path, &branch)?;
     let agent = require_agent(require_str(args, "agent")?)?;
 
     let baseline = app.db.with_transaction(|tx| {
         wait_my_turn_claim_and_capture_baseline(app, tx, session_id, agent, args)
     })?;
 
-    app.set_active_collab_session(session_id);
+    app.set_active_collab_session_for_scope(session_id, &repo_path, &branch);
     Ok(baseline)
 }
 
@@ -1352,7 +1375,7 @@ pub(super) fn wait_my_turn_begin(app: &App, args: &Value) -> Result<WaitTurnBase
 /// i.e. whether the caller should stop polling before the deadline.
 ///
 /// Deliberately free of sleeping and of any write — including the
-/// process-global attribution claim, which belongs to
+/// scoped attribution claim, which belongs to
 /// [`wait_my_turn_begin`] and happens exactly once per request. That keeps a
 /// long poll from mutating shared state after its barrier was already released,
 /// and lets a caller drive it from an async loop without holding the dispatch
@@ -1415,7 +1438,7 @@ pub(super) fn handle_collab_end(app: &App, args: &Value) -> Result<Value, Memory
     let session_id = require_str(args, "session_id")?;
     let agent = require_agent(require_str(args, "agent")?)?;
 
-    let phase = app.db.with_transaction(|tx| {
+    let (phase, repo_path, branch) = app.db.with_transaction(|tx| {
         super::handoff::ensure_actor_generation_current(
             app,
             tx,
@@ -1427,7 +1450,8 @@ pub(super) fn handle_collab_end(app: &App, args: &Value) -> Result<Value, Memory
         // the two v3 terminal phases. Rejecting during any active planning
         // or coding phase prevents either agent from killing a session the
         // counterpart is still working in.
-        let session = crate::collab::queue::load_session(tx, session_id)?;
+        let record = crate::collab::queue::load_session_record(tx, session_id)?;
+        let session = record.session;
         let allowed = matches!(
             session.phase,
             Phase::PlanLocked | Phase::CodingComplete | Phase::CodingFailed
@@ -1450,7 +1474,7 @@ pub(super) fn handle_collab_end(app: &App, args: &Value) -> Result<Value, Memory
             }),
             Some(&json!({ "ok": true })),
         )?;
-        Ok(ended_phase)
+        Ok((ended_phase, record.repo_path, record.branch))
     })?;
 
     // Operator attestation (METRICS_SPEC §12 amendment): the operator ends a
@@ -1473,10 +1497,7 @@ pub(super) fn handle_collab_end(app: &App, args: &Value) -> Result<Value, Memory
             tracing::warn!(session_id = %session_id, error = %e, "metrics: task_outcome end attestation failed");
         }
     }
-    if app.active_collab_session_snapshot().as_deref() == Some(session_id) {
-        app.clear_active_collab_session();
-        // Leaving a *different* session's cell intact is intentional: that session still owns the slot.
-    }
+    app.clear_active_collab_session_for_scope_if_matches(session_id, &repo_path, &branch);
 
     Ok(json!({ "ok": true, "session_id": session_id }))
 }
@@ -1501,7 +1522,8 @@ pub(super) fn handle_collab_end(app: &App, args: &Value) -> Result<Value, Memory
 /// outcome behind.
 pub(super) fn handle_collab_resume(app: &App, args: &Value) -> Result<Value, MemoryError> {
     let session_id = require_str(args, "session_id")?;
-    ensure_no_conflicting_process_session(app, session_id)?;
+    let (repo_path, branch) = scope_for_session(app, session_id)?;
+    ensure_no_conflicting_process_session(app, session_id, &repo_path, &branch)?;
     let agent = require_agent(require_str(args, "agent")?)?;
 
     let (phase, current_owner) = app.db.with_transaction(|tx| {
@@ -1518,7 +1540,23 @@ pub(super) fn handle_collab_resume(app: &App, args: &Value) -> Result<Value, Mem
         // (the common case: nobody has called `collab_end` on it yet) passes
         // through untouched.
         crate::collab::queue::ensure_active(tx, session_id)?;
-        let session = crate::collab::queue::load_session(tx, session_id)?;
+        let record = crate::collab::queue::load_session_record(tx, session_id)?;
+        if let Some((newer_session_id, phase)) =
+            crate::collab::queue::find_active_session_by_repo_branch(
+                tx,
+                &record.repo_path,
+                &record.branch,
+            )?
+        {
+            if newer_session_id != session_id {
+                return Err(MemoryError::Validation(format!(
+                    "cannot resume collab session {session_id}: newer active session {newer_session_id} \
+                     (phase {phase}) owns repo {} branch {}",
+                    record.repo_path, record.branch
+                )));
+            }
+        }
+        let session = record.session;
         let next = apply_event(&session, agent, &CollabEvent::ResumeCoding)
             .map_err(collab_error_to_memory_error)?;
         crate::collab::queue::save_session(tx, &next)?;
@@ -1548,7 +1586,7 @@ pub(super) fn handle_collab_resume(app: &App, args: &Value) -> Result<Value, Mem
 
     // The session is active again post-resume, same bookkeeping
     // `handle_collab_send` performs on every successful send.
-    app.set_active_collab_session(session_id);
+    app.set_active_collab_session_for_scope(session_id, &repo_path, &branch);
 
     Ok(json!({
         "ok": true,
@@ -1600,8 +1638,12 @@ mod tests {
     }
 
     fn start_session(app: &crate::mcp::app::App) -> String {
+        start_session_in_scope(app, "/tmp/repo", "main")
+    }
+
+    fn start_session_in_scope(app: &crate::mcp::app::App, repo_path: &str, branch: &str) -> String {
         let args = json!({
-            "repo_path": "/tmp/repo", "branch": "main",
+            "repo_path": repo_path, "branch": branch,
             "initiator": "claude", "task": "lifecycle test", "implementer": "claude",
         });
         let out = handle_collab_start(app, &args).unwrap();
@@ -1649,6 +1691,34 @@ mod tests {
         );
         send(app, sid, "claude", "task_list", &task_list_content);
         hash
+    }
+
+    /// Drive the normal v3 lifecycle through its terminal success phase while
+    /// deliberately leaving `collab_end` uncalled.
+    fn drive_to_coding_complete(app: &crate::mcp::app::App, sid: &str) {
+        drive_to_implement(app, sid);
+        send(
+            app,
+            sid,
+            "claude",
+            "implementation_done",
+            r#"{"head_sha":"c1"}"#,
+        );
+        send(
+            app,
+            sid,
+            "codex",
+            "review_fix_global",
+            r#"{"head_sha":"c2"}"#,
+        );
+        send(app, sid, "claude", "review_local", r#"{"head_sha":"c3"}"#);
+        send(
+            app,
+            sid,
+            "claude",
+            "final_review",
+            r#"{"head_sha":"c4","pr_url":"https://github.com/x/y/pull/9"}"#,
+        );
     }
 
     // ── lifecycle tests ───────────────────────────────────────────────────────
@@ -2040,17 +2110,35 @@ mod tests {
     }
 
     #[test]
-    fn second_live_session_cannot_steal_process_attribution_slot() {
+    fn scoped_slots_allow_distinct_repos_and_branches_but_reject_duplicate_scope() {
         let app = test_app();
-        let first = start_session(&app);
+        let repo_main = start_session_in_scope(&app, "/tmp/repo", "main");
+        let other_repo_main = start_session_in_scope(&app, "/tmp/other-repo", "main");
+        let repo_feature = start_session_in_scope(&app, "/tmp/repo", "feature");
+
+        assert_eq!(
+            app.active_collab_session_snapshot_for_scope("/tmp/repo", "main")
+                .as_deref(),
+            Some(repo_main.as_str())
+        );
+        assert_eq!(
+            app.active_collab_session_snapshot_for_scope("/tmp/other-repo", "main")
+                .as_deref(),
+            Some(other_repo_main.as_str())
+        );
+        assert_eq!(
+            app.active_collab_session_snapshot_for_scope("/tmp/repo", "feature")
+                .as_deref(),
+            Some(repo_feature.as_str())
+        );
 
         let err = handle_collab_start(
             &app,
             &json!({
                 "repo_path": "/tmp/repo",
-                "branch": "other-branch",
+                "branch": "main",
                 "initiator": "claude",
-                "task": "second live session",
+                "task": "duplicate scope",
                 "implementer": "claude",
             }),
         )
@@ -2058,12 +2146,32 @@ mod tests {
 
         assert!(
             err.to_string()
-                .contains("already bound to this MCP process"),
+                .contains("an active collab session already exists for repo /tmp/repo branch main"),
             "unexpected error: {err}"
         );
         assert_eq!(
-            app.active_collab_session_snapshot().as_deref(),
-            Some(first.as_str())
+            app.active_collab_session_snapshot_for_scope("/tmp/repo", "main")
+                .as_deref(),
+            Some(repo_main.as_str())
+        );
+    }
+
+    #[test]
+    fn coding_complete_session_releases_its_scope_without_collab_end() {
+        let app = test_app();
+        let completed = start_session(&app);
+        drive_to_coding_complete(&app, &completed);
+
+        let next = start_session_in_scope(&app, "/tmp/repo", "main");
+
+        assert_eq!(
+            app.active_collab_session_snapshot_for_scope("/tmp/repo", "main")
+                .as_deref(),
+            Some(next.as_str())
+        );
+        assert_ne!(
+            completed, next,
+            "a CodingComplete session must release its exact scope for the next session"
         );
     }
 
@@ -2168,10 +2276,10 @@ mod tests {
         std::env::remove_var("IRONMEM_METRICS");
     }
 
-    // ── G.1: send/recv to second live session rejected, cell unchanged ─────────
+    // ── G.1: send/recv to a second scoped session coexist ─────────────────────
 
     #[test]
-    fn send_to_second_live_session_is_rejected_and_cell_unchanged() {
+    fn send_and_recv_to_second_live_session_in_another_scope_are_allowed() {
         let app = test_app();
         let first = start_session(&app);
 
@@ -2190,8 +2298,7 @@ mod tests {
             })
             .unwrap();
 
-        // collab_send to the second session must be rejected.
-        let err = handle_collab_send(
+        handle_collab_send(
             &app,
             &json!({
                 "session_id": second,
@@ -2200,43 +2307,37 @@ mod tests {
                 "content": "a valid draft payload",
             }),
         )
-        .unwrap_err();
-        assert!(
-            err.to_string()
-                .contains("already bound to this MCP process"),
-            "expected conflict error, got: {err}"
+        .unwrap();
+        assert_eq!(
+            app.active_collab_session_snapshot_for_scope("/tmp/repo", "main")
+                .as_deref(),
+            Some(first.as_str())
         );
         assert_eq!(
-            app.active_collab_session_snapshot().as_deref(),
-            Some(first.as_str()),
-            "cell must still hold the first session after rejected send"
+            app.active_collab_session_snapshot_for_scope("/tmp/other", "other-branch")
+                .as_deref(),
+            Some(second)
         );
 
-        // collab_recv to the second session must also be rejected.
-        let err = handle_collab_recv(
+        handle_collab_recv(
             &app,
             &json!({
                 "session_id": second,
                 "receiver": "codex",
             }),
         )
-        .unwrap_err();
-        assert!(
-            err.to_string()
-                .contains("already bound to this MCP process"),
-            "expected conflict error on recv, got: {err}"
-        );
+        .unwrap();
         assert_eq!(
-            app.active_collab_session_snapshot().as_deref(),
-            Some(first.as_str()),
-            "cell must still hold first session after rejected recv"
+            app.active_collab_session_snapshot(),
+            None,
+            "multiple scopes must not pretend there is one active session"
         );
     }
 
-    // ── G.2: start self-heals when cell holds an ended session ────────────────
+    // ── G.2: an ended scope does not affect a new scope ───────────────────────
 
     #[test]
-    fn start_self_heals_when_cell_holds_ended_session() {
+    fn start_in_new_scope_leaves_ended_scope_binding_inspectable() {
         let app = test_app();
         let first = start_session(&app);
 
@@ -2263,14 +2364,20 @@ mod tests {
         );
         assert!(
             result.is_ok(),
-            "collab_start must self-heal ended session in cell: {:?}",
+            "collab_start in another scope must succeed: {:?}",
             result.unwrap_err()
         );
         let new_sid = result.unwrap()["session_id"].as_str().unwrap().to_string();
         assert_eq!(
-            app.active_collab_session_snapshot().as_deref(),
-            Some(new_sid.as_str()),
-            "cell must be rebound to new session after self-heal"
+            app.active_collab_session_snapshot_for_scope("/tmp/repo", "main")
+                .as_deref(),
+            Some(first.as_str()),
+            "an ended binding is only self-healed in its own scope"
+        );
+        assert_eq!(
+            app.active_collab_session_snapshot_for_scope("/tmp/new-repo", "new-branch")
+                .as_deref(),
+            Some(new_sid.as_str())
         );
     }
 
@@ -2279,7 +2386,7 @@ mod tests {
     #[test]
     fn start_self_heals_when_cell_holds_missing_session() {
         let app = test_app();
-        app.set_active_collab_session("ghost-session-id");
+        app.set_active_collab_session_for_scope("ghost-session-id", "/tmp/repo", "main");
 
         let result = handle_collab_start(
             &app,
@@ -3288,7 +3395,7 @@ mod tests {
     }
 
     #[test]
-    fn collab_resume_rejects_switching_away_from_another_active_process_session() {
+    fn collab_resume_allows_another_repository_branch_scope() {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("mem.sqlite3");
         let first = test_app_with_db_path(db_path.clone(), dir.path());
@@ -3299,7 +3406,7 @@ mod tests {
 
         // Build a separate, resumable session through a separate process so
         // both sessions are live in the same database without tripping the
-        // per-process attribution guard during setup.
+        // scoped attribution guard during setup.
         let second_sid = handle_collab_start(
             &second,
             &json!({
@@ -3316,14 +3423,52 @@ mod tests {
             .to_string();
         drive_to_tooling_coding_failed(&second, &second_sid);
 
-        let err = handle_collab_resume(
+        let result = handle_collab_resume(
             &first,
             &json!({ "session_id": second_sid, "agent": "codex" }),
-        )
-        .unwrap_err();
+        );
         assert!(
-            err.to_string().contains("another active collab session"),
-            "expected process-attribution guard, got: {err}"
+            result.is_ok(),
+            "cross-scope resume must be allowed: {result:?}"
+        );
+    }
+
+    #[test]
+    fn collab_resume_from_cold_start_restores_the_failed_scope() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("mem.sqlite3");
+        let old_owner = test_app_with_db_path(db_path.clone(), dir.path());
+
+        let old_session = start_session_in_scope(&old_owner, "/tmp/repo", "main");
+        drive_to_tooling_coding_failed(&old_owner, &old_session);
+
+        // A cold process has no in-memory binding. The durable failed session
+        // still owns its scope, so it must be able to resume instead of being
+        // stranded by a newer same-scope start.
+        let cold_resumer = test_app_with_db_path(db_path, dir.path());
+        let out = handle_collab_resume(
+            &cold_resumer,
+            &json!({ "session_id": old_session, "agent": "codex" }),
+        )
+        .unwrap();
+
+        assert_eq!(out["ok"], json!(true));
+        assert_eq!(
+            cold_resumer
+                .db
+                .collab_load_session_record(&old_session)
+                .unwrap()
+                .session
+                .phase,
+            Phase::CodeImplementPending,
+            "resume must restore the recorded phase"
+        );
+        assert_eq!(
+            cold_resumer
+                .active_collab_session_snapshot_for_scope("/tmp/repo", "main")
+                .as_deref(),
+            Some(old_session.as_str()),
+            "the cold resumer must restore its process-local scope binding"
         );
     }
 
