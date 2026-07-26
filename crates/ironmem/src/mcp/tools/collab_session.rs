@@ -3434,7 +3434,7 @@ mod tests {
     }
 
     #[test]
-    fn collab_resume_rejects_newer_live_same_scope_after_cold_start() {
+    fn collab_resume_from_cold_start_restores_the_failed_scope() {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("mem.sqlite3");
         let old_owner = test_app_with_db_path(db_path.clone(), dir.path());
@@ -3442,24 +3442,17 @@ mod tests {
         let old_session = start_session_in_scope(&old_owner, "/tmp/repo", "main");
         drive_to_tooling_coding_failed(&old_owner, &old_session);
 
-        // A separate process starts a newer live session in the same scope.
-        // `CodingFailed` deliberately does not block that start.
-        let new_owner = test_app_with_db_path(db_path.clone(), dir.path());
-        let newer_session = start_session_in_scope(&new_owner, "/tmp/repo", "main");
-
-        // A cold process has no in-memory binding to catch this conflict, so
-        // resume must consult the durable same-scope owner inside its transaction.
+        // A cold process has no in-memory binding. The durable failed session
+        // still owns its scope, so it must be able to resume instead of being
+        // stranded by a newer same-scope start.
         let cold_resumer = test_app_with_db_path(db_path, dir.path());
-        let err = handle_collab_resume(
+        let out = handle_collab_resume(
             &cold_resumer,
             &json!({ "session_id": old_session, "agent": "codex" }),
         )
-        .unwrap_err();
+        .unwrap();
 
-        assert!(
-            err.to_string().contains(&newer_session),
-            "rejection must name the newer same-scope session: {err}"
-        );
+        assert_eq!(out["ok"], json!(true));
         assert_eq!(
             cold_resumer
                 .db
@@ -3467,8 +3460,15 @@ mod tests {
                 .unwrap()
                 .session
                 .phase,
-            Phase::CodingFailed,
-            "the old session must remain terminal after rejected resume"
+            Phase::CodeImplementPending,
+            "resume must restore the recorded phase"
+        );
+        assert_eq!(
+            cold_resumer
+                .active_collab_session_snapshot_for_scope("/tmp/repo", "main")
+                .as_deref(),
+            Some(old_session.as_str()),
+            "the cold resumer must restore its process-local scope binding"
         );
     }
 
