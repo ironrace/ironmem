@@ -140,6 +140,20 @@ fn handle_add_drawer_with_embedding(
             "mcp",
         )?;
         if let Some(predecessor_id) = supersedes.as_deref() {
+            // Mirror the delete path's guard: protocol-internal collab state and
+            // synthetic enrichment siblings are addressable by id, so without
+            // this any client could hide an accepted plan (or strip a parent's
+            // enrichment) by naming it as a predecessor.
+            if crate::db::schema::Database::is_referenced_collab_drawer_tx(tx, predecessor_id)? {
+                return Err(MemoryError::Validation(
+                    "cannot supersede a drawer referenced by a collab session".into(),
+                ));
+            }
+            if is_synthetic_drawer_tx(tx, predecessor_id)? {
+                return Err(MemoryError::Validation(
+                    "cannot supersede a synthetic enrichment drawer".into(),
+                ));
+            }
             crate::db::schema::Database::mark_drawer_superseded_tx(
                 tx,
                 predecessor_id,
@@ -177,7 +191,20 @@ fn handle_add_drawer_with_embedding(
         Ok(())
     })?;
 
-    app.insert_into_index(&id, &embedding)?;
+    // The transaction has committed, so a failure here must not be reported as
+    // a write failure: the predecessor is already marked, and a client that
+    // retried with revised wording would be hard-rejected as "already
+    // superseded by a different successor" — unable to ever complete the write.
+    let mut index_deferred = false;
+    if let Err(e) = app.insert_into_index(&id, &embedding) {
+        tracing::warn!(
+            error = %e,
+            drawer_id = %id,
+            "index insert failed after commit; marking dirty for rebuild"
+        );
+        app.mark_dirty();
+        index_deferred = true;
+    }
     if let Some((sid, _, semb)) = synth.as_ref() {
         if let Err(e) = app.insert_into_index(sid, semb) {
             tracing::warn!(
@@ -204,10 +231,15 @@ fn handle_add_drawer_with_embedding(
     if let Some(predecessor_id) = supersedes {
         out["supersedes"] = json!(predecessor_id);
     }
+    if index_deferred {
+        out["index"] = json!("deferred");
+    }
 
-    // A duplicate is an advisory relationship only: the durable add has
-    // already committed and indexed, so a read-side failure must not turn it
-    // into a client-visible write failure or imply any destructive action.
+    // A duplicate is an advisory relationship only: the durable add has already
+    // committed (and is either indexed or queued for the lazy rebuild), so a
+    // read-side failure must not turn it into a client-visible write failure or
+    // imply any destructive action. It is still reported, because "check
+    // failed" and "no duplicate" are different answers to the caller.
     match app.db.find_near_duplicate(&embedding, &wing, &room, &id) {
         Ok(Some((candidate_id, score))) => {
             out["dedup_hint"] = json!({ "id": candidate_id, "score": score });
@@ -215,6 +247,7 @@ fn handle_add_drawer_with_embedding(
         Ok(None) => {}
         Err(error) => {
             tracing::warn!(error = %error, drawer_id = %id, "add_drawer near-duplicate advisory check failed");
+            out["dedup_hint_status"] = json!("unavailable");
         }
     }
     Ok(out)
@@ -548,7 +581,7 @@ pub(super) fn handle_search(app: &App, args: &Value) -> Result<Value, MemoryErro
                     redact_content,
                 );
                 remaining_content_budget = remaining_content_budget.saturating_sub(consumed_chars);
-                json!({
+                let mut row = json!({
                     "id": sd.drawer.id,
                     "content": content,
                     "content_truncated": truncated,
@@ -557,7 +590,9 @@ pub(super) fn handle_search(app: &App, args: &Value) -> Result<Value, MemoryErro
                     "room": sd.drawer.room,
                     "score": sd.score,
                     "date": sd.drawer.date,
-                })
+                });
+                label_superseded(&mut row, sd);
+                row
             } else {
                 let (excerpt, truncated, redacted, consumed_chars) = render_search_excerpt(
                     &sd.drawer.content,
@@ -566,7 +601,7 @@ pub(super) fn handle_search(app: &App, args: &Value) -> Result<Value, MemoryErro
                     redact_content,
                 );
                 remaining_content_budget = remaining_content_budget.saturating_sub(consumed_chars);
-                json!({
+                let mut row = json!({
                     "id": sd.drawer.id,
                     "excerpt": excerpt,
                     "excerpt_truncated": truncated,
@@ -575,7 +610,9 @@ pub(super) fn handle_search(app: &App, args: &Value) -> Result<Value, MemoryErro
                     "room": sd.drawer.room,
                     "score": sd.score,
                     "date": sd.drawer.date,
-                })
+                });
+                label_superseded(&mut row, sd);
+                row
             }
         })
         .collect();
@@ -588,6 +625,36 @@ pub(super) fn handle_search(app: &App, args: &Value) -> Result<Value, MemoryErro
     });
     response["content_mode"] = json!(if full { "full" } else { "excerpt" });
     Ok(response)
+}
+
+/// True when the drawer is a synthetic preference-enrichment sibling, which is
+/// identified by the `pref:` sentinel in its `source_file`.
+fn is_synthetic_drawer_tx(
+    tx: &rusqlite::Transaction<'_>,
+    drawer_id: &str,
+) -> Result<bool, MemoryError> {
+    use rusqlite::OptionalExtension;
+    let source_file: Option<String> = tx
+        .query_row(
+            "SELECT source_file FROM drawers WHERE id = ?1",
+            rusqlite::params![drawer_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    Ok(source_file.is_some_and(|source| source.starts_with(crate::db::drawers::PREF_SENTINEL)))
+}
+
+/// Tag a search result that is retained history rather than current state.
+///
+/// Only emitted when set, so the common all-current response keeps its existing
+/// size. Without it an `include_superseded: true` response is an unlabelled mix
+/// of current and historical rows — and a predecessor often outscores its own
+/// successor, since their embeddings are near-identical and the older phrasing
+/// may match the query better.
+fn label_superseded(row: &mut Value, sd: &crate::db::ScoredDrawer) {
+    if let Some(successor) = sd.drawer.superseded_by.as_deref() {
+        row["superseded_by"] = json!(successor);
+    }
 }
 
 pub(super) fn handle_status(app: &App, args: &Value) -> Result<Value, MemoryError> {
@@ -1574,6 +1641,158 @@ mod tests {
             failed_error,
             MemoryError::Validation(message) if message == "full must be a boolean"
         ));
+    }
+
+    /// The whole point of retaining history is that the current value stays
+    /// reachable. Re-filing a superseded fact must not report success for a
+    /// write that no default search can return.
+    #[test]
+    fn re_adding_superseded_content_makes_it_searchable_again() {
+        let app = test_app();
+        let original = json!({
+            "content": "deploy target is staging",
+            "wing": "project",
+            "room": "state",
+        });
+        let predecessor = handle_add_drawer(&app, &original).unwrap();
+        let predecessor_id = predecessor["id"].as_str().unwrap().to_owned();
+        handle_add_drawer(
+            &app,
+            &json!({
+                "content": "deploy target is production",
+                "wing": "project",
+                "room": "state",
+                "supersedes": predecessor_id,
+            }),
+        )
+        .unwrap();
+
+        // The team reverts: the identical original fact is filed again.
+        let readded = handle_add_drawer(&app, &original).unwrap();
+        assert_eq!(readded["id"].as_str(), Some(predecessor_id.as_str()));
+
+        let fetched = handle_get_drawer(&app, &json!({"id": predecessor_id})).unwrap();
+        assert!(
+            fetched["superseded_by"].is_null(),
+            "a re-filed drawer must be current again"
+        );
+
+        let results = handle_search(
+            &app,
+            &json!({
+                "query": "deploy target is staging",
+                "wing": "project",
+                "room": "state",
+                "limit": 10,
+            }),
+        )
+        .unwrap();
+        assert!(
+            results["results"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|r| r["id"].as_str() == Some(predecessor_id.as_str())),
+            "the resurrected drawer must be retrievable by default search"
+        );
+    }
+
+    /// `include_superseded: true` is unusable if the caller cannot tell which
+    /// rows are history — a predecessor often outscores its own successor.
+    #[test]
+    fn history_search_results_label_superseded_rows() {
+        let app = test_app();
+        let predecessor = handle_add_drawer(
+            &app,
+            &json!({"content": "labelled record one", "wing": "project", "room": "state"}),
+        )
+        .unwrap();
+        let predecessor_id = predecessor["id"].as_str().unwrap().to_owned();
+        let successor = handle_add_drawer(
+            &app,
+            &json!({
+                "content": "labelled record two",
+                "wing": "project",
+                "room": "state",
+                "supersedes": predecessor_id,
+            }),
+        )
+        .unwrap();
+        let successor_id = successor["id"].as_str().unwrap().to_owned();
+
+        let results = handle_search(
+            &app,
+            &json!({
+                "query": "labelled record",
+                "wing": "project",
+                "room": "state",
+                "limit": 10,
+                "include_superseded": true,
+            }),
+        )
+        .unwrap();
+        let rows = results["results"].as_array().unwrap();
+
+        let old = rows
+            .iter()
+            .find(|r| r["id"].as_str() == Some(predecessor_id.as_str()))
+            .expect("history row present");
+        assert_eq!(old["superseded_by"].as_str(), Some(successor_id.as_str()));
+
+        let current = rows
+            .iter()
+            .find(|r| r["id"].as_str() == Some(successor_id.as_str()))
+            .expect("current row present");
+        assert!(
+            current.get("superseded_by").is_none(),
+            "current rows must stay unlabelled so the field is not paid for on every response"
+        );
+    }
+
+    /// Synthetic enrichment siblings are protocol-internal but addressable by
+    /// id; superseding one would strip its parent's enrichment.
+    #[test]
+    fn add_drawer_refuses_to_supersede_a_synthetic_sibling() {
+        let app = test_app();
+        let parent = handle_add_drawer(
+            &app,
+            &json!({"content": "parent body", "wing": "project", "room": "state"}),
+        )
+        .unwrap();
+        let parent_id = parent["id"].as_str().unwrap().to_owned();
+
+        let synthetic_id = "a".repeat(32);
+        app.db
+            .insert_drawer(
+                &synthetic_id,
+                "User has mentioned: parent body",
+                &vec![0.0; ironrace_embed::EMBED_DIM],
+                "project",
+                "state",
+                &format!("{}{parent_id}", crate::db::drawers::PREF_SENTINEL),
+                "mcp",
+            )
+            .unwrap();
+
+        let rejected = handle_add_drawer(
+            &app,
+            &json!({
+                "content": "replacement for a synth",
+                "wing": "project",
+                "room": "state",
+                "supersedes": synthetic_id,
+            }),
+        )
+        .unwrap_err();
+        assert!(matches!(rejected, MemoryError::Validation(_)));
+        assert!(rejected.to_string().contains("synthetic"));
+        assert!(app
+            .db
+            .get_drawer(&synthetic_id)
+            .unwrap()
+            .unwrap()
+            .superseded_by
+            .is_none());
     }
 
     #[test]

@@ -44,7 +44,7 @@ pub fn tool_definitions(app: &App) -> Vec<Value> {
     let tools = vec![
         json!({
             "name": "status",
-            "description": "Memory, graph, and metrics overview.",
+            "description": "Memory, graph, and metrics overview. task-tag fields scope non-collab metrics.",
             "inputSchema": { "type": "object", "properties": {
                 "set_task_tag": { "type": "string", "description": "Process-local metrics task tag; active collab takes priority." },
                 "clear_task_tag": { "type": "boolean", "description": "Clear the explicit metrics task tag" }
@@ -52,7 +52,7 @@ pub fn tool_definitions(app: &App) -> Vec<Value> {
         }),
         json!({
             "name": "search",
-            "description": "Returns bounded excerpts and stable IDs; use get_drawer for a complete body.",
+            "description": "Semantic search. Returns bounded excerpts and stable IDs; use get_drawer for a complete body.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -68,7 +68,7 @@ pub fn tool_definitions(app: &App) -> Vec<Value> {
                     "include_superseded": {
                         "type": "boolean",
                         "default": false,
-                        "description": "false hides retained superseded history; true includes it."
+                        "description": "true includes retained superseded history; false hides it."
                     }
                 },
                 "required": ["query"]
@@ -76,7 +76,7 @@ pub fn tool_definitions(app: &App) -> Vec<Value> {
         }),
         json!({
             "name": "add_drawer",
-            "description": "Store content; logical_key rewrites context.",
+            "description": "Store content in a wing/room. logical_key overwrites replaceable current context.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -85,11 +85,11 @@ pub fn tool_definitions(app: &App) -> Vec<Value> {
                     "room": { "type": "string", "default": "general" },
                     "logical_key": {
                         "type": "string",
-                        "description": "Stable key rewrites a wing/room drawer."
+                        "description": "Stable key that rewrites this wing/room drawer."
                     },
                     "supersedes": {
                         "type": "string",
-                        "description": "The superseded drawer is retained and retrievable by ID."
+                        "description": "ID of a current drawer in this wing/room to retire; it is retained and retrievable by ID."
                     }
                 },
                 "required": ["content", "wing"]
@@ -119,7 +119,8 @@ pub fn tool_definitions(app: &App) -> Vec<Value> {
                     },
                     "hash_only": {
                         "type": "boolean",
-                        "description": "When true, omit content and return content_hash unless restricted mode redacts it. Overrides include_content. Default false."
+                        "default": false,
+                        "description": "Omit content and return content_hash unless restricted mode redacts it. Overrides include_content."
                     }
                 },
                 "anyOf": [
@@ -369,11 +370,13 @@ pub fn tool_definitions(app: &App) -> Vec<Value> {
                     "session_id": { "type": "string" },
                     "verbose": {
                         "type": "boolean",
-                        "description": "When true, include the full canonical/final plan body alongside the compact reference. Default false (compact reference only)."
+                        "default": false,
+                        "description": "Include the full canonical/final plan body beside the compact reference."
                     },
                     "include_task_list": {
                         "type": "boolean",
-                        "description": "When true, include the full task_list JSON alongside task_list_ref. Default false (compact reference only)."
+                        "default": false,
+                        "description": "Include the full task_list JSON beside task_list_ref."
                     }
                 },
                 "required": ["session_id"]
@@ -431,13 +434,13 @@ pub fn tool_definitions(app: &App) -> Vec<Value> {
         }),
         json!({
             "name": "collab_wait_my_turn",
-            "description": "Long-poll until the agent's turn or a post-claim phase, owner, terminal, ended, or recovery-state change. Timeout returns {unchanged:true}; otherwise returns {is_my_turn, phase, current_owner, session_ended}. Default 30s, max 60s.",
+            "description": "Long-poll until the agent's turn or a post-claim phase, owner, terminal, ended, or recovery-state change. Timeout returns {unchanged:true}; otherwise returns {is_my_turn, phase, current_owner, session_ended}.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "session_id": { "type": "string" },
                     "agent": { "type": "string", "enum": ["claude", "codex"] },
-                    "timeout_secs": { "type": "integer", "default": 30 },
+                    "timeout_secs": { "type": "integer", "default": 30, "maximum": 60 },
                     "handoff_token": { "type": "string" }
                 },
                 "required": ["session_id", "agent"]
@@ -1170,13 +1173,23 @@ mod tests {
         assert!(full_description.contains("use get_drawer for the complete body"));
     }
 
+    /// Raised 3_500 -> 3_550 for the v17 supersession surface (#211): `search`
+    /// gained `include_superseded` and `add_drawer` gained `supersedes`, which
+    /// cost ~140 bytes more than the previous ceiling left spare.
+    ///
+    /// The budget is deliberately a whole-listing ceiling with no per-tool
+    /// allocation, so the cheapest way to land a new field is to delete prose
+    /// from whichever unrelated tool happens to be wordiest. That trade is not
+    /// acceptable: raise this constant when new capability genuinely needs the
+    /// room, and pay for it by moving prose into real schema keys (`default`,
+    /// `maximum`) — not by silently degrading a neighbour's description.
     #[test]
     fn tool_listing_stays_within_prompt_cache_schema_budget() {
         let app = App::open_for_test().unwrap();
         let bytes = serde_json::to_vec(&tool_definitions(&app)).unwrap().len();
         let estimated_tokens = bytes.div_ceil(4);
         assert!(
-            estimated_tokens <= 3_500,
+            estimated_tokens <= 3_550,
             "tool listing is ~{estimated_tokens} tokens ({bytes} bytes); trim descriptions that duplicate their schemas"
         );
     }

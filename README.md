@@ -567,11 +567,39 @@ stale copies:
 ```
 
 For retained temporal history, add a successor with `supersedes` pointing to
-the prior drawer. Normal semantic search omits superseded drawers so current
-context stays clear; pass `include_superseded: true` to `search` when you need
-both current and historical rows. `dedup_hint` is advisory and non-destructive:
-it only points at a similar current drawer and never merges, deletes, or hides
-memory.
+the prior drawer. The predecessor must be a current drawer in the same
+wing/room:
+
+```json
+{
+  "content": "Deploy target is production.",
+  "wing": "my-project",
+  "room": "current-context",
+  "supersedes": "9f2c…"
+}
+```
+
+Normal semantic search omits superseded drawers so current context stays clear;
+pass `include_superseded: true` to `search` when you need both current and
+historical rows. History rows carry a `superseded_by` field naming their
+successor — current rows omit it — so a mixed result set stays readable.
+`get_drawer` returns `superseded_by` for any drawer.
+
+Two behaviours are worth knowing:
+
+- **Re-filing resurrects.** Drawer IDs derive from content (or `logical_key`)
+  plus wing/room, so re-adding a superseded body lands on the same row and
+  makes it current again. Reverting a decision restores it rather than writing
+  into a hidden row.
+- **Deleting a successor restores its predecessor.** `superseded_by` has no
+  foreign key, so deleting a successor clears the pointers into it instead of
+  stranding the older version out of reach.
+
+A response may also carry `dedup_hint` (`{id, score}`), which is advisory and
+non-destructive: it only points at a similar current drawer and never merges,
+deletes, or hides memory. It is a bounded check, so it can miss a duplicate in
+a very large room; `dedup_hint_status: "unavailable"` means the check itself
+could not run, which is different from "no duplicate found".
 
 Prune stale operational collab artifacts with a dry-run first:
 

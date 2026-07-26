@@ -43,8 +43,15 @@ pub(crate) const PREF_SENTINEL: &str = "pref:";
 /// references and must not be discoverable through generic memory search.
 const COLLAB_MESSAGE_ROOM: &str = "collab-messages";
 
-#[allow(dead_code)] // Used by the add-drawer handler introduced with this storage layer.
+/// Cosine-similarity floor for treating two current drawers in one wing/room as
+/// near duplicates. Tuned for the `EMBED_DIM`-wide vectors the bundled embedder
+/// produces; swapping the embedding model invalidates this constant.
 const NEAR_DUPLICATE_THRESHOLD: f32 = 0.92;
+
+/// Most recent current drawers a single near-duplicate check will scan within
+/// one wing/room. Bounds the advisory check's cost in rooms far larger than the
+/// scan was designed for; see `find_near_duplicate`.
+const NEAR_DUPLICATE_SCAN_CAP: usize = 2_000;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Drawer {
@@ -132,10 +139,38 @@ impl Database {
         )
     }
 
-    /// Mark a current predecessor as superseded inside the caller's
-    /// transaction. The successor is deliberately not validated here: callers
-    /// insert it first in the same transaction, keeping the write atomic.
-    #[allow(dead_code)] // Invoked by the add-drawer handler in the subsequent MCP task.
+    /// Read a drawer's `(wing, room, superseded_by)` lineage triple, if it exists.
+    fn drawer_lineage_tx(
+        tx: &Transaction<'_>,
+        id: &str,
+    ) -> Result<Option<(String, String, Option<String>)>, MemoryError> {
+        Ok(tx
+            .query_row(
+                "SELECT wing, room, superseded_by FROM drawers WHERE id = ?1",
+                params![id],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, Option<String>>(2)?,
+                    ))
+                },
+            )
+            .optional()?)
+    }
+
+    /// Mark a current predecessor as superseded inside the caller's transaction.
+    ///
+    /// The successor must already exist in this transaction — callers insert it
+    /// first, which keeps the write atomic. Both rows are re-checked here so a
+    /// missing, cross-scope, or already-superseded successor can never be
+    /// linked: a successor that is itself superseded would close the lineage
+    /// into a cycle, and because every `superseded_by IS NULL` filter would then
+    /// reject every row in that cycle, the whole chain would vanish from
+    /// default search with no way to restore it through the public API.
+    ///
+    /// Re-marking the identical predecessor/successor pair is idempotent, so a
+    /// replayed `add_drawer` succeeds; a *different* successor is rejected.
     pub(crate) fn mark_drawer_superseded_tx(
         tx: &Transaction<'_>,
         predecessor_id: &str,
@@ -149,46 +184,9 @@ impl Database {
             ));
         }
 
-        let successor = tx
-            .query_row(
-                "SELECT wing, room FROM drawers WHERE id = ?1",
-                params![successor_id],
-                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
-            )
-            .optional()?;
-        let Some((successor_wing, successor_room)) = successor else {
-            return Err(MemoryError::NotFound("successor drawer not found".into()));
-        };
-        if successor_wing != wing || successor_room != room {
-            return Err(MemoryError::Validation(
-                "successor drawer does not belong to requested wing/room".into(),
-            ));
-        }
-
-        let updated = tx.execute(
-            "UPDATE drawers
-             SET superseded_by = ?1
-             WHERE id = ?2 AND wing = ?3 AND room = ?4 AND superseded_by IS NULL",
-            params![successor_id, predecessor_id, wing, room],
-        )?;
-        if updated == 1 {
-            return Ok(());
-        }
-
-        let predecessor = tx
-            .query_row(
-                "SELECT wing, room, superseded_by FROM drawers WHERE id = ?1",
-                params![predecessor_id],
-                |row| {
-                    Ok((
-                        row.get::<_, String>(0)?,
-                        row.get::<_, String>(1)?,
-                        row.get::<_, Option<String>>(2)?,
-                    ))
-                },
-            )
-            .optional()?;
-        let Some((actual_wing, actual_room, superseded_by)) = predecessor else {
+        let Some((actual_wing, actual_room, predecessor_superseded_by)) =
+            Self::drawer_lineage_tx(tx, predecessor_id)?
+        else {
             return Err(MemoryError::NotFound("predecessor drawer not found".into()));
         };
         if actual_wing != wing || actual_room != room {
@@ -196,18 +194,50 @@ impl Database {
                 "predecessor drawer does not belong to requested wing/room".into(),
             ));
         }
-        if superseded_by.as_deref() == Some(successor_id) {
+        // An identical replay settles here regardless of what has happened to
+        // the successor since, so a retried `add_drawer` stays idempotent.
+        if predecessor_superseded_by.as_deref() == Some(successor_id) {
             return Ok(());
         }
-        if superseded_by.is_some() {
+        if predecessor_superseded_by.is_some() {
             return Err(MemoryError::Validation(
                 "predecessor drawer is already superseded by a different successor".into(),
             ));
         }
 
-        Err(MemoryError::Validation(
-            "predecessor drawer could not be superseded".into(),
-        ))
+        let Some((successor_wing, successor_room, successor_superseded_by)) =
+            Self::drawer_lineage_tx(tx, successor_id)?
+        else {
+            return Err(MemoryError::NotFound("successor drawer not found".into()));
+        };
+        if successor_wing != wing || successor_room != room {
+            return Err(MemoryError::Validation(
+                "successor drawer does not belong to requested wing/room".into(),
+            ));
+        }
+        if successor_superseded_by.is_some() {
+            return Err(MemoryError::Validation(
+                "successor drawer is itself superseded; supersede the current drawer instead"
+                    .into(),
+            ));
+        }
+
+        // Still a guarded compare-and-set: the predecessor read above shares
+        // this transaction, but the `IS NULL` guard keeps the write correct
+        // even if that snapshot were stale.
+        let updated = tx.execute(
+            "UPDATE drawers
+             SET superseded_by = ?1
+             WHERE id = ?2 AND wing = ?3 AND room = ?4 AND superseded_by IS NULL",
+            params![successor_id, predecessor_id, wing, room],
+        )?;
+        if updated == 1 {
+            Ok(())
+        } else {
+            Err(MemoryError::Validation(
+                "predecessor drawer could not be superseded".into(),
+            ))
+        }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -223,8 +253,21 @@ impl Database {
     ) -> Result<(), MemoryError> {
         let blob: Vec<u8> = embedding.iter().flat_map(|f| f.to_le_bytes()).collect();
 
+        // Re-filing content resurrects the row as current. Drawer ids are
+        // derived from content (or logical_key) + wing + room, so a re-add or a
+        // logical_key rewrite lands back on a row that may already be marked
+        // superseded; leaving the marker set would commit the new body into a
+        // row every `superseded_by IS NULL` filter hides, reporting success for
+        // a write nothing can retrieve.
+        let resurrect_current = if Self::has_superseded_by_column(conn)? {
+            ",\n                superseded_by = NULL"
+        } else {
+            ""
+        };
+
         conn.execute(
-            "INSERT INTO drawers (id, content, embedding, wing, room, source_file, added_by)
+            &format!(
+                "INSERT INTO drawers (id, content, embedding, wing, room, source_file, added_by)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
              ON CONFLICT(id) DO UPDATE SET
                 content = excluded.content,
@@ -232,7 +275,8 @@ impl Database {
                 wing = excluded.wing,
                 room = excluded.room,
                 source_file = excluded.source_file,
-                added_by = excluded.added_by",
+                added_by = excluded.added_by{resurrect_current}"
+            ),
             params![id, content, blob, wing, room, source_file, added_by],
         )?;
 
@@ -447,7 +491,10 @@ impl Database {
 
     /// Find the best current drawer in one wing/room whose embedding is close
     /// enough to `embedding` to be treated as a near duplicate.
-    #[allow(dead_code)] // Invoked by the add-drawer handler in the subsequent MCP task.
+    ///
+    /// Advisory only: the result decorates an `add_drawer` response and never
+    /// changes what was stored, so a miss caused by [`NEAR_DUPLICATE_SCAN_CAP`]
+    /// is acceptable where a slow write would not be.
     pub(crate) fn find_near_duplicate(
         &self,
         embedding: &[f32],
@@ -458,31 +505,52 @@ impl Database {
         let Some(query_norm) = vector_norm(embedding) else {
             return Ok(None);
         };
+        if !Self::has_superseded_by_column(&self.conn)? {
+            return Ok(None);
+        }
 
-        // ponytail: bounded per-wing/room scan is practical below ~10k current drawers; upgrade to filtered ANN retrieval when a scope exceeds that ceiling.
+        // ponytail: linear scan of the most recent NEAR_DUPLICATE_SCAN_CAP current
+        // drawers in one wing/room, decoding an EMBED_DIM f32 blob per row — an
+        // uncapped scan cost ~56MB of blob reads in this instance's largest room
+        // (~18k drawers) on every add_drawer. The cap bounds that to a constant at
+        // the price of missing duplicates older than the newest N; replace with
+        // filtered ANN retrieval over the existing HNSW index to remove both limits.
         let mut stmt = self.conn.prepare(
             "SELECT id, embedding FROM drawers
              WHERE wing = ?1 AND room = ?2 AND id != ?3 AND superseded_by IS NULL
-               AND source_file NOT LIKE ?4",
+               AND source_file NOT LIKE ?4
+             ORDER BY filed_at DESC, id ASC
+             LIMIT ?5",
         )?;
         let synthetic_pattern = format!("{PREF_SENTINEL}%");
-        let rows = stmt.query_map(params![wing, room, exclude_id, synthetic_pattern], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?))
-        })?;
+        let rows = stmt.query_map(
+            params![
+                wing,
+                room,
+                exclude_id,
+                synthetic_pattern,
+                NEAR_DUPLICATE_SCAN_CAP as i64
+            ],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?)),
+        )?;
 
+        // Malformed rows are counted, not logged individually: swapping the
+        // embedding model makes every stored row mismatch, which would
+        // otherwise emit one warning per row on every add_drawer.
+        let mut skipped_malformed = 0_usize;
         let mut best: Option<(String, f32)> = None;
         for row in rows {
             let (id, blob) = row?;
             let Some(candidate) = decode_embedding(&blob) else {
-                tracing::warn!(drawer_id = %id, "skipping drawer with malformed embedding while checking near duplicates");
+                skipped_malformed += 1;
                 continue;
             };
             if candidate.len() != embedding.len() {
-                tracing::warn!(drawer_id = %id, "skipping drawer with mismatched embedding dimensions while checking near duplicates");
+                skipped_malformed += 1;
                 continue;
             }
             let Some(candidate_norm) = vector_norm(&candidate) else {
-                tracing::warn!(drawer_id = %id, "skipping drawer with zero-norm embedding while checking near duplicates");
+                skipped_malformed += 1;
                 continue;
             };
             let dot_product: f32 = embedding
@@ -492,7 +560,7 @@ impl Database {
                 .sum();
             let score = dot_product / (query_norm * candidate_norm);
             if !score.is_finite() {
-                tracing::warn!(drawer_id = %id, "skipping drawer with non-finite similarity while checking near duplicates");
+                skipped_malformed += 1;
                 continue;
             }
             if score < NEAR_DUPLICATE_THRESHOLD {
@@ -505,6 +573,14 @@ impl Database {
             if is_better {
                 best = Some((id, score));
             }
+        }
+        if skipped_malformed > 0 {
+            tracing::warn!(
+                skipped = skipped_malformed,
+                wing,
+                room,
+                "skipped drawers with unusable embeddings while checking near duplicates"
+            );
         }
         Ok(best)
     }
@@ -538,8 +614,9 @@ impl Database {
         }
         let fts_query = fts5_sanitize(query);
         let limit_i64 = limit as i64;
-        // Read-only pre-v17 databases intentionally project superseded_by as
-        // NULL. Do not reference the absent physical column in that path.
+        // A pre-v17 database has no physical `superseded_by`, so the filter must
+        // be omitted there rather than referencing an absent column. (Reads of
+        // that database project the field as NULL — see `drawer_projection`.)
         let current_only = !include_superseded && Self::has_superseded_by_column(&self.conn)?;
         let supersession_filter = if current_only {
             " AND d.superseded_by IS NULL"
@@ -547,31 +624,35 @@ impl Database {
             ""
         };
 
+        // FTS5 will not resolve `MATCH`/`bm25()` through a table alias — an
+        // aliased form fails to prepare with "no such column", which the
+        // handler below degrades to "no lexical results". Always name
+        // `drawers_fts` in full.
         let sql = match (wing, room) {
             (Some(_), Some(_)) => {
                 format!(
-                    "SELECT f.drawer_id, -bm25(f) AS score
-                 FROM drawers_fts f
-                 JOIN drawers d ON d.id = f.drawer_id
-                 WHERE f MATCH ?1 AND d.wing = ?3 AND d.room = ?4{supersession_filter}
+                    "SELECT drawers_fts.drawer_id, -bm25(drawers_fts) AS score
+                 FROM drawers_fts
+                 JOIN drawers d ON d.id = drawers_fts.drawer_id
+                 WHERE drawers_fts MATCH ?1 AND d.wing = ?3 AND d.room = ?4{supersession_filter}
                  ORDER BY score DESC LIMIT ?2"
                 )
             }
             (Some(_), None) => {
                 format!(
-                    "SELECT f.drawer_id, -bm25(f) AS score
-                 FROM drawers_fts f
-                 JOIN drawers d ON d.id = f.drawer_id
-                 WHERE f MATCH ?1 AND d.wing = ?3{supersession_filter}
+                    "SELECT drawers_fts.drawer_id, -bm25(drawers_fts) AS score
+                 FROM drawers_fts
+                 JOIN drawers d ON d.id = drawers_fts.drawer_id
+                 WHERE drawers_fts MATCH ?1 AND d.wing = ?3{supersession_filter}
                  ORDER BY score DESC LIMIT ?2"
                 )
             }
             (None, Some(_)) => {
                 format!(
-                    "SELECT f.drawer_id, -bm25(f) AS score
-                 FROM drawers_fts f
-                 JOIN drawers d ON d.id = f.drawer_id
-                 WHERE f MATCH ?1 AND d.room = ?4{supersession_filter}
+                    "SELECT drawers_fts.drawer_id, -bm25(drawers_fts) AS score
+                 FROM drawers_fts
+                 JOIN drawers d ON d.id = drawers_fts.drawer_id
+                 WHERE drawers_fts MATCH ?1 AND d.room = ?3{supersession_filter}
                  ORDER BY score DESC LIMIT ?2"
                 )
             }
@@ -589,8 +670,16 @@ impl Database {
         let mut stmt = match self.conn.prepare(&sql) {
             Ok(s) => s,
             Err(e) => {
-                tracing::debug!("BM25 search skipped (FTS table may not exist): {e}");
-                return Ok(vec![]);
+                // Only a genuinely absent FTS table may degrade to "no lexical
+                // results". This SQL is generated, so any other prepare failure
+                // is a bug in the builder above, and silently returning an
+                // empty vec would hide it as a mere recall dip.
+                if missing_fts_table(&e) {
+                    tracing::debug!("BM25 search skipped (FTS table does not exist): {e}");
+                    return Ok(vec![]);
+                }
+                tracing::warn!("BM25 search failed to prepare (using vector-only): {sql}: {e}");
+                return Err(e.into());
             }
         };
 
@@ -611,7 +700,12 @@ impl Database {
 
         match rows {
             Err(e) => {
-                // FTS5 query syntax error or missing table — degrade gracefully.
+                // A user query that FTS5 rejects is expected; a parameter-count
+                // mismatch is a builder bug and must not look like "no hits".
+                if matches!(e, rusqlite::Error::InvalidParameterCount(..)) {
+                    tracing::warn!("BM25 query bound the wrong parameter count: {sql}: {e}");
+                    return Err(e.into());
+                }
                 tracing::debug!("BM25 query failed (will use vector-only): {e}");
                 Ok(vec![])
             }
@@ -762,7 +856,37 @@ impl Database {
         Ok(false)
     }
 
+    /// Restore any predecessor that pointed at rows about to be deleted.
+    ///
+    /// `superseded_by` has no foreign key, so without this a delete would leave
+    /// a predecessor pointing at a row that no longer exists — permanently
+    /// hidden from every `superseded_by IS NULL` filter even though it is now
+    /// the only surviving version of that memory.
+    fn clear_dangling_supersession_conn(
+        conn: &rusqlite::Connection,
+        doomed_ids_sql: &str,
+        params: &[&dyn rusqlite::types::ToSql],
+    ) -> Result<(), MemoryError> {
+        if !Self::has_superseded_by_column(conn)? {
+            return Ok(());
+        }
+        let restored = conn.execute(
+            &format!(
+                "UPDATE drawers SET superseded_by = NULL WHERE superseded_by IN ({doomed_ids_sql})"
+            ),
+            params,
+        )?;
+        if restored > 0 {
+            tracing::info!(
+                restored,
+                "restored superseded predecessors whose successor was deleted"
+            );
+        }
+        Ok(())
+    }
+
     fn delete_drawer_conn(conn: &rusqlite::Connection, id: &str) -> Result<usize, MemoryError> {
+        Self::clear_dangling_supersession_conn(conn, "?1", params![id])?;
         // Remove from FTS index first (best-effort; ignore if table doesn't exist).
         let _ = conn.execute("DELETE FROM drawers_fts WHERE drawer_id = ?1", params![id]);
         Ok(conn.execute("DELETE FROM drawers WHERE id = ?1", params![id])?)
@@ -772,6 +896,11 @@ impl Database {
         conn: &rusqlite::Connection,
         source_file: &str,
     ) -> Result<usize, MemoryError> {
+        Self::clear_dangling_supersession_conn(
+            conn,
+            "SELECT id FROM drawers WHERE source_file = ?1",
+            params![source_file],
+        )?;
         // Remove matching drawers from FTS index first (best-effort).
         let _ = conn.execute(
             "DELETE FROM drawers_fts WHERE drawer_id IN (
@@ -786,7 +915,16 @@ impl Database {
     }
 }
 
-#[allow(dead_code)] // Kept adjacent to the near-duplicate helper for its handler call site.
+/// True when a prepare failure means the FTS5 table itself is absent (a
+/// pre-migration database), as opposed to malformed generated SQL.
+fn missing_fts_table(error: &rusqlite::Error) -> bool {
+    matches!(
+        error,
+        rusqlite::Error::SqliteFailure(_, Some(message))
+            if message.contains("no such table") && message.contains("drawers_fts")
+    )
+}
+
 fn decode_embedding(blob: &[u8]) -> Option<Vec<f32>> {
     if !blob.len().is_multiple_of(std::mem::size_of::<f32>()) {
         return None;
@@ -801,7 +939,6 @@ fn decode_embedding(blob: &[u8]) -> Option<Vec<f32>> {
         .then_some(embedding)
 }
 
-#[allow(dead_code)] // Kept adjacent to the near-duplicate helper for its handler call site.
 fn vector_norm(embedding: &[f32]) -> Option<f32> {
     let squared_sum: f32 = embedding.iter().map(|value| value * value).sum();
     let norm = squared_sum.sqrt();
@@ -1451,6 +1588,198 @@ mod tests {
             .unwrap_err();
         assert!(matches!(cross_scope, MemoryError::Validation(_)));
         assert!(cross_scope.to_string().contains("does not belong"));
+    }
+
+    /// Drawer ids are derived from content, so re-filing a fact lands back on
+    /// the row that was superseded. Leaving the marker set would commit the new
+    /// body into a row every search filter hides.
+    #[test]
+    fn readding_superseded_content_restores_the_row_as_current() {
+        let db = Database::open_in_memory().unwrap();
+        let emb = dummy_embedding();
+        let predecessor = generate_id("use tabs", "wing", "room");
+        let successor = generate_id("use spaces", "wing", "room");
+        db.insert_drawer(&predecessor, "use tabs", &emb, "wing", "room", "", "test")
+            .unwrap();
+        db.insert_drawer(&successor, "use spaces", &emb, "wing", "room", "", "test")
+            .unwrap();
+        db.with_transaction(|tx| {
+            Database::mark_drawer_superseded_tx(tx, &predecessor, &successor, "wing", "room")
+        })
+        .unwrap();
+        assert!(db
+            .get_drawer(&predecessor)
+            .unwrap()
+            .unwrap()
+            .superseded_by
+            .is_some());
+
+        // Re-file the original fact: same content -> same id -> upsert.
+        db.insert_drawer(&predecessor, "use tabs", &emb, "wing", "room", "", "test")
+            .unwrap();
+
+        assert_eq!(
+            db.get_drawer(&predecessor).unwrap().unwrap().superseded_by,
+            None,
+            "a re-filed drawer must be current again, not a durable but hidden row"
+        );
+        let visible = db
+            .bm25_search("use tabs", 10, Some("wing"), Some("room"))
+            .unwrap();
+        assert!(
+            visible.iter().any(|(id, _)| id == &predecessor),
+            "the resurrected drawer must be retrievable by default search"
+        );
+    }
+
+    /// A successor that is itself superseded closes the lineage into a cycle in
+    /// which every row is hidden and none can be recovered through the API.
+    #[test]
+    fn mark_drawer_superseded_tx_rejects_a_successor_that_is_itself_superseded() {
+        let db = Database::open_in_memory().unwrap();
+        let emb = dummy_embedding();
+        let (a, b, c) = ("a".repeat(32), "b".repeat(32), "c".repeat(32));
+        for id in [&a, &b, &c] {
+            db.insert_drawer(id, "body", &emb, "wing", "room", "", "test")
+                .unwrap();
+        }
+
+        db.with_transaction(|tx| Database::mark_drawer_superseded_tx(tx, &a, &b, "wing", "room"))
+            .unwrap();
+        db.with_transaction(|tx| Database::mark_drawer_superseded_tx(tx, &b, &c, "wing", "room"))
+            .unwrap();
+
+        // b is now superseded by c, so it must not be accepted as a successor.
+        let cycle = db
+            .with_transaction(|tx| Database::mark_drawer_superseded_tx(tx, &c, &b, "wing", "room"))
+            .unwrap_err();
+        assert!(matches!(cycle, MemoryError::Validation(_)));
+        assert!(cycle.to_string().contains("itself superseded"));
+        assert!(
+            db.get_drawer(&c).unwrap().unwrap().superseded_by.is_none(),
+            "the head of the chain must stay current"
+        );
+    }
+
+    /// `superseded_by` has no foreign key, so a delete must clear inbound
+    /// pointers or the predecessor stays hidden behind a successor that is gone.
+    #[test]
+    fn deleting_a_successor_restores_its_predecessor_to_current() {
+        let db = Database::open_in_memory().unwrap();
+        let emb = dummy_embedding();
+        let predecessor = "a".repeat(32);
+        let successor = "b".repeat(32);
+        db.insert_drawer(&predecessor, "old", &emb, "wing", "room", "", "test")
+            .unwrap();
+        db.insert_drawer(&successor, "new", &emb, "wing", "room", "", "test")
+            .unwrap();
+        db.with_transaction(|tx| {
+            Database::mark_drawer_superseded_tx(tx, &predecessor, &successor, "wing", "room")
+        })
+        .unwrap();
+
+        assert!(db.delete_drawer(&successor).unwrap());
+
+        assert_eq!(
+            db.get_drawer(&predecessor).unwrap().unwrap().superseded_by,
+            None,
+            "deleting the successor must not strand the predecessor as permanently hidden"
+        );
+    }
+
+    /// FTS5 cannot resolve `MATCH`/`bm25()` through a table alias, so every
+    /// scoped branch must name `drawers_fts` in full and bind the right number
+    /// of parameters. Without this, scoped lexical search returns nothing and
+    /// the failure is invisible.
+    #[test]
+    fn bm25_search_returns_hits_for_every_wing_room_scope() {
+        let db = Database::open_in_memory().unwrap();
+        let emb = dummy_embedding();
+        let id = "a".repeat(32);
+        db.insert_drawer(
+            &id,
+            "zebra quokka narwhal",
+            &emb,
+            "wing",
+            "room",
+            "",
+            "test",
+        )
+        .unwrap();
+
+        for (wing, room) in [
+            (None, None),
+            (Some("wing"), None),
+            (None, Some("room")),
+            (Some("wing"), Some("room")),
+        ] {
+            let hits = db.bm25_search("zebra quokka", 10, wing, room).unwrap();
+            assert_eq!(
+                hits.iter().map(|(id, _)| id.as_str()).collect::<Vec<_>>(),
+                vec![id.as_str()],
+                "scope ({wing:?}, {room:?}) must return the matching drawer"
+            );
+        }
+    }
+
+    /// The supersession filter has to hold in every scoped branch, not just the
+    /// unscoped one.
+    #[test]
+    fn bm25_search_hides_superseded_rows_in_every_scope() {
+        let db = Database::open_in_memory().unwrap();
+        let emb = dummy_embedding();
+        let predecessor = "a".repeat(32);
+        let successor = "b".repeat(32);
+        db.insert_drawer(
+            &predecessor,
+            "zebra quokka one",
+            &emb,
+            "wing",
+            "room",
+            "",
+            "test",
+        )
+        .unwrap();
+        db.insert_drawer(
+            &successor,
+            "zebra quokka two",
+            &emb,
+            "wing",
+            "room",
+            "",
+            "test",
+        )
+        .unwrap();
+        db.with_transaction(|tx| {
+            Database::mark_drawer_superseded_tx(tx, &predecessor, &successor, "wing", "room")
+        })
+        .unwrap();
+
+        for (wing, room) in [
+            (None, None),
+            (Some("wing"), None),
+            (None, Some("room")),
+            (Some("wing"), Some("room")),
+        ] {
+            let current = db.bm25_search("zebra quokka", 10, wing, room).unwrap();
+            assert_eq!(
+                current
+                    .iter()
+                    .map(|(id, _)| id.as_str())
+                    .collect::<Vec<_>>(),
+                vec![successor.as_str()],
+                "scope ({wing:?}, {room:?}) must hide the superseded row"
+            );
+
+            let history = db
+                .bm25_search_with_history("zebra quokka", 10, wing, room, true)
+                .unwrap();
+            assert_eq!(
+                history.len(),
+                2,
+                "scope ({wing:?}, {room:?}) must return history on request"
+            );
+        }
     }
 
     #[test]

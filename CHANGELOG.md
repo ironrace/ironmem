@@ -9,6 +9,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Drawer supersession and advisory dedup hints (#211).** Schema **v17** adds
+  `drawers.superseded_by` plus a partial `(wing, room) WHERE superseded_by IS
+  NULL` index. `add_drawer` accepts `supersedes` (a current drawer in the same
+  wing/room) and marks the predecessor inside the same transaction; the body is
+  retained and still retrievable by ID. `search` accepts `include_superseded`
+  (default `false`) and labels history rows with `superseded_by`; `get_drawer`
+  returns `superseded_by` for any drawer. `add_drawer` responses may carry an
+  advisory `dedup_hint` (`{id, score}`), and `dedup_hint_status: "unavailable"`
+  when the check could not run. Supersession refuses collab-referenced and
+  synthetic enrichment drawers, rejects a successor that is itself superseded
+  (which would hide an entire lineage), restores a predecessor when its
+  successor is deleted, and treats re-filing a superseded body as a
+  resurrection rather than a durable-but-hidden write.
+
+### Fixed
+
+- **Scoped BM25 search returned no lexical results (#211).** All three
+  wing/room-scoped FTS5 branches referenced the table through an alias, which
+  FTS5 rejects for `MATCH`/`bm25()`; the failure was swallowed at `debug` level
+  and silently degraded scoped search to vector-only. The room-only branch also
+  bound three parameters against SQL referencing `?4`. Both are fixed and
+  covered for all four wing/room combinations, and a prepare failure that is
+  not a missing FTS table now propagates instead of looking like zero hits.
+
 - **Deterministic `/collab` MCP-response distributions and offline baseline gate
   (#212).** `ironmem report --json` now exposes p50/p95/max response-size
   distributions for every harness/tool group. `scripts/collab_baseline.py`
