@@ -388,6 +388,38 @@ codex` already writes this form for you, and upgrades a pre-existing bare
 [Shared Daemon Mode](../README.md#shared-daemon-mode) in the main README for
 the full flag/env-var reference, the fallback guarantee, and security notes.
 
+### Concurrent Collab Attribution
+
+One shared daemon can host concurrent Collab sessions for different
+repositories and branches. Attribution is scoped to `(repo_path, branch)`, so
+only a second live session in the same scope is refused; independent repos do
+not need separate daemons. Missing and ended bindings self-heal only in their
+matching scope.
+
+`CodingComplete` releases the scope's start slot while it awaits the
+`collab_end` completion attestation. A `CodingFailed` session keeps its slot:
+it remains resumable and cannot be stranded by a replayed start.
+
+Use `status` to inspect bindings. `active_collab_sessions` is a deterministic,
+sorted array of `{repo_path, branch, session_id}` records. The compatibility
+field `active_collab_session_id` is populated only when exactly one scope is
+active; it is `null` with zero or multiple scopes:
+
+```json
+{
+  "active_collab_sessions": [
+    {"repo_path":"/work/api","branch":"main","session_id":"sess-api"},
+    {"repo_path":"/work/web","branch":"feature/ui","session_id":"sess-web"}
+  ],
+  "active_collab_session_id": null
+}
+```
+
+Collab tool response metrics use each tool call's explicit session ID. An
+unscoped call is stamped only when exactly one Collab scope is live; with
+multiple scopes it is deliberately unstamped rather than attributed to the
+wrong session.
+
 **Access mode is daemon-process-global, not per-client.** `IRONMEM_MCP_MODE`
 is read once, from whichever process's environment happened to spawn the
 shared daemon first. Every OTHER client that later connects to that same

@@ -2,6 +2,7 @@
 
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::sync::LazyLock;
 use std::time::{Duration, Instant};
 
@@ -245,10 +246,13 @@ fn run_hook_with_input(
 
 /// Resolve collab attribution for a transcript row from the hook process.
 ///
-/// Unlike `MetricsContext::resolve` (which reads from `App::active_collab_session_snapshot`,
-/// empty in the hook's separate process), this function performs a fresh DB lookup
-/// by repo path — the same shape as `collab_line()` for session-start context, but
-/// loading the typed `Phase` for the `phase_bucket()` call required by METRICS_SPEC §3.2.
+/// Unlike `MetricsContext::resolve` (which reads `App`'s in-process scope
+/// bindings, empty in the hook's separate process), this function resolves the
+/// current Git branch and performs a fresh DB lookup by repo path plus branch —
+/// the same shape as `collab_line()` for session-start context, but loading the
+/// typed `Phase` for the `phase_bucket()` call required by METRICS_SPEC §3.2.
+/// The lookup includes terminal-but-unended sessions so this path and
+/// `MetricsContext::resolve` agree on which session owns the work.
 ///
 /// `task_tag` is set to `collab_session_id` (per §10.4 OR-join invariant: both keys
 /// for a collab task refer to the same task). Outside a collab session, returns
@@ -260,10 +264,7 @@ fn resolve_transcript_context(
     let Some(root) = workspace_root else {
         return crate::metrics::MetricsContext::default();
     };
-    let repo_path = root.to_string_lossy();
-    let session_id = match app.db.with_connection(|conn| {
-        crate::collab::queue::find_active_session_by_repo(conn, repo_path.as_ref())
-    }) {
+    let session_id = match active_collab_session_for_workspace(app, root) {
         Ok(Some((id, _raw_phase))) => id,
         Ok(None) => return crate::metrics::MetricsContext::default(),
         Err(e) => {
@@ -292,6 +293,74 @@ fn resolve_transcript_context(
         collab_phase: Some(collab_phase),
         task_tag: Some(session_id),
     }
+}
+
+/// Resolve the checked-out Git branch for a workspace. Detached HEADs,
+/// non-repositories, command failures, and non-UTF-8 output intentionally
+/// return `None`: hook attribution must remain absent rather than guessing a
+/// session from another branch.
+fn current_workspace_branch(workspace_root: &Path) -> Option<String> {
+    let mut command = Command::new("git");
+    // Git treats GIT_* variables as repository-selection and configuration
+    // overrides. Retain the normal process environment (especially PATH) but
+    // remove every Git override so a hook's inherited environment cannot point
+    // this workspace lookup at another repository.
+    for (key, _) in std::env::vars_os() {
+        if key
+            .to_string_lossy()
+            .to_ascii_uppercase()
+            .starts_with("GIT_")
+        {
+            command.env_remove(key);
+        }
+    }
+    let output = command
+        .arg("-C")
+        .arg(workspace_root)
+        .args(["branch", "--show-current"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let branch = String::from_utf8(output.stdout).ok()?;
+    let branch = branch.trim();
+    (!branch.is_empty()).then(|| branch.to_string())
+}
+
+/// Return the collab session that owns exactly the workspace's current Git
+/// branch, for attribution and for the session-start context line. When the
+/// branch cannot be resolved, do not fall back to a repository-wide lookup:
+/// another branch may have a live session, and a mis-keyed metrics row is
+/// worse than an absent one.
+///
+/// Uses the terminal-inclusive lookup on purpose. A session at
+/// `CodingComplete` awaiting operator attestation still owns its workspace and
+/// is still stamped (bucket `other`) by `MetricsContext::resolve`, so the hook
+/// must see it or transcript rows and MCP rows would disagree about the same
+/// session for the whole attestation window.
+fn active_collab_session_for_workspace(
+    app: &App,
+    workspace_root: &Path,
+) -> Result<Option<(String, String)>, MemoryError> {
+    let Some(branch) = current_workspace_branch(workspace_root) else {
+        // Fires legitimately for any non-git workspace, so `debug` rather than
+        // `warn`: without it, a detached HEAD (rebase, bisect, CI checkout)
+        // silently drops attribution with nothing to point at.
+        tracing::debug!(
+            workspace = %workspace_root.display(),
+            "collab attribution: branch unresolved — scoped lookup skipped"
+        );
+        return Ok(None);
+    };
+    let repo_path = workspace_root.to_string_lossy();
+    app.db.with_connection(|conn| {
+        crate::collab::queue::find_active_session_by_repo_branch_including_terminal(
+            conn,
+            repo_path.as_ref(),
+            &branch,
+        )
+    })
 }
 
 /// Read the FULL transcript file (not the tail) for token accounting.
@@ -1270,17 +1339,15 @@ fn room_names_line(app: &App) -> Option<String> {
     }
 }
 
-/// `collab <short id> @ <phase>` for the newest active session in this repo.
-/// `None` when there is no active session or the lookup fails. DB-backed because
-/// the in-process snapshot is empty in the hook's separate process.
+/// `collab <short id> @ <phase>` for the active session on this workspace's
+/// current Git branch. `None` when there is no active session, the branch is
+/// unavailable, or the lookup fails. DB-backed because the in-process snapshot
+/// is empty in the hook's separate process.
 fn collab_line(app: &App, workspace_root: &Path) -> Option<String> {
-    let repo_path = workspace_root.to_string_lossy();
-    match app.db.with_connection(|conn| {
-        crate::collab::queue::find_active_session_by_repo(conn, repo_path.as_ref())
-    }) {
+    match active_collab_session_for_workspace(app, workspace_root) {
         Ok(Some((id, phase))) => {
             // Sanitize the phase like every other DB-derived field at the
-            // injection boundary. `find_active_session_by_repo` returns the raw
+            // injection boundary. `find_active_session_by_repo_branch` returns the raw
             // phase column (not a parsed `Phase`) so this hook stays infallible;
             // treat it as an opaque display string. See its doc comment.
             let phase = compact_excerpt(&phase, SESSION_CONTEXT_LABEL_BYTES);
@@ -1341,9 +1408,9 @@ fn join_within_budget(lines: &[String], budget: usize) -> String {
 /// don't fit. Because `MEMORY_PROTOCOL` is that floor this always returns `Some`
 /// — the `Option` lets callers treat an empty block as "nothing to inject".
 ///
-/// The active collab session and diary pointer are read from the DB (not
-/// `App::active_collab_session_snapshot()`) because this hook runs in a separate
-/// process where that snapshot is empty.
+/// The active collab session and diary pointer are read from the DB (not from
+/// `App`'s in-process scope bindings) because this hook runs in a separate
+/// process where those bindings are empty.
 ///
 /// Diagnostics caveat: the `warn!`s above go to stderr, which Claude Code
 /// discards when the hook exits 0, so a persistent degradation shrinks the block
@@ -2128,10 +2195,159 @@ mod tests {
             .unwrap();
     }
 
+    fn git_test_repo(root: &Path, args: &[&str]) {
+        let mut command = std::process::Command::new("git");
+        // Tests that exercise inherited Git overrides mutate `GIT_DIR` for
+        // their subprocess assertion. A parallel temporary-repo setup must
+        // not inherit that override, or its `git init`/`commit` operates on
+        // the wrong repository despite the explicit `-C` target.
+        for (key, _) in std::env::vars_os() {
+            if key
+                .to_string_lossy()
+                .to_ascii_uppercase()
+                .starts_with("GIT_")
+            {
+                command.env_remove(key);
+            }
+        }
+        let output = command.arg("-C").arg(root).args(args).output().unwrap();
+        assert!(
+            output.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    fn init_git_test_repo(root: &Path) {
+        std::fs::create_dir_all(root).unwrap();
+        git_test_repo(root, &["init", "-b", "main"]);
+        git_test_repo(root, &["config", "user.email", "tests@ironmem.invalid"]);
+        git_test_repo(root, &["config", "user.name", "Ironmem Tests"]);
+        std::fs::write(root.join("README.md"), "initial\n").unwrap();
+        git_test_repo(root, &["add", "README.md"]);
+        git_test_repo(root, &["commit", "-m", "initial"]);
+    }
+
+    struct ScopedEnvVar {
+        key: &'static str,
+        previous: Option<std::ffi::OsString>,
+    }
+
+    impl ScopedEnvVar {
+        fn set(key: &'static str, value: impl AsRef<std::ffi::OsStr>) -> Self {
+            let previous = std::env::var_os(key);
+            std::env::set_var(key, value);
+            Self { key, previous }
+        }
+    }
+
+    impl Drop for ScopedEnvVar {
+        fn drop(&mut self) {
+            match &self.previous {
+                Some(value) => std::env::set_var(self.key, value),
+                None => std::env::remove_var(self.key),
+            }
+        }
+    }
+
+    fn seed_collab_in_branch(app: &App, repo_path: &str, sid: &str, branch: &str) {
+        app.db
+            .with_transaction(|tx| {
+                crate::collab::queue::create_session(
+                    tx,
+                    sid,
+                    repo_path,
+                    branch,
+                    None,
+                    crate::collab::Agent::Claude,
+                )
+            })
+            .unwrap();
+        app.db
+            .with_transaction(|tx| {
+                let mut session = crate::collab::queue::load_session(tx, sid)?;
+                session.phase = crate::collab::Phase::CodeImplementPending;
+                crate::collab::queue::save_session(tx, &session)
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn hook_collab_context_uses_the_current_git_branch() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("repo");
+        init_git_test_repo(&root);
+        let app = App::open_for_test().unwrap();
+        let repo_path = root.to_string_lossy();
+        seed_collab_in_branch(&app, &repo_path, "main0001-session", "main");
+        seed_collab_in_branch(&app, &repo_path, "feature001-session", "feature");
+        app.db
+            .with_connection(|conn| {
+                conn.execute(
+                    "UPDATE collab_sessions SET created_at = '2030-01-01T00:00:00Z' \
+                     WHERE id = 'feature001-session'",
+                    [],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+
+        let main_context = resolve_transcript_context(&app, Some(&root));
+        assert_eq!(
+            main_context.collab_session_id.as_deref(),
+            Some("main0001-session")
+        );
+        assert!(collab_line(&app, &root).unwrap().contains("main0001"));
+
+        git_test_repo(&root, &["checkout", "-b", "feature"]);
+        let feature_context = resolve_transcript_context(&app, Some(&root));
+        assert_eq!(
+            feature_context.collab_session_id.as_deref(),
+            Some("feature001-session")
+        );
+        assert!(collab_line(&app, &root).unwrap().contains("feature0"));
+    }
+
+    #[test]
+    fn hook_collab_context_does_not_fallback_when_branch_cannot_be_resolved() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("not-a-git-repo");
+        std::fs::create_dir_all(&root).unwrap();
+        let app = App::open_for_test().unwrap();
+        let repo_path = root.to_string_lossy();
+        seed_collab_in_branch(&app, &repo_path, "main0001-session", "main");
+        seed_collab_in_branch(&app, &repo_path, "feature001-session", "feature");
+
+        let context = resolve_transcript_context(&app, Some(&root));
+        assert_eq!(context, crate::metrics::MetricsContext::default());
+        assert!(collab_line(&app, &root).is_none());
+    }
+
+    #[test]
+    fn current_workspace_branch_ignores_inherited_git_dir() {
+        let _env = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let temp = tempfile::tempdir().unwrap();
+        let intended = temp.path().join("intended");
+        let injected = temp.path().join("injected");
+        init_git_test_repo(&intended);
+        init_git_test_repo(&injected);
+        git_test_repo(&injected, &["checkout", "-b", "injected-branch"]);
+
+        let _git_dir = ScopedEnvVar::set("GIT_DIR", injected.join(".git"));
+        assert_eq!(
+            current_workspace_branch(&intended).as_deref(),
+            Some("main"),
+            "the workspace branch must never be selected from inherited GIT_DIR"
+        );
+    }
+
     #[test]
     fn build_session_start_context_includes_counts_collab_diary_and_protocol() {
         let app = App::open_for_test().unwrap();
-        let repo = "/tmp/repo-ctx-87";
+        let temp = tempfile::tempdir().unwrap();
+        let repo_root = temp.path().join("repo");
+        init_git_test_repo(&repo_root);
+        let repo = repo_root.to_string_lossy();
 
         // "zeta" (alphabetically last) gets the MOST drawers; "alpha" the fewest —
         // proves the count-DESC re-sort actually reorders the alphabetical DB output.
@@ -2151,7 +2367,7 @@ mod tests {
                 crate::collab::queue::create_session(
                     tx,
                     "ctxsess-1234abcd",
-                    repo,
+                    repo.as_ref(),
                     "main",
                     None,
                     crate::collab::Agent::Claude,
@@ -2159,7 +2375,7 @@ mod tests {
             })
             .unwrap();
 
-        let block = build_session_start_context(&app, Some(std::path::Path::new(repo))).unwrap();
+        let block = build_session_start_context(&app, Some(&repo_root)).unwrap();
 
         assert!(block.contains("drawers"), "drawer count line present");
         let zpos = block.find("zeta").expect("zeta listed");
@@ -3636,7 +3852,7 @@ mod tests {
 
         let temp = tempfile::tempdir().unwrap();
         let workspace = temp.path().join("workspace");
-        std::fs::create_dir_all(&workspace).unwrap();
+        init_git_test_repo(&workspace);
 
         let config = Config {
             db_path: temp.path().join("memory.sqlite3"),
@@ -3654,6 +3870,13 @@ mod tests {
                 &app,
                 &workspace.to_string_lossy(),
                 "collab-attribution-test",
+            );
+            assert_eq!(
+                resolve_transcript_context(&app, Some(&workspace))
+                    .collab_session_id
+                    .as_deref(),
+                Some("collab-attribution-test"),
+                "the fixture workspace must resolve its main-branch collab session"
             );
         }
 

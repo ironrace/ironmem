@@ -364,7 +364,7 @@ pub fn search(
                 &mut scored,
             );
             if let Some(resp) = llm_response {
-                let ctx = crate::metrics::MetricsContext::resolve(app);
+                let ctx = crate::metrics::MetricsContext::resolve(app, None);
                 let row = crate::db::metrics::new_token_usage_from_llm(
                     "llm_rerank",
                     &resp,
