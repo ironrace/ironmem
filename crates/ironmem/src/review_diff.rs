@@ -225,6 +225,7 @@ fn resolve_expansion_target(
 
 fn read_source(request: &ReviewDiffRequest) -> Result<String, MemoryError> {
     let mut command = Command::new("git");
+    scrub_git_environment(&mut command);
     command.current_dir(&request.repo);
     command.args(["diff", "--no-ext-diff", "--unified=3"]);
     match &request.source {
@@ -253,6 +254,21 @@ fn read_source(request: &ReviewDiffRequest) -> Result<String, MemoryError> {
     String::from_utf8(output.stdout).map_err(|_| {
         MemoryError::Validation("review-diff git diff produced non-UTF-8 output".into())
     })
+}
+
+fn scrub_git_environment(command: &mut Command) {
+    // Git repository and configuration overrides can redirect a command away
+    // from `request.repo`; preserve normal environment such as PATH, but not
+    // inherited Git-specific process controls.
+    for (key, _) in std::env::vars_os() {
+        if key
+            .to_string_lossy()
+            .to_ascii_uppercase()
+            .starts_with("GIT_")
+        {
+            command.env_remove(key);
+        }
+    }
 }
 
 fn validate_revision(revision: &str, name: &str) -> Result<(), MemoryError> {
@@ -382,6 +398,7 @@ fn take_git_path_token(value: &str) -> Option<(String, &str)> {
 
 fn parse_unquoted_diff_header_paths(value: &str) -> Option<(String, String)> {
     let mut candidate_start = 0;
+    let mut fallback = None;
     while let Some(offset) = value[candidate_start..].find(" b/") {
         let separator = candidate_start + offset;
         let old_path = &value[..separator];
@@ -392,10 +409,11 @@ fn parse_unquoted_diff_header_paths(value: &str) -> Option<(String, String)> {
             if old_relative == new_relative {
                 return Some((old_path.to_owned(), new_path.to_owned()));
             }
+            fallback.get_or_insert_with(|| (old_path.to_owned(), new_path.to_owned()));
         }
         candidate_start = separator + 1;
     }
-    None
+    fallback
 }
 
 fn normalize_git_path(path: &str) -> Option<String> {
@@ -592,5 +610,14 @@ mod tests {
             parsed[0].public.path,
             "bell\u{7} back\u{8} form\u{c} vertical\u{b}.txt"
         );
+    }
+
+    #[test]
+    fn parser_uses_new_path_for_unquoted_header_only_rename() {
+        let parsed = parse_unified_diff(
+            "diff --git a/old name.txt b/new name.txt\nsimilarity index 100%\nrename from old name.txt\nrename to new name.txt\n",
+        );
+
+        assert_eq!(parsed[0].public.path, "new name.txt");
     }
 }

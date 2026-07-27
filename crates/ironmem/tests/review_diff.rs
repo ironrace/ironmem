@@ -1,10 +1,42 @@
 use std::path::Path;
 use std::process::Command;
+use std::sync::{LazyLock, Mutex};
 
 use ironmem::review_diff::{
     build_review_diff, expand_review_diff, ReviewDiffRequest, ReviewDiffSource,
 };
 use tempfile::TempDir;
+
+static GIT_ENV_MUTEX: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
+
+struct ScopedEnvVars {
+    previous: Vec<(&'static str, Option<std::ffi::OsString>)>,
+}
+
+impl ScopedEnvVars {
+    fn set(values: &[(&'static str, &str)]) -> Self {
+        let previous = values
+            .iter()
+            .map(|(key, value)| {
+                let previous = std::env::var_os(key);
+                std::env::set_var(key, value);
+                (*key, previous)
+            })
+            .collect();
+        Self { previous }
+    }
+}
+
+impl Drop for ScopedEnvVars {
+    fn drop(&mut self) {
+        for (key, previous) in &self.previous {
+            match previous {
+                Some(value) => std::env::set_var(key, value),
+                None => std::env::remove_var(key),
+            }
+        }
+    }
+}
 
 struct DiffFixture {
     tempdir: TempDir,
@@ -88,7 +120,9 @@ fn fixture_contents(file: &str, version: &str) -> String {
 }
 
 fn git(repo: &Path, args: impl IntoIterator<Item = impl AsRef<std::ffi::OsStr>>) {
-    let status = Command::new("git")
+    let mut command = Command::new("git");
+    scrub_git_environment(&mut command);
+    let status = command
         .args(args)
         .current_dir(repo)
         .status()
@@ -97,7 +131,9 @@ fn git(repo: &Path, args: impl IntoIterator<Item = impl AsRef<std::ffi::OsStr>>)
 }
 
 fn git_output(repo: &Path, args: impl IntoIterator<Item = impl AsRef<std::ffi::OsStr>>) -> String {
-    let output = Command::new("git")
+    let mut command = Command::new("git");
+    scrub_git_environment(&mut command);
+    let output = command
         .args(args)
         .current_dir(repo)
         .output()
@@ -107,6 +143,18 @@ fn git_output(repo: &Path, args: impl IntoIterator<Item = impl AsRef<std::ffi::O
         "git fixture command should succeed"
     );
     String::from_utf8(output.stdout).expect("fixture git output should be UTF-8")
+}
+
+fn scrub_git_environment(command: &mut Command) {
+    for (key, _) in std::env::vars_os() {
+        if key
+            .to_string_lossy()
+            .to_ascii_uppercase()
+            .starts_with("GIT_")
+        {
+            command.env_remove(key);
+        }
+    }
 }
 
 #[cfg(feature = "headroom-compression")]
@@ -204,6 +252,37 @@ fn range_rejects_option_like_revisions_before_git_executes() {
         !output_path.exists(),
         "git must not receive an output option"
     );
+}
+
+#[test]
+fn review_diff_ignores_inherited_git_repository_and_config_overrides() {
+    let _env = GIT_ENV_MUTEX.lock().expect("git env lock");
+    let intended = fixture();
+    let hostile = tempfile::tempdir().expect("hostile repo");
+    git(hostile.path(), ["init"]);
+    git(
+        hostile.path(),
+        ["config", "user.email", "hostile@example.test"],
+    );
+    git(hostile.path(), ["config", "user.name", "Hostile Git Test"]);
+    std::fs::write(hostile.path().join("hostile.txt"), "hostile\n").expect("write hostile");
+    git(hostile.path(), ["add", "."]);
+    git(hostile.path(), ["commit", "-m", "hostile"]);
+    let expected = intended.source();
+    let hostile_git_dir = hostile.path().join(".git");
+    let _overrides = ScopedEnvVars::set(&[
+        ("GIT_DIR", hostile_git_dir.to_string_lossy().as_ref()),
+        ("GIT_WORK_TREE", hostile.path().to_string_lossy().as_ref()),
+        ("GIT_CONFIG_COUNT", "1"),
+        ("GIT_CONFIG_KEY_0", "core.quotePath"),
+        ("GIT_CONFIG_VALUE_0", "false"),
+    ]);
+
+    let expanded = expand_review_diff(&intended.request(), "alpha.txt", None)
+        .expect("request repo must win over inherited Git overrides");
+    assert!(expected.contains(&expanded));
+    assert!(expanded.contains("alpha.txt section 1 head changed payload"));
+    assert!(!expanded.contains("hostile"));
 }
 
 #[cfg(feature = "headroom-compression")]
@@ -310,6 +389,57 @@ fn binary_header_path_with_b_component_remains_exact_without_markers() {
         expanded,
         expand_review_diff(&request, binary_path, None).expect("live expansion")
     );
+}
+
+#[cfg(feature = "headroom-compression")]
+#[test]
+fn header_only_rename_with_spaces_uses_the_new_path() {
+    let fixture = fixture();
+    let old_path = "old name.txt";
+    let new_path = "new name.txt";
+    std::fs::write(
+        fixture.tempdir.path().join(old_path),
+        "same rename content\n",
+    )
+    .expect("write rename source");
+    git(fixture.tempdir.path(), ["add", old_path]);
+    git(
+        fixture.tempdir.path(),
+        ["commit", "-m", "add rename source"],
+    );
+    let old_head = git_output(fixture.tempdir.path(), ["rev-parse", "HEAD"])
+        .trim()
+        .to_owned();
+    git(fixture.tempdir.path(), ["mv", old_path, new_path]);
+    std::fs::write(
+        fixture.tempdir.path().join("alpha.txt"),
+        fixture_contents("alpha.txt", "rename"),
+    )
+    .expect("write enough range diff for compression");
+    git(fixture.tempdir.path(), ["add", "alpha.txt"]);
+    git(fixture.tempdir.path(), ["commit", "-m", "rename source"]);
+    let request = ReviewDiffRequest::range(
+        fixture.tempdir.path(),
+        old_head,
+        git_output(fixture.tempdir.path(), ["rev-parse", "HEAD"]).trim(),
+    );
+    let artifact = build_review_diff(&request).expect("artifact should compress");
+
+    assert!(artifact.files.iter().any(|file| file.path == new_path));
+    let expanded = artifact
+        .expand(new_path, None)
+        .expect("rename expansion by new path");
+    assert!(expanded.starts_with("diff --git "));
+    assert!(
+        expanded.contains("old name.txt"),
+        "rename expansion: {expanded}"
+    );
+    assert!(
+        expanded.contains("new name.txt"),
+        "rename expansion: {expanded}"
+    );
+    assert!(!expanded.contains("+++ "));
+    assert!(expand_review_diff(&request, old_path, None).is_err());
 }
 
 #[cfg(feature = "headroom-compression")]
