@@ -329,9 +329,25 @@ The `headroom-compression` Cargo feature is disabled by default. It pins
 `headroom-core` from `https://github.com/headroomlabs-ai/headroom.git` at the
 immutable revision `5bd2266f16bb351a7a7334e1c29c598d28187b1d`; the reviewed
 source is Apache-2.0 per its [pinned upstream LICENSE](https://github.com/headroomlabs-ai/headroom/blob/5bd2266f16bb351a7a7334e1c29c598d28187b1d/LICENSE).
-This foundation does not compress MCP responses, collab output, diffs, or
-failure logs. Future work must explicitly enable and implement compression for
-MCP responses, collab output, diffs, and failure logs.
+Build the optional artifact command when a review workflow can use it:
+
+```bash
+cargo build --features headroom-compression
+```
+
+With that build, `ironmem review-diff --repo <repo> --base <base> --head <head>`
+prints a compact indexed review artifact. Review prompts use it only when it
+succeeds and actually shrinks the input; errors, a feature-off build, and a
+non-improving artifact fall back to the normal raw diff. Expand a selected
+source hunk without retaining the entire raw diff:
+
+```bash
+ironmem review-diff --repo <repo> --base <base> --head <head> \
+  --expand-file <path> --hunk <ordinal>
+```
+
+This feature currently targets review-diff ingestion; it does not compress MCP
+responses, collab output, or failure logs.
 
 ### Security and permissions
 
@@ -917,10 +933,23 @@ python3 scripts/collab_baseline.py check \
   --report docs/BENCHMARKS/fixtures/issue-212-reference-report.json
 ```
 
+To capture a collab report plus review-artifact compression evidence, pass one
+or more repeatable `--review-artifact PHASE=PATH` values. The artifact footer
+records source/artifact bytes and estimated tokens; capture rejects malformed,
+negative, or non-shrinking profiles.
+
+```bash
+python3 scripts/collab_baseline.py capture \
+  --session <session-id> --output /tmp/collab-baseline.json \
+  --review-artifact global_review=/tmp/global-review-diff.txt
+```
+
 It validates the report schema, requires every baseline `(harness, tool)`
 distribution to be present, and fails closed on malformed p95 values or a
-relative p95 increase above the baseline threshold. The committed reference is
-MCP-response sizing only; it is not a workflow token or savings claim. See
+relative p95 increase above the baseline threshold. Review-artifact profiles
+are recorded beside that report data for repeatable measurement; they are not a
+workflow token or savings claim. The committed reference is MCP-response sizing
+only. See
 [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md#mcp-response-baseline-issue-212) for
 the provenance and the no-measured-phase-data limitation.
 

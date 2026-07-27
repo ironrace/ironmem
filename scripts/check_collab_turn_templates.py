@@ -28,6 +28,28 @@ CODEX_PROMPTS = [
         "collab-batch-impl.md",
     )
 ]
+REVIEW_DIFF_FALLBACK_SURFACES = {
+    ROOT / ".codex-plugin" / "prompts" / "collab-global-review.md": [
+        "ironmem review-diff --repo <repo_path> --base <base_sha> --head <last_head_sha>",
+        "only on success",
+        "git diff <base_sha>..<last_head_sha>",
+        "--expand-file <path> --hunk <ordinal>",
+    ],
+    PROMPTS / "collab-turn-review-local.md": [
+        "ironmem review-diff --repo <repo_path> --base <base_sha> --head <last_head_sha>",
+        "only on success",
+        "git diff <base_sha>..<last_head_sha>",
+        "--expand-file <path> --hunk <ordinal>",
+    ],
+    ROOT / ".claude-plugin" / "commands" / "ultrareview-local.md": [
+        "ironmem review-diff --repo <repo_path> --base <baseRefName> --head <headRefName>",
+        "ironmem review-diff --repo <repo_path> --worktree",
+        "only on success",
+        "gh pr diff <N>",
+        "git diff HEAD",
+        "--expand-file <path> --hunk <ordinal>",
+    ],
+}
 
 ALLOWED_PLACEHOLDERS = {"SESSION_ID", "REPO_PATH", "BRANCH", "TOPIC",
                         "ARTIFACT_REF", "ARTIFACT_HASH", "MODE"}
@@ -281,6 +303,13 @@ def check_evaluate_issue_surfaces() -> None:
                     f"snippet {snippet!r}")
 
 
+def check_review_diff_fallback_contract() -> None:
+    """Keep every review entrypoint artifact-first with a raw fallback."""
+    for path, snippets in REVIEW_DIFF_FALLBACK_SURFACES.items():
+        if not path.exists() or any(snippet not in path.read_text() for snippet in snippets):
+            err(f"{path.relative_to(ROOT)}: missing review-diff fallback contract")
+
+
 def err(msg: str) -> None:
     errors.append(msg)
 
@@ -518,6 +547,7 @@ def main() -> int:
 
     check_failure_prefixes()
     check_evaluate_issue_surfaces()
+    check_review_diff_fallback_contract()
 
     if errors:
         print("collab-turn template lint FAILED:")

@@ -583,6 +583,20 @@ The shared required set is:
 Codex also receives `pr-review-toolkit`, which `/collab` uses during the
 `CodeReviewFixGlobalPending` / `review_fix_global` turn before Codex fans
 confirmed fixes out to subagents and Claude's `/ultrareview-local` audit runs.
+For compact review artifacts, build the CLI with:
+
+```bash
+cargo build --features headroom-compression
+```
+
+The global review prompt attempts `ironmem review-diff --repo <repo> --base
+<base> --head <head>` first, injects its output only on success, and keeps the
+existing raw `git diff` as its error/feature-off/non-improving fallback. The
+artifact is indexed: inspect a selected source hunk with `--expand-file <path>
+--hunk <ordinal>` and continue independently reading changed source and callers.
+Use repeatable `scripts/collab_baseline.py capture --review-artifact
+PHASE=PATH` flags beside `ironmem report --json` to record its stable
+source/artifact byte and token footer.
 
 Existing identical files are skipped. The installer records hidden packaged
 baselines under each target root's `.ironmem-bases/` directory; on later
