@@ -47,12 +47,14 @@ def report_fixture(p95: int = 20) -> dict:
     }
 
 
-def review_artifact_fixture(source_bytes: int = 10_000) -> str:
+def review_artifact_fixture(
+    source_bytes: int = 10_000, compressed_payload: str = "compressed payload"
+) -> str:
     """Render the stable artifact shape while solving its byte-count fixed point."""
     prefix = (
         "review-diff source index\nfile: src/example.rs\n"
         "  src/example.rs#hunk-1: @@ -1 +1 @@\n\n"
-        "review-diff compressed body\ncompressed payload\n"
+        f"review-diff compressed body\n{compressed_payload}\n"
         "review-diff metrics\n"
     )
     artifact_bytes = 0
@@ -63,7 +65,7 @@ def review_artifact_fixture(source_bytes: int = 10_000) -> str:
             f"source_estimated_tokens={math.ceil(source_bytes / 4)}\n"
             f"artifact_estimated_tokens={math.ceil(artifact_bytes / 4)}\n"
         )
-        actual_bytes = len(rendered)
+        actual_bytes = len(rendered.encode("utf-8"))
         if actual_bytes == artifact_bytes:
             return rendered
         artifact_bytes = actual_bytes
@@ -107,6 +109,23 @@ class CollabBaselineTests(unittest.TestCase):
             "source_estimated_tokens": 2_500,
             "artifact_estimated_tokens": math.ceil(len(review_artifact_fixture()) / 4),
         }])
+
+    def test_build_baseline_accepts_non_ascii_review_artifact_byte_metrics(self):
+        with tempfile.TemporaryDirectory() as directory:
+            artifact = Path(directory) / "réview-Δ.txt"
+            body = review_artifact_fixture(compressed_payload="πayload 🚀")
+            artifact.write_text(body, encoding="utf-8")
+            baseline = build_baseline(
+                report_fixture(), session_id="session-1", prompt_specs=[],
+                review_artifact_specs=[("global_review", artifact)],
+                captured_at="2026-07-22T12:00:00Z", threshold=0.2,
+            )
+
+        profile = baseline["review_diff_artifacts"][0]
+        self.assertEqual(profile["file"], "réview-Δ.txt")
+        self.assertEqual(profile["artifact_bytes"], len(body.encode("utf-8")))
+        self.assertEqual(profile["artifact_estimated_tokens"],
+                         math.ceil(len(body.encode("utf-8")) / 4))
 
     def test_build_baseline_rejects_forged_review_artifact_marker_stub(self):
         with tempfile.TemporaryDirectory() as directory:

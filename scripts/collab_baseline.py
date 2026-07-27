@@ -282,7 +282,7 @@ def _validate_review_artifact_render(
     )
     if footer != expected_footer:
         raise BaselineError("review artifact shape has a noncanonical footer")
-    actual_bytes = len(text)
+    actual_bytes = len(text.encode("utf-8"))
     if metrics["artifact_bytes"] != actual_bytes:
         raise BaselineError("review artifact artifact_bytes does not match content")
     if metrics["artifact_estimated_tokens"] != math.ceil(actual_bytes / 4):
