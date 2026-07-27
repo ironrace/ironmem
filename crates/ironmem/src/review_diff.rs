@@ -420,9 +420,13 @@ fn parse_quoted_git_path(value: &str) -> Option<(String, &str)> {
                 consumed += escaped.len_utf8();
                 match escaped {
                     '"' | '\\' => path.push(escaped),
+                    'a' => path.push('\u{7}'),
+                    'b' => path.push('\u{8}'),
+                    'f' => path.push('\u{c}'),
                     't' => path.push('\t'),
                     'n' => path.push('\n'),
                     'r' => path.push('\r'),
+                    'v' => path.push('\u{b}'),
                     'x' => {
                         let first = characters.next()?;
                         let second = characters.next()?;
@@ -570,5 +574,23 @@ mod tests {
         );
 
         assert_eq!(parsed[0].public.path, "space name.txt");
+    }
+
+    #[test]
+    fn parser_decodes_all_git_c_style_control_escapes() {
+        let parsed = parse_unified_diff(
+            r#"diff --git "a/bell\a back\b form\f vertical\v.txt" "b/bell\a back\b form\f vertical\v.txt"
+--- "a/bell\a back\b form\f vertical\v.txt"
++++ "b/bell\a back\b form\f vertical\v.txt"
+@@ -1 +1 @@
+-old
++new
+"#,
+        );
+
+        assert_eq!(
+            parsed[0].public.path,
+            "bell\u{7} back\u{8} form\u{c} vertical\u{b}.txt"
+        );
     }
 }

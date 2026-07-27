@@ -349,3 +349,38 @@ fn newline_path_selectors_are_escaped_and_reversible() {
         .expect("rendered selector should select the original hunk");
     assert!(expanded.contains("head newline content"));
 }
+
+#[cfg(feature = "headroom-compression")]
+#[test]
+fn control_character_path_is_escaped_and_expands_from_its_selector() {
+    let fixture = fixture();
+    let special_path = "bell\u{7}file.txt";
+    let special_file = fixture.tempdir.path().join(special_path);
+    std::fs::write(&special_file, "base bell content\n").expect("write bell base");
+    git(
+        fixture.tempdir.path(),
+        vec!["add".to_owned(), special_path.to_owned()],
+    );
+    git(fixture.tempdir.path(), ["commit", "-m", "add bell path"]);
+    std::fs::write(&special_file, "head bell content\n").expect("write bell head");
+    std::fs::write(
+        fixture.tempdir.path().join("alpha.txt"),
+        fixture_contents("alpha.txt", "worktree"),
+    )
+    .expect("write enough worktree diff for compression");
+    let artifact = build_review_diff(&ReviewDiffRequest::worktree(fixture.tempdir.path()))
+        .expect("artifact should compress");
+    let file = artifact
+        .files
+        .iter()
+        .find(|file| file.path == special_path)
+        .expect("bell path should retain exact identity");
+    let selector = &file.hunks[0].selector;
+
+    assert_eq!(selector, "\"bell\\x07file.txt\"#hunk-1");
+    assert!(artifact.rendered.contains(selector));
+    assert!(artifact
+        .expand(selector, None)
+        .expect("control selector expansion")
+        .contains("head bell content"));
+}
