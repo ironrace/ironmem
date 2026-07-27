@@ -323,6 +323,16 @@ lockfile — no separate process manager, cron job, or `kill` required.
 | `IRONMEM_DAEMON_IDLE_SECS` | `300` | Seconds of zero active connections before the daemon shuts itself down. |
 | `IRONMEM_NO_DAEMON` | unset (auto-spawn **enabled**) | Any value other than empty/`0`/`false`/`no` disables auto-spawn — `--connect` then behaves as if `--no-autospawn` were passed. |
 
+### Optional compression foundation
+
+The `headroom-compression` Cargo feature is disabled by default. It pins
+`headroom-core` from `https://github.com/headroomlabs-ai/headroom.git` at the
+immutable revision `5bd2266f16bb351a7a7334e1c29c598d28187b1d`; the reviewed
+source is Apache-2.0 per its [pinned upstream LICENSE](https://github.com/headroomlabs-ai/headroom/blob/5bd2266f16bb351a7a7334e1c29c598d28187b1d/LICENSE).
+This foundation does not compress MCP responses, collab output, diffs, or
+failure logs. Future work must explicitly enable and implement compression for
+MCP responses, collab output, diffs, and failure logs.
+
 ### Security and permissions
 
 - The socket is created with **owner-only permissions (`0600`)** — no other

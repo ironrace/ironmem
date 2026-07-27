@@ -182,8 +182,11 @@ jobs:
 
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32  # v2
 
-      - name: cargo package workspace
-        run: cargo package --workspace
+      # `ironmem`'s optional `headroom-compression` feature depends on an
+      # unpublished git crate, so Cargo cannot verify its registry archive.
+      # Continue archive verification for every publishable workspace crate.
+      - name: cargo package publishable workspace crates
+        run: cargo package --workspace --exclude ironmem
 
   plugin-metadata:
     name: Plugin Metadata
