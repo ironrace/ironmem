@@ -258,10 +258,37 @@ def _review_artifact_metric(text: str, key: str) -> int:
 
 
 def _review_artifact_footer(text: str) -> str:
-    marker = "review-diff metrics\n"
-    if text.count(marker) != 1:
-        raise BaselineError("review artifact metrics footer is missing or duplicated")
-    return text.split(marker, 1)[1]
+    """Return a verified final footer from the deterministic render contract."""
+    title = "review-diff source index\n"
+    body_marker = "\nreview-diff compressed body\n"
+    footer_marker = "\nreview-diff metrics\n"
+    if not text.startswith(title):
+        raise BaselineError("review artifact shape is missing its source index title")
+    body_start = text.find(body_marker)
+    footer_start = text.rfind(footer_marker)
+    if body_start < len(title) or footer_start < body_start + len(body_marker):
+        raise BaselineError("review artifact shape is missing compressed body or footer")
+    return text[footer_start + len(footer_marker):]
+
+
+def _validate_review_artifact_render(
+    text: str, footer: str, metrics: dict[str, int]
+) -> None:
+    expected_footer = (
+        f"source_bytes={metrics['source_bytes']}\n"
+        f"artifact_bytes={metrics['artifact_bytes']}\n"
+        f"source_estimated_tokens={metrics['source_estimated_tokens']}\n"
+        f"artifact_estimated_tokens={metrics['artifact_estimated_tokens']}\n"
+    )
+    if footer != expected_footer:
+        raise BaselineError("review artifact shape has a noncanonical footer")
+    actual_bytes = len(text)
+    if metrics["artifact_bytes"] != actual_bytes:
+        raise BaselineError("review artifact artifact_bytes does not match content")
+    if metrics["artifact_estimated_tokens"] != math.ceil(actual_bytes / 4):
+        raise BaselineError("review artifact artifact_estimated_tokens does not match content")
+    if metrics["source_estimated_tokens"] != math.ceil(metrics["source_bytes"] / 4):
+        raise BaselineError("review artifact source_estimated_tokens is inconsistent")
 
 
 def _review_artifact_profile(
@@ -283,6 +310,7 @@ def _review_artifact_profile(
             )
             for key in _REVIEW_ARTIFACT_METRIC_KEYS
         }
+        _validate_review_artifact_render(text, footer, metrics)
         if metrics["artifact_bytes"] >= metrics["source_bytes"]:
             raise BaselineError("review artifact metrics must be smaller than source")
         profiles.append({"phase": phase, "file": path.name, **metrics})

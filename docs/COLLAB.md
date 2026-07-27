@@ -1474,7 +1474,10 @@ before each coding-active `collab_send`:
   attempts the same range artifact before `gh pr diff <N>` and its worktree
   mode attempts `ironmem review-diff --repo <repo_path> --worktree` before
   `git diff HEAD`; raw output is used only on error, feature-off, or
-  nonbeneficial artifact. Claude
+  nonbeneficial artifact. For conditional-reviewer trigger detection,
+  `/ultrareview-local` also keeps a full raw diff only transiently, never
+  injects or repeats it in reviewer prompts, then discards it after dispatch.
+  Claude
   independently verifies the synthesized findings, groups confirmed
   CRITICAL/HIGH/MEDIUM findings into non-overlapping fix clusters, uses
   temporary worktrees on unique throwaway branches plus parallel fix subagents

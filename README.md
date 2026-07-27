@@ -339,7 +339,7 @@ With that build, `ironmem review-diff --repo <repo> --base <base> --head <head>`
 prints a compact indexed review artifact. Review prompts use it only when it
 succeeds and actually shrinks the input; errors, a feature-off build, and a
 non-improving artifact fall back to the normal raw diff. Expand a selected
-source hunk without retaining the entire raw diff:
+source hunk without retaining the entire raw diff as reviewer context:
 
 ```bash
 ironmem review-diff --repo <repo> --base <base> --head <head> \

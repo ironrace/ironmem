@@ -50,6 +50,11 @@ REVIEW_DIFF_FALLBACK_SURFACES = {
         "--expand-file <path> --hunk <ordinal>",
     ],
 }
+REVIEW_DIFF_TRIGGER_DETECTION_SNIPPETS = [
+    "Preserve the full raw diff transiently for deterministic trigger detection",
+    "Do not inject or repeat that raw diff in reviewer prompts",
+    "must not treat the lossy artifact as the\nsole classifier",
+]
 
 ALLOWED_PLACEHOLDERS = {"SESSION_ID", "REPO_PATH", "BRANCH", "TOPIC",
                         "ARTIFACT_REF", "ARTIFACT_HASH", "MODE"}
@@ -310,6 +315,18 @@ def check_review_diff_fallback_contract() -> None:
             err(f"{path.relative_to(ROOT)}: missing review-diff fallback contract")
 
 
+def check_review_diff_trigger_detection_contract() -> None:
+    """Conditional reviewer selection needs raw source, never lossy summaries."""
+    path = ROOT / ".claude-plugin" / "commands" / "ultrareview-local.md"
+    if not path.exists():
+        err(f"{path.relative_to(ROOT)}: missing review-diff trigger-detection contract")
+        return
+    text = path.read_text()
+    # PR and worktree modes each need the raw-detection-only boundary.
+    if any(text.count(snippet) < 2 for snippet in REVIEW_DIFF_TRIGGER_DETECTION_SNIPPETS):
+        err(f"{path.relative_to(ROOT)}: missing review-diff trigger-detection contract")
+
+
 def err(msg: str) -> None:
     errors.append(msg)
 
@@ -548,6 +565,7 @@ def main() -> int:
     check_failure_prefixes()
     check_evaluate_issue_surfaces()
     check_review_diff_fallback_contract()
+    check_review_diff_trigger_detection_contract()
 
     if errors:
         print("collab-turn template lint FAILED:")

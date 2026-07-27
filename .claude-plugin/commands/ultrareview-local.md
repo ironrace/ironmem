@@ -36,6 +36,12 @@ or a nonbeneficial artifact, discard its output and use the exact existing raw
 fallback `gh pr diff <N>`. Do not retain the full raw diff when the artifact
 succeeds. Diff range for agents: `<baseRefName>...<headRefName>`. If PR not
 found → stop.
+Preserve the full raw diff transiently for deterministic trigger detection with
+`gh pr diff <N>`, even when the compact artifact succeeds: conditional-reviewer
+triggers need full source coverage and must not treat the lossy artifact as the
+sole classifier. Do not inject or repeat that raw diff in reviewer prompts;
+discard it after selecting the conditional reviewers. The compact artifact
+remains the review context (or the raw fallback when no artifact is available).
 Record whether the local working tree is at the PR head: `git rev-parse HEAD` vs `headRefOid`. If they differ, Phase 4 validation must be `n/a (working tree ≠ PR head)` — never run tests on a different tree and present the result as the PR's.
 
 **Local Mode:**
@@ -54,6 +60,12 @@ Inject its compact stdout **only on success**. On error, unavailable feature,
 or a nonbeneficial artifact, discard its output and use the exact existing raw
 fallback `git diff HEAD`. Do not retain the full raw diff when the artifact
 succeeds. If empty → stop: "Nothing to review."
+Preserve the full raw diff transiently for deterministic trigger detection with
+`git diff HEAD`, even when the compact artifact succeeds: conditional-reviewer
+triggers need full source coverage and must not treat the lossy artifact as the
+sole classifier. Do not inject or repeat that raw diff in reviewer prompts;
+discard it after selecting the conditional reviewers. The compact artifact
+remains the review context (or the raw fallback when no artifact is available).
 
 Record title, file list, additions/deletions, draft flag, and the selected
 review input. The compact artifact's index supports exact source expansion:
@@ -83,10 +95,11 @@ input plus paths is enough; let the agents inspect source independently.
 
 ### Trigger detection (before dispatch)
 
-Grep the selected review input (artifact normally, raw fallback only) for
-conditional-agent triggers. When the artifact is insufficient to classify a
-trigger, expand its indexed file/hunk or inspect that source directly; do not
-retain a whole raw diff solely for trigger detection.
+Grep the transient full raw diff (not the compact artifact) for conditional-
+agent triggers, so every trigger sees complete source coverage. Do not inject
+or retain that raw detection input after dispatch; the compact artifact remains
+the reviewer context. Expand an indexed file/hunk or inspect source directly
+when detail is needed.
 
 | Agent | Grep the diff for |
 |---|---|
