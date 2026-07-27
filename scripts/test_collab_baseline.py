@@ -65,6 +65,93 @@ class CollabBaselineTests(unittest.TestCase):
         self.assertEqual(baseline["codex_dispatch_prompts"][0]["estimated_tokens"], 5)
         self.assertEqual(baseline["mcp_response_distributions"][0]["p95_output_tokens"], 20)
 
+    def test_build_baseline_records_a_review_artifact_profile(self):
+        with tempfile.TemporaryDirectory() as directory:
+            artifact = Path(directory) / "global-review.txt"
+            artifact.write_text(
+                "review-diff source index\n\nreview-diff metrics\n"
+                "source_bytes=200\nartifact_bytes=80\n"
+                "source_estimated_tokens=50\nartifact_estimated_tokens=20\n",
+                encoding="utf-8",
+            )
+            baseline = build_baseline(
+                report_fixture(),
+                session_id="session-1",
+                prompt_specs=[],
+                review_artifact_specs=[("global_review", artifact)],
+                captured_at="2026-07-22T12:00:00Z",
+                threshold=0.2,
+            )
+
+        self.assertEqual(baseline["review_diff_artifacts"], [{
+            "phase": "global_review", "file": "global-review.txt",
+            "source_bytes": 200, "artifact_bytes": 80,
+            "source_estimated_tokens": 50, "artifact_estimated_tokens": 20,
+        }])
+
+    def test_build_baseline_rejects_malformed_review_artifact_metrics(self):
+        with tempfile.TemporaryDirectory() as directory:
+            artifact = Path(directory) / "bad.txt"
+            artifact.write_text("review-diff metrics\nsource_bytes=200\n", encoding="utf-8")
+            with self.assertRaisesRegex(BaselineError, "review artifact metrics"):
+                build_baseline(
+                    report_fixture(), session_id="session-1", prompt_specs=[],
+                    review_artifact_specs=[("global_review", artifact)],
+                    captured_at="2026-07-22T12:00:00Z", threshold=0.2,
+                )
+
+    def test_build_baseline_rejects_nonimproving_review_artifact(self):
+        with tempfile.TemporaryDirectory() as directory:
+            artifact = Path(directory) / "bad.txt"
+            artifact.write_text(
+                "review-diff metrics\nsource_bytes=80\nartifact_bytes=80\n"
+                "source_estimated_tokens=20\nartifact_estimated_tokens=20\n",
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(BaselineError, "must be smaller"):
+                build_baseline(
+                    report_fixture(), session_id="session-1", prompt_specs=[],
+                    review_artifact_specs=[("global_review", artifact)],
+                    captured_at="2026-07-22T12:00:00Z", threshold=0.2,
+                )
+
+    def test_build_baseline_preserves_repeated_review_artifact_profiles(self):
+        with tempfile.TemporaryDirectory() as directory:
+            first = Path(directory) / "first.txt"
+            second = Path(directory) / "second.txt"
+            body = ("review-diff metrics\nsource_bytes=200\nartifact_bytes=80\n"
+                    "source_estimated_tokens=50\nartifact_estimated_tokens=20\n")
+            first.write_text(body, encoding="utf-8")
+            second.write_text(body, encoding="utf-8")
+            baseline = build_baseline(
+                report_fixture(), session_id="session-1", prompt_specs=[],
+                review_artifact_specs=[("review", first), ("review", second)],
+                captured_at="2026-07-22T12:00:00Z", threshold=0.2,
+            )
+
+        self.assertEqual([item["phase"] for item in baseline["review_diff_artifacts"]],
+                         ["review", "review"])
+
+    def test_capture_cli_accepts_review_artifact(self):
+        with tempfile.TemporaryDirectory() as directory:
+            report_path = Path(directory) / "report.json"
+            output_path = Path(directory) / "baseline.json"
+            artifact = Path(directory) / "artifact.txt"
+            report_path.write_text(json.dumps(report_fixture()), encoding="utf-8")
+            artifact.write_text(
+                "review-diff metrics\nsource_bytes=200\nartifact_bytes=80\n"
+                "source_estimated_tokens=50\nartifact_estimated_tokens=20\n",
+                encoding="utf-8",
+            )
+            result = main([
+                "capture", "--session", "session-1", "--report", str(report_path),
+                "--output", str(output_path), "--review-artifact",
+                f"review={artifact}", "--captured-at", "2026-07-22T12:00:00Z",
+            ])
+            self.assertEqual(result, 0)
+            baseline = json.loads(output_path.read_text(encoding="utf-8"))
+        self.assertEqual(baseline["review_diff_artifacts"][0]["artifact_bytes"], 80)
+
     def test_check_passes_at_threshold(self):
         baseline = build_baseline(
             report_fixture(),
