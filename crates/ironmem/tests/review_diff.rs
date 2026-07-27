@@ -444,6 +444,123 @@ fn header_only_rename_with_spaces_uses_the_new_path() {
 
 #[cfg(feature = "headroom-compression")]
 #[test]
+fn header_only_rename_with_embedded_b_component_uses_new_path() {
+    let fixture = fixture();
+    let old_path = "foo b/old.txt";
+    let new_path = "new name.txt";
+    let old_file = fixture.tempdir.path().join(old_path);
+    std::fs::create_dir_all(old_file.parent().expect("rename parent")).expect("make rename parent");
+    std::fs::write(&old_file, "same embedded rename content\n").expect("write rename source");
+    git(
+        fixture.tempdir.path(),
+        vec!["add".to_owned(), old_path.to_owned()],
+    );
+    git(
+        fixture.tempdir.path(),
+        ["commit", "-m", "add embedded rename source"],
+    );
+    let old_head = git_output(fixture.tempdir.path(), ["rev-parse", "HEAD"])
+        .trim()
+        .to_owned();
+    git(fixture.tempdir.path(), ["mv", old_path, new_path]);
+    std::fs::write(
+        fixture.tempdir.path().join("alpha.txt"),
+        fixture_contents("alpha.txt", "embedded-rename"),
+    )
+    .expect("write enough range diff for compression");
+    git(fixture.tempdir.path(), ["add", "alpha.txt"]);
+    git(
+        fixture.tempdir.path(),
+        ["commit", "-m", "rename embedded source"],
+    );
+    let request = ReviewDiffRequest::range(
+        fixture.tempdir.path(),
+        old_head,
+        git_output(fixture.tempdir.path(), ["rev-parse", "HEAD"]).trim(),
+    );
+    let artifact = build_review_diff(&request).expect("artifact should compress");
+
+    assert!(artifact.files.iter().any(|file| file.path == new_path));
+    let expanded = artifact
+        .expand(new_path, None)
+        .expect("rename expansion by exact new path");
+    assert!(expanded.starts_with("diff --git "));
+    assert!(expanded.contains("rename to new name.txt"));
+    assert!(!expanded.contains("+++ "));
+    assert!(expand_review_diff(&request, old_path, None).is_err());
+}
+
+#[cfg(feature = "headroom-compression")]
+#[test]
+fn review_diff_disables_repository_textconv_drivers() {
+    let fixture = fixture();
+    let marker = fixture.tempdir.path().join("textconv-ran");
+    let script = fixture.tempdir.path().join("hostile-textconv.sh");
+    std::fs::write(
+        &script,
+        format!("#!/bin/sh\nprintf invoked > '{}'\n", marker.display()),
+    )
+    .expect("write textconv script");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut permissions = std::fs::metadata(&script)
+            .expect("textconv metadata")
+            .permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&script, permissions).expect("make textconv executable");
+    }
+    std::fs::write(
+        fixture.tempdir.path().join(".gitattributes"),
+        "converted.txt diff=hostile\n",
+    )
+    .expect("write attributes");
+    std::fs::write(
+        fixture.tempdir.path().join("converted.txt"),
+        "base converted content\n",
+    )
+    .expect("write converted base");
+    git(
+        fixture.tempdir.path(),
+        ["add", ".gitattributes", "converted.txt"],
+    );
+    git(
+        fixture.tempdir.path(),
+        ["commit", "-m", "configure hostile textconv"],
+    );
+    git(
+        fixture.tempdir.path(),
+        [
+            "config",
+            "diff.hostile.textconv",
+            script.to_string_lossy().as_ref(),
+        ],
+    );
+    std::fs::write(
+        fixture.tempdir.path().join("converted.txt"),
+        "head converted content\n",
+    )
+    .expect("write converted head");
+    std::fs::write(
+        fixture.tempdir.path().join("alpha.txt"),
+        fixture_contents("alpha.txt", "textconv"),
+    )
+    .expect("write enough worktree diff for compression");
+    let request = ReviewDiffRequest::worktree(fixture.tempdir.path());
+
+    let artifact = build_review_diff(&request).expect("artifact should compress");
+    let expanded = expand_review_diff(&request, "converted.txt", None)
+        .expect("source expansion remains available without textconv");
+    assert!(artifact
+        .files
+        .iter()
+        .any(|file| file.path == "converted.txt"));
+    assert!(expanded.contains("head converted content"));
+    assert!(!marker.exists(), "repository textconv must not execute");
+}
+
+#[cfg(feature = "headroom-compression")]
+#[test]
 fn newline_path_selectors_are_escaped_and_reversible() {
     let fixture = fixture();
     let special_path = "line\nbreak.txt";

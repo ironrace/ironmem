@@ -227,7 +227,7 @@ fn read_source(request: &ReviewDiffRequest) -> Result<String, MemoryError> {
     let mut command = Command::new("git");
     scrub_git_environment(&mut command);
     command.current_dir(&request.repo);
-    command.args(["diff", "--no-ext-diff", "--unified=3"]);
+    command.args(["diff", "--no-ext-diff", "--no-textconv", "--unified=3"]);
     match &request.source {
         ReviewDiffSource::Range { base, head } => {
             validate_revision(base, "base")?;
@@ -357,7 +357,14 @@ fn stable_path(lines: &[&str]) -> Option<String> {
         })
     };
 
-    from_marker("+++ ")
+    lines
+        .iter()
+        .find_map(|line| {
+            line.strip_prefix("rename to ")
+                .and_then(parse_marker_path)
+                .and_then(|path| normalize_git_path(&path))
+        })
+        .or_else(|| from_marker("+++ "))
         .or_else(|| from_marker("--- "))
         .or_else(|| lines.first().and_then(|line| parse_diff_header_path(line)))
 }
@@ -398,7 +405,6 @@ fn take_git_path_token(value: &str) -> Option<(String, &str)> {
 
 fn parse_unquoted_diff_header_paths(value: &str) -> Option<(String, String)> {
     let mut candidate_start = 0;
-    let mut fallback = None;
     while let Some(offset) = value[candidate_start..].find(" b/") {
         let separator = candidate_start + offset;
         let old_path = &value[..separator];
@@ -409,11 +415,10 @@ fn parse_unquoted_diff_header_paths(value: &str) -> Option<(String, String)> {
             if old_relative == new_relative {
                 return Some((old_path.to_owned(), new_path.to_owned()));
             }
-            fallback.get_or_insert_with(|| (old_path.to_owned(), new_path.to_owned()));
         }
         candidate_start = separator + 1;
     }
-    fallback
+    None
 }
 
 fn normalize_git_path(path: &str) -> Option<String> {
