@@ -98,6 +98,37 @@ fn fixture() -> DiffFixture {
     }
 }
 
+fn minimal_fixture() -> DiffFixture {
+    let tempdir = tempfile::tempdir().expect("minimal temp repo");
+    git(tempdir.path(), ["init"]);
+    git(
+        tempdir.path(),
+        ["config", "user.email", "review-diff@example.test"],
+    );
+    git(tempdir.path(), ["config", "user.name", "Review Diff Test"]);
+
+    let path = tempdir.path().join("tiny.txt");
+    std::fs::write(&path, "base\n").expect("write minimal base");
+    git(tempdir.path(), ["add", "tiny.txt"]);
+    git(tempdir.path(), ["commit", "-m", "base"]);
+    let base = git_output(tempdir.path(), ["rev-parse", "HEAD"])
+        .trim()
+        .to_owned();
+
+    std::fs::write(&path, "head\n").expect("write minimal head");
+    git(tempdir.path(), ["add", "tiny.txt"]);
+    git(tempdir.path(), ["commit", "-m", "head"]);
+    let head = git_output(tempdir.path(), ["rev-parse", "HEAD"])
+        .trim()
+        .to_owned();
+
+    DiffFixture {
+        tempdir,
+        base,
+        head,
+    }
+}
+
 fn fixture_contents(file: &str, version: &str) -> String {
     (1..=12)
         .flat_map(|ordinal| {
@@ -816,6 +847,46 @@ fn cli_review_diff_expands_the_requested_hunk_from_its_new_artifact() {
     assert!(stdout.starts_with("diff --git a/beta.txt b/beta.txt\n"));
     assert!(stdout.contains("beta.txt section 7 head changed payload"));
     assert!(!stdout.contains("beta.txt section 8 head changed payload"));
+}
+
+#[cfg(feature = "headroom-compression")]
+#[test]
+fn cli_review_diff_expands_a_noncompressible_range_without_building_an_artifact() {
+    let fixture = minimal_fixture();
+    let normal = review_diff_command(&fixture)
+        .output()
+        .expect("review-diff CLI should start");
+    assert!(!normal.status.success());
+    assert!(String::from_utf8_lossy(&normal.stderr).contains("did not reduce ingestion size"));
+
+    let file = review_diff_command(&fixture)
+        .arg("--expand-file")
+        .arg("tiny.txt")
+        .output()
+        .expect("review-diff file expansion should start");
+    assert!(
+        file.status.success(),
+        "feature-on file expansion failed: {}",
+        String::from_utf8_lossy(&file.stderr)
+    );
+    let stdout = String::from_utf8(file.stdout).expect("CLI stdout should be UTF-8");
+    assert!(stdout.starts_with("diff --git a/tiny.txt b/tiny.txt\n"));
+    assert!(stdout.contains("+head\n"));
+
+    let hunk = review_diff_command(&fixture)
+        .arg("--expand-file")
+        .arg("tiny.txt")
+        .arg("--hunk")
+        .arg("1")
+        .output()
+        .expect("review-diff hunk expansion should start");
+    assert!(
+        hunk.status.success(),
+        "feature-on hunk expansion failed: {}",
+        String::from_utf8_lossy(&hunk.stderr)
+    );
+    let stdout = String::from_utf8(hunk.stdout).expect("CLI stdout should be UTF-8");
+    assert!(stdout.contains("+head\n"));
 }
 
 #[test]
