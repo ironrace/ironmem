@@ -682,6 +682,50 @@ fn review_diff_command(fixture: &DiffFixture) -> Command {
 }
 
 #[cfg(feature = "headroom-compression")]
+fn review_diff_default_repo_command(fixture: &DiffFixture) -> Command {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_ironmem"));
+    scrub_git_environment(&mut command);
+    command
+        .arg("review-diff")
+        .current_dir(fixture.tempdir.path());
+    command
+}
+
+#[cfg(not(feature = "headroom-compression"))]
+fn build_no_feature_review_diff_binary() -> (TempDir, std::path::PathBuf) {
+    let target_dir = tempfile::tempdir().expect("isolated Cargo target directory");
+    let manifest = Path::new(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml");
+    let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
+    let mut build = Command::new(cargo);
+    scrub_git_environment(&mut build);
+    let output = build
+        .arg("build")
+        .arg("--manifest-path")
+        .arg(manifest)
+        .arg("--package")
+        .arg("ironmem")
+        .arg("--bin")
+        .arg("ironmem")
+        .arg("--no-default-features")
+        .env("CARGO_TARGET_DIR", target_dir.path())
+        .output()
+        .expect("isolated no-feature ironmem build should start");
+    assert!(
+        output.status.success(),
+        "isolated no-feature ironmem build failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let binary = target_dir.path().join("debug").join(if cfg!(windows) {
+        "ironmem.exe"
+    } else {
+        "ironmem"
+    });
+    assert!(binary.is_file(), "isolated binary should exist: {binary:?}");
+    (target_dir, binary)
+}
+
+#[cfg(feature = "headroom-compression")]
 #[test]
 fn cli_review_diff_renders_the_compressed_range_artifact() {
     let fixture = fixture();
@@ -699,6 +743,41 @@ fn cli_review_diff_renders_the_compressed_range_artifact() {
     assert!(stdout.contains("alpha.txt#hunk-1"));
     assert!(stdout.contains("review-diff metrics"));
     assert!(stdout.contains("source_bytes="));
+}
+
+#[cfg(feature = "headroom-compression")]
+#[test]
+fn cli_review_diff_uses_the_current_fixture_repo_by_default() {
+    let fixture = fixture();
+    let range = review_diff_default_repo_command(&fixture)
+        .arg("--base")
+        .arg(&fixture.base)
+        .arg("--head")
+        .arg(&fixture.head)
+        .output()
+        .expect("review-diff CLI should start");
+    assert!(
+        range.status.success(),
+        "default-repo range failed: {}",
+        String::from_utf8_lossy(&range.stderr)
+    );
+    assert!(String::from_utf8_lossy(&range.stdout).contains("alpha.txt#hunk-1"));
+
+    std::fs::write(
+        fixture.tempdir.path().join("alpha.txt"),
+        fixture_contents("alpha.txt", "worktree"),
+    )
+    .expect("write worktree fixture");
+    let worktree = review_diff_default_repo_command(&fixture)
+        .arg("--worktree")
+        .output()
+        .expect("review-diff CLI should start");
+    assert!(
+        worktree.status.success(),
+        "default-repo worktree failed: {}",
+        String::from_utf8_lossy(&worktree.stderr)
+    );
+    assert!(String::from_utf8_lossy(&worktree.stdout).contains("alpha.txt#hunk-1"));
 }
 
 #[cfg(feature = "headroom-compression")]
@@ -748,11 +827,44 @@ fn cli_review_diff_rejects_incomplete_or_conflicting_sources() {
     assert!(stderr.contains("worktree") && stderr.contains("base"));
 }
 
+#[test]
+fn cli_review_diff_requires_an_expansion_file_and_positive_hunk_ordinal() {
+    let fixture = fixture();
+
+    let missing_file = review_diff_command(&fixture)
+        .arg("--hunk")
+        .arg("1")
+        .output()
+        .expect("review-diff CLI should start");
+    assert!(!missing_file.status.success());
+    assert!(String::from_utf8_lossy(&missing_file.stderr).contains("expand-file"));
+
+    let zero_hunk = review_diff_command(&fixture)
+        .arg("--expand-file")
+        .arg("alpha.txt")
+        .arg("--hunk")
+        .arg("0")
+        .output()
+        .expect("review-diff CLI should start");
+    assert!(!zero_hunk.status.success());
+    assert!(String::from_utf8_lossy(&zero_hunk.stderr).contains("one-based"));
+}
+
 #[cfg(not(feature = "headroom-compression"))]
 #[test]
 fn cli_review_diff_reports_the_optional_feature_requirement() {
     let fixture = fixture();
-    let output = review_diff_command(&fixture)
+    let (_target_dir, binary) = build_no_feature_review_diff_binary();
+    let mut command = Command::new(binary);
+    scrub_git_environment(&mut command);
+    let output = command
+        .arg("review-diff")
+        .arg("--repo")
+        .arg(fixture.tempdir.path())
+        .arg("--base")
+        .arg(&fixture.base)
+        .arg("--head")
+        .arg(&fixture.head)
         .output()
         .expect("review-diff CLI should start");
 
