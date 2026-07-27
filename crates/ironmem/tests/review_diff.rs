@@ -725,6 +725,21 @@ fn build_no_feature_review_diff_binary() -> (TempDir, std::path::PathBuf) {
     (target_dir, binary)
 }
 
+#[cfg(not(feature = "headroom-compression"))]
+fn no_feature_review_diff_command(binary: &Path, fixture: &DiffFixture) -> Command {
+    let mut command = Command::new(binary);
+    scrub_git_environment(&mut command);
+    command
+        .arg("review-diff")
+        .arg("--repo")
+        .arg(fixture.tempdir.path())
+        .arg("--base")
+        .arg(&fixture.base)
+        .arg("--head")
+        .arg(&fixture.head);
+    command
+}
+
 #[cfg(feature = "headroom-compression")]
 #[test]
 fn cli_review_diff_renders_the_compressed_range_artifact() {
@@ -852,22 +867,43 @@ fn cli_review_diff_requires_an_expansion_file_and_positive_hunk_ordinal() {
 
 #[cfg(not(feature = "headroom-compression"))]
 #[test]
-fn cli_review_diff_reports_the_optional_feature_requirement() {
+fn cli_review_diff_without_compression_supports_expansion_only() {
     let fixture = fixture();
     let (_target_dir, binary) = build_no_feature_review_diff_binary();
-    let mut command = Command::new(binary);
-    scrub_git_environment(&mut command);
-    let output = command
-        .arg("review-diff")
-        .arg("--repo")
-        .arg(fixture.tempdir.path())
-        .arg("--base")
-        .arg(&fixture.base)
-        .arg("--head")
-        .arg(&fixture.head)
+    let output = no_feature_review_diff_command(&binary, &fixture)
         .output()
         .expect("review-diff CLI should start");
 
     assert!(!output.status.success());
     assert!(String::from_utf8_lossy(&output.stderr).contains("headroom-compression"));
+
+    let file = no_feature_review_diff_command(&binary, &fixture)
+        .arg("--expand-file")
+        .arg("alpha.txt")
+        .output()
+        .expect("review-diff file expansion should start");
+    assert!(
+        file.status.success(),
+        "feature-off file expansion failed: {}",
+        String::from_utf8_lossy(&file.stderr)
+    );
+    let stdout = String::from_utf8(file.stdout).expect("CLI stdout should be UTF-8");
+    assert!(stdout.starts_with("diff --git a/alpha.txt b/alpha.txt\n"));
+    assert!(stdout.contains("alpha.txt section 12 head changed payload"));
+
+    let hunk = no_feature_review_diff_command(&binary, &fixture)
+        .arg("--expand-file")
+        .arg("beta.txt")
+        .arg("--hunk")
+        .arg("7")
+        .output()
+        .expect("review-diff hunk expansion should start");
+    assert!(
+        hunk.status.success(),
+        "feature-off hunk expansion failed: {}",
+        String::from_utf8_lossy(&hunk.stderr)
+    );
+    let stdout = String::from_utf8(hunk.stdout).expect("CLI stdout should be UTF-8");
+    assert!(stdout.contains("beta.txt section 7 head changed payload"));
+    assert!(!stdout.contains("beta.txt section 8 head changed payload"));
 }
