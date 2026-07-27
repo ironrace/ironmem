@@ -98,6 +98,7 @@ fn fixture() -> DiffFixture {
     }
 }
 
+#[cfg(feature = "headroom-compression")]
 fn minimal_fixture() -> DiffFixture {
     let tempdir = tempfile::tempdir().expect("minimal temp repo");
     git(tempdir.path(), ["init"]);
