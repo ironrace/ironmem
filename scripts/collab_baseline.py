@@ -12,6 +12,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import re
 import subprocess
 import sys
 from datetime import datetime, timezone
@@ -231,6 +232,91 @@ def _prompt_profile(prompt_specs: Iterable[str | tuple[str, Path]]) -> list[dict
     return profiles
 
 
+_REVIEW_ARTIFACT_METRIC_KEYS = (
+    "source_bytes",
+    "artifact_bytes",
+    "source_estimated_tokens",
+    "artifact_estimated_tokens",
+)
+
+
+def _review_artifact_spec(spec: str) -> tuple[str, Path]:
+    phase, separator, raw_path = spec.partition("=")
+    if not separator or not phase or not raw_path:
+        raise BaselineError(f"review artifact must use PHASE=PATH, got {spec!r}")
+    path = Path(raw_path)
+    if not path.is_file():
+        raise BaselineError(f"review artifact does not exist: {path}")
+    return phase, path
+
+
+def _review_artifact_metric(text: str, key: str) -> int:
+    matches = re.findall(rf"(?m)^{re.escape(key)}=(\d+)$", text)
+    if len(matches) != 1:
+        raise BaselineError(f"review artifact metrics missing or duplicate {key}")
+    return int(matches[0])
+
+
+def _review_artifact_footer(text: str) -> str:
+    """Return a verified final footer from the deterministic render contract."""
+    title = "review-diff source index\n"
+    body_marker = "\nreview-diff compressed body\n"
+    footer_marker = "\nreview-diff metrics\n"
+    if not text.startswith(title):
+        raise BaselineError("review artifact shape is missing its source index title")
+    body_start = text.find(body_marker)
+    footer_start = text.rfind(footer_marker)
+    if body_start < len(title) or footer_start < body_start + len(body_marker):
+        raise BaselineError("review artifact shape is missing compressed body or footer")
+    return text[footer_start + len(footer_marker):]
+
+
+def _validate_review_artifact_render(
+    text: str, footer: str, metrics: dict[str, int]
+) -> None:
+    expected_footer = (
+        f"source_bytes={metrics['source_bytes']}\n"
+        f"artifact_bytes={metrics['artifact_bytes']}\n"
+        f"source_estimated_tokens={metrics['source_estimated_tokens']}\n"
+        f"artifact_estimated_tokens={metrics['artifact_estimated_tokens']}\n"
+    )
+    if footer != expected_footer:
+        raise BaselineError("review artifact shape has a noncanonical footer")
+    actual_bytes = len(text.encode("utf-8"))
+    if metrics["artifact_bytes"] != actual_bytes:
+        raise BaselineError("review artifact artifact_bytes does not match content")
+    if metrics["artifact_estimated_tokens"] != math.ceil(actual_bytes / 4):
+        raise BaselineError("review artifact artifact_estimated_tokens does not match content")
+    if metrics["source_estimated_tokens"] != math.ceil(metrics["source_bytes"] / 4):
+        raise BaselineError("review artifact source_estimated_tokens is inconsistent")
+
+
+def _review_artifact_profile(
+    artifact_specs: Iterable[str | tuple[str, Path]],
+) -> list[dict[str, Any]]:
+    profiles = []
+    for item in artifact_specs:
+        phase, path = item if isinstance(item, tuple) else _review_artifact_spec(item)
+        if not isinstance(phase, str) or not phase:
+            raise BaselineError("review artifact phase must be a non-empty string")
+        try:
+            text = path.read_text(encoding="utf-8")
+        except OSError as exc:
+            raise BaselineError(f"cannot read review artifact {path}: {exc}") from exc
+        footer = _review_artifact_footer(text)
+        metrics = {
+            key: _require_nonnegative_int(
+                _review_artifact_metric(footer, key), f"review artifact metrics.{key}"
+            )
+            for key in _REVIEW_ARTIFACT_METRIC_KEYS
+        }
+        _validate_review_artifact_render(text, footer, metrics)
+        if metrics["artifact_bytes"] >= metrics["source_bytes"]:
+            raise BaselineError("review artifact metrics must be smaller than source")
+        profiles.append({"phase": phase, "file": path.name, **metrics})
+    return profiles
+
+
 def build_baseline(
     report: dict[str, Any],
     *,
@@ -238,6 +324,7 @@ def build_baseline(
     prompt_specs: Iterable[str | tuple[str, Path]],
     captured_at: str,
     threshold: float,
+    review_artifact_specs: Iterable[str | tuple[str, Path]] = (),
 ) -> dict[str, Any]:
     threshold = _validate_threshold(threshold)
     task = _report_task(report, session_id)
@@ -267,6 +354,7 @@ def build_baseline(
         "phase_totals": phase_totals,
         "mcp_response_distributions": distributions,
         "codex_dispatch_prompts": _prompt_profile(prompt_specs),
+        "review_diff_artifacts": _review_artifact_profile(review_artifact_specs),
     }
 
 
@@ -414,6 +502,7 @@ def _capture(args: argparse.Namespace) -> int:
         report,
         session_id=args.session,
         prompt_specs=args.codex_prompt,
+        review_artifact_specs=args.review_artifact,
         captured_at=captured_at,
         threshold=args.threshold,
     )
@@ -444,6 +533,7 @@ def _parser() -> argparse.ArgumentParser:
     capture.add_argument("--ironmem-bin", default="ironmem")
     capture.add_argument("--db")
     capture.add_argument("--codex-prompt", action="append", default=[], metavar="PHASE=PATH")
+    capture.add_argument("--review-artifact", action="append", default=[], metavar="PHASE=PATH")
     capture.add_argument("--captured-at")
     capture.add_argument("--threshold", type=float, default=DEFAULT_THRESHOLD)
     capture.set_defaults(handler=_capture)

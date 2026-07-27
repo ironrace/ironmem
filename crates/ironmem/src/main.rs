@@ -1,6 +1,7 @@
 use clap::{Parser, Subcommand};
 use std::process;
 
+use ironmem::review_diff::{build_review_diff, expand_review_diff, ReviewDiffRequest};
 use ironmem::MemoryError;
 use ironmem::{
     bootstrap, config, context, dashboard, ingest, launcher, mcp, migrate, reembed, report,
@@ -164,6 +165,27 @@ enum Commands {
         /// Internal test hook: exit when stdin closes
         #[arg(long, hide = true)]
         exit_on_stdin_close: bool,
+    },
+    /// Build a compressed Git diff artifact or expand one of its indexed hunks
+    ReviewDiff {
+        /// Git repository containing the diff source
+        #[arg(long, default_value = ".")]
+        repo: String,
+        /// Diff uncommitted worktree changes relative to HEAD
+        #[arg(long, conflicts_with_all = ["base", "head"])]
+        worktree: bool,
+        /// Base revision for a merge-base range
+        #[arg(long, conflicts_with = "worktree")]
+        base: Option<String>,
+        /// Head revision for a merge-base range
+        #[arg(long, conflicts_with = "worktree")]
+        head: Option<String>,
+        /// Expand this indexed file instead of printing the compressed artifact
+        #[arg(long)]
+        expand_file: Option<String>,
+        /// One-based hunk ordinal within --expand-file
+        #[arg(long, requires = "expand_file")]
+        hunk: Option<usize>,
     },
     /// Build or query the local symbol/import graph index
     Symbols {
@@ -634,6 +656,35 @@ async fn run(cli: Cli) -> Result<(), MemoryError> {
                 model_dir: cfg.model_dir.clone(),
             };
             dashboard::run_dashboard(dash_cfg).await
+        }
+        Commands::ReviewDiff {
+            repo,
+            worktree,
+            base,
+            head,
+            expand_file,
+            hunk,
+        } => {
+            let request = match (worktree, base, head) {
+                (true, None, None) => ReviewDiffRequest::worktree(repo),
+                (false, Some(base), Some(head)) => ReviewDiffRequest::range(repo, base, head),
+                _ => {
+                    return Err(MemoryError::Validation(
+                        "review-diff source requires exactly --worktree or both --base <rev> --head <rev>"
+                            .into(),
+                    ));
+                }
+            };
+            if hunk == Some(0) {
+                return Err(MemoryError::Validation(
+                    "review-diff hunk ordinal must be one-based".into(),
+                ));
+            }
+            match expand_file {
+                Some(path) => print!("{}", expand_review_diff(&request, &path, hunk)?),
+                None => print!("{}", build_review_diff(&request)?.rendered),
+            }
+            Ok(())
         }
         Commands::Symbols { cmd } => {
             let cfg = config::Config::load(None)?;

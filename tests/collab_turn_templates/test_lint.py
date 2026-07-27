@@ -31,6 +31,60 @@ def test_lint_passes_on_repo():
     assert r.returncode == 0, f"lint failed:\n{r.stdout}\n{r.stderr}"
 
 
+def test_review_paths_prefer_artifact_and_preserve_raw_diff_fallback():
+    global_review = (ROOT / ".codex-plugin" / "prompts" /
+                     "collab-global-review.md").read_text()
+    local_review = (ROOT / ".claude-plugin" / "prompts" /
+                    "collab-turn-review-local.md").read_text()
+    ultra_review = (ROOT / ".claude-plugin" / "commands" /
+                    "ultrareview-local.md").read_text()
+
+    for surface in (global_review, local_review, ultra_review):
+        assert "ironmem review-diff" in surface
+        assert "--expand-file <path> --hunk <ordinal>" in surface
+        assert "git diff" in surface
+        assert "only on success" in surface
+
+    assert "--repo <repo_path> --base <base_sha> --head <last_head_sha>" in global_review
+    assert "--repo <repo_path> --base <base_sha> --head <last_head_sha>" in local_review
+    assert "gh pr diff <N>" in ultra_review
+    assert "--worktree" in ultra_review
+
+
+def test_ultrareview_uses_a_transient_raw_diff_for_complete_trigger_detection():
+    ultra_review = (ROOT / ".claude-plugin" / "commands" /
+                    "ultrareview-local.md").read_text()
+
+    assert "Preserve the full raw diff transiently for deterministic trigger detection" in ultra_review
+    assert "Do not inject or repeat that raw diff in reviewer prompts" in ultra_review
+
+
+def test_lint_requires_review_diff_fallback_contract(tmp_path):
+    fixture = copy_fixture(tmp_path)
+    prompt = fixture / ".codex-plugin" / "prompts" / "collab-global-review.md"
+    prompt.write_text(prompt.read_text().replace("only on success", "on success", 1))
+
+    r = run({"COLLAB_LINT_ROOT": str(fixture)})
+
+    assert r.returncode == 1
+    assert "missing review-diff fallback contract" in r.stdout
+
+
+def test_lint_requires_raw_trigger_detection_contract(tmp_path):
+    fixture = copy_fixture(tmp_path)
+    prompt = fixture / ".claude-plugin" / "commands" / "ultrareview-local.md"
+    prompt.write_text(prompt.read_text().replace(
+        "Preserve the full raw diff transiently for deterministic trigger detection",
+        "Use the diff for trigger detection",
+        1,
+    ))
+
+    r = run({"COLLAB_LINT_ROOT": str(fixture)})
+
+    assert r.returncode == 1
+    assert "missing review-diff trigger-detection contract" in r.stdout
+
+
 def test_plan_and_manifest_workers_use_verified_references():
     task_list = (ROOT / ".claude-plugin" / "prompts" / "collab-turn-task-list.md").read_text()
     batch = (ROOT / ".codex-plugin" / "prompts" / "collab-batch-impl.md").read_text()

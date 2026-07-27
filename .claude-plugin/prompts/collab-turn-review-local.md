@@ -36,7 +36,21 @@ the normal `review_local` (never a new `failure_report`).
 1. Pre-send harness: `git fetch`; `git cat-file -e <last_head_sha>^{commit}`
    (on miss → `failure_report` `branch_drift:...`); reset to `last_head_sha`
    (Codex pushed at `review_fix_global`); `cargo fmt --check` + `clippy -D warnings`.
-2. Run the overlap-mode audit before choosing depth:
+2. Prepare the normal review input before choosing depth. First attempt:
+   ```bash
+   ironmem review-diff --repo <repo_path> --base <base_sha> --head <last_head_sha>
+   ```
+   Inject its stdout **only on success**. On an error, unavailable feature, or
+   nonbeneficial artifact, discard that output and use the exact raw fallback
+   `git diff <base_sha>..<last_head_sha>`. Do not retain or inject a full raw
+   diff when the artifact succeeds. Use the artifact's index to select source
+   precisely when needed:
+   ```bash
+   ironmem review-diff --repo <repo_path> --base <base_sha> --head <last_head_sha> --expand-file <path> --hunk <ordinal>
+   ```
+   The artifact does not replace independent source inspection; read changed
+   files and relevant callers directly before confirming findings.
+3. Run the overlap-mode audit before choosing depth:
    - Find the preceding implementation head from collab status/event history
      (the `implementation_done.head_sha` immediately before `review_fix_global`).
    - If `last_head_sha` equals that implementation head, Codex made no fix commit:
@@ -46,28 +60,28 @@ the normal `review_local` (never a new `failure_report`).
      source, Cargo manifests, lockfile, migrations, or runtime assets), use
      `review_local=reduced`.
    - If either check is uncertain, use `review_local=full`.
-3. In `review_local=full`, run `/ultrareview-local` auditing Codex's commits +
+4. In `review_local=full`, run `/ultrareview-local` auditing Codex's commits +
    catching code-quality issues. Treat the review agents as read-only.
    Independently verify the synthesized findings and keep only confirmed
    CRITICAL/HIGH/MEDIUM issues.
-4. In `review_local=reduced`, do a targeted read-only audit of the diff summary,
+5. In `review_local=reduced`, do a targeted read-only audit of the diff summary,
    changed files, and Codex commits for protocol drift, docs/config breakage,
    generated metadata inconsistencies, and security-sensitive configuration. Do
    not invoke `/ultrareview-local` unless the reduced audit finds a substantive
    uncertainty or a CRITICAL/HIGH/MEDIUM issue.
-5. Group confirmed findings into non-overlapping fix clusters. For multiple
+6. Group confirmed findings into non-overlapping fix clusters. For multiple
    independent clusters, create one temporary worktree per cluster on a unique
    throwaway branch from the same review head and dispatch fix subagents in
    parallel. Give each subagent exactly one cluster, tell it not to touch
    unrelated files, and have it return or commit only that cluster's edits. If
    findings overlap or touch the same fragile code path, fix that cluster
    sequentially instead of forcing unsafe parallelism.
-6. Merge or cherry-pick the fix commits back onto the collab branch, resolve
+7. Merge or cherry-pick the fix commits back onto the collab branch, resolve
    conflicts, then commit + push the integrated result.
-7. Post-work gate: `cargo test --workspace` if fixes were committed or Rust/
+8. Post-work gate: `cargo test --workspace` if fixes were committed or Rust/
    runtime files changed; otherwise use pushed-head proof and the pre-send
    harness result as the gate evidence.
-8. `collab_send(sender="claude", topic="review_local",
+9. `collab_send(sender="claude", topic="review_local",
    content=<JSON {"head_sha":"<HEAD>"}>)`.
 
 ## Verdict

@@ -1,4 +1,5 @@
 import json
+import math
 import tempfile
 import unittest
 from pathlib import Path
@@ -46,6 +47,30 @@ def report_fixture(p95: int = 20) -> dict:
     }
 
 
+def review_artifact_fixture(
+    source_bytes: int = 10_000, compressed_payload: str = "compressed payload"
+) -> str:
+    """Render the stable artifact shape while solving its byte-count fixed point."""
+    prefix = (
+        "review-diff source index\nfile: src/example.rs\n"
+        "  src/example.rs#hunk-1: @@ -1 +1 @@\n\n"
+        f"review-diff compressed body\n{compressed_payload}\n"
+        "review-diff metrics\n"
+    )
+    artifact_bytes = 0
+    while True:
+        rendered = (
+            f"{prefix}source_bytes={source_bytes}\n"
+            f"artifact_bytes={artifact_bytes}\n"
+            f"source_estimated_tokens={math.ceil(source_bytes / 4)}\n"
+            f"artifact_estimated_tokens={math.ceil(artifact_bytes / 4)}\n"
+        )
+        actual_bytes = len(rendered.encode("utf-8"))
+        if actual_bytes == artifact_bytes:
+            return rendered
+        artifact_bytes = actual_bytes
+
+
 class CollabBaselineTests(unittest.TestCase):
     def test_build_baseline_records_phase_totals_and_prompt_sizes(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -64,6 +89,132 @@ class CollabBaselineTests(unittest.TestCase):
         self.assertEqual(baseline["codex_dispatch_prompts"][0]["chars"], 20)
         self.assertEqual(baseline["codex_dispatch_prompts"][0]["estimated_tokens"], 5)
         self.assertEqual(baseline["mcp_response_distributions"][0]["p95_output_tokens"], 20)
+
+    def test_build_baseline_records_a_review_artifact_profile(self):
+        with tempfile.TemporaryDirectory() as directory:
+            artifact = Path(directory) / "global-review.txt"
+            artifact.write_text(review_artifact_fixture(), encoding="utf-8")
+            baseline = build_baseline(
+                report_fixture(),
+                session_id="session-1",
+                prompt_specs=[],
+                review_artifact_specs=[("global_review", artifact)],
+                captured_at="2026-07-22T12:00:00Z",
+                threshold=0.2,
+            )
+
+        self.assertEqual(baseline["review_diff_artifacts"], [{
+            "phase": "global_review", "file": "global-review.txt",
+            "source_bytes": 10_000, "artifact_bytes": len(review_artifact_fixture()),
+            "source_estimated_tokens": 2_500,
+            "artifact_estimated_tokens": math.ceil(len(review_artifact_fixture()) / 4),
+        }])
+
+    def test_build_baseline_accepts_non_ascii_review_artifact_byte_metrics(self):
+        with tempfile.TemporaryDirectory() as directory:
+            artifact = Path(directory) / "réview-Δ.txt"
+            body = review_artifact_fixture(compressed_payload="πayload 🚀")
+            artifact.write_text(body, encoding="utf-8")
+            baseline = build_baseline(
+                report_fixture(), session_id="session-1", prompt_specs=[],
+                review_artifact_specs=[("global_review", artifact)],
+                captured_at="2026-07-22T12:00:00Z", threshold=0.2,
+            )
+
+        profile = baseline["review_diff_artifacts"][0]
+        self.assertEqual(profile["file"], "réview-Δ.txt")
+        self.assertEqual(profile["artifact_bytes"], len(body.encode("utf-8")))
+        self.assertEqual(profile["artifact_estimated_tokens"],
+                         math.ceil(len(body.encode("utf-8")) / 4))
+
+    def test_build_baseline_rejects_forged_review_artifact_marker_stub(self):
+        with tempfile.TemporaryDirectory() as directory:
+            artifact = Path(directory) / "forged.txt"
+            artifact.write_text(
+                "review-diff source index\nreview-diff metrics\n"
+                "source_bytes=200\nartifact_bytes=80\n"
+                "source_estimated_tokens=50\nartifact_estimated_tokens=20\n",
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(BaselineError, "review artifact shape|artifact_bytes"):
+                build_baseline(
+                    report_fixture(), session_id="session-1", prompt_specs=[],
+                    review_artifact_specs=[("global_review", artifact)],
+                    captured_at="2026-07-22T12:00:00Z", threshold=0.2,
+                )
+
+    def test_build_baseline_rejects_forged_review_artifact_content_metrics(self):
+        with tempfile.TemporaryDirectory() as directory:
+            artifact = Path(directory) / "forged-metrics.txt"
+            body = review_artifact_fixture()
+            artifact.write_text(
+                body.replace(f"artifact_bytes={len(body)}", "artifact_bytes=1", 1),
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(BaselineError, "artifact_bytes"):
+                build_baseline(
+                    report_fixture(), session_id="session-1", prompt_specs=[],
+                    review_artifact_specs=[("global_review", artifact)],
+                    captured_at="2026-07-22T12:00:00Z", threshold=0.2,
+                )
+
+    def test_build_baseline_rejects_truncated_review_artifact_footer(self):
+        with tempfile.TemporaryDirectory() as directory:
+            artifact = Path(directory) / "bad.txt"
+            artifact.write_text(
+                review_artifact_fixture().replace("artifact_bytes=", "bytes=", 1),
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(BaselineError, "review artifact metrics"):
+                build_baseline(
+                    report_fixture(), session_id="session-1", prompt_specs=[],
+                    review_artifact_specs=[("global_review", artifact)],
+                    captured_at="2026-07-22T12:00:00Z", threshold=0.2,
+                )
+
+    def test_build_baseline_rejects_nonimproving_review_artifact(self):
+        with tempfile.TemporaryDirectory() as directory:
+            artifact = Path(directory) / "bad.txt"
+            artifact.write_text(review_artifact_fixture(source_bytes=1), encoding="utf-8")
+            with self.assertRaisesRegex(BaselineError, "must be smaller"):
+                build_baseline(
+                    report_fixture(), session_id="session-1", prompt_specs=[],
+                    review_artifact_specs=[("global_review", artifact)],
+                    captured_at="2026-07-22T12:00:00Z", threshold=0.2,
+                )
+
+    def test_build_baseline_preserves_repeated_review_artifact_profiles(self):
+        with tempfile.TemporaryDirectory() as directory:
+            first = Path(directory) / "first.txt"
+            second = Path(directory) / "second.txt"
+            body = review_artifact_fixture()
+            first.write_text(body, encoding="utf-8")
+            second.write_text(body, encoding="utf-8")
+            baseline = build_baseline(
+                report_fixture(), session_id="session-1", prompt_specs=[],
+                review_artifact_specs=[("review", first), ("review", second)],
+                captured_at="2026-07-22T12:00:00Z", threshold=0.2,
+            )
+
+        self.assertEqual([item["phase"] for item in baseline["review_diff_artifacts"]],
+                         ["review", "review"])
+
+    def test_capture_cli_accepts_review_artifact(self):
+        with tempfile.TemporaryDirectory() as directory:
+            report_path = Path(directory) / "report.json"
+            output_path = Path(directory) / "baseline.json"
+            artifact = Path(directory) / "artifact.txt"
+            report_path.write_text(json.dumps(report_fixture()), encoding="utf-8")
+            artifact.write_text(review_artifact_fixture(), encoding="utf-8")
+            result = main([
+                "capture", "--session", "session-1", "--report", str(report_path),
+                "--output", str(output_path), "--review-artifact",
+                f"review={artifact}", "--captured-at", "2026-07-22T12:00:00Z",
+            ])
+            self.assertEqual(result, 0)
+            baseline = json.loads(output_path.read_text(encoding="utf-8"))
+        self.assertEqual(baseline["review_diff_artifacts"][0]["artifact_bytes"],
+                         len(review_artifact_fixture()))
 
     def test_check_passes_at_threshold(self):
         baseline = build_baseline(

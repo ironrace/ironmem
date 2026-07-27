@@ -45,6 +45,9 @@ pub mod symbol_graph;
 /// `ironmem doctor` — local setup diagnostics (issue #142).
 pub mod doctor;
 
+/// Deterministic review-diff artifacts and source-preserving expansion helpers.
+pub mod review_diff;
+
 /// One-command launchers for `claude` and `codex` (issue #143).
 pub mod launcher;
 

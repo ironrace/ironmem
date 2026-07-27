@@ -24,9 +24,24 @@ Runs four core specialist agents in parallel (code-reviewer, security-reviewer, 
 ```bash
 gh pr view <N> --json number,title,body,baseRefName,headRefName,headRefOid,changedFiles,additions,deletions,isDraft,mergeStateStatus
 gh pr diff <N> --name-only
-gh pr diff <N>            # full diff text — needed for trigger detection and agent briefs
 ```
-Diff range for agents: `<baseRefName>...<headRefName>`. If PR not found → stop.
+After resolving `<repo_path>`, `<baseRefName>`, and `<headRefName>`, attempt:
+
+```bash
+ironmem review-diff --repo <repo_path> --base <baseRefName> --head <headRefName>
+```
+
+Inject its compact stdout **only on success**. On error, unavailable feature,
+or a nonbeneficial artifact, discard its output and use the exact existing raw
+fallback `gh pr diff <N>`. Do not retain the full raw diff when the artifact
+succeeds. Diff range for agents: `<baseRefName>...<headRefName>`. If PR not
+found → stop.
+Preserve the full raw diff transiently for deterministic trigger detection with
+`gh pr diff <N>`, even when the compact artifact succeeds: conditional-reviewer
+triggers need full source coverage and must not treat the lossy artifact as the
+sole classifier. Do not inject or repeat that raw diff in reviewer prompts;
+discard it after selecting the conditional reviewers. The compact artifact
+remains the review context (or the raw fallback when no artifact is available).
 Record whether the local working tree is at the PR head: `git rev-parse HEAD` vs `headRefOid`. If they differ, Phase 4 validation must be `n/a (working tree ≠ PR head)` — never run tests on a different tree and present the result as the PR's.
 
 **Local Mode:**
@@ -34,11 +49,33 @@ Record whether the local working tree is at the PR head: `git rev-parse HEAD` vs
 git status --short
 git add -N . 2>/dev/null || true   # register untracked files as intent-to-add so new files appear in the diff
 git diff HEAD --name-only
-git diff HEAD                      # full diff text
 ```
-If empty → stop: "Nothing to review."
+First attempt:
 
-Record title, file list, additions/deletions, draft flag, and **keep the full diff text** — Phase 3 trigger detection greps it, and every agent brief references the same range. If >50 files or >2000 additions, warn — but the parallel split scales.
+```bash
+ironmem review-diff --repo <repo_path> --worktree
+```
+
+Inject its compact stdout **only on success**. On error, unavailable feature,
+or a nonbeneficial artifact, discard its output and use the exact existing raw
+fallback `git diff HEAD`. Do not retain the full raw diff when the artifact
+succeeds. If empty → stop: "Nothing to review."
+Preserve the full raw diff transiently for deterministic trigger detection with
+`git diff HEAD`, even when the compact artifact succeeds: conditional-reviewer
+triggers need full source coverage and must not treat the lossy artifact as the
+sole classifier. Do not inject or repeat that raw diff in reviewer prompts;
+discard it after selecting the conditional reviewers. The compact artifact
+remains the review context (or the raw fallback when no artifact is available).
+
+Record title, file list, additions/deletions, draft flag, and the selected
+review input. The compact artifact's index supports exact source expansion:
+
+```bash
+# PR range form (use --worktree instead of --base/--head in Local Mode)
+ironmem review-diff --repo <repo_path> --base <baseRefName> --head <headRefName> --expand-file <path> --hunk <ordinal>
+```
+
+If >50 files or >2000 additions, warn — but the parallel split scales.
 
 ---
 
@@ -49,7 +86,8 @@ Read only what the agents won't:
 2. PR body (intent, linked issues, test plan)
 3. Plan artifacts under `.claude/PRPs/plans/` or `docs/` matching the branch
 
-Do **not** pre-read the full contents of changed files — the Phase 1 diff text plus paths is enough; let the agents read files.
+Do **not** pre-read the full contents of changed files — the Phase 1 review
+input plus paths is enough; let the agents inspect source independently.
 
 ---
 
@@ -57,7 +95,11 @@ Do **not** pre-read the full contents of changed files — the Phase 1 diff text
 
 ### Trigger detection (before dispatch)
 
-Grep the **diff text** (not just filenames) for conditional-agent triggers:
+Grep the transient full raw diff (not the compact artifact) for conditional-
+agent triggers, so every trigger sees complete source coverage. Do not inject
+or retain that raw detection input after dispatch; the compact artifact remains
+the reviewer context. Expand an indexed file/hunk or inspect source directly
+when detail is needed.
 
 | Agent | Grep the diff for |
 |---|---|
@@ -72,7 +114,14 @@ Grep the **diff text** (not just filenames) for conditional-agent triggers:
 
 Dispatch the four core agents (A–D) in **a single message** (parallel tool calls), plus any triggered conditional agents (E–K) — all in that same message, since they're independent.
 
-**Shared inputs for every agent**: the diff range, the file list, the context summary, and the instruction to run `git diff <range>` (or `gh pr diff <N>`) themselves before reading whole files, so they review what changed rather than the whole codebase.
+**Shared inputs for every agent**: the diff range, file list, selected review
+input, context summary, and the instruction to inspect changed source and
+callers independently before reading whole files. When the compact artifact is
+in use, expand an indexed selection with `ironmem review-diff --repo
+<repo_path> --base <baseRefName> --head <headRefName> --expand-file <path>
+--hunk <ordinal>` (or the Local-Mode `--worktree` form); use a targeted `git
+diff <range> -- <path>` only when needed. They must review what changed rather
+than the whole codebase.
 
 **Shared output contract (include verbatim in every brief):**
 > Findings only, inline, grouped by severity (CRITICAL / HIGH / MEDIUM / LOW). Each finding: `file:line — issue — failure scenario — suggested fix`. The **failure scenario is mandatory for CRITICAL/HIGH**: state the concrete inputs or state that reach the code and the wrong behavior that results ("X called with empty list → index panic at line N"). A finding you cannot express as a failure scenario is at most MEDIUM. Report only findings you are >80% confident in; do not pad. Word budget: 600 words for diffs under ~400 changed lines, up to 1200 for larger diffs — when over budget, drop LOWs first, never CRITICALs.

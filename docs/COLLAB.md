@@ -1435,11 +1435,18 @@ before each coding-active `collab_send`:
   full gate run. The successful push from `review_local` is the gate evidence
   for this exact HEAD.
 - **Review + fix tooling** during Codex's `review_fix_global`:
-  `/pr-review-toolkit:review-pr` runs as the final Codex review pass
-  over the raw post-implementation diff, alongside the approved Superpowers
-  task markdown when available. The collab `base_sha` and `last_head_sha`
-  define the review target; Codex must not let the toolkit silently
-  substitute a different base branch. Codex treats the toolkit output as
+  `/pr-review-toolkit:review-pr` runs as the final Codex review pass over the
+  compact `ironmem review-diff --repo <repo_path> --base <base_sha> --head
+  <last_head_sha>` artifact alongside the approved Superpowers task markdown
+  when available. Codex injects that artifact only on success; an error,
+  feature-off build, or nonbeneficial artifact uses the exact raw fallback
+  `git diff <base_sha>..<last_head_sha>`. On artifact success it does not retain
+  or inject the complete raw diff. The artifact index supports focused source
+  reads with `--expand-file <path> --hunk <ordinal>`; reviewers still inspect
+  changed source and callers independently. Build this optional path with
+  `cargo build --features headroom-compression`. The collab `base_sha` and
+  `last_head_sha` define the review target; Codex must not let the toolkit
+  silently substitute a different base branch. Codex treats the toolkit output as
   a read-only finding pass, independently verifies findings, then groups
   confirmed branch-level issues into non-overlapping fix clusters. For
   multiple independent clusters, Codex creates one temporary worktree per
@@ -1463,7 +1470,14 @@ before each coding-active `collab_send`:
   Reduced mode still audits the diff summary, changed files, and Codex commits
   for protocol drift, docs/config breakage, generated metadata inconsistencies,
   and security-sensitive configuration, and escalates to full
-  `/ultrareview-local` on uncertainty or a substantive finding. Claude
+  `/ultrareview-local` on uncertainty or a substantive finding. Its PR mode
+  attempts the same range artifact before `gh pr diff <N>` and its worktree
+  mode attempts `ironmem review-diff --repo <repo_path> --worktree` before
+  `git diff HEAD`; raw output is used only on error, feature-off, or
+  nonbeneficial artifact. For conditional-reviewer trigger detection,
+  `/ultrareview-local` also keeps a full raw diff only transiently, never
+  injects or repeats it in reviewer prompts, then discards it after dispatch.
+  Claude
   independently verifies the synthesized findings, groups confirmed
   CRITICAL/HIGH/MEDIUM findings into non-overlapping fix clusters, uses
   temporary worktrees on unique throwaway branches plus parallel fix subagents
@@ -1471,6 +1485,13 @@ before each coding-active `collab_send`:
   the collab branch, resolves conflicts, runs the required gates,
   commits/pushes the integrated result, and sends `review_local`. Overlapping
   or risky findings are fixed sequentially by the review worker.
+- **Review-artifact measurement:** capture the normal `ironmem report --json`
+  data with repeatable `python3 scripts/collab_baseline.py capture
+  --review-artifact PHASE=PATH` inputs after saving each successful artifact.
+  The stable footer records `source_bytes`, `artifact_bytes`,
+  `source_estimated_tokens`, and `artifact_estimated_tokens`; capture rejects
+  malformed or non-shrinking profiles, while repeated profiles are retained for
+  comparison.
 - **Shortcut ancestry validation** during shortcut-started
   `review_fix_global` and `review_local`: the server shells out narrowly
   to `git merge-base --is-ancestor` to distinguish a true descendant
