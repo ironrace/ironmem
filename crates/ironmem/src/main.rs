@@ -1,6 +1,8 @@
 use clap::{Parser, Subcommand};
 use std::process;
 
+#[cfg(not(feature = "headroom-compression"))]
+use ironmem::review_diff::expand_review_diff;
 use ironmem::review_diff::{build_review_diff, ReviewDiffRequest};
 use ironmem::MemoryError;
 use ironmem::{
@@ -680,10 +682,21 @@ async fn run(cli: Cli) -> Result<(), MemoryError> {
                     "review-diff hunk ordinal must be one-based".into(),
                 ));
             }
-            let artifact = build_review_diff(&request)?;
             match expand_file {
-                Some(path) => print!("{}", artifact.expand(&path, hunk)?),
-                None => print!("{}", artifact.rendered),
+                Some(path) => {
+                    #[cfg(feature = "headroom-compression")]
+                    {
+                        let artifact = build_review_diff(&request)?;
+                        print!("{}", artifact.expand(&path, hunk)?);
+                    }
+                    #[cfg(not(feature = "headroom-compression"))]
+                    {
+                        // No artifact exists without compression, but source
+                        // expansion remains available as the prompt fallback.
+                        print!("{}", expand_review_diff(&request, &path, hunk)?);
+                    }
+                }
+                None => print!("{}", build_review_diff(&request)?.rendered),
             }
             Ok(())
         }
