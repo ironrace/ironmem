@@ -90,15 +90,25 @@ pub struct ReviewDiffArtifact {
     pub files: Vec<ReviewDiffFile>,
     /// Byte and estimated-token measurements rendered in the artifact footer.
     pub metrics: ReviewDiffMetrics,
+    snapshot: Vec<ParsedFile>,
 }
 
-#[derive(Debug, Clone)]
+impl ReviewDiffArtifact {
+    /// Expands an original file section or hunk from this artifact's immutable
+    /// source snapshot. Unlike request-based expansion, this remains stable if
+    /// the worktree changes after the artifact is built.
+    pub fn expand(&self, path: &str, hunk: Option<usize>) -> Result<String, MemoryError> {
+        expand_parsed(&self.snapshot, path, hunk)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct ParsedHunk {
     public: ReviewDiffHunk,
     source: String,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct ParsedFile {
     public: ReviewDiffFile,
     preamble: String,
@@ -142,6 +152,7 @@ pub fn build_review_diff(request: &ReviewDiffRequest) -> Result<ReviewDiffArtifa
         rendered,
         files,
         metrics,
+        snapshot: parsed,
     })
 }
 
@@ -164,6 +175,14 @@ pub fn expand_review_diff(
 ) -> Result<String, MemoryError> {
     let source = read_source(request)?;
     let parsed = parse_unified_diff(&source);
+    expand_parsed(&parsed, path, hunk)
+}
+
+fn expand_parsed(
+    parsed: &[ParsedFile],
+    path: &str,
+    hunk: Option<usize>,
+) -> Result<String, MemoryError> {
     let file = parsed
         .iter()
         .find(|file| file.public.path == path)
@@ -192,10 +211,12 @@ fn read_source(request: &ReviewDiffRequest) -> Result<String, MemoryError> {
     command.args(["diff", "--no-ext-diff", "--unified=3"]);
     match &request.source {
         ReviewDiffSource::Range { base, head } => {
-            command.arg(format!("{base}...{head}"));
+            validate_revision(base, "base")?;
+            validate_revision(head, "head")?;
+            command.arg(format!("{base}...{head}")).arg("--");
         }
         ReviewDiffSource::Worktree => {
-            command.arg("HEAD");
+            command.arg("HEAD").arg("--");
         }
     }
 
@@ -214,6 +235,22 @@ fn read_source(request: &ReviewDiffRequest) -> Result<String, MemoryError> {
     String::from_utf8(output.stdout).map_err(|_| {
         MemoryError::Validation("review-diff git diff produced non-UTF-8 output".into())
     })
+}
+
+fn validate_revision(revision: &str, name: &str) -> Result<(), MemoryError> {
+    if revision.is_empty()
+        || revision.starts_with('-')
+        || revision.contains('\0')
+        || revision
+            .chars()
+            .any(|character| character.is_control() || character.is_whitespace())
+        || revision.contains("..")
+    {
+        return Err(MemoryError::Validation(format!(
+            "review-diff {name} revision is unsafe"
+        )));
+    }
+    Ok(())
 }
 
 fn parse_unified_diff(source: &str) -> Vec<ParsedFile> {
@@ -280,30 +317,93 @@ fn parse_file_section(lines: &[&str]) -> ParsedFile {
 fn stable_path(lines: &[&str]) -> Option<String> {
     let from_marker = |marker: &str| {
         lines.iter().find_map(|line| {
-            line.strip_prefix(marker).and_then(|path| {
-                let path = path.trim_end_matches(['\r', '\n']);
-                (!path.is_empty() && path != "/dev/null").then(|| {
-                    path.strip_prefix("a/")
-                        .or_else(|| path.strip_prefix("b/"))
-                        .unwrap_or(path)
-                        .to_owned()
-                })
-            })
+            line.strip_prefix(marker)
+                .and_then(parse_marker_path)
+                .and_then(|path| normalize_git_path(&path))
         })
     };
 
     from_marker("+++ ")
         .or_else(|| from_marker("--- "))
-        .or_else(|| {
-            lines.first().and_then(|line| {
-                let mut paths = line.strip_prefix("diff --git ")?.split_whitespace();
-                let _old = paths.next()?;
-                paths
-                    .next()
-                    .and_then(|path| path.strip_prefix("b/").or_else(|| path.strip_prefix("a/")))
-                    .map(str::to_owned)
-            })
-        })
+        .or_else(|| lines.first().and_then(parse_diff_header_path))
+}
+
+fn parse_marker_path(value: &str) -> Option<String> {
+    let value = value.trim_end_matches(['\r', '\n']);
+    if value.starts_with('"') {
+        parse_quoted_git_path(value).map(|(path, _)| path)
+    } else {
+        let path = value
+            .split_once('\t')
+            .map_or(value, |(path, _timestamp)| path);
+        (!path.is_empty()).then(|| path.to_owned())
+    }
+}
+
+fn parse_diff_header_path(line: &&str) -> Option<String> {
+    let value = line
+        .strip_prefix("diff --git ")?
+        .trim_end_matches(['\r', '\n']);
+    if value.starts_with('"') {
+        let (_, remaining) = parse_quoted_git_path(value)?;
+        let (path, _) = parse_quoted_git_path(remaining.trim_start())?;
+        return normalize_git_path(&path);
+    }
+
+    let path = value
+        .rfind(" b/")
+        .or_else(|| value.rfind(" a/"))
+        .map(|start| &value[start + 1..])?;
+    normalize_git_path(path)
+}
+
+fn normalize_git_path(path: &str) -> Option<String> {
+    (!path.is_empty() && path != "/dev/null").then(|| {
+        path.strip_prefix("a/")
+            .or_else(|| path.strip_prefix("b/"))
+            .unwrap_or(path)
+            .to_owned()
+    })
+}
+
+fn parse_quoted_git_path(value: &str) -> Option<(String, &str)> {
+    let mut characters = value.strip_prefix('"')?.chars();
+    let mut path = String::new();
+    let mut consumed = 1;
+    while let Some(character) = characters.next() {
+        consumed += character.len_utf8();
+        match character {
+            '"' => return Some((path, &value[consumed..])),
+            '\\' => {
+                let escaped = characters.next()?;
+                consumed += escaped.len_utf8();
+                match escaped {
+                    '"' | '\\' => path.push(escaped),
+                    't' => path.push('\t'),
+                    'n' => path.push('\n'),
+                    'r' => path.push('\r'),
+                    digit @ '0'..='7' => {
+                        let mut octal = String::from(digit);
+                        for _ in 0..2 {
+                            let next = characters.clone().next();
+                            match next {
+                                Some(next @ '0'..='7') => {
+                                    characters.next();
+                                    consumed += next.len_utf8();
+                                    octal.push(next);
+                                }
+                                _ => break,
+                            }
+                        }
+                        path.push(char::from(u8::from_str_radix(&octal, 8).ok()?));
+                    }
+                    other => path.push(other),
+                }
+            }
+            other => path.push(other),
+        }
+    }
+    None
 }
 
 #[cfg(feature = "headroom-compression")]
@@ -367,5 +467,17 @@ mod tests {
         assert_eq!(parsed[0].public.path, "new.txt");
         assert_eq!(parsed[0].public.hunks[0].selector, "new.txt#hunk-1");
         assert_eq!(estimated_tokens(5), 2);
+    }
+
+    #[test]
+    fn parser_preserves_spaces_and_discards_marker_timestamps() {
+        let parsed = parse_unified_diff(
+            "diff --git a/space name.txt b/space name.txt\n\
+             --- a/space name.txt\t2026-01-01\n\
+             +++ b/space name.txt\t2026-01-01\n\
+             @@ -1 +1 @@\n-old\n+new\n",
+        );
+
+        assert_eq!(parsed[0].public.path, "space name.txt");
     }
 }

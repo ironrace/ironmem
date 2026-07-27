@@ -186,3 +186,86 @@ fn worktree_constructor_selects_the_worktree_source() {
     let request = ReviewDiffRequest::worktree(fixture.tempdir.path());
     assert!(matches!(request.source, ReviewDiffSource::Worktree));
 }
+
+#[test]
+fn range_rejects_option_like_revisions_before_git_executes() {
+    let fixture = fixture();
+    let output_path = fixture.tempdir.path().join("review-diff-pwned");
+    let request = ReviewDiffRequest::range(
+        fixture.tempdir.path(),
+        format!("--output={}", output_path.display()),
+        &fixture.head,
+    );
+
+    let error = expand_review_diff(&request, "alpha.txt", None)
+        .expect_err("option-like revision must be rejected");
+    assert!(error.to_string().contains("revision"));
+    assert!(
+        !output_path.exists(),
+        "git must not receive an output option"
+    );
+}
+
+#[cfg(feature = "headroom-compression")]
+#[test]
+fn artifact_expansion_uses_the_immutable_worktree_snapshot() {
+    let fixture = fixture();
+    std::fs::write(
+        fixture.tempdir.path().join("alpha.txt"),
+        fixture_contents("alpha.txt", "snapshot"),
+    )
+    .expect("write dirty snapshot");
+    let request = ReviewDiffRequest::worktree(fixture.tempdir.path());
+    let artifact = build_review_diff(&request).expect("artifact should compress");
+
+    std::fs::write(
+        fixture.tempdir.path().join("alpha.txt"),
+        fixture_contents("alpha.txt", "later"),
+    )
+    .expect("mutate worktree after artifact");
+    let hunk = artifact
+        .expand("alpha.txt", Some(1))
+        .expect("snapshot hunk expansion");
+
+    assert!(hunk.contains("alpha.txt section 1 snapshot changed payload"));
+    assert!(!hunk.contains("alpha.txt section 1 later changed payload"));
+}
+
+#[cfg(feature = "headroom-compression")]
+#[test]
+fn space_and_tab_paths_have_exact_stable_selectors_and_expansions() {
+    let fixture = fixture();
+    let special_path = "space name\tfile.txt";
+    let special_file = fixture.tempdir.path().join(special_path);
+    std::fs::write(&special_file, "base special content\n").expect("write special base");
+    git(
+        fixture.tempdir.path(),
+        vec!["add".to_owned(), special_path.to_owned()],
+    );
+    git(fixture.tempdir.path(), ["commit", "-m", "add special path"]);
+    std::fs::write(&special_file, "head special content\n").expect("write special head");
+    std::fs::write(
+        fixture.tempdir.path().join("alpha.txt"),
+        fixture_contents("alpha.txt", "worktree"),
+    )
+    .expect("write enough worktree diff for compression");
+    let request = ReviewDiffRequest::worktree(fixture.tempdir.path());
+    let artifact = build_review_diff(&request).expect("artifact should compress");
+    let expected_selector = format!("{special_path}#hunk-1");
+
+    let file = artifact
+        .files
+        .iter()
+        .find(|file| file.path == special_path)
+        .expect("special path should be indexed exactly");
+    assert_eq!(file.hunks[0].selector, expected_selector);
+    assert!(artifact.rendered.contains(&expected_selector));
+
+    let artifact_hunk = artifact
+        .expand(special_path, Some(1))
+        .expect("artifact expansion by exact special path");
+    let request_hunk = expand_review_diff(&request, special_path, Some(1))
+        .expect("request expansion by exact special path");
+    assert!(artifact_hunk.contains("head special content"));
+    assert!(request_hunk.contains("head special content"));
+}
