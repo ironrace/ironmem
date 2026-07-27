@@ -20,7 +20,12 @@ impl DiffFixture {
     fn source(&self) -> String {
         git_output(
             self.tempdir.path(),
-            ["diff", "--no-ext-diff", "--unified=3", &format!("{}...{}", self.base, self.head)],
+            [
+                "diff",
+                "--no-ext-diff",
+                "--unified=3",
+                &format!("{}...{}", self.base, self.head),
+            ],
         )
     }
 }
@@ -28,7 +33,10 @@ impl DiffFixture {
 fn fixture() -> DiffFixture {
     let tempdir = tempfile::tempdir().expect("temp repo");
     git(tempdir.path(), ["init"]);
-    git(tempdir.path(), ["config", "user.email", "review-diff@example.test"]);
+    git(
+        tempdir.path(),
+        ["config", "user.email", "review-diff@example.test"],
+    );
     git(tempdir.path(), ["config", "user.name", "Review Diff Test"]);
 
     for file in ["alpha.txt", "beta.txt"] {
@@ -37,7 +45,9 @@ fn fixture() -> DiffFixture {
     }
     git(tempdir.path(), ["add", "."]);
     git(tempdir.path(), ["commit", "-m", "base"]);
-    let base = git_output(tempdir.path(), ["rev-parse", "HEAD"]).trim().to_owned();
+    let base = git_output(tempdir.path(), ["rev-parse", "HEAD"])
+        .trim()
+        .to_owned();
 
     for file in ["alpha.txt", "beta.txt"] {
         std::fs::write(tempdir.path().join(file), fixture_contents(file, "head"))
@@ -45,9 +55,15 @@ fn fixture() -> DiffFixture {
     }
     git(tempdir.path(), ["add", "."]);
     git(tempdir.path(), ["commit", "-m", "head"]);
-    let head = git_output(tempdir.path(), ["rev-parse", "HEAD"]).trim().to_owned();
+    let head = git_output(tempdir.path(), ["rev-parse", "HEAD"])
+        .trim()
+        .to_owned();
 
-    DiffFixture { tempdir, base, head }
+    DiffFixture {
+        tempdir,
+        base,
+        head,
+    }
 }
 
 fn fixture_contents(file: &str, version: &str) -> String {
@@ -57,7 +73,9 @@ fn fixture_contents(file: &str, version: &str) -> String {
                 format!("{file} section {ordinal} context one"),
                 format!("{file} section {ordinal} context two"),
                 format!("{file} section {ordinal} context three"),
-                format!("{file} section {ordinal} {version} changed payload repeated repeated repeated"),
+                format!(
+                    "{file} section {ordinal} {version} changed payload repeated repeated repeated"
+                ),
                 format!("{file} section {ordinal} context four"),
                 format!("{file} section {ordinal} context five"),
                 format!("{file} section {ordinal} context six"),
@@ -78,16 +96,16 @@ fn git(repo: &Path, args: impl IntoIterator<Item = impl AsRef<std::ffi::OsStr>>)
     assert!(status.success(), "git fixture setup should succeed");
 }
 
-fn git_output(
-    repo: &Path,
-    args: impl IntoIterator<Item = impl AsRef<std::ffi::OsStr>>,
-) -> String {
+fn git_output(repo: &Path, args: impl IntoIterator<Item = impl AsRef<std::ffi::OsStr>>) -> String {
     let output = Command::new("git")
         .args(args)
         .current_dir(repo)
         .output()
         .expect("git should start");
-    assert!(output.status.success(), "git fixture command should succeed");
+    assert!(
+        output.status.success(),
+        "git fixture command should succeed"
+    );
     String::from_utf8(output.stdout).expect("fixture git output should be UTF-8")
 }
 
@@ -99,14 +117,24 @@ fn compressed_artifact_indexes_every_source_file_and_hunk() {
 
     assert!(artifact.metrics.artifact_bytes < artifact.metrics.source_bytes);
     assert_eq!(artifact.files.len(), 2);
-    assert_eq!(artifact.files.iter().map(|file| file.hunks.len()).sum::<usize>(), 24);
+    assert_eq!(
+        artifact
+            .files
+            .iter()
+            .map(|file| file.hunks.len())
+            .sum::<usize>(),
+        24
+    );
     assert!(artifact.rendered.contains("alpha.txt"));
     assert!(artifact.rendered.contains("beta.txt"));
 
     for file in &artifact.files {
         assert!(artifact.rendered.contains(&file.path));
         for hunk in &file.hunks {
-            assert_eq!(hunk.selector, format!("{}#hunk-{}", file.path, hunk.ordinal));
+            assert_eq!(
+                hunk.selector,
+                format!("{}#hunk-{}", file.path, hunk.ordinal)
+            );
             assert!(artifact.rendered.contains(&hunk.header));
             assert!(artifact.rendered.contains(&hunk.selector));
         }
@@ -133,7 +161,11 @@ fn expansions_preserve_original_file_sections_and_selected_hunks() {
     assert!(hunk.contains("beta.txt section 7 base changed payload"));
     assert!(hunk.contains("beta.txt section 7 head changed payload"));
     assert!(!hunk.contains("beta.txt section 8 head changed payload"));
-    assert!(source.contains(&hunk));
+    let raw_hunk = hunk
+        .find("@@ ")
+        .map(|start| &hunk[start..])
+        .expect("expansion contains original hunk header");
+    assert!(source.contains(raw_hunk));
 
     assert!(expand_review_diff(&request, "missing.txt", None).is_err());
     assert!(expand_review_diff(&request, "alpha.txt", Some(0)).is_err());
