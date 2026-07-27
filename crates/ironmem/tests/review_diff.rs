@@ -514,3 +514,38 @@ fn control_character_path_is_escaped_and_expands_from_its_selector() {
         .expect("control selector expansion")
         .contains("head bell content"));
 }
+
+#[cfg(feature = "headroom-compression")]
+#[test]
+fn utf8_escaped_path_retains_unicode_identity_and_selector_expansion() {
+    let fixture = fixture();
+    let special_path = "é.txt";
+    let special_file = fixture.tempdir.path().join(special_path);
+    std::fs::write(&special_file, "base unicode content\n").expect("write unicode base");
+    git(
+        fixture.tempdir.path(),
+        vec!["add".to_owned(), special_path.to_owned()],
+    );
+    git(fixture.tempdir.path(), ["commit", "-m", "add unicode path"]);
+    std::fs::write(&special_file, "head unicode content\n").expect("write unicode head");
+    std::fs::write(
+        fixture.tempdir.path().join("alpha.txt"),
+        fixture_contents("alpha.txt", "worktree"),
+    )
+    .expect("write enough worktree diff for compression");
+    let artifact = build_review_diff(&ReviewDiffRequest::worktree(fixture.tempdir.path()))
+        .expect("artifact should compress");
+    let file = artifact
+        .files
+        .iter()
+        .find(|file| file.path == special_path)
+        .expect("unicode path should retain exact identity");
+    let selector = &file.hunks[0].selector;
+
+    assert_eq!(selector, "é.txt#hunk-1");
+    assert!(artifact.rendered.contains(selector));
+    assert!(artifact
+        .expand(selector, None)
+        .expect("unicode selector expansion")
+        .contains("head unicode content"));
+}

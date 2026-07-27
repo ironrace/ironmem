@@ -426,46 +426,48 @@ fn normalize_git_path(path: &str) -> Option<String> {
 }
 
 fn parse_quoted_git_path(value: &str) -> Option<(String, &str)> {
-    let mut characters = value.strip_prefix('"')?.chars();
-    let mut path = String::new();
-    let mut consumed = 1;
-    while let Some(character) = characters.next() {
-        consumed += character.len_utf8();
-        match character {
-            '"' => return Some((path, &value[consumed..])),
-            '\\' => {
-                let escaped = characters.next()?;
-                consumed += escaped.len_utf8();
+    let bytes = value.as_bytes();
+    (bytes.first() == Some(&b'"')).then_some(())?;
+    let mut index = 1;
+    let mut path = Vec::new();
+    while let Some(&byte) = bytes.get(index) {
+        index += 1;
+        match byte {
+            b'"' => {
+                return String::from_utf8(path)
+                    .ok()
+                    .map(|path| (path, &value[index..]))
+            }
+            b'\\' => {
+                let escaped = *bytes.get(index)?;
+                index += 1;
                 match escaped {
-                    '"' | '\\' => path.push(escaped),
-                    'a' => path.push('\u{7}'),
-                    'b' => path.push('\u{8}'),
-                    'f' => path.push('\u{c}'),
-                    't' => path.push('\t'),
-                    'n' => path.push('\n'),
-                    'r' => path.push('\r'),
-                    'v' => path.push('\u{b}'),
-                    'x' => {
-                        let first = characters.next()?;
-                        let second = characters.next()?;
-                        consumed += first.len_utf8() + second.len_utf8();
-                        let hex = format!("{first}{second}");
-                        path.push(char::from(u8::from_str_radix(&hex, 16).ok()?));
+                    b'"' | b'\\' => path.push(escaped),
+                    b'a' => path.push(0x07),
+                    b'b' => path.push(0x08),
+                    b'f' => path.push(0x0c),
+                    b't' => path.push(b'\t'),
+                    b'n' => path.push(b'\n'),
+                    b'r' => path.push(b'\r'),
+                    b'v' => path.push(0x0b),
+                    b'x' => {
+                        let first = *bytes.get(index)?;
+                        let second = *bytes.get(index + 1)?;
+                        index += 2;
+                        path.push(hex_byte(first, second)?);
                     }
-                    digit @ '0'..='7' => {
-                        let mut octal = String::from(digit);
+                    b'0'..=b'7' => {
+                        let mut octal = escaped - b'0';
                         for _ in 0..2 {
-                            let next = characters.clone().next();
-                            match next {
-                                Some(next @ '0'..='7') => {
-                                    characters.next();
-                                    consumed += next.len_utf8();
-                                    octal.push(next);
+                            match bytes.get(index) {
+                                Some(next @ b'0'..=b'7') => {
+                                    octal = octal.checked_mul(8)?.checked_add(*next - b'0')?;
+                                    index += 1;
                                 }
                                 _ => break,
                             }
                         }
-                        path.push(char::from(u8::from_str_radix(&octal, 8).ok()?));
+                        path.push(octal);
                     }
                     other => path.push(other),
                 }
@@ -474,6 +476,19 @@ fn parse_quoted_git_path(value: &str) -> Option<(String, &str)> {
         }
     }
     None
+}
+
+fn hex_byte(first: u8, second: u8) -> Option<u8> {
+    fn digit(byte: u8) -> Option<u8> {
+        match byte {
+            b'0'..=b'9' => Some(byte - b'0'),
+            b'a'..=b'f' => Some(byte - b'a' + 10),
+            b'A'..=b'F' => Some(byte - b'A' + 10),
+            _ => None,
+        }
+    }
+
+    digit(first)?.checked_mul(16)?.checked_add(digit(second)?)
 }
 
 fn render_path(path: &str) -> String {
@@ -619,5 +634,20 @@ mod tests {
         );
 
         assert_eq!(parsed[0].public.path, "new name.txt");
+    }
+
+    #[test]
+    fn parser_decodes_utf8_octal_bytes_as_one_character() {
+        let parsed = parse_unified_diff(
+            r#"diff --git "a/\303\251.txt" "b/\303\251.txt"
+--- "a/\303\251.txt"
++++ "b/\303\251.txt"
+@@ -1 +1 @@
+-old
++new
+"#,
+        );
+
+        assert_eq!(parsed[0].public.path, "é.txt");
     }
 }
