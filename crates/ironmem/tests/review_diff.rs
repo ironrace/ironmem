@@ -627,6 +627,19 @@ fn newline_path_selectors_are_escaped_and_reversible() {
         .expand(selector, None)
         .expect("rendered selector should select the original hunk");
     assert!(expanded.contains("head newline content"));
+    let quoted_path = "\"line\\nbreak.txt\"";
+    let file = artifact
+        .expand(quoted_path, None)
+        .expect("quoted file path should expand the full file section");
+    assert!(file.starts_with("diff --git "));
+    assert!(file.contains("head newline content"));
+    let live_file = expand_review_diff(
+        &ReviewDiffRequest::worktree(fixture.tempdir.path()),
+        quoted_path,
+        None,
+    )
+    .expect("live expansion should decode a quoted file path");
+    assert_eq!(live_file, file);
 }
 
 #[cfg(feature = "headroom-compression")]

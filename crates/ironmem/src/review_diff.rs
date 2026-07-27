@@ -220,6 +220,9 @@ fn resolve_expansion_target(
     if parsed.iter().any(|file| file.public.path == input) {
         return (input.to_owned(), None);
     }
+    if let Some(path) = decode_rendered_path(input) {
+        return (path, None);
+    }
     parse_rendered_selector(input).unwrap_or_else(|| (input.to_owned(), None))
 }
 
