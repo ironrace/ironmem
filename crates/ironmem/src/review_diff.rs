@@ -68,7 +68,7 @@ pub struct ReviewDiffHunk {
     pub ordinal: usize,
     /// Original unified-diff hunk header.
     pub header: String,
-    /// Stable selector accepted by callers as `path#hunk-ordinal`.
+    /// Stable, line-safe selector accepted by callers as `path#hunk-ordinal`.
     pub selector: String,
 }
 
@@ -183,6 +183,7 @@ fn expand_parsed(
     path: &str,
     hunk: Option<usize>,
 ) -> Result<String, MemoryError> {
+    let (path, hunk) = resolve_expansion_target(parsed, path, hunk);
     let file = parsed
         .iter()
         .find(|file| file.public.path == path)
@@ -203,6 +204,23 @@ fn expand_parsed(
                 ))
             }),
     }
+}
+
+fn resolve_expansion_target(
+    parsed: &[ParsedFile],
+    input: &str,
+    hunk: Option<usize>,
+) -> (String, Option<usize>) {
+    if hunk.is_some() {
+        return (
+            decode_rendered_path(input).unwrap_or_else(|| input.to_owned()),
+            hunk,
+        );
+    }
+    if parsed.iter().any(|file| file.public.path == input) {
+        return (input.to_owned(), None);
+    }
+    parse_rendered_selector(input).unwrap_or_else(|| (input.to_owned(), None))
 }
 
 fn read_source(request: &ReviewDiffRequest) -> Result<String, MemoryError> {
@@ -294,7 +312,7 @@ fn parse_file_section(lines: &[&str]) -> ParsedFile {
             ParsedHunk {
                 public: ReviewDiffHunk {
                     ordinal,
-                    selector: format!("{path}#hunk-{ordinal}"),
+                    selector: format!("{}#hunk-{ordinal}", render_path(&path)),
                     header,
                 },
                 source: lines[start..end].concat(),
@@ -325,7 +343,7 @@ fn stable_path(lines: &[&str]) -> Option<String> {
 
     from_marker("+++ ")
         .or_else(|| from_marker("--- "))
-        .or_else(|| lines.first().and_then(parse_diff_header_path))
+        .or_else(|| lines.first().and_then(|line| parse_diff_header_path(line)))
 }
 
 fn parse_marker_path(value: &str) -> Option<String> {
@@ -340,21 +358,44 @@ fn parse_marker_path(value: &str) -> Option<String> {
     }
 }
 
-fn parse_diff_header_path(line: &&str) -> Option<String> {
+fn parse_diff_header_path(line: &str) -> Option<String> {
     let value = line
         .strip_prefix("diff --git ")?
         .trim_end_matches(['\r', '\n']);
     if value.starts_with('"') {
-        let (_, remaining) = parse_quoted_git_path(value)?;
-        let (path, _) = parse_quoted_git_path(remaining.trim_start())?;
-        return normalize_git_path(&path);
+        let (_, remaining) = take_git_path_token(value)?;
+        let (new_path, _) = take_git_path_token(remaining)?;
+        return normalize_git_path(&new_path);
     }
 
-    let path = value
-        .rfind(" b/")
-        .or_else(|| value.rfind(" a/"))
-        .map(|start| &value[start + 1..])?;
-    normalize_git_path(path)
+    parse_unquoted_diff_header_paths(value).and_then(|(_, new_path)| normalize_git_path(&new_path))
+}
+
+fn take_git_path_token(value: &str) -> Option<(String, &str)> {
+    let value = value.trim_start_matches(' ');
+    if value.starts_with('"') {
+        return parse_quoted_git_path(value);
+    }
+    let end = value.find(' ').unwrap_or(value.len());
+    (end > 0).then(|| (value[..end].to_owned(), &value[end..]))
+}
+
+fn parse_unquoted_diff_header_paths(value: &str) -> Option<(String, String)> {
+    let mut candidate_start = 0;
+    while let Some(offset) = value[candidate_start..].find(" b/") {
+        let separator = candidate_start + offset;
+        let old_path = &value[..separator];
+        let new_path = &value[separator + 1..];
+        if let (Some(old_relative), Some(new_relative)) =
+            (old_path.strip_prefix("a/"), new_path.strip_prefix("b/"))
+        {
+            if old_relative == new_relative {
+                return Some((old_path.to_owned(), new_path.to_owned()));
+            }
+        }
+        candidate_start = separator + 1;
+    }
+    None
 }
 
 fn normalize_git_path(path: &str) -> Option<String> {
@@ -382,6 +423,13 @@ fn parse_quoted_git_path(value: &str) -> Option<(String, &str)> {
                     't' => path.push('\t'),
                     'n' => path.push('\n'),
                     'r' => path.push('\r'),
+                    'x' => {
+                        let first = characters.next()?;
+                        let second = characters.next()?;
+                        consumed += first.len_utf8() + second.len_utf8();
+                        let hex = format!("{first}{second}");
+                        path.push(char::from(u8::from_str_radix(&hex, 16).ok()?));
+                    }
                     digit @ '0'..='7' => {
                         let mut octal = String::from(digit);
                         for _ in 0..2 {
@@ -406,12 +454,55 @@ fn parse_quoted_git_path(value: &str) -> Option<(String, &str)> {
     None
 }
 
+fn render_path(path: &str) -> String {
+    if !path
+        .chars()
+        .any(|character| character.is_control() || matches!(character, '"' | '\\'))
+    {
+        return path.to_owned();
+    }
+
+    let mut rendered = String::from('"');
+    for character in path.chars() {
+        match character {
+            '"' => rendered.push_str("\\\""),
+            '\\' => rendered.push_str("\\\\"),
+            '\n' => rendered.push_str("\\n"),
+            '\r' => rendered.push_str("\\r"),
+            '\t' => rendered.push_str("\\t"),
+            character if character.is_control() && (character as u32) <= u8::MAX as u32 => {
+                rendered.push_str(&format!("\\x{:02X}", character as u32));
+            }
+            character => rendered.push(character),
+        }
+    }
+    rendered.push('"');
+    rendered
+}
+
+fn decode_rendered_path(input: &str) -> Option<String> {
+    let (path, remaining) = parse_quoted_git_path(input)?;
+    remaining.is_empty().then_some(path)
+}
+
+fn parse_rendered_selector(input: &str) -> Option<(String, Option<usize>)> {
+    let (path, ordinal) = if input.starts_with('"') {
+        let (path, remaining) = parse_quoted_git_path(input)?;
+        (path, remaining.strip_prefix("#hunk-")?)
+    } else {
+        let (path, ordinal) = input.rsplit_once("#hunk-")?;
+        (path.to_owned(), ordinal)
+    };
+    let ordinal = ordinal.parse::<usize>().ok()?;
+    (ordinal > 0).then_some((path, Some(ordinal)))
+}
+
 #[cfg(feature = "headroom-compression")]
 fn render_index(files: &[ReviewDiffFile]) -> String {
     let mut rendered = String::from("review-diff source index\n");
     for file in files {
         rendered.push_str("file: ");
-        rendered.push_str(&file.path);
+        rendered.push_str(&render_path(&file.path));
         rendered.push('\n');
         if file.hunks.is_empty() {
             rendered.push_str("  hunks: none\n");

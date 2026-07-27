@@ -251,7 +251,7 @@ fn space_and_tab_paths_have_exact_stable_selectors_and_expansions() {
     .expect("write enough worktree diff for compression");
     let request = ReviewDiffRequest::worktree(fixture.tempdir.path());
     let artifact = build_review_diff(&request).expect("artifact should compress");
-    let expected_selector = format!("{special_path}#hunk-1");
+    let expected_selector = "\"space name\\tfile.txt\"#hunk-1";
 
     let file = artifact
         .files
@@ -259,7 +259,7 @@ fn space_and_tab_paths_have_exact_stable_selectors_and_expansions() {
         .find(|file| file.path == special_path)
         .expect("special path should be indexed exactly");
     assert_eq!(file.hunks[0].selector, expected_selector);
-    assert!(artifact.rendered.contains(&expected_selector));
+    assert!(artifact.rendered.contains(expected_selector));
 
     let artifact_hunk = artifact
         .expand(special_path, Some(1))
@@ -268,4 +268,84 @@ fn space_and_tab_paths_have_exact_stable_selectors_and_expansions() {
         .expect("request expansion by exact special path");
     assert!(artifact_hunk.contains("head special content"));
     assert!(request_hunk.contains("head special content"));
+}
+
+#[cfg(feature = "headroom-compression")]
+#[test]
+fn binary_header_path_with_b_component_remains_exact_without_markers() {
+    let fixture = fixture();
+    let binary_path = "foo b/bar.png";
+    let binary_file = fixture.tempdir.path().join(binary_path);
+    std::fs::create_dir_all(binary_file.parent().expect("binary parent"))
+        .expect("make binary parent");
+    std::fs::write(&binary_file, [0, 1, 2, 3]).expect("write binary base");
+    git(
+        fixture.tempdir.path(),
+        vec!["add".to_owned(), binary_path.to_owned()],
+    );
+    git(fixture.tempdir.path(), ["commit", "-m", "add binary path"]);
+    std::fs::write(&binary_file, [0, 9, 2, 3]).expect("write binary head");
+    git(
+        fixture.tempdir.path(),
+        vec!["add".to_owned(), binary_path.to_owned()],
+    );
+    git(
+        fixture.tempdir.path(),
+        ["commit", "-m", "change binary path"],
+    );
+    let request = ReviewDiffRequest::range(
+        fixture.tempdir.path(),
+        &fixture.base,
+        git_output(fixture.tempdir.path(), ["rev-parse", "HEAD"]).trim(),
+    );
+    let artifact = build_review_diff(&request).expect("artifact should compress");
+
+    assert!(artifact.files.iter().any(|file| file.path == binary_path));
+    let expanded = artifact
+        .expand(binary_path, None)
+        .expect("binary expansion by exact path");
+    assert!(expanded.starts_with("diff --git a/foo b/bar.png b/foo b/bar.png\n"));
+    assert!(!expanded.contains("+++ "));
+    assert_eq!(
+        expanded,
+        expand_review_diff(&request, binary_path, None).expect("live expansion")
+    );
+}
+
+#[cfg(feature = "headroom-compression")]
+#[test]
+fn newline_path_selectors_are_escaped_and_reversible() {
+    let fixture = fixture();
+    let special_path = "line\nbreak.txt";
+    let special_file = fixture.tempdir.path().join(special_path);
+    std::fs::write(&special_file, "base newline content\n").expect("write newline base");
+    git(
+        fixture.tempdir.path(),
+        vec!["add".to_owned(), special_path.to_owned()],
+    );
+    git(fixture.tempdir.path(), ["commit", "-m", "add newline path"]);
+    std::fs::write(&special_file, "head newline content\n").expect("write newline head");
+    std::fs::write(
+        fixture.tempdir.path().join("alpha.txt"),
+        fixture_contents("alpha.txt", "worktree"),
+    )
+    .expect("write enough worktree diff for compression");
+    let artifact = build_review_diff(&ReviewDiffRequest::worktree(fixture.tempdir.path()))
+        .expect("artifact should compress");
+    let file = artifact
+        .files
+        .iter()
+        .find(|file| file.path == special_path)
+        .expect("newline path should retain exact identity");
+    let selector = &file.hunks[0].selector;
+
+    assert_eq!(selector, "\"line\\nbreak.txt\"#hunk-1");
+    assert!(artifact.rendered.contains(selector));
+    assert!(!artifact
+        .rendered
+        .contains(&format!("{special_path}#hunk-1")));
+    let expanded = artifact
+        .expand(selector, None)
+        .expect("rendered selector should select the original hunk");
+    assert!(expanded.contains("head newline content"));
 }
