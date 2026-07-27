@@ -666,3 +666,96 @@ fn utf8_escaped_path_retains_unicode_identity_and_selector_expansion() {
         .expect("unicode selector expansion")
         .contains("head unicode content"));
 }
+
+fn review_diff_command(fixture: &DiffFixture) -> Command {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_ironmem"));
+    scrub_git_environment(&mut command);
+    command
+        .arg("review-diff")
+        .arg("--repo")
+        .arg(fixture.tempdir.path())
+        .arg("--base")
+        .arg(&fixture.base)
+        .arg("--head")
+        .arg(&fixture.head);
+    command
+}
+
+#[cfg(feature = "headroom-compression")]
+#[test]
+fn cli_review_diff_renders_the_compressed_range_artifact() {
+    let fixture = fixture();
+    let output = review_diff_command(&fixture)
+        .output()
+        .expect("review-diff CLI should start");
+
+    assert!(
+        output.status.success(),
+        "review-diff CLI failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout).expect("CLI stdout should be UTF-8");
+    assert!(stdout.contains("review-diff source index"));
+    assert!(stdout.contains("alpha.txt#hunk-1"));
+    assert!(stdout.contains("review-diff metrics"));
+    assert!(stdout.contains("source_bytes="));
+}
+
+#[cfg(feature = "headroom-compression")]
+#[test]
+fn cli_review_diff_expands_the_requested_hunk_from_its_new_artifact() {
+    let fixture = fixture();
+    let output = review_diff_command(&fixture)
+        .arg("--expand-file")
+        .arg("beta.txt")
+        .arg("--hunk")
+        .arg("7")
+        .output()
+        .expect("review-diff CLI should start");
+
+    assert!(
+        output.status.success(),
+        "review-diff CLI failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout).expect("CLI stdout should be UTF-8");
+    assert!(stdout.starts_with("diff --git a/beta.txt b/beta.txt\n"));
+    assert!(stdout.contains("beta.txt section 7 head changed payload"));
+    assert!(!stdout.contains("beta.txt section 8 head changed payload"));
+}
+
+#[test]
+fn cli_review_diff_rejects_incomplete_or_conflicting_sources() {
+    let fixture = fixture();
+
+    let incomplete = Command::new(env!("CARGO_BIN_EXE_ironmem"))
+        .arg("review-diff")
+        .arg("--repo")
+        .arg(fixture.tempdir.path())
+        .arg("--base")
+        .arg(&fixture.base)
+        .output()
+        .expect("review-diff CLI should start");
+    assert!(!incomplete.status.success());
+    assert!(String::from_utf8_lossy(&incomplete.stderr).contains("head"));
+
+    let conflicting = review_diff_command(&fixture)
+        .arg("--worktree")
+        .output()
+        .expect("review-diff CLI should start");
+    assert!(!conflicting.status.success());
+    let stderr = String::from_utf8_lossy(&conflicting.stderr);
+    assert!(stderr.contains("worktree") && stderr.contains("base"));
+}
+
+#[cfg(not(feature = "headroom-compression"))]
+#[test]
+fn cli_review_diff_reports_the_optional_feature_requirement() {
+    let fixture = fixture();
+    let output = review_diff_command(&fixture)
+        .output()
+        .expect("review-diff CLI should start");
+
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("headroom-compression"));
+}
