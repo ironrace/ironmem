@@ -961,9 +961,7 @@ fn recall_block_from_db(
                             serde_json::to_string(&d.date),
                             serde_json::to_string(&excerpt),
                         ) {
-                            lines.push(format!(
-                                "- source=\"diary\" date={date} excerpt={excerpt}"
-                            ));
+                            lines.push(format!("- source=\"diary\" date={date} excerpt={excerpt}"));
                         }
                     }
                 }
