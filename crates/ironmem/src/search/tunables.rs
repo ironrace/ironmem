@@ -417,10 +417,6 @@ pub fn prompt_hook_kg_max_triples() -> usize {
 }
 
 /// Whether diary recall is enabled in the prompt hook. Default true.
-///
-/// Read and threaded through `recall_block_from_db` now so the function's
-/// signature is stable across the hybrid-recall task series; the diary
-/// section itself is implemented in a follow-up task.
 pub fn prompt_hook_diary_enabled() -> bool {
     env_bool("IRONMEM_PROMPT_HOOK_DIARY", true)
 }

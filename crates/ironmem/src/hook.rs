@@ -605,7 +605,7 @@ fn occupancy_notice(pct: f64, tier: OccupancyTier, sid: Option<&str>) -> Option<
     }
 }
 
-/// UserPromptSubmit hook: FTS/BM25 + KG-triple memory injection under a hard
+/// UserPromptSubmit hook: FTS/BM25 + KG-triple + diary-excerpt memory injection under a hard
 /// wall-clock budget. Always returns a fully-formed `HookResponse`; on ANY
 /// problem (missing/empty prompt, missing DB/FTS, lock, timeout, no
 /// qualifying hits) it emits no `hookSpecificOutput`. Never constructs `App` /
@@ -733,7 +733,7 @@ fn prompt_occupancy_sample_allowed(
     resolve_harness_spec(harness, crate::harness::REGISTRY).occupancy_support
 }
 
-/// Run the recall lookup (BM25 + KG triples) on a worker thread joined with
+/// Run the recall lookup (BM25 + KG triples + diary excerpts) on a worker thread joined with
 /// `recv_timeout(remaining)`, the hard wall-clock guard: a pathological FTS
 /// query or lock wait cannot block the prompt past the budget (the thread is
 /// abandoned; the short-lived process exits). Returns the formatted
@@ -3697,7 +3697,7 @@ mod tests {
     }
 
     #[test]
-    fn recall_block_includes_diary_excerpt_when_relevant() {
+    fn recall_block_includes_diary_excerpt() {
         let dir = tempfile::tempdir().unwrap();
         let db = crate::db::schema::Database::open(&dir.path().join("m.sqlite3")).unwrap();
         db.migrate().unwrap();
