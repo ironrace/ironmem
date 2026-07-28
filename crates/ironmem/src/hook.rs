@@ -930,10 +930,11 @@ fn recall_block_from_db(
                                     line_bytes,
                                 );
                                 if !triple_str.is_empty() {
-                                    let escaped = serde_json::to_string(&triple_str).ok()?;
-                                    lines.push(format!("- source=\"kg\" triple={escaped}"));
-                                    seen_triples.insert(t.id.clone());
-                                    triple_count += 1;
+                                    if let Ok(escaped) = serde_json::to_string(&triple_str) {
+                                        lines.push(format!("- source=\"kg\" triple={escaped}"));
+                                        seen_triples.insert(t.id.clone());
+                                        triple_count += 1;
+                                    }
                                 }
                             }
                         }
@@ -956,9 +957,14 @@ fn recall_block_from_db(
                 for d in &entries {
                     let excerpt = compact_excerpt(&d.content, diary_line_bytes);
                     if !excerpt.is_empty() {
-                        let date = serde_json::to_string(&d.date).ok()?;
-                        let excerpt = serde_json::to_string(&excerpt).ok()?;
-                        lines.push(format!("- source=\"diary\" date={date} excerpt={excerpt}"));
+                        if let (Ok(date), Ok(excerpt)) = (
+                            serde_json::to_string(&d.date),
+                            serde_json::to_string(&excerpt),
+                        ) {
+                            lines.push(format!(
+                                "- source=\"diary\" date={date} excerpt={excerpt}"
+                            ));
+                        }
                     }
                 }
             }
