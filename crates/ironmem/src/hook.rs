@@ -1617,6 +1617,8 @@ mod tests {
         std::env::remove_var("IRONMEM_PROMPT_HOOK_MAX_HITS");
         std::env::remove_var("IRONMEM_PROMPT_HOOK_MIN_SCORE");
         std::env::remove_var("IRONMEM_PROMPT_HOOK_SUMMARY_MAX_BYTES");
+        std::env::remove_var("IRONMEM_PROMPT_HOOK_KG");
+        std::env::remove_var("IRONMEM_PROMPT_HOOK_DIARY");
         guard
     }
 
@@ -3029,6 +3031,8 @@ mod tests {
         let _g = METRICS_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let _prompt = prompt_hook_tunable_defaults();
         std::env::set_var("IRONMEM_METRICS", "1");
+        std::env::set_var("IRONMEM_PROMPT_HOOK_KG", "false");
+        std::env::set_var("IRONMEM_PROMPT_HOOK_DIARY", "false");
 
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("m.sqlite3");
@@ -3072,6 +3076,8 @@ mod tests {
         let _g = METRICS_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let _prompt = prompt_hook_tunable_defaults();
         std::env::set_var("IRONMEM_METRICS", "1");
+        std::env::set_var("IRONMEM_PROMPT_HOOK_KG", "false");
+        std::env::set_var("IRONMEM_PROMPT_HOOK_DIARY", "false");
 
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("m.sqlite3");
