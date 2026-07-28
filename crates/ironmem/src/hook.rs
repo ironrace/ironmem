@@ -794,10 +794,8 @@ fn prompt_recall_block(db_path: &Path, prompt: &str, busy: Duration) -> Option<S
 /// Format the recall block from an open DB and explicit tunables: BM25, filter
 /// by `floor`, take top-`max_hits`, sanitize each hit to one ≤`line_bytes`
 /// line; then, if `kg_enabled`, append up to `kg_max_triples` KG triples for
-/// entities mentioned in `prompt`. `diary_enabled`/`diary_max`/
-/// `diary_line_bytes` are accepted and threaded through now so the signature
-/// is stable across the hybrid-recall task series; the diary section itself
-/// is wired up in a follow-up task.
+/// entities mentioned in `prompt`; finally, if `diary_enabled`, append up to
+/// `diary_max` most-recent diary excerpts (each capped to `diary_line_bytes`).
 #[allow(clippy::too_many_arguments)]
 fn recall_block_from_db(
     db: &crate::db::schema::Database,
@@ -935,8 +933,24 @@ fn recall_block_from_db(
         }
     }
 
-    // ... diary section added in Task 2 ...
-    let _ = (diary_enabled, diary_max, diary_line_bytes);
+    // Diary excerpt recall
+    if diary_enabled {
+        match db.get_drawers(Some("diary"), None, diary_max) {
+            Ok(entries) => {
+                for d in &entries {
+                    let excerpt = compact_excerpt(&d.content, diary_line_bytes);
+                    if !excerpt.is_empty() {
+                        let date = serde_json::to_string(&d.date).ok()?;
+                        let excerpt = serde_json::to_string(&excerpt).ok()?;
+                        lines.push(format!("- source=\"diary\" date={date} excerpt={excerpt}"));
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::warn!("prompt-hook recall: diary lookup failed: {e}");
+            }
+        }
+    }
 
     if lines.is_empty() {
         return None;
@@ -3637,6 +3651,87 @@ mod tests {
         assert!(
             !block.contains("excerpt="),
             "no drawer excerpt lines should appear since nothing was seeded: {block}"
+        );
+    }
+
+    #[test]
+    fn recall_block_includes_diary_excerpt_when_relevant() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = crate::db::schema::Database::open(&dir.path().join("m.sqlite3")).unwrap();
+        db.migrate().unwrap();
+
+        let zero = vec![0.0f32; ironrace_embed::embedder::EMBED_DIM];
+        // Seed a diary entry (wing="diary")
+        db.insert_drawer(
+            "diary-1",
+            "deployed new auth middleware to staging today",
+            &zero,
+            "diary",
+            "daily",
+            "test",
+            "test",
+        )
+        .unwrap();
+
+        let block = recall_block_from_db(
+            &db,
+            "auth middleware deployment",
+            0.0,
+            3,
+            120,
+            false,
+            3,
+            true,
+            1,
+            120,
+        )
+        .unwrap();
+        assert!(
+            block.contains("source=\"diary\""),
+            "diary excerpt should appear: {block}"
+        );
+        assert!(
+            block.contains("auth middleware"),
+            "diary content should appear: {block}"
+        );
+    }
+
+    #[test]
+    fn recall_block_diary_disabled_omits_diary() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = crate::db::schema::Database::open(&dir.path().join("m.sqlite3")).unwrap();
+        db.migrate().unwrap();
+
+        let zero = vec![0.0f32; ironrace_embed::embedder::EMBED_DIM];
+        db.insert_drawer(
+            "diary-1",
+            "deployed new auth middleware to staging today",
+            &zero,
+            "diary",
+            "daily",
+            "test",
+            "test",
+        )
+        .unwrap();
+        // Also seed a regular drawer so there's something to return
+        db.insert_drawer(
+            "d1",
+            "auth middleware uses JWT tokens",
+            &zero,
+            "infra",
+            "auth",
+            "test",
+            "test",
+        )
+        .unwrap();
+
+        // diary_enabled = false
+        let block =
+            recall_block_from_db(&db, "auth middleware", 0.0, 3, 120, false, 3, false, 1, 120)
+                .unwrap();
+        assert!(
+            !block.contains("source=\"diary\""),
+            "diary should not appear when disabled: {block}"
         );
     }
 
