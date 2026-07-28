@@ -11,6 +11,24 @@ Runs four core specialist agents in parallel (code-reviewer, security-reviewer, 
 
 ---
 
+## Model policy
+
+Every planning and review lens runs on **Opus 5 at `xhigh` effort**. Fable is
+OFF for this command — never dispatch a review or planning agent on `fable`,
+and if an agent definition still carries `model: fable`, override it to
+`model: opus` at dispatch and note it in the report.
+
+- `code-reviewer`, `security-reviewer`, `architect` carry `model: opus` +
+  `effort: xhigh` in their agent frontmatter — dispatch them without a model
+  override so that frontmatter wins.
+- Agents dispatched by type rather than definition — Agent J (concurrency,
+  `general-purpose`), the F–I fallbacks when `pr-review-toolkit` is missing, and
+  every Phase 5.5 verifier — get an explicit `model: opus` on the Agent call.
+- `doc-reviewer` stays on `sonnet` (documentation completeness is not a
+  reasoning-bound lens); `performance-optimizer` keeps its own frontmatter tier.
+
+---
+
 ## Mode
 
 - `$ARGUMENTS` contains a PR number / URL / branch → **PR Mode**
