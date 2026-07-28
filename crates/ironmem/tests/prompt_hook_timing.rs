@@ -23,6 +23,46 @@ fn seed_db_file_bulk(path: &Path, n: usize) {
         db.insert_drawer(&id, &content, &zero, "bench", "general", "test", "test")
             .unwrap();
     }
+
+    // Seed KG triples for entity matching. `find_entities_in_text` matches on
+    // entity name, so the subject/object names below ("alpha", "token") must
+    // appear verbatim in the prompt used by the combined-recall test.
+    let kg = ironmem::db::knowledge_graph::KnowledgeGraph::new(&db);
+    kg.add_triple(
+        "alpha",
+        "concept",
+        "relates-to",
+        "beta gamma context",
+        "concept",
+        None,
+        1.0,
+        None,
+    )
+    .unwrap();
+    kg.add_triple(
+        "token",
+        "concept",
+        "used-by",
+        "drawer system",
+        "system",
+        None,
+        1.0,
+        None,
+    )
+    .unwrap();
+
+    // Seed a diary entry (wing="diary" is what the diary-recall path looks for).
+    db.insert_drawer(
+        "diary-latest",
+        "worked on alpha beta system today",
+        &zero,
+        "diary",
+        "daily",
+        "test",
+        "test",
+    )
+    .unwrap();
+
     db.with_connection(|c| Ok(c.execute_batch("COMMIT")?))
         .unwrap();
 }
@@ -81,11 +121,31 @@ fn user_prompt_submit_binary_p95_under_budget_on_10k_drawers() {
         "relevant prompt should inject"
     );
 
+    // `seed_db_file_bulk` now also seeds a diary entry, and diary recall is
+    // unconditional (most-recent N entries, not gated by prompt relevance —
+    // see `hook.rs`'s diary-excerpt section), so an irrelevant prompt still
+    // produces a recall block containing *only* the diary line. The
+    // regression this guards against is BM25/KG noise leaking in for a
+    // prompt that matches nothing: no `excerpt=` (drawer) or `source="kg"`
+    // line should appear.
     let (miss, _) = run_prompt_hook(&db_path, &model_dir, "zzqqxx nonexistent qwerty");
-    assert!(
-        miss.get("hookSpecificOutput").is_none(),
-        "unrelated prompt should emit nothing"
-    );
+    let miss_output = miss
+        .get("hookSpecificOutput")
+        .and_then(|h| h.get("additionalContext"))
+        .and_then(|a| a.as_str());
+    match miss_output {
+        None => {}
+        Some(output) => {
+            assert!(
+                !output.contains("source=\"bench") && !output.contains("source=\"kg\""),
+                "unrelated prompt should not surface drawer/KG hits: {output}"
+            );
+            assert!(
+                output.contains("source=\"diary\""),
+                "unexpected non-diary output for unrelated prompt: {output}"
+            );
+        }
+    }
 
     let n = 20;
     let mut samples = Vec::with_capacity(n);
@@ -103,5 +163,33 @@ fn user_prompt_submit_binary_p95_under_budget_on_10k_drawers() {
     assert!(
         p95 <= 150,
         "binary p95 {p95}ms exceeds 150ms budget; samples={samples:?}"
+    );
+}
+
+#[test]
+fn user_prompt_submit_includes_kg_and_diary_alongside_drawers() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("m.sqlite3");
+    let model_dir = dir.path().join("missing-model");
+    seed_db_file_bulk(&db_path, 100); // small DB, fast
+
+    let (json, _elapsed) = run_prompt_hook(&db_path, &model_dir, "alpha beta token context");
+    let output = json
+        .get("hookSpecificOutput")
+        .and_then(|h| h.get("additionalContext"))
+        .and_then(|a| a.as_str())
+        .expect("should have additionalContext");
+
+    // Drawer recall
+    assert!(output.contains("source="), "should have drawer source tags");
+    // KG recall
+    assert!(
+        output.contains("source=\"kg\""),
+        "should have KG triple: {output}"
+    );
+    // Diary recall
+    assert!(
+        output.contains("source=\"diary\""),
+        "should have diary excerpt: {output}"
     );
 }
