@@ -408,14 +408,12 @@ pub fn prompt_hook_summary_max_bytes() -> usize {
 
 /// Whether KG triple recall is enabled in the prompt hook. Default true.
 pub fn prompt_hook_kg_enabled() -> bool {
-    static V: OnceLock<bool> = OnceLock::new();
-    *V.get_or_init(|| env_bool("IRONMEM_PROMPT_HOOK_KG", true))
+    env_bool("IRONMEM_PROMPT_HOOK_KG", true)
 }
 
 /// Max KG triples injected per prompt. Default 3, clamped to 1..=5.
 pub fn prompt_hook_kg_max_triples() -> usize {
-    static V: OnceLock<usize> = OnceLock::new();
-    *V.get_or_init(|| env_usize("IRONMEM_PROMPT_HOOK_KG_MAX_TRIPLES", 3).clamp(1, 5))
+    env_usize("IRONMEM_PROMPT_HOOK_KG_MAX_TRIPLES", 3).clamp(1, 5)
 }
 
 /// Whether diary recall is enabled in the prompt hook. Default true.
@@ -424,20 +422,17 @@ pub fn prompt_hook_kg_max_triples() -> usize {
 /// signature is stable across the hybrid-recall task series; the diary
 /// section itself is implemented in a follow-up task.
 pub fn prompt_hook_diary_enabled() -> bool {
-    static V: OnceLock<bool> = OnceLock::new();
-    *V.get_or_init(|| env_bool("IRONMEM_PROMPT_HOOK_DIARY", true))
+    env_bool("IRONMEM_PROMPT_HOOK_DIARY", true)
 }
 
 /// Max diary entries injected per prompt. Default 1, clamped to 1..=3.
 pub fn prompt_hook_diary_max() -> usize {
-    static V: OnceLock<usize> = OnceLock::new();
-    *V.get_or_init(|| env_usize("IRONMEM_PROMPT_HOOK_DIARY_MAX", 1).clamp(1, 3))
+    env_usize("IRONMEM_PROMPT_HOOK_DIARY_MAX", 1).clamp(1, 3)
 }
 
 /// Byte cap for each injected diary line. Default 120.
 pub fn prompt_hook_diary_line_bytes() -> usize {
-    static V: OnceLock<usize> = OnceLock::new();
-    *V.get_or_init(|| env_usize("IRONMEM_PROMPT_HOOK_DIARY_LINE_BYTES", 120))
+    env_usize("IRONMEM_PROMPT_HOOK_DIARY_LINE_BYTES", 120)
 }
 
 /// The pair of occupancy thresholds that gate the prompt-hook context notice.
@@ -583,11 +578,9 @@ mod tests {
     fn prompt_hook_kg_defaults() {
         let _g = PROMPT_HOOK_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         std::env::remove_var("IRONMEM_PROMPT_HOOK_KG");
-        // Can't test OnceLock defaults in-process after first read,
-        // but verify the env_bool helper directly:
-        assert!(super::env_bool("IRONMEM_PROMPT_HOOK_KG", true));
+        assert!(super::prompt_hook_kg_enabled());
         std::env::set_var("IRONMEM_PROMPT_HOOK_KG", "false");
-        assert!(!super::env_bool("IRONMEM_PROMPT_HOOK_KG", true));
+        assert!(!super::prompt_hook_kg_enabled());
         std::env::remove_var("IRONMEM_PROMPT_HOOK_KG");
     }
 
@@ -595,20 +588,11 @@ mod tests {
     fn prompt_hook_kg_max_triples_clamped() {
         let _g = PROMPT_HOOK_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         std::env::remove_var("IRONMEM_PROMPT_HOOK_KG_MAX_TRIPLES");
-        assert_eq!(
-            super::env_usize("IRONMEM_PROMPT_HOOK_KG_MAX_TRIPLES", 3).clamp(1, 5),
-            3
-        );
+        assert_eq!(super::prompt_hook_kg_max_triples(), 3);
         std::env::set_var("IRONMEM_PROMPT_HOOK_KG_MAX_TRIPLES", "0");
-        assert_eq!(
-            super::env_usize("IRONMEM_PROMPT_HOOK_KG_MAX_TRIPLES", 3).clamp(1, 5),
-            1
-        );
+        assert_eq!(super::prompt_hook_kg_max_triples(), 1);
         std::env::set_var("IRONMEM_PROMPT_HOOK_KG_MAX_TRIPLES", "99");
-        assert_eq!(
-            super::env_usize("IRONMEM_PROMPT_HOOK_KG_MAX_TRIPLES", 3).clamp(1, 5),
-            5
-        );
+        assert_eq!(super::prompt_hook_kg_max_triples(), 5);
         std::env::remove_var("IRONMEM_PROMPT_HOOK_KG_MAX_TRIPLES");
     }
 
@@ -616,11 +600,9 @@ mod tests {
     fn prompt_hook_diary_defaults() {
         let _g = PROMPT_HOOK_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         std::env::remove_var("IRONMEM_PROMPT_HOOK_DIARY");
-        // Can't test OnceLock defaults in-process after first read,
-        // but verify the env_bool helper directly:
-        assert!(super::env_bool("IRONMEM_PROMPT_HOOK_DIARY", true));
+        assert!(super::prompt_hook_diary_enabled());
         std::env::set_var("IRONMEM_PROMPT_HOOK_DIARY", "false");
-        assert!(!super::env_bool("IRONMEM_PROMPT_HOOK_DIARY", true));
+        assert!(!super::prompt_hook_diary_enabled());
         std::env::remove_var("IRONMEM_PROMPT_HOOK_DIARY");
     }
 
@@ -628,20 +610,11 @@ mod tests {
     fn prompt_hook_diary_max_clamped() {
         let _g = PROMPT_HOOK_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         std::env::remove_var("IRONMEM_PROMPT_HOOK_DIARY_MAX");
-        assert_eq!(
-            super::env_usize("IRONMEM_PROMPT_HOOK_DIARY_MAX", 1).clamp(1, 3),
-            1
-        );
+        assert_eq!(super::prompt_hook_diary_max(), 1);
         std::env::set_var("IRONMEM_PROMPT_HOOK_DIARY_MAX", "0");
-        assert_eq!(
-            super::env_usize("IRONMEM_PROMPT_HOOK_DIARY_MAX", 1).clamp(1, 3),
-            1
-        );
+        assert_eq!(super::prompt_hook_diary_max(), 1);
         std::env::set_var("IRONMEM_PROMPT_HOOK_DIARY_MAX", "99");
-        assert_eq!(
-            super::env_usize("IRONMEM_PROMPT_HOOK_DIARY_MAX", 1).clamp(1, 3),
-            3
-        );
+        assert_eq!(super::prompt_hook_diary_max(), 3);
         std::env::remove_var("IRONMEM_PROMPT_HOOK_DIARY_MAX");
     }
 
@@ -649,15 +622,9 @@ mod tests {
     fn prompt_hook_diary_line_bytes_default() {
         let _g = PROMPT_HOOK_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         std::env::remove_var("IRONMEM_PROMPT_HOOK_DIARY_LINE_BYTES");
-        assert_eq!(
-            super::env_usize("IRONMEM_PROMPT_HOOK_DIARY_LINE_BYTES", 120),
-            120
-        );
+        assert_eq!(super::prompt_hook_diary_line_bytes(), 120);
         std::env::set_var("IRONMEM_PROMPT_HOOK_DIARY_LINE_BYTES", "80");
-        assert_eq!(
-            super::env_usize("IRONMEM_PROMPT_HOOK_DIARY_LINE_BYTES", 120),
-            80
-        );
+        assert_eq!(super::prompt_hook_diary_line_bytes(), 80);
         std::env::remove_var("IRONMEM_PROMPT_HOOK_DIARY_LINE_BYTES");
     }
 

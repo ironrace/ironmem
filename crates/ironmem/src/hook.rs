@@ -870,50 +870,67 @@ fn recall_block_from_db(
     // KG triple recall
     if kg_enabled {
         let kg = crate::db::knowledge_graph::KnowledgeGraph::new(db);
-        if let Ok(entities) = kg.find_entities_in_text(prompt) {
-            let mut triple_count = 0;
-            for entity in &entities {
-                if triple_count >= kg_max_triples {
-                    break;
-                }
-                if let Ok(triples) =
-                    kg.query_entity_current(&entity.id, kg_max_triples - triple_count)
-                {
-                    for t in triples {
-                        // `Triple::subject`/`object` store entity IDs (opaque
-                        // hashes), not names — resolve each side back to a
-                        // display name so the injected line reads like
-                        // "pgbouncer runs-in transaction mode" rather than raw
-                        // hashes. The matched `entity` already gives us one
-                        // side's name for free; only the other side needs a
-                        // lookup. A resolution miss (should not happen for a
-                        // currently-valid triple, but the DB gives no such
-                        // guarantee) falls back to the raw id rather than
-                        // dropping the line.
-                        let resolve_name = |id: &str| -> String {
-                            if id == entity.id {
-                                entity.name.clone()
-                            } else {
-                                kg.get_entity(id)
-                                    .ok()
-                                    .flatten()
-                                    .map(|e| e.name)
-                                    .unwrap_or_else(|| id.to_string())
+        match kg.find_entities_in_text(prompt) {
+            Ok(entities) => {
+                let mut triple_count = 0;
+                // A prompt mentioning both endpoints of the same triple would
+                // otherwise surface it once per matched entity; track seen
+                // triple IDs so each triple is injected at most once.
+                let mut seen_triples: std::collections::HashSet<String> =
+                    std::collections::HashSet::new();
+                for entity in &entities {
+                    if triple_count >= kg_max_triples {
+                        break;
+                    }
+                    match kg.query_entity_current(&entity.id, kg_max_triples - triple_count) {
+                        Ok(triples) => {
+                            for t in triples {
+                                if seen_triples.contains(&t.id) {
+                                    continue;
+                                }
+                                // `Triple::subject`/`object` store entity IDs (opaque
+                                // hashes), not names — resolve each side back to a
+                                // display name so the injected line reads like
+                                // "pgbouncer runs-in transaction mode" rather than raw
+                                // hashes. The matched `entity` already gives us one
+                                // side's name for free; only the other side needs a
+                                // lookup. A resolution miss (should not happen for a
+                                // currently-valid triple, but the DB gives no such
+                                // guarantee) falls back to the raw id rather than
+                                // dropping the line.
+                                let resolve_name = |id: &str| -> String {
+                                    if id == entity.id {
+                                        entity.name.clone()
+                                    } else {
+                                        kg.get_entity(id)
+                                            .ok()
+                                            .flatten()
+                                            .map(|e| e.name)
+                                            .unwrap_or_else(|| id.to_string())
+                                    }
+                                };
+                                let subject_name = resolve_name(&t.subject);
+                                let object_name = resolve_name(&t.object);
+                                let triple_str = compact_excerpt(
+                                    &format!("{subject_name} {} {object_name}", t.predicate),
+                                    line_bytes,
+                                );
+                                if !triple_str.is_empty() {
+                                    let escaped = serde_json::to_string(&triple_str).ok()?;
+                                    lines.push(format!("- source=\"kg\" triple={escaped}"));
+                                    seen_triples.insert(t.id.clone());
+                                    triple_count += 1;
+                                }
                             }
-                        };
-                        let subject_name = resolve_name(&t.subject);
-                        let object_name = resolve_name(&t.object);
-                        let triple_str = compact_excerpt(
-                            &format!("{subject_name} {} {object_name}", t.predicate),
-                            line_bytes,
-                        );
-                        if !triple_str.is_empty() {
-                            let escaped = serde_json::to_string(&triple_str).ok()?;
-                            lines.push(format!("- source=\"kg\" triple={escaped}"));
-                            triple_count += 1;
+                        }
+                        Err(e) => {
+                            tracing::warn!("prompt-hook recall: KG triple query failed: {e}");
                         }
                     }
                 }
+            }
+            Err(e) => {
+                tracing::warn!("prompt-hook recall: KG entity lookup failed: {e}");
             }
         }
     }
@@ -3573,6 +3590,53 @@ mod tests {
         assert!(
             block.contains("pgbouncer"),
             "BM25 drawer hit should still appear: {block}"
+        );
+    }
+
+    #[test]
+    fn recall_block_kg_hit_when_bm25_misses() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = crate::db::schema::Database::open(&dir.path().join("m.sqlite3")).unwrap();
+        db.migrate().unwrap();
+
+        // NO drawer seeded — BM25 will find nothing.
+        // Seed a KG triple whose entity name appears in the prompt.
+        let kg = KnowledgeGraph::new(&db);
+        kg.add_triple(
+            "pgbouncer",
+            "tool",
+            "runs-in",
+            "transaction mode",
+            "concept",
+            None,
+            1.0,
+            None,
+        )
+        .unwrap();
+
+        let block = recall_block_from_db(
+            &db,
+            "how does pgbouncer work",
+            0.0,
+            3,
+            120,
+            true,
+            3,
+            false,
+            1,
+            120,
+        );
+        let block = block.expect("KG hit should produce recall even without BM25 matches");
+        assert!(
+            block.contains("source=\"kg\""),
+            "KG triple should appear: {block}"
+        );
+        // Drawer lines use `excerpt="..."`; KG lines use `triple="..."`. Since
+        // no drawer was seeded, no `excerpt=` key should appear at all — this
+        // confirms the recall came purely from the KG path, not BM25.
+        assert!(
+            !block.contains("excerpt="),
+            "no drawer excerpt lines should appear since nothing was seeded: {block}"
         );
     }
 
