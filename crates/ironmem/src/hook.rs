@@ -769,38 +769,15 @@ fn search_prompt_context(
 /// prompt tests).
 fn prompt_recall_block(db_path: &Path, prompt: &str, busy: Duration) -> Option<String> {
     let db = crate::db::schema::Database::open_with_busy_timeout(db_path, busy).ok()?;
-    let floor = crate::search::tunables::prompt_hook_min_bm25_score();
-    let max_hits = crate::search::tunables::prompt_hook_max_hits();
-    let line_bytes = crate::search::tunables::prompt_hook_summary_max_bytes();
-    let kg_enabled = crate::search::tunables::prompt_hook_kg_enabled();
-    let kg_max = crate::search::tunables::prompt_hook_kg_max_triples();
-    let diary_enabled = crate::search::tunables::prompt_hook_diary_enabled();
-    let diary_max = crate::search::tunables::prompt_hook_diary_max();
-    let diary_line_bytes = crate::search::tunables::prompt_hook_diary_line_bytes();
-    recall_block_from_db(
-        &db,
-        prompt,
-        floor,
-        max_hits,
-        line_bytes,
-        kg_enabled,
-        kg_max,
-        diary_enabled,
-        diary_max,
-        diary_line_bytes,
-    )
+    let config = RecallConfig::from_tunables();
+    recall_block_from_db(&db, prompt, &config)
 }
 
-/// Format the recall block from an open DB and explicit tunables: BM25, filter
-/// by `floor`, take top-`max_hits`, sanitize each hit to one ≤`line_bytes`
-/// line; then, if `kg_enabled`, append up to `kg_max_triples` KG triples for
-/// entities mentioned in `prompt`; finally, if `diary_enabled`, append up to
-/// `diary_max` most-recent diary excerpts (each capped to `diary_line_bytes`).
-#[allow(clippy::too_many_arguments)]
-fn recall_block_from_db(
-    db: &crate::db::schema::Database,
-    prompt: &str,
-    floor: f32,
+/// Tuning parameters for [`recall_block_from_db`], grouped to keep the
+/// function signature manageable as BM25, KG, and diary recall each grow
+/// their own knobs.
+struct RecallConfig {
+    bm25_floor: f32,
     max_hits: usize,
     line_bytes: usize,
     kg_enabled: bool,
@@ -808,7 +785,46 @@ fn recall_block_from_db(
     diary_enabled: bool,
     diary_max: usize,
     diary_line_bytes: usize,
+}
+
+impl RecallConfig {
+    /// Read all tunables fresh (no caching/`OnceLock`) so tests that mutate
+    /// `IRONMEM_PROMPT_HOOK_*` env vars observe the change immediately.
+    fn from_tunables() -> Self {
+        Self {
+            bm25_floor: crate::search::tunables::prompt_hook_min_bm25_score(),
+            max_hits: crate::search::tunables::prompt_hook_max_hits(),
+            line_bytes: crate::search::tunables::prompt_hook_summary_max_bytes(),
+            kg_enabled: crate::search::tunables::prompt_hook_kg_enabled(),
+            kg_max_triples: crate::search::tunables::prompt_hook_kg_max_triples(),
+            diary_enabled: crate::search::tunables::prompt_hook_diary_enabled(),
+            diary_max: crate::search::tunables::prompt_hook_diary_max(),
+            diary_line_bytes: crate::search::tunables::prompt_hook_diary_line_bytes(),
+        }
+    }
+}
+
+/// Format the recall block from an open DB and explicit tunables: BM25, filter
+/// by `config.bm25_floor`, take top-`config.max_hits`, sanitize each hit to
+/// one ≤`config.line_bytes` line; then, if `config.kg_enabled`, append up to
+/// `config.kg_max_triples` KG triples for entities mentioned in `prompt`;
+/// finally, if `config.diary_enabled`, append up to `config.diary_max`
+/// most-recent diary excerpts (each capped to `config.diary_line_bytes`).
+fn recall_block_from_db(
+    db: &crate::db::schema::Database,
+    prompt: &str,
+    config: &RecallConfig,
 ) -> Option<String> {
+    let RecallConfig {
+        bm25_floor: floor,
+        max_hits,
+        line_bytes,
+        kg_enabled,
+        kg_max_triples,
+        diary_enabled,
+        diary_max,
+        diary_line_bytes,
+    } = *config;
     // Overfetch `max_hits * 3` so the `prompt_hook_min_bm25_score` floor filter
     // below has room to drop low-scorers before `take(max_hits)`; simplifying
     // this to `max_hits` would starve a floor-filtered config of candidates.
@@ -3391,7 +3407,17 @@ mod tests {
         );
         let floor = (strong_score + weak_score) / 2.0;
 
-        let block = recall_block_from_db(&db, q, floor, 3, 120, false, 1, false, 1, 120)
+        let config = RecallConfig {
+            bm25_floor: floor,
+            max_hits: 3,
+            line_bytes: 120,
+            kg_enabled: false,
+            kg_max_triples: 1,
+            diary_enabled: false,
+            diary_max: 1,
+            diary_line_bytes: 120,
+        };
+        let block = recall_block_from_db(&db, q, &config)
             .expect("strong match still injects above the floor");
         assert_eq!(
             injected_source_rooms(&block),
@@ -3399,9 +3425,12 @@ mod tests {
             "only the above-floor drawer injects: {block}"
         );
         // A floor above every score drops all hits → no recall block at all.
+        let above_floor_config = RecallConfig {
+            bm25_floor: strong_score + 1.0,
+            ..config
+        };
         assert!(
-            recall_block_from_db(&db, q, strong_score + 1.0, 3, 120, false, 1, false, 1, 120)
-                .is_none(),
+            recall_block_from_db(&db, q, &above_floor_config).is_none(),
             "floor above all scores yields no recall block"
         );
     }
@@ -3449,8 +3478,17 @@ mod tests {
         });
 
         // max_hits = 3 even though five drawers qualify.
-        let block = recall_block_from_db(&db, q, 0.0, 3, 120, false, 1, false, 1, 120)
-            .expect("five matches → recall injects");
+        let config = RecallConfig {
+            bm25_floor: 0.0,
+            max_hits: 3,
+            line_bytes: 120,
+            kg_enabled: false,
+            kg_max_triples: 1,
+            diary_enabled: false,
+            diary_max: 1,
+            diary_line_bytes: 120,
+        };
+        let block = recall_block_from_db(&db, q, &config).expect("five matches → recall injects");
         let injected = injected_source_rooms(&block);
         assert_eq!(injected.len(), 3, "max_hits caps the block at 3: {block}");
         assert_eq!(
@@ -3473,8 +3511,17 @@ mod tests {
         );
         let db = crate::db::schema::Database::open(&db_path).unwrap();
         // line_bytes = 16 caps each excerpt.
-        let block = recall_block_from_db(&db, "alpha beta", 0.0, 3, 16, false, 1, false, 1, 120)
-            .expect("match injects");
+        let config = RecallConfig {
+            bm25_floor: 0.0,
+            max_hits: 3,
+            line_bytes: 16,
+            kg_enabled: false,
+            kg_max_triples: 1,
+            diary_enabled: false,
+            diary_max: 1,
+            diary_line_bytes: 120,
+        };
+        let block = recall_block_from_db(&db, "alpha beta", &config).expect("match injects");
         let summary = block
             .lines()
             .find(|l| l.starts_with("- "))
@@ -3525,19 +3572,17 @@ mod tests {
         )
         .unwrap();
 
-        let block = recall_block_from_db(
-            &db,
-            "how does pgbouncer work",
-            0.0,
-            3,
-            120,
-            true,
-            3,
-            true,
-            1,
-            120,
-        )
-        .unwrap();
+        let config = RecallConfig {
+            bm25_floor: 0.0,
+            max_hits: 3,
+            line_bytes: 120,
+            kg_enabled: true,
+            kg_max_triples: 3,
+            diary_enabled: true,
+            diary_max: 1,
+            diary_line_bytes: 120,
+        };
+        let block = recall_block_from_db(&db, "how does pgbouncer work", &config).unwrap();
         assert!(
             block.contains("source=\"kg\""),
             "KG triple should be included: {block}"
@@ -3584,19 +3629,17 @@ mod tests {
         .unwrap();
 
         // kg_enabled = false
-        let block = recall_block_from_db(
-            &db,
-            "how does pgbouncer work",
-            0.0,
-            3,
-            120,
-            false,
-            3,
-            true,
-            1,
-            120,
-        )
-        .unwrap();
+        let config = RecallConfig {
+            bm25_floor: 0.0,
+            max_hits: 3,
+            line_bytes: 120,
+            kg_enabled: false,
+            kg_max_triples: 3,
+            diary_enabled: true,
+            diary_max: 1,
+            diary_line_bytes: 120,
+        };
+        let block = recall_block_from_db(&db, "how does pgbouncer work", &config).unwrap();
         assert!(
             !block.contains("source=\"kg\""),
             "KG should not appear when disabled: {block}"
@@ -3628,18 +3671,17 @@ mod tests {
         )
         .unwrap();
 
-        let block = recall_block_from_db(
-            &db,
-            "how does pgbouncer work",
-            0.0,
-            3,
-            120,
-            true,
-            3,
-            false,
-            1,
-            120,
-        );
+        let config = RecallConfig {
+            bm25_floor: 0.0,
+            max_hits: 3,
+            line_bytes: 120,
+            kg_enabled: true,
+            kg_max_triples: 3,
+            diary_enabled: false,
+            diary_max: 1,
+            diary_line_bytes: 120,
+        };
+        let block = recall_block_from_db(&db, "how does pgbouncer work", &config);
         let block = block.expect("KG hit should produce recall even without BM25 matches");
         assert!(
             block.contains("source=\"kg\""),
@@ -3673,19 +3715,17 @@ mod tests {
         )
         .unwrap();
 
-        let block = recall_block_from_db(
-            &db,
-            "auth middleware deployment",
-            0.0,
-            3,
-            120,
-            false,
-            3,
-            true,
-            1,
-            120,
-        )
-        .unwrap();
+        let config = RecallConfig {
+            bm25_floor: 0.0,
+            max_hits: 3,
+            line_bytes: 120,
+            kg_enabled: false,
+            kg_max_triples: 3,
+            diary_enabled: true,
+            diary_max: 1,
+            diary_line_bytes: 120,
+        };
+        let block = recall_block_from_db(&db, "auth middleware deployment", &config).unwrap();
         assert!(
             block.contains("source=\"diary\""),
             "diary excerpt should appear: {block}"
@@ -3726,9 +3766,17 @@ mod tests {
         .unwrap();
 
         // diary_enabled = false
-        let block =
-            recall_block_from_db(&db, "auth middleware", 0.0, 3, 120, false, 3, false, 1, 120)
-                .unwrap();
+        let config = RecallConfig {
+            bm25_floor: 0.0,
+            max_hits: 3,
+            line_bytes: 120,
+            kg_enabled: false,
+            kg_max_triples: 3,
+            diary_enabled: false,
+            diary_max: 1,
+            diary_line_bytes: 120,
+        };
+        let block = recall_block_from_db(&db, "auth middleware", &config).unwrap();
         assert!(
             !block.contains("source=\"diary\""),
             "diary should not appear when disabled: {block}"
