@@ -133,19 +133,18 @@ fn user_prompt_submit_binary_p95_under_budget_on_10k_drawers() {
         .get("hookSpecificOutput")
         .and_then(|h| h.get("additionalContext"))
         .and_then(|a| a.as_str());
-    match miss_output {
-        None => {}
-        Some(output) => {
-            assert!(
-                !output.contains("source=\"bench") && !output.contains("source=\"kg\""),
-                "unrelated prompt should not surface drawer/KG hits: {output}"
-            );
-            assert!(
-                output.contains("source=\"diary\""),
-                "unexpected non-diary output for unrelated prompt: {output}"
-            );
-        }
-    }
+    let output = miss_output.expect(
+        "diary recall is unconditional and enabled by default; \
+         a miss prompt should still produce a diary-only block",
+    );
+    assert!(
+        !output.contains("source=\"bench") && !output.contains("source=\"kg\""),
+        "unrelated prompt should not surface drawer/KG hits: {output}"
+    );
+    assert!(
+        output.contains("source=\"diary\""),
+        "unexpected non-diary output for unrelated prompt: {output}"
+    );
 
     let n = 20;
     let mut samples = Vec::with_capacity(n);
@@ -181,7 +180,10 @@ fn user_prompt_submit_includes_kg_and_diary_alongside_drawers() {
         .expect("should have additionalContext");
 
     // Drawer recall
-    assert!(output.contains("source="), "should have drawer source tags");
+    assert!(
+        output.contains("source=\"bench"),
+        "should have drawer source from bench wing: {output}"
+    );
     // KG recall
     assert!(
         output.contains("source=\"kg\""),
