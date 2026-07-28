@@ -605,10 +605,11 @@ fn occupancy_notice(pct: f64, tier: OccupancyTier, sid: Option<&str>) -> Option<
     }
 }
 
-/// UserPromptSubmit hook: FTS/BM25-only memory injection under a hard wall-clock
-/// budget. Always returns a fully-formed `HookResponse`; on ANY problem (missing/
-/// empty prompt, missing DB/FTS, lock, timeout, no qualifying hits) it emits no
-/// `hookSpecificOutput`. Never constructs `App` / loads the embedder.
+/// UserPromptSubmit hook: FTS/BM25 + KG-triple memory injection under a hard
+/// wall-clock budget. Always returns a fully-formed `HookResponse`; on ANY
+/// problem (missing/empty prompt, missing DB/FTS, lock, timeout, no
+/// qualifying hits) it emits no `hookSpecificOutput`. Never constructs `App` /
+/// loads the embedder.
 fn run_user_prompt_submit(
     config: &Config,
     harness: &str,
@@ -732,10 +733,11 @@ fn prompt_occupancy_sample_allowed(
     resolve_harness_spec(harness, crate::harness::REGISTRY).occupancy_support
 }
 
-/// Run the BM25 lookup on a worker thread joined with `recv_timeout(remaining)`,
-/// the hard wall-clock guard: a pathological FTS query or lock wait cannot block
-/// the prompt past the budget (the thread is abandoned; the short-lived process
-/// exits). Returns the formatted additionalContext, or `None`.
+/// Run the recall lookup (BM25 + KG triples) on a worker thread joined with
+/// `recv_timeout(remaining)`, the hard wall-clock guard: a pathological FTS
+/// query or lock wait cannot block the prompt past the budget (the thread is
+/// abandoned; the short-lived process exits). Returns the formatted
+/// additionalContext, or `None`.
 fn search_prompt_context(
     db_path: &Path,
     prompt: &str,
@@ -751,7 +753,7 @@ fn search_prompt_context(
     let prompt = prompt.to_string();
     let worker_budget = remaining;
     std::thread::spawn(move || {
-        let result = bm25_prompt_block(&db_path, &prompt, worker_budget);
+        let result = prompt_recall_block(&db_path, &prompt, worker_budget);
         let _ = tx.send(result); // receiver gone (timed out) → drop silently
     });
     match rx.recv_timeout(remaining) {
@@ -761,25 +763,53 @@ fn search_prompt_context(
 }
 
 /// Pure DB work (runs on the worker thread): open budget-bounded, read the
-/// tunables, then delegate to [`bm25_block_from_db`]. Splitting the env read from
-/// the formatting keeps the latter unit-testable without mutating process-global
-/// `IRONMEM_PROMPT_HOOK_*` env vars (which would race the other prompt tests).
-fn bm25_prompt_block(db_path: &Path, prompt: &str, busy: Duration) -> Option<String> {
+/// tunables, then delegate to [`recall_block_from_db`]. Splitting the env read
+/// from the formatting keeps the latter unit-testable without mutating
+/// process-global `IRONMEM_PROMPT_HOOK_*` env vars (which would race the other
+/// prompt tests).
+fn prompt_recall_block(db_path: &Path, prompt: &str, busy: Duration) -> Option<String> {
     let db = crate::db::schema::Database::open_with_busy_timeout(db_path, busy).ok()?;
     let floor = crate::search::tunables::prompt_hook_min_bm25_score();
     let max_hits = crate::search::tunables::prompt_hook_max_hits();
     let line_bytes = crate::search::tunables::prompt_hook_summary_max_bytes();
-    bm25_block_from_db(&db, prompt, floor, max_hits, line_bytes)
+    let kg_enabled = crate::search::tunables::prompt_hook_kg_enabled();
+    let kg_max = crate::search::tunables::prompt_hook_kg_max_triples();
+    let diary_enabled = crate::search::tunables::prompt_hook_diary_enabled();
+    let diary_max = crate::search::tunables::prompt_hook_diary_max();
+    let diary_line_bytes = crate::search::tunables::prompt_hook_diary_line_bytes();
+    recall_block_from_db(
+        &db,
+        prompt,
+        floor,
+        max_hits,
+        line_bytes,
+        kg_enabled,
+        kg_max,
+        diary_enabled,
+        diary_max,
+        diary_line_bytes,
+    )
 }
 
-/// Format the recall block from an open DB and explicit tunables: BM25, filter by
-/// `floor`, take top-`max_hits`, sanitize each hit to one ≤`line_bytes` line.
-fn bm25_block_from_db(
+/// Format the recall block from an open DB and explicit tunables: BM25, filter
+/// by `floor`, take top-`max_hits`, sanitize each hit to one ≤`line_bytes`
+/// line; then, if `kg_enabled`, append up to `kg_max_triples` KG triples for
+/// entities mentioned in `prompt`. `diary_enabled`/`diary_max`/
+/// `diary_line_bytes` are accepted and threaded through now so the signature
+/// is stable across the hybrid-recall task series; the diary section itself
+/// is wired up in a follow-up task.
+#[allow(clippy::too_many_arguments)]
+fn recall_block_from_db(
     db: &crate::db::schema::Database,
     prompt: &str,
     floor: f32,
     max_hits: usize,
     line_bytes: usize,
+    kg_enabled: bool,
+    kg_max_triples: usize,
+    diary_enabled: bool,
+    diary_max: usize,
+    diary_line_bytes: usize,
 ) -> Option<String> {
     // Overfetch `max_hits * 3` so the `prompt_hook_min_bm25_score` floor filter
     // below has room to drop low-scorers before `take(max_hits)`; simplifying
@@ -802,13 +832,17 @@ fn bm25_block_from_db(
         .filter(|(_, score)| *score >= floor)
         .take(max_hits)
         .collect();
-    if qualifying.is_empty() {
-        return None;
-    }
 
     // Preserve BM25 selection above, but render the selected drawers in stable
     // ID order. `get_drawers_by_ids` returns a HashMap, so relying on either
     // DB rank ties or map iteration would churn the early prompt prefix.
+    //
+    // No early return on an empty `qualifying`: a BM25 miss must not prevent
+    // KG (or, later, diary) hits from still producing a recall block — the
+    // final `lines.is_empty()` check below is the single source of truth for
+    // "nothing to inject". `get_drawers_by_ids` already short-circuits an
+    // empty id slice to `Ok({})`, so this costs nothing when BM25 found
+    // nothing.
     let mut selected_ids: Vec<&str> = qualifying.iter().map(|(id, _)| id.as_str()).collect();
     selected_ids.sort_unstable();
     let drawers = match db.get_drawers_by_ids(&selected_ids) {
@@ -832,6 +866,61 @@ fn bm25_block_from_db(
             }
         }
     }
+
+    // KG triple recall
+    if kg_enabled {
+        let kg = crate::db::knowledge_graph::KnowledgeGraph::new(db);
+        if let Ok(entities) = kg.find_entities_in_text(prompt) {
+            let mut triple_count = 0;
+            for entity in &entities {
+                if triple_count >= kg_max_triples {
+                    break;
+                }
+                if let Ok(triples) =
+                    kg.query_entity_current(&entity.id, kg_max_triples - triple_count)
+                {
+                    for t in triples {
+                        // `Triple::subject`/`object` store entity IDs (opaque
+                        // hashes), not names — resolve each side back to a
+                        // display name so the injected line reads like
+                        // "pgbouncer runs-in transaction mode" rather than raw
+                        // hashes. The matched `entity` already gives us one
+                        // side's name for free; only the other side needs a
+                        // lookup. A resolution miss (should not happen for a
+                        // currently-valid triple, but the DB gives no such
+                        // guarantee) falls back to the raw id rather than
+                        // dropping the line.
+                        let resolve_name = |id: &str| -> String {
+                            if id == entity.id {
+                                entity.name.clone()
+                            } else {
+                                kg.get_entity(id)
+                                    .ok()
+                                    .flatten()
+                                    .map(|e| e.name)
+                                    .unwrap_or_else(|| id.to_string())
+                            }
+                        };
+                        let subject_name = resolve_name(&t.subject);
+                        let object_name = resolve_name(&t.object);
+                        let triple_str = compact_excerpt(
+                            &format!("{subject_name} {} {object_name}", t.predicate),
+                            line_bytes,
+                        );
+                        if !triple_str.is_empty() {
+                            let escaped = serde_json::to_string(&triple_str).ok()?;
+                            lines.push(format!("- source=\"kg\" triple={escaped}"));
+                            triple_count += 1;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // ... diary section added in Task 2 ...
+    let _ = (diary_enabled, diary_max, diary_line_bytes);
+
     if lines.is_empty() {
         return None;
     }
@@ -1461,6 +1550,7 @@ fn sanitize_path_for_log(raw: &str) -> String {
 mod tests {
     use super::*;
     use crate::config::{Config, EmbedMode, McpAccessMode};
+    use crate::db::knowledge_graph::KnowledgeGraph;
     use crate::mcp::protocol::JsonRpcRequest;
     use crate::mcp::server::{dispatch, run_server_io};
     use std::sync::{Arc, LazyLock, Mutex};
@@ -3242,7 +3332,7 @@ mod tests {
 
     #[test]
     fn prompt_hook_min_bm25_score_floor_drops_weak_matches() {
-        // Exercises `bm25_block_from_db` directly with an explicit floor: passing
+        // Exercises `recall_block_from_db` directly with an explicit floor: passing
         // tunables as params (not process-global `IRONMEM_PROMPT_HOOK_*` env vars)
         // keeps this from racing the other prompt tests under `cargo test`.
         let temp = tempfile::tempdir().unwrap();
@@ -3270,7 +3360,7 @@ mod tests {
         );
         let floor = (strong_score + weak_score) / 2.0;
 
-        let block = bm25_block_from_db(&db, q, floor, 3, 120)
+        let block = recall_block_from_db(&db, q, floor, 3, 120, false, 1, false, 1, 120)
             .expect("strong match still injects above the floor");
         assert_eq!(
             injected_source_rooms(&block),
@@ -3279,7 +3369,8 @@ mod tests {
         );
         // A floor above every score drops all hits → no recall block at all.
         assert!(
-            bm25_block_from_db(&db, q, strong_score + 1.0, 3, 120).is_none(),
+            recall_block_from_db(&db, q, strong_score + 1.0, 3, 120, false, 1, false, 1, 120)
+                .is_none(),
             "floor above all scores yields no recall block"
         );
     }
@@ -3327,7 +3418,8 @@ mod tests {
         });
 
         // max_hits = 3 even though five drawers qualify.
-        let block = bm25_block_from_db(&db, q, 0.0, 3, 120).expect("five matches → recall injects");
+        let block = recall_block_from_db(&db, q, 0.0, 3, 120, false, 1, false, 1, 120)
+            .expect("five matches → recall injects");
         let injected = injected_source_rooms(&block);
         assert_eq!(injected.len(), 3, "max_hits caps the block at 3: {block}");
         assert_eq!(
@@ -3350,7 +3442,8 @@ mod tests {
         );
         let db = crate::db::schema::Database::open(&db_path).unwrap();
         // line_bytes = 16 caps each excerpt.
-        let block = bm25_block_from_db(&db, "alpha beta", 0.0, 3, 16).expect("match injects");
+        let block = recall_block_from_db(&db, "alpha beta", 0.0, 3, 16, false, 1, false, 1, 120)
+            .expect("match injects");
         let summary = block
             .lines()
             .find(|l| l.starts_with("- "))
@@ -3365,6 +3458,121 @@ mod tests {
         assert!(
             !block.contains("epsilon") && !block.contains("theta"),
             "content past the byte cap must not leak: {block}"
+        );
+    }
+
+    #[test]
+    fn recall_block_includes_kg_triples_when_entities_match() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = crate::db::schema::Database::open(&dir.path().join("m.sqlite3")).unwrap();
+        db.migrate().unwrap();
+
+        // Seed a drawer so BM25 has something.
+        let zero = vec![0.0f32; ironrace_embed::embedder::EMBED_DIM];
+        db.insert_drawer(
+            "d1",
+            "how does pgbouncer work: postgres connection pooling uses pgbouncer",
+            &zero,
+            "infra",
+            "db",
+            "test",
+            "test",
+        )
+        .unwrap();
+
+        // Seed a KG triple.
+        let kg = KnowledgeGraph::new(&db);
+        kg.add_triple(
+            "pgbouncer",
+            "tool",
+            "runs-in",
+            "transaction mode",
+            "concept",
+            None,
+            1.0,
+            None,
+        )
+        .unwrap();
+
+        let block = recall_block_from_db(
+            &db,
+            "how does pgbouncer work",
+            0.0,
+            3,
+            120,
+            true,
+            3,
+            true,
+            1,
+            120,
+        )
+        .unwrap();
+        assert!(
+            block.contains("source=\"kg\""),
+            "KG triple should be included: {block}"
+        );
+        assert!(
+            block.contains("pgbouncer"),
+            "entity name should appear: {block}"
+        );
+        assert!(
+            block.contains("transaction mode"),
+            "triple object should appear: {block}"
+        );
+    }
+
+    #[test]
+    fn recall_block_kg_disabled_returns_bm25_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = crate::db::schema::Database::open(&dir.path().join("m.sqlite3")).unwrap();
+        db.migrate().unwrap();
+
+        let zero = vec![0.0f32; ironrace_embed::embedder::EMBED_DIM];
+        db.insert_drawer(
+            "d1",
+            "how does pgbouncer work: postgres connection pooling uses pgbouncer",
+            &zero,
+            "infra",
+            "db",
+            "test",
+            "test",
+        )
+        .unwrap();
+
+        let kg = KnowledgeGraph::new(&db);
+        kg.add_triple(
+            "pgbouncer",
+            "tool",
+            "runs-in",
+            "transaction mode",
+            "concept",
+            None,
+            1.0,
+            None,
+        )
+        .unwrap();
+
+        // kg_enabled = false
+        let block = recall_block_from_db(
+            &db,
+            "how does pgbouncer work",
+            0.0,
+            3,
+            120,
+            false,
+            3,
+            true,
+            1,
+            120,
+        )
+        .unwrap();
+        assert!(
+            !block.contains("source=\"kg\""),
+            "KG should not appear when disabled: {block}"
+        );
+        assert!(
+            block.contains("pgbouncer"),
+            "BM25 drawer hit should still appear: {block}"
         );
     }
 
