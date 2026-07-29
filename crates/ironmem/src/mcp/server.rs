@@ -1031,16 +1031,27 @@ async fn dispatch_request_with_barrier(
 /// The one place a successful `tools/call` result becomes a JSON-RPC response.
 /// Shared by `dispatch` and the `collab_wait_my_turn` long-poll path so the two
 /// cannot drift in how they frame a result.
+///
+/// `tool_name` drives opt-in response compaction (`compact::should_compact`):
+/// compaction defaults to OFF, so callers that pass `None` — or any tool not
+/// in `compact::COMPACTABLE_TOOLS` — get byte-for-byte the same response
+/// shape as before this existed.
 fn tool_success_response(
     id: Option<serde_json::Value>,
     content: &serde_json::Value,
+    tool_name: Option<&str>,
 ) -> JsonRpcResponse {
+    let effective_content = if super::compact::should_compact(tool_name) {
+        super::compact::try_compact(content).value
+    } else {
+        content.clone()
+    };
     JsonRpcResponse::success(
         id,
         serde_json::json!({
             "content": [{
                 "type": "text",
-                "text": serde_json::to_string_pretty(content).unwrap_or_default()
+                "text": serde_json::to_string_pretty(&effective_content).unwrap_or_default()
             }]
         }),
     )
@@ -1117,12 +1128,17 @@ async fn dispatch_wait_my_turn(
             Err(error) => return tool_error_response(request.id.clone(), tool_name, error),
             Ok((body, settled)) => {
                 if settled {
-                    return tool_success_response(request.id.clone(), &body);
+                    return tool_success_response(
+                        request.id.clone(),
+                        &body,
+                        Some("collab_wait_my_turn"),
+                    );
                 }
                 if std::time::Instant::now() >= deadline {
                     return tool_success_response(
                         request.id.clone(),
                         &serde_json::json!({ "unchanged": true }),
+                        Some("collab_wait_my_turn"),
                     );
                 }
             }
@@ -1193,7 +1209,7 @@ pub fn dispatch(app: &App, request: &JsonRpcRequest) -> Option<JsonRpcResponse> 
                 Some(name) => {
                     let result = tools::call_tool(app, name, &arguments);
                     match result {
-                        Ok(content) => Some(tool_success_response(id, &content)),
+                        Ok(content) => Some(tool_success_response(id, &content, Some(name))),
                         Err(error) => Some(tool_error_response(id, Some(name), error)),
                     }
                 }

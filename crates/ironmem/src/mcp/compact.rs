@@ -73,6 +73,22 @@ pub fn compact_json_value(value: &Value) -> Value {
     })
 }
 
+/// Tools whose responses may be compacted when `IRONMEM_COMPACT_RESPONSES=1`.
+/// Start with `search` — its homogeneous drawer-result arrays are the
+/// highest-value target. Add more tools as their response shapes are validated.
+pub const COMPACTABLE_TOOLS: &[&str] = &["search"];
+
+/// Whether compaction should be applied to this tool's response.
+/// Requires both the env-var opt-in AND the tool being in the allow-list, so
+/// compaction never changes response shape without an explicit operator opt-in.
+pub fn should_compact(tool_name: Option<&str>) -> bool {
+    let Some(name) = tool_name else { return false };
+    std::env::var("IRONMEM_COMPACT_RESPONSES")
+        .ok()
+        .is_some_and(|v| v == "1")
+        && COMPACTABLE_TOOLS.contains(&name)
+}
+
 pub fn expand_compact_value(value: &Value) -> Value {
     let Some(envelope) = value.get("__compact_v1") else {
         return value.clone();
@@ -168,5 +184,30 @@ mod tests {
     fn expand_non_compact_is_identity() {
         let input = serde_json::json!({"status": "ok"});
         assert_eq!(expand_compact_value(&input), input);
+    }
+
+    #[test]
+    fn compaction_disabled_by_default() {
+        // `EnvGuard::pin` takes `ENV_LOCK` for this var so an unguarded
+        // `remove_var` here cannot race `compaction_enabled_for_search_with_env_var`
+        // running concurrently in another thread of the same test binary — see
+        // `ENV_LOCK`'s doc comment in `config.rs` for the failure mode this
+        // avoids. Drop restores whatever the var held before this test ran.
+        let _guard = crate::config::EnvGuard::pin("IRONMEM_COMPACT_RESPONSES");
+        std::env::remove_var("IRONMEM_COMPACT_RESPONSES");
+        assert!(!should_compact(Some("search")));
+    }
+
+    #[test]
+    fn compaction_enabled_for_search_with_env_var() {
+        let _guard = crate::config::EnvGuard::set("IRONMEM_COMPACT_RESPONSES", "1");
+        assert!(should_compact(Some("search")));
+    }
+
+    #[test]
+    fn compaction_not_enabled_for_unlisted_tool() {
+        let _guard = crate::config::EnvGuard::set("IRONMEM_COMPACT_RESPONSES", "1");
+        assert!(!should_compact(Some("status")));
+        assert!(!should_compact(None));
     }
 }
