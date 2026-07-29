@@ -15,20 +15,31 @@ pub fn try_compact(value: &Value) -> CompactResult {
 /// Compact the homogeneous `results` array in a search response while retaining
 /// its response metadata and only applying the transform when it saves bytes.
 pub fn try_compact_search_response(value: &Value) -> CompactResult {
+    compact_result(value, compact_search_response(value))
+}
+
+/// Build a compact search-response candidate without deciding whether its
+/// serialized representation saves bytes. The MCP server compares the complete
+/// JSON-RPC responses because it is responsible for the final wire format.
+pub fn compact_search_response(value: &Value) -> Value {
     let Value::Object(response) = value else {
-        return try_compact(value);
+        return compact_json_value(value);
     };
     let Some(results) = response.get("results") else {
-        return try_compact(value);
+        return compact_json_value(value);
     };
     let mut compacted = response.clone();
     compacted.insert("results".to_string(), compact_json_value(results));
-    compact_result(value, Value::Object(compacted))
+    Value::Object(compacted)
 }
 
 fn compact_result(value: &Value, compacted: Value) -> CompactResult {
-    let original_bytes = serde_json::to_vec(value).map(|v| v.len()).unwrap_or(0);
-    let compacted_bytes = serde_json::to_vec(&compacted).map(|v| v.len()).unwrap_or(0);
+    let original_bytes = serde_json::to_vec(value)
+        .map(|json| json.len())
+        .unwrap_or(0);
+    let compacted_bytes = serde_json::to_vec(&compacted)
+        .map(|json| json.len())
+        .unwrap_or(0);
     if compacted_bytes >= original_bytes {
         return CompactResult {
             value: value.clone(),

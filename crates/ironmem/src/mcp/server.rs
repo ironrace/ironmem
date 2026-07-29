@@ -1060,26 +1060,43 @@ fn tool_success_response(
     content: &serde_json::Value,
     tool_name: Option<&str>,
 ) -> ResponseWithCompactDelta {
-    let (effective_content, compact_delta) = if super::compact::should_compact(tool_name) {
-        let result = super::compact::try_compact_search_response(content);
-        let compact_delta = (result.compacted_bytes < result.original_bytes)
-            .then_some((result.original_bytes, result.compacted_bytes));
-        (result.value, compact_delta)
-    } else {
-        (content.clone(), None)
-    };
-    (
-        JsonRpcResponse::success(
-            id,
-            serde_json::json!({
-                "content": [{
-                    "type": "text",
-                    "text": serde_json::to_string_pretty(&effective_content).unwrap_or_default()
-                }]
-            }),
-        ),
-        compact_delta,
-    )
+    let original = JsonRpcResponse::success(
+        id.clone(),
+        serde_json::json!({
+            "content": [{
+                "type": "text",
+                "text": serde_json::to_string_pretty(content).unwrap_or_default()
+            }]
+        }),
+    );
+    if !super::compact::should_compact(tool_name) {
+        return (original, None);
+    }
+
+    let compacted_content = super::compact::compact_search_response(content);
+    if compacted_content == *content {
+        return (original, None);
+    }
+    let compacted = JsonRpcResponse::success(
+        id,
+        serde_json::json!({
+            "content": [{
+                "type": "text",
+                "text": serde_json::to_string(&compacted_content).unwrap_or_default()
+            }]
+        }),
+    );
+    let original_bytes = serde_json::to_vec(&original)
+        .map(|json| json.len())
+        .unwrap_or(0);
+    let compacted_bytes = serde_json::to_vec(&compacted)
+        .map(|json| json.len())
+        .unwrap_or(0);
+    if compacted_bytes >= original_bytes {
+        return (original, None);
+    }
+
+    (compacted, Some((original_bytes, compacted_bytes)))
 }
 
 /// `collab_wait_my_turn` is a LONG POLL — up to 60s.
@@ -1866,6 +1883,30 @@ mod tests {
         let (_, compact_delta) = tool_success_response(Some(json!(1)), &content, Some("search"));
 
         assert_eq!(compact_delta, None);
+    }
+
+    #[test]
+    fn response_compaction_telemetry_matches_compact_wire_response() {
+        let _env = crate::config::EnvGuard::set("IRONMEM_COMPACT_RESPONSES", "1");
+        let content = json!({
+            "results": [
+                {"id": "a", "score": 1.0, "label": "first"},
+                {"id": "b", "score": 2.0, "label": "second"},
+                {"id": "c", "score": 3.0, "label": "third"},
+            ],
+        });
+
+        let (response, compact_delta) =
+            tool_success_response(Some(json!(1)), &content, Some("search"));
+        let (original_bytes, compacted_bytes) = compact_delta.expect("response must compact");
+
+        assert!(compacted_bytes < original_bytes);
+        assert_eq!(
+            compacted_bytes,
+            serde_json::to_vec(&response)
+                .expect("JSON-RPC response must serialize")
+                .len()
+        );
     }
 
     use crate::metrics::METRICS_ENV_LOCK;
