@@ -29,11 +29,13 @@ const COLLAB_RECOVERY_STATE_SQL: &str =
 const COLLAB_MESSAGE_DRAWERS_SQL: &str =
     include_str!("../../migrations/016_collab_message_drawers.sql");
 const DRAWER_SUPERSESSION_SQL: &str = include_str!("../../migrations/017_drawer_supersession.sql");
+const MCP_RESPONSE_COMPACTION_METRICS_SQL: &str =
+    include_str!("../../migrations/018_mcp_response_compaction_metrics.sql");
 
 /// Highest schema version a fully-migrated database reports. Bump alongside the
 /// `run_version_gated_migrations` ladder below so `ironmem doctor` can tell a
 /// behind-migration database from an up-to-date one.
-pub const LATEST_SCHEMA_VERSION: i64 = 17;
+pub const LATEST_SCHEMA_VERSION: i64 = 18;
 
 /// Database wrapper around a SQLite connection.
 ///
@@ -294,6 +296,14 @@ impl Database {
             self.conn.execute_batch(DRAWER_SUPERSESSION_SQL)?;
         }
 
+        // v18: nullable serialized JSON byte counts for response compaction
+        // telemetry. NULL preserves the distinction between unavailable and
+        // zero-savings values for all pre-018 rows.
+        if current_version < 18 {
+            self.conn
+                .execute_batch(MCP_RESPONSE_COMPACTION_METRICS_SQL)?;
+        }
+
         Ok(())
     }
 
@@ -457,7 +467,7 @@ mod tests {
         // fully-migrated database reports — doctor compares against it.
         let db = Database::open_in_memory().unwrap();
         assert_eq!(LATEST_SCHEMA_VERSION, db.schema_version().unwrap());
-        assert_eq!(LATEST_SCHEMA_VERSION, 17);
+        assert_eq!(LATEST_SCHEMA_VERSION, 18);
     }
 
     #[test]
@@ -1235,6 +1245,12 @@ mod tests {
         assert!(index_exists(&db, "idx_occupancy_session_ts"));
         assert!(column_exists(&db, "collab_sessions", "task_list_drawer_id"));
         assert!(column_exists(&db, "token_usage", "tool_name"));
+        assert!(column_exists(&db, "token_usage", "original_response_bytes"));
+        assert!(column_exists(
+            &db,
+            "token_usage",
+            "compacted_response_bytes"
+        ));
     }
 
     #[test]

@@ -99,6 +99,10 @@ pub struct NewTokenUsage {
     pub map_status: Option<MapStatus>,
     pub turn_id: Option<String>,
     pub area: Option<String>,
+    /// Serialized JSON byte sizes observed when opt-in response compaction ran.
+    /// Both are `None` when compaction was disabled or the response was ineligible.
+    pub original_response_bytes: Option<i64>,
+    pub compacted_response_bytes: Option<i64>,
 }
 
 /// Build a `NewTokenUsage` from an LLM call result. `source` is the call site
@@ -135,6 +139,8 @@ pub fn new_token_usage_from_llm(
         map_status: None,
         turn_id: None,
         area: None,
+        original_response_bytes: None,
+        compacted_response_bytes: None,
     }
 }
 
@@ -172,6 +178,8 @@ impl NewTokenUsage {
             map_status: None,
             turn_id: Some(row.turn_id),
             area: None,
+            original_response_bytes: None,
+            compacted_response_bytes: None,
         }
     }
 
@@ -216,6 +224,8 @@ pub struct TokenUsage {
     pub map_status: Option<MapStatus>,
     pub turn_id: Option<String>,
     pub area: Option<String>,
+    pub original_response_bytes: Option<i64>,
+    pub compacted_response_bytes: Option<i64>,
 }
 
 /// Query filters for `token_usage`. All fields are optional; unset fields
@@ -327,6 +337,8 @@ fn map_token_usage(row: &rusqlite::Row<'_>) -> rusqlite::Result<TokenUsage> {
         map_status: row.get(17)?,
         turn_id: row.get(18)?,
         area: row.get(19)?,
+        original_response_bytes: row.get(20)?,
+        compacted_response_bytes: row.get(21)?,
     })
 }
 
@@ -534,8 +546,8 @@ impl Database {
                 ts, source, harness, model, tool_name, session_id, collab_session_id, collab_phase,
                 task_tag, input_tokens, output_tokens, cache_creation_input_tokens,
                 cache_read_input_tokens, estimated, chars, cost_usd,
-                map_status, turn_id, area
-            ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19)",
+                map_status, turn_id, area, original_response_bytes, compacted_response_bytes
+            ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21)",
             params![
                 row.ts,
                 row.source,
@@ -556,6 +568,8 @@ impl Database {
                 row.map_status,
                 row.turn_id,
                 row.area,
+                row.original_response_bytes,
+                row.compacted_response_bytes,
             ],
         )?;
         Ok(self.conn.last_insert_rowid())
@@ -572,7 +586,7 @@ impl Database {
             "SELECT id, ts, source, harness, model, tool_name, session_id, collab_session_id, collab_phase,
                     task_tag, input_tokens, output_tokens, cache_creation_input_tokens,
                     cache_read_input_tokens, estimated, chars, cost_usd,
-                    map_status, turn_id, area
+                    map_status, turn_id, area, original_response_bytes, compacted_response_bytes
              FROM token_usage
              WHERE (?1 IS NULL OR task_tag = ?1)
                AND (?2 IS NULL OR collab_session_id = ?2)
@@ -1052,6 +1066,8 @@ impl Database {
             map_status,
             turn_id: turn_id.map(|s| s.to_string()),
             area: area.map(|s| s.to_string()),
+            original_response_bytes: None,
+            compacted_response_bytes: None,
         })
     }
 
@@ -1488,6 +1504,8 @@ mod tests {
             map_status: None,
             turn_id: None,
             area: None,
+            original_response_bytes: None,
+            compacted_response_bytes: None,
         }
     }
 
@@ -2198,6 +2216,8 @@ mod tests {
             map_status: None,
             turn_id: None,
             area: None,
+            original_response_bytes: None,
+            compacted_response_bytes: None,
         }
     }
 
@@ -2703,6 +2723,8 @@ mod tests {
             map_status: None,
             turn_id: Some(turn_id.to_string()),
             area: None,
+            original_response_bytes: None,
+            compacted_response_bytes: None,
         }
     }
 
@@ -2760,6 +2782,8 @@ mod tests {
             map_status: None,
             turn_id: Some("transcript:sess-t1:msg-1".to_string()),
             area: None,
+            original_response_bytes: None,
+            compacted_response_bytes: None,
         };
         db.insert_token_usage(&mcp_row).unwrap();
 
@@ -2826,6 +2850,8 @@ mod tests {
             map_status: None,
             turn_id: Some("transcript:sess-1:msg-1".into()),
             area: None,
+            original_response_bytes: None,
+            compacted_response_bytes: None,
         })
         .unwrap();
 
@@ -2850,6 +2876,8 @@ mod tests {
             map_status: None,
             turn_id: Some("transcript:codex-sess-1:codex-final".into()),
             area: None,
+            original_response_bytes: None,
+            compacted_response_bytes: None,
         })
         .unwrap();
 
@@ -2903,6 +2931,8 @@ mod tests {
             map_status: None,
             turn_id: Some("transcript:x:y".into()),
             area: None,
+            original_response_bytes: None,
+            compacted_response_bytes: None,
         })
         .unwrap();
         let headline = db.report_headline(Some("est-task"), None).unwrap();
@@ -2936,6 +2966,8 @@ mod tests {
             map_status: None,
             turn_id: Some("transcript:codex-sess-1:codex-final".to_string()),
             area: None,
+            original_response_bytes: None,
+            compacted_response_bytes: None,
         };
         db.upsert_transcript_token_usage(&codex_row).unwrap();
         db.upsert_transcript_token_usage(&codex_row).unwrap();

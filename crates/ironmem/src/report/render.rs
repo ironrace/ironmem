@@ -256,6 +256,8 @@ mod tests {
             map_status: None,
             turn_id: None,
             area: None,
+            original_response_bytes: None,
+            compacted_response_bytes: None,
         }
     }
 

@@ -145,6 +145,11 @@ pub(super) fn parse_failure_report_event(content: &str) -> Result<CollabEvent, M
             )
         })?
         .to_string();
+    let coding_failure = if crate::mcp::compact::should_compact_failure_reports() {
+        crate::mcp::compact::compact_failure_log(&coding_failure, MAX_CODING_FAILURE_CHARS)
+    } else {
+        coding_failure
+    };
     if coding_failure.chars().count() > MAX_CODING_FAILURE_CHARS {
         return Err(MemoryError::Validation(format!(
             "failure_report coding_failure exceeds {MAX_CODING_FAILURE_CHARS} chars",
@@ -329,6 +334,33 @@ mod tests {
                 "{recoverable_only} must NOT be off-turn admissible"
             );
         }
+    }
+
+    #[test]
+    fn failure_report_compaction_preserves_error_and_classification() {
+        let _guard = crate::config::EnvGuard::set("IRONMEM_COMPACT_RESPONSES", "1");
+        let verbose = (0..200)
+            .map(|index| format!("remote: Counting objects: {index}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let error = "error: failed to push some refs to 'origin'\nhint: Updates were rejected because the remote contains work\nhint: that you do not have locally.";
+        let full_log = format!("git_push_failed:\n{verbose}\n{error}");
+        assert!(full_log.chars().count() > MAX_CODING_FAILURE_CHARS);
+
+        let event = parse_failure_report_event(&json!({ "coding_failure": full_log }).to_string())
+            .expect("enabled failure-report compaction should fit the field limit");
+        let CollabEvent::FailureReport { coding_failure } = event else {
+            panic!("expected FailureReport event");
+        };
+
+        assert!(coding_failure.chars().count() <= MAX_CODING_FAILURE_CHARS);
+        assert!(coding_failure.starts_with("git_push_failed:"));
+        assert!(coding_failure.contains("hint: that you do not have locally."));
+        assert!(coding_failure.contains("[..."));
+        assert_eq!(
+            crate::collab::classify(&coding_failure),
+            crate::collab::FailureClass::Tooling
+        );
     }
 
     #[test]

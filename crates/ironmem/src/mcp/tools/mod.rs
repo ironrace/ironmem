@@ -1704,4 +1704,20 @@ mod tests {
             .expect("excerpt should be a string");
         assert!(excerpt_at_sixteen.starts_with("…x"));
     }
+
+    /// `compact::COMPACTABLE_TOOLS` opts tools into response compaction
+    /// independently of this module's mutating/read-only classification, but
+    /// it still names TOOLS — an entry that is not a real, advertised tool
+    /// would be silently inert (`should_compact` would gate on a name
+    /// `tools/call` can never receive) instead of failing loudly at the one
+    /// place that would catch a typo or a renamed tool.
+    #[test]
+    fn compactable_tools_are_known_tools() {
+        for name in crate::mcp::compact::COMPACTABLE_TOOLS {
+            assert!(
+                tool_known(name),
+                "{name} is listed in COMPACTABLE_TOOLS but is not a known tool"
+            );
+        }
+    }
 }

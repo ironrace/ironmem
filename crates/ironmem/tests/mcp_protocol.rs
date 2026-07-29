@@ -9,8 +9,51 @@ use ironmem::mcp::server::dispatch;
 use serde_json::json;
 use sha2::{Digest, Sha256};
 use std::collections::HashSet;
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::{Mutex, MutexGuard};
+
+static COMPACT_RESPONSES_ENV_LOCK: Mutex<()> = Mutex::new(());
+
+struct CompactResponsesEnvGuard {
+    previous: Option<OsString>,
+    _lock: MutexGuard<'static, ()>,
+}
+
+impl CompactResponsesEnvGuard {
+    fn enabled() -> Self {
+        Self::set(Some("1"))
+    }
+
+    fn disabled() -> Self {
+        Self::set(None)
+    }
+
+    fn set(value: Option<&str>) -> Self {
+        let lock = COMPACT_RESPONSES_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let previous = std::env::var_os("IRONMEM_COMPACT_RESPONSES");
+        match value {
+            Some(value) => std::env::set_var("IRONMEM_COMPACT_RESPONSES", value),
+            None => std::env::remove_var("IRONMEM_COMPACT_RESPONSES"),
+        }
+        Self {
+            previous,
+            _lock: lock,
+        }
+    }
+}
+
+impl Drop for CompactResponsesEnvGuard {
+    fn drop(&mut self) {
+        match &self.previous {
+            Some(value) => std::env::set_var("IRONMEM_COMPACT_RESPONSES", value),
+            None => std::env::remove_var("IRONMEM_COMPACT_RESPONSES"),
+        }
+    }
+}
 
 fn git(args: &[&str], cwd: &Path) -> String {
     let output = Command::new("git")
@@ -329,6 +372,63 @@ fn search_full_returns_content_over_mcp() {
         .expect("full search should return the inserted drawer");
     assert_eq!(hit["content"], body);
     assert!(hit.get("excerpt").is_none());
+}
+
+#[test]
+fn search_response_compacted_when_enabled() {
+    let app = App::open_for_test().unwrap();
+    let query = "compact-search-response-fixture";
+
+    for index in 0..3 {
+        call_tool(
+            &app,
+            "add_drawer",
+            json!({
+                "content": format!("{query} result {index}"),
+                "wing": "protocol-tests",
+                "room": "mcp",
+            }),
+        );
+    }
+
+    let original_results = {
+        let _guard = CompactResponsesEnvGuard::disabled();
+        call_tool(&app, "search", json!({ "query": query, "limit": 3 }))["results"].clone()
+    };
+    let response = {
+        let _guard = CompactResponsesEnvGuard::enabled();
+        call_tool(&app, "search", json!({ "query": query, "limit": 3 }))
+    };
+    let compacted_results = &response["results"];
+    assert!(
+        compacted_results.get("__compact_v1").is_some(),
+        "enabled search result must carry the compact envelope: {response}"
+    );
+    let expanded = ironmem::mcp::compact::expand_compact_value(compacted_results);
+    assert_eq!(expanded, original_results);
+}
+
+#[test]
+fn search_response_unchanged_when_disabled() {
+    let _guard = CompactResponsesEnvGuard::disabled();
+    let app = App::open_for_test().unwrap();
+    let query = "uncompacted-search-response-fixture";
+
+    for index in 0..3 {
+        call_tool(
+            &app,
+            "add_drawer",
+            json!({
+                "content": format!("{query} result {index}"),
+                "wing": "protocol-tests",
+                "room": "mcp",
+            }),
+        );
+    }
+
+    let response = call_tool(&app, "search", json!({ "query": query, "limit": 3 }));
+    assert!(response["results"].is_array());
+    assert!(response["results"].get("__compact_v1").is_none());
 }
 
 #[test]
