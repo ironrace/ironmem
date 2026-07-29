@@ -73,8 +73,9 @@ itself a DIRECT signal.
 - **Decomposability** — number of *independent* execution tasks; an estimate
   above 10 requires `SPLIT`
 - **Spec clarity** — well-specified vs ambiguous / under-defined
-- **Verification value** — would adversarial second-model review materially
-  de-risk it before merge?
+- **Security / review depth** — does it touch security-sensitive code (auth,
+  credentials, billing, user data)? Drives the post-implementation review
+  tier, not the execution path.
 
 ## Step 4 — Decide (first match wins)
 
@@ -84,8 +85,9 @@ SUPERPOWERS is the default middle. The counts below touch at the seams; when
 they overlap, the deciding factor is **task independence, not the number**
 (one tightly-coupled unit → DIRECT; two or more independently shippable tasks
 → SUPERPOWERS), and COLLAB's
-design-judgment / adversarial-review triggers dominate its crate-count range
-(a purely mechanical 3+-crate rename is SUPERPOWERS, not COLLAB).
+design-judgment triggers dominate its crate-count range (a purely mechanical
+3+-crate rename is SUPERPOWERS, not COLLAB). Security sensitivity alone does
+not justify COLLAB — it drives the review tier recommendation instead.
 
 0. **SPLIT** — choose before every other route when the issue credibly needs
    **more than 10 independent execution tasks**. Do not start collab for the
@@ -103,10 +105,10 @@ design-judgment / adversarial-review triggers dominate its crate-count range
 2. **COLLAB** — choose when **any** hold: requires real design judgment
    (public API/contract, state-machine, schema migration, new subsystem);
    ambiguous requirements that benefit from a second independent perspective;
-   large blast radius (~3+ crates or many interacting modules); genuine value
-   in cross-model adversarial review before merge (correctness-critical,
-   security-sensitive, protocol-level). (Protocol/state-machine changes,
-   migrations, cross-crate features.)
+   large blast radius (~3+ crates or many interacting modules) with tightly
+   interacting changes. Security sensitivity alone does not justify COLLAB —
+   it is handled by the review recommendation. (Protocol/state-machine
+   changes, migrations, cross-crate features.)
 
 3. **SUPERPOWERS** — the default middle when neither above fits: 2–6
    independently shippable tasks; moderate blast radius (1–2 crates);
@@ -134,6 +136,9 @@ Blast radius: <N files, M crates> (<main ones>)
 
 Recommended path:
   <exact command from the table below>
+
+Recommended review:
+  <review command — see review tier table below>
 
 For `SPLIT`, insert before the confirmation line:
 
@@ -171,6 +176,21 @@ parent comments.
 | SUPERPOWERS | Invoke the `writing-plans` skill on the issue spec; it flows into `subagent-driven-development`. |
 | COLLAB | Run `/collab start <one-line imperative task summary derived from the issue>`. Do not paste the whole issue body. |
 | SPLIT | Create the confirmed child issues, then run `/evaluate-issue` for each child. |
+
+### Review tiers
+
+Based on change complexity and security sensitivity, recommend one
+post-implementation review. This is independent of the execution-path verdict
+— a DIRECT fix in auth code still gets a Deep review.
+
+| Tier | When | Command |
+|---|---|---|
+| Standard | Small, contained changes with no security surface | `/code-review` |
+| Thorough | Multi-file changes, moderate complexity | `/pr-review-toolkit:review-pr` |
+| Deep | Complex changes, security-sensitive code (auth, credentials, billing, user data), or high blast radius | `/ultrareview-local` |
+
+Security-sensitive changes always warrant at minimum Thorough, and typically
+Deep, regardless of the execution-path verdict.
 
 ## Invariants
 
