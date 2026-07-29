@@ -670,6 +670,8 @@ mod tests {
             map_status: None,
             turn_id: None,
             area: None,
+            original_response_bytes: None,
+            compacted_response_bytes: None,
         };
         db.insert_token_usage(&row("planning", "claude-opus-4-8", 1_000_000, None))
             .unwrap();
@@ -781,6 +783,7 @@ mod tests {
                 area: Some("core".into()),
                 map_status: Some(MapStatus::Hit),
             }),
+            None,
         );
         // map_miss turn: chars=120 → output_tokens = ceil(120/4) = 30.
         account_mcp_response(
@@ -795,6 +798,7 @@ mod tests {
                 area: Some("core".into()),
                 map_status: Some(MapStatus::Miss),
             }),
+            None,
         );
 
         // Sanity: the live rows are estimated=true.
@@ -894,6 +898,8 @@ mod tests {
             map_status: None,
             turn_id: Some("tx-1".into()),
             area: None,
+            original_response_bytes: None,
+            compacted_response_bytes: None,
         })
         .unwrap();
 
@@ -985,6 +991,8 @@ mod tests {
             map_status: None,
             turn_id: None,
             area: None,
+            original_response_bytes: None,
+            compacted_response_bytes: None,
         };
         db.insert_token_usage(&row(Some("impl"))).unwrap();
         db.insert_token_usage(&row(None)).unwrap();

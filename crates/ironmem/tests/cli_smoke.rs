@@ -261,6 +261,8 @@ fn cli_report_json_smoke_test() {
             map_status: None,
             turn_id: None,
             area: None,
+            original_response_bytes: None,
+            compacted_response_bytes: None,
         })
         .unwrap();
     }

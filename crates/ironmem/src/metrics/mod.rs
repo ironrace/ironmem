@@ -305,6 +305,7 @@ pub(crate) fn account_mcp_response(
     session_id: Option<&str>,
     ctx: &MetricsContext,
     exploration: Option<&ExplorationContext>,
+    compact_delta: Option<(usize, usize)>,
 ) {
     let exploration = exploration.filter(|exp| exp.map_status.is_some());
     let row = NewTokenUsage {
@@ -327,6 +328,8 @@ pub(crate) fn account_mcp_response(
         map_status: exploration.and_then(|exp| exp.map_status),
         turn_id: exploration.and_then(|exp| exp.turn_id.clone()),
         area: exploration.and_then(|exp| exp.area.clone()),
+        original_response_bytes: compact_delta.map(|(original, _)| original as i64),
+        compacted_response_bytes: compact_delta.map(|(_, compacted)| compacted as i64),
     }
     .with_context(ctx);
     if let Err(e) = db.insert_token_usage(&row) {
@@ -500,6 +503,8 @@ mod tests {
             map_status: None,
             turn_id: None,
             area: None,
+            original_response_bytes: None,
+            compacted_response_bytes: None,
         }
         .with_context(&ctx);
         assert_eq!(row.collab_session_id.as_deref(), Some("collab-1"));
@@ -527,6 +532,7 @@ mod tests {
             None,
             &ctx,
             Some(&exploration),
+            None,
         );
 
         let rows = db
@@ -544,6 +550,45 @@ mod tests {
         let report = db.report_exploration_delta().unwrap();
         assert_eq!(report.total_turns, 1);
         assert!((report.mean_tokens_map_hit - 3.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn account_mcp_response_records_compact_delta() {
+        let db = crate::db::schema::Database::open_in_memory().unwrap();
+        let ctx = MetricsContext::default();
+
+        account_mcp_response(
+            &db,
+            100,
+            "claude",
+            Some("search"),
+            None,
+            &ctx,
+            None,
+            Some((200, 100)),
+        );
+
+        let rows = db
+            .query_token_usage(&crate::db::metrics::TokenUsageQuery::default())
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].original_response_bytes, Some(200));
+        assert_eq!(rows[0].compacted_response_bytes, Some(100));
+    }
+
+    #[test]
+    fn account_mcp_response_null_delta_when_not_compacted() {
+        let db = crate::db::schema::Database::open_in_memory().unwrap();
+        let ctx = MetricsContext::default();
+
+        account_mcp_response(&db, 100, "claude", Some("search"), None, &ctx, None, None);
+
+        let rows = db
+            .query_token_usage(&crate::db::metrics::TokenUsageQuery::default())
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].original_response_bytes, None);
+        assert_eq!(rows[0].compacted_response_bytes, None);
     }
 
     fn test_app() -> std::sync::Arc<crate::mcp::app::App> {

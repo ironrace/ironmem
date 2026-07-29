@@ -45,6 +45,8 @@ fn tok(
         map_status: None,
         turn_id: None,
         area: None,
+        original_response_bytes: None,
+        compacted_response_bytes: None,
     }
 }
 
@@ -545,6 +547,8 @@ fn headline_cost_attaches_when_tokens_keyed_by_task_tag_not_collab_id() {
         map_status: None,
         turn_id: None,
         area: None,
+        original_response_bytes: None,
+        compacted_response_bytes: None,
     })
     .unwrap();
 
@@ -897,6 +901,8 @@ fn mcp_turn(turn_id: &str, out: i64, status: ironmem::db::MapStatus) -> NewToken
         map_status: Some(status),
         turn_id: Some(turn_id.into()),
         area: Some("core".into()),
+        original_response_bytes: None,
+        compacted_response_bytes: None,
     }
 }
 
@@ -989,6 +995,8 @@ fn mcp_response(
         map_status: None,
         turn_id: None,
         area: None,
+        original_response_bytes: None,
+        compacted_response_bytes: None,
     }
 }
 

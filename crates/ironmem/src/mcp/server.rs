@@ -157,6 +157,7 @@ fn account_response_metrics(
     session_id: Option<&str>,
     request_collab_session_id: Option<&str>,
     exploration: Option<&crate::metrics::ExplorationContext>,
+    compact_delta: Option<(usize, usize)>,
 ) {
     if !crate::search::tunables::metrics_enabled() {
         return;
@@ -171,6 +172,7 @@ fn account_response_metrics(
             session_id,
             &metrics_ctx,
             exploration,
+            compact_delta,
         );
     });
 }
@@ -183,8 +185,12 @@ fn account_response_metrics(
 /// from the mutation queue — and two `async` blocks are two distinct opaque
 /// types that cannot share one `FuturesUnordered`. `LocalBoxFuture`, not
 /// `BoxFuture`: `Arc<App>` is `!Send` (see `daemon`'s module doc).
-type InFlightRequest<'a> =
-    futures_util::future::LocalBoxFuture<'a, (u64, JsonRpcRequest, Option<JsonRpcResponse>)>;
+type CompactDelta = Option<(usize, usize)>;
+type ResponseWithCompactDelta = (JsonRpcResponse, CompactDelta);
+type InFlightRequest<'a> = futures_util::future::LocalBoxFuture<
+    'a,
+    (u64, JsonRpcRequest, Option<ResponseWithCompactDelta>),
+>;
 
 /// A one-shot signal that a mutation may release the per-connection ordering
 /// barrier BEFORE its response completes, the moment its claim on
@@ -649,6 +655,7 @@ where
                             &conn,
                             chars,
                             None,
+                            None,
                             conn.session_id.as_deref(),
                             None,
                             None,
@@ -668,6 +675,7 @@ where
                         app,
                         &conn,
                         chars,
+                        None,
                         None,
                         conn.session_id.as_deref(),
                         None,
@@ -872,6 +880,7 @@ async fn reject_mutation(
         sid.as_deref(),
         request_collab_id.as_deref(),
         None,
+        None,
     );
     Ok(())
 }
@@ -883,9 +892,9 @@ async fn write_and_account(
     conn: &ConnectionContext,
     stdout: &mut (impl AsyncWrite + Unpin),
     request: &JsonRpcRequest,
-    response: Option<JsonRpcResponse>,
+    response: Option<ResponseWithCompactDelta>,
 ) -> Result<(), MemoryError> {
-    let Some(resp) = response else {
+    let Some((resp, compact_delta)) = response else {
         return Ok(());
     };
     // Extract the tool result JSON (if this is a successful tools/call)
@@ -915,6 +924,7 @@ async fn write_and_account(
         sid.as_deref(),
         request_collab_id.as_deref(),
         exploration.as_ref(),
+        compact_delta,
     );
     Ok(())
 }
@@ -958,7 +968,9 @@ async fn dispatch_request(
     request: &JsonRpcRequest,
     arrived_at: std::time::Instant,
 ) -> Option<JsonRpcResponse> {
-    dispatch_request_with_barrier(app, request, arrived_at, None).await
+    dispatch_request_with_barrier(app, request, arrived_at, None)
+        .await
+        .map(|(response, _)| response)
 }
 
 /// The barrier-aware form of `dispatch_request`. `dispatch_request` itself
@@ -971,7 +983,7 @@ async fn dispatch_request_with_barrier(
     request: &JsonRpcRequest,
     arrived_at: std::time::Instant,
     barrier: Option<BarrierRelease>,
-) -> Option<JsonRpcResponse> {
+) -> Option<ResponseWithCompactDelta> {
     let tool_name = request.params.get("name").and_then(|value| value.as_str());
 
     // The only tool that BLOCKS by design rather than by accident. Driven here
@@ -1000,7 +1012,10 @@ async fn dispatch_request_with_barrier(
             if let Err(error) =
                 tokio::task::block_in_place(|| tools::precheck_write_request(app, name, &arguments))
             {
-                return Some(tool_error_response(request.id.clone(), tool_name, error));
+                return Some((
+                    tool_error_response(request.id.clone(), tool_name, error),
+                    None,
+                ));
             }
         }
 
@@ -1021,11 +1036,14 @@ async fn dispatch_request_with_barrier(
             .write_readiness_timeout()
             .saturating_sub(arrived_at.elapsed());
         if let Err(error) = app.memory_ready.wait_for_write_async(timeout).await {
-            return Some(tool_error_response(request.id.clone(), tool_name, error));
+            return Some((
+                tool_error_response(request.id.clone(), tool_name, error),
+                None,
+            ));
         }
     }
 
-    tokio::task::block_in_place(|| dispatch(app, request))
+    tokio::task::block_in_place(|| dispatch_with_compact_delta(app, request))
 }
 
 /// The one place a successful `tools/call` result becomes a JSON-RPC response.
@@ -1040,20 +1058,27 @@ fn tool_success_response(
     id: Option<serde_json::Value>,
     content: &serde_json::Value,
     tool_name: Option<&str>,
-) -> JsonRpcResponse {
-    let effective_content = if super::compact::should_compact(tool_name) {
-        super::compact::try_compact(content).value
+) -> ResponseWithCompactDelta {
+    let (effective_content, compact_delta) = if super::compact::should_compact(tool_name) {
+        let result = super::compact::try_compact(content);
+        (
+            result.value,
+            Some((result.original_bytes, result.compacted_bytes)),
+        )
     } else {
-        content.clone()
+        (content.clone(), None)
     };
-    JsonRpcResponse::success(
-        id,
-        serde_json::json!({
-            "content": [{
-                "type": "text",
-                "text": serde_json::to_string_pretty(&effective_content).unwrap_or_default()
-            }]
-        }),
+    (
+        JsonRpcResponse::success(
+            id,
+            serde_json::json!({
+                "content": [{
+                    "type": "text",
+                    "text": serde_json::to_string_pretty(&effective_content).unwrap_or_default()
+                }]
+            }),
+        ),
+        compact_delta,
     )
 }
 
@@ -1103,7 +1128,7 @@ async fn dispatch_wait_my_turn(
     request: &JsonRpcRequest,
     arrived_at: std::time::Instant,
     barrier: Option<BarrierRelease>,
-) -> JsonRpcResponse {
+) -> ResponseWithCompactDelta {
     let tool_name = request_tool_name(request);
     let args = request
         .params
@@ -1113,7 +1138,12 @@ async fn dispatch_wait_my_turn(
 
     let baseline = match tokio::task::block_in_place(|| tools::wait_my_turn_begin(app, &args)) {
         Ok(baseline) => baseline,
-        Err(error) => return tool_error_response(request.id.clone(), tool_name, error),
+        Err(error) => {
+            return (
+                tool_error_response(request.id.clone(), tool_name, error),
+                None,
+            )
+        }
     };
     let claim_committed_at = tools::ClaimCommittedAt(std::time::Instant::now());
     let deadline =
@@ -1125,7 +1155,12 @@ async fn dispatch_wait_my_turn(
 
     loop {
         match tokio::task::block_in_place(|| tools::wait_my_turn_poll(app, &args, &baseline)) {
-            Err(error) => return tool_error_response(request.id.clone(), tool_name, error),
+            Err(error) => {
+                return (
+                    tool_error_response(request.id.clone(), tool_name, error),
+                    None,
+                )
+            }
             Ok((body, settled)) => {
                 if settled {
                     return tool_success_response(
@@ -1175,6 +1210,13 @@ fn tool_error_response(
 }
 
 pub fn dispatch(app: &App, request: &JsonRpcRequest) -> Option<JsonRpcResponse> {
+    dispatch_with_compact_delta(app, request).map(|(response, _)| response)
+}
+
+fn dispatch_with_compact_delta(
+    app: &App,
+    request: &JsonRpcRequest,
+) -> Option<ResponseWithCompactDelta> {
     let id = request.id.clone();
 
     match request.method.as_str() {
@@ -1184,16 +1226,16 @@ pub fn dispatch(app: &App, request: &JsonRpcRequest) -> Option<JsonRpcResponse> 
         // across many (see `ConnectionContext` doc comment). `dispatch` stays
         // a pure request -> response function so its many direct test callers
         // (outside this module) are unaffected by this change.
-        "initialize" => Some(JsonRpcResponse::success(
-            id,
-            protocol::capabilities_response(),
+        "initialize" => Some((
+            JsonRpcResponse::success(id, protocol::capabilities_response()),
+            None,
         )),
 
         "tools/list" => {
             let tool_list = tools::tool_definitions(app);
-            Some(JsonRpcResponse::success(
-                id,
-                serde_json::json!({ "tools": tool_list }),
+            Some((
+                JsonRpcResponse::success(id, serde_json::json!({ "tools": tool_list })),
+                None,
             ))
         }
 
@@ -1210,19 +1252,21 @@ pub fn dispatch(app: &App, request: &JsonRpcRequest) -> Option<JsonRpcResponse> 
                     let result = tools::call_tool(app, name, &arguments);
                     match result {
                         Ok(content) => Some(tool_success_response(id, &content, Some(name))),
-                        Err(error) => Some(tool_error_response(id, Some(name), error)),
+                        Err(error) => Some((tool_error_response(id, Some(name), error), None)),
                     }
                 }
-                None => Some(JsonRpcResponse::error(id, -32602, "Missing tool name")),
+                None => Some((
+                    JsonRpcResponse::error(id, -32602, "Missing tool name"),
+                    None,
+                )),
             }
         }
 
         "notifications/initialized" | "notifications/cancelled" => None, // No response
 
-        _ => Some(JsonRpcResponse::error(
-            id,
-            -32601,
-            &format!("Unknown method: {}", request.method),
+        _ => Some((
+            JsonRpcResponse::error(id, -32601, &format!("Unknown method: {}", request.method)),
+            None,
         )),
     }
 }
@@ -3512,7 +3556,7 @@ mod tests {
         };
         let wait = dispatch_wait_my_turn(&app, &request, arrived_at, None);
 
-        let (_, response) =
+        let (_, (response, _)) =
             tokio::time::timeout(Duration::from_secs(3), async { tokio::join!(flip, wait) })
                 .await
                 .expect(
@@ -3564,7 +3608,7 @@ mod tests {
         );
         let arrived_at = std::time::Instant::now() - Duration::from_secs(timeout_secs + 5);
 
-        let response = tokio::time::timeout(
+        let (response, _) = tokio::time::timeout(
             Duration::from_millis(300),
             dispatch_wait_my_turn(&app, &request, arrived_at, None),
         )
@@ -3595,7 +3639,7 @@ mod tests {
         );
         let arrived_at = std::time::Instant::now() - Duration::from_secs(35);
 
-        let response = tokio::time::timeout(
+        let (response, _) = tokio::time::timeout(
             Duration::from_millis(200),
             dispatch_wait_my_turn(&app, &request, arrived_at, None),
         )
@@ -3635,7 +3679,7 @@ mod tests {
         let arrived_at = std::time::Instant::now();
 
         let started = std::time::Instant::now();
-        let response = tokio::time::timeout(
+        let (response, _) = tokio::time::timeout(
             Duration::from_millis(1800),
             dispatch_wait_my_turn(&app, &request, arrived_at, None),
         )

@@ -1018,6 +1018,8 @@ mod tests {
             map_status: None,
             turn_id: None,
             area: None,
+            original_response_bytes: None,
+            compacted_response_bytes: None,
         };
         let row_id = db
             .insert_token_usage(&new_row)
