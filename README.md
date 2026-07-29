@@ -913,6 +913,19 @@ session.
 | `IRONMEM_SESSION_ID` | (unset) | Override seam that pins the harness session id for `session_summary` co-keying when the MCP `initialize` request does not carry one. Primarily for testing. |
 | `IRONMEM_HARNESS` | (unset) | Override seam pinning metrics harness attribution to `claude` or `codex` (otherwise learned from `initialize.clientInfo`). Primarily for testing. |
 
+### MCP response compaction (off by default)
+
+Set `IRONMEM_COMPACT_RESPONSES=1` to compact eligible MCP responses. The
+current allow-list contains `search`: its homogeneous `results` array is sent
+as a lossless `__compact_v1` column envelope, which consumers can expand back
+to the original row array. The same opt-in trims oversized `failure_report`
+log bodies while retaining the classification prefix and final actionable
+lines. With the variable unset or any value other than `1`, response shapes
+and failure-report length validation are unchanged.
+
+When metrics are enabled, compacted responses record their original and
+compacted JSON byte counts in `token_usage` for savings analysis.
+
 #### Reporting
 
 `ironmem report` renders the recorded metrics (see `docs/METRICS_SPEC.md` §10 + the §7 cost table):
