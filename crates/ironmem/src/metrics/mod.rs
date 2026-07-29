@@ -297,6 +297,7 @@ pub(crate) struct ExplorationContext {
 /// When `exploration` is `Some`, the live estimated MCP response row is tagged
 /// with Phase-5 code-map attribution. The token proxy remains the response-size
 /// estimate (`ceil(chars / 4)`), matching METRICS_SPEC's v0 cost model.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn account_mcp_response(
     db: &Database,
     chars: i64,

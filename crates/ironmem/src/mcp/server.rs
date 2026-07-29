@@ -149,6 +149,7 @@ fn normalize_session_id(value: &str) -> Option<String> {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn account_response_metrics(
     app: &App,
     conn: &ConnectionContext,
@@ -1060,7 +1061,7 @@ fn tool_success_response(
     tool_name: Option<&str>,
 ) -> ResponseWithCompactDelta {
     let (effective_content, compact_delta) = if super::compact::should_compact(tool_name) {
-        let result = super::compact::try_compact(content);
+        let result = super::compact::try_compact_search_response(content);
         (
             result.value,
             Some((result.original_bytes, result.compacted_bytes)),

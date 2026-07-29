@@ -9,8 +9,25 @@ pub struct CompactResult {
 }
 
 pub fn try_compact(value: &Value) -> CompactResult {
+    compact_result(value, compact_json_value(value))
+}
+
+/// Compact the homogeneous `results` array in a search response while retaining
+/// its response metadata and only applying the transform when it saves bytes.
+pub fn try_compact_search_response(value: &Value) -> CompactResult {
+    let Value::Object(response) = value else {
+        return try_compact(value);
+    };
+    let Some(results) = response.get("results") else {
+        return try_compact(value);
+    };
+    let mut compacted = response.clone();
+    compacted.insert("results".to_string(), compact_json_value(results));
+    compact_result(value, Value::Object(compacted))
+}
+
+fn compact_result(value: &Value, compacted: Value) -> CompactResult {
     let original_bytes = serde_json::to_vec(value).map(|v| v.len()).unwrap_or(0);
-    let compacted = compact_json_value(value);
     let compacted_bytes = serde_json::to_vec(&compacted).map(|v| v.len()).unwrap_or(0);
     if compacted_bytes >= original_bytes {
         return CompactResult {
@@ -299,5 +316,20 @@ mod tests {
         let compacted = compact_failure_log(&log, 200);
 
         assert_eq!(classify(&compacted), FailureClass::Tooling);
+    }
+
+    #[test]
+    fn realistic_search_results_round_trip() {
+        let fixture = serde_json::json!([
+            {"id": "d-001", "wing": "python-repos", "room": "general", "score": 0.92, "excerpt": "A reusable Python template..."},
+            {"id": "d-002", "wing": "python-repos", "room": "general", "score": 0.88, "excerpt": "FastAPI project skeleton..."},
+            {"id": "d-003", "wing": "python-repos", "room": "tools", "score": 0.85, "excerpt": "CLI argument parsing..."},
+            {"id": "d-004", "wing": "claude-skills", "room": "general", "score": 0.81, "excerpt": "Skill template with..."},
+            {"id": "d-005", "wing": "claude-skills", "room": "workflows", "score": 0.79, "excerpt": "Multi-agent workflow..."},
+        ]);
+        let result = try_compact(&fixture);
+
+        assert!(result.compacted_bytes < result.original_bytes);
+        assert_eq!(expand_compact_value(&result.value), fixture);
     }
 }
