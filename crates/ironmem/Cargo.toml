@@ -1,6 +1,6 @@
 [package]
 name = "ironmem"
-version = "0.5.0"
+version = "0.5.1"
 edition = "2021"
 rust-version.workspace = true
 description = "AI memory MCP server — semantic search + knowledge graph in a single binary"
