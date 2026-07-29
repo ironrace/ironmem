@@ -1062,10 +1062,9 @@ fn tool_success_response(
 ) -> ResponseWithCompactDelta {
     let (effective_content, compact_delta) = if super::compact::should_compact(tool_name) {
         let result = super::compact::try_compact_search_response(content);
-        (
-            result.value,
-            Some((result.original_bytes, result.compacted_bytes)),
-        )
+        let compact_delta = (result.compacted_bytes < result.original_bytes)
+            .then_some((result.original_bytes, result.compacted_bytes));
+        (result.value, compact_delta)
     } else {
         (content.clone(), None)
     };
@@ -1855,6 +1854,18 @@ mod tests {
         )
         .await;
         assert!(output.is_empty());
+    }
+
+    #[test]
+    fn response_compaction_telemetry_requires_actual_savings() {
+        let _env = crate::config::EnvGuard::set("IRONMEM_COMPACT_RESPONSES", "1");
+        let content = json!({
+            "results": [{"id": "only-one"}],
+        });
+
+        let (_, compact_delta) = tool_success_response(Some(json!(1)), &content, Some("search"));
+
+        assert_eq!(compact_delta, None);
     }
 
     use crate::metrics::METRICS_ENV_LOCK;
