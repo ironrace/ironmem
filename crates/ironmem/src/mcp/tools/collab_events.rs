@@ -145,6 +145,11 @@ pub(super) fn parse_failure_report_event(content: &str) -> Result<CollabEvent, M
             )
         })?
         .to_string();
+    let coding_failure = if crate::mcp::compact::should_compact_failure_reports() {
+        crate::mcp::compact::compact_failure_log(&coding_failure, MAX_CODING_FAILURE_CHARS)
+    } else {
+        coding_failure
+    };
     if coding_failure.chars().count() > MAX_CODING_FAILURE_CHARS {
         return Err(MemoryError::Validation(format!(
             "failure_report coding_failure exceeds {MAX_CODING_FAILURE_CHARS} chars",

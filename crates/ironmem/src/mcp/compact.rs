@@ -83,10 +83,47 @@ pub const COMPACTABLE_TOOLS: &[&str] = &["search"];
 /// compaction never changes response shape without an explicit operator opt-in.
 pub fn should_compact(tool_name: Option<&str>) -> bool {
     let Some(name) = tool_name else { return false };
+    compaction_enabled() && COMPACTABLE_TOOLS.contains(&name)
+}
+
+/// Whether long `failure_report` topic payloads may be compacted. A failure
+/// report is a `collab_send` topic rather than an advertised MCP tool, so it
+/// intentionally does not belong in [`COMPACTABLE_TOOLS`].
+pub fn should_compact_failure_reports() -> bool {
+    compaction_enabled()
+}
+
+fn compaction_enabled() -> bool {
     std::env::var("IRONMEM_COMPACT_RESPONSES")
         .ok()
-        .is_some_and(|v| v == "1")
-        && COMPACTABLE_TOOLS.contains(&name)
+        .is_some_and(|value| value == "1")
+}
+
+/// Compact a failure-report log while retaining its classification prefix and
+/// the final actionable lines. The input is returned unchanged when it fits.
+pub fn compact_failure_log(coding_failure: &str, max_chars: usize) -> String {
+    if coding_failure.chars().count() <= max_chars {
+        return coding_failure.to_string();
+    }
+
+    let lines: Vec<&str> = coding_failure.lines().collect();
+    if lines.len() <= 4 {
+        return coding_failure.chars().take(max_chars).collect();
+    }
+
+    let tail_count = 3.min(lines.len() - 1);
+    let omitted = lines.len() - 1 - tail_count;
+    let candidate = format!(
+        "{}\n[... {omitted} lines omitted ...]\n{}",
+        lines[0],
+        lines[lines.len() - tail_count..].join("\n")
+    );
+
+    if candidate.chars().count() <= max_chars {
+        candidate
+    } else {
+        coding_failure.chars().take(max_chars).collect()
+    }
 }
 
 pub fn expand_compact_value(value: &Value) -> Value {
@@ -209,5 +246,58 @@ mod tests {
         let _guard = crate::config::EnvGuard::set("IRONMEM_COMPACT_RESPONSES", "1");
         assert!(!should_compact(Some("status")));
         assert!(!should_compact(None));
+    }
+
+    #[test]
+    fn failure_report_compaction_requires_env_opt_in() {
+        let _guard = crate::config::EnvGuard::pin("IRONMEM_COMPACT_RESPONSES");
+        std::env::remove_var("IRONMEM_COMPACT_RESPONSES");
+        assert!(!should_compact_failure_reports());
+        std::env::set_var("IRONMEM_COMPACT_RESPONSES", "1");
+        assert!(should_compact_failure_reports());
+    }
+
+    #[test]
+    fn short_failure_log_passes_through() {
+        let log = "git_push_failed: rejected by remote";
+        assert_eq!(compact_failure_log(log, 2048), log);
+    }
+
+    #[test]
+    fn long_failure_log_preserves_prefix_and_tail() {
+        let prefix = "git_push_failed:";
+        let middle = (0..100)
+            .map(|index| format!("  verbose line {index}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let tail = "error: failed to push some refs to 'origin'\nhint: Updates were rejected";
+        let log = format!("{prefix}\n{middle}\n{tail}");
+        let compacted = compact_failure_log(&log, 300);
+
+        assert!(
+            compacted.chars().count() <= 300,
+            "compacted length {} exceeds 300",
+            compacted.chars().count()
+        );
+        assert!(compacted.starts_with(prefix));
+        assert!(compacted.contains("hint: Updates were rejected"));
+        assert!(compacted.contains("[..."));
+        assert!(compacted.contains("lines omitted"));
+    }
+
+    #[test]
+    fn compacted_failure_preserves_classification() {
+        use crate::collab::{classify, FailureClass};
+
+        let prefix = "git_push_failed:";
+        let verbose = (0..50)
+            .map(|index| format!("  frame {index}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let tail = " rejected by hooks";
+        let log = format!("{prefix}{verbose}\n{tail}");
+        let compacted = compact_failure_log(&log, 200);
+
+        assert_eq!(classify(&compacted), FailureClass::Tooling);
     }
 }
