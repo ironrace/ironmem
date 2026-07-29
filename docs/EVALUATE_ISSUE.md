@@ -96,7 +96,7 @@ Judge each signal from the issue text plus the scan:
 | **Design judgment** | Does it require architectural decisions — public API/contract, state machine, migration, new subsystem? |
 | **Decomposability** | Into how many *independent* execution tasks does it split? An estimate above 10 requires `SPLIT`. |
 | **Spec clarity** | Is the issue well-specified, or ambiguous / under-defined? |
-| **Verification value** | Would an adversarial second-model review materially de-risk it before merge? |
+| **Security / review depth** | Does it touch security-sensitive code (auth, credentials, billing, user data)? Drives the post-implementation review tier, not the execution path. |
 
 ## Step 4 — Decide (first match wins)
 
@@ -109,9 +109,10 @@ The numeric thresholds below are guidance, not bright lines, and they
 intentionally touch at the seams. When counts overlap, the deciding factor
 is **task independence, not the number**: a single unit of tightly-coupled
 work routes DIRECT; two or more *independently shippable* tasks route up to
-SUPERPOWERS. Likewise the COLLAB **design-judgment** and **adversarial-review**
-triggers dominate the crate-count range — a purely mechanical change spanning
-3+ crates (e.g. a rename) is SUPERPOWERS, not COLLAB.
+SUPERPOWERS. Likewise the COLLAB **design-judgment** triggers dominate the
+crate-count range — a purely mechanical change spanning 3+ crates (e.g. a
+rename) is SUPERPOWERS, not COLLAB. Security sensitivity alone does not
+justify COLLAB — it drives the review tier recommendation instead.
 
 ### 0. SPLIT — create smaller issues before routing
 
@@ -146,9 +147,12 @@ Choose when **any** hold:
   change, schema migration, or a new subsystem
 - requirements are ambiguous and benefit from a second, independent
   perspective before committing to a plan
-- large blast radius — roughly **3+ crates** or many interacting modules
-- the change genuinely benefits from cross-model **adversarial review**
-  before merge (correctness-critical, security-sensitive, protocol-level)
+- large blast radius — roughly **3+ crates** or many tightly interacting
+  modules where the changes cannot be planned independently
+
+Security sensitivity alone does not justify COLLAB. Security concerns are
+handled by the review tier recommendation (typically `/ultrareview-local`),
+not by adding planning overhead.
 
 Typical issues: protocol or state-machine changes, migrations, cross-crate
 features, anything touching the collab state machine or a public boundary.
@@ -187,6 +191,9 @@ Blast radius: <N files, M crates> (<short list of the main ones>)
 
 Recommended path:
   <exact command — see platform table below>
+
+Recommended review:
+  <review command — see review tier table below>
 
 For a `SPLIT` verdict, insert before the confirmation line:
 
@@ -232,6 +239,21 @@ The verdict (DIRECT / SUPERPOWERS / COLLAB / SPLIT) is platform-agnostic; the
 For the COLLAB task summary, derive a single imperative line from the issue
 title/body (e.g. `add schema migration 012 for code_map TTL`). Do not paste
 the whole issue body into the command.
+
+## Review tiers
+
+Based on change complexity and security sensitivity, recommend one
+post-implementation review. This is independent of the execution-path verdict
+— a DIRECT fix in auth code still gets a Deep review.
+
+| Tier | When | Command |
+|---|---|---|
+| Standard | Small, contained changes with no security surface | `/code-review` |
+| Thorough | Multi-file changes, moderate complexity | `/pr-review-toolkit:review-pr` |
+| Deep | Complex changes, security-sensitive code (auth, credentials, billing, user data), or high blast radius | `/ultrareview-local` |
+
+Security-sensitive changes always warrant at minimum Thorough, and typically
+Deep, regardless of the execution-path verdict.
 
 ## Invariants
 
