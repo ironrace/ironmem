@@ -1,0 +1,22 @@
+# Canonical per-harness vocabulary for skills/. Every harness-specific tool
+# name in an authored skill resolves from here via {{TOKEN}}; nothing else in
+# skills/ may name a harness tool directly.
+#
+# Adding a token means adding it to EVERY harness table below. An unknown
+# {{TOKEN}} is a hard error in scripts/sync_skills.py, so a token present for
+# one harness and missing for another fails generation rather than shipping
+# as literal text.
+
+[claude]
+DISPATCH       = "Task tool"
+TODO           = "TodoWrite"
+AGENT_DISPATCH = "Task(subagent_type=\"general-purpose\", model=<alias>, prompt=<full task text>)"
+WORKTREE_NEW   = "EnterWorktree (native), or `git worktree add ../<branch> -b <branch>`"
+SKILLS_HOME    = "~/.claude/skills"
+
+[codex]
+DISPATCH       = "spawn_agent"
+TODO           = "update_plan"
+AGENT_DISPATCH = "spawn_agent(agent_type=\"worker\", model=<model>, reasoning_effort=<effort>, message=<full task text>)"
+WORKTREE_NEW   = "git worktree add ../<branch> -b <branch>"
+SKILLS_HOME    = "~/.codex/skills"
