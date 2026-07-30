@@ -8,6 +8,7 @@ the generator's contract is tested independently of skill content.
 from __future__ import annotations
 
 import pathlib
+import re
 import sys
 import tempfile
 import unittest
@@ -335,30 +336,102 @@ class LabelRootTests(unittest.TestCase):
             self.assertNotIn(str(sync_skills.ROOT), label)
 
 
+# A markdown table row whose first cell is a single backticked token, e.g.
+# "| `cheap` | Mechanical edits ... |". The separator row (`|---|---|`) has no
+# backticked first cell and is skipped.
+_TIER_ROW_RE = re.compile(r"^\|\s*`([^`|]+)`\s*\|")
+_POLICY_HEADER = "| Tier | Task shape |"
+# "The tier names are exactly `a`, `b`." / "The tier names are fixed: `a`, `b`."
+_DECLARED_NAMES_RE = re.compile(r"tier\s+names\s+are\s+(?:exactly|fixed):?\s*([^.]*)", re.S)
+
+
+def _table_tiers(text: str, *, after: str | None = None) -> tuple[str, ...]:
+    """Tier tokens in the first column of a markdown table.
+
+    With `after`, start scanning at that header line and stop at the first
+    line that is not part of that table -- so only the intended table is read.
+    """
+    lines = text.split("\n")
+    if after is not None:
+        if after not in lines:
+            raise AssertionError(f"table header {after!r} not found")
+        lines = lines[lines.index(after) + 1 :]
+    tiers: list[str] = []
+    for line in lines:
+        if after is not None and not line.startswith("|"):
+            break
+        match = _TIER_ROW_RE.match(line)
+        if match:
+            tiers.append(match.group(1))
+    return tuple(tiers)
+
+
+def _declared_tier_names(text: str) -> tuple[str, ...]:
+    """Tier tokens from a prose sentence that enumerates the tier names."""
+    match = _DECLARED_NAMES_RE.search(text)
+    if match is None:
+        raise AssertionError("no 'tier names are exactly/fixed: ...' sentence found")
+    return tuple(re.findall(r"`([^`]+)`", match.group(1)))
+
+
 class TierParityTests(unittest.TestCase):
     """Every tier in iron-plan's shared policy has a row in EVERY harness
-    lineup. This is the one property the byte-for-byte drift check cannot
-    cover, because tiers.md is meant to differ per harness.
-    """
+    lineup, and no lineup carries a tier the policy does not declare. This is
+    the one property the byte-for-byte drift check cannot cover, because
+    tiers.md is meant to differ per harness.
 
-    TIERS = ("cheap", "standard", "deep", "frontier")
+    The tier set is *parsed* out of the rendered policy, never hardcoded --
+    hardcoding it is what let a new tier be added to the policy with no
+    lineup row and still pass.
+    """
 
     def setUp(self) -> None:
         self.rendered = sync_skills.plan()
+        self.tiers = _table_tiers(
+            self.rendered["claude"]["iron-plan/SKILL.md"], after=_POLICY_HEADER
+        )
 
-    def test_policy_names_exactly_the_declared_tiers(self) -> None:
-        policy = self.rendered["claude"]["iron-plan/SKILL.md"]
-        for tier in self.TIERS:
-            self.assertIn(f"`{tier}`", policy, f"tier {tier} missing from iron-plan policy")
+    def test_policy_table_parses_to_a_nonempty_tier_set(self) -> None:
+        # Guards the parser itself: a parse that silently yields () would make
+        # every parity assertion below vacuously true.
+        self.assertTrue(self.tiers, "no tier rows parsed out of iron-plan's policy table")
+        self.assertEqual(
+            len(set(self.tiers)), len(self.tiers), f"duplicate tier rows in policy: {self.tiers}"
+        )
+
+    def test_policy_is_identical_across_harnesses(self) -> None:
+        for harness, files in self.rendered.items():
+            self.assertEqual(
+                _table_tiers(files["iron-plan/SKILL.md"], after=_POLICY_HEADER),
+                self.tiers,
+                f"{harness} renders a different iron-plan tier policy",
+            )
 
     def test_every_tier_has_a_row_in_every_harness_lineup(self) -> None:
         for harness, files in self.rendered.items():
             lineup = files["iron-build/references/tiers.md"]
-            for tier in self.TIERS:
+            lineup_tiers = _table_tiers(lineup)
+            for tier in self.tiers:
                 self.assertIn(
                     f"| `{tier}` |",
                     lineup,
-                    f"tier {tier} has no row in the {harness} lineup",
+                    f"tier {tier!r} has no row in the {harness} lineup",
+                )
+            self.assertEqual(
+                set(lineup_tiers),
+                set(self.tiers),
+                f"{harness} lineup and iron-plan policy declare different tiers",
+            )
+
+    def test_prose_tier_names_match_the_policy_table(self) -> None:
+        # iron-build and tiers.md both spell the tier names out in prose; a
+        # tier added to the policy table alone leaves those sentences lying.
+        for harness, files in self.rendered.items():
+            for relative in ("iron-build/SKILL.md", "iron-build/references/tiers.md"):
+                self.assertEqual(
+                    set(_declared_tier_names(files[relative])),
+                    set(self.tiers),
+                    f"{harness}/{relative} names a different tier set than the policy",
                 )
 
     def test_claude_cheap_row_carries_no_effort_value(self) -> None:
