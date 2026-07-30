@@ -541,6 +541,19 @@ GATES: tuple[Gate, ...] = (
         surfaces=frozenset({SURFACE_COLLAB_PROTOCOL}),
         always=False,
     ),
+    # Runs the linter's own test suite, not the linter. Both are needed: the
+    # gate above catches a template that violates the protocol, this one
+    # catches a linter that has stopped being able to tell. Absent this gate,
+    # `tests/collab_turn_templates/` resolved only to `collab_template_lint`,
+    # which never reads the suite -- the suite was red from adb5c80 onward and
+    # neither the hook nor CI said so.
+    Gate(
+        name="collab_template_self_test",
+        argv=("python3", "-m", "pytest", "tests/collab_turn_templates/", "-q"),
+        phases=frozenset({PHASE_PRE_COMMIT, PHASE_PRE_PUSH}),
+        surfaces=frozenset({SURFACE_COLLAB_PROTOCOL}),
+        always=False,
+    ),
     Gate(
         name="skills_sync_check",
         argv=("python3", "scripts/check_skills_sync.py"),
