@@ -102,7 +102,7 @@ resume_hint: /collab join <session id>
 When `execution_mode == "mechanical_direct"`, the approved plan contains one
 verbatim mechanical task. Read its plan file, checkpoint task 1 as started,
 then execute each numbered command/code/prose step exactly. Do not invoke
-`subagent-driven-development` or spawn an agent. Verify the task acceptance
+`iron-build` or spawn an agent. Verify the task acceptance
 array, run `cargo fmt --all -- --check`,
 `cargo clippy --workspace --all-targets --all-features -- -D warnings`, and
 the project's test command. On failure checkpoint blocked and report
@@ -113,10 +113,10 @@ gate proof, and send completion.
 ## Default subagent-driven execution
 
 For any other execution mode, read the approved plan and invoke
-`subagent-driven-development`. It must complete every task, review it,
+`iron-build`. It must complete every task, review it,
 commit/push it, and update the controller plan; write the checkpoints above
 before dispatch and immediately after each task commit. Stop before
-`finishing-a-development-branch`: Claude owns PR creation at final review.
+the *Finishing the Branch* step: Claude owns PR creation at final review.
 Do not call `gh pr create`, `gh pr list`, or pull-request remote checks here.
 
 Run the project-appropriate final gates. On an unrecoverable worker failure or

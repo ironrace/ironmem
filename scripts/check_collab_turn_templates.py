@@ -130,7 +130,7 @@ REQUIRED_TEMPLATE_SNIPPETS = {
     "collab-turn-plan-finalize.md": [
         "Timebox: <=20 minutes",
         "at most 10 tasks",
-        "docs/superpowers/plans/YYYY-MM-DD-<short-feature>.md",
+        "docs/iron/plans/YYYY-MM-DD-<short-feature>.md",
         "first auto-ack response",
         "get_drawer(id=<canonical_plan_ref.drawer_id>)",
         "get_drawer(id=<message.drawer_id>)",
@@ -174,7 +174,7 @@ REQUIRED_SENTINELS = ["<!-- LINT:worker-dispatch -->",
                       "<!-- LINT:fail-closed-tiering -->",
                       "<!-- LINT:dispatch-matrix -->"]
 REQUIRED_EVALUATE_ISSUE_SNIPPETS = [
-    "Verdict: <DIRECT | SUPERPOWERS | COLLAB | SPLIT>",
+    "Verdict: <DIRECT | IRON | COLLAB | SPLIT>",
     "Task estimate: <N | N+> independent execution tasks",
     "more than 10",
     "Child issues:",

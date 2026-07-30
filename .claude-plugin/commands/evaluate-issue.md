@@ -1,5 +1,5 @@
 ---
-description: Read a GitHub issue, score its complexity, and recommend DIRECT (/plan + TDD), SUPERPOWERS (writing-plans → subagent-driven-development), COLLAB (/collab start), or mandatory SPLIT above 10 tasks. Advisory: prints a verdict and the exact command, then confirms before invoking. Usage — /evaluate-issue <issue-number | #number | issue-url>
+description: Read a GitHub issue, score its complexity, and recommend DIRECT (/plan + iron-tdd), IRON (iron-plan → iron-build), COLLAB (/collab start), or mandatory SPLIT above 10 tasks. Advisory: prints a verdict and the exact command, then confirms before invoking. Usage — /evaluate-issue <issue-number | #number | issue-url>
 argument-hint: <issue-number | #number | issue-url>
 ---
 
@@ -81,12 +81,12 @@ itself a DIRECT signal.
 
 Check in this order — the hard `SPLIT` task-budget gate comes first, DIRECT is
 the cheapest route, COLLAB is the most expensive and must be justified, and
-SUPERPOWERS is the default middle. The counts below touch at the seams; when
+IRON is the default middle. The counts below touch at the seams; when
 they overlap, the deciding factor is **task independence, not the number**
 (one tightly-coupled unit → DIRECT; two or more independently shippable tasks
-→ SUPERPOWERS), and COLLAB's
+→ IRON), and COLLAB's
 design-judgment triggers dominate its crate-count range (a purely mechanical
-3+-crate rename is SUPERPOWERS, not COLLAB). Security sensitivity alone does
+3+-crate rename is IRON, not COLLAB). Security sensitivity alone does
 not justify COLLAB — it drives the review tier recommendation instead.
 
 0. **SPLIT** — choose before every other route when the issue credibly needs
@@ -110,13 +110,13 @@ not justify COLLAB — it drives the review tier recommendation instead.
    it is handled by the review recommendation. (Protocol/state-machine
    changes, migrations, cross-crate features.)
 
-3. **SUPERPOWERS** — the default middle when neither above fits: 2–6
+3. **IRON** — the default middle when neither above fits: 2–6
    independently shippable tasks; moderate blast radius (1–2 crates);
    plannable up front; no cross-model design review needed. (A feature within
    an existing subsystem, a multi-file mechanical change, test-coverage
    expansion.)
 
-When one signal pulls toward COLLAB but the rest sit firmly in SUPERPOWERS,
+When one signal pulls toward COLLAB but the rest sit firmly in IRON,
 name the tension in the rationale rather than silently rounding up.
 
 ## Step 5 — Output, then confirm
@@ -125,7 +125,7 @@ Print exactly this shape:
 
 ```
 Issue #<number>: <title>
-Verdict: <DIRECT | SUPERPOWERS | COLLAB | SPLIT>
+Verdict: <DIRECT | IRON | COLLAB | SPLIT>
 Task estimate: <N | N+> independent execution tasks
 
 Why:
@@ -172,8 +172,8 @@ parent comments.
 
 | Verdict | What to do on confirm |
 |---|---|
-| DIRECT | Run `/plan` to scope, then invoke the `test-driven-development` skill. |
-| SUPERPOWERS | Invoke the `writing-plans` skill on the issue spec; it flows into `subagent-driven-development`. |
+| DIRECT | Run `/plan` to scope, then invoke the `iron-tdd` skill. |
+| IRON | Invoke the `iron-plan` skill on the issue spec; it flows into `iron-build`. |
 | COLLAB | Run `/collab start <one-line imperative task summary derived from the issue>`. Do not paste the whole issue body. |
 | SPLIT | Create the confirmed child issues, then run `/evaluate-issue` for each child. |
 

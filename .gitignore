@@ -10,11 +10,19 @@
 CODEX_TASK_*.md
 docs/collab_*.md
 
-# Superpowers working artifacts (writing-plans output, /collab bridges,
-# design specs). Per-session and developer-facing, not durable repo content.
-# The canonical protocol/architecture lives in docs/COLLAB.md and the
-# in-tree Rust source. Any historical file is retrievable from git history.
-docs/superpowers/
+# iron-plan output. Task-by-task implementation plans, routinely 500-2000+
+# lines and per-session. The durable design record is docs/iron/specs/, which
+# stays tracked; plans are execution scaffolding and would bloat every diff
+# they appear in.
+#
+# CONSEQUENCE, stated plainly because it is a data-loss trap: a plan written
+# after this rule landed is never committed, so it exists only in the working
+# tree that produced it. `git clean -xfd` deletes it, a fresh clone does not
+# have it, and iron-build mid-plan has nothing left to execute. Plans are NOT
+# "retrievable from git history" -- only the five that predate this rule are.
+# If a plan needs to survive, persist it outside the tree (an ironmem drawer;
+# see skills/iron-plan/SKILL.md) before cleaning.
+docs/iron/plans/
 
 # Local tool and editor state (personal, non-portable)
 .cargo/

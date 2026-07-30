@@ -2,7 +2,7 @@
 
 Source of truth for the `/evaluate-issue` command. Reads a GitHub issue,
 scores its complexity, and recommends an execution path: **DIRECT**,
-**SUPERPOWERS**, **COLLAB**, or mandatory **SPLIT** for work that exceeds
+**IRON**, **COLLAB**, or mandatory **SPLIT** for work that exceeds
 collab's 10-task issue budget. The command is advisory by default: it prints
 a verdict and the exact next step, then asks the user to confirm before
 performing any mutation.
@@ -102,16 +102,16 @@ Judge each signal from the issue text plus the scan:
 
 Evaluate in this order. The hard `SPLIT` task-budget gate comes first; then
 DIRECT is the cheapest route, COLLAB is the most expensive and must be
-positively justified, and SUPERPOWERS is the safe default for everything in
+positively justified, and IRON is the safe default for everything in
 between.
 
 The numeric thresholds below are guidance, not bright lines, and they
 intentionally touch at the seams. When counts overlap, the deciding factor
 is **task independence, not the number**: a single unit of tightly-coupled
 work routes DIRECT; two or more *independently shippable* tasks route up to
-SUPERPOWERS. Likewise the COLLAB **design-judgment** triggers dominate the
+IRON. Likewise the COLLAB **design-judgment** triggers dominate the
 crate-count range — a purely mechanical change spanning 3+ crates (e.g. a
-rename) is SUPERPOWERS, not COLLAB. Security sensitivity alone does not
+rename) is IRON, not COLLAB. Security sensitivity alone does not
 justify COLLAB — it drives the review tier recommendation instead.
 
 ### 0. SPLIT — create smaller issues before routing
@@ -157,7 +157,7 @@ not by adding planning overhead.
 Typical issues: protocol or state-machine changes, migrations, cross-crate
 features, anything touching the collab state machine or a public boundary.
 
-### 3. SUPERPOWERS — writing-plans → subagent-driven-development
+### 3. IRON — iron-plan → iron-build
 
 The default middle tier. Choose when the issue is neither DIRECT nor COLLAB:
 
@@ -170,7 +170,7 @@ Typical issues: a feature within an existing subsystem, a multi-file but
 mechanical change, a test-coverage expansion.
 
 When a single signal pulls toward COLLAB but the rest sit firmly in
-SUPERPOWERS territory, name the tension in the rationale rather than
+IRON territory, name the tension in the rationale rather than
 silently rounding up — the user confirms with that tradeoff visible.
 
 ## Step 5 — Output (recommend, then confirm)
@@ -179,7 +179,7 @@ Print exactly this shape:
 
 ```
 Issue #<number>: <title>
-Verdict: <DIRECT | SUPERPOWERS | COLLAB | SPLIT>
+Verdict: <DIRECT | IRON | COLLAB | SPLIT>
 Task estimate: <N | N+> independent execution tasks
 
 Why:
@@ -226,13 +226,13 @@ parent comments.
 
 ## Platform path mapping
 
-The verdict (DIRECT / SUPERPOWERS / COLLAB / SPLIT) is platform-agnostic; the
+The verdict (DIRECT / IRON / COLLAB / SPLIT) is platform-agnostic; the
 "recommended path" and how it is invoked differ per host.
 
 | Verdict | Claude | Codex |
 |---|---|---|
-| DIRECT | `/plan` to scope, then the `test-driven-development` skill | the `test-driven-development` skill directly |
-| SUPERPOWERS | invoke the `writing-plans` skill on the issue spec (flows into `subagent-driven-development`) | invoke the `writing-plans` skill |
+| DIRECT | `/plan` to scope, then the `iron-tdd` skill | the `iron-tdd` skill directly |
+| IRON | invoke the `iron-plan` skill on the issue spec (flows into `iron-build`) | invoke the `iron-plan` skill |
 | COLLAB | `/collab start <one-line task summary derived from the issue>` | `/collab` is Claude-driven: recommend the user run `/collab start <task>` in a Claude terminal (Codex joins via the protocol) |
 | SPLIT | create the confirmed child issues, then re-run `/evaluate-issue` for each child | create the confirmed child issues, then re-run `/evaluate-issue` for each child |
 

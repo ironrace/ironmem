@@ -757,7 +757,7 @@ gates: passed\n";
         r.session.final_plan_hash = Some("aaa111".into());
         r.session.task_list = Some(
             json!({
-                "plan_file_path": "docs/superpowers/plans/handoff.md",
+                "plan_file_path": "docs/iron/plans/handoff.md",
                 "execution_mode": "mechanical_direct",
                 "tasks": [{"id": 1}]
             })
@@ -774,7 +774,7 @@ gates: passed\n";
         assert!(block.contains("plan.canonical.drawer_id: abc123"));
         assert!(block.contains("plan.canonical.hash: def456"));
         assert!(block.contains("plan.final.drawer_id: fff999"));
-        assert!(block.contains("task_list.plan_file_path: docs/superpowers/plans/handoff.md"));
+        assert!(block.contains("task_list.plan_file_path: docs/iron/plans/handoff.md"));
         assert!(block.contains("task_list.execution_mode: mechanical_direct"));
         assert!(block.contains("gates: passed"));
         assert!(block.contains("checkpoint: present"));

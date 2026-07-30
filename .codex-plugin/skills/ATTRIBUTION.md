@@ -1,17 +1,17 @@
 # Skill Attribution
 
-Most skills in this directory are vendored, modified copies of skills from
-[obra/superpowers](https://github.com/obra/superpowers) by Jesse Vincent,
-distributed under the MIT License:
+The `iron-*` skills in this directory are derived works, generated from the
+canonical source in `skills/`. They absorb and substantially rewrite skills
+vendored from [obra/superpowers](https://github.com/obra/superpowers) by
+Jesse Vincent, distributed under the MIT License:
 
-- `executing-plans`
-- `finishing-a-development-branch`
-- `requesting-code-review`
-- `subagent-driven-development`
-- `test-driven-development`
-- `using-git-worktrees`
-- `using-superpowers`
-- `writing-plans`
+- `iron-plan` derives from `writing-plans`
+- `iron-build` derives from `subagent-driven-development`, `executing-plans`,
+  `using-git-worktrees`, `finishing-a-development-branch`, and
+  `requesting-code-review`
+- `iron-tdd` derives from `test-driven-development`
+
+`iron-spec` is authored fresh and derives from no upstream skill.
 
 They have been adapted for the ironmem `/collab` workflow. The upstream
 copyright and license notice is reproduced below as required by the MIT

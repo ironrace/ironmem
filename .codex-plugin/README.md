@@ -43,14 +43,10 @@ Before answering questions about prior work, decisions, project history, or peop
 
 `scripts/install-ironmem.sh` installs these Codex skills into `$CODEX_HOME/skills`:
 
-- `writing-plans`
-- `subagent-driven-development`
-- `finishing-a-development-branch`
-- `executing-plans`
-- `using-git-worktrees`
-- `using-superpowers`
-- `requesting-code-review`
-- `test-driven-development`
+- `iron-spec`
+- `iron-plan`
+- `iron-build`
+- `iron-tdd`
 - `pr-review-toolkit`
 
 Existing identical files are skipped. Packaged baselines are stored under each

@@ -46,20 +46,39 @@ jobs:
       - name: site/README drift guard self-test
         run: python3 scripts/test_check_site_readme_sync.py
 
-      # The git hook runner self-test is a pytest suite (parametrized cases are
-      # derived from the GATES manifest, so it cannot be plain unittest). Every
-      # other Python self-test above is stdlib-only and needs no install step.
+      # Two pytest suites need this install. The git hook runner self-test is
+      # pytest because its parametrized cases are derived from the GATES
+      # manifest, so it cannot be plain unittest; the collab turn-template
+      # suite is pytest by construction. Every other Python self-test above is
+      # stdlib-only and needs no install step.
       - name: install pytest
         run: python3 -m pip install --break-system-packages pytest
 
       - name: git hook runner self-test
         run: python3 scripts/test_run_git_hook.py
 
+      # Distinct from the "collab template lint" step above: that runs the
+      # linter, this runs the linter's own test suite. It went unrun -- and
+      # therefore silently red -- from adb5c80 until it was wired in here.
+      #
+      # Targets `tests/`, not the one package inside it. A second package added
+      # later is then covered automatically; naming the package would recreate
+      # the same silently-unrun suite one directory over. Matches the command
+      # in CONTRIBUTING.md's local loop exactly, flags included.
+      - name: python test suites
+        run: python3 -m pytest tests/
+
       - name: installer self-test
         run: python3 scripts/test_install_ironmem.py
 
       - name: MCP wrapper drift check
         run: python3 scripts/sync_mcp_wrappers.py --check
+
+      - name: skills sync drift check
+        run: python3 scripts/check_skills_sync.py
+
+      - name: skills generator self-test
+        run: python3 scripts/test_sync_skills.py
 
       - name: cargo fmt --check
         run: cargo fmt --all -- --check

@@ -29,6 +29,19 @@ SOURCE="$REPO_ROOT/target/release/ironmem"
 DAEMON_SOCKET_PATH="${IRONMEM_DAEMON_SOCKET:-$HOME/.ironrace-memory/hook_state/daemon.sock}"
 
 REQUIRED_SHARED_SKILLS=(
+  iron-spec
+  iron-plan
+  iron-build
+  iron-tdd
+)
+
+# Skills earlier ironmem versions installed, superseded by the iron-* set.
+# Removed on upgrade -- but ONLY where a base snapshot under
+# <harness home>/.ironmem-bases/skills/<name> proves ironmem wrote that copy.
+# ~/.claude/skills and ~/.codex/skills are flat namespaces shared with any
+# globally-installed upstream Superpowers, so a missing snapshot means the
+# directory is someone else's and must be left alone.
+LEGACY_SHARED_SKILLS=(
   writing-plans
   subagent-driven-development
   finishing-a-development-branch
@@ -245,6 +258,37 @@ install_skill_set() {
     fi
 
     install_dir_with_merge "$harness skill" "$source" "$target" "$base"
+  done
+}
+
+# Remove skills superseded by the iron-* set, using the three-way-merge base
+# snapshot as the provenance signal. Present => install_skill_set() wrote that
+# copy, so removing it is removing our own file. Absent => it is the user's own
+# copy (or an upstream Superpowers install sharing this flat namespace), and we
+# warn instead of deleting.
+#
+# Runs AFTER install_skill_set() so migrate_legacy_base() has already relocated
+# any older base layout -- otherwise a legitimately-ours skill whose snapshot
+# had not yet been migrated would look user-owned and survive forever.
+remove_legacy_skills() {
+  local harness="$1"
+  local target_root="$2"
+  local base_root="$3"
+
+  for skill in "${LEGACY_SHARED_SKILLS[@]}"; do
+    local target="$target_root/$skill"
+    local base="$base_root/$skill"
+
+    [[ -e "$target" || -L "$target" ]] || continue
+
+    if [[ ! -d "$base" ]]; then
+      echo "    WARN: keeping $harness skill '$skill' at $target — no ironmem base snapshot, so it is not ours to remove" >&2
+      continue
+    fi
+
+    rm -rf "$target"
+    rm -rf "$base"
+    echo "    removed superseded $harness skill $skill"
   done
 }
 
@@ -467,6 +511,8 @@ if [[ "$SKIP_SKILLS" -eq 0 ]]; then
       "$CLAUDE_HOME/.ironmem-bases/skills" \
       "${REQUIRED_CLAUDE_SKILLS[@]}"
   fi
+  remove_legacy_skills "Codex" "$CODEX_SKILLS_DIR" "$CODEX_HOME/.ironmem-bases/skills"
+  remove_legacy_skills "Claude" "$CLAUDE_SKILLS_DIR" "$CLAUDE_HOME/.ironmem-bases/skills"
   install_agent_set "Claude" "$REPO_ROOT/.claude-plugin/agents" "$CLAUDE_AGENTS_DIR" \
     "$CLAUDE_HOME/.ironmem-bases/agents"
   install_md_set "Claude command" "$REPO_ROOT/.claude-plugin/commands" \

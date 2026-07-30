@@ -284,6 +284,7 @@ def test_manifest_declaration_order_is_preserved():
         "hook_self_test",
         "hook_install_check",
         "collab_template_lint",
+        "skills_sync_check",
         "rust_fmt_check",
         "rust_clippy",
         "rust_test",
@@ -305,6 +306,7 @@ def test_manifest_matches_pre_commit_argv_and_order():
         ("python3", "scripts/test_run_git_hook.py"),
         ("bash", "scripts/install-git-hooks.sh", "--check"),
         ("python3", "scripts/check_collab_turn_templates.py"),
+        ("python3", "scripts/check_skills_sync.py"),
         ("cargo", "fmt", "--all", "--", "--check"),
         (
             "cargo",
@@ -325,6 +327,7 @@ def test_manifest_matches_pre_push_argv_and_order():
     expected = [
         ("python3", "scripts/test_run_git_hook.py"),
         ("python3", "scripts/check_collab_turn_templates.py"),
+        ("python3", "scripts/check_skills_sync.py"),
         ("cargo", "test", "--workspace"),
     ]
     actual = [gate.argv for gate in manifest.GATES if "pre-push" in gate.phases]
@@ -351,6 +354,7 @@ def test_surfaces_contains_expected_ids():
         manifest.SURFACE_RUST_WORKSPACE,
         manifest.SURFACE_COLLAB_PROTOCOL,
         manifest.SURFACE_HOOK_SELF_TEST,
+        manifest.SURFACE_SKILLS,
         manifest.SURFACE_DOCS,
         manifest.SURFACE_INERT_CONFIG,
     }
@@ -413,7 +417,7 @@ def test_is_docs_path_matches_markdown_suffix():
 
 def test_is_docs_path_matches_top_level_docs_directory():
     assert manifest.is_docs_path("docs/CODEX.md") is True
-    assert manifest.is_docs_path("docs/superpowers/plans/notes.txt") is True
+    assert manifest.is_docs_path("docs/iron/plans/notes.txt") is True
 
 
 def test_is_docs_path_rejects_look_alike_directory():
@@ -500,7 +504,7 @@ def test_classify_path_docs_markdown_file():
 
 
 def test_classify_path_docs_directory():
-    assert manifest.classify_path("docs/superpowers/plans/notes.txt") == manifest.SURFACE_DOCS
+    assert manifest.classify_path("docs/iron/plans/notes.txt") == manifest.SURFACE_DOCS
 
 
 def test_classify_path_known_surface_beats_generic_docs():
@@ -1253,6 +1257,7 @@ _SURFACE_EXAMPLE_PATH_FOR_TEST = {
     manifest.SURFACE_RUST_WORKSPACE: "crates/ironmem/src/hook.rs",
     manifest.SURFACE_COLLAB_PROTOCOL: "docs/COLLAB.md",
     manifest.SURFACE_HOOK_SELF_TEST: "scripts/run_git_hook.py",
+    manifest.SURFACE_SKILLS: "skills/iron-build/SKILL.md",
 }
 
 _GATE_PHASE_PARAMS_FOR_TEST = [
@@ -2634,6 +2639,7 @@ _RUST_TEST_ARGV = ("cargo", "test", "--workspace")
 _HOOK_SELF_TEST_ARGV = ("python3", "scripts/test_run_git_hook.py")
 _HOOK_INSTALL_CHECK_ARGV = ("bash", "scripts/install-git-hooks.sh", "--check")
 _COLLAB_LINT_ARGV = ("python3", "scripts/check_collab_turn_templates.py")
+_SKILLS_SYNC_ARGV = ("python3", "scripts/check_skills_sync.py")
 
 
 # --- main() -- end-to-end, one phase at a time: a Rust-only change selects
@@ -2705,6 +2711,7 @@ def test_main_pre_commit_git_failure_escalates_to_every_gate_never_zero_gates_ru
             _HOOK_SELF_TEST_ARGV: 0,
             _HOOK_INSTALL_CHECK_ARGV: 0,
             _COLLAB_LINT_ARGV: 0,
+            _SKILLS_SYNC_ARGV: 0,
             _RUST_FMT_ARGV: 0,
             _RUST_CLIPPY_ARGV: 0,
         }
@@ -2722,6 +2729,7 @@ def test_main_pre_commit_git_failure_escalates_to_every_gate_never_zero_gates_ru
         list(_HOOK_SELF_TEST_ARGV),
         list(_HOOK_INSTALL_CHECK_ARGV),
         list(_COLLAB_LINT_ARGV),
+        list(_SKILLS_SYNC_ARGV),
         list(_RUST_FMT_ARGV),
         list(_RUST_CLIPPY_ARGV),
     ]
@@ -2746,6 +2754,7 @@ def test_main_pre_push_git_failure_escalates_to_every_gate(monkeypatch, capsys):
             ("git", "diff", "--name-only", "--no-renames", "-z", f"{SHA_A}..{SHA_B}"): (128, ""),
             _HOOK_SELF_TEST_ARGV: 0,
             _COLLAB_LINT_ARGV: 0,
+            _SKILLS_SYNC_ARGV: 0,
             _RUST_TEST_ARGV: 0,
         }
     )
@@ -2759,6 +2768,7 @@ def test_main_pre_push_git_failure_escalates_to_every_gate(monkeypatch, capsys):
     assert non_git_calls == [
         list(_HOOK_SELF_TEST_ARGV),
         list(_COLLAB_LINT_ARGV),
+        list(_SKILLS_SYNC_ARGV),
         list(_RUST_TEST_ARGV),
     ]
     # The @{u} fallback must never fire once unknown=True -- escalation, not
@@ -2822,7 +2832,12 @@ def test_main_pre_push_whitespace_only_stdin_escalates_and_never_reaches_fallbac
     # which is the correct behavior and is deliberately left unchanged. Only
     # genuinely empty stdin reaches the fallback.
     fake = _FakeSubprocessRun(
-        {_HOOK_SELF_TEST_ARGV: 0, _COLLAB_LINT_ARGV: 0, _RUST_TEST_ARGV: 0}
+        {
+            _HOOK_SELF_TEST_ARGV: 0,
+            _COLLAB_LINT_ARGV: 0,
+            _SKILLS_SYNC_ARGV: 0,
+            _RUST_TEST_ARGV: 0,
+        }
     )
     monkeypatch.setattr(subprocess, "run", fake)
     monkeypatch.setattr(sys, "stdin", _StdinStub("   \n"))
@@ -2837,6 +2852,7 @@ def test_main_pre_push_whitespace_only_stdin_escalates_and_never_reaches_fallbac
     assert fake.calls == [
         list(_HOOK_SELF_TEST_ARGV),
         list(_COLLAB_LINT_ARGV),
+        list(_SKILLS_SYNC_ARGV),
         list(_RUST_TEST_ARGV),
     ]
 
@@ -3067,6 +3083,76 @@ def test_missing_pytest_fails_loudly_with_an_actionable_message(tmp_path):
     # The specific regression: a traceback here means the friendly message is
     # unreachable again.
     assert "Traceback" not in result.stderr, result.stderr
+
+
+# --- Task 7: SURFACE_SKILLS / is_skills_path / skills_sync_check gate ---
+
+
+def test_canonical_skills_source_classifies_skills():
+    assert manifest.classify_path("skills/iron-build/SKILL.md") == manifest.SURFACE_SKILLS
+    assert manifest.classify_path("skills/vocab.toml") == manifest.SURFACE_SKILLS
+
+
+def test_generated_skills_classify_skills_in_every_plugin_root():
+    for root in (".claude-plugin", ".codex-plugin"):
+        path = f"{root}/skills/iron-build/references/tiers.md"
+        assert manifest.classify_path(path) == manifest.SURFACE_SKILLS, path
+
+
+def test_skills_surface_beats_the_generic_docs_catch_all():
+    # skills/*.md would otherwise satisfy is_docs_path and select no gate.
+    assert manifest.is_docs_path("skills/iron-tdd/SKILL.md") is True
+    assert manifest.classify_path("skills/iron-tdd/SKILL.md") == manifest.SURFACE_SKILLS
+
+
+def test_skills_lookalike_directories_do_not_match():
+    # Byte-exact segment matching, same rule as docsite/ vs docs/.
+    assert manifest.is_skills_path("skillset/notes.md") is False
+    assert manifest.is_skills_path("docs/skills/notes.md") is False
+    assert manifest.is_skills_path(".claude-plugin-backup/skills/x.md") is False
+
+
+def test_generator_scripts_select_the_skills_gate():
+    for path in manifest.SKILLS_EXACT_PATHS:
+        assert manifest.classify_path(path) == manifest.SURFACE_SKILLS, path
+
+
+def test_skills_exact_paths_covers_every_generator_script():
+    # Mirrors test_hook_exact_paths_covers_every_git_hook_module: walk the
+    # filesystem rather than trusting a hand-maintained list, so a new
+    # generator helper cannot silently stop selecting its own gate.
+    on_disk = {
+        path.relative_to(ROOT).as_posix()
+        for path in SCRIPTS.glob("*skills*.py")
+    }
+    missing = sorted(on_disk - manifest.SKILLS_EXACT_PATHS)
+    assert not missing, (
+        f"generator script(s) {missing} are not in SKILLS_EXACT_PATHS, so editing "
+        "them would not select the skills sync gate"
+    )
+    stale = sorted(manifest.SKILLS_EXACT_PATHS - on_disk)
+    assert not stale, f"SKILLS_EXACT_PATHS names non-existent script(s) {stale}"
+
+
+def test_installer_stays_on_the_collab_surface():
+    # Deliberate, not an oversight. scripts/install-ironmem.sh is in
+    # COLLAB_EXACT_PATHS and is_collab_protocol_path is checked first, so
+    # installer edits fire the collab template lint, NOT the skills gate.
+    # That is correct: the skills gate checks generator-vs-output drift, which
+    # an installer edit cannot cause. Reordering SURFACES to "fix" this would
+    # steal the installer from the collab gate, which is the real regression.
+    assert (
+        manifest.classify_path("scripts/install-ironmem.sh")
+        == manifest.SURFACE_COLLAB_PROTOCOL
+    )
+
+
+def test_skills_sync_gate_is_registered_for_both_phases():
+    gate = next(g for g in manifest.GATES if g.name == "skills_sync_check")
+    assert gate.argv == ("python3", "scripts/check_skills_sync.py")
+    assert gate.surfaces == frozenset({manifest.SURFACE_SKILLS})
+    assert gate.phases == frozenset({manifest.PHASE_PRE_COMMIT, manifest.PHASE_PRE_PUSH})
+    assert gate.always is False
 
 
 def _run_as_script() -> int:

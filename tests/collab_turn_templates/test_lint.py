@@ -105,15 +105,15 @@ def test_codex_dispatch_uses_explicit_repository_model_defaults():
     global_review_prompt = (ROOT / ".codex-plugin" / "prompts" / "collab-global-review.md").read_text()
     recovery_prompt = (ROOT / ".codex-plugin" / "prompts" / "collab-recovery.md").read_text()
     batch_prompt = (ROOT / ".codex-plugin" / "prompts" / "collab-batch-impl.md").read_text()
-    tools = (ROOT / ".codex-plugin" / "skills" / "using-superpowers" /
-             "references" / "codex-tools.md").read_text()
-    source_tools = (ROOT / ".claude-plugin" / "skills" / "using-superpowers" /
-                    "references" / "codex-tools.md").read_text()
-    agents = (ROOT / "AGENTS.md").read_text()
+    # Two surfaces this assertion used to cover are gone, and neither is
+    # replaced. The bundled skills no longer carry a codex-tools.md reference
+    # sheet -- the iron-* skills resolve harness tool names from
+    # skills/vocab.toml at generation time. AGENTS.md was deleted outright by
+    # PR #240 (adb5c80); the read of it left this suite red from that merge
+    # until now, unnoticed because nothing ran the suite.
 
     for surface in (docs, dispatcher, plan_draft_prompt, plan_review_prompt,
-                    global_review_prompt, recovery_prompt, batch_prompt, tools, source_tools,
-                    agents):
+                    global_review_prompt, recovery_prompt, batch_prompt):
         assert "gpt-5.6-luna" in surface
         assert "gpt-5.6-terra" in surface
         assert "gpt-5.6-sol" in surface

@@ -51,14 +51,10 @@ Before answering questions about prior work, decisions, project history, or peop
 
 `scripts/install-ironmem.sh` installs these Claude Code skills into `$CLAUDE_HOME/skills`:
 
-- `writing-plans`
-- `subagent-driven-development`
-- `finishing-a-development-branch`
-- `executing-plans`
-- `using-git-worktrees`
-- `using-superpowers`
-- `requesting-code-review`
-- `test-driven-development`
+- `iron-spec`
+- `iron-plan`
+- `iron-build`
+- `iron-tdd`
 
 It also installs the `code-reviewer` agent into `$CLAUDE_HOME/agents`.
 

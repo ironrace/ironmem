@@ -58,7 +58,16 @@ HOOK_EXACT_PATHS = {
     "scripts/git_hook/runtime.py",
 }
 
-
+# The generator, its guard, and its self-test. Editing any of them must select
+# the skills sync gate: a change to the generator can silently alter every
+# generated file, which is exactly the drift the gate exists to catch. Pinned
+# by `test_skills_exact_paths_covers_every_generator_script`, which walks
+# scripts/ rather than trusting this list.
+SKILLS_EXACT_PATHS = frozenset({
+    "scripts/sync_skills.py",
+    "scripts/check_skills_sync.py",
+    "scripts/test_sync_skills.py",
+})
 
 
 # Top-level directory holding Cargo crates that are deliberately OUTSIDE the
@@ -94,6 +103,34 @@ def is_collab_protocol_path(path: str) -> bool:
         path in COLLAB_EXACT_PATHS
         or path.startswith(".claude-plugin/prompts/collab-turn-")
         or path.startswith("tests/collab_turn_templates/")
+    )
+
+
+def is_skills_path(path: str) -> bool:
+    """The workflow-skill surface: the canonical authored tree at `skills/`,
+    the generated copies inside any harness plugin root, and the generator
+    scripts themselves.
+
+    Matched on `/`-split segments, never substrings -- `skillset/notes.md` and
+    `docs/skills/notes.md` must not match, same byte-exact rule that keeps
+    `docsite/` from matching `docs/`.
+
+    Generated copies live under a gate-covered plugin root, where they would
+    otherwise classify UNKNOWN and escalate to every gate. Claiming them here
+    is deliberate: no `cargo test` assertion reads plugin-root `skills/`
+    content (`packaging.rs`'s REQUIRED_ASSETS is bin/hooks/plugin.json;
+    `plugin_metadata.rs` parses `agents/*.md`, not `skills/*.md`), so the
+    skills sync gate is the gate that actually covers them.
+    """
+    if path in SKILLS_EXACT_PATHS:
+        return True
+    segments = path.split("/")
+    if segments[0] == "skills":
+        return True
+    return (
+        len(segments) >= 2
+        and _is_gate_covered_plugin_segment(segments[0])
+        and segments[1] == "skills"
     )
 
 
@@ -274,6 +311,7 @@ PHASE_PRE_PUSH = "pre-push"
 SURFACE_RUST_WORKSPACE = "rust_workspace"
 SURFACE_COLLAB_PROTOCOL = "collab_protocol"
 SURFACE_HOOK_SELF_TEST = "hook_self_test"
+SURFACE_SKILLS = "skills"
 SURFACE_DOCS = "docs"
 SURFACE_INERT_CONFIG = "inert_config"
 
@@ -402,6 +440,7 @@ SURFACES: MappingProxyType[str, Callable[[str], bool]] = MappingProxyType(
         SURFACE_RUST_WORKSPACE: is_rust_path,
         SURFACE_COLLAB_PROTOCOL: is_collab_protocol_path,
         SURFACE_HOOK_SELF_TEST: is_hook_path,
+        SURFACE_SKILLS: is_skills_path,
         SURFACE_DOCS: is_docs_path,
         SURFACE_INERT_CONFIG: is_inert_config_path,
     }
@@ -500,6 +539,13 @@ GATES: tuple[Gate, ...] = (
         argv=("python3", "scripts/check_collab_turn_templates.py"),
         phases=frozenset({PHASE_PRE_COMMIT, PHASE_PRE_PUSH}),
         surfaces=frozenset({SURFACE_COLLAB_PROTOCOL}),
+        always=False,
+    ),
+    Gate(
+        name="skills_sync_check",
+        argv=("python3", "scripts/check_skills_sync.py"),
+        phases=frozenset({PHASE_PRE_COMMIT, PHASE_PRE_PUSH}),
+        surfaces=frozenset({SURFACE_SKILLS}),
         always=False,
     ),
     Gate(
