@@ -227,6 +227,96 @@ class InstallIronmemSelfTest(unittest.TestCase):
             self.assertTrue(legacy_base.exists())
             self.assertFalse((claude_home / ".ironmem-bases" / "commands" / "collab.md").exists())
 
+    def _full_install_env(self, home: pathlib.Path) -> dict[str, str]:
+        claude_home = home / "claude-home"
+        codex_home = home / "codex-home"
+        return {
+            "CLAUDE_HOME": str(claude_home),
+            "CODEX_HOME": str(codex_home),
+            "CLAUDE_SKILLS_DIR": str(home / "claude-discovery" / "skills"),
+            "CLAUDE_AGENTS_DIR": str(home / "claude-discovery" / "agents"),
+            "CLAUDE_COMMANDS_DIR": str(home / "claude-discovery" / "commands"),
+            "CLAUDE_PROMPTS_DIR": str(home / "claude-discovery" / "prompts"),
+            "CODEX_SKILLS_DIR": str(home / "codex-discovery" / "skills"),
+            "CODEX_COMMANDS_DIR": str(home / "codex-discovery" / "commands"),
+            "CODEX_PROMPTS_DIR": str(home / "codex-discovery" / "prompts"),
+        }
+
+    def test_install_places_the_four_iron_skills(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            home = pathlib.Path(directory)
+            env = self._full_install_env(home)
+            self.run_installer(home, home / ".claude.json", skip_skills=False, extra_env=env)
+
+            for root_key in ("CLAUDE_SKILLS_DIR", "CODEX_SKILLS_DIR"):
+                root = pathlib.Path(env[root_key])
+                for skill in ("iron-spec", "iron-plan", "iron-build", "iron-tdd"):
+                    self.assertTrue(
+                        (root / skill / "SKILL.md").is_file(),
+                        f"{skill} missing from {root_key}",
+                    )
+
+    def test_superseded_skill_is_removed_when_a_base_snapshot_proves_ours(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            home = pathlib.Path(directory)
+            env = self._full_install_env(home)
+            skills_dir = pathlib.Path(env["CLAUDE_SKILLS_DIR"])
+            base_dir = pathlib.Path(env["CLAUDE_HOME"]) / ".ironmem-bases" / "skills"
+
+            installed = skills_dir / "writing-plans"
+            installed.mkdir(parents=True)
+            (installed / "SKILL.md").write_text("ours\n", encoding="utf-8")
+            snapshot = base_dir / "writing-plans"
+            snapshot.mkdir(parents=True)
+            (snapshot / "SKILL.md").write_text("ours\n", encoding="utf-8")
+
+            self.run_installer(home, home / ".claude.json", skip_skills=False, extra_env=env)
+
+            self.assertFalse(installed.exists(), "superseded skill was not removed")
+            self.assertFalse(snapshot.exists(), "base snapshot was not removed")
+
+    def test_user_owned_skill_is_kept_when_no_base_snapshot_exists(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            home = pathlib.Path(directory)
+            env = self._full_install_env(home)
+            skills_dir = pathlib.Path(env["CLAUDE_SKILLS_DIR"])
+
+            theirs = skills_dir / "writing-plans"
+            theirs.mkdir(parents=True)
+            (theirs / "SKILL.md").write_text("the user's own copy\n", encoding="utf-8")
+
+            result = self.run_installer(
+                home, home / ".claude.json", skip_skills=False, extra_env=env
+            )
+
+            self.assertTrue(theirs.is_file() or theirs.is_dir())
+            self.assertEqual(
+                (theirs / "SKILL.md").read_text(encoding="utf-8"),
+                "the user's own copy\n",
+                "installer modified a skill it did not install",
+            )
+            self.assertIn("writing-plans", result.stderr)
+            self.assertIn("no ironmem base snapshot", result.stderr)
+
+    def test_cleanup_covers_the_codex_side_too(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            home = pathlib.Path(directory)
+            env = self._full_install_env(home)
+            skills_dir = pathlib.Path(env["CODEX_SKILLS_DIR"])
+            base_dir = pathlib.Path(env["CODEX_HOME"]) / ".ironmem-bases" / "skills"
+
+            for name in ("using-superpowers", "executing-plans"):
+                (skills_dir / name).mkdir(parents=True)
+                (skills_dir / name / "SKILL.md").write_text("ours\n", encoding="utf-8")
+                (base_dir / name).mkdir(parents=True)
+                (base_dir / name / "SKILL.md").write_text("ours\n", encoding="utf-8")
+
+            self.run_installer(home, home / ".claude.json", skip_skills=False, extra_env=env)
+
+            for name in ("using-superpowers", "executing-plans"):
+                self.assertFalse((skills_dir / name).exists(), f"{name} survived on the Codex side")
+            self.assertTrue((skills_dir / "pr-review-toolkit" / "SKILL.md").is_file())
+
 
 if __name__ == "__main__":
     unittest.main()
