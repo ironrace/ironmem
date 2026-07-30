@@ -24,8 +24,9 @@ tier for this task: at least one tier above the implementer, never below
 
     ## Git Range to Review
 
-    **Base:** [BASE_SHA — the commit before this task]
-    **Head:** [HEAD_SHA — the current commit]
+    **Base:** [BASE_SHA — the HEAD the controller recorded before dispatching
+    the implementer for this task]
+    **Head:** [HEAD_SHA — the current HEAD]
 
     Read the diff before you say anything about it:
 

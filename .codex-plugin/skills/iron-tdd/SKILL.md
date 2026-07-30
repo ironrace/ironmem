@@ -16,9 +16,11 @@ tests the right thing — it's an assertion you hope is wired up, not proof.
 Always: new features, bug fixes, refactors, behavior changes. A bug fixed
 without a regression test is a bug that comes back.
 
-The only real exceptions are throwaway prototypes, generated code, and
-configuration files. "Skip it just this once" on anything else is the
-rationalization, not the exception — treat the thought itself as a red flag.
+The only candidate exceptions are throwaway prototypes, generated code, and
+configuration files — and even those need your human partner's permission, so
+ask before skipping rather than granting yourself the exemption. "Skip it just
+this once" on anything else is the rationalization, not the exception — treat
+the thought itself as a red flag.
 
 ## The Iron Law
 

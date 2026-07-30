@@ -35,9 +35,15 @@ spawn_agent(agent_type="worker", model=<model>, reasoning_effort=<effort>, messa
     2. Write tests using the `iron-tdd` discipline: one failing test, observed
        failing, then the minimal implementation
     3. Verify implementation works
-    4. Commit your work
+    4. Commit your own work. You own every commit for this task — the
+       controller does not commit for you. `iron-tdd`'s cycle ends in a
+       commit, so commit as you go; make as many commits as the work needs.
     5. Self-review (see below)
-    6. Report back
+    6. Commit anything your self-review changed, then report back. Leave no
+       uncommitted changes behind — the reviewers only see what is committed.
+
+    If you are re-dispatched to fix review findings, the same rule holds:
+    commit the fixes yourself before reporting back.
 
     Work from: [directory]
 

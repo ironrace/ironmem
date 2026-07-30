@@ -74,21 +74,48 @@ the plan file — you hand them the text.
 
 Then, for each task in plan order:
 
-1. **Resolve the tier** from the task's `**Tier:**` line — see below.
-2. **Dispatch the implementer** at that tier using `./prompts/implementer.md`,
+1. **Record the task's base commit — before you dispatch anything.** Run `git
+   rev-parse HEAD` and keep the value; that is this task's `BASE_SHA`. Capture
+   it *first*, because once the implementer starts committing there is no way
+   to recover where the task began.
+2. **Resolve the tier** from the task's `**Tier:**` line — see below.
+3. **Dispatch the implementer** at that tier using `./prompts/implementer.md`,
    filled in with the full task text and scene-setting context.
-3. **Answer its questions.** If it asks something before or during the work,
+4. **Answer its questions.** If it asks something before or during the work,
    answer completely before letting it proceed.
-4. **Handle the reported status** — see below. Only `DONE`, or a
+5. **Handle the reported status** — see below. Only `DONE`, or a
    `DONE_WITH_CONCERNS` whose concerns you have resolved, continues.
-5. **Spec-compliance review** with `./prompts/spec-reviewer.md` at the reviewer
+6. **Spec-compliance review** with `./prompts/spec-reviewer.md` at the reviewer
    tier. Issues found → the same implementer fixes them → review again. Loop
    until compliant.
-6. **Code-quality review** with `./prompts/quality-reviewer.md` at the reviewer
+7. **Code-quality review** with `./prompts/quality-reviewer.md` at the reviewer
    tier, and only once spec compliance passes. Same fix-and-re-review loop.
-7. **Commit** the task-scoped work.
-8. **Record the outcome** as an ironmem drawer — see below.
-9. **Mark the task complete** in TodoWrite, then immediately start the next one.
+8. **Verify the task's work is committed.** The implementer commits its own
+   work — see *Who Commits* below. Run `git status --porcelain`; if anything
+   is uncommitted, dispatch the implementer back to commit it rather than
+   committing for it.
+9. **Record the outcome** as an ironmem drawer — see below.
+10. **Mark the task complete** in TodoWrite, then immediately start the next one.
+
+**Passing the review range.** Every reviewer dispatch gets the git range
+explicitly: `BASE_SHA` is the value from step 1, and `HEAD_SHA` is `git
+rev-parse HEAD` taken at the moment you dispatch that reviewer. Re-read
+`HEAD_SHA` before every re-review, so a fix round is inside the range.
+
+**`HEAD~1..HEAD` is not acceptable.** An implementer makes as many commits as
+the work needs, so a one-commit range shows the reviewer a fragment of the task
+and it will report that fragment clean — a gate that appears to fire and does
+not. The range always starts at the recorded `BASE_SHA`.
+
+## Who Commits
+
+The implementer commits its own work, including any fixes it makes during a
+review round. That is what makes `BASE_SHA..HEAD` a reviewable range at all,
+and it is why `iron-tdd`'s cycle ends in a commit.
+
+The controller does not commit implementation work. Its step 8 is a *check*,
+not a commit point: confirm the tree is clean, and send anything left over back
+to the implementer that produced it.
 
 Never run two implementers at once; they collide in the same worktree. Never
 repair an implementer's work yourself — dispatch the fix back to it, so the fix
@@ -115,9 +142,6 @@ reviewer; a `deep` one gets a `frontier` reviewer; a `frontier` one gets a
 implementer plus expensive reviewer is the better cost/quality point, because
 review is what catches the cheap model's mistakes.
 
-Under-routing is self-correcting through *Escalate on failure* below, so when a
-tier is genuinely ambiguous, guess low.
-
 Note what you actually dispatched — model, dispatch path, and effort if one was
 passed — because `./references/tiers.md` documents efforts that some dispatch
 paths silently ignore. *Recording the Outcome* is where that goes.
@@ -142,8 +166,10 @@ tier. A context gap is not a capability gap.
 
 **Escalate on failure.** If the reviewer rejects the same task twice,
 re-dispatch the implementer one tier higher — once. If that also fails, stop
-and ask the human. Never re-dispatch at the same tier with the same context
-and expect a different result.
+and ask the human. At `frontier` there is no higher tier, so escalation there
+means stopping and asking the human immediately — never re-run `frontier`
+against itself. Never re-dispatch at the same tier with the same context and
+expect a different result.
 
 **Never** silently mark a task complete after a `BLOCKED` or `NEEDS_CONTEXT`.
 

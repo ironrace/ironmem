@@ -8,15 +8,11 @@
 # as literal text.
 
 [claude]
-DISPATCH       = "Task tool"
 TODO           = "TodoWrite"
 AGENT_DISPATCH = "Task(subagent_type=\"general-purpose\", model=<alias>, prompt=<full task text>)"
 WORKTREE_NEW   = "EnterWorktree (native), or `git worktree add ../<branch> -b <branch>`"
-SKILLS_HOME    = "~/.claude/skills"
 
 [codex]
-DISPATCH       = "spawn_agent"
 TODO           = "update_plan"
 AGENT_DISPATCH = "spawn_agent(agent_type=\"worker\", model=<model>, reasoning_effort=<effort>, message=<full task text>)"
 WORKTREE_NEW   = "git worktree add ../<branch> -b <branch>"
-SKILLS_HOME    = "~/.codex/skills"

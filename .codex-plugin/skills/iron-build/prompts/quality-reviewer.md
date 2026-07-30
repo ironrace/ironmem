@@ -25,8 +25,9 @@ spawn_agent(agent_type="worker", model=<model>, reasoning_effort=<effort>, messa
 
     ## Git Range to Review
 
-    **Base:** [BASE_SHA — the commit before this task]
-    **Head:** [HEAD_SHA — the current commit]
+    **Base:** [BASE_SHA — the HEAD the controller recorded before dispatching
+    the implementer for this task]
+    **Head:** [HEAD_SHA — the current HEAD]
 
     Read the diff before you say anything about it:
 
