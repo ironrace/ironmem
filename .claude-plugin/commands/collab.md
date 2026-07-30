@@ -1,5 +1,5 @@
 ---
-description: Start or join an IronRace bounded planning session with Codex, auto-flowing into v3 batch coding. Covers v1 planning, v3 batch implementation (Claude or Codex via approved Superpowers task plan + iron-build) → global review → PR handoff, and the post-iron-build review shortcut. Usage — /collab start [--implementer=claude|codex] <task>  |  /collab join [--implementer=claude|codex] <session_id>  |  /collab review <short-topic>
+description: Start or join an IronRace bounded planning session with Codex, auto-flowing into v3 batch coding. Covers v1 planning, v3 batch implementation (Claude or Codex via approved task plan + iron-build) → global review → PR handoff, and the post-iron-build review shortcut. Usage — /collab start [--implementer=claude|codex] <task>  |  /collab join [--implementer=claude|codex] <session_id>  |  /collab review <short-topic>
 argument-hint: start [--implementer=claude|codex] <task> | join [--implementer=claude|codex] <session_id> | review <short-topic>
 ---
 
@@ -47,15 +47,11 @@ branch names.
        branch with that name already exists locally or on `origin`
        (`git show-ref --verify --quiet refs/heads/<name>` /
        `refs/remotes/origin/<name>`), append `-2`, `-3`, … until unique.
-     - Pick a worktree directory using the same priority order as
-       `iron-build`'s *Workspace* section: an existing `.worktrees/` (preferred) or
-       `worktrees/` at the repo root; otherwise a preference from
-       `CLAUDE.md` (`grep -i "worktree.*director" CLAUDE.md`); otherwise
-       default to `.worktrees/` — collab must never stop to ask, unlike the
-       general skill. For a project-local directory, verify it's gitignored
-       (`git check-ignore -q <dir>`); if not, add it to `.gitignore` and
-       commit that fix before proceeding (same "fix broken things
-       immediately" rule the skill follows).
+     - Pick a worktree directory per `iron-build`'s *Workspace* section,
+       with one collab-specific override: where that section's step 3 says
+       to ask the human, collab defaults to `.worktrees/` instead. Collab
+       must never stop to ask — it is running a bounded protocol turn, not
+       an interactive session.
      - `git worktree add "<dir>/<name>" -b "<name>"` (branches from the
        current HEAD).
      - `repo_path` ← the new worktree's absolute path. `branch` ← `<name>`.
@@ -99,7 +95,7 @@ branch names.
    user approval here.** The draft is yours alone, Codex cannot see it.
    Once drafted, call `mcp__ironmem__collab_send` with
    `sender="claude"`, `topic="draft"`, `content=<the plan text>`. Your
-   only planning user gate is the final Superpowers task plan at
+   only planning user gate is the final approved task plan at
    `PlanClaudeFinalizePending`; sending the draft autonomously lets Codex
    start grinding immediately instead of waiting on a user think-time gate.
 6. After the draft is sent, begin the v1 planning loop (below). The send
@@ -150,9 +146,10 @@ paths, branches, or SHAs.
 5. Because shortcut sessions have no collab `task_list`, the Codex review
    prompt must recover context before judging the branch: search ironmem
    checkpoints for the same `repo_path`/`branch`, read any referenced
-   Superpowers task markdown, and scan the current code/diff to determine
+   approved task markdown, and scan the current code/diff to determine
    which acceptance criteria are already complete. If no checkpoint exists,
-   fall back to the branch diff plus nearby Superpowers plan docs in the repo.
+   fall back to the branch diff plus nearby plan docs under
+   `docs/iron/plans/`.
 6. Enter the v3 dispatch loop at phase `CodeReviewFixGlobalPending`. The
    loop handles the three remaining turns (`review_fix_global` from Codex,
    `review_local` from Claude, then `final_review` from Claude) and
@@ -241,9 +238,8 @@ ends here, before a human merges the PR on GitHub — collab has no way to
 observe the merge, so it cannot clean up automatically. If `start` created an
 isolated worktree for this session (check: `git rev-parse --git-common-dir`
 differs from `git rev-parse --git-dir` in `repo_path`), include a line in the
-final report to the user naming the worktree path and pointing at the
-`engineering:git-worktree-manager` skill's `worktree_cleanup.py` (or a plain
-`git worktree remove <path>` once the PR merges) — do not run cleanup
+final report to the user naming the worktree path and the cleanup command
+(`git worktree remove <path>`, once the PR merges) — do not run cleanup
 yourself, since the branch/worktree must survive until the PR is actually
 merged.
 
@@ -297,7 +293,7 @@ own `collab_status` / `collab_recv` / drawer fetches.
 <!-- LINT:gates-ref-only -->
 ### Approval gates are reference-only
 The only planning user gate is `final`: a compose worker writes the
-Superpowers-compatible task plan to `docs/iron/plans/...` and stages the
+iron-build-compatible task plan to `docs/iron/plans/...` and stages the
 exact markdown in a drawer, then returns `{ref, file path, ≤3-line summary}`.
 The orchestrator surfaces ONLY ref+path+summary for approval (never the full
 body); `collab-turn-submit.md` sends the approved final artifact by ref. For
@@ -340,12 +336,12 @@ Repeat the dispatch loop with these actions:
 | Phase | What to do (is_my_turn == true) |
 |---|---|
 | `PlanParallelDrafts` | The draft worker (`collab-turn-plan-draft.md`, planning/opus) was already dispatched from the `start` branch. is_my_turn should be false here — if true, verify with `collab_status`. If `collab_status` confirms Claude is the owner in a Codex-owned phase, this is a protocol-level anomaly — exit the loop and report to the user; do not attempt a send. |
-| `PlanSynthesisPending` | Dispatch `collab-turn-plan-synthesis.md` (planning/opus) autonomously. It merges both blind drafts and sends `topic="canonical"` directly. Do not enter Plan Mode here; the single human planning gate is the final Superpowers task plan. `draft` and `canonical` are the only v1 topics that are NOT JSON-wrapped. Ingest only the ≤3-line verdict; loop. |
+| `PlanSynthesisPending` | Dispatch `collab-turn-plan-synthesis.md` (planning/opus) autonomously. It merges both blind drafts and sends `topic="canonical"` directly. Do not enter Plan Mode here; the single human planning gate is the final approved task plan. `draft` and `canonical` are the only v1 topics that are NOT JSON-wrapped. Ingest only the ≤3-line verdict; loop. |
 | `PlanCodexReviewPending` | Codex's turn. is_my_turn should be false — if true, verify with `collab_status`. If the inconsistency persists, exit the loop and report to the user. **Review cap:** the server enforces `MAX_REVIEW_ROUNDS = 1` at `crates/ironmem/src/collab/state_machine/mod.rs:28`. Codex gets one plan-review pass; after that review the server transitions to `PlanClaudeFinalizePending` regardless of verdict (`approve`, `approve_with_minor_edits`, or `request_changes` all map to the same next phase). Do not model v1 as open-ended iteration or return to synthesis. |
-| `PlanClaudeFinalizePending` | **Enter Plan Mode and get user approval — this is the only planning human gate.** Under reference-only gates, dispatch `collab-turn-plan-finalize.md` (planning/opus), which incorporates Codex's one review pass and produces the final Superpowers-compatible task markdown in `docs/iron/plans/...`. Every `### Task N:` must be sized for 20 minutes or less and the plan must contain at most 10 tasks. If it would need 11 or more, stop before approval and split the work into independently executable child issues; never merge unrelated work or drop acceptance criteria to evade the limit. The worker stages `{"plan": "<exact markdown>"}` in a drawer and returns `{drawer_id, file path, ≤3-line summary}`; surface ONLY ref+path+summary for approval. On approval dispatch `collab-turn-submit.md` (mechanical/sonnet) with `$TOPIC=final` `$ARTIFACT_REF=<drawer_id>` to send `topic="final"` (v1 `final` is the only v1 topic wrapped in JSON); drawer immutability is the integrity anchor. After send, `PlanLocked` is reached. Ingest only the ≤3-line verdict; loop. |
+| `PlanClaudeFinalizePending` | **Enter Plan Mode and get user approval — this is the only planning human gate.** Under reference-only gates, dispatch `collab-turn-plan-finalize.md` (planning/opus), which incorporates Codex's one review pass and produces the final iron-build-compatible task markdown in `docs/iron/plans/...`. Every `### Task N:` must be sized for 20 minutes or less and the plan must contain at most 10 tasks. If it would need 11 or more, stop before approval and split the work into independently executable child issues; never merge unrelated work or drop acceptance criteria to evade the limit. The worker stages `{"plan": "<exact markdown>"}` in a drawer and returns `{drawer_id, file path, ≤3-line summary}`; surface ONLY ref+path+summary for approval. On approval dispatch `collab-turn-submit.md` (mechanical/sonnet) with `$TOPIC=final` `$ARTIFACT_REF=<drawer_id>` to send `topic="final"` (v1 `final` is the only v1 topic wrapped in JSON); drawer immutability is the integrity anchor. After send, `PlanLocked` is reached. Ingest only the ≤3-line verdict; loop. |
 
 Rationale: blind drafts, synthesis, and Codex's single review run
-autonomously. The final Superpowers task plan is the commit point and the
+autonomously. The final approved task plan is the commit point and the
 only artifact worth interrupting the human for.
 
 ## v3 Bridge: PlanLocked → CodeImplementPending
@@ -361,7 +357,7 @@ verifies the exact file, parses tasks, and sends `task_list`. Only the worker's
 
 Once `PlanLocked` is reached with `final_plan_hash` set and no `task_list`
 yet, run this worker-owned bridge. **Do not enter harness Plan Mode here** —
-the user already approved the final Superpowers task plan.
+the user already approved the final task plan.
 
 1. Dispatch `collab-turn-task-list.md` (mechanical/sonnet). The worker reads
    `final_plan_ref`/`final_plan_hash`, obtains the repo-relative
@@ -656,7 +652,7 @@ remain:
 - The `implementation_done` payload carries ONLY `head_sha`. Do not
   embed subagent notes, self-critique, success summaries, or
   instructions for Codex in any other field — there are no other
-  fields. Codex reads the diff and the approved Superpowers task markdown at
+  fields. Codex reads the diff and the approved task markdown at
   `plan_file_path` to form its own judgment.
 - When dispatching Codex via `codex exec`, the prompt file passed is
   the verbatim expanded Codex prompt with `$ARGUMENTS` substituted —
@@ -999,7 +995,7 @@ Writes are best-effort and never block the protocol.
 - **Harness Plan Mode gates only at v1 `final`
   (`PlanClaudeFinalizePending`).** The blind `draft` send, canonical synthesis,
   and Codex's one plan-review pass run autonomously. The v3 `task_list` send is
-  a mechanical parse/submit from the already-approved Superpowers markdown, not
+  a mechanical parse/submit from the already-approved task markdown, not
   an extra task-planning handoff and not a harness Plan Mode gate. The v3
   `final_review` PR creation runs autonomously (no gate; the diff already
   passed `review_fix_global` + `review_local`). Every other turn runs
@@ -1017,7 +1013,7 @@ Writes are best-effort and never block the protocol.
   counterpart of the interrupted owner.
 - If the user interrupts with a question or correction during v1, answer it
   inside the final Plan Mode gate when possible and incorporate it into the
-  final Superpowers task plan. During v3, all turns are autonomous — the only
+  final approved task plan. During v3, all turns are autonomous — the only
   remaining content gate is v1 `final` (Plan Mode). The bridge mechanically
   submits `task_list` from the approved markdown and `final_review` PR creation
   is gateless.
