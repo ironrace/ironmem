@@ -2904,8 +2904,7 @@ mod tests {
     fn status_verbose_returns_final_ref_and_file_path_not_body() {
         let app = test_app();
         let sid = start_session(&app);
-        let final_plan =
-            "<!-- plan_file_path: docs/iron/plans/issue-207.md -->\n\nFULL FINAL";
+        let final_plan = "<!-- plan_file_path: docs/iron/plans/issue-207.md -->\n\nFULL FINAL";
         drive_to_final(&app, &sid, "canonical plan", final_plan);
 
         let status =
@@ -2981,8 +2980,7 @@ mod tests {
     fn status_legacy_null_final_drawer_returns_file_path_without_body() {
         let app = test_app();
         let sid = start_session(&app);
-        let final_plan =
-            "<!-- plan_file_path: docs/iron/plans/legacy.md -->\n\nLEGACY FINAL";
+        let final_plan = "<!-- plan_file_path: docs/iron/plans/legacy.md -->\n\nLEGACY FINAL";
         drive_to_final(&app, &sid, "canonical plan", final_plan);
 
         // Simulate a pre-009 session whose final drawer id was never recorded.
