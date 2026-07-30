@@ -167,5 +167,83 @@ class LoadVocabTests(unittest.TestCase):
             self.assertIn("codex", str(ctx.exception))
 
 
+import shutil
+
+
+class HeaderTests(unittest.TestCase):
+    def test_header_goes_after_yaml_frontmatter(self) -> None:
+        text = "---\nname: iron-build\ndescription: x\n---\n\n# Iron Build\n"
+        result = sync_skills.inject_header(text)
+        lines = result.split("\n")
+        self.assertEqual(lines[0], "---")
+        self.assertEqual(lines[3], "---")
+        self.assertEqual(lines[4], sync_skills.GENERATED_HEADER)
+        self.assertIn("# Iron Build", result)
+
+    def test_header_goes_on_top_without_frontmatter(self) -> None:
+        result = sync_skills.inject_header("# Tiers\n")
+        self.assertTrue(result.startswith(sync_skills.GENERATED_HEADER + "\n"))
+
+    def test_header_is_not_duplicated(self) -> None:
+        once = sync_skills.inject_header("# Tiers\n")
+        self.assertEqual(sync_skills.inject_header(once), once)
+
+
+class WalkTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.tmp = pathlib.Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.tmp)
+        self.source = self.tmp / "skills"
+        (self.source / "iron-demo").mkdir(parents=True)
+        (self.source / "vocab.toml").write_text(
+            '[claude]\nDISPATCH = "Task tool"\n\n[codex]\nDISPATCH = "spawn_agent"\n',
+            encoding="utf-8",
+        )
+        (self.source / "iron-demo" / "SKILL.md").write_text(
+            "---\nname: iron-demo\ndescription: demo\n---\n\nUse the {{DISPATCH}}.\n",
+            encoding="utf-8",
+        )
+        self.targets = {
+            "claude": self.tmp / "claude" / "skills",
+            "codex": self.tmp / "codex" / "skills",
+        }
+
+    def test_plan_renders_every_harness(self) -> None:
+        rendered = sync_skills.plan(self.source)
+        self.assertEqual(sorted(rendered), ["claude", "codex"])
+        self.assertIn("Use the Task tool.", rendered["claude"]["iron-demo/SKILL.md"])
+        self.assertIn("Use the spawn_agent.", rendered["codex"]["iron-demo/SKILL.md"])
+
+    def test_vocab_is_never_emitted(self) -> None:
+        rendered = sync_skills.plan(self.source)
+        for files in rendered.values():
+            self.assertNotIn("vocab.toml", files)
+
+    def test_write_is_idempotent(self) -> None:
+        rendered = sync_skills.plan(self.source)
+        first = sync_skills.write(rendered, self.targets)
+        self.assertTrue(first)
+        second = sync_skills.write(rendered, self.targets)
+        self.assertEqual(second, [])
+
+    def test_write_prunes_stale_iron_dirs_only(self) -> None:
+        claude = self.targets["claude"]
+        (claude / "iron-gone").mkdir(parents=True)
+        (claude / "iron-gone" / "SKILL.md").write_text("stale\n", encoding="utf-8")
+        (claude / "pr-review-toolkit").mkdir(parents=True)
+        (claude / "pr-review-toolkit" / "SKILL.md").write_text("keep\n", encoding="utf-8")
+        (claude / "ATTRIBUTION.md").write_text("keep\n", encoding="utf-8")
+
+        sync_skills.write(sync_skills.plan(self.source), self.targets)
+
+        self.assertFalse((claude / "iron-gone").exists())
+        self.assertTrue((claude / "pr-review-toolkit" / "SKILL.md").is_file())
+        self.assertTrue((claude / "ATTRIBUTION.md").is_file())
+
+    def test_generated_output_carries_header(self) -> None:
+        rendered = sync_skills.plan(self.source)
+        self.assertIn(sync_skills.GENERATED_HEADER, rendered["claude"]["iron-demo/SKILL.md"])
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -150,3 +150,134 @@ def render(text: str, harness: str, vocab: dict[str, dict[str, str]], *, origin:
         raise SkillSyncError(f"{origin}: unknown harness {harness!r}")
     stripped = _strip_harness_blocks(text, harness, vocab, origin)
     return _substitute_tokens(stripped, harness, vocab, origin)
+
+
+def inject_header(text: str) -> str:
+    """Place GENERATED_HEADER after YAML frontmatter, or at the top.
+
+    Frontmatter must remain the very first bytes of a SKILL.md -- both
+    harnesses parse `name`/`description` from it for discovery -- so the
+    header cannot simply be prepended.
+    """
+    if GENERATED_HEADER in text:
+        return text
+    lines = text.split("\n")
+    if lines and lines[0] == "---":
+        for index in range(1, len(lines)):
+            if lines[index] == "---":
+                lines.insert(index + 1, GENERATED_HEADER)
+                return "\n".join(lines)
+        raise SkillSyncError("frontmatter opened with '---' but never closed")
+    return GENERATED_HEADER + "\n" + text
+
+
+def plan(source: pathlib.Path = SOURCE) -> dict[str, dict[str, str]]:
+    """Render every authored file for every harness. Pure: no writes."""
+    vocab = load_vocab(source / "vocab.toml")
+    files = sorted(
+        path for path in source.rglob("*") if path.is_file() and path.name != "vocab.toml"
+    )
+    rendered: dict[str, dict[str, str]] = {harness: {} for harness in HARNESSES}
+    for path in files:
+        relative = path.relative_to(source).as_posix()
+        if not relative.startswith(OWNED_PREFIX):
+            raise SkillSyncError(
+                f"{relative}: every authored skill directory must be named "
+                f"{OWNED_PREFIX}* (the generator only owns that prefix in the targets)"
+            )
+        text = path.read_text(encoding="utf-8")
+        for harness in HARNESSES:
+            body = render(text, harness, vocab, origin=relative)
+            if not body.endswith("\n"):
+                body += "\n"
+            rendered[harness][relative] = inject_header(body)
+    return rendered
+
+
+def write(
+    rendered: dict[str, dict[str, str]], targets: dict[str, pathlib.Path]
+) -> list[str]:
+    """Write rendered output and prune stale generated files.
+
+    Only `iron-*` subtrees are owned. ATTRIBUTION.md and Codex's
+    pr-review-toolkit are hand-maintained and survive untouched.
+    """
+    changed: list[str] = []
+    for harness, files in rendered.items():
+        root = targets[harness]
+        for relative, body in sorted(files.items()):
+            destination = root / relative
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            if not destination.exists() or destination.read_text(encoding="utf-8") != body:
+                destination.write_text(body, encoding="utf-8", newline="\n")
+                changed.append(f"{root.name}/{relative}")
+
+        expected = set(files)
+        if root.is_dir():
+            for path in sorted(root.rglob("*")):
+                if not path.is_file():
+                    continue
+                relative = path.relative_to(root).as_posix()
+                if not relative.startswith(OWNED_PREFIX):
+                    continue
+                if relative not in expected:
+                    path.unlink()
+                    changed.append(f"{root.name}/{relative} (removed)")
+            for path in sorted(root.rglob("*"), reverse=True):
+                if path.is_dir() and path.name.startswith(OWNED_PREFIX) and not any(path.iterdir()):
+                    path.rmdir()
+    return changed
+
+
+def diff(rendered: dict[str, dict[str, str]], targets: dict[str, pathlib.Path]) -> list[str]:
+    """Relative paths whose committed content differs from `rendered`."""
+    drifted: list[str] = []
+    for harness, files in rendered.items():
+        root = targets[harness]
+        for relative, body in sorted(files.items()):
+            destination = root / relative
+            if not destination.is_file():
+                drifted.append(f"{root.name}/{relative} (missing)")
+            elif destination.read_text(encoding="utf-8") != body:
+                drifted.append(f"{root.name}/{relative} (stale)")
+        if root.is_dir():
+            expected = set(files)
+            for path in sorted(root.rglob("*")):
+                if path.is_file():
+                    relative = path.relative_to(root).as_posix()
+                    if relative.startswith(OWNED_PREFIX) and relative not in expected:
+                        drifted.append(f"{root.name}/{relative} (orphaned)")
+    return drifted
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description="generate per-harness skills from skills/")
+    parser.add_argument("--check", action="store_true", help="fail if generated output is stale")
+    args = parser.parse_args()
+
+    try:
+        rendered = plan()
+    except SkillSyncError as exc:
+        print(f"sync_skills: {exc}", file=sys.stderr)
+        return 2
+
+    if args.check:
+        drifted = diff(rendered, TARGETS)
+        if drifted:
+            for entry in drifted:
+                print(f"skills drifted: {entry}", file=sys.stderr)
+            print("Run: python3 scripts/sync_skills.py", file=sys.stderr)
+            return 1
+        print("generated skills match skills/")
+        return 0
+
+    changed = write(rendered, TARGETS)
+    for entry in changed:
+        print(f"wrote {entry}")
+    if not changed:
+        print("generated skills already up to date")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
