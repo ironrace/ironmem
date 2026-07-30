@@ -8,7 +8,7 @@ description: Use when you have a spec or requirements for a multi-step task, bef
 
 Turn an approved spec into an implementation plan an engineer can execute without guessing. Write for a skilled developer who has zero context for this codebase and does not know its toolset, its problem domain, or good test design. Give them everything: exact file paths per task, the actual code, exact commands with their expected output, and the docs they would otherwise have to hunt down. DRY, YAGNI, TDD, frequent commits.
 
-**Save plans to:** `docs/iron/plans/YYYY-MM-DD-<feature-name>.md` (a user preference for plan location overrides this default).
+**Save plans to:** `docs/iron/plans/YYYY-MM-DD-<feature-name>.md` (a user preference for plan location overrides this default). Check whether that path is gitignored. If it is, the working tree is the only copy — also persist the plan to an ironmem drawer with a `logical_key` so a `git clean` or a fresh clone cannot destroy it mid-execution.
 
 ## Task Right-Sizing
 

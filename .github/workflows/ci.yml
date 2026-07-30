@@ -60,8 +60,13 @@ jobs:
       # Distinct from the "collab template lint" step above: that runs the
       # linter, this runs the linter's own test suite. It went unrun -- and
       # therefore silently red -- from adb5c80 until it was wired in here.
-      - name: collab turn-template lint self-test
-        run: python3 -m pytest tests/collab_turn_templates/ -q
+      #
+      # Targets `tests/`, not the one package inside it. A second package added
+      # later is then covered automatically; naming the package would recreate
+      # the same silently-unrun suite one directory over. Matches the command
+      # in CONTRIBUTING.md's local loop exactly, flags included.
+      - name: python test suites
+        run: python3 -m pytest tests/
 
       - name: installer self-test
         run: python3 scripts/test_install_ironmem.py

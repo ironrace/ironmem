@@ -37,7 +37,7 @@ cargo fmt --all -- --check
 python3 scripts/check_collab_turn_templates.py
 python3 scripts/test_run_git_hook.py
 python3 scripts/sync_mcp_wrappers.py --check
-python3 -m pytest tests/collab_turn_templates/
+python3 -m pytest tests/
 cargo clippy --workspace --all-targets --all-features -- -D warnings
 cargo test --workspace
 bash scripts/check_versions.sh
