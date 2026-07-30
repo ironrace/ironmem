@@ -335,5 +335,72 @@ class LabelRootTests(unittest.TestCase):
             self.assertNotIn(str(sync_skills.ROOT), label)
 
 
+class TierParityTests(unittest.TestCase):
+    """Every tier in iron-plan's shared policy has a row in EVERY harness
+    lineup. This is the one property the byte-for-byte drift check cannot
+    cover, because tiers.md is meant to differ per harness.
+    """
+
+    TIERS = ("cheap", "standard", "deep", "frontier")
+
+    def setUp(self) -> None:
+        self.rendered = sync_skills.plan()
+
+    def test_policy_names_exactly_the_declared_tiers(self) -> None:
+        policy = self.rendered["claude"]["iron-plan/SKILL.md"]
+        for tier in self.TIERS:
+            self.assertIn(f"`{tier}`", policy, f"tier {tier} missing from iron-plan policy")
+
+    def test_every_tier_has_a_row_in_every_harness_lineup(self) -> None:
+        for harness, files in self.rendered.items():
+            lineup = files["iron-build/references/tiers.md"]
+            for tier in self.TIERS:
+                self.assertIn(
+                    f"| `{tier}` |",
+                    lineup,
+                    f"tier {tier} has no row in the {harness} lineup",
+                )
+
+    def test_claude_cheap_row_carries_no_effort_value(self) -> None:
+        # Haiku 4.5 returns HTTP 400 when passed `effort`. The cheap row must
+        # stay effort-free, and the generator must not synthesize one.
+        lineup = self.rendered["claude"]["iron-build/references/tiers.md"]
+        row = next(line for line in lineup.split("\n") if line.startswith("| `cheap` |"))
+        self.assertNotIn("medium", row)
+        self.assertNotIn("high", row)
+        self.assertIn("unsupported", row)
+
+    def test_claude_lineup_states_the_agent_tool_effort_caveat(self) -> None:
+        lineup = self.rendered["claude"]["iron-build/references/tiers.md"]
+        self.assertIn("no `effort` parameter", lineup)
+
+    def test_iron_build_records_the_dispatch_path(self) -> None:
+        for harness, files in self.rendered.items():
+            skill = files["iron-build/SKILL.md"]
+            self.assertIn("dispatch_path", skill, f"{harness} iron-build omits dispatch_path")
+
+    def test_no_skill_references_an_uninstalled_skill(self) -> None:
+        forbidden = (
+            "superpowers",
+            "brainstorming",
+            "writing-plans",
+            "subagent-driven-development",
+            "executing-plans",
+            "using-git-worktrees",
+            "finishing-a-development-branch",
+            "requesting-code-review",
+            "test-driven-development",
+            "using-superpowers",
+        )
+        for harness, files in self.rendered.items():
+            for relative, body in files.items():
+                for name in forbidden:
+                    self.assertNotIn(
+                        name,
+                        body,
+                        f"{harness}/{relative} references uninstalled skill {name!r}",
+                    )
+
+
 if __name__ == "__main__":
     unittest.main()
