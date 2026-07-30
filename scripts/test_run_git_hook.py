@@ -284,7 +284,6 @@ def test_manifest_declaration_order_is_preserved():
         "hook_self_test",
         "hook_install_check",
         "collab_template_lint",
-        "collab_template_self_test",
         "skills_sync_check",
         "rust_fmt_check",
         "rust_clippy",
@@ -307,7 +306,6 @@ def test_manifest_matches_pre_commit_argv_and_order():
         ("python3", "scripts/test_run_git_hook.py"),
         ("bash", "scripts/install-git-hooks.sh", "--check"),
         ("python3", "scripts/check_collab_turn_templates.py"),
-        ("python3", "-m", "pytest", "tests/collab_turn_templates/", "-q"),
         ("python3", "scripts/check_skills_sync.py"),
         ("cargo", "fmt", "--all", "--", "--check"),
         (
@@ -329,7 +327,6 @@ def test_manifest_matches_pre_push_argv_and_order():
     expected = [
         ("python3", "scripts/test_run_git_hook.py"),
         ("python3", "scripts/check_collab_turn_templates.py"),
-        ("python3", "-m", "pytest", "tests/collab_turn_templates/", "-q"),
         ("python3", "scripts/check_skills_sync.py"),
         ("cargo", "test", "--workspace"),
     ]
@@ -1151,7 +1148,6 @@ def test_resolve_gates_output_order_is_manifest_order_invariant_to_input_order()
     # input order: collab_template_lint is declared before the rust gates.
     assert [gate.name for gate in result_forward] == [
         "collab_template_lint",
-        "collab_template_self_test",
         "rust_fmt_check",
         "rust_clippy",
     ]
@@ -2643,7 +2639,6 @@ _RUST_TEST_ARGV = ("cargo", "test", "--workspace")
 _HOOK_SELF_TEST_ARGV = ("python3", "scripts/test_run_git_hook.py")
 _HOOK_INSTALL_CHECK_ARGV = ("bash", "scripts/install-git-hooks.sh", "--check")
 _COLLAB_LINT_ARGV = ("python3", "scripts/check_collab_turn_templates.py")
-_COLLAB_SELF_TEST_ARGV = ("python3", "-m", "pytest", "tests/collab_turn_templates/", "-q")
 _SKILLS_SYNC_ARGV = ("python3", "scripts/check_skills_sync.py")
 
 
@@ -2716,7 +2711,6 @@ def test_main_pre_commit_git_failure_escalates_to_every_gate_never_zero_gates_ru
             _HOOK_SELF_TEST_ARGV: 0,
             _HOOK_INSTALL_CHECK_ARGV: 0,
             _COLLAB_LINT_ARGV: 0,
-            _COLLAB_SELF_TEST_ARGV: 0,
             _SKILLS_SYNC_ARGV: 0,
             _RUST_FMT_ARGV: 0,
             _RUST_CLIPPY_ARGV: 0,
@@ -2735,7 +2729,6 @@ def test_main_pre_commit_git_failure_escalates_to_every_gate_never_zero_gates_ru
         list(_HOOK_SELF_TEST_ARGV),
         list(_HOOK_INSTALL_CHECK_ARGV),
         list(_COLLAB_LINT_ARGV),
-        list(_COLLAB_SELF_TEST_ARGV),
         list(_SKILLS_SYNC_ARGV),
         list(_RUST_FMT_ARGV),
         list(_RUST_CLIPPY_ARGV),
@@ -2761,7 +2754,6 @@ def test_main_pre_push_git_failure_escalates_to_every_gate(monkeypatch, capsys):
             ("git", "diff", "--name-only", "--no-renames", "-z", f"{SHA_A}..{SHA_B}"): (128, ""),
             _HOOK_SELF_TEST_ARGV: 0,
             _COLLAB_LINT_ARGV: 0,
-            _COLLAB_SELF_TEST_ARGV: 0,
             _SKILLS_SYNC_ARGV: 0,
             _RUST_TEST_ARGV: 0,
         }
@@ -2776,7 +2768,6 @@ def test_main_pre_push_git_failure_escalates_to_every_gate(monkeypatch, capsys):
     assert non_git_calls == [
         list(_HOOK_SELF_TEST_ARGV),
         list(_COLLAB_LINT_ARGV),
-        list(_COLLAB_SELF_TEST_ARGV),
         list(_SKILLS_SYNC_ARGV),
         list(_RUST_TEST_ARGV),
     ]
@@ -2844,7 +2835,6 @@ def test_main_pre_push_whitespace_only_stdin_escalates_and_never_reaches_fallbac
         {
             _HOOK_SELF_TEST_ARGV: 0,
             _COLLAB_LINT_ARGV: 0,
-            _COLLAB_SELF_TEST_ARGV: 0,
             _SKILLS_SYNC_ARGV: 0,
             _RUST_TEST_ARGV: 0,
         }
@@ -2862,7 +2852,6 @@ def test_main_pre_push_whitespace_only_stdin_escalates_and_never_reaches_fallbac
     assert fake.calls == [
         list(_HOOK_SELF_TEST_ARGV),
         list(_COLLAB_LINT_ARGV),
-        list(_COLLAB_SELF_TEST_ARGV),
         list(_SKILLS_SYNC_ARGV),
         list(_RUST_TEST_ARGV),
     ]
