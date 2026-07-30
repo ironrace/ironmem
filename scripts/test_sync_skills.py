@@ -244,6 +244,49 @@ class WalkTests(unittest.TestCase):
         rendered = sync_skills.plan(self.source)
         self.assertIn(sync_skills.GENERATED_HEADER, rendered["claude"]["iron-demo/SKILL.md"])
 
+    def test_diff_labels_distinguish_harnesses(self) -> None:
+        # Targets not under ROOT, so labels fall back to parent/leaf -- but
+        # they must still differ between harnesses for the same relative
+        # path, which is the whole point of labeling by root at all.
+        drifted = sync_skills.diff(sync_skills.plan(self.source), self.targets)
+        claude_entries = [d for d in drifted if d.startswith("claude/")]
+        codex_entries = [d for d in drifted if d.startswith("codex/")]
+        self.assertTrue(claude_entries)
+        self.assertTrue(codex_entries)
+        self.assertNotEqual(claude_entries, codex_entries)
+
+    def test_write_labels_distinguish_harnesses(self) -> None:
+        changed = sync_skills.write(sync_skills.plan(self.source), self.targets)
+        claude_entries = [c for c in changed if c.startswith("claude/")]
+        codex_entries = [c for c in changed if c.startswith("codex/")]
+        self.assertTrue(claude_entries)
+        self.assertTrue(codex_entries)
+        self.assertNotEqual(claude_entries, codex_entries)
+
+
+class LabelRootTests(unittest.TestCase):
+    """_label_root is what makes write()/diff() output name *which* plugin
+    root a path belongs to -- .claude-plugin/skills and .codex-plugin/skills
+    share the leaf name `skills`, so this is the fix for that ambiguity.
+    """
+
+    def test_real_targets_get_repo_relative_labels(self) -> None:
+        self.assertEqual(
+            sync_skills._label_root(sync_skills.TARGETS["claude"]),
+            ".claude-plugin/skills",
+        )
+        self.assertEqual(
+            sync_skills._label_root(sync_skills.TARGETS["codex"]),
+            ".codex-plugin/skills",
+        )
+
+    def test_target_outside_repo_falls_back_without_crashing(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            outside = pathlib.Path(tmp) / "claude" / "skills"
+            label = sync_skills._label_root(outside)
+            self.assertEqual(label, "claude/skills")
+            self.assertNotIn(str(sync_skills.ROOT), label)
+
 
 if __name__ == "__main__":
     unittest.main()

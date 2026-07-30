@@ -194,6 +194,21 @@ def plan(source: pathlib.Path = SOURCE) -> dict[str, dict[str, str]]:
     return rendered
 
 
+def _label_root(root: pathlib.Path) -> str:
+    """Repo-relative label for a target root, e.g. '.claude-plugin/skills'.
+
+    Both `.claude-plugin/skills` and `.codex-plugin/skills` share the leaf
+    name `skills`, so `root.name` alone can't tell them apart in log/diff
+    output -- exactly the ambiguity this subsystem exists to catch. Targets
+    passed in tests are temp directories outside ROOT, so fall back to an
+    unambiguous two-component label rather than raising.
+    """
+    try:
+        return root.relative_to(ROOT).as_posix()
+    except ValueError:
+        return f"{root.parent.name}/{root.name}"
+
+
 def write(
     rendered: dict[str, dict[str, str]], targets: dict[str, pathlib.Path]
 ) -> list[str]:
@@ -205,12 +220,13 @@ def write(
     changed: list[str] = []
     for harness, files in rendered.items():
         root = targets[harness]
+        label_root = _label_root(root)
         for relative, body in sorted(files.items()):
             destination = root / relative
             destination.parent.mkdir(parents=True, exist_ok=True)
             if not destination.exists() or destination.read_text(encoding="utf-8") != body:
                 destination.write_text(body, encoding="utf-8", newline="\n")
-                changed.append(f"{root.name}/{relative}")
+                changed.append(f"{label_root}/{relative}")
 
         expected = set(files)
         if root.is_dir():
@@ -222,7 +238,7 @@ def write(
                     continue
                 if relative not in expected:
                     path.unlink()
-                    changed.append(f"{root.name}/{relative} (removed)")
+                    changed.append(f"{label_root}/{relative} (removed)")
             for path in sorted(root.rglob("*"), reverse=True):
                 if path.is_dir() and path.name.startswith(OWNED_PREFIX) and not any(path.iterdir()):
                     path.rmdir()
@@ -234,19 +250,20 @@ def diff(rendered: dict[str, dict[str, str]], targets: dict[str, pathlib.Path]) 
     drifted: list[str] = []
     for harness, files in rendered.items():
         root = targets[harness]
+        label_root = _label_root(root)
         for relative, body in sorted(files.items()):
             destination = root / relative
             if not destination.is_file():
-                drifted.append(f"{root.name}/{relative} (missing)")
+                drifted.append(f"{label_root}/{relative} (missing)")
             elif destination.read_text(encoding="utf-8") != body:
-                drifted.append(f"{root.name}/{relative} (stale)")
+                drifted.append(f"{label_root}/{relative} (stale)")
         if root.is_dir():
             expected = set(files)
             for path in sorted(root.rglob("*")):
                 if path.is_file():
                     relative = path.relative_to(root).as_posix()
                     if relative.startswith(OWNED_PREFIX) and relative not in expected:
-                        drifted.append(f"{root.name}/{relative} (orphaned)")
+                        drifted.append(f"{label_root}/{relative} (orphaned)")
     return drifted
 
 
