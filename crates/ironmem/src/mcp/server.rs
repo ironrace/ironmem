@@ -1117,7 +1117,7 @@ fn tool_success_response(
 ///
 /// The deadline is computed by `wait_my_turn_deadline` (`collab_session.rs`),
 /// the single named helper holding the deadline formula (design decision 7,
-/// `docs/superpowers/plans/2026-07-19-wait-my-turn-barrier-early-release.md`);
+/// `docs/iron/plans/2026-07-19-wait-my-turn-barrier-early-release.md`);
 /// the synchronous fallback documents at its own deadline site why plain
 /// `now() + timeout` is the degenerate case rather than calling it. For a
 /// promptly-dispatched request it still runs from when the request

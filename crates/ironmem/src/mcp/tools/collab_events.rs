@@ -398,7 +398,7 @@ mod tests {
 
     #[test]
     fn task_list_accepts_optional_plan_file_path() {
-        let raw = task_list_with_plan_file_path(json!("docs/superpowers/plans/today-feature.md"));
+        let raw = task_list_with_plan_file_path(json!("docs/iron/plans/today-feature.md"));
         let event = parse_task_list_event(&raw).expect("valid plan_file_path should parse");
         let CollabEvent::SubmitTaskList { task_list_json, .. } = event else {
             panic!("expected SubmitTaskList event");
@@ -406,7 +406,7 @@ mod tests {
         // Canonicalized JSON must round-trip the field so reviewers can find
         // the markdown plan that drove subagent execution.
         assert!(
-            task_list_json.contains("docs/superpowers/plans/today-feature.md"),
+            task_list_json.contains("docs/iron/plans/today-feature.md"),
             "plan_file_path should be preserved in canonicalized task_list, got: {task_list_json}",
         );
     }

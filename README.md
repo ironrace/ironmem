@@ -864,7 +864,7 @@ Expected p95 latency with rerank enabled: ~1-3 seconds per query (subprocess sta
 
 ### Preference enrichment (off by default; experimental scaffolding)
 
-Default OFF. The pref-enrich experiment did not meet its target lift on LongMemEval — see `docs/superpowers/specs/2026-04-30-pref-enrich-experiment-retro.md`. The infrastructure (PreferenceExtractor trait, pipeline collapse step, sentinel-prefix sibling drawers) is preserved for future synth-doc strategies.
+Default OFF. The pref-enrich experiment did not meet its target lift on LongMemEval; the retro was a developer-local document and is not in-tree. The infrastructure (PreferenceExtractor trait, pipeline collapse step, sentinel-prefix sibling drawers) is preserved for future synth-doc strategies.
 
 | Variable | Default | Effect |
 |---|---|---|

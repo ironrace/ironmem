@@ -31,9 +31,9 @@ preconditions: phase == PlanClaudeFinalizePending, current_owner == claude
    document, not as a prose plan that needs a second planning conversion later.
    Incorporate Codex's review notes unless they conflict with user intent.
 2. Save the exact markdown to
-   `docs/superpowers/plans/YYYY-MM-DD-<short-feature>.md`. The first non-blank
+   `docs/iron/plans/YYYY-MM-DD-<short-feature>.md`. The first non-blank
    line of the file must be:
-   `<!-- plan_file_path: docs/superpowers/plans/YYYY-MM-DD-<short-feature>.md -->`
+   `<!-- plan_file_path: docs/iron/plans/YYYY-MM-DD-<short-feature>.md -->`
 3. Use `### Task N: <title>` headings. Every task must include:
    - `Timebox: <=20 minutes`
    - at least one concrete acceptance criterion

@@ -130,7 +130,7 @@ REQUIRED_TEMPLATE_SNIPPETS = {
     "collab-turn-plan-finalize.md": [
         "Timebox: <=20 minutes",
         "at most 10 tasks",
-        "docs/superpowers/plans/YYYY-MM-DD-<short-feature>.md",
+        "docs/iron/plans/YYYY-MM-DD-<short-feature>.md",
         "first auto-ack response",
         "get_drawer(id=<canonical_plan_ref.drawer_id>)",
         "get_drawer(id=<message.drawer_id>)",
