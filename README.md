@@ -155,14 +155,10 @@ Prebuilt macOS (arm64) and Linux (x86_64) binaries, with SHA-256 checksums, are 
 Codex collab protocol prompts, and the bundled collab skill dependencies for
 both Codex and Claude Code:
 
-- `writing-plans`
-- `subagent-driven-development`
-- `finishing-a-development-branch`
-- `executing-plans`
-- `using-git-worktrees`
-- `using-superpowers`
-- `requesting-code-review`
-- `test-driven-development`
+- `iron-spec`
+- `iron-plan`
+- `iron-build`
+- `iron-tdd`
 
 Codex also receives the `pr-review-toolkit` skill used by the `/collab`
 `review_fix_global` turn before Codex fans confirmed fixes out to
@@ -182,7 +178,7 @@ or a merge conflict occurs, the local file is left unchanged and the packaged
 update is written next to it as `*.ironmem-packaged` (conflict drafts use
 `*.ironmem-merge-conflict`). Use `--skip-skills` when you only want to replace
 the binary or leave local copies untouched.
-For Claude Code, the installer also installs the `code-reviewer` agent used by the vendored review flow.
+For Claude Code, the installer also installs the `code-reviewer` agent used by collab's inline review flow.
 
 ## First run: one-command launchers
 

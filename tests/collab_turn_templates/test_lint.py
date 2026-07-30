@@ -105,14 +105,13 @@ def test_codex_dispatch_uses_explicit_repository_model_defaults():
     global_review_prompt = (ROOT / ".codex-plugin" / "prompts" / "collab-global-review.md").read_text()
     recovery_prompt = (ROOT / ".codex-plugin" / "prompts" / "collab-recovery.md").read_text()
     batch_prompt = (ROOT / ".codex-plugin" / "prompts" / "collab-batch-impl.md").read_text()
-    tools = (ROOT / ".codex-plugin" / "skills" / "using-superpowers" /
-             "references" / "codex-tools.md").read_text()
-    source_tools = (ROOT / ".claude-plugin" / "skills" / "using-superpowers" /
-                    "references" / "codex-tools.md").read_text()
+    # The bundled skills no longer carry a codex-tools.md reference sheet: the
+    # iron-* skills resolve harness tool names from skills/vocab.toml at
+    # generation time, so there is no shipped surface left to assert against.
     agents = (ROOT / "AGENTS.md").read_text()
 
     for surface in (docs, dispatcher, plan_draft_prompt, plan_review_prompt,
-                    global_review_prompt, recovery_prompt, batch_prompt, tools, source_tools,
+                    global_review_prompt, recovery_prompt, batch_prompt,
                     agents):
         assert "gpt-5.6-luna" in surface
         assert "gpt-5.6-terra" in surface

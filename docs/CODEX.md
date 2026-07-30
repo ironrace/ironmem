@@ -571,14 +571,10 @@ The shared collab skill dependencies are bundled for Claude Code under `.claude-
 (default `~/.claude/skills`).
 The shared required set is:
 
-- `writing-plans`
-- `subagent-driven-development`
-- `finishing-a-development-branch`
-- `executing-plans`
-- `using-git-worktrees`
-- `using-superpowers`
-- `requesting-code-review`
-- `test-driven-development`
+- `iron-spec`
+- `iron-plan`
+- `iron-build`
+- `iron-tdd`
 
 Codex also receives `pr-review-toolkit`, which `/collab` uses during the
 `CodeReviewFixGlobalPending` / `review_fix_global` turn before Codex fans
@@ -605,8 +601,8 @@ agents, commands, and prompts. If no baseline exists, the target is a symlink,
 or a merge conflict occurs, the local file is left unchanged and the packaged
 update is written next to it as `*.ironmem-packaged` (conflict drafts use
 `*.ironmem-merge-conflict`). `--skip-skills` skips this step entirely.
-For Claude Code, the installer also provisions the `code-reviewer` agent used by the vendored
-`subagent-driven-development` review flow into `$CLAUDE_HOME/agents`.
+For Claude Code, the installer also provisions the `code-reviewer` agent used by collab's
+inline review flow into `$CLAUDE_HOME/agents`.
 
 ### Codex model defaults
 
@@ -619,7 +615,7 @@ explicitly instead of inheriting the caller's personal default.
 
 The installer does not modify `$CODEX_HOME/config.toml` or user-defined agent
 roles. Those personal settings remain available for ordinary Codex sessions;
-the collab dispatcher and bundled Superpowers guidance carry the repository
+the collab dispatcher and bundled `iron-*` skill guidance carry the repository
 defaults themselves.
 
 The hook wrapper delegates to:
