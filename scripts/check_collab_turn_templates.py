@@ -174,7 +174,7 @@ REQUIRED_SENTINELS = ["<!-- LINT:worker-dispatch -->",
                       "<!-- LINT:fail-closed-tiering -->",
                       "<!-- LINT:dispatch-matrix -->"]
 REQUIRED_EVALUATE_ISSUE_SNIPPETS = [
-    "Verdict: <DIRECT | SUPERPOWERS | COLLAB | SPLIT>",
+    "Verdict: <DIRECT | IRON | COLLAB | SPLIT>",
     "Task estimate: <N | N+> independent execution tasks",
     "more than 10",
     "Child issues:",

@@ -179,7 +179,7 @@ Print exactly this shape:
 
 ```
 Issue #<number>: <title>
-Verdict: <DIRECT | SUPERPOWERS | COLLAB | SPLIT>
+Verdict: <DIRECT | IRON | COLLAB | SPLIT>
 Task estimate: <N | N+> independent execution tasks
 
 Why:

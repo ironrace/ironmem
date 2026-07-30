@@ -1,5 +1,5 @@
 ---
-description: Start or join an IronRace bounded planning session with Codex, auto-flowing into v3 batch coding. Covers v1 planning, v3 batch implementation (Claude or Codex via approved Superpowers task plan + subagent-driven-development) → global review → PR handoff, and the post-subagent review shortcut. Usage — /collab start [--implementer=claude|codex] <task>  |  /collab join [--implementer=claude|codex] <session_id>  |  /collab review <short-topic>
+description: Start or join an IronRace bounded planning session with Codex, auto-flowing into v3 batch coding. Covers v1 planning, v3 batch implementation (Claude or Codex via approved Superpowers task plan + iron-build) → global review → PR handoff, and the post-iron-build review shortcut. Usage — /collab start [--implementer=claude|codex] <task>  |  /collab join [--implementer=claude|codex] <session_id>  |  /collab review <short-topic>
 argument-hint: start [--implementer=claude|codex] <task> | join [--implementer=claude|codex] <session_id> | review <short-topic>
 ---
 
@@ -33,8 +33,8 @@ branch names.
    - `repo_path` ← output of `git rev-parse --show-toplevel` (run via Bash).
    - `current_branch` ← output of `git branch --show-current`.
    - **If `current_branch` is non-empty and not `main`/`master`/`trunk`**,
-     you're already on an isolated branch (e.g. from `using-git-worktrees`,
-     or the user branched manually before running `/collab start`) — use it
+     you're already on an isolated branch (e.g. from a prior `iron-build`
+     worktree setup, or the user branched manually before running `/collab start`) — use it
      as-is: `branch` ← `current_branch`, `repo_path` unchanged. Do not create
      another branch or worktree.
    - **Otherwise** (on `main`/`master`/`trunk`, or a detached HEAD), create
@@ -47,8 +47,8 @@ branch names.
        branch with that name already exists locally or on `origin`
        (`git show-ref --verify --quiet refs/heads/<name>` /
        `refs/remotes/origin/<name>`), append `-2`, `-3`, … until unique.
-     - Pick a worktree directory using the same priority order as the
-       `using-git-worktrees` skill: an existing `.worktrees/` (preferred) or
+     - Pick a worktree directory using the same priority order as
+       `iron-build`'s *Workspace* section: an existing `.worktrees/` (preferred) or
        `worktrees/` at the repo root; otherwise a preference from
        `CLAUDE.md` (`grep -i "worktree.*director" CLAUDE.md`); otherwise
        default to `.worktrees/` — collab must never stop to ask, unlike the
@@ -117,7 +117,7 @@ branch names.
 
 ## `review <short-topic>`
 
-Shortcut entry for post-subagent-driven-development flows: skip v1
+Shortcut entry for post-iron-build flows: skip v1
 planning and v3 batch implementation, and drop straight into the v3
 global-review stage with Codex as the reviewer on the already-committed
 branch.
@@ -459,31 +459,31 @@ the user already approved the final Superpowers task plan.
      `collab-turn-code-implement.md` (mechanical/sonnet) and ingest its
      ≤3-line verdict. The worker resumes from the one current logical-keyed
      ironmem checkpoint,
-     invokes `Skill('subagent-driven-development')` on `plan_file_path`
+     invokes `Skill('iron-build')` on `plan_file_path`
      (auto-proceeding between tasks, writing the step-5a checkpoints before
      and after every task), runs the gates, and `collab_send`s
      `implementation_done` (`{"head_sha":...}`) on green or `failure_report`
      on failure. Two carve-outs the worker enforces internally:
 
      **Hard stop at the boundary before
-     `finishing-a-development-branch`.** That sub-skill prompts the user
+     `iron-build`'s *Finishing the Branch* step.** That step prompts the user
      to choose merge/PR/cleanup, which would create a PR outside the
      collab protocol and collide with the `final_review` turn here. Two
      guards apply:
 
-     1. Before invoking `subagent-driven-development`, the worker tells its
+     1. Before invoking `iron-build`, the worker tells its
         controller-loop the explicit stopping point: "stop after the
         last task is implemented, reviewed, and committed; do *not*
-        invoke `finishing-a-development-branch`." The skill's
+        run the *Finishing the Branch* step." The skill's
         controller honors that direction.
      2. After the skill returns and before `implementation_done` is sent, the
         worker verifies the local boundary invariant: the controller reported
         that it stopped at the requested point and the skill output does not
-        mention PR creation or `finishing-a-development-branch`. The worker
+        mention PR creation or the *Finishing the Branch* step. The worker
         does **not** query GitHub by default. It may run
         `gh pr list --head <branch> --json number --jq 'length'` only when the
         controller reports boundary uncertainty or the skill output mentions
-        PR creation/`finishing-a-development-branch`; if it returns >=1, abort
+        PR creation / the *Finishing the Branch* step; if it returns >=1, abort
         with `failure_report` —
         `coding_failure: "skill_overran_pr_boundary: <pr_number>"`.
 
@@ -496,11 +496,11 @@ the user already approved the final Superpowers task plan.
      **Log:** `t2_codex_dispatched` immediately before launching.
      **Log:** `t3_codex_returned` immediately after the settled wait returns.
      For `CodeImplementPending`, Codex will read `plan_file_path` from the
-     canonicalized `task_list`, run its own `subagent-driven-development`
-     end-to-end (with the same `finishing-a-development-branch` carve-out
+     canonicalized `task_list`, run its own `iron-build`
+     end-to-end (with the same *Finishing the Branch* carve-out
      applied on its side), and emit `implementation_done` itself before
      the settled wait wakes on the phase advance.
-     Do *not* invoke `subagent-driven-development` locally
+     Do *not* invoke `iron-build` locally
      in this mode — Codex owns the batch phase.
 
      **Recovery if `codex exec` errors or times out mid-batch.**
@@ -621,7 +621,7 @@ sequence before building the payload:
 
 | Phase | What to do (is_my_turn == true) |
 |---|---|
-| `CodeImplementPending` | Owner depends on `implementer`. **Claude is owner** (default or `/collab join --implementer=claude <session_id>`): dispatch the matrix worker `collab-turn-code-implement.md` (mechanical/sonnet) and ingest its ≤3-line verdict; loop. The worker resumes from `ironrace-memory/collab-checkpoints`, scans plan/code state, continues the local `subagent-driven-development` batch with the v3-bridge checkpoint rule, runs pre-send harness gates (no reset — no Codex push to sync), writes `status: batch_complete`, and `collab_send`s `sender="claude"`, `topic="implementation_done"`, `content=<JSON {"head_sha":"<current HEAD>"}>` (payload carries ONLY `head_sha`) on green, or `failure_report` on failure. After send, the phase advances to `CodeReviewFixGlobalPending` (Codex's turn — the new v3 order has Codex run `/pr-review-toolkit:review-pr` on the raw post-implementation diff first). **Codex is owner** (`--implementer=codex`): is_my_turn is false here; dispatch Codex via background `codex exec` (per the Codex handoff section). Codex must resume from ironmem checkpoints, scan the plan/code state, and emit `implementation_done` itself before the bg-exec settled wait wakes on the phase advance. |
+| `CodeImplementPending` | Owner depends on `implementer`. **Claude is owner** (default or `/collab join --implementer=claude <session_id>`): dispatch the matrix worker `collab-turn-code-implement.md` (mechanical/sonnet) and ingest its ≤3-line verdict; loop. The worker resumes from `ironrace-memory/collab-checkpoints`, scans plan/code state, continues the local `iron-build` batch with the v3-bridge checkpoint rule, runs pre-send harness gates (no reset — no Codex push to sync), writes `status: batch_complete`, and `collab_send`s `sender="claude"`, `topic="implementation_done"`, `content=<JSON {"head_sha":"<current HEAD>"}>` (payload carries ONLY `head_sha`) on green, or `failure_report` on failure. After send, the phase advances to `CodeReviewFixGlobalPending` (Codex's turn — the new v3 order has Codex run `/pr-review-toolkit:review-pr` on the raw post-implementation diff first). **Codex is owner** (`--implementer=codex`): is_my_turn is false here; dispatch Codex via background `codex exec` (per the Codex handoff section). Codex must resume from ironmem checkpoints, scan the plan/code state, and emit `implementation_done` itself before the bg-exec settled wait wakes on the phase advance. |
 | `CodeReviewFixGlobalPending` | Codex's turn unless `pending_failure` makes Claude the recovery owner. In that recovery case, preserve the diff and complete the interrupted turn per the recovery override, sending `review_fix_global`; this is valid delegated completion, not an anomaly. Otherwise dispatch Codex via background `codex exec`, with the timing logs and `/pr-review-toolkit:review-pr` review pass described in the Codex handoff section. After `review_fix_global`, the phase advances to `CodeReviewLocalPending` (Claude's audit turn). |
 | `CodeReviewLocalPending` | Dispatch the matrix worker `collab-turn-review-local.md` (review/opus) and ingest its ≤3-line verdict; loop. The worker runs the pre-send harness (with reset to `last_head_sha` — Codex just pushed at `review_fix_global`), then performs the overlap-mode audit. It runs full `/ultrareview-local` when Codex made fix commits or runtime/Rust files changed, and uses `review_local=reduced` when Codex made no fix commit or the branch diff is docs/config-only. Reduced mode is still an audit: inspect the diff summary, changed files, and Codex commits for protocol drift, docs/config breakage, generated metadata inconsistencies, and security-sensitive configuration; escalate to full `/ultrareview-local` on uncertainty or a substantive finding. Confirmed CRITICAL/HIGH/MEDIUM findings are partitioned into temporary worktrees on unique throwaway branches for parallel fix subagents where safe, merged/cherry-picked back, committed + pushed, and `collab_send`s `sender="claude"`, `topic="review_local"`, `content=<JSON {"head_sha":"<current HEAD>"}>`. **Log:** `t5_review_local_sent`. **Anti-removal:** under v3 ordering the stage audits Codex's `review_fix_global` work plus catches issues both agents missed. Its code-quality lens partially overlaps with Codex's `pr-review-toolkit`-backed branch review but does not fully duplicate it. Removing this stage requires a written overlap audit demonstrating that Codex's `review_fix_global` reviews catch the code-quality issues `/ultrareview-local` would have flagged AND that the audit-of-Codex role is unnecessary. |
 | `CodeReviewFinalPending` | **Auto-create the PR — no user-approval gate** (the diff already passed `review_fix_global` + `review_local`, and a PR is editable and unmerged after creation; do NOT enter Plan Mode here). Dispatch the matrix worker `collab-turn-final-review.md` (review/opus) with `$MODE=compose`: it performs pushed-head proof only (no reset, no gate rerun) by requiring a clean worktree, `HEAD == last_head_sha`, and local HEAD equal to the pushed upstream/origin branch head, then drafts the PR title (under 70 chars) + body (summary + test plan derived from task list + prior gate evidence / pushed-head proof), writes `{"title":"...","body":"..."}` to a drawer, and returns `{drawer_id, ≤3-line summary}`. If the proof fails, the worker returns a blocker instead of running tests. Then dispatch `collab-turn-submit.md` (mechanical/sonnet) **directly** with `$TOPIC=final_review` `$ARTIFACT_REF=<drawer_id>` (drawer immutability is the integrity anchor — the approved drawer's content cannot change, so no hash recompute is needed): it reads the title/body artifact, then runs a plain `gh pr create --base <base_branch> --head <current branch> --title <title> --body <body>` (a **ready** PR — no `--draft`), and on failure sends `failure_report` `coding_failure: "pr_create_failed: <error>"` (no silent retry). On success, **Log:** `t8_pr_created <pr_url>`, the worker captures `pr_url` and `collab_send`s `sender="claude"`, `topic="final_review"`, `content=<JSON {"head_sha":"<current HEAD>","pr_url":"<https url>"}>`. **Log:** `t9_final_review_sent`. Session advances directly to `CodingComplete`. **Log:** `t10_session_complete CodingComplete`. Exit loop. |
