@@ -224,7 +224,7 @@ def write(
         for relative, body in sorted(files.items()):
             destination = root / relative
             destination.parent.mkdir(parents=True, exist_ok=True)
-            if not destination.exists() or destination.read_text(encoding="utf-8") != body:
+            if not destination.exists() or destination.read_bytes() != body.encode("utf-8"):
                 destination.write_text(body, encoding="utf-8", newline="\n")
                 changed.append(f"{label_root}/{relative}")
 
@@ -240,7 +240,10 @@ def write(
                     path.unlink()
                     changed.append(f"{label_root}/{relative} (removed)")
             for path in sorted(root.rglob("*"), reverse=True):
-                if path.is_dir() and path.name.startswith(OWNED_PREFIX) and not any(path.iterdir()):
+                if not path.is_dir():
+                    continue
+                top = path.relative_to(root).parts[0]
+                if top.startswith(OWNED_PREFIX) and not any(path.iterdir()):
                     path.rmdir()
     return changed
 
@@ -255,7 +258,7 @@ def diff(rendered: dict[str, dict[str, str]], targets: dict[str, pathlib.Path]) 
             destination = root / relative
             if not destination.is_file():
                 drifted.append(f"{label_root}/{relative} (missing)")
-            elif destination.read_text(encoding="utf-8") != body:
+            elif destination.read_bytes() != body.encode("utf-8"):
                 drifted.append(f"{label_root}/{relative} (stale)")
         if root.is_dir():
             expected = set(files)

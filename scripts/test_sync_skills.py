@@ -263,6 +263,53 @@ class WalkTests(unittest.TestCase):
         self.assertTrue(codex_entries)
         self.assertNotEqual(claude_entries, codex_entries)
 
+    def test_write_prunes_nested_stale_iron_dirs(self) -> None:
+        # iron-* skills own nested subdirectories (references/, prompts/),
+        # not just a flat SKILL.md. Deleting the whole skill from the
+        # canonical source must delete the nested directory too, not just
+        # the files inside it.
+        (self.source / "iron-nested" / "references").mkdir(parents=True)
+        (self.source / "iron-nested" / "SKILL.md").write_text(
+            "---\nname: iron-nested\ndescription: nested\n---\n\nUse the {{DISPATCH}}.\n",
+            encoding="utf-8",
+        )
+        (self.source / "iron-nested" / "references" / "notes.md").write_text(
+            "notes\n", encoding="utf-8"
+        )
+
+        sync_skills.write(sync_skills.plan(self.source), self.targets)
+        claude = self.targets["claude"]
+        self.assertTrue((claude / "iron-nested" / "references" / "notes.md").is_file())
+
+        shutil.rmtree(self.source / "iron-nested")
+        sync_skills.write(sync_skills.plan(self.source), self.targets)
+
+        self.assertFalse((claude / "iron-nested" / "references").exists())
+        self.assertFalse((claude / "iron-nested").exists())
+
+    def test_diff_detects_crlf_drift(self) -> None:
+        rendered = sync_skills.plan(self.source)
+        sync_skills.write(rendered, self.targets)
+        destination = self.targets["claude"] / "iron-demo" / "SKILL.md"
+
+        crlf_bytes = destination.read_bytes().replace(b"\n", b"\r\n")
+        destination.write_bytes(crlf_bytes)
+
+        drifted = sync_skills.diff(rendered, self.targets)
+        self.assertIn("claude/skills/iron-demo/SKILL.md (stale)", drifted)
+
+    def test_write_corrects_crlf_drift(self) -> None:
+        rendered = sync_skills.plan(self.source)
+        sync_skills.write(rendered, self.targets)
+        destination = self.targets["claude"] / "iron-demo" / "SKILL.md"
+
+        crlf_bytes = destination.read_bytes().replace(b"\n", b"\r\n")
+        destination.write_bytes(crlf_bytes)
+
+        changed = sync_skills.write(rendered, self.targets)
+        self.assertIn("claude/skills/iron-demo/SKILL.md", changed)
+        self.assertNotIn(b"\r\n", destination.read_bytes())
+
 
 class LabelRootTests(unittest.TestCase):
     """_label_root is what makes write()/diff() output name *which* plugin
