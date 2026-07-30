@@ -22,6 +22,21 @@ spawn_agent(agent_type="worker", model=<model>, reasoning_effort=<effort>, messa
 
     [From implementer's report]
 
+    ## The Change Under Review
+
+    **Base:** [BASE_SHA — the HEAD the controller recorded before dispatching
+    this task's implementer]
+    **Head:** [HEAD_SHA — the current HEAD]
+
+    Read the actual change with:
+
+        git diff --stat [BASE_SHA]..[HEAD_SHA]
+        git diff [BASE_SHA]..[HEAD_SHA]
+
+    Review the whole range, never `HEAD~1..HEAD` — an implementer makes as
+    many commits as the work needs, and a one-commit range shows you a
+    fragment of the task that will read as clean.
+
     ## CRITICAL: Do Not Trust the Report
 
     The implementer finished suspiciously quickly. Their report may be incomplete,

@@ -123,6 +123,12 @@ lands in the context that produced the code.
 After the last task, dispatch one final code-quality review over the whole
 implementation, then go to *Finishing the Branch*.
 
+**Tier for the final review:** one tier above the highest tier any task in
+this plan used, floored at `standard` and capped at `frontier` — the same
+reviewer-floor rule, applied to the plan instead of to a task. Its range is
+the first task's `BASE_SHA` to the current `HEAD`, so it sees the whole
+implementation rather than the last task's slice.
+
 ## Resolving a Tier
 
 Every task in the plan carries a `**Tier:**` line. Read it and look the value
