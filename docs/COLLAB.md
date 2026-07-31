@@ -5,13 +5,13 @@ and Codex coordinate a single plan and then implement it through the shared
 MCP server.
 
 - **v1 (planning)**: bounded parallel drafts → canonical synthesis → one
-  Codex review pass → Claude finalizes the Superpowers task plan →
+  Codex review pass → Claude finalizes the approved task plan →
   `PlanLocked`.
 - **v3 (coding)**: post-`PlanLocked` task list → **batch implementation
-  phase** (Claude publishes `task_list` from the approved Superpowers task
+  phase** (Claude publishes `task_list` from the approved task
   markdown, then the
   session's `implementer` runs per-task subagents via
-  `subagent-driven-development` and signals completion with
+  `iron-build` and signals completion with
   `implementation_done`) → global 3-phase linear flow (Codex review plus
   parallel fix fan-out → Claude local audit plus parallel fix fan-out →
   Claude final with PR URL) → `CodingComplete` / `CodingFailed`. Per-task
@@ -25,7 +25,7 @@ This document covers:
 - topic payload formats for every protocol message
 - harness-side responsibilities (git, cargo, gh, pr-review-toolkit)
 - Claude's dispatcher loop and one-shot Codex dispatches
-- Claude's Plan Mode integration for the v1 final Superpowers task plan (the only planning user gate; synthesis, the v3 bridge, and final_review run autonomously)
+- Claude's Plan Mode integration for the v1 final approved task plan (the only planning user gate; synthesis, the v3 bridge, and final_review run autonomously)
 - copy-pasteable prompts (single-terminal default; Codex-terminal fallback)
 - a worked example
 
@@ -64,7 +64,7 @@ multi-agent framework. Exactly one plan is produced per session, with:
 1. two independent first drafts (Claude + Codex, blind to each other)
 2. one canonical synthesis by Claude
 3. one review pass by Codex
-4. one final Superpowers task plan published by Claude (Claude has the last word)
+4. one final approved task plan published by Claude (Claude has the last word)
 5. terminal state `PlanLocked`
 
 There is no `PlanEscalated` state and no re-synthesis loop. After Codex's one
@@ -266,7 +266,7 @@ Owner: `claude`. Claude sends one `canonical` message containing the merged
 plan.
 
 This phase is autonomous. Claude does not enter Plan Mode and does not ask for
-approval here; the single planning gate is the final Superpowers task plan at
+approval here; the single planning gate is the final approved task plan at
 `PlanClaudeFinalizePending`.
 
 Exit → `PlanCodexReviewPending`, owner `codex`.
@@ -290,7 +290,7 @@ can split it into independently executable child issues before finalization.
 
 ### `PlanClaudeFinalizePending`
 
-Owner: `claude`. Claude writes the final Superpowers-compatible task markdown,
+Owner: `claude`. Claude writes the final iron-build-compatible task markdown,
 asks for the only planning human approval, then sends one `final` message.
 Every task must be scoped to 20 minutes or less, and the plan must contain
 1–10 tasks. Larger work or an 11+ task scope is split into independently
@@ -329,17 +329,17 @@ entire implementation run. Which agent owns that phase depends on the
 session's current `implementer` field:
 
 - **`implementer == "claude"`** (default): Claude orchestrates per-task
-  work from the approved Superpowers markdown through
-  `subagent-driven-development` (fresh subagent per task, TDD, per-task
+  work from the approved task markdown through
+  `iron-build` (fresh subagent per task, TDD, per-task
   commits). Claude emits `implementation_done`.
 - **`implementer == "codex"`** (opt-in via
   `/collab start --implementer=codex` or
   `/collab join --implementer=codex <session_id>`): Claude still publishes
-  `task_list` from the approved Superpowers markdown. Then Claude dispatches Codex via
+  `task_list` from the approved task markdown. Then Claude dispatches Codex via
   background `codex exec` (per Implementation Notes § Background
   `codex exec` dispatch; `mcp__codex__codex` is the fallback when
   `codex` is not on PATH). Codex runs its own
-  `subagent-driven-development` (controller-owned loop, runs to
+  `iron-build` (controller-owned loop, runs to
   completion) and emits `implementation_done` itself before the
   bg-exec settled wait wakes on the phase advance.
 
@@ -361,7 +361,7 @@ same fix fan-out model for confirmed audit findings.
 
 The `implementation_done` payload carries **only** `head_sha`. There is
 no `notes`, `summary`, `subagent_report`, or any other field — the
-non-implementer agent reads the diff and the approved Superpowers task
+non-implementer agent reads the diff and the approved task
 markdown in the repo (via `plan_file_path`) at the global review stage and forms
 its own judgment.
 
@@ -434,15 +434,17 @@ checkpoint lacks the new gate-proof fields. Otherwise resume at
 `next_task_id` (or the `started` task if the last checkpoint stopped
 mid-task).
 
-**Both modes apply the same `finishing-a-development-branch` carve-out**:
-the implementer agent stops `subagent-driven-development` at the last
-task's approval+commit and does *not* let the skill auto-invoke
-`finishing-a-development-branch`. PR creation belongs to
-the collab `final_review` turn, not to the subagent skill. The Claude
-implementer verifies this as a local boundary invariant and does not query
-GitHub by default. A `gh pr list --head <branch>` probe is opt-in only when
-the controller reports boundary uncertainty or the worker output mentions PR
-creation/`finishing-a-development-branch`.
+**Both modes apply the same *Finishing the Branch* carve-out**: the
+implementer agent stops `iron-build` at the last task's approval+commit and
+does *not* let the skill run its *Finishing the Branch* step. `iron-build`
+documents the matching halt contract on its side — "an orchestrator that owns
+its own PR path (such as `/collab`) will treat a PR created here as a protocol
+violation" — so the boundary is stated from both ends rather than assumed from
+one. PR creation belongs to the collab `final_review` turn, not to the
+sub-skill. The Claude implementer verifies this as a local boundary invariant
+and does not query GitHub by default. A `gh pr list --head <branch>` probe is
+opt-in only when the controller reports boundary uncertainty or the worker
+output mentions PR creation or the *Finishing the Branch* step.
 
 ### Global review, 3-phase linear (Codex first; Claude audits after)
 
@@ -465,7 +467,7 @@ original owner's place — including `final_review`, in which case Codex opens
 the PR. See "Failure + terminal" above and the PR-ownership rule under
 "Harness-Side Responsibilities".
 
-### Shortcut: post-subagent coding review
+### Shortcut: post-iron-build coding review
 
 When an orchestrator already completed the branch's implementation outside
 Collab, it can skip v1 planning and the v3 batch implementation phase by
@@ -474,10 +476,10 @@ calling `collab_start_code_review`. The session starts directly at
 
 Because shortcut sessions have no collab `task_list`, Codex must recover
 the implementation context before reviewing: search ironmem checkpoints
-for the same `repo_path`/`branch`, read any referenced Superpowers task
+for the same `repo_path`/`branch`, read any referenced approved task
 markdown, and scan the current code/diff to determine which acceptance
 criteria are already complete. If no checkpoint exists, fall back to the
-branch diff plus nearby Superpowers plan docs in the repo.
+branch diff plus nearby plan docs under `docs/iron/plans/`.
 
 The no-op handshake turn is collapsed: `head_sha` is supplied at session
 creation time. From there, the surviving flow follows the new ordering:
@@ -830,7 +832,7 @@ continuing. Calls after `implementation_done` are rejected.
 ### `collab_start_code_review`
 
 Shortcut entry. Creates a session positioned at `CodeReviewFixGlobalPending`,
-owner `codex`. See the "Shortcut: post-subagent coding review" subsection
+owner `codex`. See the "Shortcut: post-iron-build coding review" subsection
 above for the constraints and surviving flow.
 
 ```json
@@ -1288,13 +1290,13 @@ agent can detect drift.
 
 The `implementation_done` payload carries **only** `head_sha`. There is no
 `verdict`, `notes`, `comment`, or `subagent_report` field — Codex reads
-the diff and the approved Superpowers task markdown in the repo at the
+the diff and the approved task markdown in the repo at the
 global review stage and forms its own judgment. This is the rule that prevents the
 orchestrator from steering the reviewer's conclusion.
 
 | Topic | Sender | Payload | Notes |
 |---|---|---|---|
-| `task_list` | `claude` | `{"plan_hash","base_sha","head_sha","plan_file_path"?,"execution_mode"?,"tasks":[{"id","title","timebox_minutes","acceptance":[...]}]}` | `plan_hash` must equal `final_plan_hash`; `tasks` must contain **1–10** strictly ordered entries; each task requires `timebox_minutes <= 20` and ≥1 `acceptance` entry. An 11+ task issue must be split into child issues before this message is sent. Optional `plan_file_path` (repo-relative; no leading `/`; no `..` segments) points at the approved Superpowers task markdown driving subagent execution. Optional `execution_mode` — see below. |
+| `task_list` | `claude` | `{"plan_hash","base_sha","head_sha","plan_file_path"?,"execution_mode"?,"tasks":[{"id","title","timebox_minutes","acceptance":[...]}]}` | `plan_hash` must equal `final_plan_hash`; `tasks` must contain **1–10** strictly ordered entries; each task requires `timebox_minutes <= 20` and ≥1 `acceptance` entry. An 11+ task issue must be split into child issues before this message is sent. Optional `plan_file_path` (repo-relative; no leading `/`; no `..` segments) points at the approved task markdown driving subagent execution. Optional `execution_mode` — see below. |
 | `implementation_done` | `claude` or `codex` (per session `implementer`) | `{"head_sha"}` | In `CodeImplementPending` only. Fired once after the subagent batch completes and gates pass. Carries only `head_sha` — no prose, no subagent notes. |
 | `review_fix_global` | `codex` (or `claude` as recovery owner under the delegated-completion override) | `{"head_sha"}` | In `CodeReviewFixGlobalPending` only. Codex ran `/pr-review-toolkit:review-pr` on the raw post-implementation diff (no Claude pre-clean), used parallel fix subagents for confirmed partitionable findings, merged/cherry-picked the resulting fixes, and pushed the branch-level fix commit(s). |
 | `review_local` | `claude` (or `codex` as recovery owner under the delegated-completion override) | `{"head_sha"}` | In `CodeReviewLocalPending` only. Claude ran full or reduced audit of Codex's `review_fix_global` commits + caught issues both agents missed, used parallel fix subagents for confirmed partitionable findings, merged/cherry-picked the resulting fixes, and pushed. |
@@ -1316,8 +1318,8 @@ agents can read it without re-parsing the canonicalized `task_list` JSON.
 
 | Value | Behaviour |
 |---|---|
-| *(omitted)* | Default: subagent-driven. The implementer agent invokes `subagent-driven-development` (one subagent per task). |
-| `"mechanical_direct"` | Single-task verbatim plan. The implementer applies the plan's bash/code blocks directly without spawning `subagent-driven-development`. |
+| *(omitted)* | Default: subagent-driven. The implementer agent invokes `iron-build` (one subagent per task). |
+| `"mechanical_direct"` | Single-task verbatim plan. The implementer applies the plan's bash/code blocks directly without invoking `iron-build`. **Currently honored by the Codex implementer only** — Claude's implement worker does not read `execution_mode` and always invokes `iron-build`. The field is cross-harness by design, so closing this gap means teaching Claude's implement worker to read `execution_mode` too, not dropping the field for Claude: both implementers honoring it is the intended end state. |
 
 **Validation rules (server-enforced):**
 
@@ -1332,9 +1334,12 @@ agents can read it without re-parsing the canonicalized `task_list` JSON.
   `collab_status.execution_mode`.
 
 **Eligibility criteria for `"mechanical_direct"` (Claude-side detection).** Set
-this mode when ALL four conditions hold:
+this mode when ALL four conditions hold — but note the value table above: the
+field is a no-op whenever `implementer == "claude"` (the default), because
+only the Codex implementer reads it today. Setting it is still correct; it
+just does not change Claude-side behaviour yet.
 
-1. The approved Superpowers task markdown produced exactly one task (`### Task 1` only).
+1. The approved task markdown produced exactly one task (`### Task 1` only).
 2. The task's `Files:` block lists one or zero files to create or modify.
 3. The task's steps include at least one verbatim ` ```bash ` or language code
    block meant to be applied as-is (not pseudocode or illustrative snippets).
@@ -1407,9 +1412,9 @@ before each coding-active `collab_send`:
   discard the reporter's uncommitted recovery diff. It then commits/pushes and
   sends the interrupted phase's normal completion event.
 - **Subagent orchestration** during `CodeImplementPending`. Claude's final
-  planning gate produces the Superpowers task markdown, and the PlanLocked
+  planning gate produces the approved task markdown, and the PlanLocked
   bridge publishes it via `task_list`. The selected `implementer` then runs
-  `subagent-driven-development` to dispatch fresh subagents per task. Each
+  `iron-build` to dispatch fresh subagents per task. Each
   subagent runs TDD and commits on the branch. Per-subagent failures pause
   for triage; an unrecoverable failure surfaces as `failure_report` with
   `coding_failure: "subagent_failure: ..."`.
@@ -1437,7 +1442,7 @@ before each coding-active `collab_send`:
 - **Review + fix tooling** during Codex's `review_fix_global`:
   `/pr-review-toolkit:review-pr` runs as the final Codex review pass over the
   compact `ironmem review-diff --repo <repo_path> --base <base_sha> --head
-  <last_head_sha>` artifact alongside the approved Superpowers task markdown
+  <last_head_sha>` artifact alongside the approved task markdown
   when available. Codex injects that artifact only on success; an error,
   feature-off build, or nonbeneficial artifact uses the exact raw fallback
   `git diff <base_sha>..<last_head_sha>`. On artifact success it does not retain
@@ -1535,7 +1540,7 @@ before each coding-active `collab_send`:
   applicable) rather than inventing a URL. A recoverable failure report
   costs one retry attempt; a fabricated URL corrupts the record forever.
 - **Plan Mode** on Claude's side is entered before only one gate: `final`
-  (v1), where Claude produces the approved Superpowers task plan. Canonical
+  (v1), where Claude produces the approved task plan. Canonical
   synthesis runs autonomously. The `task_list` send mechanically parses that
   already-approved markdown; it is not an extra task-planning handoff and not a Plan
   Mode gate. The `final_review` PR creation is autonomous (no gate). Codex
@@ -1588,8 +1593,8 @@ model default.
 
 ### Codex model policy
 
-Codex dispatch is explicit and phase-based. The background dispatcher and
-Codex's Superpowers subagent dispatch use the same defaults:
+Codex dispatch is explicit and phase-based. These are the background
+dispatcher's defaults for collab's own protocol turns:
 
 | Codex work | Model | Effort |
 |---|---|---|
@@ -1597,6 +1602,11 @@ Codex's Superpowers subagent dispatch use the same defaults:
 | Exploration, docs, and mechanical work | `gpt-5.6-luna` | `medium` |
 | Planning and normal review | `gpt-5.6-terra` | `high` |
 | Architecture/security escalation | `gpt-5.6-sol` | `high` |
+
+The `Implementation controller/workers` row governs the controller collab
+dispatches into `CodeImplementPending`. Per-task subagent models inside that
+run come from `iron-build`'s `**Tier:**` ladder, not from this table — see
+§ Reviewer model selection for the divergence this row still carries.
 
 `gpt-5.6-sol` is an escalation tier, not the default. Use it when a
 discovered architecture, security, or other high-risk issue needs additional
@@ -1718,7 +1728,7 @@ Phase → action (v1):
 | `PlanParallelDrafts` | send `draft` autonomously (no Plan Mode); owner flips to `codex` | one-shot bg-exec: send `draft`, exit |
 | `PlanSynthesisPending` | synthesize `canonical` and send autonomously (no Plan Mode) | wait (not polling) |
 | `PlanCodexReviewPending` | wait | one-shot bg-exec: send `review` (or `approve` shortcut), exit |
-| `PlanClaudeFinalizePending` | enter Plan Mode, get user approval for the final Superpowers task plan, send `final` | wait |
+| `PlanClaudeFinalizePending` | enter Plan Mode, get user approval for the final approved task plan, send `final` | wait |
 | `PlanLocked` | exit loop (or send `task_list` to start v3) | n/a |
 
 Phase → action (v3):
@@ -1726,8 +1736,8 @@ Phase → action (v3):
 | Phase | Claude does | Codex does |
 |---|---|---|
 | `PlanLocked` (post-final) | dispatch one mechanical `collab-turn-task-list.md` worker; worker parses the approved final markdown and sends `task_list` | n/a |
-| `CodeImplementPending` (implementer=claude) | dispatch `collab-turn-code-implement.md`; worker searches checkpoints, runs `subagent-driven-development`, gates, checkpoints, and sends `implementation_done{head_sha}` | wait |
-| `CodeImplementPending` (implementer=codex) | dispatch Codex via bg-exec; poll | one-shot bg-exec: search implementation checkpoints, resume/run `subagent-driven-development`, checkpoint every task boundary, emit `implementation_done{head_sha}`, exit |
+| `CodeImplementPending` (implementer=claude) | dispatch `collab-turn-code-implement.md`; worker searches checkpoints, runs `iron-build`, gates, checkpoints, and sends `implementation_done{head_sha}` | wait |
+| `CodeImplementPending` (implementer=codex) | dispatch Codex via bg-exec; poll | one-shot bg-exec: search implementation checkpoints, resume/run `iron-build`, checkpoint every task boundary, emit `implementation_done{head_sha}`, exit |
 | `CodeReviewFixGlobalPending` | dispatch Codex via bg-exec; poll | one-shot bg-exec: run `/pr-review-toolkit:review-pr` on the raw post-implementation diff, partition confirmed branch-level issues, fan out independent fix subagents in temporary worktrees on unique throwaway branches, merge/cherry-pick fixes back, send `review_fix_global`, exit |
 | `CodeReviewLocalPending` | dispatch `collab-turn-review-local.md`; worker runs full or reduced `review_local` audit, partitions confirmed CRITICAL/HIGH/MEDIUM findings, fans out independent fix subagents in temporary worktrees on unique throwaway branches, merges/cherry-picks fixes back, and sends `review_local` | wait |
 | `CodeReviewFinalPending` | dispatch `collab-turn-final-review.md` compose worker for pushed-head proof + PR body, then dispatch `collab-turn-submit.md` **directly** (no gate) to `gh pr create` (ready PR) and send `final_review{pr_url}` | wait |
@@ -1739,10 +1749,9 @@ observe the merge, so it cannot clean up automatically. If `start` created an
 isolated worktree for this session (check: `git rev-parse --git-common-dir`
 differs from `git rev-parse --git-dir` in `repo_path`), the exiting loop
 includes a line in its final report to the user naming the worktree path and
-pointing at the `engineering:git-worktree-manager` skill's
-`worktree_cleanup.py` (or a plain `git worktree remove <path>` once the PR
-merges). Cleanup is never run automatically — the branch/worktree must
-survive until the PR is actually merged.
+the cleanup command (`git worktree remove <path>`, once the PR merges).
+Cleanup is never run automatically — the branch/worktree must survive until
+the PR is actually merged.
 
 ### Claude's Plan Mode Integration
 
@@ -1750,7 +1759,7 @@ Claude enters harness Plan Mode at **exactly one gate**, matching the
 command-file invariant bullet:
 
 1. **v1 `final`** — `PlanClaudeFinalizePending`. Claude presents the final
-   Superpowers task plan for approval; it must contain 1–10 tasks, each
+   iron-build-compatible task markdown for approval; it must contain 1–10 tasks, each
    timeboxed to 20 minutes or less. A larger plan must first be split into
    child issues. Post-send the session is `PlanLocked`.
 
@@ -1782,61 +1791,19 @@ or free-form:
 collab-start: <one-sentence task>
 ```
 
-Claude's behavior on receiving this:
-
-1. `repo_path` ← `git rev-parse --show-toplevel` of the current working directory.
-2. `current_branch` ← `git branch --show-current`.
-3. **If `current_branch` is non-empty and not `main`/`master`/`trunk`**,
-   you're already on an isolated branch (e.g. from `using-git-worktrees`, or
-   the user branched manually before running `/collab start`) — use it
-   as-is: `branch` ← `current_branch`, `repo_path` unchanged. Do not create
-   another branch or worktree.
-4. **Otherwise** (on `main`/`master`/`trunk`, or a detached HEAD), create an
-   isolated worktree on a new branch — never record `main`/`master`/`trunk`
-   as the collab branch:
-   - Derive a slug from `task` (lowercase; strip to alphanumerics/spaces/
-     hyphens; collapse whitespace to single hyphens; truncate to ~40 chars;
-     trim trailing hyphens; fall back to `session` if empty). Candidate
-     branch name: `collab/<slug>`; if it already exists locally or on
-     `origin`, append `-2`, `-3`, … until unique.
-   - Pick a worktree directory using the same priority order as the
-     `using-git-worktrees` skill: an existing `.worktrees/` (preferred) or
-     `worktrees/` at the repo root; otherwise a preference from `CLAUDE.md`
-     (`grep -i "worktree.*director" CLAUDE.md`); otherwise default to
-     `.worktrees/` — collab must never stop to ask, unlike the general
-     skill. For a project-local directory, verify it's gitignored
-     (`git check-ignore -q <dir>`); if not, add it to `.gitignore` and
-     commit that fix before proceeding.
-   - `git worktree add "<dir>/<name>" -b "<name>"` (branches from the
-     current HEAD).
-   - `repo_path` ← the new worktree's absolute path. `branch` ← `<name>`.
-
-   > **Why a worktree, not just `checkout -b`:** every git operation for
-   > this session — including Codex's pre-send harness, which does
-   > `git checkout <branch>; git reset --hard <last_head_sha>` — now runs
-   > entirely inside the isolated worktree directory, so it can never
-   > collide with whatever the user's own terminal has checked out.
-
-   > **Why never record `main`:** the collab `branch` field is fixed at
-   > `collab_start` time and has no update API. If the session starts on
-   > `main` and it's ever recorded as such, every subsequent turn that reads
-   > `collab_status.branch` — including Codex's pre-send harness — will
-   > check out and hard-reset local `main` to the session's `last_head_sha`,
-   > and any turn that then pushes will push straight to `main`, bypassing PR
-   > review entirely.
-5. `initiator` ← `"claude"` (this is the Claude terminal).
-6. `task` ← the text after `start`/`start:`.
-7. Call `collab_start` with those four fields.
-8. Report the returned `session_id` back to the user as a single-line
-   tracking message (e.g. `Collab session started: <session_id>
-   (implementer: <claude|codex>, branch: <branch>)`), plus the worktree path
-   on its own line if step 4 created one. Do not instruct the user to paste
-   anything into a Codex terminal — Claude drives Codex inline via
-   background `codex exec`.
-9. Enter the autonomous planning loop as `claude` (see § Autonomous
-   Planning Loop). Send the blind `draft` autonomously (no Plan Mode);
-   enter Plan Mode only at the two gates listed in
-   § Claude's Plan Mode Integration. Do not call `collab_end`.
+Claude's behavior on receiving this is specified executably in
+`.claude-plugin/commands/collab.md` § `start` — this document does not
+restate it. In summary: reuse the current branch when it is already an
+isolated one; otherwise derive `collab/<slug>` from the task, uniquify it
+against local and `origin` refs, and create a worktree for it — borrowing
+only the directory-priority list from `iron-build`'s *Workspace* section, and
+defaulting to `.worktrees/` rather than asking. Two invariants are
+load-bearing and are stated in full there: collab
+must never stop to ask the user for a path or branch name, and `main` /
+`master` / `trunk` must never be recorded as the collab branch — the `branch`
+field is fixed at `collab_start` time with no update API, so a recorded
+`main` sends every later turn's checkout, hard-reset, and push straight at
+`main`, bypassing PR review entirely.
 
 ### Joining a session in a Codex terminal — fallback only
 
@@ -1912,7 +1879,7 @@ Claude: dispatches Codex again via bg-exec for the review.
 Codex (bg-exec):
         reads canonical, returns verdict=request_changes. Exits.
 Claude: poll observes phase=PlanClaudeFinalizePending. **Enters Plan
-        Mode for final Superpowers task plan.** Splits tasks to 20 minutes
+        Mode for final approved task plan.** Splits tasks to 20 minutes
         or less and routes any 11+ task scope into child issues. User approves.
         Sends final. Phase now
         PlanLocked. Loop exits.
@@ -1920,7 +1887,7 @@ Claude: poll observes phase=PlanClaudeFinalizePending. **Enters Plan
 
 Codex's single `request_changes` pass moves directly to
 `PlanClaudeFinalizePending`; last word is still Claude's. Canonical synthesis
-is always autonomous; only the final Superpowers task plan is user-gated.
+is always autonomous; only the final approved task plan is user-gated.
 
 ## Running the MCP Server
 
@@ -2224,17 +2191,24 @@ The written overlap audit above still gates removal. Reduced
 no fix commit or that the diff is docs/config-only; uncertainty escalates to
 full `/ultrareview-local`.
 
-### SDD reviewer model pinning (out of protocol)
+### Reviewer model selection (out of protocol)
 
-The `subagent-driven-development` skill's reviewer prompts in this repo
-do not currently pin a model — reviewer subagents run on the parent
-session's default. Recommendations to "use Haiku for reviewers" or
-similar model-selection rules require skill-side pinning support that
-does not exist in the current prompt surface. If preferred-model
-guidance becomes load-bearing later, it should live in the SDD skill
-itself **after** model pinning exists — NOT in the collab protocol
-spec. The collab protocol is intentionally model-agnostic for
-subagent-driven implementation.
+`iron-build` resolves a model per task from the task's `**Tier:**` line, and
+runs reviewers at least one tier above the implementer (never below
+`standard`). Reviewer model selection is therefore the skill's concern, not
+the collab protocol's: collab's own dispatch matrix in
+`.claude-plugin/commands/collab.md` pins models for protocol turns only.
+
+**Known divergence on the Codex side.** § Codex model policy above, and
+`.codex-plugin/prompts/collab-batch-impl.md` § Model routing, both pin
+*implementation workers* flat at `gpt-5.6-luna`/`max`. That predates the tier
+system and contradicts it: `max` is not a rung on
+`skills/iron-build/references/tiers.md`, and a flat pin collapses the
+reviewer floor, because a reviewer one tier above the implementer resolves to
+the same model the implementer used. Until that flat pin is scoped to protocol
+turns, a `--implementer=codex` batch has two live rules for the same dispatch.
+`iron-build`'s tier ladder is the intended winner; do not read the flat pin as
+authority over per-task model choice.
 
 ## Code-Map MCP Tools (issue #94)
 

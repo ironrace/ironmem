@@ -363,17 +363,16 @@ pub fn apply_event(
             // the user selected most recently. Default sessions have
             // `implementer == Agent::Claude` (historical flow); sessions
             // started or joined with `--implementer=codex` route Codex into
-            // the batch phase to drive its own subagent-driven-development.
+            // the batch phase to drive its own iron-build.
             next.current_owner = session.implementer;
         }
         // ── v3: batch implementation → global review ──────────────────────
-        // The implementer agent (Claude by default; Codex when selected at
-        // `collab_start`) drives per-task subagent work on its side via
-        // `superpowers:writing-plans` → `superpowers:subagent-driven-development`.
-        // The other agent does not participate per-task; the single
-        // transition out of `CodeImplementPending` jumps to global review
-        // with Codex as owner — Codex first; Claude audits after. Payload
-        // carries only `head_sha` (anti-puppeteering).
+        // The implementer drives per-task subagent work on its side via
+        // `iron-build` (or directly, per `execution_mode` — the server never
+        // observes which); the other agent does not participate per-task. The
+        // single transition out of `CodeImplementPending` jumps to global
+        // review with Codex as owner — Codex first; Claude audits after.
+        // Payload carries only `head_sha` (anti-puppeteering).
         (Phase::CodeImplementPending, CollabEvent::ImplementationDone { head_sha }) => {
             require_actor_or_recovery(session, actor, session.implementer)?;
             next.last_head_sha = Some(head_sha.clone());

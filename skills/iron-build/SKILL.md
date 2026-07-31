@@ -123,6 +123,22 @@ lands in the context that produced the code.
 After the last task, dispatch one final code-quality review over the whole
 implementation, then go to *Finishing the Branch*.
 
+**Tier for the final review:** one tier above the highest tier any task in
+this plan used, floored at `standard` and capped at `frontier` — the same
+reviewer-floor rule, applied to the plan instead of to a task. Its range is
+the first task's `BASE_SHA` to the current `HEAD`, so it sees the whole
+implementation rather than the last task's slice.
+
+Nothing retains the first task's `BASE_SHA` across the loop, and a controller
+resuming mid-plan never recorded it. Recover it, in this order: the
+orchestrator's own record if it has one (under `/collab` that is
+`collab_status.base_sha`, fixed at plan-lock time and never advanced);
+otherwise the branch's fork point, `git merge-base HEAD <default-branch>`. A
+fork point can only sit at or before task 1's base, so the range is a
+superset — never the fragment this rule exists to prevent. The highest tier
+any task used comes from re-reading the plan file's `**Tier:**` lines, plus
+any `escalated` recorded in the per-task drawers.
+
 ## Resolving a Tier
 
 Every task in the plan carries a `**Tier:**` line. Read it and look the value

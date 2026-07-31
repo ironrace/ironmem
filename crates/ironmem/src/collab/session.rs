@@ -41,11 +41,10 @@ pub struct CollabSession {
     /// (the default) keeps the historical flow where Claude orchestrates
     /// per-task subagents inline. `Agent::Codex` routes
     /// `CodeImplementPending` to Codex instead — Claude still publishes
-    /// `task_list`, but Codex drives its own `subagent-driven-development`
-    /// end-to-end and emits `implementation_done`. Set at `collab_start`
-    /// and rebindable via `collab_set_implementer` until implementation
-    /// completes. The DB CHECK constraint enforces the allowed set as
-    /// defense-in-depth.
+    /// `task_list`, but Codex drives its own `iron-build` end-to-end and
+    /// emits `implementation_done`. Set at `collab_start` and rebindable
+    /// via `collab_set_implementer` until implementation completes. The DB
+    /// CHECK constraint enforces the allowed set as defense-in-depth.
     pub implementer: Agent,
     // Recovery-state fields (issue #197). All seven persist as nullable
     // columns added in migration 015 and stay NULL/0 for the common case
@@ -167,16 +166,16 @@ impl CollabSession {
 
     /// Construct a session pre-positioned at the v3 global-review stage.
     /// Used by the coding-review shortcut (`collab_start_code_review`) for
-    /// orchestrators that already completed per-task coding via
-    /// `subagent-driven-development`. The shortcut seeds Codex's
-    /// `CodeReviewFixGlobalPending` turn directly — `head_sha` is supplied
+    /// orchestrators that already completed per-task coding via `iron-build`.
+    /// The shortcut seeds Codex's `CodeReviewFixGlobalPending` turn
+    /// directly — `head_sha` is supplied
     /// here instead of via an `implementation_done` send. From there the
     /// flow follows the canonical v3 order: Codex `review_fix_global` →
     /// Claude `review_local` (audit of Codex's commits via
     /// `/ultrareview-local`) → Claude `final_review` (PR creation).
-    /// `implementer` is fixed at `Agent::Claude` because the shortcut
-    /// never enters `CodeImplementPending`; the field is preserved only so
-    /// the session record shape stays uniform with full-flow sessions.
+    /// `implementer` is fixed at `Agent::Claude` because the shortcut never
+    /// enters `CodeImplementPending`; the field is preserved only so the
+    /// session record shape stays uniform with full-flow sessions.
     pub fn new_global_review(
         id: impl Into<String>,
         base_sha: impl Into<String>,

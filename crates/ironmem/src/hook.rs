@@ -3033,6 +3033,13 @@ mod tests {
         std::env::set_var("IRONMEM_METRICS", "1");
         std::env::set_var("IRONMEM_PROMPT_HOOK_KG", "false");
         std::env::set_var("IRONMEM_PROMPT_HOOK_DIARY", "false");
+        // The sample is best-effort and budget-gated: it is skipped unless
+        // `PROMPT_HOOK_OCCUPANCY_RESERVE_MS` still remains of the wall-clock
+        // budget. At the 150ms default a loaded CI runner can spend the whole
+        // budget on recall scheduling alone and bank no row, so this asserts a
+        // race rather than the contract. Pin the budget to the 1000ms cap.
+        let _budget = PromptHookBudgetEnvGuard;
+        std::env::set_var("IRONMEM_PROMPT_HOOK_BUDGET_MS", "1000");
 
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("m.sqlite3");
@@ -3078,6 +3085,12 @@ mod tests {
         std::env::set_var("IRONMEM_METRICS", "1");
         std::env::set_var("IRONMEM_PROMPT_HOOK_KG", "false");
         std::env::set_var("IRONMEM_PROMPT_HOOK_DIARY", "false");
+        // Same budget race as `prompt_hook_writes_occupancy_sample` above: the
+        // sample is skipped when less than the reserve remains, which a loaded
+        // runner reaches at the 150ms default. Pin it so this asserts the
+        // ReadOnly decoupling contract and not the scheduler.
+        let _budget = PromptHookBudgetEnvGuard;
+        std::env::set_var("IRONMEM_PROMPT_HOOK_BUDGET_MS", "1000");
 
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("m.sqlite3");
