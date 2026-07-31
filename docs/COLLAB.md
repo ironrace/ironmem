@@ -434,15 +434,17 @@ checkpoint lacks the new gate-proof fields. Otherwise resume at
 `next_task_id` (or the `started` task if the last checkpoint stopped
 mid-task).
 
-**Both modes apply the same `finishing-a-development-branch` carve-out**:
-the implementer agent stops `subagent-driven-development` at the last
-task's approval+commit and does *not* let the skill auto-invoke
-`finishing-a-development-branch`. PR creation belongs to
-the collab `final_review` turn, not to the subagent skill. The Claude
-implementer verifies this as a local boundary invariant and does not query
-GitHub by default. A `gh pr list --head <branch>` probe is opt-in only when
-the controller reports boundary uncertainty or the worker output mentions PR
-creation/`finishing-a-development-branch`.
+**Both modes apply the same *Finishing the Branch* carve-out**: the
+implementer agent stops `iron-build` at the last task's approval+commit and
+does *not* let the skill run its *Finishing the Branch* step. `iron-build`
+documents the matching halt contract on its side — "an orchestrator that owns
+its own PR path (such as `/collab`) will treat a PR created here as a protocol
+violation" — so the boundary is stated from both ends rather than assumed from
+one. PR creation belongs to the collab `final_review` turn, not to the
+sub-skill. The Claude implementer verifies this as a local boundary invariant
+and does not query GitHub by default. A `gh pr list --head <branch>` probe is
+opt-in only when the controller reports boundary uncertainty or the worker
+output mentions PR creation or the *Finishing the Branch* step.
 
 ### Global review, 3-phase linear (Codex first; Claude audits after)
 
@@ -465,7 +467,7 @@ original owner's place — including `final_review`, in which case Codex opens
 the PR. See "Failure + terminal" above and the PR-ownership rule under
 "Harness-Side Responsibilities".
 
-### Shortcut: post-subagent coding review
+### Shortcut: post-iron-build coding review
 
 When an orchestrator already completed the branch's implementation outside
 Collab, it can skip v1 planning and the v3 batch implementation phase by
@@ -830,7 +832,7 @@ continuing. Calls after `implementation_done` are rejected.
 ### `collab_start_code_review`
 
 Shortcut entry. Creates a session positioned at `CodeReviewFixGlobalPending`,
-owner `codex`. See the "Shortcut: post-subagent coding review" subsection
+owner `codex`. See the "Shortcut: post-iron-build coding review" subsection
 above for the constraints and surviving flow.
 
 ```json
@@ -1317,7 +1319,7 @@ agents can read it without re-parsing the canonicalized `task_list` JSON.
 | Value | Behaviour |
 |---|---|
 | *(omitted)* | Default: subagent-driven. The implementer agent invokes `iron-build` (one subagent per task). |
-| `"mechanical_direct"` | Single-task verbatim plan. The implementer applies the plan's bash/code blocks directly without invoking `iron-build`. **Currently honored by the Codex implementer only** — Claude's implement worker does not read `execution_mode` and always invokes `iron-build`. |
+| `"mechanical_direct"` | Single-task verbatim plan. The implementer applies the plan's bash/code blocks directly without invoking `iron-build`. **Currently honored by the Codex implementer only** — Claude's implement worker does not read `execution_mode` and always invokes `iron-build`. The field is cross-harness by design, so closing this gap means teaching Claude's implement worker to read `execution_mode` too, not dropping the field for Claude: both implementers honoring it is the intended end state. |
 
 **Validation rules (server-enforced):**
 
@@ -1332,7 +1334,10 @@ agents can read it without re-parsing the canonicalized `task_list` JSON.
   `collab_status.execution_mode`.
 
 **Eligibility criteria for `"mechanical_direct"` (Claude-side detection).** Set
-this mode when ALL four conditions hold:
+this mode when ALL four conditions hold — but note the value table above: the
+field is a no-op whenever `implementer == "claude"` (the default), because
+only the Codex implementer reads it today. Setting it is still correct; it
+just does not change Claude-side behaviour yet.
 
 1. The approved task markdown produced exactly one task (`### Task 1` only).
 2. The task's `Files:` block lists one or zero files to create or modify.
@@ -1739,10 +1744,9 @@ observe the merge, so it cannot clean up automatically. If `start` created an
 isolated worktree for this session (check: `git rev-parse --git-common-dir`
 differs from `git rev-parse --git-dir` in `repo_path`), the exiting loop
 includes a line in its final report to the user naming the worktree path and
-pointing at the `engineering:git-worktree-manager` skill's
-`worktree_cleanup.py` (or a plain `git worktree remove <path>` once the PR
-merges). Cleanup is never run automatically — the branch/worktree must
-survive until the PR is actually merged.
+the cleanup command (`git worktree remove <path>`, once the PR merges).
+Cleanup is never run automatically — the branch/worktree must survive until
+the PR is actually merged.
 
 ### Claude's Plan Mode Integration
 
@@ -1782,61 +1786,18 @@ or free-form:
 collab-start: <one-sentence task>
 ```
 
-Claude's behavior on receiving this:
-
-1. `repo_path` ← `git rev-parse --show-toplevel` of the current working directory.
-2. `current_branch` ← `git branch --show-current`.
-3. **If `current_branch` is non-empty and not `main`/`master`/`trunk`**,
-   you're already on an isolated branch (e.g. from `using-git-worktrees`, or
-   the user branched manually before running `/collab start`) — use it
-   as-is: `branch` ← `current_branch`, `repo_path` unchanged. Do not create
-   another branch or worktree.
-4. **Otherwise** (on `main`/`master`/`trunk`, or a detached HEAD), create an
-   isolated worktree on a new branch — never record `main`/`master`/`trunk`
-   as the collab branch:
-   - Derive a slug from `task` (lowercase; strip to alphanumerics/spaces/
-     hyphens; collapse whitespace to single hyphens; truncate to ~40 chars;
-     trim trailing hyphens; fall back to `session` if empty). Candidate
-     branch name: `collab/<slug>`; if it already exists locally or on
-     `origin`, append `-2`, `-3`, … until unique.
-   - Pick a worktree directory using the same priority order as the
-     `using-git-worktrees` skill: an existing `.worktrees/` (preferred) or
-     `worktrees/` at the repo root; otherwise a preference from `CLAUDE.md`
-     (`grep -i "worktree.*director" CLAUDE.md`); otherwise default to
-     `.worktrees/` — collab must never stop to ask, unlike the general
-     skill. For a project-local directory, verify it's gitignored
-     (`git check-ignore -q <dir>`); if not, add it to `.gitignore` and
-     commit that fix before proceeding.
-   - `git worktree add "<dir>/<name>" -b "<name>"` (branches from the
-     current HEAD).
-   - `repo_path` ← the new worktree's absolute path. `branch` ← `<name>`.
-
-   > **Why a worktree, not just `checkout -b`:** every git operation for
-   > this session — including Codex's pre-send harness, which does
-   > `git checkout <branch>; git reset --hard <last_head_sha>` — now runs
-   > entirely inside the isolated worktree directory, so it can never
-   > collide with whatever the user's own terminal has checked out.
-
-   > **Why never record `main`:** the collab `branch` field is fixed at
-   > `collab_start` time and has no update API. If the session starts on
-   > `main` and it's ever recorded as such, every subsequent turn that reads
-   > `collab_status.branch` — including Codex's pre-send harness — will
-   > check out and hard-reset local `main` to the session's `last_head_sha`,
-   > and any turn that then pushes will push straight to `main`, bypassing PR
-   > review entirely.
-5. `initiator` ← `"claude"` (this is the Claude terminal).
-6. `task` ← the text after `start`/`start:`.
-7. Call `collab_start` with those four fields.
-8. Report the returned `session_id` back to the user as a single-line
-   tracking message (e.g. `Collab session started: <session_id>
-   (implementer: <claude|codex>, branch: <branch>)`), plus the worktree path
-   on its own line if step 4 created one. Do not instruct the user to paste
-   anything into a Codex terminal — Claude drives Codex inline via
-   background `codex exec`.
-9. Enter the autonomous planning loop as `claude` (see § Autonomous
-   Planning Loop). Send the blind `draft` autonomously (no Plan Mode);
-   enter Plan Mode only at the two gates listed in
-   § Claude's Plan Mode Integration. Do not call `collab_end`.
+Claude's behavior on receiving this is specified executably in
+`.claude-plugin/commands/collab.md` § `start` — this document does not
+restate it. In summary: reuse the current branch when it is already an
+isolated one; otherwise derive `collab/<slug>` from the task, uniquify it
+against local and `origin` refs, and create a worktree for it per
+`iron-build`'s *Workspace* section, defaulting to `.worktrees/` rather than
+asking. Two invariants are load-bearing and are stated in full there: collab
+must never stop to ask the user for a path or branch name, and `main` /
+`master` / `trunk` must never be recorded as the collab branch — the `branch`
+field is fixed at `collab_start` time with no update API, so a recorded
+`main` sends every later turn's checkout, hard-reset, and push straight at
+`main`, bypassing PR review entirely.
 
 ### Joining a session in a Codex terminal — fallback only
 
@@ -2224,17 +2185,13 @@ The written overlap audit above still gates removal. Reduced
 no fix commit or that the diff is docs/config-only; uncertainty escalates to
 full `/ultrareview-local`.
 
-### SDD reviewer model pinning (out of protocol)
+### Reviewer model selection (out of protocol)
 
-The `subagent-driven-development` skill's reviewer prompts in this repo
-do not currently pin a model — reviewer subagents run on the parent
-session's default. Recommendations to "use Haiku for reviewers" or
-similar model-selection rules require skill-side pinning support that
-does not exist in the current prompt surface. If preferred-model
-guidance becomes load-bearing later, it should live in the SDD skill
-itself **after** model pinning exists — NOT in the collab protocol
-spec. The collab protocol is intentionally model-agnostic for
-subagent-driven implementation.
+`iron-build` resolves a model per task from the task's `**Tier:**` line, and
+runs reviewers at least one tier above the implementer (never below
+`standard`). Reviewer model selection is therefore the skill's concern, not
+the collab protocol's — collab pins models only for its own protocol turns,
+via the dispatch matrix in `.claude-plugin/commands/collab.md`.
 
 ## Code-Map MCP Tools (issue #94)
 
