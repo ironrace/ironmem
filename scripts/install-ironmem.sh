@@ -78,6 +78,13 @@ REQUIRED_CLAUDE_COMMANDS=(
   ultrareview-local
 )
 
+# /ultrareview-local's fan-out script. Installed as .js under
+# <harness home>/workflows/ so the Workflow tool can load it by scriptPath.
+# Keep in sync with the resolution order documented in the command file.
+REQUIRED_CLAUDE_WORKFLOWS=(
+  ultrareview
+)
+
 # Worker-per-turn prompt templates. /collab resolves these repo-relative
 # (.claude-plugin/prompts/) when running inside an ironrace-memory checkout,
 # and falls back to this installed copy for any other target repo.
@@ -423,21 +430,22 @@ install_dir_with_merge() {
   done < <(cd "$source_root" && find . -type f -print)
 }
 
-# Generic .md installer used by commands and prompts. We don't reuse
-# install_agent_set because its name list and target naming are entangled with
-# the agent loop; splitting keeps each loop readable.
-install_md_set() {
+# Generic file-set installer used by commands, prompts, and workflows. We don't
+# reuse install_agent_set because its name list and target naming are entangled
+# with the agent loop; splitting keeps each loop readable.
+install_ext_set() {
   local label="$1"      # human-readable kind (e.g. "Claude command")
-  local source_root="$2"
-  local target_root="$3"
-  local base_root="$4"
-  shift 4
+  local ext="$2"        # extension without the dot (e.g. md, js)
+  local source_root="$3"
+  local target_root="$4"
+  local base_root="$5"
+  shift 5
   local names=("$@")
 
   local missing=0
   for name in "${names[@]}"; do
-    if [[ ! -f "$source_root/$name.md" ]]; then
-      echo "ERROR: bundled $label missing: $source_root/$name.md" >&2
+    if [[ ! -f "$source_root/$name.$ext" ]]; then
+      echo "ERROR: bundled $label missing: $source_root/$name.$ext" >&2
       missing=1
     fi
   done
@@ -450,12 +458,20 @@ install_md_set() {
   echo "==> Installing ${label}s → $target_root"
 
   for name in "${names[@]}"; do
-    local source="$source_root/$name.md"
-    local target="$target_root/$name.md"
+    local source="$source_root/$name.$ext"
+    local target="$target_root/$name.$ext"
 
     install_file_with_merge "$label" "$name" "$source" "$target" \
-      "$base_root/$name.md"
+      "$base_root/$name.$ext"
   done
+}
+
+# Back-compat wrapper: the four .md call sites read better without an extension
+# argument threaded through each one.
+install_md_set() {
+  local label="$1" source_root="$2" target_root="$3" base_root="$4"
+  shift 4
+  install_ext_set "$label" md "$source_root" "$target_root" "$base_root" "$@"
 }
 
 if [[ "$SKIP_BUILD" -eq 0 ]]; then
@@ -497,6 +513,7 @@ if [[ "$SKIP_SKILLS" -eq 0 ]]; then
   CLAUDE_AGENTS_DIR="${CLAUDE_AGENTS_DIR:-$CLAUDE_HOME/agents}"
   CLAUDE_COMMANDS_DIR="${CLAUDE_COMMANDS_DIR:-$CLAUDE_HOME/commands}"
   CLAUDE_PROMPTS_DIR="${CLAUDE_PROMPTS_DIR:-$CLAUDE_HOME/prompts}"
+  CLAUDE_WORKFLOWS_DIR="${CLAUDE_WORKFLOWS_DIR:-$CLAUDE_HOME/workflows}"
   CODEX_COMMANDS_DIR="${CODEX_COMMANDS_DIR:-$CODEX_HOME/commands}"
   CODEX_PROMPTS_DIR="${CODEX_PROMPTS_DIR:-$CODEX_HOME/prompts}"
 
@@ -521,6 +538,9 @@ if [[ "$SKIP_SKILLS" -eq 0 ]]; then
   install_md_set "Claude prompt" "$REPO_ROOT/.claude-plugin/prompts" \
     "$CLAUDE_PROMPTS_DIR" "$CLAUDE_HOME/.ironmem-bases/prompts" \
     "${REQUIRED_CLAUDE_PROMPTS[@]}"
+  install_ext_set "Claude workflow" js "$REPO_ROOT/.claude-plugin/workflows" \
+    "$CLAUDE_WORKFLOWS_DIR" "$CLAUDE_HOME/.ironmem-bases/workflows" \
+    "${REQUIRED_CLAUDE_WORKFLOWS[@]}"
   install_md_set "Codex command" "$REPO_ROOT/.codex-plugin/commands" \
     "$CODEX_COMMANDS_DIR" "$CODEX_HOME/.ironmem-bases/commands" \
     "${REQUIRED_CODEX_COMMANDS[@]}"

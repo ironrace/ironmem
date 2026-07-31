@@ -240,6 +240,7 @@ class InstallIronmemSelfTest(unittest.TestCase):
             "CODEX_SKILLS_DIR": str(home / "codex-discovery" / "skills"),
             "CODEX_COMMANDS_DIR": str(home / "codex-discovery" / "commands"),
             "CODEX_PROMPTS_DIR": str(home / "codex-discovery" / "prompts"),
+            "CLAUDE_WORKFLOWS_DIR": str(home / "claude-discovery" / "workflows"),
         }
 
     def test_install_places_the_four_iron_skills(self) -> None:
@@ -255,6 +256,38 @@ class InstallIronmemSelfTest(unittest.TestCase):
                         (root / skill / "SKILL.md").is_file(),
                         f"{skill} missing from {root_key}",
                     )
+
+    def test_install_places_the_ultrareview_workflow(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            home = pathlib.Path(directory)
+            env = self._full_install_env(home)
+            self.run_installer(home, home / ".claude.json", skip_skills=False, extra_env=env)
+
+            installed = pathlib.Path(env["CLAUDE_WORKFLOWS_DIR"]) / "ultrareview.js"
+            self.assertTrue(installed.is_file(), "ultrareview.js was not installed")
+            self.assertEqual(
+                installed.read_text(encoding="utf-8"),
+                (ROOT / ".claude-plugin" / "workflows" / "ultrareview.js").read_text(encoding="utf-8"),
+                "installed workflow drifted from the packaged copy",
+            )
+
+            snapshot = (
+                pathlib.Path(env["CLAUDE_HOME"]) / ".ironmem-bases" / "workflows" / "ultrareview.js"
+            )
+            self.assertTrue(snapshot.is_file(), "no base snapshot was written for the workflow")
+
+    def test_locally_modified_workflow_is_not_clobbered(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            home = pathlib.Path(directory)
+            env = self._full_install_env(home)
+            self.run_installer(home, home / ".claude.json", skip_skills=False, extra_env=env)
+
+            installed = pathlib.Path(env["CLAUDE_WORKFLOWS_DIR"]) / "ultrareview.js"
+            installed.write_text("// the user's own edit\n", encoding="utf-8")
+
+            self.run_installer(home, home / ".claude.json", skip_skills=False, extra_env=env)
+
+            self.assertIn("the user's own edit", installed.read_text(encoding="utf-8"))
 
     def test_superseded_skill_is_removed_when_a_base_snapshot_proves_ours(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
