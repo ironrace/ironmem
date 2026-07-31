@@ -64,13 +64,38 @@ function bandFor() {
 }
 
 const BAND = bandFor()
-const SELECTED = (BAND === 'small' ? REQUESTED.filter((id) => CORE.includes(id)) : REQUESTED.slice())
-  .filter((id) => ROSTER[id])
+
+// small -> core four only. medium -> exactly what the trigger greps asked for.
+// large -> the full roster (issue #244 §6): at this size the greps are not a
+// reliable filter, and an untriggered lens silently skipped on a 1,000-line
+// diff is the failure this band exists to prevent.
+//
+// Lens E is the one exception to the large-band expansion. It is project-gated
+// — with no project-defined claim surface there is nothing for it to check and
+// it would have to guess paths — so it joins only when the command already
+// requested it or resolved a marketing auditor agent type.
+function selectFor() {
+  if (BAND === 'small') return REQUESTED.filter((id) => CORE.includes(id))
+  if (BAND !== 'large') return REQUESTED.slice()
+  const eligible = Object.keys(ROSTER).filter(
+    (id) => id !== 'E' || REQUESTED.includes('E') || !!A.marketingAgentType,
+  )
+  return [...new Set([...REQUESTED, ...eligible])]
+}
+
+const SELECTED = selectFor().filter((id) => ROSTER[id])
+// Removed by the band (only possible in `small`) and added by it (only
+// possible in `large`). Both are reported: the roster must be auditable in
+// both directions, not just when it shrinks.
 const DROPPED_BY_BAND = REQUESTED.filter((id) => !SELECTED.includes(id))
+const ADDED_BY_BAND = SELECTED.filter((id) => !REQUESTED.includes(id))
 const FABLE_SUGGESTED = BAND === 'large' && !FABLE
 
 if (DROPPED_BY_BAND.length) {
   log(`band=${BAND} (${CHANGED_LINES} changed lines, ${FILES.length} files) — dropped conditional lenses: ${DROPPED_BY_BAND.join(', ')}`)
+}
+if (ADDED_BY_BAND.length) {
+  log(`band=${BAND} (${CHANGED_LINES} changed lines, ${FILES.length} files) — expanded to the full roster, added: ${ADDED_BY_BAND.join(', ')}`)
 }
 if (FABLE_SUGGESTED) log('this diff qualifies for --fable')
 
@@ -283,15 +308,23 @@ function demote(f) {
   return f
 }
 
+// Location alone — deliberately NOT the issue text. Two lenses almost never
+// phrase the same defect identically, so folding a wording signature into the
+// key meant the cross-lens merge and severity escalation below practically
+// never fired: duplicates reached the report and one defect burned two slots
+// of the cap-8 verifier budget. Keying on file:line also makes the verifyOnce
+// memo do what it promises — one defect, one verifier. Nothing a lens said is
+// lost by the collapse; the merge keeps every non-primary wording in
+// `also_reported`.
 function keyOf(f) {
-  const sig = f.issue
-    .toLowerCase()
-    .replace(/[^a-z0-9]+/g, ' ')
-    .trim()
-    .split(' ')
-    .slice(0, 8)
-    .join(' ')
-  return `${f.file}:${f.line}:${sig}`
+  return `${f.file}:${f.line}`
+}
+
+// Files a non-primary variant's wording onto a merged finding, skipping empties
+// and anything already represented by the primary or an earlier variant.
+function keepAlso(target, text, primary) {
+  if (!text || text === primary) return
+  if (!target.also_reported.includes(text)) target.also_reported.push(text)
 }
 
 // -------------------------------------------------------------- verify
@@ -330,9 +363,13 @@ function verifyOnce(f) {
   const k = keyOf(f)
   if (verifyCache.has(k)) return verifyCache.get(k)
 
-  // CRITICALs are always verified; HIGHs consume the remaining budget. Anything
-  // past it stays UNVERIFIED — and UNVERIFIED is never fixed.
-  if (f.severity !== 'CRITICAL' && verifyBudget <= 0) {
+  // One budget of VERIFY_CAP, consumed by every dispatched verifier including
+  // CRITICALs — no severity bypass, so total dispatch never exceeds the cap.
+  // CRITICALs are NOT guaranteed a verifier; their priority is recovered
+  // upstream instead, where the pipeline sorts each lens's batch
+  // CRITICAL-before-HIGH so CRITICALs claim budget first. Anything past the cap
+  // stays UNVERIFIED — and UNVERIFIED is never fixed.
+  if (verifyBudget <= 0) {
     pastCap += 1
     const capped = Promise.resolve(UNVERIFIED(`past the verification cap of ${VERIFY_CAP}`))
     verifyCache.set(k, capped)
@@ -433,7 +470,12 @@ const lensResults = (
     async (res) => {
       if (!res) return null
       const graded = res.findings.map(normalize).filter(Boolean).map(demote)
-      const hot = graded.filter((f) => f.severity === 'CRITICAL' || f.severity === 'HIGH')
+      // CRITICAL before HIGH: verifyOnce spends a single shared budget with no
+      // severity bypass, so ordering the batch is the only thing that gives
+      // CRITICALs first claim on it.
+      const hot = graded
+        .filter((f) => f.severity === 'CRITICAL' || f.severity === 'HIGH')
+        .sort((a, b) => SEV.indexOf(b.severity) - SEV.indexOf(a.severity))
       await parallel(hot.map((f) => () => verifyOnce(f)))
       return { ...res, findings: graded }
     },
@@ -448,20 +490,31 @@ for (const res of lensResults) {
     const k = keyOf(f)
     const prev = merged.get(k)
     if (!prev) {
-      merged.set(k, { ...f, lenses: [res.id] })
+      merged.set(k, { ...f, lenses: [res.id], also_reported: [] })
       continue
     }
     if (!prev.lenses.includes(res.id)) prev.lenses.push(res.id)
-    // Escalate: two lenses at different severities -> take the higher, and
-    // adopt the better-evidenced wording along with it.
+
+    // Severity escalates independently of wording: two lenses at different
+    // severities -> take the higher.
     if (SEV.indexOf(f.severity) > SEV.indexOf(prev.severity)) {
       prev.severity = f.severity
       prev.demoted = f.demoted
-      if (f.failure_scenario.length > prev.failure_scenario.length) {
-        prev.issue = f.issue
-        prev.failure_scenario = f.failure_scenario
-        prev.suggested_fix = f.suggested_fix
-      }
+    }
+
+    // The primary wording is the variant with the longest failure scenario —
+    // that is "the clearer wording" in practice. The displaced variant's issue
+    // text moves to `also_reported` rather than being discarded: this design is
+    // recall-first, and dropping a lens's description just because another lens
+    // was more verbose is exactly the loss the coverage-first brief prevents
+    // upstream.
+    if (f.failure_scenario.length > prev.failure_scenario.length) {
+      keepAlso(prev, prev.issue, f.issue)
+      prev.issue = f.issue
+      prev.failure_scenario = f.failure_scenario
+      prev.suggested_fix = f.suggested_fix
+    } else {
+      keepAlso(prev, f.issue, prev.issue)
     }
   }
 }
@@ -485,7 +538,7 @@ const verifyStats = {
   refuted: refuted.length,
   unverified: surviving.filter((f) => f.verification.verdict === 'UNVERIFIED').length,
 }
-if (pastCap > 0) log(`${pastCap} HIGH finding(s) past the verification cap of ${VERIFY_CAP} — tagged UNVERIFIED, not fixed`)
+if (pastCap > 0) log(`${pastCap} CRITICAL/HIGH finding(s) past the verification cap of ${VERIFY_CAP} — tagged UNVERIFIED, not fixed`)
 
 // CONFIRMED only. Never PLAUSIBLE, never UNVERIFIED, never before this point.
 const confirmed = surviving.filter((f) => f.verification.verdict === 'CONFIRMED')
@@ -555,6 +608,7 @@ return {
   changedLines: CHANGED_LINES,
   fileCount: FILES.length,
   droppedByBand: DROPPED_BY_BAND,
+  addedByBand: ADDED_BY_BAND,
   fableSuggested: FABLE_SUGGESTED,
   coverage: lensResults.map((r) => ({ id: r.id, key: r.key, count: r.findings.length, answeredBy: r.answeredBy, retried: r.retried })),
   findings: surviving,
