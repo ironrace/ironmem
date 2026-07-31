@@ -260,7 +260,12 @@ const BRIEFS = {
 function asData(text) {
   const flat = String(text == null ? '' : text)
     .replace(/[\r\n]+/g, ' ')
-    .replace(/<\/?findings?>/gi, '[tag]')
+    // Whitespace variants (`</ finding >`, `< /finding>`) are covered because a
+    // fuzzy reader may treat a near-miss as the real close tag. Zero-width and
+    // fullwidth-homoglyph variants are not, and no regex closes that class —
+    // the instruction layer, the verify gate, the scope audit and post-fix
+    // validation are the real defenses. This just removes the easy forgery.
+    .replace(/<\s*\/?\s*findings?\s*>/gi, '[tag]')
     .replace(/`/g, "'")
     .trim()
   return flat.length > MAX_FIELD_CHARS ? `${flat.slice(0, MAX_FIELD_CHARS)} …(truncated)` : flat
@@ -361,8 +366,19 @@ function isEmpty(res) {
 
 function normalize(f) {
   if (!f || !f.file) return null
+  // `file` is the one model-generated field that reaches a brief OUTSIDE the
+  // data delimiters — the fix brief's header and the scope auditor's
+  // "authorised to touch" list, which is the very guard meant to catch a rogue
+  // fix. It is sanitised here rather than at the call sites so the `byFile`
+  // grouping key, the agent `label:` channels and the brief text can never
+  // diverge from one another; sanitising only where it is printed would leave
+  // the key holding the raw string. A real path contains no newline and no
+  // backtick, so nothing legitimate is lost.
+  const file = String(f.file).replace(/[\r\n`]/g, '').trim()
+  // A path that sanitises away to nothing cannot be grouped, keyed, or fixed.
+  if (!file) return null
   return {
-    file: String(f.file).trim(),
+    file,
     // Anything that is not a real 1-based line becomes 0, so "0 means
     // file-level" (which keyOf depends on) is true by construction rather than
     // by convention. A negative line would otherwise reach the pure file:line
@@ -460,6 +476,10 @@ function verifierBrief(f) {
 const UNVERIFIED = (why) => ({ verdict: 'UNVERIFIED', evidence: why, fix_complexity: 'invasive', fix_class: 'other' })
 
 const verifyCache = new Map()
+// Keys whose cached entry exists only because a HIGH hit the CRITICAL reserve
+// while slots were still open. That is a deferral, not a verdict, and it is the
+// only cache entry a later CRITICAL is allowed to overturn.
+const reserveBlocked = new Set()
 let verifyBudget = VERIFY_CAP
 let pastCap = 0
 
@@ -468,7 +488,14 @@ let pastCap = 0
 // so the cache write always beats a concurrent second caller.
 function verifyOnce(f) {
   const k = keyOf(f)
-  if (verifyCache.has(k)) return verifyCache.get(k)
+  // Two lenses can disagree on severity at one file:line. If the HIGH arrived
+  // first and was deferred by the reserve, the CRITICAL behind it must not
+  // inherit that deferral — the reserve exists for exactly this finding, and
+  // the inherited row would read `severity=CRITICAL` beside evidence saying the
+  // slots are reserved for CRITICALs. Only a reserve deferral is reclaimable;
+  // a real verdict and a genuinely cap-exhausted entry are both final.
+  const reclaimable = f.severity === 'CRITICAL' && reserveBlocked.has(k)
+  if (verifyCache.has(k) && !reclaimable) return verifyCache.get(k)
 
   // One budget of VERIFY_CAP, consumed by every dispatched verifier including
   // CRITICALs — no severity bypass, so total dispatch never exceeds the cap.
@@ -484,7 +511,9 @@ function verifyOnce(f) {
   // cost is logged at the end rather than left invisible.
   const floor = f.severity === 'CRITICAL' ? 0 : CRITICAL_RESERVE
   if (verifyBudget <= floor) {
-    pastCap += 1
+    // Guarded so re-capping an already-capped key (a reclaimable CRITICAL that
+    // then finds the budget genuinely exhausted) cannot double-count it.
+    if (!verifyCache.has(k)) pastCap += 1
     const capped = Promise.resolve(
       UNVERIFIED(
         f.severity === 'CRITICAL'
@@ -493,7 +522,17 @@ function verifyOnce(f) {
       ),
     )
     verifyCache.set(k, capped)
+    // Distinguishes "deferred by the reserve, slots still open" from "cap
+    // genuinely exhausted". Only the former is reclaimable by a later CRITICAL.
+    if (f.severity !== 'CRITICAL' && verifyBudget > 0) reserveBlocked.add(k)
     return capped
+  }
+
+  if (reclaimable) {
+    // The deferral is superseded by a real dispatch, so it stops counting as a
+    // finding past the cap.
+    pastCap -= 1
+    reserveBlocked.delete(k)
   }
   verifyBudget -= 1
 
