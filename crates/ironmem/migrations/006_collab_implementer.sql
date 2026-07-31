@@ -2,7 +2,7 @@
 --
 -- Lets `/collab start --implementer=codex` route the v3
 -- `CodeImplementPending` phase to Codex (running its own
--- subagent-driven-development end-to-end) instead of Claude. v1 planning
+-- iron-build end-to-end) instead of Claude. v1 planning
 -- and the v3 global review stage are unchanged — only the batch
 -- implementation phase's owner shifts.
 --

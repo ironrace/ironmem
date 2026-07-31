@@ -41,7 +41,7 @@ pub struct CollabSession {
     /// (the default) keeps the historical flow where Claude orchestrates
     /// per-task subagents inline. `Agent::Codex` routes
     /// `CodeImplementPending` to Codex instead — Claude still publishes
-    /// `task_list`, but Codex drives its own `subagent-driven-development`
+    /// `task_list`, but Codex drives its own `iron-build`
     /// end-to-end and emits `implementation_done`. Set at `collab_start`
     /// and rebindable via `collab_set_implementer` until implementation
     /// completes. The DB CHECK constraint enforces the allowed set as
@@ -168,7 +168,7 @@ impl CollabSession {
     /// Construct a session pre-positioned at the v3 global-review stage.
     /// Used by the coding-review shortcut (`collab_start_code_review`) for
     /// orchestrators that already completed per-task coding via
-    /// `subagent-driven-development`. The shortcut seeds Codex's
+    /// `iron-build`. The shortcut seeds Codex's
     /// `CodeReviewFixGlobalPending` turn directly — `head_sha` is supplied
     /// here instead of via an `implementation_done` send. From there the
     /// flow follows the canonical v3 order: Codex `review_fix_global` →

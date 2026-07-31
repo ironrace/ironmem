@@ -189,7 +189,7 @@ pub(super) fn failure_report_is_off_turn_admissible(
 /// Optional `plan_file_path`: if present, must be non-empty, repo-relative
 /// (no leading `/`), and contain no `..` path segments. Persisted on the
 /// session (via the canonicalized `task_list` JSON) so reviewers can locate
-/// the writing-plans markdown that drove subagent execution.
+/// the iron-plan markdown that drove subagent execution.
 ///
 /// Optional `execution_mode`: if present, must be one of the allowed values in
 /// `ALLOWED_EXECUTION_MODES`. Unknown values are rejected immediately so a

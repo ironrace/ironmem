@@ -363,7 +363,7 @@ pub fn apply_event(
             // the user selected most recently. Default sessions have
             // `implementer == Agent::Claude` (historical flow); sessions
             // started or joined with `--implementer=codex` route Codex into
-            // the batch phase to drive its own subagent-driven-development.
+            // the batch phase to drive its own iron-build.
             next.current_owner = session.implementer;
         }
         // ── v3: batch implementation → global review ──────────────────────
