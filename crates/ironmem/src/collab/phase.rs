@@ -10,7 +10,7 @@ pub enum Phase {
     PlanClaudeFinalizePending,
     PlanLocked,
     // Coding (v3) — batch implementation. The selected implementer
-    // orchestrates per-task subagents (via superpowers:subagent-driven-development)
+    // orchestrates per-task subagents (via iron-build)
     // entirely on its side. The single transition out is `implementation_done`,
     // which jumps straight to global review.
     CodeImplementPending,

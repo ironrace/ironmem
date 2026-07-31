@@ -369,7 +369,7 @@ pub fn apply_event(
         // ── v3: batch implementation → global review ──────────────────────
         // The implementer agent (Claude by default; Codex when selected at
         // `collab_start`) drives per-task subagent work on its side via
-        // `superpowers:writing-plans` → `superpowers:subagent-driven-development`.
+        // `iron-plan` → `iron-build`.
         // The other agent does not participate per-task; the single
         // transition out of `CodeImplementPending` jumps to global review
         // with Codex as owner — Codex first; Claude audits after. Payload

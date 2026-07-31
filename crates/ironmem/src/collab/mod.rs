@@ -14,7 +14,7 @@
 //! Claude `task_list` send transitions out of `PlanLocked` into the batch
 //! implementation phase (`CodeImplementPending`), where the selected
 //! implementer orchestrates per-task subagents (via
-//! `superpowers:subagent-driven-development`) entirely on its side. A
+//! `iron-build`) entirely on its side. A
 //! single `implementation_done` send jumps to the global 3-phase review
 //! flow (`CodeReviewFixGlobalPending` → `CodeReviewLocalPending` →
 //! `CodeReviewFinalPending`) — Codex reviews the raw post-implementation
