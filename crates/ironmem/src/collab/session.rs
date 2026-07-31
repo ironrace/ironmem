@@ -41,11 +41,10 @@ pub struct CollabSession {
     /// (the default) keeps the historical flow where Claude orchestrates
     /// per-task subagents inline. `Agent::Codex` routes
     /// `CodeImplementPending` to Codex instead — Claude still publishes
-    /// `task_list`, but Codex drives its own `iron-build`
-    /// end-to-end and emits `implementation_done`. Set at `collab_start`
-    /// and rebindable via `collab_set_implementer` until implementation
-    /// completes. The DB CHECK constraint enforces the allowed set as
-    /// defense-in-depth.
+    /// `task_list`, but Codex drives its own `iron-build` end-to-end and
+    /// emits `implementation_done`. Set at `collab_start` and rebindable
+    /// via `collab_set_implementer` until implementation completes. The DB
+    /// CHECK constraint enforces the allowed set as defense-in-depth.
     pub implementer: Agent,
     // Recovery-state fields (issue #197). All seven persist as nullable
     // columns added in migration 015 and stay NULL/0 for the common case
@@ -174,9 +173,9 @@ impl CollabSession {
     /// flow follows the canonical v3 order: Codex `review_fix_global` →
     /// Claude `review_local` (audit of Codex's commits via
     /// `/ultrareview-local`) → Claude `final_review` (PR creation).
-    /// `implementer` is fixed at `Agent::Claude` because the shortcut
-    /// never enters `CodeImplementPending`; the field is preserved only so
-    /// the session record shape stays uniform with full-flow sessions.
+    /// `implementer` is fixed at `Agent::Claude` because the shortcut never
+    /// enters `CodeImplementPending`; the field is preserved only so the
+    /// session record shape stays uniform with full-flow sessions.
     pub fn new_global_review(
         id: impl Into<String>,
         base_sha: impl Into<String>,
