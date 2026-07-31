@@ -395,7 +395,8 @@ Remaining: <N MEDIUM (reported)> · <N HIGH invasive (design change — yours)>
 <2-3 sentences covering every lens that was dispatched>
 
 ## Fixed
-<file:line — issue — what changed [tags]>
+<file> (<model/effort>)
+  <line — issue — what changed [tags]>
 
 ## Remaining findings
 CRITICAL: <file:line — issue — failure scenario — fix [tags] [CONFIRMED|PLAUSIBLE|UNVERIFIED]>
@@ -437,13 +438,26 @@ Filling it in:
   `--report-only` runs and runs with zero fixes.
 - **Fixed** — findings whose `outcome` is `fixed`, with the fix agent's
   `outcome_note` as "what changed". `no_change_needed` and `skipped` entries do
-  not belong here.
+  not belong here. **Group them by file and label each file with the tier its
+  fix agent ran at**: `fixes.groups[]` carries `{ file, tier, results }`, and
+  `tier` is already formatted by the workflow as `model/effort` — render it
+  directly, no lookup. The tier is per file by construction (one agent per
+  file), so it belongs on the file heading, not repeated on every line.
+
+  This is the one tier a reader most needs. Lens coverage records which model
+  *found* each issue; this records which model *edited their working tree*, and
+  this command's whole premise is that it edits. A fixed finding whose group
+  cannot be located in `fixes.groups[]` gets `(tier unknown)` — never a guessed
+  tier.
 - **Remaining findings** — grouped by severity, tagged with `lenses[]`
   (e.g. `[A+B]`), `[demoted]` where set, the verification verdict for
   CRITICAL/HIGH, and any `also_reported[]` wording from another lens, which is
   preserved rather than discarded. A finding with `outcome: skipped` or
-  `no_change_needed` belongs here with its `outcome_note`.
-- **Reported, not patched (invasive)** — from `invasive[]`.
+  `no_change_needed` belongs here with its `outcome_note`. **No tier** — no fix
+  agent ran on these, and a tier here would name a model that never touched the
+  file.
+- **Reported, not patched (invasive)** — from `invasive[]`. **No tier**, for the
+  same reason: `invasive` findings are never dispatched to a fix agent at all.
 - **Refuted during verification** — from `refuted[]`, each with its
   `verification.evidence`, so the signal is not silently lost.
 - **Fix scope audit** — from `scopeAudit`. `null` with fixes applied is not the
