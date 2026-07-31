@@ -432,8 +432,9 @@ Filling it in:
   return struct.
 - **Decision line** — when auto-fixes changed the decision, say so on that line:
   `APPROVE with comments (was BLOCK — 2 CRITICAL auto-fixed)`.
-- **Fixes applied** — `fixes.applied` and `fixes.files`. **Every report prints
-  the rollback line**, including `--report-only` runs and runs with zero fixes.
+- **Fixes applied** — `fixes.applied` and `fixes.files`. `<sha>` is the Phase 2.5
+  `rollbackSha`. **Every report prints the rollback line**, including
+  `--report-only` runs and runs with zero fixes.
 - **Fixed** — findings whose `outcome` is `fixed`, with the fix agent's
   `outcome_note` as "what changed". `no_change_needed` and `skipped` entries do
   not belong here.
