@@ -367,13 +367,11 @@ pub fn apply_event(
             next.current_owner = session.implementer;
         }
         // ── v3: batch implementation → global review ──────────────────────
-        // The implementer agent (Claude by default; Codex when selected at
-        // `collab_start`) drives per-task subagent work on its side via
-        // `iron-plan` → `iron-build`.
-        // The other agent does not participate per-task; the single
-        // transition out of `CodeImplementPending` jumps to global review
-        // with Codex as owner — Codex first; Claude audits after. Payload
-        // carries only `head_sha` (anti-puppeteering).
+        // The implementer drives per-task subagent work on its side via
+        // `iron-build`; the other agent does not participate per-task. The
+        // single transition out of `CodeImplementPending` jumps to global
+        // review with Codex as owner — Codex first; Claude audits after.
+        // Payload carries only `head_sha` (anti-puppeteering).
         (Phase::CodeImplementPending, CollabEvent::ImplementationDone { head_sha }) => {
             require_actor_or_recovery(session, actor, session.implementer)?;
             next.last_head_sha = Some(head_sha.clone());
