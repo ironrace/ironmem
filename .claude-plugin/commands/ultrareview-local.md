@@ -283,12 +283,36 @@ The SHA is passed to the workflow as `rollbackSha` and does three jobs:
 - `git diff <sha> -- .` does **not** show a file the fixes *created* — a new
   untracked file is invisible to it. A fix agent that adds a file would slip
   past the scope audit entirely. When reporting fix scope, run
-  `git status --porcelain` alongside the diff and treat new untracked files as
-  fix output.
+  `git status --porcelain` alongside the diff and treat fix-created files as fix
+  output.
 - `git checkout <sha> -- .` restores modified files but does **not delete** a
   file that did not exist at anchor time. Recovery is therefore incomplete for
   created files, and the report must say so plainly rather than implying the one
   command undoes everything.
+
+<a id="fix-created-test"></a>
+### The fix-created test
+
+Both gaps above need one question answered — *did the fixes create this file?* —
+and it has an exact answer, so do not improvise a discriminator:
+
+> A path is **fix-created** iff it is untracked now **and** absent from the
+> anchor tree:
+>
+> ```bash
+> git status --porcelain | awk '/^\?\?/ { print $2 }' | while read -r p; do
+>   git ls-tree -r "$ROLLBACK_SHA" -- "$p" | grep -q . || echo "fix-created: $p"
+> done
+> ```
+
+This works because the anchor was built with `git add -A` against the temp
+index, so **every untracked file that existed before the fixes is already in the
+anchor tree**. A path missing from that tree can only have appeared afterwards.
+
+Use this test in both modes. Do not diff against Phase 1's `git status --short`:
+that baseline exists only in Local Mode, and in PR Mode there is no captured
+untracked list at all — improvising a discriminator there means guessing at
+exactly the moment the tree is in an unknown state.
 
 ---
 
@@ -527,9 +551,10 @@ Filling it in:
   `--report-only` runs and runs with zero fixes.
 
   `git checkout <sha> -- .` restores modified files but **does not delete files
-  the fixes created**. If `git status --porcelain` shows untracked files that
-  were not there at anchor time, name them on the follow-up line so the user
-  knows recovery needs a manual `rm`. A recovery command that silently
+  the fixes created**. Identify those with the
+  [fix-created test](#the-fix-created-test) — untracked now **and** absent from
+  `git ls-tree -r <rollbackSha>` — and name them on the follow-up line so the
+  user knows recovery needs a manual `rm`. A recovery command that silently
   under-delivers is the exact failure class this command exists to prevent.
 - **Fixed** — findings whose `outcome` is `fixed`, with the fix agent's
   `outcome_note` as "what changed". `no_change_needed` and `skipped` entries do
@@ -560,9 +585,11 @@ Filling it in:
 - **Fix scope audit** — from `scopeAudit`. `null` with fixes applied is not the
   same as no audit being needed: say the audit did not return and the fixes are
   unaudited. The auditor reads `git diff <rollbackSha> -- .`, which **cannot see
-  files the fixes created**, so check `git status --porcelain` yourself and list
-  any new untracked files here. They are fix output and belong in the scope
-  question like any other hunk.
+  files the fixes created**, so apply the
+  [fix-created test](#the-fix-created-test) yourself and list every path it
+  returns here. They are fix output and belong in the scope question like any
+  other hunk — a file the fixes added is the one change most likely to be out of
+  scope and is exactly what the diff cannot show you.
 - **Lens coverage** — one line per entry in `coverage[]`, plus a line for every
   lens that was never requested (`skipped (<reason>)`) and every id in
   `droppedByBand` (`dropped by diff-size band`). `answeredBy` supplies the
