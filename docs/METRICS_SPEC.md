@@ -735,7 +735,7 @@ these record how the arm is executed and measured.
 
 The collab arm now uses the production shortcut planning flow in benchmark
 runs: two parallel planning drafts, Claude canonical synthesis, exactly one
-Codex plan-review turn, and a single human gate on Claude's final Superpowers
+Codex plan-review turn, and a single human gate on Claude's final approved
 task plan. The `PlanLocked` bridge mechanically parses that approved markdown
 into `task_list` and rejects tasks timeboxed above 20 minutes. Phase bucket names
 and the `task_list` planning attribution bucket remain unchanged.

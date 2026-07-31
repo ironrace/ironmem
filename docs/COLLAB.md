@@ -1593,8 +1593,8 @@ model default.
 
 ### Codex model policy
 
-Codex dispatch is explicit and phase-based. The background dispatcher and
-Codex's iron-build subagent dispatch use the same defaults:
+Codex dispatch is explicit and phase-based. These are the background
+dispatcher's defaults for collab's own protocol turns:
 
 | Codex work | Model | Effort |
 |---|---|---|
@@ -1602,6 +1602,11 @@ Codex's iron-build subagent dispatch use the same defaults:
 | Exploration, docs, and mechanical work | `gpt-5.6-luna` | `medium` |
 | Planning and normal review | `gpt-5.6-terra` | `high` |
 | Architecture/security escalation | `gpt-5.6-sol` | `high` |
+
+The `Implementation controller/workers` row governs the controller collab
+dispatches into `CodeImplementPending`. Per-task subagent models inside that
+run come from `iron-build`'s `**Tier:**` ladder, not from this table — see
+§ Reviewer model selection for the divergence this row still carries.
 
 `gpt-5.6-sol` is an escalation tier, not the default. Use it when a
 discovered architecture, security, or other high-risk issue needs additional
@@ -1790,9 +1795,10 @@ Claude's behavior on receiving this is specified executably in
 `.claude-plugin/commands/collab.md` § `start` — this document does not
 restate it. In summary: reuse the current branch when it is already an
 isolated one; otherwise derive `collab/<slug>` from the task, uniquify it
-against local and `origin` refs, and create a worktree for it per
-`iron-build`'s *Workspace* section, defaulting to `.worktrees/` rather than
-asking. Two invariants are load-bearing and are stated in full there: collab
+against local and `origin` refs, and create a worktree for it — borrowing
+only the directory-priority list from `iron-build`'s *Workspace* section, and
+defaulting to `.worktrees/` rather than asking. Two invariants are
+load-bearing and are stated in full there: collab
 must never stop to ask the user for a path or branch name, and `main` /
 `master` / `trunk` must never be recorded as the collab branch — the `branch`
 field is fixed at `collab_start` time with no update API, so a recorded
@@ -2190,8 +2196,19 @@ full `/ultrareview-local`.
 `iron-build` resolves a model per task from the task's `**Tier:**` line, and
 runs reviewers at least one tier above the implementer (never below
 `standard`). Reviewer model selection is therefore the skill's concern, not
-the collab protocol's — collab pins models only for its own protocol turns,
-via the dispatch matrix in `.claude-plugin/commands/collab.md`.
+the collab protocol's: collab's own dispatch matrix in
+`.claude-plugin/commands/collab.md` pins models for protocol turns only.
+
+**Known divergence on the Codex side.** § Codex model policy above, and
+`.codex-plugin/prompts/collab-batch-impl.md` § Model routing, both pin
+*implementation workers* flat at `gpt-5.6-luna`/`max`. That predates the tier
+system and contradicts it: `max` is not a rung on
+`skills/iron-build/references/tiers.md`, and a flat pin collapses the
+reviewer floor, because a reviewer one tier above the implementer resolves to
+the same model the implementer used. Until that flat pin is scoped to protocol
+turns, a `--implementer=codex` batch has two live rules for the same dispatch.
+`iron-build`'s tier ladder is the intended winner; do not read the flat pin as
+authority over per-task model choice.
 
 ## Code-Map MCP Tools (issue #94)
 

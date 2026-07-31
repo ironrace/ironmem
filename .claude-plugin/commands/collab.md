@@ -47,11 +47,18 @@ branch names.
        branch with that name already exists locally or on `origin`
        (`git show-ref --verify --quiet refs/heads/<name>` /
        `refs/remotes/origin/<name>`), append `-2`, `-3`, … until unique.
-     - Pick a worktree directory per `iron-build`'s *Workspace* section,
-       with one collab-specific override: where that section's step 3 says
-       to ask the human, collab defaults to `.worktrees/` instead. Collab
-       must never stop to ask — it is running a bounded protocol turn, not
-       an interactive session.
+     - Pick a worktree directory using **only** the directory-priority list
+       in `iron-build`'s *Workspace* section (the numbered list under
+       "Choose where the worktree lives", plus its gitignore check), with
+       one collab-specific override: where that list's final entry says to
+       ask the human for a location, collab defaults to `.worktrees/`
+       instead. Collab must never stop to ask — it is running a bounded
+       protocol turn, not an interactive session. Nothing else in that
+       section applies here: its default-branch consent stop, its dependency
+       install, its red-baseline "ask whether to proceed", and its worktree
+       creation command are all superseded by this list — step 4 exists
+       precisely to escape the default branch, and the creation command is
+       the next bullet.
      - `git worktree add "<dir>/<name>" -b "<name>"` (branches from the
        current HEAD).
      - `repo_path` ← the new worktree's absolute path. `branch` ← `<name>`.
@@ -293,7 +300,7 @@ own `collab_status` / `collab_recv` / drawer fetches.
 <!-- LINT:gates-ref-only -->
 ### Approval gates are reference-only
 The only planning user gate is `final`: a compose worker writes the
-iron-build-compatible task plan to `docs/iron/plans/...` and stages the
+iron-build-compatible task markdown to `docs/iron/plans/...` and stages the
 exact markdown in a drawer, then returns `{ref, file path, ≤3-line summary}`.
 The orchestrator surfaces ONLY ref+path+summary for approval (never the full
 body); `collab-turn-submit.md` sends the approved final artifact by ref. For

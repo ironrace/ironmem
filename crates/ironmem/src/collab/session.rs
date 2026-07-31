@@ -166,9 +166,9 @@ impl CollabSession {
 
     /// Construct a session pre-positioned at the v3 global-review stage.
     /// Used by the coding-review shortcut (`collab_start_code_review`) for
-    /// orchestrators that already completed per-task coding via
-    /// `iron-build`. The shortcut seeds Codex's
-    /// `CodeReviewFixGlobalPending` turn directly — `head_sha` is supplied
+    /// orchestrators that already completed per-task coding via `iron-build`.
+    /// The shortcut seeds Codex's `CodeReviewFixGlobalPending` turn
+    /// directly — `head_sha` is supplied
     /// here instead of via an `implementation_done` send. From there the
     /// flow follows the canonical v3 order: Codex `review_fix_global` →
     /// Claude `review_local` (audit of Codex's commits via

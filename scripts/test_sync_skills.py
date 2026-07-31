@@ -453,21 +453,11 @@ class TierParityTests(unittest.TestCase):
             self.assertIn("dispatch_path", skill, f"{harness} iron-build omits dispatch_path")
 
     def test_no_skill_references_an_uninstalled_skill(self) -> None:
-        forbidden = (
-            "superpowers",
-            "brainstorming",
-            "writing-plans",
-            "subagent-driven-development",
-            "executing-plans",
-            "using-git-worktrees",
-            "finishing-a-development-branch",
-            "requesting-code-review",
-            "test-driven-development",
-            "using-superpowers",
-        )
+        # Denylist lives in sync_skills so the prompt/command/doc gate in
+        # check_collab_turn_templates.py enforces the identical set.
         for harness, files in self.rendered.items():
             for relative, body in files.items():
-                for name in forbidden:
+                for name in sync_skills.UNINSTALLED_SKILL_NAMES:
                     self.assertNotIn(
                         name,
                         body,

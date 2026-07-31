@@ -7,6 +7,9 @@ Stdlib only.
 from __future__ import annotations
 import os, pathlib, re, sys
 
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
+from sync_skills import UNINSTALLED_SKILL_NAMES  # noqa: E402
+
 ROOT = pathlib.Path(os.environ.get(
     "COLLAB_LINT_ROOT",
     pathlib.Path(__file__).resolve().parents[1],
@@ -295,6 +298,27 @@ def check_failure_prefixes() -> None:
                 f"never documented")
 
 
+def check_no_uninstalled_skill_references() -> None:
+    """No instruction surface may name a skill this repo does not install.
+
+    test_sync_skills.py enforces the same denylist over the generated `skills/`
+    tree; that gate stops at the skill boundary, so a stale name reintroduced
+    into a prompt, the command file, or docs/COLLAB.md would otherwise ship
+    green. The skill resolves to nothing on a standalone install (the names are
+    in install-ironmem.sh's LEGACY_SHARED_SKILLS and are deleted on upgrade),
+    and the worker proceeds with its own approach with no protocol-level signal.
+    """
+    for path in failure_prefix_surfaces():
+        rel = path.relative_to(ROOT)
+        for line_no, line in enumerate(path.read_text().splitlines(), 1):
+            lowered = line.lower()
+            for name in UNINSTALLED_SKILL_NAMES:
+                if name in lowered:
+                    err(f"{rel}:{line_no}: names uninstalled skill {name!r} — "
+                        f"it is removed on install, so the instruction resolves "
+                        f"to nothing and the worker freelances the step")
+
+
 def check_evaluate_issue_surfaces() -> None:
     """Keep the evaluator's SPLIT safety contract in its three mirrors."""
     for path in (EVALUATE_ISSUE_DOC, EVALUATE_ISSUE_CLAUDE, EVALUATE_ISSUE_CODEX):
@@ -563,6 +587,7 @@ def main() -> int:
                 err(f"{prompt.relative_to(ROOT)}: missing required recovery/dispatch contract {required!r}")
 
     check_failure_prefixes()
+    check_no_uninstalled_skill_references()
     check_evaluate_issue_surfaces()
     check_review_diff_fallback_contract()
     check_review_diff_trigger_detection_contract()

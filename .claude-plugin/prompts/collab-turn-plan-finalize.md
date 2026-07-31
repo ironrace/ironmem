@@ -6,7 +6,7 @@ topics: [final]
 preconditions: phase == PlanClaudeFinalizePending, current_owner == claude
 ---
 
-# Collab worker — finalize into the approved task plan
+# Collab worker — finalize into iron-build-compatible task markdown
 
 > ANTI-PUPPETEERING: You received only this template and `$SESSION_ID`. Discover
 > all state yourself. Your final message MUST be the ≤3-line verdict only; never

@@ -178,9 +178,6 @@ pub(super) fn failure_report_is_off_turn_admissible(
         .unwrap_or(false)
 }
 
-/// Allowed values for `execution_mode` on a `task_list` payload.
-/// Absence means default (subagent-driven). The string `"subagent_driven"` is
-/// intentionally NOT in this set — callers omit the field for the default path.
 /// Parse and validate the task_list payload shape. Fails fast on missing
 /// fields, empty or oversized task arrays, missing acceptance criteria, or
 /// non-array tasks. The state machine re-checks plan_hash, base_sha presence,
