@@ -84,13 +84,20 @@ function selectFor() {
 }
 
 const SELECTED = selectFor().filter((id) => ROSTER[id])
+// A requested id that no lens implements is a typo or a stale caller, not a
+// band decision — it is reported on its own line so it cannot be misread as
+// one, and it is kept out of DROPPED_BY_BAND for the same reason.
+const UNRECOGNISED = REQUESTED.filter((id) => !ROSTER[id])
 // Removed by the band (only possible in `small`) and added by it (only
 // possible in `large`). Both are reported: the roster must be auditable in
 // both directions, not just when it shrinks.
-const DROPPED_BY_BAND = REQUESTED.filter((id) => !SELECTED.includes(id))
+const DROPPED_BY_BAND = REQUESTED.filter((id) => ROSTER[id] && !SELECTED.includes(id))
 const ADDED_BY_BAND = SELECTED.filter((id) => !REQUESTED.includes(id))
 const FABLE_SUGGESTED = BAND === 'large' && !FABLE
 
+if (UNRECOGNISED.length) {
+  log(`unrecognised lens id(s) ignored: ${UNRECOGNISED.join(', ')}`)
+}
 if (DROPPED_BY_BAND.length) {
   log(`band=${BAND} (${CHANGED_LINES} changed lines, ${FILES.length} files) — dropped conditional lenses: ${DROPPED_BY_BAND.join(', ')}`)
 }
@@ -316,8 +323,32 @@ function demote(f) {
 // memo do what it promises — one defect, one verifier. Nothing a lens said is
 // lost by the collapse; the merge keeps every non-primary wording in
 // `also_reported`.
+//
+// ...with one exception, which must not be "simplified" away. A line of 0 does
+// not mean line zero — FINDINGS_SCHEMA defines it as FILE-LEVEL. Keying those
+// on `file:0` would stretch "same location" into "same file" and collapse every
+// file-level finding in a file into one entry: severity maxed across unrelated
+// claims, a single verifier ruling on the primary's wording alone and that
+// verdict then applied to the whole blob, and the displaced claims reduced to
+// an `also_reported` string with their failure scenario and suggested fix
+// gone. D, F and C emit file-level findings routinely, so this collides on most
+// runs, not rarely. File-level findings therefore keep a wording signature in
+// the key; findings with a real line number do not.
 function keyOf(f) {
-  return `${f.file}:${f.line}`
+  if (f.line !== 0) return `${f.file}:${f.line}`
+  return `${f.file}:0:${signature(f.issue)}`
+}
+
+// First 8 normalised words of the issue text — enough to tell two file-level
+// claims apart without demanding that two lenses phrase one identically.
+function signature(issue) {
+  return issue
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, ' ')
+    .trim()
+    .split(' ')
+    .slice(0, 8)
+    .join(' ')
 }
 
 // Files a non-primary variant's wording onto a merged finding, skipping empties
@@ -427,6 +458,17 @@ function fixBrief(file, list) {
           `   failure scenario: ${f.failure_scenario}`,
           `   suggested fix: ${f.suggested_fix}`,
           `   verifier evidence: ${f.verification.evidence}`,
+          // Another lens's wording of the same location, which may describe a
+          // second and distinct defect there. The verifier ruled on the primary
+          // wording only, so without this the merged-in claim would be neither
+          // fixed nor surfaced as unfixed.
+          ...(f.also_reported && f.also_reported.length
+            ? [
+                `   also reported at this location by another lens — may be a separate defect; fix it too if it is real, otherwise account for it in your note: ${f.also_reported
+                  .map((t) => `"${t}"`)
+                  .join('; ')}`,
+              ]
+            : []),
         ].join('\n'),
       )
       .join('\n\n'),
