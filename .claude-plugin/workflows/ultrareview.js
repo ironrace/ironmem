@@ -621,8 +621,8 @@ function auditBrief(files) {
   return [
     'Audit an auto-fix patch set for scope creep. Read only the patch.',
     '',
-    `Run: \`git -C ${A.repoPath} diff ${A.rollbackSha} -- .\``,
-    `That range is exactly the fixes applied by this review — ${A.rollbackSha} is a snapshot taken before the first edit.`,
+    `Run: \`git -C ${A.repoPath} diff ${A.rollbackSha} -- .\`. Also run \`git status --porcelain\` in ${A.repoPath}.`,
+    `Together those cover exactly the fixes applied by this review: ${A.rollbackSha} is a snapshot taken before the first edit, and a fix agent can also create new files — the diff range alone will not show those, so treat any untracked ("??") entries from the porcelain status as fix output too, not scope creep.`,
     '',
     `Files the fix agents were authorised to touch:\n${files.map((f) => `  - ${f}`).join('\n')}`,
     '',

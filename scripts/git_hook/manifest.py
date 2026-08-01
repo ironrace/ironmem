@@ -138,6 +138,37 @@ def is_hook_path(path: str) -> bool:
     return path in HOOK_EXACT_PATHS
 
 
+def is_workflow_path(path: str) -> bool:
+    """The Workflow-harness surface: an executable `Workflow` script inside a
+    harness plugin root's `workflows/` directory -- today just
+    `.claude-plugin/workflows/ultrareview.js`, which edits users' working
+    trees and is covered only by its own behaviour self-test.
+
+    Unlike `is_skills_path`, there is no canonical top-level `workflows/`
+    tree to also match: `.claude-plugin/workflows/` is the only one that
+    exists, so this stays scoped to gate-covered plugin roots.
+    `.github/workflows/*.yml` cannot match: `.github` does not end in
+    `-plugin` (see `_is_gate_covered_plugin_segment`), so it never reaches
+    this predicate's `.js` check regardless of the `workflows` segment name.
+
+    Without this surface, `.claude-plugin/workflows/*.js` would still be
+    correctly excluded from SURFACE_DOCS and SURFACE_INERT_CONFIG by
+    `is_gate_covered_plugin_path` -- but it would then match no specific
+    surface either and fall through to UNKNOWN, escalating every edit to
+    every gate. That is safe but not the deliberate, provable selection the
+    ultrareview workflow self-test gate needs: this predicate is what lets
+    `resolve_gates` choose that gate specifically, not merely sweep it in as
+    a side effect of full escalation.
+    """
+    segments = path.split("/")
+    return (
+        len(segments) >= 3
+        and _is_gate_covered_plugin_segment(segments[0])
+        and segments[1] == "workflows"
+        and path.endswith(".js")
+    )
+
+
 # A harness plugin root -- `.claude-plugin/`, `.codex-plugin/`,
 # `.gemini-plugin/`, `.grok-plugin/`, and any future one -- is NOT an inert
 # surface, even though its contents are JSON/shell/Markdown, the exact
@@ -312,6 +343,7 @@ SURFACE_RUST_WORKSPACE = "rust_workspace"
 SURFACE_COLLAB_PROTOCOL = "collab_protocol"
 SURFACE_HOOK_SELF_TEST = "hook_self_test"
 SURFACE_SKILLS = "skills"
+SURFACE_WORKFLOWS = "workflows"
 SURFACE_DOCS = "docs"
 SURFACE_INERT_CONFIG = "inert_config"
 
@@ -426,8 +458,9 @@ class ChangeSet:
 
 # surface_id -> predicate. Predicates ported unchanged from the existing
 # is_rust_path/is_collab_protocol_path/is_hook_path classifiers above, plus
-# the DOCS surface's is_docs_path and the INERT_CONFIG surface's
-# is_inert_config_path. Iteration order is declaration order: classify_path()
+# is_skills_path, is_workflow_path, the DOCS surface's is_docs_path, and the
+# INERT_CONFIG surface's is_inert_config_path. Iteration order is declaration
+# order: classify_path()
 # below checks the specific surfaces first and the two generic inert
 # catch-alls (DOCS, then INERT_CONFIG) last, so a more specific surface (e.g.
 # collab protocol) wins over a generic inert catch-all when a path happens to
@@ -441,6 +474,7 @@ SURFACES: MappingProxyType[str, Callable[[str], bool]] = MappingProxyType(
         SURFACE_COLLAB_PROTOCOL: is_collab_protocol_path,
         SURFACE_HOOK_SELF_TEST: is_hook_path,
         SURFACE_SKILLS: is_skills_path,
+        SURFACE_WORKFLOWS: is_workflow_path,
         SURFACE_DOCS: is_docs_path,
         SURFACE_INERT_CONFIG: is_inert_config_path,
     }
@@ -576,6 +610,20 @@ GATES: tuple[Gate, ...] = (
         argv=("cargo", "test", "--workspace"),
         phases=frozenset({PHASE_PRE_PUSH}),
         surfaces=frozenset({SURFACE_RUST_WORKSPACE}),
+        always=False,
+    ),
+    # Task 6 (ultrareview v2): the workflow harness in
+    # scripts/test_ultrareview_workflow.mjs is the only automated coverage
+    # `.claude-plugin/workflows/ultrareview.js` has -- that script edits
+    # users' working trees, so an unwired check here would be the exact
+    # silent miss the module docstring's HOOK_EXACT_PATHS comment warns
+    # about, one surface over. Not ported from the pre-manifest hook
+    # scripts: this gate is new, added alongside the harness itself.
+    Gate(
+        name="ultrareview_workflow_self_test",
+        argv=("node", "scripts/test_ultrareview_workflow.mjs"),
+        phases=frozenset({PHASE_PRE_COMMIT, PHASE_PRE_PUSH}),
+        surfaces=frozenset({SURFACE_WORKFLOWS}),
         always=False,
     ),
 )
