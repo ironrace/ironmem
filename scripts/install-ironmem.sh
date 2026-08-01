@@ -283,6 +283,7 @@ install_skill_set() {
 
     if [[ ! -d "$target" ]]; then
       echo "    WARN: $target exists but is not a directory; leaving it unchanged" >&2
+      UNCHANGED_FILES+=("$harness skill $skill ($target) — target is not a directory; nothing installed")
       continue
     fi
 
@@ -488,6 +489,7 @@ install_ext_set() {
 
   if [[ -e "$target_root" && ! -d "$target_root" ]]; then
     echo "WARN: $label target $target_root exists but is not a directory; leaving it unchanged" >&2
+    UNCHANGED_FILES+=("$label set ($target_root) — target is not a directory; nothing installed for this kind")
     return
   fi
 

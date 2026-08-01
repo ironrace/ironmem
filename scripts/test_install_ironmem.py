@@ -338,11 +338,18 @@ class InstallIronmemSelfTest(unittest.TestCase):
 
             self.run_installer(home, home / ".claude.json", skip_skills=False, extra_env=env)
 
-            self.assertIn(
-                "the user's own edit",
+            # Exact equality, not a substring check: git merge-file's conflict
+            # draft embeds the local side verbatim inside a <<<<<<< block, so
+            # a naive assertIn("the user's own edit", ...) would still pass
+            # even if the local file got clobbered with that draft. The
+            # conflict-marker check below pins the same thing from the other
+            # direction.
+            self.assertEqual(
                 installed.read_text(encoding="utf-8"),
+                "".join(local_edit),
                 "a merge conflict must never touch the local file",
             )
+            self.assertNotIn("<<<<<<<", installed.read_text(encoding="utf-8"))
             conflict_sidecar = installed.parent / (installed.name + ".ironmem-merge-conflict")
             packaged_sidecar = installed.parent / (installed.name + ".ironmem-packaged")
             self.assertTrue(conflict_sidecar.is_file(), "no merge-conflict sidecar was written")
@@ -369,6 +376,32 @@ class InstallIronmemSelfTest(unittest.TestCase):
             )
             packaged_sidecar = theirs.parent / (theirs.name + ".ironmem-packaged")
             self.assertTrue(packaged_sidecar.is_file(), "no packaged sidecar was written")
+
+    def test_non_directory_target_root_skips_the_kind_and_is_reported(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            home = pathlib.Path(directory)
+            env = self._full_install_env(home)
+            workflows_target = pathlib.Path(env["CLAUDE_WORKFLOWS_DIR"])
+            workflows_target.parent.mkdir(parents=True)
+            workflows_target.write_text("obstruction -- not a directory\n", encoding="utf-8")
+
+            result = self.run_installer(
+                home, home / ".claude.json", skip_skills=False, extra_env=env
+            )
+
+            self.assertTrue(
+                workflows_target.is_file(),
+                "an obstructing file must be left alone, not replaced with a directory",
+            )
+            self.assertEqual(
+                workflows_target.read_text(encoding="utf-8"), "obstruction -- not a directory\n"
+            )
+            self.assertIn(
+                "target is not a directory; nothing installed for this kind",
+                result.stdout,
+                "a skipped kind must be named in the end-of-run summary, not just a buried WARN",
+            )
+            self.assertIn("Claude workflow set", result.stdout)
 
     def test_superseded_skill_is_removed_when_a_base_snapshot_proves_ours(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
