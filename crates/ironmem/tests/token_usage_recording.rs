@@ -288,6 +288,7 @@ fn seed_collab_session(app: &App, sid: &str) {
                 "main",
                 None,
                 ironmem::collab::Agent::Claude,
+                ironmem::collab::Agent::Claude,
             )
         })
         .expect("seed_collab_session must succeed");

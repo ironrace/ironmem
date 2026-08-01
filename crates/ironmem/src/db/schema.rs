@@ -471,6 +471,29 @@ mod tests {
         (dir, db_path)
     }
 
+    /// Insert a `collab_sessions` row using only the pre-019 column set (no
+    /// `pilot`). `queue::create_session` cannot be used by the legacy-row
+    /// migration tests below because it now always writes `pilot`
+    /// (migration 019), which does not exist on the pinned pre-v19 schemas
+    /// (`open_at_v8`/`open_at_v13`/`open_at_v14`/`open_at_v15`/`open_at_v18`)
+    /// those tests deliberately construct to verify migration preserves
+    /// legacy rows.
+    fn insert_legacy_collab_session_pre_pilot(
+        conn: &rusqlite::Connection,
+        id: &str,
+        repo_path: &str,
+        branch: &str,
+        task: Option<&str>,
+        implementer: &str,
+    ) {
+        conn.execute(
+            "INSERT INTO collab_sessions (id, repo_path, branch, task, implementer)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            rusqlite::params![id, repo_path, branch, task, implementer],
+        )
+        .unwrap();
+    }
+
     #[test]
     fn latest_schema_version_matches_highest_migration() {
         // The exported constant must track the highest migration a fresh,
@@ -848,15 +871,14 @@ mod tests {
     #[test]
     fn test_v8_to_v9_upgrade_preserves_existing_collab_sessions_with_null_plan_drawer_ids() {
         let db = open_at_v8();
-        crate::collab::queue::create_session(
+        insert_legacy_collab_session_pre_pilot(
             &db.conn,
             "legacy-session",
             "/repo",
             "main",
             Some("legacy task"),
-            crate::collab::Agent::Claude,
-        )
-        .unwrap();
+            "claude",
+        );
 
         db.migrate().unwrap();
 
@@ -1294,15 +1316,14 @@ mod tests {
             "token_usage.tool_name should not exist at v13"
         );
 
-        crate::collab::queue::create_session(
+        insert_legacy_collab_session_pre_pilot(
             &db.conn,
             "legacy-v13-session",
             "/repo",
             "main",
             Some("legacy task"),
-            crate::collab::Agent::Claude,
-        )
-        .unwrap();
+            "claude",
+        );
         db.conn
             .execute(
                 "INSERT INTO token_usage
@@ -1371,15 +1392,14 @@ mod tests {
             );
         }
 
-        crate::collab::queue::create_session(
+        insert_legacy_collab_session_pre_pilot(
             &db.conn,
             "legacy-v14-session",
             "/repo",
             "main",
             Some("legacy task"),
-            crate::collab::Agent::Codex,
-        )
-        .unwrap();
+            "codex",
+        );
 
         db.migrate().unwrap();
         assert_eq!(schema_version_of(&db), LATEST_SCHEMA_VERSION);
@@ -1433,15 +1453,14 @@ mod tests {
             "drawer_id should not exist at v15"
         );
 
-        crate::collab::queue::create_session(
+        insert_legacy_collab_session_pre_pilot(
             &db.conn,
             "legacy-v15-message-session",
             "/repo",
             "main",
             None,
-            crate::collab::Agent::Claude,
-        )
-        .unwrap();
+            "claude",
+        );
         db.conn
             .execute(
                 "INSERT INTO messages (id, session_id, sender, receiver, topic, content)
@@ -1556,15 +1575,14 @@ mod tests {
             "pilot should not exist at v18"
         );
 
-        crate::collab::queue::create_session(
+        insert_legacy_collab_session_pre_pilot(
             &db.conn,
             "legacy-v18-session",
             "/repo",
             "main",
             Some("legacy task"),
-            crate::collab::Agent::Claude,
-        )
-        .unwrap();
+            "claude",
+        );
 
         db.migrate().unwrap();
         assert_eq!(schema_version_of(&db), LATEST_SCHEMA_VERSION);

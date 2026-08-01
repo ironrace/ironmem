@@ -2,6 +2,7 @@
 
 use super::agent::Agent;
 use super::phase::Phase;
+use super::state_machine::counterpart;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CollabSession {
@@ -37,6 +38,20 @@ pub struct CollabSession {
     pub last_head_sha: Option<String>,
     pub pr_url: Option<String>,
     pub coding_failure: Option<String>,
+    /// Which agent is *lead* for this session — one of the four
+    /// collab-protocol role knobs: *dispatcher* (the terminal driving the
+    /// session; always `Agent::Claude` in this codebase, not modeled as a
+    /// field), *pilot* (this field — submits `canonical`/`final`/
+    /// `task_list`), *copilot* (`counterpart(pilot)`, the other agent —
+    /// submits the draft `review` and `review_fix_global`; derived on the
+    /// fly and never stored, so there is no `copilot` field), and
+    /// *implementer* (below — who writes code). `pilot` is orthogonal to
+    /// `implementer` and is deliberately NOT validated against it: a
+    /// session can have `pilot=claude` with `implementer=codex` or any
+    /// other combination. Defaults to `Agent::Claude`. The DB CHECK
+    /// constraint (migration 019) enforces the allowed set as
+    /// defense-in-depth against direct SQL writes.
+    pub pilot: Agent,
     /// Which agent runs the v3 batch implementation phase. `Agent::Claude`
     /// (the default) keeps the historical flow where Claude orchestrates
     /// per-task subagents inline. `Agent::Codex` routes
@@ -128,11 +143,21 @@ impl CollabSession {
     }
 
     /// Construct a fresh planning-stage session with an explicit
-    /// `implementer`. Used by tests and any caller that wants the
-    /// non-default `Agent::Codex` batch ownership; production code should
-    /// go through `collab_start` (which validates and persists the
-    /// implementer at INSERT time).
+    /// `implementer`, defaulting `pilot` to `Agent::Claude`. Used by tests
+    /// and any caller that wants the non-default `Agent::Codex` batch
+    /// ownership; production code should go through `collab_start` (which
+    /// validates and persists the implementer at INSERT time). Thin
+    /// wrapper over `new_with_roles` kept so existing call sites compile
+    /// unchanged.
     pub fn new_with_implementer(id: impl Into<String>, implementer: Agent) -> Self {
+        Self::new_with_roles(id, Agent::Claude, implementer)
+    }
+
+    /// Construct a fresh planning-stage session with explicit `pilot` and
+    /// `implementer` roles. See the `pilot` field doc comment for the
+    /// four-knob role vocabulary; `implementer` is orthogonal to `pilot`
+    /// and not validated against it.
+    pub fn new_with_roles(id: impl Into<String>, pilot: Agent, implementer: Agent) -> Self {
         Self {
             id: id.into(),
             phase: Phase::PlanParallelDrafts,
@@ -153,6 +178,7 @@ impl CollabSession {
             last_head_sha: None,
             pr_url: None,
             coding_failure: None,
+            pilot,
             implementer,
             pending_failure: None,
             failed_from_phase: None,
@@ -167,25 +193,28 @@ impl CollabSession {
     /// Construct a session pre-positioned at the v3 global-review stage.
     /// Used by the coding-review shortcut (`collab_start_code_review`) for
     /// orchestrators that already completed per-task coding via `iron-build`.
-    /// The shortcut seeds Codex's `CodeReviewFixGlobalPending` turn
-    /// directly — `head_sha` is supplied
+    /// The shortcut seeds the *copilot*'s (`counterpart(pilot)`)
+    /// `CodeReviewFixGlobalPending` turn directly — `head_sha` is supplied
     /// here instead of via an `implementation_done` send. From there the
-    /// flow follows the canonical v3 order: Codex `review_fix_global` →
-    /// Claude `review_local` (audit of Codex's commits via
-    /// `/ultrareview-local`) → Claude `final_review` (PR creation).
-    /// `implementer` is fixed at `Agent::Claude` because the shortcut never
-    /// enters `CodeImplementPending`; the field is preserved only so the
-    /// session record shape stays uniform with full-flow sessions.
+    /// flow follows the canonical v3 order: copilot `review_fix_global` →
+    /// pilot `review_local` (audit of the copilot's commits via
+    /// `/ultrareview-local`) → pilot `final_review` (PR creation).
+    /// `implementer` is set equal to `pilot` (rather than fixed at
+    /// `Agent::Claude`) because the shortcut never enters
+    /// `CodeImplementPending` itself, so there is no independent
+    /// implementation-agent choice to record — the field simply mirrors
+    /// whichever agent is leading this session.
     pub fn new_global_review(
         id: impl Into<String>,
         base_sha: impl Into<String>,
         head_sha: impl Into<String>,
+        pilot: Agent,
     ) -> Self {
         let head = head_sha.into();
         Self {
             id: id.into(),
             phase: Phase::CodeReviewFixGlobalPending,
-            current_owner: Agent::Codex,
+            current_owner: counterpart(pilot),
             claude_draft_hash: None,
             codex_draft_hash: None,
             canonical_plan_hash: None,
@@ -202,7 +231,8 @@ impl CollabSession {
             last_head_sha: Some(head),
             pr_url: None,
             coding_failure: None,
-            implementer: Agent::Claude,
+            pilot,
+            implementer: pilot,
             pending_failure: None,
             failed_from_phase: None,
             recovery_phase: None,

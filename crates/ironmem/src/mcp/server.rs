@@ -2162,6 +2162,7 @@ mod tests {
                     "main",
                     Some("task"),
                     crate::collab::Agent::Claude,
+                    crate::collab::Agent::Claude,
                 )
             })
             .unwrap();
@@ -2227,6 +2228,7 @@ mod tests {
                     "/tmp/repo",
                     "main",
                     None,
+                    crate::collab::Agent::Claude,
                     crate::collab::Agent::Claude,
                 )
             })
@@ -2898,6 +2900,7 @@ mod tests {
                     "main",
                     Some("task"),
                     crate::collab::Agent::Claude,
+                    crate::collab::Agent::Claude,
                 )
             })
             .unwrap();
@@ -2956,6 +2959,7 @@ mod tests {
                         "main",
                         Some("task"),
                         crate::collab::Agent::Codex,
+                        crate::collab::Agent::Claude,
                     )?;
                     crate::collab::queue::set_implementer(
                         tx,
@@ -3169,6 +3173,7 @@ mod tests {
                     "/repo",
                     "main",
                     Some("task"),
+                    crate::collab::Agent::Claude,
                     crate::collab::Agent::Claude,
                 )
             })

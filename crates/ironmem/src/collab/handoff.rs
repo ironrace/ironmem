@@ -275,6 +275,13 @@ mod tests {
         include_str!("../../migrations/009_collab_plan_drawers.sql");
     const COLLAB_GENERATION_LEASE_SQL: &str =
         include_str!("../../migrations/010_collab_generation_lease.sql");
+    // `create_session` now writes `pilot` (migration 019) on every insert.
+    // This fixture stops its migration replay at 010 for everything else
+    // (handoff logic under test doesn't touch anything past it), but the
+    // `pilot` column must exist for `create_session` to succeed. The ALTER
+    // TABLE in 019 only depends on `collab_sessions` (created in 003), so
+    // it's safe to apply out of numeric sequence relative to 011-018.
+    const COLLAB_PILOT_SQL: &str = include_str!("../../migrations/019_collab_pilot.sql");
 
     fn open() -> Connection {
         let conn = Connection::open_in_memory().unwrap();
@@ -288,11 +295,12 @@ mod tests {
         conn.execute_batch(DROP_CURRENT_TASK_INDEX_SQL).unwrap();
         conn.execute_batch(COLLAB_PLAN_DRAWERS_SQL).unwrap();
         conn.execute_batch(COLLAB_GENERATION_LEASE_SQL).unwrap();
+        conn.execute_batch(COLLAB_PILOT_SQL).unwrap();
         conn
     }
 
     fn seed_session(conn: &Connection, id: &str) {
-        create_session(conn, id, "/repo", "main", Some("t"), Agent::Claude).unwrap();
+        create_session(conn, id, "/repo", "main", Some("t"), Agent::Claude, Agent::Claude).unwrap();
     }
 
     #[test]

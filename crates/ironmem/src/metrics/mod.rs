@@ -630,6 +630,7 @@ mod tests {
                     branch,
                     None,
                     crate::collab::Agent::Claude,
+                    crate::collab::Agent::Claude,
                 )
             })
             .unwrap();

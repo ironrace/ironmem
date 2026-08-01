@@ -551,6 +551,9 @@ pub(super) fn handle_collab_start(app: &App, args: &Value) -> Result<Value, Memo
             )));
         }
         ensure_no_conflicting_process_session_tx(app, tx, &session_id, repo_path, branch)?;
+        // No MCP-level `pilot` argument exists yet (a later task in this
+        // plan adds one); default to `Agent::Claude` here to preserve
+        // today's behavior unchanged.
         crate::collab::queue::create_session(
             tx,
             &session_id,
@@ -558,6 +561,7 @@ pub(super) fn handle_collab_start(app: &App, args: &Value) -> Result<Value, Memo
             branch,
             task,
             implementer,
+            Agent::Claude,
         )?;
         crate::db::schema::Database::wal_log_tx(
             tx,
@@ -685,12 +689,16 @@ pub(super) fn handle_collab_start_code_review(
         ensure_no_conflicting_process_session_tx(app, tx, &session_id, repo_path, branch)?;
         // Shortcut sessions never enter `CodeImplementPending`, so the
         // `implementer` field is fixed at `Agent::Claude` for uniformity.
+        // `pilot` is likewise fixed here (see `start_global_review_session`);
+        // the immediately-following `save_session(tx, &session)` overwrites
+        // both with `session`'s actual values regardless.
         crate::collab::queue::create_session(
             tx,
             &session_id,
             repo_path,
             branch,
             Some(task),
+            Agent::Claude,
             Agent::Claude,
         )?;
         crate::collab::queue::save_session(tx, &session)?;
@@ -2294,6 +2302,7 @@ mod tests {
                     "other-branch",
                     None,
                     crate::collab::Agent::Claude,
+                    crate::collab::Agent::Claude,
                 )
             })
             .unwrap();
@@ -2466,6 +2475,7 @@ mod tests {
                     "/tmp/other-repo",
                     "other-branch",
                     None,
+                    crate::collab::Agent::Claude,
                     crate::collab::Agent::Claude,
                 )
             })

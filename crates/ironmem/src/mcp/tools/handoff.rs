@@ -427,7 +427,7 @@ mod tests {
         let sid = uuid::Uuid::new_v4().to_string();
         app.db
             .with_transaction(|tx| {
-                create_session(tx, &sid, "/repo", "main", Some("task"), Agent::Claude)
+                create_session(tx, &sid, "/repo", "main", Some("task"), Agent::Claude, Agent::Claude)
             })
             .unwrap();
         sid
@@ -450,6 +450,7 @@ mod tests {
                     "/repo",
                     "main",
                     Some("t"),
+                    Agent::Claude,
                     Agent::Claude,
                 )
             })
@@ -488,6 +489,7 @@ mod tests {
                     "/repo",
                     "main",
                     Some("t"),
+                    Agent::Claude,
                     Agent::Claude,
                 )
             })
@@ -983,6 +985,7 @@ gates: passed\n";
                         "/repo",
                         "main",
                         Some("t"),
+                        Agent::Claude,
                         Agent::Claude,
                     )
                 })

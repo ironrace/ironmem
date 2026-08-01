@@ -22,7 +22,16 @@ pub fn start_global_review_session(
     if head_sha.is_empty() {
         return Err(CollabError::MissingHeadSha);
     }
-    Ok(CollabSession::new_global_review(id, base_sha, head_sha))
+    // The MCP layer (`handle_collab_start_code_review`) currently rejects
+    // any `initiator` other than `Agent::Claude`, so `pilot` is pinned here
+    // to preserve that existing behavior; a future task can thread a real
+    // `pilot` argument through once the MCP surface accepts one.
+    Ok(CollabSession::new_global_review(
+        id,
+        base_sha,
+        head_sha,
+        Agent::Claude,
+    ))
 }
 
 /// Maximum number of review cycles Codex may run on the canonical plan.
@@ -78,7 +87,11 @@ fn require_actor(actor: Agent, expected: Agent) -> Result<(), CollabError> {
 /// The other agent in the two-party collab protocol. Used to flip
 /// `current_owner`/`recovery_owner` to the counterpart of whichever agent
 /// reported a recoverable ("tooling") failure.
-fn counterpart(agent: Agent) -> Agent {
+///
+/// `pub(super)` so `session::new_global_review` (a sibling module under
+/// `collab`) can derive `current_owner` from a `pilot` argument without
+/// reimplementing the same flip logic.
+pub(super) fn counterpart(agent: Agent) -> Agent {
     match agent {
         Agent::Claude => Agent::Codex,
         Agent::Codex => Agent::Claude,

@@ -11,8 +11,18 @@ impl Database {
         branch: &str,
         task: Option<&str>,
         implementer: Agent,
+        pilot: Agent,
     ) -> Result<(), MemoryError> {
-        queue::create_session(&self.conn, id, repo_path, branch, task, implementer)
+        queue::create_session(&self.conn, id, repo_path, branch, task, implementer, pilot)
+    }
+
+    pub fn collab_set_pilot(
+        &self,
+        session_id: &str,
+        pilot: Agent,
+        current_owner: Option<Agent>,
+    ) -> Result<(), MemoryError> {
+        queue::set_pilot(&self.conn, session_id, pilot, current_owner)
     }
 
     pub fn collab_end_session(&self, session_id: &str) -> Result<(), MemoryError> {
@@ -116,7 +126,7 @@ mod tests {
     #[test]
     fn collab_send_message_rejects_a_dangling_drawer_ref() {
         let db = Database::open_in_memory().unwrap();
-        db.collab_create_session("session", "/repo", "main", None, Agent::Claude)
+        db.collab_create_session("session", "/repo", "main", None, Agent::Claude, Agent::Claude)
             .unwrap();
 
         let err = db

@@ -2403,6 +2403,7 @@ mod tests {
                     branch,
                     None,
                     crate::collab::Agent::Claude,
+                    crate::collab::Agent::Claude,
                 )
             })
             .unwrap();
@@ -2513,6 +2514,7 @@ mod tests {
                     repo.as_ref(),
                     "main",
                     None,
+                    crate::collab::Agent::Claude,
                     crate::collab::Agent::Claude,
                 )
             })
@@ -4207,6 +4209,7 @@ mod tests {
                     repo_path,
                     "main",
                     None,
+                    crate::collab::Agent::Claude,
                     crate::collab::Agent::Claude,
                 )
             })
