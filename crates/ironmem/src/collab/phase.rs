@@ -45,10 +45,7 @@ const PHASE_NAMES: &[(Phase, &str)] = &[
     (Phase::PlanParallelDrafts, "PlanParallelDrafts"),
     (Phase::PlanSynthesisPending, "PlanSynthesisPending"),
     (Phase::PlanCopilotReviewPending, "PlanCodexReviewPending"),
-    (
-        Phase::PlanFinalizePending,
-        "PlanClaudeFinalizePending",
-    ),
+    (Phase::PlanFinalizePending, "PlanClaudeFinalizePending"),
     (Phase::PlanLocked, "PlanLocked"),
     (Phase::CodeImplementPending, "CodeImplementPending"),
     (Phase::CodeReviewLocalPending, "CodeReviewLocalPending"),
