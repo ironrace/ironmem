@@ -40,11 +40,14 @@ TARGETS = {
 
 GENERATED_HEADER = "<!-- GENERATED from skills/ — do not edit -->"
 
-# Skills this repo does not install. `install-ironmem.sh` lists the same names
-# in LEGACY_SHARED_SKILLS and *deletes* them on upgrade, so a prompt that names
-# one resolves to nothing on a standalone install and the worker silently
-# freelances the step instead of failing loudly. Canonical list: consumed by
-# test_sync_skills.py for the generated skill tree and by
+# Skills this repo does not install, so a prompt that names one resolves to
+# nothing on a standalone install and the worker silently freelances the step
+# instead of failing loudly. Two ways a name lands here: most are also in
+# `install-ironmem.sh`'s LEGACY_SHARED_SKILLS, which *deletes* them on upgrade;
+# the rest (`superpowers`, `brainstorming`, `git-worktree-manager`,
+# `worktree_cleanup`) are simply never installed and have no removal entry. The
+# two lists are deliberately not coupled — do not "resync" them. Canonical list:
+# consumed by test_sync_skills.py for the generated skill tree and by
 # check_collab_turn_templates.py for the prompt/command/doc surface, so the
 # denylist cannot drift between the two gates.
 #
