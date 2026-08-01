@@ -384,12 +384,23 @@ pub fn tool_definitions(app: &App) -> Vec<Value> {
         }),
         json!({
             "name": "collab_approve",
-            "description": "Codex-only shortcut for submitting an approve review",
+            // "Copilot" rather than "Codex": the approver is
+            // `copilot(session)` — the agent that is not the session's pilot,
+            // so Codex under the default `pilot=claude` and Claude under
+            // `pilot=codex`. Kept to one line: the listing is under a hard
+            // whole-listing token budget (see
+            // `tool_listing_stays_within_prompt_cache_schema_budget`).
+            "description": "Copilot-only shortcut for submitting an approve review",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "session_id": { "type": "string" },
-                    "agent": { "type": "string", "enum": ["codex"] },
+                    // Both agents are advertised because the accepted one is
+                    // session-dependent (`copilot(session)`), which a static
+                    // schema cannot express. `handle_collab_approve` does the
+                    // real narrowing; a one-value enum here would block the
+                    // legitimate pilot=codex caller.
+                    "agent": { "type": "string", "enum": ["claude", "codex"] },
                     "content_hash": { "type": "string" },
                     "handoff_token": { "type": "string" }
                 },
