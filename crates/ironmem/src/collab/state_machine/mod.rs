@@ -271,10 +271,10 @@ pub fn apply_event(
         (Phase::PlanSynthesisPending, CollabEvent::PublishCanonical { content_hash }) => {
             require_actor(actor, Agent::Claude)?;
             next.canonical_plan_hash = Some(content_hash.clone());
-            next.phase = Phase::PlanCodexReviewPending;
+            next.phase = Phase::PlanCopilotReviewPending;
             next.current_owner = Agent::Codex;
         }
-        (Phase::PlanCodexReviewPending, CollabEvent::SubmitReview { verdict }) => {
+        (Phase::PlanCopilotReviewPending, CollabEvent::SubmitReview { verdict }) => {
             require_actor(actor, Agent::Codex)?;
             if !matches!(
                 verdict.as_str(),
@@ -295,10 +295,10 @@ pub fn apply_event(
             // Codex gets exactly one review pass. Any requested changes are
             // folded into Claude's final execution-ready task plan; planning
             // never re-enters synthesis.
-            next.phase = Phase::PlanClaudeFinalizePending;
+            next.phase = Phase::PlanFinalizePending;
             next.current_owner = Agent::Claude;
         }
-        (Phase::PlanClaudeFinalizePending, CollabEvent::PublishFinal { content_hash }) => {
+        (Phase::PlanFinalizePending, CollabEvent::PublishFinal { content_hash }) => {
             require_actor(actor, Agent::Claude)?;
             next.final_plan_hash = Some(content_hash.clone());
             next.phase = Phase::PlanLocked;

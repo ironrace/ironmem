@@ -730,7 +730,7 @@ gates: passed\n";
         use crate::collab::Phase::*;
         for phase in [
             PlanParallelDrafts,
-            PlanCodexReviewPending,
+            PlanCopilotReviewPending,
             PlanLocked,
             CodeImplementPending,
             CodeReviewFixGlobalPending,

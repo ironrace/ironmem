@@ -186,7 +186,7 @@ fn test_codex_review_approve_advances_to_finalize() {
         let s = draft(Agent::Codex, "c2", &s);
         let s = canonical("canonical", &s);
         let s = review(verdict, &s);
-        assert_eq!(s.phase, Phase::PlanClaudeFinalizePending);
+        assert_eq!(s.phase, Phase::PlanFinalizePending);
         assert_eq!(s.codex_review_verdict.as_deref(), Some(verdict));
         assert_eq!(s.review_round, 1);
     }
@@ -201,7 +201,7 @@ fn test_request_changes_after_one_review_advances_to_finalize() {
     let s = review("request_changes", &s);
 
     assert_eq!(s.review_round, MAX_REVIEW_ROUNDS);
-    assert_eq!(s.phase, Phase::PlanClaudeFinalizePending);
+    assert_eq!(s.phase, Phase::PlanFinalizePending);
 }
 
 #[test]
@@ -705,7 +705,7 @@ fn test_v1_one_pass_review_cap_survives_v3_reorder() {
     let s = canonical("v1", &s);
     let s = review("request_changes", &s);
 
-    assert_eq!(s.phase, Phase::PlanClaudeFinalizePending);
+    assert_eq!(s.phase, Phase::PlanFinalizePending);
     assert_eq!(s.review_round, MAX_REVIEW_ROUNDS);
 }
 

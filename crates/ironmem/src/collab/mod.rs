@@ -8,7 +8,7 @@
 //! for collab protocol roles; harness-generic code uses `HarnessId` instead.
 //!
 //! v1 covers planning: `PlanParallelDrafts` → `PlanSynthesisPending`
-//! → `PlanCodexReviewPending` → `PlanClaudeFinalizePending` → `PlanLocked`.
+//! → `PlanCopilotReviewPending` → `PlanFinalizePending` → `PlanLocked`.
 //!
 //! v3 extends `PlanLocked` with a human-approved coding loop. A single
 //! Claude `task_list` send transitions out of `PlanLocked` into the batch

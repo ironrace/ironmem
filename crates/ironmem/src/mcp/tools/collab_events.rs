@@ -69,15 +69,15 @@ pub(super) fn build_v1_review_event(content: &str) -> Result<CollabEvent, Memory
 /// by v3 per-task `CodeFinal`), but v3 batch mode removed that path entirely.
 /// Topic dispatch now emits `PublishFinal` unconditionally; we keep an
 /// explicit early-out guard here so a caller sending `final` outside
-/// `PlanClaudeFinalizePending` gets a clear "expected phase" message
+/// `PlanFinalizePending` gets a clear "expected phase" message
 /// rather than a generic `WrongPhase` from the state machine.
 pub(super) fn build_v1_final_event(
     content: &str,
     phase: Phase,
 ) -> Result<CollabEvent, MemoryError> {
-    if !matches!(phase, Phase::PlanClaudeFinalizePending) {
+    if !matches!(phase, Phase::PlanFinalizePending) {
         return Err(MemoryError::Validation(format!(
-            "topic 'final' is only accepted in PlanClaudeFinalizePending; current phase is {phase}"
+            "topic 'final' is only accepted in PlanFinalizePending; current phase is {phase}"
         )));
     }
     let plan = parse_final_payload(content)?;

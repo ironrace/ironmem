@@ -6,8 +6,8 @@ pub enum Phase {
     // Planning (v1)
     PlanParallelDrafts,
     PlanSynthesisPending,
-    PlanCodexReviewPending,
-    PlanClaudeFinalizePending,
+    PlanCopilotReviewPending,
+    PlanFinalizePending,
     PlanLocked,
     // Coding (v3) — batch implementation. The selected implementer
     // orchestrates per-task subagents (via `iron-build`, or directly when
@@ -44,9 +44,9 @@ pub enum Phase {
 const PHASE_NAMES: &[(Phase, &str)] = &[
     (Phase::PlanParallelDrafts, "PlanParallelDrafts"),
     (Phase::PlanSynthesisPending, "PlanSynthesisPending"),
-    (Phase::PlanCodexReviewPending, "PlanCodexReviewPending"),
+    (Phase::PlanCopilotReviewPending, "PlanCodexReviewPending"),
     (
-        Phase::PlanClaudeFinalizePending,
+        Phase::PlanFinalizePending,
         "PlanClaudeFinalizePending",
     ),
     (Phase::PlanLocked, "PlanLocked"),
@@ -105,8 +105,8 @@ impl Phase {
         match self {
             Self::PlanParallelDrafts => "SubmitDraft",
             Self::PlanSynthesisPending => "PublishCanonical",
-            Self::PlanCodexReviewPending => "SubmitReview",
-            Self::PlanClaudeFinalizePending => "PublishFinal",
+            Self::PlanCopilotReviewPending => "SubmitReview",
+            Self::PlanFinalizePending => "PublishFinal",
             Self::PlanLocked => "SubmitTaskList",
             Self::CodeImplementPending => "ImplementationDone",
             Self::CodeReviewLocalPending => "ReviewLocal",
@@ -145,5 +145,58 @@ impl TryFrom<&str> for Phase {
 
     fn try_from(value: &str) -> Result<Self, Self::Error> {
         value.parse()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_renamed_plan_copilot_review_pending() {
+        // Verify that the renamed variant still serializes to the original wire string
+        let phase = Phase::PlanCopilotReviewPending;
+        assert_eq!(phase.to_string(), "PlanCodexReviewPending");
+    }
+
+    #[test]
+    fn test_renamed_plan_finalize_pending() {
+        // Verify that the renamed variant still serializes to the original wire string
+        let phase = Phase::PlanFinalizePending;
+        assert_eq!(phase.to_string(), "PlanClaudeFinalizePending");
+    }
+
+    #[test]
+    fn test_parse_plan_codex_review_pending() {
+        // Verify that parsing the original wire string produces the renamed variant
+        let phase: Phase = "PlanCodexReviewPending".parse().expect("parse failed");
+        assert_eq!(phase, Phase::PlanCopilotReviewPending);
+    }
+
+    #[test]
+    fn test_parse_plan_claude_finalize_pending() {
+        // Verify that parsing the original wire string produces the renamed variant
+        let phase: Phase = "PlanClaudeFinalizePending".parse().expect("parse failed");
+        assert_eq!(phase, Phase::PlanFinalizePending);
+    }
+
+    #[test]
+    fn test_all_phases_round_trip() {
+        // Verify that all phases round-trip: to_string and back to parse produces the same variant
+        for (phase, expected_str) in PHASE_NAMES {
+            let as_string = phase.to_string();
+            assert_eq!(
+                &as_string, expected_str,
+                "Phase {:?} serializes to {}, expected {}",
+                phase, as_string, expected_str
+            );
+
+            let parsed: Phase = as_string.parse().expect("parse failed");
+            assert_eq!(
+                parsed, *phase,
+                "Round-trip failed for phase {:?}: got {:?} after parsing {}",
+                phase, parsed, as_string
+            );
+        }
     }
 }

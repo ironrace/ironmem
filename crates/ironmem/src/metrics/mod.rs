@@ -60,8 +60,8 @@ pub(crate) fn phase_bucket(phase: Phase) -> &'static str {
     match phase {
         Phase::PlanParallelDrafts
         | Phase::PlanSynthesisPending
-        | Phase::PlanCodexReviewPending
-        | Phase::PlanClaudeFinalizePending
+        | Phase::PlanCopilotReviewPending
+        | Phase::PlanFinalizePending
         | Phase::PlanLocked => "planning",
         Phase::CodeImplementPending => "impl",
         Phase::CodeReviewLocalPending | Phase::CodeReviewFinalPending => "review",
@@ -466,8 +466,8 @@ mod tests {
         // METRICS_SPEC §3.2 table, pinned variant-by-variant.
         assert_eq!(phase_bucket(Phase::PlanParallelDrafts), "planning");
         assert_eq!(phase_bucket(Phase::PlanSynthesisPending), "planning");
-        assert_eq!(phase_bucket(Phase::PlanCodexReviewPending), "planning");
-        assert_eq!(phase_bucket(Phase::PlanClaudeFinalizePending), "planning");
+        assert_eq!(phase_bucket(Phase::PlanCopilotReviewPending), "planning");
+        assert_eq!(phase_bucket(Phase::PlanFinalizePending), "planning");
         assert_eq!(phase_bucket(Phase::PlanLocked), "planning");
         assert_eq!(phase_bucket(Phase::CodeImplementPending), "impl");
         assert_eq!(phase_bucket(Phase::CodeReviewLocalPending), "review");

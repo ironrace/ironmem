@@ -607,8 +607,8 @@ pub(super) fn handle_collab_set_implementer(app: &App, args: &Value) -> Result<V
         let can_change = match record.session.phase {
             Phase::PlanParallelDrafts
             | Phase::PlanSynthesisPending
-            | Phase::PlanCodexReviewPending
-            | Phase::PlanClaudeFinalizePending
+            | Phase::PlanCopilotReviewPending
+            | Phase::PlanFinalizePending
             | Phase::PlanLocked => record.session.task_list.is_none(),
             Phase::CodeImplementPending => true,
             Phase::CodeReviewFixGlobalPending
@@ -2588,7 +2588,7 @@ mod tests {
     fn request_changes_advances_to_finalize_and_rejects_canonical_resend() {
         // One-pass planning review (MAX_REVIEW_ROUNDS = 1): a `request_changes`
         // verdict no longer returns to synthesis. It advances to
-        // PlanClaudeFinalizePending, where Codex's requested changes are folded
+        // PlanFinalizePending, where Codex's requested changes are folded
         // into the `final` plan — there is no second canonical round. So a
         // canonical re-send after review is rejected (the phase now expects
         // `final`), and the canonical drawer id stays pinned to the single v1 body.
