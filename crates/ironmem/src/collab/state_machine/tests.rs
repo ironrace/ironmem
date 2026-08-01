@@ -2328,6 +2328,11 @@ fn pilot_claude_publish_final_accepted() {
     )
     .unwrap();
     assert_eq!(s.phase, Phase::PlanLocked);
+    // `PublishFinal` never mutates `current_owner`; it stays whatever
+    // `SubmitReview` left it at (`Agent::Claude`). Asserted explicitly so a
+    // future regression that starts mutating ownership in this arm doesn't
+    // slip past this pinning test undetected.
+    assert_eq!(s.current_owner, Agent::Claude);
     assert_eq!(s.final_plan_hash.as_deref(), Some("final-hash"));
 }
 
