@@ -670,7 +670,10 @@ pub(super) fn handle_collab_start_code_review(
     }
     let task = sanitize::sanitize_content(require_str(args, "task")?, MAX_COLLAB_CONTENT_CHARS)?;
     let session_id = uuid::Uuid::new_v4().to_string();
-    let session = start_global_review_session(&session_id, base_sha, head_sha)
+    // `initiator` is already constrained to `Agent::Claude` above, so the
+    // pilot passed here is that same fixed choice; this surface gains a real
+    // pilot selection in a later task.
+    let session = start_global_review_session(&session_id, base_sha, head_sha, Agent::Claude)
         .map_err(collab_error_to_memory_error)?;
 
     app.db.with_transaction(|tx| {

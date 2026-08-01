@@ -15,12 +15,16 @@ pub enum Phase {
     // out is `implementation_done`, which jumps straight to global review.
     CodeImplementPending,
     // Coding (v3) — global review, 3-phase linear:
-    //   CodeReviewFixGlobalPending (Codex reads the raw post-implementation
-    //   diff and applies fixes directly; no Claude pre-clean)
-    //   → CodeReviewLocalPending (Claude audits Codex's commits via
+    //   CodeReviewFixGlobalPending (the copilot reads the raw
+    //   post-implementation diff and applies fixes directly; no pilot
+    //   pre-clean)
+    //   → CodeReviewLocalPending (the pilot audits the copilot's commits via
     //     `/ultrareview-local` and catches code-quality issues both agents
     //     missed)
-    //   → CodeReviewFinalPending (Claude opens the PR)
+    //   → CodeReviewFinalPending (the pilot opens the PR)
+    // "Pilot" is the session's `pilot` agent and "copilot" is its
+    // counterpart; the split is per-session, not a fixed Claude/Codex
+    // assignment.
     // Note: enum variants are listed in alphabetical/legacy order for
     // wire compatibility (`PHASE_NAMES` mapping); the transition order is
     // enforced by `state_machine::mod::apply_event`, not by variant order.
