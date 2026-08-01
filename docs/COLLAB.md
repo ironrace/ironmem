@@ -998,11 +998,8 @@ payloads bounded:
 
 ### `collab_approve`
 
-Copilot-only shortcut for an `approve` review. The approver is the session's
-copilot — the agent that is not its `pilot`, so Codex under the default
-`pilot=claude` and Claude under `pilot=codex`. Any other agent is rejected
-naming the one that may approve. Requires `content_hash` to match the stored
-`canonical_plan_hash`.
+Codex-only shortcut for an `approve` review. Requires `content_hash` to
+match the stored `canonical_plan_hash`.
 
 ### `collab_wait_my_turn` (long-poll)
 
