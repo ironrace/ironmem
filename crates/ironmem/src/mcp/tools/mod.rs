@@ -270,7 +270,7 @@ pub fn tool_definitions(app: &App) -> Vec<Value> {
         }),
         json!({
             "name": "collab_start",
-            "description": "Create a bounded Claude↔Codex planning session. task is visible in collab_status; implementer selects the coding owner.",
+            "description": "Create a bounded Claude↔Codex planning session. task is visible in collab_status; pilot picks the planning lead (default claude); implementer defaults to pilot.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -278,6 +278,7 @@ pub fn tool_definitions(app: &App) -> Vec<Value> {
                     "branch": { "type": "string" },
                     "initiator": { "type": "string", "enum": ["claude", "codex"] },
                     "task": { "type": "string" },
+                    "pilot": { "type": "string", "enum": ["claude", "codex"] },
                     "implementer": { "type": "string", "enum": ["claude", "codex"] }
                 },
                 "required": ["repo_path", "branch", "initiator"]

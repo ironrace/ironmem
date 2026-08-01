@@ -192,6 +192,7 @@ pub(super) fn compose_handoff_block(
     let _ = writeln!(out, "phase: {}", s.phase);
     let _ = writeln!(out, "current_owner: {}", s.current_owner.as_str());
     let _ = writeln!(out, "implementer: {}", s.implementer.as_str());
+    let _ = writeln!(out, "pilot: {}", s.pilot.as_str());
     let _ = writeln!(out, "repo_path: {}", record.repo_path);
     let _ = writeln!(out, "branch: {}", record.branch);
     let _ = writeln!(out, "base_sha: {}", opt(s.base_sha.as_deref()));
@@ -413,6 +414,17 @@ mod tests {
         assert!(a.contains("task_list.execution_mode: \u{2014}"));
         assert!(a.contains("handoff.agent: claude"));
         assert!(a.contains("handoff.generation: 1"));
+    }
+
+    /// A `pilot=codex` session must expose that pilot in the handoff block —
+    /// a successor picking up a reversed session has no other way to route
+    /// which agent leads planning.
+    #[test]
+    fn compose_block_reports_non_default_pilot() {
+        let mut r = sample_record(Phase::PlanParallelDrafts);
+        r.session.pilot = Agent::Codex;
+        let block = compose_handoff_block(&r, Agent::Claude, 1, None);
+        assert!(block.contains("pilot: codex"), "block was:\n{block}");
     }
 
     fn test_handoff_app() -> (Arc<crate::mcp::app::App>, tempfile::TempDir) {

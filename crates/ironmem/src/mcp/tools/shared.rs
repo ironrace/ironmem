@@ -65,6 +65,17 @@ pub(super) fn require_implementer(value: &str) -> Result<Agent, MemoryError> {
         .map_err(|_| MemoryError::Validation("implementer must be 'claude' or 'codex'".to_string()))
 }
 
+/// Thin wrapper around `require_agent` for the `pilot` field on
+/// `collab_start`. Same accept-set today, but isolates the input-validation
+/// site the same way `require_implementer` does, and the error text names
+/// the offending value so a caller/log reader can tell at a glance which
+/// field (`pilot` vs `implementer`) was rejected.
+pub(super) fn require_pilot(value: &str) -> Result<Agent, MemoryError> {
+    value.parse::<Agent>().map_err(|_| {
+        MemoryError::Validation(format!("pilot must be 'claude' or 'codex', got '{value}'"))
+    })
+}
+
 /// Return the other collab protocol role for the given sender.
 ///
 /// This is a **two-party collab helper**: it is only meaningful within the

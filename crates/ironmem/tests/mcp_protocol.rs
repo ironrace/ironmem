@@ -2241,6 +2241,64 @@ fn collab_start_rejects_invalid_implementer() {
 }
 
 #[test]
+fn collab_start_accepts_pilot_codex_and_defaults_implementer_to_pilot() {
+    // `pilot=codex` with `implementer` omitted must round-trip through
+    // `collab_status` as pilot=codex AND implementer=codex — implementer's
+    // default follows the resolved pilot, not the historical hardcoded
+    // `claude`.
+    let app = App::open_for_test().unwrap();
+    let started = call_tool(
+        &app,
+        "collab_start",
+        json!({
+            "repo_path": "/repo",
+            "branch": "main",
+            "initiator": "claude",
+            "pilot": "codex"
+        }),
+    );
+    assert_eq!(started["pilot"], "codex");
+    assert_eq!(started["implementer"], "codex");
+    let session_id = started["session_id"].as_str().unwrap();
+
+    let status = call_tool(&app, "collab_status", json!({ "session_id": session_id }));
+    assert_eq!(status["pilot"], "codex");
+    assert_eq!(status["implementer"], "codex");
+}
+
+#[test]
+fn collab_start_rejects_invalid_pilot_and_creates_no_session_row() {
+    let app = App::open_for_test().unwrap();
+    let err = call_tool_expect_error(
+        &app,
+        "collab_start",
+        json!({
+            "repo_path": "/repo",
+            "branch": "main",
+            "initiator": "claude",
+            "pilot": "gemini"
+        }),
+    );
+    assert!(
+        err.contains("pilot") && err.contains("gemini"),
+        "expected an error naming both the field and the bad value, got: {err}"
+    );
+
+    // Prove the rejection happened before any write, not merely that the
+    // call returned an error: query `collab_sessions` directly.
+    let count: i64 = app
+        .db
+        .with_transaction(|tx| {
+            Ok(tx.query_row("SELECT COUNT(*) FROM collab_sessions", [], |row| row.get(0))?)
+        })
+        .unwrap();
+    assert_eq!(
+        count, 0,
+        "an invalid pilot must not create a collab_sessions row"
+    );
+}
+
+#[test]
 fn collab_set_implementer_before_task_list_routes_batch_owner() {
     let app = App::open_for_test().unwrap();
     let session_id = drive_to_plan_locked(&app, "fp");

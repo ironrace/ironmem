@@ -15,7 +15,7 @@ use super::collab_events::{
     build_collab_event, failure_report_is_off_turn_admissible, parse_final_payload,
 };
 use super::shared::{
-    collab_counterpart, require_agent, require_implementer, require_str, sha256_hex,
+    collab_counterpart, require_agent, require_implementer, require_pilot, require_str, sha256_hex,
     MAX_COLLAB_CONTENT_CHARS,
 };
 
@@ -168,6 +168,7 @@ pub(super) fn session_record_json(record: &SessionRecord) -> Value {
         // malformed. Consumers treat `None` as the default (subagent-driven).
         "execution_mode": execution_mode_from_task_list(record.session.task_list.as_deref()),
         "implementer": record.session.implementer.as_str(),
+        "pilot": record.session.pilot.as_str(),
         "task_review_round": record.session.task_review_round,
         "global_review_round": record.session.global_review_round,
         "base_sha": record.session.base_sha.as_deref(),
@@ -522,14 +523,22 @@ pub(super) fn handle_collab_start(app: &App, args: &Value) -> Result<Value, Memo
         .transpose()?
         .map(ToString::to_string);
     let task = task_owned.as_deref();
+    // Optional `pilot` field: selects which agent leads v1 planning. Default
+    // is `Agent::Claude` (historical flow). Resolved before `implementer` so
+    // an omitted `implementer` can default to whichever pilot was chosen.
+    let pilot = match args.get("pilot").and_then(Value::as_str) {
+        Some(value) => require_pilot(value)?,
+        None => Agent::Claude,
+    };
     // Optional `implementer` field: routes the v3 batch implementation
-    // phase. Default is `Agent::Claude` (historical flow). `Agent::Codex`
+    // phase. Defaults to the resolved `pilot` (so a `pilot=codex` caller who
+    // omits `implementer` gets `implementer=codex` too). `Agent::Codex`
     // makes Codex the owner of `CodeImplementPending` and the only valid
     // sender of `implementation_done`. It can be rebound later through
     // `collab_set_implementer` while planning or implementation is active.
     let implementer = match args.get("implementer").and_then(Value::as_str) {
         Some(value) => require_implementer(value)?,
-        None => Agent::Claude,
+        None => pilot,
     };
     let session_id = uuid::Uuid::new_v4().to_string();
 
@@ -551,9 +560,6 @@ pub(super) fn handle_collab_start(app: &App, args: &Value) -> Result<Value, Memo
             )));
         }
         ensure_no_conflicting_process_session_tx(app, tx, &session_id, repo_path, branch)?;
-        // No MCP-level `pilot` argument exists yet (a later task in this
-        // plan adds one); default to `Agent::Claude` here to preserve
-        // today's behavior unchanged.
         crate::collab::queue::create_session(
             tx,
             &session_id,
@@ -561,7 +567,7 @@ pub(super) fn handle_collab_start(app: &App, args: &Value) -> Result<Value, Memo
             branch,
             task,
             implementer,
-            Agent::Claude,
+            pilot,
         )?;
         crate::db::schema::Database::wal_log_tx(
             tx,
@@ -572,6 +578,7 @@ pub(super) fn handle_collab_start(app: &App, args: &Value) -> Result<Value, Memo
                 "branch": branch,
                 "initiator": initiator.as_str(),
                 "implementer": implementer.as_str(),
+                "pilot": pilot.as_str(),
                 "has_task": task.is_some(),
             }),
             Some(&json!({ "session_id": session_id })),
@@ -586,6 +593,7 @@ pub(super) fn handle_collab_start(app: &App, args: &Value) -> Result<Value, Memo
         "session_id": session_id,
         "task": task,
         "implementer": implementer.as_str(),
+        "pilot": pilot.as_str(),
     }))
 }
 
