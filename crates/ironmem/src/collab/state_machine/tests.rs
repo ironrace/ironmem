@@ -2149,3 +2149,475 @@ fn test_resume_is_rejected_once_the_lifetime_ceiling_is_reached() {
         other => panic!("expected CollabError::NotResumable, got {other:?}"),
     }
 }
+
+// ── pilot=claude equivalence suite (issue #246, Task 4) ───────────────
+//
+// PINNING SUITE — DO NOT MODIFY TO MATCH FUTURE BEHAVIOR.
+//
+// Every test below pins `apply_event`'s exact `pilot=claude` behavior as it
+// exists *today*, hardcoded `Agent::Claude`/`Agent::Codex` arm by arm, before
+// a future task (#246 Task 5) rewrites `apply_event` to compute owners
+// generically via `pilot()`/`copilot()` helpers instead of the hardcoded
+// agents. `pilot=claude` is the codebase's only operational role assignment
+// at the time this suite was written (`CollabSession::new` /
+// `new_with_implementer` default `pilot` to `Agent::Claude`, and nothing yet
+// lets an MCP caller choose otherwise), so these are the ONLY equivalence
+// tests this task writes; `pilot=codex` mirror tests are Task 5's job, not
+// this one's.
+//
+// The contract this suite exists to prove: if Task 5's rewrite is truly
+// behavior-preserving under `pilot=claude`, every test in this section keeps
+// passing UNMODIFIED after that rewrite lands. If a test here needs to
+// change to stay green, that is a signal the rewrite altered `pilot=claude`
+// behavior, not a cue to "fix" the test to match the new code. Do not edit,
+// relax, or delete these assertions to make Task 5 pass — file that as a
+// regression instead.
+//
+// One test per rewritten `apply_event` arm (nine), covering both the
+// accepted transition (`phase` + `current_owner`) and the wrong-actor
+// rejection, plus one test pinning `new_global_review`'s seeded
+// `current_owner`/`implementer`. The `SubmitDraft` arm gets four tests
+// instead of one: `match actor { Claude => .., Codex => .. }` are two
+// genuinely different code paths, and each has a "first drafter" and a
+// "second drafter" branch worth pinning independently.
+
+#[test]
+fn pilot_claude_submit_draft_claude_first_then_codex_advances_phase() {
+    let s = session();
+    assert_eq!(s.pilot, Agent::Claude);
+    let s = draft(Agent::Claude, "c1", &s);
+    assert_eq!(s.phase, Phase::PlanParallelDrafts);
+    assert_eq!(s.current_owner, Agent::Codex);
+    let s = draft(Agent::Codex, "c2", &s);
+    assert_eq!(s.phase, Phase::PlanSynthesisPending);
+    assert_eq!(s.current_owner, Agent::Claude);
+}
+
+#[test]
+fn pilot_claude_submit_draft_codex_first_then_claude_advances_phase() {
+    let s = session();
+    let s = draft(Agent::Codex, "c1", &s);
+    assert_eq!(s.phase, Phase::PlanParallelDrafts);
+    assert_eq!(s.current_owner, Agent::Claude);
+    let s = draft(Agent::Claude, "c2", &s);
+    assert_eq!(s.phase, Phase::PlanSynthesisPending);
+    assert_eq!(s.current_owner, Agent::Claude);
+}
+
+#[test]
+fn pilot_claude_submit_draft_duplicate_claude_rejected() {
+    let s = session();
+    let s = draft(Agent::Claude, "c1", &s);
+    let err = apply_event(
+        &s,
+        Agent::Claude,
+        &CollabEvent::SubmitDraft {
+            content_hash: "c2".to_string(),
+        },
+    )
+    .unwrap_err();
+    assert_eq!(
+        err,
+        CollabError::AlreadySubmittedDraft {
+            agent: "claude".to_string()
+        }
+    );
+}
+
+#[test]
+fn pilot_claude_submit_draft_duplicate_codex_rejected() {
+    let s = session();
+    let s = draft(Agent::Codex, "c1", &s);
+    let err = apply_event(
+        &s,
+        Agent::Codex,
+        &CollabEvent::SubmitDraft {
+            content_hash: "c2".to_string(),
+        },
+    )
+    .unwrap_err();
+    assert_eq!(
+        err,
+        CollabError::AlreadySubmittedDraft {
+            agent: "codex".to_string()
+        }
+    );
+}
+
+#[test]
+fn pilot_claude_publish_canonical_accepted() {
+    let s = session();
+    let s = draft(Agent::Claude, "c1", &s);
+    let s = draft(Agent::Codex, "c2", &s);
+    let s = canonical("canonical-hash", &s);
+    assert_eq!(s.phase, Phase::PlanCopilotReviewPending);
+    assert_eq!(s.current_owner, Agent::Codex);
+    assert_eq!(s.canonical_plan_hash.as_deref(), Some("canonical-hash"));
+}
+
+#[test]
+fn pilot_claude_publish_canonical_wrong_actor_rejected() {
+    let s = session();
+    let s = draft(Agent::Claude, "c1", &s);
+    let s = draft(Agent::Codex, "c2", &s);
+    let err = apply_event(
+        &s,
+        Agent::Codex,
+        &CollabEvent::PublishCanonical {
+            content_hash: "canonical-hash".to_string(),
+        },
+    )
+    .unwrap_err();
+    assert_eq!(
+        err,
+        CollabError::NotYourTurn {
+            expected: Agent::Claude.to_string(),
+            got: Agent::Codex.to_string(),
+        }
+    );
+}
+
+#[test]
+fn pilot_claude_submit_review_accepted() {
+    let s = session();
+    let s = draft(Agent::Claude, "c1", &s);
+    let s = draft(Agent::Codex, "c2", &s);
+    let s = canonical("canonical-hash", &s);
+    let s = review("approve", &s);
+    assert_eq!(s.phase, Phase::PlanFinalizePending);
+    assert_eq!(s.current_owner, Agent::Claude);
+    assert_eq!(s.codex_review_verdict.as_deref(), Some("approve"));
+}
+
+#[test]
+fn pilot_claude_submit_review_wrong_actor_rejected() {
+    let s = session();
+    let s = draft(Agent::Claude, "c1", &s);
+    let s = draft(Agent::Codex, "c2", &s);
+    let s = canonical("canonical-hash", &s);
+    let err = apply_event(
+        &s,
+        Agent::Claude,
+        &CollabEvent::SubmitReview {
+            verdict: "approve".to_string(),
+        },
+    )
+    .unwrap_err();
+    assert_eq!(
+        err,
+        CollabError::NotYourTurn {
+            expected: Agent::Codex.to_string(),
+            got: Agent::Claude.to_string(),
+        }
+    );
+}
+
+#[test]
+fn pilot_claude_publish_final_accepted() {
+    let s = session();
+    let s = draft(Agent::Claude, "c1", &s);
+    let s = draft(Agent::Codex, "c2", &s);
+    let s = canonical("canonical-hash", &s);
+    let s = review("approve", &s);
+    let s = apply_event(
+        &s,
+        Agent::Claude,
+        &CollabEvent::PublishFinal {
+            content_hash: "final-hash".to_string(),
+        },
+    )
+    .unwrap();
+    assert_eq!(s.phase, Phase::PlanLocked);
+    assert_eq!(s.final_plan_hash.as_deref(), Some("final-hash"));
+}
+
+#[test]
+fn pilot_claude_publish_final_wrong_actor_rejected() {
+    let s = session();
+    let s = draft(Agent::Claude, "c1", &s);
+    let s = draft(Agent::Codex, "c2", &s);
+    let s = canonical("canonical-hash", &s);
+    let s = review("approve", &s);
+    let err = apply_event(
+        &s,
+        Agent::Codex,
+        &CollabEvent::PublishFinal {
+            content_hash: "final-hash".to_string(),
+        },
+    )
+    .unwrap_err();
+    assert_eq!(
+        err,
+        CollabError::NotYourTurn {
+            expected: Agent::Claude.to_string(),
+            got: Agent::Codex.to_string(),
+        }
+    );
+}
+
+#[test]
+fn pilot_claude_submit_task_list_accepted() {
+    let s = locked_session("hash-final");
+    let s = submit_task_list(&s, "hash-final", 1);
+    assert_eq!(s.phase, Phase::CodeImplementPending);
+    // Default implementer is `Agent::Claude`.
+    assert_eq!(s.current_owner, Agent::Claude);
+}
+
+#[test]
+fn pilot_claude_submit_task_list_wrong_actor_rejected() {
+    let s = locked_session("hash-final");
+    let err = apply_event(
+        &s,
+        Agent::Codex,
+        &CollabEvent::SubmitTaskList {
+            plan_hash: "hash-final".to_string(),
+            base_sha: "base0".to_string(),
+            task_list_json: canonical_task_list(1),
+            tasks_count: 1,
+            head_sha: "head0".to_string(),
+        },
+    )
+    .unwrap_err();
+    assert_eq!(
+        err,
+        CollabError::NotYourTurn {
+            expected: Agent::Claude.to_string(),
+            got: Agent::Codex.to_string(),
+        }
+    );
+}
+
+#[test]
+fn pilot_claude_implementation_done_accepted() {
+    let s = locked_session("hf");
+    let s = submit_task_list(&s, "hf", 1);
+    let s = apply_event(
+        &s,
+        Agent::Claude,
+        &CollabEvent::ImplementationDone {
+            head_sha: "batch_head".to_string(),
+        },
+    )
+    .unwrap();
+    assert_eq!(s.phase, Phase::CodeReviewFixGlobalPending);
+    assert_eq!(s.current_owner, Agent::Codex);
+}
+
+#[test]
+fn pilot_claude_implementation_done_wrong_actor_rejected() {
+    // Default implementer is `Agent::Claude`; `Agent::Codex` is neither the
+    // implementer nor holds any recovery standing on a fresh session, so
+    // `require_actor_or_recovery` degrades to a plain wrong-actor rejection.
+    let s = locked_session("hf");
+    let s = submit_task_list(&s, "hf", 1);
+    let err = apply_event(
+        &s,
+        Agent::Codex,
+        &CollabEvent::ImplementationDone {
+            head_sha: "h".to_string(),
+        },
+    )
+    .unwrap_err();
+    assert_eq!(
+        err,
+        CollabError::NotYourTurn {
+            expected: Agent::Claude.to_string(),
+            got: Agent::Codex.to_string(),
+        }
+    );
+}
+
+#[test]
+fn pilot_claude_code_review_fix_global_accepted() {
+    let s = locked_session("hf");
+    let s = submit_task_list(&s, "hf", 1);
+    let s = apply_event(
+        &s,
+        Agent::Claude,
+        &CollabEvent::ImplementationDone {
+            head_sha: "b".to_string(),
+        },
+    )
+    .unwrap();
+    let s = apply_event(
+        &s,
+        Agent::Codex,
+        &CollabEvent::CodeReviewFixGlobal {
+            head_sha: "g1".to_string(),
+        },
+    )
+    .unwrap();
+    assert_eq!(s.phase, Phase::CodeReviewLocalPending);
+    assert_eq!(s.current_owner, Agent::Claude);
+}
+
+#[test]
+fn pilot_claude_code_review_fix_global_wrong_actor_rejected() {
+    // No recovery state set (the default), so `require_actor_or_recovery`
+    // degrades to a plain wrong-actor check against `Agent::Codex`.
+    let s = locked_session("hf");
+    let s = submit_task_list(&s, "hf", 1);
+    let s = apply_event(
+        &s,
+        Agent::Claude,
+        &CollabEvent::ImplementationDone {
+            head_sha: "b".to_string(),
+        },
+    )
+    .unwrap();
+    let err = apply_event(
+        &s,
+        Agent::Claude,
+        &CollabEvent::CodeReviewFixGlobal {
+            head_sha: "g1".to_string(),
+        },
+    )
+    .unwrap_err();
+    assert_eq!(
+        err,
+        CollabError::NotYourTurn {
+            expected: Agent::Codex.to_string(),
+            got: Agent::Claude.to_string(),
+        }
+    );
+}
+
+#[test]
+fn pilot_claude_review_local_accepted() {
+    let s = locked_session("hf");
+    let s = submit_task_list(&s, "hf", 1);
+    let s = apply_event(
+        &s,
+        Agent::Claude,
+        &CollabEvent::ImplementationDone {
+            head_sha: "b".to_string(),
+        },
+    )
+    .unwrap();
+    let s = apply_event(
+        &s,
+        Agent::Codex,
+        &CollabEvent::CodeReviewFixGlobal {
+            head_sha: "g1".to_string(),
+        },
+    )
+    .unwrap();
+    let s = apply_event(
+        &s,
+        Agent::Claude,
+        &CollabEvent::ReviewLocal {
+            head_sha: "g2".to_string(),
+        },
+    )
+    .unwrap();
+    assert_eq!(s.phase, Phase::CodeReviewFinalPending);
+    assert_eq!(s.current_owner, Agent::Claude);
+}
+
+#[test]
+fn pilot_claude_review_local_wrong_actor_rejected() {
+    // No recovery state set (the default), so `require_actor_or_recovery`
+    // degrades to a plain wrong-actor check against `Agent::Claude`.
+    let s = locked_session("hf");
+    let s = submit_task_list(&s, "hf", 1);
+    let s = apply_event(
+        &s,
+        Agent::Claude,
+        &CollabEvent::ImplementationDone {
+            head_sha: "b".to_string(),
+        },
+    )
+    .unwrap();
+    let s = apply_event(
+        &s,
+        Agent::Codex,
+        &CollabEvent::CodeReviewFixGlobal {
+            head_sha: "g1".to_string(),
+        },
+    )
+    .unwrap();
+    let err = apply_event(
+        &s,
+        Agent::Codex,
+        &CollabEvent::ReviewLocal {
+            head_sha: "g2".to_string(),
+        },
+    )
+    .unwrap_err();
+    assert_eq!(
+        err,
+        CollabError::NotYourTurn {
+            expected: Agent::Claude.to_string(),
+            got: Agent::Codex.to_string(),
+        }
+    );
+}
+
+#[test]
+fn pilot_claude_final_review_accepted() {
+    let s = submit_task_list(&locked_session("hf"), "hf", 1);
+    let s = finish_through_global_review(&s);
+    assert_eq!(s.phase, Phase::CodingComplete);
+    assert_eq!(s.current_owner, Agent::Claude);
+    assert_eq!(s.pr_url.as_deref(), Some("https://example/pr/1"));
+}
+
+#[test]
+fn pilot_claude_final_review_wrong_actor_rejected() {
+    // No recovery state set (the default), so `require_actor_or_recovery`
+    // degrades to a plain wrong-actor check against `Agent::Claude`.
+    let s = locked_session("hf");
+    let s = submit_task_list(&s, "hf", 1);
+    let s = apply_event(
+        &s,
+        Agent::Claude,
+        &CollabEvent::ImplementationDone {
+            head_sha: "b".to_string(),
+        },
+    )
+    .unwrap();
+    let s = apply_event(
+        &s,
+        Agent::Codex,
+        &CollabEvent::CodeReviewFixGlobal {
+            head_sha: "g1".to_string(),
+        },
+    )
+    .unwrap();
+    let s = apply_event(
+        &s,
+        Agent::Claude,
+        &CollabEvent::ReviewLocal {
+            head_sha: "g2".to_string(),
+        },
+    )
+    .unwrap();
+    let err = apply_event(
+        &s,
+        Agent::Codex,
+        &CollabEvent::FinalReview {
+            head_sha: "g3".to_string(),
+            pr_url: "https://example/pr/1".to_string(),
+        },
+    )
+    .unwrap_err();
+    assert_eq!(
+        err,
+        CollabError::NotYourTurn {
+            expected: Agent::Claude.to_string(),
+            got: Agent::Codex.to_string(),
+        }
+    );
+}
+
+#[test]
+fn pilot_claude_new_global_review_seeds_owner_and_implementer() {
+    // `start_global_review_session` pins `pilot` to `Agent::Claude` today
+    // (see its doc comment in `mod.rs`), and `new_global_review` derives
+    // `current_owner = counterpart(pilot)` and `implementer = pilot`.
+    let session = start_global_review_session("s1", "basesha", "headsha").unwrap();
+    assert_eq!(session.pilot, Agent::Claude);
+    assert_eq!(session.current_owner, Agent::Codex);
+    assert_eq!(session.implementer, Agent::Claude);
+}
