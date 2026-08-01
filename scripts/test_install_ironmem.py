@@ -289,6 +289,87 @@ class InstallIronmemSelfTest(unittest.TestCase):
 
             self.assertIn("the user's own edit", installed.read_text(encoding="utf-8"))
 
+    def test_workflow_installs_to_default_path_when_dir_not_overridden(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            home = pathlib.Path(directory)
+            env = self._full_install_env(home)
+            del env["CLAUDE_WORKFLOWS_DIR"]
+
+            self.run_installer(home, home / ".claude.json", skip_skills=False, extra_env=env)
+
+            installed = pathlib.Path(env["CLAUDE_HOME"]) / "workflows" / "ultrareview.js"
+            self.assertTrue(
+                installed.is_file(),
+                "ultrareview.js did not land at the CLAUDE_HOME/workflows default",
+            )
+            self.assertEqual(
+                installed.read_text(encoding="utf-8"),
+                (ROOT / ".claude-plugin" / "workflows" / "ultrareview.js").read_text(encoding="utf-8"),
+            )
+
+    def test_workflow_merge_conflict_leaves_local_file_intact_with_sidecars(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            home = pathlib.Path(directory)
+            env = self._full_install_env(home)
+            self.run_installer(home, home / ".claude.json", skip_skills=False, extra_env=env)
+
+            installed = pathlib.Path(env["CLAUDE_WORKFLOWS_DIR"]) / "ultrareview.js"
+            base_snapshot = (
+                pathlib.Path(env["CLAUDE_HOME"]) / ".ironmem-bases" / "workflows" / "ultrareview.js"
+            )
+            packaged = (ROOT / ".claude-plugin" / "workflows" / "ultrareview.js").read_text(
+                encoding="utf-8"
+            )
+            lines = packaged.splitlines(keepends=True)
+            self.assertGreater(len(lines), 1, "packaged workflow is too short to force a conflict")
+
+            # Rewind the base snapshot so it diverges from the packaged copy on
+            # the same line the "local edit" below touches. Without this, the
+            # base still equals the packaged source and install_file_with_merge
+            # takes the early "packaged copy unchanged" return -- never
+            # reaching git merge-file at all.
+            conflicting_base = lines.copy()
+            conflicting_base[0] = "// base snapshot rewound for the test\n"
+            base_snapshot.write_text("".join(conflicting_base), encoding="utf-8")
+
+            local_edit = lines.copy()
+            local_edit[0] = "// the user's own edit -- must survive intact\n"
+            installed.write_text("".join(local_edit), encoding="utf-8")
+
+            self.run_installer(home, home / ".claude.json", skip_skills=False, extra_env=env)
+
+            self.assertIn(
+                "the user's own edit",
+                installed.read_text(encoding="utf-8"),
+                "a merge conflict must never touch the local file",
+            )
+            conflict_sidecar = installed.parent / (installed.name + ".ironmem-merge-conflict")
+            packaged_sidecar = installed.parent / (installed.name + ".ironmem-packaged")
+            self.assertTrue(conflict_sidecar.is_file(), "no merge-conflict sidecar was written")
+            self.assertTrue(packaged_sidecar.is_file(), "no packaged-copy sidecar was written")
+
+    def test_preexisting_user_workflow_with_no_base_snapshot_is_left_alone(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            home = pathlib.Path(directory)
+            env = self._full_install_env(home)
+            workflows_dir = pathlib.Path(env["CLAUDE_WORKFLOWS_DIR"])
+            workflows_dir.mkdir(parents=True)
+            theirs = workflows_dir / "ultrareview.js"
+            theirs.write_text("// the user's own pre-existing workflow\n", encoding="utf-8")
+
+            result = self.run_installer(
+                home, home / ".claude.json", skip_skills=False, extra_env=env
+            )
+
+            self.assertEqual(result.returncode, 0)
+            self.assertEqual(
+                theirs.read_text(encoding="utf-8"),
+                "// the user's own pre-existing workflow\n",
+                "installer modified a workflow it did not install",
+            )
+            packaged_sidecar = theirs.parent / (theirs.name + ".ironmem-packaged")
+            self.assertTrue(packaged_sidecar.is_file(), "no packaged sidecar was written")
+
     def test_superseded_skill_is_removed_when_a_base_snapshot_proves_ours(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             home = pathlib.Path(directory)

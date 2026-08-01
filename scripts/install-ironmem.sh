@@ -28,6 +28,11 @@ SOURCE="$REPO_ROOT/target/release/ironmem"
 # default.
 DAEMON_SOCKET_PATH="${IRONMEM_DAEMON_SOCKET:-$HOME/.ironrace-memory/hook_state/daemon.sock}"
 
+# Files install_file_with_merge left untouched this run -- symlinks, merge
+# conflicts, or local edits with no base snapshot to diff against. Collected
+# here so the run ends with one summary a WARN buried mid-output can't hide.
+UNCHANGED_FILES=()
+
 REQUIRED_SHARED_SKILLS=(
   iron-spec
   iron-plan
@@ -203,6 +208,23 @@ validate_packaged_agents() {
   fi
 }
 
+validate_packaged_workflows() {
+  local harness="$1"
+  local source_root="$2"
+  local missing=0
+
+  for workflow in "${REQUIRED_CLAUDE_WORKFLOWS[@]}"; do
+    if [[ ! -f "$source_root/$workflow.js" ]]; then
+      echo "ERROR: bundled $harness workflow missing: $source_root/$workflow.js" >&2
+      missing=1
+    fi
+  done
+
+  if [[ "$missing" -eq 1 ]]; then
+    exit 1
+  fi
+}
+
 migrate_legacy_base() {
   local old_base="$1/.ironmem-bases"
   local new_base="$2"
@@ -347,11 +369,13 @@ install_file_with_merge() {
     cp -p "$source" "$packaged_symlink"
     echo "    WARN: $label $name is a symlink; left it unchanged" >&2
     echo "          packaged copy: $packaged_symlink" >&2
+    UNCHANGED_FILES+=("$label $name ($target) — symlink; packaged copy: $packaged_symlink")
     return
   fi
 
   if [[ ! -f "$target" ]]; then
     echo "    WARN: $target exists but is not a regular file; leaving it unchanged" >&2
+    UNCHANGED_FILES+=("$label $name ($target) — not a regular file; no packaged copy written")
     return
   fi
 
@@ -393,6 +417,7 @@ install_file_with_merge() {
       echo "    WARN: $label $name has merge conflicts; left local file unchanged" >&2
       echo "          conflict draft: $conflict" >&2
       echo "          packaged copy:  $packaged" >&2
+      UNCHANGED_FILES+=("$label $name ($target) — merge conflict; conflict draft: $conflict; packaged copy: $packaged")
       return
     fi
 
@@ -400,6 +425,7 @@ install_file_with_merge() {
     cp -p "$source" "$packaged_no_git"
     echo "    WARN: git not found; left local $label $name unchanged" >&2
     echo "          packaged copy: $packaged_no_git" >&2
+    UNCHANGED_FILES+=("$label $name ($target) — git not found; packaged copy: $packaged_no_git")
     return
   fi
 
@@ -407,6 +433,7 @@ install_file_with_merge() {
   cp -p "$source" "$packaged_no_base"
   echo "    WARN: no install base for $label $name; left local file unchanged" >&2
   echo "          packaged copy: $packaged_no_base" >&2
+  UNCHANGED_FILES+=("$label $name ($target) — no install base; packaged copy: $packaged_no_base")
 }
 
 install_dir_with_merge() {
@@ -442,6 +469,12 @@ install_ext_set() {
   shift 5
   local names=("$@")
 
+  # bash 3.2 (macOS's default /bin/bash) aborts on "${names[@]}" for an empty
+  # array under set -u. REQUIRED_CLAUDE_WORKFLOWS has one entry today, but a
+  # future zero-length list (as REQUIRED_CLAUDE_SKILLS already is) must not
+  # blow up here.
+  (( ${#names[@]} == 0 )) && return 0
+
   local missing=0
   for name in "${names[@]}"; do
     if [[ ! -f "$source_root/$name.$ext" ]]; then
@@ -451,6 +484,11 @@ install_ext_set() {
   done
   if [[ "$missing" -eq 1 ]]; then
     exit 1
+  fi
+
+  if [[ -e "$target_root" && ! -d "$target_root" ]]; then
+    echo "WARN: $label target $target_root exists but is not a directory; leaving it unchanged" >&2
+    return
   fi
 
   mkdir -p "$target_root"
@@ -466,8 +504,8 @@ install_ext_set() {
   done
 }
 
-# Back-compat wrapper: the four .md call sites read better without an extension
-# argument threaded through each one.
+# Convenience wrapper over install_ext_set: the four .md call sites read
+# better without an "md" literal threaded through each one.
 install_md_set() {
   local label="$1" source_root="$2" target_root="$3" base_root="$4"
   shift 4
@@ -516,6 +554,12 @@ if [[ "$SKIP_SKILLS" -eq 0 ]]; then
   CLAUDE_WORKFLOWS_DIR="${CLAUDE_WORKFLOWS_DIR:-$CLAUDE_HOME/workflows}"
   CODEX_COMMANDS_DIR="${CODEX_COMMANDS_DIR:-$CODEX_HOME/commands}"
   CODEX_PROMPTS_DIR="${CODEX_PROMPTS_DIR:-$CODEX_HOME/prompts}"
+
+  # Validated before any of this block's installers run (rather than relying
+  # solely on install_ext_set's own preflight) so a missing bundled workflow
+  # aborts before the Codex install and MCP wiring below ever start, instead
+  # of leaving the run half-applied at whichever stage happened to hit it.
+  validate_packaged_workflows "Claude" "$REPO_ROOT/.claude-plugin/workflows"
 
   install_skill_set "Codex" "$REPO_ROOT/.codex-plugin/skills" "$CODEX_SKILLS_DIR" \
     "$CODEX_HOME/.ironmem-bases/skills" \
@@ -670,6 +714,22 @@ if [[ "$LEGACY_FOUND" -eq 1 ]]; then
   echo "  Why this matters: the plugin registers itself as 'ironmem'. When a"
   echo "  legacy 'ironrace-memory' server is also registered, tool calls render"
   echo "  under the old name and both servers run against the same SQLite DB."
+fi
+
+# Loud, unmissable summary of every packaged file install_file_with_merge left
+# untouched -- a lone WARN buried in this output is easy to scroll past, but a
+# stale file paired against an upgraded counterpart (e.g. ultrareview.js
+# against a newer ultrareview-local.md) can silently misbehave. Not a failure
+# (exit code is unaffected); just something the operator must go look at.
+if (( ${#UNCHANGED_FILES[@]} > 0 )); then
+  echo ""
+  echo "################################################################"
+  echo "# ${#UNCHANGED_FILES[@]} packaged file(s) left unchanged -- review before relying on them:"
+  echo "################################################################"
+  for entry in "${UNCHANGED_FILES[@]}"; do
+    echo "  - $entry"
+  done
+  echo "################################################################"
 fi
 
 echo "==> Done"
