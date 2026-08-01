@@ -1531,7 +1531,9 @@ mod tests {
         let db = open_at_v15();
         db.conn.execute_batch(COLLAB_MESSAGE_DRAWERS_SQL).unwrap();
         db.conn.execute_batch(DRAWER_SUPERSESSION_SQL).unwrap();
-        db.conn.execute_batch(MCP_RESPONSE_COMPACTION_METRICS_SQL).unwrap();
+        db.conn
+            .execute_batch(MCP_RESPONSE_COMPACTION_METRICS_SQL)
+            .unwrap();
         db
     }
 
@@ -1577,7 +1579,10 @@ mod tests {
                 |r| r.get(0),
             )
             .unwrap();
-        assert_eq!(pilot, "claude", "legacy sessions must backfill pilot='claude'");
+        assert_eq!(
+            pilot, "claude",
+            "legacy sessions must backfill pilot='claude'"
+        );
     }
 
     #[test]
@@ -1591,20 +1596,14 @@ mod tests {
              VALUES (?1, '/repo', 'main', 'claude')",
             ["session-claude"],
         );
-        assert!(
-            claude_result.is_ok(),
-            "pilot='claude' should be accepted"
-        );
+        assert!(claude_result.is_ok(), "pilot='claude' should be accepted");
 
         let codex_result = db.conn.execute(
             "INSERT INTO collab_sessions (id, repo_path, branch, pilot)
              VALUES (?1, '/repo', 'main', 'codex')",
             ["session-codex"],
         );
-        assert!(
-            codex_result.is_ok(),
-            "pilot='codex' should be accepted"
-        );
+        assert!(codex_result.is_ok(), "pilot='codex' should be accepted");
 
         // Invalid values must be rejected by the CHECK constraint
         let invalid_result = db.conn.execute(
