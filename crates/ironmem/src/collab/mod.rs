@@ -54,6 +54,7 @@ pub use handoff::{
 };
 pub use phase::Phase;
 pub use session::{tasks_count_from_list, CollabSession};
+pub(crate) use state_machine::copilot;
 pub use state_machine::{apply_event, start_global_review_session, MAX_RECOVERY_ATTEMPTS};
 pub(crate) use task_list::{
     task_count_from_payload, validate_task_list_body, TaskListValidationError,
@@ -85,9 +86,21 @@ pub const OFF_TURN_FAILURE_PREFIXES: &[&str] = &[BRANCH_DRIFT_PREFIX, CODEX_DISP
 
 /// Whether an agent may report this failure while it is not the current
 /// owner. Branch drift is independently observable by either participant.
-/// A Codex-dispatch failure is different: only Claude can observe that a
-/// Codex-owned background dispatch never ran, so accepting it from Codex (or
-/// while Claude owns the turn) would let a non-owner seize a live Claude turn.
+/// A Codex-dispatch failure is different: only the *dispatcher* can observe
+/// that a Codex-owned background dispatch never ran, so accepting it from
+/// Codex (or while Claude owns the turn) would let a non-owner seize a live
+/// Claude turn.
+///
+/// The `reporter == Agent::Claude` term below names the **dispatcher**, not
+/// the pilot. Claude is unconditionally the dispatcher in this codebase — it
+/// is the side that spawns the Codex MCP one-shot — and that role is
+/// orthogonal to the session's `pilot`/`copilot` assignment. Under
+/// `pilot=codex` Claude is *still* the dispatcher, so this clause is
+/// deliberately unaffected by pilot assignment; note that the function takes
+/// no session, which is what makes that independence structural rather than
+/// merely intended. Do not "generalize" this literal to `pilot(session)` or
+/// `copilot(session)`: doing so would let Codex fabricate a report about its
+/// own process and seize a live Claude turn.
 ///
 /// A recognized prefix also needs at least one byte of detail. This keeps the
 /// pre-dispatch turn gate aligned with the state-machine enforcement.

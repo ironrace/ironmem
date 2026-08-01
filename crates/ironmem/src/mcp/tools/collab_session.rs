@@ -1193,14 +1193,14 @@ pub(super) fn handle_collab_status(app: &App, args: &Value) -> Result<Value, Mem
     Ok(status)
 }
 
+/// `collab_approve` — the copilot's one-pass verdict on the pilot's canonical
+/// plan. The approver is whichever agent is *not* the session's pilot, so the
+/// role gate below has to read the session first; it cannot be a constant
+/// check on the parsed argument the way it was when Claude was hardcoded as
+/// the only pilot.
 pub(super) fn handle_collab_approve(app: &App, args: &Value) -> Result<Value, MemoryError> {
     let session_id = require_str(args, "session_id")?;
     let agent = require_agent(require_str(args, "agent")?)?;
-    if agent != Agent::Codex {
-        return Err(MemoryError::Validation(
-            "agent must be 'codex' for collab_approve".to_string(),
-        ));
-    }
     let content_hash = require_str(args, "content_hash")?;
     let review_content = json!({
         "verdict": "approve",
@@ -1218,6 +1218,19 @@ pub(super) fn handle_collab_approve(app: &App, args: &Value) -> Result<Value, Me
         )?;
         crate::collab::queue::ensure_active(tx, session_id)?;
         let session = crate::collab::queue::load_session(tx, session_id)?;
+        // Role gate. `apply_event`'s `SubmitReview` arm enforces exactly this
+        // rule (`require_actor(actor, copilot(session))`) and is the primary
+        // enforcement point — this check is defense-in-depth, NOT redundant:
+        // it fails the call before any drawer or queue write, and it reports
+        // the expected approver by name instead of a bare turn violation.
+        // Do not delete it as duplicated logic.
+        let expected_approver = crate::collab::copilot(&session);
+        if agent != expected_approver {
+            return Err(MemoryError::Validation(format!(
+                "agent must be '{}' for collab_approve",
+                expected_approver.as_str()
+            )));
+        }
         let expected_hash = session
             .canonical_plan_hash
             .as_deref()
@@ -1229,7 +1242,7 @@ pub(super) fn handle_collab_approve(app: &App, args: &Value) -> Result<Value, Me
         }
         let session = apply_event(
             &session,
-            Agent::Codex,
+            agent,
             &CollabEvent::SubmitReview {
                 verdict: "approve".to_string(),
             },
@@ -1240,8 +1253,8 @@ pub(super) fn handle_collab_approve(app: &App, args: &Value) -> Result<Value, Me
         let _ = crate::collab::queue::send_message(
             tx,
             session_id,
-            Agent::Codex.as_str(),
-            Agent::Claude.as_str(),
+            agent.as_str(),
+            collab_counterpart(agent).as_str(),
             "review",
             &review_content,
             &drawer_id,
@@ -3849,5 +3862,260 @@ mod tests {
         assert_eq!(after.session.phase, Phase::CodeImplementPending);
         assert_eq!(after.session.current_owner, crate::collab::Agent::Claude);
         assert_eq!(after.session.pending_failure, None);
+    }
+    // ── pilot=codex MCP-surface coverage (issue #246, Task 6) ────────────────
+    //
+    // `collab_start` still has no `pilot` argument, so these tests start a
+    // normal session and rebind `pilot` on the stored row — the same
+    // direct-field-write trick the legacy-drawer tests above use. Every
+    // authorization assertion is mirrored under `pilot=claude`, because "no
+    // new role combination is accepted" is only provable two-directionally:
+    // a one-sided table cannot distinguish "the copilot approves" from
+    // "both agents approve".
+
+    /// Rebind a started session's `pilot` role in place. Only `pilot` is
+    /// touched: `implementer` is an independent knob and none of these tests
+    /// reach a coding phase.
+    fn set_pilot(app: &crate::mcp::app::App, sid: &str, pilot: Agent) {
+        let mut session = app.db.collab_load_session(sid).unwrap();
+        session.pilot = pilot;
+        app.db.collab_save_session(&session).unwrap();
+    }
+
+    /// Drive a `pilot`-led session to `PlanCopilotReviewPending` and return
+    /// the canonical plan hash `collab_approve` must be called with. Drafts
+    /// are agent-keyed (either side may go first); synthesis is the pilot's.
+    fn drive_to_copilot_review(app: &crate::mcp::app::App, sid: &str, pilot: Agent) -> String {
+        send(app, sid, "claude", "draft", "claude draft");
+        send(app, sid, "codex", "draft", "codex draft");
+        send(app, sid, pilot.as_str(), "canonical", "canonical plan");
+        sha256_hex("canonical plan")
+    }
+
+    fn approve(
+        app: &crate::mcp::app::App,
+        sid: &str,
+        agent: Agent,
+        content_hash: &str,
+    ) -> Result<Value, MemoryError> {
+        handle_collab_approve(
+            app,
+            &json!({
+                "session_id": sid,
+                "agent": agent.as_str(),
+                "content_hash": content_hash,
+            }),
+        )
+    }
+
+    /// Topics currently queued for `receiver`. Deliberately does not auto-ack,
+    /// so the same inbox can be inspected more than once per test.
+    fn inbox_topics(app: &crate::mcp::app::App, sid: &str, receiver: Agent) -> Vec<String> {
+        let out = handle_collab_recv(
+            app,
+            &json!({ "session_id": sid, "receiver": receiver.as_str(), "limit": 50 }),
+        )
+        .unwrap();
+        out["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|message| message["topic"].as_str().unwrap().to_string())
+            .collect()
+    }
+
+    /// The most recent `collab_approve` WAL row as `(params, result)`.
+    fn last_approve_wal(app: &crate::mcp::app::App) -> (Value, Value) {
+        let conn = rusqlite::Connection::open(&app.config.db_path).unwrap();
+        let (params, result): (String, String) = conn
+            .query_row(
+                "SELECT params, result FROM wal_log WHERE operation = 'collab_approve' \
+                 ORDER BY id DESC LIMIT 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        (
+            serde_json::from_str(&params).unwrap(),
+            serde_json::from_str(&result).unwrap(),
+        )
+    }
+
+    #[test]
+    fn approve_under_pilot_codex_lets_claude_approve_and_routes_review_to_codex() {
+        let app = test_app();
+        let sid = start_session(&app);
+        set_pilot(&app, &sid, Agent::Codex);
+        let hash = drive_to_copilot_review(&app, &sid, Agent::Codex);
+
+        let out = approve(&app, &sid, Agent::Claude, &hash).unwrap();
+        assert_eq!(out["phase"], json!("PlanClaudeFinalizePending"));
+
+        assert!(
+            inbox_topics(&app, &sid, Agent::Codex).contains(&"review".to_string()),
+            "under pilot=codex the approval must be routed claude→codex"
+        );
+        assert!(
+            !inbox_topics(&app, &sid, Agent::Claude).contains(&"review".to_string()),
+            "the approver must not be queued its own review message"
+        );
+
+        // The WAL payload shape is pilot-independent; only `agent` differs.
+        let (params, result) = last_approve_wal(&app);
+        assert_eq!(
+            params,
+            json!({ "session_id": sid, "agent": "claude", "content_hash": hash })
+        );
+        assert_eq!(result, json!({ "phase": "PlanClaudeFinalizePending" }));
+    }
+
+    #[test]
+    fn approve_under_pilot_claude_is_unchanged() {
+        // Byte-for-byte pin of today's behavior: `pilot` defaults to Claude,
+        // Codex approves, and the review is routed codex→claude.
+        let app = test_app();
+        let sid = start_session(&app);
+        assert_eq!(
+            app.db.collab_load_session(&sid).unwrap().pilot,
+            Agent::Claude
+        );
+        let hash = drive_to_copilot_review(&app, &sid, Agent::Claude);
+
+        let out = approve(&app, &sid, Agent::Codex, &hash).unwrap();
+        assert_eq!(out["phase"], json!("PlanClaudeFinalizePending"));
+
+        assert!(inbox_topics(&app, &sid, Agent::Claude).contains(&"review".to_string()));
+        assert!(!inbox_topics(&app, &sid, Agent::Codex).contains(&"review".to_string()));
+
+        let record = app.db.collab_load_session_record(&sid).unwrap();
+        assert_eq!(record.session.phase, Phase::PlanFinalizePending);
+        assert_eq!(record.session.current_owner, Agent::Claude);
+        assert_eq!(
+            record.session.codex_review_verdict.as_deref(),
+            Some("approve")
+        );
+
+        let (params, result) = last_approve_wal(&app);
+        assert_eq!(
+            params,
+            json!({ "session_id": sid, "agent": "codex", "content_hash": hash })
+        );
+        assert_eq!(result, json!({ "phase": "PlanClaudeFinalizePending" }));
+    }
+
+    /// Two-directional negative-authorization table for `collab_approve`.
+    /// Under *each* pilot assignment the copilot is the only accepted
+    /// approver: the pilot is refused by the handler gate, refused again by
+    /// the state machine underneath it, and the accepted call routes the
+    /// `review` message in exactly one direction.
+    #[test]
+    fn approve_authorization_table_is_two_directional() {
+        for pilot in [Agent::Claude, Agent::Codex] {
+            let app = test_app();
+            let sid = start_session(&app);
+            set_pilot(&app, &sid, pilot);
+            let hash = drive_to_copilot_review(&app, &sid, pilot);
+            let expected = collab_counterpart(pilot);
+
+            // Wrong role: refused by the handler's role gate, naming the
+            // agent that actually may approve.
+            let err = approve(&app, &sid, pilot, &hash).unwrap_err();
+            assert!(
+                err.to_string().contains(&format!(
+                    "agent must be '{}' for collab_approve",
+                    expected.as_str()
+                )),
+                "pilot={pilot} gate must name the expected approver, got: {err}"
+            );
+
+            // …and refused again by `apply_event`'s `SubmitReview` arm, which
+            // is the primary enforcement point. The handler gate is
+            // defense-in-depth on top of this, not a substitute for it.
+            let session = app.db.collab_load_session(&sid).unwrap();
+            let state_machine_err = apply_event(
+                &session,
+                pilot,
+                &CollabEvent::SubmitReview {
+                    verdict: "approve".to_string(),
+                },
+            )
+            .unwrap_err();
+            assert!(
+                matches!(state_machine_err, CollabError::NotYourTurn { .. }),
+                "pilot={pilot} state machine must reject the wrong approver with NotYourTurn, \
+                 got: {state_machine_err:?}"
+            );
+
+            // The refused call must have left the session untouched.
+            let record = app.db.collab_load_session_record(&sid).unwrap();
+            assert_eq!(record.session.phase, Phase::PlanCopilotReviewPending);
+            assert_eq!(record.session.codex_review_verdict, None);
+            assert!(!inbox_topics(&app, &sid, Agent::Claude).contains(&"review".to_string()));
+            assert!(!inbox_topics(&app, &sid, Agent::Codex).contains(&"review".to_string()));
+
+            // Right role: accepted, and routed to the pilot only.
+            let out = approve(&app, &sid, expected, &hash).unwrap();
+            assert_eq!(out["phase"], json!("PlanClaudeFinalizePending"));
+            assert!(inbox_topics(&app, &sid, pilot).contains(&"review".to_string()));
+            assert!(!inbox_topics(&app, &sid, expected).contains(&"review".to_string()));
+        }
+    }
+
+    #[test]
+    fn approve_still_rejects_a_content_hash_mismatch_under_pilot_codex() {
+        // The `canonical_plan_hash` check is unrelated to role assignment and
+        // must survive the de-hardcoding of the gate above it.
+        let app = test_app();
+        let sid = start_session(&app);
+        set_pilot(&app, &sid, Agent::Codex);
+        drive_to_copilot_review(&app, &sid, Agent::Codex);
+
+        let err = approve(&app, &sid, Agent::Claude, "deadbeef").unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("content_hash does not match canonical_plan_hash"));
+    }
+
+    #[test]
+    fn blind_draft_suppression_holds_for_both_receivers_under_pilot_codex() {
+        // The suppression keys on the *receiving* agent's own draft-hash
+        // column, which is identity-keyed rather than role-keyed, so it is
+        // pilot-independent by construction. Both receiver directions are
+        // exercised because a one-sided test cannot tell an identity-keyed
+        // rule apart from one that happens to name the right agent.
+        for first_drafter in [Agent::Claude, Agent::Codex] {
+            let app = test_app();
+            let sid = start_session(&app);
+            set_pilot(&app, &sid, Agent::Codex);
+            let waiting = collab_counterpart(first_drafter);
+
+            send(&app, &sid, first_drafter.as_str(), "draft", "first draft");
+            assert!(
+                inbox_topics(&app, &sid, waiting).is_empty(),
+                "under pilot=codex {waiting} must not see {first_drafter}'s draft before \
+                 submitting its own"
+            );
+
+            send(&app, &sid, waiting.as_str(), "draft", "second draft");
+            assert!(
+                inbox_topics(&app, &sid, waiting).contains(&"draft".to_string()),
+                "the counterpart's draft must appear once {waiting} has drafted"
+            );
+        }
+    }
+
+    #[test]
+    fn collab_send_under_pilot_codex_routes_to_the_counterpart() {
+        let app = test_app();
+        let sid = start_session(&app);
+        set_pilot(&app, &sid, Agent::Codex);
+        send(&app, &sid, "claude", "draft", "claude draft");
+        send(&app, &sid, "codex", "draft", "codex draft");
+
+        // Synthesis is the pilot's turn under any assignment, so the
+        // canonical plan is sent by Codex here and must land in Claude's inbox.
+        send(&app, &sid, "codex", "canonical", "canonical plan");
+        assert!(inbox_topics(&app, &sid, Agent::Claude).contains(&"canonical".to_string()));
+        assert!(!inbox_topics(&app, &sid, Agent::Codex).contains(&"canonical".to_string()));
     }
 }

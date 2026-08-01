@@ -116,7 +116,12 @@ fn pilot(session: &CollabSession) -> Agent {
 ///
 /// Note that `implementer` is an independent knob: it is read straight off
 /// the session and is neither derived from nor validated against these two.
-fn copilot(session: &CollabSession) -> Agent {
+///
+/// `pub(crate)` (unlike `pilot`, which stays private) so the MCP layer's
+/// `collab_approve` handler can gate on the same derivation this module
+/// enforces with, rather than re-deriving the copilot from `session.pilot`
+/// itself and creating a second place that could drift.
+pub(crate) fn copilot(session: &CollabSession) -> Agent {
     counterpart(session.pilot)
 }
 

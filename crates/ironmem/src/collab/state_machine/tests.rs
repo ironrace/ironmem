@@ -3175,3 +3175,96 @@ fn pilot_codex_global_review_shortcut_flows_to_coding_complete() {
     assert_eq!(s.phase, Phase::CodingComplete);
     assert_eq!(s.current_owner, Agent::Codex);
 }
+
+// ── off-turn dispatch-failure carve-out under pilot=codex (issue #246, Task 6) ──
+//
+// `off_turn_failure_is_admissible`'s `codex_dispatch_failed:` clause names
+// `Agent::Claude` as the reporter, but that literal is the *dispatcher*, not
+// the pilot: Claude is the only side that runs the Codex MCP one-shot, so it
+// is the only side that can observe one that never returned. Dispatcher and
+// pilot are orthogonal — under `pilot=codex` Claude is still the dispatcher —
+// and the predicate takes no session at all, so no pilot assignment can reach
+// it. These tests pin that; the function body is unchanged by this task.
+
+#[test]
+fn pilot_codex_claude_may_report_dispatch_failure_against_a_codex_owned_turn() {
+    let s = code_implement_pending_for(Agent::Codex);
+    assert_eq!(s.current_owner, Agent::Codex);
+
+    let s = apply_event(
+        &s,
+        Agent::Claude,
+        &CollabEvent::FailureReport {
+            coding_failure: "codex_dispatch_failed: mcp call timed out".to_string(),
+        },
+    )
+    .unwrap();
+
+    // Recoverable + off-turn-admissible: the phase holds and recovery hands
+    // the interrupted turn to the observing dispatcher.
+    assert_eq!(s.phase, Phase::CodeImplementPending);
+    assert_eq!(s.recovery_owner, Some(Agent::Claude));
+    assert_eq!(s.recovery_origin_owner, Some(Agent::Codex));
+}
+
+#[test]
+fn pilot_codex_codex_may_not_report_dispatch_failure_off_turn() {
+    // Mirror of `test_codex_dispatch_failure_is_not_off_turn_admissible_against_claude_owner`
+    // under `pilot=codex`: Codex is the pilot here, and still cannot fabricate
+    // a dispatch failure to seize a live Claude turn.
+    let s = review_fix_global_pending_for(Agent::Codex);
+    assert_eq!(s.current_owner, Agent::Claude);
+
+    let err = apply_event(
+        &s,
+        Agent::Codex,
+        &CollabEvent::FailureReport {
+            coding_failure: "codex_dispatch_failed: fabricated report".to_string(),
+        },
+    )
+    .unwrap_err();
+
+    assert!(matches!(err, CollabError::NotYourTurn { .. }));
+}
+
+#[test]
+fn pilot_codex_dispatch_failure_admissibility_table_is_dispatcher_keyed() {
+    // Owners drawn from a real `pilot=codex` session, so the table is not
+    // asserting against invented role pairs.
+    let codex_owned = code_implement_pending_for(Agent::Codex);
+    assert_eq!(codex_owned.current_owner, Agent::Codex);
+    let claude_owned = review_fix_global_pending_for(Agent::Codex);
+    assert_eq!(claude_owned.current_owner, Agent::Claude);
+
+    let failure = "codex_dispatch_failed: mcp call timed out";
+
+    // The dispatcher observing a Codex-owned one-shot that never returned:
+    // the only admissible off-turn combination.
+    assert!(off_turn_failure_is_admissible(
+        failure,
+        Agent::Claude,
+        codex_owned.current_owner
+    ));
+
+    // Codex reporting its own dispatch failure is never off-turn-admissible —
+    // it is not the dispatcher, so it cannot have observed this.
+    assert!(!off_turn_failure_is_admissible(
+        failure,
+        Agent::Codex,
+        codex_owned.current_owner
+    ));
+    assert!(!off_turn_failure_is_admissible(
+        failure,
+        Agent::Codex,
+        claude_owned.current_owner
+    ));
+
+    // The dispatcher reporting it against a Claude-owned turn is not
+    // off-turn-admissible either: such a report is only ever accepted because
+    // Claude already owns the turn, never through this carve-out.
+    assert!(!off_turn_failure_is_admissible(
+        failure,
+        Agent::Claude,
+        claude_owned.current_owner
+    ));
+}
