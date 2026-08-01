@@ -306,6 +306,12 @@ fn get_drawer_round_trips_by_id() {
 
 #[test]
 fn search_defaults_to_excerpt_and_get_drawer_dereferences_the_full_body() {
+    // `IRONMEM_COMPACT_RESPONSES` is process-global and flipped by the
+    // `search_response_*` tests in this same binary. Every assertion below
+    // reads `results` as a plain array, which the compact envelope replaces
+    // with a `__compact_v1` object — so this test has to hold the same lock
+    // those tests use, not merely assume the variable is unset.
+    let _compact_guard = CompactResponsesEnvGuard::disabled();
     let app = App::open_for_test().unwrap();
     let body = format!(
         "MCP protocol fixture prefix. {} needle exact body. {}after",
@@ -349,6 +355,12 @@ fn search_defaults_to_excerpt_and_get_drawer_dereferences_the_full_body() {
 
 #[test]
 fn search_full_returns_content_over_mcp() {
+    // `IRONMEM_COMPACT_RESPONSES` is process-global and flipped by the
+    // `search_response_*` tests in this same binary. Every assertion below
+    // reads `results` as a plain array, which the compact envelope replaces
+    // with a `__compact_v1` object — so this test has to hold the same lock
+    // those tests use, not merely assume the variable is unset.
+    let _compact_guard = CompactResponsesEnvGuard::disabled();
     let app = App::open_for_test().unwrap();
     let body = "MCP full search fixture with the exact body";
     let added = call_tool(
@@ -440,6 +452,12 @@ fn search_rejects_string_full_over_mcp() {
 
 #[test]
 fn search_response_budget_preserves_references_in_excerpt_and_full_modes() {
+    // `IRONMEM_COMPACT_RESPONSES` is process-global and flipped by the
+    // `search_response_*` tests in this same binary. Every assertion below
+    // reads `results` as a plain array, which the compact envelope replaces
+    // with a `__compact_v1` object — so this test has to hold the same lock
+    // those tests use, not merely assume the variable is unset.
+    let _compact_guard = CompactResponsesEnvGuard::disabled();
     let app = App::open_for_test().unwrap();
     let query = "aggregatebudgetfixture";
     let wing = "protocol-tests";
@@ -530,6 +548,12 @@ fn search_response_budget_preserves_references_in_excerpt_and_full_modes() {
 
 #[test]
 fn search_default_response_is_at_least_five_times_smaller_than_full_response() {
+    // `IRONMEM_COMPACT_RESPONSES` is process-global and flipped by the
+    // `search_response_*` tests in this same binary. Every assertion below
+    // reads `results` as a plain array, which the compact envelope replaces
+    // with a `__compact_v1` object — so this test has to hold the same lock
+    // those tests use, not merely assume the variable is unset.
+    let _compact_guard = CompactResponsesEnvGuard::disabled();
     let app = App::open_for_test().unwrap();
     let query = "sizefloorfixture";
     let ids = add_large_search_drawers(&app, query, "protocol-tests", "mcp", 10);
@@ -1194,6 +1218,12 @@ fn collab_recv_blocks_draft_peek_before_own_draft_submitted() {
 
 #[test]
 fn collab_recv_defaults_to_drawer_refs_that_get_drawer_can_dereference() {
+    // `IRONMEM_COMPACT_RESPONSES` is process-global and flipped by the
+    // `search_response_*` tests in this same binary. Every assertion below
+    // reads `results` as a plain array, which the compact envelope replaces
+    // with a `__compact_v1` object — so this test has to hold the same lock
+    // those tests use, not merely assume the variable is unset.
+    let _compact_guard = CompactResponsesEnvGuard::disabled();
     let app = App::open_for_test().unwrap();
     let content = "Claude's durable draft body";
     let started = call_tool(
