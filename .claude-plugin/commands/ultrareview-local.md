@@ -87,13 +87,13 @@ exact existing raw fallback `gh pr diff <N>`. Do not retain the full raw diff as
 the review input when the artifact succeeds. Diff range for the lenses:
 `<baseRefName>...<headRefName>`. If PR not found → stop.
 
-Preserve the full raw diff **transiently** for deterministic trigger detection
-with `gh pr diff <N>`, even when the compact artifact succeeds:
-conditional-reviewer triggers need full source coverage and must not treat the
-lossy artifact as the sole classifier. Do not inject or repeat that raw diff in
-reviewer prompts and never pass it to the workflow; discard it after selecting
-the conditional lenses. The compact artifact remains the review context (or the
-raw fallback when no artifact is available).
+Preserve the full raw diff transiently for deterministic trigger detection with
+`gh pr diff <N>`, even when the compact artifact succeeds: conditional-reviewer
+triggers need full source coverage and must not treat the lossy artifact as the
+sole classifier. Do not inject or repeat that raw diff in reviewer prompts, and
+never pass it to the workflow; discard it after selecting the conditional
+lenses. The compact artifact remains the review context (or the raw fallback
+when no artifact is available).
 
 Record whether the local working tree is at the PR head: `git rev-parse HEAD` vs
 `headRefOid`. If they differ:
@@ -127,8 +127,13 @@ exact existing raw fallback `git diff HEAD`. Do not retain the full raw diff as
 the review input when the artifact succeeds. If empty → stop:
 "Nothing to review." Diff range for the lenses: `HEAD`.
 
-Preserve the full raw diff **transiently** for deterministic trigger detection
-with `git diff HEAD`, on the same terms as PR Mode above.
+Preserve the full raw diff transiently for deterministic trigger detection with
+`git diff HEAD`, even when the compact artifact succeeds: conditional-reviewer
+triggers need full source coverage and must not treat the lossy artifact as the
+sole classifier. Do not inject or repeat that raw diff in reviewer prompts, and
+never pass it to the workflow; discard it after selecting the conditional
+lenses. The compact artifact remains the review context (or the raw fallback
+when no artifact is available).
 
 Record title, file list, changed-line count, draft flag, and the selected review
 input. The compact artifact's index supports exact source expansion:
@@ -278,7 +283,9 @@ The SHA is passed to the workflow as `rollbackSha` and does three jobs:
    not a rollback line.
 3. Recovery is `git checkout <sha> -- .`, with the one limit below.
 
-**Two gaps in `git`'s own behaviour that the report must state, not paper over:**
+**Four gaps in `git`'s own behaviour that the report must state, not paper over.
+Each one is a way the printed recovery line under-delivers or over-reaches, and
+a recovery line the user cannot trust is worse than none:**
 
 - `git diff <sha> -- .` does **not** show a file the fixes *created* — a new
   untracked file is invisible to it. A fix agent that adds a file would slip
@@ -289,6 +296,40 @@ The SHA is passed to the workflow as `rollbackSha` and does three jobs:
   file that did not exist at anchor time. Recovery is therefore incomplete for
   created files, and the report must say so plainly rather than implying the one
   command undoes everything.
+- `git add -A` **skips files matched by `.gitignore`**, so a gitignored path is
+  absent from the anchor tree. If a fix lands in one — a generated config, a
+  local `.env`, anything ignored but present — that edit is unanchored,
+  invisible to the scope audit's diff, and `git checkout <sha> -- .` will not
+  restore it. There is no recovery for it at all. Detect the overlap before
+  Phase 3 and state it:
+
+  ```bash
+  printf '%s\n' "${CHANGED_FILES[@]}" | git check-ignore --stdin --no-index 2>/dev/null
+  ```
+
+  Any path it prints is outside the anchor. Name those paths in the report under
+  the rollback line as **not covered by the anchor**. If a fix later lands in
+  one, say so explicitly rather than letting the blanket recovery line imply
+  otherwise.
+- `git checkout <sha> -- .` reverts the working tree to the anchor —
+  **including any edit the user made after the anchor was minted.** This review
+  takes minutes, and it does not hold a lock on the tree. The recovery line must
+  therefore carry its own scope: it undoes the fixes *and* anything else changed
+  since the anchor. Print it as a statement of what it does, never as "undo the
+  fixes":
+
+  ```
+  rollback: git checkout <sha> -- .  (reverts the tree to the pre-review
+  snapshot — this also discards any edit you made during the review)
+  ```
+
+**The anchor must exist before the recovery line is printed at all.** The
+workflow returns `rollbackUsable`. When it is `false` there is no anchor, the
+workflow has already forced `reportOnly` and nothing was edited — print
+`rollback: n/a (no anchor could be minted; nothing was edited)` and **never** a
+bare `git checkout -- .`. That command with an empty sha is not a degraded
+rollback: it discards every unstaged change in the tree, which is the work under
+review.
 
 <a id="fix-created-test"></a>
 ### The fix-created test
@@ -375,25 +416,46 @@ never enters a reviewer prompt and it never enters `args`.
   deliberately not repeated here. A `REFUTED` verdict requires quoting the guard or
   invariant that prevents the failure — that clause is defined verbatim in
   `ultrareview.js` and is deliberately not restated here, so it cannot drift.
+- **One verdict per claim.** The verify memo is keyed on the finding's exact
+  text — file, line, issue, failure scenario — not on its location. The verdict
+  printed beside a wording, and carried into a fix brief, is the verdict reached
+  about *that* wording. Do not reintroduce a location key as an optimisation:
+  the merge picks the primary wording by scenario length, so a location key
+  makes the verdict and the wording two independent selections and the
+  `CONFIRMED`-only gate becomes bypassable by wording swap.
 - **Fix on `CONFIRMED` only** — never `PLAUSIBLE`, never `UNVERIFIED`, never
   before the verify pass. `fix_complexity: invasive` is reported, never patched.
 - **Fix agents grouped by file**, one agent per file, groups in parallel, no
-  worktree isolation — the fixes land in the user's working tree.
-- The **scope-creep audit** on the fix diff, when any fix was applied.
+  worktree isolation — the fixes land in the user's working tree. The fan-out is
+  capped, every dispatch is individually caught so one failure cannot discard
+  the run, and a finding is only dispatched if its path is in the `files` list
+  passed from here.
+- **Fail-closed argument handling.** Auto-fix requires `reportOnly: false`
+  exactly; anything else, including absence, is report-only. A `rollbackSha`
+  that is not an object name disables auto-fix outright. `repoPath` and
+  `diffRange` are refused if they carry characters a shell would interpret.
+- The **scope-creep audit** whenever a fix agent was **dispatched** — not when
+  one reported success. `fixes.applied` comes from the agents' own outcome
+  strings, so gating on it would let the audited party decide whether it is
+  audited.
 
 ### Consume the return struct
 
 The workflow returns:
 
 ```
-band ('small'|'medium'|'large') · changedLines · fileCount · droppedByBand[] · addedByBand[] ·
+band ('small'|'medium'|'large') · changedLines · fileCount ·
+droppedByBand[] · addedByBand[] · unrecognisedLenses[] · rosterWidened (bool) ·
 fableSuggested (bool) ·
+coverageComplete (bool) · erroredLenses[] ·
 coverage[{ id, key, count, answeredBy, retried, errored, errorReason }] ·
-findings[] · refuted[] · invasive[] ·
-fixes { applied, files, groups[{ file, tier, results }] } ·
+findings[] · refuted[] · invasive[] · outOfScope[] ·
+fixes { applied, files, groups[{ file, tier, results, errored, errorReason }],
+        dispatchErrors[{ file, reason }], cappedFiles[] } ·
+fixAgentsDispatched (bool) ·
 scopeAudit (null | { in_scope, out_of_scope_changes, summary }) ·
-verifyStats { confirmed, plausible, refuted, unverified } ·
-reportOnly
+verifyStats { confirmed, plausible, refuted, unverified, pastCap, supersededVerdicts } ·
+reportOnly · reportOnlyForced (bool) · rollbackSha · rollbackUsable (bool)
 ```
 
 Each item in `findings[]` / `refuted[]` / `invasive[]` carries:
@@ -420,6 +482,24 @@ Notes on reading it:
   scenario and was dropped to MEDIUM before verification. Tag it `[demoted]`.
 - `invasive[]` is a subset of `findings[]`. Those entries have no `outcome`, so
   they count as remaining **and** get their own report section.
+- `outOfScope[]` is also a subset of `findings[]`: confirmed findings naming a
+  file the caller never listed as changed. They carry `outcome: skipped` and are
+  never dispatched to a fix agent, because a path that survives sanitising is
+  not thereby a path this review may edit. Report them; do not treat the fact
+  that they went unpatched as a decision the review made about severity.
+- `fixes.cappedFiles[]` and `fixes.dispatchErrors[]` are **not** cosmetic. A
+  file in `dispatchErrors` had an Edit-capable agent die on it, which is not the
+  same as no edit: that file may hold a partial change no result set describes.
+- `verifyStats.supersededVerdicts` counts verifier slots spent on a wording the
+  cross-lens merge later displaced. It is a cost, not a defect — every verdict
+  belongs to the wording it was reached about — but a non-zero value means the
+  effective verify budget was smaller than the cap.
+- `verifyStats.pastCap` counts **claims** that outran the cap;
+  `verifyStats.unverified` counts **findings** displaying an `UNVERIFIED`
+  verdict. They are different numbers and `pastCap` is the larger: a capped
+  claim at a location that also carried a verified wording is displaced into
+  `also_reported`, where it is an unverified lead rather than an unverified
+  finding. Quote `unverified` when talking about findings.
 
 ---
 
@@ -459,12 +539,42 @@ and do not drive the decision.
 
 | Condition | Decision |
 |---|---|
-| Zero remaining CRITICAL/HIGH, validation passes | **APPROVE** |
-| Only MEDIUM/LOW remaining, validation passes | **APPROVE with comments** |
+| Zero remaining CRITICAL/HIGH, validation passes, **coverage complete** | **APPROVE** |
+| Only MEDIUM/LOW remaining, validation passes, **coverage complete** | **APPROVE with comments** |
 | Any remaining HIGH, or any validation failure | **REQUEST CHANGES** |
 | Any remaining CRITICAL | **BLOCK** |
 
 Draft PRs → always **COMMENT**, regardless of findings.
+
+### Coverage is a precondition, not a finding
+
+The first two rows are the only ones that can clear a diff, and both of them
+read a **count of findings**. A count of findings is a statement about what was
+looked at, so neither row may be reached without establishing that something
+looked. These are preconditions on APPROVE, checked before the table:
+
+- **`coverageComplete` is `false`** — at least one lens contributed no coverage.
+  A `0` beside an errored lens means "we did not look", not "nothing is there",
+  and counting it toward a clean tally is the refusal-counted-as-APPROVE failure
+  this design exists to eliminate. The security lens erroring is the worst case
+  and looks identical to the best one in the count.
+- **`rosterWidened` is `true`** — the requested lenses narrowed to nothing and
+  the workflow substituted the core four. The review is real, but it is not the
+  review that was asked for; say which lenses were requested and which ran.
+- **`unrecognisedLenses` is non-empty** — an id no lens implements was
+  requested. Something upstream believes a lens ran that never existed.
+- **`fixes.dispatchErrors` is non-empty** — an Edit-capable agent died on a
+  file. That file may hold a partial change no result set describes.
+
+Where any of these hold, the decision is at most **APPROVE with comments**, and
+the reason goes on the decision line:
+
+```
+Decision: APPROVE with comments — coverage incomplete (lens B security-reviewer ERRORED)
+```
+
+Never resolve a coverage gap by re-running the workflow. One automated pass,
+then the human decides.
 
 A post-fix validation failure **is** a validation failure and cannot be argued
 down to APPROVE.
@@ -499,10 +609,16 @@ to `.claude/PRPs/reviews/`.
 # Ultra Review (local): <PR #N | Local> — <TITLE>
 
 Decision: APPROVE | APPROVE with comments | REQUEST CHANGES | BLOCK | COMMENT (draft)
-Fixes applied: <N> across <M> files · rollback: git checkout <sha> -- .
+Coverage: <complete | incomplete — lens <id> ERRORED / roster widened / unrecognised id <x>>
+Fixes applied: <N> across <M> files
+  rollback: git checkout <sha> -- .  (reverts the tree to the pre-review
+  snapshot — this also discards any edit you made during the review)
   <only when the fixes created files: "restores modified files; delete <paths> manually">
+  <only when changed files are gitignored: "not covered by the anchor: <paths>">
+  <when rollbackUsable is false, this whole block is: "rollback: n/a (no anchor
+  could be minted; nothing was edited)">
 Post-fix validation: <check → pass/fail/n/a, one line>
-Remaining: <N MEDIUM (reported)> · <N HIGH invasive (design change — yours)>
+Remaining: <N MEDIUM (reported)> · <N HIGH invasive (design change — yours)> · <N out of scope>
 
 ## Summary
 <2-3 sentences covering every lens that was dispatched>
@@ -520,11 +636,14 @@ LOW: ...
 ## Reported, not patched (invasive)
 <finding → why it needs a design decision, or "None">
 
+## Reported, not patched (outside the reviewed file set)
+<finding → the path it named, or "None">
+
 ## Refuted during verification
 <finding → refuting evidence, or "None">
 
 ## Fix scope audit
-<in scope / out-of-scope changes found, or "n/a (no fixes applied)">
+<in scope / out-of-scope changes found, or "n/a (no fix agent was dispatched)">
 
 ## Cross-cutting patterns
 <root causes from multiple findings, or "None">
@@ -534,10 +653,11 @@ LOW: ...
 
 ## Lens coverage
 - <id> <lens>: <N findings> (<model/effort>[, retried on opus after empty fable return]) | ERRORED — did not look (<reason>) | skipped (<reason>) | dropped by diff-size band
-- verification: <N confirmed / N plausible / N refuted / N unverified>
+- unrecognised lens id(s) requested: <ids, or omit the line>
+- verification: <N confirmed / N plausible / N refuted / N unverified><, N past the cap><, N slots spent on a displaced wording>
 
 ## Roster
-band <small|medium|large> · <N> changed lines · <M> files<, added by band: …><, this diff qualifies for --fable>
+band <small|medium|large> · <N> changed lines · <M> files<, added by band: …><, roster widened to the core four (requested: …)><, this diff qualifies for --fable>
 ```
 
 Filling it in:
@@ -546,16 +666,37 @@ Filling it in:
   return struct.
 - **Decision line** — when auto-fixes changed the decision, say so on that line:
   `APPROVE with comments (was BLOCK — 2 CRITICAL auto-fixed)`.
-- **Fixes applied** — `fixes.applied` and `fixes.files`. `<sha>` is the Phase 2.5
-  `rollbackSha`. **Every report prints the rollback line**, including
-  `--report-only` runs and runs with zero fixes.
+- **Coverage line** — from `coverageComplete`, `erroredLenses`, `rosterWidened`
+  and `unrecognisedLenses`. It sits directly under the decision because it is
+  the precondition that decision rests on. `complete` only when
+  `coverageComplete` is true, `rosterWidened` is false and `unrecognisedLenses`
+  is empty.
+- **Fixes applied** — `fixes.applied` and `fixes.files`. `<sha>` is
+  `rollbackSha` from the struct. **Every report prints the rollback block**,
+  including `--report-only` runs and runs with zero fixes — but print it as the
+  four cases below, never as a bare command:
 
-  `git checkout <sha> -- .` restores modified files but **does not delete files
-  the fixes created**. Identify those with the
-  [fix-created test](#the-fix-created-test) — untracked now **and** absent from
-  `git ls-tree -r <rollbackSha>` — and name them on the follow-up line so the
-  user knows recovery needs a manual `rm`. A recovery command that silently
-  under-delivers is the exact failure class this command exists to prevent.
+  1. `rollbackUsable` is `false` → `rollback: n/a (no anchor could be minted;
+     nothing was edited)`. Do **not** emit `git checkout -- .`; with an empty
+     sha that is not a weaker rollback, it is a command that discards every
+     unstaged change in the tree.
+  2. Otherwise the command carries its own scope: it reverts the tree to the
+     anchor, **including anything the user edited during the review**. The
+     review takes minutes and holds no lock on the tree, so a line that reads
+     "undo the fixes" is wrong about what it does.
+  3. `git checkout <sha> -- .` restores modified files but **does not delete
+     files the fixes created**. Identify those with the
+     [fix-created test](#the-fix-created-test) — untracked now **and** absent
+     from `git ls-tree -r <rollbackSha>` — and name them on the follow-up line
+     so the user knows recovery needs a manual `rm`.
+  4. Gitignored paths are absent from the anchor entirely (`git add -A` skips
+     them), so `git checkout <sha> -- .` cannot restore them and the scope
+     audit's diff cannot see them. Name any that overlap the changed-file set,
+     per Phase 2.5.
+
+  A recovery command that silently under-delivers — or that over-reaches into
+  the user's own work — is the exact failure class this command exists to
+  prevent.
 - **Fixed** — findings whose `outcome` is `fixed`, with the fix agent's
   `outcome_note` as "what changed". `no_change_needed` and `skipped` entries do
   not belong here. **Group them by file and label each file with the tier its
@@ -582,19 +723,34 @@ Filling it in:
   same reason: `invasive` findings are never dispatched to a fix agent at all.
 - **Refuted during verification** — from `refuted[]`, each with its
   `verification.evidence`, so the signal is not silently lost.
-- **Fix scope audit** — from `scopeAudit`. `null` with fixes applied is not the
-  same as no audit being needed: say the audit did not return and the fixes are
-  unaudited. The auditor reads `git diff <rollbackSha> -- .`, which **cannot see
-  files the fixes created**, so apply the
-  [fix-created test](#the-fix-created-test) yourself and list every path it
-  returns here. They are fix output and belong in the scope question like any
-  other hunk — a file the fixes added is the one change most likely to be out of
-  scope and is exactly what the diff cannot show you.
+- **Reported, not patched (outside the reviewed file set)** — from
+  `outOfScope[]`. Name the path each finding claimed. A finder emitting a path
+  outside the diff is worth surfacing on its own: it is either a real
+  cross-file defect the reviewer should chase manually, or a finder that has
+  lost track of what it was reviewing.
+- **Fix scope audit** — from `scopeAudit`, gated on `fixAgentsDispatched`, not
+  on `fixes.applied`. `n/a` is correct **only** when `fixAgentsDispatched` is
+  false. When it is true and `scopeAudit` is `null`, say the audit did not
+  return and the dispatched files are unaudited — an agent holding `Edit` was
+  pointed at them, and its own report of having changed nothing is not evidence
+  the tree is unchanged. Add every file in `fixes.dispatchErrors` here by name:
+  those agents died, possibly mid-edit.
+
+  The auditor reads `git diff <rollbackSha> -- .`, which **cannot see files the
+  fixes created**, so apply the [fix-created test](#the-fix-created-test)
+  yourself and list every path it returns here. They are fix output and belong
+  in the scope question like any other hunk — a file the fixes added is the one
+  change most likely to be out of scope and is exactly what the diff cannot show
+  you. Gitignored paths are invisible to it for the same reason and get the same
+  treatment.
 - **Lens coverage** — one line per entry in `coverage[]`, plus a line for every
   lens that was never requested (`skipped (<reason>)`) and every id in
   `droppedByBand` (`dropped by diff-size band`). `answeredBy` supplies the
-  model/effort and the retry note; `retried` flags the Opus re-dispatch.
+  model/effort and the retry note; `retried` flags the Opus re-dispatch. End
+  with any `unrecognisedLenses` on their own line — an id no lens implements is
+  a stale caller, not a skipped lens, and must not be filed as one.
 - **Roster** — `band`, `changedLines`, `fileCount`, `addedByBand` when non-empty,
+  `roster widened to the core four (requested: …)` when `rosterWidened` is true,
   and `this diff qualifies for --fable` when `fableSuggested` is true. Suggest
   the escalation; never auto-spend it.
 - If `verifyStats.unverified > 0`, say so in the Summary — CRITICAL/HIGH
@@ -640,6 +796,17 @@ End with one line: the next step that fits the decision.
   pass, then the human decides.
 - **Scope audit finds out-of-scope changes** → surface them under Fix scope
   audit and recommend the rollback. Never silently accept an out-of-scope hunk.
+- **A fix agent errors** → it appears in `fixes.dispatchErrors`. The run
+  continues and the scope audit still runs, because an agent that died may have
+  died *after* editing. Name the file under Fix scope audit and say the change
+  is partial and undescribed. This is not the same as `skipped`.
+- **A finding names a file outside the diff** → it lands in `outOfScope[]` and
+  is never dispatched. Report it; do not chase it by widening the `files` arg.
+- **Every requested lens dropped by the band** → the workflow widens to the core
+  four and sets `rosterWidened`. The review is real but is not the one that was
+  asked for: say so, and cap the decision at APPROVE with comments.
+- **A lens errored** → `coverageComplete` is false. APPROVE is unreachable; see
+  Coverage is a precondition. Never re-run the workflow to fill the gap.
 - **Workflow script missing** → stop with the `scripts/install-ironmem.sh`
   instruction. Do **not** hand-dispatch the lenses: the per-lens tiers, the
   `CONFIRMED`-only fix gate, and the verify cap all live in the script, and a
