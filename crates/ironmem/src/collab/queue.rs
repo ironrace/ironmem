@@ -746,7 +746,16 @@ mod tests {
     #[test]
     fn test_send_recv_ack_fifo() {
         let db = open();
-        create_session(&db, "sess1", "/repo", "main", None, Agent::Claude, Agent::Claude).unwrap();
+        create_session(
+            &db,
+            "sess1",
+            "/repo",
+            "main",
+            None,
+            Agent::Claude,
+            Agent::Claude,
+        )
+        .unwrap();
         let m1 = send_message(
             &db,
             "sess1",
@@ -782,7 +791,16 @@ mod tests {
     #[test]
     fn test_send_recv_preserves_drawer_id() {
         let db = open();
-        create_session(&db, "sess-drawer", "/repo", "main", None, Agent::Claude, Agent::Claude).unwrap();
+        create_session(
+            &db,
+            "sess-drawer",
+            "/repo",
+            "main",
+            None,
+            Agent::Claude,
+            Agent::Claude,
+        )
+        .unwrap();
 
         send_message(
             &db,
@@ -803,7 +821,16 @@ mod tests {
     #[test]
     fn test_ack_idempotent() {
         let db = open();
-        create_session(&db, "sess2", "/repo", "main", None, Agent::Claude, Agent::Claude).unwrap();
+        create_session(
+            &db,
+            "sess2",
+            "/repo",
+            "main",
+            None,
+            Agent::Claude,
+            Agent::Claude,
+        )
+        .unwrap();
         let message_id =
             send_message(&db, "sess2", "claude", "codex", "draft", "x", "drawer-x").unwrap();
         ack_message(&db, "sess2", &message_id).unwrap();
@@ -814,7 +841,16 @@ mod tests {
     #[test]
     fn test_register_caps_upsert() {
         let db = open();
-        create_session(&db, "sess3", "/repo", "main", None, Agent::Claude, Agent::Claude).unwrap();
+        create_session(
+            &db,
+            "sess3",
+            "/repo",
+            "main",
+            None,
+            Agent::Claude,
+            Agent::Claude,
+        )
+        .unwrap();
         register_caps(
             &db,
             "sess3",
@@ -846,7 +882,16 @@ mod tests {
     #[test]
     fn test_get_caps_empty_before_register() {
         let db = open();
-        create_session(&db, "sess4", "/repo", "main", None, Agent::Claude, Agent::Claude).unwrap();
+        create_session(
+            &db,
+            "sess4",
+            "/repo",
+            "main",
+            None,
+            Agent::Claude,
+            Agent::Claude,
+        )
+        .unwrap();
         let caps = get_caps(&db, "sess4", Some("claude")).unwrap();
         assert!(caps.is_empty());
     }
@@ -889,7 +934,16 @@ mod tests {
     #[test]
     fn test_review_round_persists() {
         let db = open();
-        create_session(&db, "sess-rr", "/repo", "main", None, Agent::Claude, Agent::Claude).unwrap();
+        create_session(
+            &db,
+            "sess-rr",
+            "/repo",
+            "main",
+            None,
+            Agent::Claude,
+            Agent::Claude,
+        )
+        .unwrap();
         let mut session = load_session(&db, "sess-rr").unwrap();
         session.review_round = 2;
         save_session(&db, &session).unwrap();
@@ -900,7 +954,16 @@ mod tests {
     #[test]
     fn test_ensure_active_rejects_ended_session() {
         let db = open();
-        create_session(&db, "sess-end", "/repo", "main", None, Agent::Claude, Agent::Claude).unwrap();
+        create_session(
+            &db,
+            "sess-end",
+            "/repo",
+            "main",
+            None,
+            Agent::Claude,
+            Agent::Claude,
+        )
+        .unwrap();
         ensure_active(&db, "sess-end").unwrap();
         end_session(&db, "sess-end").unwrap();
         let err = ensure_active(&db, "sess-end").unwrap_err();
@@ -910,7 +973,16 @@ mod tests {
     #[test]
     fn test_end_session_idempotent() {
         let db = open();
-        create_session(&db, "sess-end2", "/repo", "main", None, Agent::Claude, Agent::Claude).unwrap();
+        create_session(
+            &db,
+            "sess-end2",
+            "/repo",
+            "main",
+            None,
+            Agent::Claude,
+            Agent::Claude,
+        )
+        .unwrap();
         end_session(&db, "sess-end2").unwrap();
         // Calling end_session a second time must succeed (idempotent).
         end_session(&db, "sess-end2").unwrap();
@@ -926,7 +998,16 @@ mod tests {
     #[test]
     fn test_v2_fields_round_trip() {
         let db = open();
-        create_session(&db, "sess-v2", "/repo", "main", None, Agent::Claude, Agent::Claude).unwrap();
+        create_session(
+            &db,
+            "sess-v2",
+            "/repo",
+            "main",
+            None,
+            Agent::Claude,
+            Agent::Claude,
+        )
+        .unwrap();
         let mut session = load_session(&db, "sess-v2").unwrap();
         session.task_list = Some(r#"{"plan_hash":"pf","tasks":[{"id":1},{"id":2}]}"#.to_string());
         session.task_review_round = 1;
@@ -952,7 +1033,16 @@ mod tests {
     #[test]
     fn test_v1_defaults_for_fresh_session() {
         let db = open();
-        create_session(&db, "sess-fresh", "/repo", "main", None, Agent::Claude, Agent::Claude).unwrap();
+        create_session(
+            &db,
+            "sess-fresh",
+            "/repo",
+            "main",
+            None,
+            Agent::Claude,
+            Agent::Claude,
+        )
+        .unwrap();
         let session = load_session(&db, "sess-fresh").unwrap();
         assert!(session.task_list.is_none());
         assert_eq!(session.task_review_round, 0);
@@ -972,8 +1062,16 @@ mod tests {
     #[test]
     fn test_create_session_pilot_and_implementer_defaults_and_non_default() {
         let db = open();
-        create_session(&db, "sess-pilot-default", "/repo", "main", None, Agent::Claude, Agent::Claude)
-            .unwrap();
+        create_session(
+            &db,
+            "sess-pilot-default",
+            "/repo",
+            "main",
+            None,
+            Agent::Claude,
+            Agent::Claude,
+        )
+        .unwrap();
         let default_session = load_session(&db, "sess-pilot-default").unwrap();
         assert_eq!(default_session.pilot, Agent::Claude);
         assert_eq!(default_session.implementer, Agent::Claude);
@@ -1066,8 +1164,16 @@ mod tests {
     #[test]
     fn test_set_pilot_updates_pilot_and_optional_owner() {
         let db = open();
-        create_session(&db, "sess-set-pilot", "/repo", "main", None, Agent::Claude, Agent::Claude)
-            .unwrap();
+        create_session(
+            &db,
+            "sess-set-pilot",
+            "/repo",
+            "main",
+            None,
+            Agent::Claude,
+            Agent::Claude,
+        )
+        .unwrap();
 
         set_pilot(&db, "sess-set-pilot", Agent::Codex, None).unwrap();
         let session = load_session(&db, "sess-set-pilot").unwrap();
@@ -1094,7 +1200,16 @@ mod tests {
     #[test]
     fn test_recovery_fields_round_trip() {
         let db = open();
-        create_session(&db, "sess-recovery", "/repo", "main", None, Agent::Claude, Agent::Claude).unwrap();
+        create_session(
+            &db,
+            "sess-recovery",
+            "/repo",
+            "main",
+            None,
+            Agent::Claude,
+            Agent::Claude,
+        )
+        .unwrap();
         let mut session = load_session(&db, "sess-recovery").unwrap();
         session.pending_failure = Some("git_push_failed: remote rejected".to_string());
         session.failed_from_phase = Some(Phase::CodeImplementPending);
@@ -1141,7 +1256,16 @@ mod tests {
         // and both attempt counters defaulted to `0` (not propagated as an
         // error or left uninitialized).
         let db = open();
-        create_session(&db, "sess-legacy", "/repo", "main", None, Agent::Claude, Agent::Claude).unwrap();
+        create_session(
+            &db,
+            "sess-legacy",
+            "/repo",
+            "main",
+            None,
+            Agent::Claude,
+            Agent::Claude,
+        )
+        .unwrap();
         let session = load_session(&db, "sess-legacy").unwrap();
         assert!(session.pending_failure.is_none());
         assert!(session.failed_from_phase.is_none());
@@ -1155,7 +1279,16 @@ mod tests {
     #[test]
     fn test_plan_drawer_ids_round_trip() {
         let db = open();
-        create_session(&db, "sess-drawers", "/repo", "main", None, Agent::Claude, Agent::Claude).unwrap();
+        create_session(
+            &db,
+            "sess-drawers",
+            "/repo",
+            "main",
+            None,
+            Agent::Claude,
+            Agent::Claude,
+        )
+        .unwrap();
 
         // Fresh session: both drawer ids must be NULL (legacy inline path).
         let session = load_session(&db, "sess-drawers").unwrap();
@@ -1184,7 +1317,16 @@ mod tests {
     #[test]
     fn test_ack_messages_many_marks_all_acked() {
         let db = open();
-        create_session(&db, "amm-1", "/repo", "main", None, Agent::Claude, Agent::Claude).unwrap();
+        create_session(
+            &db,
+            "amm-1",
+            "/repo",
+            "main",
+            None,
+            Agent::Claude,
+            Agent::Claude,
+        )
+        .unwrap();
         let m1 = send_message(
             &db, "amm-1", "claude", "codex", "draft", "msg-a", "drawer-a",
         )
@@ -1214,7 +1356,16 @@ mod tests {
     #[test]
     fn test_ack_messages_many_empty_list_is_noop() {
         let db = open();
-        create_session(&db, "amm-2", "/repo", "main", None, Agent::Claude, Agent::Claude).unwrap();
+        create_session(
+            &db,
+            "amm-2",
+            "/repo",
+            "main",
+            None,
+            Agent::Claude,
+            Agent::Claude,
+        )
+        .unwrap();
         send_message(
             &db, "amm-2", "claude", "codex", "draft", "msg-a", "drawer-a",
         )
@@ -1231,7 +1382,16 @@ mod tests {
     #[test]
     fn test_ack_messages_many_partial_subset() {
         let db = open();
-        create_session(&db, "amm-3", "/repo", "main", None, Agent::Claude, Agent::Claude).unwrap();
+        create_session(
+            &db,
+            "amm-3",
+            "/repo",
+            "main",
+            None,
+            Agent::Claude,
+            Agent::Claude,
+        )
+        .unwrap();
         let m1 = send_message(
             &db,
             "amm-3",
@@ -1275,8 +1435,26 @@ mod tests {
     #[test]
     fn test_ack_messages_many_wrong_session_skipped() {
         let db = open();
-        create_session(&db, "amm-4a", "/repo", "main", None, Agent::Claude, Agent::Claude).unwrap();
-        create_session(&db, "amm-4b", "/repo", "main", None, Agent::Claude, Agent::Claude).unwrap();
+        create_session(
+            &db,
+            "amm-4a",
+            "/repo",
+            "main",
+            None,
+            Agent::Claude,
+            Agent::Claude,
+        )
+        .unwrap();
+        create_session(
+            &db,
+            "amm-4b",
+            "/repo",
+            "main",
+            None,
+            Agent::Claude,
+            Agent::Claude,
+        )
+        .unwrap();
         let m1 = send_message(&db, "amm-4a", "claude", "codex", "draft", "x", "drawer-x").unwrap();
 
         // Passing the correct message ID but the WRONG session_id: zero rows
@@ -1294,10 +1472,37 @@ mod tests {
     fn find_active_session_including_terminal_isolates_repo_and_branch() {
         let db = open();
         // /repo-a: one ended (older) + one active session on the same branch.
-        create_session(&db, "a-old", "/repo-a", "main", None, Agent::Claude, Agent::Claude).unwrap();
+        create_session(
+            &db,
+            "a-old",
+            "/repo-a",
+            "main",
+            None,
+            Agent::Claude,
+            Agent::Claude,
+        )
+        .unwrap();
         end_session(&db, "a-old").unwrap();
-        create_session(&db, "a-active-1", "/repo-a", "main", None, Agent::Claude, Agent::Claude).unwrap();
-        create_session(&db, "a-active-2", "/repo-a", "main", None, Agent::Claude, Agent::Claude).unwrap();
+        create_session(
+            &db,
+            "a-active-1",
+            "/repo-a",
+            "main",
+            None,
+            Agent::Claude,
+            Agent::Claude,
+        )
+        .unwrap();
+        create_session(
+            &db,
+            "a-active-2",
+            "/repo-a",
+            "main",
+            None,
+            Agent::Claude,
+            Agent::Claude,
+        )
+        .unwrap();
         // `created_at` is second-resolution, so insertion order alone may not
         // disambiguate two same-second rows. Pin both active rows to the SAME
         // instant so the `id DESC` tie-break (not creation timing) is what
@@ -1319,7 +1524,16 @@ mod tests {
             Agent::Claude,
         )
         .unwrap();
-        create_session(&db, "b-active", "/repo-b", "main", None, Agent::Claude, Agent::Claude).unwrap();
+        create_session(
+            &db,
+            "b-active",
+            "/repo-b",
+            "main",
+            None,
+            Agent::Claude,
+            Agent::Claude,
+        )
+        .unwrap();
 
         let found =
             find_active_session_by_repo_branch_including_terminal(&db, "/repo-a", "main").unwrap();
@@ -1352,7 +1566,16 @@ mod tests {
     #[test]
     fn find_active_session_by_repo_branch_releases_only_coding_complete() {
         let db = open();
-        create_session(&db, "terminal-scope", "/repo", "main", None, Agent::Claude, Agent::Claude).unwrap();
+        create_session(
+            &db,
+            "terminal-scope",
+            "/repo",
+            "main",
+            None,
+            Agent::Claude,
+            Agent::Claude,
+        )
+        .unwrap();
 
         assert_eq!(
             find_active_session_by_repo_branch(&db, "/repo", "main")
@@ -1373,7 +1596,16 @@ mod tests {
              is a human step and must not block the branch"
         );
 
-        create_session(&db, "coding-scope", "/repo", "main", None, Agent::Claude, Agent::Claude).unwrap();
+        create_session(
+            &db,
+            "coding-scope",
+            "/repo",
+            "main",
+            None,
+            Agent::Claude,
+            Agent::Claude,
+        )
+        .unwrap();
         let mut coding = load_session(&db, "coding-scope").unwrap();
         coding.phase = Phase::CodeImplementPending;
         coding.current_owner = Agent::Claude;
@@ -1410,7 +1642,16 @@ mod tests {
     #[test]
     fn attribution_lookup_still_sees_coding_complete_sessions() {
         let db = open();
-        create_session(&db, "attested", "/repo", "main", None, Agent::Claude, Agent::Claude).unwrap();
+        create_session(
+            &db,
+            "attested",
+            "/repo",
+            "main",
+            None,
+            Agent::Claude,
+            Agent::Claude,
+        )
+        .unwrap();
         let mut complete = load_session(&db, "attested").unwrap();
         complete.phase = Phase::CodingComplete;
         save_session(&db, &complete).unwrap();

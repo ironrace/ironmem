@@ -427,7 +427,15 @@ mod tests {
         let sid = uuid::Uuid::new_v4().to_string();
         app.db
             .with_transaction(|tx| {
-                create_session(tx, &sid, "/repo", "main", Some("task"), Agent::Claude, Agent::Claude)
+                create_session(
+                    tx,
+                    &sid,
+                    "/repo",
+                    "main",
+                    Some("task"),
+                    Agent::Claude,
+                    Agent::Claude,
+                )
             })
             .unwrap();
         sid

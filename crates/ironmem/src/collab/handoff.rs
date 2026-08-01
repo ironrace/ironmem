@@ -300,7 +300,16 @@ mod tests {
     }
 
     fn seed_session(conn: &Connection, id: &str) {
-        create_session(conn, id, "/repo", "main", Some("t"), Agent::Claude, Agent::Claude).unwrap();
+        create_session(
+            conn,
+            id,
+            "/repo",
+            "main",
+            Some("t"),
+            Agent::Claude,
+            Agent::Claude,
+        )
+        .unwrap();
     }
 
     #[test]

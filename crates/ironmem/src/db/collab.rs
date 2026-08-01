@@ -126,8 +126,15 @@ mod tests {
     #[test]
     fn collab_send_message_rejects_a_dangling_drawer_ref() {
         let db = Database::open_in_memory().unwrap();
-        db.collab_create_session("session", "/repo", "main", None, Agent::Claude, Agent::Claude)
-            .unwrap();
+        db.collab_create_session(
+            "session",
+            "/repo",
+            "main",
+            None,
+            Agent::Claude,
+            Agent::Claude,
+        )
+        .unwrap();
 
         let err = db
             .collab_send_message(
