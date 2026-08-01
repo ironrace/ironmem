@@ -2618,8 +2618,10 @@ fn pilot_claude_final_review_wrong_actor_rejected() {
 
 #[test]
 fn pilot_claude_new_global_review_seeds_owner_and_implementer() {
-    // `start_global_review_session` pins `pilot` to `Agent::Claude` today
-    // (see its doc comment in `mod.rs`), and `new_global_review` derives
+    // `start_global_review_session` now takes `pilot` as a real parameter;
+    // the MCP caller (`handle_collab_start_code_review`) is what pins it to
+    // `Agent::Claude` today (see the comment at that call site in
+    // `collab_session.rs`). `new_global_review` derives
     // `current_owner = counterpart(pilot)` and `implementer = pilot`.
     let session = start_global_review_session("s1", "basesha", "headsha", Agent::Claude).unwrap();
     assert_eq!(session.pilot, Agent::Claude);
