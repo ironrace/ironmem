@@ -705,10 +705,10 @@ pub(super) fn handle_collab_set_implementer(app: &App, args: &Value) -> Result<V
 pub(super) fn handle_collab_set_pilot(app: &App, args: &Value) -> Result<Value, MemoryError> {
     let session_id = require_str(args, "session_id")?;
     let agent = require_agent(require_str(args, "agent")?)?;
-    // `require_pilot` rather than `require_agent` for this field only so a bad
-    // value names `pilot` in the error text, exactly as `handle_collab_set_
-    // implementer` uses `require_implementer` for its own role field. Same
-    // accept-set either way.
+    // `require_pilot` rather than `require_agent` for this field only, so a
+    // bad value names `pilot` in the error text — the same reason the model
+    // handler above validates its own role field with `require_implementer`.
+    // Identical accept-set either way; only the message differs.
     let pilot = require_pilot(require_str(args, "pilot")?)?;
 
     app.db.with_transaction(|tx| {
