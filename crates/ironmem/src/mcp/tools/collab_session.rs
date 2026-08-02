@@ -671,17 +671,26 @@ pub(super) fn handle_collab_start_code_review(
     let base_sha = require_str(args, "base_sha")?;
     let head_sha = require_str(args, "head_sha")?;
     let initiator = require_agent(require_str(args, "initiator")?)?;
+    // `initiator` names the *dispatcher* allowed to invoke this shortcut —
+    // orthogonal to `pilot` below, which names the review-flow lead. This
+    // check stays unconditional: it rejects a non-claude initiator even when
+    // `pilot=codex`.
     if initiator != Agent::Claude {
         return Err(MemoryError::Validation(
             "initiator must be 'claude' for collab_start_code_review".to_string(),
         ));
     }
     let task = sanitize::sanitize_content(require_str(args, "task")?, MAX_COLLAB_CONTENT_CHARS)?;
+    // Optional `pilot` field: same pattern and default as `collab_start`
+    // (Task 7). Resolved before `start_global_review_session` — that call
+    // needs the real value, not a hardcoded stand-in — and before the
+    // transaction opens.
+    let pilot = match args.get("pilot").and_then(Value::as_str) {
+        Some(value) => require_pilot(value)?,
+        None => Agent::Claude,
+    };
     let session_id = uuid::Uuid::new_v4().to_string();
-    // `initiator` is already constrained to `Agent::Claude` above, so the
-    // pilot passed here is that same fixed choice; this surface gains a real
-    // pilot selection in a later task.
-    let session = start_global_review_session(&session_id, base_sha, head_sha, Agent::Claude)
+    let session = start_global_review_session(&session_id, base_sha, head_sha, pilot)
         .map_err(collab_error_to_memory_error)?;
 
     app.db.with_transaction(|tx| {
@@ -698,19 +707,22 @@ pub(super) fn handle_collab_start_code_review(
             )));
         }
         ensure_no_conflicting_process_session_tx(app, tx, &session_id, repo_path, branch)?;
-        // Shortcut sessions never enter `CodeImplementPending`, so the
-        // `implementer` field is fixed at `Agent::Claude` for uniformity.
-        // `pilot` is likewise fixed here (see `start_global_review_session`);
-        // the immediately-following `save_session(tx, &session)` overwrites
-        // both with `session`'s actual values regardless.
+        // Shortcut sessions never enter `CodeImplementPending`, so `implementer`
+        // is seeded from the resolved `pilot` for uniformity (there is no
+        // separate implementer selection on this entry point). This is
+        // belt-and-suspenders, not redundant-and-deletable: the
+        // immediately-following `save_session(tx, &session)` is the
+        // authoritative write and overwrites both fields with `session`'s
+        // actual values regardless, but a reader who only sees this call
+        // should still see the real resolved values, not a stale placeholder.
         crate::collab::queue::create_session(
             tx,
             &session_id,
             repo_path,
             branch,
             Some(task),
-            Agent::Claude,
-            Agent::Claude,
+            pilot,
+            pilot,
         )?;
         crate::collab::queue::save_session(tx, &session)?;
         crate::db::schema::Database::wal_log_tx(
@@ -723,6 +735,7 @@ pub(super) fn handle_collab_start_code_review(
                 "base_sha": base_sha,
                 "head_sha": head_sha,
                 "initiator": initiator.as_str(),
+                "pilot": pilot.as_str(),
                 "task": task,
             }),
             Some(&json!({ "session_id": session_id })),
@@ -733,7 +746,7 @@ pub(super) fn handle_collab_start_code_review(
     app.set_active_collab_session_for_scope(&session_id, repo_path, branch);
     create_initial_task_outcome(app, &session_id);
 
-    Ok(json!({ "session_id": session_id, "task": task }))
+    Ok(json!({ "session_id": session_id, "task": task, "pilot": pilot.as_str() }))
 }
 
 pub(super) fn handle_collab_send(app: &App, args: &Value) -> Result<Value, MemoryError> {

@@ -286,7 +286,7 @@ pub fn tool_definitions(app: &App) -> Vec<Value> {
         }),
         json!({
             "name": "collab_start_code_review",
-            "description": "Create a Claude↔Codex review-only session at global review. Initiator must be claude.",
+            "description": "Claude↔Codex review-only session at global review.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -295,7 +295,8 @@ pub fn tool_definitions(app: &App) -> Vec<Value> {
                     "base_sha": { "type": "string" },
                     "head_sha": { "type": "string" },
                     "initiator": { "type": "string", "enum": ["claude"] },
-                    "task": { "type": "string" }
+                    "task": { "type": "string" },
+                    "pilot": { "type": "string", "enum": ["claude", "codex"] }
                 },
                 "required": ["repo_path", "branch", "base_sha", "head_sha", "initiator", "task"]
             }

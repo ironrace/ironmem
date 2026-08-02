@@ -1123,12 +1123,18 @@ fn collab_start_code_review_roundtrips_via_status() {
         }),
     );
     assert_eq!(started["task"], "review landing page branch");
+    // Pin of the `pilot`-omitted default: `pilot` resolves to `claude` and
+    // `current_owner` seeds at `copilot(claude)` = `codex`, exactly today's
+    // pre-Task-8 behavior. If this ever drifts, it must be a deliberate
+    // change to the resolved default, not a silent regression.
+    assert_eq!(started["pilot"], "claude");
     let session_id = started["session_id"].as_str().unwrap();
 
     let status = call_tool(&app, "collab_status", json!({ "session_id": session_id }));
     assert_eq!(status["task"], "review landing page branch");
     assert_eq!(status["phase"], "CodeReviewFixGlobalPending");
     assert_eq!(status["current_owner"], "codex");
+    assert_eq!(status["pilot"], "claude");
     assert_eq!(status["base_sha"], "abc123");
     assert_eq!(status["last_head_sha"], "def456");
     assert!(status["task_list"].is_null());
@@ -1150,6 +1156,156 @@ fn collab_start_code_review_rejects_codex_initiator() {
         }),
     );
     assert!(error.contains("initiator must be 'claude'"));
+}
+
+#[test]
+fn collab_start_code_review_rejects_codex_initiator_even_with_pilot_codex() {
+    // The dispatcher-side `initiator must be 'claude'` check is orthogonal to
+    // `pilot`: it must reject a non-claude initiator unconditionally, even
+    // when the caller also asks for `pilot=codex`.
+    let app = App::open_for_test().unwrap();
+    let error = call_tool_expect_error(
+        &app,
+        "collab_start_code_review",
+        json!({
+            "repo_path": "/repo",
+            "branch": "feat/landing-page",
+            "base_sha": "abc123",
+            "head_sha": "def456",
+            "initiator": "codex",
+            "pilot": "codex",
+            "task": "review landing page branch"
+        }),
+    );
+    assert!(error.contains("initiator must be 'claude'"));
+}
+
+#[test]
+fn collab_start_code_review_pilot_codex_mirrors_owners_and_refuses_off_role() {
+    // `pilot=codex` review-only session: `start_global_review_session` seeds
+    // `current_owner = copilot(codex)` = `claude` (the copilot always moves
+    // first in the v3 global-review linear flow). Read from `apply_event`'s
+    // `CodeReviewFixGlobalPending`/`CodeReviewLocalPending`/
+    // `CodeReviewFinalPending` arms (crates/ironmem/src/collab/state_machine/mod.rs):
+    //   CodeReviewFixGlobalPending, owner=claude (copilot)
+    //     --review_fix_global(claude)--> CodeReviewLocalPending, owner=codex (pilot)
+    //     --review_local(codex)--> CodeReviewFinalPending, owner=codex (pilot)
+    //     --final_review(codex)--> CodingComplete, owner=codex (pilot)
+    let app = App::open_for_test().unwrap();
+    let (_temp, repo_path, base_sha, head_sha, descendant_sha, _drift_sha) = git_repo_fixture();
+    let started = call_tool(
+        &app,
+        "collab_start_code_review",
+        json!({
+            "repo_path": repo_path,
+            "branch": "feat/review-shortcut-codex-pilot",
+            "base_sha": base_sha,
+            "head_sha": head_sha,
+            "initiator": "claude",
+            "pilot": "codex",
+            "task": "review completed branch"
+        }),
+    );
+    assert_eq!(started["pilot"], "codex");
+    let session_id = started["session_id"].as_str().unwrap();
+
+    let status = call_tool(&app, "collab_status", json!({ "session_id": session_id }));
+    assert_eq!(status["phase"], "CodeReviewFixGlobalPending");
+    assert_eq!(status["current_owner"], "claude");
+    assert_eq!(status["pilot"], "codex");
+
+    // Off-role: codex is the pilot, not the current owner yet — refused.
+    let err = call_tool_expect_error(
+        &app,
+        "collab_send",
+        json!({
+            "session_id": session_id,
+            "sender": "codex",
+            "topic": "review_fix_global",
+            "content": json!({ "head_sha": descendant_sha }).to_string()
+        }),
+    );
+    assert!(
+        err.to_lowercase().contains("not your turn"),
+        "expected turn-ownership error, got: {err}"
+    );
+
+    // Claude (copilot) submits review_fix_global -> owner flips to codex (pilot).
+    call_tool(
+        &app,
+        "collab_send",
+        json!({
+            "session_id": session_id,
+            "sender": "claude",
+            "topic": "review_fix_global",
+            "content": json!({ "head_sha": descendant_sha }).to_string()
+        }),
+    );
+    let status = call_tool(&app, "collab_status", json!({ "session_id": session_id }));
+    assert_eq!(status["phase"], "CodeReviewLocalPending");
+    assert_eq!(status["current_owner"], "codex");
+
+    // Off-role: claude is the copilot now, not the owner — refused.
+    let err = call_tool_expect_error(
+        &app,
+        "collab_send",
+        json!({
+            "session_id": session_id,
+            "sender": "claude",
+            "topic": "review_local",
+            "content": json!({ "head_sha": descendant_sha }).to_string()
+        }),
+    );
+    assert!(
+        err.to_lowercase().contains("not your turn"),
+        "expected turn-ownership error, got: {err}"
+    );
+
+    // Codex (pilot) submits review_local -> stays owner into CodeReviewFinalPending.
+    call_tool(
+        &app,
+        "collab_send",
+        json!({
+            "session_id": session_id,
+            "sender": "codex",
+            "topic": "review_local",
+            "content": json!({ "head_sha": descendant_sha }).to_string()
+        }),
+    );
+    let status = call_tool(&app, "collab_status", json!({ "session_id": session_id }));
+    assert_eq!(status["phase"], "CodeReviewFinalPending");
+    assert_eq!(status["current_owner"], "codex");
+
+    // Off-role: claude tries the final PR turn — refused.
+    let err = call_tool_expect_error(
+        &app,
+        "collab_send",
+        json!({
+            "session_id": session_id,
+            "sender": "claude",
+            "topic": "final_review",
+            "content": json!({ "head_sha": descendant_sha, "pr_url": "https://example/pr/9" }).to_string()
+        }),
+    );
+    assert!(
+        err.to_lowercase().contains("not your turn"),
+        "expected turn-ownership error, got: {err}"
+    );
+
+    // Codex (pilot) submits final_review -> CodingComplete.
+    call_tool(
+        &app,
+        "collab_send",
+        json!({
+            "session_id": session_id,
+            "sender": "codex",
+            "topic": "final_review",
+            "content": json!({ "head_sha": descendant_sha, "pr_url": "https://example/pr/9" }).to_string()
+        }),
+    );
+    let status = call_tool(&app, "collab_status", json!({ "session_id": session_id }));
+    assert_eq!(status["phase"], "CodingComplete");
+    assert_eq!(status["pilot"], "codex");
 }
 
 #[test]
