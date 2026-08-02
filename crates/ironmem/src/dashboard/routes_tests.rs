@@ -53,6 +53,7 @@ fn fixture() -> Fixture {
                 "main",
                 Some("dashboard task"),
                 crate::collab::Agent::Claude,
+                crate::collab::Agent::Claude,
             )
         })
         .unwrap();

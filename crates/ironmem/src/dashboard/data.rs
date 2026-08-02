@@ -1180,6 +1180,7 @@ mod tests {
                     "main",
                     Some("test task"),
                     crate::collab::Agent::Claude,
+                    crate::collab::Agent::Claude,
                 )
             })
             .unwrap();

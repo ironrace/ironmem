@@ -192,6 +192,7 @@ pub(super) fn compose_handoff_block(
     let _ = writeln!(out, "phase: {}", s.phase);
     let _ = writeln!(out, "current_owner: {}", s.current_owner.as_str());
     let _ = writeln!(out, "implementer: {}", s.implementer.as_str());
+    let _ = writeln!(out, "pilot: {}", s.pilot.as_str());
     let _ = writeln!(out, "repo_path: {}", record.repo_path);
     let _ = writeln!(out, "branch: {}", record.branch);
     let _ = writeln!(out, "base_sha: {}", opt(s.base_sha.as_deref()));
@@ -415,6 +416,17 @@ mod tests {
         assert!(a.contains("handoff.generation: 1"));
     }
 
+    /// A `pilot=codex` session must expose that pilot in the handoff block —
+    /// a successor picking up a reversed session has no other way to route
+    /// which agent leads planning.
+    #[test]
+    fn compose_block_reports_non_default_pilot() {
+        let mut r = sample_record(Phase::PlanParallelDrafts);
+        r.session.pilot = Agent::Codex;
+        let block = compose_handoff_block(&r, Agent::Claude, 1, None);
+        assert!(block.contains("pilot: codex"), "block was:\n{block}");
+    }
+
     fn test_handoff_app() -> (Arc<crate::mcp::app::App>, tempfile::TempDir) {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("mem.sqlite3");
@@ -427,7 +439,15 @@ mod tests {
         let sid = uuid::Uuid::new_v4().to_string();
         app.db
             .with_transaction(|tx| {
-                create_session(tx, &sid, "/repo", "main", Some("task"), Agent::Claude)
+                create_session(
+                    tx,
+                    &sid,
+                    "/repo",
+                    "main",
+                    Some("task"),
+                    Agent::Claude,
+                    Agent::Claude,
+                )
             })
             .unwrap();
         sid
@@ -450,6 +470,7 @@ mod tests {
                     "/repo",
                     "main",
                     Some("t"),
+                    Agent::Claude,
                     Agent::Claude,
                 )
             })
@@ -488,6 +509,7 @@ mod tests {
                     "/repo",
                     "main",
                     Some("t"),
+                    Agent::Claude,
                     Agent::Claude,
                 )
             })
@@ -720,7 +742,7 @@ gates: passed\n";
         use crate::collab::Phase::*;
         for phase in [
             PlanParallelDrafts,
-            PlanCodexReviewPending,
+            PlanCopilotReviewPending,
             PlanLocked,
             CodeImplementPending,
             CodeReviewFixGlobalPending,
@@ -983,6 +1005,7 @@ gates: passed\n";
                         "/repo",
                         "main",
                         Some("t"),
+                        Agent::Claude,
                         Agent::Claude,
                     )
                 })

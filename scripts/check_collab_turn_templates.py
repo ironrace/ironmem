@@ -351,6 +351,42 @@ def check_review_diff_trigger_detection_contract() -> None:
         err(f"{path.relative_to(ROOT)}: missing review-diff trigger-detection contract")
 
 
+def check_pr_base_resolution_contract() -> None:
+    """The PR base is the integration branch, never gated on `base_sha`.
+
+    Regression guard for a live session that died at the final turn: the base
+    branch was resolved by requiring `base_sha` to be *contained* in
+    `origin/main`. A collab branch is routinely cut from a local commit that
+    never landed on the remote default, so containment failed, resolution
+    failed, and the turn reported `pr_create_failed:` — which classifies
+    Terminal. A whole reviewed, pushed, green branch lost its session at the
+    one step that only opens a PR.
+
+    Containment may inform the body (it marks commits that predate the
+    reviewed range and so were reviewed by nobody); it must never decide
+    whether the turn can proceed.
+    """
+    path = PROMPTS / "collab-turn-submit.md"
+    if not path.exists():
+        err(f"{path.relative_to(ROOT)}: missing submit template")
+        return
+    text = path.read_text()
+    for snippet in (
+        "integration branch",
+        "never a requirement",
+        "MUST NOT fail this turn",
+        "Unreviewed commits in this PR",
+    ):
+        if snippet not in text:
+            err(f"{path.relative_to(ROOT)}: missing PR-base resolution "
+                f"contract {snippet!r}")
+    # The exact shape of the original defect: resolution conditioned on the
+    # base branch containing base_sha.
+    if re.search(r"when they contain that commit", text):
+        err(f"{path.relative_to(ROOT)}: base-branch resolution must not be "
+            f"gated on base_sha containment")
+
+
 def err(msg: str) -> None:
     errors.append(msg)
 
@@ -590,6 +626,7 @@ def main() -> int:
     check_no_uninstalled_skill_references()
     check_evaluate_issue_surfaces()
     check_review_diff_fallback_contract()
+    check_pr_base_resolution_contract()
     check_review_diff_trigger_detection_contract()
 
     if errors:

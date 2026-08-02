@@ -237,6 +237,7 @@ fn tools_list_contains_required_tools() {
         "diary_write",
         "collab_start_code_review",
         "collab_set_implementer",
+        "collab_set_pilot",
     ] {
         assert!(
             names.contains(required),
@@ -261,6 +262,7 @@ fn tools_list_read_only_mode_excludes_write_tools() {
         "delete_drawer",
         "diary_write",
         "collab_set_implementer",
+        "collab_set_pilot",
     ] {
         assert!(
             !names.contains(blocked),
@@ -306,6 +308,12 @@ fn get_drawer_round_trips_by_id() {
 
 #[test]
 fn search_defaults_to_excerpt_and_get_drawer_dereferences_the_full_body() {
+    // `IRONMEM_COMPACT_RESPONSES` is process-global and flipped by the
+    // `search_response_*` tests in this same binary. Every assertion below
+    // reads `results` as a plain array, which the compact envelope replaces
+    // with a `__compact_v1` object — so this test has to hold the same lock
+    // those tests use, not merely assume the variable is unset.
+    let _compact_guard = CompactResponsesEnvGuard::disabled();
     let app = App::open_for_test().unwrap();
     let body = format!(
         "MCP protocol fixture prefix. {} needle exact body. {}after",
@@ -349,6 +357,12 @@ fn search_defaults_to_excerpt_and_get_drawer_dereferences_the_full_body() {
 
 #[test]
 fn search_full_returns_content_over_mcp() {
+    // `IRONMEM_COMPACT_RESPONSES` is process-global and flipped by the
+    // `search_response_*` tests in this same binary. Every assertion below
+    // reads `results` as a plain array, which the compact envelope replaces
+    // with a `__compact_v1` object — so this test has to hold the same lock
+    // those tests use, not merely assume the variable is unset.
+    let _compact_guard = CompactResponsesEnvGuard::disabled();
     let app = App::open_for_test().unwrap();
     let body = "MCP full search fixture with the exact body";
     let added = call_tool(
@@ -440,6 +454,12 @@ fn search_rejects_string_full_over_mcp() {
 
 #[test]
 fn search_response_budget_preserves_references_in_excerpt_and_full_modes() {
+    // `IRONMEM_COMPACT_RESPONSES` is process-global and flipped by the
+    // `search_response_*` tests in this same binary. Every assertion below
+    // reads `results` as a plain array, which the compact envelope replaces
+    // with a `__compact_v1` object — so this test has to hold the same lock
+    // those tests use, not merely assume the variable is unset.
+    let _compact_guard = CompactResponsesEnvGuard::disabled();
     let app = App::open_for_test().unwrap();
     let query = "aggregatebudgetfixture";
     let wing = "protocol-tests";
@@ -530,6 +550,12 @@ fn search_response_budget_preserves_references_in_excerpt_and_full_modes() {
 
 #[test]
 fn search_default_response_is_at_least_five_times_smaller_than_full_response() {
+    // `IRONMEM_COMPACT_RESPONSES` is process-global and flipped by the
+    // `search_response_*` tests in this same binary. Every assertion below
+    // reads `results` as a plain array, which the compact envelope replaces
+    // with a `__compact_v1` object — so this test has to hold the same lock
+    // those tests use, not merely assume the variable is unset.
+    let _compact_guard = CompactResponsesEnvGuard::disabled();
     let app = App::open_for_test().unwrap();
     let query = "sizefloorfixture";
     let ids = add_large_search_drawers(&app, query, "protocol-tests", "mcp", 10);
@@ -1099,12 +1125,18 @@ fn collab_start_code_review_roundtrips_via_status() {
         }),
     );
     assert_eq!(started["task"], "review landing page branch");
+    // Pin of the `pilot`-omitted default: `pilot` resolves to `claude` and
+    // `current_owner` seeds at `copilot(claude)` = `codex`, exactly today's
+    // pre-Task-8 behavior. If this ever drifts, it must be a deliberate
+    // change to the resolved default, not a silent regression.
+    assert_eq!(started["pilot"], "claude");
     let session_id = started["session_id"].as_str().unwrap();
 
     let status = call_tool(&app, "collab_status", json!({ "session_id": session_id }));
     assert_eq!(status["task"], "review landing page branch");
     assert_eq!(status["phase"], "CodeReviewFixGlobalPending");
     assert_eq!(status["current_owner"], "codex");
+    assert_eq!(status["pilot"], "claude");
     assert_eq!(status["base_sha"], "abc123");
     assert_eq!(status["last_head_sha"], "def456");
     assert!(status["task_list"].is_null());
@@ -1126,6 +1158,156 @@ fn collab_start_code_review_rejects_codex_initiator() {
         }),
     );
     assert!(error.contains("initiator must be 'claude'"));
+}
+
+#[test]
+fn collab_start_code_review_rejects_codex_initiator_even_with_pilot_codex() {
+    // The dispatcher-side `initiator must be 'claude'` check is orthogonal to
+    // `pilot`: it must reject a non-claude initiator unconditionally, even
+    // when the caller also asks for `pilot=codex`.
+    let app = App::open_for_test().unwrap();
+    let error = call_tool_expect_error(
+        &app,
+        "collab_start_code_review",
+        json!({
+            "repo_path": "/repo",
+            "branch": "feat/landing-page",
+            "base_sha": "abc123",
+            "head_sha": "def456",
+            "initiator": "codex",
+            "pilot": "codex",
+            "task": "review landing page branch"
+        }),
+    );
+    assert!(error.contains("initiator must be 'claude'"));
+}
+
+#[test]
+fn collab_start_code_review_pilot_codex_mirrors_owners_and_refuses_off_role() {
+    // `pilot=codex` review-only session: `start_global_review_session` seeds
+    // `current_owner = copilot(codex)` = `claude` (the copilot always moves
+    // first in the v3 global-review linear flow). Read from `apply_event`'s
+    // `CodeReviewFixGlobalPending`/`CodeReviewLocalPending`/
+    // `CodeReviewFinalPending` arms (crates/ironmem/src/collab/state_machine/mod.rs):
+    //   CodeReviewFixGlobalPending, owner=claude (copilot)
+    //     --review_fix_global(claude)--> CodeReviewLocalPending, owner=codex (pilot)
+    //     --review_local(codex)--> CodeReviewFinalPending, owner=codex (pilot)
+    //     --final_review(codex)--> CodingComplete, owner=codex (pilot)
+    let app = App::open_for_test().unwrap();
+    let (_temp, repo_path, base_sha, head_sha, descendant_sha, _drift_sha) = git_repo_fixture();
+    let started = call_tool(
+        &app,
+        "collab_start_code_review",
+        json!({
+            "repo_path": repo_path,
+            "branch": "feat/review-shortcut-codex-pilot",
+            "base_sha": base_sha,
+            "head_sha": head_sha,
+            "initiator": "claude",
+            "pilot": "codex",
+            "task": "review completed branch"
+        }),
+    );
+    assert_eq!(started["pilot"], "codex");
+    let session_id = started["session_id"].as_str().unwrap();
+
+    let status = call_tool(&app, "collab_status", json!({ "session_id": session_id }));
+    assert_eq!(status["phase"], "CodeReviewFixGlobalPending");
+    assert_eq!(status["current_owner"], "claude");
+    assert_eq!(status["pilot"], "codex");
+
+    // Off-role: codex is the pilot, not the current owner yet — refused.
+    let err = call_tool_expect_error(
+        &app,
+        "collab_send",
+        json!({
+            "session_id": session_id,
+            "sender": "codex",
+            "topic": "review_fix_global",
+            "content": json!({ "head_sha": descendant_sha }).to_string()
+        }),
+    );
+    assert!(
+        err.to_lowercase().contains("not your turn"),
+        "expected turn-ownership error, got: {err}"
+    );
+
+    // Claude (copilot) submits review_fix_global -> owner flips to codex (pilot).
+    call_tool(
+        &app,
+        "collab_send",
+        json!({
+            "session_id": session_id,
+            "sender": "claude",
+            "topic": "review_fix_global",
+            "content": json!({ "head_sha": descendant_sha }).to_string()
+        }),
+    );
+    let status = call_tool(&app, "collab_status", json!({ "session_id": session_id }));
+    assert_eq!(status["phase"], "CodeReviewLocalPending");
+    assert_eq!(status["current_owner"], "codex");
+
+    // Off-role: claude is the copilot now, not the owner — refused.
+    let err = call_tool_expect_error(
+        &app,
+        "collab_send",
+        json!({
+            "session_id": session_id,
+            "sender": "claude",
+            "topic": "review_local",
+            "content": json!({ "head_sha": descendant_sha }).to_string()
+        }),
+    );
+    assert!(
+        err.to_lowercase().contains("not your turn"),
+        "expected turn-ownership error, got: {err}"
+    );
+
+    // Codex (pilot) submits review_local -> stays owner into CodeReviewFinalPending.
+    call_tool(
+        &app,
+        "collab_send",
+        json!({
+            "session_id": session_id,
+            "sender": "codex",
+            "topic": "review_local",
+            "content": json!({ "head_sha": descendant_sha }).to_string()
+        }),
+    );
+    let status = call_tool(&app, "collab_status", json!({ "session_id": session_id }));
+    assert_eq!(status["phase"], "CodeReviewFinalPending");
+    assert_eq!(status["current_owner"], "codex");
+
+    // Off-role: claude tries the final PR turn — refused.
+    let err = call_tool_expect_error(
+        &app,
+        "collab_send",
+        json!({
+            "session_id": session_id,
+            "sender": "claude",
+            "topic": "final_review",
+            "content": json!({ "head_sha": descendant_sha, "pr_url": "https://example/pr/9" }).to_string()
+        }),
+    );
+    assert!(
+        err.to_lowercase().contains("not your turn"),
+        "expected turn-ownership error, got: {err}"
+    );
+
+    // Codex (pilot) submits final_review -> CodingComplete.
+    call_tool(
+        &app,
+        "collab_send",
+        json!({
+            "session_id": session_id,
+            "sender": "codex",
+            "topic": "final_review",
+            "content": json!({ "head_sha": descendant_sha, "pr_url": "https://example/pr/9" }).to_string()
+        }),
+    );
+    let status = call_tool(&app, "collab_status", json!({ "session_id": session_id }));
+    assert_eq!(status["phase"], "CodingComplete");
+    assert_eq!(status["pilot"], "codex");
 }
 
 #[test]
@@ -1194,6 +1376,12 @@ fn collab_recv_blocks_draft_peek_before_own_draft_submitted() {
 
 #[test]
 fn collab_recv_defaults_to_drawer_refs_that_get_drawer_can_dereference() {
+    // `IRONMEM_COMPACT_RESPONSES` is process-global and flipped by the
+    // `search_response_*` tests in this same binary. Every assertion below
+    // reads `results` as a plain array, which the compact envelope replaces
+    // with a `__compact_v1` object — so this test has to hold the same lock
+    // those tests use, not merely assume the variable is unset.
+    let _compact_guard = CompactResponsesEnvGuard::disabled();
     let app = App::open_for_test().unwrap();
     let content = "Claude's durable draft body";
     let started = call_tool(
@@ -2211,6 +2399,214 @@ fn collab_start_rejects_invalid_implementer() {
 }
 
 #[test]
+fn collab_start_accepts_pilot_codex_and_defaults_implementer_to_pilot() {
+    // `pilot=codex` with `implementer` omitted must round-trip through
+    // `collab_status` as pilot=codex AND implementer=codex — implementer's
+    // default follows the resolved pilot, not the historical hardcoded
+    // `claude`.
+    let app = App::open_for_test().unwrap();
+    let started = call_tool(
+        &app,
+        "collab_start",
+        json!({
+            "repo_path": "/repo",
+            "branch": "main",
+            "initiator": "claude",
+            "pilot": "codex"
+        }),
+    );
+    assert_eq!(started["pilot"], "codex");
+    assert_eq!(started["implementer"], "codex");
+    let session_id = started["session_id"].as_str().unwrap();
+
+    let status = call_tool(&app, "collab_status", json!({ "session_id": session_id }));
+    assert_eq!(status["pilot"], "codex");
+    assert_eq!(status["implementer"], "codex");
+}
+
+#[test]
+fn collab_pilot_and_implementer_remain_independent_in_the_reverse_mixed_case() {
+    // The inverse of the historical `pilot=claude, implementer=codex` route:
+    // pilot owns planning and the two post-implementation audit turns, while
+    // the independently selected implementer owns only the implementation.
+    let app = App::open_for_test().unwrap();
+    let started = call_tool(
+        &app,
+        "collab_start",
+        json!({
+            "repo_path": "/repo",
+            "branch": "pilot-codex-implementer-claude",
+            "initiator": "claude",
+            "pilot": "codex",
+            "implementer": "claude"
+        }),
+    );
+    let session_id = started["session_id"].as_str().unwrap().to_string();
+    assert_eq!(started["pilot"], "codex");
+    assert_eq!(started["implementer"], "claude");
+
+    for (sender, content) in [("claude", "cdraft"), ("codex", "xdraft")] {
+        call_tool(
+            &app,
+            "collab_send",
+            json!({
+                "session_id": &session_id,
+                "sender": sender,
+                "topic": "draft",
+                "content": content,
+            }),
+        );
+    }
+    call_tool(
+        &app,
+        "collab_send",
+        json!({
+            "session_id": &session_id,
+            "sender": "codex",
+            "topic": "canonical",
+            "content": "canonical plan",
+        }),
+    );
+    call_tool(
+        &app,
+        "collab_send",
+        json!({
+            "session_id": &session_id,
+            "sender": "claude",
+            "topic": "review",
+            "content": json!({ "verdict": "approve" }).to_string(),
+        }),
+    );
+    call_tool(
+        &app,
+        "collab_send",
+        json!({
+            "session_id": &session_id,
+            "sender": "codex",
+            "topic": "final",
+            "content": json!({ "plan": "final plan" }).to_string(),
+        }),
+    );
+    let plan_hash = plan_hash(&app, &session_id);
+    call_tool(
+        &app,
+        "collab_send",
+        json!({
+            "session_id": &session_id,
+            "sender": "codex",
+            "topic": "task_list",
+            "content": task_list_payload(&plan_hash, "base", "head", 1),
+        }),
+    );
+    let status = call_tool(&app, "collab_status", json!({ "session_id": &session_id }));
+    assert_eq!(status["phase"], "CodeImplementPending");
+    assert_eq!(status["current_owner"], "claude");
+
+    let wrong_implementer = call_tool_expect_error(
+        &app,
+        "collab_send",
+        json!({
+            "session_id": &session_id,
+            "sender": "codex",
+            "topic": "implementation_done",
+            "content": json!({ "head_sha": "implemented" }).to_string(),
+        }),
+    );
+    assert!(
+        wrong_implementer.to_lowercase().contains("not your turn")
+            || wrong_implementer.contains("expects sender"),
+        "pilot must not be able to substitute for the independent implementer: {wrong_implementer}"
+    );
+
+    call_tool(
+        &app,
+        "collab_send",
+        json!({
+            "session_id": &session_id,
+            "sender": "claude",
+            "topic": "implementation_done",
+            "content": json!({ "head_sha": "implemented" }).to_string(),
+        }),
+    );
+    let status = call_tool(&app, "collab_status", json!({ "session_id": &session_id }));
+    assert_eq!(status["phase"], "CodeReviewFixGlobalPending");
+    assert_eq!(status["current_owner"], "claude");
+
+    call_tool(
+        &app,
+        "collab_send",
+        json!({
+            "session_id": &session_id,
+            "sender": "claude",
+            "topic": "review_fix_global",
+            "content": json!({ "head_sha": "reviewed" }).to_string(),
+        }),
+    );
+    let status = call_tool(&app, "collab_status", json!({ "session_id": &session_id }));
+    assert_eq!(status["phase"], "CodeReviewLocalPending");
+    assert_eq!(status["current_owner"], "codex");
+
+    call_tool(
+        &app,
+        "collab_send",
+        json!({
+            "session_id": &session_id,
+            "sender": "codex",
+            "topic": "review_local",
+            "content": json!({ "head_sha": "reviewed" }).to_string(),
+        }),
+    );
+    let status = call_tool(&app, "collab_status", json!({ "session_id": &session_id }));
+    assert_eq!(status["phase"], "CodeReviewFinalPending");
+    assert_eq!(status["current_owner"], "codex");
+
+    call_tool(
+        &app,
+        "collab_send",
+        json!({
+            "session_id": &session_id,
+            "sender": "codex",
+            "topic": "final_review",
+            "content": json!({ "head_sha": "reviewed", "pr_url": "https://example.test/pr/1" }).to_string(),
+        }),
+    );
+    let status = call_tool(&app, "collab_status", json!({ "session_id": &session_id }));
+    assert_eq!(status["phase"], "CodingComplete");
+}
+
+#[test]
+fn collab_start_rejects_invalid_pilot_and_creates_no_session_row() {
+    let app = App::open_for_test().unwrap();
+    let err = call_tool_expect_error(
+        &app,
+        "collab_start",
+        json!({
+            "repo_path": "/repo",
+            "branch": "main",
+            "initiator": "claude",
+            "pilot": "gemini"
+        }),
+    );
+    assert!(
+        err.contains("pilot") && err.contains("gemini"),
+        "expected an error naming both the field and the bad value, got: {err}"
+    );
+
+    // Prove the rejection happened before any write, not merely that the
+    // call returned an error: query `collab_sessions` directly.
+    let count: i64 = app
+        .db
+        .with_transaction(|tx| {
+            Ok(tx.query_row("SELECT COUNT(*) FROM collab_sessions", [], |row| row.get(0))?)
+        })
+        .unwrap();
+    assert_eq!(
+        count, 0,
+        "an invalid pilot must not create a collab_sessions row"
+    );
+}
+
+#[test]
 fn collab_set_implementer_before_task_list_routes_batch_owner() {
     let app = App::open_for_test().unwrap();
     let session_id = drive_to_plan_locked(&app, "fp");
@@ -2329,6 +2725,274 @@ fn collab_set_implementer_rejects_after_batch_implementation() {
     assert!(
         err.contains("before implementation is complete"),
         "expected post-implementation rejection, got: {err}"
+    );
+}
+
+/// Start a fresh planning session with an explicit `pilot` and return its id.
+/// The session lands in `PlanParallelDrafts` with neither draft submitted —
+/// the only state in which `collab_set_pilot` is ever allowed.
+fn start_session_with_pilot(app: &App, branch: &str, pilot: &str) -> String {
+    let started = call_tool(
+        app,
+        "collab_start",
+        json!({
+            "repo_path": "/repo",
+            "branch": branch,
+            "initiator": "claude",
+            "pilot": pilot
+        }),
+    );
+    assert_eq!(started["pilot"], pilot);
+    started["session_id"].as_str().unwrap().to_string()
+}
+
+/// Re-read the persisted session row and return `(pilot, current_owner)`.
+/// Rejection tests use this to prove a refused `collab_set_pilot` left zero
+/// mutation behind rather than merely returning an error.
+fn pilot_and_owner(app: &App, session_id: &str) -> (String, String) {
+    let status = call_tool(app, "collab_status", json!({ "session_id": session_id }));
+    (
+        status["pilot"].as_str().unwrap().to_string(),
+        status["current_owner"].as_str().unwrap().to_string(),
+    )
+}
+
+#[test]
+fn collab_set_pilot_reassigns_pilot_and_owner_before_any_draft() {
+    let app = App::open_for_test().unwrap();
+    let session_id = start_session_with_pilot(&app, "feat/set-pilot-ok", "claude");
+
+    let updated = call_tool(
+        &app,
+        "collab_set_pilot",
+        json!({
+            "session_id": &session_id,
+            "agent": "claude",
+            "pilot": "codex"
+        }),
+    );
+    assert_eq!(updated["phase"], "PlanParallelDrafts");
+    assert_eq!(updated["pilot"], "codex");
+    // `current_owner` moves with the pilot in the same UPDATE.
+    assert_eq!(updated["current_owner"], "codex");
+
+    assert_eq!(
+        pilot_and_owner(&app, &session_id),
+        ("codex".to_string(), "codex".to_string()),
+        "the reassignment must be persisted, not merely reported"
+    );
+}
+
+#[test]
+fn collab_set_pilot_reassigns_from_codex_back_to_claude() {
+    // The permitted-caller rule is role-generic, not Claude-flavoured: under
+    // `pilot=codex` it is Codex — and only Codex — who may hand the role over.
+    let app = App::open_for_test().unwrap();
+    let session_id = start_session_with_pilot(&app, "feat/set-pilot-ok-codex", "codex");
+
+    let updated = call_tool(
+        &app,
+        "collab_set_pilot",
+        json!({
+            "session_id": &session_id,
+            "agent": "codex",
+            "pilot": "claude"
+        }),
+    );
+    assert_eq!(updated["pilot"], "claude");
+    assert_eq!(updated["current_owner"], "claude");
+
+    assert_eq!(
+        pilot_and_owner(&app, &session_id),
+        ("claude".to_string(), "claude".to_string())
+    );
+}
+
+#[test]
+fn collab_set_pilot_rejects_after_a_draft_has_landed() {
+    let app = App::open_for_test().unwrap();
+    let session_id = start_session_with_pilot(&app, "feat/set-pilot-drafted", "claude");
+    call_tool(
+        &app,
+        "collab_send",
+        json!({
+            "session_id": &session_id,
+            "sender": "claude",
+            "topic": "draft",
+            "content": "cdraft"
+        }),
+    );
+    let before = pilot_and_owner(&app, &session_id);
+
+    let err = call_tool_expect_error(
+        &app,
+        "collab_set_pilot",
+        json!({
+            "session_id": &session_id,
+            "agent": "claude",
+            "pilot": "codex"
+        }),
+    );
+    assert!(
+        err.contains("PlanParallelDrafts") && err.contains("draft"),
+        "expected a rejection naming the phase and the landed draft, got: {err}"
+    );
+
+    assert_eq!(
+        pilot_and_owner(&app, &session_id),
+        before,
+        "a refused collab_set_pilot must leave pilot and current_owner unchanged"
+    );
+}
+
+#[test]
+fn collab_set_pilot_rejects_after_batch_implementation() {
+    let app = App::open_for_test().unwrap();
+    let session_id = drive_to_plan_locked(&app, "fp");
+    let hash = plan_hash(&app, &session_id);
+    call_tool(
+        &app,
+        "collab_send",
+        json!({
+            "session_id": &session_id,
+            "sender": "claude",
+            "topic": "task_list",
+            "content": task_list_payload(&hash, "b0", "h0", 1)
+        }),
+    );
+    call_tool(
+        &app,
+        "collab_send",
+        json!({
+            "session_id": &session_id,
+            "sender": "claude",
+            "topic": "implementation_done",
+            "content": json!({ "head_sha": "batch_head" }).to_string()
+        }),
+    );
+    let before = pilot_and_owner(&app, &session_id);
+
+    // The caller IS the current pilot here, so this exercises the phase gate
+    // on its own rather than tripping the permitted-caller rule first.
+    let err = call_tool_expect_error(
+        &app,
+        "collab_set_pilot",
+        json!({
+            "session_id": &session_id,
+            "agent": "claude",
+            "pilot": "codex"
+        }),
+    );
+    assert!(
+        err.contains("CodeReviewFixGlobalPending") && err.contains("PlanParallelDrafts"),
+        "expected a rejection naming the current phase and the only allowed one, got: {err}"
+    );
+
+    assert_eq!(
+        pilot_and_owner(&app, &session_id),
+        before,
+        "a refused collab_set_pilot must leave pilot and current_owner unchanged"
+    );
+}
+
+#[test]
+fn collab_set_pilot_rejects_on_a_code_review_session() {
+    // A `collab_start_code_review` session begins at
+    // `CodeReviewFixGlobalPending` and so never passes through the one phase
+    // where the pilot is reassignable — its pilot is fixed at creation.
+    let app = App::open_for_test().unwrap();
+    let (_temp, repo_path, base_sha, head_sha, _descendant_sha, _drift_sha) = git_repo_fixture();
+    let started = call_tool(
+        &app,
+        "collab_start_code_review",
+        json!({
+            "repo_path": repo_path,
+            "branch": "feat/set-pilot-review",
+            "base_sha": base_sha,
+            "head_sha": head_sha,
+            "initiator": "claude",
+            "task": "review completed branch"
+        }),
+    );
+    let session_id = started["session_id"].as_str().unwrap().to_string();
+    let before = pilot_and_owner(&app, &session_id);
+
+    let err = call_tool_expect_error(
+        &app,
+        "collab_set_pilot",
+        json!({
+            "session_id": &session_id,
+            "agent": "claude",
+            "pilot": "codex"
+        }),
+    );
+    assert!(
+        err.contains("CodeReviewFixGlobalPending") && err.contains("PlanParallelDrafts"),
+        "expected a rejection naming the current phase and the only allowed one, got: {err}"
+    );
+
+    assert_eq!(
+        pilot_and_owner(&app, &session_id),
+        before,
+        "a refused collab_set_pilot must leave pilot and current_owner unchanged"
+    );
+}
+
+#[test]
+fn collab_set_pilot_refuses_copilot_self_promotion_under_pilot_claude() {
+    // Turn-seizure attempt: the copilot (codex here) naming itself pilot in
+    // the earliest, most permissive state. Refused on the caller rule.
+    let app = App::open_for_test().unwrap();
+    let session_id = start_session_with_pilot(&app, "feat/seize-under-claude", "claude");
+    let before = pilot_and_owner(&app, &session_id);
+
+    let err = call_tool_expect_error(
+        &app,
+        "collab_set_pilot",
+        json!({
+            "session_id": &session_id,
+            "agent": "codex",
+            "pilot": "codex"
+        }),
+    );
+    assert!(
+        err.contains("copilot") && err.contains("pilot 'claude'"),
+        "expected a rejection naming the caller's role and the current pilot, got: {err}"
+    );
+
+    assert_eq!(
+        pilot_and_owner(&app, &session_id),
+        before,
+        "a refused collab_set_pilot must leave pilot and current_owner unchanged"
+    );
+}
+
+#[test]
+fn collab_set_pilot_refuses_copilot_self_promotion_under_pilot_codex() {
+    // Mirror of the above with the roles swapped: under `pilot=codex` the
+    // copilot is Claude, and Claude promoting itself is refused identically.
+    let app = App::open_for_test().unwrap();
+    let session_id = start_session_with_pilot(&app, "feat/seize-under-codex", "codex");
+    let before = pilot_and_owner(&app, &session_id);
+
+    let err = call_tool_expect_error(
+        &app,
+        "collab_set_pilot",
+        json!({
+            "session_id": &session_id,
+            "agent": "claude",
+            "pilot": "claude"
+        }),
+    );
+    assert!(
+        err.contains("copilot") && err.contains("pilot 'codex'"),
+        "expected a rejection naming the caller's role and the current pilot, got: {err}"
+    );
+
+    assert_eq!(
+        pilot_and_owner(&app, &session_id),
+        before,
+        "a refused collab_set_pilot must leave pilot and current_owner unchanged"
     );
 }
 
@@ -3156,4 +3820,244 @@ fn recv_auto_ack_with_limit_only_acks_returned_messages() {
         total - 1,
         "only the returned message should have been acked; others must remain pending"
     );
+}
+
+/// End-to-end `pilot=codex` session driven through the real MCP tool-call
+/// surface (`call_tool`), from `collab_start` all the way to `CodingComplete`,
+/// asserting the owner at every single phase transition. This is the
+/// integration-level counterpart to the unit-level `apply_event` pinning
+/// suites in `collab/state_machine/tests.rs`: those prove the state-machine
+/// logic is role-generic in isolation; this proves the assembled MCP layer
+/// (start → send → status → handoff) carries a non-default pilot correctly
+/// end to end, not just through a single hop.
+///
+/// The owner sequence below is read directly off the live `apply_event` arms
+/// in `crates/ironmem/src/collab/state_machine/mod.rs`:
+///   PlanParallelDrafts --draft(claude)--> owner=codex (counterpart(actor))
+///     --draft(codex)--> PlanSynthesisPending, owner=codex (pilot)
+///     --canonical(codex, pilot)--> PlanCopilotReviewPending, owner=claude (copilot)
+///     --review(claude, copilot)--> PlanFinalizePending, owner=codex (pilot)
+///     --final(codex, pilot)--> PlanLocked, owner=codex (unchanged by PublishFinal)
+///     --task_list(codex, pilot)--> CodeImplementPending, owner=codex (implementer)
+///     --implementation_done(codex, implementer)--> CodeReviewFixGlobalPending, owner=claude (copilot)
+///     --review_fix_global(claude, copilot)--> CodeReviewLocalPending, owner=codex (pilot)
+///     --review_local(codex, pilot)--> CodeReviewFinalPending, owner=codex (pilot, unchanged)
+///     --final_review(codex, pilot)--> CodingComplete
+#[test]
+fn collab_pilot_codex_end_to_end_mcp_flow_reaches_coding_complete() {
+    let app = App::open_for_test().unwrap();
+
+    // `collab_start` with pilot=codex, implementer omitted: implementer must
+    // default to the resolved pilot (codex), per Task 7.
+    let started = call_tool(
+        &app,
+        "collab_start",
+        json!({
+            "repo_path": "/repo",
+            "branch": "main",
+            "initiator": "claude",
+            "pilot": "codex"
+        }),
+    );
+    assert_eq!(started["pilot"], "codex");
+    assert_eq!(started["implementer"], "codex");
+    let session_id = started["session_id"].as_str().unwrap().to_string();
+
+    let status = call_tool(&app, "collab_status", json!({ "session_id": &session_id }));
+    assert_eq!(status["phase"], "PlanParallelDrafts");
+    assert_eq!(status["pilot"], "codex");
+
+    // Blind drafts: claude submits first. Neither draft has landed yet, so
+    // ownership just flips to the counterpart of whoever acted — a role-blind
+    // identity split, independent of pilot.
+    call_tool(
+        &app,
+        "collab_send",
+        json!({
+            "session_id": session_id,
+            "sender": "claude",
+            "topic": "draft",
+            "content": "cdraft"
+        }),
+    );
+    let status = call_tool(&app, "collab_status", json!({ "session_id": &session_id }));
+    assert_eq!(status["phase"], "PlanParallelDrafts");
+    assert_eq!(status["current_owner"], "codex");
+
+    // Codex submits the second (and last) draft: both drafts are in, so
+    // synthesis is the pilot's job — owner becomes codex (the pilot).
+    call_tool(
+        &app,
+        "collab_send",
+        json!({
+            "session_id": session_id,
+            "sender": "codex",
+            "topic": "draft",
+            "content": "xdraft"
+        }),
+    );
+    let status = call_tool(&app, "collab_status", json!({ "session_id": &session_id }));
+    assert_eq!(status["phase"], "PlanSynthesisPending");
+    assert_eq!(status["current_owner"], "codex");
+    assert_eq!(status["pilot"], "codex");
+
+    // Codex (pilot) publishes the canonical plan -> owner flips to claude
+    // (the copilot), who reviews it.
+    call_tool(
+        &app,
+        "collab_send",
+        json!({
+            "session_id": session_id,
+            "sender": "codex",
+            "topic": "canonical",
+            "content": "canonical plan v1"
+        }),
+    );
+    let status = call_tool(&app, "collab_status", json!({ "session_id": &session_id }));
+    // `Phase::PlanCopilotReviewPending`'s wire string is unchanged from the
+    // historical hardcoded-Claude-pilot naming ("PlanCodexReviewPending" —
+    // Task 3 renamed the variant, not the wire form, to avoid corrupting
+    // stored sessions).
+    assert_eq!(status["phase"], "PlanCodexReviewPending");
+    assert_eq!(status["current_owner"], "claude");
+
+    // Claude (copilot) submits its one-pass review -> owner flips back to
+    // codex (the pilot), who finalizes.
+    call_tool(
+        &app,
+        "collab_send",
+        json!({
+            "session_id": session_id,
+            "sender": "claude",
+            "topic": "review",
+            "content": json!({ "verdict": "approve" }).to_string()
+        }),
+    );
+    let status = call_tool(&app, "collab_status", json!({ "session_id": &session_id }));
+    // Same wire-compatibility note as above: `PlanFinalizePending`'s wire
+    // string stays "PlanClaudeFinalizePending".
+    assert_eq!(status["phase"], "PlanClaudeFinalizePending");
+    assert_eq!(status["current_owner"], "codex");
+
+    // Codex (pilot) publishes the final execution-ready plan -> PlanLocked.
+    // `PublishFinal` does not reassign `current_owner`, so it stays codex.
+    call_tool(
+        &app,
+        "collab_send",
+        json!({
+            "session_id": session_id,
+            "sender": "codex",
+            "topic": "final",
+            "content": json!({ "plan": "final plan text" }).to_string()
+        }),
+    );
+    let status = call_tool(&app, "collab_status", json!({ "session_id": &session_id }));
+    assert_eq!(status["phase"], "PlanLocked");
+    assert_eq!(status["current_owner"], "codex");
+    assert_eq!(status["pilot"], "codex");
+
+    let final_plan_hash = status["final_plan_hash"].as_str().unwrap().to_string();
+
+    // Exposure check (mid-flow): a `session_handoff` call must render the
+    // pilot in its handoff block, not just in `collab_status`.
+    let handoff = call_tool(
+        &app,
+        "session_handoff",
+        json!({ "session_id": &session_id, "agent": "codex" }),
+    );
+    let handoff_block = handoff["handoff_block"].as_str().unwrap();
+    assert!(
+        handoff_block.contains("pilot: codex"),
+        "handoff block must carry a `pilot: codex` line, got:\n{handoff_block}"
+    );
+
+    // Codex (pilot) submits the task list -> CodeImplementPending, owner is
+    // the session's implementer, which defaulted to codex.
+    call_tool(
+        &app,
+        "collab_send",
+        json!({
+            "session_id": session_id,
+            "sender": "codex",
+            "topic": "task_list",
+            "content": task_list_payload(&final_plan_hash, "base0", "head0", 2)
+        }),
+    );
+    let status = call_tool(&app, "collab_status", json!({ "session_id": &session_id }));
+    assert_eq!(status["phase"], "CodeImplementPending");
+    assert_eq!(status["current_owner"], "codex");
+    assert_eq!(status["implementer"], "codex");
+
+    // Codex (the implementer) reports the batch implementation done ->
+    // CodeReviewFixGlobalPending, owner flips to claude (the copilot).
+    call_tool(
+        &app,
+        "collab_send",
+        json!({
+            "session_id": session_id,
+            "sender": "codex",
+            "topic": "implementation_done",
+            "content": json!({ "head_sha": "batch_head" }).to_string()
+        }),
+    );
+    let status = call_tool(&app, "collab_status", json!({ "session_id": &session_id }));
+    assert_eq!(status["phase"], "CodeReviewFixGlobalPending");
+    assert_eq!(status["current_owner"], "claude");
+
+    // Claude (copilot) applies the global review fixes -> CodeReviewLocalPending,
+    // owner flips to codex (the pilot).
+    call_tool(
+        &app,
+        "collab_send",
+        json!({
+            "session_id": session_id,
+            "sender": "claude",
+            "topic": "review_fix_global",
+            "content": json!({ "head_sha": "h2" }).to_string()
+        }),
+    );
+    let status = call_tool(&app, "collab_status", json!({ "session_id": &session_id }));
+    assert_eq!(status["phase"], "CodeReviewLocalPending");
+    assert_eq!(status["current_owner"], "codex");
+
+    // Codex (pilot) submits its local audit -> CodeReviewFinalPending; the
+    // pilot hands to the pilot, so owner stays codex.
+    call_tool(
+        &app,
+        "collab_send",
+        json!({
+            "session_id": session_id,
+            "sender": "codex",
+            "topic": "review_local",
+            "content": json!({ "head_sha": "h2" }).to_string()
+        }),
+    );
+    let status = call_tool(&app, "collab_status", json!({ "session_id": &session_id }));
+    assert_eq!(status["phase"], "CodeReviewFinalPending");
+    assert_eq!(status["current_owner"], "codex");
+    assert_eq!(status["pilot"], "codex");
+
+    // Codex (pilot) submits the final review with a PR URL -> CodingComplete.
+    call_tool(
+        &app,
+        "collab_send",
+        json!({
+            "session_id": session_id,
+            "sender": "codex",
+            "topic": "final_review",
+            "content": json!({ "head_sha": "h2", "pr_url": "https://example/pr/1" }).to_string()
+        }),
+    );
+    let status = call_tool(&app, "collab_status", json!({ "session_id": &session_id }));
+    assert_eq!(status["phase"], "CodingComplete");
+    assert_eq!(status["pr_url"], "https://example/pr/1");
+    assert_eq!(status["pilot"], "codex");
+
+    // CodingComplete is terminal — collab_end must be accepted.
+    let ended = call_tool(
+        &app,
+        "collab_end",
+        json!({ "session_id": session_id, "agent": "claude" }),
+    );
+    assert_eq!(ended["ok"], true);
 }

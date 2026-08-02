@@ -31,11 +31,12 @@ const COLLAB_MESSAGE_DRAWERS_SQL: &str =
 const DRAWER_SUPERSESSION_SQL: &str = include_str!("../../migrations/017_drawer_supersession.sql");
 const MCP_RESPONSE_COMPACTION_METRICS_SQL: &str =
     include_str!("../../migrations/018_mcp_response_compaction_metrics.sql");
+const COLLAB_PILOT_SQL: &str = include_str!("../../migrations/019_collab_pilot.sql");
 
 /// Highest schema version a fully-migrated database reports. Bump alongside the
 /// `run_version_gated_migrations` ladder below so `ironmem doctor` can tell a
 /// behind-migration database from an up-to-date one.
-pub const LATEST_SCHEMA_VERSION: i64 = 18;
+pub const LATEST_SCHEMA_VERSION: i64 = 19;
 
 /// Database wrapper around a SQLite connection.
 ///
@@ -304,6 +305,15 @@ impl Database {
                 .execute_batch(MCP_RESPONSE_COMPACTION_METRICS_SQL)?;
         }
 
+        // v19: per-session `pilot` agent role for protocol genericity
+        // (issue #246). Every pre-019 row reads `pilot='claude'`, so no
+        // data migration is needed. The column defaults to 'claude' to
+        // preserve the original behavior for sessions and callers that
+        // omit the field.
+        if current_version < 19 {
+            self.conn.execute_batch(COLLAB_PILOT_SQL)?;
+        }
+
         Ok(())
     }
 
@@ -461,13 +471,36 @@ mod tests {
         (dir, db_path)
     }
 
+    /// Insert a `collab_sessions` row using only the pre-019 column set (no
+    /// `pilot`). `queue::create_session` cannot be used by the legacy-row
+    /// migration tests below because it now always writes `pilot`
+    /// (migration 019), which does not exist on the pinned pre-v19 schemas
+    /// (`open_at_v8`/`open_at_v13`/`open_at_v14`/`open_at_v15`/`open_at_v18`)
+    /// those tests deliberately construct to verify migration preserves
+    /// legacy rows.
+    fn insert_legacy_collab_session_pre_pilot(
+        conn: &rusqlite::Connection,
+        id: &str,
+        repo_path: &str,
+        branch: &str,
+        task: Option<&str>,
+        implementer: &str,
+    ) {
+        conn.execute(
+            "INSERT INTO collab_sessions (id, repo_path, branch, task, implementer)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            rusqlite::params![id, repo_path, branch, task, implementer],
+        )
+        .unwrap();
+    }
+
     #[test]
     fn latest_schema_version_matches_highest_migration() {
         // The exported constant must track the highest migration a fresh,
         // fully-migrated database reports — doctor compares against it.
         let db = Database::open_in_memory().unwrap();
         assert_eq!(LATEST_SCHEMA_VERSION, db.schema_version().unwrap());
-        assert_eq!(LATEST_SCHEMA_VERSION, 18);
+        assert_eq!(LATEST_SCHEMA_VERSION, 19);
     }
 
     #[test]
@@ -838,15 +871,14 @@ mod tests {
     #[test]
     fn test_v8_to_v9_upgrade_preserves_existing_collab_sessions_with_null_plan_drawer_ids() {
         let db = open_at_v8();
-        crate::collab::queue::create_session(
+        insert_legacy_collab_session_pre_pilot(
             &db.conn,
             "legacy-session",
             "/repo",
             "main",
             Some("legacy task"),
-            crate::collab::Agent::Claude,
-        )
-        .unwrap();
+            "claude",
+        );
 
         db.migrate().unwrap();
 
@@ -1284,15 +1316,14 @@ mod tests {
             "token_usage.tool_name should not exist at v13"
         );
 
-        crate::collab::queue::create_session(
+        insert_legacy_collab_session_pre_pilot(
             &db.conn,
             "legacy-v13-session",
             "/repo",
             "main",
             Some("legacy task"),
-            crate::collab::Agent::Claude,
-        )
-        .unwrap();
+            "claude",
+        );
         db.conn
             .execute(
                 "INSERT INTO token_usage
@@ -1361,15 +1392,14 @@ mod tests {
             );
         }
 
-        crate::collab::queue::create_session(
+        insert_legacy_collab_session_pre_pilot(
             &db.conn,
             "legacy-v14-session",
             "/repo",
             "main",
             Some("legacy task"),
-            crate::collab::Agent::Codex,
-        )
-        .unwrap();
+            "codex",
+        );
 
         db.migrate().unwrap();
         assert_eq!(schema_version_of(&db), LATEST_SCHEMA_VERSION);
@@ -1423,15 +1453,14 @@ mod tests {
             "drawer_id should not exist at v15"
         );
 
-        crate::collab::queue::create_session(
+        insert_legacy_collab_session_pre_pilot(
             &db.conn,
             "legacy-v15-message-session",
             "/repo",
             "main",
             None,
-            crate::collab::Agent::Claude,
-        )
-        .unwrap();
+            "claude",
+        );
         db.conn
             .execute(
                 "INSERT INTO messages (id, session_id, sender, receiver, topic, content)
@@ -1511,5 +1540,106 @@ mod tests {
             superseded_by.is_none(),
             "legacy drawers must remain current"
         );
+    }
+
+    // ---- Migration 019 (collab pilot column, issue #246) ----
+
+    /// Build a connection migrated to exactly v18 (no pilot column yet)
+    /// by replaying migrations 001-018 directly from the module consts.
+    fn open_at_v18() -> Database {
+        let db = open_at_v15();
+        db.conn.execute_batch(COLLAB_MESSAGE_DRAWERS_SQL).unwrap();
+        db.conn.execute_batch(DRAWER_SUPERSESSION_SQL).unwrap();
+        db.conn
+            .execute_batch(MCP_RESPONSE_COMPACTION_METRICS_SQL)
+            .unwrap();
+        db
+    }
+
+    #[test]
+    fn test_fresh_migrate_reaches_v19_with_pilot_column() {
+        let db = Database::open_in_memory().unwrap();
+        assert_eq!(schema_version_of(&db), LATEST_SCHEMA_VERSION);
+        assert!(
+            column_exists(&db, "collab_sessions", "pilot"),
+            "pilot column must exist on collab_sessions"
+        );
+    }
+
+    #[test]
+    fn test_v18_to_v19_adds_pilot_column_and_preserves_legacy_sessions() {
+        let db = open_at_v18();
+        assert_eq!(schema_version_of(&db), 18);
+        assert!(
+            !column_exists(&db, "collab_sessions", "pilot"),
+            "pilot should not exist at v18"
+        );
+
+        insert_legacy_collab_session_pre_pilot(
+            &db.conn,
+            "legacy-v18-session",
+            "/repo",
+            "main",
+            Some("legacy task"),
+            "claude",
+        );
+
+        db.migrate().unwrap();
+        assert_eq!(schema_version_of(&db), LATEST_SCHEMA_VERSION);
+        assert!(column_exists(&db, "collab_sessions", "pilot"));
+
+        // Legacy sessions backfill pilot='claude'
+        let pilot: String = db
+            .conn
+            .query_row(
+                "SELECT pilot FROM collab_sessions WHERE id = ?1",
+                ["legacy-v18-session"],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            pilot, "claude",
+            "legacy sessions must backfill pilot='claude'"
+        );
+    }
+
+    #[test]
+    fn test_pilot_check_constraint_rejects_invalid_values() {
+        let db = Database::open_in_memory().unwrap();
+        assert_eq!(schema_version_of(&db), LATEST_SCHEMA_VERSION);
+
+        // Valid values must be accepted
+        let claude_result = db.conn.execute(
+            "INSERT INTO collab_sessions (id, repo_path, branch, pilot)
+             VALUES (?1, '/repo', 'main', 'claude')",
+            ["session-claude"],
+        );
+        assert!(claude_result.is_ok(), "pilot='claude' should be accepted");
+
+        let codex_result = db.conn.execute(
+            "INSERT INTO collab_sessions (id, repo_path, branch, pilot)
+             VALUES (?1, '/repo', 'main', 'codex')",
+            ["session-codex"],
+        );
+        assert!(codex_result.is_ok(), "pilot='codex' should be accepted");
+
+        // Invalid values must be rejected by the CHECK constraint
+        let invalid_result = db.conn.execute(
+            "INSERT INTO collab_sessions (id, repo_path, branch, pilot)
+             VALUES (?1, '/repo', 'main', 'invalid')",
+            ["session-invalid"],
+        );
+        assert!(
+            invalid_result.is_err(),
+            "pilot='invalid' should be rejected by CHECK constraint"
+        );
+    }
+
+    #[test]
+    fn test_migrate_twice_idempotent_v19() {
+        let db = Database::open_in_memory().unwrap();
+        db.migrate().unwrap();
+        db.migrate().unwrap();
+        assert_eq!(schema_version_of(&db), LATEST_SCHEMA_VERSION);
     }
 }

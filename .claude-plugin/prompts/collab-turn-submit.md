@@ -46,9 +46,20 @@ Actions below — sending `$TOPIC` (e.g. `final_review`) via the normal
 
 ## Actions
 - If `$TOPIC == final_review`: parse the artifact JSON as
-  `{"title":"...","body":"..."}`; derive the base branch from the collab
-  `base_sha` (prefer `origin/main`, then `origin/master`, then `origin/trunk`
-  when they contain that commit); run `gh pr create --base <base_branch>
+  `{"title":"...","body":"..."}`; resolve the base branch as the repository's
+  **integration branch** — the remote default from
+  `git symbolic-ref refs/remotes/origin/HEAD`, else the first of `origin/main`,
+  `origin/master`, `origin/trunk` that **exists**. Containment of `base_sha` is
+  a signal, never a requirement: a collab branch is routinely cut from a local
+  commit that never landed on the remote default, so a base branch that does
+  not contain `base_sha` is normal and MUST NOT fail this turn. Only a base
+  that cannot be resolved at all is a resolution failure. When the resolved
+  base does not contain `base_sha`, the branch carries commits that predate the
+  reviewed range and were therefore covered by **neither** review pass — list
+  them (`git log --oneline <base_branch>..<base_sha>`) in a short
+  `## Unreviewed commits in this PR` section appended to the artifact body, so
+  the human reviewer is told which commits no agent inspected. Then run
+  `gh pr create --base <base_branch>
   --head $BRANCH --title <title> --body <body>`; capture `pr_url`;
   `collab_send(sender="claude", topic="final_review",
   content=<JSON {"head_sha":"<HEAD>","pr_url":"<url>"}>)`. On `gh` failure or
