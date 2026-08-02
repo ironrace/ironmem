@@ -13,9 +13,10 @@ use super::{
 /// session never enters the review flow with unset drift-detection state.
 /// `pilot` is the agent leading the review session; `new_global_review`
 /// derives `current_owner = counterpart(pilot)` and `implementer = pilot`
-/// from it. The MCP layer (`handle_collab_start_code_review`) still rejects
-/// any `initiator` other than `Agent::Claude` and so passes `Agent::Claude`
-/// here; that surface gains a real pilot choice in a later task.
+/// from it. The MCP layer (`handle_collab_start_code_review`) resolves and
+/// forwards a real `pilot` choice (defaulting to `Agent::Claude`); this is
+/// independent of that same layer's `initiator must be 'claude'` check,
+/// which constrains the *dispatcher* invoking the shortcut, not the pilot.
 pub fn start_global_review_session(
     id: &str,
     base_sha: &str,
