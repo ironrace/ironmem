@@ -4003,9 +4003,15 @@ mod tests {
     }
     // ── pilot=codex MCP-surface coverage (issue #246, Task 6) ────────────────
     //
-    // `collab_start` still has no `pilot` argument, so these tests start a
-    // normal session and rebind `pilot` on the stored row — the same
-    // direct-field-write trick the legacy-drawer tests above use. Every
+    // `collab_start` does accept a `pilot` argument now, but these tests
+    // deliberately bypass it: they start a default session and rebind
+    // `pilot` directly on the stored row — the same direct-field-write trick
+    // the legacy-drawer tests above use. That keeps them a *storage-level*
+    // pin, so the authorization rules stay proven for any session whose
+    // stored `pilot` is codex no matter which path set it there
+    // (`collab_start`'s argument, `collab_set_pilot`, or a direct write).
+    // The argument path itself is covered end-to-end in
+    // `tests/mcp_protocol.rs`. Every
     // authorization assertion is mirrored under `pilot=claude`, because "no
     // new role combination is accepted" is only provable two-directionally:
     // a one-sided table cannot distinguish "the copilot approves" from
