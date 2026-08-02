@@ -237,6 +237,7 @@ fn tools_list_contains_required_tools() {
         "diary_write",
         "collab_start_code_review",
         "collab_set_implementer",
+        "collab_set_pilot",
     ] {
         assert!(
             names.contains(required),
@@ -261,6 +262,7 @@ fn tools_list_read_only_mode_excludes_write_tools() {
         "delete_drawer",
         "diary_write",
         "collab_set_implementer",
+        "collab_set_pilot",
     ] {
         assert!(
             !names.contains(blocked),
@@ -2573,6 +2575,274 @@ fn collab_set_implementer_rejects_after_batch_implementation() {
     assert!(
         err.contains("before implementation is complete"),
         "expected post-implementation rejection, got: {err}"
+    );
+}
+
+/// Start a fresh planning session with an explicit `pilot` and return its id.
+/// The session lands in `PlanParallelDrafts` with neither draft submitted —
+/// the only state in which `collab_set_pilot` is ever allowed.
+fn start_session_with_pilot(app: &App, branch: &str, pilot: &str) -> String {
+    let started = call_tool(
+        app,
+        "collab_start",
+        json!({
+            "repo_path": "/repo",
+            "branch": branch,
+            "initiator": "claude",
+            "pilot": pilot
+        }),
+    );
+    assert_eq!(started["pilot"], pilot);
+    started["session_id"].as_str().unwrap().to_string()
+}
+
+/// Re-read the persisted session row and return `(pilot, current_owner)`.
+/// Rejection tests use this to prove a refused `collab_set_pilot` left zero
+/// mutation behind rather than merely returning an error.
+fn pilot_and_owner(app: &App, session_id: &str) -> (String, String) {
+    let status = call_tool(app, "collab_status", json!({ "session_id": session_id }));
+    (
+        status["pilot"].as_str().unwrap().to_string(),
+        status["current_owner"].as_str().unwrap().to_string(),
+    )
+}
+
+#[test]
+fn collab_set_pilot_reassigns_pilot_and_owner_before_any_draft() {
+    let app = App::open_for_test().unwrap();
+    let session_id = start_session_with_pilot(&app, "feat/set-pilot-ok", "claude");
+
+    let updated = call_tool(
+        &app,
+        "collab_set_pilot",
+        json!({
+            "session_id": &session_id,
+            "agent": "claude",
+            "pilot": "codex"
+        }),
+    );
+    assert_eq!(updated["phase"], "PlanParallelDrafts");
+    assert_eq!(updated["pilot"], "codex");
+    // `current_owner` moves with the pilot in the same UPDATE.
+    assert_eq!(updated["current_owner"], "codex");
+
+    assert_eq!(
+        pilot_and_owner(&app, &session_id),
+        ("codex".to_string(), "codex".to_string()),
+        "the reassignment must be persisted, not merely reported"
+    );
+}
+
+#[test]
+fn collab_set_pilot_reassigns_from_codex_back_to_claude() {
+    // The permitted-caller rule is role-generic, not Claude-flavoured: under
+    // `pilot=codex` it is Codex — and only Codex — who may hand the role over.
+    let app = App::open_for_test().unwrap();
+    let session_id = start_session_with_pilot(&app, "feat/set-pilot-ok-codex", "codex");
+
+    let updated = call_tool(
+        &app,
+        "collab_set_pilot",
+        json!({
+            "session_id": &session_id,
+            "agent": "codex",
+            "pilot": "claude"
+        }),
+    );
+    assert_eq!(updated["pilot"], "claude");
+    assert_eq!(updated["current_owner"], "claude");
+
+    assert_eq!(
+        pilot_and_owner(&app, &session_id),
+        ("claude".to_string(), "claude".to_string())
+    );
+}
+
+#[test]
+fn collab_set_pilot_rejects_after_a_draft_has_landed() {
+    let app = App::open_for_test().unwrap();
+    let session_id = start_session_with_pilot(&app, "feat/set-pilot-drafted", "claude");
+    call_tool(
+        &app,
+        "collab_send",
+        json!({
+            "session_id": &session_id,
+            "sender": "claude",
+            "topic": "draft",
+            "content": "cdraft"
+        }),
+    );
+    let before = pilot_and_owner(&app, &session_id);
+
+    let err = call_tool_expect_error(
+        &app,
+        "collab_set_pilot",
+        json!({
+            "session_id": &session_id,
+            "agent": "claude",
+            "pilot": "codex"
+        }),
+    );
+    assert!(
+        err.contains("PlanParallelDrafts") && err.contains("draft"),
+        "expected a rejection naming the phase and the landed draft, got: {err}"
+    );
+
+    assert_eq!(
+        pilot_and_owner(&app, &session_id),
+        before,
+        "a refused collab_set_pilot must leave pilot and current_owner unchanged"
+    );
+}
+
+#[test]
+fn collab_set_pilot_rejects_after_batch_implementation() {
+    let app = App::open_for_test().unwrap();
+    let session_id = drive_to_plan_locked(&app, "fp");
+    let hash = plan_hash(&app, &session_id);
+    call_tool(
+        &app,
+        "collab_send",
+        json!({
+            "session_id": &session_id,
+            "sender": "claude",
+            "topic": "task_list",
+            "content": task_list_payload(&hash, "b0", "h0", 1)
+        }),
+    );
+    call_tool(
+        &app,
+        "collab_send",
+        json!({
+            "session_id": &session_id,
+            "sender": "claude",
+            "topic": "implementation_done",
+            "content": json!({ "head_sha": "batch_head" }).to_string()
+        }),
+    );
+    let before = pilot_and_owner(&app, &session_id);
+
+    // The caller IS the current pilot here, so this exercises the phase gate
+    // on its own rather than tripping the permitted-caller rule first.
+    let err = call_tool_expect_error(
+        &app,
+        "collab_set_pilot",
+        json!({
+            "session_id": &session_id,
+            "agent": "claude",
+            "pilot": "codex"
+        }),
+    );
+    assert!(
+        err.contains("CodeReviewFixGlobalPending") && err.contains("PlanParallelDrafts"),
+        "expected a rejection naming the current phase and the only allowed one, got: {err}"
+    );
+
+    assert_eq!(
+        pilot_and_owner(&app, &session_id),
+        before,
+        "a refused collab_set_pilot must leave pilot and current_owner unchanged"
+    );
+}
+
+#[test]
+fn collab_set_pilot_rejects_on_a_code_review_session() {
+    // A `collab_start_code_review` session begins at
+    // `CodeReviewFixGlobalPending` and so never passes through the one phase
+    // where the pilot is reassignable — its pilot is fixed at creation.
+    let app = App::open_for_test().unwrap();
+    let (_temp, repo_path, base_sha, head_sha, _descendant_sha, _drift_sha) = git_repo_fixture();
+    let started = call_tool(
+        &app,
+        "collab_start_code_review",
+        json!({
+            "repo_path": repo_path,
+            "branch": "feat/set-pilot-review",
+            "base_sha": base_sha,
+            "head_sha": head_sha,
+            "initiator": "claude",
+            "task": "review completed branch"
+        }),
+    );
+    let session_id = started["session_id"].as_str().unwrap().to_string();
+    let before = pilot_and_owner(&app, &session_id);
+
+    let err = call_tool_expect_error(
+        &app,
+        "collab_set_pilot",
+        json!({
+            "session_id": &session_id,
+            "agent": "claude",
+            "pilot": "codex"
+        }),
+    );
+    assert!(
+        err.contains("CodeReviewFixGlobalPending") && err.contains("PlanParallelDrafts"),
+        "expected a rejection naming the current phase and the only allowed one, got: {err}"
+    );
+
+    assert_eq!(
+        pilot_and_owner(&app, &session_id),
+        before,
+        "a refused collab_set_pilot must leave pilot and current_owner unchanged"
+    );
+}
+
+#[test]
+fn collab_set_pilot_refuses_copilot_self_promotion_under_pilot_claude() {
+    // Turn-seizure attempt: the copilot (codex here) naming itself pilot in
+    // the earliest, most permissive state. Refused on the caller rule.
+    let app = App::open_for_test().unwrap();
+    let session_id = start_session_with_pilot(&app, "feat/seize-under-claude", "claude");
+    let before = pilot_and_owner(&app, &session_id);
+
+    let err = call_tool_expect_error(
+        &app,
+        "collab_set_pilot",
+        json!({
+            "session_id": &session_id,
+            "agent": "codex",
+            "pilot": "codex"
+        }),
+    );
+    assert!(
+        err.contains("copilot") && err.contains("pilot 'claude'"),
+        "expected a rejection naming the caller's role and the current pilot, got: {err}"
+    );
+
+    assert_eq!(
+        pilot_and_owner(&app, &session_id),
+        before,
+        "a refused collab_set_pilot must leave pilot and current_owner unchanged"
+    );
+}
+
+#[test]
+fn collab_set_pilot_refuses_copilot_self_promotion_under_pilot_codex() {
+    // Mirror of the above with the roles swapped: under `pilot=codex` the
+    // copilot is Claude, and Claude promoting itself is refused identically.
+    let app = App::open_for_test().unwrap();
+    let session_id = start_session_with_pilot(&app, "feat/seize-under-codex", "codex");
+    let before = pilot_and_owner(&app, &session_id);
+
+    let err = call_tool_expect_error(
+        &app,
+        "collab_set_pilot",
+        json!({
+            "session_id": &session_id,
+            "agent": "claude",
+            "pilot": "claude"
+        }),
+    );
+    assert!(
+        err.contains("copilot") && err.contains("pilot 'codex'"),
+        "expected a rejection naming the caller's role and the current pilot, got: {err}"
+    );
+
+    assert_eq!(
+        pilot_and_owner(&app, &session_id),
+        before,
+        "a refused collab_set_pilot must leave pilot and current_owner unchanged"
     );
 }
 

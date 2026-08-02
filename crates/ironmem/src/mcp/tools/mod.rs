@@ -21,8 +21,9 @@ use code_maps::{handle_code_map_load, handle_code_map_status, handle_code_map_wr
 use collab_caps::{handle_collab_get_caps, handle_collab_register_caps};
 use collab_session::{
     handle_collab_ack, handle_collab_approve, handle_collab_end, handle_collab_recv,
-    handle_collab_resume, handle_collab_send, handle_collab_set_implementer, handle_collab_start,
-    handle_collab_start_code_review, handle_collab_status, handle_collab_wait_my_turn,
+    handle_collab_resume, handle_collab_send, handle_collab_set_implementer,
+    handle_collab_set_pilot, handle_collab_start, handle_collab_start_code_review,
+    handle_collab_status, handle_collab_wait_my_turn,
 };
 use diary::{handle_diary_read, handle_diary_write};
 use drawers::{
@@ -313,6 +314,20 @@ pub fn tool_definitions(app: &App) -> Vec<Value> {
                     "handoff_token": { "type": "string" }
                 },
                 "required": ["session_id", "agent", "implementer"]
+            }
+        }),
+        json!({
+            "name": "collab_set_pilot",
+            "description": "Reassign the session pilot. Caller must be the current pilot, and only in PlanParallelDrafts before either draft lands. Also moves current_owner.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "session_id": { "type": "string" },
+                    "agent": { "type": "string", "enum": ["claude", "codex"] },
+                    "pilot": { "type": "string", "enum": ["claude", "codex"] },
+                    "handoff_token": { "type": "string" }
+                },
+                "required": ["session_id", "agent", "pilot"]
             }
         }),
         json!({
@@ -658,6 +673,7 @@ pub fn call_tool(app: &App, name: &str, args: &Value) -> Result<Value, MemoryErr
         "collab_start" => handle_collab_start(app, args),
         "collab_start_code_review" => handle_collab_start_code_review(app, args),
         "collab_set_implementer" => handle_collab_set_implementer(app, args),
+        "collab_set_pilot" => handle_collab_set_pilot(app, args),
         "collab_send" => handle_collab_send(app, args),
         "collab_recv" => handle_collab_recv(app, args),
         "collab_ack" => handle_collab_ack(app, args),
@@ -764,6 +780,7 @@ fn tool_known(name: &str) -> bool {
             | "collab_start"
             | "collab_start_code_review"
             | "collab_set_implementer"
+            | "collab_set_pilot"
             | "collab_send"
             | "collab_recv"
             | "collab_ack"
@@ -816,6 +833,7 @@ pub(crate) const MUTATING_TOOLS: &[&str] = &[
     "collab_start",
     "collab_start_code_review",
     "collab_set_implementer",
+    "collab_set_pilot",
     "collab_send",
     "collab_ack",
     "collab_approve",
@@ -1190,6 +1208,14 @@ mod tests {
     /// gained `include_superseded` and `add_drawer` gained `supersedes`, which
     /// cost ~140 bytes more than the previous ceiling left spare.
     ///
+    /// Raised 3_550 -> 3_700 for `collab_set_pilot` (#246), the tool that
+    /// reassigns a session's pilot role. A whole new tool cannot be absorbed by
+    /// the two tokens the previous ceiling had spare, and its description has
+    /// to carry a genuinely load-bearing authorization rule (current pilot
+    /// only, `PlanParallelDrafts` only) that a caller cannot infer from the
+    /// schema keys. The listing measured 3_660 tokens after the addition; the
+    /// ceiling leaves ~40 tokens of headroom rather than pinning it exactly.
+    ///
     /// The budget is deliberately a whole-listing ceiling with no per-tool
     /// allocation, so the cheapest way to land a new field is to delete prose
     /// from whichever unrelated tool happens to be wordiest. That trade is not
@@ -1202,7 +1228,7 @@ mod tests {
         let bytes = serde_json::to_vec(&tool_definitions(&app)).unwrap().len();
         let estimated_tokens = bytes.div_ceil(4);
         assert!(
-            estimated_tokens <= 3_550,
+            estimated_tokens <= 3_700,
             "tool listing is ~{estimated_tokens} tokens ({bytes} bytes); trim descriptions that duplicate their schemas"
         );
     }

@@ -662,6 +662,122 @@ pub(super) fn handle_collab_set_implementer(app: &App, args: &Value) -> Result<V
     })
 }
 
+/// Rebind a live session's `pilot` role.
+///
+/// # Authorization policy
+///
+/// This is the one tool that can change who leads a session, so its policy is
+/// deliberately narrower than [`handle_collab_set_implementer`]'s. Three rules,
+/// all enforced below inside a single transaction:
+///
+/// 1. **Latest safe state.** Allowed *only* at [`Phase::PlanParallelDrafts`]
+///    with `claude_draft_hash.is_none() && codex_draft_hash.is_none()`. Every
+///    other phase is refused — including any `collab_start_code_review`
+///    session, which begins at `CodeReviewFixGlobalPending` and therefore never
+///    passes through the reassignable state at all. This is stricter than
+///    `collab_set_implementer`'s "anywhere in planning" on purpose: the pilot
+///    decides who may submit `canonical`/`review`/`final`, so once a
+///    role-dependent artifact exists, changing the pilot is a live-role rewrite
+///    of work already done — not configuration of work not yet started.
+/// 2. **Permitted caller.** The request's `agent` must equal the session's
+///    *current* pilot. A copilot can never promote itself, which is precisely
+///    what stops this from being a turn-seizure primitive: the only way to
+///    become pilot is to be handed the role by the agent that already holds it.
+/// 3. **Atomicity.** The pilot change and `current_owner = new_pilot` happen in
+///    the *same* `set_pilot` UPDATE inside the one transaction, so owner and
+///    pilot are never observable in an inconsistent pairing. Moving the owner
+///    is safe here because at `PlanParallelDrafts` `current_owner` is only the
+///    next-expected hint — the drafting arm of `apply_event` has its own
+///    `AlreadySubmittedDraft` guard and does not consult the owner to decide
+///    whether a draft may land.
+///
+/// Every rejection names the phase (or the caller's role) and the rule
+/// violated, so a caller can tell *why* it was refused without reading this.
+///
+/// # Deliberate deferral
+///
+/// The plugin prose assertions that pin `collab_set_implementer` into the
+/// shipped `collab.md` command files — `scripts/check_collab_turn_templates.py`
+/// and the two in `crates/ironmem/tests/plugin_metadata.rs` — are **not**
+/// mirrored for `collab_set_pilot`. Mirroring them would require editing a
+/// plugin command file, which is out of scope for this change; documenting the
+/// tool in `collab.md` and adding the matching assertions is deferred.
+pub(super) fn handle_collab_set_pilot(app: &App, args: &Value) -> Result<Value, MemoryError> {
+    let session_id = require_str(args, "session_id")?;
+    let agent = require_agent(require_str(args, "agent")?)?;
+    // `require_pilot` rather than `require_agent` for this field only so a bad
+    // value names `pilot` in the error text, exactly as `handle_collab_set_
+    // implementer` uses `require_implementer` for its own role field. Same
+    // accept-set either way.
+    let pilot = require_pilot(require_str(args, "pilot")?)?;
+
+    app.db.with_transaction(|tx| {
+        super::handoff::ensure_actor_generation_current(
+            app,
+            tx,
+            session_id,
+            agent,
+            super::handoff::opt_handoff_token(args).as_deref(),
+        )?;
+        crate::collab::queue::ensure_active(tx, session_id)?;
+        let record = crate::collab::queue::load_session_record(tx, session_id)?;
+
+        // Rule 2 first: authorization before state. An unauthorized caller is
+        // told it is the copilot regardless of which phase the session is in.
+        let previous = record.session.pilot;
+        if agent != previous {
+            return Err(MemoryError::Validation(format!(
+                "collab_set_pilot refused: caller '{}' is the copilot of this session; \
+                 only the current pilot '{}' may reassign the pilot role",
+                agent.as_str(),
+                previous.as_str()
+            )));
+        }
+
+        // Rule 1: the latest safe state, and only it.
+        if record.session.phase != Phase::PlanParallelDrafts {
+            return Err(MemoryError::Validation(format!(
+                "collab_set_pilot refused in phase {}: the pilot may only be reassigned in \
+                 PlanParallelDrafts, before any role-dependent artifact exists",
+                record.session.phase
+            )));
+        }
+        if record.session.claude_draft_hash.is_some() || record.session.codex_draft_hash.is_some() {
+            return Err(MemoryError::Validation(format!(
+                "collab_set_pilot refused in phase PlanParallelDrafts: a draft has already been \
+                 submitted (claude={}, codex={}); the pilot may only be reassigned before either \
+                 draft lands",
+                record.session.claude_draft_hash.is_some(),
+                record.session.codex_draft_hash.is_some()
+            )));
+        }
+
+        // Rule 3: pilot and owner move together, in one UPDATE. Unconditional
+        // even when `previous == pilot`, so a no-op reassignment still leaves
+        // `current_owner` consistent with the pilot it names.
+        let previous_owner = record.session.current_owner;
+        crate::collab::queue::set_pilot(tx, session_id, pilot, Some(pilot))?;
+
+        crate::db::schema::Database::wal_log_tx(
+            tx,
+            "collab_set_pilot",
+            &json!({
+                "session_id": session_id,
+                "agent": agent.as_str(),
+                "previous_pilot": previous.as_str(),
+                "pilot": pilot.as_str(),
+                "phase": record.session.phase.to_string(),
+                "previous_owner": previous_owner.as_str(),
+                "current_owner": pilot.as_str(),
+                "changed": previous != pilot || previous_owner != pilot,
+            }),
+            Some(&json!({ "session_id": session_id })),
+        )?;
+        let updated = crate::collab::queue::load_session_record(tx, session_id)?;
+        Ok(session_record_json(&updated))
+    })
+}
+
 pub(super) fn handle_collab_start_code_review(
     app: &App,
     args: &Value,
