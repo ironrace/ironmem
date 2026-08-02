@@ -1161,6 +1161,17 @@ mod tests {
         assert_eq!(round_trip.id, "sess-pilot-full");
     }
 
+    /// `set_pilot` must write `pilot` (and, on the with-owner branch,
+    /// `current_owner`) and nothing else. `implementer` is seeded to
+    /// `Codex`, deliberately *not* equal to the pilot value each branch
+    /// writes, because "`pilot` and `implementer` are orthogonal knobs" is
+    /// this feature's central design claim and the only way this UPDATE can
+    /// break it is by writing `implementer` alongside `pilot`. Seeding
+    /// `implementer` equal to the incoming pilot would make a stray
+    /// `implementer = ?2` bind write the value that was already there —
+    /// invisible. So the with-owner call below drives `pilot = Claude`
+    /// against `implementer = Codex`, and the mirror fixture at the end
+    /// gives the without-owner branch the same asymmetry.
     #[test]
     fn test_set_pilot_updates_pilot_and_optional_owner() {
         let db = open();
@@ -1170,10 +1181,12 @@ mod tests {
             "/repo",
             "main",
             None,
-            Agent::Claude,
+            Agent::Codex,
             Agent::Claude,
         )
         .unwrap();
+        let seeded = load_session(&db, "sess-set-pilot").unwrap();
+        assert_eq!(seeded.implementer, Agent::Codex, "fixture precondition");
 
         set_pilot(&db, "sess-set-pilot", Agent::Codex, None).unwrap();
         let session = load_session(&db, "sess-set-pilot").unwrap();
@@ -1183,11 +1196,44 @@ mod tests {
             Agent::Claude,
             "current_owner must be untouched when None is passed"
         );
+        assert_eq!(
+            session.implementer,
+            Agent::Codex,
+            "implementer must be untouched by the without-owner branch"
+        );
 
         set_pilot(&db, "sess-set-pilot", Agent::Claude, Some(Agent::Codex)).unwrap();
         let session = load_session(&db, "sess-set-pilot").unwrap();
         assert_eq!(session.pilot, Agent::Claude);
         assert_eq!(session.current_owner, Agent::Codex);
+        assert_eq!(
+            session.implementer,
+            Agent::Codex,
+            "implementer must be untouched by the with-owner branch"
+        );
+
+        // Mirror fixture: `implementer = Claude` so the without-owner branch
+        // (which writes `pilot = Codex`) also runs against an `implementer`
+        // that differs from the value being bound. Without this, only the
+        // with-owner branch's stray-write case would be falsifiable.
+        create_session(
+            &db,
+            "sess-set-pilot-mirror",
+            "/repo",
+            "main",
+            None,
+            Agent::Claude,
+            Agent::Claude,
+        )
+        .unwrap();
+        set_pilot(&db, "sess-set-pilot-mirror", Agent::Codex, None).unwrap();
+        let mirror = load_session(&db, "sess-set-pilot-mirror").unwrap();
+        assert_eq!(mirror.pilot, Agent::Codex);
+        assert_eq!(
+            mirror.implementer,
+            Agent::Claude,
+            "implementer must be untouched by the without-owner branch"
+        );
     }
 
     #[test]
