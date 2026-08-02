@@ -3243,7 +3243,9 @@ fn pilot_codex_dispatch_failure_admissibility_table_is_dispatcher_keyed() {
     assert!(off_turn_failure_is_admissible(
         failure,
         Agent::Claude,
-        codex_owned.current_owner
+        codex_owned.current_owner,
+        codex_owned.phase,
+        codex_owned.implementer,
     ));
 
     // Codex reporting its own dispatch failure is never off-turn-admissible —
@@ -3251,12 +3253,16 @@ fn pilot_codex_dispatch_failure_admissibility_table_is_dispatcher_keyed() {
     assert!(!off_turn_failure_is_admissible(
         failure,
         Agent::Codex,
-        codex_owned.current_owner
+        codex_owned.current_owner,
+        codex_owned.phase,
+        codex_owned.implementer,
     ));
     assert!(!off_turn_failure_is_admissible(
         failure,
         Agent::Codex,
-        claude_owned.current_owner
+        claude_owned.current_owner,
+        claude_owned.phase,
+        claude_owned.implementer,
     ));
 
     // The dispatcher reporting it against a Claude-owned turn is not
@@ -3265,6 +3271,157 @@ fn pilot_codex_dispatch_failure_admissibility_table_is_dispatcher_keyed() {
     assert!(!off_turn_failure_is_admissible(
         failure,
         Agent::Claude,
-        claude_owned.current_owner
+        claude_owned.current_owner,
+        claude_owned.phase,
+        claude_owned.implementer,
     ));
+}
+
+// ── the dispatch-failure carve-out is phase-scoped (issue #246 follow-up) ──
+//
+// `apply_event` now hands `CodeReviewLocalPending`/`CodeReviewFinalPending` to
+// `pilot(session)` instead of a hardcoded `Agent::Claude`, so under
+// `pilot=codex` those two audit/PR turns are Codex-owned. A phase-blind
+// `codex_dispatch_failed:` carve-out would let Claude — the *copilot* in such
+// a session — fabricate a dispatch failure, flip the turn to itself, and take
+// both the `/ultrareview-local` audit and the PR. Since `pilot` and
+// `implementer` are uncorrelated, Claude could then be auditing its own
+// commits, which is precisely what the pilot/copilot split prevents. The
+// carve-out is therefore admissible only from the phases Claude actually
+// dispatches to Codex.
+
+/// Assert that a rejected off-turn report left every field the carve-out
+/// could have moved exactly as it was.
+fn assert_session_untouched(before: &CollabSession, after: &CollabSession) {
+    assert_eq!(after.phase, before.phase);
+    assert_eq!(after.current_owner, before.current_owner);
+    assert_eq!(after.pending_failure, before.pending_failure);
+    assert_eq!(after.coding_failure, before.coding_failure);
+    assert_eq!(after.recovery_phase, before.recovery_phase);
+    assert_eq!(after.recovery_owner, before.recovery_owner);
+    assert_eq!(after.recovery_origin_owner, before.recovery_origin_owner);
+    assert_eq!(after.recovery_attempts, before.recovery_attempts);
+    assert_eq!(
+        after.total_recovery_attempts,
+        before.total_recovery_attempts
+    );
+}
+
+#[test]
+fn pilot_codex_claude_may_not_seize_the_pilots_audit_turn_with_a_dispatch_failure() {
+    let s = review_local_pending_for(Agent::Codex);
+    assert_eq!(s.phase, Phase::CodeReviewLocalPending);
+    assert_eq!(s.current_owner, Agent::Codex);
+    let before = s.clone();
+
+    let err = apply_event(
+        &s,
+        Agent::Claude,
+        &CollabEvent::FailureReport {
+            coding_failure: "codex_dispatch_failed: fabricated".to_string(),
+        },
+    )
+    .unwrap_err();
+
+    assert!(matches!(err, CollabError::NotYourTurn { .. }));
+    // The rejected report must leave the pilot's turn exactly where it was —
+    // same phase, same owner, no recovery bookkeeping opened.
+    assert_session_untouched(&before, &s);
+}
+
+#[test]
+fn pilot_codex_claude_may_not_seize_the_pilots_pr_turn_with_a_dispatch_failure() {
+    let s = review_final_pending_for(Agent::Codex);
+    assert_eq!(s.phase, Phase::CodeReviewFinalPending);
+    assert_eq!(s.current_owner, Agent::Codex);
+    let before = s.clone();
+
+    let err = apply_event(
+        &s,
+        Agent::Claude,
+        &CollabEvent::FailureReport {
+            coding_failure: "codex_dispatch_failed: fabricated".to_string(),
+        },
+    )
+    .unwrap_err();
+
+    assert!(matches!(err, CollabError::NotYourTurn { .. }));
+    assert_session_untouched(&before, &s);
+}
+
+#[test]
+fn pilot_codex_branch_drift_stays_admissible_from_the_pilots_review_turns() {
+    // Only the dispatch-failure half is phase-scoped. Branch drift is
+    // detectable from outside the owner's process in any phase, so scoping
+    // must not have caught it by accident.
+    for parked in [
+        review_local_pending_for(Agent::Codex),
+        review_final_pending_for(Agent::Codex),
+    ] {
+        assert_eq!(parked.current_owner, Agent::Codex);
+        let s = apply_event(
+            &parked,
+            Agent::Claude,
+            &CollabEvent::FailureReport {
+                coding_failure: "branch_drift: head_sha abc not found".to_string(),
+            },
+        )
+        .unwrap();
+        assert_eq!(s.phase, Phase::CodingFailed);
+        assert_eq!(s.failed_from_phase, Some(parked.phase));
+    }
+}
+
+#[test]
+fn pilot_codex_dispatch_failure_still_admissible_from_the_implementation_turn() {
+    // The legitimate case: Claude dispatched Codex's batch implementation
+    // turn and observed that it never returned.
+    let s = code_implement_pending_for(Agent::Codex);
+    assert_eq!(s.phase, Phase::CodeImplementPending);
+    assert_eq!(s.implementer, Agent::Codex);
+    assert_eq!(s.current_owner, Agent::Codex);
+
+    let s = apply_event(
+        &s,
+        Agent::Claude,
+        &CollabEvent::FailureReport {
+            coding_failure: "codex_dispatch_failed: mcp call timed out".to_string(),
+        },
+    )
+    .unwrap();
+
+    assert_eq!(s.phase, Phase::CodeImplementPending);
+    assert_eq!(s.current_owner, Agent::Claude);
+    assert_eq!(s.recovery_owner, Some(Agent::Claude));
+    assert_eq!(s.recovery_origin_owner, Some(Agent::Codex));
+}
+
+#[test]
+fn dispatch_failure_from_the_implementation_turn_requires_a_codex_implementer() {
+    // `current_owner == Codex` at `CodeImplementPending` with a *Claude*
+    // implementer only happens after a recovery flip — there was no Codex
+    // one-shot for Claude to have dispatched, so the carve-out must not fire.
+    let s = code_implement_pending_for(Agent::Claude);
+    assert_eq!(s.implementer, Agent::Claude);
+    assert_eq!(s.current_owner, Agent::Claude);
+    let s = apply_event(
+        &s,
+        Agent::Claude,
+        &CollabEvent::FailureReport {
+            coding_failure: "git_commit_failed: index.lock EPERM".to_string(),
+        },
+    )
+    .unwrap();
+    assert_eq!(s.current_owner, Agent::Codex);
+
+    let err = apply_event(
+        &s,
+        Agent::Claude,
+        &CollabEvent::FailureReport {
+            coding_failure: "codex_dispatch_failed: fabricated".to_string(),
+        },
+    )
+    .unwrap_err();
+
+    assert!(matches!(err, CollabError::NotYourTurn { .. }));
 }

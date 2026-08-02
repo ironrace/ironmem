@@ -909,7 +909,13 @@ pub(super) fn handle_collab_send(app: &App, args: &Value) -> Result<Value, Memor
         let turn_exempt = matches!(session.phase, crate::collab::Phase::PlanParallelDrafts)
             || (topic == "failure_report"
                 && sender != session.current_owner
-                && failure_report_is_off_turn_admissible(content, sender, session.current_owner));
+                && failure_report_is_off_turn_admissible(
+                    content,
+                    sender,
+                    session.current_owner,
+                    session.phase,
+                    session.implementer,
+                ));
         if !turn_exempt && sender != session.current_owner {
             return Err(MemoryError::Validation(format!(
                 "not your turn: phase {} expects sender '{}', got '{}'",

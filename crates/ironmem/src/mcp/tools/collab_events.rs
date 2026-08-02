@@ -161,20 +161,29 @@ pub(super) fn parse_failure_report_event(content: &str) -> Result<CollabEvent, M
 
 /// Best-effort check for a contextually authorized off-turn report. Branch
 /// drift is observable by either agent; a Codex-dispatch failure requires
-/// Claude reporting against a Codex-owned turn. Returns false on any JSON
-/// parse failure so malformed payloads still fall through to the main
-/// `parse_failure_report_event` validation.
+/// Claude reporting against a Codex-owned turn in a phase whose Codex turn
+/// Claude dispatches. Returns false on any JSON parse failure so malformed
+/// payloads still fall through to the main `parse_failure_report_event`
+/// validation.
 pub(super) fn failure_report_is_off_turn_admissible(
     content: &str,
     reporter: crate::collab::Agent,
     current_owner: crate::collab::Agent,
+    phase: Phase,
+    implementer: crate::collab::Agent,
 ) -> bool {
     serde_json::from_str::<Value>(content)
         .ok()
         .and_then(|v| {
-            v.get("coding_failure")
-                .and_then(Value::as_str)
-                .map(|s| crate::collab::off_turn_failure_is_admissible(s, reporter, current_owner))
+            v.get("coding_failure").and_then(Value::as_str).map(|s| {
+                crate::collab::off_turn_failure_is_admissible(
+                    s,
+                    reporter,
+                    current_owner,
+                    phase,
+                    implementer,
+                )
+            })
         })
         .unwrap_or(false)
 }
@@ -319,15 +328,21 @@ mod tests {
             &json!({"coding_failure": "branch_drift: head_sha abc not found"}).to_string(),
             crate::collab::Agent::Codex,
             crate::collab::Agent::Claude,
+            Phase::CodeReviewFixGlobalPending,
+            crate::collab::Agent::Claude,
         ));
         assert!(failure_report_is_off_turn_admissible(
             &json!({"coding_failure": "codex_dispatch_failed: mcp call timed out"}).to_string(),
             crate::collab::Agent::Claude,
             crate::collab::Agent::Codex,
+            Phase::CodeReviewFixGlobalPending,
+            crate::collab::Agent::Claude,
         ));
         assert!(!failure_report_is_off_turn_admissible(
             &json!({"coding_failure": "codex_dispatch_failed: mcp call timed out"}).to_string(),
             crate::collab::Agent::Codex,
+            crate::collab::Agent::Claude,
+            Phase::CodeReviewFixGlobalPending,
             crate::collab::Agent::Claude,
         ));
         for recoverable_only in [
@@ -342,10 +357,61 @@ mod tests {
                     &json!({"coding_failure": recoverable_only}).to_string(),
                     crate::collab::Agent::Codex,
                     crate::collab::Agent::Claude,
+                    Phase::CodeReviewFixGlobalPending,
+                    crate::collab::Agent::Claude,
                 ),
                 "{recoverable_only} must NOT be off-turn admissible"
             );
         }
+    }
+
+    /// The dispatch-failure carve-out is scoped to phases whose Codex turn
+    /// Claude dispatches. The pilot's own audit and PR turns are excluded, so
+    /// a `pilot=codex` session's Codex-owned review turns cannot be seized by
+    /// the dispatcher; branch drift stays admissible from those same phases.
+    #[test]
+    fn off_turn_dispatch_failure_admission_is_phase_scoped() {
+        let dispatch =
+            json!({"coding_failure": "codex_dispatch_failed: mcp call timed out"}).to_string();
+        for pilot_owned in [Phase::CodeReviewLocalPending, Phase::CodeReviewFinalPending] {
+            assert!(
+                !failure_report_is_off_turn_admissible(
+                    &dispatch,
+                    crate::collab::Agent::Claude,
+                    crate::collab::Agent::Codex,
+                    pilot_owned,
+                    crate::collab::Agent::Codex,
+                ),
+                "{pilot_owned} is a pilot turn and must not be off-turn admissible"
+            );
+            assert!(
+                failure_report_is_off_turn_admissible(
+                    &json!({"coding_failure": "branch_drift: head_sha abc not found"}).to_string(),
+                    crate::collab::Agent::Claude,
+                    crate::collab::Agent::Codex,
+                    pilot_owned,
+                    crate::collab::Agent::Codex,
+                ),
+                "branch drift stays observable from {pilot_owned}"
+            );
+        }
+
+        // The implementation turn only counts when Codex is the implementer —
+        // that is the turn Claude dispatched.
+        assert!(failure_report_is_off_turn_admissible(
+            &dispatch,
+            crate::collab::Agent::Claude,
+            crate::collab::Agent::Codex,
+            Phase::CodeImplementPending,
+            crate::collab::Agent::Codex,
+        ));
+        assert!(!failure_report_is_off_turn_admissible(
+            &dispatch,
+            crate::collab::Agent::Claude,
+            crate::collab::Agent::Codex,
+            Phase::CodeImplementPending,
+            crate::collab::Agent::Claude,
+        ));
     }
 
     #[test]

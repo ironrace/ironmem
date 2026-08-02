@@ -408,10 +408,12 @@ pub fn apply_event(
             next.last_head_sha = Some(head_sha.clone());
             next.phase = Phase::CodeImplementPending;
             // Owner of the batch implementation phase is whichever agent
-            // the user selected most recently. Default sessions have
-            // `implementer == Agent::Claude` (historical flow); sessions
-            // started or joined with `--implementer=codex` route Codex into
-            // the batch phase to drive its own iron-build.
+            // the user selected most recently. `handle_collab_start` defaults
+            // `implementer` to the resolved pilot, so a plain session (pilot
+            // defaults to `Agent::Claude`) has `implementer == Agent::Claude`
+            // (historical flow), while `--pilot=codex` with `implementer`
+            // omitted routes Codex into the batch phase — as does an explicit
+            // `--implementer=codex` at start or join, under either pilot.
             next.current_owner = session.implementer;
         }
         // ── v3: batch implementation → global review ──────────────────────
@@ -470,8 +472,20 @@ pub fn apply_event(
             // session participant abort the session with no diagnostic
             // value, so we reject the empty form and demand at least one
             // byte of context.
-            let is_off_turn_admissible =
-                off_turn_failure_is_admissible(coding_failure, actor, session.current_owner);
+            //
+            // The dispatch-failure half is also scoped to the phases whose
+            // Codex turn Claude actually dispatches, which is why `phase` and
+            // `session.implementer` are threaded in. Without that scope the
+            // pilot-owned `CodeReviewLocalPending`/`CodeReviewFinalPending`
+            // turns — Codex-owned whenever `pilot == Agent::Codex` — could be
+            // taken by the copilot with a fabricated report.
+            let is_off_turn_admissible = off_turn_failure_is_admissible(
+                coding_failure,
+                actor,
+                session.current_owner,
+                *phase,
+                session.implementer,
+            );
             if !is_off_turn_admissible && actor != session.current_owner {
                 return Err(CollabError::NotYourTurn {
                     expected: session.current_owner.to_string(),
