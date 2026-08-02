@@ -2425,6 +2425,156 @@ fn collab_start_accepts_pilot_codex_and_defaults_implementer_to_pilot() {
 }
 
 #[test]
+fn collab_pilot_and_implementer_remain_independent_in_the_reverse_mixed_case() {
+    // The inverse of the historical `pilot=claude, implementer=codex` route:
+    // pilot owns planning and the two post-implementation audit turns, while
+    // the independently selected implementer owns only the implementation.
+    let app = App::open_for_test().unwrap();
+    let started = call_tool(
+        &app,
+        "collab_start",
+        json!({
+            "repo_path": "/repo",
+            "branch": "pilot-codex-implementer-claude",
+            "initiator": "claude",
+            "pilot": "codex",
+            "implementer": "claude"
+        }),
+    );
+    let session_id = started["session_id"].as_str().unwrap().to_string();
+    assert_eq!(started["pilot"], "codex");
+    assert_eq!(started["implementer"], "claude");
+
+    for (sender, content) in [("claude", "cdraft"), ("codex", "xdraft")] {
+        call_tool(
+            &app,
+            "collab_send",
+            json!({
+                "session_id": &session_id,
+                "sender": sender,
+                "topic": "draft",
+                "content": content,
+            }),
+        );
+    }
+    call_tool(
+        &app,
+        "collab_send",
+        json!({
+            "session_id": &session_id,
+            "sender": "codex",
+            "topic": "canonical",
+            "content": "canonical plan",
+        }),
+    );
+    call_tool(
+        &app,
+        "collab_send",
+        json!({
+            "session_id": &session_id,
+            "sender": "claude",
+            "topic": "review",
+            "content": json!({ "verdict": "approve" }).to_string(),
+        }),
+    );
+    call_tool(
+        &app,
+        "collab_send",
+        json!({
+            "session_id": &session_id,
+            "sender": "codex",
+            "topic": "final",
+            "content": json!({ "plan": "final plan" }).to_string(),
+        }),
+    );
+    let plan_hash = plan_hash(&app, &session_id);
+    call_tool(
+        &app,
+        "collab_send",
+        json!({
+            "session_id": &session_id,
+            "sender": "codex",
+            "topic": "task_list",
+            "content": task_list_payload(&plan_hash, "base", "head", 1),
+        }),
+    );
+    let status = call_tool(&app, "collab_status", json!({ "session_id": &session_id }));
+    assert_eq!(status["phase"], "CodeImplementPending");
+    assert_eq!(status["current_owner"], "claude");
+
+    let wrong_implementer = call_tool_expect_error(
+        &app,
+        "collab_send",
+        json!({
+            "session_id": &session_id,
+            "sender": "codex",
+            "topic": "implementation_done",
+            "content": json!({ "head_sha": "implemented" }).to_string(),
+        }),
+    );
+    assert!(
+        wrong_implementer.to_lowercase().contains("not your turn")
+            || wrong_implementer.contains("expects sender"),
+        "pilot must not be able to substitute for the independent implementer: {wrong_implementer}"
+    );
+
+    call_tool(
+        &app,
+        "collab_send",
+        json!({
+            "session_id": &session_id,
+            "sender": "claude",
+            "topic": "implementation_done",
+            "content": json!({ "head_sha": "implemented" }).to_string(),
+        }),
+    );
+    let status = call_tool(&app, "collab_status", json!({ "session_id": &session_id }));
+    assert_eq!(status["phase"], "CodeReviewFixGlobalPending");
+    assert_eq!(status["current_owner"], "claude");
+
+    call_tool(
+        &app,
+        "collab_send",
+        json!({
+            "session_id": &session_id,
+            "sender": "claude",
+            "topic": "review_fix_global",
+            "content": json!({ "head_sha": "reviewed" }).to_string(),
+        }),
+    );
+    let status = call_tool(&app, "collab_status", json!({ "session_id": &session_id }));
+    assert_eq!(status["phase"], "CodeReviewLocalPending");
+    assert_eq!(status["current_owner"], "codex");
+
+    call_tool(
+        &app,
+        "collab_send",
+        json!({
+            "session_id": &session_id,
+            "sender": "codex",
+            "topic": "review_local",
+            "content": json!({ "head_sha": "reviewed" }).to_string(),
+        }),
+    );
+    let status = call_tool(&app, "collab_status", json!({ "session_id": &session_id }));
+    assert_eq!(status["phase"], "CodeReviewFinalPending");
+    assert_eq!(status["current_owner"], "codex");
+
+    call_tool(
+        &app,
+        "collab_send",
+        json!({
+            "session_id": &session_id,
+            "sender": "codex",
+            "topic": "final_review",
+            "content": json!({ "head_sha": "reviewed", "pr_url": "https://example.test/pr/1" }).to_string(),
+        }),
+    );
+    let status = call_tool(&app, "collab_status", json!({ "session_id": &session_id }));
+    assert_eq!(status["phase"], "CodingComplete");
+}
+
+#[test]
 fn collab_start_rejects_invalid_pilot_and_creates_no_session_row() {
     let app = App::open_for_test().unwrap();
     let err = call_tool_expect_error(

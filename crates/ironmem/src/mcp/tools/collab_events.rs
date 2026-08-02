@@ -77,7 +77,8 @@ pub(super) fn build_v1_final_event(
 ) -> Result<CollabEvent, MemoryError> {
     if !matches!(phase, Phase::PlanFinalizePending) {
         return Err(MemoryError::Validation(format!(
-            "topic 'final' is only accepted in PlanFinalizePending; current phase is {phase}"
+            "topic 'final' is only accepted in {}; current phase is {phase}",
+            Phase::PlanFinalizePending
         )));
     }
     let plan = parse_final_payload(content)?;
@@ -291,6 +292,20 @@ pub(super) fn parse_final_payload(content: &str) -> Result<String, MemoryError> 
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn final_rejection_uses_the_stable_wire_phase_name() {
+        let error = build_v1_final_event(
+            &json!({ "plan": "final plan" }).to_string(),
+            Phase::PlanSynthesisPending,
+        )
+        .expect_err("final must be refused before the finalization phase");
+
+        assert_eq!(
+            error.to_string(),
+            "Validation error: topic 'final' is only accepted in PlanClaudeFinalizePending; current phase is PlanSynthesisPending"
+        );
+    }
 
     // ── Task 9: off-turn admission regression guard ─────────────────────────
 
