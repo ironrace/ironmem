@@ -84,6 +84,7 @@ REQUIRED_CLAUDE_COMMANDS=(
 REQUIRED_CLAUDE_PROMPTS=(
   collab-turn-plan-draft
   collab-turn-plan-synthesis
+  collab-turn-plan-review
   collab-turn-plan-finalize
   collab-turn-task-list
   collab-turn-code-implement

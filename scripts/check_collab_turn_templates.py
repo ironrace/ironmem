@@ -80,6 +80,12 @@ EXPECTED_TEMPLATES = {
         "model": "opus",
         "topics": ["canonical"],
     },
+    "collab-turn-plan-review.md": {
+        "turn": "review",
+        "tier": "review",
+        "model": "opus",
+        "topics": ["review"],
+    },
     "collab-turn-plan-finalize.md": {
         "turn": "final",
         "tier": "planning",
