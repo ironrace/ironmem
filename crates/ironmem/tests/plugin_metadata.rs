@@ -3,6 +3,7 @@
 //! Ensures required JSON fields are present and plugin versions stay in sync
 //! with the crate version in Cargo.toml.
 
+use std::collections::BTreeSet;
 use std::path::PathBuf;
 
 /// Walk up from CARGO_MANIFEST_DIR until we find the workspace root
@@ -36,6 +37,20 @@ fn read_json(rel_path: &str) -> serde_json::Value {
 fn read_text(rel_path: &str) -> String {
     let path = workspace_root().join(rel_path);
     std::fs::read_to_string(&path).unwrap_or_else(|_| panic!("Could not read {}", path.display()))
+}
+
+/// Extract the body of a `NAME=( ... )` bash array declared in
+/// `scripts/install-ironmem.sh`, e.g. `installer_array("REQUIRED_CODEX_PROMPTS")`
+/// returns the lines between `REQUIRED_CODEX_PROMPTS=(` and its closing `)`.
+fn installer_array(name: &str) -> String {
+    let installer = read_text("scripts/install-ironmem.sh");
+    let marker = format!("{name}=(");
+    installer
+        .split(marker.as_str())
+        .nth(1)
+        .and_then(|rest| rest.split(')').next())
+        .unwrap_or_else(|| panic!("scripts/install-ironmem.sh: missing {name} array"))
+        .to_owned()
 }
 
 #[test]
@@ -159,12 +174,33 @@ fn codex_phase_prompts_are_packaged_and_invocable() {
     ];
     const MAX_PROMPT_BYTES: usize = 42_832 / 3;
 
-    let installer = read_text("scripts/install-ironmem.sh");
-    let required_prompts = installer
-        .split("REQUIRED_CODEX_PROMPTS=(")
-        .nth(1)
-        .and_then(|rest| rest.split(')').next())
-        .expect("scripts/install-ironmem.sh: missing REQUIRED_CODEX_PROMPTS array");
+    // Close the registry<->filesystem loop: REQUIRED_CODEX_PHASE_PROMPTS is a
+    // hardcoded allowlist, and without this check nothing forces it to match
+    // what is actually on disk. An unregistered `.codex-plugin/prompts/collab-*.md`
+    // file would otherwise pass both this test and the Python lint while
+    // receiving no byte budget, no $ARGUMENTS check, and no
+    // collab_wait_my_turn check from either gate.
+    let dir = workspace_root().join(".codex-plugin/prompts");
+    let on_disk: BTreeSet<String> = std::fs::read_dir(&dir)
+        .unwrap_or_else(|_| panic!("Could not read directory {}", dir.display()))
+        .filter_map(|entry| {
+            let file_name = entry.ok()?.file_name();
+            file_name.to_str()?.strip_suffix(".md").map(str::to_owned)
+        })
+        .filter(|name| name.starts_with("collab-"))
+        .collect();
+    let registered: BTreeSet<String> = REQUIRED_CODEX_PHASE_PROMPTS
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+    assert_eq!(
+        on_disk, registered,
+        ".codex-plugin/prompts/collab-*.md and REQUIRED_CODEX_PHASE_PROMPTS have drifted; \
+         an unregistered phase prompt gets no byte budget, no $ARGUMENTS check, and no \
+         collab_wait_my_turn check on either gate"
+    );
+
+    let required_prompts = installer_array("REQUIRED_CODEX_PROMPTS");
 
     for prompt_name in REQUIRED_CODEX_PHASE_PROMPTS {
         assert!(
@@ -224,6 +260,43 @@ fn codex_phase_prompts_are_packaged_and_invocable() {
     );
 }
 
+/// Parse the accepted verdict literals out of the `SubmitReview` match arm in
+/// `state_machine/mod.rs`, rather than hardcoding a copy that could drift out
+/// of sync with the server's actual `InvalidVerdictValue` validation. Mirrors
+/// `parse_wire_names()` in `scripts/check_collab_turn_templates.py`, which
+/// applies the same discipline to phase names: every failure to parse is a
+/// loud error, because a check that silently finds zero verdicts would pass
+/// everything.
+fn accepted_verdicts() -> BTreeSet<String> {
+    let rel = "crates/ironmem/src/collab/state_machine/mod.rs";
+    let text = read_text(rel);
+    let arm = text
+        .split_once("verdict.as_str(),")
+        .map(|(_, rest)| rest)
+        .and_then(|rest| rest.split_once(')').map(|(before, _)| before))
+        .unwrap_or_else(|| {
+            panic!(
+                "{rel}: no `verdict.as_str(), \"...\" | \"...\"` match arm found — the \
+                 plan-review verdict cross-check would pass vacuously, so it fails instead"
+            )
+        });
+    let verdicts: BTreeSet<String> = arm
+        .split('|')
+        .filter_map(|s| {
+            let s = s.trim();
+            s.strip_prefix('"')
+                .and_then(|s| s.strip_suffix('"'))
+                .map(str::to_owned)
+        })
+        .collect();
+    assert!(
+        !verdicts.is_empty(),
+        "{rel}: no verdict literals parsed out of the SubmitReview match arm — the \
+         plan-review verdict cross-check would pass vacuously, so it fails instead"
+    );
+    verdicts
+}
+
 /// The copilot turn templates are what make role reversal real on the Claude
 /// side: under `pilot=codex`, Claude runs the plan `review` and
 /// `review_fix_global` turns. A template that exists in the repo but is
@@ -237,12 +310,7 @@ fn claude_copilot_turn_templates_are_packaged() {
         "collab-turn-review-fix-global",
     ];
 
-    let installer = read_text("scripts/install-ironmem.sh");
-    let required_prompts = installer
-        .split("REQUIRED_CLAUDE_PROMPTS=(")
-        .nth(1)
-        .and_then(|rest| rest.split(')').next())
-        .expect("scripts/install-ironmem.sh: missing REQUIRED_CLAUDE_PROMPTS array");
+    let required_prompts = installer_array("REQUIRED_CLAUDE_PROMPTS");
 
     for name in REQUIRED_CLAUDE_COPILOT_TEMPLATES {
         assert!(
@@ -251,24 +319,53 @@ fn claude_copilot_turn_templates_are_packaged() {
         );
 
         let rel = format!(".claude-plugin/prompts/{name}.md");
-        let text = read_text(&rel);
+        let path = workspace_root().join(&rel);
+        let raw = std::fs::read_to_string(&path).unwrap_or_else(|_| {
+            panic!(
+                "Claude copilot turn template is missing: {}",
+                path.display()
+            )
+        });
+        let content = body(&raw);
         assert!(
-            text.contains("ANTI-PUPPETEERING"),
-            "{rel}: copilot template must carry the anti-puppeteering preamble"
+            content.contains("ANTI-PUPPETEERING"),
+            "{rel}: copilot template body must carry the anti-puppeteering preamble \
+             (frontmatter doesn't count)"
         );
         assert!(
-            text.contains("## Verdict"),
-            "{rel}: copilot template must carry the 3-line verdict contract"
+            content.contains("## Verdict"),
+            "{rel}: copilot template body must carry a `## Verdict` section (the 3-line \
+             result/ref/blocker contract itself is enforced by \
+             scripts/check_collab_turn_templates.py)"
         );
     }
 
+    // The verdict vocabulary the template offers must match exactly the set
+    // state_machine.rs actually validates: this fails both when the template
+    // drops a verdict the server still accepts, and when the server adds one
+    // the template never mentions.
     let review = read_text(".claude-plugin/prompts/collab-turn-plan-review.md");
-    for verdict in ["approve_with_minor_edits", "request_changes"] {
-        assert!(
-            review.contains(verdict),
-            "collab-turn-plan-review.md: must offer the {verdict} verdict SubmitReview validates"
-        );
-    }
+    let accepted = accepted_verdicts();
+    let anchor = "\"verdict\":\"";
+    let alt_start = review
+        .find(anchor)
+        .map(|i| i + anchor.len())
+        .unwrap_or_else(|| {
+            panic!("collab-turn-plan-review.md: no `{anchor}...\"` verdict alternation found")
+        });
+    let alt_end = review[alt_start..]
+        .find('"')
+        .map(|i| alt_start + i)
+        .unwrap_or_else(|| panic!("collab-turn-plan-review.md: unterminated verdict alternation"));
+    let offered: BTreeSet<String> = review[alt_start..alt_end]
+        .split('|')
+        .map(|s| s.trim().to_owned())
+        .collect();
+    assert_eq!(
+        offered, accepted,
+        "collab-turn-plan-review.md: verdict alternation {offered:?} must match exactly the \
+         accepted set {accepted:?} validated by state_machine.rs's SubmitReview handler"
+    );
 
     let fix_global = read_text(".claude-plugin/prompts/collab-turn-review-fix-global.md");
     assert!(
@@ -276,7 +373,7 @@ fn claude_copilot_turn_templates_are_packaged() {
         "collab-turn-review-fix-global.md: must name Claude's own finding pass"
     );
     assert!(
-        !fix_global.contains("/pr-review-toolkit:review-pr"),
+        !fix_global.contains("pr-review-toolkit"),
         "collab-turn-review-fix-global.md: must not name Codex's tooling"
     );
 }
@@ -340,6 +437,18 @@ fn frontmatter(raw: &str) -> Option<&str> {
     let rest = raw.strip_prefix("---")?;
     let end = rest.find("\n---")?;
     Some(&rest[..end])
+}
+
+/// Return the text after the closing `---` frontmatter fence, or the whole
+/// file when there is no frontmatter block. Content checks for a *body*
+/// property (a banner, a heading) must scan this, not the raw file — a token
+/// stashed in frontmatter would otherwise satisfy a `contains` check without
+/// the property it names ever appearing where a reader encounters it.
+fn body(raw: &str) -> &str {
+    match frontmatter(raw) {
+        Some(front) => &raw["---".len() + front.len() + "\n---".len()..],
+        None => raw,
+    }
 }
 
 /// Extract the full `tools:` value from YAML frontmatter, including any
