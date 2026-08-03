@@ -43,21 +43,28 @@ implementer flag (already applied by the command shim). Call
 if phase is not `CodeReviewLocalPending` or Codex is not current owner, do not
 send; report `result: review_local not sent` in the completion block below and
 exit. Read `repo_path`, `branch`, `base_sha`, `last_head_sha`, and
-`pending_failure`.
+`pending_failure`. Work in `repo_path`. This turn's gates are
+`cargo fmt --all -- --check` and
+`cargo clippy --workspace --all-targets --all-features -- -D warnings`.
 
 A non-null `pending_failure` means you are the **recovery owner** for an
 interrupted turn, not simply the next-in-line owner. As recovery owner, preserve
 and inspect the working-tree diff before any fetch, checkout, or reset; run this
 turn's gates yourself, commit and push the recovered work, then send the normal
-`review_local` exactly once rather than a new `failure_report`. **Skip the next
-paragraph entirely** — it would reset over the work you are recovering.
+`review_local` exactly once rather than a new `failure_report`. **Skip only the
+`git fetch`, the checkout, and the `git reset --hard` in the next paragraph** —
+they would reset over the work you are recovering.
 
-For a normal turn, work in `repo_path`: `git fetch`, verify
+For a normal turn, `git fetch`, verify
 `git cat-file -e <last_head_sha>^{commit}` (on a miss, send `failure_report`
-with a detailed `branch_drift:` value and exit), checkout the session `branch`
-and `git reset --hard <last_head_sha>` (the copilot pushed at
-`review_fix_global`), then run `cargo fmt --all -- --check` and
-`cargo clippy --workspace --all-targets --all-features -- -D warnings`.
+with `coding_failure: "branch_drift: <detail>"` and exit), and checkout the
+session `branch`. Immediately before resetting, require `git status
+--porcelain` to be empty: a dirty worktree here means a prior turn died
+without reporting `pending_failure`, not that there is nothing to recover — do
+not run `git reset --hard`; instead preserve and inspect the diff on the
+recovery path above. Only when the worktree is clean, `git reset --hard
+<last_head_sha>` (the copilot pushed at `review_fix_global`), then run this
+turn's gates.
 
 Prepare the review input before choosing depth. First attempt the compact
 artifact:
@@ -122,10 +129,11 @@ correct, report it as a blocker and exit.
 ## Failure classification
 
 All v3 payloads are JSON strings and the head SHA is post-commit and post-push.
-A `failure_report` is recoverable only for a detailed `git_commit_failed:`,
-`git_push_failed:`, `sandbox_denied:`, `disk_full:`, `network_failed:`, or
-`codex_dispatch_failed:` value. Preserve work for a recoverable handoff. A bare
-prefix, `branch_drift:`, a subagent failure, or a gate failure is terminal.
+A `failure_report`'s `coding_failure` field is recoverable only for a detailed
+`git_commit_failed:`, `git_push_failed:`, `sandbox_denied:`, `disk_full:`,
+`network_failed:`, or `codex_dispatch_failed:` value. Preserve work for a
+recoverable handoff. A bare prefix, `branch_drift:`, a subagent failure, or a
+gate failure is terminal.
 
 ## Completion status
 

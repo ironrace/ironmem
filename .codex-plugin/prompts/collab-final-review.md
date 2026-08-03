@@ -40,14 +40,15 @@ implementer flag (already applied by the command shim). Call
 `collab_wait_my_turn(session_id, "codex", 60)` once, then read `collab_status`;
 if phase is not `CodeReviewFinalPending` or Codex is not current owner, stage
 nothing; report `result: pr body not composed` in the completion block below and
-exit. Read `task_list_ref`, `branch`, `last_head_sha`, and `pending_failure`.
+exit. Read `repo_path`, `task_list_ref`, `branch`, `last_head_sha`, and
+`pending_failure`.
 
 A non-null `pending_failure` on entry does not change what this prompt does:
 draft the PR body exactly as below. The submit worker owns the recovery-owner
 protocol for this phase.
 
-Perform pushed-head proof only — do not reset and do not re-run gates. Verify
-`git cat-file -e <last_head_sha>^{commit}`, a clean worktree,
+Perform pushed-head proof only, run in `repo_path` — do not reset and do not
+re-run gates. Verify `git cat-file -e <last_head_sha>^{commit}`, a clean worktree,
 `git rev-parse HEAD` equal to `last_head_sha`, and local HEAD equal to the
 pushed upstream head (`@{u}`, or `refs/remotes/origin/<branch>` when no upstream
 is configured). If any proof check fails, do not run tests and do not stage an

@@ -63,10 +63,15 @@ local skills, prompts, and commands untouched.
 
 - `$CODEX_HOME/commands/collab.md` — the interactive Codex `/collab` slash command.
 - `$CODEX_HOME/prompts/collab-plan-draft.md` — the v1 Codex draft turn.
+- `$CODEX_HOME/prompts/collab-plan-synthesis.md` — the v1 Codex canonical-plan synthesis turn.
 - `$CODEX_HOME/prompts/collab-plan-review.md` — the v1 Codex plan-review turn.
-- `$CODEX_HOME/prompts/collab-global-review.md` — the v3 Codex global-review/fix turn.
-- `$CODEX_HOME/prompts/collab-recovery.md` — delegated v3 local/final-review recovery.
+- `$CODEX_HOME/prompts/collab-plan-finalize.md` — the v1 Codex plan-finalize turn.
+- `$CODEX_HOME/prompts/collab-task-list.md` — the Codex `PlanLocked` task-list bridge turn.
 - `$CODEX_HOME/prompts/collab-batch-impl.md` — the Codex-implementer batch turn.
+- `$CODEX_HOME/prompts/collab-global-review.md` — the v3 Codex global-review/fix turn.
+- `$CODEX_HOME/prompts/collab-review-local.md` — the Codex `CodeReviewLocalPending` post-fix audit turn.
+- `$CODEX_HOME/prompts/collab-final-review.md` — the Codex `CodeReviewFinalPending` PR-body compose turn.
+- `$CODEX_HOME/prompts/collab-recovery.md` — delegated v3 local/final-review recovery.
 
 The command reads session state and loads the matching phase prompt. Claude's
 background dispatcher likewise passes the resolved phase prompt directly when
