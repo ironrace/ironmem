@@ -29,13 +29,21 @@ CODEX_PROMPTS = [
         "collab-plan-review.md",
         "collab-plan-finalize.md",
         "collab-task-list.md",
-        "collab-global-review.md",
-        "collab-recovery.md",
         "collab-batch-impl.md",
+        "collab-global-review.md",
+        "collab-review-local.md",
+        "collab-final-review.md",
+        "collab-recovery.md",
     )
 ]
 REVIEW_DIFF_FALLBACK_SURFACES = {
     ROOT / ".codex-plugin" / "prompts" / "collab-global-review.md": [
+        "ironmem review-diff --repo <repo_path> --base <base_sha> --head <last_head_sha>",
+        "only on success",
+        "git diff <base_sha>..<last_head_sha>",
+        "--expand-file <path> --hunk <ordinal>",
+    ],
+    ROOT / ".codex-plugin" / "prompts" / "collab-review-local.md": [
         "ironmem review-diff --repo <repo_path> --base <base_sha> --head <last_head_sha>",
         "only on success",
         "git diff <base_sha>..<last_head_sha>",

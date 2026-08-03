@@ -104,9 +104,11 @@ REQUIRED_CODEX_PROMPTS=(
   collab-plan-review
   collab-plan-finalize
   collab-task-list
-  collab-global-review
-  collab-recovery
   collab-batch-impl
+  collab-global-review
+  collab-review-local
+  collab-final-review
+  collab-recovery
   evaluate-issue
 )
 
