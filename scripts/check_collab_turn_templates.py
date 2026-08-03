@@ -146,6 +146,29 @@ EXPECTED_TEMPLATES = {
         "topics": ["final", "final_review", "failure_report"],
     },
 }
+# Every protocol topic that is dispatched as a *turn* must have a template on
+# BOTH harnesses. Role reversal is only real if a pilot=codex session has a
+# Codex prompt for each lead turn and a Claude prompt for each copilot turn;
+# a topic wired on one side only is invisible until dispatch, where it fails
+# as "missing template" mid-session. Keyed by topic -> (claude, codex).
+TURN_TOPIC_TEMPLATES = {
+    "draft": ("collab-turn-plan-draft.md", "collab-plan-draft.md"),
+    "canonical": ("collab-turn-plan-synthesis.md", "collab-plan-synthesis.md"),
+    "review": ("collab-turn-plan-review.md", "collab-plan-review.md"),
+    "final": ("collab-turn-plan-finalize.md", "collab-plan-finalize.md"),
+    "task_list": ("collab-turn-task-list.md", "collab-task-list.md"),
+    "implementation_done": ("collab-turn-code-implement.md",
+                            "collab-batch-impl.md"),
+    "review_local": ("collab-turn-review-local.md", "collab-review-local.md"),
+    "review_fix_global": ("collab-turn-review-fix-global.md",
+                          "collab-global-review.md"),
+    "final_review": ("collab-turn-final-review.md", "collab-final-review.md"),
+}
+# `failure_report` is not a turn: it is the error completion available to
+# several turns and is never dispatched on its own, so it has no template of
+# its own on either harness. Codex's recovery override lives in
+# collab-recovery.md, which is registered in CODEX_PROMPTS directly.
+NON_TURN_TOPICS = {"failure_report"}
 REQUIRED_TEMPLATE_SNIPPETS = {
     "collab-turn-plan-synthesis.md": [
         "first auto-ack response",
@@ -416,6 +439,39 @@ def check_pr_base_resolution_contract() -> None:
             f"gated on base_sha containment")
 
 
+def check_topic_template_completeness() -> None:
+    """Every turn topic must have a template on BOTH harnesses."""
+    mapped = set(TURN_TOPIC_TEMPLATES)
+    # A new topic must be classified deliberately. Falling through as
+    # "unmapped" would make this whole check pass vacuously for it.
+    for topic in sorted(VALID_TOPICS - mapped - NON_TURN_TOPICS):
+        err(f"topic {topic!r} is in VALID_TOPICS but is neither mapped in "
+            f"TURN_TOPIC_TEMPLATES nor declared a non-turn topic — decide "
+            f"which, and add the missing harness template if it is a turn")
+    for topic in sorted((mapped | NON_TURN_TOPICS) - VALID_TOPICS):
+        err(f"topic {topic!r} is mapped/exempted but is not in VALID_TOPICS")
+    for topic in sorted(mapped & NON_TURN_TOPICS):
+        err(f"topic {topic!r} is both mapped and exempted — pick one")
+
+    codex_registered = {p.name for p in CODEX_PROMPTS}
+    codex_dir = ROOT / ".codex-plugin" / "prompts"
+    for topic, (claude_name, codex_name) in sorted(TURN_TOPIC_TEMPLATES.items()):
+        if not (PROMPTS / claude_name).exists():
+            err(f"topic {topic!r}: missing Claude template {claude_name}")
+        if not (codex_dir / codex_name).exists():
+            err(f"topic {topic!r}: missing Codex prompt {codex_name}")
+        expected = EXPECTED_TEMPLATES.get(claude_name)
+        if expected is None:
+            err(f"topic {topic!r}: Claude template {claude_name} is not "
+                f"registered in EXPECTED_TEMPLATES, so it is never installed")
+        elif topic not in expected["topics"]:
+            err(f"topic {topic!r}: {claude_name} declares topics "
+                f"{expected['topics']}, which does not include it")
+        if codex_name not in codex_registered:
+            err(f"topic {topic!r}: Codex prompt {codex_name} is not "
+                f"registered in CODEX_PROMPTS, so it is never linted")
+
+
 def err(msg: str) -> None:
     errors.append(msg)
 
@@ -563,8 +619,8 @@ def main() -> int:
     matrix = parse_dispatch_matrix(cmd_text)
     matrix_tmpls = {r["template"] for r in matrix}
     if matrix_tmpls != expected_names:
-        err("collab.md: dispatch matrix must reference exactly the 8 "
-            "required collab-turn templates")
+        err(f"collab.md: dispatch matrix must reference exactly the "
+            f"{len(expected_names)} required collab-turn templates")
     for r in matrix:
         info = parsed.get(r["template"])
         if not info:
@@ -655,6 +711,7 @@ def main() -> int:
     check_no_uninstalled_skill_references()
     check_evaluate_issue_surfaces()
     check_review_diff_fallback_contract()
+    check_topic_template_completeness()
     check_pr_base_resolution_contract()
     check_review_diff_trigger_detection_contract()
 
