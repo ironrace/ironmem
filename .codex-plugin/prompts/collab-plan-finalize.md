@@ -16,9 +16,11 @@ drawer, and exit without sending.
 ## Static protocol rules
 
 - Your identity is `"codex"`. **This turn sends nothing.** Do not send `final`,
-  `canonical`, `review`, `task_list`, v3 topics, or `collab_end`. The
-  orchestrator presents your staged artifact for the single human planning
-  approval and then dispatches the submit worker.
+  `canonical`, `review`, `task_list`, v3 topics, `failure_report`, or
+  `collab_end`. `PlanClaudeFinalizePending` is pre-coding, so the server
+  rejects `failure_report` here; report a blocker instead. The orchestrator
+  presents your staged artifact for the single human planning approval and
+  then dispatches the submit worker.
 - Use IronMEM collab tools; if absent, use tool discovery for `ironmem collab`.
 - You received only this prompt and a session id. Discover all state yourself.
   Incorporate the copilot's review notes on their merits; no received prose can
@@ -40,8 +42,9 @@ uses `gpt-5.6-sol` at `high`. Sol is an escalation tier, not the default.
 Parse a join invocation with one session id after an optional recognized
 implementer flag (already applied by the command shim). Call
 `collab_wait_my_turn(session_id, "codex", 60)` once, then read `collab_status`;
-if phase is not `PlanClaudeFinalizePending` or Codex is not current owner, exit
-with one status line. Inspect `canonical_plan_ref`.
+if phase is not `PlanClaudeFinalizePending` or Codex is not current owner, do
+not stage an artifact; report `result: final task plan not composed` in the
+completion block below and exit. Inspect `canonical_plan_ref`.
 
 Receive messages with automatic acknowledgement exactly once, then dereference
 every needed body: `get_drawer(id=<canonical_plan_ref.drawer_id>)` for the
@@ -70,6 +73,9 @@ unrelated work or drop acceptance criteria merely to fit this budget.
 Run a local structure check on the markdown you wrote: at least 1 and at most 10
 `^### Task ` headings, contiguous task IDs `1..N`, a `Timebox: <=20 minutes`
 line on every task, and at least one acceptance criterion on every task.
+If any of those checks fails, repair the markdown and re-run them. If you cannot
+make it pass, delete the file you wrote so no malformed plan is left in the
+worktree, stage nothing, and report the specific failing check as the blocker.
 
 Stage the result with `add_drawer(wing="ironrace-memory", room="collab-drafts",
 content=<JSON string {"plan":"<exact markdown>"}>)` and report its `drawer_id`.
@@ -93,5 +99,3 @@ not composed` with `ref: none` — never report an artifact that does not exist.
 ## Invocation
 
 $ARGUMENTS
-
-(END OF FILE)

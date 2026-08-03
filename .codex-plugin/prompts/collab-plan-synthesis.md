@@ -37,21 +37,24 @@ uses `gpt-5.6-sol` at `high`. Sol is an escalation tier, not the default.
 Parse a join invocation with one session id after an optional recognized
 implementer flag (already applied by the command shim). Call
 `collab_wait_my_turn(session_id, "codex", 60)` once, then read `collab_status`;
-if phase is not `PlanSynthesisPending` or Codex is not current owner, exit with
-one status line.
+if phase is not `PlanSynthesisPending` or Codex is not current owner, do not
+send; report `result: canonical not sent` in the completion block below and
+exit.
 
-Receive messages with automatic acknowledgement exactly once. Locate both
-`topic="draft"` messages and retrieve every needed body with
+Receive messages with automatic acknowledgement exactly once, then locate the
+counterpart's `topic="draft"` message and retrieve its body with
 `get_drawer(id=<message.drawer_id>)`; only a legacy row without a drawer id may
-use inline content. Never issue a second receive after auto-acknowledgement.
+use inline content. The queue is addressed, so exactly one draft is returned to
+you — your own draft was delivered to the counterpart and is not retrievable
+here. Never issue a second receive after auto-acknowledgement.
 
-Merge your own draft and the counterpart's draft into one canonical plan that
-keeps the strongest parts of each. Do not concatenate the two drafts, and do not
-drop scope that only one draft covered. A collab issue may contain at most 10
-execution tasks; if the merged scope credibly needs more, build the canonical
-plan around an independently executable child-issue split rather than one
-oversized plan. Never merge unrelated work or drop acceptance criteria to fit
-the cap.
+Merge the counterpart's draft with your own independent reading of
+`collab_status.task` into one canonical plan that keeps the strongest parts of
+each. Do not simply adopt the received draft, and do not drop scope that only
+one source covered. A collab issue may contain at most 10 execution tasks; if
+the merged scope credibly needs more, build the canonical plan around an
+independently executable child-issue split rather than one oversized plan.
+Never merge unrelated work or drop acceptance criteria to fit the cap.
 
 Send exactly one `collab_send` with sender `codex`, topic `canonical`, and the
 canonical plan text. Do not ask for user approval here: the single human
@@ -75,5 +78,3 @@ sent` — never report a send that did not happen.
 ## Invocation
 
 $ARGUMENTS
-
-(END OF FILE)

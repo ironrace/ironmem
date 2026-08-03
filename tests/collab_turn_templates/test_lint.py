@@ -100,11 +100,6 @@ def test_plan_and_manifest_workers_use_verified_references():
 def test_codex_dispatch_uses_explicit_repository_model_defaults():
     docs = (ROOT / "docs" / "COLLAB.md").read_text()
     dispatcher = (ROOT / ".claude-plugin" / "commands" / "collab.md").read_text()
-    plan_draft_prompt = (ROOT / ".codex-plugin" / "prompts" / "collab-plan-draft.md").read_text()
-    plan_review_prompt = (ROOT / ".codex-plugin" / "prompts" / "collab-plan-review.md").read_text()
-    global_review_prompt = (ROOT / ".codex-plugin" / "prompts" / "collab-global-review.md").read_text()
-    recovery_prompt = (ROOT / ".codex-plugin" / "prompts" / "collab-recovery.md").read_text()
-    batch_prompt = (ROOT / ".codex-plugin" / "prompts" / "collab-batch-impl.md").read_text()
     # Two surfaces this assertion used to cover are gone, and neither is
     # replaced. The bundled skills no longer carry a codex-tools.md reference
     # sheet -- the iron-* skills resolve harness tool names from
@@ -112,11 +107,16 @@ def test_codex_dispatch_uses_explicit_repository_model_defaults():
     # PR #240 (adb5c80); the read of it left this suite red from that merge
     # until now, unnoticed because nothing ran the suite.
 
-    for surface in (docs, dispatcher, plan_draft_prompt, plan_review_prompt,
-                    global_review_prompt, recovery_prompt, batch_prompt):
-        assert "gpt-5.6-luna" in surface
-        assert "gpt-5.6-terra" in surface
-        assert "gpt-5.6-sol" in surface
+    codex_prompts = {p.name: p.read_text()
+                     for p in sorted((ROOT / ".codex-plugin" / "prompts").glob("collab-*.md"))}
+    assert len(codex_prompts) >= 7, f"expected every collab-*.md prompt, got {sorted(codex_prompts)}"
+    plan_draft_prompt = codex_prompts["collab-plan-draft.md"]
+
+    for name, surface in [("docs/COLLAB.md", docs), (".claude-plugin/commands/collab.md", dispatcher),
+                          *codex_prompts.items()]:
+        assert "gpt-5.6-luna" in surface, name
+        assert "gpt-5.6-terra" in surface, name
+        assert "gpt-5.6-sol" in surface, name
 
     assert "CodeImplementPending" in dispatcher
     assert "-m gpt-5.6-luna -c model_reasoning_effort=max" in dispatcher
