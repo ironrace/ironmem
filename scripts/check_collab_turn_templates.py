@@ -201,6 +201,19 @@ REQUIRED_TEMPLATE_SNIPPETS = {
         'parse the artifact JSON as',
         'gh pr create --base <base_branch>',
     ],
+    "collab-turn-plan-review.md": [
+        "PlanCodexReviewPending",
+        # The one-recv rule, wrapped as the template ships it.
+        "Do not call `collab_recv` again\n   after it acknowledges.",
+        "get_drawer(id=<canonical_plan_ref.drawer_id>)",
+        "exactly one copilot plan-review pass",
+        "Send exactly once",
+    ],
+    "collab-turn-review-fix-global.md": [
+        "CodeReviewFixGlobalPending",
+        "/ultrareview-local",
+        "the payload carries only",
+    ],
 }
 FORBIDDEN_TEMPLATE_SNIPPETS = {
     "collab-turn-plan-synthesis.md": [
@@ -472,6 +485,102 @@ def check_topic_template_completeness() -> None:
                 f"registered in CODEX_PROMPTS, so it is never linted")
 
 
+def check_installer_covers_templates() -> None:
+    """Every registered template must also be installed.
+
+    The three other registration surfaces are lint-enforced against each
+    other, but a template missing from REQUIRED_CLAUDE_PROMPTS still lints
+    green — it is simply never copied to ~/.claude/prompts/, and the gap
+    surfaces mid-session as "missing template" at dispatch. Same for the
+    Codex prompts and REQUIRED_CODEX_PROMPTS.
+    """
+    installer = ROOT / "scripts" / "install-ironmem.sh"
+    if not installer.exists():
+        err("scripts/install-ironmem.sh: missing installer")
+        return
+    text = installer.read_text()
+    for array, required in (
+        ("REQUIRED_CLAUDE_PROMPTS", {n[:-3] for n in EXPECTED_TEMPLATES}),
+        ("REQUIRED_CODEX_PROMPTS", {p.stem for p in CODEX_PROMPTS}),
+    ):
+        _, sep, rest = text.partition(f"{array}=(")
+        if not sep:
+            err(f"scripts/install-ironmem.sh: missing {array} array")
+            continue
+        listed = {line.strip() for line in rest.partition(")")[0].splitlines()}
+        for name in sorted(required - listed):
+            err(f"scripts/install-ironmem.sh: {array} is missing {name!r} — "
+                f"it is registered for lint but would never be installed")
+
+
+# ---- preconditions <-> phase.rs wire-name cross-check -----------------------
+#
+# `collab_status` serializes `phase` through `Display`, which forwards to
+# `Phase::wire_name`. Two variants were genericized in #246 while their wire
+# strings stayed frozen for stored-session compatibility
+# (`PlanCopilotReviewPending` -> "PlanCodexReviewPending",
+# `PlanFinalizePending` -> "PlanClaudeFinalizePending"). Every turn template
+# tells its worker to compare `phase` against the name on its `preconditions:`
+# line and to return a blocker without sending if the comparison fails — so a
+# template naming the Rust variant instead of the wire string fails closed on
+# every single dispatch, silently and forever. Nothing else in the toolchain
+# compares the two files.
+PHASE_RS = ROOT / "crates" / "ironmem" / "src" / "collab" / "phase.rs"
+# One arm of the exhaustive `wire_name` match: `Self::Variant => "Wire",`.
+WIRE_NAME_ARM_RE = re.compile(
+    r'Self::([A-Za-z0-9_]+)\s*=>\s*"([A-Za-z0-9_]+)"')
+# `phase == PlanLocked`, `phase != CodingFailed`. A template with no phase
+# clause at all (collab-turn-submit.md) is legitimate and yields nothing.
+PRECONDITION_PHASE_RE = re.compile(r'phase\s*[=!]=\s*([A-Za-z0-9_]+)')
+
+
+def parse_wire_names() -> dict[str, str]:
+    """Rust variant -> wire string, parsed out of `Phase::wire_name`.
+
+    Derived from phase.rs rather than duplicated here: a hardcoded copy is
+    exactly the thing that rots next. Scoped to the `wire_name` body because
+    `expected_event` has identical arm syntax but maps variants to event
+    names, and admitting those would make the check permissive in the only
+    direction that matters. Every failure to parse is reported: a check that
+    silently finds zero phases would pass everything.
+    """
+    if not PHASE_RS.exists():
+        err(f"{PHASE_RS}: cannot cross-check preconditions phase names — "
+            f"collab/phase.rs not found")
+        return {}
+    _, sep, rest = PHASE_RS.read_text().partition("fn wire_name")
+    if not sep:
+        err("collab/phase.rs: no `fn wire_name` found — the phase-name "
+            "cross-check would pass vacuously, so it fails instead")
+        return {}
+    # The match arms end with the function's closing brace at 4-space indent.
+    arms = dict(WIRE_NAME_ARM_RE.findall(rest.partition("\n    }")[0]))
+    if not arms:
+        err("collab/phase.rs: no wire_name match arms parsed — the "
+            "phase-name cross-check would pass vacuously, so it fails instead")
+    return arms
+
+
+def check_precondition_phase_names() -> None:
+    """A `preconditions:` phase must be a string the server actually emits."""
+    wire_by_variant = parse_wire_names()
+    if not wire_by_variant:
+        return
+    emitted = set(wire_by_variant.values())
+    for path in sorted(PROMPTS.glob("collab-turn-*.md")):
+        fm = parse_frontmatter(path.read_text())
+        if fm is None:
+            continue  # lint_template already reports the missing frontmatter
+        names = set(PRECONDITION_PHASE_RE.findall(fm.get("preconditions", "")))
+        for name in sorted(names - emitted):
+            hint = (f"use the wire name {wire_by_variant[name]!r}"
+                    if name in wire_by_variant
+                    else "it is not a Phase wire name at all")
+            err(f"{path.name}: preconditions names phase {name!r}, which "
+                f"phase.rs never emits — {hint}; as written the precondition "
+                f"check fails on every dispatch and the turn never sends")
+
+
 def err(msg: str) -> None:
     errors.append(msg)
 
@@ -702,6 +811,32 @@ def main() -> int:
             ("collab-global-review.md", "task_list` is null"),
             ("collab-recovery.md", "topic `final_review`"),
             ("collab-batch-impl.md", "collab_wait_my_turn(session_id, \"codex\", 60)"),
+            # The five reversed-role pilot prompts. Each pins its phase name,
+            # its send (or explicit no-send) contract, and the by-reference
+            # dereference that turn depends on — without these, everything
+            # semantic in the file can be deleted with both gates green.
+            ("collab-plan-synthesis.md", "PlanSynthesisPending"),
+            ("collab-plan-synthesis.md",
+             "Send exactly one `collab_send` with sender `codex`, topic `canonical`,"),
+            ("collab-plan-synthesis.md", "get_drawer(id=<message.drawer_id>)"),
+            ("collab-plan-finalize.md", "PlanClaudeFinalizePending"),
+            ("collab-plan-finalize.md", "**This turn sends nothing.**"),
+            ("collab-plan-finalize.md", "get_drawer(id=<canonical_plan_ref.drawer_id>)"),
+            ("collab-plan-finalize.md",
+             'add_drawer(wing="ironrace-memory", room="collab-drafts",'),
+            ("collab-task-list.md", "if phase is not `PlanLocked`"),
+            ("collab-task-list.md",
+             "Send `collab_send` with sender `codex`, topic `task_list`,"),
+            ("collab-task-list.md", "SHA-256 equals both `final_plan_ref.hash` and"),
+            ("collab-review-local.md", "CodeReviewLocalPending"),
+            ("collab-review-local.md",
+             "Send `collab_send` with sender `codex`, topic `review_local`,"),
+            ("collab-review-local.md", "`review_local=reduced`"),
+            ("collab-final-review.md", "CodeReviewFinalPending"),
+            ("collab-final-review.md",
+             "**This turn sends nothing and opens no PR.**"),
+            ("collab-final-review.md", "get_drawer(id=<task_list_ref.drawer_id>)"),
+            ("collab-final-review.md", '{"title":"<title>","body":"<body>"}'),
         ]:
             prompt = ROOT / ".codex-plugin" / "prompts" / prompt_name
             if prompt.exists() and required not in prompt.read_text():
@@ -712,6 +847,8 @@ def main() -> int:
     check_evaluate_issue_surfaces()
     check_review_diff_fallback_contract()
     check_topic_template_completeness()
+    check_installer_covers_templates()
+    check_precondition_phase_names()
     check_pr_base_resolution_contract()
     check_review_diff_trigger_detection_contract()
 

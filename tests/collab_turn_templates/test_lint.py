@@ -249,6 +249,63 @@ def test_lint_requires_evaluate_issue_split_contract(tmp_path):
         in r.stdout
 
 
+def test_lint_requires_both_harness_templates_per_topic(tmp_path):
+    fixture = copy_fixture(tmp_path)
+    (fixture / ".codex-plugin" / "prompts" / "collab-review-local.md").unlink()
+
+    r = run({"COLLAB_LINT_ROOT": str(fixture)})
+
+    assert r.returncode == 1
+    assert "missing Codex prompt collab-review-local.md" in r.stdout
+
+
+def test_lint_requires_claude_copilot_templates(tmp_path):
+    fixture = copy_fixture(tmp_path)
+    (fixture / ".claude-plugin" / "prompts" / "collab-turn-plan-review.md").unlink()
+
+    r = run({"COLLAB_LINT_ROOT": str(fixture)})
+
+    assert r.returncode == 1
+    assert "missing Claude template collab-turn-plan-review.md" in r.stdout
+
+
+def test_lint_requires_installer_to_cover_every_template(tmp_path):
+    fixture = copy_fixture(tmp_path)
+    scripts = fixture / "scripts"
+    scripts.mkdir()
+    installer = ROOT / "scripts" / "install-ironmem.sh"
+    (scripts / "install-ironmem.sh").write_text(
+        installer.read_text().replace("  collab-turn-plan-review\n", "", 1))
+
+    r = run({"COLLAB_LINT_ROOT": str(fixture)})
+
+    assert r.returncode == 1
+    assert "REQUIRED_CLAUDE_PROMPTS is missing 'collab-turn-plan-review'" in r.stdout
+
+
+def test_lint_rejects_a_precondition_naming_a_rust_variant(tmp_path):
+    # `collab_status` emits `wire_name`, so a `preconditions:` line naming the
+    # Rust variant of a genericized phase fails closed on every dispatch. The
+    # valid set is parsed out of phase.rs, so the fixture needs that file.
+    fixture = copy_fixture(tmp_path)
+    phase_rel = pathlib.Path("crates") / "ironmem" / "src" / "collab" / "phase.rs"
+    (fixture / phase_rel).parent.mkdir(parents=True)
+    shutil.copy2(ROOT / phase_rel, fixture / phase_rel)
+    template = fixture / ".claude-plugin" / "prompts" / "collab-turn-plan-review.md"
+    template.write_text(template.read_text().replace(
+        "preconditions: phase == PlanCodexReviewPending",
+        "preconditions: phase == PlanCopilotReviewPending",
+        1,
+    ))
+
+    r = run({"COLLAB_LINT_ROOT": str(fixture)})
+
+    assert r.returncode == 1
+    assert ("collab-turn-plan-review.md: preconditions names phase "
+            "'PlanCopilotReviewPending', which phase.rs never emits — use the "
+            "wire name 'PlanCodexReviewPending'") in r.stdout
+
+
 def test_lint_requires_retry_safe_split_contract(tmp_path):
     fixture = copy_fixture(tmp_path)
     prompt = fixture / ".claude-plugin" / "commands" / "evaluate-issue.md"
