@@ -28,6 +28,7 @@ CODEX_PROMPTS = [
         "collab-plan-synthesis.md",
         "collab-plan-review.md",
         "collab-plan-finalize.md",
+        "collab-task-list.md",
         "collab-global-review.md",
         "collab-recovery.md",
         "collab-batch-impl.md",
