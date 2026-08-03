@@ -1679,7 +1679,7 @@ The eight per-turn worker templates live under `.claude-plugin/prompts/`:
 
 - `collab-turn-plan-draft.md` — `PlanParallelDrafts` blind draft
 - `collab-turn-plan-synthesis.md` — `PlanSynthesisPending` canonical
-- `collab-turn-plan-review.md` — `PlanCopilotReviewPending` copilot plan review
+- `collab-turn-plan-review.md` — `PlanCodexReviewPending` copilot plan review
 - `collab-turn-plan-finalize.md` — `PlanClaudeFinalizePending` final
 - `collab-turn-task-list.md` — `PlanLocked` bridge (mechanical `task_list` submit)
 - `collab-turn-code-implement.md` — `CodeImplementPending` batch (Claude implementer)

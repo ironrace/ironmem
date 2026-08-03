@@ -329,7 +329,7 @@ fall back to a lower tier.**
 |---|---|---|---|---|
 | PlanParallelDrafts | claude | `collab-turn-plan-draft.md` | planning | opus |
 | PlanSynthesisPending | claude | `collab-turn-plan-synthesis.md` | planning | opus |
-| PlanCopilotReviewPending (copilot) | claude | `collab-turn-plan-review.md` | review | opus |
+| PlanCodexReviewPending (copilot) | claude | `collab-turn-plan-review.md` | review | opus |
 | PlanClaudeFinalizePending | claude | `collab-turn-plan-finalize.md` | planning | opus |
 | PlanLocked (bridge) | claude | `collab-turn-task-list.md` | mechanical | sonnet |
 | CodeImplementPending | claude | `collab-turn-code-implement.md` | mechanical | sonnet |
