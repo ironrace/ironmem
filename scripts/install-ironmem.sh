@@ -88,6 +88,7 @@ REQUIRED_CLAUDE_PROMPTS=(
   collab-turn-plan-finalize
   collab-turn-task-list
   collab-turn-code-implement
+  collab-turn-review-fix-global
   collab-turn-review-local
   collab-turn-final-review
   collab-turn-submit

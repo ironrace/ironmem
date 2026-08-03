@@ -44,6 +44,12 @@ REVIEW_DIFF_FALLBACK_SURFACES = {
         "git diff <base_sha>..<last_head_sha>",
         "--expand-file <path> --hunk <ordinal>",
     ],
+    PROMPTS / "collab-turn-review-fix-global.md": [
+        "ironmem review-diff --repo <repo_path> --base <base_sha> --head <last_head_sha>",
+        "only on success",
+        "git diff <base_sha>..<last_head_sha>",
+        "--expand-file <path> --hunk <ordinal>",
+    ],
     ROOT / ".claude-plugin" / "commands" / "ultrareview-local.md": [
         "ironmem review-diff --repo <repo_path> --base <baseRefName> --head <headRefName>",
         "ironmem review-diff --repo <repo_path> --worktree",
@@ -103,6 +109,12 @@ EXPECTED_TEMPLATES = {
         "tier": "mechanical",
         "model": "sonnet",
         "topics": ["implementation_done", "failure_report"],
+    },
+    "collab-turn-review-fix-global.md": {
+        "turn": "review_fix_global",
+        "tier": "review",
+        "model": "opus",
+        "topics": ["review_fix_global", "failure_report"],
     },
     "collab-turn-review-local.md": {
         "turn": "review_local",

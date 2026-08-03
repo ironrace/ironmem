@@ -1675,7 +1675,7 @@ sampling — the same metrics instrumentation tracked under #82–#83.
 
 ### Worker templates
 
-The eight per-turn worker templates live under `.claude-plugin/prompts/`:
+The ten per-turn worker templates live under `.claude-plugin/prompts/`:
 
 - `collab-turn-plan-draft.md` — `PlanParallelDrafts` blind draft
 - `collab-turn-plan-synthesis.md` — `PlanSynthesisPending` canonical
@@ -1683,13 +1683,15 @@ The eight per-turn worker templates live under `.claude-plugin/prompts/`:
 - `collab-turn-plan-finalize.md` — `PlanClaudeFinalizePending` final
 - `collab-turn-task-list.md` — `PlanLocked` bridge (mechanical `task_list` submit)
 - `collab-turn-code-implement.md` — `CodeImplementPending` batch (Claude implementer)
+- `collab-turn-review-fix-global.md` — `CodeReviewFixGlobalPending` copilot review + fix
 - `collab-turn-review-local.md` — `CodeReviewLocalPending` `/ultrareview-local` audit
 - `collab-turn-final-review.md` — `CodeReviewFinalPending` PR-body compose
 - `collab-turn-submit.md` — generic submit-by-ref + PR create
 
-Codex uses four normal phase prompts plus `collab-recovery.md` for the rare
-recovery override that delegates `CodeReviewLocalPending` or
-`CodeReviewFinalPending` to Codex.
+Codex has a matching phase prompt for every protocol turn under
+`.codex-plugin/prompts/`, plus `collab-recovery.md` for the rare recovery
+override that delegates `CodeReviewLocalPending` or `CodeReviewFinalPending`
+to Codex.
 
 The Claude-side dispatch tables and the authoritative tier matrix live in
 `.claude-plugin/commands/collab.md`; this section and that command file must

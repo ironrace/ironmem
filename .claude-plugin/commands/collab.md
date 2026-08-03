@@ -333,6 +333,7 @@ fall back to a lower tier.**
 | PlanClaudeFinalizePending | claude | `collab-turn-plan-finalize.md` | planning | opus |
 | PlanLocked (bridge) | claude | `collab-turn-task-list.md` | mechanical | sonnet |
 | CodeImplementPending | claude | `collab-turn-code-implement.md` | mechanical | sonnet |
+| CodeReviewFixGlobalPending (copilot) | claude | `collab-turn-review-fix-global.md` | review | opus |
 | CodeReviewLocalPending | claude | `collab-turn-review-local.md` | review | opus |
 | CodeReviewFinalPending | claude | `collab-turn-final-review.md` | review | opus |
 | post-gate send | claude | `collab-turn-submit.md` | mechanical | sonnet |
