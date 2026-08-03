@@ -25,7 +25,9 @@ CODEX_PROMPTS = [
     ROOT / ".codex-plugin" / "prompts" / name
     for name in (
         "collab-plan-draft.md",
+        "collab-plan-synthesis.md",
         "collab-plan-review.md",
+        "collab-plan-finalize.md",
         "collab-global-review.md",
         "collab-recovery.md",
         "collab-batch-impl.md",

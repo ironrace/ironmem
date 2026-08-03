@@ -100,7 +100,9 @@ REQUIRED_CODEX_COMMANDS=(
 
 REQUIRED_CODEX_PROMPTS=(
   collab-plan-draft
+  collab-plan-synthesis
   collab-plan-review
+  collab-plan-finalize
   collab-global-review
   collab-recovery
   collab-batch-impl
