@@ -132,6 +132,9 @@ const LOCK_TIMEOUT: Duration = Duration::from_secs(10);
 /// a grace longer than the timeout would deadlock exactly like the bug it fixes.
 const UNREADABLE_LOCK_GRACE: Duration = Duration::from_secs(2);
 
+/// Distinguishes the scratch files of concurrent acquirers inside one process.
+static SCRATCH_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 impl BootstrapLock {
     fn acquire(state_dir: &Path) -> Result<Self, MemoryError> {
         std::fs::create_dir_all(state_dir)?;
@@ -175,8 +178,14 @@ fn create_lock_file(path: &Path) -> std::io::Result<()> {
     use std::io::Write;
 
     let dir = path.parent().unwrap_or_else(|| Path::new("."));
-    // Scoped to this process so concurrent acquirers never share a scratch file.
-    let scratch = dir.join(format!("bootstrap.lock.{}.tmp", std::process::id()));
+    // Unique per acquirer, not merely per process: two threads bootstrapping
+    // concurrently share a PID, and a PID-only name lets one thread truncate or
+    // unlink the scratch file the other is mid-way through linking.
+    let scratch = dir.join(format!(
+        "bootstrap.lock.{}.{}.tmp",
+        std::process::id(),
+        SCRATCH_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ));
 
     let write_pid = || -> std::io::Result<()> {
         let mut file = std::fs::File::create(&scratch)?;
@@ -744,6 +753,50 @@ mod tests {
         assert!(
             leftovers.is_empty(),
             "scratch file should be cleaned up, found: {leftovers:?}"
+        );
+    }
+
+    #[test]
+    fn concurrent_acquirers_in_one_process_never_collide_on_scratch() {
+        let temp = tempfile::tempdir().unwrap();
+        let threads = 8;
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(threads));
+
+        // Threads share a PID, so a PID-only scratch name lets one thread unlink
+        // the file another is linking — surfacing as NotFound, not AlreadyExists.
+        let handles: Vec<_> = (0..threads)
+            .map(|_| {
+                let dir = temp.path().to_path_buf();
+                let barrier = std::sync::Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    create_lock_file(&dir.join("bootstrap.lock"))
+                })
+            })
+            .collect();
+
+        let mut winners = 0;
+        for handle in handles {
+            match handle.join().unwrap() {
+                Ok(()) => winners += 1,
+                Err(error) => assert_eq!(
+                    error.kind(),
+                    std::io::ErrorKind::AlreadyExists,
+                    "losers must lose by contention, not by clobbering each other"
+                ),
+            }
+        }
+        assert_eq!(winners, 1, "exactly one acquirer may take the lock");
+
+        let leftovers: Vec<_> = std::fs::read_dir(temp.path())
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|entry| entry.file_name())
+            .filter(|name| name.to_string_lossy().ends_with(".tmp"))
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "no scratch files should survive, found: {leftovers:?}"
         );
     }
 
