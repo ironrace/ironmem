@@ -43,11 +43,15 @@ work, then send the normal `review_fix_global` exactly once — never a new
 ## Prepare the review
 1. **Normal turns only — as recovery owner, skip this step entirely.** Work in
    `repo_path`. `git fetch`, then verify
-   `git cat-file -e <last_head_sha>^{commit}`; checkout the session branch and
-   `git reset --hard <last_head_sha>`. If the commit is unavailable, send
-   `failure_report` with a detailed `branch_drift:` value and exit. Never run
-   this step with uncommitted work in the tree: as recovery owner your
-   preserved diff is the only copy, and a reset destroys it.
+   `git cat-file -e <last_head_sha>^{commit}`; checkout the session branch. If
+   the commit is unavailable, send `failure_report` with a detailed
+   `branch_drift:` value and exit. Immediately before resetting, require
+   `git status --porcelain` to be empty regardless of `pending_failure`: a
+   dirty worktree here means a prior turn died without reporting
+   `pending_failure` (OOM, container kill, sandbox teardown), not that there is
+   nothing to recover — do not run `git reset --hard`; instead preserve and
+   inspect the diff on the recovery path above. Only when the worktree is
+   clean, `git reset --hard <last_head_sha>`.
 2. For a full-flow session, load the approved task list with
    `get_drawer(id=<task_list_ref.drawer_id>)`, verify its SHA-256 against
    `task_list_ref.hash`, and read its `plan_file_path`.

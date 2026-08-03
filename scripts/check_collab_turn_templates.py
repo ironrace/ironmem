@@ -36,6 +36,47 @@ CODEX_PROMPTS = [
         "collab-recovery.md",
     )
 ]
+# Per-prompt content pins for the Codex phase prompts. These are the ONLY
+# content gate those files have: `lint_template()` globs
+# `.claude-plugin/prompts/collab-turn-*.md` and never reads `.codex-plugin/`,
+# and the Rust packaging test checks bytes, `$ARGUMENTS` and
+# `collab_wait_my_turn` only. They used to live inside the `else:` branch of
+# `if not CODEX_COMMAND.exists():`, which meant the whole fixture suite — which
+# copies `.codex-plugin/prompts` but not `.codex-plugin/commands` — never ran a
+# single one of them, and an inverted protocol contract linted green. Nothing
+# here reads the command file, so nothing here may be gated on it.
+#
+# Phase names are deliberately NOT pinned here: `check_precondition_phase_names`
+# derives them from `phase.rs`, and a hardcoded copy in this list would simply
+# rot in lockstep with the prompt it is supposed to guard.
+CODEX_PROMPT_CONTRACTS = [
+    ("collab-plan-draft.md", "selected implementer"),
+    ("collab-plan-review.md", "collab_wait_my_turn(session_id, \"codex\", 60)"),
+    ("collab-global-review.md", "task_list` is null"),
+    ("collab-recovery.md", "topic `final_review`"),
+    ("collab-batch-impl.md", "collab_wait_my_turn(session_id, \"codex\", 60)"),
+    # The five reversed-role pilot prompts. Each pins its send (or explicit
+    # no-send) contract and the by-reference dereference that turn depends on —
+    # without these, everything semantic in the file can be deleted with both
+    # gates green.
+    ("collab-plan-synthesis.md",
+     "Send exactly one `collab_send` with sender `codex`, topic `canonical`,"),
+    ("collab-plan-synthesis.md", "get_drawer(id=<message.drawer_id>)"),
+    ("collab-plan-finalize.md", "**This turn sends nothing.**"),
+    ("collab-plan-finalize.md", "get_drawer(id=<canonical_plan_ref.drawer_id>)"),
+    ("collab-plan-finalize.md",
+     'add_drawer(wing="ironrace-memory", room="collab-drafts",'),
+    ("collab-task-list.md",
+     "Send `collab_send` with sender `codex`, topic `task_list`,"),
+    ("collab-task-list.md", "SHA-256 equals both `final_plan_ref.hash` and"),
+    ("collab-review-local.md",
+     "Send `collab_send` with sender `codex`, topic `review_local`,"),
+    ("collab-review-local.md", "`review_local=reduced`"),
+    ("collab-final-review.md",
+     "**This turn sends nothing and opens no PR.**"),
+    ("collab-final-review.md", "get_drawer(id=<task_list_ref.drawer_id>)"),
+    ("collab-final-review.md", '{"title":"<title>","body":"<body>"}'),
+]
 REVIEW_DIFF_FALLBACK_SURFACES = {
     ROOT / ".codex-plugin" / "prompts" / "collab-global-review.md": [
         "ironmem review-diff --repo <repo_path> --base <base_sha> --head <last_head_sha>",
@@ -219,6 +260,16 @@ REQUIRED_TEMPLATE_SNIPPETS = {
         # interrupted work; a fetch/checkout/reset before inspecting it is
         # unrecoverable data loss.
         "preserve and inspect the working-tree diff *before* any fetch",
+        # That snippet lives in the recovery-owner paragraph, and the recovery
+        # owner never runs the reset. The agent that does is the NORMAL-turn
+        # owner, whose hazard is the opposite one: a prior turn that died hard
+        # (OOM, container kill, sandbox teardown) never sent `failure_report`,
+        # so `pending_failure` stays null, so the next dispatch correctly
+        # self-classifies as a normal turn — and resets away the only copy of
+        # the uncommitted fixes with nothing downstream registering the loss.
+        # The porcelain precondition must therefore bind unconditionally, not
+        # on `pending_failure`.
+        "`git status --porcelain` to be empty regardless of `pending_failure`",
     ],
 }
 FORBIDDEN_TEMPLATE_SNIPPETS = {
@@ -491,6 +542,21 @@ def check_topic_template_completeness() -> None:
                 f"registered in CODEX_PROMPTS, so it is never linted")
 
 
+def check_codex_prompt_contracts() -> None:
+    """Per-prompt content pins for the Codex phase prompts.
+
+    Runs unconditionally: nothing in `CODEX_PROMPT_CONTRACTS` reads
+    `.codex-plugin/commands/collab.md`, so nothing here may be skipped when
+    that file is absent. A prompt that is missing entirely is already reported
+    by the `CODEX_PROMPTS` existence loop.
+    """
+    for prompt_name, required in CODEX_PROMPT_CONTRACTS:
+        prompt = ROOT / ".codex-plugin" / "prompts" / prompt_name
+        if prompt.exists() and required not in prompt.read_text():
+            err(f"{prompt.relative_to(ROOT)}: missing required "
+                f"recovery/dispatch contract {required!r}")
+
+
 def check_installer_covers_templates() -> None:
     """Every registered template must also be installed.
 
@@ -538,6 +604,23 @@ WIRE_NAME_ARM_RE = re.compile(
 # `phase == PlanLocked`, `phase != CodingFailed`. A template with no phase
 # clause at all (collab-turn-submit.md) is legitimate and yields nothing.
 PRECONDITION_PHASE_RE = re.compile(r'phase\s*[=!]=\s*([A-Za-z0-9_]+)')
+# The Codex prompts carry no `preconditions:` frontmatter — they state the
+# phase they own in prose, in exactly two shapes (verified against all ten):
+#   "This prompt is only for `CodeImplementPending` when ..."
+#   "This prompt is only for a recoverable `A` or `B` turn ..."
+#   "This prompt is only for the `PlanLocked` bridge ..."
+#   "if phase is not `PlanSynthesisPending` or Codex is not current owner ..."
+#   "act only when phase is `CodeImplementPending`, implementer is `codex` ..."
+#   "and the phase is `A` or `B`; otherwise report ..."
+# Both shapes wrap across lines in the shipped prompts
+# (`collab-plan-draft.md`, `collab-plan-review.md`), so this is matched against
+# a whitespace-flattened copy of the file. `phase is not yours` names no phase
+# and deliberately does not match.
+CODEX_PHASE_GUARD_RE = re.compile(
+    r'(?:prompt is only for|phase is)'
+    r'((?:\s+(?:not|a|an|the|recoverable))*'
+    r'\s+`[A-Za-z0-9_]+`(?:\s+or\s+`[A-Za-z0-9_]+`)*)')
+BACKTICKED_NAME_RE = re.compile(r'`([A-Za-z0-9_]+)`')
 
 
 def parse_wire_names() -> dict[str, str]:
@@ -567,6 +650,51 @@ def parse_wire_names() -> dict[str, str]:
     return arms
 
 
+def codex_phase_names(text: str) -> set[str]:
+    """Phase names a Codex phase prompt guards on, from its prose guards."""
+    flat = " ".join(text.split())
+    names: set[str] = set()
+    for m in CODEX_PHASE_GUARD_RE.finditer(flat):
+        names.update(BACKTICKED_NAME_RE.findall(m.group(1)))
+    return names
+
+
+def check_codex_phase_names(wire_by_variant: dict[str, str]) -> None:
+    """The Codex half of the phase.rs cross-check.
+
+    Without this, renaming a wire string in phase.rs flags the Claude template
+    and leaves the Codex prompt stale — under `pilot=codex` that turn then
+    fails its own guard on every dispatch, so the session stalls with no
+    failure recorded and looks like a hang rather than a rename. The names used
+    to be pinned as hardcoded literals in `CODEX_PROMPT_CONTRACTS`, which is
+    the same duplicated copy `parse_wire_names()` exists to abolish: the stale
+    prompt and the stale literal agreed with each other and the gate passed.
+    """
+    emitted = set(wire_by_variant.values())
+    for path in CODEX_PROMPTS:
+        if not path.exists():
+            continue  # already reported as a missing Codex phase prompt
+        rel = path.relative_to(ROOT)
+        names = codex_phase_names(path.read_text())
+        # Every registered Codex phase prompt owns at least one phase and says
+        # so. A prompt that drops or reformats its guard would otherwise become
+        # silently unchecked — the exact failure mode this whole check exists
+        # to close.
+        if not names:
+            err(f"{rel}: no phase guard found — every registered Codex phase "
+                f"prompt must name the phase it owns in the "
+                f"'only for `<WireName>`' / 'phase is `<WireName>`' form so "
+                f"the name is verified against phase.rs")
+            continue
+        for name in sorted(names - emitted):
+            hint = (f"use the wire name {wire_by_variant[name]!r}"
+                    if name in wire_by_variant
+                    else "it is not a Phase wire name at all")
+            err(f"{rel}: phase guard names phase {name!r}, which phase.rs "
+                f"never emits — {hint}; as written the guard fails on every "
+                f"dispatch and the turn never sends")
+
+
 def check_precondition_phase_names() -> None:
     """Every phase a template compares against must be one the server emits.
 
@@ -577,11 +705,15 @@ def check_precondition_phase_names() -> None:
     body alone would pass this check, satisfy the `REQUIRED_TEMPLATE_SNIPPETS`
     substring pin on the strength of the frontmatter occurrence, and still
     fail closed on every dispatch.
+
+    Covers both harnesses: role reversal means a `pilot=codex` session runs the
+    Codex prompt for the same turn, and its guard rots exactly as easily.
     """
     wire_by_variant = parse_wire_names()
     if not wire_by_variant:
         return
     emitted = set(wire_by_variant.values())
+    check_codex_phase_names(wire_by_variant)
     for path in sorted(PROMPTS.glob("collab-turn-*.md")):
         text = path.read_text()
         fm = parse_frontmatter(text)
@@ -830,43 +962,7 @@ def main() -> int:
             if snippet not in codex_cmd_text:
                 err(f".codex-plugin/commands/collab.md: missing {snippet!r}")
 
-        for prompt_name, required in [
-            ("collab-plan-draft.md", "selected implementer"),
-            ("collab-plan-review.md", "collab_wait_my_turn(session_id, \"codex\", 60)"),
-            ("collab-global-review.md", "task_list` is null"),
-            ("collab-recovery.md", "topic `final_review`"),
-            ("collab-batch-impl.md", "collab_wait_my_turn(session_id, \"codex\", 60)"),
-            # The five reversed-role pilot prompts. Each pins its phase name,
-            # its send (or explicit no-send) contract, and the by-reference
-            # dereference that turn depends on — without these, everything
-            # semantic in the file can be deleted with both gates green.
-            ("collab-plan-synthesis.md", "PlanSynthesisPending"),
-            ("collab-plan-synthesis.md",
-             "Send exactly one `collab_send` with sender `codex`, topic `canonical`,"),
-            ("collab-plan-synthesis.md", "get_drawer(id=<message.drawer_id>)"),
-            ("collab-plan-finalize.md", "PlanClaudeFinalizePending"),
-            ("collab-plan-finalize.md", "**This turn sends nothing.**"),
-            ("collab-plan-finalize.md", "get_drawer(id=<canonical_plan_ref.drawer_id>)"),
-            ("collab-plan-finalize.md",
-             'add_drawer(wing="ironrace-memory", room="collab-drafts",'),
-            ("collab-task-list.md", "if phase is not `PlanLocked`"),
-            ("collab-task-list.md",
-             "Send `collab_send` with sender `codex`, topic `task_list`,"),
-            ("collab-task-list.md", "SHA-256 equals both `final_plan_ref.hash` and"),
-            ("collab-review-local.md", "CodeReviewLocalPending"),
-            ("collab-review-local.md",
-             "Send `collab_send` with sender `codex`, topic `review_local`,"),
-            ("collab-review-local.md", "`review_local=reduced`"),
-            ("collab-final-review.md", "CodeReviewFinalPending"),
-            ("collab-final-review.md",
-             "**This turn sends nothing and opens no PR.**"),
-            ("collab-final-review.md", "get_drawer(id=<task_list_ref.drawer_id>)"),
-            ("collab-final-review.md", '{"title":"<title>","body":"<body>"}'),
-        ]:
-            prompt = ROOT / ".codex-plugin" / "prompts" / prompt_name
-            if prompt.exists() and required not in prompt.read_text():
-                err(f"{prompt.relative_to(ROOT)}: missing required recovery/dispatch contract {required!r}")
-
+    check_codex_prompt_contracts()
     check_failure_prefixes()
     check_no_uninstalled_skill_references()
     check_evaluate_issue_surfaces()

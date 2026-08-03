@@ -73,7 +73,11 @@ local skills, prompts, and commands untouched.
 - `$CODEX_HOME/prompts/collab-final-review.md` — the Codex `CodeReviewFinalPending` PR-body compose turn.
 - `$CODEX_HOME/prompts/collab-recovery.md` — delegated v3 local/final-review recovery.
 
-The command reads session state and loads the matching phase prompt. Claude's
+The command reads session state and loads a phase prompt from its own routing
+table, which currently covers a subset of the prompts above
+(`collab-plan-draft.md`, `collab-plan-review.md`, `collab-batch-impl.md`,
+`collab-global-review.md`, and `collab-recovery.md`). The remaining prompts are
+installed ahead of their dispatch rows; wiring those rows is #248. Claude's
 background dispatcher likewise passes the resolved phase prompt directly when
 it drives Codex-owned turns.
 
