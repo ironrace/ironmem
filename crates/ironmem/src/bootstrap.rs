@@ -124,38 +124,34 @@ struct BootstrapLock {
     path: PathBuf,
 }
 
+/// How long to wait for a contended lock before giving up.
+const LOCK_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// How old a lock whose contents are not a PID must be before it is reclaimed.
+/// Kept well under `LOCK_TIMEOUT` so recovery actually happens inside one acquire;
+/// a grace longer than the timeout would deadlock exactly like the bug it fixes.
+const UNREADABLE_LOCK_GRACE: Duration = Duration::from_secs(2);
+
+/// Distinguishes the scratch files of concurrent acquirers inside one process.
+static SCRATCH_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 impl BootstrapLock {
     fn acquire(state_dir: &Path) -> Result<Self, MemoryError> {
         std::fs::create_dir_all(state_dir)?;
         let path = state_dir.join("bootstrap.lock");
-        let pid = std::process::id().to_string();
         let start = Instant::now();
         loop {
-            match std::fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&path)
-            {
-                Ok(mut file) => {
-                    use std::io::Write;
-                    let _ = file.write_all(pid.as_bytes());
-                    return Ok(Self { path });
-                }
+            match create_lock_file(&path) {
+                Ok(()) => return Ok(Self { path }),
                 Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-                    // Check if the owning process is still alive.
-                    if let Ok(raw) = std::fs::read_to_string(&path) {
-                        if let Ok(owner_pid) = raw.trim().parse::<u32>() {
-                            if !process_is_alive(owner_pid) {
-                                // Stale lock — owner crashed. Remove and retry immediately.
-                                tracing::warn!(
-                                    "Removing stale bootstrap lock (pid {owner_pid} is gone)"
-                                );
-                                let _ = std::fs::remove_file(&path);
-                                continue;
-                            }
-                        }
+                    if lock_is_stale(&path) {
+                        // Owner crashed, or the lock never got a PID written into it.
+                        // Remove and retry immediately.
+                        tracing::warn!("Removing stale bootstrap lock at {}", path.display());
+                        let _ = std::fs::remove_file(&path);
+                        continue;
                     }
-                    if start.elapsed() > Duration::from_secs(10) {
+                    if start.elapsed() > LOCK_TIMEOUT {
                         return Err(MemoryError::Io(std::io::Error::new(
                             std::io::ErrorKind::TimedOut,
                             format!("Timed out waiting for bootstrap lock at {}", path.display()),
@@ -167,6 +163,71 @@ impl BootstrapLock {
             }
         }
     }
+}
+
+/// Create the lock file with our PID already in it, atomically.
+///
+/// The PID is written to a private scratch file first and only then linked into
+/// place, so the lock is never observable in a contentless state. Creating the
+/// lock by `create_new` and writing the PID afterwards leaves a window where a
+/// kill (hook timeout, Ctrl-C) strands a 0-byte lock that no owner check can
+/// attribute — which is unrecoverable without the staleness grace below.
+///
+/// Returns `ErrorKind::AlreadyExists` when another holder owns the lock.
+fn create_lock_file(path: &Path) -> std::io::Result<()> {
+    use std::io::Write;
+
+    let dir = path.parent().unwrap_or_else(|| Path::new("."));
+    // Unique per acquirer, not merely per process: two threads bootstrapping
+    // concurrently share a PID, and a PID-only name lets one thread truncate or
+    // unlink the scratch file the other is mid-way through linking.
+    let scratch = dir.join(format!(
+        "bootstrap.lock.{}.{}.tmp",
+        std::process::id(),
+        SCRATCH_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ));
+
+    let write_pid = || -> std::io::Result<()> {
+        let mut file = std::fs::File::create(&scratch)?;
+        file.write_all(std::process::id().to_string().as_bytes())?;
+        file.sync_all()
+    };
+    if let Err(error) = write_pid() {
+        let _ = std::fs::remove_file(&scratch);
+        return Err(error);
+    }
+
+    // `hard_link` fails with AlreadyExists if the lock is held — this is the
+    // atomic create-if-absent step, and it publishes a fully-written file.
+    let result = std::fs::hard_link(&scratch, path);
+    let _ = std::fs::remove_file(&scratch);
+    result
+}
+
+/// Whether an existing lock file can be reclaimed.
+///
+/// A lock naming a live process is never stale. A lock naming a dead process is.
+/// A lock we cannot attribute at all — empty or garbage — is stale once it has
+/// aged past [`UNREADABLE_LOCK_GRACE`]; without this, unparseable contents skip
+/// every liveness check and the lock is held forever.
+fn lock_is_stale(path: &Path) -> bool {
+    if let Ok(raw) = std::fs::read_to_string(path) {
+        if let Ok(owner_pid) = raw.trim().parse::<u32>() {
+            return !process_is_alive(owner_pid);
+        }
+    }
+
+    // Unattributable. Age it, and treat an unusable timestamp (missing metadata,
+    // mtime in the future from clock skew) as stale too: a lock that can be
+    // neither attributed nor aged is not worth deadlocking on. Mutual exclusion
+    // still holds — the `hard_link` below decides a single winner among racers.
+    std::fs::metadata(path)
+        .and_then(|meta| meta.modified())
+        .map_or(true, |modified| {
+            modified
+                .elapsed()
+                .map_or(true, |age| age >= UNREADABLE_LOCK_GRACE)
+        })
 }
 
 /// Returns true if the given PID has a live process on this system.
@@ -591,5 +652,166 @@ mod tests {
         drop(lock);
 
         assert!(!lock_path.exists(), "lock file should have been cleaned up");
+    }
+
+    /// Backdate a file's mtime so age-based staleness can be tested without sleeping.
+    fn age_file(path: &Path, by: Duration) {
+        let modified = std::time::SystemTime::now() - by;
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(path)
+            .unwrap()
+            .set_modified(modified)
+            .unwrap();
+    }
+
+    #[test]
+    fn aged_empty_bootstrap_lock_is_reclaimed() {
+        let temp = tempfile::tempdir().unwrap();
+        let lock_path = temp.path().join("bootstrap.lock");
+
+        // A kill between lock creation and the PID write strands a 0-byte lock.
+        std::fs::write(&lock_path, b"").unwrap();
+        age_file(&lock_path, UNREADABLE_LOCK_GRACE * 2);
+
+        let lock = BootstrapLock::acquire(temp.path()).unwrap();
+        drop(lock);
+
+        assert!(!lock_path.exists(), "lock file should have been cleaned up");
+    }
+
+    #[test]
+    fn aged_garbage_bootstrap_lock_is_reclaimed() {
+        let temp = tempfile::tempdir().unwrap();
+        let lock_path = temp.path().join("bootstrap.lock");
+
+        std::fs::write(&lock_path, b"not-a-pid").unwrap();
+        age_file(&lock_path, UNREADABLE_LOCK_GRACE * 2);
+
+        let lock = BootstrapLock::acquire(temp.path()).unwrap();
+        drop(lock);
+
+        assert!(!lock_path.exists(), "lock file should have been cleaned up");
+    }
+
+    #[test]
+    fn freshly_created_empty_lock_is_not_reclaimed_within_the_grace() {
+        let temp = tempfile::tempdir().unwrap();
+        let lock_path = temp.path().join("bootstrap.lock");
+
+        std::fs::write(&lock_path, b"").unwrap();
+
+        assert!(
+            !lock_is_stale(&lock_path),
+            "an unattributable lock must age past the grace before being reclaimed"
+        );
+    }
+
+    #[test]
+    fn lock_owned_by_a_live_process_is_not_stale() {
+        let temp = tempfile::tempdir().unwrap();
+        let lock_path = temp.path().join("bootstrap.lock");
+
+        std::fs::write(&lock_path, std::process::id().to_string()).unwrap();
+        // Even aged well past the grace, a live owner keeps the lock.
+        age_file(&lock_path, UNREADABLE_LOCK_GRACE * 10);
+
+        assert!(
+            !lock_is_stale(&lock_path),
+            "live owner must retain the lock"
+        );
+    }
+
+    #[test]
+    fn lock_file_is_never_published_without_a_pid() {
+        let temp = tempfile::tempdir().unwrap();
+        let lock_path = temp.path().join("bootstrap.lock");
+
+        let lock = BootstrapLock::acquire(temp.path()).unwrap();
+
+        let contents = std::fs::read_to_string(&lock_path).unwrap();
+        assert_eq!(
+            contents.trim().parse::<u32>().ok(),
+            Some(std::process::id()),
+            "lock must carry our PID the moment it exists"
+        );
+        drop(lock);
+    }
+
+    #[test]
+    fn acquire_leaves_no_scratch_file_behind() {
+        let temp = tempfile::tempdir().unwrap();
+
+        let lock = BootstrapLock::acquire(temp.path()).unwrap();
+        drop(lock);
+
+        let leftovers: Vec<_> = std::fs::read_dir(temp.path())
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|entry| entry.file_name())
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "scratch file should be cleaned up, found: {leftovers:?}"
+        );
+    }
+
+    #[test]
+    fn concurrent_acquirers_in_one_process_never_collide_on_scratch() {
+        let temp = tempfile::tempdir().unwrap();
+        let threads = 8;
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(threads));
+
+        // Threads share a PID, so a PID-only scratch name lets one thread unlink
+        // the file another is linking — surfacing as NotFound, not AlreadyExists.
+        let handles: Vec<_> = (0..threads)
+            .map(|_| {
+                let dir = temp.path().to_path_buf();
+                let barrier = std::sync::Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    create_lock_file(&dir.join("bootstrap.lock"))
+                })
+            })
+            .collect();
+
+        let mut winners = 0;
+        for handle in handles {
+            match handle.join().unwrap() {
+                Ok(()) => winners += 1,
+                Err(error) => assert_eq!(
+                    error.kind(),
+                    std::io::ErrorKind::AlreadyExists,
+                    "losers must lose by contention, not by clobbering each other"
+                ),
+            }
+        }
+        assert_eq!(winners, 1, "exactly one acquirer may take the lock");
+
+        let leftovers: Vec<_> = std::fs::read_dir(temp.path())
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|entry| entry.file_name())
+            .filter(|name| name.to_string_lossy().ends_with(".tmp"))
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "no scratch files should survive, found: {leftovers:?}"
+        );
+    }
+
+    #[test]
+    fn held_lock_blocks_a_second_acquire() {
+        let temp = tempfile::tempdir().unwrap();
+
+        let held = BootstrapLock::acquire(temp.path()).unwrap();
+
+        // Our own PID is alive, so the contender must never reclaim it.
+        assert!(
+            create_lock_file(&temp.path().join("bootstrap.lock"))
+                .is_err_and(|error| error.kind() == std::io::ErrorKind::AlreadyExists),
+            "a held lock must reject a second creation"
+        );
+        drop(held);
     }
 }
