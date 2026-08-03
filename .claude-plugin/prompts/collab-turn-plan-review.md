@@ -22,8 +22,10 @@ you own the single independent review pass. Review once, send once, exit.
    and read `canonical_plan_ref`. If any check fails, do not send; return a
    blocker.
 2. Call `collab_recv(session_id=$SESSION_ID, receiver="claude",
-   auto_ack=true)` exactly once. The first auto-ack response contains the
-   message refs. Do not call `collab_recv` again after it acknowledges.
+   auto_ack=true)` exactly once. This receive exists only to acknowledge the
+   pending message — you do not need the refs it returns, because the plan
+   comes from `canonical_plan_ref` in step 3. Do not call `collab_recv` again
+   after it acknowledges.
 3. Dereference the canonical plan:
    `get_drawer(id=<canonical_plan_ref.drawer_id>)`. A legacy canonical plan
    with a null `drawer_id` cannot be recovered through status; do not send,
