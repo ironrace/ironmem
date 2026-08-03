@@ -145,12 +145,17 @@ fn codex_collab_command_shim_is_packaged() {
 /// collaboration turns receive only the context required for their phase.
 #[test]
 fn codex_phase_prompts_are_packaged_and_invocable() {
-    const REQUIRED_CODEX_PHASE_PROMPTS: [&str; 5] = [
+    const REQUIRED_CODEX_PHASE_PROMPTS: [&str; 10] = [
         "collab-plan-draft",
+        "collab-plan-synthesis",
         "collab-plan-review",
-        "collab-global-review",
-        "collab-recovery",
+        "collab-plan-finalize",
+        "collab-task-list",
         "collab-batch-impl",
+        "collab-global-review",
+        "collab-review-local",
+        "collab-final-review",
+        "collab-recovery",
     ];
     const MAX_PROMPT_BYTES: usize = 42_832 / 3;
 
@@ -216,6 +221,63 @@ fn codex_phase_prompts_are_packaged_and_invocable() {
     assert!(
         recovery.contains("topic `review_local`") && recovery.contains("topic `final_review`"),
         "codex recovery prompt must cover delegated local and final review completions"
+    );
+}
+
+/// The copilot turn templates are what make role reversal real on the Claude
+/// side: under `pilot=codex`, Claude runs the plan `review` and
+/// `review_fix_global` turns. A template that exists in the repo but is
+/// missing from `REQUIRED_CLAUDE_PROMPTS` is never installed into
+/// `~/.claude/prompts/`, and the gap surfaces only mid-session as a missing
+/// template at dispatch.
+#[test]
+fn claude_copilot_turn_templates_are_packaged() {
+    const REQUIRED_CLAUDE_COPILOT_TEMPLATES: [&str; 2] = [
+        "collab-turn-plan-review",
+        "collab-turn-review-fix-global",
+    ];
+
+    let installer = read_text("scripts/install-ironmem.sh");
+    let required_prompts = installer
+        .split("REQUIRED_CLAUDE_PROMPTS=(")
+        .nth(1)
+        .and_then(|rest| rest.split(')').next())
+        .expect("scripts/install-ironmem.sh: missing REQUIRED_CLAUDE_PROMPTS array");
+
+    for name in REQUIRED_CLAUDE_COPILOT_TEMPLATES {
+        assert!(
+            required_prompts.lines().any(|line| line.trim() == name),
+            "scripts/install-ironmem.sh: REQUIRED_CLAUDE_PROMPTS must include {name}"
+        );
+
+        let rel = format!(".claude-plugin/prompts/{name}.md");
+        let text = read_text(&rel);
+        assert!(
+            text.contains("ANTI-PUPPETEERING"),
+            "{rel}: copilot template must carry the anti-puppeteering preamble"
+        );
+        assert!(
+            text.contains("## Verdict"),
+            "{rel}: copilot template must carry the 3-line verdict contract"
+        );
+    }
+
+    let review = read_text(".claude-plugin/prompts/collab-turn-plan-review.md");
+    for verdict in ["approve_with_minor_edits", "request_changes"] {
+        assert!(
+            review.contains(verdict),
+            "collab-turn-plan-review.md: must offer the {verdict} verdict SubmitReview validates"
+        );
+    }
+
+    let fix_global = read_text(".claude-plugin/prompts/collab-turn-review-fix-global.md");
+    assert!(
+        fix_global.contains("/ultrareview-local"),
+        "collab-turn-review-fix-global.md: must name Claude's own finding pass"
+    );
+    assert!(
+        !fix_global.contains("/pr-review-toolkit:review-pr"),
+        "collab-turn-review-fix-global.md: must not name Codex's tooling"
     );
 }
 
