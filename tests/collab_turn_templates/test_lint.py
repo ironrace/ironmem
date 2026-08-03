@@ -26,6 +26,13 @@ def copy_fixture(tmp_path):
     return fixture
 
 
+def copy_phase_rs(fixture):
+    """The phase-name check derives its valid set from phase.rs."""
+    rel = pathlib.Path("crates") / "ironmem" / "src" / "collab" / "phase.rs"
+    (fixture / rel).parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(ROOT / rel, fixture / rel)
+
+
 def test_lint_passes_on_repo():
     r = run()
     assert r.returncode == 0, f"lint failed:\n{r.stdout}\n{r.stderr}"
@@ -288,9 +295,7 @@ def test_lint_rejects_a_precondition_naming_a_rust_variant(tmp_path):
     # Rust variant of a genericized phase fails closed on every dispatch. The
     # valid set is parsed out of phase.rs, so the fixture needs that file.
     fixture = copy_fixture(tmp_path)
-    phase_rel = pathlib.Path("crates") / "ironmem" / "src" / "collab" / "phase.rs"
-    (fixture / phase_rel).parent.mkdir(parents=True)
-    shutil.copy2(ROOT / phase_rel, fixture / phase_rel)
+    copy_phase_rs(fixture)
     template = fixture / ".claude-plugin" / "prompts" / "collab-turn-plan-review.md"
     template.write_text(template.read_text().replace(
         "preconditions: phase == PlanCodexReviewPending",
@@ -304,6 +309,47 @@ def test_lint_rejects_a_precondition_naming_a_rust_variant(tmp_path):
     assert ("collab-turn-plan-review.md: preconditions names phase "
             "'PlanCopilotReviewPending', which phase.rs never emits — use the "
             "wire name 'PlanCodexReviewPending'") in r.stdout
+
+
+def test_lint_rejects_a_rust_variant_in_the_template_body(tmp_path):
+    # The comparison a worker executes is the prose State-discovery step, not
+    # the `preconditions:` metadata. Mutating the body alone leaves the
+    # frontmatter clean AND still satisfies the "PlanCodexReviewPending"
+    # snippet pin, so only a whole-file scan catches it.
+    fixture = copy_fixture(tmp_path)
+    copy_phase_rs(fixture)
+    template = fixture / ".claude-plugin" / "prompts" / "collab-turn-plan-review.md"
+    text = template.read_text()
+    body_ref = "verify\n   `phase == PlanCodexReviewPending` (the wire name for this turn"
+    assert body_ref in text, "body State-discovery comparison not found to mutate"
+    template.write_text(text.replace(
+        body_ref, body_ref.replace("PlanCodexReviewPending",
+                                   "PlanCopilotReviewPending"), 1))
+    assert "preconditions: phase == PlanCodexReviewPending" in template.read_text(), \
+        "frontmatter must stay clean — that is the whole point of this test"
+
+    r = run({"COLLAB_LINT_ROOT": str(fixture)})
+
+    assert r.returncode == 1
+    assert ("collab-turn-plan-review.md: preconditions names phase "
+            "'PlanCopilotReviewPending', which phase.rs never emits") in r.stdout
+    # The snippet pin must NOT be what caught it: the surviving frontmatter
+    # occurrence satisfies that substring test.
+    assert "missing required contract snippet 'PlanCodexReviewPending'" not in r.stdout
+
+
+def test_lint_rejects_a_prose_precondition_naming_no_phase(tmp_path):
+    fixture = copy_fixture(tmp_path)
+    copy_phase_rs(fixture)
+    template = fixture / ".claude-plugin" / "prompts" / "collab-turn-task-list.md"
+    template.write_text(template.read_text().replace(
+        "preconditions: phase == PlanLocked,", "preconditions: phase is PlanLocked,", 1))
+
+    r = run({"COLLAB_LINT_ROOT": str(fixture)})
+
+    assert r.returncode == 1
+    assert ("collab-turn-task-list.md: preconditions mentions a phase but "
+            "names none in the `phase == <WireName>` form") in r.stdout
 
 
 def test_lint_requires_retry_safe_split_contract(tmp_path):

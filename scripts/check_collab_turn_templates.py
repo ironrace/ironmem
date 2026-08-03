@@ -208,11 +208,17 @@ REQUIRED_TEMPLATE_SNIPPETS = {
         "get_drawer(id=<canonical_plan_ref.drawer_id>)",
         "exactly one copilot plan-review pass",
         "Send exactly once",
+        "The canonical plan is your only review input.",
     ],
     "collab-turn-review-fix-global.md": [
         "CodeReviewFixGlobalPending",
         "/ultrareview-local",
         "the payload carries only",
+        "Send exactly once:",
+        # The recovery owner's preserved working tree is the only copy of the
+        # interrupted work; a fetch/checkout/reset before inspecting it is
+        # unrecoverable data loss.
+        "preserve and inspect the working-tree diff *before* any fetch",
     ],
 }
 FORBIDDEN_TEMPLATE_SNIPPETS = {
@@ -562,16 +568,35 @@ def parse_wire_names() -> dict[str, str]:
 
 
 def check_precondition_phase_names() -> None:
-    """A `preconditions:` phase must be a string the server actually emits."""
+    """Every phase a template compares against must be one the server emits.
+
+    Scans the WHOLE template, not just the `preconditions:` value: that value
+    is metadata, while the comparison a worker actually executes is the prose
+    State-discovery step restating `phase == <WireName>`. Checking only the
+    frontmatter would guard the copy nobody runs — a Rust variant name in the
+    body alone would pass this check, satisfy the `REQUIRED_TEMPLATE_SNIPPETS`
+    substring pin on the strength of the frontmatter occurrence, and still
+    fail closed on every dispatch.
+    """
     wire_by_variant = parse_wire_names()
     if not wire_by_variant:
         return
     emitted = set(wire_by_variant.values())
     for path in sorted(PROMPTS.glob("collab-turn-*.md")):
-        fm = parse_frontmatter(path.read_text())
+        text = path.read_text()
+        fm = parse_frontmatter(text)
         if fm is None:
             continue  # lint_template already reports the missing frontmatter
-        names = set(PRECONDITION_PHASE_RE.findall(fm.get("preconditions", "")))
+        names = set(PRECONDITION_PHASE_RE.findall(text))
+        # A precondition phrased as prose (`phase is PlanLocked`) matches no
+        # name and would be silently unchecked, indistinguishable from the
+        # legitimately phase-free collab-turn-submit.md.
+        preconditions = fm.get("preconditions", "")
+        if "phase" in preconditions and not PRECONDITION_PHASE_RE.search(preconditions):
+            err(f"{path.name}: preconditions mentions a phase but names none "
+                f"in the `phase == <WireName>` form this lint can check — "
+                f"rewrite it in that form so the name is verified against "
+                f"phase.rs")
         for name in sorted(names - emitted):
             hint = (f"use the wire name {wire_by_variant[name]!r}"
                     if name in wire_by_variant
