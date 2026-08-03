@@ -40,8 +40,12 @@ implementer flag (already applied by the command shim). Call
 `collab_wait_my_turn(session_id, "codex", 60)` once, then read `collab_status`;
 if phase is not `PlanLocked` or Codex is not current owner, do not send; report
 `result: task_list not sent` in the completion block below and exit. Read
-`final_plan_ref`, `final_plan_hash`, `repo_path`, and `branch`, and read the
-current `HEAD` via git.
+`final_plan_ref`, `final_plan_hash`, `repo_path`, and `branch`. In `repo_path`,
+verify the checked-out branch equals the session `branch` before reading
+`HEAD`; `base_sha` is immutable once `task_list` is sent, so a `HEAD` taken on
+the wrong branch skews every later review diff with no error. If the branch
+does not match, do not send; report a blocker. Then read the current `HEAD` via
+git.
 
 Read `plan_file_path` from `final_plan_ref.plan_file_path`. If it is missing or
 not repo-relative, do not send; report a blocker. Verify the file exists under
@@ -51,14 +55,16 @@ plan drawer or recreate the file — the file plus its hash is the approved-plan
 transport.
 
 Parse the verified file's `### Task N:` headings into
-`{id, title, timebox_minutes, acceptance:[...]}`. The parser must verify that
-the heading count is at least 1 and at most 10, that IDs are contiguous `1..N`,
-that every task has a `Timebox: <=20 minutes` line, that no `timebox_minutes`
-value exceeds 20, and that every task has at least one acceptance criterion. If
-there are more than 10 tasks, do not send `task_list`: report a blocker
-requiring the original issue to be split into independently executable child
-issues. Do not merge unrelated tasks or remove acceptance criteria to evade the
-limit.
+`{id, title, timebox_minutes, acceptance:[...]}`. The plan file carries the
+fixed literal `Timebox: <=20 minutes`, not a number, so set `timebox_minutes`
+to `20` for every task — do not invent a per-task estimate and do not copy the
+literal string into the numeric field. The parser must verify that the heading
+count is at least 1 and at most 10, that IDs are contiguous `1..N`, that every
+task has a `Timebox: <=20 minutes` line, and that every task has at least one
+acceptance criterion. If there are more than 10 tasks, do not send `task_list`:
+report a blocker requiring the original issue to be split into independently
+executable child issues. Do not merge unrelated tasks or remove acceptance
+criteria to evade the limit.
 
 Build the manifest `{plan_hash: final_plan_hash, base_sha:<HEAD>,
 head_sha:<HEAD>, plan_file_path:<path>, tasks:[...]}`. Add
@@ -66,8 +72,11 @@ head_sha:<HEAD>, plan_file_path:<path>, tasks:[...]}`. Add
 in `docs/COLLAB.md` holds.
 
 Send `collab_send` with sender `codex`, topic `task_list`, and the manifest as a
-JSON string. Send exactly once and exit after a successful send. Do not retry a
-rejected send blindly — refresh `collab_status` and correct the content first.
+JSON string. Send exactly once and exit after a successful send. If the server
+rejects the send, do not retry and do not adjust the plan to satisfy it: the
+only edits that would clear a `TooManyTasks` rejection are the ones forbidden
+above, and this turn must not resize the approved plan. Report the rejection as
+a blocker and exit.
 
 ## Completion status
 
