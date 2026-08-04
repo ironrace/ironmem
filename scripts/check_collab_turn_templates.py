@@ -241,6 +241,13 @@ REQUIRED_TEMPLATE_SNIPPETS = {
     "collab-turn-submit.md": [
         'parse the artifact JSON as',
         'gh pr create --base <base_branch>',
+        # Pin all three collab_send call sites to the post-gate `$SENDER`
+        # (never a hardcoded "claude") — one distinguishing substring per
+        # site so each of the three sends is independently proven, not just
+        # that the literal appears somewhere in the file.
+        'collab_send(sender="$SENDER", topic="final_review",',
+        'collab_send(sender="$SENDER", topic="final",',
+        'collab_send(sender="$SENDER",\n  topic="failure_report",',
     ],
     "collab-turn-plan-review.md": [
         "PlanCodexReviewPending",
@@ -279,6 +286,13 @@ FORBIDDEN_TEMPLATE_SNIPPETS = {
     "collab-turn-plan-finalize.md": [
         "read `canonical_plan`",
         "read Codex's review notes",
+    ],
+    "collab-turn-submit.md": [
+        # A hardcoded sender identity bypasses the post-gate $SENDER
+        # authorization check and lets any owner submit under a stale
+        # "claude" identity — see collab-turn-submit.md's own "$SENDER is
+        # authoritative" invariant.
+        'sender="claude"',
     ],
 }
 CHECKPOINT_PROTOCOL_SURFACES = {
