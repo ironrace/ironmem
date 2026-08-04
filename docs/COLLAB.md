@@ -5,7 +5,7 @@ and Codex coordinate a single plan and then implement it through the shared
 MCP server.
 
 - **v1 (planning)**: bounded parallel drafts → canonical synthesis → one
-  Codex review pass → Claude finalizes the approved task plan →
+  Codex review pass → the pilot finalizes the approved task plan →
   `PlanLocked`.
 - **v3 (coding)**: post-`PlanLocked` task list → **batch implementation
   phase** (Claude publishes `task_list` from the approved task
@@ -14,7 +14,7 @@ MCP server.
   `iron-build` and signals completion with
   `implementation_done`) → global 3-phase linear flow (Codex review plus
   parallel fix fan-out → Claude local audit plus parallel fix fan-out →
-  Claude final with PR URL) → `CodingComplete` / `CodingFailed`. Per-task
+  the pilot finalizes with PR URL) → `CodingComplete` / `CodingFailed`. Per-task
   implementation is single-agent on the selected implementer's side; Codex
   always owns the first branch-scope review pass.
 
@@ -69,11 +69,12 @@ multi-agent framework. Exactly one plan is produced per session, with:
 1. two independent first drafts (Claude + Codex, blind to each other)
 2. one canonical synthesis by Claude
 3. one review pass by Codex
-4. one final approved task plan published by Claude (Claude has the last word)
+4. one final approved task plan sent by the pilot (Claude still has the last
+   word — it always drives the Plan Mode approval gate, regardless of pilot)
 5. terminal state `PlanLocked`
 
 There is no `PlanEscalated` state and no re-synthesis loop. After Codex's one
-review pass, Claude finalizes regardless of Codex's verdict.
+review pass, the pilot finalizes regardless of Codex's verdict.
 
 ### Review cap (server-enforced)
 
@@ -86,12 +87,14 @@ One review pass is a maximum, not an iteration target.
   `PlanClaudeFinalizePending` **regardless of verdict** — `approve`,
   `approve_with_minor_edits`, and `request_changes` all map to the same
   next phase.
-- Claude has the last word: any unresolved review notes are absorbed (or
-  explicitly declined with a rationale) in the `final` plan.
+- The pilot has the last word on content: any unresolved review notes are
+  absorbed (or explicitly declined with a rationale) in the `final` plan —
+  composed by whichever agent is piloting; Claude still drives the Plan Mode
+  approval gate on top of whatever the pilot composes.
 - `review_round` is the audit trail. It is set to 1 after Codex's review;
   post-finalize tests assert `review_round == MAX_REVIEW_ROUNDS`.
 - The protocol is bounded by construction: at most one Codex review,
-  then Claude finalizes. Docs/prompts that frame v1 planning as
+  then the pilot finalizes. Docs/prompts that frame v1 planning as
   open-ended iteration to convergence are wrong.
 
 ## Harness generalization vs two-party protocol
@@ -463,7 +466,7 @@ branch scope. Codex runs `/pr-review-toolkit:review-pr` on the raw
 post-implementation diff first, then fans confirmed findings out to
 parallel fix subagents where they can be safely partitioned; Claude then
 runs the `review_local` audit of Codex's commits and fans confirmed audit
-findings out the same way; Claude opens the PR on the final turn.
+findings out the same way; the pilot opens the PR on the final turn.
 
 | Phase | Owner | Event | Next |
 |---|---|---|---|
@@ -474,9 +477,8 @@ findings out the same way; Claude opens the PR on the final turn.
 The `Owner` column is the normal flow. Under the delegated-completion
 override, the recovery owner sends the interrupted phase's event in the
 original owner's place — including `final_review`, in which case the
-recovery owner (the pilot's counterpart) opens the PR instead. See "Failure +
-terminal" above and the PR-ownership rule under "Harness-Side
-Responsibilities".
+recovery owner opens the PR instead. See "Failure + terminal" above and the
+PR-ownership rule under "Harness-Side Responsibilities".
 
 ### Shortcut: post-iron-build coding review
 
@@ -496,8 +498,8 @@ The no-op handshake turn is collapsed: `head_sha` is supplied at session
 creation time. From there, the surviving flow follows the new ordering:
 Codex `review_fix_global` (`/pr-review-toolkit:review-pr` plus parallel
 fix fan-out for confirmed findings on the raw diff) → Claude `review_local`
-(audit Codex's commits plus parallel fix fan-out) → Claude `final_review`
-(PR creation).
+(audit Codex's commits plus parallel fix fan-out) → the pilot's
+`final_review` (PR creation).
 
 | Phase | Owner | Event | Next |
 |---|---|---|---|
@@ -1522,19 +1524,27 @@ before each coding-active `collab_send`:
   inline with the `final_review` event. There is no separate `pr_opened` turn.
 - **PR creation is scoped by protocol ownership, not by tooling.** Codex may
   run any `gh`, git, or GitHub API operation it needs; nothing about the
-  tooling is off-limits. What is restricted is *who owns the turn that
-  creates the PR*. Codex creates a PR when it owns `CodeReviewFinalPending`
-  — either as the normal-flow pilot (`pilot == "codex"`, so
-  `current_owner == "codex"` there) or under the recovery override (all
-  three of `pending_failure` non-null, `current_owner == "codex"`, and
-  `recovery_phase == "CodeReviewFinalPending"`). Under `pilot == "claude"`
-  with no recovery in flight, Claude owns that turn and Codex never reaches
-  it, so in that configuration Codex still does not open PRs; it simply is
-  no longer forbidden to whenever ownership — pilot or recovery — hands it
-  the turn. Codex should still avoid gratuitous PR probes in its ordinary
-  phases (`gh pr list`, `git ls-remote refs/pull/*`) — they add an
-  `api.github.com` reachability dependency that was observed as a fragility
-  in practice — but that is a robustness preference, not a prohibition.
+  tooling is off-limits. What is restricted is *who is allowed to actually
+  execute `gh pr create`*. Codex runs `gh pr create` itself only when it
+  owns `CodeReviewFinalPending` under the recovery override — i.e. all three
+  of `pending_failure` non-null, `current_owner == "codex"`, and
+  `recovery_phase == "CodeReviewFinalPending"` (see `collab-recovery.md`).
+  Outside recovery, `gh pr create` is always run by the Claude-side
+  `collab-turn-submit.md` worker — even under `pilot == "codex"`. There,
+  Codex owns the `CodeReviewFinalPending` turn and composes the PR
+  title/body, but its own prompt (`collab-final-review.md`) explicitly sends
+  nothing and opens no PR ("This turn sends nothing and opens no PR... the
+  orchestrator dispatches the submit worker with your staged artifact, and
+  that worker owns PR creation and the completion send"); the orchestrator
+  then dispatches `collab-turn-submit.md` to run `gh pr create` and send
+  `final_review` as `$SENDER=codex` on Codex's behalf. So "who is the
+  protocol turn-owner / send identity" and "who literally executes
+  `gh pr create`" diverge under `pilot == "codex"`: Codex owns the send
+  identity, but Claude's submit worker still makes the `gh` call. Codex
+  should still avoid gratuitous PR probes in its ordinary phases (`gh pr
+  list`, `git ls-remote refs/pull/*`) — they add an `api.github.com`
+  reachability dependency that was observed as a fragility in practice —
+  but that is a robustness preference, not a prohibition.
 
   **Why the old blanket ban was a defect.** The previous rule said Codex
   must never call any PR-related operation, full stop. Recovery can hand
@@ -2360,8 +2370,9 @@ Scope (v1 + v3):
 - bounded planning (v1) and bounded coding loop (v3) through a single session
 - one plan → one task list → one PR per session
 - v1 planning has one Codex review round; v3 coding is strictly linear (no rounds)
-- Claude always gets the last word in planning (v1) and owns the
-  audit/PR turns after Codex's first branch-scope review in v3
+- Claude always drives the planning approval gate (v1, via Plan Mode) and
+  owns the local-audit turn after Codex's first branch-scope review in v3;
+  the final PR-creation turn (`CodeReviewFinalPending`) is owned by the pilot
 - Claude runs the dispatcher loop; Codex-owned phases are one-shot
   dispatches that act autonomously and exit
 
@@ -2369,4 +2380,4 @@ Out of scope:
 
 - multi-session orchestration
 - parallel branches / concurrent PRs
-- autonomous merge (Claude opens the PR; a human merges)
+- autonomous merge (the pilot opens the PR; a human merges)
