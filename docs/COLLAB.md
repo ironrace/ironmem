@@ -35,8 +35,13 @@ from this spec — keep them in sync when protocol changes land:
 - `.claude-plugin/commands/collab.md` — Claude's `/collab` prompt.
 - `.codex-plugin/commands/collab.md` — Codex's `/collab` slash command.
 - `.codex-plugin/prompts/collab-plan-draft.md` — Codex's v1 draft turn.
+- `.codex-plugin/prompts/collab-plan-synthesis.md` — Codex's v1 canonical-plan synthesis turn (pilot).
 - `.codex-plugin/prompts/collab-plan-review.md` — Codex's v1 plan-review turn.
+- `.codex-plugin/prompts/collab-plan-finalize.md` — Codex's v1 plan-finalize turn (pilot).
+- `.codex-plugin/prompts/collab-task-list.md` — Codex's `PlanLocked` task-list bridge turn (pilot).
 - `.codex-plugin/prompts/collab-global-review.md` — Codex's v3 global-review/fix turn.
+- `.codex-plugin/prompts/collab-review-local.md` — Codex's v3 post-fix local audit turn (pilot).
+- `.codex-plugin/prompts/collab-final-review.md` — Codex's v3 final-review PR-body compose turn (pilot).
 - `.codex-plugin/prompts/collab-recovery.md` — delegated v3 local/final-review recovery.
 - `.codex-plugin/prompts/collab-batch-impl.md` — Codex's v3 batch-implementation turn.
 
@@ -1675,20 +1680,27 @@ sampling — the same metrics instrumentation tracked under #82–#83.
 
 ### Worker templates
 
-The eight per-turn worker templates live under `.claude-plugin/prompts/`:
+The ten per-turn worker templates live under `.claude-plugin/prompts/`:
 
 - `collab-turn-plan-draft.md` — `PlanParallelDrafts` blind draft
 - `collab-turn-plan-synthesis.md` — `PlanSynthesisPending` canonical
+- `collab-turn-plan-review.md` — `PlanCodexReviewPending` copilot plan review
 - `collab-turn-plan-finalize.md` — `PlanClaudeFinalizePending` final
 - `collab-turn-task-list.md` — `PlanLocked` bridge (mechanical `task_list` submit)
 - `collab-turn-code-implement.md` — `CodeImplementPending` batch (Claude implementer)
+- `collab-turn-review-fix-global.md` — `CodeReviewFixGlobalPending` copilot review + fix
 - `collab-turn-review-local.md` — `CodeReviewLocalPending` `/ultrareview-local` audit
 - `collab-turn-final-review.md` — `CodeReviewFinalPending` PR-body compose
 - `collab-turn-submit.md` — generic submit-by-ref + PR create
 
-Codex uses four normal phase prompts plus `collab-recovery.md` for the rare
+Codex has a matching phase prompt under `.codex-plugin/prompts/` for each of
+the nine protocol turns above that carry a phase — every template except
+`collab-turn-submit.md`, which is Claude's generic submit-by-ref/PR-create turn
+and has no Codex counterpart. There is also `collab-recovery.md` for the rare
 recovery override that delegates `CodeReviewLocalPending` or
-`CodeReviewFinalPending` to Codex.
+`CodeReviewFinalPending` to Codex. Installed is not yet dispatchable: the Codex
+`/collab` shim's phase table routes only a subset of those prompts today, and
+the rest ship ahead of their dispatch rows (#248).
 
 The Claude-side dispatch tables and the authoritative tier matrix live in
 `.claude-plugin/commands/collab.md`; this section and that command file must

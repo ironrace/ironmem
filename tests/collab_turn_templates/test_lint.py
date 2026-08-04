@@ -20,10 +20,22 @@ def copy_fixture(tmp_path):
                     fixture / ".claude-plugin" / "commands")
     shutil.copytree(ROOT / ".codex-plugin" / "prompts",
                     fixture / ".codex-plugin" / "prompts")
+    # Without this the Codex-side command checks never run in any fixture test,
+    # which is how ~22 per-prompt contract pins sat unexercised behind
+    # `if not CODEX_COMMAND.exists()`.
+    shutil.copytree(ROOT / ".codex-plugin" / "commands",
+                    fixture / ".codex-plugin" / "commands")
     (fixture / "docs").mkdir()
     shutil.copy2(ROOT / "docs" / "COLLAB.md", fixture / "docs" / "COLLAB.md")
     shutil.copy2(ROOT / "docs" / "EVALUATE_ISSUE.md", fixture / "docs" / "EVALUATE_ISSUE.md")
     return fixture
+
+
+def copy_phase_rs(fixture):
+    """The phase-name check derives its valid set from phase.rs."""
+    rel = pathlib.Path("crates") / "ironmem" / "src" / "collab" / "phase.rs"
+    (fixture / rel).parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(ROOT / rel, fixture / rel)
 
 
 def test_lint_passes_on_repo():
@@ -100,11 +112,6 @@ def test_plan_and_manifest_workers_use_verified_references():
 def test_codex_dispatch_uses_explicit_repository_model_defaults():
     docs = (ROOT / "docs" / "COLLAB.md").read_text()
     dispatcher = (ROOT / ".claude-plugin" / "commands" / "collab.md").read_text()
-    plan_draft_prompt = (ROOT / ".codex-plugin" / "prompts" / "collab-plan-draft.md").read_text()
-    plan_review_prompt = (ROOT / ".codex-plugin" / "prompts" / "collab-plan-review.md").read_text()
-    global_review_prompt = (ROOT / ".codex-plugin" / "prompts" / "collab-global-review.md").read_text()
-    recovery_prompt = (ROOT / ".codex-plugin" / "prompts" / "collab-recovery.md").read_text()
-    batch_prompt = (ROOT / ".codex-plugin" / "prompts" / "collab-batch-impl.md").read_text()
     # Two surfaces this assertion used to cover are gone, and neither is
     # replaced. The bundled skills no longer carry a codex-tools.md reference
     # sheet -- the iron-* skills resolve harness tool names from
@@ -112,11 +119,16 @@ def test_codex_dispatch_uses_explicit_repository_model_defaults():
     # PR #240 (adb5c80); the read of it left this suite red from that merge
     # until now, unnoticed because nothing ran the suite.
 
-    for surface in (docs, dispatcher, plan_draft_prompt, plan_review_prompt,
-                    global_review_prompt, recovery_prompt, batch_prompt):
-        assert "gpt-5.6-luna" in surface
-        assert "gpt-5.6-terra" in surface
-        assert "gpt-5.6-sol" in surface
+    codex_prompts = {p.name: p.read_text()
+                     for p in sorted((ROOT / ".codex-plugin" / "prompts").glob("collab-*.md"))}
+    assert len(codex_prompts) >= 7, f"expected every collab-*.md prompt, got {sorted(codex_prompts)}"
+    plan_draft_prompt = codex_prompts["collab-plan-draft.md"]
+
+    for name, surface in [("docs/COLLAB.md", docs), (".claude-plugin/commands/collab.md", dispatcher),
+                          *codex_prompts.items()]:
+        assert "gpt-5.6-luna" in surface, name
+        assert "gpt-5.6-terra" in surface, name
+        assert "gpt-5.6-sol" in surface, name
 
     assert "CodeImplementPending" in dispatcher
     assert "-m gpt-5.6-luna -c model_reasoning_effort=max" in dispatcher
@@ -247,6 +259,221 @@ def test_lint_requires_evaluate_issue_split_contract(tmp_path):
     assert r.returncode == 1
     assert ".codex-plugin/prompts/evaluate-issue.md: missing evaluate-issue SPLIT contract" \
         in r.stdout
+
+
+def test_lint_requires_both_harness_templates_per_topic(tmp_path):
+    fixture = copy_fixture(tmp_path)
+    (fixture / ".codex-plugin" / "prompts" / "collab-review-local.md").unlink()
+
+    r = run({"COLLAB_LINT_ROOT": str(fixture)})
+
+    assert r.returncode == 1
+    assert "missing Codex prompt collab-review-local.md" in r.stdout
+
+
+def test_lint_requires_claude_copilot_templates(tmp_path):
+    fixture = copy_fixture(tmp_path)
+    (fixture / ".claude-plugin" / "prompts" / "collab-turn-plan-review.md").unlink()
+
+    r = run({"COLLAB_LINT_ROOT": str(fixture)})
+
+    assert r.returncode == 1
+    assert "missing Claude template collab-turn-plan-review.md" in r.stdout
+
+
+def test_lint_requires_installer_to_cover_every_template(tmp_path):
+    fixture = copy_fixture(tmp_path)
+    scripts = fixture / "scripts"
+    scripts.mkdir()
+    installer = ROOT / "scripts" / "install-ironmem.sh"
+    (scripts / "install-ironmem.sh").write_text(
+        installer.read_text().replace("  collab-turn-plan-review\n", "", 1))
+
+    r = run({"COLLAB_LINT_ROOT": str(fixture)})
+
+    assert r.returncode == 1
+    assert "REQUIRED_CLAUDE_PROMPTS is missing 'collab-turn-plan-review'" in r.stdout
+
+
+def test_lint_rejects_a_precondition_naming_a_rust_variant(tmp_path):
+    # `collab_status` emits `wire_name`, so a `preconditions:` line naming the
+    # Rust variant of a genericized phase fails closed on every dispatch. The
+    # valid set is parsed out of phase.rs, so the fixture needs that file.
+    fixture = copy_fixture(tmp_path)
+    copy_phase_rs(fixture)
+    template = fixture / ".claude-plugin" / "prompts" / "collab-turn-plan-review.md"
+    template.write_text(template.read_text().replace(
+        "preconditions: phase == PlanCodexReviewPending",
+        "preconditions: phase == PlanCopilotReviewPending",
+        1,
+    ))
+
+    r = run({"COLLAB_LINT_ROOT": str(fixture)})
+
+    assert r.returncode == 1
+    assert ("collab-turn-plan-review.md: preconditions names phase "
+            "'PlanCopilotReviewPending', which phase.rs never emits — use the "
+            "wire name 'PlanCodexReviewPending'") in r.stdout
+
+
+def test_lint_rejects_a_rust_variant_in_the_template_body(tmp_path):
+    # The comparison a worker executes is the prose State-discovery step, not
+    # the `preconditions:` metadata. Mutating the body alone leaves the
+    # frontmatter clean AND still satisfies the "PlanCodexReviewPending"
+    # snippet pin, so only a whole-file scan catches it.
+    fixture = copy_fixture(tmp_path)
+    copy_phase_rs(fixture)
+    template = fixture / ".claude-plugin" / "prompts" / "collab-turn-plan-review.md"
+    text = template.read_text()
+    body_ref = "verify\n   `phase == PlanCodexReviewPending` (the wire name for this turn"
+    assert body_ref in text, "body State-discovery comparison not found to mutate"
+    template.write_text(text.replace(
+        body_ref, body_ref.replace("PlanCodexReviewPending",
+                                   "PlanCopilotReviewPending"), 1))
+    assert "preconditions: phase == PlanCodexReviewPending" in template.read_text(), \
+        "frontmatter must stay clean — that is the whole point of this test"
+
+    r = run({"COLLAB_LINT_ROOT": str(fixture)})
+
+    assert r.returncode == 1
+    assert ("collab-turn-plan-review.md: preconditions names phase "
+            "'PlanCopilotReviewPending', which phase.rs never emits") in r.stdout
+    # The snippet pin must NOT be what caught it: the surviving frontmatter
+    # occurrence satisfies that substring test.
+    assert "missing required contract snippet 'PlanCodexReviewPending'" not in r.stdout
+
+
+def test_lint_rejects_a_prose_precondition_naming_no_phase(tmp_path):
+    fixture = copy_fixture(tmp_path)
+    copy_phase_rs(fixture)
+    template = fixture / ".claude-plugin" / "prompts" / "collab-turn-task-list.md"
+    template.write_text(template.read_text().replace(
+        "preconditions: phase == PlanLocked,", "preconditions: phase is PlanLocked,", 1))
+
+    r = run({"COLLAB_LINT_ROOT": str(fixture)})
+
+    assert r.returncode == 1
+    assert ("collab-turn-task-list.md: preconditions mentions a phase but "
+            "names none in the `phase == <WireName>` form") in r.stdout
+
+
+def test_lint_requires_codex_prompt_contracts_without_the_codex_command(tmp_path):
+    # These pins used to live inside the `else:` branch of
+    # `if not CODEX_COMMAND.exists()`, so with the command file absent two
+    # inverted protocol contracts linted green. They must fire on prompt
+    # content alone.
+    fixture = copy_fixture(tmp_path)
+    shutil.rmtree(fixture / ".codex-plugin" / "commands")
+    final_review = fixture / ".codex-plugin" / "prompts" / "collab-final-review.md"
+    final_review.write_text(final_review.read_text().replace(
+        "**This turn sends nothing and opens no PR.**",
+        "This turn may open a PR.",
+        1,
+    ))
+    task_list = fixture / ".codex-plugin" / "prompts" / "collab-task-list.md"
+    task_list.write_text(task_list.read_text().replace(
+        "SHA-256 equals both `final_plan_ref.hash` and",
+        "SHA-256 is close enough to",
+        1,
+    ))
+
+    r = run({"COLLAB_LINT_ROOT": str(fixture)})
+
+    assert r.returncode == 1
+    assert (".codex-plugin/prompts/collab-final-review.md: missing required "
+            "recovery/dispatch contract '**This turn sends nothing and opens "
+            "no PR.**'") in r.stdout
+    assert (".codex-plugin/prompts/collab-task-list.md: missing required "
+            "recovery/dispatch contract 'SHA-256 equals both "
+            "`final_plan_ref.hash` and'") in r.stdout
+
+
+def test_lint_requires_codex_prompt_contracts_with_the_codex_command(tmp_path):
+    # Same pins, command file present: the fixture must exercise the full path.
+    fixture = copy_fixture(tmp_path)
+    synthesis = fixture / ".codex-plugin" / "prompts" / "collab-plan-synthesis.md"
+    synthesis.write_text(synthesis.read_text().replace(
+        "get_drawer(id=<message.drawer_id>)", "get_drawer(id=<removed>)", 1))
+    review_local = fixture / ".codex-plugin" / "prompts" / "collab-review-local.md"
+    review_local.write_text(review_local.read_text().replace(
+        "Send `collab_send` with sender `codex`, topic `review_local`,",
+        "Send `collab_send` with sender `claude`, topic `review_local`,",
+        1,
+    ))
+
+    r = run({"COLLAB_LINT_ROOT": str(fixture)})
+
+    assert r.returncode == 1
+    assert (".codex-plugin/prompts/collab-plan-synthesis.md: missing required "
+            "recovery/dispatch contract 'get_drawer(id=<message.drawer_id>)'") \
+        in r.stdout
+    assert (".codex-plugin/prompts/collab-review-local.md: missing required "
+            "recovery/dispatch contract 'Send `collab_send` with sender "
+            "`codex`, topic `review_local`,'") in r.stdout
+
+
+def test_lint_rejects_a_stale_phase_name_in_a_codex_prompt(tmp_path):
+    # The Codex prompts hardcode their phase in prose. Renaming a wire string
+    # in phase.rs used to flag only the Claude template, because the Codex
+    # phase names were compared against hardcoded literals in the lint that
+    # rotted in lockstep with the prompts.
+    fixture = copy_fixture(tmp_path)
+    copy_phase_rs(fixture)
+    prompt = fixture / ".codex-plugin" / "prompts" / "collab-review-local.md"
+    text = prompt.read_text()
+    guard = "if phase is not `CodeReviewLocalPending`"
+    assert guard in text, "Codex phase guard not found to mutate"
+    prompt.write_text(text.replace(
+        guard, "if phase is not `CodeReviewCopilotLocalPending`", 1))
+
+    r = run({"COLLAB_LINT_ROOT": str(fixture)})
+
+    assert r.returncode == 1
+    assert (".codex-plugin/prompts/collab-review-local.md: phase guard names "
+            "phase 'CodeReviewCopilotLocalPending', which phase.rs never "
+            "emits") in r.stdout
+
+
+def test_lint_rejects_a_codex_prompt_whose_phase_guard_vanished(tmp_path):
+    # A prompt that drops or reformats its guard must fail loudly rather than
+    # become silently unchecked.
+    fixture = copy_fixture(tmp_path)
+    copy_phase_rs(fixture)
+    prompt = fixture / ".codex-plugin" / "prompts" / "collab-plan-finalize.md"
+    text = prompt.read_text()
+    mutated = (text.replace("prompt is only for `PlanClaudeFinalizePending`",
+                            "prompt is only for the finalize turn", 1)
+                   .replace("if phase is not `PlanClaudeFinalizePending`",
+                            "if the phase is wrong", 1))
+    assert mutated != text, "Codex phase guards not found to mutate"
+    prompt.write_text(mutated)
+
+    r = run({"COLLAB_LINT_ROOT": str(fixture)})
+
+    assert r.returncode == 1
+    assert ".codex-plugin/prompts/collab-plan-finalize.md: no phase guard found" \
+        in r.stdout
+
+
+def test_lint_requires_the_unconditional_dirty_worktree_guard(tmp_path):
+    # A turn that died hard never sends `failure_report`, so `pending_failure`
+    # stays null and the next dispatch is a normal turn. The porcelain
+    # precondition must therefore bind whatever `pending_failure` says.
+    fixture = copy_fixture(tmp_path)
+    template = (fixture / ".claude-plugin" / "prompts" /
+                "collab-turn-review-fix-global.md")
+    guard = "`git status --porcelain` to be empty regardless of `pending_failure`"
+    text = template.read_text()
+    assert guard in text, "porcelain precondition not found to mutate"
+    template.write_text(text.replace(
+        guard, "`git status --porcelain` to be empty when `pending_failure`", 1))
+
+    r = run({"COLLAB_LINT_ROOT": str(fixture)})
+
+    assert r.returncode == 1
+    assert ("collab-turn-review-fix-global.md: missing required contract "
+            "snippet '`git status --porcelain` to be empty regardless of "
+            "`pending_failure`'") in r.stdout
 
 
 def test_lint_requires_retry_safe_split_contract(tmp_path):
