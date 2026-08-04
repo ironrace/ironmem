@@ -1713,13 +1713,15 @@ The ten per-turn worker templates live under `.claude-plugin/prompts/`:
 
 Codex has a matching phase prompt under `.codex-plugin/prompts/` for each of
 the nine protocol turns above that carry a phase — every template except
-`collab-turn-submit.md`. That omission is by design, not a gap: Claude's
-orchestrator loop is always the one that dispatches the submit turn,
-regardless of pilot (only `$SENDER` is parameterized, from
+`collab-turn-submit.md`. That omission is by design, not a gap: in the
+normal flow, Claude's orchestrator loop is the one that dispatches the
+submit turn regardless of pilot (only `$SENDER` is parameterized, from
 `collab_status.current_owner`), so a Codex-side submit template would never
-be invoked and would just rot unused. There is also `collab-recovery.md` for
-the rare recovery override that delegates `CodeReviewLocalPending` or
-`CodeReviewFinalPending` to Codex.
+be invoked there and would just rot unused. The one exception is
+`collab-recovery.md`, which handles the rare recovery override that
+delegates `CodeReviewLocalPending` or `CodeReviewFinalPending` to Codex —
+there Codex sends the completion event (including opening the PR for
+`final_review`) itself, without going through `collab-turn-submit.md`.
 
 Separately, and unrelated to `collab-turn-submit.md`'s by-design omission:
 installed is not yet dispatchable for some of the other templates — the

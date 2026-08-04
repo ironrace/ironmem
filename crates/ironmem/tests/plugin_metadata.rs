@@ -445,15 +445,20 @@ fn collab_turn_submit_template_is_sender_parameterized() {
          sender does not match collab_status.current_owner"
     );
 
-    // Mirror the Python lint's specificity: all three collab_send call sites
-    // in this template (final_review success, final success, and the
-    // artifact-unfetchable failure_report path) must each be parameterized,
-    // not just one of them.
+    // Mirror the Python lint's specificity: all four collab_send call sites
+    // in this template (final_review success, final success, the
+    // pr_create_failed failure_report path, and the artifact-unfetchable
+    // failure_report path) must each be parameterized, not just one of
+    // them. The pr_create_failed site was originally missed — a senderless
+    // `failure_report` there strands exactly the pilot=codex PR-creation
+    // failure this template exists to fix — so this count guards against
+    // a fourth send being added (or restored) without `sender="$SENDER"`.
     let call_sites = content.matches("sender=\"$SENDER\"").count();
     assert_eq!(
-        call_sites, 3,
-        "{rel}: expected exactly 3 sender=\"$SENDER\" collab_send call sites (final_review, \
-         final, and the failure_report path), found {call_sites}"
+        call_sites, 4,
+        "{rel}: expected exactly 4 sender=\"$SENDER\" collab_send call sites (final_review, \
+         final, pr_create_failed, and the artifact-unfetchable failure_report path), found \
+         {call_sites}"
     );
 }
 

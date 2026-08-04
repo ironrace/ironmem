@@ -76,9 +76,11 @@ Actions below — sending `$TOPIC` (e.g. `final_review`) via the normal
   --head $BRANCH --title <title> --body <body>`; capture `pr_url`;
   `collab_send(sender="$SENDER", topic="final_review",
   content=<JSON {"head_sha":"<HEAD>","pr_url":"<url>"}>)`. On `gh` failure or
-  base-branch resolution failure, send `failure_report`
-  `content=<JSON {"coding_failure":"pr_create_failed: <error>"}>` (no silent
-  retry).
+  base-branch resolution failure, `collab_send(sender="$SENDER",
+  topic="failure_report",
+  content=<JSON {"coding_failure":"pr_create_failed: <error>"}>)` (no silent
+  retry) — same `$SENDER` as above; a senderless `failure_report` here would
+  strand exactly the `pilot=codex` failure this template exists to fix.
 - Otherwise (`final`): `collab_send(sender="$SENDER", topic="final",
   content=<artifact body, JSON string {"plan":"<approved markdown>"}>)`.
 

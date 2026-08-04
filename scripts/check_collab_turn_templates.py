@@ -241,13 +241,25 @@ REQUIRED_TEMPLATE_SNIPPETS = {
     "collab-turn-submit.md": [
         'parse the artifact JSON as',
         'gh pr create --base <base_branch>',
-        # Pin all three collab_send call sites to the post-gate `$SENDER`
+        # Pin all FOUR collab_send call sites to the post-gate `$SENDER`
         # (never a hardcoded "claude") — one distinguishing substring per
-        # site so each of the three sends is independently proven, not just
-        # that the literal appears somewhere in the file.
+        # site so each send is independently proven, not just that the
+        # literal appears somewhere in the file. The two failure_report
+        # sends share an identical `collab_send(sender="$SENDER",\n  topic=
+        # "failure_report",` prefix, so each snippet below extends past that
+        # shared prefix into its distinct payload to bind to its own site.
         'collab_send(sender="$SENDER", topic="final_review",',
         'collab_send(sender="$SENDER", topic="final",',
-        'collab_send(sender="$SENDER",\n  topic="failure_report",',
+        'topic="failure_report",\n  content=<JSON {"coding_failure":"pr_create_failed:',
+        'topic="failure_report", content=<JSON {"coding_failure":\n  "approved_artifact_unfetchable:',
+        # The $SENDER authorization guard itself: without this pin, deleting
+        # the whole verification/abort/recovery-invariant block (state
+        # discovery step 2) leaves every collab_send pin above still green,
+        # since the sends themselves are untouched by removing the guard
+        # that gates them.
+        'Verify `$SENDER` against `collab_status.current_owner`',
+        'MUST NOT be\n   substituted with your own identity',
+        'may\n     legitimately be the recovery owner rather than the pilot',
     ],
     "collab-turn-plan-review.md": [
         "PlanCodexReviewPending",
