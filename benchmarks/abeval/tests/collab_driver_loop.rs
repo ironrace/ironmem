@@ -509,6 +509,17 @@ fn full_happy_path_sums_usage_and_counts_rework() {
     assert!(prompts_seen
         .iter()
         .any(|p| p.contains("https://abeval.invalid/task1")));
+    // No worker prompt on the standard path ships an unsubstituted placeholder.
+    // `$SENDER` in particular: `collab-turn-submit.md` ABORTS on a literal one,
+    // and the aborted submit still returns "success", so the run would wedge on
+    // STUCK_LIMIT rather than fail loudly.
+    for p in prompts_seen.iter() {
+        assert!(!p.contains("$SENDER"), "prompt kept a literal $SENDER: {p}");
+    }
+    // The `final` submit went out as the session's current owner.
+    assert!(prompts_seen
+        .iter()
+        .any(|p| p.contains("sender=\"claude\", topic=\"final\"")));
 }
 
 #[test]

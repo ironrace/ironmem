@@ -412,53 +412,101 @@ fn claude_copilot_turn_templates_are_packaged() {
     );
 }
 
-/// `collab-turn-submit.md` is the only surface that sends collab protocol
-/// messages (`final`, `final_review`, `failure_report`) under a
-/// pilot-dependent identity: `sender="$SENDER"`, verified against
-/// `collab_status.current_owner` before every send. A regression back to a
-/// literal `sender="claude"` here silently breaks `pilot=codex` sessions —
-/// the server rejects the send as coming from the wrong owner and the
-/// session stalls in `CodeReviewFinalPending`/`PlanFinalizePending`, exactly
-/// the failure this plan fixed. `scripts/check_collab_turn_templates.py`
-/// already pins this same `$SENDER`/call-site contract on this same repo
-/// file; this test is a deliberate second, independent gate on the same
-/// protocol-critical property, run by a different suite (`cargo test`
-/// instead of the Python lint) so a change that only re-runs one of the two
-/// doesn't get a false-green. Unlike `claude_copilot_turn_templates_are_packaged`
-/// above, this is a content/contract check, not an installer-registration
-/// check — `collab-turn-submit` being present in `REQUIRED_CLAUDE_PROMPTS`
-/// is verified separately by `check_installer_covers_templates` in the
-/// Python lint.
-#[test]
-fn collab_turn_submit_template_is_sender_parameterized() {
-    let rel = ".claude-plugin/prompts/collab-turn-submit.md";
-    let content = read_text(rel);
-
+/// Assert one Claude turn template sends only under the pilot-dependent
+/// `$SENDER` identity.
+///
+/// `sites` lists one distinguishing substring per `collab_send` call site,
+/// each starting at `collab_send(sender="$SENDER"` so the sender is part of
+/// what is proven. Checking the sites individually is what a
+/// `matches(...).count() == N` lock cannot do: the count is site-blind, so a
+/// fifth send added *without* the parameterization keeps it at N and passes,
+/// while a legitimately parameterized fifth send fails it as a false alarm.
+/// The count is therefore asserted only as a floor.
+fn assert_sender_parameterized(rel: &str, sites: &[&str]) {
+    // A template that is not installed is never dispatched, whatever it
+    // contains — so the packaging claim is asserted, not assumed.
+    let name = rel
+        .strip_prefix(".claude-plugin/prompts/")
+        .and_then(|n| n.strip_suffix(".md"))
+        .unwrap_or_else(|| panic!("{rel}: expected a .claude-plugin/prompts/*.md path"));
     assert!(
-        content.contains("$SENDER"),
-        "{rel}: must send under the pilot-dependent $SENDER identity, not a hardcoded one"
+        installer_array("REQUIRED_CLAUDE_PROMPTS")
+            .lines()
+            .any(|line| line.trim() == name),
+        "scripts/install-ironmem.sh: REQUIRED_CLAUDE_PROMPTS must include {name} — an \
+         uninstalled template is never copied to ~/.claude/prompts/ and fails at dispatch"
     );
+
+    let content = read_text(rel);
     assert!(
         !content.contains("sender=\"claude\""),
         "{rel}: must not regress to a literal sender=\"claude\" — this breaks pilot=codex \
-         sessions, which stall in CodeReviewFinalPending/PlanFinalizePending when the send's \
-         sender does not match collab_status.current_owner"
+         sessions, whose sends are rejected when the sender does not match \
+         collab_status.current_owner"
     );
-
-    // Mirror the Python lint's specificity: all four collab_send call sites
-    // in this template (final_review success, final success, the
-    // pr_create_failed failure_report path, and the artifact-unfetchable
-    // failure_report path) must each be parameterized, not just one of
-    // them. The pr_create_failed site was originally missed — a senderless
-    // `failure_report` there strands exactly the pilot=codex PR-creation
-    // failure this template exists to fix — so this count guards against
-    // a fourth send being added (or restored) without `sender="$SENDER"`.
+    for site in sites {
+        assert!(
+            content.contains(site),
+            "{rel}: missing parameterized collab_send call site `{site}` — every send in \
+             this template must go out as sender=\"$SENDER\""
+        );
+    }
     let call_sites = content.matches("sender=\"$SENDER\"").count();
-    assert_eq!(
-        call_sites, 4,
-        "{rel}: expected exactly 4 sender=\"$SENDER\" collab_send call sites (final_review, \
-         final, pr_create_failed, and the artifact-unfetchable failure_report path), found \
-         {call_sites}"
+    assert!(
+        call_sites >= sites.len(),
+        "{rel}: expected at least {} sender=\"$SENDER\" collab_send call sites, found \
+         {call_sites}",
+        sites.len()
+    );
+}
+
+/// `collab-turn-submit.md` sends collab protocol messages (`final`,
+/// `final_review`, `failure_report`) under a pilot-dependent identity:
+/// `sender="$SENDER"`, verified against `collab_status.current_owner` before
+/// every send. A regression back to a literal `sender="claude"` here silently
+/// breaks `pilot=codex` sessions — the server rejects the send as coming from
+/// the wrong owner and the session stalls in
+/// `CodeReviewFinalPending`/`PlanClaudeFinalizePending` (the wire names
+/// `collab_status` emits for `CodeReviewFinalPending`/`PlanFinalizePending`,
+/// per `crates/ironmem/src/collab/phase.rs`), exactly the failure this plan
+/// fixed.
+///
+/// What this test proves, precisely: the repo file's content contract, plus
+/// its registration in `REQUIRED_CLAUDE_PROMPTS`. It reads the same repo
+/// bytes `scripts/check_collab_turn_templates.py` reads — it is a second,
+/// independent runner over one protocol-critical property, not a check of the
+/// installed copy, and it detects no packaging drift beyond that installer
+/// array.
+#[test]
+fn collab_turn_submit_template_is_sender_parameterized() {
+    // The pr_create_failed site was originally missed — a senderless
+    // `failure_report` there strands exactly the pilot=codex PR-creation
+    // failure this template exists to fix.
+    assert_sender_parameterized(
+        ".claude-plugin/prompts/collab-turn-submit.md",
+        &[
+            "collab_send(sender=\"$SENDER\", topic=\"final_review\",",
+            "collab_send(sender=\"$SENDER\", topic=\"final\",",
+            "collab_send(sender=\"$SENDER\",\n  topic=\"failure_report\",\n  \
+             content=<JSON {\"coding_failure\":\"pr_create_failed:",
+            "collab_send(sender=\"$SENDER\",\n  topic=\"failure_report\", content=<JSON \
+             {\"coding_failure\":\n  \"approved_artifact_unfetchable:",
+        ],
+    );
+}
+
+/// `collab-turn-task-list.md` has the same exposure for the `PlanLocked`
+/// bridge: `PublishFinal` does not reassign ownership
+/// (`collab/state_machine/mod.rs`), so under `pilot=codex` this turn is
+/// entered with `current_owner == codex` while `SubmitTaskList` requires
+/// `pilot(session)`. `PlanLocked` is not `Phase::is_coding_active()`, so a
+/// rejected send has no `failure_report` escape either — a hardcoded
+/// `sender="claude"` here dead-ends the session outright.
+#[test]
+fn collab_turn_task_list_template_is_sender_parameterized() {
+    assert_sender_parameterized(
+        ".claude-plugin/prompts/collab-turn-task-list.md",
+        &["collab_send(sender=\"$SENDER\", topic=\"task_list\","],
     );
 }
 

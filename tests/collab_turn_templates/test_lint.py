@@ -1,7 +1,10 @@
-import os, pathlib, shutil, subprocess, sys
+import os, pathlib, re, shutil, subprocess, sys
+
+import pytest
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
 LINT = ROOT / "scripts" / "check_collab_turn_templates.py"
+MARK = "MUTATED-BY-TEST"
 
 
 def run(extra_env=None):
@@ -13,29 +16,123 @@ def run(extra_env=None):
 
 
 def copy_fixture(tmp_path):
+    """A fixture tree the lint passes cleanly on.
+
+    Every surface the lint cross-references is copied, so `test_fixture_is_green`
+    below holds and every `assert r.returncode == 1` in this file means "the
+    mutation broke it", not "the fixture was already incomplete". The fixture
+    used to omit `scripts/install-ironmem.sh` and the Rust sources, so it exited
+    1 untouched and those assertions proved nothing on their own.
+    """
     fixture = tmp_path / "repo"
-    shutil.copytree(ROOT / ".claude-plugin" / "prompts",
-                    fixture / ".claude-plugin" / "prompts")
-    shutil.copytree(ROOT / ".claude-plugin" / "commands",
-                    fixture / ".claude-plugin" / "commands")
-    shutil.copytree(ROOT / ".codex-plugin" / "prompts",
-                    fixture / ".codex-plugin" / "prompts")
-    # Without this the Codex-side command checks never run in any fixture test,
-    # which is how ~22 per-prompt contract pins sat unexercised behind
-    # `if not CODEX_COMMAND.exists()`.
-    shutil.copytree(ROOT / ".codex-plugin" / "commands",
-                    fixture / ".codex-plugin" / "commands")
+    for rel in (".claude-plugin/prompts", ".claude-plugin/commands",
+                # Without the Codex commands dir the Codex-side command checks
+                # never run in any fixture test, which is how ~22 per-prompt
+                # contract pins sat unexercised behind
+                # `if not CODEX_COMMAND.exists()`.
+                ".codex-plugin/prompts", ".codex-plugin/commands"):
+        shutil.copytree(ROOT / rel, fixture / rel)
     (fixture / "docs").mkdir()
     shutil.copy2(ROOT / "docs" / "COLLAB.md", fixture / "docs" / "COLLAB.md")
     shutil.copy2(ROOT / "docs" / "EVALUATE_ISSUE.md", fixture / "docs" / "EVALUATE_ISSUE.md")
+    (fixture / "scripts").mkdir()
+    shutil.copy2(ROOT / "scripts" / "install-ironmem.sh",
+                 fixture / "scripts" / "install-ironmem.sh")
+    # The failure-prefix and phase-name checks derive their valid sets from
+    # the Rust sources rather than from hardcoded copies.
+    rust = pathlib.Path("crates") / "ironmem" / "src" / "collab"
+    (fixture / rust).mkdir(parents=True)
+    for name in ("mod.rs", "phase.rs"):
+        shutil.copy2(ROOT / rust / name, fixture / rust / name)
     return fixture
 
 
-def copy_phase_rs(fixture):
-    """The phase-name check derives its valid set from phase.rs."""
-    rel = pathlib.Path("crates") / "ironmem" / "src" / "collab" / "phase.rs"
-    (fixture / rel).parent.mkdir(parents=True, exist_ok=True)
-    shutil.copy2(ROOT / rel, fixture / rel)
+def mutate(path, snippet, replacement=MARK):
+    """Replace EVERY occurrence of `snippet` in `path`.
+
+    Every occurrence, not just the first: a pin whose text appears more than
+    once in its file survives a first-occurrence-only mutation, and the test
+    would then pass for the wrong reason — it would prove the lint stayed
+    green, not that it fired.
+    """
+    text = path.read_text()
+    assert snippet in text, f"target not found in {path.name}: {snippet!r}"
+    path.write_text(text.replace(snippet, replacement))
+
+
+# The lint's contract lists, duplicated here on purpose. Importing them from
+# the lint would make these tests parametrize over "whatever the lint currently
+# pins", so deleting an entry would silently shrink the sweep instead of
+# failing it. Every entry below must independently red the gate.
+CODEX_PILOT_ROUTING_SNIPPETS = [
+    "`PlanSynthesisPending` with normal Codex-pilot ownership",
+    "`PlanClaudeFinalizePending` with normal Codex-pilot ownership",
+    "`CodeReviewLocalPending` with normal Codex-pilot ownership",
+    "`CodeReviewFinalPending` with normal Codex-pilot ownership",
+]
+COMPOSE_HANDOFF_SNIPPETS = [
+    "this is a **normal compose\n      handoff**, not a dispatch failure",
+    "`$TOPIC=final`,\n        `$ARTIFACT_REF=<drawer_id>`, and\n"
+    "        `$SENDER=<collab_status.current_owner>`.",
+    "`$TOPIC=final_review`, `$ARTIFACT_REF=<drawer_id>`, and\n"
+    "        `$SENDER=<collab_status.current_owner>`.",
+    "Do\n      not re-dispatch the compose prompt, and do not emit\n      `codex_dispatch_failed:`",
+]
+TASK_LIST_BRIDGE_SNIPPETS = [
+    "`collab-turn-task-list.md` once (mechanical/sonnet) with\n"
+    "`$SENDER=<collab_status.current_owner>`.",
+    "dispatch `collab-turn-task-list.md`\n   (mechanical/sonnet) with "
+    "`$SENDER=<collab_status.current_owner>`.",
+    "it\n   must never be hardcoded to `\"claude\"`",
+]
+PLANNING_DISPATCH_FAILURE_SNIPPETS = [
+    "**Coding-active phases only** (`CodeImplementPending`,",
+    "**Planning phases** (`PlanParallelDrafts`, `PlanSynthesisPending`,",
+    "on `Phase::is_coding_active()`, so it rejects the report as\n"
+    "        `WrongPhase` and conditions 2 and 3 are unreachable.",
+    "**Planning phases:** as in condition 5, `failure_report` is rejected",
+]
+DOC_PR_BASE_SNIPPETS = [
+    "does **not** require that branch to contain `base_sha`",
+    "pre-range commits in the PR body",
+]
+DOC_PILOT_SUBMIT_SNIPPETS = [
+    "$SENDER` where that template uses",
+]
+SUBMIT_TEMPLATE_SNIPPETS = [
+    "parse the artifact JSON as",
+    "gh pr create --base <base_branch>",
+    'collab_send(sender="$SENDER", topic="final_review",',
+    'collab_send(sender="$SENDER", topic="final",',
+    'collab_send(sender="$SENDER",\n  topic="failure_report",\n'
+    '  content=<JSON {"coding_failure":"pr_create_failed:',
+    'collab_send(sender="$SENDER",\n  topic="failure_report", content=<JSON'
+    ' {"coding_failure":\n  "approved_artifact_unfetchable:',
+    'Verify `$SENDER` against `collab_status.current_owner`',
+    'MUST NOT be\n   substituted with your own identity',
+    'may\n     legitimately be the recovery owner rather than the pilot',
+    'equal `current_owner`, ABORT — do not send anything — and report the',
+]
+TASK_LIST_TEMPLATE_SNIPPETS = [
+    "Timebox: <=20 minutes",
+    "more than 10 tasks",
+    "PlanLocked is pre-coding",
+    "plan_file_path",
+    'collab_send(sender="$SENDER", topic="task_list",',
+    'Verify `$SENDER` against `collab_status.current_owner`',
+    'MUST NOT be\n   substituted with your own identity',
+    'equal `current_owner`, ABORT — do not send anything — and report the',
+    'always the pilot, which under `pilot == "codex"` is `codex`',
+]
+
+
+def test_fixture_is_green(tmp_path):
+    # The premise every `assert r.returncode == 1` below depends on.
+    fixture = copy_fixture(tmp_path)
+
+    r = run({"COLLAB_LINT_ROOT": str(fixture)})
+
+    assert r.returncode == 0, f"unmutated fixture must lint clean:\n{r.stdout}\n{r.stderr}"
 
 
 def test_lint_passes_on_repo():
@@ -283,10 +380,8 @@ def test_lint_requires_claude_copilot_templates(tmp_path):
 
 def test_lint_requires_installer_to_cover_every_template(tmp_path):
     fixture = copy_fixture(tmp_path)
-    scripts = fixture / "scripts"
-    scripts.mkdir()
-    installer = ROOT / "scripts" / "install-ironmem.sh"
-    (scripts / "install-ironmem.sh").write_text(
+    installer = fixture / "scripts" / "install-ironmem.sh"
+    installer.write_text(
         installer.read_text().replace("  collab-turn-plan-review\n", "", 1))
 
     r = run({"COLLAB_LINT_ROOT": str(fixture)})
@@ -300,7 +395,6 @@ def test_lint_rejects_a_precondition_naming_a_rust_variant(tmp_path):
     # Rust variant of a genericized phase fails closed on every dispatch. The
     # valid set is parsed out of phase.rs, so the fixture needs that file.
     fixture = copy_fixture(tmp_path)
-    copy_phase_rs(fixture)
     template = fixture / ".claude-plugin" / "prompts" / "collab-turn-plan-review.md"
     template.write_text(template.read_text().replace(
         "preconditions: phase == PlanCodexReviewPending",
@@ -322,7 +416,6 @@ def test_lint_rejects_a_rust_variant_in_the_template_body(tmp_path):
     # frontmatter clean AND still satisfies the "PlanCodexReviewPending"
     # snippet pin, so only a whole-file scan catches it.
     fixture = copy_fixture(tmp_path)
-    copy_phase_rs(fixture)
     template = fixture / ".claude-plugin" / "prompts" / "collab-turn-plan-review.md"
     text = template.read_text()
     body_ref = "verify\n   `phase == PlanCodexReviewPending` (the wire name for this turn"
@@ -345,7 +438,6 @@ def test_lint_rejects_a_rust_variant_in_the_template_body(tmp_path):
 
 def test_lint_rejects_a_prose_precondition_naming_no_phase(tmp_path):
     fixture = copy_fixture(tmp_path)
-    copy_phase_rs(fixture)
     template = fixture / ".claude-plugin" / "prompts" / "collab-turn-task-list.md"
     template.write_text(template.read_text().replace(
         "preconditions: phase == PlanLocked,", "preconditions: phase is PlanLocked,", 1))
@@ -418,7 +510,6 @@ def test_lint_rejects_a_stale_phase_name_in_a_codex_prompt(tmp_path):
     # phase names were compared against hardcoded literals in the lint that
     # rotted in lockstep with the prompts.
     fixture = copy_fixture(tmp_path)
-    copy_phase_rs(fixture)
     prompt = fixture / ".codex-plugin" / "prompts" / "collab-review-local.md"
     text = prompt.read_text()
     guard = "if phase is not `CodeReviewLocalPending`"
@@ -438,7 +529,6 @@ def test_lint_rejects_a_codex_prompt_whose_phase_guard_vanished(tmp_path):
     # A prompt that drops or reformats its guard must fail loudly rather than
     # become silently unchecked.
     fixture = copy_fixture(tmp_path)
-    copy_phase_rs(fixture)
     prompt = fixture / ".codex-plugin" / "prompts" / "collab-plan-finalize.md"
     text = prompt.read_text()
     mutated = (text.replace("prompt is only for `PlanClaudeFinalizePending`",
@@ -557,11 +647,13 @@ def test_lint_catches_dispatch_row_missing_current_owner_source(tmp_path):
 
 
 def test_lint_rejects_a_pilot_only_sender_derivation_in_dispatch_row(tmp_path):
-    # This is the pilot=codex-yields-sender=codex routing assertion: if the
-    # CodeReviewFinalPending row regresses to deriving $SENDER directly from
-    # `pilot` (bypassing the recovery-owner substitution), a recovery
-    # completion under a non-pilot current_owner would dispatch the wrong
-    # sender identity. PILOT_ONLY_SENDER_RE must catch this.
+    # Mutates the CodeReviewFinalPending row's $SENDER derivation to a
+    # pilot-only form and asserts the lint's diagnostic for it. It proves the
+    # gate, not the routing itself: nothing here runs a session or observes a
+    # send. If the row regresses this way, the recovery-owner substitution
+    # stops applying and a recovery completion under a non-pilot current_owner
+    # dispatches the wrong sender identity — PILOT_ONLY_SENDER_RE must catch
+    # it.
     fixture = copy_fixture(tmp_path)
     cmd = fixture / ".claude-plugin" / "commands" / "collab.md"
     text = cmd.read_text()
@@ -606,48 +698,303 @@ def test_lint_catches_dispatch_row_with_recovery_owner_clause_removed(tmp_path):
         in r.stdout
 
 
-def test_lint_catches_missing_codex_pilot_compose_route(tmp_path):
+def test_lint_catches_a_dispatch_row_that_negates_the_live_recovery_case(tmp_path):
+    # The negation the phrase-search could not distinguish from the real
+    # thing: `CodeReviewFinalPending` IS `is_coding_active()`, so the
+    # recovery-owner substitution is live for it. A row rewritten to say the
+    # substitution does not apply keeps every "recovery owner" word on the
+    # line and keeps the `$SENDER=<collab_status.current_owner>` pin intact.
     fixture = copy_fixture(tmp_path)
-    command = fixture / ".codex-plugin" / "commands" / "collab.md"
-    text = command.read_text()
-    route = "`CodeReviewFinalPending` with normal Codex-pilot ownership"
-    assert route in text
-    command.write_text(text.replace(route, "`CodeReviewFinalPending`", 1))
+    cmd = fixture / ".claude-plugin" / "commands" / "collab.md"
+    text = cmd.read_text()
+    old_row = next(l for l in text.splitlines()
+                   if l.startswith("| `CodeReviewFinalPending` |")
+                   and "collab-turn-submit.md" in l)
+    new_row = old_row.replace(
+        "`current_owner` may instead be the recovery owner per the recovery override",
+        "the recovery-owner substitution does **not** apply to this phase; "
+        "`current_owner`", 1)
+    assert new_row != old_row, "recovery-owner clause not found to mutate"
+    assert "$SENDER=<collab_status.current_owner>" in new_row
+    assert re.search(r"recovery[-\s]owner", new_row), \
+        "the mutation must keep the phrase — that is all the old check saw"
+    cmd.write_text(text.replace(old_row, new_row, 1))
+
+    r = run({"COLLAB_LINT_ROOT": str(fixture)})
+
+    assert r.returncode == 1
+    assert ("collab.md: CodeReviewFinalPending row must not disclaim the "
+            "recovery-owner substitution") in r.stdout
+
+
+def test_lint_catches_a_dispatch_row_lookup_pointing_at_the_wrong_table(tmp_path):
+    # Two lines start with each audited row prefix — the phase-action row and
+    # the Codex tuning-matrix row. The audit must assert how many it expects
+    # and pick its row by a second column, not take whichever comes first.
+    fixture = copy_fixture(tmp_path)
+    cmd = fixture / ".claude-plugin" / "commands" / "collab.md"
+    text = cmd.read_text()
+    matrix_row = next(l for l in text.splitlines()
+                      if l.startswith("| `PlanClaudeFinalizePending` |")
+                      and "collab-plan-finalize.md" in l)
+    cmd.write_text(text.replace(matrix_row + "\n", ""))
+
+    r = run({"COLLAB_LINT_ROOT": str(fixture)})
+
+    assert r.returncode == 1
+    assert ("collab.md: expected exactly 2 lines starting with "
+            "'| `PlanClaudeFinalizePending` |', found 1") in r.stdout
+
+
+@pytest.mark.parametrize("snippet", TASK_LIST_BRIDGE_SNIPPETS)
+def test_lint_requires_every_task_list_bridge_sender_pin(tmp_path, snippet):
+    # ITEM 7: the PlanLocked bridge passes `$SENDER` to a worker that must
+    # send as the pilot (`codex` under pilot=codex), and the bridge is a
+    # numbered list item, not a table row, so the row helper never saw it.
+    fixture = copy_fixture(tmp_path)
+    mutate(fixture / ".claude-plugin" / "commands" / "collab.md", snippet)
+
+    r = run({"COLLAB_LINT_ROOT": str(fixture)})
+
+    assert r.returncode == 1
+    assert (".claude-plugin/commands/collab.md: missing PlanLocked task-list "
+            f"bridge sender contract {snippet!r}") in r.stdout
+
+
+@pytest.mark.parametrize("snippet", PLANNING_DISPATCH_FAILURE_SNIPPETS)
+def test_lint_requires_planning_phase_dispatch_failure_guard(tmp_path, snippet):
+    # Routing Codex into PlanSynthesisPending/PlanClaudeFinalizePending made
+    # the wait loop's `codex_dispatch_failed:` remedy reachable in phases the
+    # server rejects it in: `FailureReport` is gated on
+    # `Phase::is_coding_active()`, which covers only the four `Code*` phases.
+    # Dropping the phase split sends the dispatcher into a rejected send with
+    # no reachable exit.
+    fixture = copy_fixture(tmp_path)
+    mutate(fixture / ".claude-plugin" / "commands" / "collab.md", snippet)
+
+    r = run({"COLLAB_LINT_ROOT": str(fixture)})
+
+    assert r.returncode == 1
+    assert (".claude-plugin/commands/collab.md: missing planning-phase "
+            f"dispatch-failure contract {snippet!r}") in r.stdout
+
+
+@pytest.mark.parametrize("snippet", CODEX_PILOT_ROUTING_SNIPPETS)
+def test_lint_catches_missing_codex_pilot_compose_route(tmp_path, snippet):
+    # Every entry, not one arbitrary member: the surviving members are the
+    # contract data, and that is what regresses.
+    fixture = copy_fixture(tmp_path)
+    mutate(fixture / ".codex-plugin" / "commands" / "collab.md", snippet)
 
     r = run({"COLLAB_LINT_ROOT": str(fixture)})
 
     assert r.returncode == 1
     assert (".codex-plugin/commands/collab.md: missing Codex-pilot routing "
-            "contract '`CodeReviewFinalPending` with normal Codex-pilot ownership'") \
-        in r.stdout
+            f"contract {snippet!r}") in r.stdout
 
 
-def test_lint_catches_missing_codex_pilot_compose_handoff(tmp_path):
+def test_lint_catches_a_missing_codex_command_file(tmp_path):
+    # The `not CODEX_COMMAND.exists()` branch, which no fixture reached.
     fixture = copy_fixture(tmp_path)
-    command = fixture / ".claude-plugin" / "commands" / "collab.md"
-    text = command.read_text()
-    handoff = "this is a **normal compose\n      handoff**, not a dispatch failure"
-    assert handoff in text
-    command.write_text(text.replace(handoff, "this is a dispatch failure", 1))
+    shutil.rmtree(fixture / ".codex-plugin" / "commands")
+
+    r = run({"COLLAB_LINT_ROOT": str(fixture)})
+
+    assert r.returncode == 1
+    assert (".codex-plugin/commands/collab.md: missing Codex-pilot routing "
+            "contract") in r.stdout
+
+
+@pytest.mark.parametrize("snippet", COMPOSE_HANDOFF_SNIPPETS)
+def test_lint_catches_missing_codex_pilot_compose_handoff(tmp_path, snippet):
+    # Includes the two bullet-bound `$SENDER` pins. The bare literal
+    # `$SENDER=<collab_status.current_owner>` occurs six times in collab.md,
+    # so rewriting either bullet to `$SENDER=<pilot>`, to `$SENDER=claude`, or
+    # deleting its clause used to leave this check green.
+    fixture = copy_fixture(tmp_path)
+    mutate(fixture / ".claude-plugin" / "commands" / "collab.md", snippet)
 
     r = run({"COLLAB_LINT_ROOT": str(fixture)})
 
     assert r.returncode == 1
     assert (".claude-plugin/commands/collab.md: missing Codex-pilot compose "
-            "handoff contract 'this is a **normal compose\\n      handoff**, "
-            "not a dispatch failure'") in r.stdout
+            f"handoff contract {snippet!r}") in r.stdout
 
 
-def test_lint_catches_stale_docs_pr_base_containment_rule(tmp_path):
+@pytest.mark.parametrize("replacement", ["<pilot>", "claude"])
+@pytest.mark.parametrize("topic", ["final", "final_review"])
+def test_lint_catches_a_compose_handoff_bullet_losing_current_owner(
+        tmp_path, topic, replacement):
+    # The regression shape itself, not just the literal-pin deletion: each
+    # compose-handoff bullet's own `$SENDER` clause rewritten in place, with
+    # the dispatch-table rows left untouched.
     fixture = copy_fixture(tmp_path)
-    docs = fixture / "docs" / "COLLAB.md"
-    text = docs.read_text()
-    contract = "does **not** require that branch to contain `base_sha`"
-    assert contract in text
-    docs.write_text(text.replace(contract, "requires base_sha containment", 1))
+    cmd = fixture / ".claude-plugin" / "commands" / "collab.md"
+    bullet = next(s for s in COMPOSE_HANDOFF_SNIPPETS
+                  if s.startswith(f"`$TOPIC={topic}`"))
+    mutate(cmd, bullet,
+           bullet.replace("<collab_status.current_owner>", replacement))
+    assert "`$SENDER=<collab_status.current_owner>`" in cmd.read_text(), \
+        "the dispatch-table rows must stay intact — they are the decoys"
 
     r = run({"COLLAB_LINT_ROOT": str(fixture)})
 
     assert r.returncode == 1
-    assert ("docs/COLLAB.md: missing pilot-submit routing contract "
-            "'does **not** require that branch to contain `base_sha`'") in r.stdout
+    assert (".claude-plugin/commands/collab.md: missing Codex-pilot compose "
+            f"handoff contract {bullet!r}") in r.stdout
+
+
+def test_lint_rejects_a_pilot_only_sender_derivation_anywhere_in_collab_md(tmp_path):
+    # PILOT_ONLY_SENDER_RE used to run only over the two matched dispatch
+    # rows, so a pilot-only derivation anywhere else in the file — the
+    # tuning matrix, the compose bullets, the bridge — was invisible.
+    fixture = copy_fixture(tmp_path)
+    cmd = fixture / ".claude-plugin" / "commands" / "collab.md"
+    row = next(l for l in cmd.read_text().splitlines()
+               if l.startswith("| `CodeReviewFinalPending` |")
+               and "collab-final-review.md" in l)
+    mutate(cmd, row, row + "\n<!-- $SENDER=<pilot> -->")
+
+    r = run({"COLLAB_LINT_ROOT": str(fixture)})
+
+    assert r.returncode == 1
+    assert "$SENDER must never be derived directly from `pilot`" in r.stdout
+
+
+@pytest.mark.parametrize("snippet", DOC_PR_BASE_SNIPPETS)
+def test_lint_catches_stale_docs_pr_base_containment_rule(tmp_path, snippet):
+    fixture = copy_fixture(tmp_path)
+    mutate(fixture / "docs" / "COLLAB.md", snippet)
+
+    r = run({"COLLAB_LINT_ROOT": str(fixture)})
+
+    assert r.returncode == 1
+    assert (f"docs/COLLAB.md: missing PR-base resolution contract {snippet!r}") \
+        in r.stdout
+
+
+@pytest.mark.parametrize("snippet", DOC_PILOT_SUBMIT_SNIPPETS)
+def test_lint_catches_missing_docs_pilot_submit_contract(tmp_path, snippet):
+    fixture = copy_fixture(tmp_path)
+    mutate(fixture / "docs" / "COLLAB.md", snippet)
+
+    r = run({"COLLAB_LINT_ROOT": str(fixture)})
+
+    assert r.returncode == 1
+    assert (f"docs/COLLAB.md: missing pilot-submit routing contract {snippet!r}") \
+        in r.stdout
+
+
+@pytest.mark.parametrize("snippet", SUBMIT_TEMPLATE_SNIPPETS)
+def test_lint_requires_every_submit_template_pin(tmp_path, snippet):
+    # The whole REQUIRED_TEMPLATE_SNIPPETS["collab-turn-submit.md"] block —
+    # all four call-site pins and all four guard-prose pins — could be
+    # deleted with the suite still fully green. Each entry is now proven.
+    fixture = copy_fixture(tmp_path)
+    mutate(fixture / ".claude-plugin" / "prompts" / "collab-turn-submit.md",
+           snippet)
+
+    r = run({"COLLAB_LINT_ROOT": str(fixture)})
+
+    assert r.returncode == 1
+    assert (f"collab-turn-submit.md: missing required contract snippet "
+            f"{snippet!r}") in r.stdout
+
+
+@pytest.mark.parametrize("snippet", TASK_LIST_TEMPLATE_SNIPPETS)
+def test_lint_requires_every_task_list_template_pin(tmp_path, snippet):
+    fixture = copy_fixture(tmp_path)
+    mutate(fixture / ".claude-plugin" / "prompts" / "collab-turn-task-list.md",
+           snippet)
+
+    r = run({"COLLAB_LINT_ROOT": str(fixture)})
+
+    assert r.returncode == 1
+    assert (f"collab-turn-task-list.md: missing required contract snippet "
+            f"{snippet!r}") in r.stdout
+
+
+def test_lint_catches_a_senderless_failure_report_send(tmp_path):
+    # ITEM 3: the `pr_create_failed` site with `sender=` dropped entirely is
+    # neither a `sender="claude"` literal nor a missing `topic=` — the pins
+    # that started at `topic="failure_report",` asserted nothing about the
+    # sender, leaving the Rust count assertion as the only gate on the one
+    # site commit 13f38b6 records as "previously missed".
+    fixture = copy_fixture(tmp_path)
+    submit = fixture / ".claude-plugin" / "prompts" / "collab-turn-submit.md"
+    mutate(submit,
+           'base-branch resolution failure, `collab_send(sender="$SENDER",\n'
+           '  topic="failure_report",',
+           'base-branch resolution failure, `collab_send(\n'
+           '  topic="failure_report",')
+
+    r = run({"COLLAB_LINT_ROOT": str(fixture)})
+
+    assert r.returncode == 1
+    assert ('collab-turn-submit.md: missing required contract snippet '
+            '\'collab_send(sender="$SENDER",\\n  topic="failure_report",\\n'
+            '  content=<JSON {"coding_failure":"pr_create_failed:\'') in r.stdout
+
+
+def test_lint_catches_the_submit_abort_directive_becoming_a_fallback(tmp_path):
+    # ITEM 2: the guard's rationale pins all keep matching when its
+    # ENFORCEMENT clause is rewritten from a hard abort into exactly the
+    # identity fallback this branch removed.
+    fixture = copy_fixture(tmp_path)
+    submit = fixture / ".claude-plugin" / "prompts" / "collab-turn-submit.md"
+    mutate(submit,
+           "equal `current_owner`, ABORT — do not send anything — and report the\n"
+           "   mismatch on the verdict's blocker line.",
+           "equal `current_owner`, fall back to `current_owner` and continue\n"
+           "   with the send.")
+    text = submit.read_text()
+    for surviving in ("Verify `$SENDER` against `collab_status.current_owner`",
+                      "MUST NOT be\n   substituted with your own identity",
+                      "may\n     legitimately be the recovery owner rather than the pilot"):
+        assert surviving in text, \
+            "the rationale pins must survive — they are why this mutation used to pass"
+    assert text.count('sender="$SENDER"') == 4, \
+        "the Rust call-site count must survive too"
+
+    r = run({"COLLAB_LINT_ROOT": str(fixture)})
+
+    assert r.returncode == 1
+    assert ("collab-turn-submit.md: missing required contract snippet 'equal "
+            "`current_owner`, ABORT — do not send anything — and report the'") \
+        in r.stdout
+
+
+@pytest.mark.parametrize("hardcoded", ['sender="claude"', "sender='claude'",
+                                       "sender=claude", 'sender="Claude"'])
+@pytest.mark.parametrize("template", ["collab-turn-submit.md",
+                                      "collab-turn-task-list.md"])
+def test_lint_rejects_any_hardcoded_claude_sender(tmp_path, template, hardcoded):
+    # The literal-only FORBIDDEN pin let `sender='claude'`, `sender=claude`
+    # and `sender="Claude"` through — all the same bug.
+    fixture = copy_fixture(tmp_path)
+    path = fixture / ".claude-plugin" / "prompts" / template
+    path.write_text(path.read_text() + f"\n`collab_send({hardcoded}, ...)`\n")
+
+    r = run({"COLLAB_LINT_ROOT": str(fixture)})
+
+    assert r.returncode == 1
+    assert f"{template}: hardcoded sender identity" in r.stdout
+
+
+def test_lint_catches_the_task_list_send_reverting_to_claude(tmp_path):
+    # ITEM 7's headline regression: PlanLocked is entered with
+    # `current_owner == codex` under pilot=codex, and is not
+    # `is_coding_active()`, so a rejected send has no failure_report escape.
+    fixture = copy_fixture(tmp_path)
+    task_list = (fixture / ".claude-plugin" / "prompts" /
+                 "collab-turn-task-list.md")
+    mutate(task_list, 'collab_send(sender="$SENDER", topic="task_list",',
+           'collab_send(sender="claude", topic="task_list",')
+
+    r = run({"COLLAB_LINT_ROOT": str(fixture)})
+
+    assert r.returncode == 1
+    assert ('collab-turn-task-list.md: missing required contract snippet '
+            '\'collab_send(sender="$SENDER", topic="task_list",\'') in r.stdout
+    assert ('collab-turn-task-list.md: forbidden stale direct-body claim '
+            '\'sender="claude"\'') in r.stdout

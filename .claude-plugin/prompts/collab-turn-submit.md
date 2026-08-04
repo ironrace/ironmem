@@ -102,3 +102,10 @@ result: $TOPIC sent
 ref: <pr_url | none>
 blocker: <one line | none>
 ```
+If you sent a `failure_report` instead of the protocol topic — the
+`pr_create_failed:` path or the `approved_artifact_unfetchable:` path above —
+report `result: failure_report sent (<prefix>)`. If a state-discovery check
+failed (the `$SENDER` mismatch/absence ABORT) or the artifact was unfetchable
+in a phase that rejects `failure_report`, and you therefore sent nothing at
+all, report `result: $TOPIC not sent` with `ref: none` — never report a send
+that did not happen.

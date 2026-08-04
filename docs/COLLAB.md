@@ -8,12 +8,12 @@ MCP server.
   Codex review pass → the pilot finalizes the approved task plan →
   `PlanLocked`.
 - **v3 (coding)**: post-`PlanLocked` task list → **batch implementation
-  phase** (Claude publishes `task_list` from the approved task
+  phase** (the pilot publishes `task_list` from the approved task
   markdown, then the
   session's `implementer` runs per-task subagents via
   `iron-build` and signals completion with
   `implementation_done`) → global 3-phase linear flow (Codex review plus
-  parallel fix fan-out → Claude local audit plus parallel fix fan-out →
+  parallel fix fan-out → the pilot's local audit plus parallel fix fan-out →
   the pilot finalizes with PR URL) → `CodingComplete` / `CodingFailed`. Per-task
   implementation is single-agent on the selected implementer's side; Codex
   always owns the first branch-scope review pass.
@@ -67,7 +67,7 @@ IronRace Collab v1 is a **bounded planning protocol**, not an open-ended
 multi-agent framework. Exactly one plan is produced per session, with:
 
 1. two independent first drafts (Claude + Codex, blind to each other)
-2. one canonical synthesis by Claude
+2. one canonical synthesis by the pilot
 3. one review pass by Codex
 4. one final approved task plan sent by the pilot (Claude still has the last
    word — it always drives the Plan Mode approval gate, regardless of pilot)
@@ -266,14 +266,17 @@ change.
 server-side, not by convention.
 
 Exit: once both draft hashes are present → `PlanSynthesisPending`, owner
-`claude`.
+the pilot (`current_owner`).
 
 ### `PlanSynthesisPending`
 
-Owner: `claude`. Claude sends one `canonical` message containing the merged
-plan.
+Owner: the pilot (`current_owner`). The pilot sends one `canonical` message
+containing the merged plan: `collab-turn-plan-synthesis.md` when
+`pilot == "claude"`, or Claude's loop triggers Codex's equivalent turn
+(`collab-plan-synthesis.md`, which sends `canonical` itself) when
+`pilot == "codex"`.
 
-This phase is autonomous. Claude does not enter Plan Mode and does not ask for
+This phase is autonomous. Neither agent enters Plan Mode and neither asks for
 approval here; the single planning gate is the final approved task plan at
 `PlanClaudeFinalizePending`.
 
@@ -317,7 +320,8 @@ Plan is frozen; `final_plan_hash` is set. This is terminal for `wait_my_turn`
 **only while `task_list` has not yet been submitted**. Two transitions out:
 
 - `collab_end` — abandon before coding starts (last point this is valid).
-- `collab_send` with `topic=task_list` from `claude` — enter the v3 coding
+- `collab_send` with `topic=task_list` from the pilot (`current_owner`) —
+  enter the v3 coding
   loop. The state machine verifies `plan_hash == final_plan_hash` and that the
   task list contains 1–10 tasks; the session stays active and the terminal set for
   `wait_my_turn` flips to `{CodingComplete, CodingFailed}`.
@@ -347,7 +351,7 @@ session's current `implementer` field:
   commits). Claude emits `implementation_done`.
 - **`implementer == "codex"`** (opt-in via
   `/collab start --implementer=codex` or
-  `/collab join --implementer=codex <session_id>`): Claude still publishes
+  `/collab join --implementer=codex <session_id>`): the pilot still publishes
   `task_list` from the approved task markdown. Then Claude dispatches Codex via
   background `codex exec` (per Implementation Notes § Background
   `codex exec` dispatch; `mcp__codex__codex` is the fallback when
@@ -363,7 +367,7 @@ by the implementer after each task boundary. After `implementation_done`,
 the phase advances to `CodeReviewFixGlobalPending` with **Codex** as
 owner regardless of who implemented — Codex runs `/pr-review-toolkit:review-pr`
 on the raw post-implementation diff first (no Claude pre-clean) and
-uses parallel fix subagents for confirmed, partitionable findings. Claude's
+uses parallel fix subagents for confirmed, partitionable findings. The pilot's
 `review_local` then audits Codex's commits at `CodeReviewLocalPending`
 (full `/ultrareview-local` unless reduced-mode criteria apply) and uses the
 same fix fan-out model for confirmed audit findings.
@@ -459,20 +463,20 @@ and does not query GitHub by default. A `gh pr list --head <branch>` probe is
 opt-in only when the controller reports boundary uncertainty or the worker
 output mentions PR creation or the *Finishing the Branch* step.
 
-### Global review, 3-phase linear (Codex first; Claude audits after)
+### Global review, 3-phase linear (Codex first; the pilot audits after)
 
 After `implementation_done`, the session enters a 3-turn linear review at
 branch scope. Codex runs `/pr-review-toolkit:review-pr` on the raw
 post-implementation diff first, then fans confirmed findings out to
-parallel fix subagents where they can be safely partitioned; Claude then
+parallel fix subagents where they can be safely partitioned; the pilot then
 runs the `review_local` audit of Codex's commits and fans confirmed audit
-findings out the same way; the pilot owns the final protocol identity on the
-final turn.
+findings out the same way; the pilot also owns the final protocol identity on
+the final turn.
 
 | Phase | Owner | Event | Next |
 |---|---|---|---|
 | `CodeReviewFixGlobalPending` | `codex` | `CodeReviewFixGlobal{head_sha}` — Codex ran `/pr-review-toolkit:review-pr` on the full diff AS-IS (no Claude pre-clean), partitioned confirmed findings, used parallel fix subagents where safe, merged/cherry-picked the fixes, then pushed | `CodeReviewLocalPending` |
-| `CodeReviewLocalPending` | `claude` | `ReviewLocal{head_sha}` — Claude ran full or reduced `review_local` audit of Codex's commits + issues both agents missed, partitioned confirmed findings, used parallel fix subagents where safe, merged/cherry-picked the fixes, then pushed | `CodeReviewFinalPending` |
+| `CodeReviewLocalPending` | `pilot` | `ReviewLocal{head_sha}` — the pilot ran full or reduced `review_local` audit of Codex's commits + issues both agents missed, partitioned confirmed findings, used parallel fix subagents where safe, merged/cherry-picked the fixes, then pushed | `CodeReviewFinalPending` |
 | `CodeReviewFinalPending` | `pilot` | `FinalReview{head_sha, pr_url}` — the pilot owns the event identity; in normal flow the Claude submit worker opens the PR and sends the URL under that identity | `CodingComplete` (terminal) |
 
 The `Owner` column is the normal flow. Under the delegated-completion
@@ -498,14 +502,14 @@ branch diff plus nearby plan docs under `docs/iron/plans/`.
 The no-op handshake turn is collapsed: `head_sha` is supplied at session
 creation time. From there, the surviving flow follows the new ordering:
 Codex `review_fix_global` (`/pr-review-toolkit:review-pr` plus parallel
-fix fan-out for confirmed findings on the raw diff) → Claude `review_local`
-(audit Codex's commits plus parallel fix fan-out) → the pilot's
-`final_review` (PR creation).
+fix fan-out for confirmed findings on the raw diff) → the pilot's
+`review_local` (audit Codex's commits plus parallel fix fan-out) → the
+pilot's `final_review` (PR creation).
 
 | Phase | Owner | Event | Next |
 |---|---|---|---|
 | `CodeReviewFixGlobalPending` | `codex` | `CodeReviewFixGlobal{head_sha}` | `CodeReviewLocalPending` |
-| `CodeReviewLocalPending` | `claude` | `ReviewLocal{head_sha}` | `CodeReviewFinalPending` |
+| `CodeReviewLocalPending` | `pilot` | `ReviewLocal{head_sha}` | `CodeReviewFinalPending` |
 | `CodeReviewFinalPending` | `pilot` | `FinalReview{head_sha, pr_url}` | `CodingComplete` |
 
 Invariants that still apply:
@@ -1310,10 +1314,10 @@ orchestrator from steering the reviewer's conclusion.
 
 | Topic | Sender | Payload | Notes |
 |---|---|---|---|
-| `task_list` | `claude` | `{"plan_hash","base_sha","head_sha","plan_file_path"?,"execution_mode"?,"tasks":[{"id","title","timebox_minutes","acceptance":[...]}]}` | `plan_hash` must equal `final_plan_hash`; `tasks` must contain **1–10** strictly ordered entries; each task requires `timebox_minutes <= 20` and ≥1 `acceptance` entry. An 11+ task issue must be split into child issues before this message is sent. Optional `plan_file_path` (repo-relative; no leading `/`; no `..` segments) points at the approved task markdown driving subagent execution. Optional `execution_mode` — see below. |
+| `task_list` | `pilot` | `{"plan_hash","base_sha","head_sha","plan_file_path"?,"execution_mode"?,"tasks":[{"id","title","timebox_minutes","acceptance":[...]}]}` | `plan_hash` must equal `final_plan_hash`; `tasks` must contain **1–10** strictly ordered entries; each task requires `timebox_minutes <= 20` and ≥1 `acceptance` entry. An 11+ task issue must be split into child issues before this message is sent. Optional `plan_file_path` (repo-relative; no leading `/`; no `..` segments) points at the approved task markdown driving subagent execution. Optional `execution_mode` — see below. |
 | `implementation_done` | `claude` or `codex` (per session `implementer`) | `{"head_sha"}` | In `CodeImplementPending` only. Fired once after the subagent batch completes and gates pass. Carries only `head_sha` — no prose, no subagent notes. |
 | `review_fix_global` | `codex` (or `claude` as recovery owner under the delegated-completion override) | `{"head_sha"}` | In `CodeReviewFixGlobalPending` only. Codex ran `/pr-review-toolkit:review-pr` on the raw post-implementation diff (no Claude pre-clean), used parallel fix subagents for confirmed partitionable findings, merged/cherry-picked the resulting fixes, and pushed the branch-level fix commit(s). |
-| `review_local` | `claude` (or `codex` as recovery owner under the delegated-completion override) | `{"head_sha"}` | In `CodeReviewLocalPending` only. Claude ran full or reduced audit of Codex's `review_fix_global` commits + caught issues both agents missed, used parallel fix subagents for confirmed partitionable findings, merged/cherry-picked the resulting fixes, and pushed. |
+| `review_local` | `pilot` (or the counterpart agent as recovery owner under the delegated-completion override) | `{"head_sha"}` | In `CodeReviewLocalPending` only. The pilot ran full or reduced audit of Codex's `review_fix_global` commits + caught issues both agents missed, used parallel fix subagents for confirmed partitionable findings, merged/cherry-picked the resulting fixes, and pushed. |
 | `final_review` | `pilot` (or the recovery owner under the delegated-completion override) | `{"head_sha","pr_url"}` | In `CodeReviewFinalPending` only. In normal flow the Claude submit worker opens the PR under the turn owner's identity; a Codex recovery owner opens it directly. The event carries the URL and advances directly to `CodingComplete`. `pr_url` must start with `https://` and be ≤2048 chars. |
 | `failure_report` | current owner; off-turn `branch_drift:` may come from either agent; off-turn `codex_dispatch_failed:` may come only from Claude against a Codex-owned turn | `{"coding_failure":"<reason>"}` | Valid in any coding-active phase. Classifies **Tooling** (six recoverable prefixes, stays in-phase, `current_owner` flips) or **Terminal** (everything else — including `branch_drift:` — transitions to `CodingFailed`) — see "Failure + terminal" above. |
 
@@ -1377,7 +1381,7 @@ exactly one event variant — there is no phase overloading.
 | `PlanLocked` | `task_list` | v1 → v3 hand-off |
 | `CodeImplementPending` | `implementation_done`, `failure_report` | v3 — single implementer turn after subagent batch |
 | `CodeReviewFixGlobalPending` | `review_fix_global`, `failure_report` | v3 — Codex runs `/pr-review-toolkit:review-pr` on the raw post-implementation diff, then fans confirmed fixes out to subagents |
-| `CodeReviewLocalPending` | `review_local`, `failure_report` | v3 — Claude audits Codex's commits, then fans confirmed fixes out to subagents |
+| `CodeReviewLocalPending` | `review_local`, `failure_report` | v3 — the pilot audits Codex's commits, then fans confirmed fixes out to subagents |
 | `CodeReviewFinalPending` | `final_review`, `failure_report` | v3 — the pilot owns the final-review sender identity; the Claude submit worker opens the PR normally, while a recovery owner opens it directly |
 | `CodingComplete` / `CodingFailed` | *(none — terminal; only `collab_end` accepted)* | |
 
@@ -1442,11 +1446,12 @@ before each coding-active `collab_send`:
   implementer reads that one logical-keyed current drawer and resumes
   from the first unfinished task instead of relying on transcript context.
 - **Local gates** before Claude-owned code-changing turns
-  (`implementation_done` in Claude-implementer mode and `review_local`):
-  `cargo fmt --check`, `cargo clippy -D warnings`, `cargo test --workspace`.
-  In Codex-implementer mode, Codex runs its own gates before sending
-  `implementation_done`. Any failure surfaces as `failure_report`; don't hide
-  it.
+  (`implementation_done` in Claude-implementer mode, and `review_local` when
+  Claude is the pilot): `cargo fmt --check`, `cargo clippy -D warnings`,
+  `cargo test --workspace`. In Codex-implementer mode, Codex runs its own
+  gates before sending `implementation_done`; likewise under `pilot ==
+  "codex"` Codex runs its own gates before sending `review_local`. Any failure
+  surfaces as `failure_report`; don't hide it.
 - **Pushed-head proof** during `final_review`: the final-review compose worker
   does not re-run gates. It verifies a clean worktree, `HEAD == last_head_sha`,
   and local HEAD equal to the pushed upstream/origin branch head. If that proof
@@ -1479,7 +1484,10 @@ before each coding-active `collab_send`:
   cluster sequentially instead of forcing unsafe parallelism.
   `/ultrareview-local` is NOT used here — Claude may run it later in full
   `review_local` mode. Codex's judgment is expressed as commits, not prose.
-- **Audit tooling** during Claude's `review_local`: Claude first runs an
+- **Audit tooling** during the Claude-side `review_local` worker (normal flow
+  when `pilot == "claude"`; under `pilot == "codex"` Codex's
+  `collab-review-local.md` owns the equivalent audit and its own gates):
+  Claude first runs an
   overlap-mode audit. Full mode invokes `/ultrareview-local` (code-reviewer +
   security-reviewer + architect + doc-reviewer in parallel) against the
   post-`review_fix_global` head, auditing Codex's commits + catching
@@ -1516,7 +1524,7 @@ before each coding-active `collab_send`:
   to `git merge-base --is-ancestor` to distinguish a true descendant
   check from operational git failures, and only applies that validation
   when `task_list` is still unset. Both Codex's `review_fix_global` push
-  and Claude's `review_local` audit-push must descend from the prior
+  and the pilot's `review_local` audit-push must descend from the prior
   `last_head_sha`.
 - **PR creation** during `final_review`: after pushed-head proof passes, the
   Claude submit worker resolves the integration branch from the remote default,
@@ -1684,7 +1692,8 @@ The worker reads `final_plan_ref`/`final_plan_hash`, obtains
 `plan_file_path` from the reference, verifies the file's SHA-256 against the
 approved hash, parses each `### Task N:` heading into
 `{id,title,timebox_minutes,acceptance}`, and sends `task_list`. It returns a
-blocker and sends nothing if the plan file is missing or its hash differs, the
+blocker and sends nothing if `$SENDER` is absent or disagrees with
+`collab_status.current_owner`, the plan file is missing or its hash differs, the
 plan has zero or more than 10 tasks, any task is missing acceptance criteria,
 missing `Timebox: <=20 minutes`, or is sized above 20 minutes. An 11+ task plan
 must be decomposed into child issues; it must not enter coding. PlanLocked is
@@ -1722,11 +1731,17 @@ the nine protocol turns above that carry a phase — every template except
 normal flow, Claude's orchestrator loop is the one that dispatches the
 submit turn regardless of pilot (only `$SENDER` is parameterized, from
 `collab_status.current_owner`), so a Codex-side submit template would never
-be invoked there and would just rot unused. The one exception is
-`collab-recovery.md`, which handles the rare recovery override that
-delegates `CodeReviewLocalPending` or `CodeReviewFinalPending` to Codex —
-there Codex sends the completion event (including opening the PR for
-`final_review`) itself, without going through `collab-turn-submit.md`.
+be invoked there and would just rot unused.
+
+Routing through `collab-turn-submit.md` is not universal, though. Only the
+two compose turns — `collab-plan-finalize.md` and `collab-final-review.md` —
+stage an artifact and hand the send back to Claude's submit worker. Under
+normal Codex-pilot ownership, `collab-plan-synthesis.md` and
+`collab-review-local.md` send their own completion events (`canonical` and
+`review_local`) directly. `collab-recovery.md` sends directly too: it handles
+the rare recovery override that delegates `CodeReviewLocalPending` or
+`CodeReviewFinalPending` to Codex, where Codex sends the completion event
+(including opening the PR for `final_review`) itself.
 
 Separately, and unrelated to `collab-turn-submit.md`'s by-design omission:
 installed is not yet dispatchable for some of the other templates — the
@@ -1769,7 +1784,7 @@ Phase → action (v1):
 | Phase | Claude does | Codex does |
 |---|---|---|
 | `PlanParallelDrafts` | send `draft` autonomously (no Plan Mode); owner flips to `codex` | one-shot bg-exec: send `draft`, exit |
-| `PlanSynthesisPending` | synthesize `canonical` and send autonomously (no Plan Mode) | wait (not polling) |
+| `PlanSynthesisPending` | synthesize `canonical` and send autonomously (no Plan Mode) | wait (not polling), unless `pilot == "codex"`: one-shot bg-exec synthesizes and sends `canonical` via `collab-plan-synthesis.md`, then exits |
 | `PlanCodexReviewPending` | wait | one-shot bg-exec: send `review` (or `approve` shortcut), exit |
 | `PlanClaudeFinalizePending` | enter Plan Mode, get user approval for the final approved task plan, send `final` | wait, unless `pilot == "codex"`: one-shot bg-exec composes and stages the final plan via `collab-plan-finalize.md`, then exits |
 | `PlanLocked` | exit loop (or send `task_list` to start v3) | n/a |
@@ -1778,11 +1793,11 @@ Phase → action (v3):
 
 | Phase | Claude does | Codex does |
 |---|---|---|
-| `PlanLocked` (post-final) | dispatch one mechanical `collab-turn-task-list.md` worker; worker parses the approved final markdown and sends `task_list` | n/a |
+| `PlanLocked` (post-final) | dispatch one mechanical `collab-turn-task-list.md` worker with `$SENDER=<collab_status.current_owner>`; worker parses the approved final markdown and sends `task_list` as the pilot | n/a — the Claude-side worker performs the parse and send under the pilot's identity even when `pilot == "codex"` |
 | `CodeImplementPending` (implementer=claude) | dispatch `collab-turn-code-implement.md`; worker searches checkpoints, runs `iron-build`, gates, checkpoints, and sends `implementation_done{head_sha}` | wait |
 | `CodeImplementPending` (implementer=codex) | dispatch Codex via bg-exec; poll | one-shot bg-exec: search implementation checkpoints, resume/run `iron-build`, checkpoint every task boundary, emit `implementation_done{head_sha}`, exit |
 | `CodeReviewFixGlobalPending` | dispatch Codex via bg-exec; poll | one-shot bg-exec: run `/pr-review-toolkit:review-pr` on the raw post-implementation diff, partition confirmed branch-level issues, fan out independent fix subagents in temporary worktrees on unique throwaway branches, merge/cherry-pick fixes back, send `review_fix_global`, exit |
-| `CodeReviewLocalPending` | dispatch `collab-turn-review-local.md`; worker runs full or reduced `review_local` audit, partitions confirmed CRITICAL/HIGH/MEDIUM findings, fans out independent fix subagents in temporary worktrees on unique throwaway branches, merges/cherry-picks fixes back, and sends `review_local` | wait |
+| `CodeReviewLocalPending` | dispatch `collab-turn-review-local.md`; worker runs full or reduced `review_local` audit, partitions confirmed CRITICAL/HIGH/MEDIUM findings, fans out independent fix subagents in temporary worktrees on unique throwaway branches, merges/cherry-picks fixes back, and sends `review_local` | wait, unless `pilot == "codex"`: one-shot bg-exec runs the local audit, fans out its fixes, sends `review_local`, and exits |
 | `CodeReviewFinalPending` | dispatch `collab-turn-final-review.md` compose worker for pushed-head proof + PR body, then dispatch `collab-turn-submit.md` **directly** (no gate) to `gh pr create` (ready PR) and send `final_review{pr_url}` | wait, unless `pilot == "codex"`: one-shot bg-exec drafts the PR title/body and stages it via `collab-final-review.md`, then exits |
 | `CodingComplete` / `CodingFailed` | exit loop | n/a |
 
@@ -2383,9 +2398,11 @@ Scope (v1 + v3):
 - bounded planning (v1) and bounded coding loop (v3) through a single session
 - one plan → one task list → one PR per session
 - v1 planning has one Codex review round; v3 coding is strictly linear (no rounds)
-- Claude always drives the planning approval gate (v1, via Plan Mode) and
-  owns the local-audit turn after Codex's first branch-scope review in v3;
-  the final PR-creation turn (`CodeReviewFinalPending`) is owned by the pilot
+- Claude always drives the planning approval gate (v1, via Plan Mode),
+  regardless of pilot
+- the pilot owns the v3 local-audit turn after Codex's first branch-scope
+  review (`CodeReviewLocalPending`) and the final PR-creation turn
+  (`CodeReviewFinalPending`)
 - Claude runs the dispatcher loop; Codex-owned phases are one-shot
   dispatches that act autonomously and exit
 
