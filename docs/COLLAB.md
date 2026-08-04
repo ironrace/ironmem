@@ -1563,7 +1563,7 @@ before each coding-active `collab_send`:
   applicable) rather than inventing a URL. A recoverable failure report
   costs one retry attempt; a fabricated URL corrupts the record forever.
 - **Plan Mode** on Claude's side is entered before only one gate: `final`
-  (v1), where Claude produces the approved task plan. Canonical
+  (v1), where Claude presents the approved task plan for approval. Canonical
   synthesis runs autonomously. The `task_list` send mechanically parses that
   already-approved markdown; it is not an extra task-planning handoff and not a Plan
   Mode gate. The `final_review` PR creation is autonomous (no gate). Codex
@@ -1764,7 +1764,7 @@ Phase → action (v1):
 | `PlanParallelDrafts` | send `draft` autonomously (no Plan Mode); owner flips to `codex` | one-shot bg-exec: send `draft`, exit |
 | `PlanSynthesisPending` | synthesize `canonical` and send autonomously (no Plan Mode) | wait (not polling) |
 | `PlanCodexReviewPending` | wait | one-shot bg-exec: send `review` (or `approve` shortcut), exit |
-| `PlanClaudeFinalizePending` | enter Plan Mode, get user approval for the final approved task plan, send `final` | wait |
+| `PlanClaudeFinalizePending` | enter Plan Mode, get user approval for the final approved task plan, send `final` | wait, unless `pilot == "codex"`: one-shot bg-exec composes and stages the final plan via `collab-plan-finalize.md`, then exits |
 | `PlanLocked` | exit loop (or send `task_list` to start v3) | n/a |
 
 Phase → action (v3):
@@ -1776,7 +1776,7 @@ Phase → action (v3):
 | `CodeImplementPending` (implementer=codex) | dispatch Codex via bg-exec; poll | one-shot bg-exec: search implementation checkpoints, resume/run `iron-build`, checkpoint every task boundary, emit `implementation_done{head_sha}`, exit |
 | `CodeReviewFixGlobalPending` | dispatch Codex via bg-exec; poll | one-shot bg-exec: run `/pr-review-toolkit:review-pr` on the raw post-implementation diff, partition confirmed branch-level issues, fan out independent fix subagents in temporary worktrees on unique throwaway branches, merge/cherry-pick fixes back, send `review_fix_global`, exit |
 | `CodeReviewLocalPending` | dispatch `collab-turn-review-local.md`; worker runs full or reduced `review_local` audit, partitions confirmed CRITICAL/HIGH/MEDIUM findings, fans out independent fix subagents in temporary worktrees on unique throwaway branches, merges/cherry-picks fixes back, and sends `review_local` | wait |
-| `CodeReviewFinalPending` | dispatch `collab-turn-final-review.md` compose worker for pushed-head proof + PR body, then dispatch `collab-turn-submit.md` **directly** (no gate) to `gh pr create` (ready PR) and send `final_review{pr_url}` | wait |
+| `CodeReviewFinalPending` | dispatch `collab-turn-final-review.md` compose worker for pushed-head proof + PR body, then dispatch `collab-turn-submit.md` **directly** (no gate) to `gh pr create` (ready PR) and send `final_review{pr_url}` | wait, unless `pilot == "codex"`: one-shot bg-exec drafts the PR title/body and stages it via `collab-final-review.md`, then exits |
 | `CodingComplete` / `CodingFailed` | exit loop | n/a |
 
 **Worktree cleanup reminder on `CodingComplete`.** The session's lifecycle
