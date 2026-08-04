@@ -488,3 +488,119 @@ def test_lint_requires_retry_safe_split_contract(tmp_path):
     assert r.returncode == 1
     assert ".claude-plugin/commands/evaluate-issue.md: missing evaluate-issue SPLIT contract" \
         in r.stdout
+
+
+def test_lint_catches_reverted_submit_sender_claim(tmp_path):
+    # Task 5 regression pin: collab-turn-submit.md's `final` send site
+    # reverting `sender="$SENDER"` back to a hardcoded `sender="claude"`
+    # bypasses the post-gate $SENDER authorization check entirely.
+    fixture = copy_fixture(tmp_path)
+    bad = fixture / ".claude-plugin" / "prompts" / "collab-turn-submit.md"
+    text = bad.read_text()
+    target = 'collab_send(sender="$SENDER", topic="final",'
+    assert target in text, "final send call site not found to mutate"
+    bad.write_text(text.replace(target, 'collab_send(sender="claude", topic="final",', 1))
+
+    r = run({"COLLAB_LINT_ROOT": str(fixture)})
+
+    assert r.returncode == 1
+    assert ("collab-turn-submit.md: forbidden stale direct-body claim "
+            "'sender=\"claude\"'") in r.stdout
+
+
+def test_lint_allows_sender_placeholder_but_still_rejects_unknown_ones(tmp_path):
+    # Task 1 added $SENDER to ALLOWED_PLACEHOLDERS. Prove that didn't
+    # accidentally disable the unknown-placeholder check altogether: the
+    # unmodified fixture (which uses $SENDER throughout
+    # collab-turn-submit.md) must lint clean, and a genuinely unrecognized
+    # placeholder introduced alongside it must still fail.
+    fixture = copy_fixture(tmp_path)
+    submit = fixture / ".claude-plugin" / "prompts" / "collab-turn-submit.md"
+    text = submit.read_text()
+    assert "$SENDER" in text
+
+    # The fixture is not a fully green tree on its own (it omits several
+    # files other checks cross-reference, e.g. phase.rs), so this doesn't
+    # assert a clean exit — only that the placeholder check specifically
+    # never flags $SENDER, which is the thing Task 1's allowlist entry
+    # controls.
+    r_baseline = run({"COLLAB_LINT_ROOT": str(fixture)})
+    assert "unknown placeholder $SENDER" not in r_baseline.stdout
+
+    submit.write_text(text + "\nUse $STILL_NOT_ALLOWED here.\n")
+    r = run({"COLLAB_LINT_ROOT": str(fixture)})
+
+    assert r.returncode == 1
+    assert "unknown placeholder $STILL_NOT_ALLOWED" in r.stdout
+
+
+def test_lint_catches_dispatch_row_missing_current_owner_source(tmp_path):
+    # Task 6 regression pin: the PlanClaudeFinalizePending dispatch row must
+    # name `$SENDER=<collab_status.current_owner>` as the $SENDER
+    # substitution source. Weakening it to a vaguer `<owner>` placeholder
+    # must fail closed rather than lint green.
+    fixture = copy_fixture(tmp_path)
+    cmd = fixture / ".claude-plugin" / "commands" / "collab.md"
+    text = cmd.read_text()
+    lines = text.splitlines()
+    old_row = next(l for l in lines if l.startswith("| `PlanClaudeFinalizePending` |"))
+    assert "$SENDER=<collab_status.current_owner>" in old_row
+    new_row = old_row.replace("$SENDER=<collab_status.current_owner>", "$SENDER=<owner>", 1)
+    cmd.write_text(text.replace(old_row, new_row, 1))
+
+    r = run({"COLLAB_LINT_ROOT": str(fixture)})
+
+    assert r.returncode == 1
+    assert ("collab.md: PlanClaudeFinalizePending row must derive $SENDER "
+            "from `$SENDER=<collab_status.current_owner>` (current_owner "
+            "read from collab_status)") in r.stdout
+
+
+def test_lint_rejects_a_pilot_only_sender_derivation_in_dispatch_row(tmp_path):
+    # This is the pilot=codex-yields-sender=codex routing assertion: if the
+    # CodeReviewFinalPending row regresses to deriving $SENDER directly from
+    # `pilot` (bypassing the recovery-owner substitution), a recovery
+    # completion under a non-pilot current_owner would dispatch the wrong
+    # sender identity. PILOT_ONLY_SENDER_RE must catch this.
+    fixture = copy_fixture(tmp_path)
+    cmd = fixture / ".claude-plugin" / "commands" / "collab.md"
+    text = cmd.read_text()
+    lines = text.splitlines()
+    old_row = next(l for l in lines if l.startswith("| `CodeReviewFinalPending` |"))
+    assert "$SENDER=<collab_status.current_owner>" in old_row
+    new_row = old_row.replace("$SENDER=<collab_status.current_owner>", "$SENDER=<pilot>", 1)
+    cmd.write_text(text.replace(old_row, new_row, 1))
+
+    r = run({"COLLAB_LINT_ROOT": str(fixture)})
+
+    assert r.returncode == 1
+    assert ("collab.md: CodeReviewFinalPending row must not derive $SENDER "
+            "directly from pilot — $SENDER must come from current_owner") \
+        in r.stdout
+
+
+def test_lint_catches_dispatch_row_with_recovery_owner_clause_removed(tmp_path):
+    # Task 6 also requires each row to name the recovery-owner case, so the
+    # new guard can't itself strand an existing recovery completion by
+    # silently accepting a row that dropped that case. Rewriting the
+    # CodeReviewFinalPending row's "the recovery owner" mention to neutral
+    # prose (while leaving the current_owner substitution intact) must still
+    # fail.
+    fixture = copy_fixture(tmp_path)
+    cmd = fixture / ".claude-plugin" / "commands" / "collab.md"
+    text = cmd.read_text()
+    lines = text.splitlines()
+    old_row = next(l for l in lines if l.startswith("| `CodeReviewFinalPending` |"))
+    target = "may instead be the recovery owner per the recovery override"
+    assert target in old_row, "recovery-owner clause not found to mutate"
+    new_row = old_row.replace(
+        target, "may instead be an alternate agent per the recovery override", 1)
+    assert "$SENDER=<collab_status.current_owner>" in new_row, \
+        "mutation must not disturb the current_owner substitution"
+    cmd.write_text(text.replace(old_row, new_row, 1))
+
+    r = run({"COLLAB_LINT_ROOT": str(fixture)})
+
+    assert r.returncode == 1
+    assert "collab.md: CodeReviewFinalPending row must name the recovery-owner case" \
+        in r.stdout
