@@ -281,7 +281,7 @@ For every Claude-owned protocol turn, the orchestrator: reads slim
 `collab_status` → spawns ONE fresh-context worker via the `Agent` tool, prompt =
 the verbatim `.claude-plugin/prompts/collab-turn-<turn>.md` with `$VAR`s
 substituted (`$SESSION_ID`, and where the template uses them `$REPO_PATH`,
-`$BRANCH`, `$TOPIC`, `$ARTIFACT_REF`, `$ARTIFACT_HASH`, `$MODE`) → ingests ONLY the worker's
+`$BRANCH`, `$TOPIC`, `$ARTIFACT_REF`, `$ARTIFACT_HASH`, `$MODE`, `$SENDER`) → ingests ONLY the worker's
 ≤3-line verdict → loops. Template path resolution: prefer
 `.claude-plugin/prompts/collab-turn-<turn>.md` in the target repo checkout
 (present when the target is ironrace-memory itself); otherwise use the
@@ -327,16 +327,16 @@ fall back to a lower tier.**
 ### Dispatch matrix
 | Phase | Owner | Template | Tier | Model |
 |---|---|---|---|---|
-| PlanParallelDrafts | claude | `collab-turn-plan-draft.md` | planning | opus |
-| PlanSynthesisPending | claude | `collab-turn-plan-synthesis.md` | planning | opus |
-| PlanCodexReviewPending (copilot) | claude | `collab-turn-plan-review.md` | review | opus |
-| PlanClaudeFinalizePending | claude | `collab-turn-plan-finalize.md` | planning | opus |
-| PlanLocked (bridge) | claude | `collab-turn-task-list.md` | mechanical | sonnet |
-| CodeImplementPending | claude | `collab-turn-code-implement.md` | mechanical | sonnet |
-| CodeReviewFixGlobalPending (copilot) | claude | `collab-turn-review-fix-global.md` | review | opus |
-| CodeReviewLocalPending | claude | `collab-turn-review-local.md` | review | opus |
-| CodeReviewFinalPending | claude | `collab-turn-final-review.md` | review | opus |
-| post-gate send | claude | `collab-turn-submit.md` | mechanical | sonnet |
+| PlanParallelDrafts | orchestrator | `collab-turn-plan-draft.md` | planning | opus |
+| PlanSynthesisPending | orchestrator | `collab-turn-plan-synthesis.md` | planning | opus |
+| PlanCodexReviewPending (copilot) | orchestrator | `collab-turn-plan-review.md` | review | opus |
+| PlanClaudeFinalizePending | orchestrator | `collab-turn-plan-finalize.md` | planning | opus |
+| PlanLocked (bridge) | orchestrator | `collab-turn-task-list.md` | mechanical | sonnet |
+| CodeImplementPending | orchestrator | `collab-turn-code-implement.md` | mechanical | sonnet |
+| CodeReviewFixGlobalPending (copilot) | orchestrator | `collab-turn-review-fix-global.md` | review | opus |
+| CodeReviewLocalPending | orchestrator | `collab-turn-review-local.md` | review | opus |
+| CodeReviewFinalPending | orchestrator | `collab-turn-final-review.md` | review | opus |
+| post-gate send | pilot | `collab-turn-submit.md` | mechanical | sonnet |
 
 ## v1 Planning Loop (Phase → Action Table)
 
