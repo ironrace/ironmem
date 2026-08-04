@@ -412,6 +412,47 @@ fn claude_copilot_turn_templates_are_packaged() {
     );
 }
 
+/// `collab-turn-submit.md` is the only surface that sends collab protocol
+/// messages (`final`, `final_review`, `failure_report`) under a
+/// pilot-dependent identity: `sender="$SENDER"`, verified against
+/// `collab_status.current_owner` before every send. A regression back to a
+/// literal `sender="claude"` here silently breaks `pilot=codex` sessions —
+/// the server rejects the send as coming from the wrong owner and the
+/// session stalls in `CodeReviewFinalPending`/`PlanFinalizePending`, exactly
+/// the failure this plan fixed. `scripts/check_collab_turn_templates.py`
+/// already lints the source template for this, but that Python lint runs
+/// against the repo copy, not the installed one, and isn't a substitute for
+/// the same packaging gate every other collab-turn-*.md template gets here
+/// (see `claude_copilot_turn_templates_are_packaged` above) — this test
+/// closes that gap for the packaged/installed copy.
+#[test]
+fn collab_turn_submit_template_is_sender_parameterized() {
+    let rel = ".claude-plugin/prompts/collab-turn-submit.md";
+    let content = read_text(rel);
+
+    assert!(
+        content.contains("$SENDER"),
+        "{rel}: must send under the pilot-dependent $SENDER identity, not a hardcoded one"
+    );
+    assert!(
+        !content.contains("sender=\"claude\""),
+        "{rel}: must not regress to a literal sender=\"claude\" — this breaks pilot=codex \
+         sessions, which stall in CodeReviewFinalPending/PlanFinalizePending when the send's \
+         sender does not match collab_status.current_owner"
+    );
+
+    // Mirror the Python lint's specificity: all three collab_send call sites
+    // in this template (final_review success, final success, and the
+    // artifact-unfetchable failure_report path) must each be parameterized,
+    // not just one of them.
+    let call_sites = content.matches("sender=\"$SENDER\"").count();
+    assert_eq!(
+        call_sites, 3,
+        "{rel}: expected exactly 3 sender=\"$SENDER\" collab_send call sites (final_review, \
+         final, and the failure_report path), found {call_sites}"
+    );
+}
+
 #[test]
 fn claude_plugin_json_has_required_fields() {
     let json = read_json(".claude-plugin/plugin.json");
