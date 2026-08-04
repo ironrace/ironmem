@@ -523,6 +523,60 @@ def check_pr_base_resolution_contract() -> None:
             f"gated on base_sha containment")
 
 
+# The two collab.md dispatch rows that hand off to collab-turn-submit.md
+# with a `$SENDER` substitution. Each key is the row's phase name; the
+# value is the literal line-start prefix (backticked table cell) that
+# uniquely identifies that row among all other mentions of the phase name
+# in collab.md (e.g. the dispatch-matrix summary row, or the recovery row
+# spanning both CodeReviewLocalPending/CodeReviewFinalPending).
+SENDER_DISPATCH_ROWS = {
+    "PlanClaudeFinalizePending": "| `PlanClaudeFinalizePending` |",
+    "CodeReviewFinalPending": "| `CodeReviewFinalPending` |",
+}
+# A pilot-only derivation of $SENDER — the exact regression this guards
+# against: rewriting `$SENDER=<collab_status.current_owner>` back to a
+# form that assigns $SENDER directly from `pilot`, bypassing the
+# recovery-owner substitution. Deliberately anchored on `$SENDER\s*=` so
+# it does NOT flag the row's own (required) prose stating the normal
+# invariant `current_owner == pilot`, which never puts `pilot` on the
+# right-hand side of a `$SENDER` assignment.
+PILOT_ONLY_SENDER_RE = re.compile(r"\$SENDER\s*=\s*<?\s*(?:collab_status\.)?pilot\b")
+
+
+def check_sender_dispatch_contract() -> None:
+    """Both submit-dispatch rows must derive `$SENDER` from `current_owner`.
+
+    Regression guard for the status-to-template routing decision itself
+    (as opposed to the submit template's own contract, pinned separately):
+    the orchestrator rows in collab.md for `PlanClaudeFinalizePending` and
+    `CodeReviewFinalPending` must (1) name `collab_status.current_owner` as
+    the `$SENDER` substitution source, (2) name the recovery-owner case
+    (even where, as in `PlanClaudeFinalizePending`, the row goes on to
+    explain that substitution doesn't apply to that phase), and (3) never
+    state a pilot-only derivation of `$SENDER`. If either row regresses
+    back to deriving `$SENDER` straight from `pilot`, the recovery-owner
+    substitution silently stops applying and pilot-capable submits break
+    again under recovery.
+    """
+    text = COMMAND.read_text()
+    lines = text.splitlines()
+    for phase, prefix in SENDER_DISPATCH_ROWS.items():
+        row = next((l for l in lines if l.startswith(prefix)), None)
+        if row is None:
+            err(f"collab.md: missing dispatch row for {phase!r} "
+                f"(expected a line starting with {prefix!r})")
+            continue
+        if "$SENDER=<collab_status.current_owner>" not in row:
+            err(f"collab.md: {phase} row must derive $SENDER from "
+                f"`$SENDER=<collab_status.current_owner>` (current_owner "
+                f"read from collab_status)")
+        if not re.search(r"recovery[-\s]owner", row, re.IGNORECASE):
+            err(f"collab.md: {phase} row must name the recovery-owner case")
+        if PILOT_ONLY_SENDER_RE.search(row):
+            err(f"collab.md: {phase} row must not derive $SENDER directly "
+                f"from pilot — $SENDER must come from current_owner")
+
+
 def check_topic_template_completeness() -> None:
     """Every turn topic must have a template on BOTH harnesses."""
     mapped = set(TURN_TOPIC_TEMPLATES)
@@ -985,6 +1039,7 @@ def main() -> int:
     check_installer_covers_templates()
     check_precondition_phase_names()
     check_pr_base_resolution_contract()
+    check_sender_dispatch_contract()
     check_review_diff_trigger_detection_contract()
 
     if errors:
