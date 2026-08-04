@@ -118,7 +118,7 @@ REVIEW_DIFF_TRIGGER_DETECTION_SNIPPETS = [
 ]
 
 ALLOWED_PLACEHOLDERS = {"SESSION_ID", "REPO_PATH", "BRANCH", "TOPIC",
-                        "ARTIFACT_REF", "ARTIFACT_HASH", "MODE"}
+                        "ARTIFACT_REF", "ARTIFACT_HASH", "MODE", "SENDER"}
 REQUIRED_FM = {"turn", "tier", "model", "topics", "preconditions"}
 VALID_TIERS = {"planning", "review", "mechanical"}
 VALID_MODELS = {"opus", "sonnet", "haiku", "default"}
