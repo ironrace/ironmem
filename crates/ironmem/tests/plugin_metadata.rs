@@ -420,11 +420,15 @@ fn claude_copilot_turn_templates_are_packaged() {
 /// the server rejects the send as coming from the wrong owner and the
 /// session stalls in `CodeReviewFinalPending`/`PlanFinalizePending`, exactly
 /// the failure this plan fixed. `scripts/check_collab_turn_templates.py`
-/// already lints the source template for this, but that Python lint runs
-/// against the repo copy, not the installed one, and isn't a substitute for
-/// the same packaging gate every other collab-turn-*.md template gets here
-/// (see `claude_copilot_turn_templates_are_packaged` above) — this test
-/// closes that gap for the packaged/installed copy.
+/// already pins this same `$SENDER`/call-site contract on this same repo
+/// file; this test is a deliberate second, independent gate on the same
+/// protocol-critical property, run by a different suite (`cargo test`
+/// instead of the Python lint) so a change that only re-runs one of the two
+/// doesn't get a false-green. Unlike `claude_copilot_turn_templates_are_packaged`
+/// above, this is a content/contract check, not an installer-registration
+/// check — `collab-turn-submit` being present in `REQUIRED_CLAUDE_PROMPTS`
+/// is verified separately by `check_installer_covers_templates` in the
+/// Python lint.
 #[test]
 fn collab_turn_submit_template_is_sender_parameterized() {
     let rel = ".claude-plugin/prompts/collab-turn-submit.md";
