@@ -604,3 +604,50 @@ def test_lint_catches_dispatch_row_with_recovery_owner_clause_removed(tmp_path):
     assert r.returncode == 1
     assert "collab.md: CodeReviewFinalPending row must name the recovery-owner case" \
         in r.stdout
+
+
+def test_lint_catches_missing_codex_pilot_compose_route(tmp_path):
+    fixture = copy_fixture(tmp_path)
+    command = fixture / ".codex-plugin" / "commands" / "collab.md"
+    text = command.read_text()
+    route = "`CodeReviewFinalPending` with normal Codex-pilot ownership"
+    assert route in text
+    command.write_text(text.replace(route, "`CodeReviewFinalPending`", 1))
+
+    r = run({"COLLAB_LINT_ROOT": str(fixture)})
+
+    assert r.returncode == 1
+    assert (".codex-plugin/commands/collab.md: missing Codex-pilot routing "
+            "contract '`CodeReviewFinalPending` with normal Codex-pilot ownership'") \
+        in r.stdout
+
+
+def test_lint_catches_missing_codex_pilot_compose_handoff(tmp_path):
+    fixture = copy_fixture(tmp_path)
+    command = fixture / ".claude-plugin" / "commands" / "collab.md"
+    text = command.read_text()
+    handoff = "this is a **normal compose\n      handoff**, not a dispatch failure"
+    assert handoff in text
+    command.write_text(text.replace(handoff, "this is a dispatch failure", 1))
+
+    r = run({"COLLAB_LINT_ROOT": str(fixture)})
+
+    assert r.returncode == 1
+    assert (".claude-plugin/commands/collab.md: missing Codex-pilot compose "
+            "handoff contract 'this is a **normal compose\\n      handoff**, "
+            "not a dispatch failure'") in r.stdout
+
+
+def test_lint_catches_stale_docs_pr_base_containment_rule(tmp_path):
+    fixture = copy_fixture(tmp_path)
+    docs = fixture / "docs" / "COLLAB.md"
+    text = docs.read_text()
+    contract = "does **not** require that branch to contain `base_sha`"
+    assert contract in text
+    docs.write_text(text.replace(contract, "requires base_sha containment", 1))
+
+    r = run({"COLLAB_LINT_ROOT": str(fixture)})
+
+    assert r.returncode == 1
+    assert ("docs/COLLAB.md: missing pilot-submit routing contract "
+            "'does **not** require that branch to contain `base_sha`'") in r.stdout

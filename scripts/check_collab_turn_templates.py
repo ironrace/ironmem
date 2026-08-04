@@ -589,6 +589,56 @@ def check_sender_dispatch_contract() -> None:
                 f"from pilot — $SENDER must come from current_owner")
 
 
+def check_codex_pilot_compose_handoff_contract() -> None:
+    """Keep normal Codex-pilot compose turns connected to Claude submission.
+
+    The two compose prompts intentionally stage an immutable drawer and exit
+    without a collab send, so their phase does not advance. If either the
+    Codex selector or Claude's no-phase-advance handoff drops this special
+    path, the dispatcher reports a false `codex_dispatch_failed:` and the
+    sender-parameterization fix is unreachable under `pilot=codex`.
+    """
+    if not CODEX_COMMAND.exists():
+        err(".codex-plugin/commands/collab.md: missing Codex-pilot compose routing contract")
+    else:
+        codex_text = CODEX_COMMAND.read_text()
+        for snippet in (
+            "`PlanSynthesisPending` with normal Codex-pilot ownership",
+            "`PlanClaudeFinalizePending` with normal Codex-pilot ownership",
+            "`CodeReviewLocalPending` with normal Codex-pilot ownership",
+            "`CodeReviewFinalPending` with normal Codex-pilot ownership",
+        ):
+            if snippet not in codex_text:
+                err(".codex-plugin/commands/collab.md: missing Codex-pilot "
+                    f"routing contract {snippet!r}")
+
+    if not COMMAND.exists():
+        err(".claude-plugin/commands/collab.md: missing Codex-pilot compose handoff contract")
+    else:
+        command_text = COMMAND.read_text()
+        for snippet in (
+            "this is a **normal compose\n      handoff**, not a dispatch failure",
+            "`$SENDER=<collab_status.current_owner>`",
+            "Do\n      not re-dispatch the compose prompt, and do not emit\n      `codex_dispatch_failed:`",
+        ):
+            if snippet not in command_text:
+                err(".claude-plugin/commands/collab.md: missing Codex-pilot "
+                    f"compose handoff contract {snippet!r}")
+
+    if not DOC.exists():
+        err("docs/COLLAB.md: missing PR-base resolution contract")
+    else:
+        doc_text = DOC.read_text()
+        for snippet in (
+            "does **not** require that branch to contain `base_sha`",
+            "pre-range commits in the PR body",
+            "$SENDER` where that template uses",
+        ):
+            if snippet not in doc_text:
+                err("docs/COLLAB.md: missing pilot-submit routing contract "
+                    f"{snippet!r}")
+
+
 def check_topic_template_completeness() -> None:
     """Every turn topic must have a template on BOTH harnesses."""
     mapped = set(TURN_TOPIC_TEMPLATES)
@@ -1052,6 +1102,7 @@ def main() -> int:
     check_precondition_phase_names()
     check_pr_base_resolution_contract()
     check_sender_dispatch_contract()
+    check_codex_pilot_compose_handoff_contract()
     check_review_diff_trigger_detection_contract()
 
     if errors:

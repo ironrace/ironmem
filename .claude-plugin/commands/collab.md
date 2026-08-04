@@ -227,7 +227,7 @@ loop:
   if current_owner == "codex":
     dispatch via background `codex exec`
       (see "Codex handoff — background `codex exec`" below)
-    loop  # re-read status when Codex's phase advances
+    loop  # re-read status when Codex's phase advances or returns a compose ref
 
   # current_owner == "claude"
   recv(session_id, "claude", auto_ack=true)  # atomically acks all returned messages in one round-trip
@@ -690,19 +690,25 @@ default: it governs the prompt file, model, and reasoning effort. Do not let a
 caller-supplied Codex default override a row. `gpt-5.6-sol` is reserved for an
 explicit architecture/security escalation from within a turn.
 
-| Phase from `collab_status` | `implementer` | Prompt file | Model | Reasoning effort | Rationale |
+| Phase from `collab_status` | Ownership condition | Prompt file | Model | Reasoning effort | Rationale |
 |---|---|---|---|---|---|
 | `CodeImplementPending` | `"codex"` | `collab-batch-impl.md` | `gpt-5.6-luna` | `max` | Luna is the default implementation controller/worker and handles the batch's design judgment at the higher implementation budget |
 | `CodeReviewFixGlobalPending` | (any) | `collab-global-review.md` | `gpt-5.6-terra` | `high` | Normal global review gets a dedicated review budget without paying the Sol escalation cost |
 | `CodeReviewLocalPending` / `CodeReviewFinalPending` | Codex recovery owner | `collab-recovery.md` | `gpt-5.6-terra` | `high` | Recovery must finish the delegated normal-completion event without restoring the monolithic prompt |
 | `PlanParallelDrafts` | (any) | `collab-plan-draft.md` | `gpt-5.6-terra` | `high` | Planning needs an independent draft |
+| `PlanSynthesisPending` | Codex normal pilot | `collab-plan-synthesis.md` | `gpt-5.6-terra` | `high` | The pilot synthesizes the two drafts and sends `canonical` |
 | `PlanCodexReviewPending` | (any) | `collab-plan-review.md` | `gpt-5.6-terra` | `high` | Plan review needs independent judgment |
+| `PlanClaudeFinalizePending` | Codex normal pilot | `collab-plan-finalize.md` | `gpt-5.6-terra` | `high` | The pilot composes and stages the approval artifact without sending |
+| `CodeReviewLocalPending` | Codex normal pilot | `collab-review-local.md` | `gpt-5.6-terra` | `high` | The pilot sends the local audit completion |
+| `CodeReviewFinalPending` | Codex normal pilot | `collab-final-review.md` | `gpt-5.6-terra` | `high` | The pilot composes and stages the PR artifact without sending |
 | `CodeImplementPending` | `"claude"` | n/a — Codex isn't owner | n/a | n/a | Claude runs subagents on its side; no Codex dispatch |
 
-Match **both** `Phase` and `implementer` columns when looking up a row:
-`(any)` is a wildcard, quoted strings are exact matches. The two
-`CodeImplementPending` rows are distinguished only by `implementer` —
-do not stop at the first phase match.
+Match both `Phase` and ownership condition when looking up a row. `(any)` is a
+wildcard; `Codex normal pilot` means `pilot == "codex"`,
+`current_owner == "codex"`, and `pending_failure` is null; `Codex recovery
+owner` means the status names Codex as recovery owner. The two
+`CodeImplementPending` rows are distinguished only by `implementer` — do not
+stop at the first phase match.
 
 **`-s danger-full-access` applies uniformly across every row above, not
 per-row.** The sandbox setting is a property of the protocol, not of the
@@ -754,9 +760,16 @@ b. Select prompt file, model, and reasoning effort from the "Codex dispatch tuni
      `.codex-plugin/prompts/collab-batch-impl.md`; model and reasoning:
      `-m gpt-5.6-luna -c model_reasoning_effort=max`
    - `PlanParallelDrafts` → `.codex-plugin/prompts/collab-plan-draft.md`;
+     Codex-normal-pilot `PlanSynthesisPending` →
+     `.codex-plugin/prompts/collab-plan-synthesis.md`;
      `PlanCodexReviewPending` → `.codex-plugin/prompts/collab-plan-review.md`;
+     Codex-normal-pilot `PlanClaudeFinalizePending` →
+     `.codex-plugin/prompts/collab-plan-finalize.md`;
      `CodeReviewFixGlobalPending` →
-     `.codex-plugin/prompts/collab-global-review.md`; recovery-owned
+     `.codex-plugin/prompts/collab-global-review.md`; Codex-normal-pilot
+     `CodeReviewLocalPending` → `.codex-plugin/prompts/collab-review-local.md`;
+     Codex-normal-pilot `CodeReviewFinalPending` →
+     `.codex-plugin/prompts/collab-final-review.md`; recovery-owned
      `CodeReviewLocalPending` / `CodeReviewFinalPending` →
      `.codex-plugin/prompts/collab-recovery.md`; each uses:
      `-m gpt-5.6-terra -c model_reasoning_effort=high`
@@ -792,6 +805,9 @@ d. **Log the appropriate timing event** immediately before launch. Use the
    - For `CodeReviewFixGlobalPending`: **Log:** `t6_codex_review_dispatched phase=CodeReviewFixGlobalPending round=1`
    - For `PlanParallelDrafts`: **Log:** `t2_codex_dispatched phase=PlanParallelDrafts round=1`
    - For `PlanCodexReviewPending`: **Log:** `t2_codex_dispatched phase=PlanCodexReviewPending round=1`
+   - For Codex-normal-pilot `PlanSynthesisPending`, `PlanClaudeFinalizePending`,
+     `CodeReviewLocalPending`, or `CodeReviewFinalPending`: **Log:**
+     `t2_codex_dispatched phase=<phase> round=1`
 
 e. Launch via Bash with `run_in_background: true`. Pass the model and
    reasoning effort selected above explicitly, plus `-s danger-full-access`
@@ -909,7 +925,33 @@ f. **Event-driven wait loop** — the dispatcher's interactive surface during
       that blew the recovery retry ceiling). **ABORT** — surface failure to
       user, exit the dispatcher loop.
 
-   4. Bash background process exits (BashOutput shows "exit code N" or
+   4. `collab_status.phase` is unchanged, `pilot == "codex"`,
+      `pending_failure` is null, `current_owner == "codex"`, and a clean
+      Codex-pilot compose process exits in `PlanClaudeFinalizePending` or
+      `CodeReviewFinalPending` with a non-empty `ref: <drawer_id>` verdict →
+      this is a **normal compose
+      handoff**, not a dispatch failure. The compose prompts intentionally
+      stage a drawer and send nothing, so no phase advance is expected.
+      Validate that the verdict has `blocker: none`, retain only its drawer
+      ref and short summary, and refresh `collab_status` immediately before
+      the submit worker:
+      - In `PlanClaudeFinalizePending`, surface only the ref, file path, and
+        summary for the existing human approval gate. After approval, confirm
+        the phase and owner are still unchanged, then dispatch
+        `collab-turn-submit.md` with `$TOPIC=final`,
+        `$ARTIFACT_REF=<drawer_id>`, and
+        `$SENDER=<collab_status.current_owner>`.
+      - In `CodeReviewFinalPending`, dispatch `collab-turn-submit.md`
+        directly with `$TOPIC=final_review`, `$ARTIFACT_REF=<drawer_id>`, and
+        `$SENDER=<collab_status.current_owner>`.
+
+      The Claude worker physically performs the submit/PR-create operation,
+      but `$SENDER` remains the Codex pilot's current protocol identity. Do
+      not re-dispatch the compose prompt, and do not emit
+      `codex_dispatch_failed:` for this success path. A missing ref, blocker,
+      nonzero exit, or changed status remains a real dispatch failure.
+
+   5. Bash background process exits (BashOutput shows "exit code N" or
       process is no longer running) AND no phase advance observed →
       Codex CLI failed silently. **ERROR.**
       - Capture the last 50 lines from `/tmp/codex-out-${session_id}.log`.
@@ -925,7 +967,7 @@ f. **Event-driven wait loop** — the dispatcher's interactive surface during
       byte of detail after the colon; a bare prefix, or any other prefix
       (`branch_drift:` aside, which is terminal), is rejected off-turn.
 
-   5. Wall time exceeds 600 seconds (configurable) →
+   6. Wall time exceeds 600 seconds (configurable) →
       **HANG.**
       - Kill the Bash background process via `KillShell`.
       - Send `collab_send(sender="claude", topic="failure_report",
