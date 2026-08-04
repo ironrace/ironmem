@@ -286,7 +286,7 @@ Owner: `codex`. Codex sends one `review` with a verdict:
 
 Exit:
 
-- Always → `PlanClaudeFinalizePending`, owner `claude`.
+- Always → `PlanClaudeFinalizePending`, owner the pilot (`current_owner`).
 
 Codex must put all requested edits, risks, and task-splitting concerns into
 this one review pass. In particular, any task that looks larger than 20 minutes
@@ -295,10 +295,15 @@ can split it into independently executable child issues before finalization.
 
 ### `PlanClaudeFinalizePending`
 
-Owner: `claude`. Claude writes the final iron-build-compatible task markdown,
-asks for the only planning human approval, then sends one `final` message.
-Every task must be scoped to 20 minutes or less, and the plan must contain
-1–10 tasks. Larger work or an 11+ task scope is split into independently
+Owner: the pilot (`current_owner`). Claude always drives this phase — it
+enters Plan Mode, asks for the only planning human approval, and dispatches
+the finalize worker regardless of pilot — but composition and the send are
+pilot-generic: `collab-turn-plan-finalize.md` writes the final
+iron-build-compatible task markdown when `pilot == "claude"`, or Claude's
+loop triggers Codex's equivalent turn when `pilot == "codex"`, and either way
+`collab-turn-submit.md` sends the one `final` message as the pilot. Every
+task must be scoped to 20 minutes or less, and the plan must contain 1–10
+tasks. Larger work or an 11+ task scope is split into independently
 executable child issues before approval.
 
 Exit → `PlanLocked` (always). Planning is done.
@@ -464,13 +469,14 @@ findings out the same way; Claude opens the PR on the final turn.
 |---|---|---|---|
 | `CodeReviewFixGlobalPending` | `codex` | `CodeReviewFixGlobal{head_sha}` — Codex ran `/pr-review-toolkit:review-pr` on the full diff AS-IS (no Claude pre-clean), partitioned confirmed findings, used parallel fix subagents where safe, merged/cherry-picked the fixes, then pushed | `CodeReviewLocalPending` |
 | `CodeReviewLocalPending` | `claude` | `ReviewLocal{head_sha}` — Claude ran full or reduced `review_local` audit of Codex's commits + issues both agents missed, partitioned confirmed findings, used parallel fix subagents where safe, merged/cherry-picked the fixes, then pushed | `CodeReviewFinalPending` |
-| `CodeReviewFinalPending` | `claude` | `FinalReview{head_sha, pr_url}` — Claude opens the PR and sends the URL in the same event | `CodingComplete` (terminal) |
+| `CodeReviewFinalPending` | `pilot` | `FinalReview{head_sha, pr_url}` — the pilot opens the PR and sends the URL in the same event | `CodingComplete` (terminal) |
 
 The `Owner` column is the normal flow. Under the delegated-completion
 override, the recovery owner sends the interrupted phase's event in the
-original owner's place — including `final_review`, in which case Codex opens
-the PR. See "Failure + terminal" above and the PR-ownership rule under
-"Harness-Side Responsibilities".
+original owner's place — including `final_review`, in which case the
+recovery owner (the pilot's counterpart) opens the PR instead. See "Failure +
+terminal" above and the PR-ownership rule under "Harness-Side
+Responsibilities".
 
 ### Shortcut: post-iron-build coding review
 
@@ -497,7 +503,7 @@ fix fan-out for confirmed findings on the raw diff) → Claude `review_local`
 |---|---|---|---|
 | `CodeReviewFixGlobalPending` | `codex` | `CodeReviewFixGlobal{head_sha}` | `CodeReviewLocalPending` |
 | `CodeReviewLocalPending` | `claude` | `ReviewLocal{head_sha}` | `CodeReviewFinalPending` |
-| `CodeReviewFinalPending` | `claude` | `FinalReview{head_sha, pr_url}` | `CodingComplete` |
+| `CodeReviewFinalPending` | `pilot` | `FinalReview{head_sha, pr_url}` | `CodingComplete` |
 
 Invariants that still apply:
 
@@ -1305,7 +1311,7 @@ orchestrator from steering the reviewer's conclusion.
 | `implementation_done` | `claude` or `codex` (per session `implementer`) | `{"head_sha"}` | In `CodeImplementPending` only. Fired once after the subagent batch completes and gates pass. Carries only `head_sha` — no prose, no subagent notes. |
 | `review_fix_global` | `codex` (or `claude` as recovery owner under the delegated-completion override) | `{"head_sha"}` | In `CodeReviewFixGlobalPending` only. Codex ran `/pr-review-toolkit:review-pr` on the raw post-implementation diff (no Claude pre-clean), used parallel fix subagents for confirmed partitionable findings, merged/cherry-picked the resulting fixes, and pushed the branch-level fix commit(s). |
 | `review_local` | `claude` (or `codex` as recovery owner under the delegated-completion override) | `{"head_sha"}` | In `CodeReviewLocalPending` only. Claude ran full or reduced audit of Codex's `review_fix_global` commits + caught issues both agents missed, used parallel fix subagents for confirmed partitionable findings, merged/cherry-picked the resulting fixes, and pushed. |
-| `final_review` | `claude` (or `codex` as recovery owner under the delegated-completion override) | `{"head_sha","pr_url"}` | In `CodeReviewFinalPending` only. The turn owner has opened the PR; the event carries the URL and advances directly to `CodingComplete`. `pr_url` must start with `https://` and be ≤2048 chars. |
+| `final_review` | `pilot` (or the recovery owner under the delegated-completion override) | `{"head_sha","pr_url"}` | In `CodeReviewFinalPending` only. The turn owner has opened the PR; the event carries the URL and advances directly to `CodingComplete`. `pr_url` must start with `https://` and be ≤2048 chars. |
 | `failure_report` | current owner; off-turn `branch_drift:` may come from either agent; off-turn `codex_dispatch_failed:` may come only from Claude against a Codex-owned turn | `{"coding_failure":"<reason>"}` | Valid in any coding-active phase. Classifies **Tooling** (six recoverable prefixes, stays in-phase, `current_owner` flips) or **Terminal** (everything else — including `branch_drift:` — transitions to `CodingFailed`) — see "Failure + terminal" above. |
 
 The `Sender` column above names the agent that owns the phase in the normal
@@ -1364,12 +1370,12 @@ exactly one event variant — there is no phase overloading.
 | `PlanParallelDrafts` | `draft` | v1 planning |
 | `PlanSynthesisPending` | `canonical` | v1 planning |
 | `PlanCodexReviewPending` | `review` | v1 — Codex review of canonical |
-| `PlanClaudeFinalizePending` | `final` | v1 — Claude finalizes |
+| `PlanClaudeFinalizePending` | `final` | v1 — the pilot finalizes |
 | `PlanLocked` | `task_list` | v1 → v3 hand-off |
 | `CodeImplementPending` | `implementation_done`, `failure_report` | v3 — single implementer turn after subagent batch |
 | `CodeReviewFixGlobalPending` | `review_fix_global`, `failure_report` | v3 — Codex runs `/pr-review-toolkit:review-pr` on the raw post-implementation diff, then fans confirmed fixes out to subagents |
 | `CodeReviewLocalPending` | `review_local`, `failure_report` | v3 — Claude audits Codex's commits, then fans confirmed fixes out to subagents |
-| `CodeReviewFinalPending` | `final_review`, `failure_report` | v3 — Claude opens PR (Codex opens it when recovery hands it this phase) |
+| `CodeReviewFinalPending` | `final_review`, `failure_report` | v3 — the pilot opens PR (the recovery owner opens it when recovery hands it this phase) |
 | `CodingComplete` / `CodingFailed` | *(none — terminal; only `collab_end` accepted)* | |
 
 `failure_report` is accepted from the current owner in any coding-active
@@ -1517,14 +1523,16 @@ before each coding-active `collab_send`:
 - **PR creation is scoped by protocol ownership, not by tooling.** Codex may
   run any `gh`, git, or GitHub API operation it needs; nothing about the
   tooling is off-limits. What is restricted is *who owns the turn that
-  creates the PR*. Codex creates a PR only when it actually owns
-  `CodeReviewFinalPending` under the recovery override — i.e. all three of
-  `pending_failure` non-null, `current_owner == "codex"`, and
-  `recovery_phase == "CodeReviewFinalPending"`. In the normal flow Claude
-  owns that turn and Codex never reaches it, so in practice Codex still
-  does not open PRs; it simply is no longer forbidden to when recovery
-  hands it the turn. Codex should still avoid gratuitous PR probes in its
-  ordinary phases (`gh pr list`, `git ls-remote refs/pull/*`) — they add an
+  creates the PR*. Codex creates a PR when it owns `CodeReviewFinalPending`
+  — either as the normal-flow pilot (`pilot == "codex"`, so
+  `current_owner == "codex"` there) or under the recovery override (all
+  three of `pending_failure` non-null, `current_owner == "codex"`, and
+  `recovery_phase == "CodeReviewFinalPending"`). Under `pilot == "claude"`
+  with no recovery in flight, Claude owns that turn and Codex never reaches
+  it, so in that configuration Codex still does not open PRs; it simply is
+  no longer forbidden to whenever ownership — pilot or recovery — hands it
+  the turn. Codex should still avoid gratuitous PR probes in its ordinary
+  phases (`gh pr list`, `git ls-remote refs/pull/*`) — they add an
   `api.github.com` reachability dependency that was observed as a fragility
   in practice — but that is a robustness preference, not a prohibition.
 
@@ -1695,12 +1703,18 @@ The ten per-turn worker templates live under `.claude-plugin/prompts/`:
 
 Codex has a matching phase prompt under `.codex-plugin/prompts/` for each of
 the nine protocol turns above that carry a phase — every template except
-`collab-turn-submit.md`, which is Claude's generic submit-by-ref/PR-create turn
-and has no Codex counterpart. There is also `collab-recovery.md` for the rare
-recovery override that delegates `CodeReviewLocalPending` or
-`CodeReviewFinalPending` to Codex. Installed is not yet dispatchable: the Codex
-`/collab` shim's phase table routes only a subset of those prompts today, and
-the rest ship ahead of their dispatch rows (#248).
+`collab-turn-submit.md`. That omission is by design, not a gap: Claude's
+orchestrator loop is always the one that dispatches the submit turn,
+regardless of pilot (only `$SENDER` is parameterized, from
+`collab_status.current_owner`), so a Codex-side submit template would never
+be invoked and would just rot unused. There is also `collab-recovery.md` for
+the rare recovery override that delegates `CodeReviewLocalPending` or
+`CodeReviewFinalPending` to Codex.
+
+Separately, and unrelated to `collab-turn-submit.md`'s by-design omission:
+installed is not yet dispatchable for some of the other templates — the
+Codex `/collab` shim's phase table routes only a subset of those prompts
+today, and the rest ship ahead of their dispatch rows (#248).
 
 The Claude-side dispatch tables and the authoritative tier matrix live in
 `.claude-plugin/commands/collab.md`; this section and that command file must
