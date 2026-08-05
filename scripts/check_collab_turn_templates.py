@@ -339,6 +339,16 @@ RESET_GUARD_SURFACES = (
     ".claude-plugin/prompts/collab-turn-review-local.md",
     ".claude-plugin/prompts/collab-turn-review-fix-global.md",
     ".codex-plugin/prompts/collab-review-local.md",
+    # `collab-global-review.md` is the Codex mirror of
+    # `collab-turn-review-fix-global.md` and owns `CodeReviewFixGlobalPending`
+    # under the DEFAULT `pilot=claude`, so it is on the live default path.
+    # `collab-batch-impl.md` is `CodeImplementPending` under
+    # `implementer=codex` — the phase carrying the most uncommitted work and
+    # the highest hard-kill probability, since it runs a full `iron-build`
+    # batch. Both gated preservation on `pending_failure` with no cleanliness
+    # check until #257.
+    ".codex-plugin/prompts/collab-global-review.md",
+    ".codex-plugin/prompts/collab-batch-impl.md",
 )
 # Accepts either Claude phrasing ("regardless of `pending_failure`") or the
 # Codex mirror's narrower-scoped equivalent, which binds unconditionally by

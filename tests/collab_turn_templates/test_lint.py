@@ -556,6 +556,8 @@ RESET_GUARD_PROMPTS = [
     (".claude-plugin/prompts", "collab-turn-review-local.md"),
     (".claude-plugin/prompts", "collab-turn-review-fix-global.md"),
     (".codex-plugin/prompts", "collab-review-local.md"),
+    (".codex-plugin/prompts", "collab-global-review.md"),
+    (".codex-plugin/prompts", "collab-batch-impl.md"),
 ]
 
 

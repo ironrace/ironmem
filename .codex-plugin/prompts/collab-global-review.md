@@ -36,15 +36,23 @@ Parse a join invocation with one session id after an optional recognized
 implementer flag (already applied by the command shim). Call
 `collab_wait_my_turn(session_id, "codex", 60)` once, then read fresh
 `collab_status` and require `CodeReviewFixGlobalPending` with Codex as owner.
-For normal turns, enter the recorded `repo_path`, fetch the recorded
-branch, verify `last_head_sha` with `git cat-file -e`, then checkout the branch
-and reset it to that SHA. If the commit is unavailable, send a terminal
-`failure_report` whose `coding_failure` starts `branch_drift:` and exit.
+If `pending_failure` is present and Codex owns recovery — or a normal turn
+finds a dirty worktree (next paragraph) — preserve and inspect the
+working-tree diff before any fetch, checkout, or reset, and skip the sync in
+the next paragraph entirely. Complete the interrupted phase's gates, commit
+and push recovered work, then send that phase's normal completion event
+exactly once.
 
-If `pending_failure` is present and Codex owns recovery, preserve and inspect
-the working-tree diff before fetch, checkout, or reset. Complete the
-interrupted phase's gates, commit and push recovered work, then send that
-phase's normal completion event exactly once.
+For normal turns, enter the recorded `repo_path`, fetch the recorded
+branch, verify `last_head_sha` with `git cat-file -e`, then checkout the
+branch. If the commit is unavailable, send a terminal `failure_report` whose
+`coding_failure` starts `branch_drift:` and exit. Immediately before
+resetting, require `git status --porcelain` to be empty regardless of
+`pending_failure`: a dirty worktree here means a prior turn died without
+reporting `pending_failure` (OOM, container kill, sandbox teardown), not that
+there is nothing to recover — do not run `git reset --hard`; instead preserve
+and inspect the diff on the recovery path above, which covers this case too.
+Only when the worktree is clean, `git reset --hard <last_head_sha>`.
 
 For a full-flow session, load the approved task list through `task_list_ref`,
 verify its SHA-256 against `task_list_ref.hash`, and read its `plan_file_path`.

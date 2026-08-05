@@ -39,6 +39,12 @@ act only
 when phase is `CodeImplementPending`, implementer is `codex`, and Codex owns
 the turn. Otherwise exit with a concise stale-invocation status.
 
+If `pending_failure` is non-null and Codex owns recovery — or a normal turn
+finds a dirty worktree (next paragraph) — preserve and inspect the current
+diff before any fetch, checkout, or reset, and skip the sync in the next
+paragraph entirely. Run this phase's gates, commit and push recovered work,
+and send the normal completion event exactly once.
+
 For a normal turn, read `last_head_sha`, `base_sha`, `repo_path`, branch,
 `task_list_ref`, and execution mode. Load the manifest with
 `get_drawer(id=<task_list_ref.drawer_id>)`, then verify its SHA-256 against
@@ -46,14 +52,16 @@ For a normal turn, read `last_head_sha`, `base_sha`, `repo_path`, branch,
 First take the fast path when
 both local HEAD equals `last_head_sha` and the checked-out branch equals the
 session branch. Otherwise fetch the branch, verify the SHA with
-`git cat-file -e`, checkout the session branch, and hard-reset to the recorded
-SHA. If the SHA is absent, send `failure_report` with detailed
-`branch_drift:` and exit. Do not repeat a pre-work test: the sender's active
-turn already ran the post-work gate.
-
-If `pending_failure` is non-null and Codex owns recovery, preserve and inspect
-the current diff before fetch/checkout/reset. Run this phase's gates, commit
-and push recovered work, and send the normal completion event exactly once.
+`git cat-file -e` and checkout the session branch. If the SHA is absent, send
+`failure_report` with detailed `branch_drift:` and exit. Immediately before
+resetting, require `git status --porcelain` to be empty regardless of
+`pending_failure`: a dirty worktree here means a prior turn died without
+reporting `pending_failure` (OOM, container kill, sandbox teardown), not that
+there is nothing to recover — do not run `git reset --hard`; instead preserve
+and inspect the diff on the recovery path above, which covers this case too.
+Only when the worktree is clean, `git reset --hard <last_head_sha>`. Do not
+repeat a pre-work test: the sender's active turn already ran the post-work
+gate.
 
 ## Checkpoints
 
