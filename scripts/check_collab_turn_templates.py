@@ -350,11 +350,23 @@ RESET_GUARD_SURFACES = (
     ".codex-plugin/prompts/collab-global-review.md",
     ".codex-plugin/prompts/collab-batch-impl.md",
 )
-# Accepts either Claude phrasing ("regardless of `pending_failure`") or the
-# Codex mirror's narrower-scoped equivalent, which binds unconditionally by
-# sitting in a normal-turn-only paragraph.
-RESET_GUARD_PRECONDITION_RE = re.compile(
+# The cleanliness precondition, in two forms. The bare form locates it; the
+# qualified form is what the file must actually carry.
+#
+# The qualifier is not decoration. Re-gating the precondition on
+# `pending_failure` ("...to be empty only when `pending_failure` is non-null")
+# IS issue #254 — the hard-killed turn never sent a `failure_report`, so
+# `pending_failure` is null precisely when the uncommitted work is at risk. The
+# positional checks below cannot see that mutation at all: it leaves the
+# precondition ahead of the reset, the enforcement clause intact and the reset
+# conditioned on a clean tree, so all four pass while the guard binds in
+# exactly the cases where it is not needed. This literal is therefore the one
+# part of the guard that is pinned by wording, and deliberately so.
+RESET_GUARD_BARE_PRECONDITION_RE = re.compile(
     r"`?git status\s*\n?\s*--porcelain`?\s+to be empty", re.MULTILINE)
+RESET_GUARD_PRECONDITION_RE = re.compile(
+    r"`?git status\s*\n?\s*--porcelain`?\s+to be empty\s*\n?\s*"
+    r"regardless of\s*\n?\s*`pending_failure`", re.MULTILINE)
 RESET_GUARD_ENFORCEMENT_RE = re.compile(
     r"do\s*\n?\s*not run `git reset --hard`", re.MULTILINE)
 RESET_GUARD_CONDITIONAL_RE = re.compile(
@@ -374,6 +386,17 @@ RESET_GUARD_RECOVERY_SKIP_RE = re.compile(
 RESET_MENTION_EXEMPT_RE = re.compile(
     r"(do\s*\n?\s*not run `git reset --hard`"
     r"|[Ss]kip only the[^.]{0,80}?`git reset --hard`)", re.MULTILINE)
+# How far before a reset instruction its "only when the worktree is clean"
+# clause may sit. The conditional is checked per-reset rather than
+# file-globally: a single conditional anywhere in the file satisfied a
+# file-global search no matter how many further resets followed it, so
+# appending `Later: just `git reset --hard <last_head_sha>` no matter what.`
+# to a fully guarded template linted green. In every shipped surface the
+# clause reads "Only when the worktree is clean, `git reset --hard ...`" —
+# three characters of separator, possibly wrapped — so this bound is generous
+# enough for rewrapping and far too tight for an unrelated conditional
+# elsewhere in the file to be borrowed by a later reset.
+RESET_CONDITIONAL_PROXIMITY = 40
 HTML_COMMENT_RE = re.compile(r"<!--.*?-->", re.DOTALL)
 FORBIDDEN_TEMPLATE_SNIPPETS = {
     "collab-turn-plan-synthesis.md": [
@@ -590,6 +613,17 @@ def check_reset_guards() -> None:
     stripped first: parking the required phrases in a comment while leaving an
     unconditional reset in the body is exactly how issue #254's pre-fix
     template passes a substring-only gate.
+
+    Position is checked against EVERY non-exempt reset, not just the first.
+    A guard that only has to precede the earliest occurrence is satisfied by a
+    fully guarded step 1 followed by a bare reset anywhere later in the file,
+    and — since the clauses were otherwise searched file-globally — by demoting
+    the whole guard to a trailing "historical note" below an unconditional
+    reset. Both linted green while the executable path reset unconditionally.
+
+    The one wording pin that remains is the precondition's
+    "regardless of `pending_failure`" qualifier; see
+    RESET_GUARD_PRECONDITION_RE for why no positional check can replace it.
     """
     for rel in RESET_GUARD_SURFACES:
         path = ROOT / rel
@@ -605,23 +639,45 @@ def check_reset_guards() -> None:
                 "if the reset was removed, drop this file from "
                 "RESET_GUARD_SURFACES")
             continue
+        first_reset = min(resets)
         pre = RESET_GUARD_PRECONDITION_RE.search(text)
-        if not pre:
+        if not RESET_GUARD_BARE_PRECONDITION_RE.search(text):
             err(f"{rel}: no `git status --porcelain` cleanliness precondition "
                 "guarding `git reset --hard`")
-        elif pre.start() > min(resets):
+        elif not pre:
+            err(f"{rel}: `git status --porcelain` precondition does not bind "
+                "unconditionally — expected \"to be empty regardless of "
+                "`pending_failure`\". A turn killed hard never sends a "
+                "`failure_report`, so `pending_failure` is null in exactly "
+                "the case the guard exists for (issue #254)")
+        elif pre.start() > first_reset:
             # Substring membership has no ordering; a precondition stated after
             # the reset it governs is not a precondition.
             err(f"{rel}: `git status --porcelain` precondition appears after "
                 "the `git reset --hard` it must guard")
-        if not RESET_GUARD_ENFORCEMENT_RE.search(text):
-            err(f"{rel}: cleanliness precondition states no consequence — "
-                "expected an explicit \"do not run `git reset --hard`\"")
-        if not RESET_GUARD_CONDITIONAL_RE.search(text):
-            err(f"{rel}: reset is not conditioned on a clean worktree — "
-                'expected "Only when the worktree is clean"')
-        if not RESET_GUARD_RECOVERY_SKIP_RE.search(text):
-            err(f"{rel}: recovery owner is not told to skip the sync")
+        for label, pattern, diagnostic in (
+            ("enforcement", RESET_GUARD_ENFORCEMENT_RE,
+             "cleanliness precondition states no consequence — expected an "
+             "explicit \"do not run `git reset --hard`\""),
+            ("recovery skip", RESET_GUARD_RECOVERY_SKIP_RE,
+             "recovery owner is not told to skip the sync"),
+        ):
+            match = pattern.search(text)
+            if not match:
+                err(f"{rel}: {diagnostic}")
+            elif match.start() > first_reset:
+                err(f"{rel}: the {label} clause appears after the "
+                    "`git reset --hard` it must govern")
+        # The conditional binds per reset: each instruction needs its own
+        # "only when the worktree is clean" immediately ahead of it.
+        conditionals = [m.end() for m in RESET_GUARD_CONDITIONAL_RE.finditer(text)]
+        unguarded = [r for r in resets if not any(
+            0 <= r - end <= RESET_CONDITIONAL_PROXIMITY for end in conditionals)]
+        if unguarded:
+            err(f"{rel}: {len(unguarded)} of {len(resets)} `git reset --hard` "
+                "instructions are not conditioned on a clean worktree — "
+                'expected "Only when the worktree is clean" immediately '
+                f"before each (first unguarded at offset {min(unguarded)})")
 
 
 def check_review_diff_trigger_detection_contract() -> None:

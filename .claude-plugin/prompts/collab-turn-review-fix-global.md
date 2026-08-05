@@ -24,7 +24,10 @@ review.
    either check fails, do not send; return a blocker.
 2. A non-null `pending_failure` means you are the **recovery owner** for an
    interrupted turn, not simply the next-in-line owner — read the next section
-   before touching the working tree.
+   before touching the working tree. A null `pending_failure` does not prove
+   the previous turn finished: a turn killed hard never sends a
+   `failure_report`, so the dirty-worktree check in `Prepare the review` step 1
+   routes you onto that same recovery path.
 
 ## Recoverable vs terminal failures
 
@@ -34,7 +37,11 @@ instead of ending the session: `git_commit_failed:`, `git_push_failed:`,
 `sandbox_denied:`, `disk_full:`, `network_failed:`,
 `codex_dispatch_failed:` (each needs real detail after the colon, e.g.
 `git_commit_failed: index.lock EPERM`); everything else (including
-`branch_drift:`/`subagent_failure:`) is terminal. As **recovery owner**,
+`branch_drift:`/`subagent_failure:`) is terminal. You are the **recovery
+owner** when a recoverable `failure_report` handed you control, when you
+resumed via `collab_resume`, or when you began a normal turn and found a dirty
+worktree (`Prepare the review` step 1) — that last case is a turn that died
+without reporting, and it is recovered the same way. As recovery owner,
 preserve and inspect the working-tree diff before any fetch, checkout, or
 reset; complete the interrupted phase's gates, commit and push the recovered
 work, then send the normal `review_fix_global` exactly once — never a new
@@ -50,8 +57,8 @@ work, then send the normal `review_fix_global` exactly once — never a new
    dirty worktree here means a prior turn died without reporting
    `pending_failure` (OOM, container kill, sandbox teardown), not that there is
    nothing to recover — do not run `git reset --hard`; instead preserve and
-   inspect the diff on the recovery path above. Only when the worktree is
-   clean, `git reset --hard <last_head_sha>`.
+   inspect the diff on the recovery path above, which covers this case too.
+   Only when the worktree is clean, `git reset --hard <last_head_sha>`.
 2. For a full-flow session, load the approved task list with
    `get_drawer(id=<task_list_ref.drawer_id>)`, verify its SHA-256 against
    `task_list_ref.hash`, and read its `plan_file_path`.

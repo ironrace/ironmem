@@ -47,8 +47,12 @@ exit. Read `repo_path`, `branch`, `base_sha`, `last_head_sha`, and
 `cargo fmt --all -- --check` and
 `cargo clippy --workspace --all-targets --all-features -- -D warnings`.
 
-A non-null `pending_failure` means you are the **recovery owner** for an
-interrupted turn, not simply the next-in-line owner. As recovery owner, preserve
+You are the **recovery owner** for an interrupted turn — not simply the
+next-in-line owner — when `pending_failure` is non-null, or when you began a
+normal turn and found a dirty worktree (next paragraph). A null
+`pending_failure` does not prove the previous turn finished: a turn killed hard
+never sends a `failure_report`, so that dirty worktree is the only signal, and
+it is recovered the same way. As recovery owner, preserve
 and inspect the working-tree diff before any fetch, checkout, or reset; run this
 turn's gates yourself, commit and push the recovered work, then send the normal
 `review_local` exactly once rather than a new `failure_report`. **Skip only the
@@ -59,12 +63,13 @@ For a normal turn, `git fetch`, verify
 `git cat-file -e <last_head_sha>^{commit}` (on a miss, send `failure_report`
 with `coding_failure: "branch_drift: <detail>"` and exit), and checkout the
 session `branch`. Immediately before resetting, require `git status
---porcelain` to be empty: a dirty worktree here means a prior turn died
-without reporting `pending_failure`, not that there is nothing to recover — do
+--porcelain` to be empty regardless of `pending_failure`: a dirty worktree here
+means a prior turn died without reporting `pending_failure` (OOM, container
+kill, sandbox teardown), not that there is nothing to recover — do
 not run `git reset --hard`; instead preserve and inspect the diff on the
-recovery path above. Only when the worktree is clean, `git reset --hard
-<last_head_sha>` (the copilot pushed at `review_fix_global`), then run this
-turn's gates.
+recovery path above, which covers this case too. Only when the worktree is
+clean, `git reset --hard <last_head_sha>` (the copilot pushed at
+`review_fix_global`), then run this turn's gates.
 
 Prepare the review input before choosing depth. First attempt the compact
 artifact:

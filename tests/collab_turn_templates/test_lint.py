@@ -579,6 +579,100 @@ def test_lint_requires_a_cleanliness_precondition_on_every_reset(
             "guarding `git reset --hard`") in r.stdout
 
 
+# The guard's clauses as they appear in the shipped prompts, matched by regex
+# because two of the five wrap mid-clause. Duplicated from the lint on purpose,
+# for the same reason the snippet lists above are.
+RESET_QUALIFIER_RE = re.compile(r"regardless of\s+`pending_failure`")
+RESET_ENFORCEMENT_RE = re.compile(r"do\s+not run `git reset --hard`")
+
+
+@pytest.mark.parametrize("subdir,name", RESET_GUARD_PROMPTS)
+def test_lint_rejects_a_precondition_re_gated_on_pending_failure(
+        tmp_path, subdir, name):
+    # Issue #254's exact bug shape, and the one mutation no positional check
+    # can see: the precondition stays ahead of the reset, the enforcement
+    # clause stays intact and the reset stays conditioned on a clean tree —
+    # only the qualifier flips, and the guard then binds solely in the case
+    # where a `failure_report` already announced the interruption. A turn
+    # killed hard sends no report, so `pending_failure` is null exactly when
+    # the uncommitted work is at risk.
+    fixture = copy_fixture(tmp_path)
+    template = fixture / subdir / name
+    text = template.read_text()
+    mutated, count = RESET_QUALIFIER_RE.subn(
+        "only when `pending_failure` is non-null", text)
+    assert count, f"{name}: no unconditional qualifier to mutate"
+    template.write_text(mutated)
+
+    r = run({"COLLAB_LINT_ROOT": str(fixture)})
+
+    assert r.returncode == 1
+    assert (f"{name}: `git status --porcelain` precondition does not bind "
+            "unconditionally") in r.stdout
+
+
+@pytest.mark.parametrize("subdir,name", RESET_GUARD_PROMPTS)
+def test_lint_rejects_an_unguarded_reset_appended_after_a_guarded_one(
+        tmp_path, subdir, name):
+    # The conditional has to bind per reset. Searched file-globally, one
+    # "only when the worktree is clean" anywhere satisfied it no matter how
+    # many bare resets followed — so a fully guarded step 1 plus a trailing
+    # unconditional reset linted green.
+    fixture = copy_fixture(tmp_path)
+    template = fixture / subdir / name
+    template.write_text(template.read_text() + "\n\nLater: just "
+                        "`git reset --hard <last_head_sha>` no matter what.\n")
+
+    r = run({"COLLAB_LINT_ROOT": str(fixture)})
+
+    assert r.returncode == 1
+    assert (f"{name}: 1 of 2 `git reset --hard` instructions are not "
+            "conditioned on a clean worktree") in r.stdout
+
+
+@pytest.mark.parametrize("subdir,name", RESET_GUARD_PROMPTS)
+def test_lint_requires_the_precondition_to_state_its_consequence(
+        tmp_path, subdir, name):
+    # A precondition with no stated consequence is a description, not a guard:
+    # the worker is told what to require and nothing about what to do when the
+    # requirement fails.
+    fixture = copy_fixture(tmp_path)
+    template = fixture / subdir / name
+    text = template.read_text()
+    mutated, count = RESET_ENFORCEMENT_RE.subn("note the state", text)
+    assert count, f"{name}: no enforcement clause to mutate"
+    template.write_text(mutated)
+
+    r = run({"COLLAB_LINT_ROOT": str(fixture)})
+
+    assert r.returncode == 1
+    assert (f"{name}: cleanliness precondition states no consequence — "
+            'expected an explicit "do not run `git reset --hard`"') in r.stdout
+
+
+def test_lint_rejects_a_surface_whose_only_resets_are_exempt_mentions(tmp_path):
+    # `RESET_MENTION_EXEMPT_RE` excuses the guard's own two references to the
+    # reset — the prohibition and the recovery owner's skip list — from the
+    # ordering rules. Without this test, widening that exemption until it
+    # swallowed the real instruction too would leave the whole per-file check
+    # passing vacuously: no reset instruction found means nothing to order the
+    # guard against.
+    fixture = copy_fixture(tmp_path)
+    template = (fixture / ".codex-plugin" / "prompts" /
+                "collab-global-review.md")
+    text = template.read_text()
+    instruction = "Only when the worktree is clean, `git reset --hard <last_head_sha>`."
+    assert instruction in text, "reset instruction not found to remove"
+    template.write_text(text.replace(
+        instruction, "Only when the worktree is clean, sync the branch."))
+
+    r = run({"COLLAB_LINT_ROOT": str(fixture)})
+
+    assert r.returncode == 1
+    assert ("collab-global-review.md: expected a `git reset --hard` "
+            "instruction to guard") in r.stdout
+
+
 @pytest.mark.parametrize("subdir,name", RESET_GUARD_PROMPTS)
 def test_lint_requires_the_recovery_owner_to_be_told_to_skip_the_sync(
         tmp_path, subdir, name):
@@ -624,6 +718,44 @@ def test_lint_rejects_a_precondition_stated_after_the_reset(tmp_path):
             ) in r.stdout
 
 
+def test_lint_rejects_the_whole_guard_demoted_below_the_reset(tmp_path):
+    # The enforcement, recovery-skip and conditional clauses used to be
+    # searched file-globally, so restoring the naive step 1 and re-filing the
+    # entire guard as a trailing "Historical note" left three of the four
+    # checks green — the guard was still *in* the file, just nowhere the
+    # worker reads before resetting. All four must object.
+    fixture = copy_fixture(tmp_path)
+    template = (fixture / ".claude-plugin" / "prompts" /
+                "collab-turn-review-local.md")
+    text = template.read_text()
+    start = text.index("## Actions\n1. **Normal turns only")
+    end = text.index("\n2. Prepare the normal review input")
+    guard = text[start:end]
+    naive = ("## Actions\n"
+             "1. Pre-send harness: `git fetch`; "
+             "`git cat-file -e <last_head_sha>^{commit}`\n"
+             "   (on miss → `failure_report` `branch_drift:...`);\n"
+             "   `git reset --hard <last_head_sha>`; `cargo fmt --check`.")
+    template.write_text(text[:start] + naive + text[end:]
+                        + "\n\n## Historical note\n\n" + guard + "\n")
+
+    r = run({"COLLAB_LINT_ROOT": str(fixture)})
+
+    assert r.returncode == 1
+    name = "collab-turn-review-local.md"
+    for diagnostic in (
+        f"{name}: `git status --porcelain` precondition appears after the "
+        "`git reset --hard` it must guard",
+        f"{name}: the enforcement clause appears after the "
+        "`git reset --hard` it must govern",
+        f"{name}: the recovery skip clause appears after the "
+        "`git reset --hard` it must govern",
+        f"{name}: 1 of 2 `git reset --hard` instructions are not conditioned "
+        "on a clean worktree",
+    ):
+        assert diagnostic in r.stdout, diagnostic
+
+
 def test_lint_rejects_a_precondition_that_is_stated_then_overridden(tmp_path):
     # The guard can be present and immediately negated. Requiring the reset to
     # be conditioned on a clean tree is what catches this; asserting the
@@ -640,8 +772,8 @@ def test_lint_rejects_a_precondition_that_is_stated_then_overridden(tmp_path):
     r = run({"COLLAB_LINT_ROOT": str(fixture)})
 
     assert r.returncode == 1
-    assert ("collab-turn-review-local.md: reset is not conditioned on a clean "
-            'worktree — expected "Only when the worktree is clean"') in r.stdout
+    assert ("collab-turn-review-local.md: 1 of 1 `git reset --hard` "
+            "instructions are not conditioned on a clean worktree") in r.stdout
 
 
 def test_lint_rejects_issue_254_pre_fix_text_with_the_guard_parked_in_a_comment(
