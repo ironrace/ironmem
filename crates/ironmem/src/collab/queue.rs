@@ -44,6 +44,7 @@ pub fn create_session(
     branch: &str,
     task: Option<&str>,
     implementer: Agent,
+    pilot: Agent,
 ) -> Result<(), MemoryError> {
     // `Agent` is a closed enum so the canonical wire form is guaranteed —
     // no application-layer string validation is needed here. The DB CHECK
@@ -58,9 +59,16 @@ pub fn create_session(
     // which `load_session_record` maps to `None`/`0` exactly like a legacy
     // pre-015 row. `save_session` is the only writer for these fields.
     conn.execute(
-        "INSERT INTO collab_sessions (id, repo_path, branch, task, implementer)
-         VALUES (?1, ?2, ?3, ?4, ?5)",
-        params![id, repo_path, branch, task, implementer.as_str()],
+        "INSERT INTO collab_sessions (id, repo_path, branch, task, implementer, pilot)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        params![
+            id,
+            repo_path,
+            branch,
+            task,
+            implementer.as_str(),
+            pilot.as_str()
+        ],
     )?;
     Ok(())
 }
@@ -87,6 +95,42 @@ pub fn set_implementer(
                  updated_at = datetime('now')
              WHERE id = ?1",
             params![session_id, implementer.as_str()],
+        )?
+    };
+    if updated == 0 {
+        return Err(MemoryError::NotFound(format!(
+            "session {session_id} not found"
+        )));
+    }
+    Ok(())
+}
+
+/// Rebind a session's `pilot` role, optionally also updating
+/// `current_owner` in the same statement. Mirrors `set_implementer` above
+/// exactly — see that function's shape for why the with/without-owner split
+/// exists (a single UPDATE per case, rather than a variable column list).
+pub fn set_pilot(
+    conn: &Connection,
+    session_id: &str,
+    pilot: Agent,
+    current_owner: Option<Agent>,
+) -> Result<(), MemoryError> {
+    let updated = if let Some(owner) = current_owner {
+        conn.execute(
+            "UPDATE collab_sessions
+             SET pilot = ?2,
+                 current_owner = ?3,
+                 updated_at = datetime('now')
+             WHERE id = ?1",
+            params![session_id, pilot.as_str(), owner.as_str()],
+        )?
+    } else {
+        conn.execute(
+            "UPDATE collab_sessions
+             SET pilot = ?2,
+                 updated_at = datetime('now')
+             WHERE id = ?1",
+            params![session_id, pilot.as_str()],
         )?
     };
     if updated == 0 {
@@ -229,7 +273,7 @@ pub fn load_session_record(
                 task_review_round, global_review_round,
                 base_sha, last_head_sha, pr_url, coding_failure,
                 canonical_plan_drawer_id, final_plan_drawer_id,
-                created_at, updated_at, implementer,
+                created_at, updated_at, implementer, pilot,
                 pending_failure, failed_from_phase, recovery_phase,
                 recovery_owner, recovery_origin_owner, recovery_attempts,
                 total_recovery_attempts
@@ -240,6 +284,7 @@ pub fn load_session_record(
             let phase = parse_text_column::<Phase>(row, "phase")?;
             let current_owner = parse_text_column::<Agent>(row, "current_owner")?;
             let implementer = parse_text_column::<Agent>(row, "implementer")?;
+            let pilot = parse_text_column::<Agent>(row, "pilot")?;
             let review_round_i: i64 = row.get("review_round")?;
             let review_round = review_round_i.clamp(0, u8::MAX as i64) as u8;
             let task_list: Option<String> = row.get("task_list")?;
@@ -280,6 +325,7 @@ pub fn load_session_record(
                     last_head_sha: row.get("last_head_sha")?,
                     pr_url: row.get("pr_url")?,
                     coding_failure: row.get("coding_failure")?,
+                    pilot,
                     implementer,
                     pending_failure: row.get("pending_failure")?,
                     failed_from_phase,
@@ -383,8 +429,9 @@ pub fn save_session(conn: &Connection, session: &CollabSession) -> Result<(), Me
              recovery_origin_owner = ?24,
              recovery_attempts = ?25,
              total_recovery_attempts = ?26,
+             pilot = ?27,
              updated_at = datetime('now')
-        WHERE id = ?27",
+        WHERE id = ?28",
         params![
             session.phase.to_string(),
             session.current_owner.as_str(),
@@ -412,6 +459,7 @@ pub fn save_session(conn: &Connection, session: &CollabSession) -> Result<(), Me
             session.recovery_origin_owner.map(|a| a.as_str()),
             session.recovery_attempts as i64,
             session.total_recovery_attempts as i64,
+            session.pilot.as_str(),
             session.id.as_str(),
         ],
     )?;
@@ -445,6 +493,48 @@ pub fn send_message(
         params![id, session_id, sender, receiver, topic, content, drawer_id],
     )?;
     Ok(id)
+}
+
+/// Record a session incident that is not correspondence.
+///
+/// Unlike [`send_message`], the row is self-addressed and inserted with
+/// `status = 'recorded'` rather than the default `'pending'`. Both matter:
+/// [`recv_messages`] filters on `receiver = ? AND status = 'pending'`, so an
+/// incident addressed to the counterpart would be handed to the next worker
+/// that calls `collab_recv` — whose templates enforce a one-recv rule and
+/// expect a specific topic — corrupting that turn's input. This is a record
+/// for the session history, not a message to anyone.
+pub fn record_incident(
+    conn: &Connection,
+    session_id: &str,
+    agent: &str,
+    topic: &str,
+    content: &str,
+    drawer_id: &str,
+) -> Result<String, MemoryError> {
+    let id = Uuid::new_v4().to_string();
+    conn.execute(
+        "INSERT INTO messages
+           (id, session_id, sender, receiver, topic, content, drawer_id, status)
+         VALUES (?1, ?2, ?3, ?3, ?4, ?5, ?6, 'recorded')",
+        params![id, session_id, agent, topic, content, drawer_id],
+    )?;
+    Ok(id)
+}
+
+/// Count incidents of `topic` recorded against a session by
+/// [`record_incident`]. Counts regardless of `status` so a record can never be
+/// hidden by a future inbox-state change.
+pub fn count_incidents(
+    conn: &Connection,
+    session_id: &str,
+    topic: &str,
+) -> Result<i64, MemoryError> {
+    Ok(conn.query_row(
+        "SELECT COUNT(*) FROM messages WHERE session_id = ?1 AND topic = ?2",
+        params![session_id, topic],
+        |row| row.get(0),
+    )?)
 }
 
 pub fn recv_messages(
@@ -646,6 +736,7 @@ mod tests {
         include_str!("../../migrations/015_collab_recovery_state.sql");
     const COLLAB_MESSAGE_DRAWERS_SQL: &str =
         include_str!("../../migrations/016_collab_message_drawers.sql");
+    const COLLAB_PILOT_SQL: &str = include_str!("../../migrations/019_collab_pilot.sql");
     const QUEUE_TEST_DRAWER_IDS: [&str; 7] = [
         "drawer-123",
         "drawer-a",
@@ -687,6 +778,7 @@ mod tests {
         conn.execute_batch(COLLAB_TASK_LIST_REF_SQL).unwrap();
         conn.execute_batch(COLLAB_RECOVERY_STATE_SQL).unwrap();
         conn.execute_batch(COLLAB_MESSAGE_DRAWERS_SQL).unwrap();
+        conn.execute_batch(COLLAB_PILOT_SQL).unwrap();
         for drawer_id in QUEUE_TEST_DRAWER_IDS {
             insert_queue_test_drawer(&conn, drawer_id);
         }
@@ -696,7 +788,16 @@ mod tests {
     #[test]
     fn test_send_recv_ack_fifo() {
         let db = open();
-        create_session(&db, "sess1", "/repo", "main", None, Agent::Claude).unwrap();
+        create_session(
+            &db,
+            "sess1",
+            "/repo",
+            "main",
+            None,
+            Agent::Claude,
+            Agent::Claude,
+        )
+        .unwrap();
         let m1 = send_message(
             &db,
             "sess1",
@@ -732,7 +833,16 @@ mod tests {
     #[test]
     fn test_send_recv_preserves_drawer_id() {
         let db = open();
-        create_session(&db, "sess-drawer", "/repo", "main", None, Agent::Claude).unwrap();
+        create_session(
+            &db,
+            "sess-drawer",
+            "/repo",
+            "main",
+            None,
+            Agent::Claude,
+            Agent::Claude,
+        )
+        .unwrap();
 
         send_message(
             &db,
@@ -753,7 +863,16 @@ mod tests {
     #[test]
     fn test_ack_idempotent() {
         let db = open();
-        create_session(&db, "sess2", "/repo", "main", None, Agent::Claude).unwrap();
+        create_session(
+            &db,
+            "sess2",
+            "/repo",
+            "main",
+            None,
+            Agent::Claude,
+            Agent::Claude,
+        )
+        .unwrap();
         let message_id =
             send_message(&db, "sess2", "claude", "codex", "draft", "x", "drawer-x").unwrap();
         ack_message(&db, "sess2", &message_id).unwrap();
@@ -764,7 +883,16 @@ mod tests {
     #[test]
     fn test_register_caps_upsert() {
         let db = open();
-        create_session(&db, "sess3", "/repo", "main", None, Agent::Claude).unwrap();
+        create_session(
+            &db,
+            "sess3",
+            "/repo",
+            "main",
+            None,
+            Agent::Claude,
+            Agent::Claude,
+        )
+        .unwrap();
         register_caps(
             &db,
             "sess3",
@@ -796,7 +924,16 @@ mod tests {
     #[test]
     fn test_get_caps_empty_before_register() {
         let db = open();
-        create_session(&db, "sess4", "/repo", "main", None, Agent::Claude).unwrap();
+        create_session(
+            &db,
+            "sess4",
+            "/repo",
+            "main",
+            None,
+            Agent::Claude,
+            Agent::Claude,
+        )
+        .unwrap();
         let caps = get_caps(&db, "sess4", Some("claude")).unwrap();
         assert!(caps.is_empty());
     }
@@ -827,6 +964,7 @@ mod tests {
             "main",
             Some("build a landing page"),
             Agent::Claude,
+            Agent::Claude,
         )
         .unwrap();
         let record = load_session_record(&db, "sess-task").unwrap();
@@ -838,7 +976,16 @@ mod tests {
     #[test]
     fn test_review_round_persists() {
         let db = open();
-        create_session(&db, "sess-rr", "/repo", "main", None, Agent::Claude).unwrap();
+        create_session(
+            &db,
+            "sess-rr",
+            "/repo",
+            "main",
+            None,
+            Agent::Claude,
+            Agent::Claude,
+        )
+        .unwrap();
         let mut session = load_session(&db, "sess-rr").unwrap();
         session.review_round = 2;
         save_session(&db, &session).unwrap();
@@ -849,7 +996,16 @@ mod tests {
     #[test]
     fn test_ensure_active_rejects_ended_session() {
         let db = open();
-        create_session(&db, "sess-end", "/repo", "main", None, Agent::Claude).unwrap();
+        create_session(
+            &db,
+            "sess-end",
+            "/repo",
+            "main",
+            None,
+            Agent::Claude,
+            Agent::Claude,
+        )
+        .unwrap();
         ensure_active(&db, "sess-end").unwrap();
         end_session(&db, "sess-end").unwrap();
         let err = ensure_active(&db, "sess-end").unwrap_err();
@@ -859,7 +1015,16 @@ mod tests {
     #[test]
     fn test_end_session_idempotent() {
         let db = open();
-        create_session(&db, "sess-end2", "/repo", "main", None, Agent::Claude).unwrap();
+        create_session(
+            &db,
+            "sess-end2",
+            "/repo",
+            "main",
+            None,
+            Agent::Claude,
+            Agent::Claude,
+        )
+        .unwrap();
         end_session(&db, "sess-end2").unwrap();
         // Calling end_session a second time must succeed (idempotent).
         end_session(&db, "sess-end2").unwrap();
@@ -875,7 +1040,16 @@ mod tests {
     #[test]
     fn test_v2_fields_round_trip() {
         let db = open();
-        create_session(&db, "sess-v2", "/repo", "main", None, Agent::Claude).unwrap();
+        create_session(
+            &db,
+            "sess-v2",
+            "/repo",
+            "main",
+            None,
+            Agent::Claude,
+            Agent::Claude,
+        )
+        .unwrap();
         let mut session = load_session(&db, "sess-v2").unwrap();
         session.task_list = Some(r#"{"plan_hash":"pf","tasks":[{"id":1},{"id":2}]}"#.to_string());
         session.task_review_round = 1;
@@ -901,7 +1075,16 @@ mod tests {
     #[test]
     fn test_v1_defaults_for_fresh_session() {
         let db = open();
-        create_session(&db, "sess-fresh", "/repo", "main", None, Agent::Claude).unwrap();
+        create_session(
+            &db,
+            "sess-fresh",
+            "/repo",
+            "main",
+            None,
+            Agent::Claude,
+            Agent::Claude,
+        )
+        .unwrap();
         let session = load_session(&db, "sess-fresh").unwrap();
         assert!(session.task_list.is_none());
         assert_eq!(session.task_review_round, 0);
@@ -913,12 +1096,208 @@ mod tests {
         assert!(session.canonical_plan_drawer_id.is_none());
         assert!(session.final_plan_drawer_id.is_none());
         assert_eq!(session.tasks_count(), None);
+        assert_eq!(session.pilot, Agent::Claude);
+    }
+
+    // ── pilot field (issue #246 task 2) ──────────────────────────────────────
+
+    #[test]
+    fn test_create_session_pilot_and_implementer_defaults_and_non_default() {
+        let db = open();
+        create_session(
+            &db,
+            "sess-pilot-default",
+            "/repo",
+            "main",
+            None,
+            Agent::Claude,
+            Agent::Claude,
+        )
+        .unwrap();
+        let default_session = load_session(&db, "sess-pilot-default").unwrap();
+        assert_eq!(default_session.pilot, Agent::Claude);
+        assert_eq!(default_session.implementer, Agent::Claude);
+
+        // pilot and implementer are independent knobs: a non-default pilot
+        // with the default implementer must persist as given, not coupled.
+        create_session(
+            &db,
+            "sess-pilot-codex",
+            "/repo",
+            "main",
+            None,
+            Agent::Claude,
+            Agent::Codex,
+        )
+        .unwrap();
+        let mixed_session = load_session(&db, "sess-pilot-codex").unwrap();
+        assert_eq!(mixed_session.pilot, Agent::Codex);
+        assert_eq!(mixed_session.implementer, Agent::Claude);
+    }
+
+    /// The highest-risk edit in this task: `save_session`'s UPDATE gained a
+    /// `pilot = ?27` SET clause, which shifted `WHERE id = ?27` to `?28`. A
+    /// mis-ordered `params!` append would silently write the pilot value
+    /// into the id predicate instead of the pilot column — a bug that a
+    /// round-trip test checking only `pilot` could easily miss (the UPDATE
+    /// would just match zero rows and error, OR if it happened to match by
+    /// coincidence, only the untested columns would be corrupted). Setting
+    /// a non-default value in *every* column and asserting full struct
+    /// equality (not just `pilot`) is what actually catches the bind
+    /// misalignment.
+    #[test]
+    fn test_pilot_round_trip_with_every_field_non_default() {
+        let db = open();
+        create_session(
+            &db,
+            "sess-pilot-full",
+            "/repo",
+            "main",
+            None,
+            Agent::Claude,
+            Agent::Claude,
+        )
+        .unwrap();
+        let mut session = load_session(&db, "sess-pilot-full").unwrap();
+
+        session.phase = Phase::CodeReviewFixGlobalPending;
+        session.current_owner = Agent::Codex;
+        session.claude_draft_hash = Some("claude-hash".to_string());
+        session.codex_draft_hash = Some("codex-hash".to_string());
+        session.canonical_plan_hash = Some("canonical-hash".to_string());
+        session.final_plan_hash = Some("final-hash".to_string());
+        session.canonical_plan_drawer_id = Some("c".repeat(32));
+        session.final_plan_drawer_id = Some("f".repeat(32));
+        session.codex_review_verdict = Some("approve".to_string());
+        session.review_round = 2;
+        session.task_list = Some(r#"{"tasks":[{"id":1}]}"#.to_string());
+        session.task_list_drawer_id = Some("t".repeat(32));
+        session.task_review_round = 1;
+        session.global_review_round = 3;
+        session.base_sha = Some("base-sha".to_string());
+        session.last_head_sha = Some("head-sha".to_string());
+        session.pr_url = Some("https://example/pr/9".to_string());
+        session.coding_failure = Some("gh_auth: token expired".to_string());
+        session.pilot = Agent::Codex;
+        session.implementer = Agent::Codex;
+        session.pending_failure = Some("git_push_failed: remote rejected".to_string());
+        session.failed_from_phase = Some(Phase::CodeImplementPending);
+        session.recovery_phase = Some(Phase::CodeReviewFixGlobalPending);
+        session.recovery_owner = Some(Agent::Codex);
+        session.recovery_origin_owner = Some(Agent::Claude);
+        session.recovery_attempts = 3;
+        session.total_recovery_attempts = 4;
+
+        save_session(&db, &session).unwrap();
+
+        let round_trip = load_session(&db, "sess-pilot-full").unwrap();
+        assert_eq!(
+            round_trip, session,
+            "every field, including pilot, must round-trip byte-identical"
+        );
+        assert_eq!(round_trip.pilot, Agent::Codex);
+        // The id predicate must still target the original row, not have
+        // been overwritten by the pilot bind — reloading by the same id
+        // succeeding at all (rather than erroring NotFound) is itself part
+        // of that proof, but assert it explicitly too.
+        assert_eq!(round_trip.id, "sess-pilot-full");
+    }
+
+    /// `set_pilot` must write `pilot` (and, on the with-owner branch,
+    /// `current_owner`) and nothing else. `implementer` is seeded to
+    /// `Codex`, deliberately *not* equal to the pilot value each branch
+    /// writes, because "`pilot` and `implementer` are orthogonal knobs" is
+    /// this feature's central design claim and the only way this UPDATE can
+    /// break it is by writing `implementer` alongside `pilot`. Seeding
+    /// `implementer` equal to the incoming pilot would make a stray
+    /// `implementer = ?2` bind write the value that was already there —
+    /// invisible. So the with-owner call below drives `pilot = Claude`
+    /// against `implementer = Codex`, and the mirror fixture at the end
+    /// gives the without-owner branch the same asymmetry.
+    #[test]
+    fn test_set_pilot_updates_pilot_and_optional_owner() {
+        let db = open();
+        create_session(
+            &db,
+            "sess-set-pilot",
+            "/repo",
+            "main",
+            None,
+            Agent::Codex,
+            Agent::Claude,
+        )
+        .unwrap();
+        let seeded = load_session(&db, "sess-set-pilot").unwrap();
+        assert_eq!(seeded.implementer, Agent::Codex, "fixture precondition");
+
+        set_pilot(&db, "sess-set-pilot", Agent::Codex, None).unwrap();
+        let session = load_session(&db, "sess-set-pilot").unwrap();
+        assert_eq!(session.pilot, Agent::Codex);
+        assert_eq!(
+            session.current_owner,
+            Agent::Claude,
+            "current_owner must be untouched when None is passed"
+        );
+        assert_eq!(
+            session.implementer,
+            Agent::Codex,
+            "implementer must be untouched by the without-owner branch"
+        );
+
+        set_pilot(&db, "sess-set-pilot", Agent::Claude, Some(Agent::Codex)).unwrap();
+        let session = load_session(&db, "sess-set-pilot").unwrap();
+        assert_eq!(session.pilot, Agent::Claude);
+        assert_eq!(session.current_owner, Agent::Codex);
+        assert_eq!(
+            session.implementer,
+            Agent::Codex,
+            "implementer must be untouched by the with-owner branch"
+        );
+
+        // Mirror fixture: `implementer = Claude` so the without-owner branch
+        // (which writes `pilot = Codex`) also runs against an `implementer`
+        // that differs from the value being bound. Without this, only the
+        // with-owner branch's stray-write case would be falsifiable.
+        create_session(
+            &db,
+            "sess-set-pilot-mirror",
+            "/repo",
+            "main",
+            None,
+            Agent::Claude,
+            Agent::Claude,
+        )
+        .unwrap();
+        set_pilot(&db, "sess-set-pilot-mirror", Agent::Codex, None).unwrap();
+        let mirror = load_session(&db, "sess-set-pilot-mirror").unwrap();
+        assert_eq!(mirror.pilot, Agent::Codex);
+        assert_eq!(
+            mirror.implementer,
+            Agent::Claude,
+            "implementer must be untouched by the without-owner branch"
+        );
+    }
+
+    #[test]
+    fn test_set_pilot_missing_session_returns_not_found() {
+        let db = open();
+        let err = set_pilot(&db, "does-not-exist", Agent::Codex, None).unwrap_err();
+        assert!(err.to_string().contains("not found"));
     }
 
     #[test]
     fn test_recovery_fields_round_trip() {
         let db = open();
-        create_session(&db, "sess-recovery", "/repo", "main", None, Agent::Claude).unwrap();
+        create_session(
+            &db,
+            "sess-recovery",
+            "/repo",
+            "main",
+            None,
+            Agent::Claude,
+            Agent::Claude,
+        )
+        .unwrap();
         let mut session = load_session(&db, "sess-recovery").unwrap();
         session.pending_failure = Some("git_push_failed: remote rejected".to_string());
         session.failed_from_phase = Some(Phase::CodeImplementPending);
@@ -965,7 +1344,16 @@ mod tests {
         // and both attempt counters defaulted to `0` (not propagated as an
         // error or left uninitialized).
         let db = open();
-        create_session(&db, "sess-legacy", "/repo", "main", None, Agent::Claude).unwrap();
+        create_session(
+            &db,
+            "sess-legacy",
+            "/repo",
+            "main",
+            None,
+            Agent::Claude,
+            Agent::Claude,
+        )
+        .unwrap();
         let session = load_session(&db, "sess-legacy").unwrap();
         assert!(session.pending_failure.is_none());
         assert!(session.failed_from_phase.is_none());
@@ -979,7 +1367,16 @@ mod tests {
     #[test]
     fn test_plan_drawer_ids_round_trip() {
         let db = open();
-        create_session(&db, "sess-drawers", "/repo", "main", None, Agent::Claude).unwrap();
+        create_session(
+            &db,
+            "sess-drawers",
+            "/repo",
+            "main",
+            None,
+            Agent::Claude,
+            Agent::Claude,
+        )
+        .unwrap();
 
         // Fresh session: both drawer ids must be NULL (legacy inline path).
         let session = load_session(&db, "sess-drawers").unwrap();
@@ -1008,7 +1405,16 @@ mod tests {
     #[test]
     fn test_ack_messages_many_marks_all_acked() {
         let db = open();
-        create_session(&db, "amm-1", "/repo", "main", None, Agent::Claude).unwrap();
+        create_session(
+            &db,
+            "amm-1",
+            "/repo",
+            "main",
+            None,
+            Agent::Claude,
+            Agent::Claude,
+        )
+        .unwrap();
         let m1 = send_message(
             &db, "amm-1", "claude", "codex", "draft", "msg-a", "drawer-a",
         )
@@ -1038,7 +1444,16 @@ mod tests {
     #[test]
     fn test_ack_messages_many_empty_list_is_noop() {
         let db = open();
-        create_session(&db, "amm-2", "/repo", "main", None, Agent::Claude).unwrap();
+        create_session(
+            &db,
+            "amm-2",
+            "/repo",
+            "main",
+            None,
+            Agent::Claude,
+            Agent::Claude,
+        )
+        .unwrap();
         send_message(
             &db, "amm-2", "claude", "codex", "draft", "msg-a", "drawer-a",
         )
@@ -1055,7 +1470,16 @@ mod tests {
     #[test]
     fn test_ack_messages_many_partial_subset() {
         let db = open();
-        create_session(&db, "amm-3", "/repo", "main", None, Agent::Claude).unwrap();
+        create_session(
+            &db,
+            "amm-3",
+            "/repo",
+            "main",
+            None,
+            Agent::Claude,
+            Agent::Claude,
+        )
+        .unwrap();
         let m1 = send_message(
             &db,
             "amm-3",
@@ -1099,8 +1523,26 @@ mod tests {
     #[test]
     fn test_ack_messages_many_wrong_session_skipped() {
         let db = open();
-        create_session(&db, "amm-4a", "/repo", "main", None, Agent::Claude).unwrap();
-        create_session(&db, "amm-4b", "/repo", "main", None, Agent::Claude).unwrap();
+        create_session(
+            &db,
+            "amm-4a",
+            "/repo",
+            "main",
+            None,
+            Agent::Claude,
+            Agent::Claude,
+        )
+        .unwrap();
+        create_session(
+            &db,
+            "amm-4b",
+            "/repo",
+            "main",
+            None,
+            Agent::Claude,
+            Agent::Claude,
+        )
+        .unwrap();
         let m1 = send_message(&db, "amm-4a", "claude", "codex", "draft", "x", "drawer-x").unwrap();
 
         // Passing the correct message ID but the WRONG session_id: zero rows
@@ -1118,10 +1560,37 @@ mod tests {
     fn find_active_session_including_terminal_isolates_repo_and_branch() {
         let db = open();
         // /repo-a: one ended (older) + one active session on the same branch.
-        create_session(&db, "a-old", "/repo-a", "main", None, Agent::Claude).unwrap();
+        create_session(
+            &db,
+            "a-old",
+            "/repo-a",
+            "main",
+            None,
+            Agent::Claude,
+            Agent::Claude,
+        )
+        .unwrap();
         end_session(&db, "a-old").unwrap();
-        create_session(&db, "a-active-1", "/repo-a", "main", None, Agent::Claude).unwrap();
-        create_session(&db, "a-active-2", "/repo-a", "main", None, Agent::Claude).unwrap();
+        create_session(
+            &db,
+            "a-active-1",
+            "/repo-a",
+            "main",
+            None,
+            Agent::Claude,
+            Agent::Claude,
+        )
+        .unwrap();
+        create_session(
+            &db,
+            "a-active-2",
+            "/repo-a",
+            "main",
+            None,
+            Agent::Claude,
+            Agent::Claude,
+        )
+        .unwrap();
         // `created_at` is second-resolution, so insertion order alone may not
         // disambiguate two same-second rows. Pin both active rows to the SAME
         // instant so the `id DESC` tie-break (not creation timing) is what
@@ -1140,9 +1609,19 @@ mod tests {
             "feature",
             None,
             Agent::Claude,
+            Agent::Claude,
         )
         .unwrap();
-        create_session(&db, "b-active", "/repo-b", "main", None, Agent::Claude).unwrap();
+        create_session(
+            &db,
+            "b-active",
+            "/repo-b",
+            "main",
+            None,
+            Agent::Claude,
+            Agent::Claude,
+        )
+        .unwrap();
 
         let found =
             find_active_session_by_repo_branch_including_terminal(&db, "/repo-a", "main").unwrap();
@@ -1175,7 +1654,16 @@ mod tests {
     #[test]
     fn find_active_session_by_repo_branch_releases_only_coding_complete() {
         let db = open();
-        create_session(&db, "terminal-scope", "/repo", "main", None, Agent::Claude).unwrap();
+        create_session(
+            &db,
+            "terminal-scope",
+            "/repo",
+            "main",
+            None,
+            Agent::Claude,
+            Agent::Claude,
+        )
+        .unwrap();
 
         assert_eq!(
             find_active_session_by_repo_branch(&db, "/repo", "main")
@@ -1196,7 +1684,16 @@ mod tests {
              is a human step and must not block the branch"
         );
 
-        create_session(&db, "coding-scope", "/repo", "main", None, Agent::Claude).unwrap();
+        create_session(
+            &db,
+            "coding-scope",
+            "/repo",
+            "main",
+            None,
+            Agent::Claude,
+            Agent::Claude,
+        )
+        .unwrap();
         let mut coding = load_session(&db, "coding-scope").unwrap();
         coding.phase = Phase::CodeImplementPending;
         coding.current_owner = Agent::Claude;
@@ -1233,7 +1730,16 @@ mod tests {
     #[test]
     fn attribution_lookup_still_sees_coding_complete_sessions() {
         let db = open();
-        create_session(&db, "attested", "/repo", "main", None, Agent::Claude).unwrap();
+        create_session(
+            &db,
+            "attested",
+            "/repo",
+            "main",
+            None,
+            Agent::Claude,
+            Agent::Claude,
+        )
+        .unwrap();
         let mut complete = load_session(&db, "attested").unwrap();
         complete.phase = Phase::CodingComplete;
         save_session(&db, &complete).unwrap();

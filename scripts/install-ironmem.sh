@@ -96,9 +96,11 @@ REQUIRED_CLAUDE_WORKFLOWS=(
 REQUIRED_CLAUDE_PROMPTS=(
   collab-turn-plan-draft
   collab-turn-plan-synthesis
+  collab-turn-plan-review
   collab-turn-plan-finalize
   collab-turn-task-list
   collab-turn-code-implement
+  collab-turn-review-fix-global
   collab-turn-review-local
   collab-turn-final-review
   collab-turn-submit
@@ -110,10 +112,15 @@ REQUIRED_CODEX_COMMANDS=(
 
 REQUIRED_CODEX_PROMPTS=(
   collab-plan-draft
+  collab-plan-synthesis
   collab-plan-review
-  collab-global-review
-  collab-recovery
+  collab-plan-finalize
+  collab-task-list
   collab-batch-impl
+  collab-global-review
+  collab-review-local
+  collab-final-review
+  collab-recovery
   evaluate-issue
 )
 

@@ -5,6 +5,9 @@ use serde_json::Value;
 
 use super::MAX_TASKS_PER_COLLAB_ISSUE;
 
+// Allowed values for `execution_mode` on a `task_list` payload. Absence means
+// default (subagent-driven). The string `"subagent_driven"` is intentionally
+// NOT in this set — callers omit the field for the default path.
 const ALLOWED_EXECUTION_MODES: &[&str] = &["mechanical_direct"];
 
 /// Validation failure for the JSON body stored with a collab task list.

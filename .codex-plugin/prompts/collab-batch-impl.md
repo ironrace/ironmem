@@ -39,21 +39,45 @@ act only
 when phase is `CodeImplementPending`, implementer is `codex`, and Codex owns
 the turn. Otherwise exit with a concise stale-invocation status.
 
+If `pending_failure` is non-null and Codex owns recovery — or a normal turn
+finds a dirty worktree (next paragraph) — preserve and inspect the current
+diff before any fetch, checkout, or reset, and skip the sync in the next
+paragraph entirely. Run this phase's gates, commit and push recovered work,
+and send the normal completion event exactly once. If you reached this path
+from the dirty-worktree check below rather than from a reported failure, a
+previous turn died without reporting it; after committing, record that once
+with `collab_send(sender="codex", topic="orphan_recovered",
+content=<JSON {"phase":"CodeImplementPending","recovered_sha":"<HEAD>",
+"detail":"<what you found>"}>)` — it records and returns without advancing the
+phase, changing owner, or spending a recovery attempt, so it is sent in
+addition to the normal completion event.
+
 For a normal turn, read `last_head_sha`, `base_sha`, `repo_path`, branch,
 `task_list_ref`, and execution mode. Load the manifest with
 `get_drawer(id=<task_list_ref.drawer_id>)`, then verify its SHA-256 against
 `task_list_ref.hash`; do not request `include_task_list`. Work in `repo_path`.
-First take the fast path when
-both local HEAD equals `last_head_sha` and the checked-out branch equals the
-session branch. Otherwise fetch the branch, verify the SHA with
-`git cat-file -e`, checkout the session branch, and hard-reset to the recorded
-SHA. If the SHA is absent, send `failure_report` with detailed
-`branch_drift:` and exit. Do not repeat a pre-work test: the sender's active
-turn already ran the post-work gate.
-
-If `pending_failure` is non-null and Codex owns recovery, preserve and inspect
-the current diff before fetch/checkout/reset. Run this phase's gates, commit
-and push recovered work, and send the normal completion event exactly once.
+First take the fast path when all three hold: local HEAD equals
+`last_head_sha`, the checked-out branch equals the session branch, and
+`git status --porcelain` is empty. Cleanliness is a condition of the fast path
+and not only of the reset: the state after an in-container OOM is exactly
+"HEAD still at `last_head_sha`, branch correct, tree dirty", so a two-condition
+fast path skips the reset — destroying nothing — and then builds this batch on
+top of the dead turn's unrecovered work, silently merging it into yours. A
+dirty tree here takes the recovery path above instead. Otherwise fetch the
+branch, verify the SHA with
+`git cat-file -e` and checkout the session branch. If the SHA is absent, send
+`failure_report` with detailed `branch_drift:` and exit. Immediately before
+resetting, require `git status --porcelain` to be empty regardless of
+`pending_failure`, and require `git rev-list <last_head_sha>..HEAD` to be empty
+as well: `--porcelain` says nothing about work that was committed but never
+pushed, and the reset discards it just the same. Either check failing means a
+prior turn died without
+reporting `pending_failure` (OOM, container kill, sandbox teardown), not that
+there is nothing to recover — do not run `git reset --hard`; instead preserve
+and inspect the diff on the recovery path above, which covers this case too.
+Only when the worktree is clean, `git reset --hard <last_head_sha>`. Do not
+repeat a pre-work test: the sender's active turn already ran the post-work
+gate.
 
 ## Checkpoints
 

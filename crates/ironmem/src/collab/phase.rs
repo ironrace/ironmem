@@ -6,33 +6,90 @@ pub enum Phase {
     // Planning (v1)
     PlanParallelDrafts,
     PlanSynthesisPending,
-    PlanCodexReviewPending,
-    PlanClaudeFinalizePending,
+    PlanCopilotReviewPending,
+    PlanFinalizePending,
     PlanLocked,
     // Coding (v3) — batch implementation. The selected implementer
-    // orchestrates per-task subagents (via superpowers:subagent-driven-development)
-    // entirely on its side. The single transition out is `implementation_done`,
-    // which jumps straight to global review.
+    // orchestrates per-task subagents (via `iron-build`, or directly when
+    // `execution_mode` says so) entirely on its side. The single transition
+    // out is `implementation_done`, which jumps straight to global review.
     CodeImplementPending,
     // Coding (v3) — global review, 3-phase linear:
-    //   CodeReviewFixGlobalPending (Codex reads the raw post-implementation
-    //   diff and applies fixes directly; no Claude pre-clean)
-    //   → CodeReviewLocalPending (Claude audits Codex's commits via
+    //   CodeReviewFixGlobalPending (the copilot reads the raw
+    //   post-implementation diff and applies fixes directly; no pilot
+    //   pre-clean)
+    //   → CodeReviewLocalPending (the pilot audits the copilot's commits via
     //     `/ultrareview-local` and catches code-quality issues both agents
     //     missed)
-    //   → CodeReviewFinalPending (Claude opens the PR)
-    // Note: enum variants are listed in alphabetical/legacy order for
-    // wire compatibility (`PHASE_NAMES` mapping); the transition order is
-    // enforced by `state_machine::mod::apply_event`, not by variant order.
+    //   → CodeReviewFinalPending (the pilot opens the PR)
+    // "Pilot" is the session's `pilot` agent and "copilot" is its
+    // counterpart; the split is per-session, not a fixed Claude/Codex
+    // assignment.
+    // Note: these three are listed in legacy order, not transition order —
+    // variant order carries no meaning here. The wire form comes from
+    // `wire_name`, and the transition order is enforced by
+    // `state_machine::mod::apply_event`.
     CodeReviewLocalPending,
     CodeReviewFixGlobalPending,
     CodeReviewFinalPending,
     // Coding (v3) — terminal
     CodingComplete,
+    // `CodingFailed` must remain the LAST declared variant: the
+    // compile-time completeness proof below anchors `ALL_PHASES.len()` on
+    // its discriminant. New variants go *before* it. Declaration order is
+    // otherwise cosmetic — the wire form comes from `wire_name`, never from
+    // the discriminant.
     CodingFailed,
 }
 
-/// Authoritative mapping between `Phase` variants and the DB string forms.
+/// Every `Phase` variant, in declaration order. The parse/serialize tests
+/// iterate this rather than `PHASE_NAMES`, so a variant missing a table row
+/// is a test failure instead of being invisible.
+///
+/// Completeness is proved at compile time by the `const` block below, not by
+/// review: each slot must hold the variant whose discriminant equals its
+/// index, and the length must equal the last variant's discriminant plus
+/// one. Inserting a variant anywhere shifts a discriminant and breaks one of
+/// those two assertions.
+const ALL_PHASES: &[Phase] = &[
+    Phase::PlanParallelDrafts,
+    Phase::PlanSynthesisPending,
+    Phase::PlanCopilotReviewPending,
+    Phase::PlanFinalizePending,
+    Phase::PlanLocked,
+    Phase::CodeImplementPending,
+    Phase::CodeReviewLocalPending,
+    Phase::CodeReviewFixGlobalPending,
+    Phase::CodeReviewFinalPending,
+    Phase::CodingComplete,
+    Phase::CodingFailed,
+];
+
+const _: () = {
+    assert!(
+        ALL_PHASES.len() == Phase::CodingFailed as usize + 1,
+        "ALL_PHASES must list every Phase variant (CodingFailed must stay last)"
+    );
+    let mut i = 0;
+    while i < ALL_PHASES.len() {
+        assert!(
+            ALL_PHASES[i] as usize == i,
+            "ALL_PHASES must list every Phase variant once, in declaration order"
+        );
+        i += 1;
+    }
+    assert!(
+        PHASE_NAMES.len() == ALL_PHASES.len(),
+        "PHASE_NAMES must have exactly one row per Phase variant"
+    );
+};
+
+/// Parse table for the DB string forms. `Display` does **not** read this —
+/// it delegates to the exhaustive [`Phase::wire_name`] match, so a variant
+/// with no row here can never serialize as a placeholder. This table is the
+/// reverse direction only (`FromStr`); the length assertion above and the
+/// round-trip test below together pin it as an exact inverse of `wire_name`.
+///
 /// String values are byte-identical to what the old match-based `Display`
 /// and `TryFrom` produced — changing them would corrupt stored sessions.
 ///
@@ -44,11 +101,8 @@ pub enum Phase {
 const PHASE_NAMES: &[(Phase, &str)] = &[
     (Phase::PlanParallelDrafts, "PlanParallelDrafts"),
     (Phase::PlanSynthesisPending, "PlanSynthesisPending"),
-    (Phase::PlanCodexReviewPending, "PlanCodexReviewPending"),
-    (
-        Phase::PlanClaudeFinalizePending,
-        "PlanClaudeFinalizePending",
-    ),
+    (Phase::PlanCopilotReviewPending, "PlanCodexReviewPending"),
+    (Phase::PlanFinalizePending, "PlanClaudeFinalizePending"),
     (Phase::PlanLocked, "PlanLocked"),
     (Phase::CodeImplementPending, "CodeImplementPending"),
     (Phase::CodeReviewLocalPending, "CodeReviewLocalPending"),
@@ -62,6 +116,38 @@ const PHASE_NAMES: &[(Phase, &str)] = &[
 ];
 
 impl Phase {
+    /// The DB/wire string for this variant — the single source of truth for
+    /// serialization, which `Display` merely forwards to.
+    ///
+    /// Written as an exhaustive `match` (no `_` arm) on purpose: adding a
+    /// `Phase` variant is a **compile error** here until it is given a wire
+    /// string. That is what closes the old failure mode where a table-lookup
+    /// `Display` fell back to a placeholder, `save_session` wrote that
+    /// placeholder into `collab_sessions.phase` (a column with no CHECK
+    /// constraint), and the next `load_session_record` could never parse it
+    /// back — leaving the session permanently unloadable.
+    ///
+    /// Strings are byte-identical to the historical ones, including the two
+    /// variants whose Rust names were later genericized
+    /// (`PlanCopilotReviewPending` → `"PlanCodexReviewPending"`,
+    /// `PlanFinalizePending` → `"PlanClaudeFinalizePending"`). Changing any
+    /// of them corrupts stored sessions.
+    pub const fn wire_name(&self) -> &'static str {
+        match self {
+            Self::PlanParallelDrafts => "PlanParallelDrafts",
+            Self::PlanSynthesisPending => "PlanSynthesisPending",
+            Self::PlanCopilotReviewPending => "PlanCodexReviewPending",
+            Self::PlanFinalizePending => "PlanClaudeFinalizePending",
+            Self::PlanLocked => "PlanLocked",
+            Self::CodeImplementPending => "CodeImplementPending",
+            Self::CodeReviewLocalPending => "CodeReviewLocalPending",
+            Self::CodeReviewFixGlobalPending => "CodeReviewFixGlobalPending",
+            Self::CodeReviewFinalPending => "CodeReviewFinalPending",
+            Self::CodingComplete => "CodingComplete",
+            Self::CodingFailed => "CodingFailed",
+        }
+    }
+
     /// True for phases that permanently end the session. `wait_my_turn` uses
     /// a dynamic terminal set: `PlanLocked` is terminal pre-`task_list`, and
     /// `{CodingComplete, CodingFailed}` is the terminal set post-`task_list`.
@@ -105,8 +191,8 @@ impl Phase {
         match self {
             Self::PlanParallelDrafts => "SubmitDraft",
             Self::PlanSynthesisPending => "PublishCanonical",
-            Self::PlanCodexReviewPending => "SubmitReview",
-            Self::PlanClaudeFinalizePending => "PublishFinal",
+            Self::PlanCopilotReviewPending => "SubmitReview",
+            Self::PlanFinalizePending => "PublishFinal",
             Self::PlanLocked => "SubmitTaskList",
             Self::CodeImplementPending => "ImplementationDone",
             Self::CodeReviewLocalPending => "ReviewLocal",
@@ -119,12 +205,7 @@ impl Phase {
 
 impl fmt::Display for Phase {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let name = PHASE_NAMES
-            .iter()
-            .find(|(p, _)| p == self)
-            .map(|(_, n)| *n)
-            .unwrap_or("UNKNOWN");
-        f.write_str(name)
+        f.write_str(self.wire_name())
     }
 }
 
@@ -145,5 +226,82 @@ impl TryFrom<&str> for Phase {
 
     fn try_from(value: &str) -> Result<Self, Self::Error> {
         value.parse()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_renamed_plan_copilot_review_pending() {
+        // Verify that the renamed variant still serializes to the original wire string
+        let phase = Phase::PlanCopilotReviewPending;
+        assert_eq!(phase.to_string(), "PlanCodexReviewPending");
+    }
+
+    #[test]
+    fn test_renamed_plan_finalize_pending() {
+        // Verify that the renamed variant still serializes to the original wire string
+        let phase = Phase::PlanFinalizePending;
+        assert_eq!(phase.to_string(), "PlanClaudeFinalizePending");
+    }
+
+    #[test]
+    fn test_parse_plan_codex_review_pending() {
+        // Verify that parsing the original wire string produces the renamed variant
+        let phase: Phase = "PlanCodexReviewPending".parse().expect("parse failed");
+        assert_eq!(phase, Phase::PlanCopilotReviewPending);
+    }
+
+    #[test]
+    fn test_parse_plan_claude_finalize_pending() {
+        // Verify that parsing the original wire string produces the renamed variant
+        let phase: Phase = "PlanClaudeFinalizePending".parse().expect("parse failed");
+        assert_eq!(phase, Phase::PlanFinalizePending);
+    }
+
+    /// Round-trip every variant through the DB encoding.
+    ///
+    /// Iterates `ALL_PHASES` (the variant set), deliberately **not**
+    /// `PHASE_NAMES`. Driving the loop from the parse table would make the
+    /// test self-referential — `Display` would be checked against the very
+    /// row it was read from, and a variant with no row at all would simply
+    /// never be visited. Iterating the variant set instead means a missing
+    /// or mismatched `PHASE_NAMES` row fails here, and `ALL_PHASES` itself
+    /// is proved complete by the `const` assertions in this module.
+    #[test]
+    fn test_all_phases_round_trip() {
+        for phase in ALL_PHASES {
+            let as_string = phase.to_string();
+            assert_eq!(
+                as_string,
+                phase.wire_name(),
+                "Display must forward to wire_name for {phase:?}"
+            );
+
+            let parsed: Phase = as_string
+                .parse()
+                .unwrap_or_else(|e| panic!("{phase:?} has no PHASE_NAMES row: {e}"));
+            assert_eq!(
+                parsed, *phase,
+                "Round-trip failed for phase {phase:?}: got {parsed:?} after parsing {as_string}"
+            );
+        }
+    }
+
+    /// The inverse direction: no `PHASE_NAMES` row may be stale (naming a
+    /// wire string that `wire_name` no longer emits). Together with the
+    /// `const` length assertion and the round-trip above, this pins the
+    /// table as an exact inverse of `wire_name`.
+    #[test]
+    fn test_phase_names_rows_match_wire_names() {
+        for (phase, name) in PHASE_NAMES {
+            assert_eq!(
+                phase.wire_name(),
+                *name,
+                "stale PHASE_NAMES row for {phase:?}"
+            );
+        }
     }
 }

@@ -6,7 +6,7 @@ topics: [final]
 preconditions: phase == PlanClaudeFinalizePending, current_owner == claude
 ---
 
-# Collab worker — finalize into Superpowers task plan
+# Collab worker — finalize into iron-build-compatible task markdown
 
 > ANTI-PUPPETEERING: You received only this template and `$SESSION_ID`. Discover
 > all state yourself. Your final message MUST be the ≤3-line verdict only; never
@@ -27,7 +27,7 @@ preconditions: phase == PlanClaudeFinalizePending, current_owner == claude
    blocker. Never issue a second receive after auto-ack.
 
 ## Actions
-1. Produce the final execution plan as a Superpowers-compatible task markdown
+1. Produce the final execution plan as an iron-build-compatible task markdown
    document, not as a prose plan that needs a second planning conversion later.
    Incorporate Codex's review notes unless they conflict with user intent.
 2. Save the exact markdown to

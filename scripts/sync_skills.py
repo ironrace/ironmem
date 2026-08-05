@@ -40,6 +40,36 @@ TARGETS = {
 
 GENERATED_HEADER = "<!-- GENERATED from skills/ — do not edit -->"
 
+# Skills this repo does not install, so a prompt that names one resolves to
+# nothing on a standalone install and the worker silently freelances the step
+# instead of failing loudly. Two ways a name lands here: most are also in
+# `install-ironmem.sh`'s LEGACY_SHARED_SKILLS, which *deletes* them on upgrade;
+# the rest (`superpowers`, `brainstorming`, `git-worktree-manager`,
+# `worktree_cleanup`) are simply never installed and have no removal entry. The
+# two lists are deliberately not coupled — do not "resync" them. Canonical list:
+# consumed by test_sync_skills.py for the generated skill tree and by
+# check_collab_turn_templates.py for the prompt/command/doc surface, so the
+# denylist cannot drift between the two gates.
+#
+# Scope note: only surfaces that *instruct* an agent are scanned. CHANGELOG.md,
+# ATTRIBUTION.md (MIT obligation), install-ironmem.sh's removal list, and the
+# benchmark docs — where `superpowers` names the competing A/B arm rather than
+# a skill invocation — are deliberately outside both gates' surface lists.
+UNINSTALLED_SKILL_NAMES = (
+    "superpowers",
+    "brainstorming",
+    "writing-plans",
+    "subagent-driven-development",
+    "executing-plans",
+    "using-git-worktrees",
+    "finishing-a-development-branch",
+    "requesting-code-review",
+    "test-driven-development",
+    "using-superpowers",
+    "git-worktree-manager",
+    "worktree_cleanup",
+)
+
 # The generator owns only `iron-*` subtrees inside each target. ATTRIBUTION.md
 # and .codex-plugin/skills/pr-review-toolkit/ are hand-maintained and must
 # survive regeneration untouched.

@@ -30,7 +30,7 @@ preconditions: phase == PlanSynthesisPending, current_owner == claude
 Merge Claude's draft and the retrieved Codex draft into one canonical plan and
 `collab_send(sender="claude", topic="canonical", content=<canonical text>)`.
 Do not enter Plan Mode and do not ask for user approval here; the single human
-planning gate is the final Superpowers task plan.
+planning gate is the final approved task plan.
 
 ## Verdict
 Return EXACTLY these ≤3 lines, nothing else:

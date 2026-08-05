@@ -11,10 +11,17 @@ use super::{
 /// Construct a fresh `CollabSession` positioned at the v3 global-review
 /// stage, for the coding-review shortcut. Rejects empty SHAs so the
 /// session never enters the review flow with unset drift-detection state.
+/// `pilot` is the agent leading the review session; `new_global_review`
+/// derives `current_owner = counterpart(pilot)` and `implementer = pilot`
+/// from it. The MCP layer (`handle_collab_start_code_review`) resolves and
+/// forwards a real `pilot` choice (defaulting to `Agent::Claude`); this is
+/// independent of that same layer's `initiator must be 'claude'` check,
+/// which constrains the *dispatcher* invoking the shortcut, not the pilot.
 pub fn start_global_review_session(
     id: &str,
     base_sha: &str,
     head_sha: &str,
+    pilot: Agent,
 ) -> Result<CollabSession, CollabError> {
     if base_sha.is_empty() {
         return Err(CollabError::MissingBaseSha);
@@ -22,13 +29,15 @@ pub fn start_global_review_session(
     if head_sha.is_empty() {
         return Err(CollabError::MissingHeadSha);
     }
-    Ok(CollabSession::new_global_review(id, base_sha, head_sha))
+    Ok(CollabSession::new_global_review(
+        id, base_sha, head_sha, pilot,
+    ))
 }
 
-/// Maximum number of review cycles Codex may run on the canonical plan.
-/// Planning is intentionally one-pass after the blind drafts: Claude
-/// synthesizes once, Codex reviews once, then Claude finalizes the
-/// execution-ready task plan.
+/// Maximum number of review cycles the copilot may run on the canonical
+/// plan. Planning is intentionally one-pass after the blind drafts: the
+/// pilot synthesizes once, the copilot reviews once, then the pilot
+/// finalizes the execution-ready task plan.
 pub(super) const MAX_REVIEW_ROUNDS: u8 = 1;
 
 /// Maximum number of recoverable ("tooling") `FailureReport`s tolerated per
@@ -78,11 +87,43 @@ fn require_actor(actor: Agent, expected: Agent) -> Result<(), CollabError> {
 /// The other agent in the two-party collab protocol. Used to flip
 /// `current_owner`/`recovery_owner` to the counterpart of whichever agent
 /// reported a recoverable ("tooling") failure.
-fn counterpart(agent: Agent) -> Agent {
+///
+/// `pub(super)` so `session::new_global_review` (a sibling module under
+/// `collab`) can derive `current_owner` from a `pilot` argument without
+/// reimplementing the same flip logic.
+pub(super) fn counterpart(agent: Agent) -> Agent {
     match agent {
         Agent::Claude => Agent::Codex,
         Agent::Codex => Agent::Claude,
     }
+}
+
+/// The session's *pilot*: the agent that synthesizes and finalizes the plan
+/// (`publish_canonical`, `publish_final`, `submit_task_list`) and audits the
+/// copilot's commits (`review_local`, `final_review`). Persisted on the
+/// session, so this is a plain read — it exists as a named accessor purely
+/// so every role decision in `apply_event` reads as `pilot(session)` /
+/// `copilot(session)` rather than a bare field access next to a hardcoded
+/// agent literal.
+fn pilot(session: &CollabSession) -> Agent {
+    session.pilot
+}
+
+/// The session's *copilot*: the agent that reviews the canonical plan
+/// (`submit_review`) and applies the post-implementation global fixes
+/// (`review_fix_global`). Always `counterpart(session.pilot)` — derived on
+/// the fly and deliberately never stored, so there is no second column that
+/// could drift out of sync with `pilot`.
+///
+/// Note that `implementer` is an independent knob: it is read straight off
+/// the session and is neither derived from nor validated against these two.
+///
+/// `pub(crate)` (unlike `pilot`, which stays private) so the MCP layer's
+/// `collab_approve` handler can gate on the same derivation this module
+/// enforces with, rather than re-deriving the copilot from `session.pilot`
+/// itself and creating a second place that could drift.
+pub(crate) fn copilot(session: &CollabSession) -> Agent {
+    counterpart(session.pilot)
 }
 
 /// Like `require_actor`, but additionally permits a one-turn delegated
@@ -224,45 +265,52 @@ pub fn apply_event(
     let mut next = session.clone();
 
     match (&session.phase, event) {
-        (Phase::PlanParallelDrafts, CollabEvent::SubmitDraft { content_hash }) => match actor {
-            Agent::Claude => {
-                if session.claude_draft_hash.is_some() {
-                    return Err(CollabError::AlreadySubmittedDraft {
-                        agent: actor.to_string(),
-                    });
+        (Phase::PlanParallelDrafts, CollabEvent::SubmitDraft { content_hash }) => {
+            // The two draft-hash columns are keyed by agent *identity*, not
+            // by role — `claude_draft_hash` holds Claude's draft under any
+            // pilot assignment — so slot selection stays a literal
+            // `actor` / `counterpart(actor)` split. That axis is independent
+            // of the pilot/copilot decision made further down.
+            let (own_slot, other_has_drafted) = match actor {
+                Agent::Claude => {
+                    let other = next.codex_draft_hash.is_some();
+                    (&mut next.claude_draft_hash, other)
                 }
-                next.claude_draft_hash = Some(content_hash.clone());
-                if session.codex_draft_hash.is_some() {
-                    next.phase = Phase::PlanSynthesisPending;
-                    next.current_owner = Agent::Claude;
-                } else {
-                    next.current_owner = Agent::Codex;
+                Agent::Codex => {
+                    let other = next.claude_draft_hash.is_some();
+                    (&mut next.codex_draft_hash, other)
                 }
+            };
+            if own_slot.is_some() {
+                return Err(CollabError::AlreadySubmittedDraft {
+                    agent: actor.to_string(),
+                });
             }
-            Agent::Codex => {
-                if session.codex_draft_hash.is_some() {
-                    return Err(CollabError::AlreadySubmittedDraft {
-                        agent: actor.to_string(),
-                    });
-                }
-                next.codex_draft_hash = Some(content_hash.clone());
-                // Whether Claude has drafted or not, the next owner is
-                // always Claude — either to synthesize or to wait for
-                // Codex's draft to land first.
-                next.current_owner = Agent::Claude;
-                if session.claude_draft_hash.is_some() {
-                    next.phase = Phase::PlanSynthesisPending;
-                }
+            *own_slot = Some(content_hash.clone());
+            if other_has_drafted {
+                // Both blind drafts are in. Synthesis is the pilot's job,
+                // whichever agent happened to submit second.
+                next.phase = Phase::PlanSynthesisPending;
+                next.current_owner = pilot(session);
+            } else {
+                // Exactly one draft is in and it is `actor`'s, so the agent
+                // still owing a draft *is* `counterpart(actor)` — hand it
+                // the turn. This one branch reproduces both of the old
+                // per-agent arms: under `pilot=claude`, an `actor=Claude`
+                // first draft yields Codex (as before), and an
+                // `actor=Codex` first draft yields Claude — which the old
+                // Codex arm reached by unconditionally assigning Claude.
+                next.current_owner = counterpart(actor);
             }
-        },
-        (Phase::PlanSynthesisPending, CollabEvent::PublishCanonical { content_hash }) => {
-            require_actor(actor, Agent::Claude)?;
-            next.canonical_plan_hash = Some(content_hash.clone());
-            next.phase = Phase::PlanCodexReviewPending;
-            next.current_owner = Agent::Codex;
         }
-        (Phase::PlanCodexReviewPending, CollabEvent::SubmitReview { verdict }) => {
-            require_actor(actor, Agent::Codex)?;
+        (Phase::PlanSynthesisPending, CollabEvent::PublishCanonical { content_hash }) => {
+            require_actor(actor, pilot(session))?;
+            next.canonical_plan_hash = Some(content_hash.clone());
+            next.phase = Phase::PlanCopilotReviewPending;
+            next.current_owner = copilot(session);
+        }
+        (Phase::PlanCopilotReviewPending, CollabEvent::SubmitReview { verdict }) => {
+            require_actor(actor, copilot(session))?;
             if !matches!(
                 verdict.as_str(),
                 "approve" | "approve_with_minor_edits" | "request_changes"
@@ -279,14 +327,14 @@ pub fn apply_event(
                 .saturating_add(1)
                 .min(MAX_REVIEW_ROUNDS);
 
-            // Codex gets exactly one review pass. Any requested changes are
-            // folded into Claude's final execution-ready task plan; planning
-            // never re-enters synthesis.
-            next.phase = Phase::PlanClaudeFinalizePending;
-            next.current_owner = Agent::Claude;
+            // The copilot gets exactly one review pass. Any requested
+            // changes are folded into the pilot's final execution-ready task
+            // plan; planning never re-enters synthesis.
+            next.phase = Phase::PlanFinalizePending;
+            next.current_owner = pilot(session);
         }
-        (Phase::PlanClaudeFinalizePending, CollabEvent::PublishFinal { content_hash }) => {
-            require_actor(actor, Agent::Claude)?;
+        (Phase::PlanFinalizePending, CollabEvent::PublishFinal { content_hash }) => {
+            require_actor(actor, pilot(session))?;
             next.final_plan_hash = Some(content_hash.clone());
             next.phase = Phase::PlanLocked;
         }
@@ -301,7 +349,7 @@ pub fn apply_event(
                 head_sha,
             },
         ) => {
-            require_actor(actor, Agent::Claude)?;
+            require_actor(actor, pilot(session))?;
             let expected = session
                 .final_plan_hash
                 .as_deref()
@@ -360,48 +408,53 @@ pub fn apply_event(
             next.last_head_sha = Some(head_sha.clone());
             next.phase = Phase::CodeImplementPending;
             // Owner of the batch implementation phase is whichever agent
-            // the user selected most recently. Default sessions have
-            // `implementer == Agent::Claude` (historical flow); sessions
-            // started or joined with `--implementer=codex` route Codex into
-            // the batch phase to drive its own subagent-driven-development.
+            // the user selected most recently. `handle_collab_start` defaults
+            // `implementer` to the resolved pilot, so a plain session (pilot
+            // defaults to `Agent::Claude`) has `implementer == Agent::Claude`
+            // (historical flow), while `--pilot=codex` with `implementer`
+            // omitted routes Codex into the batch phase — as does an explicit
+            // `--implementer=codex` at start or join, under either pilot.
             next.current_owner = session.implementer;
         }
         // ── v3: batch implementation → global review ──────────────────────
-        // The implementer agent (Claude by default; Codex when selected at
-        // `collab_start`) drives per-task subagent work on its side via
-        // `superpowers:writing-plans` → `superpowers:subagent-driven-development`.
-        // The other agent does not participate per-task; the single
-        // transition out of `CodeImplementPending` jumps to global review
-        // with Codex as owner — Codex first; Claude audits after. Payload
-        // carries only `head_sha` (anti-puppeteering).
+        // The implementer drives per-task subagent work on its side via
+        // `iron-build` (or directly, per `execution_mode` — the server never
+        // observes which); the other agent does not participate per-task. The
+        // single transition out of `CodeImplementPending` jumps to global
+        // review with the copilot as owner — copilot first; the pilot audits
+        // after. Payload carries only `head_sha` (anti-puppeteering).
+        //
+        // The actor check stays keyed to `session.implementer`: who wrote the
+        // code is a knob orthogonal to the pilot/copilot role split, so a
+        // session may legitimately have its implementer equal to either role.
         (Phase::CodeImplementPending, CollabEvent::ImplementationDone { head_sha }) => {
             require_actor_or_recovery(session, actor, session.implementer)?;
             next.last_head_sha = Some(head_sha.clone());
             next.phase = Phase::CodeReviewFixGlobalPending;
-            next.current_owner = Agent::Codex;
+            next.current_owner = copilot(session);
             clear_recovery_state(&mut next);
         }
-        // ── v3: global review, 3-phase linear (Codex first; Claude audits after) ──
+        // ── v3: global review, 3-phase linear (copilot first; pilot audits after) ──
         (Phase::CodeReviewFixGlobalPending, CollabEvent::CodeReviewFixGlobal { head_sha }) => {
-            require_actor_or_recovery(session, actor, Agent::Codex)?;
+            require_actor_or_recovery(session, actor, copilot(session))?;
             next.last_head_sha = Some(head_sha.clone());
             next.phase = Phase::CodeReviewLocalPending;
-            next.current_owner = Agent::Claude;
+            next.current_owner = pilot(session);
             clear_recovery_state(&mut next);
         }
         (Phase::CodeReviewLocalPending, CollabEvent::ReviewLocal { head_sha }) => {
-            require_actor_or_recovery(session, actor, Agent::Claude)?;
+            require_actor_or_recovery(session, actor, pilot(session))?;
             next.last_head_sha = Some(head_sha.clone());
             next.phase = Phase::CodeReviewFinalPending;
-            next.current_owner = Agent::Claude;
+            next.current_owner = pilot(session);
             clear_recovery_state(&mut next);
         }
         (Phase::CodeReviewFinalPending, CollabEvent::FinalReview { head_sha, pr_url }) => {
-            require_actor_or_recovery(session, actor, Agent::Claude)?;
+            require_actor_or_recovery(session, actor, pilot(session))?;
             next.last_head_sha = Some(head_sha.clone());
             next.pr_url = Some(pr_url.clone());
             next.phase = Phase::CodingComplete;
-            next.current_owner = Agent::Claude;
+            next.current_owner = pilot(session);
             clear_recovery_state(&mut next);
         }
         // ── v3: failure is valid from any coding-active phase ─────────────
@@ -419,8 +472,20 @@ pub fn apply_event(
             // session participant abort the session with no diagnostic
             // value, so we reject the empty form and demand at least one
             // byte of context.
-            let is_off_turn_admissible =
-                off_turn_failure_is_admissible(coding_failure, actor, session.current_owner);
+            //
+            // The dispatch-failure half is also scoped to the phases whose
+            // Codex turn Claude actually dispatches, which is why `phase` and
+            // `session.implementer` are threaded in. Without that scope the
+            // pilot-owned `CodeReviewLocalPending`/`CodeReviewFinalPending`
+            // turns — Codex-owned whenever `pilot == Agent::Codex` — could be
+            // taken by the copilot with a fabricated report.
+            let is_off_turn_admissible = off_turn_failure_is_admissible(
+                coding_failure,
+                actor,
+                session.current_owner,
+                *phase,
+                session.implementer,
+            );
             if !is_off_turn_admissible && actor != session.current_owner {
                 return Err(CollabError::NotYourTurn {
                     expected: session.current_owner.to_string(),

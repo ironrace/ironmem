@@ -21,8 +21,9 @@ use code_maps::{handle_code_map_load, handle_code_map_status, handle_code_map_wr
 use collab_caps::{handle_collab_get_caps, handle_collab_register_caps};
 use collab_session::{
     handle_collab_ack, handle_collab_approve, handle_collab_end, handle_collab_recv,
-    handle_collab_resume, handle_collab_send, handle_collab_set_implementer, handle_collab_start,
-    handle_collab_start_code_review, handle_collab_status, handle_collab_wait_my_turn,
+    handle_collab_resume, handle_collab_send, handle_collab_set_implementer,
+    handle_collab_set_pilot, handle_collab_start, handle_collab_start_code_review,
+    handle_collab_status, handle_collab_wait_my_turn,
 };
 use diary::{handle_diary_read, handle_diary_write};
 use drawers::{
@@ -270,7 +271,7 @@ pub fn tool_definitions(app: &App) -> Vec<Value> {
         }),
         json!({
             "name": "collab_start",
-            "description": "Create a bounded Claude↔Codex planning session. task is visible in collab_status; implementer selects the coding owner.",
+            "description": "Create a bounded Claude↔Codex planning session. task is visible in collab_status; pilot picks the planning lead (default claude); implementer defaults to pilot.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -278,6 +279,7 @@ pub fn tool_definitions(app: &App) -> Vec<Value> {
                     "branch": { "type": "string" },
                     "initiator": { "type": "string", "enum": ["claude", "codex"] },
                     "task": { "type": "string" },
+                    "pilot": { "type": "string", "enum": ["claude", "codex"] },
                     "implementer": { "type": "string", "enum": ["claude", "codex"] }
                 },
                 "required": ["repo_path", "branch", "initiator"]
@@ -285,7 +287,7 @@ pub fn tool_definitions(app: &App) -> Vec<Value> {
         }),
         json!({
             "name": "collab_start_code_review",
-            "description": "Create a Claude↔Codex review-only session at global review. Initiator must be claude.",
+            "description": "Claude↔Codex review-only session at global review.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -294,7 +296,8 @@ pub fn tool_definitions(app: &App) -> Vec<Value> {
                     "base_sha": { "type": "string" },
                     "head_sha": { "type": "string" },
                     "initiator": { "type": "string", "enum": ["claude"] },
-                    "task": { "type": "string" }
+                    "task": { "type": "string" },
+                    "pilot": { "type": "string", "enum": ["claude", "codex"] }
                 },
                 "required": ["repo_path", "branch", "base_sha", "head_sha", "initiator", "task"]
             }
@@ -311,6 +314,20 @@ pub fn tool_definitions(app: &App) -> Vec<Value> {
                     "handoff_token": { "type": "string" }
                 },
                 "required": ["session_id", "agent", "implementer"]
+            }
+        }),
+        json!({
+            "name": "collab_set_pilot",
+            "description": "Reassign the session pilot. Caller must be the current pilot, and only in PlanParallelDrafts before either draft lands. Also moves current_owner.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "session_id": { "type": "string" },
+                    "agent": { "type": "string", "enum": ["claude", "codex"] },
+                    "pilot": { "type": "string", "enum": ["claude", "codex"] },
+                    "handoff_token": { "type": "string" }
+                },
+                "required": ["session_id", "agent", "pilot"]
             }
         }),
         json!({
@@ -384,12 +401,23 @@ pub fn tool_definitions(app: &App) -> Vec<Value> {
         }),
         json!({
             "name": "collab_approve",
-            "description": "Codex-only shortcut for submitting an approve review",
+            // "Copilot" rather than "Codex": the approver is
+            // `copilot(session)` — the agent that is not the session's pilot,
+            // so Codex under the default `pilot=claude` and Claude under
+            // `pilot=codex`. Kept to one line: the listing is under a hard
+            // whole-listing token budget (see
+            // `tool_listing_stays_within_prompt_cache_schema_budget`).
+            "description": "Copilot-only shortcut for submitting an approve review",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "session_id": { "type": "string" },
-                    "agent": { "type": "string", "enum": ["codex"] },
+                    // Both agents are advertised because the accepted one is
+                    // session-dependent (`copilot(session)`), which a static
+                    // schema cannot express. `handle_collab_approve` does the
+                    // real narrowing; a one-value enum here would block the
+                    // legitimate pilot=codex caller.
+                    "agent": { "type": "string", "enum": ["claude", "codex"] },
                     "content_hash": { "type": "string" },
                     "handoff_token": { "type": "string" }
                 },
@@ -645,6 +673,7 @@ pub fn call_tool(app: &App, name: &str, args: &Value) -> Result<Value, MemoryErr
         "collab_start" => handle_collab_start(app, args),
         "collab_start_code_review" => handle_collab_start_code_review(app, args),
         "collab_set_implementer" => handle_collab_set_implementer(app, args),
+        "collab_set_pilot" => handle_collab_set_pilot(app, args),
         "collab_send" => handle_collab_send(app, args),
         "collab_recv" => handle_collab_recv(app, args),
         "collab_ack" => handle_collab_ack(app, args),
@@ -751,6 +780,7 @@ fn tool_known(name: &str) -> bool {
             | "collab_start"
             | "collab_start_code_review"
             | "collab_set_implementer"
+            | "collab_set_pilot"
             | "collab_send"
             | "collab_recv"
             | "collab_ack"
@@ -803,6 +833,7 @@ pub(crate) const MUTATING_TOOLS: &[&str] = &[
     "collab_start",
     "collab_start_code_review",
     "collab_set_implementer",
+    "collab_set_pilot",
     "collab_send",
     "collab_ack",
     "collab_approve",
@@ -1177,6 +1208,14 @@ mod tests {
     /// gained `include_superseded` and `add_drawer` gained `supersedes`, which
     /// cost ~140 bytes more than the previous ceiling left spare.
     ///
+    /// Raised 3_550 -> 3_700 for `collab_set_pilot` (#246), the tool that
+    /// reassigns a session's pilot role. A whole new tool cannot be absorbed by
+    /// the two tokens the previous ceiling had spare, and its description has
+    /// to carry a genuinely load-bearing authorization rule (current pilot
+    /// only, `PlanParallelDrafts` only) that a caller cannot infer from the
+    /// schema keys. The listing measured 3_660 tokens after the addition; the
+    /// ceiling leaves ~40 tokens of headroom rather than pinning it exactly.
+    ///
     /// The budget is deliberately a whole-listing ceiling with no per-tool
     /// allocation, so the cheapest way to land a new field is to delete prose
     /// from whichever unrelated tool happens to be wordiest. That trade is not
@@ -1189,7 +1228,7 @@ mod tests {
         let bytes = serde_json::to_vec(&tool_definitions(&app)).unwrap().len();
         let estimated_tokens = bytes.div_ceil(4);
         assert!(
-            estimated_tokens <= 3_550,
+            estimated_tokens <= 3_700,
             "tool listing is ~{estimated_tokens} tokens ({bytes} bytes); trim descriptions that duplicate their schemas"
         );
     }

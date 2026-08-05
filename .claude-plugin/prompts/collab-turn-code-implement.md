@@ -14,7 +14,11 @@ preconditions: phase == CodeImplementPending, current_owner == claude, implement
 
 ## State discovery
 1. `collab_status(session_id=$SESSION_ID)`; read `plan_file_path`,
-   `task_list_ref`, `tasks_count`, `implementer`, `pending_failure`. A
+   `task_list_ref`, `tasks_count`, `implementer`, `base_sha`,
+   `pending_failure`. `base_sha` is fixed at plan-lock time and never
+   advances, so it is the plan-level base `iron-build`'s final
+   whole-implementation review needs — including on a mid-plan resume, where
+   the first task's `BASE_SHA` was never recorded locally. A
    non-null `pending_failure` means you are the **recovery owner** for an
    interrupted turn, not simply the next-in-line owner — see "Recoverable vs
    terminal failures" below before proceeding.

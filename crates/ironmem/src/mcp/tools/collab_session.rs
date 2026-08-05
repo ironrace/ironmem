@@ -15,7 +15,7 @@ use super::collab_events::{
     build_collab_event, failure_report_is_off_turn_admissible, parse_final_payload,
 };
 use super::shared::{
-    collab_counterpart, require_agent, require_implementer, require_str, sha256_hex,
+    collab_counterpart, require_agent, require_implementer, require_pilot, require_str, sha256_hex,
     MAX_COLLAB_CONTENT_CHARS,
 };
 
@@ -168,6 +168,7 @@ pub(super) fn session_record_json(record: &SessionRecord) -> Value {
         // malformed. Consumers treat `None` as the default (subagent-driven).
         "execution_mode": execution_mode_from_task_list(record.session.task_list.as_deref()),
         "implementer": record.session.implementer.as_str(),
+        "pilot": record.session.pilot.as_str(),
         "task_review_round": record.session.task_review_round,
         "global_review_round": record.session.global_review_round,
         "base_sha": record.session.base_sha.as_deref(),
@@ -247,8 +248,27 @@ pub(super) fn is_known_collab_topic(topic: &str) -> bool {
             | "review_fix_global"
             | "final_review"
             | "failure_report"
+            | ORPHAN_RECOVERED_TOPIC
     )
 }
+
+/// Topic recording that a turn found a dirty worktree on the NORMAL path and
+/// recovered work a previous turn left behind — evidence that the previous
+/// turn died without reporting (OOM, container kill, sandbox teardown), since
+/// a reported failure would have left `pending_failure` non-null.
+///
+/// Deliberately NOT a `failure_report`. A tooling failure parks the phase,
+/// hands the turn to the counterpart, and spends `recovery_attempts` against
+/// a ceiling of [`MAX_RECOVERY_ATTEMPTS`] — but the sender here has
+/// *succeeded*: it preserved the orphaned work, ran the gates, and is carrying
+/// its own turn to completion. Charging it a recovery attempt would let three
+/// successful recoveries exhaust a session's lifetime budget.
+///
+/// So this topic is non-advancing: it is recorded and returns before any
+/// `CollabEvent` is built, leaving phase, owner and both recovery counters
+/// untouched. [`super::collab_events::build_collab_event`] has no arm for it
+/// and must never gain one.
+pub(super) const ORPHAN_RECOVERED_TOPIC: &str = "orphan_recovered";
 
 /// Polling cadence for `collab_wait_my_turn`. Short enough that
 /// turn transitions feel immediate, long enough that idle waits don't
@@ -522,14 +542,22 @@ pub(super) fn handle_collab_start(app: &App, args: &Value) -> Result<Value, Memo
         .transpose()?
         .map(ToString::to_string);
     let task = task_owned.as_deref();
+    // Optional `pilot` field: selects which agent leads v1 planning. Default
+    // is `Agent::Claude` (historical flow). Resolved before `implementer` so
+    // an omitted `implementer` can default to whichever pilot was chosen.
+    let pilot = match args.get("pilot").and_then(Value::as_str) {
+        Some(value) => require_pilot(value)?,
+        None => Agent::Claude,
+    };
     // Optional `implementer` field: routes the v3 batch implementation
-    // phase. Default is `Agent::Claude` (historical flow). `Agent::Codex`
+    // phase. Defaults to the resolved `pilot` (so a `pilot=codex` caller who
+    // omits `implementer` gets `implementer=codex` too). `Agent::Codex`
     // makes Codex the owner of `CodeImplementPending` and the only valid
     // sender of `implementation_done`. It can be rebound later through
     // `collab_set_implementer` while planning or implementation is active.
     let implementer = match args.get("implementer").and_then(Value::as_str) {
         Some(value) => require_implementer(value)?,
-        None => Agent::Claude,
+        None => pilot,
     };
     let session_id = uuid::Uuid::new_v4().to_string();
 
@@ -558,6 +586,7 @@ pub(super) fn handle_collab_start(app: &App, args: &Value) -> Result<Value, Memo
             branch,
             task,
             implementer,
+            pilot,
         )?;
         crate::db::schema::Database::wal_log_tx(
             tx,
@@ -568,6 +597,7 @@ pub(super) fn handle_collab_start(app: &App, args: &Value) -> Result<Value, Memo
                 "branch": branch,
                 "initiator": initiator.as_str(),
                 "implementer": implementer.as_str(),
+                "pilot": pilot.as_str(),
                 "has_task": task.is_some(),
             }),
             Some(&json!({ "session_id": session_id })),
@@ -582,6 +612,7 @@ pub(super) fn handle_collab_start(app: &App, args: &Value) -> Result<Value, Memo
         "session_id": session_id,
         "task": task,
         "implementer": implementer.as_str(),
+        "pilot": pilot.as_str(),
     }))
 }
 
@@ -603,8 +634,8 @@ pub(super) fn handle_collab_set_implementer(app: &App, args: &Value) -> Result<V
         let can_change = match record.session.phase {
             Phase::PlanParallelDrafts
             | Phase::PlanSynthesisPending
-            | Phase::PlanCodexReviewPending
-            | Phase::PlanClaudeFinalizePending
+            | Phase::PlanCopilotReviewPending
+            | Phase::PlanFinalizePending
             | Phase::PlanLocked => record.session.task_list.is_none(),
             Phase::CodeImplementPending => true,
             Phase::CodeReviewFixGlobalPending
@@ -650,6 +681,122 @@ pub(super) fn handle_collab_set_implementer(app: &App, args: &Value) -> Result<V
     })
 }
 
+/// Rebind a live session's `pilot` role.
+///
+/// # Authorization policy
+///
+/// This is the one tool that can change who leads a session, so its policy is
+/// deliberately narrower than [`handle_collab_set_implementer`]'s. Three rules,
+/// all enforced below inside a single transaction:
+///
+/// 1. **Latest safe state.** Allowed *only* at [`Phase::PlanParallelDrafts`]
+///    with `claude_draft_hash.is_none() && codex_draft_hash.is_none()`. Every
+///    other phase is refused — including any `collab_start_code_review`
+///    session, which begins at `CodeReviewFixGlobalPending` and therefore never
+///    passes through the reassignable state at all. This is stricter than
+///    `collab_set_implementer`'s "anywhere in planning" on purpose: the pilot
+///    decides who may submit `canonical`/`review`/`final`, so once a
+///    role-dependent artifact exists, changing the pilot is a live-role rewrite
+///    of work already done — not configuration of work not yet started.
+/// 2. **Permitted caller.** The request's `agent` must equal the session's
+///    *current* pilot. A copilot can never promote itself, which is precisely
+///    what stops this from being a turn-seizure primitive: the only way to
+///    become pilot is to be handed the role by the agent that already holds it.
+/// 3. **Atomicity.** The pilot change and `current_owner = new_pilot` happen in
+///    the *same* `set_pilot` UPDATE inside the one transaction, so owner and
+///    pilot are never observable in an inconsistent pairing. Moving the owner
+///    is safe here because at `PlanParallelDrafts` `current_owner` is only the
+///    next-expected hint — the drafting arm of `apply_event` has its own
+///    `AlreadySubmittedDraft` guard and does not consult the owner to decide
+///    whether a draft may land.
+///
+/// Every rejection names the phase (or the caller's role) and the rule
+/// violated, so a caller can tell *why* it was refused without reading this.
+///
+/// # Deliberate deferral
+///
+/// The plugin prose assertions that pin `collab_set_implementer` into the
+/// shipped `collab.md` command files — `scripts/check_collab_turn_templates.py`
+/// and the two in `crates/ironmem/tests/plugin_metadata.rs` — are **not**
+/// mirrored for `collab_set_pilot`. Mirroring them would require editing a
+/// plugin command file, which is out of scope for this change; documenting the
+/// tool in `collab.md` and adding the matching assertions is deferred.
+pub(super) fn handle_collab_set_pilot(app: &App, args: &Value) -> Result<Value, MemoryError> {
+    let session_id = require_str(args, "session_id")?;
+    let agent = require_agent(require_str(args, "agent")?)?;
+    // `require_pilot` rather than `require_agent` for this field only, so a
+    // bad value names `pilot` in the error text — the same reason the model
+    // handler above validates its own role field with `require_implementer`.
+    // Identical accept-set either way; only the message differs.
+    let pilot = require_pilot(require_str(args, "pilot")?)?;
+
+    app.db.with_transaction(|tx| {
+        super::handoff::ensure_actor_generation_current(
+            app,
+            tx,
+            session_id,
+            agent,
+            super::handoff::opt_handoff_token(args).as_deref(),
+        )?;
+        crate::collab::queue::ensure_active(tx, session_id)?;
+        let record = crate::collab::queue::load_session_record(tx, session_id)?;
+
+        // Rule 2 first: authorization before state. An unauthorized caller is
+        // told it is the copilot regardless of which phase the session is in.
+        let previous = record.session.pilot;
+        if agent != previous {
+            return Err(MemoryError::Validation(format!(
+                "collab_set_pilot refused: caller '{}' is the copilot of this session; \
+                 only the current pilot '{}' may reassign the pilot role",
+                agent.as_str(),
+                previous.as_str()
+            )));
+        }
+
+        // Rule 1: the latest safe state, and only it.
+        if record.session.phase != Phase::PlanParallelDrafts {
+            return Err(MemoryError::Validation(format!(
+                "collab_set_pilot refused in phase {}: the pilot may only be reassigned in \
+                 PlanParallelDrafts, before any role-dependent artifact exists",
+                record.session.phase
+            )));
+        }
+        if record.session.claude_draft_hash.is_some() || record.session.codex_draft_hash.is_some() {
+            return Err(MemoryError::Validation(format!(
+                "collab_set_pilot refused in phase PlanParallelDrafts: a draft has already been \
+                 submitted (claude={}, codex={}); the pilot may only be reassigned before either \
+                 draft lands",
+                record.session.claude_draft_hash.is_some(),
+                record.session.codex_draft_hash.is_some()
+            )));
+        }
+
+        // Rule 3: pilot and owner move together, in one UPDATE. Unconditional
+        // even when `previous == pilot`, so a no-op reassignment still leaves
+        // `current_owner` consistent with the pilot it names.
+        let previous_owner = record.session.current_owner;
+        crate::collab::queue::set_pilot(tx, session_id, pilot, Some(pilot))?;
+
+        crate::db::schema::Database::wal_log_tx(
+            tx,
+            "collab_set_pilot",
+            &json!({
+                "session_id": session_id,
+                "agent": agent.as_str(),
+                "previous_pilot": previous.as_str(),
+                "pilot": pilot.as_str(),
+                "phase": record.session.phase.to_string(),
+                "previous_owner": previous_owner.as_str(),
+                "current_owner": pilot.as_str(),
+                "changed": previous != pilot || previous_owner != pilot,
+            }),
+            Some(&json!({ "session_id": session_id })),
+        )?;
+        let updated = crate::collab::queue::load_session_record(tx, session_id)?;
+        Ok(session_record_json(&updated))
+    })
+}
+
 pub(super) fn handle_collab_start_code_review(
     app: &App,
     args: &Value,
@@ -659,14 +806,26 @@ pub(super) fn handle_collab_start_code_review(
     let base_sha = require_str(args, "base_sha")?;
     let head_sha = require_str(args, "head_sha")?;
     let initiator = require_agent(require_str(args, "initiator")?)?;
+    // `initiator` names the *dispatcher* allowed to invoke this shortcut —
+    // orthogonal to `pilot` below, which names the review-flow lead. This
+    // check stays unconditional: it rejects a non-claude initiator even when
+    // `pilot=codex`.
     if initiator != Agent::Claude {
         return Err(MemoryError::Validation(
             "initiator must be 'claude' for collab_start_code_review".to_string(),
         ));
     }
     let task = sanitize::sanitize_content(require_str(args, "task")?, MAX_COLLAB_CONTENT_CHARS)?;
+    // Optional `pilot` field: same pattern and default as `collab_start`
+    // (Task 7). Resolved before `start_global_review_session` — that call
+    // needs the real value, not a hardcoded stand-in — and before the
+    // transaction opens.
+    let pilot = match args.get("pilot").and_then(Value::as_str) {
+        Some(value) => require_pilot(value)?,
+        None => Agent::Claude,
+    };
     let session_id = uuid::Uuid::new_v4().to_string();
-    let session = start_global_review_session(&session_id, base_sha, head_sha)
+    let session = start_global_review_session(&session_id, base_sha, head_sha, pilot)
         .map_err(collab_error_to_memory_error)?;
 
     app.db.with_transaction(|tx| {
@@ -683,15 +842,23 @@ pub(super) fn handle_collab_start_code_review(
             )));
         }
         ensure_no_conflicting_process_session_tx(app, tx, &session_id, repo_path, branch)?;
-        // Shortcut sessions never enter `CodeImplementPending`, so the
-        // `implementer` field is fixed at `Agent::Claude` for uniformity.
+        // Shortcut sessions never enter `CodeImplementPending`, so `implementer`
+        // is seeded from the resolved `pilot` for uniformity (there is no
+        // separate implementer selection on this entry point). The
+        // immediately-following `save_session(tx, &session)` is the
+        // authoritative write and overwrites both fields with `session`'s
+        // actual values inside this same transaction, so no reader ever
+        // observes the values passed here — they're set to the real resolved
+        // `pilot` purely so this call reads correctly on its own, not because
+        // any intermediate state is externally visible.
         crate::collab::queue::create_session(
             tx,
             &session_id,
             repo_path,
             branch,
             Some(task),
-            Agent::Claude,
+            pilot,
+            pilot,
         )?;
         crate::collab::queue::save_session(tx, &session)?;
         crate::db::schema::Database::wal_log_tx(
@@ -704,6 +871,7 @@ pub(super) fn handle_collab_start_code_review(
                 "base_sha": base_sha,
                 "head_sha": head_sha,
                 "initiator": initiator.as_str(),
+                "pilot": pilot.as_str(),
                 "task": task,
             }),
             Some(&json!({ "session_id": session_id })),
@@ -714,7 +882,7 @@ pub(super) fn handle_collab_start_code_review(
     app.set_active_collab_session_for_scope(&session_id, repo_path, branch);
     create_initial_task_outcome(app, &session_id);
 
-    Ok(json!({ "session_id": session_id, "task": task }))
+    Ok(json!({ "session_id": session_id, "task": task, "pilot": pilot.as_str() }))
 }
 
 pub(super) fn handle_collab_send(app: &App, args: &Value) -> Result<Value, MemoryError> {
@@ -760,12 +928,55 @@ pub(super) fn handle_collab_send(app: &App, args: &Value) -> Result<Value, Memor
         let turn_exempt = matches!(session.phase, crate::collab::Phase::PlanParallelDrafts)
             || (topic == "failure_report"
                 && sender != session.current_owner
-                && failure_report_is_off_turn_admissible(content, sender, session.current_owner));
+                && failure_report_is_off_turn_admissible(
+                    content,
+                    sender,
+                    session.current_owner,
+                    session.phase,
+                    session.implementer,
+                ));
         if !turn_exempt && sender != session.current_owner {
             return Err(MemoryError::Validation(format!(
                 "not your turn: phase {} expects sender '{}', got '{}'",
                 session.phase, session.current_owner, sender
             )));
+        }
+
+        // Non-advancing topic: record the incident and return before the event
+        // builder. Everything below this point mutates session state, and an
+        // orphan record must not — see ORPHAN_RECOVERED_TOPIC.
+        if topic == ORPHAN_RECOVERED_TOPIC {
+            let drawer_id = store_collab_message_drawer(tx, content)?;
+            let message_id = crate::collab::queue::record_incident(
+                tx,
+                session_id,
+                sender.as_str(),
+                topic,
+                content,
+                &drawer_id,
+            )?;
+            crate::db::schema::Database::wal_log_tx(
+                tx,
+                "collab_send",
+                &json!({
+                    "session_id": session_id,
+                    "sender": sender.as_str(),
+                    "topic": topic,
+                    "phase_before": phase_before,
+                }),
+                Some(&json!({
+                    "message_id": message_id,
+                    "phase": phase_before,
+                })),
+            )?;
+            // `save_session` is deliberately not called: the session row is
+            // returned to the caller exactly as it was loaded.
+            return Ok((
+                json!({ "message_id": message_id, "phase": phase_before }),
+                phase_before_enum,
+                phase_before_enum,
+                None,
+            ));
         }
 
         let event = build_collab_event(topic, content, session.phase)?;
@@ -1131,6 +1342,12 @@ pub(super) fn handle_collab_status(app: &App, args: &Value) -> Result<Value, Mem
     let session_id = require_str(args, "session_id")?;
     let record = app.db.collab_load_session_record(session_id)?;
     let mut status = session_record_json(&record);
+    // Turns that recovered work a previous turn left behind. Non-zero means a
+    // turn died without reporting, so the session's own history understates
+    // how much went wrong — see ORPHAN_RECOVERED_TOPIC.
+    status["orphans_recovered"] = json!(app.db.with_connection(|conn| {
+        crate::collab::queue::count_incidents(conn, session_id, ORPHAN_RECOVERED_TOPIC)
+    })?);
     // `verbose` remains accepted for backwards-compatible requests, but plans
     // are always references: large plan bodies must never transit status.
     let include_task_list = args
@@ -1182,14 +1399,14 @@ pub(super) fn handle_collab_status(app: &App, args: &Value) -> Result<Value, Mem
     Ok(status)
 }
 
+/// `collab_approve` — the copilot's one-pass verdict on the pilot's canonical
+/// plan. The approver is whichever agent is *not* the session's pilot, so the
+/// role gate below has to read the session first; it cannot be a constant
+/// check on the parsed argument the way it was when Claude was hardcoded as
+/// the only pilot.
 pub(super) fn handle_collab_approve(app: &App, args: &Value) -> Result<Value, MemoryError> {
     let session_id = require_str(args, "session_id")?;
     let agent = require_agent(require_str(args, "agent")?)?;
-    if agent != Agent::Codex {
-        return Err(MemoryError::Validation(
-            "agent must be 'codex' for collab_approve".to_string(),
-        ));
-    }
     let content_hash = require_str(args, "content_hash")?;
     let review_content = json!({
         "verdict": "approve",
@@ -1207,6 +1424,19 @@ pub(super) fn handle_collab_approve(app: &App, args: &Value) -> Result<Value, Me
         )?;
         crate::collab::queue::ensure_active(tx, session_id)?;
         let session = crate::collab::queue::load_session(tx, session_id)?;
+        // Role gate. `apply_event`'s `SubmitReview` arm enforces exactly this
+        // rule (`require_actor(actor, copilot(session))`) and is the primary
+        // enforcement point — this check is defense-in-depth, NOT redundant:
+        // it fails the call before any drawer or queue write, and it reports
+        // the expected approver by name instead of a bare turn violation.
+        // Do not delete it as duplicated logic.
+        let expected_approver = crate::collab::copilot(&session);
+        if agent != expected_approver {
+            return Err(MemoryError::Validation(format!(
+                "agent must be '{}' for collab_approve",
+                expected_approver.as_str()
+            )));
+        }
         let expected_hash = session
             .canonical_plan_hash
             .as_deref()
@@ -1218,7 +1448,7 @@ pub(super) fn handle_collab_approve(app: &App, args: &Value) -> Result<Value, Me
         }
         let session = apply_event(
             &session,
-            Agent::Codex,
+            agent,
             &CollabEvent::SubmitReview {
                 verdict: "approve".to_string(),
             },
@@ -1229,8 +1459,8 @@ pub(super) fn handle_collab_approve(app: &App, args: &Value) -> Result<Value, Me
         let _ = crate::collab::queue::send_message(
             tx,
             session_id,
-            Agent::Codex.as_str(),
-            Agent::Claude.as_str(),
+            agent.as_str(),
+            collab_counterpart(agent).as_str(),
             "review",
             &review_content,
             &drawer_id,
@@ -2294,6 +2524,7 @@ mod tests {
                     "other-branch",
                     None,
                     crate::collab::Agent::Claude,
+                    crate::collab::Agent::Claude,
                 )
             })
             .unwrap();
@@ -2467,6 +2698,7 @@ mod tests {
                     "other-branch",
                     None,
                     crate::collab::Agent::Claude,
+                    crate::collab::Agent::Claude,
                 )
             })
             .unwrap();
@@ -2578,7 +2810,7 @@ mod tests {
     fn request_changes_advances_to_finalize_and_rejects_canonical_resend() {
         // One-pass planning review (MAX_REVIEW_ROUNDS = 1): a `request_changes`
         // verdict no longer returns to synthesis. It advances to
-        // PlanClaudeFinalizePending, where Codex's requested changes are folded
+        // PlanFinalizePending, where Codex's requested changes are folded
         // into the `final` plan — there is no second canonical round. So a
         // canonical re-send after review is rejected (the phase now expects
         // `final`), and the canonical drawer id stays pinned to the single v1 body.
@@ -3836,5 +4068,403 @@ mod tests {
         assert_eq!(after.session.phase, Phase::CodeImplementPending);
         assert_eq!(after.session.current_owner, crate::collab::Agent::Claude);
         assert_eq!(after.session.pending_failure, None);
+    }
+    // ── pilot=codex MCP-surface coverage (issue #246, Task 6) ────────────────
+    //
+    // `collab_start` does accept a `pilot` argument now, but these tests
+    // deliberately bypass it: they start a default session and rebind
+    // `pilot` directly on the stored row — the same direct-field-write trick
+    // the legacy-drawer tests above use. That keeps them a *storage-level*
+    // pin, so the authorization rules stay proven for any session whose
+    // stored `pilot` is codex no matter which path set it there
+    // (`collab_start`'s argument, `collab_set_pilot`, or a direct write).
+    // The argument path itself is covered end-to-end in
+    // `tests/mcp_protocol.rs`. Every
+    // authorization assertion is mirrored under `pilot=claude`, because "no
+    // new role combination is accepted" is only provable two-directionally:
+    // a one-sided table cannot distinguish "the copilot approves" from
+    // "both agents approve".
+
+    /// Rebind a started session's `pilot` role in place. Only `pilot` is
+    /// touched: `implementer` is an independent knob and none of these tests
+    /// reach a coding phase.
+    fn set_pilot(app: &crate::mcp::app::App, sid: &str, pilot: Agent) {
+        let mut session = app.db.collab_load_session(sid).unwrap();
+        session.pilot = pilot;
+        app.db.collab_save_session(&session).unwrap();
+    }
+
+    /// Drive a `pilot`-led session to `PlanCopilotReviewPending` and return
+    /// the canonical plan hash `collab_approve` must be called with. Drafts
+    /// are agent-keyed (either side may go first); synthesis is the pilot's.
+    fn drive_to_copilot_review(app: &crate::mcp::app::App, sid: &str, pilot: Agent) -> String {
+        send(app, sid, "claude", "draft", "claude draft");
+        send(app, sid, "codex", "draft", "codex draft");
+        send(app, sid, pilot.as_str(), "canonical", "canonical plan");
+        sha256_hex("canonical plan")
+    }
+
+    fn approve(
+        app: &crate::mcp::app::App,
+        sid: &str,
+        agent: Agent,
+        content_hash: &str,
+    ) -> Result<Value, MemoryError> {
+        handle_collab_approve(
+            app,
+            &json!({
+                "session_id": sid,
+                "agent": agent.as_str(),
+                "content_hash": content_hash,
+            }),
+        )
+    }
+
+    /// Topics currently queued for `receiver`. Deliberately does not auto-ack,
+    /// so the same inbox can be inspected more than once per test.
+    fn inbox_topics(app: &crate::mcp::app::App, sid: &str, receiver: Agent) -> Vec<String> {
+        let out = handle_collab_recv(
+            app,
+            &json!({ "session_id": sid, "receiver": receiver.as_str(), "limit": 50 }),
+        )
+        .unwrap();
+        out["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|message| message["topic"].as_str().unwrap().to_string())
+            .collect()
+    }
+
+    /// The most recent `collab_approve` WAL row as `(params, result)`.
+    fn last_approve_wal(app: &crate::mcp::app::App) -> (Value, Value) {
+        let conn = rusqlite::Connection::open(&app.config.db_path).unwrap();
+        let (params, result): (String, String) = conn
+            .query_row(
+                "SELECT params, result FROM wal_log WHERE operation = 'collab_approve' \
+                 ORDER BY id DESC LIMIT 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        (
+            serde_json::from_str(&params).unwrap(),
+            serde_json::from_str(&result).unwrap(),
+        )
+    }
+
+    #[test]
+    fn approve_under_pilot_codex_lets_claude_approve_and_routes_review_to_codex() {
+        let app = test_app();
+        let sid = start_session(&app);
+        set_pilot(&app, &sid, Agent::Codex);
+        let hash = drive_to_copilot_review(&app, &sid, Agent::Codex);
+
+        let out = approve(&app, &sid, Agent::Claude, &hash).unwrap();
+        assert_eq!(out["phase"], json!("PlanClaudeFinalizePending"));
+
+        assert!(
+            inbox_topics(&app, &sid, Agent::Codex).contains(&"review".to_string()),
+            "under pilot=codex the approval must be routed claude→codex"
+        );
+        assert!(
+            !inbox_topics(&app, &sid, Agent::Claude).contains(&"review".to_string()),
+            "the approver must not be queued its own review message"
+        );
+
+        // The WAL payload shape is pilot-independent; only `agent` differs.
+        let (params, result) = last_approve_wal(&app);
+        assert_eq!(
+            params,
+            json!({ "session_id": sid, "agent": "claude", "content_hash": hash })
+        );
+        assert_eq!(result, json!({ "phase": "PlanClaudeFinalizePending" }));
+    }
+
+    #[test]
+    fn approve_under_pilot_claude_is_unchanged() {
+        // Byte-for-byte pin of today's behavior: `pilot` defaults to Claude,
+        // Codex approves, and the review is routed codex→claude.
+        let app = test_app();
+        let sid = start_session(&app);
+        assert_eq!(
+            app.db.collab_load_session(&sid).unwrap().pilot,
+            Agent::Claude
+        );
+        let hash = drive_to_copilot_review(&app, &sid, Agent::Claude);
+
+        let out = approve(&app, &sid, Agent::Codex, &hash).unwrap();
+        assert_eq!(out["phase"], json!("PlanClaudeFinalizePending"));
+
+        assert!(inbox_topics(&app, &sid, Agent::Claude).contains(&"review".to_string()));
+        assert!(!inbox_topics(&app, &sid, Agent::Codex).contains(&"review".to_string()));
+
+        let record = app.db.collab_load_session_record(&sid).unwrap();
+        assert_eq!(record.session.phase, Phase::PlanFinalizePending);
+        assert_eq!(record.session.current_owner, Agent::Claude);
+        assert_eq!(
+            record.session.codex_review_verdict.as_deref(),
+            Some("approve")
+        );
+
+        let (params, result) = last_approve_wal(&app);
+        assert_eq!(
+            params,
+            json!({ "session_id": sid, "agent": "codex", "content_hash": hash })
+        );
+        assert_eq!(result, json!({ "phase": "PlanClaudeFinalizePending" }));
+    }
+
+    /// Two-directional negative-authorization table for `collab_approve`.
+    /// Under *each* pilot assignment the copilot is the only accepted
+    /// approver: the pilot is refused by the handler gate, refused again by
+    /// the state machine underneath it, and the accepted call routes the
+    /// `review` message in exactly one direction.
+    #[test]
+    fn approve_authorization_table_is_two_directional() {
+        for pilot in [Agent::Claude, Agent::Codex] {
+            let app = test_app();
+            let sid = start_session(&app);
+            set_pilot(&app, &sid, pilot);
+            let hash = drive_to_copilot_review(&app, &sid, pilot);
+            let expected = collab_counterpart(pilot);
+
+            // Wrong role: refused by the handler's role gate, naming the
+            // agent that actually may approve.
+            let err = approve(&app, &sid, pilot, &hash).unwrap_err();
+            assert!(
+                err.to_string().contains(&format!(
+                    "agent must be '{}' for collab_approve",
+                    expected.as_str()
+                )),
+                "pilot={pilot} gate must name the expected approver, got: {err}"
+            );
+
+            // …and refused again by `apply_event`'s `SubmitReview` arm, which
+            // is the primary enforcement point. The handler gate is
+            // defense-in-depth on top of this, not a substitute for it.
+            let session = app.db.collab_load_session(&sid).unwrap();
+            let state_machine_err = apply_event(
+                &session,
+                pilot,
+                &CollabEvent::SubmitReview {
+                    verdict: "approve".to_string(),
+                },
+            )
+            .unwrap_err();
+            assert!(
+                matches!(state_machine_err, CollabError::NotYourTurn { .. }),
+                "pilot={pilot} state machine must reject the wrong approver with NotYourTurn, \
+                 got: {state_machine_err:?}"
+            );
+
+            // The refused call must have left the session untouched.
+            let record = app.db.collab_load_session_record(&sid).unwrap();
+            assert_eq!(record.session.phase, Phase::PlanCopilotReviewPending);
+            assert_eq!(record.session.codex_review_verdict, None);
+            assert!(!inbox_topics(&app, &sid, Agent::Claude).contains(&"review".to_string()));
+            assert!(!inbox_topics(&app, &sid, Agent::Codex).contains(&"review".to_string()));
+
+            // Right role: accepted, and routed to the pilot only.
+            let out = approve(&app, &sid, expected, &hash).unwrap();
+            assert_eq!(out["phase"], json!("PlanClaudeFinalizePending"));
+            assert!(inbox_topics(&app, &sid, pilot).contains(&"review".to_string()));
+            assert!(!inbox_topics(&app, &sid, expected).contains(&"review".to_string()));
+        }
+    }
+
+    #[test]
+    fn approve_still_rejects_a_content_hash_mismatch_under_pilot_codex() {
+        // The `canonical_plan_hash` check is unrelated to role assignment and
+        // must survive the de-hardcoding of the gate above it.
+        let app = test_app();
+        let sid = start_session(&app);
+        set_pilot(&app, &sid, Agent::Codex);
+        drive_to_copilot_review(&app, &sid, Agent::Codex);
+
+        let err = approve(&app, &sid, Agent::Claude, "deadbeef").unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("content_hash does not match canonical_plan_hash"));
+    }
+
+    #[test]
+    fn blind_draft_suppression_holds_for_both_receivers_under_pilot_codex() {
+        // The suppression keys on the *receiving* agent's own draft-hash
+        // column, which is identity-keyed rather than role-keyed, so it is
+        // pilot-independent by construction. Both receiver directions are
+        // exercised because a one-sided test cannot tell an identity-keyed
+        // rule apart from one that happens to name the right agent.
+        for first_drafter in [Agent::Claude, Agent::Codex] {
+            let app = test_app();
+            let sid = start_session(&app);
+            set_pilot(&app, &sid, Agent::Codex);
+            let waiting = collab_counterpart(first_drafter);
+
+            send(&app, &sid, first_drafter.as_str(), "draft", "first draft");
+            assert!(
+                inbox_topics(&app, &sid, waiting).is_empty(),
+                "under pilot=codex {waiting} must not see {first_drafter}'s draft before \
+                 submitting its own"
+            );
+
+            send(&app, &sid, waiting.as_str(), "draft", "second draft");
+            assert!(
+                inbox_topics(&app, &sid, waiting).contains(&"draft".to_string()),
+                "the counterpart's draft must appear once {waiting} has drafted"
+            );
+        }
+    }
+
+    /// The whole point of `orphan_recovered` is that it records an incident
+    /// without being one. A `failure_report` would park the phase, hand the
+    /// turn to the counterpart, and burn `recovery_attempts` against a ceiling
+    /// of 2 — but the worker sending this has *succeeded*: it preserved a dead
+    /// turn's work and is carrying on. Assert the entire mutable session record
+    /// is untouched, not just the phase, so a future change that quietly
+    /// advances a counter fails here.
+    #[test]
+    fn orphan_recovered_records_the_incident_without_advancing_the_session() {
+        let app = test_app();
+        let sid = start_session(&app);
+        send(&app, &sid, "claude", "draft", "claude draft");
+
+        let before = app.db.collab_load_session_record(&sid).unwrap().session;
+        send(
+            &app,
+            &sid,
+            "claude",
+            "orphan_recovered",
+            r#"{"phase":"PlanParallelDrafts","recovered_sha":"deadbeef",
+                "detail":"dirty worktree on a normal turn"}"#,
+        );
+        let after = app.db.collab_load_session_record(&sid).unwrap().session;
+
+        assert_eq!(before.phase, after.phase, "phase must not advance");
+        assert_eq!(
+            before.current_owner, after.current_owner,
+            "the turn must not change hands"
+        );
+        assert_eq!(
+            before.recovery_attempts, after.recovery_attempts,
+            "recording an orphan must not spend the recovery budget"
+        );
+        assert_eq!(
+            before.total_recovery_attempts, after.total_recovery_attempts,
+            "recording an orphan must not spend the lifetime recovery budget"
+        );
+        assert_eq!(
+            before.pending_failure, after.pending_failure,
+            "orphan_recovered is not a failure report"
+        );
+    }
+
+    /// A record nobody can see is not a record. `collab_status` is the one
+    /// surface the orchestrator and the human both read, so the incident count
+    /// has to show up there rather than only in the `messages` table.
+    #[test]
+    fn collab_status_surfaces_recorded_orphans() {
+        let app = test_app();
+        let sid = start_session(&app);
+        send(&app, &sid, "claude", "draft", "claude draft");
+
+        let clean = handle_collab_status(&app, &json!({ "session_id": &sid })).unwrap();
+        assert_eq!(
+            clean["orphans_recovered"], 0,
+            "a session with no incident must report zero, not null"
+        );
+
+        send(
+            &app,
+            &sid,
+            "claude",
+            "orphan_recovered",
+            r#"{"detail":"dirty worktree on a normal turn"}"#,
+        );
+
+        let after = handle_collab_status(&app, &json!({ "session_id": &sid })).unwrap();
+        assert_eq!(
+            after["orphans_recovered"], 1,
+            "the recorded incident must be visible from collab_status"
+        );
+    }
+
+    /// An orphan record is a record, not correspondence. If it landed in the
+    /// counterpart's inbox it would be handed to the next worker that calls
+    /// `collab_recv`, whose templates enforce a one-recv rule and expect a
+    /// specific topic — so a recovery incident would corrupt the next turn's
+    /// input.
+    #[test]
+    fn orphan_recovered_never_lands_in_either_inbox() {
+        let app = test_app();
+        let sid = start_session(&app);
+        send(&app, &sid, "claude", "draft", "claude draft");
+        send(
+            &app,
+            &sid,
+            "claude",
+            "orphan_recovered",
+            r#"{"detail":"dirty worktree on a normal turn"}"#,
+        );
+
+        for receiver in [Agent::Claude, Agent::Codex] {
+            assert!(
+                !inbox_topics(&app, &sid, receiver).contains(&"orphan_recovered".to_string()),
+                "{receiver} must not be delivered an orphan record"
+            );
+        }
+    }
+
+    /// Defense in depth: even if a future caller reaches the event builder with
+    /// this topic, there is no `CollabEvent` for it and there must never be.
+    #[test]
+    fn orphan_recovered_never_becomes_a_collab_event() {
+        let err = super::super::collab_events::build_collab_event(
+            "orphan_recovered",
+            "{}",
+            crate::collab::Phase::PlanParallelDrafts,
+        )
+        .expect_err("orphan_recovered must not construct an event");
+        assert!(
+            err.to_string().contains("orphan_recovered"),
+            "the rejection should name the topic, got: {err}"
+        );
+    }
+
+    /// It is the sender's own turn when they find the dirty worktree, so the
+    /// ordinary turn gate applies with no `failure_report`-style off-turn
+    /// carve-out.
+    #[test]
+    fn orphan_recovered_is_rejected_off_turn() {
+        let app = test_app();
+        let sid = start_session(&app);
+        send(&app, &sid, "claude", "draft", "claude draft");
+        send(&app, &sid, "codex", "draft", "codex draft");
+        // Synthesis is Claude's turn under the default pilot; Codex is off-turn.
+        let err = handle_collab_send(
+            &app,
+            &json!({ "session_id": &sid, "sender": "codex",
+                     "topic": "orphan_recovered", "content": "{}" }),
+        )
+        .expect_err("off-turn orphan_recovered must be rejected");
+        assert!(
+            err.to_string().contains("not your turn"),
+            "expected the standard turn gate, got: {err}"
+        );
+    }
+
+    #[test]
+    fn collab_send_under_pilot_codex_routes_to_the_counterpart() {
+        let app = test_app();
+        let sid = start_session(&app);
+        set_pilot(&app, &sid, Agent::Codex);
+        send(&app, &sid, "claude", "draft", "claude draft");
+        send(&app, &sid, "codex", "draft", "codex draft");
+
+        // Synthesis is the pilot's turn under any assignment, so the
+        // canonical plan is sent by Codex here and must land in Claude's inbox.
+        send(&app, &sid, "codex", "canonical", "canonical plan");
+        assert!(inbox_topics(&app, &sid, Agent::Claude).contains(&"canonical".to_string()));
+        assert!(!inbox_topics(&app, &sid, Agent::Codex).contains(&"canonical".to_string()));
     }
 }

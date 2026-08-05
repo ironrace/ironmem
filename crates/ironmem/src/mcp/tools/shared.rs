@@ -54,15 +54,28 @@ pub(super) fn require_agent(value: &str) -> Result<Agent, MemoryError> {
         .map_err(|_| MemoryError::Validation("agent must be 'claude' or 'codex'".to_string()))
 }
 
-/// Thin wrapper around `require_agent` for the `implementer` field on
-/// `collab_start`. Same accept-set today, but isolates the input-validation
-/// site so a future divergence (e.g., adding a `codex-cli` variant only valid
-/// as an agent identity, not as a v3 batch implementer) doesn't regress
-/// silently.
+/// Parse the `implementer` field (`collab_start`, `collab_set_implementer`).
+/// Same accept-set as `require_agent` today, but deliberately a separate
+/// parse site — it isolates the input validation so a future divergence
+/// (e.g., adding a `codex-cli` variant only valid as an agent identity, not
+/// as a v3 batch implementer) doesn't regress silently, and it names the
+/// offending field in the error text.
 pub(super) fn require_implementer(value: &str) -> Result<Agent, MemoryError> {
     value
         .parse::<Agent>()
         .map_err(|_| MemoryError::Validation("implementer must be 'claude' or 'codex'".to_string()))
+}
+
+/// Parse the `pilot` field, shared by `handle_collab_start`,
+/// `handle_collab_start_code_review`, and `handle_collab_set_pilot`. Same
+/// accept-set as `require_agent` today, but a separate parse site for the
+/// same reason `require_implementer` is one, and the error text echoes the
+/// offending value so a caller/log reader can tell at a glance which field
+/// (`pilot` vs `implementer`) was rejected.
+pub(super) fn require_pilot(value: &str) -> Result<Agent, MemoryError> {
+    value.parse::<Agent>().map_err(|_| {
+        MemoryError::Validation(format!("pilot must be 'claude' or 'codex', got '{value}'"))
+    })
 }
 
 /// Return the other collab protocol role for the given sender.

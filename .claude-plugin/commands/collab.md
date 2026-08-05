@@ -1,5 +1,5 @@
 ---
-description: Start or join an IronRace bounded planning session with Codex, auto-flowing into v3 batch coding. Covers v1 planning, v3 batch implementation (Claude or Codex via approved Superpowers task plan + iron-build) → global review → PR handoff, and the post-iron-build review shortcut. Usage — /collab start [--implementer=claude|codex] <task>  |  /collab join [--implementer=claude|codex] <session_id>  |  /collab review <short-topic>
+description: Start or join an IronRace bounded planning session with Codex, auto-flowing into v3 batch coding. Covers v1 planning, v3 batch implementation (Claude or Codex via approved task plan + iron-build) → global review → PR handoff, and the post-iron-build review shortcut. Usage — /collab start [--implementer=claude|codex] <task>  |  /collab join [--implementer=claude|codex] <session_id>  |  /collab review <short-topic>
 argument-hint: start [--implementer=claude|codex] <task> | join [--implementer=claude|codex] <session_id> | review <short-topic>
 ---
 
@@ -47,15 +47,18 @@ branch names.
        branch with that name already exists locally or on `origin`
        (`git show-ref --verify --quiet refs/heads/<name>` /
        `refs/remotes/origin/<name>`), append `-2`, `-3`, … until unique.
-     - Pick a worktree directory using the same priority order as
-       `iron-build`'s *Workspace* section: an existing `.worktrees/` (preferred) or
-       `worktrees/` at the repo root; otherwise a preference from
-       `CLAUDE.md` (`grep -i "worktree.*director" CLAUDE.md`); otherwise
-       default to `.worktrees/` — collab must never stop to ask, unlike the
-       general skill. For a project-local directory, verify it's gitignored
-       (`git check-ignore -q <dir>`); if not, add it to `.gitignore` and
-       commit that fix before proceeding (same "fix broken things
-       immediately" rule the skill follows).
+     - Pick a worktree directory using **only** the directory-priority list
+       in `iron-build`'s *Workspace* section (the numbered list under
+       "Choose where the worktree lives", plus its gitignore check), with
+       one collab-specific override: where that list's final entry says to
+       ask the human for a location, collab defaults to `.worktrees/`
+       instead. Collab must never stop to ask — it is running a bounded
+       protocol turn, not an interactive session. Nothing else in that
+       section applies here: its default-branch consent stop, its dependency
+       install, its red-baseline "ask whether to proceed", and its worktree
+       creation command are all superseded by this list — step 4 exists
+       precisely to escape the default branch, and the creation command is
+       the next bullet.
      - `git worktree add "<dir>/<name>" -b "<name>"` (branches from the
        current HEAD).
      - `repo_path` ← the new worktree's absolute path. `branch` ← `<name>`.
@@ -99,7 +102,7 @@ branch names.
    user approval here.** The draft is yours alone, Codex cannot see it.
    Once drafted, call `mcp__ironmem__collab_send` with
    `sender="claude"`, `topic="draft"`, `content=<the plan text>`. Your
-   only planning user gate is the final Superpowers task plan at
+   only planning user gate is the final approved task plan at
    `PlanClaudeFinalizePending`; sending the draft autonomously lets Codex
    start grinding immediately instead of waiting on a user think-time gate.
 6. After the draft is sent, begin the v1 planning loop (below). The send
@@ -150,9 +153,10 @@ paths, branches, or SHAs.
 5. Because shortcut sessions have no collab `task_list`, the Codex review
    prompt must recover context before judging the branch: search ironmem
    checkpoints for the same `repo_path`/`branch`, read any referenced
-   Superpowers task markdown, and scan the current code/diff to determine
+   approved task markdown, and scan the current code/diff to determine
    which acceptance criteria are already complete. If no checkpoint exists,
-   fall back to the branch diff plus nearby Superpowers plan docs in the repo.
+   fall back to the branch diff plus nearby plan docs under
+   `docs/iron/plans/`.
 6. Enter the v3 dispatch loop at phase `CodeReviewFixGlobalPending`. The
    loop handles the three remaining turns (`review_fix_global` from Codex,
    `review_local` from Claude, then `final_review` from Claude) and
@@ -223,7 +227,7 @@ loop:
   if current_owner == "codex":
     dispatch via background `codex exec`
       (see "Codex handoff — background `codex exec`" below)
-    loop  # re-read status when Codex's phase advances
+    loop  # re-read status when Codex's phase advances or returns a compose ref
 
   # current_owner == "claude"
   recv(session_id, "claude", auto_ack=true)  # atomically acks all returned messages in one round-trip
@@ -241,9 +245,8 @@ ends here, before a human merges the PR on GitHub — collab has no way to
 observe the merge, so it cannot clean up automatically. If `start` created an
 isolated worktree for this session (check: `git rev-parse --git-common-dir`
 differs from `git rev-parse --git-dir` in `repo_path`), include a line in the
-final report to the user naming the worktree path and pointing at the
-`engineering:git-worktree-manager` skill's `worktree_cleanup.py` (or a plain
-`git worktree remove <path>` once the PR merges) — do not run cleanup
+final report to the user naming the worktree path and the cleanup command
+(`git worktree remove <path>`, once the PR merges) — do not run cleanup
 yourself, since the branch/worktree must survive until the PR is actually
 merged.
 
@@ -278,7 +281,7 @@ For every Claude-owned protocol turn, the orchestrator: reads slim
 `collab_status` → spawns ONE fresh-context worker via the `Agent` tool, prompt =
 the verbatim `.claude-plugin/prompts/collab-turn-<turn>.md` with `$VAR`s
 substituted (`$SESSION_ID`, and where the template uses them `$REPO_PATH`,
-`$BRANCH`, `$TOPIC`, `$ARTIFACT_REF`, `$ARTIFACT_HASH`, `$MODE`) → ingests ONLY the worker's
+`$BRANCH`, `$TOPIC`, `$ARTIFACT_REF`, `$ARTIFACT_HASH`, `$MODE`, `$SENDER`) → ingests ONLY the worker's
 ≤3-line verdict → loops. Template path resolution: prefer
 `.claude-plugin/prompts/collab-turn-<turn>.md` in the target repo checkout
 (present when the target is ironrace-memory itself); otherwise use the
@@ -297,7 +300,7 @@ own `collab_status` / `collab_recv` / drawer fetches.
 <!-- LINT:gates-ref-only -->
 ### Approval gates are reference-only
 The only planning user gate is `final`: a compose worker writes the
-Superpowers-compatible task plan to `docs/iron/plans/...` and stages the
+iron-build-compatible task markdown to `docs/iron/plans/...` and stages the
 exact markdown in a drawer, then returns `{ref, file path, ≤3-line summary}`.
 The orchestrator surfaces ONLY ref+path+summary for approval (never the full
 body); `collab-turn-submit.md` sends the approved final artifact by ref. For
@@ -324,14 +327,25 @@ fall back to a lower tier.**
 ### Dispatch matrix
 | Phase | Owner | Template | Tier | Model |
 |---|---|---|---|---|
-| PlanParallelDrafts | claude | `collab-turn-plan-draft.md` | planning | opus |
-| PlanSynthesisPending | claude | `collab-turn-plan-synthesis.md` | planning | opus |
-| PlanClaudeFinalizePending | claude | `collab-turn-plan-finalize.md` | planning | opus |
-| PlanLocked (bridge) | claude | `collab-turn-task-list.md` | mechanical | sonnet |
-| CodeImplementPending | claude | `collab-turn-code-implement.md` | mechanical | sonnet |
-| CodeReviewLocalPending | claude | `collab-turn-review-local.md` | review | opus |
-| CodeReviewFinalPending | claude | `collab-turn-final-review.md` | review | opus |
-| post-gate send | claude | `collab-turn-submit.md` | mechanical | sonnet |
+| PlanParallelDrafts | orchestrator | `collab-turn-plan-draft.md` | planning | opus |
+| PlanSynthesisPending | orchestrator | `collab-turn-plan-synthesis.md` | planning | opus |
+| PlanCodexReviewPending (copilot) | orchestrator | `collab-turn-plan-review.md` | review | opus |
+| PlanClaudeFinalizePending | orchestrator | `collab-turn-plan-finalize.md` | planning | opus |
+| PlanLocked (bridge) | orchestrator | `collab-turn-task-list.md` | mechanical | sonnet |
+| CodeImplementPending | orchestrator | `collab-turn-code-implement.md` | mechanical | sonnet |
+| CodeReviewFixGlobalPending (copilot) | orchestrator | `collab-turn-review-fix-global.md` | review | opus |
+| CodeReviewLocalPending | orchestrator | `collab-turn-review-local.md` | review | opus |
+| CodeReviewFinalPending | orchestrator | `collab-turn-final-review.md` | review | opus |
+| post-gate send | orchestrator | `collab-turn-submit.md` | mechanical | sonnet |
+
+The `Owner` column names the **runner** — who dispatches and executes the
+worker — which is always the Claude-side orchestrator, for every row
+including `post-gate send`. It is not the protocol **sender**: the submit
+worker sends under `$SENDER` (`collab_status.current_owner`, normally the
+pilot), so under `pilot == "codex"` Codex owns the send identity while the
+Claude-side orchestrator still runs the worker. Reading this column as the
+sender would imply Codex must run `collab-turn-submit.md`, for which there is
+deliberately no `.codex-plugin` prompt — the turn would be undispatchable.
 
 ## v1 Planning Loop (Phase → Action Table)
 
@@ -340,12 +354,12 @@ Repeat the dispatch loop with these actions:
 | Phase | What to do (is_my_turn == true) |
 |---|---|
 | `PlanParallelDrafts` | The draft worker (`collab-turn-plan-draft.md`, planning/opus) was already dispatched from the `start` branch. is_my_turn should be false here — if true, verify with `collab_status`. If `collab_status` confirms Claude is the owner in a Codex-owned phase, this is a protocol-level anomaly — exit the loop and report to the user; do not attempt a send. |
-| `PlanSynthesisPending` | Dispatch `collab-turn-plan-synthesis.md` (planning/opus) autonomously. It merges both blind drafts and sends `topic="canonical"` directly. Do not enter Plan Mode here; the single human planning gate is the final Superpowers task plan. `draft` and `canonical` are the only v1 topics that are NOT JSON-wrapped. Ingest only the ≤3-line verdict; loop. |
-| `PlanCodexReviewPending` | Codex's turn. is_my_turn should be false — if true, verify with `collab_status`. If the inconsistency persists, exit the loop and report to the user. **Review cap:** the server enforces `MAX_REVIEW_ROUNDS = 1` at `crates/ironmem/src/collab/state_machine/mod.rs:28`. Codex gets one plan-review pass; after that review the server transitions to `PlanClaudeFinalizePending` regardless of verdict (`approve`, `approve_with_minor_edits`, or `request_changes` all map to the same next phase). Do not model v1 as open-ended iteration or return to synthesis. |
-| `PlanClaudeFinalizePending` | **Enter Plan Mode and get user approval — this is the only planning human gate.** Under reference-only gates, dispatch `collab-turn-plan-finalize.md` (planning/opus), which incorporates Codex's one review pass and produces the final Superpowers-compatible task markdown in `docs/iron/plans/...`. Every `### Task N:` must be sized for 20 minutes or less and the plan must contain at most 10 tasks. If it would need 11 or more, stop before approval and split the work into independently executable child issues; never merge unrelated work or drop acceptance criteria to evade the limit. The worker stages `{"plan": "<exact markdown>"}` in a drawer and returns `{drawer_id, file path, ≤3-line summary}`; surface ONLY ref+path+summary for approval. On approval dispatch `collab-turn-submit.md` (mechanical/sonnet) with `$TOPIC=final` `$ARTIFACT_REF=<drawer_id>` to send `topic="final"` (v1 `final` is the only v1 topic wrapped in JSON); drawer immutability is the integrity anchor. After send, `PlanLocked` is reached. Ingest only the ≤3-line verdict; loop. |
+| `PlanSynthesisPending` | Dispatch `collab-turn-plan-synthesis.md` (planning/opus) autonomously. It merges both blind drafts and sends `topic="canonical"` directly. Do not enter Plan Mode here; the single human planning gate is the final approved task plan. `draft` and `canonical` are the only v1 topics that are NOT JSON-wrapped. Ingest only the ≤3-line verdict; loop. |
+| `PlanCodexReviewPending` | Owner depends on `pilot` — the server gates this phase on the **copilot**, not on Codex (`require_actor(actor, copilot(session))` in `crates/ironmem/src/collab/state_machine/mod.rs`), and the phase label is the frozen wire name, not an owner claim. Read `current_owner` from `collab_status`. **`current_owner == "codex"`** (`pilot == "claude"`, the default): Codex's turn. is_my_turn should be false — if true, verify with `collab_status`. If the inconsistency persists, exit the loop and report to the user. **`current_owner == "claude"`** (`pilot == "codex"`, so Claude is the copilot): this is Claude's legitimate turn, not a protocol anomaly — dispatch the matrix worker `collab-turn-plan-review.md` (review/opus), ingest only its ≤3-line verdict, and loop. **Review cap:** the server enforces `MAX_REVIEW_ROUNDS = 1` at `crates/ironmem/src/collab/state_machine/mod.rs:28`. The copilot gets exactly one plan-review pass; after that review the server transitions to `PlanClaudeFinalizePending` regardless of verdict (`approve`, `approve_with_minor_edits`, or `request_changes` all map to the same next phase). Do not model v1 as open-ended iteration or return to synthesis. |
+| `PlanClaudeFinalizePending` | **Enter Plan Mode and get user approval — this is the only planning human gate.** Under reference-only gates, dispatch `collab-turn-plan-finalize.md` (planning/opus), which incorporates Codex's one review pass and produces the final iron-build-compatible task markdown in `docs/iron/plans/...`. Every `### Task N:` must be sized for 20 minutes or less and the plan must contain at most 10 tasks. If it would need 11 or more, stop before approval and split the work into independently executable child issues; never merge unrelated work or drop acceptance criteria to evade the limit. The worker stages `{"plan": "<exact markdown>"}` in a drawer and returns `{drawer_id, file path, ≤3-line summary}`; surface ONLY ref+path+summary for approval. Composition is pilot-generic — under `pilot == "claude"` this worker (`collab-turn-plan-finalize.md`) both composes and stages the drawer as just described; under `pilot == "codex"`, Codex composes and stages the equivalent drawer itself via its own `collab-plan-finalize.md` prompt (incorporates the copilot's review notes, saves the plan file, stages `{"plan": "<exact markdown>"}`, and sends nothing) — v1 planning does have a real pilot split here, matching `.codex-plugin/prompts/collab-plan-finalize.md`. Either way, on approval the orchestrator reads `current_owner` from `collab_status` (confirming `final` is the topic authorized for this phase) and dispatches `collab-turn-submit.md` (mechanical/sonnet) with `$TOPIC=final` `$ARTIFACT_REF=<drawer_id>` `$SENDER=<collab_status.current_owner>` to send `topic="final"` (v1 `final` is the only v1 topic wrapped in JSON); drawer immutability is the integrity anchor. Normally `current_owner == pilot` here. The v3 recovery-owner substitution described in the pre-send harness recovery override in step 0 of the **Pre-send Harness Sequence (Claude-owned v3 turns)** and in the `CodeReviewLocalPending`/`CodeReviewFinalPending` recovery row in the **Codex dispatch tuning matrix** does **not** apply to this phase: `pending_failure`/`FailureReport` handling is gated to coding-active phases (`Phase::is_coding_active()`), and `PlanClaudeFinalizePending` is not one of them, so `$SENDER` always resolves to the pilot here — there is no in-flight recovery-owner case to substitute. After send, `PlanLocked` is reached. Ingest only the ≤3-line verdict; loop. |
 
 Rationale: blind drafts, synthesis, and Codex's single review run
-autonomously. The final Superpowers task plan is the commit point and the
+autonomously. The final approved task plan is the commit point and the
 only artifact worth interrupting the human for.
 
 ## v3 Bridge: PlanLocked → CodeImplementPending
@@ -354,16 +368,26 @@ only artifact worth interrupting the human for.
 ### v3 bridge (PlanLocked → CodeImplementPending) — worker-owned
 The orchestrator does NOT call a separate plan-expansion skill, read a plan
 body from status, or build the manifest inline. It dispatches
-`collab-turn-task-list.md` once (mechanical/sonnet). That worker reads the
+`collab-turn-task-list.md` once (mechanical/sonnet) with
+`$SENDER=<collab_status.current_owner>`. That worker reads the
 approved plan's `{plan_file_path, hash}` reference from `collab_status`,
 verifies the exact file, parses tasks, and sends `task_list`. Only the worker's
 ≤3-line verdict crosses the orchestrator boundary.
 
 Once `PlanLocked` is reached with `final_plan_hash` set and no `task_list`
 yet, run this worker-owned bridge. **Do not enter harness Plan Mode here** —
-the user already approved the final Superpowers task plan.
+the user already approved the final task plan.
 
-1. Dispatch `collab-turn-task-list.md` (mechanical/sonnet). The worker reads
+1. Read `current_owner` from `collab_status` (confirming `task_list` is the
+   topic authorized for this phase) and dispatch `collab-turn-task-list.md`
+   (mechanical/sonnet) with `$SENDER=<collab_status.current_owner>`. Normally
+   `current_owner == pilot` here: publishing `final` does not reassign
+   ownership, so `PlanLocked` is entered owned by the pilot, and under
+   `pilot == "codex"` this send must go out as `codex` even though the Claude
+   worker does the parse. `PlanLocked` is not a `Phase::is_coding_active()`
+   phase, so no recovery-owner substitution applies and `$SENDER` never
+   resolves to anything but the current owner read from `collab_status` — it
+   must never be hardcoded to `"claude"`. The worker reads
    `final_plan_ref`/`final_plan_hash`, obtains the repo-relative
    `plan_file_path` from that reference, verifies the file's SHA-256 against
    the approved hash, and parses each `### Task N:` heading into
@@ -622,9 +646,9 @@ sequence before building the payload:
 | Phase | What to do (is_my_turn == true) |
 |---|---|
 | `CodeImplementPending` | Owner depends on `implementer`. **Claude is owner** (default or `/collab join --implementer=claude <session_id>`): dispatch the matrix worker `collab-turn-code-implement.md` (mechanical/sonnet) and ingest its ≤3-line verdict; loop. The worker resumes from `ironrace-memory/collab-checkpoints`, scans plan/code state, continues the local `iron-build` batch with the v3-bridge checkpoint rule, runs pre-send harness gates (no reset — no Codex push to sync), writes `status: batch_complete`, and `collab_send`s `sender="claude"`, `topic="implementation_done"`, `content=<JSON {"head_sha":"<current HEAD>"}>` (payload carries ONLY `head_sha`) on green, or `failure_report` on failure. After send, the phase advances to `CodeReviewFixGlobalPending` (Codex's turn — the new v3 order has Codex run `/pr-review-toolkit:review-pr` on the raw post-implementation diff first). **Codex is owner** (`--implementer=codex`): is_my_turn is false here; dispatch Codex via background `codex exec` (per the Codex handoff section). Codex must resume from ironmem checkpoints, scan the plan/code state, and emit `implementation_done` itself before the bg-exec settled wait wakes on the phase advance. |
-| `CodeReviewFixGlobalPending` | Codex's turn unless `pending_failure` makes Claude the recovery owner. In that recovery case, preserve the diff and complete the interrupted turn per the recovery override, sending `review_fix_global`; this is valid delegated completion, not an anomaly. Otherwise dispatch Codex via background `codex exec`, with the timing logs and `/pr-review-toolkit:review-pr` review pass described in the Codex handoff section. After `review_fix_global`, the phase advances to `CodeReviewLocalPending` (Claude's audit turn). |
+| `CodeReviewFixGlobalPending` | Owner depends on `pilot`, plus a recovery override — the server gates this phase on the **copilot** (`require_actor_or_recovery(session, actor, copilot(session))` in `crates/ironmem/src/collab/state_machine/mod.rs`), so who owns it follows from `pilot`, not from the phase name. Read `current_owner` from `collab_status`. **Recovery override (checked first):** if `pending_failure` makes Claude the recovery owner, preserve the diff and complete the interrupted turn per the recovery override, sending `review_fix_global`; this is valid delegated completion, not an anomaly. **`current_owner == "codex"`** outside recovery (`pilot == "claude"`, the default): dispatch Codex via background `codex exec`, with the timing logs and `/pr-review-toolkit:review-pr` review pass described in the Codex handoff section. **`current_owner == "claude"`** outside recovery (`pilot == "codex"`, so Claude is the copilot): this is Claude's legitimate turn — dispatch the matrix worker `collab-turn-review-fix-global.md` (review/opus), ingest only its ≤3-line verdict, and loop. Do **not** dispatch Codex here: `collab-global-review.md`'s own ownership guard rejects and exits, which the wait loop reads as a dispatch failure and turns into a spurious `codex_dispatch_failed:` that burns a recovery attempt. After `review_fix_global`, the phase advances to `CodeReviewLocalPending` (Claude's audit turn). |
 | `CodeReviewLocalPending` | Dispatch the matrix worker `collab-turn-review-local.md` (review/opus) and ingest its ≤3-line verdict; loop. The worker runs the pre-send harness (with reset to `last_head_sha` — Codex just pushed at `review_fix_global`), then performs the overlap-mode audit. It runs full `/ultrareview-local` when Codex made fix commits or runtime/Rust files changed, and uses `review_local=reduced` when Codex made no fix commit or the branch diff is docs/config-only. Reduced mode is still an audit: inspect the diff summary, changed files, and Codex commits for protocol drift, docs/config breakage, generated metadata inconsistencies, and security-sensitive configuration; escalate to full `/ultrareview-local` on uncertainty or a substantive finding. Confirmed CRITICAL/HIGH/MEDIUM findings are partitioned into temporary worktrees on unique throwaway branches for parallel fix subagents where safe, merged/cherry-picked back, committed + pushed, and `collab_send`s `sender="claude"`, `topic="review_local"`, `content=<JSON {"head_sha":"<current HEAD>"}>`. **Log:** `t5_review_local_sent`. **Anti-removal:** under v3 ordering the stage audits Codex's `review_fix_global` work plus catches issues both agents missed. Its code-quality lens partially overlaps with Codex's `pr-review-toolkit`-backed branch review but does not fully duplicate it. Removing this stage requires a written overlap audit demonstrating that Codex's `review_fix_global` reviews catch the code-quality issues `/ultrareview-local` would have flagged AND that the audit-of-Codex role is unnecessary. |
-| `CodeReviewFinalPending` | **Auto-create the PR — no user-approval gate** (the diff already passed `review_fix_global` + `review_local`, and a PR is editable and unmerged after creation; do NOT enter Plan Mode here). Dispatch the matrix worker `collab-turn-final-review.md` (review/opus) with `$MODE=compose`: it performs pushed-head proof only (no reset, no gate rerun) by requiring a clean worktree, `HEAD == last_head_sha`, and local HEAD equal to the pushed upstream/origin branch head, then drafts the PR title (under 70 chars) + body (summary + test plan derived from task list + prior gate evidence / pushed-head proof), writes `{"title":"...","body":"..."}` to a drawer, and returns `{drawer_id, ≤3-line summary}`. If the proof fails, the worker returns a blocker instead of running tests. Then dispatch `collab-turn-submit.md` (mechanical/sonnet) **directly** with `$TOPIC=final_review` `$ARTIFACT_REF=<drawer_id>` (drawer immutability is the integrity anchor — the approved drawer's content cannot change, so no hash recompute is needed): it reads the title/body artifact, then runs a plain `gh pr create --base <base_branch> --head <current branch> --title <title> --body <body>` (a **ready** PR — no `--draft`), and on failure sends `failure_report` `coding_failure: "pr_create_failed: <error>"` (no silent retry). On success, **Log:** `t8_pr_created <pr_url>`, the worker captures `pr_url` and `collab_send`s `sender="claude"`, `topic="final_review"`, `content=<JSON {"head_sha":"<current HEAD>","pr_url":"<https url>"}>`. **Log:** `t9_final_review_sent`. Session advances directly to `CodingComplete`. **Log:** `t10_session_complete CodingComplete`. Exit loop. |
+| `CodeReviewFinalPending` | **Auto-create the PR — no user-approval gate** (the diff already passed `review_fix_global` + `review_local`, and a PR is editable and unmerged after creation; do NOT enter Plan Mode here). Dispatch the matrix worker `collab-turn-final-review.md` (review/opus) with `$MODE=compose`: it performs pushed-head proof only (no reset, no gate rerun) by requiring a clean worktree, `HEAD == last_head_sha`, and local HEAD equal to the pushed upstream/origin branch head, then drafts the PR title (under 70 chars) + body (summary + test plan derived from task list + prior gate evidence / pushed-head proof), writes `{"title":"...","body":"..."}` to a drawer, and returns `{drawer_id, ≤3-line summary}`. If the proof fails, the worker returns a blocker instead of running tests. Composition is pilot-generic — under `pilot == "claude"` this worker (`collab-turn-final-review.md`) composes as just described; under `pilot == "codex"`, Codex composes the equivalent drawer itself via its own `collab-final-review.md` prompt (proves the pushed head, drafts the PR title/body, stages `{"title":"...","body":"..."}`, and sends nothing and opens no PR). Either way, the orchestrator reads `current_owner` from `collab_status` (confirming `final_review` is the topic authorized for this phase) and dispatches `collab-turn-submit.md` (mechanical/sonnet) **directly** with `$TOPIC=final_review` `$ARTIFACT_REF=<drawer_id>` `$SENDER=<collab_status.current_owner>` (drawer immutability is the integrity anchor — the approved drawer's content cannot change, so no hash recompute is needed): it reads the title/body artifact, then runs a plain `gh pr create --base <base_branch> --head <current branch> --title <title> --body <body>` (a **ready** PR — no `--draft`), and on failure sends `failure_report` `coding_failure: "pr_create_failed: <error>"` (no silent retry). Normally `current_owner == pilot` here; under recovery (`collab_status.pending_failure` non-null), `current_owner` may instead be the recovery owner per the recovery override in step 0 of the **Pre-send Harness Sequence (Claude-owned v3 turns)** and the `CodeReviewLocalPending`/`CodeReviewFinalPending` recovery row in the **Codex dispatch tuning matrix** — `CodeReviewFinalPending` is a coding-active phase, so this substitution is live here, and `$SENDER` must always be read from `current_owner`, never assumed to equal `pilot`. On success, **Log:** `t8_pr_created <pr_url>`, the worker captures `pr_url` and `collab_send`s as `$SENDER`, `topic="final_review"`, `content=<JSON {"head_sha":"<current HEAD>","pr_url":"<https url>"}>`. **Log:** `t9_final_review_sent`. Session advances directly to `CodingComplete`. **Log:** `t10_session_complete CodingComplete`. Exit loop. |
 
 After each send in v3, loop back to polling. The loop continues until
 `phase in {CodingComplete, CodingFailed}` or `session_ended` — and
@@ -656,7 +680,7 @@ remain:
 - The `implementation_done` payload carries ONLY `head_sha`. Do not
   embed subagent notes, self-critique, success summaries, or
   instructions for Codex in any other field — there are no other
-  fields. Codex reads the diff and the approved Superpowers task markdown at
+  fields. Codex reads the diff and the approved task markdown at
   `plan_file_path` to form its own judgment.
 - When dispatching Codex via `codex exec`, the prompt file passed is
   the verbatim expanded Codex prompt with `$ARGUMENTS` substituted —
@@ -685,19 +709,29 @@ default: it governs the prompt file, model, and reasoning effort. Do not let a
 caller-supplied Codex default override a row. `gpt-5.6-sol` is reserved for an
 explicit architecture/security escalation from within a turn.
 
-| Phase from `collab_status` | `implementer` | Prompt file | Model | Reasoning effort | Rationale |
+| Phase from `collab_status` | Ownership condition | Prompt file | Model | Reasoning effort | Rationale |
 |---|---|---|---|---|---|
 | `CodeImplementPending` | `"codex"` | `collab-batch-impl.md` | `gpt-5.6-luna` | `max` | Luna is the default implementation controller/worker and handles the batch's design judgment at the higher implementation budget |
-| `CodeReviewFixGlobalPending` | (any) | `collab-global-review.md` | `gpt-5.6-terra` | `high` | Normal global review gets a dedicated review budget without paying the Sol escalation cost |
+| `CodeReviewFixGlobalPending` | `current_owner == "codex"` | `collab-global-review.md` | `gpt-5.6-terra` | `high` | Normal global review gets a dedicated review budget without paying the Sol escalation cost |
+| `CodeReviewFixGlobalPending` | `current_owner == "claude"` | n/a — Codex isn't owner | n/a | n/a | The phase is copilot-gated, so under `pilot == "codex"` Claude owns it and runs the Claude worker itself; no Codex dispatch |
 | `CodeReviewLocalPending` / `CodeReviewFinalPending` | Codex recovery owner | `collab-recovery.md` | `gpt-5.6-terra` | `high` | Recovery must finish the delegated normal-completion event without restoring the monolithic prompt |
 | `PlanParallelDrafts` | (any) | `collab-plan-draft.md` | `gpt-5.6-terra` | `high` | Planning needs an independent draft |
-| `PlanCodexReviewPending` | (any) | `collab-plan-review.md` | `gpt-5.6-terra` | `high` | Plan review needs independent judgment |
+| `PlanSynthesisPending` | Codex normal pilot | `collab-plan-synthesis.md` | `gpt-5.6-terra` | `high` | The pilot synthesizes the two drafts and sends `canonical` |
+| `PlanCodexReviewPending` | `current_owner == "codex"` | `collab-plan-review.md` | `gpt-5.6-terra` | `high` | Plan review needs independent judgment |
+| `PlanCodexReviewPending` | `current_owner == "claude"` | n/a — Codex isn't owner | n/a | n/a | The phase is copilot-gated (the wire name is frozen, not an owner claim), so under `pilot == "codex"` Claude owns it and runs the Claude worker itself; no Codex dispatch |
+| `PlanClaudeFinalizePending` | Codex normal pilot | `collab-plan-finalize.md` | `gpt-5.6-terra` | `high` | The pilot composes and stages the approval artifact without sending |
+| `CodeReviewLocalPending` | Codex normal pilot | `collab-review-local.md` | `gpt-5.6-terra` | `high` | The pilot sends the local audit completion |
+| `CodeReviewFinalPending` | Codex normal pilot | `collab-final-review.md` | `gpt-5.6-terra` | `high` | The pilot composes and stages the PR artifact without sending |
 | `CodeImplementPending` | `"claude"` | n/a — Codex isn't owner | n/a | n/a | Claude runs subagents on its side; no Codex dispatch |
 
-Match **both** `Phase` and `implementer` columns when looking up a row:
-`(any)` is a wildcard, quoted strings are exact matches. The two
-`CodeImplementPending` rows are distinguished only by `implementer` —
-do not stop at the first phase match.
+Match both `Phase` and ownership condition when looking up a row. `(any)` is a
+wildcard; `Codex normal pilot` means `pilot == "codex"`,
+`current_owner == "codex"`, and `pending_failure` is null; `Codex recovery
+owner` means the status names Codex as recovery owner. The two
+`CodeImplementPending` rows are distinguished only by `implementer`, and the
+paired `PlanCodexReviewPending` and `CodeReviewFixGlobalPending` rows only by
+`current_owner` (both phases are gated on the copilot, so Claude owns them
+under `pilot == "codex"`) — do not stop at the first phase match.
 
 **`-s danger-full-access` applies uniformly across every row above, not
 per-row.** The sandbox setting is a property of the protocol, not of the
@@ -749,9 +783,16 @@ b. Select prompt file, model, and reasoning effort from the "Codex dispatch tuni
      `.codex-plugin/prompts/collab-batch-impl.md`; model and reasoning:
      `-m gpt-5.6-luna -c model_reasoning_effort=max`
    - `PlanParallelDrafts` → `.codex-plugin/prompts/collab-plan-draft.md`;
+     Codex-normal-pilot `PlanSynthesisPending` →
+     `.codex-plugin/prompts/collab-plan-synthesis.md`;
      `PlanCodexReviewPending` → `.codex-plugin/prompts/collab-plan-review.md`;
+     Codex-normal-pilot `PlanClaudeFinalizePending` →
+     `.codex-plugin/prompts/collab-plan-finalize.md`;
      `CodeReviewFixGlobalPending` →
-     `.codex-plugin/prompts/collab-global-review.md`; recovery-owned
+     `.codex-plugin/prompts/collab-global-review.md`; Codex-normal-pilot
+     `CodeReviewLocalPending` → `.codex-plugin/prompts/collab-review-local.md`;
+     Codex-normal-pilot `CodeReviewFinalPending` →
+     `.codex-plugin/prompts/collab-final-review.md`; recovery-owned
      `CodeReviewLocalPending` / `CodeReviewFinalPending` →
      `.codex-plugin/prompts/collab-recovery.md`; each uses:
      `-m gpt-5.6-terra -c model_reasoning_effort=high`
@@ -787,6 +828,9 @@ d. **Log the appropriate timing event** immediately before launch. Use the
    - For `CodeReviewFixGlobalPending`: **Log:** `t6_codex_review_dispatched phase=CodeReviewFixGlobalPending round=1`
    - For `PlanParallelDrafts`: **Log:** `t2_codex_dispatched phase=PlanParallelDrafts round=1`
    - For `PlanCodexReviewPending`: **Log:** `t2_codex_dispatched phase=PlanCodexReviewPending round=1`
+   - For Codex-normal-pilot `PlanSynthesisPending`, `PlanClaudeFinalizePending`,
+     `CodeReviewLocalPending`, or `CodeReviewFinalPending`: **Log:**
+     `t2_codex_dispatched phase=<phase> round=1`
 
 e. Launch via Bash with `run_in_background: true`. Pass the model and
    reasoning effort selected above explicitly, plus `-s danger-full-access`
@@ -862,12 +906,15 @@ f. **Event-driven wait loop** — the dispatcher's interactive surface during
 
    - When the wait returns exactly `{"unchanged": true}`, do not call
      `collab_status` and do not produce an idle user update. After the single
-     bounded BashOutput drain above, first apply conditions 4 and 5 below if
-     the process exited or 600 seconds of no progress elapsed; otherwise
-     immediately begin the next wait.
+     bounded BashOutput drain above, first apply conditions 4, 5, and 6 below
+     if the process exited or 600 seconds of no progress elapsed; otherwise
+     immediately begin the next wait. Condition 4 (normal compose handoff) is
+     checked first among those three: a clean compose exit is a success path,
+     not a dispatch failure.
    - On a settled wake, call `mcp__ironmem__collab_status(session_id)` exactly
-     once, then apply the existing success, recovery, terminal, process-exit,
-     and hang conditions below in their stated order. A changed phase that
+     once, then apply the existing success, recovery, terminal,
+     compose-handoff, process-exit, and hang conditions below in their stated
+     order. A changed phase that
      remains Codex-owned is a normal return: select and launch its next
      phase-specific Codex prompt immediately, before considering the previous
      background process's normal exit an error. **Log:**
@@ -904,29 +951,92 @@ f. **Event-driven wait loop** — the dispatcher's interactive surface during
       that blew the recovery retry ceiling). **ABORT** — surface failure to
       user, exit the dispatcher loop.
 
-   4. Bash background process exits (BashOutput shows "exit code N" or
+   4. `collab_status.phase` is unchanged, `pilot == "codex"`,
+      `pending_failure` is null, `current_owner == "codex"`, and a clean
+      Codex-pilot compose process exits in `PlanClaudeFinalizePending` or
+      `CodeReviewFinalPending` with a non-empty `ref: <drawer_id>` verdict →
+      this is a **normal compose
+      handoff**, not a dispatch failure. The compose prompts intentionally
+      stage a drawer and send nothing, so no phase advance is expected.
+      Validate that the verdict has `blocker: none`, retain only its drawer
+      ref and short summary, and refresh `collab_status` immediately before
+      the submit worker:
+      - In `PlanClaudeFinalizePending`, surface only the ref, file path, and
+        summary for the existing human approval gate. After approval, confirm
+        the phase and owner are still unchanged, then dispatch
+        `collab-turn-submit.md` with `$TOPIC=final`,
+        `$ARTIFACT_REF=<drawer_id>`, and
+        `$SENDER=<collab_status.current_owner>`.
+      - In `CodeReviewFinalPending`, dispatch `collab-turn-submit.md`
+        directly with `$TOPIC=final_review`, `$ARTIFACT_REF=<drawer_id>`, and
+        `$SENDER=<collab_status.current_owner>`.
+
+      The Claude worker physically performs the submit/PR-create operation,
+      but `$SENDER` remains the Codex pilot's current protocol identity. Do
+      not re-dispatch the compose prompt, and do not emit
+      `codex_dispatch_failed:` for this success path. A missing ref, blocker,
+      nonzero exit, or changed status remains a real dispatch failure.
+
+   5. Bash background process exits (BashOutput shows "exit code N" or
       process is no longer running) AND no phase advance observed →
       Codex CLI failed silently. **ERROR.**
       - Capture the last 50 lines from `/tmp/codex-out-${session_id}.log`.
-      - Send `collab_send(sender="claude", topic="failure_report",
+      - **Dispatch-failure-admitting phases only** — `CodeImplementPending`
+        (when `implementer == "codex"`) and `CodeReviewFixGlobalPending`:
+        send `collab_send(sender="claude",
+          topic="failure_report",
           content=<JSON {"coding_failure":"codex_dispatch_failed: codex exec exited without a phase advance — <last 50 log lines>"}>)`.
-      - Read `collab_status` again, then exit the wait loop via condition 2
+        Read `collab_status` again, then exit the wait loop via condition 2
         (recovery handed to Claude) or condition 3 (retry ceiling exceeded).
+      - **Every other phase** — the planning phases (`PlanParallelDrafts`,
+        `PlanSynthesisPending`, `PlanCodexReviewPending`,
+        `PlanClaudeFinalizePending`) **and** `CodeReviewLocalPending` /
+        `CodeReviewFinalPending`: do **not** send `failure_report`. Kill any
+        surviving background process, exit the wait loop, and report the
+        captured log tail and the stalled phase to the user as a dispatch
+        failure that needs manual intervention.
+
+        Two independent server gates apply here, and passing the first is
+        **not** sufficient. Planning phases fail `Phase::is_coding_active()`
+        (`crates/ironmem/src/collab/phase.rs`) and are rejected as
+        `WrongPhase`. `CodeReviewLocalPending` and `CodeReviewFinalPending`
+        *are* coding-active, but an **off-turn** `codex_dispatch_failed:`
+        additionally requires `dispatch_failure_phase_admits`
+        (`crates/ironmem/src/collab/mod.rs`), which returns `false` for both —
+        so `off_turn_failure_is_admissible` is false, `actor != current_owner`,
+        and the send is rejected as `NotYourTurn`. Either way conditions 2 and
+        3 are unreachable, so sending would leave the dispatcher looping on a
+        rejected send with no exit. This case is reachable whenever
+        `pilot == "codex"`, which routes Codex into both phases.
 
       `codex_dispatch_failed:` is the ONLY off-turn-admissible prefix Claude
       may use against a Codex-owned turn, and it classifies **Tooling**
-      (recoverable) — so conditions 4 and 5 hand recovery to Claude rather
-      than aborting the session. The server admits it only with at least one
-      byte of detail after the colon; a bare prefix, or any other prefix
-      (`branch_drift:` aside, which is terminal), is rejected off-turn.
+      (recoverable) — so in the dispatch-failure-admitting phases above,
+      conditions 5 and 6 hand recovery to Claude rather than aborting the
+      session (condition 4 is a success path and emits no
+      `codex_dispatch_failed:` at all). In every other phase there is no
+      protocol escape at all: the report is rejected, so the only correct
+      action is to exit and surface the stall to a human. The server admits
+      the prefix only with at least one byte of detail after the colon; a bare
+      prefix, or any other prefix (`branch_drift:` aside, which is terminal),
+      is rejected off-turn.
 
-   5. Wall time exceeds 600 seconds (configurable) →
+   6. Wall time exceeds 600 seconds (configurable) →
       **HANG.**
       - Kill the Bash background process via `KillShell`.
-      - Send `collab_send(sender="claude", topic="failure_report",
+      - **Dispatch-failure-admitting phases only** (`CodeImplementPending`
+        with `implementer == "codex"`, and `CodeReviewFixGlobalPending`):
+        send `collab_send(sender="claude",
+          topic="failure_report",
           content=<JSON {"coding_failure":"codex_dispatch_failed: codex exec exceeded the 600s hang timeout with no phase advance"}>)`.
-      - Read `collab_status` again, then exit the wait loop via condition 2
+        Read `collab_status` again, then exit the wait loop via condition 2
         (recovery handed to Claude) or condition 3 (retry ceiling exceeded).
+      - **Every other phase:** as in condition 5 — the planning phases are
+        rejected by `Phase::is_coding_active()`, and `CodeReviewLocalPending` /
+        `CodeReviewFinalPending` are rejected by
+        `dispatch_failure_phase_admits` despite being coding-active. Do not
+        send `failure_report`; exit the wait loop and report the hang and the
+        stalled phase to the user instead.
 
 g. Resume the normal dispatch loop after a settled success or recovery. The
    settled `collab_status` read already observed the Claude-owned or terminal
@@ -999,7 +1109,7 @@ Writes are best-effort and never block the protocol.
 - **Harness Plan Mode gates only at v1 `final`
   (`PlanClaudeFinalizePending`).** The blind `draft` send, canonical synthesis,
   and Codex's one plan-review pass run autonomously. The v3 `task_list` send is
-  a mechanical parse/submit from the already-approved Superpowers markdown, not
+  a mechanical parse/submit from the already-approved task markdown, not
   an extra task-planning handoff and not a harness Plan Mode gate. The v3
   `final_review` PR creation runs autonomously (no gate; the diff already
   passed `review_fix_global` + `review_local`). Every other turn runs
@@ -1017,7 +1127,7 @@ Writes are best-effort and never block the protocol.
   counterpart of the interrupted owner.
 - If the user interrupts with a question or correction during v1, answer it
   inside the final Plan Mode gate when possible and incorporate it into the
-  final Superpowers task plan. During v3, all turns are autonomous — the only
+  final approved task plan. During v3, all turns are autonomous — the only
   remaining content gate is v1 `final` (Plan Mode). The bridge mechanically
   submits `task_list` from the approved markdown and `final_review` PR creation
   is gateless.

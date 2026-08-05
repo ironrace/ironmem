@@ -309,20 +309,93 @@ pub fn parse_session_id(stdout: &str) -> Result<String> {
 /// Render a worker template by reading `<prompts_dir>/<template>` and replacing
 /// each `$VAR` in `subst`. Keys are applied longest-first so that a prefix key
 /// (`$ARTIFACT_HASH`) cannot clobber a longer one (`$ARTIFACT_REF`).
+///
+/// Errors when the rendered body still carries an unsubstituted `$PLACEHOLDER`
+/// (see [`render_prompt_body`]) — these prompts are fed to a real `claude -p`
+/// subprocess, so a literal `$SENDER` reaching a worker is a live failure, not a
+/// cosmetic one.
 pub fn render_worker_prompt(
     prompts_dir: &Path,
     template: &str,
     subst: &[(&str, &str)],
 ) -> Result<String> {
     let path = prompts_dir.join(template);
-    let mut body = std::fs::read_to_string(&path)
+    let body = std::fs::read_to_string(&path)
         .map_err(|e| anyhow!("reading worker template {}: {e}", path.display()))?;
+    render_prompt_body(template, &body, subst)
+}
+
+/// Substitute `subst` into `body` (longest key first, as above) and reject the
+/// result if any `$PLACEHOLDER` survived. `source` names the template (or the
+/// driver-owned constant) in the error.
+///
+/// This is the class-level guard: the matrix templates in
+/// `.claude-plugin/prompts/` are edited independently of this driver, so a
+/// template that gains a new placeholder the driver does not supply would
+/// otherwise ship a literal `$SENDER` to a live worker, which then aborts on the
+/// template's own sender guard and wedges the run silently.
+pub fn render_prompt_body(source: &str, body: &str, subst: &[(&str, &str)]) -> Result<String> {
+    let mut out = body.to_string();
     let mut keys: Vec<&(&str, &str)> = subst.iter().collect();
     keys.sort_by_key(|(k, _)| Reverse(k.len()));
     for (k, v) in keys {
-        body = body.replace(k, v);
+        out = out.replace(k, v);
     }
-    Ok(body)
+    if let Some(leftover) = first_leftover_placeholder(&out) {
+        return Err(anyhow!(
+            "worker template {source} rendered with unsubstituted placeholder \
+             {leftover}: add it to the substitution list for this call site \
+             (the template was changed without updating the driver)"
+        ));
+    }
+    Ok(out)
+}
+
+/// First `$UPPERCASE_PLACEHOLDER` left in `body`, or `None`.
+///
+/// A placeholder is `$` + an ASCII-uppercase letter + `[A-Z0-9_]*` (length ≥ 2),
+/// which is exactly the shape `scripts/check_collab_turn_templates.py` admits via
+/// its `ALLOWED_PLACEHOLDERS` set. Deliberately narrow so the ordinary `$`-sigil
+/// text a prompt may carry never trips it: `${session_id}` and `$1` fail the
+/// uppercase-letter test, and a bare `$` (regex anchor, price) has no name at all.
+///
+/// One exemption: an occurrence immediately followed by `=` is the orchestrator's
+/// *contract notation* for naming a placeholder rather than using it — e.g.
+/// `collab-turn-plan-finalize.md` and `collab-turn-final-review.md` both instruct
+/// the next turn to call `collab-turn-submit.md` "with `$TOPIC=final` and
+/// `$ARTIFACT_REF=<drawer_id>`", mirroring `$SENDER=<collab_status.current_owner>`
+/// in `.claude-plugin/commands/collab.md`. Those are prose references to a
+/// *different* template's inputs, never substitution sites for the current render;
+/// no real substitution site in the corpus is written `$NAME=`.
+fn first_leftover_placeholder(body: &str) -> Option<String> {
+    let bytes = body.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] != b'$' {
+            i += 1;
+            continue;
+        }
+        let start = i + 1;
+        if start >= bytes.len() || !bytes[start].is_ascii_uppercase() {
+            i += 1;
+            continue;
+        }
+        let mut end = start + 1;
+        while end < bytes.len()
+            && (bytes[end].is_ascii_uppercase()
+                || bytes[end].is_ascii_digit()
+                || bytes[end] == b'_')
+        {
+            end += 1;
+        }
+        // Contract notation (`$TOPIC=final`) names a placeholder; it is not one.
+        if bytes.get(end) == Some(&b'=') {
+            i = end;
+            continue;
+        }
+        return Some(body[i..end].to_string());
+    }
+    None
 }
 
 // ── Dispatcher loop ──────────────────────────────────────────────────────────
@@ -343,11 +416,18 @@ const STUCK_LIMIT: usize = 2;
 
 /// Driver-owned synthetic final-review submit (replaces `gh pr create`): the
 /// worker sends `final_review` with a synthetic, un-pushed `pr_url`. No network,
-/// nothing pushed. `$SESSION_ID` and `$PR_URL` are substituted by the driver.
+/// nothing pushed. `$SESSION_ID`, `$PR_URL` and `$SENDER` are substituted by the
+/// driver.
+///
+/// `$SENDER` (rather than a hardcoded `"claude"`) mirrors the pilot-generic
+/// contract `collab-turn-submit.md` now uses. This action is only dispatched for
+/// `("claude", "CodeReviewFinalPending")`, so the rendered value is `claude`
+/// today — parameterizing it keeps the constant correct if that pairing ever
+/// widens, instead of re-introducing the same hardcoded-sender bug here.
 const SYNTHETIC_FINAL_SUBMIT: &str = "\
 You are an abeval headless submit worker. Do NOT run `gh pr create` and do NOT \
 push anything. Send the final review event directly:\n\
-mcp__ironmem__collab_send with sender=\"claude\", topic=\"final_review\", \
+mcp__ironmem__collab_send with sender=\"$SENDER\", topic=\"final_review\", \
 content=<JSON {\"head_sha\":\"<current HEAD of this worktree>\",\"pr_url\":\"$PR_URL\"}> \
 for session_id=$SESSION_ID.\n\
 Return EXACTLY:\nresult: final_review sent\nref: $PR_URL\nblocker: none\n";
@@ -774,6 +854,7 @@ fn drive_collab_loop<R: CollabStateReader, S: WorkerSpawner>(
                         ("$SESSION_ID", &session_id),
                         ("$BRANCH", &ctx.branch),
                         ("$MODE", mode),
+                        ("$SENDER", &state.current_owner),
                     ],
                 )
                 .map_err(DriveError::Invalid)?;
@@ -801,6 +882,7 @@ fn drive_collab_loop<R: CollabStateReader, S: WorkerSpawner>(
                         ("$BRANCH", &ctx.branch),
                         ("$MODE", "compose"),
                         ("$TOPIC", topic),
+                        ("$SENDER", &state.current_owner),
                     ],
                 )
                 .map_err(DriveError::Invalid)?;
@@ -823,6 +905,15 @@ fn drive_collab_loop<R: CollabStateReader, S: WorkerSpawner>(
                 }
                 let artifact_ref = resolve_compose_ref(reader, &cr.stdout, before_rowid, topic)
                     .map_err(DriveError::Invalid)?;
+                // Re-poll immediately before the submit render. `state` was read
+                // before the compose turn, and ownership can flip during it (a
+                // recovery handoff reassigns `current_owner`). `.claude-plugin/
+                // commands/collab.md` requires the orchestrator to refresh
+                // `collab_status` immediately before dispatching the submit
+                // worker for exactly this reason: a stale `$SENDER` trips the
+                // worker's own ABORT guard, so nothing is sent and the run
+                // stalls out later as a STUCK_LIMIT instead of failing here.
+                let submit_state = reader.read(&session_id).map_err(DriveError::Invalid)?;
                 let submit = render_worker_prompt(
                     &ctx.prompts_dir,
                     "collab-turn-submit.md",
@@ -832,6 +923,15 @@ fn drive_collab_loop<R: CollabStateReader, S: WorkerSpawner>(
                         ("$MODE", "submit"),
                         ("$TOPIC", topic),
                         ("$ARTIFACT_REF", &artifact_ref),
+                        // `collab-turn-submit.md` is pilot-generic: it sends as
+                        // `$SENDER` and ABORTS unless `$SENDER` equals
+                        // `collab_status.current_owner`. Same contract the
+                        // interactive orchestrator uses
+                        // (`$SENDER=<collab_status.current_owner>` in
+                        // `.claude-plugin/commands/collab.md`), so the value must
+                        // come from the freshest poll, not a hardcoded "claude"
+                        // and not the pre-compose snapshot.
+                        ("$SENDER", &submit_state.current_owner),
                     ],
                 )
                 .map_err(DriveError::Invalid)?;
@@ -849,12 +949,30 @@ fn drive_collab_loop<R: CollabStateReader, S: WorkerSpawner>(
                 if let Some(e) = worker_result_error(WorkerFailureSite::ClaudeTurn, &sr) {
                     return Err(e);
                 }
+                // The submit worker reports a `$SENDER` mismatch (or an
+                // unfetchable artifact) by returning a blocker and sending
+                // nothing. Without this check the driver would count the
+                // aborted submit as success and only fail much later as a
+                // STUCK_LIMIT stall, whose "submit never landed" message hides
+                // the real cause. Same treatment `TaskListBridge` already gives
+                // its own worker.
+                if let Some(blocker) = parse_blocker_line(&sr.stdout) {
+                    return Err(DriveError::Invalid(anyhow!(
+                        "submit worker for topic {} returned blocker: {} — INVALID run",
+                        topic,
+                        blocker
+                    )));
+                }
             }
             WorkerAction::TaskListBridge => {
                 let prompt = render_worker_prompt(
                     &ctx.prompts_dir,
                     "collab-turn-task-list.md",
-                    &[("$SESSION_ID", &session_id), ("$BRANCH", &ctx.branch)],
+                    &[
+                        ("$SESSION_ID", &session_id),
+                        ("$BRANCH", &ctx.branch),
+                        ("$SENDER", &state.current_owner),
+                    ],
                 )
                 .map_err(DriveError::Invalid)?;
                 // Mechanical bridge (parse approved plan markdown → send task_list).
@@ -888,9 +1006,18 @@ fn drive_collab_loop<R: CollabStateReader, S: WorkerSpawner>(
                 // giving `WorkerResult` a `commits_added` the live spawner fills
                 // from the same `git_head`/`count_commits_between` pair
                 // `spawn_codex` already uses.
-                let prompt = RECOVERY_FIX_GLOBAL_PROMPT
-                    .replace("$SESSION_ID", &session_id)
-                    .replace("$BRANCH", &ctx.branch);
+                // Stays hardcoded `sender="claude"`: unlike the matrix templates
+                // this prompt is claude-pinned end to end — it is dispatched only
+                // for `("claude", "CodeReviewFixGlobalPending")` and its own step 1
+                // makes the worker abort unless `recovery_owner` is "claude". A
+                // `$SENDER` here would imply a genericity the prompt body does not
+                // have.
+                let prompt = render_prompt_body(
+                    "RECOVERY_FIX_GLOBAL_PROMPT",
+                    RECOVERY_FIX_GLOBAL_PROMPT,
+                    &[("$SESSION_ID", &session_id), ("$BRANCH", &ctx.branch)],
+                )
+                .map_err(DriveError::Invalid)?;
                 let r = spawner
                     .spawn_claude(&prompt, wt, ModelTier::Opus)
                     .map_err(|e| {
@@ -923,6 +1050,7 @@ fn drive_collab_loop<R: CollabStateReader, S: WorkerSpawner>(
                         ("$SESSION_ID", &session_id),
                         ("$BRANCH", &ctx.branch),
                         ("$MODE", "compose"),
+                        ("$SENDER", &state.current_owner),
                     ],
                 )
                 .map_err(DriveError::Invalid)?;
@@ -940,9 +1068,16 @@ fn drive_collab_loop<R: CollabStateReader, S: WorkerSpawner>(
                 if let Some(e) = worker_result_error(WorkerFailureSite::ClaudeTurn, &cr) {
                     return Err(e);
                 }
-                let submit = SYNTHETIC_FINAL_SUBMIT
-                    .replace("$SESSION_ID", &session_id)
-                    .replace("$PR_URL", synthetic_pr);
+                let submit = render_prompt_body(
+                    "SYNTHETIC_FINAL_SUBMIT",
+                    SYNTHETIC_FINAL_SUBMIT,
+                    &[
+                        ("$SESSION_ID", &session_id),
+                        ("$PR_URL", synthetic_pr),
+                        ("$SENDER", &state.current_owner),
+                    ],
+                )
+                .map_err(DriveError::Invalid)?;
                 let sr = spawner
                     .spawn_claude(&submit, wt, ModelTier::Sonnet)
                     .map_err(|e| {
