@@ -416,3 +416,151 @@ fn template_render_substitutes_vars_without_prefix_clobber() {
         "session=s1 ref=drawer-1 hash=deadbeef branch=abeval/task1 mode=compose topic=canonical"
     );
 }
+
+#[test]
+fn template_render_rejects_leftover_placeholder() {
+    let dir = tempfile::tempdir().unwrap();
+    fs::write(
+        dir.path().join("t.md"),
+        "collab_send(sender=\"$SENDER\") for session_id=$SESSION_ID",
+    )
+    .unwrap();
+    // The exact shape of the bug this guards: the template gained `$SENDER`,
+    // the call site was never updated. Must be a hard error, not a prompt with
+    // a literal `$SENDER` shipped to a live `claude -p` worker.
+    let err = render_worker_prompt(dir.path(), "t.md", &[("$SESSION_ID", "s1")])
+        .expect_err("leftover $SENDER must fail the render");
+    let msg = err.to_string();
+    assert!(msg.contains("t.md"), "error must name the template: {msg}");
+    assert!(
+        msg.contains("$SENDER"),
+        "error must name the leftover: {msg}"
+    );
+
+    // Supplying it renders clean.
+    let ok = render_worker_prompt(
+        dir.path(),
+        "t.md",
+        &[("$SESSION_ID", "s1"), ("$SENDER", "codex")],
+    )
+    .unwrap();
+    assert_eq!(ok, "collab_send(sender=\"codex\") for session_id=s1");
+}
+
+#[test]
+fn template_render_allows_non_placeholder_dollar_text() {
+    let dir = tempfile::tempdir().unwrap();
+    // `$NAME=` is the orchestrator's contract notation naming ANOTHER template's
+    // input (`collab-turn-final-review.md` documents `$TOPIC=final_review` and
+    // `$ARTIFACT_REF=<drawer_id>`); `${...}`, `$1` and a bare `$` are ordinary
+    // shell/regex text. None of these are unsubstituted placeholders.
+    let body = "call submit with `$TOPIC=final` and `$ARTIFACT_REF=<drawer_id>`; \
+                run `echo ${session_id}` and `$1`; costs $5; anchor /x$/ for $SESSION_ID";
+    fs::write(dir.path().join("t.md"), body).unwrap();
+    let out = render_worker_prompt(dir.path(), "t.md", &[("$SESSION_ID", "s1")]).unwrap();
+    assert!(out.ends_with("for s1"));
+}
+
+/// Point at the real repo templates so the render sees what a live run sees.
+fn repo_prompts_dir() -> std::path::PathBuf {
+    std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .join(".claude-plugin/prompts")
+}
+
+#[test]
+fn real_submit_template_renders_with_a_concrete_sender() {
+    // Mirrors the driver's `ClaudeCompose` submit call site exactly. Renders the
+    // REAL `.claude-plugin/prompts/collab-turn-submit.md`, which the live driver
+    // feeds to a `claude -p` subprocess: a surviving `$SENDER` trips the
+    // template's own "if `$SENDER` … does not equal `current_owner`, ABORT"
+    // guard, and the aborted submit still reports success — the run then wedges
+    // on STUCK_LIMIT instead of failing loudly.
+    for owner in ["claude", "codex"] {
+        let out = render_worker_prompt(
+            &repo_prompts_dir(),
+            "collab-turn-submit.md",
+            &[
+                ("$SESSION_ID", "sess-xyz"),
+                ("$BRANCH", "abeval/task1"),
+                ("$MODE", "submit"),
+                ("$TOPIC", "final"),
+                ("$ARTIFACT_REF", "drawer-1"),
+                ("$SENDER", owner),
+            ],
+        )
+        .unwrap();
+        assert!(
+            !out.contains("$SENDER"),
+            "rendered submit prompt still contains a literal $SENDER"
+        );
+        assert!(
+            out.contains(&format!("sender=\"{owner}\"")),
+            "rendered submit prompt must send as the session's current owner"
+        );
+    }
+}
+
+#[test]
+fn every_driver_rendered_template_has_no_leftover_placeholders() {
+    // The driver's full render surface, each with the substitution list its call
+    // site supplies. Any template that gains a placeholder the driver does not
+    // pass fails here instead of in a live run.
+    let dir = repo_prompts_dir();
+    let send = |t: &str| {
+        render_worker_prompt(
+            &dir,
+            t,
+            &[
+                ("$SESSION_ID", "sess-xyz"),
+                ("$BRANCH", "abeval/task1"),
+                ("$MODE", "send"),
+                ("$SENDER", "claude"),
+            ],
+        )
+    };
+    for t in [
+        "collab-turn-plan-draft.md",
+        "collab-turn-plan-synthesis.md",
+        "collab-turn-code-implement.md",
+        "collab-turn-review-local.md",
+    ] {
+        send(t).unwrap_or_else(|e| panic!("{t}: {e}"));
+    }
+    render_worker_prompt(
+        &dir,
+        "collab-turn-plan-finalize.md",
+        &[
+            ("$SESSION_ID", "sess-xyz"),
+            ("$BRANCH", "abeval/task1"),
+            ("$MODE", "compose"),
+            ("$TOPIC", "final"),
+            ("$SENDER", "claude"),
+        ],
+    )
+    .unwrap();
+    render_worker_prompt(
+        &dir,
+        "collab-turn-task-list.md",
+        &[
+            ("$SESSION_ID", "sess-xyz"),
+            ("$BRANCH", "abeval/task1"),
+            ("$SENDER", "claude"),
+        ],
+    )
+    .unwrap();
+    render_worker_prompt(
+        &dir,
+        "collab-turn-final-review.md",
+        &[
+            ("$SESSION_ID", "sess-xyz"),
+            ("$BRANCH", "abeval/task1"),
+            ("$MODE", "compose"),
+            ("$SENDER", "claude"),
+        ],
+    )
+    .unwrap();
+}

@@ -37,11 +37,19 @@ handoff race, refresh `collab_status`, and select the prompt from session state:
 | Phase | Prompt |
 |---|---|
 | `PlanParallelDrafts` | `collab-plan-draft.md` |
+| `PlanSynthesisPending` with normal Codex-pilot ownership | `collab-plan-synthesis.md` |
 | `PlanCodexReviewPending` | `collab-plan-review.md` |
+| `PlanClaudeFinalizePending` with normal Codex-pilot ownership | `collab-plan-finalize.md` |
 | `CodeImplementPending` with `implementer == "codex"` | `collab-batch-impl.md` |
 | `CodeReviewFixGlobalPending` | `collab-global-review.md` |
+| `CodeReviewLocalPending` with normal Codex-pilot ownership | `collab-review-local.md` |
+| `CodeReviewFinalPending` with normal Codex-pilot ownership | `collab-final-review.md` |
 | `CodeReviewLocalPending` or `CodeReviewFinalPending` with Codex recovery ownership | `collab-recovery.md` |
 
+For the two recovery phases, select `collab-recovery.md` only when
+`pending_failure` is non-null and Codex is the recorded recovery owner; otherwise
+use the normal-pilot row above. “Normal Codex-pilot ownership” means
+`pilot == "codex"`, `current_owner == "codex"`, and no `pending_failure`.
 For a normal Claude-owned or terminal phase, report the concise status and exit.
 Locate the selected prompt at the first existing root:
 

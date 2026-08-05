@@ -471,6 +471,16 @@ fn full_happy_path_sums_usage_and_counts_rework() {
             st("PlanSynthesisPending", "claude", 0),
             st("PlanCodexReviewPending", "codex", 0),
             st("PlanClaudeFinalizePending", "claude", 0),
+            // `ScriptedReader` advances one state per *poll*, and the
+            // ClaudeCompose turn polls twice: once at the top of the loop, then
+            // again immediately before rendering the submit prompt (the driver
+            // must resolve `$SENDER` from a fresh `current_owner`, since
+            // ownership can flip during the long compose turn). The phase does
+            // not advance between those two polls — it advances only once the
+            // submit lands — so the second poll legitimately returns
+            // `PlanClaudeFinalizePending` again. Without this entry the extra
+            // poll swallows `PlanLocked` and the TaskListBridge turn is skipped.
+            st("PlanClaudeFinalizePending", "claude", 0),
             st("PlanLocked", "claude", 0),
             st("CodeImplementPending", "claude", 0),
             st("CodeReviewFixGlobalPending", "codex", 1),
@@ -509,6 +519,17 @@ fn full_happy_path_sums_usage_and_counts_rework() {
     assert!(prompts_seen
         .iter()
         .any(|p| p.contains("https://abeval.invalid/task1")));
+    // No worker prompt on the standard path ships an unsubstituted placeholder.
+    // `$SENDER` in particular: `collab-turn-submit.md` ABORTS on a literal one,
+    // and the aborted submit still returns "success", so the run would wedge on
+    // STUCK_LIMIT rather than fail loudly.
+    for p in prompts_seen.iter() {
+        assert!(!p.contains("$SENDER"), "prompt kept a literal $SENDER: {p}");
+    }
+    // The `final` submit went out as the session's current owner.
+    assert!(prompts_seen
+        .iter()
+        .any(|p| p.contains("sender=\"claude\", topic=\"final\"")));
 }
 
 #[test]

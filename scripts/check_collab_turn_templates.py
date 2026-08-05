@@ -118,7 +118,7 @@ REVIEW_DIFF_TRIGGER_DETECTION_SNIPPETS = [
 ]
 
 ALLOWED_PLACEHOLDERS = {"SESSION_ID", "REPO_PATH", "BRANCH", "TOPIC",
-                        "ARTIFACT_REF", "ARTIFACT_HASH", "MODE"}
+                        "ARTIFACT_REF", "ARTIFACT_HASH", "MODE", "SENDER"}
 REQUIRED_FM = {"turn", "tier", "model", "topics", "preconditions"}
 VALID_TIERS = {"planning", "review", "mechanical"}
 VALID_MODELS = {"opus", "sonnet", "haiku", "default"}
@@ -222,6 +222,20 @@ REQUIRED_TEMPLATE_SNIPPETS = {
         "more than 10 tasks",
         "PlanLocked is pre-coding",
         "plan_file_path",
+        # The `PlanLocked` bridge is sender-parameterized for exactly the same
+        # reason the submit template is: `PublishFinal` does not reassign
+        # ownership (`state_machine/mod.rs`), so under `pilot=codex` this turn
+        # is entered with `current_owner == codex` and `SubmitTaskList`
+        # requires `pilot(session)`. A hardcoded `sender="claude"` here is
+        # rejected by the server, and because `PlanLocked` is not
+        # `Phase::is_coding_active()` there is no `failure_report` escape —
+        # the session simply dead-ends. Pin the send site, the authorization
+        # guard, its ABORT enforcement, and the pilot-generic invariant.
+        'collab_send(sender="$SENDER", topic="task_list",',
+        'Verify `$SENDER` against `collab_status.current_owner`',
+        'MUST NOT be\n   substituted with your own identity',
+        'equal `current_owner`, ABORT — do not send anything — and report the',
+        'always the pilot, which under `pilot == "codex"` is `codex`',
     ],
     "collab-turn-plan-finalize.md": [
         "Timebox: <=20 minutes",
@@ -241,6 +255,34 @@ REQUIRED_TEMPLATE_SNIPPETS = {
     "collab-turn-submit.md": [
         'parse the artifact JSON as',
         'gh pr create --base <base_branch>',
+        # Pin all FOUR collab_send call sites to the post-gate `$SENDER`
+        # (never a hardcoded "claude") — every snippet below STARTS at its
+        # site's `collab_send(sender="$SENDER",` so the sender is part of the
+        # pin, then extends into that site's distinct payload so it binds to
+        # one site only. Snippets that started at `topic="failure_report",`
+        # asserted nothing at all about the sender: dropping `sender=` from
+        # the `pr_create_failed` send left it senderless (and so also clear of
+        # the FORBIDDEN `sender="claude"` pin) with this lint still green.
+        'collab_send(sender="$SENDER", topic="final_review",',
+        'collab_send(sender="$SENDER", topic="final",',
+        'collab_send(sender="$SENDER",\n  topic="failure_report",\n'
+        '  content=<JSON {"coding_failure":"pr_create_failed:',
+        'collab_send(sender="$SENDER",\n  topic="failure_report", content=<JSON'
+        ' {"coding_failure":\n  "approved_artifact_unfetchable:',
+        # The $SENDER authorization guard itself: without this pin, deleting
+        # the whole verification/abort/recovery-invariant block (state
+        # discovery step 2) leaves every collab_send pin above still green,
+        # since the sends themselves are untouched by removing the guard
+        # that gates them.
+        'Verify `$SENDER` against `collab_status.current_owner`',
+        'MUST NOT be\n   substituted with your own identity',
+        'may\n     legitimately be the recovery owner rather than the pilot',
+        # ...and the guard's ENFORCEMENT clause, which the rationale pins
+        # above do not imply. Rewriting the abort to "fall back to
+        # `current_owner` and continue with the send" left all three of them
+        # matching and the whole lint green, silently converting the hard
+        # abort into the identity fallback this branch exists to remove.
+        'equal `current_owner`, ABORT — do not send anything — and report the',
     ],
     "collab-turn-plan-review.md": [
         "PlanCodexReviewPending",
@@ -280,7 +322,25 @@ FORBIDDEN_TEMPLATE_SNIPPETS = {
         "read `canonical_plan`",
         "read Codex's review notes",
     ],
+    "collab-turn-submit.md": [
+        # A hardcoded sender identity bypasses the post-gate $SENDER
+        # authorization check and lets any owner submit under a stale
+        # "claude" identity — see collab-turn-submit.md's own "$SENDER is
+        # authoritative" invariant.
+        'sender="claude"',
+    ],
+    "collab-turn-task-list.md": [
+        'sender="claude"',
+    ],
 }
+# The literal pins above name the exact regression that shipped, and their
+# diagnostics quote it verbatim. They are still only literals: `sender='claude'`,
+# `sender=claude` and `sender="Claude"` are the same bug and all passed. This
+# regex generalizes them over quoting and capitalization for the two templates
+# whose sends must go out as `sender="$SENDER"`.
+HARDCODED_SENDER_RE = re.compile(r'sender\s*=\s*["\']?\s*claude\b', re.IGNORECASE)
+SENDER_PARAMETERIZED_TEMPLATES = ("collab-turn-submit.md",
+                                  "collab-turn-task-list.md")
 CHECKPOINT_PROTOCOL_SURFACES = {
     DOC: "docs/COLLAB.md",
     COMMAND: ".claude-plugin/commands/collab.md",
@@ -473,6 +533,63 @@ def check_review_diff_trigger_detection_contract() -> None:
         err(f"{path.relative_to(ROOT)}: missing review-diff trigger-detection contract")
 
 
+# Contract lists for the pilot-routing checks below. They are module-level
+# constants (rather than tuples inline in the functions) so the lint's own
+# test suite can enumerate them entry by entry: every one of these is contract
+# DATA, and a pin nobody exercises is a pin that can be deleted silently.
+CODEX_PILOT_ROUTING_SNIPPETS = [
+    "`PlanSynthesisPending` with normal Codex-pilot ownership",
+    "`PlanClaudeFinalizePending` with normal Codex-pilot ownership",
+    "`CodeReviewLocalPending` with normal Codex-pilot ownership",
+    "`CodeReviewFinalPending` with normal Codex-pilot ownership",
+]
+COMPOSE_HANDOFF_SNIPPETS = [
+    "this is a **normal compose\n      handoff**, not a dispatch failure",
+    # Each bullet's `$SENDER` clause, bound to that bullet's own `$TOPIC` so
+    # the pin cannot be satisfied by the identical literal in the dispatch
+    # table rows.
+    "`$TOPIC=final`,\n        `$ARTIFACT_REF=<drawer_id>`, and\n"
+    "        `$SENDER=<collab_status.current_owner>`.",
+    "`$TOPIC=final_review`, `$ARTIFACT_REF=<drawer_id>`, and\n"
+    "        `$SENDER=<collab_status.current_owner>`.",
+    "Do\n      not re-dispatch the compose prompt, and do not emit\n      `codex_dispatch_failed:`",
+]
+TASK_LIST_BRIDGE_SNIPPETS = [
+    "`collab-turn-task-list.md` once (mechanical/sonnet) with\n"
+    "`$SENDER=<collab_status.current_owner>`.",
+    "dispatch `collab-turn-task-list.md`\n   (mechanical/sonnet) with "
+    "`$SENDER=<collab_status.current_owner>`.",
+    "it\n   must never be hardcoded to `\"claude\"`",
+]
+# The wait loop's `codex_dispatch_failed:` remedy is admissible in far fewer
+# phases than "coding-active". Two independent server gates apply, and passing
+# the first is not sufficient: planning phases fail `Phase::is_coding_active()`,
+# while `CodeReviewLocalPending`/`CodeReviewFinalPending` pass that check but
+# are still refused by `dispatch_failure_phase_admits`, which admits only
+# `CodeImplementPending` (implementer=codex) and `CodeReviewFixGlobalPending`.
+# An earlier revision of this contract lumped the two `CodeReview*` phases into
+# the "send it" bucket on the strength of `is_coding_active()` alone; under
+# `pilot == "codex"`, which routes Codex into both, that sent the dispatcher
+# into a rejected send with no reachable exit.
+DISPATCH_FAILURE_ADMISSIBILITY_SNIPPETS = [
+    "**Dispatch-failure-admitting phases only** — `CodeImplementPending`\n"
+    "        (when `implementer == \"codex\"`) and "
+    "`CodeReviewFixGlobalPending`:",
+    "**Every other phase** — the planning phases (`PlanParallelDrafts`,",
+    "additionally requires `dispatch_failure_phase_admits`\n"
+    "        (`crates/ironmem/src/collab/mod.rs`), which returns `false` "
+    "for both —",
+    "**Every other phase:** as in condition 5 — the planning phases are",
+]
+DOC_PR_BASE_SNIPPETS = [
+    "does **not** require that branch to contain `base_sha`",
+    "pre-range commits in the PR body",
+]
+DOC_PILOT_SUBMIT_SNIPPETS = [
+    "$SENDER` where that template uses",
+]
+
+
 def check_pr_base_resolution_contract() -> None:
     """The PR base is the integration branch, never gated on `base_sha`.
 
@@ -507,6 +624,228 @@ def check_pr_base_resolution_contract() -> None:
     if re.search(r"when they contain that commit", text):
         err(f"{path.relative_to(ROOT)}: base-branch resolution must not be "
             f"gated on base_sha containment")
+    # The docs mirror of the same contract. These two used to be checked
+    # inside `check_codex_pilot_compose_handoff_contract` under a
+    # "pilot-submit routing" label, which sent anyone grepping the diagnostic
+    # to the wrong function; they are PR-base resolution snippets and belong
+    # here, under this function's name.
+    doc_text = DOC.read_text()
+    for snippet in DOC_PR_BASE_SNIPPETS:
+        if snippet not in doc_text:
+            err(f"docs/COLLAB.md: missing PR-base resolution contract "
+                f"{snippet!r}")
+
+
+# The two collab.md dispatch rows that hand off to collab-turn-submit.md
+# with a `$SENDER` substitution.
+#
+# `prefix` does NOT uniquely identify the row: collab.md has TWO lines
+# starting with each of these prefixes — the phase-action table row, and the
+# Codex dispatch tuning matrix row for the same phase. A `next(...)` lookup
+# silently audited the first and left the second entirely unchecked. What is
+# guaranteed instead, and asserted below, is: exactly `row_count` lines start
+# with `prefix`, and exactly ONE of them also names `marker` (the submit
+# worker) — that one is the dispatch row this contract is about. Both numbers
+# are pinned so that adding, removing or restructuring a row fails loudly here
+# rather than quietly re-pointing the audit at a different line.
+#
+# `recovery_snippets` are phase-SPECIFIC on purpose. A bare
+# `recovery[-\s]owner` search cannot tell "names the recovery case" from
+# "mentions the phrase while saying it does not apply": the
+# PlanClaudeFinalizePending row legitimately says the substitution does NOT
+# apply (PlanLocked-side phases are not `is_coding_active()`), and rewriting
+# the CodeReviewFinalPending row to that same negation used to pass — while
+# `is_coding_active()` makes the recovery case genuinely live for that phase.
+# So each phase pins the exact form its own prose must take, and
+# CodeReviewFinalPending additionally forbids the negation. Literal snippets
+# also make the check occurrence-count-independent: a second "recovery owner"
+# mention elsewhere in the row can neither satisfy nor defeat it.
+SENDER_DISPATCH_ROWS = {
+    "PlanClaudeFinalizePending": {
+        "prefix": "| `PlanClaudeFinalizePending` |",
+        "row_count": 2,
+        "marker": "collab-turn-submit.md",
+        "recovery_snippets": [
+            "recovery-owner substitution",
+            "does **not** apply to this phase",
+        ],
+        "forbidden_snippets": [],
+    },
+    "CodeReviewFinalPending": {
+        "prefix": "| `CodeReviewFinalPending` |",
+        "row_count": 2,
+        "marker": "collab-turn-submit.md",
+        "recovery_snippets": [
+            "may instead be the recovery owner per the recovery override",
+            "is a coding-active phase, so this substitution is live here",
+        ],
+        "forbidden_snippets": [
+            "does **not** apply to this phase",
+        ],
+    },
+}
+# A pilot-only derivation of $SENDER — the exact regression this guards
+# against: rewriting `$SENDER=<collab_status.current_owner>` back to a
+# form that assigns $SENDER directly from `pilot`, bypassing the
+# recovery-owner substitution. Deliberately anchored on `$SENDER\s*=` so
+# it does NOT flag the row's own (required) prose stating the normal
+# invariant `current_owner == pilot`, which never puts `pilot` on the
+# right-hand side of a `$SENDER` assignment.
+PILOT_ONLY_SENDER_RE = re.compile(r"\$SENDER\s*=\s*<?\s*(?:collab_status\.)?pilot\b")
+
+
+def check_sender_dispatch_contract() -> None:
+    """Both submit-dispatch rows must derive `$SENDER` from `current_owner`.
+
+    Regression guard for the status-to-template routing decision itself
+    (as opposed to the submit template's own contract, pinned separately):
+    the orchestrator rows in collab.md for `PlanClaudeFinalizePending` and
+    `CodeReviewFinalPending` must (1) name `collab_status.current_owner` as
+    the `$SENDER` substitution source, (2) state the recovery-owner case in
+    the exact form that phase requires — live for `CodeReviewFinalPending`,
+    explicitly inapplicable for `PlanClaudeFinalizePending` — and (3) never
+    state a pilot-only derivation of `$SENDER`. If either row regresses
+    back to deriving `$SENDER` straight from `pilot`, the recovery-owner
+    substitution silently stops applying and pilot-capable submits break
+    again under recovery.
+
+    The pilot-only derivation is additionally rejected file-wide: the two
+    audited rows are not the only places collab.md substitutes `$SENDER`
+    (the compose-handoff bullets and the PlanLocked bridge do too), and a
+    pilot-only derivation is wrong in every one of them.
+    """
+    text = COMMAND.read_text()
+    lines = text.splitlines()
+    for phase, spec in SENDER_DISPATCH_ROWS.items():
+        prefix = spec["prefix"]
+        matching = [l for l in lines if l.startswith(prefix)]
+        if len(matching) != spec["row_count"]:
+            err(f"collab.md: expected exactly {spec['row_count']} lines "
+                f"starting with {prefix!r}, found {len(matching)} — the "
+                f"{phase} dispatch-row audit selects one of them by its "
+                f"{spec['marker']!r} cell, so an added, removed or "
+                f"restructured row means the audit is reading a different "
+                f"table than the one it was written for")
+        rows = [l for l in matching if spec["marker"] in l]
+        if len(rows) != 1:
+            err(f"collab.md: expected exactly one {phase} row naming "
+                f"{spec['marker']!r} (the submit-dispatch row), found "
+                f"{len(rows)}")
+            continue
+        row = rows[0]
+        if "$SENDER=<collab_status.current_owner>" not in row:
+            err(f"collab.md: {phase} row must derive $SENDER from "
+                f"`$SENDER=<collab_status.current_owner>` (current_owner "
+                f"read from collab_status)")
+        for snippet in spec["recovery_snippets"]:
+            if snippet not in row:
+                err(f"collab.md: {phase} row must name the recovery-owner "
+                    f"case in the form this phase requires — missing "
+                    f"{snippet!r}")
+        for snippet in spec["forbidden_snippets"]:
+            if snippet in row:
+                err(f"collab.md: {phase} row must not disclaim the "
+                    f"recovery-owner substitution ({snippet!r}) — this phase "
+                    f"is coding-active, so the substitution is live and "
+                    f"$SENDER may legitimately be the recovery owner")
+        if PILOT_ONLY_SENDER_RE.search(row):
+            err(f"collab.md: {phase} row must not derive $SENDER directly "
+                f"from pilot — $SENDER must come from current_owner")
+    for line_no, line in enumerate(lines, 1):
+        if PILOT_ONLY_SENDER_RE.search(line):
+            err(f"collab.md:{line_no}: $SENDER must never be derived directly "
+                f"from `pilot` — every substitution site reads "
+                f"`collab_status.current_owner`, so that the recovery owner "
+                f"is honoured wherever the substitution is live")
+
+
+def check_codex_pilot_routing_contract() -> None:
+    """Codex must select a prompt for all four Codex-pilot-owned phases.
+
+    Two of these are compose turns that stage a drawer and send nothing
+    (`PlanClaudeFinalizePending`, `CodeReviewFinalPending`); the other two
+    are SENDING turns that advance the phase themselves
+    (`PlanSynthesisPending`, `CodeReviewLocalPending`). What they share is
+    that under `pilot == "codex"` Codex owns them, so a missing selector row
+    leaves the turn undispatchable.
+    """
+    if not CODEX_COMMAND.exists():
+        err(".codex-plugin/commands/collab.md: missing Codex-pilot routing contract")
+        return
+    codex_text = CODEX_COMMAND.read_text()
+    for snippet in CODEX_PILOT_ROUTING_SNIPPETS:
+        if snippet not in codex_text:
+            err(".codex-plugin/commands/collab.md: missing Codex-pilot "
+                f"routing contract {snippet!r}")
+
+
+def check_codex_pilot_compose_handoff_contract() -> None:
+    """Keep normal Codex-pilot compose turns connected to Claude submission.
+
+    The two compose prompts intentionally stage an immutable drawer and exit
+    without a collab send, so their phase does not advance. If Claude's
+    no-phase-advance handoff drops this special path, the dispatcher reports
+    a false `codex_dispatch_failed:` and the sender-parameterization fix is
+    unreachable under `pilot=codex`.
+
+    Each of the two handoff bullets pins its `$SENDER` substitution as part
+    of a snippet spanning that bullet's own `$TOPIC`. The bare literal
+    `` `$SENDER=<collab_status.current_owner>` `` occurs six times in
+    collab.md, so pinning it alone proved nothing about these bullets:
+    rewriting either of them to `$SENDER=<pilot>`, to `$SENDER=claude`, or
+    deleting the clause outright all left this check green on the strength of
+    the dispatch-table rows.
+    """
+    command_text = COMMAND.read_text()
+    for snippet in COMPOSE_HANDOFF_SNIPPETS:
+        if snippet not in command_text:
+            err(".claude-plugin/commands/collab.md: missing Codex-pilot "
+                f"compose handoff contract {snippet!r}")
+
+
+def check_task_list_bridge_sender_contract() -> None:
+    """The PlanLocked bridge must pass `$SENDER` from `current_owner`.
+
+    `PublishFinal` does not reassign ownership, so under `pilot == "codex"`
+    `PlanLocked` is entered with `current_owner == codex` while
+    `SubmitTaskList` requires `pilot(session)`. The bridge dispatches the
+    Claude-side `collab-turn-task-list.md` worker, which must therefore send
+    as the pilot, not as itself. The bridge is a prose paragraph plus a
+    numbered list item — not a table row — so the dispatch-row helper above
+    does not reach it.
+    """
+    command_text = COMMAND.read_text()
+    for snippet in TASK_LIST_BRIDGE_SNIPPETS:
+        if snippet not in command_text:
+            err(".claude-plugin/commands/collab.md: missing PlanLocked "
+                f"task-list bridge sender contract {snippet!r}")
+
+
+def check_planning_dispatch_failure_contract() -> None:
+    """A Codex dispatch failure in a planning phase must not send a report.
+
+    `mod.rs` gates the whole `FailureReport` arm on
+    `Phase::is_coding_active()`, and `phase.rs` limits that to the four
+    `Code*` phases. Routing Codex into `PlanSynthesisPending` /
+    `PlanClaudeFinalizePending` made the wait loop's `codex_dispatch_failed:`
+    remedy reachable in phases where the server rejects it as `WrongPhase` —
+    and the stated exits via conditions 2 and 3 are unreachable there, so the
+    dispatcher would loop on a rejected send instead of surfacing the stall.
+    """
+    command_text = COMMAND.read_text()
+    for snippet in DISPATCH_FAILURE_ADMISSIBILITY_SNIPPETS:
+        if snippet not in command_text:
+            err(".claude-plugin/commands/collab.md: missing dispatch-failure "
+                f"admissibility contract {snippet!r}")
+
+
+def check_pilot_submit_doc_contract() -> None:
+    """docs/COLLAB.md must document `$SENDER` as a worker placeholder."""
+    doc_text = DOC.read_text()
+    for snippet in DOC_PILOT_SUBMIT_SNIPPETS:
+        if snippet not in doc_text:
+            err("docs/COLLAB.md: missing pilot-submit routing contract "
+                f"{snippet!r}")
 
 
 def check_topic_template_completeness() -> None:
@@ -808,6 +1147,12 @@ def lint_template(path: pathlib.Path) -> dict | None:
     for stale_claim in FORBIDDEN_TEMPLATE_SNIPPETS.get(name, []):
         if stale_claim in text:
             err(f"{name}: forbidden stale direct-body claim {stale_claim!r}")
+    if name in SENDER_PARAMETERIZED_TEMPLATES:
+        for m in HARDCODED_SENDER_RE.finditer(text):
+            err(f"{name}: hardcoded sender identity {m.group(0)!r} — every "
+                f"send in this template must go out as `sender=\"$SENDER\"`, "
+                f"verified against `collab_status.current_owner`; a literal "
+                f"claude identity breaks pilot=codex sessions")
     return {"name": name, "turn": fm.get("turn"), "tier": fm.get("tier"),
             "model": fm.get("model"), "topics": topics}
 
@@ -971,6 +1316,12 @@ def main() -> int:
     check_installer_covers_templates()
     check_precondition_phase_names()
     check_pr_base_resolution_contract()
+    check_sender_dispatch_contract()
+    check_codex_pilot_routing_contract()
+    check_codex_pilot_compose_handoff_contract()
+    check_task_list_bridge_sender_contract()
+    check_planning_dispatch_failure_contract()
+    check_pilot_submit_doc_contract()
     check_review_diff_trigger_detection_contract()
 
     if errors:

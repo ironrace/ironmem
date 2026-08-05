@@ -9,9 +9,9 @@ preconditions: a prior compose worker wrote $ARTIFACT_REF; for final the user ap
 # Collab worker — submit-by-ref (post-gate sender)
 
 > ANTI-PUPPETEERING: You received only this template, `$SESSION_ID`, `$TOPIC`,
-> and `$ARTIFACT_REF`. Read the approved artifact by ref and send it. Do NOT
-> re-author or editorialize. Your final message MUST be the ≤3-line verdict
-> only.
+> `$ARTIFACT_REF`, and `$SENDER`. Read the approved artifact by ref and send
+> it. Do NOT re-author or editorialize. Your final message MUST be the
+> ≤3-line verdict only.
 
 ## Recoverable vs terminal failures
 
@@ -33,7 +33,20 @@ Actions below — sending `$TOPIC` (e.g. `final_review`) via the normal
 ## State discovery
 1. `collab_status(session_id=$SESSION_ID)` to confirm phase/owner and read
    `repo_path`, `branch`, `base_sha`, and `pending_failure`.
-2. Fetch the artifact named by `$ARTIFACT_REF`:
+2. Verify `$SENDER` against `collab_status.current_owner` from step 1.
+   `$SENDER` is authoritative for the send below and MUST NOT be
+   substituted with your own identity. If `$SENDER` is absent, or does not
+   equal `current_owner`, ABORT — do not send anything — and report the
+   mismatch on the verdict's blocker line. Two invariants apply:
+   - **Normal case:** `current_owner == pilot`.
+   - **Recovery case:** when `pending_failure` is non-null (see
+     "Recoverable vs terminal failures" above), `current_owner` may
+     legitimately be the recovery owner rather than the pilot, and sending
+     under that identity via the normal Actions below is the documented
+     recovery-completion step — the same convention as
+     `.codex-plugin/prompts/collab-recovery.md:16,49,56-57` on the Codex
+     side.
+3. Fetch the artifact named by `$ARTIFACT_REF`:
    - **drawer id** → `mcp__ironmem__get_drawer(id=$ARTIFACT_REF)` (deterministic
      read-by-id; do NOT use `search`, which is semantic and will not reliably
      return a freshly-staged drawer). If the response is `found:false`, treat the
@@ -61,18 +74,20 @@ Actions below — sending `$TOPIC` (e.g. `final_review`) via the normal
   the human reviewer is told which commits no agent inspected. Then run
   `gh pr create --base <base_branch>
   --head $BRANCH --title <title> --body <body>`; capture `pr_url`;
-  `collab_send(sender="claude", topic="final_review",
+  `collab_send(sender="$SENDER", topic="final_review",
   content=<JSON {"head_sha":"<HEAD>","pr_url":"<url>"}>)`. On `gh` failure or
-  base-branch resolution failure, send `failure_report`
-  `content=<JSON {"coding_failure":"pr_create_failed: <error>"}>` (no silent
-  retry).
-- Otherwise (`final`): `collab_send(sender="claude", topic="final",
+  base-branch resolution failure, `collab_send(sender="$SENDER",
+  topic="failure_report",
+  content=<JSON {"coding_failure":"pr_create_failed: <error>"}>)` (no silent
+  retry) — same `$SENDER` as above; a senderless `failure_report` here would
+  strand exactly the `pilot=codex` failure this template exists to fix.
+- Otherwise (`final`): `collab_send(sender="$SENDER", topic="final",
   content=<artifact body, JSON string {"plan":"<approved markdown>"}>)`.
 
 ### Failure path (artifact unfetchable, e.g. drawer missing)
 Do NOT send the protocol topic. The valid recovery depends on the phase:
 - `$TOPIC == final_review` (phase CodeReviewFinalPending is coding-active): a
-  `failure_report` send IS valid — `collab_send(sender="claude",
+  `failure_report` send IS valid — `collab_send(sender="$SENDER",
   topic="failure_report", content=<JSON {"coding_failure":
   "approved_artifact_unfetchable:<$ARTIFACT_REF>"}>)` and stop.
 - `$TOPIC == final` (v1 planning phase): the state machine
@@ -87,3 +102,10 @@ result: $TOPIC sent
 ref: <pr_url | none>
 blocker: <one line | none>
 ```
+If you sent a `failure_report` instead of the protocol topic — the
+`pr_create_failed:` path or the `approved_artifact_unfetchable:` path above —
+report `result: failure_report sent (<prefix>)`. If a state-discovery check
+failed (the `$SENDER` mismatch/absence ABORT) or the artifact was unfetchable
+in a phase that rejects `failure_report`, and you therefore sent nothing at
+all, report `result: $TOPIC not sent` with `ref: none` — never report a send
+that did not happen.
