@@ -55,7 +55,14 @@ never sends a `failure_report`, so that dirty worktree is the only signal, and
 it is recovered the same way. As recovery owner, preserve
 and inspect the working-tree diff before any fetch, checkout, or reset; run this
 turn's gates yourself, commit and push the recovered work, then send the normal
-`review_local` exactly once rather than a new `failure_report`. **Skip only the
+`review_local` exactly once rather than a new `failure_report`. If you reached
+this path from the dirty-worktree check below rather than from a reported
+failure, a previous turn died without reporting it; after committing, record
+that once with `collab_send(sender="codex", topic="orphan_recovered",
+content=<JSON {"phase":"CodeReviewLocalPending","recovered_sha":"<HEAD>",
+"detail":"<what you found>"}>)` — it records and returns without advancing the
+phase, changing owner, or spending a recovery attempt, so it is sent in
+addition to the normal `review_local`. **Skip only the
 `git fetch`, the checkout, and the `git reset --hard` in the next paragraph** —
 they would reset over the work you are recovering. When you recovered work, the
 review range head is your post-recovery `HEAD`, not `last_head_sha`: substitute

@@ -887,6 +887,8 @@ v1 planning topics: `draft`, `canonical`, `review`, `final`.
 v3 coding topics: `task_list`, `implementation_done`, `review_local`,
 `review_fix_global`, `final_review`, `failure_report`.
 
+Non-advancing topic: `orphan_recovered` — recorded, never applied as an event.
+
 The phase→topic acceptance matrix is tabulated in
 [§ Phase → Topic Acceptance](#phase--topic-acceptance); consult that table
 before every `collab_send`.
@@ -1327,6 +1329,8 @@ orchestrator from steering the reviewer's conclusion.
 | `review_local` | `pilot` (or the counterpart agent as recovery owner under the delegated-completion override) | `{"head_sha"}` | In `CodeReviewLocalPending` only. The pilot ran full or reduced audit of Codex's `review_fix_global` commits + caught issues both agents missed, used parallel fix subagents for confirmed partitionable findings, merged/cherry-picked the resulting fixes, and pushed. |
 | `final_review` | `pilot` (or the recovery owner under the delegated-completion override) | `{"head_sha","pr_url"}` | In `CodeReviewFinalPending` only. In normal flow the Claude submit worker opens the PR under the turn owner's identity; a Codex recovery owner opens it directly. The event carries the URL and advances directly to `CodingComplete`. `pr_url` must start with `https://` and be ≤2048 chars. |
 | `failure_report` | current owner; off-turn `branch_drift:` may come from either agent; off-turn `codex_dispatch_failed:` may come only from Claude against a Codex-owned turn | `{"coding_failure":"<reason>"}` | Valid in any coding-active phase. Classifies **Tooling** (six recoverable prefixes, stays in-phase, `current_owner` flips) or **Terminal** (everything else — including `branch_drift:` — transitions to `CodingFailed`) — see "Failure + terminal" above. |
+
+| `orphan_recovered` | current owner | `{"phase","recovered_sha","detail"}` | Valid in any phase. **Non-advancing**: the server records it and returns before building an event, so `phase`, `current_owner`, `recovery_attempts` and `total_recovery_attempts` are all unchanged. Sent *in addition to* the turn's normal completion event, never instead of it. Deliberately not a `failure_report`: a Tooling failure parks the phase, hands the turn over and spends a recovery attempt against a ceiling of 2 — but the sender here succeeded, having preserved work a previous turn left behind. The row is self-addressed with `status='recorded'` so it never appears in either agent's `collab_recv` inbox. `collab_status` reports the count as `orphans_recovered`. |
 
 The `Sender` column above names the agent that owns the phase in the normal
 flow. While a recovery is in flight, the delegated-completion override

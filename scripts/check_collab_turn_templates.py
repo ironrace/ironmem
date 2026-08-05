@@ -124,7 +124,7 @@ VALID_TIERS = {"planning", "review", "mechanical"}
 VALID_MODELS = {"opus", "sonnet", "haiku", "default"}
 VALID_TOPICS = {"draft", "canonical", "review", "final", "task_list",
                 "implementation_done", "review_local", "review_fix_global",
-                "final_review", "failure_report"}
+                "final_review", "failure_report", "orphan_recovered"}
 EXPECTED_TEMPLATES = {
     "collab-turn-plan-draft.md": {
         "turn": "draft",
@@ -166,13 +166,13 @@ EXPECTED_TEMPLATES = {
         "turn": "review_fix_global",
         "tier": "review",
         "model": "opus",
-        "topics": ["review_fix_global", "failure_report"],
+        "topics": ["review_fix_global", "failure_report", "orphan_recovered"],
     },
     "collab-turn-review-local.md": {
         "turn": "review_local",
         "tier": "review",
         "model": "opus",
-        "topics": ["review_local", "failure_report"],
+        "topics": ["review_local", "failure_report", "orphan_recovered"],
     },
     "collab-turn-final-review.md": {
         "turn": "final_review",
@@ -209,7 +209,11 @@ TURN_TOPIC_TEMPLATES = {
 # several turns and is never dispatched on its own, so it has no template of
 # its own on either harness. Codex's recovery override lives in
 # collab-recovery.md, which is registered in CODEX_PROMPTS directly.
-NON_TURN_TOPICS = {"failure_report"}
+# Neither advances a turn. `failure_report` parks the phase and hands over;
+# `orphan_recovered` does not even do that — the server records it and returns
+# before building an event, so phase, owner and both recovery counters are
+# untouched. See ORPHAN_RECOVERED_TOPIC in collab_session.rs.
+NON_TURN_TOPICS = {"failure_report", "orphan_recovered"}
 REQUIRED_TEMPLATE_SNIPPETS = {
     "collab-turn-plan-synthesis.md": [
         "first auto-ack response",
@@ -414,6 +418,12 @@ RESET_GUARD_RECOVERY_SKIP_RE = re.compile("|".join(
 # every occurrence that IS an instruction, rather than weakening it to "the
 # last one wins" — which would let a guarded reset be followed by an
 # unguarded one.
+# Finding a dirty worktree on a NORMAL turn is evidence a previous turn died
+# without reporting. Preserving the work is necessary but not sufficient: if
+# the turn then completes normally and says nothing, the session's own history
+# shows an ordinary turn and the lost turn is invisible. Every prompt that
+# guards a reset must also report the incident.
+RESET_GUARD_REPORT_RE = re.compile(r"topic=\"?orphan_recovered", re.MULTILINE)
 RESET_MENTION_EXEMPT_RE = re.compile(
     "(" + RESET_GUARD_ENFORCEMENT_RE.pattern + "|"
     + flex("Skip only the").pattern
@@ -719,6 +729,12 @@ def check_reset_guards() -> None:
                 "instructions are not conditioned on a clean worktree — "
                 'expected "Only when the worktree is clean" immediately '
                 f"before each (first unguarded at offset {min(unguarded)})")
+        # Presence only, deliberately unpositioned: the incident is recorded
+        # *after* the recovered work is committed, so it legitimately sits on
+        # either side of the reset the other clauses are ordered against.
+        if not RESET_GUARD_REPORT_RE.search(text):
+            err(f"{rel}: a dirty worktree on a normal turn is never reported — "
+                "expected a `collab_send` with topic=orphan_recovered")
 
 
 # The four review turns whose reviewed range is `base_sha..last_head_sha` read
