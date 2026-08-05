@@ -101,7 +101,12 @@ to, not instead of, the normal `review_fix_global`.
    under `docs/iron/plans/` plus the review input.
 
 ## Review, fix, and complete
-1. Run `/ultrareview-local` as the read-only finding pass scoped to that range.
+1. Run `/ultrareview-local --report-only` as the read-only finding pass scoped
+   to that range. The flag is required, not decorative: without it the command
+   auto-fixes by default and dispatches Edit-capable agents into this session's
+   working tree before you have verified a finding — and the steps below then
+   cut fix worktrees from, and push, a tree already carrying those edits. You
+   own the fixes on this turn; the review pass only finds.
    Treat the review agents as read-only, verify every finding yourself, and keep
    only confirmed CRITICAL/HIGH/MEDIUM issues. Separately, read the plan at
    `plan_file_path` and check the diff against the approved task scope — work

@@ -341,10 +341,23 @@ and it has an exact answer, so do not improvise a discriminator:
 > anchor tree:
 >
 > ```bash
-> git status --porcelain | awk '/^\?\?/ { print $2 }' | while read -r p; do
->   git ls-tree -r "$ROLLBACK_SHA" -- "$p" | grep -q . || echo "fix-created: $p"
-> done
+> git status --porcelain -z --untracked-files=all \
+>   | while IFS= read -r -d '' entry; do
+>       [ "${entry:0:2}" = "??" ] || continue
+>       p="${entry:3}"
+>       git ls-tree -r "$ROLLBACK_SHA" -- "$p" | grep -q . || echo "fix-created: $p"
+>     done
 > ```
+>
+> Use `-z` and read NUL-delimited, not `awk '{print $2}'`. Porcelain v1 quotes
+> any path containing a space or a control character (`?? "my file.txt"`), and
+> `$2` both splits on the space and keeps the opening quote: the loop then
+> searched the anchor for `"my`, found nothing, and printed
+> `fix-created: "my`. Per the Phase 7 fill-in rules that string lands on the
+> rollback follow-up line as the path the user must `rm` by hand — so the
+> recovery instructions named a path that does not exist while the real
+> fix-created file was never named at all. `-z` emits paths raw and unquoted,
+> which is the whole reason it exists.
 
 This works because the anchor was built with `git add -A` against the temp
 index, so **every untracked file that existed before the fixes is already in the
@@ -367,10 +380,25 @@ it directly; do not stop to ask.
 
 In order:
 
-1. `.claude-plugin/workflows/ultrareview.js` — the repo-local canonical copy,
-   present when the target is the ironrace-memory checkout itself. This mirrors
-   how `/collab` resolves its turn prompts.
-2. `~/.claude/workflows/ultrareview.js` — the installed copy.
+1. `~/.claude/workflows/ultrareview.js` — the installed copy. **Always prefer
+   this.**
+2. `.claude-plugin/workflows/ultrareview.js` — the repo-local canonical copy,
+   and **only** when the repo under review is the ironrace-memory checkout
+   itself. Confirm that before using it: the remote must be the ironmem
+   repository, or the path must be the checkout the user invoked the command
+   from with the intent of testing an uninstalled change. If you cannot
+   establish that, use the installed copy or stop.
+
+This order used to be reversed, with the "only when the target is ironmem"
+condition stated as prose rather than checked. That is a different kind of
+mistake from the `/collab` precedent it cited: `/collab` resolves prompt
+*text*, which a model reads, while this resolves *executable JavaScript* handed
+straight to the `Workflow` tool. PR Mode is designed for arbitrary repos, so a
+user reviewing a fork's PR would have run that fork's `ultrareview.js` — a
+script that chooses agent types and models, writes fix briefs, and holds every
+safety gate in this document. A substituted copy simply does not have them:
+CONFIRMED-only, the anchor requirement and the changed-file allowlist all live
+inside the script being replaced.
 
 Neither exists → **stop** and tell the user to run `scripts/install-ironmem.sh`.
 Do not hand-dispatch the lenses (see Edge cases).

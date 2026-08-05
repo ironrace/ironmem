@@ -377,7 +377,13 @@ class InstallIronmemSelfTest(unittest.TestCase):
             packaged_sidecar = theirs.parent / (theirs.name + ".ironmem-packaged")
             self.assertTrue(packaged_sidecar.is_file(), "no packaged sidecar was written")
 
-    def test_non_directory_target_root_skips_the_kind_and_is_reported(self) -> None:
+    def test_non_directory_target_root_fails_the_install(self) -> None:
+        # An obstructed target root means an entire kind of file — every Claude
+        # command, or the workflow — installs nowhere. Reporting it while
+        # exiting 0 is the worst of both: the summary names the skip, and any
+        # automated caller gating on the exit code proceeds as though the
+        # install succeeded, with /ultrareview-local absent at runtime. The
+        # obstructing file must still be left alone.
         with tempfile.TemporaryDirectory() as directory:
             home = pathlib.Path(directory)
             env = self._full_install_env(home)
@@ -386,7 +392,11 @@ class InstallIronmemSelfTest(unittest.TestCase):
             workflows_target.write_text("obstruction -- not a directory\n", encoding="utf-8")
 
             result = self.run_installer(
-                home, home / ".claude.json", skip_skills=False, extra_env=env
+                home,
+                home / ".claude.json",
+                skip_skills=False,
+                extra_env=env,
+                expected_returncode=1,
             )
 
             self.assertTrue(
@@ -397,11 +407,15 @@ class InstallIronmemSelfTest(unittest.TestCase):
                 workflows_target.read_text(encoding="utf-8"), "obstruction -- not a directory\n"
             )
             self.assertIn(
-                "target is not a directory; nothing installed for this kind",
-                result.stdout,
-                "a skipped kind must be named in the end-of-run summary, not just a buried WARN",
+                "exists but is not a directory",
+                result.stderr,
+                "the obstructed path must be named on the way out",
             )
-            self.assertIn("Claude workflow set", result.stdout)
+            self.assertNotIn(
+                "==> Done",
+                result.stdout,
+                "a run that installed nothing for a kind must not report completion",
+            )
 
     def test_superseded_skill_is_removed_when_a_base_snapshot_proves_ours(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

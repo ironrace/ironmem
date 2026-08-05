@@ -494,10 +494,23 @@ install_ext_set() {
     exit 1
   fi
 
+  # Fatal, not a warning. This guard was added to make the condition
+  # *reportable*, but returning 0 from it also made it survivable: before, the
+  # `mkdir -p` below failed under `set -euo pipefail` and aborted the run
+  # non-zero. Once install_md_set routed Claude commands, Claude prompts, Codex
+  # commands and Codex prompts through here too, a single non-directory target
+  # meant the script printed "==> Done", exited 0, and had installed an entire
+  # kind of file — every command, or the workflow — not at all. An automated
+  # setup or CI step gating on the exit code proceeds, and `/ultrareview-local`
+  # is simply absent at runtime while the installer reported success.
+  #
+  # Reporting and exit status are independent: record it for the summary, then
+  # fail. A partial install that claims success is the one outcome worse than a
+  # loud stop.
   if [[ -e "$target_root" && ! -d "$target_root" ]]; then
-    echo "WARN: $label target $target_root exists but is not a directory; leaving it unchanged" >&2
-    UNCHANGED_FILES+=("$label set ($target_root) — target is not a directory; nothing installed for this kind")
-    return
+    echo "ERROR: $label target $target_root exists but is not a directory; cannot install ${label}s" >&2
+    echo "       Remove or rename that path and re-run. Nothing was installed for this kind." >&2
+    exit 1
   fi
 
   mkdir -p "$target_root"
