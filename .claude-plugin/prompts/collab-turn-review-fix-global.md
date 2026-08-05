@@ -35,7 +35,7 @@ instead of ending the session: `git_commit_failed:`, `git_push_failed:`,
 `codex_dispatch_failed:` (each needs real detail after the colon, e.g.
 `git_commit_failed: index.lock EPERM`); everything else (including
 `branch_drift:`/`subagent_failure:`) is terminal. As **recovery owner**,
-preserve and inspect the working-tree diff *before* any fetch, checkout, or
+preserve and inspect the working-tree diff before any fetch, checkout, or
 reset; complete the interrupted phase's gates, commit and push the recovered
 work, then send the normal `review_fix_global` exactly once — never a new
 `failure_report`.

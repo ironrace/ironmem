@@ -295,47 +295,76 @@ REQUIRED_TEMPLATE_SNIPPETS = {
     ],
     "collab-turn-review-local.md": [
         "CodeReviewLocalPending",
-        # Same protocol position as `collab-turn-review-fix-global.md` below,
-        # same reset, same hazard — and this template shipped without either
-        # half of the guard. Under the default `pilot=claude` it IS the
-        # dispatched template for `CodeReviewLocalPending`, so the gap was live.
-        #
-        # Half one: the recovery owner's preserved working tree is the only
-        # copy of the interrupted work, so preservation must be sequenced
-        # ahead of any git state change, not merely mentioned near it.
-        "preserve and inspect the working-tree diff *before* any fetch",
-        # Half two: that snippet lives in the recovery-owner paragraph, and the
-        # recovery owner never runs the reset. The agent that does is the
-        # NORMAL-turn owner, whose hazard is the opposite one: a prior turn
-        # that died hard (OOM, container kill, sandbox teardown) never sent
-        # `failure_report`, so `pending_failure` stays null, so the next
-        # dispatch correctly self-classifies as a normal turn — and resets away
-        # the only copy of the uncommitted fixes with nothing downstream
-        # registering the loss. The porcelain precondition must therefore bind
-        # unconditionally, not on `pending_failure`.
-        "`git status --porcelain` to be empty regardless of `pending_failure`",
+        # The reset guard itself is NOT pinned here. Substring pins assert that
+        # words exist somewhere in the file, not that the reset obeys them —
+        # parking these literals in an HTML comment while restoring an
+        # unconditional reset keeps every pin matching. `check_reset_guards`
+        # enforces the guard structurally instead; see RESET_GUARD_SURFACES.
     ],
     "collab-turn-review-fix-global.md": [
         "CodeReviewFixGlobalPending",
         "/ultrareview-local",
         "the payload carries only",
         "Send exactly once:",
-        # The recovery owner's preserved working tree is the only copy of the
-        # interrupted work; a fetch/checkout/reset before inspecting it is
-        # unrecoverable data loss.
-        "preserve and inspect the working-tree diff *before* any fetch",
-        # That snippet lives in the recovery-owner paragraph, and the recovery
-        # owner never runs the reset. The agent that does is the NORMAL-turn
-        # owner, whose hazard is the opposite one: a prior turn that died hard
-        # (OOM, container kill, sandbox teardown) never sent `failure_report`,
-        # so `pending_failure` stays null, so the next dispatch correctly
-        # self-classifies as a normal turn — and resets away the only copy of
-        # the uncommitted fixes with nothing downstream registering the loss.
-        # The porcelain precondition must therefore bind unconditionally, not
-        # on `pending_failure`.
-        "`git status --porcelain` to be empty regardless of `pending_failure`",
+        # The reset guard is enforced structurally by `check_reset_guards`,
+        # not by substring pins — see RESET_GUARD_SURFACES for why.
     ],
 }
+# Prompts that instruct a worker to `git reset --hard`. Each one is a place a
+# turn can destroy the only copy of uncommitted work, so each is checked for a
+# guard by structure rather than by wording.
+#
+# Two distinct hazards, both of which the guard must cover:
+#
+#   1. The RECOVERY owner holds the interrupted turn's preserved working tree.
+#      It must be told to skip the sync outright; a fetch/checkout/reset before
+#      inspecting that tree is unrecoverable data loss.
+#   2. The NORMAL-turn owner faces the opposite case. A turn that died hard
+#      (OOM, container kill, sandbox teardown) never sent `failure_report`, so
+#      `pending_failure` stays null, so the next dispatch correctly
+#      self-classifies as a normal turn — and resets away the only copy of the
+#      uncommitted work with nothing downstream registering the loss. The
+#      cleanliness precondition must therefore bind unconditionally, never on
+#      `pending_failure`.
+#
+# Why this is not a REQUIRED_TEMPLATE_SNIPPETS entry: substring pins assert
+# that words appear somewhere in the file, not that the reset obeys them.
+# Issue #254's exact pre-fix template passes a pure-substring gate if the
+# pinned literals are parked in an HTML comment, and a template may state the
+# precondition and then override it ("if dirty, note it and continue anyway").
+# Both were verified green against a substring-only pin before this check
+# existed. Ordering and enforcement are the properties that matter, so they are
+# what gets checked.
+RESET_GUARD_SURFACES = (
+    ".claude-plugin/prompts/collab-turn-review-local.md",
+    ".claude-plugin/prompts/collab-turn-review-fix-global.md",
+    ".codex-plugin/prompts/collab-review-local.md",
+)
+# Accepts either Claude phrasing ("regardless of `pending_failure`") or the
+# Codex mirror's narrower-scoped equivalent, which binds unconditionally by
+# sitting in a normal-turn-only paragraph.
+RESET_GUARD_PRECONDITION_RE = re.compile(
+    r"`?git status\s*\n?\s*--porcelain`?\s+to be empty", re.MULTILINE)
+RESET_GUARD_ENFORCEMENT_RE = re.compile(
+    r"do\s*\n?\s*not run `git reset --hard`", re.MULTILINE)
+RESET_GUARD_CONDITIONAL_RE = re.compile(
+    r"[Oo]nly when the worktree\s*\n?\s*is\s*\n?\s*clean", re.MULTILINE)
+RESET_GUARD_RECOVERY_SKIP_RE = re.compile(
+    r"(skip the sync|skip this step entirely|Skip only the)", re.MULTILINE)
+# Not every `git reset --hard` in a template is an instruction to reset. Two
+# kinds are the guard talking about the reset rather than ordering one, and
+# both legitimately precede the precondition:
+#   - the prohibition itself ("do not run `git reset --hard`")
+#   - the recovery owner's skip list ("Skip only the `git fetch`, the
+#     checkout, and the `git reset --hard` in the next paragraph")
+# Exempting them by surrounding context keeps the ordering rule strict for
+# every occurrence that IS an instruction, rather than weakening it to "the
+# last one wins" — which would let a guarded reset be followed by an
+# unguarded one.
+RESET_MENTION_EXEMPT_RE = re.compile(
+    r"(do\s*\n?\s*not run `git reset --hard`"
+    r"|[Ss]kip only the[^.]{0,80}?`git reset --hard`)", re.MULTILINE)
+HTML_COMMENT_RE = re.compile(r"<!--.*?-->", re.DOTALL)
 FORBIDDEN_TEMPLATE_SNIPPETS = {
     "collab-turn-plan-synthesis.md": [
         "read Codex's draft",
@@ -541,6 +570,48 @@ def check_review_diff_fallback_contract() -> None:
     for path, snippets in REVIEW_DIFF_FALLBACK_SURFACES.items():
         if not path.exists() or any(snippet not in path.read_text() for snippet in snippets):
             err(f"{path.relative_to(ROOT)}: missing review-diff fallback contract")
+
+
+def check_reset_guards() -> None:
+    """Every `git reset --hard` instruction must be structurally guarded.
+
+    Checked by position, not by wording, so the guard survives rephrasing and
+    cannot be satisfied by text that merely mentions it. HTML comments are
+    stripped first: parking the required phrases in a comment while leaving an
+    unconditional reset in the body is exactly how issue #254's pre-fix
+    template passes a substring-only gate.
+    """
+    for rel in RESET_GUARD_SURFACES:
+        path = ROOT / rel
+        if not path.exists():
+            err(f"{rel}: missing reset-guard surface")
+            continue
+        text = HTML_COMMENT_RE.sub("", path.read_text())
+        exempt = [m.span() for m in RESET_MENTION_EXEMPT_RE.finditer(text)]
+        resets = [m.start() for m in re.finditer(r"git reset --hard", text)
+                  if not any(s <= m.start() < e for s, e in exempt)]
+        if not resets:
+            err(f"{rel}: expected a `git reset --hard` instruction to guard; "
+                "if the reset was removed, drop this file from "
+                "RESET_GUARD_SURFACES")
+            continue
+        pre = RESET_GUARD_PRECONDITION_RE.search(text)
+        if not pre:
+            err(f"{rel}: no `git status --porcelain` cleanliness precondition "
+                "guarding `git reset --hard`")
+        elif pre.start() > min(resets):
+            # Substring membership has no ordering; a precondition stated after
+            # the reset it governs is not a precondition.
+            err(f"{rel}: `git status --porcelain` precondition appears after "
+                "the `git reset --hard` it must guard")
+        if not RESET_GUARD_ENFORCEMENT_RE.search(text):
+            err(f"{rel}: cleanliness precondition states no consequence — "
+                "expected an explicit \"do not run `git reset --hard`\"")
+        if not RESET_GUARD_CONDITIONAL_RE.search(text):
+            err(f"{rel}: reset is not conditioned on a clean worktree — "
+                'expected "Only when the worktree is clean"')
+        if not RESET_GUARD_RECOVERY_SKIP_RE.search(text):
+            err(f"{rel}: recovery owner is not told to skip the sync")
 
 
 def check_review_diff_trigger_detection_contract() -> None:
@@ -1334,6 +1405,7 @@ def main() -> int:
     check_no_uninstalled_skill_references()
     check_evaluate_issue_surfaces()
     check_review_diff_fallback_contract()
+    check_reset_guards()
     check_topic_template_completeness()
     check_installer_covers_templates()
     check_precondition_phase_names()

@@ -28,23 +28,26 @@ instead of ending the session: `git_commit_failed:`, `git_push_failed:`,
 `git_commit_failed: index.lock EPERM`); everything else (including
 `branch_drift:`/`subagent_failure:`) is terminal. If you are acting as
 **recovery owner** — control was handed to you after Codex's recoverable
-`failure_report`, or you resumed via `collab_resume` —
-preserve and inspect the working-tree diff *before* any fetch, checkout,
-or reset; run this turn's gates yourself, commit + push, then send the
+`failure_report`, you resumed via `collab_resume`, or you began a normal
+turn and found a dirty worktree (step 1) —
+preserve and inspect the working-tree diff before any fetch, checkout, or
+reset; run this turn's gates yourself, commit + push, then send the
 normal `review_local` (never a new `failure_report`).
 
 ## Actions
-1. **Normal turns only — as recovery owner, skip this step entirely.**
-   Pre-send harness: `git fetch`; `git cat-file -e <last_head_sha>^{commit}`
-   (on miss → `failure_report` `branch_drift:...`). Immediately before
-   resetting, require
-   `git status --porcelain` to be empty regardless of `pending_failure`: a
-   dirty worktree here means a prior turn died without reporting
-   `pending_failure` (OOM, container kill, sandbox teardown), not that there
-   is nothing to recover — do not run `git reset --hard`; instead preserve
-   and inspect the diff on the recovery path above. Only when the worktree
-   is clean, `git reset --hard <last_head_sha>` (Codex pushed at
-   `review_fix_global`). Then `cargo fmt --check` + `clippy -D warnings`.
+1. **Normal turns only — as recovery owner, skip the sync below and go
+   straight to the gates at the end of this step.** Pre-send harness:
+   `git fetch`; `git cat-file -e <last_head_sha>^{commit}` (on miss →
+   `failure_report` `branch_drift:...`). Immediately before resetting,
+   require `git status --porcelain` to be empty regardless of
+   `pending_failure`: a dirty worktree here means a prior turn died without
+   reporting `pending_failure` (OOM, container kill, sandbox teardown), not
+   that there is nothing to recover — do not run `git reset --hard`; instead
+   preserve and inspect the diff on the recovery path above, which covers
+   this case too. Only when the worktree is clean, `git reset --hard
+   <last_head_sha>` (Codex pushed at `review_fix_global`).
+   **Both normal and recovery turns** then run this turn's gates:
+   `cargo fmt --check` + `clippy -D warnings`.
 2. Prepare the normal review input before choosing depth. First attempt:
    ```bash
    ironmem review-diff --repo <repo_path> --base <base_sha> --head <last_head_sha>
@@ -88,8 +91,8 @@ normal `review_local` (never a new `failure_report`).
 7. Merge or cherry-pick the fix commits back onto the collab branch, resolve
    conflicts, then commit + push the integrated result.
 8. Post-work gate: `cargo test --workspace` if fixes were committed or Rust/
-   runtime files changed; otherwise use pushed-head proof and the pre-send
-   harness result as the gate evidence.
+   runtime files changed; otherwise use pushed-head proof and this turn's
+   step-1 gate results as the gate evidence.
 9. `collab_send(sender="claude", topic="review_local",
    content=<JSON {"head_sha":"<HEAD>"}>)`.
 

@@ -548,69 +548,130 @@ def test_lint_rejects_a_codex_prompt_whose_phase_guard_vanished(tmp_path):
         in r.stdout
 
 
-def test_lint_requires_the_unconditional_dirty_worktree_guard(tmp_path):
-    # A turn that died hard never sends `failure_report`, so `pending_failure`
-    # stays null and the next dispatch is a normal turn. The porcelain
-    # precondition must therefore bind whatever `pending_failure` says.
+# Every prompt that orders a `git reset --hard`. A turn that died hard never
+# sends `failure_report`, so `pending_failure` stays null and the next dispatch
+# is a normal turn — the cleanliness precondition must bind whatever
+# `pending_failure` says, on every one of these files.
+RESET_GUARD_PROMPTS = [
+    (".claude-plugin/prompts", "collab-turn-review-local.md"),
+    (".claude-plugin/prompts", "collab-turn-review-fix-global.md"),
+    (".codex-plugin/prompts", "collab-review-local.md"),
+]
+
+
+@pytest.mark.parametrize("subdir,name", RESET_GUARD_PROMPTS)
+def test_lint_requires_a_cleanliness_precondition_on_every_reset(
+        tmp_path, subdir, name):
     fixture = copy_fixture(tmp_path)
-    template = (fixture / ".claude-plugin" / "prompts" /
-                "collab-turn-review-fix-global.md")
-    guard = "`git status --porcelain` to be empty regardless of `pending_failure`"
+    template = fixture / subdir / name
     text = template.read_text()
-    assert guard in text, "porcelain precondition not found to mutate"
-    template.write_text(text.replace(
-        guard, "`git status --porcelain` to be empty when `pending_failure`", 1))
+    assert "--porcelain" in text, f"{name}: no precondition to mutate"
+    # replace-all: a pin surviving because only its first occurrence moved is
+    # the failure mode `mutate()` above exists to prevent.
+    template.write_text(text.replace("--porcelain", "--short"))
 
     r = run({"COLLAB_LINT_ROOT": str(fixture)})
 
     assert r.returncode == 1
-    assert ("collab-turn-review-fix-global.md: missing required contract "
-            "snippet '`git status --porcelain` to be empty regardless of "
-            "`pending_failure`'") in r.stdout
+    assert (f"{name}: no `git status --porcelain` cleanliness precondition "
+            "guarding `git reset --hard`") in r.stdout
 
 
-def test_lint_requires_the_dirty_worktree_guard_in_review_local(tmp_path):
-    # `collab-turn-review-local.md` sits at the same protocol position as
-    # `collab-turn-review-fix-global.md` above and carries the same reset, but
-    # shipped with neither half of the guard while its Claude sibling and its
-    # Codex mirror both had it. Under the default `pilot=claude` this is the
-    # dispatched template for `CodeReviewLocalPending`, so the gap was live.
+@pytest.mark.parametrize("subdir,name", RESET_GUARD_PROMPTS)
+def test_lint_requires_the_recovery_owner_to_be_told_to_skip_the_sync(
+        tmp_path, subdir, name):
+    fixture = copy_fixture(tmp_path)
+    template = fixture / subdir / name
+    text = template.read_text()
+    for marker in ("skip the sync", "skip this step entirely", "Skip only the"):
+        if marker in text:
+            template.write_text(text.replace(marker, "proceed with the sync"))
+            break
+    else:
+        pytest.fail(f"{name}: no recovery-skip marker to mutate")
+
+    r = run({"COLLAB_LINT_ROOT": str(fixture)})
+
+    assert r.returncode == 1
+    assert f"{name}: recovery owner is not told to skip the sync" in r.stdout
+
+
+def test_lint_rejects_a_precondition_stated_after_the_reset(tmp_path):
+    # Substring membership has no ordering. A precondition that appears after
+    # the reset it governs is not a precondition, and a pure-substring gate
+    # cannot tell the difference.
     fixture = copy_fixture(tmp_path)
     template = (fixture / ".claude-plugin" / "prompts" /
                 "collab-turn-review-local.md")
-    guard = "`git status --porcelain` to be empty regardless of `pending_failure`"
     text = template.read_text()
-    assert guard in text, "porcelain precondition not found to mutate"
-    template.write_text(text.replace(
-        guard, "`git status --porcelain` to be empty when `pending_failure`", 1))
+    guard_start = text.index("Immediately before resetting,")
+    guard_end = text.index("**Both normal and recovery turns**")
+    guard = text[guard_start:guard_end]
+    # Move the whole guard paragraph to after the step that resets.
+    moved = (text[:guard_start] + "`git reset --hard <last_head_sha>`.\n   "
+             + text[guard_end:].replace(
+                 "2. Prepare the normal review input",
+                 f"2. Afterwards: {guard}\n3. Prepare the normal review input", 1))
+    template.write_text(moved)
 
     r = run({"COLLAB_LINT_ROOT": str(fixture)})
 
     assert r.returncode == 1
-    assert ("collab-turn-review-local.md: missing required contract "
-            "snippet '`git status --porcelain` to be empty regardless of "
-            "`pending_failure`'") in r.stdout
+    assert ("collab-turn-review-local.md: `git status --porcelain` "
+            "precondition appears after the `git reset --hard` it must guard"
+            ) in r.stdout
 
 
-def test_lint_requires_review_local_preservation_to_precede_any_reset(tmp_path):
-    # The recovery half. Mutating back to the exact pre-fix wording — which
-    # said "inspect the preserved diff" with no ordering constraint, three
-    # lines above an unconditional reset — must fail the lint.
+def test_lint_rejects_a_precondition_that_is_stated_then_overridden(tmp_path):
+    # The guard can be present and immediately negated. Requiring the reset to
+    # be conditioned on a clean tree is what catches this; asserting the
+    # precondition's words appear does not.
     fixture = copy_fixture(tmp_path)
     template = (fixture / ".claude-plugin" / "prompts" /
                 "collab-turn-review-local.md")
-    ordering = ("preserve and inspect the working-tree diff *before* any "
-                "fetch, checkout,\nor reset;")
     text = template.read_text()
-    assert ordering in text, "recovery ordering constraint not found to mutate"
-    template.write_text(text.replace(ordering, "inspect the\npreserved diff;", 1))
+    override = "Only when the worktree is clean, `git reset --hard"
+    assert override in text, "conditional reset not found to mutate"
+    template.write_text(text.replace(
+        override, "If dirty, note it and continue anyway; `git reset --hard"))
 
     r = run({"COLLAB_LINT_ROOT": str(fixture)})
 
     assert r.returncode == 1
-    assert ("collab-turn-review-local.md: missing required contract "
-            "snippet 'preserve and inspect the working-tree diff *before* "
-            "any fetch'") in r.stdout
+    assert ("collab-turn-review-local.md: reset is not conditioned on a clean "
+            'worktree — expected "Only when the worktree is clean"') in r.stdout
+
+
+def test_lint_rejects_issue_254_pre_fix_text_with_the_guard_parked_in_a_comment(
+        tmp_path):
+    # The regression that motivated the structural check. Restoring issue
+    # #254's unconditional reset while parking the guard's phrases in an HTML
+    # comment satisfies every substring pin — verified green against the
+    # substring-only gate this replaced.
+    fixture = copy_fixture(tmp_path)
+    template = (fixture / ".claude-plugin" / "prompts" /
+                "collab-turn-review-local.md")
+    text = template.read_text()
+    start = text.index("## Actions\n1. **Normal turns only")
+    end = text.index("\n2. Prepare the normal review input")
+    pre_fix = (
+        "## Actions\n"
+        "1. Pre-send harness: `git fetch`; `git cat-file -e <last_head_sha>^{commit}`\n"
+        "   (on miss → `failure_report` `branch_drift:...`);\n"
+        "   `git reset --hard <last_head_sha>`; `cargo fmt --check`.\n"
+        "<!-- guard phrases parked out of the executable path:\n"
+        "`git status --porcelain` to be empty regardless of `pending_failure`: a\n"
+        "do not run `git reset --hard`; instead preserve\n"
+        "Only when the worktree is clean\n"
+        "as recovery owner, skip the sync\n"
+        "-->")
+    template.write_text(text[:start] + pre_fix + text[end:])
+
+    r = run({"COLLAB_LINT_ROOT": str(fixture)})
+
+    assert r.returncode == 1
+    assert ("collab-turn-review-local.md: no `git status --porcelain` "
+            "cleanliness precondition guarding `git reset --hard`") in r.stdout
 
 
 def test_lint_requires_retry_safe_split_contract(tmp_path):

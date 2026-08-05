@@ -1436,6 +1436,19 @@ before each coding-active `collab_send`:
   fetching, checking out, or resetting; ordinary pre-send synchronization may
   discard the reporter's uncommitted recovery diff. It then commits/pushes and
   sends the interrupted phase's normal completion event.
+- **A clean worktree is an unconditional precondition of the reset.**
+  Preservation must never be gated on `pending_failure` alone. A turn that
+  dies hard — OOM, container kill, sandbox teardown — never sends a
+  `failure_report`, so `pending_failure` stays null and the next dispatch
+  correctly self-classifies as a *normal* turn. Immediately before
+  `git reset --hard`, the harness must therefore require
+  `git status --porcelain` to be empty regardless of `pending_failure`. A
+  dirty worktree at that point is evidence of an unreported death, not of an
+  empty turn: do not reset, and take the preservation path above instead.
+  Without this, a normal turn destroys the only copy of the dead turn's
+  uncommitted work with nothing downstream registering the loss.
+  `scripts/check_collab_turn_templates.py` enforces this structurally
+  (`check_reset_guards`) on every prompt that orders a reset.
 - **Subagent orchestration** during `CodeImplementPending`. Claude's final
   planning gate produces the approved task markdown, and the PlanLocked
   bridge publishes it via `task_list`. The selected `implementer` then runs
