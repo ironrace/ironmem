@@ -471,6 +471,16 @@ fn full_happy_path_sums_usage_and_counts_rework() {
             st("PlanSynthesisPending", "claude", 0),
             st("PlanCodexReviewPending", "codex", 0),
             st("PlanClaudeFinalizePending", "claude", 0),
+            // `ScriptedReader` advances one state per *poll*, and the
+            // ClaudeCompose turn polls twice: once at the top of the loop, then
+            // again immediately before rendering the submit prompt (the driver
+            // must resolve `$SENDER` from a fresh `current_owner`, since
+            // ownership can flip during the long compose turn). The phase does
+            // not advance between those two polls — it advances only once the
+            // submit lands — so the second poll legitimately returns
+            // `PlanClaudeFinalizePending` again. Without this entry the extra
+            // poll swallows `PlanLocked` and the TaskListBridge turn is skipped.
+            st("PlanClaudeFinalizePending", "claude", 0),
             st("PlanLocked", "claude", 0),
             st("CodeImplementPending", "claude", 0),
             st("CodeReviewFixGlobalPending", "codex", 1),

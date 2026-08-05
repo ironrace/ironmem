@@ -336,7 +336,16 @@ fall back to a lower tier.**
 | CodeReviewFixGlobalPending (copilot) | orchestrator | `collab-turn-review-fix-global.md` | review | opus |
 | CodeReviewLocalPending | orchestrator | `collab-turn-review-local.md` | review | opus |
 | CodeReviewFinalPending | orchestrator | `collab-turn-final-review.md` | review | opus |
-| post-gate send | pilot | `collab-turn-submit.md` | mechanical | sonnet |
+| post-gate send | orchestrator | `collab-turn-submit.md` | mechanical | sonnet |
+
+The `Owner` column names the **runner** — who dispatches and executes the
+worker — which is always the Claude-side orchestrator, for every row
+including `post-gate send`. It is not the protocol **sender**: the submit
+worker sends under `$SENDER` (`collab_status.current_owner`, normally the
+pilot), so under `pilot == "codex"` Codex owns the send identity while the
+Claude-side orchestrator still runs the worker. Reading this column as the
+sender would imply Codex must run `collab-turn-submit.md`, for which there is
+deliberately no `.codex-plugin` prompt — the turn would be undispatchable.
 
 ## v1 Planning Loop (Phase → Action Table)
 
@@ -972,41 +981,62 @@ f. **Event-driven wait loop** — the dispatcher's interactive surface during
       process is no longer running) AND no phase advance observed →
       Codex CLI failed silently. **ERROR.**
       - Capture the last 50 lines from `/tmp/codex-out-${session_id}.log`.
-      - **Coding-active phases only** (`CodeImplementPending`,
-        `CodeReviewFixGlobalPending`, `CodeReviewLocalPending`,
-        `CodeReviewFinalPending`): send `collab_send(sender="claude",
+      - **Dispatch-failure-admitting phases only** — `CodeImplementPending`
+        (when `implementer == "codex"`) and `CodeReviewFixGlobalPending`:
+        send `collab_send(sender="claude",
           topic="failure_report",
           content=<JSON {"coding_failure":"codex_dispatch_failed: codex exec exited without a phase advance — <last 50 log lines>"}>)`.
         Read `collab_status` again, then exit the wait loop via condition 2
         (recovery handed to Claude) or condition 3 (retry ceiling exceeded).
-      - **Planning phases** (`PlanParallelDrafts`, `PlanSynthesisPending`,
-        `PlanCodexReviewPending`, `PlanClaudeFinalizePending`): do **not**
-        send `failure_report`. The server gates the whole `FailureReport` arm
-        on `Phase::is_coding_active()`, so it rejects the report as
-        `WrongPhase` and conditions 2 and 3 are unreachable. Kill any surviving
-        background process, exit the wait loop, and report the captured log
-        tail and the stalled phase to the user as a dispatch failure that
-        needs manual intervention.
+      - **Every other phase** — the planning phases (`PlanParallelDrafts`,
+        `PlanSynthesisPending`, `PlanCodexReviewPending`,
+        `PlanClaudeFinalizePending`) **and** `CodeReviewLocalPending` /
+        `CodeReviewFinalPending`: do **not** send `failure_report`. Kill any
+        surviving background process, exit the wait loop, and report the
+        captured log tail and the stalled phase to the user as a dispatch
+        failure that needs manual intervention.
+
+        Two independent server gates apply here, and passing the first is
+        **not** sufficient. Planning phases fail `Phase::is_coding_active()`
+        (`crates/ironmem/src/collab/phase.rs`) and are rejected as
+        `WrongPhase`. `CodeReviewLocalPending` and `CodeReviewFinalPending`
+        *are* coding-active, but an **off-turn** `codex_dispatch_failed:`
+        additionally requires `dispatch_failure_phase_admits`
+        (`crates/ironmem/src/collab/mod.rs`), which returns `false` for both —
+        so `off_turn_failure_is_admissible` is false, `actor != current_owner`,
+        and the send is rejected as `NotYourTurn`. Either way conditions 2 and
+        3 are unreachable, so sending would leave the dispatcher looping on a
+        rejected send with no exit. This case is reachable whenever
+        `pilot == "codex"`, which routes Codex into both phases.
 
       `codex_dispatch_failed:` is the ONLY off-turn-admissible prefix Claude
       may use against a Codex-owned turn, and it classifies **Tooling**
-      (recoverable) — so conditions 5 and 6 hand recovery to Claude rather
-      than aborting the session (condition 4 is a success path and emits no
-      `codex_dispatch_failed:` at all). The server admits it only with at least one
-      byte of detail after the colon; a bare prefix, or any other prefix
-      (`branch_drift:` aside, which is terminal), is rejected off-turn.
+      (recoverable) — so in the dispatch-failure-admitting phases above,
+      conditions 5 and 6 hand recovery to Claude rather than aborting the
+      session (condition 4 is a success path and emits no
+      `codex_dispatch_failed:` at all). In every other phase there is no
+      protocol escape at all: the report is rejected, so the only correct
+      action is to exit and surface the stall to a human. The server admits
+      the prefix only with at least one byte of detail after the colon; a bare
+      prefix, or any other prefix (`branch_drift:` aside, which is terminal),
+      is rejected off-turn.
 
    6. Wall time exceeds 600 seconds (configurable) →
       **HANG.**
       - Kill the Bash background process via `KillShell`.
-      - **Coding-active phases only:** send `collab_send(sender="claude",
+      - **Dispatch-failure-admitting phases only** (`CodeImplementPending`
+        with `implementer == "codex"`, and `CodeReviewFixGlobalPending`):
+        send `collab_send(sender="claude",
           topic="failure_report",
           content=<JSON {"coding_failure":"codex_dispatch_failed: codex exec exceeded the 600s hang timeout with no phase advance"}>)`.
         Read `collab_status` again, then exit the wait loop via condition 2
         (recovery handed to Claude) or condition 3 (retry ceiling exceeded).
-      - **Planning phases:** as in condition 5, `failure_report` is rejected
-        outside `Phase::is_coding_active()` — exit the wait loop and report
-        the hang and the stalled phase to the user instead.
+      - **Every other phase:** as in condition 5 — the planning phases are
+        rejected by `Phase::is_coding_active()`, and `CodeReviewLocalPending` /
+        `CodeReviewFinalPending` are rejected by
+        `dispatch_failure_phase_admits` despite being coding-active. Do not
+        send `failure_report`; exit the wait loop and report the hang and the
+        stalled phase to the user instead.
 
 g. Resume the normal dispatch loop after a settled success or recovery. The
    settled `collab_status` read already observed the Claude-owned or terminal

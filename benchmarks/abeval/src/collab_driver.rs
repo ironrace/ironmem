@@ -905,6 +905,15 @@ fn drive_collab_loop<R: CollabStateReader, S: WorkerSpawner>(
                 }
                 let artifact_ref = resolve_compose_ref(reader, &cr.stdout, before_rowid, topic)
                     .map_err(DriveError::Invalid)?;
+                // Re-poll immediately before the submit render. `state` was read
+                // before the compose turn, and ownership can flip during it (a
+                // recovery handoff reassigns `current_owner`). `.claude-plugin/
+                // commands/collab.md` requires the orchestrator to refresh
+                // `collab_status` immediately before dispatching the submit
+                // worker for exactly this reason: a stale `$SENDER` trips the
+                // worker's own ABORT guard, so nothing is sent and the run
+                // stalls out later as a STUCK_LIMIT instead of failing here.
+                let submit_state = reader.read(&session_id).map_err(DriveError::Invalid)?;
                 let submit = render_worker_prompt(
                     &ctx.prompts_dir,
                     "collab-turn-submit.md",
@@ -920,8 +929,9 @@ fn drive_collab_loop<R: CollabStateReader, S: WorkerSpawner>(
                         // interactive orchestrator uses
                         // (`$SENDER=<collab_status.current_owner>` in
                         // `.claude-plugin/commands/collab.md`), so the value must
-                        // come from this poll's owner, not a hardcoded "claude".
-                        ("$SENDER", &state.current_owner),
+                        // come from the freshest poll, not a hardcoded "claude"
+                        // and not the pre-compose snapshot.
+                        ("$SENDER", &submit_state.current_owner),
                     ],
                 )
                 .map_err(DriveError::Invalid)?;
@@ -938,6 +948,20 @@ fn drive_collab_loop<R: CollabStateReader, S: WorkerSpawner>(
                 accumulate_claude(&mut acc.claude_usage, &mut acc.any_usage_unparseable, &sr);
                 if let Some(e) = worker_result_error(WorkerFailureSite::ClaudeTurn, &sr) {
                     return Err(e);
+                }
+                // The submit worker reports a `$SENDER` mismatch (or an
+                // unfetchable artifact) by returning a blocker and sending
+                // nothing. Without this check the driver would count the
+                // aborted submit as success and only fail much later as a
+                // STUCK_LIMIT stall, whose "submit never landed" message hides
+                // the real cause. Same treatment `TaskListBridge` already gives
+                // its own worker.
+                if let Some(blocker) = parse_blocker_line(&sr.stdout) {
+                    return Err(DriveError::Invalid(anyhow!(
+                        "submit worker for topic {} returned blocker: {} — INVALID run",
+                        topic,
+                        blocker
+                    )));
                 }
             }
             WorkerAction::TaskListBridge => {

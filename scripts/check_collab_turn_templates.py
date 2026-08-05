@@ -561,12 +561,25 @@ TASK_LIST_BRIDGE_SNIPPETS = [
     "`$SENDER=<collab_status.current_owner>`.",
     "it\n   must never be hardcoded to `\"claude\"`",
 ]
-PLANNING_DISPATCH_FAILURE_SNIPPETS = [
-    "**Coding-active phases only** (`CodeImplementPending`,",
-    "**Planning phases** (`PlanParallelDrafts`, `PlanSynthesisPending`,",
-    "on `Phase::is_coding_active()`, so it rejects the report as\n"
-    "        `WrongPhase` and conditions 2 and 3 are unreachable.",
-    "**Planning phases:** as in condition 5, `failure_report` is rejected",
+# The wait loop's `codex_dispatch_failed:` remedy is admissible in far fewer
+# phases than "coding-active". Two independent server gates apply, and passing
+# the first is not sufficient: planning phases fail `Phase::is_coding_active()`,
+# while `CodeReviewLocalPending`/`CodeReviewFinalPending` pass that check but
+# are still refused by `dispatch_failure_phase_admits`, which admits only
+# `CodeImplementPending` (implementer=codex) and `CodeReviewFixGlobalPending`.
+# An earlier revision of this contract lumped the two `CodeReview*` phases into
+# the "send it" bucket on the strength of `is_coding_active()` alone; under
+# `pilot == "codex"`, which routes Codex into both, that sent the dispatcher
+# into a rejected send with no reachable exit.
+DISPATCH_FAILURE_ADMISSIBILITY_SNIPPETS = [
+    "**Dispatch-failure-admitting phases only** — `CodeImplementPending`\n"
+    "        (when `implementer == \"codex\"`) and "
+    "`CodeReviewFixGlobalPending`:",
+    "**Every other phase** — the planning phases (`PlanParallelDrafts`,",
+    "additionally requires `dispatch_failure_phase_admits`\n"
+    "        (`crates/ironmem/src/collab/mod.rs`), which returns `false` "
+    "for both —",
+    "**Every other phase:** as in condition 5 — the planning phases are",
 ]
 DOC_PR_BASE_SNIPPETS = [
     "does **not** require that branch to contain `base_sha`",
@@ -820,10 +833,10 @@ def check_planning_dispatch_failure_contract() -> None:
     dispatcher would loop on a rejected send instead of surfacing the stall.
     """
     command_text = COMMAND.read_text()
-    for snippet in PLANNING_DISPATCH_FAILURE_SNIPPETS:
+    for snippet in DISPATCH_FAILURE_ADMISSIBILITY_SNIPPETS:
         if snippet not in command_text:
-            err(".claude-plugin/commands/collab.md: missing planning-phase "
-                f"dispatch-failure contract {snippet!r}")
+            err(".claude-plugin/commands/collab.md: missing dispatch-failure "
+                f"admissibility contract {snippet!r}")
 
 
 def check_pilot_submit_doc_contract() -> None:

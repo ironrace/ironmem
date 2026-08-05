@@ -85,12 +85,15 @@ TASK_LIST_BRIDGE_SNIPPETS = [
     "`$SENDER=<collab_status.current_owner>`.",
     "it\n   must never be hardcoded to `\"claude\"`",
 ]
-PLANNING_DISPATCH_FAILURE_SNIPPETS = [
-    "**Coding-active phases only** (`CodeImplementPending`,",
-    "**Planning phases** (`PlanParallelDrafts`, `PlanSynthesisPending`,",
-    "on `Phase::is_coding_active()`, so it rejects the report as\n"
-    "        `WrongPhase` and conditions 2 and 3 are unreachable.",
-    "**Planning phases:** as in condition 5, `failure_report` is rejected",
+DISPATCH_FAILURE_ADMISSIBILITY_SNIPPETS = [
+    "**Dispatch-failure-admitting phases only** — `CodeImplementPending`\n"
+    "        (when `implementer == \"codex\"`) and "
+    "`CodeReviewFixGlobalPending`:",
+    "**Every other phase** — the planning phases (`PlanParallelDrafts`,",
+    "additionally requires `dispatch_failure_phase_admits`\n"
+    "        (`crates/ironmem/src/collab/mod.rs`), which returns `false` "
+    "for both —",
+    "**Every other phase:** as in condition 5 — the planning phases are",
 ]
 DOC_PR_BASE_SNIPPETS = [
     "does **not** require that branch to contain `base_sha`",
@@ -609,11 +612,10 @@ def test_lint_allows_sender_placeholder_but_still_rejects_unknown_ones(tmp_path)
     text = submit.read_text()
     assert "$SENDER" in text
 
-    # The fixture is not a fully green tree on its own (it omits several
-    # files other checks cross-reference, e.g. phase.rs), so this doesn't
-    # assert a clean exit — only that the placeholder check specifically
-    # never flags $SENDER, which is the thing Task 1's allowlist entry
-    # controls.
+    # `test_fixture_is_green` covers the clean-exit case for the whole
+    # fixture; this test stays narrow on purpose, asserting only that the
+    # placeholder check specifically never flags $SENDER — the thing Task 1's
+    # allowlist entry controls.
     r_baseline = run({"COLLAB_LINT_ROOT": str(fixture)})
     assert "unknown placeholder $SENDER" not in r_baseline.stdout
 
@@ -761,22 +763,26 @@ def test_lint_requires_every_task_list_bridge_sender_pin(tmp_path, snippet):
             f"bridge sender contract {snippet!r}") in r.stdout
 
 
-@pytest.mark.parametrize("snippet", PLANNING_DISPATCH_FAILURE_SNIPPETS)
-def test_lint_requires_planning_phase_dispatch_failure_guard(tmp_path, snippet):
-    # Routing Codex into PlanSynthesisPending/PlanClaudeFinalizePending made
-    # the wait loop's `codex_dispatch_failed:` remedy reachable in phases the
-    # server rejects it in: `FailureReport` is gated on
-    # `Phase::is_coding_active()`, which covers only the four `Code*` phases.
-    # Dropping the phase split sends the dispatcher into a rejected send with
-    # no reachable exit.
+@pytest.mark.parametrize("snippet", DISPATCH_FAILURE_ADMISSIBILITY_SNIPPETS)
+def test_lint_requires_dispatch_failure_admissibility_guard(tmp_path, snippet):
+    # Routing Codex into new phases makes the wait loop's
+    # `codex_dispatch_failed:` remedy reachable in phases the server rejects it
+    # in. TWO gates apply and passing the first is not enough: the planning
+    # phases fail `Phase::is_coding_active()`, while `CodeReviewLocalPending`
+    # and `CodeReviewFinalPending` pass that check yet are still refused by
+    # `dispatch_failure_phase_admits` (it admits only `CodeImplementPending`
+    # with implementer=codex, and `CodeReviewFixGlobalPending`). Reasoning from
+    # `is_coding_active()` alone is what previously put those two phases in the
+    # "send it" bucket; under `pilot == "codex"` that sends the dispatcher into
+    # a rejected send with no reachable exit.
     fixture = copy_fixture(tmp_path)
     mutate(fixture / ".claude-plugin" / "commands" / "collab.md", snippet)
 
     r = run({"COLLAB_LINT_ROOT": str(fixture)})
 
     assert r.returncode == 1
-    assert (".claude-plugin/commands/collab.md: missing planning-phase "
-            f"dispatch-failure contract {snippet!r}") in r.stdout
+    assert (".claude-plugin/commands/collab.md: missing dispatch-failure "
+            f"admissibility contract {snippet!r}") in r.stdout
 
 
 @pytest.mark.parametrize("snippet", CODEX_PILOT_ROUTING_SNIPPETS)
