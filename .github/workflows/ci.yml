@@ -71,6 +71,9 @@ jobs:
       - name: installer self-test
         run: python3 scripts/test_install_ironmem.py
 
+      - name: ultrareview workflow self-test
+        run: node scripts/test_ultrareview_workflow.mjs
+
       - name: MCP wrapper drift check
         run: python3 scripts/sync_mcp_wrappers.py --check
 

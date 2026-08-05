@@ -288,6 +288,7 @@ def test_manifest_declaration_order_is_preserved():
         "rust_fmt_check",
         "rust_clippy",
         "rust_test",
+        "ultrareview_workflow_self_test",
     ]
 
 
@@ -302,6 +303,9 @@ def test_manifest_declaration_order_is_not_alphabetical():
 
 
 def test_manifest_matches_pre_commit_argv_and_order():
+    # Ported gates match the pre-Task-6 port unchanged, plus the Task 6
+    # (ultrareview v2) ultrareview_workflow_self_test gate appended at the
+    # end -- new, not ported, added alongside the harness it runs.
     expected = [
         ("python3", "scripts/test_run_git_hook.py"),
         ("bash", "scripts/install-git-hooks.sh", "--check"),
@@ -318,17 +322,20 @@ def test_manifest_matches_pre_commit_argv_and_order():
             "-D",
             "warnings",
         ),
+        ("node", "scripts/test_ultrareview_workflow.mjs"),
     ]
     actual = [gate.argv for gate in manifest.GATES if "pre-commit" in gate.phases]
     assert actual == expected
 
 
 def test_manifest_matches_pre_push_argv_and_order():
+    # Same appended-not-ported note as the pre-commit test above.
     expected = [
         ("python3", "scripts/test_run_git_hook.py"),
         ("python3", "scripts/check_collab_turn_templates.py"),
         ("python3", "scripts/check_skills_sync.py"),
         ("cargo", "test", "--workspace"),
+        ("node", "scripts/test_ultrareview_workflow.mjs"),
     ]
     actual = [gate.argv for gate in manifest.GATES if "pre-push" in gate.phases]
     assert actual == expected
@@ -355,6 +362,7 @@ def test_surfaces_contains_expected_ids():
         manifest.SURFACE_COLLAB_PROTOCOL,
         manifest.SURFACE_HOOK_SELF_TEST,
         manifest.SURFACE_SKILLS,
+        manifest.SURFACE_WORKFLOWS,
         manifest.SURFACE_DOCS,
         manifest.SURFACE_INERT_CONFIG,
     }
@@ -1258,6 +1266,7 @@ _SURFACE_EXAMPLE_PATH_FOR_TEST = {
     manifest.SURFACE_COLLAB_PROTOCOL: "docs/COLLAB.md",
     manifest.SURFACE_HOOK_SELF_TEST: "scripts/run_git_hook.py",
     manifest.SURFACE_SKILLS: "skills/iron-build/SKILL.md",
+    manifest.SURFACE_WORKFLOWS: ".claude-plugin/workflows/ultrareview.js",
 }
 
 _GATE_PHASE_PARAMS_FOR_TEST = [
@@ -2640,6 +2649,7 @@ _HOOK_SELF_TEST_ARGV = ("python3", "scripts/test_run_git_hook.py")
 _HOOK_INSTALL_CHECK_ARGV = ("bash", "scripts/install-git-hooks.sh", "--check")
 _COLLAB_LINT_ARGV = ("python3", "scripts/check_collab_turn_templates.py")
 _SKILLS_SYNC_ARGV = ("python3", "scripts/check_skills_sync.py")
+_ULTRAREVIEW_ARGV = ("node", "scripts/test_ultrareview_workflow.mjs")
 
 
 # --- main() -- end-to-end, one phase at a time: a Rust-only change selects
@@ -2714,6 +2724,7 @@ def test_main_pre_commit_git_failure_escalates_to_every_gate_never_zero_gates_ru
             _SKILLS_SYNC_ARGV: 0,
             _RUST_FMT_ARGV: 0,
             _RUST_CLIPPY_ARGV: 0,
+            _ULTRAREVIEW_ARGV: 0,
         }
     )
     monkeypatch.setattr(subprocess, "run", fake)
@@ -2732,6 +2743,7 @@ def test_main_pre_commit_git_failure_escalates_to_every_gate_never_zero_gates_ru
         list(_SKILLS_SYNC_ARGV),
         list(_RUST_FMT_ARGV),
         list(_RUST_CLIPPY_ARGV),
+        list(_ULTRAREVIEW_ARGV),
     ]
 
 
@@ -2756,6 +2768,7 @@ def test_main_pre_push_git_failure_escalates_to_every_gate(monkeypatch, capsys):
             _COLLAB_LINT_ARGV: 0,
             _SKILLS_SYNC_ARGV: 0,
             _RUST_TEST_ARGV: 0,
+            _ULTRAREVIEW_ARGV: 0,
         }
     )
     monkeypatch.setattr(subprocess, "run", fake)
@@ -2770,6 +2783,7 @@ def test_main_pre_push_git_failure_escalates_to_every_gate(monkeypatch, capsys):
         list(_COLLAB_LINT_ARGV),
         list(_SKILLS_SYNC_ARGV),
         list(_RUST_TEST_ARGV),
+        list(_ULTRAREVIEW_ARGV),
     ]
     # The @{u} fallback must never fire once unknown=True -- escalation, not
     # the manual-invocation fallback, is the fail-closed path here.
@@ -2837,6 +2851,7 @@ def test_main_pre_push_whitespace_only_stdin_escalates_and_never_reaches_fallbac
             _COLLAB_LINT_ARGV: 0,
             _SKILLS_SYNC_ARGV: 0,
             _RUST_TEST_ARGV: 0,
+            _ULTRAREVIEW_ARGV: 0,
         }
     )
     monkeypatch.setattr(subprocess, "run", fake)
@@ -2854,6 +2869,7 @@ def test_main_pre_push_whitespace_only_stdin_escalates_and_never_reaches_fallbac
         list(_COLLAB_LINT_ARGV),
         list(_SKILLS_SYNC_ARGV),
         list(_RUST_TEST_ARGV),
+        list(_ULTRAREVIEW_ARGV),
     ]
 
 
@@ -3153,6 +3169,59 @@ def test_skills_sync_gate_is_registered_for_both_phases():
     assert gate.surfaces == frozenset({manifest.SURFACE_SKILLS})
     assert gate.phases == frozenset({manifest.PHASE_PRE_COMMIT, manifest.PHASE_PRE_PUSH})
     assert gate.always is False
+
+
+# --- Task 6 (ultrareview v2): SURFACE_WORKFLOWS / is_workflow_path /
+# ultrareview_workflow_self_test gate ---------------------------------------
+
+
+def test_ultrareview_script_classifies_workflows():
+    assert (
+        manifest.classify_path(".claude-plugin/workflows/ultrareview.js")
+        == manifest.SURFACE_WORKFLOWS
+    )
+
+
+def test_workflows_surface_beats_the_generic_inert_config_catch_all():
+    # .claude-plugin is a gate-covered plugin root, so is_inert_config_path
+    # already yields for it -- but prove the positive: the path must reach
+    # SURFACE_WORKFLOWS specifically, not fall through to UNKNOWN.
+    path = ".claude-plugin/workflows/ultrareview.js"
+    assert manifest.is_inert_config_path(path) is False
+    assert manifest.classify_path(path) == manifest.SURFACE_WORKFLOWS
+
+
+def test_workflows_lookalike_paths_do_not_match():
+    # .github/workflows/*.yml must stay inert_config: `.github` does not end
+    # in `-plugin`, so it never reaches is_workflow_path's `.js`/`workflows`
+    # check regardless of the shared directory name.
+    assert manifest.is_workflow_path(".github/workflows/ci.yml") is False
+    assert manifest.classify_path(".github/workflows/ci.yml") == manifest.SURFACE_INERT_CONFIG
+    # A non-.js file in the same directory must not match either.
+    assert manifest.is_workflow_path(".claude-plugin/workflows/README.md") is False
+    # A plugin-root-shaped directory that isn't actually a plugin root must
+    # not match: same byte-exact-segment rule as the skills lookalikes.
+    assert manifest.is_workflow_path(".claude-plugin-backup/workflows/x.js") is False
+
+
+def test_ultrareview_workflow_self_test_gate_is_registered_for_both_phases():
+    gate = next(g for g in manifest.GATES if g.name == "ultrareview_workflow_self_test")
+    assert gate.argv == ("node", "scripts/test_ultrareview_workflow.mjs")
+    assert gate.surfaces == frozenset({manifest.SURFACE_WORKFLOWS})
+    assert gate.phases == frozenset({manifest.PHASE_PRE_COMMIT, manifest.PHASE_PRE_PUSH})
+    assert gate.always is False
+
+
+def test_ultrareview_workflow_edit_selects_its_own_gate():
+    # The end-to-end property: editing the workflow script must actually
+    # select the gate that tests it, in both hook phases -- not merely
+    # register a Gate object that resolve_gates never reaches.
+    gate = next(g for g in manifest.GATES if g.name == "ultrareview_workflow_self_test")
+    for phase in (manifest.PHASE_PRE_COMMIT, manifest.PHASE_PRE_PUSH):
+        changes = manifest.ChangeSet(
+            paths=(".claude-plugin/workflows/ultrareview.js",), unknown=False, reason=None
+        )
+        assert gate in manifest.resolve_gates(phase, changes)
 
 
 def _run_as_script() -> int:

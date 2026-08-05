@@ -96,15 +96,19 @@ to, not instead of, the normal `review_local`.
      source, Cargo manifests, lockfile, migrations, or runtime assets), use
      `review_local=reduced`.
    - If either check is uncertain, use `review_local=full`.
-4. In `review_local=full`, run `/ultrareview-local` auditing Codex's commits +
-   catching code-quality issues. Treat the review agents as read-only.
-   Independently verify the synthesized findings and keep only confirmed
-   CRITICAL/HIGH/MEDIUM issues.
+4. In `review_local=full`, run `/ultrareview-local --report-only` auditing
+   Codex's commits + catching code-quality issues. The flag is required, not
+   decorative: without it the command auto-fixes by default and dispatches
+   Edit-capable agents into this session's working tree before you have
+   verified a finding — and step 6 then cuts fix worktrees from, and step 7
+   pushes, a tree already carrying those edits. Treat the review agents as
+   read-only. Independently verify the synthesized findings and keep only
+   confirmed CRITICAL/HIGH/MEDIUM issues.
 5. In `review_local=reduced`, do a targeted read-only audit of the diff summary,
    changed files, and Codex commits for protocol drift, docs/config breakage,
    generated metadata inconsistencies, and security-sensitive configuration. Do
-   not invoke `/ultrareview-local` unless the reduced audit finds a substantive
-   uncertainty or a CRITICAL/HIGH/MEDIUM issue.
+   not invoke `/ultrareview-local --report-only` unless the reduced audit finds
+   a substantive uncertainty or a CRITICAL/HIGH/MEDIUM issue.
 6. Group confirmed findings into non-overlapping fix clusters. For multiple
    independent clusters, create one temporary worktree per cluster on a unique
    throwaway branch from the same review head and dispatch fix subagents in
