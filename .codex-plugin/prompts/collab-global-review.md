@@ -46,7 +46,15 @@ post-recovery `HEAD`, not `last_head_sha`: substitute it for `<last_head_sha>`
 in the review-input commands below, so you review `<base_sha>..<HEAD>` and the
 commits you just recovered are inside the range you review, and send that same
 `HEAD`. Reviewing the recorded range and sending a head beyond it makes the
-recovered work the session head with nobody having read it.
+recovered work the session head with nobody having read it. If you reached
+this path from the dirty-worktree check below rather than from a reported
+failure, a previous turn died without reporting it; after committing, record
+that once with
+`collab_send(sender="codex", topic="orphan_recovered",
+content=<JSON {"phase":"CodeReviewFixGlobalPending","recovered_sha":"<HEAD>",
+"detail":"<what you found>"}>)` — it records and returns without advancing the
+phase, changing owner, or spending a recovery attempt, so it is sent in
+addition to the normal completion event.
 
 For normal turns, enter the recorded `repo_path`, fetch the recorded
 branch, verify `last_head_sha` with `git cat-file -e`, then checkout the

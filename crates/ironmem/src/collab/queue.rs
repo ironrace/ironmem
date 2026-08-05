@@ -495,6 +495,48 @@ pub fn send_message(
     Ok(id)
 }
 
+/// Record a session incident that is not correspondence.
+///
+/// Unlike [`send_message`], the row is self-addressed and inserted with
+/// `status = 'recorded'` rather than the default `'pending'`. Both matter:
+/// [`recv_messages`] filters on `receiver = ? AND status = 'pending'`, so an
+/// incident addressed to the counterpart would be handed to the next worker
+/// that calls `collab_recv` — whose templates enforce a one-recv rule and
+/// expect a specific topic — corrupting that turn's input. This is a record
+/// for the session history, not a message to anyone.
+pub fn record_incident(
+    conn: &Connection,
+    session_id: &str,
+    agent: &str,
+    topic: &str,
+    content: &str,
+    drawer_id: &str,
+) -> Result<String, MemoryError> {
+    let id = Uuid::new_v4().to_string();
+    conn.execute(
+        "INSERT INTO messages
+           (id, session_id, sender, receiver, topic, content, drawer_id, status)
+         VALUES (?1, ?2, ?3, ?3, ?4, ?5, ?6, 'recorded')",
+        params![id, session_id, agent, topic, content, drawer_id],
+    )?;
+    Ok(id)
+}
+
+/// Count incidents of `topic` recorded against a session by
+/// [`record_incident`]. Counts regardless of `status` so a record can never be
+/// hidden by a future inbox-state change.
+pub fn count_incidents(
+    conn: &Connection,
+    session_id: &str,
+    topic: &str,
+) -> Result<i64, MemoryError> {
+    Ok(conn.query_row(
+        "SELECT COUNT(*) FROM messages WHERE session_id = ?1 AND topic = ?2",
+        params![session_id, topic],
+        |row| row.get(0),
+    )?)
+}
+
 pub fn recv_messages(
     conn: &Connection,
     session_id: &str,

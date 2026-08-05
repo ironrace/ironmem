@@ -248,8 +248,27 @@ pub(super) fn is_known_collab_topic(topic: &str) -> bool {
             | "review_fix_global"
             | "final_review"
             | "failure_report"
+            | ORPHAN_RECOVERED_TOPIC
     )
 }
+
+/// Topic recording that a turn found a dirty worktree on the NORMAL path and
+/// recovered work a previous turn left behind — evidence that the previous
+/// turn died without reporting (OOM, container kill, sandbox teardown), since
+/// a reported failure would have left `pending_failure` non-null.
+///
+/// Deliberately NOT a `failure_report`. A tooling failure parks the phase,
+/// hands the turn to the counterpart, and spends `recovery_attempts` against
+/// a ceiling of [`MAX_RECOVERY_ATTEMPTS`] — but the sender here has
+/// *succeeded*: it preserved the orphaned work, ran the gates, and is carrying
+/// its own turn to completion. Charging it a recovery attempt would let three
+/// successful recoveries exhaust a session's lifetime budget.
+///
+/// So this topic is non-advancing: it is recorded and returns before any
+/// `CollabEvent` is built, leaving phase, owner and both recovery counters
+/// untouched. [`super::collab_events::build_collab_event`] has no arm for it
+/// and must never gain one.
+pub(super) const ORPHAN_RECOVERED_TOPIC: &str = "orphan_recovered";
 
 /// Polling cadence for `collab_wait_my_turn`. Short enough that
 /// turn transitions feel immediate, long enough that idle waits don't
@@ -923,6 +942,43 @@ pub(super) fn handle_collab_send(app: &App, args: &Value) -> Result<Value, Memor
             )));
         }
 
+        // Non-advancing topic: record the incident and return before the event
+        // builder. Everything below this point mutates session state, and an
+        // orphan record must not — see ORPHAN_RECOVERED_TOPIC.
+        if topic == ORPHAN_RECOVERED_TOPIC {
+            let drawer_id = store_collab_message_drawer(tx, content)?;
+            let message_id = crate::collab::queue::record_incident(
+                tx,
+                session_id,
+                sender.as_str(),
+                topic,
+                content,
+                &drawer_id,
+            )?;
+            crate::db::schema::Database::wal_log_tx(
+                tx,
+                "collab_send",
+                &json!({
+                    "session_id": session_id,
+                    "sender": sender.as_str(),
+                    "topic": topic,
+                    "phase_before": phase_before,
+                }),
+                Some(&json!({
+                    "message_id": message_id,
+                    "phase": phase_before,
+                })),
+            )?;
+            // `save_session` is deliberately not called: the session row is
+            // returned to the caller exactly as it was loaded.
+            return Ok((
+                json!({ "message_id": message_id, "phase": phase_before }),
+                phase_before_enum,
+                phase_before_enum,
+                None,
+            ));
+        }
+
         let event = build_collab_event(topic, content, session.phase)?;
         let shortcut_ancestry = session.task_list.is_none()
             && matches!(
@@ -1286,6 +1342,12 @@ pub(super) fn handle_collab_status(app: &App, args: &Value) -> Result<Value, Mem
     let session_id = require_str(args, "session_id")?;
     let record = app.db.collab_load_session_record(session_id)?;
     let mut status = session_record_json(&record);
+    // Turns that recovered work a previous turn left behind. Non-zero means a
+    // turn died without reporting, so the session's own history understates
+    // how much went wrong — see ORPHAN_RECOVERED_TOPIC.
+    status["orphans_recovered"] = json!(app.db.with_connection(|conn| {
+        crate::collab::queue::count_incidents(conn, session_id, ORPHAN_RECOVERED_TOPIC)
+    })?);
     // `verbose` remains accepted for backwards-compatible requests, but plans
     // are always references: large plan bodies must never transit status.
     let include_task_list = args
@@ -4252,6 +4314,143 @@ mod tests {
                 "the counterpart's draft must appear once {waiting} has drafted"
             );
         }
+    }
+
+    /// The whole point of `orphan_recovered` is that it records an incident
+    /// without being one. A `failure_report` would park the phase, hand the
+    /// turn to the counterpart, and burn `recovery_attempts` against a ceiling
+    /// of 2 — but the worker sending this has *succeeded*: it preserved a dead
+    /// turn's work and is carrying on. Assert the entire mutable session record
+    /// is untouched, not just the phase, so a future change that quietly
+    /// advances a counter fails here.
+    #[test]
+    fn orphan_recovered_records_the_incident_without_advancing_the_session() {
+        let app = test_app();
+        let sid = start_session(&app);
+        send(&app, &sid, "claude", "draft", "claude draft");
+
+        let before = app.db.collab_load_session_record(&sid).unwrap().session;
+        send(
+            &app,
+            &sid,
+            "claude",
+            "orphan_recovered",
+            r#"{"phase":"PlanParallelDrafts","recovered_sha":"deadbeef",
+                "detail":"dirty worktree on a normal turn"}"#,
+        );
+        let after = app.db.collab_load_session_record(&sid).unwrap().session;
+
+        assert_eq!(before.phase, after.phase, "phase must not advance");
+        assert_eq!(
+            before.current_owner, after.current_owner,
+            "the turn must not change hands"
+        );
+        assert_eq!(
+            before.recovery_attempts, after.recovery_attempts,
+            "recording an orphan must not spend the recovery budget"
+        );
+        assert_eq!(
+            before.total_recovery_attempts, after.total_recovery_attempts,
+            "recording an orphan must not spend the lifetime recovery budget"
+        );
+        assert_eq!(
+            before.pending_failure, after.pending_failure,
+            "orphan_recovered is not a failure report"
+        );
+    }
+
+    /// A record nobody can see is not a record. `collab_status` is the one
+    /// surface the orchestrator and the human both read, so the incident count
+    /// has to show up there rather than only in the `messages` table.
+    #[test]
+    fn collab_status_surfaces_recorded_orphans() {
+        let app = test_app();
+        let sid = start_session(&app);
+        send(&app, &sid, "claude", "draft", "claude draft");
+
+        let clean = handle_collab_status(&app, &json!({ "session_id": &sid })).unwrap();
+        assert_eq!(
+            clean["orphans_recovered"], 0,
+            "a session with no incident must report zero, not null"
+        );
+
+        send(
+            &app,
+            &sid,
+            "claude",
+            "orphan_recovered",
+            r#"{"detail":"dirty worktree on a normal turn"}"#,
+        );
+
+        let after = handle_collab_status(&app, &json!({ "session_id": &sid })).unwrap();
+        assert_eq!(
+            after["orphans_recovered"], 1,
+            "the recorded incident must be visible from collab_status"
+        );
+    }
+
+    /// An orphan record is a record, not correspondence. If it landed in the
+    /// counterpart's inbox it would be handed to the next worker that calls
+    /// `collab_recv`, whose templates enforce a one-recv rule and expect a
+    /// specific topic — so a recovery incident would corrupt the next turn's
+    /// input.
+    #[test]
+    fn orphan_recovered_never_lands_in_either_inbox() {
+        let app = test_app();
+        let sid = start_session(&app);
+        send(&app, &sid, "claude", "draft", "claude draft");
+        send(
+            &app,
+            &sid,
+            "claude",
+            "orphan_recovered",
+            r#"{"detail":"dirty worktree on a normal turn"}"#,
+        );
+
+        for receiver in [Agent::Claude, Agent::Codex] {
+            assert!(
+                !inbox_topics(&app, &sid, receiver).contains(&"orphan_recovered".to_string()),
+                "{receiver} must not be delivered an orphan record"
+            );
+        }
+    }
+
+    /// Defense in depth: even if a future caller reaches the event builder with
+    /// this topic, there is no `CollabEvent` for it and there must never be.
+    #[test]
+    fn orphan_recovered_never_becomes_a_collab_event() {
+        let err = super::super::collab_events::build_collab_event(
+            "orphan_recovered",
+            "{}",
+            crate::collab::Phase::PlanParallelDrafts,
+        )
+        .expect_err("orphan_recovered must not construct an event");
+        assert!(
+            err.to_string().contains("orphan_recovered"),
+            "the rejection should name the topic, got: {err}"
+        );
+    }
+
+    /// It is the sender's own turn when they find the dirty worktree, so the
+    /// ordinary turn gate applies with no `failure_report`-style off-turn
+    /// carve-out.
+    #[test]
+    fn orphan_recovered_is_rejected_off_turn() {
+        let app = test_app();
+        let sid = start_session(&app);
+        send(&app, &sid, "claude", "draft", "claude draft");
+        send(&app, &sid, "codex", "draft", "codex draft");
+        // Synthesis is Claude's turn under the default pilot; Codex is off-turn.
+        let err = handle_collab_send(
+            &app,
+            &json!({ "session_id": &sid, "sender": "codex",
+                     "topic": "orphan_recovered", "content": "{}" }),
+        )
+        .expect_err("off-turn orphan_recovered must be rejected");
+        assert!(
+            err.to_string().contains("not your turn"),
+            "expected the standard turn gate, got: {err}"
+        );
     }
 
     #[test]

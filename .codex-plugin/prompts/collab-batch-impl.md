@@ -43,7 +43,14 @@ If `pending_failure` is non-null and Codex owns recovery — or a normal turn
 finds a dirty worktree (next paragraph) — preserve and inspect the current
 diff before any fetch, checkout, or reset, and skip the sync in the next
 paragraph entirely. Run this phase's gates, commit and push recovered work,
-and send the normal completion event exactly once.
+and send the normal completion event exactly once. If you reached this path
+from the dirty-worktree check below rather than from a reported failure, a
+previous turn died without reporting it; after committing, record that once
+with `collab_send(sender="codex", topic="orphan_recovered",
+content=<JSON {"phase":"CodeImplementPending","recovered_sha":"<HEAD>",
+"detail":"<what you found>"}>)` — it records and returns without advancing the
+phase, changing owner, or spending a recovery attempt, so it is sent in
+addition to the normal completion event.
 
 For a normal turn, read `last_head_sha`, `base_sha`, `repo_path`, branch,
 `task_list_ref`, and execution mode. Load the manifest with

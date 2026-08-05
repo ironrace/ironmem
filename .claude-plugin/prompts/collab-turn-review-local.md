@@ -2,7 +2,7 @@
 turn: review_local
 tier: review
 model: opus
-topics: [review_local, failure_report]
+topics: [review_local, failure_report, orphan_recovered]
 preconditions: phase == CodeReviewLocalPending, current_owner == claude
 ---
 
@@ -43,6 +43,15 @@ commands below, so you review `<base_sha>..<HEAD>` and the commits you just
 recovered are inside the range you review, and send that same `HEAD`.
 Reviewing the recorded range and sending a head beyond it makes the recovered
 work the session head with nobody having read it.
+
+If you reached this path from step 1's dirty-worktree check rather than from
+a reported failure, a previous turn died without reporting it. After you
+commit, record that once:
+`collab_send(sender="claude", topic="orphan_recovered",
+content=<JSON {"phase":"CodeReviewLocalPending","recovered_sha":"<HEAD>",
+"detail":"<what you found>"}>)`. It records and returns — it does not advance
+the phase, change owner, or spend a recovery attempt — so send it in addition
+to, not instead of, the normal `review_local`.
 
 ## Actions
 1. **Normal turns only — as recovery owner, skip the sync below and go

@@ -807,6 +807,28 @@ def test_lint_requires_the_recovery_owner_to_be_told_to_skip_the_sync(
     assert f"{name}: recovery owner is not told to skip the sync" in r.stdout
 
 
+@pytest.mark.parametrize("subdir,name", RESET_GUARD_PROMPTS)
+def test_lint_requires_the_orphan_recovery_to_be_reported(
+        tmp_path, subdir, name):
+    # Preserving the orphaned work is necessary but not sufficient. A turn
+    # that recovers it and then completes normally leaves status, event
+    # history and the human all seeing an ordinary turn — the lost turn is
+    # invisible. Every prompt that guards a reset must also record the
+    # incident with a non-advancing `orphan_recovered` send.
+    fixture = copy_fixture(tmp_path)
+    template = fixture / subdir / name
+    text = template.read_text()
+    assert 'topic="orphan_recovered"' in text, f"{name}: no report to mutate"
+    template.write_text(text.replace('topic="orphan_recovered"',
+                                     'topic="review_local"'))
+
+    r = run({"COLLAB_LINT_ROOT": str(fixture)})
+
+    assert r.returncode == 1
+    assert (f"{name}: a dirty worktree on a normal turn is never reported") \
+        in r.stdout
+
+
 def test_lint_rejects_a_precondition_stated_after_the_reset(tmp_path):
     # Substring membership has no ordering. A precondition that appears after
     # the reset it governs is not a precondition, and a pure-substring gate
