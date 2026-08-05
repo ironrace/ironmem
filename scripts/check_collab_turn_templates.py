@@ -293,27 +293,143 @@ REQUIRED_TEMPLATE_SNIPPETS = {
         "Send exactly once",
         "The canonical plan is your only review input.",
     ],
+    "collab-turn-review-local.md": [
+        "CodeReviewLocalPending",
+        # The reset guard itself is NOT pinned here. Substring pins assert that
+        # words exist somewhere in the file, not that the reset obeys them —
+        # parking these literals in an HTML comment while restoring an
+        # unconditional reset keeps every pin matching. `check_reset_guards`
+        # enforces the guard structurally instead; see RESET_GUARD_SURFACES.
+    ],
     "collab-turn-review-fix-global.md": [
         "CodeReviewFixGlobalPending",
         "/ultrareview-local",
         "the payload carries only",
         "Send exactly once:",
-        # The recovery owner's preserved working tree is the only copy of the
-        # interrupted work; a fetch/checkout/reset before inspecting it is
-        # unrecoverable data loss.
-        "preserve and inspect the working-tree diff *before* any fetch",
-        # That snippet lives in the recovery-owner paragraph, and the recovery
-        # owner never runs the reset. The agent that does is the NORMAL-turn
-        # owner, whose hazard is the opposite one: a prior turn that died hard
-        # (OOM, container kill, sandbox teardown) never sent `failure_report`,
-        # so `pending_failure` stays null, so the next dispatch correctly
-        # self-classifies as a normal turn — and resets away the only copy of
-        # the uncommitted fixes with nothing downstream registering the loss.
-        # The porcelain precondition must therefore bind unconditionally, not
-        # on `pending_failure`.
-        "`git status --porcelain` to be empty regardless of `pending_failure`",
+        # The reset guard is enforced structurally by `check_reset_guards`,
+        # not by substring pins — see RESET_GUARD_SURFACES for why.
     ],
 }
+# Prompts that instruct a worker to `git reset --hard`. Each one is a place a
+# turn can destroy the only copy of uncommitted work, so each is checked for a
+# guard by structure rather than by wording.
+#
+# Two distinct hazards, both of which the guard must cover:
+#
+#   1. The RECOVERY owner holds the interrupted turn's preserved working tree.
+#      It must be told to skip the sync outright; a fetch/checkout/reset before
+#      inspecting that tree is unrecoverable data loss.
+#   2. The NORMAL-turn owner faces the opposite case. A turn that died hard
+#      (OOM, container kill, sandbox teardown) never sent `failure_report`, so
+#      `pending_failure` stays null, so the next dispatch correctly
+#      self-classifies as a normal turn — and resets away the only copy of the
+#      uncommitted work with nothing downstream registering the loss. The
+#      cleanliness precondition must therefore bind unconditionally, never on
+#      `pending_failure`.
+#
+# Why this is not a REQUIRED_TEMPLATE_SNIPPETS entry: substring pins assert
+# that words appear somewhere in the file, not that the reset obeys them.
+# Issue #254's exact pre-fix template passes a pure-substring gate if the
+# pinned literals are parked in an HTML comment, and a template may state the
+# precondition and then override it ("if dirty, note it and continue anyway").
+# Both were verified green against a substring-only pin before this check
+# existed. Ordering and enforcement are the properties that matter, so they are
+# what gets checked.
+RESET_GUARD_SURFACES = (
+    ".claude-plugin/prompts/collab-turn-review-local.md",
+    ".claude-plugin/prompts/collab-turn-review-fix-global.md",
+    ".codex-plugin/prompts/collab-review-local.md",
+    # `collab-global-review.md` is the Codex mirror of
+    # `collab-turn-review-fix-global.md` and owns `CodeReviewFixGlobalPending`
+    # under the DEFAULT `pilot=claude`, so it is on the live default path.
+    # `collab-batch-impl.md` is `CodeImplementPending` under
+    # `implementer=codex` — the phase carrying the most uncommitted work and
+    # the highest hard-kill probability, since it runs a full `iron-build`
+    # batch. Both gated preservation on `pending_failure` with no cleanliness
+    # check until #257.
+    ".codex-plugin/prompts/collab-global-review.md",
+    ".codex-plugin/prompts/collab-batch-impl.md",
+)
+# The cleanliness precondition, in two forms. The bare form locates it; the
+# qualified form is what the file must actually carry.
+#
+# The qualifier is not decoration. Re-gating the precondition on
+# `pending_failure` ("...to be empty only when `pending_failure` is non-null")
+# IS issue #254 — the hard-killed turn never sent a `failure_report`, so
+# `pending_failure` is null precisely when the uncommitted work is at risk. The
+# positional checks below cannot see that mutation at all: it leaves the
+# precondition ahead of the reset, the enforcement clause intact and the reset
+# conditioned on a clean tree, so all four pass while the guard binds in
+# exactly the cases where it is not needed. This literal is therefore the one
+# part of the guard that is pinned by wording, and deliberately so.
+def flex(phrase: str) -> re.Pattern:
+    """A fixed phrase, matched across any run of whitespace.
+
+    Every clause below is prose inside a wrapped paragraph, so its line breaks
+    move whenever a word is added anywhere earlier in the sentence. Patterns
+    that hardcoded the wrap points present when they were written
+    (`do\\s*\\n?\\s*not run ...`) went silently unmatched the first time a
+    sentence was extended — reporting the guard as missing when it was only
+    reflowed. Whitespace-insensitive matching is the whole point of checking
+    prose by regex rather than by literal.
+    """
+    return re.compile(r"\s+".join(re.escape(w) for w in phrase.split()))
+
+
+RESET_GUARD_BARE_PRECONDITION_RE = flex("`git status --porcelain` to be empty")
+RESET_GUARD_PRECONDITION_RE = flex(
+    "`git status --porcelain` to be empty regardless of `pending_failure`")
+# `--porcelain` reports the working tree and the index. It is silent about work
+# that was committed but never pushed, and `git reset --hard <last_head_sha>`
+# discards those commits exactly as thoroughly as it discards an unstaged edit.
+# A turn that got far enough to commit before dying — the common case, since
+# `iron-build` commits per task — therefore leaves a tree the cleanliness check
+# calls clean and the reset then destroys. The ahead-count must be checked
+# alongside it, not instead of it: the two cover different halves of the same
+# hazard.
+RESET_GUARD_UNPUSHED_RE = flex(
+    "`git rev-list <last_head_sha>..HEAD` to be empty")
+RESET_GUARD_ENFORCEMENT_RE = flex("do not run `git reset --hard`")
+# Every one of these turns commits and pushes. `git fetch` + `git reset --hard`
+# does not move the checkout, so a turn that inherits whatever branch the
+# previous one left behind resets THAT branch to the session head and pushes
+# from it. `collab-turn-review-local.md` ordered the reset with no checkout at
+# all. The wording varies across the five surfaces ("`git checkout <branch>`",
+# "checkout the session branch", "checkout the session `branch`"), so this
+# matches the verb and its object rather than any one phrasing.
+RESET_GUARD_CHECKOUT_RE = re.compile(
+    r"(`git checkout <branch>`|checkout[^.]{0,40}?branch)", re.IGNORECASE)
+RESET_GUARD_CONDITIONAL_RE = re.compile(
+    flex("Only when the worktree is clean").pattern, re.IGNORECASE)
+RESET_GUARD_RECOVERY_SKIP_RE = re.compile("|".join(
+    flex(p).pattern for p in ("skip the sync", "skip this step entirely",
+                              "skip only the")), re.IGNORECASE)
+# Not every `git reset --hard` in a template is an instruction to reset. Two
+# kinds are the guard talking about the reset rather than ordering one, and
+# both legitimately precede the precondition:
+#   - the prohibition itself ("do not run `git reset --hard`")
+#   - the recovery owner's skip list ("Skip only the `git fetch`, the
+#     checkout, and the `git reset --hard` in the next paragraph")
+# Exempting them by surrounding context keeps the ordering rule strict for
+# every occurrence that IS an instruction, rather than weakening it to "the
+# last one wins" — which would let a guarded reset be followed by an
+# unguarded one.
+RESET_MENTION_EXEMPT_RE = re.compile(
+    "(" + RESET_GUARD_ENFORCEMENT_RE.pattern + "|"
+    + flex("Skip only the").pattern
+    + r"[^.]{0,80}?`git reset --hard`)", re.IGNORECASE)
+# How far before a reset instruction its "only when the worktree is clean"
+# clause may sit. The conditional is checked per-reset rather than
+# file-globally: a single conditional anywhere in the file satisfied a
+# file-global search no matter how many further resets followed it, so
+# appending `Later: just `git reset --hard <last_head_sha>` no matter what.`
+# to a fully guarded template linted green. In every shipped surface the
+# clause reads "Only when the worktree is clean, `git reset --hard ...`" —
+# three characters of separator, possibly wrapped — so this bound is generous
+# enough for rewrapping and far too tight for an unrelated conditional
+# elsewhere in the file to be borrowed by a later reset.
+RESET_CONDITIONAL_PROXIMITY = 40
+HTML_COMMENT_RE = re.compile(r"<!--.*?-->", re.DOTALL)
 FORBIDDEN_TEMPLATE_SNIPPETS = {
     "collab-turn-plan-synthesis.md": [
         "read Codex's draft",
@@ -519,6 +635,165 @@ def check_review_diff_fallback_contract() -> None:
     for path, snippets in REVIEW_DIFF_FALLBACK_SURFACES.items():
         if not path.exists() or any(snippet not in path.read_text() for snippet in snippets):
             err(f"{path.relative_to(ROOT)}: missing review-diff fallback contract")
+
+
+def check_reset_guards() -> None:
+    """Every `git reset --hard` instruction must be structurally guarded.
+
+    Checked by position, not by wording, so the guard survives rephrasing and
+    cannot be satisfied by text that merely mentions it. HTML comments are
+    stripped first: parking the required phrases in a comment while leaving an
+    unconditional reset in the body is exactly how issue #254's pre-fix
+    template passes a substring-only gate.
+
+    Position is checked against EVERY non-exempt reset, not just the first.
+    A guard that only has to precede the earliest occurrence is satisfied by a
+    fully guarded step 1 followed by a bare reset anywhere later in the file,
+    and — since the clauses were otherwise searched file-globally — by demoting
+    the whole guard to a trailing "historical note" below an unconditional
+    reset. Both linted green while the executable path reset unconditionally.
+
+    The one wording pin that remains is the precondition's
+    "regardless of `pending_failure`" qualifier; see
+    RESET_GUARD_PRECONDITION_RE for why no positional check can replace it.
+    """
+    for rel in RESET_GUARD_SURFACES:
+        path = ROOT / rel
+        if not path.exists():
+            err(f"{rel}: missing reset-guard surface")
+            continue
+        text = HTML_COMMENT_RE.sub("", path.read_text())
+        exempt = [m.span() for m in RESET_MENTION_EXEMPT_RE.finditer(text)]
+        resets = [m.start() for m in re.finditer(r"git reset --hard", text)
+                  if not any(s <= m.start() < e for s, e in exempt)]
+        if not resets:
+            err(f"{rel}: expected a `git reset --hard` instruction to guard; "
+                "if the reset was removed, drop this file from "
+                "RESET_GUARD_SURFACES")
+            continue
+        first_reset = min(resets)
+        pre = RESET_GUARD_PRECONDITION_RE.search(text)
+        if not RESET_GUARD_BARE_PRECONDITION_RE.search(text):
+            err(f"{rel}: no `git status --porcelain` cleanliness precondition "
+                "guarding `git reset --hard`")
+        elif not pre:
+            err(f"{rel}: `git status --porcelain` precondition does not bind "
+                "unconditionally — expected \"to be empty regardless of "
+                "`pending_failure`\". A turn killed hard never sends a "
+                "`failure_report`, so `pending_failure` is null in exactly "
+                "the case the guard exists for (issue #254)")
+        elif pre.start() > first_reset:
+            # Substring membership has no ordering; a precondition stated after
+            # the reset it governs is not a precondition.
+            err(f"{rel}: `git status --porcelain` precondition appears after "
+                "the `git reset --hard` it must guard")
+        for label, pattern, diagnostic in (
+            ("checkout", RESET_GUARD_CHECKOUT_RE,
+             "does not check out the session branch before resetting — this "
+             "turn commits and pushes, and `git reset --hard` moves whatever "
+             "branch the previous turn happened to leave checked out"),
+            ("unpushed-commit", RESET_GUARD_UNPUSHED_RE,
+             "cleanliness precondition covers only the working tree — expected "
+             "`git rev-list <last_head_sha>..HEAD` to be empty alongside it, "
+             "since `--porcelain` is empty for committed-but-unpushed work "
+             "that the reset discards just the same"),
+            ("enforcement", RESET_GUARD_ENFORCEMENT_RE,
+             "cleanliness precondition states no consequence — expected an "
+             "explicit \"do not run `git reset --hard`\""),
+            ("recovery skip", RESET_GUARD_RECOVERY_SKIP_RE,
+             "recovery owner is not told to skip the sync"),
+        ):
+            match = pattern.search(text)
+            if not match:
+                err(f"{rel}: {diagnostic}")
+            elif match.start() > first_reset:
+                err(f"{rel}: the {label} clause appears after the "
+                    "`git reset --hard` it must govern")
+        # The conditional binds per reset: each instruction needs its own
+        # "only when the worktree is clean" immediately ahead of it.
+        conditionals = [m.end() for m in RESET_GUARD_CONDITIONAL_RE.finditer(text)]
+        unguarded = [r for r in resets if not any(
+            0 <= r - end <= RESET_CONDITIONAL_PROXIMITY for end in conditionals)]
+        if unguarded:
+            err(f"{rel}: {len(unguarded)} of {len(resets)} `git reset --hard` "
+                "instructions are not conditioned on a clean worktree — "
+                'expected "Only when the worktree is clean" immediately '
+                f"before each (first unguarded at offset {min(unguarded)})")
+
+
+# The four review turns whose reviewed range is `base_sha..last_head_sha` read
+# from `collab_status`, but whose completion event sends the CURRENT HEAD. A
+# recovery owner commits the work it recovered, so its HEAD moves past the
+# recorded `last_head_sha` — and reviewing the recorded range while sending a
+# head beyond it promotes those commits to session head with nobody having read
+# them. `collab-batch-impl.md` is deliberately absent: it implements rather than
+# reviews, and the head it sends is reviewed afterwards at `review_fix_global`.
+#
+# Pinned by literal rather than by structure, because the property is a
+# statement about which SHA the worker feeds two later steps — there is no
+# position or ordering in the file that distinguishes stating it from not. The
+# sentence is therefore identical in all four surfaces, so one pin covers them.
+REVIEW_RANGE_RECOVERY_SURFACES = (
+    ".claude-plugin/prompts/collab-turn-review-local.md",
+    ".claude-plugin/prompts/collab-turn-review-fix-global.md",
+    ".codex-plugin/prompts/collab-review-local.md",
+    ".codex-plugin/prompts/collab-global-review.md",
+)
+REVIEW_RANGE_RECOVERY_SNIPPETS = [
+    "the review range head is your post-recovery `HEAD`, not `last_head_sha`",
+    # Naming the substitution site matters as much as naming the rule: the
+    # review-input commands below it spell `--head <last_head_sha>` literally,
+    # and are themselves pinned verbatim by REVIEW_DIFF_FALLBACK_SURFACES.
+    "substitute it for `<last_head_sha>` in the review-input commands below",
+    "so you review `<base_sha>..<HEAD>`",
+    "makes the recovered work the session head with nobody having read it",
+]
+# `collab-batch-impl.md`'s fast path returns before the reset, so
+# `check_reset_guards` never reaches it — and the state it skips ahead from is
+# precisely the post-OOM one: HEAD still at `last_head_sha`, branch correct,
+# tree dirty. Nothing is destroyed there, but the batch is then built on top of
+# the dead turn's unrecovered work. Matched by proximity so the condition has
+# to sit in the fast-path sentence itself, not merely somewhere in the file.
+FAST_PATH_RE = re.compile(r"take the fast path")
+FAST_PATH_CLEANLINESS_RE = re.compile(r"`git status --porcelain` is empty")
+FAST_PATH_PROXIMITY = 200
+
+
+def check_review_range_after_recovery() -> None:
+    """A recovery owner must review the range it is about to send."""
+    for rel in REVIEW_RANGE_RECOVERY_SURFACES:
+        path = ROOT / rel
+        if not path.exists():
+            err(f"{rel}: missing review-range surface")
+            continue
+        text = HTML_COMMENT_RE.sub("", path.read_text())
+        for snippet in REVIEW_RANGE_RECOVERY_SNIPPETS:
+            if snippet.replace("\n", " ") not in " ".join(text.split()):
+                err(f"{rel}: recovered commits are not brought into the "
+                    f"reviewed range — missing {snippet!r}")
+
+
+def check_batch_impl_fast_path_cleanliness() -> None:
+    """The implement turn's fast path must require a clean tree too."""
+    rel = ".codex-plugin/prompts/collab-batch-impl.md"
+    path = ROOT / rel
+    if not path.exists():
+        err(f"{rel}: missing fast-path surface")
+        return
+    text = HTML_COMMENT_RE.sub("", path.read_text())
+    fast = FAST_PATH_RE.search(text)
+    if not fast:
+        err(f"{rel}: expected a fast path to guard; if it was removed, drop "
+            "this check")
+        return
+    window = text[fast.end():fast.end() + FAST_PATH_PROXIMITY]
+    if not FAST_PATH_CLEANLINESS_RE.search(window):
+        err(f"{rel}: the fast path is not conditioned on a clean worktree — "
+            "expected \"`git status --porcelain` is empty\" among its "
+            "conditions. HEAD at `last_head_sha` on the right branch with a "
+            "dirty tree is the post-OOM state, and the fast path skips the "
+            "reset, so the guard below never runs and the batch builds on "
+            "top of the dead turn's unrecovered work")
 
 
 def check_review_diff_trigger_detection_contract() -> None:
@@ -1312,6 +1587,9 @@ def main() -> int:
     check_no_uninstalled_skill_references()
     check_evaluate_issue_surfaces()
     check_review_diff_fallback_contract()
+    check_reset_guards()
+    check_review_range_after_recovery()
+    check_batch_impl_fast_path_cleanliness()
     check_topic_template_completeness()
     check_installer_covers_templates()
     check_precondition_phase_names()

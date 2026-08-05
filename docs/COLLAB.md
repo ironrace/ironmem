@@ -1423,19 +1423,59 @@ before each coding-active `collab_send`:
 - **Pre-send harness fast-path.** Before running `git fetch`, `git checkout`,
   and `git reset --hard` to sync the working tree to `last_head_sha`, the
   harness first checks: is `git rev-parse HEAD` already equal to
-  `last_head_sha` AND is the current branch already the session branch? When
-  both hold, steps 3 (`git fetch`) and 5 (`git checkout` + `git reset
-  --hard`) are skipped entirely. The `git cat-file -e` sanity check (step 4)
-  still runs because the commit is already local. This avoids a network
-  round-trip and a working-tree reset on the common case where the agent is
-  already at the right SHA — for example, entering the batch-impl turn
-  immediately after `task_list` is sent.
+  `last_head_sha`, is the current branch already the session branch, AND is
+  `git status --porcelain` empty? When all three hold, steps 3 (`git fetch`)
+  and 5 (`git checkout` + `git reset --hard`) are skipped entirely. The
+  `git cat-file -e` sanity check (step 4) still runs because the commit is
+  already local. This avoids a network round-trip and a working-tree reset on
+  the common case where the agent is already at the right SHA — for example,
+  entering the batch-impl turn immediately after `task_list` is sent.
+  Cleanliness is a condition of the fast path and not only of the reset:
+  "HEAD at `last_head_sha`, branch correct, tree dirty" is precisely the state
+  an in-container OOM leaves behind, and a two-condition fast path skips the
+  reset — destroying nothing — only to build the next turn on top of the dead
+  turn's unrecovered work. A dirty tree here takes the preservation path
+  below.
 - **Recovery turns preserve the diff.** If `pending_failure` is non-null and
   the current harness owns the session, it is recovering an interrupted turn.
   It must inspect the existing worktree and run that phase's gates before
   fetching, checking out, or resetting; ordinary pre-send synchronization may
   discard the reporter's uncommitted recovery diff. It then commits/pushes and
   sends the interrupted phase's normal completion event.
+- **A clean worktree is an unconditional precondition of the reset.**
+  Preservation must never be gated on `pending_failure` alone. A turn that
+  dies hard — OOM, container kill, sandbox teardown — never sends a
+  `failure_report`, so `pending_failure` stays null and the next dispatch
+  correctly self-classifies as a *normal* turn. Immediately before
+  `git reset --hard`, the harness must therefore require
+  `git status --porcelain` to be empty regardless of `pending_failure`. A
+  dirty worktree at that point is evidence of an unreported death, not of an
+  empty turn: do not reset, and take the preservation path above instead.
+  Without this, a normal turn destroys the only copy of the dead turn's
+  uncommitted work with nothing downstream registering the loss.
+  `scripts/check_collab_turn_templates.py` enforces this structurally
+  (`check_reset_guards`) on every prompt that orders a reset.
+- **Cleanliness also means "no unpushed commits."** `--porcelain` reports the
+  working tree and the index; it is silent about work that was committed but
+  never pushed, and `git reset --hard <last_head_sha>` discards those commits
+  just as completely. Since `iron-build` commits per task, a turn killed
+  partway through is likelier to leave committed work than unstaged work. The
+  harness must therefore require `git rev-list <last_head_sha>..HEAD` to be
+  empty alongside the porcelain check, and treat either one failing as the
+  same unreported death.
+- **The reset needs a checkout in front of it.** `git fetch` plus
+  `git reset --hard` never moves the checkout, so a turn that inherits
+  whatever branch its predecessor left behind resets *that* branch to the
+  session head and pushes from it. Every phase that orders a reset also
+  commits and pushes, so every one of them must check out the session branch
+  first.
+- **A recovery owner reviews the range it is about to send.** The review
+  turns audit `base_sha..last_head_sha` as read from `collab_status`, but
+  their completion event carries the *current* head. A recovery owner commits
+  what it recovered, so its head moves past the recorded `last_head_sha` —
+  and reviewing the recorded range while sending a head beyond it promotes
+  those commits to session head with nobody having read them. After
+  recovering, the review range head is the post-recovery `HEAD`.
 - **Subagent orchestration** during `CodeImplementPending`. Claude's final
   planning gate produces the approved task markdown, and the PlanLocked
   bridge publishes it via `task_list`. The selected `implementer` then runs
