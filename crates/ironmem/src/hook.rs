@@ -2815,6 +2815,38 @@ mod tests {
         }
     }
 
+    /// Count the prompt hook's occupancy rows for `session_id`, waiting for an
+    /// in-flight worker rather than reading once.
+    ///
+    /// `sample_prompt_occupancy` hands the insert to a thread and waits only
+    /// `PROMPT_HOOK_OCCUPANCY_RESERVE_MS` (30ms) on `recv_timeout`, then abandons
+    /// it — see the same race documented in
+    /// `prompt_hook_occupancy_sampler_honors_remaining_budget_under_lock`. On a
+    /// loaded runner (a rollback-journal fsync on CI's disk alone can exceed
+    /// 30ms) the hook returns with the row still in flight, so an immediate read
+    /// sees 0. The worker is abandoned, not killed, so the row lands shortly
+    /// after. Waiting keeps these tests asserting the write contract instead of
+    /// a 30ms wall-clock deadline.
+    fn wait_for_occupancy_rows(path: &std::path::Path, session_id: &str, want: i64) -> i64 {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let db = crate::db::schema::Database::open(path).unwrap();
+            let n: i64 = db
+                .with_connection(|c| {
+                    Ok(c.query_row(
+                        "SELECT COUNT(*) FROM occupancy_samples WHERE hook_event = 'user-prompt-submit' AND session_id = ?1",
+                        [session_id],
+                        |r| r.get(0),
+                    )?)
+                })
+                .unwrap();
+            if n >= want || Instant::now() >= deadline {
+                return n;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
     #[test]
     fn prompt_hook_injects_relevant_summary_without_embedder() {
         let _prompt = prompt_hook_tunable_defaults();
@@ -3062,12 +3094,7 @@ mod tests {
         )
         .unwrap();
 
-        let db = crate::db::schema::Database::open(&db_path).unwrap();
-        let n: i64 = db.with_connection(|c| {
-            Ok(c.query_row(
-                "SELECT COUNT(*) FROM occupancy_samples WHERE hook_event = 'user-prompt-submit' AND session_id = 'occ-1'",
-                [], |r| r.get(0))?)
-        }).unwrap();
+        let n = wait_for_occupancy_rows(&db_path, "occ-1", 1);
         assert_eq!(n, 1);
         std::env::remove_var("IRONMEM_METRICS");
     }
@@ -3114,12 +3141,7 @@ mod tests {
         )
         .unwrap();
 
-        let db = crate::db::schema::Database::open(&db_path).unwrap();
-        let n: i64 = db.with_connection(|c| {
-            Ok(c.query_row(
-                "SELECT COUNT(*) FROM occupancy_samples WHERE hook_event = 'user-prompt-submit' AND session_id = 'ro-occ-1'",
-                [], |r| r.get(0))?)
-        }).unwrap();
+        let n = wait_for_occupancy_rows(&db_path, "ro-occ-1", 1);
         assert_eq!(n, 1, "ReadOnly UPS hook must still bank occupancy");
         std::env::remove_var("IRONMEM_METRICS");
     }
