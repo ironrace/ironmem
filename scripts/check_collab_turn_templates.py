@@ -293,6 +293,28 @@ REQUIRED_TEMPLATE_SNIPPETS = {
         "Send exactly once",
         "The canonical plan is your only review input.",
     ],
+    "collab-turn-review-local.md": [
+        "CodeReviewLocalPending",
+        # Same protocol position as `collab-turn-review-fix-global.md` below,
+        # same reset, same hazard — and this template shipped without either
+        # half of the guard. Under the default `pilot=claude` it IS the
+        # dispatched template for `CodeReviewLocalPending`, so the gap was live.
+        #
+        # Half one: the recovery owner's preserved working tree is the only
+        # copy of the interrupted work, so preservation must be sequenced
+        # ahead of any git state change, not merely mentioned near it.
+        "preserve and inspect the working-tree diff *before* any fetch",
+        # Half two: that snippet lives in the recovery-owner paragraph, and the
+        # recovery owner never runs the reset. The agent that does is the
+        # NORMAL-turn owner, whose hazard is the opposite one: a prior turn
+        # that died hard (OOM, container kill, sandbox teardown) never sent
+        # `failure_report`, so `pending_failure` stays null, so the next
+        # dispatch correctly self-classifies as a normal turn — and resets away
+        # the only copy of the uncommitted fixes with nothing downstream
+        # registering the loss. The porcelain precondition must therefore bind
+        # unconditionally, not on `pending_failure`.
+        "`git status --porcelain` to be empty regardless of `pending_failure`",
+    ],
     "collab-turn-review-fix-global.md": [
         "CodeReviewFixGlobalPending",
         "/ultrareview-local",

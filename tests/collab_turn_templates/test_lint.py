@@ -569,6 +569,50 @@ def test_lint_requires_the_unconditional_dirty_worktree_guard(tmp_path):
             "`pending_failure`'") in r.stdout
 
 
+def test_lint_requires_the_dirty_worktree_guard_in_review_local(tmp_path):
+    # `collab-turn-review-local.md` sits at the same protocol position as
+    # `collab-turn-review-fix-global.md` above and carries the same reset, but
+    # shipped with neither half of the guard while its Claude sibling and its
+    # Codex mirror both had it. Under the default `pilot=claude` this is the
+    # dispatched template for `CodeReviewLocalPending`, so the gap was live.
+    fixture = copy_fixture(tmp_path)
+    template = (fixture / ".claude-plugin" / "prompts" /
+                "collab-turn-review-local.md")
+    guard = "`git status --porcelain` to be empty regardless of `pending_failure`"
+    text = template.read_text()
+    assert guard in text, "porcelain precondition not found to mutate"
+    template.write_text(text.replace(
+        guard, "`git status --porcelain` to be empty when `pending_failure`", 1))
+
+    r = run({"COLLAB_LINT_ROOT": str(fixture)})
+
+    assert r.returncode == 1
+    assert ("collab-turn-review-local.md: missing required contract "
+            "snippet '`git status --porcelain` to be empty regardless of "
+            "`pending_failure`'") in r.stdout
+
+
+def test_lint_requires_review_local_preservation_to_precede_any_reset(tmp_path):
+    # The recovery half. Mutating back to the exact pre-fix wording — which
+    # said "inspect the preserved diff" with no ordering constraint, three
+    # lines above an unconditional reset — must fail the lint.
+    fixture = copy_fixture(tmp_path)
+    template = (fixture / ".claude-plugin" / "prompts" /
+                "collab-turn-review-local.md")
+    ordering = ("preserve and inspect the working-tree diff *before* any "
+                "fetch, checkout,\nor reset;")
+    text = template.read_text()
+    assert ordering in text, "recovery ordering constraint not found to mutate"
+    template.write_text(text.replace(ordering, "inspect the\npreserved diff;", 1))
+
+    r = run({"COLLAB_LINT_ROOT": str(fixture)})
+
+    assert r.returncode == 1
+    assert ("collab-turn-review-local.md: missing required contract "
+            "snippet 'preserve and inspect the working-tree diff *before* "
+            "any fetch'") in r.stdout
+
+
 def test_lint_requires_retry_safe_split_contract(tmp_path):
     fixture = copy_fixture(tmp_path)
     prompt = fixture / ".claude-plugin" / "commands" / "evaluate-issue.md"
