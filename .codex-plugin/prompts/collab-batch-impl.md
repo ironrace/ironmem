@@ -49,13 +49,22 @@ For a normal turn, read `last_head_sha`, `base_sha`, `repo_path`, branch,
 `task_list_ref`, and execution mode. Load the manifest with
 `get_drawer(id=<task_list_ref.drawer_id>)`, then verify its SHA-256 against
 `task_list_ref.hash`; do not request `include_task_list`. Work in `repo_path`.
-First take the fast path when
-both local HEAD equals `last_head_sha` and the checked-out branch equals the
-session branch. Otherwise fetch the branch, verify the SHA with
+First take the fast path when all three hold: local HEAD equals
+`last_head_sha`, the checked-out branch equals the session branch, and
+`git status --porcelain` is empty. Cleanliness is a condition of the fast path
+and not only of the reset: the state after an in-container OOM is exactly
+"HEAD still at `last_head_sha`, branch correct, tree dirty", so a two-condition
+fast path skips the reset — destroying nothing — and then builds this batch on
+top of the dead turn's unrecovered work, silently merging it into yours. A
+dirty tree here takes the recovery path above instead. Otherwise fetch the
+branch, verify the SHA with
 `git cat-file -e` and checkout the session branch. If the SHA is absent, send
 `failure_report` with detailed `branch_drift:` and exit. Immediately before
 resetting, require `git status --porcelain` to be empty regardless of
-`pending_failure`: a dirty worktree here means a prior turn died without
+`pending_failure`, and require `git rev-list <last_head_sha>..HEAD` to be empty
+as well: `--porcelain` says nothing about work that was committed but never
+pushed, and the reset discards it just the same. Either check failing means a
+prior turn died without
 reporting `pending_failure` (OOM, container kill, sandbox teardown), not that
 there is nothing to recover — do not run `git reset --hard`; instead preserve
 and inspect the diff on the recovery path above, which covers this case too.

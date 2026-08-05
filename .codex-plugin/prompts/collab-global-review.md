@@ -41,14 +41,22 @@ finds a dirty worktree (next paragraph) — preserve and inspect the
 working-tree diff before any fetch, checkout, or reset, and skip the sync in
 the next paragraph entirely. Complete the interrupted phase's gates, commit
 and push recovered work, then send that phase's normal completion event
-exactly once.
+exactly once. When you recovered work, the review range head is your
+post-recovery `HEAD`, not `last_head_sha`: substitute it for `<last_head_sha>`
+in the review-input commands below, so you review `<base_sha>..<HEAD>` and the
+commits you just recovered are inside the range you review, and send that same
+`HEAD`. Reviewing the recorded range and sending a head beyond it makes the
+recovered work the session head with nobody having read it.
 
 For normal turns, enter the recorded `repo_path`, fetch the recorded
 branch, verify `last_head_sha` with `git cat-file -e`, then checkout the
 branch. If the commit is unavailable, send a terminal `failure_report` whose
 `coding_failure` starts `branch_drift:` and exit. Immediately before
 resetting, require `git status --porcelain` to be empty regardless of
-`pending_failure`: a dirty worktree here means a prior turn died without
+`pending_failure`, and require `git rev-list <last_head_sha>..HEAD` to be
+empty as well: `--porcelain` says nothing about work that was committed but
+never pushed, and the reset discards it just the same. Either check failing
+means a prior turn died without
 reporting `pending_failure` (OOM, container kill, sandbox teardown), not that
 there is nothing to recover — do not run `git reset --hard`; instead preserve
 and inspect the diff on the recovery path above, which covers this case too.

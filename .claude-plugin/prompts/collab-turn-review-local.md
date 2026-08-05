@@ -13,10 +13,14 @@ preconditions: phase == CodeReviewLocalPending, current_owner == claude
 > paste the review report.
 
 ## State discovery
-1. `collab_status(session_id=$SESSION_ID)`; read `last_head_sha`,
-   `pending_failure`. A non-null `pending_failure` means you are the
-   **recovery owner** for an interrupted turn, not simply the next-in-line
-   owner — see "Recoverable vs terminal failures" below before proceeding.
+1. `collab_status(session_id=$SESSION_ID)`; read `repo_path`, `branch`,
+   `base_sha`, `last_head_sha`, and `pending_failure`. A non-null
+   `pending_failure` means you are the **recovery owner** for an interrupted
+   turn, not simply the next-in-line owner — see "Recoverable vs terminal
+   failures" below before proceeding. A null `pending_failure` does not prove
+   the previous turn finished: a turn killed hard never sends a
+   `failure_report`, so the cleanliness check in Actions step 1 routes you
+   onto that same recovery path.
 
 ## Recoverable vs terminal failures
 
@@ -32,20 +36,31 @@ instead of ending the session: `git_commit_failed:`, `git_push_failed:`,
 turn and found a dirty worktree (step 1) —
 preserve and inspect the working-tree diff before any fetch, checkout, or
 reset; run this turn's gates yourself, commit + push, then send the
-normal `review_local` (never a new `failure_report`).
+normal `review_local` (never a new `failure_report`). When you recovered
+work, the review range head is your post-recovery `HEAD`, not
+`last_head_sha`: substitute it for `<last_head_sha>` in the review-input
+commands below, so you review `<base_sha>..<HEAD>` and the commits you just
+recovered are inside the range you review, and send that same `HEAD`.
+Reviewing the recorded range and sending a head beyond it makes the recovered
+work the session head with nobody having read it.
 
 ## Actions
 1. **Normal turns only — as recovery owner, skip the sync below and go
-   straight to the gates at the end of this step.** Pre-send harness:
-   `git fetch`; `git cat-file -e <last_head_sha>^{commit}` (on miss →
-   `failure_report` `branch_drift:...`). Immediately before resetting,
+   straight to the gates at the end of this step.** Pre-send harness: work in
+   `repo_path`; `git fetch`; `git cat-file -e <last_head_sha>^{commit}` (on
+   miss → `failure_report` `branch_drift:...`); `git checkout <branch>` —
+   this turn commits and pushes, so it must be on the session branch, not on
+   whatever the previous turn left checked out. Immediately before resetting,
    require `git status --porcelain` to be empty regardless of
-   `pending_failure`: a dirty worktree here means a prior turn died without
-   reporting `pending_failure` (OOM, container kill, sandbox teardown), not
-   that there is nothing to recover — do not run `git reset --hard`; instead
-   preserve and inspect the diff on the recovery path above, which covers
-   this case too. Only when the worktree is clean, `git reset --hard
-   <last_head_sha>` (Codex pushed at `review_fix_global`).
+   `pending_failure`, and require `git rev-list <last_head_sha>..HEAD` to be
+   empty as well: `--porcelain` says nothing about work that was committed
+   but never pushed, and the reset discards it just the same. Either check
+   failing means a prior turn died without reporting `pending_failure` (OOM,
+   container kill, sandbox teardown), not that there is nothing to recover —
+   do not run `git reset --hard`; instead preserve and inspect the diff on
+   the recovery path above, which covers this case too. Only when the
+   worktree is clean, `git reset --hard <last_head_sha>` (Codex pushed at
+   `review_fix_global`).
    **Both normal and recovery turns** then run this turn's gates:
    `cargo fmt --check` + `clippy -D warnings`.
 2. Prepare the normal review input before choosing depth. First attempt:
