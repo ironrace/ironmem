@@ -881,6 +881,230 @@ DOC_PILOT_SUBMIT_SNIPPETS = [
 ]
 
 
+def command_section(text: str, heading: str) -> str | None:
+    """The body of one `## ` section, heading line included.
+
+    The `--pilot` parsing contract has to hold in EACH of the three subcommand
+    sections, and each of them states it in its own words about its own
+    positional (`<task>`, `<session_id>`, `<short-topic>`). A file-wide
+    substring search cannot tell "all three sections carry the rule" from
+    "`start` carries it three times", which is exactly the regression this
+    guards: the flags were added to `start` first, and `join`/`review` were
+    left parsing the old way for several revisions.
+    """
+    body: list[str] = []
+    inside = False
+    for line in text.splitlines(keepends=True):
+        if line.startswith("## "):
+            if inside:
+                break
+            inside = line.rstrip("\n") == heading
+        if inside:
+            body.append(line)
+    return "".join(body) if body else None
+
+
+# ---- three-role (dispatcher / pilot / copilot) contracts --------------------
+#
+# Contract lists for the five checks below, module-level for the same reason as
+# the pilot-routing lists above: every entry is contract DATA, and a pin nobody
+# enumerates is a pin that can be deleted silently. Each is a plain phrase
+# rather than a compiled pattern so a failure can quote the sentence the author
+# has to restore; each is matched through `flex()` rather than as a literal
+# because all of it is prose inside wrapped paragraphs, table rows and numbered
+# lists — adding one word earlier in a sentence re-wraps it, and a literal pin
+# would then report a contract as missing when it had only moved.
+PILOT_FLAG_SECTION_HEADINGS = {
+    "start": "## `start [--pilot=claude|codex] "
+             "[--implementer=claude|codex] <task>`",
+    "review": "## `review [--pilot=claude|codex] <short-topic>`",
+    "join": "## `join [--pilot=claude|codex] "
+            "[--implementer=claude|codex] <session_id>`",
+}
+# The rule every subcommand states identically: detect the flag, reject
+# anything that is not `claude`/`codex`, and never paper over a malformed flag
+# with the default. The no-fallback clause is the load-bearing one — a parser
+# that silently defaults on `--pilot=gpt` starts a session under a role
+# assignment the user did not ask for and never reports it.
+PILOT_FLAG_COMMON_SNIPPETS = [
+    "Detect the optional `--pilot=claude` / `--pilot=codex` flag",
+    "Malformed flag input is a hard usage error",
+    "do not silently fall back to the default on a malformed flag",
+    "`{claude, codex}`",
+]
+# Per-section: the strip-before-positional-capture rule named against that
+# section's own positional (a flag left in the stream lands in the task text,
+# the session id, or the review topic), plus what only that section owes.
+PILOT_FLAG_SECTION_SNIPPETS = {
+    "start": [
+        "Strip both flag tokens out of the stream before capturing the "
+        "positional `<task>`",
+        "an unrecognized value (`--pilot=gpt`), an empty value (`--pilot=`), "
+        "the bare flag with no `=` (`--pilot`), and the same flag given more "
+        "than once",
+        "The identical rule, wording and accepted set `{claude, codex}` apply "
+        "to `--implementer`",
+    ],
+    "review": [
+        "strip that flag token before capturing the positional "
+        "`<short-topic>`",
+        "naming **both** the offending token/value **and** the accepted set "
+        "`{claude, codex}`",
+        # `initiator` names the DISPATCHER and is a separate axis from
+        # `pilot`: `collab_start_code_review`'s `initiator` enum admits only
+        # `"claude"` unconditionally, so deriving it from `--pilot` makes
+        # `review --pilot=codex` fail at the server with a validation error
+        # instead of starting a Codex-piloted review session.
+        '`initiator` ← `"claude"`',
+        'It stays `"claude"` under **every** `--pilot` value',
+        "Never set `initiator` from the `--pilot` value",
+        "`{repo_path, branch, base_sha, head_sha, initiator, task, pilot}`",
+    ],
+    "join": [
+        "Strip both flag tokens out of the stream before capturing the "
+        "positional `<session_id>`",
+        "naming **both** the offending token/value **and** the accepted set "
+        "`{claude, codex}`",
+    ],
+}
+# The join-side pilot reassignment contract, per command file. Both harnesses
+# carry it, mirrored around their own identity: each may hand the role away
+# only while it IS the pilot, and neither may reclaim it from the other side.
+# The two lists are written out rather than templated over the agent name
+# precisely so a one-sided rewrite (Claude's file updated, Codex's shim left on
+# the old unconditional `collab_set_pilot` call) fails here.
+CLAUDE_JOIN_PILOT_SNIPPETS = [
+    "Call `mcp__ironmem__collab_status` FIRST**, before any mutation",
+    "Passing `--pilot` is never by itself authorization to change the pilot",
+    "branch on `status.pilot` in **exactly this order**",
+    "**Requested pilot matches `status.pilot`** → no-op",
+    "Do not call `mcp__ironmem__collab_set_pilot`",
+    '**Differs and `status.pilot == "claude"`** → authorized',
+    'Call `mcp__ironmem__collab_set_pilot` with `session_id`, '
+    '`agent="claude"`, and `pilot=<flag value>` — **before** any '
+    '`collab_set_implementer` call',
+    '**Differs and `status.pilot != "claude"`** → **fail before attempting '
+    'the mutation.**',
+    "**Never call `collab_set_pilot` in this branch, and never retry.**",
+]
+CODEX_JOIN_PILOT_SNIPPETS = [
+    "Call `collab_status` first, before any mutation",
+    "Passing `--pilot` is never by itself authorization to change the pilot",
+    "branch on `status.pilot` in **exactly this order**",
+    "**Requested pilot matches `status.pilot`** → no-op",
+    "Do not call `collab_set_pilot`",
+    '**Differs and `status.pilot == "codex"`** → authorized',
+    'Call `collab_set_pilot` with `session_id`, `agent="codex"`, and '
+    '`pilot=<flag value>` — **before** any `collab_set_implementer` call',
+    '**Differs and `status.pilot != "codex"`** → **fail before attempting '
+    'the mutation.**',
+    "**Never call `collab_set_pilot` in this branch, and never retry.**",
+]
+# The human planning gate moved from the `PlanClaudeFinalizePending` dispatch
+# row to the `PlanLocked` bridge, so this contract is a MOVE and both halves
+# have to be asserted. The gate is dispatcher-owned: a `codex exec` one-shot
+# cannot prompt a human, and under `pilot == "codex"` the finalize turn belongs
+# to Codex — a gate parked on that row is unreachable exactly when it matters.
+# `PlanLocked` pre-`task_list` is also the one phase where `collab_end` is
+# legal, which is what makes rejection an actual exit rather than a wedge.
+PLAN_LOCKED_GATE_HEADING = "## v3 Bridge: PlanLocked → CodeImplementPending"
+PLAN_LOCKED_GATE_SNIPPETS = [
+    "**Dispatcher-owned planning approval gate.**",
+    "When `phase == PlanLocked`, `final_plan_ref` is set, and no `task_list` "
+    "has been sent yet, enter harness Plan Mode and get user approval before "
+    "dispatching anything",
+    "This gate is the dispatcher's and no worker's",
+    "surface ONLY `{drawer_id, plan_file_path, ≤3-line summary}` for approval",
+    "On rejection:** do **not** send `task_list`",
+    "`collab_end` is legal precisely and only at `PlanLocked` pre-`task_list`",
+]
+# The row the gate moved OFF. Selected the same way as SENDER_DISPATCH_ROWS:
+# `prefix` matches two lines (the phase-action row and the Codex dispatch
+# tuning row), and `marker` picks the phase-action one.
+PLAN_FINALIZE_ROW_PREFIX = "| `PlanClaudeFinalizePending` |"
+PLAN_FINALIZE_ROW_COUNT = 2
+PLAN_FINALIZE_ROW_MARKER = "collab-turn-plan-finalize.md"
+PLAN_FINALIZE_ROW_SNIPPETS = [
+    "**No human gate here — this turn is autonomous.**",
+    "The single human planning gate is the dispatcher's, and it fires one "
+    "phase later, at `PlanLocked` before the bridge dispatches `task_list`",
+]
+# The negative half of the move: the gate phrase itself, matched wherever the
+# row might carry it. Case-insensitive and with `harness` optional because the
+# realistic regression is the sentence being moved back onto this row, where
+# it would open one — capitalized, and not necessarily naming the harness.
+# Deliberately NOT shortened to "enter Plan Mode" or "get user approval" on
+# their own: the row legitimately cross-references the gate it no longer owns
+# ("it fires one phase later, at `PlanLocked`"), and a pin that cannot tell a
+# cross-reference from a gate would fail on correct prose.
+PLAN_MODE_GATE_RE = re.compile(
+    r"enter\s+(?:harness\s+)?Plan\s+Mode\s+and\s+get\s+user\s+approval",
+    re.IGNORECASE)
+# `pilot`/`copilot` are resolved once per iteration and read from those
+# bindings everywhere else. Two call sites that each work out who leads —
+# from a phase name, a template filename, or a value remembered from the
+# previous iteration — is split-brain routing: the loop dispatches a local
+# Claude worker and a `codex exec` for the same turn.
+SINGLE_PILOT_RESOLUTION_HEADING = "## Dispatch Loop Structure"
+SINGLE_PILOT_RESOLUTION_SNIPPETS = [
+    "status = collab_status(session_id)",
+    "pilot = status.pilot",
+    'copilot = counterpart(pilot)  # "codex" if pilot == "claude", '
+    'else "claude"',
+    "**`pilot`/`copilot` are bound once, at the top of the iteration, from "
+    "the same `collab_status` read that yields `phase` and `current_owner`.**",
+    "No call site may re-derive role identity from a phase name, a prompt "
+    "filename, or a value remembered from a prior iteration",
+    "split-brain routing",
+]
+# docs/COLLAB.md is the only place the three roles are DEFINED; the command
+# files use the vocabulary without restating it. Keeping the doc pinned here
+# is what keeps prose and command file in sync by lint rather than by
+# discipline — every one of these six was written to answer a question the
+# command file deliberately does not answer.
+DOC_PILOT_ROLE_CONTRACTS = {
+    "the three role definitions (§ Runtime Model → Roles)": [
+        "- **dispatcher** — runs the control loop shown above and is the only "
+        "role that talks to the human",
+        "always Claude in this codebase",
+        "- **pilot** — the `collab_sessions.pilot` field, per-session, "
+        "default `claude`",
+        "- **copilot** — `counterpart(pilot)`, derived on the fly and never "
+        "stored",
+        "**pilot is not the same role as dispatcher.**",
+    ],
+    "the `pilot` Session State row": [
+        "| `pilot` | Which agent leads v1 planning and the v3 review-audit "
+        "turns",
+        "Rebindable via `collab_set_pilot`",
+        "only by the agent that is currently the pilot — a copilot can never "
+        "promote itself",
+    ],
+    "the `collab_set_pilot` tool section": [
+        "### `collab_set_pilot`",
+        "Only the session's *current* pilot may call this",
+        "Legal only in `PlanParallelDrafts`",
+    ],
+    "the wire-compat note": [
+        "**Wire-compat note:**",
+        '`Phase::PlanCopilotReviewPending` still serializes as '
+        '`"PlanCodexReviewPending"`',
+        '`Phase::PlanFinalizePending` still serializes as '
+        '`"PlanClaudeFinalizePending"`',
+    ],
+    "the Codex-terminal non-goal": [
+        "### Codex-terminal-led sessions are a non-goal",
+        "Generalizing the Codex-side prompt into a symmetric long-running "
+        "dispatcher is intentionally out of scope",
+    ],
+    "the N-party amendment": [
+        "**Pilot-configurability is not a step toward an N-party protocol.**",
+        "does not open `Agent` to a third variant or generalize `counterpart` "
+        "to an N-party lookup",
+    ],
+}
+
+
 def check_pr_base_resolution_contract() -> None:
     """The PR base is the integration branch, never gated on `base_sha`.
 
@@ -1137,6 +1361,167 @@ def check_pilot_submit_doc_contract() -> None:
         if snippet not in doc_text:
             err("docs/COLLAB.md: missing pilot-submit routing contract "
                 f"{snippet!r}")
+
+
+def check_pilot_flag_parsing_contract() -> None:
+    """`start`, `join` and `review` must all parse `--pilot` the same way.
+
+    Each of the three subcommand sections must accept
+    `--pilot=claude|codex`, strip the flag tokens out of the stream *before*
+    capturing its positional argument, and reject any other value outright
+    instead of falling back to the default. `review` additionally keeps
+    sending `initiator="claude"` under every `--pilot` value: `initiator`
+    names the dispatcher, and `collab_start_code_review` admits no other
+    value for it, so a `--pilot`-derived `initiator` turns
+    `review --pilot=codex` into a server-side validation failure.
+    """
+    text = COMMAND.read_text()
+    for name, heading in PILOT_FLAG_SECTION_HEADINGS.items():
+        section = command_section(text, heading)
+        if section is None:
+            err(f".claude-plugin/commands/collab.md: missing `{name}` "
+                f"subcommand section {heading!r} — the `--pilot` parsing "
+                f"contract is pinned per section, so a renamed heading drops "
+                f"that section's pins silently")
+            continue
+        for phrase in PILOT_FLAG_COMMON_SNIPPETS + PILOT_FLAG_SECTION_SNIPPETS[name]:
+            if not flex(phrase).search(section):
+                err(f".claude-plugin/commands/collab.md: `{name}` section is "
+                    f"missing pilot-flag parsing contract {phrase!r}")
+
+
+def check_pilot_join_authorization_contract() -> None:
+    """Both command files must carry the role-aware `join --pilot` contract.
+
+    `collab_set_pilot` is caller-restricted server-side: only the session's
+    current pilot may reassign the role, checked before any phase check. So
+    the flag states an intent and `status.pilot` decides whether that intent
+    is even attemptable — which is why each file must read `collab_status`
+    first and branch three ways: no-op when the requested pilot already
+    matches, mutate only when the caller IS the current pilot, and fail
+    *before* calling when it is not. The third branch is the one that has to
+    be prose: attempting the call and handling the rejection looks similar
+    but reports a server error where the user needs to be told that
+    reclaiming the role requires a join from the other side.
+
+    Both files are checked because the shim is where this regresses: the
+    Codex side previously called `collab_set_pilot` unconditionally whenever
+    the flag was present, which is the exact defect the flag-presence-alone
+    wording rules out.
+    """
+    surfaces = [
+        (COMMAND, ".claude-plugin/commands/collab.md",
+         PILOT_FLAG_SECTION_HEADINGS["join"], CLAUDE_JOIN_PILOT_SNIPPETS),
+        (CODEX_COMMAND, ".codex-plugin/commands/collab.md",
+         None, CODEX_JOIN_PILOT_SNIPPETS),
+    ]
+    for path, rel, heading, snippets in surfaces:
+        if not path.exists():
+            err(f"{rel}: missing join pilot-authorization contract")
+            continue
+        text = path.read_text()
+        if heading is not None:
+            section = command_section(text, heading)
+            if section is None:
+                err(f"{rel}: missing `join` subcommand section {heading!r}")
+                continue
+            text = section
+        for phrase in snippets:
+            if not flex(phrase).search(text):
+                err(f"{rel}: missing join pilot-authorization contract "
+                    f"{phrase!r}")
+
+
+def check_dispatcher_approval_gate_contract() -> None:
+    """The human planning gate belongs to the dispatcher, at `PlanLocked`.
+
+    This contract is a MOVE, so both halves are asserted: the gate must be
+    stated in the `PlanLocked` bridge, and it must be gone from the
+    `PlanClaudeFinalizePending` dispatch row it moved off. A gate left on
+    that row is unreachable under `pilot == "codex"` — the finalize turn is
+    Codex's there, and a `codex exec` one-shot cannot prompt a human — while
+    `PlanLocked` pre-`task_list` is the one phase where `collab_end` is
+    legal, which is what lets rejection abandon the session cleanly instead
+    of wedging it.
+    """
+    text = COMMAND.read_text()
+    bridge = command_section(text, PLAN_LOCKED_GATE_HEADING)
+    if bridge is None:
+        err(f".claude-plugin/commands/collab.md: missing bridge section "
+            f"{PLAN_LOCKED_GATE_HEADING!r}, which owns the dispatcher's "
+            f"planning approval gate")
+    else:
+        for phrase in PLAN_LOCKED_GATE_SNIPPETS:
+            if not flex(phrase).search(bridge):
+                err(f".claude-plugin/commands/collab.md: v3 bridge is missing "
+                    f"dispatcher approval-gate contract {phrase!r}")
+    matching = [l for l in text.splitlines()
+                if l.startswith(PLAN_FINALIZE_ROW_PREFIX)]
+    if len(matching) != PLAN_FINALIZE_ROW_COUNT:
+        err(f"collab.md: expected exactly {PLAN_FINALIZE_ROW_COUNT} lines "
+            f"starting with {PLAN_FINALIZE_ROW_PREFIX!r} — the approval-gate "
+            f"audit selects the phase-action row by its "
+            f"{PLAN_FINALIZE_ROW_MARKER!r} cell, so a restructured table "
+            f"means it is reading a different one than it was written for, "
+            f"found {len(matching)}")
+    rows = [l for l in matching if PLAN_FINALIZE_ROW_MARKER in l]
+    if len(rows) != 1:
+        err(f"collab.md: expected exactly one `PlanClaudeFinalizePending` row "
+            f"naming {PLAN_FINALIZE_ROW_MARKER!r} (the phase-action row), "
+            f"found {len(rows)}")
+        return
+    row = rows[0]
+    for phrase in PLAN_FINALIZE_ROW_SNIPPETS:
+        if not flex(phrase).search(row):
+            err(f"collab.md: `PlanClaudeFinalizePending` row must state that "
+                f"the turn is autonomous and that the gate fires at "
+                f"`PlanLocked` — missing {phrase!r}")
+    if PLAN_MODE_GATE_RE.search(row):
+        err(f"collab.md: `PlanClaudeFinalizePending` row must not take the "
+            f"human planning gate — the gate moved to the `PlanLocked` "
+            f"bridge, and a gate on this row is unreachable under "
+            f"`pilot == \"codex\"`, where Codex owns the finalize turn and "
+            f"cannot prompt a human")
+
+
+def check_single_pilot_resolution_contract() -> None:
+    """Role identity is resolved once per iteration, from `collab_status`.
+
+    The dispatch loop binds `pilot` from the same `collab_status` read that
+    yields `phase` and `current_owner`, derives `copilot` as its
+    counterpart, and forbids every other call site from re-deriving role
+    identity — from a phase name, a template filename, or a value carried
+    over from the previous iteration. Two call sites disagreeing about who
+    leads is split-brain routing: a local Claude worker and a `codex exec`
+    dispatched for the same turn.
+    """
+    text = COMMAND.read_text()
+    section = command_section(text, SINGLE_PILOT_RESOLUTION_HEADING)
+    if section is None:
+        err(f".claude-plugin/commands/collab.md: missing "
+            f"{SINGLE_PILOT_RESOLUTION_HEADING!r} section, which owns the "
+            f"single-pilot-resolution rule")
+        return
+    for phrase in SINGLE_PILOT_RESOLUTION_SNIPPETS:
+        if not flex(phrase).search(section):
+            err(f".claude-plugin/commands/collab.md: dispatch loop is missing "
+                f"single-pilot-resolution contract {phrase!r}")
+
+
+def check_pilot_doc_contract() -> None:
+    """docs/COLLAB.md must define the three roles and the `pilot` surface.
+
+    The command files use the pilot/copilot/dispatcher vocabulary without
+    defining it, and nothing but this check keeps the definitions, the
+    `pilot` state row, the `collab_set_pilot` tool section, the frozen wire
+    names, the Codex-terminal non-goal and the N-party boundary in sync with
+    the command file that depends on them.
+    """
+    doc_text = DOC.read_text()
+    for element, snippets in DOC_PILOT_ROLE_CONTRACTS.items():
+        for phrase in snippets:
+            if not flex(phrase).search(doc_text):
+                err(f"docs/COLLAB.md: missing {element} — {phrase!r}")
 
 
 def check_topic_template_completeness() -> None:
@@ -1617,6 +2002,11 @@ def main() -> int:
     check_planning_dispatch_failure_contract()
     check_pilot_submit_doc_contract()
     check_review_diff_trigger_detection_contract()
+    check_pilot_flag_parsing_contract()
+    check_pilot_join_authorization_contract()
+    check_dispatcher_approval_gate_contract()
+    check_single_pilot_resolution_contract()
+    check_pilot_doc_contract()
 
     if errors:
         print("collab-turn template lint FAILED:")
