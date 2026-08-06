@@ -14,6 +14,12 @@ pub struct SessionState {
     pub phase: String,
     pub current_owner: String,
     pub implementer: String,
+    /// Which agent LEADS the session — synthesizes/finalizes the plan and audits
+    /// the copilot's commits (migration 019). Orthogonal to `implementer`.
+    /// `claude` for every pre-019 row and every session that omits the flag.
+    /// The driver only knows how to drive `claude`; see
+    /// `collab_driver::ensure_supported_pilot`.
+    pub pilot: String,
     pub pr_url: Option<String>,
     pub review_round: u32,
     pub global_review_round: u32,
@@ -49,10 +55,15 @@ pub fn read_session_state(db_path: &Path, session_id: &str) -> Result<SessionSta
         rusqlite::Connection::open_with_flags(db_path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
             .with_context(|| format!("opening collab db {} read-only", db_path.display()))?;
 
+    // `pilot` is `NOT NULL DEFAULT 'claude'` (migration 019), so the COALESCE is
+    // belt-and-braces for a row written before that default existed or by a hand
+    // patched DB: a NULL pilot reads as the pre-019 behavior (`claude`) instead
+    // of failing the whole poll on a type error.
     let mut stmt = conn.prepare(
         "SELECT phase, current_owner, implementer, pr_url, \
                 review_round, global_review_round, task_review_round, last_head_sha, \
-                pending_failure, recovery_phase, recovery_owner \
+                pending_failure, recovery_phase, recovery_owner, \
+                COALESCE(pilot, 'claude') \
          FROM collab_sessions WHERE id = ?1",
     )?;
 
@@ -69,6 +80,7 @@ pub fn read_session_state(db_path: &Path, session_id: &str) -> Result<SessionSta
             pending_failure: row.get(8)?,
             recovery_phase: row.get(9)?,
             recovery_owner: row.get(10)?,
+            pilot: row.get(11)?,
         })
     })
     .with_context(|| format!("no collab_sessions row for session {session_id}"))

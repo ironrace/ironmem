@@ -372,6 +372,7 @@ fn st(phase: &str, owner: &str, grr: u32) -> SessionState {
         pending_failure: None,
         recovery_phase: None,
         recovery_owner: None,
+        pilot: "claude".into(),
     }
 }
 
