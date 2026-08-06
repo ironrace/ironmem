@@ -841,17 +841,24 @@ Creates a new session.
   "branch": "feat/landing-page",
   "initiator": "claude",
   "task": "design the marketing landing page",
+  "pilot": "claude",
   "implementer": "claude"
 }
 ```
 
-Returns `{ session_id, task, implementer }`. The `task` is stored on the
-session so the counterpart agent can read it via `collab_status` without
-a manual paste. `implementer` is optional, defaults to `"claude"`, and
-must be one of `{"claude","codex"}` — it routes the v3
-`CodeImplementPending` phase to the named agent. The DB CHECK constraint
-on the `implementer` column enforces the same set, so direct writes
-cannot bypass validation.
+Returns `{ session_id, task, implementer, pilot }`. The `task` is stored on
+the session so the counterpart agent can read it via `collab_status`
+without a manual paste. `pilot` is optional, defaults to `"claude"`, and
+must be one of `{"claude","codex"}` — it selects which agent leads v1
+planning and the v3 review-audit turns (§ Runtime Model → Roles). The DB
+CHECK constraint on the `pilot` column enforces the same set (migration
+019), so direct writes cannot bypass validation. `implementer` is
+optional and must be one of `{"claude","codex"}` — it routes the v3
+`CodeImplementPending` phase to the named agent, defaulting to the
+resolved `pilot` (so an omitted `implementer` is `"claude"` under the
+default `pilot=claude`, or `"codex"` if `pilot=codex` was passed). The DB
+CHECK constraint on the `implementer` column enforces the same set, so
+direct writes cannot bypass validation.
 
 **Duplicate-session guard.** `collab_start` (and `collab_start_code_review`)
 reject the call when a session that still reserves the same `repo_path` +
@@ -895,11 +902,64 @@ the active batch to another agent. The new implementer resumes from the
 one current logical-keyed ironmem checkpoint, then scans the plan and current code before
 continuing. Calls after `implementation_done` are rejected.
 
+### `collab_set_pilot`
+
+Reassigns the session's `pilot` — far more restricted than
+`collab_set_implementer` beside it. See § Session State and § Runtime
+Model → Roles for the `pilot`/`copilot` vocabulary this section assumes.
+
+```json
+{
+  "session_id": "...",
+  "agent": "claude",
+  "pilot": "codex"
+}
+```
+
+All three fields are required: `session_id`, `agent` (the caller's claimed
+identity), and `pilot` (the agent to reassign the role to) — each one of
+`{"claude","codex"}`.
+
+**Caller restriction.** Only the session's *current* pilot may call this,
+checked before phase, so an unauthorized caller is rejected identically
+regardless of what phase the session is in. A copilot can never promote
+itself; the rejection names the caller's role and the pilot that may act:
+`"collab_set_pilot refused: caller '<agent>' is the copilot of this
+session; only the current pilot '<pilot>' may reassign the pilot role"`.
+This is what stops the tool from being a turn-seizure primitive — the only
+way to become pilot is to be handed the role by the agent that already
+holds it.
+
+**Phase policy.** Legal only in `PlanParallelDrafts`, and only before
+either agent's first draft has landed. It is rejected:
+- once a draft (`claude_draft_hash` or `codex_draft_hash`) has been
+  submitted, even while still in `PlanParallelDrafts`;
+- in any phase reached after batch implementation, e.g.
+  `CodeReviewFixGlobalPending`;
+- on a `collab_start_code_review` session, which begins at
+  `CodeReviewFixGlobalPending` and so never passes through the one phase
+  where reassignment is legal — its pilot is fixed at creation.
+
+**On success**, `current_owner` moves to the new pilot in the same
+transactional update, so pilot and owner are never observable in an
+inconsistent pairing.
+
+**No-partial-write guarantee.** A refused call — whether for the caller
+restriction or the phase policy — leaves both `pilot` and `current_owner`
+unchanged; every check runs inside the request's transaction before any
+write.
+
+See `crates/ironmem/tests/mcp_protocol.rs:2761-2966` for the caller and
+phase-policy tests, including the self-promotion refusal in both
+pilot directions.
+
 ### `collab_start_code_review`
 
 Shortcut entry. Creates a session positioned at `CodeReviewFixGlobalPending`,
-owner `codex`. See the "Shortcut: post-iron-build coding review" subsection
-above for the constraints and surviving flow.
+owned by the **copilot** (`counterpart(pilot)`) — Codex under the default
+`pilot=claude`, but Claude when `pilot=codex` is passed. See the "Shortcut:
+post-iron-build coding review" subsection above for the constraints and
+surviving flow.
 
 ```json
 {
@@ -908,12 +968,17 @@ above for the constraints and surviving flow.
   "base_sha": "abc123",
   "head_sha": "def456",
   "initiator": "claude",
-  "task": "add landing page"
+  "task": "add landing page",
+  "pilot": "claude"
 }
 ```
 
-Returns `{ session_id, task }`. The `task` is stored on the session and is
-readable via `collab_status`.
+Returns `{ session_id, task, pilot }`. The `task` is stored on the session
+and is readable via `collab_status`. `pilot` is optional, defaults to
+`"claude"`, and must be one of `{"claude","codex"}` — same DB CHECK as
+`collab_start` (migration 019). `initiator` stays fixed to `"claude"`
+regardless of `pilot`: it names the dispatcher invoking the shortcut, not
+the review-flow lead (§ Runtime Model → Roles).
 
 ### `collab_send`
 
@@ -1066,7 +1131,10 @@ payloads bounded:
 
 ### `collab_approve`
 
-Codex-only shortcut for an `approve` review. Requires `content_hash` to
+Copilot-only shortcut for an `approve` review. The approver is the
+session's copilot — the agent that is not its `pilot`, so Codex under the
+default `pilot=claude` and Claude under `pilot=codex`. Any other agent is
+rejected naming the one that may approve. Requires `content_hash` to
 match the stored `canonical_plan_hash`.
 
 ### `collab_wait_my_turn` (long-poll)
@@ -1188,7 +1256,7 @@ byte-identically reuses) a one-time `handoff_token` and sets
 `pending_handoff_generation = active_generation + 1` **without** advancing
 the active generation. A successor presents the `handoff_token` on its first
 actor-bearing mutating/binding collab call (`collab_send`, `collab_recv`,
-`collab_ack`, `collab_approve`, `collab_set_implementer`,
+`collab_ack`, `collab_approve`, `collab_set_implementer`, `collab_set_pilot`,
 `collab_register_caps`, `collab_wait_my_turn`, `collab_end`, `collab_resume`, or
 `session_handoff` itself) to **claim** — the claim advances the active
 generation, making the predecessor process **inert**.
@@ -1295,6 +1363,7 @@ An unattended `claude -p` successor needs at minimum:
 - `mcp__ironmem__collab_ack` — acknowledge messages
 - `mcp__ironmem__collab_approve` — approve plans/reviews
 - `mcp__ironmem__collab_set_implementer` — set implementer
+- `mcp__ironmem__collab_set_pilot` — reassign pilot
 - `mcp__ironmem__collab_register_caps` — register capabilities
 - `mcp__ironmem__collab_wait_my_turn` — wait for turn
 - `mcp__ironmem__collab_end` — end session
