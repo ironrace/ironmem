@@ -25,7 +25,11 @@ through `/evaluate-issue`; start a separate collab session only for a child
 that receives a `COLLAB` verdict.
 
 For `start`, select `collab-plan-draft.md`. `start` takes no `--pilot` flag on
-this side.
+this side: reject any `--pilot` token — `--pilot=claude`, `--pilot=codex`, an
+unrecognized value, the bare flag with no `=`, or any other form — as a usage
+error naming the offending token and stating that `start` takes no `--pilot`
+flag on the Codex side. Never strip it into the task text and never call
+`collab_start` with a pilot inferred from it.
 
 For `join`, parse exactly one session id plus an optional
 `--pilot=claude|codex` flag and an optional `--implementer=claude|codex` flag,
