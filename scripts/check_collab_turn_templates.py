@@ -1102,6 +1102,10 @@ DOC_PILOT_ROLE_CONTRACTS = {
         "does not open `Agent` to a third variant or generalize `counterpart` "
         "to an N-party lookup",
     ],
+    "the schema v19 migration note": [
+        "### Migration note: `pilot` column (schema v19)",
+        "`crates/ironmem/migrations/019_collab_pilot.sql`",
+    ],
 }
 
 
