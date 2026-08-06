@@ -824,21 +824,36 @@ sequence before building the payload:
    sends — Claude is the only writer in those phases (same condition as
    the reset-skip in step 3), so there's nothing for Codex to have pushed
    that needs syncing. The cat-file check still catches local-tree drift.
-3. **Reset only when Codex just pushed (Claude-side rule under new v3 order).**
-   Under the new v3 phase order
-   (`CodeImplementPending` → `CodeReviewFixGlobalPending` (Codex) →
-   `CodeReviewLocalPending` (Claude audit) → `CodeReviewFinalPending` (Claude PR)),
-   Codex's only push happens at `review_fix_global`. So:
-   - **Reset to `last_head_sha`** before `review_local` (Codex pushed at
-     `review_fix_global` — the only Codex push in v3).
-   - **Skip reset** before `final_review` (Claude pushed at `review_local`).
+3. **Reset only when the counterpart just pushed (Claude-side rule under new
+   v3 order).** Key the decision to the ROLE that owns each phase, never to a
+   fixed agent: read `pilot`, `copilot`, and `current_owner` from
+   `collab_status` first. Under the new v3 phase order
+   (`CodeImplementPending` → `CodeReviewFixGlobalPending` (copilot) →
+   `CodeReviewLocalPending` (pilot audit) → `CodeReviewFinalPending` (pilot PR)),
+   the copilot's only push happens at `review_fix_global`. So:
+   - **Reset to `last_head_sha`** before `review_local` (the copilot pushed at
+     `review_fix_global` — the only copilot push in v3).
+   - **Reset to `last_head_sha`** before `review_fix_global` when Claude owns
+     that phase as the copilot (`pilot == "codex"`): the implementer pushed at
+     `implementation_done`, so the review must run on the canonical post-impl
+     head.
+   - **Skip reset** before `final_review` (the pilot — the same owner as this
+     turn — pushed at `review_local`).
    - **Skip reset** before `task_list` and `implementation_done` (Claude is
      the sole writer in those phases).
-   Codex's own pre-send harness (sending `review_fix_global`) keeps its
+   Under the default `pilot == "claude"` the copilot is Codex, so in practice
+   these rules read "reset before `review_local` because Codex just pushed",
+   and `review_fix_global` is not a Claude-owned turn at all; under
+   `pilot == "codex"` Claude is the copilot and the `review_fix_global` bullet
+   is the live one. That example mapping is an illustration, not the rule.
+   The copilot's own pre-send harness (sending `review_fix_global`) keeps its
    receive-side fetch/cat-file/checkout/reset-to-`last_head_sha` before
-   reviewing — Codex syncs to whatever Claude pushed at `implementation_done`
-   so review uses the canonical post-impl head. That rule lives in the
-   Codex global-review prompt (`.codex-plugin/prompts/collab-global-review.md`);
+   reviewing — the copilot syncs to whatever the implementer pushed at
+   `implementation_done` so review uses the canonical post-impl head. When the
+   copilot is Codex that rule lives in the
+   Codex global-review prompt (`.codex-plugin/prompts/collab-global-review.md`),
+   and when it is Claude it lives in
+   `.claude-plugin/prompts/collab-turn-review-fix-global.md`;
    the rules in this list
    apply to Claude's send-side harness only.
 4. Run local gates for code-changing Claude turns only (pre-work — fmt +
@@ -855,9 +870,9 @@ sequence before building the payload:
 
 | Phase | What to do (is_my_turn == true) |
 |---|---|
-| `CodeImplementPending` | Owner depends on `implementer`. **Claude is owner** (default or `/collab join --implementer=claude <session_id>`): dispatch the matrix worker `collab-turn-code-implement.md` (mechanical/sonnet) and ingest its ≤3-line verdict; loop. The worker resumes from `ironrace-memory/collab-checkpoints`, scans plan/code state, continues the local `iron-build` batch with the v3-bridge checkpoint rule, runs pre-send harness gates (no reset — no Codex push to sync), writes `status: batch_complete`, and `collab_send`s `sender="claude"`, `topic="implementation_done"`, `content=<JSON {"head_sha":"<current HEAD>"}>` (payload carries ONLY `head_sha`) on green, or `failure_report` on failure. After send, the phase advances to `CodeReviewFixGlobalPending` (Codex's turn — the new v3 order has Codex run `/pr-review-toolkit:review-pr` on the raw post-implementation diff first). **Codex is owner** (`--implementer=codex`): is_my_turn is false here; dispatch Codex via background `codex exec` (per the Codex handoff section). Codex must resume from ironmem checkpoints, scan the plan/code state, and emit `implementation_done` itself before the bg-exec settled wait wakes on the phase advance. |
-| `CodeReviewFixGlobalPending` | Owner depends on `pilot`, plus a recovery override — the server gates this phase on the **copilot** (`require_actor_or_recovery(session, actor, copilot(session))` in `crates/ironmem/src/collab/state_machine/mod.rs`), so who owns it follows from `pilot`, not from the phase name. Read `current_owner` from `collab_status`. **Recovery override (checked first):** if `pending_failure` makes Claude the recovery owner, preserve the diff and complete the interrupted turn per the recovery override, sending `review_fix_global`; this is valid delegated completion, not an anomaly. **`current_owner == "codex"`** outside recovery (`pilot == "claude"`, the default): dispatch Codex via background `codex exec`, with the timing logs and `/pr-review-toolkit:review-pr` review pass described in the Codex handoff section. **`current_owner == "claude"`** outside recovery (`pilot == "codex"`, so Claude is the copilot): this is Claude's legitimate turn — dispatch the matrix worker `collab-turn-review-fix-global.md` (review/opus), ingest only its ≤3-line verdict, and loop. Do **not** dispatch Codex here: `collab-global-review.md`'s own ownership guard rejects and exits, which the wait loop reads as a dispatch failure and turns into a spurious `codex_dispatch_failed:` that burns a recovery attempt. After `review_fix_global`, the phase advances to `CodeReviewLocalPending` (Claude's audit turn). |
-| `CodeReviewLocalPending` | Dispatch the matrix worker `collab-turn-review-local.md` (review/opus) and ingest its ≤3-line verdict; loop. The worker runs the pre-send harness (with reset to `last_head_sha` — Codex just pushed at `review_fix_global`), then performs the overlap-mode audit. It runs full `/ultrareview-local` when Codex made fix commits or runtime/Rust files changed, and uses `review_local=reduced` when Codex made no fix commit or the branch diff is docs/config-only. Reduced mode is still an audit: inspect the diff summary, changed files, and Codex commits for protocol drift, docs/config breakage, generated metadata inconsistencies, and security-sensitive configuration; escalate to full `/ultrareview-local` on uncertainty or a substantive finding. Confirmed CRITICAL/HIGH/MEDIUM findings are partitioned into temporary worktrees on unique throwaway branches for parallel fix subagents where safe, merged/cherry-picked back, committed + pushed, and `collab_send`s `sender="claude"`, `topic="review_local"`, `content=<JSON {"head_sha":"<current HEAD>"}>`. **Log:** `t5_review_local_sent`. **Anti-removal:** under v3 ordering the stage audits Codex's `review_fix_global` work plus catches issues both agents missed. Its code-quality lens partially overlaps with Codex's `pr-review-toolkit`-backed branch review but does not fully duplicate it. Removing this stage requires a written overlap audit demonstrating that Codex's `review_fix_global` reviews catch the code-quality issues `/ultrareview-local` would have flagged AND that the audit-of-Codex role is unnecessary. |
+| `CodeImplementPending` | Owner depends on `implementer`. **Claude is owner** (default or `/collab join --implementer=claude <session_id>`): dispatch the matrix worker `collab-turn-code-implement.md` (mechanical/sonnet) and ingest its ≤3-line verdict; loop. The worker resumes from `ironrace-memory/collab-checkpoints`, scans plan/code state, continues the local `iron-build` batch with the v3-bridge checkpoint rule, runs pre-send harness gates (no reset — no Codex push to sync), writes `status: batch_complete`, and `collab_send`s `sender="claude"`, `topic="implementation_done"`, `content=<JSON {"head_sha":"<current HEAD>"}>` (payload carries ONLY `head_sha`) on green, or `failure_report` on failure. After send, the phase advances to `CodeReviewFixGlobalPending` (the copilot's turn — the new v3 order has the copilot run `/pr-review-toolkit:review-pr` on the raw post-implementation diff first; the copilot is Codex under the default `pilot == "claude"` and Claude under `pilot == "codex"`, so read `current_owner` rather than assuming). **Codex is owner** (`--implementer=codex`): is_my_turn is false here; dispatch Codex via background `codex exec` (per the Codex handoff section). Codex must resume from ironmem checkpoints, scan the plan/code state, and emit `implementation_done` itself before the bg-exec settled wait wakes on the phase advance. |
+| `CodeReviewFixGlobalPending` | Owner depends on `pilot`, plus a recovery override — the server gates this phase on the **copilot** (`require_actor_or_recovery(session, actor, copilot(session))` in `crates/ironmem/src/collab/state_machine/mod.rs`), so who owns it follows from `pilot`, not from the phase name. Read `current_owner` from `collab_status`. **Recovery override (checked first):** if `pending_failure` makes Claude the recovery owner, preserve the diff and complete the interrupted turn per the recovery override, sending `review_fix_global`; this is valid delegated completion, not an anomaly. **`current_owner == "codex"`** outside recovery (`pilot == "claude"`, the default): dispatch Codex via background `codex exec`, with the timing logs and `/pr-review-toolkit:review-pr` review pass described in the Codex handoff section. **`current_owner == "claude"`** outside recovery (`pilot == "codex"`, so Claude is the copilot): this is Claude's legitimate turn — dispatch the matrix worker `collab-turn-review-fix-global.md` (review/opus), ingest only its ≤3-line verdict, and loop. Do **not** dispatch Codex here: `collab-global-review.md`'s own ownership guard rejects and exits, which the wait loop reads as a dispatch failure and turns into a spurious `codex_dispatch_failed:` that burns a recovery attempt. After `review_fix_global`, the phase advances to `CodeReviewLocalPending` (the pilot's audit turn). |
+| `CodeReviewLocalPending` | Owner depends on `pilot`, plus a recovery override — the server gates this phase on the **pilot** (`require_actor_or_recovery(session, actor, pilot(session))` in `crates/ironmem/src/collab/state_machine/mod.rs`), so who owns it follows from `pilot`, not from the phase name. Read `current_owner` from `collab_status`: under the default `pilot == "claude"` that is Claude; under `pilot == "codex"` it is Codex, dispatched via the **§ Codex dispatch tuning matrix**, unless a `codex_dispatch_failed:` recovery makes Claude the recovery owner for this turn. When Claude is the owner (normal pilot or recovery owner): dispatch the matrix worker `collab-turn-review-local.md` (review/opus) and ingest its ≤3-line verdict; loop. The worker runs the pre-send harness (with reset to `last_head_sha` — the copilot just pushed at `review_fix_global`), then performs the overlap-mode audit of the copilot's work. It runs full `/ultrareview-local` when the copilot made fix commits or runtime/Rust files changed, and uses `review_local=reduced` when the copilot made no fix commit or the branch diff is docs/config-only. Reduced mode is still an audit: inspect the diff summary, changed files, and the copilot's commits for protocol drift, docs/config breakage, generated metadata inconsistencies, and security-sensitive configuration; escalate to full `/ultrareview-local` on uncertainty or a substantive finding. Confirmed CRITICAL/HIGH/MEDIUM findings are partitioned into temporary worktrees on unique throwaway branches for parallel fix subagents where safe, merged/cherry-picked back, committed + pushed, and `collab_send`s with `$SENDER=<collab_status.current_owner>`, `topic="review_local"`, `content=<JSON {"head_sha":"<current HEAD>"}>` — never a hardcoded sender, because under the recovery override the owner here is not necessarily the pilot. **Log:** `t5_review_local_sent`. **Anti-removal:** under v3 ordering this pilot-owned stage audits the copilot's `review_fix_global` work plus catches issues both agents missed. Its code-quality lens partially overlaps with the copilot's `pr-review-toolkit`-backed branch review but does not fully duplicate it. Removing this stage requires a written overlap audit demonstrating that the copilot's `review_fix_global` reviews catch the code-quality issues `/ultrareview-local` would have flagged AND that the audit-of-the-copilot role is unnecessary. (Under the default `pilot == "claude"` the copilot is Codex, so this reads concretely as "Claude audits Codex's `review_fix_global` work" — an example of the rule, never the whole rule.) |
 | `CodeReviewFinalPending` | **Auto-create the PR — no user-approval gate** (the diff already passed `review_fix_global` + `review_local`, and a PR is editable and unmerged after creation; do NOT enter Plan Mode here). Dispatch the matrix worker `collab-turn-final-review.md` (review/opus) with `$MODE=compose`: it performs pushed-head proof only (no reset, no gate rerun) by requiring a clean worktree, `HEAD == last_head_sha`, and local HEAD equal to the pushed upstream/origin branch head, then drafts the PR title (under 70 chars) + body (summary + test plan derived from task list + prior gate evidence / pushed-head proof), writes `{"title":"...","body":"..."}` to a drawer, and returns `{drawer_id, ≤3-line summary}`. If the proof fails, the worker returns a blocker instead of running tests. Composition is pilot-generic — under `pilot == "claude"` this worker (`collab-turn-final-review.md`) composes as just described; under `pilot == "codex"`, Codex composes the equivalent drawer itself via its own `collab-final-review.md` prompt (proves the pushed head, drafts the PR title/body, stages `{"title":"...","body":"..."}`, and sends nothing and opens no PR). Either way, the orchestrator reads `current_owner` from `collab_status` (confirming `final_review` is the topic authorized for this phase) and dispatches `collab-turn-submit.md` (mechanical/sonnet) **directly** with `$TOPIC=final_review` `$ARTIFACT_REF=<drawer_id>` `$SENDER=<collab_status.current_owner>` (drawer immutability is the integrity anchor — the approved drawer's content cannot change, so no hash recompute is needed): it reads the title/body artifact, then runs a plain `gh pr create --base <base_branch> --head <current branch> --title <title> --body <body>` (a **ready** PR — no `--draft`), and on failure sends `failure_report` `coding_failure: "pr_create_failed: <error>"` (no silent retry). Normally `current_owner == pilot` here; under recovery (`collab_status.pending_failure` non-null), `current_owner` may instead be the recovery owner per the recovery override in step 0 of the **Pre-send Harness Sequence (Claude-owned v3 turns)** and the `CodeReviewLocalPending`/`CodeReviewFinalPending` recovery row in the **Codex dispatch tuning matrix** — `CodeReviewFinalPending` is a coding-active phase, so this substitution is live here, and `$SENDER` must always be read from `current_owner`, never assumed to equal `pilot`. On success, **Log:** `t8_pr_created <pr_url>`, the worker captures `pr_url` and `collab_send`s as `$SENDER`, `topic="final_review"`, `content=<JSON {"head_sha":"<current HEAD>","pr_url":"<https url>"}>`. **Log:** `t9_final_review_sent`. Session advances directly to `CodingComplete`. **Log:** `t10_session_complete CodingComplete`. Exit loop. |
 
 After each send in v3, loop back to polling. The loop continues until
@@ -866,16 +881,22 @@ After each send in v3, loop back to polling. The loop continues until
 non-resumable.
 
 **Shortcut entry:** `/collab review` starts the loop at phase
-`CodeReviewFixGlobalPending` with `current_owner == "codex"`. No batch
-implementation phase is traversed. Codex must recover context by searching
+`CodeReviewFixGlobalPending` with `current_owner == counterpart(pilot)` —
+the **copilot**, which is Codex under the default `pilot == "claude"` and
+Claude under `pilot == "codex"`. Read `current_owner` from `collab_status`
+rather than assuming an agent. No batch
+implementation phase is traversed. The copilot must recover context by searching
 ironmem checkpoints for the branch, reading any referenced plan, and
 scanning the current code/diff against that plan before sending
 `review_fix_global`. Under the new v3 order the surviving flow is three
-turns: Codex's `review_fix_global` (`/pr-review-toolkit:review-pr` plus
-parallel fix subagents for confirmed findings on the raw diff) → Claude's
-`review_local` (audit Codex's commits via
+turns: the copilot's `review_fix_global` (`/pr-review-toolkit:review-pr` plus
+parallel fix subagents for confirmed findings on the raw diff) → the pilot's
+`review_local` (audit the copilot's commits via
 `/ultrareview-local`, plus parallel fix subagents for confirmed audit
-findings) → Claude's `final_review` (PR creation). The
+findings) → the pilot's `final_review` (PR creation). Under the default
+`pilot == "claude"` that is Codex, then Claude, then Claude; under
+`pilot == "codex"` it is Claude, then Codex, then Codex. Route each turn
+from `collab_status.current_owner`, never from these agent names. The
 shortcut-ancestry gate now fires at BOTH `review_fix_global` AND
 `review_local` sends when `task_list.is_none()` — each push must
 descend from the prior `last_head_sha`. All anti-puppeteering rules
