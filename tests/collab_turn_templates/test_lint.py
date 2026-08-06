@@ -1995,3 +1995,377 @@ def test_lint_requires_the_allowlist_to_say_why_set_pilot_is_absent(
     assert r.returncode == 1
     assert (f"{path}: the permission allowlist must say why "
             "`collab_set_pilot` is absent") in r.stdout
+
+
+# ---- `--` end-of-options terminator ----------------------------------------
+#
+# Duplicated from the lint rather than imported, for the reason given at the
+# top of this file: importing would make the sweep parametrize over "whatever
+# the lint currently pins", so deleting a pin would shrink these tests along
+# with it instead of failing them.
+#
+# Every test below is a CROSS-SURFACE test. The contract is stated once per
+# flag-parsing subcommand in three files, and the recurring failure is a
+# contract fixed in one surface and left stale in another — so removing it from
+# one file at a time is exactly the mutation that has to red, and a sweep that
+# only ever removes it everywhere at once would have missed this round's drift.
+TERMINATOR_SHARED_SNIPPETS = [
+    "**`--` ends the flags.** The first bare `--` token is the end-of-options "
+    "terminator: every token after it is literal positional text, never "
+    "parsed as a flag and never stripped.",
+    "The `--` itself is consumed — it is not part of the captured positional.",
+    "Flags are recognized only before the first `--`",
+    "anywhere in the token stream before the first `--`",
+    "a flag-shaped token after the first `--` is not malformed input — it is "
+    "literal positional text, and it must never raise a usage error.",
+]
+# (surface, every region label the lint must report for that surface).
+TERMINATOR_SURFACE_LABELS = [
+    (".claude-plugin/commands/collab.md", ["`start`", "`review`", "`join`"]),
+    (".codex-plugin/commands/collab.md", ["`start`", "`join`"]),
+    ("docs/COLLAB.md", ["§ `/collab` flag parsing"]),
+]
+TERMINATOR_REGION_SNIPPETS = [
+    (".claude-plugin/commands/collab.md", "`start`",
+     "**When the task text legitimately contains a flag-shaped token, put "
+     "`--` before the task**"),
+    (".claude-plugin/commands/collab.md", "`start`",
+     "`/collab start -- document how --pilot=codex behaves` records that "
+     "whole sentence as the task"),
+    (".claude-plugin/commands/collab.md", "`start`",
+     "the `--` terminator if one was given, with every token after that `--` "
+     "kept verbatim"),
+    (".claude-plugin/commands/collab.md", "`review`",
+     "**When the short topic legitimately contains a flag-shaped token, put "
+     "`--` before the topic**"),
+    (".claude-plugin/commands/collab.md", "`review`",
+     "`/collab review -- --pilot= handling` reviews that topic verbatim"),
+    (".claude-plugin/commands/collab.md", "`join`",
+     "**When the session id legitimately contains a flag-shaped token, put "
+     "`--` before the id**"),
+    (".claude-plugin/commands/collab.md", "`join`",
+     "`/collab join -- <session_id>` takes the id verbatim"),
+    (".claude-plugin/commands/collab.md", "`join`",
+     "both flags, and the `--` terminator if one was given"),
+    (".codex-plugin/commands/collab.md", "`start`",
+     "That rejection binds only tokens before the first `--`"),
+    (".codex-plugin/commands/collab.md", "`start`",
+     "`/collab start -- document how --pilot=codex behaves` records that "
+     "whole sentence as the task rather than erroring on it"),
+    (".codex-plugin/commands/collab.md", "`join`",
+     "These rules bind only tokens before the first `--`"),
+    (".codex-plugin/commands/collab.md", "`join`",
+     "`/collab join -- <session_id>` takes the id verbatim"),
+    (".codex-plugin/commands/collab.md", "`join`",
+     "leaves `pilot` and `implementer` both untouched"),
+    (".codex-plugin/commands/collab.md", "`join`",
+     "both flags, and the `--` terminator if one was given, kept verbatim"),
+    ("docs/COLLAB.md", "§ `/collab` flag parsing",
+     "**Malformed flag input stays a hard usage error**, unchanged by the "
+     "terminator"),
+    ("docs/COLLAB.md", "§ `/collab` flag parsing",
+     "**When the positional text legitimately contains a flag-shaped token, "
+     "put `--` before it.**"),
+    ("docs/COLLAB.md", "§ `/collab` flag parsing", "[--] <task>"),
+    ("docs/COLLAB.md", "§ `/collab` flag parsing", "[--] <session_id>"),
+    ("docs/COLLAB.md", "§ `/collab` flag parsing", "[--] <short-topic>"),
+]
+# The escape hatch — the half of the terminator contract a USER acts on —
+# stated once per flag-parsing region in that region's own words about its own
+# positional. Listed separately from TERMINATOR_REGION_SNIPPETS above (which it
+# partly duplicates) because the assertion is different: this one is swept
+# region by region, and every region NOT mutated has to stay green. A pin that
+# only proved "the phrase is missing somewhere" would be satisfied by a lint
+# that pinned the hatch file-wide, and file-wide is exactly what let the Codex
+# shim ship a `start` example with no sentence and a `join` with neither.
+#
+# All SIX regions, not the four that first carried it. `join`'s positional is a
+# session UUID that cannot realistically contain a flag-shaped token, so the
+# hatch there is not really about escaping one: it is the promise that
+# `/collab join -- <id>`, typed by a user who learned the habit from `start`,
+# is accepted rather than rejected as the "extra positional value" that parse
+# refuses. Both command files state it for `join`, so both are pinned for it.
+ESCAPE_HATCH_REGIONS = [
+    (".claude-plugin/commands/collab.md", "`start`",
+     "**When the task text legitimately contains a flag-shaped token, put "
+     "`--` before the task**"),
+    (".claude-plugin/commands/collab.md", "`review`",
+     "**When the short topic legitimately contains a flag-shaped token, put "
+     "`--` before the topic**"),
+    (".claude-plugin/commands/collab.md", "`join`",
+     "**When the session id legitimately contains a flag-shaped token, put "
+     "`--` before the id**"),
+    (".codex-plugin/commands/collab.md", "`start`",
+     "**When the task text legitimately contains a flag-shaped token, put "
+     "`--` before the task**"),
+    (".codex-plugin/commands/collab.md", "`join`",
+     "**When the session id legitimately contains a flag-shaped token, put "
+     "`--` before the id**"),
+    ("docs/COLLAB.md", "§ `/collab` flag parsing",
+     "**When the positional text legitimately contains a flag-shaped token, "
+     "put `--` before it.**"),
+]
+DOC_FLAG_PARSING_HEADING = "### `/collab` flag parsing — `--` ends the flags"
+TERMINATOR_USAGE_SNIPPETS = [
+    (".claude-plugin/commands/collab.md", "frontmatter `description`",
+     "/collab start [--pilot=claude|codex] [--implementer=claude|codex] "
+     "[--] <task>"),
+    (".claude-plugin/commands/collab.md", "frontmatter `description`",
+     "/collab review [--pilot=claude|codex] [--] <short-topic>"),
+    (".claude-plugin/commands/collab.md", "frontmatter `description`",
+     "(`--` ends the flags: everything after it is literal text)"),
+    (".claude-plugin/commands/collab.md", "frontmatter `argument-hint`",
+     "review [--pilot=claude|codex] [--] <short-topic>"),
+    (".claude-plugin/commands/collab.md", "§ `Unknown subcommand`",
+     "Usage: /collab start [--pilot=claude|codex] "
+     "[--implementer=claude|codex] [--] <task>"),
+    (".claude-plugin/commands/collab.md", "§ `Unknown subcommand`",
+     "`--` ends the flags: every token after it is literal text, so put `--` "
+     "before task text that contains a flag-shaped token"),
+    (".codex-plugin/commands/collab.md", "frontmatter `argument-hint`",
+     "start [--implementer=claude|codex] [--] <task>"),
+    (".codex-plugin/commands/collab.md", "frontmatter `argument-hint`",
+     "(`--` ends the flags: everything after it is literal text)"),
+]
+UNBOUNDED_FLAG_WORDING = "anywhere in the remaining token stream"
+
+
+def mutate_flex_occurrence(path, snippet, index, replacement=MARK):
+    """Replace only the `index`-th (0-based) occurrence of a flex phrase.
+
+    The whole-file `mutate*` helpers prove a phrase is pinned SOMEWHERE in the
+    file. That is the wrong granularity for a contract stated once per
+    subcommand: deleting all three copies reds a file-wide search just as well
+    as a per-section one, so only a single-copy mutation can tell them apart —
+    and "the flags were added to `start` and `join` was left on the old parse"
+    is precisely the single-copy case.
+    """
+    text = path.read_text()
+    pattern = r"\s+".join(re.escape(part) for part in snippet.split())
+    matches = list(re.finditer(pattern, text))
+    assert len(matches) > index, (
+        f"{path.name}: expected more than {index} occurrences of {snippet!r}, "
+        f"found {len(matches)}")
+    m = matches[index]
+    path.write_text(text[:m.start()] + replacement + text[m.end():])
+
+
+@pytest.mark.parametrize("surface,labels", TERMINATOR_SURFACE_LABELS)
+@pytest.mark.parametrize("snippet", TERMINATOR_SHARED_SNIPPETS)
+def test_lint_requires_the_terminator_contract_in_each_surface(
+        tmp_path, surface, labels, snippet):
+    # One surface at a time: this is the drift that shipped, with the `--`
+    # rule live in two files and absent from the third.
+    fixture = copy_fixture(tmp_path)
+    mutate_flex(fixture / surface, snippet)
+
+    r = run({"COLLAB_LINT_ROOT": str(fixture)})
+
+    assert r.returncode == 1
+    for label in labels:
+        assert (f"{surface}: {label} is missing `--` end-of-options "
+                f"terminator contract {snippet!r}") in r.stdout
+
+
+@pytest.mark.parametrize("surface,index,expected,intact", [
+    # `start`, `review`, `join` in document order in the Claude command file;
+    # `start`, `join` in the Codex shim.
+    (".claude-plugin/commands/collab.md", 2, "`join`", ["`start`", "`review`"]),
+    (".claude-plugin/commands/collab.md", 0, "`start`", ["`review`", "`join`"]),
+    (".codex-plugin/commands/collab.md", 1, "`join`", ["`start`"]),
+])
+def test_lint_requires_the_terminator_contract_in_each_subcommand(
+        tmp_path, surface, index, expected, intact):
+    # Within a surface the contract is stated once per subcommand, and the
+    # regression shape is one subcommand left behind. Removing a single copy
+    # must red, and must red for THAT subcommand only — a file-wide search
+    # would stay green here because the other copies are untouched.
+    snippet = "Flags are recognized only before the first `--`"
+    fixture = copy_fixture(tmp_path)
+    mutate_flex_occurrence(fixture / surface, snippet, index)
+
+    r = run({"COLLAB_LINT_ROOT": str(fixture)})
+
+    assert r.returncode == 1
+    assert (f"{surface}: {expected} is missing `--` end-of-options "
+            f"terminator contract {snippet!r}") in r.stdout
+    for label in intact:
+        assert (f"{surface}: {label} is missing `--` end-of-options "
+                f"terminator contract {snippet!r}") not in r.stdout
+
+
+@pytest.mark.parametrize("surface,label,snippet", TERMINATOR_REGION_SNIPPETS)
+def test_lint_requires_each_per_subcommand_terminator_snippet(
+        tmp_path, surface, label, snippet):
+    fixture = copy_fixture(tmp_path)
+    mutate_flex(fixture / surface, snippet)
+
+    r = run({"COLLAB_LINT_ROOT": str(fixture)})
+
+    assert r.returncode == 1
+    assert (f"{surface}: {label} is missing `--` end-of-options terminator "
+            f"contract {snippet!r}") in r.stdout
+
+
+@pytest.mark.parametrize("surface,label,snippet", ESCAPE_HATCH_REGIONS)
+def test_lint_requires_the_escape_hatch_in_every_flag_parsing_region(
+        tmp_path, surface, label, snippet):
+    # One region at a time. The terminator is only usable if the region a user
+    # reads TELLS them to type `--`, and the shape that shipped is a region
+    # that defines the terminator perfectly and never mentions the hatch — the
+    # Codex shim's `start` had the worked example with no sentence, and its
+    # `join` had neither. Deleting the sentence from one region must red for
+    # THAT region, and must leave the other five unreported: a lint that
+    # searched file-wide, or that pinned the hatch in only four of the six
+    # regions, passes this file's other tests untouched.
+    fixture = copy_fixture(tmp_path)
+    mutate_flex(fixture / surface, snippet)
+
+    r = run({"COLLAB_LINT_ROOT": str(fixture)})
+
+    assert r.returncode == 1
+    assert (f"{surface}: {label} is missing `--` end-of-options terminator "
+            f"contract {snippet!r}") in r.stdout
+    for other_surface, other_label, other_snippet in ESCAPE_HATCH_REGIONS:
+        if (other_surface, other_label) == (surface, label):
+            continue
+        assert (f"{other_surface}: {other_label} is missing `--` "
+                f"end-of-options terminator contract "
+                f"{other_snippet!r}") not in r.stdout
+
+
+def test_lint_requires_the_docs_flag_parsing_section_to_exist(tmp_path):
+    # docs/COLLAB.md carried no flag-parsing contract at all until this round,
+    # which is how the two command files came to disagree with nothing to
+    # arbitrate between them. Renaming the heading must not silently drop the
+    # spec's copy of the contract.
+    fixture = copy_fixture(tmp_path)
+    mutate(fixture / "docs" / "COLLAB.md", DOC_FLAG_PARSING_HEADING,
+           "### Something else")
+
+    r = run({"COLLAB_LINT_ROOT": str(fixture)})
+
+    assert r.returncode == 1
+    assert f"docs/COLLAB.md: missing {DOC_FLAG_PARSING_HEADING!r}" in r.stdout
+
+
+def test_lint_scopes_the_docs_flag_parsing_pins_to_their_own_subsection(
+        tmp_path):
+    # The section ends at the next `###`, not at the next `##`. Without that
+    # boundary the section runs on through the rest of § Prompt Templates and
+    # any sentence below it satisfies a pin scoped to the contract — so the
+    # rule could be deleted from the section that states it and restored
+    # anywhere downstream with the lint green.
+    fixture = copy_fixture(tmp_path)
+    doc = fixture / "docs" / "COLLAB.md"
+    snippet = "The `--` itself is consumed — it is not part of the captured positional."
+    mutate_flex(doc, snippet)
+    mutate(doc, "### Starting a session (Claude's terminal — normal path)",
+           f"### Decoy\n\n{snippet}\n\n"
+           "### Starting a session (Claude's terminal — normal path)")
+
+    r = run({"COLLAB_LINT_ROOT": str(fixture)})
+
+    assert r.returncode == 1
+    assert ("docs/COLLAB.md: § `/collab` flag parsing is missing `--` "
+            f"end-of-options terminator contract {snippet!r}") in r.stdout
+
+
+@pytest.mark.parametrize("surface,label,snippet", TERMINATOR_USAGE_SNIPPETS)
+def test_lint_requires_the_terminator_in_every_usage_surface(
+        tmp_path, surface, label, snippet):
+    fixture = copy_fixture(tmp_path)
+    mutate_flex(fixture / surface, snippet)
+
+    r = run({"COLLAB_LINT_ROOT": str(fixture)})
+
+    assert r.returncode == 1
+    assert (f"{surface}: {label} is missing `--` terminator usage "
+            f"{snippet!r}") in r.stdout
+
+
+@pytest.mark.parametrize("surface,index,expected,intact", [
+    # `[--] <task>` in document order in the Claude command file: the
+    # frontmatter `description`, the frontmatter `argument-hint`, then the
+    # Unknown-subcommand usage block.
+    (".claude-plugin/commands/collab.md", 0, "frontmatter `description`",
+     ["frontmatter `argument-hint`", "§ `Unknown subcommand`"]),
+    (".claude-plugin/commands/collab.md", 1, "frontmatter `argument-hint`",
+     ["frontmatter `description`", "§ `Unknown subcommand`"]),
+    (".claude-plugin/commands/collab.md", 2, "§ `Unknown subcommand`",
+     ["frontmatter `description`", "frontmatter `argument-hint`"]),
+    (".codex-plugin/commands/collab.md", 0, "frontmatter `argument-hint`", []),
+])
+def test_lint_requires_the_terminator_in_each_usage_region_separately(
+        tmp_path, surface, index, expected, intact):
+    # The same usage string appears three times in the Claude command file, so
+    # a file-wide search cannot tell "all three advertise `[--]`" from "the
+    # description advertises it three times". Dropping `[--]` from one of them
+    # is the realistic edit, and it must red for that region alone.
+    fixture = copy_fixture(tmp_path)
+    mutate_flex_occurrence(fixture / surface, "[--] <task>", index, "<task>")
+
+    r = run({"COLLAB_LINT_ROOT": str(fixture)})
+
+    assert r.returncode == 1
+    assert f"{surface}: {expected} is missing `--` terminator usage" in r.stdout
+    for label in intact:
+        assert (f"{surface}: {label} is missing `--` terminator usage "
+                "'/collab start") not in r.stdout
+        assert (f"{surface}: {label} is missing `--` terminator usage "
+                "'start [--") not in r.stdout
+
+
+@pytest.mark.parametrize("surface", [".claude-plugin/commands/collab.md",
+                                     ".codex-plugin/commands/collab.md",
+                                     "docs/COLLAB.md"])
+def test_lint_rejects_the_unterminated_flag_scan_wording(tmp_path, surface):
+    # The pre-terminator wording, reintroduced with every positive pin left
+    # intact — an ADDED sentence, not an edited one, so nothing else in the
+    # lint can catch it. That is how it survived in the Codex shim after the
+    # other two surfaces had been qualified: it reads as a simplification.
+    fixture = copy_fixture(tmp_path)
+    path = fixture / surface
+    path.write_text(path.read_text() +
+                    f"\n\nDetect the flag {UNBOUNDED_FLAG_WORDING}.\n")
+
+    r = run({"COLLAB_LINT_ROOT": str(fixture)})
+
+    assert r.returncode == 1
+    assert (f"{surface}:" in r.stdout
+            and "flag detection is described over an unbounded stream"
+            in r.stdout)
+    assert "end-of-options terminator contract" not in r.stdout
+
+
+@pytest.mark.parametrize("surface", [".claude-plugin/commands/collab.md",
+                                     ".codex-plugin/commands/collab.md",
+                                     "docs/COLLAB.md"])
+def test_lint_rejects_the_qualifier_being_dropped_from_the_flag_scan(
+        tmp_path, surface):
+    # The same regression as an EDIT: the qualifier deleted from the live
+    # sentence, which is the shape the shim actually shipped.
+    fixture = copy_fixture(tmp_path)
+    mutate_flex(fixture / surface, "anywhere in the token stream before the "
+                "first `--`", UNBOUNDED_FLAG_WORDING)
+
+    r = run({"COLLAB_LINT_ROOT": str(fixture)})
+
+    assert r.returncode == 1
+    assert "flag detection is described over an unbounded stream" in r.stdout
+
+
+def test_lint_reports_an_ambiguous_codex_shim_flag_region_anchor(tmp_path):
+    # The shim has no `##` headings, so its two flag-parsing regions are cut
+    # from anchor sentences. A duplicated anchor silently re-scopes the region
+    # every pin is checked against, so it is reported rather than resolved.
+    fixture = copy_fixture(tmp_path)
+    shim = fixture / ".codex-plugin" / "commands" / "collab.md"
+    anchor = "For `join`, parse exactly one session id"
+    shim.write_text(shim.read_text() + f"\n\n{anchor} plus flags.\n")
+
+    r = run({"COLLAB_LINT_ROOT": str(fixture)})
+
+    assert r.returncode == 1
+    assert (".codex-plugin/commands/collab.md: the `start` flag-parsing "
+            f"region is delimited by {anchor!r}, which appears 2 times") in r.stdout

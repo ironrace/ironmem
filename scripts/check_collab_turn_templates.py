@@ -906,8 +906,16 @@ def live_text(path: pathlib.Path) -> str:
 FENCE_OPEN_RE = re.compile(r"(`{3,}|~{3,})")
 
 
-def command_sections(text: str, heading: str) -> list[str]:
-    """Every `## ` section whose heading line is exactly `heading`.
+def command_sections(text: str, heading: str,
+                     boundaries: tuple[str, ...] = ("## ",)) -> list[str]:
+    """Every section whose heading line is exactly `heading`.
+
+    `boundaries` is the set of heading prefixes that END a section. It
+    defaults to `## ` alone, which is what every command-file pin wants: a
+    `### ` subheading is part of the `## ` section it sits under. docs/COLLAB.md
+    states the flag-parsing contract in a `### ` section, so that caller passes
+    `("## ", "### ")` — otherwise the section would run on to the end of the
+    file and a pin scoped to it would be satisfied by any text below it.
 
     Fenced code blocks are skipped when looking for boundaries. The dispatch
     loop's ```text pseudocode is full of `#` comment lines, and any line in a
@@ -933,7 +941,7 @@ def command_sections(text: str, heading: str) -> list[str]:
             opening = FENCE_OPEN_RE.match(stripped)
             if opening:
                 fence = opening.group(1)
-            elif line.startswith("## "):
+            elif any(line.startswith(prefix) for prefix in boundaries):
                 if inside:
                     sections.append("".join(body))
                     body = []
@@ -947,8 +955,9 @@ def command_sections(text: str, heading: str) -> list[str]:
     return sections
 
 
-def command_section(text: str, heading: str) -> str | None:
-    """The body of one `## ` section, heading line included.
+def command_section(text: str, heading: str,
+                    boundaries: tuple[str, ...] = ("## ",)) -> str | None:
+    """The body of one section, heading line included.
 
     The `--pilot` parsing contract has to hold in EACH of the three subcommand
     sections, and each of them states it in its own words about its own
@@ -964,7 +973,7 @@ def command_section(text: str, heading: str) -> str | None:
     only meaningful while there is exactly one copy, which is precisely why
     the duplicate is an error rather than a silent merge.
     """
-    sections = command_sections(text, heading)
+    sections = command_sections(text, heading, boundaries)
     if len(sections) > 1:
         err(f"{heading!r} appears {len(sections)} times — every pin scoped to "
             f"this section is written for one copy, and a second copy can "
@@ -1073,6 +1082,212 @@ PILOT_FLAG_SECTION_SNIPPETS = {
         "`{claude, codex}`",
     ],
 }
+# ---- `--` end-of-options terminator ----------------------------------------
+#
+# The contract is stated once per flag-parsing subcommand — `start`, `join` and
+# `review` in the Claude command file, `start` and `join` in the Codex shim,
+# once for all three in docs/COLLAB.md — and it has to be the SAME contract in
+# every one of them, because all three surfaces are executable agent specs and
+# whichever one an agent happens to read is the parser it implements.
+#
+# This is pinned across all three files, not one, because single-surface drift
+# is the failure mode this file exists to catch and it recurred while the
+# terminator was being added: the `--` rule landed in the Claude command file
+# and the Codex shim while docs/COLLAB.md still carried no flag-parsing
+# contract at all, and the shim's own `join` paragraph still said flags are
+# detected "anywhere in the remaining token stream" — unbounded, i.e. the
+# pre-terminator parser — after the other two had been qualified. A pin that
+# reads only one surface is green through all of that.
+#
+# What the five shared sentences buy, one hazard each:
+#   1. terminator definition — without it there is no `--` at all and
+#      `/collab start document how --pilot=codex behaves` silently reroutes
+#      the session (and, via the implementer-inherits-pilot default, BOTH
+#      roles) while dropping the token from the recorded task.
+#   2. consumption      — a `--` left in the captured positional lands in the
+#                         recorded task/session id/review topic.
+#   3. before-first-`--`— the recognition REGION. Without it, "anywhere in the
+#                         token stream" is unbounded again and rule 1 is dead
+#                         letter.
+#   4. anywhere-before  — the prior behaviour, preserved *inside* that region:
+#                         a terminator that also made flags positional would
+#                         break every existing invocation.
+#   5. not-an-error     — the interaction with the malformed-flag rule. A
+#                         parser that keeps `--pilot=gpt` after `--` as a
+#                         literal but still raises the usage error rejects
+#                         exactly the invocation the terminator exists to make
+#                         work.
+TERMINATOR_SHARED_SNIPPETS = [
+    "**`--` ends the flags.** The first bare `--` token is the end-of-options "
+    "terminator: every token after it is literal positional text, never "
+    "parsed as a flag and never stripped.",
+    "The `--` itself is consumed — it is not part of the captured positional.",
+    "Flags are recognized only before the first `--`",
+    "anywhere in the token stream before the first `--`",
+    "a flag-shaped token after the first `--` is not malformed input — it is "
+    "literal positional text, and it must never raise a usage error.",
+]
+# Per-region additions. Where a surface legitimately words the contract
+# differently it is pinned in ITS wording rather than the shared pin being
+# weakened to something vague enough to match every variant: the escape hatch
+# names that subcommand's own positional (task / short topic / session id /
+# positional text), and only the two command files restate the terminator at
+# the capture site, because only they specify the capture.
+#
+# The escape hatch is pinned separately from the terminator definition because
+# it is the half a user acts on. A file can define `--` correctly and never
+# tell anyone to type it; the invocations that motivate the terminator here are
+# `/collab start` tasks that are *about* the flags, and they are written by
+# whoever read this section.
+#
+# It is pinned in ALL SIX regions, not just the four that first carried it. The
+# Codex shim shipped this round with a worked `--` example under `start` and
+# nothing at all under `join`, which is the same one-region-left-behind drift
+# `terminator_regions()` exists to catch — an agent implementing the shim's
+# `join` reads a parse that rejects "an extra positional value" and is never
+# told that the consumed `--` is not one. The `join` hatch is worth stating
+# even though a session id is a UUID that cannot realistically contain a
+# flag-shaped token: what it buys there is the promise that `/collab join --
+# <id>`, typed by a user who learned the habit from `start`, is accepted rather
+# than rejected as a second positional.
+TERMINATOR_REGION_SNIPPETS = {
+    (".claude-plugin/commands/collab.md", "start"): [
+        "**When the task text legitimately contains a flag-shaped token, put "
+        "`--` before the task**",
+        "`/collab start -- document how --pilot=codex behaves` records that "
+        "whole sentence as the task",
+        "the `--` terminator if one was given, with every token after that "
+        "`--` kept verbatim",
+    ],
+    (".claude-plugin/commands/collab.md", "review"): [
+        "**When the short topic legitimately contains a flag-shaped token, "
+        "put `--` before the topic**",
+        "`/collab review -- --pilot= handling` reviews that topic verbatim",
+        "the `--` terminator if one was given, with every token after that "
+        "`--` kept verbatim",
+    ],
+    (".claude-plugin/commands/collab.md", "join"): [
+        "**When the session id legitimately contains a flag-shaped token, put "
+        "`--` before the id**",
+        "`/collab join -- <session_id>` takes the id verbatim",
+        "both flags, and the `--` terminator if one was given",
+    ],
+    (".codex-plugin/commands/collab.md", "start"): [
+        # The shim's `start` takes no `--pilot` at all, so its terminator
+        # clause has to bound the REJECTION rather than the parse — otherwise
+        # `/collab start -- document how --pilot=codex behaves` is a usage
+        # error on this side and literal text on the other two.
+        "That rejection binds only tokens before the first `--`",
+        "**When the task text legitimately contains a flag-shaped token, put "
+        "`--` before the task**",
+        "`/collab start -- document how --pilot=codex behaves` records that "
+        "whole sentence as the task rather than erroring on it",
+        "the `--` terminator if one was given, with every token after that "
+        "`--` kept verbatim",
+    ],
+    (".codex-plugin/commands/collab.md", "join"): [
+        "These rules bind only tokens before the first `--`",
+        "**When the session id legitimately contains a flag-shaped token, put "
+        "`--` before the id**",
+        # The shim's `join` is the one region whose parse rejects "an extra
+        # positional value", so its worked example has to say that the
+        # consumed `--` is not one — and, this side having two flags rather
+        # than the Claude file's one, that neither role moves.
+        "`/collab join -- <session_id>` takes the id verbatim",
+        "leaves `pilot` and `implementer` both untouched",
+        "both flags, and the `--` terminator if one was given, kept verbatim",
+    ],
+    ("docs/COLLAB.md", "`/collab` flag parsing"): [
+        # The doc is the only surface that states the interaction with the
+        # malformed-flag rule as its own bullet, and the only one whose usage
+        # block shows `[--]` for all three subcommands at once.
+        "**Malformed flag input stays a hard usage error**, unchanged by the "
+        "terminator",
+        "**When the positional text legitimately contains a flag-shaped "
+        "token, put `--` before it.**",
+        "These rules bind only tokens before the first `--`",
+        "[--] <task>",
+        "[--] <session_id>",
+        "[--] <short-topic>",
+    ],
+}
+DOC_FLAG_PARSING_HEADING = "### `/collab` flag parsing — `--` ends the flags"
+# The Codex shim has no `## ` sections, so its two flag-parsing paragraphs are
+# delimited by the sentences that open them. Each anchor must appear exactly
+# once: a duplicated or vanished anchor silently re-scopes (or empties) the
+# region every pin below is checked against, which is the same failure mode
+# `command_section` reports a duplicated heading for.
+CODEX_SHIM_FLAG_REGIONS = (
+    ("start", "For `start`, select `collab-plan-draft.md`.",
+     "For `join`, parse exactly one session id"),
+    ("join", "For `join`, parse exactly one session id",
+     "**Call `collab_status` first, before any mutation**"),
+)
+# The usage surfaces that advertise the terminator. These are what a user sees
+# before they type anything, and they are the only place the terminator is
+# discoverable without reading the spec: `[--]` missing from the hint while the
+# body defines it means the feature exists and nobody knows.
+#
+# Pinned per REGION rather than per file, because the same usage string appears
+# three times in the Claude command file (frontmatter `description`,
+# `argument-hint`, and the Unknown-subcommand block) and a file-wide search
+# cannot tell "all three carry `[--]`" from "the description carries it three
+# times" — the identical confusion `command_section` exists to prevent for the
+# subcommand sections.
+TERMINATOR_USAGE_SURFACES = [
+    (".claude-plugin/commands/collab.md", "fm:description", [
+        "/collab start [--pilot=claude|codex] [--implementer=claude|codex] "
+        "[--] <task>",
+        "/collab join [--pilot=claude|codex] [--implementer=claude|codex] "
+        "[--] <session_id>",
+        "/collab review [--pilot=claude|codex] [--] <short-topic>",
+        "(`--` ends the flags: everything after it is literal text)",
+    ]),
+    (".claude-plugin/commands/collab.md", "fm:argument-hint", [
+        "start [--pilot=claude|codex] [--implementer=claude|codex] "
+        "[--] <task>",
+        "join [--pilot=claude|codex] [--implementer=claude|codex] "
+        "[--] <session_id>",
+        "review [--pilot=claude|codex] [--] <short-topic>",
+    ]),
+    (".claude-plugin/commands/collab.md", "section:## Unknown subcommand", [
+        "Usage: /collab start [--pilot=claude|codex] "
+        "[--implementer=claude|codex] [--] <task>",
+        "[--] <session_id>",
+        "[--] <short-topic>",
+        "`--` ends the flags: every token after it is literal text, so put "
+        "`--` before task text that contains a flag-shaped token",
+    ]),
+    (".codex-plugin/commands/collab.md", "fm:argument-hint", [
+        # No `--pilot` on this side's `start` — see
+        # CODEX_START_PILOT_REJECTION_SNIPPETS — so the hint is deliberately
+        # NOT the Claude one, and pinning it verbatim is what keeps a
+        # copy-paste sync from advertising a flag the shim rejects.
+        "start [--implementer=claude|codex] [--] <task>",
+        "join [--pilot=claude|codex] [--implementer=claude|codex] "
+        "[--] <session_id>",
+        "(`--` ends the flags: everything after it is literal text)",
+    ]),
+]
+# The negative half. The pre-terminator wording said flags are detected
+# "anywhere in the remaining token stream" — unbounded, with nothing to stop a
+# `--pilot=` inside the positional text from being consumed as a flag — and it
+# survived in the Codex shim after the other surfaces had been qualified. It is
+# the wording a rewrite reaches for, because it is shorter and reads as a
+# simplification rather than as a behaviour change.
+#
+# Matched by scanning for the unbounded SHAPE (`anywhere in the … token/argument
+# stream`) and requiring the qualifier right behind it, rather than by pinning
+# the one stale sentence: "remaining", "whole", "argument stream" and a bare
+# "anywhere in the token stream" are the same contract and only one of them
+# actually shipped. The window is generous enough for a markdown bold marker
+# and a line wrap between the two halves (the docs copy wraps mid-phrase) and
+# far too tight to borrow a qualifier from an unrelated sentence.
+UNBOUNDED_FLAG_SCAN_RE = re.compile(
+    r"anywhere\s+in\s+the\s+(?:[A-Za-z]+\s+){0,3}(?:token|argument)\s+stream",
+    re.IGNORECASE)
+UNBOUNDED_FLAG_QUALIFIER_RE = flex("before the first `--`")
+UNBOUNDED_FLAG_QUALIFIER_WINDOW = 60
 # The join-side pilot reassignment contract, per command file. Both harnesses
 # carry it, mirrored around their own identity: each may hand the role away
 # only while it IS the pilot, and neither may reclaim it from the other side.
@@ -1697,6 +1912,147 @@ def check_pilot_flag_parsing_contract() -> None:
             if not flex(phrase).search(section):
                 err(f".claude-plugin/commands/collab.md: `{name}` section is "
                     f"missing pilot-flag parsing contract {phrase!r}")
+
+
+def terminator_regions() -> list[tuple[str, str, str, str]]:
+    """Regions that must state the `--` terminator: (rel, key, label, text).
+
+    A region is one subcommand's flag-parsing prose. Regions are extracted
+    per surface rather than searched file-wide for the reason
+    `command_section` exists: a file-wide match cannot tell "`start`, `join`
+    and `review` each carry the rule" from "`start` carries it three times",
+    and adding the flags to `start` first and leaving the other two on the old
+    parse is the regression that has now happened twice on this contract.
+
+    A missing region is reported here and skipped, rather than silently
+    contributing no pins — an empty region satisfies nothing, but only if
+    someone is told it was empty.
+    """
+    regions: list[tuple[str, str, str, str]] = []
+    command_text = live_text(COMMAND)
+    for name in ("start", "review", "join"):
+        section = command_section(command_text,
+                                  PILOT_FLAG_SECTION_HEADINGS[name])
+        if section is None:
+            err(f".claude-plugin/commands/collab.md: missing `{name}` "
+                f"subcommand section — the `--` end-of-options terminator "
+                f"contract is pinned per subcommand, so a renamed heading "
+                f"drops that subcommand's terminator pins silently")
+            continue
+        regions.append((".claude-plugin/commands/collab.md", name,
+                        f"`{name}`", section))
+
+    rel = ".codex-plugin/commands/collab.md"
+    if not CODEX_COMMAND.exists():
+        err(f"{rel}: missing Codex slash command, so its `--` end-of-options "
+            f"terminator contract is unpinned")
+    else:
+        shim = live_text(CODEX_COMMAND)
+        for name, opening, closing in CODEX_SHIM_FLAG_REGIONS:
+            counts = [(anchor, len(flex(anchor).findall(shim)))
+                      for anchor in (opening, closing)]
+            bad = [(anchor, n) for anchor, n in counts if n != 1]
+            if bad:
+                for anchor, n in bad:
+                    err(f"{rel}: the `{name}` flag-parsing region is "
+                        f"delimited by {anchor!r}, which appears {n} times "
+                        f"(expected exactly 1) — the region every `--` "
+                        f"terminator pin is checked against cannot be "
+                        f"located")
+                continue
+            start = flex(opening).search(shim).start()
+            end = flex(closing).search(shim).start()
+            if end <= start:
+                err(f"{rel}: the `{name}` flag-parsing region's closing "
+                    f"anchor {closing!r} precedes its opening anchor "
+                    f"{opening!r}")
+                continue
+            regions.append((rel, name, f"`{name}`", shim[start:end]))
+
+    section = command_section(live_text(DOC), DOC_FLAG_PARSING_HEADING,
+                              ("## ", "### "))
+    if section is None:
+        err(f"docs/COLLAB.md: missing {DOC_FLAG_PARSING_HEADING!r} — the "
+            f"spec carried no flag-parsing contract at all until the "
+            f"terminator was added, which is how the two command files came "
+            f"to disagree with nothing to arbitrate between them")
+    else:
+        regions.append(("docs/COLLAB.md", "`/collab` flag parsing",
+                        "§ `/collab` flag parsing", section))
+    return regions
+
+
+def check_end_of_options_terminator_contract() -> None:
+    """`--` must end the flags identically in all three surfaces.
+
+    Five sentences have to hold in every flag-parsing region (see
+    TERMINATOR_SHARED_SNIPPETS for what each one buys), plus that region's own
+    escape hatch and capture rule. All three files are checked because the
+    contract is only real if all three hold it: they are executable agent
+    specs, and an agent implements whichever one it reads.
+    """
+    for rel, key, label, text in terminator_regions():
+        phrases = TERMINATOR_SHARED_SNIPPETS + TERMINATOR_REGION_SNIPPETS.get(
+            (rel, key), [])
+        for phrase in phrases:
+            if not flex(phrase).search(text):
+                err(f"{rel}: {label} is missing `--` end-of-options "
+                    f"terminator contract {phrase!r}")
+
+
+def check_terminator_usage_surfaces() -> None:
+    """`[--]` must appear in every usage string that advertises the flags."""
+    for rel, spec, phrases in TERMINATOR_USAGE_SURFACES:
+        path = ROOT / rel
+        if not path.exists():
+            err(f"{rel}: missing usage surface for the `--` terminator")
+            continue
+        kind, _, key = spec.partition(":")
+        if kind == "fm":
+            fm = parse_frontmatter(path.read_text())
+            region = None if fm is None else fm.get(key)
+            label = f"frontmatter `{key}`"
+        else:
+            region = command_section(live_text(path), key)
+            label = f"§ `{key.removeprefix('## ')}`"
+        if region is None:
+            err(f"{rel}: {label} is missing entirely — the `[--]` usage "
+                f"contract is pinned there, and a usage string that never "
+                f"shows `[--]` leaves the terminator undiscoverable")
+            continue
+        for phrase in phrases:
+            if not flex(phrase).search(region):
+                err(f"{rel}: {label} is missing `--` terminator usage "
+                    f"{phrase!r}")
+
+
+def check_no_unbounded_flag_scan() -> None:
+    """No surface may describe flag detection over an unterminated stream.
+
+    The qualifier is the whole terminator: "anywhere in the token stream" with
+    no `before the first `--`` behind it is the pre-terminator parser, in
+    which a `--pilot=` inside the positional text is consumed as a real flag no
+    matter where the user put `--`. That exact sentence outlived the fix in the
+    Codex shim while the other two surfaces were already qualified, so this is
+    checked in all three files.
+    """
+    for path, rel in ((COMMAND, ".claude-plugin/commands/collab.md"),
+                      (CODEX_COMMAND, ".codex-plugin/commands/collab.md"),
+                      (DOC, "docs/COLLAB.md")):
+        if not path.exists():
+            continue
+        text = live_text(path)
+        for match in UNBOUNDED_FLAG_SCAN_RE.finditer(text):
+            window = text[match.end():
+                          match.end() + UNBOUNDED_FLAG_QUALIFIER_WINDOW]
+            if not UNBOUNDED_FLAG_QUALIFIER_RE.search(window):
+                line_no = text.count("\n", 0, match.start()) + 1
+                err(f"{rel}:{line_no}: flag detection is described over an "
+                    f"unbounded stream ({match.group(0)!r}) with no "
+                    f"\"before the first `--`\" qualifier behind it — that is "
+                    f"the pre-terminator parser, which consumes a "
+                    f"flag-shaped token in the positional text as a real flag "
+                    f"however the user quoted it")
 
 
 def check_pilot_join_authorization_contract() -> None:
@@ -2671,6 +3027,9 @@ def main() -> int:
     check_pilot_submit_doc_contract()
     check_review_diff_trigger_detection_contract()
     check_pilot_flag_parsing_contract()
+    check_end_of_options_terminator_contract()
+    check_terminator_usage_surfaces()
+    check_no_unbounded_flag_scan()
     check_pilot_join_authorization_contract()
     check_dispatcher_approval_gate_contract()
     check_codex_shim_unrouted_phases_contract()
