@@ -1,6 +1,6 @@
 ---
-description: Start or join an IronRace bounded planning session with Codex, auto-flowing into v3 batch coding. Covers v1 planning, v3 batch implementation (Claude or Codex via approved task plan + iron-build) → global review → PR handoff, and the post-iron-build review shortcut. Usage — /collab start [--implementer=claude|codex] <task>  |  /collab join [--implementer=claude|codex] <session_id>  |  /collab review <short-topic>
-argument-hint: start [--implementer=claude|codex] <task> | join [--implementer=claude|codex] <session_id> | review <short-topic>
+description: Start or join an IronRace bounded planning session with Codex, auto-flowing into v3 batch coding. Covers v1 planning, v3 batch implementation (Claude or Codex via approved task plan + iron-build) → global review → PR handoff, and the post-iron-build review shortcut. Usage — /collab start [--pilot=claude|codex] [--implementer=claude|codex] <task>  |  /collab join [--pilot=claude|codex] [--implementer=claude|codex] <session_id>  |  /collab review [--pilot=claude|codex] <short-topic>
+argument-hint: start [--pilot=claude|codex] [--implementer=claude|codex] <task> | join [--pilot=claude|codex] [--implementer=claude|codex] <session_id> | review [--pilot=claude|codex] <short-topic>
 ---
 
 <!-- DERIVED FROM docs/COLLAB.md — protocol changes must update:
@@ -18,17 +18,57 @@ $ARGUMENTS
 
 Parse the first word of `$ARGUMENTS` as the subcommand and behave as follows.
 
-## `start [--implementer=claude|codex] <task>`
+## `start [--pilot=claude|codex] [--implementer=claude|codex] <task>`
 
 Everything except the task is inferred — never ask the user for paths or
 branch names.
 
 1. Parse `$ARGUMENTS`:
    - Strip the leading `start` token.
-   - Detect optional `--implementer=claude` or `--implementer=codex` flag
-     anywhere in the remaining tokens. Default `"claude"` if absent. Reject
-     any other value with a usage error (do not silently fall back).
-   - `task` ← the remaining text after stripping `start` and the flag.
+   - Detect the optional `--pilot=claude` / `--pilot=codex` flag and the
+     optional `--implementer=claude` / `--implementer=codex` flag
+     **anywhere in the remaining token stream** — in either order, before
+     or after task text. **Strip both flag tokens out of the stream before
+     capturing the positional `<task>`**, so no flag ever leaks into the
+     task string.
+   - `pilot` ← the `--pilot` value; default `"claude"` when the flag is
+     absent. `pilot` names the agent that leads v1 planning (synthesis,
+     finalize) and the v3 pilot-owned review turns.
+   - `implementer` ← the `--implementer` value; when the flag is absent it
+     defaults to the **resolved pilot**, not unconditionally to
+     `"claude"`. This mirrors the server's own default — `collab_start`
+     resolves `pilot` first and then falls back to it for an omitted
+     `implementer` (`crates/ironmem/src/mcp/tools/mod.rs:274`:
+     "pilot picks the planning lead (default claude); implementer defaults
+     to pilot") — so `start --pilot=codex <task>` yields
+     `implementer=codex` with no second flag. You may simply omit
+     `implementer` from the call and let the server apply that default;
+     either way the resolved value is read back in step 3.
+   - **`pilot` and `implementer` are orthogonal.** All four combinations
+     are legal and none is rejected: `(claude, claude)`, `(claude, codex)`,
+     `(codex, claude)`, `(codex, codex)`. A `pilot=codex` session with
+     `--implementer=claude` is a normal configuration (Codex plans, Claude
+     codes), and so is its mirror. Never coerce one flag to match the other
+     when both were given explicitly, and never refuse a pairing.
+   - **Malformed flag input is a hard usage error.** Reject — and **do not
+     silently fall back to the default on a malformed flag** — each of:
+     an unrecognized value (`--pilot=gpt`), an empty value (`--pilot=`),
+     the bare flag with no `=` (`--pilot`), and the same flag given more
+     than once (`--pilot=claude --pilot=codex`). The error text must name
+     **both** the offending token/value **and** the accepted set
+     `{claude, codex}`:
+
+     ```
+     Usage error: `--pilot=gpt` is not valid — `--pilot` accepts one of {claude, codex}
+     ```
+
+     ```
+     Usage error: `--pilot` given twice (`claude`, `codex`) — `--pilot` accepts one of {claude, codex}, exactly once
+     ```
+
+     The identical rule, wording and accepted set `{claude, codex}` apply
+     to `--implementer`. Stop on the error; do not start a session.
+   - `task` ← the remaining text after stripping `start` and both flags.
 2. Resolve defaults:
    - `repo_path` ← output of `git rev-parse --show-toplevel` (run via Bash).
    - `current_branch` ← output of `git branch --show-current`.
@@ -72,21 +112,28 @@ branch names.
        `main`, every later turn that trusts `collab_status.branch` will
        check out and hard-reset local `main`, and the next push lands
        straight on `main`, bypassing PR review entirely.)
-   - `initiator` ← `"claude"` (this is Claude's terminal).
+   - `initiator` ← `"claude"` (this is Claude's terminal). `initiator`
+     names the **dispatcher**, not the pilot — it stays `"claude"` under
+     every `--pilot` value, and is orthogonal to `pilot`.
 3. Call `mcp__ironmem__collab_start` with `repo_path`, `branch`,
-   `initiator`, `task`, and `implementer`. The MCP tool returns
-   `session_id`, `task`, and the resolved `implementer` — verify it
-   matches what you sent. **Log:** `t0_session_started`
+   `initiator`, `task`, `pilot`, and `implementer`. The MCP tool returns
+   `session_id`, `task`, and the resolved `pilot` and `implementer` —
+   **verify both against what you sent**, exactly as `implementer` is
+   verified today. If either resolved value differs from what you
+   requested, stop and report it rather than proceeding under a role
+   assignment you did not ask for. (When you omitted `implementer` to take
+   the server's pilot-derived default, the resolved value to expect is the
+   resolved `pilot`.) **Log:** `t0_session_started`
 4. **Do not ask the user to run anything in a Codex terminal.** Claude
    drives every Codex-owned turn via background `codex exec` in this
    same terminal — there is no second terminal for the user to manage.
    See the "Codex handoff — background `codex exec`" section below for
    the procedure, fallback, and failure modes. Just report the new
-   `session_id` and selected `implementer` to the user as a single line
-   so they can track it:
+   `session_id` and the resolved `pilot` and `implementer` to the user as
+   a single line so they can track it:
 
    ```
-   Collab session started: <session_id> (implementer: <claude|codex>, branch: <branch>)
+   Collab session started: <session_id> (pilot: <claude|codex>, implementer: <claude|codex>, branch: <branch>)
    ```
 
    If step 2 created a new worktree, also report its path on the next line:
@@ -101,7 +148,11 @@ branch names.
 5. Draft your first plan for `<task>` autonomously — **no Plan Mode, no
    user approval here.** The draft is yours alone, Codex cannot see it.
    Once drafted, call `mcp__ironmem__collab_send` with
-   `sender="claude"`, `topic="draft"`, `content=<the plan text>`. Your
+   `sender="claude"`, `topic="draft"`, `content=<the plan text>`.
+   **`sender="claude"` stays literal here regardless of `--pilot`** —
+   `PlanParallelDrafts` requires *both* agents to draft blind, so this is
+   Claude writing its own draft as itself, not a pilot-routed send; there
+   is no `$SENDER` substitution on this call. Your
    only planning user gate is the final approved task plan at
    `PlanClaudeFinalizePending`; sending the draft autonomously lets Codex
    start grinding immediately instead of waiting on a user think-time gate.
@@ -112,22 +163,45 @@ branch names.
    polls. **Race exception (fallback only):** if Codex submitted its
    draft first (only possible when the user manually ran `/collab join`
    in a Codex terminal under the fallback path), the phase advances
-   directly to `PlanSynthesisPending` with `current_owner == "claude"`
-   on the second draft's arrival — the loop will see Claude is owner
-   and proceed to synthesis. After the plan locks (`PlanLocked`), the
+   directly to `PlanSynthesisPending` on the second draft's arrival, owned
+   by the **pilot** — read `current_owner` from `collab_status` rather than
+   assuming Claude. Under the default `pilot == "claude"` the loop sees
+   Claude is owner and proceeds to synthesis; under `pilot == "codex"`
+   synthesis is Codex's turn and the loop dispatches Codex via bg-exec
+   instead. Do not synthesize as Claude on the strength of the phase name
+   alone. After the plan locks (`PlanLocked`), the
    session automatically flows into the v3 coding bridge (no separate
    invocation needed).
 
-## `review <short-topic>`
+## `review [--pilot=claude|codex] <short-topic>`
 
 Shortcut entry for post-iron-build flows: skip v1
 planning and v3 batch implementation, and drop straight into the v3
-global-review stage with Codex as the reviewer on the already-committed
-branch.
+global-review stage with the copilot as the reviewer on the
+already-committed branch (under the default `pilot=claude` the copilot is
+Codex).
 Everything except the short topic is inferred — never ask the user for
 paths, branches, or SHAs.
 
-1. Resolve defaults:
+1. Parse `$ARGUMENTS`:
+   - Strip the leading `review` token.
+   - Detect the optional `--pilot=claude` / `--pilot=codex` flag
+     **anywhere in the remaining token stream**, and **strip that flag
+     token before capturing the positional `<short-topic>`**. Default
+     `"claude"` when absent.
+   - **Malformed flag input is a hard usage error**, with the same rule as
+     `start`: an unrecognized value (`--pilot=gpt`), an empty value
+     (`--pilot=`), the bare flag with no `=` (`--pilot`), or `--pilot`
+     given more than once is rejected with a message naming **both** the
+     offending token/value **and** the accepted set `{claude, codex}` —
+     **do not silently fall back to the default on a malformed flag.**
+     Stop on the error; do not start a review session.
+   - `review` takes no `--implementer` flag: a review-only session has no
+     implementation phase to route. The server seeds `implementer` from
+     the resolved `pilot` for uniformity. `pilot` and `implementer` stay
+     orthogonal fields — nothing here rejects a `(pilot, implementer)`
+     combination.
+2. Resolve defaults:
    - `repo_path` ← output of `git rev-parse --show-toplevel`.
    - `branch` ← output of `git branch --show-current`. If the result is
      empty (detached HEAD) or equals `main`/`master`/`trunk`, abort with
@@ -136,53 +210,133 @@ paths, branches, or SHAs.
    - `base_sha` ← output of `git merge-base origin/main HEAD` (fall back
      to `origin/master` if that fails, then `origin/trunk`). Abort if all
      three fail with a message asking the user to set an upstream.
-   - `initiator` ← `"claude"`.
-   - `task` ← the remainder of `$ARGUMENTS` after the word `review`.
-2. Call `mcp__ironmem__collab_start_code_review` with
-   `{repo_path, branch, base_sha, head_sha, initiator, task}`.
-3. Report the session id back as a single line:
+   - `initiator` ← `"claude"`. **`initiator` names the *dispatcher*, not
+     the pilot** — the terminal invoking this shortcut. It stays
+     `"claude"` under **every** `--pilot` value, including
+     `--pilot=codex`, because this command only ever runs from Claude's
+     terminal. The server enforces that: `collab_start_code_review`'s
+     `initiator` enum admits only `"claude"`, and the check is
+     deliberately unconditional even when `pilot=codex`
+     (`crates/ironmem/src/mcp/tools/collab_session.rs`). `pilot` is the
+     orthogonal field naming the review-flow lead. Never set `initiator`
+     from the `--pilot` value.
+   - `task` ← the remaining text after stripping `review` and the flag.
+3. Call `mcp__ironmem__collab_start_code_review` with
+   `{repo_path, branch, base_sha, head_sha, initiator, task, pilot}`. It
+   returns `session_id`, `task`, and the resolved `pilot` — verify the
+   resolved `pilot` matches what you sent, and stop and report if it does
+   not.
+4. Report the session id back as a single line:
 
    ```
-   Collab review session started: <session_id>
+   Collab review session started: <session_id> (pilot: <claude|codex>)
    ```
 
-4. **Do not enter Plan Mode and do not draft anything.** The shortcut
-   positions the session at `CodeReviewFixGlobalPending` — the next action
-   is Codex's review turn, driven inline via `codex exec` under the
-   existing "Codex handoff — background `codex exec`" rules.
-5. Because shortcut sessions have no collab `task_list`, the Codex review
-   prompt must recover context before judging the branch: search ironmem
+5. **Do not enter Plan Mode and do not draft anything.** The shortcut
+   positions the session at `CodeReviewFixGlobalPending`, which is
+   **copilot**-owned — read `current_owner` from `collab_status` rather
+   than assuming an agent. Under the default `pilot == "claude"` the next
+   action is Codex's review turn, driven inline via `codex exec` under the
+   existing "Codex handoff — background `codex exec`" rules; under
+   `pilot == "codex"` Claude is the copilot and owns that turn itself (the
+   v3 dispatch loop's `CodeReviewFixGlobalPending` row covers both).
+6. Because shortcut sessions have no collab `task_list`, the copilot's
+   review turn must recover context before judging the branch: search ironmem
    checkpoints for the same `repo_path`/`branch`, read any referenced
    approved task markdown, and scan the current code/diff to determine
    which acceptance criteria are already complete. If no checkpoint exists,
    fall back to the branch diff plus nearby plan docs under
    `docs/iron/plans/`.
-6. Enter the v3 dispatch loop at phase `CodeReviewFixGlobalPending`. The
-   loop handles the three remaining turns (`review_fix_global` from Codex,
-   `review_local` from Claude, then `final_review` from Claude) and
-   terminates at `CodingComplete`.
+7. Enter the v3 dispatch loop at phase `CodeReviewFixGlobalPending`. The
+   loop handles the three remaining turns (`review_fix_global` from the
+   **copilot**, `review_local` from the **pilot**, then `final_review`
+   from the **pilot**) and terminates at `CodingComplete`. Under the
+   default `pilot == "claude"` that is Codex, then Claude, then Claude;
+   under `pilot == "codex"` it is Claude, then Codex, then Codex. Route
+   each turn from `collab_status.current_owner`, never from these agent
+   names.
 
-## `join [--implementer=claude|codex] <session_id>`
+## `join [--pilot=claude|codex] [--implementer=claude|codex] <session_id>`
 
 1. Parse `$ARGUMENTS`:
    - Strip the leading `join` token.
-   - Detect optional `--implementer=claude` or `--implementer=codex` flag
-     anywhere in the remaining tokens. Reject any other value with a usage
-     error.
-   - `session_id` ← the remaining token. Reject missing or extra tokens.
+   - Detect the optional `--pilot=claude` / `--pilot=codex` flag and the
+     optional `--implementer=claude` / `--implementer=codex` flag
+     **anywhere in the remaining token stream**, in either order, before
+     or after the id. **Strip both flag tokens out of the stream before
+     capturing the positional `<session_id>`.**
+   - **Malformed flag input is a hard usage error**, identical to `start`:
+     an unrecognized value (`--pilot=gpt`), an empty value (`--pilot=`),
+     the bare flag with no `=` (`--pilot`), or the same flag given more
+     than once is rejected with a message naming **both** the offending
+     token/value **and** the accepted set `{claude, codex}` — **do not
+     silently fall back to the default on a malformed flag.** The same
+     rule and accepted set apply to `--implementer`. Stop on the error;
+     do not join.
+   - **`pilot` and `implementer` are orthogonal here too**: no
+     `(pilot, implementer)` combination is rejected, and neither flag is
+     inferred from the other on `join`.
+   - Unlike `start`, an **absent** flag is not defaulted on `join` — the
+     session already carries both roles. Absent `--pilot` means "leave the
+     session's pilot alone"; absent `--implementer` means "leave the
+     session's implementer alone". Only issue a mutation for a flag that
+     was actually given.
+   - `session_id` ← the single remaining token. Reject missing or extra
+     tokens.
 2. Store `<session_id>` as the current collab session — reuse it on every
    subsequent `collab_*` call without re-prompting the user.
 3. `agent` / `sender` / `receiver` ← `"claude"` (still Claude's terminal;
    in Codex's terminal this would be `"codex"`, handled by the Codex side).
-4. If the optional implementer flag was present, call
+4. **Call `mcp__ironmem__collab_status` FIRST**, before any mutation, and
+   read `task`, `phase`, `current_owner`, `implementer`, and `pilot`.
+   Every branch below is decided from that record. **Passing `--pilot` is
+   never by itself authorization to change the pilot** — the flag states an
+   intent; `status.pilot` decides whether that intent is even attemptable.
+5. If `--pilot` was given, branch on `status.pilot` in **exactly this
+   order**:
+   1. **Requested pilot matches `status.pilot`** → no-op. **Do not call
+      `mcp__ironmem__collab_set_pilot`.** Report the (unchanged) pilot and
+      continue with the status you already read. Re-joining with the same
+      `--pilot` is idempotent and must not touch the session — including
+      mid-drafting, where an unnecessary call would be rejected outright.
+   2. **Differs and `status.pilot == "claude"`** → authorized: Claude
+      currently holds the role and may hand it away. Call
+      `mcp__ironmem__collab_set_pilot` with `session_id`,
+      `agent="claude"`, and `pilot=<flag value>` — **before** any
+      `collab_set_implementer` call — and use the returned session record
+      as the current status from then on (the same update also moves
+      `current_owner` to the new pilot, so a stale pre-call status would
+      misroute the very next turn).
+   3. **Differs and `status.pilot != "claude"`** → **fail before
+      attempting the mutation.** `collab_set_pilot` is caller-restricted:
+      `crates/ironmem/src/mcp/tools/collab_session.rs` checks
+      authorization *before* any state check, and only the session's
+      **current** pilot may reassign the role. Claude, having already
+      handed the role away, is the copilot here and can never reclaim it
+      from this side. Report to the user naming the current pilot and
+      stating that reclaiming `pilot=claude` requires a **Codex-side**
+      `join --pilot=claude`. **Never call `collab_set_pilot` in this
+      branch, and never retry.**
+
+   **Stacked constraint — authorization is necessary, not sufficient.**
+   Even in the authorized branch the server applies a second, independent
+   rule: the pilot may only be reassigned in `PlanParallelDrafts` **and
+   only before either draft lands** (both `claude_draft_hash` and
+   `codex_draft_hash` still unset). So a re-join into a session that is
+   already drafting — or past drafting altogether — is rejected even for a
+   legitimately authorized caller. When that happens, **surface the
+   server's rejection message verbatim, preserve the existing pilot, and
+   continue with the session exactly as it stands — never retry, never
+   overwrite.** Do not pre-empt the server's decision either: make the one
+   call and report what it says.
+6. If the optional implementer flag was present, call
    `mcp__ironmem__collab_set_implementer` with `session_id`,
-   `agent="claude"`, and `implementer=<flag value>`, then use the returned
-   session record as the current status. This may transfer an active
-   `CodeImplementPending` batch to the selected implementer.
-5. Otherwise call `mcp__ironmem__collab_status` to read `task`,
-   `phase`, `current_owner`, and `implementer`.
-6. Report the task, phase, and implementer to the user.
-7. Branch on the returned `phase`:
+   `agent="claude"`, and `implementer=<flag value>` — **after** any pilot
+   change from step 5 — then use the returned session record as the
+   current status. This may transfer an active `CodeImplementPending`
+   batch to the selected implementer.
+7. Report the task, phase, pilot, and implementer to the user.
+8. Branch on the returned `phase`:
    - **v1 active** (`PlanParallelDrafts` .. `PlanClaudeFinalizePending`) →
      enter the v1 planning loop (see below).
    - **`PlanLocked` pre-task_list** (final_plan_hash set, no task_list yet) →
@@ -1229,5 +1383,5 @@ Full semantics: `docs/COLLAB.md` § "Context-occupancy handoff".
 If `$ARGUMENTS` does not start with `start`, `join`, or `review`, tell the user:
 
 ```
-Usage: /collab start [--implementer=claude|codex] <task>  |  /collab join [--implementer=claude|codex] <session_id>  |  /collab review <short-topic>
+Usage: /collab start [--pilot=claude|codex] [--implementer=claude|codex] <task>  |  /collab join [--pilot=claude|codex] [--implementer=claude|codex] <session_id>  |  /collab review [--pilot=claude|codex] <short-topic>
 ```
