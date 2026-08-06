@@ -46,6 +46,39 @@ impl SessionState {
         // keep in sync with collab_driver::PHASE_CODING_{COMPLETE,FAILED}
         matches!(self.phase.as_str(), "CodingComplete" | "CodingFailed")
     }
+
+    /// Fixture row for tests, carrying the three fields that decide what the
+    /// dispatcher does — `phase`, `current_owner`, `pilot` — as required
+    /// arguments; everything else takes an inert placeholder that callers
+    /// override with struct-update syntax (`..SessionState::fixture(..)`).
+    ///
+    /// `pilot` is deliberately an argument rather than a defaulted field, and
+    /// there is deliberately no `Default` impl: a `SessionState` that can be
+    /// built without saying who leads the session is the exact silent default
+    /// `collab_driver::ensure_supported_pilot` exists to eliminate — a
+    /// codex-piloted session read as `claude` misclassifies every lead turn.
+    /// Every other field may gain a placeholder here precisely because none of
+    /// them changes which agent the driver believes is in charge.
+    ///
+    /// Not a production path. `read_session_state` below populates all eleven
+    /// fields from the row and must keep doing so — no read may reach a
+    /// placeholder.
+    pub fn fixture(phase: &str, current_owner: &str, pilot: &str) -> Self {
+        Self {
+            phase: phase.to_string(),
+            current_owner: current_owner.to_string(),
+            implementer: "claude".to_string(),
+            pilot: pilot.to_string(),
+            pr_url: None,
+            review_round: 0,
+            global_review_round: 0,
+            task_review_round: 0,
+            last_head_sha: None,
+            pending_failure: None,
+            recovery_phase: None,
+            recovery_owner: None,
+        }
+    }
 }
 
 /// Open the per-task collab DB read-only and select the single session row.

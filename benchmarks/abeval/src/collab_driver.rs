@@ -166,24 +166,47 @@ impl<'a> RecoveryState<'a> {
 /// already covers the pair (or nothing in this harness can serve it).
 ///
 /// The phase decides WHICH completion event is owed; the owner decides WHICH
-/// agent runs it. `.codex-plugin/prompts/collab.md` is a single prompt that
-/// branches on `collab_status` and documents the recovery override for every
-/// coding-active phase, so a Codex recovery is always a plain Codex turn.
+/// agent runs it. A Codex recovery is NOT automatically a plain Codex turn:
+/// `.codex-plugin/prompts/` holds ten per-phase prompts, not one prompt that
+/// branches on `collab_status`, and `.codex-plugin/commands/collab.md` picks
+/// among them from session state — for any phase with no matching row it
+/// reports the concise status, selects nothing, and exits. So a
+/// `("codex", <phase>)` pair belongs here only when the shim carries a row that
+/// actually routes it; today that is the recovery row for
+/// `CodeReviewLocalPending`/`CodeReviewFinalPending` → `collab-recovery.md`.
 fn delegated_completion_action(phase: &str, owner: &str) -> Option<WorkerAction> {
     match (owner, phase) {
-        // Codex recovers Claude's interrupted implementation / local-review turn.
-        ("codex", "CodeImplementPending") | ("codex", "CodeReviewLocalPending") => {
-            Some(WorkerAction::Codex)
-        }
+        // Codex recovers Claude's interrupted local-review audit. The shim's
+        // recovery row ("`CodeReviewLocalPending` or `CodeReviewFinalPending`
+        // with Codex recovery ownership") routes it to `collab-recovery.md`,
+        // whose `CodeReviewLocalPending` section finishes the audit and sends
+        // `review_local` — so a plain Codex turn really does complete the phase.
+        ("codex", "CodeReviewLocalPending") => Some(WorkerAction::Codex),
         // Claude recovers Codex's interrupted global-review-fix turn. No matrix
         // template sends `review_fix_global`, so the driver owns the prompt.
         ("claude", "CodeReviewFixGlobalPending") => Some(WorkerAction::ClaudeRecoveryFixGlobal),
+        // A Codex recovery owner at `CodeImplementPending` — i.e. an
+        // `--implementer=claude` session whose Claude batch turn reported a
+        // recoverable failure — has NO Codex turn to dispatch. The shim routes
+        // `CodeImplementPending` only when `implementer == "codex"` (to
+        // `collab-batch-impl.md`, which re-checks that in its own join guard),
+        // and its recovery row covers only the two review phases;
+        // `collab-recovery.md` says as much itself ("only for a recoverable
+        // `CodeReviewLocalPending` or `CodeReviewFinalPending` turn delegated to
+        // Codex") and exits on any other phase. With no matching row the shim
+        // reports status and selects nothing, so spawning Codex here burns a
+        // turn that can never send `implementation_done`: no completion, no
+        // failure report, and the run only dies later as an opaque
+        // `STUCK_LIMIT` stall. Refuse it instead — it falls through to
+        // `Anomaly`, which stops the run and names the pair.
+        ("codex", "CodeImplementPending") => None,
         // A Codex recovery owner at `CodeReviewFinalPending` owes a REAL PR
-        // (`.codex-plugin/prompts/collab.md`: "create the PR yourself … never
-        // fabricate a pr_url"), and the Codex turn prompt is fixed — the driver
-        // cannot redirect it to the synthetic un-pushed `pr_url` this harness
-        // uses. There is no honest mapping here, so it stays `Anomaly`: the run
-        // stops rather than opening a real PR from a throwaway abeval branch.
+        // (`.codex-plugin/prompts/collab-recovery.md` § `CodeReviewFinalPending`:
+        // "create the ready PR" … "Never fabricate a URL"), and the Codex turn
+        // prompt is fixed — the driver cannot redirect it to the synthetic
+        // un-pushed `pr_url` this harness uses. There is no honest mapping here,
+        // so it stays `Anomaly`: the run stops rather than opening a real PR
+        // from a throwaway abeval branch.
         ("codex", "CodeReviewFinalPending") => None,
         // Claude recovering `CodeImplementPending` (an `--implementer=codex`
         // session) is already the normal matrix entry, and its template is
@@ -1242,28 +1265,12 @@ mod tests {
     }
 
     fn pinned_state(phase: &str, owner: &str) -> SessionState {
-        SessionState {
-            phase: phase.to_string(),
-            current_owner: owner.to_string(),
-            implementer: "claude".to_string(),
-            pr_url: None,
-            global_review_round: 0,
-            review_round: 0,
-            task_review_round: 0,
-            last_head_sha: None,
-            pending_failure: None,
-            recovery_phase: None,
-            recovery_owner: None,
-            pilot: SUPPORTED_PILOT.to_string(),
-        }
+        SessionState::fixture(phase, owner, SUPPORTED_PILOT)
     }
 
     /// Same row with a non-default `pilot` (migration 019's other legal value).
     fn pinned_state_with_pilot(phase: &str, owner: &str, pilot: &str) -> SessionState {
-        SessionState {
-            pilot: pilot.to_string(),
-            ..pinned_state(phase, owner)
-        }
+        SessionState::fixture(phase, owner, pilot)
     }
 
     /// Reader that returns a fixed sequence of states (one per `read` call),

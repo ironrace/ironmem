@@ -2,7 +2,7 @@ use abeval::client::Usage;
 use abeval::collab_db::SessionState;
 use abeval::collab_driver::{
     run_collab_task, CodexAttributor, CodexResult, CollabStateReader, CollabTaskCtx, ModelTier,
-    RunDisposition, WorkerResult, WorkerSpawner,
+    RunDisposition, WorkerResult, WorkerSpawner, SUPPORTED_PILOT,
 };
 use std::cell::RefCell;
 use std::path::{Path, PathBuf};
@@ -359,20 +359,13 @@ impl CollabStateReader for ScriptedReader {
     }
 }
 
+/// Every state in this file drives the supported (Claude-piloted) path; the
+/// pilot-guard cases live in `collab_driver`'s own unit tests.
 fn st(phase: &str, owner: &str, grr: u32) -> SessionState {
     SessionState {
-        phase: phase.into(),
-        current_owner: owner.into(),
-        implementer: "claude".into(),
-        pr_url: None,
-        review_round: 0,
         global_review_round: grr,
-        task_review_round: 0,
         last_head_sha: Some("h".into()),
-        pending_failure: None,
-        recovery_phase: None,
-        recovery_owner: None,
-        pilot: "claude".into(),
+        ..SessionState::fixture(phase, owner, SUPPORTED_PILOT)
     }
 }
 

@@ -55,6 +55,9 @@ fn reads_existing_session_row() {
         2,
     );
     let st = read_session_state(&db, "sess-1").unwrap();
+    // Spelled out field by field on purpose — NOT `SessionState::fixture`. This
+    // is the reader's exhaustive contract: a new column must break this literal
+    // so whoever adds it has to state what the reader should return for it.
     assert_eq!(
         st,
         SessionState {
