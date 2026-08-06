@@ -312,6 +312,32 @@ Stored in `collab_sessions`:
 
 All state changes are recorded in `wal_log`.
 
+### Migration note: `pilot` column (schema v19)
+
+The `pilot` column on `collab_sessions` was added by migration
+`crates/ironmem/migrations/019_collab_pilot.sql`, bringing the schema to
+version 19. It is declared `NOT NULL DEFAULT 'claude'` with
+`CHECK (pilot IN ('claude', 'codex'))`, so **every pre-019 session reads
+back as `pilot = "claude"`** with no data migration needed — the default
+reproduces the hard-wired Claude-led behavior that predates this column,
+and existing `/collab start` callers that omit `--pilot` keep their
+original behavior unchanged.
+
+`crates/ironmem/src/collab/handoff.rs:278-284` documents the dependency
+this creates: `create_session` now writes `pilot` on every insert, so the
+column must exist before `create_session` can succeed. That comment (on
+the test fixture's `open()` helper) also notes that migration 019's
+`ALTER TABLE` depends only on `collab_sessions` (created in migration
+003), so it is safe to apply out of numeric sequence relative to
+migrations 011-018 — which is exactly what the fixture does, stopping its
+own replay at 010 for everything else while still applying 019 so
+`create_session` succeeds.
+
+No new environment variable is introduced by this change: `pilot` is set
+exclusively via the `collab_start` / `collab_start_code_review` `pilot`
+argument (defaulting to `"claude"` when omitted) or reassigned post-creation
+via `collab_set_pilot` — there is no `IRONMEM_*` toggle for it.
+
 ## Phase Model
 
 **Wire-compat note:** two `Phase` variants were renamed in
