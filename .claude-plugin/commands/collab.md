@@ -395,8 +395,11 @@ loop:
 **`pilot`/`copilot` are bound once, at the top of the iteration, from the
 same `collab_status` read that yields `phase` and `current_owner`.** Every
 dispatch decision made during that iteration — which worker template to
-run, whether to bg-exec Codex, what `$SENDER` to send as — reads those two
-bindings (or `current_owner`, from the same read). No call site may
+run, whether to bg-exec Codex — reads those two bindings. `$SENDER` is
+**not** one of them: it is always `collab_status.current_owner` read at
+send time (the Pre-send Harness Sequence re-reads `collab_status`
+immediately before sending), which under recovery may be the recovery
+owner rather than the pilot. No call site may
 re-derive role identity from a phase name, a prompt filename, or a value
 remembered from a prior iteration. This is what prevents **split-brain
 routing**: two call sites disagreeing about who leads and the session
