@@ -894,20 +894,23 @@ remain:
   `plan_file_path` to form its own judgment.
 - When dispatching Codex via `codex exec`, the prompt file passed is
   the verbatim expanded Codex prompt with `$ARGUMENTS` substituted —
-  nothing more. Use `.codex-plugin/prompts/collab-batch-impl.md` for the
-  `CodeImplementPending+codex` turn (slim phase-specific prompt) and
-  `.codex-plugin/prompts/collab-plan-draft.md` for `PlanParallelDrafts`,
-  `.codex-plugin/prompts/collab-plan-review.md` for `PlanCodexReviewPending`,
-  and `.codex-plugin/prompts/collab-global-review.md` for
-  `CodeReviewFixGlobalPending`; use `.codex-plugin/prompts/collab-recovery.md`
-  only when the recovery override gives Codex `CodeReviewLocalPending` or
-  `CodeReviewFinalPending`. Do not append session context, state
+  nothing more. **Which** file that is comes from exactly one place: the
+  **§ Codex dispatch tuning matrix** row matched on
+  `(phase, ownership condition)` — the same row that fixes the model and
+  reasoning effort. Never select from a phase name alone, and never keep
+  a second, abbreviated prompt list here: a partial list drifts from the
+  matrix and mis-selects under `pilot == "codex"`, where the
+  copilot-gated rows dispatch no Codex prompt at all and the pilot-owned
+  compose rows dispatch a different one. Do not append session context, state
   summary, or recommendations about what Codex should conclude. See the
   handoff section below. This rule applies equally when falling back to
   `mcp__codex__codex` — the prompt content must be the verbatim file
   with `$ARGUMENTS` substituted, never hand-crafted steering text.
-- Codex's `review_fix_global` integrated fix commit(s) stand as its own judgment. If
-  Claude disagrees with a fix during `CodeReviewFinalPending`, the right
+- The `review_fix_global` integrated fix commit(s) stand as the
+  **copilot's** own judgment — `CodeReviewFixGlobalPending` is
+  copilot-gated, so the author is Codex under `pilot == "claude"` and
+  Claude under `pilot == "codex"`. If the **pilot** disagrees with a fix
+  during `CodeReviewFinalPending` (the pilot's own turn), the right
   response is to amend the code and commit — not to re-litigate in
   prose.
 
@@ -1293,6 +1296,16 @@ Writes are best-effort and never block the protocol.
 
 ## Invariants — do not violate
 
+**Wire strings — never rename.** `PlanCodexReviewPending` and the Claude-named
+finalize phase listed next to it in the very first bullet below are the frozen
+serializations of `Phase::PlanCopilotReviewPending` /
+`Phase::PlanFinalizePending`: the agent name inside each label is a wire
+artifact, not an owner claim (the first is copilot-gated, the second
+pilot-owned, so under `pilot == "codex"` the label names the wrong agent).
+Role-keyed **prose** about them may change freely; the literals may not,
+anywhere they act as wire values — `preconditions:` lines, dispatch-matrix row
+keys, and state checks.
+
 - **Never** call `mcp__ironmem__collab_end` during any active phase. Rejected in:
   - v1 active: `PlanParallelDrafts`, `PlanSynthesisPending`,
     `PlanCodexReviewPending`, `PlanClaudeFinalizePending`.
@@ -1361,7 +1374,12 @@ Writes are best-effort and never block the protocol.
 ## Session handoff (fallback succession)
 
 When your context is exhausted mid-session, call `session_handoff` with
-`{ session_id, agent: "claude" }` before stopping. The server composes a
+`{ session_id, agent: "claude" }` before stopping. **`agent: "claude"` here is
+the dispatcher, not the pilot** — succession replaces *this* process, so the
+literal stays `"claude"` under every `--pilot` value and is never substituted
+with `pilot`, `copilot`, or `current_owner`. (A `pilot == "codex"` session is
+still driven from this Claude terminal; Codex runs as one-shot `codex exec`
+turns and has no context to hand off.) The server composes a
 deterministic, model-free ` ```ironrace-session-handoff ` block from
 persisted state + the one logical-keyed current `collab-checkpoints` drawer — it never asks a
 model to summarize. The response carries both a `handoff_block` (context for
@@ -1391,6 +1409,12 @@ Full semantics: `docs/COLLAB.md` § "session_handoff (fallback succession)".
 The UserPromptSubmit hook injects a one-line notice when context occupancy
 crosses a threshold (default 60% warn / 80% handoff, overridable via
 `IRONMEM_CONTEXT_WARN_PCT` / `IRONMEM_CONTEXT_HANDOFF_PCT`).
+
+Every `session_handoff(session_id, agent)` below passes `agent = "claude"` — **the
+dispatcher's own identity**, exactly as in **§ Session handoff** above. It is
+the process whose context is full that is being replaced, so this literal is
+never role-keyed: it does not follow `pilot`, `copilot`, or `current_owner`,
+and a `pilot == "codex"` session hands off the Claude dispatcher just the same.
 
 **Automated successor path (autonomous/collab phases):**
 
@@ -1438,6 +1462,7 @@ An unattended `claude -p` successor needs at minimum:
 - `mcp__ironmem__collab_send`, `mcp__ironmem__collab_recv`,
   `mcp__ironmem__collab_ack`, `mcp__ironmem__collab_approve`,
   `mcp__ironmem__collab_set_implementer`,
+  `mcp__ironmem__collab_set_pilot`,
   `mcp__ironmem__collab_register_caps`,
   `mcp__ironmem__collab_wait_my_turn`, `mcp__ironmem__collab_end`,
   `mcp__ironmem__collab_resume`, `mcp__ironmem__session_handoff`,
