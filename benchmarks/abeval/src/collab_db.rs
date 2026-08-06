@@ -14,6 +14,12 @@ pub struct SessionState {
     pub phase: String,
     pub current_owner: String,
     pub implementer: String,
+    /// Which agent LEADS the session — synthesizes/finalizes the plan and audits
+    /// the copilot's commits (migration 019). Orthogonal to `implementer`.
+    /// `claude` for every pre-019 row and every session that omits the flag.
+    /// The driver only knows how to drive `claude`; see
+    /// `collab_driver::ensure_supported_pilot`.
+    pub pilot: String,
     pub pr_url: Option<String>,
     pub review_round: u32,
     pub global_review_round: u32,
@@ -40,6 +46,39 @@ impl SessionState {
         // keep in sync with collab_driver::PHASE_CODING_{COMPLETE,FAILED}
         matches!(self.phase.as_str(), "CodingComplete" | "CodingFailed")
     }
+
+    /// Fixture row for tests, carrying the three fields that decide what the
+    /// dispatcher does — `phase`, `current_owner`, `pilot` — as required
+    /// arguments; everything else takes an inert placeholder that callers
+    /// override with struct-update syntax (`..SessionState::fixture(..)`).
+    ///
+    /// `pilot` is deliberately an argument rather than a defaulted field, and
+    /// there is deliberately no `Default` impl: a `SessionState` that can be
+    /// built without saying who leads the session is the exact silent default
+    /// `collab_driver::ensure_supported_pilot` exists to eliminate — a
+    /// codex-piloted session read as `claude` misclassifies every lead turn.
+    /// Every other field may gain a placeholder here precisely because none of
+    /// them changes which agent the driver believes is in charge.
+    ///
+    /// Not a production path. `read_session_state` below populates all eleven
+    /// fields from the row and must keep doing so — no read may reach a
+    /// placeholder.
+    pub fn fixture(phase: &str, current_owner: &str, pilot: &str) -> Self {
+        Self {
+            phase: phase.to_string(),
+            current_owner: current_owner.to_string(),
+            implementer: "claude".to_string(),
+            pilot: pilot.to_string(),
+            pr_url: None,
+            review_round: 0,
+            global_review_round: 0,
+            task_review_round: 0,
+            last_head_sha: None,
+            pending_failure: None,
+            recovery_phase: None,
+            recovery_owner: None,
+        }
+    }
 }
 
 /// Open the per-task collab DB read-only and select the single session row.
@@ -49,12 +88,27 @@ pub fn read_session_state(db_path: &Path, session_id: &str) -> Result<SessionSta
         rusqlite::Connection::open_with_flags(db_path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
             .with_context(|| format!("opening collab db {} read-only", db_path.display()))?;
 
-    let mut stmt = conn.prepare(
-        "SELECT phase, current_owner, implementer, pr_url, \
+    // Migration 019 adds `pilot` as `NOT NULL DEFAULT 'claude'`, and the ALTER
+    // backfills every pre-019 row with `'claude'`, so no DB the product can
+    // produce yields a NULL here: the COALESCE never fires on a real row and
+    // only covers a hand-patched schema that dropped the NOT NULL. It does NOT
+    // cover a genuinely pre-019 DB — there the column is absent entirely and
+    // `prepare` fails first, hence the context on that call.
+    let mut stmt = conn
+        .prepare(
+            "SELECT phase, current_owner, implementer, pr_url, \
                 review_round, global_review_round, task_review_round, last_head_sha, \
-                pending_failure, recovery_phase, recovery_owner \
+                pending_failure, recovery_phase, recovery_owner, \
+                COALESCE(pilot, 'claude') \
          FROM collab_sessions WHERE id = ?1",
-    )?;
+        )
+        .with_context(|| {
+            format!(
+                "preparing the collab_sessions poll against {} \
+                 (a `no such column: pilot` here means the DB predates migration 019)",
+                db_path.display()
+            )
+        })?;
 
     stmt.query_row([session_id], |row| {
         Ok(SessionState {
@@ -69,6 +123,7 @@ pub fn read_session_state(db_path: &Path, session_id: &str) -> Result<SessionSta
             pending_failure: row.get(8)?,
             recovery_phase: row.get(9)?,
             recovery_owner: row.get(10)?,
+            pilot: row.get(11)?,
         })
     })
     .with_context(|| format!("no collab_sessions row for session {session_id}"))

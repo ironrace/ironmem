@@ -82,20 +82,20 @@ pub fn parse_rollout(jsonl: &str) -> Result<Option<CodexSessionTokens>> {
                     .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
                     .map(|dt| dt.with_timezone(&Utc));
             }
-            "event_msg" => {
-                if line.payload.get("type").and_then(|v| v.as_str()) == Some("token_count") {
-                    if let Some(tu) = line
-                        .payload
-                        .get("info")
-                        .and_then(|v| v.get("total_token_usage"))
-                    {
-                        match serde_json::from_value::<TotalTokenUsage>(tu.clone()) {
-                            Ok(parsed) => last_usage = Some(parsed),
-                            Err(e) => {
-                                return Err(anyhow!(
-                                    "token_count event has unparseable total_token_usage: {e}"
-                                ));
-                            }
+            "event_msg"
+                if line.payload.get("type").and_then(|v| v.as_str()) == Some("token_count") =>
+            {
+                if let Some(tu) = line
+                    .payload
+                    .get("info")
+                    .and_then(|v| v.get("total_token_usage"))
+                {
+                    match serde_json::from_value::<TotalTokenUsage>(tu.clone()) {
+                        Ok(parsed) => last_usage = Some(parsed),
+                        Err(e) => {
+                            return Err(anyhow!(
+                                "token_count event has unparseable total_token_usage: {e}"
+                            ));
                         }
                     }
                 }

@@ -166,24 +166,47 @@ impl<'a> RecoveryState<'a> {
 /// already covers the pair (or nothing in this harness can serve it).
 ///
 /// The phase decides WHICH completion event is owed; the owner decides WHICH
-/// agent runs it. `.codex-plugin/prompts/collab.md` is a single prompt that
-/// branches on `collab_status` and documents the recovery override for every
-/// coding-active phase, so a Codex recovery is always a plain Codex turn.
+/// agent runs it. A Codex recovery is NOT automatically a plain Codex turn:
+/// `.codex-plugin/prompts/` holds ten per-phase prompts, not one prompt that
+/// branches on `collab_status`, and `.codex-plugin/commands/collab.md` picks
+/// among them from session state — for any phase with no matching row it
+/// reports the concise status, selects nothing, and exits. So a
+/// `("codex", <phase>)` pair belongs here only when the shim carries a row that
+/// actually routes it; today that is the recovery row for
+/// `CodeReviewLocalPending`/`CodeReviewFinalPending` → `collab-recovery.md`.
 fn delegated_completion_action(phase: &str, owner: &str) -> Option<WorkerAction> {
     match (owner, phase) {
-        // Codex recovers Claude's interrupted implementation / local-review turn.
-        ("codex", "CodeImplementPending") | ("codex", "CodeReviewLocalPending") => {
-            Some(WorkerAction::Codex)
-        }
+        // Codex recovers Claude's interrupted local-review audit. The shim's
+        // recovery row ("`CodeReviewLocalPending` or `CodeReviewFinalPending`
+        // with Codex recovery ownership") routes it to `collab-recovery.md`,
+        // whose `CodeReviewLocalPending` section finishes the audit and sends
+        // `review_local` — so a plain Codex turn really does complete the phase.
+        ("codex", "CodeReviewLocalPending") => Some(WorkerAction::Codex),
         // Claude recovers Codex's interrupted global-review-fix turn. No matrix
         // template sends `review_fix_global`, so the driver owns the prompt.
         ("claude", "CodeReviewFixGlobalPending") => Some(WorkerAction::ClaudeRecoveryFixGlobal),
+        // A Codex recovery owner at `CodeImplementPending` — i.e. an
+        // `--implementer=claude` session whose Claude batch turn reported a
+        // recoverable failure — has NO Codex turn to dispatch. The shim routes
+        // `CodeImplementPending` only when `implementer == "codex"` (to
+        // `collab-batch-impl.md`, which re-checks that in its own join guard),
+        // and its recovery row covers only the two review phases;
+        // `collab-recovery.md` says as much itself ("only for a recoverable
+        // `CodeReviewLocalPending` or `CodeReviewFinalPending` turn delegated to
+        // Codex") and exits on any other phase. With no matching row the shim
+        // reports status and selects nothing, so spawning Codex here burns a
+        // turn that can never send `implementation_done`: no completion, no
+        // failure report, and the run only dies later as an opaque
+        // `STUCK_LIMIT` stall. Refuse it instead — it falls through to
+        // `Anomaly`, which stops the run and names the pair.
+        ("codex", "CodeImplementPending") => None,
         // A Codex recovery owner at `CodeReviewFinalPending` owes a REAL PR
-        // (`.codex-plugin/prompts/collab.md`: "create the PR yourself … never
-        // fabricate a pr_url"), and the Codex turn prompt is fixed — the driver
-        // cannot redirect it to the synthetic un-pushed `pr_url` this harness
-        // uses. There is no honest mapping here, so it stays `Anomaly`: the run
-        // stops rather than opening a real PR from a throwaway abeval branch.
+        // (`.codex-plugin/prompts/collab-recovery.md` § `CodeReviewFinalPending`:
+        // "create the ready PR" … "Never fabricate a URL"), and the Codex turn
+        // prompt is fixed — the driver cannot redirect it to the synthetic
+        // un-pushed `pr_url` this harness uses. There is no honest mapping here,
+        // so it stays `Anomaly`: the run stops rather than opening a real PR
+        // from a throwaway abeval branch.
         ("codex", "CodeReviewFinalPending") => None,
         // Claude recovering `CodeImplementPending` (an `--implementer=codex`
         // session) is already the normal matrix entry, and its template is
@@ -259,6 +282,43 @@ pub fn worker_action(
         },
         _ => WorkerAction::Anomaly,
     }
+}
+
+/// The only `pilot` (migration 019) this headless driver can drive. See
+/// [`ensure_supported_pilot`].
+pub const SUPPORTED_PILOT: &str = "claude";
+
+/// Fail fast on a session whose `pilot` this driver cannot drive.
+///
+/// [`worker_action`]'s matrix is keyed on the literal agent name in
+/// `current_owner`, and its `"claude"` arm IS the lead-role map: plan synthesis,
+/// plan finalize, the `PlanLocked` bridge and the final review are listed only
+/// under `claude`, while the `"codex"` arm carries only the two copilot phases
+/// (`PlanCodexReviewPending`, `CodeReviewFixGlobalPending`) plus
+/// `PlanParallelDrafts` — not a copilot phase at all, but the blind-draft phase
+/// both agents work under either pilot, which is why it appears under both
+/// arms. That is exactly the Claude-pilot layout. Under `pilot = "codex"` the
+/// roles swap, so every lead turn arrives owned by `codex` in a phase the codex
+/// arm does not list and falls through to [`WorkerAction::Anomaly`] — the run
+/// would abort on its first lead turn and be recorded as an INVALID data point.
+///
+/// Teaching `worker_action` a role-keyed map (pilot/copilot instead of
+/// claude/codex, plus Codex-side equivalents of the compose/bridge/synthetic-PR
+/// turns those templates implement only for Claude) is a substantially larger
+/// change than this guard and is deliberately NOT done here. Until it is, abeval
+/// refuses reversed-pilot sessions instead of mismeasuring them.
+pub fn ensure_supported_pilot(task_id: &str, session_id: &str, pilot: &str) -> Result<()> {
+    if pilot == SUPPORTED_PILOT {
+        return Ok(());
+    }
+    Err(anyhow!(
+        "collab run for task {task_id} (session {session_id}) has pilot={pilot}, but the \
+         headless abeval driver only supports pilot={SUPPORTED_PILOT} — INVALID run. Its \
+         phase→action map (`worker_action`) is Claude-pilot-specific: the lead phases are \
+         listed only under a `claude` owner, so with pilot={pilot} every lead turn would be \
+         classified as an Anomaly and abort the run. Driving a reversed-pilot session needs \
+         a role-keyed dispatch map, which this crate does not implement yet."
+    ))
 }
 
 /// Extract the `ref:` value from a worker's ≤3-line verdict. `none` / absent → None.
@@ -794,13 +854,30 @@ fn drive_collab_loop<R: CollabStateReader, S: WorkerSpawner>(
     }
     let session_id = parse_session_id(&boot.stdout).map_err(DriveError::Invalid)?;
 
+    // Bind time: refuse a session this driver cannot drive BEFORE the loop, so a
+    // campaign dies on its first task instead of burning worker turns and dying
+    // mid-run on the first lead-owned phase. The bound row is handed to the first
+    // loop iteration rather than re-read, so the guard costs no extra poll.
+    let bound = reader.read(&session_id).map_err(DriveError::Invalid)?;
+    ensure_supported_pilot(&ctx.task_id, &session_id, &bound.pilot).map_err(DriveError::Invalid)?;
+    let mut bound = Some(bound);
+
     // (2) Dispatcher loop.
     // Stall guard: the `(phase, owner, plan_round, global_round)` key last
     // dispatched, and how many consecutive turns have left it unchanged.
     let mut stall_key: Option<(String, String, u32, u32)> = None;
     let mut stall_count: usize = 0;
     for _ in 0..MAX_TURNS {
-        let state = reader.read(&session_id).map_err(DriveError::Invalid)?;
+        let state = match bound.take() {
+            Some(s) => s,
+            None => reader.read(&session_id).map_err(DriveError::Invalid)?,
+        };
+        // Re-check every poll, not just at bind: `collab_set_pilot` can flip the
+        // lead mid-session, and the dispatch below would then misread the new
+        // lead's turns. This must precede `worker_action` so the run reports the
+        // real cause instead of the Anomaly the reversed roles would produce.
+        ensure_supported_pilot(&ctx.task_id, &session_id, &state.pilot)
+            .map_err(DriveError::Invalid)?;
         let key = (
             state.phase.clone(),
             state.current_owner.clone(),
@@ -914,6 +991,11 @@ fn drive_collab_loop<R: CollabStateReader, S: WorkerSpawner>(
                 // worker's own ABORT guard, so nothing is sent and the run
                 // stalls out later as a STUCK_LIMIT instead of failing here.
                 let submit_state = reader.read(&session_id).map_err(DriveError::Invalid)?;
+                // Same guard as every other poll: this read can straddle a
+                // mid-run `collab_set_pilot`, and a reversed lead must abort
+                // here rather than be dispatched to a Claude-only submit turn.
+                ensure_supported_pilot(&ctx.task_id, &session_id, &submit_state.pilot)
+                    .map_err(DriveError::Invalid)?;
                 let submit = render_worker_prompt(
                     &ctx.prompts_dir,
                     "collab-turn-submit.md",
@@ -1183,19 +1265,12 @@ mod tests {
     }
 
     fn pinned_state(phase: &str, owner: &str) -> SessionState {
-        SessionState {
-            phase: phase.to_string(),
-            current_owner: owner.to_string(),
-            implementer: "claude".to_string(),
-            pr_url: None,
-            global_review_round: 0,
-            review_round: 0,
-            task_review_round: 0,
-            last_head_sha: None,
-            pending_failure: None,
-            recovery_phase: None,
-            recovery_owner: None,
-        }
+        SessionState::fixture(phase, owner, SUPPORTED_PILOT)
+    }
+
+    /// Same row with a non-default `pilot` (migration 019's other legal value).
+    fn pinned_state_with_pilot(phase: &str, owner: &str, pilot: &str) -> SessionState {
+        SessionState::fixture(phase, owner, pilot)
     }
 
     /// Reader that returns a fixed sequence of states (one per `read` call),
@@ -1337,6 +1412,133 @@ mod tests {
         assert!(
             msg.contains("undercount"),
             "must name the undercount cause: {msg}"
+        );
+    }
+
+    fn pilot_test_ctx(task_id: &str) -> CollabTaskCtx {
+        CollabTaskCtx {
+            task_id: task_id.into(),
+            worktree: PathBuf::from("/tmp/nonexistent-wt"),
+            branch: "abeval/pilot".into(),
+            prompts_dir: PathBuf::from("/tmp/nonexistent-prompts"),
+            bootstrap_prompt: "boot".into(),
+        }
+    }
+
+    #[test]
+    fn codex_pilot_session_is_refused_naming_both_pilots() {
+        // A reversed-pilot session must be refused at bind time with a message
+        // that names the offending value AND the supported one.
+        let reader = StuckReader(pinned_state_with_pilot(
+            "CodeReviewFixGlobalPending",
+            "codex",
+            "codex",
+        ));
+        let err = run_collab_task(
+            &pilot_test_ctx("abeval-pilot-codex"),
+            &reader,
+            &FakeSpawner,
+            &FakeAttributor,
+        )
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("pilot=codex"),
+            "must name the offending pilot: {msg}"
+        );
+        assert!(
+            msg.contains("pilot=claude"),
+            "must name the supported pilot: {msg}"
+        );
+        assert!(msg.contains("INVALID"), "must mark INVALID: {msg}");
+        assert!(
+            msg.contains("worker_action") && msg.contains("Anomaly"),
+            "must state the reason — the Claude-pilot phase→action map: {msg}"
+        );
+        // The message stands on its own: no unfiled-issue placeholder to chase.
+        assert!(
+            !msg.contains('#'),
+            "message must be self-contained, not point at an issue number: {msg}"
+        );
+    }
+
+    #[test]
+    fn claude_pilot_session_runs_unaffected() {
+        // The default pilot is untouched by the guard: the same trajectory still
+        // drives to a terminal phase.
+        let active = pinned_state("CodeReviewFixGlobalPending", "codex");
+        let terminal = pinned_state(PHASE_CODING_COMPLETE, "claude");
+        let reader = SequenceReader {
+            // [bound row (reused as the first poll), terminal]
+            states: vec![active, terminal],
+            idx: std::cell::Cell::new(0),
+        };
+        let res = run_collab_task(
+            &pilot_test_ctx("abeval-pilot-claude"),
+            &reader,
+            &UsageSpawner,
+            &NonZeroAttributor,
+        )
+        .expect("a claude-pilot session must not trip the guard");
+        assert_eq!(res.reached_phase, PHASE_CODING_COMPLETE);
+    }
+
+    #[test]
+    fn pilot_guard_fires_before_anomaly_classification() {
+        // `(PlanSynthesisPending, codex)` is exactly what a reversed-pilot lead
+        // turn looks like, and the Claude-pilot map calls it an Anomaly …
+        assert_eq!(
+            worker_action("PlanSynthesisPending", "codex", 0, RecoveryState::NONE),
+            WorkerAction::Anomaly,
+            "fixture must be a state the map misclassifies"
+        );
+        // … so the run must report the pilot, not the symptom.
+        let reader = StuckReader(pinned_state_with_pilot(
+            "PlanSynthesisPending",
+            "codex",
+            "codex",
+        ));
+        let err = run_collab_task(
+            &pilot_test_ctx("abeval-pilot-precedence"),
+            &reader,
+            &FakeSpawner,
+            &FakeAttributor,
+        )
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("pilot=codex"),
+            "guard must win over the anomaly bail: {msg}"
+        );
+        assert!(
+            !msg.contains("collab anomaly"),
+            "must not surface as an anomaly: {msg}"
+        );
+    }
+
+    #[test]
+    fn mid_run_pilot_flip_is_caught_by_the_poll_recheck() {
+        // Bind-time pilot is `claude`, so only the per-poll re-check can catch a
+        // `collab_set_pilot` that flips the lead after the run started.
+        let active = pinned_state("CodeReviewFixGlobalPending", "codex");
+        let flipped = pinned_state_with_pilot("CodeReviewFixGlobalPending", "codex", "codex");
+        let reader = SequenceReader {
+            // [bound row (claude) — passes the bind check and drives one turn,
+            //  then the next poll returns the flipped row]
+            states: vec![active, flipped],
+            idx: std::cell::Cell::new(0),
+        };
+        let err = run_collab_task(
+            &pilot_test_ctx("abeval-pilot-flip"),
+            &reader,
+            &UsageSpawner,
+            &FakeAttributor,
+        )
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("pilot=codex"),
+            "the poll re-check must catch a mid-run flip: {msg}"
         );
     }
 

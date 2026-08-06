@@ -60,6 +60,15 @@ def mutate(path, snippet, replacement=MARK):
     path.write_text(text.replace(snippet, replacement))
 
 
+def mutate_flex(path, snippet, replacement=MARK):
+    """Replace a lint `flex()` phrase despite prose line wrapping."""
+    text = path.read_text()
+    pattern = r"\s+".join(re.escape(part) for part in snippet.split())
+    mutated, count = re.subn(pattern, replacement, text)
+    assert count, f"flex target not found in {path.name}: {snippet!r}"
+    path.write_text(mutated)
+
+
 # The lint's contract lists, duplicated here on purpose. Importing them from
 # the lint would make these tests parametrize over "whatever the lint currently
 # pins", so deleting an entry would silently shrink the sweep instead of
@@ -128,6 +137,35 @@ TASK_LIST_TEMPLATE_SNIPPETS = [
     'always the pilot, which under `pilot == "codex"` is `codex`',
 ]
 
+# The three-role checks added for pilot configurability are intentionally
+# duplicated here instead of imported from the lint.  These tests are the
+# proof that each checker is live: deleting a phrase from the checker itself
+# must not silently shrink the fixture-mutation sweep along with it.
+PILOT_FLAG_SECTION_SNIPPETS = {
+    "start": "Strip both flag tokens out of the stream before capturing the positional `<task>`",
+    "review": "Never set `initiator` from the `--pilot` value",
+    "join": "Strip both flag tokens out of the stream before capturing the positional `<session_id>`",
+}
+JOIN_PILOT_SURFACES = [
+    (".claude-plugin/commands/collab.md",
+     "**Requested pilot matches `status.pilot`** → no-op",
+     ".claude-plugin/commands/collab.md: missing join pilot-authorization contract"),
+    (".codex-plugin/commands/collab.md",
+     "**Requested pilot matches `status.pilot`** → no-op",
+     ".codex-plugin/commands/collab.md: missing join pilot-authorization contract"),
+]
+PLAN_LOCKED_GATE_SNIPPET = "**Dispatcher-owned planning approval gate.**"
+PLAN_FINALIZE_ROW_SNIPPET = "**No human gate here — this turn is autonomous.**"
+SINGLE_PILOT_RESOLUTION_SNIPPET = "No call site may re-derive role identity from a phase name, a prompt filename, or a value remembered from a prior iteration"
+DOC_PILOT_CONTRACT_SNIPPETS = [
+    "- **dispatcher** — runs the control loop shown above and is the only role that talks to the human",
+    "| `pilot` | Which agent leads v1 planning and the v3 review-audit turns",
+    "### `collab_set_pilot`",
+    "**Wire-compat note:**",
+    "### Codex-terminal-led sessions are a non-goal",
+    "**Pilot-configurability is not a step toward an N-party protocol.**",
+]
+
 
 def test_fixture_is_green(tmp_path):
     # The premise every `assert r.returncode == 1` below depends on.
@@ -141,6 +179,85 @@ def test_fixture_is_green(tmp_path):
 def test_lint_passes_on_repo():
     r = run()
     assert r.returncode == 0, f"lint failed:\n{r.stdout}\n{r.stderr}"
+
+
+@pytest.mark.parametrize("section,snippet", PILOT_FLAG_SECTION_SNIPPETS.items())
+def test_lint_requires_pilot_flag_contract_in_each_entry_section(tmp_path, section, snippet):
+    fixture = copy_fixture(tmp_path)
+    command = fixture / ".claude-plugin" / "commands" / "collab.md"
+    mutate_flex(command, snippet)
+
+    r = run({"COLLAB_LINT_ROOT": str(fixture)})
+
+    assert r.returncode == 1
+    assert (f".claude-plugin/commands/collab.md: `{section}` section is "
+            f"missing pilot-flag parsing contract {snippet!r}") in r.stdout
+
+
+@pytest.mark.parametrize("path,snippet,error", JOIN_PILOT_SURFACES)
+def test_lint_requires_pilot_join_authorization_on_both_harnesses(
+        tmp_path, path, snippet, error):
+    fixture = copy_fixture(tmp_path)
+    mutate(fixture / path, snippet)
+
+    r = run({"COLLAB_LINT_ROOT": str(fixture)})
+
+    assert r.returncode == 1
+    assert f"{error} {snippet!r}" in r.stdout
+
+
+def test_lint_requires_dispatcher_planlocked_gate_and_autonomous_finalize(tmp_path):
+    fixture = copy_fixture(tmp_path)
+    command = fixture / ".claude-plugin" / "commands" / "collab.md"
+    mutate(command, PLAN_LOCKED_GATE_SNIPPET)
+    mutate(command, PLAN_FINALIZE_ROW_SNIPPET)
+
+    r = run({"COLLAB_LINT_ROOT": str(fixture)})
+
+    assert r.returncode == 1
+    assert "v3 bridge is missing dispatcher approval-gate contract" in r.stdout
+    assert "PlanClaudeFinalizePending` row must state that the turn is autonomous" in r.stdout
+
+
+def test_lint_rejects_a_planlocked_row_in_the_codex_shim(tmp_path):
+    fixture = copy_fixture(tmp_path)
+    command = fixture / ".codex-plugin" / "commands" / "collab.md"
+    table_header = "| Phase | Prompt |\n|---|---|"
+    assert table_header in command.read_text()
+    command.write_text(command.read_text().replace(
+        table_header,
+        table_header + "\n| `PlanLocked` | `collab-task-list.md` |",
+        1,
+    ))
+
+    r = run({"COLLAB_LINT_ROOT": str(fixture)})
+
+    assert r.returncode == 1
+    assert "phase→prompt table must never carry a `PlanLocked` row" in r.stdout
+
+
+def test_lint_requires_single_pilot_resolution_contract(tmp_path):
+    fixture = copy_fixture(tmp_path)
+    mutate_flex(fixture / ".claude-plugin" / "commands" / "collab.md",
+                SINGLE_PILOT_RESOLUTION_SNIPPET)
+
+    r = run({"COLLAB_LINT_ROOT": str(fixture)})
+
+    assert r.returncode == 1
+    assert ("dispatch loop is missing single-pilot-resolution contract "
+            f"{SINGLE_PILOT_RESOLUTION_SNIPPET!r}") in r.stdout
+
+
+@pytest.mark.parametrize("snippet", DOC_PILOT_CONTRACT_SNIPPETS)
+def test_lint_requires_each_pilot_documentation_contract(tmp_path, snippet):
+    fixture = copy_fixture(tmp_path)
+    mutate_flex(fixture / "docs" / "COLLAB.md", snippet)
+
+    r = run({"COLLAB_LINT_ROOT": str(fixture)})
+
+    assert r.returncode == 1
+    assert "docs/COLLAB.md: missing" in r.stdout
+    assert snippet in r.stdout
 
 
 def test_review_paths_prefer_artifact_and_preserve_raw_diff_fallback():
@@ -1380,3 +1497,875 @@ def test_lint_catches_the_task_list_send_reverting_to_claude(tmp_path):
             '\'collab_send(sender="$SENDER", topic="task_list",\'') in r.stdout
     assert ('collab-turn-task-list.md: forbidden stale direct-body claim '
             '\'sender="claude"\'') in r.stdout
+
+
+# ── The gate pins must read the *executable* prose, not the raw file ────────
+#
+# Every check above asserts a rule is stated where an agent will read it, and
+# an agent reads the rendered body — not a commented-out "historical note".
+# A raw-text substring search cannot tell the two apart, so a pin was once
+# satisfiable by its own epitaph: park the live rule in an HTML comment,
+# write the opposite instruction underneath, and the lint stayed green while
+# the shipped instruction said the reverse. These tests are the proof that
+# the comment-stripping in `live_text()` is wired into the gate checks; both
+# mutations below were verified green against the pre-fix lint.
+
+def comment_out(path, start, end, replacement):
+    """Park `start`..`end` in an HTML comment and substitute `replacement`.
+
+    Models the realistic edit — provenance kept, instruction replaced — not a
+    deletion. A deletion reds any substring pin; only this shape distinguishes
+    a pin that reads the live body from one that reads the raw bytes.
+    """
+    text = path.read_text()
+    i = text.index(start)
+    j = text.index(end, i)
+    path.write_text(
+        f"{text[:i]}<!-- HISTORICAL NOTE:\n{text[i:j]}\n-->\n{replacement}{text[j:]}")
+
+
+def test_lint_rejects_the_approval_gate_demoted_into_an_html_comment(tmp_path):
+    fixture = copy_fixture(tmp_path)
+    command = fixture / ".claude-plugin" / "commands" / "collab.md"
+    comment_out(
+        command,
+        "0. **Dispatcher-owned planning approval gate.**",
+        "1. Read `current_owner` from `collab_status`",
+        "0. Dispatch the task list immediately; no user approval is required.\n\n",
+    )
+
+    r = run({"COLLAB_LINT_ROOT": str(fixture)})
+
+    assert r.returncode == 1
+    assert ("v3 bridge is missing dispatcher approval-gate contract "
+            "'**Dispatcher-owned planning approval gate.**'") in r.stdout
+
+
+def test_lint_rejects_the_no_silent_fallback_rule_demoted_into_a_comment(tmp_path):
+    fixture = copy_fixture(tmp_path)
+    command = fixture / ".claude-plugin" / "commands" / "collab.md"
+    comment_out(
+        command,
+        "**Malformed flag input is a hard usage error",
+        "Stop on the error",
+        "On any unrecognized `--pilot` value, quietly use the default "
+        "`claude` and continue. ",
+    )
+
+    r = run({"COLLAB_LINT_ROOT": str(fixture)})
+
+    assert r.returncode == 1
+    assert ("`start` section is missing pilot-flag parsing contract "
+            "'do not silently fall back to the default on a malformed flag'") in r.stdout
+
+
+def test_lint_rejects_the_approval_gate_moved_below_the_dispatch_it_guards(tmp_path):
+    # Presence is not enough: a gate stated *after* the dispatch it guards is
+    # documentation, not a gate — the bridge would send `task_list` and only
+    # then ask. Every phrase pin still passes under this mutation, so only the
+    # ordering assertion can catch it.
+    fixture = copy_fixture(tmp_path)
+    command = fixture / ".claude-plugin" / "commands" / "collab.md"
+    text = command.read_text()
+    start = text.index("0. **Dispatcher-owned planning approval gate.**")
+    end = text.index("1. Read `current_owner` from `collab_status`", start)
+    gate, rest = text[start:end], text[end:]
+    after_dispatch = rest.index(
+        "2. The worker must reject the bridge before sending if:")
+    command.write_text(
+        text[:start] + rest[:after_dispatch] + gate + rest[after_dispatch:])
+
+    r = run({"COLLAB_LINT_ROOT": str(fixture)})
+
+    assert r.returncode == 1
+    assert "must appear BEFORE the bridge dispatches" in r.stdout
+
+
+# ── The gate must be REACHABLE and ATTENDED, not merely stated ──────────────
+#
+# The pins above prove the gate is written down, before the dispatch it
+# guards. Two ways it can still never gate anything: the loop exits at
+# `PlanLocked` (it is in the v1 terminal set) before reaching the bridge, or
+# the turn is handed to an unattended `claude -p` successor with no human to
+# ask. Both were harmless under the old placement — the gate had already
+# fired one phase earlier — which is why neither was pinned.
+
+PLAN_LOCKED_REACHABILITY_SNIPPETS = [
+    "if phase == PlanLocked and no task_list has been sent yet:",
+    "enter § v3 Bridge, step 0 (the approval gate) — do NOT exit the loop",
+    "`PlanLocked` is terminal for `wait_my_turn`, not for the dispatch loop.",
+    "routes there instead of exiting",
+    "Never spawn an unattended successor into the planning gate.",
+]
+
+
+@pytest.mark.parametrize("snippet", PLAN_LOCKED_REACHABILITY_SNIPPETS)
+def test_lint_requires_the_approval_gate_to_stay_reachable(tmp_path, snippet):
+    fixture = copy_fixture(tmp_path)
+    mutate_flex(fixture / ".claude-plugin" / "commands" / "collab.md", snippet)
+
+    r = run({"COLLAB_LINT_ROOT": str(fixture)})
+
+    assert r.returncode == 1
+    assert "must route `PlanLocked` pre-`task_list` into the approval gate" in r.stdout
+
+
+# ── Reachability is an ORDER, not a presence ────────────────────────────────
+#
+# Every phrase above can be satisfied by the same pseudocode block moved from
+# above the terminal-set branch to below it: no text is added or removed, so
+# each pin still matches — and `PlanLocked` is in the v1 terminal set, so the
+# loop matches the exit first, logs `t10_session_complete` and ends the session
+# with `final_plan_hash` set and the human never asked. That is the exact
+# regression the block's own comment says it exists to prevent, and it was
+# verified GREEN against the pre-fix lint before this test existed.
+
+def test_lint_rejects_the_planlocked_branch_moved_below_the_terminal_exit(tmp_path):
+    fixture = copy_fixture(tmp_path)
+    command = fixture / ".claude-plugin" / "commands" / "collab.md"
+    text = command.read_text()
+    start = text.index(
+        "  # PlanLocked pre-`task_list` is in the v1 terminal set")
+    end = text.index("  if session_ended or phase in terminal_set:", start)
+    block, rest = text[start:end], text[end:]
+    after_exit = rest.index('  if current_owner == "codex":')
+    command.write_text(
+        text[:start] + rest[:after_exit] + block + rest[after_exit:])
+
+    r = run({"COLLAB_LINT_ROOT": str(fixture)})
+
+    assert r.returncode == 1
+    assert "must be tested BEFORE" in r.stdout
+    assert "a branch placed after the terminal test is dead code" in r.stdout
+
+
+def test_lint_orders_the_gate_against_the_real_step_one_dispatch(tmp_path):
+    # The gate's ordering must be anchored on the bridge's actual step-1
+    # dispatch, not on the gate's own "On approval: proceed to step 1 and
+    # dispatch `collab-turn-task-list.md`" self-reference three lines below its
+    # heading. Here step 1 stops naming the dispatch, so under the pre-fix
+    # anchor the only remaining match was that self-reference: the gate was
+    # ordered against itself, trivially in order, and the bridge's loss of its
+    # dispatch went unreported by the ordering assertion entirely.
+    fixture = copy_fixture(tmp_path)
+    command = fixture / ".claude-plugin" / "commands" / "collab.md"
+    mutate(command,
+           "and dispatch `collab-turn-task-list.md`\n   (mechanical/sonnet) with",
+           "and run the task-list step with")
+
+    r = run({"COLLAB_LINT_ROOT": str(fixture)})
+
+    assert r.returncode == 1
+    assert "v3 bridge no longer names" in r.stdout
+    assert "re-anchor PLAN_LOCKED_DISPATCH_ANCHOR" in r.stdout
+
+
+# ── Section extraction must survive fences and duplicated headings ──────────
+
+def test_lint_does_not_treat_a_heading_inside_a_fence_as_a_boundary(tmp_path):
+    # A `## `-prefixed line inside a ```text fence is content, not a section
+    # boundary. Treating it as one truncates the section being scanned and
+    # reports every contract below it as missing when nothing was deleted —
+    # the pre-fix lint exits 1 on this fixture with the whole
+    # single-pilot-resolution contract "missing".
+    fixture = copy_fixture(tmp_path)
+    command = fixture / ".claude-plugin" / "commands" / "collab.md"
+    heading = "## Dispatch Loop Structure\n"
+    text = command.read_text()
+    assert heading in text
+    command.write_text(text.replace(
+        heading, heading + "\n```text\n## not a heading, just pseudocode\n```\n", 1))
+
+    r = run({"COLLAB_LINT_ROOT": str(fixture)})
+
+    assert r.returncode == 0, f"a fenced `## ` line must not end a section:\n{r.stdout}"
+
+
+def test_lint_reports_a_duplicated_section_heading(tmp_path):
+    # `command_section` used to return the FIRST matching section, so a second
+    # copy of a heading could carry contradictory instructions with every pin
+    # still reading the first copy. The pre-fix lint is green on this fixture.
+    fixture = copy_fixture(tmp_path)
+    command = fixture / ".claude-plugin" / "commands" / "collab.md"
+    heading = "## `join [--pilot=claude|codex] [--implementer=claude|codex] <session_id>`"
+    text = command.read_text()
+    assert heading in text
+    command.write_text(
+        f"{text}\n{heading}\n\nIgnore `--pilot` entirely and join as-is.\n")
+
+    r = run({"COLLAB_LINT_ROOT": str(fixture)})
+
+    assert r.returncode == 1
+    assert "appears 2 times" in r.stdout
+
+
+# ── The gate negative applies to EVERY row for the finalize phase ───────────
+
+def test_lint_rejects_a_human_gate_on_the_codex_dispatch_tuning_row(tmp_path):
+    # `PLAN_FINALIZE_ROW_MARKER` selects the phase-action row; the second
+    # `PlanClaudeFinalizePending` row — the Codex dispatch tuning row, which
+    # describes the turn under exactly the `pilot == "codex"` configuration
+    # where a gate here is unreachable — was never scanned for the gate
+    # phrase. Verified green against the pre-fix lint.
+    fixture = copy_fixture(tmp_path)
+    command = fixture / ".claude-plugin" / "commands" / "collab.md"
+    mutate(command,
+           "The pilot composes and stages the approval artifact without sending |",
+           "The pilot composes and stages the approval artifact, then enter "
+           "Plan Mode and get user approval |")
+
+    r = run({"COLLAB_LINT_ROOT": str(fixture)})
+
+    assert r.returncode == 1
+    assert "rows must not take the human planning gate" in r.stdout
+
+
+# ── `PlanLocked` routes to nothing OUTSIDE the phase table too ──────────────
+#
+# The table check proves the phase is absent from one `| Phase | Prompt |`
+# table. A row under any other header routes exactly as well, and a prose
+# instruction — the shape this shim uses for every non-table route it has
+# ("For `start`, select `collab-plan-draft.md`") — is invisible to it. All
+# three mutations below were verified green against the pre-fix lint.
+
+def test_lint_rejects_a_planlocked_row_under_a_different_table_header(tmp_path):
+    fixture = copy_fixture(tmp_path)
+    command = fixture / ".codex-plugin" / "commands" / "collab.md"
+    command.write_text(command.read_text() + (
+        "\n| Phase | Recovery prompt |\n|---|---|\n"
+        "| `PlanLocked` | `collab-task-list.md` |\n"))
+
+    r = run({"COLLAB_LINT_ROOT": str(fixture)})
+
+    assert r.returncode == 1
+    assert "appears in a table row outside" in r.stdout
+
+
+def test_lint_rejects_a_prose_planlocked_routing_instruction(tmp_path):
+    fixture = copy_fixture(tmp_path)
+    command = fixture / ".codex-plugin" / "commands" / "collab.md"
+    command.write_text(command.read_text() +
+                       "\nFor `PlanLocked`, select `collab-task-list.md`.\n")
+
+    r = run({"COLLAB_LINT_ROOT": str(fixture)})
+
+    assert r.returncode == 1
+    assert "is a routing instruction for `collab-task-list.md`" in r.stdout
+
+
+def test_lint_requires_the_shim_to_keep_saying_never_select_the_task_list(tmp_path):
+    fixture = copy_fixture(tmp_path)
+    command = fixture / ".codex-plugin" / "commands" / "collab.md"
+    mutate_flex(command, "Never select `collab-task-list.md`.",
+                "Select `collab-task-list.md` in that case.")
+
+    r = run({"COLLAB_LINT_ROOT": str(fixture)})
+
+    assert r.returncode == 1
+    assert "missing the sentence that keeps `collab-task-list.md` unrouted" in r.stdout
+    assert "is a routing instruction for `collab-task-list.md`" in r.stdout
+
+
+# ── The $SENDER and Codex turn-boundary pins read the live body ─────────────
+#
+# `live_text()` was wired into the pilot/gate checks only. The pins guarding
+# the `$SENDER` sender-authorization contract and the Codex turn boundaries
+# still matched raw bytes, so the HTML-comment demotion those checks exist to
+# close was still open for them. Both mutations below were verified green
+# against the pre-fix lint.
+
+def test_lint_rejects_the_sender_authorization_guard_demoted_into_a_comment(tmp_path):
+    fixture = copy_fixture(tmp_path)
+    submit = fixture / ".claude-plugin" / "prompts" / "collab-turn-submit.md"
+    comment_out(
+        submit,
+        "2. Verify `$SENDER` against `collab_status.current_owner`",
+        "3. Fetch the artifact named by `$ARTIFACT_REF`",
+        "2. The sender is always the dispatcher; no verification is needed.\n\n",
+    )
+
+    r = run({"COLLAB_LINT_ROOT": str(fixture)})
+
+    assert r.returncode == 1
+    assert ("collab-turn-submit.md: missing required contract snippet "
+            "'Verify `$SENDER` against `collab_status.current_owner`'") in r.stdout
+
+
+def test_lint_rejects_a_codex_turn_boundary_demoted_into_a_comment(tmp_path):
+    fixture = copy_fixture(tmp_path)
+    finalize = fixture / ".codex-plugin" / "prompts" / "collab-plan-finalize.md"
+    comment_out(
+        finalize,
+        '- Your identity is `"codex"`. **This turn sends nothing.**',
+        "- Use IronMEM collab tools;",
+        '- Your identity is `"codex"`. Send `final` yourself once the plan is '
+        "staged.\n\n",
+    )
+
+    r = run({"COLLAB_LINT_ROOT": str(fixture)})
+
+    assert r.returncode == 1
+    assert ("collab-plan-finalize.md: missing required recovery/dispatch "
+            "contract '**This turn sends nothing.**'") in r.stdout
+
+
+# ── A green run must say which tree it was green on ─────────────────────────
+
+def test_lint_success_line_names_the_scanned_root(tmp_path):
+    # `COLLAB_LINT_ROOT` redirects every path the lint reads, so a vacuous pass
+    # on a fixture, a stale worktree or a half-copied checkout is otherwise
+    # indistinguishable from a real one. The pre-fix success line printed only
+    # the template and matrix counts.
+    fixture = copy_fixture(tmp_path)
+
+    r = run({"COLLAB_LINT_ROOT": str(fixture)})
+
+    assert r.returncode == 0, r.stdout
+    assert str(fixture.resolve()) in r.stdout
+
+
+# ── Contracts introduced alongside the dispatcher-owned gate ────────────────
+#
+# Every snippet below is contract DATA duplicated here on purpose (see the
+# note above CODEX_PILOT_ROUTING_SNIPPETS): importing the lint's lists would
+# make these tests parametrize over "whatever the lint currently pins", so
+# deleting an entry would shrink the sweep instead of failing it. Every one of
+# these mutations was verified green against the pre-fix lint.
+
+def mutate_quoted_flex(path, snippet, replacement=MARK):
+    """`mutate_flex` for a phrase inside a `> ` blockquote.
+
+    Blockquote markers are not whitespace, so a phrase that wraps across two
+    quoted lines is unreachable by `mutate_flex` — and, before this fix, by
+    the lint's own `flex()` pins. The unattended-successor guard is written as
+    a blockquote in both surfaces, so every multi-line pin on it needs this.
+    """
+    text = path.read_text()
+    pattern = r"[\s>]+".join(re.escape(part) for part in snippet.split())
+    mutated, count = re.subn(pattern, replacement, text)
+    assert count, f"quoted flex target not found in {path.name}: {snippet!r}"
+    path.write_text(mutated)
+
+
+UNATTENDED_SUCCESSOR_SNIPPETS = [
+    "Never spawn an unattended successor into the planning gate.",
+    "The exclusion is **every v1 planning phase**, not just the gate's own",
+    "if `phase` is `PlanParallelDrafts`, `PlanSynthesisPending`, "
+    "`PlanCodexReviewPending`, `PlanClaudeFinalizePending`, or `PlanLocked` "
+    "with no `task_list` sent",
+    "use the **Interactive phases** flow below instead",
+    "**Reason the list is this wide, so it cannot be narrowed without "
+    "confronting it:**",
+    "Dropping a phase from this list is only safe if some other human "
+    "checkpoint sits ahead of the gate on that phase's path, and there is "
+    "none.",
+]
+UNATTENDED_SUCCESSOR_SURFACES = [".claude-plugin/commands/collab.md",
+                                 "docs/COLLAB.md"]
+
+
+@pytest.mark.parametrize("path", UNATTENDED_SUCCESSOR_SURFACES)
+@pytest.mark.parametrize("snippet", UNATTENDED_SUCCESSOR_SNIPPETS)
+def test_lint_requires_the_widened_unattended_successor_guard(
+        tmp_path, path, snippet):
+    fixture = copy_fixture(tmp_path)
+    mutate_quoted_flex(fixture / path, snippet)
+
+    r = run({"COLLAB_LINT_ROOT": str(fixture)})
+
+    assert r.returncode == 1
+    assert f"{path}: missing unattended-successor guard {snippet!r}" in r.stdout
+
+
+BRIDGE_BLOCKER_SURFACES = [
+    (".claude-plugin/commands/collab.md",
+     "If the worker returns `blocker:`, the bridge is over — report it and "
+     "exit the loop.",
+     ".claude-plugin/commands/collab.md: v3 bridge is missing "
+     "blocker-terminates-the-bridge contract"),
+    (".claude-plugin/commands/collab.md", "an unbounded re-approval loop",
+     ".claude-plugin/commands/collab.md: v3 bridge is missing "
+     "blocker-terminates-the-bridge contract"),
+    (".claude-plugin/commands/collab.md",
+     "Do not re-dispatch the worker, and do not fall back through the loop "
+     "into step 0.",
+     ".claude-plugin/commands/collab.md: v3 bridge is missing "
+     "blocker-terminates-the-bridge contract"),
+    ("docs/COLLAB.md",
+     "If the worker returns `blocker:`, the bridge is over — report it and "
+     "exit the loop.",
+     "docs/COLLAB.md: missing blocker-terminates-the-bridge contract"),
+    ("docs/COLLAB.md", "an unbounded re-approval loop",
+     "docs/COLLAB.md: missing blocker-terminates-the-bridge contract"),
+    ("docs/COLLAB.md",
+     "The orchestrator must not re-dispatch the worker or fall back through "
+     "the loop into the step-0 gate.",
+     "docs/COLLAB.md: missing blocker-terminates-the-bridge contract"),
+]
+
+
+@pytest.mark.parametrize("path,snippet,error", BRIDGE_BLOCKER_SURFACES)
+def test_lint_requires_the_bridge_blocker_rule(tmp_path, path, snippet, error):
+    fixture = copy_fixture(tmp_path)
+    mutate_flex(fixture / path, snippet)
+
+    r = run({"COLLAB_LINT_ROOT": str(fixture)})
+
+    assert r.returncode == 1
+    assert f"{error} {snippet!r}" in r.stdout
+
+
+DOC_BRIDGE_GATE_SNIPPETS = [
+    "The bridge's **parse** is worker-owned; its **dispatch** is gated.",
+    "But before it dispatches anything, it takes the **dispatcher-owned "
+    "planning approval gate** at step 0",
+    "it enters Plan Mode and gets user approval, surfacing only "
+    "`{drawer_id, plan_file_path, ≤3-line summary}`",
+    "This gate is the dispatcher's and no worker's",
+    "On rejection it does not send `task_list` and offers `collab_end` "
+    "instead.",
+]
+
+
+@pytest.mark.parametrize("snippet", DOC_BRIDGE_GATE_SNIPPETS)
+def test_lint_requires_the_doc_bridge_gate_contract(tmp_path, snippet):
+    fixture = copy_fixture(tmp_path)
+    mutate_flex(fixture / "docs" / "COLLAB.md", snippet)
+
+    r = run({"COLLAB_LINT_ROOT": str(fixture)})
+
+    assert r.returncode == 1
+    assert ("docs/COLLAB.md: missing v3-bridge approval-gate contract "
+            f"{snippet!r}") in r.stdout
+
+
+CODEX_START_PILOT_REJECTION_SNIPPETS = [
+    "`start` takes no `--pilot` flag on this side: reject any `--pilot` token",
+    "as a usage error naming the offending token",
+    "Never strip it into the task text and never call `collab_start` with a "
+    "pilot inferred from it",
+]
+
+
+@pytest.mark.parametrize("snippet", CODEX_START_PILOT_REJECTION_SNIPPETS)
+def test_lint_requires_codex_start_to_reject_the_pilot_flag(tmp_path, snippet):
+    fixture = copy_fixture(tmp_path)
+    mutate_flex(fixture / ".codex-plugin" / "commands" / "collab.md", snippet)
+
+    r = run({"COLLAB_LINT_ROOT": str(fixture)})
+
+    assert r.returncode == 1
+    assert (".codex-plugin/commands/collab.md: missing `start` `--pilot` "
+            f"rejection contract {snippet!r}") in r.stdout
+
+
+PERMISSION_ALLOWLIST_SURFACES = [".claude-plugin/commands/collab.md",
+                                 "docs/COLLAB.md"]
+
+
+@pytest.mark.parametrize("path", PERMISSION_ALLOWLIST_SURFACES)
+def test_lint_rejects_set_pilot_on_the_unattended_permission_allowlist(
+        tmp_path, path):
+    # The negative is scoped to the allowlist BULLETS: the identifier
+    # legitimately appears in the paragraph right below them, in the
+    # generation-lease claim list and in the `join` authorization contract, so
+    # an unscoped negative would be wrong three times over. Adding it back to
+    # the bullets is the edit that has to fail — and did not, pre-fix.
+    fixture = copy_fixture(tmp_path)
+    mutate(fixture / path, "- Git bash operations",
+           "- `mcp__ironmem__collab_set_pilot`\n- Git bash operations")
+
+    r = run({"COLLAB_LINT_ROOT": str(fixture)})
+
+    assert r.returncode == 1
+    assert (f"{path}: `mcp__ironmem__collab_set_pilot` must not be on the "
+            "unattended successor's permission allowlist") in r.stdout
+
+
+@pytest.mark.parametrize("path", PERMISSION_ALLOWLIST_SURFACES)
+def test_lint_requires_the_allowlist_to_say_why_set_pilot_is_absent(
+        tmp_path, path):
+    fixture = copy_fixture(tmp_path)
+    mutate_flex(fixture / path,
+                "`mcp__ironmem__collab_set_pilot` is deliberately **not** on "
+                "this list")
+
+    r = run({"COLLAB_LINT_ROOT": str(fixture)})
+
+    assert r.returncode == 1
+    assert (f"{path}: the permission allowlist must say why "
+            "`collab_set_pilot` is absent") in r.stdout
+
+
+# ---- `--` end-of-options terminator ----------------------------------------
+#
+# Duplicated from the lint rather than imported, for the reason given at the
+# top of this file: importing would make the sweep parametrize over "whatever
+# the lint currently pins", so deleting a pin would shrink these tests along
+# with it instead of failing them.
+#
+# Every test below is a CROSS-SURFACE test. The contract is stated once per
+# flag-parsing subcommand in three files, and the recurring failure is a
+# contract fixed in one surface and left stale in another — so removing it from
+# one file at a time is exactly the mutation that has to red, and a sweep that
+# only ever removes it everywhere at once would have missed this round's drift.
+TERMINATOR_SHARED_SNIPPETS = [
+    "**`--` ends the flags.** The first bare `--` token is the end-of-options "
+    "terminator: every token after it is literal positional text, never "
+    "parsed as a flag and never stripped.",
+    "The `--` itself is consumed — it is not part of the captured positional.",
+    "Flags are recognized only before the first `--`",
+    "anywhere in the token stream before the first `--`",
+    "a flag-shaped token after the first `--` is not malformed input — it is "
+    "literal positional text, and it must never raise a usage error.",
+]
+# (surface, every region label the lint must report for that surface).
+TERMINATOR_SURFACE_LABELS = [
+    (".claude-plugin/commands/collab.md", ["`start`", "`review`", "`join`"]),
+    (".codex-plugin/commands/collab.md", ["`start`", "`join`"]),
+    ("docs/COLLAB.md", ["§ `/collab` flag parsing"]),
+]
+TERMINATOR_REGION_SNIPPETS = [
+    (".claude-plugin/commands/collab.md", "`start`",
+     "**When the task text legitimately contains a flag-shaped token, put "
+     "`--` before the task**"),
+    (".claude-plugin/commands/collab.md", "`start`",
+     "`/collab start -- document how --pilot=codex behaves` records that "
+     "whole sentence as the task"),
+    (".claude-plugin/commands/collab.md", "`start`",
+     "the `--` terminator if one was given, with every token after that `--` "
+     "kept verbatim"),
+    (".claude-plugin/commands/collab.md", "`review`",
+     "**When the short topic legitimately contains a flag-shaped token, put "
+     "`--` before the topic**"),
+    (".claude-plugin/commands/collab.md", "`review`",
+     "`/collab review -- --pilot= handling` reviews that topic verbatim"),
+    (".claude-plugin/commands/collab.md", "`join`",
+     "**When the session id legitimately contains a flag-shaped token, put "
+     "`--` before the id**"),
+    (".claude-plugin/commands/collab.md", "`join`",
+     "`/collab join -- <session_id>` takes the id verbatim"),
+    (".claude-plugin/commands/collab.md", "`join`",
+     "both flags, and the `--` terminator if one was given"),
+    (".codex-plugin/commands/collab.md", "`start`",
+     "That rejection binds only tokens before the first `--`"),
+    (".codex-plugin/commands/collab.md", "`start`",
+     "`/collab start -- document how --pilot=codex behaves` records that "
+     "whole sentence as the task rather than erroring on it"),
+    (".codex-plugin/commands/collab.md", "`join`",
+     "These rules bind only tokens before the first `--`"),
+    (".codex-plugin/commands/collab.md", "`join`",
+     "`/collab join -- <session_id>` takes the id verbatim"),
+    (".codex-plugin/commands/collab.md", "`join`",
+     "leaves `pilot` and `implementer` both untouched"),
+    (".codex-plugin/commands/collab.md", "`join`",
+     "both flags, and the `--` terminator if one was given, kept verbatim"),
+    ("docs/COLLAB.md", "§ `/collab` flag parsing",
+     "**Malformed flag input stays a hard usage error**, unchanged by the "
+     "terminator"),
+    ("docs/COLLAB.md", "§ `/collab` flag parsing",
+     "**When the positional text legitimately contains a flag-shaped token, "
+     "put `--` before it.**"),
+    ("docs/COLLAB.md", "§ `/collab` flag parsing", "[--] <task>"),
+    ("docs/COLLAB.md", "§ `/collab` flag parsing", "[--] <session_id>"),
+    ("docs/COLLAB.md", "§ `/collab` flag parsing", "[--] <short-topic>"),
+]
+# The escape hatch — the half of the terminator contract a USER acts on —
+# stated once per flag-parsing region in that region's own words about its own
+# positional. Listed separately from TERMINATOR_REGION_SNIPPETS above (which it
+# partly duplicates) because the assertion is different: this one is swept
+# region by region, and every region NOT mutated has to stay green. A pin that
+# only proved "the phrase is missing somewhere" would be satisfied by a lint
+# that pinned the hatch file-wide, and file-wide is exactly what let the Codex
+# shim ship a `start` example with no sentence and a `join` with neither.
+#
+# All SIX regions, not the four that first carried it. `join`'s positional is a
+# session UUID that cannot realistically contain a flag-shaped token, so the
+# hatch there is not really about escaping one: it is the promise that
+# `/collab join -- <id>`, typed by a user who learned the habit from `start`,
+# is accepted rather than rejected as the "extra positional value" that parse
+# refuses. Both command files state it for `join`, so both are pinned for it.
+ESCAPE_HATCH_REGIONS = [
+    (".claude-plugin/commands/collab.md", "`start`",
+     "**When the task text legitimately contains a flag-shaped token, put "
+     "`--` before the task**"),
+    (".claude-plugin/commands/collab.md", "`review`",
+     "**When the short topic legitimately contains a flag-shaped token, put "
+     "`--` before the topic**"),
+    (".claude-plugin/commands/collab.md", "`join`",
+     "**When the session id legitimately contains a flag-shaped token, put "
+     "`--` before the id**"),
+    (".codex-plugin/commands/collab.md", "`start`",
+     "**When the task text legitimately contains a flag-shaped token, put "
+     "`--` before the task**"),
+    (".codex-plugin/commands/collab.md", "`join`",
+     "**When the session id legitimately contains a flag-shaped token, put "
+     "`--` before the id**"),
+    ("docs/COLLAB.md", "§ `/collab` flag parsing",
+     "**When the positional text legitimately contains a flag-shaped token, "
+     "put `--` before it.**"),
+]
+DOC_FLAG_PARSING_HEADING = "### `/collab` flag parsing — `--` ends the flags"
+TERMINATOR_USAGE_SNIPPETS = [
+    (".claude-plugin/commands/collab.md", "frontmatter `description`",
+     "/collab start [--pilot=claude|codex] [--implementer=claude|codex] "
+     "[--] <task>"),
+    (".claude-plugin/commands/collab.md", "frontmatter `description`",
+     "/collab review [--pilot=claude|codex] [--] <short-topic>"),
+    (".claude-plugin/commands/collab.md", "frontmatter `description`",
+     "(`--` ends the flags: everything after it is literal text)"),
+    (".claude-plugin/commands/collab.md", "frontmatter `argument-hint`",
+     "review [--pilot=claude|codex] [--] <short-topic>"),
+    (".claude-plugin/commands/collab.md", "§ `Unknown subcommand`",
+     "Usage: /collab start [--pilot=claude|codex] "
+     "[--implementer=claude|codex] [--] <task>"),
+    (".claude-plugin/commands/collab.md", "§ `Unknown subcommand`",
+     "`--` ends the flags: every token after it is literal text, so put `--` "
+     "before task text that contains a flag-shaped token"),
+    (".codex-plugin/commands/collab.md", "frontmatter `argument-hint`",
+     "start [--implementer=claude|codex] [--] <task>"),
+    (".codex-plugin/commands/collab.md", "frontmatter `argument-hint`",
+     "(`--` ends the flags: everything after it is literal text)"),
+]
+UNBOUNDED_FLAG_WORDING = "anywhere in the remaining token stream"
+
+
+def mutate_flex_occurrence(path, snippet, index, replacement=MARK):
+    """Replace only the `index`-th (0-based) occurrence of a flex phrase.
+
+    The whole-file `mutate*` helpers prove a phrase is pinned SOMEWHERE in the
+    file. That is the wrong granularity for a contract stated once per
+    subcommand: deleting all three copies reds a file-wide search just as well
+    as a per-section one, so only a single-copy mutation can tell them apart —
+    and "the flags were added to `start` and `join` was left on the old parse"
+    is precisely the single-copy case.
+    """
+    text = path.read_text()
+    pattern = r"\s+".join(re.escape(part) for part in snippet.split())
+    matches = list(re.finditer(pattern, text))
+    assert len(matches) > index, (
+        f"{path.name}: expected more than {index} occurrences of {snippet!r}, "
+        f"found {len(matches)}")
+    m = matches[index]
+    path.write_text(text[:m.start()] + replacement + text[m.end():])
+
+
+@pytest.mark.parametrize("surface,labels", TERMINATOR_SURFACE_LABELS)
+@pytest.mark.parametrize("snippet", TERMINATOR_SHARED_SNIPPETS)
+def test_lint_requires_the_terminator_contract_in_each_surface(
+        tmp_path, surface, labels, snippet):
+    # One surface at a time: this is the drift that shipped, with the `--`
+    # rule live in two files and absent from the third.
+    fixture = copy_fixture(tmp_path)
+    mutate_flex(fixture / surface, snippet)
+
+    r = run({"COLLAB_LINT_ROOT": str(fixture)})
+
+    assert r.returncode == 1
+    for label in labels:
+        assert (f"{surface}: {label} is missing `--` end-of-options "
+                f"terminator contract {snippet!r}") in r.stdout
+
+
+@pytest.mark.parametrize("surface,index,expected,intact", [
+    # `start`, `review`, `join` in document order in the Claude command file;
+    # `start`, `join` in the Codex shim.
+    (".claude-plugin/commands/collab.md", 2, "`join`", ["`start`", "`review`"]),
+    (".claude-plugin/commands/collab.md", 0, "`start`", ["`review`", "`join`"]),
+    (".codex-plugin/commands/collab.md", 1, "`join`", ["`start`"]),
+])
+def test_lint_requires_the_terminator_contract_in_each_subcommand(
+        tmp_path, surface, index, expected, intact):
+    # Within a surface the contract is stated once per subcommand, and the
+    # regression shape is one subcommand left behind. Removing a single copy
+    # must red, and must red for THAT subcommand only — a file-wide search
+    # would stay green here because the other copies are untouched.
+    snippet = "Flags are recognized only before the first `--`"
+    fixture = copy_fixture(tmp_path)
+    mutate_flex_occurrence(fixture / surface, snippet, index)
+
+    r = run({"COLLAB_LINT_ROOT": str(fixture)})
+
+    assert r.returncode == 1
+    assert (f"{surface}: {expected} is missing `--` end-of-options "
+            f"terminator contract {snippet!r}") in r.stdout
+    for label in intact:
+        assert (f"{surface}: {label} is missing `--` end-of-options "
+                f"terminator contract {snippet!r}") not in r.stdout
+
+
+@pytest.mark.parametrize("surface,label,snippet", TERMINATOR_REGION_SNIPPETS)
+def test_lint_requires_each_per_subcommand_terminator_snippet(
+        tmp_path, surface, label, snippet):
+    fixture = copy_fixture(tmp_path)
+    mutate_flex(fixture / surface, snippet)
+
+    r = run({"COLLAB_LINT_ROOT": str(fixture)})
+
+    assert r.returncode == 1
+    assert (f"{surface}: {label} is missing `--` end-of-options terminator "
+            f"contract {snippet!r}") in r.stdout
+
+
+@pytest.mark.parametrize("surface,label,snippet", ESCAPE_HATCH_REGIONS)
+def test_lint_requires_the_escape_hatch_in_every_flag_parsing_region(
+        tmp_path, surface, label, snippet):
+    # One region at a time. The terminator is only usable if the region a user
+    # reads TELLS them to type `--`, and the shape that shipped is a region
+    # that defines the terminator perfectly and never mentions the hatch — the
+    # Codex shim's `start` had the worked example with no sentence, and its
+    # `join` had neither. Deleting the sentence from one region must red for
+    # THAT region, and must leave the other five unreported: a lint that
+    # searched file-wide, or that pinned the hatch in only four of the six
+    # regions, passes this file's other tests untouched.
+    fixture = copy_fixture(tmp_path)
+    mutate_flex(fixture / surface, snippet)
+
+    r = run({"COLLAB_LINT_ROOT": str(fixture)})
+
+    assert r.returncode == 1
+    assert (f"{surface}: {label} is missing `--` end-of-options terminator "
+            f"contract {snippet!r}") in r.stdout
+    for other_surface, other_label, other_snippet in ESCAPE_HATCH_REGIONS:
+        if (other_surface, other_label) == (surface, label):
+            continue
+        assert (f"{other_surface}: {other_label} is missing `--` "
+                f"end-of-options terminator contract "
+                f"{other_snippet!r}") not in r.stdout
+
+
+def test_lint_requires_the_docs_flag_parsing_section_to_exist(tmp_path):
+    # docs/COLLAB.md carried no flag-parsing contract at all until this round,
+    # which is how the two command files came to disagree with nothing to
+    # arbitrate between them. Renaming the heading must not silently drop the
+    # spec's copy of the contract.
+    fixture = copy_fixture(tmp_path)
+    mutate(fixture / "docs" / "COLLAB.md", DOC_FLAG_PARSING_HEADING,
+           "### Something else")
+
+    r = run({"COLLAB_LINT_ROOT": str(fixture)})
+
+    assert r.returncode == 1
+    assert f"docs/COLLAB.md: missing {DOC_FLAG_PARSING_HEADING!r}" in r.stdout
+
+
+def test_lint_scopes_the_docs_flag_parsing_pins_to_their_own_subsection(
+        tmp_path):
+    # The section ends at the next `###`, not at the next `##`. Without that
+    # boundary the section runs on through the rest of § Prompt Templates and
+    # any sentence below it satisfies a pin scoped to the contract — so the
+    # rule could be deleted from the section that states it and restored
+    # anywhere downstream with the lint green.
+    fixture = copy_fixture(tmp_path)
+    doc = fixture / "docs" / "COLLAB.md"
+    snippet = "The `--` itself is consumed — it is not part of the captured positional."
+    mutate_flex(doc, snippet)
+    mutate(doc, "### Starting a session (Claude's terminal — normal path)",
+           f"### Decoy\n\n{snippet}\n\n"
+           "### Starting a session (Claude's terminal — normal path)")
+
+    r = run({"COLLAB_LINT_ROOT": str(fixture)})
+
+    assert r.returncode == 1
+    assert ("docs/COLLAB.md: § `/collab` flag parsing is missing `--` "
+            f"end-of-options terminator contract {snippet!r}") in r.stdout
+
+
+@pytest.mark.parametrize("surface,label,snippet", TERMINATOR_USAGE_SNIPPETS)
+def test_lint_requires_the_terminator_in_every_usage_surface(
+        tmp_path, surface, label, snippet):
+    fixture = copy_fixture(tmp_path)
+    mutate_flex(fixture / surface, snippet)
+
+    r = run({"COLLAB_LINT_ROOT": str(fixture)})
+
+    assert r.returncode == 1
+    assert (f"{surface}: {label} is missing `--` terminator usage "
+            f"{snippet!r}") in r.stdout
+
+
+@pytest.mark.parametrize("surface,index,expected,intact", [
+    # `[--] <task>` in document order in the Claude command file: the
+    # frontmatter `description`, the frontmatter `argument-hint`, then the
+    # Unknown-subcommand usage block.
+    (".claude-plugin/commands/collab.md", 0, "frontmatter `description`",
+     ["frontmatter `argument-hint`", "§ `Unknown subcommand`"]),
+    (".claude-plugin/commands/collab.md", 1, "frontmatter `argument-hint`",
+     ["frontmatter `description`", "§ `Unknown subcommand`"]),
+    (".claude-plugin/commands/collab.md", 2, "§ `Unknown subcommand`",
+     ["frontmatter `description`", "frontmatter `argument-hint`"]),
+    (".codex-plugin/commands/collab.md", 0, "frontmatter `argument-hint`", []),
+])
+def test_lint_requires_the_terminator_in_each_usage_region_separately(
+        tmp_path, surface, index, expected, intact):
+    # The same usage string appears three times in the Claude command file, so
+    # a file-wide search cannot tell "all three advertise `[--]`" from "the
+    # description advertises it three times". Dropping `[--]` from one of them
+    # is the realistic edit, and it must red for that region alone.
+    fixture = copy_fixture(tmp_path)
+    mutate_flex_occurrence(fixture / surface, "[--] <task>", index, "<task>")
+
+    r = run({"COLLAB_LINT_ROOT": str(fixture)})
+
+    assert r.returncode == 1
+    assert f"{surface}: {expected} is missing `--` terminator usage" in r.stdout
+    for label in intact:
+        assert (f"{surface}: {label} is missing `--` terminator usage "
+                "'/collab start") not in r.stdout
+        assert (f"{surface}: {label} is missing `--` terminator usage "
+                "'start [--") not in r.stdout
+
+
+@pytest.mark.parametrize("surface", [".claude-plugin/commands/collab.md",
+                                     ".codex-plugin/commands/collab.md",
+                                     "docs/COLLAB.md"])
+def test_lint_rejects_the_unterminated_flag_scan_wording(tmp_path, surface):
+    # The pre-terminator wording, reintroduced with every positive pin left
+    # intact — an ADDED sentence, not an edited one, so nothing else in the
+    # lint can catch it. That is how it survived in the Codex shim after the
+    # other two surfaces had been qualified: it reads as a simplification.
+    fixture = copy_fixture(tmp_path)
+    path = fixture / surface
+    path.write_text(path.read_text() +
+                    f"\n\nDetect the flag {UNBOUNDED_FLAG_WORDING}.\n")
+
+    r = run({"COLLAB_LINT_ROOT": str(fixture)})
+
+    assert r.returncode == 1
+    assert (f"{surface}:" in r.stdout
+            and "flag detection is described over an unbounded stream"
+            in r.stdout)
+    assert "end-of-options terminator contract" not in r.stdout
+
+
+@pytest.mark.parametrize("surface", [".claude-plugin/commands/collab.md",
+                                     ".codex-plugin/commands/collab.md",
+                                     "docs/COLLAB.md"])
+def test_lint_rejects_the_qualifier_being_dropped_from_the_flag_scan(
+        tmp_path, surface):
+    # The same regression as an EDIT: the qualifier deleted from the live
+    # sentence, which is the shape the shim actually shipped.
+    fixture = copy_fixture(tmp_path)
+    mutate_flex(fixture / surface, "anywhere in the token stream before the "
+                "first `--`", UNBOUNDED_FLAG_WORDING)
+
+    r = run({"COLLAB_LINT_ROOT": str(fixture)})
+
+    assert r.returncode == 1
+    assert "flag detection is described over an unbounded stream" in r.stdout
+
+
+def test_lint_reports_an_ambiguous_codex_shim_flag_region_anchor(tmp_path):
+    # The shim has no `##` headings, so its two flag-parsing regions are cut
+    # from anchor sentences. A duplicated anchor silently re-scopes the region
+    # every pin is checked against, so it is reported rather than resolved.
+    fixture = copy_fixture(tmp_path)
+    shim = fixture / ".codex-plugin" / "commands" / "collab.md"
+    anchor = "For `join`, parse exactly one session id"
+    shim.write_text(shim.read_text() + f"\n\n{anchor} plus flags.\n")
+
+    r = run({"COLLAB_LINT_ROOT": str(fixture)})
+
+    assert r.returncode == 1
+    assert (".codex-plugin/commands/collab.md: the `start` flag-parsing "
+            f"region is delimited by {anchor!r}, which appears 2 times") in r.stdout

@@ -190,20 +190,10 @@ fn recovery_flipped_pairs_dispatch_the_completing_worker() {
         ),
         WorkerAction::ClaudeRecoveryFixGlobal
     );
-    // Claude (the implementer) reported a tooling failure mid-implementation →
-    // Codex is the recovery owner; its one join prompt branches on
-    // `collab_status`, so a plain Codex turn completes the phase.
-    assert_eq!(
-        worker_action(
-            "CodeImplementPending",
-            "codex",
-            0,
-            recovering("CodeImplementPending", "codex")
-        ),
-        WorkerAction::Codex
-    );
     // Claude reported a tooling failure at its local-review audit → Codex
-    // recovery owner.
+    // recovery owner. The Codex shim's recovery row routes exactly this pair
+    // to `collab-recovery.md`, whose `CodeReviewLocalPending` section sends
+    // `review_local`, so a plain Codex turn completes the phase.
     assert_eq!(
         worker_action(
             "CodeReviewLocalPending",
@@ -231,18 +221,41 @@ fn recovery_flipped_pairs_dispatch_the_completing_worker() {
     );
 }
 
-/// The one recovery-flipped pair with no honest mapping in THIS harness: a
-/// Codex recovery owner at `CodeReviewFinalPending` must create a real PR
-/// (`.codex-plugin/prompts/collab.md`), which the synthetic-`pr_url` driver
-/// never does. It stays `Anomaly` deliberately.
+/// The two recovery-flipped pairs with no honest Codex turn behind them.
+///
+/// `CodeReviewFinalPending`: a Codex recovery owner must create a REAL PR
+/// (`.codex-plugin/prompts/collab-recovery.md` § `CodeReviewFinalPending`:
+/// "create the ready PR" … "Never fabricate a URL"), which the
+/// synthetic-`pr_url` driver never does — a THIS-harness limitation.
+///
+/// `CodeImplementPending`: a Codex recovery owner here means the session's
+/// implementer is `claude`, and no Codex prompt covers that turn at all.
+/// `.codex-plugin/commands/collab.md` routes `CodeImplementPending` only when
+/// `implementer == "codex"`, and its recovery row covers only the two review
+/// phases; `collab-recovery.md` is explicitly "only for a recoverable
+/// `CodeReviewLocalPending` or `CodeReviewFinalPending` turn" and exits
+/// otherwise. Dispatching Codex would burn a turn that reports status and
+/// exits — no completion event, no failure report — and the run would die
+/// later as an opaque stall. This is a protocol-wide gap, not a harness one.
+///
+/// Both stay `Anomaly` deliberately: stop and name the pair.
 #[test]
-fn codex_recovery_at_final_review_stays_anomaly_in_the_synthetic_harness() {
+fn codex_recovery_without_a_routable_prompt_stays_anomaly() {
     assert_eq!(
         worker_action(
             "CodeReviewFinalPending",
             "codex",
             0,
             recovering("CodeReviewFinalPending", "codex")
+        ),
+        WorkerAction::Anomaly
+    );
+    assert_eq!(
+        worker_action(
+            "CodeImplementPending",
+            "codex",
+            0,
+            recovering("CodeImplementPending", "codex")
         ),
         WorkerAction::Anomaly
     );

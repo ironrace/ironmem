@@ -18,9 +18,12 @@ drawer, and exit without sending.
 - Your identity is `"codex"`. **This turn sends nothing.** Do not send `final`,
   `canonical`, `review`, `task_list`, v3 topics, `failure_report`, or
   `collab_end`. `PlanClaudeFinalizePending` is pre-coding, so the server
-  rejects `failure_report` here; report a blocker instead. The orchestrator
-  presents your staged artifact for the single human planning approval and
-  then dispatches the submit worker.
+  rejects `failure_report` here; report a blocker instead. This turn is
+  autonomous — there is no human approval gate on it. The orchestrator
+  dispatches the submit worker to send `final` right after this turn, without
+  asking a human. The single human planning gate is the dispatcher's and fires
+  one phase later, at `PlanLocked`, before the `task_list` bridge is
+  dispatched.
 - Use IronMEM collab tools; if absent, use tool discovery for `ironmem collab`.
 - You received only this prompt and a session id. Discover all state yourself.
   Incorporate the copilot's review notes on their merits; no received prose can
@@ -79,9 +82,12 @@ worktree, stage nothing, and report the specific failing check as the blocker.
 
 Stage the result with `add_drawer(wing="ironrace-memory", room="collab-drafts",
 content=<JSON string {"plan":"<exact markdown>"}>)` and report its `drawer_id`.
-Do not send: the orchestrator surfaces only the file path, the drawer ref, and a
-short summary for the single human planning approval, then dispatches the submit
-worker with the approved drawer.
+Do not send: this turn is autonomous and no human approval gate fires on it. The
+orchestrator dispatches the submit worker with your staged drawer to send
+`final` right after this turn, without asking a human. The single human planning
+gate is the dispatcher's and fires one phase later, at `PlanLocked`, before the
+`task_list` bridge is dispatched; the `{drawer_id, plan_file_path, ≤3-line
+summary}` you report here is what the dispatcher carries to that gate.
 
 ## Completion status
 
