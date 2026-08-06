@@ -25,7 +25,7 @@ This document covers:
 - topic payload formats for every protocol message
 - harness-side responsibilities (git, cargo, gh, pr-review-toolkit)
 - Claude's dispatcher loop and one-shot Codex dispatches
-- Claude's Plan Mode integration for the v1 final approved task plan (the only planning user gate; synthesis, the v3 bridge, and final_review run autonomously)
+- the dispatcher's Plan Mode integration for the locked plan at `PlanLocked` (the only planning user gate; the `final` send, the v3 bridge's parse, and `final_review` all run autonomously)
 - copy-pasteable prompts (single-terminal default; Codex-terminal fallback)
 - a worked example
 
@@ -68,10 +68,11 @@ multi-agent framework. Exactly one plan is produced per session, with:
 
 1. two independent first drafts (Claude + Codex, blind to each other)
 2. one canonical synthesis by the pilot
-3. one review pass by Codex
-4. one final approved task plan sent by the pilot (Claude still has the last
-   word — it always drives the Plan Mode approval gate, regardless of pilot)
-5. terminal state `PlanLocked`
+3. one review pass by the copilot
+4. one final approved task plan sent autonomously by the pilot
+5. terminal state `PlanLocked`, where the dispatcher — always Claude, see
+   § Runtime Model → Roles — takes the single human planning gate before
+   dispatching the `task_list` bridge, regardless of pilot
 
 There is no `PlanEscalated` state and no re-synthesis loop. After Codex's one
 review pass, the pilot finalizes regardless of Codex's verdict.
@@ -89,8 +90,10 @@ One review pass is a maximum, not an iteration target.
   next phase.
 - The pilot has the last word on content: any unresolved review notes are
   absorbed (or explicitly declined with a rationale) in the `final` plan —
-  composed by whichever agent is piloting; Claude still drives the Plan Mode
-  approval gate on top of whatever the pilot composes.
+  composed and sent autonomously by whichever agent is piloting. The
+  dispatcher's word comes after that, one phase later: it takes the single
+  human planning gate at `PlanLocked`, on top of whatever the pilot composed
+  and already sent.
 - `review_round` is the audit trail. It is set to 1 after Codex's review;
   post-finalize tests assert `review_round == MAX_REVIEW_ROUNDS`.
 - The protocol is bounded by construction: at most one Codex review,
@@ -177,6 +180,19 @@ The following are intentionally NOT generalized:
   enforces this. Adding a third variant would silently require updates across
   all match sites — the intentional design forces that cost to be visible.
   See the boundary note at the top of `collab/agent.rs`.
+- **Pilot-configurability is not a step toward an N-party protocol.** The
+  per-session `pilot` field (§ Runtime Model → Roles) lets either named agent
+  lead planning and the v3 audit turns, but this is reuse of the two-party
+  primitives above, not a loosening of them: `Agent` stays the closed
+  two-variant enum, and `copilot()` is `counterpart(pilot)` — the same
+  exhaustive `collab_counterpart` role-flip, just evaluated against whichever
+  agent is currently piloting. `counterpart(x)` is only definable when there
+  are exactly two participants (it returns "the other one"); it has no
+  meaning for three or more. Making the pilot configurable does not open
+  `Agent` to a third variant or generalize `counterpart` to an N-party
+  lookup — a third protocol participant still requires the v2 redesign
+  described above, independent of how many pilot values a two-party session
+  supports.
 - **`collab_sessions.implementer` CHECK** (migration 006) — the DB constraint
   pins the allowed implementer values to `'claude'` and `'codex'`.
 - **`collab_actor_generations.agent` CHECK** (migration 010) — the
@@ -200,6 +216,26 @@ See the boundary doc comments at the top of
 `crates/ironmem/src/collab/agent.rs` and
 `crates/ironmem/src/collab/mod.rs` for the authoritative in-code statement of
 this boundary.
+
+### Codex-terminal-led sessions are a non-goal
+
+The Codex-terminal `/collab join` path (§ Prompt Templates → "Joining a
+session in a Codex terminal — fallback only") stays a one-shot shim by
+design, not an unfinished feature. The Codex CLI cannot sustain a
+`wait_my_turn` polling loop across handoffs, so it cannot host the
+long-running dispatcher that `/collab`'s control loop requires (§ Runtime
+Model → Roles: the dispatcher is always Claude for exactly this reason).
+Generalizing the Codex-side prompt into a symmetric long-running dispatcher
+is intentionally out of scope, for the same one-shot-CLI reason the
+Codex-terminal path is a fallback at all.
+
+The apparent requirement this would serve — "let Codex lead the session" —
+is already met without it: `pilot=codex` in a Claude terminal makes Codex own
+`canonical`, `final`, `task_list`, `review_local`, and `final_review`, so
+every lead-role transition requires Codex as the actor. The Claude terminal
+keeps running the dispatcher loop and talking to the human; Codex leads
+planning and review as pilot. `dispatcher=claude, pilot=codex` delivers
+Codex-led planning and review without needing the Codex CLI to poll.
 
 ## Runtime Model
 
@@ -262,7 +298,7 @@ Stored in `collab_sessions`:
 | `phase` | Current protocol phase (see below) |
 | `current_owner` | Agent whose turn it is (`claude` or `codex`) |
 | `claude_draft_hash`, `codex_draft_hash` | SHA-256 of each first draft |
-| `canonical_plan_hash` | SHA-256 of Claude's synthesis |
+| `canonical_plan_hash` | SHA-256 of the pilot's synthesis |
 | `canonical_plan_ref` | The latest `canonical` plan reference (present when `canonical_plan_hash` is set): `{drawer_id, hash, plan_file_path}`. `plan_file_path` is null unless the plan carries the required leading marker. Status never includes the plan body; dereference the drawer only when required. See "Plan-by-reference contract". |
 | `canonical_plan_drawer_id` / `final_plan_drawer_id` | Deterministic 32-char id of the `collab-plans` drawer storing the canonical/final plan body once accepted (migration 009). NULL on pre-009 sessions; status still exposes a body-free legacy reference when possible. |
 | `final_plan_hash` | SHA-256 of the locked plan |
@@ -270,7 +306,7 @@ Stored in `collab_sessions`:
 | `task_list` / `task_list_ref` | The accepted v3 task-list reference: `{drawer_id, hash}` plus top-level `tasks_count`, `plan_file_path`, and `execution_mode`. `include_task_list:true` repeats this compact ref under `task_list`; it never inlines JSON. New sessions store the task list in `collab-task-lists`; pre-014 sessions may have `task_list_ref.drawer_id = null`. |
 | `task_list_drawer_id` | Deterministic 32-char id of the `collab-task-lists` drawer storing the canonicalized task-list JSON once accepted (migration 014). NULL on pre-014 sessions. |
 | `codex_review_verdict` | The **copilot's** verdict from the one review pass — Codex under the default `pilot=claude`, Claude under `pilot=codex`. The column name is historical and was deliberately not migrated. |
-| `review_round` | Number of completed Codex reviews (0 or 1; planning has one review pass) |
+| `review_round` | Number of completed copilot reviews (0 or 1; planning has one review pass) |
 | `ended_at` | Non-null once `collab_end` has been called |
 
 All state changes are recorded in `wal_log`.
@@ -318,8 +354,8 @@ containing the merged plan: `collab-turn-plan-synthesis.md` when
 `pilot == "codex"`.
 
 This phase is autonomous. Neither agent enters Plan Mode and neither asks for
-approval here; the single planning gate is the final approved task plan at
-`PlanClaudeFinalizePending`.
+approval here; the single planning gate is the dispatcher's, at `PlanLocked`,
+two phases later.
 
 Exit → `PlanCodexReviewPending`, owner the copilot (`current_owner`).
 
@@ -348,30 +384,44 @@ can split it into independently executable child issues before finalization.
 
 ### `PlanClaudeFinalizePending`
 
-Owner: the pilot (`current_owner`). Claude always drives this phase — it
-enters Plan Mode, asks for the only planning human approval, and dispatches
-the finalize worker regardless of pilot — but composition and the send are
-pilot-generic: `collab-turn-plan-finalize.md` writes the final
-iron-build-compatible task markdown when `pilot == "claude"`, or Claude's
-loop triggers Codex's equivalent turn when `pilot == "codex"`, and either way
-`collab-turn-submit.md` sends the one `final` message as the pilot. Every
-task must be scoped to 20 minutes or less, and the plan must contain 1–10
-tasks. Larger work or an 11+ task scope is split into independently
-executable child issues before approval.
+Owner: the pilot (`current_owner`). **No human gate here — this turn is
+autonomous.** The single human planning gate belongs to the dispatcher, and
+it fires one phase later, at `PlanLocked`, before the bridge dispatches
+`task_list` (see § v3 Bridge, step 0) — a `codex exec` one-shot cannot prompt
+a human, so only the dispatcher can own a human gate, and under
+`pilot == "codex"` this finalize turn belongs to Codex regardless. Composition
+and the send are pilot-generic: `collab-turn-plan-finalize.md` writes the
+final iron-build-compatible task markdown when `pilot == "claude"`, or
+Claude's loop triggers Codex's equivalent turn when `pilot == "codex"`, and
+either way `collab-turn-submit.md` sends the one `final` message as the
+pilot. Every task must be scoped to 20 minutes or less, and the plan must
+contain 1–10 tasks. If it would need 11 or more, stop before sending `final`
+— that send, not the later `PlanLocked` gate, is the point of no return:
+once `PlanLocked` is reached the plan is immutable, and an oversized
+`task_list` is rejected on the `> 10` task-count check with `collab_end` as
+the only exit. Split larger work into independently executable child issues
+before sending `final`, never at the gate.
 
 Exit → `PlanLocked` (always). Planning is done.
 
 ### `PlanLocked`
 
 Plan is frozen; `final_plan_hash` is set. This is terminal for `wait_my_turn`
-**only while `task_list` has not yet been submitted**. Two transitions out:
+**only while `task_list` has not yet been submitted**.
 
-- `collab_end` — abandon before coding starts (last point this is valid).
-- `collab_send` with `topic=task_list` from the pilot (`current_owner`) —
-  enter the v3 coding
-  loop. The state machine verifies `plan_hash == final_plan_hash` and that the
-  task list contains 1–10 tasks; the session stays active and the terminal set for
-  `wait_my_turn` flips to `{CodingComplete, CodingFailed}`.
+The dispatcher takes the single human planning gate here — after `final` is
+already on the wire, before `task_list` is dispatched (see § v3 Bridge, step
+0; § Approval gates are reference-only). It surfaces ONLY
+`{drawer_id, plan_file_path, ≤3-line summary}` for approval, never the plan
+body. Two transitions out:
+
+- `collab_end` — abandon before coding starts, on gate rejection (last point
+  this is valid).
+- `collab_send` with `topic=task_list` from the pilot (`current_owner`), on
+  gate approval — enter the v3 coding loop. The state machine verifies
+  `plan_hash == final_plan_hash` and that the task list contains 1–10 tasks;
+  the session stays active and the terminal set for `wait_my_turn` flips to
+  `{CodingComplete, CodingFailed}`.
 
 ## v3 Coding Phase Model
 
@@ -1496,12 +1546,12 @@ exactly one event variant — there is no phase overloading.
 |---|---|---|
 | `PlanParallelDrafts` | `draft` | v1 planning |
 | `PlanSynthesisPending` | `canonical` | v1 planning |
-| `PlanCodexReviewPending` | `review` | v1 — Codex review of canonical |
-| `PlanClaudeFinalizePending` | `final` | v1 — the pilot finalizes |
-| `PlanLocked` | `task_list` | v1 → v3 hand-off |
+| `PlanCodexReviewPending` | `review` | v1 — the copilot's review of canonical |
+| `PlanClaudeFinalizePending` | `final` | v1 — the pilot finalizes and sends autonomously; the dispatcher's gate is one phase later, at `PlanLocked` |
+| `PlanLocked` | `task_list` | v1 → v3 hand-off, gated by the dispatcher's planning approval gate (see § v3 Bridge, step 0) |
 | `CodeImplementPending` | `implementation_done`, `failure_report` | v3 — single implementer turn after subagent batch |
-| `CodeReviewFixGlobalPending` | `review_fix_global`, `failure_report` | v3 — Codex runs `/pr-review-toolkit:review-pr` on the raw post-implementation diff, then fans confirmed fixes out to subagents |
-| `CodeReviewLocalPending` | `review_local`, `failure_report` | v3 — the pilot audits Codex's commits, then fans confirmed fixes out to subagents |
+| `CodeReviewFixGlobalPending` | `review_fix_global`, `failure_report` | v3 — the copilot runs `/pr-review-toolkit:review-pr` on the raw post-implementation diff, then fans confirmed fixes out to subagents |
+| `CodeReviewLocalPending` | `review_local`, `failure_report` | v3 — the pilot audits the copilot's commits, then fans confirmed fixes out to subagents |
 | `CodeReviewFinalPending` | `final_review`, `failure_report` | v3 — the pilot owns the final-review sender identity; the Claude submit worker opens the PR normally, while a recovery owner opens it directly |
 | `CodingComplete` / `CodingFailed` | *(none — terminal; only `collab_end` accepted)* | |
 
@@ -1735,12 +1785,16 @@ before each coding-active `collab_send`:
   what actually failed (`network_failed:` or `sandbox_denied:` as
   applicable) rather than inventing a URL. A recoverable failure report
   costs one retry attempt; a fabricated URL corrupts the record forever.
-- **Plan Mode** on Claude's side is entered before only one gate: `final`
-  (v1), where Claude presents the approved task plan for approval. Canonical
-  synthesis runs autonomously. The `task_list` send mechanically parses that
-  already-approved markdown; it is not an extra task-planning handoff and not a Plan
-  Mode gate. The `final_review` PR creation is autonomous (no gate). Codex
-  never enters Plan Mode.
+- **Plan Mode** on the dispatcher's side is entered before only one gate: the
+  locked plan at `PlanLocked` (v1), where the dispatcher presents the
+  approved task plan for approval before dispatching the `task_list` bridge.
+  Canonical synthesis and the `final` send both run autonomously — the plan
+  is already on the wire by the time the gate fires. The `task_list` send
+  itself mechanically parses that already-approved markdown; it is not an
+  extra task-planning handoff and not a second Plan Mode gate. The
+  `final_review` PR creation is autonomous (no gate). Codex never enters Plan
+  Mode; under `pilot == "codex"` the dispatcher terminal still takes this
+  gate, since the dispatcher is always Claude.
 
 The server does not read the git tree for the full v3 flow, and it still
 trusts the harness's `head_sha` string there. The narrow shortcut-only
@@ -1817,29 +1871,39 @@ tier.**
 
 ### Approval gates are reference-only
 
-The only planning user gate (`final`) uses a two-phase reference-only split so
-the orchestrator never has to ingest a full artifact to gate it:
+The only planning user gate is the locked plan, and the dispatcher takes it
+at `PlanLocked` — after `final` is on the wire, before `task_list` is
+dispatched (see § v3 Bridge, step 0):
 
-1. **Compose worker** writes the artifact to a drawer and returns
-   `{ref, ≤3-line summary}`.
-2. **Orchestrator gate** surfaces ONLY `ref + summary` for the user's
-   approval — never the full body.
-3. **Submit worker** (`collab-turn-submit.md`) reads the approved artifact by
-   `$ARTIFACT_REF` and sends it. **Drawer immutability is the integrity
-   anchor:** drawers are append-only, so the approved `drawer_id`'s content
-   cannot change — the ref itself guarantees the user approved exactly what is
-   sent, and no hash recompute is needed (a cross-worker recompute would be both
-   redundant and non-reproducible across readback/encoding). It never
-   re-authors. If the artifact cannot be fetched, the submit worker does not
-   send the protocol topic: for `final_review` (coding-active) it sends a
-   `failure_report`; for the v1 `final` planning topic the state machine
-   rejects `failure_report`, so it aborts with a `blocker:` verdict instead.
+1. **Compose worker** (`collab-turn-plan-finalize.md`, dispatched at
+   `PlanClaudeFinalizePending`) writes the final iron-build-compatible task
+   markdown to `docs/iron/plans/...`, stages the exact markdown in a drawer,
+   and returns `{drawer_id, plan_file_path, ≤3-line summary}`.
+   `collab-turn-submit.md` sends `final` from that artifact immediately,
+   autonomously — composing and sending `final` is not the gate.
+2. **Orchestrator gate**, at `PlanLocked`, surfaces ONLY
+   `drawer_id + plan_file_path + summary` for the user's approval — never the
+   full plan body.
+3. **On approval**, the orchestrator dispatches `collab-turn-task-list.md`
+   (§ v3 Bridge), which reads `final_plan_ref`/`final_plan_hash` by
+   reference, verifies the file's SHA-256 against the approved hash, and
+   sends `task_list`. **Drawer immutability is the integrity anchor:**
+   drawers are append-only, so the approved `drawer_id`'s content cannot
+   change — the ref itself guarantees the user approved exactly what gets
+   parsed, and no hash recompute is needed (a cross-worker recompute would be
+   both redundant and non-reproducible across readback/encoding). **On
+   rejection**, the orchestrator does not send `task_list`; it offers
+   `collab_end` instead — legal precisely and only at `PlanLocked`
+   pre-`task_list`, the one clean abandon point in the session.
 
 The same compose→submit pattern still drives the autonomous v3 `final_review`
 PR creation (the orchestrator dispatches the submit worker directly, since the
 diff already passed `review_fix_global` + `review_local` and a PR is editable
-and unmerged after creation). The PlanLocked bridge is separate: it is a single
-mechanical parse/submit worker, not a compose gate.
+and unmerged after creation) — that turn runs gateless, with no dispatcher
+approval step. Post-plan-lock work runs autonomously apart from the one gate:
+the `PlanLocked` bridge's **parse** stays mechanical — it parses/submits
+`task_list` from the approved markdown and never re-plans — while its
+**dispatch** is exactly what the gate holds.
 
 ### v3 bridge (PlanLocked → CodeImplementPending) — worker-owned
 
@@ -1903,11 +1967,6 @@ the rare recovery override that delegates `CodeReviewLocalPending` or
 `CodeReviewFinalPending` to Codex, where Codex sends the completion event
 (including opening the PR for `final_review`) itself.
 
-Separately, and unrelated to `collab-turn-submit.md`'s by-design omission:
-installed is not yet dispatchable for some of the other templates — the
-Codex `/collab` shim's phase table routes only a subset of those prompts
-today, and the rest ship ahead of their dispatch rows (#248).
-
 The Claude-side dispatch tables and the authoritative tier matrix live in
 `.claude-plugin/commands/collab.md`; this section and that command file must
 stay in lockstep with the Codex command/prompt surface (see the headers in
@@ -1946,14 +2005,14 @@ Phase → action (v1):
 | `PlanParallelDrafts` | send `draft` autonomously (no Plan Mode); owner flips to `codex` | one-shot bg-exec: send `draft`, exit |
 | `PlanSynthesisPending` | synthesize `canonical` and send autonomously (no Plan Mode) | wait (not polling), unless `pilot == "codex"`: one-shot bg-exec synthesizes and sends `canonical` via `collab-plan-synthesis.md`, then exits |
 | `PlanCodexReviewPending` | wait, unless `pilot == "codex"`: Claude is the copilot and owns this turn — dispatch `collab-turn-plan-review.md` (review/opus) and send `review` | one-shot bg-exec: send `review` (or `approve` shortcut), exit — only when `pilot == "claude"`, which makes Codex the copilot |
-| `PlanClaudeFinalizePending` | enter Plan Mode, get user approval for the final approved task plan, send `final` | wait, unless `pilot == "codex"`: one-shot bg-exec composes and stages the final plan via `collab-plan-finalize.md`, then exits |
-| `PlanLocked` | exit loop (or send `task_list` to start v3) | n/a |
+| `PlanClaudeFinalizePending` | compose and send `final` autonomously — no Plan Mode here | wait, unless `pilot == "codex"`: one-shot bg-exec composes and stages the final plan via `collab-plan-finalize.md`, then exits |
+| `PlanLocked` | dispatcher enters Plan Mode, gets user approval for the locked plan (reference-only), then dispatches the `task_list` bridge on approval or offers `collab_end` on rejection; exit loop otherwise | n/a |
 
 Phase → action (v3):
 
 | Phase | Claude does | Codex does |
 |---|---|---|
-| `PlanLocked` (post-final) | dispatch one mechanical `collab-turn-task-list.md` worker with `$SENDER=<collab_status.current_owner>`; worker parses the approved final markdown and sends `task_list` as the pilot | n/a — the Claude-side worker performs the parse and send under the pilot's identity even when `pilot == "codex"` |
+| `PlanLocked` (post-final) | enter Plan Mode, surface only `{drawer_id, plan_file_path, ≤3-line summary}` for the locked plan; on approval, dispatch one mechanical `collab-turn-task-list.md` worker with `$SENDER=<collab_status.current_owner>`, which parses the approved final markdown and sends `task_list` as the pilot; on rejection, offer `collab_end` instead | n/a — the Claude-side worker performs the parse and send under the pilot's identity even when `pilot == "codex"` |
 | `CodeImplementPending` (implementer=claude) | dispatch `collab-turn-code-implement.md`; worker searches checkpoints, runs `iron-build`, gates, checkpoints, and sends `implementation_done{head_sha}` | wait |
 | `CodeImplementPending` (implementer=codex) | dispatch Codex via bg-exec; poll | one-shot bg-exec: search implementation checkpoints, resume/run `iron-build`, checkpoint every task boundary, emit `implementation_done{head_sha}`, exit |
 | `CodeReviewFixGlobalPending` | dispatch Codex via bg-exec and poll — **only when `pilot == "claude"`**, which makes Codex the copilot. Under `pilot == "codex"` Claude is the copilot and owns this turn: dispatch `collab-turn-review-fix-global.md` (review/opus) and send `review_fix_global`. Dispatching Codex into a phase it does not own makes its own ownership guard reject and exit, which the dispatcher then misreads as a spurious `codex_dispatch_failed:` that burns a recovery attempt | one-shot bg-exec: run `/pr-review-toolkit:review-pr` on the raw post-implementation diff, partition confirmed branch-level issues, fan out independent fix subagents in temporary worktrees on unique throwaway branches, merge/cherry-pick fixes back, send `review_fix_global`, exit |
@@ -1971,22 +2030,31 @@ the cleanup command (`git worktree remove <path>`, once the PR merges).
 Cleanup is never run automatically — the branch/worktree must survive until
 the PR is actually merged.
 
-### Claude's Plan Mode Integration
+### Plan Mode integration (dispatcher)
 
-Claude enters harness Plan Mode at **exactly one gate**, matching the
-command-file invariant bullet:
+The dispatcher (always Claude — § Runtime Model → Roles) enters harness Plan
+Mode at **exactly one gate**, matching the command-file invariant bullet:
 
-1. **v1 `final`** — `PlanClaudeFinalizePending`. Claude presents the final
-   iron-build-compatible task markdown for approval; it must contain 1–10 tasks, each
-   timeboxed to 20 minutes or less. A larger plan must first be split into
-   child issues. Post-send the session is `PlanLocked`.
+1. **`PlanLocked` pre-`task_list`.** After the pilot's `final` send has
+   already locked the plan (`final_plan_ref` set, no `task_list` sent yet),
+   the dispatcher presents the locked plan for approval, surfacing only
+   `{drawer_id, plan_file_path, ≤3-line summary}` — never the plan body (see
+   § v3 Bridge, step 0). It must contain 1–10 tasks, each timeboxed to 20
+   minutes or less; a larger plan must have been split into child issues
+   before `final` was sent, since `PlanLocked` makes the plan immutable. On
+   approval, the dispatcher dispatches the `task_list` bridge; on rejection,
+   it offers `collab_end` instead of sending `task_list`.
 
-Every other step runs autonomously: the blind `draft` send (from
-`/collab start`), canonical synthesis, Codex's one plan-review pass, the v3
-`task_list` send (mechanical parse/submit from the approved markdown), and the
-v3 `final_review` PR creation (auto-dispatched after the diff passes
-`review_fix_global` + `review_local`). Codex never enters Plan Mode — it posts
-drafts, reviews, and global fixes directly.
+Every other step runs autonomously, including the `final` send itself: the
+blind `draft` send (from `/collab start`), canonical synthesis, the copilot's
+one plan-review pass, the pilot's `final` send, the v3 `task_list` send
+(mechanical parse/submit from the approved markdown, gated only by the
+dispatcher's approval one phase earlier), and the v3 `final_review` PR
+creation (auto-dispatched after the diff passes `review_fix_global` +
+`review_local`). Codex never enters Plan Mode — it posts drafts, reviews, and
+global fixes directly; under `pilot == "codex"` the dispatcher terminal still
+takes the one `PlanLocked` gate, since the dispatcher is always Claude
+regardless of pilot.
 
 ## Prompt Templates
 
@@ -2096,16 +2164,23 @@ Claude: poll observes owner=claude, phase=PlanSynthesisPending,
 Claude: dispatches Codex again via bg-exec for the review.
 Codex (bg-exec):
         reads canonical, returns verdict=request_changes. Exits.
-Claude: poll observes phase=PlanClaudeFinalizePending. **Enters Plan
-        Mode for final approved task plan.** Splits tasks to 20 minutes
-        or less and routes any 11+ task scope into child issues. User approves.
-        Sends final. Phase now
-        PlanLocked. Loop exits.
+Claude: poll observes phase=PlanClaudeFinalizePending. Finalize turn is
+        autonomous — no Plan Mode here. Dispatches the finalize worker,
+        which splits tasks to 20 minutes or less, routes any 11+ task scope
+        into child issues, composes the final iron-build-compatible task
+        markdown, and sends final. Phase now PlanLocked.
+Claude: dispatcher takes the single planning gate here — **enters Plan
+        Mode**, surfacing only {drawer_id, plan_file_path, ≤3-line summary}
+        for the locked plan (never the plan body). User approves. Dispatches
+        the task_list bridge worker, which parses the approved markdown and
+        sends task_list. Loop exits (or continues into v3 coding).
 ```
 
 Codex's single `request_changes` pass moves directly to
-`PlanClaudeFinalizePending`; last word is still Claude's. Canonical synthesis
-is always autonomous; only the final approved task plan is user-gated.
+`PlanClaudeFinalizePending`, where the pilot composes and sends `final`
+autonomously. The dispatcher's last word comes one phase later, at the
+`PlanLocked` gate. Canonical synthesis and the `final` send are both
+autonomous; only the locked plan is user-gated.
 
 ## Running the MCP Server
 
@@ -2557,12 +2632,13 @@ Scope (v1 + v3):
 
 - bounded planning (v1) and bounded coding loop (v3) through a single session
 - one plan → one task list → one PR per session
-- v1 planning has one Codex review round; v3 coding is strictly linear (no rounds)
-- Claude always drives the planning approval gate (v1, via Plan Mode),
-  regardless of pilot
-- the pilot owns the v3 local-audit turn after Codex's first branch-scope
-  review (`CodeReviewLocalPending`) and the final PR-creation turn
-  (`CodeReviewFinalPending`)
+- v1 planning has one copilot review round; v3 coding is strictly linear (no rounds)
+- the dispatcher (always Claude) drives the single planning approval gate at
+  `PlanLocked`, after `final` is on the wire and before `task_list` is
+  dispatched, regardless of pilot
+- the pilot owns the v3 local-audit turn after the copilot's first
+  branch-scope review (`CodeReviewLocalPending`) and the final PR-creation
+  turn (`CodeReviewFinalPending`)
 - Claude runs the dispatcher loop; Codex-owned phases are one-shot
   dispatches that act autonomously and exit
 
