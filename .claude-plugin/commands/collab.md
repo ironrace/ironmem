@@ -975,9 +975,10 @@ one, which never launches `codex exec` at all) passes the identical
 `-s danger-full-access` flag in step (e) of the Codex handoff procedure
 below.
 
-Read `phase` and `implementer` from the `collab_status` you fetched at
-the top of the dispatch step; branch on them when selecting the prompt
-file, model, and reasoning effort below.
+Read `phase`, `current_owner`, `pilot`, `implementer`, and
+`pending_failure` from the `collab_status` you fetched at the top of the
+dispatch step; branch on them when selecting the prompt file, model, and
+reasoning effort below.
 
 **When falling back to `mcp__codex__codex`** (see fallback path in the
 handoff section), apply the same prompt file, model, and effort from this
@@ -987,12 +988,17 @@ preserved whether the transport is `codex exec` or MCP.
 
 ### Codex handoff — background `codex exec`
 
-**ALL Codex-owned non-terminal phases dispatch via this path.** This
-covers:
-- `PlanParallelDrafts` (Codex draft turn)
-- `PlanCodexReviewPending` (Codex plan review)
-- `CodeReviewFixGlobalPending` (Codex global review)
-- `CodeImplementPending` + `implementer == "codex"` (batch impl)
+**ALL Codex-owned non-terminal phases dispatch via this path** — that is,
+every **§ Codex dispatch tuning matrix** row that names a real prompt file,
+matched on `(phase, ownership condition)`. That set is not fixed: it depends
+on `pilot`, `current_owner`, `implementer`, and `pending_failure`, so no
+abbreviated phase list is restated here. Under the default
+`pilot == "claude"` it is the copilot-gated review phases plus the draft turn
+and a Codex batch implementation; under `pilot == "codex"` those
+copilot-gated rows resolve to Claude (no Codex dispatch at all) and the
+pilot-owned synthesis/finalize/local-audit/final-review rows dispatch
+instead. Resolve the row from live `collab_status` every time; the matrix is
+the single source.
 
 Codex CLI sessions are one-shot and do not sustain `wait_my_turn` loops
 across handoffs, so Claude is the single control loop: polling when it's
@@ -1012,7 +1018,8 @@ a. Read a fresh `collab_status`. If `current_owner == "claude"` or
    `phase` is terminal, skip this step and resume polling / exit.
 
 b. Select prompt file, model, and reasoning effort from the "Codex dispatch tuning
-   matrix" above using `phase` and `implementer` from `collab_status`:
+   matrix" above using `phase`, `current_owner`, `pilot`, `implementer`, and
+   `pending_failure` from `collab_status`:
    - `CodeImplementPending` + `implementer == "codex"` → prompt file:
      `.codex-plugin/prompts/collab-batch-impl.md`; model and reasoning:
      `-m gpt-5.6-luna -c model_reasoning_effort=max`
