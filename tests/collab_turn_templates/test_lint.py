@@ -60,6 +60,15 @@ def mutate(path, snippet, replacement=MARK):
     path.write_text(text.replace(snippet, replacement))
 
 
+def mutate_flex(path, snippet, replacement=MARK):
+    """Replace a lint `flex()` phrase despite prose line wrapping."""
+    text = path.read_text()
+    pattern = r"\s+".join(re.escape(part) for part in snippet.split())
+    mutated, count = re.subn(pattern, replacement, text)
+    assert count, f"flex target not found in {path.name}: {snippet!r}"
+    path.write_text(mutated)
+
+
 # The lint's contract lists, duplicated here on purpose. Importing them from
 # the lint would make these tests parametrize over "whatever the lint currently
 # pins", so deleting an entry would silently shrink the sweep instead of
@@ -128,6 +137,35 @@ TASK_LIST_TEMPLATE_SNIPPETS = [
     'always the pilot, which under `pilot == "codex"` is `codex`',
 ]
 
+# The three-role checks added for pilot configurability are intentionally
+# duplicated here instead of imported from the lint.  These tests are the
+# proof that each checker is live: deleting a phrase from the checker itself
+# must not silently shrink the fixture-mutation sweep along with it.
+PILOT_FLAG_SECTION_SNIPPETS = {
+    "start": "Strip both flag tokens out of the stream before capturing the positional `<task>`",
+    "review": "Never set `initiator` from the `--pilot` value",
+    "join": "Strip both flag tokens out of the stream before capturing the positional `<session_id>`",
+}
+JOIN_PILOT_SURFACES = [
+    (".claude-plugin/commands/collab.md",
+     "**Requested pilot matches `status.pilot`** → no-op",
+     ".claude-plugin/commands/collab.md: missing join pilot-authorization contract"),
+    (".codex-plugin/commands/collab.md",
+     "**Requested pilot matches `status.pilot`** → no-op",
+     ".codex-plugin/commands/collab.md: missing join pilot-authorization contract"),
+]
+PLAN_LOCKED_GATE_SNIPPET = "**Dispatcher-owned planning approval gate.**"
+PLAN_FINALIZE_ROW_SNIPPET = "**No human gate here — this turn is autonomous.**"
+SINGLE_PILOT_RESOLUTION_SNIPPET = "No call site may re-derive role identity from a phase name, a prompt filename, or a value remembered from a prior iteration"
+DOC_PILOT_CONTRACT_SNIPPETS = [
+    "- **dispatcher** — runs the control loop shown above and is the only role that talks to the human",
+    "| `pilot` | Which agent leads v1 planning and the v3 review-audit turns",
+    "### `collab_set_pilot`",
+    "**Wire-compat note:**",
+    "### Codex-terminal-led sessions are a non-goal",
+    "**Pilot-configurability is not a step toward an N-party protocol.**",
+]
+
 
 def test_fixture_is_green(tmp_path):
     # The premise every `assert r.returncode == 1` below depends on.
@@ -141,6 +179,85 @@ def test_fixture_is_green(tmp_path):
 def test_lint_passes_on_repo():
     r = run()
     assert r.returncode == 0, f"lint failed:\n{r.stdout}\n{r.stderr}"
+
+
+@pytest.mark.parametrize("section,snippet", PILOT_FLAG_SECTION_SNIPPETS.items())
+def test_lint_requires_pilot_flag_contract_in_each_entry_section(tmp_path, section, snippet):
+    fixture = copy_fixture(tmp_path)
+    command = fixture / ".claude-plugin" / "commands" / "collab.md"
+    mutate_flex(command, snippet)
+
+    r = run({"COLLAB_LINT_ROOT": str(fixture)})
+
+    assert r.returncode == 1
+    assert (f".claude-plugin/commands/collab.md: `{section}` section is "
+            f"missing pilot-flag parsing contract {snippet!r}") in r.stdout
+
+
+@pytest.mark.parametrize("path,snippet,error", JOIN_PILOT_SURFACES)
+def test_lint_requires_pilot_join_authorization_on_both_harnesses(
+        tmp_path, path, snippet, error):
+    fixture = copy_fixture(tmp_path)
+    mutate(fixture / path, snippet)
+
+    r = run({"COLLAB_LINT_ROOT": str(fixture)})
+
+    assert r.returncode == 1
+    assert f"{error} {snippet!r}" in r.stdout
+
+
+def test_lint_requires_dispatcher_planlocked_gate_and_autonomous_finalize(tmp_path):
+    fixture = copy_fixture(tmp_path)
+    command = fixture / ".claude-plugin" / "commands" / "collab.md"
+    mutate(command, PLAN_LOCKED_GATE_SNIPPET)
+    mutate(command, PLAN_FINALIZE_ROW_SNIPPET)
+
+    r = run({"COLLAB_LINT_ROOT": str(fixture)})
+
+    assert r.returncode == 1
+    assert "v3 bridge is missing dispatcher approval-gate contract" in r.stdout
+    assert "PlanClaudeFinalizePending` row must state that the turn is autonomous" in r.stdout
+
+
+def test_lint_rejects_a_planlocked_row_in_the_codex_shim(tmp_path):
+    fixture = copy_fixture(tmp_path)
+    command = fixture / ".codex-plugin" / "commands" / "collab.md"
+    table_header = "| Phase | Prompt |\n|---|---|"
+    assert table_header in command.read_text()
+    command.write_text(command.read_text().replace(
+        table_header,
+        table_header + "\n| `PlanLocked` | `collab-task-list.md` |",
+        1,
+    ))
+
+    r = run({"COLLAB_LINT_ROOT": str(fixture)})
+
+    assert r.returncode == 1
+    assert "phase→prompt table must never carry a `PlanLocked` row" in r.stdout
+
+
+def test_lint_requires_single_pilot_resolution_contract(tmp_path):
+    fixture = copy_fixture(tmp_path)
+    mutate_flex(fixture / ".claude-plugin" / "commands" / "collab.md",
+                SINGLE_PILOT_RESOLUTION_SNIPPET)
+
+    r = run({"COLLAB_LINT_ROOT": str(fixture)})
+
+    assert r.returncode == 1
+    assert ("dispatch loop is missing single-pilot-resolution contract "
+            f"{SINGLE_PILOT_RESOLUTION_SNIPPET!r}") in r.stdout
+
+
+@pytest.mark.parametrize("snippet", DOC_PILOT_CONTRACT_SNIPPETS)
+def test_lint_requires_each_pilot_documentation_contract(tmp_path, snippet):
+    fixture = copy_fixture(tmp_path)
+    mutate_flex(fixture / "docs" / "COLLAB.md", snippet)
+
+    r = run({"COLLAB_LINT_ROOT": str(fixture)})
+
+    assert r.returncode == 1
+    assert "docs/COLLAB.md: missing" in r.stdout
+    assert snippet in r.stdout
 
 
 def test_review_paths_prefer_artifact_and_preserve_raw_diff_fallback():
