@@ -5,18 +5,19 @@ and Codex coordinate a single plan and then implement it through the shared
 MCP server.
 
 - **v1 (planning)**: bounded parallel drafts → canonical synthesis → one
-  Codex review pass → the pilot finalizes the approved task plan →
+  copilot review pass → the pilot finalizes the approved task plan →
   `PlanLocked`.
 - **v3 (coding)**: post-`PlanLocked` task list → **batch implementation
   phase** (the pilot publishes `task_list` from the approved task
   markdown, then the
   session's `implementer` runs per-task subagents via
   `iron-build` and signals completion with
-  `implementation_done`) → global 3-phase linear flow (Codex review plus
+  `implementation_done`) → global 3-phase linear flow (copilot review plus
   parallel fix fan-out → the pilot's local audit plus parallel fix fan-out →
   the pilot finalizes with PR URL) → `CodingComplete` / `CodingFailed`. Per-task
-  implementation is single-agent on the selected implementer's side; Codex
-  always owns the first branch-scope review pass.
+  implementation is single-agent on the selected implementer's side; the
+  copilot always owns the first branch-scope review pass — Codex under the
+  default `pilot=claude`, Claude under `pilot=codex`.
 
 This document covers:
 
@@ -74,17 +75,17 @@ multi-agent framework. Exactly one plan is produced per session, with:
    § Runtime Model → Roles — takes the single human planning gate before
    dispatching the `task_list` bridge, regardless of pilot
 
-There is no `PlanEscalated` state and no re-synthesis loop. After Codex's one
-review pass, the pilot finalizes regardless of Codex's verdict.
+There is no `PlanEscalated` state and no re-synthesis loop. After the
+copilot's one review pass, the pilot finalizes regardless of that verdict.
 
 ### Review cap (server-enforced)
 
-`MAX_REVIEW_ROUNDS = 1` is the hard cap on Codex plan reviews, enforced
+`MAX_REVIEW_ROUNDS = 1` is the hard cap on copilot plan reviews, enforced
 server-side at `crates/ironmem/src/collab/state_machine/mod.rs:28`
 (the `PlanCodexReviewPending` transition always advances to finalization).
 One review pass is a maximum, not an iteration target.
 
-- After Codex's `review` message, the server transitions to
+- After the copilot's `review` message, the server transitions to
   `PlanClaudeFinalizePending` **regardless of verdict** — `approve`,
   `approve_with_minor_edits`, and `request_changes` all map to the same
   next phase.
@@ -94,9 +95,9 @@ One review pass is a maximum, not an iteration target.
   dispatcher's word comes after that, one phase later: it takes the single
   human planning gate at `PlanLocked`, on top of whatever the pilot composed
   and already sent.
-- `review_round` is the audit trail. It is set to 1 after Codex's review;
-  post-finalize tests assert `review_round == MAX_REVIEW_ROUNDS`.
-- The protocol is bounded by construction: at most one Codex review,
+- `review_round` is the audit trail. It is set to 1 after the copilot's
+  review; post-finalize tests assert `review_round == MAX_REVIEW_ROUNDS`.
+- The protocol is bounded by construction: at most one copilot review,
   then the pilot finalizes. Docs/prompts that frame v1 planning as
   open-ended iteration to convergence are wrong.
 
@@ -167,7 +168,7 @@ The following are intentionally NOT generalized:
 - **Blind dual-draft authoring** — the `PlanParallelDrafts` phase assumes
   exactly two independent drafters; `collab_recv` filters drafts by
   counterpart identity.
-- **Single Codex counterpart-review pass** — the `MAX_REVIEW_ROUNDS = 1`
+- **Single copilot counterpart-review pass** — the `MAX_REVIEW_ROUNDS = 1`
   cap is tied to one named counterpart; there is no general "other party"
   abstraction.
 - **`collab_counterpart` role-flip** — the helper in
@@ -377,10 +378,11 @@ Exit:
 
 - Always → `PlanClaudeFinalizePending`, owner the pilot (`current_owner`).
 
-Codex must put all requested edits, risks, and task-splitting concerns into
-this one review pass. In particular, any task that looks larger than 20 minutes
-or any scope that credibly needs more than 10 tasks must be called out so Claude
-can split it into independently executable child issues before finalization.
+The copilot must put all requested edits, risks, and task-splitting concerns
+into this one review pass. In particular, any task that looks larger than 20
+minutes or any scope that credibly needs more than 10 tasks must be called out
+so the pilot can split it into independently executable child issues before
+finalization.
 
 ### `PlanClaudeFinalizePending`
 
@@ -434,7 +436,7 @@ phase names the exact event that advances it.
 v3 is deliberately linear: every turn deterministically advances to the
 next phase. There are no debate rounds, no verdicts, no round counters
 at the coding stage. This structurally prevents the orchestrator from
-steering the reviewer's conclusion — Codex's only coding turn is at the
+steering the reviewer's conclusion — the copilot's only coding turn is at the
 global review stage and is expressed as commits, not prose.
 
 ### Batch implementation
@@ -462,17 +464,18 @@ In both modes the server stores the `task_list` manifest as an audit
 artifact but does not iterate it. Per-task progress is observable through
 the git log on the branch and through durable ironmem checkpoints written
 by the implementer after each task boundary. After `implementation_done`,
-the phase advances to `CodeReviewFixGlobalPending` with **Codex** as
-owner regardless of who implemented — Codex runs `/pr-review-toolkit:review-pr`
-on the raw post-implementation diff first (no Claude pre-clean) and
+the phase advances to `CodeReviewFixGlobalPending` with the **copilot** as
+owner regardless of who implemented — the copilot runs
+`/pr-review-toolkit:review-pr` on the raw post-implementation diff first
+(no pre-clean by the pilot) and
 uses parallel fix subagents for confirmed, partitionable findings. The pilot's
-`review_local` then audits Codex's commits at `CodeReviewLocalPending`
+`review_local` then audits the copilot's commits at `CodeReviewLocalPending`
 (full `/ultrareview-local` unless reduced-mode criteria apply) and uses the
 same fix fan-out model for confirmed audit findings.
 
 | Phase | Owner | Event | Next |
 |---|---|---|---|
-| `CodeImplementPending` | `claude` or `codex` (per session `implementer`) | `ImplementationDone{head_sha}` from the implementer agent — fired once after the full subagent batch completes (gates green, all commits pushed) | `CodeReviewFixGlobalPending` (Codex-owned) |
+| `CodeImplementPending` | `claude` or `codex` (per session `implementer`) | `ImplementationDone{head_sha}` from the implementer agent — fired once after the full subagent batch completes (gates green, all commits pushed) | `CodeReviewFixGlobalPending` (copilot-owned) |
 
 The `implementation_done` payload carries **only** `head_sha`. There is
 no `notes`, `summary`, `subagent_report`, or any other field — the
@@ -561,10 +564,10 @@ and does not query GitHub by default. A `gh pr list --head <branch>` probe is
 opt-in only when the controller reports boundary uncertainty or the worker
 output mentions PR creation or the *Finishing the Branch* step.
 
-### Global review, 3-phase linear (Codex first; the pilot audits after)
+### Global review, 3-phase linear (the copilot first; the pilot audits after)
 
 After `implementation_done`, the session enters a 3-turn linear review at
-branch scope. Codex runs `/pr-review-toolkit:review-pr` on the raw
+branch scope. The copilot runs `/pr-review-toolkit:review-pr` on the raw
 post-implementation diff first, then fans confirmed findings out to
 parallel fix subagents where they can be safely partitioned; the pilot then
 runs the `review_local` audit of the copilot's commits and fans confirmed audit
@@ -602,7 +605,7 @@ The no-op handshake turn is collapsed: `head_sha` is supplied at session
 creation time. From there, the surviving flow follows the new ordering:
 the copilot's `review_fix_global` (`/pr-review-toolkit:review-pr` plus parallel
 fix fan-out for confirmed findings on the raw diff) → the pilot's
-`review_local` (audit Codex's commits plus parallel fix fan-out) → the
+`review_local` (audit the copilot's commits plus parallel fix fan-out) → the
 pilot's `final_review` (PR creation).
 
 | Phase | Owner | Event | Next |
@@ -622,7 +625,7 @@ Invariants that still apply:
 - Drift detection is special-cased for shortcut-started sessions:
   the server validates `CodeReviewFixGlobal{head_sha}` **and**
   `ReviewLocal{head_sha}` with a git ancestry check when `task_list` is
-  still unset. Both Codex's `review_fix_global` push and Claude's
+  still unset. Both the copilot's `review_fix_global` push and the pilot's
   `review_local` audit-push must descend from the prior `last_head_sha`.
   Full-flow v3 sessions keep their existing non-shell-out behavior.
 - **Scoped attribution:** one live collab session may own each
@@ -1476,7 +1479,7 @@ on every coding message so the server can record branch progress and either
 agent can detect drift.
 
 The `implementation_done` payload carries **only** `head_sha`. There is no
-`verdict`, `notes`, `comment`, or `subagent_report` field — Codex reads
+`verdict`, `notes`, `comment`, or `subagent_report` field — the copilot reads
 the diff and the approved task markdown in the repo at the
 global review stage and forms its own judgment. This is the rule that prevents the
 orchestrator from steering the reviewer's conclusion.
@@ -1485,8 +1488,8 @@ orchestrator from steering the reviewer's conclusion.
 |---|---|---|---|
 | `task_list` | `pilot` | `{"plan_hash","base_sha","head_sha","plan_file_path"?,"execution_mode"?,"tasks":[{"id","title","timebox_minutes","acceptance":[...]}]}` | `plan_hash` must equal `final_plan_hash`; `tasks` must contain **1–10** strictly ordered entries; each task requires `timebox_minutes <= 20` and ≥1 `acceptance` entry. An 11+ task issue must be split into child issues before this message is sent. Optional `plan_file_path` (repo-relative; no leading `/`; no `..` segments) points at the approved task markdown driving subagent execution. Optional `execution_mode` — see below. |
 | `implementation_done` | `claude` or `codex` (per session `implementer`) | `{"head_sha"}` | In `CodeImplementPending` only. Fired once after the subagent batch completes and gates pass. Carries only `head_sha` — no prose, no subagent notes. |
-| `review_fix_global` | `codex` (or `claude` as recovery owner under the delegated-completion override) | `{"head_sha"}` | In `CodeReviewFixGlobalPending` only. Codex ran `/pr-review-toolkit:review-pr` on the raw post-implementation diff (no Claude pre-clean), used parallel fix subagents for confirmed partitionable findings, merged/cherry-picked the resulting fixes, and pushed the branch-level fix commit(s). |
-| `review_local` | `pilot` (or the counterpart agent as recovery owner under the delegated-completion override) | `{"head_sha"}` | In `CodeReviewLocalPending` only. The pilot ran full or reduced audit of Codex's `review_fix_global` commits + caught issues both agents missed, used parallel fix subagents for confirmed partitionable findings, merged/cherry-picked the resulting fixes, and pushed. |
+| `review_fix_global` | `copilot` (or the counterpart agent as recovery owner under the delegated-completion override) | `{"head_sha"}` | In `CodeReviewFixGlobalPending` only. The copilot ran `/pr-review-toolkit:review-pr` on the raw post-implementation diff (no pre-clean by the pilot), used parallel fix subagents for confirmed partitionable findings, merged/cherry-picked the resulting fixes, and pushed the branch-level fix commit(s). |
+| `review_local` | `pilot` (or the counterpart agent as recovery owner under the delegated-completion override) | `{"head_sha"}` | In `CodeReviewLocalPending` only. The pilot ran full or reduced audit of the copilot's `review_fix_global` commits + caught issues both agents missed, used parallel fix subagents for confirmed partitionable findings, merged/cherry-picked the resulting fixes, and pushed. |
 | `final_review` | `pilot` (or the recovery owner under the delegated-completion override) | `{"head_sha","pr_url"}` | In `CodeReviewFinalPending` only. In normal flow the Claude submit worker opens the PR under the turn owner's identity; a Codex recovery owner opens it directly. The event carries the URL and advances directly to `CodingComplete`. `pr_url` must start with `https://` and be ≤2048 chars. |
 | `failure_report` | current owner; off-turn `branch_drift:` may come from either agent; off-turn `codex_dispatch_failed:` may come only from Claude against a Codex-owned turn | `{"coding_failure":"<reason>"}` | Valid in any coding-active phase. Classifies **Tooling** (six recoverable prefixes, stays in-phase, `current_owner` flips) or **Terminal** (everything else — including `branch_drift:` — transitions to `CodingFailed`) — see "Failure + terminal" above. |
 
@@ -1640,10 +1643,10 @@ before each coding-active `collab_send`:
   and reviewing the recorded range while sending a head beyond it promotes
   those commits to session head with nobody having read them. After
   recovering, the review range head is the post-recovery `HEAD`.
-- **Subagent orchestration** during `CodeImplementPending`. Claude's final
-  planning gate produces the approved task markdown, and the PlanLocked
-  bridge publishes it via `task_list`. The selected `implementer` then runs
-  `iron-build` to dispatch fresh subagents per task. Each
+- **Subagent orchestration** during `CodeImplementPending`. The pilot's
+  finalize turn produces the approved task markdown, the dispatcher gates it
+  at `PlanLocked`, and the bridge publishes it via `task_list`. The selected
+  `implementer` then runs `iron-build` to dispatch fresh subagents per task. Each
   subagent runs TDD and commits on the branch. Per-subagent failures pause
   for triage; an unrecoverable failure surfaces as `failure_report` with
   `coding_failure: "subagent_failure: ..."`.
@@ -1669,43 +1672,45 @@ before each coding-active `collab_send`:
   fails, the worker blocks for branch-drift triage instead of burning another
   full gate run. The successful push from `review_local` is the gate evidence
   for this exact HEAD.
-- **Review + fix tooling** during Codex's `review_fix_global`:
-  `/pr-review-toolkit:review-pr` runs as the final Codex review pass over the
+- **Review + fix tooling** during the copilot's `review_fix_global` (Codex
+  under the default `pilot == "claude"`, Claude under `pilot == "codex"`):
+  `/pr-review-toolkit:review-pr` runs as the final branch review pass over the
   compact `ironmem review-diff --repo <repo_path> --base <base_sha> --head
   <last_head_sha>` artifact alongside the approved task markdown
-  when available. Codex injects that artifact only on success; an error,
+  when available. The copilot injects that artifact only on success; an error,
   feature-off build, or nonbeneficial artifact uses the exact raw fallback
   `git diff <base_sha>..<last_head_sha>`. On artifact success it does not retain
   or inject the complete raw diff. The artifact index supports focused source
   reads with `--expand-file <path> --hunk <ordinal>`; reviewers still inspect
   changed source and callers independently. Build this optional path with
   `cargo build --features headroom-compression`. The collab `base_sha` and
-  `last_head_sha` define the review target; Codex must not let the toolkit
-  silently substitute a different base branch. Codex treats the toolkit output as
-  a read-only finding pass, independently verifies findings, then groups
+  `last_head_sha` define the review target; the copilot must not let the toolkit
+  silently substitute a different base branch. The copilot treats the toolkit
+  output as a read-only finding pass, independently verifies findings, then
+  groups
   confirmed branch-level issues into non-overlapping fix clusters. For
-  multiple independent clusters, Codex creates one temporary worktree per
+  multiple independent clusters, the copilot creates one temporary worktree per
   cluster on a unique throwaway branch from the same review head and
   dispatches fix subagents in parallel; each subagent owns exactly one
-  cluster and returns/commits only that cluster's edits. Codex then merges
+  cluster and returns/commits only that cluster's edits. The copilot then merges
   or cherry-picks those fix commits back onto the collab branch, resolves
   conflicts, runs the required gates, commits/pushes the integrated result,
   and sends `review_fix_global`.
-  If findings overlap or touch the same fragile area, Codex fixes that
+  If findings overlap or touch the same fragile area, the copilot fixes that
   cluster sequentially instead of forcing unsafe parallelism.
-  `/ultrareview-local` is NOT used here — Claude may run it later in full
-  `review_local` mode. Codex's judgment is expressed as commits, not prose.
+  `/ultrareview-local` is NOT used here — the pilot may run it later in full
+  `review_local` mode. The copilot's judgment is expressed as commits, not prose.
 - **Audit tooling** during the Claude-side `review_local` worker (normal flow
   when `pilot == "claude"`; under `pilot == "codex"` Codex's
   `collab-review-local.md` owns the equivalent audit and its own gates):
   Claude first runs an
   overlap-mode audit. Full mode invokes `/ultrareview-local` (code-reviewer +
   security-reviewer + architect + doc-reviewer in parallel) against the
-  post-`review_fix_global` head, auditing Codex's commits + catching
-  code-quality issues both agents missed. Reduced mode is allowed when Codex
-  made no fix commit (`review_fix_global.head_sha` equals the preceding
+  post-`review_fix_global` head, auditing the copilot's commits + catching
+  code-quality issues both agents missed. Reduced mode is allowed when the
+  copilot made no fix commit (`review_fix_global.head_sha` equals the preceding
   `implementation_done.head_sha`) or when the branch diff is docs/config-only.
-  Reduced mode still audits the diff summary, changed files, and Codex commits
+  Reduced mode still audits the diff summary, changed files, and copilot commits
   for protocol drift, docs/config breakage, generated metadata inconsistencies,
   and security-sensitive configuration, and escalates to full
   `/ultrareview-local` on uncertainty or a substantive finding. Its PR mode
@@ -1734,7 +1739,7 @@ before each coding-active `collab_send`:
   `review_fix_global` and `review_local`: the server shells out narrowly
   to `git merge-base --is-ancestor` to distinguish a true descendant
   check from operational git failures, and only applies that validation
-  when `task_list` is still unset. Both Codex's `review_fix_global` push
+  when `task_list` is still unset. Both the copilot's `review_fix_global` push
   and the pilot's `review_local` audit-push must descend from the prior
   `last_head_sha`.
 - **PR creation** during `final_review`: after pushed-head proof passes, the
@@ -1823,7 +1828,7 @@ never appends an inline recap, a state summary, or "what to conclude." Each
 worker discovers state for itself via its own `collab_status` / `collab_recv` /
 drawer fetches. This structurally removes the channel the orchestrator could
 otherwise use to steer a worker's judgment (mirrors the v3 design that keeps
-Claude from steering Codex's review).
+the pilot from steering the copilot's review).
 
 **Verdict contract.** The worker's final message is at most three lines
 (`result:` / `ref:` / `blocker:`). The orchestrator stores only this verdict;
@@ -1881,7 +1886,12 @@ dispatched (see `.claude-plugin/commands/collab.md` § v3 Bridge, step 0):
    markdown to `docs/iron/plans/...`, stages the exact markdown in a drawer,
    and returns `{drawer_id, plan_file_path, ≤3-line summary}`.
    `collab-turn-submit.md` sends `final` from that artifact immediately,
-   autonomously — composing and sending `final` is not the gate.
+   autonomously — composing and sending `final` is not the gate. It never
+   re-authors: if the artifact cannot be fetched, the submit worker does not
+   send the protocol topic at all. For `final_review` (coding-active) it
+   sends a `failure_report`; for the v1 `final` planning topic the state
+   machine rejects `failure_report`, so it aborts with a `blocker:` verdict
+   instead.
 2. **Orchestrator gate**, at `PlanLocked`, surfaces ONLY
    `drawer_id + plan_file_path + summary` for the user's approval — never the
    full plan body.
@@ -2464,32 +2474,32 @@ gated on user input.
 
 ### Anti-removal: `/ultrareview-local` overlap audit
 
-Under the new v3 ordering, `CodeReviewLocalPending` runs after Codex's
+Under the new v3 ordering, `CodeReviewLocalPending` runs after the copilot's
 `review_fix_global`. Its role is **audit of the copilot's commits** plus
 catching code-quality, maintainability, consistency, and local-read
-issues that Codex's pr-review-toolkit-backed branch review may miss.
+issues that the copilot's pr-review-toolkit-backed branch review may miss.
 Full-mode `/ultrareview-local` (code-reviewer + security-reviewer +
 architect + doc-reviewer in parallel, synthesized by the review worker,
 then fixed via isolated fix-subagent fan-out where safe) exercises a
 different set of agent prompts, a different synthesis path, and a
-different fix integration pass than Codex's review toolkit turn. Reduced
+different fix integration pass than the copilot's review toolkit turn. Reduced
 mode keeps the audit stage but narrows it to no-fix or docs/config-only
 cases.
 
 Removing the `CodeReviewLocalPending` stage from the v3 flow therefore
 requires a written **overlap audit**: a demonstration, against a
-representative sample of prior collab sessions, that Codex's
+representative sample of prior collab sessions, that the copilot's
 `pr-review-toolkit`-backed `review_fix_global` reviews catch the
 code-quality issues `/ultrareview-local` would have flagged AND that the
-audit-of-Codex role is unnecessary (e.g., Codex's commits never
+audit-of-the-copilot role is unnecessary (e.g., the copilot's commits never
 reintroduce issues).
 Without that audit, the stage stays.
 
 **Status as of 2026-07-07: kept with reduced mode.** Code-quality /
-consistency overlap with Codex's branch review is accepted as deliberate.
+consistency overlap with the copilot's branch review is accepted as deliberate.
 The written overlap audit above still gates removal. Reduced
-`review_local` mode is allowed only after the worker records that Codex made
-no fix commit or that the diff is docs/config-only; uncertainty escalates to
+`review_local` mode is allowed only after the worker records that the copilot
+made no fix commit or that the diff is docs/config-only; uncertainty escalates to
 full `/ultrareview-local`.
 
 ### Reviewer model selection (out of protocol)
