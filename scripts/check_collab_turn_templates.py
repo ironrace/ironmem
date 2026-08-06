@@ -904,6 +904,31 @@ def command_section(text: str, heading: str) -> str | None:
     return "".join(body) if body else None
 
 
+def markdown_tables(text: str, header: str) -> list[str]:
+    """Every markdown table introduced by exactly `header`, header included.
+
+    The Codex shim has no `## ` sections, so `command_section` cannot reach
+    its phase→prompt table and a file-wide search cannot tell a routing row
+    from the prose that discusses one — the file names `PlanLocked` in prose
+    legitimately. A table is delimited by nothing but the run of `|` lines
+    that follows its header, so that is what this returns; callers assert on
+    the count so a duplicated or restructured table is reported rather than
+    silently half-checked.
+    """
+    lines = text.splitlines()
+    tables: list[str] = []
+    for i, line in enumerate(lines):
+        if line.strip() != header:
+            continue
+        body: list[str] = []
+        for row in lines[i:]:
+            if not row.lstrip().startswith("|"):
+                break
+            body.append(row)
+        tables.append("\n".join(body))
+    return tables
+
+
 # ---- three-role (dispatcher / pilot / copilot) contracts --------------------
 #
 # Contract lists for the five checks below, module-level for the same reason as
@@ -1040,6 +1065,19 @@ PLAN_FINALIZE_ROW_SNIPPETS = [
 PLAN_MODE_GATE_RE = re.compile(
     r"enter\s+(?:harness\s+)?Plan\s+Mode\s+and\s+get\s+user\s+approval",
     re.IGNORECASE)
+# The SHIM-side half of the same move, and the one that was pinned by nothing.
+# The two halves above both live in the Claude command file; the gate they pin
+# is only actually unbypassable while the Codex `/collab` shim keeps routing no
+# turn at `PlanLocked` at all. That absence looks accidental from the shim
+# side: nothing in its table says why the phase is skipped, and an orphaned
+# `.codex-plugin/prompts/collab-task-list.md` sits on disk looking exactly like
+# the missing row's other half. An editor who "completes" the pair adds
+# `| \`PlanLocked\` | collab-task-list.md |`, and a Codex-terminal `join` at
+# `PlanLocked` under `pilot == "codex"` then sends `task_list` from a one-shot
+# `codex exec` that cannot prompt a human — no gate fires anywhere. Pinning an
+# absence is the only way that edit has to argue with something.
+CODEX_PHASE_TABLE_HEADER = "| Phase | Prompt |"
+CODEX_UNROUTED_PHASES = ("PlanLocked",)
 # `pilot`/`copilot` are resolved once per iteration and read from those
 # bindings everywhere else. Two call sites that each work out who leads —
 # from a phase name, a template filename, or a value remembered from the
@@ -1105,6 +1143,18 @@ DOC_PILOT_ROLE_CONTRACTS = {
     "the schema v19 migration note": [
         "### Migration note: `pilot` column (schema v19)",
         "`crates/ironmem/migrations/019_collab_pilot.sql`",
+    ],
+    # The prose half of the shim-side pin below. The prompt inventory used to
+    # describe `collab-task-list.md` as "Codex's `PlanLocked` task-list bridge
+    # turn (pilot)" — a description of routing that has never existed, and the
+    # single best argument a future editor could have for adding the row that
+    # bypasses the gate. Saying why the file is unrouted is what stops the
+    # absence from reading as an unfinished job.
+    "the unrouted `collab-task-list.md` note": [
+        "**installed but deliberately unrouted.**",
+        "the Codex shim's phase→prompt table carries **no `PlanLocked` row** "
+        "and must never grow one",
+        "Routing `PlanLocked` through the shim would bypass that gate",
     ],
 }
 
@@ -1450,6 +1500,13 @@ def check_dispatcher_approval_gate_contract() -> None:
     `PlanLocked` pre-`task_list` is the one phase where `collab_end` is
     legal, which is what lets rejection abandon the session cleanly instead
     of wedging it.
+
+    Both halves here are about the Claude command file. The shim side of the
+    same contract — the Codex `/collab` table routing nothing at
+    `PlanLocked`, which is what keeps the bridge the dispatcher's under
+    either pilot — is pinned by
+    `check_codex_shim_unrouted_phases_contract` below, under its own name so
+    that failure says which file has to change.
     """
     text = COMMAND.read_text()
     bridge = command_section(text, PLAN_LOCKED_GATE_HEADING)
@@ -1489,6 +1546,51 @@ def check_dispatcher_approval_gate_contract() -> None:
             f"bridge, and a gate on this row is unreachable under "
             f"`pilot == \"codex\"`, where Codex owns the finalize turn and "
             f"cannot prompt a human")
+
+
+def check_codex_shim_unrouted_phases_contract() -> None:
+    """The Codex shim's phase table must route nothing at `PlanLocked`.
+
+    The other half of the dispatcher-owned approval gate, and the half that
+    lives in a different file than the gate itself. The gate is only
+    unbypassable while `PlanLocked` is dispatched by exactly one thing —
+    Claude's always-on dispatcher — so the shim's *absence* of a row is load
+    bearing, and an absence is what nobody notices deleting. Checked against
+    the table alone rather than the whole file: the shim discusses
+    `PlanLocked` in prose legitimately, and only a routing row is the bug.
+    """
+    if not CODEX_COMMAND.exists():
+        err(".codex-plugin/commands/collab.md: missing Codex slash command, "
+            "so the shim half of the dispatcher approval-gate contract "
+            "(`PlanLocked` routes to nothing) is unpinned")
+        return
+    tables = markdown_tables(CODEX_COMMAND.read_text(),
+                             CODEX_PHASE_TABLE_HEADER)
+    if len(tables) != 1:
+        err(f".codex-plugin/commands/collab.md: expected exactly one "
+            f"{CODEX_PHASE_TABLE_HEADER!r} table — the unrouted-phase audit "
+            f"reads that table to prove {CODEX_UNROUTED_PHASES!r} route to "
+            f"nothing, so a renamed or duplicated header leaves the "
+            f"dispatcher's approval gate bypassable with nothing reporting "
+            f"it, found {len(tables)}")
+        return
+    for phase in CODEX_UNROUTED_PHASES:
+        if phase in tables[0]:
+            err(f".codex-plugin/commands/collab.md: the phase→prompt table "
+                f"must never carry a `{phase}` row. `/collab` on the Codex "
+                f"side is a one-shot `codex exec` turn that cannot open Plan "
+                f"Mode or prompt a human, so the dispatcher-owned planning "
+                f"approval gate cannot fire there; `{phase}` is dispatched "
+                f"only by Claude's always-running dispatcher via "
+                f"`collab-turn-task-list.md`, under either pilot. Routing "
+                f"`{phase}` here lets a Codex-terminal `join` at `{phase}` "
+                f"under `pilot == \"codex\"` send `task_list` with no human "
+                f"gate ever having fired — the exact bypass that moving the "
+                f"gate to the `{phase}` bridge exists to prevent. "
+                f"`.codex-plugin/prompts/collab-task-list.md` is installed "
+                f"but intentionally unrouted; it is not a missing row. If "
+                f"this routing genuinely must change, the gate has to move "
+                f"with it and this pin has to be retired deliberately")
 
 
 def check_single_pilot_resolution_contract() -> None:
@@ -2012,6 +2114,7 @@ def main() -> int:
     check_pilot_flag_parsing_contract()
     check_pilot_join_authorization_contract()
     check_dispatcher_approval_gate_contract()
+    check_codex_shim_unrouted_phases_contract()
     check_single_pilot_resolution_contract()
     check_pilot_doc_contract()
 

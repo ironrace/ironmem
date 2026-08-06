@@ -39,7 +39,15 @@ from this spec — keep them in sync when protocol changes land:
 - `.codex-plugin/prompts/collab-plan-synthesis.md` — Codex's v1 canonical-plan synthesis turn (pilot).
 - `.codex-plugin/prompts/collab-plan-review.md` — Codex's v1 plan-review turn.
 - `.codex-plugin/prompts/collab-plan-finalize.md` — Codex's v1 plan-finalize turn (pilot).
-- `.codex-plugin/prompts/collab-task-list.md` — Codex's `PlanLocked` task-list bridge turn (pilot).
+- `.codex-plugin/prompts/collab-task-list.md` — **installed but deliberately
+  unrouted.** The file ships (the packaging test's `REQUIRED_CODEX_PHASE_PROMPTS`
+  and this repo's lint both require it on disk), but the Codex shim's
+  phase→prompt table carries **no `PlanLocked` row** and must never grow one.
+  The live `PlanLocked` bridge is always executed by the Claude-side
+  dispatcher's mechanical worker (`collab-turn-task-list.md`) under **either**
+  pilot: the dispatcher-owned planning approval gate has to fire before any
+  `task_list` send, and a one-shot `codex exec` cannot prompt a human. Routing
+  `PlanLocked` through the shim would bypass that gate entirely.
 - `.codex-plugin/prompts/collab-global-review.md` — Codex's v3 global-review/fix turn.
 - `.codex-plugin/prompts/collab-review-local.md` — Codex's v3 post-fix local audit turn (pilot).
 - `.codex-plugin/prompts/collab-final-review.md` — Codex's v3 final-review PR-body compose turn (pilot).

@@ -66,7 +66,7 @@ local skills, prompts, and commands untouched.
 - `$CODEX_HOME/prompts/collab-plan-synthesis.md` — the v1 Codex canonical-plan synthesis turn.
 - `$CODEX_HOME/prompts/collab-plan-review.md` — the v1 Codex plan-review turn.
 - `$CODEX_HOME/prompts/collab-plan-finalize.md` — the v1 Codex plan-finalize turn.
-- `$CODEX_HOME/prompts/collab-task-list.md` — the Codex `PlanLocked` task-list bridge turn.
+- `$CODEX_HOME/prompts/collab-task-list.md` — installed but deliberately unrouted (see below).
 - `$CODEX_HOME/prompts/collab-batch-impl.md` — the Codex-implementer batch turn.
 - `$CODEX_HOME/prompts/collab-global-review.md` — the v3 Codex global-review/fix turn.
 - `$CODEX_HOME/prompts/collab-review-local.md` — the Codex `CodeReviewLocalPending` post-fix audit turn.
@@ -74,12 +74,17 @@ local skills, prompts, and commands untouched.
 - `$CODEX_HOME/prompts/collab-recovery.md` — delegated v3 local/final-review recovery.
 
 The command reads session state and loads a phase prompt from its own routing
-table, which currently covers a subset of the prompts above
-(`collab-plan-draft.md`, `collab-plan-review.md`, `collab-batch-impl.md`,
-`collab-global-review.md`, and `collab-recovery.md`). The remaining prompts are
-installed ahead of their dispatch rows; wiring those rows is #248. Claude's
-background dispatcher likewise passes the resolved phase prompt directly when
-it drives Codex-owned turns.
+table, which covers a subset of the prompts above. Claude's background
+dispatcher likewise passes the resolved phase prompt directly when it drives
+Codex-owned turns.
+
+`collab-task-list.md` is the one prompt that is installed and intentionally
+never routed: the table carries **no `PlanLocked` row** and must never grow
+one. That phase's bridge is always run by Claude's always-on dispatcher
+(`collab-turn-task-list.md`) under either pilot, because the dispatcher-owned
+planning approval gate must fire before any `task_list` send and a one-shot
+`codex exec` cannot prompt a human. `scripts/check_collab_turn_templates.py`
+fails if a `PlanLocked` row ever appears in the table.
 
 ## Default Codex routing
 
