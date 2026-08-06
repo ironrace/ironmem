@@ -620,6 +620,22 @@ single human planning gate and takes it in step 0, before any worker runs.
    `plan_file_path` from that reference, verifies the file's SHA-256 against
    the approved hash, and parses each `### Task N:` heading into
    `{id, title, timebox_minutes, acceptance:[...]}`.
+
+   **If the worker returns `blocker:`, the bridge is over — report it and exit
+   the loop.** Do not re-dispatch the worker, and do not fall back through the
+   loop into step 0. The plan is immutable at `PlanLocked`: the approved drawer
+   is append-only and the plan file is pinned to `final_plan_hash`, so a
+   re-dispatch re-reads the same bytes and returns the same blocker, while the
+   loop finds `phase == PlanLocked` with `task_list` still unsent and
+   re-prompts the human with a plan nobody can change — an unbounded
+   re-approval loop. Every step 2 rejection below is of that kind (an 11-task
+   plan, a plan-file SHA-256 mismatch, non-contiguous task IDs, a missing
+   timebox). Report the blocker verbatim to the user and offer
+   `mcp__ironmem__collab_end`, legal precisely and only at `PlanLocked`
+   pre-`task_list` exactly as on rejection in step 0; the work has to be
+   re-cut — usually split into child issues — in a new session. This mirrors
+   the `TaskListBridge` arm in `benchmarks/abeval/src/collab_driver.rs`, which
+   maps a bridge `blocker:` to `DriveError::Invalid` rather than retrying.
 2. The worker must reject the bridge before sending if:
    - there are zero `### Task ` headings
    - there are more than 10 `### Task ` headings (the issue must be split into
@@ -1464,17 +1480,26 @@ and a `pilot == "codex"` session hands off the Claude dispatcher just the same.
 
 **Automated successor path (autonomous/collab phases):**
 
-> **Never spawn an unattended successor into the planning gate.** If `phase ==
-> PlanLocked` with no `task_list` sent — or the current turn is
-> `PlanClaudeFinalizePending`, which lands there — use the **Interactive
-> phases** flow below instead. The whole reason the gate is the dispatcher's is
-> that a one-shot process cannot prompt a human, and `claude -p` is exactly
-> such a process: the successor would arrive at **§ v3 Bridge** step 0, find no
-> human to ask, and either stall forever or self-approve the only human
-> checkpoint in the protocol. The cron fallback re-fires every minute, so a
-> self-approving successor is not a one-off. Mint the token, report
-> `join collab <sid>` to the user, and stop — a session parked at the gate
-> waiting for a human is the correct outcome, not a failure.
+> **Never spawn an unattended successor into the planning gate.** The
+> exclusion is **every v1 planning phase**, not just the gate's own: if `phase`
+> is `PlanParallelDrafts`, `PlanSynthesisPending`, `PlanCodexReviewPending`,
+> `PlanClaudeFinalizePending`, or `PlanLocked` with no `task_list` sent, use
+> the **Interactive phases** flow below instead. **Reason the list is this
+> wide, so it cannot be narrowed without confronting it:** blind drafts,
+> synthesis, the copilot's single review and the autonomous finalize turn run
+> end to end with **no human checkpoint anywhere between them and the gate** —
+> the gate at **§ v3 Bridge** step 0 is the only one left in v1 — so a
+> successor spawned at *any* v1 planning phase drives straight through
+> finalize into it. Dropping a phase from this list is only safe if some other
+> human checkpoint sits ahead of the gate on that phase's path, and there is
+> none. The whole reason the gate is the dispatcher's is that a one-shot
+> process cannot prompt a human, and `claude -p` is exactly such a process: the
+> successor would arrive at **§ v3 Bridge** step 0, find no human to ask, and
+> either stall forever or self-approve the only human checkpoint in the
+> protocol. The cron fallback re-fires every minute, so a self-approving
+> successor is not a one-off. Mint the token, report `join collab <sid>` to the
+> user, and stop — a session parked at the gate waiting for a human is the
+> correct outcome, not a failure.
 
 1. On a `>= 80%` (Handoff) notice, call `session_handoff(session_id, agent)`
    and capture the **top-level** `handoff_token` and `handoff_block` (the
@@ -1520,7 +1545,6 @@ An unattended `claude -p` successor needs at minimum:
 - `mcp__ironmem__collab_send`, `mcp__ironmem__collab_recv`,
   `mcp__ironmem__collab_ack`, `mcp__ironmem__collab_approve`,
   `mcp__ironmem__collab_set_implementer`,
-  `mcp__ironmem__collab_set_pilot`,
   `mcp__ironmem__collab_register_caps`,
   `mcp__ironmem__collab_wait_my_turn`, `mcp__ironmem__collab_end`,
   `mcp__ironmem__collab_resume`, `mcp__ironmem__session_handoff`,
@@ -1528,6 +1552,11 @@ An unattended `claude -p` successor needs at minimum:
 - `Bash(claude -p "join ironmem collab *":*)` — re-spawn a further successor if
   needed (scope to the join-command form; avoid the broader `Bash(claude -p:*)`)
 - Git bash operations as needed for implementation tasks
+
+`mcp__ironmem__collab_set_pilot` is deliberately **not** on this list: the
+successor is spawned as `join ironmem collab <sid> with token <token>`, which
+carries no `--pilot`, and `join` calls `collab_set_pilot` only for a `--pilot`
+that was actually given (step 5 of **§ `join`**). No successor path reaches it.
 
 Configure these in `.claude/settings.json` under `permissions.allow`.
 

@@ -1383,6 +1383,28 @@ crosses a threshold (default 60% warn / 80% handoff, overridable via
 
 **Automated successor path (autonomous/collab phases):**
 
+> **Never spawn an unattended successor into the planning gate.** The
+> exclusion is **every v1 planning phase**, not just the gate's own: if `phase`
+> is `PlanParallelDrafts`, `PlanSynthesisPending`, `PlanCodexReviewPending`,
+> `PlanClaudeFinalizePending`, or `PlanLocked` with no `task_list` sent, use
+> the **Interactive phases** flow below instead. **Reason the list is this
+> wide, so it cannot be narrowed without confronting it:** blind drafts,
+> synthesis, the copilot's single review and the autonomous finalize turn run
+> end to end with **no human checkpoint anywhere between them and the gate** —
+> the dispatcher-owned gate at `PlanLocked` (see § Approval gates are
+> reference-only, and `.claude-plugin/commands/collab.md` § v3 Bridge, step 0)
+> is the only one left in v1 — so a successor spawned at *any* v1 planning
+> phase drives straight through finalize into it. Dropping a phase from this
+> list is only safe if some other human checkpoint sits ahead of the gate on
+> that phase's path, and there is none. The whole reason the gate is the
+> dispatcher's is that a one-shot process cannot prompt a human, and
+> `claude -p` is exactly such a process: the successor would arrive at the gate,
+> find no human to ask, and either stall forever or self-approve the only human
+> checkpoint in the protocol. The cron fallback below re-fires every minute, so
+> a self-approving successor is not a one-off. Mint the token, report
+> `join collab <sid>` to the user, and stop — a session parked at the gate
+> waiting for a human is the correct outcome, not a failure.
+
 1. On a `>= 80%` (Handoff) notice, the active agent calls
    `session_handoff(session_id, agent)` and captures the **top-level**
    `handoff_token` and `handoff_block` from the response (the token is NOT
@@ -1450,7 +1472,6 @@ An unattended `claude -p` successor needs at minimum:
 - `mcp__ironmem__collab_ack` — acknowledge messages
 - `mcp__ironmem__collab_approve` — approve plans/reviews
 - `mcp__ironmem__collab_set_implementer` — set implementer
-- `mcp__ironmem__collab_set_pilot` — reassign pilot
 - `mcp__ironmem__collab_register_caps` — register capabilities
 - `mcp__ironmem__collab_wait_my_turn` — wait for turn
 - `mcp__ironmem__collab_end` — end session
@@ -1463,6 +1484,13 @@ An unattended `claude -p` successor needs at minimum:
   sub-agents.
 - Git bash operations (`Bash(git commit:*)`, `Bash(git push:*)`, etc.) as
   needed for the implementation tasks the successor will perform.
+
+`mcp__ironmem__collab_set_pilot` is deliberately **not** on this list: the
+successor is spawned as `join ironmem collab <sid> with token <token>`, which
+carries no `--pilot`, and `join` calls `collab_set_pilot` only for a `--pilot`
+that was actually given. No successor path reaches it — and the server admits
+the call only in `PlanParallelDrafts` before either draft lands, which the
+guard above already routes to the manual flow.
 
 Operators should configure these in `.claude/settings.json` under
 `permissions.allow` before running unattended.
@@ -1952,10 +1980,18 @@ the `PlanLocked` bridge's **parse** stays mechanical — it parses/submits
 
 ### v3 bridge (PlanLocked → CodeImplementPending) — worker-owned
 
-The PlanLocked bridge is worker-owned. The orchestrator does NOT call any
-separate plan-expansion skill, does NOT read a plan body from status, and does
-NOT build the `task_list` manifest. It dispatches `collab-turn-task-list.md`
-once.
+The bridge's **parse** is worker-owned; its **dispatch** is gated. The
+orchestrator does NOT call any separate plan-expansion skill, does NOT read a
+plan body from status, and does NOT build the `task_list` manifest — it
+dispatches `collab-turn-task-list.md` once. But before it dispatches anything,
+it takes the **dispatcher-owned planning approval gate** at step 0 (§ Approval
+gates are reference-only; `.claude-plugin/commands/collab.md` § v3 Bridge,
+step 0): with `phase == PlanLocked`, `final_plan_ref` set and no `task_list`
+sent, it enters Plan Mode and gets user approval, surfacing only
+`{drawer_id, plan_file_path, ≤3-line summary}`. This gate is the dispatcher's
+and no worker's — a `codex exec` one-shot cannot prompt a human, and under
+`pilot == "codex"` the finalize turn belongs to Codex. On rejection it does not
+send `task_list` and offers `collab_end` instead.
 
 The worker reads `final_plan_ref`/`final_plan_hash`, obtains
 `plan_file_path` from the reference, verifies the file's SHA-256 against the
@@ -1968,6 +2004,19 @@ missing `Timebox: <=20 minutes`, or is sized above 20 minutes. An 11+ task plan
 must be decomposed into child issues; it must not enter coding. PlanLocked is
 pre-coding, so `failure_report` is not valid in
 this bridge.
+
+**If the worker returns `blocker:`, the bridge is over — report it and exit
+the loop.** The orchestrator must not re-dispatch the worker or fall back
+through the loop into the step-0 gate. The plan is immutable at `PlanLocked`
+(append-only drawer, file pinned to `final_plan_hash`), so a re-dispatch
+re-reads the same bytes and returns the same blocker, while the loop still
+sees `phase == PlanLocked` with `task_list` unsent and re-prompts the human
+with a plan nobody can change — an unbounded re-approval loop. Report the
+blocker verbatim and offer `collab_end`, legal precisely and only at
+`PlanLocked` pre-`task_list`, exactly as on rejection at the gate; the work has
+to be re-cut in a new session. `TaskListBridge` in
+`benchmarks/abeval/src/collab_driver.rs` encodes the same rule, mapping a
+bridge `blocker:` to `DriveError::Invalid` rather than retrying.
 
 Only the worker's ≤3-line verdict crosses the orchestrator boundary; the plan
 markdown and manifest JSON never do.
