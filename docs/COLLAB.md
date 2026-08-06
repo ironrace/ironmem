@@ -917,8 +917,8 @@ Model → Roles for the `pilot`/`copilot` vocabulary this section assumes.
 ```
 
 All three fields are required: `session_id`, `agent` (the caller's claimed
-identity), and `pilot` (the agent to reassign the role to) — each one of
-`{"claude","codex"}`.
+identity), and `pilot` (the agent to reassign the role to) — the latter two
+each one of `{"claude","codex"}`.
 
 **Caller restriction.** Only the session's *current* pilot may call this,
 checked before phase, so an unauthorized caller is rejected identically
@@ -934,8 +934,7 @@ holds it.
 either agent's first draft has landed. It is rejected:
 - once a draft (`claude_draft_hash` or `codex_draft_hash`) has been
   submitted, even while still in `PlanParallelDrafts`;
-- in any phase reached after batch implementation, e.g.
-  `CodeReviewFixGlobalPending`;
+- in any other phase, e.g. `CodeReviewFixGlobalPending`;
 - on a `collab_start_code_review` session, which begins at
   `CodeReviewFixGlobalPending` and so never passes through the one phase
   where reassignment is legal — its pilot is fixed at creation.
@@ -949,7 +948,7 @@ restriction or the phase policy — leaves both `pilot` and `current_owner`
 unchanged; every check runs inside the request's transaction before any
 write.
 
-See `crates/ironmem/tests/mcp_protocol.rs:2761-2966` for the caller and
+See `crates/ironmem/tests/mcp_protocol.rs:2760-2997` for the caller and
 phase-policy tests, including the self-promotion refusal in both
 pilot directions.
 
