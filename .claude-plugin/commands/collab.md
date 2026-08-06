@@ -367,6 +367,8 @@ Both v1 and v3 share a common dispatch loop:
 ```text
 loop:
   status = collab_status(session_id)
+  pilot = status.pilot
+  copilot = counterpart(pilot)  # "codex" if pilot == "claude", else "claude"
 
   if phase changed since last iteration:
     Log: t4_phase_advanced phase=<new_phase>   # write timing event
@@ -389,6 +391,20 @@ loop:
   act on phase (send exactly one message per iteration)
   loop
 ```
+
+**`pilot`/`copilot` are bound once, at the top of the iteration, from the
+same `collab_status` read that yields `phase` and `current_owner`.** Every
+dispatch decision made during that iteration — which worker template to
+run, whether to bg-exec Codex, what `$SENDER` to send as — reads those two
+bindings (or `current_owner`, from the same read). No call site may
+re-derive role identity from a phase name, a prompt filename, or a value
+remembered from a prior iteration. This is what prevents **split-brain
+routing**: two call sites disagreeing about who leads and the session
+dispatching both a local Claude worker and a `codex exec` for the same
+turn. Corollary: a `pilot` change (via `collab_set_pilot`) is observable
+only at the top of the *next* iteration's `collab_status` read — a
+mid-iteration `collab_set_pilot` call never retargets a dispatch that is
+already in flight.
 
 `wait_my_turn` is only needed to bridge brief race windows where the
 server is still writing state after a send. Do NOT use it as a
@@ -500,6 +516,10 @@ pilot), so under `pilot == "codex"` Codex owns the send identity while the
 Claude-side orchestrator still runs the worker. Reading this column as the
 sender would imply Codex must run `collab-turn-submit.md`, for which there is
 deliberately no `.codex-plugin` prompt — the turn would be undispatchable.
+Pilot/copilot resolution is not a per-row lookup in this table — it is the
+single `pilot = status.pilot` / `copilot = counterpart(pilot)` binding made
+once per dispatch-loop iteration (see § Dispatch Loop Structure), which
+every row's `current_owner` check then relies on.
 
 ## v1 Planning Loop (Phase → Action Table)
 
