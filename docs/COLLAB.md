@@ -224,6 +224,30 @@ the MCP tools and reads/writes artifacts itself. Codex turns are one-shot
 clients dispatched inline that read state, send exactly one protocol message,
 and exit. See § "Worker-per-turn dispatch (Claude side)" for the full model.
 
+### Roles
+
+Four names recur throughout this document. Each is defined exactly once,
+here:
+
+- **dispatcher** — runs the control loop shown above and is the only role
+  that talks to the human. It is determined by which terminal the session
+  runs in, never persisted as a protocol role (there is no `dispatcher`
+  column), and is always Claude in this codebase: the Codex CLI is one-shot
+  and cannot sustain a `wait_my_turn` loop across handoffs, so only a Claude
+  terminal can host the long-running dispatcher.
+- **pilot** — the `collab_sessions.pilot` field, per-session, default
+  `claude`. The pilot owns `canonical`, `final`, `task_list`,
+  `review_local`, and `final_review`.
+- **copilot** — `counterpart(pilot)`, derived on the fly and never stored.
+  The copilot owns `review` and `review_fix_global`.
+
+Consequence: **pilot is not the same role as dispatcher.** The dispatcher is
+always Claude; the pilot can be either agent. "Codex-led role reversal in a
+Claude terminal" is exactly `pilot=codex, dispatcher=claude` — the Claude
+terminal keeps running the control loop and talking to the human, while
+Codex leads planning and review as pilot. See also `implementer` (Session
+State, below), a fourth, orthogonal knob that decides who writes the code.
+
 ## Session State
 
 Stored in `collab_sessions`:
@@ -233,6 +257,7 @@ Stored in `collab_sessions`:
 | `id` | Session identifier (returned from `collab_start`) |
 | `repo_path`, `branch` | Where this plan applies |
 | `task` | Human description of the planning goal. Set at `start`, readable via `status`. |
+| `pilot` | Which agent leads v1 planning and the v3 review-audit turns (`claude` or `codex`); see § Runtime Model → Roles. Settable at `collab_start` and `collab_start_code_review`. Rebindable via `collab_set_pilot`, but only in `PlanParallelDrafts` before either first draft lands, and only by the agent that is currently the pilot — a copilot can never promote itself. Default `claude`. DB CHECK-constrained to `{claude, codex}` (migration 019). Orthogonal to `implementer`: the two columns are not validated against each other, and every combination (e.g. `pilot=codex` with `implementer=claude`) is legal. |
 | `implementer` | Which agent runs the v3 batch implementation phase (`claude` or `codex`). Set at `start` and rebindable with `collab_set_implementer` while planning or `CodeImplementPending` is active. Default `claude`. |
 | `phase` | Current protocol phase (see below) |
 | `current_owner` | Agent whose turn it is (`claude` or `codex`) |
@@ -244,13 +269,29 @@ Stored in `collab_sessions`:
 | `final_plan_ref` | The locked `final` plan reference (present when `final_plan_hash` is set): `{drawer_id, hash, plan_file_path}`. It is the primary input to the v3 `task_list` bridge after `PlanLocked`; the worker verifies the file against `hash`. Status never returns the normalized plan text. See "Plan-by-reference contract". |
 | `task_list` / `task_list_ref` | The accepted v3 task-list reference: `{drawer_id, hash}` plus top-level `tasks_count`, `plan_file_path`, and `execution_mode`. `include_task_list:true` repeats this compact ref under `task_list`; it never inlines JSON. New sessions store the task list in `collab-task-lists`; pre-014 sessions may have `task_list_ref.drawer_id = null`. |
 | `task_list_drawer_id` | Deterministic 32-char id of the `collab-task-lists` drawer storing the canonicalized task-list JSON once accepted (migration 014). NULL on pre-014 sessions. |
-| `codex_review_verdict` | Last Codex verdict |
+| `codex_review_verdict` | The **copilot's** verdict from the one review pass — Codex under the default `pilot=claude`, Claude under `pilot=codex`. The column name is historical and was deliberately not migrated. |
 | `review_round` | Number of completed Codex reviews (0 or 1; planning has one review pass) |
 | `ended_at` | Non-null once `collab_end` has been called |
 
 All state changes are recorded in `wal_log`.
 
 ## Phase Model
+
+**Wire-compat note:** two `Phase` variants were renamed in
+`crates/ironmem/src/collab/phase.rs` when the pilot/copilot role split was
+generalized, but their serialized wire strings — the values actually stored
+in `collab_sessions.phase` and used as headings/labels below — were kept
+byte-identical for backward compatibility with in-flight sessions:
+`Phase::PlanCopilotReviewPending` still serializes as `"PlanCodexReviewPending"`,
+and `Phase::PlanFinalizePending` still serializes as
+`"PlanClaudeFinalizePending"`. Read every `PlanCodexReviewPending` /
+`PlanClaudeFinalizePending` heading below as the frozen wire name, not a
+claim about which agent owns the turn — ownership is `pilot`/`copilot`, per
+§ Runtime Model → Roles. Likewise, the `claude_draft_hash` /
+`codex_draft_hash` columns (§ Session State) are documented, not migrated:
+they stay keyed by agent *identity* (`claude_draft_hash` always holds
+Claude's draft, `codex_draft_hash` always holds Codex's), independent of and
+orthogonal to whichever agent is piloting.
 
 ### `PlanParallelDrafts`
 
