@@ -1384,7 +1384,8 @@ def check_pilot_flag_parsing_contract() -> None:
                 f"contract is pinned per section, so a renamed heading drops "
                 f"that section's pins silently")
             continue
-        for phrase in PILOT_FLAG_COMMON_SNIPPETS + PILOT_FLAG_SECTION_SNIPPETS[name]:
+        for phrase in (PILOT_FLAG_COMMON_SNIPPETS
+                       + PILOT_FLAG_SECTION_SNIPPETS[name]):
             if not flex(phrase).search(section):
                 err(f".claude-plugin/commands/collab.md: `{name}` section is "
                     f"missing pilot-flag parsing contract {phrase!r}")
@@ -1404,10 +1405,12 @@ def check_pilot_join_authorization_contract() -> None:
     but reports a server error where the user needs to be told that
     reclaiming the role requires a join from the other side.
 
-    Both files are checked because the shim is where this regresses: the
-    Codex side previously called `collab_set_pilot` unconditionally whenever
-    the flag was present, which is the exact defect the flag-presence-alone
-    wording rules out.
+    Both files are checked because the contract is only real if both sides
+    hold it: the Codex shim is a much shorter file with no `##` sections and
+    is the easier one to leave behind on a rewrite, and a shim that calls
+    `collab_set_pilot` whenever the flag is present — the shape this rules
+    out — turns every copilot-side re-join into a server rejection, in a
+    one-shot process with nowhere to report it.
     """
     surfaces = [
         (COMMAND, ".claude-plugin/commands/collab.md",
