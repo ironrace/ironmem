@@ -303,7 +303,7 @@ Stored in `collab_sessions`:
 | `repo_path`, `branch` | Where this plan applies |
 | `task` | Human description of the planning goal. Set at `start`, readable via `status`. |
 | `pilot` | Which agent leads v1 planning and the v3 review-audit turns (`claude` or `codex`); see § Runtime Model → Roles. Settable at `collab_start` and `collab_start_code_review`. Rebindable via `collab_set_pilot`, but only in `PlanParallelDrafts` before either first draft lands, and only by the agent that is currently the pilot — a copilot can never promote itself. Default `claude`. DB CHECK-constrained to `{claude, codex}` (migration 019). Orthogonal to `implementer` at validation time: the two columns are not validated against each other, and every combination (e.g. `pilot=codex` with `implementer=claude`) is legal — but an omitted `implementer` inherits `pilot` at defaulting time (see `implementer`, below). |
-| `implementer` | Which agent runs the v3 batch implementation phase (`claude` or `codex`). Set at `start` and rebindable with `collab_set_implementer` while planning or `CodeImplementPending` is active. Defaults to the resolved `pilot` (so `pilot=codex` with no explicit `implementer` yields `implementer=codex`); pass `implementer` explicitly to split them. |
+| `implementer` | Which agent runs the v3 batch implementation phase (`claude` or `codex`). Set at `start` and rebindable with `collab_set_implementer` while planning or `CodeImplementPending` is active. Defaults to the resolved `pilot` (so `pilot=codex` with no explicit `implementer` yields `implementer=codex`); pass `implementer` explicitly to split them. That inheritance is why a stray flag-shaped token in the task text would reroute **both** roles at once — see § Prompt Templates → `/collab` flag parsing for the `--` end-of-options terminator that keeps such text literal. |
 | `phase` | Current protocol phase (see below) |
 | `current_owner` | Agent whose turn it is (`claude` or `codex`) |
 | `claude_draft_hash`, `codex_draft_hash` | SHA-256 of each first draft |
@@ -2157,6 +2157,49 @@ The user types the task; the agent fills in everything else. Normal path
 is **single-terminal**: the user runs `/collab start` in Claude's terminal
 and Claude dispatches every Codex turn inline via background `codex exec`.
 The Codex-terminal "join" path is the fallback below.
+
+### `/collab` flag parsing — `--` ends the flags
+
+All three flag-taking subcommands share one parsing contract, and all three
+capture a positional after the flags are stripped:
+
+```text
+/collab start  [--pilot=claude|codex] [--implementer=claude|codex] [--] <task>
+/collab join   [--pilot=claude|codex] [--implementer=claude|codex] [--] <session_id>
+/collab review [--pilot=claude|codex] [--] <short-topic>
+```
+
+- **`--` ends the flags.** The first bare `--` token is the end-of-options
+  terminator: every token after it is literal positional text, never parsed
+  as a flag and never stripped. The `--` itself is consumed — it is not part
+  of the captured positional. Flags are recognized only before the first
+  `--`; within that region they may appear **anywhere in the token stream
+  before the first `--`**, in either order, before or after the positional
+  text, and each is stripped out of the stream before the positional is
+  captured.
+- **When the positional text legitimately contains a flag-shaped token, put
+  `--` before it.** This is not hypothetical: `/collab start` tasks in this
+  repo are routinely *about* the flags, and
+  `/collab start document how --pilot=codex behaves` would otherwise consume
+  `--pilot=codex` as a real flag — silently piloting the session with Codex
+  and dropping the token from the recorded `task`. Because an omitted
+  `--implementer` inherits the resolved `pilot` (§ Session State), one stray
+  token reroutes **both** roles. Written as
+  `/collab start -- document how --pilot=codex behaves`, the whole sentence
+  is recorded verbatim and both roles keep their defaults.
+- **Malformed flag input stays a hard usage error**, unchanged by the
+  terminator: an unrecognized value (`--pilot=gpt`), an empty value
+  (`--pilot=`), the bare flag with no `=` (`--pilot`), and the same flag
+  given more than once are each rejected with a message naming both the
+  offending token/value and the accepted set `{claude, codex}` — never a
+  silent fallback to the default. The same rule and accepted set apply to
+  `--implementer`. These rules bind only tokens before the first `--`:
+  **a flag-shaped token after the first `--` is not malformed input — it is
+  literal positional text, and it must never raise a usage error.**
+
+The executable statement of this contract lives in
+`.claude-plugin/commands/collab.md` § `start` / § `join` / § `review`, one
+copy per subcommand against that subcommand's own positional.
 
 ### Starting a session (Claude's terminal — normal path)
 

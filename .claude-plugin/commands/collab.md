@@ -1,6 +1,6 @@
 ---
-description: Start or join an IronRace bounded planning session with Codex, auto-flowing into v3 batch coding. Covers v1 planning, v3 batch implementation (Claude or Codex via approved task plan + iron-build) → global review → PR handoff, and the post-iron-build review shortcut. Usage — /collab start [--pilot=claude|codex] [--implementer=claude|codex] <task>  |  /collab join [--pilot=claude|codex] [--implementer=claude|codex] <session_id>  |  /collab review [--pilot=claude|codex] <short-topic>
-argument-hint: start [--pilot=claude|codex] [--implementer=claude|codex] <task> | join [--pilot=claude|codex] [--implementer=claude|codex] <session_id> | review [--pilot=claude|codex] <short-topic>
+description: Start or join an IronRace bounded planning session with Codex, auto-flowing into v3 batch coding. Covers v1 planning, v3 batch implementation (Claude or Codex via approved task plan + iron-build) → global review → PR handoff, and the post-iron-build review shortcut. Usage — /collab start [--pilot=claude|codex] [--implementer=claude|codex] [--] <task>  |  /collab join [--pilot=claude|codex] [--implementer=claude|codex] [--] <session_id>  |  /collab review [--pilot=claude|codex] [--] <short-topic>  (`--` ends the flags: everything after it is literal text)
+argument-hint: start [--pilot=claude|codex] [--implementer=claude|codex] [--] <task> | join [--pilot=claude|codex] [--implementer=claude|codex] [--] <session_id> | review [--pilot=claude|codex] [--] <short-topic>
 ---
 
 <!-- DERIVED FROM docs/COLLAB.md — protocol changes must update:
@@ -25,12 +25,23 @@ branch names.
 
 1. Parse `$ARGUMENTS`:
    - Strip the leading `start` token.
+   - **`--` ends the flags.** The first bare `--` token is the
+     end-of-options terminator: every token after it is literal positional
+     text, never parsed as a flag and never stripped. The `--` itself is
+     consumed — it is not part of the captured positional. Flags are
+     recognized only before the first `--`. **When the task text
+     legitimately contains a flag-shaped token, put `--` before the task**:
+     `/collab start -- document how --pilot=codex behaves` records that
+     whole sentence as the task and leaves `pilot` at its default, whereas
+     without the `--` the `--pilot=codex` token is consumed as a real flag
+     and silently disappears from the recorded task — taking `implementer`
+     with it, since an omitted `--implementer` inherits the resolved pilot.
    - Detect the optional `--pilot=claude` / `--pilot=codex` flag and the
      optional `--implementer=claude` / `--implementer=codex` flag
-     **anywhere in the remaining token stream** — in either order, before
-     or after task text. **Strip both flag tokens out of the stream before
-     capturing the positional `<task>`**, so no flag ever leaks into the
-     task string.
+     **anywhere in the token stream before the first `--`** — in either
+     order, before or after task text. **Strip both flag tokens out of the
+     stream before capturing the positional `<task>`**, so no flag ever
+     leaks into the task string.
    - `pilot` ← the `--pilot` value; default `"claude"` when the flag is
      absent. `pilot` names the agent that leads v1 planning (synthesis,
      finalize) and the v3 pilot-owned review turns.
@@ -68,7 +79,12 @@ branch names.
 
      The identical rule, wording and accepted set `{claude, codex}` apply
      to `--implementer`. Stop on the error; do not start a session.
-   - `task` ← the remaining text after stripping `start` and both flags.
+     These rules bind only tokens before the first `--`: **a flag-shaped
+     token after the first `--` is not malformed input — it is literal
+     positional text, and it must never raise a usage error.**
+   - `task` ← the remaining text after stripping `start`, both flags, and
+     the `--` terminator if one was given, with every token after that
+     `--` kept verbatim.
 2. Resolve defaults:
    - `repo_path` ← output of `git rev-parse --show-toplevel` (run via Bash).
    - `current_branch` ← output of `git branch --show-current`.
@@ -186,17 +202,28 @@ paths, branches, or SHAs.
 
 1. Parse `$ARGUMENTS`:
    - Strip the leading `review` token.
+   - **`--` ends the flags.** The first bare `--` token is the
+     end-of-options terminator: every token after it is literal positional
+     text, never parsed as a flag and never stripped. The `--` itself is
+     consumed — it is not part of the captured positional. Flags are
+     recognized only before the first `--`. **When the short topic
+     legitimately contains a flag-shaped token, put `--` before the
+     topic**: `/collab review -- --pilot= handling` reviews that topic
+     verbatim under the default pilot.
    - Detect the optional `--pilot=claude` / `--pilot=codex` flag
-     **anywhere in the remaining token stream**, and **strip that flag
-     token before capturing the positional `<short-topic>`**. Default
-     `"claude"` when absent.
+     **anywhere in the token stream before the first `--`**, and **strip
+     that flag token before capturing the positional `<short-topic>`**.
+     Default `"claude"` when absent.
    - **Malformed flag input is a hard usage error**, with the same rule as
      `start`: an unrecognized value (`--pilot=gpt`), an empty value
      (`--pilot=`), the bare flag with no `=` (`--pilot`), or `--pilot`
      given more than once is rejected with a message naming **both** the
      offending token/value **and** the accepted set `{claude, codex}` —
      **do not silently fall back to the default on a malformed flag.**
-     Stop on the error; do not start a review session.
+     Stop on the error; do not start a review session. These rules bind
+     only tokens before the first `--`: **a flag-shaped token after the
+     first `--` is not malformed input — it is literal positional text,
+     and it must never raise a usage error.**
    - `review` takes no `--implementer` flag: a review-only session has no
      implementation phase to route. The server seeds `implementer` from
      the resolved `pilot` for uniformity. `pilot` and `implementer` stay
@@ -221,7 +248,9 @@ paths, branches, or SHAs.
      (`crates/ironmem/src/mcp/tools/collab_session.rs`). `pilot` is the
      orthogonal field naming the review-flow lead. Never set `initiator`
      from the `--pilot` value.
-   - `task` ← the remaining text after stripping `review` and the flag.
+   - `task` ← the remaining text after stripping `review`, the flag, and
+     the `--` terminator if one was given, with every token after that
+     `--` kept verbatim.
 3. Call `mcp__ironmem__collab_start_code_review` with
    `{repo_path, branch, base_sha, head_sha, initiator, task, pilot}`. It
    returns `session_id`, `task`, and the resolved `pilot` — verify the
@@ -261,11 +290,19 @@ paths, branches, or SHAs.
 
 1. Parse `$ARGUMENTS`:
    - Strip the leading `join` token.
+   - **`--` ends the flags.** The first bare `--` token is the
+     end-of-options terminator: every token after it is literal positional
+     text, never parsed as a flag and never stripped. The `--` itself is
+     consumed — it is not part of the captured positional. Flags are
+     recognized only before the first `--`. **When the session id
+     legitimately contains a flag-shaped token, put `--` before the id**:
+     `/collab join -- <session_id>` takes the id verbatim and mutates
+     neither role.
    - Detect the optional `--pilot=claude` / `--pilot=codex` flag and the
      optional `--implementer=claude` / `--implementer=codex` flag
-     **anywhere in the remaining token stream**, in either order, before
-     or after the id. **Strip both flag tokens out of the stream before
-     capturing the positional `<session_id>`.**
+     **anywhere in the token stream before the first `--`**, in either
+     order, before or after the id. **Strip both flag tokens out of the
+     stream before capturing the positional `<session_id>`.**
    - **Malformed flag input is a hard usage error**, identical to `start`:
      an unrecognized value (`--pilot=gpt`), an empty value (`--pilot=`),
      the bare flag with no `=` (`--pilot`), or the same flag given more
@@ -273,7 +310,10 @@ paths, branches, or SHAs.
      token/value **and** the accepted set `{claude, codex}` — **do not
      silently fall back to the default on a malformed flag.** The same
      rule and accepted set apply to `--implementer`. Stop on the error;
-     do not join.
+     do not join. These rules bind only tokens before the first `--`:
+     **a flag-shaped token after the first `--` is not malformed input —
+     it is literal positional text, and it must never raise a usage
+     error.**
    - **`pilot` and `implementer` are orthogonal here too**: no
      `(pilot, implementer)` combination is rejected, and neither flag is
      inferred from the other on `join`.
@@ -282,8 +322,9 @@ paths, branches, or SHAs.
      session's pilot alone"; absent `--implementer` means "leave the
      session's implementer alone". Only issue a mutation for a flag that
      was actually given.
-   - `session_id` ← the single remaining token. Reject missing or extra
-     tokens.
+   - `session_id` ← the single remaining token after stripping `join`,
+     both flags, and the `--` terminator if one was given. Reject missing
+     or extra tokens.
 2. Store `<session_id>` as the current collab session — reuse it on every
    subsequent `collab_*` call without re-prompting the user.
 3. `agent` / `sender` / `receiver` ← `"claude"` (still Claude's terminal;
@@ -1567,5 +1608,6 @@ Full semantics: `docs/COLLAB.md` § "Context-occupancy handoff".
 If `$ARGUMENTS` does not start with `start`, `join`, or `review`, tell the user:
 
 ```
-Usage: /collab start [--pilot=claude|codex] [--implementer=claude|codex] <task>  |  /collab join [--pilot=claude|codex] [--implementer=claude|codex] <session_id>  |  /collab review [--pilot=claude|codex] <short-topic>
+Usage: /collab start [--pilot=claude|codex] [--implementer=claude|codex] [--] <task>  |  /collab join [--pilot=claude|codex] [--implementer=claude|codex] [--] <session_id>  |  /collab review [--pilot=claude|codex] [--] <short-topic>
+`--` ends the flags: every token after it is literal text, so put `--` before task text that contains a flag-shaped token (e.g. /collab start -- document how --pilot=codex behaves).
 ```
