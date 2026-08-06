@@ -102,7 +102,18 @@ use the normal-pilot row above. “Normal Codex-pilot ownership” means
 “Copilot (Codex-owned) ownership” means `current_owner == "codex"` on a
 copilot-gated phase — true under the default `pilot == "claude"`; under
 `pilot == "codex"` Claude owns those two phases and there is no Codex turn.
-For a normal Claude-owned or terminal phase, report the concise status and exit.
+For **any phase with no matching row above** — including a normal Claude-owned
+or terminal phase — report the concise status and exit. Select nothing.
+
+`PlanLocked` is the one phase that needs saying out loud, because under
+`pilot == "codex"` it is Codex-owned and not obviously terminal, and an
+installed `collab-task-list.md` sits on disk with a matching name. It routes to
+**nothing** on this side under either pilot: report the status, state that the
+`task_list` bridge is owned by Claude's dispatcher, and exit. Never select
+`collab-task-list.md`. The dispatcher-owned human planning approval gate fires
+at `PlanLocked` before any `task_list` send, and this one-shot `codex exec`
+cannot prompt a human — sending from here would start autonomous coding on a
+plan no human approved.
 Locate the selected prompt at the first existing root:
 
 1. `$CODEX_HOME/prompts/<selected prompt>`

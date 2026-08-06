@@ -1,11 +1,33 @@
 ---
-description: Codex-only prompt for the PlanLocked task_list bridge turn of IronMEM collaboration.
+description: INSTALLED BUT DELIBERATELY UNROUTED — the PlanLocked bridge is dispatcher-owned; never dispatch this prompt.
 ---
 
 <!-- DERIVED FROM docs/COLLAB.md. This prompt intentionally contains only the
 PlanLocked bridge turn so repeated dispatches retain a stable cache prefix. -->
 
-# Collab task list bridge
+# Collab task list bridge — DO NOT DISPATCH
+
+> **STOP. This prompt is installed but never routed, and that is deliberate.**
+> The Codex `/collab` shim's phase→prompt table carries **no `PlanLocked` row**
+> and must never grow one (`scripts/check_collab_turn_templates.py` fails if it
+> does). The `PlanLocked` bridge is always run by Claude's always-on dispatcher
+> via `collab-turn-task-list.md`, under **either** pilot, because the
+> dispatcher-owned human planning approval gate must fire before any
+> `task_list` send and a one-shot `codex exec` cannot prompt a human.
+>
+> **If you were somehow dispatched with this prompt, send nothing.** Report
+> that `PlanLocked` is dispatcher-owned and exit. Sending `task_list` from here
+> bypasses the only human gate in the protocol and starts autonomous coding on
+> a plan no human approved. Your ownership check is not sufficient
+> authorization: under `pilot == "codex"` this phase *is* Codex-owned and the
+> server *will* accept the send — the gate is the reason not to, not the
+> phase check. See `.codex-plugin/README.md` and `docs/COLLAB.md`
+> § "Migration note" / the unrouted-prompt note.
+
+The remainder of this file is retained only so the packaging test's
+`REQUIRED_CODEX_PHASE_PROMPTS` finds it on disk, and so the bridge's shape stays
+documented on the Codex side if it is ever legitimately routed (which would
+require moving the human gate with it).
 
 You are Codex in the IronMEM bounded collaboration protocol, running as this
 session's **pilot**. This prompt is only for the `PlanLocked` bridge: parse the

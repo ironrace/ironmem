@@ -1497,3 +1497,114 @@ def test_lint_catches_the_task_list_send_reverting_to_claude(tmp_path):
             '\'collab_send(sender="$SENDER", topic="task_list",\'') in r.stdout
     assert ('collab-turn-task-list.md: forbidden stale direct-body claim '
             '\'sender="claude"\'') in r.stdout
+
+
+# ── The gate pins must read the *executable* prose, not the raw file ────────
+#
+# Every check above asserts a rule is stated where an agent will read it, and
+# an agent reads the rendered body — not a commented-out "historical note".
+# A raw-text substring search cannot tell the two apart, so a pin was once
+# satisfiable by its own epitaph: park the live rule in an HTML comment,
+# write the opposite instruction underneath, and the lint stayed green while
+# the shipped instruction said the reverse. These tests are the proof that
+# the comment-stripping in `live_text()` is wired into the gate checks; both
+# mutations below were verified green against the pre-fix lint.
+
+def comment_out(path, start, end, replacement):
+    """Park `start`..`end` in an HTML comment and substitute `replacement`.
+
+    Models the realistic edit — provenance kept, instruction replaced — not a
+    deletion. A deletion reds any substring pin; only this shape distinguishes
+    a pin that reads the live body from one that reads the raw bytes.
+    """
+    text = path.read_text()
+    i = text.index(start)
+    j = text.index(end, i)
+    path.write_text(
+        f"{text[:i]}<!-- HISTORICAL NOTE:\n{text[i:j]}\n-->\n{replacement}{text[j:]}")
+
+
+def test_lint_rejects_the_approval_gate_demoted_into_an_html_comment(tmp_path):
+    fixture = copy_fixture(tmp_path)
+    command = fixture / ".claude-plugin" / "commands" / "collab.md"
+    comment_out(
+        command,
+        "0. **Dispatcher-owned planning approval gate.**",
+        "1. Read `current_owner` from `collab_status`",
+        "0. Dispatch the task list immediately; no user approval is required.\n\n",
+    )
+
+    r = run({"COLLAB_LINT_ROOT": str(fixture)})
+
+    assert r.returncode == 1
+    assert ("v3 bridge is missing dispatcher approval-gate contract "
+            "'**Dispatcher-owned planning approval gate.**'") in r.stdout
+
+
+def test_lint_rejects_the_no_silent_fallback_rule_demoted_into_a_comment(tmp_path):
+    fixture = copy_fixture(tmp_path)
+    command = fixture / ".claude-plugin" / "commands" / "collab.md"
+    comment_out(
+        command,
+        "**Malformed flag input is a hard usage error",
+        "Stop on the error",
+        "On any unrecognized `--pilot` value, quietly use the default "
+        "`claude` and continue. ",
+    )
+
+    r = run({"COLLAB_LINT_ROOT": str(fixture)})
+
+    assert r.returncode == 1
+    assert ("`start` section is missing pilot-flag parsing contract "
+            "'do not silently fall back to the default on a malformed flag'") in r.stdout
+
+
+def test_lint_rejects_the_approval_gate_moved_below_the_dispatch_it_guards(tmp_path):
+    # Presence is not enough: a gate stated *after* the dispatch it guards is
+    # documentation, not a gate — the bridge would send `task_list` and only
+    # then ask. Every phrase pin still passes under this mutation, so only the
+    # ordering assertion can catch it.
+    fixture = copy_fixture(tmp_path)
+    command = fixture / ".claude-plugin" / "commands" / "collab.md"
+    text = command.read_text()
+    start = text.index("0. **Dispatcher-owned planning approval gate.**")
+    end = text.index("1. Read `current_owner` from `collab_status`", start)
+    gate, rest = text[start:end], text[end:]
+    after_dispatch = rest.index(
+        "2. The worker must reject the bridge before sending if:")
+    command.write_text(
+        text[:start] + rest[:after_dispatch] + gate + rest[after_dispatch:])
+
+    r = run({"COLLAB_LINT_ROOT": str(fixture)})
+
+    assert r.returncode == 1
+    assert "must appear BEFORE the bridge dispatches" in r.stdout
+
+
+# ── The gate must be REACHABLE and ATTENDED, not merely stated ──────────────
+#
+# The pins above prove the gate is written down, before the dispatch it
+# guards. Two ways it can still never gate anything: the loop exits at
+# `PlanLocked` (it is in the v1 terminal set) before reaching the bridge, or
+# the turn is handed to an unattended `claude -p` successor with no human to
+# ask. Both were harmless under the old placement — the gate had already
+# fired one phase earlier — which is why neither was pinned.
+
+PLAN_LOCKED_REACHABILITY_SNIPPETS = [
+    "if phase == PlanLocked and no task_list has been sent yet:",
+    "enter § v3 Bridge, step 0 (the approval gate) — do NOT exit the loop",
+    "`PlanLocked` is terminal for `wait_my_turn`, not for the dispatch loop.",
+    "routes there instead of exiting",
+    "Never spawn an unattended successor into the planning gate.",
+]
+
+
+@pytest.mark.parametrize("snippet", PLAN_LOCKED_REACHABILITY_SNIPPETS)
+def test_lint_requires_the_approval_gate_to_stay_reachable(tmp_path, snippet):
+    fixture = copy_fixture(tmp_path)
+    mutate_flex(fixture / ".claude-plugin" / "commands" / "collab.md", snippet)
+
+    r = run({"COLLAB_LINT_ROOT": str(fixture)})
+
+    assert r.returncode == 1
+    assert "must route `PlanLocked` pre-`task_list` into the approval gate" in r.stdout

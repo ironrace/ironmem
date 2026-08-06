@@ -374,6 +374,14 @@ loop:
   if phase changed since last iteration:
     Log: t4_phase_advanced phase=<new_phase>   # write timing event
 
+  # PlanLocked pre-`task_list` is in the v1 terminal set, but it is NOT a loop
+  # exit — it is where the dispatcher takes the single human planning gate.
+  # This branch must be tested BEFORE the terminal-set branch below: the gate
+  # now lives past the point the loop would otherwise stop, so an exit here
+  # would end the session with `final_plan_hash` set and the human never asked.
+  if phase == PlanLocked and no task_list has been sent yet:
+    enter § v3 Bridge, step 0 (the approval gate) — do NOT exit the loop
+
   if session_ended or phase in terminal_set:
     Log: t10_session_complete <phase>       # CodingComplete or CodingFailed
     if phase == CodingFailed and resumable:  # see the resumability check below
@@ -427,6 +435,16 @@ merged.
 Terminal sets:
 - **v1**: `{PlanLocked}` (until `task_list` is sent)
 - **v3**: `{CodingComplete, CodingFailed}`
+
+**`PlanLocked` is terminal for `wait_my_turn`, not for the dispatch loop.**
+It is in the v1 terminal set because the server has no further turn to wait
+for — the pilot's `final` is already on the wire — but the dispatcher's work
+at that phase has not started. `PlanLocked` pre-`task_list` is where the
+single human planning gate fires (**§ v3 Bridge**, step 0), so the loop
+routes there instead of exiting; that is why the skeleton tests it *before*
+the terminal-set branch. Treating it as an ordinary loop exit ends the
+session with `final_plan_hash` set and the plan never approved — the gate
+would be unreachable in the one flow that always passes through it.
 
 **`CodingFailed` is only conditionally terminal — the resumability check.**
 A session is resumable when `failed_from_phase` is non-null AND
@@ -536,7 +554,7 @@ Repeat the dispatch loop with these actions:
 | Phase | What to do (is_my_turn == true) |
 |---|---|
 | `PlanParallelDrafts` | The draft worker (`collab-turn-plan-draft.md`, planning/opus) was already dispatched from the `start` branch. is_my_turn should be false here — if true, verify with `collab_status`. If `collab_status` confirms Claude is the owner in a Codex-owned phase, this is a protocol-level anomaly — exit the loop and report to the user; do not attempt a send. |
-| `PlanSynthesisPending` | Dispatch `collab-turn-plan-synthesis.md` (planning/opus) autonomously. It merges both blind drafts and sends `topic="canonical"` directly. Do not enter Plan Mode here; the single human planning gate is the final approved task plan. `draft` and `canonical` are the only v1 topics that are NOT JSON-wrapped. Ingest only the ≤3-line verdict; loop. |
+| `PlanSynthesisPending` | Dispatch `collab-turn-plan-synthesis.md` (planning/opus) autonomously. It merges both blind drafts and sends `topic="canonical"` directly. Do not enter Plan Mode here; the single human planning gate is the dispatcher's and fires at `PlanLocked` (see **§ v3 Bridge**, step 0). `draft` and `canonical` are the only v1 topics that are NOT JSON-wrapped. Ingest only the ≤3-line verdict; loop. |
 | `PlanCodexReviewPending` | Owner depends on `pilot` — the server gates this phase on the **copilot**, not on Codex (`require_actor(actor, copilot(session))` in `crates/ironmem/src/collab/state_machine/mod.rs`), and the phase label is the frozen wire name, not an owner claim. Read `current_owner` from `collab_status`. **`current_owner == "codex"`** (`pilot == "claude"`, the default): Codex's turn. is_my_turn should be false — if true, verify with `collab_status`. If the inconsistency persists, exit the loop and report to the user. **`current_owner == "claude"`** (`pilot == "codex"`, so Claude is the copilot): this is Claude's legitimate turn, not a protocol anomaly — dispatch the matrix worker `collab-turn-plan-review.md` (review/opus), ingest only its ≤3-line verdict, and loop. **Review cap:** the server enforces `MAX_REVIEW_ROUNDS = 1` at `crates/ironmem/src/collab/state_machine/mod.rs:28`. The copilot gets exactly one plan-review pass; after that review the server transitions to `PlanClaudeFinalizePending` regardless of verdict (`approve`, `approve_with_minor_edits`, or `request_changes` all map to the same next phase). Do not model v1 as open-ended iteration or return to synthesis. |
 | `PlanClaudeFinalizePending` | **No human gate here — this turn is autonomous.** The single human planning gate is the dispatcher's, and it fires one phase later, at `PlanLocked` before the bridge dispatches `task_list` (see **§ v3 Bridge**, step 0). Rationale: a `codex exec` one-shot cannot prompt a human, so only the dispatcher can own a human gate, and under `pilot == "codex"` this finalize turn belongs to Codex. Under reference-only gates, dispatch `collab-turn-plan-finalize.md` (planning/opus), which incorporates Codex's one review pass and produces the final iron-build-compatible task markdown in `docs/iron/plans/...`. Every `### Task N:` must be sized for 20 minutes or less and the plan must contain at most 10 tasks. If it would need 11 or more, stop before sending `final` — that send, not the later `PlanLocked` gate, is the point of no return: once `PlanLocked` is reached the plan is immutable and bridge step 2 rejects an oversized `task_list` on the `> 10` task-count check, wedging the session with `collab_end` as the only exit — and split the work into independently executable child issues; never merge unrelated work or drop acceptance criteria to evade the limit. The worker stages `{"plan": "<exact markdown>"}` in a drawer and returns `{drawer_id, file path, ≤3-line summary}`; retain ONLY ref+path+summary (never the full body) and carry them to the dispatcher's `PlanLocked` gate. Composition is pilot-generic — under `pilot == "claude"` this worker (`collab-turn-plan-finalize.md`) both composes and stages the drawer as just described; under `pilot == "codex"`, Codex composes and stages the equivalent drawer itself via its own `collab-plan-finalize.md` prompt (incorporates the copilot's review notes, saves the plan file, stages `{"plan": "<exact markdown>"}`, and sends nothing) — v1 planning does have a real pilot split here, matching `.codex-plugin/prompts/collab-plan-finalize.md`. Either way, the orchestrator reads `current_owner` from `collab_status` (confirming `final` is the topic authorized for this phase) and dispatches `collab-turn-submit.md` (mechanical/sonnet) with `$TOPIC=final` `$ARTIFACT_REF=<drawer_id>` `$SENDER=<collab_status.current_owner>` to send `topic="final"` (v1 `final` is the only v1 topic wrapped in JSON); drawer immutability is the integrity anchor. Normally `current_owner == pilot` here. The v3 recovery-owner substitution described in the pre-send harness recovery override in step 0 of the **Pre-send Harness Sequence (Claude-owned v3 turns)** and in the `CodeReviewLocalPending`/`CodeReviewFinalPending` recovery row in the **Codex dispatch tuning matrix** does **not** apply to this phase: `pending_failure`/`FailureReport` handling is gated to coding-active phases (`Phase::is_coding_active()`), and `PlanClaudeFinalizePending` is not one of them, so `$SENDER` always resolves to the pilot here — there is no in-flight recovery-owner case to substitute. After send, `PlanLocked` is reached. Ingest only the ≤3-line verdict; loop. |
 
@@ -1445,6 +1463,18 @@ never role-keyed: it does not follow `pilot`, `copilot`, or `current_owner`,
 and a `pilot == "codex"` session hands off the Claude dispatcher just the same.
 
 **Automated successor path (autonomous/collab phases):**
+
+> **Never spawn an unattended successor into the planning gate.** If `phase ==
+> PlanLocked` with no `task_list` sent — or the current turn is
+> `PlanClaudeFinalizePending`, which lands there — use the **Interactive
+> phases** flow below instead. The whole reason the gate is the dispatcher's is
+> that a one-shot process cannot prompt a human, and `claude -p` is exactly
+> such a process: the successor would arrive at **§ v3 Bridge** step 0, find no
+> human to ask, and either stall forever or self-approve the only human
+> checkpoint in the protocol. The cron fallback re-fires every minute, so a
+> self-approving successor is not a one-off. Mint the token, report
+> `join collab <sid>` to the user, and stop — a session parked at the gate
+> waiting for a human is the correct outcome, not a failure.
 
 1. On a `>= 80%` (Handoff) notice, call `session_handoff(session_id, agent)`
    and capture the **top-level** `handoff_token` and `handoff_block` (the

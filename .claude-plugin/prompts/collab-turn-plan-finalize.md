@@ -51,9 +51,13 @@ preconditions: phase == PlanClaudeFinalizePending, current_owner == claude
    - every task has at least one acceptance criterion
 5. `add_drawer(wing="ironrace-memory", room="collab-drafts",
    content=<JSON string {"plan":"<exact markdown>"}>)`; return its `drawer_id`.
-   Do NOT send — the orchestrator presents only the file path, drawer ref, and
-   short summary for the single human planning approval, then dispatches
-   `collab-turn-submit.md` with `$TOPIC=final` and `$ARTIFACT_REF=<drawer_id>`.
+   Do NOT send — this turn is autonomous and there is NO human approval gate on
+   it. Right after this turn the orchestrator dispatches
+   `collab-turn-submit.md` with `$TOPIC=final` and `$ARTIFACT_REF=<drawer_id>`
+   to send `final`, without asking a human. The single human planning gate is
+   the dispatcher's and fires one phase later, at `PlanLocked`, before the
+   `task_list` bridge is dispatched; the `{drawer_id, plan_file_path, ≤3-line
+   summary}` you return here is what the dispatcher carries to that gate.
 
 ## Verdict
 Return EXACTLY these ≤3 lines, nothing else:
