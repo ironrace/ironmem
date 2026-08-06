@@ -55,17 +55,27 @@ pub fn read_session_state(db_path: &Path, session_id: &str) -> Result<SessionSta
         rusqlite::Connection::open_with_flags(db_path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
             .with_context(|| format!("opening collab db {} read-only", db_path.display()))?;
 
-    // `pilot` is `NOT NULL DEFAULT 'claude'` (migration 019), so the COALESCE is
-    // belt-and-braces for a row written before that default existed or by a hand
-    // patched DB: a NULL pilot reads as the pre-019 behavior (`claude`) instead
-    // of failing the whole poll on a type error.
-    let mut stmt = conn.prepare(
-        "SELECT phase, current_owner, implementer, pr_url, \
+    // Migration 019 adds `pilot` as `NOT NULL DEFAULT 'claude'`, and the ALTER
+    // backfills every pre-019 row with `'claude'`, so no DB the product can
+    // produce yields a NULL here: the COALESCE never fires on a real row and
+    // only covers a hand-patched schema that dropped the NOT NULL. It does NOT
+    // cover a genuinely pre-019 DB — there the column is absent entirely and
+    // `prepare` fails first, hence the context on that call.
+    let mut stmt = conn
+        .prepare(
+            "SELECT phase, current_owner, implementer, pr_url, \
                 review_round, global_review_round, task_review_round, last_head_sha, \
                 pending_failure, recovery_phase, recovery_owner, \
                 COALESCE(pilot, 'claude') \
          FROM collab_sessions WHERE id = ?1",
-    )?;
+        )
+        .with_context(|| {
+            format!(
+                "preparing the collab_sessions poll against {} \
+                 (a `no such column: pilot` here means the DB predates migration 019)",
+                db_path.display()
+            )
+        })?;
 
     stmt.query_row([session_id], |row| {
         Ok(SessionState {

@@ -100,12 +100,13 @@ fn reads_a_non_default_pilot() {
     );
 }
 
-/// A row whose `pilot` is NULL (pre-019 shape, before the column carried a
-/// default) reads as the original hard-wired lead instead of failing the poll.
+/// The real pre-019 shape has no `pilot` column at all — the COALESCE cannot
+/// save that case, `prepare` fails on it. The error has to name migration 019
+/// so an operator sees an un-migrated DB rather than a bare SQLite message.
 #[test]
-fn null_pilot_reads_as_claude() {
+fn pre_019_db_without_a_pilot_column_names_the_migration() {
     let dir = tempfile::tempdir().unwrap();
-    let db = dir.path().join("nullable.db");
+    let db = dir.path().join("pre019.db");
     let conn = rusqlite::Connection::open(&db).unwrap();
     conn.execute_batch(
         "CREATE TABLE collab_sessions (
@@ -120,15 +121,35 @@ fn null_pilot_reads_as_claude() {
             pr_url TEXT,
             pending_failure TEXT,
             recovery_phase TEXT,
-            recovery_owner TEXT,
-            pilot TEXT
+            recovery_owner TEXT
         );
-        INSERT INTO collab_sessions (id, phase, current_owner, pilot)
-            VALUES ('sess-null', 'PlanParallelDrafts', 'claude', NULL);",
+        INSERT INTO collab_sessions (id, phase, current_owner)
+            VALUES ('sess-old', 'PlanParallelDrafts', 'claude');",
     )
     .unwrap();
+    let err = read_session_state(&db, "sess-old").unwrap_err();
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains("migration 019"),
+        "error points at the un-migrated DB: {msg}"
+    );
+}
+
+/// A row that omits `pilot` entirely takes the migration's `'claude'` default,
+/// i.e. the pre-019 lead, so an un-flagged session drives unchanged.
+#[test]
+fn omitted_pilot_reads_as_claude() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = seed_db(
+        dir.path(),
+        "sess-default",
+        "PlanParallelDrafts",
+        "claude",
+        0,
+        0,
+    );
     assert_eq!(
-        read_session_state(&db, "sess-null").unwrap().pilot,
+        read_session_state(&db, "sess-default").unwrap().pilot,
         "claude"
     );
 }

@@ -270,8 +270,11 @@ pub const SUPPORTED_PILOT: &str = "claude";
 /// [`worker_action`]'s matrix is keyed on the literal agent name in
 /// `current_owner`, and its `"claude"` arm IS the lead-role map: plan synthesis,
 /// plan finalize, the `PlanLocked` bridge and the final review are listed only
-/// under `claude`, while the `"codex"` arm carries just the three copilot
-/// phases. That is exactly the Claude-pilot layout. Under `pilot = "codex"` the
+/// under `claude`, while the `"codex"` arm carries only the two copilot phases
+/// (`PlanCodexReviewPending`, `CodeReviewFixGlobalPending`) plus
+/// `PlanParallelDrafts` — not a copilot phase at all, but the blind-draft phase
+/// both agents work under either pilot, which is why it appears under both
+/// arms. That is exactly the Claude-pilot layout. Under `pilot = "codex"` the
 /// roles swap, so every lead turn arrives owned by `codex` in a phase the codex
 /// arm does not list and falls through to [`WorkerAction::Anomaly`] — the run
 /// would abort on its first lead turn and be recorded as an INVALID data point.
@@ -965,6 +968,11 @@ fn drive_collab_loop<R: CollabStateReader, S: WorkerSpawner>(
                 // worker's own ABORT guard, so nothing is sent and the run
                 // stalls out later as a STUCK_LIMIT instead of failing here.
                 let submit_state = reader.read(&session_id).map_err(DriveError::Invalid)?;
+                // Same guard as every other poll: this read can straddle a
+                // mid-run `collab_set_pilot`, and a reversed lead must abort
+                // here rather than be dispatched to a Claude-only submit turn.
+                ensure_supported_pilot(&ctx.task_id, &session_id, &submit_state.pilot)
+                    .map_err(DriveError::Invalid)?;
                 let submit = render_worker_prompt(
                     &ctx.prompts_dir,
                     "collab-turn-submit.md",
