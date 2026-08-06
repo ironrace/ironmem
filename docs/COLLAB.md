@@ -387,7 +387,7 @@ can split it into independently executable child issues before finalization.
 Owner: the pilot (`current_owner`). **No human gate here — this turn is
 autonomous.** The single human planning gate belongs to the dispatcher, and
 it fires one phase later, at `PlanLocked`, before the bridge dispatches
-`task_list` (see § v3 Bridge, step 0) — a `codex exec` one-shot cannot prompt
+`task_list` (see `.claude-plugin/commands/collab.md` § v3 Bridge, step 0) — a `codex exec` one-shot cannot prompt
 a human, so only the dispatcher can own a human gate, and under
 `pilot == "codex"` this finalize turn belongs to Codex regardless. Composition
 and the send are pilot-generic: `collab-turn-plan-finalize.md` writes the
@@ -410,8 +410,9 @@ Plan is frozen; `final_plan_hash` is set. This is terminal for `wait_my_turn`
 **only while `task_list` has not yet been submitted**.
 
 The dispatcher takes the single human planning gate here — after `final` is
-already on the wire, before `task_list` is dispatched (see § v3 Bridge, step
-0; § Approval gates are reference-only). It surfaces ONLY
+already on the wire, before `task_list` is dispatched (see
+`.claude-plugin/commands/collab.md` § v3 Bridge, step 0; § Approval gates are
+reference-only, below). It surfaces ONLY
 `{drawer_id, plan_file_path, ≤3-line summary}` for approval, never the plan
 body. Two transitions out:
 
@@ -1548,7 +1549,7 @@ exactly one event variant — there is no phase overloading.
 | `PlanSynthesisPending` | `canonical` | v1 planning |
 | `PlanCodexReviewPending` | `review` | v1 — the copilot's review of canonical |
 | `PlanClaudeFinalizePending` | `final` | v1 — the pilot finalizes and sends autonomously; the dispatcher's gate is one phase later, at `PlanLocked` |
-| `PlanLocked` | `task_list` | v1 → v3 hand-off, gated by the dispatcher's planning approval gate (see § v3 Bridge, step 0) |
+| `PlanLocked` | `task_list` | v1 → v3 hand-off, gated by the dispatcher's planning approval gate (see `.claude-plugin/commands/collab.md` § v3 Bridge, step 0) |
 | `CodeImplementPending` | `implementation_done`, `failure_report` | v3 — single implementer turn after subagent batch |
 | `CodeReviewFixGlobalPending` | `review_fix_global`, `failure_report` | v3 — the copilot runs `/pr-review-toolkit:review-pr` on the raw post-implementation diff, then fans confirmed fixes out to subagents |
 | `CodeReviewLocalPending` | `review_local`, `failure_report` | v3 — the pilot audits the copilot's commits, then fans confirmed fixes out to subagents |
@@ -1873,7 +1874,7 @@ tier.**
 
 The only planning user gate is the locked plan, and the dispatcher takes it
 at `PlanLocked` — after `final` is on the wire, before `task_list` is
-dispatched (see § v3 Bridge, step 0):
+dispatched (see `.claude-plugin/commands/collab.md` § v3 Bridge, step 0):
 
 1. **Compose worker** (`collab-turn-plan-finalize.md`, dispatched at
    `PlanClaudeFinalizePending`) writes the final iron-build-compatible task
@@ -2039,8 +2040,9 @@ Mode at **exactly one gate**, matching the command-file invariant bullet:
    already locked the plan (`final_plan_ref` set, no `task_list` sent yet),
    the dispatcher presents the locked plan for approval, surfacing only
    `{drawer_id, plan_file_path, ≤3-line summary}` — never the plan body (see
-   § v3 Bridge, step 0). It must contain 1–10 tasks, each timeboxed to 20
-   minutes or less; a larger plan must have been split into child issues
+   `.claude-plugin/commands/collab.md` § v3 Bridge, step 0). It must contain
+   1–10 tasks, each timeboxed to 20 minutes or less; a larger plan must have
+   been split into child issues
    before `final` was sent, since `PlanLocked` makes the plan immutable. On
    approval, the dispatcher dispatches the `task_list` bridge; on rejection,
    it offers `collab_end` instead of sending `task_list`.
