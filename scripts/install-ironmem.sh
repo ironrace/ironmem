@@ -706,15 +706,32 @@ fi
 # daemons have been observed still serving pre-upgrade code 23 hours after an
 # install. Printing an FYI does not fix that; signalling does.
 #
-# SIGTERM is a GRACEFUL RETIRE, not a kill (see `serve_accept_loop` in
-# crates/ironmem/src/mcp/daemon.rs). The daemon stops admitting new clients
+# SIGTERM is a GRACEFUL RETIRE, not a kill -- IN A DAEMON THAT HAS THE RETIRE
+# HANDLER (see `retire_on_signal` / `serve_accept_loop` in
+# crates/ironmem/src/mcp/daemon.rs). Such a daemon stops admitting new clients
 # immediately, but every connection already attached when the signal lands is
 # served to its natural end and the process only exits once the last one
-# disconnects. So this does NOT break anyone's live session: an attached Claude
+# disconnects. So it does NOT break anyone's live session: an attached Claude
 # Code / Codex keeps working (on the old build, until it is restarted), while
 # any NEW client is refused, auto-spawns a fresh daemon, and gets this build.
-# That is why no "is it idle?" pre-check is needed here -- and none is possible
-# anyway, since nothing the daemon exposes reports its connection count.
+# Repeat signals are no-ops there, so re-signalling a daemon that is still
+# draining a days-old session across several installs is safe.
+#
+# THE ONE-TIME CUTOVER. A daemon that PREDATES the retire handler has no
+# handler at all, so SIGTERM takes its default disposition and terminates it on
+# the spot, cutting off whatever was attached. That is guaranteed on the first
+# install of this change -- the daemon running right then is by definition the
+# old binary -- and the script cannot tell the two cases apart: the running
+# process's argv, socket, and pid are identical either way, and nothing the
+# daemon exposes reports its build. Probing indirectly (marker files vs process
+# start times, version guesses) would be fragile and could only ever change the
+# wording, never the outcome, since signalling is the point. So the message
+# below states both cases plainly instead of claiming the good one. Cost of the
+# cutover: restart the affected Claude Code / Codex session once. Every install
+# after it is graceful for real.
+#
+# No "is it idle?" pre-check is needed here -- and none is possible anyway,
+# since nothing the daemon exposes reports its connection count.
 #
 # Only `--listen` processes are the upgrade-staleness concern. `serve --connect`
 # processes are per-client shims holding no daemon state; they die with their
@@ -753,8 +770,7 @@ if [[ -n "$DAEMON_PIDS" ]]; then
   echo "==> Retiring the shared ironmem daemon so new clients get this build"
   for pid in $DAEMON_PIDS; do
     if kill -TERM "$pid" 2>/dev/null; then
-      echo "    Signalled daemon PID $pid (graceful: it finishes serving every"
-      echo "    already-attached session, then exits)."
+      echo "    Signalled daemon PID $pid."
     else
       # Permission denied (a daemon owned by another user), or it exited
       # between the pgrep and here. Never fatal: the binary is already
@@ -764,9 +780,19 @@ if [[ -n "$DAEMON_PIDS" ]]; then
       echo "             binary until it exits on its own."
     fi
   done
-  echo "    Already-open Claude Code / Codex sessions continue on the previous"
-  echo "    build until you restart them; new sessions auto-spawn a daemon"
-  echo "    running the freshly installed binary."
+  echo ""
+  echo "    New Claude Code / Codex sessions auto-spawn a daemon running the"
+  echo "    freshly installed binary. What happens to sessions attached RIGHT"
+  echo "    NOW depends on which build the signalled daemon was running, and"
+  echo "    this script cannot tell from the outside:"
+  echo "      - Built from this change onward: SIGTERM is a graceful retire."
+  echo "        Every attached session is served to its end (on the previous"
+  echo "        build) and the daemon exits only once the last one detaches."
+  echo "      - Built before it: there is no signal handler, so SIGTERM takes"
+  echo "        its default disposition and the daemon exits immediately,"
+  echo "        DROPPING any attached session. This is a one-time cost on the"
+  echo "        first install of graceful retire -- restart the affected"
+  echo "        client and it reconnects to a fresh daemon."
 fi
 
 # Detect legacy MCP server registrations left over from the pre-rename era
