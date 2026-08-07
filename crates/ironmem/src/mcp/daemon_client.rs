@@ -329,7 +329,7 @@ fn parse_search_ids(response: &[u8]) -> Option<Vec<String>> {
         return None;
     }
 
-    let results = crate::mcp::compact::expand_compact_value(payload.get("results")?);
+    let results = validated_search_results(payload.get("results")?)?;
     let rows = results.as_array()?;
     let ids: Vec<String> = rows
         .iter()
@@ -340,6 +340,27 @@ fn parse_search_ids(response: &[u8]) -> Option<Vec<String>> {
         })
         .collect::<Option<Vec<_>>>()?;
     (!ids.is_empty()).then_some(ids)
+}
+
+fn validated_search_results(value: &serde_json::Value) -> Option<serde_json::Value> {
+    let Some(envelope) = value.get("__compact_v1") else {
+        return Some(value.clone());
+    };
+    let columns = envelope.get("columns")?.as_object()?;
+    if columns.is_empty() {
+        return None;
+    }
+
+    let mut row_count = None;
+    for column in columns.values() {
+        let length = column.as_array()?.len();
+        if row_count.is_some_and(|expected| expected != length) {
+            return None;
+        }
+        row_count = Some(length);
+    }
+
+    Some(crate::mcp::compact::expand_compact_value(value))
 }
 
 #[cfg(test)]
@@ -625,6 +646,34 @@ mod tests {
             elapsed < Duration::from_millis(500),
             "connect exceeded its absolute deadline: {elapsed:?}"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn malformed_compact_columns_are_misses() {
+        let mismatched_rows = search_response(serde_json::json!({
+            "results": {
+                "__compact_v1": {
+                    "columns": {
+                        "id": ["first", "second"],
+                        "score": [0.9]
+                    }
+                }
+            }
+        }));
+        assert_eq!(run_socket_fixture(Some(mismatched_rows)), None);
+
+        let non_array_column = search_response(serde_json::json!({
+            "results": {
+                "__compact_v1": {
+                    "columns": {
+                        "id": ["first", "second"],
+                        "score": "not-an-array"
+                    }
+                }
+            }
+        }));
+        assert_eq!(run_socket_fixture(Some(non_array_column)), None);
     }
 
     #[cfg(unix)]
