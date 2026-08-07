@@ -502,10 +502,12 @@ REQUIRED_EVALUATE_ISSUE_SNIPPETS = [
 TASK_BUDGET_SURFACE_CONTRACTS = {
     DOC: [
         "**1–15 execution tasks**",
+        "1–15-task collab session",
         "A plan projected to require 16 or more tasks",
         "more than 15 tasks",
         "`> 15` task-count check",
         "A 16+ task issue",
+        "**1–15** strictly ordered entries",
     ],
     EVALUATE_ISSUE_DOC: [
         "An estimate above 15 requires `SPLIT`.",
@@ -536,6 +538,7 @@ TASK_BUDGET_SURFACE_CONTRACTS = {
     PROMPTS / "collab-turn-plan-finalize.md": [
         "at most 15 tasks",
         "needs 16 or more",
+        "heading count is at most 15",
     ],
     PROMPTS / "collab-turn-task-list.md": [
         "heading count is at most 15",
@@ -566,6 +569,7 @@ TASK_BUDGET_SURFACE_CONTRACTS = {
     ROOT / ".codex-plugin" / "prompts" / "collab-plan-finalize.md": [
         "at most 15 tasks",
         "needs 16 or more",
+        "at least 1 and at most 15",
     ],
     ROOT / ".codex-plugin" / "prompts" / "collab-task-list.md": [
         "at most 15",
@@ -578,8 +582,10 @@ TASK_BUDGET_SURFACE_CONTRACTS = {
 STALE_TASK_BUDGET_PATTERNS = [
     ("10-task issue budget", re.compile(r"\b10-task issue budget\b")),
     ("1–10 task range", re.compile(
-        r"\b1[–-]10(?:-task\s+estimate|\s+(?:execution\s+tasks?|"
+        r"\b1[–-]10(?:-task\s+(?:estimate|collab\s+session)|\s+(?:execution\s+tasks?|"
         r"task\s+estimate|tasks?))\b")),
+    ("1–10 strictly ordered entries", re.compile(
+        r"\*\*1[–-]10\*\*\s+strictly ordered entries\b")),
     ("10-task comparative ceiling", re.compile(
         r"\b(?:more than|at most|above)\s+10(?:\s+(?:independent\s+)?"
         r"(?:execution\s+)?tasks?|\s+requires\b)")),
@@ -587,6 +593,8 @@ STALE_TASK_BUDGET_PATTERNS = [
     ("> 10 task-count", re.compile(r">\s*10`?\s+task-count\b")),
     ("more than 10 task headings", re.compile(
         r"\bmore than 10\s+`### Task `\s+headings\b")),
+    ("heading count at most 10", re.compile(r"\bheading count is at most 10\b")),
+    ("structure count at most 10", re.compile(r"\bat least 1 and at most 10\b")),
     ("11 or more task/plan/scope", re.compile(
         r"\b(?:needs?|requires?|require|would need)\s+11 or more\b")),
     ("11 or more task/plan/scope", re.compile(

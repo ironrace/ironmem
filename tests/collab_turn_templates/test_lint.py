@@ -148,10 +148,12 @@ TASK_LIST_TEMPLATE_SNIPPETS = [
 TASK_BUDGET_SURFACE_SNIPPETS = {
     "docs/COLLAB.md": [
         "**1–15 execution tasks**",
+        "1–15-task collab session",
         "A plan projected to require 16 or more tasks",
         "more than 15 tasks",
         "`> 15` task-count check",
         "A 16+ task issue",
+        "**1–15** strictly ordered entries",
     ],
     "docs/EVALUATE_ISSUE.md": [
         "An estimate above 15 requires `SPLIT`.",
@@ -182,6 +184,7 @@ TASK_BUDGET_SURFACE_SNIPPETS = {
     ".claude-plugin/prompts/collab-turn-plan-finalize.md": [
         "at most 15 tasks",
         "needs 16 or more",
+        "heading count is at most 15",
     ],
     ".claude-plugin/prompts/collab-turn-task-list.md": [
         "heading count is at most 15",
@@ -212,6 +215,7 @@ TASK_BUDGET_SURFACE_SNIPPETS = {
     ".codex-plugin/prompts/collab-plan-finalize.md": [
         "at most 15 tasks",
         "needs 16 or more",
+        "at least 1 and at most 15",
     ],
     ".codex-plugin/prompts/collab-task-list.md": [
         "at most 15",
@@ -233,6 +237,9 @@ TASK_BUDGET_STALE_DRIFT_CASES = [
     ("docs/COLLAB.md",
      "that the task list contains 1–15 tasks",
      "1–15 tasks"),
+    ("docs/COLLAB.md", "its own 1–15-task collab session", "1–15-task collab session"),
+    ("docs/COLLAB.md", "**1–15** strictly ordered entries",
+     "**1–15** strictly ordered entries"),
     ("docs/COLLAB.md", "A 16+ task issue", "16+ task"),
     ("docs/EVALUATE_ISSUE.md", "collab's 15-task issue budget", "15-task issue budget"),
     ("docs/EVALUATE_ISSUE.md", "An estimate above 15 requires `SPLIT`.",
@@ -259,12 +266,16 @@ TASK_BUDGET_STALE_DRIFT_CASES = [
      "credibly needs 16 or more", "needs 16 or more"),
     (".claude-plugin/prompts/collab-turn-plan-finalize.md", "at most 15 tasks",
      "at most 15 tasks"),
+    (".claude-plugin/prompts/collab-turn-plan-finalize.md",
+     "heading count is at most 15", "heading count is at most 15"),
     (".claude-plugin/prompts/collab-turn-task-list.md",
      "more than 15 tasks", "more than 15 tasks"),
     (".codex-plugin/prompts/collab-plan-review.md",
      "credibly needs 16 or more", "needs 16 or more"),
     (".codex-plugin/prompts/collab-plan-finalize.md",
      "If it needs 16 or more", "needs 16 or more"),
+    (".codex-plugin/prompts/collab-plan-finalize.md",
+     "at least 1 and at most 15", "at least 1 and at most 15"),
     (".codex-plugin/prompts/collab-task-list.md",
      "more than 15 tasks", "more than 15 tasks"),
 ]
