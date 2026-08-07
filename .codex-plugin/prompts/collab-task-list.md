@@ -81,9 +81,9 @@ Parse the verified file's `### Task N:` headings into
 fixed literal `Timebox: <=20 minutes`, not a number, so set `timebox_minutes`
 to `20` for every task — do not invent a per-task estimate and do not copy the
 literal string into the numeric field. The parser must verify that the heading
-count is at least 1 and at most 10, that IDs are contiguous `1..N`, that every
+count is at least 1 and at most 15, that IDs are contiguous `1..N`, that every
 task has a `Timebox: <=20 minutes` line, and that every task has at least one
-acceptance criterion. If there are more than 10 tasks, do not send `task_list`:
+acceptance criterion. If there are more than 15 tasks, do not send `task_list`:
 report a blocker requiring the original issue to be split into independently
 executable child issues. Do not merge unrelated tasks or remove acceptance
 criteria to evade the limit.

@@ -127,7 +127,7 @@ SUBMIT_TEMPLATE_SNIPPETS = [
 ]
 TASK_LIST_TEMPLATE_SNIPPETS = [
     "Timebox: <=20 minutes",
-    "more than 10 tasks",
+    "more than 15 tasks",
     "PlanLocked is pre-coding",
     "plan_file_path",
     'collab_send(sender="$SENDER", topic="task_list",',
@@ -470,6 +470,26 @@ def test_lint_requires_evaluate_issue_split_contract(tmp_path):
     fixture = copy_fixture(tmp_path)
     prompt = fixture / ".codex-plugin" / "prompts" / "evaluate-issue.md"
     prompt.write_text(prompt.read_text().replace("Child issues:", "Child work:", 1))
+
+    r = run({"COLLAB_LINT_ROOT": str(fixture)})
+
+    assert r.returncode == 1
+    assert ".codex-plugin/prompts/evaluate-issue.md: missing evaluate-issue SPLIT contract" \
+        in r.stdout
+
+
+def test_lint_requires_fifteen_task_evaluate_issue_ceiling(tmp_path):
+    fixture = copy_fixture(tmp_path)
+    prompt = fixture / ".codex-plugin" / "prompts" / "evaluate-issue.md"
+    text = prompt.read_text()
+    stale_ceiling = "more than " + "10 independent execution tasks"
+    mutated = text.replace(
+        "more than 15 independent execution tasks",
+        stale_ceiling,
+        1,
+    )
+    assert mutated != text, "15-task evaluate-issue ceiling not found"
+    prompt.write_text(mutated)
 
     r = run({"COLLAB_LINT_ROOT": str(fixture)})
 

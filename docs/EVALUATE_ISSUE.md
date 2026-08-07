@@ -3,7 +3,7 @@
 Source of truth for the `/evaluate-issue` command. Reads a GitHub issue,
 scores its complexity, and recommends an execution path: **DIRECT**,
 **IRON**, **COLLAB**, or mandatory **SPLIT** for work that exceeds
-collab's 10-task issue budget. The command is advisory by default: it prints
+collab's 15-task issue budget. The command is advisory by default: it prints
 a verdict and the exact next step, then asks the user to confirm before
 performing any mutation.
 
@@ -94,7 +94,7 @@ Judge each signal from the issue text plus the scan:
 |---|---|
 | **Blast radius** | How many files / crates / modules will change? |
 | **Design judgment** | Does it require architectural decisions — public API/contract, state machine, migration, new subsystem? |
-| **Decomposability** | Into how many *independent* execution tasks does it split? An estimate above 10 requires `SPLIT`. |
+| **Decomposability** | Into how many *independent* execution tasks does it split? An estimate above 15 requires `SPLIT`. |
 | **Spec clarity** | Is the issue well-specified, or ambiguous / under-defined? |
 | **Security / review depth** | Does it touch security-sensitive code (auth, credentials, billing, user data)? Drives the post-implementation review tier, not the execution path. |
 
@@ -116,13 +116,13 @@ justify COLLAB — it drives the review tier recommendation instead.
 
 ### 0. SPLIT — create smaller issues before routing
 
-Choose **SPLIT** when the issue credibly requires **more than 10 independent
+Choose **SPLIT** when the issue credibly requires **more than 15 independent
 execution tasks**. This is a hard ceiling: do not route the parent issue to
 COLLAB, even if it has protocol-level risk or needs adversarial review.
 
 Before the confirmation gate, propose 2+ independently executable child
 issues. Every child must have a focused outcome, concrete acceptance criteria,
-explicit dependencies (if any), and an estimated **1–10** execution tasks.
+explicit dependencies (if any), and an estimated **1–15** execution tasks.
 Keep the original issue open as the tracking parent. Do not evade the ceiling
 by merging unrelated tasks, weakening acceptance criteria, or silently
 discarding scope.
@@ -198,8 +198,8 @@ Recommended review:
 For a `SPLIT` verdict, insert before the confirmation line:
 
 Child issues:
-  1. <title> — <scope, acceptance summary, 1–10 task estimate, dependencies>
-  2. <title> — <scope, acceptance summary, 1–10 task estimate, dependencies>
+  1. <title> — <scope, acceptance summary, 1–15 task estimate, dependencies>
+  2. <title> — <scope, acceptance summary, 1–15 task estimate, dependencies>
   ...
 
 Proceed with this path? [y/N]
@@ -260,7 +260,7 @@ Deep, regardless of the execution-path verdict.
 - **Read-only until the confirm gate.** Steps 1–4 never mutate state. The
   only action is invoking the chosen path *after* the user confirms.
 - **Never auto-launch.** Even an obvious DIRECT verdict waits for `y`.
-- **Task-budget first.** An estimate above 10 tasks always yields `SPLIT`;
+- **Task-budget first.** An estimate above 15 tasks always yields `SPLIT`;
   never launch collab for the oversized parent issue.
 - **Recommend one path, not a menu.** Pick the single best fit and justify
   it. The user can override by declining and running something else.

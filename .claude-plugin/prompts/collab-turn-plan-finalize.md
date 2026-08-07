@@ -39,13 +39,13 @@ preconditions: phase == PlanClaudeFinalizePending, current_owner == claude
    - at least one concrete acceptance criterion
    - the files/areas it is expected to touch
    If a task cannot credibly be completed in 20 minutes, split it before saving.
-   The plan must contain at most 10 tasks. If it needs 11 or more, do not
+   The plan must contain at most 15 tasks. If it needs 16 or more, do not
    compose or submit a collab plan: return a blocker that names the required
    independently executable child-issue split. Never merge unrelated work or
    drop acceptance criteria merely to fit this budget.
 4. Run a local structure check on the markdown you wrote:
    - heading count for `^### Task ` is at least 1
-   - heading count is at most 10
+   - heading count is at most 15
    - task IDs are contiguous `1..N`
    - every task has `Timebox: <=20 minutes`
    - every task has at least one acceptance criterion

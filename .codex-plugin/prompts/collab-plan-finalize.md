@@ -68,12 +68,12 @@ first non-blank line of the file must be
 Use `### Task N: <title>` headings. Every task must carry
 `Timebox: <=20 minutes`, at least one concrete acceptance criterion, and the
 files or areas it is expected to touch. If a task cannot credibly be completed
-in 20 minutes, split it before saving. The plan must contain at most 10 tasks.
-If it needs 11 or more, do not compose or stage a collab plan: report a blocker
+in 20 minutes, split it before saving. The plan must contain at most 15 tasks.
+If it needs 16 or more, do not compose or stage a collab plan: report a blocker
 naming the required independently executable child-issue split. Never merge
 unrelated work or drop acceptance criteria merely to fit this budget.
 
-Run a local structure check on the markdown you wrote: at least 1 and at most 10
+Run a local structure check on the markdown you wrote: at least 1 and at most 15
 `^### Task ` headings, contiguous task IDs `1..N`, a `Timebox: <=20 minutes`
 line on every task, and at least one acceptance criterion on every task.
 If any of those checks fails, repair the markdown and re-run them. If you cannot

@@ -1,5 +1,5 @@
 ---
-description: Read a GitHub issue, score its complexity, and recommend DIRECT (/plan + iron-tdd), IRON (iron-plan → iron-build), COLLAB (/collab start), or mandatory SPLIT above 10 tasks. Advisory: prints a verdict and the exact command, then confirms before invoking. Usage — /evaluate-issue <issue-number | #number | issue-url>
+description: Read a GitHub issue, score its complexity, and recommend DIRECT (/plan + iron-tdd), IRON (iron-plan → iron-build), COLLAB (/collab start), or mandatory SPLIT above 15 tasks. Advisory: prints a verdict and the exact command, then confirms before invoking. Usage — /evaluate-issue <issue-number | #number | issue-url>
 argument-hint: <issue-number | #number | issue-url>
 ---
 
@@ -71,7 +71,7 @@ itself a DIRECT signal.
 - **Design judgment** — architectural decisions (API/contract, state
   machine, migration, new subsystem)?
 - **Decomposability** — number of *independent* execution tasks; an estimate
-  above 10 requires `SPLIT`
+  above 15 requires `SPLIT`
 - **Spec clarity** — well-specified vs ambiguous / under-defined
 - **Security / review depth** — does it touch security-sensitive code (auth,
   credentials, billing, user data)? Drives the post-implementation review
@@ -90,9 +90,9 @@ design-judgment triggers dominate its crate-count range (a purely mechanical
 not justify COLLAB — it drives the review tier recommendation instead.
 
 0. **SPLIT** — choose before every other route when the issue credibly needs
-   **more than 10 independent execution tasks**. Do not start collab for the
+   **more than 15 independent execution tasks**. Do not start collab for the
    parent. Propose 2+ independently executable child issues, each with focused
-   scope, acceptance criteria, dependencies, and a 1–10-task estimate. Never
+   scope, acceptance criteria, dependencies, and a 1–15-task estimate. Never
    merge unrelated work, weaken acceptance criteria, or discard scope merely to
    fit the limit. Keep the parent open as the tracking issue.
 
@@ -143,8 +143,8 @@ Recommended review:
 For `SPLIT`, insert before the confirmation line:
 
 Child issues:
-  1. <title> — <scope, acceptance summary, 1–10 task estimate, dependencies>
-  2. <title> — <scope, acceptance summary, 1–10 task estimate, dependencies>
+  1. <title> — <scope, acceptance summary, 1–15 task estimate, dependencies>
+  2. <title> — <scope, acceptance summary, 1–15 task estimate, dependencies>
   ...
 
 Proceed with this path? [y/N]
@@ -196,7 +196,7 @@ Deep, regardless of the execution-path verdict.
 
 - **Read-only until the confirm gate.** Steps 1–4 never mutate state.
 - **Never auto-launch** — even an obvious DIRECT waits for `y`.
-- **Task-budget first** — an estimate above 10 tasks always yields `SPLIT`;
+- **Task-budget first** — an estimate above 15 tasks always yields `SPLIT`;
   never launch collab for the oversized parent issue.
 - **Recommend one path, not a menu** — pick the single best fit and justify
   it; the user overrides by declining.

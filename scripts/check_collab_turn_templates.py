@@ -223,7 +223,7 @@ REQUIRED_TEMPLATE_SNIPPETS = {
     ],
     "collab-turn-task-list.md": [
         "Timebox: <=20 minutes",
-        "more than 10 tasks",
+        "more than 15 tasks",
         "PlanLocked is pre-coding",
         "plan_file_path",
         # The `PlanLocked` bridge is sender-parameterized for exactly the same
@@ -243,7 +243,7 @@ REQUIRED_TEMPLATE_SNIPPETS = {
     ],
     "collab-turn-plan-finalize.md": [
         "Timebox: <=20 minutes",
-        "at most 10 tasks",
+        "at most 15 tasks",
         "docs/iron/plans/YYYY-MM-DD-<short-feature>.md",
         "first auto-ack response",
         "get_drawer(id=<canonical_plan_ref.drawer_id>)",
@@ -487,7 +487,7 @@ REQUIRED_SENTINELS = ["<!-- LINT:worker-dispatch -->",
 REQUIRED_EVALUATE_ISSUE_SNIPPETS = [
     "Verdict: <DIRECT | IRON | COLLAB | SPLIT>",
     "Task estimate: <N | N+> independent execution tasks",
-    "more than 10",
+    "more than 15",
     "Child issues:",
     "Parent: #<number>",
     "advisory-only",

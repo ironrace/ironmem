@@ -51,7 +51,7 @@ here. Never issue a second receive after auto-acknowledgement.
 Merge the counterpart's draft with your own independent reading of
 `collab_status.task` into one canonical plan that keeps the strongest parts of
 each. Do not simply adopt the received draft, and do not drop scope that only
-one source covered. A collab issue may contain at most 10 execution tasks; if
+one source covered. A collab issue may contain at most 15 execution tasks; if
 the merged scope credibly needs more, build the canonical plan around an
 independently executable child-issue split rather than one oversized plan.
 Never merge unrelated work or drop acceptance criteria to fit the cap.
