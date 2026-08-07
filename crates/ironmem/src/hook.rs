@@ -980,7 +980,7 @@ fn recall_block_from_qualifying(
             }
         }
         let lookup_refs: Vec<&str> = lookup_ids.iter().map(String::as_str).collect();
-        let fetched = match db.get_drawers_by_ids(&lookup_refs) {
+        let fetched = match db.get_drawers_by_ids_filtered(&lookup_refs, None, None, false) {
             Ok(drawers) => drawers,
             Err(e) => {
                 tracing::warn!("prompt-hook recall: drawer fetch failed: {e}");
@@ -3398,6 +3398,157 @@ mod tests {
             off_bytes,
             "a timed-out vector lookup must preserve the local hook bytes"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unavailable_hybrid_peer_preserves_byte_identical_local_recall() {
+        let _env = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let _prompt = prompt_hook_tunable_defaults();
+        let _hybrid_env = PromptHookEnvGuard;
+        std::env::set_var("IRONMEM_PROMPT_HOOK_BUDGET_MS", "200");
+        std::env::set_var("IRONMEM_PROMPT_HOOK_HYBRID_BUDGET_MS", "40");
+        std::env::set_var("IRONMEM_PROMPT_HOOK_KG", "false");
+        std::env::set_var("IRONMEM_PROMPT_HOOK_DIARY", "false");
+
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("memory.sqlite3");
+        let state_dir = dir.path().join("missing-state");
+        seed_db_file(&db_path, &[("alpha beta gamma", "infra", "local")]);
+        let input = serde_json::json!({"prompt": "alpha beta gamma"});
+
+        std::env::remove_var("IRONMEM_PROMPT_RECALL_HYBRID");
+        let off = run_hook_with_input(
+            "user-prompt-submit",
+            "claude-code",
+            prompt_hook_config(db_path.clone(), state_dir.clone()),
+            input.clone(),
+        )
+        .unwrap();
+        let off_bytes = serde_json::to_vec(&off).unwrap();
+
+        std::env::set_var("IRONMEM_PROMPT_RECALL_HYBRID", "true");
+        let on = run_hook_with_input(
+            "user-prompt-submit",
+            "claude-code",
+            prompt_hook_config(db_path, state_dir),
+            input,
+        )
+        .unwrap();
+
+        assert_eq!(serde_json::to_vec(&on).unwrap(), off_bytes);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn empty_hybrid_vector_response_preserves_byte_identical_local_recall() {
+        let _env = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let _prompt = prompt_hook_tunable_defaults();
+        let _hybrid_env = PromptHookEnvGuard;
+        std::env::set_var("IRONMEM_PROMPT_HOOK_BUDGET_MS", "200");
+        std::env::set_var("IRONMEM_PROMPT_HOOK_HYBRID_BUDGET_MS", "40");
+        std::env::set_var("IRONMEM_PROMPT_HOOK_KG", "false");
+        std::env::set_var("IRONMEM_PROMPT_HOOK_DIARY", "false");
+
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("memory.sqlite3");
+        let state_dir = dir.path().join("state");
+        seed_db_file(&db_path, &[("alpha beta gamma", "infra", "local")]);
+        let input = serde_json::json!({"prompt": "alpha beta gamma"});
+
+        std::env::remove_var("IRONMEM_PROMPT_RECALL_HYBRID");
+        let off = run_hook_with_input(
+            "user-prompt-submit",
+            "claude-code",
+            prompt_hook_config(db_path.clone(), state_dir.clone()),
+            input.clone(),
+        )
+        .unwrap();
+        let off_bytes = serde_json::to_vec(&off).unwrap();
+
+        std::fs::create_dir_all(&state_dir).unwrap();
+        let (peer, _, accepted) =
+            spawn_vector_peer(state_dir.join("daemon.sock"), Some(Vec::new()), false);
+        std::env::set_var("IRONMEM_PROMPT_RECALL_HYBRID", "true");
+        let on = run_hook_with_input(
+            "user-prompt-submit",
+            "claude-code",
+            prompt_hook_config(db_path, state_dir),
+            input,
+        )
+        .unwrap();
+        assert!(
+            accepted.recv_timeout(Duration::from_millis(200)).is_ok(),
+            "empty-response fallback must exercise the vector peer"
+        );
+        peer.join().unwrap();
+
+        assert_eq!(serde_json::to_vec(&on).unwrap(), off_bytes);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn superseded_vector_id_is_not_injected_or_promoted() {
+        let _env = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let _prompt = prompt_hook_tunable_defaults();
+        let _hybrid_env = PromptHookEnvGuard;
+        std::env::set_var("IRONMEM_PROMPT_HOOK_BUDGET_MS", "200");
+        std::env::set_var("IRONMEM_PROMPT_HOOK_HYBRID_BUDGET_MS", "40");
+        std::env::set_var("IRONMEM_PROMPT_HOOK_MAX_HITS", "1");
+        std::env::set_var("IRONMEM_PROMPT_HOOK_KG", "false");
+        std::env::set_var("IRONMEM_PROMPT_HOOK_DIARY", "false");
+
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("memory.sqlite3");
+        let state_dir = dir.path().join("state");
+        let lexical = ("alpha beta gamma", "infra", "lexical");
+        let stale = ("stale semantic drawer", "infra", "semantic");
+        let successor = ("current replacement drawer", "infra", "semantic");
+        seed_db_file(&db_path, &[lexical, stale, successor]);
+        let stale_id = generate_id(stale.0, stale.1, stale.2);
+        let successor_id = generate_id(successor.0, successor.1, successor.2);
+        let db = crate::db::schema::Database::open(&db_path).unwrap();
+        db.exec_raw(&format!(
+            "UPDATE drawers SET superseded_by = '{successor_id}' WHERE id = '{stale_id}'"
+        ))
+        .unwrap();
+        drop(db);
+        let input = serde_json::json!({"prompt": "alpha beta gamma"});
+
+        std::env::remove_var("IRONMEM_PROMPT_RECALL_HYBRID");
+        let off = run_hook_with_input(
+            "user-prompt-submit",
+            "claude-code",
+            prompt_hook_config(db_path.clone(), state_dir.clone()),
+            input.clone(),
+        )
+        .unwrap();
+        let off_bytes = serde_json::to_vec(&off).unwrap();
+
+        std::fs::create_dir_all(&state_dir).unwrap();
+        let (peer, _, accepted) =
+            spawn_vector_peer(state_dir.join("daemon.sock"), Some(vec![stale_id]), false);
+        std::env::set_var("IRONMEM_PROMPT_RECALL_HYBRID", "true");
+        let on = run_hook_with_input(
+            "user-prompt-submit",
+            "claude-code",
+            prompt_hook_config(db_path, state_dir),
+            input,
+        )
+        .unwrap();
+        assert!(
+            accepted.recv_timeout(Duration::from_millis(200)).is_ok(),
+            "superseded-ID regression must exercise the vector peer"
+        );
+        peer.join().unwrap();
+
+        assert_eq!(serde_json::to_vec(&on).unwrap(), off_bytes);
+        let context = on
+            .hook_specific_output
+            .expect("BM25 fallback must remain available")
+            .additional_context;
+        assert!(context.contains("source=\"infra/lexical\""));
+        assert!(!context.contains("source=\"infra/semantic\""));
     }
 
     #[cfg(unix)]
