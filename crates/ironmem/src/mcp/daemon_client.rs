@@ -23,15 +23,13 @@ pub(crate) fn search_ids(
 ) -> Option<Vec<String>> {
     use std::fs;
     use std::os::unix::fs::FileTypeExt;
-    use std::os::unix::net::UnixStream;
 
     let metadata = fs::symlink_metadata(socket_path).ok()?;
     if !metadata.file_type().is_socket() {
         return None;
     }
-    remaining(deadline)?;
 
-    let mut stream = UnixStream::connect(socket_path).ok()?;
+    let mut stream = connect_with_deadline(socket_path, deadline)?;
     let mut request = serde_json::to_vec(&serde_json::json!({
         "jsonrpc": "2.0",
         "id": REQUEST_ID,
@@ -67,6 +65,119 @@ pub(crate) fn search_ids(
 fn remaining(deadline: Instant) -> Option<Duration> {
     let remaining = deadline.checked_duration_since(Instant::now())?;
     (!remaining.is_zero()).then_some(remaining)
+}
+
+#[cfg(unix)]
+fn connect_with_deadline(
+    socket_path: &Path,
+    deadline: Instant,
+) -> Option<std::os::unix::net::UnixStream> {
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+
+    let (address, address_len) = unix_socket_address(socket_path)?;
+    remaining(deadline)?;
+
+    let raw_fd = unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_STREAM, 0) };
+    if raw_fd < 0 {
+        return None;
+    }
+    let fd = unsafe { OwnedFd::from_raw_fd(raw_fd) };
+    let original_flags = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_GETFL) };
+    if original_flags < 0 {
+        return None;
+    }
+    remaining(deadline)?;
+    if unsafe {
+        libc::fcntl(
+            fd.as_raw_fd(),
+            libc::F_SETFL,
+            original_flags | libc::O_NONBLOCK,
+        )
+    } < 0
+    {
+        return None;
+    }
+
+    remaining(deadline)?;
+    let connect_result = unsafe {
+        libc::connect(
+            fd.as_raw_fd(),
+            &address as *const libc::sockaddr_un as *const libc::sockaddr,
+            address_len,
+        )
+    };
+    if connect_result < 0 {
+        let error = std::io::Error::last_os_error();
+        let code = error.raw_os_error()?;
+        if !is_connect_pending(code) && code != libc::EINTR && code != libc::EISCONN {
+            return None;
+        }
+        if code != libc::EISCONN {
+            loop {
+                wait_for_fd(fd.as_raw_fd(), libc::POLLOUT, deadline)?;
+                remaining(deadline)?;
+                let connect_error = socket_error(fd.as_raw_fd())?;
+                if connect_error == 0 || connect_error == libc::EISCONN {
+                    break;
+                }
+                if is_connect_pending(connect_error) || connect_error == libc::EINTR {
+                    continue;
+                }
+                return None;
+            }
+        }
+    }
+
+    remaining(deadline)?;
+    if unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_SETFL, original_flags) } < 0 {
+        return None;
+    }
+    Some(std::os::unix::net::UnixStream::from(fd))
+}
+
+#[cfg(unix)]
+fn unix_socket_address(path: &Path) -> Option<(libc::sockaddr_un, libc::socklen_t)> {
+    use std::os::unix::ffi::OsStrExt;
+
+    let bytes = path.as_os_str().as_bytes();
+    if bytes.is_empty() || bytes.contains(&0) {
+        return None;
+    }
+    let mut address: libc::sockaddr_un = unsafe { std::mem::zeroed() };
+    if bytes.len() >= address.sun_path.len() {
+        return None;
+    }
+    address.sun_family = libc::AF_UNIX as _;
+    for (slot, byte) in address.sun_path.iter_mut().zip(bytes.iter().copied()) {
+        *slot = byte as _;
+    }
+    let address_len =
+        (std::mem::size_of_val(&address.sun_family) + bytes.len() + 1) as libc::socklen_t;
+    Some((address, address_len))
+}
+
+#[cfg(unix)]
+fn is_connect_pending(code: libc::c_int) -> bool {
+    code == libc::EINPROGRESS
+        || code == libc::EALREADY
+        || code == libc::EAGAIN
+        || code == libc::EWOULDBLOCK
+}
+
+#[cfg(unix)]
+fn socket_error(fd: std::os::fd::RawFd) -> Option<libc::c_int> {
+    let mut error = 0 as libc::c_int;
+    let mut length = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+    let result = unsafe {
+        libc::getsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_ERROR,
+            &mut error as *mut libc::c_int as *mut libc::c_void,
+            &mut length,
+        )
+    };
+    (result == 0).then_some(error)
 }
 
 #[cfg(unix)]
@@ -158,15 +269,16 @@ fn wait_for_io(
 ) -> Option<()> {
     use std::os::unix::io::AsRawFd;
 
+    wait_for_fd(stream.as_raw_fd(), event, deadline)
+}
+
+#[cfg(unix)]
+fn wait_for_fd(fd: std::os::fd::RawFd, event: i16, deadline: Instant) -> Option<()> {
     loop {
         let timeout = remaining(deadline)?;
-        let timeout_ms = timeout
-            .as_nanos()
-            .saturating_add(999_999)
-            .checked_div(1_000_000)?
-            .clamp(1, i32::MAX as u128) as i32;
+        let timeout_ms = timeout.as_millis().min(i32::MAX as u128) as i32;
         let mut poll_fd = libc::pollfd {
-            fd: stream.as_raw_fd(),
+            fd,
             events: event,
             revents: 0,
         };
@@ -389,6 +501,129 @@ mod tests {
                 Instant::now() + Duration::from_secs(1)
             ),
             None
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn connect_to_a_full_listener_honors_the_absolute_deadline() {
+        use std::os::unix::ffi::OsStrExt;
+        use std::os::unix::io::RawFd;
+        use std::path::Path;
+        use std::time::{Duration, Instant};
+
+        struct FdGuard(RawFd);
+        impl Drop for FdGuard {
+            fn drop(&mut self) {
+                unsafe {
+                    libc::close(self.0);
+                }
+            }
+        }
+
+        fn socket_address(path: &Path) -> Option<(libc::sockaddr_un, libc::socklen_t)> {
+            let bytes = path.as_os_str().as_bytes();
+            let mut address: libc::sockaddr_un = unsafe { std::mem::zeroed() };
+            if bytes.is_empty() || bytes.len() >= address.sun_path.len() {
+                return None;
+            }
+            address.sun_family = libc::AF_UNIX as _;
+            for (slot, byte) in address.sun_path.iter_mut().zip(bytes.iter().copied()) {
+                *slot = byte as _;
+            }
+            let address_len =
+                (std::mem::size_of_val(&address.sun_family) + bytes.len() + 1) as libc::socklen_t;
+            Some((address, address_len))
+        }
+
+        fn bind_small_listener(path: &Path) -> Option<FdGuard> {
+            let (address, address_len) = socket_address(path)?;
+            let fd = unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_STREAM, 0) };
+            if fd < 0 {
+                return None;
+            }
+            let guard = FdGuard(fd);
+            let bound = unsafe {
+                libc::bind(
+                    fd,
+                    &address as *const libc::sockaddr_un as *const libc::sockaddr,
+                    address_len,
+                )
+            } == 0;
+            let listening = bound && unsafe { libc::listen(fd, 1) } == 0;
+            listening.then_some(guard)
+        }
+
+        fn fill_listener_backlog(path: &Path) -> Vec<FdGuard> {
+            let Some((address, address_len)) = socket_address(path) else {
+                return Vec::new();
+            };
+            let mut clients = Vec::new();
+            for _ in 0..32 {
+                let fd = unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_STREAM, 0) };
+                if fd < 0 {
+                    break;
+                }
+                let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+                if flags < 0
+                    || unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0
+                {
+                    unsafe {
+                        libc::close(fd);
+                    }
+                    break;
+                }
+                let result = unsafe {
+                    libc::connect(
+                        fd,
+                        &address as *const libc::sockaddr_un as *const libc::sockaddr,
+                        address_len,
+                    )
+                };
+                let accepted = result == 0
+                    || matches!(
+                        std::io::Error::last_os_error().raw_os_error(),
+                        Some(code)
+                            if code == libc::EINPROGRESS
+                                || code == libc::EALREADY
+                                || code == libc::EINTR
+                    );
+                if accepted {
+                    clients.push(FdGuard(fd));
+                } else {
+                    unsafe {
+                        libc::close(fd);
+                    }
+                    break;
+                }
+            }
+            clients
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let socket_path = dir.path().join("backlog.sock");
+        let Some(_listener) = bind_small_listener(&socket_path) else {
+            panic!("test platform could not bind a Unix listener");
+        };
+        let clients = fill_listener_backlog(&socket_path);
+        assert!(
+            !clients.is_empty(),
+            "fixture failed to fill the listener backlog: {} clients",
+            clients.len()
+        );
+
+        let deadline = Instant::now() + Duration::from_millis(75);
+        let started = Instant::now();
+        let result = super::connect_with_deadline(&socket_path, deadline);
+        let elapsed = started.elapsed();
+
+        assert!(
+            result.is_none(),
+            "a full listener must not produce a stream"
+        );
+        assert!(
+            elapsed < Duration::from_millis(500),
+            "connect exceeded its absolute deadline: {elapsed:?}"
         );
     }
 
