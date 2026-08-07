@@ -15,15 +15,6 @@ const REQUEST_ID: u64 = 1;
 
 #[cfg(unix)]
 #[derive(serde::Serialize)]
-struct SearchRequest<'a> {
-    jsonrpc: &'static str,
-    id: u64,
-    method: &'static str,
-    params: SearchParams<'a>,
-}
-
-#[cfg(unix)]
-#[derive(serde::Serialize)]
 struct SearchParams<'a> {
     name: &'static str,
     arguments: SearchArguments<'a>,
@@ -95,7 +86,7 @@ pub(crate) fn search_ids(
     let mut request = BoundedRequest::new();
     serde_json::to_writer(
         &mut request,
-        &SearchRequest {
+        &crate::mcp::protocol::JsonRpcCall {
             jsonrpc: "2.0",
             id: REQUEST_ID,
             method: "tools/call",
