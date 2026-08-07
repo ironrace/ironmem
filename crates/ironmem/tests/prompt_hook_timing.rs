@@ -12,6 +12,8 @@ fn bin() -> &'static str {
     env!("CARGO_BIN_EXE_ironmem")
 }
 
+const PROMPT_HOOK_BUDGET_MS: u64 = 150;
+
 fn seed_db_file_bulk(path: &Path, n: usize) {
     let db = Database::open(path).unwrap();
     db.migrate().unwrap();
@@ -107,7 +109,7 @@ fn run_prompt_hook(db_path: &Path, model_dir: &Path, prompt: &str) -> (Value, u1
         model_dir,
         prompt,
         HookOptions {
-            hook_budget_ms: 150,
+            hook_budget_ms: PROMPT_HOOK_BUDGET_MS,
             hybrid_budget_ms: 40,
             hybrid_limit: 10,
             ..HookOptions::default()
@@ -129,7 +131,7 @@ fn run_prompt_hook_hybrid(
         HookOptions {
             socket_path: Some(socket_path.to_path_buf()),
             hybrid: true,
-            hook_budget_ms: 150,
+            hook_budget_ms: PROMPT_HOOK_BUDGET_MS,
             hybrid_budget_ms: 40,
             hybrid_limit: 10,
             ..HookOptions::default()
@@ -490,7 +492,7 @@ fn user_prompt_submit_binary_p95_under_budget_on_10k_drawers() {
     samples.sort_unstable();
     let p95 = samples[((n as f64 * 0.95) as usize).saturating_sub(1)];
     assert!(
-        p95 <= 150,
+        p95 <= PROMPT_HOOK_BUDGET_MS,
         "binary p95 {p95}ms exceeds 150ms budget; samples={samples:?}"
     );
 }
@@ -662,10 +664,14 @@ fn prompt_hook_warm_noop_daemon_fuses_compact_remote_ids_into_local_rendering() 
     let semantic = ("unrelated local semantic memory", "infra", "semantic");
     let foreign = ("foreign daemon-only vector memory", "remote", "foreign");
     let local_ids = seed_db_file_rows(&local_db, &[lexical, semantic]);
-    let daemon_ids = seed_db_file_rows(&daemon_db, &[lexical, semantic, foreign]);
+    // Keep the warm daemon's zero-vector index to the two IDs the test needs.
+    // With three equal noop vectors, HNSW tie traversal can omit one candidate
+    // even when the requested limit is larger; the local DB still supplies the
+    // lexical BM25 row for the fused selection path.
+    let daemon_ids = seed_db_file_rows(&daemon_db, &[semantic, foreign]);
     let lexical_id = &local_ids[0];
     let semantic_id = &local_ids[1];
-    let foreign_id = &daemon_ids[2];
+    let foreign_id = &daemon_ids[1];
 
     let daemon = spawn_noop_daemon(&daemon_socket, &daemon_db, &daemon_home);
     let daemon_payload = wait_for_ready_daemon(&daemon_socket, "alpha beta gamma \"quoted\"\n", 10);
@@ -694,7 +700,7 @@ fn prompt_hook_warm_noop_daemon_fuses_compact_remote_ids_into_local_rendering() 
         HookOptions {
             socket_path: Some(hook_socket.clone()),
             hybrid: false,
-            hook_budget_ms: 300,
+            hook_budget_ms: PROMPT_HOOK_BUDGET_MS,
             hybrid_budget_ms: 80,
             hybrid_limit: 10,
             max_hits: Some(2),
@@ -710,7 +716,7 @@ fn prompt_hook_warm_noop_daemon_fuses_compact_remote_ids_into_local_rendering() 
         HookOptions {
             socket_path: Some(hook_socket.clone()),
             hybrid: true,
-            hook_budget_ms: 300,
+            hook_budget_ms: PROMPT_HOOK_BUDGET_MS,
             hybrid_budget_ms: 80,
             hybrid_limit: 10,
             max_hits: Some(2),
@@ -720,6 +726,11 @@ fn prompt_hook_warm_noop_daemon_fuses_compact_remote_ids_into_local_rendering() 
         },
     );
     let request = proxy.take_request();
+    assert!(
+        on.elapsed <= Duration::from_millis(PROMPT_HOOK_BUDGET_MS),
+        "warm-daemon hook exceeded the retained 150 ms budget: {:?}",
+        on.elapsed
+    );
     assert_eq!(request["jsonrpc"], "2.0");
     assert_eq!(request["id"], 1);
     assert_eq!(request["method"], "tools/call");
