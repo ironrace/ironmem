@@ -692,13 +692,6 @@ fn run_user_prompt_submit(
 
     let should_sample_occupancy = crate::search::tunables::metrics_enabled()
         && prompt_occupancy_sample_allowed(harness, session_id, usage);
-    let recall_budget = if should_sample_occupancy {
-        budget
-            .checked_sub(Duration::from_millis(PROMPT_HOOK_OCCUPANCY_RESERVE_MS))
-            .unwrap_or_default()
-    } else {
-        budget
-    };
 
     let hybrid =
         crate::search::tunables::prompt_recall_hybrid_enabled().then(|| HybridRecallConfig {
@@ -706,10 +699,14 @@ fn run_user_prompt_submit(
             limit: crate::search::tunables::prompt_hook_hybrid_limit(),
         });
 
+    // `budget` (not a pre-shrunk copy) goes to recall: `effective_hybrid_vector_budget`
+    // already reserves `PROMPT_HOOK_OCCUPANCY_RESERVE_MS` once for the hybrid path, and
+    // the post-hoc `remaining >= reserve` gate below already makes the occupancy sample
+    // best-effort. Reserving the same 30ms a second time here would halve hybrid's
+    // window whenever occupancy sampling is active, with no corresponding benefit.
     if let Some(prompt) = input.get("prompt").and_then(|v| v.as_str()) {
-        if !prompt.trim().is_empty() && !recall_budget.is_zero() {
-            if let Some(ctx) =
-                search_prompt_context(&config.db_path, prompt, start, recall_budget, hybrid)
+        if !prompt.trim().is_empty() && !budget.is_zero() {
+            if let Some(ctx) = search_prompt_context(&config.db_path, prompt, start, budget, hybrid)
             {
                 response.hook_specific_output = Some(HookSpecificOutput::user_prompt_submit(ctx));
             }
@@ -907,17 +904,8 @@ fn recall_block_from_db(
     prompt: &str,
     config: &RecallConfig,
 ) -> Option<String> {
-    recall_block_from_db_with_vectors(db, prompt, config, None)
-}
-
-fn recall_block_from_db_with_vectors(
-    db: &crate::db::schema::Database,
-    prompt: &str,
-    config: &RecallConfig,
-    vector_ids: Option<&[String]>,
-) -> Option<String> {
     let qualifying = bm25_qualifying(db, prompt, config)?;
-    recall_block_from_qualifying(db, prompt, config, qualifying, vector_ids)
+    recall_block_from_qualifying(db, prompt, config, qualifying, None)
 }
 
 fn recall_block_from_vector_handoff(
@@ -957,6 +945,20 @@ fn bm25_qualifying(
     )
 }
 
+/// Top `max_hits` BM25-qualifying ids, sorted for stable output. `qualifying`
+/// comes from `db.bm25_search`, which already excludes superseded rows, so a
+/// drawer map already fetched for a superset of these ids (e.g. `fetched` in
+/// the vector-fusion path) can be reused directly without a second query.
+fn bm25_only_ids(qualifying: &[(String, f32)], max_hits: usize) -> Vec<String> {
+    let mut ids: Vec<String> = qualifying
+        .iter()
+        .take(max_hits)
+        .map(|(id, _)| id.clone())
+        .collect();
+    ids.sort_unstable();
+    ids
+}
+
 fn recall_block_from_qualifying(
     db: &crate::db::schema::Database,
     prompt: &str,
@@ -974,16 +976,25 @@ fn recall_block_from_qualifying(
     )
 }
 
+/// Shared guard for both vector-response pollers: nothing to poll once a
+/// vector or an already-resolved response is missing.
+fn pending_vector<'a>(
+    response: &Option<Option<Vec<String>>>,
+    vector: Option<&'a VectorHandoff>,
+) -> Option<&'a VectorHandoff> {
+    if response.is_some() {
+        return None;
+    }
+    vector
+}
+
 fn poll_vector_response(
     response: &mut Option<Option<Vec<String>>>,
     vector: Option<&VectorHandoff>,
 ) {
-    let Some(vector) = vector else {
+    let Some(vector) = pending_vector(response, vector) else {
         return;
     };
-    if response.is_some() {
-        return;
-    }
     match vector.rx.try_recv() {
         Ok(ids) => *response = Some(ids),
         Err(std::sync::mpsc::TryRecvError::Disconnected) => *response = Some(None),
@@ -1005,12 +1016,9 @@ fn opportunistic_vector_response(
     response: &mut Option<Option<Vec<String>>>,
     vector: Option<&VectorHandoff>,
 ) {
-    let Some(vector) = vector else {
+    let Some(vector) = pending_vector(response, vector) else {
         return;
     };
-    if response.is_some() {
-        return;
-    }
     let wait = vector.deadline.saturating_duration_since(Instant::now());
     if wait.is_zero() {
         return;
@@ -1177,30 +1185,17 @@ fn recall_block_from_qualifying_with_vector_poll(
             .collect();
 
         if valid_vector_ids.is_empty() {
-            let mut ids: Vec<String> = qualifying
-                .iter()
-                .take(max_hits)
-                .map(|(id, _)| id.clone())
-                .collect();
-            let refs: Vec<&str> = ids.iter().map(String::as_str).collect();
-            let drawers = match db.get_drawers_by_ids(&refs) {
-                Ok(drawers) => drawers,
-                Err(e) => {
-                    tracing::warn!("prompt-hook recall: drawer fetch failed: {e}");
-                    return None;
-                }
-            };
-            ids.sort_unstable();
-            (ids, drawers)
+            // `fetched` was already queried (with `include_superseded: false`) for
+            // the union of bm25_ids and vector_ids, and bm25_ids can never contain a
+            // superseded row (BM25 search excludes them already) — so it already
+            // holds exactly what a fresh `get_drawers_by_ids` fetch for these ids
+            // would return. No second query needed.
+            (bm25_only_ids(&qualifying, max_hits), fetched)
         } else {
-            let sparse_threshold = crate::search::tunables::bm25_sparse_threshold();
-            let bm25_weight = if current_bm25_ids.is_empty() {
-                0.0
-            } else if current_bm25_ids.len() < sparse_threshold {
-                current_bm25_ids.len() as f32 / sparse_threshold as f32
-            } else {
-                1.0
-            };
+            let bm25_weight = crate::search::pipeline::sparse_bm25_weight(
+                current_bm25_ids.len(),
+                crate::search::tunables::bm25_sparse_threshold(),
+            );
             let merged = crate::search::pipeline::rrf_merge_weighted(
                 &valid_vector_ids,
                 &current_bm25_ids,
@@ -1216,11 +1211,7 @@ fn recall_block_from_qualifying_with_vector_poll(
             (ids, fetched)
         }
     } else {
-        let mut ids: Vec<String> = qualifying
-            .iter()
-            .take(max_hits)
-            .map(|(id, _)| id.clone())
-            .collect();
+        let ids = bm25_only_ids(&qualifying, max_hits);
         let refs: Vec<&str> = ids.iter().map(String::as_str).collect();
         let drawers = match db.get_drawers_by_ids(&refs) {
             Ok(drawers) => drawers,
@@ -1229,7 +1220,6 @@ fn recall_block_from_qualifying_with_vector_poll(
                 return None;
             }
         };
-        ids.sort_unstable();
         (ids, drawers)
     };
 
@@ -3639,6 +3629,90 @@ mod tests {
         .unwrap();
 
         assert_eq!(serde_json::to_vec(&on).unwrap(), off_bytes);
+    }
+
+    /// Regression for a caller-side double reservation: `run_user_prompt_submit`
+    /// used to shrink the outer budget by `PROMPT_HOOK_OCCUPANCY_RESERVE_MS`
+    /// *before* calling `search_prompt_context` whenever occupancy sampling was
+    /// active, and `effective_hybrid_vector_budget` reserved the same constant
+    /// again from what it received — halving hybrid's actual window (60ms
+    /// reserved instead of the intended 30ms) any time both features were on
+    /// together. This is exactly the interaction the existing hybrid timing
+    /// tests never exercise: they never set a session id + usage, so
+    /// `should_sample_occupancy` is always false there.
+    ///
+    /// A peer that never replies makes the vector wait run out its full
+    /// deadline, so the hook's wall-clock time is dominated by that wait. With
+    /// a single 30ms reserve the wait extends close to budget-30ms; with the
+    /// old double reserve it topped out at budget-60ms. The assertion only
+    /// needs a lower bound comfortably above the old (buggy) ceiling —
+    /// `recv_timeout` never returns before its requested duration, so this
+    /// side is not sensitive to scheduler jitter the way an upper bound would
+    /// be.
+    #[cfg(unix)]
+    #[test]
+    fn hybrid_budget_is_not_double_reserved_when_occupancy_sampling_is_active() {
+        use crate::metrics::METRICS_ENV_LOCK;
+        let _config_env = crate::config::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _env = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let _g = METRICS_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _prompt = prompt_hook_tunable_defaults();
+        let _hybrid_env = PromptHookEnvGuard::new();
+        std::env::set_var("IRONMEM_METRICS", "1");
+        std::env::set_var("IRONMEM_PROMPT_HOOK_BUDGET_MS", "400");
+        // Large enough that the outer budget's reserve is the binding
+        // constraint, not the configured hybrid budget itself.
+        std::env::set_var("IRONMEM_PROMPT_HOOK_HYBRID_BUDGET_MS", "2000");
+        std::env::set_var("IRONMEM_PROMPT_HOOK_KG", "false");
+        std::env::set_var("IRONMEM_PROMPT_HOOK_DIARY", "false");
+        std::env::set_var("IRONMEM_PROMPT_RECALL_HYBRID", "true");
+
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("memory.sqlite3");
+        let state_dir = dir.path().join("state");
+        std::fs::create_dir_all(&state_dir).unwrap();
+        seed_db_file(&db_path, &[("alpha beta gamma", "infra", "local")]);
+
+        let transcript = dir.path().join("t.jsonl");
+        std::fs::write(&transcript,
+            "{\"type\":\"assistant\",\"message\":{\"usage\":{\"input_tokens\":1000,\"output_tokens\":5,\"cache_read_input_tokens\":0}}}\n",
+        ).unwrap();
+
+        let (peer, release, accepted) =
+            spawn_vector_peer(state_dir.join("daemon.sock"), None, true);
+
+        let started = Instant::now();
+        let _ = run_hook_with_input(
+            "user-prompt-submit",
+            "claude-code",
+            prompt_hook_config(db_path, state_dir),
+            serde_json::json!({ "prompt": "alpha beta gamma", "session_id": "budget-1",
+                                "transcript_path": transcript.to_string_lossy() }),
+        )
+        .unwrap();
+        let elapsed = started.elapsed();
+
+        assert!(
+            accepted.recv_timeout(Duration::from_millis(200)).is_ok(),
+            "hybrid mode must connect to the configured vector peer"
+        );
+        let _ = release.unwrap().send(());
+        peer.join().unwrap();
+
+        // Single reserve: hybrid waits close to 400 - 30 = 370ms. Double
+        // reserve (the bug): capped at 400 - 60 = 340ms. 355ms sits strictly
+        // between the two, comfortably above the buggy ceiling.
+        assert!(
+            elapsed >= Duration::from_millis(355),
+            "hybrid budget appears to be reserving PROMPT_HOOK_OCCUPANCY_RESERVE_MS \
+             twice when occupancy sampling is active: {elapsed:?}"
+        );
+        assert!(
+            elapsed < Duration::from_millis(700),
+            "hook exceeded its outer budget by an unreasonable margin: {elapsed:?}"
+        );
     }
 
     #[cfg(unix)]

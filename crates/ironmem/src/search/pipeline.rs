@@ -135,14 +135,7 @@ pub fn search(
 
     // Step 5: Weighted RRF — down-weight BM25 when results are sparse to keep
     // HNSW authoritative rather than letting a few noisy BM25 hits dominate.
-    let sparse_threshold = tunables::bm25_sparse_threshold();
-    let bm25_weight = if bm25_ids.is_empty() {
-        0.0
-    } else if bm25_ids.len() < sparse_threshold {
-        bm25_ids.len() as f32 / sparse_threshold as f32
-    } else {
-        1.0
-    };
+    let bm25_weight = sparse_bm25_weight(bm25_ids.len(), tunables::bm25_sparse_threshold());
 
     let rrf_k = tunables::rrf_k();
     let mut merged_ids = if bm25_weight == 0.0 {
@@ -505,6 +498,22 @@ fn rrf_scores_map_nway<'a>(
         }
     }
     scores
+}
+
+/// BM25's RRF weight, down-scaled when the result set is sparse (fewer than
+/// `sparse_threshold` hits) so a handful of noisy lexical matches can't
+/// dominate a stronger dense/vector signal; at or above the threshold BM25
+/// gets full weight. Shared by the main search pipeline and the prompt-hook's
+/// hybrid vector fusion — both merge a dense id list with a BM25 id list via
+/// [`rrf_merge_weighted`] and must down-weight sparse BM25 identically.
+pub(crate) fn sparse_bm25_weight(bm25_id_count: usize, sparse_threshold: usize) -> f32 {
+    if bm25_id_count == 0 {
+        0.0
+    } else if bm25_id_count < sparse_threshold {
+        bm25_id_count as f32 / sparse_threshold as f32
+    } else {
+        1.0
+    }
 }
 
 /// Weighted RRF merge. `bm25_weight ∈ [0, 1]` scales list_b's contribution.

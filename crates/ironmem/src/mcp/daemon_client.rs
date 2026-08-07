@@ -307,29 +307,34 @@ fn read_bounded_line(
     }
 }
 
+/// Shared body for `refresh_read_timeout`/`refresh_write_timeout`: recompute
+/// the socket timeout from the absolute deadline before each syscall.
+///
+/// macOS rejects repeated `SO_RCVTIMEO`/`SO_SNDTIMEO` updates on `AF_UNIX`
+/// streams (`InvalidInput`); the poll immediately before the read/write still
+/// enforces this same absolute deadline on that platform, so that specific
+/// error is not fatal.
 #[cfg(unix)]
-fn refresh_read_timeout(stream: &std::os::unix::net::UnixStream, deadline: Instant) -> Option<()> {
+fn refresh_timeout(
+    deadline: Instant,
+    set_timeout: impl FnOnce(Option<Duration>) -> std::io::Result<()>,
+) -> Option<()> {
     let timeout = remaining(deadline)?;
-    match stream.set_read_timeout(Some(timeout)) {
+    match set_timeout(Some(timeout)) {
         Ok(()) => Some(()),
-        // macOS rejects repeated SO_RCVTIMEO updates on AF_UNIX streams. The
-        // poll immediately before the read still enforces this same absolute
-        // deadline on that platform.
         Err(error) if error.kind() == std::io::ErrorKind::InvalidInput => Some(()),
         Err(_) => None,
     }
 }
 
 #[cfg(unix)]
+fn refresh_read_timeout(stream: &std::os::unix::net::UnixStream, deadline: Instant) -> Option<()> {
+    refresh_timeout(deadline, |timeout| stream.set_read_timeout(timeout))
+}
+
+#[cfg(unix)]
 fn refresh_write_timeout(stream: &std::os::unix::net::UnixStream, deadline: Instant) -> Option<()> {
-    let timeout = remaining(deadline)?;
-    match stream.set_write_timeout(Some(timeout)) {
-        Ok(()) => Some(()),
-        // See `refresh_read_timeout` for the macOS AF_UNIX behavior. Polling
-        // is the fallback deadline guard when the socket option is rejected.
-        Err(error) if error.kind() == std::io::ErrorKind::InvalidInput => Some(()),
-        Err(_) => None,
-    }
+    refresh_timeout(deadline, |timeout| stream.set_write_timeout(timeout))
 }
 
 #[cfg(unix)]
