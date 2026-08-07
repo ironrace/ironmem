@@ -109,7 +109,7 @@ DISPATCH_FAILURE_ADMISSIBILITY_SNIPPETS = [
     "additionally requires `dispatch_failure_phase_admits`\n"
     "        (`crates/ironmem/src/collab/mod.rs`), which returns `false` "
     "for both —",
-    "**Every other phase:** as in condition 5 — the planning phases are",
+    "**Every other phase:** as in condition 6 — the planning phases are",
 ]
 DOC_PR_BASE_SNIPPETS = [
     "does **not** require that branch to contain `base_sha`",
@@ -180,6 +180,12 @@ TASK_BUDGET_SURFACE_SNIPPETS = {
     ".claude-plugin/prompts/collab-turn-plan-review.md": [
         "capped at 15 execution tasks",
         "credibly needs 16 or more",
+    ],
+    ".claude-plugin/prompts/collab-turn-plan-draft.md": [
+        "at most 15 execution tasks",
+    ],
+    ".claude-plugin/prompts/collab-turn-plan-synthesis.md": [
+        "at most 15 execution tasks",
     ],
     ".claude-plugin/prompts/collab-turn-plan-finalize.md": [
         "at most 15 tasks",
@@ -681,6 +687,98 @@ def test_lint_rejects_each_single_occurrence_stale_task_budget_drift(
     assert r.returncode == 1
     assert (f"{path}: stale task-budget ceiling {stale!r}; "
             "required 15/16 contract") in r.stdout
+
+
+@pytest.mark.parametrize(
+    "path,context,replacement,canonical,expected_count",
+    [
+        (
+            ".codex-plugin/prompts/evaluate-issue.md",
+            "1. <title> — <scope, acceptance summary, 1–15 task estimate, dependencies>",
+            "1. <title> — <scope, acceptance summary, 1–14 task estimate, dependencies>",
+            "1–15 task estimate",
+            2,
+        ),
+        (
+            "docs/COLLAB.md",
+            "minutes or any scope that credibly needs more than 15 tasks must be called out",
+            "minutes or any scope that credibly needs more than 20 tasks must be called out",
+            "more than 15 tasks",
+            3,
+        ),
+    ],
+)
+def test_lint_rejects_nonlegacy_single_occurrence_task_budget_drift(
+        tmp_path, path, context, replacement, canonical, expected_count):
+    fixture = copy_fixture(tmp_path)
+    mutate_once(fixture / path, context, replacement)
+
+    r = run({"COLLAB_LINT_ROOT": str(fixture)})
+
+    assert r.returncode == 1
+    assert (f"{path}: task-budget contract {canonical!r} expected "
+            f"{expected_count} occurrences, found {expected_count - 1}") in r.stdout
+
+
+def test_lint_scopes_task_budget_enforcement_to_planlocked_bridge(tmp_path):
+    fixture = copy_fixture(tmp_path)
+    command = fixture / ".claude-plugin" / "commands" / "collab.md"
+    text = command.read_text()
+    heading = "## v3 Bridge: PlanLocked → CodeImplementPending"
+    prefix, bridge = text.split(heading, 1)
+    enforcement = "more than 15 `### Task ` headings"
+    pattern = r"\s+".join(re.escape(part) for part in enforcement.split())
+    mutated_bridge, count = re.subn(pattern, MARK, bridge, count=1)
+    assert count == 1, "PlanLocked bridge task-budget enforcement not found"
+    # Preserve the whole-file positive pin outside the bridge. Only the
+    # section-specific checker can reject this mutation.
+    command.write_text(prefix + enforcement + "\n\n" + heading + mutated_bridge)
+
+    r = run({"COLLAB_LINT_ROOT": str(fixture)})
+
+    assert r.returncode == 1
+    assert (".claude-plugin/commands/collab.md: PlanLocked bridge is missing "
+            "task-budget enforcement 'more than 15 `### Task ` headings'") in r.stdout
+
+
+FINALIZE_ABORT_SURFACES = [
+    (
+        ".claude-plugin/prompts/collab-turn-plan-finalize.md",
+        "any blocker that prevents staging a valid final plan must call "
+        "`collab_end(session_id=$SESSION_ID, agent=\"claude\")` exactly once",
+    ),
+    (
+        ".codex-plugin/prompts/collab-plan-finalize.md",
+        "any blocker that prevents staging a valid final plan must call "
+        "`collab_end(session_id, agent=\"codex\")` exactly once",
+    ),
+    (
+        ".claude-plugin/prompts/collab-turn-submit.md",
+        "call `collab_end(session_id=$SESSION_ID, agent=\"$SENDER\")` "
+        "before returning the blocker",
+    ),
+    (
+        ".claude-plugin/commands/collab.md",
+        "A finalization `blocker:` is terminal: the worker must have ended "
+        "the session",
+    ),
+    (
+        "docs/COLLAB.md",
+        "A finalization `blocker:` is terminal: the worker must have ended "
+        "the session",
+    ),
+]
+
+
+@pytest.mark.parametrize("path,snippet", FINALIZE_ABORT_SURFACES)
+def test_lint_requires_finalize_blocker_to_end_session(tmp_path, path, snippet):
+    fixture = copy_fixture(tmp_path)
+    mutate_flex(fixture / path, snippet)
+
+    r = run({"COLLAB_LINT_ROOT": str(fixture)})
+
+    assert r.returncode == 1
+    assert f"{path}: missing finalize-abort contract {snippet!r}" in r.stdout
 
 
 def test_lint_requires_both_harness_templates_per_topic(tmp_path):

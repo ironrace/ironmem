@@ -17,7 +17,9 @@ preconditions: phase == PlanParallelDrafts, current_owner == claude
 1. `mcp__ironmem__collab_status` with `session_id=$SESSION_ID`; read `task`.
 
 ## Actions
-1. Draft a complete implementation plan for `task`.
+1. Draft a complete implementation plan for `task`. A collab issue may contain
+   at most 15 execution tasks; if the work credibly needs more, draft an
+   independently executable child-issue split rather than one oversized plan.
 2. `mcp__ironmem__collab_send` with `sender="claude"`, `topic="draft"`,
    `content=<the plan text>` (plain text).
 

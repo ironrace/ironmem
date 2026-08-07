@@ -14,7 +14,8 @@ preconditions: phase == PlanClaudeFinalizePending, current_owner == claude
 
 ## State discovery
 1. `collab_status(session_id=$SESSION_ID)`; verify
-   `phase == PlanClaudeFinalizePending` and inspect `canonical_plan_ref`.
+   `phase == PlanClaudeFinalizePending`, `current_owner == claude`, and inspect
+   `canonical_plan_ref`.
 2. Call `collab_recv(session_id=$SESSION_ID, receiver="claude",
    auto_ack=true)` exactly once. The first auto-ack response contains the
    message refs. Do not call `collab_recv` again after it acknowledges.
@@ -23,8 +24,8 @@ preconditions: phase == PlanClaudeFinalizePending, current_owner == claude
    `get_drawer(id=<message.drawer_id>)` for Codex's `topic="review"` message.
    `full:true` is compatibility-only: use it only on that first receive when a
    known legacy review row requires inline content. A legacy canonical plan
-   without a drawer reference cannot be recovered through status; return a
-   blocker. Never issue a second receive after auto-ack.
+   without a drawer reference cannot be recovered through status; follow the
+   finalization-abort rule below. Never issue a second receive after auto-ack.
 
 ## Actions
 1. Produce the final execution plan as an iron-build-compatible task markdown
@@ -40,9 +41,10 @@ preconditions: phase == PlanClaudeFinalizePending, current_owner == claude
    - the files/areas it is expected to touch
    If a task cannot credibly be completed in 20 minutes, split it before saving.
    The plan must contain at most 15 tasks. If it needs 16 or more, do not
-   compose or submit a collab plan: return a blocker that names the required
-   independently executable child-issue split. Never merge unrelated work or
-   drop acceptance criteria merely to fit this budget.
+   compose or submit a collab plan: follow the finalization-abort rule and name
+   the required independently executable child-issue split in the blocker.
+   Never merge unrelated work or drop acceptance criteria merely to fit this
+   budget.
 4. Run a local structure check on the markdown you wrote:
    - heading count for `^### Task ` is at least 1
    - heading count is at most 15
@@ -58,6 +60,12 @@ preconditions: phase == PlanClaudeFinalizePending, current_owner == claude
    the dispatcher's and fires one phase later, at `PlanLocked`, before the
    `task_list` bridge is dispatched; the `{drawer_id, plan_file_path, ≤3-line
    summary}` you return here is what the dispatcher carries to that gate.
+6. **Finalization-abort rule:** after the phase/owner check succeeds, any
+   blocker that prevents staging a valid final plan must call
+   `collab_end(session_id=$SESSION_ID, agent="claude")` exactly once before
+   returning the blocker. This is the narrow legal exit for an oversized or
+   otherwise unfinalizable plan; never leave the session parked in
+   `PlanClaudeFinalizePending`, and never send `final` on this path.
 
 ## Verdict
 Return EXACTLY these ≤3 lines, nothing else:

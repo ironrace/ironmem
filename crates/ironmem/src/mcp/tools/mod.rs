@@ -476,7 +476,7 @@ pub fn tool_definitions(app: &App) -> Vec<Value> {
         }),
         json!({
             "name": "collab_end",
-            "description": "End an eligible collab session; rejected during active planning or coding.",
+            "description": "End an eligible collab session. The current owner may abort PlanClaudeFinalizePending; other active planning and all active coding phases are rejected.",
             "inputSchema": {
                 "type": "object",
                 "properties": {

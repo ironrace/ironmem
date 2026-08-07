@@ -377,6 +377,11 @@ change.
 `draft` until the calling agent has submitted its own. This is enforced
 server-side, not by convention.
 
+Each draft keeps a collab issue to at most 15 execution tasks. If the scope
+credibly needs more, it proposes an independently executable child-issue split
+instead of one oversized plan. This applies to both the Claude and Codex draft
+workers.
+
 Exit: once both draft hashes are present → `PlanSynthesisPending`, owner
 the pilot (`current_owner`).
 
@@ -391,6 +396,11 @@ containing the merged plan: `collab-turn-plan-synthesis.md` when
 This phase is autonomous. Neither agent enters Plan Mode and neither asks for
 approval here; the single planning gate is the dispatcher's, at `PlanLocked`,
 two phases later.
+
+The synthesis worker also keeps the canonical plan to at most 15 execution
+tasks for either pilot. If merging the drafts reveals a larger scope, it
+organizes the canonical plan around independently executable child issues
+instead of forwarding an oversized plan into finalization.
 
 Exit → `PlanCodexReviewPending`, owner the copilot (`current_owner`).
 
@@ -435,10 +445,13 @@ contain 1–15 tasks. If it would need 16 or more, stop before sending `final`
 — that send, not the later `PlanLocked` gate, is the point of no return:
 once `PlanLocked` is reached the plan is immutable, and an oversized
 `task_list` is rejected on the `> 15` task-count check with `collab_end` as
-the only exit. Split larger work into independently executable child issues
-before sending `final`, never at the gate.
+the only exit. The current-owner finalizer calls `collab_end` before returning
+a blocker that identifies the independently executable child-issue split;
+never leave an oversized plan parked in finalization or defer the split to the
+gate.
 
-Exit → `PlanLocked` (always). Planning is done.
+Exit → `PlanLocked` after a valid `final`, or session ended when the current
+owner aborts an unfinalizable plan before `final`.
 
 ### `PlanLocked`
 
@@ -1249,16 +1262,20 @@ plan around them.
 
 ### `collab_end`
 
-Ends a session. Valid **only** from one of three phases:
+Ends a session. Valid **only** from one of four phase paths:
 
+- `PlanClaudeFinalizePending`, by `current_owner` only, when the finalizer
+  cannot stage a valid bounded plan,
 - `PlanLocked` pre-`task_list` (the user abandons the plan before coding),
 - `CodingComplete` (post-PR),
 - `CodingFailed` (after `failure_report`).
 
-**Rejected** during any active planning phase (`PlanParallelDrafts` through
-`PlanClaudeFinalizePending`) or coding-active phase (`CodeImplementPending`
-through `CodeReviewFinalPending`). This prevents either agent from killing
-a session the counterpart is still working in.
+**Rejected** during the other active planning phases (`PlanParallelDrafts`
+through `PlanCodexReviewPending`) or any coding-active phase
+(`CodeImplementPending` through `CodeReviewFinalPending`). A non-owner is also
+rejected in `PlanClaudeFinalizePending`. These rules prevent either agent from
+killing a session the counterpart is still working in while giving the
+finalizer a clean exit for oversized or otherwise unfinalizable plans.
 
 Idempotent once allowed: calling from a terminal phase or an
 already-ended session is a no-op, and subsequent `send`, `ack`, `approve`,
@@ -1952,8 +1969,12 @@ dispatched (see `.claude-plugin/commands/collab.md` § v3 Bridge, step 0):
    re-authors: if the artifact cannot be fetched, the submit worker does not
    send the protocol topic at all. For `final_review` (coding-active) it
    sends a `failure_report`; for the v1 `final` planning topic the state
-   machine rejects `failure_report`, so it aborts with a `blocker:` verdict
-   instead.
+   machine rejects `failure_report`, so the current-owner submit worker calls
+   `collab_end` and aborts with a `blocker:` verdict instead.
+   **A finalization `blocker:` is terminal: the worker must have ended the
+   session** with `collab_end` before returning it. The orchestrator verifies
+   `ended_at`, reports the blocker and child-issue split, and exits; it never
+   re-dispatches finalization or sends `final` on that path.
 2. **Orchestrator gate**, at `PlanLocked`, surfaces ONLY
    `drawer_id + plan_file_path + summary` for the user's approval — never the
    full plan body.

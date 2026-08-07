@@ -1676,19 +1676,30 @@ pub(super) fn handle_collab_end(app: &App, args: &Value) -> Result<Value, Memory
             agent,
             super::handoff::opt_handoff_token(args).as_deref(),
         )?;
-        // collab_end is valid only from PlanLocked (pre-task_list), or from
-        // the two v3 terminal phases. Rejecting during any active planning
-        // or coding phase prevents either agent from killing a session the
-        // counterpart is still working in.
+        // PlanFinalizePending has one narrow abort path: the current owner may
+        // end a plan that cannot be finalized (for example, because it needs
+        // more than the bounded task budget). The owner check prevents the
+        // counterpart from killing an in-flight finalization turn. The other
+        // endable phases are PlanLocked (pre-task_list) and the two v3
+        // terminal phases.
         let record = crate::collab::queue::load_session_record(tx, session_id)?;
         let session = record.session;
+        if session.phase == Phase::PlanFinalizePending && agent != session.current_owner {
+            return Err(MemoryError::Validation(format!(
+                "collab_end from PlanClaudeFinalizePending requires current owner {}; got {}",
+                session.current_owner, agent
+            )));
+        }
         let allowed = matches!(
             session.phase,
-            Phase::PlanLocked | Phase::CodingComplete | Phase::CodingFailed
+            Phase::PlanFinalizePending
+                | Phase::PlanLocked
+                | Phase::CodingComplete
+                | Phase::CodingFailed
         );
         if !allowed {
             return Err(MemoryError::Validation(format!(
-                "collab_end rejected in active phase {}; end is only valid from PlanLocked (pre-task_list), CodingComplete, or CodingFailed",
+                "collab_end rejected in active phase {}; end is only valid from PlanClaudeFinalizePending (by the current owner), PlanLocked (pre-task_list), CodingComplete, or CodingFailed",
                 session.phase
             )));
         }
@@ -1708,7 +1719,8 @@ pub(super) fn handle_collab_end(app: &App, args: &Value) -> Result<Value, Memory
     })?;
 
     // Operator attestation (METRICS_SPEC §12 amendment): the operator ends a
-    // CodingComplete session after the PR lands, or abandons a PlanLocked one.
+    // CodingComplete session after the PR lands, or abandons a pre-coding
+    // session during finalization / after the plan locks.
     if crate::search::tunables::metrics_enabled() {
         let now = crate::metrics::now_rfc3339();
         let attested = match phase {
@@ -1716,7 +1728,7 @@ pub(super) fn handle_collab_end(app: &App, args: &Value) -> Result<Value, Memory
                 app.db
                     .mark_task_outcome_done(session_id, None, Some("merged"), None)
             }
-            Phase::PlanLocked => {
+            Phase::PlanFinalizePending | Phase::PlanLocked => {
                 app.db
                     .mark_task_outcome_done(session_id, Some(&now), Some("abandoned"), None)
             }
@@ -1894,15 +1906,20 @@ mod tests {
         .unwrap()
     }
 
+    /// Drive v1 planning to the pilot-owned finalization phase.
+    fn drive_to_plan_finalize_pending(app: &crate::mcp::app::App, sid: &str) {
+        send(app, sid, "claude", "draft", "claude draft");
+        send(app, sid, "codex", "draft", "codex draft");
+        send(app, sid, "claude", "canonical", "canonical plan");
+        send(app, sid, "codex", "review", r#"{"verdict":"approve"}"#);
+    }
+
     /// Drive v1 planning to PlanLocked and return the final_plan_hash that
     /// must be used in the subsequent task_list payload.
     fn drive_to_plan_locked(app: &crate::mcp::app::App, sid: &str) -> String {
         let plan_text = "final plan";
         let final_plan_hash = super::super::shared::sha256_hex(plan_text);
-        send(app, sid, "claude", "draft", "claude draft");
-        send(app, sid, "codex", "draft", "codex draft");
-        send(app, sid, "claude", "canonical", "canonical plan");
-        send(app, sid, "codex", "review", r#"{"verdict":"approve"}"#);
+        drive_to_plan_finalize_pending(app, sid);
         send(
             app,
             sid,
@@ -2134,6 +2151,45 @@ mod tests {
             "collab_end from PlanLocked must mark abandoned"
         );
         assert!(row.done_at.is_some(), "abandoned must set done_at");
+    }
+
+    #[test]
+    fn collab_end_from_plan_finalize_pending_lets_owner_abort_oversized_plan() {
+        let _g = metrics_on_guard();
+        let app = test_app();
+        let sid = start_session(&app);
+        drive_to_plan_finalize_pending(&app, &sid);
+
+        handle_collab_end(&app, &json!({"session_id": sid, "agent": "claude"})).unwrap();
+
+        let record = app.db.collab_load_session_record(&sid).unwrap();
+        assert!(
+            record.ended_at.is_some(),
+            "oversized plan abort must end session"
+        );
+        let row = app.db.get_task_outcome(&sid).unwrap().unwrap();
+        assert_eq!(row.outcome.as_deref(), Some("abandoned"));
+        assert!(
+            row.done_at.is_some(),
+            "oversized plan abort must finish outcome"
+        );
+    }
+
+    #[test]
+    fn collab_end_from_plan_finalize_pending_rejects_non_owner() {
+        let app = test_app();
+        let sid = start_session(&app);
+        drive_to_plan_finalize_pending(&app, &sid);
+
+        let err =
+            handle_collab_end(&app, &json!({"session_id": sid, "agent": "codex"})).unwrap_err();
+
+        assert!(
+            err.to_string().contains(
+                "collab_end from PlanClaudeFinalizePending requires current owner claude"
+            ),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]

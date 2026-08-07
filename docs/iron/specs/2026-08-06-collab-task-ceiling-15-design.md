@@ -26,8 +26,8 @@ Changing only `/evaluate-issue` would create a broken contract: the router could
 - Making the task ceiling configurable at runtime.
 - Changing how task independence, acceptance criteria, task ordering, or timeboxes are judged.
 - Changing the DIRECT, IRON, or COLLAB routing criteria other than the mandatory SPLIT boundary.
-- Reworking existing issue #250 findings, authorization policy, state-machine behavior, or review semantics.
-- Migrating persisted data; task-list JSON already stores a count and array without a schema-bound maximum.
+- Reworking existing issue #250 findings, authorization policy, or review semantics beyond the narrow finalization-abort path required to avoid stranding an oversized plan.
+- Migrating persisted data; task-list JSON stores the `tasks` array without a schema-bound maximum, and task cardinality is derived from that array at runtime rather than persisted separately.
 
 ## Architecture
 

@@ -91,9 +91,11 @@ Do NOT send the protocol topic. The valid recovery depends on the phase:
   topic="failure_report", content=<JSON {"coding_failure":
   "approved_artifact_unfetchable:<$ARTIFACT_REF>"}>)` and stop.
 - `$TOPIC == final` (v1 planning phase): the state machine
-  REJECTS `failure_report` in these phases. Do NOT send anything — ABORT and
-  describe the problem on the verdict's blocker line (e.g.
-  "artifact unfetchable `<$ARTIFACT_REF>`; cannot send final").
+  REJECTS `failure_report` in these phases. Because state discovery already
+  verified that `$SENDER == current_owner`, call
+  `collab_end(session_id=$SESSION_ID, agent="$SENDER")` before returning the
+  blocker, then ABORT without sending `final` (e.g. "artifact unfetchable
+  `<$ARTIFACT_REF>`; session ended without final").
 
 ## Verdict
 Return EXACTLY these ≤3 lines, nothing else:

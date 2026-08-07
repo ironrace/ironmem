@@ -535,6 +535,12 @@ TASK_BUDGET_SURFACE_CONTRACTS = {
         "capped at 15 execution tasks",
         "credibly needs 16 or more",
     ],
+    PROMPTS / "collab-turn-plan-draft.md": [
+        "at most 15 execution tasks",
+    ],
+    PROMPTS / "collab-turn-plan-synthesis.md": [
+        "at most 15 execution tasks",
+    ],
     PROMPTS / "collab-turn-plan-finalize.md": [
         "at most 15 tasks",
         "needs 16 or more",
@@ -574,6 +580,38 @@ TASK_BUDGET_SURFACE_CONTRACTS = {
     ROOT / ".codex-plugin" / "prompts" / "collab-task-list.md": [
         "at most 15",
         "more than 15 tasks",
+    ],
+}
+# Most positive phrases occur once, so changing their number removes the sole
+# required match. These four phrases are deliberately repeated in their live
+# surface; pin their exact cardinality so changing only one copy to any wrong
+# value (not just the legacy 10/11 boundary) cannot hide behind another copy.
+TASK_BUDGET_SURFACE_CONTRACT_COUNTS = {
+    (DOC, "more than 15 tasks"): 3,
+    (EVALUATE_ISSUE_DOC, "1–15 task estimate"): 2,
+    (EVALUATE_ISSUE_CLAUDE, "1–15 task estimate"): 2,
+    (EVALUATE_ISSUE_CODEX, "1–15 task estimate"): 2,
+}
+FINALIZE_ABORT_SURFACE_CONTRACTS = {
+    PROMPTS / "collab-turn-plan-finalize.md": [
+        "any blocker that prevents staging a valid final plan must call "
+        "`collab_end(session_id=$SESSION_ID, agent=\"claude\")` exactly once",
+    ],
+    ROOT / ".codex-plugin" / "prompts" / "collab-plan-finalize.md": [
+        "any blocker that prevents staging a valid final plan must call "
+        "`collab_end(session_id, agent=\"codex\")` exactly once",
+    ],
+    PROMPTS / "collab-turn-submit.md": [
+        "call `collab_end(session_id=$SESSION_ID, agent=\"$SENDER\")` "
+        "before returning the blocker",
+    ],
+    COMMAND: [
+        "A finalization `blocker:` is terminal: the worker must have ended "
+        "the session",
+    ],
+    DOC: [
+        "A finalization `blocker:` is terminal: the worker must have ended "
+        "the session",
     ],
 }
 # Positive pins alone cannot detect one stale occurrence when the same current
@@ -756,9 +794,17 @@ def check_task_budget_surface_contracts() -> None:
             continue
         body = live_text(path)
         for snippet in snippets:
-            if not flex(snippet).search(body):
+            match_count = len(flex(snippet).findall(body))
+            if match_count == 0:
                 err(f"{path.relative_to(ROOT)}: missing task-budget contract "
                     f"{snippet!r}")
+                continue
+            expected_count = TASK_BUDGET_SURFACE_CONTRACT_COUNTS.get(
+                (path, snippet), 1)
+            if match_count != expected_count:
+                err(f"{path.relative_to(ROOT)}: task-budget contract "
+                    f"{snippet!r} expected {expected_count} occurrences, "
+                    f"found {match_count}")
         for pattern_name, pattern in STALE_TASK_BUDGET_PATTERNS:
             for match in pattern.finditer(body):
                 stale_text = " ".join(match.group(0).split())
@@ -774,6 +820,19 @@ def check_task_budget_surface_contracts() -> None:
     elif not flex(enforcement).search(bridge):
         err(".claude-plugin/commands/collab.md: PlanLocked bridge is missing "
             f"task-budget enforcement {enforcement!r}")
+
+
+def check_finalize_abort_contracts() -> None:
+    """An unfinalizable bounded plan must end, never strand the start slot."""
+    for path, snippets in FINALIZE_ABORT_SURFACE_CONTRACTS.items():
+        if not path.exists():
+            err(f"{path.relative_to(ROOT)}: missing finalize-abort surface")
+            continue
+        body = live_text(path)
+        for snippet in snippets:
+            if not flex(snippet).search(body):
+                err(f"{path.relative_to(ROOT)}: missing finalize-abort contract "
+                    f"{snippet!r}")
 
 
 def check_review_diff_fallback_contract() -> None:
@@ -1006,7 +1065,7 @@ DISPATCH_FAILURE_ADMISSIBILITY_SNIPPETS = [
     "additionally requires `dispatch_failure_phase_admits`\n"
     "        (`crates/ironmem/src/collab/mod.rs`), which returns `false` "
     "for both —",
-    "**Every other phase:** as in condition 5 — the planning phases are",
+    "**Every other phase:** as in condition 6 — the planning phases are",
 ]
 DOC_PR_BASE_SNIPPETS = [
     "does **not** require that branch to contain `base_sha`",
@@ -3149,6 +3208,7 @@ def main() -> int:
     check_no_uninstalled_skill_references()
     check_evaluate_issue_surfaces()
     check_task_budget_surface_contracts()
+    check_finalize_abort_contracts()
     check_review_diff_fallback_contract()
     check_reset_guards()
     check_review_range_after_recovery()

@@ -442,6 +442,15 @@ loop:
   loop
 ```
 
+**A finalization `blocker:` is terminal: the worker must have ended the
+session** from `PlanClaudeFinalizePending` before returning it. Re-read
+`collab_status` and require `ended_at` to be non-null, then report the blocker
+and the independently executable child-issue split to the user and exit the
+dispatch loop. Never dispatch `final`, re-dispatch the finalize worker, or
+fall through to another loop iteration. If the worker reported a blocker but
+the session is not ended, surface that protocol error and exit rather than
+retrying.
+
 **`pilot`/`copilot` are bound once, at the top of the iteration, from the
 same `collab_status` read that yields `phase` and `current_owner`.** Every
 dispatch decision made during that iteration — which worker template to
@@ -597,7 +606,7 @@ Repeat the dispatch loop with these actions:
 | `PlanParallelDrafts` | The draft worker (`collab-turn-plan-draft.md`, planning/opus) was already dispatched from the `start` branch. is_my_turn should be false here — if true, verify with `collab_status`. If `collab_status` confirms Claude is the owner in a Codex-owned phase, this is a protocol-level anomaly — exit the loop and report to the user; do not attempt a send. |
 | `PlanSynthesisPending` | Dispatch `collab-turn-plan-synthesis.md` (planning/opus) autonomously. It merges both blind drafts and sends `topic="canonical"` directly. Do not enter Plan Mode here; the single human planning gate is the dispatcher's and fires at `PlanLocked` (see **§ v3 Bridge**, step 0). `draft` and `canonical` are the only v1 topics that are NOT JSON-wrapped. Ingest only the ≤3-line verdict; loop. |
 | `PlanCodexReviewPending` | Owner depends on `pilot` — the server gates this phase on the **copilot**, not on Codex (`require_actor(actor, copilot(session))` in `crates/ironmem/src/collab/state_machine/mod.rs`), and the phase label is the frozen wire name, not an owner claim. Read `current_owner` from `collab_status`. **`current_owner == "codex"`** (`pilot == "claude"`, the default): Codex's turn. is_my_turn should be false — if true, verify with `collab_status`. If the inconsistency persists, exit the loop and report to the user. **`current_owner == "claude"`** (`pilot == "codex"`, so Claude is the copilot): this is Claude's legitimate turn, not a protocol anomaly — dispatch the matrix worker `collab-turn-plan-review.md` (review/opus), ingest only its ≤3-line verdict, and loop. **Review cap:** the server enforces `MAX_REVIEW_ROUNDS = 1` at `crates/ironmem/src/collab/state_machine/mod.rs:28`. The copilot gets exactly one plan-review pass; after that review the server transitions to `PlanClaudeFinalizePending` regardless of verdict (`approve`, `approve_with_minor_edits`, or `request_changes` all map to the same next phase). Do not model v1 as open-ended iteration or return to synthesis. |
-| `PlanClaudeFinalizePending` | **No human gate here — this turn is autonomous.** The single human planning gate is the dispatcher's, and it fires one phase later, at `PlanLocked` before the bridge dispatches `task_list` (see **§ v3 Bridge**, step 0). Rationale: a `codex exec` one-shot cannot prompt a human, so only the dispatcher can own a human gate, and under `pilot == "codex"` this finalize turn belongs to Codex. Under reference-only gates, dispatch `collab-turn-plan-finalize.md` (planning/opus), which incorporates Codex's one review pass and produces the final iron-build-compatible task markdown in `docs/iron/plans/...`. Every `### Task N:` must be sized for 20 minutes or less and the plan must contain at most 15 tasks. If it would need 16 or more, stop before sending `final` — that send, not the later `PlanLocked` gate, is the point of no return: once `PlanLocked` is reached the plan is immutable and bridge step 2 rejects an oversized `task_list` on the `> 15` task-count check, wedging the session with `collab_end` as the only exit — and split the work into independently executable child issues; never merge unrelated work or drop acceptance criteria to evade the limit. The worker stages `{"plan": "<exact markdown>"}` in a drawer and returns `{drawer_id, file path, ≤3-line summary}`; retain ONLY ref+path+summary (never the full body) and carry them to the dispatcher's `PlanLocked` gate. Composition is pilot-generic — under `pilot == "claude"` this worker (`collab-turn-plan-finalize.md`) both composes and stages the drawer as just described; under `pilot == "codex"`, Codex composes and stages the equivalent drawer itself via its own `collab-plan-finalize.md` prompt (incorporates the copilot's review notes, saves the plan file, stages `{"plan": "<exact markdown>"}`, and sends nothing) — v1 planning does have a real pilot split here, matching `.codex-plugin/prompts/collab-plan-finalize.md`. Either way, the orchestrator reads `current_owner` from `collab_status` (confirming `final` is the topic authorized for this phase) and dispatches `collab-turn-submit.md` (mechanical/sonnet) with `$TOPIC=final` `$ARTIFACT_REF=<drawer_id>` `$SENDER=<collab_status.current_owner>` to send `topic="final"` (v1 `final` is the only v1 topic wrapped in JSON); drawer immutability is the integrity anchor. Normally `current_owner == pilot` here. The v3 recovery-owner substitution described in the pre-send harness recovery override in step 0 of the **Pre-send Harness Sequence (Claude-owned v3 turns)** and in the `CodeReviewLocalPending`/`CodeReviewFinalPending` recovery row in the **Codex dispatch tuning matrix** does **not** apply to this phase: `pending_failure`/`FailureReport` handling is gated to coding-active phases (`Phase::is_coding_active()`), and `PlanClaudeFinalizePending` is not one of them, so `$SENDER` always resolves to the pilot here — there is no in-flight recovery-owner case to substitute. After send, `PlanLocked` is reached. Ingest only the ≤3-line verdict; loop. |
+| `PlanClaudeFinalizePending` | **No human gate here — this turn is autonomous.** The single human planning gate is the dispatcher's, and it fires one phase later, at `PlanLocked` before the bridge dispatches `task_list` (see **§ v3 Bridge**, step 0). Rationale: a `codex exec` one-shot cannot prompt a human, so only the dispatcher can own a human gate, and under `pilot == "codex"` this finalize turn belongs to Codex. Under reference-only gates, dispatch `collab-turn-plan-finalize.md` (planning/opus), which incorporates Codex's one review pass and produces the final iron-build-compatible task markdown in `docs/iron/plans/...`. Every `### Task N:` must be sized for 20 minutes or less and the plan must contain at most 15 tasks. If it would need 16 or more, stop before sending `final` — that send, not the later `PlanLocked` gate, is the point of no return: once `PlanLocked` is reached the plan is immutable and bridge step 2 rejects an oversized `task_list` on the `> 15` task-count check. The current-owner worker must call `collab_end` before returning a blocker that names the independently executable child-issue split; never merge unrelated work or drop acceptance criteria to evade the limit. The worker stages `{"plan": "<exact markdown>"}` in a drawer and returns `{drawer_id, file path, ≤3-line summary}`; retain ONLY ref+path+summary (never the full body) and carry them to the dispatcher's `PlanLocked` gate. Composition is pilot-generic — under `pilot == "claude"` this worker (`collab-turn-plan-finalize.md`) both composes and stages the drawer as just described; under `pilot == "codex"`, Codex composes and stages the equivalent drawer itself via its own `collab-plan-finalize.md` prompt (incorporates the copilot's review notes, saves the plan file, stages `{"plan": "<exact markdown>"}`, and sends nothing) — v1 planning does have a real pilot split here, matching `.codex-plugin/prompts/collab-plan-finalize.md`. Either way, on success the orchestrator reads `current_owner` from `collab_status` (confirming `final` is the topic authorized for this phase) and dispatches `collab-turn-submit.md` (mechanical/sonnet) with `$TOPIC=final` `$ARTIFACT_REF=<drawer_id>` `$SENDER=<collab_status.current_owner>` to send `topic="final"` (v1 `final` is the only v1 topic wrapped in JSON); drawer immutability is the integrity anchor. Normally `current_owner == pilot` here. The v3 recovery-owner substitution described in the pre-send harness recovery override in step 0 of the **Pre-send Harness Sequence (Claude-owned v3 turns)** and in the `CodeReviewLocalPending`/`CodeReviewFinalPending` recovery row in the **Codex dispatch tuning matrix** does **not** apply to this phase: `pending_failure`/`FailureReport` handling is gated to coding-active phases (`Phase::is_coding_active()`), and `PlanClaudeFinalizePending` is not one of them, so `$SENDER` always resolves to the pilot here — there is no in-flight recovery-owner case to substitute. After a successful send, `PlanLocked` is reached and the loop continues. On a blocker, apply the terminal finalization-blocker rule and exit. |
 
 Rationale: blind drafts, synthesis, the copilot's single review and the
 `final` send itself all run autonomously. The final task plan is the commit
@@ -1267,14 +1276,23 @@ f. **Event-driven wait loop** — the dispatcher's interactive surface during
       that blew the recovery retry ceiling). **ABORT** — surface failure to
       user, exit the dispatcher loop.
 
-   4. `collab_status.phase` is unchanged, `pilot == "codex"`,
+   4. A clean Codex-pilot compose process exits in
+      `PlanClaudeFinalizePending` with a non-`none` `blocker:` verdict and the
+      refreshed status has `ended_at` set → this is a **normal finalization
+      abort**, not a dispatch failure. Apply the terminal finalization-blocker
+      rule above: report the blocker and child-issue split, then exit the
+      dispatcher loop. Do not re-dispatch Codex, dispatch the submit worker,
+      or emit `codex_dispatch_failed:`. A blocker without an ended session is
+      a protocol error that needs manual intervention, not a retry path.
+
+   5. `collab_status.phase` is unchanged, `pilot == "codex"`,
       `pending_failure` is null, `current_owner == "codex"`, and a clean
       Codex-pilot compose process exits in `PlanClaudeFinalizePending` or
       `CodeReviewFinalPending` with a non-empty `ref: <drawer_id>` verdict →
       this is a **normal compose
       handoff**, not a dispatch failure. The compose prompts intentionally
       stage a drawer and send nothing, so no phase advance is expected.
-      Validate that the verdict has `blocker: none`, retain only its drawer
+      The verdict has `blocker: none`; retain only its drawer
       ref and short summary, and refresh `collab_status` immediately before
       the submit worker:
       - In `PlanClaudeFinalizePending`, retain only the ref, file path, and
@@ -1292,10 +1310,11 @@ f. **Event-driven wait loop** — the dispatcher's interactive surface during
       The Claude worker physically performs the submit/PR-create operation,
       but `$SENDER` remains the Codex pilot's current protocol identity. Do
       not re-dispatch the compose prompt, and do not emit
-      `codex_dispatch_failed:` for this success path. A missing ref, blocker,
-      nonzero exit, or changed status remains a real dispatch failure.
+      `codex_dispatch_failed:` for this success path. A missing ref, nonzero
+      exit, or changed status remains a real dispatch failure; condition 4
+      handles a blocker separately.
 
-   5. Bash background process exits (BashOutput shows "exit code N" or
+   6. Bash background process exits (BashOutput shows "exit code N" or
       process is no longer running) AND no phase advance observed →
       Codex CLI failed silently. **ERROR.**
       - Capture the last 50 lines from `/tmp/codex-out-${session_id}.log`.
@@ -1330,8 +1349,8 @@ f. **Event-driven wait loop** — the dispatcher's interactive surface during
       `codex_dispatch_failed:` is the ONLY off-turn-admissible prefix Claude
       may use against a Codex-owned turn, and it classifies **Tooling**
       (recoverable) — so in the dispatch-failure-admitting phases above,
-      conditions 5 and 6 hand recovery to Claude rather than aborting the
-      session (condition 4 is a success path and emits no
+      conditions 6 and 7 hand recovery to Claude rather than aborting the
+      session (condition 5 is a success path and emits no
       `codex_dispatch_failed:` at all). In every other phase there is no
       protocol escape at all: the report is rejected, so the only correct
       action is to exit and surface the stall to a human. The server admits
@@ -1339,7 +1358,7 @@ f. **Event-driven wait loop** — the dispatcher's interactive surface during
       prefix, or any other prefix (`branch_drift:` aside, which is terminal),
       is rejected off-turn.
 
-   6. Wall time exceeds 600 seconds (configurable) →
+   7. Wall time exceeds 600 seconds (configurable) →
       **HANG.**
       - Kill the Bash background process via `KillShell`.
       - **Dispatch-failure-admitting phases only** (`CodeImplementPending`
@@ -1349,7 +1368,7 @@ f. **Event-driven wait loop** — the dispatcher's interactive surface during
           content=<JSON {"coding_failure":"codex_dispatch_failed: codex exec exceeded the 600s hang timeout with no phase advance"}>)`.
         Read `collab_status` again, then exit the wait loop via condition 2
         (recovery handed to Claude) or condition 3 (retry ceiling exceeded).
-      - **Every other phase:** as in condition 5 — the planning phases are
+      - **Every other phase:** as in condition 6 — the planning phases are
         rejected by `Phase::is_coding_active()`, and `CodeReviewLocalPending` /
         `CodeReviewFinalPending` are rejected by
         `dispatch_failure_phase_admits` despite being coding-active. Do not
@@ -1409,14 +1428,16 @@ Role-keyed **prose** about them may change freely; the literals may not,
 anywhere they act as wire values — `preconditions:` lines, dispatch-matrix row
 keys, and state checks.
 
-- **Never** call `mcp__ironmem__collab_end` during any active phase. Rejected in:
-  - v1 active: `PlanParallelDrafts`, `PlanSynthesisPending`,
-    `PlanCodexReviewPending`, `PlanClaudeFinalizePending`.
+- **Never** call `mcp__ironmem__collab_end` during an active phase except for
+  the current-owner finalization-abort rule. Rejected in:
+  - v1 active: `PlanParallelDrafts`, `PlanSynthesisPending`, and
+    `PlanCodexReviewPending`.
   - v3 active: `CodeImplementPending`, `CodeReviewFixGlobalPending`,
     `CodeReviewLocalPending`, `CodeReviewFinalPending`.
 
-  Only valid from `PlanLocked` pre-`task_list` (abandon plan), `CodingComplete`,
-  or `CodingFailed`.
+  Valid from `PlanClaudeFinalizePending` only when called by its current owner
+  to abort an unfinalizable plan; otherwise valid from `PlanLocked`
+  pre-`task_list` (abandon plan), `CodingComplete`, or `CodingFailed`.
 - **Never** peek at Codex's draft before sending your own during
   `PlanParallelDrafts`. The server enforces blind-draft in `recv`.
 - **Duplicate-session guard.** `collab_start` / `collab_start_code_review`
