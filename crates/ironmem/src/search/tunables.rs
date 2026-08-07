@@ -20,6 +20,13 @@ fn env_f32(name: &str, default: f32) -> f32 {
         .unwrap_or(default)
 }
 
+fn env_nonnegative_finite_f32(name: &str, default: f32) -> f32 {
+    match std::env::var(name).ok().and_then(|s| s.parse::<f32>().ok()) {
+        Some(value) if value.is_finite() && value >= 0.0 => value,
+        _ => default,
+    }
+}
+
 fn env_usize(name: &str, default: usize) -> usize {
     std::env::var(name)
         .ok()
@@ -46,7 +53,7 @@ pub fn max_overfetch() -> usize {
 /// RRF k constant (Cormack et al. 2009 default: 60).
 pub fn rrf_k() -> f32 {
     static V: OnceLock<f32> = OnceLock::new();
-    *V.get_or_init(|| env_f32("IRONMEM_RRF_K", 60.0))
+    *V.get_or_init(|| env_nonnegative_finite_f32("IRONMEM_RRF_K", 60.0))
 }
 
 /// Minimum token count to fire the content-word query variant.
@@ -519,6 +526,11 @@ pub fn context_threshold_pair() -> ContextThresholds {
 #[cfg(test)]
 pub(crate) static KG_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+/// Serializes tests that mutate `IRONMEM_RRF_K`. The production accessor is
+/// OnceLock-cached, so these tests exercise its uncached parser directly.
+#[cfg(test)]
+pub(crate) static RRF_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// Serializes tests that mutate the `IRONMEM_PROMPT_HOOK_*`,
 /// `IRONMEM_PROMPT_RECALL_HYBRID`, and `IRONMEM_CONTEXT_*_PCT` env vars. These
 /// env vars are process-global and are read fresh by hook/tunable tests across
@@ -534,6 +546,35 @@ mod tests {
     // env lock so tests in other modules that flip `IRONMEM_METRICS` (e.g.
     // `mcp::server`) cannot clobber these.
     use crate::metrics::METRICS_ENV_LOCK;
+
+    #[test]
+    fn rrf_k_parser_accepts_only_finite_nonnegative_values() {
+        let _g = RRF_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        const DEFAULT: f32 = 60.0;
+
+        for valid in ["0", "42.5"] {
+            std::env::set_var("IRONMEM_RRF_K", valid);
+            assert_eq!(
+                env_nonnegative_finite_f32("IRONMEM_RRF_K", DEFAULT),
+                valid.parse::<f32>().unwrap()
+            );
+        }
+
+        for invalid in ["not-a-number", "NaN", "inf", "-inf", "-0.1"] {
+            std::env::set_var("IRONMEM_RRF_K", invalid);
+            assert_eq!(
+                env_nonnegative_finite_f32("IRONMEM_RRF_K", DEFAULT),
+                DEFAULT,
+                "{invalid}"
+            );
+        }
+
+        std::env::remove_var("IRONMEM_RRF_K");
+        assert_eq!(
+            env_nonnegative_finite_f32("IRONMEM_RRF_K", DEFAULT),
+            DEFAULT
+        );
+    }
 
     #[test]
     fn prompt_hook_budget_defaults_and_overrides() {
