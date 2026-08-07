@@ -423,11 +423,14 @@ fn parse_search_ids(response: &[u8], limit: usize) -> Option<Vec<String>> {
 /// size: `expand_compact_value` materialises one object per row and clones
 /// every column key into each one, so a well-formed 1 MiB envelope carrying a
 /// single ~500 KB column key over ~260k rows expands to well over 100 GB. The
-/// row-count check below is what makes the frame cap an allocation bound — the
+/// row-count checks below are what make the frame cap an allocation bound — the
 /// client asked for `limit` (at most 10) rows, so a peer returning more is out
 /// of contract and treated as no vector result.
 fn validated_search_results(value: &serde_json::Value, limit: usize) -> Option<serde_json::Value> {
     let Some(envelope) = value.get("__compact_v1") else {
+        if value.as_array().is_some_and(|rows| rows.len() > limit) {
+            return None;
+        }
         return Some(value.clone());
     };
     let columns = envelope.get("columns")?.as_object()?;
@@ -612,7 +615,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn duplicate_ids_are_ordered_deduplicated_and_capped() {
+    fn duplicate_ids_are_ordered_and_deduplicated() {
         let response = search_response(serde_json::json!({
             "results": [
                 {"id": "first"},
@@ -623,9 +626,29 @@ mod tests {
         }));
 
         assert_eq!(
-            run_socket_fixture_with_limit(Some(response), 2),
-            Some(vec!["first".to_owned(), "second".to_owned()])
+            run_socket_fixture_with_limit(Some(response), 4),
+            Some(vec![
+                "first".to_owned(),
+                "second".to_owned(),
+                "third".to_owned()
+            ])
         );
+    }
+
+    /// Ordinary rows must obey the same request bound as compact rows before
+    /// they are cloned for parsing.
+    #[cfg(unix)]
+    #[test]
+    fn ordinary_row_count_above_the_requested_limit_is_rejected() {
+        let response = search_response(serde_json::json!({
+            "results": [
+                {"id": "first"},
+                {"id": "second"},
+                {"id": "third"}
+            ]
+        }));
+
+        assert_eq!(run_socket_fixture_with_limit(Some(response), 2), None);
     }
 
     #[cfg(unix)]
@@ -912,5 +935,45 @@ mod tests {
         let oversized = vec![b'x'; super::MAX_RESPONSE_BYTES + 1];
         assert_ne!(oversized.last(), Some(&b'\n'));
         assert_eq!(run_socket_fixture(Some(oversized)), None);
+    }
+
+    /// A daemon that writes only a response prefix must not keep prompt-hook
+    /// recall blocked past its absolute deadline.
+    #[cfg(unix)]
+    #[test]
+    fn partial_response_that_stalls_respects_the_absolute_deadline() {
+        use std::io::{BufRead, BufReader, Write};
+        use std::os::unix::net::UnixListener;
+        use std::sync::mpsc::channel;
+        use std::thread;
+        use std::time::{Duration, Instant};
+
+        let dir = tempfile::tempdir().unwrap();
+        let socket_path = dir.path().join("daemon.sock");
+        let listener = UnixListener::bind(&socket_path).unwrap();
+        let (release_tx, release_rx) = channel();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request_line = String::new();
+            BufReader::new(stream.try_clone().unwrap())
+                .read_line(&mut request_line)
+                .unwrap();
+            stream.write_all(b"{\"jsonrpc\":\"2.0\"").unwrap();
+            stream.flush().unwrap();
+            release_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        });
+
+        let deadline = Instant::now() + Duration::from_millis(75);
+        let started = Instant::now();
+        let ids = super::search_ids(&socket_path, "fixture query", 5, deadline);
+        let elapsed = started.elapsed();
+
+        assert_eq!(ids, None);
+        assert!(
+            elapsed < Duration::from_millis(200),
+            "stalled response exceeded its absolute deadline: {elapsed:?}"
+        );
+        release_tx.send(()).unwrap();
+        server.join().unwrap();
     }
 }
