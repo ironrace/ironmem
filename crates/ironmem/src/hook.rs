@@ -987,6 +987,11 @@ fn recall_block_from_qualifying(
                 return None;
             }
         };
+        let current_bm25_ids: Vec<String> = bm25_ids
+            .iter()
+            .filter(|id| fetched.contains_key(*id))
+            .cloned()
+            .collect();
         let valid_vector_ids: Vec<String> = vector_ids
             .iter()
             .filter(|id| fetched.contains_key(*id))
@@ -1011,16 +1016,16 @@ fn recall_block_from_qualifying(
             (ids, drawers)
         } else {
             let sparse_threshold = crate::search::tunables::bm25_sparse_threshold();
-            let bm25_weight = if bm25_ids.is_empty() {
+            let bm25_weight = if current_bm25_ids.is_empty() {
                 0.0
-            } else if bm25_ids.len() < sparse_threshold {
-                bm25_ids.len() as f32 / sparse_threshold as f32
+            } else if current_bm25_ids.len() < sparse_threshold {
+                current_bm25_ids.len() as f32 / sparse_threshold as f32
             } else {
                 1.0
             };
             let merged = crate::search::pipeline::rrf_merge_weighted(
                 &valid_vector_ids,
-                &bm25_ids,
+                &current_bm25_ids,
                 crate::search::tunables::rrf_k(),
                 bm25_weight,
             );
@@ -3549,6 +3554,106 @@ mod tests {
             .additional_context;
         assert!(context.contains("source=\"infra/lexical\""));
         assert!(!context.contains("source=\"infra/semantic\""));
+    }
+
+    #[test]
+    fn superseded_bm25_id_cannot_change_current_rrf_selection() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("memory.sqlite3");
+        let lexical = ("current lexical drawer", "infra", "lexical");
+        let stale_one = ("stale bm25 drawer one", "infra", "stale-one");
+        let stale_two = ("stale bm25 drawer two", "infra", "stale-two");
+        let successor = ("current replacement drawer", "infra", "replacement");
+        let bm25_one = ("current bm25 drawer one", "infra", "bm25-one");
+        let bm25_two = ("current bm25 drawer two", "infra", "bm25-two");
+        let bm25_three = ("current bm25 drawer three", "infra", "bm25-three");
+        let bm25_four = ("current bm25 drawer four", "infra", "bm25-four");
+        let vector_lead = ("semantic vector lead", "infra", "vector-lead");
+        let vector_candidate = ("semantic vector candidate", "infra", "vector-candidate");
+        seed_db_file(
+            &db_path,
+            &[
+                lexical,
+                stale_one,
+                stale_two,
+                successor,
+                bm25_one,
+                bm25_two,
+                bm25_three,
+                bm25_four,
+                vector_lead,
+                vector_candidate,
+            ],
+        );
+        let stale_one_id = generate_id(stale_one.0, stale_one.1, stale_one.2);
+        let stale_two_id = generate_id(stale_two.0, stale_two.1, stale_two.2);
+        let successor_id = generate_id(successor.0, successor.1, successor.2);
+        let lexical_id = generate_id(lexical.0, lexical.1, lexical.2);
+        let bm25_one_id = generate_id(bm25_one.0, bm25_one.1, bm25_one.2);
+        let bm25_two_id = generate_id(bm25_two.0, bm25_two.1, bm25_two.2);
+        let bm25_three_id = generate_id(bm25_three.0, bm25_three.1, bm25_three.2);
+        let bm25_four_id = generate_id(bm25_four.0, bm25_four.1, bm25_four.2);
+        let vector_lead_id = generate_id(vector_lead.0, vector_lead.1, vector_lead.2);
+        let vector_candidate_id =
+            generate_id(vector_candidate.0, vector_candidate.1, vector_candidate.2);
+        let db = crate::db::schema::Database::open(&db_path).unwrap();
+        db.exec_raw(&format!(
+            "UPDATE drawers SET superseded_by = '{successor_id}' WHERE id IN ('{stale_one_id}', '{stale_two_id}')"
+        ))
+        .unwrap();
+        let config = RecallConfig {
+            bm25_floor: 0.0,
+            max_hits: 2,
+            line_bytes: 120,
+            kg_enabled: false,
+            kg_max_triples: 0,
+            diary_enabled: false,
+            diary_max: 0,
+            diary_line_bytes: 120,
+        };
+        let vector_ids = vec![vector_lead_id, vector_candidate_id];
+        let with_stale = recall_block_from_qualifying(
+            &db,
+            "ignored",
+            &config,
+            vec![
+                (stale_one_id, 1.0),
+                (stale_two_id, 1.0),
+                (lexical_id.clone(), 1.0),
+                (bm25_one_id.clone(), 1.0),
+                (bm25_two_id.clone(), 1.0),
+                (bm25_three_id.clone(), 1.0),
+                (bm25_four_id.clone(), 1.0),
+            ],
+            Some(&vector_ids),
+        )
+        .unwrap();
+        let without_stale = recall_block_from_qualifying(
+            &db,
+            "ignored",
+            &config,
+            vec![
+                (lexical_id, 1.0),
+                (bm25_one_id, 1.0),
+                (bm25_two_id, 1.0),
+                (bm25_three_id, 1.0),
+                (bm25_four_id, 1.0),
+            ],
+            Some(&vector_ids),
+        )
+        .unwrap();
+
+        assert_eq!(
+            with_stale, without_stale,
+            "superseded BM25 rows must not shift current RRF selection or order"
+        );
+        let rooms = injected_source_rooms(&with_stale);
+        assert_eq!(rooms.len(), 2, "stale BM25 rows must not consume max_hits");
+        assert!(rooms.contains(&"lexical".to_string()));
+        assert!(rooms.contains(&"vector-lead".to_string()));
+        assert!(!rooms.contains(&"vector-candidate".to_string()));
+        assert!(!with_stale.contains("source=\"infra/stale-one\""));
+        assert!(!with_stale.contains("source=\"infra/stale-two\""));
     }
 
     #[cfg(unix)]
