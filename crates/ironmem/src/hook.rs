@@ -1899,17 +1899,35 @@ mod tests {
         std::env::remove_var("IRONMEM_PROMPT_RECALL_HYBRID");
         std::env::remove_var("IRONMEM_PROMPT_HOOK_HYBRID_BUDGET_MS");
         std::env::remove_var("IRONMEM_PROMPT_HOOK_HYBRID_LIMIT");
-        // Hybrid recall resolves its peer through `Config::daemon_socket_path`,
-        // which honors this var. `config.rs` sets it under its own `ENV_LOCK`,
-        // so a hybrid test that inherits it would talk to that path — or to a
-        // developer's live daemon — instead of its own tempdir fixture.
-        std::env::remove_var("IRONMEM_DAEMON_SOCKET");
         guard
     }
 
     /// Drop guard that removes prompt-hook tunables on scope exit, including on
     /// panic/unwind, so no value leaks to other ENV_MUTEX tests.
-    struct PromptHookEnvGuard;
+    struct PromptHookEnvGuard {
+        clear_daemon_socket: bool,
+    }
+
+    impl PromptHookEnvGuard {
+        /// Isolate a hybrid fixture from a configured daemon socket.
+        ///
+        /// Callers must hold `crate::config::ENV_LOCK` for this guard's entire
+        /// lifetime, including its drop cleanup.
+        fn new() -> Self {
+            std::env::remove_var("IRONMEM_DAEMON_SOCKET");
+            Self {
+                clear_daemon_socket: true,
+            }
+        }
+
+        /// Clean up prompt-hook tunables without touching config-owned env.
+        fn tunables_only() -> Self {
+            Self {
+                clear_daemon_socket: false,
+            }
+        }
+    }
+
     impl Drop for PromptHookEnvGuard {
         fn drop(&mut self) {
             std::env::remove_var("IRONMEM_PROMPT_HOOK_BUDGET_MS");
@@ -1919,8 +1937,25 @@ mod tests {
             std::env::remove_var("IRONMEM_PROMPT_RECALL_HYBRID");
             std::env::remove_var("IRONMEM_PROMPT_HOOK_HYBRID_BUDGET_MS");
             std::env::remove_var("IRONMEM_PROMPT_HOOK_HYBRID_LIMIT");
-            std::env::remove_var("IRONMEM_DAEMON_SOCKET");
+            if self.clear_daemon_socket {
+                std::env::remove_var("IRONMEM_DAEMON_SOCKET");
+            }
         }
+    }
+
+    #[test]
+    fn prompt_hook_env_guard_clears_daemon_socket_on_construction_and_drop() {
+        let _config_env = crate::config::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("IRONMEM_DAEMON_SOCKET", "/tmp/inherited-ironmem.sock");
+
+        let guard = PromptHookEnvGuard::new();
+        assert!(std::env::var_os("IRONMEM_DAEMON_SOCKET").is_none());
+
+        std::env::set_var("IRONMEM_DAEMON_SOCKET", "/tmp/test-ironmem.sock");
+        drop(guard);
+        assert!(std::env::var_os("IRONMEM_DAEMON_SOCKET").is_none());
     }
 
     #[test]
@@ -3360,7 +3395,7 @@ mod tests {
             .unwrap_or_else(|e| e.into_inner());
         let _env = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
         let _prompt = prompt_hook_tunable_defaults();
-        let _hybrid_env = PromptHookEnvGuard;
+        let _hybrid_env = PromptHookEnvGuard::new();
 
         assert_eq!(
             effective_hybrid_vector_budget(Duration::from_millis(
@@ -3511,7 +3546,7 @@ mod tests {
             .unwrap_or_else(|e| e.into_inner());
         let _env = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
         let _prompt = prompt_hook_tunable_defaults();
-        let _hybrid_env = PromptHookEnvGuard;
+        let _hybrid_env = PromptHookEnvGuard::new();
         std::env::set_var("IRONMEM_PROMPT_HOOK_BUDGET_MS", "200");
         std::env::set_var("IRONMEM_PROMPT_HOOK_HYBRID_BUDGET_MS", "40");
         std::env::set_var("IRONMEM_PROMPT_HOOK_KG", "false");
@@ -3572,7 +3607,7 @@ mod tests {
             .unwrap_or_else(|e| e.into_inner());
         let _env = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
         let _prompt = prompt_hook_tunable_defaults();
-        let _hybrid_env = PromptHookEnvGuard;
+        let _hybrid_env = PromptHookEnvGuard::new();
         std::env::set_var("IRONMEM_PROMPT_HOOK_BUDGET_MS", "200");
         std::env::set_var("IRONMEM_PROMPT_HOOK_HYBRID_BUDGET_MS", "40");
         std::env::set_var("IRONMEM_PROMPT_HOOK_KG", "false");
@@ -3614,7 +3649,7 @@ mod tests {
             .unwrap_or_else(|e| e.into_inner());
         let _env = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
         let _prompt = prompt_hook_tunable_defaults();
-        let _hybrid_env = PromptHookEnvGuard;
+        let _hybrid_env = PromptHookEnvGuard::new();
         std::env::set_var("IRONMEM_PROMPT_HOOK_BUDGET_MS", "200");
         std::env::set_var("IRONMEM_PROMPT_HOOK_HYBRID_BUDGET_MS", "40");
         std::env::set_var("IRONMEM_PROMPT_HOOK_KG", "false");
@@ -3664,7 +3699,7 @@ mod tests {
             .unwrap_or_else(|e| e.into_inner());
         let _env = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
         let _prompt = prompt_hook_tunable_defaults();
-        let _hybrid_env = PromptHookEnvGuard;
+        let _hybrid_env = PromptHookEnvGuard::new();
         std::env::set_var("IRONMEM_PROMPT_HOOK_BUDGET_MS", "200");
         std::env::set_var("IRONMEM_PROMPT_HOOK_HYBRID_BUDGET_MS", "40");
         std::env::set_var("IRONMEM_PROMPT_HOOK_MAX_HITS", "1");
@@ -3832,7 +3867,7 @@ mod tests {
             .unwrap_or_else(|e| e.into_inner());
         let _env = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
         let _prompt = prompt_hook_tunable_defaults();
-        let _hybrid_env = PromptHookEnvGuard;
+        let _hybrid_env = PromptHookEnvGuard::new();
         std::env::set_var("IRONMEM_PROMPT_HOOK_BUDGET_MS", "200");
         std::env::set_var("IRONMEM_PROMPT_HOOK_HYBRID_BUDGET_MS", "40");
         std::env::set_var("IRONMEM_PROMPT_HOOK_MAX_HITS", "3");
@@ -3891,7 +3926,7 @@ mod tests {
             .unwrap_or_else(|e| e.into_inner());
         let _env = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
         let _prompt = prompt_hook_tunable_defaults();
-        let _hybrid_env = PromptHookEnvGuard;
+        let _hybrid_env = PromptHookEnvGuard::new();
         std::env::set_var("IRONMEM_PROMPT_HOOK_BUDGET_MS", "200");
         std::env::set_var("IRONMEM_PROMPT_HOOK_HYBRID_BUDGET_MS", "40");
         std::env::set_var("IRONMEM_PROMPT_HOOK_MAX_HITS", "1");
@@ -3944,7 +3979,7 @@ mod tests {
         // budget. At the 150ms default a loaded CI runner can spend the whole
         // budget on recall scheduling alone and bank no row, so this asserts a
         // race rather than the contract. Pin the budget to the 1000ms cap.
-        let _budget = PromptHookEnvGuard;
+        let _budget = PromptHookEnvGuard::tunables_only();
         std::env::set_var("IRONMEM_PROMPT_HOOK_BUDGET_MS", "1000");
 
         let dir = tempfile::tempdir().unwrap();
@@ -3990,7 +4025,7 @@ mod tests {
         // sample is skipped when less than the reserve remains, which a loaded
         // runner reaches at the 150ms default. Pin it so this asserts the
         // ReadOnly decoupling contract and not the scheduler.
-        let _budget = PromptHookEnvGuard;
+        let _budget = PromptHookEnvGuard::tunables_only();
         std::env::set_var("IRONMEM_PROMPT_HOOK_BUDGET_MS", "1000");
 
         let dir = tempfile::tempdir().unwrap();
@@ -4201,7 +4236,7 @@ mod tests {
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         std::env::set_var("IRONMEM_PROMPT_HOOK_BUDGET_MS", "150");
-        let _budget_guard = PromptHookEnvGuard;
+        let _budget_guard = PromptHookEnvGuard::tunables_only();
 
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("m.sqlite3");
