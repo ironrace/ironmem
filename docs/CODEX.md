@@ -454,7 +454,7 @@ The database is kept up to date automatically through hooks:
 | Hook | What happens |
 |------|-------------|
 | `session-start` | Bootstrap if first run; initial mine if workspace not yet indexed. On the Claude Code harness, also emits a compact memory-status block via `hookSpecificOutput.additionalContext` (drawer/wing/room counts, active collab session + phase, last-diary pointer, `MEMORY_PROTOCOL`); Codex receives no such output (silent degrade) |
-| `user-prompt-submit` | Claude Code only — FTS/BM25 drawer lookup and optional context injection (see below). Codex registers no UserPromptSubmit hook |
+| `user-prompt-submit` | Claude Code only — bounded local BM25/KG/diary recall with optional ready-daemon hybrid vector recall and context injection (see below). Codex registers no UserPromptSubmit hook |
 | `stop` | Persist measured transcript token rows and occupancy samples under `IRONMEM_METRICS`; persist session summary to diary and re-mine changed files when writes are allowed |
 | `precompact` | Persist measured transcript token rows and occupancy samples under `IRONMEM_METRICS`; snapshot pending session context and re-mine changed files when writes are allowed |
 
@@ -485,7 +485,7 @@ Tunables (all fresh-read per invocation):
 | `IRONMEM_PROMPT_RECALL_HYBRID` | off | `1`, `true`, or `yes` enables ready-daemon vector recall; other values are off. |
 | `IRONMEM_PROMPT_HOOK_HYBRID_BUDGET_MS` | `60` | Hybrid vector-request budget in ms; non-positive/unparseable → `60`, and the effective request is bounded by the outer budget/reserve. |
 | `IRONMEM_PROMPT_HOOK_HYBRID_LIMIT` | `5` | Vector candidates considered; clamped to `1`–`10`. |
-| `IRONMEM_PROMPT_HOOK_MAX_HITS` | `3` | BM25 memory excerpts injected; clamped to `1`–`3`. |
+| `IRONMEM_PROMPT_HOOK_MAX_HITS` | `3` | Maximum fused vector/BM25 memory excerpts injected per prompt; clamped to `1`–`3`. |
 | `IRONMEM_PROMPT_HOOK_MIN_SCORE` | `0.0` | BM25 floor; higher is stricter. `0.0` allows any FTS `MATCH` result. |
 | `IRONMEM_PROMPT_HOOK_SUMMARY_MAX_BYTES` | `120` | Byte cap per BM25 one-line excerpt. |
 | `IRONMEM_PROMPT_HOOK_KG` | on | `0`, `false`, or `no` disables KG recall; other values use enabled default. |
