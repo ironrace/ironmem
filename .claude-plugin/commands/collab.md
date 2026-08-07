@@ -669,7 +669,7 @@ single human planning gate and takes it in step 0, before any worker runs.
    re-dispatch re-reads the same bytes and returns the same blocker, while the
    loop finds `phase == PlanLocked` with `task_list` still unsent and
    re-prompts the human with a plan nobody can change — an unbounded
-   re-approval loop. Every step 2 rejection below is of that kind (an 11-task
+   re-approval loop. Every step 2 rejection below is of that kind (a 16-task
    plan, a plan-file SHA-256 mismatch, non-contiguous task IDs, a missing
    timebox). Report the blocker verbatim to the user and offer
    `mcp__ironmem__collab_end`, legal precisely and only at `PlanLocked`

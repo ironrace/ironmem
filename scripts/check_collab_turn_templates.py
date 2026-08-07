@@ -1503,6 +1503,7 @@ BRIDGE_BLOCKER_SNIPPETS = [
 BRIDGE_BLOCKER_COMMAND_SNIPPETS = [
     "Do not re-dispatch the worker, and do not fall back through the loop "
     "into step 0.",
+    "a 16-task plan",
 ]
 BRIDGE_BLOCKER_DOC_SNIPPETS = [
     "The orchestrator must not re-dispatch the worker or fall back through "

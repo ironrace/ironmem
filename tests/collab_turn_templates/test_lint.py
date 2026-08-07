@@ -498,6 +498,22 @@ def test_lint_requires_fifteen_task_evaluate_issue_ceiling(tmp_path):
         in r.stdout
 
 
+def test_lint_requires_sixteen_task_bridge_ceiling(tmp_path):
+    fixture = copy_fixture(tmp_path)
+    command = fixture / ".claude-plugin" / "commands" / "collab.md"
+    text = command.read_text()
+    stale_ceiling = "an " + "11" + "-task plan"
+    mutated = text.replace("a 16-task\n   plan", stale_ceiling, 1)
+    assert mutated != text, "16-task bridge ceiling not found"
+    command.write_text(mutated)
+
+    r = run({"COLLAB_LINT_ROOT": str(fixture)})
+
+    assert r.returncode == 1
+    assert (".claude-plugin/commands/collab.md: v3 bridge is missing "
+            "blocker-terminates-the-bridge contract 'a 16-task plan'") in r.stdout
+
+
 def test_lint_requires_both_harness_templates_per_topic(tmp_path):
     fixture = copy_fixture(tmp_path)
     (fixture / ".codex-plugin" / "prompts" / "collab-review-local.md").unlink()
