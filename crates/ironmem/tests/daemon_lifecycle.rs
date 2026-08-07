@@ -14,9 +14,18 @@
 //! 3. No-daemon + `--no-autospawn` fallback answering `initialize` via
 //!    in-process `serve` — see `no_daemon_no_autospawn_falls_back_to_in_process_serve`
 //!    below.
+//! 4. Graceful retire on `SIGTERM` (the install-upgrade path): a signalled
+//!    daemon stops admitting new clients but serves its attached ones to the
+//!    end — see `sigterm_retires_the_daemon_without_cutting_off_an_attached_client`
+//!    below. This is the only test that exercises the real signal wiring in
+//!    `run_daemon`; the unit tests fire the shutdown channel directly and so
+//!    cannot see whether anything is actually listening for a signal.
+//! 5. REPEATED `SIGTERM`, i.e. the second and third install while the first
+//!    install's daemon is still draining an always-on session — see
+//!    `repeated_sigterms_never_sever_an_attached_client` below.
 //!
-//! All three run with test-overridden idle windows / tempdir socket paths and
-//! leave no orphaned daemon process, socket, or lockfile behind.
+//! All run with test-overridden idle windows / tempdir socket paths and leave
+//! no orphaned daemon process, socket, or lockfile behind.
 #![cfg(unix)]
 
 use std::io::{BufRead, BufReader, Write};
@@ -179,6 +188,335 @@ fn admitted_connection_near_idle_boundary_is_served_not_dropped() {
     // of an already-dead pid — it only matters as a safety net if the
     // assertions above failed instead of panicking past this point.
     drop(daemon);
+}
+
+/// Bound on how long a purely causal, event-driven wait may take before we
+/// call it a hang. NOT a timing margin: every step below is triggered by an
+/// event this test just caused (a signal, a write, a close), so a correct
+/// daemon reaches each observable in milliseconds and only a real regression
+/// ever spends this budget. Generous because it also has to absorb a
+/// subprocess's scheduling under a fully parallel `cargo test --workspace`.
+const RETIRE_BUDGET: Duration = Duration::from_secs(10);
+
+/// Poll `condition` until it holds or [`RETIRE_BUDGET`] elapses.
+fn wait_for(mut condition: impl FnMut() -> bool) -> bool {
+    let deadline = std::time::Instant::now() + RETIRE_BUDGET;
+    while std::time::Instant::now() < deadline {
+        if condition() {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    condition()
+}
+
+/// PIDs of `ironmem serve --listen` daemons bound to `sock`, found the same way
+/// `scripts/install-ironmem.sh` finds them: `--listen` only (never a `--connect`
+/// shim), and only on this socket. Used here to reap a daemon that was
+/// auto-spawned *detached* by a proxy, whose `Child` this test never owns.
+/// `sock` lives in a per-test tempdir, so this cannot match another test's
+/// daemon even under a fully parallel run.
+fn listening_daemon_pids(sock: &Path) -> Vec<u32> {
+    let out = Command::new("pgrep")
+        .args(["-f", "ironmem serve"])
+        .output()
+        .expect("pgrep must run");
+    String::from_utf8_lossy(&out.stdout)
+        .split_whitespace()
+        .filter_map(|pid| pid.parse::<u32>().ok())
+        .filter(|pid| {
+            let args = Command::new("ps")
+                .args(["-o", "args=", "-p", &pid.to_string()])
+                .output()
+                .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+                .unwrap_or_default();
+            args.contains("--listen") && args.contains(&sock.display().to_string())
+        })
+        .collect()
+}
+
+/// The install-upgrade contract, end to end through the real binary and a real
+/// `SIGTERM`: `scripts/install-ironmem.sh` retires the shared daemon so the
+/// next MCP client picks up the newly installed build, and that must NOT cost
+/// anyone their live session.
+///
+/// A signalled daemon must therefore:
+///   1. stop admitting new clients at once (refused, so a `--connect` proxy
+///      auto-spawns a fresh daemon rather than hanging on a dead backlog),
+///   2. keep serving the client that was already attached when the signal
+///      landed, for as long as that client stays attached,
+///   3. let a NEW `--connect` proxy auto-spawn a successor daemon (the point of
+///      the whole exercise: that client is the one running the new binary),
+///   4. exit once that last old client disconnects, without ever needing a
+///      `SIGKILL` — and WITHOUT unlinking the successor's socket on the way
+///      out, even though the successor now owns the same path (C1, arriving via
+///      the drain window this retire path introduces).
+///
+/// The idle window is 600s so the idle timer cannot account for any of it: the
+/// only thing that can end this daemon is the signal.
+#[test]
+fn sigterm_retires_the_daemon_without_cutting_off_an_attached_client() {
+    let temp = tempfile::tempdir().unwrap();
+    let home = temp.path().join("home");
+    let db_path = temp.path().join("memory.sqlite3");
+    let sock = temp.path().join("daemon.sock");
+    std::fs::create_dir_all(&home).unwrap();
+
+    let mut listen_cmd = Command::new(bin());
+    listen_cmd
+        .arg("serve")
+        .arg("--listen")
+        .arg(&sock)
+        .env("IRONMEM_DAEMON_IDLE_SECS", "600");
+    base_env(&mut listen_cmd, &home, &db_path);
+    let mut daemon = KillOnDrop(
+        listen_cmd
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("daemon must spawn"),
+    );
+
+    // An attached client, mid-session: connected, initialized, holding on.
+    let stream = connect_with_retry(&sock);
+    let mut writer = stream.try_clone().unwrap();
+    let mut reader = BufReader::new(stream);
+    writer
+        .write_all(b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{}}\n")
+        .unwrap();
+    writer.flush().unwrap();
+    let mut line = String::new();
+    reader.read_line(&mut line).unwrap();
+    assert!(line.contains("\"protocolVersion\""));
+
+    // What the installer does.
+    let pid = daemon.0.id();
+    let signalled = Command::new("kill")
+        .arg("-TERM")
+        .arg(pid.to_string())
+        .status()
+        .expect("kill must run");
+    assert!(signalled.success(), "SIGTERM must be delivered to {pid}");
+
+    // 1. New clients are refused promptly — the daemon really did receive and
+    //    act on the signal, which is the wiring this test exists to prove.
+    assert!(
+        wait_for(|| UnixStream::connect(&sock).is_err()),
+        "a SIGTERMed daemon must stop admitting new connections"
+    );
+
+    // 2. The attached client is untouched and still answered. This is the
+    //    whole safety argument for signalling on install: an ungraceful
+    //    shutdown closes this socket and the exchange below fails.
+    let mut line2 = String::new();
+    let served = writer
+        .write_all(b"{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"initialize\",\"params\":{}}\n")
+        .and_then(|()| writer.flush())
+        .and_then(|()| reader.read_line(&mut line2));
+    assert!(
+        matches!(served, Ok(n) if n > 0),
+        "a client attached before the SIGTERM must keep being served, not cut \
+         off mid-session (outcome: {served:?})"
+    );
+    assert!(
+        line2.contains("\"protocolVersion\""),
+        "and must get real responses, not a truncated stream: {line2}"
+    );
+    assert!(
+        daemon.0.try_wait().unwrap().is_none(),
+        "the daemon must still be draining, not already exited"
+    );
+
+    // 3. A NEW client auto-spawns a successor and is served. This is the upgrade
+    //    actually taking effect: the refusal in step 1 is only useful because it
+    //    routes new clients to a daemon running the freshly installed binary.
+    let mut connect_cmd = Command::new(bin());
+    connect_cmd
+        .arg("serve")
+        .arg("--connect")
+        .arg(&sock)
+        .env("IRONMEM_DAEMON_IDLE_SECS", "600");
+    base_env(&mut connect_cmd, &home, &db_path);
+    let (mut proxy_child, proxy_line) = run_initialize_over_stdio(connect_cmd);
+    assert!(
+        proxy_line.contains("\"protocolVersion\""),
+        "a new client arriving after the retire must auto-spawn a successor \
+         daemon and be served by it: {proxy_line}"
+    );
+    assert!(proxy_child.wait().unwrap().success());
+    let successors = listening_daemon_pids(&sock);
+    assert!(
+        successors.iter().any(|&p| p != pid),
+        "a successor daemon must now be listening on {} (found {successors:?}, \
+         old daemon was {pid})",
+        sock.display()
+    );
+
+    // The old daemon is still draining its own client throughout, undisturbed
+    // by the successor taking over the socket.
+    let mut line3 = String::new();
+    let still_served = writer
+        .write_all(b"{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"initialize\",\"params\":{}}\n")
+        .and_then(|()| writer.flush())
+        .and_then(|()| reader.read_line(&mut line3));
+    assert!(
+        matches!(still_served, Ok(n) if n > 0),
+        "the draining daemon must keep serving its client even after a \
+         successor claims the socket (outcome: {still_served:?})"
+    );
+
+    // 4. Releasing the last client completes the drain and the old daemon exits
+    //    on its own. No SIGKILL.
+    drop(writer);
+    drop(reader);
+    assert!(
+        wait_for(|| daemon.0.try_wait().unwrap().is_some()),
+        "the daemon must exit once its last drained connection closes"
+    );
+    let status = daemon.0.try_wait().unwrap().unwrap();
+    assert!(
+        status.success(),
+        "a signalled retire is a requested shutdown, not a failure: {status:?}"
+    );
+
+    // C1: and its cleanup must have left the LIVE successor's socket alone.
+    // An unconditional `remove_file` at exit would unlink it here, stranding
+    // every future client on a daemon they can no longer find.
+    assert!(
+        sock.exists(),
+        "the exiting daemon must not remove the successor's socket"
+    );
+    assert!(
+        UnixStream::connect(&sock).is_ok(),
+        "and the successor must still be reachable there"
+    );
+
+    for successor in listening_daemon_pids(&sock) {
+        let _ = Command::new("kill")
+            .arg("-TERM")
+            .arg(successor.to_string())
+            .status();
+    }
+}
+
+/// The install-CYCLE contract: signalling an ALREADY-RETIRING daemon must be an
+/// idempotent no-op, however many times it happens.
+///
+/// This is the failure mode that makes the retire mechanism dangerous rather
+/// than safe if it is got wrong. Retiring is not instant — a daemon draining an
+/// always-on Claude Code session stays alive for as long as that session does,
+/// days in the case this whole feature exists for — and its argv still reads
+/// `ironmem serve --listen <socket>` the entire time. So the NEXT run of
+/// `scripts/install-ironmem.sh` lists that same pid and sends it another
+/// `SIGTERM`. If the daemon escalates on it, `exit(0)` severs the very session
+/// the drain was protecting (its `--connect` proxy gets `BrokenPipe`), and
+/// every install cycle silently kills the previous cycle's live sessions.
+///
+/// So: SIGTERM #1 retires. SIGTERM #2 and #3 land mid-drain and must change
+/// nothing at all — the attached client keeps being answered and the process
+/// stays up until that client itself disconnects. Nothing here waits on a
+/// duration; every step is caused by something this test just did.
+#[test]
+fn repeated_sigterms_never_sever_an_attached_client() {
+    let temp = tempfile::tempdir().unwrap();
+    let home = temp.path().join("home");
+    let db_path = temp.path().join("memory.sqlite3");
+    let sock = temp.path().join("daemon.sock");
+    std::fs::create_dir_all(&home).unwrap();
+
+    // 600s idle window: only the signals can end this daemon.
+    let mut listen_cmd = Command::new(bin());
+    listen_cmd
+        .arg("serve")
+        .arg("--listen")
+        .arg(&sock)
+        .env("IRONMEM_DAEMON_IDLE_SECS", "600");
+    base_env(&mut listen_cmd, &home, &db_path);
+    let mut daemon = KillOnDrop(
+        listen_cmd
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("daemon must spawn"),
+    );
+
+    // The always-on session: attached and mid-conversation.
+    let stream = connect_with_retry(&sock);
+    let mut writer = stream.try_clone().unwrap();
+    let mut reader = BufReader::new(stream);
+    writer
+        .write_all(b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{}}\n")
+        .unwrap();
+    writer.flush().unwrap();
+    let mut line = String::new();
+    reader.read_line(&mut line).unwrap();
+    assert!(line.contains("\"protocolVersion\""));
+
+    let pid = daemon.0.id();
+    let sigterm = |label: &str| {
+        assert!(
+            Command::new("kill")
+                .arg("-TERM")
+                .arg(pid.to_string())
+                .status()
+                .expect("kill must run")
+                .success(),
+            "SIGTERM ({label}) must be delivered to {pid}"
+        );
+    };
+
+    // Install #1. Waiting for the refusal is what proves the daemon has
+    // actually processed this signal and is now DRAINING — without it the
+    // later signals could race ahead of the first and prove nothing.
+    sigterm("install #1");
+    assert!(
+        wait_for(|| UnixStream::connect(&sock).is_err()),
+        "the first SIGTERM must retire the daemon (new connections refused)"
+    );
+
+    // Installs #2 and #3, both landing on the draining daemon. After each, the
+    // attached client must still get a real response over the SAME connection.
+    for (n, label) in [(2, "install #2"), (3, "install #3")] {
+        sigterm(label);
+
+        let mut reply = String::new();
+        let request = format!(
+            "{{\"jsonrpc\":\"2.0\",\"id\":{n},\"method\":\"initialize\",\"params\":{{}}}}\n"
+        );
+        let served = writer
+            .write_all(request.as_bytes())
+            .and_then(|()| writer.flush())
+            .and_then(|()| reader.read_line(&mut reply));
+        assert!(
+            matches!(served, Ok(n) if n > 0),
+            "SIGTERM #{n} landed on an already-retiring daemon and severed its \
+             attached session — a repeat signal must be an idempotent no-op, \
+             not an immediate exit (outcome: {served:?})"
+        );
+        assert!(
+            reply.contains("\"protocolVersion\""),
+            "and the session must keep getting real responses across repeat \
+             signals, not a truncated stream: {reply}"
+        );
+        assert!(
+            daemon.0.try_wait().unwrap().is_none(),
+            "the daemon must still be draining after SIGTERM #{n}, not exited"
+        );
+    }
+
+    // And the drain still ends the way it should: the client leaves, the daemon
+    // exits on its own, cleanly. No SIGKILL, no non-zero status.
+    drop(writer);
+    drop(reader);
+    assert!(
+        wait_for(|| daemon.0.try_wait().unwrap().is_some()),
+        "the daemon must still exit once its last drained connection closes"
+    );
+    let status = daemon.0.try_wait().unwrap().unwrap();
+    assert!(
+        status.success(),
+        "a signalled retire is a requested shutdown, not a failure: {status:?}"
+    );
 }
 
 /// #190 Task 16 scenario 3: no daemon reachable + `--no-autospawn` set ->

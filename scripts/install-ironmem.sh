@@ -695,15 +695,104 @@ else
   echo "==> Skipping MCP wiring"
 fi
 
-# Surface running `ironmem serve` instances as an FYI — the atomic install
-# does not disturb them, but callers that want new clients to hit the fresh
-# binary must restart their MCP client (Claude Code, Codex, etc).
-RUNNING="$(pgrep -f 'ironmem serve' 2>/dev/null || true)"
-if [[ -n "$RUNNING" ]]; then
+# Retire the shared daemon so the next MCP client runs the binary we just
+# installed.
+#
+# The atomic install above deliberately does not disturb running processes, but
+# the shared daemon (`ironmem serve --listen <socket>`) is long-lived: it keeps
+# executing the OLD binary for as long as it stays up, and its only self-exit is
+# the idle timer, which fires solely at ZERO active connections. An always-on
+# Claude Code session holds one open continuously, so that timer never fires --
+# daemons have been observed still serving pre-upgrade code 23 hours after an
+# install. Printing an FYI does not fix that; signalling does.
+#
+# SIGTERM is a GRACEFUL RETIRE, not a kill -- IN A DAEMON THAT HAS THE RETIRE
+# HANDLER (see `retire_on_signal` / `serve_accept_loop` in
+# crates/ironmem/src/mcp/daemon.rs). Such a daemon stops admitting new clients
+# immediately, but every connection already attached when the signal lands is
+# served to its natural end and the process only exits once the last one
+# disconnects. So it does NOT break anyone's live session: an attached Claude
+# Code / Codex keeps working (on the old build, until it is restarted), while
+# any NEW client is refused, auto-spawns a fresh daemon, and gets this build.
+# Repeat signals are no-ops there, so re-signalling a daemon that is still
+# draining a days-old session across several installs is safe.
+#
+# THE ONE-TIME CUTOVER. A daemon that PREDATES the retire handler has no
+# handler at all, so SIGTERM takes its default disposition and terminates it on
+# the spot, cutting off whatever was attached. That is guaranteed on the first
+# install of this change -- the daemon running right then is by definition the
+# old binary -- and the script cannot tell the two cases apart: the running
+# process's argv, socket, and pid are identical either way, and nothing the
+# daemon exposes reports its build. Probing indirectly (marker files vs process
+# start times, version guesses) would be fragile and could only ever change the
+# wording, never the outcome, since signalling is the point. So the message
+# below states both cases plainly instead of claiming the good one. Cost of the
+# cutover: restart the affected Claude Code / Codex session once. Every install
+# after it is graceful for real.
+#
+# No "is it idle?" pre-check is needed here -- and none is possible anyway,
+# since nothing the daemon exposes reports its connection count.
+#
+# Only `--listen` processes are the upgrade-staleness concern. `serve --connect`
+# processes are per-client shims holding no daemon state; they die with their
+# MCP client on their own, and reporting them was actively misleading (nine
+# "running" processes, seven of them transient shims). They are neither
+# signalled nor mentioned.
+
+# PIDs of daemons listening on THIS install's socket -- never someone else's
+# daemon on an unrelated socket. `pgrep -f` matches a regex against the whole
+# command line, so the exact `--listen` / socket-path discrimination is done in
+# bash against `ps` output, where "$DAEMON_SOCKET_PATH" is matched literally
+# rather than as a pattern.
+daemon_pids_on_our_socket() {
+  local pid args
+  # No matches makes pgrep exit 1; `|| true` keeps `set -e` from aborting.
+  for pid in $(pgrep -f 'ironmem serve' 2>/dev/null || true); do
+    args="$(ps -o args= -p "$pid" 2>/dev/null || true)"
+    # A `--connect` shim never carries `--listen`, so this is the whole
+    # daemon-vs-shim test.
+    case "$args" in
+      *--listen*) ;;
+      *) continue ;;
+    esac
+    case "$args" in
+      *"$DAEMON_SOCKET_PATH"*) printf '%s\n' "$pid" ;;
+    esac
+  done
+  # Explicit success: the loop's last command may have been a non-matching
+  # `case`, and a non-zero return here would abort the command substitution.
+  return 0
+}
+
+DAEMON_PIDS="$(daemon_pids_on_our_socket)"
+if [[ -n "$DAEMON_PIDS" ]]; then
   echo ""
-  echo "Note: running ironmem serve process(es) detected (PIDs: $RUNNING)."
-  echo "      They continue on the previous binary. Restart your MCP client"
-  echo "      (Claude Code / Codex) to reconnect to the freshly installed one."
+  echo "==> Retiring the shared ironmem daemon so new clients get this build"
+  for pid in $DAEMON_PIDS; do
+    if kill -TERM "$pid" 2>/dev/null; then
+      echo "    Signalled daemon PID $pid."
+    else
+      # Permission denied (a daemon owned by another user), or it exited
+      # between the pgrep and here. Never fatal: the binary is already
+      # installed and correct, only the daemon refresh was missed.
+      echo "    WARNING: could not signal daemon PID $pid (already gone, or"
+      echo "             owned by another user). It keeps serving the previous"
+      echo "             binary until it exits on its own."
+    fi
+  done
+  echo ""
+  echo "    New Claude Code / Codex sessions auto-spawn a daemon running the"
+  echo "    freshly installed binary. What happens to sessions attached RIGHT"
+  echo "    NOW depends on which build the signalled daemon was running, and"
+  echo "    this script cannot tell from the outside:"
+  echo "      - Built from this change onward: SIGTERM is a graceful retire."
+  echo "        Every attached session is served to its end (on the previous"
+  echo "        build) and the daemon exits only once the last one detaches."
+  echo "      - Built before it: there is no signal handler, so SIGTERM takes"
+  echo "        its default disposition and the daemon exits immediately,"
+  echo "        DROPPING any attached session. This is a one-time cost on the"
+  echo "        first install of graceful retire -- restart the affected"
+  echo "        client and it reconnects to a fresh daemon."
 fi
 
 # Detect legacy MCP server registrations left over from the pre-rename era
