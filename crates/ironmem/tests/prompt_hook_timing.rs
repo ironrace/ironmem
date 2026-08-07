@@ -653,11 +653,15 @@ fn prompt_hook_stalled_hybrid_peer_preserves_kg_diary_fallback() {
     let socket_path = dir.path().join("stalled-daemon-with-fallbacks.sock");
     seed_db_file_bulk(&db_path, 10_000);
     let prompt = "drawer token alpha beta context";
+    // A stalled peer consumes its whole hybrid budget by design — the join
+    // honors the configured deadline, not a fixed window — so keep that budget
+    // small enough that the assertions below still discriminate between "spent
+    // the vector budget" and "spent the outer guard".
     let options = HookOptions {
         socket_path: Some(socket_path.clone()),
         hybrid: true,
         hook_budget_ms: 150,
-        hybrid_budget_ms: 100,
+        hybrid_budget_ms: 40,
         hybrid_limit: 5,
         max_hits: Some(3),
         kg_enabled: Some(true),
@@ -672,7 +676,7 @@ fn prompt_hook_stalled_hybrid_peer_preserves_kg_diary_fallback() {
         HookOptions {
             socket_path: Some(socket_path.clone()),
             hook_budget_ms: 150,
-            hybrid_budget_ms: 100,
+            hybrid_budget_ms: 40,
             hybrid_limit: 5,
             max_hits: Some(3),
             kg_enabled: Some(true),
@@ -694,8 +698,13 @@ fn prompt_hook_stalled_hybrid_peer_preserves_kg_diary_fallback() {
         on.elapsed
     );
     assert!(
+        on.elapsed >= Duration::from_millis(40),
+        "the join must honor the configured hybrid deadline, not a fixed window: {:?}",
+        on.elapsed
+    );
+    assert!(
         on.elapsed < Duration::from_millis(90),
-        "local KG/diary fallback must finish without waiting for the vector deadline: {:?}",
+        "a stalled peer must cost at most its own vector budget, never the outer guard: {:?}",
         on.elapsed
     );
     assert_eq!(

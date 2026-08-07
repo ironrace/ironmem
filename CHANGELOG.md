@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Opt-in hybrid prompt recall (#235).** The UserPromptSubmit hook can ask an
+  already-running shared daemon for vector candidates over its Unix socket and
+  fuse them with local BM25 through weighted RRF. Off by default; enable with
+  `IRONMEM_PROMPT_RECALL_HYBRID`, budget it with
+  `IRONMEM_PROMPT_HOOK_HYBRID_BUDGET_MS` (default `60`), and cap candidates
+  with `IRONMEM_PROMPT_HOOK_HYBRID_LIMIT` (default `5`, clamped `1`–`10`). The
+  hook never initializes, spawns, or warms a daemon and never loads an
+  embedder; the request runs on an abandonable worker with its own absolute
+  deadline, and every failure falls back to the byte-identical local
+  BM25/KG/diary result. Vector IDs are filtered against locally fetched drawers
+  before fusion, so a daemon serving another database cannot consume injection
+  slots.
+
 ### Documentation
 
 - Documented all UserPromptSubmit recall knobs, defaults, clamps, opt-in and

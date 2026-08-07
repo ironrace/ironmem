@@ -898,17 +898,27 @@ worker/read at the deadline and exits successfully; a fallback is not an error.
 
 Operational cost: with hybrid recall enabled, each prompt may leave the
 shared-daemon search work running after the hook abandons its read. If that
-daemon search has LLM reranking enabled, the rerank can therefore add latency
-and API/subprocess cost per prompt even when the hook ultimately falls back or
-injects nothing. Keep hybrid and daemon reranking opt-in when that cost is not
-desired.
+daemon search has LLM reranking enabled (`IRONMEM_RERANK`, read in the *daemon*
+process, not the hook's), the rerank can therefore add latency and
+API/subprocess cost per prompt even when the hook ultimately falls back or
+injects nothing — and your prompt text reaches whatever backend that rerank is
+configured to use. Keep hybrid and daemon reranking opt-in when that cost is
+not desired.
+
+Fusion of the daemon's IDs with local BM25 reuses the shared search pipeline's
+weighted RRF, so `IRONMEM_RRF_K` and `IRONMEM_BM25_SPARSE_THRESHOLD` also shape
+which excerpts are injected. Unlike the `IRONMEM_PROMPT_HOOK_*` knobs above,
+those two are cached per process rather than re-read per prompt. Hybrid recall
+is a no-op on non-Unix platforms, and restricted `IRONMEM_MCP_MODE` suppresses
+all recall injection.
 
 | Variable | Default | Effect |
 |---|---|---|
 | `IRONMEM_PROMPT_HOOK_BUDGET_MS` | `150` | Hard wall-clock budget for the whole hook, milliseconds. Non-positive/unparseable falls back to the default; capped at `1000`. |
 | `IRONMEM_PROMPT_RECALL_HYBRID` | off | Set to `1`, `true`, or `yes` to ask a ready shared daemon for vector candidates. Other values leave hybrid recall off. No daemon is initialized or spawned by the hook. |
-| `IRONMEM_PROMPT_HOOK_HYBRID_BUDGET_MS` | `60` | Maximum wall-clock time for the hybrid vector request. Non-positive/unparseable falls back to `60`; the effective request also cannot exceed the outer hook budget after its reserve. |
-| `IRONMEM_PROMPT_HOOK_HYBRID_LIMIT` | `5` | Maximum vector candidates considered. Clamped to `1`–`10`. |
+| `IRONMEM_PROMPT_HOOK_HYBRID_BUDGET_MS` | `60` | Maximum wall-clock time for the hybrid vector request, and how long the hook will wait for its answer. Non-positive/unparseable falls back to `60`; the effective request also cannot exceed the outer hook budget after its reserve. |
+| `IRONMEM_PROMPT_HOOK_HYBRID_LIMIT` | `5` | Maximum vector candidates considered. Clamped to `1`–`10`. A daemon returning more rows than this is treated as out of contract and ignored. |
+| `IRONMEM_DAEMON_SOCKET` | `<state_dir>/daemon.sock` | Which daemon the hook borrows for hybrid recall. The path must be the socket itself (a symlink is rejected); a missing or non-socket path falls back to local recall. |
 | `IRONMEM_PROMPT_HOOK_MAX_HITS` | `3` | Max memory excerpts injected per prompt. Clamped to `1`–`3`. |
 | `IRONMEM_PROMPT_HOOK_MIN_SCORE` | `0.0` | Minimum BM25 score a hit must clear (higher = better). `0.0` lets any FTS match through, since `MATCH` already filters relevance. |
 | `IRONMEM_PROMPT_HOOK_SUMMARY_MAX_BYTES` | `120` | Byte cap for each injected one-line excerpt. |

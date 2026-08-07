@@ -116,6 +116,21 @@ struct HybridRecallConfig {
     limit: usize,
 }
 
+/// The local worker's end of the abandoned vector request: the channel the
+/// vector thread reports on, plus the same absolute deadline that thread is
+/// working to.
+///
+/// The deadline travels with the receiver so the join honors the configured
+/// hybrid budget instead of a fixed window. It is derived from
+/// [`effective_hybrid_vector_budget`], so it always lands at least
+/// `PROMPT_HOOK_OCCUPANCY_RESERVE_MS` before the outer prompt-hook deadline —
+/// waiting for it can therefore never consume the render reserve, and once it
+/// has passed the join degrades to a non-blocking poll.
+struct VectorHandoff {
+    rx: std::sync::mpsc::Receiver<Option<Vec<String>>>,
+    deadline: Instant,
+}
+
 /// Run a session lifecycle hook, reading the harness JSON payload from stdin.
 ///
 /// `harness` gates harness-specific output. Two hooks populate the returned
@@ -556,19 +571,17 @@ fn sample_occupancy(
 /// transcript-tail scan and DB write stay well inside the prompt budget.
 const PROMPT_HOOK_OCCUPANCY_RESERVE_MS: u64 = 30;
 
-/// Small final handoff window for a fast vector peer after local recall work
-/// has completed. This is deliberately separate from the vector deadline.
-const PROMPT_HOOK_VECTOR_HANDOFF_MS: u64 = 10;
-
 /// Parent-safe launch ceiling for one hybrid vector request.
 ///
 /// The outer prompt-hook budget must retain the named render/occupancy reserve
 /// even when hybrid recall is enabled. Callers must check this at request
 /// launch: `None` means the reserve is exhausted, and `Some` is the lesser of
 /// the configured hybrid budget and the time left after that reserve.
-// This contract is intentionally defined before the follow-up launch path
-// consumes it.
-#[allow(dead_code)]
+///
+/// Because the returned budget is already the outer remaining time minus the
+/// reserve, the absolute deadline derived from it is a parent-safe join point:
+/// waiting for the vector answer until that instant still leaves the reserve
+/// for the drawer fetch and render that follow.
 pub(crate) fn effective_hybrid_vector_budget(
     remaining_outer_wall_budget: Duration,
 ) -> Option<Duration> {
@@ -793,7 +806,7 @@ fn search_prompt_context(
     // connection. Its absolute deadline is independent of the local worker's
     // outer deadline; a peer that accepts and never replies cannot consume the
     // local worker's render time.
-    let vector_setup = hybrid.and_then(|hybrid| {
+    let local_vector_handoff = hybrid.and_then(|hybrid| {
         let vector_budget = effective_hybrid_vector_budget(remaining)?;
         let vector_deadline = Instant::now().checked_add(vector_budget)?;
         let (vector_tx, vector_rx) = std::sync::mpsc::channel();
@@ -807,17 +820,22 @@ fn search_prompt_context(
             );
             let _ = vector_tx.send(ids);
         });
-        Some(vector_rx)
+        // The worker joins on the same absolute deadline the request thread
+        // works to, so `IRONMEM_PROMPT_HOOK_HYBRID_BUDGET_MS` governs how long
+        // an answer is actually usable — not just how long the abandoned
+        // thread keeps talking to the peer.
+        Some(VectorHandoff {
+            rx: vector_rx,
+            deadline: vector_deadline,
+        })
     });
-
-    let local_vector_rx = vector_setup;
 
     let (tx, rx) = std::sync::mpsc::channel();
     let db_path = db_path.to_path_buf();
     let prompt = prompt.to_string();
     let worker_budget = budget.checked_sub(start.elapsed()).unwrap_or_default();
     std::thread::spawn(move || {
-        let result = prompt_recall_block(&db_path, &prompt, worker_budget, local_vector_rx);
+        let result = prompt_recall_block(&db_path, &prompt, worker_budget, local_vector_handoff);
         let _ = tx.send(result); // receiver gone (timed out) → drop silently
     });
 
@@ -837,12 +855,12 @@ fn prompt_recall_block(
     db_path: &Path,
     prompt: &str,
     busy: Duration,
-    vector_rx: Option<std::sync::mpsc::Receiver<Option<Vec<String>>>>,
+    vector: Option<VectorHandoff>,
 ) -> Option<String> {
     let db = crate::db::schema::Database::open_with_busy_timeout(db_path, busy).ok()?;
     let config = RecallConfig::from_tunables();
-    match vector_rx {
-        Some(rx) => recall_block_from_vector_rx(&db, prompt, &config, rx),
+    match vector {
+        Some(handoff) => recall_block_from_vector_handoff(&db, prompt, &config, handoff),
         None => recall_block_from_db(&db, prompt, &config),
     }
 }
@@ -902,11 +920,11 @@ fn recall_block_from_db_with_vectors(
     recall_block_from_qualifying(db, prompt, config, qualifying, vector_ids)
 }
 
-fn recall_block_from_vector_rx(
+fn recall_block_from_vector_handoff(
     db: &crate::db::schema::Database,
     prompt: &str,
     config: &RecallConfig,
-    vector_rx: std::sync::mpsc::Receiver<Option<Vec<String>>>,
+    handoff: VectorHandoff,
 ) -> Option<String> {
     let qualifying = bm25_qualifying(db, prompt, config)?;
     recall_block_from_qualifying_with_vector_poll(
@@ -915,7 +933,7 @@ fn recall_block_from_vector_rx(
         config,
         qualifying,
         None,
-        Some(&vector_rx),
+        Some(&handoff),
     )
 }
 
@@ -958,35 +976,46 @@ fn recall_block_from_qualifying(
 
 fn poll_vector_response(
     response: &mut Option<Option<Vec<String>>>,
-    vector_rx: Option<&std::sync::mpsc::Receiver<Option<Vec<String>>>>,
+    vector: Option<&VectorHandoff>,
 ) {
-    let Some(vector_rx) = vector_rx else {
+    let Some(vector) = vector else {
         return;
     };
     if response.is_some() {
         return;
     }
-    match vector_rx.try_recv() {
+    match vector.rx.try_recv() {
         Ok(ids) => *response = Some(ids),
         Err(std::sync::mpsc::TryRecvError::Disconnected) => *response = Some(None),
         Err(std::sync::mpsc::TryRecvError::Empty) => {}
     }
 }
 
+/// Final join on the vector request, bounded by the request's own absolute
+/// deadline.
+///
+/// That deadline is [`effective_hybrid_vector_budget`] applied at launch, so it
+/// always leaves `PROMPT_HOOK_OCCUPANCY_RESERVE_MS` before the outer
+/// prompt-hook deadline for the drawer fetch and render that follow. Local
+/// KG/diary work has already happened by the time this runs, so the wait is
+/// whatever the operator's hybrid budget has left over — and once that instant
+/// has passed (a slow local path, or a peer that never replied) the wait is
+/// zero and the local block renders exactly as it would with hybrid off.
 fn opportunistic_vector_response(
     response: &mut Option<Option<Vec<String>>>,
-    vector_rx: Option<&std::sync::mpsc::Receiver<Option<Vec<String>>>>,
+    vector: Option<&VectorHandoff>,
 ) {
-    let Some(vector_rx) = vector_rx else {
+    let Some(vector) = vector else {
         return;
     };
     if response.is_some() {
         return;
     }
-    // This is only a short scheduler handoff after local recall has progressed,
-    // never the configured vector deadline. A stalled peer therefore cannot
-    // consume the local KG/diary or outer render budget.
-    match vector_rx.recv_timeout(Duration::from_millis(PROMPT_HOOK_VECTOR_HANDOFF_MS)) {
+    let wait = vector.deadline.saturating_duration_since(Instant::now());
+    if wait.is_zero() {
+        return;
+    }
+    match vector.rx.recv_timeout(wait) {
         Ok(ids) => *response = Some(ids),
         Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => *response = Some(None),
         Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
@@ -999,7 +1028,7 @@ fn recall_block_from_qualifying_with_vector_poll(
     config: &RecallConfig,
     qualifying: Vec<(String, f32)>,
     initial_vector_response: Option<Option<Vec<String>>>,
-    vector_rx: Option<&std::sync::mpsc::Receiver<Option<Vec<String>>>>,
+    vector: Option<&VectorHandoff>,
 ) -> Option<String> {
     let RecallConfig {
         max_hits,
@@ -1017,7 +1046,7 @@ fn recall_block_from_qualifying_with_vector_poll(
     // final `lines.is_empty()` check below is the single source of truth for
     // "nothing to inject".
     let mut vector_response = initial_vector_response;
-    poll_vector_response(&mut vector_response, vector_rx);
+    poll_vector_response(&mut vector_response, vector);
     let mut lines = Vec::new();
 
     // KG triple recall
@@ -1111,11 +1140,11 @@ fn recall_block_from_qualifying_with_vector_poll(
         }
     }
 
-    // Give the vector worker one bounded final handoff after the local KG/diary
-    // work has progressed. A response that is still pending cannot take
-    // ownership of the local DB work or full render budget; local recall wins.
-    opportunistic_vector_response(&mut vector_response, vector_rx);
-    poll_vector_response(&mut vector_response, vector_rx);
+    // Give the vector worker its final, deadline-bounded handoff after the
+    // local KG/diary work has progressed. The deadline reserves render time by
+    // construction, so a pending response can never take ownership of the local
+    // DB work or the outer render budget; local recall still wins.
+    opportunistic_vector_response(&mut vector_response, vector);
     let vector_ids = vector_response
         .as_ref()
         .and_then(|response| response.as_deref());
@@ -1870,6 +1899,11 @@ mod tests {
         std::env::remove_var("IRONMEM_PROMPT_RECALL_HYBRID");
         std::env::remove_var("IRONMEM_PROMPT_HOOK_HYBRID_BUDGET_MS");
         std::env::remove_var("IRONMEM_PROMPT_HOOK_HYBRID_LIMIT");
+        // Hybrid recall resolves its peer through `Config::daemon_socket_path`,
+        // which honors this var. `config.rs` sets it under its own `ENV_LOCK`,
+        // so a hybrid test that inherits it would talk to that path — or to a
+        // developer's live daemon — instead of its own tempdir fixture.
+        std::env::remove_var("IRONMEM_DAEMON_SOCKET");
         guard
     }
 
@@ -1879,9 +1913,13 @@ mod tests {
     impl Drop for PromptHookEnvGuard {
         fn drop(&mut self) {
             std::env::remove_var("IRONMEM_PROMPT_HOOK_BUDGET_MS");
+            std::env::remove_var("IRONMEM_PROMPT_HOOK_MAX_HITS");
+            std::env::remove_var("IRONMEM_PROMPT_HOOK_KG");
+            std::env::remove_var("IRONMEM_PROMPT_HOOK_DIARY");
             std::env::remove_var("IRONMEM_PROMPT_RECALL_HYBRID");
             std::env::remove_var("IRONMEM_PROMPT_HOOK_HYBRID_BUDGET_MS");
             std::env::remove_var("IRONMEM_PROMPT_HOOK_HYBRID_LIMIT");
+            std::env::remove_var("IRONMEM_DAEMON_SOCKET");
         }
     }
 
@@ -3345,6 +3383,58 @@ mod tests {
             effective_hybrid_vector_budget(Duration::from_millis(200)),
             Some(Duration::from_millis(7)),
             "configured hybrid budget remains a ceiling above the reserve"
+        );
+    }
+
+    /// The final join must wait up to the vector request's own deadline, not a
+    /// fixed window: a daemon slower than a hardcoded handoff would otherwise
+    /// have every answer discarded, making the configured hybrid budget inert.
+    #[test]
+    fn vector_join_waits_for_the_configured_deadline_not_a_fixed_window() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(60));
+            let _ = tx.send(Some(vec!["late-but-inside-budget".to_string()]));
+        });
+        let handoff = VectorHandoff {
+            rx,
+            deadline: Instant::now() + Duration::from_secs(5),
+        };
+
+        let mut response = None;
+        opportunistic_vector_response(&mut response, Some(&handoff));
+
+        assert_eq!(
+            response,
+            Some(Some(vec!["late-but-inside-budget".to_string()])),
+            "an answer arriving inside the vector deadline must still be used"
+        );
+    }
+
+    /// Once the deadline has passed the join must not block at all — otherwise
+    /// a stalled peer could push the worker past the outer prompt-hook deadline
+    /// and cost the whole local recall block, not just the vector hits.
+    #[test]
+    fn vector_join_does_not_block_once_the_deadline_has_passed() {
+        let (tx, rx) = std::sync::mpsc::channel::<Option<Vec<String>>>();
+        let handoff = VectorHandoff {
+            rx,
+            deadline: Instant::now() - Duration::from_millis(1),
+        };
+
+        let started = Instant::now();
+        let mut response = None;
+        opportunistic_vector_response(&mut response, Some(&handoff));
+        let waited = started.elapsed();
+        drop(tx);
+
+        assert_eq!(
+            response, None,
+            "an expired deadline yields no vector answer"
+        );
+        assert!(
+            waited < Duration::from_millis(20),
+            "an expired deadline must not block the render path: {waited:?}"
         );
     }
 

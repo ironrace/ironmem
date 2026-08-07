@@ -1,9 +1,10 @@
 //! Synchronous, bounded client for the already-running MCP daemon.
 //!
-//! Hook orchestration consumes this internal API in the follow-up task; keep
-//! the transport self-contained here so it cannot initialize, spawn, or load
-//! an embedder while it is staged.
-#![allow(dead_code)]
+//! Prompt-hook recall consumes this internal API; the transport stays
+//! self-contained here so it cannot initialize, spawn, or load an embedder.
+// Only the non-Unix stub leaves items unreferenced; on Unix the dead-code lint
+// must stay live so unreachable parsing/validation helpers are caught.
+#![cfg_attr(not(unix), allow(dead_code))]
 
 use std::path::Path;
 use std::time::{Duration, Instant};
@@ -219,12 +220,19 @@ fn unix_socket_address(path: &Path) -> Option<(libc::sockaddr_un, libc::socklen_
     Some((address, address_len))
 }
 
+/// Whether a non-blocking `connect` result means "still connecting".
+///
+/// `EAGAIN`/`EWOULDBLOCK` are deliberately excluded. For `AF_UNIX` on Linux
+/// they mean the listener's accept backlog is full — the socket is *not*
+/// queued for connection — and the kernel then reports `POLLOUT|POLLHUP` with
+/// `SO_ERROR == 0` on that unconnected fd. Treating them as pending therefore
+/// yields a `UnixStream` that is not connected (the following `write` fails
+/// with `ENOTCONN`) and spins the retry loop for the rest of the budget. A
+/// saturated daemon is an "unavailable peer, fall back to BM25" signal, so it
+/// fails closed here instead.
 #[cfg(unix)]
 fn is_connect_pending(code: libc::c_int) -> bool {
-    code == libc::EINPROGRESS
-        || code == libc::EALREADY
-        || code == libc::EAGAIN
-        || code == libc::EWOULDBLOCK
+    code == libc::EINPROGRESS || code == libc::EALREADY
 }
 
 #[cfg(unix)]
@@ -392,7 +400,7 @@ fn parse_search_ids(response: &[u8], limit: usize) -> Option<Vec<String>> {
         return None;
     }
 
-    let results = validated_search_results(payload.get("results")?)?;
+    let results = validated_search_results(payload.get("results")?, limit)?;
     let rows = results.as_array()?;
     let mut seen = std::collections::HashSet::new();
     let mut ids = Vec::with_capacity(limit.min(rows.len()));
@@ -408,7 +416,17 @@ fn parse_search_ids(response: &[u8], limit: usize) -> Option<Vec<String>> {
     (!ids.is_empty()).then_some(ids)
 }
 
-fn validated_search_results(value: &serde_json::Value) -> Option<serde_json::Value> {
+/// Validate a `results` payload before it is expanded, and reject anything the
+/// request did not ask for.
+///
+/// The `MAX_RESPONSE_BYTES` frame cap bounds the *wire* size, not the expanded
+/// size: `expand_compact_value` materialises one object per row and clones
+/// every column key into each one, so a well-formed 1 MiB envelope carrying a
+/// single ~500 KB column key over ~260k rows expands to well over 100 GB. The
+/// row-count check below is what makes the frame cap an allocation bound — the
+/// client asked for `limit` (at most 10) rows, so a peer returning more is out
+/// of contract and treated as no vector result.
+fn validated_search_results(value: &serde_json::Value, limit: usize) -> Option<serde_json::Value> {
     let Some(envelope) = value.get("__compact_v1") else {
         return Some(value.clone());
     };
@@ -424,6 +442,9 @@ fn validated_search_results(value: &serde_json::Value) -> Option<serde_json::Val
             return None;
         }
         row_count = Some(length);
+    }
+    if row_count.is_some_and(|rows| rows > limit) {
+        return None;
     }
 
     Some(crate::mcp::compact::expand_compact_value(value))
@@ -656,9 +677,16 @@ mod tests {
         );
     }
 
+    /// A saturated listener must fail closed, promptly, on every Unix.
+    ///
+    /// The platforms disagree on how they say so — macOS/BSD refuse the
+    /// connect, Linux returns `EAGAIN` on an fd that then polls
+    /// `POLLOUT|POLLHUP` with `SO_ERROR == 0` — so the deadline bound below is
+    /// what pins the shared contract: neither answer may be mistaken for a
+    /// connect in progress and waited on.
     #[cfg(unix)]
     #[test]
-    fn connect_to_a_full_listener_honors_the_absolute_deadline() {
+    fn connect_to_a_full_listener_fails_closed_within_the_absolute_deadline() {
         use std::os::unix::ffi::OsStrExt;
         use std::os::unix::io::RawFd;
         use std::path::Path;
@@ -774,7 +802,7 @@ mod tests {
             "a full listener must not produce a stream"
         );
         assert!(
-            elapsed < Duration::from_millis(500),
+            elapsed < Duration::from_millis(200),
             "connect exceeded its absolute deadline: {elapsed:?}"
         );
     }
@@ -805,6 +833,46 @@ mod tests {
             }
         }));
         assert_eq!(run_socket_fixture(Some(non_array_column)), None);
+    }
+
+    /// The 1 MiB frame cap bounds the wire size, not the expanded size:
+    /// expanding a compact envelope clones every column key once per row, so a
+    /// payload that fits the cap can still demand orders of magnitude more
+    /// memory. A row count above the requested limit is out of contract and
+    /// must be rejected before expansion rather than after it.
+    #[cfg(unix)]
+    #[test]
+    fn compact_row_count_above_the_requested_limit_is_rejected_before_expansion() {
+        let wide_key = "k".repeat(4096);
+        let rows: Vec<serde_json::Value> = (0..64).map(|_| serde_json::json!(0)).collect();
+        let amplifying = search_response(serde_json::json!({
+            "results": {
+                "__compact_v1": {
+                    "columns": {
+                        wide_key: rows,
+                    }
+                }
+            }
+        }));
+        assert_eq!(run_socket_fixture_with_limit(Some(amplifying), 5), None);
+
+        // A compact envelope inside the requested limit still expands normally.
+        let within_limit = search_response(serde_json::json!({
+            "results": {
+                "__compact_v1": {
+                    "columns": {
+                        "id": ["bounded-first", "bounded-second"]
+                    }
+                }
+            }
+        }));
+        assert_eq!(
+            run_socket_fixture_with_limit(Some(within_limit), 5),
+            Some(vec![
+                "bounded-first".to_string(),
+                "bounded-second".to_string()
+            ])
+        );
     }
 
     #[cfg(unix)]
