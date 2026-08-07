@@ -572,6 +572,28 @@ TASK_BUDGET_SURFACE_CONTRACTS = {
         "more than 15 tasks",
     ],
 }
+# Positive pins alone cannot detect one stale occurrence when the same current
+# phrase appears elsewhere in a surface. Scan only the task-budget surfaces
+# above, and only task-budget contexts, so unrelated 10/11 values remain free.
+STALE_TASK_BUDGET_PATTERNS = [
+    ("10-task issue budget", re.compile(r"\b10-task issue budget\b")),
+    ("1–10 task range", re.compile(
+        r"\b1[–-]10(?:-task\s+estimate|\s+(?:execution\s+tasks?|"
+        r"task\s+estimate|tasks?))\b")),
+    ("10-task comparative ceiling", re.compile(
+        r"\b(?:more than|at most|above)\s+10(?:\s+(?:independent\s+)?"
+        r"(?:execution\s+)?tasks?|\s+requires\b)")),
+    ("estimate above 10", re.compile(r"\bestimate above 10(?:\s+tasks?)?\b")),
+    ("> 10 task-count", re.compile(r">\s*10`?\s+task-count\b")),
+    ("more than 10 task headings", re.compile(
+        r"\bmore than 10\s+`### Task `\s+headings\b")),
+    ("11 or more task/plan/scope", re.compile(
+        r"\b(?:needs?|requires?|require|would need)\s+11 or more\b")),
+    ("11 or more task/plan/scope", re.compile(
+        r"\b11 or more\s+(?:tasks?|plans?|scope)\b")),
+    ("11+ task/plan/scope", re.compile(r"\b11\+\s+(?:task|plan|scope)\b")),
+    ("11-task plan", re.compile(r"\b11-task\s+plan\b")),
+]
 # Legacy inline-orchestrator instructions that must NOT survive the rewrite.
 FORBIDDEN_IN_COMMAND = [
     "Derive the `task_list` manifest from the markdown",
@@ -729,6 +751,12 @@ def check_task_budget_surface_contracts() -> None:
             if not flex(snippet).search(body):
                 err(f"{path.relative_to(ROOT)}: missing task-budget contract "
                     f"{snippet!r}")
+        for pattern_name, pattern in STALE_TASK_BUDGET_PATTERNS:
+            for match in pattern.finditer(body):
+                stale_text = " ".join(match.group(0).split())
+                err(f"{path.relative_to(ROOT)}: stale task-budget ceiling "
+                    f"{stale_text!r}; required 15/16 contract "
+                    f"(pattern: {pattern_name})")
 
     bridge = command_section(live_text(COMMAND), PLAN_LOCKED_GATE_HEADING)
     enforcement = "more than 15 `### Task ` headings"

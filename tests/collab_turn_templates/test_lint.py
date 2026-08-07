@@ -69,6 +69,13 @@ def mutate_flex(path, snippet, replacement=MARK):
     path.write_text(mutated)
 
 
+def mutate_once(path, snippet, replacement):
+    """Replace one occurrence so repeated ceiling text cannot hide drift."""
+    text = path.read_text()
+    assert snippet in text, f"target not found in {path.name}: {snippet!r}"
+    path.write_text(text.replace(snippet, replacement, 1))
+
+
 # The lint's contract lists, duplicated here on purpose. Importing them from
 # the lint would make these tests parametrize over "whatever the lint currently
 # pins", so deleting an entry would silently shrink the sweep instead of
@@ -215,6 +222,51 @@ TASK_BUDGET_SURFACE_CASES = [
     (path, snippet)
     for path, snippets in TASK_BUDGET_SURFACE_SNIPPETS.items()
     for snippet in snippets
+]
+TASK_BUDGET_STALE_DRIFT_CASES = [
+    ("docs/COLLAB.md",
+     "minutes or any scope that credibly needs more than 15 tasks must be called out",
+     "more than 15 tasks"),
+    ("docs/COLLAB.md",
+     "contain 1–15 tasks. If it would need 16 or more, stop before sending `final`",
+     "1–15 tasks"),
+    ("docs/COLLAB.md",
+     "that the task list contains 1–15 tasks",
+     "1–15 tasks"),
+    ("docs/COLLAB.md", "A 16+ task issue", "16+ task"),
+    ("docs/EVALUATE_ISSUE.md", "collab's 15-task issue budget", "15-task issue budget"),
+    ("docs/EVALUATE_ISSUE.md", "An estimate above 15 requires `SPLIT`.",
+     "above 15 requires"),
+    ("docs/EVALUATE_ISSUE.md", "An estimate above 15 tasks always yields `SPLIT`",
+     "estimate above 15 tasks"),
+    ("docs/EVALUATE_ISSUE.md",
+     "1. <title> — <scope, acceptance summary, 1–15 task estimate, dependencies>",
+     "1–15 task estimate"),
+    (".claude-plugin/commands/evaluate-issue.md",
+     "1. <title> — <scope, acceptance summary, 1–15 task estimate, dependencies>",
+     "1–15 task estimate"),
+    (".codex-plugin/prompts/evaluate-issue.md",
+     "1. <title> — <scope, acceptance summary, 1–15 task estimate, dependencies>",
+     "1–15 task estimate"),
+    (".codex-plugin/commands/collab.md", "1–15 execution tasks", "1–15 execution tasks"),
+    (".claude-plugin/commands/collab.md",
+     "there are more than 15 `### Task ` headings",
+     "more than 15 `### Task ` headings"),
+    (".claude-plugin/commands/collab.md", "`> 15` task-count check",
+     "> 15` task-count"),
+    (".claude-plugin/commands/collab.md", "a 16-task\n   plan", "16-task plan"),
+    (".claude-plugin/prompts/collab-turn-plan-review.md",
+     "credibly needs 16 or more", "needs 16 or more"),
+    (".claude-plugin/prompts/collab-turn-plan-finalize.md", "at most 15 tasks",
+     "at most 15 tasks"),
+    (".claude-plugin/prompts/collab-turn-task-list.md",
+     "more than 15 tasks", "more than 15 tasks"),
+    (".codex-plugin/prompts/collab-plan-review.md",
+     "credibly needs 16 or more", "needs 16 or more"),
+    (".codex-plugin/prompts/collab-plan-finalize.md",
+     "If it needs 16 or more", "needs 16 or more"),
+    (".codex-plugin/prompts/collab-task-list.md",
+     "more than 15 tasks", "more than 15 tasks"),
 ]
 
 # The three-role checks added for pilot configurability are intentionally
@@ -603,6 +655,21 @@ def test_lint_requires_every_task_budget_surface_contract(tmp_path, path, snippe
 
     assert r.returncode == 1
     assert f"{path}: missing task-budget contract {snippet!r}" in r.stdout
+
+
+@pytest.mark.parametrize("path,context,canonical", TASK_BUDGET_STALE_DRIFT_CASES)
+def test_lint_rejects_each_single_occurrence_stale_task_budget_drift(
+        tmp_path, path, context, canonical):
+    fixture = copy_fixture(tmp_path)
+    stale_context = context.replace("15", "10").replace("16", "11")
+    stale = canonical.replace("15", "10").replace("16", "11")
+    mutate_once(fixture / path, context, stale_context)
+
+    r = run({"COLLAB_LINT_ROOT": str(fixture)})
+
+    assert r.returncode == 1
+    assert (f"{path}: stale task-budget ceiling {stale!r}; "
+            "required 15/16 contract") in r.stdout
 
 
 def test_lint_requires_both_harness_templates_per_topic(tmp_path):
