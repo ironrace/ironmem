@@ -3352,6 +3352,12 @@ mod tests {
 
     #[test]
     fn hybrid_vector_budget_preserves_prompt_hook_occupancy_reserve() {
+        // Keep the config socket override isolated for the entire fixture,
+        // including PromptHookEnvGuard's panic-safe cleanup below. Take this
+        // shared lock before this module's narrower env and tunable locks.
+        let _config_env = crate::config::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let _env = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
         let _prompt = prompt_hook_tunable_defaults();
         let _hybrid_env = PromptHookEnvGuard;
@@ -3500,6 +3506,9 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn stalled_hybrid_peer_preserves_byte_identical_local_recall() {
+        let _config_env = crate::config::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let _env = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
         let _prompt = prompt_hook_tunable_defaults();
         let _hybrid_env = PromptHookEnvGuard;
@@ -3558,6 +3567,9 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn unavailable_hybrid_peer_preserves_byte_identical_local_recall() {
+        let _config_env = crate::config::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let _env = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
         let _prompt = prompt_hook_tunable_defaults();
         let _hybrid_env = PromptHookEnvGuard;
@@ -3597,6 +3609,9 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn empty_hybrid_vector_response_preserves_byte_identical_local_recall() {
+        let _config_env = crate::config::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let _env = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
         let _prompt = prompt_hook_tunable_defaults();
         let _hybrid_env = PromptHookEnvGuard;
@@ -3644,6 +3659,9 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn superseded_vector_id_is_not_injected_or_promoted() {
+        let _config_env = crate::config::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let _env = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
         let _prompt = prompt_hook_tunable_defaults();
         let _hybrid_env = PromptHookEnvGuard;
@@ -3809,6 +3827,9 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn foreign_vector_ids_do_not_consume_max_hit_slots() {
+        let _config_env = crate::config::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let _env = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
         let _prompt = prompt_hook_tunable_defaults();
         let _hybrid_env = PromptHookEnvGuard;
@@ -3865,6 +3886,9 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn valid_vector_only_local_id_can_be_promoted_by_rrf() {
+        let _config_env = crate::config::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let _env = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
         let _prompt = prompt_hook_tunable_defaults();
         let _hybrid_env = PromptHookEnvGuard;
