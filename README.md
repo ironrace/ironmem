@@ -733,7 +733,7 @@ Codex and Claude Code read from and write to the **same database by default** (`
 The DB is updated automatically as you work:
 
 - **Session start** — bootstrap runs if this is the first time; the workspace is mined if it hasn't been indexed yet
-- **UserPromptSubmit** (Claude Code only) — every prompt triggers a budget-bounded FTS/BM25 drawer lookup (embedder never loaded) that injects up to 3 sanitized untrusted-memory excerpts as `additionalContext`; see [docs/CODEX.md](docs/CODEX.md) for the `IRONMEM_PROMPT_HOOK_*` tunables
+- **UserPromptSubmit** (Claude Code only) — every prompt triggers bounded local BM25/KG/diary recall (with opt-in ready-daemon hybrid vector recall; embedder never loaded by the hook) that injects sanitized untrusted-memory excerpts as `additionalContext`; see [docs/CODEX.md](docs/CODEX.md) for all prompt-recall tunables and daemon cost caveats
 - **Stop / PreCompact** — changed files are detected via SHA-256 manifest and re-mined incrementally; a session summary is appended to the diary
 - **Later sessions** — only files whose content hash changed since the last hook run are re-embedded, so updates are fast
 
@@ -880,16 +880,43 @@ Bound how many triples the KG layer serves and walks so a well-connected hub ent
 | `IRONMEM_KG_QUERY_LIMIT` | `50` | Max currently-valid triples `query_entity_current` returns (the `kg_query` tool and the KG-boost 1-hop fetch). Truncation is deterministic — ordered by `extracted_at DESC, id ASC`. `0` falls back to the default. |
 | `IRONMEM_KG_BOOST_FANOUT` | `32` | Max distinct related entities the KG boost walks to across all mentioned entities, bounding the per-triple entity lookups a high-degree hub would otherwise trigger unbounded. `0` falls back to the default. |
 
-### UserPromptSubmit FTS injection (Claude Code only)
+### UserPromptSubmit recall (Claude Code only)
 
-On every prompt, ironmem runs an FTS/BM25-only drawer lookup (the embedder is never loaded) and injects up to 3 sanitized one-line untrusted-memory excerpts as `hookSpecificOutput.additionalContext`, under a hard wall-clock budget. On overrun, lock contention, or no qualifying hit it emits nothing and exits 0. Codex registers no UserPromptSubmit hook.
+On every prompt, ironmem runs a bounded, fail-closed recall lookup and injects
+sanitized untrusted-memory excerpts as `hookSpecificOutput.additionalContext`.
+The ordinary path is local FTS5/BM25, followed by optional KG-triple and
+diary recall; the embedder is never loaded. Codex registers no UserPromptSubmit
+hook.
+
+Hybrid recall is opt-in. When enabled, the hook only borrows an already-ready
+shared daemon through its Unix socket for vector IDs; it never initializes,
+starts, or warms a daemon and never opens the daemon's database or embedder.
+Missing/unready daemon, connection or I/O deadline, malformed/error response,
+empty qualifying recall, DB/lock failure, or the hook deadline all fall back to
+the local BM25/KG/diary result (or emit no context). The hook abandons its
+worker/read at the deadline and exits successfully; a fallback is not an error.
+
+Operational cost: with hybrid recall enabled, each prompt may leave the
+shared-daemon search work running after the hook abandons its read. If that
+daemon search has LLM reranking enabled, the rerank can therefore add latency
+and API/subprocess cost per prompt even when the hook ultimately falls back or
+injects nothing. Keep hybrid and daemon reranking opt-in when that cost is not
+desired.
 
 | Variable | Default | Effect |
 |---|---|---|
 | `IRONMEM_PROMPT_HOOK_BUDGET_MS` | `150` | Hard wall-clock budget for the whole hook, milliseconds. Non-positive/unparseable falls back to the default; capped at `1000`. |
+| `IRONMEM_PROMPT_RECALL_HYBRID` | off | Set to `1`, `true`, or `yes` to ask a ready shared daemon for vector candidates. Other values leave hybrid recall off. No daemon is initialized or spawned by the hook. |
+| `IRONMEM_PROMPT_HOOK_HYBRID_BUDGET_MS` | `60` | Maximum wall-clock time for the hybrid vector request. Non-positive/unparseable falls back to `60`; the effective request also cannot exceed the outer hook budget after its reserve. |
+| `IRONMEM_PROMPT_HOOK_HYBRID_LIMIT` | `5` | Maximum vector candidates considered. Clamped to `1`–`10`. |
 | `IRONMEM_PROMPT_HOOK_MAX_HITS` | `3` | Max memory excerpts injected per prompt. Clamped to `1`–`3`. |
 | `IRONMEM_PROMPT_HOOK_MIN_SCORE` | `0.0` | Minimum BM25 score a hit must clear (higher = better). `0.0` lets any FTS match through, since `MATCH` already filters relevance. |
 | `IRONMEM_PROMPT_HOOK_SUMMARY_MAX_BYTES` | `120` | Byte cap for each injected one-line excerpt. |
+| `IRONMEM_PROMPT_HOOK_KG` | on | Set to `0`, `false`, or `no` to disable KG-triple recall. Other values use the default (enabled). |
+| `IRONMEM_PROMPT_HOOK_KG_MAX_TRIPLES` | `3` | Maximum KG triples injected per prompt. Clamped to `1`–`5`. |
+| `IRONMEM_PROMPT_HOOK_DIARY` | on | Set to `0`, `false`, or `no` to disable diary recall. Other values use the default (enabled). |
+| `IRONMEM_PROMPT_HOOK_DIARY_MAX` | `1` | Maximum diary excerpts injected per prompt. Clamped to `1`–`3`. |
+| `IRONMEM_PROMPT_HOOK_DIARY_LINE_BYTES` | `120` | Byte cap for each injected diary line. |
 | `IRONMEM_CONTEXT_WARN_PCT` | `0.60` | Context-occupancy fraction at which the hook injects a soft warning line (`>= warn`, `< handoff`). Unparseable or outside `0.0..=1.0` falls back to the default. If the resolved warn value `>=` handoff value, both revert to defaults to preserve the `warn < handoff` invariant. Occupancy uses `IRONMEM_CONTEXT_WINDOW` as the denominator. |
 | `IRONMEM_CONTEXT_HANDOFF_PCT` | `0.80` | Context-occupancy fraction at which the hook injects the handoff instruction (`>= handoff`). Same parsing/clamping and `warn < handoff` invariant as above. |
 
