@@ -508,7 +508,7 @@ fn rrf_scores_map_nway<'a>(
 }
 
 /// Weighted RRF merge. `bm25_weight ∈ [0, 1]` scales list_b's contribution.
-fn rrf_merge_weighted(
+pub(crate) fn rrf_merge_weighted(
     list_a: &[String],
     list_b: &[String],
     k: f32,
