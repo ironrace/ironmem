@@ -65,7 +65,7 @@ pub(crate) use task_list::{
 /// Maximum implementation tasks accepted by one collab session. Larger work
 /// must be split into independently executable child issues before collab
 /// planning is approved.
-pub const MAX_TASKS_PER_COLLAB_ISSUE: u32 = 10;
+pub const MAX_TASKS_PER_COLLAB_ISSUE: u32 = 15;
 
 /// Prefix on `coding_failure` that marks a failure as "branch drift" — a
 /// mismatch the non-owner may detect via its own git ops.
