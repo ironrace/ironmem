@@ -646,6 +646,80 @@ fn prompt_hook_stalled_hybrid_peer_matches_hybrid_off_within_budget() {
 
 #[cfg(unix)]
 #[test]
+fn prompt_hook_stalled_hybrid_peer_preserves_kg_diary_fallback() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("local.sqlite3");
+    let model_dir = dir.path().join("missing-model");
+    let socket_path = dir.path().join("stalled-daemon-with-fallbacks.sock");
+    seed_db_file_bulk(&db_path, 10_000);
+    let prompt = "drawer token alpha beta context";
+    let options = HookOptions {
+        socket_path: Some(socket_path.clone()),
+        hybrid: true,
+        hook_budget_ms: 150,
+        hybrid_budget_ms: 100,
+        hybrid_limit: 5,
+        max_hits: Some(3),
+        kg_enabled: Some(true),
+        diary_enabled: Some(true),
+        ..HookOptions::default()
+    };
+
+    let off = run_prompt_hook_with_options(
+        &db_path,
+        &model_dir,
+        prompt,
+        HookOptions {
+            socket_path: Some(socket_path.clone()),
+            hook_budget_ms: 150,
+            hybrid_budget_ms: 100,
+            hybrid_limit: 5,
+            max_hits: Some(3),
+            kg_enabled: Some(true),
+            diary_enabled: Some(true),
+            ..HookOptions::default()
+        },
+    );
+    let (peer, accepted) = spawn_stalled_peer(&socket_path);
+    let on = run_prompt_hook_with_options(&db_path, &model_dir, prompt, options);
+    assert!(
+        accepted.recv_timeout(Duration::from_secs(1)).is_ok(),
+        "the hook must use the real stalled Unix peer"
+    );
+    drop(peer);
+
+    assert!(
+        on.elapsed <= Duration::from_millis(150),
+        "stalled-daemon fallback exceeded the outer hook guard: {:?}",
+        on.elapsed
+    );
+    assert!(
+        on.elapsed < Duration::from_millis(90),
+        "local KG/diary fallback must finish without waiting for the vector deadline: {:?}",
+        on.elapsed
+    );
+    assert_eq!(
+        on.raw, off.raw,
+        "stalled vector I/O must preserve local drawer/KG/diary bytes"
+    );
+    let output = on
+        .json
+        .get("hookSpecificOutput")
+        .and_then(|hook| hook.get("additionalContext"))
+        .and_then(Value::as_str)
+        .expect("local fallback must still inject context");
+    assert!(
+        output.contains("source=\"kg\""),
+        "KG fallback missing: {output}"
+    );
+    assert!(
+        output.contains("source=\"diary\""),
+        "diary fallback missing: {output}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
 fn prompt_hook_warm_noop_daemon_fuses_compact_remote_ids_into_local_rendering() {
     let dir = tempfile::tempdir().unwrap();
     let local_db = dir.path().join("local.sqlite3");

@@ -556,6 +556,10 @@ fn sample_occupancy(
 /// transcript-tail scan and DB write stay well inside the prompt budget.
 const PROMPT_HOOK_OCCUPANCY_RESERVE_MS: u64 = 30;
 
+/// Small final handoff window for a fast vector peer after local recall work
+/// has completed. This is deliberately separate from the vector deadline.
+const PROMPT_HOOK_VECTOR_HANDOFF_MS: u64 = 10;
+
 /// Parent-safe launch ceiling for one hybrid vector request.
 ///
 /// The outer prompt-hook budget must retain the named render/occupancy reserve
@@ -793,7 +797,6 @@ fn search_prompt_context(
         let vector_budget = effective_hybrid_vector_budget(remaining)?;
         let vector_deadline = Instant::now().checked_add(vector_budget)?;
         let (vector_tx, vector_rx) = std::sync::mpsc::channel();
-        let (forward_tx, forward_rx) = std::sync::mpsc::channel();
         let query = prompt.to_string();
         std::thread::spawn(move || {
             let ids = crate::mcp::daemon_client::search_ids(
@@ -804,15 +807,10 @@ fn search_prompt_context(
             );
             let _ = vector_tx.send(ids);
         });
-        Some((vector_rx, forward_tx, forward_rx, vector_deadline))
+        Some(vector_rx)
     });
 
-    let (vector_rx, vector_forward_tx, local_vector_rx, vector_deadline) = match vector_setup {
-        Some((rx, forward_tx, forward_rx, deadline)) => {
-            (Some(rx), Some(forward_tx), Some(forward_rx), Some(deadline))
-        }
-        None => (None, None, None, None),
-    };
+    let local_vector_rx = vector_setup;
 
     let (tx, rx) = std::sync::mpsc::channel();
     let db_path = db_path.to_path_buf();
@@ -822,19 +820,6 @@ fn search_prompt_context(
         let result = prompt_recall_block(&db_path, &prompt, worker_budget, local_vector_rx);
         let _ = tx.send(result); // receiver gone (timed out) → drop silently
     });
-
-    // Resolve the vector result at its own deadline, then hand the result (or
-    // a fail-closed miss) to the local worker. The local worker may already be
-    // doing BM25/KG/diary work, so this forwarding send never blocks it.
-    if let (Some(vector_rx), Some(forward_tx), Some(deadline)) =
-        (vector_rx, vector_forward_tx, vector_deadline)
-    {
-        let vector_remaining = deadline.checked_duration_since(Instant::now());
-        let vector_ids = vector_remaining
-            .and_then(|timeout| vector_rx.recv_timeout(timeout).ok())
-            .flatten();
-        let _ = forward_tx.send(vector_ids);
-    }
 
     let local_remaining = budget.checked_sub(start.elapsed()).unwrap_or_default();
     match rx.recv_timeout(local_remaining) {
@@ -924,8 +909,14 @@ fn recall_block_from_vector_rx(
     vector_rx: std::sync::mpsc::Receiver<Option<Vec<String>>>,
 ) -> Option<String> {
     let qualifying = bm25_qualifying(db, prompt, config)?;
-    let vector_ids = vector_rx.recv().ok().flatten();
-    recall_block_from_qualifying(db, prompt, config, qualifying, vector_ids.as_deref())
+    recall_block_from_qualifying_with_vector_poll(
+        db,
+        prompt,
+        config,
+        qualifying,
+        None,
+        Some(&vector_rx),
+    )
 }
 
 fn bm25_qualifying(
@@ -955,6 +946,61 @@ fn recall_block_from_qualifying(
     qualifying: Vec<(String, f32)>,
     vector_ids: Option<&[String]>,
 ) -> Option<String> {
+    recall_block_from_qualifying_with_vector_poll(
+        db,
+        prompt,
+        config,
+        qualifying,
+        vector_ids.map(|ids| Some(ids.to_vec())),
+        None,
+    )
+}
+
+fn poll_vector_response(
+    response: &mut Option<Option<Vec<String>>>,
+    vector_rx: Option<&std::sync::mpsc::Receiver<Option<Vec<String>>>>,
+) {
+    let Some(vector_rx) = vector_rx else {
+        return;
+    };
+    if response.is_some() {
+        return;
+    }
+    match vector_rx.try_recv() {
+        Ok(ids) => *response = Some(ids),
+        Err(std::sync::mpsc::TryRecvError::Disconnected) => *response = Some(None),
+        Err(std::sync::mpsc::TryRecvError::Empty) => {}
+    }
+}
+
+fn opportunistic_vector_response(
+    response: &mut Option<Option<Vec<String>>>,
+    vector_rx: Option<&std::sync::mpsc::Receiver<Option<Vec<String>>>>,
+) {
+    let Some(vector_rx) = vector_rx else {
+        return;
+    };
+    if response.is_some() {
+        return;
+    }
+    // This is only a short scheduler handoff after local recall has progressed,
+    // never the configured vector deadline. A stalled peer therefore cannot
+    // consume the local KG/diary or outer render budget.
+    match vector_rx.recv_timeout(Duration::from_millis(PROMPT_HOOK_VECTOR_HANDOFF_MS)) {
+        Ok(ids) => *response = Some(ids),
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => *response = Some(None),
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+    }
+}
+
+fn recall_block_from_qualifying_with_vector_poll(
+    db: &crate::db::schema::Database,
+    prompt: &str,
+    config: &RecallConfig,
+    qualifying: Vec<(String, f32)>,
+    initial_vector_response: Option<Option<Vec<String>>>,
+    vector_rx: Option<&std::sync::mpsc::Receiver<Option<Vec<String>>>>,
+) -> Option<String> {
     let RecallConfig {
         max_hits,
         line_bytes,
@@ -970,104 +1016,9 @@ fn recall_block_from_qualifying(
     // KG (or, later, diary) hits from still producing a recall block — the
     // final `lines.is_empty()` check below is the single source of truth for
     // "nothing to inject".
-    let (selected_ids, drawers) = if let Some(vector_ids) = vector_ids.filter(|ids| !ids.is_empty())
-    {
-        let bm25_ids: Vec<String> = qualifying.iter().map(|(id, _)| id.clone()).collect();
-        let mut lookup_ids = bm25_ids.clone();
-        for id in vector_ids {
-            if !lookup_ids.iter().any(|candidate| candidate == id) {
-                lookup_ids.push(id.clone());
-            }
-        }
-        let lookup_refs: Vec<&str> = lookup_ids.iter().map(String::as_str).collect();
-        let fetched = match db.get_drawers_by_ids_filtered(&lookup_refs, None, None, false) {
-            Ok(drawers) => drawers,
-            Err(e) => {
-                tracing::warn!("prompt-hook recall: drawer fetch failed: {e}");
-                return None;
-            }
-        };
-        let current_bm25_ids: Vec<String> = bm25_ids
-            .iter()
-            .filter(|id| fetched.contains_key(*id))
-            .cloned()
-            .collect();
-        let valid_vector_ids: Vec<String> = vector_ids
-            .iter()
-            .filter(|id| fetched.contains_key(*id))
-            .cloned()
-            .collect();
-
-        if valid_vector_ids.is_empty() {
-            let mut ids: Vec<String> = qualifying
-                .iter()
-                .take(max_hits)
-                .map(|(id, _)| id.clone())
-                .collect();
-            let refs: Vec<&str> = ids.iter().map(String::as_str).collect();
-            let drawers = match db.get_drawers_by_ids(&refs) {
-                Ok(drawers) => drawers,
-                Err(e) => {
-                    tracing::warn!("prompt-hook recall: drawer fetch failed: {e}");
-                    return None;
-                }
-            };
-            ids.sort_unstable();
-            (ids, drawers)
-        } else {
-            let sparse_threshold = crate::search::tunables::bm25_sparse_threshold();
-            let bm25_weight = if current_bm25_ids.is_empty() {
-                0.0
-            } else if current_bm25_ids.len() < sparse_threshold {
-                current_bm25_ids.len() as f32 / sparse_threshold as f32
-            } else {
-                1.0
-            };
-            let merged = crate::search::pipeline::rrf_merge_weighted(
-                &valid_vector_ids,
-                &current_bm25_ids,
-                crate::search::tunables::rrf_k(),
-                bm25_weight,
-            );
-            let mut ids: Vec<String> = merged
-                .into_iter()
-                .filter(|id| fetched.contains_key(id))
-                .take(max_hits)
-                .collect();
-            ids.sort_unstable();
-            (ids, fetched)
-        }
-    } else {
-        let mut ids: Vec<String> = qualifying
-            .iter()
-            .take(max_hits)
-            .map(|(id, _)| id.clone())
-            .collect();
-        let refs: Vec<&str> = ids.iter().map(String::as_str).collect();
-        let drawers = match db.get_drawers_by_ids(&refs) {
-            Ok(drawers) => drawers,
-            Err(e) => {
-                tracing::warn!("prompt-hook recall: drawer fetch failed: {e}");
-                return None;
-            }
-        };
-        ids.sort_unstable();
-        (ids, drawers)
-    };
-
+    let mut vector_response = initial_vector_response;
+    poll_vector_response(&mut vector_response, vector_rx);
     let mut lines = Vec::new();
-    for id in selected_ids {
-        if let Some(d) = drawers.get(&id) {
-            let excerpt = compact_excerpt(&d.content, line_bytes);
-            if !excerpt.is_empty() {
-                let wing = compact_excerpt(&d.wing, PROMPT_RECALL_LABEL_BYTES);
-                let room = compact_excerpt(&d.room, PROMPT_RECALL_LABEL_BYTES);
-                let source = serde_json::to_string(&format!("{wing}/{room}")).ok()?;
-                let excerpt = serde_json::to_string(&excerpt).ok()?;
-                lines.push(format!("- source={source} excerpt={excerpt}"));
-            }
-        }
-    }
 
     // KG triple recall
     if kg_enabled {
@@ -1159,6 +1110,115 @@ fn recall_block_from_qualifying(
             }
         }
     }
+
+    // Give the vector worker one bounded final handoff after the local KG/diary
+    // work has progressed. A response that is still pending cannot take
+    // ownership of the local DB work or full render budget; local recall wins.
+    opportunistic_vector_response(&mut vector_response, vector_rx);
+    poll_vector_response(&mut vector_response, vector_rx);
+    let vector_ids = vector_response
+        .as_ref()
+        .and_then(|response| response.as_deref());
+    let (selected_ids, drawers) = if let Some(vector_ids) = vector_ids.filter(|ids| !ids.is_empty())
+    {
+        let bm25_ids: Vec<String> = qualifying.iter().map(|(id, _)| id.clone()).collect();
+        let mut lookup_ids = bm25_ids.clone();
+        for id in vector_ids {
+            if !lookup_ids.iter().any(|candidate| candidate == id) {
+                lookup_ids.push(id.clone());
+            }
+        }
+        let lookup_refs: Vec<&str> = lookup_ids.iter().map(String::as_str).collect();
+        let fetched = match db.get_drawers_by_ids_filtered(&lookup_refs, None, None, false) {
+            Ok(drawers) => drawers,
+            Err(e) => {
+                tracing::warn!("prompt-hook recall: drawer fetch failed: {e}");
+                return None;
+            }
+        };
+        let current_bm25_ids: Vec<String> = bm25_ids
+            .iter()
+            .filter(|id| fetched.contains_key(*id))
+            .cloned()
+            .collect();
+        let valid_vector_ids: Vec<String> = vector_ids
+            .iter()
+            .filter(|id| fetched.contains_key(*id))
+            .cloned()
+            .collect();
+
+        if valid_vector_ids.is_empty() {
+            let mut ids: Vec<String> = qualifying
+                .iter()
+                .take(max_hits)
+                .map(|(id, _)| id.clone())
+                .collect();
+            let refs: Vec<&str> = ids.iter().map(String::as_str).collect();
+            let drawers = match db.get_drawers_by_ids(&refs) {
+                Ok(drawers) => drawers,
+                Err(e) => {
+                    tracing::warn!("prompt-hook recall: drawer fetch failed: {e}");
+                    return None;
+                }
+            };
+            ids.sort_unstable();
+            (ids, drawers)
+        } else {
+            let sparse_threshold = crate::search::tunables::bm25_sparse_threshold();
+            let bm25_weight = if current_bm25_ids.is_empty() {
+                0.0
+            } else if current_bm25_ids.len() < sparse_threshold {
+                current_bm25_ids.len() as f32 / sparse_threshold as f32
+            } else {
+                1.0
+            };
+            let merged = crate::search::pipeline::rrf_merge_weighted(
+                &valid_vector_ids,
+                &current_bm25_ids,
+                crate::search::tunables::rrf_k(),
+                bm25_weight,
+            );
+            let mut ids: Vec<String> = merged
+                .into_iter()
+                .filter(|id| fetched.contains_key(id))
+                .take(max_hits)
+                .collect();
+            ids.sort_unstable();
+            (ids, fetched)
+        }
+    } else {
+        let mut ids: Vec<String> = qualifying
+            .iter()
+            .take(max_hits)
+            .map(|(id, _)| id.clone())
+            .collect();
+        let refs: Vec<&str> = ids.iter().map(String::as_str).collect();
+        let drawers = match db.get_drawers_by_ids(&refs) {
+            Ok(drawers) => drawers,
+            Err(e) => {
+                tracing::warn!("prompt-hook recall: drawer fetch failed: {e}");
+                return None;
+            }
+        };
+        ids.sort_unstable();
+        (ids, drawers)
+    };
+
+    let mut drawer_lines = Vec::new();
+    for id in selected_ids {
+        if let Some(d) = drawers.get(&id) {
+            let excerpt = compact_excerpt(&d.content, line_bytes);
+            if !excerpt.is_empty() {
+                let wing = compact_excerpt(&d.wing, PROMPT_RECALL_LABEL_BYTES);
+                let room = compact_excerpt(&d.room, PROMPT_RECALL_LABEL_BYTES);
+                let source = serde_json::to_string(&format!("{wing}/{room}")).ok()?;
+                let excerpt = serde_json::to_string(&excerpt).ok()?;
+                drawer_lines.push(format!("- source={source} excerpt={excerpt}"));
+            }
+        }
+    }
+    drawer_lines.extend(lines);
+    lines = drawer_lines;
 
     if lines.is_empty() {
         return None;
