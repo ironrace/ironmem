@@ -547,6 +547,25 @@ fn sample_occupancy(
 /// transcript-tail scan and DB write stay well inside the prompt budget.
 const PROMPT_HOOK_OCCUPANCY_RESERVE_MS: u64 = 30;
 
+/// Parent-safe launch ceiling for one hybrid vector request.
+///
+/// The outer prompt-hook budget must retain the named render/occupancy reserve
+/// even when hybrid recall is enabled. Callers must check this at request
+/// launch: `None` means the reserve is exhausted, and `Some` is the lesser of
+/// the configured hybrid budget and the time left after that reserve.
+// This contract is intentionally defined before the follow-up launch path
+// consumes it.
+#[allow(dead_code)]
+pub(crate) fn effective_hybrid_vector_budget(
+    remaining_outer_wall_budget: Duration,
+) -> Option<Duration> {
+    let reserve = Duration::from_millis(PROMPT_HOOK_OCCUPANCY_RESERVE_MS);
+    let remaining_after_reserve = remaining_outer_wall_budget.checked_sub(reserve)?;
+    let configured = Duration::from_millis(crate::search::tunables::prompt_hook_hybrid_budget_ms());
+    let effective = configured.min(remaining_after_reserve);
+    (!effective.is_zero()).then_some(effective)
+}
+
 // ── Occupancy tier + notice ─────────────────────────────────────────────────
 
 /// Occupancy tier derived from context-window percentage.
@@ -1619,15 +1638,21 @@ mod tests {
         std::env::remove_var("IRONMEM_PROMPT_HOOK_SUMMARY_MAX_BYTES");
         std::env::remove_var("IRONMEM_PROMPT_HOOK_KG");
         std::env::remove_var("IRONMEM_PROMPT_HOOK_DIARY");
+        std::env::remove_var("IRONMEM_PROMPT_RECALL_HYBRID");
+        std::env::remove_var("IRONMEM_PROMPT_HOOK_HYBRID_BUDGET_MS");
+        std::env::remove_var("IRONMEM_PROMPT_HOOK_HYBRID_LIMIT");
         guard
     }
 
-    /// Drop guard that removes `IRONMEM_PROMPT_HOOK_BUDGET_MS` on scope exit,
-    /// including on panic/unwind, so the var never leaks to other ENV_MUTEX tests.
-    struct PromptHookBudgetEnvGuard;
-    impl Drop for PromptHookBudgetEnvGuard {
+    /// Drop guard that removes prompt-hook tunables on scope exit, including on
+    /// panic/unwind, so no value leaks to other ENV_MUTEX tests.
+    struct PromptHookEnvGuard;
+    impl Drop for PromptHookEnvGuard {
         fn drop(&mut self) {
             std::env::remove_var("IRONMEM_PROMPT_HOOK_BUDGET_MS");
+            std::env::remove_var("IRONMEM_PROMPT_RECALL_HYBRID");
+            std::env::remove_var("IRONMEM_PROMPT_HOOK_HYBRID_BUDGET_MS");
+            std::env::remove_var("IRONMEM_PROMPT_HOOK_HYBRID_LIMIT");
         }
     }
 
@@ -3059,6 +3084,42 @@ mod tests {
     }
 
     #[test]
+    fn hybrid_vector_budget_preserves_prompt_hook_occupancy_reserve() {
+        let _env = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let _prompt = prompt_hook_tunable_defaults();
+        let _hybrid_env = PromptHookEnvGuard;
+
+        assert_eq!(
+            effective_hybrid_vector_budget(Duration::from_millis(
+                PROMPT_HOOK_OCCUPANCY_RESERVE_MS + 15,
+            )),
+            Some(Duration::from_millis(15)),
+            "hybrid recall may use only the time left after the occupancy reserve"
+        );
+        assert_eq!(
+            effective_hybrid_vector_budget(
+                Duration::from_millis(PROMPT_HOOK_OCCUPANCY_RESERVE_MS,)
+            ),
+            None,
+            "no vector request may launch when only the occupancy reserve remains"
+        );
+        assert_eq!(
+            effective_hybrid_vector_budget(Duration::from_millis(
+                PROMPT_HOOK_OCCUPANCY_RESERVE_MS - 1,
+            )),
+            None,
+            "a parent already inside the reserve cannot launch vector recall"
+        );
+
+        std::env::set_var("IRONMEM_PROMPT_HOOK_HYBRID_BUDGET_MS", "7");
+        assert_eq!(
+            effective_hybrid_vector_budget(Duration::from_millis(200)),
+            Some(Duration::from_millis(7)),
+            "configured hybrid budget remains a ceiling above the reserve"
+        );
+    }
+
+    #[test]
     fn prompt_hook_writes_occupancy_sample() {
         use crate::metrics::METRICS_ENV_LOCK;
         let _env = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
@@ -3072,7 +3133,7 @@ mod tests {
         // budget. At the 150ms default a loaded CI runner can spend the whole
         // budget on recall scheduling alone and bank no row, so this asserts a
         // race rather than the contract. Pin the budget to the 1000ms cap.
-        let _budget = PromptHookBudgetEnvGuard;
+        let _budget = PromptHookEnvGuard;
         std::env::set_var("IRONMEM_PROMPT_HOOK_BUDGET_MS", "1000");
 
         let dir = tempfile::tempdir().unwrap();
@@ -3118,7 +3179,7 @@ mod tests {
         // sample is skipped when less than the reserve remains, which a loaded
         // runner reaches at the 150ms default. Pin it so this asserts the
         // ReadOnly decoupling contract and not the scheduler.
-        let _budget = PromptHookBudgetEnvGuard;
+        let _budget = PromptHookEnvGuard;
         std::env::set_var("IRONMEM_PROMPT_HOOK_BUDGET_MS", "1000");
 
         let dir = tempfile::tempdir().unwrap();
@@ -3329,7 +3390,7 @@ mod tests {
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         std::env::set_var("IRONMEM_PROMPT_HOOK_BUDGET_MS", "150");
-        let _budget_guard = PromptHookBudgetEnvGuard;
+        let _budget_guard = PromptHookEnvGuard;
 
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("m.sqlite3");
