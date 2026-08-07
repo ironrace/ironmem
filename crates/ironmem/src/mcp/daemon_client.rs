@@ -9,7 +9,68 @@ use std::path::Path;
 use std::time::{Duration, Instant};
 
 const MAX_RESPONSE_BYTES: usize = 1024 * 1024;
+const MAX_REQUEST_BYTES: usize = 64 * 1024;
 const REQUEST_ID: u64 = 1;
+
+#[cfg(unix)]
+#[derive(serde::Serialize)]
+struct SearchRequest<'a> {
+    jsonrpc: &'static str,
+    id: u64,
+    method: &'static str,
+    params: SearchParams<'a>,
+}
+
+#[cfg(unix)]
+#[derive(serde::Serialize)]
+struct SearchParams<'a> {
+    name: &'static str,
+    arguments: SearchArguments<'a>,
+}
+
+#[cfg(unix)]
+#[derive(serde::Serialize)]
+struct SearchArguments<'a> {
+    query: &'a str,
+    limit: usize,
+}
+
+#[cfg(unix)]
+struct BoundedRequest {
+    bytes: Vec<u8>,
+}
+
+#[cfg(unix)]
+impl BoundedRequest {
+    fn new() -> Self {
+        Self {
+            bytes: Vec::with_capacity(MAX_REQUEST_BYTES),
+        }
+    }
+
+    fn into_bytes(self) -> Vec<u8> {
+        self.bytes
+    }
+}
+
+#[cfg(unix)]
+impl std::io::Write for BoundedRequest {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        let remaining = MAX_REQUEST_BYTES.saturating_sub(self.bytes.len());
+        if bytes.len() > remaining {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "daemon search request exceeds the size limit",
+            ));
+        }
+        self.bytes.extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
 
 /// Search the already-running daemon without initialization, spawning, or
 /// touching the local embedder. The deadline is absolute and applies to the
@@ -30,24 +91,26 @@ pub(crate) fn search_ids(
     }
 
     let mut stream = connect_with_deadline(socket_path, deadline)?;
-    let mut request = serde_json::to_vec(&serde_json::json!({
-        "jsonrpc": "2.0",
-        "id": REQUEST_ID,
-        "method": "tools/call",
-        "params": {
-            "name": "search",
-            "arguments": {
-                "query": query,
-                "limit": limit,
-            }
-        }
-    }))
+    let mut request = BoundedRequest::new();
+    serde_json::to_writer(
+        &mut request,
+        &SearchRequest {
+            jsonrpc: "2.0",
+            id: REQUEST_ID,
+            method: "tools/call",
+            params: SearchParams {
+                name: "search",
+                arguments: SearchArguments { query, limit },
+            },
+        },
+    )
     .ok()?;
-    request.push(b'\n');
+    std::io::Write::write_all(&mut request, b"\n").ok()?;
+    let request = request.into_bytes();
 
     write_with_deadline(&mut stream, &request, deadline)?;
     let response = read_bounded_line(&mut stream, deadline)?;
-    parse_search_ids(&response)
+    parse_search_ids(&response, limit)
 }
 
 /// The daemon transport is unavailable on platforms without Unix sockets.
@@ -301,7 +364,7 @@ fn wait_for_fd(fd: std::os::fd::RawFd, event: i16, deadline: Instant) -> Option<
     }
 }
 
-fn parse_search_ids(response: &[u8]) -> Option<Vec<String>> {
+fn parse_search_ids(response: &[u8], limit: usize) -> Option<Vec<String>> {
     let response: serde_json::Value = serde_json::from_slice(response).ok()?;
     if response.get("jsonrpc").and_then(serde_json::Value::as_str) != Some("2.0")
         || response.get("id").and_then(serde_json::Value::as_u64) != Some(REQUEST_ID)
@@ -331,14 +394,17 @@ fn parse_search_ids(response: &[u8]) -> Option<Vec<String>> {
 
     let results = validated_search_results(payload.get("results")?)?;
     let rows = results.as_array()?;
-    let ids: Vec<String> = rows
-        .iter()
-        .map(|row| {
-            row.get("id")
-                .and_then(serde_json::Value::as_str)
-                .map(str::to_owned)
-        })
-        .collect::<Option<Vec<_>>>()?;
+    let mut seen = std::collections::HashSet::new();
+    let mut ids = Vec::with_capacity(limit.min(rows.len()));
+    for row in rows {
+        let id = row
+            .get("id")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned)?;
+        if ids.len() < limit && seen.insert(id.clone()) {
+            ids.push(id);
+        }
+    }
     (!ids.is_empty()).then_some(ids)
 }
 
@@ -384,6 +450,14 @@ mod tests {
 
     #[cfg(unix)]
     fn run_socket_fixture(response: Option<Vec<u8>>) -> Option<Vec<String>> {
+        run_socket_fixture_with_limit(response, 5)
+    }
+
+    #[cfg(unix)]
+    fn run_socket_fixture_with_limit(
+        response: Option<Vec<u8>>,
+        limit: usize,
+    ) -> Option<Vec<String>> {
         use std::io::{BufRead, BufReader, Write};
         use std::os::unix::net::UnixListener;
         use std::thread;
@@ -408,11 +482,40 @@ mod tests {
         let ids = super::search_ids(
             &socket_path,
             "fixture query",
-            5,
+            limit,
             Instant::now() + Duration::from_secs(2),
         );
         server.join().unwrap();
         ids
+    }
+
+    #[cfg(unix)]
+    fn run_socket_fixture_observing_request(query: &str) -> (String, Option<Vec<String>>) {
+        use std::io::{BufRead, BufReader};
+        use std::os::unix::net::UnixListener;
+        use std::sync::mpsc::channel;
+        use std::thread;
+        use std::time::{Duration, Instant};
+
+        let dir = tempfile::tempdir().unwrap();
+        let socket_path = dir.path().join("daemon.sock");
+        let listener = UnixListener::bind(&socket_path).unwrap();
+        let (request_tx, request_rx) = channel();
+        let server = thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let mut request_line = String::new();
+            BufReader::new(stream).read_line(&mut request_line).unwrap();
+            request_tx.send(request_line).unwrap();
+        });
+
+        let ids = super::search_ids(
+            &socket_path,
+            query,
+            5,
+            Instant::now() + Duration::from_secs(2),
+        );
+        server.join().unwrap();
+        (request_rx.recv().unwrap(), ids)
     }
 
     #[cfg(unix)]
@@ -474,6 +577,34 @@ mod tests {
             "server fixture panicked: {server_result:?}"
         );
         assert_eq!(ids, Some(vec!["first".to_string(), "second".to_string()]));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn oversized_serialized_request_is_rejected_before_write() {
+        let oversized_query = "x".repeat(super::MAX_REQUEST_BYTES);
+        let (request_line, ids) = run_socket_fixture_observing_request(&oversized_query);
+
+        assert!(request_line.is_empty());
+        assert_eq!(ids, None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn duplicate_ids_are_ordered_deduplicated_and_capped() {
+        let response = search_response(serde_json::json!({
+            "results": [
+                {"id": "first"},
+                {"id": "first"},
+                {"id": "second"},
+                {"id": "third"}
+            ]
+        }));
+
+        assert_eq!(
+            run_socket_fixture_with_limit(Some(response), 2),
+            Some(vec!["first".to_owned(), "second".to_owned()])
+        );
     }
 
     #[cfg(unix)]
