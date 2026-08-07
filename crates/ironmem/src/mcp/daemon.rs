@@ -250,10 +250,39 @@ fn temp_socket_path(path: &Path) -> std::path::PathBuf {
 ///
 /// Accept errors are logged and the loop continues: a transient accept failure
 /// (a client that vanished mid-handshake, a momentary fd-limit hiccup) must not
-/// tear down a daemon serving many other peers. On `shutdown`, or on idle-timer
-/// expiry, we stop accepting and return immediately; in-flight handlers are
-/// dropped (their sockets close). Callers own removing the socket/lockfile on
-/// return (see `run_daemon`).
+/// tear down a daemon serving many other peers.
+///
+/// Graceful RETIRE on `shutdown` (fired by SIGTERM/SIGINT — see [`run_daemon`]):
+/// a signalled daemon is retired, not killed. It CLOSES the listening fd, then
+/// keeps polling the handlers already in `connections` until every one has run
+/// to its natural end, and only then returns. This extends the same "an
+/// admitted connection is served, never dropped" guarantee the biased `select!`
+/// gives the idle timer to the shutdown path as well: an attached Claude Code /
+/// Codex session keeps working across the signal and is never cut off
+/// mid-conversation. There is deliberately no drain deadline — a client may
+/// legitimately hold its connection for hours, and a caller that needs the
+/// process gone NOW should `SIGKILL` it (or signal twice, see [`run_daemon`]).
+///
+/// Closing the listener (rather than merely ceasing to select on it) is what
+/// makes the retire safe for NEW clients: with the fd closed, a later
+/// `connect()` is refused instead of landing in a backlog nobody will ever
+/// drain — and `ConnectionRefused` is exactly the kind `run_connect_mode_io`
+/// treats as "no daemon here", so the next `--connect` proxy auto-spawns a
+/// fresh daemon (on the freshly installed binary) whose `prepare_socket_path`
+/// reclaims the now-stale socket file. The retiring daemon deliberately does
+/// NOT unlink that file itself: it still owns the path until it exits, and
+/// [`SocketCleanupGuard`] is what removes it, exactly once, on the way out.
+///
+/// Idle-timer expiry is unchanged and still returns immediately rather than
+/// draining: it can only fire while `active == 0`, at which point `connections`
+/// is necessarily empty, so "return now" and "drain, then return" are the same
+/// thing there.
+///
+/// Callers own removing the socket/lockfile on return (see `run_daemon`). The
+/// drain window this path introduces — during which a successor may reclaim and
+/// rebind the socket path while this daemon is still alive — is precisely why
+/// [`SocketCleanupGuard`] must check that the socket is still ITS socket before
+/// removing it.
 #[cfg(unix)]
 pub async fn serve_accept_loop(
     app: Arc<App>,
@@ -276,11 +305,43 @@ pub async fn serve_accept_loop(
     let mut idle_deadline: Option<tokio::time::Instant> =
         Some(tokio::time::Instant::now() + idle_timeout);
 
+    // `Some` while this daemon still accepts; `None` once `shutdown` has
+    // retired it. `retire_requested` is a separate flag rather than the
+    // shutdown arm simply doing `listener.take()` because the accept branch
+    // borrows `listener` for the whole `select!` — so the retirement is
+    // recorded here and performed at the top of the next iteration.
+    let mut listener = Some(listener);
+    let mut retire_requested = false;
+
     loop {
+        // Closing the fd (not just ignoring it) is load-bearing: it makes a
+        // later `connect()` be REFUSED rather than succeed into a backlog
+        // nothing will ever accept from. The socket file itself stays ours
+        // until exit — `SocketCleanupGuard` removes it.
+        if retire_requested {
+            drop(listener.take());
+        }
+
+        // Retired AND fully drained: every connection admitted before the
+        // signal has finished, and nothing new can arrive. Graceful exit.
+        if listener.is_none() && connections.is_empty() {
+            tracing::info!("daemon drained after shutdown signal; exiting");
+            break;
+        }
+
         let idle_sleep = async {
             match idle_deadline {
                 Some(deadline) => tokio::time::sleep_until(deadline).await,
                 None => std::future::pending::<()>().await,
+            }
+        };
+
+        // Never resolves once retired, so the accept branch stays in the
+        // `select!` (keeping it first under `biased`) while admitting nothing.
+        let accept_next = async {
+            match listener.as_ref() {
+                Some(listener) => listener.accept().await,
+                None => std::future::pending().await,
             }
         };
 
@@ -289,7 +350,7 @@ pub async fn serve_accept_loop(
 
             // Highest priority: an accepted connection always wins over an
             // expired idle timer on the same poll (see doc comment above).
-            accepted = listener.accept() => {
+            accepted = accept_next => {
                 match accepted {
                     Ok((stream, _addr)) => {
                         // Admit BEFORE the handler future is even constructed:
@@ -346,7 +407,17 @@ pub async fn serve_accept_loop(
                     idle_deadline = Some(tokio::time::Instant::now() + idle_timeout);
                 }
             }
-            _ = &mut shutdown => break,
+            // Retire rather than break: stop accepting, then keep looping so
+            // the branch above drains every already-admitted connection. The
+            // `!retire_requested` guard also stops this branch from polling an
+            // already-resolved `oneshot::Receiver` on later iterations.
+            _ = &mut shutdown, if !retire_requested => {
+                tracing::info!(
+                    "daemon received shutdown; retiring and draining {} in-flight connection(s)",
+                    active.load(Ordering::SeqCst)
+                );
+                retire_requested = true;
+            }
             // Lowest priority: only fires when nothing else was ready this poll.
             _ = idle_sleep => {
                 tracing::info!("daemon idle for {idle_timeout:?}; shutting down");
@@ -369,14 +440,58 @@ pub async fn serve_accept_loop(
 /// Deliberately does NOT also remove a lockfile (H1): `<socket>.lock` is
 /// owned by the `--connect` auto-spawn proxy's [`LockGuard`], not by the
 /// daemon process itself, so the daemon must never touch it.
+///
+/// The removal is also conditional on the path still being OUR socket. C1
+/// originally only had to cover a failed bind (fixed by never constructing the
+/// guard in that case), because the sole exit path — the idle timer — fires at
+/// zero connections and returns instantly, leaving no window for anyone else to
+/// bind. The graceful-retire path in [`serve_accept_loop`] opens exactly such a
+/// window: it closes the listener the moment it is signalled and can then drain
+/// for as long as an attached client lives — during which the socket file looks
+/// stale to everyone else, so a successor daemon legitimately reclaims it and
+/// binds a NEW socket at the same path. An unconditional `remove_file` at exit
+/// would then unlink the LIVE successor's socket — the same C1 hazard arriving
+/// by a new route. Comparing `(st_dev, st_ino)` against the socket this daemon
+/// actually bound makes the guard remove its own socket and nothing else.
 #[cfg(unix)]
 struct SocketCleanupGuard {
     path: std::path::PathBuf,
+    /// Identity of the socket this daemon bound, or `None` if it could not be
+    /// stat'ed at arm time (in which case we fall back to the historical
+    /// unconditional removal rather than silently leaking the socket).
+    bound: Option<(u64, u64)>,
+}
+
+/// `(st_dev, st_ino)` for `path`, or `None` if it cannot be stat'ed. Uses
+/// `symlink_metadata` so a symlink is identified as itself and never followed
+/// to some other file's inode.
+#[cfg(unix)]
+fn path_identity(path: &Path) -> Option<(u64, u64)> {
+    use std::os::unix::fs::MetadataExt;
+    let meta = std::fs::symlink_metadata(path).ok()?;
+    Some((meta.dev(), meta.ino()))
+}
+
+#[cfg(unix)]
+impl SocketCleanupGuard {
+    /// Arm cleanup for a socket THIS process has just successfully bound,
+    /// recording its identity so exit can tell it apart from a successor's.
+    fn arm(path: std::path::PathBuf) -> Self {
+        let bound = path_identity(&path);
+        Self { path, bound }
+    }
 }
 
 #[cfg(unix)]
 impl Drop for SocketCleanupGuard {
     fn drop(&mut self) {
+        if let Some(bound) = self.bound {
+            if path_identity(&self.path) != Some(bound) {
+                // Already gone (retired), or a different inode now lives here
+                // — a successor daemon's socket. Not ours to remove.
+                return;
+            }
+        }
         let _ = std::fs::remove_file(&self.path);
     }
 }
@@ -402,7 +517,7 @@ async fn run_daemon_async(
     let listener = bind_daemon_listener(&socket_path).await?;
     // Reached only after a successful bind: this process now owns the
     // socket, so cleanup is safe to arm from this point on.
-    let _cleanup = SocketCleanupGuard { path: socket_path };
+    let _cleanup = SocketCleanupGuard::arm(socket_path);
     serve_accept_loop(app, listener, idle_timeout, shutdown).await
 }
 
@@ -419,9 +534,25 @@ async fn run_daemon_async(
 /// tokio runtime must invoke it on a dedicated `std::thread` to avoid a nested
 /// runtime panic — see `main.rs`'s `--listen` arm.
 ///
-/// The shutdown receiver here is a never-fired channel: the daemon runs until
-/// process exit or the idle timer (from `Config::daemon_idle_timeout`) expires
-/// via `serve_accept_loop`. On a successful bind, EITHER exit path removes
+/// Signal handling is installed HERE, in the `--listen` entry point, and
+/// deliberately NOT inside `serve_accept_loop`: `doctor`'s health-probe test
+/// and the daemon unit tests drive that loop directly with their own shutdown
+/// channel, and must not acquire a process-wide signal handler as a side
+/// effect. The `--connect` proxy never reaches this function either, so a
+/// per-client shim keeps its default signal disposition.
+///
+/// `SIGTERM`/`SIGINT` fire the shutdown channel, which retires the daemon
+/// gracefully (see [`serve_accept_loop`]): the listener closes so new clients
+/// are refused and auto-spawn a daemon on the current binary, already-attached
+/// clients are served to their natural end, and the process exits once the last
+/// one disconnects. This is what makes an upgrade able to take effect without
+/// severing anybody's live MCP session. A SECOND signal while draining exits
+/// immediately, so an interactive `ironmem serve --listen` still stops on a
+/// second Ctrl-C instead of appearing to ignore it.
+///
+/// Absent a signal, the daemon runs until the idle timer (from
+/// `Config::daemon_idle_timeout`) expires via `serve_accept_loop`. On a
+/// successful bind, EVERY exit path removes
 /// ONLY the daemon-owned socket (best-effort, via [`SocketCleanupGuard`]; a
 /// `NotFound` is expected and ignored), so a later `--connect` proxy correctly
 /// probes "no daemon" rather than finding a stale path. A FAILED bind (a live
@@ -449,11 +580,66 @@ pub fn run_daemon(
         let memory_ready = Arc::clone(&app.memory_ready);
         crate::bootstrap::run_background_memory_init(config, memory_ready);
 
-        // Never-fired shutdown: only the idle timer inside `serve_accept_loop`
-        // ends this daemon absent an external kill.
-        let (_tx, rx) = oneshot::channel::<()>();
+        // SIGTERM/SIGINT fire this channel; absent a signal only the idle
+        // timer inside `serve_accept_loop` ends this daemon. The handler task
+        // owns the sender for the whole life of the process, so the sender is
+        // never dropped early (which would resolve the receiver and retire the
+        // daemon the instant it started).
+        let (tx, rx) = oneshot::channel::<()>();
+        tokio::spawn(retire_on_signal(tx));
         run_daemon_async(app, socket_path, idle_timeout, rx).await
     })
+}
+
+/// Fire `shutdown` when this process receives `SIGTERM` or `SIGINT`, then
+/// escalate to an immediate exit if a SECOND signal arrives while the daemon is
+/// still draining.
+///
+/// The escalation is not a nicety. Registering a `tokio` signal handler
+/// replaces the OS default disposition for the whole process, so once this task
+/// has consumed the first signal, a second Ctrl-C would otherwise be swallowed
+/// with no visible effect — and the graceful drain has no deadline, because an
+/// attached MCP client may legitimately hold its connection for hours. Exiting
+/// on the second signal keeps "I really mean it" working. Exit status is 0: a
+/// signalled retire is a requested shutdown, not a failure. The socket has
+/// already been unlinked by the retire path by this point, so skipping
+/// [`SocketCleanupGuard`] here leaves nothing behind that a successor's stale-
+/// socket recovery does not already handle.
+#[cfg(unix)]
+async fn retire_on_signal(shutdown: oneshot::Sender<()>) {
+    use tokio::signal::unix::{signal, SignalKind};
+
+    match (
+        signal(SignalKind::terminate()),
+        signal(SignalKind::interrupt()),
+    ) {
+        (Ok(mut sigterm), Ok(mut sigint)) => {
+            tokio::select! {
+                _ = sigterm.recv() => tracing::info!("daemon received SIGTERM; retiring gracefully"),
+                _ = sigint.recv() => tracing::info!("daemon received SIGINT; retiring gracefully"),
+            }
+            let _ = shutdown.send(());
+
+            tokio::select! {
+                _ = sigterm.recv() => {}
+                _ = sigint.recv() => {}
+            }
+            tracing::warn!("daemon signalled again while draining; exiting immediately");
+            std::process::exit(0);
+        }
+        (term, int) => {
+            let err = term.err().or_else(|| int.err());
+            tracing::warn!(
+                "could not install the daemon's SIGTERM/SIGINT handlers ({err:?}); \
+                 the idle timer remains the only exit path"
+            );
+            // Park forever holding `shutdown`. RETURNING here would drop the
+            // sender, resolving the receiver with `RecvError` and retiring the
+            // daemon instantly at startup — the exact opposite of the intended
+            // "signals unavailable, carry on as before" fallback.
+            std::future::pending::<()>().await;
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1351,6 +1537,229 @@ mod daemon_tests {
              closes and the idle window elapses"
         );
         joined.join().unwrap().unwrap();
+    }
+
+    /// Bound on how long a purely causal, event-driven wait may take before we
+    /// call it a hang. Deliberately NOT a timing margin: every step of the
+    /// retire tests below is triggered by an event we just caused (a signal, a
+    /// write, a close), so a correct implementation reaches each observable in
+    /// microseconds and only a genuine regression ever spends this budget.
+    const RETIRE_BUDGET: Duration = Duration::from_secs(5);
+
+    /// Poll `condition` until it holds or [`RETIRE_BUDGET`] elapses; reports
+    /// whether it ever held.
+    fn wait_for(mut condition: impl FnMut() -> bool) -> bool {
+        let deadline = std::time::Instant::now() + RETIRE_BUDGET;
+        while std::time::Instant::now() < deadline {
+            if condition() {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        condition()
+    }
+
+    /// The install-upgrade contract, at loop granularity: a daemon told to shut
+    /// down while a connection is OPEN must RETIRE, not die. It stops admitting
+    /// new clients immediately — refusing them, so the next `--connect` proxy
+    /// auto-spawns a daemon on the freshly installed binary instead of
+    /// attaching to this stale one — while the already-attached connection
+    /// keeps being served until the client itself disconnects, and only then
+    /// does the daemon exit.
+    ///
+    /// This is the assertion that separates a retire from the previous
+    /// `_ = &mut shutdown => break`: that version dropped every in-flight
+    /// handler, closing the attached socket, so the post-signal request below
+    /// reads EOF instead of a response. The idle window is 600s so the timer
+    /// cannot participate in any step; nothing here waits on a duration.
+    #[test]
+    fn shutdown_retires_the_socket_and_drains_the_open_connection_before_exiting() {
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("daemon.sock");
+        let sock_thread = sock.clone();
+
+        let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+
+        let daemon = std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            rt.block_on(async move {
+                #[allow(clippy::arc_with_non_send_sync)]
+                let app = Arc::new(App::open_for_test().unwrap());
+                let listener = bind_daemon_listener(&sock_thread).await.unwrap();
+                serve_accept_loop(app, listener, Duration::from_secs(600), shutdown_rx)
+                    .await
+                    .unwrap();
+            });
+        });
+
+        // An attached client, mid-session, holding its connection open.
+        let stream = connect_with_retry(&sock, "attached client, held open across shutdown");
+        let mut writer = stream.try_clone().unwrap();
+        let mut reader = StdBufReader::new(stream);
+        writer
+            .write_all(b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{}}\n")
+            .unwrap();
+        writer.flush().unwrap();
+        let mut line = String::new();
+        reader.read_line(&mut line).unwrap();
+        assert!(line.contains("\"protocolVersion\""));
+
+        shutdown_tx.send(()).unwrap();
+
+        // 1. New clients stop being admitted promptly, without waiting for the
+        //    drain to finish. Refused, not queued: a `connect()` that succeeded
+        //    into an unattended backlog would hang the new client forever
+        //    instead of sending it off to auto-spawn a fresh daemon.
+        assert!(
+            wait_for(|| StdUnixStream::connect(&sock).is_err()),
+            "a retiring daemon must stop admitting new connections immediately, \
+             so the next --connect proxy is refused and auto-spawns a fresh \
+             daemon instead of attaching to this one"
+        );
+        // 2. The refusal is the kind `run_connect_mode_io` treats as "no daemon
+        //    here" (and `prepare_socket_path` as "stale, reclaim it") — not,
+        //    say, a PermissionDenied that would propagate to the user instead.
+        let refusal = StdUnixStream::connect(&sock).unwrap_err().kind();
+        assert!(
+            matches!(
+                refusal,
+                std::io::ErrorKind::ConnectionRefused | std::io::ErrorKind::NotFound
+            ),
+            "the refusal must be an auto-spawn-triggering kind, got {refusal:?}"
+        );
+        // 3. But the already-attached client is still served — the load-bearing
+        //    assertion. A `break`-on-shutdown drops this handler and closes the
+        //    socket under the client, which surfaces as EPIPE on the write or
+        //    EOF on the read depending on which side notices first; both mean
+        //    the same regression, so both land on the same explanation rather
+        //    than an anonymous `unwrap` panic.
+        let mut line2 = String::new();
+        let served = writer
+            .write_all(b"{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"initialize\",\"params\":{}}\n")
+            .and_then(|()| writer.flush())
+            .and_then(|()| reader.read_line(&mut line2));
+        assert!(
+            matches!(served, Ok(n) if n > 0),
+            "a connection admitted before the shutdown signal must be served to \
+             its natural end, not dropped mid-session (outcome: {served:?})"
+        );
+        assert!(
+            line2.contains("\"protocolVersion\""),
+            "the attached client keeps getting real responses while the daemon \
+             drains: {line2}"
+        );
+
+        // 4. The daemon must NOT have exited yet — it is draining, not gone.
+        assert!(
+            !daemon.is_finished(),
+            "the daemon must stay alive while an admitted connection is open"
+        );
+
+        // 5. Once the last client disconnects, the drain completes and the
+        //    daemon exits on its own. No second signal, no kill.
+        drop(writer);
+        drop(reader);
+        let joined = std::thread::spawn(move || daemon.join());
+        assert!(
+            wait_for(|| joined.is_finished()),
+            "the daemon must exit once its last drained connection closes"
+        );
+        joined.join().unwrap().unwrap();
+    }
+
+    /// The zero-connection case the install script hits most often: a shutdown
+    /// signal with nothing attached retires and exits immediately rather than
+    /// waiting out the (600s) idle window. Socket cleanup on this path runs in
+    /// `run_daemon_async`'s guard, one layer up, and is covered end to end by
+    /// `daemon_lifecycle`'s `sigterm_*` test.
+    #[test]
+    fn shutdown_with_no_connections_exits_immediately() {
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("daemon.sock");
+        let sock_thread = sock.clone();
+
+        let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+
+        let daemon = std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            rt.block_on(async move {
+                #[allow(clippy::arc_with_non_send_sync)]
+                let app = Arc::new(App::open_for_test().unwrap());
+                let listener = bind_daemon_listener(&sock_thread).await.unwrap();
+                serve_accept_loop(app, listener, Duration::from_secs(600), shutdown_rx)
+                    .await
+                    .unwrap();
+            });
+        });
+
+        // Wait for the bind, so the signal cannot land before there is a
+        // listener to retire.
+        drop(connect_with_retry(
+            &sock,
+            "probe connect, confirms the daemon bound",
+        ));
+        shutdown_tx.send(()).unwrap();
+
+        let joined = std::thread::spawn(move || daemon.join());
+        assert!(
+            wait_for(|| joined.is_finished()),
+            "an idle daemon must exit on the shutdown signal, not sit out its \
+             idle window"
+        );
+        joined.join().unwrap().unwrap();
+    }
+
+    /// `SocketCleanupGuard` must remove its own socket — the behaviour the
+    /// idle-timeout path has always depended on, pinned here directly now that
+    /// the guard has a condition on it.
+    #[test]
+    fn socket_cleanup_guard_removes_its_own_socket() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("daemon.sock");
+        std::fs::write(&path, b"ours").unwrap();
+
+        drop(SocketCleanupGuard::arm(path.clone()));
+
+        assert!(
+            !path.exists(),
+            "the guard must still remove the socket this daemon bound"
+        );
+    }
+
+    /// C1, via the route the graceful retire opens: a retiring daemon unlinks
+    /// its socket at signal time and may then drain for hours, during which a
+    /// SUCCESSOR daemon binds the same path. When the drained daemon finally
+    /// exits, its cleanup guard must not unlink the live successor's socket.
+    #[test]
+    fn socket_cleanup_guard_never_removes_a_successors_socket() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("daemon.sock");
+        std::fs::write(&path, b"ours").unwrap();
+
+        let guard = SocketCleanupGuard::arm(path.clone());
+
+        // Retire: our socket goes away. Then a successor binds the same path,
+        // producing a different inode at the same name.
+        std::fs::remove_file(&path).unwrap();
+        std::fs::write(&path, b"successor").unwrap();
+
+        drop(guard);
+
+        assert!(
+            path.exists(),
+            "the retired daemon must not unlink the successor daemon's socket"
+        );
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            b"successor",
+            "and specifically must leave the successor's own socket in place"
+        );
     }
 
     /// Task 7 + H1: on idle-timeout exit, `run_daemon_async` removes ONLY the
