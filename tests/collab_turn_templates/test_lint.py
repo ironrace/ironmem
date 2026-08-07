@@ -136,6 +136,86 @@ TASK_LIST_TEMPLATE_SNIPPETS = [
     'equal `current_owner`, ABORT — do not send anything — and report the',
     'always the pilot, which under `pilot == "codex"` is `codex`',
 ]
+# Deliberately independent from the linter's map: importing production pins
+# here would let deleting a checker entry silently shrink the mutation sweep.
+TASK_BUDGET_SURFACE_SNIPPETS = {
+    "docs/COLLAB.md": [
+        "**1–15 execution tasks**",
+        "A plan projected to require 16 or more tasks",
+        "more than 15 tasks",
+        "`> 15` task-count check",
+        "A 16+ task issue",
+    ],
+    "docs/EVALUATE_ISSUE.md": [
+        "An estimate above 15 requires `SPLIT`.",
+        "more than 15 independent execution tasks",
+        "**1–15** execution tasks",
+        "1–15 task estimate",
+        "An estimate above 15 tasks always yields `SPLIT`",
+    ],
+    ".claude-plugin/commands/collab.md": [
+        "at most 15 tasks",
+        "If it would need 16 or more",
+        "`> 15` task-count check",
+        "a 16-task plan",
+        "more than 15 `### Task ` headings",
+    ],
+    ".claude-plugin/commands/evaluate-issue.md": [
+        "mandatory SPLIT above 15 tasks",
+        "above 15 requires `SPLIT`",
+        "more than 15 independent execution tasks",
+        "1–15-task estimate",
+        "1–15 task estimate",
+        "estimate above 15 tasks always yields `SPLIT`",
+    ],
+    ".claude-plugin/prompts/collab-turn-plan-review.md": [
+        "capped at 15 execution tasks",
+        "credibly needs 16 or more",
+    ],
+    ".claude-plugin/prompts/collab-turn-plan-finalize.md": [
+        "at most 15 tasks",
+        "needs 16 or more",
+    ],
+    ".claude-plugin/prompts/collab-turn-task-list.md": [
+        "heading count is at most 15",
+        "more than 15 tasks",
+    ],
+    ".codex-plugin/commands/collab.md": [
+        "1–15 execution tasks",
+        "work needs 16 or more",
+    ],
+    ".codex-plugin/prompts/evaluate-issue.md": [
+        "mandatory SPLIT above 15 tasks",
+        "above 15 requires `SPLIT`",
+        "more than 15 independent execution tasks",
+        "1–15-task estimate",
+        "1–15 task estimate",
+        "estimate above 15 tasks always yields `SPLIT`",
+    ],
+    ".codex-plugin/prompts/collab-plan-draft.md": [
+        "at most 15 execution tasks",
+    ],
+    ".codex-plugin/prompts/collab-plan-synthesis.md": [
+        "at most 15 execution tasks",
+    ],
+    ".codex-plugin/prompts/collab-plan-review.md": [
+        "capped at 15 execution tasks",
+        "credibly needs 16 or more",
+    ],
+    ".codex-plugin/prompts/collab-plan-finalize.md": [
+        "at most 15 tasks",
+        "needs 16 or more",
+    ],
+    ".codex-plugin/prompts/collab-task-list.md": [
+        "at most 15",
+        "more than 15 tasks",
+    ],
+}
+TASK_BUDGET_SURFACE_CASES = [
+    (path, snippet)
+    for path, snippets in TASK_BUDGET_SURFACE_SNIPPETS.items()
+    for snippet in snippets
+]
 
 # The three-role checks added for pilot configurability are intentionally
 # duplicated here instead of imported from the lint.  These tests are the
@@ -512,6 +592,17 @@ def test_lint_requires_sixteen_task_bridge_ceiling(tmp_path):
     assert r.returncode == 1
     assert (".claude-plugin/commands/collab.md: v3 bridge is missing "
             "blocker-terminates-the-bridge contract 'a 16-task plan'") in r.stdout
+
+
+@pytest.mark.parametrize("path,snippet", TASK_BUDGET_SURFACE_CASES)
+def test_lint_requires_every_task_budget_surface_contract(tmp_path, path, snippet):
+    fixture = copy_fixture(tmp_path)
+    mutate_flex(fixture / path, snippet)
+
+    r = run({"COLLAB_LINT_ROOT": str(fixture)})
+
+    assert r.returncode == 1
+    assert f"{path}: missing task-budget contract {snippet!r}" in r.stdout
 
 
 def test_lint_requires_both_harness_templates_per_topic(tmp_path):
