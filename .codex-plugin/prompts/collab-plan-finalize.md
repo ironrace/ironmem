@@ -17,9 +17,10 @@ drawer, and exit without sending.
 
 - Your identity is `"codex"`. **This turn sends nothing.** Do not send `final`,
   `canonical`, `review`, `task_list`, v3 topics, `failure_report`, or
-  `collab_end`. `PlanClaudeFinalizePending` is pre-coding, so the server
-  rejects `failure_report` here; report a blocker instead. This turn is
-  autonomous — there is no human approval gate on it. The orchestrator
+  `collab_end` except under the finalization-abort rule below.
+  `PlanClaudeFinalizePending` is pre-coding, so the server rejects
+  `failure_report` here; report a blocker and end the session instead. This
+  turn is autonomous — there is no human approval gate on it. The orchestrator
   dispatches the submit worker to send `final` right after this turn, without
   asking a human. The single human planning gate is the dispatcher's and fires
   one phase later, at `PlanLocked`, before the `task_list` bridge is
@@ -68,12 +69,12 @@ first non-blank line of the file must be
 Use `### Task N: <title>` headings. Every task must carry
 `Timebox: <=20 minutes`, at least one concrete acceptance criterion, and the
 files or areas it is expected to touch. If a task cannot credibly be completed
-in 20 minutes, split it before saving. The plan must contain at most 10 tasks.
-If it needs 11 or more, do not compose or stage a collab plan: report a blocker
+in 20 minutes, split it before saving. The plan must contain at most 15 tasks.
+If it needs 16 or more, do not compose or stage a collab plan: report a blocker
 naming the required independently executable child-issue split. Never merge
 unrelated work or drop acceptance criteria merely to fit this budget.
 
-Run a local structure check on the markdown you wrote: at least 1 and at most 10
+Run a local structure check on the markdown you wrote: at least 1 and at most 15
 `^### Task ` headings, contiguous task IDs `1..N`, a `Timebox: <=20 minutes`
 line on every task, and at least one acceptance criterion on every task.
 If any of those checks fails, repair the markdown and re-run them. If you cannot
@@ -88,6 +89,12 @@ orchestrator dispatches the submit worker with your staged drawer to send
 gate is the dispatcher's and fires one phase later, at `PlanLocked`, before the
 `task_list` bridge is dispatched; the `{drawer_id, plan_file_path, ≤3-line
 summary}` you report here is what the dispatcher carries to that gate.
+
+After the phase/owner check succeeds, any blocker that prevents staging a
+valid final plan must call `collab_end(session_id, agent="codex")` exactly once
+before reporting the blocker. This finalization-abort rule is the narrow legal
+exit for an oversized or otherwise unfinalizable plan: never leave the session
+parked in `PlanClaudeFinalizePending`, and never send `final` on this path.
 
 ## Completion status
 

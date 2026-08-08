@@ -191,7 +191,7 @@ pub(super) fn failure_report_is_off_turn_admissible(
 /// Parse and validate the task_list payload shape. Fails fast on missing
 /// fields, empty or oversized task arrays, missing acceptance criteria, or
 /// non-array tasks. The state machine re-checks plan_hash, base_sha presence,
-/// and the 10-task issue budget.
+/// and the 15-task issue budget.
 ///
 /// Optional `plan_file_path`: if present, must be non-empty, repo-relative
 /// (no leading `/`), and contain no `..` path segments. Persisted on the
@@ -576,9 +576,9 @@ mod tests {
     }
 
     #[test]
-    fn task_list_rejects_more_than_ten_tasks() {
+    fn task_list_rejects_more_than_fifteen_tasks() {
         let mut payload = base_task_list();
-        let tasks: Vec<_> = (1..=11)
+        let tasks: Vec<_> = (1..=16)
             .map(|id| {
                 json!({
                     "id": id,
@@ -595,15 +595,15 @@ mod tests {
         let err = parse_task_list_event(&payload.to_string()).unwrap_err();
         assert!(
             err.to_string()
-                .contains("at most 10 tasks; split it into smaller issues"),
+                .contains("at most 15 tasks; split it into smaller issues"),
             "unexpected error: {err}"
         );
     }
 
     #[test]
-    fn task_list_accepts_exactly_ten_tasks() {
+    fn task_list_accepts_exactly_fifteen_tasks() {
         let mut payload = base_task_list();
-        let tasks: Vec<_> = (1..=10)
+        let tasks: Vec<_> = (1..=15)
             .map(|id| {
                 json!({
                     "id": id,
@@ -618,11 +618,11 @@ mod tests {
             .insert("tasks".to_string(), json!(tasks));
 
         let event = parse_task_list_event(&payload.to_string())
-            .expect("a ten-task collab issue should be accepted");
+            .expect("a fifteen-task collab issue should be accepted");
         let CollabEvent::SubmitTaskList { tasks_count, .. } = event else {
             panic!("expected SubmitTaskList event");
         };
-        assert_eq!(tasks_count, 10);
+        assert_eq!(tasks_count, 15);
     }
 
     #[test]

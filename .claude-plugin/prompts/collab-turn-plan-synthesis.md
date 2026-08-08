@@ -28,6 +28,10 @@ preconditions: phase == PlanSynthesisPending, current_owner == claude
 
 ## Actions
 Merge Claude's draft and the retrieved Codex draft into one canonical plan and
+keep the canonical plan to at most 15 execution tasks. If the merged scope
+credibly needs more, organize it as an independently executable child-issue
+split rather than one oversized plan; never merge unrelated work or drop
+acceptance criteria to fit the cap. Then
 `collab_send(sender="claude", topic="canonical", content=<canonical text>)`.
 Do not enter Plan Mode and do not ask for user approval here; the single human
 planning gate is the final approved task plan.

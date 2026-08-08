@@ -41,8 +41,8 @@ the task, the plan, and its acceptance criteria are the sources of truth.
 1. Review the complete canonical plan for correct scope, acceptance coverage,
    executable steps, focused files, security and risk gaps, and tasks that are
    too large for the promised implementation workflow.
-2. A collab issue is capped at 10 execution tasks. If the canonical scope
-   credibly needs 11 or more, request a split into independently executable
+2. A collab issue is capped at 15 execution tasks. If the canonical scope
+   credibly needs 16 or more, request a split into independently executable
    child issues. Never recommend merging unrelated work or dropping acceptance
    criteria merely to fit the cap.
 3. The server permits exactly one copilot plan-review pass. Put every requested

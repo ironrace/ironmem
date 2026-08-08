@@ -338,7 +338,7 @@ fn test_task_list_rejects_unsafe_plan_file_path_from_direct_caller() {
 }
 
 #[test]
-fn test_task_list_rejects_more_than_ten_tasks() {
+fn test_task_list_rejects_more_than_fifteen_tasks() {
     let s = locked_session("hash-final");
     let err = apply_event(
         &s,
@@ -346,8 +346,8 @@ fn test_task_list_rejects_more_than_ten_tasks() {
         &CollabEvent::SubmitTaskList {
             plan_hash: "hash-final".to_string(),
             base_sha: "base".to_string(),
-            task_list_json: canonical_task_list(11),
-            tasks_count: 11,
+            task_list_json: canonical_task_list(16),
+            tasks_count: 16,
             head_sha: "h".to_string(),
         },
     )
@@ -355,8 +355,8 @@ fn test_task_list_rejects_more_than_ten_tasks() {
     assert_eq!(
         err,
         CollabError::TooManyTasks {
-            actual: 11,
-            max: 10,
+            actual: 16,
+            max: 15,
         }
     );
 }
@@ -370,8 +370,8 @@ fn test_task_list_rejects_declared_count_that_hides_oversized_json() {
         &CollabEvent::SubmitTaskList {
             plan_hash: "hash-final".to_string(),
             base_sha: "base".to_string(),
-            task_list_json: canonical_task_list(11),
-            tasks_count: 10,
+            task_list_json: canonical_task_list(16),
+            tasks_count: 15,
             head_sha: "h".to_string(),
         },
     )
@@ -379,18 +379,18 @@ fn test_task_list_rejects_declared_count_that_hides_oversized_json() {
     assert_eq!(
         err,
         CollabError::TaskListCountMismatch {
-            declared: 10,
-            actual: 11,
+            declared: 15,
+            actual: 16,
         }
     );
 }
 
 #[test]
-fn test_task_list_accepts_exactly_ten_tasks() {
+fn test_task_list_accepts_exactly_fifteen_tasks() {
     let s = locked_session("hash-final");
-    let s = submit_task_list(&s, "hash-final", 10);
+    let s = submit_task_list(&s, "hash-final", 15);
     assert_eq!(s.phase, Phase::CodeImplementPending);
-    assert_eq!(s.tasks_count(), Some(10));
+    assert_eq!(s.tasks_count(), Some(15));
 }
 
 #[test]

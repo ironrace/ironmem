@@ -223,7 +223,7 @@ REQUIRED_TEMPLATE_SNIPPETS = {
     ],
     "collab-turn-task-list.md": [
         "Timebox: <=20 minutes",
-        "more than 10 tasks",
+        "more than 15 tasks",
         "PlanLocked is pre-coding",
         "plan_file_path",
         # The `PlanLocked` bridge is sender-parameterized for exactly the same
@@ -243,7 +243,7 @@ REQUIRED_TEMPLATE_SNIPPETS = {
     ],
     "collab-turn-plan-finalize.md": [
         "Timebox: <=20 minutes",
-        "at most 10 tasks",
+        "at most 15 tasks",
         "docs/iron/plans/YYYY-MM-DD-<short-feature>.md",
         "first auto-ack response",
         "get_drawer(id=<canonical_plan_ref.drawer_id>)",
@@ -487,12 +487,158 @@ REQUIRED_SENTINELS = ["<!-- LINT:worker-dispatch -->",
 REQUIRED_EVALUATE_ISSUE_SNIPPETS = [
     "Verdict: <DIRECT | IRON | COLLAB | SPLIT>",
     "Task estimate: <N | N+> independent execution tasks",
-    "more than 10",
+    "more than 15",
     "Child issues:",
     "Parent: #<number>",
     "advisory-only",
     "Split-child-key:",
     "Split-parent-key:",
+]
+# Every planning surface that states the collab execution ceiling has an
+# explicit 15/16 contract. This is intentionally more specific than the
+# evaluator and template checks above: those guards catch a few shared phrases,
+# while this map keeps every user-facing mirror and the PlanLocked enforcement
+# line synchronized with the server's 15-task boundary.
+TASK_BUDGET_SURFACE_CONTRACTS = {
+    DOC: [
+        "**1–15 execution tasks**",
+        "1–15-task collab session",
+        "A plan projected to require 16 or more tasks",
+        "more than 15 tasks",
+        "`> 15` task-count check",
+        "A 16+ task issue",
+        "**1–15** strictly ordered entries",
+    ],
+    EVALUATE_ISSUE_DOC: [
+        "An estimate above 15 requires `SPLIT`.",
+        "more than 15 independent execution tasks",
+        "**1–15** execution tasks",
+        "1–15 task estimate",
+        "An estimate above 15 tasks always yields `SPLIT`",
+    ],
+    COMMAND: [
+        "at most 15 tasks",
+        "If it would need 16 or more",
+        "`> 15` task-count check",
+        "a 16-task plan",
+        "more than 15 `### Task ` headings",
+    ],
+    EVALUATE_ISSUE_CLAUDE: [
+        "mandatory SPLIT above 15 tasks",
+        "above 15 requires `SPLIT`",
+        "more than 15 independent execution tasks",
+        "1–15-task estimate",
+        "1–15 task estimate",
+        "estimate above 15 tasks always yields `SPLIT`",
+    ],
+    PROMPTS / "collab-turn-plan-review.md": [
+        "capped at 15 execution tasks",
+        "credibly needs 16 or more",
+    ],
+    PROMPTS / "collab-turn-plan-draft.md": [
+        "at most 15 execution tasks",
+    ],
+    PROMPTS / "collab-turn-plan-synthesis.md": [
+        "at most 15 execution tasks",
+    ],
+    PROMPTS / "collab-turn-plan-finalize.md": [
+        "at most 15 tasks",
+        "needs 16 or more",
+        "heading count is at most 15",
+    ],
+    PROMPTS / "collab-turn-task-list.md": [
+        "heading count is at most 15",
+        "more than 15 tasks",
+    ],
+    CODEX_COMMAND: [
+        "1–15 execution tasks",
+        "work needs 16 or more",
+    ],
+    EVALUATE_ISSUE_CODEX: [
+        "mandatory SPLIT above 15 tasks",
+        "above 15 requires `SPLIT`",
+        "more than 15 independent execution tasks",
+        "1–15-task estimate",
+        "1–15 task estimate",
+        "estimate above 15 tasks always yields `SPLIT`",
+    ],
+    ROOT / ".codex-plugin" / "prompts" / "collab-plan-draft.md": [
+        "at most 15 execution tasks",
+    ],
+    ROOT / ".codex-plugin" / "prompts" / "collab-plan-synthesis.md": [
+        "at most 15 execution tasks",
+    ],
+    ROOT / ".codex-plugin" / "prompts" / "collab-plan-review.md": [
+        "capped at 15 execution tasks",
+        "credibly needs 16 or more",
+    ],
+    ROOT / ".codex-plugin" / "prompts" / "collab-plan-finalize.md": [
+        "at most 15 tasks",
+        "needs 16 or more",
+        "at least 1 and at most 15",
+    ],
+    ROOT / ".codex-plugin" / "prompts" / "collab-task-list.md": [
+        "at most 15",
+        "more than 15 tasks",
+    ],
+}
+# Most positive phrases occur once, so changing their number removes the sole
+# required match. These four phrases are deliberately repeated in their live
+# surface; pin their exact cardinality so changing only one copy to any wrong
+# value (not just the legacy 10/11 boundary) cannot hide behind another copy.
+TASK_BUDGET_SURFACE_CONTRACT_COUNTS = {
+    (DOC, "more than 15 tasks"): 3,
+    (EVALUATE_ISSUE_DOC, "1–15 task estimate"): 2,
+    (EVALUATE_ISSUE_CLAUDE, "1–15 task estimate"): 2,
+    (EVALUATE_ISSUE_CODEX, "1–15 task estimate"): 2,
+}
+FINALIZE_ABORT_SURFACE_CONTRACTS = {
+    PROMPTS / "collab-turn-plan-finalize.md": [
+        "any blocker that prevents staging a valid final plan must call "
+        "`collab_end(session_id=$SESSION_ID, agent=\"claude\")` exactly once",
+    ],
+    ROOT / ".codex-plugin" / "prompts" / "collab-plan-finalize.md": [
+        "any blocker that prevents staging a valid final plan must call "
+        "`collab_end(session_id, agent=\"codex\")` exactly once",
+    ],
+    PROMPTS / "collab-turn-submit.md": [
+        "call `collab_end(session_id=$SESSION_ID, agent=\"$SENDER\")` "
+        "before returning the blocker",
+    ],
+    COMMAND: [
+        "A finalization `blocker:` is terminal: the worker must have ended "
+        "the session",
+    ],
+    DOC: [
+        "A finalization `blocker:` is terminal: the worker must have ended "
+        "the session",
+    ],
+}
+# Positive pins alone cannot detect one stale occurrence when the same current
+# phrase appears elsewhere in a surface. Scan only the task-budget surfaces
+# above, and only task-budget contexts, so unrelated 10/11 values remain free.
+STALE_TASK_BUDGET_PATTERNS = [
+    ("10-task issue budget", re.compile(r"\b10-task issue budget\b")),
+    ("1–10 task range", re.compile(
+        r"\b1[–-]10(?:-task\s+(?:estimate|collab\s+session)|\s+(?:execution\s+tasks?|"
+        r"task\s+estimate|tasks?))\b")),
+    ("1–10 strictly ordered entries", re.compile(
+        r"\*\*1[–-]10\*\*\s+strictly ordered entries\b")),
+    ("10-task comparative ceiling", re.compile(
+        r"\b(?:more than|at most|above)\s+10(?:\s+(?:independent\s+)?"
+        r"(?:execution\s+)?tasks?|\s+requires\b)")),
+    ("estimate above 10", re.compile(r"\bestimate above 10(?:\s+tasks?)?\b")),
+    ("> 10 task-count", re.compile(r">\s*10`?\s+task-count\b")),
+    ("more than 10 task headings", re.compile(
+        r"\bmore than 10\s+`### Task `\s+headings\b")),
+    ("heading count at most 10", re.compile(r"\bheading count is at most 10\b")),
+    ("structure count at most 10", re.compile(r"\bat least 1 and at most 10\b")),
+    ("11 or more task/plan/scope", re.compile(
+        r"\b(?:needs?|requires?|require|would need)\s+11 or more\b")),
+    ("11 or more task/plan/scope", re.compile(
+        r"\b11 or more\s+(?:tasks?|plans?|scope)\b")),
+    ("11+ task/plan/scope", re.compile(r"\b11\+\s+(?:task|plan|scope)\b")),
+    ("11-task plan", re.compile(r"\b11-task\s+plan\b")),
 ]
 # Legacy inline-orchestrator instructions that must NOT survive the rewrite.
 FORBIDDEN_IN_COMMAND = [
@@ -638,6 +784,55 @@ def check_evaluate_issue_surfaces() -> None:
             if snippet not in body:
                 err(f"{path.relative_to(ROOT)}: missing evaluate-issue SPLIT contract "
                     f"snippet {snippet!r}")
+
+
+def check_task_budget_surface_contracts() -> None:
+    """Keep every task-budget mirror at the 15-task / 16-task split."""
+    for path, snippets in TASK_BUDGET_SURFACE_CONTRACTS.items():
+        if not path.exists():
+            err(f"{path.relative_to(ROOT)}: missing task-budget surface")
+            continue
+        body = live_text(path)
+        for snippet in snippets:
+            match_count = len(flex(snippet).findall(body))
+            if match_count == 0:
+                err(f"{path.relative_to(ROOT)}: missing task-budget contract "
+                    f"{snippet!r}")
+                continue
+            expected_count = TASK_BUDGET_SURFACE_CONTRACT_COUNTS.get(
+                (path, snippet), 1)
+            if match_count != expected_count:
+                err(f"{path.relative_to(ROOT)}: task-budget contract "
+                    f"{snippet!r} expected {expected_count} occurrences, "
+                    f"found {match_count}")
+        for pattern_name, pattern in STALE_TASK_BUDGET_PATTERNS:
+            for match in pattern.finditer(body):
+                stale_text = " ".join(match.group(0).split())
+                err(f"{path.relative_to(ROOT)}: stale task-budget ceiling "
+                    f"{stale_text!r}; required 15/16 contract "
+                    f"(pattern: {pattern_name})")
+
+    bridge = command_section(live_text(COMMAND), PLAN_LOCKED_GATE_HEADING)
+    enforcement = "more than 15 `### Task ` headings"
+    if bridge is None:
+        err(".claude-plugin/commands/collab.md: missing PlanLocked bridge "
+            "task-budget enforcement section")
+    elif not flex(enforcement).search(bridge):
+        err(".claude-plugin/commands/collab.md: PlanLocked bridge is missing "
+            f"task-budget enforcement {enforcement!r}")
+
+
+def check_finalize_abort_contracts() -> None:
+    """An unfinalizable bounded plan must end, never strand the start slot."""
+    for path, snippets in FINALIZE_ABORT_SURFACE_CONTRACTS.items():
+        if not path.exists():
+            err(f"{path.relative_to(ROOT)}: missing finalize-abort surface")
+            continue
+        body = live_text(path)
+        for snippet in snippets:
+            if not flex(snippet).search(body):
+                err(f"{path.relative_to(ROOT)}: missing finalize-abort contract "
+                    f"{snippet!r}")
 
 
 def check_review_diff_fallback_contract() -> None:
@@ -870,7 +1065,7 @@ DISPATCH_FAILURE_ADMISSIBILITY_SNIPPETS = [
     "additionally requires `dispatch_failure_phase_admits`\n"
     "        (`crates/ironmem/src/collab/mod.rs`), which returns `false` "
     "for both —",
-    "**Every other phase:** as in condition 5 — the planning phases are",
+    "**Every other phase:** as in condition 6 — the planning phases are",
 ]
 DOC_PR_BASE_SNIPPETS = [
     "does **not** require that branch to contain `base_sha`",
@@ -1503,6 +1698,7 @@ BRIDGE_BLOCKER_SNIPPETS = [
 BRIDGE_BLOCKER_COMMAND_SNIPPETS = [
     "Do not re-dispatch the worker, and do not fall back through the loop "
     "into step 0.",
+    "a 16-task plan",
 ]
 BRIDGE_BLOCKER_DOC_SNIPPETS = [
     "The orchestrator must not re-dispatch the worker or fall back through "
@@ -3011,6 +3207,8 @@ def main() -> int:
     check_failure_prefixes()
     check_no_uninstalled_skill_references()
     check_evaluate_issue_surfaces()
+    check_task_budget_surface_contracts()
+    check_finalize_abort_contracts()
     check_review_diff_fallback_contract()
     check_reset_guards()
     check_review_range_after_recovery()

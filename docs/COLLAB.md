@@ -57,17 +57,17 @@ from this spec — keep them in sync when protocol changes land:
 ## Collab issue task budget
 
 One collab session implements exactly one independently shippable issue with
-**1–10 execution tasks**. A plan projected to require 11 or more tasks is too
+**1–15 execution tasks**. A plan projected to require 16 or more tasks is too
 large for collab: split its scope into linked, independently executable child
 issues before starting implementation. Route every child through
 `/evaluate-issue`; only a child that itself receives a `COLLAB` verdict gets
-its own 1–10-task collab session.
+its own 1–15-task collab session.
 
 Do not make an oversized issue fit by merging unrelated work, weakening
 acceptance criteria, or silently dropping tasks. During `/evaluate-issue`,
 return the required `SPLIT` verdict and child-issue proposal; create the child
 issues only after the user confirms. Keep the parent open as the tracking
-issue. The MCP server rejects every `task_list` with more than 10 tasks as a
+issue. The MCP server rejects every `task_list` with more than 15 tasks as a
 final invariant, even if an upstream prompt or evaluator misses the split.
 
 ## What It Is
@@ -377,6 +377,11 @@ change.
 `draft` until the calling agent has submitted its own. This is enforced
 server-side, not by convention.
 
+Each draft keeps a collab issue to at most 15 execution tasks. If the scope
+credibly needs more, it proposes an independently executable child-issue split
+instead of one oversized plan. This applies to both the Claude and Codex draft
+workers.
+
 Exit: once both draft hashes are present → `PlanSynthesisPending`, owner
 the pilot (`current_owner`).
 
@@ -391,6 +396,11 @@ containing the merged plan: `collab-turn-plan-synthesis.md` when
 This phase is autonomous. Neither agent enters Plan Mode and neither asks for
 approval here; the single planning gate is the dispatcher's, at `PlanLocked`,
 two phases later.
+
+The synthesis worker also keeps the canonical plan to at most 15 execution
+tasks for either pilot. If merging the drafts reveals a larger scope, it
+organizes the canonical plan around independently executable child issues
+instead of forwarding an oversized plan into finalization.
 
 Exit → `PlanCodexReviewPending`, owner the copilot (`current_owner`).
 
@@ -414,7 +424,7 @@ Exit:
 
 The copilot must put all requested edits, risks, and task-splitting concerns
 into this one review pass. In particular, any task that looks larger than 20
-minutes or any scope that credibly needs more than 10 tasks must be called out
+minutes or any scope that credibly needs more than 15 tasks must be called out
 so the pilot can split it into independently executable child issues before
 finalization.
 
@@ -431,14 +441,17 @@ final iron-build-compatible task markdown when `pilot == "claude"`, or
 Claude's loop triggers Codex's equivalent turn when `pilot == "codex"`, and
 either way `collab-turn-submit.md` sends the one `final` message as the
 pilot. Every task must be scoped to 20 minutes or less, and the plan must
-contain 1–10 tasks. If it would need 11 or more, stop before sending `final`
+contain 1–15 tasks. If it would need 16 or more, stop before sending `final`
 — that send, not the later `PlanLocked` gate, is the point of no return:
 once `PlanLocked` is reached the plan is immutable, and an oversized
-`task_list` is rejected on the `> 10` task-count check with `collab_end` as
-the only exit. Split larger work into independently executable child issues
-before sending `final`, never at the gate.
+`task_list` is rejected on the `> 15` task-count check with `collab_end` as
+the only exit. The current-owner finalizer calls `collab_end` before returning
+a blocker that identifies the independently executable child-issue split;
+never leave an oversized plan parked in finalization or defer the split to the
+gate.
 
-Exit → `PlanLocked` (always). Planning is done.
+Exit → `PlanLocked` after a valid `final`, or session ended when the current
+owner aborts an unfinalizable plan before `final`.
 
 ### `PlanLocked`
 
@@ -456,7 +469,7 @@ body. Two transitions out:
   this is valid).
 - `collab_send` with `topic=task_list` from the pilot (`current_owner`), on
   gate approval — enter the v3 coding loop. The state machine verifies
-  `plan_hash == final_plan_hash` and that the task list contains 1–10 tasks;
+  `plan_hash == final_plan_hash` and that the task list contains 1–15 tasks;
   the session stays active and the terminal set for `wait_my_turn` flips to
   `{CodingComplete, CodingFailed}`.
 
@@ -1249,16 +1262,20 @@ plan around them.
 
 ### `collab_end`
 
-Ends a session. Valid **only** from one of three phases:
+Ends a session. Valid **only** from one of four phase paths:
 
+- `PlanClaudeFinalizePending`, by `current_owner` only, when the finalizer
+  cannot stage a valid bounded plan,
 - `PlanLocked` pre-`task_list` (the user abandons the plan before coding),
 - `CodingComplete` (post-PR),
 - `CodingFailed` (after `failure_report`).
 
-**Rejected** during any active planning phase (`PlanParallelDrafts` through
-`PlanClaudeFinalizePending`) or coding-active phase (`CodeImplementPending`
-through `CodeReviewFinalPending`). This prevents either agent from killing
-a session the counterpart is still working in.
+**Rejected** during the other active planning phases (`PlanParallelDrafts`
+through `PlanCodexReviewPending`) or any coding-active phase
+(`CodeImplementPending` through `CodeReviewFinalPending`). A non-owner is also
+rejected in `PlanClaudeFinalizePending`. These rules prevent either agent from
+killing a session the counterpart is still working in while giving the
+finalizer a clean exit for oversized or otherwise unfinalizable plans.
 
 Idempotent once allowed: calling from a terminal phase or an
 already-ended session is a no-op, and subsequent `send`, `ack`, `approve`,
@@ -1548,7 +1565,7 @@ orchestrator from steering the reviewer's conclusion.
 
 | Topic | Sender | Payload | Notes |
 |---|---|---|---|
-| `task_list` | `pilot` | `{"plan_hash","base_sha","head_sha","plan_file_path"?,"execution_mode"?,"tasks":[{"id","title","timebox_minutes","acceptance":[...]}]}` | `plan_hash` must equal `final_plan_hash`; `tasks` must contain **1–10** strictly ordered entries; each task requires `timebox_minutes <= 20` and ≥1 `acceptance` entry. An 11+ task issue must be split into child issues before this message is sent. Optional `plan_file_path` (repo-relative; no leading `/`; no `..` segments) points at the approved task markdown driving subagent execution. Optional `execution_mode` — see below. |
+| `task_list` | `pilot` | `{"plan_hash","base_sha","head_sha","plan_file_path"?,"execution_mode"?,"tasks":[{"id","title","timebox_minutes","acceptance":[...]}]}` | `plan_hash` must equal `final_plan_hash`; `tasks` must contain **1–15** strictly ordered entries; each task requires `timebox_minutes <= 20` and ≥1 `acceptance` entry. A 16+ task issue must be split into child issues before this message is sent. Optional `plan_file_path` (repo-relative; no leading `/`; no `..` segments) points at the approved task markdown driving subagent execution. Optional `execution_mode` — see below. |
 | `implementation_done` | `claude` or `codex` (per session `implementer`) | `{"head_sha"}` | In `CodeImplementPending` only. Fired once after the subagent batch completes and gates pass. Carries only `head_sha` — no prose, no subagent notes. |
 | `review_fix_global` | `copilot` (or the counterpart agent as recovery owner under the delegated-completion override) | `{"head_sha"}` | In `CodeReviewFixGlobalPending` only. The copilot ran `/pr-review-toolkit:review-pr` on the raw post-implementation diff (no pre-clean by the pilot), used parallel fix subagents for confirmed partitionable findings, merged/cherry-picked the resulting fixes, and pushed the branch-level fix commit(s). |
 | `review_local` | `pilot` (or the counterpart agent as recovery owner under the delegated-completion override) | `{"head_sha"}` | In `CodeReviewLocalPending` only. The pilot ran full or reduced audit of the copilot's `review_fix_global` commits + caught issues both agents missed, used parallel fix subagents for confirmed partitionable findings, merged/cherry-picked the resulting fixes, and pushed. |
@@ -1952,8 +1969,12 @@ dispatched (see `.claude-plugin/commands/collab.md` § v3 Bridge, step 0):
    re-authors: if the artifact cannot be fetched, the submit worker does not
    send the protocol topic at all. For `final_review` (coding-active) it
    sends a `failure_report`; for the v1 `final` planning topic the state
-   machine rejects `failure_report`, so it aborts with a `blocker:` verdict
-   instead.
+   machine rejects `failure_report`, so the current-owner submit worker calls
+   `collab_end` and aborts with a `blocker:` verdict instead.
+   **A finalization `blocker:` is terminal: the worker must have ended the
+   session** with `collab_end` before returning it. The orchestrator verifies
+   `ended_at`, reports the blocker and child-issue split, and exits; it never
+   re-dispatches finalization or sends `final` on that path.
 2. **Orchestrator gate**, at `PlanLocked`, surfaces ONLY
    `drawer_id + plan_file_path + summary` for the user's approval — never the
    full plan body.
@@ -1999,8 +2020,8 @@ approved hash, parses each `### Task N:` heading into
 `{id,title,timebox_minutes,acceptance}`, and sends `task_list`. It returns a
 blocker and sends nothing if `$SENDER` is absent or disagrees with
 `collab_status.current_owner`, the plan file is missing or its hash differs, the
-plan has zero or more than 10 tasks, any task is missing acceptance criteria,
-missing `Timebox: <=20 minutes`, or is sized above 20 minutes. An 11+ task plan
+plan has zero or more than 15 tasks, any task is missing acceptance criteria,
+missing `Timebox: <=20 minutes`, or is sized above 20 minutes. A 16+ task plan
 must be decomposed into child issues; it must not enter coding. PlanLocked is
 pre-coding, so `failure_report` is not valid in
 this bridge.
@@ -2134,7 +2155,7 @@ Mode at **exactly one gate**, matching the command-file invariant bullet:
    the dispatcher presents the locked plan for approval, surfacing only
    `{drawer_id, plan_file_path, ≤3-line summary}` — never the plan body (see
    `.claude-plugin/commands/collab.md` § v3 Bridge, step 0). It must contain
-   1–10 tasks, each timeboxed to 20 minutes or less; a larger plan must have
+   1–15 tasks, each timeboxed to 20 minutes or less; a larger plan must have
    been split into child issues
    before `final` was sent, since `PlanLocked` makes the plan immutable. On
    approval, the dispatcher dispatches the `task_list` bridge; on rejection,
@@ -2304,7 +2325,7 @@ Codex (bg-exec):
         reads canonical, returns verdict=request_changes. Exits.
 Claude: poll observes phase=PlanClaudeFinalizePending. Finalize turn is
         autonomous — no Plan Mode here. Dispatches the finalize worker,
-        which splits tasks to 20 minutes or less, routes any 11+ task scope
+        which splits tasks to 20 minutes or less, routes any 16+ task scope
         into child issues, composes the final iron-build-compatible task
         markdown, and sends final. Phase now PlanLocked.
 Claude: dispatcher takes the single planning gate here — **enters Plan

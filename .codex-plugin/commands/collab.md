@@ -18,8 +18,8 @@ You are Codex. This is one-shot: one invocation handles one Codex-owned action
 and exits. Use the IronMEM collab tools; if `mcp__ironmem__collab_*` is
 unavailable, use tool discovery for `ironmem collab` first.
 
-One collab session may implement only one issue with 1–10 execution tasks. If
-planning establishes that the work needs 11 or more, stop before implementation
+One collab session may implement only one issue with 1–15 execution tasks. If
+planning establishes that the work needs 16 or more, stop before implementation
 and split it into independently executable child issues. Route every child
 through `/evaluate-issue`; start a separate collab session only for a child
 that receives a `COLLAB` verdict.
