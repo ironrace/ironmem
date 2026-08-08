@@ -107,6 +107,30 @@ struct StoredReview {
     room: String,
 }
 
+/// Configuration captured by the prompt hook before the recall workers start.
+/// The vector worker receives only this transport data; it must never receive
+/// a local database handle or anything that can keep a local DB lock alive.
+#[derive(Debug, Clone)]
+struct HybridRecallConfig {
+    socket_path: PathBuf,
+    limit: usize,
+}
+
+/// The local worker's end of the abandoned vector request: the channel the
+/// vector thread reports on, plus the same absolute deadline that thread is
+/// working to.
+///
+/// The deadline travels with the receiver so the join honors the configured
+/// hybrid budget instead of a fixed window. It is derived from
+/// [`effective_hybrid_vector_budget`], so it always lands at least
+/// `PROMPT_HOOK_OCCUPANCY_RESERVE_MS` before the outer prompt-hook deadline —
+/// waiting for it can therefore never consume the render reserve, and once it
+/// has passed the join degrades to a non-blocking poll.
+struct VectorHandoff {
+    rx: std::sync::mpsc::Receiver<Option<Vec<String>>>,
+    deadline: Instant,
+}
+
 /// Run a session lifecycle hook, reading the harness JSON payload from stdin.
 ///
 /// `harness` gates harness-specific output. Two hooks populate the returned
@@ -547,6 +571,27 @@ fn sample_occupancy(
 /// transcript-tail scan and DB write stay well inside the prompt budget.
 const PROMPT_HOOK_OCCUPANCY_RESERVE_MS: u64 = 30;
 
+/// Parent-safe launch ceiling for one hybrid vector request.
+///
+/// The outer prompt-hook budget must retain the named render/occupancy reserve
+/// even when hybrid recall is enabled. Callers must check this at request
+/// launch: `None` means the reserve is exhausted, and `Some` is the lesser of
+/// the configured hybrid budget and the time left after that reserve.
+///
+/// Because the returned budget is already the outer remaining time minus the
+/// reserve, the absolute deadline derived from it is a parent-safe join point:
+/// waiting for the vector answer until that instant still leaves the reserve
+/// for the drawer fetch and render that follow.
+pub(crate) fn effective_hybrid_vector_budget(
+    remaining_outer_wall_budget: Duration,
+) -> Option<Duration> {
+    let reserve = Duration::from_millis(PROMPT_HOOK_OCCUPANCY_RESERVE_MS);
+    let remaining_after_reserve = remaining_outer_wall_budget.checked_sub(reserve)?;
+    let configured = Duration::from_millis(crate::search::tunables::prompt_hook_hybrid_budget_ms());
+    let effective = configured.min(remaining_after_reserve);
+    (!effective.is_zero()).then_some(effective)
+}
+
 // ── Occupancy tier + notice ─────────────────────────────────────────────────
 
 /// Occupancy tier derived from context-window percentage.
@@ -647,17 +692,21 @@ fn run_user_prompt_submit(
 
     let should_sample_occupancy = crate::search::tunables::metrics_enabled()
         && prompt_occupancy_sample_allowed(harness, session_id, usage);
-    let recall_budget = if should_sample_occupancy {
-        budget
-            .checked_sub(Duration::from_millis(PROMPT_HOOK_OCCUPANCY_RESERVE_MS))
-            .unwrap_or_default()
-    } else {
-        budget
-    };
 
+    let hybrid =
+        crate::search::tunables::prompt_recall_hybrid_enabled().then(|| HybridRecallConfig {
+            socket_path: config.daemon_socket_path(),
+            limit: crate::search::tunables::prompt_hook_hybrid_limit(),
+        });
+
+    // `budget` (not a pre-shrunk copy) goes to recall: `effective_hybrid_vector_budget`
+    // already reserves `PROMPT_HOOK_OCCUPANCY_RESERVE_MS` once for the hybrid path, and
+    // the post-hoc `remaining >= reserve` gate below already makes the occupancy sample
+    // best-effort. Reserving the same 30ms a second time here would halve hybrid's
+    // window whenever occupancy sampling is active, with no corresponding benefit.
     if let Some(prompt) = input.get("prompt").and_then(|v| v.as_str()) {
-        if !prompt.trim().is_empty() && !recall_budget.is_zero() {
-            if let Some(ctx) = search_prompt_context(&config.db_path, prompt, start, recall_budget)
+        if !prompt.trim().is_empty() && !budget.is_zero() {
+            if let Some(ctx) = search_prompt_context(&config.db_path, prompt, start, budget, hybrid)
             {
                 response.hook_specific_output = Some(HookSpecificOutput::user_prompt_submit(ctx));
             }
@@ -743,20 +792,52 @@ fn search_prompt_context(
     prompt: &str,
     start: Instant,
     budget: Duration,
+    hybrid: Option<HybridRecallConfig>,
 ) -> Option<String> {
     let remaining = budget.checked_sub(start.elapsed())?;
     if remaining.is_zero() {
         return None;
     }
+
+    // Start vector I/O first, but give it no access to the local DB path or
+    // connection. Its absolute deadline is independent of the local worker's
+    // outer deadline; a peer that accepts and never replies cannot consume the
+    // local worker's render time.
+    let local_vector_handoff = hybrid.and_then(|hybrid| {
+        let vector_budget = effective_hybrid_vector_budget(remaining)?;
+        let vector_deadline = Instant::now().checked_add(vector_budget)?;
+        let (vector_tx, vector_rx) = std::sync::mpsc::channel();
+        let query = prompt.to_string();
+        std::thread::spawn(move || {
+            let ids = crate::mcp::daemon_client::search_ids(
+                &hybrid.socket_path,
+                &query,
+                hybrid.limit,
+                vector_deadline,
+            );
+            let _ = vector_tx.send(ids);
+        });
+        // The worker joins on the same absolute deadline the request thread
+        // works to, so `IRONMEM_PROMPT_HOOK_HYBRID_BUDGET_MS` governs how long
+        // an answer is actually usable — not just how long the abandoned
+        // thread keeps talking to the peer.
+        Some(VectorHandoff {
+            rx: vector_rx,
+            deadline: vector_deadline,
+        })
+    });
+
     let (tx, rx) = std::sync::mpsc::channel();
     let db_path = db_path.to_path_buf();
     let prompt = prompt.to_string();
-    let worker_budget = remaining;
+    let worker_budget = budget.checked_sub(start.elapsed()).unwrap_or_default();
     std::thread::spawn(move || {
-        let result = prompt_recall_block(&db_path, &prompt, worker_budget);
+        let result = prompt_recall_block(&db_path, &prompt, worker_budget, local_vector_handoff);
         let _ = tx.send(result); // receiver gone (timed out) → drop silently
     });
-    match rx.recv_timeout(remaining) {
+
+    let local_remaining = budget.checked_sub(start.elapsed()).unwrap_or_default();
+    match rx.recv_timeout(local_remaining) {
         Ok(Some(block)) => Some(block),
         _ => None, // timeout, disconnect, or no qualifying hits
     }
@@ -767,10 +848,18 @@ fn search_prompt_context(
 /// from the formatting keeps the latter unit-testable without mutating
 /// process-global `IRONMEM_PROMPT_HOOK_*` env vars (which would race the other
 /// prompt tests).
-fn prompt_recall_block(db_path: &Path, prompt: &str, busy: Duration) -> Option<String> {
+fn prompt_recall_block(
+    db_path: &Path,
+    prompt: &str,
+    busy: Duration,
+    vector: Option<VectorHandoff>,
+) -> Option<String> {
     let db = crate::db::schema::Database::open_with_busy_timeout(db_path, busy).ok()?;
     let config = RecallConfig::from_tunables();
-    recall_block_from_db(&db, prompt, &config)
+    match vector {
+        Some(handoff) => recall_block_from_vector_handoff(&db, prompt, &config, handoff),
+        None => recall_block_from_db(&db, prompt, &config),
+    }
 }
 
 /// Tuning parameters for [`recall_block_from_db`], grouped to keep the
@@ -815,8 +904,141 @@ fn recall_block_from_db(
     prompt: &str,
     config: &RecallConfig,
 ) -> Option<String> {
+    let qualifying = bm25_qualifying(db, prompt, config)?;
+    recall_block_from_qualifying(db, prompt, config, qualifying, None)
+}
+
+fn recall_block_from_vector_handoff(
+    db: &crate::db::schema::Database,
+    prompt: &str,
+    config: &RecallConfig,
+    handoff: VectorHandoff,
+) -> Option<String> {
+    let qualifying = bm25_qualifying(db, prompt, config)?;
+    recall_block_from_qualifying_with_vector_poll(
+        db,
+        prompt,
+        config,
+        qualifying,
+        None,
+        Some(&handoff),
+    )
+}
+
+fn bm25_qualifying(
+    db: &crate::db::schema::Database,
+    prompt: &str,
+    config: &RecallConfig,
+) -> Option<Vec<(String, f32)>> {
+    let scored = match db.bm25_search(prompt, config.max_hits * 3, None, None) {
+        Ok(scored) => scored,
+        Err(e) => {
+            tracing::warn!("prompt-hook recall: BM25 query failed: {e}");
+            return None;
+        }
+    };
+    Some(
+        scored
+            .into_iter()
+            .filter(|(_, score)| *score >= config.bm25_floor)
+            .collect(),
+    )
+}
+
+/// Top `max_hits` BM25-qualifying ids, sorted for stable output. `qualifying`
+/// comes from `db.bm25_search`, which already excludes superseded rows, so a
+/// drawer map already fetched for a superset of these ids (e.g. `fetched` in
+/// the vector-fusion path) can be reused directly without a second query.
+fn bm25_only_ids(qualifying: &[(String, f32)], max_hits: usize) -> Vec<String> {
+    let mut ids: Vec<String> = qualifying
+        .iter()
+        .take(max_hits)
+        .map(|(id, _)| id.clone())
+        .collect();
+    ids.sort_unstable();
+    ids
+}
+
+fn recall_block_from_qualifying(
+    db: &crate::db::schema::Database,
+    prompt: &str,
+    config: &RecallConfig,
+    qualifying: Vec<(String, f32)>,
+    vector_ids: Option<&[String]>,
+) -> Option<String> {
+    recall_block_from_qualifying_with_vector_poll(
+        db,
+        prompt,
+        config,
+        qualifying,
+        vector_ids.map(|ids| Some(ids.to_vec())),
+        None,
+    )
+}
+
+/// Shared guard for both vector-response pollers: nothing to poll once a
+/// vector or an already-resolved response is missing.
+fn pending_vector<'a>(
+    response: &Option<Option<Vec<String>>>,
+    vector: Option<&'a VectorHandoff>,
+) -> Option<&'a VectorHandoff> {
+    if response.is_some() {
+        return None;
+    }
+    vector
+}
+
+fn poll_vector_response(
+    response: &mut Option<Option<Vec<String>>>,
+    vector: Option<&VectorHandoff>,
+) {
+    let Some(vector) = pending_vector(response, vector) else {
+        return;
+    };
+    match vector.rx.try_recv() {
+        Ok(ids) => *response = Some(ids),
+        Err(std::sync::mpsc::TryRecvError::Disconnected) => *response = Some(None),
+        Err(std::sync::mpsc::TryRecvError::Empty) => {}
+    }
+}
+
+/// Final join on the vector request, bounded by the request's own absolute
+/// deadline.
+///
+/// That deadline is [`effective_hybrid_vector_budget`] applied at launch, so it
+/// always leaves `PROMPT_HOOK_OCCUPANCY_RESERVE_MS` before the outer
+/// prompt-hook deadline for the drawer fetch and render that follow. Local
+/// KG/diary work has already happened by the time this runs, so the wait is
+/// whatever the operator's hybrid budget has left over — and once that instant
+/// has passed (a slow local path, or a peer that never replied) the wait is
+/// zero and the local block renders exactly as it would with hybrid off.
+fn opportunistic_vector_response(
+    response: &mut Option<Option<Vec<String>>>,
+    vector: Option<&VectorHandoff>,
+) {
+    let Some(vector) = pending_vector(response, vector) else {
+        return;
+    };
+    let wait = vector.deadline.saturating_duration_since(Instant::now());
+    if wait.is_zero() {
+        return;
+    }
+    match vector.rx.recv_timeout(wait) {
+        Ok(ids) => *response = Some(ids),
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => *response = Some(None),
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+    }
+}
+
+fn recall_block_from_qualifying_with_vector_poll(
+    db: &crate::db::schema::Database,
+    prompt: &str,
+    config: &RecallConfig,
+    qualifying: Vec<(String, f32)>,
+    initial_vector_response: Option<Option<Vec<String>>>,
+    vector: Option<&VectorHandoff>,
+) -> Option<String> {
     let RecallConfig {
-        bm25_floor: floor,
         max_hits,
         line_bytes,
         kg_enabled,
@@ -824,62 +1046,16 @@ fn recall_block_from_db(
         diary_enabled,
         diary_max,
         diary_line_bytes,
+        ..
     } = *config;
-    // Overfetch `max_hits * 3` so the `prompt_hook_min_bm25_score` floor filter
-    // below has room to drop low-scorers before `take(max_hits)`; simplifying
-    // this to `max_hits` would starve a floor-filtered config of candidates.
-    //
-    // Distinguish a genuine query failure (broken/missing FTS index) from "no
-    // hits": the former is a diagnosable degradation the sibling SessionStart
-    // builders `warn!` about, so do the same here rather than swallowing it as a
-    // silent `None`. A `busy_timeout` open failure above stays silent (expected
-    // under lock contention / missing DB — the fail-closed path).
-    let scored = match db.bm25_search(prompt, max_hits * 3, None, None) {
-        Ok(scored) => scored,
-        Err(e) => {
-            tracing::warn!("prompt-hook recall: BM25 query failed: {e}");
-            return None;
-        }
-    };
-    let qualifying: Vec<(String, f32)> = scored
-        .into_iter()
-        .filter(|(_, score)| *score >= floor)
-        .take(max_hits)
-        .collect();
 
-    // Preserve BM25 selection above, but render the selected drawers in stable
-    // ID order. `get_drawers_by_ids` returns a HashMap, so relying on either
-    // DB rank ties or map iteration would churn the early prompt prefix.
-    //
     // No early return on an empty `qualifying`: a BM25 miss must not prevent
     // KG (or, later, diary) hits from still producing a recall block — the
     // final `lines.is_empty()` check below is the single source of truth for
-    // "nothing to inject". `get_drawers_by_ids` already short-circuits an
-    // empty id slice to `Ok({})`, so this costs nothing when BM25 found
-    // nothing.
-    let mut selected_ids: Vec<&str> = qualifying.iter().map(|(id, _)| id.as_str()).collect();
-    selected_ids.sort_unstable();
-    let drawers = match db.get_drawers_by_ids(&selected_ids) {
-        Ok(drawers) => drawers,
-        Err(e) => {
-            tracing::warn!("prompt-hook recall: drawer fetch failed: {e}");
-            return None;
-        }
-    };
-
+    // "nothing to inject".
+    let mut vector_response = initial_vector_response;
+    poll_vector_response(&mut vector_response, vector);
     let mut lines = Vec::new();
-    for id in selected_ids {
-        if let Some(d) = drawers.get(id) {
-            let excerpt = compact_excerpt(&d.content, line_bytes);
-            if !excerpt.is_empty() {
-                let wing = compact_excerpt(&d.wing, PROMPT_RECALL_LABEL_BYTES);
-                let room = compact_excerpt(&d.room, PROMPT_RECALL_LABEL_BYTES);
-                let source = serde_json::to_string(&format!("{wing}/{room}")).ok()?;
-                let excerpt = serde_json::to_string(&excerpt).ok()?;
-                lines.push(format!("- source={source} excerpt={excerpt}"));
-            }
-        }
-    }
 
     // KG triple recall
     if kg_enabled {
@@ -971,6 +1147,97 @@ fn recall_block_from_db(
             }
         }
     }
+
+    // Give the vector worker its final, deadline-bounded handoff after the
+    // local KG/diary work has progressed. The deadline reserves render time by
+    // construction, so a pending response can never take ownership of the local
+    // DB work or the outer render budget; local recall still wins.
+    opportunistic_vector_response(&mut vector_response, vector);
+    let vector_ids = vector_response
+        .as_ref()
+        .and_then(|response| response.as_deref());
+    let (selected_ids, drawers) = if let Some(vector_ids) = vector_ids.filter(|ids| !ids.is_empty())
+    {
+        let bm25_ids: Vec<String> = qualifying.iter().map(|(id, _)| id.clone()).collect();
+        let mut lookup_ids = bm25_ids.clone();
+        for id in vector_ids {
+            if !lookup_ids.iter().any(|candidate| candidate == id) {
+                lookup_ids.push(id.clone());
+            }
+        }
+        let lookup_refs: Vec<&str> = lookup_ids.iter().map(String::as_str).collect();
+        let fetched = match db.get_drawers_by_ids_filtered(&lookup_refs, None, None, false) {
+            Ok(drawers) => drawers,
+            Err(e) => {
+                tracing::warn!("prompt-hook recall: drawer fetch failed: {e}");
+                return None;
+            }
+        };
+        let current_bm25_ids: Vec<String> = bm25_ids
+            .iter()
+            .filter(|id| fetched.contains_key(*id))
+            .cloned()
+            .collect();
+        let valid_vector_ids: Vec<String> = vector_ids
+            .iter()
+            .filter(|id| fetched.contains_key(*id))
+            .cloned()
+            .collect();
+
+        if valid_vector_ids.is_empty() {
+            // `fetched` was already queried (with `include_superseded: false`) for
+            // the union of bm25_ids and vector_ids, and bm25_ids can never contain a
+            // superseded row (BM25 search excludes them already) — so it already
+            // holds exactly what a fresh `get_drawers_by_ids` fetch for these ids
+            // would return. No second query needed.
+            (bm25_only_ids(&qualifying, max_hits), fetched)
+        } else {
+            let bm25_weight = crate::search::pipeline::sparse_bm25_weight(
+                current_bm25_ids.len(),
+                crate::search::tunables::bm25_sparse_threshold(),
+            );
+            let merged = crate::search::pipeline::rrf_merge_weighted(
+                &valid_vector_ids,
+                &current_bm25_ids,
+                crate::search::tunables::rrf_k(),
+                bm25_weight,
+            );
+            let mut ids: Vec<String> = merged
+                .into_iter()
+                .filter(|id| fetched.contains_key(id))
+                .take(max_hits)
+                .collect();
+            ids.sort_unstable();
+            (ids, fetched)
+        }
+    } else {
+        let ids = bm25_only_ids(&qualifying, max_hits);
+        let refs: Vec<&str> = ids.iter().map(String::as_str).collect();
+        let drawers = match db.get_drawers_by_ids(&refs) {
+            Ok(drawers) => drawers,
+            Err(e) => {
+                tracing::warn!("prompt-hook recall: drawer fetch failed: {e}");
+                return None;
+            }
+        };
+        (ids, drawers)
+    };
+
+    let mut drawer_lines = Vec::new();
+    for id in selected_ids {
+        if let Some(d) = drawers.get(&id) {
+            let excerpt = compact_excerpt(&d.content, line_bytes);
+            if !excerpt.is_empty() {
+                let wing = compact_excerpt(&d.wing, PROMPT_RECALL_LABEL_BYTES);
+                let room = compact_excerpt(&d.room, PROMPT_RECALL_LABEL_BYTES);
+                let source = serde_json::to_string(&format!("{wing}/{room}")).ok()?;
+                let excerpt = serde_json::to_string(&excerpt).ok()?;
+                drawer_lines.push(format!("- source={source} excerpt={excerpt}"));
+            }
+        }
+    }
+    drawer_lines.extend(lines);
+    lines = drawer_lines;
 
     if lines.is_empty() {
         return None;
@@ -1619,16 +1886,66 @@ mod tests {
         std::env::remove_var("IRONMEM_PROMPT_HOOK_SUMMARY_MAX_BYTES");
         std::env::remove_var("IRONMEM_PROMPT_HOOK_KG");
         std::env::remove_var("IRONMEM_PROMPT_HOOK_DIARY");
+        std::env::remove_var("IRONMEM_PROMPT_RECALL_HYBRID");
+        std::env::remove_var("IRONMEM_PROMPT_HOOK_HYBRID_BUDGET_MS");
+        std::env::remove_var("IRONMEM_PROMPT_HOOK_HYBRID_LIMIT");
         guard
     }
 
-    /// Drop guard that removes `IRONMEM_PROMPT_HOOK_BUDGET_MS` on scope exit,
-    /// including on panic/unwind, so the var never leaks to other ENV_MUTEX tests.
-    struct PromptHookBudgetEnvGuard;
-    impl Drop for PromptHookBudgetEnvGuard {
+    /// Drop guard that removes prompt-hook tunables on scope exit, including on
+    /// panic/unwind, so no value leaks to other ENV_MUTEX tests.
+    struct PromptHookEnvGuard {
+        clear_daemon_socket: bool,
+    }
+
+    impl PromptHookEnvGuard {
+        /// Isolate a hybrid fixture from a configured daemon socket.
+        ///
+        /// Callers must hold `crate::config::ENV_LOCK` for this guard's entire
+        /// lifetime, including its drop cleanup.
+        fn new() -> Self {
+            std::env::remove_var("IRONMEM_DAEMON_SOCKET");
+            Self {
+                clear_daemon_socket: true,
+            }
+        }
+
+        /// Clean up prompt-hook tunables without touching config-owned env.
+        fn tunables_only() -> Self {
+            Self {
+                clear_daemon_socket: false,
+            }
+        }
+    }
+
+    impl Drop for PromptHookEnvGuard {
         fn drop(&mut self) {
             std::env::remove_var("IRONMEM_PROMPT_HOOK_BUDGET_MS");
+            std::env::remove_var("IRONMEM_PROMPT_HOOK_MAX_HITS");
+            std::env::remove_var("IRONMEM_PROMPT_HOOK_KG");
+            std::env::remove_var("IRONMEM_PROMPT_HOOK_DIARY");
+            std::env::remove_var("IRONMEM_PROMPT_RECALL_HYBRID");
+            std::env::remove_var("IRONMEM_PROMPT_HOOK_HYBRID_BUDGET_MS");
+            std::env::remove_var("IRONMEM_PROMPT_HOOK_HYBRID_LIMIT");
+            if self.clear_daemon_socket {
+                std::env::remove_var("IRONMEM_DAEMON_SOCKET");
+            }
         }
+    }
+
+    #[test]
+    fn prompt_hook_env_guard_clears_daemon_socket_on_construction_and_drop() {
+        let _config_env = crate::config::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("IRONMEM_DAEMON_SOCKET", "/tmp/inherited-ironmem.sock");
+
+        let guard = PromptHookEnvGuard::new();
+        assert!(std::env::var_os("IRONMEM_DAEMON_SOCKET").is_none());
+
+        std::env::set_var("IRONMEM_DAEMON_SOCKET", "/tmp/test-ironmem.sock");
+        drop(guard);
+        assert!(std::env::var_os("IRONMEM_DAEMON_SOCKET").is_none());
     }
 
     #[test]
@@ -3059,6 +3376,670 @@ mod tests {
     }
 
     #[test]
+    fn hybrid_vector_budget_preserves_prompt_hook_occupancy_reserve() {
+        // Keep the config socket override isolated for the entire fixture,
+        // including PromptHookEnvGuard's panic-safe cleanup below. Take this
+        // shared lock before this module's narrower env and tunable locks.
+        let _config_env = crate::config::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _env = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let _prompt = prompt_hook_tunable_defaults();
+        let _hybrid_env = PromptHookEnvGuard::new();
+
+        assert_eq!(
+            effective_hybrid_vector_budget(Duration::from_millis(
+                PROMPT_HOOK_OCCUPANCY_RESERVE_MS + 15,
+            )),
+            Some(Duration::from_millis(15)),
+            "hybrid recall may use only the time left after the occupancy reserve"
+        );
+        assert_eq!(
+            effective_hybrid_vector_budget(
+                Duration::from_millis(PROMPT_HOOK_OCCUPANCY_RESERVE_MS,)
+            ),
+            None,
+            "no vector request may launch when only the occupancy reserve remains"
+        );
+        assert_eq!(
+            effective_hybrid_vector_budget(Duration::from_millis(
+                PROMPT_HOOK_OCCUPANCY_RESERVE_MS - 1,
+            )),
+            None,
+            "a parent already inside the reserve cannot launch vector recall"
+        );
+
+        std::env::set_var("IRONMEM_PROMPT_HOOK_HYBRID_BUDGET_MS", "7");
+        assert_eq!(
+            effective_hybrid_vector_budget(Duration::from_millis(200)),
+            Some(Duration::from_millis(7)),
+            "configured hybrid budget remains a ceiling above the reserve"
+        );
+    }
+
+    /// The final join must wait up to the vector request's own deadline, not a
+    /// fixed window: a daemon slower than a hardcoded handoff would otherwise
+    /// have every answer discarded, making the configured hybrid budget inert.
+    #[test]
+    fn vector_join_waits_for_the_configured_deadline_not_a_fixed_window() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(60));
+            let _ = tx.send(Some(vec!["late-but-inside-budget".to_string()]));
+        });
+        let handoff = VectorHandoff {
+            rx,
+            deadline: Instant::now() + Duration::from_secs(5),
+        };
+
+        let mut response = None;
+        opportunistic_vector_response(&mut response, Some(&handoff));
+
+        assert_eq!(
+            response,
+            Some(Some(vec!["late-but-inside-budget".to_string()])),
+            "an answer arriving inside the vector deadline must still be used"
+        );
+    }
+
+    /// Once the deadline has passed the join must not block at all — otherwise
+    /// a stalled peer could push the worker past the outer prompt-hook deadline
+    /// and cost the whole local recall block, not just the vector hits.
+    #[test]
+    fn vector_join_does_not_block_once_the_deadline_has_passed() {
+        let (tx, rx) = std::sync::mpsc::channel::<Option<Vec<String>>>();
+        let handoff = VectorHandoff {
+            rx,
+            deadline: Instant::now() - Duration::from_millis(1),
+        };
+
+        let started = Instant::now();
+        let mut response = None;
+        opportunistic_vector_response(&mut response, Some(&handoff));
+        let waited = started.elapsed();
+        drop(tx);
+
+        assert_eq!(
+            response, None,
+            "an expired deadline yields no vector answer"
+        );
+        assert!(
+            waited < Duration::from_millis(20),
+            "an expired deadline must not block the render path: {waited:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    fn spawn_vector_peer(
+        socket_path: std::path::PathBuf,
+        ids: Option<Vec<String>>,
+        hold_open: bool,
+    ) -> (
+        std::thread::JoinHandle<()>,
+        Option<std::sync::mpsc::Sender<()>>,
+        std::sync::mpsc::Receiver<()>,
+    ) {
+        use std::io::{BufRead, BufReader, Write};
+        use std::os::unix::net::UnixListener;
+
+        let listener = UnixListener::bind(socket_path).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let (accepted_tx, accepted_rx) = std::sync::mpsc::channel();
+        let handle = std::thread::spawn(move || {
+            let accept_deadline = Instant::now() + Duration::from_millis(300);
+            let (stream, _) = loop {
+                match listener.accept() {
+                    Ok(connection) => break connection,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        if Instant::now() >= accept_deadline {
+                            return;
+                        }
+                        std::thread::sleep(Duration::from_millis(1));
+                    }
+                    Err(error) => panic!("vector fixture accept failed: {error}"),
+                }
+            };
+            let _ = accepted_tx.send(());
+            let mut request = String::new();
+            BufReader::new(stream.try_clone().unwrap())
+                .read_line(&mut request)
+                .unwrap();
+            if let Some(ids) = ids {
+                let payload = serde_json::json!({
+                    "results": ids.into_iter().map(|id| serde_json::json!({"id": id})).collect::<Vec<_>>(),
+                });
+                let response = serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "result": {
+                        "content": [{
+                            "type": "text",
+                            "text": serde_json::to_string(&payload).unwrap(),
+                        }]
+                    }
+                });
+                let mut stream = stream;
+                writeln!(stream, "{response}").unwrap();
+            } else if hold_open {
+                let _ = release_rx.recv();
+            }
+        });
+        (handle, hold_open.then_some(release_tx), accepted_rx)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stalled_hybrid_peer_preserves_byte_identical_local_recall() {
+        let _config_env = crate::config::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _env = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let _prompt = prompt_hook_tunable_defaults();
+        let _hybrid_env = PromptHookEnvGuard::new();
+        std::env::set_var("IRONMEM_PROMPT_HOOK_BUDGET_MS", "200");
+        std::env::set_var("IRONMEM_PROMPT_HOOK_HYBRID_BUDGET_MS", "40");
+        std::env::set_var("IRONMEM_PROMPT_HOOK_KG", "false");
+        std::env::set_var("IRONMEM_PROMPT_HOOK_DIARY", "false");
+
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("memory.sqlite3");
+        let state_dir = dir.path().join("state");
+        seed_db_file(&db_path, &[("alpha beta gamma", "infra", "local")]);
+        let input = serde_json::json!({"prompt": "alpha beta gamma"});
+
+        std::env::remove_var("IRONMEM_PROMPT_RECALL_HYBRID");
+        let off = run_hook_with_input(
+            "user-prompt-submit",
+            "claude-code",
+            prompt_hook_config(db_path.clone(), state_dir.clone()),
+            input.clone(),
+        )
+        .unwrap();
+        let off_bytes = serde_json::to_vec(&off).unwrap();
+
+        std::fs::create_dir_all(&state_dir).unwrap();
+        let (peer, release, accepted) =
+            spawn_vector_peer(state_dir.join("daemon.sock"), None, true);
+        std::env::set_var("IRONMEM_PROMPT_RECALL_HYBRID", "true");
+        let started = Instant::now();
+        let on = run_hook_with_input(
+            "user-prompt-submit",
+            "claude-code",
+            prompt_hook_config(db_path, state_dir),
+            input,
+        )
+        .unwrap();
+        let elapsed = started.elapsed();
+        assert!(
+            accepted.recv_timeout(Duration::from_millis(200)).is_ok(),
+            "hybrid mode must connect to the configured vector peer"
+        );
+        let _ = release.unwrap().send(());
+        peer.join().unwrap();
+
+        assert!(
+            elapsed < Duration::from_millis(200),
+            "stalled vector peer exceeded the outer hook guard: {elapsed:?}"
+        );
+        assert_eq!(
+            serde_json::to_vec(&on).unwrap(),
+            off_bytes,
+            "a timed-out vector lookup must preserve the local hook bytes"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unavailable_hybrid_peer_preserves_byte_identical_local_recall() {
+        let _config_env = crate::config::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _env = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let _prompt = prompt_hook_tunable_defaults();
+        let _hybrid_env = PromptHookEnvGuard::new();
+        std::env::set_var("IRONMEM_PROMPT_HOOK_BUDGET_MS", "200");
+        std::env::set_var("IRONMEM_PROMPT_HOOK_HYBRID_BUDGET_MS", "40");
+        std::env::set_var("IRONMEM_PROMPT_HOOK_KG", "false");
+        std::env::set_var("IRONMEM_PROMPT_HOOK_DIARY", "false");
+
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("memory.sqlite3");
+        let state_dir = dir.path().join("missing-state");
+        seed_db_file(&db_path, &[("alpha beta gamma", "infra", "local")]);
+        let input = serde_json::json!({"prompt": "alpha beta gamma"});
+
+        std::env::remove_var("IRONMEM_PROMPT_RECALL_HYBRID");
+        let off = run_hook_with_input(
+            "user-prompt-submit",
+            "claude-code",
+            prompt_hook_config(db_path.clone(), state_dir.clone()),
+            input.clone(),
+        )
+        .unwrap();
+        let off_bytes = serde_json::to_vec(&off).unwrap();
+
+        std::env::set_var("IRONMEM_PROMPT_RECALL_HYBRID", "true");
+        let on = run_hook_with_input(
+            "user-prompt-submit",
+            "claude-code",
+            prompt_hook_config(db_path, state_dir),
+            input,
+        )
+        .unwrap();
+
+        assert_eq!(serde_json::to_vec(&on).unwrap(), off_bytes);
+    }
+
+    /// Regression for a caller-side double reservation: `run_user_prompt_submit`
+    /// used to shrink the outer budget by `PROMPT_HOOK_OCCUPANCY_RESERVE_MS`
+    /// *before* calling `search_prompt_context` whenever occupancy sampling was
+    /// active, and `effective_hybrid_vector_budget` reserved the same constant
+    /// again from what it received — halving hybrid's actual window (60ms
+    /// reserved instead of the intended 30ms) any time both features were on
+    /// together. This is exactly the interaction the existing hybrid timing
+    /// tests never exercise: they never set a session id + usage, so
+    /// `should_sample_occupancy` is always false there.
+    ///
+    /// A peer that never replies makes the vector wait run out its full
+    /// deadline, so the hook's wall-clock time is dominated by that wait. With
+    /// a single 30ms reserve the wait extends close to budget-30ms; with the
+    /// old double reserve it topped out at budget-60ms. The assertion only
+    /// needs a lower bound comfortably above the old (buggy) ceiling —
+    /// `recv_timeout` never returns before its requested duration, so this
+    /// side is not sensitive to scheduler jitter the way an upper bound would
+    /// be.
+    #[cfg(unix)]
+    #[test]
+    fn hybrid_budget_is_not_double_reserved_when_occupancy_sampling_is_active() {
+        use crate::metrics::METRICS_ENV_LOCK;
+        let _config_env = crate::config::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _env = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let _g = METRICS_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _prompt = prompt_hook_tunable_defaults();
+        let _hybrid_env = PromptHookEnvGuard::new();
+        std::env::set_var("IRONMEM_METRICS", "1");
+        std::env::set_var("IRONMEM_PROMPT_HOOK_BUDGET_MS", "400");
+        // Large enough that the outer budget's reserve is the binding
+        // constraint, not the configured hybrid budget itself.
+        std::env::set_var("IRONMEM_PROMPT_HOOK_HYBRID_BUDGET_MS", "2000");
+        std::env::set_var("IRONMEM_PROMPT_HOOK_KG", "false");
+        std::env::set_var("IRONMEM_PROMPT_HOOK_DIARY", "false");
+        std::env::set_var("IRONMEM_PROMPT_RECALL_HYBRID", "true");
+
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("memory.sqlite3");
+        let state_dir = dir.path().join("state");
+        std::fs::create_dir_all(&state_dir).unwrap();
+        seed_db_file(&db_path, &[("alpha beta gamma", "infra", "local")]);
+
+        let transcript = dir.path().join("t.jsonl");
+        std::fs::write(&transcript,
+            "{\"type\":\"assistant\",\"message\":{\"usage\":{\"input_tokens\":1000,\"output_tokens\":5,\"cache_read_input_tokens\":0}}}\n",
+        ).unwrap();
+
+        let (peer, release, accepted) =
+            spawn_vector_peer(state_dir.join("daemon.sock"), None, true);
+
+        let started = Instant::now();
+        let _ = run_hook_with_input(
+            "user-prompt-submit",
+            "claude-code",
+            prompt_hook_config(db_path, state_dir),
+            serde_json::json!({ "prompt": "alpha beta gamma", "session_id": "budget-1",
+                                "transcript_path": transcript.to_string_lossy() }),
+        )
+        .unwrap();
+        let elapsed = started.elapsed();
+
+        assert!(
+            accepted.recv_timeout(Duration::from_millis(200)).is_ok(),
+            "hybrid mode must connect to the configured vector peer"
+        );
+        let _ = release.unwrap().send(());
+        peer.join().unwrap();
+
+        // Single reserve: hybrid waits close to 400 - 30 = 370ms. Double
+        // reserve (the bug): capped at 400 - 60 = 340ms. 355ms sits strictly
+        // between the two, comfortably above the buggy ceiling.
+        assert!(
+            elapsed >= Duration::from_millis(355),
+            "hybrid budget appears to be reserving PROMPT_HOOK_OCCUPANCY_RESERVE_MS \
+             twice when occupancy sampling is active: {elapsed:?}"
+        );
+        assert!(
+            elapsed < Duration::from_millis(700),
+            "hook exceeded its outer budget by an unreasonable margin: {elapsed:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn empty_hybrid_vector_response_preserves_byte_identical_local_recall() {
+        let _config_env = crate::config::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _env = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let _prompt = prompt_hook_tunable_defaults();
+        let _hybrid_env = PromptHookEnvGuard::new();
+        std::env::set_var("IRONMEM_PROMPT_HOOK_BUDGET_MS", "200");
+        std::env::set_var("IRONMEM_PROMPT_HOOK_HYBRID_BUDGET_MS", "40");
+        std::env::set_var("IRONMEM_PROMPT_HOOK_KG", "false");
+        std::env::set_var("IRONMEM_PROMPT_HOOK_DIARY", "false");
+
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("memory.sqlite3");
+        let state_dir = dir.path().join("state");
+        seed_db_file(&db_path, &[("alpha beta gamma", "infra", "local")]);
+        let input = serde_json::json!({"prompt": "alpha beta gamma"});
+
+        std::env::remove_var("IRONMEM_PROMPT_RECALL_HYBRID");
+        let off = run_hook_with_input(
+            "user-prompt-submit",
+            "claude-code",
+            prompt_hook_config(db_path.clone(), state_dir.clone()),
+            input.clone(),
+        )
+        .unwrap();
+        let off_bytes = serde_json::to_vec(&off).unwrap();
+
+        std::fs::create_dir_all(&state_dir).unwrap();
+        let (peer, _, accepted) =
+            spawn_vector_peer(state_dir.join("daemon.sock"), Some(Vec::new()), false);
+        std::env::set_var("IRONMEM_PROMPT_RECALL_HYBRID", "true");
+        let on = run_hook_with_input(
+            "user-prompt-submit",
+            "claude-code",
+            prompt_hook_config(db_path, state_dir),
+            input,
+        )
+        .unwrap();
+        assert!(
+            accepted.recv_timeout(Duration::from_millis(200)).is_ok(),
+            "empty-response fallback must exercise the vector peer"
+        );
+        peer.join().unwrap();
+
+        assert_eq!(serde_json::to_vec(&on).unwrap(), off_bytes);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn superseded_vector_id_is_not_injected_or_promoted() {
+        let _config_env = crate::config::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _env = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let _prompt = prompt_hook_tunable_defaults();
+        let _hybrid_env = PromptHookEnvGuard::new();
+        std::env::set_var("IRONMEM_PROMPT_HOOK_BUDGET_MS", "200");
+        std::env::set_var("IRONMEM_PROMPT_HOOK_HYBRID_BUDGET_MS", "40");
+        std::env::set_var("IRONMEM_PROMPT_HOOK_MAX_HITS", "1");
+        std::env::set_var("IRONMEM_PROMPT_HOOK_KG", "false");
+        std::env::set_var("IRONMEM_PROMPT_HOOK_DIARY", "false");
+
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("memory.sqlite3");
+        let state_dir = dir.path().join("state");
+        let lexical = ("alpha beta gamma", "infra", "lexical");
+        let stale = ("stale semantic drawer", "infra", "semantic");
+        let successor = ("current replacement drawer", "infra", "semantic");
+        seed_db_file(&db_path, &[lexical, stale, successor]);
+        let stale_id = generate_id(stale.0, stale.1, stale.2);
+        let successor_id = generate_id(successor.0, successor.1, successor.2);
+        let db = crate::db::schema::Database::open(&db_path).unwrap();
+        db.exec_raw(&format!(
+            "UPDATE drawers SET superseded_by = '{successor_id}' WHERE id = '{stale_id}'"
+        ))
+        .unwrap();
+        drop(db);
+        let input = serde_json::json!({"prompt": "alpha beta gamma"});
+
+        std::env::remove_var("IRONMEM_PROMPT_RECALL_HYBRID");
+        let off = run_hook_with_input(
+            "user-prompt-submit",
+            "claude-code",
+            prompt_hook_config(db_path.clone(), state_dir.clone()),
+            input.clone(),
+        )
+        .unwrap();
+        let off_bytes = serde_json::to_vec(&off).unwrap();
+
+        std::fs::create_dir_all(&state_dir).unwrap();
+        let (peer, _, accepted) =
+            spawn_vector_peer(state_dir.join("daemon.sock"), Some(vec![stale_id]), false);
+        std::env::set_var("IRONMEM_PROMPT_RECALL_HYBRID", "true");
+        let on = run_hook_with_input(
+            "user-prompt-submit",
+            "claude-code",
+            prompt_hook_config(db_path, state_dir),
+            input,
+        )
+        .unwrap();
+        assert!(
+            accepted.recv_timeout(Duration::from_millis(200)).is_ok(),
+            "superseded-ID regression must exercise the vector peer"
+        );
+        peer.join().unwrap();
+
+        assert_eq!(serde_json::to_vec(&on).unwrap(), off_bytes);
+        let context = on
+            .hook_specific_output
+            .expect("BM25 fallback must remain available")
+            .additional_context;
+        assert!(context.contains("source=\"infra/lexical\""));
+        assert!(!context.contains("source=\"infra/semantic\""));
+    }
+
+    #[test]
+    fn superseded_bm25_id_cannot_change_current_rrf_selection() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("memory.sqlite3");
+        let lexical = ("current lexical drawer", "infra", "lexical");
+        let stale_one = ("stale bm25 drawer one", "infra", "stale-one");
+        let stale_two = ("stale bm25 drawer two", "infra", "stale-two");
+        let successor = ("current replacement drawer", "infra", "replacement");
+        let bm25_one = ("current bm25 drawer one", "infra", "bm25-one");
+        let bm25_two = ("current bm25 drawer two", "infra", "bm25-two");
+        let bm25_three = ("current bm25 drawer three", "infra", "bm25-three");
+        let bm25_four = ("current bm25 drawer four", "infra", "bm25-four");
+        let vector_lead = ("semantic vector lead", "infra", "vector-lead");
+        let vector_candidate = ("semantic vector candidate", "infra", "vector-candidate");
+        seed_db_file(
+            &db_path,
+            &[
+                lexical,
+                stale_one,
+                stale_two,
+                successor,
+                bm25_one,
+                bm25_two,
+                bm25_three,
+                bm25_four,
+                vector_lead,
+                vector_candidate,
+            ],
+        );
+        let stale_one_id = generate_id(stale_one.0, stale_one.1, stale_one.2);
+        let stale_two_id = generate_id(stale_two.0, stale_two.1, stale_two.2);
+        let successor_id = generate_id(successor.0, successor.1, successor.2);
+        let lexical_id = generate_id(lexical.0, lexical.1, lexical.2);
+        let bm25_one_id = generate_id(bm25_one.0, bm25_one.1, bm25_one.2);
+        let bm25_two_id = generate_id(bm25_two.0, bm25_two.1, bm25_two.2);
+        let bm25_three_id = generate_id(bm25_three.0, bm25_three.1, bm25_three.2);
+        let bm25_four_id = generate_id(bm25_four.0, bm25_four.1, bm25_four.2);
+        let vector_lead_id = generate_id(vector_lead.0, vector_lead.1, vector_lead.2);
+        let vector_candidate_id =
+            generate_id(vector_candidate.0, vector_candidate.1, vector_candidate.2);
+        let db = crate::db::schema::Database::open(&db_path).unwrap();
+        db.exec_raw(&format!(
+            "UPDATE drawers SET superseded_by = '{successor_id}' WHERE id IN ('{stale_one_id}', '{stale_two_id}')"
+        ))
+        .unwrap();
+        let config = RecallConfig {
+            bm25_floor: 0.0,
+            max_hits: 2,
+            line_bytes: 120,
+            kg_enabled: false,
+            kg_max_triples: 0,
+            diary_enabled: false,
+            diary_max: 0,
+            diary_line_bytes: 120,
+        };
+        let vector_ids = vec![vector_lead_id, vector_candidate_id];
+        let with_stale = recall_block_from_qualifying(
+            &db,
+            "ignored",
+            &config,
+            vec![
+                (stale_one_id, 1.0),
+                (stale_two_id, 1.0),
+                (lexical_id.clone(), 1.0),
+                (bm25_one_id.clone(), 1.0),
+                (bm25_two_id.clone(), 1.0),
+                (bm25_three_id.clone(), 1.0),
+                (bm25_four_id.clone(), 1.0),
+            ],
+            Some(&vector_ids),
+        )
+        .unwrap();
+        let without_stale = recall_block_from_qualifying(
+            &db,
+            "ignored",
+            &config,
+            vec![
+                (lexical_id, 1.0),
+                (bm25_one_id, 1.0),
+                (bm25_two_id, 1.0),
+                (bm25_three_id, 1.0),
+                (bm25_four_id, 1.0),
+            ],
+            Some(&vector_ids),
+        )
+        .unwrap();
+
+        assert_eq!(
+            with_stale, without_stale,
+            "superseded BM25 rows must not shift current RRF selection or order"
+        );
+        let rooms = injected_source_rooms(&with_stale);
+        assert_eq!(rooms.len(), 2, "stale BM25 rows must not consume max_hits");
+        assert!(rooms.contains(&"lexical".to_string()));
+        assert!(rooms.contains(&"vector-lead".to_string()));
+        assert!(!rooms.contains(&"vector-candidate".to_string()));
+        assert!(!with_stale.contains("source=\"infra/stale-one\""));
+        assert!(!with_stale.contains("source=\"infra/stale-two\""));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn foreign_vector_ids_do_not_consume_max_hit_slots() {
+        let _config_env = crate::config::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _env = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let _prompt = prompt_hook_tunable_defaults();
+        let _hybrid_env = PromptHookEnvGuard::new();
+        std::env::set_var("IRONMEM_PROMPT_HOOK_BUDGET_MS", "200");
+        std::env::set_var("IRONMEM_PROMPT_HOOK_HYBRID_BUDGET_MS", "40");
+        std::env::set_var("IRONMEM_PROMPT_HOOK_MAX_HITS", "3");
+        std::env::set_var("IRONMEM_PROMPT_HOOK_KG", "false");
+        std::env::set_var("IRONMEM_PROMPT_HOOK_DIARY", "false");
+
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("memory.sqlite3");
+        let state_dir = dir.path().join("state");
+        let rows = [
+            ("alpha beta gamma one", "infra", "one"),
+            ("alpha beta gamma two", "infra", "two"),
+            ("alpha beta gamma three", "infra", "three"),
+            ("local vector-only drawer", "infra", "vector"),
+        ];
+        seed_db_file(&db_path, &rows);
+        let vector_id = generate_id(rows[3].0, rows[3].1, rows[3].2);
+        std::fs::create_dir_all(&state_dir).unwrap();
+        let (peer, _, _) = spawn_vector_peer(
+            state_dir.join("daemon.sock"),
+            Some(vec!["foreign-database-id".into(), vector_id.clone()]),
+            false,
+        );
+
+        std::env::set_var("IRONMEM_PROMPT_RECALL_HYBRID", "true");
+        let response = run_hook_with_input(
+            "user-prompt-submit",
+            "claude-code",
+            prompt_hook_config(db_path, state_dir),
+            serde_json::json!({"prompt": "alpha beta gamma"}),
+        )
+        .unwrap();
+        peer.join().unwrap();
+
+        let context = response
+            .hook_specific_output
+            .expect("local drawers must still be injected")
+            .additional_context;
+        let rooms = injected_source_rooms(&context);
+        assert_eq!(
+            rooms.len(),
+            3,
+            "foreign IDs must not consume slots: {context}"
+        );
+        assert!(
+            context.contains("source=\"infra/vector\""),
+            "the valid local vector ID remains eligible: {context}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn valid_vector_only_local_id_can_be_promoted_by_rrf() {
+        let _config_env = crate::config::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _env = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let _prompt = prompt_hook_tunable_defaults();
+        let _hybrid_env = PromptHookEnvGuard::new();
+        std::env::set_var("IRONMEM_PROMPT_HOOK_BUDGET_MS", "200");
+        std::env::set_var("IRONMEM_PROMPT_HOOK_HYBRID_BUDGET_MS", "40");
+        std::env::set_var("IRONMEM_PROMPT_HOOK_MAX_HITS", "1");
+        std::env::set_var("IRONMEM_PROMPT_HOOK_KG", "false");
+        std::env::set_var("IRONMEM_PROMPT_HOOK_DIARY", "false");
+
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("memory.sqlite3");
+        let state_dir = dir.path().join("state");
+        let bm25 = ("alpha beta gamma", "infra", "lexical");
+        let vector = ("unrelated local vector drawer", "infra", "semantic");
+        seed_db_file(&db_path, &[bm25, vector]);
+        let vector_id = generate_id(vector.0, vector.1, vector.2);
+        std::fs::create_dir_all(&state_dir).unwrap();
+        let (peer, _, _) =
+            spawn_vector_peer(state_dir.join("daemon.sock"), Some(vec![vector_id]), false);
+
+        std::env::set_var("IRONMEM_PROMPT_RECALL_HYBRID", "true");
+        let response = run_hook_with_input(
+            "user-prompt-submit",
+            "claude-code",
+            prompt_hook_config(db_path, state_dir),
+            serde_json::json!({"prompt": "alpha beta gamma"}),
+        )
+        .unwrap();
+        peer.join().unwrap();
+
+        let context = response
+            .hook_specific_output
+            .expect("the vector-only local drawer must be injected")
+            .additional_context;
+        assert!(
+            context.contains("source=\"infra/semantic\""),
+            "vector-only local ID must be promoted through RRF: {context}"
+        );
+        assert!(!context.contains("source=\"infra/lexical\""));
+    }
+
+    #[test]
     fn prompt_hook_writes_occupancy_sample() {
         use crate::metrics::METRICS_ENV_LOCK;
         let _env = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
@@ -3072,7 +4053,7 @@ mod tests {
         // budget. At the 150ms default a loaded CI runner can spend the whole
         // budget on recall scheduling alone and bank no row, so this asserts a
         // race rather than the contract. Pin the budget to the 1000ms cap.
-        let _budget = PromptHookBudgetEnvGuard;
+        let _budget = PromptHookEnvGuard::tunables_only();
         std::env::set_var("IRONMEM_PROMPT_HOOK_BUDGET_MS", "1000");
 
         let dir = tempfile::tempdir().unwrap();
@@ -3118,7 +4099,7 @@ mod tests {
         // sample is skipped when less than the reserve remains, which a loaded
         // runner reaches at the 150ms default. Pin it so this asserts the
         // ReadOnly decoupling contract and not the scheduler.
-        let _budget = PromptHookBudgetEnvGuard;
+        let _budget = PromptHookEnvGuard::tunables_only();
         std::env::set_var("IRONMEM_PROMPT_HOOK_BUDGET_MS", "1000");
 
         let dir = tempfile::tempdir().unwrap();
@@ -3329,7 +4310,7 @@ mod tests {
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         std::env::set_var("IRONMEM_PROMPT_HOOK_BUDGET_MS", "150");
-        let _budget_guard = PromptHookBudgetEnvGuard;
+        let _budget_guard = PromptHookEnvGuard::tunables_only();
 
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("m.sqlite3");
