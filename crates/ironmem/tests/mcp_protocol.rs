@@ -1939,7 +1939,7 @@ fn collab_start_allows_restart_after_end() {
 }
 
 #[test]
-fn collab_end_rejected_in_active_planning_phase() {
+fn collab_end_rejects_ineligible_active_planning_calls() {
     let app = App::open_for_test().unwrap();
     let started = call_tool(
         &app,
@@ -1992,7 +1992,9 @@ fn collab_end_rejected_in_active_planning_phase() {
         "expected PlanSynthesisPending rejection, got: {blocked}"
     );
 
-    // Advance to PlanCodexReviewPending → PlanClaudeFinalizePending.
+    // Advance to PlanCodexReviewPending → PlanClaudeFinalizePending. The
+    // finalize owner has a narrow abort path for oversized plans, but the
+    // counterpart must still be rejected.
     call_tool(
         &app,
         "collab_send",
@@ -2029,14 +2031,14 @@ fn collab_end_rejected_in_active_planning_phase() {
     let blocked = call_tool(
         &app,
         "collab_end",
-        json!({ "session_id": &session_id, "agent": "claude" }),
+        json!({ "session_id": &session_id, "agent": "codex" }),
     );
     assert!(
         blocked["error"]
             .as_str()
             .unwrap_or("")
-            .contains("active phase PlanClaudeFinalizePending"),
-        "expected PlanClaudeFinalizePending rejection, got: {blocked}"
+            .contains("PlanClaudeFinalizePending requires current owner claude"),
+        "expected non-owner PlanClaudeFinalizePending rejection, got: {blocked}"
     );
 
     // Reach PlanLocked — now end is allowed.
