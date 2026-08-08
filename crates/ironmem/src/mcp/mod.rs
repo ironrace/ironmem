@@ -3,6 +3,7 @@
 pub mod app;
 pub mod compact;
 pub mod daemon;
+pub(crate) mod daemon_client;
 pub mod protocol;
 pub mod readiness;
 pub mod server;

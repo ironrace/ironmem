@@ -454,27 +454,61 @@ The database is kept up to date automatically through hooks:
 | Hook | What happens |
 |------|-------------|
 | `session-start` | Bootstrap if first run; initial mine if workspace not yet indexed. On the Claude Code harness, also emits a compact memory-status block via `hookSpecificOutput.additionalContext` (drawer/wing/room counts, active collab session + phase, last-diary pointer, `MEMORY_PROTOCOL`); Codex receives no such output (silent degrade) |
-| `user-prompt-submit` | Claude Code only — FTS/BM25 drawer lookup and optional context injection (see below). Codex registers no UserPromptSubmit hook |
+| `user-prompt-submit` | Claude Code only — bounded local BM25/KG/diary recall with optional ready-daemon hybrid vector recall and context injection (see below). Codex registers no UserPromptSubmit hook |
 | `stop` | Persist measured transcript token rows and occupancy samples under `IRONMEM_METRICS`; persist session summary to diary and re-mine changed files when writes are allowed |
 | `precompact` | Persist measured transcript token rows and occupancy samples under `IRONMEM_METRICS`; snapshot pending session context and re-mine changed files when writes are allowed |
 
-### UserPromptSubmit (Claude Code only)
+### UserPromptSubmit recall (Claude Code only)
 
-On every prompt, ironmem runs an FTS/BM25-only drawer lookup (the embedder is
-never loaded) and injects up to 3 sanitized one-line memory matches as
-`hookSpecificOutput.additionalContext`. On overrun or no match it emits nothing
-and exits 0. Codex registers no UserPromptSubmit hook.
+On every prompt, ironmem runs bounded, fail-closed recall and injects sanitized
+untrusted-memory matches into `hookSpecificOutput.additionalContext`. The local
+path uses FTS5/BM25, then optional KG-triple and diary recall; it never loads
+the embedder. Codex registers no UserPromptSubmit hook.
+
+Hybrid vector recall is opt-in. It only borrows a ready shared daemon over its
+Unix socket. The hook never initializes, starts, or warms a daemon, and never
+opens the daemon database or embedder. A missing/unready daemon, deadline,
+malformed/error response, DB/lock failure, empty result, or overall hook
+timeout falls back to local BM25/KG/diary recall or emits no context. The hook
+exits successfully on these ordinary fallbacks.
+
+With hybrid enabled, shared-daemon search work may continue after the hook
+abandons its read. If daemon LLM reranking is enabled (`IRONMEM_RERANK`, read
+by the daemon process), that work can incur reranking latency and
+API/subprocess cost for each prompt — and send the prompt text to that
+backend — even when the hook falls back or injects nothing.
+
+Hybrid recall is a no-op on non-Unix platforms, and restricted
+`IRONMEM_MCP_MODE` suppresses all recall injection. Fusion reuses the shared
+pipeline's weighted RRF, so `IRONMEM_RRF_K` and `IRONMEM_BM25_SPARSE_THRESHOLD`
+also shape the injected set; those two are process-cached rather than fresh-read.
 
 Tunables (all fresh-read per invocation):
 
-- `IRONMEM_PROMPT_HOOK_BUDGET_MS` — hard wall-clock budget, ms (default `150`,
-  capped `1000`).
-- `IRONMEM_PROMPT_HOOK_MAX_HITS` — max excerpts injected per prompt (default `3`,
-  clamped `1`–`3`).
-- `IRONMEM_PROMPT_HOOK_MIN_SCORE` — minimum BM25 score a hit must clear, higher =
-  better (default `0.0`; any FTS match passes).
-- `IRONMEM_PROMPT_HOOK_SUMMARY_MAX_BYTES` — byte cap per injected one-line excerpt
-  (default `120`).
+| Variable | Default | Semantics |
+|---|---:|---|
+| `IRONMEM_PROMPT_HOOK_BUDGET_MS` | `150` | Whole-hook wall-clock budget in ms; non-positive/unparseable → `150`, capped at `1000`. |
+| `IRONMEM_PROMPT_RECALL_HYBRID` | off | `1`, `true`, or `yes` enables ready-daemon vector recall; other values are off. |
+| `IRONMEM_PROMPT_HOOK_HYBRID_BUDGET_MS` | `60` | Hybrid vector-request budget in ms, and how long the hook waits for the answer; non-positive/unparseable → `60`, and the effective request is bounded by the outer budget/reserve. |
+| `IRONMEM_PROMPT_HOOK_HYBRID_LIMIT` | `5` | Vector candidates considered; clamped to `1`–`10`. A reply with more rows than this is out of contract and ignored. |
+| `IRONMEM_DAEMON_SOCKET` | `<state_dir>/daemon.sock` | Daemon borrowed for hybrid recall. Must be the socket itself (symlinks rejected); missing/non-socket → local fallback. |
+| `IRONMEM_PROMPT_HOOK_MAX_HITS` | `3` | Maximum fused vector/BM25 memory excerpts injected per prompt; clamped to `1`–`3`. |
+| `IRONMEM_PROMPT_HOOK_MIN_SCORE` | `0.0` | BM25 floor; higher is stricter. `0.0` allows any FTS `MATCH` result. |
+| `IRONMEM_PROMPT_HOOK_SUMMARY_MAX_BYTES` | `120` | Byte cap per BM25 one-line excerpt. |
+| `IRONMEM_PROMPT_HOOK_KG` | on | `0`, `false`, or `no` disables KG recall; other values use enabled default. |
+| `IRONMEM_PROMPT_HOOK_KG_MAX_TRIPLES` | `3` | KG triples injected; clamped to `1`–`5`. |
+| `IRONMEM_PROMPT_HOOK_DIARY` | on | `0`, `false`, or `no` disables diary recall; other values use enabled default. |
+| `IRONMEM_PROMPT_HOOK_DIARY_MAX` | `1` | Diary excerpts injected; clamped to `1`–`3`. |
+| `IRONMEM_PROMPT_HOOK_DIARY_LINE_BYTES` | `120` | Byte cap per diary line. |
+
+The hook also supports `IRONMEM_CONTEXT_WARN_PCT` (default `0.60`) and
+`IRONMEM_CONTEXT_HANDOFF_PCT` (default `0.80`) for occupancy notices. Each must
+be finite and in `0.0..=1.0`; if either is invalid, or resolved `warn >=
+handoff`, the invalid value or both values respectively revert to defaults.
+`IRONMEM_CONTEXT_WINDOW` (default `200000`) is the positive token denominator;
+invalid/non-positive values use the default. `IRONMEM_METRICS` is the separate
+metrics-write kill switch: unset/on by default, and `0`, `false`, `no`, or `off`
+disable metric writes.
 
 Incremental re-mining uses a SHA-256 manifest so only files whose content changed are re-embedded. Repeat hook runs on unchanged workspaces are fast.
 
