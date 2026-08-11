@@ -4,6 +4,7 @@
 //! no ONNX model required) and assert on the JSON-RPC response shape.
 
 use ironmem::collab::Agent;
+use ironmem::config::{Config, EmbedMode, McpAccessMode};
 use ironmem::mcp::app::App;
 use ironmem::mcp::protocol::JsonRpcRequest;
 use ironmem::mcp::server::dispatch;
@@ -11,9 +12,12 @@ use serde_json::json;
 use sha2::{Digest, Sha256};
 use std::collections::HashSet;
 use std::ffi::OsString;
+use std::io::{BufRead, BufReader, Read, Write};
+use std::net::TcpStream;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Child, Command, Stdio};
 use std::sync::{Mutex, MutexGuard};
+use std::time::{Duration, Instant};
 
 static COMPACT_RESPONSES_ENV_LOCK: Mutex<()> = Mutex::new(());
 
@@ -4836,4 +4840,581 @@ fn collab_pilot_codex_end_to_end_mcp_flow_reaches_coding_complete() {
         json!({ "session_id": session_id, "agent": "claude" }),
     );
     assert_eq!(ended["ok"], true);
+}
+
+// ── Task 15: full verification sweep and reversed-role scenario ────────────
+//
+// One end-to-end MCP-level run of the plan's reversed-role scenario
+// (docs/iron/plans/2026-08-10-collab-role-safety.md, Task 15), exercising
+// every role-safety change from Tasks 1-14 together in a single flow rather
+// than in isolation, plus a *live* cross-check against the Task 12 dashboard
+// (`/api/sessions`, served by the real `ironmem dashboard` binary against the
+// same on-disk DB the App writes to) and the Task 13 `collab_wait_my_turn`
+// baseline. The dashboard's `list_sessions`/`CollabSessionSummary` live in a
+// `pub(crate)` module, so a genuine HTTP round trip against the real binary —
+// not a direct function call — is the only way an integration test outside
+// the crate can exercise it; `App::open_for_test`'s in-memory DB can't be
+// reopened by a second connection, so this test uses an on-disk DB instead.
+
+/// Spawn the real `ironmem dashboard` binary against `db_path` on an
+/// ephemeral port and return once its bound address is known. A trimmed
+/// duplicate of `dashboard_server.rs`'s `spawn_dashboard` helper — test
+/// binaries in `tests/` do not share code with each other.
+struct DashboardHandle {
+    child: Child,
+    addr: String,
+}
+
+impl Drop for DashboardHandle {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+fn spawn_dashboard(db_path: &Path) -> DashboardHandle {
+    let mut child = Command::new(env!("CARGO_BIN_EXE_ironmem"))
+        .arg("dashboard")
+        .arg("--db")
+        .arg(db_path)
+        .arg("--port")
+        .arg("0")
+        .arg("--json")
+        .arg("--exit-on-stdin-close")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn dashboard binary for Task 15's live cross-check");
+
+    let stdout = child.stdout.take().expect("dashboard stdout must be piped");
+    let mut reader = BufReader::new(stdout);
+    let mut line = String::new();
+    reader
+        .read_line(&mut line)
+        .expect("read dashboard startup line");
+    let meta: serde_json::Value = serde_json::from_str(line.trim())
+        .unwrap_or_else(|e| panic!("bad dashboard startup json ({e}): {line}"));
+    let url = meta["url"]
+        .as_str()
+        .expect("startup json must carry url")
+        .to_string();
+    let addr = url
+        .strip_prefix("http://")
+        .expect("dashboard url must be http")
+        .to_string();
+
+    // Drain stderr in the background so the child never blocks on a full pipe.
+    if let Some(err) = child.stderr.take() {
+        std::thread::spawn(move || {
+            let mut r = BufReader::new(err);
+            let mut l = String::new();
+            while r.read_line(&mut l).unwrap_or(0) > 0 {
+                eprint!("[dashboard] {l}");
+                l.clear();
+            }
+        });
+    }
+
+    DashboardHandle { child, addr }
+}
+
+/// Issue one raw `GET` over TCP and parse the JSON response body.
+fn http_get_json(addr: &str, path: &str) -> serde_json::Value {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut stream = loop {
+        match TcpStream::connect(addr) {
+            Ok(s) => break s,
+            Err(_) if Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(25));
+            }
+            Err(e) => panic!("connect {addr}: {e}"),
+        }
+    };
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    let req = format!("GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
+    stream.write_all(req.as_bytes()).unwrap();
+
+    let mut bytes: Vec<u8> = Vec::new();
+    let mut buf = [0u8; 4096];
+    loop {
+        match stream.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => bytes.extend_from_slice(&buf[..n]),
+            Err(e)
+                if e.kind() == std::io::ErrorKind::ConnectionReset
+                    || e.kind() == std::io::ErrorKind::UnexpectedEof =>
+            {
+                break;
+            }
+            Err(e) => panic!("read dashboard response: {e}"),
+        }
+    }
+    let raw = String::from_utf8_lossy(&bytes).into_owned();
+    let body = raw
+        .split_once("\r\n\r\n")
+        .map(|(_, body)| body)
+        .unwrap_or("");
+    serde_json::from_str(body).unwrap_or_else(|e| panic!("dashboard response json ({e}): {body}"))
+}
+
+/// Fetch `/api/sessions` and return the `CollabSessionSummary` entry for
+/// `session_id`.
+fn dashboard_session_summary(addr: &str, session_id: &str) -> serde_json::Value {
+    let sessions = http_get_json(addr, "/api/sessions");
+    sessions
+        .as_array()
+        .expect("dashboard /api/sessions must return a JSON array")
+        .iter()
+        .find(|s| s["id"] == session_id)
+        .unwrap_or_else(|| {
+            panic!("session {session_id} missing from dashboard listing: {sessions}")
+        })
+        .clone()
+}
+
+/// Open an on-disk `App` (noop embedder, trusted MCP mode) so a second,
+/// independent read-only connection — the real dashboard binary — can see
+/// the same committed rows. `App::open_for_test`'s in-memory DB cannot be
+/// shared this way.
+fn open_disk_app_for_dashboard_sweep() -> (tempfile::TempDir, PathBuf, App) {
+    let dir = tempfile::tempdir().expect("temp dir must be creatable");
+    let db_path = dir.path().join("collab.sqlite3");
+    let state_dir = dir.path().join("state");
+    let config = Config {
+        db_path: db_path.clone(),
+        model_dir: PathBuf::from("/nonexistent"),
+        model_dir_explicit: true,
+        state_dir,
+        mcp_access_mode: McpAccessMode::Trusted,
+        embed_mode: EmbedMode::Noop,
+    };
+    let app = App::new(config).expect("disk-backed App must open for Task 15's full sweep");
+    (dir, db_path, app)
+}
+
+/// Open a SECOND, independent `App` against the same on-disk DB — models a
+/// second agent's own local `ironmem` MCP server process sharing one
+/// repository's DB, the deployment topology `ensure_actor_generation_current`
+/// (`crates/ironmem/src/mcp/tools/handoff.rs`) is designed around. Used by the
+/// full sweep to model the documented recovery path from the Task 9 audit
+/// finding in this file (`Not in scope here...`, above): a per-process actor
+/// generation cache that ends up ahead of the DB after a claimed-then-rolled-
+/// back handoff token has no in-process recovery — the fix is a fresh process,
+/// which is exactly what a real Codex client would do here.
+fn open_second_disk_app(db_path: &Path) -> (tempfile::TempDir, App) {
+    let dir = tempfile::tempdir().expect("temp dir must be creatable");
+    let state_dir = dir.path().join("state");
+    let config = Config {
+        db_path: db_path.to_path_buf(),
+        model_dir: PathBuf::from("/nonexistent"),
+        model_dir_explicit: true,
+        state_dir,
+        mcp_access_mode: McpAccessMode::Trusted,
+        embed_mode: EmbedMode::Noop,
+    };
+    let app = App::new(config)
+        .expect("second disk-backed App must open for the fresh-process workaround");
+    (dir, app)
+}
+
+/// Step 7 cross-check, `collab_wait_my_turn` half: the current owner must
+/// observe its own turn immediately; the other agent must never observe
+/// `is_my_turn: true` and instead time out unsettled — mirroring
+/// `collab_set_pilot_reassignment_leaves_exactly_one_claimable_owner`'s
+/// pattern, reused here as a running cross-check against `collab_status`
+/// rather than a one-off assertion. `owner_app`/`non_owner_app` are separate
+/// parameters (rather than one shared `App`) so a checkpoint can cross-check
+/// an agent whose in-process generation cache lives in a different `App`
+/// instance than the owner's — see `open_second_disk_app`.
+fn assert_wait_turn_matches_status(
+    owner_app: &App,
+    non_owner_app: &App,
+    session_id: &str,
+    owner: &str,
+    non_owner: &str,
+    checkpoint: &str,
+) {
+    let owner_wait = call_tool(
+        owner_app,
+        "collab_wait_my_turn",
+        json!({ "session_id": session_id, "agent": owner, "timeout_secs": 1 }),
+    );
+    assert_eq!(
+        owner_wait["is_my_turn"], true,
+        "{checkpoint}: collab_wait_my_turn must report {owner}'s own turn"
+    );
+    assert_eq!(owner_wait["current_owner"], owner);
+
+    let non_owner_wait = call_tool(
+        non_owner_app,
+        "collab_wait_my_turn",
+        json!({ "session_id": session_id, "agent": non_owner, "timeout_secs": 1 }),
+    );
+    assert_eq!(
+        non_owner_wait,
+        json!({ "unchanged": true }),
+        "{checkpoint}: collab_wait_my_turn must never report {non_owner}'s turn while {owner} owns it"
+    );
+}
+
+/// Step 7 cross-check, dashboard half: the live `/api/sessions` listing must
+/// report the same `pilot`/`implementer`/`current_owner`/`phase` as
+/// `collab_status` at the same checkpoint.
+fn assert_dashboard_matches_status(
+    addr: &str,
+    session_id: &str,
+    status: &serde_json::Value,
+    checkpoint: &str,
+) {
+    let summary = dashboard_session_summary(addr, session_id);
+    assert_eq!(
+        summary["pilot"], status["pilot"],
+        "{checkpoint}: dashboard pilot must match collab_status"
+    );
+    assert_eq!(
+        summary["implementer"], status["implementer"],
+        "{checkpoint}: dashboard implementer must match collab_status"
+    );
+    assert_eq!(
+        summary["current_owner"], status["current_owner"],
+        "{checkpoint}: dashboard current_owner must match collab_status"
+    );
+    assert_eq!(
+        summary["phase"], status["phase"],
+        "{checkpoint}: dashboard phase must match collab_status"
+    );
+}
+
+/// Task 15's full scenario, run in the exact 7-step order specified by the
+/// plan. `pilot=codex, implementer=claude` at start, reassigned to
+/// `pilot=claude` mid-flight (step 2) — the reversed-role case the plan
+/// exists to pin. Step numbering in the comments below matches the plan's
+/// literal step list verbatim.
+///
+/// Note on step 6: the plan's own scenario never reassigns `implementer`
+/// away from `claude` (it is fixed at `collab_start` in step 1 and never
+/// touched again), and step 2 ends with `pilot=claude` too — so by
+/// `CodeImplementPending` this run has `pilot == implementer == claude`,
+/// not a genuinely split pair. The assertion below is implemented exactly as
+/// the plan specifies ("Assert `current_owner == claude`") rather than
+/// silently strengthened into a split-role case; the split-role invariant
+/// itself already has a dedicated regression guard from Task 4's tests
+/// (`collab_start_accepts_pilot_codex_and_defaults_implementer_to_pilot` and
+/// neighbors).
+#[test]
+fn collab_role_safety_full_verification_sweep_reversed_role_scenario() {
+    let (_dir, db_path, app) = open_disk_app_for_dashboard_sweep();
+    let dashboard = spawn_dashboard(&db_path);
+
+    // ── Step 1 ──────────────────────────────────────────────────────────
+    // collab_start --pilot=codex --implementer=claude. current_owner must
+    // seed from the PILOT (Task 4's invariant), not the implementer.
+    let started = call_tool(
+        &app,
+        "collab_start",
+        json!({
+            "repo_path": "/repo",
+            "branch": "feat/role-safety-sweep",
+            "initiator": "claude",
+            "pilot": "codex",
+            "implementer": "claude"
+        }),
+    );
+    let session_id = started["session_id"].as_str().unwrap().to_string();
+    assert_eq!(started["pilot"], "codex");
+    assert_eq!(started["implementer"], "claude");
+
+    let status = call_tool(&app, "collab_status", json!({ "session_id": &session_id }));
+    assert_eq!(status["pilot"], "codex");
+    assert_eq!(status["implementer"], "claude");
+    assert_eq!(status["current_owner"], "codex");
+    assert_eq!(status["phase"], "PlanParallelDrafts");
+
+    // Step 7 checkpoint (post step 1).
+    assert_wait_turn_matches_status(&app, &app, &session_id, "codex", "claude", "after step 1");
+    assert_dashboard_matches_status(&dashboard.addr, &session_id, &status, "after step 1");
+
+    // Mint a handoff token for codex BEFORE step 2's reassignment, and hold
+    // it unspent through steps 2-3 for step 4's retry.
+    let handoff = call_tool(
+        &app,
+        "session_handoff",
+        json!({ "session_id": &session_id, "agent": "codex" }),
+    );
+    let pre_reassignment_token = handoff["handoff_token"]
+        .as_str()
+        .expect("session_handoff must return a token")
+        .to_string();
+
+    // ── Step 2 ──────────────────────────────────────────────────────────
+    // As Codex (the CURRENT pilot), before any draft lands: reassign the
+    // pilot to Claude. Must succeed; current_owner moves with it.
+    let reassigned = call_tool(
+        &app,
+        "collab_set_pilot",
+        json!({
+            "session_id": &session_id,
+            "agent": "codex",
+            "pilot": "claude"
+        }),
+    );
+    assert_eq!(reassigned["pilot"], "claude");
+    assert_eq!(reassigned["current_owner"], "claude");
+
+    let status = call_tool(&app, "collab_status", json!({ "session_id": &session_id }));
+    assert_eq!(status["pilot"], "claude");
+    assert_eq!(status["implementer"], "claude");
+    assert_eq!(status["current_owner"], "claude");
+
+    // Step 7 checkpoint (post step 2).
+    assert_wait_turn_matches_status(&app, &app, &session_id, "claude", "codex", "after step 2");
+    assert_dashboard_matches_status(&dashboard.addr, &session_id, &status, "after step 2");
+
+    // ── Step 3 ──────────────────────────────────────────────────────────
+    // As Codex (now the FORMER pilot): both collab_set_pilot and
+    // collab_set_implementer must be refused with the matrix's
+    // authorization error, and pilot/implementer/current_owner/updated_at
+    // must all be unchanged after BOTH attempts.
+    let before = call_tool(&app, "collab_status", json!({ "session_id": &session_id }));
+
+    let set_pilot_auth_err = call_tool_expect_error(
+        &app,
+        "collab_set_pilot",
+        json!({
+            "session_id": &session_id,
+            "agent": "codex",
+            "pilot": "codex"
+        }),
+    );
+    assert_eq!(
+        set_pilot_auth_err,
+        "collab_set_pilot refused: caller 'codex' is the copilot of this session; \
+         only the current pilot 'claude' may reassign the pilot role"
+    );
+
+    let set_implementer_auth_err = call_tool_expect_error(
+        &app,
+        "collab_set_implementer",
+        json!({
+            "session_id": &session_id,
+            "agent": "codex",
+            "implementer": "codex"
+        }),
+    );
+    assert_eq!(
+        set_implementer_auth_err,
+        "collab_set_implementer refused: caller 'codex' is not the pilot of this session; \
+         only the current pilot 'claude' may reassign the implementer"
+    );
+
+    let after_step3 = call_tool(&app, "collab_status", json!({ "session_id": &session_id }));
+    assert_eq!(after_step3["pilot"], before["pilot"]);
+    assert_eq!(after_step3["implementer"], before["implementer"]);
+    assert_eq!(after_step3["current_owner"], before["current_owner"]);
+    assert_eq!(
+        after_step3["updated_at"], before["updated_at"],
+        "step 3: two refused authorization attempts must not touch updated_at"
+    );
+
+    // ── Step 4 ──────────────────────────────────────────────────────────
+    // Retry step 3's mutations using the token minted for codex BEFORE the
+    // reassignment. Still refused — by the caller-identity check, not a
+    // token-staleness mechanism (Task 9's finding: reassignment never
+    // invalidates an outstanding token) — with zero mutation. Reusing the
+    // SAME token for both retries is safe: `claim_handoff_token` succeeds
+    // inside each call's own transaction, but the caller-identity check that
+    // runs immediately after it fails, so the whole transaction (including
+    // the token claim) rolls back every time and the token is never actually
+    // spent.
+    let retry_set_implementer_err = call_tool_expect_error(
+        &app,
+        "collab_set_implementer",
+        json!({
+            "session_id": &session_id,
+            "agent": "codex",
+            "implementer": "codex",
+            "handoff_token": &pre_reassignment_token
+        }),
+    );
+    assert_eq!(retry_set_implementer_err, set_implementer_auth_err);
+    assert!(
+        !retry_set_implementer_err.contains("already claimed")
+            && !retry_set_implementer_err.contains("invalid handoff_token"),
+        "step 4's refusal must come from the caller-identity check, not a token error: \
+         {retry_set_implementer_err}"
+    );
+
+    let retry_set_pilot_err = call_tool_expect_error(
+        &app,
+        "collab_set_pilot",
+        json!({
+            "session_id": &session_id,
+            "agent": "codex",
+            "pilot": "codex",
+            "handoff_token": &pre_reassignment_token
+        }),
+    );
+    assert_eq!(retry_set_pilot_err, set_pilot_auth_err);
+    assert!(
+        !retry_set_pilot_err.contains("already claimed")
+            && !retry_set_pilot_err.contains("invalid handoff_token"),
+        "step 4's refusal must come from the caller-identity check, not a token error: \
+         {retry_set_pilot_err}"
+    );
+
+    let after_step4 = call_tool(&app, "collab_status", json!({ "session_id": &session_id }));
+    assert_eq!(after_step4["pilot"], before["pilot"]);
+    assert_eq!(after_step4["implementer"], before["implementer"]);
+    assert_eq!(after_step4["current_owner"], before["current_owner"]);
+    assert_eq!(
+        after_step4["updated_at"], before["updated_at"],
+        "step 4: a refused token-bearing retry must not touch updated_at either"
+    );
+
+    // ── Step 5 ──────────────────────────────────────────────────────────
+    // Land a draft, then attempt collab_set_pilot as Claude — the ACTUAL
+    // current pilot post-step-2 — again. Refused on the PHASE gate this
+    // time: a genuinely distinct error from step 3's authorization refusal.
+    call_tool(
+        &app,
+        "collab_send",
+        json!({
+            "session_id": &session_id,
+            "sender": "claude",
+            "topic": "draft",
+            "content": "claude blind draft"
+        }),
+    );
+
+    let phase_gate_err = call_tool_expect_error(
+        &app,
+        "collab_set_pilot",
+        json!({
+            "session_id": &session_id,
+            "agent": "claude",
+            "pilot": "codex"
+        }),
+    );
+    assert!(
+        phase_gate_err.contains("PlanParallelDrafts") && phase_gate_err.contains("draft"),
+        "expected the phase-gate rejection naming the phase and the landed draft, got: \
+         {phase_gate_err}"
+    );
+    assert_ne!(
+        phase_gate_err, set_pilot_auth_err,
+        "step 5's phase-gate refusal must be textually distinct from step 3's authorization \
+         refusal"
+    );
+
+    // ── Step 6 ──────────────────────────────────────────────────────────
+    // Continue driving to CodeImplementPending. current_owner must equal the
+    // IMPLEMENTER, not merely the (also-claude, post-reassignment) pilot —
+    // see the file-level note above on why this scenario doesn't reach a
+    // genuinely split pilot != implementer pair at this checkpoint.
+    //
+    // Codex's remaining actions in this scenario (submitting its own blind
+    // draft, reviewing the canonical plan) route through a SECOND, fresh
+    // `App` rather than the original one. This is the documented recovery
+    // from step 4's token-bearing retries: presenting `pre_reassignment_token`
+    // there claimed it successfully (`claim_handoff_token` runs, and
+    // `ensure_actor_generation_current` calls `app.set_cached_generation`)
+    // inside a transaction that then rolled back on the caller-identity
+    // check, per the Task 9 audit finding documented earlier in this file
+    // ("Not in scope here..."). That leaves the ORIGINAL `App`'s in-process
+    // generation cache for codex one ahead of the DB, and there is no
+    // in-process recovery for that — codex's next call through `app`, even
+    // an ordinary draft submission, is refused with "stale collab
+    // generation ... obtain a session_handoff token in a fresh process".
+    // This is a pre-existing, deliberately out-of-scope limitation (the
+    // audit finding says so explicitly), not a new defect this sweep should
+    // fix in production code — so the test follows the documented recovery
+    // instead: a fresh process (a second `App` on the same DB) for codex.
+    let (_dir2, app_codex) = open_second_disk_app(&db_path);
+
+    call_tool(
+        &app_codex,
+        "collab_send",
+        json!({
+            "session_id": &session_id,
+            "sender": "codex",
+            "topic": "draft",
+            "content": "codex blind draft"
+        }),
+    );
+    let status = call_tool(&app, "collab_status", json!({ "session_id": &session_id }));
+    assert_eq!(status["phase"], "PlanSynthesisPending");
+    assert_eq!(status["current_owner"], "claude");
+
+    call_tool(
+        &app,
+        "collab_send",
+        json!({
+            "session_id": &session_id,
+            "sender": "claude",
+            "topic": "canonical",
+            "content": "canonical plan v1"
+        }),
+    );
+    call_tool(
+        &app_codex,
+        "collab_send",
+        json!({
+            "session_id": &session_id,
+            "sender": "codex",
+            "topic": "review",
+            "content": json!({ "verdict": "approve" }).to_string()
+        }),
+    );
+    call_tool(
+        &app,
+        "collab_send",
+        json!({
+            "session_id": &session_id,
+            "sender": "claude",
+            "topic": "final",
+            "content": json!({ "plan": "final plan text" }).to_string()
+        }),
+    );
+    let status = call_tool(&app, "collab_status", json!({ "session_id": &session_id }));
+    assert_eq!(status["phase"], "PlanLocked");
+    let final_plan_hash = status["final_plan_hash"].as_str().unwrap().to_string();
+
+    call_tool(
+        &app,
+        "collab_send",
+        json!({
+            "session_id": &session_id,
+            "sender": "claude",
+            "topic": "task_list",
+            "content": task_list_payload(&final_plan_hash, "base0", "head0", 1)
+        }),
+    );
+    let status = call_tool(&app, "collab_status", json!({ "session_id": &session_id }));
+    assert_eq!(status["phase"], "CodeImplementPending");
+    assert_eq!(
+        status["current_owner"], "claude",
+        "current_owner at CodeImplementPending must equal the implementer"
+    );
+    assert_eq!(status["pilot"], "claude");
+    assert_eq!(status["implementer"], "claude");
+
+    // Step 7 checkpoint (step 6's final state). Codex's half again goes
+    // through `app_codex` — see the step 6 comment above.
+    assert_wait_turn_matches_status(
+        &app,
+        &app_codex,
+        &session_id,
+        "claude",
+        "codex",
+        "at CodeImplementPending",
+    );
+    assert_dashboard_matches_status(
+        &dashboard.addr,
+        &session_id,
+        &status,
+        "at CodeImplementPending",
+    );
 }
