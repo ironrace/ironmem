@@ -783,9 +783,12 @@ pub(super) fn handle_collab_set_implementer(app: &App, args: &Value) -> Result<V
 ///    role-dependent artifact exists, changing the pilot is a live-role rewrite
 ///    of work already done — not configuration of work not yet started.
 /// 2. **Permitted caller.** The request's `agent` must equal the session's
-///    *current* pilot. A copilot can never promote itself, which is precisely
-///    what stops this from being a turn-seizure primitive: the only way to
-///    become pilot is to be handed the role by the agent that already holds it.
+///    *current* pilot. This stops an *honest* client from promoting itself
+///    without being handed the role by the agent that already holds it — it
+///    does **not** defeat a caller willing to misrepresent its own identity,
+///    since `agent` is caller-asserted, not authenticated. It is therefore
+///    not a turn-seizure-proof primitive against a lying caller, only against
+///    an honest one that has not been handed the role.
 ///    Enforced by the shared [`ensure_caller_is_current_pilot`] helper — see
 ///    its doc comment for the caller-asserted-identity caveat that applies to
 ///    this check.

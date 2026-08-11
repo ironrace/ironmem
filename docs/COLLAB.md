@@ -1023,13 +1023,16 @@ each one of `{"claude","codex"}`.
 
 **Caller restriction.** Only the session's *current* pilot may call this,
 checked before phase, so an unauthorized caller is rejected identically
-regardless of what phase the session is in. A copilot can never promote
-itself; the rejection names the caller's role and the pilot that may act:
+regardless of what phase the session is in. The rejection names the
+caller's role and the pilot that may act:
 `"collab_set_pilot refused: caller '<agent>' is the copilot of this
 session; only the current pilot '<pilot>' may reassign the pilot role"`.
-This is what stops the tool from being a turn-seizure primitive — the only
-way to become pilot is to be handed the role by the agent that already
-holds it.
+This stops an *honest* client from promoting itself without being handed
+the role by the agent that already holds it — it does **not** defeat a
+caller willing to misrepresent its own identity, since `agent` is
+caller-asserted rather than authenticated. See the caller-asserted-identity
+caveat in § Authorization / Phase / Ownership Matrix, below, which applies
+identically to `collab_set_implementer`.
 
 **Phase policy.** Legal only in `PlanParallelDrafts`, and only before
 either agent's first draft has landed. It is rejected:
@@ -1079,6 +1082,47 @@ and is readable via `collab_status`. `pilot` is optional, defaults to
 `collab_start` (migration 019). `initiator` stays fixed to `"claude"`
 regardless of `pilot`: it names the dispatcher invoking the shortcut, not
 the review-flow lead (§ Runtime Model → Roles).
+
+### Authorization / Phase / Ownership Matrix
+
+The three tools above are the only ones that create a session or reassign
+one of its two roles (`pilot`, `implementer`). This section is the single
+source of truth for their authorization, phase, and ownership behavior;
+every later reference to "who may call X, from where, with what side
+effects" should point back here rather than restate it.
+
+**Phase-aware ownership invariant.** Ownership of `current_owner` is
+phase-derived, not caller-derived. The pilot owns the planning turns the
+phase model assigns it (`canonical` at `PlanSynthesisPending`, `final` at
+`PlanClaudeFinalizePending`, `task_list` at `PlanLocked`, `review_local` and
+`final_review` in the v3 review phases); the implementer owns
+`CodeImplementPending`; the `collab_start_code_review` shortcut seeds
+`current_owner = counterpart(pilot)` (the copilot) at creation, since it
+begins the session already inside a copilot-owned phase
+(`CodeReviewFixGlobalPending`). A role-reassignment tool moves
+`current_owner` **only where the code's phase policy requires it**:
+`collab_set_pilot` moves it unconditionally on every call, because every
+call happens in `PlanParallelDrafts`, where `current_owner` is only a
+next-expected hint, not a gate on which draft may land; `collab_set_implementer`
+moves it only when the session is currently in `CodeImplementPending`, and
+leaves it untouched in every planning phase. Neither tool touches
+`current_owner` outside those conditions.
+
+**Caller-asserted-identity caveat — applies to both mutators.**
+`collab_set_pilot` and `collab_set_implementer` both gate on the request's
+`agent` field, and that field is supplied by the caller, not authenticated
+against any process-bound identity (see `ensure_caller_is_current_pilot`'s
+doc comment in `collab_session.rs`, the shared helper both handlers call).
+The check stops an *honest* client from acting on a role/turn it does not
+own; it does **not** stop a caller willing to misrepresent which agent it
+is. This is not a property of `collab_set_pilot` alone — it applies
+identically to `collab_set_implementer`, since both call the same guard.
+
+| Tool | Permitted caller(s) | Permitted phase(s) | Coupled field writes | Rejection reasons |
+|---|---|---|---|---|
+| `collab_start` | Any `initiator` that is a valid agent value (`claude`/`codex`); not checked against any existing role, since no session exists yet | N/A — creates the session | Seeds `pilot` (default `claude`), `implementer` (default = resolved `pilot`), and the initial `current_owner` via `create_session`/`CollabRoles` | An active session already reserves the same `(repo_path, branch)`; `pilot`/`implementer`/`initiator` is present but not a valid agent string |
+| `collab_set_pilot` | Only the session's *current* pilot, checked before phase (caller-asserted-identity caveat above applies) | Only `PlanParallelDrafts`, and only while both `claude_draft_hash` and `codex_draft_hash` are unset | Always moves `current_owner = new_pilot`, in the same `set_pilot` UPDATE, even when `previous_pilot == new_pilot` | Caller is not the current pilot ("...caller '<agent>' is the copilot..."); phase is not `PlanParallelDrafts`; a draft (`claude_draft_hash` or `codex_draft_hash`) has already landed |
+| `collab_set_implementer` | Only the session's *current* pilot, checked before phase (caller-asserted-identity caveat above applies) — the implementer cannot hand off its own role | `PlanParallelDrafts`, `PlanSynthesisPending`, `PlanCodexReviewPending`, `PlanClaudeFinalizePending`, or `PlanLocked` while `task_list` is unset; or `CodeImplementPending`. Refused from any code-review phase onward and once coding is complete or failed | Moves `current_owner` to the new implementer only when the session is currently in `CodeImplementPending`; leaves `current_owner` untouched in every planning phase | Caller is not the current pilot ("...caller '<agent>' is not the pilot..."); phase disallows the change (`task_list` already set during planning, any code-review phase, `CodingComplete`, or `CodingFailed`) |
 
 ### `collab_send`
 
