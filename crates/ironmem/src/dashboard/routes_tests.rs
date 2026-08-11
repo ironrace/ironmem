@@ -52,8 +52,10 @@ fn fixture() -> Fixture {
                 "/repo-a",
                 "main",
                 Some("dashboard task"),
-                crate::collab::Agent::Claude,
-                crate::collab::Agent::Claude,
+                crate::collab::CollabRoles {
+                    pilot: crate::collab::Agent::Claude,
+                    implementer: crate::collab::Agent::Claude,
+                },
             )
         })
         .unwrap();

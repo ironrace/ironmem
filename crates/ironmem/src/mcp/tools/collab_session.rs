@@ -601,8 +601,7 @@ pub(super) fn handle_collab_start(app: &App, args: &Value) -> Result<Value, Memo
             repo_path,
             branch,
             task,
-            implementer,
-            pilot,
+            crate::collab::CollabRoles { pilot, implementer },
         )?;
         crate::db::schema::Database::wal_log_tx(
             tx,
@@ -946,8 +945,10 @@ pub(super) fn handle_collab_start_code_review(
             repo_path,
             branch,
             Some(task),
-            pilot,
-            pilot,
+            crate::collab::CollabRoles {
+                pilot,
+                implementer: pilot,
+            },
         )?;
         crate::collab::queue::save_session(tx, &session)?;
         crate::db::schema::Database::wal_log_tx(
@@ -2668,8 +2669,10 @@ mod tests {
                     "/tmp/other",
                     "other-branch",
                     None,
-                    crate::collab::Agent::Claude,
-                    crate::collab::Agent::Claude,
+                    crate::collab::CollabRoles {
+                        pilot: crate::collab::Agent::Claude,
+                        implementer: crate::collab::Agent::Claude,
+                    },
                 )
             })
             .unwrap();
@@ -2842,8 +2845,10 @@ mod tests {
                     "/tmp/other-repo",
                     "other-branch",
                     None,
-                    crate::collab::Agent::Claude,
-                    crate::collab::Agent::Claude,
+                    crate::collab::CollabRoles {
+                        pilot: crate::collab::Agent::Claude,
+                        implementer: crate::collab::Agent::Claude,
+                    },
                 )
             })
             .unwrap();

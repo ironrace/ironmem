@@ -2719,8 +2719,10 @@ mod tests {
                     repo_path,
                     branch,
                     None,
-                    crate::collab::Agent::Claude,
-                    crate::collab::Agent::Claude,
+                    crate::collab::CollabRoles {
+                        pilot: crate::collab::Agent::Claude,
+                        implementer: crate::collab::Agent::Claude,
+                    },
                 )
             })
             .unwrap();
@@ -2831,8 +2833,10 @@ mod tests {
                     repo.as_ref(),
                     "main",
                     None,
-                    crate::collab::Agent::Claude,
-                    crate::collab::Agent::Claude,
+                    crate::collab::CollabRoles {
+                        pilot: crate::collab::Agent::Claude,
+                        implementer: crate::collab::Agent::Claude,
+                    },
                 )
             })
             .unwrap();
@@ -5212,8 +5216,10 @@ mod tests {
                     repo_path,
                     "main",
                     None,
-                    crate::collab::Agent::Claude,
-                    crate::collab::Agent::Claude,
+                    crate::collab::CollabRoles {
+                        pilot: crate::collab::Agent::Claude,
+                        implementer: crate::collab::Agent::Claude,
+                    },
                 )
             })
             .unwrap();

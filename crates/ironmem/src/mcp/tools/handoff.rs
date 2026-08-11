@@ -363,7 +363,7 @@ pub(super) fn handle_session_handoff(app: &App, args: &Value) -> Result<Value, M
 mod tests {
     use super::*;
     use crate::collab::queue::{create_session, SessionRecord};
-    use crate::collab::{issue_or_reuse_handoff, Agent, Phase};
+    use crate::collab::{issue_or_reuse_handoff, Agent, CollabRoles, Phase};
     use std::sync::Arc;
 
     fn test_app_with_db_path(
@@ -445,8 +445,10 @@ mod tests {
                     "/repo",
                     "main",
                     Some("task"),
-                    Agent::Claude,
-                    Agent::Claude,
+                    CollabRoles {
+                        pilot: Agent::Claude,
+                        implementer: Agent::Claude,
+                    },
                 )
             })
             .unwrap();
@@ -470,8 +472,10 @@ mod tests {
                     "/repo",
                     "main",
                     Some("t"),
-                    Agent::Claude,
-                    Agent::Claude,
+                    CollabRoles {
+                        pilot: Agent::Claude,
+                        implementer: Agent::Claude,
+                    },
                 )
             })
             .unwrap();
@@ -509,8 +513,10 @@ mod tests {
                     "/repo",
                     "main",
                     Some("t"),
-                    Agent::Claude,
-                    Agent::Claude,
+                    CollabRoles {
+                        pilot: Agent::Claude,
+                        implementer: Agent::Claude,
+                    },
                 )
             })
             .unwrap();
@@ -1005,8 +1011,10 @@ gates: passed\n";
                         "/repo",
                         "main",
                         Some("t"),
-                        Agent::Claude,
-                        Agent::Claude,
+                        CollabRoles {
+                            pilot: Agent::Claude,
+                            implementer: Agent::Claude,
+                        },
                     )
                 })
                 .unwrap();

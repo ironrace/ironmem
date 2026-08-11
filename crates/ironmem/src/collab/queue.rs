@@ -3,7 +3,7 @@
 use rusqlite::{params, Connection, OptionalExtension};
 use uuid::Uuid;
 
-use super::{Agent, CollabSession, Phase};
+use super::{Agent, CollabRoles, CollabSession, Phase};
 use crate::error::MemoryError;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -43,9 +43,9 @@ pub fn create_session(
     repo_path: &str,
     branch: &str,
     task: Option<&str>,
-    implementer: Agent,
-    pilot: Agent,
+    roles: CollabRoles,
 ) -> Result<(), MemoryError> {
+    let CollabRoles { pilot, implementer } = roles;
     // `Agent` is a closed enum so the canonical wire form is guaranteed —
     // no application-layer string validation is needed here. The DB CHECK
     // constraint on the column remains as defense-in-depth against direct
@@ -805,8 +805,10 @@ mod tests {
             "/repo",
             "main",
             None,
-            Agent::Claude,
-            Agent::Claude,
+            CollabRoles {
+                pilot: Agent::Claude,
+                implementer: Agent::Claude,
+            },
         )
         .unwrap();
         let m1 = send_message(
@@ -850,8 +852,10 @@ mod tests {
             "/repo",
             "main",
             None,
-            Agent::Claude,
-            Agent::Claude,
+            CollabRoles {
+                pilot: Agent::Claude,
+                implementer: Agent::Claude,
+            },
         )
         .unwrap();
 
@@ -880,8 +884,10 @@ mod tests {
             "/repo",
             "main",
             None,
-            Agent::Claude,
-            Agent::Claude,
+            CollabRoles {
+                pilot: Agent::Claude,
+                implementer: Agent::Claude,
+            },
         )
         .unwrap();
         let message_id =
@@ -900,8 +906,10 @@ mod tests {
             "/repo",
             "main",
             None,
-            Agent::Claude,
-            Agent::Claude,
+            CollabRoles {
+                pilot: Agent::Claude,
+                implementer: Agent::Claude,
+            },
         )
         .unwrap();
         register_caps(
@@ -941,8 +949,10 @@ mod tests {
             "/repo",
             "main",
             None,
-            Agent::Claude,
-            Agent::Claude,
+            CollabRoles {
+                pilot: Agent::Claude,
+                implementer: Agent::Claude,
+            },
         )
         .unwrap();
         let caps = get_caps(&db, "sess4", Some("claude")).unwrap();
@@ -974,8 +984,10 @@ mod tests {
             "/repo",
             "main",
             Some("build a landing page"),
-            Agent::Claude,
-            Agent::Claude,
+            CollabRoles {
+                pilot: Agent::Claude,
+                implementer: Agent::Claude,
+            },
         )
         .unwrap();
         let record = load_session_record(&db, "sess-task").unwrap();
@@ -993,8 +1005,10 @@ mod tests {
             "/repo",
             "main",
             None,
-            Agent::Claude,
-            Agent::Claude,
+            CollabRoles {
+                pilot: Agent::Claude,
+                implementer: Agent::Claude,
+            },
         )
         .unwrap();
         let mut session = load_session(&db, "sess-rr").unwrap();
@@ -1013,8 +1027,10 @@ mod tests {
             "/repo",
             "main",
             None,
-            Agent::Claude,
-            Agent::Claude,
+            CollabRoles {
+                pilot: Agent::Claude,
+                implementer: Agent::Claude,
+            },
         )
         .unwrap();
         ensure_active(&db, "sess-end").unwrap();
@@ -1032,8 +1048,10 @@ mod tests {
             "/repo",
             "main",
             None,
-            Agent::Claude,
-            Agent::Claude,
+            CollabRoles {
+                pilot: Agent::Claude,
+                implementer: Agent::Claude,
+            },
         )
         .unwrap();
         end_session(&db, "sess-end2").unwrap();
@@ -1057,8 +1075,10 @@ mod tests {
             "/repo",
             "main",
             None,
-            Agent::Claude,
-            Agent::Claude,
+            CollabRoles {
+                pilot: Agent::Claude,
+                implementer: Agent::Claude,
+            },
         )
         .unwrap();
         let mut session = load_session(&db, "sess-v2").unwrap();
@@ -1092,8 +1112,10 @@ mod tests {
             "/repo",
             "main",
             None,
-            Agent::Claude,
-            Agent::Claude,
+            CollabRoles {
+                pilot: Agent::Claude,
+                implementer: Agent::Claude,
+            },
         )
         .unwrap();
         let session = load_session(&db, "sess-fresh").unwrap();
@@ -1121,8 +1143,10 @@ mod tests {
             "/repo",
             "main",
             None,
-            Agent::Claude,
-            Agent::Claude,
+            CollabRoles {
+                pilot: Agent::Claude,
+                implementer: Agent::Claude,
+            },
         )
         .unwrap();
         let default_session = load_session(&db, "sess-pilot-default").unwrap();
@@ -1137,8 +1161,10 @@ mod tests {
             "/repo",
             "main",
             None,
-            Agent::Claude,
-            Agent::Codex,
+            CollabRoles {
+                pilot: Agent::Codex,
+                implementer: Agent::Claude,
+            },
         )
         .unwrap();
         let mixed_session = load_session(&db, "sess-pilot-codex").unwrap();
@@ -1165,8 +1191,10 @@ mod tests {
             "/repo",
             "main",
             None,
-            Agent::Claude,
-            Agent::Claude,
+            CollabRoles {
+                pilot: Agent::Claude,
+                implementer: Agent::Claude,
+            },
         )
         .unwrap();
         let mut session = load_session(&db, "sess-pilot-full").unwrap();
@@ -1234,12 +1262,15 @@ mod tests {
             "/repo",
             "main",
             None,
-            Agent::Codex,
-            Agent::Claude,
+            CollabRoles {
+                pilot: Agent::Claude,
+                implementer: Agent::Codex,
+            },
         )
         .unwrap();
         let seeded = load_session(&db, "sess-set-pilot").unwrap();
         assert_eq!(seeded.implementer, Agent::Codex, "fixture precondition");
+        assert_eq!(seeded.pilot, Agent::Claude, "fixture precondition");
 
         set_pilot(&db, "sess-set-pilot", Agent::Codex, None).unwrap();
         let session = load_session(&db, "sess-set-pilot").unwrap();
@@ -1275,8 +1306,10 @@ mod tests {
             "/repo",
             "main",
             None,
-            Agent::Claude,
-            Agent::Claude,
+            CollabRoles {
+                pilot: Agent::Claude,
+                implementer: Agent::Claude,
+            },
         )
         .unwrap();
         set_pilot(&db, "sess-set-pilot-mirror", Agent::Codex, None).unwrap();
@@ -1305,8 +1338,10 @@ mod tests {
             "/repo",
             "main",
             None,
-            Agent::Claude,
-            Agent::Claude,
+            CollabRoles {
+                pilot: Agent::Claude,
+                implementer: Agent::Claude,
+            },
         )
         .unwrap();
         let mut session = load_session(&db, "sess-recovery").unwrap();
@@ -1361,8 +1396,10 @@ mod tests {
             "/repo",
             "main",
             None,
-            Agent::Claude,
-            Agent::Claude,
+            CollabRoles {
+                pilot: Agent::Claude,
+                implementer: Agent::Claude,
+            },
         )
         .unwrap();
         let session = load_session(&db, "sess-legacy").unwrap();
@@ -1384,8 +1421,10 @@ mod tests {
             "/repo",
             "main",
             None,
-            Agent::Claude,
-            Agent::Claude,
+            CollabRoles {
+                pilot: Agent::Claude,
+                implementer: Agent::Claude,
+            },
         )
         .unwrap();
 
@@ -1422,8 +1461,10 @@ mod tests {
             "/repo",
             "main",
             None,
-            Agent::Claude,
-            Agent::Claude,
+            CollabRoles {
+                pilot: Agent::Claude,
+                implementer: Agent::Claude,
+            },
         )
         .unwrap();
         let m1 = send_message(
@@ -1461,8 +1502,10 @@ mod tests {
             "/repo",
             "main",
             None,
-            Agent::Claude,
-            Agent::Claude,
+            CollabRoles {
+                pilot: Agent::Claude,
+                implementer: Agent::Claude,
+            },
         )
         .unwrap();
         send_message(
@@ -1487,8 +1530,10 @@ mod tests {
             "/repo",
             "main",
             None,
-            Agent::Claude,
-            Agent::Claude,
+            CollabRoles {
+                pilot: Agent::Claude,
+                implementer: Agent::Claude,
+            },
         )
         .unwrap();
         let m1 = send_message(
@@ -1540,8 +1585,10 @@ mod tests {
             "/repo",
             "main",
             None,
-            Agent::Claude,
-            Agent::Claude,
+            CollabRoles {
+                pilot: Agent::Claude,
+                implementer: Agent::Claude,
+            },
         )
         .unwrap();
         create_session(
@@ -1550,8 +1597,10 @@ mod tests {
             "/repo",
             "main",
             None,
-            Agent::Claude,
-            Agent::Claude,
+            CollabRoles {
+                pilot: Agent::Claude,
+                implementer: Agent::Claude,
+            },
         )
         .unwrap();
         let m1 = send_message(&db, "amm-4a", "claude", "codex", "draft", "x", "drawer-x").unwrap();
@@ -1577,8 +1626,10 @@ mod tests {
             "/repo-a",
             "main",
             None,
-            Agent::Claude,
-            Agent::Claude,
+            CollabRoles {
+                pilot: Agent::Claude,
+                implementer: Agent::Claude,
+            },
         )
         .unwrap();
         end_session(&db, "a-old").unwrap();
@@ -1588,8 +1639,10 @@ mod tests {
             "/repo-a",
             "main",
             None,
-            Agent::Claude,
-            Agent::Claude,
+            CollabRoles {
+                pilot: Agent::Claude,
+                implementer: Agent::Claude,
+            },
         )
         .unwrap();
         create_session(
@@ -1598,8 +1651,10 @@ mod tests {
             "/repo-a",
             "main",
             None,
-            Agent::Claude,
-            Agent::Claude,
+            CollabRoles {
+                pilot: Agent::Claude,
+                implementer: Agent::Claude,
+            },
         )
         .unwrap();
         // `created_at` is second-resolution, so insertion order alone may not
@@ -1619,8 +1674,10 @@ mod tests {
             "/repo-a",
             "feature",
             None,
-            Agent::Claude,
-            Agent::Claude,
+            CollabRoles {
+                pilot: Agent::Claude,
+                implementer: Agent::Claude,
+            },
         )
         .unwrap();
         create_session(
@@ -1629,8 +1686,10 @@ mod tests {
             "/repo-b",
             "main",
             None,
-            Agent::Claude,
-            Agent::Claude,
+            CollabRoles {
+                pilot: Agent::Claude,
+                implementer: Agent::Claude,
+            },
         )
         .unwrap();
 
@@ -1671,8 +1730,10 @@ mod tests {
             "/repo",
             "main",
             None,
-            Agent::Claude,
-            Agent::Claude,
+            CollabRoles {
+                pilot: Agent::Claude,
+                implementer: Agent::Claude,
+            },
         )
         .unwrap();
 
@@ -1701,8 +1762,10 @@ mod tests {
             "/repo",
             "main",
             None,
-            Agent::Claude,
-            Agent::Claude,
+            CollabRoles {
+                pilot: Agent::Claude,
+                implementer: Agent::Claude,
+            },
         )
         .unwrap();
         let mut coding = load_session(&db, "coding-scope").unwrap();
@@ -1747,8 +1810,10 @@ mod tests {
             "/repo",
             "main",
             None,
-            Agent::Claude,
-            Agent::Claude,
+            CollabRoles {
+                pilot: Agent::Claude,
+                implementer: Agent::Claude,
+            },
         )
         .unwrap();
         let mut complete = load_session(&db, "attested").unwrap();

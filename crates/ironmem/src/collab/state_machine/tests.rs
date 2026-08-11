@@ -1,4 +1,4 @@
-use super::super::agent::Agent;
+use super::super::agent::{Agent, CollabRoles};
 use super::super::session::tasks_count_from_list;
 use super::*;
 
@@ -2648,7 +2648,13 @@ fn pilot_claude_new_global_review_seeds_owner_and_implementer() {
 /// A fresh planning-stage session led by `pilot`, with `implementer` set to
 /// the same agent (see the section comment for why).
 fn session_with_pilot(pilot: Agent) -> CollabSession {
-    CollabSession::new_with_roles("test-session", pilot, pilot)
+    CollabSession::new_with_roles(
+        "test-session",
+        CollabRoles {
+            pilot,
+            implementer: pilot,
+        },
+    )
 }
 
 /// Role-generic twin of `drive_to_plan_locked`: drives a `pilot`-led session

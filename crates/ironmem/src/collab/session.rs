@@ -1,6 +1,6 @@
 //! `CollabSession` — single source of truth for collab session state.
 
-use super::agent::Agent;
+use super::agent::{Agent, CollabRoles};
 use super::phase::Phase;
 use super::state_machine::counterpart;
 
@@ -150,14 +150,21 @@ impl CollabSession {
     /// wrapper over `new_with_roles` kept so existing call sites compile
     /// unchanged.
     pub fn new_with_implementer(id: impl Into<String>, implementer: Agent) -> Self {
-        Self::new_with_roles(id, Agent::Claude, implementer)
+        Self::new_with_roles(
+            id,
+            CollabRoles {
+                pilot: Agent::Claude,
+                implementer,
+            },
+        )
     }
 
     /// Construct a fresh planning-stage session with explicit `pilot` and
     /// `implementer` roles. See the `pilot` field doc comment for the
     /// four-knob role vocabulary; `implementer` is orthogonal to `pilot`
     /// and not validated against it.
-    pub fn new_with_roles(id: impl Into<String>, pilot: Agent, implementer: Agent) -> Self {
+    pub fn new_with_roles(id: impl Into<String>, roles: CollabRoles) -> Self {
+        let CollabRoles { pilot, implementer } = roles;
         Self {
             id: id.into(),
             phase: Phase::PlanParallelDrafts,
@@ -283,11 +290,25 @@ mod tests {
     #[test]
     fn new_with_roles_seeds_current_owner_from_pilot() {
         assert_eq!(
-            CollabSession::new_with_roles("s", Agent::Codex, Agent::Claude).current_owner,
+            CollabSession::new_with_roles(
+                "s",
+                CollabRoles {
+                    pilot: Agent::Codex,
+                    implementer: Agent::Claude,
+                }
+            )
+            .current_owner,
             Agent::Codex
         );
         assert_eq!(
-            CollabSession::new_with_roles("s", Agent::Claude, Agent::Codex).current_owner,
+            CollabSession::new_with_roles(
+                "s",
+                CollabRoles {
+                    pilot: Agent::Claude,
+                    implementer: Agent::Codex,
+                }
+            )
+            .current_owner,
             Agent::Claude
         );
     }

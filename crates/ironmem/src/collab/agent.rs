@@ -80,6 +80,23 @@ impl TryFrom<&str> for Agent {
     }
 }
 
+/// The two-role pairing for a collab session, bundled into a single named
+/// type so callers cannot silently transpose `pilot` and `implementer`.
+///
+/// Before this type existed, the role pair was threaded through call sites
+/// as two trailing positional `Agent` arguments — and different functions
+/// disagreed on the order (`create_session`/`collab_create_session` took
+/// `(implementer, pilot)`, while `CollabSession::new_with_roles` took
+/// `(pilot, implementer)`). A caller copying a call-site pattern from one
+/// function to the other could silently swap the roles. Named fields make
+/// that transposition a compile error instead of a silent bug: every
+/// construction site must write `pilot: ..., implementer: ...` explicitly.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct CollabRoles {
+    pub pilot: Agent,
+    pub implementer: Agent,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
