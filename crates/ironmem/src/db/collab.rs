@@ -16,15 +16,6 @@ impl Database {
         queue::create_session(&self.conn, id, repo_path, branch, task, implementer, pilot)
     }
 
-    pub fn collab_set_pilot(
-        &self,
-        session_id: &str,
-        pilot: Agent,
-        current_owner: Option<Agent>,
-    ) -> Result<(), MemoryError> {
-        queue::set_pilot(&self.conn, session_id, pilot, current_owner)
-    }
-
     pub fn collab_end_session(&self, session_id: &str) -> Result<(), MemoryError> {
         queue::end_session(&self.conn, session_id)
     }
