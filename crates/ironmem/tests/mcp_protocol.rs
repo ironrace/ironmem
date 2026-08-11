@@ -3341,6 +3341,167 @@ fn collab_set_pilot_refuses_copilot_self_promotion_under_pilot_codex() {
     );
 }
 
+/// Re-read the persisted session row and return `(pilot, implementer,
+/// current_owner)`. Used by the Task 9 handoff-staleness tests below to prove
+/// a refused role mutation left all three role fields untouched, not merely
+/// the two `pilot_and_owner` checks — `collab_set_implementer` is the tool
+/// under test in `..._reuse_after_reassignment_is_refused...`, so its own
+/// target field must be pinned too.
+fn full_roles(app: &App, session_id: &str) -> (String, String, String) {
+    let status = call_tool(app, "collab_status", json!({ "session_id": session_id }));
+    (
+        status["pilot"].as_str().unwrap().to_string(),
+        status["implementer"].as_str().unwrap().to_string(),
+        status["current_owner"].as_str().unwrap().to_string(),
+    )
+}
+
+/// Task 9 (audit reassignment against handoff staleness): a `session_handoff`
+/// token is a one-time credential. This proves that once a token has been
+/// claimed to perform a permitted pilot reassignment, presenting that SAME
+/// now-spent token again for a *different* role mutation is refused — and
+/// refused before either mutator touches `pilot`, `implementer`, or
+/// `current_owner`.
+///
+/// The second call deliberately uses `agent: "codex"` — genuinely the
+/// current pilot after the reassignment below — so that if the stale-token
+/// guard were missing or misordered, the call would otherwise be fully
+/// authorized and would succeed. Isolating the token-reuse rejection from the
+/// unrelated "caller is not the pilot" rejection is the point: this proves
+/// `ensure_actor_generation_current`'s `claim_handoff_token` call, which both
+/// `handle_collab_set_pilot` and `handle_collab_set_implementer` run as the
+/// literal first step of their shared `ensure_caller_is_current_pilot`
+/// preamble (before `ensure_active`, before loading the session record,
+/// before the pilot-identity check, before any write), is what stops reuse —
+/// not a downstream authorization check that happens to also reject it.
+#[test]
+fn collab_set_pilot_stale_handoff_token_reuse_after_reassignment_is_refused_with_no_mutation() {
+    let app = App::open_for_test().unwrap();
+    let session_id = start_session_with_pilot(&app, "feat/stale-handoff-reuse", "claude");
+
+    // Mint a handoff token for claude (the current pilot) — this is the
+    // "pre-reassignment" token, T1.
+    let issued = call_tool(
+        &app,
+        "session_handoff",
+        json!({ "session_id": &session_id, "agent": "claude" }),
+    );
+    let token = issued["handoff_token"].as_str().unwrap().to_string();
+
+    // Use T1 to perform a permitted pilot reassignment (claude -> codex).
+    // This claims T1: claude's generation advances 0 -> 1 and the pending
+    // token row is cleared (spent) inside `collab_actor_generations`.
+    let reassigned = call_tool(
+        &app,
+        "collab_set_pilot",
+        json!({
+            "session_id": &session_id,
+            "agent": "claude",
+            "pilot": "codex",
+            "handoff_token": &token
+        }),
+    );
+    assert_eq!(reassigned["pilot"], "codex");
+    assert_eq!(reassigned["current_owner"], "codex");
+
+    let before = full_roles(&app, &session_id);
+    assert_eq!(
+        before,
+        (
+            "codex".to_string(),
+            "claude".to_string(),
+            "codex".to_string()
+        ),
+        "sanity: the reassignment above must actually have landed"
+    );
+
+    // Reuse the SAME (now-spent) token T1 for a different role mutation. It
+    // must be refused before any role field is touched.
+    let err = call_tool_expect_error(
+        &app,
+        "collab_set_implementer",
+        json!({
+            "session_id": &session_id,
+            "agent": "codex",
+            "implementer": "codex",
+            "handoff_token": &token
+        }),
+    );
+    assert!(
+        err.contains("already claimed") || err.contains("invalid handoff_token"),
+        "expected a rejection naming the stale token as already claimed/invalid, got: {err}"
+    );
+
+    assert_eq!(
+        full_roles(&app, &session_id),
+        before,
+        "a refused stale-token role mutation must leave pilot, implementer, \
+         and current_owner unchanged"
+    );
+}
+
+/// Task 9: after a permitted `collab_set_pilot` reassignment, turn
+/// acquisition must resolve to exactly one claimable owner — never both
+/// agents believing it is their turn, and never neither. `current_owner` is a
+/// single-valued field and `wait_turn_snapshot`'s `is_my_turn` is a plain
+/// equality against it, so this is a by-construction invariant; this test
+/// pins it through the actual `collab_wait_my_turn` tool for both agents
+/// rather than asserting on the internal snapshot type directly.
+#[test]
+fn collab_set_pilot_reassignment_leaves_exactly_one_claimable_owner() {
+    let app = App::open_for_test().unwrap();
+    let session_id = start_session_with_pilot(&app, "feat/single-claimable-owner", "codex");
+
+    // codex is pilot and current_owner initially; hand the pilot (and, in the
+    // same UPDATE, current_owner) to claude.
+    let reassigned = call_tool(
+        &app,
+        "collab_set_pilot",
+        json!({
+            "session_id": &session_id,
+            "agent": "codex",
+            "pilot": "claude"
+        }),
+    );
+    assert_eq!(reassigned["pilot"], "claude");
+    assert_eq!(reassigned["current_owner"], "claude");
+
+    // The new owner (claude) must resolve its turn immediately.
+    let claude_wait = call_tool(
+        &app,
+        "collab_wait_my_turn",
+        json!({ "session_id": &session_id, "agent": "claude", "timeout_secs": 1 }),
+    );
+    assert_eq!(claude_wait["is_my_turn"], true);
+    assert_eq!(claude_wait["current_owner"], "claude");
+
+    // The demoted agent (codex) must NOT resolve as its turn — it times out
+    // unsettled rather than ever observing `is_my_turn: true`.
+    let codex_wait = call_tool(
+        &app,
+        "collab_wait_my_turn",
+        json!({ "session_id": &session_id, "agent": "codex", "timeout_secs": 1 }),
+    );
+    assert_eq!(
+        codex_wait,
+        json!({ "unchanged": true }),
+        "the demoted agent must never observe is_my_turn: true after reassignment"
+    );
+
+    // Cross-check against collab_status: exactly one of the two agents'
+    // identity matches current_owner.
+    let status = call_tool(&app, "collab_status", json!({ "session_id": &session_id }));
+    let owner = status["current_owner"].as_str().unwrap();
+    let claimable_count = ["claude", "codex"]
+        .iter()
+        .filter(|agent| **agent == owner)
+        .count();
+    assert_eq!(
+        claimable_count, 1,
+        "exactly one agent identity must match current_owner, got owner={owner}"
+    );
+}
+
 #[test]
 fn collab_v2_end_rejected_in_coding_active_phase() {
     let app = App::open_for_test().unwrap();
