@@ -3,6 +3,7 @@
 //! These tests call `dispatch` directly with an in-memory App (noop embedder,
 //! no ONNX model required) and assert on the JSON-RPC response shape.
 
+use ironmem::collab::Agent;
 use ironmem::mcp::app::App;
 use ironmem::mcp::protocol::JsonRpcRequest;
 use ironmem::mcp::server::dispatch;
@@ -2994,6 +2995,30 @@ fn wal_row_count(app: &App, session_id: &str, operation: &str) -> i64 {
         .unwrap()
 }
 
+/// The most recent `wal_log` row for `operation`, as `(params, result)` JSON
+/// values. Companion to `wal_row_count`: that helper proves a row exists;
+/// this one proves what it actually says. Mirrors `last_approve_wal`, the
+/// same pattern `collab_session.rs`'s own unit tests use to assert
+/// `collab_approve`'s WAL payload — reused here (rather than reopening a
+/// fresh connection to `app.config.db_path`, as `last_approve_wal` does) so
+/// it also works against `App::open_for_test`'s in-memory database, which a
+/// second connection to the same path would not see.
+fn last_wal_row(app: &App, operation: &str) -> (serde_json::Value, serde_json::Value) {
+    app.db
+        .with_transaction(|tx| {
+            let (params, result): (String, String) = tx.query_row(
+                "SELECT params, result FROM wal_log WHERE operation = ?1 ORDER BY id DESC LIMIT 1",
+                rusqlite::params![operation],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )?;
+            Ok((
+                serde_json::from_str(&params).unwrap(),
+                serde_json::from_str(&result).unwrap(),
+            ))
+        })
+        .unwrap()
+}
+
 #[test]
 fn collab_set_implementer_rejects_non_pilot_caller() {
     // The pilot defaults to `claude` (see `handle_collab_start`); `codex` is
@@ -3628,6 +3653,94 @@ fn collab_set_pilot_reassignment_leaves_exactly_one_claimable_owner() {
     assert_eq!(
         claimable_count, 1,
         "exactly one agent identity must match current_owner, got owner={owner}"
+    );
+}
+
+#[test]
+fn collab_set_pilot_writes_wal_row_with_operation_session_and_actor() {
+    let app = App::open_for_test().unwrap();
+    let session_id = start_session_with_pilot(&app, "feat/set-pilot-wal-row", "claude");
+
+    let updated = call_tool(
+        &app,
+        "collab_set_pilot",
+        json!({
+            "session_id": &session_id,
+            "agent": "claude",
+            "pilot": "codex"
+        }),
+    );
+    assert_eq!(updated["pilot"], "codex");
+
+    // `last_wal_row` already filters by operation name via its SQL WHERE
+    // clause; the exact-equality assertion below additionally pins the
+    // session id and the acting agent (`agent`, i.e. the actor) inside the
+    // logged payload, plus every other field `handle_collab_set_pilot`
+    // writes.
+    let (params, _result) = last_wal_row(&app, "collab_set_pilot");
+    assert_eq!(
+        params,
+        json!({
+            "session_id": session_id,
+            "agent": "claude",
+            "previous_pilot": "claude",
+            "pilot": "codex",
+            "phase": "PlanParallelDrafts",
+            "previous_owner": "claude",
+            "current_owner": "codex",
+            "changed": true,
+        }),
+        "the collab_set_pilot WAL row must record the operation's session id \
+         and acting agent, matching the payload the handler actually writes"
+    );
+}
+
+#[test]
+fn collab_set_pilot_same_pilot_call_repairs_drifted_current_owner() {
+    // Rule 3 in `handle_collab_set_pilot` moves `current_owner` to the named
+    // `pilot` unconditionally, in the very same UPDATE as the pilot
+    // assignment itself — even when `pilot` names the agent who is already
+    // pilot. This proves the "unconditional" half specifically: manufacture
+    // a session where `current_owner` has drifted away from `pilot` (the
+    // public MCP surface cannot produce this starting from a fresh session;
+    // it is constructed here directly against the DB, the same way the
+    // `set_pilot` test helper in `collab_session.rs`'s own unit tests
+    // rebinds session state for setup), then show a same-pilot call — a
+    // request that does not change `pilot` at all — still repairs it.
+    let app = App::open_for_test().unwrap();
+    let session_id = start_session_with_pilot(&app, "feat/set-pilot-repair-drift", "claude");
+
+    let mut session = app.db.collab_load_session(&session_id).unwrap();
+    assert_eq!(session.pilot, Agent::Claude);
+    session.current_owner = Agent::Codex;
+    app.db.collab_save_session(&session).unwrap();
+    assert_eq!(
+        pilot_and_owner(&app, &session_id),
+        ("claude".to_string(), "codex".to_string()),
+        "setup must produce a genuine drift: pilot and current_owner disagree"
+    );
+
+    let updated = call_tool(
+        &app,
+        "collab_set_pilot",
+        json!({
+            "session_id": &session_id,
+            "agent": "claude",
+            "pilot": "claude"
+        }),
+    );
+    assert_eq!(
+        updated["pilot"], "claude",
+        "pilot did not change — this is the no-op reassignment case"
+    );
+    assert_eq!(
+        updated["current_owner"], "claude",
+        "a same-pilot call must still repair a drifted current_owner"
+    );
+    assert_eq!(
+        pilot_and_owner(&app, &session_id),
+        ("claude".to_string(), "claude".to_string()),
+        "the repair must be persisted, not merely reported"
     );
 }
 
