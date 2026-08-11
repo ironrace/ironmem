@@ -3422,15 +3422,11 @@ fn full_roles(app: &App, session_id: &str) -> (String, String, String) {
 // identity* check, not by any token-staleness check — because no such check
 // exists.
 //
-// Not in scope here (tracked separately, per the plan's scope exclusions):
-// `ensure_actor_generation_current` calls `app.set_cached_generation` right
-// after `claim_handoff_token` succeeds but before the enclosing transaction
-// commits (see `crates/ironmem/src/mcp/tools/handoff.rs`); if that
-// transaction later rolls back (e.g. because the caller-identity check below
-// it then fails, as happens in the second test here), the in-process cache
-// can end up one generation ahead of the database. That is a
-// transaction/retry-behavior class issue, not a reassignment/staleness one,
-// and is intentionally left unfixed by this task.
+// The generation guard's transaction/retry behavior is covered separately by
+// `refused_token_role_mutation_does_not_poison_tokenless_generation_cache`:
+// if a post-claim validation rolls back the DB lease, the guard rebinds its
+// advisory cache to the authoritative DB generation before the next tokenless
+// action.
 
 /// Task 9, scenario 1 (genuine spent-token reuse): a `session_handoff` token
 /// is a one-time credential. Mint T1 for claude, spend it on a *permitted*
@@ -3596,6 +3592,104 @@ fn collab_set_pilot_unspent_pre_reassignment_token_is_refused_by_caller_identity
          unchanged, even though claiming T1 briefly succeeded inside the (rolled-back) \
          transaction"
     );
+}
+
+/// A token claim happens before the role-authorization check, so a refused
+/// token-bearing role mutation must roll back both the role mutation and the
+/// generation lease. The process-local generation cache must follow that
+/// rollback: a subsequent tokenless action from the same App must still be
+/// accepted at generation 0.
+#[test]
+fn refused_token_role_mutation_does_not_poison_tokenless_generation_cache() {
+    let app = App::open_for_test().unwrap();
+    let session_id = start_session_with_pilot(&app, "feat/rollback-cache", "claude");
+
+    // Mint a token for claude while claude is the pilot, then move the pilot
+    // away in a separate tokenless call. The token remains valid and unspent.
+    let issued = call_tool(
+        &app,
+        "session_handoff",
+        json!({ "session_id": &session_id, "agent": "claude" }),
+    );
+    let token = issued["handoff_token"]
+        .as_str()
+        .expect("session_handoff must return a token")
+        .to_string();
+    let reassigned = call_tool(
+        &app,
+        "collab_set_pilot",
+        json!({
+            "session_id": &session_id,
+            "agent": "claude",
+            "pilot": "codex"
+        }),
+    );
+    assert_eq!(reassigned["pilot"], "codex");
+
+    // The claim succeeds inside this transaction, but the caller is no
+    // longer the pilot, so the role mutation is rejected and the transaction
+    // rolls back.
+    let err = call_tool_expect_error(
+        &app,
+        "collab_set_implementer",
+        json!({
+            "session_id": &session_id,
+            "agent": "claude",
+            "implementer": "codex",
+            "handoff_token": &token
+        }),
+    );
+    assert!(
+        err.contains("caller 'claude' is not the pilot"),
+        "expected the post-claim caller-identity rejection, got: {err}"
+    );
+
+    let lease = app
+        .db
+        .with_connection(|conn| {
+            conn.query_row(
+                "SELECT generation, pending_handoff_token, pending_handoff_generation \
+                 FROM collab_actor_generations WHERE session_id = ?1 AND agent = 'claude'",
+                rusqlite::params![&session_id],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, Option<String>>(1)?,
+                        row.get::<_, Option<i64>>(2)?,
+                    ))
+                },
+            )
+            .map_err(ironmem::error::MemoryError::from)
+        })
+        .unwrap();
+    assert_eq!(
+        lease.0, 0,
+        "the rolled-back claim must not advance the lease"
+    );
+    assert_eq!(
+        lease.1.as_deref(),
+        Some(token.as_str()),
+        "the rolled-back claim must leave the token pending"
+    );
+    assert_eq!(
+        lease.2,
+        Some(1),
+        "the pending generation must remain claimable after rollback"
+    );
+
+    // Parallel drafts permit either agent. This is a valid tokenless action
+    // from the same App whose cache was touched by the failed claim.
+    let draft = call_tool(
+        &app,
+        "collab_send",
+        json!({
+            "session_id": &session_id,
+            "sender": "claude",
+            "topic": "draft",
+            "content": "claude rollback-cache draft"
+        }),
+    );
+    assert!(draft["message_id"].is_string(), "draft response: {draft}");
 }
 
 /// Task 9: after a permitted `collab_set_pilot` reassignment, turn
@@ -5002,20 +5096,8 @@ fn open_disk_app_for_dashboard_sweep() -> (tempfile::TempDir, PathBuf, App) {
 /// production each agent runs its own MCP server process, so driving this
 /// scenario across two `App` instances over one shared on-disk DB is
 /// arguably MORE faithful to that topology than routing both agents through
-/// a single `App`. It also happens to route around the narrow slice of the
-/// Task 9 audit finding in this file (`Not in scope here...`, above) that
-/// this sweep exercises but leaves unfixed: after a claimed-then-rolled-back
-/// handoff token leaves the ORIGINAL `App`'s per-process actor generation
-/// cache one ahead of the DB, a TOKENLESS call by that agent on that SAME
-/// `App` is refused ("stale collab generation ... obtain a session_handoff
-/// token in a fresh process") — but re-presenting a still-valid handoff
-/// token on that SAME `App` actually succeeds, since the token-claim branch
-/// of `ensure_actor_generation_current` never consults the cache before
-/// overwriting it, and the rolled-back transaction left the token itself
-/// still claimable. So the real limitation is narrower than "no in-process
-/// recovery": it's "no in-process recovery for a tokenless call after this
-/// specific rollback sequence" — a fresh process is simply what a real
-/// Codex client would do here regardless.
+/// a single `App`. The second App is used to model those independent MCP
+/// server processes, not as a workaround for generation-cache rollback.
 fn open_second_disk_app(db_path: &Path) -> (tempfile::TempDir, App) {
     let dir = tempfile::tempdir().expect("temp dir must be creatable");
     let state_dir = dir.path().join("state");
@@ -5330,24 +5412,7 @@ fn collab_role_safety_full_verification_sweep_reversed_role_scenario() {
     // Codex's remaining actions in this scenario (submitting its own blind
     // draft, reviewing the canonical plan) route through a SECOND, independent
     // `App` rather than the original one — modeling codex's own local MCP
-    // server process, per `open_second_disk_app`'s doc comment above. That
-    // choice also happens to sidestep a side effect of step 4's token-bearing
-    // retries: presenting `pre_reassignment_token` there claimed it
-    // successfully (`claim_handoff_token` runs, and
-    // `ensure_actor_generation_current` calls `app.set_cached_generation`)
-    // inside a transaction that then rolled back on the caller-identity
-    // check, per the Task 9 audit finding documented earlier in this file
-    // ("Not in scope here..."). That leaves the ORIGINAL `App`'s in-process
-    // generation cache for codex one ahead of the DB, so a TOKENLESS call by
-    // codex through that same `app` — even an ordinary draft submission — is
-    // refused with "stale collab generation ... obtain a session_handoff
-    // token in a fresh process". This is a pre-existing, deliberately
-    // out-of-scope limitation (the audit finding says so explicitly), and it
-    // is narrower than it looks: re-presenting `pre_reassignment_token`
-    // itself on that same `app` would still succeed (the token-claim path
-    // never consults the cache, and the token survived the rollback), so a
-    // fresh process is not the only recovery — it's just the one this test
-    // uses, matching the real deployment topology.
+    // server process, per `open_second_disk_app`'s doc comment above.
     let (_dir2, app_codex) = open_second_disk_app(&db_path);
 
     call_tool(

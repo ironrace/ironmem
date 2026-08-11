@@ -50,10 +50,9 @@ pub(super) fn ensure_actor_generation_current(
             ));
         }
         let claimed = claim_handoff_token(conn, session_id, agent, token)?;
-        // The cache is advisory; the DB is authoritative. If the enclosing
-        // transaction rolls back after this claim, the process cache may be one
-        // generation ahead of the DB. The guard treats that as a (fail-safe)
-        // stale condition on subsequent calls rather than silently accepting it.
+        // The cache is advisory; the DB is authoritative. A successful claim
+        // normally commits with the enclosing transaction, so retain the new
+        // generation for subsequent tokenless calls.
         app.set_cached_generation(session_id, agent, claimed);
         return Ok(());
     }
@@ -62,6 +61,16 @@ pub(super) fn ensure_actor_generation_current(
         .unwrap_or(0);
     if let Some(cached) = app.cached_generation(session_id, agent) {
         if cached == db_active {
+            return Ok(());
+        }
+        if cached > db_active {
+            // A token claim may have happened inside a transaction that later
+            // rolled back. In that case the DB correctly remains at the prior
+            // generation while this advisory cache is one step ahead. Rebind
+            // to the authoritative DB value so the process can make a valid
+            // tokenless call without weakening stale-predecessor protection
+            // (the cached < DB case below remains rejected).
+            app.set_cached_generation(session_id, agent, db_active);
             return Ok(());
         }
         return Err(MemoryError::Validation(format!(
