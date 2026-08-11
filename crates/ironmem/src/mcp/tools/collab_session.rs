@@ -545,9 +545,17 @@ pub(super) fn handle_collab_start(app: &App, args: &Value) -> Result<Value, Memo
     // Optional `pilot` field: selects which agent leads v1 planning. Default
     // is `Agent::Claude` (historical flow). Resolved before `implementer` so
     // an omitted `implementer` can default to whichever pilot was chosen.
-    let pilot = match args.get("pilot").and_then(Value::as_str) {
-        Some(value) => require_pilot(value)?,
+    //
+    // Three cases: absent → default, present-string → validate, present-non-string → error.
+    // Explicit `null` is treated as non-string and rejected.
+    let pilot = match args.get("pilot") {
         None => Agent::Claude,
+        Some(Value::String(s)) => require_pilot(s)?,
+        Some(_) => {
+            return Err(MemoryError::Validation(
+                "pilot must be a string".to_string(),
+            ))
+        }
     };
     // Optional `implementer` field: routes the v3 batch implementation
     // phase. Defaults to the resolved `pilot` (so a `pilot=codex` caller who
@@ -555,9 +563,17 @@ pub(super) fn handle_collab_start(app: &App, args: &Value) -> Result<Value, Memo
     // makes Codex the owner of `CodeImplementPending` and the only valid
     // sender of `implementation_done`. It can be rebound later through
     // `collab_set_implementer` while planning or implementation is active.
-    let implementer = match args.get("implementer").and_then(Value::as_str) {
-        Some(value) => require_implementer(value)?,
+    //
+    // Three cases: absent → default, present-string → validate, present-non-string → error.
+    // Explicit `null` is treated as non-string and rejected.
+    let implementer = match args.get("implementer") {
         None => pilot,
+        Some(Value::String(s)) => require_implementer(s)?,
+        Some(_) => {
+            return Err(MemoryError::Validation(
+                "implementer must be a string".to_string(),
+            ))
+        }
     };
     let session_id = uuid::Uuid::new_v4().to_string();
 

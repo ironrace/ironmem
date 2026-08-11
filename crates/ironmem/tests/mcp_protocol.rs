@@ -2609,6 +2609,231 @@ fn collab_start_rejects_invalid_pilot_and_creates_no_session_row() {
 }
 
 #[test]
+fn collab_start_pilot_absent_defaults_to_claude() {
+    // Absent `pilot` key should default to `Agent::Claude`.
+    let app = App::open_for_test().unwrap();
+    let started = call_tool(
+        &app,
+        "collab_start",
+        json!({
+            "repo_path": "/repo",
+            "branch": "main",
+            "initiator": "claude"
+        }),
+    );
+    assert_eq!(started["pilot"], "claude");
+}
+
+#[test]
+fn collab_start_pilot_valid_string_is_accepted() {
+    // Valid string `pilot` value should be accepted and used.
+    let app = App::open_for_test().unwrap();
+    let started = call_tool(
+        &app,
+        "collab_start",
+        json!({
+            "repo_path": "/repo",
+            "branch": "main",
+            "initiator": "claude",
+            "pilot": "codex"
+        }),
+    );
+    assert_eq!(started["pilot"], "codex");
+}
+
+#[test]
+fn collab_start_pilot_number_is_rejected() {
+    // Non-string `pilot` value (number) should be rejected.
+    let app = App::open_for_test().unwrap();
+    let err = call_tool_expect_error(
+        &app,
+        "collab_start",
+        json!({
+            "repo_path": "/repo",
+            "branch": "main",
+            "initiator": "claude",
+            "pilot": 123
+        }),
+    );
+    assert!(
+        err.to_lowercase().contains("pilot"),
+        "expected error to name 'pilot', got: {err}"
+    );
+    assert!(
+        err.to_lowercase().contains("string"),
+        "expected error to mention 'string', got: {err}"
+    );
+}
+
+#[test]
+fn collab_start_pilot_boolean_is_rejected() {
+    // Non-string `pilot` value (boolean) should be rejected.
+    let app = App::open_for_test().unwrap();
+    let err = call_tool_expect_error(
+        &app,
+        "collab_start",
+        json!({
+            "repo_path": "/repo",
+            "branch": "main",
+            "initiator": "claude",
+            "pilot": true
+        }),
+    );
+    assert!(
+        err.to_lowercase().contains("pilot"),
+        "expected error to name 'pilot', got: {err}"
+    );
+    assert!(
+        err.to_lowercase().contains("string"),
+        "expected error to mention 'string', got: {err}"
+    );
+}
+
+#[test]
+fn collab_start_pilot_explicit_null_is_rejected() {
+    // Explicit `null` for `pilot` should be rejected (not treated as absent).
+    let app = App::open_for_test().unwrap();
+    let err = call_tool_expect_error(
+        &app,
+        "collab_start",
+        json!({
+            "repo_path": "/repo",
+            "branch": "main",
+            "initiator": "claude",
+            "pilot": null
+        }),
+    );
+    assert!(
+        err.to_lowercase().contains("pilot"),
+        "expected error to name 'pilot', got: {err}"
+    );
+    assert!(
+        err.to_lowercase().contains("string"),
+        "expected error to mention 'string', got: {err}"
+    );
+}
+
+#[test]
+fn collab_start_implementer_absent_defaults_to_pilot() {
+    // Absent `implementer` key should default to the resolved `pilot`.
+    let app = App::open_for_test().unwrap();
+    let started = call_tool(
+        &app,
+        "collab_start",
+        json!({
+            "repo_path": "/repo",
+            "branch": "main",
+            "initiator": "claude",
+            "pilot": "codex"
+        }),
+    );
+    assert_eq!(started["pilot"], "codex");
+    assert_eq!(started["implementer"], "codex");
+
+    // Also test with absent pilot (so both default).
+    let started2 = call_tool(
+        &app,
+        "collab_start",
+        json!({
+            "repo_path": "/repo2",
+            "branch": "main",
+            "initiator": "claude"
+        }),
+    );
+    assert_eq!(started2["pilot"], "claude");
+    assert_eq!(started2["implementer"], "claude");
+}
+
+#[test]
+fn collab_start_implementer_valid_string_is_accepted() {
+    // Valid string `implementer` value should be accepted and used.
+    let app = App::open_for_test().unwrap();
+    let started = call_tool(
+        &app,
+        "collab_start",
+        json!({
+            "repo_path": "/repo",
+            "branch": "main",
+            "initiator": "claude",
+            "implementer": "codex"
+        }),
+    );
+    assert_eq!(started["implementer"], "codex");
+}
+
+#[test]
+fn collab_start_implementer_number_is_rejected() {
+    // Non-string `implementer` value (number) should be rejected.
+    let app = App::open_for_test().unwrap();
+    let err = call_tool_expect_error(
+        &app,
+        "collab_start",
+        json!({
+            "repo_path": "/repo",
+            "branch": "main",
+            "initiator": "claude",
+            "implementer": 456
+        }),
+    );
+    assert!(
+        err.to_lowercase().contains("implementer"),
+        "expected error to name 'implementer', got: {err}"
+    );
+    assert!(
+        err.to_lowercase().contains("string"),
+        "expected error to mention 'string', got: {err}"
+    );
+}
+
+#[test]
+fn collab_start_implementer_boolean_is_rejected() {
+    // Non-string `implementer` value (boolean) should be rejected.
+    let app = App::open_for_test().unwrap();
+    let err = call_tool_expect_error(
+        &app,
+        "collab_start",
+        json!({
+            "repo_path": "/repo",
+            "branch": "main",
+            "initiator": "claude",
+            "implementer": false
+        }),
+    );
+    assert!(
+        err.to_lowercase().contains("implementer"),
+        "expected error to name 'implementer', got: {err}"
+    );
+    assert!(
+        err.to_lowercase().contains("string"),
+        "expected error to mention 'string', got: {err}"
+    );
+}
+
+#[test]
+fn collab_start_implementer_explicit_null_is_rejected() {
+    // Explicit `null` for `implementer` should be rejected (not treated as absent).
+    let app = App::open_for_test().unwrap();
+    let err = call_tool_expect_error(
+        &app,
+        "collab_start",
+        json!({
+            "repo_path": "/repo",
+            "branch": "main",
+            "initiator": "claude",
+            "implementer": null
+        }),
+    );
+    assert!(
+        err.to_lowercase().contains("implementer"),
+        "expected error to name 'implementer', got: {err}"
+    );
+    assert!(
+        err.to_lowercase().contains("string"),
+        "expected error to mention 'string', got: {err}"
+    );
+}
+
+#[test]
 fn collab_set_implementer_before_task_list_routes_batch_owner() {
     let app = App::open_for_test().unwrap();
     let session_id = drive_to_plan_locked(&app, "fp");
