@@ -3344,9 +3344,8 @@ fn collab_set_pilot_refuses_copilot_self_promotion_under_pilot_codex() {
 /// Re-read the persisted session row and return `(pilot, implementer,
 /// current_owner)`. Used by the Task 9 handoff-staleness tests below to prove
 /// a refused role mutation left all three role fields untouched, not merely
-/// the two `pilot_and_owner` checks — `collab_set_implementer` is the tool
-/// under test in `..._reuse_after_reassignment_is_refused...`, so its own
-/// target field must be pinned too.
+/// the two `pilot_and_owner` checks — `collab_set_implementer` is one of the
+/// tools under test below, so its own target field must be pinned too.
 fn full_roles(app: &App, session_id: &str) -> (String, String, String) {
     let status = call_tool(app, "collab_status", json!({ "session_id": session_id }));
     (
@@ -3356,31 +3355,59 @@ fn full_roles(app: &App, session_id: &str) -> (String, String, String) {
     )
 }
 
-/// Task 9 (audit reassignment against handoff staleness): a `session_handoff`
-/// token is a one-time credential. This proves that once a token has been
-/// claimed to perform a permitted pilot reassignment, presenting that SAME
-/// now-spent token again for a *different* role mutation is refused — and
-/// refused before either mutator touches `pilot`, `implementer`, or
-/// `current_owner`.
-///
-/// The second call deliberately uses `agent: "codex"` — genuinely the
-/// current pilot after the reassignment below — so that if the stale-token
-/// guard were missing or misordered, the call would otherwise be fully
-/// authorized and would succeed. Isolating the token-reuse rejection from the
-/// unrelated "caller is not the pilot" rejection is the point: this proves
-/// `ensure_actor_generation_current`'s `claim_handoff_token` call, which both
-/// `handle_collab_set_pilot` and `handle_collab_set_implementer` run as the
-/// literal first step of their shared `ensure_caller_is_current_pilot`
-/// preamble (before `ensure_active`, before loading the session record,
-/// before the pilot-identity check, before any write), is what stops reuse —
-/// not a downstream authorization check that happens to also reject it.
-#[test]
-fn collab_set_pilot_stale_handoff_token_reuse_after_reassignment_is_refused_with_no_mutation() {
-    let app = App::open_for_test().unwrap();
-    let session_id = start_session_with_pilot(&app, "feat/stale-handoff-reuse", "claude");
+// ── Task 9 audit finding ────────────────────────────────────────────────────
+//
+// AUDIT FINDING (Task 9: "audit reassignment against handoff staleness"):
+// pilot/implementer reassignment (`collab_set_pilot`, `collab_set_implementer`)
+// does NOT advance any actor's generation and does NOT invalidate any
+// outstanding `session_handoff` token. `collab_actor_generations` (the
+// generation/token lease table) is keyed by `(session_id, agent)` and models
+// process succession for a given agent identity — "has a fresh process
+// claimed the right to act as this agent" — which is an orthogonal concern
+// to `pilot`/`implementer`/`current_owner`, which model *role* state. Neither
+// `handle_collab_set_pilot` nor `handle_collab_set_implementer` touches
+// `collab_actor_generations` at all (see `crates/ironmem/src/mcp/tools/collab_session.rs`);
+// a token minted for an agent before a reassignment remains just as claimable
+// after one. There is no such thing, in the current implementation, as "a
+// handoff token invalidated specifically by a role reassignment."
+//
+// The task's acceptance criteria ("attempt a role mutation using the
+// pre-reassignment handoff token — refused, zero mutation") is nonetheless
+// satisfied *in practice* — but via the pre-existing "caller must equal the
+// current pilot" identity check in `ensure_caller_is_current_pilot`
+// (`crates/ironmem/src/mcp/tools/collab_session.rs`), not via any
+// staleness/generation mechanism coupled to role state. The two tests below
+// pin both halves of this finding: (1) the token guard genuinely does reject
+// reuse of an already-*spent* token, on its own, independent of role state;
+// and (2) the literal "present a still-valid, never-spent, pre-reassignment
+// token after the pilot has moved on" scenario is refused by the *caller
+// identity* check, not by any token-staleness check — because no such check
+// exists.
+//
+// Not in scope here (tracked separately, per the plan's scope exclusions):
+// `ensure_actor_generation_current` calls `app.set_cached_generation` right
+// after `claim_handoff_token` succeeds but before the enclosing transaction
+// commits (see `crates/ironmem/src/mcp/tools/handoff.rs`); if that
+// transaction later rolls back (e.g. because the caller-identity check below
+// it then fails, as happens in the second test here), the in-process cache
+// can end up one generation ahead of the database. That is a
+// transaction/retry-behavior class issue, not a reassignment/staleness one,
+// and is intentionally left unfixed by this task.
 
-    // Mint a handoff token for claude (the current pilot) — this is the
-    // "pre-reassignment" token, T1.
+/// Task 9, scenario 1 (genuine spent-token reuse): a `session_handoff` token
+/// is a one-time credential. Mint T1 for claude, spend it on a *permitted*
+/// same-agent no-op `collab_set_pilot` call (claude -> claude — still legal
+/// in `PlanParallelDrafts` with no draft landed), then reuse the same T1 for
+/// a second call **by the same agent** (claude). Reusing it as the same
+/// caller isolates the token guard: the pilot-identity check would pass
+/// (claude is still pilot), so only `claim_handoff_token` finding the token
+/// already spent can be the source of the refusal.
+#[test]
+fn collab_set_pilot_spent_handoff_token_reuse_by_same_agent_is_refused_with_no_mutation() {
+    let app = App::open_for_test().unwrap();
+    let session_id = start_session_with_pilot(&app, "feat/spent-handoff-reuse", "claude");
+
+    // Mint a handoff token for claude — this is T1.
     let issued = call_tool(
         &app,
         "session_handoff",
@@ -3388,17 +3415,98 @@ fn collab_set_pilot_stale_handoff_token_reuse_after_reassignment_is_refused_with
     );
     let token = issued["handoff_token"].as_str().unwrap().to_string();
 
-    // Use T1 to perform a permitted pilot reassignment (claude -> codex).
-    // This claims T1: claude's generation advances 0 -> 1 and the pending
-    // token row is cleared (spent) inside `collab_actor_generations`.
+    // Spend T1 on a permitted same-agent no-op reassignment (claude -> claude).
+    // `handle_collab_set_pilot`'s Rule 3 UPDATE is unconditional even when
+    // `previous == pilot`, so this is a legal, real claim of T1.
+    let spent = call_tool(
+        &app,
+        "collab_set_pilot",
+        json!({
+            "session_id": &session_id,
+            "agent": "claude",
+            "pilot": "claude",
+            "handoff_token": &token
+        }),
+    );
+    assert_eq!(spent["pilot"], "claude");
+    assert_eq!(spent["current_owner"], "claude");
+
+    let before = full_roles(&app, &session_id);
+    assert_eq!(
+        before,
+        (
+            "claude".to_string(),
+            "claude".to_string(),
+            "claude".to_string()
+        ),
+        "sanity: claude remains pilot/implementer/owner after the no-op spend"
+    );
+
+    // Reuse the SAME (now-spent) token T1 for a second call, still as
+    // claude — the current pilot. If the token guard were missing, this call
+    // would otherwise be fully authorized (claude == current pilot) and
+    // would succeed; only the spent-token guard can refuse it.
+    let err = call_tool_expect_error(
+        &app,
+        "collab_set_implementer",
+        json!({
+            "session_id": &session_id,
+            "agent": "claude",
+            "implementer": "codex",
+            "handoff_token": &token
+        }),
+    );
+    assert_eq!(
+        err, "handoff_token already claimed",
+        "expected the exact spent-token refusal from claim_handoff_token, got: {err}"
+    );
+
+    assert_eq!(
+        full_roles(&app, &session_id),
+        before,
+        "a refused spent-token role mutation must leave pilot, implementer, \
+         and current_owner unchanged"
+    );
+}
+
+/// Task 9, scenario 2 (the literal acceptance-criteria scenario): mint T1 for
+/// claude and leave it **unspent**. Reassign the pilot away from claude
+/// (claude -> codex) through a *separate, tokenless* `collab_set_pilot` call
+/// — legal because claude's actual generation is still 0 (issuing a token
+/// never advances it; only claiming one does). Then present the
+/// still-valid, never-claimed T1 as claude in a subsequent role-mutation
+/// call. `claim_handoff_token` actually *succeeds* here (T1 is genuinely
+/// still pending and unclaimed for claude) — the refusal comes entirely from
+/// the downstream "caller is not the current pilot" check, since claude is
+/// no longer pilot. This is the mechanism the audit finding above documents:
+/// no staleness/generation check fires here, only the pre-existing
+/// caller-identity check. (The successful claim inside this failed call's
+/// transaction rolls back along with everything else, per
+/// `Database::with_transaction`'s "no commit on Err" behavior — so this
+/// assertion of zero role mutation holds regardless.)
+#[test]
+fn collab_set_pilot_unspent_pre_reassignment_token_is_refused_by_caller_identity_not_token_guard() {
+    let app = App::open_for_test().unwrap();
+    let session_id = start_session_with_pilot(&app, "feat/pre-reassignment-token", "claude");
+
+    // Mint a handoff token for claude — this is T1 — and leave it unspent.
+    let issued = call_tool(
+        &app,
+        "session_handoff",
+        json!({ "session_id": &session_id, "agent": "claude" }),
+    );
+    let token = issued["handoff_token"].as_str().unwrap().to_string();
+
+    // Reassign the pilot away from claude via a SEPARATE, tokenless call.
+    // T1 is untouched by this: role reassignment does not consult, advance,
+    // or invalidate `collab_actor_generations` at all.
     let reassigned = call_tool(
         &app,
         "collab_set_pilot",
         json!({
             "session_id": &session_id,
             "agent": "claude",
-            "pilot": "codex",
-            "handoff_token": &token
+            "pilot": "codex"
         }),
     );
     assert_eq!(reassigned["pilot"], "codex");
@@ -3412,31 +3520,39 @@ fn collab_set_pilot_stale_handoff_token_reuse_after_reassignment_is_refused_with
             "claude".to_string(),
             "codex".to_string()
         ),
-        "sanity: the reassignment above must actually have landed"
+        "sanity: the tokenless reassignment above must actually have landed"
     );
 
-    // Reuse the SAME (now-spent) token T1 for a different role mutation. It
-    // must be refused before any role field is touched.
+    // Present the still-unspent, pre-reassignment token T1 as claude. Refused
+    // — but by the caller-identity check, not a token error.
     let err = call_tool_expect_error(
         &app,
         "collab_set_implementer",
         json!({
             "session_id": &session_id,
-            "agent": "codex",
+            "agent": "claude",
             "implementer": "codex",
             "handoff_token": &token
         }),
     );
+    assert_eq!(
+        err,
+        "collab_set_implementer refused: caller 'claude' is not the pilot of this \
+         session; only the current pilot 'codex' may reassign the implementer",
+        "expected the caller-identity refusal (T1 is still valid and claimable, so no \
+         token error can fire here), got: {err}"
+    );
     assert!(
-        err.contains("already claimed") || err.contains("invalid handoff_token"),
-        "expected a rejection naming the stale token as already claimed/invalid, got: {err}"
+        !err.contains("already claimed") && !err.contains("invalid handoff_token"),
+        "this refusal must come from the caller-identity check, not a token error: {err}"
     );
 
     assert_eq!(
         full_roles(&app, &session_id),
         before,
-        "a refused stale-token role mutation must leave pilot, implementer, \
-         and current_owner unchanged"
+        "a refused role mutation must leave pilot, implementer, and current_owner \
+         unchanged, even though claiming T1 briefly succeeded inside the (rolled-back) \
+         transaction"
     );
 }
 
