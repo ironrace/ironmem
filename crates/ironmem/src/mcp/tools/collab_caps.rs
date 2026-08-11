@@ -36,8 +36,8 @@ pub(super) fn handle_collab_register_caps(app: &App, args: &Value) -> Result<Val
     }
 
     let count = parsed.len();
-    app.db.with_transaction(|tx| {
-        super::handoff::ensure_actor_generation_current(
+    let claim = app.db.with_transaction(|tx| {
+        let claim = super::handoff::ensure_actor_generation_current(
             app,
             tx,
             session_id,
@@ -56,8 +56,9 @@ pub(super) fn handle_collab_register_caps(app: &App, args: &Value) -> Result<Val
             }),
             Some(&json!({ "success": true, "count": count })),
         )?;
-        Ok(())
+        Ok(claim)
     })?;
+    claim.publish(app);
 
     Ok(json!({ "success": true, "count": count }))
 }

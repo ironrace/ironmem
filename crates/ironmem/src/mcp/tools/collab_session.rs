@@ -14,6 +14,7 @@ use crate::sanitize;
 use super::collab_events::{
     build_collab_event, failure_report_is_off_turn_admissible, parse_final_payload,
 };
+use super::handoff::GenerationClaim;
 use super::shared::{
     collab_counterpart, require_agent, require_implementer, require_pilot, require_str,
     resolve_optional_agent_field, sha256_hex, MAX_COLLAB_CONTENT_CHARS,
@@ -630,6 +631,10 @@ pub(super) fn handle_collab_start(app: &App, args: &Value) -> Result<Value, Memo
 /// observable behavior change, since the exact error text is part of each
 /// tool's API.
 ///
+/// The returned [`GenerationClaim`] must be published by the caller once its
+/// transaction commits; this helper is precisely the post-claim refusal that
+/// makes publishing from inside the transaction unsafe.
+///
 /// **Caveat: authorization here is caller-asserted, not authenticated.** The
 /// `agent` value comes from the caller's own claim, not from any
 /// process-bound identity check. This check defeats an honest client
@@ -643,15 +648,16 @@ fn ensure_caller_is_current_pilot(
     agent: Agent,
     maybe_token: Option<&str>,
     unauthorized: impl FnOnce(Agent, Agent) -> MemoryError,
-) -> Result<SessionRecord, MemoryError> {
-    super::handoff::ensure_actor_generation_current(app, tx, session_id, agent, maybe_token)?;
+) -> Result<(SessionRecord, GenerationClaim), MemoryError> {
+    let claim =
+        super::handoff::ensure_actor_generation_current(app, tx, session_id, agent, maybe_token)?;
     crate::collab::queue::ensure_active(tx, session_id)?;
     let record = crate::collab::queue::load_session_record(tx, session_id)?;
     let current_pilot = record.session.pilot;
     if agent != current_pilot {
         return Err(unauthorized(agent, current_pilot));
     }
-    Ok(record)
+    Ok((record, claim))
 }
 
 /// Rebind a live session's `implementer` role.
@@ -678,11 +684,11 @@ pub(super) fn handle_collab_set_implementer(app: &App, args: &Value) -> Result<V
     let agent = require_agent(require_str(args, "agent")?)?;
     let implementer = require_implementer(require_str(args, "implementer")?)?;
 
-    app.db.with_transaction(|tx| {
+    let (response, claim) = app.db.with_transaction(|tx| {
         // Rule 1 first: authorization before state, mirroring
         // `handle_collab_set_pilot`. An unauthorized caller is refused
         // regardless of which phase the session is in.
-        let record = ensure_caller_is_current_pilot(
+        let (record, claim) = ensure_caller_is_current_pilot(
             app,
             tx,
             session_id,
@@ -744,8 +750,10 @@ pub(super) fn handle_collab_set_implementer(app: &App, args: &Value) -> Result<V
             Some(&json!({ "session_id": session_id })),
         )?;
         let updated = crate::collab::queue::load_session_record(tx, session_id)?;
-        Ok(session_record_json(&updated))
-    })
+        Ok((session_record_json(&updated), claim))
+    })?;
+    claim.publish(app);
+    Ok(response)
 }
 
 /// Rebind a live session's `pilot` role.
@@ -803,10 +811,10 @@ pub(super) fn handle_collab_set_pilot(app: &App, args: &Value) -> Result<Value, 
     // Identical accept-set either way; only the message differs.
     let pilot = require_pilot(require_str(args, "pilot")?)?;
 
-    app.db.with_transaction(|tx| {
+    let (response, claim) = app.db.with_transaction(|tx| {
         // Rule 2 first: authorization before state. An unauthorized caller is
         // told it is the copilot regardless of which phase the session is in.
-        let record = ensure_caller_is_current_pilot(
+        let (record, claim) = ensure_caller_is_current_pilot(
             app,
             tx,
             session_id,
@@ -863,8 +871,10 @@ pub(super) fn handle_collab_set_pilot(app: &App, args: &Value) -> Result<Value, 
             Some(&json!({ "session_id": session_id })),
         )?;
         let updated = crate::collab::queue::load_session_record(tx, session_id)?;
-        Ok(session_record_json(&updated))
-    })
+        Ok((session_record_json(&updated), claim))
+    })?;
+    claim.publish(app);
+    Ok(response)
 }
 
 pub(super) fn handle_collab_start_code_review(
@@ -972,8 +982,8 @@ pub(super) fn handle_collab_send(app: &App, args: &Value) -> Result<Value, Memor
         )));
     }
 
-    let (response, before, after, pr_url) = app.db.with_transaction(|tx| {
-        super::handoff::ensure_actor_generation_current(
+    let (response, before, after, pr_url, claim) = app.db.with_transaction(|tx| {
+        let claim = super::handoff::ensure_actor_generation_current(
             app,
             tx,
             session_id,
@@ -1049,6 +1059,7 @@ pub(super) fn handle_collab_send(app: &App, args: &Value) -> Result<Value, Memor
                 phase_before_enum,
                 phase_before_enum,
                 None,
+                claim,
             ));
         }
 
@@ -1138,8 +1149,10 @@ pub(super) fn handle_collab_send(app: &App, args: &Value) -> Result<Value, Memor
             phase_before_enum,
             phase_after_enum,
             post_pr_url,
+            claim,
         ))
     })?;
+    claim.publish(app);
 
     // Deliberately also set on terminal sends — terminal-but-not-ended sessions
     // still attribute (bucket 'other') until a newer session claims this scope.
@@ -1203,8 +1216,8 @@ pub(super) fn handle_collab_recv(app: &App, args: &Value) -> Result<Value, Memor
         .unwrap_or(false);
     let full = args.get("full").and_then(Value::as_bool).unwrap_or(false);
 
-    let result = app.db.with_transaction(|tx| {
-        super::handoff::ensure_actor_generation_current(
+    let (result, claim) = app.db.with_transaction(|tx| {
+        let claim = super::handoff::ensure_actor_generation_current(
             app,
             tx,
             session_id,
@@ -1275,8 +1288,9 @@ pub(super) fn handle_collab_recv(app: &App, args: &Value) -> Result<Value, Memor
                 }
             })
             .collect();
-        Ok(json!({ "messages": json_messages }))
+        Ok((json!({ "messages": json_messages }), claim))
     })?;
+    claim.publish(app);
     app.set_active_collab_session_for_scope(session_id, &repo_path, &branch);
     Ok(result)
 }
@@ -1284,7 +1298,7 @@ pub(super) fn handle_collab_recv(app: &App, args: &Value) -> Result<Value, Memor
 pub(super) fn handle_collab_ack(app: &App, args: &Value) -> Result<Value, MemoryError> {
     let message_id = require_str(args, "message_id")?;
     let session_id = require_str(args, "session_id")?;
-    app.db.with_transaction(|tx| {
+    let claim = app.db.with_transaction(|tx| {
         crate::collab::queue::ensure_active(tx, session_id)?;
         // Resolve the receiver from the target message so we can run the
         // generation guard. A missing message surfaces as NotFound — same
@@ -1304,7 +1318,7 @@ pub(super) fn handle_collab_ack(app: &App, args: &Value) -> Result<Value, Memory
         let agent = receiver_str
             .parse::<crate::collab::Agent>()
             .map_err(|e| MemoryError::Validation(format!("invalid receiver in message: {e}")))?;
-        super::handoff::ensure_actor_generation_current(
+        let claim = super::handoff::ensure_actor_generation_current(
             app,
             tx,
             session_id,
@@ -1321,8 +1335,9 @@ pub(super) fn handle_collab_ack(app: &App, args: &Value) -> Result<Value, Memory
             }),
             Some(&json!({ "ok": true })),
         )?;
-        Ok(())
+        Ok(claim)
     })?;
+    claim.publish(app);
     Ok(json!({ "ok": true }))
 }
 
@@ -1487,8 +1502,8 @@ pub(super) fn handle_collab_approve(app: &App, args: &Value) -> Result<Value, Me
     })
     .to_string();
 
-    app.db.with_transaction(|tx| {
-        super::handoff::ensure_actor_generation_current(
+    let (response, claim) = app.db.with_transaction(|tx| {
+        let claim = super::handoff::ensure_actor_generation_current(
             app,
             tx,
             session_id,
@@ -1548,8 +1563,10 @@ pub(super) fn handle_collab_approve(app: &App, args: &Value) -> Result<Value, Me
             }),
             Some(&json!({ "phase": session.phase.to_string() })),
         )?;
-        Ok(json!({ "phase": session.phase.to_string() }))
-    })
+        Ok((json!({ "phase": session.phase.to_string() }), claim))
+    })?;
+    claim.publish(app);
+    Ok(response)
 }
 
 /// Gap between `collab_wait_my_turn` snapshot reads.
@@ -1631,8 +1648,8 @@ fn wait_my_turn_claim_and_capture_baseline(
     session_id: &str,
     agent: Agent,
     args: &Value,
-) -> Result<WaitTurnBaseline, MemoryError> {
-    super::handoff::ensure_actor_generation_current(
+) -> Result<(WaitTurnBaseline, GenerationClaim), MemoryError> {
+    let claim = super::handoff::ensure_actor_generation_current(
         app,
         tx,
         session_id,
@@ -1640,7 +1657,7 @@ fn wait_my_turn_claim_and_capture_baseline(
         super::handoff::opt_handoff_token(args).as_deref(),
     )?;
     let record = crate::collab::queue::load_session_record(tx, session_id)?;
-    Ok(wait_turn_snapshot(&record, agent).baseline)
+    Ok((wait_turn_snapshot(&record, agent).baseline, claim))
 }
 
 /// Validate the arguments, settle the generation, and capture one baseline
@@ -1665,9 +1682,10 @@ pub(super) fn wait_my_turn_begin(app: &App, args: &Value) -> Result<WaitTurnBase
     ensure_no_conflicting_process_session(app, session_id, &repo_path, &branch)?;
     let agent = require_agent(require_str(args, "agent")?)?;
 
-    let baseline = app.db.with_transaction(|tx| {
+    let (baseline, claim) = app.db.with_transaction(|tx| {
         wait_my_turn_claim_and_capture_baseline(app, tx, session_id, agent, args)
     })?;
+    claim.publish(app);
 
     app.set_active_collab_session_for_scope(session_id, &repo_path, &branch);
     Ok(baseline)
@@ -1741,8 +1759,8 @@ pub(super) fn handle_collab_end(app: &App, args: &Value) -> Result<Value, Memory
     let session_id = require_str(args, "session_id")?;
     let agent = require_agent(require_str(args, "agent")?)?;
 
-    let (phase, repo_path, branch) = app.db.with_transaction(|tx| {
-        super::handoff::ensure_actor_generation_current(
+    let (phase, repo_path, branch, claim) = app.db.with_transaction(|tx| {
+        let claim = super::handoff::ensure_actor_generation_current(
             app,
             tx,
             session_id,
@@ -1788,8 +1806,9 @@ pub(super) fn handle_collab_end(app: &App, args: &Value) -> Result<Value, Memory
             }),
             Some(&json!({ "ok": true })),
         )?;
-        Ok((ended_phase, record.repo_path, record.branch))
+        Ok((ended_phase, record.repo_path, record.branch, claim))
     })?;
+    claim.publish(app);
 
     // Operator attestation (METRICS_SPEC §12 amendment): the operator ends a
     // CodingComplete session after the PR lands, or abandons a pre-coding
@@ -1841,8 +1860,8 @@ pub(super) fn handle_collab_resume(app: &App, args: &Value) -> Result<Value, Mem
     ensure_no_conflicting_process_session(app, session_id, &repo_path, &branch)?;
     let agent = require_agent(require_str(args, "agent")?)?;
 
-    let (phase, current_owner) = app.db.with_transaction(|tx| {
-        super::handoff::ensure_actor_generation_current(
+    let (phase, current_owner, claim) = app.db.with_transaction(|tx| {
+        let claim = super::handoff::ensure_actor_generation_current(
             app,
             tx,
             session_id,
@@ -1887,8 +1906,9 @@ pub(super) fn handle_collab_resume(app: &App, args: &Value) -> Result<Value, Mem
                 "current_owner": next.current_owner.to_string(),
             })),
         )?;
-        Ok((next.phase, next.current_owner))
+        Ok((next.phase, next.current_owner, claim))
     })?;
+    claim.publish(app);
 
     // Clear the stale `outcome='failed'`/`done_at` row that `failure_report`
     // wrote before this resume (METRICS_SPEC §5.4 amendment, task 10). Runs
@@ -2405,7 +2425,7 @@ mod tests {
         let baseline = app
             .db
             .with_transaction(|tx| {
-                let baseline = wait_my_turn_claim_and_capture_baseline(
+                let (baseline, _claim) = wait_my_turn_claim_and_capture_baseline(
                     &app,
                     tx,
                     wait_args["session_id"].as_str().unwrap(),
