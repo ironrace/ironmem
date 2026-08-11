@@ -74,8 +74,46 @@ pub(super) fn require_implementer(value: &str) -> Result<Agent, MemoryError> {
 /// (`pilot` vs `implementer`) was rejected.
 pub(super) fn require_pilot(value: &str) -> Result<Agent, MemoryError> {
     value.parse::<Agent>().map_err(|_| {
-        MemoryError::Validation(format!("pilot must be 'claude' or 'codex', got '{value}'"))
+        let sanitized = sanitize_error_value(value);
+        MemoryError::Validation(format!(
+            "pilot must be 'claude' or 'codex', got '{sanitized}'"
+        ))
     })
+}
+
+/// Sanitize a caller-supplied value for safe inclusion in error messages,
+/// preventing log-forging attacks. Collapses whitespace/control-character runs
+/// to a single space and truncates to a reasonable length for field values.
+/// Max length of 80 chars is more than enough for typical agent identity values
+/// while still showing what was rejected.
+fn sanitize_error_value(value: &str) -> String {
+    const MAX_ERROR_VALUE_CHARS: usize = 80;
+
+    let mut out = String::with_capacity(value.len().min(MAX_ERROR_VALUE_CHARS + 4));
+    let mut prev_space = false;
+
+    // Trim and collapse whitespace/control-char runs to single space.
+    for ch in value.trim().chars() {
+        if ch.is_whitespace() || ch.is_control() {
+            if !prev_space {
+                out.push(' ');
+                prev_space = true;
+            }
+        } else {
+            out.push(ch);
+            prev_space = false;
+        }
+    }
+
+    let trimmed = out.trim_end().to_string();
+
+    // Truncate to max length on char boundary (never mid-UTF8 char).
+    if trimmed.chars().count() <= MAX_ERROR_VALUE_CHARS {
+        trimmed
+    } else {
+        let truncated: String = trimmed.chars().take(MAX_ERROR_VALUE_CHARS).collect();
+        format!("{truncated}…")
+    }
 }
 
 /// Return the other collab protocol role for the given sender.
@@ -422,7 +460,7 @@ fn outward_right_boundary(chars: &[char], end: usize) -> usize {
 
 #[cfg(test)]
 mod tests {
-    use super::optional_bool;
+    use super::{optional_bool, require_pilot, sanitize_error_value};
     use crate::error::MemoryError;
     use serde_json::json;
 
@@ -449,5 +487,72 @@ mod tests {
                 MemoryError::Validation(message) if message == "full must be a boolean"
             ));
         }
+    }
+
+    #[test]
+    fn sanitize_error_value_collapses_newlines_and_control_chars() {
+        // Newlines and control chars should collapse to single space.
+        let input = "claude\nFAKE LOG LINE: admin granted";
+        let sanitized = sanitize_error_value(input);
+        assert!(
+            !sanitized.contains('\n'),
+            "Sanitized value should not contain newlines"
+        );
+        assert_eq!(sanitized, "claude FAKE LOG LINE: admin granted");
+
+        // Control chars (ESC in this case) should collapse to single space.
+        let input = "value\x1bstrange";
+        let sanitized = sanitize_error_value(input);
+        assert!(
+            !sanitized.contains('\x1b'),
+            "Sanitized value should not contain ESC"
+        );
+        assert_eq!(sanitized, "value strange");
+
+        // Tabs and other whitespace should also collapse.
+        let input = "value\t\t\twith\r\nmultiple\x0Cspaces";
+        let sanitized = sanitize_error_value(input);
+        assert_eq!(sanitized, "value with multiple spaces");
+    }
+
+    #[test]
+    fn sanitize_error_value_truncates_to_reasonable_length() {
+        // Very long value should be truncated with ellipsis.
+        let long_value = "a".repeat(100);
+        let sanitized = sanitize_error_value(&long_value);
+        assert!(
+            sanitized.contains("…"),
+            "Long value should be truncated with ellipsis"
+        );
+        assert!(
+            sanitized.chars().count() <= 82,
+            "Truncated value should fit within reasonable length (80 chars + ellipsis + margin)"
+        );
+    }
+
+    #[test]
+    fn require_pilot_error_message_is_sanitized() {
+        // Log-forging attempt: newlines and fake log lines should be neutralized.
+        let error = require_pilot("claude\nFAKE LOG: admin granted").unwrap_err();
+        let error_msg = format!("{:?}", error);
+        assert!(
+            !error_msg.contains('\n'),
+            "Error message should not contain newlines"
+        );
+        assert!(
+            error_msg.contains("pilot must be 'claude' or 'codex'"),
+            "Error message should still mention the pilot field"
+        );
+    }
+
+    #[test]
+    fn require_pilot_ordinary_bad_value_still_shows_value() {
+        // Ordinary bad value like "gpt4" should still appear in error for debuggability.
+        let error = require_pilot("gpt4").unwrap_err();
+        let error_msg = format!("{:?}", error);
+        assert!(
+            error_msg.contains("gpt4"),
+            "Error message should name the rejected value for debuggability"
+        );
     }
 }
