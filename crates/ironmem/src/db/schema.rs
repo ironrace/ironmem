@@ -329,9 +329,15 @@ impl Database {
     }
 
     /// Execute a closure inside a SQLite transaction and commit on success.
+    ///
+    /// The closure is bound by `Fn`, not `FnOnce`, because this function is
+    /// gaining a bounded `SQLITE_BUSY_SNAPSHOT` retry loop that may call it
+    /// more than once. Closures that genuinely cannot be called twice (they
+    /// move an uncloneable capture, or perform a non-idempotent side effect
+    /// outside the database) belong on [`Self::with_transaction_once`].
     pub fn with_transaction<T>(
         &self,
-        f: impl FnOnce(&Transaction<'_>) -> Result<T, MemoryError>,
+        f: impl Fn(&Transaction<'_>) -> Result<T, MemoryError>,
     ) -> Result<T, MemoryError> {
         let tx = self.conn.unchecked_transaction()?;
         let result = f(&tx)?;
