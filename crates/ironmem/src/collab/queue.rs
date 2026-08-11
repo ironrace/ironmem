@@ -58,15 +58,22 @@ pub fn create_session(
     // have no `DEFAULT` and are all nullable, so a fresh row lands on NULL,
     // which `load_session_record` maps to `None`/`0` exactly like a legacy
     // pre-015 row. `save_session` is the only writer for these fields.
+    // `current_owner` is seeded to `pilot` explicitly rather than relying on
+    // the schema's `DEFAULT 'claude'` — the pilot drafts first at
+    // `PlanParallelDrafts`, so a `pilot=codex` session must be born owned by
+    // `codex`, not fall through to the claude default. Mirrors
+    // `CollabSession::new_with_roles`. The DEFAULT remains as defense in
+    // depth for any other writer of this table.
     conn.execute(
-        "INSERT INTO collab_sessions (id, repo_path, branch, task, implementer, pilot)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        "INSERT INTO collab_sessions (id, repo_path, branch, task, implementer, pilot, current_owner)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
         params![
             id,
             repo_path,
             branch,
             task,
             implementer.as_str(),
+            pilot.as_str(),
             pilot.as_str()
         ],
     )?;

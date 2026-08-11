@@ -161,7 +161,11 @@ impl CollabSession {
         Self {
             id: id.into(),
             phase: Phase::PlanParallelDrafts,
-            current_owner: Agent::Claude,
+            // The pilot drafts first at `PlanParallelDrafts`, so ownership
+            // starts with the pilot. Contrast `new_global_review`, a
+            // different entry point that seeds `counterpart(pilot)` because
+            // it starts the *copilot* at `CodeReviewFixGlobalPending`.
+            current_owner: pilot,
             claude_draft_hash: None,
             codex_draft_hash: None,
             canonical_plan_hash: None,

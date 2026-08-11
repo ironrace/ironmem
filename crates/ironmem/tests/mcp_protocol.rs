@@ -2577,6 +2577,129 @@ fn collab_pilot_and_implementer_remain_independent_in_the_reverse_mixed_case() {
 }
 
 #[test]
+fn collab_start_pilot_codex_seeds_current_owner_from_pilot_at_creation() {
+    // Task 4 (issue #235 hardening): `create_session`/`new_with_roles` used
+    // to seed `current_owner` at `Agent::Claude` (a hardcoded default /
+    // schema DEFAULT fallthrough) regardless of `pilot`. The pilot drafts
+    // first at `PlanParallelDrafts`, so a `pilot=codex` session with no
+    // explicit `implementer` (defaults to the resolved pilot) must be born
+    // owned by codex, not claude.
+    let app = App::open_for_test().unwrap();
+    let started = call_tool(
+        &app,
+        "collab_start",
+        json!({
+            "repo_path": "/repo",
+            "branch": "pilot-codex-owner-seed",
+            "initiator": "claude",
+            "pilot": "codex"
+        }),
+    );
+    assert_eq!(started["pilot"], "codex");
+    assert_eq!(started["implementer"], "codex");
+    let session_id = started["session_id"].as_str().unwrap();
+
+    let status = call_tool(&app, "collab_status", json!({ "session_id": session_id }));
+    assert_eq!(status["current_owner"], "codex");
+    assert_eq!(status["implementer"], "codex");
+}
+
+#[test]
+fn collab_start_split_roles_owner_seeds_pilot_then_moves_to_implementer_at_code_implement_pending()
+{
+    // Regression guard for the Task 4 creation-seed fix (phase-aware
+    // invariant): seeding `current_owner = pilot` at birth must NOT make
+    // ownership sticky to the pilot all the way through planning. A
+    // split-role session (`pilot=codex`, `implementer=claude`) starts
+    // codex-owned (the pilot drafts first) but must land back on
+    // `claude` — the independent implementer, not the pilot — once it
+    // reaches `CodeImplementPending`. This pins the state machine's
+    // existing `next.current_owner = session.implementer` transition
+    // (`state_machine/mod.rs`, the `PlanLocked` -> `SubmitTaskList` arm)
+    // against a future regression introduced by the creation-seed change.
+    let app = App::open_for_test().unwrap();
+    let started = call_tool(
+        &app,
+        "collab_start",
+        json!({
+            "repo_path": "/repo",
+            "branch": "split-roles-owner-seed-then-implementer",
+            "initiator": "claude",
+            "pilot": "codex",
+            "implementer": "claude"
+        }),
+    );
+    let session_id = started["session_id"].as_str().unwrap().to_string();
+
+    // Creation-seed: current_owner starts at the pilot (codex drafts first).
+    let status = call_tool(&app, "collab_status", json!({ "session_id": &session_id }));
+    assert_eq!(status["current_owner"], "codex");
+
+    // Drive to PlanLocked with codex as pilot (drafts, synthesizes, finalizes).
+    for (sender, content) in [("claude", "cdraft"), ("codex", "xdraft")] {
+        call_tool(
+            &app,
+            "collab_send",
+            json!({
+                "session_id": &session_id,
+                "sender": sender,
+                "topic": "draft",
+                "content": content,
+            }),
+        );
+    }
+    call_tool(
+        &app,
+        "collab_send",
+        json!({
+            "session_id": &session_id,
+            "sender": "codex",
+            "topic": "canonical",
+            "content": "canonical plan",
+        }),
+    );
+    call_tool(
+        &app,
+        "collab_send",
+        json!({
+            "session_id": &session_id,
+            "sender": "claude",
+            "topic": "review",
+            "content": json!({ "verdict": "approve" }).to_string(),
+        }),
+    );
+    call_tool(
+        &app,
+        "collab_send",
+        json!({
+            "session_id": &session_id,
+            "sender": "codex",
+            "topic": "final",
+            "content": json!({ "plan": "final plan" }).to_string(),
+        }),
+    );
+
+    let hash = plan_hash(&app, &session_id);
+    call_tool(
+        &app,
+        "collab_send",
+        json!({
+            "session_id": &session_id,
+            "sender": "codex",
+            "topic": "task_list",
+            "content": task_list_payload(&hash, "base", "head", 1),
+        }),
+    );
+
+    let status = call_tool(&app, "collab_status", json!({ "session_id": &session_id }));
+    assert_eq!(status["phase"], "CodeImplementPending");
+    assert_eq!(
+        status["current_owner"], "claude",
+        "implementer must own CodeImplementPending, not the pilot"
+    );
+}
+
+#[test]
 fn collab_start_rejects_invalid_pilot_and_creates_no_session_row() {
     let app = App::open_for_test().unwrap();
     let err = call_tool_expect_error(
