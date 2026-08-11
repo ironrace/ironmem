@@ -905,21 +905,19 @@ pub(super) fn handle_collab_start_code_review(
         ));
     }
     let task = sanitize::sanitize_content(require_str(args, "task")?, MAX_COLLAB_CONTENT_CHARS)?;
-    // Optional `pilot` field: same default as `collab_start` (Task 7), but
-    // NOT the same validation pattern — this still uses the pre-Task-3
-    // `and_then(Value::as_str)` shortcut (silently falls back to the default
-    // on a non-string value) rather than `collab_start`'s hardened
-    // absent/string/non-string three-way match. Known, deliberately
-    // deferred divergence: low practical risk, since both tools' MCP
-    // `inputSchema` already declares `pilot` as a string enum, and this
-    // shortcut entry point never reaches a pilot-reassignable phase. Not
-    // fixed here — see the whole-implementation review that flagged it.
-    // Resolved before `start_global_review_session` — that call needs the
-    // real value, not a hardcoded stand-in — and before the transaction
-    // opens.
-    let pilot = match args.get("pilot").and_then(Value::as_str) {
-        Some(value) => require_pilot(value)?,
+    // Optional `pilot` field: selects which agent leads the review flow and
+    // defaults to Claude for the historical path. Match `collab_start`'s
+    // absent/string/non-string validation so malformed values cannot silently
+    // route ownership to the default pilot. Explicit `null` is non-string and
+    // therefore rejected.
+    let pilot = match args.get("pilot") {
         None => Agent::Claude,
+        Some(Value::String(s)) => require_pilot(s)?,
+        Some(_) => {
+            return Err(MemoryError::Validation(
+                "pilot must be a string".to_string(),
+            ))
+        }
     };
     let session_id = uuid::Uuid::new_v4().to_string();
     let session = start_global_review_session(&session_id, base_sha, head_sha, pilot)
@@ -2069,6 +2067,62 @@ mod tests {
             "final_review",
             r#"{"head_sha":"c4","pr_url":"https://github.com/x/y/pull/9"}"#,
         );
+    }
+
+    fn collab_session_count(app: &crate::mcp::app::App) -> i64 {
+        app.db
+            .with_connection(|conn| {
+                Ok(conn.query_row("SELECT COUNT(*) FROM collab_sessions", [], |row| row.get(0))?)
+            })
+            .unwrap()
+    }
+
+    fn assert_code_review_rejects_non_string_pilot(pilot: Value) {
+        let app = test_app();
+        let before = collab_session_count(&app);
+        let err = handle_collab_start_code_review(
+            &app,
+            &json!({
+                "repo_path": "/tmp/repo",
+                "branch": "main",
+                "base_sha": "base",
+                "head_sha": "head",
+                "initiator": "claude",
+                "task": "review-only test",
+                "pilot": pilot,
+            }),
+        )
+        .unwrap_err();
+
+        assert!(
+            err.to_string().contains("pilot must be a string"),
+            "unexpected validation error: {err}"
+        );
+        assert_eq!(
+            collab_session_count(&app),
+            before,
+            "invalid pilot must not create a collab session"
+        );
+        assert!(
+            app.active_collab_session_snapshot_for_scope("/tmp/repo", "main")
+                .is_none(),
+            "invalid pilot must not bind an active collab session"
+        );
+    }
+
+    #[test]
+    fn collab_start_code_review_rejects_numeric_pilot() {
+        assert_code_review_rejects_non_string_pilot(json!(42));
+    }
+
+    #[test]
+    fn collab_start_code_review_rejects_boolean_pilot() {
+        assert_code_review_rejects_non_string_pilot(json!(true));
+    }
+
+    #[test]
+    fn collab_start_code_review_rejects_explicit_null_pilot() {
+        assert_code_review_rejects_non_string_pilot(Value::Null);
     }
 
     // ── lifecycle tests ───────────────────────────────────────────────────────
