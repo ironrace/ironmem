@@ -8,6 +8,10 @@ CREATE TABLE IF NOT EXISTS collab_sessions (
     codex_draft_hash     TEXT,
     canonical_plan_hash  TEXT,
     final_plan_hash      TEXT,
+    -- Stores the copilot's verdict, not literally Codex's verdict. Under
+    -- `pilot=codex`, this column holds Claude's verdict. The column name
+    -- dates from the pre-pilot-column protocol and was deliberately not
+    -- migrated; see docs/COLLAB.md for the rationale.
     codex_review_verdict TEXT,
     created_at           TEXT NOT NULL DEFAULT (datetime('now')),
     updated_at           TEXT NOT NULL DEFAULT (datetime('now'))

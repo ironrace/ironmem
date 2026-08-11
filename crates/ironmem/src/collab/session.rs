@@ -19,6 +19,12 @@ pub struct CollabSession {
     pub canonical_plan_drawer_id: Option<String>,
     /// Deterministic 32-char drawer id of the final (parsed) plan body.
     pub final_plan_drawer_id: Option<String>,
+    /// The **copilot's** verdict from the one review pass — the copilot's
+    /// review result regardless of which agent is `pilot`. Under the default
+    /// `pilot=claude`, this holds Codex's verdict; under `pilot=codex`, this
+    /// holds Claude's verdict. The field name is historical (dating from the
+    /// pre-pilot-column protocol when the copilot was always Codex) and was
+    /// deliberately not renamed; see docs/COLLAB.md for the rationale.
     pub codex_review_verdict: Option<String>,
     pub review_round: u8,
     // v3 coding fields. `tasks_count` is not stored — it is derived from
