@@ -1302,6 +1302,50 @@ gates: passed\n";
         );
     }
 
+    /// The other half of the deferred-publish contract: a claim whose
+    /// transaction DOES commit must still reach the advisory cache, so the
+    /// claimant's next tokenless call is admitted.
+    ///
+    /// Driven through `handle_session_handoff` — a real caller of the guard —
+    /// because publishing is now the caller's job: dropping `claim.publish(app)`
+    /// from a handler would strand that process at "this session has been handed
+    /// off" for every subsequent tokenless op.
+    #[test]
+    fn committed_claim_is_published_by_its_caller() {
+        let (origin, dir) = test_handoff_app();
+        let sid = seed_active_session(&origin);
+
+        let token =
+            handle_session_handoff(&origin, &json!({ "session_id": sid, "agent": "claude" }))
+                .unwrap()["handoff_token"]
+                .as_str()
+                .unwrap()
+                .to_string();
+
+        // A fresh process claims the token through the handler, whose
+        // transaction commits.
+        let succ = test_app_with_db_path(origin.config.db_path.clone(), dir.path());
+        handle_session_handoff(
+            &succ,
+            &json!({ "session_id": sid, "agent": "claude", "handoff_token": token }),
+        )
+        .unwrap();
+
+        assert_eq!(
+            succ.cached_generation(&sid, Agent::Claude),
+            Some(1),
+            "a committed claim must be published to the claimant's cache"
+        );
+
+        // Which is what makes the claimant's next tokenless op legal.
+        succ.db
+            .with_connection(|conn| {
+                ensure_actor_generation_current(&succ, conn, &sid, Agent::Claude, None)
+            })
+            .unwrap()
+            .publish(&succ);
+    }
+
     /// `handle_session_handoff` bumps `task_outcomes.handoffs` by 1 for a
     /// session whose row exists (keyed on session_id). A metrics failure or
     /// absent row must still return the normal handoff JSON.
