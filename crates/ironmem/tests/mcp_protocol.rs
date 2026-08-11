@@ -4998,12 +4998,24 @@ fn open_disk_app_for_dashboard_sweep() -> (tempfile::TempDir, PathBuf, App) {
 /// Open a SECOND, independent `App` against the same on-disk DB — models a
 /// second agent's own local `ironmem` MCP server process sharing one
 /// repository's DB, the deployment topology `ensure_actor_generation_current`
-/// (`crates/ironmem/src/mcp/tools/handoff.rs`) is designed around. Used by the
-/// full sweep to model the documented recovery path from the Task 9 audit
-/// finding in this file (`Not in scope here...`, above): a per-process actor
-/// generation cache that ends up ahead of the DB after a claimed-then-rolled-
-/// back handoff token has no in-process recovery — the fix is a fresh process,
-/// which is exactly what a real Codex client would do here.
+/// (`crates/ironmem/src/mcp/tools/handoff.rs`) is designed around: in
+/// production each agent runs its own MCP server process, so driving this
+/// scenario across two `App` instances over one shared on-disk DB is
+/// arguably MORE faithful to that topology than routing both agents through
+/// a single `App`. It also happens to route around the narrow slice of the
+/// Task 9 audit finding in this file (`Not in scope here...`, above) that
+/// this sweep exercises but leaves unfixed: after a claimed-then-rolled-back
+/// handoff token leaves the ORIGINAL `App`'s per-process actor generation
+/// cache one ahead of the DB, a TOKENLESS call by that agent on that SAME
+/// `App` is refused ("stale collab generation ... obtain a session_handoff
+/// token in a fresh process") — but re-presenting a still-valid handoff
+/// token on that SAME `App` actually succeeds, since the token-claim branch
+/// of `ensure_actor_generation_current` never consults the cache before
+/// overwriting it, and the rolled-back transaction left the token itself
+/// still claimable. So the real limitation is narrower than "no in-process
+/// recovery": it's "no in-process recovery for a tokenless call after this
+/// specific rollback sequence" — a fresh process is simply what a real
+/// Codex client would do here regardless.
 fn open_second_disk_app(db_path: &Path) -> (tempfile::TempDir, App) {
     let dir = tempfile::tempdir().expect("temp dir must be creatable");
     let state_dir = dir.path().join("state");
@@ -5316,22 +5328,26 @@ fn collab_role_safety_full_verification_sweep_reversed_role_scenario() {
     // genuinely split pilot != implementer pair at this checkpoint.
     //
     // Codex's remaining actions in this scenario (submitting its own blind
-    // draft, reviewing the canonical plan) route through a SECOND, fresh
-    // `App` rather than the original one. This is the documented recovery
-    // from step 4's token-bearing retries: presenting `pre_reassignment_token`
-    // there claimed it successfully (`claim_handoff_token` runs, and
+    // draft, reviewing the canonical plan) route through a SECOND, independent
+    // `App` rather than the original one — modeling codex's own local MCP
+    // server process, per `open_second_disk_app`'s doc comment above. That
+    // choice also happens to sidestep a side effect of step 4's token-bearing
+    // retries: presenting `pre_reassignment_token` there claimed it
+    // successfully (`claim_handoff_token` runs, and
     // `ensure_actor_generation_current` calls `app.set_cached_generation`)
     // inside a transaction that then rolled back on the caller-identity
     // check, per the Task 9 audit finding documented earlier in this file
     // ("Not in scope here..."). That leaves the ORIGINAL `App`'s in-process
-    // generation cache for codex one ahead of the DB, and there is no
-    // in-process recovery for that — codex's next call through `app`, even
-    // an ordinary draft submission, is refused with "stale collab
-    // generation ... obtain a session_handoff token in a fresh process".
-    // This is a pre-existing, deliberately out-of-scope limitation (the
-    // audit finding says so explicitly), not a new defect this sweep should
-    // fix in production code — so the test follows the documented recovery
-    // instead: a fresh process (a second `App` on the same DB) for codex.
+    // generation cache for codex one ahead of the DB, so a TOKENLESS call by
+    // codex through that same `app` — even an ordinary draft submission — is
+    // refused with "stale collab generation ... obtain a session_handoff
+    // token in a fresh process". This is a pre-existing, deliberately
+    // out-of-scope limitation (the audit finding says so explicitly), and it
+    // is narrower than it looks: re-presenting `pre_reassignment_token`
+    // itself on that same `app` would still succeed (the token-claim path
+    // never consults the cache, and the token survived the rollback), so a
+    // fresh process is not the only recovery — it's just the one this test
+    // uses, matching the real deployment topology.
     let (_dir2, app_codex) = open_second_disk_app(&db_path);
 
     call_tool(
