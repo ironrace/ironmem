@@ -616,6 +616,28 @@ pub(super) fn handle_collab_start(app: &App, args: &Value) -> Result<Value, Memo
     }))
 }
 
+/// Rebind a live session's `implementer` role.
+///
+/// # Authorization policy
+///
+/// Two rules, both enforced below inside a single transaction, in this order:
+///
+/// 1. **Permitted caller.** The request's `agent` must equal the session's
+///    *current* pilot — the same rule [`handle_collab_set_pilot`] enforces for
+///    reassigning the pilot role. The implementer cannot hand off its own role;
+///    only the pilot may rebind who implements. This runs *before* the phase
+///    check below, so an unauthorized caller is refused regardless of phase.
+/// 2. **Phase.** Allowed anywhere in planning up to and including
+///    `CodeImplementPending` (see the `can_change` match below); refused once
+///    code review has started or coding has finished. This is looser than
+///    `collab_set_pilot`'s single pre-draft phase, because the implementer
+///    role has no role-dependent planning artifact analogous to a draft.
+///
+/// **Caveat: authorization here is caller-asserted, not authenticated.** The
+/// `agent` value comes from the caller's own claim, not from any process-bound
+/// identity check. This check defeats an honest client attempting to take a
+/// turn it does not own; it does not defeat an agent that lies about which
+/// identity it is. The same caveat applies to `handle_collab_set_pilot`.
 pub(super) fn handle_collab_set_implementer(app: &App, args: &Value) -> Result<Value, MemoryError> {
     let session_id = require_str(args, "session_id")?;
     let agent = require_agent(require_str(args, "agent")?)?;
@@ -631,6 +653,20 @@ pub(super) fn handle_collab_set_implementer(app: &App, args: &Value) -> Result<V
         )?;
         crate::collab::queue::ensure_active(tx, session_id)?;
         let record = crate::collab::queue::load_session_record(tx, session_id)?;
+
+        // Rule 1 first: authorization before state, mirroring
+        // `handle_collab_set_pilot`. An unauthorized caller is refused
+        // regardless of which phase the session is in.
+        let current_pilot = record.session.pilot;
+        if agent != current_pilot {
+            return Err(MemoryError::Validation(format!(
+                "collab_set_implementer refused: caller '{}' is not the pilot of this session; \
+                 only the current pilot '{}' may reassign the implementer",
+                agent.as_str(),
+                current_pilot.as_str()
+            )));
+        }
+
         let can_change = match record.session.phase {
             Phase::PlanParallelDrafts
             | Phase::PlanSynthesisPending

@@ -2730,6 +2730,102 @@ fn collab_set_implementer_rejects_after_batch_implementation() {
     );
 }
 
+/// Number of `wal_log` rows for the given `operation` whose `params` blob
+/// mentions this `session_id`. Rejection tests use this to prove a refused
+/// call wrote nothing to the audit trail, not merely that it returned an
+/// error.
+fn wal_row_count(app: &App, session_id: &str, operation: &str) -> i64 {
+    let pattern = format!("%\"session_id\":\"{session_id}\"%");
+    app.db
+        .with_transaction(|tx| {
+            Ok(tx.query_row(
+                "SELECT COUNT(*) FROM wal_log WHERE operation = ?1 AND params LIKE ?2",
+                rusqlite::params![operation, pattern],
+                |row| row.get(0),
+            )?)
+        })
+        .unwrap()
+}
+
+#[test]
+fn collab_set_implementer_rejects_non_pilot_caller() {
+    // The pilot defaults to `claude` (see `handle_collab_start`); `codex` is
+    // therefore not the pilot here and must be refused, mirroring
+    // `collab_set_pilot`'s permitted-caller rule.
+    let app = App::open_for_test().unwrap();
+    let session_id = drive_to_plan_locked(&app, "fp");
+
+    let before = call_tool(&app, "collab_status", json!({ "session_id": &session_id }));
+    let wal_before = wal_row_count(&app, &session_id, "collab_set_implementer");
+
+    let err = call_tool_expect_error(
+        &app,
+        "collab_set_implementer",
+        json!({
+            "session_id": &session_id,
+            "agent": "codex",
+            "implementer": "codex"
+        }),
+    );
+    assert!(
+        err.contains("codex") && err.contains("pilot 'claude'"),
+        "expected a rejection naming the caller and the current pilot, got: {err}"
+    );
+
+    let after = call_tool(&app, "collab_status", json!({ "session_id": &session_id }));
+    assert_eq!(
+        after["implementer"], before["implementer"],
+        "a refused collab_set_implementer must leave implementer unchanged"
+    );
+    assert_eq!(
+        after["current_owner"], before["current_owner"],
+        "a refused collab_set_implementer must leave current_owner unchanged"
+    );
+    assert_eq!(
+        after["updated_at"], before["updated_at"],
+        "a refused collab_set_implementer must not touch updated_at"
+    );
+    assert_eq!(
+        wal_row_count(&app, &session_id, "collab_set_implementer"),
+        wal_before,
+        "a refused collab_set_implementer must write no WAL row"
+    );
+}
+
+#[test]
+fn collab_set_implementer_allows_current_pilot_caller_pre_lock() {
+    // The permitted-caller rule is role-generic, not Claude-flavoured: under
+    // `pilot=codex` it is Codex — and only Codex — who may reassign the
+    // implementer, here in the earliest phase the gate allows
+    // (`PlanParallelDrafts`, before any task list exists).
+    let app = App::open_for_test().unwrap();
+    let started = call_tool(
+        &app,
+        "collab_start",
+        json!({
+            "repo_path": "/repo",
+            "branch": "feat/set-implementer-pilot-caller",
+            "initiator": "claude",
+            "pilot": "codex"
+        }),
+    );
+    let session_id = started["session_id"].as_str().unwrap().to_string();
+    let status = call_tool(&app, "collab_status", json!({ "session_id": &session_id }));
+    assert_eq!(status["phase"], "PlanParallelDrafts");
+
+    let updated = call_tool(
+        &app,
+        "collab_set_implementer",
+        json!({
+            "session_id": &session_id,
+            "agent": "codex",
+            "implementer": "claude"
+        }),
+    );
+    assert_eq!(updated["implementer"], "claude");
+    assert_eq!(updated["phase"], "PlanParallelDrafts");
+}
+
 /// Start a fresh planning session with an explicit `pilot` and return its id.
 /// The session lands in `PlanParallelDrafts` with neither draft submitted —
 /// the only state in which `collab_set_pilot` is ever allowed.
