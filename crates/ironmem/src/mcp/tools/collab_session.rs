@@ -4444,29 +4444,35 @@ mod tests {
     #[test]
     fn blind_draft_suppression_holds_for_both_receivers_regardless_of_pilot() {
         // The suppression keys on the *receiving* agent's own draft-hash
-        // column, which is identity-keyed rather than role-keyed, so it is
-        // pilot-independent by construction. This test deliberately leaves
-        // pilot at its default (claude) rather than calling set_pilot, since
-        // the whole point is that suppression does not depend on it. Both
-        // receiver directions are exercised because a one-sided test cannot
-        // tell an identity-keyed rule apart from one that happens to name
-        // the right agent.
-        for first_drafter in [Agent::Claude, Agent::Codex] {
-            let app = test_app();
-            let sid = start_session(&app);
-            let waiting = collab_counterpart(first_drafter);
+        // column, which is identity-keyed rather than role-keyed. To prove
+        // that in fact rather than by assertion, this test exercises both
+        // pilot assignments (outer loop) crossed with both draft-first
+        // orderings (inner loop) and checks that suppression behaves
+        // identically in all four cases. Both receiver directions are
+        // exercised because a one-sided test cannot tell an identity-keyed
+        // rule apart from one that happens to name the right agent, and both
+        // pilot values are exercised because a predicate that secretly keyed
+        // on `session.pilot` would otherwise pass undetected.
+        for pilot in [Agent::Claude, Agent::Codex] {
+            for first_drafter in [Agent::Claude, Agent::Codex] {
+                let app = test_app();
+                let sid = start_session(&app);
+                set_pilot(&app, &sid, pilot);
+                let waiting = collab_counterpart(first_drafter);
 
-            send(&app, &sid, first_drafter.as_str(), "draft", "first draft");
-            assert!(
-                inbox_topics(&app, &sid, waiting).is_empty(),
-                "{waiting} must not see {first_drafter}'s draft before submitting its own"
-            );
+                send(&app, &sid, first_drafter.as_str(), "draft", "first draft");
+                assert!(
+                    inbox_topics(&app, &sid, waiting).is_empty(),
+                    "pilot={pilot}: {waiting} must not see {first_drafter}'s draft before \
+                     submitting its own"
+                );
 
-            send(&app, &sid, waiting.as_str(), "draft", "second draft");
-            assert!(
-                inbox_topics(&app, &sid, waiting).contains(&"draft".to_string()),
-                "the counterpart's draft must appear once {waiting} has drafted"
-            );
+                send(&app, &sid, waiting.as_str(), "draft", "second draft");
+                assert!(
+                    inbox_topics(&app, &sid, waiting).contains(&"draft".to_string()),
+                    "pilot={pilot}: the counterpart's draft must appear once {waiting} has drafted"
+                );
+            }
         }
     }
 
