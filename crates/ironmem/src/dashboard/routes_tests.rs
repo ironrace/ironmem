@@ -317,6 +317,23 @@ async fn sessions_json_surfaces_pilot_distinctly_from_current_owner() {
             )
         })
         .unwrap();
+        // `create_session` seeds `current_owner = pilot`, so right after
+        // creation both fields hold "codex" and a mutation-tested reviewer
+        // could swap the row-mapping's SQL column indices for `pilot` and
+        // `current_owner` without this test noticing. Move ownership to the
+        // implementer via the production mutator so the two fields genuinely
+        // diverge (pilot stays "codex", current_owner becomes "claude"),
+        // matching the acceptance criteria's "reversed session is visually
+        // distinguishable" scenario, which only arises once ownership moves.
+        db.with_connection(|conn| {
+            crate::collab::queue::set_implementer(
+                conn,
+                "dash-session-codex-pilot",
+                crate::collab::Agent::Claude,
+                Some(crate::collab::Agent::Claude),
+            )
+        })
+        .unwrap();
     }
     let model_dir = dir.path().join("models");
     let model_status = crate::dashboard::data::WarmingStatus::from(
@@ -346,6 +363,11 @@ async fn sessions_json_surfaces_pilot_distinctly_from_current_owner() {
     // claude — proving the assertion targets the `pilot` field specifically,
     // not just any occurrence of the string "codex" in the row.
     assert_eq!(codex_row["implementer"], "claude");
+    // `set_implementer` above moved current_owner to claude while pilot
+    // stayed codex, so pilot and current_owner now genuinely differ. This
+    // proves the JSON response reads `pilot` from its own column rather than
+    // aliasing `current_owner`'s.
+    assert_eq!(codex_row["current_owner"], "claude");
 
     let claude_row = rows
         .iter()
@@ -470,6 +492,20 @@ fn dashboard_html_sections_and_user_text_rendering_are_stable() {
     assert!(DASHBOARD_HTML.contains("td.textContent = v || ''"));
     assert!(DASHBOARD_HTML.contains("pre.textContent = JSON.stringify"));
     assert!(!DASHBOARD_HTML.contains("\nloadReport();"));
+
+    // Task 12: the sessions table's `<thead>` header list and the per-row
+    // `vals` array must stay in lockstep. Pin Pilot's ADJACENCY to Owner in
+    // both lists (not just each string's bare presence) so that removing
+    // either half, or reordering one relative to the other, fails this test
+    // instead of silently shifting every column to the right of the edit.
+    assert!(
+        DASHBOARD_HTML.contains("<th>Owner</th><th>Pilot</th>"),
+        "sessions table header must list Pilot immediately after Owner"
+    );
+    assert!(
+        DASHBOARD_HTML.contains("row.current_owner,\n        row.pilot,"),
+        "sessions table vals array must read row.pilot immediately after row.current_owner"
+    );
 
     // Negative XSS assertion: no `innerHTML =` assignment may be fed by row or
     // record data. The only permitted `innerHTML` writes are static strings
