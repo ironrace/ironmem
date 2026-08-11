@@ -3424,9 +3424,13 @@ fn full_roles(app: &App, session_id: &str) -> (String, String, String) {
 //
 // The generation guard's transaction/retry behavior is covered separately by
 // `refused_token_role_mutation_does_not_poison_tokenless_generation_cache`:
-// if a post-claim validation rolls back the DB lease, the guard rebinds its
-// advisory cache to the authoritative DB generation before the next tokenless
-// action.
+// if a post-claim validation rolls back the DB lease, the guard drops the
+// advisory cache entry the claim wrote, so the next tokenless action is
+// answered by the authoritative DB state instead of a generation that never
+// committed. That this is a *drop* and not a rebind to `db_active` matters
+// only once the DB is past generation 0, which is pinned by the unit test
+// `rolled_back_claim_does_not_admit_claimant_at_incumbent_generation`
+// (`crates/ironmem/src/mcp/tools/handoff.rs`).
 
 /// Task 9, scenario 1 (genuine spent-token reuse): a `session_handoff` token
 /// is a one-time credential. Mint T1 for claude, spend it on a *permitted*
@@ -3599,6 +3603,13 @@ fn collab_set_pilot_unspent_pre_reassignment_token_is_refused_by_caller_identity
 /// generation lease. The process-local generation cache must follow that
 /// rollback: a subsequent tokenless action from the same App must still be
 /// accepted at generation 0.
+///
+/// Scoped deliberately to generation 0, where "the process may act" is the
+/// correct answer for *any* process. The guard reaches that answer by dropping
+/// the cache entry the rolled-back claim wrote, not by rebinding it to the DB
+/// value — a distinction this test cannot see and
+/// `rolled_back_claim_does_not_admit_claimant_at_incumbent_generation`
+/// (`crates/ironmem/src/mcp/tools/handoff.rs`) exists to pin.
 #[test]
 fn refused_token_role_mutation_does_not_poison_tokenless_generation_cache() {
     let app = App::open_for_test().unwrap();

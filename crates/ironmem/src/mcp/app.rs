@@ -493,6 +493,21 @@ impl App {
             .insert((session_id.to_string(), agent), generation);
     }
 
+    /// Drop this process's cached active generation for (session, agent).
+    ///
+    /// Used when the cache is known to describe a DB state that never
+    /// committed (a claim whose enclosing transaction rolled back). Removing
+    /// the entry — rather than overwriting it with the DB value — returns the
+    /// caller to the authoritative no-cache rules in
+    /// `ensure_actor_generation_current`, which is the only answer that cannot
+    /// admit a process at a generation it was never granted.
+    pub(crate) fn clear_cached_generation(&self, session_id: &str, agent: crate::collab::Agent) {
+        self.active_collab_generations
+            .write()
+            .expect("active_collab_generations lock poisoned")
+            .remove(&(session_id.to_string(), agent));
+    }
+
     /// Mark index as dirty after a write operation. The index will be
     /// rebuilt lazily on the next search via `ensure_index_fresh()`.
     pub fn mark_dirty(&self) {

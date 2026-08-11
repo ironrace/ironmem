@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **`collab_set_implementer` is now restricted to the session's current pilot
+  (#264).** The tool previously gated only on phase, so either agent could
+  rebind the implementer; it now runs the same caller-identity check as
+  `collab_set_pilot`, before the phase gate, and rejects with
+  `collab_set_implementer refused: caller '<agent>' is not the pilot of this
+  session; only the current pilot '<pilot>' may reassign the implementer`. A
+  copilot that needs the implementer changed must ask the pilot to make the
+  call. Like `collab_set_pilot`, the check is caller-*asserted*: it stops an
+  honest client from taking a turn it does not own, and is not process-bound
+  authentication. Both `/collab` command templates now check the current pilot
+  before attempting the call rather than letting the server refuse it.
+  `collab_start` and `collab_start_code_review` additionally reject non-string
+  `pilot`/`implementer` values (including explicit `null`) instead of silently
+  falling back to the `claude` default, and a new session's `current_owner` is
+  seeded from the resolved pilot rather than hardcoded to `claude`. See
+  § Authorization / Phase / Ownership Matrix in `docs/COLLAB.md`.
+
 ### Added
 
 - **Opt-in hybrid prompt recall (#235).** The UserPromptSubmit hook can ask an

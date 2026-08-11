@@ -1773,8 +1773,26 @@ DOC_PILOT_ROLE_CONTRACTS = {
         "| `pilot` | Which agent leads v1 planning and the v3 review-audit "
         "turns",
         "Rebindable via `collab_set_pilot`",
-        "only by the agent that is currently the pilot — a copilot can never "
-        "promote itself",
+        "only by the agent that is currently the pilot",
+        # This row used to end the sentence above with "— a copilot can never
+        # promote itself". That absolute claim contradicts the
+        # `collab_set_pilot` tool section in this same file, which states the
+        # check "does **not** defeat a caller willing to misrepresent its own
+        # identity, since `agent` is caller-asserted rather than
+        # authenticated". Pinning the caveat instead of the absolute claim
+        # keeps the restriction stated while making it impossible for the row
+        # to drift back to promising a guarantee the check does not give.
+        "That check is caller-*asserted*, not authenticated",
+    ],
+    # `collab_set_implementer` gained the same current-pilot-only caller
+    # restriction as `collab_set_pilot` (#264). Pinned here so the summary row
+    # — the first place a reader looks for field semantics — can never drift
+    # back to describing the tool as callable by either agent.
+    "the `implementer` Session State row": [
+        "| `implementer` | Which agent runs the v3 batch implementation phase",
+        "rebindable with `collab_set_implementer`",
+        "and only by the agent that is currently the pilot — the same "
+        "caller-asserted restriction as `collab_set_pilot`, above",
     ],
     "the `collab_set_pilot` tool section": [
         "### `collab_set_pilot`",

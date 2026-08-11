@@ -86,6 +86,30 @@ pub(super) fn require_pilot(value: &str) -> Result<Agent, MemoryError> {
 /// to a single space and truncates to a reasonable length for field values.
 /// Max length of 80 chars is more than enough for typical agent identity values
 /// while still showing what was rejected.
+///
+/// `char::is_control` covers only Unicode general category `Cc`, so bidi
+/// overrides and zero-width joiners (category `Cf`) would otherwise pass
+/// through untouched — and those, not newlines, are what let a rejected value
+/// visually reorder or hide the rest of an error line in a terminal, a log
+/// viewer, or the dashboard (Trojan-Source-style spoofing). They are folded
+/// into the same single-space collapse as every other invisible character; see
+/// `is_forgeable_invisible`.
+/// Unicode `Cf` (format) characters that render as nothing but change how the
+/// surrounding text is displayed. Neither `char::is_control` (`Cc` only) nor
+/// `char::is_whitespace` (`White_Space` only) matches any of them.
+fn is_forgeable_invisible(ch: char) -> bool {
+    matches!(ch,
+        // Zero-width space/non-joiner/joiner and the bidi marks.
+        '\u{200B}'..='\u{200F}'
+        // Bidi embedding/override controls (LRE, RLE, PDF, LRO, RLO).
+        | '\u{202A}'..='\u{202E}'
+        // Word joiner, invisible operators, and the bidi isolates.
+        | '\u{2060}'..='\u{2069}'
+        // Zero-width no-break space / BOM.
+        | '\u{FEFF}'
+    )
+}
+
 fn sanitize_error_value(value: &str) -> String {
     const MAX_ERROR_VALUE_CHARS: usize = 80;
 
@@ -94,7 +118,7 @@ fn sanitize_error_value(value: &str) -> String {
 
     // Trim and collapse whitespace/control-char runs to single space.
     for ch in value.trim().chars() {
-        if ch.is_whitespace() || ch.is_control() {
+        if ch.is_whitespace() || ch.is_control() || is_forgeable_invisible(ch) {
             if !prev_space {
                 out.push(' ');
                 prev_space = true;
@@ -105,7 +129,11 @@ fn sanitize_error_value(value: &str) -> String {
         }
     }
 
-    let trimmed = out.trim_end().to_string();
+    // `trim`, not `trim_end`: the leading `value.trim()` above only strips
+    // `White_Space`, so a value that starts with a `Cf` character (a BOM, say)
+    // reaches the loop and collapses into a leading space that would otherwise
+    // be echoed back inside the quotes.
+    let trimmed = out.trim().to_string();
 
     // Truncate to max length on char boundary (never mid-UTF8 char).
     if trimmed.chars().count() <= MAX_ERROR_VALUE_CHARS {
@@ -513,6 +541,31 @@ mod tests {
         let input = "value\t\t\twith\r\nmultiple\x0Cspaces";
         let sanitized = sanitize_error_value(input);
         assert_eq!(sanitized, "value with multiple spaces");
+    }
+
+    /// Category `Cf` characters are invisible but reorder or hide the text
+    /// around them, which is the display-forging half of the same threat the
+    /// newline collapse covers. `char::is_control` is `Cc`-only and
+    /// `char::is_whitespace` is `White_Space`-only, so neither catches these —
+    /// removing `is_forgeable_invisible` from the filter fails this test.
+    #[test]
+    fn sanitize_error_value_neutralizes_bidi_and_zero_width_chars() {
+        // RLO (U+202E) reverses everything after it when rendered.
+        let sanitized = sanitize_error_value("claude\u{202E}detnarg nimda");
+        assert!(
+            !sanitized.contains('\u{202E}'),
+            "bidi override must not survive sanitization: {sanitized:?}"
+        );
+        assert_eq!(sanitized, "claude detnarg nimda");
+
+        // Bidi isolates (U+2066 LRI / U+2069 PDI) and zero-width space.
+        let sanitized = sanitize_error_value("a\u{2066}b\u{2069}c\u{200B}d");
+        assert_eq!(sanitized, "a b c d");
+
+        // A BOM/ZWNBSP leading the value is trimmed away with the rest of the
+        // invisible run rather than being echoed back.
+        let sanitized = sanitize_error_value("\u{FEFF}claude");
+        assert_eq!(sanitized, "claude");
     }
 
     #[test]
