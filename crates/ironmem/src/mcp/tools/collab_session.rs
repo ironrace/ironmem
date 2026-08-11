@@ -295,6 +295,7 @@ pub(crate) struct WaitTurnBaseline {
     ended: bool,
     phase_is_terminal: bool,
     implementer: String,
+    pilot: String,
     coding_failure: Option<String>,
     pending_failure: Option<String>,
     failed_from_phase: Option<String>,
@@ -337,6 +338,7 @@ fn wait_turn_snapshot(record: &SessionRecord, agent: Agent) -> WaitTurnSnapshot 
             ended,
             phase_is_terminal,
             implementer: record.session.implementer.to_string(),
+            pilot: record.session.pilot.to_string(),
             coding_failure: record.session.coding_failure.clone(),
             pending_failure: record.session.pending_failure.clone(),
             failed_from_phase: record
@@ -2440,6 +2442,51 @@ mod tests {
         );
         assert_eq!(body["is_my_turn"], json!(false));
         assert_eq!(body["phase"], json!("CodeReviewFixGlobalPending"));
+        assert_eq!(body["current_owner"], json!("codex"));
+        assert_eq!(body["session_ended"], json!(false));
+    }
+
+    #[test]
+    fn wait_my_turn_settles_when_pilot_changes_without_owner_change() {
+        // Task 13: pilot reassignment must be observable even when it moves
+        // neither `current_owner` nor `phase`. This test proves the baseline
+        // comparison genuinely detects pilot-only changes via the derived
+        // PartialEq (not just decorative field population).
+        let app = test_app();
+        let args = json!({
+            "repo_path": "/tmp/repo",
+            "branch": "main",
+            "initiator": "claude",
+            "task": "pilot change test",
+            "implementer": "codex",
+        });
+        let sid = handle_collab_start(&app, &args).unwrap()["session_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        drive_to_implement(&app, &sid);
+        let wait_args = json!({"session_id": sid, "agent": "claude"});
+
+        let baseline = wait_my_turn_begin(&app, &wait_args).unwrap();
+        assert_eq!(baseline.pilot, "claude", "initial pilot is claude");
+        let (_, settled_before) = wait_my_turn_poll(&app, &wait_args, &baseline).unwrap();
+        assert!(!settled_before, "Codex still owns CodeImplementPending");
+
+        // Direct DB manipulation to change pilot without moving current_owner
+        // or phase — simulating the "Task 10 no-op case" mentioned in the task
+        // context (defense in depth for a scenario that can't happen via the
+        // normal API, but must still be detectable).
+        let mut session = app.db.collab_load_session(&sid).unwrap();
+        session.pilot = crate::collab::Agent::Codex;
+        app.db.collab_save_session(&session).unwrap();
+
+        let (body, settled_after) = wait_my_turn_poll(&app, &wait_args, &baseline).unwrap();
+        assert!(
+            settled_after,
+            "a pilot-only change (without phase/owner movement) must still wake Claude"
+        );
+        assert_eq!(body["is_my_turn"], json!(false));
+        assert_eq!(body["phase"], json!("CodeImplementPending"));
         assert_eq!(body["current_owner"], json!("codex"));
         assert_eq!(body["session_ended"], json!(false));
     }
