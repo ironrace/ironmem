@@ -616,6 +616,46 @@ pub(super) fn handle_collab_start(app: &App, args: &Value) -> Result<Value, Memo
     }))
 }
 
+/// Shared preamble for [`handle_collab_set_implementer`] and
+/// [`handle_collab_set_pilot`]: bind/validate the actor generation, confirm
+/// the session is still active, load its current record, and confirm the
+/// caller is the session's current pilot — the only role either tool permits
+/// to reassign a role. Must run inside the caller's write transaction (see
+/// [`super::handoff::ensure_actor_generation_current`]'s own doc comment for
+/// why).
+///
+/// Each caller supplies its own `unauthorized` closure so the rejection text
+/// stays byte-for-byte what that specific tool has always returned. Both
+/// tools perform the identical underlying check (caller must equal the
+/// current pilot) but have always worded the rejection differently ("is not
+/// the pilot" vs. "is the copilot") — unifying that wording would be an
+/// observable behavior change, since the exact error text is part of each
+/// tool's API.
+///
+/// **Caveat: authorization here is caller-asserted, not authenticated.** The
+/// `agent` value comes from the caller's own claim, not from any
+/// process-bound identity check. This check defeats an honest client
+/// attempting to take a turn it does not own; it does not defeat an agent
+/// that lies about which identity it is. Both [`handle_collab_set_implementer`]
+/// and [`handle_collab_set_pilot`] inherit this caveat from this helper.
+fn ensure_caller_is_current_pilot(
+    app: &App,
+    tx: &rusqlite::Transaction<'_>,
+    session_id: &str,
+    agent: Agent,
+    maybe_token: Option<&str>,
+    unauthorized: impl FnOnce(Agent, Agent) -> MemoryError,
+) -> Result<SessionRecord, MemoryError> {
+    super::handoff::ensure_actor_generation_current(app, tx, session_id, agent, maybe_token)?;
+    crate::collab::queue::ensure_active(tx, session_id)?;
+    let record = crate::collab::queue::load_session_record(tx, session_id)?;
+    let current_pilot = record.session.pilot;
+    if agent != current_pilot {
+        return Err(unauthorized(agent, current_pilot));
+    }
+    Ok(record)
+}
+
 /// Rebind a live session's `implementer` role.
 ///
 /// # Authorization policy
@@ -627,45 +667,38 @@ pub(super) fn handle_collab_start(app: &App, args: &Value) -> Result<Value, Memo
 ///    reassigning the pilot role. The implementer cannot hand off its own role;
 ///    only the pilot may rebind who implements. This runs *before* the phase
 ///    check below, so an unauthorized caller is refused regardless of phase.
+///    Enforced by the shared [`ensure_caller_is_current_pilot`] helper — see
+///    its doc comment for the caller-asserted-identity caveat that applies to
+///    this check.
 /// 2. **Phase.** Allowed anywhere in planning up to and including
 ///    `CodeImplementPending` (see the `can_change` match below); refused once
 ///    code review has started or coding has finished. This is looser than
 ///    `collab_set_pilot`'s single pre-draft phase, because the implementer
 ///    role has no role-dependent planning artifact analogous to a draft.
-///
-/// **Caveat: authorization here is caller-asserted, not authenticated.** The
-/// `agent` value comes from the caller's own claim, not from any process-bound
-/// identity check. This check defeats an honest client attempting to take a
-/// turn it does not own; it does not defeat an agent that lies about which
-/// identity it is. The same caveat applies to `handle_collab_set_pilot`.
 pub(super) fn handle_collab_set_implementer(app: &App, args: &Value) -> Result<Value, MemoryError> {
     let session_id = require_str(args, "session_id")?;
     let agent = require_agent(require_str(args, "agent")?)?;
     let implementer = require_implementer(require_str(args, "implementer")?)?;
 
     app.db.with_transaction(|tx| {
-        super::handoff::ensure_actor_generation_current(
+        // Rule 1 first: authorization before state, mirroring
+        // `handle_collab_set_pilot`. An unauthorized caller is refused
+        // regardless of which phase the session is in.
+        let record = ensure_caller_is_current_pilot(
             app,
             tx,
             session_id,
             agent,
             super::handoff::opt_handoff_token(args).as_deref(),
+            |caller, current_pilot| {
+                MemoryError::Validation(format!(
+                    "collab_set_implementer refused: caller '{}' is not the pilot of this \
+                     session; only the current pilot '{}' may reassign the implementer",
+                    caller.as_str(),
+                    current_pilot.as_str()
+                ))
+            },
         )?;
-        crate::collab::queue::ensure_active(tx, session_id)?;
-        let record = crate::collab::queue::load_session_record(tx, session_id)?;
-
-        // Rule 1 first: authorization before state, mirroring
-        // `handle_collab_set_pilot`. An unauthorized caller is refused
-        // regardless of which phase the session is in.
-        let current_pilot = record.session.pilot;
-        if agent != current_pilot {
-            return Err(MemoryError::Validation(format!(
-                "collab_set_implementer refused: caller '{}' is not the pilot of this session; \
-                 only the current pilot '{}' may reassign the implementer",
-                agent.as_str(),
-                current_pilot.as_str()
-            )));
-        }
 
         let can_change = match record.session.phase {
             Phase::PlanParallelDrafts
@@ -738,6 +771,9 @@ pub(super) fn handle_collab_set_implementer(app: &App, args: &Value) -> Result<V
 ///    *current* pilot. A copilot can never promote itself, which is precisely
 ///    what stops this from being a turn-seizure primitive: the only way to
 ///    become pilot is to be handed the role by the agent that already holds it.
+///    Enforced by the shared [`ensure_caller_is_current_pilot`] helper — see
+///    its doc comment for the caller-asserted-identity caveat that applies to
+///    this check.
 /// 3. **Atomicity.** The pilot change and `current_owner = new_pilot` happen in
 ///    the *same* `set_pilot` UPDATE inside the one transaction, so owner and
 ///    pilot are never observable in an inconsistent pairing. Moving the owner
@@ -767,27 +803,24 @@ pub(super) fn handle_collab_set_pilot(app: &App, args: &Value) -> Result<Value, 
     let pilot = require_pilot(require_str(args, "pilot")?)?;
 
     app.db.with_transaction(|tx| {
-        super::handoff::ensure_actor_generation_current(
+        // Rule 2 first: authorization before state. An unauthorized caller is
+        // told it is the copilot regardless of which phase the session is in.
+        let record = ensure_caller_is_current_pilot(
             app,
             tx,
             session_id,
             agent,
             super::handoff::opt_handoff_token(args).as_deref(),
+            |caller, current_pilot| {
+                MemoryError::Validation(format!(
+                    "collab_set_pilot refused: caller '{}' is the copilot of this session; \
+                     only the current pilot '{}' may reassign the pilot role",
+                    caller.as_str(),
+                    current_pilot.as_str()
+                ))
+            },
         )?;
-        crate::collab::queue::ensure_active(tx, session_id)?;
-        let record = crate::collab::queue::load_session_record(tx, session_id)?;
-
-        // Rule 2 first: authorization before state. An unauthorized caller is
-        // told it is the copilot regardless of which phase the session is in.
         let previous = record.session.pilot;
-        if agent != previous {
-            return Err(MemoryError::Validation(format!(
-                "collab_set_pilot refused: caller '{}' is the copilot of this session; \
-                 only the current pilot '{}' may reassign the pilot role",
-                agent.as_str(),
-                previous.as_str()
-            )));
-        }
 
         // Rule 1: the latest safe state, and only it.
         if record.session.phase != Phase::PlanParallelDrafts {
