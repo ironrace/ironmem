@@ -267,3 +267,28 @@ pub fn tasks_count_from_list(raw: Option<&str>) -> Option<u32> {
     let tasks = value.get("tasks")?.as_array()?;
     u32::try_from(tasks.len()).ok()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // `new_with_roles` is exercised end-to-end by the `collab_start` /
+    // `create_session` integration tests in `mcp_protocol.rs`, but those
+    // never inspect a freshly-constructed `CollabSession` directly — by the
+    // time they observe `current_owner` it has round-tripped through the DB
+    // INSERT in `queue::create_session`. Pin the in-memory constructor's
+    // seeding behavior directly here so a regression in `new_with_roles`
+    // itself (independent of the INSERT) is caught by a fast unit test
+    // rather than only by the slower DB-backed path.
+    #[test]
+    fn new_with_roles_seeds_current_owner_from_pilot() {
+        assert_eq!(
+            CollabSession::new_with_roles("s", Agent::Codex, Agent::Claude).current_owner,
+            Agent::Codex
+        );
+        assert_eq!(
+            CollabSession::new_with_roles("s", Agent::Claude, Agent::Codex).current_owner,
+            Agent::Claude
+        );
+    }
+}
