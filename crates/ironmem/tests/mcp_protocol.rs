@@ -3364,12 +3364,21 @@ fn full_roles(app: &App, session_id: &str) -> (String, String, String) {
 // generation/token lease table) is keyed by `(session_id, agent)` and models
 // process succession for a given agent identity — "has a fresh process
 // claimed the right to act as this agent" — which is an orthogonal concern
-// to `pilot`/`implementer`/`current_owner`, which model *role* state. Neither
-// `handle_collab_set_pilot` nor `handle_collab_set_implementer` touches
-// `collab_actor_generations` at all (see `crates/ironmem/src/mcp/tools/collab_session.rs`);
-// a token minted for an agent before a reassignment remains just as claimable
-// after one. There is no such thing, in the current implementation, as "a
-// handoff token invalidated specifically by a role reassignment."
+// to `pilot`/`implementer`/`current_owner`, which model *role* state. Both
+// `handle_collab_set_pilot` and `handle_collab_set_implementer` route through
+// the shared `ensure_caller_is_current_pilot` preamble
+// (`crates/ironmem/src/mcp/tools/collab_session.rs`), which does touch
+// `collab_actor_generations` on every call via `ensure_actor_generation_current`
+// (`crates/ironmem/src/mcp/tools/handoff.rs`) — it always reads the caller's
+// row, and writes to it when the request carries a `handoff_token`. What it
+// does NOT do is couple that read/write to the role-reassignment logic itself:
+// whether `pilot`/`implementer`/`current_owner` gets changed by the call has
+// no bearing on whether a generation advances, and vice versa — the two are
+// driven by orthogonal inputs (the `handoff_token` field vs. the `pilot`/
+// `implementer` field). So a token minted for an agent before a reassignment
+// remains just as claimable after one. There is no such thing, in the current
+// implementation, as "a handoff token invalidated specifically by a role
+// reassignment."
 //
 // The task's acceptance criteria ("attempt a role mutation using the
 // pre-reassignment handoff token — refused, zero mutation") is nonetheless
@@ -3498,8 +3507,12 @@ fn collab_set_pilot_unspent_pre_reassignment_token_is_refused_by_caller_identity
     let token = issued["handoff_token"].as_str().unwrap().to_string();
 
     // Reassign the pilot away from claude via a SEPARATE, tokenless call.
-    // T1 is untouched by this: role reassignment does not consult, advance,
-    // or invalidate `collab_actor_generations` at all.
+    // T1 is untouched by this: the call's shared preamble still reads claude's
+    // row in `collab_actor_generations` (via `ensure_actor_generation_current`,
+    // since no `handoff_token` arg means it takes the read-only validation
+    // path), but the *reassignment logic* itself never advances a generation
+    // or invalidates a token as a side effect of changing `pilot` — that only
+    // happens when a request separately supplies a `handoff_token` to claim.
     let reassigned = call_tool(
         &app,
         "collab_set_pilot",
