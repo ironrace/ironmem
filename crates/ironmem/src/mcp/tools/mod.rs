@@ -304,7 +304,7 @@ pub fn tool_definitions(app: &App) -> Vec<Value> {
         }),
         json!({
             "name": "collab_set_implementer",
-            "description": "Select the coding owner during planning or CodeImplementPending.",
+            "description": "Select the coding owner during planning or CodeImplementPending. Caller must be the current pilot.",
             "inputSchema": {
                 "type": "object",
                 "properties": {

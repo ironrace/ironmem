@@ -1003,6 +1003,16 @@ the active batch to another agent. The new implementer resumes from the
 one current logical-keyed ironmem checkpoint, then scans the plan and current code before
 continuing. Calls after `implementation_done` are rejected.
 
+**Caller restriction.** Only the session's *current* pilot may call this,
+checked before phase — the implementer cannot hand off its own role, and an
+unauthorized caller is rejected identically regardless of what phase the
+session is in. The rejection names the caller's role and the pilot that may
+act: `"collab_set_implementer refused: caller '<agent>' is not the pilot of
+this session; only the current pilot '<pilot>' may reassign the
+implementer"`. See § Authorization / Phase / Ownership Matrix, below, for
+the full phase table and the caller-asserted-identity caveat that applies
+identically to `collab_set_pilot` beside it.
+
 ### `collab_set_pilot`
 
 Reassigns the session's `pilot` — far more restricted than

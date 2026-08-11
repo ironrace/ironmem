@@ -106,10 +106,28 @@ preserve the existing pilot, and continue with the session exactly as it
 stands — never retry, never overwrite.** Do not pre-empt the server's decision
 either: make the one call and report what it says.
 
-When the implementer flag is present, call `collab_set_implementer` with
-`agent="codex"` — **after** any pilot change above — before waiting or
-selecting a prompt; use its returned session record. That rebinds an active
-batch before the phase is routed.
+When the implementer flag is present, first determine whether Codex is the
+session's **current** pilot — `collab_set_implementer` is caller-restricted
+identically to `collab_set_pilot` (only the current pilot may reassign the
+implementer), and the pilot branch above may have just moved the pilot away
+from Codex. Read the current pilot from whichever status is now in hand: the
+record returned by the authorized `collab_set_pilot` call above if that
+branch ran, otherwise `status.pilot` from the initial `collab_status` read.
+
+1. **Current pilot is `"codex"`** → authorized: call `collab_set_implementer`
+   with `agent="codex"` — **after** any pilot change above — before waiting
+   or selecting a prompt; use its returned session record. That rebinds an
+   active batch before the phase is routed.
+2. **Current pilot is not `"codex"`** → **fail before attempting the
+   mutation.** Codex is the copilot here — either it always was, or the
+   pilot role was just handed away above — and `collab_set_implementer`
+   would refuse the call. Report that the implementer flag could not be
+   applied, naming the current pilot and stating that setting
+   `implementer=<flag value>` now requires a pilot-side
+   `join --implementer=<flag value>` (or a prior `--pilot=codex`
+   hand-back). Continue with the status already in hand — the implementer
+   is simply left as it was. **Never call `collab_set_implementer` in this
+   branch, and never retry.**
 
 Then call `collab_wait_my_turn(session_id, "codex", 60)` once to bridge the
 handoff race, refresh `collab_status`, and select the prompt from session state:

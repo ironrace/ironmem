@@ -905,10 +905,18 @@ pub(super) fn handle_collab_start_code_review(
         ));
     }
     let task = sanitize::sanitize_content(require_str(args, "task")?, MAX_COLLAB_CONTENT_CHARS)?;
-    // Optional `pilot` field: same pattern and default as `collab_start`
-    // (Task 7). Resolved before `start_global_review_session` — that call
-    // needs the real value, not a hardcoded stand-in — and before the
-    // transaction opens.
+    // Optional `pilot` field: same default as `collab_start` (Task 7), but
+    // NOT the same validation pattern — this still uses the pre-Task-3
+    // `and_then(Value::as_str)` shortcut (silently falls back to the default
+    // on a non-string value) rather than `collab_start`'s hardened
+    // absent/string/non-string three-way match. Known, deliberately
+    // deferred divergence: low practical risk, since both tools' MCP
+    // `inputSchema` already declares `pilot` as a string enum, and this
+    // shortcut entry point never reaches a pilot-reassignable phase. Not
+    // fixed here — see the whole-implementation review that flagged it.
+    // Resolved before `start_global_review_session` — that call needs the
+    // real value, not a hardcoded stand-in — and before the transaction
+    // opens.
     let pilot = match args.get("pilot").and_then(Value::as_str) {
         Some(value) => require_pilot(value)?,
         None => Agent::Claude,
