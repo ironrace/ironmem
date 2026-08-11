@@ -15,8 +15,8 @@ use super::collab_events::{
     build_collab_event, failure_report_is_off_turn_admissible, parse_final_payload,
 };
 use super::shared::{
-    collab_counterpart, require_agent, require_implementer, require_pilot, require_str, sha256_hex,
-    MAX_COLLAB_CONTENT_CHARS,
+    collab_counterpart, require_agent, require_implementer, require_pilot, require_str,
+    resolve_optional_agent_field, sha256_hex, MAX_COLLAB_CONTENT_CHARS,
 };
 
 /// Wing under which collaboration-owned drawer artifacts are filed. Runtime
@@ -547,36 +547,17 @@ pub(super) fn handle_collab_start(app: &App, args: &Value) -> Result<Value, Memo
     // Optional `pilot` field: selects which agent leads v1 planning. Default
     // is `Agent::Claude` (historical flow). Resolved before `implementer` so
     // an omitted `implementer` can default to whichever pilot was chosen.
-    //
-    // Three cases: absent → default, present-string → validate, present-non-string → error.
-    // Explicit `null` is treated as non-string and rejected.
-    let pilot = match args.get("pilot") {
-        None => Agent::Claude,
-        Some(Value::String(s)) => require_pilot(s)?,
-        Some(_) => {
-            return Err(MemoryError::Validation(
-                "pilot must be a string".to_string(),
-            ))
-        }
-    };
+    // `resolve_optional_agent_field` rejects an explicit non-string/`null`
+    // instead of silently defaulting it.
+    let pilot = resolve_optional_agent_field(args, "pilot", Agent::Claude, require_pilot)?;
     // Optional `implementer` field: routes the v3 batch implementation
     // phase. Defaults to the resolved `pilot` (so a `pilot=codex` caller who
     // omits `implementer` gets `implementer=codex` too). `Agent::Codex`
     // makes Codex the owner of `CodeImplementPending` and the only valid
     // sender of `implementation_done`. It can be rebound later through
     // `collab_set_implementer` while planning or implementation is active.
-    //
-    // Three cases: absent → default, present-string → validate, present-non-string → error.
-    // Explicit `null` is treated as non-string and rejected.
-    let implementer = match args.get("implementer") {
-        None => pilot,
-        Some(Value::String(s)) => require_implementer(s)?,
-        Some(_) => {
-            return Err(MemoryError::Validation(
-                "implementer must be a string".to_string(),
-            ))
-        }
-    };
+    let implementer =
+        resolve_optional_agent_field(args, "implementer", pilot, require_implementer)?;
     let session_id = uuid::Uuid::new_v4().to_string();
 
     app.db.with_transaction(|tx| {
@@ -906,19 +887,10 @@ pub(super) fn handle_collab_start_code_review(
     }
     let task = sanitize::sanitize_content(require_str(args, "task")?, MAX_COLLAB_CONTENT_CHARS)?;
     // Optional `pilot` field: selects which agent leads the review flow and
-    // defaults to Claude for the historical path. Match `collab_start`'s
-    // absent/string/non-string validation so malformed values cannot silently
-    // route ownership to the default pilot. Explicit `null` is non-string and
-    // therefore rejected.
-    let pilot = match args.get("pilot") {
-        None => Agent::Claude,
-        Some(Value::String(s)) => require_pilot(s)?,
-        Some(_) => {
-            return Err(MemoryError::Validation(
-                "pilot must be a string".to_string(),
-            ))
-        }
-    };
+    // defaults to Claude for the historical path. `resolve_optional_agent_field`
+    // is the same helper `handle_collab_start` uses, so malformed values
+    // cannot silently route ownership to the default pilot here either.
+    let pilot = resolve_optional_agent_field(args, "pilot", Agent::Claude, require_pilot)?;
     let session_id = uuid::Uuid::new_v4().to_string();
     let session = start_global_review_session(&session_id, base_sha, head_sha, pilot)
         .map_err(collab_error_to_memory_error)?;

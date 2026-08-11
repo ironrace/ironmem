@@ -45,7 +45,12 @@ pub fn create_session(
     task: Option<&str>,
     roles: CollabRoles,
 ) -> Result<(), MemoryError> {
-    let CollabRoles { pilot, implementer } = roles;
+    // Keep `roles.pilot` / `roles.implementer` field-qualified through this
+    // function body rather than destructuring into bare locals — the
+    // `CollabRoles` struct exists specifically so a positional mix-up here
+    // (e.g. between the `implementer`, `pilot`, and `current_owner` slots
+    // below) is caught by name, not by argument order.
+    //
     // `Agent` is a closed enum so the canonical wire form is guaranteed —
     // no application-layer string validation is needed here. The DB CHECK
     // constraint on the column remains as defense-in-depth against direct
@@ -79,9 +84,9 @@ pub fn create_session(
             repo_path,
             branch,
             task,
-            implementer.as_str(),
-            pilot.as_str(),
-            pilot.as_str()
+            roles.implementer.as_str(),
+            roles.pilot.as_str(),
+            roles.pilot.as_str()
         ],
     )?;
     Ok(())

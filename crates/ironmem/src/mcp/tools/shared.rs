@@ -81,6 +81,29 @@ pub(super) fn require_pilot(value: &str) -> Result<Agent, MemoryError> {
     })
 }
 
+/// Resolve an optional `Agent`-valued JSON field with a shared three-way
+/// policy: absent → `default`, a JSON string → `validate`, anything else
+/// (including an explicit JSON `null`) → rejected by field name rather than
+/// silently defaulted.
+///
+/// Used for every `pilot`/`implementer` field on `collab_start` and
+/// `collab_start_code_review` so the three call sites cannot silently diverge
+/// on how a malformed value is handled — see [`require_pilot`] and
+/// [`require_implementer`] for the per-field validators passed in as
+/// `validate`.
+pub(super) fn resolve_optional_agent_field(
+    args: &Value,
+    key: &str,
+    default: Agent,
+    validate: impl FnOnce(&str) -> Result<Agent, MemoryError>,
+) -> Result<Agent, MemoryError> {
+    match args.get(key) {
+        None => Ok(default),
+        Some(Value::String(s)) => validate(s),
+        Some(_) => Err(MemoryError::Validation(format!("{key} must be a string"))),
+    }
+}
+
 /// Sanitize a caller-supplied value for safe inclusion in error messages,
 /// preventing log-forging attacks. Collapses whitespace/control-character runs
 /// to a single space and truncates to a reasonable length for field values.
@@ -91,48 +114,21 @@ pub(super) fn require_pilot(value: &str) -> Result<Agent, MemoryError> {
 /// overrides and zero-width joiners (category `Cf`) would otherwise pass
 /// through untouched — and those, not newlines, are what let a rejected value
 /// visually reorder or hide the rest of an error line in a terminal, a log
-/// viewer, or the dashboard (Trojan-Source-style spoofing). They are folded
-/// into the same single-space collapse as every other invisible character; see
-/// `is_forgeable_invisible`.
-/// Unicode `Cf` (format) characters that render as nothing but change how the
-/// surrounding text is displayed. Neither `char::is_control` (`Cc` only) nor
-/// `char::is_whitespace` (`White_Space` only) matches any of them.
-fn is_forgeable_invisible(ch: char) -> bool {
-    matches!(ch,
-        // Zero-width space/non-joiner/joiner and the bidi marks.
-        '\u{200B}'..='\u{200F}'
-        // Bidi embedding/override controls (LRE, RLE, PDF, LRO, RLO).
-        | '\u{202A}'..='\u{202E}'
-        // Word joiner, invisible operators, and the bidi isolates.
-        | '\u{2060}'..='\u{2069}'
-        // Zero-width no-break space / BOM.
-        | '\u{FEFF}'
-    )
-}
-
+/// viewer, or the dashboard (Trojan-Source-style spoofing). This is the one
+/// call site of [`crate::sanitize::collapse_whitespace_and_control`] that
+/// passes `strip_invisible: true` to fold those characters into the same
+/// single-space collapse as every other invisible character; see
+/// [`crate::sanitize::is_forgeable_invisible`].
 fn sanitize_error_value(value: &str) -> String {
     const MAX_ERROR_VALUE_CHARS: usize = 80;
 
-    let mut out = String::with_capacity(value.len().min(MAX_ERROR_VALUE_CHARS + 4));
-    let mut prev_space = false;
+    let out = crate::sanitize::collapse_whitespace_and_control(value, true);
 
-    // Trim and collapse whitespace/control-char runs to single space.
-    for ch in value.trim().chars() {
-        if ch.is_whitespace() || ch.is_control() || is_forgeable_invisible(ch) {
-            if !prev_space {
-                out.push(' ');
-                prev_space = true;
-            }
-        } else {
-            out.push(ch);
-            prev_space = false;
-        }
-    }
-
-    // `trim`, not `trim_end`: the leading `value.trim()` above only strips
-    // `White_Space`, so a value that starts with a `Cf` character (a BOM, say)
-    // reaches the loop and collapses into a leading space that would otherwise
-    // be echoed back inside the quotes.
+    // `trim`, not `trim_end`: `collapse_whitespace_and_control`'s internal
+    // `value.trim()` only strips `White_Space`, so a value that starts with a
+    // `Cf` character (a BOM, say) reaches the collapse loop and turns into a
+    // leading space in `out` that would otherwise be echoed back inside the
+    // quotes.
     let trimmed = out.trim().to_string();
 
     // Truncate to max length on char boundary (never mid-UTF8 char).
