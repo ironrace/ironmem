@@ -3742,6 +3742,34 @@ fn collab_set_pilot_same_pilot_call_repairs_drifted_current_owner() {
         ("claude".to_string(), "claude".to_string()),
         "the repair must be persisted, not merely reported"
     );
+
+    // `changed` is audit metadata with no programmatic consumer — its only
+    // job is telling an auditor reading `wal_log` whether this call actually
+    // mutated state. It is computed as `previous != pilot || previous_owner
+    // != pilot`: the pilot-changed disjunct is already covered by
+    // `collab_set_pilot_writes_wal_row_with_operation_session_and_actor`
+    // above, but the owner-drift-repaired disjunct — a same-pilot call whose
+    // `pilot` field never moves, yet a real mutation (repairing the drifted
+    // `current_owner`) still happened — was untested. A future
+    // "simplification" of that expression down to just `previous != pilot`
+    // would silently start mislabeling this repair as a no-op in the audit
+    // trail, and nothing would catch it. Assert the WAL row genuinely
+    // reflects the drift-then-repair, not just that `changed` happens to be
+    // true for an unrelated reason.
+    let (params, _result) = last_wal_row(&app, "collab_set_pilot");
+    assert_eq!(
+        params["previous_owner"], "codex",
+        "must record the drifted owner this call repaired"
+    );
+    assert_eq!(
+        params["current_owner"], "claude",
+        "must record the repaired owner"
+    );
+    assert_eq!(
+        params["changed"], true,
+        "a same-pilot call that repairs a drifted current_owner is a real \
+         mutation and must be logged as changed: true, not a no-op"
+    );
 }
 
 #[test]
