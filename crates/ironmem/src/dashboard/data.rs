@@ -499,6 +499,7 @@ pub struct CollabSessionSummary {
     pub phase: String,
     pub current_owner: String,
     pub implementer: String,
+    pub pilot: String,
     pub base_sha: Option<String>,
     pub head_sha: Option<String>,
     pub created_at: String,
@@ -549,7 +550,7 @@ pub(crate) fn list_sessions_conn(
                 base_sha, last_head_sha, created_at, updated_at, ended_at,
                 coding_failure, pr_url, task_list,
                 canonical_plan_drawer_id, canonical_plan_hash,
-                final_plan_drawer_id, final_plan_hash
+                final_plan_drawer_id, final_plan_hash, pilot
          FROM collab_sessions
          ORDER BY updated_at DESC
          LIMIT ?1",
@@ -578,6 +579,7 @@ pub(crate) fn list_sessions_conn(
             canonical_plan_hash: row.get(16)?,
             final_plan_drawer_id: row.get(17)?,
             final_plan_hash: row.get(18)?,
+            pilot: row.get(19)?,
         })
     })?;
 

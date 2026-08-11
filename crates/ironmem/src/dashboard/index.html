@@ -265,7 +265,7 @@ async function loadSessions() {
       return;
     }
     const table = document.createElement('table');
-    table.innerHTML = '<thead><tr><th>ID</th><th>Task</th><th>Branch</th><th>Phase</th><th>Owner</th><th>Tasks</th><th>Updated</th></tr></thead>';
+    table.innerHTML = '<thead><tr><th>ID</th><th>Task</th><th>Branch</th><th>Phase</th><th>Owner</th><th>Pilot</th><th>Tasks</th><th>Updated</th></tr></thead>';
     const tbody = document.createElement('tbody');
     rows.forEach(row => {
       const tr = document.createElement('tr');
@@ -275,6 +275,7 @@ async function loadSessions() {
         row.branch,
         row.phase,
         row.current_owner,
+        row.pilot,
         row.tasks_count != null ? row.tasks_count : '—',
         (row.updated_at||'').replace('T',' ').slice(0,16),
       ];

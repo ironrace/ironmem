@@ -277,6 +277,84 @@ async fn dashboard_handlers_return_expected_shapes_against_fixture() {
 }
 
 #[tokio::test]
+async fn sessions_json_surfaces_pilot_distinctly_from_current_owner() {
+    // Task 12: `pilot` must be visible in the /api/sessions response so a
+    // reversed session (pilot=codex leading a claude implementer) is
+    // distinguishable from the default pilot=claude session. Uses a
+    // dedicated two-session fixture (rather than extending the shared
+    // `fixture()` used elsewhere) so this test doesn't perturb the
+    // session-count assertions other tests make against that fixture.
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("memory.sqlite3");
+    {
+        let db = Database::open(&db_path).unwrap();
+        db.migrate().unwrap();
+        db.with_connection(|conn| {
+            crate::collab::queue::create_session(
+                conn,
+                "dash-session-claude",
+                "/repo-a",
+                "main",
+                Some("default pilot task"),
+                crate::collab::CollabRoles {
+                    pilot: crate::collab::Agent::Claude,
+                    implementer: crate::collab::Agent::Claude,
+                },
+            )
+        })
+        .unwrap();
+        db.with_connection(|conn| {
+            crate::collab::queue::create_session(
+                conn,
+                "dash-session-codex-pilot",
+                "/repo-a",
+                "main",
+                Some("reversed pilot task"),
+                crate::collab::CollabRoles {
+                    pilot: crate::collab::Agent::Codex,
+                    implementer: crate::collab::Agent::Claude,
+                },
+            )
+        })
+        .unwrap();
+    }
+    let model_dir = dir.path().join("models");
+    let model_status = crate::dashboard::data::WarmingStatus::from(
+        &ironrace_embed::embedder::model_status(&model_dir),
+    );
+    let state = Arc::new(ServerState {
+        db_path: Arc::new(db_path),
+        schema_version: LATEST_SCHEMA_VERSION,
+        model_status,
+    });
+
+    let sessions = handle_sessions(state, "limit=10").await;
+    assert_eq!(sessions.status(), StatusCode::OK);
+    let json: serde_json::Value = serde_json::from_str(&body_text(sessions).await).unwrap();
+    let rows = json.as_array().unwrap();
+    assert_eq!(rows.len(), 2);
+
+    let codex_row = rows
+        .iter()
+        .find(|r| r["id"] == "dash-session-codex-pilot")
+        .expect("codex-piloted session must be present in /api/sessions");
+    assert_eq!(
+        codex_row["pilot"], "codex",
+        "pilot=codex session must surface pilot=\"codex\" in the dashboard API response"
+    );
+    // Distinguish from the reversed session's implementer, which stays
+    // claude — proving the assertion targets the `pilot` field specifically,
+    // not just any occurrence of the string "codex" in the row.
+    assert_eq!(codex_row["implementer"], "claude");
+
+    let claude_row = rows
+        .iter()
+        .find(|r| r["id"] == "dash-session-claude")
+        .expect("default pilot session must be present in /api/sessions");
+    assert_eq!(claude_row["pilot"], "claude");
+}
+
+#[tokio::test]
 async fn summary_surfaces_model_status_alongside_total_drawers() {
     // GAP 1: /api/summary must report embed-model readiness (can it embed?)
     // AND total_drawers (is memory populated?) so warming is never misread as
