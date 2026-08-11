@@ -61,9 +61,13 @@ pub fn create_session(
     // `current_owner` is seeded to `pilot` explicitly rather than relying on
     // the schema's `DEFAULT 'claude'` — the pilot drafts first at
     // `PlanParallelDrafts`, so a `pilot=codex` session must be born owned by
-    // `codex`, not fall through to the claude default. Mirrors
-    // `CollabSession::new_with_roles`. The DEFAULT remains as defense in
-    // depth for any other writer of this table.
+    // `codex`, not fall through to the claude default. `CollabSession::new_with_roles`
+    // seeds `current_owner` the same way, but that constructor is a
+    // `#[cfg(test)]`-only fixture, not a production path this INSERT needs
+    // to stay in sync with for correctness — every production row is
+    // created via this function directly. Keeping the two consistent is
+    // still good practice so the fixture models production. The DEFAULT
+    // remains as defense in depth for any other writer of this table.
     conn.execute(
         "INSERT INTO collab_sessions (id, repo_path, branch, task, implementer, pilot, current_owner)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",

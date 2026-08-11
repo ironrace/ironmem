@@ -929,13 +929,17 @@ pub(super) fn handle_collab_start_code_review(
         ensure_no_conflicting_process_session_tx(app, tx, &session_id, repo_path, branch)?;
         // Shortcut sessions never enter `CodeImplementPending`, so `implementer`
         // is seeded from the resolved `pilot` for uniformity (there is no
-        // separate implementer selection on this entry point). The
-        // immediately-following `save_session(tx, &session)` is the
-        // authoritative write and overwrites both fields with `session`'s
-        // actual values inside this same transaction, so no reader ever
-        // observes the values passed here — they're set to the real resolved
-        // `pilot` purely so this call reads correctly on its own, not because
-        // any intermediate state is externally visible.
+        // separate implementer selection on this entry point). `create_session`
+        // also seeds `current_owner` from the same `pilot` argument (Task 4).
+        // The immediately-following `save_session(tx, &session)` is the
+        // authoritative write and overwrites all three fields — implementer,
+        // pilot, and current_owner — with `session`'s actual values (current_owner
+        // becomes `counterpart(pilot)`, since `new_global_review` starts the
+        // *copilot* at `CodeReviewFixGlobalPending`) inside this same
+        // transaction, so no reader ever observes the values passed here —
+        // they're set to the real resolved `pilot` purely so this call reads
+        // correctly on its own, not because any intermediate state is
+        // externally visible.
         crate::collab::queue::create_session(
             tx,
             &session_id,
