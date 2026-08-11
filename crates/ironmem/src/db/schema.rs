@@ -339,6 +339,45 @@ impl Database {
         Ok(result)
     }
 
+    /// Execute a closure inside a SQLite transaction and commit on success,
+    /// **without any retry**.
+    ///
+    /// `with_transaction` is gaining a bounded retry loop for
+    /// `SQLITE_BUSY_SNAPSHOT` (a concurrent writer invalidated this
+    /// transaction's read snapshot), which requires its closure to be safely
+    /// callable more than once and so widens its bound from `FnOnce` to
+    /// `Fn`. This variant is the escape hatch for closures that cannot meet
+    /// that bound: it keeps the original `FnOnce` signature and runs the
+    /// closure exactly once, with no retry loop at all.
+    ///
+    /// Use `with_transaction_once` only for closures that are non-repeatable
+    /// *in principle*, not merely inconvenient to rewrite:
+    /// - the closure moves a captured value that cannot be cloned or
+    ///   reborrowed (so it cannot be called a second time), or
+    /// - the closure performs a non-idempotent side effect outside the
+    ///   database (e.g. sending a network request, appending to an external
+    ///   log) that must not happen twice.
+    ///
+    /// Every call site must carry a one-line comment explaining which of the
+    /// above applies. Choosing this variant forfeits the bounded
+    /// `SQLITE_BUSY_SNAPSHOT` retry guarantee that `with_transaction`
+    /// provides (once its retry loop lands), so prefer `with_transaction`
+    /// whenever the closure can be made `Fn`.
+    ///
+    /// # Call sites
+    ///
+    /// (Populated as call sites migrate to this opt-out; see the
+    /// `with_transaction` bound-widening work.)
+    pub fn with_transaction_once<T>(
+        &self,
+        f: impl FnOnce(&Transaction<'_>) -> Result<T, MemoryError>,
+    ) -> Result<T, MemoryError> {
+        let tx = self.conn.unchecked_transaction()?;
+        let result = f(&tx)?;
+        tx.commit()?;
+        Ok(result)
+    }
+
     /// Borrow the underlying connection for a read-only closure. Unlike
     /// [`Self::with_transaction`], this opens no transaction — use it for plain
     /// `SELECT`s (e.g. the session-start hook reading collab/diary state) so a
