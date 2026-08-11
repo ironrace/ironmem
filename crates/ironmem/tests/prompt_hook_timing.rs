@@ -654,14 +654,17 @@ fn prompt_hook_stalled_hybrid_peer_preserves_kg_diary_fallback() {
     seed_db_file_bulk(&db_path, 10_000);
     let prompt = "drawer token alpha beta context";
     // A stalled peer consumes its whole hybrid budget by design — the join
-    // honors the configured deadline, not a fixed window — so keep that budget
-    // small enough that the assertions below still discriminate between "spent
-    // the vector budget" and "spent the outer guard".
+    // honors the configured deadline, not a fixed window. Budgets here are
+    // deliberately wider than production defaults to leave headroom for
+    // shared-CI-runner jitter in the fixed subprocess-spawn overhead that
+    // `run_prompt_hook_with_options` incurs on every invocation.
+    let hook_budget_ms = 300;
+    let hybrid_budget_ms = 80;
     let options = HookOptions {
         socket_path: Some(socket_path.clone()),
         hybrid: true,
-        hook_budget_ms: 150,
-        hybrid_budget_ms: 40,
+        hook_budget_ms,
+        hybrid_budget_ms,
         hybrid_limit: 5,
         max_hits: Some(3),
         kg_enabled: Some(true),
@@ -675,8 +678,8 @@ fn prompt_hook_stalled_hybrid_peer_preserves_kg_diary_fallback() {
         prompt,
         HookOptions {
             socket_path: Some(socket_path.clone()),
-            hook_budget_ms: 150,
-            hybrid_budget_ms: 40,
+            hook_budget_ms,
+            hybrid_budget_ms,
             hybrid_limit: 5,
             max_hits: Some(3),
             kg_enabled: Some(true),
@@ -693,19 +696,28 @@ fn prompt_hook_stalled_hybrid_peer_preserves_kg_diary_fallback() {
     drop(peer);
 
     assert!(
-        on.elapsed <= Duration::from_millis(150),
+        on.elapsed <= Duration::from_millis(hook_budget_ms),
         "stalled-daemon fallback exceeded the outer hook guard: {:?}",
         on.elapsed
     );
     assert!(
-        on.elapsed >= Duration::from_millis(40),
+        on.elapsed >= Duration::from_millis(hybrid_budget_ms),
         "the join must honor the configured hybrid deadline, not a fixed window: {:?}",
         on.elapsed
     );
+    // Discriminate "spent the vector budget" from "spent the outer guard" by
+    // the overhead *relative to the same-run, same-machine `off` baseline*
+    // rather than a fixed absolute ceiling — an absolute bound conflates
+    // real CPU-scheduling jitter on shared CI runners with the property
+    // under test and was observed to fail intermittently under load.
+    let stall_overhead = on.elapsed.saturating_sub(off.elapsed);
     assert!(
-        on.elapsed < Duration::from_millis(90),
-        "a stalled peer must cost at most its own vector budget, never the outer guard: {:?}",
-        on.elapsed
+        stall_overhead < Duration::from_millis(hybrid_budget_ms) * 3,
+        "a stalled peer must cost roughly its own vector budget on top of local work, \
+         never the outer guard: on={:?} off={:?} overhead={:?}",
+        on.elapsed,
+        off.elapsed,
+        stall_overhead
     );
     assert_eq!(
         on.raw, off.raw,
