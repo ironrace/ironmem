@@ -2161,8 +2161,10 @@ mod tests {
                     "/tmp/repo",
                     "main",
                     Some("task"),
-                    crate::collab::Agent::Claude,
-                    crate::collab::Agent::Claude,
+                    crate::collab::CollabRoles {
+                        pilot: crate::collab::Agent::Claude,
+                        implementer: crate::collab::Agent::Claude,
+                    },
                 )
             })
             .unwrap();
@@ -2228,8 +2230,10 @@ mod tests {
                     "/tmp/repo",
                     "main",
                     None,
-                    crate::collab::Agent::Claude,
-                    crate::collab::Agent::Claude,
+                    crate::collab::CollabRoles {
+                        pilot: crate::collab::Agent::Claude,
+                        implementer: crate::collab::Agent::Claude,
+                    },
                 )
             })
             .unwrap();
@@ -2899,8 +2903,10 @@ mod tests {
                     "/repo",
                     "main",
                     Some("task"),
-                    crate::collab::Agent::Claude,
-                    crate::collab::Agent::Claude,
+                    crate::collab::CollabRoles {
+                        pilot: crate::collab::Agent::Claude,
+                        implementer: crate::collab::Agent::Claude,
+                    },
                 )
             })
             .unwrap();
@@ -2958,8 +2964,10 @@ mod tests {
                         "/repo",
                         "main",
                         Some("task"),
-                        crate::collab::Agent::Codex,
-                        crate::collab::Agent::Claude,
+                        crate::collab::CollabRoles {
+                            pilot: crate::collab::Agent::Claude,
+                            implementer: crate::collab::Agent::Codex,
+                        },
                     )?;
                     crate::collab::queue::set_implementer(
                         tx,
@@ -2969,6 +2977,17 @@ mod tests {
                     )
                 })
                 .unwrap();
+
+            // Pin the exact role pairing this fixture depends on: the session
+            // is created with `pilot = Claude`, `implementer = Codex` — the
+            // reverse of `create_session`'s old positional order — so a
+            // careless migration of the two-`Agent` call above could
+            // silently swap them without any other assertion in this test
+            // catching it (the `current_owner` check below is satisfied by
+            // `set_implementer`'s explicit owner argument, not by `pilot`).
+            let seeded = app.db.collab_load_session(&session_id).unwrap();
+            assert_eq!(seeded.pilot, crate::collab::Agent::Claude);
+            assert_eq!(seeded.implementer, crate::collab::Agent::Codex);
 
             let request = json!({
                 "jsonrpc": "2.0", "id": 1, "method": "tools/call",
@@ -3173,8 +3192,10 @@ mod tests {
                     "/repo",
                     "main",
                     Some("task"),
-                    crate::collab::Agent::Claude,
-                    crate::collab::Agent::Claude,
+                    crate::collab::CollabRoles {
+                        pilot: crate::collab::Agent::Claude,
+                        implementer: crate::collab::Agent::Claude,
+                    },
                 )
             })
             .unwrap();

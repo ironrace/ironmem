@@ -371,12 +371,30 @@ paths, branches, or SHAs.
    continue with the session exactly as it stands — never retry, never
    overwrite.** Do not pre-empt the server's decision either: make the one
    call and report what it says.
-6. If the optional implementer flag was present, call
-   `mcp__ironmem__collab_set_implementer` with `session_id`,
-   `agent="claude"`, and `implementer=<flag value>` — **after** any pilot
-   change from step 5 — then use the returned session record as the
-   current status. This may transfer an active `CodeImplementPending`
-   batch to the selected implementer.
+6. If the optional implementer flag was present, first determine whether
+   Claude is the session's **current** pilot — `collab_set_implementer` is
+   caller-restricted identically to `collab_set_pilot` (only the current
+   pilot may reassign the implementer), and step 5 may have just moved the
+   pilot away from Claude. Read the current pilot from whichever status you
+   now hold: the record returned by step 5's branch 2 call if that branch
+   ran, otherwise `status.pilot` from step 4.
+   1. **Current pilot is `"claude"`** → authorized: call
+      `mcp__ironmem__collab_set_implementer` with `session_id`,
+      `agent="claude"`, and `implementer=<flag value>` — **after** any pilot
+      change from step 5 — then use the returned session record as the
+      current status. This may transfer an active `CodeImplementPending`
+      batch to the selected implementer.
+   2. **Current pilot is not `"claude"`** → **fail before attempting the
+      mutation.** Claude is the copilot here — either it always was, or
+      step 5 just handed the pilot role away — and `collab_set_implementer`
+      would refuse the call. Report to the user that the implementer flag
+      could not be applied, naming the current pilot and stating that
+      setting `implementer=<flag value>` now requires a pilot-side
+      `join --implementer=<flag value>` (or a prior `--pilot=claude`
+      hand-back). Continue with the status already in hand — the
+      implementer is simply left as it was. **Never call
+      `mcp__ironmem__collab_set_implementer` in this branch, and never
+      retry.**
 7. Report the task, phase, pilot, and implementer to the user.
 8. Branch on the returned `phase`:
    - **v1 active** (`PlanParallelDrafts` .. `PlanClaudeFinalizePending`) →

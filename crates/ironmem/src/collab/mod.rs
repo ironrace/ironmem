@@ -44,7 +44,7 @@ mod session;
 mod state_machine;
 mod task_list;
 
-pub use agent::Agent;
+pub use agent::{Agent, CollabRoles};
 pub use error::CollabError;
 pub use event::CollabEvent;
 pub use failure_class::{classify, FailureClass};

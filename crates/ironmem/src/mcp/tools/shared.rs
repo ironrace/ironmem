@@ -74,8 +74,70 @@ pub(super) fn require_implementer(value: &str) -> Result<Agent, MemoryError> {
 /// (`pilot` vs `implementer`) was rejected.
 pub(super) fn require_pilot(value: &str) -> Result<Agent, MemoryError> {
     value.parse::<Agent>().map_err(|_| {
-        MemoryError::Validation(format!("pilot must be 'claude' or 'codex', got '{value}'"))
+        let sanitized = sanitize_error_value(value);
+        MemoryError::Validation(format!(
+            "pilot must be 'claude' or 'codex', got '{sanitized}'"
+        ))
     })
+}
+
+/// Resolve an optional `Agent`-valued JSON field with a shared three-way
+/// policy: absent → `default`, a JSON string → `validate`, anything else
+/// (including an explicit JSON `null`) → rejected by field name rather than
+/// silently defaulted.
+///
+/// Used for every `pilot`/`implementer` field on `collab_start` and
+/// `collab_start_code_review` so the three call sites cannot silently diverge
+/// on how a malformed value is handled — see [`require_pilot`] and
+/// [`require_implementer`] for the per-field validators passed in as
+/// `validate`.
+pub(super) fn resolve_optional_agent_field(
+    args: &Value,
+    key: &str,
+    default: Agent,
+    validate: impl FnOnce(&str) -> Result<Agent, MemoryError>,
+) -> Result<Agent, MemoryError> {
+    match args.get(key) {
+        None => Ok(default),
+        Some(Value::String(s)) => validate(s),
+        Some(_) => Err(MemoryError::Validation(format!("{key} must be a string"))),
+    }
+}
+
+/// Sanitize a caller-supplied value for safe inclusion in error messages,
+/// preventing log-forging attacks. Collapses whitespace/control-character runs
+/// to a single space and truncates to a reasonable length for field values.
+/// Max length of 80 chars is more than enough for typical agent identity values
+/// while still showing what was rejected.
+///
+/// `char::is_control` covers only Unicode general category `Cc`, so bidi
+/// overrides and zero-width joiners (category `Cf`) would otherwise pass
+/// through untouched — and those, not newlines, are what let a rejected value
+/// visually reorder or hide the rest of an error line in a terminal, a log
+/// viewer, or the dashboard (Trojan-Source-style spoofing). This is the one
+/// call site of [`crate::sanitize::collapse_whitespace_and_control`] that
+/// passes `strip_invisible: true` to fold those characters into the same
+/// single-space collapse as every other invisible character; see
+/// [`crate::sanitize::is_forgeable_invisible`].
+fn sanitize_error_value(value: &str) -> String {
+    const MAX_ERROR_VALUE_CHARS: usize = 80;
+
+    let out = crate::sanitize::collapse_whitespace_and_control(value, true);
+
+    // `trim`, not `trim_end`: `collapse_whitespace_and_control`'s internal
+    // `value.trim()` only strips `White_Space`, so a value that starts with a
+    // `Cf` character (a BOM, say) reaches the collapse loop and turns into a
+    // leading space in `out` that would otherwise be echoed back inside the
+    // quotes.
+    let trimmed = out.trim().to_string();
+
+    // Truncate to max length on char boundary (never mid-UTF8 char).
+    if trimmed.chars().count() <= MAX_ERROR_VALUE_CHARS {
+        trimmed
+    } else {
+        let truncated: String = trimmed.chars().take(MAX_ERROR_VALUE_CHARS).collect();
+        format!("{truncated}…")
+    }
 }
 
 /// Return the other collab protocol role for the given sender.
@@ -422,7 +484,7 @@ fn outward_right_boundary(chars: &[char], end: usize) -> usize {
 
 #[cfg(test)]
 mod tests {
-    use super::optional_bool;
+    use super::{optional_bool, require_pilot, sanitize_error_value};
     use crate::error::MemoryError;
     use serde_json::json;
 
@@ -449,5 +511,97 @@ mod tests {
                 MemoryError::Validation(message) if message == "full must be a boolean"
             ));
         }
+    }
+
+    #[test]
+    fn sanitize_error_value_collapses_newlines_and_control_chars() {
+        // Newlines and control chars should collapse to single space.
+        let input = "claude\nFAKE LOG LINE: admin granted";
+        let sanitized = sanitize_error_value(input);
+        assert!(
+            !sanitized.contains('\n'),
+            "Sanitized value should not contain newlines"
+        );
+        assert_eq!(sanitized, "claude FAKE LOG LINE: admin granted");
+
+        // Control chars (ESC in this case) should collapse to single space.
+        let input = "value\x1bstrange";
+        let sanitized = sanitize_error_value(input);
+        assert!(
+            !sanitized.contains('\x1b'),
+            "Sanitized value should not contain ESC"
+        );
+        assert_eq!(sanitized, "value strange");
+
+        // Tabs and other whitespace should also collapse.
+        let input = "value\t\t\twith\r\nmultiple\x0Cspaces";
+        let sanitized = sanitize_error_value(input);
+        assert_eq!(sanitized, "value with multiple spaces");
+    }
+
+    /// Category `Cf` characters are invisible but reorder or hide the text
+    /// around them, which is the display-forging half of the same threat the
+    /// newline collapse covers. `char::is_control` is `Cc`-only and
+    /// `char::is_whitespace` is `White_Space`-only, so neither catches these —
+    /// removing `is_forgeable_invisible` from the filter fails this test.
+    #[test]
+    fn sanitize_error_value_neutralizes_bidi_and_zero_width_chars() {
+        // RLO (U+202E) reverses everything after it when rendered.
+        let sanitized = sanitize_error_value("claude\u{202E}detnarg nimda");
+        assert!(
+            !sanitized.contains('\u{202E}'),
+            "bidi override must not survive sanitization: {sanitized:?}"
+        );
+        assert_eq!(sanitized, "claude detnarg nimda");
+
+        // Bidi isolates (U+2066 LRI / U+2069 PDI) and zero-width space.
+        let sanitized = sanitize_error_value("a\u{2066}b\u{2069}c\u{200B}d");
+        assert_eq!(sanitized, "a b c d");
+
+        // A BOM/ZWNBSP leading the value is trimmed away with the rest of the
+        // invisible run rather than being echoed back.
+        let sanitized = sanitize_error_value("\u{FEFF}claude");
+        assert_eq!(sanitized, "claude");
+    }
+
+    #[test]
+    fn sanitize_error_value_truncates_to_reasonable_length() {
+        // Very long value should be truncated with ellipsis.
+        let long_value = "a".repeat(100);
+        let sanitized = sanitize_error_value(&long_value);
+        assert!(
+            sanitized.contains("…"),
+            "Long value should be truncated with ellipsis"
+        );
+        assert!(
+            sanitized.chars().count() <= 82,
+            "Truncated value should fit within reasonable length (80 chars + ellipsis + margin)"
+        );
+    }
+
+    #[test]
+    fn require_pilot_error_message_is_sanitized() {
+        // Log-forging attempt: newlines and fake log lines should be neutralized.
+        let error = require_pilot("claude\nFAKE LOG: admin granted").unwrap_err();
+        let error_msg = format!("{:?}", error);
+        assert!(
+            !error_msg.contains('\n'),
+            "Error message should not contain newlines"
+        );
+        assert!(
+            error_msg.contains("pilot must be 'claude' or 'codex'"),
+            "Error message should still mention the pilot field"
+        );
+    }
+
+    #[test]
+    fn require_pilot_ordinary_bad_value_still_shows_value() {
+        // Ordinary bad value like "gpt4" should still appear in error for debuggability.
+        let error = require_pilot("gpt4").unwrap_err();
+        let error_msg = format!("{:?}", error);
+        assert!(
+            error_msg.contains("gpt4"),
+            "Error message should name the rejected value for debuggability"
+        );
     }
 }

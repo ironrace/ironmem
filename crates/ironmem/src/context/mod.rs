@@ -331,20 +331,9 @@ fn short_sha(sha: &str) -> String {
 /// control characters nor open a fenced block in the host prompt. Length caps
 /// are applied separately by the callers.
 fn sanitize_inline(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    let mut prev_space = false;
-    for ch in s.trim().chars() {
-        if ch.is_whitespace() || ch.is_control() {
-            if !prev_space {
-                out.push(' ');
-                prev_space = true;
-            }
-        } else {
-            out.push(ch);
-            prev_space = false;
-        }
-    }
-    out.trim_end().replace("```", "`")
+    crate::sanitize::collapse_whitespace_and_control(s, false)
+        .trim_end()
+        .replace("```", "`")
 }
 
 /// Trim a code-map summary to a bounded length, preserving readability.

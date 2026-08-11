@@ -80,6 +80,30 @@ impl TryFrom<&str> for Agent {
     }
 }
 
+/// The two-role pairing for a collab session, bundled into a single named
+/// type so a `pilot`/`implementer` swap is visible at the construction
+/// site rather than hidden in positional argument order.
+///
+/// Before this type existed, the role pair was threaded through call sites
+/// as two trailing positional `Agent` arguments — and different functions
+/// disagreed on the order (`create_session`/`collab_create_session` took
+/// `(implementer, pilot)`, while `CollabSession::new_with_roles` took
+/// `(pilot, implementer)`). A caller copying a call-site pattern from one
+/// function to the other could silently swap the roles. Named fields don't
+/// make that transposition a compile error — `pilot` and `implementer` are
+/// both `Agent`, so a swapped assignment still type-checks — but they make
+/// it visible at every construction site: a reader sees `pilot: ...,
+/// implementer: ...` explicitly instead of having to recall which
+/// function's positional convention applied. A genuine compile-time
+/// swap-proof guarantee would require per-role newtypes (`Pilot(Agent)` /
+/// `Implementer(Agent)`), deliberately not taken here as disproportionate
+/// for a two-variant enum.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct CollabRoles {
+    pub pilot: Agent,
+    pub implementer: Agent,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

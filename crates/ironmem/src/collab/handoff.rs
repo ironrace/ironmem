@@ -261,6 +261,7 @@ mod tests {
 
     use super::*;
     use crate::collab::queue::create_session;
+    use crate::collab::CollabRoles;
 
     const BASE_SQL: &str = include_str!("../../migrations/001_init.sql");
     const FTS_SQL: &str = include_str!("../../migrations/002_fts.sql");
@@ -306,8 +307,10 @@ mod tests {
             "/repo",
             "main",
             Some("t"),
-            Agent::Claude,
-            Agent::Claude,
+            CollabRoles {
+                pilot: Agent::Claude,
+                implementer: Agent::Claude,
+            },
         )
         .unwrap();
     }

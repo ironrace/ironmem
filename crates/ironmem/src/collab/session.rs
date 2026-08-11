@@ -1,6 +1,6 @@
 //! `CollabSession` — single source of truth for collab session state.
 
-use super::agent::Agent;
+use super::agent::{Agent, CollabRoles};
 use super::phase::Phase;
 use super::state_machine::counterpart;
 
@@ -19,6 +19,12 @@ pub struct CollabSession {
     pub canonical_plan_drawer_id: Option<String>,
     /// Deterministic 32-char drawer id of the final (parsed) plan body.
     pub final_plan_drawer_id: Option<String>,
+    /// The **copilot's** verdict from the one review pass — the copilot's
+    /// review result regardless of which agent is `pilot`. Under the default
+    /// `pilot=claude`, this holds Codex's verdict; under `pilot=codex`, this
+    /// holds Claude's verdict. The field name is historical (dating from the
+    /// pre-pilot-column protocol when the copilot was always Codex) and was
+    /// deliberately not renamed; see docs/COLLAB.md for the rationale.
     pub codex_review_verdict: Option<String>,
     pub review_round: u8,
     // v3 coding fields. `tasks_count` is not stored — it is derived from
@@ -150,18 +156,29 @@ impl CollabSession {
     /// wrapper over `new_with_roles` kept so existing call sites compile
     /// unchanged.
     pub fn new_with_implementer(id: impl Into<String>, implementer: Agent) -> Self {
-        Self::new_with_roles(id, Agent::Claude, implementer)
+        Self::new_with_roles(
+            id,
+            CollabRoles {
+                pilot: Agent::Claude,
+                implementer,
+            },
+        )
     }
 
     /// Construct a fresh planning-stage session with explicit `pilot` and
     /// `implementer` roles. See the `pilot` field doc comment for the
     /// four-knob role vocabulary; `implementer` is orthogonal to `pilot`
     /// and not validated against it.
-    pub fn new_with_roles(id: impl Into<String>, pilot: Agent, implementer: Agent) -> Self {
+    pub fn new_with_roles(id: impl Into<String>, roles: CollabRoles) -> Self {
+        let CollabRoles { pilot, implementer } = roles;
         Self {
             id: id.into(),
             phase: Phase::PlanParallelDrafts,
-            current_owner: Agent::Claude,
+            // The pilot drafts first at `PlanParallelDrafts`, so ownership
+            // starts with the pilot. Contrast `new_global_review`, a
+            // different entry point that seeds `counterpart(pilot)` because
+            // it starts the *copilot* at `CodeReviewFixGlobalPending`.
+            current_owner: pilot,
             claude_draft_hash: None,
             codex_draft_hash: None,
             canonical_plan_hash: None,
@@ -262,4 +279,43 @@ pub fn tasks_count_from_list(raw: Option<&str>) -> Option<u32> {
     let value: serde_json::Value = serde_json::from_str(raw).ok()?;
     let tasks = value.get("tasks")?.as_array()?;
     u32::try_from(tasks.len()).ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // `new_with_roles` is exercised end-to-end by the `collab_start` /
+    // `create_session` integration tests in `mcp_protocol.rs`, but those
+    // never inspect a freshly-constructed `CollabSession` directly — by the
+    // time they observe `current_owner` it has round-tripped through the DB
+    // INSERT in `queue::create_session`. Pin the in-memory constructor's
+    // seeding behavior directly here so a regression in `new_with_roles`
+    // itself (independent of the INSERT) is caught by a fast unit test
+    // rather than only by the slower DB-backed path.
+    #[test]
+    fn new_with_roles_seeds_current_owner_from_pilot() {
+        assert_eq!(
+            CollabSession::new_with_roles(
+                "s",
+                CollabRoles {
+                    pilot: Agent::Codex,
+                    implementer: Agent::Claude,
+                }
+            )
+            .current_owner,
+            Agent::Codex
+        );
+        assert_eq!(
+            CollabSession::new_with_roles(
+                "s",
+                CollabRoles {
+                    pilot: Agent::Claude,
+                    implementer: Agent::Codex,
+                }
+            )
+            .current_owner,
+            Agent::Claude
+        );
+    }
 }

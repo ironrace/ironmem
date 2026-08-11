@@ -151,6 +151,58 @@ pub fn sanitize_harness(value: &str) -> String {
     }
 }
 
+/// Unicode `Cf` (format) characters that render as nothing but change how the
+/// surrounding text is displayed — zero-width joiners, bidi embedding/override
+/// controls, bidi isolates, and the zero-width no-break space / BOM. Neither
+/// `char::is_control` (`Cc` only) nor `char::is_whitespace` (`White_Space`
+/// only) matches any of them, and they are what let untrusted text visually
+/// reorder or hide the rest of a line in a terminal, a log viewer, or a
+/// dashboard (Trojan-Source-style spoofing) even after control characters and
+/// whitespace have been collapsed.
+pub fn is_forgeable_invisible(ch: char) -> bool {
+    matches!(ch,
+        // Zero-width space/non-joiner/joiner and the bidi marks.
+        '\u{200B}'..='\u{200F}'
+        // Bidi embedding/override controls (LRE, RLE, PDF, LRO, RLO).
+        | '\u{202A}'..='\u{202E}'
+        // Word joiner, invisible operators, and the bidi isolates.
+        | '\u{2060}'..='\u{2069}'
+        // Zero-width no-break space / BOM.
+        | '\u{FEFF}'
+    )
+}
+
+/// Collapse runs of whitespace and `Cc` control characters — plus, when
+/// `strip_invisible` is set, the `Cf` characters matched by
+/// [`is_forgeable_invisible`] — into a single space. Leading/trailing
+/// `White_Space` is trimmed before the scan; a run of collapsed characters at
+/// either end still leaves a single space, which callers that need a fully
+/// trimmed result strip themselves (as content sanitizers do) or accept (as
+/// error-message formatters do, before their own final trim).
+///
+/// Shared by every site that neutralizes hostile or malformed text before it
+/// reaches a log line, error message, or model-visible excerpt — each caller
+/// layers its own truncation and fence-handling on top of this collapse.
+pub fn collapse_whitespace_and_control(value: &str, strip_invisible: bool) -> String {
+    let mut out = String::with_capacity(value.len());
+    let mut prev_space = false;
+
+    for ch in value.trim().chars() {
+        if ch.is_whitespace() || ch.is_control() || (strip_invisible && is_forgeable_invisible(ch))
+        {
+            if !prev_space {
+                out.push(' ');
+                prev_space = true;
+            }
+        } else {
+            out.push(ch);
+            prev_space = false;
+        }
+    }
+
+    out
+}
+
 /// Sanitize a session ID to prevent path traversal. Bounded to 128 chars so an
 /// attacker-controlled `sessionId` (e.g. from MCP `initialize`) cannot become an
 /// unbounded primary key in `session_summary` / `token_usage` / `occupancy_samples`.
@@ -298,5 +350,30 @@ mod tests {
     fn sanitize_harness_returns_unknown_for_empty_result() {
         assert_eq!(sanitize_harness(""), "unknown");
         assert_eq!(sanitize_harness(";;;"), "unknown");
+    }
+
+    #[test]
+    fn collapse_whitespace_and_control_collapses_runs_to_single_space() {
+        let out = collapse_whitespace_and_control("  line one\nline\ttwo\r\nthree  ", false);
+        assert_eq!(out, "line one line two three");
+        assert!(!out.contains('\n') && !out.contains('\t') && !out.contains('\r'));
+    }
+
+    #[test]
+    fn collapse_whitespace_and_control_leaves_forgeable_invisible_when_not_stripping() {
+        let out = collapse_whitespace_and_control("a\u{200B}b", false);
+        assert!(
+            out.contains('\u{200B}'),
+            "expected zero-width space to survive when strip_invisible is false: {out:?}"
+        );
+    }
+
+    #[test]
+    fn collapse_whitespace_and_control_strips_forgeable_invisible_when_requested() {
+        let out = collapse_whitespace_and_control("a\u{200B}\u{202E}b", true);
+        assert!(
+            !out.chars().any(is_forgeable_invisible),
+            "invisible/bidi character survived strip_invisible=true: {out:?}"
+        );
     }
 }

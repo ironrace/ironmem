@@ -50,10 +50,9 @@ pub(super) fn ensure_actor_generation_current(
             ));
         }
         let claimed = claim_handoff_token(conn, session_id, agent, token)?;
-        // The cache is advisory; the DB is authoritative. If the enclosing
-        // transaction rolls back after this claim, the process cache may be one
-        // generation ahead of the DB. The guard treats that as a (fail-safe)
-        // stale condition on subsequent calls rather than silently accepting it.
+        // The cache is advisory; the DB is authoritative. A successful claim
+        // normally commits with the enclosing transaction, so retain the new
+        // generation for subsequent tokenless calls.
         app.set_cached_generation(session_id, agent, claimed);
         return Ok(());
     }
@@ -64,11 +63,34 @@ pub(super) fn ensure_actor_generation_current(
         if cached == db_active {
             return Ok(());
         }
-        return Err(MemoryError::Validation(format!(
-            "stale collab generation for {}: local={cached} current={db_active}; \
-             obtain a session_handoff token in a fresh process",
-            agent.as_str()
-        )));
+        if cached > db_active {
+            // A token claim writes this cache (below) from inside the caller's
+            // transaction, before that transaction is known to commit. If it
+            // later rolls back — as it does whenever a post-claim check such as
+            // `ensure_caller_is_current_pilot` refuses the call — the DB
+            // correctly stays at the prior generation while this advisory cache
+            // is one step ahead.
+            //
+            // DROP the entry rather than rebinding it to `db_active`. Rebinding
+            // would admit this process at the *incumbent's* generation, which it
+            // was never granted and which the rolled-back claim did not evict:
+            // the incumbent still satisfies `cached == db_active`, so both
+            // processes would pass this guard and act as the same agent at once
+            // — exactly the split-brain the lease exists to prevent. Dropping
+            // the entry restores the pre-claim answer from the authoritative
+            // rules below: bind at generation 0 on a never-handed-off session,
+            // and otherwise demand a token. The rolled-back claim leaves the
+            // handoff token pending and re-claimable, so re-presenting it is
+            // both the documented and the correct recovery — and it advances the
+            // DB generation, which does evict the incumbent.
+            app.clear_cached_generation(session_id, agent);
+        } else {
+            return Err(MemoryError::Validation(format!(
+                "stale collab generation for {}: local={cached} current={db_active}; \
+                 obtain a session_handoff token in a fresh process",
+                agent.as_str()
+            )));
+        }
     }
     if db_active == 0 {
         app.set_cached_generation(session_id, agent, 0);
@@ -363,7 +385,7 @@ pub(super) fn handle_session_handoff(app: &App, args: &Value) -> Result<Value, M
 mod tests {
     use super::*;
     use crate::collab::queue::{create_session, SessionRecord};
-    use crate::collab::{issue_or_reuse_handoff, Agent, Phase};
+    use crate::collab::{issue_or_reuse_handoff, Agent, CollabRoles, Phase};
     use std::sync::Arc;
 
     fn test_app_with_db_path(
@@ -445,8 +467,10 @@ mod tests {
                     "/repo",
                     "main",
                     Some("task"),
-                    Agent::Claude,
-                    Agent::Claude,
+                    CollabRoles {
+                        pilot: Agent::Claude,
+                        implementer: Agent::Claude,
+                    },
                 )
             })
             .unwrap();
@@ -470,8 +494,10 @@ mod tests {
                     "/repo",
                     "main",
                     Some("t"),
-                    Agent::Claude,
-                    Agent::Claude,
+                    CollabRoles {
+                        pilot: Agent::Claude,
+                        implementer: Agent::Claude,
+                    },
                 )
             })
             .unwrap();
@@ -509,8 +535,10 @@ mod tests {
                     "/repo",
                     "main",
                     Some("t"),
-                    Agent::Claude,
-                    Agent::Claude,
+                    CollabRoles {
+                        pilot: Agent::Claude,
+                        implementer: Agent::Claude,
+                    },
                 )
             })
             .unwrap();
@@ -558,6 +586,97 @@ mod tests {
             err.to_string().contains("stale collab generation"),
             "expected stale collab generation error, got: {err}"
         );
+    }
+
+    /// A token claim whose enclosing transaction rolls back must not upgrade
+    /// the claiming process. The claim writes the advisory cache before the
+    /// transaction is known to commit, so the cache is left one generation
+    /// ahead of the DB; the guard must DROP that entry rather than rebind it to
+    /// the DB value.
+    ///
+    /// The distinction is only observable when `db_active > 0`, which is
+    /// precisely the case the sibling integration test
+    /// (`refused_token_role_mutation_does_not_poison_tokenless_generation_cache`,
+    /// `tests/mcp_protocol.rs`) cannot see: at generation 0 every process is
+    /// admitted anyway. Here the incumbent holds generation 1, so rebinding
+    /// would silently admit a second live actor for the same agent. Deleting
+    /// `clear_cached_generation` (or restoring the rebind) makes the tokenless
+    /// call below succeed and fails this test.
+    #[test]
+    fn rolled_back_claim_does_not_admit_claimant_at_incumbent_generation() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("mem.sqlite3");
+
+        let origin = test_app_with_db_path(db_path.clone(), dir.path());
+        let incumbent = test_app_with_db_path(db_path.clone(), dir.path());
+        let claimant = test_app_with_db_path(db_path, dir.path());
+
+        let sid = seed_active_session(&origin);
+
+        // The incumbent claims generation 1 and is the live actor.
+        let first = origin
+            .db
+            .with_transaction(|tx| issue_or_reuse_handoff(tx, &sid, Agent::Claude))
+            .unwrap()
+            .token;
+        incumbent
+            .db
+            .with_transaction(|tx| {
+                ensure_actor_generation_current(&incumbent, tx, &sid, Agent::Claude, Some(&first))
+            })
+            .unwrap();
+        assert_eq!(
+            incumbent.cached_generation(&sid, Agent::Claude),
+            Some(1),
+            "incumbent must hold generation 1"
+        );
+
+        // A second handoff is minted for generation 2 but its claim is refused
+        // *after* `claim_handoff_token` has already run — the shape produced by
+        // every post-claim check in `ensure_caller_is_current_pilot`.
+        let second = incumbent
+            .db
+            .with_transaction(|tx| issue_or_reuse_handoff(tx, &sid, Agent::Claude))
+            .unwrap()
+            .token;
+        let refused = claimant.db.with_transaction(|tx| {
+            ensure_actor_generation_current(&claimant, tx, &sid, Agent::Claude, Some(&second))?;
+            Err::<(), _>(MemoryError::Validation(
+                "simulated post-claim refusal".into(),
+            ))
+        });
+        assert!(refused.is_err(), "the post-claim check must refuse");
+        assert_eq!(
+            claimant.cached_generation(&sid, Agent::Claude),
+            Some(2),
+            "the rolled-back claim leaves the advisory cache ahead of the DB"
+        );
+
+        // The claimant's next tokenless call must still be refused: it never
+        // held generation 1, and the rollback did not evict the incumbent.
+        let err = claimant
+            .db
+            .with_connection(|conn| {
+                ensure_actor_generation_current(&claimant, conn, &sid, Agent::Claude, None)
+            })
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("handed off"),
+            "expected the 'handed off, present a token' refusal, got: {err}"
+        );
+        assert_eq!(
+            claimant.cached_generation(&sid, Agent::Claude),
+            None,
+            "the poisoned entry must be dropped, not rebound to the DB value"
+        );
+
+        // The incumbent keeps the lease.
+        incumbent
+            .db
+            .with_connection(|conn| {
+                ensure_actor_generation_current(&incumbent, conn, &sid, Agent::Claude, None)
+            })
+            .unwrap();
     }
 
     #[test]
@@ -1005,8 +1124,10 @@ gates: passed\n";
                         "/repo",
                         "main",
                         Some("t"),
-                        Agent::Claude,
-                        Agent::Claude,
+                        CollabRoles {
+                            pilot: Agent::Claude,
+                            implementer: Agent::Claude,
+                        },
                     )
                 })
                 .unwrap();

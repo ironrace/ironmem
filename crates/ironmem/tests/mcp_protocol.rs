@@ -3,6 +3,8 @@
 //! These tests call `dispatch` directly with an in-memory App (noop embedder,
 //! no ONNX model required) and assert on the JSON-RPC response shape.
 
+use ironmem::collab::Agent;
+use ironmem::config::{Config, EmbedMode, McpAccessMode};
 use ironmem::mcp::app::App;
 use ironmem::mcp::protocol::JsonRpcRequest;
 use ironmem::mcp::server::dispatch;
@@ -10,9 +12,12 @@ use serde_json::json;
 use sha2::{Digest, Sha256};
 use std::collections::HashSet;
 use std::ffi::OsString;
+use std::io::{BufRead, BufReader, Read, Write};
+use std::net::TcpStream;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Child, Command, Stdio};
 use std::sync::{Mutex, MutexGuard};
+use std::time::{Duration, Instant};
 
 static COMPACT_RESPONSES_ENV_LOCK: Mutex<()> = Mutex::new(());
 
@@ -2406,6 +2411,11 @@ fn collab_start_accepts_pilot_codex_and_defaults_implementer_to_pilot() {
     // `collab_status` as pilot=codex AND implementer=codex — implementer's
     // default follows the resolved pilot, not the historical hardcoded
     // `claude`.
+    //
+    // Also pins the Task 4 creation-seed fix: `current_owner` used to be
+    // hardcoded to `Agent::Claude` at session creation regardless of
+    // `pilot`. The pilot drafts first at `PlanParallelDrafts`, so a
+    // `pilot=codex` session must be born owned by codex, not claude.
     let app = App::open_for_test().unwrap();
     let started = call_tool(
         &app,
@@ -2424,6 +2434,7 @@ fn collab_start_accepts_pilot_codex_and_defaults_implementer_to_pilot() {
     let status = call_tool(&app, "collab_status", json!({ "session_id": session_id }));
     assert_eq!(status["pilot"], "codex");
     assert_eq!(status["implementer"], "codex");
+    assert_eq!(status["current_owner"], "codex");
 }
 
 #[test]
@@ -2431,6 +2442,17 @@ fn collab_pilot_and_implementer_remain_independent_in_the_reverse_mixed_case() {
     // The inverse of the historical `pilot=claude, implementer=codex` route:
     // pilot owns planning and the two post-implementation audit turns, while
     // the independently selected implementer owns only the implementation.
+    //
+    // Also pins the Task 4 creation-seed fix (phase-aware invariant):
+    // `current_owner` is seeded to the resolved `pilot` at birth (the pilot
+    // drafts first), but that must NOT make ownership sticky to the pilot
+    // all the way through planning — a split-role session (`pilot=codex`,
+    // `implementer=claude`) starts codex-owned but must land back on
+    // `claude`, the independent implementer, once it reaches
+    // `CodeImplementPending`. This pins the state machine's existing
+    // `next.current_owner = session.implementer` transition
+    // (`state_machine/mod.rs`, the `PlanLocked` -> `SubmitTaskList` arm)
+    // against a future regression introduced by the creation-seed change.
     let app = App::open_for_test().unwrap();
     let started = call_tool(
         &app,
@@ -2446,6 +2468,11 @@ fn collab_pilot_and_implementer_remain_independent_in_the_reverse_mixed_case() {
     let session_id = started["session_id"].as_str().unwrap().to_string();
     assert_eq!(started["pilot"], "codex");
     assert_eq!(started["implementer"], "claude");
+
+    // Creation-seed: current_owner starts at the pilot (codex drafts first),
+    // before any drafting has happened.
+    let status = call_tool(&app, "collab_status", json!({ "session_id": &session_id }));
+    assert_eq!(status["current_owner"], "codex");
 
     for (sender, content) in [("claude", "cdraft"), ("codex", "xdraft")] {
         call_tool(
@@ -2609,6 +2636,231 @@ fn collab_start_rejects_invalid_pilot_and_creates_no_session_row() {
 }
 
 #[test]
+fn collab_start_pilot_absent_defaults_to_claude() {
+    // Absent `pilot` key should default to `Agent::Claude`.
+    let app = App::open_for_test().unwrap();
+    let started = call_tool(
+        &app,
+        "collab_start",
+        json!({
+            "repo_path": "/repo",
+            "branch": "main",
+            "initiator": "claude"
+        }),
+    );
+    assert_eq!(started["pilot"], "claude");
+}
+
+#[test]
+fn collab_start_pilot_valid_string_is_accepted() {
+    // Valid string `pilot` value should be accepted and used.
+    let app = App::open_for_test().unwrap();
+    let started = call_tool(
+        &app,
+        "collab_start",
+        json!({
+            "repo_path": "/repo",
+            "branch": "main",
+            "initiator": "claude",
+            "pilot": "codex"
+        }),
+    );
+    assert_eq!(started["pilot"], "codex");
+}
+
+#[test]
+fn collab_start_pilot_number_is_rejected() {
+    // Non-string `pilot` value (number) should be rejected.
+    let app = App::open_for_test().unwrap();
+    let err = call_tool_expect_error(
+        &app,
+        "collab_start",
+        json!({
+            "repo_path": "/repo",
+            "branch": "main",
+            "initiator": "claude",
+            "pilot": 123
+        }),
+    );
+    assert!(
+        err.to_lowercase().contains("pilot"),
+        "expected error to name 'pilot', got: {err}"
+    );
+    assert!(
+        err.to_lowercase().contains("string"),
+        "expected error to mention 'string', got: {err}"
+    );
+}
+
+#[test]
+fn collab_start_pilot_boolean_is_rejected() {
+    // Non-string `pilot` value (boolean) should be rejected.
+    let app = App::open_for_test().unwrap();
+    let err = call_tool_expect_error(
+        &app,
+        "collab_start",
+        json!({
+            "repo_path": "/repo",
+            "branch": "main",
+            "initiator": "claude",
+            "pilot": true
+        }),
+    );
+    assert!(
+        err.to_lowercase().contains("pilot"),
+        "expected error to name 'pilot', got: {err}"
+    );
+    assert!(
+        err.to_lowercase().contains("string"),
+        "expected error to mention 'string', got: {err}"
+    );
+}
+
+#[test]
+fn collab_start_pilot_explicit_null_is_rejected() {
+    // Explicit `null` for `pilot` should be rejected (not treated as absent).
+    let app = App::open_for_test().unwrap();
+    let err = call_tool_expect_error(
+        &app,
+        "collab_start",
+        json!({
+            "repo_path": "/repo",
+            "branch": "main",
+            "initiator": "claude",
+            "pilot": null
+        }),
+    );
+    assert!(
+        err.to_lowercase().contains("pilot"),
+        "expected error to name 'pilot', got: {err}"
+    );
+    assert!(
+        err.to_lowercase().contains("string"),
+        "expected error to mention 'string', got: {err}"
+    );
+}
+
+#[test]
+fn collab_start_implementer_absent_defaults_to_pilot() {
+    // Absent `implementer` key should default to the resolved `pilot`.
+    let app = App::open_for_test().unwrap();
+    let started = call_tool(
+        &app,
+        "collab_start",
+        json!({
+            "repo_path": "/repo",
+            "branch": "main",
+            "initiator": "claude",
+            "pilot": "codex"
+        }),
+    );
+    assert_eq!(started["pilot"], "codex");
+    assert_eq!(started["implementer"], "codex");
+
+    // Also test with absent pilot (so both default).
+    let started2 = call_tool(
+        &app,
+        "collab_start",
+        json!({
+            "repo_path": "/repo2",
+            "branch": "main",
+            "initiator": "claude"
+        }),
+    );
+    assert_eq!(started2["pilot"], "claude");
+    assert_eq!(started2["implementer"], "claude");
+}
+
+#[test]
+fn collab_start_implementer_valid_string_is_accepted() {
+    // Valid string `implementer` value should be accepted and used.
+    let app = App::open_for_test().unwrap();
+    let started = call_tool(
+        &app,
+        "collab_start",
+        json!({
+            "repo_path": "/repo",
+            "branch": "main",
+            "initiator": "claude",
+            "implementer": "codex"
+        }),
+    );
+    assert_eq!(started["implementer"], "codex");
+}
+
+#[test]
+fn collab_start_implementer_number_is_rejected() {
+    // Non-string `implementer` value (number) should be rejected.
+    let app = App::open_for_test().unwrap();
+    let err = call_tool_expect_error(
+        &app,
+        "collab_start",
+        json!({
+            "repo_path": "/repo",
+            "branch": "main",
+            "initiator": "claude",
+            "implementer": 456
+        }),
+    );
+    assert!(
+        err.to_lowercase().contains("implementer"),
+        "expected error to name 'implementer', got: {err}"
+    );
+    assert!(
+        err.to_lowercase().contains("string"),
+        "expected error to mention 'string', got: {err}"
+    );
+}
+
+#[test]
+fn collab_start_implementer_boolean_is_rejected() {
+    // Non-string `implementer` value (boolean) should be rejected.
+    let app = App::open_for_test().unwrap();
+    let err = call_tool_expect_error(
+        &app,
+        "collab_start",
+        json!({
+            "repo_path": "/repo",
+            "branch": "main",
+            "initiator": "claude",
+            "implementer": false
+        }),
+    );
+    assert!(
+        err.to_lowercase().contains("implementer"),
+        "expected error to name 'implementer', got: {err}"
+    );
+    assert!(
+        err.to_lowercase().contains("string"),
+        "expected error to mention 'string', got: {err}"
+    );
+}
+
+#[test]
+fn collab_start_implementer_explicit_null_is_rejected() {
+    // Explicit `null` for `implementer` should be rejected (not treated as absent).
+    let app = App::open_for_test().unwrap();
+    let err = call_tool_expect_error(
+        &app,
+        "collab_start",
+        json!({
+            "repo_path": "/repo",
+            "branch": "main",
+            "initiator": "claude",
+            "implementer": null
+        }),
+    );
+    assert!(
+        err.to_lowercase().contains("implementer"),
+        "expected error to name 'implementer', got: {err}"
+    );
+    assert!(
+        err.to_lowercase().contains("string"),
+        "expected error to mention 'string', got: {err}"
+    );
+}
+
+#[test]
 fn collab_set_implementer_before_task_list_routes_batch_owner() {
     let app = App::open_for_test().unwrap();
     let session_id = drive_to_plan_locked(&app, "fp");
@@ -2728,6 +2980,126 @@ fn collab_set_implementer_rejects_after_batch_implementation() {
         err.contains("before implementation is complete"),
         "expected post-implementation rejection, got: {err}"
     );
+}
+
+/// Number of `wal_log` rows for the given `operation` whose `params` blob
+/// mentions this `session_id`. Rejection tests use this to prove a refused
+/// call wrote nothing to the audit trail, not merely that it returned an
+/// error.
+fn wal_row_count(app: &App, session_id: &str, operation: &str) -> i64 {
+    let pattern = format!("%\"session_id\":\"{session_id}\"%");
+    app.db
+        .with_transaction(|tx| {
+            Ok(tx.query_row(
+                "SELECT COUNT(*) FROM wal_log WHERE operation = ?1 AND params LIKE ?2",
+                rusqlite::params![operation, pattern],
+                |row| row.get(0),
+            )?)
+        })
+        .unwrap()
+}
+
+/// The most recent `wal_log` row for `operation`, as `(params, result)` JSON
+/// values. Companion to `wal_row_count`: that helper proves a row exists;
+/// this one proves what it actually says. Mirrors `last_approve_wal`, the
+/// same pattern `collab_session.rs`'s own unit tests use to assert
+/// `collab_approve`'s WAL payload — reused here (rather than reopening a
+/// fresh connection to `app.config.db_path`, as `last_approve_wal` does) so
+/// it also works against `App::open_for_test`'s in-memory database, which a
+/// second connection to the same path would not see.
+fn last_wal_row(app: &App, operation: &str) -> (serde_json::Value, serde_json::Value) {
+    app.db
+        .with_transaction(|tx| {
+            let (params, result): (String, String) = tx.query_row(
+                "SELECT params, result FROM wal_log WHERE operation = ?1 ORDER BY id DESC LIMIT 1",
+                rusqlite::params![operation],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )?;
+            Ok((
+                serde_json::from_str(&params).unwrap(),
+                serde_json::from_str(&result).unwrap(),
+            ))
+        })
+        .unwrap()
+}
+
+#[test]
+fn collab_set_implementer_rejects_non_pilot_caller() {
+    // The pilot defaults to `claude` (see `handle_collab_start`); `codex` is
+    // therefore not the pilot here and must be refused, mirroring
+    // `collab_set_pilot`'s permitted-caller rule.
+    let app = App::open_for_test().unwrap();
+    let session_id = drive_to_plan_locked(&app, "fp");
+
+    let before = call_tool(&app, "collab_status", json!({ "session_id": &session_id }));
+    let wal_before = wal_row_count(&app, &session_id, "collab_set_implementer");
+
+    let err = call_tool_expect_error(
+        &app,
+        "collab_set_implementer",
+        json!({
+            "session_id": &session_id,
+            "agent": "codex",
+            "implementer": "codex"
+        }),
+    );
+    assert!(
+        err.contains("codex") && err.contains("pilot 'claude'"),
+        "expected a rejection naming the caller and the current pilot, got: {err}"
+    );
+
+    let after = call_tool(&app, "collab_status", json!({ "session_id": &session_id }));
+    assert_eq!(
+        after["implementer"], before["implementer"],
+        "a refused collab_set_implementer must leave implementer unchanged"
+    );
+    assert_eq!(
+        after["current_owner"], before["current_owner"],
+        "a refused collab_set_implementer must leave current_owner unchanged"
+    );
+    assert_eq!(
+        after["updated_at"], before["updated_at"],
+        "a refused collab_set_implementer must not touch updated_at"
+    );
+    assert_eq!(
+        wal_row_count(&app, &session_id, "collab_set_implementer"),
+        wal_before,
+        "a refused collab_set_implementer must write no WAL row"
+    );
+}
+
+#[test]
+fn collab_set_implementer_allows_current_pilot_caller_pre_lock() {
+    // The permitted-caller rule is role-generic, not Claude-flavoured: under
+    // `pilot=codex` it is Codex — and only Codex — who may reassign the
+    // implementer, here in the earliest phase the gate allows
+    // (`PlanParallelDrafts`, before any task list exists).
+    let app = App::open_for_test().unwrap();
+    let started = call_tool(
+        &app,
+        "collab_start",
+        json!({
+            "repo_path": "/repo",
+            "branch": "feat/set-implementer-pilot-caller",
+            "initiator": "claude",
+            "pilot": "codex"
+        }),
+    );
+    let session_id = started["session_id"].as_str().unwrap().to_string();
+    let status = call_tool(&app, "collab_status", json!({ "session_id": &session_id }));
+    assert_eq!(status["phase"], "PlanParallelDrafts");
+
+    let updated = call_tool(
+        &app,
+        "collab_set_implementer",
+        json!({
+            "session_id": &session_id,
+            "agent": "codex",
+            "implementer": "claude"
+        }),
+    );
+    assert_eq!(updated["implementer"], "claude");
+    assert_eq!(updated["phase"], "PlanParallelDrafts");
 }
 
 /// Start a fresh planning session with an explicit `pilot` and return its id.
@@ -2995,6 +3367,517 @@ fn collab_set_pilot_refuses_copilot_self_promotion_under_pilot_codex() {
         pilot_and_owner(&app, &session_id),
         before,
         "a refused collab_set_pilot must leave pilot and current_owner unchanged"
+    );
+}
+
+/// Re-read the persisted session row and return `(pilot, implementer,
+/// current_owner)`. Used by the Task 9 handoff-staleness tests below to prove
+/// a refused role mutation left all three role fields untouched, not merely
+/// the two `pilot_and_owner` checks — `collab_set_implementer` is one of the
+/// tools under test below, so its own target field must be pinned too.
+fn full_roles(app: &App, session_id: &str) -> (String, String, String) {
+    let status = call_tool(app, "collab_status", json!({ "session_id": session_id }));
+    (
+        status["pilot"].as_str().unwrap().to_string(),
+        status["implementer"].as_str().unwrap().to_string(),
+        status["current_owner"].as_str().unwrap().to_string(),
+    )
+}
+
+// ── Task 9 audit finding ────────────────────────────────────────────────────
+//
+// AUDIT FINDING (Task 9: "audit reassignment against handoff staleness"):
+// pilot/implementer reassignment (`collab_set_pilot`, `collab_set_implementer`)
+// does NOT advance any actor's generation and does NOT invalidate any
+// outstanding `session_handoff` token. `collab_actor_generations` (the
+// generation/token lease table) is keyed by `(session_id, agent)` and models
+// process succession for a given agent identity — "has a fresh process
+// claimed the right to act as this agent" — which is an orthogonal concern
+// to `pilot`/`implementer`/`current_owner`, which model *role* state. Both
+// `handle_collab_set_pilot` and `handle_collab_set_implementer` route through
+// the shared `ensure_caller_is_current_pilot` preamble
+// (`crates/ironmem/src/mcp/tools/collab_session.rs`), which does touch
+// `collab_actor_generations` on every call via `ensure_actor_generation_current`
+// (`crates/ironmem/src/mcp/tools/handoff.rs`) — it always reads the caller's
+// row, and writes to it when the request carries a `handoff_token`. What it
+// does NOT do is couple that read/write to the role-reassignment logic itself:
+// whether `pilot`/`implementer`/`current_owner` gets changed by the call has
+// no bearing on whether a generation advances, and vice versa — the two are
+// driven by orthogonal inputs (the `handoff_token` field vs. the `pilot`/
+// `implementer` field). So a token minted for an agent before a reassignment
+// remains just as claimable after one. There is no such thing, in the current
+// implementation, as "a handoff token invalidated specifically by a role
+// reassignment."
+//
+// The task's acceptance criteria ("attempt a role mutation using the
+// pre-reassignment handoff token — refused, zero mutation") is nonetheless
+// satisfied *in practice* — but via the pre-existing "caller must equal the
+// current pilot" identity check in `ensure_caller_is_current_pilot`
+// (`crates/ironmem/src/mcp/tools/collab_session.rs`), not via any
+// staleness/generation mechanism coupled to role state. The two tests below
+// pin both halves of this finding: (1) the token guard genuinely does reject
+// reuse of an already-*spent* token, on its own, independent of role state;
+// and (2) the literal "present a still-valid, never-spent, pre-reassignment
+// token after the pilot has moved on" scenario is refused by the *caller
+// identity* check, not by any token-staleness check — because no such check
+// exists.
+//
+// The generation guard's transaction/retry behavior is covered separately by
+// `refused_token_role_mutation_does_not_poison_tokenless_generation_cache`:
+// if a post-claim validation rolls back the DB lease, the guard drops the
+// advisory cache entry the claim wrote, so the next tokenless action is
+// answered by the authoritative DB state instead of a generation that never
+// committed. That this is a *drop* and not a rebind to `db_active` matters
+// only once the DB is past generation 0, which is pinned by the unit test
+// `rolled_back_claim_does_not_admit_claimant_at_incumbent_generation`
+// (`crates/ironmem/src/mcp/tools/handoff.rs`).
+
+/// Task 9, scenario 1 (genuine spent-token reuse): a `session_handoff` token
+/// is a one-time credential. Mint T1 for claude, spend it on a *permitted*
+/// same-agent no-op `collab_set_pilot` call (claude -> claude — still legal
+/// in `PlanParallelDrafts` with no draft landed), then reuse the same T1 for
+/// a second call **by the same agent** (claude). Reusing it as the same
+/// caller isolates the token guard: the pilot-identity check would pass
+/// (claude is still pilot), so only `claim_handoff_token` finding the token
+/// already spent can be the source of the refusal.
+#[test]
+fn collab_set_pilot_spent_handoff_token_reuse_by_same_agent_is_refused_with_no_mutation() {
+    let app = App::open_for_test().unwrap();
+    let session_id = start_session_with_pilot(&app, "feat/spent-handoff-reuse", "claude");
+
+    // Mint a handoff token for claude — this is T1.
+    let issued = call_tool(
+        &app,
+        "session_handoff",
+        json!({ "session_id": &session_id, "agent": "claude" }),
+    );
+    let token = issued["handoff_token"].as_str().unwrap().to_string();
+
+    // Spend T1 on a permitted same-agent no-op reassignment (claude -> claude).
+    // `handle_collab_set_pilot`'s Rule 3 UPDATE is unconditional even when
+    // `previous == pilot`, so this is a legal, real claim of T1.
+    let spent = call_tool(
+        &app,
+        "collab_set_pilot",
+        json!({
+            "session_id": &session_id,
+            "agent": "claude",
+            "pilot": "claude",
+            "handoff_token": &token
+        }),
+    );
+    assert_eq!(spent["pilot"], "claude");
+    assert_eq!(spent["current_owner"], "claude");
+
+    let before = full_roles(&app, &session_id);
+    assert_eq!(
+        before,
+        (
+            "claude".to_string(),
+            "claude".to_string(),
+            "claude".to_string()
+        ),
+        "sanity: claude remains pilot/implementer/owner after the no-op spend"
+    );
+
+    // Reuse the SAME (now-spent) token T1 for a second call, still as
+    // claude — the current pilot. If the token guard were missing, this call
+    // would otherwise be fully authorized (claude == current pilot) and
+    // would succeed; only the spent-token guard can refuse it.
+    let err = call_tool_expect_error(
+        &app,
+        "collab_set_implementer",
+        json!({
+            "session_id": &session_id,
+            "agent": "claude",
+            "implementer": "codex",
+            "handoff_token": &token
+        }),
+    );
+    assert_eq!(
+        err, "handoff_token already claimed",
+        "expected the exact spent-token refusal from claim_handoff_token, got: {err}"
+    );
+
+    assert_eq!(
+        full_roles(&app, &session_id),
+        before,
+        "a refused spent-token role mutation must leave pilot, implementer, \
+         and current_owner unchanged"
+    );
+}
+
+/// Task 9, scenario 2 (the literal acceptance-criteria scenario): mint T1 for
+/// claude and leave it **unspent**. Reassign the pilot away from claude
+/// (claude -> codex) through a *separate, tokenless* `collab_set_pilot` call
+/// — legal because claude's actual generation is still 0 (issuing a token
+/// never advances it; only claiming one does). Then present the
+/// still-valid, never-claimed T1 as claude in a subsequent role-mutation
+/// call. `claim_handoff_token` actually *succeeds* here (T1 is genuinely
+/// still pending and unclaimed for claude) — the refusal comes entirely from
+/// the downstream "caller is not the current pilot" check, since claude is
+/// no longer pilot. This is the mechanism the audit finding above documents:
+/// no staleness/generation check fires here, only the pre-existing
+/// caller-identity check. (The successful claim inside this failed call's
+/// transaction rolls back along with everything else, per
+/// `Database::with_transaction`'s "no commit on Err" behavior — so this
+/// assertion of zero role mutation holds regardless.)
+#[test]
+fn collab_set_pilot_unspent_pre_reassignment_token_is_refused_by_caller_identity_not_token_guard() {
+    let app = App::open_for_test().unwrap();
+    let session_id = start_session_with_pilot(&app, "feat/pre-reassignment-token", "claude");
+
+    // Mint a handoff token for claude — this is T1 — and leave it unspent.
+    let issued = call_tool(
+        &app,
+        "session_handoff",
+        json!({ "session_id": &session_id, "agent": "claude" }),
+    );
+    let token = issued["handoff_token"].as_str().unwrap().to_string();
+
+    // Reassign the pilot away from claude via a SEPARATE, tokenless call.
+    // T1 is untouched by this: the call's shared preamble still reads claude's
+    // row in `collab_actor_generations` (via `ensure_actor_generation_current`,
+    // since no `handoff_token` arg means it takes the read-only validation
+    // path), but the *reassignment logic* itself never advances a generation
+    // or invalidates a token as a side effect of changing `pilot` — that only
+    // happens when a request separately supplies a `handoff_token` to claim.
+    let reassigned = call_tool(
+        &app,
+        "collab_set_pilot",
+        json!({
+            "session_id": &session_id,
+            "agent": "claude",
+            "pilot": "codex"
+        }),
+    );
+    assert_eq!(reassigned["pilot"], "codex");
+    assert_eq!(reassigned["current_owner"], "codex");
+
+    let before = full_roles(&app, &session_id);
+    assert_eq!(
+        before,
+        (
+            "codex".to_string(),
+            "claude".to_string(),
+            "codex".to_string()
+        ),
+        "sanity: the tokenless reassignment above must actually have landed"
+    );
+
+    // Present the still-unspent, pre-reassignment token T1 as claude. Refused
+    // — but by the caller-identity check, not a token error.
+    let err = call_tool_expect_error(
+        &app,
+        "collab_set_implementer",
+        json!({
+            "session_id": &session_id,
+            "agent": "claude",
+            "implementer": "codex",
+            "handoff_token": &token
+        }),
+    );
+    assert_eq!(
+        err,
+        "collab_set_implementer refused: caller 'claude' is not the pilot of this \
+         session; only the current pilot 'codex' may reassign the implementer",
+        "expected the caller-identity refusal (T1 is still valid and claimable, so no \
+         token error can fire here), got: {err}"
+    );
+    assert!(
+        !err.contains("already claimed") && !err.contains("invalid handoff_token"),
+        "this refusal must come from the caller-identity check, not a token error: {err}"
+    );
+
+    assert_eq!(
+        full_roles(&app, &session_id),
+        before,
+        "a refused role mutation must leave pilot, implementer, and current_owner \
+         unchanged, even though claiming T1 briefly succeeded inside the (rolled-back) \
+         transaction"
+    );
+}
+
+/// A token claim happens before the role-authorization check, so a refused
+/// token-bearing role mutation must roll back both the role mutation and the
+/// generation lease. The process-local generation cache must follow that
+/// rollback: a subsequent tokenless action from the same App must still be
+/// accepted at generation 0.
+///
+/// Scoped deliberately to generation 0, where "the process may act" is the
+/// correct answer for *any* process. The guard reaches that answer by dropping
+/// the cache entry the rolled-back claim wrote, not by rebinding it to the DB
+/// value — a distinction this test cannot see and
+/// `rolled_back_claim_does_not_admit_claimant_at_incumbent_generation`
+/// (`crates/ironmem/src/mcp/tools/handoff.rs`) exists to pin.
+#[test]
+fn refused_token_role_mutation_does_not_poison_tokenless_generation_cache() {
+    let app = App::open_for_test().unwrap();
+    let session_id = start_session_with_pilot(&app, "feat/rollback-cache", "claude");
+
+    // Mint a token for claude while claude is the pilot, then move the pilot
+    // away in a separate tokenless call. The token remains valid and unspent.
+    let issued = call_tool(
+        &app,
+        "session_handoff",
+        json!({ "session_id": &session_id, "agent": "claude" }),
+    );
+    let token = issued["handoff_token"]
+        .as_str()
+        .expect("session_handoff must return a token")
+        .to_string();
+    let reassigned = call_tool(
+        &app,
+        "collab_set_pilot",
+        json!({
+            "session_id": &session_id,
+            "agent": "claude",
+            "pilot": "codex"
+        }),
+    );
+    assert_eq!(reassigned["pilot"], "codex");
+
+    // The claim succeeds inside this transaction, but the caller is no
+    // longer the pilot, so the role mutation is rejected and the transaction
+    // rolls back.
+    let err = call_tool_expect_error(
+        &app,
+        "collab_set_implementer",
+        json!({
+            "session_id": &session_id,
+            "agent": "claude",
+            "implementer": "codex",
+            "handoff_token": &token
+        }),
+    );
+    assert!(
+        err.contains("caller 'claude' is not the pilot"),
+        "expected the post-claim caller-identity rejection, got: {err}"
+    );
+
+    let lease = app
+        .db
+        .with_connection(|conn| {
+            conn.query_row(
+                "SELECT generation, pending_handoff_token, pending_handoff_generation \
+                 FROM collab_actor_generations WHERE session_id = ?1 AND agent = 'claude'",
+                rusqlite::params![&session_id],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, Option<String>>(1)?,
+                        row.get::<_, Option<i64>>(2)?,
+                    ))
+                },
+            )
+            .map_err(ironmem::error::MemoryError::from)
+        })
+        .unwrap();
+    assert_eq!(
+        lease.0, 0,
+        "the rolled-back claim must not advance the lease"
+    );
+    assert_eq!(
+        lease.1.as_deref(),
+        Some(token.as_str()),
+        "the rolled-back claim must leave the token pending"
+    );
+    assert_eq!(
+        lease.2,
+        Some(1),
+        "the pending generation must remain claimable after rollback"
+    );
+
+    // Parallel drafts permit either agent. This is a valid tokenless action
+    // from the same App whose cache was touched by the failed claim.
+    let draft = call_tool(
+        &app,
+        "collab_send",
+        json!({
+            "session_id": &session_id,
+            "sender": "claude",
+            "topic": "draft",
+            "content": "claude rollback-cache draft"
+        }),
+    );
+    assert!(draft["message_id"].is_string(), "draft response: {draft}");
+}
+
+/// Task 9: after a permitted `collab_set_pilot` reassignment, turn
+/// acquisition must resolve to exactly one claimable owner — never both
+/// agents believing it is their turn, and never neither. `current_owner` is a
+/// single-valued field and `wait_turn_snapshot`'s `is_my_turn` is a plain
+/// equality against it, so this is a by-construction invariant; this test
+/// pins it through the actual `collab_wait_my_turn` tool for both agents
+/// rather than asserting on the internal snapshot type directly.
+#[test]
+fn collab_set_pilot_reassignment_leaves_exactly_one_claimable_owner() {
+    let app = App::open_for_test().unwrap();
+    let session_id = start_session_with_pilot(&app, "feat/single-claimable-owner", "codex");
+
+    // codex is pilot and current_owner initially; hand the pilot (and, in the
+    // same UPDATE, current_owner) to claude.
+    let reassigned = call_tool(
+        &app,
+        "collab_set_pilot",
+        json!({
+            "session_id": &session_id,
+            "agent": "codex",
+            "pilot": "claude"
+        }),
+    );
+    assert_eq!(reassigned["pilot"], "claude");
+    assert_eq!(reassigned["current_owner"], "claude");
+
+    // The new owner (claude) must resolve its turn immediately.
+    let claude_wait = call_tool(
+        &app,
+        "collab_wait_my_turn",
+        json!({ "session_id": &session_id, "agent": "claude", "timeout_secs": 1 }),
+    );
+    assert_eq!(claude_wait["is_my_turn"], true);
+    assert_eq!(claude_wait["current_owner"], "claude");
+
+    // The demoted agent (codex) must NOT resolve as its turn — it times out
+    // unsettled rather than ever observing `is_my_turn: true`.
+    let codex_wait = call_tool(
+        &app,
+        "collab_wait_my_turn",
+        json!({ "session_id": &session_id, "agent": "codex", "timeout_secs": 1 }),
+    );
+    assert_eq!(
+        codex_wait,
+        json!({ "unchanged": true }),
+        "the demoted agent must never observe is_my_turn: true after reassignment"
+    );
+
+    // Cross-check against collab_status: exactly one of the two agents'
+    // identity matches current_owner.
+    let status = call_tool(&app, "collab_status", json!({ "session_id": &session_id }));
+    let owner = status["current_owner"].as_str().unwrap();
+    let claimable_count = ["claude", "codex"]
+        .iter()
+        .filter(|agent| **agent == owner)
+        .count();
+    assert_eq!(
+        claimable_count, 1,
+        "exactly one agent identity must match current_owner, got owner={owner}"
+    );
+}
+
+#[test]
+fn collab_set_pilot_writes_wal_row_with_operation_session_and_actor() {
+    let app = App::open_for_test().unwrap();
+    let session_id = start_session_with_pilot(&app, "feat/set-pilot-wal-row", "claude");
+
+    let updated = call_tool(
+        &app,
+        "collab_set_pilot",
+        json!({
+            "session_id": &session_id,
+            "agent": "claude",
+            "pilot": "codex"
+        }),
+    );
+    assert_eq!(updated["pilot"], "codex");
+
+    // `last_wal_row` already filters by operation name via its SQL WHERE
+    // clause; the exact-equality assertion below additionally pins the
+    // session id and the acting agent (`agent`, i.e. the actor) inside the
+    // logged payload, plus every other field `handle_collab_set_pilot`
+    // writes.
+    let (params, _result) = last_wal_row(&app, "collab_set_pilot");
+    assert_eq!(
+        params,
+        json!({
+            "session_id": session_id,
+            "agent": "claude",
+            "previous_pilot": "claude",
+            "pilot": "codex",
+            "phase": "PlanParallelDrafts",
+            "previous_owner": "claude",
+            "current_owner": "codex",
+            "changed": true,
+        }),
+        "the collab_set_pilot WAL row must record the operation's session id \
+         and acting agent, matching the payload the handler actually writes"
+    );
+}
+
+#[test]
+fn collab_set_pilot_same_pilot_call_repairs_drifted_current_owner() {
+    // Rule 3 in `handle_collab_set_pilot` moves `current_owner` to the named
+    // `pilot` unconditionally, in the very same UPDATE as the pilot
+    // assignment itself — even when `pilot` names the agent who is already
+    // pilot. This proves the "unconditional" half specifically: manufacture
+    // a session where `current_owner` has drifted away from `pilot` (the
+    // public MCP surface cannot produce this starting from a fresh session;
+    // it is constructed here directly against the DB, the same way the
+    // `set_pilot` test helper in `collab_session.rs`'s own unit tests
+    // rebinds session state for setup), then show a same-pilot call — a
+    // request that does not change `pilot` at all — still repairs it.
+    let app = App::open_for_test().unwrap();
+    let session_id = start_session_with_pilot(&app, "feat/set-pilot-repair-drift", "claude");
+
+    let mut session = app.db.collab_load_session(&session_id).unwrap();
+    assert_eq!(session.pilot, Agent::Claude);
+    session.current_owner = Agent::Codex;
+    app.db.collab_save_session(&session).unwrap();
+    assert_eq!(
+        pilot_and_owner(&app, &session_id),
+        ("claude".to_string(), "codex".to_string()),
+        "setup must produce a genuine drift: pilot and current_owner disagree"
+    );
+
+    let updated = call_tool(
+        &app,
+        "collab_set_pilot",
+        json!({
+            "session_id": &session_id,
+            "agent": "claude",
+            "pilot": "claude"
+        }),
+    );
+    assert_eq!(
+        updated["pilot"], "claude",
+        "pilot did not change — this is the no-op reassignment case"
+    );
+    assert_eq!(
+        updated["current_owner"], "claude",
+        "a same-pilot call must still repair a drifted current_owner"
+    );
+    assert_eq!(
+        pilot_and_owner(&app, &session_id),
+        ("claude".to_string(), "claude".to_string()),
+        "the repair must be persisted, not merely reported"
+    );
+
+    // `changed` is audit metadata with no programmatic consumer — its only
+    // job is telling an auditor reading `wal_log` whether this call actually
+    // mutated state. It is computed as `previous != pilot || previous_owner
+    // != pilot`: the pilot-changed disjunct is already covered by
+    // `collab_set_pilot_writes_wal_row_with_operation_session_and_actor`
+    // above, but the owner-drift-repaired disjunct — a same-pilot call whose
+    // `pilot` field never moves, yet a real mutation (repairing the drifted
+    // `current_owner`) still happened — was untested. A future
+    // "simplification" of that expression down to just `previous != pilot`
+    // would silently start mislabeling this repair as a no-op in the audit
+    // trail, and nothing would catch it. Assert the WAL row genuinely
+    // reflects the drift-then-repair, not just that `changed` happens to be
+    // true for an unrelated reason.
+    let (params, _result) = last_wal_row(&app, "collab_set_pilot");
+    assert_eq!(
+        params["previous_owner"], "codex",
+        "must record the drifted owner this call repaired"
+    );
+    assert_eq!(
+        params["current_owner"], "claude",
+        "must record the repaired owner"
+    );
+    assert_eq!(
+        params["changed"], true,
+        "a same-pilot call that repairs a drifted current_owner is a real \
+         mutation and must be logged as changed: true, not a no-op"
     );
 }
 
@@ -4062,4 +4945,568 @@ fn collab_pilot_codex_end_to_end_mcp_flow_reaches_coding_complete() {
         json!({ "session_id": session_id, "agent": "claude" }),
     );
     assert_eq!(ended["ok"], true);
+}
+
+// ── Task 15: full verification sweep and reversed-role scenario ────────────
+//
+// One end-to-end MCP-level run of the plan's reversed-role scenario
+// (docs/iron/plans/2026-08-10-collab-role-safety.md, Task 15), exercising
+// every role-safety change from Tasks 1-14 together in a single flow rather
+// than in isolation, plus a *live* cross-check against the Task 12 dashboard
+// (`/api/sessions`, served by the real `ironmem dashboard` binary against the
+// same on-disk DB the App writes to) and the Task 13 `collab_wait_my_turn`
+// baseline. The dashboard's `list_sessions`/`CollabSessionSummary` live in a
+// `pub(crate)` module, so a genuine HTTP round trip against the real binary —
+// not a direct function call — is the only way an integration test outside
+// the crate can exercise it; `App::open_for_test`'s in-memory DB can't be
+// reopened by a second connection, so this test uses an on-disk DB instead.
+
+/// Spawn the real `ironmem dashboard` binary against `db_path` on an
+/// ephemeral port and return once its bound address is known. A trimmed
+/// duplicate of `dashboard_server.rs`'s `spawn_dashboard` helper — test
+/// binaries in `tests/` do not share code with each other.
+struct DashboardHandle {
+    child: Child,
+    addr: String,
+}
+
+impl Drop for DashboardHandle {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+fn spawn_dashboard(db_path: &Path) -> DashboardHandle {
+    let mut child = Command::new(env!("CARGO_BIN_EXE_ironmem"))
+        .arg("dashboard")
+        .arg("--db")
+        .arg(db_path)
+        .arg("--port")
+        .arg("0")
+        .arg("--json")
+        .arg("--exit-on-stdin-close")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn dashboard binary for Task 15's live cross-check");
+
+    let stdout = child.stdout.take().expect("dashboard stdout must be piped");
+    let mut reader = BufReader::new(stdout);
+    let mut line = String::new();
+    reader
+        .read_line(&mut line)
+        .expect("read dashboard startup line");
+    let meta: serde_json::Value = serde_json::from_str(line.trim())
+        .unwrap_or_else(|e| panic!("bad dashboard startup json ({e}): {line}"));
+    let url = meta["url"]
+        .as_str()
+        .expect("startup json must carry url")
+        .to_string();
+    let addr = url
+        .strip_prefix("http://")
+        .expect("dashboard url must be http")
+        .to_string();
+
+    // Drain stderr in the background so the child never blocks on a full pipe.
+    if let Some(err) = child.stderr.take() {
+        std::thread::spawn(move || {
+            let mut r = BufReader::new(err);
+            let mut l = String::new();
+            while r.read_line(&mut l).unwrap_or(0) > 0 {
+                eprint!("[dashboard] {l}");
+                l.clear();
+            }
+        });
+    }
+
+    DashboardHandle { child, addr }
+}
+
+/// Issue one raw `GET` over TCP and parse the JSON response body.
+fn http_get_json(addr: &str, path: &str) -> serde_json::Value {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut stream = loop {
+        match TcpStream::connect(addr) {
+            Ok(s) => break s,
+            Err(_) if Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(25));
+            }
+            Err(e) => panic!("connect {addr}: {e}"),
+        }
+    };
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    let req = format!("GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
+    stream.write_all(req.as_bytes()).unwrap();
+
+    let mut bytes: Vec<u8> = Vec::new();
+    let mut buf = [0u8; 4096];
+    loop {
+        match stream.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => bytes.extend_from_slice(&buf[..n]),
+            Err(e)
+                if e.kind() == std::io::ErrorKind::ConnectionReset
+                    || e.kind() == std::io::ErrorKind::UnexpectedEof =>
+            {
+                break;
+            }
+            Err(e) => panic!("read dashboard response: {e}"),
+        }
+    }
+    let raw = String::from_utf8_lossy(&bytes).into_owned();
+    let body = raw
+        .split_once("\r\n\r\n")
+        .map(|(_, body)| body)
+        .unwrap_or("");
+    serde_json::from_str(body).unwrap_or_else(|e| panic!("dashboard response json ({e}): {body}"))
+}
+
+/// Fetch `/api/sessions` and return the `CollabSessionSummary` entry for
+/// `session_id`.
+fn dashboard_session_summary(addr: &str, session_id: &str) -> serde_json::Value {
+    let sessions = http_get_json(addr, "/api/sessions");
+    sessions
+        .as_array()
+        .expect("dashboard /api/sessions must return a JSON array")
+        .iter()
+        .find(|s| s["id"] == session_id)
+        .unwrap_or_else(|| {
+            panic!("session {session_id} missing from dashboard listing: {sessions}")
+        })
+        .clone()
+}
+
+/// Open an on-disk `App` (noop embedder, trusted MCP mode) so a second,
+/// independent read-only connection — the real dashboard binary — can see
+/// the same committed rows. `App::open_for_test`'s in-memory DB cannot be
+/// shared this way.
+fn open_disk_app_for_dashboard_sweep() -> (tempfile::TempDir, PathBuf, App) {
+    let dir = tempfile::tempdir().expect("temp dir must be creatable");
+    let db_path = dir.path().join("collab.sqlite3");
+    let state_dir = dir.path().join("state");
+    let config = Config {
+        db_path: db_path.clone(),
+        model_dir: PathBuf::from("/nonexistent"),
+        model_dir_explicit: true,
+        state_dir,
+        mcp_access_mode: McpAccessMode::Trusted,
+        embed_mode: EmbedMode::Noop,
+    };
+    let app = App::new(config).expect("disk-backed App must open for Task 15's full sweep");
+    (dir, db_path, app)
+}
+
+/// Open a SECOND, independent `App` against the same on-disk DB — models a
+/// second agent's own local `ironmem` MCP server process sharing one
+/// repository's DB, the deployment topology `ensure_actor_generation_current`
+/// (`crates/ironmem/src/mcp/tools/handoff.rs`) is designed around: in
+/// production each agent runs its own MCP server process, so driving this
+/// scenario across two `App` instances over one shared on-disk DB is
+/// arguably MORE faithful to that topology than routing both agents through
+/// a single `App`. The second App is used to model those independent MCP
+/// server processes, not as a workaround for generation-cache rollback.
+fn open_second_disk_app(db_path: &Path) -> (tempfile::TempDir, App) {
+    let dir = tempfile::tempdir().expect("temp dir must be creatable");
+    let state_dir = dir.path().join("state");
+    let config = Config {
+        db_path: db_path.to_path_buf(),
+        model_dir: PathBuf::from("/nonexistent"),
+        model_dir_explicit: true,
+        state_dir,
+        mcp_access_mode: McpAccessMode::Trusted,
+        embed_mode: EmbedMode::Noop,
+    };
+    let app = App::new(config)
+        .expect("second disk-backed App must open for the fresh-process workaround");
+    (dir, app)
+}
+
+/// Step 7 cross-check, `collab_wait_my_turn` half: the current owner must
+/// observe its own turn immediately; the other agent must never observe
+/// `is_my_turn: true` and instead time out unsettled — mirroring
+/// `collab_set_pilot_reassignment_leaves_exactly_one_claimable_owner`'s
+/// pattern, reused here as a running cross-check against `collab_status`
+/// rather than a one-off assertion. `owner_app`/`non_owner_app` are separate
+/// parameters (rather than one shared `App`) so a checkpoint can cross-check
+/// an agent whose in-process generation cache lives in a different `App`
+/// instance than the owner's — see `open_second_disk_app`.
+fn assert_wait_turn_matches_status(
+    owner_app: &App,
+    non_owner_app: &App,
+    session_id: &str,
+    owner: &str,
+    non_owner: &str,
+    checkpoint: &str,
+) {
+    let owner_wait = call_tool(
+        owner_app,
+        "collab_wait_my_turn",
+        json!({ "session_id": session_id, "agent": owner, "timeout_secs": 1 }),
+    );
+    assert_eq!(
+        owner_wait["is_my_turn"], true,
+        "{checkpoint}: collab_wait_my_turn must report {owner}'s own turn"
+    );
+    assert_eq!(owner_wait["current_owner"], owner);
+
+    let non_owner_wait = call_tool(
+        non_owner_app,
+        "collab_wait_my_turn",
+        json!({ "session_id": session_id, "agent": non_owner, "timeout_secs": 1 }),
+    );
+    assert_eq!(
+        non_owner_wait,
+        json!({ "unchanged": true }),
+        "{checkpoint}: collab_wait_my_turn must never report {non_owner}'s turn while {owner} owns it"
+    );
+}
+
+/// Step 7 cross-check, dashboard half: the live `/api/sessions` listing must
+/// report the same `pilot`/`implementer`/`current_owner`/`phase` as
+/// `collab_status` at the same checkpoint.
+fn assert_dashboard_matches_status(
+    addr: &str,
+    session_id: &str,
+    status: &serde_json::Value,
+    checkpoint: &str,
+) {
+    let summary = dashboard_session_summary(addr, session_id);
+    assert_eq!(
+        summary["pilot"], status["pilot"],
+        "{checkpoint}: dashboard pilot must match collab_status"
+    );
+    assert_eq!(
+        summary["implementer"], status["implementer"],
+        "{checkpoint}: dashboard implementer must match collab_status"
+    );
+    assert_eq!(
+        summary["current_owner"], status["current_owner"],
+        "{checkpoint}: dashboard current_owner must match collab_status"
+    );
+    assert_eq!(
+        summary["phase"], status["phase"],
+        "{checkpoint}: dashboard phase must match collab_status"
+    );
+}
+
+/// Task 15's full scenario, run in the exact 7-step order specified by the
+/// plan. `pilot=codex, implementer=claude` at start, reassigned to
+/// `pilot=claude` mid-flight (step 2) — the reversed-role case the plan
+/// exists to pin. Step numbering in the comments below matches the plan's
+/// literal step list verbatim.
+///
+/// Note on step 6: the plan's own scenario never reassigns `implementer`
+/// away from `claude` (it is fixed at `collab_start` in step 1 and never
+/// touched again), and step 2 ends with `pilot=claude` too — so by
+/// `CodeImplementPending` this run has `pilot == implementer == claude`,
+/// not a genuinely split pair. The assertion below is implemented exactly as
+/// the plan specifies ("Assert `current_owner == claude`") rather than
+/// silently strengthened into a split-role case; the split-role invariant
+/// itself already has a dedicated regression guard from Task 4's tests
+/// (`collab_start_accepts_pilot_codex_and_defaults_implementer_to_pilot` and
+/// neighbors).
+#[test]
+fn collab_role_safety_full_verification_sweep_reversed_role_scenario() {
+    let (_dir, db_path, app) = open_disk_app_for_dashboard_sweep();
+    let dashboard = spawn_dashboard(&db_path);
+
+    // ── Step 1 ──────────────────────────────────────────────────────────
+    // collab_start --pilot=codex --implementer=claude. current_owner must
+    // seed from the PILOT (Task 4's invariant), not the implementer.
+    let started = call_tool(
+        &app,
+        "collab_start",
+        json!({
+            "repo_path": "/repo",
+            "branch": "feat/role-safety-sweep",
+            "initiator": "claude",
+            "pilot": "codex",
+            "implementer": "claude"
+        }),
+    );
+    let session_id = started["session_id"].as_str().unwrap().to_string();
+    assert_eq!(started["pilot"], "codex");
+    assert_eq!(started["implementer"], "claude");
+
+    let status = call_tool(&app, "collab_status", json!({ "session_id": &session_id }));
+    assert_eq!(status["pilot"], "codex");
+    assert_eq!(status["implementer"], "claude");
+    assert_eq!(status["current_owner"], "codex");
+    assert_eq!(status["phase"], "PlanParallelDrafts");
+
+    // Step 7 checkpoint (post step 1).
+    assert_wait_turn_matches_status(&app, &app, &session_id, "codex", "claude", "after step 1");
+    assert_dashboard_matches_status(&dashboard.addr, &session_id, &status, "after step 1");
+
+    // Mint a handoff token for codex BEFORE step 2's reassignment, and hold
+    // it unspent through steps 2-3 for step 4's retry.
+    let handoff = call_tool(
+        &app,
+        "session_handoff",
+        json!({ "session_id": &session_id, "agent": "codex" }),
+    );
+    let pre_reassignment_token = handoff["handoff_token"]
+        .as_str()
+        .expect("session_handoff must return a token")
+        .to_string();
+
+    // ── Step 2 ──────────────────────────────────────────────────────────
+    // As Codex (the CURRENT pilot), before any draft lands: reassign the
+    // pilot to Claude. Must succeed; current_owner moves with it.
+    let reassigned = call_tool(
+        &app,
+        "collab_set_pilot",
+        json!({
+            "session_id": &session_id,
+            "agent": "codex",
+            "pilot": "claude"
+        }),
+    );
+    assert_eq!(reassigned["pilot"], "claude");
+    assert_eq!(reassigned["current_owner"], "claude");
+
+    let status = call_tool(&app, "collab_status", json!({ "session_id": &session_id }));
+    assert_eq!(status["pilot"], "claude");
+    assert_eq!(status["implementer"], "claude");
+    assert_eq!(status["current_owner"], "claude");
+
+    // Step 7 checkpoint (post step 2).
+    assert_wait_turn_matches_status(&app, &app, &session_id, "claude", "codex", "after step 2");
+    assert_dashboard_matches_status(&dashboard.addr, &session_id, &status, "after step 2");
+
+    // ── Step 3 ──────────────────────────────────────────────────────────
+    // As Codex (now the FORMER pilot): both collab_set_pilot and
+    // collab_set_implementer must be refused with the matrix's
+    // authorization error, and pilot/implementer/current_owner/updated_at
+    // must all be unchanged after BOTH attempts.
+    let before = call_tool(&app, "collab_status", json!({ "session_id": &session_id }));
+
+    let set_pilot_auth_err = call_tool_expect_error(
+        &app,
+        "collab_set_pilot",
+        json!({
+            "session_id": &session_id,
+            "agent": "codex",
+            "pilot": "codex"
+        }),
+    );
+    assert_eq!(
+        set_pilot_auth_err,
+        "collab_set_pilot refused: caller 'codex' is the copilot of this session; \
+         only the current pilot 'claude' may reassign the pilot role"
+    );
+
+    let set_implementer_auth_err = call_tool_expect_error(
+        &app,
+        "collab_set_implementer",
+        json!({
+            "session_id": &session_id,
+            "agent": "codex",
+            "implementer": "codex"
+        }),
+    );
+    assert_eq!(
+        set_implementer_auth_err,
+        "collab_set_implementer refused: caller 'codex' is not the pilot of this session; \
+         only the current pilot 'claude' may reassign the implementer"
+    );
+
+    let after_step3 = call_tool(&app, "collab_status", json!({ "session_id": &session_id }));
+    assert_eq!(after_step3["pilot"], before["pilot"]);
+    assert_eq!(after_step3["implementer"], before["implementer"]);
+    assert_eq!(after_step3["current_owner"], before["current_owner"]);
+    assert_eq!(
+        after_step3["updated_at"], before["updated_at"],
+        "step 3: two refused authorization attempts must not touch updated_at"
+    );
+
+    // ── Step 4 ──────────────────────────────────────────────────────────
+    // Retry step 3's mutations using the token minted for codex BEFORE the
+    // reassignment. Still refused — by the caller-identity check, not a
+    // token-staleness mechanism (Task 9's finding: reassignment never
+    // invalidates an outstanding token) — with zero mutation. Reusing the
+    // SAME token for both retries is safe: `claim_handoff_token` succeeds
+    // inside each call's own transaction, but the caller-identity check that
+    // runs immediately after it fails, so the whole transaction (including
+    // the token claim) rolls back every time and the token is never actually
+    // spent.
+    let retry_set_implementer_err = call_tool_expect_error(
+        &app,
+        "collab_set_implementer",
+        json!({
+            "session_id": &session_id,
+            "agent": "codex",
+            "implementer": "codex",
+            "handoff_token": &pre_reassignment_token
+        }),
+    );
+    assert_eq!(retry_set_implementer_err, set_implementer_auth_err);
+    assert!(
+        !retry_set_implementer_err.contains("already claimed")
+            && !retry_set_implementer_err.contains("invalid handoff_token"),
+        "step 4's refusal must come from the caller-identity check, not a token error: \
+         {retry_set_implementer_err}"
+    );
+
+    let retry_set_pilot_err = call_tool_expect_error(
+        &app,
+        "collab_set_pilot",
+        json!({
+            "session_id": &session_id,
+            "agent": "codex",
+            "pilot": "codex",
+            "handoff_token": &pre_reassignment_token
+        }),
+    );
+    assert_eq!(retry_set_pilot_err, set_pilot_auth_err);
+    assert!(
+        !retry_set_pilot_err.contains("already claimed")
+            && !retry_set_pilot_err.contains("invalid handoff_token"),
+        "step 4's refusal must come from the caller-identity check, not a token error: \
+         {retry_set_pilot_err}"
+    );
+
+    let after_step4 = call_tool(&app, "collab_status", json!({ "session_id": &session_id }));
+    assert_eq!(after_step4["pilot"], before["pilot"]);
+    assert_eq!(after_step4["implementer"], before["implementer"]);
+    assert_eq!(after_step4["current_owner"], before["current_owner"]);
+    assert_eq!(
+        after_step4["updated_at"], before["updated_at"],
+        "step 4: a refused token-bearing retry must not touch updated_at either"
+    );
+
+    // ── Step 5 ──────────────────────────────────────────────────────────
+    // Land a draft, then attempt collab_set_pilot as Claude — the ACTUAL
+    // current pilot post-step-2 — again. Refused on the PHASE gate this
+    // time: a genuinely distinct error from step 3's authorization refusal.
+    call_tool(
+        &app,
+        "collab_send",
+        json!({
+            "session_id": &session_id,
+            "sender": "claude",
+            "topic": "draft",
+            "content": "claude blind draft"
+        }),
+    );
+
+    let phase_gate_err = call_tool_expect_error(
+        &app,
+        "collab_set_pilot",
+        json!({
+            "session_id": &session_id,
+            "agent": "claude",
+            "pilot": "codex"
+        }),
+    );
+    assert!(
+        phase_gate_err.contains("PlanParallelDrafts") && phase_gate_err.contains("draft"),
+        "expected the phase-gate rejection naming the phase and the landed draft, got: \
+         {phase_gate_err}"
+    );
+    assert_ne!(
+        phase_gate_err, set_pilot_auth_err,
+        "step 5's phase-gate refusal must be textually distinct from step 3's authorization \
+         refusal"
+    );
+
+    // ── Step 6 ──────────────────────────────────────────────────────────
+    // Continue driving to CodeImplementPending. current_owner must equal the
+    // IMPLEMENTER, not merely the (also-claude, post-reassignment) pilot —
+    // see the file-level note above on why this scenario doesn't reach a
+    // genuinely split pilot != implementer pair at this checkpoint.
+    //
+    // Codex's remaining actions in this scenario (submitting its own blind
+    // draft, reviewing the canonical plan) route through a SECOND, independent
+    // `App` rather than the original one — modeling codex's own local MCP
+    // server process, per `open_second_disk_app`'s doc comment above.
+    let (_dir2, app_codex) = open_second_disk_app(&db_path);
+
+    call_tool(
+        &app_codex,
+        "collab_send",
+        json!({
+            "session_id": &session_id,
+            "sender": "codex",
+            "topic": "draft",
+            "content": "codex blind draft"
+        }),
+    );
+    let status = call_tool(&app, "collab_status", json!({ "session_id": &session_id }));
+    assert_eq!(status["phase"], "PlanSynthesisPending");
+    assert_eq!(status["current_owner"], "claude");
+
+    call_tool(
+        &app,
+        "collab_send",
+        json!({
+            "session_id": &session_id,
+            "sender": "claude",
+            "topic": "canonical",
+            "content": "canonical plan v1"
+        }),
+    );
+    call_tool(
+        &app_codex,
+        "collab_send",
+        json!({
+            "session_id": &session_id,
+            "sender": "codex",
+            "topic": "review",
+            "content": json!({ "verdict": "approve" }).to_string()
+        }),
+    );
+    call_tool(
+        &app,
+        "collab_send",
+        json!({
+            "session_id": &session_id,
+            "sender": "claude",
+            "topic": "final",
+            "content": json!({ "plan": "final plan text" }).to_string()
+        }),
+    );
+    let status = call_tool(&app, "collab_status", json!({ "session_id": &session_id }));
+    assert_eq!(status["phase"], "PlanLocked");
+    let final_plan_hash = status["final_plan_hash"].as_str().unwrap().to_string();
+
+    call_tool(
+        &app,
+        "collab_send",
+        json!({
+            "session_id": &session_id,
+            "sender": "claude",
+            "topic": "task_list",
+            "content": task_list_payload(&final_plan_hash, "base0", "head0", 1)
+        }),
+    );
+    let status = call_tool(&app, "collab_status", json!({ "session_id": &session_id }));
+    assert_eq!(status["phase"], "CodeImplementPending");
+    assert_eq!(
+        status["current_owner"], "claude",
+        "current_owner at CodeImplementPending must equal the implementer"
+    );
+    assert_eq!(status["pilot"], "claude");
+    assert_eq!(status["implementer"], "claude");
+
+    // Step 7 checkpoint (step 6's final state). Codex's half again goes
+    // through `app_codex` — see the step 6 comment above.
+    assert_wait_turn_matches_status(
+        &app,
+        &app_codex,
+        &session_id,
+        "claude",
+        "codex",
+        "at CodeImplementPending",
+    );
+    assert_dashboard_matches_status(
+        &dashboard.addr,
+        &session_id,
+        &status,
+        "at CodeImplementPending",
+    );
 }

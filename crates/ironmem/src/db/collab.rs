@@ -1,5 +1,7 @@
 use crate::collab::queue::{self, Capability, Message, SessionRecord};
-use crate::collab::{Agent, CollabSession};
+#[cfg(test)]
+use crate::collab::Agent;
+use crate::collab::{CollabRoles, CollabSession};
 use crate::db::schema::Database;
 use crate::error::MemoryError;
 
@@ -10,19 +12,9 @@ impl Database {
         repo_path: &str,
         branch: &str,
         task: Option<&str>,
-        implementer: Agent,
-        pilot: Agent,
+        roles: CollabRoles,
     ) -> Result<(), MemoryError> {
-        queue::create_session(&self.conn, id, repo_path, branch, task, implementer, pilot)
-    }
-
-    pub fn collab_set_pilot(
-        &self,
-        session_id: &str,
-        pilot: Agent,
-        current_owner: Option<Agent>,
-    ) -> Result<(), MemoryError> {
-        queue::set_pilot(&self.conn, session_id, pilot, current_owner)
+        queue::create_session(&self.conn, id, repo_path, branch, task, roles)
     }
 
     pub fn collab_end_session(&self, session_id: &str) -> Result<(), MemoryError> {
@@ -131,8 +123,10 @@ mod tests {
             "/repo",
             "main",
             None,
-            Agent::Claude,
-            Agent::Claude,
+            CollabRoles {
+                pilot: Agent::Claude,
+                implementer: Agent::Claude,
+            },
         )
         .unwrap();
 

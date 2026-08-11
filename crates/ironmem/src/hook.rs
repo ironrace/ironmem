@@ -1649,21 +1649,11 @@ fn truncate_text_to_byte_limit(text: &str, max_bytes: usize) -> String {
 /// the host prompt, then byte-cap on a char boundary. serde handles JSON
 /// escaping when the enclosing `HookResponse` is serialized.
 fn compact_excerpt(text: &str, max_bytes: usize) -> String {
-    let mut out = String::with_capacity(text.len().min(max_bytes + 4));
-    let mut prev_space = false;
-    // Manual scan (not `split_whitespace`): this must also collapse `is_control()`
-    // runs to a single space, which a whitespace split would silently let through.
-    for ch in text.trim().chars() {
-        if ch.is_whitespace() || ch.is_control() {
-            if !prev_space {
-                out.push(' ');
-                prev_space = true;
-            }
-        } else {
-            out.push(ch);
-            prev_space = false;
-        }
-    }
+    // Shared collapse (also used by `context::sanitize_inline` and
+    // `mcp::tools::shared::sanitize_error_value`): folds whitespace/`Cc`
+    // control-char runs to a single space so untrusted excerpt text can't
+    // inject newlines or terminal control sequences.
+    let out = crate::sanitize::collapse_whitespace_and_control(text, false);
     let collapsed = out.trim_end();
     if collapsed.contains("```") {
         let without_fences = collapsed.replace("```", "`");
@@ -2719,8 +2709,10 @@ mod tests {
                     repo_path,
                     branch,
                     None,
-                    crate::collab::Agent::Claude,
-                    crate::collab::Agent::Claude,
+                    crate::collab::CollabRoles {
+                        pilot: crate::collab::Agent::Claude,
+                        implementer: crate::collab::Agent::Claude,
+                    },
                 )
             })
             .unwrap();
@@ -2831,8 +2823,10 @@ mod tests {
                     repo.as_ref(),
                     "main",
                     None,
-                    crate::collab::Agent::Claude,
-                    crate::collab::Agent::Claude,
+                    crate::collab::CollabRoles {
+                        pilot: crate::collab::Agent::Claude,
+                        implementer: crate::collab::Agent::Claude,
+                    },
                 )
             })
             .unwrap();
@@ -5212,8 +5206,10 @@ mod tests {
                     repo_path,
                     "main",
                     None,
-                    crate::collab::Agent::Claude,
-                    crate::collab::Agent::Claude,
+                    crate::collab::CollabRoles {
+                        pilot: crate::collab::Agent::Claude,
+                        implementer: crate::collab::Agent::Claude,
+                    },
                 )
             })
             .unwrap();
