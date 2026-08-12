@@ -38,13 +38,28 @@ const make = () => new AsyncFunction('args', 'budget', 'agent', 'parallel', 'pip
 const parallel = (thunks) => Promise.all(thunks.map((t) => t()))
 const pipeline = (items, s1, s2) => Promise.all(items.map(async (i) => s2(await s1(i))))
 
+// A Find-phase worktree-isolation dispatch: `isolate:<id> cut` cuts the
+// throwaway worktree a mutating lens is dispatched into, `isolate:<id> release`
+// removes it. Both run a fixed git command list; neither reviews anything.
+const isIsolationCall = (opts) => typeof opts.label === 'string' && opts.label.startsWith('isolate:')
+
 async function run(args, agentImpl) {
   const logs = []
   const calls = []
   const agent = (brief, opts) => {
     calls.push({ brief, opts })
     // agentImpl may return a promise (to model latency) or a plain value.
-    return Promise.resolve().then(() => agentImpl(brief, opts, calls))
+    return Promise.resolve()
+      .then(() => agentImpl(brief, opts, calls))
+      // Isolation dispatches default to a clean success. Every agentImpl here
+      // describes the LENSES its test is about, and none of them knows about
+      // worktree cutting — without this default, each one would silently answer
+      // a cut with a findings object, the workflow's fail-closed check (`ok`
+      // must be the literal `true`) would refuse it, and every mutating lens
+      // would come back "not dispatched" in tests that are about something
+      // else. A test that wants the failure path returns `{ ok: false }`
+      // itself, and that answer is passed through untouched.
+      .then((v) => (isIsolationCall(opts) && !(v && typeof v.ok === 'boolean') ? { ok: true, detail: '' } : v))
   }
   const out = await make()(args, {}, agent, parallel, pipeline, (m) => logs.push(m), () => {}, () => {})
   return { out, logs, calls }
@@ -995,7 +1010,11 @@ for (const verdict of ['PLAUSIBLE', 'REFUTED', 'UNVERIFIED', 'N/A', '']) {
 // --- mutation: gut briefFor() ---------------------------------------------
 {
   const { calls } = await run({ ...baseArgs, changedLines: 1000, lenses: ['A'] }, noFindings)
-  const find = calls.filter((c) => c.opts.phase === 'Find')
+  // Lens dispatches only. The Find phase also carries the `isolate:<id>` cut and
+  // release dispatches for mutating lenses, which run git commands and carry
+  // none of a finder brief's contract — folding them in would make every
+  // assertion below false for a reason that has nothing to do with briefFor().
+  const find = calls.filter((c) => c.opts.phase === 'Find' && c.opts.label.startsWith('find:'))
   const byLens = (id) => find.find((c) => c.opts.label.startsWith(`find:${id} `)).brief
   // Every lens brief must carry its own hunt list, the shared inputs, and the
   // coverage-first output contract. A brief that collapsed to a placeholder,
@@ -1648,6 +1667,62 @@ for (const verdict of ['PLAUSIBLE', 'REFUTED', 'UNVERIFIED', 'N/A', '']) {
     assert.match(thrown.message, /ROSTER entry 'G'/)
     assert.match(thrown.message, /mutates/)
   })
+}
+
+// --- find-phase worktree isolation (smoke) --------------------------------
+//
+// The four acceptance conditions of the isolation boundary, at the coarsest
+// level that can fail: cwd, the retargeted `review-diff --repo`, cleanup on
+// both exits, and read-only lenses paying no worktree cost. Deliberately thin —
+// the exhaustive version (cut failure, leaked worktrees, PR-mode ranges) is its
+// own section, added with the tests that own this path.
+{
+  const isoArgs = {
+    ...baseArgs,
+    changedLines: 1000,
+    lenses: ['A'],
+    reportOnly: true,
+    expandCmd: 'ironmem review-diff --repo /r --worktree --expand-file <path> --hunk <ordinal>',
+  }
+  // `<repo>-ultrareview-<lens>-<sha12>`: a sibling of the checkout, never a path
+  // inside it, and pinned at the anchor rather than at a ref.
+  const WT_G = `/r-ultrareview-g-${SHA.slice(0, 12)}`
+  const { calls } = await run(isoArgs, noFindings)
+  const labelled = (l) => calls.find((c) => c.opts.label === l)
+  const g = calls.find((c) => c.opts.label.startsWith('find:G '))
+  const a = calls.find((c) => c.opts.label.startsWith('find:A '))
+  check('a mutating lens is dispatched with cwd = its cut worktree', () =>
+    assert.equal(g.opts.cwd, WT_G))
+  check("the same path reaches the lens's repo and its review-diff --repo", () => {
+    assert.ok(g.brief.includes(`Repo: ${WT_G}`))
+    assert.ok(g.brief.includes(`ironmem review-diff --repo ${WT_G} `))
+    assert.ok(!g.brief.includes('--repo /r '))
+  })
+  check('the worktree is cut at the anchor object, not at a ref', () =>
+    assert.ok(labelled('isolate:G cut').brief.includes(`worktree add --detach ${WT_G} ${SHA}`)))
+  check('cleanup removes and prunes on the success path', () => {
+    const rel = labelled('isolate:G release').brief
+    assert.ok(rel.includes(`git -C ${WT_G} worktree prune`))
+    assert.ok(rel.includes(`git -C ${WT_G} worktree remove --force ${WT_G}`))
+  })
+  check('cleanup never names the shared checkout', () =>
+    assert.ok(!labelled('isolate:G release').brief.split(WT_G).join('').includes('/r')))
+  check('a read-only lens cuts no worktree and keeps the shared tree', () => {
+    assert.equal(a.opts.cwd, undefined)
+    assert.ok(a.brief.includes('Repo: /r'))
+    assert.ok(!calls.some((c) => c.opts.label.startsWith('isolate:A')))
+  })
+}
+{
+  // The failure path: the lens rejects, and the worktree still goes away. This
+  // is the one that a `try` without a `finally` passes every other test with.
+  const impl = (b, o) =>
+    o.label.startsWith('find:G ') ? Promise.reject(new Error('lens exploded')) : noFindings(b, o)
+  const { out, calls } = await run({ ...baseArgs, changedLines: 1000, lenses: ['A'], reportOnly: true }, impl)
+  check('cleanup runs on the failure path too', () =>
+    assert.ok(calls.some((c) => c.opts.label === 'isolate:G release')))
+  check('the failed lens is reported as errored, not as a clean zero', () =>
+    assert.ok(out.erroredLenses.includes('G')))
 }
 
 console.log(`\n${pass} checks passed`)

@@ -274,7 +274,7 @@ pre-fix state. On a dirty tree it is not, and there is no safe anchor:
 
 ### What the anchor is for
 
-The SHA is passed to the workflow as `rollbackSha` and does three jobs:
+The SHA is passed to the workflow as `rollbackSha` and does four jobs:
 
 1. It scopes the scope-creep audit — `git diff <sha> -- .` is the fix diff, with
    the one exception below.
@@ -282,6 +282,13 @@ The SHA is passed to the workflow as `rollbackSha` and does three jobs:
    that applied zero fixes. A rollback line the user has to go looking for is
    not a rollback line.
 3. Recovery is `git checkout <sha> -- .`, with the one limit below.
+4. It is the commit the workflow cuts each Find-phase isolation worktree at —
+   see the isolation bullet under "What the workflow guarantees". This is the
+   one job that needs the anchor to be an **immutable object naming the
+   reviewed tree** rather than merely a restore point: a worktree cut at a ref
+   would move under the review, and one cut at `HEAD` would not contain the
+   uncommitted work being reviewed at all. Anything that changes how this SHA is
+   minted changes what those lenses read.
 
 **Four gaps in `git`'s own behaviour that the report must state, not paper over.
 Each one is a way the printed recovery line under-delivers or over-reaches, and
@@ -453,8 +460,22 @@ never enters a reviewer prompt and it never enters `args`.
   `CONFIRMED`-only gate becomes bypassable by wording swap.
 - **Fix on `CONFIRMED` only** — never `PLAUSIBLE`, never `UNVERIFIED`, never
   before the verify pass. `fix_complexity: invasive` is reported, never patched.
+- **Find-phase worktree isolation, decided by `ROSTER.mutates` in
+  `ultrareview.js`.** Whether a given lens runs commands that write is declared
+  there and nowhere else — do not restate that list here, in a prompt, or in a
+  brief. Where the entry says so, the workflow cuts a throwaway worktree at
+  `rollbackSha`, points that lens's working directory, diff range and
+  `review-diff --repo` at it, waits, and removes **and** prunes it on both the
+  success and the failure path. Where it does not, the lens reads this checkout
+  directly and no worktree is cut. Two consequences for this command: the anchor
+  is load-bearing beyond rollback (Phase 2.5), and a lens whose worktree cannot
+  be cut is reported as an **errored** lens — never quietly re-run against the
+  shared tree — so `coverageComplete` goes false and the Phase 6 precondition
+  applies.
 - **Fix agents grouped by file**, one agent per file, groups in parallel, no
-  worktree isolation — the fixes land in the user's working tree. The fan-out is
+  worktree isolation — the fixes land in the user's working tree. That is the
+  deliberate opposite of the Find-phase policy above and stays that way: a fix
+  applied inside a throwaway worktree would be deleted with it. The fan-out is
   capped, every dispatch is individually caught so one failure cannot discard
   the run, and a finding is only dispatched if its path is in the `files` list
   passed from here.
@@ -483,6 +504,7 @@ fixes { applied, files, groups[{ file, tier, results, errored, errorReason }],
 fixAgentsDispatched (bool) ·
 scopeAudit (null | { in_scope, out_of_scope_changes, summary }) ·
 verifyStats { confirmed, plausible, refuted, unverified, pastCap, supersededVerdicts } ·
+isolationLeaks[] ·
 reportOnly · reportOnlyForced (bool) · rollbackSha · rollbackUsable (bool)
 ```
 
@@ -522,6 +544,11 @@ Notes on reading it:
   cross-lens merge later displaced. It is a cost, not a defect — every verdict
   belongs to the wording it was reached about — but a non-zero value means the
   effective verify budget was smaller than the cap.
+- `isolationLeaks[]` holds any Find-phase isolation worktree whose removal could
+  not be confirmed. Each entry is a directory beside this checkout plus a stale
+  entry in its worktree bookkeeping — it does not affect the verdict, but name
+  the paths in the report with
+  `git -C <path> worktree remove --force <path>` so the user can clear them.
 - `verifyStats.pastCap` counts **claims** that outran the cap;
   `verifyStats.unverified` counts **findings** displaying an `UNVERIFIED`
   verdict. They are different numbers and `pastCap` is the larger: a capped

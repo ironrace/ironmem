@@ -101,18 +101,24 @@ to, not instead of, the normal `review_local`.
    decorative: without it the command auto-fixes by default and dispatches
    Edit-capable agents into this session's working tree before you have
    verified a finding — and step 6 then cuts fix worktrees from, and step 7
-   pushes, a tree already carrying those edits. Treat the review agents as
-   read-only. Independently verify the synthesized findings and keep only
-   confirmed CRITICAL/HIGH/MEDIUM issues.
+   pushes, a tree already carrying those edits. With the flag, nothing that
+   command dispatches writes to this checkout: `ROSTER.mutates` in
+   `ultrareview.js` declares which lenses run commands that write, and the
+   workflow gives each of those its own throwaway worktree at the review
+   snapshot and removes it afterwards — that classification lives there and is
+   not to be restated here. Independently verify the synthesized findings and
+   keep only confirmed CRITICAL/HIGH/MEDIUM issues.
 5. In `review_local=reduced`, do a targeted read-only audit of the diff summary,
    changed files, and Codex commits for protocol drift, docs/config breakage,
    generated metadata inconsistencies, and security-sensitive configuration. Do
    not invoke `/ultrareview-local --report-only` unless the reduced audit finds
    a substantive uncertainty or a CRITICAL/HIGH/MEDIUM issue.
-6. Group confirmed findings into non-overlapping fix clusters. For multiple
-   independent clusters, create one temporary worktree per cluster on a unique
-   throwaway branch from the same review head and dispatch fix subagents in
-   parallel. Give each subagent exactly one cluster, tell it not to touch
+6. Group confirmed findings into non-overlapping fix clusters. These fix
+   worktrees are yours and unrelated to the review-side isolation in step 4:
+   they exist to parallelise edits you intend to keep, and their commits are
+   merged back in step 7. For multiple independent clusters, create one
+   temporary worktree per cluster on a unique throwaway branch from the same
+   review head and dispatch fix subagents in parallel. Give each subagent exactly one cluster, tell it not to touch
    unrelated files, and have it return or commit only that cluster's edits. If
    findings overlap or touch the same fragile code path, fix that cluster
    sequentially instead of forcing unsafe parallelism.
