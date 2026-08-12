@@ -95,6 +95,25 @@ never pass it to the workflow; discard it after selecting the conditional
 lenses. The compact artifact remains the review context (or the raw fallback
 when no artifact is available).
 
+**Make `headRefOid` a local object.** Nothing above fetches git objects — `gh pr
+view` and `gh pr diff` both answer from the API — so for a fork PR, or any PR
+whose head branch was never fetched, that SHA does not exist in the local object
+database. It is passed to the workflow as `reviewSha`, and every Find-phase
+isolation worktree is cut at it, so without this the cut fails on every PR-Mode
+run and each lens that ROSTER.mutates sends into a worktree is reported ERRORED,
+making `coverageComplete` false for a reason that has nothing to do with the
+diff:
+
+```bash
+git -C <repo_path> fetch origin refs/pull/<N>/head
+git -C <repo_path> cat-file -e <headRefOid>^{commit}
+```
+
+If the fetch is not possible (no network, no such remote), say so in the report
+and expect those lenses to come back ERRORED — isolation fails closed, which is
+correct, but the reason belongs in the report rather than looking like a defect
+in the code.
+
 Record whether the local working tree is at the PR head: `git rev-parse HEAD` vs
 `headRefOid`. If they differ:
 
@@ -518,7 +537,7 @@ fixes { applied, files, groups[{ file, tier, results, errored, errorReason }],
 fixAgentsDispatched (bool) ·
 scopeAudit (null | { in_scope, out_of_scope_changes, summary }) ·
 verifyStats { confirmed, plausible, refuted, unverified, pastCap, supersededVerdicts } ·
-isolationLeaks[] ·
+isolationLeaks[] · isolationUnknown[] ·
 reportOnly · reportOnlyForced (bool) · rollbackSha · rollbackUsable (bool)
 ```
 
@@ -563,6 +582,14 @@ Notes on reading it:
   entry in its worktree bookkeeping — it does not affect the verdict, but name
   the paths in the report with
   `git -C <path> worktree remove --force <path>` so the user can clear them.
+- `isolationUnknown[]` is **not** the same list and must not be given the same
+  remedy. It holds paths where the isolation cut never reported back, so the run
+  does not know whether it created anything there — and the same path could
+  equally be a concurrent review's worktree or pre-existing user data. Name
+  these paths too, but tell the user to **inspect** them
+  (`git worktree list`, then look at the directory), never to force-remove
+  them. Telling someone to delete a path this run may not own is the one
+  mistake here that destroys work rather than leaving litter.
 - `verifyStats.pastCap` counts **claims** that outran the cap;
   `verifyStats.unverified` counts **findings** displaying an `UNVERIFIED`
   verdict. They are different numbers and `pastCap` is the larger: a capped
@@ -686,6 +713,11 @@ Fixes applied: <N> across <M> files
   <only when changed files are gitignored: "not covered by the anchor: <paths>">
   <when rollbackUsable is false, this whole block is: "rollback: n/a (no anchor
   could be minted; nothing was edited)">
+<only when isolationLeaks is non-empty: "isolation worktrees left behind:
+  <paths> — clear each with git -C <path> worktree remove --force <path>">
+<only when isolationUnknown is non-empty: "isolation paths this run could not
+  account for: <paths> — INSPECT before touching; they may belong to another
+  review or predate this one. Do not force-remove them.">
 Post-fix validation: <check → pass/fail/n/a, one line>
 Remaining: <N MEDIUM (reported)> · <N HIGH invasive (design change — yours)> · <N out of scope>
 
