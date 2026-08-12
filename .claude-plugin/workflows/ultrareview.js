@@ -614,6 +614,13 @@ function isolationNote(isoPath, range) {
     'ISOLATION:',
     `Your working directory for this review is ${isoPath} — a throwaway git worktree holding the exact snapshot under review. Run everything there: \`cd ${isoPath}\` first, or pass \`-C ${isoPath}\` to git. That includes any test run, benchmark, profiler or build, whose output must land inside that worktree and nowhere else.`,
     `Do not read, write, build or run tests in any other checkout of this repository. Other reviewers are reading one right now, and a file your run leaves behind there is a defect they will report against code that never had it.`,
+    // The snapshot is `git add -A` against a throwaway index, which skips
+    // everything `.gitignore` covers. So the worktree has the source and none
+    // of the state a suite needs to run: no installed dependencies, no build
+    // cache, no local env file. The two lenses this isolation applies to are
+    // exactly the two that run suites and benchmarks, so an unstated absence
+    // here reads to them as a broken repository rather than a cold checkout.
+    `It is a fresh checkout: gitignored state — installed dependencies, build caches, compiled artifacts, local env files — is NOT present. Install or build what you need inside ${isoPath} before running a suite or a benchmark, and if that is not practical, say so in your findings rather than reporting the failure as a defect in the code.`,
     // Without a usable range there is nothing to hand the agent but the
     // worktree itself, and a `git diff` line with an empty range would be a
     // broken command rather than a degraded one.

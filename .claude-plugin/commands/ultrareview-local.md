@@ -467,11 +467,17 @@ never enters a reviewer prompt and it never enters `args`.
   `rollbackSha`, points that lens's working directory, diff range and
   `review-diff --repo` at it, waits, and removes **and** prunes it on both the
   success and the failure path. Where it does not, the lens reads this checkout
-  directly and no worktree is cut. Two consequences for this command: the anchor
-  is load-bearing beyond rollback (Phase 2.5), and a lens whose worktree cannot
-  be cut is reported as an **errored** lens — never quietly re-run against the
-  shared tree — so `coverageComplete` goes false and the Phase 6 precondition
-  applies.
+  directly and no worktree is cut. Three consequences for this command: the
+  anchor is load-bearing beyond rollback (Phase 2.5); a lens whose worktree
+  cannot be cut is reported as an **errored** lens — never quietly re-run
+  against the shared tree — so `coverageComplete` goes false and the Phase 6
+  precondition applies; and a cut worktree is a **fresh checkout carrying no
+  gitignored state** — no installed dependencies, no build cache, no local env
+  file — because the anchor is built with `git add -A`, which skips everything
+  `.gitignore` covers. An isolated lens must install or build what it needs
+  before it can run a suite or a benchmark, and may report that it could not.
+  That is the price of the isolation, not a lens defect: report it as such
+  rather than as a coverage failure with no cause.
 - **Fix agents grouped by file**, one agent per file, groups in parallel, no
   worktree isolation — the fixes land in the user's working tree. That is the
   deliberate opposite of the Find-phase policy above and stays that way: a fix
