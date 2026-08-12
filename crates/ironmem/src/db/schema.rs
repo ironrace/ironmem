@@ -510,6 +510,35 @@ fn is_busy_error(error: &rusqlite::Error) -> bool {
     )
 }
 
+/// True only for `SQLITE_BUSY_SNAPSHOT` (extended result code 517, primary
+/// `SQLITE_BUSY`): a WAL-mode read transaction whose snapshot went stale — a
+/// concurrent connection committed after this transaction's first read — and
+/// which then attempted to upgrade to a writer.
+///
+/// This is deliberately **narrower** than [`is_busy_error`], which matches any
+/// `SQLITE_BUSY`/`SQLITE_LOCKED` primary code and is used only around schema
+/// init/migration. `rusqlite::ErrorCode` cannot distinguish busy-snapshot from
+/// plain busy (both map to `DatabaseBusy`), so this predicate matches on the
+/// raw `extended_code` instead. Busy-snapshot is the one busy flavor where
+/// waiting is futile but *re-running the whole transaction* is guaranteed to
+/// see a fresh snapshot — which is exactly what the bounded retry loop in
+/// `with_transaction` needs to detect.
+// TODO(Task 6): drop the `cfg_attr` once `with_transaction`'s retry loop
+// consumes this predicate outside the test module.
+#[cfg_attr(not(test), allow(dead_code))]
+fn is_busy_snapshot_error(error: &MemoryError) -> bool {
+    matches!(
+        error,
+        MemoryError::Db(rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error {
+                extended_code: rusqlite::ffi::SQLITE_BUSY_SNAPSHOT,
+                ..
+            },
+            _,
+        ))
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use std::path::PathBuf;
@@ -1697,5 +1726,107 @@ mod tests {
         db.migrate().unwrap();
         db.migrate().unwrap();
         assert_eq!(schema_version_of(&db), LATEST_SCHEMA_VERSION);
+    }
+
+    /// Deterministic contention harness: produce a genuine
+    /// `SQLITE_BUSY_SNAPSHOT` (extended code 517) from a real WAL-mode
+    /// database, with no sleeps and no threads.
+    ///
+    /// The staleness is engineered purely by statement ordering on two
+    /// connections driven from the one test thread:
+    /// 1. conn A opens a `BEGIN DEFERRED` transaction and reads — this pins
+    ///    A's read snapshot without taking any write lock;
+    /// 2. conn B commits a write, advancing the WAL past A's snapshot;
+    /// 3. conn A then attempts its first write. Its snapshot is now stale, so
+    ///    SQLite refuses the read→write upgrade with `SQLITE_BUSY_SNAPSHOT`
+    ///    immediately (the busy handler is never invoked for this code —
+    ///    waiting can't un-stale a snapshot), making the failure
+    ///    deterministic rather than timing-dependent.
+    fn produce_busy_snapshot_error() -> rusqlite::Error {
+        let dir = tempfile::tempdir().unwrap();
+        // WAL mode requires a real file-backed database, not `:memory:`.
+        let db_path = dir.path().join("busy_snapshot.db");
+
+        let conn_a = rusqlite::Connection::open(&db_path).unwrap();
+        conn_a
+            .execute_batch(
+                "PRAGMA journal_mode=WAL;
+                 CREATE TABLE snapshot_probe (id INTEGER PRIMARY KEY, v INTEGER NOT NULL);
+                 INSERT INTO snapshot_probe (v) VALUES (0);",
+            )
+            .unwrap();
+        let mode: String = conn_a
+            .query_row("PRAGMA journal_mode;", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(mode, "wal", "harness requires WAL mode to be engaged");
+
+        let conn_b = rusqlite::Connection::open(&db_path).unwrap();
+
+        // Step 1: pin conn A's read snapshot (DEFERRED takes no lock until
+        // the first write; the SELECT starts the read transaction).
+        conn_a.execute_batch("BEGIN DEFERRED").unwrap();
+        let count: i64 = conn_a
+            .query_row("SELECT COUNT(*) FROM snapshot_probe", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, 1);
+
+        // Step 2: conn B commits a write, so the WAL moves past A's snapshot.
+        conn_b
+            .execute("INSERT INTO snapshot_probe (v) VALUES (1)", [])
+            .unwrap();
+
+        // Step 3: conn A's first write inside its still-open transaction must
+        // now fail the snapshot upgrade.
+        conn_a
+            .execute("INSERT INTO snapshot_probe (v) VALUES (2)", [])
+            .expect_err("stale-snapshot write upgrade must fail with SQLITE_BUSY_SNAPSHOT")
+    }
+
+    #[test]
+    fn harness_reproduces_busy_snapshot_extended_code() {
+        // The harness must yield exactly extended code 517 — not plain
+        // SQLITE_BUSY — or every consumer test below proves nothing.
+        let error = produce_busy_snapshot_error();
+        match &error {
+            rusqlite::Error::SqliteFailure(ffi_error, _) => {
+                assert_eq!(
+                    ffi_error.extended_code,
+                    rusqlite::ffi::SQLITE_BUSY_SNAPSHOT,
+                    "expected extended code 517 (SQLITE_BUSY_SNAPSHOT), got {error:?}"
+                );
+                assert_eq!(ffi_error.code, rusqlite::ErrorCode::DatabaseBusy);
+            }
+            other => panic!("expected SqliteFailure, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn is_busy_snapshot_error_true_for_genuine_busy_snapshot() {
+        let error = MemoryError::from(produce_busy_snapshot_error());
+        assert!(is_busy_snapshot_error(&error));
+    }
+
+    #[test]
+    fn is_busy_snapshot_error_false_for_plain_busy_and_locked() {
+        // Plain SQLITE_BUSY (5) and SQLITE_LOCKED (6) satisfy the broad
+        // `is_busy_error` predicate but must NOT satisfy the snapshot-specific
+        // one: extended code 517 is the only accepted value.
+        let plain_busy = MemoryError::Db(rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_BUSY),
+            None,
+        ));
+        assert!(!is_busy_snapshot_error(&plain_busy));
+
+        let plain_locked = MemoryError::Db(rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_LOCKED),
+            None,
+        ));
+        assert!(!is_busy_snapshot_error(&plain_locked));
+    }
+
+    #[test]
+    fn is_busy_snapshot_error_false_for_semantic_error() {
+        let semantic = MemoryError::Validation("not a database error".into());
+        assert!(!is_busy_snapshot_error(&semantic));
     }
 }
