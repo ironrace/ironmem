@@ -730,8 +730,8 @@ function isolationCutBrief(isoPath) {
   return [
     'Setup task, not a review. Run the commands below in a shell and report what happened. Do not review anything, do not read source, do not edit any file.',
     '',
-    `${REPO_ROOT} must be the TOP LEVEL of its checkout. ${isoPath} is built by appending a suffix to it, so if ${REPO_ROOT} were a subdirectory the worktree would land INSIDE the tree under review. Check it first, and if it does not print ${REPO_ROOT} exactly, report ok: false, created: false and stop:`,
-    `  test "$(git -C ${REPO_ROOT} rev-parse --show-toplevel)" = "${REPO_ROOT}"`,
+    `${REPO_ROOT} must be the TOP LEVEL of its checkout. ${isoPath} is built by appending a suffix to it, so if ${REPO_ROOT} were a subdirectory the worktree would land INSIDE the tree under review. Check it first — resolving both sides through the filesystem so a symlinked path (e.g. macOS /tmp) does not read as a false mismatch — and if they do not match, report ok: false, created: false and stop:`,
+    `  test "$(git -C ${REPO_ROOT} rev-parse --show-toplevel)" = "$(cd ${REPO_ROOT} && pwd -P)"`,
     '',
     `${isoPath} must not already exist. If it does, report ok: false, created: false and stop: it belongs to another run or is user data. Do not run rm, git worktree remove, or any cleanup command on it.`,
     `  test ! -e ${isoPath}`,

@@ -438,24 +438,8 @@ mod tests {
     use super::*;
     use crate::collab::queue::{create_session, SessionRecord};
     use crate::collab::{issue_or_reuse_handoff, Agent, CollabRoles, Phase};
+    use crate::mcp::tools::test_support::test_app_with_db_path;
     use std::sync::Arc;
-
-    fn test_app_with_db_path(
-        db_path: std::path::PathBuf,
-        root: &std::path::Path,
-    ) -> Arc<crate::mcp::app::App> {
-        use crate::config::{Config, EmbedMode, McpAccessMode};
-        let config = Config {
-            db_path,
-            model_dir: root.join("model"),
-            model_dir_explicit: true,
-            state_dir: root.join("state"),
-            mcp_access_mode: McpAccessMode::Trusted,
-            embed_mode: EmbedMode::Noop,
-        };
-        #[allow(clippy::arc_with_non_send_sync)]
-        Arc::new(crate::mcp::app::App::new(config).unwrap())
-    }
 
     fn sample_record(phase: Phase) -> SessionRecord {
         use crate::collab::CollabSession;

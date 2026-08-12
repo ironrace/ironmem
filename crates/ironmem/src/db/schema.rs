@@ -521,8 +521,8 @@ impl Database {
     ///
     /// ## Known in-tree exceptions
     ///
-    /// The tree does **not** honor the contract literally. Two production
-    /// closures reach outside the transaction today. Both are replay-safe, but
+    /// The tree does **not** honor the contract literally. Three production
+    /// closures reach outside the transaction today. All are replay-safe, but
     /// for reasons specific to each — not because the contract held:
     ///
     /// 1. `crates/ironmem/src/mcp/tools/handoff.rs` —
@@ -564,8 +564,24 @@ impl Database {
     ///    competing commit has to invalidate the snapshot. That makes this the
     ///    closure most likely to lose the snapshot race and consume the whole
     ///    retry budget.
+    /// 3. `crates/ironmem/src/mcp/tools/collab_session.rs` —
+    ///    `ensure_no_conflicting_process_session_tx`, called from inside
+    ///    `handle_collab_start`'s and `handle_collab_start_code_review`'s
+    ///    closures, mutates the same process-global `RwLock<HashMap>` active-
+    ///    session-scope cache as exception 1 above
+    ///    (`App::clear_active_collab_session_for_scope_if_matches`), used for
+    ///    metrics attribution rather than authorization. Replaying it is safe
+    ///    for the same shape of reason as exception 1: the clear is
+    ///    conditional on the cached binding still matching the session being
+    ///    superseded, so it is a no-op once already cleared, and a clear that
+    ///    survives a rolled-back attempt only means the scope's next lookup
+    ///    finds no cached binding — the metrics-attribution code path already
+    ///    treats an absent binding as "not eligible for implicit
+    ///    attribution," never as a wider grant. Worst case is a transient
+    ///    attribution miss until a later successful call repopulates the
+    ///    binding, not a correctness or authorization gap.
     ///
-    /// A third exception added without updating this list would be
+    /// A fourth exception added without updating this list would be
     /// indistinguishable, at review time, from a closure that honors the
     /// contract — so add it here.
     pub fn with_transaction<T>(
