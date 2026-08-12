@@ -1725,4 +1725,154 @@ for (const verdict of ['PLAUSIBLE', 'REFUTED', 'UNVERIFIED', 'N/A', '']) {
     assert.ok(out.erroredLenses.includes('G')))
 }
 
+// --- find-phase worktree isolation (exhaustive) ----------------------------
+//
+// The smoke section above is deliberately thin. This is "the tests that own
+// this path": cut failure, an unconfirmed release surfacing as a leak, the
+// no-anchor path, PR Mode's range staying intact inside the worktree, an
+// expand command that cannot be safely retargeted, the fix fan-out staying
+// unisolated on purpose, and a negative test that proves the
+// shared-checkout-safety assertion is not vacuous — it actually fails against
+// a source that regresses to naming the shared checkout in cleanup.
+{
+  const WT_G = `/r-ultrareview-g-${SHA.slice(0, 12)}`
+  const WT_K = `/r-ultrareview-k-${SHA.slice(0, 12)}`
+  const isoArgs = { ...baseArgs, changedLines: 1000, lenses: ['A'], reportOnly: true }
+
+  // ---- cut fails: the lens is never dispatched, cleanup still runs, and the
+  // failure is coverage-affecting, not a silent zero.
+  {
+    const impl = (b, o) => {
+      if (o.label === 'isolate:G cut') return { ok: false, detail: 'fatal: not a git repository' }
+      return noFindings(b, o)
+    }
+    const { out, calls, logs } = await run(isoArgs, impl)
+    check('a failed cut never dispatches the lens', () =>
+      assert.ok(!calls.some((c) => c.opts.label.startsWith('find:G '))))
+    check('a failed cut still releases (half-cut cleanup)', () =>
+      assert.ok(calls.some((c) => c.opts.label === 'isolate:G release')))
+    check('a failed cut is reported as errored coverage, not a clean zero', () => {
+      assert.ok(out.erroredLenses.includes('G'))
+      assert.equal(out.coverageComplete, false)
+      const cov = out.coverage.find((c) => c.id === 'G')
+      assert.ok(cov.errored)
+      assert.match(cov.errorReason, /could not be cut/)
+    })
+    check('the reason reaches the log too', () =>
+      assert.ok(logs.some((l) => l.includes('was not dispatched'))))
+  }
+
+  // ---- release cannot confirm removal: reported as a leak, not swallowed.
+  {
+    const impl = (b, o) => {
+      if (o.label === 'isolate:G release') return { ok: false, detail: 'directory busy' }
+      return noFindings(b, o)
+    }
+    const { out } = await run(isoArgs, impl)
+    check('an unconfirmed release is reported as a leak, by exact path', () =>
+      assert.deepEqual(out.isolationLeaks, [WT_G]))
+  }
+
+  // ---- no anchor: no worktree is cut at all, mutating lenses do not run
+  // against the shared checkout as a fallback, and read-only lenses are
+  // unaffected.
+  {
+    const { out, calls } = await run({ ...isoArgs, rollbackSha: '' }, noFindings)
+    check('no anchor cuts no worktree', () =>
+      assert.ok(!calls.some((c) => c.opts.label.startsWith('isolate:'))))
+    check('no anchor means the mutating lenses are not dispatched at all', () => {
+      assert.ok(!calls.some((c) => c.opts.label.startsWith('find:G ')))
+      assert.ok(!calls.some((c) => c.opts.label.startsWith('find:K ')))
+      assert.ok(out.erroredLenses.includes('G') && out.erroredLenses.includes('K'))
+    })
+    check('read-only lenses still run without an anchor', () =>
+      assert.ok(calls.some((c) => c.opts.label.startsWith('find:A '))))
+  }
+
+  // ---- PR Mode: the caller's base...head range reaches the worktree
+  // unchanged (it resolves there — a linked worktree shares the object
+  // store), only `--repo` is retargeted.
+  {
+    const prArgs = {
+      ...isoArgs,
+      mode: 'pr',
+      diffRange: 'main...feat',
+      expandCmd: 'ironmem review-diff --repo /r --base main --head feat --expand-file <path> --hunk <ordinal>',
+    }
+    const { calls } = await run(prArgs, noFindings)
+    const g = calls.find((c) => c.opts.label.startsWith('find:G '))
+    check('PR mode keeps base/head and retargets only --repo', () =>
+      assert.ok(g.brief.includes(`ironmem review-diff --repo ${WT_G} --base main --head feat`)))
+    check('PR mode keeps the caller diff range, not the local-mode snapshot range', () =>
+      assert.ok(g.brief.includes('Diff range: main...feat')))
+  }
+
+  // ---- an expand command that does not carry `--repo <REPO_PATH>` verbatim
+  // cannot be safely retargeted, so it is dropped for the isolated lens
+  // rather than left pointing at the shared tree.
+  {
+    const badExpand = {
+      ...isoArgs,
+      expandCmd: 'ironmem review-diff --repo /other --worktree --expand-file <path> --hunk <ordinal>',
+    }
+    const { calls } = await run(badExpand, noFindings)
+    const g = calls.find((c) => c.opts.label.startsWith('find:G '))
+    check('an unretargetable expand command is dropped, not left pointing at the shared tree', () => {
+      assert.ok(!g.brief.includes('--repo /other'))
+      assert.ok(!g.brief.includes(`--repo ${WT_G}`))
+    })
+  }
+
+  // ---- the post-confirmation fix fan-out is deliberately unisolated: fixes
+  // must land in the shared tree.
+  {
+    const hi = { file: 'a.rs', line: 1, severity: 'HIGH', confidence: 'high', issue: 'x', failure_scenario: 'a concrete scenario long enough to pass validation', suggested_fix: 'y' }
+    const impl = (b, o) => {
+      if (o.phase === 'Find') return { findings: o.label.startsWith('find:A ') ? [hi] : [] }
+      if (o.phase === 'Verify') return { verdict: 'CONFIRMED', evidence: 'e', fix_complexity: 'mechanical', fix_class: 'correctness' }
+      if (o.phase === 'Fix') return { results: [{ index: 1, file: 'a.rs', line: 1, outcome: 'fixed', note: 'n' }] }
+      return { in_scope: true, out_of_scope_changes: [], summary: 's' }
+    }
+    const { calls } = await run({ ...isoArgs, reportOnly: false }, impl)
+    const fix = calls.filter((c) => c.opts.phase === 'Fix')
+    check('fix agents run with no cwd, against the shared tree, untouched by isolation', () => {
+      assert.equal(fix.length, 1)
+      assert.equal(fix[0].opts.cwd, undefined)
+      assert.ok(!fix[0].brief.includes('-ultrareview-'))
+    })
+  }
+
+  // ---- negative test: prove the shared-checkout-safety assertion is not
+  // vacuous. Patch the real source so the `finally`-block release call is
+  // handed the shared checkout instead of the throwaway worktree — the exact
+  // regression the smoke section's "cleanup never names the shared checkout"
+  // check exists to catch — and confirm that check actually fires against it.
+  {
+    const target = 'releaseIsolationWorktree(id, isoPath)'
+    const idx = body.lastIndexOf(target)
+    check('setup: located the finally-block release call to mutate', () => assert.ok(idx > 0))
+    const patched = body.slice(0, idx) + 'releaseIsolationWorktree(id, REPO_ROOT)' + body.slice(idx + target.length)
+    check('setup: patching the release call actually changed the source', () => assert.notEqual(patched, body))
+    const patchedMake = new AsyncFunction('args', 'budget', 'agent', 'parallel', 'pipeline', 'log', 'phase', 'workflow', patched)
+    const calls = []
+    const agent = (brief, opts) => {
+      calls.push({ brief, opts })
+      return Promise.resolve().then(() => (isIsolationCall(opts) ? { ok: true, detail: '' } : noFindings(brief, opts)))
+    }
+    await patchedMake(isoArgs, {}, agent, parallel, pipeline, () => {}, () => {}, () => {})
+    const rel = calls.find((c) => c.opts.label === 'isolate:G release').brief
+    check('setup: the patched source reproduces the regression — cleanup now names the shared checkout', () =>
+      assert.ok(rel.includes('git -C /r worktree remove')))
+    check('the shared-checkout-safety assertion catches this regression', () => {
+      let caught = false
+      try {
+        assert.ok(!rel.split(WT_G).join('').includes('/r'))
+      } catch {
+        caught = true
+      }
+      assert.ok(caught, 'the safety assertion did not fire against a release brief naming the shared checkout')
+    })
+  }
+}
+
 console.log(`\n${pass} checks passed`)
