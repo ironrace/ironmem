@@ -372,8 +372,19 @@ impl Database {
     ///
     /// # Call sites
     ///
-    /// (Populated as call sites migrate to this opt-out; see the
-    /// `with_transaction` bound-widening work.)
+    /// **None.** There are currently zero production call sites. Widening
+    /// `with_transaction` to `Fn` was compiler-checked against every call
+    /// site in the workspace: exactly one closure failed the new bound
+    /// (`symbol_graph::index::index_repo`, which accumulated per-file counts
+    /// into captured `usize`s), and it was repairable rather than
+    /// non-repeatable — it now returns its counts so the caller accumulates
+    /// them after commit. No closure in the tree is non-repeatable in
+    /// principle, so none needs this opt-out.
+    ///
+    /// This list is the single reviewable place the escape-hatch surface can
+    /// be audited from: any future call site must be added here with its
+    /// path, why the closure is non-repeatable in principle, and why
+    /// forfeiting `SQLITE_BUSY_SNAPSHOT` retry is safe there.
     pub fn with_transaction_once<T>(
         &self,
         f: impl FnOnce(&Transaction<'_>) -> Result<T, MemoryError>,
