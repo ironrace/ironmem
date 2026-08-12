@@ -38,6 +38,16 @@ const COLLAB_PILOT_SQL: &str = include_str!("../../migrations/019_collab_pilot.s
 /// behind-migration database from an up-to-date one.
 pub const LATEST_SCHEMA_VERSION: i64 = 19;
 
+/// Total attempts (first try included) `with_transaction` makes when every
+/// attempt fails with `SQLITE_BUSY_SNAPSHOT`. See the retry-policy section of
+/// [`Database::with_transaction`] for why this is bounded.
+const BUSY_SNAPSHOT_MAX_ATTEMPTS: usize = 5;
+
+/// Fixed pause between busy-snapshot retry attempts. A snapshot retry needs a
+/// *fresh* snapshot, not a long wait, so a short fixed delay (to let the
+/// competing writer finish its commit) is sufficient — no backoff.
+const BUSY_SNAPSHOT_RETRY_DELAY: Duration = Duration::from_millis(10);
+
 /// Database wrapper around a SQLite connection.
 ///
 /// `conn` is intentionally restricted to `pub(super)` (visible only within
@@ -328,27 +338,84 @@ impl Database {
         self.migrate()
     }
 
-    /// Execute a closure inside a SQLite transaction and commit on success.
+    /// Execute a closure inside a SQLite transaction and commit on success,
+    /// with a bounded retry for `SQLITE_BUSY_SNAPSHOT`.
     ///
-    /// The closure is bound by `Fn`, not `FnOnce`, because this function is
-    /// gaining a bounded `SQLITE_BUSY_SNAPSHOT` retry loop that may call it
-    /// more than once. Closures that genuinely cannot be called twice (they
-    /// move an uncloneable capture, or perform a non-idempotent side effect
-    /// outside the database) belong on [`Self::with_transaction_once`].
+    /// # Retry policy
+    ///
+    /// **Retried:** only `SQLITE_BUSY_SNAPSHOT` (extended result code 517),
+    /// detected by [`is_busy_snapshot_error`]. In WAL mode this means a
+    /// concurrent connection committed after this transaction pinned its read
+    /// snapshot, so the read→write upgrade was refused. Waiting inside the
+    /// same transaction is futile (SQLite never invokes the busy handler for
+    /// this code — a stale snapshot cannot become fresh), but re-running the
+    /// *whole* transaction from `BEGIN` acquires a new snapshot, which is
+    /// exactly what each retry attempt does.
+    ///
+    /// **Never retried:** every other `MemoryError`, including all
+    /// semantic/validation failures, `NotFound`, and every other SQLite code
+    /// (plain `SQLITE_BUSY`, constraint violations, I/O errors, …). Those
+    /// propagate immediately from the first attempt, unretried: a semantic
+    /// failure is deterministic — re-running the closure would produce the
+    /// same error, waste the delay budget, and mask real bugs behind
+    /// "it failed five times" noise.
+    ///
+    /// **Bound:** a fixed cap of [`BUSY_SNAPSHOT_MAX_ATTEMPTS`] (5) total
+    /// attempts with a short fixed sleep between them. The cap is deliberate:
+    /// under sustained contention an unbounded loop would hang the caller
+    /// invisibly, whereas exhausting the cap surfaces the busy-snapshot error
+    /// itself as a clear, diagnosable failure.
+    ///
+    /// # Why retrying is safe (atomicity)
+    ///
+    /// Each attempt is a complete `BEGIN`/`COMMIT` against a fresh
+    /// transaction. A failed attempt's transaction is dropped uncommitted,
+    /// and rusqlite's `Transaction` rolls back on `Drop` — so a failed
+    /// attempt leaves **no partial state**: the database after N failed
+    /// attempts is byte-for-byte the state before attempt 1. That is what
+    /// makes retry-until-success sound — a retry can never double-apply or
+    /// half-apply the closure's writes.
+    ///
+    /// # Closure contract: no non-DB side effects
+    ///
+    /// Because the closure may run more than once, it must not perform any
+    /// side effect outside the database that is unsafe to repeat — no network
+    /// calls, no file writes, no mutation of external caches or captured
+    /// state that survives a rolled-back attempt. Only its writes *through
+    /// the transaction* are undone by rollback. Closures that cannot honor
+    /// this contract (non-idempotent external effects, or captures that can
+    /// only be consumed once) belong on [`Self::with_transaction_once`], the
+    /// documented no-retry opt-out.
     pub fn with_transaction<T>(
         &self,
         f: impl Fn(&Transaction<'_>) -> Result<T, MemoryError>,
     ) -> Result<T, MemoryError> {
-        let tx = self.conn.unchecked_transaction()?;
-        let result = f(&tx)?;
-        tx.commit()?;
-        Ok(result)
+        let mut attempt = 1;
+        loop {
+            let result: Result<T, MemoryError> = (|| {
+                let tx = self.conn.unchecked_transaction()?;
+                let value = f(&tx)?;
+                tx.commit()?;
+                Ok(value)
+            })();
+            match result {
+                Err(error)
+                    if is_busy_snapshot_error(&error) && attempt < BUSY_SNAPSHOT_MAX_ATTEMPTS =>
+                {
+                    // The failed attempt's `Transaction` was dropped above,
+                    // rolling it back; the next iteration begins fresh.
+                    attempt += 1;
+                    std::thread::sleep(BUSY_SNAPSHOT_RETRY_DELAY);
+                }
+                other => return other,
+            }
+        }
     }
 
     /// Execute a closure inside a SQLite transaction and commit on success,
     /// **without any retry**.
     ///
-    /// `with_transaction` is gaining a bounded retry loop for
+    /// `with_transaction` has a bounded retry loop for
     /// `SQLITE_BUSY_SNAPSHOT` (a concurrent writer invalidated this
     /// transaction's read snapshot), which requires its closure to be safely
     /// callable more than once and so widens its bound from `FnOnce` to
@@ -367,8 +434,8 @@ impl Database {
     /// Every call site must carry a one-line comment explaining which of the
     /// above applies. Choosing this variant forfeits the bounded
     /// `SQLITE_BUSY_SNAPSHOT` retry guarantee that `with_transaction`
-    /// provides (once its retry loop lands), so prefer `with_transaction`
-    /// whenever the closure can be made `Fn`.
+    /// provides, so prefer `with_transaction` whenever the closure can be
+    /// made `Fn`.
     ///
     /// # Call sites
     ///
@@ -523,9 +590,6 @@ fn is_busy_error(error: &rusqlite::Error) -> bool {
 /// waiting is futile but *re-running the whole transaction* is guaranteed to
 /// see a fresh snapshot — which is exactly what the bounded retry loop in
 /// `with_transaction` needs to detect.
-// TODO(Task 6): drop the `cfg_attr` once `with_transaction`'s retry loop
-// consumes this predicate outside the test module.
-#[cfg_attr(not(test), allow(dead_code))]
 fn is_busy_snapshot_error(error: &MemoryError) -> bool {
     matches!(
         error,
@@ -1828,5 +1892,152 @@ mod tests {
     fn is_busy_snapshot_error_false_for_semantic_error() {
         let semantic = MemoryError::Validation("not a database error".into());
         assert!(!is_busy_snapshot_error(&semantic));
+    }
+
+    // ---- `with_transaction` bounded busy-snapshot retry (Task 6) ----
+
+    /// Task 6 extension of the Task 5 harness above: instead of producing one
+    /// bare `SQLITE_BUSY_SNAPSHOT` error, this sets up a file-backed WAL
+    /// [`Database`] plus a second "contender" connection so a test can dictate
+    /// *per attempt* whether `with_transaction`'s closure hits a genuine
+    /// busy-snapshot failure. Same determinism recipe as
+    /// [`produce_busy_snapshot_error`] — staleness is engineered purely by
+    /// statement ordering on one thread, never by sleeps or timing races.
+    ///
+    /// The caller must retain the returned `TempDir` for the test's lifetime.
+    fn retry_harness() -> (tempfile::TempDir, Database, rusqlite::Connection) {
+        let dir = tempfile::tempdir().unwrap();
+        // WAL mode requires a real file-backed database, not `:memory:`.
+        let db_path = dir.path().join("retry_probe.db");
+        let db = Database::open(&db_path).unwrap();
+        db.exec_raw("CREATE TABLE retry_probe (id INTEGER PRIMARY KEY, v INTEGER NOT NULL);")
+            .unwrap();
+        let contender = rusqlite::Connection::open(&db_path).unwrap();
+        (dir, db, contender)
+    }
+
+    /// Drive `with_transaction` so its first `fail_first_n` attempts fail with
+    /// a genuine `SQLITE_BUSY_SNAPSHOT` and every later attempt succeeds.
+    ///
+    /// Each attempt of the closure:
+    /// 1. increments `attempts` (so the test can count invocations),
+    /// 2. pins the attempt's read snapshot with a `SELECT` (the transaction is
+    ///    `BEGIN DEFERRED`, so no lock is taken until the first write),
+    /// 3. if this attempt is still within `fail_first_n`, has the contender
+    ///    connection commit a write — advancing the WAL past the snapshot
+    ///    pinned in step 2, so
+    /// 4. the closure's own `INSERT` (value 100) deterministically fails the
+    ///    read→write upgrade with extended code 517. Past `fail_first_n`, the
+    ///    contender stays quiet and the same `INSERT` succeeds.
+    fn run_retry_scenario(
+        db: &Database,
+        contender: &rusqlite::Connection,
+        fail_first_n: usize,
+        attempts: &std::cell::Cell<usize>,
+    ) -> Result<(), MemoryError> {
+        db.with_transaction(|tx| {
+            let attempt = attempts.get() + 1;
+            attempts.set(attempt);
+            let _count: i64 =
+                tx.query_row("SELECT COUNT(*) FROM retry_probe", [], |row| row.get(0))?;
+            if attempt <= fail_first_n {
+                contender.execute("INSERT INTO retry_probe (v) VALUES (?1)", [attempt as i64])?;
+            }
+            tx.execute("INSERT INTO retry_probe (v) VALUES (100)", [])?;
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn with_transaction_retry_exhaustion_propagates_busy_snapshot() {
+        // (i) Exhaustion: the contender wins every attempt. After the fixed
+        // cap of 5 attempts the busy-snapshot error must propagate, and the
+        // closure must have run exactly 5 times (bounded, not infinite).
+        let (_dir, db, contender) = retry_harness();
+        let attempts = std::cell::Cell::new(0usize);
+
+        let result = run_retry_scenario(&db, &contender, usize::MAX, &attempts);
+
+        let error = result.expect_err("all attempts stale — busy snapshot must propagate");
+        assert!(
+            is_busy_snapshot_error(&error),
+            "exhaustion must surface the busy-snapshot error itself, got {error:?}"
+        );
+        assert_eq!(attempts.get(), 5, "retry must stop at the 5-attempt cap");
+
+        // No attempt may have left partial state behind: every failed attempt
+        // rolled back, so no closure INSERT (v=100) ever committed.
+        let committed: i64 = db
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM retry_probe WHERE v = 100",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(committed, 0, "failed attempts must leave no partial state");
+    }
+
+    #[test]
+    fn with_transaction_retry_succeeds_after_transient_contention() {
+        // (ii) Success after N: the contender wins the first 2 attempts and
+        // then stays quiet; attempt 3 must succeed and the committed state
+        // must reflect exactly ONE application of the closure.
+        let (_dir, db, contender) = retry_harness();
+        let attempts = std::cell::Cell::new(0usize);
+
+        run_retry_scenario(&db, &contender, 2, &attempts)
+            .expect("attempt 3 sees a fresh snapshot and must succeed");
+        assert_eq!(attempts.get(), 3, "2 stale attempts + 1 successful attempt");
+
+        // Exactly one committed closure write — the two rolled-back attempts
+        // must not have double-applied it.
+        let committed: i64 = db
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM retry_probe WHERE v = 100",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            committed, 1,
+            "committed state must reflect exactly one application of the closure"
+        );
+
+        // Sanity: both contender commits (v=1, v=2) are present.
+        let contender_rows: i64 = db
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM retry_probe WHERE v < 100",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(contender_rows, 2);
+    }
+
+    #[test]
+    fn with_transaction_retry_never_retries_semantic_error() {
+        // (iii) Negative: a semantic error is not a busy snapshot — the
+        // closure must run exactly once and the error must propagate
+        // unwrapped, on the first attempt.
+        let db = Database::open_in_memory().unwrap();
+        let calls = std::cell::Cell::new(0usize);
+
+        let result: Result<(), _> = db.with_transaction(|_tx| {
+            calls.set(calls.get() + 1);
+            Err(MemoryError::Validation("semantic failure".into()))
+        });
+
+        match result {
+            Err(MemoryError::Validation(msg)) => assert_eq!(msg, "semantic failure"),
+            other => panic!("expected the Validation error unwrapped, got {other:?}"),
+        }
+        assert_eq!(
+            calls.get(),
+            1,
+            "a non-busy-snapshot error must never trigger a retry"
+        );
     }
 }
