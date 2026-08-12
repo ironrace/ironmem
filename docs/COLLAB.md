@@ -935,13 +935,21 @@ failure at that one command loses exactly one `gh` invocation, nothing else
 about the session's work is at risk. Making the most authority-sensitive
 transition in the whole machine (the one that hands a reviewed, pushed
 branch to a human as a PR) resumable, just to save re-running one command,
-is a bad trade. It is also asymmetric with the six recoverable prefixes on
-purpose: when Codex owns `final_review` under recovery and `gh pr create`
-fails there, it reports `network_failed:` or `sandbox_denied:`, which
-classify Tooling and hand the turn to Claude — its live counterpart. Claude
-owns PR creation in the normal flow and has no counterpart of its own to
-hand a `pr_create_failed:` retry to, so there is nothing for a Tooling
-classification to hand off to.
+is a bad trade. It is also structurally different from the six recoverable
+prefixes above, each of which names an operation either agent's own turn
+might perform and so always has a live counterpart on the other side to
+hand off to. PR creation isn't one of those: it is Claude-worker-only by
+design. The Claude-side submit worker (`collab-turn-submit.md`) is the one
+that runs `gh pr create`, even when `$SENDER == "codex"` — Codex's own
+final-review and batch-implementation prompts
+(`.codex-plugin/prompts/collab-final-review.md`,
+`.codex-plugin/prompts/collab-batch-impl.md`) explicitly forbid Codex from
+calling `gh pr create`, `gh pr list`, or any pull-request remote check.
+There is no scenario where Codex's own turn fails at PR creation and hands a
+Tooling-classified report back to Claude, because Codex never attempts PR
+creation in the first place. The asymmetry is simply that Claude is the
+only agent that ever runs this command, so a failure at it has no
+counterpart process to hand a retry to.
 
 **Incident context.** The motivating incident (session `06667e54`: 29 green,
 reviewed, pushed commits apparently stranded by a `pr_create_failed:`
@@ -975,8 +983,11 @@ hand, not a protocol action:
    gh pr create --base <integration-branch> --head <branch> \
      --title <title> --body <body>
    ```
-   using the title/body the failed turn was trying to send (recoverable from
-   the session's artifact/drawer, or written fresh by the human).
+   using the title/body the failed turn was trying to send — recoverable
+   from the staged drawer named by that turn's `$ARTIFACT_REF` via
+   `get_drawer(id=<artifact_ref>)` (drawers are immutable, so the staged
+   title/body is unchanged), or written fresh by the human if the drawer is
+   gone.
 
 ## Blind-Draft Invariant
 

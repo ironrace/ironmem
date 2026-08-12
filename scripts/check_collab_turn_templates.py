@@ -681,10 +681,11 @@ RUST_PREFIX_RE = re.compile(
 #   mechanical_direct_gate_failed: the same, on Codex's mechanical_direct path
 #   skill_overran_pr_boundary:     a sub-skill opened a PR outside the protocol
 #   pr_create_failed:              `gh pr create` failed on Claude's final turn
-# `pr_create_failed:` stays Terminal deliberately (asymmetric with Codex's
-# recoverable PR-turn prefixes, which hand off to a live Claude counterpart —
-# Claude has none) — see "`pr_create_failed:` stays Terminal" in
-# docs/COLLAB.md for the full rationale and manual recovery steps.
+# `pr_create_failed:` stays Terminal deliberately: PR creation is
+# Claude-worker-only (Codex never calls `gh pr create`, even when it owns the
+# turn), so a failure here has no live counterpart to hand a retry to — see
+# "`pr_create_failed:` stays Terminal" in docs/COLLAB.md for the full
+# rationale and manual recovery steps.
 DOCUMENTED_TERMINAL_PREFIXES = {
     "subagent_failure:",
     "gate_failure:",
@@ -1878,6 +1879,23 @@ def check_pr_base_resolution_contract() -> None:
         if snippet not in doc_text:
             err(f"docs/COLLAB.md: missing PR-base resolution contract "
                 f"{snippet!r}")
+
+
+def check_pr_create_failed_doc_pointer_contract() -> None:
+    """The shrunk `pr_create_failed:` comment must still resolve.
+
+    `check_collab_turn_templates.py`'s `DOCUMENTED_TERMINAL_PREFIXES` comment
+    deliberately doesn't restate why `pr_create_failed:` stays Terminal — it
+    points at a heading in docs/COLLAB.md instead, so the rationale lives in
+    exactly one place. That pointer is only load-bearing if the heading it
+    names actually exists; pin it so a doc reorganization that drops or
+    renames the heading fails here instead of leaving a dead pointer.
+    """
+    doc_text = DOC.read_text()
+    if "`pr_create_failed:` stays Terminal" not in doc_text:
+        err("docs/COLLAB.md: missing the `pr_create_failed:` stays Terminal "
+            "heading that scripts/check_collab_turn_templates.py's "
+            "DOCUMENTED_TERMINAL_PREFIXES comment points at")
 
 
 # The two collab.md dispatch rows that hand off to collab-turn-submit.md
@@ -3234,6 +3252,7 @@ def main() -> int:
     check_installer_covers_templates()
     check_precondition_phase_names()
     check_pr_base_resolution_contract()
+    check_pr_create_failed_doc_pointer_contract()
     check_sender_dispatch_contract()
     check_codex_pilot_routing_contract()
     check_codex_pilot_compose_handoff_contract()
