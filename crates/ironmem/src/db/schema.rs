@@ -58,6 +58,33 @@ pub struct Database {
     pub(super) conn: Connection,
 }
 
+/// What [`Database::arm_busy_snapshot_once`] observed on the armed connection.
+///
+/// Both counters keep running for the connection's lifetime, so a test reads
+/// them *after* the production call it is exercising has returned.
+#[cfg(test)]
+pub(crate) struct BusySnapshotProbe {
+    transactions: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    contentions: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+}
+
+#[cfg(test)]
+impl BusySnapshotProbe {
+    /// Number of `BEGIN`s issued on the armed connection — one per
+    /// [`Database::with_transaction`] attempt, so `2` means the first attempt
+    /// failed and was replayed.
+    pub(crate) fn transactions_begun(&self) -> usize {
+        self.transactions.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Number of contending commits that actually landed. Arming injects at
+    /// most one, so `0` means the fixture never fired — the contended call ran
+    /// unopposed and the test proved nothing.
+    pub(crate) fn contentions_injected(&self) -> usize {
+        self.contentions.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
 impl Database {
     /// Open (or create) the database at the given path.
     pub fn open(path: &Path) -> Result<Self, MemoryError> {
@@ -146,6 +173,96 @@ impl Database {
     pub(crate) fn exec_raw(&self, sql: &str) -> Result<(), MemoryError> {
         self.conn.execute_batch(sql)?;
         Ok(())
+    }
+
+    /// Test-only contention fixture: arm this connection so that the **next**
+    /// transaction which reads before it writes fails, exactly once, with a
+    /// genuine `SQLITE_BUSY_SNAPSHOT` (extended code 517).
+    ///
+    /// This is the Task 5/6 determinism recipe (two connections on one
+    /// file-backed WAL database, staleness engineered by statement ordering on
+    /// a single thread — never by sleeps or timing races) generalised so it can
+    /// be pointed at a **production** closure, whose body a test cannot edit to
+    /// interleave the contending write by hand.
+    ///
+    /// The interleave point is SQLite's authorizer, which fires while a
+    /// statement is being *prepared*. Within one `with_transaction` attempt the
+    /// statements run in order, so the first authorizer callback reporting a
+    /// write action (`INSERT`/`UPDATE`/`DELETE`) is necessarily raised *after*
+    /// the closure's preceding read has already been stepped — i.e. after the
+    /// transaction's read snapshot is pinned — and *before* that write is
+    /// stepped. Committing the contender's write at exactly that moment
+    /// advances the WAL past the pinned snapshot, so the closure's write then
+    /// fails the read→write upgrade with `SQLITE_BUSY_SNAPSHOT` immediately
+    /// (the busy handler is never consulted for this code — waiting cannot
+    /// un-stale a snapshot). The contender fires only once, so the replay that
+    /// [`Self::with_transaction`] performs sees a fresh snapshot and commits.
+    ///
+    /// The returned [`BusySnapshotProbe`] reports what actually happened, so a
+    /// test can prove the replay occurred instead of assuming it:
+    /// `transactions_begun()` counts `BEGIN`s on this connection (one per
+    /// `with_transaction` attempt) and `contentions_injected()` counts
+    /// contender commits.
+    ///
+    /// `path` must be the path this database was opened from. The armed
+    /// authorizer owns the contending connection and lives until this
+    /// `Database` is dropped.
+    #[cfg(test)]
+    pub(crate) fn arm_busy_snapshot_once(
+        &self,
+        path: &Path,
+    ) -> Result<BusySnapshotProbe, MemoryError> {
+        use rusqlite::hooks::{AuthAction, AuthContext, Authorization, TransactionOperation};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        // Scratch table for the contender: its commit only has to advance the
+        // WAL, so it must not touch any table the test asserts on.
+        self.conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS busy_snapshot_contention (id INTEGER PRIMARY KEY);",
+        )?;
+        let contender = Connection::open(path)?;
+
+        let transactions = Arc::new(AtomicUsize::new(0));
+        let contentions = Arc::new(AtomicUsize::new(0));
+        let transaction_counter = Arc::clone(&transactions);
+        let contention_counter = Arc::clone(&contentions);
+        let mut armed = true;
+
+        self.conn.authorizer(Some(move |context: AuthContext<'_>| {
+            match context.action {
+                AuthAction::Transaction {
+                    operation: TransactionOperation::Begin,
+                } => {
+                    transaction_counter.fetch_add(1, Ordering::SeqCst);
+                }
+                AuthAction::Insert { .. }
+                | AuthAction::Update { .. }
+                | AuthAction::Delete { .. }
+                    if armed =>
+                {
+                    armed = false;
+                    // Deliberately not `expect`: this runs inside a SQLite
+                    // callback, where a panic would surface as an opaque
+                    // authorizer failure. Count only commits that landed, and
+                    // let the test's `contentions_injected()` assertion report
+                    // a fixture that failed to fire.
+                    if contender
+                        .execute("INSERT INTO busy_snapshot_contention DEFAULT VALUES", [])
+                        .is_ok()
+                    {
+                        contention_counter.fetch_add(1, Ordering::SeqCst);
+                    }
+                }
+                _ => {}
+            }
+            Authorization::Allow
+        }));
+
+        Ok(BusySnapshotProbe {
+            transactions,
+            contentions,
+        })
     }
 
     /// Open an in-memory database (for testing and integration tests).
