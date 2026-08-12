@@ -503,6 +503,71 @@ impl Database {
     /// this contract (non-idempotent external effects, or captures that can
     /// only be consumed once) belong on [`Self::with_transaction_once`], the
     /// documented no-retry opt-out.
+    ///
+    /// **Nothing enforces that contract.** The `Fn` bound is not a
+    /// repeatability check. All it rules out is capture by unique borrow
+    /// (`&mut`) and moved-out captures — the *syntactic* shapes that make a
+    /// closure literally uncallable a second time. It permits every side
+    /// effect that actually matters here, because none of them need a unique
+    /// borrow at the capture site: `Cell`/`RefCell`/`Mutex`/`RwLock`/atomic
+    /// interior mutability, `Command::new(..).output()`, `std::fs::write`, an
+    /// outbound HTTP request. A future closure that bumps an `AtomicU64`,
+    /// pushes onto a `RefCell<Vec<_>>`, emits a webhook, or appends to a log
+    /// file compiles cleanly under `Fn` and then silently double-applies that
+    /// effect the first time a busy-snapshot replay fires — invisible in every
+    /// uncontended test run, reproducible only under real concurrency. This
+    /// contract is prose, upheld by review; treat this section as its
+    /// checklist, not as a description of something the compiler checks.
+    ///
+    /// ## Known in-tree exceptions
+    ///
+    /// The tree does **not** honor the contract literally. Two production
+    /// closures reach outside the transaction today. Both are replay-safe, but
+    /// for reasons specific to each — not because the contract held:
+    ///
+    /// 1. `crates/ironmem/src/mcp/tools/handoff.rs` —
+    ///    `ensure_actor_generation_current`, called from inside the caller's
+    ///    closure (e.g. `handle_collab_send`), mutates the process-global
+    ///    `RwLock<HashMap>` advisory generation cache: it clears an entry
+    ///    (`App::clear_cached_generation`) on the cache-ahead-of-DB path, and
+    ///    writes a `0` entry (`App::set_cached_generation`) on the
+    ///    never-handed-off path. Both survive a rolled-back attempt, so this
+    ///    is exactly the "mutation of external caches" the paragraph above
+    ///    forbids — the class `GenerationClaim` was introduced to eliminate
+    ///    (a *token claim* describes uncommitted DB state and is therefore
+    ///    deliberately not cached here; the caller publishes it after commit).
+    ///    Replaying them is nevertheless safe because both are idempotent and
+    ///    fail-closed. Clearing an absent entry is a no-op, and a dropped
+    ///    entry can only make the next check stricter — it falls back to the
+    ///    authoritative DB rules (bind at 0 on a never-handed-off session,
+    ///    otherwise demand a token), never wider. The `0` entry is written
+    ///    only on the `db_active == 0` path, so a surviving `0` can later
+    ///    select just two arms: `cached == db_active`, which admits exactly
+    ///    when `db_active` is still `0` — the same answer a *missing* entry
+    ///    produces via the `db_active == 0` branch — or `cached < db_active`
+    ///    once the DB generation advances, which refuses. The `cached >
+    ///    db_active` arm is unreachable from a `0` entry because
+    ///    `collab_generation_lease` carries a `CHECK (generation >= 0)`. So a
+    ///    replay can neither widen access nor desynchronize the cache.
+    /// 2. `crates/ironmem/src/mcp/tools/collab_session.rs` —
+    ///    `handle_collab_send`'s closure calls
+    ///    `validate_global_review_head_advance`, which spawns `git merge-base
+    ///    --is-ancestor` via `Command::new("git")` while the write transaction
+    ///    is open. The subprocess is read-only, so re-running it is safe in
+    ///    the sense that matters for correctness — but it is still a process
+    ///    spawn inside a closure this doc calls side-effect-free, it holds the
+    ///    transaction open across the blocking `Command::output()`, and the
+    ///    retry loop can now re-spawn it up to [`BUSY_SNAPSHOT_MAX_ATTEMPTS`]
+    ///    times per request. Worse for contention: in the tokenless case that
+    ///    spawn sits exactly between the reads that pin the transaction's
+    ///    snapshot and the first write, which is precisely the window a
+    ///    competing commit has to invalidate the snapshot. That makes this the
+    ///    closure most likely to lose the snapshot race and consume the whole
+    ///    retry budget.
+    ///
+    /// A third exception added without updating this list would be
+    /// indistinguishable, at review time, from a closure that honors the
+    /// contract — so add it here.
     pub fn with_transaction<T>(
         &self,
         f: impl Fn(&Transaction<'_>) -> Result<T, MemoryError>,
@@ -556,14 +621,25 @@ impl Database {
     ///
     /// # Call sites
     ///
-    /// **None.** There are currently zero production call sites. Widening
-    /// `with_transaction` to `Fn` was compiler-checked against every call
-    /// site in the workspace: exactly one closure failed the new bound
-    /// (`symbol_graph::index::index_repo`, which accumulated per-file counts
-    /// into captured `usize`s), and it was repairable rather than
-    /// non-repeatable — it now returns its counts so the caller accumulates
-    /// them after commit. No closure in the tree is non-repeatable in
-    /// principle, so none needs this opt-out.
+    /// **None.** There are currently zero production call sites — but that
+    /// absence is hand-maintained, not compiler-established.
+    ///
+    /// What widening `with_transaction` from `FnOnce` to `Fn` actually
+    /// established is narrower than "no closure needs the opt-out":
+    /// recompiling the workspace under the new bound surfaced exactly one
+    /// closure that failed it (`symbol_graph::index::index_repo`, which
+    /// accumulated per-file counts into captured `usize`s — a unique-borrow
+    /// capture, i.e. a *syntactic* failure, not a semantic one), and it was
+    /// repairable rather than non-repeatable: it now returns its counts so
+    /// the caller accumulates them after commit. Every other closure
+    /// compiled, which proves only that none of them captures by unique
+    /// borrow. It is not a repeatability proof — see the closure-contract
+    /// section on [`Self::with_transaction`] for what `Fn` does and does not
+    /// rule out, and for the two in-tree closures that do reach outside the
+    /// transaction while satisfying the bound. Judging that no closure in the
+    /// tree is non-repeatable *in principle* was a human reading of those
+    /// bodies, and it stays true only for as long as future changes keep
+    /// making it true.
     ///
     /// This list is the single reviewable place the escape-hatch surface can
     /// be audited from: any future call site must be added here with its
@@ -707,6 +783,18 @@ fn is_busy_error(error: &rusqlite::Error) -> bool {
 /// waiting is futile but *re-running the whole transaction* is guaranteed to
 /// see a fresh snapshot — which is exactly what the bounded retry loop in
 /// `with_transaction` needs to detect.
+///
+/// The match is on [`MemoryError::Db`] specifically, so the retry is reachable
+/// only while the underlying `rusqlite::Error` is still carried in that
+/// variant. A write path that rewraps its SQLite failure on the way out —
+/// `.map_err(|e| MemoryError::Validation(format!("...{e}")))`, or a rewrap into
+/// `Internal`/`Migration` — makes its busy-snapshots invisible to this
+/// predicate, silently forfeits the retry for that path, and surfaces a
+/// transient snapshot collision to the MCP client as a hard failure. Today's
+/// write helpers propagate with bare `?` or `.map_err(MemoryError::from)` and
+/// so keep the variant, but nothing enforces that: when adding a `map_err` to
+/// anything that runs inside `with_transaction`, preserve `MemoryError::Db`
+/// for genuine SQLite failures and rewrap only non-SQLite ones.
 fn is_busy_snapshot_error(error: &MemoryError) -> bool {
     matches!(
         error,
