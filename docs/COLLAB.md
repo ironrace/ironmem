@@ -921,6 +921,63 @@ dead-but-recoverable session back up — it is not needed for the normal
 in-flight recovery described above, since that session never leaves its
 phase in the first place.
 
+#### `pr_create_failed:` stays Terminal
+
+**Decision.** `pr_create_failed:` — reported by Claude's `final_review` turn
+when `gh pr create` fails — is not one of the six recoverable prefixes and
+is not going to become one. It stays in `DOCUMENTED_TERMINAL_PREFIXES`
+(`scripts/check_collab_turn_templates.py`) and every failure of this kind
+ends the session in `CodingFailed`.
+
+**Rationale.** By the time `.claude-plugin/prompts/collab-turn-submit.md`
+runs `gh pr create`, the branch is already reviewed, gated, and pushed — a
+failure at that one command loses exactly one `gh` invocation, nothing else
+about the session's work is at risk. Making the most authority-sensitive
+transition in the whole machine (the one that hands a reviewed, pushed
+branch to a human as a PR) resumable, just to save re-running one command,
+is a bad trade. It is also asymmetric with the six recoverable prefixes on
+purpose: when Codex owns `final_review` under recovery and `gh pr create`
+fails there, it reports `network_failed:` or `sandbox_denied:`, which
+classify Tooling and hand the turn to Claude — its live counterpart. Claude
+owns PR creation in the normal flow and has no counterpart of its own to
+hand a `pr_create_failed:` retry to, so there is nothing for a Tooling
+classification to hand off to.
+
+**Incident context.** The motivating incident (session `06667e54`: 29 green,
+reviewed, pushed commits apparently stranded by a `pr_create_failed:`
+Terminal) was a *spurious trigger*, not a genuine `gh` failure: the submit
+turn was gating PR-base resolution on `base_sha` being contained in
+`origin/main`, which a normally-cut collab branch routinely fails, so the
+turn reported `pr_create_failed:` before `gh pr create` ever ran for a real
+reason. That defect is fixed in `c803979` (base resolution now uses the
+remote default / `origin/main`/`master`/`trunk` existence, never containment
+of `base_sha`, as the gate) and is pinned by
+`check_pr_base_resolution_contract` in
+`scripts/check_collab_turn_templates.py`. The incident is evidence that base
+resolution had a bug, not evidence that transient `gh` failures are common
+enough to justify making this transition resumable.
+
+**Manual recovery.** A session that ends `CodingFailed` with `coding_failure`
+starting `pr_create_failed:` is not resumable (the prefix classifies
+Terminal, so `collab_resume`'s Tooling precondition never holds — see above).
+The branch itself is untouched by the failure — it was already pushed before
+`gh pr create` ran — so recovery is a human running the same command by
+hand, not a protocol action:
+
+1. Read `branch` and `last_head_sha` off the failed session, e.g.
+   `collab_status(session_id=<session_id>)` (or the `session_handoff` block).
+2. Confirm the branch is what the session left behind:
+   `git rev-parse <branch>` (or `HEAD` after checking it out) must equal
+   `last_head_sha`.
+3. Open the PR by hand, against the same integration branch
+   `collab-turn-submit.md` resolves for `final_review`:
+   ```
+   gh pr create --base <integration-branch> --head <branch> \
+     --title <title> --body <body>
+   ```
+   using the title/body the failed turn was trying to send (recoverable from
+   the session's artifact/drawer, or written fresh by the human).
+
 ## Blind-Draft Invariant
 
 During `PlanParallelDrafts`, neither agent can see the other's draft until

@@ -681,11 +681,10 @@ RUST_PREFIX_RE = re.compile(
 #   mechanical_direct_gate_failed: the same, on Codex's mechanical_direct path
 #   skill_overran_pr_boundary:     a sub-skill opened a PR outside the protocol
 #   pr_create_failed:              `gh pr create` failed on Claude's final turn
-# `pr_create_failed:` is deliberately NOT the prefix Codex uses when it owns
-# `final_review` under recovery — there it reports `network_failed:` /
-# `sandbox_denied:`, which classify Tooling and hand the PR turn to Claude,
-# who owns PR creation in the normal flow. The asymmetry is intentional: a
-# Codex PR failure has a live counterpart to fall back on, Claude's does not.
+# `pr_create_failed:` stays Terminal deliberately (asymmetric with Codex's
+# recoverable PR-turn prefixes, which hand off to a live Claude counterpart —
+# Claude has none) — see "`pr_create_failed:` stays Terminal" in
+# docs/COLLAB.md for the full rationale and manual recovery steps.
 DOCUMENTED_TERMINAL_PREFIXES = {
     "subagent_failure:",
     "gate_failure:",
