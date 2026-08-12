@@ -126,18 +126,44 @@ function toolkit(name) {
 // `fable: true` marks a lens eligible for the --fable swap. B is false on
 // purpose and permanently: Fable's bug-finding gains exclude security analysis,
 // and its classifiers decline security-shaped briefs.
+//
+// `mutates` is the machine-readable answer to "can this lens's Find-phase
+// dispatch run the test suite or otherwise write to the tree?" — Codex review
+// D5 on issue #265: that split used to live only as a sentence inside a
+// lens's own brief text ("Findings only — read-only, never edit files"), which
+// is unenforceable and, for K, was flatly wrong: K's brief claims read-only
+// while its tool profile can run benchmarks/profiling that write output. A
+// prompt sentence is not a gate; this field is what tasks 12/13 read to decide
+// worktree isolation, and `check_collab_turn_templates.py` fails any prompt or
+// command markdown that tries to restate this list in prose instead of
+// pointing back here. Every entry MUST declare it explicitly — see the
+// assertion right below this object — so a new lens cannot be added
+// unclassified.
 const ROSTER = {
-  A: { key: 'code-reviewer (correctness)', agentType: 'code-reviewer', model: 'opus', effort: 'xhigh', fable: true, blastRadius: true },
-  B: { key: 'security-reviewer', agentType: 'security-reviewer', model: 'opus', effort: 'xhigh', fable: false },
-  C: { key: 'architect', agentType: 'architect', model: 'opus', effort: 'xhigh', fable: true, blastRadius: true },
-  D: { key: 'doc-reviewer', agentType: 'doc-reviewer', model: 'sonnet', effort: 'medium', fable: false },
-  E: { key: 'marketing-claims auditor', agentType: A.marketingAgentType || 'general-purpose', model: 'sonnet', effort: 'medium', fable: false },
-  F: { key: 'comment-analyzer', agentType: toolkit('comment-analyzer'), model: 'sonnet', effort: 'low', fable: false },
-  G: { key: 'pr-test-analyzer', agentType: toolkit('pr-test-analyzer'), model: 'sonnet', effort: 'high', fable: false },
-  H: { key: 'silent-failure-hunter', agentType: toolkit('silent-failure-hunter'), model: 'opus', effort: 'high', fable: false },
-  I: { key: 'type-design-analyzer', agentType: toolkit('type-design-analyzer'), model: 'sonnet', effort: 'high', fable: false },
-  J: { key: 'concurrency-reviewer', agentType: 'general-purpose', model: 'opus', effort: 'xhigh', fable: true },
-  K: { key: 'performance-reviewer', agentType: A.perfAgentAvailable ? 'performance-optimizer' : 'general-purpose', model: 'opus', effort: 'high', fable: false },
+  A: { key: 'code-reviewer (correctness)', agentType: 'code-reviewer', model: 'opus', effort: 'xhigh', fable: true, blastRadius: true, mutates: false },
+  B: { key: 'security-reviewer', agentType: 'security-reviewer', model: 'opus', effort: 'xhigh', fable: false, mutates: false },
+  C: { key: 'architect', agentType: 'architect', model: 'opus', effort: 'xhigh', fable: true, blastRadius: true, mutates: false },
+  D: { key: 'doc-reviewer', agentType: 'doc-reviewer', model: 'sonnet', effort: 'medium', fable: false, mutates: false },
+  E: { key: 'marketing-claims auditor', agentType: A.marketingAgentType || 'general-purpose', model: 'sonnet', effort: 'medium', fable: false, mutates: false },
+  F: { key: 'comment-analyzer', agentType: toolkit('comment-analyzer'), model: 'sonnet', effort: 'low', fable: false, mutates: false },
+  G: { key: 'pr-test-analyzer', agentType: toolkit('pr-test-analyzer'), model: 'sonnet', effort: 'high', fable: false, mutates: true },
+  H: { key: 'silent-failure-hunter', agentType: toolkit('silent-failure-hunter'), model: 'opus', effort: 'high', fable: false, mutates: false },
+  I: { key: 'type-design-analyzer', agentType: toolkit('type-design-analyzer'), model: 'sonnet', effort: 'high', fable: false, mutates: false },
+  J: { key: 'concurrency-reviewer', agentType: 'general-purpose', model: 'opus', effort: 'xhigh', fable: true, mutates: false },
+  K: { key: 'performance-reviewer', agentType: A.perfAgentAvailable ? 'performance-optimizer' : 'general-purpose', model: 'opus', effort: 'high', fable: false, mutates: true },
+}
+
+// The classification is worthless if it can silently go missing on the next
+// lens someone adds. Every ROSTER entry must declare `mutates` as an actual
+// boolean — not merely a truthy/falsy value, since `undefined` and `0` are
+// both falsy and both wrong here — or the workflow refuses to run at all
+// rather than dispatch an unclassified lens.
+for (const rid of Object.keys(ROSTER)) {
+  if (typeof ROSTER[rid].mutates !== 'boolean') {
+    throw new Error(
+      `ROSTER entry '${rid}' (${ROSTER[rid].key || 'unknown'}) does not declare mutates: true|false — every lens must be classified as mutating or read-only before it can be dispatched`,
+    )
+  }
 }
 
 function tierFor(id) {

@@ -16,6 +16,10 @@ ROOT = pathlib.Path(os.environ.get(
 )).resolve()
 PROMPTS = ROOT / ".claude-plugin" / "prompts"
 COMMAND = ROOT / ".claude-plugin" / "commands" / "collab.md"
+COMMANDS_DIR = ROOT / ".claude-plugin" / "commands"
+CODEX_PROMPTS_DIR = ROOT / ".codex-plugin" / "prompts"
+CODEX_COMMANDS_DIR = ROOT / ".codex-plugin" / "commands"
+ULTRAREVIEW_SRC = ROOT / ".claude-plugin" / "workflows" / "ultrareview.js"
 DOC = ROOT / "docs" / "COLLAB.md"
 EVALUATE_ISSUE_DOC = ROOT / "docs" / "EVALUATE_ISSUE.md"
 EVALUATE_ISSUE_CLAUDE = ROOT / ".claude-plugin" / "commands" / "evaluate-issue.md"
@@ -1025,6 +1029,102 @@ def check_review_diff_trigger_detection_contract() -> None:
     # PR and worktree modes each need the raw-detection-only boundary.
     if any(text.count(snippet) < 2 for snippet in REVIEW_DIFF_TRIGGER_DETECTION_SNIPPETS):
         err(f"{path.relative_to(ROOT)}: missing review-diff trigger-detection contract")
+
+
+# `ultrareview.js`'s ROSTER is the only place a review lens is classified
+# mutating vs. read-only (task 11, issue #265 hardening, Codex review D5). Map
+# every lens's spelled-out name back to its one-letter ROSTER id so prose that
+# names a lens by its full name ("performance-reviewer") is caught exactly
+# like prose that names it by id ("(K)").
+ULTRAREVIEW_LENS_NAME_TO_ID = {
+    "code-reviewer": "A",
+    "security-reviewer": "B",
+    "architect": "C",
+    "doc-reviewer": "D",
+    "marketing-claims auditor": "E",
+    "comment-analyzer": "F",
+    "pr-test-analyzer": "G",
+    "silent-failure-hunter": "H",
+    "type-design-analyzer": "I",
+    "concurrency-reviewer": "J",
+    "performance-reviewer": "K",
+}
+ULTRAREVIEW_MUTATION_WORD_RE = re.compile(r"mutat|read-only|read only", re.IGNORECASE)
+ULTRAREVIEW_LENS_REF_RE = re.compile(
+    r"\b(" + "|".join(re.escape(n) for n in ULTRAREVIEW_LENS_NAME_TO_ID) + r")\b"
+    r"|\(([A-K])\)",
+    re.IGNORECASE,
+)
+ULTRAREVIEW_ROSTER_BLOCK_RE = re.compile(r"const ROSTER = \{(.*?)\n\}\n", re.DOTALL)
+ULTRAREVIEW_ROSTER_ENTRY_RE = re.compile(r"^\s*([A-Z]):\s*\{(.*)\},?\s*$", re.MULTILINE)
+
+
+def parse_ultrareview_roster_mutates(text: str) -> dict[str, bool | None]:
+    """`{lens id: mutates}`, with `None` standing in for "field is missing"."""
+    block = ULTRAREVIEW_ROSTER_BLOCK_RE.search(text)
+    if not block:
+        return {}
+    out: dict[str, bool | None] = {}
+    for entry in ULTRAREVIEW_ROSTER_ENTRY_RE.finditer(block.group(1)):
+        lens_id, entry_body = entry.group(1), entry.group(2)
+        m = re.search(r"\bmutates:\s*(true|false)\b", entry_body)
+        out[lens_id] = (m.group(1) == "true") if m else None
+    return out
+
+
+def check_review_lens_mutation_classification_contract() -> None:
+    """`mutates` lives in exactly one place: ultrareview.js's ROSTER.
+
+    Task 11 (issue #265 hardening, Codex review D5): the mutating/read-only
+    split for review lenses must be a machine-readable classification, not a
+    sentence in a prompt — a prompt sentence can silently drift from the code
+    that actually gates worktree isolation. This check has two halves: the
+    ROSTER itself must classify every lens (mirrors the workflow's own
+    assertion, so a parse-level regression here is caught even if
+    `ultrareview.js` is edited without running its JS test), and no review
+    prompt/command markdown may restate that classification in prose — even
+    correctly, since a correct restatement today is exactly the copy that
+    drifts tomorrow. Flag any such restatement outright rather than trying to
+    prove it wrong first.
+    """
+    if not ULTRAREVIEW_SRC.exists():
+        err(f"{ULTRAREVIEW_SRC.relative_to(ROOT)}: missing — cannot verify the "
+            f"review-lens mutation classification")
+        return
+    roster = parse_ultrareview_roster_mutates(ULTRAREVIEW_SRC.read_text())
+    if not roster:
+        err(f"{ULTRAREVIEW_SRC.relative_to(ROOT)}: could not parse ROSTER — "
+            f"review-lens mutation-classification check has nothing to verify")
+        return
+    missing = sorted(lens_id for lens_id, mutates in roster.items() if mutates is None)
+    if missing:
+        err(f"{ULTRAREVIEW_SRC.relative_to(ROOT)}: ROSTER entries {missing} do "
+            f"not declare mutates: true|false")
+
+    candidates: list[pathlib.Path] = []
+    for base in (PROMPTS, COMMANDS_DIR, CODEX_PROMPTS_DIR, CODEX_COMMANDS_DIR):
+        if base.is_dir():
+            candidates.extend(sorted(base.glob("*.md")))
+    for path in candidates:
+        text = path.read_text()
+        # Scoped to files that actually discuss the ultrareview lens roster —
+        # a bare "mutat"/"read-only" sentence unrelated to review lenses (e.g.
+        # collab session-state mutation, or the blanket "review agents are
+        # read-only under --report-only" instruction, which names no specific
+        # lens) is not a competing classification and must not be flagged.
+        if "ultrareview" not in text.lower():
+            continue
+        for lineno, line in enumerate(text.splitlines(), 1):
+            if not ULTRAREVIEW_MUTATION_WORD_RE.search(line):
+                continue
+            for m in ULTRAREVIEW_LENS_REF_RE.finditer(line):
+                lens_id = m.group(2) or ULTRAREVIEW_LENS_NAME_TO_ID.get((m.group(1) or "").lower())
+                if lens_id:
+                    err(f"{path.relative_to(ROOT)}:{lineno}: restates the "
+                        f"mutating/read-only classification for lens "
+                        f"{lens_id!r} in prose — ROSTER.{lens_id}.mutates in "
+                        f"{ULTRAREVIEW_SRC.relative_to(ROOT)} is the only "
+                        f"place this may be declared: {line.strip()!r}")
 
 
 # Contract lists for the pilot-routing checks below. They are module-level
@@ -3298,6 +3398,7 @@ def main() -> int:
     check_planning_dispatch_failure_contract()
     check_pilot_submit_doc_contract()
     check_review_diff_trigger_detection_contract()
+    check_review_lens_mutation_classification_contract()
     check_pilot_flag_parsing_contract()
     check_end_of_options_terminator_contract()
     check_terminator_usage_surfaces()

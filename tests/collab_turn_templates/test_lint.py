@@ -38,6 +38,13 @@ def copy_fixture(tmp_path):
     (fixture / "scripts").mkdir()
     shutil.copy2(ROOT / "scripts" / "install-ironmem.sh",
                  fixture / "scripts" / "install-ironmem.sh")
+    # The review-lens mutation-classification check (task 11) reads the
+    # ROSTER straight out of ultrareview.js — without this the check has no
+    # source of truth to compare prompt/command prose against and every
+    # fixture run fails on "missing" rather than exercising the check.
+    (fixture / ".claude-plugin" / "workflows").mkdir(parents=True)
+    shutil.copy2(ROOT / ".claude-plugin" / "workflows" / "ultrareview.js",
+                 fixture / ".claude-plugin" / "workflows" / "ultrareview.js")
     # The failure-prefix and phase-name checks derive their valid sets from
     # the Rust sources rather than from hardcoded copies.
     rust = pathlib.Path("crates") / "ironmem" / "src" / "collab"
@@ -2672,3 +2679,76 @@ def test_lint_reports_an_ambiguous_codex_shim_flag_region_anchor(tmp_path):
     assert r.returncode == 1
     assert (".codex-plugin/commands/collab.md: the `start` flag-parsing "
             f"region is delimited by {anchor!r}, which appears 2 times") in r.stdout
+
+
+# ------------------------------------------------------------------ task 11
+#
+# The mutating/read-only split for ultrareview's review lenses must be a
+# machine-readable classification with one source of truth — ROSTER in
+# ultrareview.js — never a sentence restated in prompt/command markdown, since
+# a restatement is a second copy of the fact and a second copy drifts. These
+# tests pin the check three ways: a restatement that CONTRADICTS the roster,
+# a restatement that happens to AGREE with the roster (still forbidden — "no
+# review prompt/command markdown redefines ... the roster classification in
+# prose"), and the roster itself failing to classify a lens.
+
+def test_lint_rejects_prose_that_contradicts_the_roster_mutation_classification(tmp_path):
+    fixture = copy_fixture(tmp_path)
+    path = fixture / ".claude-plugin" / "commands" / "ultrareview-local.md"
+    # K is classified `mutates: true` in the real ROSTER; this sentence claims
+    # the opposite in prose.
+    path.write_text(path.read_text() +
+                     "\n\nperformance-reviewer (K) is read-only and never "
+                     "writes to the tree.\n")
+
+    r = run({"COLLAB_LINT_ROOT": str(fixture)})
+
+    assert r.returncode == 1
+    assert (".claude-plugin/commands/ultrareview-local.md:" in r.stdout
+            and "restates the mutating/read-only classification for lens "
+                "'K' in prose" in r.stdout)
+
+
+def test_lint_rejects_prose_that_merely_duplicates_the_roster_mutation_classification(tmp_path):
+    fixture = copy_fixture(tmp_path)
+    path = fixture / ".claude-plugin" / "commands" / "ultrareview-local.md"
+    # Both ids are correct per the real ROSTER — restating them is still a
+    # second source of truth, so it must fail too, not just a wrong one.
+    path.write_text(path.read_text() +
+                     "\n\npr-test-analyzer (G) and performance-reviewer (K) "
+                     "are the only lenses that mutate the working tree.\n")
+
+    r = run({"COLLAB_LINT_ROOT": str(fixture)})
+
+    assert r.returncode == 1
+    assert "restates the mutating/read-only classification for lens 'G' in prose" in r.stdout
+    assert "restates the mutating/read-only classification for lens 'K' in prose" in r.stdout
+
+
+def test_lint_ignores_the_blanket_report_only_instruction(tmp_path):
+    # `collab-turn-review-fix-global.md` already tells the pilot to "Treat the
+    # review agents as read-only" under `--report-only` — a blanket statement
+    # about the whole finding pass, naming no specific lens. It must stay
+    # allowed; a green fixture (asserted by `test_fixture_is_green`) already
+    # proves this, but the assertion is repeated here so a regression in the
+    # detection regex reads as "this specific case broke", not a diff against
+    # an unrelated failure elsewhere in the corpus.
+    fixture = copy_fixture(tmp_path)
+    r = run({"COLLAB_LINT_ROOT": str(fixture)})
+    assert r.returncode == 0, r.stdout
+
+
+def test_lint_rejects_a_roster_entry_missing_the_mutates_field(tmp_path):
+    fixture = copy_fixture(tmp_path)
+    path = fixture / ".claude-plugin" / "workflows" / "ultrareview.js"
+    mutate(path,
+           "agentType: toolkit('pr-test-analyzer'), model: 'sonnet', "
+           "effort: 'high', fable: false, mutates: true",
+           "agentType: toolkit('pr-test-analyzer'), model: 'sonnet', "
+           "effort: 'high', fable: false")
+
+    r = run({"COLLAB_LINT_ROOT": str(fixture)})
+
+    assert r.returncode == 1
+    assert ("ultrareview.js: ROSTER entries ['G'] do not declare "
+            "mutates: true|false") in r.stdout

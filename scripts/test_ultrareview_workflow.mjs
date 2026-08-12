@@ -1580,4 +1580,62 @@ for (const verdict of ['PLAUSIBLE', 'REFUTED', 'UNVERIFIED', 'N/A', '']) {
   })
 }
 
+// ------------------------------------------------- TASK 11: mutates classification
+//
+// Codex review D5 (issue #265 hardening): the mutating/read-only split must be
+// a machine-readable classification with one source of truth — ultrareview.js's
+// ROSTER — not a sentence in a prompt. Pinned at two levels: every entry in the
+// real ROSTER declares `mutates` explicitly (so the classification stays
+// complete), and the workflow itself refuses to run if a future lens omits it
+// (so an incomplete classification fails loudly instead of dispatching an
+// unclassified lens).
+{
+  const rosterMatch = body.match(/const ROSTER = \{([\s\S]*?)\n\}\n/)
+  check('ROSTER block is present in the workflow source', () => assert.ok(rosterMatch))
+  const rosterEntries = rosterMatch ? [...rosterMatch[1].matchAll(/^\s*([A-Z]):\s*\{(.*)\},?\s*$/gm)] : []
+  check('every ROSTER line in the source was matched', () =>
+    assert.ok(rosterEntries.length >= 11, `matched ${rosterEntries.length} entries, expected 11`))
+  const mutatesById = Object.fromEntries(
+    rosterEntries.map(([, id, entryBody]) => {
+      const m = entryBody.match(/\bmutates:\s*(true|false)\b/)
+      return [id, m ? m[1] === 'true' : undefined]
+    }),
+  )
+  check('every ROSTER entry declares mutates explicitly', () => {
+    const missing = Object.entries(mutatesById).filter(([, v]) => v === undefined).map(([id]) => id)
+    assert.deepEqual(missing, [], `entries missing mutates: ${missing.join(', ')}`)
+  })
+  check('pr-test-analyzer (G) is classified mutating — it can run the test suite', () =>
+    assert.equal(mutatesById.G, true))
+  check('performance-reviewer (K) is classified mutating — it can run benchmarks/profiling', () =>
+    assert.equal(mutatesById.K, true))
+  check('the remaining lenses stay classified read-only (mutates: false)', () =>
+    assert.deepEqual(
+      Object.entries(mutatesById).filter(([, v]) => v === false).map(([id]) => id).sort(),
+      ['A', 'B', 'C', 'D', 'E', 'F', 'H', 'I', 'J'],
+    ))
+}
+{
+  // A lens added (or edited) without a `mutates` field must stop the workflow,
+  // not dispatch unclassified. Simulated by stripping the field from the real
+  // source at lens G and confirming the workflow throws before dispatching
+  // anything.
+  const G_LINE = "agentType: toolkit('pr-test-analyzer'), model: 'sonnet', effort: 'high', fable: false, mutates: true"
+  check('setup: located the exact ROSTER line for lens G to mutate', () => assert.ok(body.includes(G_LINE)))
+  const stripped = body.replace(G_LINE, G_LINE.replace(', mutates: true', ''))
+  check('setup: stripping mutates from lens G actually changed the source', () => assert.notEqual(stripped, body))
+  const strippedMake = new AsyncFunction('args', 'budget', 'agent', 'parallel', 'pipeline', 'log', 'phase', 'workflow', stripped)
+  let thrown = null
+  try {
+    await strippedMake(baseArgs, {}, () => Promise.resolve(null), parallel, pipeline, () => {}, () => {}, () => {})
+  } catch (e) {
+    thrown = e
+  }
+  check('an unclassified ROSTER entry stops the workflow instead of running silently', () => {
+    assert.ok(thrown, 'expected the workflow to throw before dispatching any lens')
+    assert.match(thrown.message, /ROSTER entry 'G'/)
+    assert.match(thrown.message, /mutates/)
+  })
+}
+
 console.log(`\n${pass} checks passed`)
