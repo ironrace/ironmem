@@ -69,9 +69,26 @@ const REPORT_ONLY_INFERRED = REPORT_ONLY && A.reportOnly !== true
 // Refused rather than escaped: quoting rules differ between the shells an agent
 // may reach for, and a review that omits one convenience command is a smaller
 // loss than one that runs someone else's.
-const SHELL_SAFE_RE = /^[A-Za-z0-9._/@+=:,^~-]+$/
+//
+// THREE separate hazards, not one. (1) Shell METACHARACTERS — `;`, `|`, a
+// backtick, whitespace — start a second command or split one argument into two.
+// (2) Shell GLOB operators, which need no metacharacter at all: `^` is one
+// under zsh's EXTENDED_GLOB, so `HEAD^..HEAD` is a legal git ref that the
+// interactive shell an agent is most likely to be running expands or errors on
+// before git ever sees it. It is dropped from the class here rather than only
+// avoided by the callers — `isoRange` picks `~1` over `^` for exactly this
+// reason, and a rule that lives only in one caller's comment is not a gate.
+// (3) OPTION vs OPERAND, which is the class neither of the above covers: every
+// character in `--output=/tmp/x` is in the safe set, and it is a legal refname,
+// but `git diff --output=/tmp/x -- <path>` reads it as a git OPTION and
+// truncates that file. The `--` separator in those command strings comes AFTER
+// the interpolation point, so it cannot protect a value that is itself the
+// argument being parsed for flags. A leading `-` is therefore refused outright.
+// `repoPath` is unaffected: it is required to start with `/` a few lines below.
+const SHELL_SAFE_RE = /^[A-Za-z0-9._/@+=:,~-]+$/
 function shellSafe(raw) {
   const s = String(raw == null ? '' : raw).trim()
+  if (s.startsWith('-')) return ''
   return s && s.length <= 256 && SHELL_SAFE_RE.test(s) ? s : ''
 }
 
@@ -103,7 +120,22 @@ const DIFF_RANGE = shellSafe(A.diffRange)
 // PR Mode the range refs resolve there unchanged because a linked worktree
 // shares the object store, while in Local Mode "uncommitted vs HEAD" is empty
 // by construction there — the changes are the snapshot commit itself.
-const MODE_LOCAL = String(A.mode == null ? '' : A.mode).trim().toLowerCase() === 'local'
+//
+// Recognised as literals, with a third state for everything else, like every
+// other decision-shaped value in this file. This was `… === 'local'`, a loose
+// compare with only two outcomes, and it was the one place a near-miss at the
+// JSON boundary — a misspelt or omitted `mode` on a Local-Mode run — failed
+// OPEN: it yielded "not local", so `isoRange` handed the lens the caller's
+// literal `HEAD` range, and inside a clean isolation worktree
+// `git diff HEAD -- <path>` prints NOTHING. The lens then reports zero
+// findings with `errored: false`, `coverageComplete` stays true, and a lens
+// that saw an empty diff is indistinguishable from one that saw clean code.
+// An unknown mode is NOT quietly treated as PR: `isoRange` returns '' for it,
+// which drops the range line and the `git diff` command from the brief rather
+// than printing one that lies. See `isoRange` for the three-way handling.
+const MODE = ((m) => (m === 'local' || m === 'pr' ? m : ''))(
+  String(A.mode == null ? '' : A.mode).trim().toLowerCase(),
+)
 // `expandCmd` is a whole command line, so it legitimately contains spaces and
 // the literal `<path>` / `<ordinal>` placeholders the agent substitutes before
 // running it. It is admitted only when it is the `ironmem review-diff`
@@ -143,13 +175,33 @@ const ISOLATION_NONCE = /^[A-Za-z0-9_-]{1,64}$/.test(String(A.isolationNonce || 
   ? String(A.isolationNonce).trim()
   : ''
 
-// Repo-relative, no traversal, no absolute paths. This is the allowlist the fix
-// dispatch checks findings against, so it is built from the caller's file list
-// rather than from anything a finder said.
-function normPath(p) {
+// Spelling only: `./a.rs` and `a.rs` are the same file, so one of the two
+// spellings is picked. It does NOT decide whether a path is allowed — see
+// `normPath` right below, which does.
+function tidyPath(p) {
   return String(p == null ? '' : p)
     .replace(/^\.\//, '')
     .trim()
+}
+
+// Repo-relative, no traversal, no absolute paths — enforced here rather than
+// merely described. This is the allowlist the fix dispatch checks findings
+// against (`REVIEWED`), so what it admits is what an Edit-capable agent may be
+// pointed at. It used to only strip a leading `./` and trim, and the comment
+// saying "no traversal, no absolute paths" was a claim about the CALLER's input
+// rather than anything this function did: `../../.ssh/authorized_keys` and
+// `/etc/passwd` passed through unchanged. That held in practice only because
+// git refuses `..` components in tree paths, so the caller's `--name-only`
+// output could never contain one — a guarantee two layers away, in a different
+// process, that nothing here restates or checks.
+//
+// A rejected path becomes '', which `.filter(Boolean)` drops from FILES.
+// `..` is rejected as a whole SEGMENT, not as a substring: `..hidden` and
+// `a..b` are ordinary filenames.
+function normPath(p) {
+  const s = tidyPath(p)
+  if (!s || s.startsWith('/') || s.split('/').some((seg) => seg === '..')) return ''
+  return s
 }
 const FILES = (Array.isArray(A.files) ? A.files : []).map(normPath).filter(Boolean)
 const REVIEWED = new Set(FILES)
@@ -378,6 +430,7 @@ const ISOLATION_SCHEMA = {
   properties: {
     ok: { type: 'boolean', description: 'true only if the commands ran and the described end state actually holds' },
     created: { type: 'boolean', description: 'cut only: true only if this invocation actually created the worktree; false for an existing-path collision' },
+    removed: { type: 'boolean', description: 'cleanup only, and only meaningful when ok is false: true if the directory is gone but its worktree bookkeeping entry is not (the rm -rf fallback); false if the directory itself is still there' },
     detail: { type: 'string', description: 'the exact error text when ok is false; a short note otherwise' },
   },
 }
@@ -594,17 +647,31 @@ function isolationPathFor(id) {
   return `${REPO_ROOT}-ultrareview-${String(id).toLowerCase()}-${REVIEW_SHA.slice(0, 12)}-${ISOLATION_NONCE}`
 }
 
-// What "the reviewed change" is called inside the worktree. In PR Mode the
-// caller's range is base...head and those refs resolve there unchanged. In
-// Local Mode the caller's range is `HEAD` — "uncommitted vs HEAD" — and the
-// worktree is clean by construction, so that range shows an empty diff there
-// and would tell the lens nothing changed. The equivalent inside the worktree
-// is the snapshot commit against its parent.
+// What "the reviewed change" is called inside the worktree. Three answers, one
+// per state of `MODE`, because there are genuinely three situations:
+//
+//   'local' — the caller's range is `HEAD`, "uncommitted vs HEAD", and the
+//     worktree is clean by construction, so that range shows an empty diff
+//     there and would tell the lens nothing changed. The equivalent inside the
+//     worktree is the snapshot commit against its parent.
+//   'pr'    — the caller's range is base...head and those refs resolve there
+//     unchanged, so it is passed through.
+//   ''      — the caller sent a mode this workflow could not read. There is no
+//     range that is known to be right, so NOTHING is claimed: the empty string
+//     drops the `Diff range:` line and sends `isolationNote` down its no-range
+//     branch, which tells the lens to diff the checked-out files against their
+//     parent commit itself. Falling back to the PR passthrough here is what
+//     used to happen and it is the fail-open direction — a `HEAD` range in a
+//     clean worktree is a command that silently shows nothing.
 //
 // `~1` rather than `^`: both name the first parent, but `^` is a glob operator
 // under zsh's EXTENDED_GLOB and this string is pasted into an agent's shell.
+// `shellSafe` now refuses `^` in a caller-supplied range for the same reason,
+// so this is belt and braces rather than the only guard.
 function isoRange() {
-  return MODE_LOCAL ? `${REVIEW_SHA}~1..${REVIEW_SHA}` : DIFF_RANGE
+  if (MODE === 'local') return `${REVIEW_SHA}~1..${REVIEW_SHA}`
+  if (MODE === 'pr') return DIFF_RANGE
+  return ''
 }
 
 // The `ironmem review-diff` line, retargeted at the worktree.
@@ -682,12 +749,27 @@ function isolationCutBrief(isoPath) {
 // appear in this brief at all, so there is no path here for a cleanup command
 // to be pointed at by mistake or by a model filling in a blank.
 //
-// `prune` runs BEFORE `remove` because `remove` deletes the directory, and once
-// it is gone there is no worktree left to run git from — and running git in the
-// shared checkout to prune afterwards is exactly what this must not do. Run in
-// this order the pair still leaves nothing behind: `prune` clears bookkeeping
-// left by any earlier run whose directory is already gone, and `remove` deletes
-// this worktree's directory together with its own bookkeeping entry.
+// WHY THERE IS NO `worktree prune` HERE, though it reads like the tidy thing to
+// pair with `remove`. `git worktree prune` is not scoped to the worktree it is
+// run FROM: it operates on `$GIT_COMMON_DIR/worktrees`, the SHARED repository's
+// registry, so `git -C <isoPath> worktree prune` reaches every worktree of this
+// repository no matter which one issued it. `-C <isoPath>` looks like a bound
+// and is not one. With no `--expire` it deregisters any worktree whose
+// directory is merely absent at that instant — an unmounted volume, a directory
+// moved aside, another run mid-`rm -rf`. Reproduced: a long-lived user worktree
+// whose directory was transiently gone came back to
+// `fatal: not a git repository: (null)` and lost git's duplicate-checkout lock
+// on its branch. This repo's own collab flow keeps exactly such worktrees under
+// `.worktrees/` and runs reviews from inside them. A repository-wide command
+// therefore cannot appear in a brief whose entire safety property is that it
+// names only the throwaway path — the property was never about the spelling of
+// the path, it is about what the command can reach.
+//
+// It is not needed either: `worktree remove --force <isoPath>` ALONE leaves
+// nothing behind on the success path — no directory and no registry entry —
+// verified with untracked build residue and modified tracked files present,
+// which is the state a suite or benchmark leaves. The prune only ever cleared
+// bookkeeping belonging to OTHER runs, which was never this brief's to clear.
 //
 // The `rm -rf` fallback is the one case that CANNOT be made to leave nothing
 // behind here: deleting the directory orphans the bookkeeping entry, and the
@@ -695,23 +777,45 @@ function isolationCutBrief(isoPath) {
 // not name. So that path reports `ok: false` and becomes a reported leak rather
 // than a silent one — the directory is gone but the entry is not, and the entry
 // also keeps the review snapshot commit reachable, so the user has to be told.
+// `removed` is what tells the two leak modes apart afterwards; see
+// `releaseIsolationWorktree`, where they get opposite remedies.
 function isolationCleanupBrief(isoPath) {
   return [
-    'Cleanup task, not a review. Run the commands below and report what happened. Do not review anything, do not read source, do not edit any file.',
+    'Cleanup task, not a review. Run the command below and report what happened. Do not review anything, do not read source, do not edit any file.',
     '',
-    `  git -C ${isoPath} worktree prune`,
     `  git -C ${isoPath} worktree remove --force ${isoPath}`,
     '',
-    `If ${isoPath} still exists after that, delete the directory with \`rm -rf ${isoPath}\` and report ok: false with "removed by rm -rf; stale worktree bookkeeping entry left behind" in detail. The directory is gone but its registration is not, and pruning that from the other checkout is not yours to do.`,
-    `Every command names ${isoPath} and nothing else. Do not substitute another path, do not run these or any other command in a different checkout of this repository, and never run \`git reset\`, \`git checkout\`, \`git clean\` or \`rm\` outside ${isoPath}. A review is reading that other checkout while you work.`,
+    `If ${isoPath} still exists after that, delete the directory with \`rm -rf ${isoPath}\` and report ok: false, removed: true with "removed by rm -rf; stale worktree bookkeeping entry left behind" in detail. The directory is gone but its registration is not, and pruning that from the other checkout is not yours to do.`,
+    `If ${isoPath} still exists even after that, report ok: false, removed: false and say so in detail.`,
+    `Every command names ${isoPath} and nothing else. Do not substitute another path, do not run these or any other command in a different checkout of this repository, and never run \`git worktree prune\`, \`git reset\`, \`git checkout\`, \`git clean\` or \`rm\` outside ${isoPath}. A review is reading that other checkout while you work, and \`worktree prune\` is repository-wide however you invoke it.`,
     `Report ok: true only if \`git -C ${isoPath} worktree remove --force ${isoPath}\` is what removed it and ${isoPath} no longer exists.`,
   ].join('\n')
 }
 
-// Paths cleanup could not confirm gone. Returned rather than only logged: a
+// Residue cleanup could not confirm gone. Returned rather than only logged: a
 // leftover worktree is a directory beside the user's checkout plus a stale
 // bookkeeping entry inside it, and the command is forbidden to re-derive state
 // from log lines.
+//
+// Entries are objects, not bare paths, because "a leak" is two different
+// situations with OPPOSITE remedies and the report has to print the right one:
+//
+//   residue: 'directory' — the directory is still there. Remedy:
+//     `git -C <path> worktree remove --force <path>`.
+//   residue: 'registry'  — the cleanup brief's `rm -rf` fallback ran. The
+//     directory is GONE and only the bookkeeping entry survives, so the remove
+//     command above cannot work at all: git cannot chdir into a path that does
+//     not exist and exits 128 with `cannot change to '<path>'`. The remedy is
+//     to prune the stale entry from the checkout that holds the registry.
+//   residue: 'unknown'   — the cleanup dispatch never answered, so which of the
+//     two it is was never established. Both remedies are offered, in the order
+//     that is safe to try blind.
+//
+// This list used to hold bare paths and the printed remedy was always the
+// `worktree remove --force` one, which is precisely the command that cannot
+// work on the `rm -rf` path — the single path this workflow *documents itself*
+// as producing. `remedy` is computed here rather than in the report so the
+// command never has to re-derive which case it is looking at.
 const ISOLATION_LEAKS = []
 
 // Paths whose very existence is unknown: the cut dispatch never came back with
@@ -758,10 +862,26 @@ async function releaseIsolationWorktree(id, isoPath) {
   }).catch(() => null)
   const ok = !!(res && res.ok === true)
   if (!ok) {
-    ISOLATION_LEAKS.push(isoPath)
-    log(
-      `isolation worktree for lens ${id} may still exist at ${isoPath} — remove it with \`git -C ${isoPath} worktree remove --force ${isoPath}\``,
-    )
+    // Three states again, and for the same reason `created` has three: the
+    // cleanup task's own `removed: true|false` answer, and `null` for "it never
+    // told us" — the dispatch threw, or came back without the field.
+    const removed = res && typeof res.removed === 'boolean' ? res.removed : null
+    const residue = removed === true ? 'registry' : removed === false ? 'directory' : 'unknown'
+    const removeCmd = `git -C ${isoPath} worktree remove --force ${isoPath}`
+    const pruneCmd = `git -C ${REPO_ROOT} worktree prune`
+    const remedy =
+      residue === 'registry'
+        ? `the directory is already gone; clear the stale bookkeeping entry with \`${pruneCmd}\``
+        : residue === 'directory'
+          ? `remove it with \`${removeCmd}\``
+          : `if the directory is still there, remove it with \`${removeCmd}\`; if it is already gone, a stale bookkeeping entry may remain — \`git -C ${REPO_ROOT} worktree list\` shows it and \`${pruneCmd}\` clears it`
+    ISOLATION_LEAKS.push({
+      path: isoPath,
+      residue,
+      remedy,
+      detail: asData((res && res.detail) || '').slice(0, 160),
+    })
+    log(`isolation worktree for lens ${id} was not confirmed removed at ${isoPath} — ${remedy}`)
   }
   return ok
 }
@@ -823,9 +943,22 @@ async function runLens(id) {
     return await runLensIn(id, isoPath)
   } finally {
     // Success, lens error, retry exhaustion, schema rejection, a throw from
-    // anywhere in the dispatch: all of them land here. The only exit that skips
-    // it is the process dying outright, which the cut brief's "clear a leftover
-    // first" step covers on the next run.
+    // anywhere in the dispatch: all of them land here. The one exit that skips
+    // it is the process dying outright, and NOTHING reclaims the worktree in
+    // that case. There is no self-healing next run: the cut brief refuses a
+    // pre-existing path rather than clearing it ("report ok: false,
+    // created: false and stop… Do not run rm, git worktree remove, or any
+    // cleanup command on it"), and `isolationPathFor` mixes a per-run nonce
+    // into the path, so the next run does not even visit the abandoned one. A
+    // hard kill therefore leaves a full second checkout of the repository on
+    // disk, plus a registry entry that keeps the review snapshot commit
+    // reachable so `gc` will not reclaim it either.
+    //
+    // What makes that recoverable at all is the stable
+    // `<repo>-ultrareview-` prefix in the path: it is what a human can list and
+    // sweep. Deliberately not swept automatically — a matching path may be a
+    // CONCURRENT review's live worktree, and the whole reason the nonce exists
+    // is that this workflow cannot tell those apart from the outside.
     await releaseIsolationWorktree(id, isoPath)
   }
 }
@@ -912,12 +1045,23 @@ function normalize(f) {
   // diverge from one another; sanitising only where it is printed would leave
   // the key holding the raw string. A real path contains no newline and no
   // backtick, so nothing legitimate is lost.
-  // `./a.rs` and `a.rs` are the same file, and `normPath` already strips the
-  // prefix when building REVIEWED from the caller's list. Stripping it on only
-  // one side meant a finder that wrote `./a.rs` produced a confirmed finding
-  // that failed the allowlist: never dispatched to a fix agent, and printed
-  // under "outside the reviewed file set" for a file squarely inside it.
-  const file = normPath(String(f.file).replace(/[\r\n`]/g, ''))
+  // `./a.rs` and `a.rs` are the same file, and `tidyPath` strips the prefix on
+  // both sides — here and inside `normPath` when REVIEWED is built from the
+  // caller's list. Stripping it on only one side meant a finder that wrote
+  // `./a.rs` produced a confirmed finding that failed the allowlist: never
+  // dispatched to a fix agent, and printed under "outside the reviewed file
+  // set" for a file squarely inside it.
+  //
+  // `tidyPath` and NOT `normPath`, deliberately. `normPath` rejects absolute
+  // and traversing paths so they can never enter the allowlist, which is right
+  // for the caller's list — but a FINDING naming `/etc/passwd` must not be
+  // silently dropped just because it can never be fixed. It has no place in
+  // REVIEWED either way, so it falls out under "outside the reviewed file set",
+  // where it is printed, counts as remaining, and is visibly never dispatched.
+  // Dropping it here instead would delete a HIGH from the report and move the
+  // verdict toward APPROVE — the fail-open direction — for a finding whose only
+  // sin is naming a path this review may not touch.
+  const file = tidyPath(String(f.file).replace(/[\r\n`]/g, ''))
   // A path that sanitises away to nothing cannot be grouped, keyed, or fixed.
   if (!file) return null
   // Case and stray whitespace are the realistic way a model misses this enum

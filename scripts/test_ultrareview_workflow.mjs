@@ -50,6 +50,14 @@ const isIsolationCall = (opts) => typeof opts.label === 'string' && opts.label.s
 // both must fail together if either regresses.
 const namesOnlyIsolationPath = (brief, isoPath, repoPath) => !brief.split(isoPath).join('').includes(repoPath)
 
+// The lines of a brief that are actual commands to run, as opposed to prose
+// that merely mentions a command. The isolation briefs put every command on its
+// own indented line and nothing else there, so "does this brief RUN x?" and
+// "does this brief mention x?" are two different questions and the cleanup
+// brief needs both answered — it must never run `worktree prune` and must
+// explicitly tell the agent not to run it either.
+const commandLines = (brief) => brief.split('\n').filter((l) => /^\s+\S/.test(l))
+
 async function run(args, agentImpl) {
   const logs = []
   const calls = []
@@ -1374,6 +1382,101 @@ for (const verdict of ['PLAUSIBLE', 'REFUTED', 'UNVERIFIED', 'N/A', '']) {
     assert.ok(calls[0].brief.includes('Diff range: origin/main...feat/thing-1')))
 }
 {
+  // Not every hostile value needs a metacharacter. `diffRange` is interpolated
+  // BEFORE the `--` separator in `git diff <range> -- <path>`, so a refname
+  // that begins with `-` is parsed as a git OPTION, not as a revision: every
+  // character of `--output=/tmp/x` is in the safe set, it is a legal refname,
+  // and it truncates whatever file it names. The `--` cannot help — it comes
+  // after the value being parsed for flags.
+  for (const evil of ['--output=/tmp/pwned', '-p', '--exec=curl']) {
+    const { calls } = await run({ ...baseArgs, changedLines: 300, lenses: ['A'], diffRange: evil }, noFindings)
+    const briefs = calls.map((c) => c.brief).join('\n')
+    check(`a diffRange that would parse as a git option (${evil}) is refused`, () => {
+      assert.ok(!briefs.includes(evil))
+      assert.ok(!briefs.includes('Diff range: '))
+    })
+  }
+  // `^` needs no shell metacharacter either: it is a glob operator under zsh's
+  // EXTENDED_GLOB, and these strings are pasted into an agent's interactive
+  // shell. isoRange already picks `~1` over `^` for this reason; the caller's
+  // own range has to be held to the same rule rather than trusted.
+  const { calls: caret } = await run({ ...baseArgs, changedLines: 300, lenses: ['A'], diffRange: 'HEAD^..HEAD' }, noFindings)
+  check('a caret in diffRange is refused rather than pasted into a zsh command', () =>
+    assert.ok(!caret.map((c) => c.brief).join('\n').includes('HEAD^')))
+  // The gate must not swallow the ordinary absolute repo path it exists to let
+  // through: `/r` starts with `/`, not with `-`.
+  const { calls: ok } = await run({ ...baseArgs, changedLines: 300, lenses: ['A'] }, noFindings)
+  check('an ordinary absolute repoPath still reaches the briefs', () =>
+    assert.ok(ok[0].brief.includes('Repo: /r')))
+}
+{
+  // `mode` decides what the reviewed change is called inside an isolation
+  // worktree, and it was the one decision-shaped value read with a loose
+  // compare. A misspelt or absent mode on a Local-Mode run yielded "not local",
+  // so the lens was handed the caller's literal `HEAD` range — and inside a
+  // clean worktree `git diff HEAD -- <path>` prints NOTHING. Zero findings,
+  // errored: false, coverageComplete still true: a lens that saw an empty diff
+  // is indistinguishable from one that saw clean code.
+  const isoArgs = { ...baseArgs, changedLines: 1000, lenses: ['A'], reportOnly: true }
+  const WT_G = `/r-ultrareview-g-${SHA.slice(0, 12)}-${ISOLATION_NONCE}`
+  for (const mode of ['locl', 'LOCAL ', undefined, '', 'PR-mode', 42]) {
+    const { calls } = await run({ ...isoArgs, mode }, noFindings)
+    const g = calls.find((c) => c.opts.label.startsWith('find:G '))
+    const label = JSON.stringify(mode)
+    // 'LOCAL ' is trimmed and lowercased, so it IS local and keeps its range.
+    if (String(mode ?? '').trim().toLowerCase() === 'local') {
+      check(`mode ${label} is still read as local`, () =>
+        assert.ok(g.brief.includes(`Diff range: ${SHA}~1..${SHA}`)))
+      continue
+    }
+    check(`an unreadable mode (${label}) never hands the lens the caller's HEAD range`, () =>
+      assert.ok(!g.brief.includes('Diff range: HEAD')))
+    check(`an unreadable mode (${label}) falls through to the no-range isolation wording`, () => {
+      assert.ok(g.brief.includes('Its checked-out files are the exact reviewed source'))
+      assert.ok(!g.brief.includes(`git -C ${WT_G} diff `))
+    })
+  }
+  // And the two literals still do their own thing, so this is a third state
+  // rather than a blanket refusal.
+  const { calls: pr } = await run({ ...isoArgs, mode: 'pr', diffRange: 'main...feat' }, noFindings)
+  check('mode pr still passes the caller range into the worktree', () =>
+    assert.ok(pr.find((c) => c.opts.label.startsWith('find:G ')).brief.includes('Diff range: main...feat')))
+}
+{
+  // normPath is documented "no traversal, no absolute paths" and is the source
+  // of REVIEWED, the allowlist the fix dispatch checks findings against. It
+  // used to only strip a leading './': `..` and `/etc/passwd` in the caller's
+  // own file list passed straight through, held out only by git's refusal to
+  // emit `..` components — a guarantee two layers away in another process.
+  const { out, calls } = await run(
+    { ...baseArgs, changedLines: 300, lenses: ['A'], files: ['a.rs', '../../.ssh/authorized_keys', '/etc/passwd', './b.rs'] },
+    noFindings,
+  )
+  check('a traversing or absolute path never enters the reviewed file list', () => {
+    const listed = calls[0].brief.match(/Changed files \(\d+\):\n([\s\S]*?)\n\n/)[1]
+    assert.ok(!listed.includes('authorized_keys') && !listed.includes('/etc/passwd'))
+    assert.ok(listed.includes('a.rs') && listed.includes('b.rs'))
+  })
+  check('ordinary paths, including ./-prefixed ones, survive intact', () =>
+    assert.ok(calls[0].brief.includes('Changed files (2):')))
+  check('no lens was told a file count that includes the refused paths', () =>
+    assert.equal(out.fileCount, 2))
+  // Rejecting them in the ALLOWLIST must not silently delete a FINDING that
+  // names one. It has no place in REVIEWED either way, so it falls out under
+  // "outside the reviewed file set" — printed, counted as remaining, visibly
+  // never dispatched. Dropping it here instead would delete a HIGH from the
+  // report and move the verdict toward APPROVE.
+  const outside = { file: '/etc/passwd', line: 1, severity: 'HIGH', confidence: 'high', issue: 'absolute', failure_scenario: 'q'.repeat(40), suggested_fix: 'f' }
+  const impl = (b, o) => {
+    if (o.phase === 'Find') return { findings: [outside] }
+    if (o.phase === 'Verify') return { verdict: 'CONFIRMED', evidence: 'e', fix_complexity: 'local', fix_class: 'correctness' }
+    return { results: [] }
+  }
+  const { out: rep } = await run({ ...baseArgs, changedLines: 300, lenses: ['A'], files: ['a.rs'] }, impl)
+  check('a finding naming a refused path is still reported, not silently dropped', () =>
+    assert.deepEqual(rep.outOfScope.map((f) => f.file), ['/etc/passwd']))
+}
+{
   // expandCmd is a whole command line, admitted only in the documented shape.
   const good = 'ironmem review-diff --repo /r --worktree --expand-file <path> --hunk <ordinal>'
   const { calls } = await run({ ...baseArgs, changedLines: 300, lenses: ['A'], expandCmd: good }, noFindings)
@@ -1710,15 +1813,21 @@ for (const verdict of ['PLAUSIBLE', 'REFUTED', 'UNVERIFIED', 'N/A', '']) {
   })
   check('the worktree is cut at the anchor object, not at a ref', () =>
     assert.ok(labelled('isolate:G cut').brief.includes(`worktree add --detach ${WT_G} ${SHA}`)))
-  check('cleanup removes and prunes, prune before remove, on the success path', () => {
+  check('cleanup removes the worktree, and prunes nothing, on the success path', () => {
     const rel = labelled('isolate:G release').brief
-    assert.ok(rel.includes(`git -C ${WT_G} worktree prune`))
     assert.ok(rel.includes(`git -C ${WT_G} worktree remove --force ${WT_G}`))
-    // Order matters: `remove` deletes the directory, so pruning after it would
-    // have no worktree left to prune from — see ultrareview.js's comment on
-    // isolationCleanupBrief for why this order is load-bearing, not stylistic.
-    assert.ok(rel.indexOf('worktree prune') < rel.indexOf('worktree remove'))
+    // `git worktree prune` operates on the SHARED repository's worktree
+    // registry no matter which worktree runs it, so `-C <isoPath>` is not a
+    // bound: with no --expire it deregisters any worktree of this repository
+    // whose directory happens to be absent right now (an unmounted volume, a
+    // directory being moved, another run mid-rm), leaving that checkout at
+    // `fatal: not a git repository: (null)`. It therefore cannot appear in a
+    // brief whose whole safety property is that it names only the throwaway
+    // path. `remove --force` alone leaves nothing behind on this path.
+    assert.ok(!commandLines(rel).some((l) => l.includes('worktree prune')))
   })
+  check('cleanup tells the agent not to prune either, since prune is repo-wide', () =>
+    assert.ok(labelled('isolate:G release').brief.includes('worktree prune')))
   check('cleanup never names the shared checkout', () =>
     assert.ok(namesOnlyIsolationPath(labelled('isolate:G release').brief, WT_G, '/r')))
   check('a read-only lens cuts no worktree and keeps the shared tree', () => {
@@ -1735,11 +1844,11 @@ for (const verdict of ['PLAUSIBLE', 'REFUTED', 'UNVERIFIED', 'N/A', '']) {
   const { out, calls } = await run({ ...baseArgs, changedLines: 1000, lenses: ['A'], reportOnly: true }, impl)
   const releaseOnFailure = calls.find((c) => c.opts.label === 'isolate:G release')
   check('cleanup runs on the failure path too', () => assert.ok(releaseOnFailure))
-  check('cleanup on the failure path still prunes, removes, and names only the throwaway', () => {
+  check('cleanup on the failure path still removes, prunes nothing, and names only the throwaway', () => {
     const rel = releaseOnFailure.brief
     const wt = `/r-ultrareview-g-${SHA.slice(0, 12)}-${ISOLATION_NONCE}`
-    assert.ok(rel.includes(`git -C ${wt} worktree prune`))
     assert.ok(rel.includes(`git -C ${wt} worktree remove --force ${wt}`))
+    assert.ok(!commandLines(rel).some((l) => l.includes('worktree prune')))
     assert.ok(namesOnlyIsolationPath(rel, wt, '/r'))
   })
   check('the failed lens is reported as errored, not as a clean zero', () =>
@@ -1829,14 +1938,76 @@ for (const verdict of ['PLAUSIBLE', 'REFUTED', 'UNVERIFIED', 'N/A', '']) {
   }
 
   // ---- release cannot confirm removal: reported as a leak, not swallowed.
+  //
+  // A leak is TWO situations with opposite remedies, and the entry has to say
+  // which one it is. The cleanup brief's own documented fallback is
+  // `rm -rf <path>` → report ok: false — on that path the directory is GONE, so
+  // `git -C <path> worktree remove --force <path>` cannot run at all (git
+  // cannot chdir into a path that does not exist: exit 128). Printing that one
+  // command for every leak meant the printed remedy was guaranteed wrong for
+  // the single leak mode this workflow documents itself as producing.
   {
+    // Mode 1: the directory is still there. Remove is the remedy.
     const impl = (b, o) => {
-      if (o.label === 'isolate:G release') return { ok: false, detail: 'directory busy' }
+      if (o.label === 'isolate:G release') return { ok: false, removed: false, detail: 'directory busy' }
+      return noFindings(b, o)
+    }
+    const { out, logs } = await run(isoArgs, impl)
+    check('a leak with the directory still present is reported by exact path', () => {
+      assert.equal(out.isolationLeaks.length, 1)
+      assert.equal(out.isolationLeaks[0].path, WT_G)
+      assert.equal(out.isolationLeaks[0].residue, 'directory')
+    })
+    check('its remedy is worktree remove --force, and never a prune', () => {
+      assert.ok(out.isolationLeaks[0].remedy.includes(`git -C ${WT_G} worktree remove --force ${WT_G}`))
+      assert.ok(!out.isolationLeaks[0].remedy.includes('worktree prune'))
+    })
+    check('the cleanup agent’s own detail survives into the entry', () =>
+      assert.match(out.isolationLeaks[0].detail, /directory busy/))
+    check('the log prints the same remedy the struct carries', () =>
+      assert.ok(logs.some((l) => l.includes(WT_G) && l.includes('worktree remove --force'))))
+  }
+  {
+    // Mode 2: the rm -rf fallback ran. The directory is gone and only the
+    // bookkeeping entry survives, so `worktree remove --force` would fail with
+    // `cannot change to '<path>'`; the remedy is a prune from the checkout that
+    // holds the registry.
+    const impl = (b, o) => {
+      if (o.label === 'isolate:G release') {
+        return { ok: false, removed: true, detail: 'removed by rm -rf; stale worktree bookkeeping entry left behind' }
+      }
+      return noFindings(b, o)
+    }
+    const { out, logs } = await run(isoArgs, impl)
+    check('an rm -rf fallback is still a leak, by exact path', () => {
+      assert.equal(out.isolationLeaks.length, 1)
+      assert.equal(out.isolationLeaks[0].path, WT_G)
+      assert.equal(out.isolationLeaks[0].residue, 'registry')
+    })
+    check('its remedy is a prune, NOT the remove command that cannot work there', () => {
+      assert.ok(out.isolationLeaks[0].remedy.includes('git -C /r worktree prune'))
+      assert.ok(!out.isolationLeaks[0].remedy.includes('worktree remove --force'))
+    })
+    check('the log for the rm -rf leak prints the prune remedy too', () =>
+      assert.ok(logs.some((l) => l.includes(WT_G) && l.includes('worktree prune'))))
+  }
+  {
+    // Mode 3: the cleanup dispatch never answered, so which of the two it is
+    // was never established. Neither remedy may be asserted alone, so both are
+    // offered — this is the old bare-path behaviour's only honest form.
+    const impl = (b, o) => {
+      if (o.label === 'isolate:G release') return Promise.reject(new Error('release dispatch died'))
       return noFindings(b, o)
     }
     const { out } = await run(isoArgs, impl)
-    check('an unconfirmed release is reported as a leak, by exact path', () =>
-      assert.deepEqual(out.isolationLeaks, [WT_G]))
+    check('an unanswered release is a leak of unknown residue', () => {
+      assert.equal(out.isolationLeaks.length, 1)
+      assert.equal(out.isolationLeaks[0].residue, 'unknown')
+    })
+    check('an unknown residue offers both remedies rather than guessing one', () => {
+      assert.ok(out.isolationLeaks[0].remedy.includes('worktree remove --force'))
+      assert.ok(out.isolationLeaks[0].remedy.includes('worktree prune'))
+    })
   }
 
   // ---- no anchor: no worktree is cut at all, mutating lenses do not run
@@ -1891,7 +2062,7 @@ for (const verdict of ['PLAUSIBLE', 'REFUTED', 'UNVERIFIED', 'N/A', '']) {
     check('an unanswered cut is reported as unknown, by exact path', () =>
       assert.deepEqual(out.isolationUnknown, [WT_G]))
     check('an unanswered cut is not reported as a leak', () =>
-      assert.ok(!out.isolationLeaks.includes(WT_G)))
+      assert.ok(!out.isolationLeaks.some((l) => l.path === WT_G)))
   }
 
   // ---- a collision reports created: false explicitly, so it is neither
@@ -1903,7 +2074,7 @@ for (const verdict of ['PLAUSIBLE', 'REFUTED', 'UNVERIFIED', 'N/A', '']) {
     }
     const { out } = await run(isoArgs, impl)
     check('a refused pre-existing path is not reported as this run’s residue', () => {
-      assert.ok(!out.isolationLeaks.includes(WT_G))
+      assert.ok(!out.isolationLeaks.some((l) => l.path === WT_G))
       assert.ok(!out.isolationUnknown.includes(WT_G))
     })
   }

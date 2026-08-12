@@ -114,6 +114,24 @@ and expect those lenses to come back ERRORED — isolation fails closed, which i
 correct, but the reason belongs in the report rather than looking like a defect
 in the code.
 
+> **Only run PR Mode against a PR head you trust to execute.** The fetch above
+> brings the PR head into your local object database, and every isolation
+> worktree is a checkout of it. The isolation note handed to a lens whose ROSTER
+> entry sends it into one tells that lens to "install or build what you need
+> inside `<isoPath>` before running a suite or a benchmark" — so for a fork PR
+> that is **the contributor's code being built and executed on your machine,
+> under your user account, with your credentials, network and filesystem
+> reachable**. A `build.rs`, a `conftest.py`, an npm `postinstall`, a `Makefile`
+> target or a test fixture all run as ordinary steps of doing that. The worktree
+> bounds where files are *written*, not what the process may *do*, and it is a
+> linked worktree sharing this repository's object store, not a sandbox.
+>
+> **`--report-only` does not disable this.** It governs the post-verification
+> fix agents and nothing else; the Find phase never consults it, so a
+> `--report-only` PR-Mode review still builds and runs the PR head's code. If
+> you do not trust the head, do not run this command on it — review the diff by
+> reading it, or run it somewhere disposable.
+
 Record whether the local working tree is at the PR head: `git rev-parse HEAD` vs
 `headRefOid`. If they differ:
 
@@ -491,9 +509,20 @@ never enters a reviewer prompt and it never enters `args`.
   there and nowhere else — do not restate that list here, in a prompt, or in a
   brief. Where the entry says so, the workflow cuts a throwaway worktree at
   `reviewSha`, points that lens's working directory, diff range and
-  `review-diff --repo` at it, waits, and removes **and** prunes it on both the
-  success and the failure path. Where it does not, the lens reads this checkout
-  directly and no worktree is cut. Three consequences for this command: the
+  `review-diff --repo` at it, waits, and then removes it with
+  `git -C <path> worktree remove --force <path>` — on the success path and on
+  the failure path alike, so a lens that throws still takes its worktree with
+  it. Nothing prunes: `git worktree prune` acts on the whole repository's
+  worktree registry regardless of which worktree issues it, so it can
+  deregister an unrelated worktree of yours whose directory is momentarily
+  absent, and it is therefore not something the cleanup step may run.
+  Removal is attempted in exactly one case — the worktree was cut. When the cut
+  refused a **pre-existing** path, nothing is removed, by design: that path is
+  another run's or user data. When the cut gave **no answer at all**, nothing is
+  removed either and the path is reported under `isolationUnknown[]` for a human
+  to look at. Where the ROSTER entry does not call for a worktree, the lens
+  reads this checkout directly and no worktree is cut. Three consequences for
+  this command: the
   PR head is load-bearing for PR Mode, and the Local Mode anchor is
   load-bearing beyond rollback (Phase 2.5); a lens whose worktree
   cannot be cut is reported as an **errored** lens — never quietly re-run
@@ -537,7 +566,7 @@ fixes { applied, files, groups[{ file, tier, results, errored, errorReason }],
 fixAgentsDispatched (bool) ·
 scopeAudit (null | { in_scope, out_of_scope_changes, summary }) ·
 verifyStats { confirmed, plausible, refuted, unverified, pastCap, supersededVerdicts } ·
-isolationLeaks[] · isolationUnknown[] ·
+isolationLeaks[{ path, residue, remedy, detail }] · isolationUnknown[] ·
 reportOnly · reportOnlyForced (bool) · rollbackSha · rollbackUsable (bool)
 ```
 
@@ -578,10 +607,18 @@ Notes on reading it:
   belongs to the wording it was reached about — but a non-zero value means the
   effective verify budget was smaller than the cap.
 - `isolationLeaks[]` holds any Find-phase isolation worktree whose removal could
-  not be confirmed. Each entry is a directory beside this checkout plus a stale
-  entry in its worktree bookkeeping — it does not affect the verdict, but name
-  the paths in the report with
-  `git -C <path> worktree remove --force <path>` so the user can clear them.
+  not be confirmed. Each entry is
+  `{ path, residue: 'directory'|'registry'|'unknown', remedy, detail }` — it
+  does not affect the verdict, but name each `path` in the report **followed by
+  its own `remedy` string, printed verbatim**. The remedies are not
+  interchangeable: `residue: 'directory'` means the directory is still there and
+  `git -C <path> worktree remove --force <path>` clears it, while
+  `residue: 'registry'` means the workflow's `rm -rf` fallback already deleted
+  the directory and only a stale bookkeeping entry remains — that same remove
+  command then fails with `cannot change to '<path>'` and exit 128, because
+  there is no directory left to run git from. `remedy` already says the right
+  thing for the case at hand; do not substitute a command of your own, and do
+  not print one remedy for the whole list.
 - `isolationUnknown[]` is **not** the same list and must not be given the same
   remedy. It holds paths where the isolation cut never reported back, so the run
   does not know whether it created anything there — and the same path could
@@ -713,8 +750,8 @@ Fixes applied: <N> across <M> files
   <only when changed files are gitignored: "not covered by the anchor: <paths>">
   <when rollbackUsable is false, this whole block is: "rollback: n/a (no anchor
   could be minted; nothing was edited)">
-<only when isolationLeaks is non-empty: "isolation worktrees left behind:
-  <paths> — clear each with git -C <path> worktree remove --force <path>">
+<only when isolationLeaks is non-empty: "isolation worktrees left behind:" then
+  one line per entry: "<path> — <remedy>", each entry's own remedy verbatim>
 <only when isolationUnknown is non-empty: "isolation paths this run could not
   account for: <paths> — INSPECT before touching; they may belong to another
   review or predate this one. Do not force-remove them.">
