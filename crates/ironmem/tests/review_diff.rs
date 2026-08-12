@@ -317,6 +317,98 @@ fn review_diff_ignores_inherited_git_repository_and_config_overrides() {
     assert!(!expanded.contains("hostile"));
 }
 
+#[test]
+fn range_diff_over_the_shared_checkout_is_blind_to_a_dirty_second_worktree() {
+    // The #249 incident in test form: a read-only reviewer treated a mutating
+    // lens's leftovers in a shared checkout as canonical, and reported a
+    // finding that did not exist in the code under review. Task 12 gives
+    // every mutating lens its own throwaway worktree cut from the same
+    // repository instead of writing into the shared checkout; this pins that
+    // the isolation actually holds at the review_diff layer — an uncommitted
+    // change accumulated in a SEPARATE worktree must never appear in a
+    // `Range` diff of the canonical range read from the shared checkout,
+    // which is exactly what a read-only lens reads while a mutating lens runs
+    // concurrently in its own worktree.
+    let fixture = fixture();
+    let worktree_root = tempfile::tempdir().expect("worktree parent");
+    let worktree_path = worktree_root.path().join("mutating-lens-worktree");
+    git(
+        fixture.tempdir.path(),
+        [
+            "worktree",
+            "add",
+            "--detach",
+            worktree_path.to_str().expect("worktree path is utf8"),
+            &fixture.head,
+        ],
+    );
+
+    // Accumulate a contaminating, uncommitted change in the second worktree —
+    // both a tracked-file edit and an untracked leftover, exactly what a
+    // mutating lens's test run or build would leave behind.
+    let contaminant = "CONTAMINATION_FROM_A_MUTATING_LENS_LEFTOVER";
+    std::fs::write(worktree_path.join("alpha.txt"), format!("{contaminant}\n"))
+        .expect("write contaminating change in the second worktree");
+    std::fs::write(
+        worktree_path.join("untracked-leftover.txt"),
+        format!("{contaminant}\n"),
+    )
+    .expect("write untracked leftover in the second worktree");
+
+    // Read the canonical range from the SHARED checkout — the tree a
+    // read-only reviewer is looking at while the mutating lens runs isolated
+    // in its own worktree above.
+    let request = fixture.request();
+    let expanded = expand_review_diff(&request, "alpha.txt", None)
+        .expect("shared-checkout expansion should succeed");
+    assert!(
+        !expanded.contains(contaminant),
+        "a canonical-range diff of the shared checkout must not see a dirty \
+         change made in a separate worktree: {expanded}"
+    );
+
+    let source = fixture.source();
+    assert!(
+        !source.contains(contaminant),
+        "the raw source diff of the canonical range must not see the \
+         separate worktree's dirty change either: {source}"
+    );
+
+    // Positive control: the two assertions above must not be satisfiable by a
+    // degenerate (e.g. empty) diff. Confirm the real reviewed content is
+    // still there, exactly like the sibling test at line ~232 above does for
+    // its own expansion.
+    assert!(
+        expanded.contains("alpha.txt section 1 head changed payload"),
+        "expansion lost the real reviewed content, so the absence of the \
+         contaminant proves nothing: {expanded}"
+    );
+
+    // Negative control on `ReviewDiffSource` itself, not just on git's
+    // worktree semantics: an uncommitted, differently-marked change written
+    // directly into the SHARED checkout (not the second worktree) must also
+    // stay out of a `Range` diff. Unlike the assertions above — which pass
+    // for any correct `Range` implementation regardless of what this test
+    // does — this one is what would actually fail if `fixture.request()`
+    // ever regressed from `ReviewDiffSource::Range` to
+    // `ReviewDiffSource::Worktree` (which reads the caller's own working
+    // directory instead of committed history).
+    let shared_checkout_marker = "CONTAMINATION_FROM_THE_SHARED_CHECKOUTS_OWN_DIRTY_STATE";
+    std::fs::write(
+        fixture.tempdir.path().join("alpha.txt"),
+        format!("{shared_checkout_marker}\n"),
+    )
+    .expect("write dirty state directly in the shared checkout");
+    let expanded_after_dirty = expand_review_diff(&request, "alpha.txt", None)
+        .expect("shared-checkout expansion should still succeed with dirty state present");
+    assert!(
+        !expanded_after_dirty.contains(shared_checkout_marker),
+        "a Range diff must read committed history, not the shared checkout's \
+         own uncommitted state — this fails if the request ever regressed to \
+         ReviewDiffSource::Worktree: {expanded_after_dirty}"
+    );
+}
+
 #[cfg(feature = "headroom-compression")]
 #[test]
 fn artifact_expansion_uses_the_immutable_worktree_snapshot() {

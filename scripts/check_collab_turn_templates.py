@@ -14,8 +14,24 @@ ROOT = pathlib.Path(os.environ.get(
     "COLLAB_LINT_ROOT",
     pathlib.Path(__file__).resolve().parents[1],
 )).resolve()
+# This checker's own source, for the one check that cross-references a
+# comment in this file (`check_pr_create_failed_doc_pointer_contract`).
+# Resolved through `ROOT` like every other surface the lint reads rather than
+# pinned to `__file__`: pinned to `__file__` the self-side of that check reads
+# the real script no matter what `COLLAB_LINT_ROOT` says, so no fixture tree
+# can ever plant a drifted copy and no test can reach its failure path — the
+# rule was structurally untestable, and deleting it outright went unnoticed by
+# the whole suite. An in-tree run has `ROOT` == the repo root, so this is this
+# very file; a fixture tree that does not copy the script falls back to it.
+_SELF_FILE = pathlib.Path(__file__).resolve()
+_ROOT_SELF = ROOT / "scripts" / _SELF_FILE.name
+SELF_SOURCE = _ROOT_SELF if _ROOT_SELF.exists() else _SELF_FILE
 PROMPTS = ROOT / ".claude-plugin" / "prompts"
 COMMAND = ROOT / ".claude-plugin" / "commands" / "collab.md"
+COMMANDS_DIR = ROOT / ".claude-plugin" / "commands"
+CODEX_PROMPTS_DIR = ROOT / ".codex-plugin" / "prompts"
+CODEX_COMMANDS_DIR = ROOT / ".codex-plugin" / "commands"
+ULTRAREVIEW_SRC = ROOT / ".claude-plugin" / "workflows" / "ultrareview.js"
 DOC = ROOT / "docs" / "COLLAB.md"
 EVALUATE_ISSUE_DOC = ROOT / "docs" / "EVALUATE_ISSUE.md"
 EVALUATE_ISSUE_CLAUDE = ROOT / ".claude-plugin" / "commands" / "evaluate-issue.md"
@@ -667,6 +683,12 @@ errors: list[str] = []
 COLLAB_RS = ROOT / "crates" / "ironmem" / "src" / "collab" / "mod.rs"
 RUST_PREFIX_RE = re.compile(
     r'pub const [A-Z0-9_]+_PREFIX: &str = "([a-z0-9_]+:)";')
+# Anchor text for the docs/COLLAB.md heading the `pr_create_failed:` comment
+# below points at. Defined once so `check_pr_create_failed_doc_pointer_contract`
+# can pin BOTH sides of that pointer — this file's comment and the doc
+# heading — against the same string, instead of only pinning the doc side and
+# trusting the comment's prose to stay in sync by hand.
+PR_CREATE_FAILED_DOC_HEADING = "`pr_create_failed:` stays Terminal"
 # Prefixes the surfaces may legitimately use that are deliberately absent from
 # the Rust constants: `classify()` maps every unrecognized string to
 # `FailureClass::Terminal`, and these two are documented terminal failures. Any
@@ -681,11 +703,17 @@ RUST_PREFIX_RE = re.compile(
 #   mechanical_direct_gate_failed: the same, on Codex's mechanical_direct path
 #   skill_overran_pr_boundary:     a sub-skill opened a PR outside the protocol
 #   pr_create_failed:              `gh pr create` failed on Claude's final turn
-# `pr_create_failed:` is deliberately NOT the prefix Codex uses when it owns
-# `final_review` under recovery — there it reports `network_failed:` /
-# `sandbox_denied:`, which classify Tooling and hand the PR turn to Claude,
-# who owns PR creation in the normal flow. The asymmetry is intentional: a
-# Codex PR failure has a live counterpart to fall back on, Claude's does not.
+# `pr_create_failed:` stays Terminal deliberately: in normal flow PR creation
+# is Claude-worker-only, so a failure here has no live counterpart to hand a
+# retry to. Codex opens the PR itself only under the delegated-completion
+# recovery override (`.codex-plugin/prompts/collab-recovery.md`,
+# `CodeReviewFinalPending`), and there it reports the recoverable
+# `network_failed:`/`sandbox_denied:` prefix rather than this one — so that
+# exception does not give this prefix a live counterpart either. See
+# "`pr_create_failed:` stays Terminal" in docs/COLLAB.md for the full
+# rationale and manual recovery steps. (That quoted phrase must stay
+# byte-identical to PR_CREATE_FAILED_DOC_HEADING above —
+# check_pr_create_failed_doc_pointer_contract pins both against it.)
 DOCUMENTED_TERMINAL_PREFIXES = {
     "subagent_failure:",
     "gate_failure:",
@@ -1017,6 +1045,288 @@ def check_review_diff_trigger_detection_contract() -> None:
     # PR and worktree modes each need the raw-detection-only boundary.
     if any(text.count(snippet) < 2 for snippet in REVIEW_DIFF_TRIGGER_DETECTION_SNIPPETS):
         err(f"{path.relative_to(ROOT)}: missing review-diff trigger-detection contract")
+
+
+# `ultrareview.js`'s ROSTER is the only place a review lens is classified
+# mutating vs. read-only (task 11, issue #265 hardening, Codex review D5).
+# `EXPECTED_LENS_COUNT` mirrors the same guard `test_ultrareview_workflow.mjs`
+# pins on the JS side (`rosterEntries.length >= 11`): a roster reformatted so
+# the entry-line regex below stops matching some of it must fail loudly, not
+# quietly check fewer lenses than exist.
+ULTRAREVIEW_EXPECTED_LENS_COUNT = 11
+ULTRAREVIEW_ROSTER_BLOCK_RE = re.compile(r"const ROSTER = \{(.*?)\n\}\n", re.DOTALL)
+ULTRAREVIEW_ROSTER_ENTRY_RE = re.compile(r"^\s*([A-Z]):\s*\{(.*)\},?\s*$", re.MULTILINE)
+
+# The four shapes a lens reference written as its bare id takes — `(K)`,
+# `Agent K`, `Lens K`, `**K**`. `{ids}` is filled in with a character class
+# built from the ids ROSTER actually declares (see
+# `ultrareview_id_ref_res`), never a hardcoded `A-K`.
+ULTRAREVIEW_ID_REF_TEMPLATES = (
+    r"\(([{ids}])\)",
+    r"\b[Aa]gent\s+([{ids}])\b",
+    r"\b[Ll]ens\s+([{ids}])\b",
+    r"\*\*([{ids}])\*\*",
+)
+
+
+def ultrareview_id_ref_res(lens_ids) -> list[re.Pattern]:
+    """Id-form reference patterns for exactly the ids ROSTER declares.
+
+    The id set is derived from the parsed roster rather than hardcoded, for
+    the same reason the name set is (`ultrareview_name_to_id`): a hardcoded
+    `[A-K]` was a second, hand-maintained copy of roster metadata inside the
+    very check that exists to stop roster metadata being copied. Adding a
+    lens `L` left every id-form reference to it — `(L)`, `Agent L`, `Lens L`,
+    `**L**` — invisible to this check while the name form still worked.
+
+    The letter is still matched case-SENSITIVE, deliberately: case-insensitive
+    matching here previously turned "(a) is read-only, (b) never writes" (an
+    ordinary lowercase lettered list) into a false-positive reference to lens
+    A/B. A real lens id is always written uppercase, so the ids go into the
+    class verbatim and no `re.IGNORECASE` is applied.
+    """
+    ids = "".join(sorted(lens_id for lens_id in lens_ids if len(lens_id) == 1))
+    if not ids:
+        return []
+    return [re.compile(t.format(ids=re.escape(ids))) for t in ULTRAREVIEW_ID_REF_TEMPLATES]
+
+
+# What immediately follows a lens reference for it to count as an actual
+# classification assertion about THAT lens, as opposed to the lens merely
+# being named in a sentence about something else ("the architect lens is
+# dispatched during the read-only find phase" — read-only describes the
+# phase, not the lens, and must not match). The optional leading filler
+# absorbs a trailing "(id)" or "lens" between the name and the predicate, e.g.
+# "pr-test-analyzer (G) never writes ..." or "performance-reviewer lens is
+# read-only ...".
+# The optional parenthetical is not just `(A)`-`(K)`: this corpus names lenses
+# as "Lens K (performance-reviewer)" and "G (pr-test-analyzer)", so a bare
+# `\([A-K]\)` left the agent-name form unmatched and any classification written
+# that way sailed through. Bounded and `[^)]` so it cannot run past its own
+# close paren into an unrelated clause. The leading `\)?` is the mirror case:
+# when the matched reference is the agent NAME, the match ends inside the
+# parentheses and the predicate is preceded by the closing paren instead.
+ULTRAREVIEW_TRAILING_PREDICATE_RE = re.compile(
+    r"\s*\)?\s*(?:\([^)]{0,60}\)\s*)?(?:lens\s+)?(?:"
+    r"(?:is|are)\s+(?:still\s+|currently\s+|classified\s+as\s+)?(?:read-only|mutat\w*)"
+    r"|(?:never\s+)?writes?\s+to\s+the\s+(?:working\s+)?tree"
+    r"|never\s+(?:writes?|edits?)\b"
+    r"|runs?\s+(?:the\s+)?test\s+suite"
+    r"|runs?\s+benchmarks?"
+    r")",
+    re.IGNORECASE,
+)
+# A sentence can assert a competing classification without tying it to one
+# specific lens id at all — "the mutating lenses are ..." or "lenses that
+# mutate: G, K" is exactly the kind of drift-prone list this task exists to
+# ban, independent of whether any single id sits next to the verb.
+ULTRAREVIEW_GENERIC_COMPETING_LIST_RE = re.compile(
+    r"\b(?:mutating|read-only|non-mutating)\s+lenses?\b"
+    r"|\blenses?\s+that\s+(?:mutate|write|edit|run\s+the\s+test\s+suite)\b",
+    re.IGNORECASE,
+)
+# What earns a paragraph the ROSTER exemption below: an explicit, deliberate
+# reference to the source of truth as code — `ROSTER.mutates`, `ROSTER.`,
+# `ROSTER[id]` — matched case-sensitively on the identifier itself.
+# The exemption used to be keyed on the bare substring "roster", which any
+# paragraph could trip by accident: "the full roster is applied by band" is
+# already written in this corpus, and `ultrareview.js` logs lines beginning
+# `roster:`. One such clause anywhere in a paragraph disabled the whole check
+# for it, so appending "The full roster is applied by band." to a prose
+# restatement of the classification was enough to make the lint pass.
+ULTRAREVIEW_ROSTER_POINTER_RE = re.compile(r"\bROSTER\s*(?:\.|\[)")
+
+
+def parse_ultrareview_roster(text: str) -> dict[str, dict]:
+    """`{lens id: {"mutates": bool|None, "key": str|None}}`.
+
+    `mutates` is `None` when the entry omits the field. `key` is the lens's
+    own spelled-out name straight from its ROSTER entry (e.g.
+    `'performance-reviewer'`), so callers never need a second, hand-maintained
+    copy of the name-to-id mapping — deriving it from the same parse this
+    function already does is the whole point of task 11.
+    """
+    block = ULTRAREVIEW_ROSTER_BLOCK_RE.search(text)
+    if not block:
+        return {}
+    out: dict[str, dict] = {}
+    for entry in ULTRAREVIEW_ROSTER_ENTRY_RE.finditer(block.group(1)):
+        lens_id, entry_body = entry.group(1), entry.group(2)
+        m = re.search(r"\bmutates:\s*(true|false)\b", entry_body)
+        km = re.search(r"key:\s*'([^']+)'", entry_body)
+        out[lens_id] = {
+            "mutates": (m.group(1) == "true") if m else None,
+            "key": km.group(1) if km else None,
+        }
+    return out
+
+
+def ultrareview_name_to_id(roster: dict[str, dict]) -> dict[str, str]:
+    """Spelled-out lens name -> id, derived from ROSTER's own `key` field.
+
+    A `key` like `'code-reviewer (correctness)'` carries a parenthetical
+    descriptor that nobody writing prose about the lens would reproduce
+    verbatim, so it is stripped to the base name the same way a human
+    shorthand would.
+    """
+    out: dict[str, str] = {}
+    for lens_id, info in roster.items():
+        key = info.get("key")
+        if not key:
+            continue
+        base = re.sub(r"\s*\([^)]*\)\s*$", "", key).strip()
+        if base:
+            out[base.lower()] = lens_id
+    return out
+
+
+# `- `, `* `, `+ ` or `1. ` at any indent: the start of a markdown list item,
+# which ultrareview_paragraphs treats as a block boundary.
+MARKDOWN_LIST_ITEM_RE = re.compile(r"^\s*(?:[-*+]|\d+\.)\s")
+
+
+def ultrareview_paragraphs(text: str) -> list[tuple[int, str]]:
+    """Blank-line-delimited blocks, each joined to a single line.
+
+    This corpus hard-wraps prose at ~78 columns, so a sentence asserting a
+    per-lens classification routinely spans two source lines (task 11 review
+    finding #2). Scanning line-at-a-time missed those; joining every
+    non-blank run into one string before sentence-splitting does not. The
+    paragraph's first source line is kept for the error message — an
+    approximation once lines are joined, but enough to locate the block.
+
+    A markdown list item also starts a new block, even with no blank line
+    before it. Bullets in this corpus are written as one blank-line-delimited
+    run, so blank-lines-only splitting made an entire list a single block —
+    and since the ROSTER exemption below is block-scoped, one sanctioned
+    "see ROSTER.mutates" bullet exempted every other bullet beside it,
+    including the "What the workflow guarantees" list, which is the most
+    likely place for a prose restatement to appear. A bullet's own hard-wrap
+    continuation lines are indented and keep joining it, so the wrapped-
+    sentence fix this function exists for is unaffected.
+    """
+    blocks: list[tuple[int, str]] = []
+    cur: list[str] = []
+    cur_start = None
+    for i, line in enumerate(text.splitlines(), 1):
+        if line.strip() == "":
+            if cur:
+                blocks.append((cur_start, " ".join(cur)))
+                cur = []
+                cur_start = None
+        else:
+            if MARKDOWN_LIST_ITEM_RE.match(line) and cur:
+                blocks.append((cur_start, " ".join(cur)))
+                cur = []
+                cur_start = None
+            if cur_start is None:
+                cur_start = i
+            cur.append(line)
+    if cur:
+        blocks.append((cur_start, " ".join(cur)))
+    return blocks
+
+
+def ultrareview_sentences(paragraph: str) -> list[str]:
+    normalized = re.sub(r"\s+", " ", paragraph).strip()
+    return re.split(r"(?<=[.!?])\s+", normalized)
+
+
+def find_ultrareview_lens_refs(sentence: str, id_res: list[re.Pattern], name_re: re.Pattern, name_to_id: dict[str, str]) -> list[tuple[int, int, str]]:
+    """`(start, end, lens_id)` for every lens reference in `sentence`, sorted by position."""
+    refs = []
+    for pat in id_res:
+        for m in pat.finditer(sentence):
+            refs.append((m.start(), m.end(), m.group(1)))
+    if name_re is not None:
+        for m in name_re.finditer(sentence):
+            lens_id = name_to_id.get(m.group(1).lower())
+            if lens_id:
+                refs.append((m.start(), m.end(), lens_id))
+    refs.sort()
+    return refs
+
+
+def check_review_lens_mutation_classification_contract() -> None:
+    """`mutates` lives in exactly one place: ultrareview.js's ROSTER.
+
+    Task 11 (issue #265 hardening, Codex review D5): the mutating/read-only
+    split for review lenses must be a machine-readable classification, not a
+    sentence in a prompt — a prompt sentence can silently drift from the code
+    that actually gates worktree isolation. This check has two halves: the
+    ROSTER itself must classify every lens (mirrors the workflow's own
+    assertion, so a parse-level regression here is caught even if
+    `ultrareview.js` is edited without running its JS test), and no review
+    prompt/command markdown may restate that classification in prose — even
+    correctly, since a correct restatement today is exactly the copy that
+    drifts tomorrow. Flag any such restatement outright rather than trying to
+    prove it wrong first.
+
+    A paragraph that points at `ROSTER` as code (e.g. "see ROSTER.mutates for
+    which lenses mutate") is exempted entirely: that is the sanctioned way to
+    describe the policy without a second copy of it, and task 12 needs to be
+    able to write exactly that sentence in these same files. The bare English
+    word "roster" does not earn the exemption — see
+    `ULTRAREVIEW_ROSTER_POINTER_RE`.
+    """
+    if not ULTRAREVIEW_SRC.exists():
+        err(f"{ULTRAREVIEW_SRC.relative_to(ROOT)}: missing — cannot verify the "
+            f"review-lens mutation classification")
+        return
+    roster = parse_ultrareview_roster(ULTRAREVIEW_SRC.read_text(encoding="utf-8"))
+    if len(roster) < ULTRAREVIEW_EXPECTED_LENS_COUNT:
+        err(f"{ULTRAREVIEW_SRC.relative_to(ROOT)}: only parsed {len(roster)} "
+            f"ROSTER entr{'y' if len(roster) == 1 else 'ies'}, expected "
+            f"{ULTRAREVIEW_EXPECTED_LENS_COUNT} — review-lens "
+            f"mutation-classification check may be silently checking fewer "
+            f"lenses than actually exist")
+        if not roster:
+            return
+    missing = sorted(lens_id for lens_id, info in roster.items() if info["mutates"] is None)
+    if missing:
+        err(f"{ULTRAREVIEW_SRC.relative_to(ROOT)}: ROSTER entries {missing} do "
+            f"not declare mutates: true|false")
+
+    id_res = ultrareview_id_ref_res(roster)
+    name_to_id = ultrareview_name_to_id(roster)
+    name_re = (
+        re.compile(r"\b(" + "|".join(re.escape(n) for n in name_to_id) + r")\b", re.IGNORECASE)
+        if name_to_id else None
+    )
+
+    candidates: list[pathlib.Path] = []
+    for base in (PROMPTS, COMMANDS_DIR, CODEX_PROMPTS_DIR, CODEX_COMMANDS_DIR):
+        if base.is_dir():
+            candidates.extend(sorted(base.glob("*.md")))
+    for path in candidates:
+        text = path.read_text(encoding="utf-8")
+        for start_line, paragraph in ultrareview_paragraphs(text):
+            # Deliberately paragraph-scoped, not sentence-scoped: the
+            # sanctioned "point back to ROSTER" phrasing and the sentence it
+            # is clarifying are often split by a semicolon or a second
+            # sentence in the same paragraph, and both must stay exempt.
+            if ULTRAREVIEW_ROSTER_POINTER_RE.search(paragraph):
+                continue
+            for sentence in ultrareview_sentences(paragraph):
+                if ULTRAREVIEW_GENERIC_COMPETING_LIST_RE.search(sentence):
+                    err(f"{path.relative_to(ROOT)}:{start_line}: describes a "
+                        f"competing mutating/read-only lens list in prose — "
+                        f"ROSTER.mutates in {ULTRAREVIEW_SRC.relative_to(ROOT)} "
+                        f"is the only place this may be declared: "
+                        f"{sentence.strip()!r}")
+                flagged: set[str] = set()
+                for start, end, lens_id in find_ultrareview_lens_refs(sentence, id_res, name_re, name_to_id):
+                    if lens_id in flagged:
+                        continue
+                    trailing = sentence[end:end + 80]
+                    if ULTRAREVIEW_TRAILING_PREDICATE_RE.match(trailing):
+                        flagged.add(lens_id)
+                        err(f"{path.relative_to(ROOT)}:{start_line}: restates "
+                            f"the mutating/read-only classification for lens "
+                            f"{lens_id!r} in prose — ROSTER.{lens_id}.mutates "
+                            f"in {ULTRAREVIEW_SRC.relative_to(ROOT)} is the "
+                            f"only place this may be declared: "
+                            f"{sentence.strip()!r}")
 
 
 # Contract lists for the pilot-routing checks below. They are module-level
@@ -1879,6 +2189,75 @@ def check_pr_base_resolution_contract() -> None:
         if snippet not in doc_text:
             err(f"docs/COLLAB.md: missing PR-base resolution contract "
                 f"{snippet!r}")
+
+
+def check_pr_create_failed_doc_pointer_contract() -> None:
+    """The shrunk `pr_create_failed:` comment must still resolve, both ways.
+
+    `check_collab_turn_templates.py`'s `DOCUMENTED_TERMINAL_PREFIXES` comment
+    deliberately doesn't restate why `pr_create_failed:` stays Terminal — it
+    points at a heading in docs/COLLAB.md instead, so the rationale lives in
+    exactly one place. A pointer like that can break from either end:
+    docs/COLLAB.md could drop or rename the heading, or this file's comment
+    could drift to naming a different string. Pinning only the doc side
+    would miss the second case entirely — a comment edited to reference a
+    stale heading would still pass. Both sides are checked here against the
+    single `PR_CREATE_FAILED_DOC_HEADING` constant, so a mismatch on either
+    end fails loudly instead of leaving a dead pointer.
+    """
+    # This file's own pointer comment sits immediately above
+    # `DOCUMENTED_TERMINAL_PREFIXES = {`. `SELF_SOURCE` is `ROOT`-relative on
+    # purpose (see its definition): in-tree it is this very file, and under a
+    # `COLLAB_LINT_ROOT` fixture tree it is that tree's copy, which is what
+    # makes this side of the check reachable from a test at all.
+    self_text = SELF_SOURCE.read_text(encoding="utf-8")
+    anchor_def = 'PR_CREATE_FAILED_DOC_HEADING = "'
+    prefixes_def = "DOCUMENTED_TERMINAL_PREFIXES = {"
+    anchor_idx = self_text.find(anchor_def)
+    prefixes_idx = self_text.find(prefixes_def)
+    if anchor_idx == -1 or prefixes_idx == -1 or prefixes_idx <= anchor_idx:
+        err("scripts/check_collab_turn_templates.py: could not locate the "
+            "PR_CREATE_FAILED_DOC_HEADING constant and the "
+            "DOCUMENTED_TERMINAL_PREFIXES comment above it to cross-check")
+        return
+    # COMMENT lines only, unwrapped into one string. The window opens ON the
+    # constant's definition line, whose value IS the anchor, so counting
+    # occurrences across the raw window let the definition supply one of the
+    # matches the comment was supposed to supply — the exact drift this check
+    # exists to catch (the comment edited to stop quoting the anchor) still
+    # passed. Dropping the non-comment text and pinning the pointer SENTENCE,
+    # rather than a bare occurrence count, is what closes that.
+    comment_text = re.sub(r"\s+", " ", " ".join(
+        line.lstrip().lstrip("#").strip()
+        for line in self_text[anchor_idx:prefixes_idx].splitlines()
+        if line.lstrip().startswith("#")
+    ))
+    pointer = f'See "{PR_CREATE_FAILED_DOC_HEADING}" in docs/COLLAB.md'
+    if pointer not in comment_text:
+        err("scripts/check_collab_turn_templates.py: the "
+            "DOCUMENTED_TERMINAL_PREFIXES pointer comment no longer quotes "
+            f"{PR_CREATE_FAILED_DOC_HEADING!r} byte-identically — expected "
+            f"the comment to say {pointer!r}; the comment and "
+            "PR_CREATE_FAILED_DOC_HEADING have drifted apart")
+
+    # docs/COLLAB.md side: the anchor must appear as the literal `####`
+    # heading, not merely as a passing mention in prose elsewhere in the
+    # file — a reorg that folds the section into inline prose should fail
+    # this, not pass it.
+    # Guarded and explicitly UTF-8 like every neighbouring check that reads a
+    # surface. (Several older `DOC` reads elsewhere in this file are still
+    # unguarded, so today a fixture tree with no docs/COLLAB.md tracebacks
+    # before reaching this line; that sweep is its own change. This check does
+    # not add to the pile.)
+    if not DOC.exists():
+        err("docs/COLLAB.md: missing — cannot verify the "
+            f"{PR_CREATE_FAILED_DOC_HEADING!r} pointer target")
+        return
+    doc_text = DOC.read_text(encoding="utf-8")
+    if f"#### {PR_CREATE_FAILED_DOC_HEADING}" not in doc_text:
+        err(f"docs/COLLAB.md: missing the {PR_CREATE_FAILED_DOC_HEADING!r} "
+            "`####` heading that scripts/check_collab_turn_templates.py's "
+            "DOCUMENTED_TERMINAL_PREFIXES comment points at")
 
 
 # The two collab.md dispatch rows that hand off to collab-turn-submit.md
@@ -3235,6 +3614,7 @@ def main() -> int:
     check_installer_covers_templates()
     check_precondition_phase_names()
     check_pr_base_resolution_contract()
+    check_pr_create_failed_doc_pointer_contract()
     check_sender_dispatch_contract()
     check_codex_pilot_routing_contract()
     check_codex_pilot_compose_handoff_contract()
@@ -3242,6 +3622,7 @@ def main() -> int:
     check_planning_dispatch_failure_contract()
     check_pilot_submit_doc_contract()
     check_review_diff_trigger_detection_contract()
+    check_review_lens_mutation_classification_contract()
     check_pilot_flag_parsing_contract()
     check_end_of_options_terminator_contract()
     check_terminator_usage_surfaces()

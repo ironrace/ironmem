@@ -921,6 +921,78 @@ dead-but-recoverable session back up — it is not needed for the normal
 in-flight recovery described above, since that session never leaves its
 phase in the first place.
 
+#### `pr_create_failed:` stays Terminal
+
+**Decision.** `pr_create_failed:` — reported by Claude's `final_review` turn
+when `gh pr create` fails — is not one of the six recoverable prefixes and
+is not going to become one. It stays in `DOCUMENTED_TERMINAL_PREFIXES`
+(`scripts/check_collab_turn_templates.py`) and every failure of this kind
+ends the session in `CodingFailed`.
+
+**Rationale.** By the time `.claude-plugin/prompts/collab-turn-submit.md`
+runs `gh pr create`, the branch is already reviewed, gated, and pushed — a
+failure at that one command loses exactly one `gh` invocation, nothing else
+about the session's work is at risk. Making the most authority-sensitive
+transition in the whole machine (the one that hands a reviewed, pushed
+branch to a human as a PR) resumable, just to save re-running one command,
+is a bad trade. It is also structurally different from the six recoverable
+prefixes above, each of which names an operation either agent's own turn
+might perform and so always has a live counterpart on the other side to
+hand off to. In normal flow, PR creation isn't one of those: the Claude-side
+submit worker (`collab-turn-submit.md`) is the one that runs `gh pr create`,
+even when `$SENDER == "codex"` — Codex's ordinary final-review and
+batch-implementation prompts
+(`.codex-plugin/prompts/collab-final-review.md`,
+`.codex-plugin/prompts/collab-batch-impl.md`) explicitly forbid Codex from
+calling `gh pr create`, `gh pr list`, or any pull-request remote check. The
+delegated-completion recovery override is the narrow exception: when Codex
+owns recovery for `CodeReviewFinalPending`, it opens the PR directly and a
+real network or sandbox failure is reported with the corresponding recoverable
+`network_failed:` or `sandbox_denied:` prefix. That exception does not make
+`pr_create_failed:` recoverable: it remains the Terminal classification for
+the normal submit-worker failure described here.
+
+**Incident context.** The motivating incident (session `06667e54`: 29 green,
+reviewed, pushed commits apparently stranded by a `pr_create_failed:`
+Terminal) was a *spurious trigger*, not a genuine `gh` failure: the submit
+turn was gating PR-base resolution on `base_sha` being contained in
+`origin/main`, which a normally-cut collab branch routinely fails, so the
+turn reported `pr_create_failed:` before `gh pr create` ever ran for a real
+reason. That defect is fixed in `c803979` (base resolution now uses the
+remote default / `origin/main`/`master`/`trunk` existence, never containment
+of `base_sha`, as the gate) and is pinned by
+`check_pr_base_resolution_contract` in
+`scripts/check_collab_turn_templates.py`. The incident is evidence that base
+resolution had a bug, not evidence that transient `gh` failures are common
+enough to justify making this transition resumable.
+
+**Manual recovery.** A session that ends `CodingFailed` with `coding_failure`
+starting `pr_create_failed:` is not resumable (the prefix classifies
+Terminal, so `collab_resume`'s Tooling precondition never holds — see above).
+The branch itself is untouched by the failure — it was already pushed before
+`gh pr create` ran — so recovery is a human running the same command by
+hand, not a protocol action:
+
+1. Read `branch` and `last_head_sha` off the failed session, e.g.
+   `collab_status(session_id=<session_id>)` (or the `session_handoff` block).
+2. Confirm the branch is what the session left behind:
+   `git rev-parse <branch>` (or `HEAD` after checking it out) must equal
+   `last_head_sha`.
+3. Open the PR by hand, against the repository's default branch — the same
+   resolution `collab-turn-submit.md` runs for `final_review`
+   (`git symbolic-ref refs/remotes/origin/HEAD`, else the first of
+   `origin/main`/`origin/master`/`origin/trunk` that exists). In this repo
+   that is `main`, so the command is:
+   ```bash
+   gh pr create --base main --head "<branch>" \
+     --title "<title>" --body "<body>"
+   ```
+   using the title/body the failed turn was trying to send — recoverable
+   from the staged drawer named by that turn's `$ARTIFACT_REF` via
+   `get_drawer(id=<artifact_ref>)` (drawers are immutable, so the staged
+   title/body is unchanged), or written fresh by the human if the drawer is
+   gone.
+
 ## Blind-Draft Invariant
 
 During `PlanParallelDrafts`, neither agent can see the other's draft until

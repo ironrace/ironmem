@@ -172,8 +172,11 @@ pub fn index_repo(db: &Database, repo_path: &str, force: bool) -> Result<IndexRe
 
         let language = &parsed.language;
 
-        // Per-file replacement: delete old rows, insert new.
-        db.with_transaction(|tx| {
+        // Per-file replacement: delete old rows, insert new. The closure
+        // returns its per-file counts rather than accumulating into the outer
+        // totals, so a transaction that is rolled back and re-run cannot
+        // double-count: the totals below advance exactly once, after commit.
+        let (local_symbols, local_imports, local_edges) = db.with_transaction(|tx| {
             // Remove stale rows.
             Database::delete_file_rows_tx(tx, &canonical, &rel_path)?;
 
@@ -300,11 +303,12 @@ pub fn index_repo(db: &Database, repo_path: &str, force: bool) -> Result<IndexRe
                 )?;
             }
 
-            symbols_inserted += local_symbols;
-            imports_inserted += local_imports;
-            edges_inserted += local_edges;
-            Ok(())
+            Ok((local_symbols, local_imports, local_edges))
         })?;
+
+        symbols_inserted += local_symbols;
+        imports_inserted += local_imports;
+        edges_inserted += local_edges;
 
         files_indexed += 1;
     }

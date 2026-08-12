@@ -38,6 +38,20 @@ def copy_fixture(tmp_path):
     (fixture / "scripts").mkdir()
     shutil.copy2(ROOT / "scripts" / "install-ironmem.sh",
                  fixture / "scripts" / "install-ironmem.sh")
+    # The lint reads one comment out of its OWN source
+    # (`check_pr_create_failed_doc_pointer_contract`), resolved through
+    # COLLAB_LINT_ROOT like every other surface. Copying the script in is what
+    # lets a test drift that comment in the fixture instead of in the real
+    # file — without it that half of the check reads the real script and no
+    # test can ever red it.
+    shutil.copy2(LINT, fixture / "scripts" / LINT.name)
+    # The review-lens mutation-classification check (task 11) reads the
+    # ROSTER straight out of ultrareview.js — without this the check has no
+    # source of truth to compare prompt/command prose against and every
+    # fixture run fails on "missing" rather than exercising the check.
+    (fixture / ".claude-plugin" / "workflows").mkdir(parents=True)
+    shutil.copy2(ROOT / ".claude-plugin" / "workflows" / "ultrareview.js",
+                 fixture / ".claude-plugin" / "workflows" / "ultrareview.js")
     # The failure-prefix and phase-name checks derive their valid sets from
     # the Rust sources rather than from hardcoded copies.
     rust = pathlib.Path("crates") / "ironmem" / "src" / "collab"
@@ -2672,3 +2686,393 @@ def test_lint_reports_an_ambiguous_codex_shim_flag_region_anchor(tmp_path):
     assert r.returncode == 1
     assert (".codex-plugin/commands/collab.md: the `start` flag-parsing "
             f"region is delimited by {anchor!r}, which appears 2 times") in r.stdout
+
+
+# ------------------------------------------------------------------ task 11
+#
+# The mutating/read-only split for ultrareview's review lenses must be a
+# machine-readable classification with one source of truth — ROSTER in
+# ultrareview.js — never a sentence restated in prompt/command markdown, since
+# a restatement is a second copy of the fact and a second copy drifts.
+#
+# Each `test_lint_rejects_*` case below is a literal reproduction of an
+# example a code-quality review of the first cut of this check said was
+# missed or wrongly flagged — not a paraphrase — so a regression in either
+# direction reproduces the exact review finding, not a nearby approximation.
+
+def test_lint_rejects_prose_that_contradicts_the_roster_mutation_classification(tmp_path):
+    fixture = copy_fixture(tmp_path)
+    path = fixture / ".claude-plugin" / "commands" / "ultrareview-local.md"
+    # K is classified `mutates: true` in the real ROSTER; this sentence claims
+    # the opposite in prose.
+    path.write_text(path.read_text() +
+                     "\n\nperformance-reviewer (K) is read-only and never "
+                     "writes to the tree.\n")
+
+    r = run({"COLLAB_LINT_ROOT": str(fixture)})
+
+    assert r.returncode == 1
+    assert (".claude-plugin/commands/ultrareview-local.md:" in r.stdout
+            and "restates the mutating/read-only classification for lens "
+                "'K' in prose" in r.stdout)
+
+
+def test_lint_rejects_a_generic_competing_lens_list_even_when_correct(tmp_path):
+    fixture = copy_fixture(tmp_path)
+    path = fixture / ".claude-plugin" / "commands" / "ultrareview-local.md"
+    # Both ids are correct per the real ROSTER — restating them is still a
+    # second source of truth, so it must fail too, not just a wrong one. This
+    # phrasing ("lenses that mutate") names no single lens as its direct
+    # subject, so it is caught by the generic competing-list detector rather
+    # than the per-lens one.
+    path.write_text(path.read_text() +
+                     "\n\npr-test-analyzer (G) and performance-reviewer (K) "
+                     "are the only lenses that mutate the working tree.\n")
+
+    r = run({"COLLAB_LINT_ROOT": str(fixture)})
+
+    assert r.returncode == 1
+    assert ("describes a competing mutating/read-only lens list in prose"
+            in r.stdout)
+
+
+def test_lint_rejects_a_wrapped_per_lens_classification_sentence(tmp_path):
+    # This corpus hard-wraps prose at ~78 columns, so a classification
+    # sentence routinely spans two source lines. A line-at-a-time scan missed
+    # this; the paragraph-joining fix must not.
+    fixture = copy_fixture(tmp_path)
+    path = fixture / ".claude-plugin" / "commands" / "ultrareview-local.md"
+    path.write_text(path.read_text() +
+                     "\n\nThe performance-reviewer lens\nis read-only and "
+                     "never writes.\n")
+
+    r = run({"COLLAB_LINT_ROOT": str(fixture)})
+
+    assert r.returncode == 1
+    assert "restates the mutating/read-only classification for lens 'K' in prose" in r.stdout
+
+
+def test_lint_rejects_a_classification_bullet_inside_a_roster_citing_list(tmp_path):
+    # The ROSTER exemption is block-scoped, and bullets used to be joined into
+    # one block with no blank line between them. That made a single sanctioned
+    # "see ROSTER.mutates" bullet exempt every other bullet beside it —
+    # including the "What the workflow guarantees" list, the most likely place
+    # for a restatement to be written. A list item is its own block now.
+    fixture = copy_fixture(tmp_path)
+    path = fixture / ".claude-plugin" / "commands" / "ultrareview-local.md"
+    path.write_text(path.read_text() +
+                    "\n\n- Whether a lens mutates is declared in ROSTER.mutates.\n"
+                    "- Lens K is read-only and never writes to the tree.\n")
+
+    r = run({"COLLAB_LINT_ROOT": str(fixture)})
+
+    assert r.returncode == 1
+    assert "restates the mutating/read-only classification for lens 'K' in prose" in r.stdout
+
+
+def test_lint_still_exempts_a_roster_pointer_bullet_itself(tmp_path):
+    # The other half of the same change: splitting bullets must not start
+    # flagging the sanctioned pointer phrasing when it cites ROSTER in its own
+    # bullet.
+    fixture = copy_fixture(tmp_path)
+    path = fixture / ".claude-plugin" / "commands" / "ultrareview-local.md"
+    path.write_text(path.read_text() +
+                    "\n\n- Lens K is read-only or mutating exactly as "
+                    "ROSTER.mutates says; this file does not restate it.\n")
+
+    r = run({"COLLAB_LINT_ROOT": str(fixture)})
+
+    assert r.returncode == 0, r.stdout
+
+
+@pytest.mark.parametrize("sentence,lens_id", [
+    ("Agent K is read-only and never edits files.", "K"),
+    ("Lens K is read-only.", "K"),
+    ("**K** is read-only.", "K"),
+    ("pr-test-analyzer (G) never writes to the working tree.", "G"),
+    ("Lens G runs the test suite so it writes to the tree; all others do not.", "G"),
+    # An agent name in parentheses sits between the reference and the verb. The
+    # trailing-predicate matcher allowed only a bare `(A)`-`(K)` there, so both
+    # of these forms used to slip through.
+    ("Lens K (performance-reviewer) is read-only and never writes to the tree.", "K"),
+    ("G (pr-test-analyzer) never writes to the tree.", "G"),
+])
+def test_lint_rejects_various_per_lens_classification_phrasings(tmp_path, sentence, lens_id):
+    fixture = copy_fixture(tmp_path)
+    path = fixture / ".claude-plugin" / "commands" / "ultrareview-local.md"
+    path.write_text(path.read_text() + f"\n\n{sentence}\n")
+
+    r = run({"COLLAB_LINT_ROOT": str(fixture)})
+
+    assert r.returncode == 1
+    assert (f"restates the mutating/read-only classification for lens "
+            f"{lens_id!r} in prose") in r.stdout
+
+
+BLANKET_REPORT_ONLY_SENTENCE = (
+    "Treat the review agents as read-only, verify every finding yourself, and "
+    "keep")
+
+
+def test_lint_ignores_the_blanket_report_only_instruction(tmp_path):
+    # `collab-turn-review-fix-global.md` already tells the pilot to "Treat the
+    # review agents as read-only" under `--report-only` — a blanket statement
+    # about the whole finding pass, naming no specific lens, and it must stay
+    # allowed. This used to be a copy of `test_fixture_is_green`: it asserted
+    # nothing about the sentence it names, so it could not fail for the reason
+    # its name gives. It now pins the sentence is really in the corpus (a
+    # rewrite there must not silently empty this test) AND re-plants it as a
+    # standalone paragraph in a second governed file, which is the shape the
+    # detector actually sees.
+    fixture = copy_fixture(tmp_path)
+    source = fixture / ".claude-plugin" / "prompts" / "collab-turn-review-fix-global.md"
+    assert BLANKET_REPORT_ONLY_SENTENCE in source.read_text()
+    target = fixture / ".claude-plugin" / "commands" / "ultrareview-local.md"
+    target.write_text(target.read_text() +
+                      f"\n\n{BLANKET_REPORT_ONLY_SENTENCE} them honest.\n")
+
+    r = run({"COLLAB_LINT_ROOT": str(fixture)})
+
+    assert r.returncode == 0, r.stdout
+
+
+@pytest.mark.parametrize("sentence", [
+    # A lettered list, not a lens reference — case-insensitive id matching
+    # once turned "(a)"/"(b)" into false positives for lens A/B. Each item
+    # must be followed by a phrase the trailing-predicate matcher accepts, or
+    # the case-sensitivity of the id class is not what keeps this green: the
+    # earlier wording ("(a) no edits, (b) no commits") stayed green even with
+    # the id class reverted to case-insensitive, because "no edits" is not a
+    # predicate this check recognises.
+    "The pass is read-only in two senses: (a) is read-only for the whole "
+    "run, and (b) never writes to the tree.",
+    # Names a lens near a mutation word without classifying THAT lens — the
+    # find phase is read-only, not the architect lens.
+    "The architect lens is dispatched during the read-only find phase.",
+    # The sanctioned way to describe the policy without a second copy of it —
+    # must be reachable, or the fix can't be documented in the files this
+    # check governs.
+    "Whether a lens like performance-reviewer mutates is declared by "
+    "ROSTER.mutates; do not restate it here.",
+    # Task 12's own forward-looking wording (issue #265 hardening plan, task
+    # 12 step 4): a generic policy description that points back to
+    # ROSTER.mutates must stay allowed, since task 12 needs to write exactly
+    # this.
+    "mutating lenses run in an isolated worktree; see ROSTER.mutates for "
+    "which ones",
+])
+def test_lint_does_not_flag_prose_that_only_looks_like_a_classification(tmp_path, sentence):
+    fixture = copy_fixture(tmp_path)
+    path = fixture / ".claude-plugin" / "commands" / "ultrareview-local.md"
+    path.write_text(path.read_text() + f"\n\n{sentence}\n")
+
+    r = run({"COLLAB_LINT_ROOT": str(fixture)})
+
+    assert r.returncode == 0, r.stdout
+
+
+def test_lint_covers_codex_prompts_not_naming_ultrareview_by_substring(tmp_path):
+    # `.codex-plugin/prompts/collab-review-local.md` is the Codex-side
+    # counterpart of what a later task edits, and it never contains the
+    # literal string "ultrareview" — the check used to gate its file scope on
+    # that substring, which skipped this file (and its two pre-existing
+    # read-only sentences) entirely. The scope must not be gated on it.
+    fixture = copy_fixture(tmp_path)
+    path = fixture / ".codex-plugin" / "prompts" / "collab-review-local.md"
+    assert "ultrareview" not in path.read_text().lower()
+    path.write_text(path.read_text() +
+                     "\n\nAgent K is read-only and never edits files.\n")
+
+    r = run({"COLLAB_LINT_ROOT": str(fixture)})
+
+    assert r.returncode == 1
+    assert ".codex-plugin/prompts/collab-review-local.md:" in r.stdout
+    assert "restates the mutating/read-only classification for lens 'K' in prose" in r.stdout
+
+
+def test_lint_derives_lens_names_from_the_roster_instead_of_a_second_list(tmp_path):
+    # If the check carried its own hardcoded name-to-id table (the shape of
+    # the original cut of this check), renaming a lens in ROSTER would leave
+    # prose using the OLD name uncovered and prose using the NEW name
+    # unrecognised — a second copy of roster metadata going stale exactly the
+    # way this task exists to prevent. Renaming K here and referencing it by
+    # the new name only must still be caught.
+    fixture = copy_fixture(tmp_path)
+    js_path = fixture / ".claude-plugin" / "workflows" / "ultrareview.js"
+    mutate(js_path, "key: 'performance-reviewer'", "key: 'query-cost-reviewer'")
+    md_path = fixture / ".claude-plugin" / "commands" / "ultrareview-local.md"
+    md_path.write_text(md_path.read_text() +
+                        "\n\nquery-cost-reviewer is read-only and never "
+                        "writes to the tree.\n")
+
+    r = run({"COLLAB_LINT_ROOT": str(fixture)})
+
+    assert r.returncode == 1
+    assert "restates the mutating/read-only classification for lens 'K' in prose" in r.stdout
+
+
+def test_lint_rejects_a_roster_entry_missing_the_mutates_field(tmp_path):
+    fixture = copy_fixture(tmp_path)
+    path = fixture / ".claude-plugin" / "workflows" / "ultrareview.js"
+    mutate(path,
+           "agentType: toolkit('pr-test-analyzer'), model: 'sonnet', "
+           "effort: 'high', fable: false, mutates: true",
+           "agentType: toolkit('pr-test-analyzer'), model: 'sonnet', "
+           "effort: 'high', fable: false")
+
+    r = run({"COLLAB_LINT_ROOT": str(fixture)})
+
+    assert r.returncode == 1
+    assert ("ultrareview.js: ROSTER entries ['G'] do not declare "
+            "mutates: true|false") in r.stdout
+
+
+def test_lint_rejects_a_classification_paragraph_that_merely_says_roster(tmp_path):
+    # The ROSTER exemption is paragraph-scoped, so keying it on the bare word
+    # "roster" handed every paragraph a way to switch the check off by
+    # accident: "the full roster" is ordinary prose in this corpus, and
+    # `ultrareview.js` logs lines beginning `roster:`. The identical sentence
+    # WITHOUT the leading clause is already pinned as a failure by
+    # `test_lint_rejects_prose_that_contradicts_...`; adding the clause must
+    # not change the verdict.
+    fixture = copy_fixture(tmp_path)
+    path = fixture / ".claude-plugin" / "commands" / "ultrareview-local.md"
+    path.write_text(path.read_text() +
+                    "\n\nThe full roster is applied by band. Lens K is "
+                    "read-only and never writes to the tree.\n")
+
+    r = run({"COLLAB_LINT_ROOT": str(fixture)})
+
+    assert r.returncode == 1
+    assert ("restates the mutating/read-only classification for lens 'K' in "
+            "prose") in r.stdout
+
+
+def test_lint_still_exempts_the_sanctioned_roster_pointer_paragraph(tmp_path):
+    # The other half of tightening that exemption: pointing at ROSTER as code
+    # must still exempt the whole paragraph, including a clause that would be
+    # a classification restatement on its own. Task 12 needs to write exactly
+    # this, so an over-tightened pointer pattern has to fail here.
+    fixture = copy_fixture(tmp_path)
+    path = fixture / ".claude-plugin" / "commands" / "ultrareview-local.md"
+    path.write_text(path.read_text() +
+                    "\n\nLens K is read-only or mutating exactly as "
+                    "ROSTER.mutates says; this file does not restate it.\n")
+
+    r = run({"COLLAB_LINT_ROOT": str(fixture)})
+
+    assert r.returncode == 0, r.stdout
+
+
+# A twelfth lens, appended to ROSTER ahead of the closing brace. Its `key` is
+# deliberately never written in the planted prose below: the point is that the
+# ID form is matched, which a hardcoded `[A-K]` class could not do.
+NEW_ROSTER_ENTRY = (
+    "  L: { key: 'query-cost-reviewer', agentType: 'general-purpose', "
+    "model: 'sonnet', effort: 'low', fable: false, mutates: false },\n"
+    "  K: { key: 'performance-reviewer'"
+)
+
+
+@pytest.mark.parametrize("sentence", [
+    "(L) is read-only and never writes to the tree.",
+    "Agent L is read-only and never writes to the tree.",
+    "Lens L is read-only and never writes to the tree.",
+    "**L** is read-only and never writes to the tree.",
+])
+def test_lint_matches_id_form_refs_to_a_lens_added_to_the_roster(tmp_path, sentence):
+    # The id character class is derived from the parsed ROSTER ids, not
+    # hardcoded: a second hand-maintained copy of roster metadata is exactly
+    # what this check exists to prevent, and with `[A-K]` frozen in, every
+    # id-form reference to a newly added lens `L` was invisible while the name
+    # form still worked.
+    fixture = copy_fixture(tmp_path)
+    js_path = fixture / ".claude-plugin" / "workflows" / "ultrareview.js"
+    mutate(js_path, "  K: { key: 'performance-reviewer'", NEW_ROSTER_ENTRY)
+    md_path = fixture / ".claude-plugin" / "commands" / "ultrareview-local.md"
+    md_path.write_text(md_path.read_text() + f"\n\n{sentence}\n")
+
+    r = run({"COLLAB_LINT_ROOT": str(fixture)})
+
+    assert r.returncode == 1
+    assert ("restates the mutating/read-only classification for lens 'L' in "
+            "prose") in r.stdout
+
+
+# --- `pr_create_failed:` doc-pointer contract -------------------------------
+#
+# Both sides of the pointer are reachable from a fixture tree: the doc side
+# through `COLLAB_LINT_ROOT`'s `docs/COLLAB.md`, and the self side through the
+# copy of the lint script `copy_fixture` plants in the fixture's `scripts/`.
+# The self side used to read `__file__`, which no fixture can redirect, so
+# nothing below could be written at all.
+
+PR_CREATE_FAILED_HEADING = "`pr_create_failed:` stays Terminal"
+
+
+def test_lint_rejects_a_self_comment_that_stops_quoting_the_doc_anchor(tmp_path):
+    # Exactly the drift this rule exists to catch: the pointer sentence edited
+    # to name a heading that is no longer the one docs/COLLAB.md carries. Only
+    # the pointer sentence is touched — the earlier `pr_create_failed: stays
+    # Terminal deliberately:` line in the same comment is left alone, because
+    # counting anchor occurrences across the whole window (definition line
+    # included) is what let this mutation pass.
+    fixture = copy_fixture(tmp_path)
+    script = fixture / "scripts" / LINT.name
+    mutate_once(script,
+                f'# "{PR_CREATE_FAILED_HEADING}" in docs/COLLAB.md',
+                '# "`pr_create_failed:` is Terminal" in docs/COLLAB.md')
+
+    r = run({"COLLAB_LINT_ROOT": str(fixture)})
+
+    assert r.returncode == 1
+    assert ("the DOCUMENTED_TERMINAL_PREFIXES pointer comment no longer "
+            "quotes") in r.stdout
+
+
+def test_lint_rejects_a_self_comment_with_the_pointer_sentence_removed(tmp_path):
+    # The same rule from the other direction: the comment keeps talking about
+    # the prefix but stops pointing anywhere.
+    fixture = copy_fixture(tmp_path)
+    script = fixture / "scripts" / LINT.name
+    mutate_once(
+        script,
+        f'either. See\n# "{PR_CREATE_FAILED_HEADING}" in docs/COLLAB.md for '
+        f'the full\n# rationale and manual recovery steps.',
+        "either.")
+
+    r = run({"COLLAB_LINT_ROOT": str(fixture)})
+
+    assert r.returncode == 1
+    assert ("the DOCUMENTED_TERMINAL_PREFIXES pointer comment no longer "
+            "quotes") in r.stdout
+
+
+def test_lint_rejects_the_doc_heading_being_renamed(tmp_path):
+    fixture = copy_fixture(tmp_path)
+    mutate_once(fixture / "docs" / "COLLAB.md",
+                f"#### {PR_CREATE_FAILED_HEADING}",
+                "#### `pr_create_failed:` is not retried")
+
+    r = run({"COLLAB_LINT_ROOT": str(fixture)})
+
+    assert r.returncode == 1
+    assert (f"docs/COLLAB.md: missing the {PR_CREATE_FAILED_HEADING!r} "
+            "`####` heading") in r.stdout
+
+
+def test_lint_rejects_the_doc_anchor_demoted_to_inline_prose(tmp_path):
+    # A reorg that folds the section into a sentence leaves the anchor text in
+    # the file but leaves the comment pointing at a heading that is no longer
+    # there to link to, so a substring check on the anchor alone would pass
+    # this. The `####` prefix is part of the contract.
+    fixture = copy_fixture(tmp_path)
+    mutate_once(fixture / "docs" / "COLLAB.md",
+                f"#### {PR_CREATE_FAILED_HEADING}",
+                f"Note that {PR_CREATE_FAILED_HEADING}, as described below.")
+
+    r = run({"COLLAB_LINT_ROOT": str(fixture)})
+
+    assert r.returncode == 1
+    assert (f"docs/COLLAB.md: missing the {PR_CREATE_FAILED_HEADING!r} "
+            "`####` heading") in r.stdout

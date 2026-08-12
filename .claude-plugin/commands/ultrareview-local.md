@@ -95,6 +95,43 @@ never pass it to the workflow; discard it after selecting the conditional
 lenses. The compact artifact remains the review context (or the raw fallback
 when no artifact is available).
 
+**Make `headRefOid` a local object.** Nothing above fetches git objects — `gh pr
+view` and `gh pr diff` both answer from the API — so for a fork PR, or any PR
+whose head branch was never fetched, that SHA does not exist in the local object
+database. It is passed to the workflow as `reviewSha`, and every Find-phase
+isolation worktree is cut at it, so without this the cut fails on every PR-Mode
+run and each lens that ROSTER.mutates sends into a worktree is reported ERRORED,
+making `coverageComplete` false for a reason that has nothing to do with the
+diff:
+
+```bash
+git -C <repo_path> fetch origin refs/pull/<N>/head
+git -C <repo_path> cat-file -e <headRefOid>^{commit}
+```
+
+If the fetch is not possible (no network, no such remote), say so in the report
+and expect those lenses to come back ERRORED — isolation fails closed, which is
+correct, but the reason belongs in the report rather than looking like a defect
+in the code.
+
+> **Only run PR Mode against a PR head you trust to execute.** The fetch above
+> brings the PR head into your local object database, and every isolation
+> worktree is a checkout of it. The isolation note handed to a lens whose ROSTER
+> entry sends it into one tells that lens to "install or build what you need
+> inside `<isoPath>` before running a suite or a benchmark" — so for a fork PR
+> that is **the contributor's code being built and executed on your machine,
+> under your user account, with your credentials, network and filesystem
+> reachable**. A `build.rs`, a `conftest.py`, an npm `postinstall`, a `Makefile`
+> target or a test fixture all run as ordinary steps of doing that. The worktree
+> bounds where files are *written*, not what the process may *do*, and it is a
+> linked worktree sharing this repository's object store, not a sandbox.
+>
+> **`--report-only` does not disable this.** It governs the post-verification
+> fix agents and nothing else; the Find phase never consults it, so a
+> `--report-only` PR-Mode review still builds and runs the PR head's code. If
+> you do not trust the head, do not run this command on it — review the diff by
+> reading it, or run it somewhere disposable.
+
 Record whether the local working tree is at the PR head: `git rev-parse HEAD` vs
 `headRefOid`. If they differ:
 
@@ -283,6 +320,18 @@ The SHA is passed to the workflow as `rollbackSha` and does three jobs:
    not a rollback line.
 3. Recovery is `git checkout <sha> -- .`, with the one limit below.
 
+For each workflow invocation, also generate an isolation nonce:
+
+```bash
+ISOLATION_NONCE="$(uuidgen | tr -d '-')"
+```
+
+In Local Mode, pass `rollbackSha` again as `reviewSha`: it is the immutable
+snapshot the Find-phase worktrees must inspect. In PR Mode, pass `headRefOid`
+as `reviewSha` instead. This distinction is load-bearing when the local checkout
+does not equal the PR head: isolated Find-phase lenses must inspect the PR
+commit, never a rollback snapshot of unrelated local files.
+
 **Four gaps in `git`'s own behaviour that the report must state, not paper over.
 Each one is a way the printed recovery line under-delivers or over-reaches, and
 a recovery line the user cannot trust is worse than none:**
@@ -419,6 +468,8 @@ Call `Workflow` with `{ scriptPath: <resolved>, args: { … } }`:
 | `changedLines` | number | additions + deletions |
 | `lenses` | string[] | the triggered lens ids from Trigger detection |
 | `rollbackSha` | string | the Phase 2.5 anchor |
+| `reviewSha` | string | Local Mode: `rollbackSha`; PR Mode: the resolved `headRefOid` |
+| `isolationNonce` | string | freshly generated `ISOLATION_NONCE` for this one Workflow invocation |
 | `fable` | boolean | `--fable` present |
 | `reportOnly` | boolean | `--report-only` present, **or** forced `true` by the PR-head mismatch (Phase 1) or a missing rollback anchor on a dirty tree (Phase 2.5). Whenever it is forced, say so in the report. |
 | `toolkitAvailable` | boolean | capability probe |
@@ -453,8 +504,40 @@ never enters a reviewer prompt and it never enters `args`.
   `CONFIRMED`-only gate becomes bypassable by wording swap.
 - **Fix on `CONFIRMED` only** — never `PLAUSIBLE`, never `UNVERIFIED`, never
   before the verify pass. `fix_complexity: invasive` is reported, never patched.
+- **Find-phase worktree isolation, decided by `ROSTER.mutates` in
+  `ultrareview.js`.** Whether a given lens runs commands that write is declared
+  there and nowhere else — do not restate that list here, in a prompt, or in a
+  brief. Where the entry says so, the workflow cuts a throwaway worktree at
+  `reviewSha`, points that lens's working directory, diff range and
+  `review-diff --repo` at it, waits, and then removes it with
+  `git -C <path> worktree remove --force <path>` — on the success path and on
+  the failure path alike, so a lens that throws still takes its worktree with
+  it. Nothing prunes: `git worktree prune` acts on the whole repository's
+  worktree registry regardless of which worktree issues it, so it can
+  deregister an unrelated worktree of yours whose directory is momentarily
+  absent, and it is therefore not something the cleanup step may run.
+  Removal is attempted in exactly one case — the worktree was cut. When the cut
+  refused a **pre-existing** path, nothing is removed, by design: that path is
+  another run's or user data. When the cut gave **no answer at all**, nothing is
+  removed either and the path is reported under `isolationUnknown[]` for a human
+  to look at. Where the ROSTER entry does not call for a worktree, the lens
+  reads this checkout directly and no worktree is cut. Three consequences for
+  this command: the
+  PR head is load-bearing for PR Mode, and the Local Mode anchor is
+  load-bearing beyond rollback (Phase 2.5); a lens whose worktree
+  cannot be cut is reported as an **errored** lens — never quietly re-run
+  against the shared tree — so `coverageComplete` goes false and the Phase 6
+  precondition applies; and a cut worktree is a **fresh checkout carrying no
+  gitignored state** — no installed dependencies, no build cache, no local env
+  file — because the anchor is built with `git add -A`, which skips everything
+  `.gitignore` covers. An isolated lens must install or build what it needs
+  before it can run a suite or a benchmark, and may report that it could not.
+  That is the price of the isolation, not a lens defect: report it as such
+  rather than as a coverage failure with no cause.
 - **Fix agents grouped by file**, one agent per file, groups in parallel, no
-  worktree isolation — the fixes land in the user's working tree. The fan-out is
+  worktree isolation — the fixes land in the user's working tree. That is the
+  deliberate opposite of the Find-phase policy above and stays that way: a fix
+  applied inside a throwaway worktree would be deleted with it. The fan-out is
   capped, every dispatch is individually caught so one failure cannot discard
   the run, and a finding is only dispatched if its path is in the `files` list
   passed from here.
@@ -483,6 +566,7 @@ fixes { applied, files, groups[{ file, tier, results, errored, errorReason }],
 fixAgentsDispatched (bool) ·
 scopeAudit (null | { in_scope, out_of_scope_changes, summary }) ·
 verifyStats { confirmed, plausible, refuted, unverified, pastCap, supersededVerdicts } ·
+isolationLeaks[{ path, residue, remedy, detail }] · isolationUnknown[] ·
 reportOnly · reportOnlyForced (bool) · rollbackSha · rollbackUsable (bool)
 ```
 
@@ -522,6 +606,27 @@ Notes on reading it:
   cross-lens merge later displaced. It is a cost, not a defect — every verdict
   belongs to the wording it was reached about — but a non-zero value means the
   effective verify budget was smaller than the cap.
+- `isolationLeaks[]` holds any Find-phase isolation worktree whose removal could
+  not be confirmed. Each entry is
+  `{ path, residue: 'directory'|'registry'|'unknown', remedy, detail }` — it
+  does not affect the verdict, but name each `path` in the report **followed by
+  its own `remedy` string, printed verbatim**. The remedies are not
+  interchangeable: `residue: 'directory'` means the directory is still there and
+  `git -C <path> worktree remove --force <path>` clears it, while
+  `residue: 'registry'` means the workflow's `rm -rf` fallback already deleted
+  the directory and only a stale bookkeeping entry remains — that same remove
+  command then fails with `cannot change to '<path>'` and exit 128, because
+  there is no directory left to run git from. `remedy` already says the right
+  thing for the case at hand; do not substitute a command of your own, and do
+  not print one remedy for the whole list.
+- `isolationUnknown[]` is **not** the same list and must not be given the same
+  remedy. It holds paths where the isolation cut never reported back, so the run
+  does not know whether it created anything there — and the same path could
+  equally be a concurrent review's worktree or pre-existing user data. Name
+  these paths too, but tell the user to **inspect** them
+  (`git worktree list`, then look at the directory), never to force-remove
+  them. Telling someone to delete a path this run may not own is the one
+  mistake here that destroys work rather than leaving litter.
 - `verifyStats.pastCap` counts **claims** that outran the cap;
   `verifyStats.unverified` counts **findings** displaying an `UNVERIFIED`
   verdict. They are different numbers and `pastCap` is the larger: a capped
@@ -645,6 +750,11 @@ Fixes applied: <N> across <M> files
   <only when changed files are gitignored: "not covered by the anchor: <paths>">
   <when rollbackUsable is false, this whole block is: "rollback: n/a (no anchor
   could be minted; nothing was edited)">
+<only when isolationLeaks is non-empty: "isolation worktrees left behind:" then
+  one line per entry: "<path> — <remedy>", each entry's own remedy verbatim>
+<only when isolationUnknown is non-empty: "isolation paths this run could not
+  account for: <paths> — INSPECT before touching; they may belong to another
+  review or predate this one. Do not force-remove them.">
 Post-fix validation: <check → pass/fail/n/a, one line>
 Remaining: <N MEDIUM (reported)> · <N HIGH invasive (design change — yours)> · <N out of scope>
 

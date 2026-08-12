@@ -1,6 +1,7 @@
 use super::super::agent::{Agent, CollabRoles};
 use super::super::session::tasks_count_from_list;
 use super::*;
+use crate::db::schema::Database;
 
 fn session() -> CollabSession {
     CollabSession::new("test-session")
@@ -1212,6 +1213,172 @@ fn test_failure_report_terminal_sets_failed_from_phase_and_clears_pending_failur
     );
     assert_eq!(s.failed_from_phase, Some(Phase::CodeReviewFixGlobalPending));
     assert_eq!(s.pending_failure, None);
+}
+
+// ── v3: `pr_create_failed:` semantics ────────────────────────────────
+//
+// `pr_create_failed:` is what Claude's `final_review` turn reports when
+// `gh pr create` fails, *after* the diff has passed every gate and the
+// branch head has been pushed. It is deliberately absent from
+// `RECOVERABLE_FAILURE_PREFIXES`, so it classifies Terminal and the
+// session cannot resume — the work is not lost, it is on a pushed branch,
+// and the recovery is a human running `gh pr create` (see
+// "`pr_create_failed:` stays Terminal" in docs/COLLAB.md). These three
+// tests pin that contract: the classification, the state a human reads
+// back to find the stranded commits, and the fact that reporting the
+// failure records a diagnostic without touching any recorded git state.
+
+/// The head the `final_review` turn proved pushed before it attempted
+/// `gh pr create` — the commit a human needs to find after the PR step
+/// failed.
+const PR_CREATE_PUSHED_HEAD: &str = "9f8e7d6c5b4a39281706f5e4d3c2b1a098765432";
+
+/// A representative `pr_create_failed:` report, prefix plus detail exactly
+/// as `collab-turn-submit.md` sends it.
+const PR_CREATE_FAILED: &str = "pr_create_failed: gh: HTTP 403 (permission denied)";
+
+/// Drive a session to `CodeReviewFinalPending` — the PR-creating phase, and
+/// so the only phase a `pr_create_failed:` report can arrive from — with
+/// `last_head_sha` at [`PR_CREATE_PUSHED_HEAD`]. Claude owns the turn here.
+fn session_awaiting_pr_creation() -> CollabSession {
+    let s = submit_task_list(&locked_session("hf"), "hf", 1);
+    let s = apply_event(
+        &s,
+        Agent::Claude,
+        &CollabEvent::ImplementationDone {
+            head_sha: "batch_head".to_string(),
+        },
+    )
+    .unwrap();
+    let s = apply_event(
+        &s,
+        Agent::Codex,
+        &CollabEvent::CodeReviewFixGlobal {
+            head_sha: "g1".to_string(),
+        },
+    )
+    .unwrap();
+    let s = apply_event(
+        &s,
+        Agent::Claude,
+        &CollabEvent::ReviewLocal {
+            head_sha: PR_CREATE_PUSHED_HEAD.to_string(),
+        },
+    )
+    .unwrap();
+    assert_eq!(s.phase, Phase::CodeReviewFinalPending);
+    assert_eq!(s.current_owner, Agent::Claude);
+    assert_eq!(s.last_head_sha.as_deref(), Some(PR_CREATE_PUSHED_HEAD));
+    s
+}
+
+fn report_pr_create_failure(s: &CollabSession) -> CollabSession {
+    apply_event(
+        s,
+        Agent::Claude,
+        &CollabEvent::FailureReport {
+            coding_failure: PR_CREATE_FAILED.to_string(),
+        },
+    )
+    .unwrap()
+}
+
+#[test]
+fn test_pr_create_failed_classifies_terminal_and_refuses_resume() {
+    // No recoverable prefix matches, so `classify` falls through to its
+    // Terminal default…
+    assert_eq!(classify(PR_CREATE_FAILED), FailureClass::Terminal);
+
+    let s = report_pr_create_failure(&session_awaiting_pr_creation());
+    assert_eq!(s.phase, Phase::CodingFailed);
+    // …and `failed_from_phase` IS recorded, so the refusal below can only be
+    // the classification check firing — not the legacy-row (pre-migration-015)
+    // check, which rejects for an entirely different reason.
+    assert_eq!(s.failed_from_phase, Some(Phase::CodeReviewFinalPending));
+
+    let err = apply_event(&s, Agent::Claude, &CollabEvent::ResumeCoding).unwrap_err();
+    let CollabError::NotResumable { reason } = err else {
+        panic!("expected NotResumable, got {err:?}");
+    };
+    assert!(
+        reason.contains("does not classify as a recoverable tooling failure"),
+        "expected the classification refusal, got {reason:?}"
+    );
+}
+
+#[test]
+fn test_pr_create_failed_session_state_yields_branch_and_pushed_head() {
+    // The recovery story for a terminal `pr_create_failed:` is "go open the
+    // PR by hand", which needs two facts: which branch, and which commit.
+    // Both must be readable off the persisted `CodingFailed` session without
+    // consulting any log. `branch` lives on the session *row* rather than on
+    // `CollabSession` (the state machine has no access to it, and
+    // `save_session` never writes that column), so this test round-trips
+    // through the DB to assert the pair together the way a human reads them.
+    let db = Database::open_in_memory().unwrap();
+    db.collab_create_session(
+        "test-session",
+        "/repo",
+        "collab/pr-create-failure",
+        None,
+        CollabRoles {
+            pilot: Agent::Claude,
+            implementer: Agent::Claude,
+        },
+    )
+    .unwrap();
+
+    let failed = report_pr_create_failure(&session_awaiting_pr_creation());
+    db.collab_save_session(&failed).unwrap();
+
+    let record = db.collab_load_session_record("test-session").unwrap();
+    assert_eq!(record.session.phase, Phase::CodingFailed);
+    assert_eq!(
+        record.session.coding_failure.as_deref(),
+        Some(PR_CREATE_FAILED)
+    );
+    // The two facts that make the stranded work recoverable.
+    assert_eq!(record.branch, "collab/pr-create-failure");
+    assert_eq!(
+        record.session.last_head_sha.as_deref(),
+        Some(PR_CREATE_PUSHED_HEAD)
+    );
+    // And no PR was opened — the reason a human has to.
+    assert_eq!(record.session.pr_url, None);
+}
+
+#[test]
+fn test_pr_create_failed_report_mutates_no_recorded_git_state() {
+    // Reporting the failure is a pure phase/diagnostic transition: it records
+    // *that* PR creation failed and never rewrites what the session knows
+    // about git. The branch half of "no git state" is structural — `branch`
+    // is not a `CollabSession` field at all, so `apply_event` cannot reach it
+    // (asserted end-to-end in the round-trip test above); the head/base pair
+    // is asserted byte-identical here.
+    let before = session_awaiting_pr_creation();
+    let recorded_base = before.base_sha.clone();
+    let recorded_head = before.last_head_sha.clone();
+
+    let after = report_pr_create_failure(&before);
+
+    assert_eq!(after.base_sha, recorded_base);
+    assert_eq!(after.last_head_sha, recorded_head);
+    assert_eq!(after.pr_url, before.pr_url);
+
+    // Stronger than field-by-field: the ONLY differences from the pre-report
+    // session are the phase, the owner the failure is attributed to, the
+    // diagnostic, and the phase it failed from. Everything else — every git
+    // field, every plan/task-list field, every recovery field — is carried
+    // through untouched, so a future edit to this arm that quietly rewrote a
+    // sha would fail here.
+    let expected = CollabSession {
+        phase: Phase::CodingFailed,
+        current_owner: Agent::Claude,
+        coding_failure: Some(PR_CREATE_FAILED.to_string()),
+        failed_from_phase: Some(Phase::CodeReviewFinalPending),
+        ..before
+    };
+    assert_eq!(after, expected);
 }
 
 #[test]

@@ -58,3 +58,16 @@ futures-util = "0.3"
 
 [dev-dependencies]
 tempfile = "3"
+# Test-only feature bump. `hooks` unlocks `Connection::authorizer`, which the
+# busy-snapshot replay tests use as a deterministic interleave point: the
+# authorizer fires while a statement is being *prepared*, so a test can make a
+# contending connection commit between a production closure's read and its
+# first write and force a genuine `SQLITE_BUSY_SNAPSHOT` with no sleeps and no
+# threads. Declared here (not in `[dependencies]`) so release builds, which
+# skip dev-dependencies, never compile the hook machinery in. That separation
+# is load-bearing on `resolver = "2"` in the workspace root manifest: under
+# resolver v1 Cargo unifies dev-dependency features into a plain `cargo build`,
+# so `hooks` would be enabled for every build no matter which table declares
+# it. A virtual workspace does not get v2 implicitly from the edition, so
+# dropping that key during a manifest refactor silently re-enables hooks here.
+rusqlite = { version = "0.32", features = ["bundled", "hooks"] }

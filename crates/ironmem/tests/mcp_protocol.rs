@@ -3424,11 +3424,13 @@ fn full_roles(app: &App, session_id: &str) -> (String, String, String) {
 //
 // The generation guard's transaction/retry behavior is covered separately by
 // `refused_token_role_mutation_does_not_poison_tokenless_generation_cache`:
-// if a post-claim validation rolls back the DB lease, the guard drops the
-// advisory cache entry the claim wrote, so the next tokenless action is
-// answered by the authoritative DB state instead of a generation that never
-// committed. That this is a *drop* and not a rebind to `db_active` matters
-// only once the DB is past generation 0, which is pinned by the unit test
+// if a post-claim validation rolls back the DB lease, the next tokenless
+// action is still answered by the authoritative DB state instead of a
+// generation that never committed. The claim reaches the advisory cache only
+// once its transaction commits (`GenerationClaim`), and if an entry ever does
+// lead the DB the guard *drops* it rather than rebinding it to `db_active` —
+// a distinction that matters only once the DB is past generation 0, which is
+// pinned by the unit test
 // `rolled_back_claim_does_not_admit_claimant_at_incumbent_generation`
 // (`crates/ironmem/src/mcp/tools/handoff.rs`).
 
@@ -3605,11 +3607,14 @@ fn collab_set_pilot_unspent_pre_reassignment_token_is_refused_by_caller_identity
 /// accepted at generation 0.
 ///
 /// Scoped deliberately to generation 0, where "the process may act" is the
-/// correct answer for *any* process. The guard reaches that answer by dropping
-/// the cache entry the rolled-back claim wrote, not by rebinding it to the DB
-/// value — a distinction this test cannot see and
-/// `rolled_back_claim_does_not_admit_claimant_at_incumbent_generation`
-/// (`crates/ironmem/src/mcp/tools/handoff.rs`) exists to pin.
+/// correct answer for *any* process. It reaches that answer because the
+/// rolled-back claim never reaches the cache at all (`GenerationClaim` is
+/// published only after the transaction commits), and — should an entry ever
+/// lead the DB anyway — because the guard drops it rather than rebinding it to
+/// the DB value. Neither distinction is visible from here;
+/// `rolled_back_claim_does_not_admit_claimant_at_incumbent_generation` and
+/// `claim_refused_after_write_never_mutates_generation_cache`
+/// (`crates/ironmem/src/mcp/tools/handoff.rs`) exist to pin them.
 #[test]
 fn refused_token_role_mutation_does_not_poison_tokenless_generation_cache() {
     let app = App::open_for_test().unwrap();

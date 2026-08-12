@@ -5,7 +5,9 @@
 //! actor-bearing mutating/binding collab op. When `maybe_token` is `Some`, the
 //! guard must run inside the caller's write transaction so the claim is atomic
 //! with the op; the no-token validation path may run in its own transaction (as
-//! `collab_wait_my_turn` does).
+//! `collab_wait_my_turn` does). A claim is returned as a [`GenerationClaim`]
+//! for the caller to `publish` after that transaction commits — see the type
+//! for why the guard must not touch the advisory cache itself.
 //!
 //! `handle_session_handoff` issues (or byte-identically reuses) a one-time
 //! handoff token and renders a deterministic, model-free session handoff block
@@ -32,16 +34,62 @@ const CHECKPOINT_ROOM: &str = "collab-checkpoints";
 
 // ── Generation-lease guard ───────────────────────────────────────────────────
 
+/// A generation claimed by [`ensure_actor_generation_current`] inside a
+/// transaction that has not committed yet.
+///
+/// The advisory generation cache is a `RwLock<HashMap>` with no rollback hook,
+/// so writing it from inside the caller's transaction poisons it whenever a
+/// later check in that same closure refuses and the claim is rolled back. The
+/// guard therefore hands the claim back to its caller, which publishes it with
+/// [`GenerationClaim::publish`] only after `with_transaction` returns `Ok`.
+#[must_use = "a claimed generation must be published once its transaction commits"]
+#[derive(Debug)]
+pub(super) enum GenerationClaim {
+    /// No token was presented: the guard only validated an already-committed
+    /// generation, so there is nothing to publish.
+    Unchanged,
+    /// A one-time handoff token was consumed inside the caller's transaction,
+    /// advancing this actor to `generation` if and only if that transaction
+    /// commits.
+    Claimed {
+        session_id: String,
+        agent: Agent,
+        generation: u64,
+    },
+}
+
+impl GenerationClaim {
+    /// Publish a claimed generation to `app`'s advisory cache so subsequent
+    /// tokenless calls from this process are admitted.
+    ///
+    /// Call only after the transaction that carried the claim has committed —
+    /// publishing earlier is exactly the poisoning this type exists to prevent.
+    pub(super) fn publish(self, app: &App) {
+        if let Self::Claimed {
+            session_id,
+            agent,
+            generation,
+        } = self
+        {
+            app.set_cached_generation(&session_id, agent, generation);
+        }
+    }
+}
+
 /// Validate (and on first-touch/claim, bind) this process's generation for
 /// (session, agent). Call before any actor-bearing mutating/binding collab op.
 /// Must run inside the caller's transaction so a claim is atomic with the op.
+///
+/// A token claim is a DB write that has not committed when this returns, so the
+/// claimed generation is returned rather than cached here; the caller must
+/// [`GenerationClaim::publish`] it after its transaction commits.
 pub(super) fn ensure_actor_generation_current(
     app: &App,
     conn: &rusqlite::Connection,
     session_id: &str,
     agent: Agent,
     maybe_token: Option<&str>,
-) -> Result<(), MemoryError> {
+) -> Result<GenerationClaim, MemoryError> {
     if let Some(token) = maybe_token {
         if !app.config.mcp_access_mode.allows_writes() {
             return Err(MemoryError::Permission(
@@ -49,27 +97,26 @@ pub(super) fn ensure_actor_generation_current(
                     .to_string(),
             ));
         }
-        let claimed = claim_handoff_token(conn, session_id, agent, token)?;
-        // The cache is advisory; the DB is authoritative. A successful claim
-        // normally commits with the enclosing transaction, so retain the new
-        // generation for subsequent tokenless calls.
-        app.set_cached_generation(session_id, agent, claimed);
-        return Ok(());
+        let generation = claim_handoff_token(conn, session_id, agent, token)?;
+        return Ok(GenerationClaim::Claimed {
+            session_id: session_id.to_string(),
+            agent,
+            generation,
+        });
     }
     let db_active = read_actor_generation(conn, session_id, agent)?
         .map(|a| a.generation)
         .unwrap_or(0);
     if let Some(cached) = app.cached_generation(session_id, agent) {
         if cached == db_active {
-            return Ok(());
+            return Ok(GenerationClaim::Unchanged);
         }
         if cached > db_active {
-            // A token claim writes this cache (below) from inside the caller's
-            // transaction, before that transaction is known to commit. If it
-            // later rolls back — as it does whenever a post-claim check such as
-            // `ensure_caller_is_current_pilot` refuses the call — the DB
-            // correctly stays at the prior generation while this advisory cache
-            // is one step ahead.
+            // Defense in depth: callers publish a claim only after their
+            // transaction commits (see `GenerationClaim`), so the cache should
+            // never lead the DB. If it ever does — a caller that publishes too
+            // early, or a claim whose commit was lost — the DB correctly holds
+            // the prior generation while this advisory cache is one step ahead.
             //
             // DROP the entry rather than rebinding it to `db_active`. Rebinding
             // would admit this process at the *incumbent's* generation, which it
@@ -93,8 +140,12 @@ pub(super) fn ensure_actor_generation_current(
         }
     }
     if db_active == 0 {
+        // Safe to cache immediately even inside an uncommitted transaction:
+        // this path writes no DB state, so a rollback leaves the DB at the same
+        // generation 0 this entry records. Only a token claim (above) describes
+        // DB state that may never commit.
         app.set_cached_generation(session_id, agent, 0);
-        return Ok(());
+        return Ok(GenerationClaim::Unchanged);
     }
     Err(MemoryError::Validation(format!(
         "this session has been handed off (generation {db_active}); \
@@ -335,8 +386,8 @@ pub(super) fn handle_session_handoff(app: &App, args: &Value) -> Result<Value, M
     let agent = require_agent(require_str(args, "agent")?)?;
 
     // Resurrection guard + active-session snapshot + issue, atomic in one transaction.
-    let (record, issued) = app.db.with_transaction(|tx| {
-        ensure_actor_generation_current(
+    let (claim, record, issued) = app.db.with_transaction(|tx| {
+        let claim = ensure_actor_generation_current(
             app,
             tx,
             session_id,
@@ -346,8 +397,9 @@ pub(super) fn handle_session_handoff(app: &App, args: &Value) -> Result<Value, M
         crate::collab::queue::ensure_active(tx, session_id)?;
         let record = crate::collab::queue::load_session_record(tx, session_id)?;
         let issued = crate::collab::issue_or_reuse_handoff(tx, session_id, agent)?;
-        Ok((record, issued))
+        Ok((claim, record, issued))
     })?;
+    claim.publish(app);
 
     // Best-effort handoff counter: keyed on session_id (the repo's task_tag
     // convention for collab rows, matching increment_task_review_rounds call sites).
@@ -507,7 +559,8 @@ mod tests {
             .with_transaction(|tx| {
                 ensure_actor_generation_current(&app, tx, session_id, Agent::Claude, None)
             })
-            .unwrap();
+            .unwrap()
+            .publish(&app);
 
         assert_eq!(app.cached_generation(session_id, Agent::Claude), Some(0));
     }
@@ -548,7 +601,8 @@ mod tests {
             .with_transaction(|tx| {
                 ensure_actor_generation_current(&pred, tx, session_id, Agent::Claude, None)
             })
-            .unwrap();
+            .unwrap()
+            .publish(&pred);
         assert_eq!(
             pred.cached_generation(session_id, Agent::Claude),
             Some(0),
@@ -562,12 +616,15 @@ mod tests {
             .unwrap()
             .token;
 
-        // Successor claims the handoff token — advances DB generation to 1.
+        // Successor claims the handoff token — advances DB generation to 1 and
+        // publishes the claim once that transaction commits, exactly as every
+        // real caller does.
         succ.db
             .with_transaction(|tx| {
                 ensure_actor_generation_current(&succ, tx, session_id, Agent::Claude, Some(&token))
             })
-            .unwrap();
+            .unwrap()
+            .publish(&succ);
         assert_eq!(
             succ.cached_generation(session_id, Agent::Claude),
             Some(1),
@@ -588,11 +645,85 @@ mod tests {
         );
     }
 
-    /// A token claim whose enclosing transaction rolls back must not upgrade
-    /// the claiming process. The claim writes the advisory cache before the
-    /// transaction is known to commit, so the cache is left one generation
-    /// ahead of the DB; the guard must DROP that entry rather than rebind it to
-    /// the DB value.
+    /// A token claim whose enclosing transaction later refuses the call must
+    /// leave the advisory cache completely untouched.
+    ///
+    /// `claim_handoff_token` writes the DB inside the caller's transaction, so
+    /// the guard cannot know whether that write will commit. Publishing the new
+    /// generation to the cache from inside the closure poisons it on rollback:
+    /// the `RwLock<HashMap>` has no rollback hook, so the entry survives a write
+    /// the DB threw away. The guard therefore hands the claimed generation back
+    /// to the caller, which caches it only after `with_transaction` returns
+    /// `Ok`. This test pins "never mutated", which is strictly stronger than the
+    /// "mutated, then healed on the next call" behaviour the sibling healing
+    /// tests cover.
+    #[test]
+    fn claim_refused_after_write_never_mutates_generation_cache() {
+        let (app, _dir) = test_handoff_app();
+        let sid = seed_active_session(&app);
+
+        let token = app
+            .db
+            .with_transaction(|tx| issue_or_reuse_handoff(tx, &sid, Agent::Claude))
+            .unwrap()
+            .token;
+
+        // A fresh process claims the token, then a post-claim check inside the
+        // same closure refuses — the shape every `ensure_caller_is_current_pilot`
+        // rejection produces. The transaction rolls back on `Drop`.
+        let claimant = test_app_with_db_path(app.config.db_path.clone(), _dir.path());
+        let refused = claimant.db.with_transaction(|tx| {
+            let claim =
+                ensure_actor_generation_current(&claimant, tx, &sid, Agent::Claude, Some(&token))?;
+            assert!(
+                matches!(claim, GenerationClaim::Claimed { generation: 1, .. }),
+                "the claim must be handed back to the caller, not cached here: {claim:?}"
+            );
+            Err::<(), _>(MemoryError::Validation(
+                "simulated post-claim refusal".into(),
+            ))
+        });
+        assert!(refused.is_err(), "the post-claim check must refuse");
+
+        assert_eq!(
+            claimant.cached_generation(&sid, Agent::Claude),
+            None,
+            "a rolled-back claim must never write the advisory cache"
+        );
+
+        // The DB agrees the claim never happened, so the token stays claimable.
+        let (generation, pending_token) = claimant
+            .db
+            .with_connection(|conn| {
+                conn.query_row(
+                    "SELECT generation, pending_handoff_token \
+                     FROM collab_actor_generations WHERE session_id = ?1 AND agent = 'claude'",
+                    rusqlite::params![sid],
+                    |r| Ok((r.get::<_, i64>(0)?, r.get::<_, Option<String>>(1)?)),
+                )
+                .map_err(MemoryError::from)
+            })
+            .unwrap();
+        assert_eq!(
+            generation, 0,
+            "the rolled-back claim must not advance the DB"
+        );
+        assert_eq!(
+            pending_token.as_deref(),
+            Some(token.as_str()),
+            "the rolled-back claim must leave the token pending and re-claimable"
+        );
+    }
+
+    /// A cache entry that leads the DB must not upgrade the process holding it.
+    /// The guard must DROP that entry rather than rebind it to the DB value.
+    ///
+    /// `GenerationClaim` keeps the in-tree callers from ever producing that
+    /// state (see `claim_refused_after_write_never_mutates_generation_cache`),
+    /// so this test constructs it directly — a claim published for a
+    /// transaction that then failed to commit. The healing branch stays as
+    /// defense in depth for exactly that, and this test is what pins its
+    /// behaviour.
     ///
     /// The distinction is only observable when `db_active > 0`, which is
     /// precisely the case the sibling integration test
@@ -624,23 +755,25 @@ mod tests {
             .with_transaction(|tx| {
                 ensure_actor_generation_current(&incumbent, tx, &sid, Agent::Claude, Some(&first))
             })
-            .unwrap();
+            .unwrap()
+            .publish(&incumbent);
         assert_eq!(
             incumbent.cached_generation(&sid, Agent::Claude),
             Some(1),
             "incumbent must hold generation 1"
         );
 
-        // A second handoff is minted for generation 2 but its claim is refused
-        // *after* `claim_handoff_token` has already run — the shape produced by
-        // every post-claim check in `ensure_caller_is_current_pilot`.
+        // A second handoff is minted for generation 2 but its claim never
+        // commits, leaving the claimant's cache one generation ahead of the DB.
         let second = incumbent
             .db
             .with_transaction(|tx| issue_or_reuse_handoff(tx, &sid, Agent::Claude))
             .unwrap()
             .token;
         let refused = claimant.db.with_transaction(|tx| {
-            ensure_actor_generation_current(&claimant, tx, &sid, Agent::Claude, Some(&second))?;
+            let claim =
+                ensure_actor_generation_current(&claimant, tx, &sid, Agent::Claude, Some(&second))?;
+            claim.publish(&claimant); // published too early — the poisoning this branch heals
             Err::<(), _>(MemoryError::Validation(
                 "simulated post-claim refusal".into(),
             ))
@@ -649,7 +782,7 @@ mod tests {
         assert_eq!(
             claimant.cached_generation(&sid, Agent::Claude),
             Some(2),
-            "the rolled-back claim leaves the advisory cache ahead of the DB"
+            "sanity: the advisory cache is now ahead of the rolled-back DB"
         );
 
         // The claimant's next tokenless call must still be refused: it never
@@ -676,7 +809,8 @@ mod tests {
             .with_connection(|conn| {
                 ensure_actor_generation_current(&incumbent, conn, &sid, Agent::Claude, None)
             })
-            .unwrap();
+            .unwrap()
+            .publish(&incumbent);
     }
 
     #[test]
@@ -1027,7 +1161,8 @@ gates: passed\n";
             .with_transaction(|tx| {
                 ensure_actor_generation_current(&trusted_app, tx, &sid, Agent::Claude, Some(&token))
             })
-            .unwrap();
+            .unwrap()
+            .publish(&trusted_app);
     }
 
     /// The no-token path of `ensure_actor_generation_current` must not create a
@@ -1047,7 +1182,8 @@ gates: passed\n";
             .with_connection(|conn| {
                 ensure_actor_generation_current(&app, conn, &sid, Agent::Claude, None)
             })
-            .unwrap();
+            .unwrap()
+            .publish(&app);
         let n: i64 = app
             .db
             .with_connection(|conn| {
@@ -1094,14 +1230,16 @@ gates: passed\n";
             .with_connection(|conn| {
                 ensure_actor_generation_current(&app, conn, &sid, Agent::Claude, None)
             })
-            .unwrap();
+            .unwrap()
+            .publish(&app);
 
         // Second call: cached == db (both 0) → must still be Ok.
         app.db
             .with_connection(|conn| {
                 ensure_actor_generation_current(&app, conn, &sid, Agent::Claude, None)
             })
-            .unwrap();
+            .unwrap()
+            .publish(&app);
     }
 
     /// A fresh process (empty cache) calling the no-token guard when the DB
@@ -1146,7 +1284,8 @@ gates: passed\n";
             .with_transaction(|tx| {
                 ensure_actor_generation_current(&succ, tx, &sid, Agent::Claude, Some(&token))
             })
-            .unwrap();
+            .unwrap()
+            .publish(&succ);
 
         // Third fresh App: empty cache, DB gen = 1, no token → must be rejected.
         let fresh = test_app_with_db_path(db_path, dir.path());
@@ -1161,6 +1300,50 @@ gates: passed\n";
             err.to_string().contains("handed off"),
             "expected 'handed off' in error, got: {err}"
         );
+    }
+
+    /// The other half of the deferred-publish contract: a claim whose
+    /// transaction DOES commit must still reach the advisory cache, so the
+    /// claimant's next tokenless call is admitted.
+    ///
+    /// Driven through `handle_session_handoff` — a real caller of the guard —
+    /// because publishing is now the caller's job: dropping `claim.publish(app)`
+    /// from a handler would strand that process at "this session has been handed
+    /// off" for every subsequent tokenless op.
+    #[test]
+    fn committed_claim_is_published_by_its_caller() {
+        let (origin, dir) = test_handoff_app();
+        let sid = seed_active_session(&origin);
+
+        let token =
+            handle_session_handoff(&origin, &json!({ "session_id": sid, "agent": "claude" }))
+                .unwrap()["handoff_token"]
+                .as_str()
+                .unwrap()
+                .to_string();
+
+        // A fresh process claims the token through the handler, whose
+        // transaction commits.
+        let succ = test_app_with_db_path(origin.config.db_path.clone(), dir.path());
+        handle_session_handoff(
+            &succ,
+            &json!({ "session_id": sid, "agent": "claude", "handoff_token": token }),
+        )
+        .unwrap();
+
+        assert_eq!(
+            succ.cached_generation(&sid, Agent::Claude),
+            Some(1),
+            "a committed claim must be published to the claimant's cache"
+        );
+
+        // Which is what makes the claimant's next tokenless op legal.
+        succ.db
+            .with_connection(|conn| {
+                ensure_actor_generation_current(&succ, conn, &sid, Agent::Claude, None)
+            })
+            .unwrap()
+            .publish(&succ);
     }
 
     /// `handle_session_handoff` bumps `task_outcomes.handoffs` by 1 for a
