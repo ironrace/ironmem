@@ -131,14 +131,18 @@ function toolkit(name) {
 // dispatch run the test suite or otherwise write to the tree?" — Codex review
 // D5 on issue #265: that split used to live only as a sentence inside a
 // lens's own brief text ("Findings only — read-only, never edit files"), which
-// is unenforceable and, for K, was flatly wrong: K's brief claims read-only
+// is unenforceable and, for K, was flatly wrong: K's brief claimed read-only
 // while its tool profile can run benchmarks/profiling that write output. A
-// prompt sentence is not a gate; this field is what tasks 12/13 read to decide
-// worktree isolation, and `check_collab_turn_templates.py` fails any prompt or
-// command markdown that tries to restate this list in prose instead of
-// pointing back here. Every entry MUST declare it explicitly — see the
-// assertion right below this object — so a new lens cannot be added
-// unclassified.
+// prompt sentence is not a gate, so B/D/E/K's briefs below no longer assert a
+// read-only/mutating classification at all — they keep the "do not edit
+// files" instruction (still meaningful: it is what stops today's unisolated
+// dispatch from writing) but drop the categorical claim, so this field is the
+// only place any lens's classification is stated. It is what tasks 12/13
+// read to decide worktree isolation, and `check_collab_turn_templates.py`
+// fails any review prompt/command markdown that tries to restate this list
+// in prose instead of pointing back here. Every entry MUST declare it
+// explicitly — see the assertion right below this object — so a new lens
+// cannot be added unclassified.
 const ROSTER = {
   A: { key: 'code-reviewer (correctness)', agentType: 'code-reviewer', model: 'opus', effort: 'xhigh', fable: true, blastRadius: true, mutates: false },
   B: { key: 'security-reviewer', agentType: 'security-reviewer', model: 'opus', effort: 'xhigh', fable: false, mutates: false },
@@ -356,17 +360,17 @@ const BRIEFS = {
     fable: 'Find the correctness bugs in this diff. Security, architecture, and documentation belong to other reviewers — skip them. How you look is up to you.',
   },
   B: {
-    standard: 'OWASP Top 10, injection, auth/authz, secret exposure, SSRF, path traversal, unsafe crypto, input validation at boundaries, rate limiting, error-message leakage, deserialization. Use ecosystem-appropriate scanners when present (`cargo audit`, `pip-audit`, `bandit`, `npm audit`, `gitleaks`). Read-only: findings only, never edit files. Do not review general code quality — Agent A owns it.',
+    standard: 'OWASP Top 10, injection, auth/authz, secret exposure, SSRF, path traversal, unsafe crypto, input validation at boundaries, rate limiting, error-message leakage, deserialization. Use ecosystem-appropriate scanners when present (`cargo audit`, `pip-audit`, `bandit`, `npm audit`, `gitleaks`). Findings only for this dispatch — do not edit files. Do not review general code quality — Agent A owns it.',
   },
   C: {
     standard: 'You are reviewing a diff, not designing a system: no ADRs, no scalability roadmaps. Focus on defects with architectural cause: state-machine correctness (unreachable/missing transitions), migration safety (data loss, non-reversible steps), API contract stability (breaking change without versioning), coupling that will force shotgun surgery, abstraction placed in the wrong layer, invariants held in one module silently assumed by another.',
     fable: 'Find the defects in this diff whose cause is architectural — wrong layer, broken invariant, unsafe migration, contract change without versioning. You are reviewing a diff, not designing a system: no ADRs, no roadmaps. How you look is up to you.',
   },
   D: {
-    standard: 'Documentation completeness for this diff: missing public-API docstrings, breaking changes without CHANGELOG/migration notes, new env vars or config flags absent from `.env.example` or README, stale comments referring to removed/renamed code, README examples that drift from new behaviour, codemap entries missing for new modules. Findings only — never edit files.',
+    standard: 'Documentation completeness for this diff: missing public-API docstrings, breaking changes without CHANGELOG/migration notes, new env vars or config flags absent from `.env.example` or README, stale comments referring to removed/renamed code, README examples that drift from new behaviour, codemap entries missing for new modules. Findings only for this dispatch — do not edit files.',
   },
   E: {
-    standard: 'Cross-check every user-visible claim in this diff against its ground-truth source in code/config. Each finding: claim -> ground-truth source -> verdict -> suggested fix. Read-only.',
+    standard: 'Cross-check every user-visible claim in this diff against its ground-truth source in code/config. Each finding: claim -> ground-truth source -> verdict -> suggested fix. Findings only for this dispatch — do not edit files.',
   },
   F: {
     standard: 'Comment accuracy vs the code it describes, comment rot (comment says X, code does Y), missing context for non-obvious logic. Findings only. Ignore project-specific conventions baked into your agent definition that this repo does not use.',
@@ -385,7 +389,7 @@ const BRIEFS = {
     fable: 'Find the concurrency defects in this diff. Every CRITICAL/HIGH must spell out the interleaving that produces the failure ("A reads balance, B commits, A writes stale"). Findings only. How you look is up to you.',
   },
   K: {
-    standard: 'N+1 queries, unbounded queries/collections, missing pagination, O(n^2) on user-scaled data, allocation or I/O in hot loops, missing or wrong indexes for new query shapes. Findings only — read-only, never edit files. Skip micro-optimisations; flag only what degrades at realistic scale.',
+    standard: 'N+1 queries, unbounded queries/collections, missing pagination, O(n^2) on user-scaled data, allocation or I/O in hot loops, missing or wrong indexes for new query shapes. Findings only for this dispatch — do not edit files. Skip micro-optimisations; flag only what degrades at realistic scale.',
   },
 }
 

@@ -1032,44 +1032,145 @@ def check_review_diff_trigger_detection_contract() -> None:
 
 
 # `ultrareview.js`'s ROSTER is the only place a review lens is classified
-# mutating vs. read-only (task 11, issue #265 hardening, Codex review D5). Map
-# every lens's spelled-out name back to its one-letter ROSTER id so prose that
-# names a lens by its full name ("performance-reviewer") is caught exactly
-# like prose that names it by id ("(K)").
-ULTRAREVIEW_LENS_NAME_TO_ID = {
-    "code-reviewer": "A",
-    "security-reviewer": "B",
-    "architect": "C",
-    "doc-reviewer": "D",
-    "marketing-claims auditor": "E",
-    "comment-analyzer": "F",
-    "pr-test-analyzer": "G",
-    "silent-failure-hunter": "H",
-    "type-design-analyzer": "I",
-    "concurrency-reviewer": "J",
-    "performance-reviewer": "K",
-}
-ULTRAREVIEW_MUTATION_WORD_RE = re.compile(r"mutat|read-only|read only", re.IGNORECASE)
-ULTRAREVIEW_LENS_REF_RE = re.compile(
-    r"\b(" + "|".join(re.escape(n) for n in ULTRAREVIEW_LENS_NAME_TO_ID) + r")\b"
-    r"|\(([A-K])\)",
-    re.IGNORECASE,
-)
+# mutating vs. read-only (task 11, issue #265 hardening, Codex review D5).
+# `EXPECTED_LENS_COUNT` mirrors the same guard `test_ultrareview_workflow.mjs`
+# pins on the JS side (`rosterEntries.length >= 11`): a roster reformatted so
+# the entry-line regex below stops matching some of it must fail loudly, not
+# quietly check fewer lenses than exist.
+ULTRAREVIEW_EXPECTED_LENS_COUNT = 11
 ULTRAREVIEW_ROSTER_BLOCK_RE = re.compile(r"const ROSTER = \{(.*?)\n\}\n", re.DOTALL)
 ULTRAREVIEW_ROSTER_ENTRY_RE = re.compile(r"^\s*([A-Z]):\s*\{(.*)\},?\s*$", re.MULTILINE)
 
+# A lens reference written as its bracketed id — `(K)`, `Agent K`, `Lens K`,
+# `**K**` — is deliberately matched case-SENSITIVE on the letter itself.
+# Case-insensitive matching here previously turned "(a) no edits, (b) no
+# commits" (an ordinary lettered list, lowercase) into a false-positive
+# reference to lens A/B. A real lens id is always written uppercase.
+ULTRAREVIEW_ID_REF_RES = [
+    re.compile(r"\(([A-K])\)"),
+    re.compile(r"\b[Aa]gent\s+([A-K])\b"),
+    re.compile(r"\b[Ll]ens\s+([A-K])\b"),
+    re.compile(r"\*\*([A-K])\*\*"),
+]
 
-def parse_ultrareview_roster_mutates(text: str) -> dict[str, bool | None]:
-    """`{lens id: mutates}`, with `None` standing in for "field is missing"."""
+# What immediately follows a lens reference for it to count as an actual
+# classification assertion about THAT lens, as opposed to the lens merely
+# being named in a sentence about something else ("the architect lens is
+# dispatched during the read-only find phase" — read-only describes the
+# phase, not the lens, and must not match). The optional leading filler
+# absorbs a trailing "(id)" or "lens" between the name and the predicate, e.g.
+# "pr-test-analyzer (G) never writes ..." or "performance-reviewer lens is
+# read-only ...".
+ULTRAREVIEW_TRAILING_PREDICATE_RE = re.compile(
+    r"\s*(?:\([A-K]\)\s*)?(?:lens\s+)?(?:"
+    r"(?:is|are)\s+(?:still\s+|currently\s+|classified\s+as\s+)?(?:read-only|mutat\w*)"
+    r"|(?:never\s+)?writes?\s+to\s+the\s+(?:working\s+)?tree"
+    r"|never\s+(?:writes?|edits?)\b"
+    r"|runs?\s+(?:the\s+)?test\s+suite"
+    r"|runs?\s+benchmarks?"
+    r")",
+    re.IGNORECASE,
+)
+# A sentence can assert a competing classification without tying it to one
+# specific lens id at all — "the mutating lenses are ..." or "lenses that
+# mutate: G, K" is exactly the kind of drift-prone list this task exists to
+# ban, independent of whether any single id sits next to the verb.
+ULTRAREVIEW_GENERIC_COMPETING_LIST_RE = re.compile(
+    r"\b(?:mutating|read-only|non-mutating)\s+lenses?\b"
+    r"|\blenses?\s+that\s+(?:mutate|write|edit|run\s+the\s+test\s+suite)\b",
+    re.IGNORECASE,
+)
+
+
+def parse_ultrareview_roster(text: str) -> dict[str, dict]:
+    """`{lens id: {"mutates": bool|None, "key": str|None}}`.
+
+    `mutates` is `None` when the entry omits the field. `key` is the lens's
+    own spelled-out name straight from its ROSTER entry (e.g.
+    `'performance-reviewer'`), so callers never need a second, hand-maintained
+    copy of the name-to-id mapping — deriving it from the same parse this
+    function already does is the whole point of task 11.
+    """
     block = ULTRAREVIEW_ROSTER_BLOCK_RE.search(text)
     if not block:
         return {}
-    out: dict[str, bool | None] = {}
+    out: dict[str, dict] = {}
     for entry in ULTRAREVIEW_ROSTER_ENTRY_RE.finditer(block.group(1)):
         lens_id, entry_body = entry.group(1), entry.group(2)
         m = re.search(r"\bmutates:\s*(true|false)\b", entry_body)
-        out[lens_id] = (m.group(1) == "true") if m else None
+        km = re.search(r"key:\s*'([^']+)'", entry_body)
+        out[lens_id] = {
+            "mutates": (m.group(1) == "true") if m else None,
+            "key": km.group(1) if km else None,
+        }
     return out
+
+
+def ultrareview_name_to_id(roster: dict[str, dict]) -> dict[str, str]:
+    """Spelled-out lens name -> id, derived from ROSTER's own `key` field.
+
+    A `key` like `'code-reviewer (correctness)'` carries a parenthetical
+    descriptor that nobody writing prose about the lens would reproduce
+    verbatim, so it is stripped to the base name the same way a human
+    shorthand would.
+    """
+    out: dict[str, str] = {}
+    for lens_id, info in roster.items():
+        key = info.get("key")
+        if not key:
+            continue
+        base = re.sub(r"\s*\([^)]*\)\s*$", "", key).strip()
+        if base:
+            out[base.lower()] = lens_id
+    return out
+
+
+def ultrareview_paragraphs(text: str) -> list[tuple[int, str]]:
+    """Blank-line-delimited blocks, each joined to a single line.
+
+    This corpus hard-wraps prose at ~78 columns, so a sentence asserting a
+    per-lens classification routinely spans two source lines (task 11 review
+    finding #2). Scanning line-at-a-time missed those; joining every
+    non-blank run into one string before sentence-splitting does not. The
+    paragraph's first source line is kept for the error message — an
+    approximation once lines are joined, but enough to locate the block.
+    """
+    blocks: list[tuple[int, str]] = []
+    cur: list[str] = []
+    cur_start = None
+    for i, line in enumerate(text.splitlines(), 1):
+        if line.strip() == "":
+            if cur:
+                blocks.append((cur_start, " ".join(cur)))
+                cur = []
+                cur_start = None
+        else:
+            if cur_start is None:
+                cur_start = i
+            cur.append(line)
+    if cur:
+        blocks.append((cur_start, " ".join(cur)))
+    return blocks
+
+
+def ultrareview_sentences(paragraph: str) -> list[str]:
+    normalized = re.sub(r"\s+", " ", paragraph).strip()
+    return re.split(r"(?<=[.!?])\s+", normalized)
+
+
+def find_ultrareview_lens_refs(sentence: str, name_re: re.Pattern, name_to_id: dict[str, str]) -> list[tuple[int, int, str]]:
+    """`(start, end, lens_id)` for every lens reference in `sentence`, sorted by position."""
+    refs = []
+    for pat in ULTRAREVIEW_ID_REF_RES:
+        for m in pat.finditer(sentence):
+            refs.append((m.start(), m.end(), m.group(1)))
+    if name_re is not None:
+        for m in name_re.finditer(sentence):
+            lens_id = name_to_id.get(m.group(1).lower())
+            if lens_id:
+                refs.append((m.start(), m.end(), lens_id))
+    refs.sort()
+    return refs
 
 
 def check_review_lens_mutation_classification_contract() -> None:
@@ -1086,20 +1187,35 @@ def check_review_lens_mutation_classification_contract() -> None:
     correctly, since a correct restatement today is exactly the copy that
     drifts tomorrow. Flag any such restatement outright rather than trying to
     prove it wrong first.
+
+    A paragraph that itself names `ROSTER` (e.g. "see ROSTER.mutates for
+    which lenses mutate") is exempted entirely: that is the sanctioned way to
+    describe the policy without a second copy of it, and task 12 needs to be
+    able to write exactly that sentence in these same files.
     """
     if not ULTRAREVIEW_SRC.exists():
         err(f"{ULTRAREVIEW_SRC.relative_to(ROOT)}: missing — cannot verify the "
             f"review-lens mutation classification")
         return
-    roster = parse_ultrareview_roster_mutates(ULTRAREVIEW_SRC.read_text())
-    if not roster:
-        err(f"{ULTRAREVIEW_SRC.relative_to(ROOT)}: could not parse ROSTER — "
-            f"review-lens mutation-classification check has nothing to verify")
-        return
-    missing = sorted(lens_id for lens_id, mutates in roster.items() if mutates is None)
+    roster = parse_ultrareview_roster(ULTRAREVIEW_SRC.read_text())
+    if len(roster) < ULTRAREVIEW_EXPECTED_LENS_COUNT:
+        err(f"{ULTRAREVIEW_SRC.relative_to(ROOT)}: only parsed {len(roster)} "
+            f"ROSTER entr{'y' if len(roster) == 1 else 'ies'}, expected "
+            f"{ULTRAREVIEW_EXPECTED_LENS_COUNT} — review-lens "
+            f"mutation-classification check may be silently checking fewer "
+            f"lenses than actually exist")
+        if not roster:
+            return
+    missing = sorted(lens_id for lens_id, info in roster.items() if info["mutates"] is None)
     if missing:
         err(f"{ULTRAREVIEW_SRC.relative_to(ROOT)}: ROSTER entries {missing} do "
             f"not declare mutates: true|false")
+
+    name_to_id = ultrareview_name_to_id(roster)
+    name_re = (
+        re.compile(r"\b(" + "|".join(re.escape(n) for n in name_to_id) + r")\b", re.IGNORECASE)
+        if name_to_id else None
+    )
 
     candidates: list[pathlib.Path] = []
     for base in (PROMPTS, COMMANDS_DIR, CODEX_PROMPTS_DIR, CODEX_COMMANDS_DIR):
@@ -1107,24 +1223,33 @@ def check_review_lens_mutation_classification_contract() -> None:
             candidates.extend(sorted(base.glob("*.md")))
     for path in candidates:
         text = path.read_text()
-        # Scoped to files that actually discuss the ultrareview lens roster —
-        # a bare "mutat"/"read-only" sentence unrelated to review lenses (e.g.
-        # collab session-state mutation, or the blanket "review agents are
-        # read-only under --report-only" instruction, which names no specific
-        # lens) is not a competing classification and must not be flagged.
-        if "ultrareview" not in text.lower():
-            continue
-        for lineno, line in enumerate(text.splitlines(), 1):
-            if not ULTRAREVIEW_MUTATION_WORD_RE.search(line):
+        for start_line, paragraph in ultrareview_paragraphs(text):
+            # Deliberately paragraph-scoped, not sentence-scoped: the
+            # sanctioned "point back to ROSTER" phrasing and the sentence it
+            # is clarifying are often split by a semicolon or a second
+            # sentence in the same paragraph, and both must stay exempt.
+            if "roster" in paragraph.lower():
                 continue
-            for m in ULTRAREVIEW_LENS_REF_RE.finditer(line):
-                lens_id = m.group(2) or ULTRAREVIEW_LENS_NAME_TO_ID.get((m.group(1) or "").lower())
-                if lens_id:
-                    err(f"{path.relative_to(ROOT)}:{lineno}: restates the "
-                        f"mutating/read-only classification for lens "
-                        f"{lens_id!r} in prose — ROSTER.{lens_id}.mutates in "
-                        f"{ULTRAREVIEW_SRC.relative_to(ROOT)} is the only "
-                        f"place this may be declared: {line.strip()!r}")
+            for sentence in ultrareview_sentences(paragraph):
+                if ULTRAREVIEW_GENERIC_COMPETING_LIST_RE.search(sentence):
+                    err(f"{path.relative_to(ROOT)}:{start_line}: describes a "
+                        f"competing mutating/read-only lens list in prose — "
+                        f"ROSTER.mutates in {ULTRAREVIEW_SRC.relative_to(ROOT)} "
+                        f"is the only place this may be declared: "
+                        f"{sentence.strip()!r}")
+                flagged: set[str] = set()
+                for start, end, lens_id in find_ultrareview_lens_refs(sentence, name_re, name_to_id):
+                    if lens_id in flagged:
+                        continue
+                    trailing = sentence[end:end + 80]
+                    if ULTRAREVIEW_TRAILING_PREDICATE_RE.match(trailing):
+                        flagged.add(lens_id)
+                        err(f"{path.relative_to(ROOT)}:{start_line}: restates "
+                            f"the mutating/read-only classification for lens "
+                            f"{lens_id!r} in prose — ROSTER.{lens_id}.mutates "
+                            f"in {ULTRAREVIEW_SRC.relative_to(ROOT)} is the "
+                            f"only place this may be declared: "
+                            f"{sentence.strip()!r}")
 
 
 # Contract lists for the pilot-routing checks below. They are module-level

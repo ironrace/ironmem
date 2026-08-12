@@ -1044,9 +1044,21 @@ for (const verdict of ['PLAUSIBLE', 'REFUTED', 'UNVERIFIED', 'N/A', '']) {
     assert.ok(byLens('A').includes('BLAST RADIUS:') && byLens('C').includes('BLAST RADIUS:'))
     assert.ok(!byLens('B').includes('BLAST RADIUS:') && !byLens('D').includes('BLAST RADIUS:'))
   })
-  check('read-only lenses are told never to edit', () => {
-    assert.ok(byLens('B').includes('never edit files'))
-    assert.ok(byLens('D').includes('never edit files'))
+  check('read-only lenses are told not to edit, without a competing classification claim', () => {
+    // Task 11: a lens's brief instructs "don't edit files in this dispatch"
+    // (still operationally meaningful pre-worktree-isolation) but must not
+    // assert "read-only"/"mutating" as a categorical fact — ROSTER.mutates is
+    // the only place that fact may be declared, on pain of the two silently
+    // disagreeing (which is exactly what happened to K's old brief text).
+    assert.ok(byLens('B').includes('do not edit files'))
+    assert.ok(byLens('D').includes('do not edit files'))
+    // Every DISPATCHED lens this run (large band excludes E — no
+    // marketingAgentType and E not requested), not a hardcoded id list: the
+    // point is that NO brief, present or future, may assert the
+    // classification in prose.
+    for (const c of find) {
+      assert.ok(!/read-only|mutat/i.test(c.brief), `${c.opts.label} brief still asserts a classification: ${c.brief}`)
+    }
   })
 }
 {
