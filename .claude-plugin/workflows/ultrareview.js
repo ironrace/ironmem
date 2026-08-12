@@ -592,13 +592,19 @@ function isoRange() {
 // than left pointing at the shared checkout. The lens still has the review input
 // and the source in front of it; a lens reading the wrong tree is the failure
 // being prevented, and a missing convenience command is not.
+// The argument must END where the flag's value ends, not merely start there:
+// `--repo /r` is a prefix of `--repo /repo2`, so a substring rewrite against a
+// short repo path would splice the worktree into the middle of some other
+// path and hand the lens a directory that does not exist.
 function expandCmdFor(isoPath) {
   if (!EXPAND_CMD) return ''
   if (!isoPath) return EXPAND_CMD
   const repoFlag = `--repo ${REPO_PATH}`
-  if (!EXPAND_CMD.includes(repoFlag)) return ''
-  return EXPAND_CMD.split(repoFlag)
-    .join(`--repo ${isoPath}`)
+  const at = EXPAND_CMD.indexOf(repoFlag)
+  if (at === -1) return ''
+  const after = EXPAND_CMD.charAt(at + repoFlag.length)
+  if (after !== '' && after !== ' ') return ''
+  return (EXPAND_CMD.slice(0, at) + `--repo ${isoPath}` + EXPAND_CMD.slice(at + repoFlag.length))
     .split(' --worktree')
     .join(` --base ${ROLLBACK_SHA}~1 --head ${ROLLBACK_SHA}`)
 }
@@ -612,8 +618,8 @@ function isolationNote(isoPath, range) {
     // worktree itself, and a `git diff` line with an empty range would be a
     // broken command rather than a degraded one.
     range
-      ? `The reviewed change is the tip commit of that worktree: \`git -C ${isoPath} diff ${range} -- <path>\` shows it one file at a time.`
-      : `The reviewed change is the tip commit of that worktree; its checked-out files are the exact reviewed source.`,
+      ? `The reviewed change is what \`git -C ${isoPath} diff ${range} -- <path>\` shows, one file at a time.`
+      : `Its checked-out files are the exact reviewed source; diff them against their parent commit to see what changed.`,
     `The worktree is deleted as soon as you return, so anything you want kept has to be in your findings.`,
   ].join('\n')
 }
@@ -743,6 +749,10 @@ async function runLens(id) {
     await releaseIsolationWorktree(id, isoPath)
     return notDispatched(`the isolation worktree at ${isoPath} could not be cut${cut.detail ? `: ${cut.detail}` : ''}`)
   }
+  // Said out loud because it is a second checkout of the repository on the
+  // user's disk and two extra dispatches in the run, both of which are
+  // otherwise unexplained.
+  log(`lens ${id} (${lens.key}) runs isolated in ${isoPath} — a throwaway worktree at ${ROLLBACK_SHA.slice(0, 12)}, removed when it returns`)
 
   try {
     return await runLensIn(id, isoPath)
