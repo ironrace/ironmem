@@ -2745,12 +2745,50 @@ def test_lint_rejects_a_wrapped_per_lens_classification_sentence(tmp_path):
     assert "restates the mutating/read-only classification for lens 'K' in prose" in r.stdout
 
 
+def test_lint_rejects_a_classification_bullet_inside_a_roster_citing_list(tmp_path):
+    # The ROSTER exemption is block-scoped, and bullets used to be joined into
+    # one block with no blank line between them. That made a single sanctioned
+    # "see ROSTER.mutates" bullet exempt every other bullet beside it —
+    # including the "What the workflow guarantees" list, the most likely place
+    # for a restatement to be written. A list item is its own block now.
+    fixture = copy_fixture(tmp_path)
+    path = fixture / ".claude-plugin" / "commands" / "ultrareview-local.md"
+    path.write_text(path.read_text() +
+                    "\n\n- Whether a lens mutates is declared in ROSTER.mutates.\n"
+                    "- Lens K is read-only and never writes to the tree.\n")
+
+    r = run({"COLLAB_LINT_ROOT": str(fixture)})
+
+    assert r.returncode == 1
+    assert "restates the mutating/read-only classification for lens 'K' in prose" in r.stdout
+
+
+def test_lint_still_exempts_a_roster_pointer_bullet_itself(tmp_path):
+    # The other half of the same change: splitting bullets must not start
+    # flagging the sanctioned pointer phrasing when it cites ROSTER in its own
+    # bullet.
+    fixture = copy_fixture(tmp_path)
+    path = fixture / ".claude-plugin" / "commands" / "ultrareview-local.md"
+    path.write_text(path.read_text() +
+                    "\n\n- Lens K is read-only or mutating exactly as "
+                    "ROSTER.mutates says; this file does not restate it.\n")
+
+    r = run({"COLLAB_LINT_ROOT": str(fixture)})
+
+    assert r.returncode == 0, r.stdout
+
+
 @pytest.mark.parametrize("sentence,lens_id", [
     ("Agent K is read-only and never edits files.", "K"),
     ("Lens K is read-only.", "K"),
     ("**K** is read-only.", "K"),
     ("pr-test-analyzer (G) never writes to the working tree.", "G"),
     ("Lens G runs the test suite so it writes to the tree; all others do not.", "G"),
+    # An agent name in parentheses sits between the reference and the verb. The
+    # trailing-predicate matcher allowed only a bare `(A)`-`(K)` there, so both
+    # of these forms used to slip through.
+    ("Lens K (performance-reviewer) is read-only and never writes to the tree.", "K"),
+    ("G (pr-test-analyzer) never writes to the tree.", "G"),
 ])
 def test_lint_rejects_various_per_lens_classification_phrasings(tmp_path, sentence, lens_id):
     fixture = copy_fixture(tmp_path)

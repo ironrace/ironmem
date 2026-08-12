@@ -1065,8 +1065,15 @@ ULTRAREVIEW_ID_REF_RES = [
 # absorbs a trailing "(id)" or "lens" between the name and the predicate, e.g.
 # "pr-test-analyzer (G) never writes ..." or "performance-reviewer lens is
 # read-only ...".
+# The optional parenthetical is not just `(A)`-`(K)`: this corpus names lenses
+# as "Lens K (performance-reviewer)" and "G (pr-test-analyzer)", so a bare
+# `\([A-K]\)` left the agent-name form unmatched and any classification written
+# that way sailed through. Bounded and `[^)]` so it cannot run past its own
+# close paren into an unrelated clause. The leading `\)?` is the mirror case:
+# when the matched reference is the agent NAME, the match ends inside the
+# parentheses and the predicate is preceded by the closing paren instead.
 ULTRAREVIEW_TRAILING_PREDICATE_RE = re.compile(
-    r"\s*(?:\([A-K]\)\s*)?(?:lens\s+)?(?:"
+    r"\s*\)?\s*(?:\([^)]{0,60}\)\s*)?(?:lens\s+)?(?:"
     r"(?:is|are)\s+(?:still\s+|currently\s+|classified\s+as\s+)?(?:read-only|mutat\w*)"
     r"|(?:never\s+)?writes?\s+to\s+the\s+(?:working\s+)?tree"
     r"|never\s+(?:writes?|edits?)\b"
@@ -1129,6 +1136,11 @@ def ultrareview_name_to_id(roster: dict[str, dict]) -> dict[str, str]:
     return out
 
 
+# `- `, `* `, `+ ` or `1. ` at any indent: the start of a markdown list item,
+# which ultrareview_paragraphs treats as a block boundary.
+MARKDOWN_LIST_ITEM_RE = re.compile(r"^\s*(?:[-*+]|\d+\.)\s")
+
+
 def ultrareview_paragraphs(text: str) -> list[tuple[int, str]]:
     """Blank-line-delimited blocks, each joined to a single line.
 
@@ -1138,6 +1150,16 @@ def ultrareview_paragraphs(text: str) -> list[tuple[int, str]]:
     non-blank run into one string before sentence-splitting does not. The
     paragraph's first source line is kept for the error message — an
     approximation once lines are joined, but enough to locate the block.
+
+    A markdown list item also starts a new block, even with no blank line
+    before it. Bullets in this corpus are written as one blank-line-delimited
+    run, so blank-lines-only splitting made an entire list a single block —
+    and since the ROSTER exemption below is block-scoped, one sanctioned
+    "see ROSTER.mutates" bullet exempted every other bullet beside it,
+    including the "What the workflow guarantees" list, which is the most
+    likely place for a prose restatement to appear. A bullet's own hard-wrap
+    continuation lines are indented and keep joining it, so the wrapped-
+    sentence fix this function exists for is unaffected.
     """
     blocks: list[tuple[int, str]] = []
     cur: list[str] = []
@@ -1149,6 +1171,10 @@ def ultrareview_paragraphs(text: str) -> list[tuple[int, str]]:
                 cur = []
                 cur_start = None
         else:
+            if MARKDOWN_LIST_ITEM_RE.match(line) and cur:
+                blocks.append((cur_start, " ".join(cur)))
+                cur = []
+                cur_start = None
             if cur_start is None:
                 cur_start = i
             cur.append(line)
