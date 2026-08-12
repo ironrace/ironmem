@@ -43,6 +43,13 @@ const pipeline = (items, s1, s2) => Promise.all(items.map(async (i) => s2(await 
 // removes it. Both run a fixed git command list; neither reviews anything.
 const isIsolationCall = (opts) => typeof opts.label === 'string' && opts.label.startsWith('isolate:')
 
+// The shared-checkout-safety predicate: a brief may freely name the throwaway
+// worktree, but nothing that survives stripping every occurrence of it may
+// still name the shared repo path. Shared by the smoke section's cleanup
+// check and the exhaustive section's proof that this check is not vacuous —
+// both must fail together if either regresses.
+const namesOnlyIsolationPath = (brief, isoPath, repoPath) => !brief.split(isoPath).join('').includes(repoPath)
+
 async function run(args, agentImpl) {
   const logs = []
   const calls = []
@@ -1700,13 +1707,17 @@ for (const verdict of ['PLAUSIBLE', 'REFUTED', 'UNVERIFIED', 'N/A', '']) {
   })
   check('the worktree is cut at the anchor object, not at a ref', () =>
     assert.ok(labelled('isolate:G cut').brief.includes(`worktree add --detach ${WT_G} ${SHA}`)))
-  check('cleanup removes and prunes on the success path', () => {
+  check('cleanup removes and prunes, prune before remove, on the success path', () => {
     const rel = labelled('isolate:G release').brief
     assert.ok(rel.includes(`git -C ${WT_G} worktree prune`))
     assert.ok(rel.includes(`git -C ${WT_G} worktree remove --force ${WT_G}`))
+    // Order matters: `remove` deletes the directory, so pruning after it would
+    // have no worktree left to prune from — see ultrareview.js's comment on
+    // isolationCleanupBrief for why this order is load-bearing, not stylistic.
+    assert.ok(rel.indexOf('worktree prune') < rel.indexOf('worktree remove'))
   })
   check('cleanup never names the shared checkout', () =>
-    assert.ok(!labelled('isolate:G release').brief.split(WT_G).join('').includes('/r')))
+    assert.ok(namesOnlyIsolationPath(labelled('isolate:G release').brief, WT_G, '/r')))
   check('a read-only lens cuts no worktree and keeps the shared tree', () => {
     assert.equal(a.opts.cwd, undefined)
     assert.ok(a.brief.includes('Repo: /r'))
@@ -1719,8 +1730,15 @@ for (const verdict of ['PLAUSIBLE', 'REFUTED', 'UNVERIFIED', 'N/A', '']) {
   const impl = (b, o) =>
     o.label.startsWith('find:G ') ? Promise.reject(new Error('lens exploded')) : noFindings(b, o)
   const { out, calls } = await run({ ...baseArgs, changedLines: 1000, lenses: ['A'], reportOnly: true }, impl)
-  check('cleanup runs on the failure path too', () =>
-    assert.ok(calls.some((c) => c.opts.label === 'isolate:G release')))
+  const releaseOnFailure = calls.find((c) => c.opts.label === 'isolate:G release')
+  check('cleanup runs on the failure path too', () => assert.ok(releaseOnFailure))
+  check('cleanup on the failure path still prunes, removes, and names only the throwaway', () => {
+    const rel = releaseOnFailure.brief
+    const wt = `/r-ultrareview-g-${SHA.slice(0, 12)}`
+    assert.ok(rel.includes(`git -C ${wt} worktree prune`))
+    assert.ok(rel.includes(`git -C ${wt} worktree remove --force ${wt}`))
+    assert.ok(namesOnlyIsolationPath(rel, wt, '/r'))
+  })
   check('the failed lens is reported as errored, not as a clean zero', () =>
     assert.ok(out.erroredLenses.includes('G')))
 }
@@ -1758,8 +1776,41 @@ for (const verdict of ['PLAUSIBLE', 'REFUTED', 'UNVERIFIED', 'N/A', '']) {
       assert.ok(cov.errored)
       assert.match(cov.errorReason, /could not be cut/)
     })
-    check('the reason reaches the log too', () =>
-      assert.ok(logs.some((l) => l.includes('was not dispatched'))))
+    check('the reason reaches the log too, naming the lens and the actual error', () =>
+      assert.ok(logs.some((l) => l.includes('lens G') && l.includes('not a git repository'))))
+  }
+
+  // ---- local mode retargets the isolated lens's range and expand command,
+  // and each mutating lens gets its OWN distinct worktree (G and K both join
+  // via isoArgs's large-band expansion). The smoke section only checks that
+  // `--repo` moves to the worktree; it does not check what follows, so it
+  // does not catch a regression that leaves `--worktree` in place instead of
+  // rewriting it to `--base <sha>~1 --head <sha>` — inside a clean worktree
+  // that reads as an EMPTY diff, a silent zero-findings pass, which is
+  // checked explicitly here.
+  {
+    const localExpandArgs = {
+      ...isoArgs,
+      expandCmd: 'ironmem review-diff --repo /r --worktree --expand-file <path> --hunk <ordinal>',
+    }
+    const { calls } = await run(localExpandArgs, noFindings)
+    const g = calls.find((c) => c.opts.label.startsWith('find:G '))
+    const k = calls.find((c) => c.opts.label.startsWith('find:K '))
+    check('local mode retargets the diff range to the snapshot range', () =>
+      assert.ok(g.brief.includes(`Diff range: ${SHA}~1..${SHA}`)))
+    check('local mode rewrites --worktree to an explicit --base/--head, not left in place', () => {
+      assert.ok(g.brief.includes(`ironmem review-diff --repo ${WT_G} --base ${SHA}~1 --head ${SHA}`))
+      assert.ok(!g.brief.includes('--worktree'))
+    })
+    check('K joins via large-band expansion and gets its own distinct worktree, not G\'s', () => {
+      assert.ok(k, 'lens K should be dispatched alongside G')
+      assert.equal(k.opts.cwd, WT_K)
+      assert.notEqual(WT_K, WT_G)
+    })
+    check('K gets its own cut and release calls, independent of G\'s', () => {
+      assert.ok(calls.some((c) => c.opts.label === 'isolate:K cut'))
+      assert.ok(calls.some((c) => c.opts.label === 'isolate:K release'))
+    })
   }
 
   // ---- release cannot confirm removal: reported as a leak, not swallowed.
@@ -1853,20 +1904,31 @@ for (const verdict of ['PLAUSIBLE', 'REFUTED', 'UNVERIFIED', 'N/A', '']) {
     check('setup: located the finally-block release call to mutate', () => assert.ok(idx > 0))
     const patched = body.slice(0, idx) + 'releaseIsolationWorktree(id, REPO_ROOT)' + body.slice(idx + target.length)
     check('setup: patching the release call actually changed the source', () => assert.notEqual(patched, body))
-    const patchedMake = new AsyncFunction('args', 'budget', 'agent', 'parallel', 'pipeline', 'log', 'phase', 'workflow', patched)
-    const calls = []
-    const agent = (brief, opts) => {
-      calls.push({ brief, opts })
-      return Promise.resolve().then(() => (isIsolationCall(opts) ? { ok: true, detail: '' } : noFindings(brief, opts)))
+    // Guarded like the Task 11 mutation test: a bad patch (index miss, a
+    // rename that does not resolve) must not throw an unhandled rejection
+    // and take out the rest of the suite's tally with it.
+    let rel = null
+    let setupError = null
+    try {
+      const patchedMake = new AsyncFunction('args', 'budget', 'agent', 'parallel', 'pipeline', 'log', 'phase', 'workflow', patched)
+      const calls = []
+      const agent = (brief, opts) => {
+        calls.push({ brief, opts })
+        return Promise.resolve().then(() => (isIsolationCall(opts) ? { ok: true, detail: '' } : noFindings(brief, opts)))
+      }
+      await patchedMake(isoArgs, {}, agent, parallel, pipeline, () => {}, () => {}, () => {})
+      rel = calls.find((c) => c.opts.label === 'isolate:G release')?.brief ?? null
+    } catch (e) {
+      setupError = e
     }
-    await patchedMake(isoArgs, {}, agent, parallel, pipeline, () => {}, () => {}, () => {})
-    const rel = calls.find((c) => c.opts.label === 'isolate:G release').brief
+    check('setup: the patched source ran without throwing', () =>
+      assert.equal(setupError, null, setupError && setupError.message))
     check('setup: the patched source reproduces the regression — cleanup now names the shared checkout', () =>
-      assert.ok(rel.includes('git -C /r worktree remove')))
+      assert.ok(rel && rel.includes('git -C /r worktree remove')))
     check('the shared-checkout-safety assertion catches this regression', () => {
       let caught = false
       try {
-        assert.ok(!rel.split(WT_G).join('').includes('/r'))
+        assert.ok(namesOnlyIsolationPath(rel || '', WT_G, '/r'))
       } catch {
         caught = true
       }

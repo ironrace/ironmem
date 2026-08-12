@@ -373,6 +373,40 @@ fn range_diff_over_the_shared_checkout_is_blind_to_a_dirty_second_worktree() {
         "the raw source diff of the canonical range must not see the \
          separate worktree's dirty change either: {source}"
     );
+
+    // Positive control: the two assertions above must not be satisfiable by a
+    // degenerate (e.g. empty) diff. Confirm the real reviewed content is
+    // still there, exactly like the sibling test at line ~232 above does for
+    // its own expansion.
+    assert!(
+        expanded.contains("alpha.txt section 1 head changed payload"),
+        "expansion lost the real reviewed content, so the absence of the \
+         contaminant proves nothing: {expanded}"
+    );
+
+    // Negative control on `ReviewDiffSource` itself, not just on git's
+    // worktree semantics: an uncommitted, differently-marked change written
+    // directly into the SHARED checkout (not the second worktree) must also
+    // stay out of a `Range` diff. Unlike the assertions above — which pass
+    // for any correct `Range` implementation regardless of what this test
+    // does — this one is what would actually fail if `fixture.request()`
+    // ever regressed from `ReviewDiffSource::Range` to
+    // `ReviewDiffSource::Worktree` (which reads the caller's own working
+    // directory instead of committed history).
+    let shared_checkout_marker = "CONTAMINATION_FROM_THE_SHARED_CHECKOUTS_OWN_DIRTY_STATE";
+    std::fs::write(
+        fixture.tempdir.path().join("alpha.txt"),
+        format!("{shared_checkout_marker}\n"),
+    )
+    .expect("write dirty state directly in the shared checkout");
+    let expanded_after_dirty = expand_review_diff(&request, "alpha.txt", None)
+        .expect("shared-checkout expansion should still succeed with dirty state present");
+    assert!(
+        !expanded_after_dirty.contains(shared_checkout_marker),
+        "a Range diff must read committed history, not the shared checkout's \
+         own uncommitted state — this fails if the request ever regressed to \
+         ReviewDiffSource::Worktree: {expanded_after_dirty}"
+    );
 }
 
 #[cfg(feature = "headroom-compression")]
