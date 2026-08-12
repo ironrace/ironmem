@@ -117,6 +117,19 @@ const ROLLBACK_SHA = /^[0-9a-f]{7,64}$/.test(String(A.rollbackSha || '').trim())
   ? String(A.rollbackSha).trim()
   : ''
 const NO_ANCHOR = !ROLLBACK_SHA
+// In Local Mode the anchor is the immutable snapshot under review. In PR Mode
+// the caller may deliberately be checked out somewhere other than the PR head;
+// `reviewSha` then names the PR commit that the mutating lens must inspect.
+// Falling back to the anchor preserves Local Mode and same-head PR Mode.
+const REVIEW_SHA = /^[0-9a-f]{7,64}$/.test(String(A.reviewSha || '').trim())
+  ? String(A.reviewSha).trim()
+  : ROLLBACK_SHA
+// A nonce makes the throwaway worktree belong to one workflow invocation. A
+// SHA is shared by every review of that snapshot, so it is not an ownership
+// token and cannot safely distinguish concurrent runs.
+const ISOLATION_NONCE = /^[A-Za-z0-9_-]{1,64}$/.test(String(A.isolationNonce || '').trim())
+  ? String(A.isolationNonce).trim()
+  : ''
 
 // Repo-relative, no traversal, no absolute paths. This is the allowlist the fix
 // dispatch checks findings against, so it is built from the caller's file list
@@ -340,13 +353,15 @@ const FIX_SCHEMA = {
   },
 }
 
-// Cut and cleanup dispatches (see "find-phase isolation"). Two fields only:
-// this agent runs a fixed command list, it does not review anything.
+// Cut and cleanup dispatches (see "find-phase isolation"). `created` is used
+// only for a cut: it distinguishes a partial creation this run may clean up
+// from a pre-existing path this run must leave untouched.
 const ISOLATION_SCHEMA = {
   type: 'object',
   required: ['ok', 'detail'],
   properties: {
     ok: { type: 'boolean', description: 'true only if the commands ran and the described end state actually holds' },
+    created: { type: 'boolean', description: 'cut only: true only if this invocation actually created the worktree; false for an existing-path collision' },
     detail: { type: 'string', description: 'the exact error text when ok is false; a short note otherwise' },
   },
 }
@@ -514,25 +529,22 @@ function briefFor(id, model, isoPath) {
 // the code under review and reported a defect that did not exist. The finding
 // was refuted as harness contamination, but the next one may not be.
 //
-// So a mutating lens gets its own throwaway worktree, cut at ROLLBACK_SHA, and
+// So a mutating lens gets its own throwaway worktree, cut at REVIEW_SHA, and
 // every path in its brief points there. Read-only lenses are untouched: they
 // keep reading the shared tree directly, so the common case pays no worktree
 // cost. One worktree PER mutating lens, not one shared by all of them — two
 // mutating lenses in one tree contaminate each other exactly as they
 // contaminate the shared checkout.
 //
-// WHICH SHA. `rollbackSha` is the object `git commit-tree` minted from a
-// throwaway index in the command's Phase 2.5: the tracked modifications AND the
-// untracked files, exactly the tree the lenses are reviewing, frozen as a commit
-// object rather than a ref. That is the definition of "the immutable review
-// SHA" this needs — `HEAD` is a moving ref and does not contain the uncommitted
-// work under review at all, so a worktree cut at `HEAD` would review the wrong
-// code. The anchor's other three jobs (scope audit, report line, recovery
-// command) are unrelated to this one; what makes it right here is only that it
-// is the immutable snapshot of the reviewed tree. No separate `reviewSha`
-// argument is threaded through, because a second object naming the same tree
-// would be a second thing to keep in sync for no gain — and where the anchor
-// cannot be minted there is no snapshot to cut a worktree at either.
+// WHICH SHA. In Local Mode `reviewSha` is the `rollbackSha` object
+// `git commit-tree` minted from a throwaway index: the tracked modifications
+// and untracked files, frozen as an immutable commit rather than a moving ref.
+// In PR Mode it is the resolved PR `headRefOid`. The local checkout is allowed
+// to differ from that PR head in report-only mode, so cutting at the rollback
+// anchor there would make a lens inspect unrelated source while its diff range
+// still names the PR. `reviewSha` is therefore separate from `rollbackSha`:
+// the latter remains the local rollback/scope-audit anchor, while the former
+// is always the source snapshot being reviewed.
 //
 // HOW, AND THE LIMIT OF IT. This script is the body of an AsyncFunction with no
 // filesystem and no shell — `agent()` is its only side-effecting primitive (the
@@ -546,24 +558,24 @@ function briefFor(id, model, isoPath) {
 // that becomes load-bearing the day it is honoured — not the mechanism the
 // isolation currently rests on. Treat the brief as the mechanism.
 //
-// FAIL CLOSED. If the worktree cannot be cut — no usable `repoPath`, no anchor,
-// or the cut itself failed — the lens is NOT dispatched against the shared
+// FAIL CLOSED. If the worktree cannot be cut — no usable `repoPath`, no review
+// snapshot/per-run nonce, or the cut itself failed — the lens is NOT dispatched against the shared
 // checkout as a consolation. It is reported as an errored lens, which is what
 // makes `coverageComplete` false and caps the decision. Running it unisolated
 // is the exact behaviour this section exists to end, and doing that silently
 // while the roster claims isolation would be worse than the gap.
 const ISOLATION_TIER = { model: 'sonnet', effort: 'low' }
 
-// `<repo>-ultrareview-<lens>-<sha12>`, a SIBLING of the checkout — never a path
+// `<repo>-ultrareview-<lens>-<sha12>-<nonce>`, a SIBLING of the checkout — never a path
 // inside it. A worktree under the repo would appear as an untracked directory
 // in `git status`, which the command's fix-created test reads as a file the fix
 // agents created, and would put a `rm -rf` target inside the tree being
-// reviewed. Deterministic rather than random so a run that is killed outright
-// leaves a path the next run recognises and clears (the cut brief does that
-// first), since a killed process runs no `finally`.
+// reviewed. The per-invocation nonce avoids two live reviews of the same SHA
+// sharing a path; a pre-existing path is refused rather than deleted because
+// it may be another run or user data.
 function isolationPathFor(id) {
-  if (!REPO_ROOT || !ROLLBACK_SHA) return ''
-  return `${REPO_ROOT}-ultrareview-${String(id).toLowerCase()}-${ROLLBACK_SHA.slice(0, 12)}`
+  if (!REPO_ROOT || !REVIEW_SHA || !ISOLATION_NONCE) return ''
+  return `${REPO_ROOT}-ultrareview-${String(id).toLowerCase()}-${REVIEW_SHA.slice(0, 12)}-${ISOLATION_NONCE}`
 }
 
 // What "the reviewed change" is called inside the worktree. In PR Mode the
@@ -576,7 +588,7 @@ function isolationPathFor(id) {
 // `~1` rather than `^`: both name the first parent, but `^` is a glob operator
 // under zsh's EXTENDED_GLOB and this string is pasted into an agent's shell.
 function isoRange() {
-  return MODE_LOCAL ? `${ROLLBACK_SHA}~1..${ROLLBACK_SHA}` : DIFF_RANGE
+  return MODE_LOCAL ? `${REVIEW_SHA}~1..${REVIEW_SHA}` : DIFF_RANGE
 }
 
 // The `ironmem review-diff` line, retargeted at the worktree.
@@ -606,7 +618,7 @@ function expandCmdFor(isoPath) {
   if (after !== '' && after !== ' ') return ''
   return (EXPAND_CMD.slice(0, at) + `--repo ${isoPath}` + EXPAND_CMD.slice(at + repoFlag.length))
     .split(' --worktree')
-    .join(` --base ${ROLLBACK_SHA}~1 --head ${ROLLBACK_SHA}`)
+    .join(` --base ${REVIEW_SHA}~1 --head ${REVIEW_SHA}`)
 }
 
 function isolationNote(isoPath, range) {
@@ -635,16 +647,15 @@ function isolationCutBrief(isoPath) {
   return [
     'Setup task, not a review. Run the commands below in a shell and report what happened. Do not review anything, do not read source, do not edit any file.',
     '',
-    `If ${isoPath} already exists — a leftover from a run that was killed — clear it first:`,
-    `  git -C ${isoPath} worktree remove --force ${isoPath}`,
-    `  rm -rf ${isoPath}`,
+    `${isoPath} must not already exist. If it does, report ok: false, created: false and stop: it belongs to another run or is user data. Do not run rm, git worktree remove, or any cleanup command on it.`,
+    `  test ! -e ${isoPath}`,
     '',
     'Then, in this order:',
     `  git -C ${REPO_ROOT} worktree prune`,
-    `  git -C ${REPO_ROOT} worktree add --detach ${isoPath} ${ROLLBACK_SHA}`,
+    `  git -C ${REPO_ROOT} worktree add --detach ${isoPath} ${REVIEW_SHA}`,
     '',
-    `${ROLLBACK_SHA} is an object name, not a ref. Do not substitute a branch, a tag or HEAD for it: the point is a tree that cannot move while the review runs.`,
-    `Report ok: true only if ${isoPath} now exists and \`git -C ${isoPath} rev-parse HEAD\` prints ${ROLLBACK_SHA} (one may be an abbreviation of the other). Anything else is ok: false, with the exact error text in detail.`,
+    `${REVIEW_SHA} is an object name, not a ref. Do not substitute a branch, a tag or HEAD for it: the point is a tree that cannot move while the review runs.`,
+    `Report ok: true, created: true only if ${isoPath} now exists and \`git -C ${isoPath} rev-parse HEAD\` prints ${REVIEW_SHA} (one may be an abbreviation of the other). If a failure occurs after this invocation created the worktree, report ok: false, created: true; otherwise report created: false. Include exact error text in detail.`,
     `Never create ${isoPath} any other way — no mkdir, no cp, no clone — and never modify the working tree of ${REPO_ROOT}. An empty or hand-built directory reported as ok would send a reviewer at a tree that is not the one under review.`,
   ].join('\n')
 }
@@ -693,6 +704,7 @@ async function cutIsolationWorktree(id, isoPath) {
   }).catch((e) => ({ ok: false, detail: (e && e.message) || 'isolation cut dispatch failed' }))
   return {
     ok: !!(res && res.ok === true),
+    created: !!(res && res.created === true),
     detail: asData((res && res.detail) || '').slice(0, 160),
   }
 }
@@ -745,21 +757,22 @@ async function runLens(id) {
   const isoPath = isolationPathFor(id)
   if (!isoPath) {
     return notDispatched(
-      'no isolation worktree could be cut (repoPath is not a usable absolute path, or no rollback anchor was minted) and this lens is classified mutating, so it is never run against the shared checkout',
+      'no isolation worktree could be cut (repoPath is not a usable absolute path, no review snapshot was supplied, or no per-run isolation nonce was supplied) and this lens is classified mutating, so it is never run against the shared checkout',
     )
   }
 
   const cut = await cutIsolationWorktree(id, isoPath)
   if (!cut.ok) {
-    // The cut may have half-happened — a registered worktree, a partial
-    // checkout — so the cleanup runs even when the cut reports failure.
-    await releaseIsolationWorktree(id, isoPath)
+    // A pre-existing path belongs to someone else; releasing it would turn a
+    // fail-closed collision into deletion. Only clean up a partial worktree
+    // the cut task explicitly says this invocation created.
+    if (cut.created) await releaseIsolationWorktree(id, isoPath)
     return notDispatched(`the isolation worktree at ${isoPath} could not be cut${cut.detail ? `: ${cut.detail}` : ''}`)
   }
   // Said out loud because it is a second checkout of the repository on the
   // user's disk and two extra dispatches in the run, both of which are
   // otherwise unexplained.
-  log(`lens ${id} (${lens.key}) runs isolated in ${isoPath} — a throwaway worktree at ${ROLLBACK_SHA.slice(0, 12)}, removed when it returns`)
+  log(`lens ${id} (${lens.key}) runs isolated in ${isoPath} — a throwaway worktree at ${REVIEW_SHA.slice(0, 12)}, removed when it returns`)
 
   try {
     return await runLensIn(id, isoPath)

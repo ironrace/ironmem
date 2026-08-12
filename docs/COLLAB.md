@@ -938,16 +938,19 @@ branch to a human as a PR) resumable, just to save re-running one command,
 is a bad trade. It is also structurally different from the six recoverable
 prefixes above, each of which names an operation either agent's own turn
 might perform and so always has a live counterpart on the other side to
-hand off to. PR creation isn't one of those: it is Claude-worker-only by
-design. The Claude-side submit worker (`collab-turn-submit.md`) is the one
-that runs `gh pr create`, even when `$SENDER == "codex"` — Codex's own
-final-review and batch-implementation prompts
+hand off to. In normal flow, PR creation isn't one of those: the Claude-side
+submit worker (`collab-turn-submit.md`) is the one that runs `gh pr create`,
+even when `$SENDER == "codex"` — Codex's ordinary final-review and
+batch-implementation prompts
 (`.codex-plugin/prompts/collab-final-review.md`,
 `.codex-plugin/prompts/collab-batch-impl.md`) explicitly forbid Codex from
-calling `gh pr create`, `gh pr list`, or any pull-request remote check.
-There is no scenario where Codex's own turn fails at PR creation and hands a
-Tooling-classified report back to Claude, because Codex never attempts PR
-creation in the first place.
+calling `gh pr create`, `gh pr list`, or any pull-request remote check. The
+delegated-completion recovery override is the narrow exception: when Codex
+owns recovery for `CodeReviewFinalPending`, it opens the PR directly and a
+real network or sandbox failure is reported with the corresponding recoverable
+`network_failed:` or `sandbox_denied:` prefix. That exception does not make
+`pr_create_failed:` recoverable: it remains the Terminal classification for
+the normal submit-worker failure described here.
 
 **Incident context.** The motivating incident (session `06667e54`: 29 green,
 reviewed, pushed commits apparently stranded by a `pr_create_failed:`

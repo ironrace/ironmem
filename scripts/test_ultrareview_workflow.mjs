@@ -66,7 +66,9 @@ async function run(args, agentImpl) {
       // would come back "not dispatched" in tests that are about something
       // else. A test that wants the failure path returns `{ ok: false }`
       // itself, and that answer is passed through untouched.
-      .then((v) => (isIsolationCall(opts) && !(v && typeof v.ok === 'boolean') ? { ok: true, detail: '' } : v))
+      .then((v) => (isIsolationCall(opts) && !(v && typeof v.ok === 'boolean')
+        ? { ok: true, created: opts.label.endsWith(' cut'), detail: '' }
+        : v))
   }
   const out = await make()(args, {}, agent, parallel, pipeline, (m) => logs.push(m), () => {}, () => {})
   return { out, logs, calls }
@@ -78,10 +80,11 @@ const delay = (ms) => new Promise((r) => setTimeout(r, ms))
 // empty `rollbackSha` degrades the printed recovery command to
 // `git checkout -- .` — which restores nothing and discards the working tree.
 const SHA = '0123456789abcdef0123456789abcdef01234567'
+const ISOLATION_NONCE = 'test-run'
 const baseArgs = {
   mode: 'local', title: 't', repoPath: '/r', diffRange: 'HEAD', reviewInput: 'diff',
   expandCmd: '', context: '', files: ['a.rs', 'b.rs'], changedLines: 50, lenses: ['A', 'B'],
-  rollbackSha: SHA, fable: false, reportOnly: false,
+  rollbackSha: SHA, isolationNonce: ISOLATION_NONCE, fable: false, reportOnly: false,
   toolkitAvailable: true, perfAgentAvailable: true, marketingAgentType: '',
 }
 const noFindings = (b, o) =>
@@ -1691,9 +1694,9 @@ for (const verdict of ['PLAUSIBLE', 'REFUTED', 'UNVERIFIED', 'N/A', '']) {
     reportOnly: true,
     expandCmd: 'ironmem review-diff --repo /r --worktree --expand-file <path> --hunk <ordinal>',
   }
-  // `<repo>-ultrareview-<lens>-<sha12>`: a sibling of the checkout, never a path
+  // `<repo>-ultrareview-<lens>-<sha12>-<nonce>`: a sibling of the checkout, never a path
   // inside it, and pinned at the anchor rather than at a ref.
-  const WT_G = `/r-ultrareview-g-${SHA.slice(0, 12)}`
+  const WT_G = `/r-ultrareview-g-${SHA.slice(0, 12)}-${ISOLATION_NONCE}`
   const { calls } = await run(isoArgs, noFindings)
   const labelled = (l) => calls.find((c) => c.opts.label === l)
   const g = calls.find((c) => c.opts.label.startsWith('find:G '))
@@ -1734,7 +1737,7 @@ for (const verdict of ['PLAUSIBLE', 'REFUTED', 'UNVERIFIED', 'N/A', '']) {
   check('cleanup runs on the failure path too', () => assert.ok(releaseOnFailure))
   check('cleanup on the failure path still prunes, removes, and names only the throwaway', () => {
     const rel = releaseOnFailure.brief
-    const wt = `/r-ultrareview-g-${SHA.slice(0, 12)}`
+    const wt = `/r-ultrareview-g-${SHA.slice(0, 12)}-${ISOLATION_NONCE}`
     assert.ok(rel.includes(`git -C ${wt} worktree prune`))
     assert.ok(rel.includes(`git -C ${wt} worktree remove --force ${wt}`))
     assert.ok(namesOnlyIsolationPath(rel, wt, '/r'))
@@ -1753,15 +1756,15 @@ for (const verdict of ['PLAUSIBLE', 'REFUTED', 'UNVERIFIED', 'N/A', '']) {
 // shared-checkout-safety assertion is not vacuous — it actually fails against
 // a source that regresses to naming the shared checkout in cleanup.
 {
-  const WT_G = `/r-ultrareview-g-${SHA.slice(0, 12)}`
-  const WT_K = `/r-ultrareview-k-${SHA.slice(0, 12)}`
+  const WT_G = `/r-ultrareview-g-${SHA.slice(0, 12)}-${ISOLATION_NONCE}`
+  const WT_K = `/r-ultrareview-k-${SHA.slice(0, 12)}-${ISOLATION_NONCE}`
   const isoArgs = { ...baseArgs, changedLines: 1000, lenses: ['A'], reportOnly: true }
 
   // ---- cut fails: the lens is never dispatched, cleanup still runs, and the
   // failure is coverage-affecting, not a silent zero.
   {
     const impl = (b, o) => {
-      if (o.label === 'isolate:G cut') return { ok: false, detail: 'fatal: not a git repository' }
+      if (o.label === 'isolate:G cut') return { ok: false, created: true, detail: 'fatal: not a git repository' }
       return noFindings(b, o)
     }
     const { out, calls, logs } = await run(isoArgs, impl)
@@ -1778,6 +1781,18 @@ for (const verdict of ['PLAUSIBLE', 'REFUTED', 'UNVERIFIED', 'N/A', '']) {
     })
     check('the reason reaches the log too, naming the lens and the actual error', () =>
       assert.ok(logs.some((l) => l.includes('lens G') && l.includes('not a git repository'))))
+  }
+
+  // A collision is reported by the cut task before it creates anything. Its
+  // failure must never trigger cleanup against the pre-existing path.
+  {
+    const impl = (b, o) => {
+      if (o.label === 'isolate:G cut') return { ok: false, created: false, detail: 'path already exists' }
+      return noFindings(b, o)
+    }
+    const { calls } = await run(isoArgs, impl)
+    check('a preexisting-path cut failure is not cleaned up by this run', () =>
+      assert.ok(!calls.some((c) => c.opts.label === 'isolate:G release')))
   }
 
   // ---- local mode retargets the isolated lens's range and expand command,
@@ -1844,18 +1859,38 @@ for (const verdict of ['PLAUSIBLE', 'REFUTED', 'UNVERIFIED', 'N/A', '']) {
   // unchanged (it resolves there — a linked worktree shares the object
   // store), only `--repo` is retargeted.
   {
+    const PR_SHA = 'fedcba9876543210fedcba9876543210fedcba98'
+    const PR_WT_G = `/r-ultrareview-g-${PR_SHA.slice(0, 12)}-${ISOLATION_NONCE}`
     const prArgs = {
       ...isoArgs,
       mode: 'pr',
+      reviewSha: PR_SHA,
       diffRange: 'main...feat',
       expandCmd: 'ironmem review-diff --repo /r --base main --head feat --expand-file <path> --hunk <ordinal>',
     }
     const { calls } = await run(prArgs, noFindings)
     const g = calls.find((c) => c.opts.label.startsWith('find:G '))
     check('PR mode keeps base/head and retargets only --repo', () =>
-      assert.ok(g.brief.includes(`ironmem review-diff --repo ${WT_G} --base main --head feat`)))
+      assert.ok(g.brief.includes(`ironmem review-diff --repo ${PR_WT_G} --base main --head feat`)))
     check('PR mode keeps the caller diff range, not the local-mode snapshot range', () =>
       assert.ok(g.brief.includes('Diff range: main...feat')))
+    check('PR mode cuts mutating-lens worktrees at the supplied PR head, not the local rollback anchor', () => {
+      assert.equal(g.opts.cwd, PR_WT_G)
+      assert.ok(calls.find((c) => c.opts.label === 'isolate:G cut').brief.includes(`worktree add --detach ${PR_WT_G} ${PR_SHA}`))
+    })
+  }
+
+  // An isolation path belongs to exactly one workflow invocation. A preexisting
+  // path is a collision (or user data), never an invitation to delete it before
+  // cutting this run's worktree.
+  {
+    const { calls } = await run(isoArgs, noFindings)
+    const cut = calls.find((c) => c.opts.label === 'isolate:G cut').brief
+    check('the cut brief refuses an existing isolation path instead of deleting it', () => {
+      assert.ok(cut.includes('must not already exist'))
+      assert.ok(!cut.includes('rm -rf'))
+      assert.ok(!cut.includes('worktree remove --force'))
+    })
   }
 
   // ---- an expand command that does not carry `--repo <REPO_PATH>` verbatim
@@ -1914,7 +1949,9 @@ for (const verdict of ['PLAUSIBLE', 'REFUTED', 'UNVERIFIED', 'N/A', '']) {
       const calls = []
       const agent = (brief, opts) => {
         calls.push({ brief, opts })
-        return Promise.resolve().then(() => (isIsolationCall(opts) ? { ok: true, detail: '' } : noFindings(brief, opts)))
+        return Promise.resolve().then(() => (isIsolationCall(opts)
+          ? { ok: true, created: opts.label.endsWith(' cut'), detail: '' }
+          : noFindings(brief, opts)))
       }
       await patchedMake(isoArgs, {}, agent, parallel, pipeline, () => {}, () => {}, () => {})
       rel = calls.find((c) => c.opts.label === 'isolate:G release')?.brief ?? null

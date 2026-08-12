@@ -274,7 +274,7 @@ pre-fix state. On a dirty tree it is not, and there is no safe anchor:
 
 ### What the anchor is for
 
-The SHA is passed to the workflow as `rollbackSha` and does four jobs:
+The SHA is passed to the workflow as `rollbackSha` and does three jobs:
 
 1. It scopes the scope-creep audit — `git diff <sha> -- .` is the fix diff, with
    the one exception below.
@@ -282,13 +282,18 @@ The SHA is passed to the workflow as `rollbackSha` and does four jobs:
    that applied zero fixes. A rollback line the user has to go looking for is
    not a rollback line.
 3. Recovery is `git checkout <sha> -- .`, with the one limit below.
-4. It is the commit the workflow cuts each Find-phase isolation worktree at —
-   see the isolation bullet under "What the workflow guarantees". This is the
-   one job that needs the anchor to be an **immutable object naming the
-   reviewed tree** rather than merely a restore point: a worktree cut at a ref
-   would move under the review, and one cut at `HEAD` would not contain the
-   uncommitted work being reviewed at all. Anything that changes how this SHA is
-   minted changes what those lenses read.
+
+For each workflow invocation, also generate an isolation nonce:
+
+```bash
+ISOLATION_NONCE="$(uuidgen | tr -d '-')"
+```
+
+In Local Mode, pass `rollbackSha` again as `reviewSha`: it is the immutable
+snapshot the Find-phase worktrees must inspect. In PR Mode, pass `headRefOid`
+as `reviewSha` instead. This distinction is load-bearing when the local checkout
+does not equal the PR head: isolated Find-phase lenses must inspect the PR
+commit, never a rollback snapshot of unrelated local files.
 
 **Four gaps in `git`'s own behaviour that the report must state, not paper over.
 Each one is a way the printed recovery line under-delivers or over-reaches, and
@@ -426,6 +431,8 @@ Call `Workflow` with `{ scriptPath: <resolved>, args: { … } }`:
 | `changedLines` | number | additions + deletions |
 | `lenses` | string[] | the triggered lens ids from Trigger detection |
 | `rollbackSha` | string | the Phase 2.5 anchor |
+| `reviewSha` | string | Local Mode: `rollbackSha`; PR Mode: the resolved `headRefOid` |
+| `isolationNonce` | string | freshly generated `ISOLATION_NONCE` for this one Workflow invocation |
 | `fable` | boolean | `--fable` present |
 | `reportOnly` | boolean | `--report-only` present, **or** forced `true` by the PR-head mismatch (Phase 1) or a missing rollback anchor on a dirty tree (Phase 2.5). Whenever it is forced, say so in the report. |
 | `toolkitAvailable` | boolean | capability probe |
@@ -464,11 +471,12 @@ never enters a reviewer prompt and it never enters `args`.
   `ultrareview.js`.** Whether a given lens runs commands that write is declared
   there and nowhere else — do not restate that list here, in a prompt, or in a
   brief. Where the entry says so, the workflow cuts a throwaway worktree at
-  `rollbackSha`, points that lens's working directory, diff range and
+  `reviewSha`, points that lens's working directory, diff range and
   `review-diff --repo` at it, waits, and removes **and** prunes it on both the
   success and the failure path. Where it does not, the lens reads this checkout
   directly and no worktree is cut. Three consequences for this command: the
-  anchor is load-bearing beyond rollback (Phase 2.5); a lens whose worktree
+  PR head is load-bearing for PR Mode, and the Local Mode anchor is
+  load-bearing beyond rollback (Phase 2.5); a lens whose worktree
   cannot be cut is reported as an **errored** lens — never quietly re-run
   against the shared tree — so `coverageComplete` goes false and the Phase 6
   precondition applies; and a cut worktree is a **fresh checkout carrying no

@@ -2135,6 +2135,40 @@ mod tests {
     }
 
     #[test]
+    fn with_transaction_once_propagates_busy_snapshot_without_replay() {
+        // The non-retryable escape hatch must preserve its defining promise:
+        // even a genuine SQLITE_BUSY_SNAPSHOT invokes an FnOnce closure once,
+        // returns that error unchanged, and rolls back its attempted write.
+        let (_dir, db, contender) = retry_harness();
+        let attempts = std::cell::Cell::new(0usize);
+
+        let result: Result<(), _> = db.with_transaction_once(|tx| {
+            attempts.set(attempts.get() + 1);
+            let _count: i64 =
+                tx.query_row("SELECT COUNT(*) FROM retry_probe", [], |row| row.get(0))?;
+            contender.execute("INSERT INTO retry_probe (v) VALUES (1)", [])?;
+            tx.execute("INSERT INTO retry_probe (v) VALUES (100)", [])?;
+            Ok(())
+        });
+
+        let error = result.expect_err("the stale snapshot must propagate without retry");
+        assert!(
+            is_busy_snapshot_error(&error),
+            "the original busy-snapshot error must propagate, got {error:?}"
+        );
+        assert_eq!(attempts.get(), 1, "FnOnce closure must run exactly once");
+        let committed: i64 = db
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM retry_probe WHERE v = 100",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(committed, 0, "the failed one-shot attempt must roll back");
+    }
+
+    #[test]
     fn with_transaction_retry_never_retries_semantic_error() {
         // (iii) Negative: a semantic error is not a busy snapshot — the
         // closure must run exactly once and the error must propagate
