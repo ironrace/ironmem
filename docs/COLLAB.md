@@ -947,9 +947,7 @@ final-review and batch-implementation prompts
 calling `gh pr create`, `gh pr list`, or any pull-request remote check.
 There is no scenario where Codex's own turn fails at PR creation and hands a
 Tooling-classified report back to Claude, because Codex never attempts PR
-creation in the first place. The asymmetry is simply that Claude is the
-only agent that ever runs this command, so a failure at it has no
-counterpart process to hand a retry to.
+creation in the first place.
 
 **Incident context.** The motivating incident (session `06667e54`: 29 green,
 reviewed, pushed commits apparently stranded by a `pr_create_failed:`
@@ -977,11 +975,14 @@ hand, not a protocol action:
 2. Confirm the branch is what the session left behind:
    `git rev-parse <branch>` (or `HEAD` after checking it out) must equal
    `last_head_sha`.
-3. Open the PR by hand, against the same integration branch
-   `collab-turn-submit.md` resolves for `final_review`:
-   ```
-   gh pr create --base <integration-branch> --head <branch> \
-     --title <title> --body <body>
+3. Open the PR by hand, against the repository's default branch — the same
+   resolution `collab-turn-submit.md` runs for `final_review`
+   (`git symbolic-ref refs/remotes/origin/HEAD`, else the first of
+   `origin/main`/`origin/master`/`origin/trunk` that exists). In this repo
+   that is `main`, so the command is:
+   ```bash
+   gh pr create --base main --head "<branch>" \
+     --title "<title>" --body "<body>"
    ```
    using the title/body the failed turn was trying to send — recoverable
    from the staged drawer named by that turn's `$ARTIFACT_REF` via

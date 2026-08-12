@@ -667,6 +667,12 @@ errors: list[str] = []
 COLLAB_RS = ROOT / "crates" / "ironmem" / "src" / "collab" / "mod.rs"
 RUST_PREFIX_RE = re.compile(
     r'pub const [A-Z0-9_]+_PREFIX: &str = "([a-z0-9_]+:)";')
+# Anchor text for the docs/COLLAB.md heading the `pr_create_failed:` comment
+# below points at. Defined once so `check_pr_create_failed_doc_pointer_contract`
+# can pin BOTH sides of that pointer — this file's comment and the doc
+# heading — against the same string, instead of only pinning the doc side and
+# trusting the comment's prose to stay in sync by hand.
+PR_CREATE_FAILED_DOC_HEADING = "`pr_create_failed:` stays Terminal"
 # Prefixes the surfaces may legitimately use that are deliberately absent from
 # the Rust constants: `classify()` maps every unrecognized string to
 # `FailureClass::Terminal`, and these two are documented terminal failures. Any
@@ -685,7 +691,9 @@ RUST_PREFIX_RE = re.compile(
 # Claude-worker-only (Codex never calls `gh pr create`, even when it owns the
 # turn), so a failure here has no live counterpart to hand a retry to — see
 # "`pr_create_failed:` stays Terminal" in docs/COLLAB.md for the full
-# rationale and manual recovery steps.
+# rationale and manual recovery steps. (That quoted phrase must stay
+# byte-identical to PR_CREATE_FAILED_DOC_HEADING above —
+# check_pr_create_failed_doc_pointer_contract pins both against it.)
 DOCUMENTED_TERMINAL_PREFIXES = {
     "subagent_failure:",
     "gate_failure:",
@@ -1882,19 +1890,49 @@ def check_pr_base_resolution_contract() -> None:
 
 
 def check_pr_create_failed_doc_pointer_contract() -> None:
-    """The shrunk `pr_create_failed:` comment must still resolve.
+    """The shrunk `pr_create_failed:` comment must still resolve, both ways.
 
     `check_collab_turn_templates.py`'s `DOCUMENTED_TERMINAL_PREFIXES` comment
     deliberately doesn't restate why `pr_create_failed:` stays Terminal — it
     points at a heading in docs/COLLAB.md instead, so the rationale lives in
-    exactly one place. That pointer is only load-bearing if the heading it
-    names actually exists; pin it so a doc reorganization that drops or
-    renames the heading fails here instead of leaving a dead pointer.
+    exactly one place. A pointer like that can break from either end:
+    docs/COLLAB.md could drop or rename the heading, or this file's comment
+    could drift to naming a different string. Pinning only the doc side
+    would miss the second case entirely — a comment edited to reference a
+    stale heading would still pass. Both sides are checked here against the
+    single `PR_CREATE_FAILED_DOC_HEADING` constant, so a mismatch on either
+    end fails loudly instead of leaving a dead pointer.
     """
+    # This file's own pointer comment sits immediately above
+    # `DOCUMENTED_TERMINAL_PREFIXES = {`. Read this script's actual source
+    # (not `ROOT`-relative — the checker's own location is fixed regardless
+    # of `COLLAB_LINT_ROOT`) and confirm the comment window still quotes the
+    # anchor byte-identically.
+    self_text = pathlib.Path(__file__).resolve().read_text()
+    anchor_def = 'PR_CREATE_FAILED_DOC_HEADING = "'
+    prefixes_def = "DOCUMENTED_TERMINAL_PREFIXES = {"
+    anchor_idx = self_text.find(anchor_def)
+    prefixes_idx = self_text.find(prefixes_def)
+    if anchor_idx == -1 or prefixes_idx == -1 or prefixes_idx <= anchor_idx:
+        err("scripts/check_collab_turn_templates.py: could not locate the "
+            "PR_CREATE_FAILED_DOC_HEADING constant and the "
+            "DOCUMENTED_TERMINAL_PREFIXES comment above it to cross-check")
+        return
+    comment_window = self_text[anchor_idx:prefixes_idx]
+    if comment_window.count(PR_CREATE_FAILED_DOC_HEADING) < 2:
+        err("scripts/check_collab_turn_templates.py: the "
+            "DOCUMENTED_TERMINAL_PREFIXES pointer comment no longer quotes "
+            f"{PR_CREATE_FAILED_DOC_HEADING!r} byte-identically — the "
+            "comment and PR_CREATE_FAILED_DOC_HEADING have drifted apart")
+
+    # docs/COLLAB.md side: the anchor must appear as the literal `####`
+    # heading, not merely as a passing mention in prose elsewhere in the
+    # file — a reorg that folds the section into inline prose should fail
+    # this, not pass it.
     doc_text = DOC.read_text()
-    if "`pr_create_failed:` stays Terminal" not in doc_text:
-        err("docs/COLLAB.md: missing the `pr_create_failed:` stays Terminal "
-            "heading that scripts/check_collab_turn_templates.py's "
+    if f"#### {PR_CREATE_FAILED_DOC_HEADING}" not in doc_text:
+        err(f"docs/COLLAB.md: missing the {PR_CREATE_FAILED_DOC_HEADING!r} "
+            "`####` heading that scripts/check_collab_turn_templates.py's "
             "DOCUMENTED_TERMINAL_PREFIXES comment points at")
 
 
