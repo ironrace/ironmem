@@ -317,6 +317,64 @@ fn review_diff_ignores_inherited_git_repository_and_config_overrides() {
     assert!(!expanded.contains("hostile"));
 }
 
+#[test]
+fn range_diff_over_the_shared_checkout_is_blind_to_a_dirty_second_worktree() {
+    // The #249 incident in test form: a read-only reviewer treated a mutating
+    // lens's leftovers in a shared checkout as canonical, and reported a
+    // finding that did not exist in the code under review. Task 12 gives
+    // every mutating lens its own throwaway worktree cut from the same
+    // repository instead of writing into the shared checkout; this pins that
+    // the isolation actually holds at the review_diff layer — an uncommitted
+    // change accumulated in a SEPARATE worktree must never appear in a
+    // `Range` diff of the canonical range read from the shared checkout,
+    // which is exactly what a read-only lens reads while a mutating lens runs
+    // concurrently in its own worktree.
+    let fixture = fixture();
+    let worktree_root = tempfile::tempdir().expect("worktree parent");
+    let worktree_path = worktree_root.path().join("mutating-lens-worktree");
+    git(
+        fixture.tempdir.path(),
+        [
+            "worktree",
+            "add",
+            "--detach",
+            worktree_path.to_str().expect("worktree path is utf8"),
+            &fixture.head,
+        ],
+    );
+
+    // Accumulate a contaminating, uncommitted change in the second worktree —
+    // both a tracked-file edit and an untracked leftover, exactly what a
+    // mutating lens's test run or build would leave behind.
+    let contaminant = "CONTAMINATION_FROM_A_MUTATING_LENS_LEFTOVER";
+    std::fs::write(worktree_path.join("alpha.txt"), format!("{contaminant}\n"))
+        .expect("write contaminating change in the second worktree");
+    std::fs::write(
+        worktree_path.join("untracked-leftover.txt"),
+        format!("{contaminant}\n"),
+    )
+    .expect("write untracked leftover in the second worktree");
+
+    // Read the canonical range from the SHARED checkout — the tree a
+    // read-only reviewer is looking at while the mutating lens runs isolated
+    // in its own worktree above.
+    let request = fixture.request();
+    let expanded = expand_review_diff(&request, "alpha.txt", None)
+        .expect("shared-checkout expansion should succeed");
+    assert!(
+        !expanded.contains(contaminant),
+        "a canonical-range diff of the shared checkout must not see a dirty \
+         change made in a separate worktree: {expanded}"
+    );
+
+    let source = fixture.source();
+    assert!(
+        !source.contains(contaminant),
+        "the raw source diff of the canonical range must not see the \
+         separate worktree's dirty change either: {source}"
+    );
+}
+
 #[cfg(feature = "headroom-compression")]
 #[test]
 fn artifact_expansion_uses_the_immutable_worktree_snapshot() {
