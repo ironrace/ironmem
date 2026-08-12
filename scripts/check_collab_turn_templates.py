@@ -691,9 +691,13 @@ PR_CREATE_FAILED_DOC_HEADING = "`pr_create_failed:` stays Terminal"
 #   mechanical_direct_gate_failed: the same, on Codex's mechanical_direct path
 #   skill_overran_pr_boundary:     a sub-skill opened a PR outside the protocol
 #   pr_create_failed:              `gh pr create` failed on Claude's final turn
-# `pr_create_failed:` stays Terminal deliberately: PR creation is
-# Claude-worker-only (Codex never calls `gh pr create`, even when it owns the
-# turn), so a failure here has no live counterpart to hand a retry to — see
+# `pr_create_failed:` stays Terminal deliberately: in normal flow PR creation
+# is Claude-worker-only, so a failure here has no live counterpart to hand a
+# retry to. Codex opens the PR itself only under the delegated-completion
+# recovery override (`.codex-plugin/prompts/collab-recovery.md`,
+# `CodeReviewFinalPending`), and there it reports the recoverable
+# `network_failed:`/`sandbox_denied:` prefix rather than this one — so that
+# exception does not give this prefix a live counterpart either. See
 # "`pr_create_failed:` stays Terminal" in docs/COLLAB.md for the full
 # rationale and manual recovery steps. (That quoted phrase must stay
 # byte-identical to PR_CREATE_FAILED_DOC_HEADING above —

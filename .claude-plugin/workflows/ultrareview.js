@@ -84,7 +84,19 @@ const REPO_PATH = shellSafe(A.repoPath)
 // test and the scope audit, and would be deleted from inside the tree a lens is
 // reading. Anything that is not a rooted path with something after the root
 // yields '' and switches isolation off rather than guessing.
-const REPO_ROOT = /^\/.+/.test(REPO_PATH) ? REPO_PATH.replace(/\/+$/, '') : ''
+//
+// A `.` or `..` segment is rejected for the same reason rather than normalised:
+// `/repo/.` survives `shellSafe` and the absoluteness test, but appending the
+// suffix to it yields `/repo/.-ultrareview-…`, which is again a path INSIDE the
+// checkout. This script has no filesystem, so it cannot resolve such a path —
+// refusing it switches isolation off, which is the fail-closed direction.
+// Whether the path is the checkout's TOP LEVEL — the other half of the sibling
+// invariant, and one that only the filesystem can answer — is enforced as a
+// precondition in the cut brief instead.
+const REPO_ROOT =
+  /^\/.+/.test(REPO_PATH) && !REPO_PATH.split('/').some((seg) => seg === '.' || seg === '..')
+    ? REPO_PATH.replace(/\/+$/, '')
+    : ''
 const DIFF_RANGE = shellSafe(A.diffRange)
 // `local` (uncommitted changes on HEAD) vs `pr` (a base...head range). It
 // decides what the reviewed change is called INSIDE an isolation worktree: in
@@ -355,7 +367,11 @@ const FIX_SCHEMA = {
 
 // Cut and cleanup dispatches (see "find-phase isolation"). `created` is used
 // only for a cut: it distinguishes a partial creation this run may clean up
-// from a pre-existing path this run must leave untouched.
+// from a pre-existing path this run must leave untouched. It is deliberately
+// NOT required — the cleanup dispatch shares this schema and has no use for it,
+// and on a cut an ABSENT `created` is meaningful in its own right: it means the
+// answer never came back (the dispatch itself failed), which is neither "we
+// made it" nor "we did not" and is handled as its own case.
 const ISOLATION_SCHEMA = {
   type: 'object',
   required: ['ok', 'detail'],
@@ -647,11 +663,13 @@ function isolationCutBrief(isoPath) {
   return [
     'Setup task, not a review. Run the commands below in a shell and report what happened. Do not review anything, do not read source, do not edit any file.',
     '',
+    `${REPO_ROOT} must be the TOP LEVEL of its checkout. ${isoPath} is built by appending a suffix to it, so if ${REPO_ROOT} were a subdirectory the worktree would land INSIDE the tree under review. Check it first, and if it does not print ${REPO_ROOT} exactly, report ok: false, created: false and stop:`,
+    `  test "$(git -C ${REPO_ROOT} rev-parse --show-toplevel)" = "${REPO_ROOT}"`,
+    '',
     `${isoPath} must not already exist. If it does, report ok: false, created: false and stop: it belongs to another run or is user data. Do not run rm, git worktree remove, or any cleanup command on it.`,
     `  test ! -e ${isoPath}`,
     '',
-    'Then, in this order:',
-    `  git -C ${REPO_ROOT} worktree prune`,
+    'Then:',
     `  git -C ${REPO_ROOT} worktree add --detach ${isoPath} ${REVIEW_SHA}`,
     '',
     `${REVIEW_SHA} is an object name, not a ref. Do not substitute a branch, a tag or HEAD for it: the point is a tree that cannot move while the review runs.`,
@@ -670,6 +688,13 @@ function isolationCutBrief(isoPath) {
 // this order the pair still leaves nothing behind: `prune` clears bookkeeping
 // left by any earlier run whose directory is already gone, and `remove` deletes
 // this worktree's directory together with its own bookkeeping entry.
+//
+// The `rm -rf` fallback is the one case that CANNOT be made to leave nothing
+// behind here: deleting the directory orphans the bookkeeping entry, and the
+// only place left to prune it from is the shared checkout, which this brief may
+// not name. So that path reports `ok: false` and becomes a reported leak rather
+// than a silent one — the directory is gone but the entry is not, and the entry
+// also keeps the review snapshot commit reachable, so the user has to be told.
 function isolationCleanupBrief(isoPath) {
   return [
     'Cleanup task, not a review. Run the commands below and report what happened. Do not review anything, do not read source, do not edit any file.',
@@ -677,9 +702,9 @@ function isolationCleanupBrief(isoPath) {
     `  git -C ${isoPath} worktree prune`,
     `  git -C ${isoPath} worktree remove --force ${isoPath}`,
     '',
-    `If ${isoPath} still exists after that, delete the directory with \`rm -rf ${isoPath}\` and say so in detail.`,
+    `If ${isoPath} still exists after that, delete the directory with \`rm -rf ${isoPath}\` and report ok: false with "removed by rm -rf; stale worktree bookkeeping entry left behind" in detail. The directory is gone but its registration is not, and pruning that from the other checkout is not yours to do.`,
     `Every command names ${isoPath} and nothing else. Do not substitute another path, do not run these or any other command in a different checkout of this repository, and never run \`git reset\`, \`git checkout\`, \`git clean\` or \`rm\` outside ${isoPath}. A review is reading that other checkout while you work.`,
-    `Report ok: true only if ${isoPath} no longer exists.`,
+    `Report ok: true only if \`git -C ${isoPath} worktree remove --force ${isoPath}\` is what removed it and ${isoPath} no longer exists.`,
   ].join('\n')
 }
 
@@ -688,6 +713,14 @@ function isolationCleanupBrief(isoPath) {
 // bookkeeping entry inside it, and the command is forbidden to re-derive state
 // from log lines.
 const ISOLATION_LEAKS = []
+
+// Paths whose very existence is unknown: the cut dispatch never came back with
+// an answer, so this run may or may not have created a worktree there. Kept
+// SEPARATE from ISOLATION_LEAKS because the remedy differs and getting it wrong
+// is destructive: a leak is known to be ours and is safe to force-remove, while
+// a path in this list may equally be another run's worktree or user data that
+// was already there. The report must say "inspect", never "remove".
+const ISOLATION_UNKNOWN = []
 
 // `ok` is required to be the literal `true`, like every other consent-shaped
 // value in this file: a cut that returns a string, a number, or a findings
@@ -702,11 +735,13 @@ async function cutIsolationWorktree(id, isoPath) {
     effort: ISOLATION_TIER.effort,
     schema: ISOLATION_SCHEMA,
   }).catch((e) => ({ ok: false, detail: (e && e.message) || 'isolation cut dispatch failed' }))
-  return {
-    ok: !!(res && res.ok === true),
-    created: !!(res && res.created === true),
-    detail: asData((res && res.detail) || '').slice(0, 160),
-  }
+  const ok = !!(res && res.ok === true)
+  // Three states, not two. `true`/`false` are the cut task's own answer; `null`
+  // is "no answer" — the dispatch threw, or returned a shape without the field.
+  // A successful cut is `true` by construction: the brief only permits ok: true
+  // together with created: true.
+  const created = ok ? true : res && typeof res.created === 'boolean' ? res.created : null
+  return { ok, created, detail: asData((res && res.detail) || '').slice(0, 160) }
 }
 
 // Never throws and never rejects. It is called from a `finally`, where a throw
@@ -765,8 +800,18 @@ async function runLens(id) {
   if (!cut.ok) {
     // A pre-existing path belongs to someone else; releasing it would turn a
     // fail-closed collision into deletion. Only clean up a partial worktree
-    // the cut task explicitly says this invocation created.
-    if (cut.created) await releaseIsolationWorktree(id, isoPath)
+    // the cut task explicitly says this invocation created. When it could not
+    // say (created === null), deleting is not an option either — but staying
+    // silent would strand a possible second checkout of the repository that no
+    // later run can reclaim, because the next run's path carries a new nonce.
+    if (cut.created === true) {
+      await releaseIsolationWorktree(id, isoPath)
+    } else if (cut.created === null) {
+      ISOLATION_UNKNOWN.push(isoPath)
+      log(
+        `isolation cut for lens ${id} gave no answer — ${isoPath} may or may not exist and is NOT this run's to delete; inspect it before removing anything`,
+      )
+    }
     return notDispatched(`the isolation worktree at ${isoPath} could not be cut${cut.detail ? `: ${cut.detail}` : ''}`)
   }
   // Said out loud because it is a second checkout of the repository on the
@@ -1801,6 +1846,10 @@ return {
   // worktree bookkeeping — harmless to the verdict, invisible without this
   // field, and trivially cleared once named.
   isolationLeaks: ISOLATION_LEAKS,
+  // Paths this run may have created and cannot verify either way. Separate from
+  // isolationLeaks because the remedy is "look", not "delete": the same path
+  // could be another live review's worktree.
+  isolationUnknown: ISOLATION_UNKNOWN,
   rollbackSha: ROLLBACK_SHA,
   // False means the report must not print a `git checkout <sha> -- .` line at
   // all: with an empty sha that command becomes `git checkout -- .`, which

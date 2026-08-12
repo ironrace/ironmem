@@ -1855,6 +1855,59 @@ for (const verdict of ['PLAUSIBLE', 'REFUTED', 'UNVERIFIED', 'N/A', '']) {
       assert.ok(calls.some((c) => c.opts.label.startsWith('find:A '))))
   }
 
+  // ---- the OTHER two halves of the same fail-closed guard. Without these the
+  // nonce and the path-shape check could each be deleted with every check still
+  // green, because every other isolation assertion runs with a well-formed
+  // nonce and a top-level repoPath.
+  for (const [label, patch] of [
+    ['no per-run nonce', { isolationNonce: '' }],
+    ['a repoPath with a dot segment', { repoPath: '/r/.' }],
+    ['a repoPath with a parent segment', { repoPath: '/r/sub/..' }],
+    ['a relative repoPath', { repoPath: 'r' }],
+  ]) {
+    const { out, calls } = await run({ ...isoArgs, ...patch }, noFindings)
+    check(`${label} cuts no worktree`, () =>
+      assert.ok(!calls.some((c) => c.opts.label.startsWith('isolate:'))))
+    check(`${label} means the mutating lenses are not dispatched at all`, () => {
+      assert.ok(!calls.some((c) => c.opts.label.startsWith('find:G ')))
+      assert.ok(!calls.some((c) => c.opts.label.startsWith('find:K ')))
+      assert.ok(out.erroredLenses.includes('G') && out.erroredLenses.includes('K'))
+    })
+    check(`${label} leaves the read-only lenses running`, () =>
+      assert.ok(calls.some((c) => c.opts.label.startsWith('find:A '))))
+  }
+
+  // ---- a cut whose dispatch never answered. `created` is absent, which is
+  // neither "we made it" nor "we did not": nothing may be deleted, but the path
+  // must still be surfaced, and NOT as a leak (whose remedy is force-removal).
+  {
+    const impl = (b, o) => {
+      if (o.label === 'isolate:G cut') return { ok: false, detail: 'dispatch failed' }
+      return noFindings(b, o)
+    }
+    const { out, calls } = await run(isoArgs, impl)
+    check('an unanswered cut deletes nothing', () =>
+      assert.ok(!calls.some((c) => c.opts.label === 'isolate:G release')))
+    check('an unanswered cut is reported as unknown, by exact path', () =>
+      assert.deepEqual(out.isolationUnknown, [WT_G]))
+    check('an unanswered cut is not reported as a leak', () =>
+      assert.ok(!out.isolationLeaks.includes(WT_G)))
+  }
+
+  // ---- a collision reports created: false explicitly, so it is neither
+  // deleted nor reported as something this run left behind.
+  {
+    const impl = (b, o) => {
+      if (o.label === 'isolate:G cut') return { ok: false, created: false, detail: 'path already exists' }
+      return noFindings(b, o)
+    }
+    const { out } = await run(isoArgs, impl)
+    check('a refused pre-existing path is not reported as this run’s residue', () => {
+      assert.ok(!out.isolationLeaks.includes(WT_G))
+      assert.ok(!out.isolationUnknown.includes(WT_G))
+    })
+  }
+
   // ---- PR Mode: the caller's base...head range reaches the worktree
   // unchanged (it resolves there — a linked worktree shares the object
   // store), only `--repo` is retargeted.
@@ -1891,6 +1944,35 @@ for (const verdict of ['PLAUSIBLE', 'REFUTED', 'UNVERIFIED', 'N/A', '']) {
       assert.ok(!cut.includes('rm -rf'))
       assert.ok(!cut.includes('worktree remove --force'))
     })
+    // The sibling-path invariant has a half this script cannot check: whether
+    // repoPath is the checkout's TOP LEVEL. Only the filesystem knows, so the
+    // cut brief has to ask — otherwise a subdirectory repoPath silently puts
+    // the worktree inside the tree under review.
+    check('the cut brief makes the top-level check a precondition', () => {
+      assert.ok(cut.includes('rev-parse --show-toplevel'))
+      assert.ok(cut.includes('TOP LEVEL'))
+    })
+    // `prune` in the SHARED checkout is unbounded: with no --expire it deletes
+    // the bookkeeping of any worktree whose directory is merely absent right
+    // now (an unmounted volume, a directory moved aside). The nonce means no
+    // stale entry for this run's own path can exist, so it bought nothing.
+    check('the cut brief never prunes the shared checkout', () =>
+      assert.ok(!cut.includes('worktree prune')))
+  }
+
+  // ---- the rm -rf fallback orphans the bookkeeping entry, and the only place
+  // to prune it from is the shared checkout, which cleanup may not name. So it
+  // must report a leak rather than a clean removal.
+  {
+    const { calls: relCalls } = await run(isoArgs, noFindings)
+    const rel = relCalls.find((c) => c.opts.label === 'isolate:G release').brief
+    check('the cleanup brief reports the rm -rf fallback as a leak, not a success', () => {
+      assert.ok(rel.includes('rm -rf'))
+      assert.ok(/ok: false/.test(rel))
+      assert.ok(/bookkeeping/.test(rel))
+    })
+    check('the cleanup brief still names only the throwaway path', () =>
+      assert.ok(namesOnlyIsolationPath(rel, WT_G, '/r')))
   }
 
   // ---- an expand command that does not carry `--repo <REPO_PATH>` verbatim
