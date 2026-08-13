@@ -10,10 +10,10 @@ is a hard error at plan-parse time — never default to `standard`.
 | `cheap` | `haiku` | `claude-haiku-4-5` | *(unsupported — do not pass)* |
 | `standard` | `sonnet` | `claude-sonnet-5` | `medium` |
 | `deep` | `opus` | `claude-opus-5` | `xhigh` |
-| `frontier` | `fable` | `claude-fable-5` | `high` |
+| `frontier` | `opus` | `claude-opus-5` | `xhigh` |
 
 The **model alias** is the operative value. Subagent dispatch takes
-`model: haiku|sonnet|opus|fable`, not a full API id; the API id column is for
+`model: haiku|sonnet|opus`, not a full API id; the API id column is for
 traceability only.
 
 ## Effort is not settable on every dispatch path
@@ -31,18 +31,23 @@ was not — the routing dataset is only worth keeping if it is honest.
 **Haiku 4.5 rejects `effort` outright** (HTTP 400). The `cheap` row carries no
 effort value on purpose. Do not synthesize one, on either path.
 
-## When `frontier` returns 400
+## `deep` and `frontier` resolve to the same model
 
-Claude Fable 5 requires 30-day data retention. An organization configured for
-zero data retention gets `400 invalid_request_error` on *every* request,
-regardless of the task. ironmem ships to other users, so treat that 400 as a
-**configuration problem, not a task failure**:
+Both rows are Opus 5 at `xhigh`. The tiers stay distinct as *plan vocabulary* —
+`iron-plan` keeps assigning them, and the reviewer floor keeps reading them —
+but on the Claude lineup they dispatch identically.
 
-1. Say plainly that `frontier` is unavailable under this org's data-retention
-   setting.
-2. Fall back to `deep` and state the substitution.
-3. Continue. Do not report the task as failed, and do not retry `frontier`
-   again in this run.
+Two consequences, both already implied by `../SKILL.md`:
+
+- A `deep` task's `frontier` reviewer is a fresh-context reviewer, not a
+  stronger model. That is the point: independent eyes on the diff. Do not
+  claim a capability step-up in the run record.
+- Escalation out of `deep` has no higher model to reach for, so treat a failing
+  `deep` task the way the skill already treats a failing `frontier` one — stop
+  and ask the human rather than re-running the same model against itself.
+
+Record `tier_used` as the tier the plan named. The model column is what makes
+the routing dataset honest.
 <!-- /harness -->
 
 <!-- harness:codex -->
