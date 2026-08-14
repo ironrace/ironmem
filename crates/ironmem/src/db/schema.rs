@@ -32,11 +32,12 @@ const DRAWER_SUPERSESSION_SQL: &str = include_str!("../../migrations/017_drawer_
 const MCP_RESPONSE_COMPACTION_METRICS_SQL: &str =
     include_str!("../../migrations/018_mcp_response_compaction_metrics.sql");
 const COLLAB_PILOT_SQL: &str = include_str!("../../migrations/019_collab_pilot.sql");
+const COLLAB_CHECKPOINTS_SQL: &str = include_str!("../../migrations/020_collab_checkpoints.sql");
 
 /// Highest schema version a fully-migrated database reports. Bump alongside the
 /// `run_version_gated_migrations` ladder below so `ironmem doctor` can tell a
 /// behind-migration database from an up-to-date one.
-pub const LATEST_SCHEMA_VERSION: i64 = 19;
+pub const LATEST_SCHEMA_VERSION: i64 = 20;
 
 /// Total attempts (first try included) `with_transaction` makes when every
 /// attempt fails with `SQLITE_BUSY_SNAPSHOT`. See the retry-policy section of
@@ -439,6 +440,13 @@ impl Database {
         // omit the field.
         if current_version < 19 {
             self.conn.execute_batch(COLLAB_PILOT_SQL)?;
+        }
+
+        // v20: first-class collab implementation checkpoints (issue #273).
+        // Replaces the `collab-checkpoint:<session_id>` drawer convention with
+        // an enforceable table so `implementation_done` can demand proof.
+        if current_version < 20 {
+            self.conn.execute_batch(COLLAB_CHECKPOINTS_SQL)?;
         }
 
         Ok(())
@@ -870,7 +878,7 @@ mod tests {
         // fully-migrated database reports — doctor compares against it.
         let db = Database::open_in_memory().unwrap();
         assert_eq!(LATEST_SCHEMA_VERSION, db.schema_version().unwrap());
-        assert_eq!(LATEST_SCHEMA_VERSION, 19);
+        assert_eq!(LATEST_SCHEMA_VERSION, 20);
     }
 
     #[test]
@@ -2293,6 +2301,72 @@ mod tests {
             calls.get(),
             1,
             "a non-busy-snapshot error must never trigger a retry"
+        );
+    }
+
+    // ---- Migration 020 (collab_checkpoints table) coverage ----
+
+    #[test]
+    fn migration_020_creates_collab_checkpoints_table() {
+        let db = Database::open_in_memory().unwrap();
+        assert_eq!(schema_version_of(&db), LATEST_SCHEMA_VERSION);
+        assert_eq!(LATEST_SCHEMA_VERSION, 20);
+
+        // The table exists and carries every column the checkpoint contract needs.
+        let columns: Vec<String> = db
+            .conn
+            .prepare("SELECT name FROM pragma_table_info('collab_checkpoints')")
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(0))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+
+        for expected in [
+            "session_id",
+            "task_id",
+            "task_title",
+            "status",
+            "head_sha",
+            "commit_sha",
+            "completed_task_ids",
+            "next_task_id",
+            "gates_result",
+            "gates_sha",
+            "gates_commands",
+            "summary",
+            "attested_by",
+            "acknowledged_divergence",
+            "updated_at",
+        ] {
+            assert!(
+                columns.iter().any(|c| c == expected),
+                "collab_checkpoints is missing column {expected:?}; has {columns:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn migration_020_enforces_one_current_checkpoint_per_session() {
+        let db = Database::open_in_memory().unwrap();
+        db.conn
+            .execute_batch(
+                "INSERT INTO collab_sessions (id, phase, current_owner, repo_path, branch)
+                 VALUES ('s1', 'CodeImplementPending', 'claude', '/repo', 'main');",
+            )
+            .unwrap();
+
+        let insert = "INSERT INTO collab_checkpoints
+            (session_id, status, head_sha, completed_task_ids, attested_by, updated_at)
+            VALUES ('s1', 'started', 'aaa', '', 'implementer', 1)";
+        db.conn.execute(insert, []).unwrap();
+
+        // session_id is the primary key: a second plain INSERT must conflict
+        // rather than accumulate a second 'current' row.
+        let err = db.conn.execute(insert, []).unwrap_err();
+        assert!(
+            err.to_string().contains("UNIQUE"),
+            "expected a UNIQUE violation on the second insert, got: {err}"
         );
     }
 }
