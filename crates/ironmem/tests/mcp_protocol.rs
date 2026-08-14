@@ -60,8 +60,22 @@ impl Drop for CompactResponsesEnvGuard {
     }
 }
 
+/// Run `git`, first scrubbing every inherited `GIT_*` environment variable —
+/// an inherited `GIT_DIR`/`GIT_WORK_TREE` would otherwise make `git` operate
+/// on (or report shas from) a different repo than the fixture at `cwd`,
+/// silently. Same idiom as `review_diff.rs`'s `scrub_git_environment`.
 fn git(args: &[&str], cwd: &Path) -> String {
-    let output = Command::new("git")
+    let mut command = Command::new("git");
+    for (key, _) in std::env::vars_os() {
+        if key
+            .to_string_lossy()
+            .to_ascii_uppercase()
+            .starts_with("GIT_")
+        {
+            command.env_remove(key);
+        }
+    }
+    let output = command
         .args(args)
         .current_dir(cwd)
         .output()
@@ -95,6 +109,11 @@ fn git_repo_fixture() -> (tempfile::TempDir, PathBuf, String, String, String, St
     git(&["init"], &repo_path);
     git(&["config", "user.name", "Ironmem Test"], &repo_path);
     git(&["config", "user.email", "ironmem@example.com"], &repo_path);
+    // Pinned off, not inherited: a developer machine with a working signing
+    // key or a personal hooksPath configured globally masks what is fragile
+    // on a CI runner with neither.
+    git(&["config", "commit.gpgsign", "false"], &repo_path);
+    git(&["config", "core.hooksPath", "/dev/null"], &repo_path);
 
     let base_sha = commit_file(&repo_path, "branch.txt", "base\n", "base commit");
     let head_sha = commit_file(
@@ -4571,7 +4590,6 @@ fn test_shortcut_final_review_ancestry_enforced() {
     assert_eq!(status["phase"], "CodeReviewFinalPending");
     assert_eq!(status["current_owner"], "claude");
     assert_eq!(status["last_head_sha"], descendant_sha);
-    assert_ne!(status["last_head_sha"], json!(drift_sha));
 }
 
 #[test]
@@ -4636,6 +4654,71 @@ fn collab_start_code_review_operational_git_failure_is_not_branch_drift() {
     );
     assert!(blocked.contains("git ancestry validation failed"));
     assert!(!blocked.contains("branch_drift"));
+}
+
+/// A well-formed sha that names no real commit at all — the purest form of
+/// the #273 incident: an agent that never reached any commit, reporting one
+/// anyway. `git merge-base --is-ancestor` exits 128 for this case (not 1,
+/// which is reserved for "resolves, but isn't an ancestor"), so without its
+/// own detection it falls into the generic operational-failure message and
+/// reads as broken tooling — inviting a recoverable `failure_report` that
+/// parks and hands off the turn — rather than naming the caller's own
+/// fabricated report as the defect.
+#[test]
+fn collab_start_code_review_rejects_a_nonexistent_head_sha() {
+    let app = App::open_for_test().unwrap();
+    let (_temp, repo_path, base_sha, head_sha, _descendant_sha, _drift_sha) = git_repo_fixture();
+
+    let started = call_tool(
+        &app,
+        "collab_start_code_review",
+        json!({
+            "repo_path": repo_path,
+            "branch": "feat/review-shortcut-nonexistent-head",
+            "base_sha": base_sha,
+            "head_sha": head_sha,
+            "initiator": "claude",
+            "task": "review completed branch"
+        }),
+    );
+    let session_id = started["session_id"].as_str().unwrap();
+
+    let fabricated = "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef";
+    let blocked = call_tool_expect_error(
+        &app,
+        "collab_send",
+        json!({
+            "session_id": session_id,
+            "sender": "codex",
+            "topic": "review_fix_global",
+            "content": json!({ "head_sha": fabricated }).to_string()
+        }),
+    );
+    assert!(
+        blocked.contains("branch_drift:"),
+        "a fabricated head_sha must still classify as branch_drift, got: {blocked}"
+    );
+    assert!(
+        blocked.contains("does not name a commit that exists"),
+        "expected the nonexistent-commit diagnostic, not the generic operational \
+         failure, got: {blocked}"
+    );
+    assert!(
+        !blocked.contains("git ancestry validation failed"),
+        "a fabricated sha must not be misdiagnosed as an operational git failure, \
+         got: {blocked}"
+    );
+    assert!(
+        blocked.contains(fabricated),
+        "the diagnostic should name the offending sha, got: {blocked}"
+    );
+
+    // Phase must NOT have advanced, and the session's real last_head_sha
+    // (from collab_start_code_review) must be untouched by the refused send.
+    let status = call_tool(&app, "collab_status", json!({ "session_id": session_id }));
+    assert_eq!(status["phase"], "CodeReviewFixGlobalPending");
+    assert_eq!(status["current_owner"], "codex");
+    assert_eq!(status["last_head_sha"], head_sha);
 }
 
 #[test]
@@ -6317,6 +6400,19 @@ fn commit_file_deterministic(
     write_file(&cwd.join(filename), contents);
     git(&["add", filename], cwd);
     let mut command = Command::new("git");
+    // Scrub every inherited `GIT_*` var first — same reason `git()` does —
+    // before setting the specific author/committer ones below. An inherited
+    // `GIT_DIR` would silently redirect this commit (and the determinism
+    // `GATE_HEAD` depends on) to a different repo than `cwd`.
+    for (key, _) in std::env::vars_os() {
+        if key
+            .to_string_lossy()
+            .to_ascii_uppercase()
+            .starts_with("GIT_")
+        {
+            command.env_remove(key);
+        }
+    }
     command
         .args(["commit", "-m", message])
         .current_dir(cwd)
@@ -6886,8 +6982,16 @@ fn git_batch_repo(n: usize) -> (tempfile::TempDir, PathBuf, Vec<String>) {
 }
 
 /// An `App` paired with a fresh [`git_batch_repo`]. Named to match what issue
-/// #273's Task 9 plans to build as a shared fixture
-/// (`test_app_with_git_repo`) — adopt this rather than duplicating it.
+/// #273's Task 9 plans to build as a shared fixture (`test_app_with_git_repo`)
+/// — adopt the *name* rather than duplicating it, but note the shape does not
+/// match Task 9's plan as written: the plan calls
+/// `let (app, _tmp, repo) = test_app_with_git_repo();` (no argument, a
+/// 3-tuple with no commits made yet), while this is
+/// `test_app_with_git_repo(n_commits) -> (App, TempDir, PathBuf, Vec<String>)`
+/// — a commit count in, and the resulting shas out, because every caller in
+/// this file needs at least one real commit before it can drive a session
+/// anywhere. Task 9 should treat this as a starting point to reconcile
+/// against its own plan, not a fixture it can call unmodified.
 fn test_app_with_git_repo(n_commits: usize) -> (App, tempfile::TempDir, PathBuf, Vec<String>) {
     let app = App::open_for_test().unwrap();
     let (temp, repo_path, shas) = git_batch_repo(n_commits);

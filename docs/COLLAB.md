@@ -669,12 +669,31 @@ Invariants that still apply:
   report transitions to `CodingFailed`; a **Tooling**-classified report
   (seven recoverable prefixes — see "Failure + terminal") instead keeps the
   session at its current phase and flips `current_owner`.
-- Drift detection is special-cased for shortcut-started sessions:
-  the server validates `CodeReviewFixGlobal{head_sha}` **and**
-  `ReviewLocal{head_sha}` with a git ancestry check when `task_list` is
-  still unset. Both the copilot's `review_fix_global` push and the pilot's
-  `review_local` audit-push must descend from the prior `last_head_sha`.
-  Full-flow v3 sessions keep their existing non-shell-out behavior.
+- Drift detection applies to every head-advancing coding event, in both the
+  `collab_start_code_review` shortcut and the normal full-flow v3 batch:
+  `ImplementationDone{head_sha}`, `CodeReviewFixGlobal{head_sha}`,
+  `ReviewLocal{head_sha}`, and `FinalReview{head_sha, ...}` are all validated
+  with a `git merge-base --is-ancestor` shell-out against the session's
+  prior `last_head_sha` before the event is applied. This does not depend on
+  whether `task_list` is set — it is unconditional, so a full v3 batch
+  (`SubmitTaskList` → `ImplementationDone` → ... → `CodingComplete`) is
+  checked exactly as the shortcut is. A non-descendant head is refused with
+  a **Terminal** `branch_drift:` error: the reported commit isn't reachable
+  from where the batch was known to start (wrong branch, force-reset, or a
+  fabricated/nonexistent sha), which is not something a retry or a corrected
+  checkpoint can fix in place.
+- **Rebasing or amending during an in-flight batch produces `branch_drift:`.**
+  Once `task_list` (or the shortcut's seed) has recorded a `last_head_sha`,
+  every later head in that session must be a real descendant of it. A
+  rebase onto an updated `main`, an amended commit, or any other history
+  rewrite between two sends breaks that — the new head is no longer a
+  descendant of the last recorded one, and the very next send is refused,
+  terminally, with no in-place remedy, because the review range itself is
+  what changed. This is defensible (a rebase genuinely invalidates the
+  range a reviewer would be looking at), but it means an implementer must
+  not rebase or amend already-reported commits mid-batch. If `main` has
+  moved, merge it in instead — a merge commit's first parent is still a
+  descendant of the prior head — or finish the batch and rebase afterward.
 - **Scoped attribution:** one live collab session may own each
   `(repo_path, branch)` scope. A shared daemon may therefore run live sessions
   for different repositories or branches concurrently. A second live session
@@ -1984,13 +2003,16 @@ before each coding-active `collab_send`:
   `source_estimated_tokens`, and `artifact_estimated_tokens`; capture rejects
   malformed or non-shrinking profiles, while repeated profiles are retained for
   comparison.
-- **Shortcut ancestry validation** during shortcut-started
-  `review_fix_global` and `review_local`: the server shells out narrowly
-  to `git merge-base --is-ancestor` to distinguish a true descendant
-  check from operational git failures, and only applies that validation
-  when `task_list` is still unset. Both the copilot's `review_fix_global` push
-  and the pilot's `review_local` audit-push must descend from the prior
-  `last_head_sha`.
+- **Ancestry validation** on `implementation_done`, `review_fix_global`,
+  `review_local`, and `final_review`, in both the shortcut and the normal
+  full-flow v3 batch: the server shells out narrowly to `git merge-base
+  --is-ancestor` to distinguish a true descendant check from operational
+  git failures (a git binary that fails to run, an unreadable repo) and
+  from a well-formed-but-nonexistent sha (its own diagnostic — git exits
+  128, not 1, for a sha that resolves to no real object at all). Each of
+  those four heads must descend from the session's prior `last_head_sha`.
+  This does not depend on `task_list` — it applies equally to a full v3
+  batch and to the `collab_start_code_review` shortcut.
 - **PR creation** during `final_review`: after pushed-head proof passes, the
   Claude submit worker resolves the integration branch from the remote default,
   falling back to the first existing `origin/main`, `origin/master`, or
@@ -2051,12 +2073,21 @@ before each coding-active `collab_send`:
   Mode; under `pilot == "codex"` the dispatcher terminal still takes this
   gate, since the dispatcher is always Claude.
 
-The server does not read the git tree for the full v3 flow, and it still
-trusts the harness's `head_sha` string there. The narrow shortcut-only
-ancestry check is the exception; drift detection in that path is now a
-hybrid responsibility, with the server performing the git ancestor check
-and the harness still responsible for local verification and any
-`failure_report` it emits.
+The server reads the git tree for the full v3 flow, the same as it does for
+the shortcut: every head-advancing send —
+`implementation_done`/`review_fix_global`/`review_local`/`final_review`, in
+either flow — is checked with `git merge-base --is-ancestor` against the
+session's `last_head_sha` before the event is applied, and a non-descendant
+head is refused rather than accepted on the harness's word. What the server
+does *not* verify is everything upstream of "is this a real, reachable
+commit": it does not run gates, does not read the diff, and does not confirm
+the commit was actually pushed anywhere — `implementation_done`'s
+checkpoint-proof gate covers gates/coverage self-consistency (see
+"Implementation checkpoints"), but neither check inspects diff content.
+Drift detection is a hybrid responsibility in both flows: the server
+performs the git ancestor check, and the harness remains responsible for
+everything the ancestor check cannot see plus any `failure_report` it
+emits.
 
 ## Worker-per-turn dispatch (Claude side)
 

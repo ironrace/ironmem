@@ -1084,19 +1084,16 @@ pub(super) fn handle_collab_send(app: &App, args: &Value) -> Result<Value, Memor
         //
         // It also runs BEFORE the ancestry check below (Task 8), on purpose.
         // Both checks can fail independently, and when they do, checkpoint
-        // proof is almost always the more specific and more actionable
-        // diagnosis: "you never checkpointed", "your checkpoint's ledger
-        // under-covers the task list", "your gates aren't green at this head"
-        // are all things a caller can go fix, and they are the actual defect
-        // in the overwhelming majority of refusals — an implementer that is
-        // honest about its checkpoint is, in practice, also on the right
-        // branch. Running ancestry first would instead hand every one of
-        // those callers a Terminal `branch_drift:` refusal (see the note on
-        // `validate_global_review_head_advance` below) that says nothing
-        // about the checkpoint defect they actually need to fix, and — worse
-        // — would be flatly wrong when the checkpoint itself hasn't been
-        // written yet, since there is then no "reported head" whose ancestry
-        // is even the caller's live claim.
+        // proof is the more specific and more actionable diagnosis: "you
+        // never checkpointed", "your checkpoint's ledger under-covers the
+        // task list", "your gates aren't green at this head" are all things
+        // a caller can go fix directly, unlike a Terminal `branch_drift:`
+        // refusal (see the note on `validate_global_review_head_advance`
+        // below), which names no remedy at all — it ends the session.
+        // Running ancestry first would hand every checkpoint-shaped defect
+        // that refusal instead, and would be flatly wrong when the
+        // checkpoint itself hasn't been written yet, since there is then no
+        // "reported head" whose ancestry is even the caller's live claim.
         //
         // This ordering does not weaken what Task 8 exists to close. The
         // incident is a checkpoint that *lies consistently* — head_sha equal
@@ -1106,6 +1103,17 @@ pub(super) fn handle_collab_send(app: &App, args: &Value) -> Result<Value, Memor
         // checkpoint proof first only means that case now falls through to
         // the ancestry check below rather than being caught earlier; it is
         // never skipped.
+        // No phase check here, unlike the `advancing_head_sha` match below —
+        // deliberately, not an oversight. `build_collab_event` maps the
+        // `implementation_done` topic to `CollabEvent::ImplementationDone`
+        // independent of `session.phase` (only `apply_event` enforces that
+        // this event is only valid from `CodeImplementPending`), so this
+        // arm can in principle run for a session in some other phase. That
+        // is harmless: `apply_event` below still refuses the wrong-phase
+        // send regardless of what this gate decides, so the worst case is
+        // this check running (and possibly refusing with `checkpoint_drift:`)
+        // one turn before a phase mismatch would have refused it anyway —
+        // never the reverse.
         if let crate::collab::CollabEvent::ImplementationDone { head_sha } = &event {
             require_checkpoint_proof(tx, &session, head_sha)?;
         }
@@ -1517,6 +1525,10 @@ fn validate_global_review_head_advance(
             repo_path,
             "merge-base",
             "--is-ancestor",
+            // `--` stops a `head_sha`/`last_head_sha` that happens to start
+            // with `-` (a caller-supplied string, ultimately) from being
+            // read as a git option instead of a revision.
+            "--",
             last_head_sha,
             head_sha,
         ])
@@ -1539,6 +1551,34 @@ fn validate_global_review_head_advance(
 
     let stderr = String::from_utf8_lossy(&output.stderr);
     let stderr = stderr.trim();
+
+    // git exits 128 (not 1) when either revision does not resolve to a real
+    // object at all — "fatal: Not a valid commit name <sha>" for a
+    // well-formed-but-unknown sha, "fatal: Not a valid object name <sha>"
+    // for a malformed one. That is a fabricated or mistyped sha, which is
+    // itself one of branch drift's causes (see the doc comment above) and
+    // arguably the incident's purest form: an agent that never reached any
+    // commit, reporting one anyway. Left undetected here it falls into the
+    // generic operational message below, which reads as broken tooling and
+    // — per docs/COLLAB.md's failure-report guidance — invites a
+    // Tooling-class `failure_report` that parks the session and hands off
+    // the turn instead of naming the actual defect. git echoes the
+    // offending revision literally in its stderr, so the message below can
+    // say which of the two shas is the one that does not exist rather than
+    // making the caller guess.
+    if output.status.code() == Some(128) && stderr.to_ascii_lowercase().contains("not a valid") {
+        let missing = if stderr.contains(head_sha) {
+            format!("head_sha {head_sha}")
+        } else if stderr.contains(last_head_sha) {
+            format!("last_head_sha {last_head_sha}")
+        } else {
+            format!("head_sha {head_sha} or last_head_sha {last_head_sha}")
+        };
+        return Err(MemoryError::Validation(format!(
+            "branch_drift: {missing} does not name a commit that exists in this repository ({stderr})"
+        )));
+    }
+
     let detail = if stderr.is_empty() {
         format!("git exited with status {:?}", output.status.code())
     } else {
@@ -2405,7 +2445,7 @@ mod tests {
     use super::*;
     use crate::collab::queue::SessionRecord;
     use crate::collab::CollabSession;
-    use crate::mcp::tools::test_support::test_app_with_db_path;
+    use crate::mcp::tools::test_support::{git_ancestor_chain, test_app_with_db_path};
     use std::sync::Arc;
 
     // ── test helpers ──────────────────────────────────────────────────────────
@@ -2438,67 +2478,6 @@ mod tests {
         });
         let out = handle_collab_start(app, &args).unwrap();
         out["session_id"].as_str().unwrap().to_string()
-    }
-
-    /// A real git repo with `n` sequential commits, each a real descendant of
-    /// the one before. Issue #273 Task 8 made `implementation_done` and every
-    /// later batch-flow head git-ancestry-checked against `repo_path`, so any
-    /// test that drives a session past `CodeImplementPending` needs one of
-    /// these instead of the placeholder `"/tmp/repo"` and synthetic heads like
-    /// `"c1"`/`"c2"`. `commit.gpgsign` and `core.hooksPath` are pinned off so
-    /// the fixture does not inherit a developer machine's signing key or
-    /// personal hooks directory — this one has both configured globally,
-    /// which would mask what is fragile on a CI runner with neither.
-    fn git_batch_repo(n: usize) -> (tempfile::TempDir, String, Vec<String>) {
-        let temp = tempfile::tempdir().expect("temp repo must be creatable");
-        let repo_path = temp.path().to_path_buf();
-        let run = |args: &[&str]| {
-            let mut command = Command::new("git");
-            for (key, _) in std::env::vars_os() {
-                if key
-                    .to_string_lossy()
-                    .to_ascii_uppercase()
-                    .starts_with("GIT_")
-                {
-                    command.env_remove(key);
-                }
-            }
-            let output = command
-                .args(args)
-                .current_dir(&repo_path)
-                .output()
-                .expect("git must run");
-            assert!(
-                output.status.success(),
-                "git {args:?} failed: {}",
-                String::from_utf8_lossy(&output.stderr)
-            );
-        };
-        run(&["init"]);
-        run(&["config", "user.name", "Ironmem Test"]);
-        run(&["config", "user.email", "ironmem@example.com"]);
-        run(&["config", "commit.gpgsign", "false"]);
-        run(&["config", "core.hooksPath", "/dev/null"]);
-        let mut shas = Vec::with_capacity(n);
-        for i in 0..n {
-            std::fs::write(repo_path.join("batch.txt"), format!("v{i}\n"))
-                .expect("fixture file must be writable");
-            run(&["add", "batch.txt"]);
-            run(&["commit", "-m", &format!("commit {i}")]);
-            let output = Command::new("git")
-                .args(["rev-parse", "HEAD"])
-                .current_dir(&repo_path)
-                .output()
-                .expect("git rev-parse must run");
-            assert!(output.status.success(), "git rev-parse HEAD failed");
-            shas.push(
-                String::from_utf8(output.stdout)
-                    .expect("sha must be utf-8")
-                    .trim()
-                    .to_string(),
-            );
-        }
-        (temp, repo_path.to_string_lossy().into_owned(), shas)
     }
 
     fn send(
@@ -2732,7 +2711,7 @@ mod tests {
         let app = test_app();
         // Real repo (issue #273 Task 8): every head reported past
         // `CodeImplementPending` is now git-ancestry-checked.
-        let (_temp, repo_path, heads) = git_batch_repo(5);
+        let (_temp, repo_path, heads) = git_ancestor_chain(5);
         let sid = start_session_in_scope(&app, &repo_path, "main");
 
         // v1 planning → PlanLocked, then v3 → CodeImplementPending.
@@ -3040,7 +3019,7 @@ mod tests {
         let app = test_app();
         // Real repo (issue #273 Task 8): `implementation_done`'s head is now
         // git-ancestry-checked.
-        let (_temp, repo_path, heads) = git_batch_repo(2);
+        let (_temp, repo_path, heads) = git_ancestor_chain(2);
         let args = json!({
             "repo_path": repo_path,
             "branch": "main",
@@ -3218,7 +3197,7 @@ mod tests {
         let app = test_app();
         // Real repo (issue #273 Task 8): every head reported past
         // `CodeImplementPending` is now git-ancestry-checked.
-        let (_temp, repo_path, heads) = git_batch_repo(5);
+        let (_temp, repo_path, heads) = git_ancestor_chain(5);
         let completed = start_session_in_scope(&app, &repo_path, "main");
         drive_to_coding_complete(&app, &completed, &heads);
 
@@ -4391,7 +4370,7 @@ mod tests {
         let app = test_app();
         // Real repo (issue #273 Task 8): `implementation_done`'s head is now
         // git-ancestry-checked.
-        let (_temp, repo_path, heads) = git_batch_repo(2);
+        let (_temp, repo_path, heads) = git_ancestor_chain(2);
         let sid = start_session_in_scope(&app, &repo_path, "main");
         drive_to_tooling_coding_failed_with_head(&app, &sid, &heads[0]);
 
@@ -4618,7 +4597,7 @@ mod tests {
         let app = test_app();
         // Real repo (issue #273 Task 8): `implementation_done`'s head is now
         // git-ancestry-checked.
-        let (_temp, repo_path, heads) = git_batch_repo(2);
+        let (_temp, repo_path, heads) = git_ancestor_chain(2);
         let sid = start_session_in_scope(&app, &repo_path, "main");
         drive_to_implement_with_head(&app, &sid, &heads[0]);
         send_implementation_done(&app, &sid, "claude", &heads[1]);
@@ -4765,7 +4744,7 @@ mod tests {
         let app = test_app();
         // Real repo (issue #273 Task 8): every head reported past
         // `CodeImplementPending` is now git-ancestry-checked.
-        let (_temp, repo_path, heads) = git_batch_repo(3);
+        let (_temp, repo_path, heads) = git_ancestor_chain(3);
         let sid = start_session_in_scope(&app, &repo_path, "main");
         drive_to_implement_with_head(&app, &sid, &heads[0]);
 
@@ -4843,7 +4822,7 @@ mod tests {
         let app = test_app();
         // Real repo (issue #273 Task 8): every head reported past
         // `CodeImplementPending` is now git-ancestry-checked.
-        let (_temp, repo_path, heads) = git_batch_repo(3);
+        let (_temp, repo_path, heads) = git_ancestor_chain(3);
         let sid = start_session_in_scope(&app, &repo_path, "main");
         drive_to_implement_with_head(&app, &sid, &heads[0]);
         send_implementation_done(&app, &sid, "claude", &heads[1]);
