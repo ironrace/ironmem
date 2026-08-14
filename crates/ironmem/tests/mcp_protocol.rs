@@ -5567,6 +5567,7 @@ fn collab_checkpoint_persists_and_is_readable_back() {
         "collab_checkpoint",
         json!({
             "session_id": &session_id,
+            "agent": "claude",
             "task_id": 3,
             "task_title": "Add the gate",
             "status": "completed",
@@ -5597,9 +5598,19 @@ fn collab_checkpoint_persists_and_is_readable_back() {
         "the server must stamp updated_at at write time, got {}",
         stored.updated_at
     );
+    // Echoed back, and echoed as what the ROW says: a caller checking that its
+    // checkpoint landed fresh must be reading the server's stamp, not a value
+    // the response computed on its own.
+    assert_eq!(
+        written["updated_at"],
+        json!(stored.updated_at),
+        "the response must echo the stamp the row carries"
+    );
+    assert_eq!(written["agent"], "claude");
 
     let (params, result) = last_wal_row(&app, "collab_checkpoint");
     assert_eq!(params["session_id"], session_id);
+    assert_eq!(params["agent"], "claude");
     assert_eq!(params["head_sha"], head);
     assert_eq!(params["attested_by"], "implementer");
     assert_eq!(result["completed_task_ids"], json!([1, 2, 3]));
@@ -5619,6 +5630,7 @@ fn collab_checkpoint_overwrites_the_previous_checkpoint() {
         "collab_checkpoint",
         json!({
             "session_id": &session_id,
+            "agent": "claude",
             "task_id": 1,
             "status": "started",
             "head_sha": "b9c2ce0"
@@ -5629,6 +5641,7 @@ fn collab_checkpoint_overwrites_the_previous_checkpoint() {
         "collab_checkpoint",
         json!({
             "session_id": &session_id,
+            "agent": "claude",
             "status": "batch_complete",
             "head_sha": &head,
             "completed_task_ids": "1,2"
@@ -5659,6 +5672,7 @@ fn collab_checkpoint_rejects_an_unknown_status() {
         "collab_checkpoint",
         json!({
             "session_id": &session_id,
+            "agent": "claude",
             "status": "nearly_done",
             "head_sha": &head
         }),
@@ -5702,6 +5716,7 @@ fn collab_checkpoint_rejects_an_implementer_attested_divergence() {
         "collab_checkpoint",
         json!({
             "session_id": &session_id,
+            "agent": "claude",
             "status": "batch_complete",
             "head_sha": &head,
             "acknowledged_divergence": "b9c2ce0..75a4ea3"
@@ -5740,6 +5755,7 @@ fn collab_checkpoint_accepts_an_operator_attested_divergence() {
         "collab_checkpoint",
         json!({
             "session_id": &session_id,
+            "agent": "claude",
             "status": "batch_complete",
             "head_sha": "b9c2ce0",
             "attested_by": "operator",
@@ -5770,6 +5786,7 @@ fn collab_checkpoint_reports_a_verified_match_against_live_head() {
         "collab_checkpoint",
         json!({
             "session_id": &session_id,
+            "agent": "claude",
             "status": "completed",
             "task_id": 1,
             "head_sha": &head
@@ -5794,6 +5811,7 @@ fn collab_checkpoint_reports_divergence_without_refusing_the_write() {
         "collab_checkpoint",
         json!({
             "session_id": &session_id,
+            "agent": "claude",
             "status": "started",
             "task_id": 1,
             "head_sha": "b9c2ce0"
@@ -5833,6 +5851,7 @@ fn collab_checkpoint_does_not_report_unverified_head_as_undiverged() {
         "collab_checkpoint",
         json!({
             "session_id": &session_id,
+            "agent": "claude",
             "status": "started",
             "task_id": 1,
             "head_sha": "b9c2ce0"
@@ -5880,6 +5899,7 @@ fn collab_checkpoint_uses_one_session_id_for_lookup_and_row() {
         "collab_checkpoint",
         json!({
             "session_id": format!("  {session_id}  "),
+            "agent": "claude",
             "status": "started",
             "task_id": 1,
             "head_sha": &head
@@ -5904,19 +5924,142 @@ fn collab_checkpoint_names_a_wrong_typed_session_id() {
     let err = call_tool_expect_error(
         &app,
         "collab_checkpoint",
-        json!({ "session_id": 42, "status": "started", "head_sha": "b9c2ce0" }),
+        json!({ "session_id": 42, "agent": "claude", "status": "started", "head_sha": "b9c2ce0" }),
     );
     assert_eq!(err, "session_id must be a string", "got: {err}");
 
     let absent = call_tool_expect_error(
         &app,
         "collab_checkpoint",
-        json!({ "status": "started", "head_sha": "b9c2ce0" }),
+        json!({ "agent": "claude", "status": "started", "head_sha": "b9c2ce0" }),
     );
     assert_eq!(
         absent, "session_id is required and must be a non-empty string",
         "got: {absent}"
     );
+}
+
+/// The generation lease, driven across two `App` instances over one on-disk
+/// DB — the real deployment topology, where each agent runs its own `ironmem`
+/// MCP server process (see `open_second_disk_app`).
+///
+/// A superseded process must not be able to land its stale view of progress.
+/// Nothing downstream could catch it if it did: `updated_at` is server-stamped,
+/// so the stale content would arrive carrying a *fresh* timestamp, and a Task 7
+/// gate asking "is this checkpoint recent?" would be answered by the very
+/// anti-backdating stamp that exists to prevent this. Hence the check at the
+/// write.
+///
+/// The final assertion is on the stored ROW, not on the error string: an
+/// error message proves the call was answered, only the row proves nothing
+/// was written.
+#[test]
+fn collab_checkpoint_refuses_a_superseded_process() {
+    let (_dir_a, db_path, app_a) = open_disk_app_for_dashboard_sweep();
+    let (_repo, repo_path, head) = checkpoint_repo();
+    let session_id = start_checkpoint_session(&app_a, &repo_path, "main");
+
+    // The incumbent process files a checkpoint tokenlessly, binding itself to
+    // the session's current generation.
+    call_tool(
+        &app_a,
+        "collab_checkpoint",
+        json!({
+            "session_id": &session_id,
+            "agent": "claude",
+            "task_id": 1,
+            "status": "started",
+            "head_sha": &head
+        }),
+    );
+
+    // A successor process takes the session over: mint a handoff token and
+    // spend it on its own checkpoint, which advances claude's generation.
+    let (_dir_b, app_b) = open_second_disk_app(&db_path);
+    let issued = call_tool(
+        &app_b,
+        "session_handoff",
+        json!({ "session_id": &session_id, "agent": "claude" }),
+    );
+    let token = issued["handoff_token"]
+        .as_str()
+        .expect("session_handoff must return a token")
+        .to_string();
+    let successor = call_tool(
+        &app_b,
+        "collab_checkpoint",
+        json!({
+            "session_id": &session_id,
+            "agent": "claude",
+            "status": "batch_complete",
+            "head_sha": &head,
+            "completed_task_ids": "1,2,3",
+            "handoff_token": &token
+        }),
+    );
+    assert_eq!(successor["status"], "batch_complete");
+
+    // The superseded process now tries to file its stale "task 1 / started"
+    // progress — the issue #273 shape, one process behind.
+    let err = call_tool_expect_error(
+        &app_a,
+        "collab_checkpoint",
+        json!({
+            "session_id": &session_id,
+            "agent": "claude",
+            "task_id": 1,
+            "status": "started",
+            "head_sha": &head
+        }),
+    );
+    assert!(
+        err.contains("stale collab generation"),
+        "the superseded process must be refused by the generation lease: {err}"
+    );
+
+    let stored = stored_checkpoint(&app_b, &session_id).expect("checkpoint row must exist");
+    assert_eq!(
+        stored.status,
+        ironmem::collab::CheckpointStatus::BatchComplete,
+        "the successor's progress must survive the superseded process's write"
+    );
+    assert_eq!(stored.completed_task_ids, vec![1, 2, 3]);
+    assert_eq!(stored.task_id, None);
+}
+
+/// `agent` is required, not optional-and-checked-when-present: a superseded
+/// process would simply omit an optional one, and an authorization check the
+/// caller can decline is not a check. Pinned separately from the lease test
+/// because the lease is only reachable once an agent has been named.
+#[test]
+fn collab_checkpoint_requires_an_agent() {
+    let app = App::open_for_test().unwrap();
+    let (_repo, repo_path, head) = checkpoint_repo();
+    let session_id = start_checkpoint_session(&app, &repo_path, "main");
+
+    let err = call_tool_expect_error(
+        &app,
+        "collab_checkpoint",
+        json!({ "session_id": &session_id, "status": "started", "head_sha": &head }),
+    );
+    assert_eq!(err, "agent is required", "got: {err}");
+    assert!(
+        stored_checkpoint(&app, &session_id).is_none(),
+        "an unauthenticated checkpoint must persist nothing"
+    );
+
+    let bad = call_tool_expect_error(
+        &app,
+        "collab_checkpoint",
+        json!({
+            "session_id": &session_id,
+            "agent": "operator",
+            "status": "started",
+            "head_sha": &head
+        }),
+    );
+    assert_eq!(bad, "agent must be 'claude' or 'codex'", "got: {bad}");
+    assert!(stored_checkpoint(&app, &session_id).is_none());
 }
 
 /// A checkpoint is session-scoped state, so it needs a live session: an
@@ -5930,7 +6073,7 @@ fn collab_checkpoint_requires_a_live_session() {
     let unknown = call_tool_expect_error(
         &app,
         "collab_checkpoint",
-        json!({ "session_id": "no-such-session", "status": "started", "head_sha": head }),
+        json!({ "session_id": "no-such-session", "agent": "claude", "status": "started", "head_sha": head }),
     );
     assert!(
         unknown.contains("not found"),
@@ -5948,7 +6091,7 @@ fn collab_checkpoint_requires_a_live_session() {
     let ended = call_tool_expect_error(
         &app,
         "collab_checkpoint",
-        json!({ "session_id": &session_id, "status": "started", "head_sha": head }),
+        json!({ "session_id": &session_id, "agent": "claude", "status": "started", "head_sha": head }),
     );
     assert!(
         ended.contains("has ended"),

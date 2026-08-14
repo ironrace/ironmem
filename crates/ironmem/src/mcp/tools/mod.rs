@@ -516,21 +516,39 @@ pub fn tool_definitions(app: &App) -> Vec<Value> {
                 "type": "object",
                 "properties": {
                     "session_id": { "type": "string" },
-                    "task_id": { "type": "integer", "minimum": 1 },
+                    // Required, like every other session-scoped collab write:
+                    // it names the identity the generation lease is checked
+                    // against, so a superseded process cannot land stale
+                    // progress. See `handle_collab_checkpoint`.
+                    "agent": { "type": "string", "enum": ["claude", "codex"] },
+                    // Both types, because `optional_task_id` accepts the string
+                    // form and the `none` sentinel on purpose — that is what
+                    // the `task_id: <N|none>` turn template in docs/COLLAB.md
+                    // tells agents to send. An `integer`-only schema would have
+                    // a validating client reject exactly the input the tool was
+                    // built to take.
+                    "task_id": { "type": ["integer", "string"], "description": "Task id (1-based) or \"none\"" },
                     "task_title": { "type": "string" },
                     "status": {
                         "type": "string",
                         "enum": ["started", "completed", "blocked", "batch_complete"]
                     },
-                    "head_sha": { "type": "string", "description": "Repo HEAD at checkpoint time" },
+                    "head_sha": {
+                        "type": "string",
+                        // The full sha is load-bearing, not a style note: the
+                        // divergence check is string equality against
+                        // `git rev-parse HEAD`, so an abbreviated sha reads as
+                        // permanent drift on a repo that has not moved.
+                        "description": "Full 40-char repo HEAD at checkpoint time; matched verbatim, so a short sha always reads as drift"
+                    },
                     "commit_sha": { "type": "string" },
                     "completed_task_ids": {
                         "type": "string",
                         "description": "Comma-separated, cumulative: carry every id already done."
                     },
-                    "next_task_id": { "type": "integer", "minimum": 1 },
+                    "next_task_id": { "type": ["integer", "string"], "description": "Task id (1-based) or \"none\"" },
                     "gates_result": { "type": "string", "description": "not_run | passed | failed: <reason>" },
-                    "gates_sha": { "type": "string", "description": "HEAD the gates ran against" },
+                    "gates_sha": { "type": "string", "description": "Full sha the gates ran against" },
                     "gates_commands": { "type": "string", "description": "Gate command set, \" && \"-joined" },
                     "summary": { "type": "string" },
                     // Advertised, but an operator attestation is a human
@@ -542,9 +560,10 @@ pub fn tool_definitions(app: &App) -> Vec<Value> {
                     "acknowledged_divergence": {
                         "type": "string",
                         "description": "Operator-only: SHA range vouched for, <from>..<to>"
-                    }
+                    },
+                    "handoff_token": { "type": "string" }
                 },
-                "required": ["session_id", "status", "head_sha"]
+                "required": ["session_id", "agent", "status", "head_sha"]
             }
         }),
         json!({
@@ -1258,6 +1277,64 @@ mod tests {
         assert!(full_description.contains("use get_drawer for the complete body"));
     }
 
+    /// The advertised `collab_checkpoint` surface has to agree with the parser
+    /// behind it, and with the turn templates agents copy from. Both halves
+    /// below are places where the obvious schema is the wrong one, and neither
+    /// is visible from any behavioural test: the tool would keep working for
+    /// every caller that ignores the schema, and break only for the ones that
+    /// honor it.
+    ///
+    /// Task 11 copies this surface into the plugin prompts, so it has to be
+    /// right before then.
+    #[test]
+    fn collab_checkpoint_schema_matches_what_the_parser_accepts() {
+        let app = App::open_for_test().unwrap();
+        let tool = tool_definitions(&app)
+            .into_iter()
+            .find(|tool| tool["name"] == "collab_checkpoint")
+            .expect("collab_checkpoint must be advertised");
+        let properties = &tool["inputSchema"]["properties"];
+
+        // `optional_task_id` accepts a JSON number, the string form, and the
+        // `none` sentinel — the last being what the `task_id: <N|none>` turn
+        // template in docs/COLLAB.md tells agents to send. An integer-only
+        // schema would have a validating client reject the documented input.
+        for field in ["task_id", "next_task_id"] {
+            assert_eq!(
+                properties[field]["type"],
+                json!(["integer", "string"]),
+                "{field} must advertise both forms the parser accepts"
+            );
+        }
+
+        // The divergence check is string equality against `git rev-parse HEAD`,
+        // so a short sha is permanent, self-inflicted drift. Nothing else in
+        // the surface tells a caller that.
+        let head_sha = properties["head_sha"]["description"]
+            .as_str()
+            .expect("head_sha needs a description");
+        assert!(
+            head_sha.contains("40-char") && head_sha.contains("short sha"),
+            "head_sha must say the full sha is required and why: {head_sha}"
+        );
+
+        // The generation lease is only reachable if the caller names an agent,
+        // and it is only an authorization check if they cannot decline to.
+        assert_eq!(
+            properties["agent"]["enum"],
+            json!(["claude", "codex"]),
+            "agent must be advertised with the two-value enum"
+        );
+        let required = tool["inputSchema"]["required"]
+            .as_array()
+            .expect("collab_checkpoint needs a required list");
+        assert!(
+            required.contains(&json!("agent")),
+            "agent must be REQUIRED: a superseded process would simply omit an \
+             optional one, and a check a caller can opt out of is not a check"
+        );
+    }
+
     /// Raised 3_500 -> 3_550 for the v17 supersession surface (#211): `search`
     /// gained `include_superseded` and `add_drawer` gained `supersedes`, which
     /// cost ~140 bytes more than the previous ceiling left spare.
@@ -1270,17 +1347,23 @@ mod tests {
     /// schema keys. The listing measured 3_660 tokens after the addition; the
     /// ceiling leaves ~40 tokens of headroom rather than pinning it exactly.
     ///
-    /// Raised 3_700 -> 4_020 for `collab_checkpoint` (#273), the durable write
+    /// Raised 3_700 -> 4_085 for `collab_checkpoint` (#273), the durable write
     /// path that replaces the unverified `collab-checkpoint:<id>` drawer
-    /// convention. It is the widest collab tool in the listing — fourteen
+    /// convention. It is the widest collab tool in the listing — sixteen
     /// properties, because the schema mirrors migration 020's columns one for
-    /// one — and the structure alone is ~800 of its ~1_180 bytes, so no amount
-    /// of prose-trimming brings it under the previous ceiling's ~12 spare
-    /// tokens. What prose it keeps is the part a caller cannot infer from the
-    /// keys: the three-state `diverged`, `completed_task_ids` being cumulative,
-    /// `gates_result`'s vocabulary, and `acknowledged_divergence` being
-    /// operator-only. The listing measured 3_982 tokens after the addition,
-    /// leaving ~38 tokens of headroom, in line with the previous raise.
+    /// one and then adds the `agent`/`handoff_token` pair every session-scoped
+    /// collab write carries — and the structure alone is ~800 of its ~1_240
+    /// bytes, so no amount of prose-trimming brings it under the previous
+    /// ceiling's ~12 spare tokens. What prose it keeps is the part a caller
+    /// cannot infer from the keys, and each clause is pinned by
+    /// `collab_checkpoint_schema_matches_what_the_parser_accepts` or paid for
+    /// by a bug it prevents: the three-state `diverged`, `head_sha` having to
+    /// be the full 40 chars (the divergence check is string equality, so a
+    /// short sha is permanent self-inflicted drift), `completed_task_ids` being
+    /// cumulative, `gates_result`'s vocabulary, and `acknowledged_divergence`
+    /// being operator-only. The listing measured 4_046 tokens after the
+    /// addition, leaving ~39 tokens of headroom, in line with the previous
+    /// raise.
     ///
     /// The budget is deliberately a whole-listing ceiling with no per-tool
     /// allocation, so the cheapest way to land a new field is to delete prose
@@ -1294,7 +1377,7 @@ mod tests {
         let bytes = serde_json::to_vec(&tool_definitions(&app)).unwrap().len();
         let estimated_tokens = bytes.div_ceil(4);
         assert!(
-            estimated_tokens <= 4_020,
+            estimated_tokens <= 4_085,
             "tool listing is ~{estimated_tokens} tokens ({bytes} bytes); trim descriptions that duplicate their schemas"
         );
     }
