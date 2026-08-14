@@ -3,7 +3,9 @@
 use rusqlite::{params, Connection, OptionalExtension};
 use uuid::Uuid;
 
-use super::{Agent, CollabRoles, CollabSession, Phase};
+use super::{
+    Agent, AttestedBy, CheckpointStatus, CollabCheckpoint, CollabRoles, CollabSession, Phase,
+};
 use crate::error::MemoryError;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -491,6 +493,243 @@ pub fn save_session(conn: &Connection, session: &CollabSession) -> Result<(), Me
     Ok(())
 }
 
+/// Write the session's one current checkpoint, replacing any prior one.
+///
+/// `session_id` is the table's primary key, so this is an upsert rather than
+/// an append: exactly one current checkpoint per session, matching the
+/// one-logical-keyed-drawer semantics this table replaced. History lives in
+/// the git log and the `wal_log` audit trail.
+///
+/// `updated_at` is stamped here from the server clock and deliberately ignored
+/// from the caller's payload — otherwise a caller could backdate a checkpoint
+/// and make a stale one look fresh.
+pub fn upsert_checkpoint(
+    conn: &Connection,
+    checkpoint: &CollabCheckpoint,
+) -> Result<(), MemoryError> {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+
+    let completed = checkpoint
+        .completed_task_ids
+        .iter()
+        .map(u32::to_string)
+        .collect::<Vec<_>>()
+        .join(",");
+
+    conn.execute(
+        "INSERT INTO collab_checkpoints (
+             session_id, task_id, task_title, status, head_sha, commit_sha,
+             completed_task_ids, next_task_id, gates_result, gates_sha,
+             gates_commands, summary, attested_by, acknowledged_divergence,
+             updated_at
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)
+         ON CONFLICT(session_id) DO UPDATE SET
+             task_id = excluded.task_id,
+             task_title = excluded.task_title,
+             status = excluded.status,
+             head_sha = excluded.head_sha,
+             commit_sha = excluded.commit_sha,
+             completed_task_ids = excluded.completed_task_ids,
+             next_task_id = excluded.next_task_id,
+             gates_result = excluded.gates_result,
+             gates_sha = excluded.gates_sha,
+             gates_commands = excluded.gates_commands,
+             summary = excluded.summary,
+             attested_by = excluded.attested_by,
+             acknowledged_divergence = excluded.acknowledged_divergence,
+             updated_at = excluded.updated_at",
+        params![
+            checkpoint.session_id,
+            checkpoint.task_id,
+            checkpoint.task_title,
+            checkpoint.status.as_str(),
+            checkpoint.head_sha,
+            checkpoint.commit_sha,
+            completed,
+            checkpoint.next_task_id,
+            checkpoint.gates_result,
+            checkpoint.gates_sha,
+            checkpoint.gates_commands,
+            checkpoint.summary,
+            checkpoint.attested_by.as_str(),
+            checkpoint.acknowledged_divergence,
+            now,
+        ],
+    )?;
+    Ok(())
+}
+
+/// Parse the stored `completed_task_ids` column strictly, refusing to do what
+/// `CollabCheckpoint::from_json`'s own parser refuses: silently drop an
+/// unparseable entry. A `filter_map(...ok())` here would let a corrupted
+/// value like `"1,2,X,4"` load as `[1, 2, 4]` — a checkpoint that quietly
+/// under-reports progress with no error anywhere in the path. That matters
+/// because `CollabCheckpoint::covers_all_tasks` reads exactly this field to
+/// gate the `implementation_done` transition (Tasks 7-10), so a silently
+/// shortened list would let a corrupted row look like partial progress
+/// instead of failing loudly.
+///
+/// Deliberately not a call into `CollabCheckpoint::from_json`'s private
+/// parser: that function parses a comma-separated *string value already
+/// extracted from JSON*, whereas this reads directly off the SQL row. Both
+/// enforce the same "no entry may fail to parse" rule; keeping them separate
+/// avoids coupling this loader to `checkpoint.rs`'s JSON-shaped error
+/// plumbing for a few lines of logic.
+fn parse_stored_completed_task_ids(raw: &str, session_id: &str) -> Result<Vec<u32>, MemoryError> {
+    let mut ids = Vec::new();
+    for piece in raw.split(',') {
+        let piece = piece.trim();
+        if piece.is_empty() {
+            continue;
+        }
+        let id: u32 = piece.parse().map_err(|_| {
+            MemoryError::Validation(format!(
+                "checkpoint for session {session_id}: completed_task_ids contains a \
+                 non-numeric entry {piece:?} in stored value {raw:?}"
+            ))
+        })?;
+        ids.push(id);
+    }
+    ids.sort_unstable();
+    ids.dedup();
+    Ok(ids)
+}
+
+/// Narrow a nullable `INTEGER` column to `u32`, refusing to do what a bare
+/// `as u32` cast would: silently wrap a negative or over-`u32::MAX` value
+/// into an unrelated small number instead of failing. `task_id` and
+/// `next_task_id` have no CHECK constraint in migration 020, so a direct SQL
+/// write (or a future writer with a bug) can put an out-of-range value in
+/// either column; `CollabCheckpoint::from_json`'s own `optional_task_id`
+/// already refuses one on the write path via `u32::try_from`, so the loader
+/// owes the same refusal rather than quietly reinterpreting corrupt data as
+/// some other task id.
+fn checked_task_id_column(
+    raw: Option<i64>,
+    field: &str,
+    session_id: &str,
+) -> Result<Option<u32>, MemoryError> {
+    raw.map(|n| {
+        u32::try_from(n).map_err(|_| {
+            MemoryError::Validation(format!(
+                "checkpoint for session {session_id}: {field} value {n} does not fit in u32"
+            ))
+        })
+    })
+    .transpose()
+}
+
+/// Load the session's one current checkpoint, or `None` when it has never
+/// written one. `None` is materially different from a stale checkpoint and
+/// callers must keep them distinct: it means the session predates migration
+/// 020 or the implementer has not checkpointed at all.
+///
+/// Rebuilds the struct field-by-field from the row rather than going through
+/// [`CollabCheckpoint::from_json`] — every field on the type is `pub`
+/// precisely so this loader can do that — which means every rule
+/// `from_json` enforces at parse time is bypassed here unless re-applied.
+/// [`CollabCheckpoint::validate`] exists to be that re-application: migration
+/// 020's CHECK on `acknowledged_divergence` is deliberately one-directional
+/// (it permits `attested_by = 'operator'` with no acknowledged range), so
+/// without this call a row the schema allows but the domain rules forbid
+/// would load clean and hand the `implementation_done` gate a checkpoint
+/// claiming the operator escape hatch while naming nothing it vouches for.
+pub fn load_current_checkpoint(
+    conn: &Connection,
+    session_id: &str,
+) -> Result<Option<CollabCheckpoint>, MemoryError> {
+    let row = conn
+        .query_row(
+            "SELECT session_id, task_id, task_title, status, head_sha, commit_sha,
+                    completed_task_ids, next_task_id, gates_result, gates_sha,
+                    gates_commands, summary, attested_by, acknowledged_divergence,
+                    updated_at
+             FROM collab_checkpoints
+             WHERE session_id = ?1",
+            params![session_id],
+            |row| {
+                Ok((
+                    row.get::<_, String>("session_id")?,
+                    row.get::<_, Option<i64>>("task_id")?,
+                    row.get::<_, Option<String>>("task_title")?,
+                    row.get::<_, String>("status")?,
+                    row.get::<_, String>("head_sha")?,
+                    row.get::<_, Option<String>>("commit_sha")?,
+                    row.get::<_, String>("completed_task_ids")?,
+                    row.get::<_, Option<i64>>("next_task_id")?,
+                    row.get::<_, String>("gates_result")?,
+                    row.get::<_, Option<String>>("gates_sha")?,
+                    row.get::<_, Option<String>>("gates_commands")?,
+                    row.get::<_, Option<String>>("summary")?,
+                    row.get::<_, String>("attested_by")?,
+                    row.get::<_, Option<String>>("acknowledged_divergence")?,
+                    row.get::<_, i64>("updated_at")?,
+                ))
+            },
+        )
+        .optional()?;
+
+    let Some((
+        row_session_id,
+        task_id,
+        task_title,
+        status_raw,
+        head_sha,
+        commit_sha,
+        completed_raw,
+        next_task_id,
+        gates_result,
+        gates_sha,
+        gates_commands,
+        summary,
+        attested_by_raw,
+        acknowledged_divergence,
+        updated_at,
+    )) = row
+    else {
+        return Ok(None);
+    };
+
+    let status = status_raw.parse::<CheckpointStatus>().map_err(|err| {
+        MemoryError::Validation(format!("checkpoint for session {row_session_id}: {err}"))
+    })?;
+    let attested_by = attested_by_raw.parse::<AttestedBy>().map_err(|err| {
+        MemoryError::Validation(format!("checkpoint for session {row_session_id}: {err}"))
+    })?;
+    let completed_task_ids = parse_stored_completed_task_ids(&completed_raw, &row_session_id)?;
+    let task_id = checked_task_id_column(task_id, "task_id", &row_session_id)?;
+    let next_task_id = checked_task_id_column(next_task_id, "next_task_id", &row_session_id)?;
+
+    let checkpoint = CollabCheckpoint {
+        session_id: row_session_id.clone(),
+        task_id,
+        task_title,
+        status,
+        head_sha,
+        commit_sha,
+        completed_task_ids,
+        next_task_id,
+        gates_result,
+        gates_sha,
+        gates_commands,
+        summary,
+        attested_by,
+        acknowledged_divergence,
+        updated_at,
+    };
+
+    // See this function's doc comment: this is the required call Task 2's
+    // `validate` doc comment names both entry points as owing.
+    checkpoint.validate().map_err(|err| {
+        MemoryError::Validation(format!("checkpoint for session {row_session_id}: {err}"))
+    })?;
+
+    Ok(Some(checkpoint))
+}
+
 /// Persist a message that references an already-written drawer.
 ///
 /// This low-level helper does not create the drawer. Production callers must
@@ -756,6 +995,8 @@ mod tests {
     const COLLAB_MESSAGE_DRAWERS_SQL: &str =
         include_str!("../../migrations/016_collab_message_drawers.sql");
     const COLLAB_PILOT_SQL: &str = include_str!("../../migrations/019_collab_pilot.sql");
+    const COLLAB_CHECKPOINTS_SQL: &str =
+        include_str!("../../migrations/020_collab_checkpoints.sql");
     const QUEUE_TEST_DRAWER_IDS: [&str; 7] = [
         "drawer-123",
         "drawer-a",
@@ -798,6 +1039,7 @@ mod tests {
         conn.execute_batch(COLLAB_RECOVERY_STATE_SQL).unwrap();
         conn.execute_batch(COLLAB_MESSAGE_DRAWERS_SQL).unwrap();
         conn.execute_batch(COLLAB_PILOT_SQL).unwrap();
+        conn.execute_batch(COLLAB_CHECKPOINTS_SQL).unwrap();
         for drawer_id in QUEUE_TEST_DRAWER_IDS {
             insert_queue_test_drawer(&conn, drawer_id);
         }
@@ -1849,6 +2091,269 @@ mod tests {
                 .unwrap()
                 .is_none(),
             "collab_end ends attribution too"
+        );
+    }
+
+    // ── checkpoint persistence (issue #273 task 3) ────────────────────────────
+
+    fn checkpoint_fixture(session_id: &str, head: &str) -> CollabCheckpoint {
+        CollabCheckpoint::from_json(&serde_json::json!({
+            "session_id": session_id,
+            "task_id": 1,
+            "status": "started",
+            "head_sha": head,
+            "completed_task_ids": "",
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn checkpoint_round_trips() {
+        let db = open();
+        create_session(
+            &db,
+            "s1",
+            "/repo",
+            "main",
+            None,
+            CollabRoles {
+                pilot: Agent::Claude,
+                implementer: Agent::Claude,
+            },
+        )
+        .unwrap();
+
+        upsert_checkpoint(&db, &checkpoint_fixture("s1", "aaa111")).unwrap();
+        let loaded = load_current_checkpoint(&db, "s1").unwrap().unwrap();
+
+        assert_eq!(loaded.head_sha, "aaa111");
+        assert_eq!(loaded.status, CheckpointStatus::Started);
+        assert_eq!(loaded.attested_by, AttestedBy::Implementer);
+        assert!(loaded.updated_at > 0, "server must stamp updated_at");
+    }
+
+    #[test]
+    fn checkpoint_upsert_replaces_rather_than_accumulates() {
+        let db = open();
+        create_session(
+            &db,
+            "s1",
+            "/repo",
+            "main",
+            None,
+            CollabRoles {
+                pilot: Agent::Claude,
+                implementer: Agent::Claude,
+            },
+        )
+        .unwrap();
+
+        upsert_checkpoint(&db, &checkpoint_fixture("s1", "aaa111")).unwrap();
+
+        let mut advanced = checkpoint_fixture("s1", "bbb222");
+        advanced.status = CheckpointStatus::Completed;
+        advanced.completed_task_ids = vec![1];
+        upsert_checkpoint(&db, &advanced).unwrap();
+
+        let count: i64 = db
+            .query_row(
+                "SELECT COUNT(*) FROM collab_checkpoints WHERE session_id = 's1'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1, "one current checkpoint per session");
+
+        let loaded = load_current_checkpoint(&db, "s1").unwrap().unwrap();
+        assert_eq!(loaded.head_sha, "bbb222");
+        assert_eq!(loaded.completed_task_ids, vec![1]);
+    }
+
+    #[test]
+    fn load_current_checkpoint_is_none_for_a_session_without_one() {
+        let db = open();
+        create_session(
+            &db,
+            "s1",
+            "/repo",
+            "main",
+            None,
+            CollabRoles {
+                pilot: Agent::Claude,
+                implementer: Agent::Claude,
+            },
+        )
+        .unwrap();
+        assert!(load_current_checkpoint(&db, "s1").unwrap().is_none());
+    }
+
+    /// Every field must survive the round trip — a dropped column here would
+    /// silently weaken the `implementation_done` gate downstream.
+    #[test]
+    fn checkpoint_round_trips_every_field() {
+        let db = open();
+        create_session(
+            &db,
+            "s1",
+            "/repo",
+            "main",
+            None,
+            CollabRoles {
+                pilot: Agent::Claude,
+                implementer: Agent::Claude,
+            },
+        )
+        .unwrap();
+
+        let full = CollabCheckpoint::from_json(&serde_json::json!({
+            "session_id": "s1",
+            "task_id": 4,
+            "task_title": "Wire the gate",
+            "status": "batch_complete",
+            "head_sha": "ccc333",
+            "commit_sha": "ccc333",
+            "completed_task_ids": "1,2,3,4",
+            "gates_result": "passed",
+            "gates_sha": "ccc333",
+            "gates_commands": "cargo fmt --all -- --check && cargo test --workspace",
+            "summary": "batch done",
+            "attested_by": "operator",
+            "acknowledged_divergence": "aaa111..ccc333",
+        }))
+        .unwrap();
+
+        upsert_checkpoint(&db, &full).unwrap();
+        let loaded = load_current_checkpoint(&db, "s1").unwrap().unwrap();
+
+        assert_eq!(loaded.task_id, Some(4));
+        assert_eq!(loaded.task_title.as_deref(), Some("Wire the gate"));
+        assert_eq!(loaded.status, CheckpointStatus::BatchComplete);
+        assert_eq!(loaded.commit_sha.as_deref(), Some("ccc333"));
+        assert_eq!(loaded.completed_task_ids, vec![1, 2, 3, 4]);
+        assert_eq!(loaded.gates_result, "passed");
+        assert_eq!(loaded.gates_sha.as_deref(), Some("ccc333"));
+        assert_eq!(loaded.attested_by, AttestedBy::Operator);
+        assert_eq!(
+            loaded.acknowledged_divergence.as_deref(),
+            Some("aaa111..ccc333")
+        );
+        assert!(loaded.gates_are_green_at_head());
+    }
+
+    /// The obligation Task 2 left this loader: rebuilding a `CollabCheckpoint`
+    /// field-by-field from a row bypasses every rule `from_json` enforces
+    /// unless `validate()` is called on the reconstructed struct. Migration
+    /// 020's CHECK is one-directional and *deliberately* permits
+    /// `attested_by = 'operator'` with `acknowledged_divergence` still NULL —
+    /// its header calls that combination's exclusion "a tool-layer rule, not
+    /// a schema guarantee" — so a raw INSERT of exactly that row must load as
+    /// an error, not a checkpoint claiming an unnamed operator escape hatch
+    /// from the head-consistency gate.
+    #[test]
+    fn load_current_checkpoint_rejects_an_operator_row_with_no_acknowledged_divergence() {
+        let db = open();
+        create_session(
+            &db,
+            "s1",
+            "/repo",
+            "main",
+            None,
+            CollabRoles {
+                pilot: Agent::Claude,
+                implementer: Agent::Claude,
+            },
+        )
+        .unwrap();
+
+        // Written with raw SQL, deliberately bypassing upsert_checkpoint (and
+        // therefore CollabCheckpoint::validate) entirely — this is the row
+        // migration 020's schema permits but the domain rules forbid.
+        db.execute(
+            "INSERT INTO collab_checkpoints
+               (session_id, status, head_sha, attested_by, updated_at)
+             VALUES ('s1', 'started', 'aaa111', 'operator', 1)",
+            [],
+        )
+        .unwrap();
+
+        let err = load_current_checkpoint(&db, "s1").unwrap_err();
+        assert!(
+            err.to_string().contains("s1") && err.to_string().contains("acknowledged_divergence"),
+            "got: {err}"
+        );
+    }
+
+    /// The mirror of Requirement B: a corrupted `completed_task_ids` value
+    /// must fail loudly rather than silently drop the unparseable entry. A
+    /// `filter_map(...ok())` loader would read `"1,2,X,4"` as `[1, 2, 4]` —
+    /// a checkpoint that quietly under-reports progress with no error
+    /// anywhere, which matters because `covers_all_tasks` gates
+    /// `implementation_done` on this exact field.
+    #[test]
+    fn load_current_checkpoint_rejects_a_corrupt_completed_task_ids_list() {
+        let db = open();
+        create_session(
+            &db,
+            "s1",
+            "/repo",
+            "main",
+            None,
+            CollabRoles {
+                pilot: Agent::Claude,
+                implementer: Agent::Claude,
+            },
+        )
+        .unwrap();
+
+        db.execute(
+            "INSERT INTO collab_checkpoints
+               (session_id, status, head_sha, completed_task_ids, updated_at)
+             VALUES ('s1', 'started', 'aaa111', '1,2,X,4', 1)",
+            [],
+        )
+        .unwrap();
+
+        let err = load_current_checkpoint(&db, "s1").unwrap_err();
+        assert!(
+            err.to_string().contains("completed_task_ids") && err.to_string().contains("X"),
+            "got: {err}"
+        );
+    }
+
+    /// The same silent-corruption failure Requirement B refuses for
+    /// `completed_task_ids`, one column over: `task_id` has no CHECK in
+    /// migration 020, so a raw write can put a negative value in it. A bare
+    /// `as u32` cast would wrap that into an unrelated positive task id
+    /// instead of failing, which is exactly the kind of quiet
+    /// misrepresentation this loader exists to refuse.
+    #[test]
+    fn load_current_checkpoint_rejects_a_negative_task_id() {
+        let db = open();
+        create_session(
+            &db,
+            "s1",
+            "/repo",
+            "main",
+            None,
+            CollabRoles {
+                pilot: Agent::Claude,
+                implementer: Agent::Claude,
+            },
+        )
+        .unwrap();
+
+        db.execute(
+            "INSERT INTO collab_checkpoints
+               (session_id, task_id, status, head_sha, updated_at)
+             VALUES ('s1', -1, 'started', 'aaa111', 1)",
+            [],
+        )
+        .unwrap();
+
+        let err = load_current_checkpoint(&db, "s1").unwrap_err();
+        assert!(
+            err.to_string().contains("task_id") && err.to_string().contains("-1"),
+            "got: {err}"
         );
     }
 }
