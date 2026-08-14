@@ -302,9 +302,16 @@ impl CollabCheckpoint {
     /// Requiredness, not shape: as with `head_sha`, this type cannot tell a
     /// real `<from_sha>..<to_sha>` from any other non-blank string, and it has
     /// no repo to resolve one against. Checking that the range parses, that
-    /// both endpoints exist, and that it actually spans the divergence is the
-    /// `implementation_done` gate's job in Task 10, which has the repo —
-    /// **that check is yours to add there, not here.**
+    /// both endpoints exist, and that it actually spans the divergence needs
+    /// the repo, and lives in
+    /// `mcp::tools::collab_checkpoint::verify_acknowledged_range` — at the
+    /// **write**, not at the `implementation_done` gate this comment used to
+    /// point at. See that function for why: verifying at the gate would leave a
+    /// fabricated range sitting in `collab_checkpoints` in the meantime, where
+    /// `session_handoff`, `collab_status` and `collab_resume` all render it to
+    /// a human as `attested_by: operator`; and `require_checkpoint_proof` is
+    /// deliberately pure with respect to the filesystem, so it has no repo
+    /// either.
     ///
     /// The `status`-shaped correlations — `batch_complete` should carry no
     /// `task_id`, `completed` should carry a `commit_sha` — are deliberately

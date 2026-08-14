@@ -1331,9 +1331,13 @@ fn checkpoint_drift(detail: String) -> MemoryError {
 /// caller-asserted like every other collab identity. Refusing them outright
 /// would leave the escape hatch with nothing to build on. Ignoring the field
 /// does neither: an operator-attested checkpoint that satisfies these four
-/// conditions passes here today, and the live-HEAD comparison plus the range
-/// verification that actually honors the attestation belong on the handoff
-/// and resume paths, *outside* this function.
+/// conditions passes here today, and the two checks that actually honor the
+/// attestation live outside this function — the live-HEAD comparison on the
+/// handoff and resume paths, and the range verification at the checkpoint
+/// *write*
+/// (`super::collab_checkpoint::verify_acknowledged_range`, Task 10), which is
+/// where the range is asserted and the only place a false one can be refused
+/// before it becomes a stored row every later reader trusts.
 ///
 /// **Binding constraint on the next author.** All of the above holds only
 /// because this function never reads live git HEAD. If a live-HEAD comparison
@@ -1530,7 +1534,12 @@ fn require_checkpoint_proof(
 /// the review hook does the same, and this file's own test fixtures already
 /// scrub — the production path was the one left exposed. PATH and the rest of
 /// the environment are deliberately preserved; only git's process controls go.
-fn scrub_git_environment(command: &mut Command) {
+///
+/// `pub(super)` so `collab_checkpoint`'s inspection and range-verification
+/// shell-outs (Task 10) go through the same scrub rather than growing a second,
+/// unscrubbed spelling. Every `Command::new("git")` in this module tree must
+/// call it before `.output()`.
+pub(super) fn scrub_git_environment(command: &mut Command) {
     for (key, _) in std::env::vars_os() {
         if key
             .to_string_lossy()
@@ -1808,7 +1817,16 @@ fn checkpoint_drift_message(head: &str, checkpoint: &crate::collab::CollabCheckp
 /// Takes the [`HeadCheck`] rather than performing it, so a caller that also
 /// needs to *act* on the result (`collab_resume` refuses on it) decides from
 /// the same single git read this block reports.
-fn checkpoint_json(checkpoint: Option<(&crate::collab::CollabCheckpoint, &HeadCheck)>) -> Value {
+///
+/// `pub(super)` so `collab_checkpoint`'s read-only inspection mode (Task 10)
+/// shows an operator the *same* checkpoint rendering `collab_status` and
+/// `collab_resume` do. An inspection that described the checkpoint in its own
+/// words would be a second, drifting statement of what the row says — and the
+/// operator about to attest is exactly the reader who must not be shown a
+/// different story from the successor who reads it afterwards.
+pub(super) fn checkpoint_json(
+    checkpoint: Option<(&crate::collab::CollabCheckpoint, &HeadCheck)>,
+) -> Value {
     let Some((cp, head_check)) = checkpoint else {
         return Value::Null;
     };

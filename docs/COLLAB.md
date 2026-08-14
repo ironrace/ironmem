@@ -1549,7 +1549,9 @@ a live divergence is by construction drift past that range, which no existing
 attestation has seen. The escape hatch works by *ending* the divergence rather
 than forgiving it — the operator files a fresh checkpoint at the current HEAD
 carrying the range it vouches for, at which point there is no divergence left
-to find and the attestation stays on the row for audit.
+to find and the attestation stays on the row for audit. See "Operator-attested
+checkpoint backfill" below for how that range is inspected and what the server
+checks before accepting it.
 
 A checkpoint that could not be compared against git at all does not refuse — a
 transient filesystem problem must not strand a recoverable session — but the
@@ -1573,6 +1575,112 @@ pick a dead-but-recoverable session back up — it is not needed for the
 normal in-flight recovery path (staying in-phase after a Tooling
 `failure_report`), which never calls `collab_resume` since that session
 never leaves its phase in the first place.
+
+### Operator-attested checkpoint backfill (issue #273)
+
+When a batch has committed work its checkpoint never recorded, the recorded
+progress is behind the repo and every reader — `session_handoff`,
+`collab_status`, `collab_resume` — is being shown a false progress report. The
+recovery is **not** for the server to write the missing checkpoint itself.
+
+**The server never synthesizes a checkpoint from post-checkpoint commits.** It
+can see the commits; it cannot know which *tasks* they completed, and inferring
+that from commit messages would manufacture exactly the false provenance this
+issue exists to prevent. An auto-backfill would replace a stale-but-honest
+report with a fresh-and-fabricated one. So the operator **inspects** the range,
+then explicitly **attests** to it.
+
+#### 1. Inspect (read-only)
+
+```
+collab_checkpoint(session_id=<id>, agent=<you>, inspect_divergence=true)
+```
+
+Writes nothing: no checkpoint row, no audit row, no session change. `agent` is
+still required — there is no `agent`-less operator entry point onto the one
+tool that can write `attested_by=operator` — but this mode takes no generation
+lease, so an operator can look *before* taking the session over. A
+`handoff_token` is refused rather than ignored, claiming one being a write.
+
+Returns the same `checkpoint` block `collab_status` does (so the operator and
+the successor who reads the row later are shown one story), plus:
+
+- `commit_range` — `<checkpoint head_sha>..<live HEAD>`, or `null`.
+- `commits` — the commits in that range, newest first, each `{ sha, subject }`.
+  The subjects are the point: an override that shows only a sha range is a
+  rubber stamp, which is worse than no override because it launders a
+  fabrication through a human. Capped at 200, with `commits_truncated` saying
+  so rather than the list quietly ending.
+- `attestable` — whether there is a range here to attest to at all.
+- `attestation` — the exact `collab_checkpoint(...)` call that would attest to
+  what was just shown, present only when `attestable`.
+- `commit_range_status` — **five** answers, and the distinctions are the
+  substance:
+  - `listed` — a real run of commits after the checkpoint. The only
+    `attestable` answer.
+  - `no_divergence` — checked, and the checkpoint already describes live HEAD.
+  - `not_checked` — live HEAD could not be read, so drift is **unknown**. Never
+    reported as `no_divergence`: an unreadable repo is precisely where a
+    checkpoint is most likely stale.
+  - `checkpoint_head_unreachable` — the checkpoint's `head_sha` is not
+    reachable from live HEAD (history rewritten, a different branch, or a sha
+    that never existed). That is **branch drift, not a checkpoint gap**, and it
+    is not offered as an attestable range. Note `git log <cp>..<HEAD>`
+    *succeeds* for an unrelated branch and would list every commit on it, none
+    of which is post-checkpoint work — so the reachability is asked directly,
+    not inferred from git failing.
+  - `no_checkpoint` — the session never checkpointed, so there is no claim to
+    reconcile and nothing to attest over.
+- `commit_range_error` — why, for the three answers that have no range.
+
+#### 2. Attest
+
+```
+collab_checkpoint(session_id=<id>, agent=<you>, status=<...>,
+                  head_sha=<live HEAD>, completed_task_ids=<cumulative>,
+                  attested_by=operator, acknowledged_divergence=<from>..<to>)
+```
+
+`attested_by=operator` **requires** `acknowledged_divergence`, and an
+implementer may never carry one — an agent that could set the field itself
+would be writing its own permission slip. Beyond that presence rule, the range
+is resolved **against the repository** before the write lands:
+
+- both endpoints must name real commits;
+- the range must **end at this checkpoint's own `head_sha`** — the closed-range
+  property `collab_resume` relies on, without which one inspection could be
+  pasted onto any later checkpoint;
+- it must cover at least one commit (`X..X` vouches for nothing);
+- `from` must be an ancestor of `to`;
+- and it must **span the divergence**: `from` must be an ancestor-or-equal of
+  the head of the checkpoint being replaced, so the tail of the gap cannot be
+  attested while the commits nearest the stale checkpoint go uncovered.
+
+A refused attestation persists nothing. Two states are labelled rather than
+refused, so a legitimate attestation stays writable when the repo momentarily
+cannot answer — the response and the audit row both carry
+`attestation_check`:
+
+- `verified` — every check ran and held.
+- `verified_without_span` — the endpoints held, but the replaced checkpoint's
+  head no longer resolves (history rewritten out from under it), so coverage of
+  the gap is unknown.
+- `unverified_repo_unreadable` — live HEAD could not be read, so only the
+  range's *syntax* was checked. A malformed range is still refused here; an
+  unresolvable one is recorded as unverified rather than dressed as verified.
+
+Operator attestations are logged under their own `wal_log` operation,
+`collab_checkpoint_operator_attested`, rather than as ordinary
+`collab_checkpoint` rows. This is the one path that knowingly covers commits
+the protocol never witnessed, so an audit finds every one of them by operation
+name without parsing payloads.
+
+**What this does not do.** The attestation is a *human's* claim, checked for
+consistency against the repo — it is not proof the human looked. `attested_by`
+is caller-asserted like every other collab identity, and an agent holding the
+session's generation lease can set it. What the checks above buy is that the
+range it names cannot be fiction: the commits exist, they end where the
+checkpoint is filed, and they cover the whole gap.
 
 ### `session_handoff` (fallback succession)
 
