@@ -24,6 +24,7 @@ use crate::collab::{claim_handoff_token, read_actor_generation, Agent};
 use crate::error::MemoryError;
 use crate::mcp::app::App;
 
+use super::collab_session::HeadCheck;
 use super::shared::{require_agent, require_str};
 
 // ── Checkpoint constants ─────────────────────────────────────────────────────
@@ -172,15 +173,6 @@ fn task_list_str_field(raw: Option<&str>, key: &str) -> Option<String> {
 
 // ── Checkpoint reader ────────────────────────────────────────────────────────
 
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub(super) struct Checkpoint {
-    pub status: Option<String>,
-    pub task_id: Option<String>,
-    pub completed_task_ids: Option<String>,
-    pub next_task_id: Option<String>,
-    pub gates: Option<String>,
-}
-
 fn opt(s: Option<&str>) -> &str {
     match s {
         Some(v) if !v.is_empty() => v,
@@ -188,59 +180,227 @@ fn opt(s: Option<&str>) -> &str {
     }
 }
 
-/// Current collab checkpoint drawer for this session, parsed from the compact
-/// KV format. The logical-keyed drawer is preferred deterministically; legacy
-/// append-only checkpoints remain a fallback during rollout. Never use semantic
+/// Everything the handoff block says about this session's progress record.
+///
+/// # Why the legacy drawer's *contents* are gone
+///
+/// Until issue #273 this block was rendered from the
+/// `collab-checkpoint:<session_id>` drawer — an agent-side convention written
+/// by `add_drawer` and verified by nothing. That is the exact artifact the
+/// incident turned on: a batch committed 28 changes while its drawer stayed
+/// frozen at "task 1 / started", and the handoff that followed presented the
+/// frozen drawer to a successor as current progress.
+///
+/// Three options were on the table for that read, and this type is the third.
+/// *Replacing it outright* with the `collab_checkpoints` row loses information
+/// for any session already mid-flight at upgrade time, and — worse — would
+/// have this block assert `checkpoint: none` about a session that does have a
+/// (legacy) progress record, which is its own false claim. *Reading the row
+/// and falling back to the drawer* keeps the incident's code path alive and
+/// puts unverified content under the same keys as verified content, which is
+/// precisely the conflation that did the damage.
+///
+/// So: the row is the only thing ever rendered as checkpoint content, and the
+/// drawer is reported by **existence only**, under its own key, described as
+/// unverified, with the `get_drawer` call that reads it. A successor loses no
+/// ability to find the legacy record and gains no ability to mistake it for a
+/// verified one — the drawer's field values never enter the block at all.
+///
+/// The drawer is unverifiable in a way that is not a matter of degree: its KV
+/// format has no `head_sha` field, so there is nothing in it to compare
+/// against git HEAD. Rendering it beside a row's `checkpoint.head_check` line
+/// would mean showing a progress claim under keys that imply it was checked.
+#[derive(Default)]
+pub(super) struct CheckpointSection {
+    /// The verified `collab_checkpoints` row and what comparing it against
+    /// live git HEAD established. `None` means this session has no row.
+    pub current: Option<(crate::collab::CollabCheckpoint, HeadCheck)>,
+    /// Whether a pre-#273 checkpoint drawer exists for this session. Its
+    /// contents are deliberately not carried — see the type's doc comment.
+    pub legacy_drawer_present: bool,
+}
+
+/// Whether a pre-#273 `collab-checkpoints` drawer exists for this session.
+///
+/// Existence only, by design: see [`CheckpointSection`]. Never use semantic
 /// search for recovery state.
-pub(super) fn latest_checkpoint(
+pub(super) fn legacy_checkpoint_drawer_exists(
     db: &crate::db::schema::Database,
     session_id: &str,
-) -> Result<Option<Checkpoint>, MemoryError> {
-    // Intentionally runs as a separate read after the session-snapshot transaction
-    // (render-only; can't interleave under the single-request MCP dispatch model).
+) -> Result<bool, MemoryError> {
     db.with_connection(|conn| {
         // Wrap the needle in sentinel newlines so `session_id: <id>` matches only
         // as a complete line, avoiding substring collisions (e.g. "test-sid" inside
         // "test-sid-extra") or cross-session matches. Concatenating char(10) on both
         // sides of `content` ensures first-line and last-line entries also match.
+        //
+        // Matches the logical-keyed drawer and the older append-only ones
+        // alike: for an existence answer the distinction between them does not
+        // matter, and both are equally unverified.
         let needle = format!("\nsession_id: {session_id}\n");
-        let logical_source = format!("logical:collab-checkpoint:{session_id}");
-        let content: Option<String> = conn
+        let found: Option<i64> = conn
             .query_row(
-                "SELECT content FROM drawers
+                "SELECT 1 FROM drawers
                  WHERE wing = ?1 AND room = ?2
                    AND (char(10) || content || char(10)) LIKE '%' || ?3 || '%'
-                 -- Prefer the current logical-keyed checkpoint. If absent, retain legacy
-                 -- recovery behavior by selecting the newest append-only checkpoint.
-                 ORDER BY CASE WHEN source_file = ?4 THEN 0 ELSE 1 END, rowid DESC LIMIT 1",
-                rusqlite::params![CHECKPOINT_WING, CHECKPOINT_ROOM, needle, logical_source],
+                 LIMIT 1",
+                rusqlite::params![CHECKPOINT_WING, CHECKPOINT_ROOM, needle],
                 |r| r.get(0),
             )
             .optional()?;
-        Ok(content.map(|c| parse_checkpoint(&c)))
+        Ok(found.is_some())
     })
 }
 
-fn parse_checkpoint(content: &str) -> Checkpoint {
-    let mut cp = Checkpoint::default();
-    for line in content.lines() {
-        let Some((k, v)) = line.split_once(':') else {
-            continue;
-        };
-        let v = v.trim().to_string();
-        match k.trim() {
-            "status" => cp.status = Some(v),
-            "task_id" => cp.task_id = Some(v),
-            "completed_task_ids" => cp.completed_task_ids = Some(v),
-            "next_task_id" => cp.next_task_id = Some(v),
-            "gates" => cp.gates = Some(v),
-            _ => {}
+// ── Handoff block renderer ───────────────────────────────────────────────────
+
+const EM_DASH: &str = "\u{2014}";
+
+/// Write one `key: value` line of the checkpoint section, rendering `None` as
+/// an em-dash and flattening the value onto a single line.
+///
+/// The flattening is structural rather than applied per field on purpose.
+/// Several of these values are text this module did not compose — a git error
+/// message, and stored checkpoint columns a direct SQL write could put
+/// anything in. A newline inside one would split the value across two lines,
+/// and the tail would parse as a key the successor has no reason to distrust.
+/// Doing it here means a field added later cannot forget.
+fn kv(out: &mut String, key: &str, value: Option<&str>) {
+    match value.filter(|v| !v.is_empty()) {
+        Some(v) => {
+            let _ = writeln!(
+                out,
+                "{key}: {}",
+                v.split_whitespace().collect::<Vec<_>>().join(" ")
+            );
+        }
+        None => {
+            let _ = writeln!(out, "{key}: {EM_DASH}");
         }
     }
-    cp
 }
 
-// ── Handoff block renderer ───────────────────────────────────────────────────
+/// Render the checkpoint lines of the handoff block.
+///
+/// Every key is emitted on every call, unset ones as an em-dash, so the block's
+/// key set stays fixed and a successor parsing it never has to distinguish
+/// "absent key" from "absent value".
+///
+/// `checkpoint.head_check` is the line issue #273 turns on. It has **three**
+/// values, never two: `matches`, `diverged`, and `unverified`. Reporting an
+/// unreadable repo as anything resembling "no divergence" would present an
+/// unverified claim as verified — the same failure, one level down, as the
+/// stale checkpoint that caused the incident.
+fn render_checkpoint(out: &mut String, section: &CheckpointSection) {
+    let current = section.current.as_ref();
+    let _ = writeln!(
+        out,
+        "checkpoint: {}",
+        // "present" means a server-verified `collab_checkpoints` row, and only
+        // that. A legacy drawer never makes this say "present".
+        if current.is_some() { "present" } else { "none" }
+    );
+
+    let status = current.map(|(cp, _)| cp.status.to_string());
+    let task_id = current
+        .and_then(|(cp, _)| cp.task_id)
+        .map(|id| id.to_string());
+    let completed = current.map(|(cp, _)| {
+        if cp.completed_task_ids.is_empty() {
+            "none".to_string()
+        } else {
+            cp.completed_task_ids
+                .iter()
+                .map(u32::to_string)
+                .collect::<Vec<_>>()
+                .join(",")
+        }
+    });
+    let next_task_id = current
+        .and_then(|(cp, _)| cp.next_task_id)
+        .map(|id| id.to_string());
+    kv(out, "checkpoint.status", status.as_deref());
+    kv(out, "checkpoint.task_id", task_id.as_deref());
+    kv(out, "checkpoint.completed_task_ids", completed.as_deref());
+    kv(out, "checkpoint.next_task_id", next_task_id.as_deref());
+    kv(
+        out,
+        "checkpoint.head_sha",
+        current.map(|(cp, _)| cp.head_sha.as_str()),
+    );
+    kv(
+        out,
+        "checkpoint.gates_result",
+        current.map(|(cp, _)| cp.gates_result.as_str()),
+    );
+    kv(
+        out,
+        "checkpoint.attested_by",
+        current.map(|(cp, _)| cp.attested_by.as_str()),
+    );
+    kv(
+        out,
+        "checkpoint.acknowledged_divergence",
+        current.and_then(|(cp, _)| cp.acknowledged_divergence.as_deref()),
+    );
+    // The row's `updated_at` — the server's anti-backdating stamp — is
+    // deliberately NOT rendered here. This block is contractually free of
+    // timestamps (see `compose_handoff_block`), and `head_check` below is a
+    // strictly better staleness signal anyway: it compares the checkpoint
+    // against the repo rather than inviting a reader to guess from a clock.
+    // `collab_status` and `collab_resume` carry `updated_at` in their JSON,
+    // which is under no such constraint.
+    let head_check = current.map(|(_, check)| check);
+    kv(
+        out,
+        "checkpoint.head_check",
+        match head_check {
+            None => None,
+            Some(HeadCheck::Unreadable { .. }) => Some("unverified"),
+            Some(check) if check.divergence().is_some() => Some("diverged"),
+            Some(_) => Some("matches"),
+        },
+    );
+    kv(
+        out,
+        "checkpoint.repo_head_sha",
+        head_check.and_then(|check| match check {
+            HeadCheck::Checked { repo_head_sha, .. } => Some(repo_head_sha.as_str()),
+            HeadCheck::Unreadable { .. } => None,
+        }),
+    );
+    kv(
+        out,
+        "checkpoint.divergence",
+        head_check.and_then(HeadCheck::divergence),
+    );
+    let verification_error = head_check
+        .and_then(HeadCheck::unreadable_detail)
+        .map(|detail| format!("checkpoint could not be verified against git HEAD: {detail}"));
+    kv(
+        out,
+        "checkpoint.head_check_error",
+        verification_error.as_deref(),
+    );
+
+    kv(
+        out,
+        "checkpoint.legacy_drawer",
+        Some(if section.legacy_drawer_present {
+            // Existence, never contents — see `CheckpointSection`. Naming the
+            // read explicitly is what keeps this from being information loss:
+            // the successor can still fetch the drawer, having first been told
+            // nothing verifies it.
+            "present (pre-#273 drawer; UNVERIFIED and deliberately not shown here — \
+             it records no head_sha, so nothing can check it against git. Read it with \
+             get_drawer(wing=ironrace-memory, room=collab-checkpoints) if you need it, \
+             and treat it as a claim, not a record. Any checkpoint.* value above comes \
+             from the verified collab_checkpoints row, never from this drawer.)"
+        } else {
+            "none"
+        }),
+    );
+}
 
 /// Pure deterministic render of session state + checkpoint (no clock,
 /// no randomness, no timestamps). Key order in the fenced block is stable
@@ -252,11 +412,9 @@ pub(super) fn compose_handoff_block(
     record: &SessionRecord,
     agent: Agent,
     pending_generation: u64,
-    checkpoint: Option<Checkpoint>,
+    checkpoint: CheckpointSection,
 ) -> String {
     let s = &record.session;
-    let cp = checkpoint.unwrap_or_default();
-    let cp_present = cp != Checkpoint::default();
     let plan_file_path = task_list_str_field(s.task_list.as_deref(), "plan_file_path");
     let execution_mode = task_list_str_field(s.task_list.as_deref(), "execution_mode");
     let mut out = String::new();
@@ -348,31 +506,7 @@ pub(super) fn compose_handoff_block(
     );
     let _ = writeln!(out, "pr_url: {}", opt(s.pr_url.as_deref()));
     let _ = writeln!(out, "expected_next_event: {}", s.phase.expected_event());
-    let _ = writeln!(
-        out,
-        "checkpoint: {}",
-        if cp_present { "present" } else { "none" }
-    );
-    let _ = writeln!(out, "checkpoint.status: {}", opt(cp.status.as_deref()));
-    let _ = writeln!(out, "checkpoint.task_id: {}", opt(cp.task_id.as_deref()));
-    let _ = writeln!(
-        out,
-        "checkpoint.completed_task_ids: {}",
-        opt(cp.completed_task_ids.as_deref())
-    );
-    let _ = writeln!(
-        out,
-        "checkpoint.next_task_id: {}",
-        opt(cp.next_task_id.as_deref())
-    );
-    let _ = writeln!(
-        out,
-        "gates: {}",
-        cp.gates
-            .as_deref()
-            .filter(|g| !g.is_empty())
-            .unwrap_or("not_recorded")
-    );
+    render_checkpoint(&mut out, &checkpoint);
     let _ = writeln!(out, "handoff.agent: {}", agent.as_str());
     let _ = writeln!(out, "handoff.generation: {pending_generation}");
     out.push_str("```");
@@ -419,8 +553,28 @@ pub(super) fn handle_session_handoff(app: &App, args: &Value) -> Result<Value, M
         }
     }
 
-    let checkpoint = latest_checkpoint(&app.db, session_id)?;
-    let block = compose_handoff_block(&record, agent, issued.pending_generation, checkpoint);
+    // Issue #273: the handoff block is where a stale checkpoint did the most
+    // damage — a successor read it as current progress while the branch had
+    // moved on. It now carries the verified checkpoint row and, when git
+    // disagrees with it, the drift diagnostic.
+    //
+    // Both reads run *after* the transaction above, render-only: they cannot
+    // interleave under the single-request MCP dispatch model, and the git
+    // shell-out in particular must not sit inside a write transaction —
+    // `with_transaction` replays on `SQLITE_BUSY_SNAPSHOT`, and a
+    // `Command::output()` there holds the transaction open across a process
+    // spawn. Same reasoning `collab_checkpoint` records at its own git read.
+    let current = app
+        .db
+        .with_connection(|conn| crate::collab::queue::load_current_checkpoint(conn, session_id))?;
+    let section = CheckpointSection {
+        current: current.map(|cp| {
+            let check = HeadCheck::read(&record.repo_path, &cp);
+            (cp, check)
+        }),
+        legacy_drawer_present: legacy_checkpoint_drawer_exists(&app.db, session_id)?,
+    };
+    let block = compose_handoff_block(&record, agent, issued.pending_generation, section);
 
     Ok(json!({
         "session_id": session_id,
@@ -459,15 +613,17 @@ mod tests {
     #[test]
     fn compose_block_is_deterministic_and_has_no_timestamps() {
         let r = sample_record(Phase::CodeImplementPending);
-        let a = compose_handoff_block(&r, Agent::Claude, 1, None);
-        let b = compose_handoff_block(&r, Agent::Claude, 1, None);
+        let a = compose_handoff_block(&r, Agent::Claude, 1, CheckpointSection::default());
+        let b = compose_handoff_block(&r, Agent::Claude, 1, CheckpointSection::default());
         assert_eq!(a, b);
         assert!(a.starts_with("```ironrace-session-handoff\n"));
         assert!(a.trim_end().ends_with("```"));
         assert!(!a.contains("created_at") && !a.contains("updated_at") && !a.contains("ended_at"));
         assert!(a.contains("phase: CodeImplementPending"));
         assert!(a.contains("checkpoint: none"));
-        assert!(a.contains("gates: not_recorded"));
+        assert!(a.contains("checkpoint.gates_result: \u{2014}"));
+        assert!(a.contains("checkpoint.head_check: \u{2014}"));
+        assert!(a.contains("checkpoint.legacy_drawer: none"));
         assert!(a.contains("task_list.plan_file_path: \u{2014}"));
         assert!(a.contains("task_list.execution_mode: \u{2014}"));
         assert!(a.contains("handoff.agent: claude"));
@@ -481,7 +637,7 @@ mod tests {
     fn compose_block_reports_non_default_pilot() {
         let mut r = sample_record(Phase::PlanParallelDrafts);
         r.session.pilot = Agent::Codex;
-        let block = compose_handoff_block(&r, Agent::Claude, 1, None);
+        let block = compose_handoff_block(&r, Agent::Claude, 1, CheckpointSection::default());
         assert!(block.contains("pilot: codex"), "block was:\n{block}");
     }
 
@@ -813,81 +969,174 @@ mod tests {
         assert_eq!(out["generation"], json!(1));
     }
 
-    #[test]
-    fn latest_checkpoint_prefers_current_logical_key_over_newer_legacy_drawer() {
-        let (app, _dir) = test_handoff_app();
-        let session_id = "test-current-checkpoint";
-        let wing = CHECKPOINT_WING;
-        let room = CHECKPOINT_ROOM;
-        let embedding = vec![0.0; 384];
-        let logical = format!(
-            "collab_checkpoint\nsession_id: {session_id}\nstatus: completed\ncompleted_task_ids: 1,2\nnext_task_id: 3"
-        );
-        let legacy = format!(
-            "collab_checkpoint\nsession_id: {session_id}\nstatus: started\ncompleted_task_ids: 1\nnext_task_id: 2"
-        );
+    /// A `collab_checkpoints` row, built through `from_json` (and therefore
+    /// through `validate`) like every real checkpoint rather than
+    /// hand-assembled.
+    fn row_checkpoint(session_id: &str, head_sha: &str) -> crate::collab::CollabCheckpoint {
+        crate::collab::CollabCheckpoint::from_json(&json!({
+            "session_id": session_id,
+            "task_id": 2,
+            "status": "completed",
+            "head_sha": head_sha,
+            "completed_task_ids": "1,2",
+            "next_task_id": 3,
+            "gates_result": "passed",
+            "gates_sha": head_sha,
+        }))
+        .unwrap()
+    }
 
+    fn section_at_head(cp: crate::collab::CollabCheckpoint) -> CheckpointSection {
+        let head = cp.head_sha.clone();
+        CheckpointSection {
+            current: Some((
+                cp,
+                HeadCheck::Checked {
+                    repo_head_sha: head,
+                    divergence: None,
+                },
+            )),
+            legacy_drawer_present: false,
+        }
+    }
+
+    fn insert_legacy_drawer(app: &crate::mcp::app::App, session_id: &str, body: &str) {
         app.db
             .insert_drawer(
-                &crate::db::drawers::generate_id("logical-key:checkpoint", wing, room),
-                &logical,
-                &embedding,
-                wing,
-                room,
+                &crate::db::drawers::generate_id(body, CHECKPOINT_WING, CHECKPOINT_ROOM),
+                body,
+                &vec![0.0; 384],
+                CHECKPOINT_WING,
+                CHECKPOINT_ROOM,
                 &format!("logical:collab-checkpoint:{session_id}"),
                 "test",
             )
             .unwrap();
-        // Insert after the logical drawer to prove the legacy row's newer rowid
-        // cannot supersede the one current checkpoint.
-        app.db
-            .insert_drawer(
-                &crate::db::drawers::generate_id("legacy-checkpoint", wing, room),
-                &legacy,
-                &embedding,
-                wing,
-                room,
-                "",
-                "test",
-            )
-            .unwrap();
-
-        let checkpoint = latest_checkpoint(&app.db, session_id).unwrap().unwrap();
-        assert_eq!(checkpoint.status.as_deref(), Some("completed"));
-        assert_eq!(checkpoint.completed_task_ids.as_deref(), Some("1,2"));
-        assert_eq!(checkpoint.next_task_id.as_deref(), Some("3"));
     }
 
-    /// Verify that `parse_checkpoint` extracts all expected fields from a realistic
-    /// multi-line checkpoint string, and that `compose_handoff_block` with that
-    /// checkpoint renders the populated fields (checkpoint: present, gates: passed,
-    /// checkpoint.status: completed, etc.).
+    /// The incident's own artifact. A pre-#273 checkpoint drawer must be
+    /// reported as *existing* and never rendered as checkpoint content: its
+    /// values must not reach the block under any `checkpoint.*` key, because
+    /// a successor that reads an unverified drawer under the same keys as a
+    /// verified row is exactly the conflation that caused issue #273.
     #[test]
-    fn parse_checkpoint_and_compose_block_with_populated_checkpoint() {
-        let checkpoint_body = "\
-collab_checkpoint\n\
-session_id: test-sid\n\
-phase: CodeImplementPending\n\
-status: completed\n\
-task_id: 2\n\
-completed_task_ids: 1,2\n\
-next_task_id: 3\n\
-gates: passed\n";
-
-        let cp = parse_checkpoint(checkpoint_body);
-        assert_eq!(cp.status.as_deref(), Some("completed"), "status");
-        assert_eq!(cp.task_id.as_deref(), Some("2"), "task_id");
-        assert_eq!(
-            cp.completed_task_ids.as_deref(),
-            Some("1,2"),
-            "completed_task_ids"
+    fn a_legacy_drawer_is_named_but_never_rendered_as_checkpoint_content() {
+        let (app, _dir) = test_handoff_app();
+        let session_id = seed_active_session(&app);
+        insert_legacy_drawer(
+            &app,
+            &session_id,
+            &format!(
+                "collab_checkpoint\nsession_id: {session_id}\nstatus: completed\n\
+                 completed_task_ids: 1,2\nnext_task_id: 3\ngates: passed"
+            ),
         );
-        assert_eq!(cp.next_task_id.as_deref(), Some("3"), "next_task_id");
-        assert_eq!(cp.gates.as_deref(), Some("passed"), "gates");
 
-        // compose_handoff_block must render the populated checkpoint correctly.
+        assert!(legacy_checkpoint_drawer_exists(&app.db, &session_id).unwrap());
+        let out =
+            handle_session_handoff(&app, &json!({"session_id": session_id, "agent": "claude"}))
+                .unwrap();
+        let block = out["handoff_block"].as_str().unwrap();
+
+        assert!(
+            block.contains("checkpoint: none"),
+            "a drawer is not a checkpoint row and must never make this say present: {block}"
+        );
+        assert!(
+            block.contains("checkpoint.legacy_drawer: present"),
+            "the successor must be told the legacy drawer exists: {block}"
+        );
+        assert!(
+            block.contains("UNVERIFIED"),
+            "the legacy drawer must be named as unverified: {block}"
+        );
+        // The values the drawer claims must not appear anywhere in the block.
+        for claimed in [
+            "checkpoint.status: completed",
+            "checkpoint.completed_task_ids: 1,2",
+        ] {
+            assert!(
+                !block.contains(claimed),
+                "drawer content must never be rendered as checkpoint content ({claimed}): {block}"
+            );
+        }
+    }
+
+    /// A session with neither a row nor a drawer says so on both keys, so
+    /// `legacy_drawer: present` above is a real finding rather than a constant.
+    #[test]
+    fn no_checkpoint_and_no_drawer_reports_both_as_none() {
+        let (app, _dir) = test_handoff_app();
+        let session_id = seed_active_session(&app);
+        assert!(!legacy_checkpoint_drawer_exists(&app.db, &session_id).unwrap());
+        let out =
+            handle_session_handoff(&app, &json!({"session_id": session_id, "agent": "claude"}))
+                .unwrap();
+        let block = out["handoff_block"].as_str().unwrap();
+        assert!(block.contains("checkpoint: none"), "{block}");
+        assert!(block.contains("checkpoint.legacy_drawer: none"), "{block}");
+    }
+
+    /// A drawer belonging to another session must not be reported here — the
+    /// existence query is line-anchored on `session_id`, and a substring match
+    /// would attach one session's legacy record to another's handoff.
+    #[test]
+    fn a_legacy_drawer_for_another_session_is_not_reported() {
+        let (app, _dir) = test_handoff_app();
+        let session_id = seed_active_session(&app);
+        insert_legacy_drawer(
+            &app,
+            &format!("{session_id}-extra"),
+            &format!("collab_checkpoint\nsession_id: {session_id}-extra\nstatus: completed"),
+        );
+        assert!(!legacy_checkpoint_drawer_exists(&app.db, &session_id).unwrap());
+    }
+
+    /// A multi-line git error must not split the block into a bogus extra key.
+    /// `git rev-parse` can emit several lines of stderr, and the block is
+    /// line-oriented `key: value` — a raw newline in a value would make the
+    /// tail parse as a key a successor has no reason to distrust.
+    #[test]
+    fn a_multi_line_git_error_is_flattened_onto_one_block_line() {
+        let cp = row_checkpoint("test-sid-sample", "aaaaaaa");
+        let section = CheckpointSection {
+            current: Some((
+                cp,
+                HeadCheck::Unreadable {
+                    detail: "fatal: not a git repository\nhint: use git init\ncurrent_owner: codex"
+                        .to_string(),
+                },
+            )),
+            legacy_drawer_present: false,
+        };
         let r = sample_record(Phase::CodeImplementPending);
-        let block = compose_handoff_block(&r, Agent::Codex, 2, Some(cp));
+        let block = compose_handoff_block(&r, Agent::Claude, 1, section);
+
+        let error_lines: Vec<_> = block
+            .lines()
+            .filter(|l| l.starts_with("checkpoint.head_check_error: "))
+            .collect();
+        assert_eq!(error_lines.len(), 1, "block was:\n{block}");
+        assert!(
+            error_lines[0].contains("hint: use git init"),
+            "the whole message must survive, flattened: {}",
+            error_lines[0]
+        );
+        // The smuggled line must not have become a block key of its own.
+        assert!(
+            !block.lines().any(|l| l == "current_owner: codex"),
+            "a newline in git stderr must not forge a block key:\n{block}"
+        );
+    }
+
+    /// `compose_handoff_block` renders every field of a verified checkpoint
+    /// row, including the two the drawer never had: `head_sha` and
+    /// `attested_by`.
+    #[test]
+    fn compose_block_renders_a_verified_checkpoint_row() {
+        let cp = row_checkpoint("test-sid-sample", "aaaaaaa");
+        let r = sample_record(Phase::CodeImplementPending);
+        let block = compose_handoff_block(&r, Agent::Codex, 2, section_at_head(cp));
 
         assert!(
             block.contains("checkpoint: present"),
@@ -910,7 +1159,19 @@ gates: passed\n";
             "checkpoint.next_task_id must be rendered"
         );
         assert!(
-            block.contains("gates: passed"),
+            block.contains("checkpoint.head_sha: aaaaaaa"),
+            "checkpoint.head_sha must be rendered — it is the field the whole issue turns on"
+        );
+        assert!(
+            block.contains("checkpoint.attested_by: implementer"),
+            "checkpoint.attested_by must be rendered"
+        );
+        assert!(
+            block.contains("checkpoint.head_check: matches"),
+            "a checkpoint at live HEAD must be reported as matching"
+        );
+        assert!(
+            block.contains("checkpoint.gates_result: passed"),
             "gates must be rendered from checkpoint"
         );
         assert!(
@@ -941,7 +1202,7 @@ gates: passed\n";
         r.session.recovery_attempts = 1;
         r.session.total_recovery_attempts = 3;
 
-        let block = compose_handoff_block(&r, Agent::Claude, 1, None);
+        let block = compose_handoff_block(&r, Agent::Claude, 1, CheckpointSection::default());
         assert!(block.contains("pending_failure: git_commit_failed: index.lock EPERM"));
         assert!(block.contains("failed_from_phase: CodeReviewFixGlobalPending"));
         assert!(block.contains("recovery_phase: CodeReviewFixGlobalPending"));
@@ -960,7 +1221,7 @@ gates: passed\n";
     #[test]
     fn handoff_block_renders_recovery_placeholders_when_unset() {
         let r = sample_record(crate::collab::Phase::CodeImplementPending);
-        let block = compose_handoff_block(&r, Agent::Claude, 1, None);
+        let block = compose_handoff_block(&r, Agent::Claude, 1, CheckpointSection::default());
         assert!(block.contains("pending_failure: \u{2014}"));
         assert!(block.contains("failed_from_phase: \u{2014}"));
         assert!(block.contains("recovery_phase: \u{2014}"));
@@ -989,8 +1250,8 @@ gates: passed\n";
             CodingFailed,
         ] {
             let r = sample_record(phase);
-            let b1 = compose_handoff_block(&r, Agent::Claude, 1, None);
-            let b2 = compose_handoff_block(&r, Agent::Claude, 1, None);
+            let b1 = compose_handoff_block(&r, Agent::Claude, 1, CheckpointSection::default());
+            let b2 = compose_handoff_block(&r, Agent::Claude, 1, CheckpointSection::default());
             assert_eq!(b1, b2, "phase {phase} must render identically");
             assert!(
                 b1.contains(&format!("phase: {phase}")),
@@ -1022,20 +1283,14 @@ gates: passed\n";
             })
             .to_string(),
         );
-        let cp = Checkpoint {
-            status: Some("completed".into()),
-            task_id: Some("2".into()),
-            completed_task_ids: Some("1,2".into()),
-            next_task_id: Some("3".into()),
-            gates: Some("passed".into()),
-        };
-        let block = compose_handoff_block(&r, Agent::Codex, 2, Some(cp));
+        let cp = row_checkpoint("test-sid-sample", "aaaaaaa");
+        let block = compose_handoff_block(&r, Agent::Codex, 2, section_at_head(cp));
         assert!(block.contains("plan.canonical.drawer_id: abc123"));
         assert!(block.contains("plan.canonical.hash: def456"));
         assert!(block.contains("plan.final.drawer_id: fff999"));
         assert!(block.contains("task_list.plan_file_path: docs/iron/plans/handoff.md"));
         assert!(block.contains("task_list.execution_mode: mechanical_direct"));
-        assert!(block.contains("gates: passed"));
+        assert!(block.contains("checkpoint.gates_result: passed"));
         assert!(block.contains("checkpoint: present"));
         assert!(block.contains("checkpoint.status: completed"));
         assert!(block.contains("handoff.agent: codex"));

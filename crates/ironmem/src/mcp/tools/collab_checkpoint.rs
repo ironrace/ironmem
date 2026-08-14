@@ -24,80 +24,8 @@ use crate::collab::CollabCheckpoint;
 use crate::error::MemoryError;
 use crate::mcp::app::App;
 
+use super::collab_session::HeadCheck;
 use super::shared::{require_agent, require_str};
-
-/// What comparing the checkpoint against live git HEAD actually established.
-///
-/// Three states, deliberately not two. `checkpoint_divergence` collapses
-/// "checked, no drift" and "could not check" into a single `None` — which is
-/// safe for the gate paths it was written for, and wrong here: git missing from
-/// `PATH`, an unreadable repo, or a path that is not a repo at all are exactly
-/// the environments where a checkpoint is most likely stale, and answering
-/// `diverged: false` there reports an unverified claim as verified. That is a
-/// smaller instance of the failure issue #273 exists to end, so this tool calls
-/// [`super::collab_session::git_head_sha`] directly — as that function's doc
-/// comment instructs any caller that must tell the two apart — and reports the
-/// third state as itself.
-enum HeadCheck {
-    /// Live HEAD was read. `diverged` is a real finding either way.
-    Checked {
-        repo_head_sha: String,
-        diverged: bool,
-    },
-    /// Live HEAD could not be read, so nothing about drift is known. An
-    /// *operational* failure, distinct from a stale checkpoint — hence not an
-    /// error: it must not cost the caller a write it can no longer retry
-    /// accurately, and the checkpoint is still the best record available.
-    Unreadable { detail: String },
-}
-
-impl HeadCheck {
-    fn read(repo_path: &str, checkpoint: &CollabCheckpoint) -> Self {
-        match super::collab_session::git_head_sha(repo_path) {
-            Ok(head) => Self::Checked {
-                diverged: head != checkpoint.head_sha,
-                repo_head_sha: head,
-            },
-            // `git_head_sha` reports every failure as `Validation`, whose
-            // `Display` prefixes "Validation error:" — misleading for what is
-            // an environment problem, and about the repo rather than the
-            // caller's arguments. Unwrap that one variant; anything else keeps
-            // its full rendering rather than being silently reshaped.
-            Err(MemoryError::Validation(detail)) => Self::Unreadable { detail },
-            Err(other) => Self::Unreadable {
-                detail: other.to_string(),
-            },
-        }
-    }
-
-    /// `true`, `false`, or JSON `null` for "the check did not run". A caller
-    /// that treats the value as a plain boolean reads `null` as falsy, which is
-    /// why [`Self::label`] is reported beside it in words.
-    fn diverged(&self) -> Value {
-        match self {
-            Self::Checked { diverged, .. } => json!(diverged),
-            Self::Unreadable { .. } => Value::Null,
-        }
-    }
-
-    /// Whether the check ran at all — the field that keeps `diverged: null`
-    /// from being read as "no drift".
-    fn label(&self) -> &'static str {
-        match self {
-            Self::Checked { .. } => "checked",
-            Self::Unreadable { .. } => "unreadable",
-        }
-    }
-
-    /// The HEAD actually read, so a caller told it has drifted can file an
-    /// accurate checkpoint without shelling out to git itself.
-    fn repo_head_sha(&self) -> Value {
-        match self {
-            Self::Checked { repo_head_sha, .. } => json!(repo_head_sha),
-            Self::Unreadable { .. } => Value::Null,
-        }
-    }
-}
 
 /// Write the session's current checkpoint.
 ///
@@ -241,7 +169,7 @@ pub(super) fn handle_collab_checkpoint(app: &App, args: &Value) -> Result<Value,
         "head_check": head_check.label(),
         "repo_head_sha": head_check.repo_head_sha(),
     });
-    if let HeadCheck::Unreadable { detail } = &head_check {
+    if let Some(detail) = head_check.unreadable_detail() {
         // Only present when there is something to explain, and always
         // alongside `head_check: "unreadable"` — the caller is told why the
         // check could not run, not left to infer it from a missing verdict.
