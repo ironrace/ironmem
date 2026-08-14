@@ -8,6 +8,7 @@ use crate::error::MemoryError;
 
 mod code_maps;
 mod collab_caps;
+mod collab_checkpoint;
 mod collab_events;
 mod collab_session;
 mod diary;
@@ -21,6 +22,7 @@ mod test_support;
 
 use code_maps::{handle_code_map_load, handle_code_map_status, handle_code_map_write};
 use collab_caps::{handle_collab_get_caps, handle_collab_register_caps};
+use collab_checkpoint::handle_collab_checkpoint;
 use collab_session::{
     handle_collab_ack, handle_collab_approve, handle_collab_end, handle_collab_recv,
     handle_collab_resume, handle_collab_send, handle_collab_set_implementer,
@@ -503,6 +505,49 @@ pub fn tool_definitions(app: &App) -> Vec<Value> {
             }
         }),
         json!({
+            "name": "collab_checkpoint",
+            // Descriptions are under a whole-listing token budget (see
+            // `tool_listing_stays_within_prompt_cache_schema_budget`), so this
+            // spends its words on the one thing a caller cannot infer from the
+            // keys: `diverged` is a THREE-state answer, and its `null` means
+            // the check did not run, not that it found nothing.
+            "description": "Record v3 batch implementation progress. diverged is true|false|null; null means live HEAD was unreadable, so drift is UNKNOWN, not absent.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "session_id": { "type": "string" },
+                    "task_id": { "type": "integer", "minimum": 1 },
+                    "task_title": { "type": "string" },
+                    "status": {
+                        "type": "string",
+                        "enum": ["started", "completed", "blocked", "batch_complete"]
+                    },
+                    "head_sha": { "type": "string", "description": "Repo HEAD at checkpoint time" },
+                    "commit_sha": { "type": "string" },
+                    "completed_task_ids": {
+                        "type": "string",
+                        "description": "Comma-separated, cumulative: carry every id already done."
+                    },
+                    "next_task_id": { "type": "integer", "minimum": 1 },
+                    "gates_result": { "type": "string", "description": "not_run | passed | failed: <reason>" },
+                    "gates_sha": { "type": "string", "description": "HEAD the gates ran against" },
+                    "gates_commands": { "type": "string", "description": "Gate command set, \" && \"-joined" },
+                    "summary": { "type": "string" },
+                    // Advertised, but an operator attestation is a human
+                    // vouching for commits the protocol never witnessed: it
+                    // REQUIRES acknowledged_divergence, and an implementer may
+                    // never carry one. `CollabCheckpoint::validate` enforces
+                    // both directions; a static schema cannot express either.
+                    "attested_by": { "type": "string", "enum": ["implementer", "operator"] },
+                    "acknowledged_divergence": {
+                        "type": "string",
+                        "description": "Operator-only: SHA range vouched for, <from>..<to>"
+                    }
+                },
+                "required": ["session_id", "status", "head_sha"]
+            }
+        }),
+        json!({
             "name": "code_map_write",
             "description": "Write or refresh a per-area code map. Write-mode only.",
             "inputSchema": {
@@ -686,6 +731,7 @@ pub fn call_tool(app: &App, name: &str, args: &Value) -> Result<Value, MemoryErr
         "collab_wait_my_turn" => handle_collab_wait_my_turn(app, args),
         "collab_end" => handle_collab_end(app, args),
         "collab_resume" => handle_collab_resume(app, args),
+        "collab_checkpoint" => handle_collab_checkpoint(app, args),
         "session_handoff" => handle_session_handoff(app, args),
         "code_map_write" => handle_code_map_write(app, args),
         "code_map_load" => handle_code_map_load(app, args),
@@ -793,6 +839,7 @@ fn tool_known(name: &str) -> bool {
             | "collab_wait_my_turn"
             | "collab_end"
             | "collab_resume"
+            | "collab_checkpoint"
             | "session_handoff"
             | "code_map_write"
             | "code_map_load"
@@ -842,6 +889,11 @@ pub(crate) const MUTATING_TOOLS: &[&str] = &[
     "collab_register_caps",
     "collab_end",
     "collab_resume",
+    // Persists a row in `collab_checkpoints` on every call, so it is disabled
+    // in read-only mode and takes the framing loop's ordering barrier. NOT in
+    // `WRITE_SHAPED_TOOLS`: it needs no embedder, so it must not park on the
+    // readiness gate.
+    "collab_checkpoint",
     "session_handoff",
     "code_map_write",
     "symbol_graph_index",
@@ -1218,6 +1270,18 @@ mod tests {
     /// schema keys. The listing measured 3_660 tokens after the addition; the
     /// ceiling leaves ~40 tokens of headroom rather than pinning it exactly.
     ///
+    /// Raised 3_700 -> 4_020 for `collab_checkpoint` (#273), the durable write
+    /// path that replaces the unverified `collab-checkpoint:<id>` drawer
+    /// convention. It is the widest collab tool in the listing — fourteen
+    /// properties, because the schema mirrors migration 020's columns one for
+    /// one — and the structure alone is ~800 of its ~1_180 bytes, so no amount
+    /// of prose-trimming brings it under the previous ceiling's ~12 spare
+    /// tokens. What prose it keeps is the part a caller cannot infer from the
+    /// keys: the three-state `diverged`, `completed_task_ids` being cumulative,
+    /// `gates_result`'s vocabulary, and `acknowledged_divergence` being
+    /// operator-only. The listing measured 3_982 tokens after the addition,
+    /// leaving ~38 tokens of headroom, in line with the previous raise.
+    ///
     /// The budget is deliberately a whole-listing ceiling with no per-tool
     /// allocation, so the cheapest way to land a new field is to delete prose
     /// from whichever unrelated tool happens to be wordiest. That trade is not
@@ -1230,7 +1294,7 @@ mod tests {
         let bytes = serde_json::to_vec(&tool_definitions(&app)).unwrap().len();
         let estimated_tokens = bytes.div_ceil(4);
         assert!(
-            estimated_tokens <= 3_700,
+            estimated_tokens <= 4_020,
             "tool listing is ~{estimated_tokens} tokens ({bytes} bytes); trim descriptions that duplicate their schemas"
         );
     }

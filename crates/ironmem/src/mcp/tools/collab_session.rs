@@ -1212,12 +1212,12 @@ fn validate_global_review_head_advance(
 /// `pub(super)` so the `collab_checkpoint` tool can report divergence on write
 /// without duplicating the shell-out.
 ///
-/// No production caller lands in this task (#273 Task 6): the `collab_checkpoint`
-/// tool that calls this (Task 5) and the gate/handoff/resume wiring (Tasks
-/// 7-10) are dispatched separately. Only the tests below exercise it until
-/// then, hence `allow(dead_code)` outside `cfg(test)` — the same pattern
-/// `ToolMeta::mutating_witnesses` uses in `mcp/tools/mod.rs`.
-#[cfg_attr(not(test), allow(dead_code))]
+/// `collab_checkpoint` calls this **directly** rather than going through
+/// [`checkpoint_divergence`], and that is the point of it being reachable:
+/// that function's `None` is ambiguous between "no drift" and "could not
+/// check", and a tool that answered `diverged: false` for an unreadable repo
+/// would report an unverified claim as verified. See
+/// `mcp::tools::collab_checkpoint::HeadCheck`.
 pub(super) fn git_head_sha(repo_path: &str) -> Result<String, MemoryError> {
     let output = Command::new("git")
         .args(["-C", repo_path, "rev-parse", "HEAD"])
@@ -1283,9 +1283,11 @@ pub(super) fn git_head_sha(repo_path: &str) -> Result<String, MemoryError> {
 /// function's result, not here. A caller that wires this in as an
 /// unconditional block would silently defeat that hatch.
 ///
-/// Same forward-reference situation as `git_head_sha` above: no production
-/// caller lands until Tasks 7-10 wire this into the gate, handoff, and resume
-/// paths, so it is test-only for now.
+/// No production caller lands until Tasks 7-10 wire this into the gate,
+/// handoff, and resume paths, so it is test-only for now — hence
+/// `allow(dead_code)` outside `cfg(test)`, the same pattern
+/// `ToolMeta::mutating_witnesses` uses in `mcp/tools/mod.rs`. `git_head_sha`
+/// above no longer needs it: `collab_checkpoint` calls that one.
 #[cfg_attr(not(test), allow(dead_code))]
 pub(super) fn checkpoint_divergence(
     repo_path: &str,
