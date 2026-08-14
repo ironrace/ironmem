@@ -667,7 +667,7 @@ Invariants that still apply:
   coding-active phase.
 - `failure_report` is the only escape hatch. A **Terminal**-classified
   report transitions to `CodingFailed`; a **Tooling**-classified report
-  (six recoverable prefixes — see "Failure + terminal") instead keeps the
+  (seven recoverable prefixes — see "Failure + terminal") instead keeps the
   session at its current phase and flips `current_owner`.
 - Drift detection is special-cased for shortcut-started sessions:
   the server validates `CodeReviewFixGlobal{head_sha}` **and**
@@ -709,7 +709,7 @@ severity, it only picks an accurate `coding_failure` prefix.
 | **Tooling** (recoverable) | Session **stays in its current phase**; `current_owner` flips to the counterpart agent, who must recover the turn. |
 | **Terminal** (unrecoverable) | Session transitions to `CodingFailed`. |
 
-#### The six recoverable prefixes
+#### The seven recoverable prefixes
 
 A `coding_failure` classifies **Tooling** only if it starts with one of
 these prefixes AND has >=1 byte of detail after the colon. A bare prefix
@@ -724,6 +724,16 @@ with nothing after it — like every other unrecognized string — classifies
 | `disk_full:` | `disk_full: no space left on device` |
 | `network_failed:` | `network_failed: connection reset` |
 | `codex_dispatch_failed:` | `codex_dispatch_failed: process exited 137` |
+| `checkpoint_drift:` | `checkpoint_drift: HEAD 75a4ea3 differs from the current checkpoint's head_sha b9c2ce0` |
+
+`checkpoint_drift:` is the one the *server itself* also emits: the
+`implementation_done` gate refuses the send with this prefix when the
+session's stored checkpoint does not back the claim that the batch is
+finished. It is recoverable rather than Terminal on purpose — the ledger is
+merely behind the work, and writing an accurate checkpoint fixes it, unlike
+`branch_drift:` where the work is on the wrong branch and cannot be
+reconciled in place. Every such refusal names the `collab_checkpoint(...)`
+call that would satisfy it.
 
 Everything else classifies **Terminal**: a bare recoverable prefix with no
 suffix, `branch_drift:` (see the drift check in "Harness-Side
@@ -733,6 +743,7 @@ the empty string.
 | Phase | Owner | Event | Next |
 |---|---|---|---|
 | *any coding-active phase* | owner; `codex_dispatch_failed:` may also be reported by Claude while Codex owns the interrupted turn | `FailureReport{coding_failure}` classifying **Tooling** | same phase; `current_owner` becomes the counterpart of the interrupted turn owner |
+| `CodeImplementPending` | owner; `checkpoint_drift:` with detail may also be reported by either agent | `FailureReport{coding_failure}` classifying **Tooling** | same phase; `current_owner` becomes the counterpart of the interrupted turn owner |
 | *any coding-active phase* | owner; `branch_drift:` with detail may also be reported by either agent | `FailureReport{coding_failure}` classifying **Terminal** | `CodingFailed` (terminal) |
 
 #### Two independent axes: off-turn admissibility vs recoverable classification
@@ -742,20 +753,29 @@ produces wrong expectations:
 
 - **Admissibility** — *may a non-owner send this report at all?* Decided by
   `off_turn_failure_is_admissible` against `OFF_TURN_FAILURE_PREFIXES`
-  (`branch_drift:`, `codex_dispatch_failed:`).
+  (`branch_drift:`, `checkpoint_drift:`, `codex_dispatch_failed:`).
 - **Classification** — *does this report recover or kill the session?*
   Decided by `failure_class::classify` against
-  `RECOVERABLE_FAILURE_PREFIXES` (the six prefixes above). The reporter's
+  `RECOVERABLE_FAILURE_PREFIXES` (the seven prefixes above). The reporter's
   identity is irrelevant here.
 
 The two vocabularies overlap but are not the same set.
-`codex_dispatch_failed:` is in both — off-turn-admissible *and* Tooling.
+`codex_dispatch_failed:` and `checkpoint_drift:` are in both —
+off-turn-admissible *and* Tooling. Every prefix in that intersection is
+**phase-scoped** in `off_turn_failure_is_admissible`, and that is not
+incidental: a recoverable report installs a new `current_owner`, so an
+unscoped off-turn clause on a Tooling prefix would be a turn-seizure
+primitive. `checkpoint_drift:` is admissible off-turn only from
+`CodeImplementPending` — the one phase where a checkpoint is a live ledger
+rather than frozen proof of what was built.
+
 `branch_drift:` is in only the first: **off-turn-admissible but always
-Terminal**, because it is not in `RECOVERABLE_FAILURE_PREFIXES`. Either
-agent may report drift at any time, and every such report ends the session
-in `CodingFailed` — drift means the two agents disagree about what is on
-the branch, which no in-place recovery turn can reconcile. The remaining
-five recoverable prefixes are Tooling but owner-only.
+Terminal**, because it is not in `RECOVERABLE_FAILURE_PREFIXES` — which is
+exactly what lets its clause be unscoped. Either agent may report drift at
+any time, and every such report ends the session in `CodingFailed` — drift
+means the two agents disagree about what is on the branch, which no in-place
+recovery turn can reconcile. The remaining five recoverable prefixes are
+Tooling but owner-only.
 
 `collab_end` is **rejected** in every coding-active phase
 (`CodeImplementPending`, `CodeReviewFixGlobalPending`,
@@ -924,7 +944,7 @@ phase in the first place.
 #### `pr_create_failed:` stays Terminal
 
 **Decision.** `pr_create_failed:` — reported by Claude's `final_review` turn
-when `gh pr create` fails — is not one of the six recoverable prefixes and
+when `gh pr create` fails — is not one of the seven recoverable prefixes and
 is not going to become one. It stays in `DOCUMENTED_TERMINAL_PREFIXES`
 (`scripts/check_collab_turn_templates.py`) and every failure of this kind
 ends the session in `CodingFailed`.
@@ -1442,7 +1462,7 @@ Tooling-classified failure.
 ```
 
 Eligible only when the session's stored `coding_failure` classifies
-**Tooling** (one of the six recoverable prefixes, with a detail suffix),
+**Tooling** (one of the seven recoverable prefixes, with a detail suffix),
 `failed_from_phase` was recorded, **and** the lifetime recovery budget is
 not exhausted. An ineligible call rejects with `NotResumable { reason }`:
 
@@ -1714,11 +1734,11 @@ orchestrator from steering the reviewer's conclusion.
 | Topic | Sender | Payload | Notes |
 |---|---|---|---|
 | `task_list` | `pilot` | `{"plan_hash","base_sha","head_sha","plan_file_path"?,"execution_mode"?,"tasks":[{"id","title","timebox_minutes","acceptance":[...]}]}` | `plan_hash` must equal `final_plan_hash`; `tasks` must contain **1–15** strictly ordered entries; each task requires `timebox_minutes <= 20` and ≥1 `acceptance` entry. A 16+ task issue must be split into child issues before this message is sent. Optional `plan_file_path` (repo-relative; no leading `/`; no `..` segments) points at the approved task markdown driving subagent execution. Optional `execution_mode` — see below. |
-| `implementation_done` | `claude` or `codex` (per session `implementer`) | `{"head_sha"}` | In `CodeImplementPending` only. Fired once after the subagent batch completes and gates pass. Carries only `head_sha` — no prose, no subagent notes. |
+| `implementation_done` | `claude` or `codex` (per session `implementer`) | `{"head_sha"}` | In `CodeImplementPending` only. Fired once after the subagent batch completes and gates pass. Carries only `head_sha` — no prose, no subagent notes. **Gated on checkpoint proof**: refused with a `checkpoint_drift:` message unless the session's stored checkpoint exists, records this exact `head_sha`, is `batch_complete` covering every task in the accepted task list, and carries a green gate proof at that same sha. A refusal leaves the session in `CodeImplementPending` with nothing written. |
 | `review_fix_global` | `copilot` (or the counterpart agent as recovery owner under the delegated-completion override) | `{"head_sha"}` | In `CodeReviewFixGlobalPending` only. The copilot ran `/pr-review-toolkit:review-pr` on the raw post-implementation diff (no pre-clean by the pilot), used parallel fix subagents for confirmed partitionable findings, merged/cherry-picked the resulting fixes, and pushed the branch-level fix commit(s). |
 | `review_local` | `pilot` (or the counterpart agent as recovery owner under the delegated-completion override) | `{"head_sha"}` | In `CodeReviewLocalPending` only. The pilot ran full or reduced audit of the copilot's `review_fix_global` commits + caught issues both agents missed, used parallel fix subagents for confirmed partitionable findings, merged/cherry-picked the resulting fixes, and pushed. |
 | `final_review` | `pilot` (or the recovery owner under the delegated-completion override) | `{"head_sha","pr_url"}` | In `CodeReviewFinalPending` only. In normal flow the Claude submit worker opens the PR under the turn owner's identity; a Codex recovery owner opens it directly. The event carries the URL and advances directly to `CodingComplete`. `pr_url` must start with `https://` and be ≤2048 chars. |
-| `failure_report` | current owner; off-turn `branch_drift:` may come from either agent; off-turn `codex_dispatch_failed:` may come only from Claude against a Codex-owned turn | `{"coding_failure":"<reason>"}` | Valid in any coding-active phase. Classifies **Tooling** (six recoverable prefixes, stays in-phase, `current_owner` flips) or **Terminal** (everything else — including `branch_drift:` — transitions to `CodingFailed`) — see "Failure + terminal" above. |
+| `failure_report` | current owner; off-turn `branch_drift:` may come from either agent; off-turn `checkpoint_drift:` may come from either agent but only in `CodeImplementPending`; off-turn `codex_dispatch_failed:` may come only from Claude against a Codex-owned turn | `{"coding_failure":"<reason>"}` | Valid in any coding-active phase. Classifies **Tooling** (seven recoverable prefixes, stays in-phase, `current_owner` flips) or **Terminal** (everything else — including `branch_drift:` — transitions to `CodingFailed`) — see "Failure + terminal" above. |
 
 | `orphan_recovered` | current owner | `{"phase","recovered_sha","detail"}` | Valid in any phase. **Non-advancing**: the server records it and returns before building an event, so `phase`, `current_owner`, `recovery_attempts` and `total_recovery_attempts` are all unchanged. Sent *in addition to* the turn's normal completion event, never instead of it. Deliberately not a `failure_report`: a Tooling failure parks the phase, hands the turn over and spends a recovery attempt against a ceiling of 2 — but the sender here succeeded, having preserved work a previous turn left behind. The row is self-addressed with `status='recorded'` so it never appears in either agent's `collab_recv` inbox. `collab_status` reports the count as `orphans_recovered`. |
 
@@ -1788,10 +1808,12 @@ exactly one event variant — there is no phase overloading.
 
 `failure_report` is accepted from the current owner in any coding-active
 phase. `branch_drift:` with real detail is also accepted off-turn from either
-agent; `codex_dispatch_failed:` with real detail is accepted off-turn only
+agent; `checkpoint_drift:` with real detail is accepted off-turn from either
+agent but only in `CodeImplementPending`; `codex_dispatch_failed:` with real
+detail is accepted off-turn only
 from Claude against a Codex-owned turn. A **Terminal**-classified report
 transitions the session to `CodingFailed`; a **Tooling**-classified report
-(one of the six recoverable prefixes, with detail — see "Failure + terminal"
+(one of the seven recoverable prefixes, with detail — see "Failure + terminal"
 above) instead keeps the session in its current phase and hands recovery to
 the counterpart of the interrupted turn owner. All other topics are gated by
 the owner recorded in the phase table above.

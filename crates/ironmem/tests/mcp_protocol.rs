@@ -2163,10 +2163,54 @@ fn task_list_payload(plan_hash: &str, base_sha: &str, head_sha: &str, n: usize) 
     .to_string()
 }
 
+/// A checkpoint payload that satisfies every condition of the
+/// `implementation_done` gate for a batch of `tasks` tasks at `head`.
+fn batch_complete_checkpoint(
+    session_id: &str,
+    agent: &str,
+    head: &str,
+    tasks: u64,
+) -> serde_json::Value {
+    let completed = (1..=tasks)
+        .map(|i| i.to_string())
+        .collect::<Vec<_>>()
+        .join(",");
+    json!({
+        "session_id": session_id,
+        "agent": agent,
+        "status": "batch_complete",
+        "head_sha": head,
+        "completed_task_ids": completed,
+        "gates_result": "passed",
+        "gates_sha": head,
+        "gates_commands": "cargo test --workspace",
+    })
+}
+
+/// File the checkpoint `implementation_done` now demands as proof (issue #273
+/// Task 7), covering every task in the session's accepted task list.
+///
+/// The task count is read back from `collab_status` — the same single source
+/// of truth the gate derives it from — so a test that changes its task list
+/// cannot silently file a checkpoint that under-covers and then be refused for
+/// a reason it was not written to exercise.
+fn checkpoint_batch_complete(app: &App, session_id: &str, agent: &str, head: &str) {
+    let status = call_tool(app, "collab_status", json!({ "session_id": session_id }));
+    let tasks = status["tasks_count"]
+        .as_u64()
+        .expect("a session at CodeImplementPending has a readable tasks_count");
+    call_tool(
+        app,
+        "collab_checkpoint",
+        batch_complete_checkpoint(session_id, agent, head, tasks),
+    );
+}
+
 /// Send `implementation_done` from Claude, advancing the batch phase to
 /// global review (`CodeReviewFixGlobalPending`, Codex-owned) under the v3
-/// reorder.
+/// reorder. Files the proving checkpoint first, as a real implementer must.
 fn do_implementation_done(app: &App, session_id: &str, head: &str) {
+    checkpoint_batch_complete(app, session_id, "claude", head);
     call_tool(
         app,
         "collab_send",
@@ -2370,6 +2414,7 @@ fn collab_start_accepts_implementer_codex_and_routes_owner() {
 
     // Codex fires it and the phase advances to global review (Codex-owned
     // under v3 reorder: Codex reads the raw post-implementation diff first).
+    checkpoint_batch_complete(&app, &session_id, "codex", "batch_head");
     call_tool(
         &app,
         "collab_send",
@@ -2547,6 +2592,7 @@ fn collab_pilot_and_implementer_remain_independent_in_the_reverse_mixed_case() {
         "pilot must not be able to substitute for the independent implementer: {wrong_implementer}"
     );
 
+    checkpoint_batch_complete(&app, &session_id, "claude", "implemented");
     call_tool(
         &app,
         "collab_send",
@@ -2956,6 +3002,7 @@ fn collab_set_implementer_rejects_after_batch_implementation() {
             "content": task_list_payload(&hash, "b0", "h0", 1)
         }),
     );
+    checkpoint_batch_complete(&app, &session_id, "claude", "batch_head");
     call_tool(
         &app,
         "collab_send",
@@ -3234,6 +3281,7 @@ fn collab_set_pilot_rejects_after_batch_implementation() {
             "content": task_list_payload(&hash, "b0", "h0", 1)
         }),
     );
+    checkpoint_batch_complete(&app, &session_id, "claude", "batch_head");
     call_tool(
         &app,
         "collab_send",
@@ -3913,6 +3961,7 @@ fn collab_v2_end_rejected_in_coding_active_phase() {
         .contains("active phase CodeImplementPending"));
 
     // Session still active — `implementation_done` should advance it.
+    checkpoint_batch_complete(&app, &session_id, "claude", "h1");
     let ok = call_tool(
         &app,
         "collab_send",
@@ -4880,6 +4929,7 @@ fn collab_pilot_codex_end_to_end_mcp_flow_reaches_coding_complete() {
 
     // Codex (the implementer) reports the batch implementation done ->
     // CodeReviewFixGlobalPending, owner flips to claude (the copilot).
+    checkpoint_batch_complete(&app, &session_id, "codex", "batch_head");
     call_tool(
         &app,
         "collab_send",
@@ -6101,4 +6151,359 @@ fn collab_checkpoint_requires_a_live_session() {
         stored_checkpoint(&app, &session_id).is_none(),
         "a refused checkpoint must persist nothing"
     );
+}
+
+// ── implementation_done checkpoint gate (issue #273 Task 7) ─────────────────
+//
+// The acceptance criterion for the whole issue: a runner cannot report a
+// normal batch state when the checkpoint does not back the claim. Every
+// refusal test below asserts the *stored phase* as well as the error — an
+// error proves the call was answered; only the row proves the session did not
+// advance anyway.
+
+/// The head sha every gate test reports on `implementation_done`.
+const GATE_HEAD: &str = "75a4ea3ee2f0c1b8d4a69f7c3e5b2a1d0c9f8e7b";
+
+/// Drive a fresh session to `CodeImplementPending` with `tasks` tasks.
+fn drive_to_code_implement_pending(app: &App, tasks: usize) -> String {
+    let session_id = drive_to_plan_locked(app, "gate plan");
+    let hash = plan_hash(app, &session_id);
+    call_tool(
+        app,
+        "collab_send",
+        json!({
+            "session_id": &session_id,
+            "sender": "claude",
+            "topic": "task_list",
+            "content": task_list_payload(&hash, "b0", "h0", tasks)
+        }),
+    );
+    let status = call_tool(app, "collab_status", json!({ "session_id": &session_id }));
+    assert_eq!(status["phase"], "CodeImplementPending");
+    session_id
+}
+
+/// A checkpoint payload that satisfies *every* condition of the gate, so each
+/// test can break exactly one of them and know which condition it is
+/// exercising. Deliberately built as a full payload rather than by mutating a
+/// previous write: the conditions must be checked independently, and a shared
+/// mutated fixture is how one of them ends up masking another.
+fn passing_checkpoint(session_id: &str, tasks: u64) -> serde_json::Value {
+    batch_complete_checkpoint(session_id, "claude", GATE_HEAD, tasks)
+}
+
+/// Attempt the gated send and return the refusal text, having first proved
+/// the session did not advance.
+fn implementation_done_refused(app: &App, session_id: &str) -> String {
+    let sends_before = wal_row_count(app, session_id, "collab_send");
+    let err = call_tool_expect_error(
+        app,
+        "collab_send",
+        json!({
+            "session_id": session_id,
+            "sender": "claude",
+            "topic": "implementation_done",
+            "content": json!({ "head_sha": GATE_HEAD }).to_string()
+        }),
+    );
+    // The gate sits before `apply_event`, so the refusal must roll back the
+    // whole turn — no audit row, no queued message, no phase move. Counting
+    // the audit rows is what distinguishes "refused" from "refused after
+    // recording that it happened".
+    assert_eq!(
+        wal_row_count(app, session_id, "collab_send"),
+        sends_before,
+        "a refused implementation_done must write no audit row: {err}"
+    );
+    let status = call_tool(app, "collab_status", json!({ "session_id": session_id }));
+    assert_eq!(
+        status["phase"], "CodeImplementPending",
+        "a refused implementation_done must leave the session in CodeImplementPending, \
+         not merely return an error: {err}"
+    );
+    assert_eq!(
+        status["current_owner"], "claude",
+        "a refused implementation_done must not hand the turn on: {err}"
+    );
+    assert_ne!(
+        status["last_head_sha"],
+        json!(GATE_HEAD),
+        "a refused implementation_done must not record the reported head: {err}"
+    );
+    // The prefix is what makes the condition reportable off-turn as a
+    // recoverable failure, so it is asserted on every refusal rather than
+    // only on the ones whose wording a test happens to inspect. Matched with
+    // `contains` because `MemoryError::Validation`'s own "Validation error:"
+    // rendering sits in front of it on the wire.
+    assert!(
+        err.contains("checkpoint_drift:"),
+        "every gate refusal must carry the checkpoint_drift: prefix, got: {err}"
+    );
+    err
+}
+
+/// Condition 1: a session that never checkpointed has no progress claim to
+/// verify, and must be told which tool fixes that. Waving legacy/never-written
+/// sessions through would reinstate exactly the hole issue #273 closes.
+#[test]
+fn implementation_done_refused_without_any_checkpoint() {
+    let app = App::open_for_test().unwrap();
+    let session_id = drive_to_code_implement_pending(&app, 3);
+
+    let err = implementation_done_refused(&app, &session_id);
+    assert!(
+        err.contains("collab_checkpoint"),
+        "the refusal must name the tool that fixes it, got: {err}"
+    );
+    assert!(
+        stored_checkpoint(&app, &session_id).is_none(),
+        "the refusal must not fabricate a checkpoint"
+    );
+}
+
+/// Condition 2, and the incident itself: 28 commits landed while the
+/// checkpoint stayed frozen at task 1's head.
+#[test]
+fn implementation_done_refused_when_the_checkpoint_head_is_stale() {
+    let app = App::open_for_test().unwrap();
+    let session_id = drive_to_code_implement_pending(&app, 3);
+    let mut cp = passing_checkpoint(&session_id, 3);
+    cp["head_sha"] = json!("b9c2ce0e1d2c3b4a5968778695a4b3c2d1e0f9a8");
+    cp["gates_sha"] = json!("b9c2ce0e1d2c3b4a5968778695a4b3c2d1e0f9a8");
+    call_tool(&app, "collab_checkpoint", cp);
+
+    let err = implementation_done_refused(&app, &session_id);
+    assert!(
+        err.contains("b9c2ce0") && err.contains(GATE_HEAD),
+        "the refusal must name both shas so the operator can see the drift, got: {err}"
+    );
+}
+
+/// Condition 2's diagnosability requirement: the comparison is raw string
+/// equality, so an abbreviated sha reads as permanent drift. An operator
+/// staring at two shas that look identical must be told why they are not.
+#[test]
+fn implementation_done_refusal_explains_an_abbreviated_sha() {
+    let app = App::open_for_test().unwrap();
+    let session_id = drive_to_code_implement_pending(&app, 1);
+    let short = &GATE_HEAD[..7];
+    let mut cp = passing_checkpoint(&session_id, 1);
+    cp["head_sha"] = json!(short);
+    cp["gates_sha"] = json!(short);
+    call_tool(&app, "collab_checkpoint", cp);
+
+    let err = implementation_done_refused(&app, &session_id);
+    assert!(
+        err.contains("abbreviated") || err.contains("prefix"),
+        "a short sha must be diagnosed, not left as two lookalike strings, got: {err}"
+    );
+    assert!(
+        err.contains("7 chars") && err.contains("40 chars"),
+        "the refusal must show the lengths that differ, got: {err}"
+    );
+}
+
+/// Condition 3a: `batch_complete` is the only status that claims the batch is
+/// finished. The incident's checkpoint said `started`.
+#[test]
+fn implementation_done_refused_when_the_checkpoint_is_not_batch_complete() {
+    let app = App::open_for_test().unwrap();
+    let session_id = drive_to_code_implement_pending(&app, 3);
+    let mut cp = passing_checkpoint(&session_id, 3);
+    cp["status"] = json!("completed");
+    call_tool(&app, "collab_checkpoint", cp);
+
+    let err = implementation_done_refused(&app, &session_id);
+    assert!(
+        err.contains("batch_complete") && err.contains("completed"),
+        "the refusal must name the required status and the one recorded, got: {err}"
+    );
+}
+
+/// Condition 3b: reporting the batch done while the ledger shows 2 of 3 is a
+/// false progress report even when the shas agree.
+#[test]
+fn implementation_done_refused_when_the_checkpoint_misses_a_task() {
+    let app = App::open_for_test().unwrap();
+    let session_id = drive_to_code_implement_pending(&app, 3);
+    let mut cp = passing_checkpoint(&session_id, 3);
+    cp["completed_task_ids"] = json!("1,2");
+    call_tool(&app, "collab_checkpoint", cp);
+
+    let err = implementation_done_refused(&app, &session_id);
+    assert!(
+        err.contains("1, 2") && err.contains('3'),
+        "the refusal must name what is covered and how many tasks there are, got: {err}"
+    );
+}
+
+/// Coverage is set membership, not arithmetic: `1,2,4` over three tasks has
+/// the right count and the wrong contents. Pinned separately from the
+/// missing-task case because a length-only gate passes that one.
+#[test]
+fn implementation_done_refused_when_the_covered_ids_have_a_gap() {
+    let app = App::open_for_test().unwrap();
+    let session_id = drive_to_code_implement_pending(&app, 3);
+    let mut cp = passing_checkpoint(&session_id, 3);
+    cp["completed_task_ids"] = json!("1,2,4");
+    call_tool(&app, "collab_checkpoint", cp);
+
+    implementation_done_refused(&app, &session_id);
+}
+
+/// Condition 4: green gates at an older sha describe a tree that no longer
+/// exists.
+#[test]
+fn implementation_done_refused_when_the_gate_proof_is_stale() {
+    let app = App::open_for_test().unwrap();
+    let session_id = drive_to_code_implement_pending(&app, 2);
+    let mut cp = passing_checkpoint(&session_id, 2);
+    cp["gates_sha"] = json!("older99e1d2c3b4a5968778695a4b3c2d1e0f9a8b");
+    call_tool(&app, "collab_checkpoint", cp);
+
+    let err = implementation_done_refused(&app, &session_id);
+    assert!(
+        err.contains("gates"),
+        "the refusal must name the gate proof, got: {err}"
+    );
+}
+
+/// Condition 4's other half: gates that never ran, or ran red, are not a
+/// proof at all even when the shas line up.
+#[test]
+fn implementation_done_refused_when_the_gates_did_not_pass() {
+    let app = App::open_for_test().unwrap();
+    let session_id = drive_to_code_implement_pending(&app, 2);
+    let mut cp = passing_checkpoint(&session_id, 2);
+    cp["gates_result"] = json!("failed: 3 tests red");
+    call_tool(&app, "collab_checkpoint", cp);
+
+    implementation_done_refused(&app, &session_id);
+}
+
+/// The positive direction. A gate that refuses everything is not a gate, and
+/// this is the case that proves the four conditions are jointly satisfiable
+/// by an honest implementer.
+#[test]
+fn implementation_done_accepted_with_a_checkpoint_that_proves_the_batch() {
+    let app = App::open_for_test().unwrap();
+    let session_id = drive_to_code_implement_pending(&app, 3);
+    call_tool(
+        &app,
+        "collab_checkpoint",
+        passing_checkpoint(&session_id, 3),
+    );
+
+    call_tool(
+        &app,
+        "collab_send",
+        json!({
+            "session_id": &session_id,
+            "sender": "claude",
+            "topic": "implementation_done",
+            "content": json!({ "head_sha": GATE_HEAD }).to_string()
+        }),
+    );
+    let status = call_tool(&app, "collab_status", json!({ "session_id": &session_id }));
+    assert_eq!(status["phase"], "CodeReviewFixGlobalPending");
+    assert_eq!(status["current_owner"], "codex");
+    assert_eq!(status["last_head_sha"], GATE_HEAD);
+}
+
+/// The gate does not consult `attested_by`, in either direction.
+///
+/// It never compares the checkpoint against *live* git HEAD — only against the
+/// head the caller is reporting in this same payload — and a "divergence" is
+/// by definition a checkpoint-vs-live-HEAD disagreement. So an operator
+/// attestation has nothing to excuse here: it neither exempts a checkpoint
+/// from the four conditions (which would make the gate bypassable by setting
+/// one field) nor is refused by them (which would leave Task 10's escape hatch
+/// with nothing to build on). Both halves are asserted.
+#[test]
+fn implementation_done_gate_ignores_the_operator_attestation() {
+    // Half 1: an operator attestation does NOT exempt a stale checkpoint.
+    let app = App::open_for_test().unwrap();
+    let session_id = drive_to_code_implement_pending(&app, 2);
+    let mut cp = passing_checkpoint(&session_id, 2);
+    cp["head_sha"] = json!("b9c2ce0e1d2c3b4a5968778695a4b3c2d1e0f9a8");
+    cp["gates_sha"] = json!("b9c2ce0e1d2c3b4a5968778695a4b3c2d1e0f9a8");
+    cp["attested_by"] = json!("operator");
+    cp["acknowledged_divergence"] = json!("b9c2ce0..75a4ea3");
+    call_tool(&app, "collab_checkpoint", cp);
+    implementation_done_refused(&app, &session_id);
+
+    // Half 2: an operator-attested checkpoint that DOES satisfy the four
+    // conditions passes — the gate refuses nothing on the strength of
+    // `attested_by` alone, so Task 10 has a reachable path to extend.
+    let app2 = App::open_for_test().unwrap();
+    let session2 = drive_to_code_implement_pending(&app2, 2);
+    let mut ok = passing_checkpoint(&session2, 2);
+    ok["attested_by"] = json!("operator");
+    ok["acknowledged_divergence"] = json!("b9c2ce0..75a4ea3");
+    call_tool(&app2, "collab_checkpoint", ok);
+    call_tool(
+        &app2,
+        "collab_send",
+        json!({
+            "session_id": &session2,
+            "sender": "claude",
+            "topic": "implementation_done",
+            "content": json!({ "head_sha": GATE_HEAD }).to_string()
+        }),
+    );
+    let status = call_tool(&app2, "collab_status", json!({ "session_id": &session2 }));
+    assert_eq!(status["phase"], "CodeReviewFixGlobalPending");
+}
+
+/// The gate is scoped to `implementation_done`. Every other coding topic must
+/// still be sendable without a checkpoint, or a checkpoint-less session that
+/// legitimately reached global review could never finish.
+#[test]
+fn the_checkpoint_gate_does_not_apply_to_the_review_topics() {
+    let app = App::open_for_test().unwrap();
+    let session_id = drive_to_code_implement_pending(&app, 1);
+    call_tool(
+        &app,
+        "collab_checkpoint",
+        passing_checkpoint(&session_id, 1),
+    );
+    call_tool(
+        &app,
+        "collab_send",
+        json!({
+            "session_id": &session_id,
+            "sender": "claude",
+            "topic": "implementation_done",
+            "content": json!({ "head_sha": GATE_HEAD }).to_string()
+        }),
+    );
+
+    // The checkpoint is now stale relative to every later head, which must
+    // not stop the review phases from running.
+    for (sender, topic, extra) in [
+        ("codex", "review_fix_global", json!({})),
+        ("claude", "review_local", json!({})),
+        (
+            "claude",
+            "final_review",
+            json!({ "pr_url": "https://example.test/pr/1" }),
+        ),
+    ] {
+        let mut content = json!({ "head_sha": "later-head" });
+        for (k, v) in extra.as_object().unwrap() {
+            content[k] = v.clone();
+        }
+        call_tool(
+            &app,
+            "collab_send",
+            json!({
+                "session_id": &session_id,
+                "sender": sender,
+                "topic": topic,
+                "content": content.to_string()
+            }),
+        );
+    }
+    let status = call_tool(&app, "collab_status", json!({ "session_id": &session_id }));
+    assert_eq!(status["phase"], "CodingComplete");
 }

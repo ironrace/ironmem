@@ -1096,6 +1096,14 @@ pub(super) fn handle_collab_send(app: &App, args: &Value) -> Result<Value, Memor
             )?;
         }
 
+        // The head-consistency gate (issue #273). Placed after the ancestry
+        // block and before `apply_event` so a refusal leaves the session in
+        // `CodeImplementPending` with nothing persisted — the transaction has
+        // not written a thing at this point.
+        if let crate::collab::CollabEvent::ImplementationDone { head_sha } = &event {
+            require_checkpoint_proof(tx, &session, head_sha)?;
+        }
+
         session = apply_event(&session, sender, &event).map_err(collab_error_to_memory_error)?;
         // Persist the accepted plan body by reference. `apply_event` only
         // records the content hash; here we file the body itself as a
@@ -1162,6 +1170,214 @@ pub(super) fn handle_collab_send(app: &App, args: &Value) -> Result<Value, Memor
     app.set_active_collab_session_for_scope(session_id, &repo_path, &branch);
     record_task_outcome_transition(app, session_id, before, after, pr_url.as_deref());
     Ok(response)
+}
+
+/// Wrap a gate refusal in the recoverable `checkpoint_drift:` prefix.
+///
+/// The prefix is what makes the condition *reportable* rather than merely
+/// refused: `collab::off_turn_failure_is_admissible` admits a
+/// `checkpoint_drift:` failure report from either agent while the session is
+/// in `CodeImplementPending`, and `failure_class::classify` grades it Tooling.
+/// So an owner that keeps hitting this gate — or a counterpart that sees it
+/// stuck there — can park the phase and hand the turn on instead of the
+/// session dead-ending on an implementer whose ledger it cannot fix.
+fn checkpoint_drift(detail: String) -> MemoryError {
+    MemoryError::Validation(format!(
+        "{} {detail}",
+        crate::collab::CHECKPOINT_DRIFT_PREFIX
+    ))
+}
+
+/// Refuse `implementation_done` unless the session's stored checkpoint proves
+/// the batch actually reached the head being reported.
+///
+/// This is the enforcement issue #273 exists for. Before it, a collab v3
+/// checkpoint was an agent-side convention verified by nothing: a batch
+/// committed 28 changes while its checkpoint stayed frozen at "task 1 /
+/// started / `b9c2ce0`", and the handoff that followed showed a resuming agent
+/// a materially false progress report. Four conditions, each closing a
+/// distinct way the protocol could report progress it cannot back.
+///
+/// **1. A checkpoint exists.** A session that never checkpointed has no
+/// progress claim to verify at all. Legacy and never-written sessions are
+/// *not* waved through: an exemption for "no record" is the hole itself,
+/// since a stale record and no record are equally unverified. The population
+/// this can strand is only in-flight sessions, and the remedy — write the
+/// checkpoint — is named in the refusal.
+///
+/// **2. The checkpoint's `head_sha` equals the reported one.** The incident,
+/// exactly. Note the comparison is raw string equality, so an abbreviated sha
+/// reads as permanent drift; the message says so, with both lengths, because
+/// an operator looking at `75a4ea3` and `75a4ea3ee2f…` sees two strings that
+/// begin identically and no reason they should differ.
+///
+/// **3. `status == BatchComplete` and `completed_task_ids` covers every task.**
+/// A batch reported done while the ledger shows 2 of 3 is a false progress
+/// report even when the shas agree. The total comes from
+/// [`crate::collab::CollabSession::tasks_count`] — the same single source of
+/// truth `collab_status` reads — never from anything the caller supplied,
+/// which would let the reporter choose the bar it is measured against. Its
+/// `None` (an unreadable task list) is a *refusal*, not a zero: "cannot check"
+/// and "checked and clean" must not collapse into the same answer, which is
+/// the same distinction `HeadCheck` draws in `collab_checkpoint`.
+///
+/// **4. The gates are green at the checkpoint's own head.** Green gates at an
+/// older sha describe a tree that no longer exists.
+///
+/// # Deliberately not consulting live git HEAD
+///
+/// `head_sha` is what the state machine is about to record as the session's
+/// head, so tying the checkpoint to it is what makes the *recorded* head and
+/// the *proven* head the same value. Comparing against the reported head — not
+/// the repo — keeps this function pure with respect to the filesystem, so it
+/// is testable without a git fixture and cannot fail a turn on a transient
+/// repo problem.
+///
+/// What that buys is *internal consistency*, and it is worth being precise
+/// about the limit. Nothing here proves the reported head exists in the repo:
+/// the ancestry check above runs only for shortcut-started sessions (it is
+/// guarded on `task_list.is_none()` and matches only the two review events),
+/// so an `implementation_done` head is unvalidated caller input at this point.
+/// A caller could file a checkpoint at a head it never reached and then report
+/// that same head, and both would agree. Closing that needs a comparison
+/// against the repo itself, which belongs on the handoff and resume paths —
+/// where a *reader* is being shown a progress report nobody is currently
+/// vouching for, and where a transient git failure costs a diagnostic rather
+/// than a turn.
+///
+/// # Why `attested_by` is not consulted
+///
+/// [`checkpoint_divergence`]'s doc comment warns that a caller wiring it in as
+/// an unconditional block would defeat the operator-attestation escape hatch.
+/// This gate does not consult `attested_by` in *either* direction, and the
+/// reason is the paragraph above: a divergence is by definition a
+/// checkpoint-versus-live-HEAD disagreement, and this function never reads
+/// live HEAD. There is nothing here for an operator attestation to excuse —
+/// the checkpoint and the reported head come from the same caller in the same
+/// moment, and an operator performing a backfill writes the checkpoint at the
+/// head being reported, which is precisely what condition 2 asks for.
+///
+/// So both failure modes are avoided by construction rather than by a
+/// judgement call. Exempting operator-attested checkpoints from these four
+/// conditions would make the whole gate bypassable by setting one field —
+/// [`crate::collab::CollabCheckpoint::validate`] checks only that the
+/// acknowledged range is non-blank, not that it is real, and `attested_by` is
+/// caller-asserted like every other collab identity. Refusing them outright
+/// would leave the escape hatch with nothing to build on. Ignoring the field
+/// does neither: an operator-attested checkpoint that satisfies these four
+/// conditions passes here today, and the live-HEAD comparison plus the range
+/// verification that actually honors the attestation layer on top of this
+/// function rather than around it.
+fn require_checkpoint_proof(
+    tx: &rusqlite::Transaction<'_>,
+    session: &crate::collab::CollabSession,
+    head_sha: &str,
+) -> Result<(), MemoryError> {
+    let session_id = session.id.as_str();
+    let total = session.tasks_count();
+    // Rendered into the remedy text below, where the count is advice rather
+    // than a check — an unreadable task list still gets a usable instruction,
+    // and condition 3 refuses it on its own terms.
+    let total_hint = total.map_or_else(|| "N".to_string(), |count| count.to_string());
+    let remedy = format!(
+        "collab_checkpoint(session_id={session_id}, agent=<you>, status=batch_complete, \
+         head_sha={head_sha}, completed_task_ids=\"1,..,{total_hint}\", gates_result=passed, \
+         gates_sha={head_sha})"
+    );
+
+    // Condition 1.
+    let Some(checkpoint) = crate::collab::queue::load_current_checkpoint(tx, session_id)? else {
+        return Err(checkpoint_drift(format!(
+            "session {session_id} reports implementation_done at head_sha {head_sha}, but it has \
+             never written a checkpoint — nothing on the server records what was actually built, \
+             so the claim cannot be verified. Record it with {remedy} and send \
+             implementation_done again."
+        )));
+    };
+
+    // The checkpoint's own state, quoted in every refusal below so an operator
+    // reads what the ledger says rather than having to go and look.
+    let ledger = format!(
+        "checkpoint: task {}, status {}, head_sha {}, completed {}, gates {}",
+        format_task_id(checkpoint.task_id),
+        checkpoint.status,
+        checkpoint.head_sha,
+        format_task_id_list(&checkpoint.completed_task_ids),
+        checkpoint.gates_result,
+    );
+
+    // Condition 2.
+    if checkpoint.head_sha != head_sha {
+        // Raw string equality is the right comparison — this function has no
+        // repo to resolve an abbreviation against — but it makes an
+        // abbreviated sha look like permanent, inexplicable drift. Say which
+        // of the two shapes of disagreement this is.
+        let shape = if head_sha.starts_with(checkpoint.head_sha.as_str())
+            || checkpoint.head_sha.starts_with(head_sha)
+        {
+            "one is a prefix of the other, so this is an abbreviated sha compared against a \
+             fuller one; the comparison is exact string equality and never matches those"
+        } else {
+            "the two name different commits"
+        };
+        return Err(checkpoint_drift(format!(
+            "session {session_id} reports implementation_done at head_sha {head_sha} ({} chars) \
+             while its current checkpoint records head_sha {} ({} chars) — {shape} ({ledger}). \
+             This is the stale-progress condition issue #273 exists to catch: commits landed \
+             after the last checkpoint, or the reported head is not the one the checkpoint \
+             describes. File an accurate checkpoint with {remedy} and send implementation_done \
+             again.",
+            head_sha.chars().count(),
+            checkpoint.head_sha,
+            checkpoint.head_sha.chars().count(),
+        )));
+    }
+
+    // Condition 3, first half: the status must claim the batch is finished.
+    if checkpoint.status != crate::collab::CheckpointStatus::BatchComplete {
+        return Err(checkpoint_drift(format!(
+            "session {session_id} reports implementation_done, but its current checkpoint's \
+             status is {} rather than batch_complete ({ledger}) — the checkpoint does not itself \
+             claim the batch is finished. File the finishing checkpoint with {remedy} and send \
+             implementation_done again.",
+            checkpoint.status,
+        )));
+    }
+
+    // Condition 3, second half: and the ledger must cover every task. `None`
+    // is a refusal rather than a zero — see this function's doc comment.
+    let Some(total) = total else {
+        return Err(checkpoint_drift(format!(
+            "session {session_id} reports implementation_done, but its accepted task list cannot \
+             be read, so how many tasks the checkpoint must cover is unknown and the batch's \
+             completeness cannot be verified ({ledger}). This is a corrupt session record rather \
+             than a checkpoint problem; it needs an operator, not another checkpoint."
+        )));
+    };
+    if !checkpoint.covers_all_tasks(total) {
+        return Err(checkpoint_drift(format!(
+            "session {session_id} reports implementation_done, but its current checkpoint covers \
+             tasks {} of the {total} in the accepted task list ({ledger}) — coverage is checked \
+             as set membership, so every id from 1 to {total} must appear. Reporting the batch \
+             done over an incomplete ledger is a false progress report even when the shas agree. \
+             Finish the remaining tasks, then file {remedy}.",
+            format_task_id_list(&checkpoint.completed_task_ids),
+        )));
+    }
+
+    // Condition 4.
+    if !checkpoint.gates_are_green_at_head() {
+        return Err(checkpoint_drift(format!(
+            "session {session_id} reports implementation_done, but its current checkpoint carries \
+             no green gate proof at its own head {head_sha}: gates_result is {} and gates_sha is \
+             {} ({ledger}). Gates green at an older sha describe a tree that no longer exists. \
+             Run the gates at {head_sha} and file {remedy}.",
+            checkpoint.gates_result,
+            checkpoint.gates_sha.as_deref().unwrap_or("none"),
+        )));
+    }
+
+    Ok(())
 }
 
 fn validate_global_review_head_advance(
@@ -2112,6 +2328,43 @@ mod tests {
         .unwrap()
     }
 
+    /// Send `implementation_done`, first filing the `batch_complete`
+    /// checkpoint [`require_checkpoint_proof`] now demands as proof.
+    ///
+    /// Every session in this module is a one-task batch built by
+    /// [`drive_to_implement`], so the covering ledger is exactly `"1"`. The
+    /// checkpoint is filed through the real `collab_checkpoint` handler rather
+    /// than written straight to the table, so these tests keep exercising the
+    /// path an implementer actually takes.
+    fn send_implementation_done(
+        app: &crate::mcp::app::App,
+        sid: &str,
+        sender: &str,
+        head: &str,
+    ) -> Value {
+        super::super::collab_checkpoint::handle_collab_checkpoint(
+            app,
+            &json!({
+                "session_id": sid,
+                "agent": sender,
+                "status": "batch_complete",
+                "head_sha": head,
+                "completed_task_ids": "1",
+                "gates_result": "passed",
+                "gates_sha": head,
+                "gates_commands": "cargo test --workspace",
+            }),
+        )
+        .expect("the batch-complete checkpoint must be writable");
+        send(
+            app,
+            sid,
+            sender,
+            "implementation_done",
+            &json!({ "head_sha": head }).to_string(),
+        )
+    }
+
     /// Drive v1 planning to the pilot-owned finalization phase.
     fn drive_to_plan_finalize_pending(app: &crate::mcp::app::App, sid: &str) {
         send(app, sid, "claude", "draft", "claude draft");
@@ -2150,13 +2403,7 @@ mod tests {
     /// deliberately leaving `collab_end` uncalled.
     fn drive_to_coding_complete(app: &crate::mcp::app::App, sid: &str) {
         drive_to_implement(app, sid);
-        send(
-            app,
-            sid,
-            "claude",
-            "implementation_done",
-            r#"{"head_sha":"c1"}"#,
-        );
+        send_implementation_done(app, sid, "claude", "c1");
         send(
             app,
             sid,
@@ -2277,13 +2524,7 @@ mod tests {
         drive_to_implement(&app, &sid);
 
         // CodeImplementPending(impl) → CodeReviewFixGlobalPending(rework): no increment yet.
-        send(
-            &app,
-            &sid,
-            "claude",
-            "implementation_done",
-            r#"{"head_sha":"c1"}"#,
-        );
+        send_implementation_done(&app, &sid, "claude", "c1");
         let row = app.db.get_task_outcome(&sid).unwrap().unwrap();
         assert_eq!(row.review_rounds, 0, "impl→rework must NOT increment");
 
@@ -2594,12 +2835,11 @@ mod tests {
         let (_, settled_before) = wait_my_turn_poll(&app, &wait_args, &baseline).unwrap();
         assert!(!settled_before, "Codex still owns CodeImplementPending");
 
-        send(
+        send_implementation_done(
             &app,
             wait_args["session_id"].as_str().unwrap(),
             "codex",
-            "implementation_done",
-            r#"{"head_sha":"c1"}"#,
+            "c1",
         );
 
         let (body, settled_after) = wait_my_turn_poll(&app, &wait_args, &baseline).unwrap();
@@ -3918,13 +4158,7 @@ mod tests {
         // The resumed Codex owner completes the restored implementation phase.
         // This exercises the tool-level turn gate and delegated-completion
         // override together, rather than only asserting the resume snapshot.
-        send(
-            &app,
-            &sid,
-            "codex",
-            "implementation_done",
-            r#"{"head_sha":"resumed-implementation-head"}"#,
-        );
+        send_implementation_done(&app, &sid, "codex", "resumed-implementation-head");
 
         let after = app.db.collab_load_session_record(&sid).unwrap().session;
         assert_eq!(after.phase, Phase::CodeReviewFixGlobalPending);
@@ -4145,13 +4379,7 @@ mod tests {
         let app = test_app();
         let sid = start_session(&app);
         drive_to_implement(&app, &sid);
-        send(
-            &app,
-            &sid,
-            "claude",
-            "implementation_done",
-            r#"{"head_sha":"c1"}"#,
-        );
+        send_implementation_done(&app, &sid, "claude", "c1");
 
         let record = app.db.collab_load_session_record(&sid).unwrap();
         assert_eq!(record.session.phase, Phase::CodeReviewFixGlobalPending);
@@ -4297,13 +4525,7 @@ mod tests {
         drive_to_implement(&app, &sid);
 
         // 1. Claude finishes implementation → CodeReviewFixGlobalPending, Codex owns.
-        send(
-            &app,
-            &sid,
-            "claude",
-            "implementation_done",
-            r#"{"head_sha":"c1"}"#,
-        );
+        send_implementation_done(&app, &sid, "claude", "c1");
         let record = app.db.collab_load_session_record(&sid).unwrap();
         assert_eq!(record.session.phase, Phase::CodeReviewFixGlobalPending);
         assert_eq!(record.session.current_owner, crate::collab::Agent::Codex);
@@ -4376,13 +4598,7 @@ mod tests {
         let app = test_app();
         let sid = start_session(&app);
         drive_to_implement(&app, &sid);
-        send(
-            &app,
-            &sid,
-            "claude",
-            "implementation_done",
-            r#"{"head_sha":"impl-head"}"#,
-        );
+        send_implementation_done(&app, &sid, "claude", "impl-head");
 
         // Claude observes that Codex never ran its global-review turn. This
         // is the one recoverable failure that is valid from off-turn.
