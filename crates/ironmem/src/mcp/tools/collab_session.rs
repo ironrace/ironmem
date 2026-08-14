@@ -1207,6 +1207,86 @@ fn validate_global_review_head_advance(
     )))
 }
 
+/// Read the repo's current HEAD sha.
+///
+/// `pub(super)` so the `collab_checkpoint` tool can report divergence on write
+/// without duplicating the shell-out.
+///
+/// No production caller lands in this task (#273 Task 6): the `collab_checkpoint`
+/// tool that calls this (Task 5) and the gate/handoff/resume wiring (Tasks
+/// 7-10) are dispatched separately. Only the tests below exercise it until
+/// then, hence `allow(dead_code)` outside `cfg(test)` — the same pattern
+/// `ToolMeta::mutating_witnesses` uses in `mcp/tools/mod.rs`.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(super) fn git_head_sha(repo_path: &str) -> Result<String, MemoryError> {
+    let output = Command::new("git")
+        .args(["-C", repo_path, "rev-parse", "HEAD"])
+        .output()
+        .map_err(|err| {
+            MemoryError::Validation(format!("unable to execute git rev-parse: {err}"))
+        })?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(MemoryError::Validation(format!(
+            "git rev-parse HEAD failed in {repo_path}: {}",
+            stderr.trim()
+        )));
+    }
+
+    let sha = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if sha.is_empty() {
+        return Err(MemoryError::Validation(format!(
+            "git rev-parse HEAD returned empty output in {repo_path}"
+        )));
+    }
+    Ok(sha)
+}
+
+/// Compare a checkpoint against live git HEAD, returning a `checkpoint_drift:`
+/// diagnostic when they disagree.
+///
+/// Returns `None` — deliberately not an error and not a drift report — when
+/// git itself cannot be read. An unreadable repo is an *operational* failure,
+/// a different condition from a stale checkpoint; reporting it as drift would
+/// park sessions in recovery over a transient filesystem problem. This is the
+/// same distinction `validate_global_review_head_advance` draws between exit
+/// code 1 and any other git failure.
+///
+/// **Direction.** The diagnostic says HEAD "differs from" the checkpoint's
+/// `head_sha`, not "is ahead of" it. This function only proves the two SHAs
+/// are unequal — it does not run an ancestry check, so it cannot tell a normal
+/// forward advance (the issue #273 case) from HEAD having moved *behind* the
+/// checkpoint (a reset) or onto an unrelated commit entirely. Asserting "ahead
+/// of" here would be exactly the kind of claim-outrunning-evidence this issue
+/// is about; a caller that needs the direction can run its own ancestry check
+/// (see `validate_global_review_head_advance`) against the two SHAs this
+/// diagnostic already names.
+///
+/// Same forward-reference situation as `git_head_sha` above: no production
+/// caller lands until Tasks 7-10 wire this into the gate, handoff, and resume
+/// paths, so it is test-only for now.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(super) fn checkpoint_divergence(
+    repo_path: &str,
+    checkpoint: &crate::collab::CollabCheckpoint,
+) -> Option<String> {
+    let head = git_head_sha(repo_path).ok()?;
+    if head == checkpoint.head_sha {
+        return None;
+    }
+    Some(format!(
+        "{} HEAD {head} differs from the current checkpoint's head_sha {} \
+         (checkpoint: task {:?}, status {}, completed {:?}); \
+         file an accurate checkpoint with collab_checkpoint before proceeding",
+        crate::collab::CHECKPOINT_DRIFT_PREFIX,
+        checkpoint.head_sha,
+        checkpoint.task_id,
+        checkpoint.status,
+        checkpoint.completed_task_ids,
+    ))
+}
+
 pub(super) fn handle_collab_recv(app: &App, args: &Value) -> Result<Value, MemoryError> {
     let session_id = require_str(args, "session_id")?;
     let (repo_path, branch) = scope_for_session(app, session_id)?;
@@ -4716,5 +4796,120 @@ mod tests {
         send(&app, &sid, "codex", "canonical", "canonical plan");
         assert!(inbox_topics(&app, &sid, Agent::Claude).contains(&"canonical".to_string()));
         assert!(!inbox_topics(&app, &sid, Agent::Codex).contains(&"canonical".to_string()));
+    }
+
+    // ── git_head_sha / checkpoint_divergence (Task 6, issue #273) ──────────────
+
+    /// A temp repo with two commits, modeled on the fixture the spec supplied
+    /// (this file otherwise has no ancestry-test git fixture to mirror).
+    fn git_repo_with_two_commits() -> (tempfile::TempDir, String, String) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().to_string_lossy().to_string();
+        let run = |args: &[&str]| {
+            std::process::Command::new("git")
+                .args(["-C", &path])
+                .args(args)
+                .output()
+                .unwrap()
+        };
+        run(&["init", "-q"]);
+        run(&["config", "user.email", "t@example.com"]);
+        run(&["config", "user.name", "T"]);
+        std::fs::write(dir.path().join("a.txt"), "1").unwrap();
+        run(&["add", "."]);
+        run(&["commit", "-qm", "first"]);
+        let first = String::from_utf8(run(&["rev-parse", "HEAD"]).stdout)
+            .unwrap()
+            .trim()
+            .to_string();
+        std::fs::write(dir.path().join("a.txt"), "2").unwrap();
+        run(&["add", "."]);
+        run(&["commit", "-qm", "second"]);
+        let second = String::from_utf8(run(&["rev-parse", "HEAD"]).stdout)
+            .unwrap()
+            .trim()
+            .to_string();
+        (dir, first, second)
+    }
+
+    /// A minimal valid checkpoint at the given `head_sha`, built through
+    /// `from_json` (and therefore through `validate`) like every real
+    /// checkpoint, rather than hand-assembled.
+    fn checkpoint_at(head_sha: &str) -> crate::collab::CollabCheckpoint {
+        let payload = json!({
+            "session_id": "s1",
+            "task_id": 1,
+            "task_title": "first task",
+            "status": "started",
+            "head_sha": head_sha,
+            "completed_task_ids": "",
+        });
+        crate::collab::CollabCheckpoint::from_json(&payload).unwrap()
+    }
+
+    #[test]
+    fn git_head_sha_reads_current_head() {
+        let (dir, _first, second) = git_repo_with_two_commits();
+        let sha = git_head_sha(&dir.path().to_string_lossy()).unwrap();
+        assert_eq!(sha, second);
+    }
+
+    #[test]
+    fn git_head_sha_errors_outside_a_repo() {
+        let dir = tempfile::tempdir().unwrap();
+        let err = git_head_sha(&dir.path().to_string_lossy()).unwrap_err();
+        assert!(
+            matches!(err, MemoryError::Validation(_)),
+            "expected a Validation error outside a git repo, got {err:?}"
+        );
+    }
+
+    /// The core of issue #273: a checkpoint filed at an earlier commit while
+    /// the branch advanced past it must be reported as drift, and the
+    /// diagnostic must name both the live HEAD and the stale checkpoint sha
+    /// so a resuming agent can tell what happened without re-deriving it.
+    #[test]
+    fn stale_checkpoint_behind_head_is_reported_as_drift() {
+        let (dir, first, second) = git_repo_with_two_commits();
+        let checkpoint = checkpoint_at(&first);
+        let diagnostic = checkpoint_divergence(&dir.path().to_string_lossy(), &checkpoint)
+            .expect("a checkpoint filed at an earlier commit must be reported as drift");
+        assert!(
+            diagnostic.starts_with(crate::collab::CHECKPOINT_DRIFT_PREFIX),
+            "diagnostic must start with CHECKPOINT_DRIFT_PREFIX, got: {diagnostic}"
+        );
+        assert!(
+            diagnostic.contains(&second),
+            "diagnostic must name the live HEAD sha, got: {diagnostic}"
+        );
+        assert!(
+            diagnostic.contains(&first),
+            "diagnostic must name the checkpoint's head_sha, got: {diagnostic}"
+        );
+    }
+
+    #[test]
+    fn checkpoint_at_head_has_no_divergence() {
+        let (dir, _first, second) = git_repo_with_two_commits();
+        let checkpoint = checkpoint_at(&second);
+        assert_eq!(
+            checkpoint_divergence(&dir.path().to_string_lossy(), &checkpoint),
+            None
+        );
+    }
+
+    /// An unreadable repo (git itself cannot be read) must yield `None`, not a
+    /// drift report — a transient filesystem problem must not park a live
+    /// session in recovery. This is the mutation most likely to be
+    /// under-tested and matters most: see the doc comment on
+    /// `checkpoint_divergence`.
+    #[test]
+    fn unreadable_repo_yields_none_not_a_drift_report() {
+        let dir = tempfile::tempdir().unwrap();
+        let checkpoint = checkpoint_at("deadbeef");
+        assert_eq!(
+            checkpoint_divergence(&dir.path().to_string_lossy(), &checkpoint),
+            None
+        );
     }
 }
