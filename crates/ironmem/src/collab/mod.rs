@@ -32,6 +32,7 @@
 //! unrecoverable. See [`failure_class::classify`] and
 //! [`MAX_RECOVERY_ATTEMPTS`] for the exact rule.
 
+pub mod checkpoint;
 pub mod handoff;
 pub mod queue;
 
@@ -45,6 +46,7 @@ mod state_machine;
 mod task_list;
 
 pub use agent::{Agent, CollabRoles};
+pub use checkpoint::{AttestedBy, CheckpointError, CheckpointStatus, CollabCheckpoint};
 pub use error::CollabError;
 pub use event::CollabEvent;
 pub use failure_class::{classify, FailureClass};
