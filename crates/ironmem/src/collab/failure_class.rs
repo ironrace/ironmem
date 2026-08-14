@@ -55,16 +55,16 @@ pub fn classify(coding_failure: &str) -> FailureClass {
 mod tests {
     use super::*;
     use crate::collab::{
-        BRANCH_DRIFT_PREFIX, CODEX_DISPATCH_FAILED_PREFIX, DISK_FULL_PREFIX,
-        GIT_COMMIT_FAILED_PREFIX, GIT_PUSH_FAILED_PREFIX, NETWORK_FAILED_PREFIX,
+        BRANCH_DRIFT_PREFIX, CHECKPOINT_DRIFT_PREFIX, CODEX_DISPATCH_FAILED_PREFIX,
+        DISK_FULL_PREFIX, GIT_COMMIT_FAILED_PREFIX, GIT_PUSH_FAILED_PREFIX, NETWORK_FAILED_PREFIX,
         RECOVERABLE_FAILURE_PREFIXES, SANDBOX_DENIED_PREFIX,
     };
 
     #[test]
-    fn all_six_recoverable_prefixes_are_covered_by_the_fixture() {
+    fn all_seven_recoverable_prefixes_are_covered_by_the_fixture() {
         // Guards against the fixture list below silently drifting from the
         // canonical prefix list if a prefix is ever added or removed.
-        assert_eq!(RECOVERABLE_FAILURE_PREFIXES.len(), 6);
+        assert_eq!(RECOVERABLE_FAILURE_PREFIXES.len(), 7);
     }
 
     #[test]
@@ -76,6 +76,7 @@ mod tests {
             DISK_FULL_PREFIX,
             NETWORK_FAILED_PREFIX,
             CODEX_DISPATCH_FAILED_PREFIX,
+            CHECKPOINT_DRIFT_PREFIX,
         ] {
             let with_detail = format!("{prefix} something went wrong");
             assert_eq!(
@@ -95,6 +96,7 @@ mod tests {
             DISK_FULL_PREFIX,
             NETWORK_FAILED_PREFIX,
             CODEX_DISPATCH_FAILED_PREFIX,
+            CHECKPOINT_DRIFT_PREFIX,
         ] {
             assert_eq!(
                 classify(prefix),
@@ -130,5 +132,21 @@ mod tests {
     #[test]
     fn empty_string_classifies_terminal() {
         assert_eq!(classify(""), FailureClass::Terminal);
+    }
+
+    /// Checkpoint drift is recoverable, unlike `branch_drift:`. The remedy is
+    /// filing an accurate checkpoint, not abandoning the session — so it must
+    /// park the session in recovery rather than transition it to
+    /// `CodingFailed`.
+    #[test]
+    fn checkpoint_drift_with_detail_classifies_tooling() {
+        let failure =
+            format!("{CHECKPOINT_DRIFT_PREFIX} HEAD 75a4ea3 is ahead of checkpoint b9c2ce0");
+        assert_eq!(classify(&failure), FailureClass::Tooling);
+    }
+
+    #[test]
+    fn bare_checkpoint_drift_classifies_terminal() {
+        assert_eq!(classify(CHECKPOINT_DRIFT_PREFIX), FailureClass::Terminal);
     }
 }

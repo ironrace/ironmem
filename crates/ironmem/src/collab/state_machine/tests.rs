@@ -947,6 +947,96 @@ fn test_failure_report_branch_drift_from_codex_during_batch_phase() {
     assert_eq!(s.current_owner, Agent::Codex);
 }
 
+// ── checkpoint drift is off-turn admissible, but recoverable (issue #273, Task 4) ──
+//
+// Unlike branch drift, checkpoint drift does not send the session to
+// `CodingFailed`: the remedy is filing an accurate checkpoint, not
+// abandoning the session. It shares branch drift's unconditional off-turn
+// carve-out because a git-HEAD-vs-checkpoint comparison, like a branch
+// comparison, needs no turn ownership to run — whichever agent happens to
+// run it may be the one to detect the drift.
+
+#[test]
+fn test_failure_report_rejects_bare_checkpoint_drift_prefix() {
+    // Mirror of `test_failure_report_rejects_bare_branch_drift_prefix`: the
+    // off-turn carve-out demands diagnostic content after the prefix, so a
+    // bare `"checkpoint_drift:"` from a non-owner must still be rejected.
+    let s = locked_session("hf");
+    let s = submit_task_list(&s, "hf", 1);
+    assert_eq!(s.current_owner, Agent::Claude);
+
+    let err = apply_event(
+        &s,
+        Agent::Codex,
+        &CollabEvent::FailureReport {
+            coding_failure: "checkpoint_drift:".to_string(),
+        },
+    )
+    .unwrap_err();
+    assert!(matches!(err, CollabError::NotYourTurn { .. }));
+}
+
+#[test]
+fn test_failure_report_checkpoint_drift_from_codex_during_batch_phase() {
+    // Checkpoint drift is off-turn admissible like branch drift, but
+    // recoverable: the phase holds and recovery hands the turn to the
+    // reporting non-owner instead of transitioning to `CodingFailed`.
+    let s = locked_session("hf");
+    let s = submit_task_list(&s, "hf", 1);
+    assert_eq!(s.current_owner, Agent::Claude);
+
+    let s = apply_event(
+        &s,
+        Agent::Codex,
+        &CollabEvent::FailureReport {
+            coding_failure: "checkpoint_drift: HEAD 75a4ea3 is ahead of checkpoint b9c2ce0"
+                .to_string(),
+        },
+    )
+    .unwrap();
+    assert_eq!(s.phase, Phase::CodeImplementPending);
+    assert_eq!(s.recovery_owner, Some(Agent::Codex));
+    assert_eq!(s.recovery_origin_owner, Some(Agent::Claude));
+}
+
+#[test]
+fn checkpoint_drift_admissibility_matches_branch_drift_unconditionally() {
+    // Direct coverage of `off_turn_failure_is_admissible`: checkpoint drift,
+    // like branch drift, is admissible for either reporter, against either
+    // owner, from any coding-active phase — no dispatcher/phase gating like
+    // `codex_dispatch_failed:` carries.
+    let codex_owned = code_implement_pending_for(Agent::Codex);
+    assert_eq!(codex_owned.current_owner, Agent::Codex);
+    let claude_owned = review_fix_global_pending_for(Agent::Codex);
+    assert_eq!(claude_owned.current_owner, Agent::Claude);
+
+    let failure = "checkpoint_drift: HEAD 75a4ea3 is ahead of checkpoint b9c2ce0";
+
+    assert!(off_turn_failure_is_admissible(
+        failure,
+        Agent::Codex,
+        claude_owned.current_owner,
+        claude_owned.phase,
+        claude_owned.implementer,
+    ));
+    assert!(off_turn_failure_is_admissible(
+        failure,
+        Agent::Claude,
+        codex_owned.current_owner,
+        codex_owned.phase,
+        codex_owned.implementer,
+    ));
+
+    // A bare prefix (no detail) is never admissible, off-turn or not.
+    assert!(!off_turn_failure_is_admissible(
+        "checkpoint_drift:",
+        Agent::Codex,
+        claude_owned.current_owner,
+        claude_owned.phase,
+        claude_owned.implementer,
+    ));
+}
+
 #[test]
 fn test_failure_report_rejected_outside_coding_active_phase() {
     let s = locked_session("hf");
