@@ -99,6 +99,12 @@ impl AttestedBy {
     }
 }
 
+impl fmt::Display for AttestedBy {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 impl FromStr for AttestedBy {
     type Err = CheckpointError;
 
@@ -132,10 +138,12 @@ impl std::error::Error for CheckpointError {}
 ///
 /// The field set mirrors the table in migration 020 column for column, so this
 /// type is what both the MCP tool payload and the stored row round-trip
-/// through. Every field is `pub` because the type carries no invariant that
-/// survives construction — [`CollabCheckpoint::from_json`] is where validation
-/// happens, and callers that build one field-by-field (the loader in
-/// `collab::queue`) are reconstructing an already-validated row.
+/// through — which is why every field is `pub`: the loader in `collab::queue`
+/// rebuilds one field-by-field from a row rather than from JSON. That open
+/// construction is exactly why the cross-field rule lives in
+/// [`CollabCheckpoint::validate`] rather than only inside
+/// [`CollabCheckpoint::from_json`]; see that method for what every builder
+/// owes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CollabCheckpoint {
     pub session_id: String,
@@ -147,8 +155,10 @@ pub struct CollabCheckpoint {
     /// turns on.
     pub head_sha: String,
     pub commit_sha: Option<String>,
-    /// Cumulative and carried forward on every write. Deduplicated and sorted
-    /// at parse time so coverage arithmetic cannot be fooled by repeats.
+    /// Cumulative and carried forward on every write, deduplicated and sorted
+    /// at parse time so that equal progress stores as an equal string. Note
+    /// that it is [`CollabCheckpoint::covers_all_tasks`]'s own set, not this
+    /// normalization, that stops repeats inflating coverage.
     pub completed_task_ids: Vec<u32>,
     pub next_task_id: Option<u32>,
     /// `not_run`, `passed`, or `failed: <reason>` — free text after the
@@ -163,82 +173,104 @@ pub struct CollabCheckpoint {
     pub summary: Option<String>,
     pub attested_by: AttestedBy,
     /// The SHA range an operator is vouching for, as `<from>..<to>`. Always
-    /// `None` for an implementer attestation — see
-    /// [`CollabCheckpoint::from_json`].
+    /// `None` for an implementer attestation, and never `None` for an operator
+    /// one — see [`CollabCheckpoint::validate`].
     pub acknowledged_divergence: Option<String>,
     /// Unix seconds, server-stamped at write time rather than parsed from the
-    /// payload.
+    /// payload. `0` means "not yet stamped": that is what
+    /// [`CollabCheckpoint::from_json`] leaves here, and
+    /// `queue::upsert_checkpoint` overwrites it unconditionally, so a `0` in
+    /// hand means the checkpoint has not been through a write.
     pub updated_at: i64,
 }
 
 impl CollabCheckpoint {
     /// Parse and validate a checkpoint from the MCP tool payload.
     ///
-    /// Absent optional fields may arrive either omitted, JSON `null`, or as
-    /// the literal string `"none"` — the last because the collab turn
-    /// templates spell absent values `<N|none>` (see the checkpoint block in
-    /// `docs/COLLAB.md`), and an agent transcribing that template will send
-    /// the sentinel rather than dropping the key.
+    /// A caller with nothing to say for an optional field may omit it, send
+    /// JSON `null`, or send the literal string `"none"` — see
+    /// [`ABSENT_SENTINEL`]. `session_id`, `head_sha`, and `status` are
+    /// mandatory and reject all three alike; `completed_task_ids` and
+    /// `gates_result` are the two columns migration 020 gives a `NOT NULL
+    /// DEFAULT`, so for them "nothing to say" means that default (`""` and
+    /// `not_run`) rather than a `None`.
     ///
     /// `updated_at` is deliberately NOT read from the payload — the server
     /// stamps it at write time in `queue::upsert_checkpoint`, so a caller
-    /// cannot backdate a checkpoint to make a stale one look fresh.
+    /// cannot backdate a checkpoint to make a stale one look fresh. That is a
+    /// direct defense against the incident in issue #273, where a frozen
+    /// checkpoint was presented as a current progress report.
     pub fn from_json(value: &Value) -> Result<Self, CheckpointError> {
-        let session_id = require_str(value, "session_id")?;
-        let head_sha = require_str(value, "head_sha")?;
-        let status = CheckpointStatus::from_str(&require_str(value, "status")?)?;
-
-        let attested_by = AttestedBy::from_str(str_or_default(
-            value,
-            "attested_by",
-            AttestedBy::Implementer.as_str(),
-        )?)?;
-        let acknowledged_divergence = optional_string(value, "acknowledged_divergence");
-
-        // Enforced here as well as by the migration-020 CHECK so the caller
-        // gets a validation message rather than a raw SQL error. The operator
-        // direction is *only* enforced here: the schema's CHECK is
-        // deliberately one-directional and permits an operator row with a NULL
-        // range.
-        match (attested_by, acknowledged_divergence.as_deref()) {
-            (AttestedBy::Implementer, Some(_)) => {
-                return Err(CheckpointError(
-                    "acknowledged_divergence is only valid with attested_by=operator: an \
-                     implementer cannot self-attest over commits the protocol never witnessed"
-                        .to_string(),
-                ));
-            }
-            (AttestedBy::Operator, None) => {
-                return Err(CheckpointError(
-                    "attested_by=operator requires acknowledged_divergence naming the range \
-                     being vouched for, as <from_sha>..<to_sha>"
-                        .to_string(),
-                ));
-            }
-            _ => {}
-        }
-
-        Ok(Self {
-            session_id,
-            task_id: optional_u32(value, "task_id")?,
-            task_title: optional_string(value, "task_title"),
-            status,
-            head_sha,
-            commit_sha: optional_string(value, "commit_sha"),
+        let checkpoint = Self {
+            session_id: require_str(value, "session_id")?,
+            task_id: optional_task_id(value, "task_id")?,
+            task_title: optional_string(value, "task_title")?,
+            status: CheckpointStatus::from_str(&require_str(value, "status")?)?,
+            head_sha: require_str(value, "head_sha")?,
+            commit_sha: optional_string(value, "commit_sha")?,
             completed_task_ids: parse_completed_task_ids(str_or_default(
                 value,
                 "completed_task_ids",
                 "",
             )?)?,
-            next_task_id: optional_u32(value, "next_task_id")?,
+            next_task_id: optional_task_id(value, "next_task_id")?,
             gates_result: str_or_default(value, "gates_result", "not_run")?.to_string(),
-            gates_sha: optional_string(value, "gates_sha"),
-            gates_commands: optional_string(value, "gates_commands"),
-            summary: optional_string(value, "summary"),
-            attested_by,
-            acknowledged_divergence,
+            gates_sha: optional_string(value, "gates_sha")?,
+            gates_commands: optional_string(value, "gates_commands")?,
+            summary: optional_string(value, "summary")?,
+            attested_by: AttestedBy::from_str(str_or_default(
+                value,
+                "attested_by",
+                AttestedBy::Implementer.as_str(),
+            )?)?,
+            acknowledged_divergence: optional_string(value, "acknowledged_divergence")?,
+            // Not read from the payload; see this function's doc comment.
             updated_at: 0,
-        })
+        };
+        checkpoint.validate()?;
+        Ok(checkpoint)
+    }
+
+    /// Check the cross-field rules that hold for every checkpoint, however it
+    /// was built.
+    ///
+    /// Separate from [`CollabCheckpoint::from_json`] because every field is
+    /// `pub`: `queue::load_current_checkpoint` reconstructs a checkpoint
+    /// field-by-field from a row and never goes through the parser, so without
+    /// this it could hand Tasks 7-10 a combination the MCP path would have
+    /// rejected. `task_list::validate_task_list_body` is factored out of its
+    /// own parser for exactly this reason. **Both entry points must call it.**
+    ///
+    /// It enforces the attestation correlation and nothing else. An
+    /// `Operator` attestation is the escape hatch from the head-consistency
+    /// gate, so a checkpoint claiming it while naming no range it vouches for
+    /// is the one combination that must never reach the gate — and migration
+    /// 020 deliberately will not catch it, its `CHECK` being one-directional
+    /// by design (it forbids an implementer row carrying a range, and permits
+    /// an operator row without one). The implementer direction is checked here
+    /// too, redundantly with the schema, so the caller gets a validation
+    /// message rather than a raw SQL error.
+    ///
+    /// The `status`-shaped correlations — `batch_complete` should carry no
+    /// `task_id`, `completed` should carry a `commit_sha` — are deliberately
+    /// *not* here. They are conventions in migration 020's header rather than
+    /// constraints, and the useful version of each ("every task is covered")
+    /// needs the session's task count, which this type cannot see. They belong
+    /// to the `implementation_done` gate, which has it.
+    pub fn validate(&self) -> Result<(), CheckpointError> {
+        match (self.attested_by, self.acknowledged_divergence.as_deref()) {
+            (AttestedBy::Implementer, Some(_)) => Err(CheckpointError(
+                "acknowledged_divergence is only valid with attested_by=operator: an \
+                 implementer cannot self-attest over commits the protocol never witnessed"
+                    .to_string(),
+            )),
+            (AttestedBy::Operator, None) => Err(CheckpointError(
+                "attested_by=operator requires acknowledged_divergence naming the range \
+                 being vouched for, as <from_sha>..<to_sha>"
+                    .to_string(),
+            )),
+            _ => Ok(()),
+        }
     }
 
     /// Whether this checkpoint carries a *reusable* gate proof: the gates
@@ -272,81 +304,101 @@ impl CollabCheckpoint {
     }
 }
 
-/// Read a mandatory string field. Whitespace-only is treated as absent rather
-/// than as a value, so a checkpoint can never claim a `head_sha` of `" "`.
-fn require_str(value: &Value, field: &str) -> Result<String, CheckpointError> {
-    let raw = value
-        .get(field)
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .unwrap_or_default();
-    if raw.is_empty() {
-        return Err(CheckpointError(format!(
-            "{field} is required and must be a non-empty string"
-        )));
+/// The collab turn templates spell an absent value `none` (see the checkpoint
+/// block in `docs/COLLAB.md`), so an agent transcribing one sends the literal
+/// string rather than dropping the key.
+const ABSENT_SENTINEL: &str = "none";
+
+/// Read a string field, normalizing "the caller has nothing to say here" —
+/// absent, `null`, empty/whitespace, or the [`ABSENT_SENTINEL`] — to `None`,
+/// and rejecting a present value of some other JSON type.
+///
+/// Every other string reader in this module is built on this one, so the type
+/// strictness is uniform. That strictness is the point. `completed_task_ids`
+/// is a comma-separated string on the wire and the obvious caller mistake is
+/// sending `[1, 2, 3]`; `commit_sha` is the evidence of what a `completed`
+/// task produced. Reading either wrong-typed value as "absent" would persist a
+/// checkpoint that quietly contradicts what the caller believed it sent — the
+/// unverified bookkeeping this module exists to end.
+///
+/// Values are trimmed, so a `" completed "` transcribed out of a template is
+/// the same value as `"completed"` rather than a parse failure or a gate proof
+/// that silently fails to match.
+fn optional_str<'a>(value: &'a Value, field: &str) -> Result<Option<&'a str>, CheckpointError> {
+    match value.get(field) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(raw)) => {
+            let trimmed = raw.trim();
+            Ok((!trimmed.is_empty() && trimmed != ABSENT_SENTINEL).then_some(trimmed))
+        }
+        Some(_) => Err(CheckpointError(format!("{field} must be a string"))),
     }
-    Ok(raw.to_string())
 }
 
-/// Read a string field that falls back to `default` when absent or `null`,
-/// but *rejects* a present value of some other JSON type.
-///
-/// The rejection is the point. `completed_task_ids` is a comma-separated
-/// string on the wire, and the obvious caller mistake is sending
-/// `[1, 2, 3]` instead; silently reading that as `""` would persist an empty
-/// cumulative list over a real one and hand the next resumer a checkpoint
-/// claiming no task ever finished. This module exists because unverified
-/// bookkeeping was believed once already.
+/// Read a mandatory string field. Absent, whitespace-only, and the
+/// [`ABSENT_SENTINEL`] are all rejected alike, so a checkpoint can never claim
+/// a `head_sha` of `" "` or `"none"`.
+fn require_str(value: &Value, field: &str) -> Result<String, CheckpointError> {
+    optional_str(value, field)?
+        .map(str::to_string)
+        .ok_or_else(|| {
+            CheckpointError(format!(
+                "{field} is required and must be a non-empty string"
+            ))
+        })
+}
+
+/// Read an optional string field.
+fn optional_string(value: &Value, field: &str) -> Result<Option<String>, CheckpointError> {
+    Ok(optional_str(value, field)?.map(str::to_string))
+}
+
+/// Read a string field that falls back to `default` when the caller supplied
+/// nothing — the reader for the two columns migration 020 gives a `NOT NULL
+/// DEFAULT`, where "absent" means the default rather than `None`.
 fn str_or_default<'a>(
     value: &'a Value,
     field: &str,
     default: &'a str,
 ) -> Result<&'a str, CheckpointError> {
-    match value.get(field) {
-        None | Some(Value::Null) => Ok(default),
-        Some(Value::String(s)) => Ok(s),
-        Some(_) => Err(CheckpointError(format!("{field} must be a string"))),
-    }
-}
-
-/// Read an optional string field, treating absent, empty, and the template's
-/// `"none"` sentinel alike. Nothing here can fail: an optional string field
-/// has no shape to violate, so the absent case is a `None`, not an error.
-fn optional_string(value: &Value, field: &str) -> Option<String> {
-    value
-        .get(field)
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|s| !s.is_empty() && *s != "none")
-        .map(str::to_string)
+    Ok(optional_str(value, field)?.unwrap_or(default))
 }
 
 /// Read an optional task id, accepting both a JSON number and the string form
 /// an agent transcribing the `<N|none>` template will produce.
-fn optional_u32(value: &Value, field: &str) -> Result<Option<u32>, CheckpointError> {
-    match value.get(field) {
-        None | Some(Value::Null) => Ok(None),
-        Some(Value::String(s)) if s.trim().is_empty() || s.trim() == "none" => Ok(None),
-        Some(Value::String(s)) => s
-            .trim()
-            .parse::<u32>()
-            .map(Some)
-            .map_err(|_| CheckpointError(format!("{field} must be a non-negative integer"))),
-        Some(Value::Number(n)) => n
-            .as_u64()
-            .and_then(|v| u32::try_from(v).ok())
-            .map(Some)
-            .ok_or_else(|| CheckpointError(format!("{field} must be a non-negative integer"))),
-        Some(_) => Err(CheckpointError(format!(
-            "{field} must be a non-negative integer"
-        ))),
+///
+/// Zero is rejected: task ids are 1-based, which is a property of the id
+/// itself and so checkable here, unlike "id exceeds the session's task count",
+/// which needs a task list this type deliberately cannot see.
+fn optional_task_id(value: &Value, field: &str) -> Result<Option<u32>, CheckpointError> {
+    let invalid = || CheckpointError(format!("{field} must be a task id of 1 or greater"));
+    let parsed = match value.get(field) {
+        None | Some(Value::Null) => None,
+        Some(Value::String(_)) => optional_str(value, field)?
+            .map(|raw| raw.parse::<u32>().map_err(|_| invalid()))
+            .transpose()?,
+        Some(Value::Number(n)) => Some(
+            n.as_u64()
+                .and_then(|v| u32::try_from(v).ok())
+                .ok_or_else(invalid)?,
+        ),
+        Some(_) => return Err(invalid()),
+    };
+    match parsed {
+        Some(0) => Err(invalid()),
+        other => Ok(other),
     }
 }
 
 /// Parse the cumulative `completed_task_ids` list from its wire form (a
-/// comma-separated string), normalizing to a deduplicated, sorted vec so that
-/// coverage arithmetic in [`CollabCheckpoint::covers_all_tasks`] cannot be
-/// inflated by repeated ids.
+/// comma-separated string) into a deduplicated, sorted vec.
+///
+/// The normalization is for storage and comparison, not for coverage:
+/// [`CollabCheckpoint::covers_all_tasks`] builds its own set and is safe
+/// either way. What it buys is that two checkpoints recording the same
+/// progress round-trip to the same string, so an equality or diff over stored
+/// checkpoints reflects real progress rather than the order the ids were
+/// appended in.
 fn parse_completed_task_ids(raw: &str) -> Result<Vec<u32>, CheckpointError> {
     let mut ids = BTreeSet::new();
     for piece in raw.split(',') {
@@ -359,6 +411,11 @@ fn parse_completed_task_ids(raw: &str) -> Result<Vec<u32>, CheckpointError> {
                 "completed_task_ids must be a comma-separated list of integers, got {piece:?}"
             ))
         })?;
+        if id == 0 {
+            return Err(CheckpointError(
+                "completed_task_ids entries must be task ids of 1 or greater, got 0".to_string(),
+            ));
+        }
         ids.insert(id);
     }
     Ok(ids.into_iter().collect())
@@ -573,6 +630,173 @@ mod tests {
         assert!(!CollabCheckpoint::from_json(&dupes)
             .unwrap()
             .covers_all_tasks(3));
+    }
+
+    /// The parsed *field* is normalized, not just the coverage arithmetic
+    /// derived from it — the test above passes either way, because
+    /// `covers_all_tasks` builds its own set. This is what pins the
+    /// normalization the field doc promises, and with it the property that
+    /// equal progress stores as an equal string.
+    #[test]
+    fn completed_task_ids_are_deduplicated_and_sorted_in_the_parsed_field() {
+        let mut v = valid();
+        v["completed_task_ids"] = json!("3,1,2,2");
+        assert_eq!(
+            CollabCheckpoint::from_json(&v).unwrap().completed_task_ids,
+            vec![1, 2, 3]
+        );
+    }
+
+    /// Task ids are 1-based, so a zero is a malformed id however it arrives.
+    #[test]
+    fn task_ids_of_zero_are_rejected() {
+        let mut v = valid();
+        v["task_id"] = json!(0);
+        assert!(CollabCheckpoint::from_json(&v)
+            .unwrap_err()
+            .to_string()
+            .contains("task_id"));
+
+        let mut v = valid();
+        v["completed_task_ids"] = json!("0,1");
+        assert!(CollabCheckpoint::from_json(&v)
+            .unwrap_err()
+            .to_string()
+            .contains("completed_task_ids"));
+    }
+
+    /// A batch with no tasks is a malformed task list, not a finished one, so
+    /// `total = 0` must not be vacuously covered — an
+    /// `implementation_done` gate that read a zero task count would otherwise
+    /// wave the batch through on an empty checkpoint.
+    #[test]
+    fn covers_all_tasks_is_false_for_a_zero_total() {
+        let mut v = valid();
+        v["completed_task_ids"] = json!("");
+        assert!(!CollabCheckpoint::from_json(&v).unwrap().covers_all_tasks(0));
+        // Not merely because the list is empty:
+        assert!(!CollabCheckpoint::from_json(&valid())
+            .unwrap()
+            .covers_all_tasks(0));
+    }
+
+    /// The anti-backdating property, and the most direct defense against the
+    /// incident in issue #273: a caller cannot set its own `updated_at` and so
+    /// cannot make a frozen checkpoint look freshly written. The server stamps
+    /// it in `queue::upsert_checkpoint`.
+    #[test]
+    fn updated_at_is_never_read_from_the_payload() {
+        let mut v = valid();
+        v["updated_at"] = json!(99999);
+        assert_eq!(CollabCheckpoint::from_json(&v).unwrap().updated_at, 0);
+    }
+
+    /// The turn templates spell an absent value `none`, so the sentinel has to
+    /// mean absent for every field that can be absent — including the two
+    /// defaulted columns, where it means the column default rather than
+    /// a parse failure.
+    #[test]
+    fn the_none_sentinel_means_absent_everywhere_it_can_appear() {
+        let mut v = valid();
+        for field in [
+            "task_id",
+            "task_title",
+            "commit_sha",
+            "next_task_id",
+            "gates_sha",
+            "gates_commands",
+            "summary",
+        ] {
+            v[field] = json!("none");
+        }
+        v["completed_task_ids"] = json!("none");
+        v["gates_result"] = json!("none");
+        v["attested_by"] = json!("none");
+
+        let cp = CollabCheckpoint::from_json(&v).unwrap();
+        assert_eq!(cp.task_id, None);
+        assert_eq!(cp.task_title, None);
+        assert_eq!(cp.commit_sha, None);
+        assert_eq!(cp.next_task_id, None);
+        assert_eq!(cp.gates_sha, None);
+        assert_eq!(cp.gates_commands, None);
+        assert_eq!(cp.summary, None);
+        assert!(cp.completed_task_ids.is_empty());
+        // The defaulted columns fall back to migration 020's defaults rather
+        // than storing a value outside their documented vocabulary.
+        assert_eq!(cp.gates_result, "not_run");
+        assert_eq!(cp.attested_by, AttestedBy::Implementer);
+    }
+
+    /// Values arrive transcribed out of a template, so stray whitespace is
+    /// routine. Trimming everywhere keeps `" passed "` a reusable gate proof
+    /// instead of silently forcing a gate rerun.
+    #[test]
+    fn values_are_trimmed_before_they_are_interpreted() {
+        let mut v = valid();
+        v["status"] = json!(" completed ");
+        v["attested_by"] = json!(" implementer ");
+        v["gates_result"] = json!(" passed ");
+        v["head_sha"] = json!(" abc123 ");
+
+        let cp = CollabCheckpoint::from_json(&v).unwrap();
+        assert_eq!(cp.status, CheckpointStatus::Completed);
+        assert_eq!(cp.attested_by, AttestedBy::Implementer);
+        assert_eq!(cp.head_sha, "abc123");
+        assert!(cp.gates_are_green_at_head());
+    }
+
+    /// The same silent-drop failure `completed_task_ids` refuses, in the
+    /// fields next door. A wrong-typed `commit_sha` read as `None` would
+    /// record a `completed` task that produced no commit.
+    #[test]
+    fn optional_string_fields_reject_a_non_string_value() {
+        for (field, wrong) in [
+            ("commit_sha", json!(12345)),
+            ("gates_sha", json!(["abc123"])),
+            ("summary", json!(true)),
+            ("task_title", json!({"text": "Add the gate"})),
+        ] {
+            let mut v = valid();
+            v[field] = wrong;
+            let err = CollabCheckpoint::from_json(&v).unwrap_err();
+            assert!(err.to_string().contains(field), "got: {err}");
+        }
+    }
+
+    /// `validate` exists because every field is `pub`: the `collab::queue`
+    /// loader rebuilds a checkpoint from a row without going through
+    /// `from_json`, and migration 020's one-directional CHECK deliberately
+    /// permits the row below. Nothing else stands between a fabricated
+    /// operator attestation and the head-consistency gate it exempts.
+    #[test]
+    fn validate_catches_an_operator_attestation_built_without_the_parser() {
+        let mut smuggled = CollabCheckpoint::from_json(&valid()).unwrap();
+        smuggled.attested_by = AttestedBy::Operator;
+        smuggled.acknowledged_divergence = None;
+
+        let err = smuggled.validate().unwrap_err();
+        assert!(
+            err.to_string().contains("acknowledged_divergence"),
+            "got: {err}"
+        );
+
+        smuggled.acknowledged_divergence = Some("b9c2ce0..75a4ea3".to_string());
+        assert!(smuggled.validate().is_ok());
+    }
+
+    /// The mirror image: an implementer row carrying a range. The schema does
+    /// catch this one, but a direct Rust caller never reaches the schema.
+    #[test]
+    fn validate_catches_an_implementer_attestation_carrying_a_range() {
+        let mut smuggled = CollabCheckpoint::from_json(&valid()).unwrap();
+        smuggled.acknowledged_divergence = Some("aaa..bbb".to_string());
+
+        let err = smuggled.validate().unwrap_err();
+        assert!(
+            err.to_string().contains("acknowledged_divergence"),
+            "got: {err}"
+        );
     }
 
     /// The Rust enum and migration 020's `CHECK` list are two independent
