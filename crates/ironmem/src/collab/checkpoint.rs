@@ -152,7 +152,10 @@ pub struct CollabCheckpoint {
     pub status: CheckpointStatus,
     /// The repo HEAD this checkpoint was taken at. The divergence check
     /// compares this against live git HEAD; it is the field the whole issue
-    /// turns on.
+    /// turns on. Required to be non-blank — see
+    /// [`CollabCheckpoint::validate`], which is what makes that true of a
+    /// struct built field-by-field rather than parsed, migration 020 having
+    /// only `NOT NULL` on the column.
     pub head_sha: String,
     pub commit_sha: Option<String>,
     /// Cumulative and carried forward on every write, deduplicated and sorted
@@ -162,7 +165,10 @@ pub struct CollabCheckpoint {
     pub completed_task_ids: Vec<u32>,
     pub next_task_id: Option<u32>,
     /// `not_run`, `passed`, or `failed: <reason>` — free text after the
-    /// prefix, which is why it is a `String` rather than an enum.
+    /// prefix, which is why it is a `String` rather than an enum. Free text
+    /// still is not *no* text: [`CollabCheckpoint::validate`] requires it
+    /// non-blank, "nothing to say" being the `not_run` default rather than an
+    /// empty string.
     pub gates_result: String,
     /// The HEAD the gates actually ran against, distinct from `head_sha` on
     /// purpose. See [`CollabCheckpoint::gates_are_green_at_head`].
@@ -173,11 +179,12 @@ pub struct CollabCheckpoint {
     pub summary: Option<String>,
     pub attested_by: AttestedBy,
     /// The SHA range an operator is vouching for, as `<from>..<to>`. It *must*
-    /// be `None` for an implementer attestation and `Some` for an operator
-    /// one — but this being a `pub` field on a struct anyone can name, that is
-    /// a rule rather than a guarantee: it holds only of a checkpoint that has
-    /// been through [`CollabCheckpoint::validate`], which is why that method
-    /// exists and why every builder owes a call to it.
+    /// be `None` for an implementer attestation and a *non-blank* `Some` for
+    /// an operator one — `Some("")` being the same claim as `None` dressed to
+    /// pass a presence check — but this being a `pub` field on a struct anyone
+    /// can name, that is a rule rather than a guarantee: it holds only of a
+    /// checkpoint that has been through [`CollabCheckpoint::validate`], which
+    /// is why that method exists and why every builder owes a call to it.
     pub acknowledged_divergence: Option<String>,
     /// Unix seconds, server-stamped at write time rather than parsed from the
     /// payload. `0` means "not yet stamped": that is what
@@ -244,7 +251,34 @@ impl CollabCheckpoint {
     /// rejected. `task_list::validate_task_list_body` is factored out of its
     /// own parser for exactly this reason. **Both entry points must call it.**
     ///
-    /// It enforces the attestation correlation and nothing else. An
+    /// It enforces two things.
+    ///
+    /// **The required-field rules.** `session_id`, `head_sha`, and
+    /// `gates_result` are the type's three non-`Option` `String` fields, and
+    /// [`CollabCheckpoint::from_json`] can never produce a blank one: the
+    /// first two go through [`require_str`], and the third through
+    /// [`str_or_default`], which substitutes migration 020's `not_run` default
+    /// exactly when the caller had nothing to say. So "empty, whitespace-only,
+    /// or the [`ABSENT_SENTINEL`]" is a property of every *parsed* checkpoint,
+    /// and a struct built field-by-field must be held to it too. `head_sha` is
+    /// the field the whole issue turns on: migration 020 gives it `NOT NULL`
+    /// and no `CHECK (head_sha <> '')`, so without this a checkpoint whose
+    /// recorded HEAD is `""` or the word `none` would write and load clean.
+    /// That direction is fail-safe — such a value can never equal live git
+    /// HEAD, so the divergence gate blocks rather than passes — but the
+    /// resulting gate failure describes a checkpoint nobody can explain, which
+    /// is the unverified bookkeeping this module exists to end. Note the rule
+    /// is *requiredness*, not shape: this type cannot tell a real SHA from any
+    /// other word, and `gates_result` is free text after its prefix.
+    ///
+    /// The rules live here rather than being restated in `from_json`, which
+    /// inherits them through its call below. `from_json`'s readers reject the
+    /// same inputs earlier and with a field-specific parse message, because
+    /// they are answering a different question (what did this JSON payload
+    /// say?) and can distinguish an absent key from a wrong-typed one; this is
+    /// the backstop that holds when nobody parsed anything.
+    ///
+    /// **The attestation correlation.** An
     /// `Operator` attestation is the escape hatch from the head-consistency
     /// gate, so a checkpoint claiming it while naming no range it vouches for
     /// is the one combination that must never reach the gate — and migration
@@ -254,6 +288,24 @@ impl CollabCheckpoint {
     /// too, redundantly with the schema, so the caller gets a validation
     /// message rather than a raw SQL error.
     ///
+    /// "Names a range" means a *non-blank* one, held to the same [`is_blank`]
+    /// rule as the required fields above. `Some("")` is not a weaker version
+    /// of naming a range, it is the same claim as `None` dressed to pass:
+    /// Tasks 7-10 read an operator attestation as a human having inspected a
+    /// commit range and taken responsibility for it, so an empty one asserts
+    /// that a human vouched for nothing. Unlike the other blank-value holes
+    /// this type can have, that one is *not* fail-safe — a blank `head_sha`
+    /// or `gates_sha` can never match live git HEAD and so blocks the gate,
+    /// whereas this defeats it — which is why the presence check is a content
+    /// check.
+    ///
+    /// Requiredness, not shape: as with `head_sha`, this type cannot tell a
+    /// real `<from_sha>..<to_sha>` from any other non-blank string, and it has
+    /// no repo to resolve one against. Checking that the range parses, that
+    /// both endpoints exist, and that it actually spans the divergence is the
+    /// `implementation_done` gate's job in Task 10, which has the repo —
+    /// **that check is yours to add there, not here.**
+    ///
     /// The `status`-shaped correlations — `batch_complete` should carry no
     /// `task_id`, `completed` should carry a `commit_sha` — are deliberately
     /// *not* here. They are conventions in migration 020's header rather than
@@ -261,6 +313,19 @@ impl CollabCheckpoint {
     /// needs the session's task count, which this type cannot see. They belong
     /// to the `implementation_done` gate, which has it.
     pub fn validate(&self) -> Result<(), CheckpointError> {
+        for (field, value) in [
+            ("session_id", self.session_id.as_str()),
+            ("head_sha", self.head_sha.as_str()),
+            ("gates_result", self.gates_result.as_str()),
+        ] {
+            if is_blank(value) {
+                return Err(CheckpointError(format!(
+                    "{field} must carry a real value: {value:?} is empty, whitespace-only, or \
+                     the {ABSENT_SENTINEL:?} absent-sentinel"
+                )));
+            }
+        }
+
         match (self.attested_by, self.acknowledged_divergence.as_deref()) {
             (AttestedBy::Implementer, Some(_)) => Err(CheckpointError(
                 "acknowledged_divergence is only valid with attested_by=operator: an \
@@ -272,6 +337,13 @@ impl CollabCheckpoint {
                  being vouched for, as <from_sha>..<to_sha>"
                     .to_string(),
             )),
+            (AttestedBy::Operator, Some(range)) if is_blank(range) => {
+                Err(CheckpointError(format!(
+                    "attested_by=operator requires acknowledged_divergence naming the \
+                     range being vouched for, as <from_sha>..<to_sha>: {range:?} names \
+                     nothing, so the checkpoint claims a human vouched for no commits at all"
+                )))
+            }
             _ => Ok(()),
         }
     }
@@ -311,6 +383,20 @@ impl CollabCheckpoint {
 /// block in `docs/COLLAB.md`), so an agent transcribing one sends the literal
 /// string rather than dropping the key.
 const ABSENT_SENTINEL: &str = "none";
+
+/// "The caller said nothing here", for a value that has already been extracted
+/// from JSON — or was never JSON at all.
+///
+/// One statement of the rule [`optional_str`] applies at parse time, so
+/// [`CollabCheckpoint::validate`] holds a struct built field-by-field to the
+/// same standard a parsed one meets by construction. Deliberately shared
+/// rather than restated: a `validate` that disagreed with the parser about
+/// what counts as blank would be the drift the split entry points already
+/// invite.
+fn is_blank(value: &str) -> bool {
+    let trimmed = value.trim();
+    trimmed.is_empty() || trimmed == ABSENT_SENTINEL
+}
 
 /// Read a string field, normalizing "the caller has nothing to say here" —
 /// absent, `null`, empty/whitespace, or the [`ABSENT_SENTINEL`] — to `None`,
@@ -373,7 +459,16 @@ fn str_or_default<'a>(
 /// Zero is rejected: task ids are 1-based, which is a property of the id
 /// itself and so checkable here, unlike "id exceeds the session's task count",
 /// which needs a task list this type deliberately cannot see.
-fn optional_task_id(value: &Value, field: &str) -> Result<Option<u32>, CheckpointError> {
+///
+/// `pub(crate)` purely so a test can reach it, not because anything outside
+/// this module should call it. `queue::checked_task_id_column` is an
+/// independent statement of this function's refusal set on the *load* path,
+/// and `queue::tests::task_id_column_loader_mirrors_the_parser` feeds the same
+/// candidates through both to pin them together — the same lockstep idiom
+/// `status_variants_match_migration_020` uses for the enum/SQL vocabulary.
+/// Without it, relaxing either side silently stops the loader mirroring the
+/// parser and reopens the gap Task 3 closed.
+pub(crate) fn optional_task_id(value: &Value, field: &str) -> Result<Option<u32>, CheckpointError> {
     let invalid = || CheckpointError(format!("{field} must be a task id of 1 or greater"));
     let parsed = match value.get(field) {
         None | Some(Value::Null) => None,
@@ -837,6 +932,111 @@ mod tests {
 
         smuggled.acknowledged_divergence = Some("b9c2ce0..75a4ea3".to_string());
         assert!(smuggled.validate().is_ok());
+    }
+
+    /// The required-field half of `validate`, and the reason it is there: the
+    /// three non-`Option` `String` fields are exactly the ones a
+    /// field-by-field builder can leave blank, and migration 020 gives them
+    /// `NOT NULL` without any `CHECK (<col> <> '')`. `head_sha` is the field
+    /// the whole issue turns on — a checkpoint recording a HEAD of `""` or the
+    /// word `none` fails the divergence gate in a way nobody can diagnose.
+    ///
+    /// Every field/value pair is checked on its own: a single struct mutated
+    /// in three places at once would let one rule mask the other two.
+    #[test]
+    fn validate_rejects_a_blank_required_field() {
+        for blank in ["", "   ", "none", "  none  "] {
+            for field in ["session_id", "head_sha", "gates_result"] {
+                let mut cp = CollabCheckpoint::from_json(&valid()).unwrap();
+                match field {
+                    "session_id" => cp.session_id = blank.to_string(),
+                    "head_sha" => cp.head_sha = blank.to_string(),
+                    _ => cp.gates_result = blank.to_string(),
+                }
+                let err = match cp.validate() {
+                    Ok(()) => panic!("{field} = {blank:?} must be rejected"),
+                    Err(err) => err.to_string(),
+                };
+                assert!(
+                    err.contains(field),
+                    "{field} = {blank:?} was rejected without naming the field: {err}"
+                );
+            }
+        }
+    }
+
+    /// The blank-value hole in its one *non*-fail-safe position. Everywhere
+    /// else a blank value makes the gate block — a `head_sha` of `""` can
+    /// never equal live git HEAD — but `acknowledged_divergence` is the
+    /// escape hatch *from* that gate, so a blank one makes the gate pass while
+    /// vouching for nothing. `Some("")` is not a weaker claim than `None`, it
+    /// is the same claim shaped to survive a presence check, and neither
+    /// migration 020's one-directional CHECK nor `from_json` (which never
+    /// produces it, `optional_string` normalizing blanks to `None`) stands in
+    /// its way. Only a struct built field-by-field can reach this state, which
+    /// is exactly what the loader does.
+    ///
+    /// One value per constructed struct, so no case is carried by another.
+    #[test]
+    fn validate_rejects_a_blank_operator_range() {
+        for blank in ["", "   ", "none", "  none  "] {
+            let mut cp = CollabCheckpoint::from_json(&valid()).unwrap();
+            cp.attested_by = AttestedBy::Operator;
+            cp.acknowledged_divergence = Some(blank.to_string());
+
+            let err = match cp.validate() {
+                Ok(()) => panic!("an operator range of {blank:?} must be rejected"),
+                Err(err) => err.to_string(),
+            };
+            assert!(
+                err.contains("acknowledged_divergence"),
+                "operator range {blank:?} was rejected without naming the field: {err}"
+            );
+        }
+
+        // And the rule is requiredness, not shape: a non-blank range passes
+        // here even though this type cannot tell a real SHA range from any
+        // other string. Resolving it against the repo is Task 10's job.
+        let mut ok = CollabCheckpoint::from_json(&valid()).unwrap();
+        ok.attested_by = AttestedBy::Operator;
+        ok.acknowledged_divergence = Some("b9c2ce0..75a4ea3".to_string());
+        assert!(ok.validate().is_ok());
+    }
+
+    /// The other direction, so the rule above cannot be satisfied by a
+    /// `validate` that rejects everything: a legitimately-defaulted
+    /// `gates_result` is *not* blank. `from_json` substitutes migration 020's
+    /// `not_run` default when the caller says nothing, so "absent" and
+    /// "empty" are different states for this column and only the second is an
+    /// error.
+    #[test]
+    fn validate_accepts_the_defaulted_gates_result() {
+        let mut v = valid();
+        v.as_object_mut().unwrap().remove("gates_result");
+        let cp = CollabCheckpoint::from_json(&v).unwrap();
+        assert_eq!(cp.gates_result, "not_run");
+        assert!(cp.validate().is_ok());
+    }
+
+    /// `validate`'s required-field rules are a backstop for struct builders,
+    /// not a replacement for the parser's own errors: a bad JSON payload must
+    /// still fail in `require_str`, with its field-specific "is required"
+    /// message, rather than falling through to `validate`'s. Pinned because
+    /// the two now overlap, and a refactor that deleted the parser's check
+    /// would still leave every `contains(field)` assertion in this module
+    /// green while silently changing what a tool caller is told.
+    #[test]
+    fn from_json_reports_the_parser_error_for_a_blank_mandatory_field() {
+        for field in ["session_id", "head_sha"] {
+            let mut v = valid();
+            v[field] = json!("");
+            let err = CollabCheckpoint::from_json(&v).unwrap_err().to_string();
+            assert_eq!(
+                err,
+                format!("{field} is required and must be a non-empty string"),
+                "from_json must report its own parse error, not validate's"
+            );
+        }
     }
 
     /// The mirror image: an implementer row carrying a range. The schema does
