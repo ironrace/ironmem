@@ -1096,10 +1096,19 @@ pub(super) fn handle_collab_send(app: &App, args: &Value) -> Result<Value, Memor
             )?;
         }
 
-        // The head-consistency gate (issue #273). Placed after the ancestry
-        // block and before `apply_event` so a refusal leaves the session in
-        // `CodeImplementPending` with nothing persisted — the transaction has
-        // not written a thing at this point.
+        // The head-consistency gate (issue #273). What guarantees a refusal
+        // leaves the session in `CodeImplementPending` with nothing persisted
+        // is the enclosing `with_transaction`, which rolls back on any `Err` —
+        // not this placement. Moving the check below `apply_event` and
+        // `save_session` keeps every test green, because the rollback carries
+        // the property either way.
+        //
+        // It sits here anyway, for two reasons that are about cost rather than
+        // correctness: nothing downstream of it is worth computing for a turn
+        // that is about to be discarded, and the gate reads only state that
+        // already exists at this point, so a later position would invite a
+        // future author to read post-event state and quietly make the check
+        // depend on the transition it is meant to authorize.
         if let crate::collab::CollabEvent::ImplementationDone { head_sha } = &event {
             require_checkpoint_proof(tx, &session, head_sha)?;
         }
@@ -1181,6 +1190,11 @@ pub(super) fn handle_collab_send(app: &App, args: &Value) -> Result<Value, Memor
 /// So an owner that keeps hitting this gate — or a counterpart that sees it
 /// stuck there — can park the phase and hand the turn on instead of the
 /// session dead-ending on an implementer whose ledger it cannot fix.
+///
+/// Which is why it is a helper rather than something applied to every refusal
+/// on the way out: it is a *claim* about the condition, not decoration.
+/// [`require_checkpoint_proof`]'s unreadable-task-list arm deliberately does
+/// not use it, neither half of the promise being true there.
 fn checkpoint_drift(detail: String) -> MemoryError {
     MemoryError::Validation(format!(
         "{} {detail}",
@@ -1217,9 +1231,9 @@ fn checkpoint_drift(detail: String) -> MemoryError {
 /// [`crate::collab::CollabSession::tasks_count`] — the same single source of
 /// truth `collab_status` reads — never from anything the caller supplied,
 /// which would let the reporter choose the bar it is measured against. Its
-/// `None` (an unreadable task list) is a *refusal*, not a zero: "cannot check"
-/// and "checked and clean" must not collapse into the same answer, which is
-/// the same distinction `HeadCheck` draws in `collab_checkpoint`.
+/// `None` (an unreadable task list) gets its own refusal — see the comment at
+/// that arm for why it is separate, why it is unreachable, and why it is the
+/// one refusal here that does not carry the `checkpoint_drift:` prefix.
 ///
 /// **4. The gates are green at the checkpoint's own head.** Green gates at an
 /// older sha describe a tree that no longer exists.
@@ -1266,8 +1280,17 @@ fn checkpoint_drift(detail: String) -> MemoryError {
 /// would leave the escape hatch with nothing to build on. Ignoring the field
 /// does neither: an operator-attested checkpoint that satisfies these four
 /// conditions passes here today, and the live-HEAD comparison plus the range
-/// verification that actually honors the attestation layer on top of this
-/// function rather than around it.
+/// verification that actually honors the attestation belong on the handoff
+/// and resume paths, *outside* this function.
+///
+/// **Binding constraint on the next author.** All of the above holds only
+/// because this function never reads live git HEAD. If a live-HEAD comparison
+/// is ever added *inside* this function, `attested_by` MUST be consulted at
+/// that point — at that moment the function would be deciding a real
+/// divergence, and continuing to ignore the field would make the operator
+/// escape hatch unreachable. Do not add such a read without also wiring the
+/// attestation, and do not treat this paragraph as commentary: it is the
+/// condition under which the reasoning above stops being true.
 fn require_checkpoint_proof(
     tx: &rusqlite::Transaction<'_>,
     session: &crate::collab::CollabSession,
@@ -1275,13 +1298,29 @@ fn require_checkpoint_proof(
 ) -> Result<(), MemoryError> {
     let session_id = session.id.as_str();
     let total = session.tasks_count();
-    // Rendered into the remedy text below, where the count is advice rather
-    // than a check — an unreadable task list still gets a usable instruction,
-    // and condition 3 refuses it on its own terms.
-    let total_hint = total.map_or_else(|| "N".to_string(), |count| count.to_string());
+    // The remedy is a *machine-followable* instruction — an agent that hits
+    // this gate is expected to copy it verbatim — so `completed_task_ids` must
+    // render the literal list rather than an ellipsis. `1,..,3` looks like an
+    // obvious range to a human and is a parse error to the server:
+    // `checkpoint::parse_completed_task_ids` rejects any non-numeric piece, so
+    // following the advice would earn a second, unrelated error and another
+    // round trip through the very recovery loop this gate exists to open.
+    // Task lists are capped at 15 entries, so the literal list is always short.
+    //
+    // The `None` arm cannot produce a valid list because it does not know the
+    // count; it says so in words instead of emitting something that would
+    // parse into the wrong claim. It is unreachable in practice — see the
+    // `total` refusal below.
+    let completed_hint = match total {
+        Some(count) => (1..=count)
+            .map(|id| id.to_string())
+            .collect::<Vec<_>>()
+            .join(","),
+        None => "<every task id, comma-separated>".to_string(),
+    };
     let remedy = format!(
         "collab_checkpoint(session_id={session_id}, agent=<you>, status=batch_complete, \
-         head_sha={head_sha}, completed_task_ids=\"1,..,{total_hint}\", gates_result=passed, \
+         head_sha={head_sha}, completed_task_ids=\"{completed_hint}\", gates_result=passed, \
          gates_sha={head_sha})"
     );
 
@@ -1344,10 +1383,34 @@ fn require_checkpoint_proof(
         )));
     }
 
-    // Condition 3, second half: and the ledger must cover every task. `None`
-    // is a refusal rather than a zero — see this function's doc comment.
+    // Condition 3, second half: and the ledger must cover every task.
+    //
+    // `None` is a refusal rather than a zero: "cannot check" and "checked and
+    // clean" must not collapse into one answer, the same distinction
+    // `collab_checkpoint`'s `HeadCheck` draws. Note the direction is not
+    // load-bearing on its own — `covers_all_tasks(0)` is already `false`, so
+    // an `unwrap_or(0)` here would still refuse the send, just with the
+    // coverage wording below. The value of the separate arm is the *diagnosis*
+    // (a corrupt session record, not an incomplete batch), which is why no
+    // test pins it: reaching it needs a `CodeImplementPending` session whose
+    // `task_list` will not parse, and the only path into that phase is a
+    // `task_list` send that already validated. Deliberate defense in depth,
+    // deliberately unreachable, deliberately unpinned.
+    //
+    // This is the one refusal that does NOT carry `CHECKPOINT_DRIFT_PREFIX`,
+    // and dropping it is the point rather than an oversight. That prefix is a
+    // promise with two halves the protocol acts on: `failure_class::classify`
+    // grades it Tooling (recoverable — park the phase, hand the turn over) and
+    // `off_turn_failure_is_admissible` lets the counterpart report it. Both
+    // halves are false here. No checkpoint fixes an unparseable task list, and
+    // no counterpart's turn repairs it, so a message telling the caller it
+    // "needs an operator, not another checkpoint" while wearing a prefix that
+    // means "write a better checkpoint" would contradict itself — and would
+    // route an agent keying on the prefix into a retry loop that cannot
+    // terminate. Unprefixed, it classifies Terminal, which is what a corrupt
+    // session record deserves.
     let Some(total) = total else {
-        return Err(checkpoint_drift(format!(
+        return Err(MemoryError::Validation(format!(
             "session {session_id} reports implementation_done, but its accepted task list cannot \
              be read, so how many tasks the checkpoint must cover is unknown and the batch's \
              completeness cannot be verified ({ledger}). This is a corrupt session record rather \

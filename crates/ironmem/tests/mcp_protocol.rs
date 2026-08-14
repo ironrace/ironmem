@@ -6242,6 +6242,120 @@ fn implementation_done_refused(app: &App, session_id: &str) -> String {
     err
 }
 
+/// Pull one `<key>=<value>` argument out of the `collab_checkpoint(...)`
+/// remedy embedded in a refusal. Quoted values end at the closing quote, bare
+/// ones at the next `,` or the closing `)`.
+fn remedy_field(err: &str, key: &str) -> String {
+    let needle = format!("{key}=");
+    let start = err
+        .find(&needle)
+        .unwrap_or_else(|| panic!("the remedy names no {key}: {err}"))
+        + needle.len();
+    let rest = &err[start..];
+    match rest.strip_prefix('"') {
+        Some(quoted) => {
+            let end = quoted
+                .find('"')
+                .unwrap_or_else(|| panic!("unterminated quoted {key}: {err}"));
+            quoted[..end].to_string()
+        }
+        None => {
+            let end = rest
+                .find([',', ')'])
+                .unwrap_or_else(|| panic!("unterminated {key}: {err}"));
+            rest[..end].to_string()
+        }
+    }
+}
+
+/// Do exactly what the refusal told the caller to do: send a
+/// `collab_checkpoint` built from the arguments the remedy named, taking
+/// nothing from the test's own knowledge of the session.
+///
+/// `agent=<you>` is the one argument the remedy deliberately leaves as a
+/// placeholder — it names the caller's own identity, which the server cannot
+/// fill in — so it is the one value substituted here.
+fn follow_the_remedy(app: &App, err: &str) {
+    let completed = remedy_field(err, "completed_task_ids");
+    // A property, not a literal: any future ellipsis, range dash, or prose
+    // creeps back in as a non-digit. `parse_completed_task_ids` rejects those,
+    // and the tool call below is what proves it — this assertion just fails
+    // with a message that says which character was wrong.
+    assert!(
+        completed.chars().all(|c| c.is_ascii_digit() || c == ','),
+        "the remedy's completed_task_ids must be a literal comma-separated list \
+         the server can parse, got {completed:?} in: {err}"
+    );
+    call_tool(
+        app,
+        "collab_checkpoint",
+        json!({
+            "session_id": remedy_field(err, "session_id"),
+            "agent": "claude",
+            "status": remedy_field(err, "status"),
+            "head_sha": remedy_field(err, "head_sha"),
+            "completed_task_ids": completed,
+            "gates_result": remedy_field(err, "gates_result"),
+            "gates_sha": remedy_field(err, "gates_sha"),
+        }),
+    );
+}
+
+/// The refusal's remedy is a *machine-followable* instruction — an agent that
+/// hits this gate is expected to copy it verbatim — so follow it verbatim and
+/// require the retried send to be accepted.
+///
+/// Deliberately not a string match on the rendered list. Asserting
+/// `completed_task_ids="1,2,3"` would still pass if the server's own parser
+/// disagreed with that format; feeding the emitted value back through the real
+/// `collab_checkpoint` tool is what proves the advice works. It would have
+/// caught the ellipsis form `1,..,3`, which reads as an obvious range to a
+/// human and is a parse error to `parse_completed_task_ids` — an agent
+/// following it would earn a second, unrelated error and another trip round
+/// the recovery loop this gate exists to open.
+///
+/// Run from two different conditions because all four refusals embed the same
+/// remedy: one arriving with no checkpoint at all, one with a checkpoint whose
+/// ledger under-covers.
+#[test]
+fn the_refusal_remedy_is_a_call_that_actually_satisfies_the_gate() {
+    for under_covering_checkpoint in [false, true] {
+        let app = App::open_for_test().unwrap();
+        let session_id = drive_to_code_implement_pending(&app, 3);
+        if under_covering_checkpoint {
+            let mut cp = passing_checkpoint(&session_id, 3);
+            cp["completed_task_ids"] = json!("1,2");
+            call_tool(&app, "collab_checkpoint", cp);
+        }
+
+        let err = implementation_done_refused(&app, &session_id);
+        assert_eq!(
+            remedy_field(&err, "head_sha"),
+            GATE_HEAD,
+            "the remedy must point at the head being reported, not the stale one: {err}"
+        );
+
+        follow_the_remedy(&app, &err);
+
+        call_tool(
+            &app,
+            "collab_send",
+            json!({
+                "session_id": &session_id,
+                "sender": "claude",
+                "topic": "implementation_done",
+                "content": json!({ "head_sha": GATE_HEAD }).to_string()
+            }),
+        );
+        let status = call_tool(&app, "collab_status", json!({ "session_id": &session_id }));
+        assert_eq!(
+            status["phase"], "CodeReviewFixGlobalPending",
+            "following the remedy verbatim must satisfy the gate \
+             (under_covering_checkpoint={under_covering_checkpoint})"
+        );
+    }
+}
+
 /// Condition 1: a session that never checkpointed has no progress claim to
 /// verify, and must be told which tool fixes that. Waving legacy/never-written
 /// sessions through would reinstate exactly the hole issue #273 closes.
@@ -6331,8 +6445,11 @@ fn implementation_done_refused_when_the_checkpoint_misses_a_task() {
     call_tool(&app, "collab_checkpoint", cp);
 
     let err = implementation_done_refused(&app, &session_id);
+    // `contains("of the 3")` rather than `contains('3')`: the session id is a
+    // UUID, so a bare `'3'` is very nearly always present and would assert
+    // almost nothing about the message.
     assert!(
-        err.contains("1, 2") && err.contains('3'),
+        err.contains("1, 2") && err.contains("of the 3"),
         "the refusal must name what is covered and how many tasks there are, got: {err}"
     );
 }
