@@ -172,9 +172,12 @@ pub struct CollabCheckpoint {
     pub gates_commands: Option<String>,
     pub summary: Option<String>,
     pub attested_by: AttestedBy,
-    /// The SHA range an operator is vouching for, as `<from>..<to>`. Always
-    /// `None` for an implementer attestation, and never `None` for an operator
-    /// one — see [`CollabCheckpoint::validate`].
+    /// The SHA range an operator is vouching for, as `<from>..<to>`. It *must*
+    /// be `None` for an implementer attestation and `Some` for an operator
+    /// one — but this being a `pub` field on a struct anyone can name, that is
+    /// a rule rather than a guarantee: it holds only of a checkpoint that has
+    /// been through [`CollabCheckpoint::validate`], which is why that method
+    /// exists and why every builder owes a call to it.
     pub acknowledged_divergence: Option<String>,
     /// Unix seconds, server-stamped at write time rather than parsed from the
     /// payload. `0` means "not yet stamped": that is what
@@ -691,12 +694,42 @@ mod tests {
         assert_eq!(CollabCheckpoint::from_json(&v).unwrap().updated_at, 0);
     }
 
-    /// The turn templates spell an absent value `none`, so the sentinel has to
-    /// mean absent for every field that can be absent — including the two
-    /// defaulted columns, where it means the column default rather than
-    /// a parse failure.
+    /// The turn templates spell an absent value `none`, so the sentinel means
+    /// absent for every field that *may* be absent — and therefore means
+    /// rejected for the three that may not. Both halves are behavior the
+    /// helpers introduced: a length-only check would accept `"none"` as a
+    /// literal `head_sha`. That direction is fail-safe (a `head_sha` of
+    /// `"none"` can never equal live git HEAD, so the gate blocks rather than
+    /// passes) but it would store a checkpoint whose recorded HEAD is a word.
     #[test]
-    fn the_none_sentinel_means_absent_everywhere_it_can_appear() {
+    fn the_none_sentinel_is_rejected_for_the_three_mandatory_fields() {
+        for field in ["session_id", "head_sha", "status"] {
+            let mut v = valid();
+            v[field] = json!("none");
+            let err = CollabCheckpoint::from_json(&v).unwrap_err();
+            assert!(err.to_string().contains(field), "got: {err}");
+        }
+    }
+
+    /// `session_id` is the checkpoint's primary key and its FK to
+    /// `collab_sessions`, so the database does backstop a missing one. This
+    /// asserts the Rust half, whose whole justification is that the caller
+    /// gets a validation message instead of a raw SQL constraint error.
+    #[test]
+    fn session_id_is_required_and_non_empty() {
+        let mut v = valid();
+        v["session_id"] = json!("");
+        assert!(CollabCheckpoint::from_json(&v)
+            .unwrap_err()
+            .to_string()
+            .contains("session_id"));
+    }
+
+    /// The other half of the sentinel rule: for every field that may be
+    /// absent it means absent — including the two defaulted columns, where it
+    /// means the column default rather than a parse failure.
+    #[test]
+    fn the_none_sentinel_means_absent_for_every_optional_field() {
         let mut v = valid();
         for field in [
             "task_id",
@@ -769,11 +802,32 @@ mod tests {
     /// `from_json`, and migration 020's one-directional CHECK deliberately
     /// permits the row below. Nothing else stands between a fabricated
     /// operator attestation and the head-consistency gate it exempts.
+    ///
+    /// Written as a full struct literal naming all fifteen fields rather than
+    /// as a mutation of a parsed value, because the openness of the type is
+    /// the thing under test — this is the construction Task 3's loader will
+    /// perform. It therefore also stops compiling if a field is later made
+    /// private or the struct gains `#[non_exhaustive]`, which is the change
+    /// that would invalidate the reasoning above.
     #[test]
     fn validate_catches_an_operator_attestation_built_without_the_parser() {
-        let mut smuggled = CollabCheckpoint::from_json(&valid()).unwrap();
-        smuggled.attested_by = AttestedBy::Operator;
-        smuggled.acknowledged_divergence = None;
+        let mut smuggled = CollabCheckpoint {
+            session_id: "s1".to_string(),
+            task_id: Some(3),
+            task_title: Some("Add the gate".to_string()),
+            status: CheckpointStatus::BatchComplete,
+            head_sha: "75a4ea3".to_string(),
+            commit_sha: Some("75a4ea3".to_string()),
+            completed_task_ids: vec![1, 2, 3],
+            next_task_id: None,
+            gates_result: "passed".to_string(),
+            gates_sha: Some("75a4ea3".to_string()),
+            gates_commands: Some("cargo test --workspace".to_string()),
+            summary: Some("Batch complete".to_string()),
+            attested_by: AttestedBy::Operator,
+            acknowledged_divergence: None,
+            updated_at: 1_760_000_000,
+        };
 
         let err = smuggled.validate().unwrap_err();
         assert!(
