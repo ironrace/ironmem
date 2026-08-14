@@ -489,11 +489,34 @@ CHECKPOINT_PROTOCOL_SURFACES = {
     PROMPTS / "collab-turn-code-implement.md": ".claude-plugin/prompts/collab-turn-code-implement.md",
     ROOT / ".codex-plugin" / "prompts" / "collab-batch-impl.md": ".codex-plugin/prompts/collab-batch-impl.md",
 }
+# Issue #273 / Tasks 11-12: checkpoints moved from an `add_drawer` convention
+# (verified by nothing) to the `collab_checkpoint` MCP tool, backed by the
+# `collab_checkpoints` table and enforced by the `implementation_done` gate.
+# These snippets pin the NEW contract across all four surfaces above, so a
+# surface that quietly reverts to describing the drawer form — or drops the
+# divergence-handling / gate-refusal contract that makes the tool load-bearing
+# — fails here rather than shipping.
 REQUIRED_CHECKPOINT_PROTOCOL_SNIPPETS = [
-    "collab-checkpoint:<session_id>",
-    "one logical-keyed current drawer",
-    "get_drawer(wing=ironrace-memory",
+    "collab_checkpoint(",
     "completed_task_ids",
+    "inspect_divergence",
+    "checkpoint_drift",
+]
+# The two worker-facing mirrors (plus collab.md, the dispatcher's own copy of
+# the same contract) must never describe checkpoints as an `add_drawer`
+# write again — a checkpoint written to a drawer is invisible to
+# `implementation_done`'s gate, which reads only the `collab_checkpoints`
+# table. docs/COLLAB.md is deliberately excluded: its "Historical note"
+# quotes the retired `logical_key=collab-checkpoint:<session_id>` form on
+# purpose, to explain what it was replaced with.
+CHECKPOINT_MIRROR_SURFACES = {
+    PROMPTS / "collab-turn-code-implement.md": ".claude-plugin/prompts/collab-turn-code-implement.md",
+    ROOT / ".codex-plugin" / "prompts" / "collab-batch-impl.md": ".codex-plugin/prompts/collab-batch-impl.md",
+    COMMAND: ".claude-plugin/commands/collab.md",
+}
+FORBIDDEN_CHECKPOINT_DRAWER_SNIPPETS = [
+    "logical_key=collab-checkpoint:",
+    "logical_key: collab-checkpoint:",
 ]
 REQUIRED_SENTINELS = ["<!-- LINT:worker-dispatch -->",
                       "<!-- LINT:gates-ref-only -->",
@@ -3563,6 +3586,26 @@ def main() -> int:
         for snippet in REQUIRED_CHECKPOINT_PROTOCOL_SNIPPETS:
             if snippet not in text:
                 err(f"{label}: missing checkpoint contract {snippet!r}")
+
+    # Independent of the required-snippet loop above: a mirror could satisfy
+    # every required snippet by mentioning `collab_checkpoint(` once in
+    # passing while still describing the write itself as an `add_drawer`
+    # call. This checks the drawer form's absence directly rather than
+    # inferring it from what IS present.
+    for path, label in CHECKPOINT_MIRROR_SURFACES.items():
+        if not path.exists():
+            continue  # already reported as missing above
+        text = path.read_text()
+        for snippet in FORBIDDEN_CHECKPOINT_DRAWER_SNIPPETS:
+            if snippet in text:
+                err(f"{label}: reverted to the retired add_drawer checkpoint "
+                    f"form ({snippet!r}) — checkpoints are written with "
+                    f"collab_checkpoint(...) against the collab_checkpoints "
+                    f"table, not a drawer")
+        if "collab_checkpoint(" not in text:
+            err(f"{label}: does not show a collab_checkpoint( call — the "
+                f"checkpoint write contract must be demonstrated, not just "
+                f"named")
 
     for prompt in CODEX_PROMPTS:
         if not prompt.exists():

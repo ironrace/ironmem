@@ -533,16 +533,24 @@ its own judgment.
 ### Implementation checkpoints
 
 During `CodeImplementPending`, the implementer must write durable
-checkpoints to ironmem so a fresh Claude or Codex process can resume if
-the current session stops mid-batch. These checkpoints do **not** advance
-the collab state machine and must not be sent through `collab_send`.
+checkpoints so a fresh Claude or Codex process can resume if the current
+session stops mid-batch. These checkpoints do **not** advance the collab
+state machine and must not be sent through `collab_send`.
 
-Checkpoint storage:
+Checkpoint storage is the `collab_checkpoints` table (migrations 020/021),
+written with the `collab_checkpoint` MCP tool — **not** an `add_drawer`
+drawer. Required for a write: `session_id`, `agent` (`claude|codex` —
+identifies the caller for the generation lease every other session-scoped
+collab write takes), `status`, and `head_sha` (the **full 40-char** repo
+HEAD; the divergence check is exact string equality, so an abbreviated sha
+always reads as permanent drift). The rest of the record is optional:
+`task_id`/`task_title`, `commit_sha`, `completed_task_ids`, `next_task_id`,
+`gates_result`, `gates_sha`, `gates_commands`, `summary`, plus
+`attested_by`/`acknowledged_divergence` for the operator-attested backfill
+path (see below) and `handoff_token`. `task_id`/`next_task_id` each accept
+either an integer or the string form, plus the literal `"none"` sentinel for
+absent.
 
-- Tool: `mcp__ironmem__add_drawer`
-- `wing`: `ironrace-memory`
-- `room`: `collab-checkpoints`
-- `logical_key`: `collab-checkpoint:<session_id>`
 - One checkpoint before starting each task (`status: started`)
 - One checkpoint after each task is implemented, reviewed, committed, and
   pushed (`status: completed`)
@@ -550,46 +558,59 @@ Checkpoint storage:
 - One final checkpoint before `implementation_done`
   (`status: batch_complete`)
 
-Every checkpoint write for a session uses that same logical key, replacing the
-one logical-keyed current drawer instead of appending another checkpoint.
-Carry `completed_task_ids` forward in the replacement content so the drawer
-always contains the full recovery state.
+Each write **replaces** the session's one current checkpoint row rather than
+appending another — there is exactly one row per session, not a log. Carry
+`completed_task_ids` forward as the full cumulative list on every write, or
+the replacement loses the record of tasks a prior write already reported
+done.
 
-Checkpoint content should be compact, line-oriented, and include enough
-state for another agent to resume without transcript context:
+Example write:
 
-```text
-collab_checkpoint
-session_id: <uuid>
-phase: CodeImplementPending
-implementer: <claude|codex>
-repo_path: <absolute repo path>
-branch: <branch>
-plan_file_path: <repo-relative plan path>
-task_id: <N|none>
-task_title: <title|none>
-status: <started|completed|blocked|batch_complete>
-head_sha: <current HEAD>
-commit_sha: <task commit sha|none>
-completed_task_ids: <comma-separated ids>
-next_task_id: <N|none>
-gates: <not_run|passed|failed: short reason>
-gates_sha: <HEAD sha that gates ran against|none>
-gates_commands: <exact gate commands separated by " && "|none>
-gates_result: <not_run|passed|failed: short reason>
-summary: <one concise sentence>
-resume_hint: /collab join [--implementer=<claude|codex>] <session_id>
+```
+collab_checkpoint(session_id=<uuid>, agent=<claude|codex>,
+  task_id=<N|none>, task_title=<title|none>,
+  status=<started|completed|blocked|batch_complete>,
+  head_sha=<current HEAD, full 40 chars>,
+  commit_sha=<task commit sha|none>,
+  completed_task_ids=<comma-separated ids, cumulative>,
+  next_task_id=<N|none>,
+  gates_result=<not_run|passed|failed: short reason>,
+  gates_sha=<HEAD sha gates ran against|none>,
+  gates_commands=<exact gate commands separated by " && "|none>,
+  summary=<one concise sentence>)
 ```
 
-On any fresh `/collab join` that lands in `CodeImplementPending`, the owning
-implementer must fetch the one logical-keyed current drawer deterministically
-with `get_drawer(wing=ironrace-memory, room=collab-checkpoints,
-logical_key=collab-checkpoint:<session_id>)`, then use that checkpoint plus the
-git log to choose the first unfinished task. The new implementer must then read
-the plan and scan the current code/diff to
-verify which acceptance criteria are already complete before editing. If
-the current checkpoint is `batch_complete`, first try to reuse its gate
-proof: require clean pushed-head proof, local `HEAD == checkpoint.head_sha`,
+The response carries `diverged` (`true|false|null`) and a named `head_check`
+(`"checked"` or `"unreadable"`). **`diverged: null` means the server could
+not compare the checkpoint against live git HEAD — it is not a report of "no
+divergence."** Always read `head_check` before trusting `diverged`.
+
+`implementation_done` refuses — prefixed `checkpoint_drift:`, with a
+ready-to-paste remedy — unless all four hold:
+
+1. a checkpoint exists for the session at all;
+2. its `head_sha` equals the `head_sha` reported to `implementation_done`
+   (exact string equality — no abbreviation);
+3. its `status` is `batch_complete` and its `completed_task_ids` covers
+   every task id in the accepted task list;
+4. gates passed at that same head (`gates_result` starts with `passed` and
+   `gates_sha == head_sha`).
+
+On any fresh `/collab join` that lands in `CodeImplementPending`, read the
+checkpoint from `collab_status`'s `checkpoint` block (the stored row's
+fields plus the live-HEAD comparison) rather than from transcript context.
+If it reports `diverged: true` — or `null`, since "could not check" is not
+"no divergence" — do **not** resume on that progress claim. Inspect it first
+with `collab_checkpoint(session_id=<id>, agent=<you>,
+inspect_divergence=true)`, which lists the commits that actually landed
+after the checkpoint without writing anything, then either file an accurate
+checkpoint at the current HEAD or escalate for an operator-attested backfill
+— see "Operator-attested checkpoint backfill" below. Only once the
+checkpoint agrees with HEAD should you use it, plus the git log, to pick the
+first unfinished task; then read the plan and scan the current code/diff to
+verify which acceptance criteria are already complete before editing. If the
+current checkpoint is `batch_complete`, first try to reuse its gate proof:
+require clean pushed-head proof, local `HEAD == checkpoint.head_sha`,
 `checkpoint.gates_sha == checkpoint.head_sha`, `checkpoint.gates_result`
 starts with `passed`, and `checkpoint.gates_commands` exactly matches the
 current required gate set. When all checks hold, send
@@ -598,6 +619,17 @@ drifted, the gate command set changed, the pushed-head proof fails, or the
 checkpoint lacks the new gate-proof fields. Otherwise resume at
 `next_task_id` (or the `started` task if the last checkpoint stopped
 mid-task).
+
+**Historical note.** Before issue #273, checkpoints were an
+`add_drawer(wing=ironrace-memory, room=collab-checkpoints,
+logical_key=collab-checkpoint:<session_id>)` convention, verified by
+nothing: a Codex batch committed 28 changes while its drawer stayed frozen
+at "task 1 / started", and a later handoff carried that frozen claim to a
+resuming agent while the branch had advanced 27 commits further with
+nothing to catch the discrepancy. The `collab_checkpoints` table plus the
+`implementation_done` gate above exist to make that specific failure
+structurally impossible — the claim is now compared against live git rather
+than trusted on its own say-so.
 
 **Both modes apply the same *Finishing the Branch* carve-out**: the
 implementer agent stops `iron-build` at the last task's approval+commit and
@@ -979,7 +1011,7 @@ failure at that one command loses exactly one `gh` invocation, nothing else
 about the session's work is at risk. Making the most authority-sensitive
 transition in the whole machine (the one that hands a reviewed, pushed
 branch to a human as a PR) resumable, just to save re-running one command,
-is a bad trade. It is also structurally different from the six recoverable
+is a bad trade. It is also structurally different from the seven recoverable
 prefixes above, each of which names an operation either agent's own turn
 might perform and so always has a live counterpart on the other side to
 hand off to. In normal flow, PR creation isn't one of those: the Claude-side
@@ -1116,8 +1148,9 @@ Valid during planning and during `CodeImplementPending`. During
 `CodeImplementPending`, this also moves `current_owner` to the selected
 implementer so `/collab join --implementer=<agent> <session_id>` can hand
 the active batch to another agent. The new implementer resumes from the
-one current logical-keyed ironmem checkpoint, then scans the plan and current code before
-continuing. Calls after `implementation_done` are rejected.
+session's current `collab_checkpoints` row (via `collab_status`'s `checkpoint`
+block), then scans the plan and current code before continuing. Calls after
+`implementation_done` are rejected.
 
 **Caller restriction.** Only the session's *current* pilot may call this,
 checked before phase — the implementer cannot hand off its own role, and an
@@ -2168,14 +2201,14 @@ before each coding-active `collab_send`:
   for triage; an unrecoverable failure surfaces as `failure_report` with
   `coding_failure: "subagent_failure: ..."`.
 - **Implementation checkpoints** during `CodeImplementPending`. The
-  implementer writes `ironrace-memory/collab-checkpoints` drawers before
-  each task starts, after each task completes, on blocked failures, and
-  after final gates pass, always with
-  `logical_key: collab-checkpoint:<session_id>`. This replaces one
-  logical-keyed current drawer while preserving cumulative
+  implementer writes a `collab_checkpoints` row via the `collab_checkpoint`
+  MCP tool before each task starts, after each task completes, on blocked
+  failures, and after final gates pass. Each write replaces the session's
+  one current checkpoint row while preserving cumulative
   `completed_task_ids`. On a fresh join at `CodeImplementPending`, the
-  implementer reads that one logical-keyed current drawer and resumes
-  from the first unfinished task instead of relying on transcript context.
+  implementer reads that current checkpoint from `collab_status`'s
+  `checkpoint` block, confirms it agrees with live HEAD, and resumes from
+  the first unfinished task instead of relying on transcript context.
 - **Local gates** before Claude-owned code-changing turns
   (`implementation_done` in Claude-implementer mode, and `review_local` when
   Claude is the pilot): `cargo fmt --check`, `cargo clippy -D warnings`,

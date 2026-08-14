@@ -519,17 +519,101 @@ def test_codex_dispatch_uses_explicit_repository_model_defaults():
     assert "escalation tier, not the default" in plan_draft_prompt
 
 
-def test_lint_requires_logical_keyed_checkpoint_contract(tmp_path):
+# Issue #273 / Tasks 11-12: checkpoints moved off the `add_drawer` convention
+# onto the `collab_checkpoint` MCP tool + `collab_checkpoints` table. This list
+# is REQUIRED_CHECKPOINT_PROTOCOL_SNIPPETS duplicated here on purpose — see the
+# comment on CODEX_PILOT_ROUTING_SNIPPETS above for why importing it instead
+# would let a deleted entry silently shrink the sweep rather than fail it.
+CHECKPOINT_CONTRACT_SNIPPETS = [
+    "collab_checkpoint(",
+    "completed_task_ids",
+    "inspect_divergence",
+    "checkpoint_drift",
+]
+
+
+@pytest.mark.parametrize("snippet", CHECKPOINT_CONTRACT_SNIPPETS)
+def test_lint_requires_checkpoint_contract_snippet(tmp_path, snippet):
     fixture = copy_fixture(tmp_path)
     bad = fixture / ".codex-plugin" / "prompts" / "collab-batch-impl.md"
-    bad.write_text(bad.read_text().replace(
-        "collab-checkpoint:<session_id>", "missing-checkpoint-key"
-    ))
+    mutate(bad, snippet, "MUTATED-CHECKPOINT-SNIPPET")
 
     r = run({"COLLAB_LINT_ROOT": str(fixture)})
 
     assert r.returncode == 1
-    assert "missing checkpoint contract 'collab-checkpoint:<session_id>'" in r.stdout
+    assert f"missing checkpoint contract {snippet!r}" in r.stdout
+
+
+def test_lint_rejects_add_drawer_equals_form_reverted_into_claude_mirror(tmp_path):
+    """A mirror that reverts to `logical_key=collab-checkpoint:<id>` (the
+    `add_drawer` call-site spelling) must fail, even though it still mentions
+    `collab_checkpoint(` elsewhere — the two checks are independent."""
+    fixture = copy_fixture(tmp_path)
+    bad = fixture / ".claude-plugin" / "prompts" / "collab-turn-code-implement.md"
+    bad.write_text(
+        bad.read_text()
+        + "\n<!-- regressed: logical_key=collab-checkpoint:<session_id> -->\n"
+    )
+
+    r = run({"COLLAB_LINT_ROOT": str(fixture)})
+
+    assert r.returncode == 1
+    assert (
+        ".claude-plugin/prompts/collab-turn-code-implement.md: reverted to the "
+        "retired add_drawer checkpoint form ('logical_key=collab-checkpoint:')"
+    ) in r.stdout
+
+
+def test_lint_rejects_add_drawer_colon_form_reverted_into_codex_mirror(tmp_path):
+    """The other quoting style of the same regression
+    (`logical_key: collab-checkpoint:<id>`, as a YAML-ish drawer arg rather
+    than a Python kwarg), on the other mirror — an independent mutation from
+    the equals-form test above."""
+    fixture = copy_fixture(tmp_path)
+    bad = fixture / ".codex-plugin" / "prompts" / "collab-batch-impl.md"
+    bad.write_text(
+        bad.read_text()
+        + "\n<!-- regressed: logical_key: collab-checkpoint:<session_id> -->\n"
+    )
+
+    r = run({"COLLAB_LINT_ROOT": str(fixture)})
+
+    assert r.returncode == 1
+    assert (
+        ".codex-plugin/prompts/collab-batch-impl.md: reverted to the retired "
+        "add_drawer checkpoint form ('logical_key: collab-checkpoint:')"
+    ) in r.stdout
+
+
+def test_lint_requires_a_demonstrated_collab_checkpoint_call_in_claude_mirror(tmp_path):
+    """Dropping every `collab_checkpoint(` call from a mirror (without
+    reintroducing the drawer form) must fail on its own, independently of the
+    required-snippet loop above."""
+    fixture = copy_fixture(tmp_path)
+    bad = fixture / ".claude-plugin" / "prompts" / "collab-turn-code-implement.md"
+    mutate(bad, "collab_checkpoint(", "record_checkpoint(")
+
+    r = run({"COLLAB_LINT_ROOT": str(fixture)})
+
+    assert r.returncode == 1
+    assert (
+        ".claude-plugin/prompts/collab-turn-code-implement.md: does not show a "
+        "collab_checkpoint( call"
+    ) in r.stdout
+
+
+def test_lint_requires_a_demonstrated_collab_checkpoint_call_in_collab_md(tmp_path):
+    fixture = copy_fixture(tmp_path)
+    bad = fixture / ".claude-plugin" / "commands" / "collab.md"
+    mutate(bad, "collab_checkpoint(", "record_checkpoint(")
+
+    r = run({"COLLAB_LINT_ROOT": str(fixture)})
+
+    assert r.returncode == 1
+    assert (
+        ".claude-plugin/commands/collab.md: does not show a collab_checkpoint( "
+        "call"
+    ) in r.stdout
 
 
 def test_codex_background_dispatcher_uses_quiet_settled_waits():
