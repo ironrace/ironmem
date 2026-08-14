@@ -20,8 +20,6 @@ use crate::collab::CollabCheckpoint;
 use crate::error::MemoryError;
 use crate::mcp::app::App;
 
-use super::shared::require_str;
-
 /// What comparing the checkpoint against live git HEAD actually established.
 ///
 /// Three states, deliberately not two. `checkpoint_divergence` collapses
@@ -96,16 +94,16 @@ impl HeadCheck {
 }
 
 pub(super) fn handle_collab_checkpoint(app: &App, args: &Value) -> Result<Value, MemoryError> {
-    // Presence-checked here purely so an absent `session_id` fails with this
-    // module's own message before the payload parse does. The parsed
-    // `checkpoint.session_id` below — trimmed, sentinel-checked, and validated
-    // non-blank — is THE session id from here on: it addresses the
-    // existence check, keys the row, and is echoed back, so the session whose
-    // liveness was verified is always the session the row is written under.
-    // Reading the argument a second time would reintroduce that gap for the
-    // price of a `trim()` disagreement between two parsers.
-    require_str(args, "session_id")?;
-
+    // Unlike its neighbours this handler does NOT pull `session_id` out with
+    // `shared::require_str` first. The payload parser reads the same key and
+    // refuses a strict superset of what that helper does — absent, non-string,
+    // blank, *and* the `none` absent-sentinel — with a message that says which
+    // of those went wrong, so a second reading could only ever subtract
+    // information or disagree. And disagree it would: the two differ on
+    // trimming, so a `" <id> "` transcribed out of a turn template would parse
+    // into one session id and be looked up under another. Keeping a single
+    // reading makes the session whose liveness is checked the same session the
+    // row is keyed by, by construction rather than by a comparison.
     let checkpoint = CollabCheckpoint::from_json(args)
         .map_err(|err| MemoryError::Validation(err.to_string()))?;
     let session_id = checkpoint.session_id.as_str();

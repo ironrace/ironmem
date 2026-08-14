@@ -5892,6 +5892,33 @@ fn collab_checkpoint_uses_one_session_id_for_lookup_and_row() {
     );
 }
 
+/// The payload parser is the ONLY reader of `session_id` here, which is what
+/// lets the diagnosis survive: it can tell a wrong-typed value from an absent
+/// one. `shared::require_str`, the helper the neighbouring handlers reach for,
+/// collapses both into "session_id is required" — true but useless to a caller
+/// that sent a number and needs to be told so.
+#[test]
+fn collab_checkpoint_names_a_wrong_typed_session_id() {
+    let app = App::open_for_test().unwrap();
+
+    let err = call_tool_expect_error(
+        &app,
+        "collab_checkpoint",
+        json!({ "session_id": 42, "status": "started", "head_sha": "b9c2ce0" }),
+    );
+    assert_eq!(err, "session_id must be a string", "got: {err}");
+
+    let absent = call_tool_expect_error(
+        &app,
+        "collab_checkpoint",
+        json!({ "status": "started", "head_sha": "b9c2ce0" }),
+    );
+    assert_eq!(
+        absent, "session_id is required and must be a non-empty string",
+        "got: {absent}"
+    );
+}
+
 /// A checkpoint is session-scoped state, so it needs a live session: an
 /// unknown id is a `NotFound`, and an ended one a validation error. Without
 /// this the FK would still refuse the unknown id, but as a raw SQL error.
