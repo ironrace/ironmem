@@ -295,6 +295,27 @@ fn kv_display(out: &mut String, key: &str, value: impl std::fmt::Display) {
     kv(out, key, Some(rendered.as_str()));
 }
 
+/// Spell out an attestation verdict for a successor reading the block.
+///
+/// Every value except `verified` carries what it means for what the reader may
+/// conclude, because all three of the others are ways of *not* having checked
+/// and a bare label invites the reader to treat them as grades of success.
+/// `kv` collapses the result onto one line, so the prose cannot forge a key.
+fn attestation_check_line(verdict: &'static str) -> String {
+    let caveat = match verdict {
+        "verified" => "",
+        "verified_without_span" => {
+            " (endpoints resolved; whether the range COVERS the gap was not checked)"
+        }
+        "unverified_repo_unreadable" => {
+            " (the range was never resolved against the repo — treat it as unchecked)"
+        }
+        // `unrecorded`, and anything a future variant adds: fail safe.
+        _ => " (no verdict was stored — treat it as unchecked)",
+    };
+    format!("{verdict}{caveat}")
+}
+
 /// Render the checkpoint lines of the handoff block.
 ///
 /// Every key is emitted on every call, unset ones as an em-dash, so the block's
@@ -357,6 +378,23 @@ fn render_checkpoint(out: &mut String, section: &CheckpointSection) {
         out,
         "checkpoint.acknowledged_divergence",
         current.and_then(|(cp, _)| cp.acknowledged_divergence.as_deref()),
+    );
+    // What the server established about the line above, never omitted for an
+    // operator row. Without it, a range the server never resolved — an
+    // attestation filed while the repo was unreadable, say — is rendered to a
+    // successor in exactly the same words as one it did resolve. The successor
+    // is the reader with the least context and the most reason to trust this
+    // block, so this line carries the caveat in prose rather than only a label:
+    // `head_check` is a bare word because a successor already knows what
+    // "diverged" means, whereas "verified_without_span" is a term of art from
+    // one function.
+    kv(
+        out,
+        "checkpoint.attestation_check",
+        current
+            .and_then(|(cp, _)| cp.attestation_verdict())
+            .map(attestation_check_line)
+            .as_deref(),
     );
     // The row's `updated_at` — the server's anti-backdating stamp — is
     // deliberately NOT rendered here. This block is contractually free of

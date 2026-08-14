@@ -1377,8 +1377,10 @@ Fields: every column the checkpoint row stores — `status`, `task_id`,
 `task_title`, `head_sha`, `commit_sha`, `completed_task_ids` (an array of
 integers), `next_task_id`, `gates_result`, `gates_sha`, `gates_commands`,
 `summary`, `attested_by`,
-`acknowledged_divergence`, `updated_at` (the server's anti-backdating stamp),
-and the comparison:
+`acknowledged_divergence`, `attestation_check` (what the server established
+about that range — see "Operator-attested checkpoint backfill"; `null` for an
+implementer checkpoint, which makes no attestation claim), `updated_at` (the
+server's anti-backdating stamp), and the comparison:
 
 - `head_check` — `"checked"` or `"unreadable"`.
 - `diverged` — `true`, `false`, or **`null`** when `head_check` is
@@ -1614,7 +1616,7 @@ the successor who reads the row later are shown one story), plus:
 - `attestable` — whether there is a range here to attest to at all.
 - `attestation` — the exact `collab_checkpoint(...)` call that would attest to
   what was just shown, present only when `attestable`.
-- `commit_range_status` — **five** answers, and the distinctions are the
+- `commit_range_status` — **six** answers, and the distinctions are the
   substance:
   - `listed` — a real run of commits after the checkpoint. The only
     `attestable` answer.
@@ -1629,6 +1631,10 @@ the successor who reads the row later are shown one story), plus:
     *succeeds* for an unrelated branch and would list every commit on it, none
     of which is post-checkpoint work — so the reachability is asked directly,
     not inferred from git failing.
+  - `empty_range` — the checkpoint's head is an ancestor of live HEAD but the
+    range lists nothing. Reachable via an **abbreviated** `head_sha`: the
+    divergence check is string equality, so a short sha reads as drift while
+    resolving to the very same commit. Not attestable.
   - `no_checkpoint` — the session never checkpointed, so there is no claim to
     reconcile and nothing to attest over.
 - `commit_range_error` — why, for the three answers that have no range.
@@ -1656,18 +1662,43 @@ is resolved **against the repository** before the write lands:
   the head of the checkpoint being replaced, so the tail of the gap cannot be
   attested while the commits nearest the stale checkpoint go uncovered.
 
-A refused attestation persists nothing. Two states are labelled rather than
+A refused attestation persists nothing. Two situations are labelled rather than
 refused, so a legitimate attestation stays writable when the repo momentarily
-cannot answer — the response and the audit row both carry
-`attestation_check`:
+cannot answer.
 
-- `verified` — every check ran and held.
-- `verified_without_span` — the endpoints held, but the replaced checkpoint's
-  head no longer resolves (history rewritten out from under it), so coverage of
-  the gap is unknown.
+#### 3. The verdict — `attestation_check`
+
+The finding is **stored on the checkpoint row** (migration 021) and rendered
+wherever `attested_by: operator` is: `collab_status`, `collab_resume`, and the
+`session_handoff` block's `checkpoint.attestation_check` line. That is the
+point of checking at the write rather than at the gate — a range the server
+never resolved must not read, on those three surfaces, exactly like one it did.
+
+- `verified` — every rule ran and held.
+- `verified_without_span` — the endpoints held, but **coverage of the gap was
+  not established**. Two triggers, and the second is much the more reachable:
+  the replaced checkpoint's head no longer resolves (history rewritten out from
+  under it), **or** it resolves but is not an ancestor of the new head — most
+  simply, the new checkpoint is on an orphan or unrelated branch, so the two
+  bound no linear run of commits to demand coverage of. An operator can
+  therefore file a well-formed attestation over a narrow range on an unrelated
+  branch and have every endpoint rule pass; this label is what tells a reader
+  nobody checked what it leaves out.
 - `unverified_repo_unreadable` — live HEAD could not be read, so only the
-  range's *syntax* was checked. A malformed range is still refused here; an
+  range's *syntax* was checked. A malformed range is still refused; an
   unresolvable one is recorded as unverified rather than dressed as verified.
+- `unrecorded` — no verdict is stored (a row written before migration 021).
+  Reads as **unchecked**, never as absent: an unstamped operator attestation
+  must not be mistaken for a verified one.
+- `null` — `attested_by: implementer`, which makes no attestation claim at all.
+
+**The stored range is canonicalized.** Git accepts revision *expressions* —
+`HEAD~1..HEAD`, `main..feature` — that resolve to different commits later, and
+`acknowledged_divergence` is a durable audit record. When both endpoints
+resolve, the **resolved** `<from_oid>..<to_oid>` is what is stored and echoed
+back. When nothing could be resolved the operator's own expression is kept
+verbatim, and the `unverified_repo_unreadable` verdict beside it is what says
+the stored string was never looked up.
 
 Operator attestations are logged under their own `wal_log` operation,
 `collab_checkpoint_operator_attested`, rather than as ordinary
@@ -1678,9 +1709,13 @@ name without parsing payloads.
 **What this does not do.** The attestation is a *human's* claim, checked for
 consistency against the repo — it is not proof the human looked. `attested_by`
 is caller-asserted like every other collab identity, and an agent holding the
-session's generation lease can set it. What the checks above buy is that the
-range it names cannot be fiction: the commits exist, they end where the
-checkpoint is filed, and they cover the whole gap.
+session's generation lease can set it. Nor is the task ledger
+(`status`, `completed_task_ids`) verifiable at all: the server can see the
+commits and cannot know which tasks they completed, which is the same reason it
+refuses to synthesize a checkpoint in the first place. What the checks above
+buy is narrower and worth stating exactly: when `attestation_check` is
+`verified`, the range the attestation names cannot be fiction — the commits
+exist, they end where the checkpoint is filed, and they cover the whole gap.
 
 ### `session_handoff` (fallback succession)
 
@@ -1704,7 +1739,10 @@ restricted MCP mode.
 **Checkpoint lines.** The block carries `checkpoint` (`present` only for a
 verified `collab_checkpoints` row), `checkpoint.status`, `.task_id`,
 `.completed_task_ids`, `.next_task_id`, `.head_sha`, `.gates_result`,
-`.attested_by`, and `.acknowledged_divergence`, plus the live-HEAD comparison:
+`.attested_by`, `.acknowledged_divergence`, and `.attestation_check` (what the
+server established about that range, spelled out with what it means for what
+the reader may conclude — see "Operator-attested checkpoint backfill"), plus the
+live-HEAD comparison:
 
 - `checkpoint.head_check` — `matches`, `diverged`, or `unverified`. **Three
   values, never two.** `unverified` means git could not be read at all

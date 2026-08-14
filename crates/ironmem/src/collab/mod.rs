@@ -46,7 +46,10 @@ mod state_machine;
 mod task_list;
 
 pub use agent::{Agent, CollabRoles};
-pub use checkpoint::{AttestedBy, CheckpointError, CheckpointStatus, CollabCheckpoint};
+pub use checkpoint::{
+    AttestationCheck, AttestedBy, CheckpointError, CheckpointStatus, CollabCheckpoint,
+    ATTESTATION_UNRECORDED,
+};
 pub use error::CollabError;
 pub use event::CollabEvent;
 pub use failure_class::{classify, FailureClass};

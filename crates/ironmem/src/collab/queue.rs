@@ -4,7 +4,8 @@ use rusqlite::{params, Connection, OptionalExtension};
 use uuid::Uuid;
 
 use super::{
-    Agent, AttestedBy, CheckpointStatus, CollabCheckpoint, CollabRoles, CollabSession, Phase,
+    Agent, AttestationCheck, AttestedBy, CheckpointStatus, CollabCheckpoint, CollabRoles,
+    CollabSession, Phase,
 };
 use crate::error::MemoryError;
 
@@ -562,9 +563,9 @@ pub fn upsert_checkpoint(
              session_id, task_id, task_title, status, head_sha, commit_sha,
              completed_task_ids, next_task_id, gates_result, gates_sha,
              gates_commands, summary, attested_by, acknowledged_divergence,
-             updated_at
+             attestation_check, updated_at
          ) VALUES (
-             ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14,
+             ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15,
              strftime('%s','now')
          )
          ON CONFLICT(session_id) DO UPDATE SET
@@ -581,6 +582,7 @@ pub fn upsert_checkpoint(
              summary = excluded.summary,
              attested_by = excluded.attested_by,
              acknowledged_divergence = excluded.acknowledged_divergence,
+             attestation_check = excluded.attestation_check,
              updated_at = excluded.updated_at",
         params![
             checkpoint.session_id,
@@ -597,6 +599,7 @@ pub fn upsert_checkpoint(
             checkpoint.summary,
             checkpoint.attested_by.as_str(),
             checkpoint.acknowledged_divergence,
+            checkpoint.attestation_check.map(AttestationCheck::as_str),
         ],
     )?;
     Ok(())
@@ -719,7 +722,7 @@ pub fn load_current_checkpoint(
             "SELECT session_id, task_id, task_title, status, head_sha, commit_sha,
                     completed_task_ids, next_task_id, gates_result, gates_sha,
                     gates_commands, summary, attested_by, acknowledged_divergence,
-                    updated_at
+                    attestation_check, updated_at
              FROM collab_checkpoints
              WHERE session_id = ?1",
             params![session_id],
@@ -739,6 +742,7 @@ pub fn load_current_checkpoint(
                     row.get::<_, Option<String>>("summary")?,
                     row.get::<_, String>("attested_by")?,
                     row.get::<_, Option<String>>("acknowledged_divergence")?,
+                    row.get::<_, Option<String>>("attestation_check")?,
                     row.get::<_, i64>("updated_at")?,
                 ))
             },
@@ -760,6 +764,7 @@ pub fn load_current_checkpoint(
         summary,
         attested_by_raw,
         acknowledged_divergence,
+        attestation_check_raw,
         updated_at,
     )) = row
     else {
@@ -772,6 +777,18 @@ pub fn load_current_checkpoint(
     let attested_by = attested_by_raw.parse::<AttestedBy>().map_err(|err| {
         MemoryError::Validation(format!("checkpoint for session {row_session_id}: {err}"))
     })?;
+    // Parsed rather than carried as a string, so a value migration 021's CHECK
+    // somehow admitted — or a row written by a future author against a widened
+    // vocabulary — fails here instead of reaching a reader as an unrecognised
+    // verdict it would render verbatim. Same belt-and-braces `status` and
+    // `attested_by` get above.
+    let attestation_check = attestation_check_raw
+        .map(|raw| {
+            raw.parse::<AttestationCheck>().map_err(|err| {
+                MemoryError::Validation(format!("checkpoint for session {row_session_id}: {err}"))
+            })
+        })
+        .transpose()?;
     let completed_task_ids = parse_stored_completed_task_ids(&completed_raw, &row_session_id)?;
     let task_id = checked_task_id_column(task_id, "task_id", &row_session_id)?;
     let next_task_id = checked_task_id_column(next_task_id, "next_task_id", &row_session_id)?;
@@ -791,6 +808,7 @@ pub fn load_current_checkpoint(
         summary,
         attested_by,
         acknowledged_divergence,
+        attestation_check,
         updated_at,
     };
 
@@ -1070,6 +1088,8 @@ mod tests {
     const COLLAB_PILOT_SQL: &str = include_str!("../../migrations/019_collab_pilot.sql");
     const COLLAB_CHECKPOINTS_SQL: &str =
         include_str!("../../migrations/020_collab_checkpoints.sql");
+    const CHECKPOINT_ATTESTATION_CHECK_SQL: &str =
+        include_str!("../../migrations/021_checkpoint_attestation_check.sql");
     const QUEUE_TEST_DRAWER_IDS: [&str; 7] = [
         "drawer-123",
         "drawer-a",
@@ -1113,6 +1133,8 @@ mod tests {
         conn.execute_batch(COLLAB_MESSAGE_DRAWERS_SQL).unwrap();
         conn.execute_batch(COLLAB_PILOT_SQL).unwrap();
         conn.execute_batch(COLLAB_CHECKPOINTS_SQL).unwrap();
+        conn.execute_batch(CHECKPOINT_ATTESTATION_CHECK_SQL)
+            .unwrap();
         for drawer_id in QUEUE_TEST_DRAWER_IDS {
             insert_queue_test_drawer(&conn, drawer_id);
         }
