@@ -2081,8 +2081,28 @@ fn drive_to_plan_locked_with_implementer(
     final_plan: &str,
     implementer: Option<&str>,
 ) -> String {
+    drive_to_plan_locked_full(app, final_plan, implementer, "/repo")
+}
+
+/// Same as `drive_to_plan_locked`, but seeded at a real `repo_path` instead
+/// of the historical `"/repo"` placeholder. Every test that drives a session
+/// past `CodeImplementPending` needs one of these now (issue #273 Task 8):
+/// `implementation_done`/`review_fix_global`/`review_local`/`final_review`
+/// are all git-ancestry-checked against `repo_path`, and a placeholder path
+/// that resolves to nothing makes that check an operational failure rather
+/// than the real refusal (or real success) the test means to exercise.
+fn drive_to_plan_locked_in_repo(app: &App, final_plan: &str, repo_path: &Path) -> String {
+    drive_to_plan_locked_full(app, final_plan, None, &repo_path.to_string_lossy())
+}
+
+fn drive_to_plan_locked_full(
+    app: &App,
+    final_plan: &str,
+    implementer: Option<&str>,
+    repo_path: &str,
+) -> String {
     let mut start_args = json!({
-        "repo_path": "/repo",
+        "repo_path": repo_path,
         "branch": "main",
         "initiator": "claude"
     });
@@ -2225,8 +2245,13 @@ fn do_implementation_done(app: &App, session_id: &str, head: &str) {
 
 #[test]
 fn collab_v2_happy_path_reaches_coding_complete() {
-    let app = App::open_for_test().unwrap();
-    let session_id = drive_to_plan_locked(&app, "final plan text");
+    // Issue #273 Task 8: every head reported past `CodeImplementPending` is
+    // now git-ancestry-checked against the session's real repo, so this
+    // needs a real chain of commits behind `head0` → `batch_head` → `h2`
+    // instead of unrelated placeholder strings.
+    let (app, _temp, repo_path, shas) = test_app_with_git_repo(3);
+    let (head0, batch_head, h2) = (&shas[0], &shas[1], &shas[2]);
+    let session_id = drive_to_plan_locked_in_repo(&app, "final plan text", &repo_path);
     let hash = plan_hash(&app, &session_id);
 
     // Submit a 2-task list — server stores the manifest for audit but
@@ -2238,7 +2263,7 @@ fn collab_v2_happy_path_reaches_coding_complete() {
             "session_id": session_id,
             "sender": "claude",
             "topic": "task_list",
-            "content": task_list_payload(&hash, "base0", "head0", 2)
+            "content": task_list_payload(&hash, "base0", head0, 2)
         }),
     );
     let status = call_tool(&app, "collab_status", json!({ "session_id": &session_id }));
@@ -2247,10 +2272,10 @@ fn collab_v2_happy_path_reaches_coding_complete() {
     assert_eq!(status["base_sha"], "base0");
 
     // Single batch send replaces the per-task loop.
-    do_implementation_done(&app, &session_id, "batch_head");
+    do_implementation_done(&app, &session_id, batch_head);
     let status = call_tool(&app, "collab_status", json!({ "session_id": &session_id }));
     assert_eq!(status["phase"], "CodeReviewFixGlobalPending");
-    assert_eq!(status["last_head_sha"], "batch_head");
+    assert_eq!(&status["last_head_sha"], batch_head);
 
     // Global review_fix (Codex) → local audit (Claude) → final_review
     // (v3 reorder linear, terminal in 3 turns).
@@ -2261,7 +2286,7 @@ fn collab_v2_happy_path_reaches_coding_complete() {
             "session_id": session_id,
             "sender": "codex",
             "topic": "review_fix_global",
-            "content": json!({ "head_sha": "h2" }).to_string()
+            "content": json!({ "head_sha": h2 }).to_string()
         }),
     );
     let status = call_tool(&app, "collab_status", json!({ "session_id": &session_id }));
@@ -2274,7 +2299,7 @@ fn collab_v2_happy_path_reaches_coding_complete() {
             "session_id": session_id,
             "sender": "claude",
             "topic": "review_local",
-            "content": json!({ "head_sha": "h2" }).to_string()
+            "content": json!({ "head_sha": h2 }).to_string()
         }),
     );
     let status = call_tool(&app, "collab_status", json!({ "session_id": &session_id }));
@@ -2287,13 +2312,13 @@ fn collab_v2_happy_path_reaches_coding_complete() {
             "session_id": session_id,
             "sender": "claude",
             "topic": "final_review",
-            "content": json!({ "head_sha": "h2", "pr_url": "https://example/pr/1" }).to_string()
+            "content": json!({ "head_sha": h2, "pr_url": "https://example/pr/1" }).to_string()
         }),
     );
     let status = call_tool(&app, "collab_status", json!({ "session_id": &session_id }));
     assert_eq!(status["phase"], "CodingComplete");
     assert_eq!(status["pr_url"], "https://example/pr/1");
-    assert_eq!(status["last_head_sha"], "h2");
+    assert_eq!(&status["last_head_sha"], h2);
 
     // CodingComplete is a terminal phase — collab_end must be accepted.
     let ended = call_tool(
@@ -2309,8 +2334,13 @@ fn collab_v3_implementation_done_jumps_to_global_review() {
     // v3 batch mode (reorder): a single `implementation_done` send transitions
     // `CodeImplementPending` → `CodeReviewFixGlobalPending` with Codex as owner.
     // No per-task review/fix turns server-side.
-    let app = App::open_for_test().unwrap();
-    let session_id = drive_to_plan_locked(&app, "fp");
+    //
+    // Real repo (issue #273 Task 8): `implementation_done`'s head is now
+    // git-ancestry-checked against `last_head_sha`, so `head0`/`batch_head`
+    // must be real, order-respecting commits.
+    let (app, _temp, repo_path, shas) = test_app_with_git_repo(2);
+    let (head0, batch_head) = (&shas[0], &shas[1]);
+    let session_id = drive_to_plan_locked_in_repo(&app, "fp", &repo_path);
     let hash = plan_hash(&app, &session_id);
     call_tool(
         &app,
@@ -2319,18 +2349,18 @@ fn collab_v3_implementation_done_jumps_to_global_review() {
             "session_id": session_id,
             "sender": "claude",
             "topic": "task_list",
-            "content": task_list_payload(&hash, "b0", "h0", 3)
+            "content": task_list_payload(&hash, "b0", head0, 3)
         }),
     );
     let status = call_tool(&app, "collab_status", json!({ "session_id": &session_id }));
     assert_eq!(status["phase"], "CodeImplementPending");
     assert_eq!(status["current_owner"], "claude");
 
-    do_implementation_done(&app, &session_id, "batch_head");
+    do_implementation_done(&app, &session_id, batch_head);
     let status = call_tool(&app, "collab_status", json!({ "session_id": &session_id }));
     assert_eq!(status["phase"], "CodeReviewFixGlobalPending");
     assert_eq!(status["current_owner"], "codex");
-    assert_eq!(status["last_head_sha"], "batch_head");
+    assert_eq!(&status["last_head_sha"], batch_head);
 }
 
 #[test]
@@ -2375,8 +2405,13 @@ fn collab_start_accepts_implementer_codex_and_routes_owner() {
     // `--implementer=codex` flips the owner of `CodeImplementPending` to
     // Codex. Claude still publishes `task_list`; Codex is the only valid
     // sender of `implementation_done`.
-    let app = App::open_for_test().unwrap();
-    let session_id = drive_to_plan_locked_with_implementer(&app, "fp", Some("codex"));
+    //
+    // Real repo (issue #273 Task 8): `implementation_done`'s head is now
+    // git-ancestry-checked against `last_head_sha`.
+    let (app, _temp, repo_path, shas) = test_app_with_git_repo(2);
+    let (head0, batch_head) = (&shas[0], &shas[1]);
+    let session_id =
+        drive_to_plan_locked_full(&app, "fp", Some("codex"), &repo_path.to_string_lossy());
 
     let status = call_tool(&app, "collab_status", json!({ "session_id": &session_id }));
     assert_eq!(status["implementer"], "codex");
@@ -2389,7 +2424,7 @@ fn collab_start_accepts_implementer_codex_and_routes_owner() {
             "session_id": session_id,
             "sender": "claude",
             "topic": "task_list",
-            "content": task_list_payload(&hash, "b0", "h0", 2)
+            "content": task_list_payload(&hash, "b0", head0, 2)
         }),
     );
     let status = call_tool(&app, "collab_status", json!({ "session_id": &session_id }));
@@ -2404,7 +2439,7 @@ fn collab_start_accepts_implementer_codex_and_routes_owner() {
             "session_id": session_id,
             "sender": "claude",
             "topic": "implementation_done",
-            "content": json!({ "head_sha": "batch_head" }).to_string()
+            "content": json!({ "head_sha": batch_head }).to_string()
         }),
     );
     assert!(
@@ -2414,7 +2449,7 @@ fn collab_start_accepts_implementer_codex_and_routes_owner() {
 
     // Codex fires it and the phase advances to global review (Codex-owned
     // under v3 reorder: Codex reads the raw post-implementation diff first).
-    checkpoint_batch_complete(&app, &session_id, "codex", "batch_head");
+    checkpoint_batch_complete(&app, &session_id, "codex", batch_head);
     call_tool(
         &app,
         "collab_send",
@@ -2422,7 +2457,7 @@ fn collab_start_accepts_implementer_codex_and_routes_owner() {
             "session_id": session_id,
             "sender": "codex",
             "topic": "implementation_done",
-            "content": json!({ "head_sha": "batch_head" }).to_string()
+            "content": json!({ "head_sha": batch_head }).to_string()
         }),
     );
     let status = call_tool(&app, "collab_status", json!({ "session_id": &session_id }));
@@ -2498,12 +2533,16 @@ fn collab_pilot_and_implementer_remain_independent_in_the_reverse_mixed_case() {
     // `next.current_owner = session.implementer` transition
     // (`state_machine/mod.rs`, the `PlanLocked` -> `SubmitTaskList` arm)
     // against a future regression introduced by the creation-seed change.
-    let app = App::open_for_test().unwrap();
+    //
+    // Real repo (issue #273 Task 8): every head reported past
+    // `CodeImplementPending` is now git-ancestry-checked.
+    let (app, _temp, repo_path, shas) = test_app_with_git_repo(3);
+    let (head, implemented, reviewed) = (&shas[0], &shas[1], &shas[2]);
     let started = call_tool(
         &app,
         "collab_start",
         json!({
-            "repo_path": "/repo",
+            "repo_path": repo_path.to_string_lossy(),
             "branch": "pilot-codex-implementer-claude",
             "initiator": "claude",
             "pilot": "codex",
@@ -2569,7 +2608,7 @@ fn collab_pilot_and_implementer_remain_independent_in_the_reverse_mixed_case() {
             "session_id": &session_id,
             "sender": "codex",
             "topic": "task_list",
-            "content": task_list_payload(&plan_hash, "base", "head", 1),
+            "content": task_list_payload(&plan_hash, "base", head, 1),
         }),
     );
     let status = call_tool(&app, "collab_status", json!({ "session_id": &session_id }));
@@ -2583,7 +2622,7 @@ fn collab_pilot_and_implementer_remain_independent_in_the_reverse_mixed_case() {
             "session_id": &session_id,
             "sender": "codex",
             "topic": "implementation_done",
-            "content": json!({ "head_sha": "implemented" }).to_string(),
+            "content": json!({ "head_sha": implemented }).to_string(),
         }),
     );
     assert!(
@@ -2592,7 +2631,7 @@ fn collab_pilot_and_implementer_remain_independent_in_the_reverse_mixed_case() {
         "pilot must not be able to substitute for the independent implementer: {wrong_implementer}"
     );
 
-    checkpoint_batch_complete(&app, &session_id, "claude", "implemented");
+    checkpoint_batch_complete(&app, &session_id, "claude", implemented);
     call_tool(
         &app,
         "collab_send",
@@ -2600,7 +2639,7 @@ fn collab_pilot_and_implementer_remain_independent_in_the_reverse_mixed_case() {
             "session_id": &session_id,
             "sender": "claude",
             "topic": "implementation_done",
-            "content": json!({ "head_sha": "implemented" }).to_string(),
+            "content": json!({ "head_sha": implemented }).to_string(),
         }),
     );
     let status = call_tool(&app, "collab_status", json!({ "session_id": &session_id }));
@@ -2614,7 +2653,7 @@ fn collab_pilot_and_implementer_remain_independent_in_the_reverse_mixed_case() {
             "session_id": &session_id,
             "sender": "claude",
             "topic": "review_fix_global",
-            "content": json!({ "head_sha": "reviewed" }).to_string(),
+            "content": json!({ "head_sha": reviewed }).to_string(),
         }),
     );
     let status = call_tool(&app, "collab_status", json!({ "session_id": &session_id }));
@@ -2628,7 +2667,7 @@ fn collab_pilot_and_implementer_remain_independent_in_the_reverse_mixed_case() {
             "session_id": &session_id,
             "sender": "codex",
             "topic": "review_local",
-            "content": json!({ "head_sha": "reviewed" }).to_string(),
+            "content": json!({ "head_sha": reviewed }).to_string(),
         }),
     );
     let status = call_tool(&app, "collab_status", json!({ "session_id": &session_id }));
@@ -2642,7 +2681,7 @@ fn collab_pilot_and_implementer_remain_independent_in_the_reverse_mixed_case() {
             "session_id": &session_id,
             "sender": "codex",
             "topic": "final_review",
-            "content": json!({ "head_sha": "reviewed", "pr_url": "https://example.test/pr/1" }).to_string(),
+            "content": json!({ "head_sha": reviewed, "pr_url": "https://example.test/pr/1" }).to_string(),
         }),
     );
     let status = call_tool(&app, "collab_status", json!({ "session_id": &session_id }));
@@ -2989,8 +3028,11 @@ fn collab_set_implementer_during_batch_moves_current_owner() {
 
 #[test]
 fn collab_set_implementer_rejects_after_batch_implementation() {
-    let app = App::open_for_test().unwrap();
-    let session_id = drive_to_plan_locked(&app, "fp");
+    // Real repo (issue #273 Task 8): `implementation_done`'s head is now
+    // git-ancestry-checked, and this test needs that send to succeed.
+    let (app, _temp, repo_path, shas) = test_app_with_git_repo(2);
+    let (head0, batch_head) = (&shas[0], &shas[1]);
+    let session_id = drive_to_plan_locked_in_repo(&app, "fp", &repo_path);
     let hash = plan_hash(&app, &session_id);
     call_tool(
         &app,
@@ -2999,10 +3041,10 @@ fn collab_set_implementer_rejects_after_batch_implementation() {
             "session_id": session_id,
             "sender": "claude",
             "topic": "task_list",
-            "content": task_list_payload(&hash, "b0", "h0", 1)
+            "content": task_list_payload(&hash, "b0", head0, 1)
         }),
     );
-    checkpoint_batch_complete(&app, &session_id, "claude", "batch_head");
+    checkpoint_batch_complete(&app, &session_id, "claude", batch_head);
     call_tool(
         &app,
         "collab_send",
@@ -3010,7 +3052,7 @@ fn collab_set_implementer_rejects_after_batch_implementation() {
             "session_id": session_id,
             "sender": "claude",
             "topic": "implementation_done",
-            "content": json!({ "head_sha": "batch_head" }).to_string()
+            "content": json!({ "head_sha": batch_head }).to_string()
         }),
     );
 
@@ -3268,8 +3310,11 @@ fn collab_set_pilot_rejects_after_a_draft_has_landed() {
 
 #[test]
 fn collab_set_pilot_rejects_after_batch_implementation() {
-    let app = App::open_for_test().unwrap();
-    let session_id = drive_to_plan_locked(&app, "fp");
+    // Real repo (issue #273 Task 8): `implementation_done`'s head is now
+    // git-ancestry-checked, and this test needs that send to succeed.
+    let (app, _temp, repo_path, shas) = test_app_with_git_repo(2);
+    let (head0, batch_head) = (&shas[0], &shas[1]);
+    let session_id = drive_to_plan_locked_in_repo(&app, "fp", &repo_path);
     let hash = plan_hash(&app, &session_id);
     call_tool(
         &app,
@@ -3278,10 +3323,10 @@ fn collab_set_pilot_rejects_after_batch_implementation() {
             "session_id": &session_id,
             "sender": "claude",
             "topic": "task_list",
-            "content": task_list_payload(&hash, "b0", "h0", 1)
+            "content": task_list_payload(&hash, "b0", head0, 1)
         }),
     );
-    checkpoint_batch_complete(&app, &session_id, "claude", "batch_head");
+    checkpoint_batch_complete(&app, &session_id, "claude", batch_head);
     call_tool(
         &app,
         "collab_send",
@@ -3289,7 +3334,7 @@ fn collab_set_pilot_rejects_after_batch_implementation() {
             "session_id": &session_id,
             "sender": "claude",
             "topic": "implementation_done",
-            "content": json!({ "head_sha": "batch_head" }).to_string()
+            "content": json!({ "head_sha": batch_head }).to_string()
         }),
     );
     let before = pilot_and_owner(&app, &session_id);
@@ -3936,8 +3981,11 @@ fn collab_set_pilot_same_pilot_call_repairs_drifted_current_owner() {
 
 #[test]
 fn collab_v2_end_rejected_in_coding_active_phase() {
-    let app = App::open_for_test().unwrap();
-    let session_id = drive_to_plan_locked(&app, "fp");
+    // Real repo (issue #273 Task 8): `implementation_done`'s head is now
+    // git-ancestry-checked, and this test needs that send to succeed.
+    let (app, _temp, repo_path, shas) = test_app_with_git_repo(2);
+    let (head0, h1) = (&shas[0], &shas[1]);
+    let session_id = drive_to_plan_locked_in_repo(&app, "fp", &repo_path);
     let hash = plan_hash(&app, &session_id);
     call_tool(
         &app,
@@ -3946,7 +3994,7 @@ fn collab_v2_end_rejected_in_coding_active_phase() {
             "session_id": session_id,
             "sender": "claude",
             "topic": "task_list",
-            "content": task_list_payload(&hash, "b0", "h0", 1)
+            "content": task_list_payload(&hash, "b0", head0, 1)
         }),
     );
     // Now in CodeImplementPending — collab_end must be rejected.
@@ -3961,7 +4009,7 @@ fn collab_v2_end_rejected_in_coding_active_phase() {
         .contains("active phase CodeImplementPending"));
 
     // Session still active — `implementation_done` should advance it.
-    checkpoint_batch_complete(&app, &session_id, "claude", "h1");
+    checkpoint_batch_complete(&app, &session_id, "claude", h1);
     let ok = call_tool(
         &app,
         "collab_send",
@@ -3969,7 +4017,7 @@ fn collab_v2_end_rejected_in_coding_active_phase() {
             "session_id": session_id,
             "sender": "claude",
             "topic": "implementation_done",
-            "content": json!({ "head_sha": "h1" }).to_string()
+            "content": json!({ "head_sha": h1 }).to_string()
         }),
     );
     assert_eq!(ok["phase"], "CodeReviewFixGlobalPending");
@@ -4449,6 +4497,83 @@ fn test_shortcut_review_local_ancestry_enforced() {
     assert_eq!(status["last_head_sha"], claude_head);
 }
 
+/// The `final_review` transition (`CodeReviewFinalPending` → `CodingComplete`)
+/// is ancestry-checked too (issue #273 Task 8) — before Task 8 it was the one
+/// v3 batch-flow transition with no ancestry check at all, in either the
+/// shortcut or the normal flow: the old `shortcut_ancestry` computation only
+/// matched `(CodeReviewFixGlobalPending, CodeReviewFixGlobal)` and
+/// `(CodeReviewLocalPending, ReviewLocal)`. `drift_sha` shares only
+/// `base_sha` with `descendant_sha` (the review-local head), so it is not a
+/// descendant — the cleanest non-descendant available from `git_repo_fixture`
+/// without building a second branch by hand.
+#[test]
+fn test_shortcut_final_review_ancestry_enforced() {
+    let app = App::open_for_test().unwrap();
+    let (_temp, repo_path, base_sha, head_sha, descendant_sha, drift_sha) = git_repo_fixture();
+
+    let started = call_tool(
+        &app,
+        "collab_start_code_review",
+        json!({
+            "repo_path": repo_path,
+            "branch": "feat/review-shortcut-final-ancestry",
+            "base_sha": base_sha,
+            "head_sha": head_sha,
+            "initiator": "claude",
+            "task": "review completed branch"
+        }),
+    );
+    let session_id = started["session_id"].as_str().unwrap();
+
+    call_tool(
+        &app,
+        "collab_send",
+        json!({
+            "session_id": session_id,
+            "sender": "codex",
+            "topic": "review_fix_global",
+            "content": json!({ "head_sha": descendant_sha }).to_string()
+        }),
+    );
+    call_tool(
+        &app,
+        "collab_send",
+        json!({
+            "session_id": session_id,
+            "sender": "claude",
+            "topic": "review_local",
+            "content": json!({ "head_sha": descendant_sha }).to_string()
+        }),
+    );
+    let status = call_tool(&app, "collab_status", json!({ "session_id": session_id }));
+    assert_eq!(status["phase"], "CodeReviewFinalPending");
+    assert_eq!(status["last_head_sha"], descendant_sha);
+
+    let blocked = call_tool_expect_error(
+        &app,
+        "collab_send",
+        json!({
+            "session_id": session_id,
+            "sender": "claude",
+            "topic": "final_review",
+            "content": json!({ "head_sha": drift_sha, "pr_url": "https://example/pr/1" })
+                .to_string()
+        }),
+    );
+    assert!(
+        blocked.contains("branch_drift:"),
+        "expected branch_drift for a non-descendant final_review head, got: {blocked}"
+    );
+
+    // Phase must NOT have advanced past CodeReviewFinalPending, and the
+    // rejected head must not have been recorded.
+    let status = call_tool(&app, "collab_status", json!({ "session_id": session_id }));
+    assert_eq!(status["phase"], "CodeReviewFinalPending");
+    assert_eq!(status["current_owner"], "claude");
+    assert_eq!(status["last_head_sha"], descendant_sha);
+    assert_ne!(status["last_head_sha"], json!(drift_sha));
+}
+
 #[test]
 fn collab_start_code_review_rejects_non_descendant_head() {
     let app = App::open_for_test().unwrap();
@@ -4784,7 +4909,10 @@ fn recv_auto_ack_with_limit_only_acks_returned_messages() {
 ///     --final_review(codex, pilot)--> CodingComplete
 #[test]
 fn collab_pilot_codex_end_to_end_mcp_flow_reaches_coding_complete() {
-    let app = App::open_for_test().unwrap();
+    // Real repo (issue #273 Task 8): every head reported past
+    // `CodeImplementPending` is now git-ancestry-checked.
+    let (app, _temp, repo_path, shas) = test_app_with_git_repo(3);
+    let (head0, batch_head, h2) = (&shas[0], &shas[1], &shas[2]);
 
     // `collab_start` with pilot=codex, implementer omitted: implementer must
     // default to the resolved pilot (codex), per Task 7.
@@ -4792,7 +4920,7 @@ fn collab_pilot_codex_end_to_end_mcp_flow_reaches_coding_complete() {
         &app,
         "collab_start",
         json!({
-            "repo_path": "/repo",
+            "repo_path": repo_path.to_string_lossy(),
             "branch": "main",
             "initiator": "claude",
             "pilot": "codex"
@@ -4919,7 +5047,7 @@ fn collab_pilot_codex_end_to_end_mcp_flow_reaches_coding_complete() {
             "session_id": session_id,
             "sender": "codex",
             "topic": "task_list",
-            "content": task_list_payload(&final_plan_hash, "base0", "head0", 2)
+            "content": task_list_payload(&final_plan_hash, "base0", head0, 2)
         }),
     );
     let status = call_tool(&app, "collab_status", json!({ "session_id": &session_id }));
@@ -4929,7 +5057,7 @@ fn collab_pilot_codex_end_to_end_mcp_flow_reaches_coding_complete() {
 
     // Codex (the implementer) reports the batch implementation done ->
     // CodeReviewFixGlobalPending, owner flips to claude (the copilot).
-    checkpoint_batch_complete(&app, &session_id, "codex", "batch_head");
+    checkpoint_batch_complete(&app, &session_id, "codex", batch_head);
     call_tool(
         &app,
         "collab_send",
@@ -4937,7 +5065,7 @@ fn collab_pilot_codex_end_to_end_mcp_flow_reaches_coding_complete() {
             "session_id": session_id,
             "sender": "codex",
             "topic": "implementation_done",
-            "content": json!({ "head_sha": "batch_head" }).to_string()
+            "content": json!({ "head_sha": batch_head }).to_string()
         }),
     );
     let status = call_tool(&app, "collab_status", json!({ "session_id": &session_id }));
@@ -4953,7 +5081,7 @@ fn collab_pilot_codex_end_to_end_mcp_flow_reaches_coding_complete() {
             "session_id": session_id,
             "sender": "claude",
             "topic": "review_fix_global",
-            "content": json!({ "head_sha": "h2" }).to_string()
+            "content": json!({ "head_sha": h2 }).to_string()
         }),
     );
     let status = call_tool(&app, "collab_status", json!({ "session_id": &session_id }));
@@ -4969,7 +5097,7 @@ fn collab_pilot_codex_end_to_end_mcp_flow_reaches_coding_complete() {
             "session_id": session_id,
             "sender": "codex",
             "topic": "review_local",
-            "content": json!({ "head_sha": "h2" }).to_string()
+            "content": json!({ "head_sha": h2 }).to_string()
         }),
     );
     let status = call_tool(&app, "collab_status", json!({ "session_id": &session_id }));
@@ -4985,7 +5113,7 @@ fn collab_pilot_codex_end_to_end_mcp_flow_reaches_coding_complete() {
             "session_id": session_id,
             "sender": "codex",
             "topic": "final_review",
-            "content": json!({ "head_sha": "h2", "pr_url": "https://example/pr/1" }).to_string()
+            "content": json!({ "head_sha": h2, "pr_url": "https://example/pr/1" }).to_string()
         }),
     );
     let status = call_tool(&app, "collab_status", json!({ "session_id": &session_id }));
@@ -6162,11 +6290,96 @@ fn collab_checkpoint_requires_a_live_session() {
 // advance anyway.
 
 /// The head sha every gate test reports on `implementation_done`.
-const GATE_HEAD: &str = "75a4ea3ee2f0c1b8d4a69f7c3e5b2a1d0c9f8e7b";
+///
+/// A real, deterministically-reproducible commit sha (issue #273 Task 8), not
+/// an arbitrary string: [`gate_head_repo`] below produces exactly this value
+/// by committing fixed content under a fixed author/committer identity and
+/// timestamp, so it is always both a well-formed 40-hex sha AND a real object
+/// in the repo `drive_to_code_implement_pending` seeds every gate test with.
+/// Task 8 added git-ancestry validation to `implementation_done`; an
+/// arbitrary made-up sha (this constant's value before Task 8) would now be
+/// refused as `branch_drift:` before ever reaching Task 7's checkpoint gate —
+/// which is not what any test in this section means to exercise.
+const GATE_HEAD: &str = "fca655866ba97de53fb6a0029a1f65804a78f903";
 
-/// Drive a fresh session to `CodeImplementPending` with `tasks` tasks.
-fn drive_to_code_implement_pending(app: &App, tasks: usize) -> String {
-    let session_id = drive_to_plan_locked(app, "gate plan");
+/// Commit with a fixed author/committer identity and timestamp so the
+/// resulting sha is reproducible across machines and runs. Required for
+/// [`GATE_HEAD`] to be a fixed literal that is also always a real, reachable
+/// commit — a plain `commit_file` call would produce a different sha on every
+/// run (committer date defaults to "now").
+fn commit_file_deterministic(
+    cwd: &Path,
+    filename: &str,
+    contents: &str,
+    message: &str,
+    date: &str,
+) -> String {
+    write_file(&cwd.join(filename), contents);
+    git(&["add", filename], cwd);
+    let mut command = Command::new("git");
+    command
+        .args(["commit", "-m", message])
+        .current_dir(cwd)
+        .env("GIT_AUTHOR_NAME", "Ironmem Test")
+        .env("GIT_AUTHOR_EMAIL", "ironmem@example.com")
+        .env("GIT_AUTHOR_DATE", date)
+        .env("GIT_COMMITTER_NAME", "Ironmem Test")
+        .env("GIT_COMMITTER_EMAIL", "ironmem@example.com")
+        .env("GIT_COMMITTER_DATE", date);
+    let output = command.output().expect("git commit must run");
+    assert!(
+        output.status.success(),
+        "git commit failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    git(&["rev-parse", "HEAD"], cwd)
+}
+
+/// A repo containing the real, deterministic two-commit chain that produces
+/// [`GATE_HEAD`]. `commit.gpgsign` and `core.hooksPath` are pinned off for the
+/// same reason every other git fixture in this file pins them off: an
+/// inherited signing key or personal hooksPath would make this fragile
+/// outside the machine that happens to have them configured.
+fn gate_head_repo() -> (tempfile::TempDir, PathBuf, String) {
+    let temp = tempfile::tempdir().expect("temp repo must be creatable");
+    let repo_path = temp.path().to_path_buf();
+    git(&["init"], &repo_path);
+    git(&["config", "user.name", "Ironmem Test"], &repo_path);
+    git(&["config", "user.email", "ironmem@example.com"], &repo_path);
+    git(&["config", "commit.gpgsign", "false"], &repo_path);
+    git(&["config", "core.hooksPath", "/dev/null"], &repo_path);
+    let base_sha = commit_file_deterministic(
+        &repo_path,
+        "gate.txt",
+        "base",
+        "gate base",
+        "2020-01-01T00:00:00+00:00",
+    );
+    let head_sha = commit_file_deterministic(
+        &repo_path,
+        "gate.txt",
+        "head",
+        "gate head",
+        "2020-01-01T00:01:00+00:00",
+    );
+    assert_eq!(
+        head_sha, GATE_HEAD,
+        "the deterministic gate-head recipe drifted from the pinned GATE_HEAD constant — if \
+         this fires, either the recipe above was edited without recomputing GATE_HEAD, or git's \
+         commit-hashing changed shape"
+    );
+    (temp, repo_path, base_sha)
+}
+
+/// Drive a fresh session to `CodeImplementPending` with `tasks` tasks, seeded
+/// in [`gate_head_repo`] so `GATE_HEAD` is a real descendant of the session's
+/// `last_head_sha`. Returns the `TempDir` alongside the session id — the
+/// caller must keep it alive for the session's lifetime, since dropping it
+/// deletes the repo `implementation_done`'s ancestry check later shells out
+/// to.
+fn drive_to_code_implement_pending(app: &App, tasks: usize) -> (tempfile::TempDir, String) {
+    let (temp, repo_path, base_sha) = gate_head_repo();
+    let session_id = drive_to_plan_locked_in_repo(app, "gate plan", &repo_path);
     let hash = plan_hash(app, &session_id);
     call_tool(
         app,
@@ -6175,12 +6388,12 @@ fn drive_to_code_implement_pending(app: &App, tasks: usize) -> String {
             "session_id": &session_id,
             "sender": "claude",
             "topic": "task_list",
-            "content": task_list_payload(&hash, "b0", "h0", tasks)
+            "content": task_list_payload(&hash, "b0", &base_sha, tasks)
         }),
     );
     let status = call_tool(app, "collab_status", json!({ "session_id": &session_id }));
     assert_eq!(status["phase"], "CodeImplementPending");
-    session_id
+    (temp, session_id)
 }
 
 /// A checkpoint payload that satisfies *every* condition of the gate, so each
@@ -6321,7 +6534,7 @@ fn follow_the_remedy(app: &App, err: &str) {
 fn the_refusal_remedy_is_a_call_that_actually_satisfies_the_gate() {
     for under_covering_checkpoint in [false, true] {
         let app = App::open_for_test().unwrap();
-        let session_id = drive_to_code_implement_pending(&app, 3);
+        let (_temp, session_id) = drive_to_code_implement_pending(&app, 3);
         if under_covering_checkpoint {
             let mut cp = passing_checkpoint(&session_id, 3);
             cp["completed_task_ids"] = json!("1,2");
@@ -6362,7 +6575,7 @@ fn the_refusal_remedy_is_a_call_that_actually_satisfies_the_gate() {
 #[test]
 fn implementation_done_refused_without_any_checkpoint() {
     let app = App::open_for_test().unwrap();
-    let session_id = drive_to_code_implement_pending(&app, 3);
+    let (_temp, session_id) = drive_to_code_implement_pending(&app, 3);
 
     let err = implementation_done_refused(&app, &session_id);
     assert!(
@@ -6380,7 +6593,7 @@ fn implementation_done_refused_without_any_checkpoint() {
 #[test]
 fn implementation_done_refused_when_the_checkpoint_head_is_stale() {
     let app = App::open_for_test().unwrap();
-    let session_id = drive_to_code_implement_pending(&app, 3);
+    let (_temp, session_id) = drive_to_code_implement_pending(&app, 3);
     let mut cp = passing_checkpoint(&session_id, 3);
     cp["head_sha"] = json!("b9c2ce0e1d2c3b4a5968778695a4b3c2d1e0f9a8");
     cp["gates_sha"] = json!("b9c2ce0e1d2c3b4a5968778695a4b3c2d1e0f9a8");
@@ -6399,7 +6612,7 @@ fn implementation_done_refused_when_the_checkpoint_head_is_stale() {
 #[test]
 fn implementation_done_refusal_explains_an_abbreviated_sha() {
     let app = App::open_for_test().unwrap();
-    let session_id = drive_to_code_implement_pending(&app, 1);
+    let (_temp, session_id) = drive_to_code_implement_pending(&app, 1);
     let short = &GATE_HEAD[..7];
     let mut cp = passing_checkpoint(&session_id, 1);
     cp["head_sha"] = json!(short);
@@ -6422,7 +6635,7 @@ fn implementation_done_refusal_explains_an_abbreviated_sha() {
 #[test]
 fn implementation_done_refused_when_the_checkpoint_is_not_batch_complete() {
     let app = App::open_for_test().unwrap();
-    let session_id = drive_to_code_implement_pending(&app, 3);
+    let (_temp, session_id) = drive_to_code_implement_pending(&app, 3);
     let mut cp = passing_checkpoint(&session_id, 3);
     cp["status"] = json!("completed");
     call_tool(&app, "collab_checkpoint", cp);
@@ -6439,7 +6652,7 @@ fn implementation_done_refused_when_the_checkpoint_is_not_batch_complete() {
 #[test]
 fn implementation_done_refused_when_the_checkpoint_misses_a_task() {
     let app = App::open_for_test().unwrap();
-    let session_id = drive_to_code_implement_pending(&app, 3);
+    let (_temp, session_id) = drive_to_code_implement_pending(&app, 3);
     let mut cp = passing_checkpoint(&session_id, 3);
     cp["completed_task_ids"] = json!("1,2");
     call_tool(&app, "collab_checkpoint", cp);
@@ -6460,7 +6673,7 @@ fn implementation_done_refused_when_the_checkpoint_misses_a_task() {
 #[test]
 fn implementation_done_refused_when_the_covered_ids_have_a_gap() {
     let app = App::open_for_test().unwrap();
-    let session_id = drive_to_code_implement_pending(&app, 3);
+    let (_temp, session_id) = drive_to_code_implement_pending(&app, 3);
     let mut cp = passing_checkpoint(&session_id, 3);
     cp["completed_task_ids"] = json!("1,2,4");
     call_tool(&app, "collab_checkpoint", cp);
@@ -6473,7 +6686,7 @@ fn implementation_done_refused_when_the_covered_ids_have_a_gap() {
 #[test]
 fn implementation_done_refused_when_the_gate_proof_is_stale() {
     let app = App::open_for_test().unwrap();
-    let session_id = drive_to_code_implement_pending(&app, 2);
+    let (_temp, session_id) = drive_to_code_implement_pending(&app, 2);
     let mut cp = passing_checkpoint(&session_id, 2);
     cp["gates_sha"] = json!("older99e1d2c3b4a5968778695a4b3c2d1e0f9a8b");
     call_tool(&app, "collab_checkpoint", cp);
@@ -6490,7 +6703,7 @@ fn implementation_done_refused_when_the_gate_proof_is_stale() {
 #[test]
 fn implementation_done_refused_when_the_gates_did_not_pass() {
     let app = App::open_for_test().unwrap();
-    let session_id = drive_to_code_implement_pending(&app, 2);
+    let (_temp, session_id) = drive_to_code_implement_pending(&app, 2);
     let mut cp = passing_checkpoint(&session_id, 2);
     cp["gates_result"] = json!("failed: 3 tests red");
     call_tool(&app, "collab_checkpoint", cp);
@@ -6504,7 +6717,7 @@ fn implementation_done_refused_when_the_gates_did_not_pass() {
 #[test]
 fn implementation_done_accepted_with_a_checkpoint_that_proves_the_batch() {
     let app = App::open_for_test().unwrap();
-    let session_id = drive_to_code_implement_pending(&app, 3);
+    let (_temp, session_id) = drive_to_code_implement_pending(&app, 3);
     call_tool(
         &app,
         "collab_checkpoint",
@@ -6540,7 +6753,7 @@ fn implementation_done_accepted_with_a_checkpoint_that_proves_the_batch() {
 fn implementation_done_gate_ignores_the_operator_attestation() {
     // Half 1: an operator attestation does NOT exempt a stale checkpoint.
     let app = App::open_for_test().unwrap();
-    let session_id = drive_to_code_implement_pending(&app, 2);
+    let (_temp, session_id) = drive_to_code_implement_pending(&app, 2);
     let mut cp = passing_checkpoint(&session_id, 2);
     cp["head_sha"] = json!("b9c2ce0e1d2c3b4a5968778695a4b3c2d1e0f9a8");
     cp["gates_sha"] = json!("b9c2ce0e1d2c3b4a5968778695a4b3c2d1e0f9a8");
@@ -6553,7 +6766,7 @@ fn implementation_done_gate_ignores_the_operator_attestation() {
     // conditions passes — the gate refuses nothing on the strength of
     // `attested_by` alone, so Task 10 has a reachable path to extend.
     let app2 = App::open_for_test().unwrap();
-    let session2 = drive_to_code_implement_pending(&app2, 2);
+    let (_temp2, session2) = drive_to_code_implement_pending(&app2, 2);
     let mut ok = passing_checkpoint(&session2, 2);
     ok["attested_by"] = json!("operator");
     ok["acknowledged_divergence"] = json!("b9c2ce0..75a4ea3");
@@ -6578,7 +6791,7 @@ fn implementation_done_gate_ignores_the_operator_attestation() {
 #[test]
 fn the_checkpoint_gate_does_not_apply_to_the_review_topics() {
     let app = App::open_for_test().unwrap();
-    let session_id = drive_to_code_implement_pending(&app, 1);
+    let (temp, session_id) = drive_to_code_implement_pending(&app, 1);
     call_tool(
         &app,
         "collab_checkpoint",
@@ -6595,6 +6808,11 @@ fn the_checkpoint_gate_does_not_apply_to_the_review_topics() {
         }),
     );
 
+    // Real repo (issue #273 Task 8): the review phases' heads are now
+    // git-ancestry-checked too, so "later-head" must be a real descendant of
+    // GATE_HEAD — add one more commit to the same repo `temp` still owns.
+    let later_head = commit_file(temp.path(), "gate.txt", "later", "later head");
+
     // The checkpoint is now stale relative to every later head, which must
     // not stop the review phases from running.
     for (sender, topic, extra) in [
@@ -6606,7 +6824,7 @@ fn the_checkpoint_gate_does_not_apply_to_the_review_topics() {
             json!({ "pr_url": "https://example.test/pr/1" }),
         ),
     ] {
-        let mut content = json!({ "head_sha": "later-head" });
+        let mut content = json!({ "head_sha": &later_head });
         for (k, v) in extra.as_object().unwrap() {
             content[k] = v.clone();
         }
@@ -6623,4 +6841,135 @@ fn the_checkpoint_gate_does_not_apply_to_the_review_topics() {
     }
     let status = call_tool(&app, "collab_status", json!({ "session_id": &session_id }));
     assert_eq!(status["phase"], "CodingComplete");
+}
+
+// ── ancestry validation extended to the v3 batch flow (issue #273 Task 8) ──
+//
+// Task 7's `implementation_done` gate proves the checkpoint's own story is
+// self-consistent: the reported head matches what the checkpoint claims, the
+// ledger covers every task, gates are green at that head. It does not prove
+// the reported head is *real* — a caller can file a checkpoint at a head_sha
+// it invented and report that same invented value back, and every one of
+// Task 7's four conditions is satisfied by construction. Only asking git
+// whether the reported head actually descends from the session's last
+// recorded head closes that gap, which is what production code now does for
+// every head-advancing coding event, not just the `collab_start_code_review`
+// shortcut it used to be limited to.
+
+/// A fresh git repo, isolated from this machine's global git config —
+/// `commit.gpgsign` and `core.hooksPath` are pinned off explicitly rather
+/// than left to whatever the developer machine running this test happens to
+/// have configured. A working SSH/GPG signing key locally makes an inherited
+/// `commit.gpgsign=true` invisible here and a silent hang-or-fail on a CI
+/// runner with no key configured; an inherited `core.hooksPath` risks running
+/// someone's personal hooks against a throwaway fixture repo — with `n`
+/// sequential commits, each a real descendant of the one before.
+fn git_batch_repo(n: usize) -> (tempfile::TempDir, PathBuf, Vec<String>) {
+    let temp = tempfile::tempdir().expect("temp repo must be creatable");
+    let repo_path = temp.path().to_path_buf();
+    git(&["init"], &repo_path);
+    git(&["config", "user.name", "Ironmem Test"], &repo_path);
+    git(&["config", "user.email", "ironmem@example.com"], &repo_path);
+    git(&["config", "commit.gpgsign", "false"], &repo_path);
+    git(&["config", "core.hooksPath", "/dev/null"], &repo_path);
+    let shas = (0..n)
+        .map(|i| {
+            commit_file(
+                &repo_path,
+                "batch.txt",
+                &format!("v{i}\n"),
+                &format!("commit {i}"),
+            )
+        })
+        .collect();
+    (temp, repo_path, shas)
+}
+
+/// An `App` paired with a fresh [`git_batch_repo`]. Named to match what issue
+/// #273's Task 9 plans to build as a shared fixture
+/// (`test_app_with_git_repo`) — adopt this rather than duplicating it.
+fn test_app_with_git_repo(n_commits: usize) -> (App, tempfile::TempDir, PathBuf, Vec<String>) {
+    let app = App::open_for_test().unwrap();
+    let (temp, repo_path, shas) = git_batch_repo(n_commits);
+    (app, temp, repo_path, shas)
+}
+
+/// `collab_status`'s `phase` field, as an owned `String`. Named to match what
+/// issue #273's Task 9 plans to build (`phase_of`) — adopt this rather than
+/// duplicating it.
+fn phase_of(app: &App, session_id: &str) -> String {
+    call_tool(app, "collab_status", json!({ "session_id": session_id }))["phase"]
+        .as_str()
+        .unwrap()
+        .to_string()
+}
+
+/// The core case: the batch flow now refuses a non-descendant `head_sha` on
+/// `implementation_done`, exactly as the shortcut already refused it on
+/// `review_fix_global`/`review_local`.
+///
+/// The checkpoint filed here is a **passing** one — it satisfies every Task 7
+/// condition at `orphan_sha`, the exact "checkpoint lies consistently"
+/// scenario Task 8 exists to close. If this test filed no checkpoint (or an
+/// under-covering one) instead, it would still get refused, but by Task 7's
+/// gate rather than Task 8's — proving nothing about the ancestry check this
+/// test exists to pin. An orphan commit (`git checkout --orphan`) is the
+/// cleanest possible non-descendant: it shares no parent with `base_sha` at
+/// all, so there is no ambiguity with "on the same branch but not far
+/// enough".
+#[test]
+fn batch_flow_implementation_done_rejects_non_descendant_head() {
+    let (app, _temp, repo_path, shas) = test_app_with_git_repo(1);
+    let base_sha = shas[0].clone();
+    let session_id = drive_to_plan_locked_in_repo(&app, "batch plan", &repo_path);
+    let hash = plan_hash(&app, &session_id);
+    call_tool(
+        &app,
+        "collab_send",
+        json!({
+            "session_id": &session_id,
+            "sender": "claude",
+            "topic": "task_list",
+            "content": task_list_payload(&hash, &base_sha, &base_sha, 1)
+        }),
+    );
+    assert_eq!(phase_of(&app, &session_id), "CodeImplementPending");
+
+    git(&["checkout", "--orphan", "unrelated"], &repo_path);
+    let orphan_sha = commit_file(&repo_path, "orphan.txt", "orphan\n", "orphan commit");
+
+    checkpoint_batch_complete(&app, &session_id, "claude", &orphan_sha);
+    let sends_before = wal_row_count(&app, &session_id, "collab_send");
+    let err = call_tool_expect_error(
+        &app,
+        "collab_send",
+        json!({
+            "session_id": &session_id,
+            "sender": "claude",
+            "topic": "implementation_done",
+            "content": json!({ "head_sha": orphan_sha }).to_string()
+        }),
+    );
+    assert!(
+        err.contains("branch_drift:"),
+        "expected branch_drift for a non-descendant head in the batch flow, got: {err}"
+    );
+    // Assert on stored state, not just the error: the error proves the call
+    // was answered, only the row proves nothing was written.
+    assert_eq!(
+        wal_row_count(&app, &session_id, "collab_send"),
+        sends_before,
+        "a refused implementation_done must write no audit row: {err}"
+    );
+    let status = call_tool(&app, "collab_status", json!({ "session_id": &session_id }));
+    assert_eq!(
+        status["phase"], "CodeImplementPending",
+        "a refused implementation_done must not advance the phase: {err}"
+    );
+    assert_eq!(status["current_owner"], "claude");
+    assert_ne!(
+        status["last_head_sha"],
+        json!(orphan_sha),
+        "a refused implementation_done must not record the reported head: {err}"
+    );
 }
