@@ -2372,6 +2372,91 @@ mod tests {
     }
 
     #[test]
+    fn migration_020_requires_session_id_head_sha_and_updated_at() {
+        let db = Database::open_in_memory().unwrap();
+        // A fresh session per case, so a primary-key collision can never
+        // masquerade as the NOT NULL constraint firing.
+        for session_id in ["s-req-head", "s-req-updated", "s-req-defaults"] {
+            db.conn
+                .execute(
+                    "INSERT INTO collab_sessions (id, repo_path, branch) VALUES (?1, '/repo', 'main')",
+                    [session_id],
+                )
+                .unwrap();
+        }
+
+        // session_id: plain SQLite does not imply NOT NULL for a `TEXT PRIMARY
+        // KEY`, so the explicit NOT NULL is the only thing keeping a NULL-keyed
+        // row — unreachable by lookup and by FK cascade alike — out of the table.
+        let null_session_id = db.conn.execute(
+            "INSERT INTO collab_checkpoints (session_id, status, head_sha, updated_at)
+             VALUES (NULL, 'started', 'aaa', 1)",
+            [],
+        );
+        assert!(
+            null_session_id.is_err(),
+            "session_id must be NOT NULL, but a NULL-keyed checkpoint was accepted"
+        );
+
+        // head_sha: the column the whole issue turns on. A checkpoint without
+        // one cannot be compared against live git HEAD at all.
+        let missing_head_sha = db.conn.execute(
+            "INSERT INTO collab_checkpoints (session_id, status, updated_at)
+             VALUES ('s-req-head', 'started', 1)",
+            [],
+        );
+        assert!(
+            missing_head_sha.is_err(),
+            "head_sha must be NOT NULL, but a checkpoint without one was accepted"
+        );
+
+        // updated_at: NOT NULL with deliberately no DEFAULT, so a writer that
+        // forgot to stamp it fails loudly instead of getting a silently-filled
+        // timestamp. That property is asserted here, not just in the comment.
+        let missing_updated_at = db.conn.execute(
+            "INSERT INTO collab_checkpoints (session_id, status, head_sha)
+             VALUES ('s-req-updated', 'started', 'aaa')",
+            [],
+        );
+        assert!(
+            missing_updated_at.is_err(),
+            "updated_at must be NOT NULL with no DEFAULT, but an unstamped checkpoint was accepted"
+        );
+
+        // With only the required columns supplied the insert succeeds, and the
+        // NOT NULL DEFAULTs fill in the documented values rather than NULL.
+        // Reading them back as `String` also fails loudly if a DEFAULT is lost.
+        db.conn
+            .execute(
+                "INSERT INTO collab_checkpoints (session_id, status, head_sha, updated_at)
+                 VALUES ('s-req-defaults', 'started', 'aaa', 1)",
+                [],
+            )
+            .unwrap();
+        let (completed_task_ids, gates_result, attested_by): (String, String, String) = db
+            .conn
+            .query_row(
+                "SELECT completed_task_ids, gates_result, attested_by
+                 FROM collab_checkpoints WHERE session_id = 's-req-defaults'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            completed_task_ids, "",
+            "completed_task_ids must default to the empty string, not NULL"
+        );
+        assert_eq!(
+            gates_result, "not_run",
+            "gates_result must default to 'not_run', not NULL"
+        );
+        assert_eq!(
+            attested_by, "implementer",
+            "attested_by must default to 'implementer', not NULL"
+        );
+    }
+
+    #[test]
     fn migration_020_status_check_constraint_accepts_known_rejects_unknown() {
         let db = Database::open_in_memory().unwrap();
 
@@ -2461,12 +2546,18 @@ mod tests {
     #[test]
     fn migration_020_correlation_check_rejects_implementer_with_divergence() {
         let db = Database::open_in_memory().unwrap();
-        db.conn
-            .execute(
-                "INSERT INTO collab_sessions (id, repo_path, branch) VALUES ('s-corr', '/repo', 'main')",
-                [],
-            )
-            .unwrap();
+        // A fresh session per case: sharing one session would make the
+        // positive case depend on the negative case having failed first and
+        // left the primary key free, so a regressed CHECK would surface as a
+        // UNIQUE violation pointing at the wrong constraint.
+        for session_id in ["s-corr", "s-corr-ok"] {
+            db.conn
+                .execute(
+                    "INSERT INTO collab_sessions (id, repo_path, branch) VALUES (?1, '/repo', 'main')",
+                    [session_id],
+                )
+                .unwrap();
+        }
 
         // attested_by='implementer' can never carry acknowledged_divergence.
         let bad = db.conn.execute(
@@ -2487,7 +2578,7 @@ mod tests {
             "INSERT INTO collab_checkpoints
                 (session_id, status, head_sha, completed_task_ids, attested_by,
                  acknowledged_divergence, updated_at)
-             VALUES ('s-corr', 'started', 'aaa', '', 'operator', 'b9c2ce0..75a4ea3', 1)",
+             VALUES ('s-corr-ok', 'started', 'aaa', '', 'operator', 'b9c2ce0..75a4ea3', 1)",
             [],
         );
         assert!(

@@ -16,9 +16,12 @@
 -- `WITHOUT ROWID` table, plain SQLite does not treat a `TEXT PRIMARY KEY` as
 -- implicitly NOT NULL, so without this a direct write could insert an
 -- orphaned NULL-keyed row that a FK cascade can never reach and no
--- `WHERE session_id = ?` lookup can ever find. Writes go through
--- `queue::upsert_checkpoint` (INSERT … ON CONFLICT DO UPDATE); history is the
--- git log and the `wal_log` audit trail, subject to its retention window,
+-- `WHERE session_id = ?` lookup can ever find. This migration adds the table
+-- and nothing else: as of it there is no writer, so a reader who finds no
+-- checkpoint rows and no checkpoint entries in `wal_log` is looking at an
+-- unbuilt feature, not a bug. Writes will go through
+-- `queue::upsert_checkpoint` (INSERT … ON CONFLICT DO UPDATE); history will be
+-- the git log and the `wal_log` audit trail, subject to its retention window,
 -- deliberately not a second table, because a checkpoint ledger nobody reads
 -- is exactly the kind of drawer accumulation `ironmem memory gc` exists to
 -- prune.
