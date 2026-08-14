@@ -2372,11 +2372,16 @@ mod tests {
     }
 
     #[test]
-    fn migration_020_requires_session_id_head_sha_and_updated_at() {
+    fn migration_020_requires_session_id_status_head_sha_and_updated_at() {
         let db = Database::open_in_memory().unwrap();
         // A fresh session per case, so a primary-key collision can never
         // masquerade as the NOT NULL constraint firing.
-        for session_id in ["s-req-head", "s-req-updated", "s-req-defaults"] {
+        for session_id in [
+            "s-req-status",
+            "s-req-head",
+            "s-req-updated",
+            "s-req-defaults",
+        ] {
             db.conn
                 .execute(
                     "INSERT INTO collab_sessions (id, repo_path, branch) VALUES (?1, '/repo', 'main')",
@@ -2396,6 +2401,20 @@ mod tests {
         assert!(
             null_session_id.is_err(),
             "session_id must be NOT NULL, but a NULL-keyed checkpoint was accepted"
+        );
+
+        // status: NOT NULL is the *only* thing rejecting a NULL status here.
+        // The `CHECK (status IN (...))` beside it gives no NULL protection at
+        // all, because `NULL IN (...)` evaluates to NULL and SQLite treats a
+        // CHECK that evaluates to NULL as satisfied.
+        let missing_status = db.conn.execute(
+            "INSERT INTO collab_checkpoints (session_id, head_sha, updated_at)
+             VALUES ('s-req-status', 'aaa', 1)",
+            [],
+        );
+        assert!(
+            missing_status.is_err(),
+            "status must be NOT NULL, but a checkpoint without one was accepted"
         );
 
         // head_sha: the column the whole issue turns on. A checkpoint without
@@ -2584,6 +2603,28 @@ mod tests {
         assert!(
             ok.is_ok(),
             "attested_by='operator' with acknowledged_divergence set should be accepted"
+        );
+    }
+
+    #[test]
+    fn migration_020_rejects_checkpoint_for_nonexistent_session() {
+        let db = Database::open_in_memory().unwrap();
+
+        // The sibling cascade test covers the delete-time half of the foreign
+        // key; this covers the insert-time half. Dropping `REFERENCES`
+        // entirely reddens both, but dropping only `ON DELETE CASCADE` reddens
+        // only the cascade test, so the pair says *which* half regressed
+        // rather than just that something did.
+        let orphan = db.conn.execute(
+            "INSERT INTO collab_checkpoints
+                (session_id, status, head_sha, completed_task_ids, updated_at)
+             VALUES ('no-such-session', 'started', 'aaa', '', 1)",
+            [],
+        );
+        assert!(
+            orphan.is_err(),
+            "a checkpoint naming a session that does not exist must be rejected \
+             by the foreign key, got {orphan:?}"
         );
     }
 
