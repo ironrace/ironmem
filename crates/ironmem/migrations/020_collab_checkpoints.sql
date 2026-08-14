@@ -11,11 +11,17 @@
 -- against. `session_id` is the PRIMARY KEY, not an autoincrement id, because
 -- the contract is "exactly one *current* checkpoint per session" — the same
 -- one-logical-keyed-drawer semantics the convention had, now enforced by the
--- schema instead of by prompt discipline. Writes go through
+-- schema instead of by prompt discipline. It is explicitly `NOT NULL` in
+-- addition to `PRIMARY KEY`: unlike `INTEGER PRIMARY KEY` or a
+-- `WITHOUT ROWID` table, plain SQLite does not treat a `TEXT PRIMARY KEY` as
+-- implicitly NOT NULL, so without this a direct write could insert an
+-- orphaned NULL-keyed row that a FK cascade can never reach and no
+-- `WHERE session_id = ?` lookup can ever find. Writes go through
 -- `queue::upsert_checkpoint` (INSERT … ON CONFLICT DO UPDATE); history is the
--- git log and the WAL, deliberately not a second table, because a checkpoint
--- ledger nobody reads is exactly the kind of drawer accumulation
--- `ironmem memory gc` exists to prune.
+-- git log and the `wal_log` audit trail, subject to its retention window,
+-- deliberately not a second table, because a checkpoint ledger nobody reads
+-- is exactly the kind of drawer accumulation `ironmem memory gc` exists to
+-- prune.
 --
 --   task_id / task_title      the task the checkpoint describes; NULL for a
 --                             `batch_complete` checkpoint, which describes the
@@ -54,15 +60,32 @@
 --                             For an operator attestation it records the SHA
 --                             range being vouched for, as `<from>..<to>`. The
 --                             CHECK below pins the correlation at the DB level:
---                             an implementer row can never carry one.
---   updated_at                unix seconds; the WAL carries the full history.
+--                             an implementer row can never carry one. The
+--                             CHECK is intentionally one-directional — it
+--                             permits `attested_by='operator'` with this
+--                             column still NULL. Requiring operator writes to
+--                             populate it is a tool-layer rule, not a schema
+--                             guarantee; a reader must not conflate the two.
+--   updated_at                unix seconds, NOT the `TEXT`/`datetime('now')`
+--                             convention every other `_at` column in this
+--                             schema uses (collab_sessions.updated_at,
+--                             messages.created_at, code_maps.built_at,
+--                             schema_version.applied_at). Deliberately the one
+--                             integer timestamp in the schema: the value is
+--                             server-stamped for programmatic comparison
+--                             (divergence checks, staleness), not display, and
+--                             a TEXT column with a DEFAULT invites a writer
+--                             that forgot to pass it to get a silently-filled
+--                             timestamp anyway — exactly the
+--                             unverified-bookkeeping failure mode this table
+--                             exists to kill.
 --
 -- CREATE TABLE is idempotent under IF NOT EXISTS, but this migration is still
 -- version-gated behind `current_version < 20` in schema.rs::migrate() for
 -- consistency with the rest of the ladder.
 
 CREATE TABLE IF NOT EXISTS collab_checkpoints (
-    session_id              TEXT PRIMARY KEY
+    session_id              TEXT NOT NULL PRIMARY KEY
                             REFERENCES collab_sessions(id) ON DELETE CASCADE,
     task_id                 INTEGER,
     task_title              TEXT,

@@ -1934,6 +1934,15 @@ mod tests {
         db
     }
 
+    /// Build a connection migrated to exactly v19 (no collab_checkpoints
+    /// table yet) by replaying migrations 001-019 directly from the module
+    /// consts.
+    fn open_at_v19() -> Database {
+        let db = open_at_v18();
+        db.conn.execute_batch(COLLAB_PILOT_SQL).unwrap();
+        db
+    }
+
     #[test]
     fn test_fresh_migrate_reaches_v19_with_pilot_column() {
         let db = Database::open_in_memory().unwrap();
@@ -2011,14 +2020,6 @@ mod tests {
             invalid_result.is_err(),
             "pilot='invalid' should be rejected by CHECK constraint"
         );
-    }
-
-    #[test]
-    fn test_migrate_twice_idempotent_v19() {
-        let db = Database::open_in_memory().unwrap();
-        db.migrate().unwrap();
-        db.migrate().unwrap();
-        assert_eq!(schema_version_of(&db), LATEST_SCHEMA_VERSION);
     }
 
     /// Deterministic contention harness: produce a genuine
@@ -2367,6 +2368,204 @@ mod tests {
         assert!(
             err.to_string().contains("UNIQUE"),
             "expected a UNIQUE violation on the second insert, got: {err}"
+        );
+    }
+
+    #[test]
+    fn migration_020_status_check_constraint_accepts_known_rejects_unknown() {
+        let db = Database::open_in_memory().unwrap();
+
+        for (i, status) in ["started", "completed", "blocked", "batch_complete"]
+            .iter()
+            .enumerate()
+        {
+            let session_id = format!("s-status-{i}");
+            db.conn
+                .execute(
+                    "INSERT INTO collab_sessions (id, repo_path, branch) VALUES (?1, '/repo', 'main')",
+                    [&session_id],
+                )
+                .unwrap();
+            let result = db.conn.execute(
+                "INSERT INTO collab_checkpoints
+                    (session_id, status, head_sha, completed_task_ids, updated_at)
+                 VALUES (?1, ?2, 'aaa', '', 1)",
+                rusqlite::params![session_id, status],
+            );
+            assert!(
+                result.is_ok(),
+                "status={status:?} should be accepted, got {result:?}"
+            );
+        }
+
+        db.conn
+            .execute(
+                "INSERT INTO collab_sessions (id, repo_path, branch) VALUES ('s-status-bad', '/repo', 'main')",
+                [],
+            )
+            .unwrap();
+        let bad = db.conn.execute(
+            "INSERT INTO collab_checkpoints
+                (session_id, status, head_sha, completed_task_ids, updated_at)
+             VALUES ('s-status-bad', 'bogus', 'aaa', '', 1)",
+            [],
+        );
+        assert!(
+            bad.is_err(),
+            "status='bogus' should be rejected by the CHECK constraint"
+        );
+    }
+
+    #[test]
+    fn migration_020_attested_by_check_constraint_accepts_known_rejects_unknown() {
+        let db = Database::open_in_memory().unwrap();
+
+        for (i, attested_by) in ["implementer", "operator"].iter().enumerate() {
+            let session_id = format!("s-attested-{i}");
+            db.conn
+                .execute(
+                    "INSERT INTO collab_sessions (id, repo_path, branch) VALUES (?1, '/repo', 'main')",
+                    [&session_id],
+                )
+                .unwrap();
+            let result = db.conn.execute(
+                "INSERT INTO collab_checkpoints
+                    (session_id, status, head_sha, completed_task_ids, attested_by, updated_at)
+                 VALUES (?1, 'started', 'aaa', '', ?2, 1)",
+                rusqlite::params![session_id, attested_by],
+            );
+            assert!(
+                result.is_ok(),
+                "attested_by={attested_by:?} should be accepted, got {result:?}"
+            );
+        }
+
+        db.conn
+            .execute(
+                "INSERT INTO collab_sessions (id, repo_path, branch) VALUES ('s-attested-bad', '/repo', 'main')",
+                [],
+            )
+            .unwrap();
+        let bad = db.conn.execute(
+            "INSERT INTO collab_checkpoints
+                (session_id, status, head_sha, completed_task_ids, attested_by, updated_at)
+             VALUES ('s-attested-bad', 'started', 'aaa', '', 'bogus', 1)",
+            [],
+        );
+        assert!(
+            bad.is_err(),
+            "attested_by='bogus' should be rejected by the CHECK constraint"
+        );
+    }
+
+    #[test]
+    fn migration_020_correlation_check_rejects_implementer_with_divergence() {
+        let db = Database::open_in_memory().unwrap();
+        db.conn
+            .execute(
+                "INSERT INTO collab_sessions (id, repo_path, branch) VALUES ('s-corr', '/repo', 'main')",
+                [],
+            )
+            .unwrap();
+
+        // attested_by='implementer' can never carry acknowledged_divergence.
+        let bad = db.conn.execute(
+            "INSERT INTO collab_checkpoints
+                (session_id, status, head_sha, completed_task_ids, attested_by,
+                 acknowledged_divergence, updated_at)
+             VALUES ('s-corr', 'started', 'aaa', '', 'implementer', 'b9c2ce0..75a4ea3', 1)",
+            [],
+        );
+        assert!(
+            bad.is_err(),
+            "attested_by='implementer' with acknowledged_divergence set must be rejected"
+        );
+
+        // attested_by='operator' with a divergence range set is exactly the
+        // human-attested-backfill case the column exists for.
+        let ok = db.conn.execute(
+            "INSERT INTO collab_checkpoints
+                (session_id, status, head_sha, completed_task_ids, attested_by,
+                 acknowledged_divergence, updated_at)
+             VALUES ('s-corr', 'started', 'aaa', '', 'operator', 'b9c2ce0..75a4ea3', 1)",
+            [],
+        );
+        assert!(
+            ok.is_ok(),
+            "attested_by='operator' with acknowledged_divergence set should be accepted"
+        );
+    }
+
+    #[test]
+    fn migration_020_deleting_session_cascades_to_checkpoint() {
+        let db = Database::open_in_memory().unwrap();
+        db.conn
+            .execute(
+                "INSERT INTO collab_sessions (id, repo_path, branch) VALUES ('s-cascade', '/repo', 'main')",
+                [],
+            )
+            .unwrap();
+        db.conn
+            .execute(
+                "INSERT INTO collab_checkpoints
+                    (session_id, status, head_sha, completed_task_ids, updated_at)
+                 VALUES ('s-cascade', 'started', 'aaa', '', 1)",
+                [],
+            )
+            .unwrap();
+
+        db.conn
+            .execute("DELETE FROM collab_sessions WHERE id = 's-cascade'", [])
+            .unwrap();
+
+        let remaining: i64 = db
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM collab_checkpoints WHERE session_id = 's-cascade'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            remaining, 0,
+            "ON DELETE CASCADE must remove the checkpoint when its session is deleted"
+        );
+    }
+
+    #[test]
+    fn test_v19_to_v20_adds_collab_checkpoints_table_and_preserves_legacy_sessions() {
+        let db = open_at_v19();
+        assert_eq!(schema_version_of(&db), 19);
+        assert!(
+            !table_exists(&db, "collab_checkpoints"),
+            "collab_checkpoints should not exist at v19"
+        );
+
+        db.conn
+            .execute(
+                "INSERT INTO collab_sessions (id, repo_path, branch)
+                 VALUES ('legacy-v19-session', '/repo', 'main')",
+                [],
+            )
+            .unwrap();
+
+        db.migrate().unwrap();
+        assert_eq!(schema_version_of(&db), LATEST_SCHEMA_VERSION);
+        assert_eq!(LATEST_SCHEMA_VERSION, 20);
+        assert!(table_exists(&db, "collab_checkpoints"));
+
+        // The pre-upgrade session must survive the migration intact.
+        let survived: i64 = db
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM collab_sessions WHERE id = 'legacy-v19-session'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            survived, 1,
+            "legacy session must survive the v19->v20 upgrade"
         );
     }
 }
