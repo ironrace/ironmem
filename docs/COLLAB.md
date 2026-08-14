@@ -1373,8 +1373,10 @@ live-HEAD comparison, or JSON `null` when the session has never checkpointed.
 This is the same information the `session_handoff` block carries, exposed
 without needing a handoff so drift is visible while a batch is still running.
 
-Fields: `status`, `task_id`, `head_sha`, `completed_task_ids` (an array of
-integers), `next_task_id`, `gates_result`, `gates_sha`, `attested_by`,
+Fields: every column the checkpoint row stores — `status`, `task_id`,
+`task_title`, `head_sha`, `commit_sha`, `completed_task_ids` (an array of
+integers), `next_task_id`, `gates_result`, `gates_sha`, `gates_commands`,
+`summary`, `attested_by`,
 `acknowledged_divergence`, `updated_at` (the server's anti-backdating stamp),
 and the comparison:
 
@@ -1389,6 +1391,11 @@ and the comparison:
   `diverged` is `true`.
 - `head_check_error` — why the check could not run, present only when
   `head_check` is `"unreadable"`.
+
+`gates_commands` is what the gate-proof reuse rule under "Implementation
+checkpoints" compares against the current required gate set; it and
+`commit_sha`, `task_title`, and `summary` are readable here rather than only
+from the checkpoint drawer, so that rule survives the drawer going away.
 
 The git read only happens for a session that has a checkpoint row at all, so
 polling a session still in planning costs nothing.
@@ -1607,6 +1614,15 @@ Every key is emitted on every call, unset ones as an em-dash, so the key set
 is fixed. The block remains timestamp-free: the row's `updated_at` is exposed
 through `collab_status` and `collab_resume` instead, `head_check` being a
 better staleness signal than a clock in any case.
+
+**The block is unforgeable.** Every line is written through one renderer that
+collapses its value onto a single line, so no field can inject additional
+`key: value` lines. This matters because several rendered values are
+agent-supplied free text — `coding_failure` and its `pending_failure` clone
+arrive from a `failure_report` and are *expected* to be multi-line — and a
+successor routes off this block. Long values therefore appear with internal
+newlines and runs of whitespace collapsed to single spaces; nothing is
+truncated.
 
 **The legacy checkpoint drawer.** Before issue #273 this block was rendered
 from the `collab-checkpoint:<session_id>` drawer — the artifact the incident

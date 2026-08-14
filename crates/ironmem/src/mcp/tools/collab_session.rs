@@ -1515,12 +1515,41 @@ fn require_checkpoint_proof(
 /// `final_review` turns. Treating the batch flow's `implementation_done`
 /// differently — recoverable there, terminal everywhere else — would draw a
 /// distinction the underlying git fact does not support.
+/// Strip every inherited `GIT_*` variable before spawning git.
+///
+/// `git -C <path>` is not enough on its own: an inherited `GIT_DIR` /
+/// `GIT_WORK_TREE` (and friends) silently redirects the command at a
+/// *different* repository, so a checkpoint would be compared against the wrong
+/// HEAD — and could be reported `head_check: matches` while the session's real
+/// repo has drifted. That is an unverified claim presented as verified, the
+/// exact failure issue #273 exists to end, arriving through the environment
+/// rather than through a stale record.
+///
+/// Not hypothetical, and not novel here: `review::diff`'s helper of the same
+/// name says these overrides "can redirect a command away from `request.repo`",
+/// the review hook does the same, and this file's own test fixtures already
+/// scrub — the production path was the one left exposed. PATH and the rest of
+/// the environment are deliberately preserved; only git's process controls go.
+fn scrub_git_environment(command: &mut Command) {
+    for (key, _) in std::env::vars_os() {
+        if key
+            .to_string_lossy()
+            .to_ascii_uppercase()
+            .starts_with("GIT_")
+        {
+            command.env_remove(key);
+        }
+    }
+}
+
 fn validate_global_review_head_advance(
     repo_path: &str,
     last_head_sha: &str,
     head_sha: &str,
 ) -> Result<(), MemoryError> {
-    let output = Command::new("git")
+    let mut command = Command::new("git");
+    scrub_git_environment(&mut command);
+    let output = command
         .args([
             "-C",
             repo_path,
@@ -1602,7 +1631,9 @@ fn validate_global_review_head_advance(
 /// check" into one answer and report `diverged: false` for an unreadable repo.
 /// See [`HeadCheck`].
 pub(super) fn git_head_sha(repo_path: &str) -> Result<String, MemoryError> {
-    let output = Command::new("git")
+    let mut command = Command::new("git");
+    scrub_git_environment(&mut command);
+    let output = command
         .args(["-C", repo_path, "rev-parse", "HEAD"])
         .output()
         .map_err(|err| {
@@ -1789,6 +1820,19 @@ fn checkpoint_json(checkpoint: Option<(&crate::collab::CollabCheckpoint, &HeadCh
         "next_task_id": cp.next_task_id,
         "gates_result": cp.gates_result,
         "gates_sha": cp.gates_sha,
+        // The rest of the stored row. Every column the table accepts is
+        // readable from *some* tool, or it is write-only state: a resumer
+        // reads `gates_commands` to decide whether a recorded gate proof
+        // covers the gate set it would otherwise re-run (COLLAB.md's
+        // "Implementation checkpoints" requires exactly that comparison),
+        // `commit_sha` to find the commit a task landed on, and
+        // `task_title`/`summary` to say what the batch was doing. Those all
+        // used to come from the checkpoint drawer; once the drawer stops being
+        // written, this is the only place they exist.
+        "gates_commands": cp.gates_commands,
+        "commit_sha": cp.commit_sha,
+        "task_title": cp.task_title,
+        "summary": cp.summary,
         "attested_by": cp.attested_by.as_str(),
         "acknowledged_divergence": cp.acknowledged_divergence,
         // The anti-backdating server stamp — the field that tells a fresh
@@ -1802,6 +1846,12 @@ fn checkpoint_json(checkpoint: Option<(&crate::collab::CollabCheckpoint, &HeadCh
         block["divergence"] = json!(divergence);
     }
     if let Some(detail) = head_check.unreadable_detail() {
+        // Deliberately NOT the same string `collab_checkpoint` returns under
+        // this key: that tool emits the bare git detail, and its response
+        // bytes are a shipped contract (Task 5). The prefix belongs here,
+        // where the reader is a successor or an operator looking at session
+        // state rather than the caller of a write it just made. Do not
+        // "unify" the two spellings without moving Task 5's contract too.
         block["head_check_error"] = json!(format!(
             "checkpoint could not be verified against git HEAD: {detail}"
         ));
@@ -5487,22 +5537,6 @@ mod tests {
 
     // ── git_head_sha / HeadCheck (Task 6, issue #273) ──────────────────────────
 
-    /// Scrub inherited `GIT_*` environment variables before spawning a fixture
-    /// git command, same shape as `tests/review_diff.rs`'s helper of the same
-    /// name — a fixture command must not pick up ambient `GIT_DIR`/`GIT_WORK_TREE`
-    /// (etc.) from whatever process launched the test.
-    fn scrub_git_environment(command: &mut std::process::Command) {
-        for (key, _) in std::env::vars_os() {
-            if key
-                .to_string_lossy()
-                .to_ascii_uppercase()
-                .starts_with("GIT_")
-            {
-                command.env_remove(key);
-            }
-        }
-    }
-
     /// Run a fixture git command and assert it succeeded. Mirrors
     /// `tests/review_diff.rs`'s `git()` helper: a fixture step that silently
     /// fails (e.g. a global `commit.gpgsign`/`core.hooksPath` misconfiguration
@@ -5574,6 +5608,139 @@ mod tests {
             "completed_task_ids": "",
         });
         crate::collab::CollabCheckpoint::from_json(&payload).unwrap()
+    }
+
+    /// Serializes the tests below that mutate `GIT_*` process-wide. Separate
+    /// from `METRICS_ENV_LOCK` because it guards a different variable family;
+    /// sharing one lock would couple two unrelated suites.
+    static GIT_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Sets `GIT_*` overrides for the duration of a test and restores them on
+    /// drop, holding [`GIT_ENV_LOCK`] throughout — `std::env::set_var` is
+    /// process-global, so an unsynchronized test would leak into whatever runs
+    /// beside it.
+    struct ScopedGitEnv {
+        previous: Vec<(String, Option<std::ffi::OsString>)>,
+        _guard: std::sync::MutexGuard<'static, ()>,
+    }
+
+    impl ScopedGitEnv {
+        fn set(vars: &[(&str, &str)]) -> Self {
+            let guard = GIT_ENV_LOCK
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            let previous = vars
+                .iter()
+                .map(|(key, value)| {
+                    let old = std::env::var_os(key);
+                    std::env::set_var(key, value);
+                    ((*key).to_string(), old)
+                })
+                .collect();
+            Self {
+                previous,
+                _guard: guard,
+            }
+        }
+    }
+
+    impl Drop for ScopedGitEnv {
+        fn drop(&mut self) {
+            for (key, old) in &self.previous {
+                match old {
+                    Some(value) => std::env::set_var(key, value),
+                    None => std::env::remove_var(key),
+                }
+            }
+        }
+    }
+
+    /// A second repo whose history is genuinely disjoint from
+    /// [`git_repo_with_two_commits`]'s.
+    ///
+    /// Two calls to that fixture produce **byte-identical SHAs** — same file
+    /// contents, same messages, same author, and the commit timestamps land in
+    /// the same second — so using one as the "hostile" repo would make every
+    /// assertion below true whether or not the environment was scrubbed. The
+    /// distinct file content is what makes these tests able to fail.
+    fn hostile_git_repo() -> (tempfile::TempDir, String) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path();
+        git(path, &["init", "-q"]);
+        git(path, &["config", "user.email", "hostile@example.com"]);
+        git(path, &["config", "user.name", "Hostile"]);
+        std::fs::write(path.join("hostile.txt"), "hostile\n").unwrap();
+        git(path, &["add", "."]);
+        git(path, &["commit", "-qm", "hostile commit"]);
+        let head = git_output(path, &["rev-parse", "HEAD"]);
+        (dir, head)
+    }
+
+    /// An inherited `GIT_DIR`/`GIT_WORK_TREE` must not redirect the HEAD read
+    /// at a different repository.
+    ///
+    /// This is the environment-borne form of the issue #273 failure: pointed
+    /// at the wrong repo, `git rev-parse HEAD` succeeds and returns a sha, so
+    /// `HeadCheck` would report `checked` / `matches` — an unverified claim
+    /// presented as verified — for a session whose real repo has drifted.
+    /// Mirrors `tests/review_diff.rs`'s hostile-`GIT_DIR` test.
+    #[test]
+    fn git_head_sha_ignores_an_inherited_hostile_git_dir() {
+        let (intended_dir, _first, intended_head) = git_repo_with_two_commits();
+        let (hostile_dir, hostile_head) = hostile_git_repo();
+        assert_ne!(
+            intended_head, hostile_head,
+            "fixture precondition: the two repos must have different HEADs, or a \
+             redirected read would return the right answer by accident"
+        );
+
+        let hostile_git_dir = hostile_dir.path().join(".git");
+        let _overrides = ScopedGitEnv::set(&[
+            ("GIT_DIR", hostile_git_dir.to_string_lossy().as_ref()),
+            (
+                "GIT_WORK_TREE",
+                hostile_dir.path().to_string_lossy().as_ref(),
+            ),
+        ]);
+
+        let read = git_head_sha(&intended_dir.path().to_string_lossy()).unwrap();
+        assert_eq!(
+            read, intended_head,
+            "the repo_path argument must win over inherited Git overrides"
+        );
+        assert_ne!(read, hostile_head);
+    }
+
+    /// The same hazard on the ancestry spawn: an inherited `GIT_DIR` would
+    /// have `merge-base --is-ancestor` answer about the wrong repository's
+    /// history, turning a real `branch_drift:` into a pass (or the reverse).
+    #[test]
+    fn ancestry_validation_ignores_an_inherited_hostile_git_dir() {
+        let (intended_dir, first, second) = git_repo_with_two_commits();
+        let (hostile_dir, hostile_head) = hostile_git_repo();
+        assert!(
+            hostile_head != first && hostile_head != second,
+            "fixture precondition: the hostile repo must not share history"
+        );
+
+        let hostile_git_dir = hostile_dir.path().join(".git");
+        let _overrides = ScopedGitEnv::set(&[
+            ("GIT_DIR", hostile_git_dir.to_string_lossy().as_ref()),
+            (
+                "GIT_WORK_TREE",
+                hostile_dir.path().to_string_lossy().as_ref(),
+            ),
+        ]);
+
+        // `second` descends from `first` in the intended repo. Neither sha
+        // exists in the hostile one, so a redirected command cannot answer
+        // this correctly — it errors on an unknown revision instead.
+        validate_global_review_head_advance(
+            &intended_dir.path().to_string_lossy(),
+            &first,
+            &second,
+        )
+        .expect("the repo_path argument must win over inherited Git overrides");
     }
 
     #[test]

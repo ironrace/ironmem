@@ -7563,6 +7563,51 @@ fn collab_status_reports_a_current_checkpoint_as_undiverged() {
     assert!(status["checkpoint"].get("divergence").is_none());
 }
 
+/// Every column the `collab_checkpoints` table accepts must be readable back.
+///
+/// `gates_commands`, `commit_sha`, `task_title` and `summary` are stored and
+/// validated but, until this task defined the read surfaces, appeared in no
+/// tool response — a resumer got them from the checkpoint drawer instead.
+/// COLLAB.md's gate-proof reuse rule requires comparing
+/// `checkpoint.gates_commands` against the current gate set, so once the
+/// drawer stops being written this is the only place that rule can be served
+/// from. Anything stored and unreadable is write-only state.
+#[test]
+fn collab_status_checkpoint_round_trips_every_stored_field() {
+    let (app, _temp, repo, _shas) = test_app_with_git_repo(1);
+    let session_id = start_batch_session_in(&app, &repo, 3);
+    let head = commit_file(&repo, "task1.rs", "done\n", "task 1");
+    checkpoint(
+        &app,
+        &session_id,
+        json!({
+            "status": "completed",
+            "task_id": 1,
+            "task_title": "wire the detector",
+            "head_sha": head,
+            "commit_sha": head,
+            "completed_task_ids": "1",
+            "next_task_id": 2,
+            "gates_result": "passed",
+            "gates_sha": head,
+            "gates_commands": "cargo fmt --check && cargo clippy -D warnings",
+            "summary": "task 1 landed",
+        }),
+    );
+
+    let cp = &call_tool(&app, "collab_status", json!({ "session_id": &session_id }))["checkpoint"];
+    assert_eq!(cp["task_title"], json!("wire the detector"));
+    assert_eq!(cp["commit_sha"], json!(head));
+    assert_eq!(
+        cp["gates_commands"],
+        json!("cargo fmt --check && cargo clippy -D warnings"),
+        "the gate-proof reuse rule cannot be served without this: {cp}"
+    );
+    assert_eq!(cp["summary"], json!("task 1 landed"));
+    assert_eq!(cp["next_task_id"], json!(2));
+    assert_eq!(cp["gates_sha"], json!(head));
+}
+
 /// `diverged: null` plus `head_check: "unreadable"`, never `diverged: false`.
 /// A consumer that treats `diverged` as a plain boolean reads `null` as falsy,
 /// which is exactly why the label is reported beside it.
@@ -7606,5 +7651,12 @@ fn collab_status_checkpoint_is_null_without_a_checkpoint() {
     let (app, _temp, repo, _shas) = test_app_with_git_repo(1);
     let session_id = start_batch_session_in(&app, &repo, 3);
     let status = call_tool(&app, "collab_status", json!({ "session_id": &session_id }));
+    // `Index` returns Null for a *missing* key too, so asserting only on the
+    // value would pass just as well against a build that never emitted the
+    // field. The docs promise `checkpoint` is always present; pin that first.
+    assert!(
+        status.get("checkpoint").is_some(),
+        "collab_status must always carry a checkpoint field: {status}"
+    );
     assert_eq!(status["checkpoint"], serde_json::Value::Null);
 }
