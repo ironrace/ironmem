@@ -460,12 +460,13 @@ pub fn apply_event(
         // ── v3: failure is valid from any coding-active phase ─────────────
         (phase, CollabEvent::FailureReport { coding_failure }) if phase.is_coding_active() => {
             // Some failure classes are structurally detectable only from
-            // outside the owner's process (branch drift via git ops; a
-            // Codex dispatch failure observed from Claude's MCP call when
-            // `--implementer=codex` and Codex itself never returned). For
-            // those, allow the non-owner to emit a `FailureReport` with a
-            // recognized prefix; everything else still requires the
-            // current owner.
+            // outside the owner's process (branch drift via git ops; a stale
+            // checkpoint seen by whoever compares HEAD against the
+            // implementer's ledger; a Codex dispatch failure observed from
+            // Claude's MCP call when `--implementer=codex` and Codex itself
+            // never returned). For those, allow the non-owner to emit a
+            // `FailureReport` with a recognized prefix; everything else still
+            // requires the current owner.
             //
             // The carve-out additionally requires *content* after the
             // prefix: a bare prefix string would let any authenticated
@@ -473,12 +474,16 @@ pub fn apply_event(
             // value, so we reject the empty form and demand at least one
             // byte of context.
             //
-            // The dispatch-failure half is also scoped to the phases whose
-            // Codex turn Claude actually dispatches, which is why `phase` and
-            // `session.implementer` are threaded in. Without that scope the
-            // pilot-owned `CodeReviewLocalPending`/`CodeReviewFinalPending`
-            // turns — Codex-owned whenever `pilot == Agent::Codex` — could be
-            // taken by the copilot with a fabricated report.
+            // The checkpoint-drift and dispatch-failure halves are further
+            // scoped by phase — which is why `phase` and
+            // `session.implementer` are threaded in. Only `branch_drift:` is
+            // unscoped, because it is Terminal: admitting it ends the session
+            // rather than handing anyone a turn. Both recoverable prefixes
+            // park the session with a new `current_owner`, so without a phase
+            // scope the pilot-owned `CodeReviewLocalPending`/
+            // `CodeReviewFinalPending` turns — Codex-owned whenever
+            // `pilot == Agent::Codex` — could be taken by the copilot with a
+            // fabricated report.
             let is_off_turn_admissible = off_turn_failure_is_admissible(
                 coding_failure,
                 actor,
@@ -540,13 +545,19 @@ pub fn apply_event(
                     } else {
                         // Most tooling reports come from the interrupted
                         // turn's owner, so this normally equals
-                        // `counterpart(actor)`. `codex_dispatch_failed:` is
-                        // deliberately off-turn-admissible, though: Claude
-                        // can report an unavailable Codex turn. Derive the
-                        // recovery owner from the interrupted owner rather
-                        // than the observing reporter so that case hands the
-                        // work to Claude instead of back to unavailable
-                        // Codex.
+                        // `counterpart(actor)`. Two prefixes are deliberately
+                        // off-turn-admissible and recoverable, though, and
+                        // both land here: `codex_dispatch_failed:` (Claude
+                        // reporting an unavailable Codex turn) and
+                        // `checkpoint_drift:` (the non-implementer reporting
+                        // the implementer's stale ledger during
+                        // `CodeImplementPending`). Derive the recovery owner
+                        // from the interrupted owner rather than the observing
+                        // reporter so those cases hand the work to the
+                        // observer instead of back to the agent that could not
+                        // keep its own state straight. Both are phase-scoped
+                        // in `off_turn_failure_is_admissible` precisely
+                        // because this branch installs a new `current_owner`.
                         let interrupted_owner = session.current_owner;
                         let owner = counterpart(interrupted_owner);
                         next.pending_failure = Some(coding_failure.clone());
